@@ -1,0 +1,17 @@
+{
+    "mcpServers": {
+        "hitl": {
+            "type": "stdio",
+            "command": "cmd",
+            "args": [
+                "/c",
+                "npx",
+                "-y",
+                "@achieveai/hitl-mcp-server@latest",
+                "--no-auto-launch-client"
+            ],
+            "env": {},
+            "timeout": 2147483647
+        }
+    }
+}

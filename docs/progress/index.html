@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rEtcd — Build Progress</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --panel: #ffffff;
+    --text: #16181d;
+    --muted: #565c66;
+    --border: #dde1e7;
+    --accent: #1f6feb;
+    --accent-soft: #e8f0fe;
+    --green: #16794f;
+    --green-soft: #e3f6ec;
+    --amber: #8a5a00;
+    --amber-soft: #fff2d9;
+    --grey: #6b7280;
+    --grey-soft: #eceef1;
+    --red: #b42318;
+    --red-soft: #fdecea;
+    --shadow: 0 1px 2px rgba(20,20,30,0.06), 0 2px 8px rgba(20,20,30,0.04);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216;
+      --panel: #171b21;
+      --text: #eef0f3;
+      --muted: #9aa2af;
+      --border: #2a2f38;
+      --accent: #5b9dff;
+      --accent-soft: #16233b;
+      --green: #4fd394;
+      --green-soft: #10281d;
+      --amber: #ffc266;
+      --amber-soft: #2e2408;
+      --grey: #9aa2af;
+      --grey-soft: #232830;
+      --red: #ff8a80;
+      --red-soft: #331312;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 2px 10px rgba(0,0,0,0.3);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 80px; }
+
+  /* ---------- Header ---------- */
+  header.top {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px 28px;
+    box-shadow: var(--shadow);
+    margin-bottom: 24px;
+  }
+  .top-row { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .proj-name { font-size: 30px; font-weight: 800; letter-spacing: -0.01em; }
+  .proj-name .dim { color: var(--muted); font-weight: 600; font-size: 18px; margin-left: 8px; }
+  .meta-line { color: var(--muted); font-size: 15px; margin-top: 4px; }
+  .phase-pill {
+    display: inline-block; padding: 6px 14px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 15px;
+    border: 1px solid var(--accent);
+  }
+  .progress-outer { margin-top: 18px; }
+  .progress-label { display: flex; justify-content: space-between; font-size: 14px; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
+  .progress-track { background: var(--grey-soft); border-radius: 999px; height: 22px; overflow: hidden; border: 1px solid var(--border); display: flex; }
+  .progress-seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #fff; }
+  .progress-seg.done { background: var(--green); }
+  .progress-seg.pending { background: transparent; color: var(--muted); }
+
+  /* ---------- Sections ---------- */
+  section { margin-bottom: 28px; }
+  h2.section-title {
+    font-size: 20px; font-weight: 800; margin: 0 0 12px 2px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  h2.section-title .num { color: var(--muted); font-weight: 700; font-size: 15px; }
+
+  /* ---------- Milestone board ---------- */
+  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    padding: 18px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px;
+  }
+  .card-head { display: flex; align-items: center; justify-content: space-between; }
+  .card-title { font-size: 18px; font-weight: 800; }
+  .chip { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+  .chip.not_started { background: var(--grey-soft); color: var(--grey); }
+  .chip.in_progress { background: var(--amber-soft); color: var(--amber); }
+  .chip.gate_passed { background: var(--green-soft); color: var(--green); }
+  .card ul.acc { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .card ul.acc li { display: flex; gap: 8px; align-items: flex-start; font-size: 14.5px; color: var(--text); }
+  .card ul.acc li .box {
+    flex: 0 0 16px; width: 16px; height: 16px; margin-top: 2px; border-radius: 4px;
+    border: 2px solid var(--border); background: var(--panel);
+  }
+  .card ul.acc li.checked .box { background: var(--green); border-color: var(--green); }
+  .card .tests { font-size: 13px; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 4px; }
+
+  /* ---------- Diagrams ---------- */
+  .diagram-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: var(--shadow); overflow-x: auto; }
+  .diagram-caption { color: var(--muted); font-size: 14px; margin-top: 8px; }
+  svg text { font-family: -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif; }
+
+  /* ---------- Team panel ---------- */
+  .team-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .team-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: var(--shadow); }
+  .team-role { font-weight: 800; font-size: 15px; }
+  .team-model { color: var(--accent); font-size: 13px; font-weight: 700; margin-bottom: 6px; }
+  .team-activity { color: var(--muted); font-size: 14px; }
+
+  /* ---------- Table ---------- */
+  table.decisions { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); }
+  table.decisions th, table.decisions td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 14.5px; }
+  table.decisions th { background: var(--grey-soft); font-weight: 700; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.03em; }
+  table.decisions tr:last-child td { border-bottom: none; }
+  table.decisions a { color: var(--accent); text-decoration: none; font-weight: 600; }
+  table.decisions a:hover { text-decoration: underline; }
+  .adr-status { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 999px; background: var(--green-soft); color: var(--green); }
+
+  /* ---------- Timeline ---------- */
+  ul.timeline { list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); }
+  ul.timeline li { display: flex; gap: 14px; padding: 12px 18px; border-bottom: 1px solid var(--border); font-size: 14.5px; }
+  ul.timeline li:last-child { border-bottom: none; }
+  ul.timeline .ts { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 130px; font-size: 13px; font-weight: 600; }
+
+  /* ---------- Risks ---------- */
+  ul.risks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  ul.risks li {
+    background: var(--panel); border: 1px solid var(--border); border-left: 5px solid var(--amber);
+    border-radius: 10px; padding: 12px 16px; font-size: 14.5px; box-shadow: var(--shadow);
+  }
+  ul.risks li.high { border-left-color: var(--red); }
+  ul.risks li .sev { font-size: 11px; font-weight: 800; text-transform: uppercase; color: var(--amber); margin-right: 8px; }
+  ul.risks li.high .sev { color: var(--red); }
+
+  footer { text-align: center; color: var(--muted); font-size: 13px; margin-top: 36px; }
+
+  @media (max-width: 600px) {
+    .proj-name { font-size: 24px; }
+    header.top { padding: 18px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div class="top-row">
+      <div>
+        <span class="proj-name">rEtcd<span class="dim">— build progress</span></span>
+        <div class="meta-line" id="meta-line">Last updated — · Phase —</div>
+      </div>
+      <div class="phase-pill" id="phase-pill">—</div>
+    </div>
+    <div class="progress-outer">
+      <div class="progress-label"><span>Overall release progress (M0 → M3)</span><span id="progress-pct">0%</span></div>
+      <div class="progress-track" id="progress-track"></div>
+    </div>
+  </header>
+
+  <section id="section-milestones">
+    <h2 class="section-title"><span class="num">1</span> Milestone board</h2>
+    <div class="board" id="board"></div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">2</span> Crate layer diagram <span style="font-weight:500;color:var(--muted);font-size:13px;">— dependencies point inward to config-core (ADR-0004)</span></h2>
+    <div class="diagram-panel">
+      <svg viewBox="0 0 1040 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Crate dependency diagram">
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+          </marker>
+        </defs>
+        <style>
+          .box { fill: var(--grey-soft); stroke: var(--border); stroke-width: 1.5; rx: 10; }
+          .box.core { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+          .lbl { fill: var(--text); font-size: 14px; font-weight: 700; }
+          .sub { fill: var(--muted); font-size: 11px; }
+          .dep { stroke: var(--muted); stroke-width: 1.4; fill: none; marker-end: url(#arrow); opacity: 0.75; }
+          .tier-lbl { fill: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+        </style>
+
+        <text x="20" y="24" class="tier-lbl">binary / test harness</text>
+        <rect class="box" x="20" y="34" width="200" height="52" rx="10"></rect>
+        <text x="120" y="56" class="lbl" text-anchor="middle">config-server</text>
+        <text x="120" y="72" class="sub" text-anchor="middle">binary, supervision</text>
+
+        <rect class="box" x="820" y="34" width="200" height="52" rx="10"></rect>
+        <text x="920" y="56" class="lbl" text-anchor="middle">config-testkit</text>
+        <text x="920" y="72" class="sub" text-anchor="middle">harness, fault injection</text>
+
+        <text x="20" y="128" class="tier-lbl">client / transport</text>
+        <rect class="box" x="20" y="138" width="200" height="52" rx="10"></rect>
+        <text x="120" y="160" class="lbl" text-anchor="middle">config-client</text>
+        <text x="120" y="176" class="sub" text-anchor="middle">DirectClient, GrpcClient</text>
+
+        <rect class="box" x="420" y="138" width="200" height="52" rx="10"></rect>
+        <text x="520" y="160" class="lbl" text-anchor="middle">config-grpc</text>
+        <text x="520" y="176" class="sub" text-anchor="middle">tonic, protox, mTLS</text>
+
+        <rect class="box" x="820" y="138" width="200" height="52" rx="10"></rect>
+        <text x="920" y="160" class="lbl" text-anchor="middle">config-gossip</text>
+        <text x="920" y="176" class="sub" text-anchor="middle">memberlist adapter</text>
+
+        <text x="20" y="232" class="tier-lbl">consensus / storage</text>
+        <rect class="box" x="220" y="242" width="200" height="52" rx="10"></rect>
+        <text x="320" y="264" class="lbl" text-anchor="middle">config-engine</text>
+        <text x="320" y="280" class="sub" text-anchor="middle">OpenRaft lifecycle</text>
+
+        <rect class="box" x="620" y="242" width="200" height="52" rx="10"></rect>
+        <text x="720" y="264" class="lbl" text-anchor="middle">config-storage</text>
+        <text x="720" y="280" class="sub" text-anchor="middle">Ephemeral / RocksDB</text>
+
+        <text x="20" y="336" class="tier-lbl">foundation</text>
+        <rect class="box core" x="370" y="360" width="220" height="58" rx="12"></rect>
+        <text x="480" y="384" class="lbl" text-anchor="middle">config-core</text>
+        <text x="480" y="401" class="sub" text-anchor="middle">records, requests, errors, Command</text>
+
+        <rect class="box" x="640" y="360" width="180" height="58" rx="10"></rect>
+        <text x="730" y="384" class="lbl" text-anchor="middle">config-log</text>
+        <text x="730" y="401" class="sub" text-anchor="middle">tracing JSONL</text>
+
+        <!-- dependency arrows, all pointing inward -->
+        <path class="dep" d="M120,86 L120,138"></path>
+        <path class="dep" d="M170,138 C260,110 380,110 460,138"></path>
+        <path class="dep" d="M520,190 C500,220 460,240 420,258"></path>
+        <path class="dep" d="M920,86 L920,138"></path>
+        <path class="dep" d="M900,190 C820,230 780,235 730,242"></path>
+        <path class="dep" d="M320,294 L420,378"></path>
+        <path class="dep" d="M720,294 C700,320 640,345 590,378"></path>
+        <path class="dep" d="M730,360 C730,300 730,235 660,190"></path>
+        <path class="dep" d="M730,360 C730,280 620,190 560,160"></path>
+        <path class="dep" d="M480,360 C420,320 380,300 340,294"></path>
+        <path class="dep" d="M600,378 L590,378"></path>
+        <path class="dep" d="M120,190 C160,260 260,330 370,388"></path>
+        <path class="dep" d="M920,60 C700,10 300,10 120,60" opacity="0"></path>
+
+        <text x="1020" y="470" text-anchor="end" class="sub">grey = not started</text>
+      </svg>
+      <div class="diagram-caption">All crates currently grey — repository has no <code>crates/</code> directory yet (workspace scaffolding is next).</div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">3</span> Write path <span style="font-weight:500;color:var(--muted);font-size:13px;">— §8.1</span></h2>
+    <div class="diagram-panel">
+      <svg viewBox="0 0 1000 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Write path sequence diagram">
+        <style>
+          .actor { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+          .actor-lbl { fill: var(--text); font-size: 14px; font-weight: 700; }
+          .life { stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 4 4; }
+          .msg { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow2); }
+          .msg-lbl { fill: var(--text); font-size: 12.5px; }
+          .note { fill: var(--grey-soft); stroke: var(--border); }
+          .note-lbl { fill: var(--muted); font-size: 12px; font-style: italic; }
+        </style>
+        <defs>
+          <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+          </marker>
+        </defs>
+
+        <!-- actors -->
+        <g>
+          <rect class="actor" x="10" y="14" width="150" height="38" rx="8"></rect>
+          <text x="85" y="38" class="actor-lbl" text-anchor="middle">Client</text>
+          <line class="life" x1="85" y1="52" x2="85" y2="240"></line>
+        </g>
+        <g>
+          <rect class="actor" x="280" y="14" width="150" height="38" rx="8"></rect>
+          <text x="355" y="38" class="actor-lbl" text-anchor="middle">Leader</text>
+          <line class="life" x1="355" y1="52" x2="355" y2="240"></line>
+        </g>
+        <g>
+          <rect class="actor" x="550" y="14" width="150" height="38" rx="8"></rect>
+          <text x="625" y="38" class="actor-lbl" text-anchor="middle">OpenRaft</text>
+          <line class="life" x1="625" y1="52" x2="625" y2="240"></line>
+        </g>
+        <g>
+          <rect class="actor" x="820" y="14" width="150" height="38" rx="8"></rect>
+          <text x="895" y="38" class="actor-lbl" text-anchor="middle">State machine</text>
+          <line class="life" x1="895" y1="52" x2="895" y2="240"></line>
+        </g>
+
+        <path class="msg" d="M85,80 L355,80"></path>
+        <text x="90" y="74" class="msg-lbl">Put / Delete / CAS</text>
+
+        <path class="msg" d="M355,104 L625,104"></path>
+        <text x="360" y="98" class="msg-lbl">client_write(command)</text>
+
+        <rect class="note" x="600" y="114" width="180" height="30" rx="6"></rect>
+        <text x="690" y="133" class="note-lbl" text-anchor="middle">replicate + commit quorum</text>
+
+        <path class="msg" d="M625,158 L895,158"></path>
+        <text x="630" y="152" class="msg-lbl">apply committed entry</text>
+
+        <rect class="note" x="770" y="168" width="220" height="30" rx="6"></rect>
+        <text x="880" y="187" class="note-lbl" text-anchor="middle">one atomic synced batch</text>
+
+        <path class="msg" d="M895,212 L355,212"></path>
+        <text x="620" y="206" class="msg-lbl" text-anchor="middle">durable result</text>
+
+        <path class="msg" d="M355,232 L85,232"></path>
+        <text x="220" y="226" class="msg-lbl" text-anchor="middle">outcome + revision</text>
+      </svg>
+      <div class="diagram-caption">Success returns only after OpenRaft commit and durable state-machine apply. A deadline may yield an unknown outcome — clients never auto-replay; they re-read and use CAS.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">4</span> Read path + NotLeader flow <span style="font-weight:500;color:var(--muted);font-size:13px;">— ADR-0009</span></h2>
+    <div class="diagram-panel">
+      <svg viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Read path and NotLeader flow diagram">
+        <style>
+          .n { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
+          .n.start { fill: var(--accent-soft); stroke: var(--accent); }
+          .n.ok { fill: var(--green-soft); stroke: var(--green); }
+          .n.err { fill: var(--red-soft); stroke: var(--red); }
+          .n.warn { fill: var(--amber-soft); stroke: var(--amber); }
+          .nlbl { fill: var(--text); font-size: 13px; font-weight: 700; }
+          .elbl { fill: var(--muted); font-size: 12px; }
+          .e { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow3); }
+        </style>
+        <defs>
+          <marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+          </marker>
+        </defs>
+
+        <rect class="n start" x="20" y="20" width="200" height="46" rx="10"></rect>
+        <text x="120" y="48" class="nlbl" text-anchor="middle">Get / List request</text>
+
+        <rect class="n" x="300" y="20" width="230" height="46" rx="10"></rect>
+        <text x="415" y="43" class="nlbl" text-anchor="middle">Node: ensure_linearizable()</text>
+        <text x="415" y="58" class="elbl" text-anchor="middle">confirms leadership by quorum</text>
+
+        <path class="e" d="M220,43 L300,43"></path>
+
+        <!-- branch: this node is leader and quorum ok -->
+        <rect class="n ok" x="620" y="10" width="210" height="46" rx="10"></rect>
+        <text x="725" y="33" class="nlbl" text-anchor="middle">Read local KvState</text>
+        <text x="725" y="48" class="elbl" text-anchor="middle">returns record + read_revision</text>
+        <path class="e" d="M530,35 C560,25 590,20 620,25"></path>
+        <text x="560" y="16" class="elbl">leader, quorum ok</text>
+
+        <!-- branch: follower -->
+        <rect class="n warn" x="300" y="110" width="230" height="46" rx="10"></rect>
+        <text x="415" y="133" class="nlbl" text-anchor="middle">ForwardToLeader(id, node)</text>
+        <text x="415" y="148" class="elbl" text-anchor="middle">this node is a follower</text>
+        <path class="e" d="M415,66 L415,110"></path>
+        <text x="425" y="90" class="elbl">not leader</text>
+
+        <rect class="n err" x="620" y="110" width="210" height="46" rx="10"></rect>
+        <text x="725" y="133" class="nlbl" text-anchor="middle">NotLeader { hint }</text>
+        <text x="725" y="148" class="elbl" text-anchor="middle">hint = committed member endpoint</text>
+        <path class="e" d="M530,133 L620,133"></path>
+
+        <!-- branch: former leader cannot reach quorum -->
+        <rect class="n warn" x="300" y="200" width="230" height="46" rx="10"></rect>
+        <text x="415" y="223" class="nlbl" text-anchor="middle">Quorum unreachable</text>
+        <text x="415" y="238" class="elbl" text-anchor="middle">former / isolated leader</text>
+        <path class="e" d="M415,66 L415,200"></path>
+        <text x="270" y="180" class="elbl">no quorum</text>
+
+        <rect class="n err" x="620" y="200" width="210" height="46" rx="10"></rect>
+        <text x="725" y="223" class="nlbl" text-anchor="middle">Unavailable</text>
+        <text x="725" y="238" class="elbl" text-anchor="middle">never serves a strict read</text>
+        <path class="e" d="M530,223 L620,223"></path>
+
+        <text x="20" y="280" class="elbl">Client (GrpcClient) follows up to N=3 authenticated leader hints, then returns last error.</text>
+      </svg>
+      <div class="diagram-caption">No stale/follower reads exist in this release. Leader unknown → Unavailable.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">5</span> Team panel</h2>
+    <div class="team-grid" id="team-grid"></div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">6</span> Decision log</h2>
+    <table class="decisions">
+      <thead><tr><th>ADR</th><th>Title</th><th>Status</th></tr></thead>
+      <tbody id="decisions-body"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">7</span> Timeline</h2>
+    <ul class="timeline" id="timeline"></ul>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">8</span> Risks</h2>
+    <ul class="risks" id="risks"></ul>
+  </section>
+
+  <footer>rEtcd progress report — regenerated after each milestone gate. Data lives in the JSON block below; edit it in place for future updates.</footer>
+</div>
+
+<script id="progress-data" type="application/json">
+{
+  "project": "rEtcd",
+  "lastUpdatedISO": "2026-09-17T23:58:00-07:00",
+  "phase": "M0 — Deterministic state-machine laboratory (research)",
+  "milestones": [
+    {
+      "id": "M0",
+      "name": "Deterministic state-machine laboratory",
+      "status": "not_started",
+      "weightPct": 25,
+      "acceptance": [
+        "Replaying an identical command sequence yields byte-identical state and responses",
+        "Exactly one competing CAS on the same expected revision succeeds",
+        "Conflicts and missing deletes allocate no revision",
+        "Apply uses no clock, randomness, environment lookup, unordered output, or external I/O"
+      ],
+      "tests": { "unit": 0, "integration": 0, "e2e": 0 }
+    },
+    {
+      "id": "M1",
+      "name": "Three-node distributed core",
+      "status": "not_started",
+      "weightPct": 25,
+      "acceptance": [
+        "No empty node self-forms",
+        "One stopped voter does not stop committed writes",
+        "Isolated / former leader rejects successful strict reads and writes",
+        "Direct access demonstrably uses the same Raft path",
+        "False, missing, disabled, or partitioned gossip cannot alter membership, data, or leader choice",
+        "Capability output: durability=Ephemeral, watch_resumption=Unsupported, authz=Development"
+      ],
+      "tests": { "unit": 0, "integration": 0, "e2e": 0 }
+    },
+    {
+      "id": "M2",
+      "name": "Persistence and restart correctness",
+      "status": "not_started",
+      "weightPct": 25,
+      "acceptance": [
+        "Every acknowledged mutation survives ordinary stop/restart of each node",
+        "Committed-but-unapplied entries replay without duplicate public revisions",
+        "Injected crashes at vote sync, log append/flush, state batch boundaries lose nothing",
+        "Storage identity mismatch prevents startup",
+        "Capability output states durability=Persistent only after all M2 gates pass"
+      ],
+      "tests": { "unit": 0, "integration": 0, "e2e": 0 }
+    },
+    {
+      "id": "M3",
+      "name": "Safe remote use baseline — first release gate",
+      "status": "not_started",
+      "weightPct": 25,
+      "acceptance": [
+        "Wrong cluster, node, destination, and client identities are rejected",
+        "Direct and gRPC clients pass the same semantic conformance suite",
+        "A lost mutation response cannot trigger an automatic duplicate mutation",
+        "Static authorization denies unlisted principals and unauthorized key prefixes",
+        "Complete M0, M1, M2, and M3 suites pass together on the target VM and disk class"
+      ],
+      "tests": { "unit": 0, "integration": 0, "e2e": 0 }
+    }
+  ],
+  "team": [
+    { "role": "Lead / Architect", "model": "Fable", "activity": "Orchestrating M0–M3 build; owns ledger and milestone gates." },
+    { "role": "Arch Critic", "model": "Opus", "activity": "Idle — waiting on first M0 design to review." },
+    { "role": "Developer", "model": "Opus", "activity": "Idle — waiting on research to land before workspace scaffolding." },
+    { "role": "Tester Planner", "model": "Opus", "activity": "Active — drafting M0 test plan (conformance + determinism replay)." },
+    { "role": "Tester", "model": "Sonnet", "activity": "Idle — no test plan handed off yet." },
+    { "role": "Debugger", "model": "Opus", "activity": "Idle — no failures to investigate yet." },
+    { "role": "Progress", "model": "Sonnet", "activity": "Generating this report from DesignSpec-01, ADRs, and the ledger." }
+  ],
+  "researchAgents": [
+    { "name": "research-memberlist", "activity": "Researching memberlist 0.8.5 API for config-gossip." },
+    { "name": "research-openraft", "activity": "Researching OpenRaft 0.9.25 traits for config-storage / config-engine." }
+  ],
+  "decisions": [
+    { "number": "0000", "title": "ADR process and template", "status": "Accepted", "path": "../ADRs/0000-adr-process.md" },
+    { "number": "0001", "title": "Milestone-gated scope; first release is M0–M3", "status": "Accepted", "path": "../ADRs/0001-milestone-gated-scope.md" },
+    { "number": "0002", "title": "OpenRaft =0.9.25 is the sole authority", "status": "Accepted", "path": "../ADRs/0002-openraft-consensus.md" },
+    { "number": "0003", "title": "memberlist =0.8.5 gossip is advisory only", "status": "Accepted", "path": "../ADRs/0003-gossip-advisory-only.md" },
+    { "number": "0004", "title": "Workspace crates and dependency direction", "status": "Accepted", "path": "../ADRs/0004-workspace-boundaries.md" },
+    { "number": "0005", "title": "Public revision model", "status": "Accepted", "path": "../ADRs/0005-revision-model.md" },
+    { "number": "0006", "title": "Put/Delete/CAS semantics and outcomes", "status": "Accepted", "path": "../ADRs/0006-cas-semantics.md" },
+    { "number": "0007", "title": "Canonical versioned replicated command envelope", "status": "Accepted", "path": "../ADRs/0007-command-envelope.md" },
+    { "number": "0008", "title": "Storage — ephemeral (M1) and RocksDB (M2) layout and sync rules", "status": "Accepted", "path": "../ADRs/0008-storage-layout.md" },
+    { "number": "0009", "title": "Leader-linearizable reads and NotLeader hints", "status": "Accepted", "path": "../ADRs/0009-linearizable-reads.md" },
+    { "number": "0010", "title": "gRPC/Protobuf transport, protox, mTLS planes, error mapping", "status": "Accepted", "path": "../ADRs/0010-transport-grpc-mtls.md" },
+    { "number": "0011", "title": "Cluster/Node identity binding and static formation", "status": "Accepted", "path": "../ADRs/0011-identity-and-formation.md" },
+    { "number": "0012", "title": "Principal derivation and static allowlist", "status": "Accepted", "path": "../ADRs/0012-static-authorization.md" },
+    { "number": "0013", "title": "JSONL structured logging and cross-wire trace context", "status": "Accepted", "path": "../ADRs/0013-structured-logging-tracing.md" },
+    { "number": "0014", "title": "Test strategy — harnesses, conformance, E2E, fault injection", "status": "Accepted", "path": "../ADRs/0014-test-strategy.md" },
+    { "number": "0015", "title": "Unknown mutation outcome and no automatic replay", "status": "Accepted", "path": "../ADRs/0015-unknown-outcome-no-auto-retry.md" },
+    { "number": "0016", "title": "Capability reporting", "status": "Accepted", "path": "../ADRs/0016-capability-reporting.md" },
+    { "number": "0017", "title": "Build toolchain — MSVC, LLVM for RocksDB, no protoc", "status": "Accepted", "path": "../ADRs/0017-build-toolchain.md" }
+  ],
+  "timeline": [
+    { "ts": "2026-09-17 22:30", "text": "Session start — objective: finish config-server + library (M0–M3) per DesignSpec-01." },
+    { "ts": "2026-09-17 22:35", "text": "Toolchain survey done — Rust 1.93, VS2022 present; protoc and LLVM absent; duckdb CLI present." },
+    { "ts": "2026-09-17 23:00", "text": "LLVM install for RocksDB build dependency (ADR-0017)." },
+    { "ts": "2026-09-17 23:50", "text": "ADR-0000..0017 committed — architecture decisions for M0–M3 seeded." },
+    { "ts": "2026-09-17 23:55", "text": "Research agents launched — memberlist 0.8.5 and OpenRaft 0.9.25 API survey." }
+  ],
+  "risks": [
+    { "text": "HITL MCP tools unavailable this session; clarifying questions routed through chat instead. Goal hook says proceed without pausing.", "severity": "medium" },
+    { "text": "protoc is absent on this machine; build plan depends on protox (pure-Rust proto compilation) working end to end.", "severity": "medium" },
+    { "text": "libclang absent for RocksDB's bindgen step; plan is pip-installed libclang + LIBCLANG_PATH before falling back to a system LLVM install.", "severity": "medium" },
+    { "text": "OpenRaft 0.9.25 is pre-1.0 and its linearizable-read API must be verified by compile-time integration and partition tests before M1 acceptance can be trusted.", "severity": "high" }
+  ]
+}
+</script>
+
+<script>
+(function () {
+  var raw = document.getElementById('progress-data').textContent;
+  var data;
+  try { data = JSON.parse(raw); } catch (e) { console.error('progress-data JSON parse failed', e); return; }
+
+  var STATUS_LABEL = { not_started: 'Not started', in_progress: 'In progress', gate_passed: 'Gate passed' };
+
+  function fmtLocal(iso) {
+    try {
+      var d = new Date(iso);
+      return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    } catch (e) { return iso; }
+  }
+
+  // Header
+  document.getElementById('meta-line').textContent =
+    'Last updated ' + fmtLocal(data.lastUpdatedISO) + ' (local)';
+  document.getElementById('phase-pill').textContent = data.phase;
+
+  var track = document.getElementById('progress-track');
+  var totalDone = 0;
+  data.milestones.forEach(function (m) {
+    var seg = document.createElement('div');
+    var isDone = m.status === 'gate_passed';
+    seg.className = 'progress-seg ' + (isDone ? 'done' : 'pending');
+    seg.style.width = m.weightPct + '%';
+    seg.style.borderRight = '1px solid var(--bg)';
+    seg.textContent = isDone ? (m.id + ' ✓') : m.id;
+    if (isDone) totalDone += m.weightPct;
+    track.appendChild(seg);
+  });
+  document.getElementById('progress-pct').textContent = totalDone + '%';
+
+  // Milestone board
+  var board = document.getElementById('board');
+  data.milestones.forEach(function (m) {
+    var card = document.createElement('div');
+    card.className = 'card';
+    var accHtml = m.acceptance.map(function (a) {
+      return '<li><span class="box"></span><span>' + a + '</span></li>';
+    }).join('');
+    card.innerHTML =
+      '<div class="card-head"><span class="card-title">' + m.id + '</span>' +
+      '<span class="chip ' + m.status + '">' + (STATUS_LABEL[m.status] || m.status) + '</span></div>' +
+      '<div style="font-size:14px;color:var(--muted);margin-top:-6px;">' + m.name + '</div>' +
+      '<ul class="acc">' + accHtml + '</ul>' +
+      '<div class="tests">Tests — unit: ' + m.tests.unit + ' · integration: ' + m.tests.integration + ' · e2e: ' + m.tests.e2e + '</div>';
+    board.appendChild(card);
+  });
+
+  // Team panel (team + research agents)
+  var teamGrid = document.getElementById('team-grid');
+  data.team.forEach(function (t) {
+    var c = document.createElement('div');
+    c.className = 'team-card';
+    c.innerHTML =
+      '<div class="team-role">' + t.role + '</div>' +
+      '<div class="team-model">' + t.model + '</div>' +
+      '<div class="team-activity">' + t.activity + '</div>';
+    teamGrid.appendChild(c);
+  });
+  (data.researchAgents || []).forEach(function (r) {
+    var c = document.createElement('div');
+    c.className = 'team-card';
+    c.innerHTML =
+      '<div class="team-role">' + r.name + '</div>' +
+      '<div class="team-model">Research agent</div>' +
+      '<div class="team-activity">' + r.activity + '</div>';
+    teamGrid.appendChild(c);
+  });
+
+  // Decision log
+  var decBody = document.getElementById('decisions-body');
+  data.decisions.forEach(function (d) {
+    var tr = document.createElement('tr');
+    tr.innerHTML =
+      '<td>ADR-' + d.number + '</td>' +
+      '<td><a href="' + d.path + '">' + d.title + '</a></td>' +
+      '<td><span class="adr-status">' + d.status + '</span></td>';
+    decBody.appendChild(tr);
+  });
+
+  // Timeline
+  var tl = document.getElementById('timeline');
+  data.timeline.forEach(function (e) {
+    var li = document.createElement('li');
+    li.innerHTML = '<span class="ts">' + e.ts + '</span><span>' + e.text + '</span>';
+    tl.appendChild(li);
+  });
+
+  // Risks
+  var risks = document.getElementById('risks');
+  data.risks.forEach(function (r) {
+    var li = document.createElement('li');
+    li.className = r.severity === 'high' ? 'high' : '';
+    li.innerHTML = '<span class="sev">' + r.severity + '</span>' + r.text;
+    risks.appendChild(li);
+  });
+})();
+</script>
+</body>
+</html>

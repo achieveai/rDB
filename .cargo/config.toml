@@ -1,0 +1,3 @@
+# ADR-0017: RocksDB bindgen needs libclang; LLVM installed via winget on the dev host.
+[env]
+LIBCLANG_PATH = { value = "C:\\Program Files\\LLVM\\bin", force = false }
