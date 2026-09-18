@@ -5,7 +5,7 @@
 //! level** (root span first, leaf span last, so more specific spans override). That is what
 //! makes DuckDB queries like `WHERE testMethod = '...' AND trace_id = '...'` possible.
 //!
-//! * [`init`] installs the global subscriber for a process (daemon or embedder).
+//! * [`init()`] installs the global subscriber for a process (daemon or embedder).
 //! * [`testing`] provides the per-test root span (`testModule`, `testMethod`, `testRun`) and
 //!   the `#[retcd_test]` attribute re-exported from `config-log-macros`.
 //! * [`context`] provides [`TraceContext`] (`trace_id`, `span_id`, `request_id`) and the

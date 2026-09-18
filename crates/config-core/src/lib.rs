@@ -45,8 +45,8 @@ pub mod types;
 pub mod validate;
 
 pub use authz::{
-    Action, AllowAll, AllowlistPolicy, Authorizer, Decision, Grant, Principal, PrincipalKind,
-    StaticAllowlist,
+    audit, Action, AllowAll, AllowlistPolicy, Authorizer, Decision, Grant, Principal,
+    PrincipalKind, StaticAllowlist,
 };
 pub use capabilities::{
     Authz, Capabilities, Dedup, Durability, Pagination, TransportSecurity, WatchResumption,
@@ -65,4 +65,4 @@ pub use types::{
     DeleteRequest, GetRequest, GetResponse, ListRequest, ListResponse, MutationOutcome,
     MutationResponse, PutRequest, Record,
 };
-pub use validate::{validate_command, validate_delete, validate_list, validate_put};
+pub use validate::{validate_command, validate_delete, validate_get, validate_list, validate_put};

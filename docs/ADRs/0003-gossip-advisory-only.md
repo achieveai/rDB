@@ -102,3 +102,25 @@ Advertised metadata is a 1-byte `HINT_WIRE_VERSION` (currently 1) followed by th
 body, within the same 512-byte `MAX_HINT_BYTES` total. Decoding ignores trailing bytes (so a
 newer build may append fields) but refuses an unknown version byte with
 `HintDecodeError::UnsupportedVersion`. Both outcomes skip the peer and log; neither is fatal.
+
+### Note (2026-09-18, A10): a hint carries the recovery epoch, and wrong-epoch hints are rejected
+
+ADR-0011 makes a node's identity the pair `(ClusterId, RecoveryEpoch)`. `ObservedPeerHint`
+originally carried only `cluster_id`, so `validate_hint` could not tell a live peer from one
+that was fenced off during an unsafe recovery: the fenced peer keeps the cluster id, keeps its
+node id, and keeps advertising the pre-recovery endpoint, and every field a validator could
+look at matches. `ObservedPeerHint` now carries `recovery_epoch`, and `validate_hint` rejects a
+mismatch with reason `"recovery_epoch mismatch"` (`REASON_EPOCH_MISMATCH`), logged as
+`gossip_hint_rejected` like every other rejection.
+
+Ordering: the epoch check runs after `cluster_mismatch` and **before** `self_claim`. A peer
+stranded on the old epoch may well advertise a node id that has since been reassigned —
+possibly our own — and "wrong epoch" is the truthful diagnosis of that, not "impersonation".
+
+`HINT_WIRE_VERSION` stays at **1**. The field is inserted into the postcard body, which is not
+a backward-compatible change, but rEtcd has not shipped: there is no v1 encoder in existence to
+be incompatible with, and a `2` would be a version number nothing ever spoke. The format is
+actually guarded by the golden byte vector in `config-gossip/tests/gossip.rs`
+(`m1_gossip_09_hint_wire_format_golden_bytes`), which failed on this change and was updated
+deliberately. The epoch is a postcard varint, so the 512-byte `MAX_HINT_BYTES` budget is
+unaffected even at `u32::MAX` — asserted by `a10_recovery_epoch_round_trips_over_the_gossip_wire`.

@@ -74,19 +74,6 @@ async fn m1_04_explicit_formation_elects_a_leader_and_is_not_repeatable() {
     let cluster = Cluster::formed(3).await;
     let ids = cluster.ids();
 
-    cluster
-        .wait_for(
-            "committed membership on all three",
-            cluster.elections(8),
-            |c| {
-                c.metrics()
-                    .iter()
-                    .all(|m| m.membership_voter_ids.len() == 3)
-                    .then_some(())
-            },
-        )
-        .await;
-
     let membership: Vec<_> = ids.iter().map(|id| c_membership(&cluster, *id)).collect();
     for (id, view) in ids.iter().zip(&membership) {
         assert_eq!(
@@ -154,26 +141,37 @@ async fn m1_06_formation_requires_matching_identity() {
     cluster.shutdown().await;
 }
 
-/// M1-23, M1-26: a direct write really goes through Raft — one entry, on every node.
+/// M1-23, M1-26: a direct write really goes through Raft — the applied index advances, and
+/// advances on **every** node, not just the one the client talked to.
+///
+/// # Why nothing here counts entries exactly
+///
+/// A Raft cluster may hold an election at any moment, and a new leader appends a blank entry
+/// before it serves anything. `raft_log_len == before + 1` and `leader == the leader I saw a
+/// moment ago` are therefore assertions about *luck*, not about the write path: they pass on a
+/// quiet machine and fail on a loaded CI box while the system is behaving perfectly. So the
+/// leader is re-read inside every poll predicate, and every index claim is `>=`. What stays
+/// exact is what the write path actually determines: one command applied, revision 1.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m1_23_direct_write_advances_applied_index_on_all_nodes() {
     let cluster = Cluster::formed(3).await;
     let ids = cluster.ids();
-    let leader = cluster.leader();
 
     // Settle first: formation entries are still replicating, and a "before" taken mid-flight
-    // would make the +1 assertion meaningless.
-    let settled = cluster
+    // would make the advance assertion meaningless. The predicate re-reads the leader each
+    // time, so an election during the settle just restarts the agreement it is waiting for.
+    let (leader, settled) = cluster
         .wait_for(
-            "all nodes level after formation",
+            "a leader with every node level on its applied index",
             cluster.elections(8),
             |c| {
+                let leader = c.try_leader()?;
                 let idx = c.get_node(leader).applied_index();
                 (idx > 0
                     && c.ids()
                         .iter()
                         .all(|id| c.get_node(*id).applied_index() == idx))
-                .then_some(idx)
+                .then_some((leader, idx))
             },
         )
         .await;
@@ -192,22 +190,31 @@ async fn m1_23_direct_write_advances_applied_index_on_all_nodes() {
         "first mutation allocates cluster revision 1"
     );
 
+    // At least the entry this write produced. More is legal: an election in between appends a
+    // blank of its own, and that is not a failure of the write path.
+    let wanted = settled + 1;
     cluster
-        .wait_applied(&ids, settled + 1, cluster.elections(8))
+        .wait_applied(&ids, wanted, cluster.elections(8))
         .await;
 
     for (id, before_len) in ids.iter().zip(before) {
-        let m = cluster.get_node(*id).metrics();
-        assert_eq!(
-            m.raft_log_len,
-            before_len + 1,
-            "node {id} log grew by {} entries, not 1",
-            m.raft_log_len as i64 - before_len as i64
+        let node = cluster.get_node(*id);
+        let m = node.metrics();
+        // `applied_index()` reads the state machine, which is what "applied" means and what
+        // the wait above polled. `NodeMetrics::last_applied` is OpenRaft's metrics *watch*,
+        // published after the apply returns — asserting on it here would be asserting that the
+        // watch had already been delivered, which is a race, not a property of the write path.
+        assert!(
+            node.applied_index() >= wanted,
+            "node {id} applied index is {}, not past the settled {settled}",
+            node.applied_index()
         );
         assert!(
-            m.last_applied.expect("applied something").index > settled,
-            "node {id} did not advance last_applied"
+            m.raft_log_len > before_len,
+            "node {id} log did not grow: {} entries, was {before_len}",
+            m.raft_log_len
         );
+        // Exact, because an election appends a *blank* entry and blanks are not commands.
         assert_eq!(
             m.applied_commands, 1,
             "node {id} applied the wrong command count"
@@ -218,8 +225,9 @@ async fn m1_23_direct_write_advances_applied_index_on_all_nodes() {
         );
     }
 
-    // Read it back through the linearizable barrier on the leader.
-    let got = cluster.get(leader, "/a/k").await.expect("linearizable get");
+    // Read it back through the linearizable barrier, on whoever leads now.
+    let reader = cluster.wait_leader().await;
+    let got = cluster.get(reader, "/a/k").await.expect("linearizable get");
     assert_eq!(got.read_revision, 1);
     let record = got.record.expect("record present");
     assert_eq!(record.value, key("v1"));
@@ -426,9 +434,14 @@ async fn m1_37_capabilities_are_exactly_the_m1_profile() {
     cluster.shutdown().await;
 }
 
-/// M1-22: the embedded client is the same client — same validation, same Raft, same CAS.
+/// The embedded client is the same client — same validation, same Raft, same CAS.
+///
+/// Deliberately **not** named for a plan row: M1-22 is "a direct client does not follow
+/// hints", which `m1_17_follower_returns_not_leader_with_the_committed_endpoint` proves. This
+/// is a smoke test over the `DirectClient` surface, and the real conformance obligation is
+/// M1-44 (`conformance::run_all`), which runs from the testkit.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
-async fn m1_22_direct_client_conformance_smoke() {
+async fn m1_smoke_direct_client_conformance() {
     let cluster = Cluster::formed(3).await;
     let leader = cluster.leader();
     let client = cluster.get_node(leader).direct_client(principal());
@@ -534,6 +547,8 @@ async fn m1_obs_engine_and_raft_lines_carry_test_and_node_identity() {
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSONL line {l}: {e}")))
+        // The file accumulates across `cargo test` runs; judge only this run's lines.
+        .filter(|l: &serde_json::Value| l["testRun"] == config_log::testing::test_run_id())
         .collect();
     assert!(
         !lines.is_empty(),
@@ -590,6 +605,7 @@ async fn m1_19_a_hijacked_gossip_endpoint_never_reaches_a_client_hint() {
         fn peers(&self) -> Vec<config_core::ObservedPeerHint> {
             let mk = |id: u64, endpoint: &str| config_core::ObservedPeerHint {
                 cluster_id: common::cluster_id(),
+                recovery_epoch: common::recovery_epoch(),
                 node_id: config_core::NodeId(id),
                 peer_endpoint: endpoint.to_string(),
                 client_endpoint: None,
@@ -611,6 +627,7 @@ async fn m1_19_a_hijacked_gossip_endpoint_never_reaches_a_client_hint() {
     .await;
     cluster.form().await;
     cluster.wait_leader().await;
+    cluster.wait_formed().await;
 
     // Node 2 is a follower in every run: node 1 forms and therefore campaigns first, and the
     // assertion below does not depend on which node leads anyway.
@@ -676,4 +693,235 @@ async fn m1_19_a_hijacked_gossip_endpoint_never_reaches_a_client_hint() {
         .expect("no endpoint_mismatch line for the hijacked node");
     assert_eq!(rejected["peer_endpoint"], HIJACKED);
     assert_eq!(rejected["@l"], "Warning");
+}
+
+/// Every key/value this node has **applied locally**, read straight off its state machine.
+///
+/// Not a client call: a client `get` is leader-linearizable and a follower refuses it, so
+/// "the value is on all three nodes" can only be asserted against each node's own applied
+/// state. That is the claim M1-42 and M1-43 are actually making.
+fn applied_locally(cluster: &Cluster, id: config_core::NodeId, k: &str) -> Option<bytes::Bytes> {
+    let mut found = None;
+    cluster
+        .store(id)
+        .reader()
+        .with_state(&mut |s| found = s.get(&key(k)).map(|r| r.value.clone()));
+    found
+}
+
+/// M1-42: a graceful stop loses nothing that was acknowledged.
+///
+/// Five acknowledged revisions, then the leader is stopped the way an operator would stop it.
+/// The survivors elect a new leader and still hold all five — on their own state machines and
+/// through a linearizable read on the new leader.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1_42_graceful_stop_is_not_a_data_loss_event() {
+    const N: usize = 5;
+
+    let cluster = Cluster::formed(3).await;
+    let leader = cluster.wait_leader().await;
+
+    let mut acked = Vec::new();
+    for i in 0..N {
+        let resp = cluster
+            .put(leader, &format!("/a/k{i}"), &format!("v{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("put {i} on the leader: {e:?}"));
+        assert_eq!(resp.outcome, MutationOutcome::Applied);
+        acked.push(resp.revision);
+    }
+    assert_eq!(acked, (1..=N as u64).collect::<Vec<_>>());
+
+    let survivors: Vec<_> = cluster.followers();
+    assert_eq!(survivors.len(), 2, "a 3-node cluster has two survivors");
+    cluster.stop(leader).await;
+
+    // A new leader, and it is one of the survivors — not the node that just went away.
+    let new_leader = cluster
+        .wait_for(
+            "a new leader among the survivors",
+            cluster.elections(8),
+            |c| c.try_leader().filter(|id| survivors.contains(id)),
+        )
+        .await;
+
+    for (i, revision) in acked.iter().enumerate() {
+        let k = format!("/a/k{i}");
+        // Through the real client path, on the node that now leads.
+        let got = cluster
+            .get(new_leader, &k)
+            .await
+            .unwrap_or_else(|e| panic!("linearizable get of {k} after the stop: {e:?}"));
+        let record = got.record.unwrap_or_else(|| panic!("{k} was lost"));
+        assert_eq!(record.value, key(&format!("v{i}")));
+        assert_eq!(
+            record.mod_revision, *revision,
+            "{k} came back at a different revision than the one acknowledged"
+        );
+        // And on every survivor's own applied state, not only the one that answered.
+        for id in &survivors {
+            assert_eq!(
+                applied_locally(&cluster, *id, &k),
+                Some(key(&format!("v{i}"))),
+                "survivor {id} does not hold {k}"
+            );
+        }
+    }
+
+    cluster.shutdown().await;
+}
+
+/// M1-43: an Ephemeral node that restarts comes back **empty** and is refilled from the log.
+///
+/// This is the durability gate stated as a test rather than as a paragraph: the restarted
+/// node keeps its id and gets a brand new store, which is exactly what losing a process means
+/// when storage is in memory (ADR-0008). What must survive is the *cluster's* data, so every
+/// value written before the outage and during it is readable on all three nodes afterwards,
+/// and the three applied indexes converge.
+///
+/// The restart is a legal log revert from the leader's point of view — a follower whose log
+/// went backwards — which is why `config-engine` carries openraft's
+/// `loosen-follower-log-revert` as a **dev-dependency** feature (see the ADR-0008 note).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1_43_ephemeral_restart_loses_local_state_by_design() {
+    const BEFORE: usize = 3;
+    const DURING: usize = 2;
+
+    let mut cluster = Cluster::formed(3).await;
+    let ids = cluster.ids();
+    let leader = cluster.wait_leader().await;
+    let victim = *cluster
+        .followers()
+        .first()
+        .expect("a follower to restart, never the leader");
+
+    for i in 0..BEFORE {
+        cluster
+            .put(leader, &format!("/a/k{i}"), &format!("v{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("put {i} before the outage: {e:?}"));
+    }
+
+    // The outage. The remaining two are a quorum, so writes keep being acknowledged.
+    cluster.stop(victim).await;
+    for i in BEFORE..BEFORE + DURING {
+        cluster
+            .put(leader, &format!("/a/k{i}"), &format!("v{i}"))
+            .await
+            .unwrap_or_else(|e| panic!("put {i} during the outage: {e:?}"));
+    }
+
+    // Same id, new store: the restarted node genuinely starts from nothing.
+    cluster.restart(victim).await;
+    assert_eq!(
+        cluster.get_node(victim).applied_index(),
+        0,
+        "an Ephemeral restart that kept state would make M1 look durable"
+    );
+
+    // Re-replication: every node ends at the same applied index, and it is the leader's.
+    let converged = cluster
+        .wait_for(
+            "all three nodes level again after the restart",
+            cluster.elections(16),
+            |c| {
+                let leader = c.try_leader()?;
+                let idx = c.get_node(leader).applied_index();
+                (idx > 0
+                    && c.ids()
+                        .iter()
+                        .all(|id| c.get_node(*id).applied_index() == idx))
+                .then_some(idx)
+            },
+        )
+        .await;
+    assert!(converged >= (BEFORE + DURING) as u64);
+    cluster.wait_converged(&ids, cluster.elections(8)).await;
+
+    // Every value, on every node's own state machine — including the one that was wiped.
+    for i in 0..BEFORE + DURING {
+        let k = format!("/a/k{i}");
+        for id in &ids {
+            assert_eq!(
+                applied_locally(&cluster, *id, &k),
+                Some(key(&format!("v{i}"))),
+                "node {id} is missing {k} after the restart"
+            );
+        }
+    }
+    assert_eq!(
+        cluster.get_node(victim).metrics().applied_commands,
+        (BEFORE + DURING) as u64,
+        "the restarted node did not replay every command"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// M1-17/M1-19 in the other direction: the hint comes from **committed** membership, and the
+/// Raft core agrees with the state machine about what that is.
+///
+/// `RaftMetrics::membership_config` is the *effective* membership, which moves the moment an
+/// entry is appended. Asking the core for `membership_state.committed()` and comparing it to
+/// the state machine's `StoredMembership` is the only way to show the engine reads the
+/// committed one — the two sides of the boundary have to say the same thing, and the hint has
+/// to be derived from it (ADR-0009).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1_obs_hints_are_derived_from_committed_membership() {
+    let cluster = Cluster::formed(3).await;
+    let leader = cluster.wait_leader().await;
+    let follower = cluster.followers()[0];
+
+    for id in cluster.ids() {
+        let from_sm = c_membership(&cluster, id);
+        let from_core = cluster
+            .get_node(id)
+            .raft_committed_membership()
+            .await
+            .expect("the raft core answers for its committed membership");
+        assert_eq!(
+            from_sm, from_core,
+            "node {id}: the state machine and the raft core disagree about committed membership"
+        );
+        assert!(from_sm.is_formed(), "node {id} has no committed membership");
+    }
+
+    // The follower must know the leader before it can hint at one.
+    cluster
+        .wait_for(
+            "the follower to learn the leader",
+            cluster.elections(8),
+            |c| (c.get_node(follower).metrics().current_leader == Some(leader)).then_some(()),
+        )
+        .await;
+
+    let committed = cluster
+        .get_node(follower)
+        .raft_committed_membership()
+        .await
+        .expect("committed membership");
+    let hint = cluster
+        .get_node(follower)
+        .leader_hint()
+        .expect("a follower that knows the leader hints at it");
+
+    assert!(
+        committed.voters.contains(&hint.node_id),
+        "the hint names {:?}, which is not a committed voter {:?}",
+        hint.node_id,
+        committed.voters
+    );
+    assert_eq!(
+        Some(hint.endpoint.as_str()),
+        committed.client_endpoint_of(hint.node_id),
+        "the hint endpoint is not the committed client endpoint"
+    );
+    // The node set a client could be sent to *is* the committed voter set: nothing wider.
+    assert_eq!(
+        committed.voters,
+        cluster.ids().into_iter().collect(),
+        "committed voters drifted from the formed cluster"
+    );
+
+    cluster.shutdown().await;
 }

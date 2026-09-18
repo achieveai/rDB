@@ -392,7 +392,7 @@ impl KvState {
 
 /// Render a key as lowercase hex, truncated to [`KEY_HEX_MAX_BYTES`] so a log line can never
 /// carry a full large key (ADR-0013). Values are never rendered at all.
-fn key_hex(key: &[u8]) -> String {
+pub(crate) fn key_hex(key: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
     for byte in key.iter().take(KEY_HEX_MAX_BYTES) {

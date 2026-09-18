@@ -41,7 +41,7 @@ fn get_request() -> pb::GetRequest {
 }
 
 #[retcd_test]
-async fn every_config_error_maps_to_its_normative_status_code() {
+async fn m1_grpc_01_every_config_error_maps_to_its_normative_status_code() {
     let store = FakeStore::new();
     let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
     let mut client = dial(&server.endpoint).await;
@@ -120,7 +120,7 @@ async fn every_config_error_maps_to_its_normative_status_code() {
 }
 
 #[retcd_test]
-async fn not_leader_carries_the_leader_hint_as_metadata() {
+async fn m1_grpc_02_not_leader_carries_the_leader_hint_as_metadata() {
     let store = FakeStore::new();
     let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
     let mut client = dial(&server.endpoint).await;
@@ -128,7 +128,8 @@ async fn not_leader_carries_the_leader_hint_as_metadata() {
     store.set_error(Some(ConfigError::NotLeader {
         hint: Some(LeaderHint {
             node_id: NodeId(2),
-            endpoint: "127.0.0.1:7002".into(),
+            // A fixture, never dialed: the hint only has to survive the metadata round trip.
+            endpoint: "127.0.0.1:7002".into(), // testkit:allow-port
         }),
     }));
 
@@ -146,13 +147,13 @@ async fn not_leader_carries_the_leader_hint_as_metadata() {
             .metadata()
             .get(HEADER_LEADER_ENDPOINT)
             .and_then(|v| v.to_str().ok()),
-        Some("127.0.0.1:7002")
+        Some("127.0.0.1:7002") // testkit:allow-port
     );
 
     // And the client-side inverse reconstructs the same hint.
     let hint = config_grpc::leader_hint(&status).expect("hint is readable back");
     assert_eq!(hint.node_id, NodeId(2));
-    assert_eq!(hint.endpoint, "127.0.0.1:7002");
+    assert_eq!(hint.endpoint, "127.0.0.1:7002"); // testkit:allow-port
 
     // A hintless NotLeader carries no metadata at all, and must not be mistaken for a hint.
     store.set_error(Some(ConfigError::NotLeader { hint: None }));
@@ -161,7 +162,7 @@ async fn not_leader_carries_the_leader_hint_as_metadata() {
 }
 
 #[retcd_test]
-async fn conflict_and_not_found_outcomes_arrive_as_ok_responses() {
+async fn m1_grpc_03_conflict_and_not_found_outcomes_arrive_as_ok_responses() {
     let store = FakeStore::new();
     let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
     let mut client = dial(&server.endpoint).await;
@@ -200,7 +201,7 @@ async fn conflict_and_not_found_outcomes_arrive_as_ok_responses() {
 }
 
 #[retcd_test]
-async fn insecure_transport_yields_the_development_principal() {
+async fn m1_grpc_04_insecure_transport_yields_the_development_principal() {
     let store = FakeStore::new();
     let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
     let mut client = dial(&server.endpoint).await;
@@ -214,7 +215,7 @@ async fn insecure_transport_yields_the_development_principal() {
 }
 
 #[retcd_test]
-async fn trace_headers_reach_the_server_log_line() {
+async fn m1_grpc_05_trace_headers_reach_the_server_log_line() {
     let store = FakeStore::new();
     let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
     let mut client = dial(&server.endpoint).await;
@@ -238,7 +239,7 @@ async fn trace_headers_reach_the_server_log_line() {
     let path = config_log::layer::test_file_path(
         &config_log::testing::test_log_dir(),
         module_path!(),
-        "trace_headers_reach_the_server_log_line",
+        "m1_grpc_05_trace_headers_reach_the_server_log_line",
     );
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("test log {} is readable: {e}", path.display()));
@@ -279,7 +280,7 @@ async fn trace_headers_reach_the_server_log_line() {
     // queries in the test plan §5 work.
     assert_eq!(
         line.get("testMethod").and_then(Value::as_str),
-        Some("trace_headers_reach_the_server_log_line")
+        Some("m1_grpc_05_trace_headers_reach_the_server_log_line")
     );
 
     server.handle.shutdown().await.expect("clean shutdown");
@@ -288,12 +289,12 @@ async fn trace_headers_reach_the_server_log_line() {
 /// The server table and the client's inverse table must agree variant-for-variant; a
 /// mismatch would silently reclassify a "safe to resubmit" answer (ADR-0015).
 #[retcd_test]
-async fn status_mapping_round_trips_every_variant() {
+async fn m1_grpc_06_status_mapping_round_trips_every_variant() {
     let cases = vec![
         ConfigError::NotLeader {
             hint: Some(LeaderHint {
                 node_id: NodeId(3),
-                endpoint: "127.0.0.1:1".into(),
+                endpoint: "127.0.0.1:1".into(), // testkit:allow-port
             }),
         },
         ConfigError::NotLeader { hint: None },
@@ -348,4 +349,201 @@ async fn status_mapping_round_trips_every_variant() {
             _ => {}
         }
     }
+}
+
+/// ADR-0015: a status a *server* produced is marked, so the client can tell it apart from one
+/// the transport minted. Without the marker a reset connection and a node's own `UNAVAILABLE`
+/// are the same three letters, and only one of them is safe to resubmit.
+#[retcd_test]
+async fn m1_grpc_07_every_server_status_is_marked_as_a_rejection() {
+    let store = FakeStore::new();
+    let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
+    let mut client = dial(&server.endpoint).await;
+
+    let cases = [
+        ConfigError::Unavailable {
+            reason: "not formed".into(),
+        },
+        ConfigError::FatalStorage {
+            detail: "rocksdb io".into(),
+        },
+        ConfigError::NotLeader { hint: None },
+        ConfigError::InvalidArgument {
+            detail: "empty key".into(),
+        },
+    ];
+    for error in cases {
+        store.set_error(Some(error.clone()));
+        let status = client
+            .get(get_request())
+            .await
+            .expect_err("scripted error surfaces as a status");
+        assert!(
+            config_grpc::is_server_rejection(&status),
+            "{error:?} reached the client without {}",
+            config_grpc::HEADER_OUTCOME
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(config_grpc::HEADER_OUTCOME)
+                .and_then(|v| v.to_str().ok()),
+            Some(config_grpc::OUTCOME_REJECTED)
+        );
+    }
+
+    // The same table applied off the wire.
+    let marked = config_grpc::status_from_error(&ConfigError::NotFound);
+    assert!(config_grpc::is_server_rejection(&marked));
+    assert!(
+        !config_grpc::is_server_rejection(&tonic::Status::unavailable("a reset stream")),
+        "an unmarked status must never be read as a server decision"
+    );
+}
+
+/// Every field of every request must survive the hop. A conversion that dropped one would be
+/// invisible to a test that only checks the call succeeded.
+#[retcd_test]
+async fn m1_grpc_08_every_request_field_reaches_the_store() {
+    let store = FakeStore::new();
+    let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
+    let mut client = dial(&server.endpoint).await;
+
+    client
+        .get(pb::GetRequest {
+            key: Bytes::from_static(b"/app/get"),
+        })
+        .await
+        .expect("get");
+    assert_eq!(
+        store.last_get().expect("the store saw a get").key,
+        Bytes::from_static(b"/app/get")
+    );
+
+    client
+        .list(pb::ListRequest {
+            prefix: Bytes::from_static(b"/app/"),
+            max_items: 33,
+            max_bytes: 4096,
+        })
+        .await
+        .expect("list");
+    let list = store.last_list().expect("the store saw a list");
+    assert_eq!(list.prefix, Bytes::from_static(b"/app/"));
+    assert_eq!(list.max_items, 33);
+    assert_eq!(list.max_bytes, 4096);
+
+    client
+        .put(pb::PutRequest {
+            key: Bytes::from_static(b"/app/put"),
+            value: Bytes::from_static(b"value-bytes"),
+            expected_mod_revision: Some(17),
+        })
+        .await
+        .expect("put");
+    let put = store.last_put().expect("the store saw a put");
+    assert_eq!(put.key, Bytes::from_static(b"/app/put"));
+    assert_eq!(put.value, Bytes::from_static(b"value-bytes"));
+    assert_eq!(
+        put.expected_mod_revision,
+        Some(17),
+        "a dropped CAS precondition would turn a guarded write into a blind one"
+    );
+
+    client
+        .delete(pb::DeleteRequest {
+            key: Bytes::from_static(b"/app/delete"),
+            expected_mod_revision: Some(5),
+        })
+        .await
+        .expect("delete");
+    let delete = store.last_delete().expect("the store saw a delete");
+    assert_eq!(delete.key, Bytes::from_static(b"/app/delete"));
+    assert_eq!(delete.expected_mod_revision, Some(5));
+
+    // `None` is a different precondition from `Some(0)` and must not collapse into it.
+    client
+        .put(pb::PutRequest {
+            key: Bytes::from_static(b"/app/put"),
+            value: Bytes::from_static(b"v"),
+            expected_mod_revision: None,
+        })
+        .await
+        .expect("unguarded put");
+    assert_eq!(
+        store.last_put().expect("put").expected_mod_revision,
+        None,
+        "an absent precondition must not arrive as `must not exist`"
+    );
+}
+
+/// The mirror of the previous test: every response field the store produced must reach the
+/// caller unchanged.
+#[retcd_test]
+async fn m1_grpc_09_every_response_field_reaches_the_caller() {
+    let store = FakeStore::new();
+    let server = start_client_plane(store.clone(), TlsMode::Insecure).await;
+    let mut client = dial(&server.endpoint).await;
+
+    let record = config_core::Record {
+        key: Bytes::from_static(b"/app/a"),
+        value: Bytes::from_static(b"v1"),
+        create_revision: 4,
+        mod_revision: 9,
+    };
+    store.set_get(config_core::GetResponse {
+        record: Some(record.clone()),
+        read_revision: 21,
+    });
+    let response = client.get(get_request()).await.expect("get").into_inner();
+    assert_eq!(response.read_revision, 21);
+    let got: config_core::Record = response.record.expect("a record came back").into();
+    assert_eq!(got, record);
+
+    store.set_list(config_core::ListResponse {
+        records: vec![record.clone()],
+        read_revision: 22,
+        truncated: true,
+    });
+    let response = client
+        .list(pb::ListRequest {
+            prefix: Bytes::from_static(b"/app/"),
+            max_items: 1,
+            max_bytes: 0,
+        })
+        .await
+        .expect("list")
+        .into_inner();
+    assert_eq!(response.read_revision, 22);
+    assert!(response.truncated, "a lost `truncated` hides withheld rows");
+    assert_eq!(response.records.len(), 1);
+    assert_eq!(
+        config_core::Record::from(response.records[0].clone()),
+        record
+    );
+
+    store.set_mutation(MutationResponse::conflict(30, true, 29));
+    let response = client
+        .put(pb::PutRequest {
+            key: Bytes::from_static(b"/app/a"),
+            value: Bytes::from_static(b"v"),
+            expected_mod_revision: Some(1),
+        })
+        .await
+        .expect("a conflict outcome is an Ok response")
+        .into_inner();
+    let core: MutationResponse = response.try_into().expect("decodes back to core");
+    assert_eq!(core, MutationResponse::conflict(30, true, 29));
+
+    store.set_mutation(MutationResponse::not_found(31));
+    let response = client
+        .delete(pb::DeleteRequest {
+            key: Bytes::from_static(b"/app/missing"),
+            expected_mod_revision: None,
+        })
+        .await
+        .expect("a not-found outcome is an Ok response")
+        .into_inner();
+    let core: MutationResponse = response.try_into().expect("decodes back to core");
+    assert_eq!(core, MutationResponse::not_found(31));
 }

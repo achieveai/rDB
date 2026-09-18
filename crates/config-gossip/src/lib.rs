@@ -31,11 +31,14 @@
 //! # Example
 //!
 //! ```no_run
-//! use config_core::{ClusterId, GossipObservationSource, Liveness, NodeId, ObservedPeerHint};
+//! use config_core::{
+//!     ClusterId, GossipObservationSource, Liveness, NodeId, ObservedPeerHint, RecoveryEpoch,
+//! };
 //! use config_gossip::{GossipConfig, GossipNode};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! let cluster_id = ClusterId::from_bytes([1u8; 16]);
+//! let recovery_epoch = RecoveryEpoch(1);
 //! let node_id = NodeId(1);
 //! let mut cfg = GossipConfig::new(cluster_id, node_id, "127.0.0.1:7946".parse()?);
 //! cfg.secret_key = Some([7u8; 32]);
@@ -43,6 +46,7 @@
 //!
 //! let hint = ObservedPeerHint {
 //!     cluster_id,
+//!     recovery_epoch,
 //!     node_id,
 //!     peer_endpoint: "127.0.0.1:2380".into(),
 //!     client_endpoint: Some("127.0.0.1:2379".into()),

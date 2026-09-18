@@ -2,8 +2,8 @@
 //!
 //! OpenRaft asks for a connection per target; we answer with a value that carries the
 //! target's **committed** endpoint and the shared transport. Nothing here ever consults
-//! gossip: `new_client` is handed the `BasicNode` from committed membership, and that
-//! address is the only one dialed.
+//! gossip: `new_client` is handed the [`RaftNode`] from committed membership, and its
+//! `peer` address is the only one dialed.
 //!
 //! Error mapping is the load-bearing part (research §4):
 //!
@@ -18,14 +18,13 @@ use std::time::Duration;
 
 use config_core::{ClusterIdentity, NodeId};
 use config_log::TraceContext;
-use config_storage::{RaftNodeId, TypeConfig};
+use config_storage::{RaftNode, RaftNodeId, TraceRegistry, TypeConfig};
 use openraft::error::{Fatal, NetworkError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::BasicNode;
 use tracing::Instrument;
 
 use crate::transport::{
@@ -38,18 +37,20 @@ pub(crate) struct EngineNetworkFactory {
     pub(crate) identity: ClusterIdentity,
     pub(crate) transport: Arc<dyn PeerTransport>,
     pub(crate) span: tracing::Span,
+    pub(crate) traces: Arc<TraceRegistry>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for EngineNetworkFactory {
     type Network = EngineNetwork;
 
-    async fn new_client(&mut self, target: RaftNodeId, node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: RaftNodeId, node: &RaftNode) -> Self::Network {
         EngineNetwork {
             identity: self.identity,
             target: NodeId(target),
-            endpoint: node.addr.clone(),
+            endpoint: node.peer.clone(),
             transport: Arc::clone(&self.transport),
             span: self.span.clone(),
+            traces: Arc::clone(&self.traces),
         }
     }
 }
@@ -61,16 +62,48 @@ pub(crate) struct EngineNetwork {
     endpoint: String,
     transport: Arc<dyn PeerTransport>,
     span: tracing::Span,
+    traces: Arc<TraceRegistry>,
 }
 
 impl EngineNetwork {
-    fn meta(&self) -> PeerEnvelopeMeta {
+    /// The client trace this RPC is replicating, if it is unambiguous.
+    ///
+    /// Only when *every* command entry in the request maps to the same recorded client trace:
+    /// the receiving node cannot tell which of a batch's entries an envelope trace belongs to,
+    /// so a mixed batch propagates nothing rather than mislabelling entries. A heartbeat (no
+    /// command entries) also propagates nothing (ADR-0013; `config_storage::trace`).
+    fn client_trace_id(&self, req: &PeerRequest) -> Option<String> {
+        let PeerRequest::AppendEntries(rpc) = req else {
+            return None;
+        };
+        let mut found: Option<String> = None;
+        for entry in &rpc.entries {
+            let openraft::EntryPayload::Normal(cmd) = &entry.payload else {
+                continue;
+            };
+            let trace_id = self.traces.lookup(cmd)?;
+            match &found {
+                None => found = Some(trace_id),
+                Some(seen) if *seen == trace_id => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    fn meta(&self, req: &PeerRequest) -> PeerEnvelopeMeta {
+        // A replicated client write travels under the client's trace; anything else opens its
+        // own hop, which is still a truthful statement about why the entry moved.
+        let trace = match self.client_trace_id(req) {
+            Some(trace_id) => TraceContext::from_headers(Some(&trace_id), None, None),
+            None => TraceContext::current_or_root().child(),
+        };
         PeerEnvelopeMeta {
             cluster_id: self.identity.cluster_id,
             recovery_epoch: self.identity.recovery_epoch,
             from: self.identity.node_id,
             to: self.target,
-            trace: TraceContext::current_or_root().child(),
+            trace,
         }
     }
 
@@ -80,7 +113,7 @@ impl EngineNetwork {
         deadline: Duration,
     ) -> Result<PeerResponse, TransportError> {
         let rpc = req.kind();
-        let meta = self.meta();
+        let meta = self.meta(&req);
         self.transport
             .send(meta, &self.endpoint, req, deadline)
             .instrument(tracing::debug_span!(
@@ -98,7 +131,7 @@ impl EngineNetwork {
 fn to_rpc_error<E>(
     target: NodeId,
     err: TransportError,
-) -> RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, E>>
+) -> RPCError<RaftNodeId, RaftNode, RaftError<RaftNodeId, E>>
 where
     E: std::error::Error,
 {
@@ -125,7 +158,7 @@ fn wrong_variant<E>(
     target: NodeId,
     expected: &'static str,
     got: &'static str,
-) -> RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId, E>>
+) -> RPCError<RaftNodeId, RaftNode, RaftError<RaftNodeId, E>>
 where
     E: std::error::Error,
 {
@@ -141,12 +174,12 @@ impl RaftNetwork<TypeConfig> for EngineNetwork {
         option: RPCOption,
     ) -> Result<
         AppendEntriesResponse<RaftNodeId>,
-        RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>,
+        RPCError<RaftNodeId, RaftNode, RaftError<RaftNodeId>>,
     > {
         let resp = self
             .call(PeerRequest::AppendEntries(rpc), option.hard_ttl())
             .await
-            .map_err(|e| to_rpc_error(self.target, e))?;
+            .map_err(|e| self.span.in_scope(|| to_rpc_error(self.target, e)))?;
         match resp {
             PeerResponse::AppendEntries(r) => Ok(r),
             other => Err(wrong_variant(self.target, "append_entries", other.kind())),
@@ -157,12 +190,12 @@ impl RaftNetwork<TypeConfig> for EngineNetwork {
         &mut self,
         rpc: VoteRequest<RaftNodeId>,
         option: RPCOption,
-    ) -> Result<VoteResponse<RaftNodeId>, RPCError<RaftNodeId, BasicNode, RaftError<RaftNodeId>>>
+    ) -> Result<VoteResponse<RaftNodeId>, RPCError<RaftNodeId, RaftNode, RaftError<RaftNodeId>>>
     {
         let resp = self
             .call(PeerRequest::Vote(rpc), option.hard_ttl())
             .await
-            .map_err(|e| to_rpc_error(self.target, e))?;
+            .map_err(|e| self.span.in_scope(|| to_rpc_error(self.target, e)))?;
         match resp {
             PeerResponse::Vote(r) => Ok(r),
             other => Err(wrong_variant(self.target, "vote", other.kind())),
@@ -177,7 +210,7 @@ impl RaftNetwork<TypeConfig> for EngineNetwork {
         InstallSnapshotResponse<RaftNodeId>,
         RPCError<
             RaftNodeId,
-            BasicNode,
+            RaftNode,
             RaftError<RaftNodeId, openraft::error::InstallSnapshotError>,
         >,
     > {
@@ -187,7 +220,7 @@ impl RaftNetwork<TypeConfig> for EngineNetwork {
         let resp = self
             .call(PeerRequest::InstallSnapshot(rpc), option.hard_ttl())
             .await
-            .map_err(|e| to_rpc_error(self.target, e))?;
+            .map_err(|e| self.span.in_scope(|| to_rpc_error(self.target, e)))?;
         match resp {
             PeerResponse::InstallSnapshot(r) => Ok(r),
             other => Err(wrong_variant(self.target, "install_snapshot", other.kind())),

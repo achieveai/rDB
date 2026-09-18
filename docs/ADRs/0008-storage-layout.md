@@ -69,3 +69,45 @@ Rules (§9.3 invariants → implementation):
 OpenRaft 0.9.25 requires `NodeId: Default`. `config_core::NodeId` deliberately has no
 `Default` (a `NodeId(0)` footgun), so the Raft plane uses `RaftNodeId = u64`
 (`config_storage::TypeConfig`) and converts at the engine boundary. Ratified by the lead.
+
+### Note (2026-09-18, revised): `loosen-follower-log-revert` is a **test-only** feature
+
+**Why it is needed at all.** OpenRaft's leader asserts that a follower's log never goes
+backwards. When it does, `debug_assert` fires and the leader's core task aborts. An
+`EphemeralStore` restart is exactly that event by construction: the node comes back under the
+same id with an empty log (test plan M1-09, M1-43). Without the feature those tests cannot
+express the behaviour M1 is specified to have.
+
+**Why relaxing it is acceptable — and only here.** The assertion detects a real fault: a voter
+that silently lost its log is a voter that may have lost an acknowledged write. Relaxing it in
+a *shipped* binary would mean a production leader could no longer distinguish "this follower
+was wiped" from "this follower is fine". Relaxing it in a *test* binary costs nothing, because
+the wipe is the thing the test deliberately caused.
+
+**How it is scoped.** The feature is **not** in the workspace `openraft` dependency. It is a
+`[dev-dependencies]` feature of exactly two crates — `config-engine` and `config-testkit` —
+which are the only crates whose tests restart a node onto a fresh store. Cargo's v2 resolver
+does not unify dev-dependency features into a normal build, so `cargo build` compiles openraft
+with the assertion intact and only `cargo test` relaxes it. Observed:
+
+```text
+$ cargo tree -e features -p config-engine --edges normal | grep -c loosen   # cargo build
+0
+$ cargo tree -e features -p config-engine | grep -c loosen                  # cargo test
+1
+$ cargo tree -e features -p config-testkit --edges normal | grep -c loosen
+0
+$ cargo tree -e features -p config-testkit | grep -c loosen
+1
+```
+
+**Which tests guard it.** `config-engine`'s `m1_43_ephemeral_restart_loses_local_state_by_design`
+(a follower is stopped, restarted under the same id on a brand new store, and must be
+re-replicated to the leader's applied index) and the M1-09 cluster row in `config-testkit`. If
+either crate stopped restarting nodes, the dev-dependency line should be deleted with it.
+
+**M2 and beyond.** With `RocksStore` a restart reopens the same directory, so a log revert can
+only follow a lost disk — which identity binding (ADR-0011) treats as an operator event that
+must be handled explicitly, not absorbed by a relaxed assertion. Nothing in the M2+ production
+path depends on the feature, and the scoping above is what keeps that true by construction
+rather than by review.

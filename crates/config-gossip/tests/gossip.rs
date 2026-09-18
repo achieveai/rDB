@@ -22,7 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use config_core::hint::{GossipObservationSource, Liveness, ObservedPeerHint};
-use config_core::identity::{ClusterId, NodeId};
+use config_core::identity::{ClusterId, NodeId, RecoveryEpoch};
 use config_gossip::{
     decode_hint, encode_hint, GossipConfig, GossipError, GossipNode, HintDecodeError,
     StaticObservationSource, HINT_WIRE_VERSION, MAX_HINT_BYTES,
@@ -114,6 +114,7 @@ fn fake_client_endpoint(node_id: u64) -> String {
 fn hint(node_id: u64) -> ObservedPeerHint {
     ObservedPeerHint {
         cluster_id: cluster(),
+        recovery_epoch: RecoveryEpoch(1),
         node_id: NodeId(node_id),
         peer_endpoint: fake_endpoint(node_id),
         client_endpoint: Some(fake_client_endpoint(node_id)),
@@ -580,6 +581,7 @@ fn m1_gossip_08_meta_round_trips_within_budget() {
 fn m1_gossip_09_hint_wire_format_golden_bytes() {
     let golden_hint = ObservedPeerHint {
         cluster_id: ClusterId::from_bytes([0x5a; 16]),
+        recovery_epoch: RecoveryEpoch(1),
         node_id: NodeId(2),
         peer_endpoint: "node-2.retcd.invalid".into(),
         client_endpoint: None,
@@ -638,11 +640,53 @@ fn m1_gossip_10_wire_version_is_checked_and_trailing_bytes_ignored() {
 }
 
 /// Golden encoding of the hint in [`m1_gossip_09_hint_wire_format_golden_bytes`]:
-/// `HINT_WIRE_VERSION`, then postcard (16 raw cluster-id bytes, varint node id,
-/// length-prefixed strings, option tags, varint protocol version, enum discriminant).
-const GOLDEN_HINT_V1: [u8; 49] = [
+/// `HINT_WIRE_VERSION`, then postcard (16 raw cluster-id bytes, **varint recovery epoch**,
+/// varint node id, length-prefixed strings, option tags, varint protocol version, enum
+/// discriminant).
+///
+/// A10 added `recovery_epoch` as byte 17 without bumping `HINT_WIRE_VERSION`: rEtcd has not
+/// shipped, so there is no v1 encoder anywhere to be incompatible with, and a `2` would be a
+/// version number nothing ever spoke. The golden vector is what actually guards the format —
+/// it fails loudly on any layout change, which is how this change was caught and updated.
+const GOLDEN_HINT_V1: [u8; 50] = [
     0x01, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
-    0x5a, 0x02, 0x14, 0x6e, 0x6f, 0x64, 0x65, 0x2d, 0x32, 0x2e, 0x72, 0x65, 0x74, 0x63, 0x64, 0x2e,
-    0x69, 0x6e, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x00, 0x05, 0x30, 0x2e, 0x31, 0x2e, 0x30, 0x01, 0x00,
-    0x00,
+    0x5a, 0x01, 0x02, 0x14, 0x6e, 0x6f, 0x64, 0x65, 0x2d, 0x32, 0x2e, 0x72, 0x65, 0x74, 0x63, 0x64,
+    0x2e, 0x69, 0x6e, 0x76, 0x61, 0x6c, 0x69, 0x64, 0x00, 0x05, 0x30, 0x2e, 0x31, 0x2e, 0x30, 0x01,
+    0x00, 0x00,
 ];
+
+/// A10: the recovery epoch survives the gossip wire, and two hints that differ only in their
+/// epoch encode to different bytes. Without this the engine's epoch check would be validating
+/// a field the transport had silently dropped.
+#[config_log::retcd_test]
+fn a10_recovery_epoch_round_trips_over_the_gossip_wire() {
+    let mut at_1 = hint(5);
+    at_1.recovery_epoch = RecoveryEpoch(1);
+    let mut at_2 = at_1.clone();
+    at_2.recovery_epoch = RecoveryEpoch(2);
+
+    let enc_1 = encode_hint(&at_1).expect("encode");
+    let enc_2 = encode_hint(&at_2).expect("encode");
+    assert_ne!(
+        enc_1, enc_2,
+        "hints differing only in recovery_epoch must not encode identically"
+    );
+
+    assert_eq!(decode_hint(&enc_1).expect("decode"), at_1);
+    assert_eq!(
+        decode_hint(&enc_2).expect("decode").recovery_epoch,
+        RecoveryEpoch(2)
+    );
+    assert!(enc_2.len() <= MAX_HINT_BYTES);
+
+    // A large epoch is still a varint, so the 512-byte budget is not at risk.
+    let mut at_max = at_1.clone();
+    at_max.recovery_epoch = RecoveryEpoch(u32::MAX);
+    let enc_max = encode_hint(&at_max).expect("encode");
+    assert!(
+        enc_max.len() <= MAX_HINT_BYTES,
+        "u32::MAX epoch encodes to {} bytes",
+        enc_max.len()
+    );
+    assert_eq!(decode_hint(&enc_max).expect("decode"), at_max);
+}

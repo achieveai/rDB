@@ -69,3 +69,53 @@ hyper spawns one task per connection and Tokio tasks do not inherit `tracing` sp
 `serve_client_plane` / `serve_peer_plane` capture `Span::current()` at call time and parent
 every RPC span to it. Call them inside the node span (or the `#[retcd_test]` span) or RPC
 lines lose `node_id` / `testMethod`.
+
+### Note (2026-09-18): what `node_id` is required on, and how M1-48 enforces it
+
+The mandatory-context list above says "`node_id`". Test plan §5's query Q2 turns that into an
+assertion, so the list needs a precise scope. The enforced rule, as written in
+`config-testkit/tests/m1_observability.rs::m1_48_every_log_line_carries_test_context`:
+
+- **Required:** every line on a `config_engine*`, `config_grpc*`, or `config_gossip*` target
+  carries `node_id`. These crates only ever do work on some node's behalf, so a line from them
+  without a node is unattributable.
+- **Exempt (no node exists):** `config_core*` and `config_storage*`. Both are also exercised as
+  plain libraries with no node at all — `config_core::state`'s apply tests, `config-storage`'s
+  store tests — and inventing a `node_id` for a `KvState` unit test would be a false statement.
+  When a store is opened by a node it logs inside that node's span and its lines *do* carry
+  `node_id`; that is asserted separately (M1-47 reads `node_id` off apply lines on all three
+  nodes, and M2-20 off the persistent store).
+- **Exempt (third party):** `openraft*`, `memberlist*` — per the note above. OpenRaft's
+  `sm::worker` in particular runs on its own task outside the node span.
+- **`NetFault`:** a fault rule always has an originating side (`from`, or `a` for a pair), and
+  that side is the `node_id`; `from`/`to` are kept alongside it. `unblock_all` has no single
+  subject, so it emits **one line per node whose rules it cleared** rather than one anonymous
+  line — see `config_engine::netfault`'s module docs.
+
+Q2 is split in two because the two halves have different natural scopes:
+
+- The `node_id` half is scoped to the current test run via
+  `config_testkit::logs::current_run_filter()`. `target/test-logs` is never truncated between
+  `cargo test` invocations, so a repo-wide `node_id` assertion is not an assertion about the
+  code under test — it would fail on output written by any earlier build, including ones that
+  predate a fix, and it would pass or fail depending on whether someone ran `cargo clean`. It
+  is not hermetic, so it is not a test.
+- The missing-test-context half stays repo-wide (still restricted to the three node-scoped
+  targets), because the fields it hunts for are exactly the ones that would be NULL: a line
+  that escaped its test context cannot be found by filtering on `testRun`.
+
+Because a scoped query can pass vacuously, the test also asserts the run produced a non-zero
+number of node-scoped lines before trusting either result.
+
+### Note (2026-09-18): trace context on the apply path (M1-47)
+
+A client's `trace_id` must appear on the leader's client-operation line and on the apply line
+of every node. The replicated `Command` does not carry it: ADR-0007 makes the command's canonical
+bytes the determinism oracle, and a per-request trace would make identical logical writes encode
+differently. Instead each store owns a bounded side table (`config_storage::TraceRegistry`,
+1024 entries, FIFO) keyed by a fingerprint of the command bytes. The leader records
+`fingerprint -> trace_id` when it accepts the write; the replication envelope already carries a
+`TraceContext`, so a follower records the same mapping on ingress and the apply line reads it
+back. Two identical commands share a fingerprint (the newest trace wins), and a replication
+batch whose entries map to different traces propagates the RPC's own trace rather than
+mislabelling entries. Both limits are accepted: the table is observability, never correctness.

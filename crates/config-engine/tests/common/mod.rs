@@ -31,11 +31,17 @@ pub fn cluster_id() -> ClusterId {
     ClusterId::from_bytes([7u8; 16])
 }
 
+/// The recovery epoch every harness cluster runs at (ADR-0011). Fixed for the same reason as
+/// [`cluster_id`]: the tests that matter are about *mismatched* epochs.
+pub fn recovery_epoch() -> RecoveryEpoch {
+    RecoveryEpoch(1)
+}
+
 /// The identity of node `id` in the harness cluster.
 pub fn identity(node_id: u64) -> ClusterIdentity {
     ClusterIdentity {
         cluster_id: cluster_id(),
-        recovery_epoch: RecoveryEpoch(1),
+        recovery_epoch: recovery_epoch(),
         node_id: NodeId(node_id),
     }
 }
@@ -170,7 +176,30 @@ impl Cluster {
         let cluster = Cluster::start(n).await;
         cluster.form().await;
         cluster.wait_leader().await;
+        cluster.wait_formed().await;
         cluster
+    }
+
+    /// Wait until every node has *applied* the membership entry.
+    ///
+    /// Not the same as "a leader exists", and not the same as
+    /// `NodeMetrics::membership_voter_ids`: that is OpenRaft's **effective** membership, which
+    /// is set the moment the entry is appended. Committed membership is what hints, health and
+    /// the formation gate read (ADR-0009), and it lags the append by a replication round —
+    /// so a test that asserts on it has to wait for it.
+    pub async fn wait_formed(&self) {
+        let n = self.nodes.len();
+        self.wait_for(
+            "committed membership on every node",
+            self.elections(8),
+            |c| {
+                c.nodes
+                    .values()
+                    .all(|node| node.committed_membership().voters.len() == n)
+                    .then_some(())
+            },
+        )
+        .await;
     }
 
     /// The first node that reports itself leader, within `8` election timeouts.
@@ -255,7 +284,7 @@ impl Cluster {
                     self.metrics()
                 );
             }
-            tokio::time::sleep(STEP).await;
+            tokio::time::sleep(STEP).await; // testkit:allow-sleep
         }
     }
 
@@ -275,7 +304,7 @@ impl Cluster {
                     self.metrics()
                 );
             }
-            tokio::time::sleep(STEP).await;
+            tokio::time::sleep(STEP).await; // testkit:allow-sleep
         }
     }
 
@@ -332,6 +361,28 @@ impl Cluster {
         self.nodes[&id].stop().await.expect("stop");
     }
 
+    /// Restart a stopped node under the **same** id on a **brand new** [`EphemeralStore`].
+    ///
+    /// That is what an Ephemeral restart is: the process comes back with its identity and
+    /// nothing else, and the leader has to re-replicate the whole log into it (ADR-0008,
+    /// M1-43). The node is re-registered on the transport, so peers can reach it again.
+    ///
+    /// Takes `&mut self` because the old [`ConfigNode`] and its store are *replaced*: keeping
+    /// a handle to the dead node around is exactly the mistake this models the absence of.
+    pub async fn restart(&mut self, id: NodeId) {
+        self.stop(id).await;
+        let (node, store) = start_one(
+            identity(id.0),
+            self.timers,
+            Arc::clone(&self.transport),
+            Arc::new(NoGossip),
+        )
+        .await;
+        self.transport.register(id, node.peer_handler());
+        self.nodes.insert(id, node);
+        self.stores.insert(id, store);
+    }
+
     /// Stop every node. Called at the end of each test so nothing outlives the runtime.
     pub async fn shutdown(&self) {
         for node in self.nodes.values() {
@@ -341,6 +392,25 @@ impl Cluster {
 
     pub fn store(&self, id: NodeId) -> &EphemeralStore {
         &self.stores[&id]
+    }
+}
+
+/// Poll `predicate` every [`STEP`] until it yields, or panic naming `what` and the wait.
+///
+/// The single-node counterpart of [`Cluster::wait_for`], for the tests that build one node
+/// directly instead of a cluster. Deadline-bounded, never a fixed sleep (test plan §6).
+pub async fn poll_until<T>(what: &str, deadline: Duration, predicate: impl Fn() -> Option<T>) -> T {
+    let started = Instant::now();
+    loop {
+        if let Some(v) = predicate() {
+            return v;
+        }
+        assert!(
+            started.elapsed() < deadline,
+            "timed out after {:?} waiting for {what}",
+            started.elapsed()
+        );
+        tokio::time::sleep(STEP).await; // testkit:allow-sleep
     }
 }
 
@@ -354,12 +424,23 @@ pub async fn start_one(
     transport: Arc<InProcTransport>,
     gossip: Arc<dyn GossipObservationSource>,
 ) -> (ConfigNode, EphemeralStore) {
-    let store = EphemeralStore::new(
+    start_one_with(
         identity,
-        config_core::Limits::DEFAULT,
-        Arc::new(NoFaults),
-        tracing::info_span!("store", node_id = identity.node_id.0),
-    );
+        timers,
+        transport,
+        gossip,
+        Arc::new(AllowAll),
+        |_| {},
+    )
+    .await
+}
+
+/// The harness node config: everything [`start_one`] sets, without starting anything.
+///
+/// Exposed so a test that needs a *different* node (another authorization model, a second
+/// listener on the client plane) builds the same node in the same way and changes one field,
+/// instead of growing a second slightly-different fixture.
+pub fn node_config(identity: ClusterIdentity, timers: RaftTimers) -> NodeConfig {
     let mut cfg = NodeConfig::new(identity, InProcTransport::endpoint(identity.node_id));
     cfg.raft = timers;
     // Short enough that a test against an unreachable quorum finishes inside the 10 s budget,
@@ -368,12 +449,32 @@ pub async fn start_one(
     cfg.write_timeout = Duration::from_secs(2);
     // Fast enough that a hint-validation assertion does not dominate the test's runtime.
     cfg.gossip_poll = Duration::from_millis(100);
+    cfg
+}
+
+/// [`start_one`] with an explicit authorizer and a last-minute tweak to the config.
+pub async fn start_one_with(
+    identity: ClusterIdentity,
+    timers: RaftTimers,
+    transport: Arc<InProcTransport>,
+    gossip: Arc<dyn GossipObservationSource>,
+    authorizer: Arc<dyn config_core::Authorizer>,
+    tweak: impl FnOnce(&mut NodeConfig),
+) -> (ConfigNode, EphemeralStore) {
+    let store = EphemeralStore::new(
+        identity,
+        config_core::Limits::DEFAULT,
+        Arc::new(NoFaults),
+        tracing::info_span!("store", node_id = identity.node_id.0),
+    );
+    let mut cfg = node_config(identity, timers);
+    tweak(&mut cfg);
     let node = ConfigNode::start(
         cfg,
         StorageHandle::from(store.clone()),
         transport,
         gossip,
-        Arc::new(AllowAll),
+        authorizer,
     )
     .await
     .expect("node start");

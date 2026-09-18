@@ -41,6 +41,8 @@ impl HintVerdict {
 
 /// The hint claims a different cluster.
 pub const REASON_CLUSTER_MISMATCH: &str = "cluster_mismatch";
+/// The hint claims our cluster at a different recovery epoch (ADR-0011).
+pub const REASON_EPOCH_MISMATCH: &str = "recovery_epoch mismatch";
 /// The hint claims a node id that is not a committed voter.
 pub const REASON_UNKNOWN_NODE: &str = "unknown_node";
 /// The hint advertises a peer endpoint other than the committed one.
@@ -54,7 +56,8 @@ pub const REASON_NOT_FORMED: &str = "not_formed";
 ///
 /// Pure: same inputs, same verdict, no I/O and no clock. The checks are ordered from the
 /// cheapest and most damning to the most specific, so the reported reason names the first
-/// thing that was actually wrong.
+/// thing that was actually wrong: wrong cluster, then wrong epoch of the right cluster
+/// (ADR-0011's identity is the *pair*), then self-claim, then membership questions.
 pub fn validate_hint(
     hint: &ObservedPeerHint,
     membership: &MembershipView,
@@ -63,6 +66,14 @@ pub fn validate_hint(
     if hint.cluster_id != identity.cluster_id {
         return HintVerdict::Rejected {
             reason: REASON_CLUSTER_MISMATCH,
+        };
+    }
+    // Checked before `self_claim`: a peer stranded on the pre-recovery epoch may well be
+    // advertising *our* node id (it still believes the old membership), and "wrong epoch" is
+    // the truthful diagnosis of that, not "someone is impersonating me".
+    if hint.recovery_epoch != identity.recovery_epoch {
+        return HintVerdict::Rejected {
+            reason: REASON_EPOCH_MISMATCH,
         };
     }
     if hint.node_id == identity.node_id {

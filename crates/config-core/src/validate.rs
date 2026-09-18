@@ -20,7 +20,7 @@
 use crate::command::Command;
 use crate::error::ConfigError;
 use crate::limits::Limits;
-use crate::types::{DeleteRequest, ListRequest, PutRequest};
+use crate::types::{DeleteRequest, GetRequest, ListRequest, PutRequest};
 
 /// Validate the key shared by every mutation and read.
 ///
@@ -50,6 +50,14 @@ fn validate_request_size(cmd: &Command, limits: &Limits) -> Result<(), ConfigErr
         )));
     }
     Ok(())
+}
+
+/// Validate a [`GetRequest`]: the key rules only (spec §7.1).
+///
+/// Shared by `DirectClient` and the gRPC service so both edges reject the same inputs with
+/// the same error, before any authorization or Raft work.
+pub fn validate_get(req: &GetRequest, limits: &Limits) -> Result<(), ConfigError> {
+    validate_key(&req.key, limits)
 }
 
 /// Validate a [`PutRequest`] (spec §7.1 caps, ADR-0006).

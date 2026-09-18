@@ -14,7 +14,10 @@
 //! Nothing semantic. Validation, authorization, consensus, and revision allocation happen
 //! below it; this crate moves bytes and maps errors. The mapping itself lives in one place
 //! ([`error`]) and is asserted in both directions, because a transport that quietly reclassed
-//! an error would turn a "safe to retry" answer into a duplicate write (ADR-0015).
+//! an error would turn a "safe to retry" answer into a duplicate write (ADR-0015). For the
+//! same reason every status a plane emits is marked with [`HEADER_OUTCOME`]: an error status
+//! *without* that marker was minted by the transport and says nothing about whether the
+//! request was applied.
 //!
 //! # Wire encoding
 //!
@@ -27,7 +30,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use config_core::{ConfigStore, Principal};
+//! use config_core::{ClusterId, ConfigStore, Principal};
 //! use config_grpc::{serve_client_plane, ClientBackend, TlsMode};
 //!
 //! struct OneStore(Arc<dyn ConfigStore>);
@@ -37,9 +40,15 @@
 //!     }
 //! }
 //!
-//! # async fn run(store: Arc<dyn ConfigStore>) -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn run(store: Arc<dyn ConfigStore>, cluster_id: ClusterId)
+//! # -> Result<(), Box<dyn std::error::Error>> {
 //! let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-//! let handle = serve_client_plane(Arc::new(OneStore(store)), listener, TlsMode::Insecure)?;
+//! let handle = serve_client_plane(
+//!     Arc::new(OneStore(store)),
+//!     listener,
+//!     TlsMode::Insecure,
+//!     cluster_id,
+//! )?;
 //! println!("serving on {}", handle.local_addr());
 //! handle.shutdown().await?;
 //! # Ok(()) }
@@ -71,10 +80,11 @@ pub mod transport;
 
 pub use client_plane::{serve_client_plane, ClientBackend};
 pub use error::{
-    code_for, error_from_status, leader_hint, status_from_error, GrpcError, HEADER_CONFLICT_EXISTS,
-    HEADER_CONFLICT_MOD_REVISION, HEADER_LEADER_ENDPOINT, HEADER_LEADER_NODE_ID,
+    code_for, error_from_status, is_server_rejection, leader_hint, mark_rejected,
+    status_from_error, GrpcError, HEADER_CONFLICT_EXISTS, HEADER_CONFLICT_MOD_REVISION,
+    HEADER_LEADER_ENDPOINT, HEADER_LEADER_NODE_ID, HEADER_OUTCOME, OUTCOME_REJECTED,
 };
-pub use peer_plane::{serve_peer_plane, status_from_reject};
+pub use peer_plane::{serve_peer_plane, status_from_reject, PeerIdentity};
 pub use server::ServerHandle;
-pub use tls::{CertIdentity, MtlsConfig, TlsMode};
+pub use tls::{peer_server_domain, CertIdentity, MtlsConfig, TlsMode};
 pub use transport::GrpcPeerTransport;

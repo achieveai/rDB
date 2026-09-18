@@ -12,8 +12,17 @@
 //! * peer plane: `retcd://<cluster_id>/node/<node_id>` → the sender's claimed identity, which
 //!   must equal the envelope's `cluster_id` and `from_node_id`.
 //!
-//! A certificate with no usable SAN URI falls back to its Common Name, which covers CAs that
-//! cannot mint URI SANs. A certificate with neither is refused.
+//! The `<cluster_id>` is checked on both planes. A CA is frequently shared across a company,
+//! so "signed by our CA" is not "minted for our cluster"; without the check, a certificate
+//! issued for a neighbouring cluster would be served here.
+//!
+//! # The Common Name fallback, and its exact limit
+//!
+//! A certificate that asserts **no** `retcd://` URI SAN at all falls back to its Common Name,
+//! which covers CAs that cannot mint URI SANs. A certificate that asserts one and means
+//! something else by it — a node identity, another cluster, a URI our grammar rejects — is
+//! refused outright. Falling back there would let a peer node's certificate log in as a
+//! client under its CN, which is the separation of the two planes undone.
 
 use std::str::FromStr;
 
@@ -37,9 +46,16 @@ pub struct MtlsConfig {
     pub key_pem: Vec<u8>,
     /// Name to verify the server certificate against when dialing.
     ///
-    /// Peers are addressed by `host:port` from committed membership, which is frequently a
-    /// literal address while the certificate names a DNS identity. `None` verifies against
-    /// the endpoint's own host.
+    /// Endpoints are `host:port`, frequently a literal address, while a certificate names a
+    /// DNS identity. `None` verifies against the endpoint's own host.
+    ///
+    /// **Not honoured on the peer plane.** [`crate::GrpcPeerTransport`] derives the name it
+    /// verifies from the envelope it is about to send — `peer_server_domain(cluster_id, to)`
+    /// — because the name that matters there is the *dialled node's*, and one `MtlsConfig`
+    /// describes one dialler talking to every peer. A single configured name would either be
+    /// wrong for all but one peer or, worse, let any member's certificate satisfy a dial
+    /// addressed to a different member. This field therefore configures the client plane
+    /// only.
     pub server_domain: Option<String>,
 }
 
@@ -76,15 +92,57 @@ impl MtlsConfig {
     }
 
     /// tonic client profile: present our identity, verify the server against our CA.
+    ///
+    /// Honours [`MtlsConfig::server_domain`]; see the field docs for where that does *not*
+    /// apply.
     pub fn client_tls_config(&self) -> ClientTlsConfig {
-        let cfg = ClientTlsConfig::new()
-            .identity(self.identity())
-            .ca_certificate(self.ca());
         match &self.server_domain {
-            Some(d) => cfg.domain_name(d.clone()),
-            None => cfg,
+            Some(d) => self.client_tls_config_for(d),
+            None => self.base_client_tls_config(),
         }
     }
+
+    /// tonic client profile pinned to `domain`, whatever [`MtlsConfig::server_domain`] says.
+    ///
+    /// The peer plane and an authenticated leader-hint dial both know the identity of the
+    /// node they are about to reach and must verify *that* name, not a name the profile was
+    /// built with. Passing the name per dial is what makes one `MtlsConfig` usable against
+    /// every member without weakening any of them.
+    pub fn client_tls_config_for(&self, domain: &str) -> ClientTlsConfig {
+        self.base_client_tls_config()
+            .domain_name(domain.to_string())
+    }
+
+    fn base_client_tls_config(&self) -> ClientTlsConfig {
+        ClientTlsConfig::new()
+            .identity(self.identity())
+            .ca_certificate(self.ca())
+    }
+}
+
+/// The DNS name node `node_id` of `cluster_id` presents, and the only name a dialler may
+/// accept from it (ADR-0010, ADR-0011, m3-architecture §3).
+///
+/// tonic can express a per-connection DNS name and cannot express a per-call URI-SAN check, so
+/// the node identity that the peer plane checks *inside* the envelope is mirrored into a DNS
+/// SAN that TLS itself can check *before* a byte of payload moves. This function is the one
+/// definition of that string: the certificate fixture issues it, the peer transport pins it,
+/// and [`config_client`](https://docs.rs/config-client) pins it when following a leader hint.
+/// Two spellings of it would be a hole that never shows up as a test failure, only as an
+/// accepted impostor.
+///
+/// ```
+/// use config_core::{ClusterId, NodeId};
+/// use config_grpc::peer_server_domain;
+///
+/// let cluster = ClusterId::from_bytes([0x11; 16]);
+/// assert_eq!(
+///     peer_server_domain(&cluster, NodeId(3)),
+///     "node-3.11111111111111111111111111111111.retcd"
+/// );
+/// ```
+pub fn peer_server_domain(cluster_id: &ClusterId, node_id: NodeId) -> String {
+    format!("node-{node_id}.{cluster_id}.retcd")
 }
 
 impl std::fmt::Debug for MtlsConfig {
@@ -99,11 +157,13 @@ impl std::fmt::Debug for MtlsConfig {
 }
 
 /// How a plane protects its connections.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+///
+/// Deliberately not [`Default`]: the safe-looking default would be the insecure one, and a
+/// caller that forgets to choose should not get an unauthenticated listener by omission.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TlsMode {
     /// Plain TCP. Development and the in-process harness only (ADR-0010); a node serving this
     /// mode reports [`config_core::TransportSecurity::Insecure`].
-    #[default]
     Insecure,
     /// Mutual TLS. The only mode from which an authenticated identity can be derived.
     MutualTls(MtlsConfig),
@@ -159,12 +219,15 @@ pub enum CertIdentity {
     },
 }
 
+/// URI scheme prefix every rEtcd identity SAN carries.
+pub const RETCD_URI_PREFIX: &str = "retcd://";
+
 /// Parse one `retcd://` SAN URI.
 ///
 /// Returns `None` for any URI that is not a well-formed rEtcd identity, so an attacker cannot
 /// smuggle an identity through a malformed SAN that a lenient parser would round up.
 pub fn parse_san_uri(uri: &str) -> Option<CertIdentity> {
-    let rest = uri.strip_prefix("retcd://")?;
+    let rest = uri.strip_prefix(RETCD_URI_PREFIX)?;
     let mut parts = rest.split('/');
     let cluster_id = ClusterId::from_str(parts.next()?).ok()?;
     let kind = parts.next()?;
@@ -185,8 +248,11 @@ pub fn parse_san_uri(uri: &str) -> Option<CertIdentity> {
     }
 }
 
-/// Every rEtcd identity asserted by a DER certificate's SAN URIs.
-pub fn identities_from_der(der: &[u8]) -> Vec<CertIdentity> {
+/// Every URI SAN a DER certificate asserts, verbatim.
+///
+/// Kept separate from [`identities_from_der`] because "asserts nothing" and "asserts something
+/// we refuse to parse" are different facts, and only the first may fall back to a Common Name.
+pub fn uri_sans_from_der(der: &[u8]) -> Vec<String> {
     let Ok((_, cert)) = X509Certificate::from_der(der) else {
         return Vec::new();
     };
@@ -197,9 +263,17 @@ pub fn identities_from_der(der: &[u8]) -> Vec<CertIdentity> {
         .general_names
         .iter()
         .filter_map(|gn| match gn {
-            GeneralName::URI(uri) => parse_san_uri(uri),
+            GeneralName::URI(uri) => Some((*uri).to_string()),
             _ => None,
         })
+        .collect()
+}
+
+/// Every rEtcd identity asserted by a DER certificate's SAN URIs.
+pub fn identities_from_der(der: &[u8]) -> Vec<CertIdentity> {
+    uri_sans_from_der(der)
+        .iter()
+        .filter_map(|uri| parse_san_uri(uri))
         .collect()
 }
 
@@ -219,24 +293,48 @@ pub fn common_name_from_der(der: &[u8]) -> Option<String> {
 ///
 /// The leaf certificate is the only one consulted; an intermediate asserting an identity
 /// would let a CA delegate naming without the leaf saying so.
-pub fn principal_from_certs(certs: &[impl AsRef<[u8]>]) -> Result<Principal, Status> {
+///
+/// `expected_cluster` is this listener's cluster. A `retcd://` client SAN naming a different
+/// cluster is refused rather than accepted under its Common Name, and so is a node SAN: see
+/// the module docs for why the fallback stops there.
+pub fn principal_from_certs(
+    certs: &[impl AsRef<[u8]>],
+    expected_cluster: ClusterId,
+) -> Result<Principal, Status> {
     let leaf = certs
         .first()
         .ok_or_else(|| Status::unauthenticated("no client certificate presented"))?
         .as_ref();
 
-    if let Some(CertIdentity::Client { name, .. }) = identities_from_der(leaf)
+    let asserted: Vec<String> = uri_sans_from_der(leaf)
         .into_iter()
-        .find(|id| matches!(id, CertIdentity::Client { .. }))
-    {
-        return Ok(Principal::new(name, PrincipalKind::Certificate));
+        .filter(|uri| uri.starts_with(RETCD_URI_PREFIX))
+        .collect();
+
+    if asserted.is_empty() {
+        return match common_name_from_der(leaf) {
+            Some(cn) => Ok(Principal::new(cn, PrincipalKind::Certificate)),
+            None => Err(Status::unauthenticated(
+                "client certificate carries no retcd SAN URI and no common name",
+            )),
+        };
     }
-    match common_name_from_der(leaf) {
-        Some(cn) => Ok(Principal::new(cn, PrincipalKind::Certificate)),
-        None => Err(Status::unauthenticated(
-            "client certificate carries no retcd SAN URI and no common name",
-        )),
-    }
+
+    asserted
+        .iter()
+        .find_map(|uri| match parse_san_uri(uri) {
+            Some(CertIdentity::Client { cluster_id, name }) if cluster_id == expected_cluster => {
+                Some(Principal::new(name, PrincipalKind::Certificate))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            // No detail: the holder of the certificate already knows what it presented, and a
+            // prober must not learn this listener's cluster id from a refusal.
+            Status::unauthenticated(
+                "client certificate asserts a retcd identity that is not a client of this cluster",
+            )
+        })
 }
 
 /// The node identity a peer certificate claims, if any.

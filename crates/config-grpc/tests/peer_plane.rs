@@ -13,21 +13,17 @@ use config_engine::transport::{
 };
 use config_grpc::pb;
 use config_grpc::pb::peer_service_client::PeerServiceClient;
-use config_grpc::{serve_peer_plane, GrpcPeerTransport, ServerHandle, TlsMode};
+use config_grpc::{serve_peer_plane, GrpcPeerTransport, PeerIdentity, ServerHandle, TlsMode};
 use config_log::{retcd_test, TraceContext};
 use openraft::raft::VoteRequest;
 use openraft::Vote;
+use serde_json::Value;
 use tokio::net::TcpListener;
 
-use support::FakeSink;
+use support::{cluster, FakeSink, CLUSTER};
 
 const DEADLINE: Duration = Duration::from_secs(5);
-const CLUSTER: &str = "0123456789abcdef0123456789abcdef";
 const OTHER_CLUSTER: &str = "ffffffffffffffffffffffffffffffff";
-
-fn cluster() -> ClusterId {
-    CLUSTER.parse().expect("test cluster id is valid hex")
-}
 
 fn meta(cluster_id: ClusterId, from: u64, to: u64) -> PeerEnvelopeMeta {
     PeerEnvelopeMeta {
@@ -44,17 +40,29 @@ fn vote() -> PeerRequest {
 }
 
 async fn start_peer_plane(sink: &std::sync::Arc<FakeSink>) -> (ServerHandle, String) {
+    start_peer_plane_as(sink, sink.identity()).await
+}
+
+/// Serve `sink` while stamping `identity` on the answers, so a test can make the responder
+/// lie about who it is.
+async fn start_peer_plane_as(
+    sink: &std::sync::Arc<FakeSink>,
+    identity: PeerIdentity,
+) -> (ServerHandle, String) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral peer-plane port");
-    let handle =
-        serve_peer_plane(sink.handler(), listener, TlsMode::Insecure).expect("serve peer plane");
+    // ADR-0013: the plane's lines name the node it serves for (see `support::node_span`).
+    let handle = support::node_span(sink.node_id.0).in_scope(|| {
+        serve_peer_plane(sink.handler(), listener, TlsMode::Insecure, identity)
+            .expect("serve peer plane")
+    });
     let endpoint = handle.local_addr().to_string();
     (handle, endpoint)
 }
 
 #[retcd_test]
-async fn vote_round_trips_through_the_peer_plane() {
+async fn m1_grpc_10_vote_round_trips_through_the_peer_plane() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (handle, endpoint) = start_peer_plane(&sink).await;
     let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
@@ -90,7 +98,7 @@ async fn vote_round_trips_through_the_peer_plane() {
 }
 
 #[retcd_test]
-async fn wrong_cluster_id_is_rejected_as_identity() {
+async fn m1_grpc_11_wrong_cluster_id_is_rejected_as_identity() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
     let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
@@ -112,7 +120,7 @@ async fn wrong_cluster_id_is_rejected_as_identity() {
 }
 
 #[retcd_test]
-async fn wrong_destination_node_is_rejected_as_identity() {
+async fn m1_grpc_12_wrong_destination_node_is_rejected_as_identity() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
     let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
@@ -129,7 +137,7 @@ async fn wrong_destination_node_is_rejected_as_identity() {
 }
 
 #[retcd_test]
-async fn a_closed_port_is_unreachable_not_a_remote_error() {
+async fn m1_grpc_13_a_closed_port_is_unreachable_not_a_remote_error() {
     let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
     let mut stolen = Vec::new();
 
@@ -163,7 +171,7 @@ async fn a_closed_port_is_unreachable_not_a_remote_error() {
 }
 
 #[retcd_test]
-async fn a_blocked_pair_fails_without_dialing() {
+async fn m1_grpc_14_a_blocked_pair_fails_without_dialing() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
 
@@ -196,7 +204,7 @@ async fn a_blocked_pair_fails_without_dialing() {
 }
 
 #[retcd_test]
-async fn a_dropped_response_is_a_network_error() {
+async fn m1_grpc_15_a_dropped_response_is_a_network_error() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
 
@@ -218,7 +226,7 @@ async fn a_dropped_response_is_a_network_error() {
 }
 
 #[retcd_test]
-async fn unknown_payload_encoding_is_invalid_argument() {
+async fn m1_grpc_16_unknown_payload_encoding_is_invalid_argument() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
 
@@ -255,10 +263,33 @@ async fn unknown_payload_encoding_is_invalid_argument() {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
     assert!(sink.seen_metas().is_empty());
+
+    // Every refusal before the handler leaves one warn line inside the rpc span, or a peer
+    // that is being refused is invisible to the operator watching the log (ADR-0013).
+    let rejected: Vec<_> = support::log_lines(
+        module_path!(),
+        "m1_grpc_16_unknown_payload_encoding_is_invalid_argument",
+    )
+    .into_iter()
+    .filter(|v| v.get("@m").and_then(Value::as_str) == Some("peer rpc rejected"))
+    .collect();
+    assert_eq!(
+        rejected.len(),
+        2,
+        "expected one warn line per refusal, got {rejected:#?}"
+    );
+    for line in &rejected {
+        assert_eq!(line.get("@l").and_then(Value::as_str), Some("Warning"));
+        assert_eq!(
+            line.get("reason").and_then(Value::as_str),
+            Some("bad_payload_encoding")
+        );
+        assert!(line.get("latency_ms").is_some(), "no latency on {line:#?}");
+    }
 }
 
 #[retcd_test]
-async fn install_snapshot_is_unimplemented_in_this_release() {
+async fn m1_grpc_17_install_snapshot_is_unimplemented_in_this_release() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
 
@@ -278,4 +309,102 @@ async fn install_snapshot_is_unimplemented_in_this_release() {
         .await
         .expect_err("snapshots are never served in this release (ADR-0008)");
     assert_eq!(status.code(), tonic::Code::Unimplemented);
+}
+
+/// ADR-0011: the responder stamps its **own** identity, and the caller checks it.
+///
+/// Echoing the request's identity fields back would make them self-confirming — whoever
+/// answers gets to agree with whatever the caller already believed — so an impostor on the
+/// endpoint would be indistinguishable from the node we meant to reach.
+#[retcd_test]
+async fn m1_grpc_18_an_answer_from_the_wrong_identity_is_rejected() {
+    let sink = FakeSink::new(cluster(), NodeId(2));
+    let honest = sink.identity();
+
+    // Same sink, but the plane answers as node 9.
+    let impostor = PeerIdentity {
+        node_id: NodeId(9),
+        ..honest
+    };
+    let (_handle, endpoint) = start_peer_plane_as(&sink, impostor).await;
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
+
+    let error = transport
+        .send(meta(cluster(), 1, 2), &endpoint, vote(), DEADLINE)
+        .await
+        .expect_err("an answer from another node must be refused");
+    assert!(
+        matches!(error, TransportError::IdentityRejected(_)),
+        "expected IdentityRejected, got {error:?}"
+    );
+    assert_eq!(
+        sink.seen_metas().len(),
+        1,
+        "the call itself was served; it is the answer that is refused"
+    );
+
+    // Answering as another cluster is refused the same way.
+    let foreign = PeerIdentity {
+        cluster_id: OTHER_CLUSTER.parse().expect("valid hex"),
+        ..honest
+    };
+    let (_handle, endpoint) = start_peer_plane_as(&sink, foreign).await;
+    let error = transport
+        .send(meta(cluster(), 1, 2), &endpoint, vote(), DEADLINE)
+        .await
+        .expect_err("an answer from another cluster must be refused");
+    assert!(
+        matches!(error, TransportError::IdentityRejected(_)),
+        "expected IdentityRejected, got {error:?}"
+    );
+
+    // And the truthful case still works, so the check is not simply refusing everything.
+    let (handle, endpoint) = start_peer_plane_as(&sink, honest).await;
+    transport
+        .send(meta(cluster(), 1, 2), &endpoint, vote(), DEADLINE)
+        .await
+        .expect("a truthful answer is accepted");
+    handle.shutdown().await.expect("clean shutdown");
+}
+
+/// An injected latency is spent *inside* the caller's budget.
+///
+/// Applying it outside would make `NetFault::delay` unable to express the failure it exists
+/// for — a link slow enough to blow a deadline — because every call would still complete in
+/// `delay + deadline`.
+#[retcd_test]
+async fn m1_grpc_19_an_injected_delay_is_charged_to_the_call_deadline() {
+    let sink = FakeSink::new(cluster(), NodeId(2));
+    let (_handle, endpoint) = start_peer_plane(&sink).await;
+
+    let faults = NetFault::new();
+    // The subject of the test, not a synchronization sleep: the deadline is a tenth of it, so
+    // the call must fail on time however fast the machine is.
+    faults.delay(NodeId(1), NodeId(2), Duration::from_secs(30));
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults);
+
+    let started = std::time::Instant::now();
+    let error = transport
+        .send(
+            meta(cluster(), 1, 2),
+            &endpoint,
+            vote(),
+            Duration::from_millis(200),
+        )
+        .await
+        .expect_err("the injected latency exceeds the deadline");
+
+    assert!(
+        matches!(error, TransportError::Network(_)),
+        "a call that ran out of time is a Network error, got {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the deadline did not bound the injected delay: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        sink.seen_metas().is_empty(),
+        "the call never got past the delay, so the peer never saw it"
+    );
 }

@@ -5,9 +5,9 @@
 //! the engine gates them.
 
 use config_core::KvState;
-use openraft::{BasicNode, LogId, StoredMembership};
+use openraft::{LogId, StoredMembership};
 
-use crate::types::RaftNodeId;
+use crate::types::{RaftNode, RaftNodeId};
 
 /// Synchronous, cheap access to the state machine's applied state.
 pub trait StateReader: Send + Sync {
@@ -19,7 +19,7 @@ pub trait StateReader: Send + Sync {
     fn last_applied(&self) -> Option<LogId<RaftNodeId>>;
 
     /// Committed membership as recorded by the state machine.
-    fn membership(&self) -> StoredMembership<RaftNodeId, BasicNode>;
+    fn membership(&self) -> StoredMembership<RaftNodeId, RaftNode>;
 
     /// Convenience: the public cluster revision.
     fn cluster_revision(&self) -> u64 {

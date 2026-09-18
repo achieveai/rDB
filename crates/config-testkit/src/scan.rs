@@ -35,15 +35,32 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether `file` ends with one of `exempt` (a `/`-separated path suffix, e.g.
+/// `"tests/common/mod.rs"`). Windows separators are normalised so a suffix written the POSIX
+/// way matches on both platforms.
+fn is_exempt(file: &Path, exempt: &[&str]) -> bool {
+    if exempt.is_empty() {
+        return false;
+    }
+    let normalised = file
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/");
+    exempt.iter().any(|suffix| normalised.ends_with(suffix))
+}
+
 fn scan_lines(
     dir: &Path,
     allow_marker: &str,
+    exempt: &[&str],
     mut check: impl FnMut(&str) -> Option<String>,
 ) -> Vec<String> {
     let mut files = Vec::new();
     rust_sources(dir, &mut files);
     let mut findings = Vec::new();
     for file in &files {
+        if is_exempt(file, exempt) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(file) else {
             continue;
         };
@@ -68,7 +85,18 @@ fn scan_lines(
 /// `yield_now` busy-loop outside a line carrying [`ALLOW_SLEEP_MARKER`] (rule 1: "no fixed
 /// sleeps... allowlisting only sleeps that are the *subject* of a test").
 pub fn assert_no_fixed_sleeps(dir: &Path) {
-    let findings = scan_lines(dir, ALLOW_SLEEP_MARKER, |line| {
+    assert_no_fixed_sleeps_except(dir, &[]);
+}
+
+/// [`assert_no_fixed_sleeps`], skipping files whose path ends with one of `exempt_files`.
+///
+/// This exists for one situation: a file that *should* carry a line-level
+/// [`ALLOW_SLEEP_MARKER`] but belongs to a crate the caller does not own, so the marker cannot
+/// be added there. A whole-file exemption is weaker than a line marker — it hides future
+/// violations in that file too — so every entry must be justified at the call site, and the
+/// marker should be pushed into the file itself as soon as its owner can take it.
+pub fn assert_no_fixed_sleeps_except(dir: &Path, exempt_files: &[&str]) {
+    let findings = scan_lines(dir, ALLOW_SLEEP_MARKER, exempt_files, |line| {
         SLEEP_TOKENS
             .iter()
             .find(|tok| line.contains(*tok))
@@ -86,7 +114,13 @@ pub fn assert_no_fixed_sleeps(dir: &Path) {
 /// `0` outside a line carrying [`ALLOW_PORT_MARKER`] (rule 4: "no literal port anywhere in
 /// `tests/**`").
 pub fn assert_no_literal_ports(dir: &Path) {
-    let findings = scan_lines(dir, ALLOW_PORT_MARKER, |line| {
+    assert_no_literal_ports_except(dir, &[]);
+}
+
+/// [`assert_no_literal_ports`], skipping files whose path ends with one of `exempt_files`.
+/// See [`assert_no_fixed_sleeps_except`] for when a whole-file exemption is justified.
+pub fn assert_no_literal_ports_except(dir: &Path, exempt_files: &[&str]) {
+    let findings = scan_lines(dir, ALLOW_PORT_MARKER, exempt_files, |line| {
         for prefix in HOST_PREFIXES {
             for (idx, _) in line.match_indices(prefix) {
                 let after = idx + prefix.len();

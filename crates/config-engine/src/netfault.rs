@@ -6,8 +6,17 @@
 //! applied mid-request behaves like a cut cable, not like a slow link.
 //!
 //! Production nodes use `NetFault::default()`, which is permanently transparent.
+//!
+//! # Logging
+//!
+//! Every line this module emits names the node the rule is *about* in `node_id`, because
+//! ADR-0013 requires a `config_engine*` line to be attributable to a node. A rule always has
+//! an originating side — `from` for a one-way block, `a` for a pair, the isolated node for
+//! `isolate` — and that side is the `node_id`. The switchboard-wide [`NetFault::unblock_all`]
+//! has no single subject, so it reports **one line per node whose rules it cleared** rather
+//! than one anonymous line.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -64,7 +73,7 @@ impl NetFault {
 
     /// Block `from → to` (one way). Idempotent.
     pub fn block(&self, from: NodeId, to: NodeId) {
-        tracing::info!(from = from.0, to = to.0, "netfault block");
+        tracing::info!(node_id = from.0, from = from.0, to = to.0, "netfault block");
         self.mutate(|s| {
             s.blocked.insert((from, to));
         });
@@ -72,7 +81,14 @@ impl NetFault {
 
     /// Block both directions between `a` and `b`.
     pub fn block_pair(&self, a: NodeId, b: NodeId) {
-        tracing::info!(a = a.0, b = b.0, "netfault block_pair");
+        tracing::info!(
+            node_id = a.0,
+            from = a.0,
+            to = b.0,
+            a = a.0,
+            b = b.0,
+            "netfault block_pair"
+        );
         self.mutate(|s| {
             s.blocked.insert((a, b));
             s.blocked.insert((b, a));
@@ -94,23 +110,53 @@ impl NetFault {
 
     /// Remove one one-way block.
     pub fn unblock(&self, from: NodeId, to: NodeId) {
+        tracing::info!(
+            node_id = from.0,
+            from = from.0,
+            to = to.0,
+            "netfault unblock"
+        );
         self.mutate(|s| {
             s.blocked.remove(&(from, to));
         });
     }
 
     /// Clear every block, delay, and drop rule (the harness's `heal`).
+    ///
+    /// Reports one line per node that had an outbound rule, so every line carries the
+    /// `node_id` ADR-0013 requires. A switchboard that was already transparent reports
+    /// nothing, because nothing happened.
     pub fn unblock_all(&self) {
-        tracing::info!("netfault unblock_all");
+        let mut cleared: Vec<(u64, usize)> = Vec::new();
         self.mutate(|s| {
+            let mut per_node: BTreeMap<u64, usize> = BTreeMap::new();
+            for (from, _) in s
+                .blocked
+                .iter()
+                .chain(s.drop_response.iter())
+                .chain(s.delays.keys())
+            {
+                *per_node.entry(from.0).or_default() += 1;
+            }
+            cleared = per_node.into_iter().collect();
             s.blocked.clear();
             s.delays.clear();
             s.drop_response.clear();
         });
+        for (node_id, rules) in cleared {
+            tracing::info!(node_id, rules, "netfault unblock_all");
+        }
     }
 
     /// Add latency before each `from → to` call is sent.
     pub fn delay(&self, from: NodeId, to: NodeId, d: Duration) {
+        tracing::info!(
+            node_id = from.0,
+            from = from.0,
+            to = to.0,
+            delay_ms = d.as_millis() as u64,
+            "netfault delay"
+        );
         self.mutate(|s| {
             s.delays.insert((from, to), d);
         });
@@ -119,6 +165,12 @@ impl NetFault {
     /// Send `from → to` calls but discard their responses; the caller sees a `Network` error.
     /// Used to prove `DeadlineExceededUnknownOutcome` handling (ADR-0015).
     pub fn drop_response(&self, from: NodeId, to: NodeId) {
+        tracing::info!(
+            node_id = from.0,
+            from = from.0,
+            to = to.0,
+            "netfault drop_response"
+        );
         self.mutate(|s| {
             s.drop_response.insert((from, to));
         });
@@ -126,6 +178,12 @@ impl NetFault {
 
     /// Stop dropping responses for `from → to`.
     pub fn undrop_response(&self, from: NodeId, to: NodeId) {
+        tracing::info!(
+            node_id = from.0,
+            from = from.0,
+            to = to.0,
+            "netfault undrop_response"
+        );
         self.mutate(|s| {
             s.drop_response.remove(&(from, to));
         });

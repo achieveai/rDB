@@ -21,12 +21,6 @@ pub enum EngineError {
     /// The store refused to open or answer.
     #[error("storage error: {0}")]
     Storage(String),
-    /// This node has already been started.
-    #[error("node already started")]
-    AlreadyStarted,
-    /// The node has been stopped; it will not serve anything further.
-    #[error("node stopped")]
-    Stopped,
 }
 
 /// The explicit act of creating a cluster (spec §13.1, ADR-0011).
@@ -41,13 +35,23 @@ pub struct FormationPlan {
     /// The recovery epoch being created at; must equal the node's configured epoch.
     pub recovery_epoch: RecoveryEpoch,
     /// The initial voters and their **peer** endpoints (`host:port`). These become
-    /// `BasicNode::addr` in committed membership, and are thereafter the only addresses the
-    /// transport dials and the only endpoints a leader hint may name (ADR-0003).
+    /// [`config_storage::RaftNode::peer`] in committed membership and are thereafter the only
+    /// addresses the Raft transport dials (ADR-0003).
     pub voters: BTreeMap<NodeId, String>,
+    /// The initial voters' **client** endpoints (`host:port`), which become
+    /// [`config_storage::RaftNode::client`] and are the only endpoints a leader hint may name
+    /// (ADR-0009).
+    ///
+    /// A voter absent from this map advertises its peer endpoint as its client endpoint,
+    /// which is the single-listener in-process profile.
+    pub client_endpoints: BTreeMap<NodeId, String>,
 }
 
 impl FormationPlan {
     /// Build a plan for `identity`'s cluster from `(node id, peer endpoint)` pairs.
+    ///
+    /// Every voter's client endpoint defaults to its peer endpoint. Use
+    /// [`FormationPlan::with_client_endpoints`] when the two planes have separate listeners.
     pub fn new(
         identity: &ClusterIdentity,
         voters: impl IntoIterator<Item = (NodeId, String)>,
@@ -56,7 +60,35 @@ impl FormationPlan {
             cluster_id: identity.cluster_id,
             recovery_epoch: identity.recovery_epoch,
             voters: voters.into_iter().collect(),
+            client_endpoints: BTreeMap::new(),
         }
+    }
+
+    /// Build a plan from `(node id, peer endpoint, client endpoint)` triples.
+    pub fn with_client_endpoints(
+        identity: &ClusterIdentity,
+        voters: impl IntoIterator<Item = (NodeId, String, String)>,
+    ) -> Self {
+        let mut peers = BTreeMap::new();
+        let mut clients = BTreeMap::new();
+        for (id, peer, client) in voters {
+            peers.insert(id, peer);
+            clients.insert(id, client);
+        }
+        Self {
+            cluster_id: identity.cluster_id,
+            recovery_epoch: identity.recovery_epoch,
+            voters: peers,
+            client_endpoints: clients,
+        }
+    }
+
+    /// The client endpoint this plan gives `node_id`: its explicit one, or its peer endpoint.
+    pub fn client_endpoint_of(&self, node_id: NodeId) -> Option<&str> {
+        self.client_endpoints
+            .get(&node_id)
+            .or_else(|| self.voters.get(&node_id))
+            .map(String::as_str)
     }
 }
 
@@ -76,6 +108,19 @@ pub enum FormationError {
     /// The plan does not list this node among its voters.
     #[error("this node is not a voter in the supplied formation plan")]
     NotAVoter,
+    /// The plan's entry for this node names an endpoint this node does not serve.
+    ///
+    /// Committing it would publish an address nobody answers on, and the disagreement would
+    /// only surface later as an unreachable peer or an unusable leader hint.
+    #[error("formation plan gives this node {plane} endpoint {planned:?}, but it is configured as {configured:?}")]
+    EndpointMismatch {
+        /// `"peer"` or `"client"`.
+        plane: &'static str,
+        /// What the plan said.
+        planned: String,
+        /// What this node is configured to advertise.
+        configured: String,
+    },
     /// OpenRaft refused `initialize`.
     #[error("raft error: {0}")]
     Raft(String),

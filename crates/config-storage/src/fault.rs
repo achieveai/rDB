@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -90,22 +91,34 @@ pub enum FaultAction {
     /// reopened (RocksStore) or recreated (EphemeralStore). `Drop` must not flush pending
     /// data. This simulates a process crash at that instant.
     Crash,
+    /// Stall the calling task for the given duration, then proceed normally (the crossing
+    /// still succeeds and still counts). Simulates a slow-but-not-failed boundary crossing —
+    /// e.g. RocksDB's blocking I/O taking a while under load — without failing or poisoning
+    /// anything. A store must consult this off the async runtime's worker threads (RocksStore
+    /// already runs every boundary inside `spawn_blocking`) so the stall cannot starve other
+    /// tasks; a store that has no such offload point may block its caller for the duration.
+    Delay(Duration),
 }
 
 impl FaultAction {
-    /// Stable snake_case name for log fields.
+    /// Stable snake_case name for log fields. `Delay` carries a duration that this alone
+    /// cannot express; callers that need the duration in a log line add it as a separate field.
     pub const fn as_str(self) -> &'static str {
         match self {
             FaultAction::Proceed => "proceed",
             FaultAction::Fail => "fail",
             FaultAction::Crash => "crash",
+            FaultAction::Delay(_) => "delay",
         }
     }
 }
 
 impl fmt::Display for FaultAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            FaultAction::Delay(d) => write!(f, "delay({}ms)", d.as_millis()),
+            other => f.write_str(other.as_str()),
+        }
     }
 }
 

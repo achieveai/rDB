@@ -8,11 +8,32 @@ description = "rEtcd test toolkit: ConfigStore conformance suite, in-memory refe
 [dependencies]
 config-core = { workspace = true }
 config-log = { workspace = true }
+config-storage = { workspace = true }
+config-engine = { workspace = true }
+config-grpc = { workspace = true }
+config-client = { workspace = true }
+config-gossip = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+# `pkcs8`/`pem`: `TlsFixture` derives deterministic Ed25519 keys and hands them to rcgen as
+# PKCS#8 PEM, because rcgen 0.13 has no seeded-RNG constructor (see `tls` module docs).
+ed25519-dalek = { workspace = true, features = ["pkcs8", "pem"] }
 futures = { workspace = true }
+rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# Test-only: a same-id restart on a fresh EphemeralStore is a legal log revert here, and
+# openraft's debug_assert would otherwise abort the leader (ADR-0008 note).
+openraft = { workspace = true, features = ["loosen-follower-log-revert"] }
+# Test-only: the M3 peer-plane rows (M3-09..M3-11) dial `PeerService` directly with a
+# hand-built envelope to prove the engine's identity checks are independent of the
+# certificate presented — something no `Cluster` method does on a caller's behalf.
+tonic = { workspace = true }

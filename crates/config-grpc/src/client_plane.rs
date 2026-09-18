@@ -19,13 +19,13 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use config_core::{ConfigError, ConfigStore, Principal};
+use config_core::{ClusterId, ConfigError, ConfigStore, Principal};
 use config_log::TraceContext;
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
-use crate::error::{status_from_error, GrpcError};
+use crate::error::{mark_rejected, status_from_error, GrpcError};
 use crate::pb;
 use crate::pb::config_service_server::{ConfigService, ConfigServiceServer};
 use crate::server::{spawn, ServerHandle};
@@ -33,15 +33,27 @@ use crate::tls::{principal_from_certs, TlsMode};
 
 /// Supplies the store a given authenticated principal should be served by.
 ///
-/// One method, because the only per-connection decision this plane makes is *whose* store to
-/// use. An implementation over a `ConfigNode` typically returns a `DirectClient` bound to the
-/// principal; a test implementation returns a scripted store and ignores the principal.
+/// The one required method exists because the only per-connection decision this plane makes
+/// is *whose* store to use. An implementation over a `ConfigNode` typically returns a
+/// `DirectClient` bound to the principal; a test implementation returns a scripted store and
+/// ignores the principal.
 pub trait ClientBackend: Send + Sync {
     /// The store that serves `principal`.
     ///
     /// Called once per request, so it must be cheap — typically an `Arc` clone or a small
     /// wrapper construction, never I/O.
     fn store_for(&self, principal: Principal) -> Arc<dyn ConfigStore>;
+
+    /// Called when a caller's transport identity could not be established (M3-81).
+    ///
+    /// This plane is the only place that sees a certificate, and the engine is the only place
+    /// that keeps counters, so the fact has to cross the boundary here. An implementation over
+    /// a `ConfigNode` forwards to `ConfigNode::record_authn_rejection`.
+    ///
+    /// It is *not* an authorization denial: no principal was derived, so no `Authorizer` was
+    /// consulted and no audit line was written. The default does nothing, which is right for a
+    /// backend with nothing to count.
+    fn record_authn_rejection(&self) {}
 }
 
 impl<F> ClientBackend for F
@@ -56,6 +68,9 @@ where
 struct ConfigSvc {
     backend: Arc<dyn ClientBackend>,
     tls: TlsMode,
+    /// The cluster this listener serves; a client certificate minted for another one is
+    /// refused even when the CA is shared (ADR-0011).
+    cluster_id: ClusterId,
     /// The span in effect when the plane was started — the node span in production, the test
     /// span under `#[retcd_test]`.
     ///
@@ -74,7 +89,7 @@ impl ConfigSvc {
             TlsMode::MutualTls(_) => match request.peer_certs() {
                 Some(certs) if !certs.is_empty() => {
                     let der: Vec<&[u8]> = certs.iter().map(|c| c.as_ref()).collect();
-                    principal_from_certs(&der)
+                    principal_from_certs(&der, self.cluster_id)
                 }
                 _ => Err(Status::unauthenticated(
                     "mutual TLS is required on this listener but no client certificate was presented",
@@ -95,7 +110,6 @@ impl ConfigSvc {
         Fut: Future<Output = Result<Res, ConfigError>>,
     {
         let started = Instant::now();
-        let principal = self.principal(&request)?;
 
         let meta = request.metadata();
         let header = |k: &str| meta.get(k).and_then(|v| v.to_str().ok());
@@ -104,7 +118,26 @@ impl ConfigSvc {
             header(config_log::HEADER_PARENT_SPAN),
             header(config_log::HEADER_REQUEST_ID),
         );
+        // Built before the identity check, so a refusal is logged inside the caller's trace
+        // rather than as an orphan line nothing can be correlated with (ADR-0013).
         let span = self.server_span.in_scope(|| ctx.span(op));
+
+        let principal = match self.principal(&request) {
+            Ok(principal) => principal,
+            Err(status) => {
+                self.backend.record_authn_rejection();
+                span.in_scope(|| {
+                    tracing::warn!(
+                        rpc = op,
+                        reason = "unauthenticated",
+                        latency_ms = started.elapsed().as_millis() as u64,
+                        detail = status.message(),
+                        "rpc rejected"
+                    )
+                });
+                return Err(mark_rejected(status));
+            }
+        };
 
         let store = self.backend.store_for(principal.clone());
         let result = call(store, request.into_inner())
@@ -178,15 +211,21 @@ impl ConfigService for ConfigSvc {
 
 /// Serve `ConfigService` on an already-bound listener.
 ///
+/// `cluster_id` is the cluster this node belongs to; under [`TlsMode::MutualTls`] a client
+/// certificate must carry a `retcd://<cluster_id>/client/<name>` SAN for *that* cluster
+/// (ADR-0011). Under [`TlsMode::Insecure`] it is unused — there is no certificate to check.
+///
 /// Requires a current Tokio runtime; the library never creates one (spec §6.3).
 pub fn serve_client_plane(
     backend: Arc<dyn ClientBackend>,
     listener: TcpListener,
     tls: TlsMode,
+    cluster_id: ClusterId,
 ) -> Result<ServerHandle, GrpcError> {
     let svc = ConfigSvc {
         backend,
         tls: tls.clone(),
+        cluster_id,
         server_span: tracing::Span::current(),
     };
     let router = tls

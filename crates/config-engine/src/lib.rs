@@ -4,8 +4,11 @@
 //! leader-linearizable reads gated by `ensure_linearizable`, health/metrics/capabilities, and
 //! the transport-agnostic peer-plane contract ([`transport`]) that `config-grpc` implements.
 //!
-//! The engine never creates a Tokio runtime and never exposes OpenRaft or tonic types on the
-//! client-facing API; [`DirectClient`] wraps it as a [`config_core::ConfigStore`].
+//! The engine never creates a Tokio runtime, and no OpenRaft or tonic type appears on the
+//! **client-facing** API — `put`/`get`/`list`/`delete`, [`DirectClient`], [`NodeMetrics`],
+//! [`Health`] and [`MembershipView`] are all OpenRaft-free. The peer plane is a different
+//! matter: [`transport::PeerRequest`] and [`transport::PeerResponse`] wrap OpenRaft RPC types
+//! by design, because that is what a Raft transport transports (ADR-0010).
 //!
 //! # Shape
 //!
@@ -45,9 +48,11 @@ pub use direct::DirectClient;
 pub use error::{EngineError, FormationError, FormationPlan, Timeout};
 pub use hint::{
     validate_hint, HintVerdict, REASON_CLUSTER_MISMATCH, REASON_ENDPOINT_MISMATCH,
-    REASON_NOT_FORMED, REASON_SELF_CLAIM, REASON_UNKNOWN_NODE,
+    REASON_EPOCH_MISMATCH, REASON_NOT_FORMED, REASON_SELF_CLAIM, REASON_UNKNOWN_NODE,
 };
-pub use metrics::{Health, LogIdView, MembershipView, NodeMetrics, NodeRole};
+pub use metrics::{
+    Health, HealthPayload, LogIdView, MembershipView, NodeMetrics, NodeRole, PolicySummary,
+};
 pub use netfault::NetFault;
 pub use node::ConfigNode;
 pub use testing::InProcTransport;

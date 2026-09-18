@@ -372,3 +372,96 @@ fn m0_70_allowlist_denies_unverified_principal_kind() {
         config_core::Decision::Deny { .. }
     ));
 }
+
+/// TA-22: the audit line has one shape, never carries a value, and caps the key as hex.
+#[config_log::retcd_test]
+fn m0_73_audit_line_shape() {
+    let p = Principal::new("svc-a", PrincipalKind::Certificate);
+    config_core::audit(
+        &p,
+        Action::Write,
+        b"/app/a/k1",
+        &config_core::Decision::Allow,
+        Authz::StaticAllowlist,
+    );
+    config_core::audit(
+        &p,
+        Action::Read,
+        b"/app/b/x",
+        &config_core::Decision::deny("no grant"),
+        Authz::StaticAllowlist,
+    );
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        "m0_73_audit_line_shape",
+    );
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        // The per-test file is never truncated between `cargo test` runs, so scope to this
+        // process's `testRun` or a second run sees the first run's lines too.
+        .filter(|v: &serde_json::Value| {
+            v["@logger"] == "retcd.audit" && v["testRun"] == config_log::testing::test_run_id()
+        })
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected two audit lines in {}",
+        path.display()
+    );
+    assert_eq!(lines[0]["decision"], "allow");
+    assert_eq!(lines[0]["principal"], "svc-a");
+    assert_eq!(lines[0]["key_hex"], hex::encode(b"/app/a/k1"));
+    assert_eq!(lines[0]["policy_kind"], "StaticAllowlist");
+    assert_eq!(lines[1]["decision"], "deny");
+    assert_eq!(lines[1]["reason"], "no grant");
+    assert!(lines
+        .iter()
+        .all(|l| l.get("key").is_none() && l.get("value").is_none()));
+}
+
+/// M0-74: `ObservedPeerHint` carries the recovery epoch, so ADR-0011's identity — the *pair*
+/// `(cluster_id, recovery_epoch)` — is fully represented on the advisory path.
+///
+/// This lives here rather than with the engine's `validate_hint` table because it is a claim
+/// about the *type*, not about any validator: a hint whose only difference from a legitimate
+/// one is the epoch must be a distinguishable value. If `recovery_epoch` were dropped from the
+/// struct, every epoch check downstream would silently start passing.
+#[config_log::retcd_test]
+fn m0_74_observed_peer_hint_carries_the_recovery_epoch() {
+    use config_core::{ClusterId, Liveness, ObservedPeerHint, RecoveryEpoch};
+
+    let at = |epoch: u32| ObservedPeerHint {
+        cluster_id: ClusterId::from_bytes([3u8; 16]),
+        recovery_epoch: RecoveryEpoch(epoch),
+        node_id: NodeId(2),
+        peer_endpoint: "node-2.retcd.invalid".to_string(),
+        client_endpoint: None,
+        software_version: "0.1.0".to_string(),
+        protocol_version: 1,
+        zone: None,
+        liveness: Liveness::Alive,
+    };
+
+    let current = at(2);
+    let fenced = at(1);
+
+    assert_eq!(current.recovery_epoch, RecoveryEpoch(2));
+    // Same cluster, same node, same endpoint: the epoch is the only thing that separates a
+    // live peer from one stranded on the pre-recovery epoch.
+    assert_eq!(current.cluster_id, fenced.cluster_id);
+    assert_eq!(current.node_id, fenced.node_id);
+    assert_eq!(current.peer_endpoint, fenced.peer_endpoint);
+    assert_ne!(current, fenced, "the two hints must not compare equal");
+
+    // And the difference survives serialization, which is what gossip actually ships.
+    let round_trip: ObservedPeerHint =
+        serde_json::from_str(&serde_json::to_string(&fenced).expect("serialize"))
+            .expect("deserialize");
+    assert_eq!(round_trip, fenced);
+    assert_ne!(round_trip, current);
+}

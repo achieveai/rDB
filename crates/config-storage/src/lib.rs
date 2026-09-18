@@ -13,9 +13,17 @@
 pub mod ephemeral;
 pub mod fault;
 pub mod reader;
+pub mod rocks;
+pub mod trace;
 pub mod types;
+pub(crate) mod util;
 
 pub use ephemeral::{EphemeralLog, EphemeralSm, EphemeralStore, NoSnapshots};
 pub use fault::{Boundary, FaultAction, FaultCounters, FaultInjector, NoFaults};
 pub use reader::StateReader;
-pub use types::{RaftNodeId, TypeConfig};
+pub use rocks::{
+    RocksLog, RocksOptions, RocksSm, RocksStore, StorageOpenError, CF_KV, CF_RAFT_LOG,
+    CF_RAFT_META, CF_STATE_META, COLUMN_FAMILIES,
+};
+pub use trace::{fingerprint, CommandFingerprint, TraceRegistry, TRACE_REGISTRY_CAPACITY};
+pub use types::{RaftNode, RaftNodeId, TypeConfig};

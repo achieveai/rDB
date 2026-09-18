@@ -162,3 +162,28 @@ fn m0_71_default_limits_match_spec() {
         }
     );
 }
+
+/// `validate_get` shares the key rules with the mutation validators (TA-3, one validator).
+#[config_log::retcd_test]
+fn m0_72_validate_get_shares_key_rules() {
+    let limits = Limits {
+        max_key_bytes: 4,
+        ..Limits::DEFAULT
+    };
+    let ok = config_core::GetRequest { key: b(b"abcd") };
+    assert!(config_core::validate_get(&ok, &limits).is_ok());
+    let empty = config_core::GetRequest { key: b(b"") };
+    assert_eq!(
+        config_core::validate_get(&empty, &limits)
+            .unwrap_err()
+            .kind(),
+        StatusClass::InvalidArgument
+    );
+    let long = config_core::GetRequest { key: b(b"abcde") };
+    assert_eq!(
+        config_core::validate_get(&long, &limits)
+            .unwrap_err()
+            .kind(),
+        StatusClass::InvalidArgument
+    );
+}

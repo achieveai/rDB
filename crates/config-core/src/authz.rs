@@ -104,6 +104,44 @@ impl Decision {
     }
 }
 
+/// Emit the audit record for one authorization decision (spec §18.2, test plan TA-22).
+///
+/// This is the single audit line format; every edge that calls an [`Authorizer`] routes the
+/// result through here so log queries can rely on one shape. Keys are logged as capped hex,
+/// never as bytes; values never reach this function.
+pub fn audit(
+    principal: &Principal,
+    action: Action,
+    key_or_prefix: &[u8],
+    decision: &Decision,
+    policy_kind: crate::Authz,
+) {
+    let key_hex = crate::state::key_hex(key_or_prefix);
+    match decision {
+        Decision::Allow => tracing::info!(
+            target: "retcd.audit",
+            principal = %principal.name,
+            principal_kind = ?principal.kind,
+            action = ?action,
+            key_hex = %key_hex,
+            decision = "allow",
+            policy_kind = ?policy_kind,
+            "authorization decision"
+        ),
+        Decision::Deny { reason } => tracing::warn!(
+            target: "retcd.audit",
+            principal = %principal.name,
+            principal_kind = ?principal.kind,
+            action = ?action,
+            key_hex = %key_hex,
+            decision = "deny",
+            policy_kind = ?policy_kind,
+            reason = %reason,
+            "authorization decision"
+        ),
+    }
+}
+
 /// The transport-independent authorization hook the engine consults (ADR-0012).
 ///
 /// The engine passes the *requested* key for a mutation or `Get`, and the *requested prefix*

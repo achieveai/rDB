@@ -97,13 +97,14 @@ pub fn decode_hint(bytes: &[u8]) -> Result<ObservedPeerHint, HintDecodeError> {
 #[cfg(test)]
 mod tests {
     use config_core::hint::Liveness;
-    use config_core::identity::{ClusterId, NodeId};
+    use config_core::identity::{ClusterId, NodeId, RecoveryEpoch};
 
     use super::*;
 
     fn sample() -> ObservedPeerHint {
         ObservedPeerHint {
             cluster_id: ClusterId::from_bytes([0xab; 16]),
+            recovery_epoch: RecoveryEpoch(7),
             node_id: NodeId(2),
             peer_endpoint: "node-2.retcd.invalid".into(),
             client_endpoint: Some("node-2-client.retcd.invalid".into()),

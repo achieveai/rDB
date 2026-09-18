@@ -8,29 +8,45 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use common::{cluster_id, identity};
-use config_core::{ClusterId, Liveness, NodeId, ObservedPeerHint};
+use common::{cluster_id, identity, recovery_epoch};
+use config_core::{ClusterId, Liveness, NodeId, ObservedPeerHint, RecoveryEpoch};
 use config_engine::{
     validate_hint, HintVerdict, InProcTransport, MembershipView, REASON_CLUSTER_MISMATCH,
-    REASON_ENDPOINT_MISMATCH, REASON_NOT_FORMED, REASON_SELF_CLAIM, REASON_UNKNOWN_NODE,
+    REASON_ENDPOINT_MISMATCH, REASON_EPOCH_MISMATCH, REASON_NOT_FORMED, REASON_SELF_CLAIM,
+    REASON_UNKNOWN_NODE,
 };
 
 /// A committed 3-voter membership at the in-process endpoints.
 fn membership() -> MembershipView {
     let voters: BTreeSet<NodeId> = (1..=3).map(NodeId).collect();
+    let endpoints = voters
+        .iter()
+        .map(|id| (*id, InProcTransport::endpoint(*id)))
+        .collect::<BTreeMap<_, _>>();
     MembershipView {
-        endpoints: voters
-            .iter()
-            .map(|id| (*id, InProcTransport::endpoint(*id)))
-            .collect::<BTreeMap<_, _>>(),
+        // In-process nodes serve both planes from one listener, so the client endpoint is the
+        // peer endpoint. Hint validation only ever looks at the peer plane.
+        client_endpoints: endpoints.clone(),
+        endpoints,
         voters,
         membership_log_id: Some((1, 1)),
     }
 }
 
 fn hint(node_id: u64, cluster: ClusterId, endpoint: &str) -> ObservedPeerHint {
+    hint_at(node_id, cluster, recovery_epoch(), endpoint)
+}
+
+/// Like [`hint`] but names the recovery epoch the peer claims (ADR-0011).
+fn hint_at(
+    node_id: u64,
+    cluster: ClusterId,
+    epoch: RecoveryEpoch,
+    endpoint: &str,
+) -> ObservedPeerHint {
     ObservedPeerHint {
         cluster_id: cluster,
+        recovery_epoch: epoch,
         node_id: NodeId(node_id),
         peer_endpoint: endpoint.to_string(),
         client_endpoint: None,
@@ -60,6 +76,32 @@ fn ta7_validate_hint_rejection_matrix() {
             formed.clone(),
             HintVerdict::Rejected {
                 reason: REASON_CLUSTER_MISMATCH,
+            },
+        ),
+        (
+            "the right cluster at the wrong recovery epoch is a fenced-off peer, not a peer",
+            hint_at(
+                2,
+                cluster_id(),
+                RecoveryEpoch(recovery_epoch().0 + 1),
+                &InProcTransport::endpoint(NodeId(2)),
+            ),
+            formed.clone(),
+            HintVerdict::Rejected {
+                reason: REASON_EPOCH_MISMATCH,
+            },
+        ),
+        (
+            "an epoch behind ours is refused for the same reason as one ahead",
+            hint_at(
+                2,
+                cluster_id(),
+                RecoveryEpoch(recovery_epoch().0 - 1),
+                &InProcTransport::endpoint(NodeId(2)),
+            ),
+            formed.clone(),
+            HintVerdict::Rejected {
+                reason: REASON_EPOCH_MISMATCH,
             },
         ),
         (
@@ -100,6 +142,7 @@ fn ta7_validate_hint_rejection_matrix() {
             MembershipView {
                 voters: (1..=3).map(NodeId).collect(),
                 endpoints: BTreeMap::new(),
+                client_endpoints: BTreeMap::new(),
                 membership_log_id: Some((1, 1)),
             },
             HintVerdict::Rejected {
@@ -133,4 +176,42 @@ fn ta7_an_accepted_hint_carries_nothing_a_caller_could_route_on() {
         std::mem::size_of_val(&accepted),
         std::mem::size_of::<HintVerdict>()
     );
+}
+
+/// A10 (ADR-0011): identity is the *pair* `(cluster_id, recovery_epoch)`. After an unsafe
+/// recovery the cluster id does not change, so a peer that was fenced off during the recovery
+/// still advertises a hint whose `cluster_id` matches ours exactly. Only the epoch tells them
+/// apart, which is why `ObservedPeerHint` carries one.
+#[config_log::retcd_test]
+fn a10_a_hint_at_the_wrong_recovery_epoch_is_rejected_though_the_cluster_matches() {
+    let me = identity(1);
+    let view = membership();
+    let endpoint = InProcTransport::endpoint(NodeId(2));
+
+    let right = hint_at(2, cluster_id(), me.recovery_epoch, &endpoint);
+    assert_eq!(right.cluster_id, me.cluster_id);
+    assert_eq!(
+        validate_hint(&right, &view, &me),
+        HintVerdict::Accepted,
+        "the same hint at our epoch must still be accepted, or the test proves nothing"
+    );
+
+    let stale = hint_at(
+        2,
+        cluster_id(),
+        RecoveryEpoch(me.recovery_epoch.0 - 1),
+        &endpoint,
+    );
+    // Everything a pre-A10 validator could see is identical between the two hints.
+    assert_eq!(stale.cluster_id, right.cluster_id);
+    assert_eq!(stale.node_id, right.node_id);
+    assert_eq!(stale.peer_endpoint, right.peer_endpoint);
+
+    assert_eq!(
+        validate_hint(&stale, &view, &me),
+        HintVerdict::Rejected {
+            reason: REASON_EPOCH_MISMATCH,
+        }
+    );
+    assert_eq!(REASON_EPOCH_MISMATCH, "recovery_epoch mismatch");
 }

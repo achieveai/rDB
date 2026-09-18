@@ -25,3 +25,4 @@ Status values: `Proposed` | `Accepted` | `Superseded by ADR-NNNN` | `Deprecated`
 | [0015](0015-unknown-outcome-no-auto-retry.md) | Unknown mutation outcome and no automatic replay | Accepted |
 | [0016](0016-capability-reporting.md) | Capability reporting | Accepted |
 | [0017](0017-build-toolchain.md) | Build toolchain: MSVC, LLVM for RocksDB, no `protoc` | Accepted |
+| [0018](0018-daemon-lifecycle-and-cli.md) | Daemon lifecycle and CLI surface: flags, ready line, shutdown triggers, exit codes | Accepted |

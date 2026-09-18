@@ -14,12 +14,11 @@ use config_core::{
 };
 use config_log::retcd_test;
 use config_storage::{
-    Boundary, EphemeralStore, FaultAction, FaultInjector, NoFaults, RaftNodeId, TypeConfig,
+    Boundary, EphemeralStore, FaultAction, FaultInjector, NoFaults, RaftNode, RaftNodeId,
+    TypeConfig,
 };
 use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
-use openraft::{
-    BasicNode, CommittedLeaderId, Entry, EntryPayload, LogId, Membership, RaftLogReader, Vote,
-};
+use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Membership, RaftLogReader, Vote};
 use tracing::Span;
 
 fn identity() -> ClusterIdentity {
@@ -51,9 +50,9 @@ fn blank(term: u64, index: u64) -> Entry<TypeConfig> {
 
 fn membership_entry(term: u64, index: u64, voters: [u64; 3]) -> Entry<TypeConfig> {
     let voters: BTreeSet<u64> = voters.into_iter().collect();
-    let nodes: BTreeMap<u64, BasicNode> = voters
+    let nodes: BTreeMap<u64, RaftNode> = voters
         .iter()
-        .map(|id| (*id, BasicNode::new(format!("inproc://{id}"))))
+        .map(|id| (*id, RaftNode::same(format!("inproc://{id}"))))
         .collect();
     Entry {
         log_id: log_id(term, index),
@@ -356,29 +355,98 @@ async fn crash_poisons_the_store_for_every_later_call() {
     );
     assert!(s.is_poisoned());
 
-    // Everything afterwards fails, including reads and boundaries the injector never names.
-    assert!(s.log_store().read_vote().await.is_err());
-    assert!(s.log_store().get_log_state().await.is_err());
-    assert!(s.log_store().read_committed().await.is_err());
-    assert!(s.log_store().try_get_log_entries(0..10).await.is_err());
-    assert!(s.log_store().save_vote(&Vote::new(2, 1)).await.is_err());
-    assert!(s
-        .log_store()
-        .blocking_append(vec![blank(1, 1)])
-        .await
-        .is_err());
-    assert!(s.state_machine().applied_state().await.is_err());
-    assert!(s
-        .state_machine()
-        .apply(vec![put(1, 2, "/b", "2")])
-        .await
-        .is_err());
+    // *Every* fallible trait entry point, not a sample of them: a poisoned store that still
+    // answered one call would let OpenRaft believe some part of it had survived the crash.
+    // `truncate`, `purge` and the two snapshot readers are the ones that used to answer.
+    for (name, result) in poisoned_call_results(&s).await {
+        assert!(result.is_err(), "{name} answered on a poisoned store");
+    }
+}
+
+/// Call each fallible `RaftLogReader` / `RaftLogStorage` / `RaftStateMachine` method once and
+/// report its outcome by name, so a failure says which entry point leaked.
+async fn poisoned_call_results(s: &EphemeralStore) -> Vec<(&'static str, Result<(), String>)> {
+    async fn r<T, E: std::fmt::Display>(v: Result<T, E>) -> Result<(), String> {
+        v.map(|_| ()).map_err(|e| e.to_string())
+    }
+    vec![
+        (
+            "try_get_log_entries",
+            r(s.log_store().try_get_log_entries(0..10).await).await,
+        ),
+        (
+            "get_log_state",
+            r(s.log_store().get_log_state().await).await,
+        ),
+        (
+            "save_vote",
+            r(s.log_store().save_vote(&Vote::new(2, 1)).await).await,
+        ),
+        ("read_vote", r(s.log_store().read_vote().await).await),
+        (
+            "save_committed",
+            r(s.log_store().save_committed(Some(log_id(1, 1))).await).await,
+        ),
+        (
+            "read_committed",
+            r(s.log_store().read_committed().await).await,
+        ),
+        (
+            "append",
+            r(s.log_store().blocking_append(vec![blank(1, 1)]).await).await,
+        ),
+        (
+            "truncate",
+            r(s.log_store().truncate(log_id(1, 1)).await).await,
+        ),
+        ("purge", r(s.log_store().purge(log_id(1, 1)).await).await),
+        (
+            "applied_state",
+            r(s.state_machine().applied_state().await).await,
+        ),
+        (
+            "apply",
+            r(s.state_machine().apply(vec![put(1, 2, "/b", "2")]).await).await,
+        ),
+        (
+            "build_snapshot",
+            r({
+                use openraft::RaftSnapshotBuilder;
+                s.state_machine()
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+            })
+            .await,
+        ),
+        (
+            "begin_receiving_snapshot",
+            r(s.state_machine().begin_receiving_snapshot().await).await,
+        ),
+        (
+            "install_snapshot",
+            r(s.state_machine()
+                .install_snapshot(
+                    &openraft::SnapshotMeta::default(),
+                    Box::new(std::io::Cursor::new(Vec::new())),
+                )
+                .await)
+            .await,
+        ),
+        (
+            "get_current_snapshot",
+            r(s.state_machine().get_current_snapshot().await).await,
+        ),
+    ]
 }
 
 #[retcd_test]
 async fn snapshots_are_unsupported_but_never_panic() {
     let s = plain_store();
     let mut sm = s.state_machine();
+    // A *healthy* store has no snapshot and says so with `Ok(None)`. Only a poisoned one
+    // errors here — the poison check must not become an unconditional refusal.
     assert!(sm.get_current_snapshot().await.unwrap().is_none());
     assert!(sm.begin_receiving_snapshot().await.is_ok());
     let mut builder = sm.get_snapshot_builder().await;

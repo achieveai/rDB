@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{ClusterId, NodeId};
+use crate::identity::{ClusterId, NodeId, RecoveryEpoch};
 
 /// Local liveness observation of a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +27,13 @@ pub enum Liveness {
 pub struct ObservedPeerHint {
     /// Cluster the peer claims to belong to.
     pub cluster_id: ClusterId,
+    /// Recovery epoch the peer claims (ADR-0011).
+    ///
+    /// Carried so a hint from the *right* cluster at the *wrong* epoch can be rejected. After
+    /// an unsafe recovery the surviving cluster keeps its `ClusterId` and bumps its epoch, so
+    /// `cluster_id` alone cannot tell a live peer from a stale one that was fenced off during
+    /// the recovery and is still advertising the pre-recovery membership.
+    pub recovery_epoch: RecoveryEpoch,
     /// Node id the peer claims.
     pub node_id: NodeId,
     /// Candidate Raft peer endpoint (`host:port`).

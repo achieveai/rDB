@@ -80,6 +80,13 @@ pub struct ScenarioResult {
     pub observed: serde_json::Value,
 }
 
+/// How many scenarios [`run_all`] must produce: C-01..C-15.
+///
+/// Asserted by [`ConformanceReport::assert_all_passed`] so that a report which lost scenarios
+/// — a truncated run, a hand-built report, a future refactor that forgets a `run_one` — fails
+/// instead of passing vacuously on the ones that survived.
+pub const SCENARIO_COUNT: usize = 15;
+
 /// The result of running every scenario once.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConformanceReport {
@@ -99,7 +106,17 @@ impl ConformanceReport {
     }
 
     /// Panic, listing every failure, unless [`ConformanceReport::passed`].
+    ///
+    /// The scenario count is checked first: "nothing failed" is only meaningful once we know
+    /// all [`SCENARIO_COUNT`] scenarios actually ran.
     pub fn assert_all_passed(&self) {
+        assert_eq!(
+            self.results.len(),
+            SCENARIO_COUNT,
+            "the conformance report has {} scenarios, expected {SCENARIO_COUNT} (C-01..C-15); ran: {:?}",
+            self.results.len(),
+            self.results.iter().map(|r| r.id).collect::<Vec<_>>()
+        );
         let failures = self.failures();
         assert!(
             failures.is_empty(),

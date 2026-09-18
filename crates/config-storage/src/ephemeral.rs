@@ -31,37 +31,16 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use config_core::{ClusterIdentity, CommandResponse, Durability, KvState, Limits};
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    AnyError, BasicNode, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState,
-    OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError,
-    StoredMembership, Vote,
+    Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend, RaftLogReader,
+    RaftSnapshotBuilder, SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use tracing::Span;
 
 use crate::fault::{Boundary, FaultAction, FaultCounters, FaultInjector};
 use crate::reader::StateReader;
-use crate::types::{RaftNodeId, TypeConfig};
-
-/// Maximum key bytes rendered into a `key_hex` log field (64 hex chars, ADR-0013).
-const KEY_HEX_MAX_BYTES: usize = 32;
-
-/// Render key bytes as lowercase hex, capped so a log line can never carry a whole large key.
-fn key_hex(key: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(KEY_HEX_MAX_BYTES * 2);
-    for byte in key.iter().take(KEY_HEX_MAX_BYTES) {
-        out.push(DIGITS[usize::from(byte >> 4)] as char);
-        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
-    }
-    out
-}
-
-fn io_error(
-    subject: ErrorSubject<RaftNodeId>,
-    verb: ErrorVerb,
-    msg: String,
-) -> StorageError<RaftNodeId> {
-    StorageIOError::new(subject, verb, AnyError::error(msg)).into()
-}
+use crate::trace::TraceRegistry;
+use crate::types::{RaftNode, RaftNodeId, TypeConfig};
+use crate::util::{io_error, key_hex, outcome_name};
 
 #[derive(Debug, Default)]
 struct LogInner {
@@ -77,7 +56,7 @@ struct LogInner {
 struct SmInner {
     kv: KvState,
     last_applied: Option<LogId<RaftNodeId>>,
-    membership: StoredMembership<RaftNodeId, BasicNode>,
+    membership: StoredMembership<RaftNodeId, RaftNode>,
 }
 
 struct Shared {
@@ -85,6 +64,7 @@ struct Shared {
     faults: Arc<dyn FaultInjector>,
     counters: Arc<FaultCounters>,
     span: Span,
+    traces: Arc<TraceRegistry>,
     poisoned: AtomicBool,
     applied_commands: AtomicU64,
     log: Mutex<LogInner>,
@@ -158,6 +138,22 @@ impl Shared {
                     format!("injected storage crash at {boundary}; storage is poisoned"),
                 ))
             }
+            FaultAction::Delay(d) => {
+                // `EphemeralStore`'s boundary hook runs directly on the caller's task — unlike
+                // `RocksStore`, nothing here offloads to a blocking thread pool, so this stalls
+                // whatever task crossed the boundary (by design: `EphemeralStore` has no I/O to
+                // move off the async runtime in the first place). M2-65 exercises `RocksStore`
+                // specifically for this reason; `EphemeralStore` still has to handle the variant
+                // to stay exhaustive.
+                tracing::debug!(
+                    boundary = boundary.as_str(),
+                    fault_action = "delay",
+                    delay_ms = d.as_millis() as u64,
+                    "injected storage delay"
+                );
+                std::thread::sleep(d);
+                Ok(())
+            }
         }
     }
 }
@@ -199,6 +195,7 @@ impl EphemeralStore {
                 faults,
                 counters: Arc::new(FaultCounters::default()),
                 span,
+                traces: Arc::new(TraceRegistry::new()),
                 poisoned: AtomicBool::new(false),
                 applied_commands: AtomicU64::new(0),
                 log: Mutex::new(LogInner::default()),
@@ -277,6 +274,15 @@ impl EphemeralStore {
     /// Per-boundary crossing counters (test plan TA-4).
     pub fn counters(&self) -> Arc<FaultCounters> {
         Arc::clone(&self.shared.counters)
+    }
+
+    /// This node's `command → trace_id` side table (ADR-0013).
+    ///
+    /// The engine writes it (on the client path and on peer ingress); [`EphemeralSm::apply`]
+    /// reads it so a replicated entry's apply line carries the originating client's
+    /// `trace_id`. Shared by every clone of the store.
+    pub fn traces(&self) -> Arc<TraceRegistry> {
+        Arc::clone(&self.shared.traces)
     }
 }
 
@@ -556,7 +562,7 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
     ) -> Result<
         (
             Option<LogId<RaftNodeId>>,
-            StoredMembership<RaftNodeId, BasicNode>,
+            StoredMembership<RaftNodeId, RaftNode>,
         ),
         StorageError<RaftNodeId>,
     > {
@@ -603,10 +609,12 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                             tracing::debug!(
                                 log_index = log_id.index,
                                 term = log_id.leader_id.term,
-                                op = "blank",
+                                op = "apply",
+                                command = "blank",
                                 key_hex = "",
                                 outcome = "noop",
                                 revision = sm.kv.cluster_revision(),
+                                trace_id = "",
                                 "applied non-command entry"
                             );
                             CommandResponse::Noop
@@ -616,16 +624,19 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                             tracing::debug!(
                                 log_index = log_id.index,
                                 term = log_id.leader_id.term,
-                                op = "membership",
+                                op = "apply",
+                                command = "membership",
                                 key_hex = "",
                                 outcome = "noop",
                                 revision = sm.kv.cluster_revision(),
+                                trace_id = "",
                                 "applied non-command entry"
                             );
                             CommandResponse::Noop
                         }
                         EntryPayload::Normal(cmd) => {
                             commands += 1;
+                            let trace_id = self.shared.traces.lookup(&cmd);
                             let response = sm.kv.apply(&cmd);
                             let (outcome, revision) = match &response {
                                 CommandResponse::Mutation { response, .. } => {
@@ -639,10 +650,12 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                             tracing::debug!(
                                 log_index = log_id.index,
                                 term = log_id.leader_id.term,
-                                op = cmd.op_name(),
+                                op = "apply",
+                                command = cmd.op_name(),
                                 key_hex = %key_hex(cmd.key()),
                                 outcome,
                                 revision,
+                                trace_id = trace_id.as_deref().unwrap_or(""),
                                 "applied command entry"
                             );
                             response
@@ -650,10 +663,13 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                     };
                     out.push(response);
                 }
+                // Inside the critical section, with `last_applied`: an observer that has seen
+                // the applied index move must also see the command that moved it, or a test
+                // that waits on the index and then reads the count races the apply path.
+                self.shared
+                    .applied_commands
+                    .fetch_add(commands, Ordering::SeqCst);
             }
-            self.shared
-                .applied_commands
-                .fetch_add(commands, Ordering::SeqCst);
 
             self.shared.boundary(
                 Boundary::AfterStateBatch,
@@ -671,12 +687,24 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<RaftNodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+        // A crashed store must not hand OpenRaft a buffer to stream a snapshot into: the
+        // whole point of poisoning is that *every* later call fails, and a store that
+        // accepted a snapshot after a crash would look like it had recovered.
+        self.shared.span.clone().in_scope(|| {
+            if self.shared.is_poisoned() {
+                return Err(io_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Write,
+                    "storage is poisoned by an injected crash".to_string(),
+                ));
+            }
+            Ok(Box::new(Cursor::new(Vec::new())))
+        })
     }
 
     async fn install_snapshot(
         &mut self,
-        _meta: &SnapshotMeta<RaftNodeId, BasicNode>,
+        _meta: &SnapshotMeta<RaftNodeId, RaftNode>,
         _snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<RaftNodeId>> {
         Err(io_error(
@@ -689,15 +717,18 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<RaftNodeId>> {
-        Ok(None)
-    }
-}
-
-fn outcome_name(outcome: config_core::MutationOutcome) -> &'static str {
-    match outcome {
-        config_core::MutationOutcome::Applied => "applied",
-        config_core::MutationOutcome::Conflict => "conflict",
-        config_core::MutationOutcome::NotFound => "not_found",
+        // A poison check, not an unconditional error: a healthy store legitimately has no
+        // snapshot and must say so with `Ok(None)` (`SnapshotPolicy::Never`).
+        self.shared.span.clone().in_scope(|| {
+            if self.shared.is_poisoned() {
+                return Err(io_error(
+                    ErrorSubject::Snapshot(None),
+                    ErrorVerb::Read,
+                    "storage is poisoned by an injected crash".to_string(),
+                ));
+            }
+            Ok(None)
+        })
     }
 }
 
@@ -715,7 +746,7 @@ impl StateReader for EphemeralReader {
         self.shared.sm().last_applied
     }
 
-    fn membership(&self) -> StoredMembership<RaftNodeId, BasicNode> {
+    fn membership(&self) -> StoredMembership<RaftNodeId, RaftNode> {
         self.shared.sm().membership.clone()
     }
 }

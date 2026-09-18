@@ -2,7 +2,7 @@
 //! peer-plane server side (spec §6.3, §8.1, §10.1, §13.1; ADR-0009, ADR-0011, ADR-0015).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -14,16 +14,18 @@ use config_core::{
     NodeId, ObservedPeerHint, Pagination, Principal, PutRequest, WatchResumption,
 };
 use config_log::TraceContext;
-use config_storage::{RaftNodeId, StateReader, TypeConfig};
+use config_storage::{RaftNode, RaftNodeId, StateReader, TraceRegistry, TypeConfig};
 use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, InitializeError, RaftError};
-use openraft::{BasicNode, Raft, ServerState};
+use openraft::{Raft, ServerState};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
 use crate::config::{NodeConfig, StorageHandle};
 use crate::error::{EngineError, FormationError, FormationPlan, Timeout};
 use crate::hint::{validate_hint, HintVerdict};
-use crate::metrics::{Health, LogIdView, MembershipView, NodeMetrics, NodeRole};
+use crate::metrics::{
+    Health, HealthPayload, LogIdView, MembershipView, NodeMetrics, NodeRole, PolicySummary,
+};
 use crate::network::EngineNetworkFactory;
 use crate::transport::{
     PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSink, PeerTransport,
@@ -46,25 +48,37 @@ fn key_hex(key: &[u8]) -> String {
     out
 }
 
-/// Validate a [`GetRequest`]'s key.
+/// What a `CommandResponse::Noop` for a *command* entry is reported as.
 ///
-/// `config-core` exposes `validate_put`/`validate_delete`/`validate_list` but no
-/// `validate_get`, because a `Get` never becomes a command and so never needs apply-time
-/// re-validation. The edge still has to reject an empty or over-long key, and it must produce
-/// *byte-identical* `InvalidArgument` detail to `config-core`'s shared key validator so a
-/// client cannot tell `Get` from `Put` by its error text.
-fn validate_get(req: &GetRequest, limits: &Limits) -> Result<(), ConfigError> {
-    if req.key.is_empty() {
-        return Err(ConfigError::invalid_argument("key must not be empty"));
+/// Deliberately **not** `Unavailable`. By the time `Raft::client_write` returns, the entry is
+/// committed and applied on this node. `ConfigError::Unavailable` is contracted to mean
+/// "rejected before entering the log", and `ConfigError::is_safe_to_resubmit` answers `true`
+/// for it, so reporting this case as `Unavailable` invited a caller to replay a mutation that
+/// had already taken effect — ADR-0015's no-duplicate rule broken by the one path that knows
+/// for certain the write landed.
+///
+/// `Noop` for a command entry is a state-machine contract violation, not a condition a client
+/// can do anything about: the store answers `Mutation` or `Rejected` for a command, and `Noop`
+/// belongs to blank and membership entries. `config-core` has no `Internal` variant of its
+/// own, so the internal-class error is [`ConfigError::FatalStorage`] — `INTERNAL` on the wire
+/// (spec §6.2), and never resubmittable.
+fn noop_for_command_entry() -> ConfigError {
+    ConfigError::FatalStorage {
+        detail: "the state machine answered Noop for a command entry; the entry is committed \
+                 and applied, so this outcome must not be resubmitted"
+            .to_string(),
     }
-    if req.key.len() > limits.max_key_bytes {
-        return Err(ConfigError::invalid_argument(format!(
-            "key is {} bytes, limit is {}",
-            req.key.len(),
-            limits.max_key_bytes
-        )));
+}
+
+/// A 32-byte digest as 64 lowercase hex characters (test plan TA-2).
+fn hex32(bytes: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 0x0f)] as char);
     }
-    Ok(())
+    out
 }
 
 pub(crate) struct NodeInner {
@@ -75,15 +89,32 @@ pub(crate) struct NodeInner {
     authorizer: Arc<dyn Authorizer>,
     gossip: Arc<dyn GossipObservationSource>,
     span: Span,
+    /// `command -> trace_id`, shared with this node's store so the apply line can name the
+    /// client trace that produced the entry (ADR-0013).
+    traces: Arc<TraceRegistry>,
     stopped: AtomicBool,
     accepted_hints: Mutex<BTreeMap<NodeId, ObservedPeerHint>>,
     background: Mutex<Option<JoinHandle<()>>>,
+    /// Authorization decisions refused, counted in the one authorize seam (M3-81).
+    authz_denied: AtomicU64,
+    /// Client connections whose transport identity could not be established (M3-81). The
+    /// engine never sees a certificate, so only the transport can count these.
+    authn_rejected: AtomicU64,
 }
 
 /// A running rEtcd node: one OpenRaft instance, one store, one authorizer.
 ///
 /// Cheap to clone (one `Arc`); every clone is the same node. The embedder holds one and
 /// hands out [`crate::DirectClient`]s from it.
+///
+/// # Dropping is not stopping
+///
+/// There is no `Drop` impl that shuts OpenRaft down, and dropping the last `ConfigNode` is
+/// **not** a graceful stop. The background observer holds a `Weak` and exits on its next tick,
+/// and OpenRaft's core task ends when its own handles drop — both asynchronously, at an
+/// instant nothing here observes. Until then the node still answers peer RPCs and still
+/// counts toward quorum. Call [`ConfigNode::stop`] and await it: that is the only point at
+/// which the node has demonstrably stopped serving.
 #[derive(Clone)]
 pub struct ConfigNode {
     inner: Arc<NodeInner>,
@@ -141,21 +172,42 @@ impl ConfigNode {
                 .map_err(|e| EngineError::Raft(e.to_string()))?,
         );
 
+        let traces = storage.traces();
+
         let factory = EngineNetworkFactory {
             identity,
             transport,
             span: span.clone(),
+            traces: Arc::clone(&traces),
         };
 
-        let raft = Raft::new(
-            identity.node_id.0,
-            raft_config,
-            factory,
-            storage.log_store(),
-            storage.state_machine(),
-        )
-        .instrument(span.clone())
-        .await
+        // Hand-matched per store kind rather than dispatched through a wrapper: `Raft::new` is
+        // generic over the two storage types but always yields the same `Raft<TypeConfig>`, so
+        // a match here costs one arm per store and keeps every OpenRaft call monomorphic.
+        let raft = match &storage {
+            StorageHandle::Ephemeral(s) => {
+                Raft::new(
+                    identity.node_id.0,
+                    raft_config,
+                    factory,
+                    s.log_store(),
+                    s.state_machine(),
+                )
+                .instrument(span.clone())
+                .await
+            }
+            StorageHandle::Rocks(s) => {
+                Raft::new(
+                    identity.node_id.0,
+                    raft_config,
+                    factory,
+                    s.log_store(),
+                    s.state_machine(),
+                )
+                .instrument(span.clone())
+                .await
+            }
+        }
         .map_err(|e| EngineError::Raft(e.to_string()))?;
 
         let inner = Arc::new(NodeInner {
@@ -166,9 +218,12 @@ impl ConfigNode {
             authorizer,
             gossip,
             span: span.clone(),
+            traces,
             stopped: AtomicBool::new(false),
             accepted_hints: Mutex::new(BTreeMap::new()),
             background: Mutex::new(None),
+            authz_denied: AtomicU64::new(0),
+            authn_rejected: AtomicU64::new(0),
         });
 
         let handle = tokio::spawn(
@@ -181,7 +236,15 @@ impl ConfigNode {
         );
         *inner.background.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
-        span.in_scope(|| tracing::info!(peer_endpoint = %inner.cfg.peer_endpoint, "node started"));
+        span.in_scope(|| {
+            tracing::info!(
+                peer_endpoint = %inner.cfg.peer_endpoint,
+                client_endpoint = %inner.cfg.client_endpoint(),
+                durability = ?inner.storage.durability(),
+                authz_kind = inner.cfg.authz_kind.as_str(),
+                "node started"
+            )
+        });
         Ok(ConfigNode { inner })
     }
 
@@ -222,24 +285,64 @@ impl ConfigNode {
                 },
             }));
         }
-        if !plan.voters.contains_key(&identity.node_id) {
+        let Some(planned_peer) = plan.voters.get(&identity.node_id) else {
             return Err(FormationError::NotAVoter);
+        };
+        // The plan's entry for *this* node must be what this node actually serves. Without
+        // this check `NodeConfig::peer_endpoint` was decorative: the plan decided what went
+        // into committed membership, and a node could advertise one address while the cluster
+        // committed another. The disagreement would then surface as an unreachable peer or a
+        // leader hint clients cannot dial.
+        let planned_client = plan
+            .client_endpoint_of(identity.node_id)
+            .unwrap_or(planned_peer.as_str());
+        for (plane, planned, configured) in [
+            (
+                "peer",
+                planned_peer.as_str(),
+                inner.cfg.peer_endpoint.as_str(),
+            ),
+            ("client", planned_client, inner.cfg.client_endpoint()),
+        ] {
+            if planned != configured {
+                span.in_scope(|| {
+                    tracing::warn!(
+                        plane,
+                        planned,
+                        configured,
+                        "formation plan disagrees with this node's configured endpoint"
+                    )
+                });
+                return Err(FormationError::EndpointMismatch {
+                    plane,
+                    planned: planned.to_string(),
+                    configured: configured.to_string(),
+                });
+            }
         }
         // Checked before freshness so a second `form_cluster` on a working cluster reports the
         // thing the caller actually did wrong. A store that is dirty but *unformed* — a
         // half-wiped data directory — still reports `StoreNotFresh`, which is the case
         // ADR-0011 exists for.
-        if inner.committed_membership().is_formed() {
+        //
+        // This is the one place that deliberately consults the *effective* membership as well
+        // as the committed one. A hint must only ever come from committed membership, but a
+        // formation guard wants the stricter of the two: a node that has merely *appended* a
+        // membership entry is already formed enough that forming it again is a mistake.
+        if inner.committed_membership().is_formed() || inner.effective_membership().is_formed() {
             return Err(FormationError::AlreadyFormed);
         }
         if !inner.storage.is_fresh() {
             return Err(FormationError::StoreNotFresh);
         }
 
-        let members: BTreeMap<RaftNodeId, BasicNode> = plan
+        let members: BTreeMap<RaftNodeId, RaftNode> = plan
             .voters
             .iter()
-            .map(|(id, endpoint)| (id.0, BasicNode::new(endpoint.clone())))
+            .map(|(id, peer)| {
+                let client = plan.client_endpoint_of(*id).unwrap_or(peer.as_str());
+                (id.0, RaftNode::new(peer.clone(), client))
+            })
             .collect();
 
         span.in_scope(|| {
@@ -308,10 +411,35 @@ impl ConfigNode {
         self.inner.reader.state_hash()
     }
 
-    /// Committed membership: voter ids, their committed peer endpoints, and the membership
-    /// log id. The only authoritative answer to "who is in this cluster".
+    /// Committed membership: voter ids, their committed peer and client endpoints, and the
+    /// membership log id. The only authoritative answer to "who is in this cluster".
+    ///
+    /// Read from the applied state machine, which only ever holds committed entries — not
+    /// from OpenRaft's *effective* membership, which moves before any quorum has agreed
+    /// (ADR-0009).
     pub fn committed_membership(&self) -> MembershipView {
         self.inner.committed_membership()
+    }
+
+    /// The Raft core's own committed membership, asked of the core task directly.
+    ///
+    /// Equivalent to [`ConfigNode::committed_membership`] — the state machine cannot have
+    /// applied a membership entry the core has not committed, and the core commits nothing it
+    /// will not apply — but it comes from the other side of the boundary, which is what makes
+    /// it worth asserting the two agree. Async, because OpenRaft answers it on its core task.
+    pub async fn raft_committed_membership(&self) -> Result<MembershipView, EngineError> {
+        self.inner
+            .raft
+            .with_raft_state(|st| {
+                let m = st.membership_state.committed();
+                membership_view(
+                    m.voter_ids(),
+                    m.nodes().map(|(id, node)| (*id, node.clone())),
+                    *m.log_id(),
+                )
+            })
+            .await
+            .map_err(|e| EngineError::Raft(e.to_string()))
     }
 
     /// The validated leader hint, built from `current_leader` plus committed membership.
@@ -323,6 +451,71 @@ impl ConfigNode {
     /// What this node will do with client traffic right now (spec §18.1).
     pub fn health(&self) -> Health {
         self.inner.health()
+    }
+
+    /// Whether this node will serve client traffic: committed membership known, storage not
+    /// poisoned, and an authorization model actually in force (OQ-19).
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_ready()
+    }
+
+    /// The full serializable health payload (test plan TA-17).
+    ///
+    /// Async because `committed` — the Raft core's commit index — is only knowable by asking
+    /// the core task. Carries no keys and no values, only ids, counts, revisions, enums and
+    /// the state-hash digest, so it is safe to serve on an unauthenticated loopback listener
+    /// (§15.2, OQ-16).
+    ///
+    /// [`ConfigNode::health`] stays as the cheap synchronous "what will you do with my
+    /// request" answer; this is the cross-process state oracle.
+    pub async fn health_payload(&self) -> HealthPayload {
+        let inner = &self.inner;
+        let committed = inner
+            .raft
+            .with_raft_state(|st| st.committed.map(|l| l.index))
+            .await
+            .ok()
+            .flatten();
+        let m = inner.metrics();
+        let membership = inner.committed_membership();
+        let (node_id, cluster_id, recovery_epoch) =
+            HealthPayload::identity_fields(&inner.cfg.identity);
+        HealthPayload {
+            node_id,
+            cluster_id,
+            recovery_epoch,
+            role: m.role,
+            current_leader: m.current_leader,
+            term: m.current_term,
+            last_applied: m.last_applied.map(|l| l.index),
+            committed,
+            membership_voter_ids: membership.voters.iter().copied().collect(),
+            membership_log_id: membership
+                .membership_log_id
+                .map(|(term, index)| LogIdView::new(term, index)),
+            cluster_revision: m.cluster_revision,
+            state_hash_hex: hex32(&inner.reader.state_hash()),
+            applied_commands: m.applied_commands,
+            durability: inner.storage.durability(),
+            ready: inner.is_ready(),
+            authz_kind: inner.cfg.authz_kind,
+            transport_security: inner.cfg.transport_security,
+            policy: inner.policy_summary(),
+            authz_denied: m.authz_denied,
+            authn_rejected: m.authn_rejected,
+        }
+    }
+
+    /// Record that a caller's transport identity could not be established (M3-81).
+    ///
+    /// Called by the transport — `config-grpc`'s client plane, when the peer certificate
+    /// yields no principal — because the engine never sees a certificate. It is deliberately
+    /// *not* an authorization denial: no principal existed, so no [`config_core::Authorizer`]
+    /// was consulted and no audit line was written. The two counters are kept apart for that
+    /// reason: "who are you" failing and "you may not" failing are different operator
+    /// problems with different fixes.
+    pub fn record_authn_rejection(&self) {
+        self.inner.authn_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// What this node actually guarantees (ADR-0016).
@@ -427,7 +620,7 @@ impl ConfigNode {
                 principal,
                 "get",
                 key.clone(),
-                move || validate_get(&req, &limits),
+                move || config_core::validate_get(&req, &limits),
                 move |s, _: &()| s.get_response(&key),
                 |r: &GetResponse| r.read_revision,
             )
@@ -489,25 +682,72 @@ impl NodeInner {
             applied_commands: self.storage.applied_commands(),
             running_state_ok: m.running_state.is_ok(),
             millis_since_quorum_ack: m.millis_since_quorum_ack,
+            authz_denied: self.authz_denied.load(Ordering::Relaxed),
+            authn_rejected: self.authn_rejected.load(Ordering::Relaxed),
         }
     }
 
+    /// The policy this node holds, as the health payload reports it (M3-42).
+    ///
+    /// `grants` is forced to `0` unless a static allowlist is actually in force: an
+    /// `AllowAll`, missing, or invalid policy enforces no grant, and reporting a non-zero
+    /// count for one of those would be the exact "looks guarded, is not" reading ADR-0016
+    /// exists to prevent.
+    fn policy_summary(&self) -> PolicySummary {
+        let kind = self.cfg.authz_kind;
+        PolicySummary {
+            kind: kind.into(),
+            grants: match kind {
+                crate::AuthzKind::StaticAllowlist => self.cfg.policy_grants,
+                _ => 0,
+            },
+            policy_hash_hex: self.cfg.policy_document_sha256.as_ref().map(hex32),
+        }
+    }
+
+    /// Committed membership, read from the state machine.
+    ///
+    /// The state machine's `StoredMembership` is set when a membership entry is *applied*, and
+    /// an applied entry is committed by definition. `RaftMetrics::membership_config` is the
+    /// **effective** membership, which moves as soon as an entry is appended — before any
+    /// quorum has agreed to it. Deriving a client-followable hint from that would mean handing
+    /// a client an address a quorum never committed to, which is precisely what ADR-0009
+    /// forbids.
+    ///
+    /// Synchronous on purpose: `health()`, `hint_for()` and the gossip poll all need it, and
+    /// OpenRaft's own `with_raft_state` is an async round trip through the core task. Use
+    /// [`ConfigNode::raft_committed_membership`] when the Raft core's own committed view is
+    /// the thing under test.
     fn committed_membership(&self) -> MembershipView {
-        let m = self.raft.metrics().borrow().membership_config.clone();
-        MembershipView {
-            voters: m.voter_ids().map(NodeId).collect(),
-            endpoints: m
-                .nodes()
-                .map(|(id, node)| (NodeId(*id), node.addr.clone()))
-                .collect(),
-            membership_log_id: m.log_id().map(|l| (l.leader_id.term, l.index)),
-        }
+        let m = self.reader.membership();
+        membership_view(
+            m.voter_ids(),
+            m.nodes().map(|(id, node)| (*id, node.clone())),
+            *m.log_id(),
+        )
     }
 
-    /// The committed endpoint of `node_id`, as a client-followable hint.
+    /// OpenRaft's *effective* membership: appended, not necessarily committed.
+    ///
+    /// Only the formation guard uses this (see `form_cluster`); nothing client-facing may.
+    fn effective_membership(&self) -> MembershipView {
+        let m = self.raft.metrics().borrow().membership_config.clone();
+        membership_view(
+            m.voter_ids(),
+            m.nodes().map(|(id, node)| (*id, node.clone())),
+            *m.log_id(),
+        )
+    }
+
+    /// The committed **client-plane** endpoint of `node_id`, as a client-followable hint.
+    ///
+    /// The client endpoint, not the peer endpoint: a hint exists to tell a client where to
+    /// retry, and the peer plane is not a place a client can go (ADR-0009). The peer endpoint
+    /// of the same node stays available through [`MembershipView::endpoint_of`], which is
+    /// what the transport dials.
     fn hint_for(&self, node_id: NodeId) -> Option<LeaderHint> {
         self.committed_membership()
-            .endpoint_of(node_id)
+            .client_endpoint_of(node_id)
             .map(|endpoint| LeaderHint {
                 node_id,
                 endpoint: endpoint.to_string(),
@@ -519,25 +759,40 @@ impl NodeInner {
         self.hint_for(NodeId(leader))
     }
 
+    /// Whether this node will serve client traffic at all: membership known, storage not
+    /// poisoned, and an authorization model actually in force (OQ-19).
+    fn is_ready(&self) -> bool {
+        !self.is_stopped()
+            && self.cfg.authz_kind.is_present()
+            && !self.storage.is_poisoned()
+            && self.committed_membership().is_formed()
+    }
+
     fn health(&self) -> Health {
         if self.is_stopped() {
             return Health::Stopped;
         }
         let rx = self.raft.metrics();
-        let (running, leader, formed) = {
+        let (running, leader) = {
             let m = rx.borrow();
-            (
-                m.running_state.clone(),
-                m.current_leader,
-                m.membership_config.voter_ids().next().is_some(),
-            )
+            (m.running_state.clone(), m.current_leader)
         };
         if let Err(fatal) = running {
             return Health::Unavailable {
                 reason: format!("raft core stopped: {fatal}"),
             };
         }
-        if !formed {
+        if !self.cfg.authz_kind.is_present() {
+            return Health::Unavailable {
+                reason: format!("authorization policy is {}", self.cfg.authz_kind),
+            };
+        }
+        if self.storage.is_poisoned() {
+            return Health::Unavailable {
+                reason: "storage is poisoned".to_string(),
+            };
+        }
+        if !self.committed_membership().is_formed() {
             return Health::Unavailable {
                 reason: "cluster is not formed".to_string(),
             };
@@ -586,22 +841,51 @@ impl NodeInner {
         }
     }
 
+    /// The one authorization seam (ADR-0012, spec §15.2).
+    ///
+    /// `put`/`delete` ask for [`Action::Write`] on the key; `get` asks for [`Action::Read`] on
+    /// the key; `list` asks for [`Action::Read`] on the **prefix**, so a scan is checked
+    /// against the range it would actually return rather than against one member of it
+    /// (OQ-22). Every decision — allow or deny — produces exactly one
+    /// [`config_core::audit`] line, so the audit trail has no gaps and no duplicates.
+    ///
+    /// A node whose policy is [`crate::AuthzKind::Missing`] or [`crate::AuthzKind::Invalid`]
+    /// denies here, before Raft is touched: failing closed is the only safe reading of "the
+    /// operator meant to restrict this and we could not load the restriction" (OQ-19).
     fn authorize(
         &self,
         principal: &Principal,
         action: Action,
         key_or_prefix: &[u8],
     ) -> Result<(), ConfigError> {
-        match self.authorizer.authorize(principal, action, key_or_prefix) {
+        let decision = if self.cfg.authz_kind.is_present() {
+            self.authorizer.authorize(principal, action, key_or_prefix)
+        } else {
+            Decision::deny(format!(
+                "node is not ready to authorize: policy is {}",
+                self.cfg.authz_kind
+            ))
+        };
+        config_core::audit(
+            principal,
+            action,
+            key_or_prefix,
+            &decision,
+            self.cfg.authz_kind.into(),
+        );
+        match decision {
             Decision::Allow => Ok(()),
-            Decision::Deny { reason } => Err(ConfigError::PermissionDenied {
-                detail: format!(
-                    "principal {:?} may not {:?} key_hex={} ({reason})",
-                    principal.name,
-                    action,
-                    key_hex(key_or_prefix)
-                ),
-            }),
+            Decision::Deny { reason } => {
+                self.authz_denied.fetch_add(1, Ordering::Relaxed);
+                Err(ConfigError::PermissionDenied {
+                    detail: format!(
+                        "principal {:?} may not {:?} key_hex={} ({reason})",
+                        principal.name,
+                        action,
+                        key_hex(key_or_prefix)
+                    ),
+                })
+            }
         }
     }
 
@@ -616,9 +900,14 @@ impl NodeInner {
     ) -> Result<MutationResponse, ConfigError> {
         let started = Instant::now();
         let result = self.mutate_inner(principal, key.as_ref(), build).await;
-        self.log_outcome(op, principal, key.as_ref(), started, &result, |r| {
-            r.revision
-        });
+        self.log_outcome(
+            OutcomeLine::write(op),
+            principal,
+            key.as_ref(),
+            started,
+            &result,
+            |r| r.revision,
+        );
         result
     }
 
@@ -635,6 +924,12 @@ impl NodeInner {
                 reason: "stopped".to_string(),
             });
         }
+        // Before replication, so the entry is already labelled when the apply path (which runs
+        // on OpenRaft's own state-machine task, outside this span) reaches it, and when the
+        // replication task builds the `AppendEntries` that carries it to the followers.
+        if let Some(trace) = TraceContext::current() {
+            self.traces.record(&cmd, &trace.trace_id);
+        }
 
         match tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await {
             // The deadline elapsed *after* submission, so the mutation may still commit.
@@ -645,9 +940,7 @@ impl NodeInner {
                 CommandResponse::Rejected { reason } => {
                     Err(ConfigError::InvalidArgument { detail: reason })
                 }
-                CommandResponse::Noop => Err(ConfigError::Unavailable {
-                    reason: "state machine returned no answer for a command entry".to_string(),
-                }),
+                CommandResponse::Noop => Err(noop_for_command_entry()),
             },
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f)))) => {
                 Err(self.not_leader(f.leader_id.map(NodeId)))
@@ -680,7 +973,7 @@ impl NodeInner {
             .read_inner(principal, key_or_prefix.as_ref(), validate, project)
             .await;
         self.log_outcome(
-            op,
+            OutcomeLine::read(op),
             principal,
             key_or_prefix.as_ref(),
             started,
@@ -727,7 +1020,13 @@ impl NodeInner {
                         out = Some(f(s, &validated));
                     }
                 });
-                Ok(out.expect("with_state always invokes its closure exactly once"))
+                // `StateReader::with_state` is contracted to call its closure exactly once.
+                // A store that broke that contract would be returning no state at all, so the
+                // honest answer is a retryable `Unavailable` naming the broken contract —
+                // panicking inside a client call would take the whole node's runtime with it.
+                out.ok_or_else(|| ConfigError::Unavailable {
+                    reason: "state reader did not yield applied state".to_string(),
+                })
             }
         }
     }
@@ -745,28 +1044,38 @@ impl NodeInner {
         }
     }
 
+    /// The one client-facing outcome line per request (ADR-0013 `info` level).
+    ///
+    /// `outcome` distinguishes success from failure so a query never has to know two message
+    /// spellings for one operation. `role` is recorded here rather than on the node span
+    /// because a node's role changes while the span lives, and a query that asks "what did the
+    /// *leader* log" needs the role at the time of the line.
     fn log_outcome<T>(
         &self,
-        op: &'static str,
+        line: OutcomeLine,
         principal: &Principal,
         key: &[u8],
         started: Instant,
         result: &Result<T, ConfigError>,
         revision: impl FnOnce(&T) -> u64,
     ) {
+        let OutcomeLine { msg, op } = line;
         let latency_ms = started.elapsed().as_millis() as u64;
+        let role = role_of(self.raft.metrics().borrow().state);
         match result {
             Ok(v) => tracing::info!(
                 op,
+                role = role.as_str(),
                 principal = %principal.name,
                 key_hex = %key_hex(key),
                 outcome = "ok",
                 revision = revision(v),
                 latency_ms,
-                "client operation completed"
+                "{msg}"
             ),
             Err(e) => tracing::info!(
                 op,
+                role = role.as_str(),
                 principal = %principal.name,
                 key_hex = %key_hex(key),
                 outcome = "error",
@@ -774,7 +1083,7 @@ impl NodeInner {
                 error_kind = ?e.kind(),
                 revision = 0u64,
                 latency_ms,
-                "client operation failed"
+                "{msg}"
             ),
         }
     }
@@ -815,6 +1124,57 @@ fn view(id: openraft::LogId<RaftNodeId>) -> LogIdView {
     LogIdView::new(id.leader_id.term, id.index)
 }
 
+/// Flatten one OpenRaft membership into the engine's OpenRaft-free view.
+///
+/// Takes the three parts rather than a membership type because the committed membership is a
+/// `StoredMembership` on one side of the boundary and an `EffectiveMembership` on the other,
+/// and the two do not share a trait.
+fn membership_view(
+    voters: impl Iterator<Item = RaftNodeId>,
+    nodes: impl Iterator<Item = (RaftNodeId, RaftNode)>,
+    log_id: Option<openraft::LogId<RaftNodeId>>,
+) -> MembershipView {
+    let mut endpoints = BTreeMap::new();
+    let mut client_endpoints = BTreeMap::new();
+    for (id, node) in nodes {
+        endpoints.insert(NodeId(id), node.peer);
+        client_endpoints.insert(NodeId(id), node.client);
+    }
+    MembershipView {
+        voters: voters.map(NodeId).collect(),
+        endpoints,
+        client_endpoints,
+        membership_log_id: log_id.map(|l| (l.leader_id.term, l.index)),
+    }
+}
+
+/// Which client-facing outcome line to emit, and for which operation.
+///
+/// `msg` is what the §5 log queries join on (`client_write` for a mutation, `client_read` for
+/// a read); `op` names the specific operation within it (`put`, `delete`, `get`, `list`).
+/// Bundled because the two are never chosen independently.
+#[derive(Debug, Clone, Copy)]
+struct OutcomeLine {
+    msg: &'static str,
+    op: &'static str,
+}
+
+impl OutcomeLine {
+    fn write(op: &'static str) -> Self {
+        Self {
+            msg: "client_write",
+            op,
+        }
+    }
+
+    fn read(op: &'static str) -> Self {
+        Self {
+            msg: "client_read",
+            op,
+        }
+    }
+}
+
 fn role_of(state: ServerState) -> NodeRole {
     match state {
         ServerState::Learner => NodeRole::Learner,
@@ -842,7 +1202,7 @@ fn fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
 /// is dropped, and is aborted outright by [`ConfigNode::stop`].
 async fn background_loop(
     inner: Weak<NodeInner>,
-    mut metrics: tokio::sync::watch::Receiver<openraft::RaftMetrics<RaftNodeId, BasicNode>>,
+    mut metrics: tokio::sync::watch::Receiver<openraft::RaftMetrics<RaftNodeId, RaftNode>>,
     gossip_poll: Duration,
 ) {
     let mut ticker = tokio::time::interval(gossip_poll);
@@ -915,6 +1275,18 @@ impl PeerSink for NodeInner {
             return Err(PeerReject::NotRunning);
         }
 
+        // Every command entry this envelope delivers belongs to the envelope's trace: when the
+        // leader was replicating one client write it is that client's trace, otherwise it is
+        // the replication RPC's own. Recorded before OpenRaft sees the request, because apply
+        // can follow immediately (ADR-0013; `config_storage::trace`).
+        if let PeerRequest::AppendEntries(rpc) = &req {
+            for entry in &rpc.entries {
+                if let openraft::EntryPayload::Normal(cmd) = &entry.payload {
+                    self.traces.record(cmd, &meta.trace.trace_id);
+                }
+            }
+        }
+
         let span = tracing::debug_span!(
             "peer_in",
             rpc = req.kind(),
@@ -943,5 +1315,31 @@ impl PeerSink for NodeInner {
         .instrument(span)
         .instrument(self.span.clone())
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config_core::StatusClass;
+
+    /// L3 (critic A1): a command entry that comes back `Noop` is committed and applied, so
+    /// whatever it is reported as must not tell the caller to send it again.
+    ///
+    /// The regression this pins is one word: the arm used to build `ConfigError::Unavailable`,
+    /// whose whole contract is "rejected before entering the log, safe to retry" — on the one
+    /// path that knows the entry already took effect (ADR-0015).
+    #[test]
+    fn a_noop_for_a_command_entry_is_never_resubmittable() {
+        let error = noop_for_command_entry();
+        assert!(
+            !error.is_safe_to_resubmit(),
+            "the entry is applied; resubmitting would apply it twice: {error:?}"
+        );
+        assert_eq!(
+            error.kind(),
+            StatusClass::Internal,
+            "a broken state-machine contract is an internal failure, not a retryable one"
+        );
     }
 }

@@ -17,41 +17,51 @@
 //! * [`scan`] — source scanners enforcing anti-flake rules 1 (no fixed sleeps) and 4 (no
 //!   literal ports).
 //!
-//! # What is not here yet
+//! * [`cluster`] — [`cluster::Cluster`], an N-node rEtcd cluster over the **real** gRPC peer
+//!   and client planes (test plan §4.1). This is what the M1 rows are written against.
 //!
-//! The `Cluster` harness (test plan §4.1) spins up a real N-node in-process cluster over
-//! `config-engine` and lands once the engine does. Nothing in this crate needs to change to
-//! accept it: `Cluster` only has to produce an `Arc<dyn config_core::ConfigStore>`.
+//! # Running the conformance suite over both clients
 //!
-//! ```ignore
-//! impl Cluster {
-//!     pub fn client(&self, id: NodeId) -> Arc<dyn ConfigStore>;    // -> conformance::run_all
-//!     pub async fn grpc_client_multi(&self) -> GrpcClient;         // -> conformance::run_all
-//! }
+//! ```no_run
+//! # use std::sync::Arc;
+//! # use config_testkit::{cluster::{Cluster, StorageKind}, conformance, ConformanceConfig};
+//! # async fn run() {
+//! let cluster = Cluster::start(3, StorageKind::Ephemeral).await;
+//! let leader = cluster.leader().await;
 //!
-//! let report_direct = conformance::run_all(cluster.client(leader), cfg.clone()).await;
-//! let report_grpc = conformance::run_all(
-//!     Arc::new(cluster.grpc_client_multi().await),
-//!     cfg,
+//! let direct = conformance::run_all(cluster.client(leader), ConformanceConfig::unique("direct")).await;
+//! let grpc = conformance::run_all(
+//!     Arc::new(cluster.grpc_client_multi()),
+//!     ConformanceConfig::unique("grpc"),
 //! ).await;
-//! assert!(report_direct.diff(&report_grpc).is_empty());
+//! assert!(direct.diff(&grpc).is_empty());
+//! cluster.shutdown().await;
+//! # }
 //! ```
 //!
-//! [`memstore::MemStore`] is the reference implementation that proves the suite, the poll
-//! helpers, and the log assertions all work before `Cluster` exists — the extension point is
-//! "produce an `Arc<dyn ConfigStore>`", nothing more.
+//! [`memstore::MemStore`] remains the reference implementation that proves the suite, the poll
+//! helpers, and the log assertions without needing a cluster at all.
 
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod cluster;
 pub mod conformance;
 pub mod fs;
 pub mod logs;
+pub mod manifest;
 pub mod memstore;
 pub mod poll;
 pub mod ports;
 pub mod scan;
+pub mod tls;
 
+pub use cluster::{
+    AuthzKind, Cluster, ClusterBuilder, ClusterConfig, ClusterTls, GossipControl, GossipKind,
+    NodeStartError, PoisonSpec, RocksSpec, StorageKind,
+};
 pub use conformance::{ConformanceConfig, ConformanceReport, ScenarioResult};
+pub use manifest::{Manifest, ManifestFixture, ManifestPaths, Tamper, Voter};
 pub use memstore::MemStore;
 pub use poll::{election_timeout_multiple, poll_until, poll_until_async, TestTimers, Timeout};
+pub use tls::{CertOverrides, CertPair, CertPaths, CertProfile, TlsFixture};

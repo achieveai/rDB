@@ -69,7 +69,7 @@ async fn poll_until_async_polls_an_async_predicate() {
             let a = a.clone();
             async move {
                 let n = a.fetch_add(1, Ordering::SeqCst) + 1;
-                tokio::task::yield_now().await;
+                tokio::task::yield_now().await; // testkit:allow-sleep: the subject of this test is the async predicate itself
                 (n >= 2).then_some(n)
             }
         },

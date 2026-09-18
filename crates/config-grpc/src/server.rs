@@ -3,6 +3,16 @@
 //! Each plane is handed an already-bound [`TcpListener`] rather than an address. Tests bind
 //! `127.0.0.1:0` and read the assigned port back from [`ServerHandle::local_addr`], which is
 //! what makes the "ephemeral ports only" anti-flake rule enforceable.
+//!
+//! # Limitation: accept-loop errors are not surfaced
+//!
+//! `serve_with_incoming_shutdown` consumes errors from the incoming stream itself — a failed
+//! `accept`, a TLS handshake a client aborted — and logs them at `trace` level inside tonic.
+//! They never reach [`ServerHandle::shutdown`], which therefore reports only what the serving
+//! future returned. A node that has stopped accepting connections while its task is still
+//! alive is consequently invisible here, and must be detected by a client failing to connect.
+//! What [`ServerHandle::shutdown`] *does* report faithfully is the serving task ending
+//! abnormally, including a panic ([`GrpcError::ServerTask`]).
 
 use std::net::SocketAddr;
 
@@ -38,6 +48,9 @@ impl ServerHandle {
     }
 
     /// Stop accepting, drain in-flight calls, and wait for the server task to end.
+    ///
+    /// A serving task that panicked is reported as [`GrpcError::ServerTask`], not as a clean
+    /// stop: "the server crashed" and "the server drained" must not look the same to a test.
     pub async fn shutdown(mut self) -> Result<(), GrpcError> {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
@@ -45,8 +58,10 @@ impl ServerHandle {
         match self.join.take() {
             Some(join) => match join.await {
                 Ok(result) => result.map_err(GrpcError::Transport),
-                // The task was cancelled or panicked; there is nothing left to drain.
-                Err(_) => Ok(()),
+                Err(join_error) => Err(GrpcError::ServerTask(format!(
+                    "{} plane task ended abnormally: {join_error}",
+                    self.plane
+                ))),
             },
             None => Ok(()),
         }
@@ -86,4 +101,36 @@ pub(crate) fn spawn(
         shutdown: Some(tx),
         join: Some(join),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A serving task that panicked must not be reported as a clean drain.
+    ///
+    /// Constructed directly rather than through [`spawn`]: tonic owns the real serving future,
+    /// and there is no supported way to make *it* panic from outside. What is being asserted
+    /// is the handle's own bookkeeping, which is where the defect was.
+    #[tokio::test]
+    async fn a_panicked_server_task_is_reported_not_swallowed() {
+        let (tx, _rx) = oneshot::channel::<()>();
+        let join: JoinHandle<Result<(), tonic::transport::Error>> =
+            tokio::spawn(async { panic!("serving task exploded") });
+        let handle = ServerHandle {
+            addr: "127.0.0.1:0".parse().expect("socket addr"),
+            plane: "client",
+            shutdown: Some(tx),
+            join: Some(join),
+        };
+
+        let error = handle
+            .shutdown()
+            .await
+            .expect_err("a panicked task is not a clean shutdown");
+        assert!(
+            matches!(error, GrpcError::ServerTask(ref detail) if detail.contains("client")),
+            "expected a ServerTask error naming the plane, got {error:?}"
+        );
+    }
 }
