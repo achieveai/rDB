@@ -6,7 +6,7 @@
 
 ## Decision
 
-- `config_core::Capabilities { durability: Ephemeral|Persistent, watch_resumption: Unsupported,
+- `config_core::Capabilities { durability: Ephemeral|Persistent|PersistentUnverified, watch_resumption: Unsupported,
   authz: Development|StaticAllowlist, transport_security: Insecure|MutualTls, pagination:
   Unsupported, dedup: Unsupported }`.
 - Exposed via `ConfigNode::capabilities()`, in `config-server --capabilities` output, and in

@@ -10,7 +10,7 @@ Cargo workspace `retcd` with crates under `crates/`:
 
 | Crate | Owns | May depend on |
 |---|---|---|
-| `config-core` | requests/responses/records/revisions/typed errors, `ConfigStore` trait, `Principal` + `Authorizer` hook, versioned `Command`, `MutationEvent`, deterministic `KvState` (M0 state machine), `Capabilities` | `bytes`, `serde`, `thiserror` |
+| `config-core` | requests/responses/records/revisions/typed errors, `ConfigStore` trait, `Principal` + `Authorizer` hook, versioned `Command`, `MutationEvent`, deterministic `KvState` (M0 state machine), `Capabilities` | `bytes`, `serde`, `thiserror`, `sha2`, `async-trait`, `tracing` |
 | `config-log` | `tracing` JSONL init, context fields, gRPC metadata propagation helpers, test-context macro | `tracing*`, `serde_json` |
 | `config-storage` | `RaftLogStorage`/`RaftStateMachine` impls: `Ephemeral` (M1) and `Rocks` (M2); identity file binding; fault injector | core, log, openraft, rocksdb |
 | `config-engine` | OpenRaft lifecycle, `Engine` (linearizable reads, quorum writes), `ConfigNode` embedding, health, capabilities, gossip hint validation, Raft network client | core, log, storage, gossip, grpc-peer types, openraft |
@@ -31,3 +31,9 @@ Rules:
 
 - Some duplication of request types across core (Rust) and proto (wire); mapped in `config-grpc`.
 - Tests that need multiple crates live in `config-testkit` or the top-level `tests/` crate.
+
+## Clarifications (2026-09-18)
+
+- `config-core` may additionally depend on `sha2` (state hash, ADR-0007), `async-trait`
+  (object-safe `ConfigStore`), and `tracing` (facade only; no subscriber). None of these pulls
+  in an async runtime or network stack. The purity gate M0-59 enforces exactly this set.

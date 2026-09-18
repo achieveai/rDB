@@ -35,3 +35,18 @@
 - Conformance suite runs identically over `DirectClient` and `GrpcClient` (ADR-0014).
 - M3 identity tests: wrong cluster id / node id / cert → rejected with `UNAUTHENTICATED` /
   `PERMISSION_DENIED`.
+
+## Notes (2026-09-18, M1 delivery)
+
+- Additive response metadata: `retcd-leader-node-id` / `retcd-leader-endpoint` on `NotLeader`, and
+  `retcd-conflict-exists` / `retcd-conflict-mod-revision` when a `FAILED_PRECONDITION` carries a
+  CAS conflict. Both `NotLeader` and `Conflict` map to `FAILED_PRECONDITION` (§6.2), so the
+  client needs a structured marker instead of parsing prose. No key or value bytes travel in
+  metadata or status messages.
+- `PeerService.InstallSnapshot` answers `UNIMPLEMENTED` without decoding (ADR-0008: no snapshots).
+- `MtlsConfig.server_domain` optionally names the DNS identity used for peer dialing, because
+  committed endpoints are `host:port` while certificates carry names.
+- `GrpcClientOptions.max_hint_follows = 3` means at most three follows, four sends per call.
+- `GrpcClient::capabilities()` is configuration (`expected_capabilities`), not discovery: the
+  normative schema has no capabilities RPC. `config-server` always sets it.
+- Dependencies `x509-parser` (SAN/CN parsing) and `tokio-stream` are pinned in the root manifest.

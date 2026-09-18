@@ -1,0 +1,18 @@
+[package]
+name = "config-gossip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd memberlist adapter exposing advisory ObservedPeerHint data (ADR-0003)"
+
+[dependencies]
+config-core = { workspace = true }
+memberlist = { workspace = true }
+postcard = { workspace = true }
+smol_str = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+config-log = { workspace = true }

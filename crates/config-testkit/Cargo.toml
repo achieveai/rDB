@@ -1,0 +1,18 @@
+[package]
+name = "config-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd test toolkit: ConfigStore conformance suite, in-memory reference store, deadline polling, DuckDB log assertions, anti-flake scanners (ADR-0014, TA-8/10/11)"
+
+[dependencies]
+config-core = { workspace = true }
+config-log = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

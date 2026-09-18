@@ -145,6 +145,36 @@
   ul.risks li .sev { font-size: 11px; font-weight: 800; text-transform: uppercase; color: var(--amber); margin-right: 8px; }
   ul.risks li.high .sev { color: var(--red); }
 
+  /* ---------- Code block ---------- */
+  pre.codeblock {
+    background: var(--grey-soft); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.5;
+  }
+  pre.codeblock code { font-family: "Cascadia Code", Consolas, "SFMono-Regular", Menlo, monospace; color: var(--text); }
+
+  /* ---------- Crate legend + notes ---------- */
+  .crate-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .crate-legend .sw { display: inline-flex; align-items: center; gap: 6px; }
+  .crate-legend .dot { width: 12px; height: 12px; border-radius: 3px; display: inline-block; border: 1.5px solid var(--border); }
+  .crate-legend .dot.done { background: var(--green-soft); border-color: var(--green); }
+  .crate-legend .dot.in_progress { background: var(--amber-soft); border-color: var(--amber); }
+  .crate-legend .dot.not_started { background: var(--grey-soft); border-color: var(--border); }
+  .crate-notes { list-style: none; margin: 10px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
+  .crate-notes li {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 13.5px;
+  }
+  .crate-notes .cn-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-weight: 700; }
+  .crate-notes .cn-tests { color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .crate-notes .cn-note { color: var(--muted); margin-top: 3px; }
+  .crate-notes li.status-done { border-left: 4px solid var(--green); }
+  .crate-notes li.status-in_progress { border-left: 4px solid var(--amber); }
+  .crate-notes li.status-not_started { border-left: 4px solid var(--border); }
+
+  /* ---------- Test architecture list ---------- */
+  .ta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
+  .ta-item { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; box-shadow: var(--shadow); font-size: 14px; }
+  .ta-item .ta-id { color: var(--accent); font-weight: 800; margin-right: 6px; }
+
   footer { text-align: center; color: var(--muted); font-size: 13px; margin-top: 36px; }
 
   @media (max-width: 600px) {
@@ -194,44 +224,44 @@
         </style>
 
         <text x="20" y="24" class="tier-lbl">binary / test harness</text>
-        <rect class="box" x="20" y="34" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-server" x="20" y="34" width="200" height="52" rx="10"></rect>
         <text x="120" y="56" class="lbl" text-anchor="middle">config-server</text>
         <text x="120" y="72" class="sub" text-anchor="middle">binary, supervision</text>
 
-        <rect class="box" x="820" y="34" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-testkit" x="820" y="34" width="200" height="52" rx="10"></rect>
         <text x="920" y="56" class="lbl" text-anchor="middle">config-testkit</text>
         <text x="920" y="72" class="sub" text-anchor="middle">harness, fault injection</text>
 
         <text x="20" y="128" class="tier-lbl">client / transport</text>
-        <rect class="box" x="20" y="138" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-client" x="20" y="138" width="200" height="52" rx="10"></rect>
         <text x="120" y="160" class="lbl" text-anchor="middle">config-client</text>
         <text x="120" y="176" class="sub" text-anchor="middle">DirectClient, GrpcClient</text>
 
-        <rect class="box" x="420" y="138" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-grpc" x="420" y="138" width="200" height="52" rx="10"></rect>
         <text x="520" y="160" class="lbl" text-anchor="middle">config-grpc</text>
         <text x="520" y="176" class="sub" text-anchor="middle">tonic, protox, mTLS</text>
 
-        <rect class="box" x="820" y="138" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-gossip" x="820" y="138" width="200" height="52" rx="10"></rect>
         <text x="920" y="160" class="lbl" text-anchor="middle">config-gossip</text>
         <text x="920" y="176" class="sub" text-anchor="middle">memberlist adapter</text>
 
         <text x="20" y="232" class="tier-lbl">consensus / storage</text>
-        <rect class="box" x="220" y="242" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-engine" x="220" y="242" width="200" height="52" rx="10"></rect>
         <text x="320" y="264" class="lbl" text-anchor="middle">config-engine</text>
         <text x="320" y="280" class="sub" text-anchor="middle">OpenRaft lifecycle</text>
 
-        <rect class="box" x="620" y="242" width="200" height="52" rx="10"></rect>
+        <rect class="box" id="box-config-storage" x="620" y="242" width="200" height="52" rx="10"></rect>
         <text x="720" y="264" class="lbl" text-anchor="middle">config-storage</text>
         <text x="720" y="280" class="sub" text-anchor="middle">Ephemeral / RocksDB</text>
 
         <text x="20" y="336" class="tier-lbl">foundation</text>
-        <rect class="box core" x="370" y="360" width="220" height="58" rx="12"></rect>
+        <rect class="box core" id="box-config-core" x="370" y="360" width="220" height="58" rx="12"></rect>
         <text x="480" y="384" class="lbl" text-anchor="middle">config-core</text>
         <text x="480" y="401" class="sub" text-anchor="middle">records, requests, errors, Command</text>
 
-        <rect class="box" x="640" y="360" width="180" height="58" rx="10"></rect>
+        <rect class="box" id="box-config-log" x="640" y="360" width="180" height="58" rx="10"></rect>
         <text x="730" y="384" class="lbl" text-anchor="middle">config-log</text>
-        <text x="730" y="401" class="sub" text-anchor="middle">tracing JSONL</text>
+        <text x="730" y="401" class="sub" text-anchor="middle">tracing JSONL (+ macros)</text>
 
         <!-- dependency arrows, all pointing inward -->
         <path class="dep" d="M120,86 L120,138"></path>
@@ -248,9 +278,14 @@
         <path class="dep" d="M120,190 C160,260 260,330 370,388"></path>
         <path class="dep" d="M920,60 C700,10 300,10 120,60" opacity="0"></path>
 
-        <text x="1020" y="470" text-anchor="end" class="sub">grey = not started</text>
       </svg>
-      <div class="diagram-caption">All crates currently grey — repository has no <code>crates/</code> directory yet (workspace scaffolding is next).</div>
+      <div class="diagram-caption" id="crate-caption">Box color = build status, driven by the <code>crates</code> data below.</div>
+      <div class="crate-legend">
+        <span class="sw"><span class="dot done"></span>done</span>
+        <span class="sw"><span class="dot in_progress"></span>in progress</span>
+        <span class="sw"><span class="dot not_started"></span>not started</span>
+      </div>
+      <ul class="crate-notes" id="crate-notes"></ul>
     </div>
   </section>
 
@@ -387,12 +422,137 @@
   </section>
 
   <section>
-    <h2 class="section-title"><span class="num">5</span> Team panel</h2>
+    <h2 class="section-title"><span class="num">5</span> Logging &amp; observability <span style="font-weight:500;color:var(--muted);font-size:13px;">— ADR-0013</span></h2>
+    <div class="diagram-panel">
+      <svg viewBox="0 0 1040 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="JSONL logging pipeline diagram">
+        <style>
+          .lg-box { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+          .lg-box.sink { fill: var(--green-soft); stroke: var(--green); }
+          .lg-lbl { fill: var(--text); font-size: 13px; font-weight: 700; }
+          .lg-sub { fill: var(--muted); font-size: 10.5px; }
+          .lg-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow4); }
+        </style>
+        <defs>
+          <marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+          </marker>
+        </defs>
+
+        <rect class="lg-box" x="10" y="40" width="190" height="56" rx="10"></rect>
+        <text x="105" y="62" class="lg-lbl" text-anchor="middle">#[retcd_test]</text>
+        <text x="105" y="78" class="lg-sub" text-anchor="middle">root span: testModule /</text>
+        <text x="105" y="90" class="lg-sub" text-anchor="middle">testMethod / testRun</text>
+
+        <path class="lg-arrow" d="M200,68 L272,68"></path>
+
+        <rect class="lg-box" x="282" y="40" width="150" height="56" rx="10"></rect>
+        <text x="357" y="64" class="lg-lbl" text-anchor="middle">tracing</text>
+        <text x="357" y="80" class="lg-sub" text-anchor="middle">span + event fields</text>
+
+        <path class="lg-arrow" d="M432,68 L494,68"></path>
+
+        <rect class="lg-box" x="504" y="40" width="150" height="56" rx="10"></rect>
+        <text x="579" y="64" class="lg-lbl" text-anchor="middle">JsonlLayer</text>
+        <text x="579" y="80" class="lg-sub" text-anchor="middle">config-log</text>
+
+        <path class="lg-arrow" d="M654,68 L716,68"></path>
+
+        <rect class="lg-box sink" x="726" y="40" width="150" height="56" rx="10"></rect>
+        <text x="801" y="60" class="lg-lbl" text-anchor="middle">per-test file</text>
+        <text x="801" y="76" class="lg-sub" text-anchor="middle">target/test-logs/</text>
+        <text x="801" y="88" class="lg-sub" text-anchor="middle">&lt;module&gt;/&lt;method&gt;.jsonl</text>
+
+        <path class="lg-arrow" d="M876,68 L938,68"></path>
+
+        <rect class="lg-box sink" x="948" y="40" width="82" height="56" rx="10"></rect>
+        <text x="989" y="64" class="lg-lbl" text-anchor="middle">DuckDB</text>
+        <text x="989" y="80" class="lg-sub" text-anchor="middle">query</text>
+      </svg>
+      <div class="diagram-caption">Every test opens the span before any code runs (TA-8); fields propagate across <code>tokio::spawn</code> so follower <code>apply</code> lines carry the same <code>testMethod</code>. Files flush on panic so DuckDB always sees complete data.</div>
+      <pre class="codeblock"><code>SELECT testMethod, count(*) FROM read_json_auto('target/test-logs/**/*.jsonl', union_by_name=true) GROUP BY 1;</code></pre>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">6</span> Test architecture <span style="font-weight:500;color:var(--muted);font-size:13px;">— docs/testing/test-plan-m0-m1.md §1</span></h2>
+    <div class="ta-grid" id="ta-grid"></div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">7</span> Team workflow</h2>
+    <div class="diagram-panel">
+      <svg viewBox="0 0 1040 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Team workflow diagram">
+        <style>
+          .wf-box { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
+          .wf-box.lead { fill: var(--accent-soft); stroke: var(--accent); }
+          .wf-box.gate { fill: var(--green-soft); stroke: var(--green); }
+          .wf-box.fix { fill: var(--amber-soft); stroke: var(--amber); }
+          .wf-lbl { fill: var(--text); font-size: 12.5px; font-weight: 700; }
+          .wf-e { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow5); }
+          .wf-e.dash { stroke-dasharray: 4 3; }
+          .wf-elbl { fill: var(--muted); font-size: 10.5px; }
+        </style>
+        <defs>
+          <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+          </marker>
+        </defs>
+
+        <rect class="wf-box lead" x="10" y="16" width="150" height="46" rx="10"></rect>
+        <text x="85" y="44" class="wf-lbl" text-anchor="middle">Architect</text>
+
+        <path class="wf-e" d="M160,39 L222,39"></path>
+        <rect class="wf-box" x="232" y="16" width="150" height="46" rx="10"></rect>
+        <text x="307" y="44" class="wf-lbl" text-anchor="middle">Tester Planner</text>
+
+        <path class="wf-e" d="M382,39 L444,39"></path>
+        <rect class="wf-box" x="454" y="16" width="150" height="46" rx="10"></rect>
+        <text x="529" y="44" class="wf-lbl" text-anchor="middle">Developer</text>
+
+        <path class="wf-e" d="M604,39 L666,39"></path>
+        <rect class="wf-box" x="676" y="16" width="150" height="46" rx="10"></rect>
+        <text x="751" y="44" class="wf-lbl" text-anchor="middle">Tester</text>
+
+        <path class="wf-e" d="M826,39 L888,39"></path>
+        <rect class="wf-box" x="898" y="16" width="132" height="46" rx="10"></rect>
+        <text x="964" y="44" class="wf-lbl" text-anchor="middle">Arch Critic</text>
+
+        <rect class="wf-box fix" x="676" y="100" width="150" height="46" rx="10"></rect>
+        <text x="751" y="128" class="wf-lbl" text-anchor="middle">Fixes</text>
+        <path class="wf-e" d="M964,62 C964,110 900,123 826,123"></path>
+        <text x="900" y="95" class="wf-elbl" text-anchor="middle">findings</text>
+        <path class="wf-e" d="M751,100 C751,80 670,60 604,44"></path>
+        <text x="700" y="78" class="wf-elbl">back to Developer</text>
+
+        <rect class="wf-box gate" x="454" y="100" width="150" height="46" rx="10"></rect>
+        <text x="529" y="128" class="wf-lbl" text-anchor="middle">Gate commit</text>
+        <path class="wf-e" d="M964,62 L964,80 C964,130 680,123 604,123" opacity="0"></path>
+        <path class="wf-e" d="M898,39 C960,70 700,123 604,123" opacity="0"></path>
+        <path class="wf-e" d="M964,62 C964,150 640,150 604,123"></path>
+        <text x="820" y="163" class="wf-elbl" text-anchor="middle">clean review</text>
+
+        <rect class="wf-box" x="232" y="100" width="150" height="46" rx="10"></rect>
+        <text x="307" y="122" class="wf-lbl" text-anchor="middle">Debugger</text>
+        <text x="307" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(on failures)</text>
+        <path class="wf-e dash" d="M751,146 C751,190 380,190 307,146"></path>
+        <text x="530" y="204" class="wf-elbl" text-anchor="middle">test failure escalation</text>
+
+        <rect class="wf-box lead" x="10" y="100" width="150" height="46" rx="10"></rect>
+        <text x="85" y="122" class="wf-lbl" text-anchor="middle">Progress</text>
+        <text x="85" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(this report)</text>
+        <path class="wf-e dash" d="M232,123 L160,123"></path>
+      </svg>
+      <div class="diagram-caption">Architect designs and gates; Tester Planner writes the backlog before code (TA contract); Developer implements against it; Tester and Arch Critic review; findings loop back to Developer as fixes; Debugger is pulled in only on failures; Progress reports status throughout, off the critical path.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2 class="section-title"><span class="num">8</span> Team panel</h2>
     <div class="team-grid" id="team-grid"></div>
   </section>
 
   <section>
-    <h2 class="section-title"><span class="num">6</span> Decision log</h2>
+    <h2 class="section-title"><span class="num">9</span> Decision log</h2>
     <table class="decisions">
       <thead><tr><th>ADR</th><th>Title</th><th>Status</th></tr></thead>
       <tbody id="decisions-body"></tbody>
@@ -400,12 +560,12 @@
   </section>
 
   <section>
-    <h2 class="section-title"><span class="num">7</span> Timeline</h2>
+    <h2 class="section-title"><span class="num">10</span> Timeline</h2>
     <ul class="timeline" id="timeline"></ul>
   </section>
 
   <section>
-    <h2 class="section-title"><span class="num">8</span> Risks</h2>
+    <h2 class="section-title"><span class="num">11</span> Risks</h2>
     <ul class="risks" id="risks"></ul>
   </section>
 
@@ -415,13 +575,13 @@
 <script id="progress-data" type="application/json">
 {
   "project": "rEtcd",
-  "lastUpdatedISO": "2026-09-17T23:58:00-07:00",
-  "phase": "M0 — Deterministic state-machine laboratory (research)",
+  "lastUpdatedISO": "2026-09-18T11:20:00-07:00",
+  "phase": "M0 — in progress (config-core CAS/KvState; config-gossip adapter)",
   "milestones": [
     {
       "id": "M0",
       "name": "Deterministic state-machine laboratory",
-      "status": "not_started",
+      "status": "in_progress",
       "weightPct": 25,
       "acceptance": [
         "Replaying an identical command sequence yields byte-identical state and responses",
@@ -429,7 +589,7 @@
         "Conflicts and missing deletes allocate no revision",
         "Apply uses no clock, randomness, environment lookup, unordered output, or external I/O"
       ],
-      "tests": { "unit": 0, "integration": 0, "e2e": 0 }
+      "tests": { "unit": 1, "integration": 0, "e2e": 0 }
     },
     {
       "id": "M1",
@@ -476,17 +636,44 @@
     }
   ],
   "team": [
-    { "role": "Lead / Architect", "model": "Fable", "activity": "Orchestrating M0–M3 build; owns ledger and milestone gates." },
-    { "role": "Arch Critic", "model": "Opus", "activity": "Idle — waiting on first M0 design to review." },
-    { "role": "Developer", "model": "Opus", "activity": "Idle — waiting on research to land before workspace scaffolding." },
-    { "role": "Tester Planner", "model": "Opus", "activity": "Active — drafting M0 test plan (conformance + determinism replay)." },
-    { "role": "Tester", "model": "Sonnet", "activity": "Idle — no test plan handed off yet." },
+    { "role": "Lead / Architect", "model": "Fable", "activity": "Orchestrating M0–M3 build; answered ADR-0003/0006/0007/0014 clarifications (OQ-1..10); owns ledger and gates." },
+    { "role": "Arch Critic", "model": "Opus", "activity": "Idle — waiting on first M0 KvState/CAS code from dev-core to review." },
+    { "role": "Developer (dev-core)", "model": "Opus", "activity": "Active — implementing M0 config-core: KvState, Command envelope, CAS, validation, errors, ConfigStore trait, authorizer, capabilities." },
+    { "role": "Developer (dev-gossip)", "model": "Opus", "activity": "Active — implementing config-gossip memberlist 0.8.5 adapter (advisory-only, ADR-0003)." },
+    { "role": "Tester Planner", "model": "Opus", "activity": "Active — drafting docs/testing/test-plan-m2-m3.md; M0-M1 plan (TA-1..TA-12, 65+49 test rows) delivered." },
+    { "role": "Tester", "model": "Sonnet", "activity": "Idle — waiting on M0 code to land before running the conformance suite." },
     { "role": "Debugger", "model": "Opus", "activity": "Idle — no failures to investigate yet." },
-    { "role": "Progress", "model": "Sonnet", "activity": "Generating this report from DesignSpec-01, ADRs, and the ledger." }
+    { "role": "Progress", "model": "Sonnet", "activity": "Generating this report from DesignSpec-01, ADRs, the ledger, the test plan, and cargo test output." }
   ],
   "researchAgents": [
-    { "name": "research-memberlist", "activity": "Researching memberlist 0.8.5 API for config-gossip." },
-    { "name": "research-openraft", "activity": "Researching OpenRaft 0.9.25 traits for config-storage / config-engine." }
+    { "name": "research-memberlist", "activity": "Done — memberlist 0.8.5 API verified from crate source; probe compiled and ran 2 encrypted nodes." },
+    { "name": "research-openraft", "activity": "Done — OpenRaft 0.9.25 traits verified from crate source." }
+  ],
+  "crates": [
+    { "name": "config-core", "status": "in_progress", "tests": 1, "note": "Identity + hint types compile (1 test green, uncommitted). KvState / Command / CAS / apply (TA-1..TA-3) not yet implemented — dev-core active." },
+    { "name": "config-log", "status": "done", "tests": 7, "note": "JSONL tracing layer, TraceContext (retcd-trace-id / retcd-parent-span / retcd-request-id), #[retcd_test] macro — committed 8bc683a (ADR-0013)." },
+    { "name": "config-log-macros", "status": "done", "tests": 0, "note": "#[retcd_test] proc-macro backing config-log; folded into the config-log box above. 1 doctest (ignored)." },
+    { "name": "config-gossip", "status": "in_progress", "tests": 0, "note": "memberlist 0.8.5 adapter, advisory-only (ADR-0003) — dev-gossip active." },
+    { "name": "config-engine", "status": "not_started", "tests": 0, "note": "OpenRaft lifecycle — blocked on the M0 config-core gate." },
+    { "name": "config-storage", "status": "not_started", "tests": 0, "note": "Ephemeral (M1) / RocksDB (M2) with FaultInjector hook (TA-4) — blocked on M0." },
+    { "name": "config-grpc", "status": "not_started", "tests": 0, "note": "tonic + protox transport, mTLS — M3 scope." },
+    { "name": "config-client", "status": "not_started", "tests": 0, "note": "DirectClient / GrpcClient — M1/M3 scope." },
+    { "name": "config-server", "status": "not_started", "tests": 0, "note": "binary + supervision — M3 scope." },
+    { "name": "config-testkit", "status": "not_started", "tests": 0, "note": "Cluster / NetFault / FaultInjector / conformance harness — required surface defined in test-plan-m0-m1.md §4.1; not yet implemented." }
+  ],
+  "testArchitecture": [
+    { "id": "TA-1", "text": "Pure, synchronous state machine — KvState::apply is sync, total, infallible; never Result/panic; no async runtime in config-core." },
+    { "id": "TA-2", "text": "state_hash() is a stable SHA-256 digest over revision + records in key order; excludes node-local fields; golden constant for empty state." },
+    { "id": "TA-3", "text": "One deterministic validator (validate_put/delete/list) shared by the API edge and apply; Limits is a plain passed-in value, never global." },
+    { "id": "TA-4", "text": "Storage (Ephemeral + RocksDB) accepts a FaultInjector hook at every vote/log/state-batch boundary; default is a zero-cost no-op." },
+    { "id": "TA-5", "text": "NetFault lets tests block/delay/drop traffic in-process before RPC dispatch; a blocked call fails fast, never hangs." },
+    { "id": "TA-6", "text": "ConfigNode exposes deadline-pollable wait_for_leader / wait_applied + sync NodeMetrics / health — no test ever sleeps to wait for consensus." },
+    { "id": "TA-7", "text": "Gossip is injectable (GossipObservationSource); hint validation is a pure, table-driven function — no sockets needed for poisoning tests." },
+    { "id": "TA-8", "text": "Every test opens #[retcd_test] — testModule/testMethod/testRun propagate across tokio::spawn and flush on panic." },
+    { "id": "TA-9", "text": "Purity is machine-checked: a source scan rejects std::time/env/fs/rand/unordered iteration in config-core's state-machine code." },
+    { "id": "TA-10", "text": "Conformance suite runs once against Arc<dyn ConfigStore> — DirectClient and GrpcClient both pass with no extra methods." },
+    { "id": "TA-11", "text": "Cluster isolation: ephemeral ports, per-test temp dirs, cleaned up on Drop even on panic; no process-wide env/config reads." },
+    { "id": "TA-12", "text": "Capabilities is PartialEq + Debug + Serialize — asserted as one struct equality, not string greps." }
   ],
   "decisions": [
     { "number": "0000", "title": "ADR process and template", "status": "Accepted", "path": "../ADRs/0000-adr-process.md" },
@@ -513,13 +700,18 @@
     { "ts": "2026-09-17 22:35", "text": "Toolchain survey done — Rust 1.93, VS2022 present; protoc and LLVM absent; duckdb CLI present." },
     { "ts": "2026-09-17 23:00", "text": "LLVM install for RocksDB build dependency (ADR-0017)." },
     { "ts": "2026-09-17 23:50", "text": "ADR-0000..0017 committed — architecture decisions for M0–M3 seeded." },
-    { "ts": "2026-09-17 23:55", "text": "Research agents launched — memberlist 0.8.5 and OpenRaft 0.9.25 API survey." }
+    { "ts": "2026-09-17 23:55", "text": "Research agents launched — memberlist 0.8.5 and OpenRaft 0.9.25 API survey." },
+    { "ts": "2026-09-18 09:00", "text": "Research complete — OpenRaft 0.9.25 and memberlist 0.8.5 verified from crate source; memberlist probe compiled and ran 2 encrypted nodes." },
+    { "ts": "2026-09-18 09:20", "text": "config-log committed (8bc683a) — JSONL tracing layer, TraceContext, #[retcd_test] macro; 7 tests green (ADR-0013)." },
+    { "ts": "2026-09-18 09:45", "text": "ADR clarifications answered — OQ-1..10 resolved in ADR-0003/0006/0007/0014 (staged, not yet committed)." },
+    { "ts": "2026-09-18 10:00", "text": "Test plan M0-M1 drafted — TA-1..TA-12 harness requirements, 65 M0 rows, 49 M1 rows, 15 conformance scenarios." },
+    { "ts": "2026-09-18 10:15", "text": "Team fan-out — dev-core (M0 config-core) and dev-gossip (config-gossip adapter) started; Tester Planner drafting the M2-M3 plan." },
+    { "ts": "2026-09-18 11:10", "text": "config-core identity + hint types compiling, 1 test green (uncommitted)." }
   ],
   "risks": [
-    { "text": "HITL MCP tools unavailable this session; clarifying questions routed through chat instead. Goal hook says proceed without pausing.", "severity": "medium" },
-    { "text": "protoc is absent on this machine; build plan depends on protox (pure-Rust proto compilation) working end to end.", "severity": "medium" },
-    { "text": "libclang absent for RocksDB's bindgen step; plan is pip-installed libclang + LIBCLANG_PATH before falling back to a system LLVM install.", "severity": "medium" },
-    { "text": "OpenRaft 0.9.25 is pre-1.0 and its linearizable-read API must be verified by compile-time integration and partition tests before M1 acceptance can be trusted.", "severity": "high" }
+    { "text": "OpenRaft 0.9.25 is pre-1.0 and its linearizable-read API must be verified by compile-time integration and partition tests before M1 acceptance can be trusted.", "severity": "high" },
+    { "text": "Windows timer latency/coalescing could widen Raft election and heartbeat timers beyond Linux-tuned defaults; M1 leader-election and partition tests must be run and timed on the target Windows Server 2022 host before deadlines are trusted.", "severity": "medium" },
+    { "text": "memberlist 0.8.5's real API differs from its docs.rs documentation in places (confirmed by the research probe); config-gossip must be implemented and tested against the actual crate source, not assumed signatures.", "severity": "medium" }
   ]
 }
 </script>
@@ -573,6 +765,37 @@
       '<ul class="acc">' + accHtml + '</ul>' +
       '<div class="tests">Tests — unit: ' + m.tests.unit + ' · integration: ' + m.tests.integration + ' · e2e: ' + m.tests.e2e + '</div>';
     board.appendChild(card);
+  });
+
+  // Crate layer diagram — color boxes by status, list notes
+  var STATUS_FILL = { done: 'var(--green-soft)', in_progress: 'var(--amber-soft)', not_started: 'var(--grey-soft)' };
+  var STATUS_STROKE = { done: 'var(--green)', in_progress: 'var(--amber)', not_started: 'var(--border)' };
+  var crateNotes = document.getElementById('crate-notes');
+  (data.crates || []).forEach(function (c) {
+    var box = document.getElementById('box-' + c.name);
+    if (box) {
+      box.style.fill = STATUS_FILL[c.status] || STATUS_FILL.not_started;
+      box.style.stroke = STATUS_STROKE[c.status] || STATUS_STROKE.not_started;
+    }
+    var li = document.createElement('li');
+    li.className = 'status-' + c.status;
+    li.innerHTML =
+      '<div class="cn-head"><span>' + c.name + '</span><span class="cn-tests">tests: ' + c.tests + '</span></div>' +
+      '<div class="cn-note">' + c.note + '</div>';
+    crateNotes.appendChild(li);
+  });
+  var doneCount = (data.crates || []).filter(function (c) { return c.status === 'done'; }).length;
+  var inProgCount = (data.crates || []).filter(function (c) { return c.status === 'in_progress'; }).length;
+  document.getElementById('crate-caption').textContent =
+    (data.crates || []).length + ' crates — ' + doneCount + ' done, ' + inProgCount + ' in progress. Dependencies point inward to config-core (ADR-0004).';
+
+  // Test architecture list
+  var taGrid = document.getElementById('ta-grid');
+  (data.testArchitecture || []).forEach(function (t) {
+    var d = document.createElement('div');
+    d.className = 'ta-item';
+    d.innerHTML = '<span class="ta-id">' + t.id + '</span>' + t.text;
+    taGrid.appendChild(d);
   });
 
   // Team panel (team + research agents)

@@ -1,0 +1,21 @@
+[package]
+name = "config-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd node engine: OpenRaft lifecycle, formation, linearizable reads, peer transport contract, NetFault"
+
+[dependencies]
+bytes = { workspace = true }
+config-core = { workspace = true }
+config-log = { workspace = true }
+config-storage = { workspace = true }
+openraft = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

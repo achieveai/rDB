@@ -6,7 +6,7 @@
 
 ## Decision
 
-- `Principal { name: String, kind: Client|Peer|Embedded }` is derived **only** from the mTLS
+- `Principal { name: String, kind: Certificate|Peer|Embedded|Development }` is derived **only** from the mTLS
   client certificate (SAN URI `retcd://<cluster_id>/client/<name>`, CN fallback) on the
   client plane, or supplied at construction of `DirectClient` by the embedder via
   `ConfigNode::direct_client(Principal)`. Request fields never carry identity.

@@ -35,3 +35,29 @@ are cleaned. Every test starts with the test-context macro.
 
 - `cargo test --workspace` green; `tests/` file names match milestone bullets; a DuckDB query
   over `target/test-logs` returns rows for every test method.
+
+## Clarifications (2026-09-18, Architect, from test-plan OQ-8, OQ-9)
+
+- Log assertions in tests use `duckdb` (dev-dependency of `config-testkit`, bundled feature).
+  A missing/unqueryable log file fails the test loudly; it is never skipped.
+- Harness naming: `Cluster::start(n, StorageKind)` / `Cluster::start_with(ClusterConfig)`;
+  restart a stopped node with `cluster.start_node(id)`; `cluster.stop(id)` stops it.
+- `FaultInjector` is consulted on every crossing and may fire on the *n*-th crossing of a
+  boundary (`CrashAt { boundary, nth }`); the earlier `crash_at(node, boundary)` wording means
+  this. Restart of a crashed node = `Cluster::reopen_store(id)` + `start_node(id)`.
+- Process-level E2E lives in `crates/config-server/tests/e2e_daemon.rs` so
+  `CARGO_BIN_EXE_config-server` resolves. Daemon shutdown for tests: `ctrl_c` and
+  `--shutdown-file <path>` (Windows has no SIGTERM).
+- Daemon health: loopback-only plaintext HTTP `--health-listen 127.0.0.1:0` returning JSON
+  `{ role, leader, term, last_applied, cluster_revision, state_hash, capabilities, membership }`
+  (digests and counts only, no keys/values). Used by the E2E suite as its cross-process oracle.
+- "Authenticated leader hint" = the hint arrives over the mTLS session and the client verifies
+  the hinted endpoint's certificate SAN (`retcd://<cluster_id>/node/<node_id>`) matches the
+  hinted node id before sending. No hint signature.
+
+### Note (2026-09-18): DuckDB access in tests
+
+`config-testkit::logs` invokes the `duckdb` CLI (`-json`) through `std::process::Command`
+instead of linking `duckdb-rs`. Reason: the bundled DuckDB C++ build adds 10+ minutes to a
+clean Windows build. Override the binary with `RETCD_DUCKDB`. A missing CLI fails the test
+loudly; it never skips.

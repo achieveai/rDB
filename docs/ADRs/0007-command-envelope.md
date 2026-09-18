@@ -34,3 +34,13 @@ survives upgrades, and never depends on serde container ordering or platform det
 
 - Round-trip and golden-bytes tests; replay determinism test (identical command sequence →
   byte-identical state hash and identical response sequence).
+
+## Clarifications (2026-09-18, Architect, from test-plan OQ-1, OQ-10)
+
+- Delete envelopes omit `value len` and `value` entirely. Golden: `Delete key=b"a"
+  expected=7` encodes to 21 bytes
+  `52 43 4D 44 01 00 02 01 00 00 00 61 01 07 00 00 00 00 00 00 00`.
+- `KvState::state_hash()` (SHA-256 over `cluster_revision u64 LE`, record count `u64 LE`, then
+  each `(key, value, create_revision, mod_revision)` length-prefixed in key order; excludes
+  last_applied and membership) ships unconditionally in `config-core`; it is the replay
+  determinism oracle. `sha2` is therefore a normal dependency of `config-core`.

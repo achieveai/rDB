@@ -1,0 +1,19 @@
+[package]
+name = "config-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd OpenRaft storage: TypeConfig, fault-injection boundaries, EphemeralStore (M1), RocksStore (M2)"
+
+[dependencies]
+config-core = { workspace = true }
+config-log = { workspace = true }
+openraft = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+tempfile = { workspace = true }

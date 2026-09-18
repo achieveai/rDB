@@ -48,3 +48,24 @@ Rules (§9.3 invariants → implementation):
 
 - M2 tests: restart survives acknowledged mutations; committed-but-unapplied replay has no
   duplicate revisions; crash injection at each boundary; identity mismatch blocks startup.
+
+## Clarifications (2026-09-18, Architect, from test-plan M2-M3 §11)
+
+- Fault boundaries are exactly eight: `BeforeVoteSync, AfterVoteSync, BeforeLogAppend,
+  AfterLogAppend, BeforeLogFlush, AfterLogFlush, BeforeStateBatch, AfterStateBatch`. Log append
+  is write-then-explicit-sync (`flush_wal(true)` / `WriteOptions.sync` on a separate step) so the
+  three log boundaries are distinct instants.
+- `RaftLogStorage::save_committed` / `read_committed` MUST be implemented by both stores (the
+  OpenRaft defaults are no-ops, which would silently disable committed-but-unapplied replay).
+- `FaultAction::Crash` returns an error AND poisons the store: every later call fails until the
+  store is reopened; `Drop` must not flush pending data. `FaultAction::Fail` is a plain
+  recoverable I/O error.
+- `RocksStore` reports `Durability::Persistent` when opened with full sync and verified identity;
+  the "only after M2 gates pass" rule is enforced by CI requiring `tests/m2_*.rs` green, not by a
+  cfg flag. `PersistentUnverified` is reported when opened with sync disabled (dev/bench only).
+
+### Note (2026-09-18): Raft node id type
+
+OpenRaft 0.9.25 requires `NodeId: Default`. `config_core::NodeId` deliberately has no
+`Default` (a `NodeId(0)` footgun), so the Raft plane uses `RaftNodeId = u64`
+(`config_storage::TypeConfig`) and converts at the engine boundary. Ratified by the lead.
