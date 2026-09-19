@@ -122,6 +122,14 @@ const MACHINE_READABLE_DENIALS: [&str; 3] = [
     config_core::REASON_TOKEN_PRINCIPAL,
 ];
 
+/// The [`ConfigError::Unavailable`] reasons that are part of the wire contract.
+///
+/// Closed for the same reason as [`MACHINE_READABLE_DENIALS`]: most `Unavailable` reasons are
+/// operator prose about *this* node's state, while this one is a cluster-wide fact the client
+/// can act on — the feature is off until the slowest voter is upgraded, so retrying the same
+/// call in a second is pointless (ADR-0030 M6-93).
+const MACHINE_READABLE_UNAVAILABLE: [&str; 1] = [config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED];
+
 /// Map a semantic error onto the wire.
 ///
 /// `NotLeader` with a validated hint additionally carries `retcd-leader-node-id` and
@@ -165,6 +173,11 @@ pub fn status_from_error(err: &ConfigError) -> Status {
                 .filter(|r| MACHINE_READABLE_DENIALS.contains(r))
             {
                 insert_ascii(&mut status, HEADER_REASON, reason.to_string());
+            }
+        }
+        ConfigError::Unavailable { reason } => {
+            if MACHINE_READABLE_UNAVAILABLE.contains(&reason.as_str()) {
+                insert_ascii(&mut status, HEADER_REASON, reason.clone());
             }
         }
         ConfigError::Conflict {
@@ -307,5 +320,48 @@ pub fn leader_hint(status: &Status) -> Option<LeaderHint> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M6-93, the wire half: the schema gate's refusal is `UNAVAILABLE` *and* machine-readable.
+    ///
+    /// The trailer is the whole contract. A client that can only read the message text has to
+    /// match on prose to tell "the cluster is mid-upgrade, back off" from "this node is
+    /// briefly busy, retry now", and prose is not an API (ADR-0030 M6-93).
+    #[test]
+    fn the_schema_gate_refusal_carries_its_reason_trailer() {
+        let status = status_from_error(&ConfigError::Unavailable {
+            reason: config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string(),
+        });
+
+        assert_eq!(status.code(), Code::Unavailable, "a transient class");
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_REASON)
+                .and_then(|v| v.to_str().ok()),
+            Some(config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED)
+        );
+    }
+
+    /// The other half of the closed allowlist: ordinary `Unavailable` prose stays out of it.
+    ///
+    /// Without this, the arm above would be indistinguishable from "copy every reason into a
+    /// header", which is how an operator-facing string becomes something clients branch on.
+    #[test]
+    fn an_ordinary_unavailable_reason_stays_out_of_the_trailer() {
+        let status = status_from_error(&ConfigError::Unavailable {
+            reason: "this node has no snapshot to serve yet".to_string(),
+        });
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(
+            status.metadata().get(HEADER_REASON).is_none(),
+            "only the closed set reaches the trailer"
+        );
     }
 }

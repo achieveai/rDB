@@ -9,7 +9,7 @@
     --bg: #f7f8fa;
     --panel: #ffffff;
     --text: #16181d;
-    --muted: #565c66;
+    --muted: #4b5160;
     --border: #dde1e7;
     --accent: #1f6feb;
     --accent-soft: #e8f0fe;
@@ -17,31 +17,41 @@
     --green-soft: #e3f6ec;
     --amber: #8a5a00;
     --amber-soft: #fff2d9;
-    --grey: #6b7280;
+    --grey: #565c66;
     --grey-soft: #eceef1;
     --red: #b42318;
     --red-soft: #fdecea;
+    --purple: #6934c9;
+    --purple-soft: #f0e8fd;
     --shadow: 0 1px 2px rgba(20,20,30,0.06), 0 2px 8px rgba(20,20,30,0.04);
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #0f1216;
       --panel: #171b21;
-      --text: #eef0f3;
-      --muted: #9aa2af;
+      --text: #f1f2f5;
+      --muted: #b7bec9;
       --border: #2a2f38;
-      --accent: #5b9dff;
+      --accent: #6fabff;
       --accent-soft: #16233b;
-      --green: #4fd394;
+      --green: #57dba0;
       --green-soft: #10281d;
       --amber: #ffc266;
       --amber-soft: #2e2408;
-      --grey: #9aa2af;
+      --grey: #b7bec9;
       --grey-soft: #232830;
-      --red: #ff8a80;
+      --red: #ff9b90;
       --red-soft: #331312;
+      --purple: #bda2f7;
+      --purple-soft: #241a36;
       --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 2px 10px rgba(0,0,0,0.3);
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1216; --panel: #171b21; --text: #f1f2f5; --muted: #b7bec9; --border: #2a2f38;
+    --accent: #6fabff; --accent-soft: #16233b; --green: #57dba0; --green-soft: #10281d;
+    --amber: #ffc266; --amber-soft: #2e2408; --grey: #b7bec9; --grey-soft: #232830;
+    --red: #ff9b90; --red-soft: #331312; --purple: #bda2f7; --purple-soft: #241a36;
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -49,882 +59,723 @@
     background: var(--bg);
     color: var(--text);
     font-family: -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif;
-    font-size: 16px;
-    line-height: 1.5;
+    font-size: 18px;
+    line-height: 1.6;
   }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 20px 80px; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 20px 16px 80px; }
+  p, li { max-width: 70ch; }
+  h1, h2, h3 { line-height: 1.3; }
+  a { color: var(--accent); }
 
-  /* ---------- Header ---------- */
-  header.top {
-    background: var(--panel);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    padding: 24px 28px;
-    box-shadow: var(--shadow);
-    margin-bottom: 24px;
+  /* ---------- Stale banner ---------- */
+  .stale-banner {
+    background: var(--red-soft); color: var(--red); border: 1px solid var(--red);
+    border-radius: 10px; padding: 12px 16px; font-weight: 700; margin-bottom: 14px; font-size: 16px;
   }
-  .top-row { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 12px; }
-  .proj-name { font-size: 30px; font-weight: 800; letter-spacing: -0.01em; }
-  .proj-name .dim { color: var(--muted); font-weight: 600; font-size: 18px; margin-left: 8px; }
-  .meta-line { color: var(--muted); font-size: 15px; margin-top: 4px; }
-  .phase-pill {
-    display: inline-block; padding: 6px 14px; border-radius: 999px;
-    background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 15px;
-    border: 1px solid var(--accent);
+
+  /* ---------- Now box ---------- */
+  .now-box {
+    background: var(--panel); border: 2px solid var(--accent); border-radius: 16px;
+    padding: 20px 24px; box-shadow: var(--shadow); margin-bottom: 22px;
   }
-  .progress-outer { margin-top: 18px; }
-  .progress-label { display: flex; justify-content: space-between; font-size: 14px; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
-  .progress-track { background: var(--grey-soft); border-radius: 999px; height: 22px; overflow: hidden; border: 1px solid var(--border); display: flex; }
-  .progress-seg { height: 100%; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #fff; }
-  .progress-seg.done { background: var(--green); }
-  .progress-seg.pending { background: transparent; color: var(--muted); }
+  .now-box h1 { font-size: 22px; margin: 0 0 14px; font-weight: 800; }
+  .now-line { display: flex; gap: 10px; padding: 6px 0; border-top: 1px solid var(--border); }
+  .now-line:first-of-type { border-top: none; }
+  .now-label { font-weight: 800; flex: 0 0 150px; }
+  .now-value { color: var(--text); }
+  .now-value .muted { color: var(--muted); }
 
   /* ---------- Sections ---------- */
-  section { margin-bottom: 28px; }
-  h2.section-title {
-    font-size: 20px; font-weight: 800; margin: 0 0 12px 2px;
-    display: flex; align-items: center; gap: 8px;
+  section { margin-bottom: 30px; }
+  h2.section-title { font-size: 21px; font-weight: 800; margin: 0 0 12px 2px; }
+  h3.card-note-h { font-size: 14px; margin: 10px 0 4px; color: var(--muted); font-weight: 800; text-transform: uppercase; letter-spacing: .03em; }
+
+  /* ---------- Legend ---------- */
+  .legend-row { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 0 0 14px; font-size: 14px; color: var(--muted); }
+  .legend-row .chip { font-size: 12px; }
+
+  /* ---------- Milestone strip ---------- */
+  .strip-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; box-shadow: var(--shadow); margin-bottom: 22px; }
+  .strip { display: flex; gap: 4px; }
+  .strip-seg {
+    flex: 1; text-align: center; padding: 10px 4px; border-radius: 8px; font-weight: 800; font-size: 15px;
+    background: var(--grey-soft); color: var(--muted); border: 1px solid var(--border);
   }
-  h2.section-title .num { color: var(--muted); font-weight: 700; font-size: 15px; }
+  .strip-seg.pass { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+  .strip-seg.active { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+  .strip-caption { color: var(--muted); font-size: 14px; margin-top: 10px; }
+
+  /* ---------- System picture ---------- */
+  .sys-block { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; box-shadow: var(--shadow); margin-bottom: 14px; }
+  .sys-block.sys-fixed { border: 2px solid var(--accent); }
+  .sys-block > summary { cursor: pointer; font-weight: 800; font-size: 16.5px; }
+  .sys-block > summary .sys-asof { color: var(--muted); font-size: 13px; font-weight: 400; margin-left: 8px; }
+  .sys-fixed-title { font-weight: 800; font-size: 16.5px; }
+  .sys-fixed-title .sys-asof { color: var(--muted); font-size: 13px; font-weight: 400; margin-left: 8px; }
+  .mm-legend { display: flex; flex-wrap: wrap; gap: 8px 18px; margin: 10px 0 14px; font-size: 14px; color: var(--muted); }
+  .mm-legend .mm-lg-item { display: inline-flex; align-items: center; gap: 6px; }
+  .mm-legend .mm-sw { display: inline-block; width: 16px; height: 16px; border-radius: 3px; flex: none; }
+  .mm-legend .mm-sw.built { background: var(--green-soft); border: 2px solid var(--green); }
+  .mm-legend .mm-sw.building { background: repeating-linear-gradient(45deg, var(--panel), var(--panel) 3px, var(--amber) 3px, var(--amber) 5px); border: 2px solid var(--amber); }
+  .mm-legend .mm-sw.planned { background: transparent; border: 2px dashed var(--grey); }
+  .mm-legend .mm-sw.gap { background: var(--amber-soft); border: 2px solid var(--amber); }
+  .mm-box-lbl { fill: var(--text); font-size: 13px; font-weight: 700; }
+  .mm-box-tag { fill: var(--muted); font-size: 11px; font-weight: 800; }
+  .mm-box-state { font-size: 12.5px; font-weight: 800; }
+  .mm-box-state.mm-built { fill: var(--green); }
+  .mm-box-state.mm-building { fill: var(--amber); }
+  .mm-box-state.mm-planned { fill: var(--grey); }
+  .mm-box-state.mm-gap { fill: var(--amber); }
+  .mm-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; opacity: .8; }
+  .mm-arrow.dashed { stroke-dasharray: 4 3; }
+  .mm-rect { stroke-width: 2; rx: 10; }
+  .mm-rect.mm-built { fill: var(--green-soft); stroke: var(--green); }
+  .mm-rect.mm-building { fill: url(#hatch-mm); stroke: var(--amber); }
+  .mm-rect.mm-planned { fill: var(--panel); stroke: var(--grey); stroke-dasharray: 5 4; }
+  .mm-rect.mm-gap { fill: var(--amber-soft); stroke: var(--amber); }
+  g.mm-new .mm-rect { stroke-width: 4; }
+  .mm-new-badge { fill: var(--accent); font-size: 10.5px; font-weight: 800; }
+  .mm-row-lbl { fill: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+  .sys-caption { color: var(--muted); font-size: 14px; margin-top: 10px; }
 
   /* ---------- Milestone board ---------- */
-  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+  .board { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
   .card {
     background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
-    padding: 18px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px;
+    padding: 18px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px;
   }
-  .card-head { display: flex; align-items: center; justify-content: space-between; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .card-title { font-size: 18px; font-weight: 800; }
-  .chip { font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
-  .chip.not_started { background: var(--grey-soft); color: var(--grey); }
-  .chip.in_progress { background: var(--amber-soft); color: var(--amber); }
-  .chip.gate_passed { background: var(--green-soft); color: var(--green); }
-  .card ul.acc { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-  .card ul.acc li { display: flex; gap: 8px; align-items: flex-start; font-size: 14.5px; color: var(--text); }
-  .card ul.acc li .box {
-    flex: 0 0 16px; width: 16px; height: 16px; margin-top: 2px; border-radius: 4px;
-    border: 2px solid var(--border); background: var(--panel);
-  }
-  .card ul.acc li.checked .box { background: var(--green); border-color: var(--green); }
-  .card .tests { font-size: 13px; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 4px; }
+  .chip { font-size: 13px; font-weight: 700; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+  .chip.st-not-started { background: var(--grey-soft); color: var(--grey); }
+  .chip.st-in-progress { background: var(--amber-soft); color: var(--amber); }
+  .chip.st-blocked { background: var(--red-soft); color: var(--red); }
+  .chip.st-review { background: var(--purple-soft); color: var(--purple); }
+  .chip.st-gate-passed { background: var(--green-soft); color: var(--green); }
+  .chip.st-done { background: var(--green-soft); color: var(--green); border: 1px solid var(--green); }
 
-  /* ---------- Diagrams ---------- */
-  .diagram-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: var(--shadow); overflow-x: auto; }
-  .diagram-caption { color: var(--muted); font-size: 14px; margin-top: 8px; }
-  svg text { font-family: -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif; }
+  .card ul.acc { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  .card ul.acc li { font-size: 16px; }
+  .card ul.acc li .mark { font-weight: 800; margin-right: 6px; }
+  .card ul.acc li .mark.yes { color: var(--green); }
+  .card ul.acc li .mark.warn { color: var(--amber); }
+  .card ul.acc li .mark.no { color: var(--grey); }
+  .card ul.acc li .evi { display: block; color: var(--muted); font-size: 14px; margin: 2px 0 0 22px; }
 
-  /* ---------- Team panel ---------- */
-  .team-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
-  .team-card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; box-shadow: var(--shadow); }
-  .team-role { font-weight: 800; font-size: 15px; }
-  .team-model { color: var(--accent); font-size: 13px; font-weight: 700; margin-bottom: 6px; }
-  .team-activity { color: var(--muted); font-size: 14px; }
+  .card ul.status { list-style: disc; margin: 4px 0 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; font-size: 17px; }
 
-  /* ---------- Table ---------- */
-  table.decisions { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); }
-  table.decisions th, table.decisions td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 14.5px; }
-  table.decisions th { background: var(--grey-soft); font-weight: 700; color: var(--muted); font-size: 13px; text-transform: uppercase; letter-spacing: 0.03em; }
-  table.decisions tr:last-child td { border-bottom: none; }
-  table.decisions a { color: var(--accent); text-decoration: none; font-weight: 600; }
-  table.decisions a:hover { text-decoration: underline; }
-  .adr-status { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 999px; background: var(--green-soft); color: var(--green); }
+  .card .tests { font-size: 14px; color: var(--muted); border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 2px; }
 
-  /* ---------- Timeline ---------- */
-  ul.timeline { list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); }
-  ul.timeline li { display: flex; gap: 14px; padding: 12px 18px; border-bottom: 1px solid var(--border); font-size: 14.5px; }
-  ul.timeline li:last-child { border-bottom: none; }
-  ul.timeline .ts { color: var(--muted); font-variant-numeric: tabular-nums; min-width: 130px; font-size: 13px; font-weight: 600; }
+  details.history { margin-top: 4px; }
+  details.history summary { cursor: pointer; color: var(--accent); font-weight: 700; font-size: 14px; }
+  details.history ul { margin: 8px 0 0; padding-left: 20px; font-size: 14.5px; color: var(--muted); display: flex; flex-direction: column; gap: 5px; }
+
+  /* ---------- Gate pipeline ---------- */
+  .pipeline-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; box-shadow: var(--shadow); margin: 8px 0 18px; }
+  .pipeline { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pipe-box { flex: 1; min-width: 110px; text-align: center; padding: 10px 6px; border-radius: 8px; background: var(--grey-soft); border: 1px solid var(--border); font-weight: 700; font-size: 14.5px; }
+  .pipe-box .glyph { display: block; font-size: 18px; margin-bottom: 2px; }
+  .pipe-box.done { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+  .pipe-box.active { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
+  .pipeline-note { color: var(--muted); font-size: 14.5px; margin-top: 10px; }
+
+  /* ---------- Active work ---------- */
+  ul.active-list { list-style: none; margin: 0 0 14px; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+  ul.active-list li { background: var(--panel); border: 1px solid var(--border); border-left: 4px solid var(--amber); border-radius: 10px; padding: 12px 16px; font-size: 16px; box-shadow: var(--shadow); }
+  ul.active-list li .who { font-weight: 800; }
+  ul.active-list li .since { color: var(--muted); font-size: 14px; display: block; margin-top: 2px; }
+
+  details.finished summary { cursor: pointer; font-weight: 700; color: var(--accent); font-size: 15px; padding: 4px 0; }
+  details.finished ul { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  details.finished li { font-size: 14.5px; color: var(--muted); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  details.finished li .fn { font-weight: 700; color: var(--text); }
 
   /* ---------- Risks ---------- */
   ul.risks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
-  ul.risks li {
-    background: var(--panel); border: 1px solid var(--border); border-left: 5px solid var(--amber);
-    border-radius: 10px; padding: 12px 16px; font-size: 14.5px; box-shadow: var(--shadow);
-  }
-  ul.risks li.high { border-left-color: var(--red); }
-  ul.risks li .sev { font-size: 11px; font-weight: 800; text-transform: uppercase; color: var(--amber); margin-right: 8px; }
-  ul.risks li.high .sev { color: var(--red); }
+  ul.risks li { background: var(--panel); border: 1px solid var(--border); border-left: 5px solid var(--amber); border-radius: 10px; padding: 12px 16px; font-size: 16px; box-shadow: var(--shadow); }
+  ul.risks li .owner { display: block; color: var(--muted); font-size: 14px; margin-top: 4px; }
 
-  /* ---------- Code block ---------- */
-  pre.codeblock {
-    background: var(--grey-soft); border: 1px solid var(--border); border-radius: 10px;
-    padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.5;
-  }
+  /* ---------- Reference ---------- */
+  details.ref-block { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; box-shadow: var(--shadow); margin-bottom: 12px; }
+  details.ref-block summary { cursor: pointer; font-weight: 800; font-size: 16.5px; }
+  details.ref-block .ref-body { margin-top: 14px; }
+  .diagram-panel { overflow-x: auto; }
+  .diagram-caption { color: var(--muted); font-size: 14px; margin-top: 8px; }
+  svg text { font-family: -apple-system, "Segoe UI", Inter, Roboto, Arial, sans-serif; }
+  pre.codeblock { background: var(--grey-soft); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.5; }
   pre.codeblock code { font-family: "Cascadia Code", Consolas, "SFMono-Regular", Menlo, monospace; color: var(--text); }
-
-  /* ---------- Crate legend + notes ---------- */
-  .crate-legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 13px; color: var(--muted); margin-top: 8px; }
-  .crate-legend .sw { display: inline-flex; align-items: center; gap: 6px; }
-  .crate-legend .dot { width: 12px; height: 12px; border-radius: 3px; display: inline-block; border: 1.5px solid var(--border); }
-  .crate-legend .dot.done { background: var(--green-soft); border-color: var(--green); }
-  .crate-legend .dot.in_progress { background: var(--amber-soft); border-color: var(--amber); }
-  .crate-legend .dot.not_started { background: var(--grey-soft); border-color: var(--border); }
-  .crate-notes { list-style: none; margin: 10px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 8px; }
-  .crate-notes li {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 13.5px;
-  }
-  .crate-notes .cn-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-weight: 700; }
-  .crate-notes .cn-tests { color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap; }
-  .crate-notes .cn-note { color: var(--muted); margin-top: 3px; }
-  .crate-notes li.status-done { border-left: 4px solid var(--green); }
-  .crate-notes li.status-in_progress { border-left: 4px solid var(--amber); }
-  .crate-notes li.status-not_started { border-left: 4px solid var(--border); }
-
-  /* ---------- Test architecture list ---------- */
-  .ta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 10px; }
-  .ta-item { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; box-shadow: var(--shadow); font-size: 14px; }
+  .ta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+  .ta-item { background: var(--grey-soft); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; font-size: 14.5px; }
   .ta-item .ta-id { color: var(--accent); font-weight: 800; margin-right: 6px; }
+  table.decisions { width: 100%; border-collapse: collapse; font-size: 14.5px; }
+  table.decisions th, table.decisions td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.decisions th { color: var(--muted); font-size: 12.5px; text-transform: uppercase; }
+  code { font-family: "Cascadia Code", Consolas, "SFMono-Regular", Menlo, monospace; background: var(--grey-soft); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
 
   footer { text-align: center; color: var(--muted); font-size: 13px; margin-top: 36px; }
-
-  @media (max-width: 600px) {
-    .proj-name { font-size: 24px; }
-    header.top { padding: 18px; }
-  }
 </style>
 </head>
 <body>
 <div class="wrap">
 
-  <header class="top">
-    <div class="top-row">
-      <div>
-        <span class="proj-name">rEtcd<span class="dim">— build progress</span></span>
-        <div class="meta-line" id="meta-line">Last updated — · Phase —</div>
-      </div>
-      <div class="phase-pill" id="phase-pill">—</div>
-    </div>
-    <div class="progress-outer">
-      <div class="progress-label"><span>Overall release progress (M0 → M6)</span><span id="progress-pct">0%</span></div>
-      <div class="progress-track" id="progress-track"></div>
-    </div>
+  <div id="stale-banner" class="stale-banner" hidden></div>
+
+  <header class="now-box">
+    <h1>rEtcd — where things stand</h1>
+    <div class="now-line"><span class="now-label">Where we are:</span><span class="now-value">M6, gate run 3 running.</span></div>
+    <div class="now-line"><span class="now-label">Blocked on:</span><span class="now-value">Nothing.</span></div>
+    <div class="now-line"><span class="now-label">Next:</span><span class="now-value">The <code>feat(m6)</code> commit after a clean gate run.</span></div>
+    <div class="now-line"><span class="now-label">Updated:</span><span class="now-value" id="updated-line">—</span></div>
   </header>
 
-  <section id="section-milestones">
-    <h2 class="section-title"><span class="num">1</span> Milestone board</h2>
-    <div class="board" id="board"></div>
-  </section>
+  <div class="strip-wrap">
+    <div class="strip" aria-label="Milestone strip M0 through M6">
+      <div class="strip-seg pass">M0 ✓</div>
+      <div class="strip-seg pass">M1 ✓</div>
+      <div class="strip-seg pass">M2 ✓</div>
+      <div class="strip-seg pass">M3 ✓</div>
+      <div class="strip-seg pass">M4 ✓</div>
+      <div class="strip-seg pass">M5 ✓</div>
+      <div class="strip-seg active">M6 ▶</div>
+    </div>
+    <div class="strip-caption">6 of 7 milestones passed their gate. 86%.</div>
+  </div>
 
-  <section>
-    <h2 class="section-title"><span class="num">2</span> Crate layer diagram <span style="font-weight:500;color:var(--muted);font-size:13px;">— dependencies point inward to config-core (ADR-0004)</span></h2>
-    <div class="diagram-panel">
-      <svg viewBox="0 0 1040 480" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Crate dependency diagram">
-        <defs>
-          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
-          </marker>
-        </defs>
-        <style>
-          .box { fill: var(--grey-soft); stroke: var(--border); stroke-width: 1.5; rx: 10; }
-          .box.core { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
-          .lbl { fill: var(--text); font-size: 14px; font-weight: 700; }
-          .sub { fill: var(--muted); font-size: 11px; }
-          .dep { stroke: var(--muted); stroke-width: 1.4; fill: none; marker-end: url(#arrow); opacity: 0.75; }
-          .tier-lbl { fill: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
-        </style>
+  <section id="section-system-picture">
+    <h2 class="section-title">System picture</h2>
 
-        <text x="20" y="24" class="tier-lbl">binary / test harness</text>
-        <rect class="box" id="box-config-server" x="20" y="34" width="200" height="52" rx="10"></rect>
-        <text x="120" y="56" class="lbl" text-anchor="middle">config-server</text>
-        <text x="120" y="72" class="sub" text-anchor="middle">binary, supervision</text>
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <defs>
+        <marker id="mm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+        </marker>
+        <pattern id="hatch-mm" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+          <rect width="6" height="6" fill="var(--panel)"></rect>
+          <line x1="0" y1="0" x2="0" y2="6" stroke="var(--amber)" stroke-width="3"></line>
+        </pattern>
+      </defs>
+    </svg>
 
-        <rect class="box" id="box-config-testkit" x="820" y="34" width="200" height="52" rx="10"></rect>
-        <text x="920" y="56" class="lbl" text-anchor="middle">config-testkit</text>
-        <text x="920" y="72" class="sub" text-anchor="middle">harness, fault injection</text>
+    <div class="mm-legend">
+      <span>Part states:</span>
+      <span class="mm-lg-item"><span class="mm-sw built"></span>✓ built — evidence: gate commit or named green tests</span>
+      <span class="mm-lg-item"><span class="mm-sw building"></span>▶ building — dispatched, tests landing, no gate yet</span>
+      <span class="mm-lg-item"><span class="mm-sw planned"></span>○ planned — designed, no code yet</span>
+      <span class="mm-lg-item"><span class="mm-sw gap"></span>⚠ gap — built, with a logged known gap</span>
+    </div>
 
-        <text x="20" y="128" class="tier-lbl">client / transport</text>
-        <rect class="box" id="box-config-client" x="20" y="138" width="200" height="52" rx="10"></rect>
-        <text x="120" y="160" class="lbl" text-anchor="middle">config-client</text>
-        <text x="120" y="176" class="sub" text-anchor="middle">DirectClient, GrpcClient</text>
-
-        <rect class="box" id="box-config-grpc" x="420" y="138" width="200" height="52" rx="10"></rect>
-        <text x="520" y="160" class="lbl" text-anchor="middle">config-grpc</text>
-        <text x="520" y="176" class="sub" text-anchor="middle">tonic, protox, mTLS</text>
-
-        <rect class="box" id="box-config-gossip" x="820" y="138" width="200" height="52" rx="10"></rect>
-        <text x="920" y="160" class="lbl" text-anchor="middle">config-gossip</text>
-        <text x="920" y="176" class="sub" text-anchor="middle">memberlist adapter</text>
-
-        <text x="20" y="232" class="tier-lbl">consensus / storage</text>
-        <rect class="box" id="box-config-engine" x="220" y="242" width="200" height="52" rx="10"></rect>
-        <text x="320" y="264" class="lbl" text-anchor="middle">config-engine</text>
-        <text x="320" y="280" class="sub" text-anchor="middle">OpenRaft lifecycle</text>
-
-        <rect class="box" id="box-config-storage" x="620" y="242" width="200" height="52" rx="10"></rect>
-        <text x="720" y="264" class="lbl" text-anchor="middle">config-storage</text>
-        <text x="720" y="280" class="sub" text-anchor="middle">Ephemeral / RocksDB</text>
-
-        <text x="20" y="336" class="tier-lbl">foundation</text>
-        <rect class="box core" id="box-config-core" x="370" y="360" width="220" height="58" rx="12"></rect>
-        <text x="480" y="384" class="lbl" text-anchor="middle">config-core</text>
-        <text x="480" y="401" class="sub" text-anchor="middle">records, requests, errors, Command</text>
-
-        <rect class="box" id="box-config-log" x="640" y="360" width="180" height="58" rx="10"></rect>
-        <text x="730" y="384" class="lbl" text-anchor="middle">config-log</text>
-        <text x="730" y="401" class="sub" text-anchor="middle">tracing JSONL (+ macros)</text>
-
-        <!-- dependency arrows, all pointing inward -->
-        <path class="dep" d="M120,86 L120,138"></path>
-        <path class="dep" d="M170,138 C260,110 380,110 460,138"></path>
-        <path class="dep" d="M520,190 C500,220 460,240 420,258"></path>
-        <path class="dep" d="M920,86 L920,138"></path>
-        <path class="dep" d="M900,190 C820,230 780,235 730,242"></path>
-        <path class="dep" d="M320,294 L420,378"></path>
-        <path class="dep" d="M720,294 C700,320 640,345 590,378"></path>
-        <path class="dep" d="M730,360 C730,300 730,235 660,190"></path>
-        <path class="dep" d="M730,360 C730,280 620,190 560,160"></path>
-        <path class="dep" d="M480,360 C420,320 380,300 340,294"></path>
-        <path class="dep" d="M600,378 L590,378"></path>
-        <path class="dep" d="M120,190 C160,260 260,330 370,388"></path>
-        <path class="dep" d="M920,60 C700,10 300,10 120,60" opacity="0"></path>
-
-      </svg>
-      <div class="diagram-caption" id="crate-caption">Box color = build status, driven by the <code>crates</code> data below.</div>
-      <div class="crate-legend">
-        <span class="sw"><span class="dot done"></span>done</span>
-        <span class="sw"><span class="dot in_progress"></span>in progress</span>
-        <span class="sw"><span class="dot not_started"></span>not started</span>
+    <div class="sys-block sys-fixed">
+      <div class="sys-fixed-title">System map<span class="sys-asof"> — as of <span class="as-of">—</span></span></div>
+      <div class="diagram-panel">
+        <svg id="diagram-system-map" data-diagram="system-map" viewBox="0 0 800 560" xmlns="http://www.w3.org/2000/svg" role="img"></svg>
+        <div class="sys-caption">Crates and subsystems, grouped by layer. Foundation up, hardening at the bottom.</div>
       </div>
-      <ul class="crate-notes" id="crate-notes"></ul>
+    </div>
+
+    <details class="sys-block" open>
+      <summary>Write call path <span class="sys-asof">as of <span class="as-of">—</span></span> — <span data-role="rollup">–</span></summary>
+      <div class="diagram-panel" style="margin-top:12px;">
+        <svg id="diagram-write-path" data-diagram="write-path" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg" role="img"></svg>
+        <div class="sys-caption">What happens on a Put, step by step. Spec §8.1.</div>
+      </div>
+    </details>
+
+    <details class="sys-block" open>
+      <summary>Read and watch path <span class="sys-asof">as of <span class="as-of">—</span></span> — <span data-role="rollup">–</span></summary>
+      <div class="diagram-panel" style="margin-top:12px;">
+        <svg id="diagram-read-path" data-diagram="read-path" viewBox="0 0 900 280" xmlns="http://www.w3.org/2000/svg" role="img"></svg>
+        <div class="sys-caption">Linearizable reads, NotLeader redirect, watch resume, compaction floor.</div>
+      </div>
+    </details>
+
+    <details class="sys-block" open>
+      <summary>Data flow <span class="sys-asof">as of <span class="as-of">—</span></span> — <span data-role="rollup">–</span></summary>
+      <div class="diagram-panel" style="margin-top:12px;">
+        <svg id="diagram-data-flow" data-diagram="data-flow" viewBox="0 0 900 260" xmlns="http://www.w3.org/2000/svg" role="img"></svg>
+        <div class="sys-caption">Where bytes live and how they move: log, state, snapshot, backup, restore.</div>
+      </div>
+    </details>
+
+    <details class="sys-block" open>
+      <summary>Operator workflows <span class="sys-asof">as of <span class="as-of">—</span></span> — <span data-role="rollup">–</span></summary>
+      <div class="diagram-panel" style="margin-top:12px;">
+        <svg id="diagram-operator-workflows" data-diagram="operator-workflows" viewBox="0 0 640 560" xmlns="http://www.w3.org/2000/svg" role="img"></svg>
+        <div class="sys-caption">Local cluster up, snapshot and purge, backup and restore, credential rotation, rolling upgrade.</div>
+      </div>
+    </details>
+
+    <script type="application/json" id="system-map">
+[
+  {"id":"sm-core","label":"config-core","milestone":"M0","state":"built","evidence":"Records, requests, Command, CAS. Evidence: m0_replay green; critic-core PASS_WITH_RISKS closed.","changed":false},
+  {"id":"sm-storage-log","label":"config-storage + config-log","milestone":"M0","state":"built","evidence":"RocksDB store, JSONL tracing. Evidence: M2 gate commit 01a58b8.","changed":false},
+  {"id":"sm-engine","label":"config-engine","milestone":"M1","state":"built","evidence":"OpenRaft lifecycle. Evidence: M1 gate commit 01a58b8, 27 of 27 rows.","changed":false},
+  {"id":"sm-gossip","label":"config-gossip","milestone":"M1","state":"built","evidence":"Memberlist adapter, advisory-only. Evidence: critic-gossip blockers closed pre-gate.","changed":false},
+  {"id":"sm-planes","label":"config-grpc + config-client","milestone":"M3","state":"built","evidence":"mTLS client, peer, admin planes. Evidence: M3 gate commit 7d524ac.","changed":false},
+  {"id":"watch-hub","label":"Watch hub","milestone":"M4","state":"built","evidence":"Bounded per-stream queues, resume, delivery. Evidence: M4 gate commit 33b5f4b, critic-m4 FINAL PASS.","changed":false},
+  {"id":"event-journal","label":"Event journal","milestone":"M4","state":"built","evidence":"Journal gate, replicated retention compaction. Evidence: M4 gate commit 33b5f4b.","changed":false},
+  {"id":"snapshots-purge","label":"Snapshots + log purge","milestone":"M5","state":"built","evidence":"Consistent snapshot, guarded purge. Evidence: M5 gate commit e54c6ef, ruling M5-R11.","changed":false},
+  {"id":"admin-backup-restore","label":"Admin plane + backup/restore","milestone":"M5","state":"gap","evidence":"Learner lifecycle, fencing, backup/restore. Evidence: M5 gate commit e54c6ef. Known gaps: backup policy_version_ref always None (M6-33); no restore_policy_mismatch log line (M6-35).","changed":false},
+  {"id":"rbac-policy","label":"Signed RBAC + policy","milestone":"M6","state":"building","evidence":"Signed policy documents, gossip convergence. Evidence: m6_rbac 20/20, critic-rbac PASS_WITH_RISKS round 2. No M6 gate commit yet.","changed":false},
+  {"id":"tls-gossip-rotation","label":"TLS + gossip-key rotation","milestone":"M6","state":"building","evidence":"Certificate and gossip-key rotation. Evidence: m6_rotation.rs 24 of 24. Known gap: handshake timeout not rotator-configurable (ADR-0031).","changed":false},
+  {"id":"pagination-migration","label":"Pagination + mixed-version gate","milestone":"M6","state":"building","evidence":"Revision-pinned pagination, format migration gate. Evidence: m6_pagination_e2e green, E2E-42 rolling upgrade 8x green. No M6 gate commit yet.","changed":false},
+
+  {"id":"wp-client","label":"Client, Put/Delete/CAS","milestone":"M0","state":"built","evidence":"Client request shapes. Evidence: M0 gate, config-core conformance.","changed":false},
+  {"id":"wp-plane","label":"Client plane, mTLS ingress","milestone":"M3","state":"built","evidence":"Identity-checked client listener. Evidence: M3 gate commit 7d524ac.","changed":false},
+  {"id":"wp-leader","label":"Leader, ConfigNode propose","milestone":"M1","state":"built","evidence":"Propose path on the leader. Evidence: M1 gate commit 01a58b8.","changed":false},
+  {"id":"wp-raft-replicate","label":"Raft replicate + commit","milestone":"M1","state":"built","evidence":"OpenRaft replication and quorum commit. Evidence: M1 gate commit 01a58b8.","changed":false},
+  {"id":"wp-apply","label":"State machine apply","milestone":"M5","state":"built","evidence":"Deterministic apply, dedup principal bind. Evidence: M5 gate commit e54c6ef, ruling M5-R16.","changed":false},
+  {"id":"wp-storage","label":"Storage, atomic batch","milestone":"M2","state":"built","evidence":"One synced RocksDB batch per apply. Evidence: M2 gate commit 01a58b8.","changed":false},
+
+  {"id":"rp-request","label":"Get / List request","milestone":"M0","state":"built","evidence":"Read request shapes. Evidence: M0 gate.","changed":false},
+  {"id":"rp-linearizable","label":"ensure_linearizable()","milestone":"M0","state":"built","evidence":"Leadership confirmed by quorum before read. Evidence: ADR-0009, M0-M1 gates.","changed":false},
+  {"id":"rp-read-local","label":"Read local KvState","milestone":"M0","state":"built","evidence":"Returns record and read_revision. Evidence: M0 gate.","changed":false},
+  {"id":"rp-notleader","label":"NotLeader + hint","milestone":"M3","state":"built","evidence":"Follower redirects with a committed member hint. Evidence: M3 gate commit 7d524ac.","changed":false},
+  {"id":"pagination","label":"Paginated List, revision-pinned","milestone":"M6","state":"building","evidence":"Six-reason PageTokenExpired, ruling M6-R7. Evidence: m6_pagination_e2e green. Known gap: a follower continuation page has no leader hint.","changed":false},
+  {"id":"watch-register","label":"Watch register, journal gate","milestone":"M4","state":"built","evidence":"Validate, capture H, subscribe. Evidence: M4 gate commit 33b5f4b, ruling M4-R11.","changed":false},
+  {"id":"compaction-floor","label":"RevisionCompacted floor","milestone":"M4","state":"built","evidence":"Typed error below the watermark, never a silent hole. Evidence: M4 gate commit 33b5f4b.","changed":false},
+
+  {"id":"df-raft-log","label":"Raft log","milestone":"M1","state":"built","evidence":"Positional postcard Command entries. Evidence: M1-M2 gates.","changed":false},
+  {"id":"df-column-families","label":"Column families, format v3","milestone":"M5","state":"built","evidence":"kv, events, dedup, state_meta. Evidence: M5 gate commit e54c6ef, ruling M5-R16.","changed":false},
+  {"id":"df-snapshot","label":"Snapshot file","milestone":"M5","state":"built","evidence":"Consistent view, fsync file and dir. Evidence: M5 gate commit e54c6ef, ruling M5-R1.","changed":false},
+  {"id":"backup","label":"Backup artifact","milestone":"M5","state":"gap","evidence":"Manifest and signature, TA-47 exit codes. Evidence: M5 gate commit e54c6ef. Known gap: policy_version_ref always None (M6-33).","changed":false},
+  {"id":"restore","label":"Restore, fenced","milestone":"M5","state":"gap","evidence":"New identity only, state_meta/restored_from. Evidence: M5 gate commit e54c6ef, ruling M5-R14. Known gap: no restore_policy_mismatch log line (M6-35).","changed":false},
+
+  {"id":"local-cluster-up","label":"local-cluster.ps1 / .sh up","milestone":"M6","state":"built","evidence":"One-command 3-node dev cluster. Evidence: lead ran end to end, 3 of 3 ready, health JSON ok, clean teardown.","changed":false},
+  {"id":"local-cluster-ready","label":"3 nodes ready, leader elected","milestone":"M6","state":"built","evidence":"Same run as local-cluster-up. Evidence: lead-verified, dev-quickstart ACCEPTED.","changed":false},
+  {"id":"log-purge","label":"Log purge, guarded","milestone":"M5","state":"built","evidence":"Never crosses last_applied or the snapshot boundary. Evidence: M5 gate commit e54c6ef, ruling M5-R11.","changed":false},
+  {"id":"tls-rotation","label":"TLS cert rotation","milestone":"M6","state":"building","evidence":"ReloadTls admin RPC, file-watch poller. Evidence: m6_rotation.rs rows landed. Known gap: handshake timeout not rotator-configurable.","changed":false},
+  {"id":"gossip-key-rotation","label":"Gossip-key rotation","milestone":"M6","state":"building","evidence":"Staged two-key overlap window. Evidence: m6_rotation.rs 24 of 24, ruling M6-R21 refusal guard.","changed":false},
+  {"id":"drain-check","label":"Drain check before migration","milestone":"M6","state":"building","evidence":"Every retained entry decodes and is applied. Evidence: m6_compat_open green, ruling M6-R20. Known gap: decode-only, not a semantic check.","changed":false},
+  {"id":"rolling-upgrade","label":"Rolling upgrade, v1 to v3","milestone":"M6","state":"building","evidence":"In-place format migration then restart. Evidence: E2E-42, 8 of 8 green. No M6 gate commit yet.","changed":false}
+]
+    </script>
+  </section>
+
+  <section id="section-milestones">
+    <h2 class="section-title">Milestones</h2>
+    <div class="legend-row">
+      <span>Legend:</span>
+      <span class="chip st-not-started">Not started</span>
+      <span class="chip st-in-progress">In progress</span>
+      <span class="chip st-blocked">Blocked</span>
+      <span class="chip st-review">Review</span>
+      <span class="chip st-gate-passed">Gate passed</span>
+      <span class="chip st-done">Done</span>
+    </div>
+
+    <div class="pipeline-wrap">
+      <strong>M6 gate pipeline</strong> <span style="color:var(--muted);font-size:14px;">— as of <span class="as-of">—</span></span>
+      <div class="pipeline" style="margin-top:10px;">
+        <div class="pipe-box done"><span class="glyph">☑</span>Design</div>
+        <div class="pipe-box done"><span class="glyph">☑</span>Develop</div>
+        <div class="pipe-box done"><span class="glyph">☑</span>Test</div>
+        <div class="pipe-box done"><span class="glyph">☑</span>Review</div>
+        <div class="pipe-box active"><span class="glyph">▶</span>Gate</div>
+      </div>
+      <div class="pipeline-note">Running: full gate, run 3. Runs 1 and 2 each found one flaky test, both fixed.</div>
+    </div>
+
+    <div class="board">
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M0 — Deterministic core</span><span class="chip st-done">Done</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>Replay is deterministic.<span class="evi">Evidence: <code>m0_replay</code> suite green.</span></li>
+          <li><span class="mark yes">☑</span>Exactly one competing CAS wins.<span class="evi">Evidence: critic-core PASS_WITH_RISKS, fixed direct.</span></li>
+          <li><span class="mark yes">☑</span>Apply uses no clock, randomness, or I/O.<span class="evi">Evidence: purity scan, config-core.</span></li>
+        </ul>
+        <ul class="status">
+          <li><strong>Merged</strong> into main. No further M0 work planned.</li>
+        </ul>
+        <div class="tests">Tests: 74 <code>m0_*</code> functions on disk (grep).</div>
+        <details class="history"><summary>History (2)</summary>
+          <ul>
+            <li>config-core delivered by dev-core: 85 tests at M0 gate.</li>
+            <li>critic-core PASS_WITH_RISKS, 6 MATERIAL findings, all fixed direct.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M1 — Three-node cluster</span><span class="chip st-done">Done</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>No empty node self-forms.<span class="evi">Evidence: M1 gate, commit <code>01a58b8</code>.</span></li>
+          <li><span class="mark yes">☑</span>One stopped voter does not block writes.</li>
+          <li><span class="mark yes">☑</span>Gossip cannot alter membership or data.</li>
+        </ul>
+        <ul class="status">
+          <li><strong>Merged</strong> into main. 27/27 plan rows passed.</li>
+        </ul>
+        <div class="tests">Tests: 109 <code>m1_*</code> functions on disk (grep).</div>
+        <details class="history"><summary>History (2)</summary>
+          <ul>
+            <li>config-engine + config-gossip delivered by dev-engine, dev-gossip.</li>
+            <li>critic-gossip FAIL (2 BLOCKER); dev-gossip-fix closed both.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M2 — Durable restart</span><span class="chip st-done">Done</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>Every acknowledged mutation survives a restart.</li>
+          <li><span class="mark yes">☑</span>A crash at any boundary loses nothing.</li>
+          <li><span class="mark yes">☑</span>A storage identity mismatch blocks startup.</li>
+        </ul>
+        <ul class="status">
+          <li><strong>Merged</strong> into main via <code>01a58b8</code>.</li>
+        </ul>
+        <div class="tests">Tests: 80 <code>m2_*</code> functions on disk (grep).</div>
+        <details class="history"><summary>History (2)</summary>
+          <ul>
+            <li>RocksStore + M2 harness delivered by dev-rocks, dev-testkit.</li>
+            <li>All store-level gaps closed by tester-m2-storage, verified.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M3 — First release gate</span><span class="chip st-done">Done</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>Wrong cluster, node, or client identity is rejected.</li>
+          <li><span class="mark yes">☑</span>Direct and gRPC clients share one conformance suite.</li>
+          <li><span class="mark yes">☑</span>Static authorization denies unlisted principals.</li>
+        </ul>
+        <ul class="status">
+          <li><strong>Merged</strong> into main via <code>7d524ac</code>.</li>
+        </ul>
+        <div class="tests">Tests: 94 <code>m3_*</code> functions on disk (grep).</div>
+        <details class="history"><summary>History (2)</summary>
+          <ul>
+            <li>config-grpc, config-client, daemon delivered. critic-grpc FAIL then closed.</li>
+            <li>E2E-01..19 green over 4 consecutive runs.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M4 — Resumable watches</span><span class="chip st-gate-passed">Gate passed</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>No silent loss under replay or leader change.<span class="evi">Evidence: critic-m4 FINAL PASS, 178 tests fresh build.</span></li>
+          <li><span class="mark yes">☑</span>A slow watcher never blocks apply.<span class="evi">Evidence: bounded-queue rows green.</span></li>
+          <li><span class="mark yes">☑</span>Resume below the watermark is typed.<span class="evi">Evidence: <code>RevisionCompacted</code> row, gate <code>33b5f4b</code>.</span></li>
+        </ul>
+        <ul class="status">
+          <li><strong>Gate committed</strong> as <code>33b5f4b</code>. Coverage sweep now closed.</li>
+          <li><strong>Both post-gate testers finished:</strong> tester-m4c, tester-m4d.</li>
+          <li><strong>One regression found and fixed:</strong> <code>m4_88</code> schema-gate interaction, closed by ruling M6-R15.</li>
+        </ul>
+        <div class="tests">Tests: 137 <code>m4_*</code> functions on disk (grep).</div>
+        <details class="history"><summary>History (7)</summary>
+          <ul>
+            <li>critic-m4 round 1 FAIL (C4-01 BLOCKER + C4-02..07); dev-watch closed all.</li>
+            <li>critic-m4 re-review found C4-08..11; round 2 closed with mutation checks.</li>
+            <li>critic-m4 FINAL: PASS, 178 tests, residue sweep clean.</li>
+            <li>tester-m4 found production bug M4-32; lead fixed, verified 12/12 x4.</li>
+            <li>tester-m4b delivered the remaining ~45 M4 rows + E2E-21/22.</li>
+            <li>Mutation-hygiene incident: two live mutations found and reverted same hour.</li>
+            <li>tester-m4c, tester-m4d each COMPLETED_WITH_RISKS on the post-gate coverage sweep.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M5 — Operable lifecycle</span><span class="chip st-gate-passed">Gate passed</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>Interrupted membership transitions recover.<span class="evi">Evidence: critic-m5a blockers closed; <code>m5_admin</code> 10/10.</span></li>
+          <li><span class="mark yes">☑</span>Backup restores into one fenced authority.<span class="evi">Evidence: ADR-0024, gate <code>e54c6ef</code>.</span></li>
+          <li><span class="mark yes">☑</span>Stale identities cannot rejoin.<span class="evi">Evidence: <code>m5_133</code>, retired-node fencing (dev-fence).</span></li>
+          <li><span class="mark yes">☑</span>Snapshot interruption leaves recoverable state.<span class="evi">Evidence: dev-snapshot fix round, 5 findings closed.</span></li>
+        </ul>
+        <ul class="status">
+          <li><strong>Gate committed</strong> as <code>e54c6ef</code>, same checkpoint as M6 wave 1.</li>
+          <li><strong>critic-m5b re-review:</strong> PASS_WITH_RISKS, all blockers closed.</li>
+          <li><strong>dev-fence</strong> closed the last snapshot-fencing gap (ruling M5-R21).</li>
+        </ul>
+        <div class="tests">Tests: 121 <code>m5_*</code> functions on disk (grep).</div>
+        <details class="history"><summary>History (6)</summary>
+          <ul>
+            <li>critic-m5a FAIL, 2 BLOCKERs (Backup RPC, RemoveMember fencing); dev-admin closed both.</li>
+            <li>critic-m5b FAIL then PASS_WITH_RISKS on re-review; 3 new MATERIAL findings, all closed.</li>
+            <li>INCIDENT (resolved): dev-dedup ran an unauthorized checkout, discarding uncommitted M4 edits. Reconstructed same session.</li>
+            <li>dev-snapshot fix round closed C5-05/06/07/13/14 with 2 new mutation checks.</li>
+            <li>dev-fence closed C5B-18 (retired_nodes not carried in snapshot) with ruling M5-R21.</li>
+            <li>tester-m5a, tester-m5b, dev-harness all COMPLETED on M5 rows.</li>
+          </ul>
+        </details>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><span class="card-title">M6 — Production hardening</span><span class="chip st-in-progress">In progress</span></div>
+        <ul class="acc">
+          <li><span class="mark yes">☑</span>Signed distributed RBAC lifecycle.<span class="evi">Evidence: <code>m6_rbac</code> 20/20; critic-rbac PASS_WITH_RISKS round 2.</span></li>
+          <li><span class="mark yes">☑</span>Certificate and gossip-key rotation.<span class="evi">Evidence: <code>m6_rotation.rs</code> 24/24. Rows M6-49..56, M6-60 landed (tester-m6e).</span></li>
+          <li><span class="mark yes">☑</span>Revision-pinned pagination.<span class="evi">Evidence: 38 tests; <code>m6_pagination_e2e.rs</code> green; E2E-44 passed.</span></li>
+          <li><span class="mark warn">⚠</span>Watch capacity validated.<span class="evi">Evidence: M6-105 at reduced scale, 100 not 1,000.</span></li>
+          <li><span class="mark yes">☑</span>Mixed-version upgrades and migrations.<span class="evi">Evidence: E2E-42 rolling-upgrade row, 8x green. Ruling M6-R22 fix verified red then green.</span></li>
+          <li><span class="mark warn">⚠</span>Fault and security matrix.<span class="evi">Evidence: M6-107..112 green. 8 of 17 crash boundaries not driven.</span></li>
+          <li><span class="mark warn">⚠</span>Measured RPO/RTO and capacity.<span class="evi">Evidence: M6-106 measures primitives, not the CLI.</span></li>
+        </ul>
+        <ul class="status">
+          <li><strong>critic-m6 review closed.</strong> Zero open blockers, zero open material findings.</li>
+          <li><strong>Gate run 3 running.</strong> Runs 1 and 2 each hit one flaky test, both fixed.</li>
+          <li><strong>Next:</strong> <code>feat(m6)</code> commit on a clean run, then branch review.</li>
+        </ul>
+        <div class="tests">Tests: 156 <code>m6_*</code> functions on disk (grep). 35 <code>e2e_*</code> functions total across the suite.</div>
+        <details class="history"><summary>History (16)</summary>
+          <ul>
+            <li>dev-evidence, dev-pagination DONE (wave 1): evidence rows, pagination wired.</li>
+            <li>dev-rbac COMPLETED_WITH_DEVIATIONS: signed policy, gossip convergence M6-20/21.</li>
+            <li>dev-compat COMPLETED: mixed-version schema gate (ADR-0030), ruling M6-R15.</li>
+            <li>dev-rotation COMPLETED_WITH_RISKS: TLS + gossip-key rotation (ADR-0028).</li>
+            <li>tester-m6a, tester-m6b, tester-m6c each COMPLETED_WITH_RISKS on M6 rows.</li>
+            <li>dev-rotation-harness COMPLETED_WITH_PARTIAL_SCOPE: 15 rows in <code>m6_rotation.rs</code>.</li>
+            <li>Ruling M6-R20: the storage drain precondition blocks rolling upgrade. Material finding.</li>
+            <li>dev-migration COMPLETED: landed the M6-R20 drain fix. Lead-verified, accepted.</li>
+            <li>dev-quickstart COMPLETE: one-command local cluster script + docs.</li>
+            <li>Disk-full incident today; corrupted build artifacts purged (see Risks).</li>
+            <li>tester-m6e COMPLETE: <code>m6_rotation.rs</code> grew from 15 to 24 rows (M6-49..56, M6-60).</li>
+            <li>tester-m6d COMPLETE: E2E-41, 42, 43, 45 landed and lead-verified.</li>
+            <li>critic-m6 first pass: PASS_WITH_RISKS, 1 blocker (M6-R22 log-drain gap), 3 material, 5 advisory.</li>
+            <li>Blocker M6-R22 closed by lead: pinned-schema dirs no longer lose their compact watermark.</li>
+            <li>dev-m6-fixes COMPLETE: closed all 3 material and 5 advisory critic-m6 findings.</li>
+            <li>critic-m6 delta review: PASS_WITH_RISKS, gate clear. Lead closed the 2 new advisory notes.</li>
+          </ul>
+        </details>
+      </div>
+
     </div>
   </section>
 
-  <section>
-    <h2 class="section-title"><span class="num">3</span> Write path <span style="font-weight:500;color:var(--muted);font-size:13px;">— §8.1</span></h2>
-    <div class="diagram-panel">
-      <svg viewBox="0 0 1000 260" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Write path sequence diagram">
-        <style>
-          .actor { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
-          .actor-lbl { fill: var(--text); font-size: 14px; font-weight: 700; }
-          .life { stroke: var(--border); stroke-width: 1.5; stroke-dasharray: 4 4; }
-          .msg { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow2); }
-          .msg-lbl { fill: var(--text); font-size: 12.5px; }
-          .note { fill: var(--grey-soft); stroke: var(--border); }
-          .note-lbl { fill: var(--muted); font-size: 12px; font-style: italic; }
-        </style>
-        <defs>
-          <marker id="arrow2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
-          </marker>
-        </defs>
-
-        <!-- actors -->
-        <g>
-          <rect class="actor" x="10" y="14" width="150" height="38" rx="8"></rect>
-          <text x="85" y="38" class="actor-lbl" text-anchor="middle">Client</text>
-          <line class="life" x1="85" y1="52" x2="85" y2="240"></line>
-        </g>
-        <g>
-          <rect class="actor" x="280" y="14" width="150" height="38" rx="8"></rect>
-          <text x="355" y="38" class="actor-lbl" text-anchor="middle">Leader</text>
-          <line class="life" x1="355" y1="52" x2="355" y2="240"></line>
-        </g>
-        <g>
-          <rect class="actor" x="550" y="14" width="150" height="38" rx="8"></rect>
-          <text x="625" y="38" class="actor-lbl" text-anchor="middle">OpenRaft</text>
-          <line class="life" x1="625" y1="52" x2="625" y2="240"></line>
-        </g>
-        <g>
-          <rect class="actor" x="820" y="14" width="150" height="38" rx="8"></rect>
-          <text x="895" y="38" class="actor-lbl" text-anchor="middle">State machine</text>
-          <line class="life" x1="895" y1="52" x2="895" y2="240"></line>
-        </g>
-
-        <path class="msg" d="M85,80 L355,80"></path>
-        <text x="90" y="74" class="msg-lbl">Put / Delete / CAS</text>
-
-        <path class="msg" d="M355,104 L625,104"></path>
-        <text x="360" y="98" class="msg-lbl">client_write(command)</text>
-
-        <rect class="note" x="600" y="114" width="180" height="30" rx="6"></rect>
-        <text x="690" y="133" class="note-lbl" text-anchor="middle">replicate + commit quorum</text>
-
-        <path class="msg" d="M625,158 L895,158"></path>
-        <text x="630" y="152" class="msg-lbl">apply committed entry</text>
-
-        <rect class="note" x="770" y="168" width="220" height="30" rx="6"></rect>
-        <text x="880" y="187" class="note-lbl" text-anchor="middle">one atomic synced batch</text>
-
-        <path class="msg" d="M895,212 L355,212"></path>
-        <text x="620" y="206" class="msg-lbl" text-anchor="middle">durable result</text>
-
-        <path class="msg" d="M355,232 L85,232"></path>
-        <text x="220" y="226" class="msg-lbl" text-anchor="middle">outcome + revision</text>
-      </svg>
-      <div class="diagram-caption">Success returns only after OpenRaft commit and durable state-machine apply. A deadline may yield an unknown outcome — clients never auto-replay; they re-read and use CAS.</div>
-    </div>
+  <section id="section-active">
+    <h2 class="section-title">Active work</h2>
+    <ul class="active-list">
+      <li><span class="who">M6 gate</span> (script): full workspace gate, run 3.<span class="since">Running since 12:05 today.</span></li>
+    </ul>
+    <details class="finished"><summary>Finished (51)</summary>
+      <ul>
+        <li><span class="fn">critic-m6</span>: delta review PASS_WITH_RISKS, gate clear, all findings closed.</li>
+        <li><span class="fn">dev-m6-fixes</span>: closed 3 material and 5 advisory critic-m6 findings.</li>
+        <li><span class="fn">tester-m6d</span>: E2E-41, 42, 43, 45 landed, lead-verified.</li>
+        <li><span class="fn">tester-m6e</span>: <code>m6_rotation.rs</code> to 24 rows, M6-49..56 and M6-60.</li>
+        <li><span class="fn">dev-migration</span>: landed the M6-R20 drain fix, lead-verified.</li>
+        <li><span class="fn">dev-quickstart</span>: local-cluster scripts + quickstart doc, verified end to end.</li>
+        <li><span class="fn">dev-rotation-harness</span>: testkit rotation support, 15 rows in <code>m6_rotation.rs</code>.</li>
+        <li><span class="fn">tester-m6c</span>: E2E-40, E2E-44, E2E-46, third clean E2E-47 run.</li>
+        <li><span class="fn">tester-m6b</span>: M6-110 gossip matrix, E2E-44 root cause.</li>
+        <li><span class="fn">dev-rotation</span>: TLS and gossip-key rotation, ADR-0028.</li>
+        <li><span class="fn">dev-rbac</span>: signed RBAC wiring, gossip convergence M6-20/21.</li>
+        <li><span class="fn">tester-m6a</span>: <code>m6_policy_daemon.rs</code>, 10 rows.</li>
+        <li><span class="fn">dev-compat</span>: mixed-version schema gate, ADR-0030.</li>
+        <li><span class="fn">dev-pagination</span>: revision-pinned pagination wired into <code>run.rs</code>.</li>
+        <li><span class="fn">dev-evidence</span>: 12 evidence rows, <code>docs/evidence/</code>.</li>
+        <li><span class="fn">tester-m5b</span>: dedup cluster rows, E2E-38.</li>
+        <li><span class="fn">dev-harness</span>: testkit gaps from tester-m5a, 12 rows.</li>
+        <li><span class="fn">tester-m4d</span>: gRPC/wire/E2E M4 rows.</li>
+        <li><span class="fn">tester-m4c</span>: cluster/observability M4 rows, 22 rows.</li>
+        <li><span class="fn">dev-fence</span>: retired-node fencing carried into snapshots.</li>
+        <li><span class="fn">critic-m5b</span>: dedup/metrics re-review, PASS_WITH_RISKS.</li>
+        <li><span class="fn">critic-m5a</span>: snapshot/admin review, 2 blockers closed.</li>
+        <li><span class="fn">dev-admin</span>: admin plane, backup/restore, two-step RemoveMember.</li>
+        <li><span class="fn">dev-dedup</span>: bounded request deduplication, format v3.</li>
+        <li><span class="fn">dev-snapshot</span>: snapshot build/install, safe purge.</li>
+        <li><span class="fn">tester-m5a</span>: M5 snapshot/admin rows, 19 tests.</li>
+        <li><span class="fn">tester-m4b</span>: remaining M4 rows, E2E-21/22.</li>
+        <li><span class="fn">tester-m4</span>: first M4 wave, found production bug M4-32.</li>
+        <li><span class="fn">critic-m4</span>: final verdict PASS, 178 tests.</li>
+        <li><span class="fn">dev-watch</span>: watch hub, serialized gate, two fix rounds.</li>
+        <li><span class="fn">dev-journal</span>: event journal, replicated compaction.</li>
+        <li><span class="fn">doc-m5-metrics</span>: metric-name alignment against ADR-0026.</li>
+        <li><span class="fn">planner-m4</span>: <code>test-plan-m4.md</code>, 121 rows.</li>
+        <li><span class="fn">planner-m5</span>: <code>test-plan-m5.md</code>, 133 rows.</li>
+        <li><span class="fn">planner-m6</span>: <code>test-plan-m6.md</code>, 132 rows.</li>
+        <li><span class="fn">adr-m4</span>: ADR-0019, 0020, 0021.</li>
+        <li><span class="fn">adr-m5</span>: ADR-0022 through 0026.</li>
+        <li><span class="fn">adr-m6</span>: ADR-0027 through 0031.</li>
+        <li><span class="fn">research-openraft</span>: 15-trap catalogue, folded into the architecture brief.</li>
+        <li><span class="fn">research-memberlist</span>: memberlist 0.8.5 API verified from source.</li>
+        <li><span class="fn">dev-core</span>: config-core: state machine, CAS, validation.</li>
+        <li><span class="fn">dev-gossip</span>: memberlist adapter, advisory-only.</li>
+        <li><span class="fn">dev-gossip-fix</span>: closed both critic-gossip blockers.</li>
+        <li><span class="fn">dev-engine</span>: storage + engine base, ConfigNode.</li>
+        <li><span class="fn">dev-rocks</span>: RocksStore, 34 tests.</li>
+        <li><span class="fn">dev-grpc</span>: config-grpc, config-client base.</li>
+        <li><span class="fn">dev-grpc-fix</span>: closed critic-grpc's blocker and 9 MATERIAL findings.</li>
+        <li><span class="fn">dev-engine-fix</span>: closed critic-engine's blocker and 7 MATERIAL findings.</li>
+        <li><span class="fn">dev-testkit</span>: testkit base, conformance suite.</li>
+        <li><span class="fn">critic-core</span>, <span class="fn">critic-gossip</span>, <span class="fn">critic-grpc</span>, <span class="fn">critic-engine</span>: M0-M3 architecture reviews.</li>
+        <li><span class="fn">tester-m3</span>: M3 rows across mTLS, authz, conformance.</li>
+      </ul>
+    </details>
   </section>
 
-  <section>
-    <h2 class="section-title"><span class="num">4</span> Read path + NotLeader flow <span style="font-weight:500;color:var(--muted);font-size:13px;">— ADR-0009</span></h2>
-    <div class="diagram-panel">
-      <svg viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Read path and NotLeader flow diagram">
-        <style>
-          .n { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
-          .n.start { fill: var(--accent-soft); stroke: var(--accent); }
-          .n.ok { fill: var(--green-soft); stroke: var(--green); }
-          .n.err { fill: var(--red-soft); stroke: var(--red); }
-          .n.warn { fill: var(--amber-soft); stroke: var(--amber); }
-          .nlbl { fill: var(--text); font-size: 13px; font-weight: 700; }
-          .elbl { fill: var(--muted); font-size: 12px; }
-          .e { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow3); }
-        </style>
-        <defs>
-          <marker id="arrow3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
-          </marker>
-        </defs>
-
-        <rect class="n start" x="20" y="20" width="200" height="46" rx="10"></rect>
-        <text x="120" y="48" class="nlbl" text-anchor="middle">Get / List request</text>
-
-        <rect class="n" x="300" y="20" width="230" height="46" rx="10"></rect>
-        <text x="415" y="43" class="nlbl" text-anchor="middle">Node: ensure_linearizable()</text>
-        <text x="415" y="58" class="elbl" text-anchor="middle">confirms leadership by quorum</text>
-
-        <path class="e" d="M220,43 L300,43"></path>
-
-        <!-- branch: this node is leader and quorum ok -->
-        <rect class="n ok" x="620" y="10" width="210" height="46" rx="10"></rect>
-        <text x="725" y="33" class="nlbl" text-anchor="middle">Read local KvState</text>
-        <text x="725" y="48" class="elbl" text-anchor="middle">returns record + read_revision</text>
-        <path class="e" d="M530,35 C560,25 590,20 620,25"></path>
-        <text x="560" y="16" class="elbl">leader, quorum ok</text>
-
-        <!-- branch: follower -->
-        <rect class="n warn" x="300" y="110" width="230" height="46" rx="10"></rect>
-        <text x="415" y="133" class="nlbl" text-anchor="middle">ForwardToLeader(id, node)</text>
-        <text x="415" y="148" class="elbl" text-anchor="middle">this node is a follower</text>
-        <path class="e" d="M415,66 L415,110"></path>
-        <text x="425" y="90" class="elbl">not leader</text>
-
-        <rect class="n err" x="620" y="110" width="210" height="46" rx="10"></rect>
-        <text x="725" y="133" class="nlbl" text-anchor="middle">NotLeader { hint }</text>
-        <text x="725" y="148" class="elbl" text-anchor="middle">hint = committed member endpoint</text>
-        <path class="e" d="M530,133 L620,133"></path>
-
-        <!-- branch: former leader cannot reach quorum -->
-        <rect class="n warn" x="300" y="200" width="230" height="46" rx="10"></rect>
-        <text x="415" y="223" class="nlbl" text-anchor="middle">Quorum unreachable</text>
-        <text x="415" y="238" class="elbl" text-anchor="middle">former / isolated leader</text>
-        <path class="e" d="M415,66 L415,200"></path>
-        <text x="270" y="180" class="elbl">no quorum</text>
-
-        <rect class="n err" x="620" y="200" width="210" height="46" rx="10"></rect>
-        <text x="725" y="223" class="nlbl" text-anchor="middle">Unavailable</text>
-        <text x="725" y="238" class="elbl" text-anchor="middle">never serves a strict read</text>
-        <path class="e" d="M530,223 L620,223"></path>
-
-        <text x="20" y="280" class="elbl">Client (GrpcClient) follows up to N=3 authenticated leader hints, then returns last error.</text>
-      </svg>
-      <div class="diagram-caption">No stale/follower reads exist in this release. Leader unknown → Unavailable.</div>
-    </div>
+  <section id="section-risks">
+    <h2 class="section-title">Risks and open decisions</h2>
+    <ul class="risks">
+      <li><strong>Backup field gap.</strong> <code>policy_version_ref</code> in every backup is always <code>None</code> (M6-33).<span class="owner">Owner: lead: product backlog, after the M6 gate.</span></li>
+      <li><strong>Missing log line.</strong> <code>restore_policy_mismatch</code> is never emitted (M6-35).<span class="owner">Owner: lead: product backlog, after the M6 gate.</span></li>
+      <li><strong>Follower pagination hint.</strong> A continuation page on a follower has no leader hint.<span class="owner">Owner: lead: product backlog, after the M6 gate.</span></li>
+      <li><strong>Disk space, twice today.</strong> The C: drive ran low; corrupted build artifacts were purged.<span class="owner">Owner: lead: check free space before treating a linker failure as a defect.</span></li>
+      <li><strong>Port contention.</strong> Concurrent agents hit Windows ephemeral-port exhaustion on rotation tests.<span class="owner">Owner: lead: known environment constraint, not a code defect.</span></li>
+      <li><strong>Evidence is dev-host only.</strong> M6 evidence rows are reduced-scale, never a production claim.<span class="owner">Owner: lead: restated per ADR-0031 on every refresh.</span></li>
+    </ul>
   </section>
 
-  <section>
-    <h2 class="section-title"><span class="num">5</span> Logging &amp; observability <span style="font-weight:500;color:var(--muted);font-size:13px;">— ADR-0013</span></h2>
-    <div class="diagram-panel">
-      <svg viewBox="0 0 1040 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="JSONL logging pipeline diagram">
-        <style>
-          .lg-box { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
-          .lg-box.sink { fill: var(--green-soft); stroke: var(--green); }
-          .lg-lbl { fill: var(--text); font-size: 13px; font-weight: 700; }
-          .lg-sub { fill: var(--muted); font-size: 10.5px; }
-          .lg-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow4); }
-        </style>
-        <defs>
-          <marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
-          </marker>
-        </defs>
+  <section id="section-reference">
+    <h2 class="section-title">Reference</h2>
 
-        <rect class="lg-box" x="10" y="40" width="190" height="56" rx="10"></rect>
-        <text x="105" y="62" class="lg-lbl" text-anchor="middle">#[retcd_test]</text>
-        <text x="105" y="78" class="lg-sub" text-anchor="middle">root span: testModule /</text>
-        <text x="105" y="90" class="lg-sub" text-anchor="middle">testMethod / testRun</text>
+    <details class="ref-block">
+      <summary>Logging and observability — ADR-0013</summary>
+      <div class="ref-body diagram-panel">
+        <svg viewBox="0 0 1040 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="JSONL logging pipeline diagram">
+          <style>
+            .lg-box { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+            .lg-box.sink { fill: var(--green-soft); stroke: var(--green); }
+            .lg-lbl { fill: var(--text); font-size: 13px; font-weight: 700; }
+            .lg-sub { fill: var(--muted); font-size: 10.5px; }
+            .lg-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow4); }
+          </style>
+          <defs>
+            <marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+            </marker>
+          </defs>
+          <rect class="lg-box" x="10" y="40" width="190" height="56" rx="10"></rect>
+          <text x="105" y="62" class="lg-lbl" text-anchor="middle">#[retcd_test]</text>
+          <text x="105" y="78" class="lg-sub" text-anchor="middle">root span: testModule /</text>
+          <text x="105" y="90" class="lg-sub" text-anchor="middle">testMethod / testRun</text>
+          <path class="lg-arrow" d="M200,68 L272,68"></path>
+          <rect class="lg-box" x="282" y="40" width="150" height="56" rx="10"></rect>
+          <text x="357" y="64" class="lg-lbl" text-anchor="middle">tracing</text>
+          <text x="357" y="80" class="lg-sub" text-anchor="middle">span + event fields</text>
+          <path class="lg-arrow" d="M432,68 L494,68"></path>
+          <rect class="lg-box" x="504" y="40" width="150" height="56" rx="10"></rect>
+          <text x="579" y="64" class="lg-lbl" text-anchor="middle">JsonlLayer</text>
+          <text x="579" y="80" class="lg-sub" text-anchor="middle">config-log</text>
+          <path class="lg-arrow" d="M654,68 L716,68"></path>
+          <rect class="lg-box sink" x="726" y="40" width="150" height="56" rx="10"></rect>
+          <text x="801" y="60" class="lg-lbl" text-anchor="middle">per-test file</text>
+          <text x="801" y="76" class="lg-sub" text-anchor="middle">target/test-logs/</text>
+          <text x="801" y="88" class="lg-sub" text-anchor="middle">&lt;module&gt;/&lt;method&gt;.jsonl</text>
+          <path class="lg-arrow" d="M876,68 L938,68"></path>
+          <rect class="lg-box sink" x="948" y="40" width="82" height="56" rx="10"></rect>
+          <text x="989" y="64" class="lg-lbl" text-anchor="middle">DuckDB</text>
+          <text x="989" y="80" class="lg-sub" text-anchor="middle">query</text>
+        </svg>
+        <div class="diagram-caption">Every test opens its span before any code runs (TA-8). Files flush on panic.</div>
+        <pre class="codeblock"><code>SELECT testMethod, count(*) FROM read_json_auto('target/test-logs/**/*.jsonl', union_by_name=true) GROUP BY 1;</code></pre>
+        <div class="diagram-caption">M6 gate rule: use a fresh <code>RETCD_TEST_LOG_DIR</code> per package or suite. A shared path makes DuckDB sample half-written files.</div>
+      </div>
+    </details>
 
-        <path class="lg-arrow" d="M200,68 L272,68"></path>
+    <details class="ref-block">
+      <summary>Test architecture — 12 invariants</summary>
+      <div class="ref-body ta-grid">
+        <div class="ta-item"><span class="ta-id">TA-1</span>Pure, synchronous state machine — apply is sync, total, infallible.</div>
+        <div class="ta-item"><span class="ta-id">TA-2</span><code>state_hash()</code> is a stable digest over revision + records.</div>
+        <div class="ta-item"><span class="ta-id">TA-3</span>One deterministic validator shared by the API edge and apply.</div>
+        <div class="ta-item"><span class="ta-id">TA-4</span>Storage accepts a FaultInjector hook at every durability boundary.</div>
+        <div class="ta-item"><span class="ta-id">TA-5</span>NetFault blocks or delays traffic in-process; a blocked call fails fast.</div>
+        <div class="ta-item"><span class="ta-id">TA-6</span>ConfigNode exposes deadline-pollable waits — no test ever sleeps for consensus.</div>
+        <div class="ta-item"><span class="ta-id">TA-7</span>Gossip is injectable; hint validation is pure and table-driven.</div>
+        <div class="ta-item"><span class="ta-id">TA-8</span>Every test opens <code>#[retcd_test]</code>; spans propagate across <code>tokio::spawn</code>.</div>
+        <div class="ta-item"><span class="ta-id">TA-9</span>Purity is machine-checked: a scan rejects clock/env/fs/rand in apply.</div>
+        <div class="ta-item"><span class="ta-id">TA-10</span>One conformance suite runs against <code>Arc&lt;dyn ConfigStore&gt;</code> for both clients.</div>
+        <div class="ta-item"><span class="ta-id">TA-11</span>Cluster isolation: ephemeral ports, per-test temp dirs, cleaned up on Drop.</div>
+        <div class="ta-item"><span class="ta-id">TA-12</span>Capabilities is one struct equality, never a string grep.</div>
+      </div>
+    </details>
 
-        <rect class="lg-box" x="282" y="40" width="150" height="56" rx="10"></rect>
-        <text x="357" y="64" class="lg-lbl" text-anchor="middle">tracing</text>
-        <text x="357" y="80" class="lg-sub" text-anchor="middle">span + event fields</text>
+    <details class="ref-block">
+      <summary>Team workflow</summary>
+      <div class="ref-body diagram-panel">
+        <svg viewBox="0 0 1040 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Team workflow diagram">
+          <style>
+            .wf-box { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
+            .wf-box.lead { fill: var(--accent-soft); stroke: var(--accent); }
+            .wf-box.gate { fill: var(--green-soft); stroke: var(--green); }
+            .wf-box.fix { fill: var(--amber-soft); stroke: var(--amber); }
+            .wf-lbl { fill: var(--text); font-size: 12.5px; font-weight: 700; }
+            .wf-e { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow5); }
+            .wf-e.dash { stroke-dasharray: 4 3; }
+            .wf-elbl { fill: var(--muted); font-size: 10.5px; }
+          </style>
+          <defs>
+            <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+            </marker>
+          </defs>
+          <rect class="wf-box lead" x="10" y="16" width="150" height="46" rx="10"></rect>
+          <text x="85" y="44" class="wf-lbl" text-anchor="middle">Architect</text>
+          <path class="wf-e" d="M160,39 L222,39"></path>
+          <rect class="wf-box" x="232" y="16" width="150" height="46" rx="10"></rect>
+          <text x="307" y="44" class="wf-lbl" text-anchor="middle">Tester Planner</text>
+          <path class="wf-e" d="M382,39 L444,39"></path>
+          <rect class="wf-box" x="454" y="16" width="150" height="46" rx="10"></rect>
+          <text x="529" y="44" class="wf-lbl" text-anchor="middle">Developer</text>
+          <path class="wf-e" d="M604,39 L666,39"></path>
+          <rect class="wf-box" x="676" y="16" width="150" height="46" rx="10"></rect>
+          <text x="751" y="44" class="wf-lbl" text-anchor="middle">Tester</text>
+          <path class="wf-e" d="M826,39 L888,39"></path>
+          <rect class="wf-box" x="898" y="16" width="132" height="46" rx="10"></rect>
+          <text x="964" y="44" class="wf-lbl" text-anchor="middle">Arch Critic</text>
+          <rect class="wf-box fix" x="676" y="100" width="150" height="46" rx="10"></rect>
+          <text x="751" y="128" class="wf-lbl" text-anchor="middle">Fixes</text>
+          <path class="wf-e" d="M964,62 C964,110 900,123 826,123"></path>
+          <text x="900" y="95" class="wf-elbl" text-anchor="middle">findings</text>
+          <path class="wf-e" d="M751,100 C751,80 670,60 604,44"></path>
+          <text x="700" y="78" class="wf-elbl">back to Developer</text>
+          <rect class="wf-box gate" x="454" y="100" width="150" height="46" rx="10"></rect>
+          <text x="529" y="128" class="wf-lbl" text-anchor="middle">Gate commit</text>
+          <path class="wf-e" d="M964,62 C964,150 640,150 604,123"></path>
+          <text x="820" y="163" class="wf-elbl" text-anchor="middle">clean review</text>
+          <rect class="wf-box" x="232" y="100" width="150" height="46" rx="10"></rect>
+          <text x="307" y="122" class="wf-lbl" text-anchor="middle">Debugger</text>
+          <text x="307" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(on failures)</text>
+          <path class="wf-e dash" d="M751,146 C751,190 380,190 307,146"></path>
+          <text x="530" y="204" class="wf-elbl" text-anchor="middle">test failure escalation</text>
+          <rect class="wf-box lead" x="10" y="100" width="150" height="46" rx="10"></rect>
+          <text x="85" y="122" class="wf-lbl" text-anchor="middle">Progress</text>
+          <text x="85" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(this report)</text>
+          <path class="wf-e dash" d="M232,123 L160,123"></path>
+        </svg>
+        <div class="diagram-caption">Architect designs and gates. Tester Planner writes the backlog before code. Developer implements. Tester and Arch Critic review. Findings loop back as fixes. Debugger joins only on failures.</div>
+      </div>
+    </details>
 
-        <path class="lg-arrow" d="M432,68 L494,68"></path>
+    <details class="ref-block">
+      <summary>Decision log — 32 ADRs</summary>
+      <div class="ref-body">
+        <table class="decisions">
+          <thead><tr><th>ADR</th><th>Title</th><th>Note</th></tr></thead>
+          <tbody>
+            <tr><td>0000-0018</td><td>M0-M3 foundational decisions</td><td>Accepted, merged. See <code>docs/ADRs/</code>.</td></tr>
+            <tr><td>0019</td><td>Event journal and replicated compaction</td><td>Delivered by dev-journal. Gate <code>33b5f4b</code>.</td></tr>
+            <tr><td>0020</td><td>Watch delivery and isolation</td><td>Delivered by dev-watch. Two fix rounds closed.</td></tr>
+            <tr><td>0021</td><td>Storage format v2 and migration</td><td>Amended by ruling M5-R19 (undrained-log refusal).</td></tr>
+            <tr><td>0022</td><td>Snapshots and log purge</td><td>Delivered by dev-snapshot. Ruling M5-R11 (purge/defer/refuse).</td></tr>
+            <tr><td>0023</td><td>Admin plane, learner lifecycle, fencing</td><td>Delivered by dev-admin. Two-step RemoveMember.</td></tr>
+            <tr><td>0024</td><td>Backup and fenced restore</td><td>Exit codes per ruling M5-R12.</td></tr>
+            <tr><td>0025</td><td>Bounded request deduplication</td><td>Delivered by dev-dedup. Format v3.</td></tr>
+            <tr><td>0026</td><td>Metrics facade, exporter, runbooks</td><td>Names authoritative over the test plan (ruling M5-R18).</td></tr>
+            <tr><td>0027</td><td>Signed policy documents and RBAC lifecycle</td><td>Delivered by dev-rbac. Gossip convergence M6-20/21.</td></tr>
+            <tr><td>0028</td><td>TLS and gossip key rotation</td><td>Delivered by dev-rotation. <code>m6_rotation.rs</code> 24/24.</td></tr>
+            <tr><td>0029</td><td>Revision-pinned pagination</td><td>Delivered by dev-pagination. 38 tests.</td></tr>
+            <tr><td>0030</td><td>Mixed-version upgrades and migrations</td><td>M6-R20/R22 fixes verified. E2E-42 landed, 8x green.</td></tr>
+            <tr><td>0031</td><td>Evidence artifacts and known gaps</td><td>12/12 evidence rows. Dev-host numbers only.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
 
-        <rect class="lg-box" x="504" y="40" width="150" height="56" rx="10"></rect>
-        <text x="579" y="64" class="lg-lbl" text-anchor="middle">JsonlLayer</text>
-        <text x="579" y="80" class="lg-sub" text-anchor="middle">config-log</text>
-
-        <path class="lg-arrow" d="M654,68 L716,68"></path>
-
-        <rect class="lg-box sink" x="726" y="40" width="150" height="56" rx="10"></rect>
-        <text x="801" y="60" class="lg-lbl" text-anchor="middle">per-test file</text>
-        <text x="801" y="76" class="lg-sub" text-anchor="middle">target/test-logs/</text>
-        <text x="801" y="88" class="lg-sub" text-anchor="middle">&lt;module&gt;/&lt;method&gt;.jsonl</text>
-
-        <path class="lg-arrow" d="M876,68 L938,68"></path>
-
-        <rect class="lg-box sink" x="948" y="40" width="82" height="56" rx="10"></rect>
-        <text x="989" y="64" class="lg-lbl" text-anchor="middle">DuckDB</text>
-        <text x="989" y="80" class="lg-sub" text-anchor="middle">query</text>
-      </svg>
-      <div class="diagram-caption">Every test opens the span before any code runs (TA-8); fields propagate across <code>tokio::spawn</code> so follower <code>apply</code> lines carry the same <code>testMethod</code>. Files flush on panic so DuckDB always sees complete data.</div>
-      <pre class="codeblock"><code>SELECT testMethod, count(*) FROM read_json_auto('target/test-logs/**/*.jsonl', union_by_name=true) GROUP BY 1;</code></pre>
-    </div>
   </section>
 
-  <section>
-    <h2 class="section-title"><span class="num">6</span> Test architecture <span style="font-weight:500;color:var(--muted);font-size:13px;">— docs/testing/test-plan-m0-m1.md §1</span></h2>
-    <div class="ta-grid" id="ta-grid"></div>
-  </section>
-
-  <section>
-    <h2 class="section-title"><span class="num">7</span> Team workflow</h2>
-    <div class="diagram-panel">
-      <svg viewBox="0 0 1040 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Team workflow diagram">
-        <style>
-          .wf-box { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
-          .wf-box.lead { fill: var(--accent-soft); stroke: var(--accent); }
-          .wf-box.gate { fill: var(--green-soft); stroke: var(--green); }
-          .wf-box.fix { fill: var(--amber-soft); stroke: var(--amber); }
-          .wf-lbl { fill: var(--text); font-size: 12.5px; font-weight: 700; }
-          .wf-e { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow5); }
-          .wf-e.dash { stroke-dasharray: 4 3; }
-          .wf-elbl { fill: var(--muted); font-size: 10.5px; }
-        </style>
-        <defs>
-          <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
-          </marker>
-        </defs>
-
-        <rect class="wf-box lead" x="10" y="16" width="150" height="46" rx="10"></rect>
-        <text x="85" y="44" class="wf-lbl" text-anchor="middle">Architect</text>
-
-        <path class="wf-e" d="M160,39 L222,39"></path>
-        <rect class="wf-box" x="232" y="16" width="150" height="46" rx="10"></rect>
-        <text x="307" y="44" class="wf-lbl" text-anchor="middle">Tester Planner</text>
-
-        <path class="wf-e" d="M382,39 L444,39"></path>
-        <rect class="wf-box" x="454" y="16" width="150" height="46" rx="10"></rect>
-        <text x="529" y="44" class="wf-lbl" text-anchor="middle">Developer</text>
-
-        <path class="wf-e" d="M604,39 L666,39"></path>
-        <rect class="wf-box" x="676" y="16" width="150" height="46" rx="10"></rect>
-        <text x="751" y="44" class="wf-lbl" text-anchor="middle">Tester</text>
-
-        <path class="wf-e" d="M826,39 L888,39"></path>
-        <rect class="wf-box" x="898" y="16" width="132" height="46" rx="10"></rect>
-        <text x="964" y="44" class="wf-lbl" text-anchor="middle">Arch Critic</text>
-
-        <rect class="wf-box fix" x="676" y="100" width="150" height="46" rx="10"></rect>
-        <text x="751" y="128" class="wf-lbl" text-anchor="middle">Fixes</text>
-        <path class="wf-e" d="M964,62 C964,110 900,123 826,123"></path>
-        <text x="900" y="95" class="wf-elbl" text-anchor="middle">findings</text>
-        <path class="wf-e" d="M751,100 C751,80 670,60 604,44"></path>
-        <text x="700" y="78" class="wf-elbl">back to Developer</text>
-
-        <rect class="wf-box gate" x="454" y="100" width="150" height="46" rx="10"></rect>
-        <text x="529" y="128" class="wf-lbl" text-anchor="middle">Gate commit</text>
-        <path class="wf-e" d="M964,62 L964,80 C964,130 680,123 604,123" opacity="0"></path>
-        <path class="wf-e" d="M898,39 C960,70 700,123 604,123" opacity="0"></path>
-        <path class="wf-e" d="M964,62 C964,150 640,150 604,123"></path>
-        <text x="820" y="163" class="wf-elbl" text-anchor="middle">clean review</text>
-
-        <rect class="wf-box" x="232" y="100" width="150" height="46" rx="10"></rect>
-        <text x="307" y="122" class="wf-lbl" text-anchor="middle">Debugger</text>
-        <text x="307" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(on failures)</text>
-        <path class="wf-e dash" d="M751,146 C751,190 380,190 307,146"></path>
-        <text x="530" y="204" class="wf-elbl" text-anchor="middle">test failure escalation</text>
-
-        <rect class="wf-box lead" x="10" y="100" width="150" height="46" rx="10"></rect>
-        <text x="85" y="122" class="wf-lbl" text-anchor="middle">Progress</text>
-        <text x="85" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(this report)</text>
-        <path class="wf-e dash" d="M232,123 L160,123"></path>
-      </svg>
-      <div class="diagram-caption">Architect designs and gates; Tester Planner writes the backlog before code (TA contract); Developer implements against it; Tester and Arch Critic review; findings loop back to Developer as fixes; Debugger is pulled in only on failures; Progress reports status throughout, off the critical path.</div>
-    </div>
-  </section>
-
-  <section>
-    <h2 class="section-title"><span class="num">8</span> Team panel</h2>
-    <div class="team-grid" id="team-grid"></div>
-  </section>
-
-  <section>
-    <h2 class="section-title"><span class="num">9</span> Decision log</h2>
-    <table class="decisions">
-      <thead><tr><th>ADR</th><th>Title</th><th>Status</th><th>2026-09-18 note</th></tr></thead>
-      <tbody id="decisions-body"></tbody>
-    </table>
-  </section>
-
-  <section>
-    <h2 class="section-title"><span class="num">10</span> Timeline</h2>
-    <ul class="timeline" id="timeline"></ul>
-  </section>
-
-  <section>
-    <h2 class="section-title"><span class="num">11</span> Risks</h2>
-    <ul class="risks" id="risks"></ul>
-  </section>
-
-  <footer>rEtcd progress report — regenerated after each milestone gate. Data lives in the JSON block below; edit it in place for future updates.</footer>
+  <footer>rEtcd progress report. Source of truth: the M4-M6 ledger. Regenerated after each milestone gate or critic verdict.</footer>
 </div>
-
-<script id="progress-data" type="application/json">
-{
-  "project": "rEtcd",
-  "lastUpdatedISO": "2026-09-19T04:15:00-07:00",
-  "phase": "M0–M3 delivered and gate-committed (01a58b8). M4 COMMITTED as 33b5f4b on feature/m4-m6 (2026-09-19). Gate: all crates green, 8 config-testkit suites green on serial rerun with an isolated log dir, critic-m4 FINAL PASS. Row coverage 79/121 at commit; tester-m4c and tester-m4d now adding the remaining 42 rows + 6 E2E rows (M4-20 deferred by plan). M5: critic-m5b re-review is PASS_WITH_RISKS — 8 blockers closed, 3 more fixed by the lead today (C5B-06 apply-time size check, C5B-17 operator compaction never trims dedup, C5B-18 retired-node fencing survives snapshot install). Open before feat(m5): tester-m5b rows, dev-harness gaps, dev-rbac metrics round (incl. C5B-15). M6: pagination DONE (ADR-0029, M6-R7). RBAC signed policy in progress (ADR-0027, M6-R8/R9). dev-compat and dev-rotation not started. M6 scope stays features-local — evidence rows are dev-host artifacts, never production claims.",
-  "milestones": [
-    {
-      "id": "M0",
-      "name": "Deterministic state-machine laboratory",
-      "status": "gate_passed",
-      "weightPct": 14,
-      "acceptance": [
-        "Replaying an identical command sequence yields byte-identical state and responses",
-        "Exactly one competing CAS on the same expected revision succeeds",
-        "Conflicts and missing deletes allocate no revision",
-        "Apply uses no clock, randomness, environment lookup, unordered output, or external I/O"
-      ],
-      "tests": { "unit": 127, "integration": 0, "e2e": 0 }
-    },
-    {
-      "id": "M1",
-      "name": "Three-node distributed core",
-      "status": "gate_passed",
-      "weightPct": 14,
-      "acceptance": [
-        "No empty node self-forms",
-        "One stopped voter does not stop committed writes",
-        "Isolated / former leader rejects successful strict reads and writes",
-        "Direct access demonstrably uses the same Raft path",
-        "False, missing, disabled, or partitioned gossip cannot alter membership, data, or leader choice",
-        "Capability output: durability=Ephemeral, watch_resumption=Unsupported, authz=Development"
-      ],
-      "tests": { "unit": 73, "integration": 0, "e2e": 0 },
-      "note": "27/27 M1 test-plan rows covered, all passing (M1-47 trace propagation + M1-48 node_id gaps closed by dev-engine-obs). Delivered and gate-committed (01a58b8). Tests figure is a static attribute count across the 10 owning files."
-    },
-    {
-      "id": "M2",
-      "name": "Persistence and restart correctness",
-      "status": "gate_passed",
-      "weightPct": 14,
-      "acceptance": [
-        "Every acknowledged mutation survives ordinary stop/restart of each node",
-        "Committed-but-unapplied entries replay without duplicate public revisions",
-        "Injected crashes at vote sync, log append/flush, state batch boundaries lose nothing",
-        "Storage identity mismatch prevents startup",
-        "Capability output states durability=Persistent only after all M2 gates pass"
-      ],
-      "tests": { "unit": 91, "integration": 0, "e2e": 0 },
-      "note": "RocksStore + M2 harness delivered. 45 harness-level rows pass (tester-m2, verified) + all store-level gaps closed (M2-14/15/31/32/36/37/39/40/60/61/65, tester-m2-storage, verified, incl. new FaultAction::Delay). Storage format-version guard delivered (M2-66/67/68 — m2_storage_27_format_version_stamped_on_first_open_and_reopen_succeeds, m2_storage_28_unsupported_format_version_refused, m2_storage_29_missing_format_version_on_non_empty_store_refused in crates/config-storage/tests/rocks.rs). Delivered and gate-committed (01a58b8)."
-    },
-    {
-      "id": "M3",
-      "name": "Safe remote use baseline — first release gate",
-      "status": "gate_passed",
-      "weightPct": 15,
-      "acceptance": [
-        "Wrong cluster, node, destination, and client identities are rejected",
-        "Direct and gRPC clients pass the same semantic conformance suite",
-        "A lost mutation response cannot trigger an automatic duplicate mutation",
-        "Static authorization denies unlisted principals and unauthorized key prefixes",
-        "Complete M0, M1, M2, and M3 suites pass together on the target VM and disk class"
-      ],
-      "tests": { "unit": 89, "integration": 0, "e2e": 20 },
-      "note": "Library gaps closed: per-target peer SAN pinning (R1), authenticated hint following (R2), connect-phase Unavailable (R3), NodeStartError (R4). config-server daemon + E2E-01..17 verified green (14 unit + 18 E2E, 4 consecutive clean runs after flake fixes); E2E-19 locked-data-dir exit-code row delivered (e2e_19_locked_data_dir_exits_storage_code in crates/config-server/tests/e2e_daemon.rs). Payload-size limits delivered (M3-86/87 — m3_86_max_size_value_replicates_to_every_voter, m3_87_oversize_list_reply_is_truncated_not_unavailable in crates/config-testkit/tests/m3_payload_size.rs). Common-Name-principal gating delivered (M3-88 — m3_88_common_name_principals_are_refused_unless_enabled in crates/config-grpc/tests/mtls.rs). M3-38/42/81 resolved with real assertions (m3_38_allowall_requires_dev_flag, m3_42_policy_summary_in_health, m3_81_authn_authz_failure_metrics); the previous stub rows are gone. Delivered and gate-committed (01a58b8)."
-    },
-    {
-      "id": "M4",
-      "name": "Resumable watches — retained event journal",
-      "status": "gate_passed",
-      "weightPct": 14,
-      "acceptance": [
-        "No silent loss in retained history under replay/live races or a leader change",
-        "Duplicate delivery is allowed and documented; slow watchers never block apply",
-        "Resume below the retained watermark returns a typed RevisionCompacted relist, never a silent gap",
-        "Retention and compaction bound the journal without breaking active watchers"
-      ],
-      "tests": { "unit": 108, "integration": 0, "e2e": 6 },
-      "note": "COMMITTED — 33b5f4b feat(m4) on feature/m4-m6 (2026-09-19). Gate evidence: all packages rc=0 in the sweep; all 8 config-testkit suites green on a serial rerun with an isolated log dir; critic-m4 FINAL PASS (178 tests fresh build, residue sweep clean). Both fix rounds closed C4-01..11 (progress-cursor loss, CompactGuard gaps, stale ADR text) with mutation checks; a leftover mutation and a lost-wakeup bug were found and fixed along the way. Row coverage at commit: 79/121 test-plan rows (108 fn m4_* test functions by grep, --exclude-dir=target). Remaining 42 rows + 6 E2E rows (M4-20 deferred by plan note) are being added now by tester-m4c (cluster/observability rows, new files m4_watch_faults_cluster.rs + m4_observability.rs) and tester-m4d (gRPC/wire/E2E rows, new files m4_watch_wire.rs, m4_capabilities.rs, m4_e2e_daemon.rs)."
-    },
-    {
-      "id": "M5",
-      "name": "Operable cluster lifecycle",
-      "status": "in_progress",
-      "weightPct": 14,
-      "acceptance": [
-        "An interrupted membership transition recovers cleanly",
-        "A backup restores into exactly one new fenced authority",
-        "Stale or retired identities cannot rejoin the cluster",
-        "An interrupted snapshot leaves storage in a valid, recoverable state"
-      ],
-      "tests": { "unit": 93, "integration": 0, "e2e": 0 },
-      "note": "critic-m5b re-review: PASS_WITH_RISKS. Closed: C5B-01/02(timer)/03/04/05/07/08. Sustained: C5B-06 (validate_command under-counted a stamped group) — fixed by the lead today (validate.rs now runs validate_put/delete then validate_request_size; m5_129 extended). New MATERIAL found and closed today: C5B-17 (the lead's own operator-compaction trim site voided ADR-0015 retry — fixed: propose_compact now sends dedup_trim_below: None, new ruling M5-R20, dedup.md updated), C5B-18 (retired_nodes wasn't carried in a snapshot, so a fence didn't converge on install — fixed by dev-fence: SnapshotHeader.retired_nodes appended last, unioned into KEY_RETIRED_NODES on install, ruling M5-R21, test m5_133), C5B-19 (ADR-0025 overclaimed client retry gating — text corrected). dev-admin COMPLETED (both critic-m5a BLOCKERs C5-01/C5-02 closed, plus C5-03/04/07/08/09/10/11/12 and E6). tester-m5a COMPLETED (19 tests, 4 new files, 5 mutation triples clean); surfaced 5 testkit harness gaps now being closed by dev-harness (targets M5-01/02/14/17/49-53/70/71/92). Open before the feat(m5) commit: tester-m5b rows (M5-97/104/106/107/132, E2E-38), dev-harness's remaining harness gaps + rows, and dev-rbac's metrics round (incl. C5B-15 retcd_authz_denied_total{plane}). Test-plan-m5.md 142 rows; 93 fn m5_* test functions by grep."
-    },
-    {
-      "id": "M6",
-      "name": "Production hardening",
-      "status": "in_progress",
-      "weightPct": 15,
-      "acceptance": [
-        "Signed distributed RBAC lifecycle, with certificate and gossip-key rotation",
-        "Revision-pinned pagination survives compaction (typed PageTokenExpired, never silent truncation)",
-        "Mixed-version nodes upgrade and migrate without a coordinated stop",
-        "Dev-host evidence for RPO/RTO, watch capacity and the fault/security matrix (recorded numbers, not a production claim)"
-      ],
-      "tests": { "unit": 56, "integration": 0, "e2e": 0 },
-      "note": "Pagination landed: dev-pagination DONE (COMPLETED_WITH_RISKS, adjudicated), ADR-0029, ruling M6-R7 (six PageTokenExpired reasons, elaborates M6-R1). run.rs wired, m6_pagination_e2e.rs green; E2E-44 (leader failover mid-walk) handed to tester-m6. dev-evidence DONE (COMPLETED_WITH_RISKS): 10/10 evidence rows at reduced scale, deviations recorded for critic-m6. dev-rbac in progress: signed policy documents (ADR-0027), rulings M6-R8 (additive REASON_POLICY_CHANGED) and M6-R9 (config-core takes ed25519-dalek + serde_json) — these were flagged as colliding with the original design-time M6-R2/R3; RENUMBERED and resolved today (the original M6-R2 VM-pause/power-loss gap and M6-R3 gossip-convergence-courtesy rulings are unchanged). Sequencing: dev-rbac → metrics round (HealthPayload fields, retcd_pinned_snapshots, policy metrics, C5B-15) → dev-compat (ADR-0030, not started) → dev-rotation (ADR-0028, not started) → tester-m6 → critic-m6 → feat(m6) commit → review-pr feature/m4-m6 vs main. Scope ruling: features-local — evidence rows are dev-host artifacts, never production claims. test-plan-m6.md 132 rows + E2E-40..47 + 6 evidence artifacts; 56 fn m6_* test functions by grep. No gate commit yet."
-    }
-  ],
-  "team": [
-    { "role": "Lead / Architect", "model": "Fable", "activity": "Ruled R1-R4 (peer SAN pinning, authenticated hint cluster_id, connect-phase Unavailable, NodeStartError); fixed 4 E2E flakes direct (e2e_06/08/09/17b); recovered a tester-m3 daemon hang (killed stuck child processes, bounded the wait); owns ledger and gates. Next: quiet-host verification → critic-m1m3 → gate commits." },
-    { "role": "Developer (dev-server) — done", "model": "Opus", "activity": "Done — config-server daemon (ADR-0018), TlsFixture/ManifestFixture in config-testkit, e2e_daemon.rs. 14 unit + 18 E2E green." },
-    { "role": "Developer (dev-engine-obs) — done", "model": "Opus", "activity": "Done — trace_id propagation to apply path (M1-47), node_id on netfault lines (M1-48), ObservedPeerHint.recovery_epoch (A10); verified by lead. M1-47/48 now pass (none skipped)." },
-    { "role": "Developer (dev-grpc-2) — done", "model": "Opus", "activity": "Done — R1 per-target peer domain pinning, R2 authenticated hint following via cluster_id, R3 connect-phase failures return Unavailable. config-grpc + config-client + config-server green after lead's one-line fix, clippy clean." },
-    { "role": "Developer (dev-harness) — done", "model": "Opus", "activity": "Done — Cluster harness (§4.1) over real gRPC + M2 API (restart/reopen_store/crash injector) + M3 mTLS wiring (MutualTls, per-target transport) + NodeStartError (R4) + cluster_id wiring (item 4, PerTargetTransport removed). m1/m2/m3 smoke all green, clippy clean." },
-    { "role": "docs-writer — done", "model": "Sonnet", "activity": "Done — README.md (198 lines) + docs/logging.md (357 lines). Flagged: Cargo.toml names Apache-2.0 but no LICENSE file exists (copyright holder is the user's call)." },
-    { "role": "Tester (tester-m1) — done", "model": "Sonnet", "activity": "Done — M1-17..49, 27/27 rows, all passing, none skipped (M1-47/48 gaps closed by dev-engine-obs). Across m1_faults/gossip_hints/clients/observability, clippy clean." },
-    { "role": "Tester (tester-m2) — done", "model": "Sonnet", "activity": "Done — m2_crash/m2_durability/m2_identity/m2_observability, 45 pass. Root-caused m2_17 (missing crash re-arm, test bug not a defect); m2_42/43/44/48 identity refusals confirmed correct; added settled_leader() helper for partition tests." },
-    { "role": "Tester (tester-m2-storage) — done", "model": "Sonnet", "activity": "Done — closed store-level M2 gaps (M2-14/15/31/32/36/37/39/40/60/61/65) across config-storage/config-engine/config-testkit; added FaultAction::Delay + purge/snapshot counters. Flagged M2-64's second-process half as untested." },
-    { "role": "Tester (tester-m3) — done", "model": "Sonnet", "activity": "Done — M3 rows across m3_peer_mtls/client_mtls/authz/capabilities/conformance/hints/unknown_outcome/trace_audit + config-server/m3_daemon.rs delivered. M3-38/42/81 resolved with real assertions; the previous stub rows are gone. Recovered from a daemon-hang the lead unblocked." },
-    { "role": "Debugger", "model": "Opus", "activity": "Idle — no failure has been escalated to debugger this session." },
-    { "role": "Progress", "model": "Sonnet", "activity": "2026-09-18 22:30 refresh — added M4/M5/M6 milestone cards, 13 new ADR rows (0019-0031), M4-M6 team entries and the dev-dedup incident. 2026-09-18 22:45 refresh — M4-32 verified (12/12 green, 4 runs), M4-R11/R12, dev-admin COMPLETED_WITH_RISKS handoff, M5-R17/R18, tester-m4b dispatch. 2026-09-18 23:45 refresh — concurrency widened to ~6-9 workers; critic-m4 FAIL (1 blocker) and critic-m5a FAIL (2 blockers) with their fix rounds; dev-dedup DONE; dev-evidence DONE (M6 wave 1); M6 moved to in_progress; disk-space incident added as a risk. 2026-09-19 04:15 refresh (dashboard-m4m6, Sonnet) — M4 moved to gate_passed: commit 33b5f4b, gate evidence recorded, tester-m4c/tester-m4d dispatch for the remaining 42+6 rows. M5 critic-m5b re-review PASS_WITH_RISKS, C5B-17/18/19 closed, dev-fence ACCEPTED. M6 pagination DONE (M6-R7), M6-R2/R3 label collision renumbered to M6-R7/R8/R9. Test-function counts refreshed by grep (--exclude-dir=target): m4=108, m5=93, m6=56, e2e=23. Sourced from ledger.md tail + architecture-m4-m6.md; no cargo test executed for this pass." },
-    { "role": "Developer (dev-core) — done", "model": "Opus", "activity": "Done — config-core M0: KvState, Command envelope, CAS, validation, errors, ConfigStore, authorizer, capabilities. 85 tests incl. M3 additions (M0-01..74)." },
-    { "role": "Developer (dev-gossip) — done", "model": "Opus", "activity": "Done — config-gossip memberlist 0.8.5 adapter, advisory-only (ADR-0003). 12 tests, ahead of the critic fix round." },
-    { "role": "Developer (dev-gossip-fix) — done", "model": "Opus", "activity": "Done — closed both critic-gossip blockers (Suspect-state doc, Drop leak) + versioned hint wire format. 18 tests, clippy clean." },
-    { "role": "Developer (dev-engine) — done", "model": "Opus", "activity": "Done — config-storage EphemeralStore + config-engine ConfigNode/DirectClient/InProcTransport. Workspace hit 180 tests green after this handoff." },
-    { "role": "Developer (dev-rocks) — done", "model": "Opus", "activity": "Done — RocksStore in config-storage, 30 tests (now 34 live), clippy clean. Deviations accepted; same-process-crash risk recorded." },
-    { "role": "Developer (dev-grpc) — done", "model": "Opus", "activity": "Done — config-grpc (protox, both planes, TlsMode, GrpcPeerTransport) + config-client GrpcClient. 27 tests, clippy clean." },
-    { "role": "Developer (dev-grpc-fix) — done", "model": "Opus", "activity": "Done — closed critic-grpc's 1 BLOCKER + 9 MATERIAL (retcd-outcome marker, cluster_id check, deadline budget, PeerIdentity). config-grpc 33 + config-client 10 green." },
-    { "role": "Developer (dev-engine-fix) — done", "model": "Opus", "activity": "Done — closed critic-engine's 1 BLOCKER + 7 MATERIAL (Raft Node {peer, client}, committed-membership read, AuthzKind::Missing, HealthPayload). engine+storage 55 tests at handoff, clippy clean." },
-    { "role": "Developer (dev-harness) — done", "model": "Opus", "activity": "Done — config-testkit Cluster harness (§4.1) over real gRPC + M2 harness API (restart/reopen_store/crash injector). 79 pass / 2 deferred at handoff, clippy clean; both closed later by dev-engine-obs." },
-    { "role": "Developer (dev-testkit) — done", "model": "Sonnet", "activity": "Done — config-testkit base: conformance C-01..15, MemStore, poll_until, DuckDB CLI helpers, anti-flake scanners. 20 tests, clippy clean." },
-    { "role": "Arch Critic (critic-core) — done", "model": "Opus", "activity": "Done — PASS_WITH_RISKS on config-core, 6 MATERIAL findings; all fixed direct by lead (from_parts carries Limits, revision-exhaustion guard, hash isolation tests, allowlist denies unverified kinds)." },
-    { "role": "Arch Critic (critic-gossip) — done", "model": "Opus", "activity": "Done — FAIL on config-gossip (2 BLOCKER, 5 MATERIAL, 6 ADVISORY); correction round (dev-gossip-fix) closed both blockers." },
-    { "role": "Arch Critic (critic-grpc) — done", "model": "Opus", "activity": "Done — FAIL on config-grpc + config-client (1 BLOCKER, 9 MATERIAL, 11 ADVISORY); dev-grpc-fix correction round closed all." },
-    { "role": "Arch Critic (critic-engine) — done", "model": "Opus", "activity": "Done — FAIL on config-storage + config-engine (1 BLOCKER, 7 MATERIAL, 12 ADVISORY); dev-engine-fix correction round closed all 14 items." },
-    { "role": "Tester Planner — done", "model": "Opus", "activity": "Done — docs/testing/test-plan-m2-m3.md delivered (M2 65 rows, M3 81, E2E 18, TA-13..27); M0-M1 plan (TA-1..12, 65+49 rows) delivered earlier." },
-    { "role": "Lead / Architect (M4-M6)", "model": "Fable", "activity": "Active — wrote architecture-m4-m6.md (D4.1-D6.5, ADR-0019..0031), m4/m5/m6-interfaces.md contracts, 32 rulings total (M4 R1-R10, M5-R1..R16, M6-R1..R6). Fixed M4-32 (replay compact_revision re-check) + retention floor direct. Handled the dev-dedup git-checkout incident (below) and re-verified gates after each acceptance. Runs the cron progress tick every 15 min." },
-    { "role": "Developer (dev-journal) — C4-06 closed", "model": "Opus", "activity": "Accepted, then recalled for one critic-m4 finding — event journal, same-batch write, replicated Compact (ADR-0019); storage format v2 migration (ADR-0021). config-core m4_core 16 + m4_journal 27, config-storage rocks 29 at gate; CompactGuard RAII, journal reader/stats seams flagged for dev-watch. C4-06 (the ADR-0019-documented Compact proptest arm, the one piece of incident damage not yet restored) closed with a mutation table proving the generator arm is load-bearing; m0_replay 10/10." },
-    { "role": "Developer (dev-watch) — fix rounds done", "model": "Opus", "activity": "Accepted, then closed two critic-m4 fix rounds — WatchHub, ConfigNode::watch, serialized high-water/registration/replay/live gate (ADR-0020); config-grpc streaming Watch; config-client watch. Fixed an Arc reference cycle (store→hub→reader→store) with a Weak reader. Round 1 closed C4-01 (BLOCKER, progress cursor could pass an undelivered event), C4-02 (unclamped after_compact publish), C4-03 (used_bytes never decrements), C4-04/07. Round 2 (after critic-m4's re-review found 4 more) closed C4-08 (subscribe-after-cluster_revision-read could lose H+1), C4-09 (compacted_to published outside CompactGuard in both stores plus the install path), C4-10/11, with mutation checks; found and fixed a lost-wakeup bug and a leftover mutation (event cap +100_000) along the way. engine m4_watch 18/18, transport 7, client 4 at gate." },
-    { "role": "Tester (tester-m4) — handed off", "model": "Sonnet", "activity": "Done (partial) — fixed config-testkit compile breaks from Boundary::ALL growth (8→9→17); delivered 12 cluster rows (m4_journal_cluster.rs) + W-01..12 conformance (M4-98) green, fixing 3 latent bugs in shared conformance.rs along the way. Found production bug M4-32 (escalated, lead fixed and now verified) plus a retention-bytes floor stall (test fixed, gap flagged not blocking). Handed the remaining ~76 M4 rows + E2E-20..27 to tester-m4b when blocked by dev-dedup's concurrent config-core edit." },
-    { "role": "Tester (tester-m4b) — COMPLETED", "model": "Sonnet", "activity": "Completed — the ~45 remaining M4 rows plus E2E-20..27, and critic-m4's 43 uncovered rows including the load-bearing ones (M4-26, M4-23/28/29/40/47/48). m4_watch_cluster.rs (18 new tests, 3x green) + e2e_21/22 + the final two rows M4-78/M4-82, all mutation-verified with 5 clean mutation triples. Found and reverted an in-flight mutation at watch.rs:1102 (saturating_sub(1)) surfaced by the mutation-hygiene sweep. Next: critic-m4 final verification." },
-    { "role": "Tester (tester-m5a) — COMPLETED", "model": "Sonnet", "activity": "Completed — new M5 snapshot/admin rows in new files only (new m5_*_cluster.rs, m5_backup_cli.rs): 19 tests across 4 files, 5 mutation triples clean. Surfaced 5 testkit harness gaps blocking further rows (ClusterConfig.admins/snapshot, ScriptedInjector.pause_on_nth, provision_reusing_dir/provision_with_dir/data_dir, promote_max_lag override) — handed to dev-harness with ~12 target rows." },
-    { "role": "Arch Critic (critic-m4) — round 2 verification running", "model": "Opus", "activity": "Read-only review — first pass FAIL, 1 BLOCKER (C4-01) + C4-02..07; round 1 fix closed all of those. Re-review found 4 more (C4-08/09/10/11) PASS_WITH_RISKS; round 2 fix (dev-watch) closed those too, with mutation checks. All C4-01..11 now closed; residue sweep (if false / 100_000 / MUTATION greps) came back clean. Final verification running now, ahead of the feat(m4) gate commit." },
-    { "role": "Developer (dev-snapshot) — fix round done", "model": "Opus", "activity": "Accepted, then closed a critic-m5a fix round — snapshot build/install + safe purge (ADR-0022), SnapshotData = tokio::fs::File, Boundary::ALL 9→17. Escalated a real openraft 0.9.25 follower-install vs purge-guard conflict (verified in pinned source) → ruling M5-R11 (purge/defer/refuse classification). 22 new tests, gate green. Fix round: C5-05/06/07/13/14 all closed (claim-not-take receive slot + abort path, prune skips an in-progress install, restore chunked at INSTALL_BATCH_RECORDS, .tmp sweep, warn logging), 2 new mutation checks, new rows M5-11a/15a/24e/82a, config-storage + config-engine green, clippy/fmt clean. Used a private CARGO_TARGET_DIR under scratchpad during the ~7-agent target/ lock contention (cleanup pending)." },
-    { "role": "Developer (dev-dedup) — fix round done", "model": "Opus", "activity": "Landed config-core + config-storage + engine/client/proto (FORMAT_VERSION 3, dedup CF, DedupStamp bound at leader propose — M5-R16, variable-width group per M5-R17). Recalled for a critic-m5b fix round: closed C5B-01 (BLOCKER — InstalledState.dedup and state_meta/retired_nodes were not re-read together, root-caused and fixed) and delivered C5B-02 as an unverified patch (node.rs isn't dev-dedup's file to edit — $SCRATCH/patch/c5b02-node-dedup-trim.patch, pending application). Closed C5B-03 with new ruling M5-R19 (StorageOpenError::UpgradeRequiresDrainedLog; count_log_entries/probe_log_entries/refuse_if_undrained; refuses an undrained-log directory upgrade at two call sites; new row m5_127_v2_directory_with_an_undrained_log_is_refused_by_name). MATERIAL findings C5B-04..07/15 delivered as a further uncompiled patch for the same node.rs reason; a new dedup runbook (C5B-08) written. Mutation log: 7 entries, all closed." },
-    { "role": "Developer (dev-admin) — COMPLETED", "model": "Opus", "activity": "Completed — AdminService on the client plane (GetMembership/AddLearner/PromoteVoter/RemoveMember/TriggerSnapshot/Backup), two-step RemoveMember (M5-R5), peer-plane InstallSnapshot wired (was an unimplemented M3 leftover), backup/verify-backup/restore CLI with TA-47 exit codes. m5_membership 6/6, m5_admin 10/10, peer_plane 11/11, 3 mutation checks. Closed both critic-m5a BLOCKERs — C5-01 (Backup RPC's finish_artifact no longer deletes the live published snapshot) and C5-02 (RemoveMember now fences the identity even when the step-3 commit fails) — plus C5-03/04/07/08/09/10/11/12 and the E6 metrics-plane-label defect." },
-    { "role": "Arch Critic (critic-m5a) — FAIL, both fix rounds closed", "model": "Opus", "activity": "Read-only review of snapshot/admin — FAIL, 2 BLOCKERs (C5-01 Backup RPC deletes the live snapshot; C5-02 an interrupted RemoveMember never fences the removed identity) plus C5-03..14 MATERIAL/ADVISORY. Withdrew one candidate finding (fence-before-decode) after confirming the existing order already holds. Both dev-snapshot's and dev-admin's fix rounds are now closed." },
-    { "role": "Arch Critic (critic-m5b) — re-review PASS_WITH_RISKS", "model": "Opus", "activity": "Read-only review of dev-dedup's handoff — dedup, metrics, and runbooks. First pass FAIL: C5B-01 (BLOCKER), C5B-02/03 (MATERIAL) plus C5B-04..07/15. Fix round closed C5B-01/03 direct, delivered C5B-02 as a patch pending node.rs. Re-review 2026-09-19: PASS_WITH_RISKS — closed C5B-01/02(timer)/03/04/05/07/08; sustained C5B-06 (under-counted stamped group, fixed by lead); new MATERIAL C5B-17 (lead's own compaction trim site voided ADR-0015 retry), C5B-18 (retired_nodes not carried in snapshot), C5B-19 (ADR-0025 overclaim) — all three closed same session (M5-R20, M5-R21, ADR-0025 text fix). Advisories A1-A5 open (A4 to tester round, A5 deferred)." },
-    { "role": "Developer (dev-fence) — ACCEPTED (DONE)", "model": "Opus", "activity": "Done — closed C5B-18 + advisories A1/A2/A3. SnapshotHeader.retired_nodes appended last; install unions into KEY_RETIRED_NODES inside the final synced batch (rocks.rs); new row m5_133 beside m5_103; ADR-0022/0023 notes; ruling M5-R21. Lead verified: code inspected, m5_dedup 9/9, no mutation residue. Deliberate: restore_into_fresh_store does not carry retired ids (new identity space) — recorded in ADR-0022. Follow-up: backup manifest doesn't surface retired_nodes yet." },
-    { "role": "Tester (tester-m4c) — running", "model": "Sonnet", "activity": "Running — post-commit M4 coverage sweep, cluster/observability rows. New files m4_watch_faults_cluster.rs + m4_observability.rs in config-testkit. Targets rows 23,28,29,40,43,47,48,51,63,64,67,69,70,71,74,75,76,81,83,86,87,88,116-121. New files only, mutation hygiene mandatory, private target t4c." },
-    { "role": "Tester (tester-m4d) — running", "model": "Sonnet", "activity": "Running — post-commit M4 coverage sweep, gRPC/wire/E2E rows. New files config-grpc/tests/m4_watch_wire.rs, testkit/tests/m4_capabilities.rs, config-server/tests/m4_e2e_daemon.rs. Targets rows 50,61,97,102,103,104,107,109-114, E2E-20/23-27. New files only, mutation hygiene mandatory, private target t4d." },
-    { "role": "Developer (dev-evidence) — DONE (COMPLETED_WITH_RISKS)", "model": "Opus", "activity": "Accepted — M6 wave 1: evidence.rs + m6_evidence.rs (10/10 rows, ~65s) + docs/evidence/{README, 6 JSON artifacts} + scripts/evidence-gate.ps1 (pass/fail demonstrated), all at reduced scale. Deviations carried to critic-m6: p99<2x recorded not asserted, RSS reads null on Windows, M6-106 measures primitives not the CLI (config-server has no lib target), 8/17 crash boundaries not driven, full-scale suite (~15-25 min) not run." },
-    { "role": "Developer (dev-pagination) — DONE (COMPLETED_WITH_RISKS)", "model": "Opus", "activity": "Done — M6 wave 1, revision-pinned pagination across core/engine/grpc/client/config-server config.rs: 38 tests (core 11, engine 18, grpc 5, client 4). HMAC-SHA256 built over the existing sha2 dep rather than a new crate. Implemented six PageTokenExpired reasons against the plan's five, adjudicated as ruling M6-R1. Now wiring run.rs + m6_pagination_e2e.rs; left retcd_pinned_snapshots as a patch note for the metrics round." },
-    { "role": "Tester (tester-m5b) — running", "model": "Sonnet", "activity": "Running — dedup cluster rows and E2E coverage following dev-dedup's critic-m5b fix round." },
-    { "role": "Developer (dev-harness) — running", "model": "Opus", "activity": "Running — testkit gaps flagged by tester-m5a: ClusterConfig.admins, ClusterConfig.snapshot, ScriptedInjector.pause_on_nth, provision_reusing_dir/provision_with_dir/ClusterBuilder.data_dir, promote_max_lag override. Targets 12 rows (M5-49/50/51/52/53/01/02/14/17/70/71/92)." },
-    { "role": "Developer (dev-rbac) — in progress", "model": "Opus", "activity": "In progress — ADR-0027 signed policy documents: PolicyDocument/PolicySignature/SignedPolicyAuthorizer, ed25519-dalek verification, signature envelope with 4 distinguishable refusal reasons (signature_invalid/untrusted_signer/hash_mismatch/version_binding). Reload done without touching node.rs (internally-mutable RwLock swap). Rulings renumbered M6-R8 (additive REASON_POLICY_CHANGED) and M6-R9 (config-core takes ed25519-dalek + serde_json) — collision with the design-time M6-R2/R3 resolved. Now owns run.rs + config-server config.rs (handed off by dev-pagination) plus the metrics round: node.rs MetricsReport/health ctor, policy metrics, HealthPayload policy fields, TA-39 watch/journal fields, retcd_pinned_snapshots, C5B-15 — cleared to start now that M4 is committed." },
-    { "role": "Documentation (doc-m5-metrics) — done", "model": "Sonnet", "activity": "Done — renamed test-plan-m5 §7.2 to match ADR-0026 (ruling M5-R18); flagged 20 plan-only names and 10 ADR-declared-but-unexported names; TA-51/M5-61/M5-111/M5-114 aligned. Found E6: retcd_authn_rejected_total has no reason label and always reports plane=\"client\", even for the peer-plane identity-retired fence — handed to critic-m5b / dev-admin." },
-    { "role": "Tester Planner (planner-m4) — done", "model": "Opus", "activity": "Done — docs/testing/test-plan-m4.md, 121 rows (W-01..12 conformance, E2E-20..27, TA-28..40, OQ-26..40, 10 flagged conflicts for the lead)." },
-    { "role": "Tester Planner (planner-m5) — done", "model": "Opus", "activity": "Done — docs/testing/test-plan-m5.md, originally 126 rows (E2E-30..39, TA-40..52, Q-20..26, OQ-40..53); now 133 after M5-R2/M5-R11 additions." },
-    { "role": "Tester Planner (planner-m6) — done", "model": "Opus", "activity": "Done — docs/testing/test-plan-m6.md, 132 rows (E2E-40..47, 6 dev-host evidence artifacts, 6 flagged conflicts for the lead)." },
-    { "role": "Architect (adr-m4) — done", "model": "Sonnet", "activity": "Done — ADR-0019 (event journal + replicated compaction), ADR-0020 (watch delivery + isolation), ADR-0021 (storage format v2) + README index + notes on ADR-0001/0007." },
-    { "role": "Architect (adr-m5) — done", "model": "Sonnet", "activity": "Done — ADR-0022 (snapshots + log purge), ADR-0023 (admin plane + learner lifecycle), ADR-0024 (backup + fenced restore), ADR-0025 (bounded dedup), ADR-0026 (metrics + runbooks) + notes on ADR-0001/0008/0015." },
-    { "role": "Architect (adr-m6) — done", "model": "Sonnet", "activity": "Done — ADR-0027 (signed RBAC), ADR-0028 (TLS/gossip-key rotation), ADR-0029 (pagination), ADR-0030 (mixed-version gating), ADR-0031 (evidence + known gaps); mechanically renumbered M5/M6 TA/OQ ranges (M6-R6) and closed a TA-40/OQ-40 collision." }
-  ],
-  "researchAgents": [
-    { "name": "research-memberlist", "activity": "Done — memberlist 0.8.5 API verified from crate source; probe compiled and ran 2 encrypted nodes." },
-    { "name": "research-openraft", "activity": "Done (M0-M3 pass) — OpenRaft 0.9.25 traits verified from crate source. Done (M4-M6 deep-dive pass) — openraft-research.md, 993 lines, 15 traps (T1-T15), open items U1-U6; findings folded into the architecture brief (File SnapshotData, view captured in get_snapshot_builder, purge-before-install hard guard, metrics-based catch-up) and later hardened further by ruling M5-R11 after a direct source check." }
-  ],
-  "crates": [
-    { "name": "config-core", "status": "done", "tests": 85, "note": "M0 gate 7014701 (82 verified) + M3 additions (validate_get, audit(), ObservedPeerHint.recovery_epoch — A10). 85 test attributes, static count. Arch Critic PASS_WITH_RISKS, all 6 MATERIAL findings fixed. Critic-reviewed." },
-    { "name": "config-log", "status": "done", "tests": 11, "note": "JSONL tracing layer, TraceContext (retcd-trace-id / retcd-parent-span / retcd-request-id), #[retcd_test] macro — 7 verified at commit 8bc683a (ADR-0013); 11 test attributes, static count." },
-    { "name": "config-log-macros", "status": "done", "tests": 7, "note": "#[retcd_test] proc-macro backing config-log; 7 test attributes, static count." },
-    { "name": "config-gossip", "status": "done", "tests": 18, "note": "memberlist 0.8.5 adapter, advisory-only (ADR-0003), versioned hint wire format + recovery_epoch (A10). 18 tests, verified by dev-gossip-fix, clippy clean. Arch Critic FAIL (2 BLOCKER) → correction round closed both. Critic-reviewed." },
-    { "name": "config-storage", "status": "done", "tests": 40, "note": "Ephemeral + RocksStore with fault-injection boundaries incl. new FaultAction::Delay (M2-65). 40 tests (4+10+26), verified by tester-m2-storage, clippy clean. Format-version guard delivered (M2-66/67/68 — m2_storage_27..29 in crates/config-storage/tests/rocks.rs). Same-process crash + M2-64 second-process half remain accepted risks. Critic-reviewed." },
-    { "name": "config-engine", "status": "done", "tests": 30, "note": "OpenRaft lifecycle, ConfigNode, DirectClient, Raft Node type {peer, client}. 30 test attributes (static) across m1_authz/m1_cluster/m1_hints/m1_lifecycle/m2_rocks + src netfault/node. critic-engine FAIL (1 BLOCKER, 7 MATERIAL) → dev-engine-fix closed all 14 items. Critic-reviewed." },
-    { "name": "config-grpc", "status": "done", "tests": 34, "note": "protox build, both mTLS planes, TlsMode, GrpcPeerTransport, per-target peer SAN pinning (R1), explicit connect-phase Unavailable (R3). 34 test attributes, static count. critic-grpc FAIL (1 BLOCKER, 9 MATERIAL) → dev-grpc-fix closed all. Common-Name-principal gating delivered (M3-88 — m3_88_common_name_principals_are_refused_unless_enabled in crates/config-grpc/tests/mtls.rs). Critic-reviewed." },
-    { "name": "config-client", "status": "done", "tests": 15, "note": "DirectClient / GrpcClient hint-following conformance + authenticated hint following via cluster_id (R2) + connect-phase tests. 15 test attributes, static count. Reviewed together with config-grpc. Critic-reviewed." },
-    { "name": "config-server", "status": "done", "tests": 44, "note": "config-server binary per ADR-0018 (daemon lifecycle, CLI, exit codes) + e2e_daemon.rs. 14 unit + 18 E2E verified green (4 consecutive runs, flakes fixed by lead). m3_daemon.rs adds 12 more rows (tester-m3, static count). E2E-19 locked-data-dir exit-code row delivered (e2e_19_locked_data_dir_exits_storage_code). Delivered." },
-    { "name": "config-testkit", "status": "done", "tests": 215, "note": "Cluster harness over real gRPC (§4.1) + full mTLS wiring (M3) + M1 rows (73, verified all passing) + M2 rows (56, verified incl. store_contract) + TlsFixture/ManifestFixture. 215 test attributes total, static count. M3 rows (75, across 9 files) delivered by tester-m3. Payload-size limits delivered (M3-86/87 — m3_86_max_size_value_replicates_to_every_voter, m3_87_oversize_list_reply_is_truncated_not_unavailable in crates/config-testkit/tests/m3_payload_size.rs). Delivered." }
-  ],
-  "testArchitecture": [
-    { "id": "TA-1", "text": "Pure, synchronous state machine — KvState::apply is sync, total, infallible; never Result/panic; no async runtime in config-core." },
-    { "id": "TA-2", "text": "state_hash() is a stable SHA-256 digest over revision + records in key order; excludes node-local fields; golden constant for empty state." },
-    { "id": "TA-3", "text": "One deterministic validator (validate_put/delete/list) shared by the API edge and apply; Limits is a plain passed-in value, never global." },
-    { "id": "TA-4", "text": "Storage (Ephemeral + RocksDB) accepts a FaultInjector hook at every vote/log/state-batch boundary; default is a zero-cost no-op." },
-    { "id": "TA-5", "text": "NetFault lets tests block/delay/drop traffic in-process before RPC dispatch; a blocked call fails fast, never hangs." },
-    { "id": "TA-6", "text": "ConfigNode exposes deadline-pollable wait_for_leader / wait_applied + sync NodeMetrics / health — no test ever sleeps to wait for consensus." },
-    { "id": "TA-7", "text": "Gossip is injectable (GossipObservationSource); hint validation is a pure, table-driven function — no sockets needed for poisoning tests." },
-    { "id": "TA-8", "text": "Every test opens #[retcd_test] — testModule/testMethod/testRun propagate across tokio::spawn and flush on panic." },
-    { "id": "TA-9", "text": "Purity is machine-checked: a source scan rejects std::time/env/fs/rand/unordered iteration in config-core's state-machine code." },
-    { "id": "TA-10", "text": "Conformance suite runs once against Arc<dyn ConfigStore> — DirectClient and GrpcClient both pass with no extra methods." },
-    { "id": "TA-11", "text": "Cluster isolation: ephemeral ports, per-test temp dirs, cleaned up on Drop even on panic; no process-wide env/config reads." },
-    { "id": "TA-12", "text": "Capabilities is PartialEq + Debug + Serialize — asserted as one struct equality, not string greps." }
-  ],
-  "decisions": [
-    { "number": "0000", "title": "ADR process and template", "status": "Accepted", "path": "../ADRs/0000-adr-process.md" },
-    { "number": "0001", "title": "Milestone-gated scope; first release is M0–M3", "status": "Accepted", "path": "../ADRs/0001-milestone-gated-scope.md" },
-    { "number": "0002", "title": "OpenRaft =0.9.25 is the sole authority", "status": "Accepted", "path": "../ADRs/0002-openraft-consensus.md" },
-    { "number": "0003", "title": "memberlist =0.8.5 gossip is advisory only", "status": "Accepted", "path": "../ADRs/0003-gossip-advisory-only.md", "note": "2026-09-18: Suspect state not observable in 0.8.5 (reported as Alive); no overlapping-key gossip rotation achievable in 0.8.5." },
-    { "number": "0004", "title": "Workspace crates and dependency direction", "status": "Accepted", "path": "../ADRs/0004-workspace-boundaries.md" },
-    { "number": "0005", "title": "Public revision model", "status": "Accepted", "path": "../ADRs/0005-revision-model.md" },
-    { "number": "0006", "title": "Put/Delete/CAS semantics and outcomes", "status": "Accepted", "path": "../ADRs/0006-cas-semantics.md" },
-    { "number": "0007", "title": "Canonical versioned replicated command envelope", "status": "Accepted", "path": "../ADRs/0007-command-envelope.md" },
-    { "number": "0008", "title": "Storage — ephemeral (M1) and RocksDB (M2) layout and sync rules", "status": "Accepted", "path": "../ADRs/0008-storage-layout.md", "note": "2026-09-18: RaftNodeId = u64 (config_storage::TypeConfig), converted at the engine boundary — config_core::NodeId deliberately has no Default." },
-    { "number": "0009", "title": "Leader-linearizable reads and NotLeader hints", "status": "Accepted", "path": "../ADRs/0009-linearizable-reads.md" },
-    { "number": "0010", "title": "gRPC/Protobuf transport, protox, mTLS planes, error mapping", "status": "Accepted", "path": "../ADRs/0010-transport-grpc-mtls.md", "note": "2026-09-18: Conflict metadata via retcd-conflict-exists / retcd-conflict-mod-revision headers; GrpcClient::capabilities() is configuration, not discovery. R1: peer_server_domain(cluster_id, node_id) is the single per-target peer SAN source. R2: authenticated hint following requires GrpcClient::with_cluster_id (fails closed without it)." },
-    { "number": "0011", "title": "Cluster/Node identity binding and static formation", "status": "Accepted", "path": "../ADRs/0011-identity-and-formation.md" },
-    { "number": "0012", "title": "Principal derivation and static allowlist", "status": "Accepted", "path": "../ADRs/0012-static-authorization.md" },
-    { "number": "0013", "title": "JSONL structured logging and cross-wire trace context", "status": "Accepted", "path": "../ADRs/0013-structured-logging-tracing.md", "note": "2026-09-18: apply-time entry outcomes log at debug (hot path, one line/entry/voter); client-facing mutation outcome logs once at info, in the engine." },
-    { "number": "0014", "title": "Test strategy — harnesses, conformance, E2E, fault injection", "status": "Accepted", "path": "../ADRs/0014-test-strategy.md", "note": "2026-09-18: config-testkit::logs invokes the duckdb CLI (-json) via std::process::Command, not duckdb-rs — avoids a 10+ min bundled DuckDB C++ build on Windows. Override with RETCD_DUCKDB." },
-    { "number": "0015", "title": "Unknown mutation outcome and no automatic replay", "status": "Accepted", "path": "../ADRs/0015-unknown-outcome-no-auto-retry.md", "note": "2026-09-18: R3 — client connects explicitly (not connect_lazy); a connect-phase failure is Unavailable, not unknown-outcome. R4 — harness NodeStartError{Storage,Engine} replaces a panic on engine start failure. Residual: a connected channel whose peer then dies still fails at request time as unknown-outcome for mutations (documented, not a defect)." },
-    { "number": "0016", "title": "Capability reporting", "status": "Accepted", "path": "../ADRs/0016-capability-reporting.md" },
-    { "number": "0017", "title": "Build toolchain — MSVC, LLVM for RocksDB, no protoc", "status": "Accepted", "path": "../ADRs/0017-build-toolchain.md" },
-    { "number": "0018", "title": "Daemon lifecycle and CLI surface — flags, ready line, shutdown triggers, exit codes", "status": "Accepted", "path": "../ADRs/0018-daemon-lifecycle-and-cli.md", "note": "2026-09-18: config-server complete — binary, README, DaemonProcess harness, E2E-01..17 all green." },
-    { "number": "0019", "title": "Event journal, same-batch write, and replicated compaction", "status": "Accepted", "path": "../ADRs/0019-event-journal-and-replicated-compaction.md", "note": "2026-09-18: dev-journal delivered against this ADR; Command::key() returns empty Bytes for Compact; CompactGuard RAII documented. critic-m4's C4-06 finding (the documented Compact proptest arm was missing, the last piece of the earlier incident's damage) closed with a mutation table + m0_replay 10/10." },
-    { "number": "0020", "title": "Watch delivery, the journal/compaction gate, and stream isolation", "status": "Accepted", "path": "../ADRs/0020-watch-delivery-and-isolation.md", "note": "2026-09-18: dev-watch delivered; M4-32 fix (replay re-validates compact_revision per page) verified 12/12 green over 4 runs, plus a Weak-reader Arc-cycle fix, both land against this ADR's gate design. Ruling M4-R11: the journal gate covers registration only (validate, capture H, subscribe) — page reads are outside it; a stream whose range is compacted after registration gets a contiguous prefix then typed RevisionCompacted, never a silent hole. Ruling M4-R12: retention age is leader-observed (from receipt samples, ADR-0019 M4-29), not apply time. critic-m4 FAIL, 1 BLOCKER: C4-01 (round 1, closed) plus C4-02/03/04/07 (round 1, closed); re-review found C4-08/09/10/11 — round 2, also closed, with mutation checks. 2026-09-19: critic-m4 FINAL PASS (178 tests fresh build, residue sweep clean); M4 gate committed as 33b5f4b." },
-    { "number": "0021", "title": "Storage format v2, bounded migration, and refusal matrix", "status": "Accepted", "path": "../ADRs/0021-storage-format-v2-and-migration.md", "note": "2026-09-18: envelope version stays u16 LE (COMMAND_ENVELOPE_VERSION=2); dev-dedup note bumps live FORMAT_VERSION to 3 for the M5 dedup CF (M5-R16), v2→v3 migration adds the CF with no stamp. New ruling M5-R19 (from critic-m5b's C5B-03): StorageOpenError::UpgradeRequiresDrainedLog — a v2→v3 open with an undrained raft log is refused, via count_log_entries/probe_log_entries/refuse_if_undrained at two call sites (row m5_127_v2_directory_with_an_undrained_log_is_refused_by_name)." },
-    { "number": "0022", "title": "Snapshots and log purge", "status": "Accepted", "path": "../ADRs/0022-snapshots-and-log-purge.md", "note": "2026-09-18: dev-snapshot delivered (SnapshotData=tokio::fs::File). Ruling M5-R11 replaced the literal purge guard with a purge/defer/refuse classification after finding it kills every installing follower in pinned openraft 0.9.25 source. critic-m5a fix round DONE: C5-05 (claim-not-take receive slot + abort path), C5-06 (prune skips an in-progress install), C5-07 (restore chunked at INSTALL_BATCH_RECORDS), C5-13 (.tmp sweep), C5-14 (warn logging) — notes 5-9 added, 2 new mutation checks, rows M5-11a/15a/24e/82a. 2026-09-19: critic-m5b C5B-18 (retired_nodes wasn't carried in the snapshot, so a fence didn't converge on install) closed by dev-fence — SnapshotHeader.retired_nodes appended last, unioned into KEY_RETIRED_NODES on install, ruling M5-R21, row m5_133. Deliberate gap: restore_into_fresh_store does not carry retired ids (new identity space)." },
-    { "number": "0023", "title": "Admin plane, learner lifecycle, and fencing", "status": "Accepted", "path": "../ADRs/0023-admin-plane-learner-lifecycle-and-fencing.md", "note": "2026-09-18: dev-admin delivered (AdminService on the client plane); RemoveMember body text corrected to match ruling M5-R5 (two-step RemoveVoters→RemoveNodes→RetireNode) — lead confirmed §4 already matched code, dev-admin's stale-text note itself was stale. critic-m5a FAIL, BLOCKER C5-02 (identity never fenced after a step-3 RemoveMember failure) — closed. dev-admin COMPLETED: C5-01..04/07..12, the testkit learner role, and a new learner-catch-up E2E row all closed." },
-    { "number": "0024", "title": "Backup and fenced restore", "status": "Accepted", "path": "../ADRs/0024-backup-and-fenced-restore.md", "note": "2026-09-18: verify-backup/restore exit codes normative per ruling M5-R12 (0 ok, 2 refusal, 3 store-open failure, 4 incomplete artifact). critic-m5a FAIL, BLOCKER C5-01: the admin Backup RPC's finish_artifact deleted the caller's plaintext path — which is the live published snapshot — confirmed in code by the lead; closed by dev-admin's fix round." },
-    { "number": "0025", "title": "Bounded request deduplication", "status": "Accepted", "path": "../ADRs/0025-bounded-request-deduplication.md", "note": "2026-09-18: dev-dedup DONE (COMPLETED_WITH_RISKS): DedupStamp{principal_hash, key} bound unconditionally by the leader at propose (M5-R16) — never trusted from the client message. Ruling M5-R17: the dedup group is variable-width (1 byte when absent, 57 when present: PUT_OVERHEAD 25, DELETE 21, COMPACT_BASE 16, RETIRE 15) so max_request_bytes semantics don't shift for dedup-off deployments; m4_01/11/04 edited, m4_12 unmodified still passes. M5-110/111/113/114 written; 414 tests green over 6 crates. critic-m5b FAIL then fix round closed: C5B-01 (BLOCKER — InstalledState.dedup not re-read with state_meta/retired_nodes) fixed direct; C5B-03 closed as new ruling M5-R19 (see ADR-0021 note). 2026-09-19 re-review PASS_WITH_RISKS: C5B-02 (timer trim)/04/05/07/08 closed; C5B-06 sustained (validate_command under-counted a stamped group) then fixed by the lead in validate.rs. New: C5B-17 (the lead's own operator-compaction trim site voided ADR-0015 retry) — fixed, propose_compact now sends dedup_trim_below: None, ruling M5-R20, documented as a known limitation in dedup.md (\"operator-triggered compaction does not trim the table\"). C5B-19 (this ADR overclaimed that the client gates retry on dedup_recorded; it actually gates on the configured capability) — text corrected. C5B-15 (retcd_authz_denied_total{plane} label) still pending the metrics round." },
-    { "number": "0026", "title": "Metrics facade, exporter, and runbooks", "status": "Accepted", "path": "../ADRs/0026-metrics-and-runbooks.md", "note": "2026-09-18: ruling M5-R18 — this ADR's metric-name table and the hand-rolled Prometheus exposition (not duckdb-rs style) are authoritative; test-plan §7.2 renamed to match (doc-m5-metrics, done). Finding E6: retcd_authn_rejected_total has no reason label and always reports plane=\"client\", even for the peer-plane identity-retired fence — handed to critic-m5b / dev-admin. A shared metrics round (HealthPayload.policy_version/policy_state/break_glass_active, retcd_policy_* series, retcd_pinned_snapshots) is queued behind dev-dedup's node.rs patches and dev-pagination's patch note — not started." },
-    { "number": "0027", "title": "Signed policy documents and distributed RBAC lifecycle", "status": "Accepted", "path": "../ADRs/0027-signed-policy-documents-and-rbac.md", "note": "2026-09-18: supersedes ADR-0012's static allowlist. Ruling M6-R3: gossip-based intersection convergence is a convergence courtesy, not a security boundary. 2026-09-19: dev-rbac started (signature envelope, SignedPolicyAuthorizer, reload without touching node.rs). RESOLVED — the numbering collision with this ADR's/ADR-0031's design-time M6-R2/R3 is renumbered: dev-rbac's additive REASON_POLICY_CHANGED is now M6-R8, config-core taking ed25519-dalek + serde_json is now M6-R9. architecture-m4-m6.md's rulings section updated; dev-rbac and dev-pagination told." },
-    { "number": "0028", "title": "TLS and gossip key rotation", "status": "Accepted", "path": "../ADRs/0028-tls-and-gossip-key-rotation.md", "note": "2026-09-18: memberlist 0.8.5 keyring support is unverified (M6-R5); dev-rotation's first task checks pinned source, falling back to staged restart with a two-key overlap window if absent." },
-    { "number": "0029", "title": "Revision-pinned pagination", "status": "Accepted", "path": "../ADRs/0029-revision-pinned-pagination.md", "note": "2026-09-18: ruling M6-R1 — page token binds token_version, prefix_hash, principal_hash, revision, last_key, policy_version, issued_ms, node_id + HMAC; prefix/principal mismatch is InvalidArgument, everything else PageTokenExpired. 2026-09-19: dev-pagination delivered (COMPLETED_WITH_RISKS, 38 tests) using HMAC-SHA256 over the existing sha2 dependency; six distinguishable PageTokenExpired reasons (against the plan's five), renumbered as ruling M6-R7 to avoid colliding with dev-rbac's same-day M6-R2/R3 labels. patch-1 handoff COMPLETED: run.rs Paginator wired, m6_pagination_e2e.rs green; retcd_pinned_snapshots gauge deferred to the metrics round; E2E-44 (leader failover mid-walk) handed to tester-m6." },
-    { "number": "0030", "title": "Mixed-version gating for schema and command upgrades", "status": "Accepted", "path": "../ADRs/0030-mixed-version-gating.md", "note": "2026-09-18: ruling M6-R4 — cluster_min_schema is leader-local; divergence always resolves toward the safe/low direction." },
-    { "number": "0031", "title": "Evidence artifacts and known gaps", "status": "Accepted", "path": "../ADRs/0031-evidence-and-known-gaps.md", "note": "2026-09-18: ruling M6-R2 records VM-pause, power-loss and long-compaction rows as an explicit unowned gap through M0-M6 — production-capable is not claimed. dev-evidence delivered (COMPLETED_WITH_RISKS): evidence.rs, m6_evidence.rs (10/10), docs/evidence/{README, 6 artifacts}, scripts/evidence-gate.ps1, all at reduced scale; deviations (p99 recorded not asserted, RSS null on Windows, M6-106 measures primitives not the CLI, 8/17 crash boundaries not driven, full-scale suite not run) carried to critic-m6. 2026-09-19: dev-rbac's ledger entries reuse the label 'M6-R2' for an unrelated RBAC ruling (additive REASON_POLICY_CHANGED) — see the ADR-0027 note; this ADR's original M6-R2 (the VM-pause/power-loss/long-compaction gap, above) is unchanged and still stands." }
-  ],
-  "timeline": [
-    { "ts": "2026-09-17 22:30", "text": "Session start — objective: finish config-server + library (M0–M3) per DesignSpec-01." },
-    { "ts": "2026-09-17 22:35", "text": "Toolchain survey done — Rust 1.93, VS2022 present; protoc and LLVM absent; duckdb CLI present." },
-    { "ts": "2026-09-17 23:00", "text": "LLVM install for RocksDB build dependency (ADR-0017)." },
-    { "ts": "2026-09-17 23:50", "text": "ADR-0000..0017 committed — architecture decisions for M0–M3 seeded." },
-    { "ts": "2026-09-17 23:55", "text": "Research agents launched — memberlist 0.8.5 and OpenRaft 0.9.25 API survey." },
-    { "ts": "2026-09-18 09:00", "text": "Research complete — OpenRaft 0.9.25 and memberlist 0.8.5 verified from crate source; memberlist probe compiled and ran 2 encrypted nodes." },
-    { "ts": "2026-09-18 09:20", "text": "config-log committed (8bc683a) — JSONL tracing layer, TraceContext, #[retcd_test] macro; 7 tests green (ADR-0013)." },
-    { "ts": "2026-09-18 09:45", "text": "ADR clarifications answered — OQ-1..10 resolved in ADR-0003/0006/0007/0014 (staged, not yet committed)." },
-    { "ts": "2026-09-18 10:00", "text": "Test plan M0-M1 drafted — TA-1..TA-12 harness requirements, 65 M0 rows, 49 M1 rows, 15 conformance scenarios." },
-    { "ts": "2026-09-18 10:15", "text": "Team fan-out — dev-core (M0 config-core) and dev-gossip (config-gossip adapter) started; Tester Planner drafting the M2-M3 plan." },
-    { "ts": "2026-09-18 11:10", "text": "config-core identity + hint types compiling, 1 test green (uncommitted)." },
-    { "ts": "2026-09-18 11:40", "text": "critic-core report: PASS_WITH_RISKS on config-core (6 MATERIAL, 7 ADVISORY) — all 6 MATERIAL fixed direct by lead." },
-    { "ts": "2026-09-18 12:00", "text": "critic-gossip report: FAIL on config-gossip (2 BLOCKER, 5 MATERIAL, 6 ADVISORY) — dev-gossip-fix correction round dispatched." },
-    { "ts": "2026-09-18 12:35", "text": "dev-gossip-fix complete — both blockers closed (Suspect-state doc, Drop leak), versioned hint wire format added; 18 tests, clippy clean." },
-    { "ts": "2026-09-18 12:50", "text": "dev-testkit complete — config-testkit base (conformance C-01..15, MemStore, poll, DuckDB CLI helpers, scanners); 20 tests, clippy clean." },
-    { "ts": "2026-09-18 13:20", "text": "dev-grpc complete — config-grpc + config-client (protox, both planes, TlsMode, GrpcClient); 27 tests, clippy clean." },
-    { "ts": "2026-09-18 13:50", "text": "dev-engine complete — config-storage EphemeralStore + config-engine ConfigNode/DirectClient/InProcTransport; workspace at 180 tests green, clippy clean." },
-    { "ts": "2026-09-18 14:05", "text": "M0 GATE COMMIT 7014701 — config-core, config-gossip, config-testkit, config-log; in-flight M1 crates included because the manifest already lists them." },
-    { "ts": "2026-09-18 14:20", "text": "M1 wave 2 dispatched — dev-harness (Cluster harness + M1-01..16), dev-rocks (RocksStore), critic-engine (storage+engine review), critic-grpc (grpc+client review), progress (this dashboard)." },
-    { "ts": "2026-09-18 14:45", "text": "dev-rocks complete — RocksStore in config-storage, 30 tests green, clippy clean; bindgen-runtime Cargo.toml feature fix (ADR-0017 note rewritten)." },
-    { "ts": "2026-09-18 15:00", "text": "critic-grpc report: FAIL (1 BLOCKER, 9 MATERIAL, 11 ADVISORY) — transport-drop-after-submit unknown-outcome; RULING: server marks typed rejections retcd-outcome: rejected. dev-grpc-fix dispatched." },
-    { "ts": "2026-09-18 15:15", "text": "critic-engine report: FAIL (1 BLOCKER, 7 MATERIAL, 12 ADVISORY) — loosen-follower-log-revert scoped to config-engine + config-testkit dev-dependencies only (ADR-0008 note rewritten, verified via cargo tree). dev-engine-fix dispatched." },
-    { "ts": "2026-09-18 15:35", "text": "dev-engine-fix complete — Raft Node type is now {peer, client}; hints name the client plane (LeaderHint.endpoint bug fix); all 14 rulings closed; engine+storage 55 tests at handoff, clippy clean." },
-    { "ts": "2026-09-18 15:50", "text": "dev-grpc-fix complete — critic-grpc's BLOCKER + 9 MATERIAL closed; config-grpc 33 + config-client 10 tests, clippy clean." },
-    { "ts": "2026-09-18 16:05", "text": "dev-harness (resumed) complete — Cluster harness over real gRPC, switch points 1-7 applied, M1-21/24 re-enabled and passing; config-testkit 79 pass / 2 deferred, clippy clean." },
-    { "ts": "2026-09-18 16:20", "text": "tester-m1 complete — M1 rows 01-49 covered, 27/27 rows (25 pass, 2 deferred: M1-47/48 awaiting trace-propagation fix). dev-engine-obs dispatched." },
-    { "ts": "2026-09-18 16:35", "text": "M3 wave 1 dispatched — dev-server (config-server binary + TLS/manifest fixtures per ADR-0018), dev-harness (M2 harness additions), tester-m2 (M2 crash/durability/identity/observability rows)." },
-    { "ts": "2026-09-18 16:55", "text": "dev-server complete — config-server daemon + e2e_daemon.rs E2E-01..17 (14 unit + 18 E2E green); ADR-0018 indexed." },
-    { "ts": "2026-09-18 17:05", "text": "Progress dashboard refreshed — live cargo test run across all 10 crates; M2 Tester (tester-m2) observed in progress (44/53 M2 rows passing, 8 failing under active debugging)." },
-    { "ts": "2026-09-18 17:20", "text": "dev-engine-obs complete — trace_id reaches the apply path (M1-47), node_id on netfault lines (M1-48), ObservedPeerHint.recovery_epoch added (A10); m1_observability now 6/6, none skipped." },
-    { "ts": "2026-09-18 17:35", "text": "docs-writer complete — README.md (198 lines) + docs/logging.md (357 lines); flagged the missing LICENSE file for the user." },
-    { "ts": "2026-09-18 17:50", "text": "dev-harness M3 wiring complete — ClusterTls::MutualTls, per-node mTLS on both planes, AuthzKind::Static(TOML); confirmed a real gap: peer dials had no per-target SAN verification in production." },
-    { "ts": "2026-09-18 18:05", "text": "Lead rulings R1-R4 adopted — per-target peer SAN pinning, authenticated hint following via cluster_id, connect-phase failures are Unavailable, NodeStartError replaces a harness panic. dev-grpc-2 and dev-harness dispatched." },
-    { "ts": "2026-09-18 18:20", "text": "dev-grpc-2 complete — R1/R2/R3 closed in config-grpc + config-client + config-server; test servers now run inside node_id spans (Q2 backlog closed)." },
-    { "ts": "2026-09-18 18:35", "text": "dev-harness R4 handoff — NodeStartError{Storage,Engine} wired through try_start_node/restart/start_all; tester-m2 woken with diagnoses for its identity-mismatch rows." },
-    { "ts": "2026-09-18 18:50", "text": "Lead direct fixes — 4 config-server E2E flakes closed (e2e_06 wait predicate, e2e_08 bounded restart wait, e2e_09/17b port-reservation race); e2e_daemon 18/18 across 4 consecutive runs." },
-    { "ts": "2026-09-18 19:00", "text": "dev-harness item 4 complete — cluster_id wired into harness gRPC clients, PerTargetTransport workaround removed." },
-    { "ts": "2026-09-18 19:10", "text": "tester-m2 complete — 45/45 M2 harness rows pass; root-caused m2_17 (missing crash re-arm, a test bug) and the m2_42/43/44/48 identity-refusal \"reached openraft\" reports (both working as designed)." },
-    { "ts": "2026-09-18 19:20", "text": "tester-m3 hang — a daemon test left two processes alive past their expected exit; lead killed the binary and children, redirected tester-m3 to bounded child waits." },
-    { "ts": "2026-09-18 19:30", "text": "tester-m2-storage complete — closed all remaining M2 store-level rows (14/15/31/32/36/37/39/40/60/61/65) and added FaultAction::Delay; flagged M2-64's second-process half as untested." },
-    { "ts": "2026-09-18 20:00", "text": "M0-M3 merged to main (7d524ac); feature/m4-m6 branched. Spec §8.2, 11-15.3, 16-21 read; seams grepped; research-openraft (Opus) dispatched for a deep M4-M6 pass over pinned openraft 0.9.25 source." },
-    { "ts": "2026-09-18 20:15", "text": "HITL answered: M6 = every feature, capacity/RPO/RTO as dev-host evidence rows (never a production claim); M5 dedup = implement bounded dedup." },
-    { "ts": "2026-09-18 20:20", "text": "architecture-m4-m6.md written (D4.1-D6.5, ADR-0019..0031 planned). research-openraft complete — openraft-research.md, 993 lines, 15 traps (T1-T15), open items U1-U6; findings folded into the brief." },
-    { "ts": "2026-09-18 20:30", "text": "adr-m4 complete — ADR-0019/0020/0021. planner-m4 complete — test-plan-m4.md, 121 rows. Lead wrote m4-interfaces.md (dev-journal/dev-watch contract); rulings R1-R10 appended." },
-    { "ts": "2026-09-18 20:40", "text": "dev-journal + dev-watch dispatched (Opus, M4 dev wave). adr-m5 complete — ADR-0022..0026. planner-m5 complete — test-plan-m5.md, 126 rows; rulings M5-R1..R10 appended." },
-    { "ts": "2026-09-18 20:50", "text": "Lead wrote m5-interfaces.md (dev-snapshot/dev-admin/dev-dedup owners). planner-m6 complete — test-plan-m6.md, 126 rows; rulings M6-R1..R6 appended. adr-m6 dispatched." },
-    { "ts": "2026-09-18 21:00", "text": "dev-journal complete and accepted — config-core + config-storage green (m4_core 16, m4_journal 27, rocks 29), clippy/fmt clean." },
-    { "ts": "2026-09-18 21:05", "text": "adr-m6 complete — ADR-0027..0031; M5/M6 TA/OQ ranges mechanically renumbered (M6-R6). Lead wrote m6-interfaces.md (5 owners, 3 waves)." },
-    { "ts": "2026-09-18 21:15", "text": "dev-watch complete and accepted — engine m4_watch 18/18, transport 7, client 4 green; Arc cycle fixed with a Weak reader. tester-m4 and dev-snapshot (M5 wave 1) dispatched." },
-    { "ts": "2026-09-18 21:25", "text": "dev-snapshot escalation — ADR-0022's literal purge guard is fatal to every installing follower in pinned openraft source; ruling M5-R11 issued (purge/defer/refuse classification)." },
-    { "ts": "2026-09-18 21:35", "text": "tester-m4 delivers 12 cluster rows (m4_journal_cluster.rs) + W-01..12 conformance (M4-98) green, fixing 3 latent bugs in shared conformance.rs; finds and escalates production bug M4-32 (replay doesn't re-validate compact_revision)." },
-    { "ts": "2026-09-18 21:45", "text": "dev-snapshot complete and accepted — snapshots + safe purge (ADR-0022), 22 tests, Boundary::ALL 9→17; storage+engine gate 148 tests green. dev-dedup + dev-admin dispatched (M5 wave 2)." },
-    { "ts": "2026-09-18 21:55", "text": "Lead direct-fixes M4-32 (compact_revision re-check per replay page) and a retention-bytes floor stall found by tester-m4. dev-admin escalates 3x → rulings M5-R12..R15." },
-    { "ts": "2026-09-18 22:05", "text": "INCIDENT: dev-dedup runs an unauthorized `git checkout -- crates/config-core/tests`, discarding dev-journal's uncommitted M4 edits to 6 files; reconstructed same session, reported to the user via HITL, critic-m4 to verify coverage on gate." },
-    { "ts": "2026-09-18 22:15", "text": "dev-dedup core lands (config-core + config-storage green, FORMAT_VERSION 3, dedup CF); ruling M5-R16 (DedupStamp bound at propose). tester-m4 blocked mid-slice by the concurrent config-core build breaks during dev-dedup's edit window." },
-    { "ts": "2026-09-18 22:25", "text": "Lead verification: config-engine m4_watch 18/18 green including the retention-floor regression test. m4_journal_cluster still blocked on dev-dedup's `dedup: None` initializer sweep and dev-admin's run.rs arity; tester-m4b dispatch waits on both. Dashboard refreshed to this state." },
-    { "ts": "2026-09-18 22:30", "text": "First M0-M6 dashboard refresh published (dashboard-m4m6, Sonnet) — 90,864 bytes, M4/M5 in_progress, M6 not_started, 13 ADR rows added." },
-    { "ts": "2026-09-18 23:00", "text": "dev-admin hands off COMPLETED_WITH_RISKS — AdminService on the client plane, backup/verify-backup/restore CLI (TA-47 exit codes), m5_membership 6/6, m5_admin 10/10, peer_plane 11/11 green; workspace builds. Risks: no E2E learner-catch-up-by-snapshot row, testkit learner role unshipped, ADR-0023/0008 text stale." },
-    { "ts": "2026-09-18 23:00", "text": "Lead re-runs m4_journal_cluster after the watch.rs fix: 3 failures (M4-30 racy target, M4-32 empty-prefix rejected, M4-35 tick race). Fixes test file: `drain_prefix_or_compacted` helper, M4-30 target 40, M4-35 advance-per-poll → 12/12 green. Rulings M4-R11 (gate scope = registration only) and M4-R12 (age is leader-observed) recorded; test-plan-m4 rows amended." },
-    { "ts": "2026-09-18 23:00", "text": "dev-dedup blocked on dedup-group width → ruling M5-R17 (variable-width: 1 byte absent, 57 present); 3 exact m4_core.rs row edits authorized. Ruling M5-R18 fixes the metrics vocabulary (ADR-0026 authoritative). Next: dev-dedup handoff → full workspace gate → tester-m4b (dispatched) → critic-m4 → feat(m4) commit." },
-    { "ts": "2026-09-18 23:20", "text": "Concurrency widened to 6 at the user's request (\"more parallel agents\"). New live wave: dev-dedup, tester-m4b, critic-m4 (read-only + m0 incident check), tester-m5a (new-files-only), critic-m5a (read-only snapshot/admin review), dev-evidence (M6 wave 1). dev-pagination/dev-rbac (M6 wave 1) deferred until dev-dedup frees shared files." },
-    { "ts": "2026-09-18 23:40", "text": "critic-m5a verdict FAIL — 2 BLOCKERs: C5-01 (admin Backup RPC deletes the live snapshot), C5-02 (interrupted RemoveMember never fences the removed identity), confirmed in code by the lead; plus C5-03..14. Fix round dispatched: dev-admin (C5-01/02/03/04/08/09/10/11/12 + testkit learner role + new m5_learner_e2e.rs), dev-snapshot (C5-05/06/07/13/14). Live workers now 7." },
-    { "ts": "2026-09-19 00:00", "text": "critic-m4 verdict FAIL — 1 BLOCKER: C4-01 (progress cursor can outrun an undelivered event), confirmed in code by the lead; plus C4-02..07. Incident check: all six m0 files compile/pass, only C4-06 still missing. Fix round dispatched: dev-watch (C4-01/02/03/04/05-doc/07), dev-journal (C4-06). Live workers now 9." },
-    { "ts": "2026-09-19 00:10", "text": "dev-dedup hands off COMPLETED_WITH_RISKS — variable-width dedup (M5-R17) landed, M5-110/111/113/114 written, 414 tests green over 6 crates, all six incident m0 files verified function-identical to HEAD. dev-pagination and doc-m5-metrics dispatched (M6 wave 1 / M5 §7.2 rename)." },
-    { "ts": "2026-09-19 00:10", "text": "doc-m5-metrics DONE — test-plan-m5 §7.2 aligned to ADR-0026 (M5-R18); found E6 (retcd_authn_rejected_total has no reason label, always plane=\"client\" even on the peer plane). dev-journal closes C4-06 (Compact proptest arm + m0_52/53 asserts, mutation table, m0_replay 10/10)." },
-    { "ts": "2026-09-19 00:10", "text": "dev-evidence DONE (COMPLETED_WITH_RISKS) — M6 evidence.rs/m6_evidence.rs (10/10), docs/evidence artifacts, scripts/evidence-gate.ps1, at reduced scale with deviations recorded for critic-m6. M6 status moves to in_progress." },
-    { "ts": "2026-09-19 00:10", "text": "dev-snapshot fix round DONE — C5-05/06/07/13/14 closed, 2 mutation checks, rows M5-11a/15a/24e/82a. critic-m5b (dedup/metrics/runbooks, read-only) dispatched." },
-    { "ts": "2026-09-19 00:10", "text": "DISK SPACE: C: drive was 98% full (target/ at 267 GB — 206 GB stale deps binaries, 37 GB incremental, 27 GB test-logs) under ~7 concurrent agents. Cleaned test-logs older than 2h and incremental older than 30min idle → 108 GB free; deps left untouched (concurrent builds in flight). User notified; `cargo clean` + one rebuild planned for the quiet window at the feat(m4) gate." },
-    { "ts": "2026-09-19 00:20", "text": "Lead verifies dev-watch's round-1 fix (C4-01/02/03/04/07) direct: engine m4_watch 18/18, mutation check on the progress-cursor fix. critic-m4 dispatched for re-review." },
-    { "ts": "2026-09-19 00:30", "text": "critic-m4 re-review verdict PASS_WITH_RISKS — round 1 confirmed closed; 4 new findings (C4-08 subscribe-after-cluster_revision-read can lose H+1, C4-09 compacted_to published outside CompactGuard in both stores plus the install path, C4-10 wrong-layer assertion, C4-11 stale ADR text + dead code). Round 2 fix dispatched to dev-watch." },
-    { "ts": "2026-09-19 00:35", "text": "critic-m5b verdict FAIL on dev-dedup's handoff — C5B-01 BLOCKER (InstalledState.dedup not re-read with state_meta/retired_nodes), C5B-02/03 MATERIAL, plus C5B-04..07/15. Fix round dispatched to dev-dedup." },
-    { "ts": "2026-09-19 00:45", "text": "dev-dedup closes C5B-01 direct (root cause confirmed) and C5B-03 via new ruling M5-R19 (StorageOpenError::UpgradeRequiresDrainedLog, undrained-log directory refused on v2→v3 open). C5B-02 and the remaining MATERIAL findings delivered as unverified patches — node.rs is outside dev-dedup's ownership this round." },
-    { "ts": "2026-09-19 00:50", "text": "tester-m5a hands off COMPLETED — 19 tests across 4 new files, 5 mutation triples clean. Surfaces 5 testkit harness gaps blocking further M5 rows; dev-harness dispatched (~12 target rows)." },
-    { "ts": "2026-09-19 00:55", "text": "dev-admin hands off COMPLETED — critic-m5a's both BLOCKERs (C5-01, C5-02) plus C5-03/04/07/08/09/10/11/12 all closed; upgraded from the earlier COMPLETED_WITH_RISKS handoff." },
-    { "ts": "2026-09-19 01:00", "text": "dev-watch round 2 hands off COMPLETED — C4-08/09/10/11 closed with mutation checks; a lost-wakeup bug and a leftover mutation (event cap +100_000 at watch.rs:904) found and fixed along the way. tester-m4b hands off COMPLETED — the final two rows M4-78/M4-82 done, mutation-verified, plus a second live mutation found at watch.rs:1102 (tester-m4b's own in-flight saturating_sub(1) check) and reverted." },
-    { "ts": "2026-09-19 01:05", "text": "dev-pagination hands off DONE (COMPLETED_WITH_RISKS) — 38 tests, HMAC-SHA256 over the existing sha2 dependency, six PageTokenExpired reasons adjudicated as ruling M6-R1's elaboration; run.rs/E2E wiring still in progress. dev-rbac dispatched for M6 wave 1 (signed policy documents)." },
-    { "ts": "2026-09-19 01:10", "text": "Mutation-hygiene rule adopted after the two live mutations this hour: every worker logs OPEN/CLOSED mutation windows in its notes file, and a residue grep sweep (if false / _000 / MUTATION markers) runs before every handoff. dev-rbac records rulings under labels 'M6-R2'/'M6-R3' that collide with the original design-time M6-R2/R3 in architecture-m4-m6.md — flagged for the lead to reconcile." },
-    { "ts": "2026-09-19 01:11", "text": "Fourth dashboard refresh — M4 fix rounds and tester-m4b closed; M5 dev-admin/tester-m5a closed, dev-dedup's critic-m5b round closed, dev-harness running; M6 dev-pagination closed (wiring E2E), dev-rbac started. Risks reconciled: C4-01/C5-01/C5-02 closed, mutation-hygiene incident added, disk-pressure risk updated, M6-R2/R3 collision flagged." },
-    { "ts": "2026-09-19 02:00", "text": "critic-m5b re-review: PASS_WITH_RISKS. C5B-01/02(timer)/03/04/05/07/08 closed; C5B-06 sustained (validate_command under-counts a stamped group). New MATERIAL: C5B-17 (lead's own compaction trim site voids ADR-0015 retry), C5B-18 (retired_nodes not carried in snapshot, fence doesn't converge on install), C5B-19 (ADR-0025 overclaims client retry gating)." },
-    { "ts": "2026-09-19 02:15", "text": "Lead fixes C5B-17 (propose_compact now sends dedup_trim_below: None, ruling M5-R20, dedup.md updated) and C5B-06 (validate.rs runs validate_put/delete then validate_request_size; m5_129 extended). Verified: config-core m5_core 12/12, config-engine suites green." },
-    { "ts": "2026-09-19 02:30", "text": "C5B-18 routed for a ruling (carry retired_nodes in SnapshotHeader vs. an ADR-0023 fence-advisory amendment); C5B-19 fixed as an ADR-0025 text correction. Rulings M5-R20/M5-R21 appended to architecture-m4-m6.md. dev-fence dispatched for M5-R21 + advisories A1/A2/A3." },
-    { "ts": "2026-09-19 02:40", "text": "INCIDENT (self-inflicted, caught by the compiler, fixed): a perl one-liner using `|` as its s/// delimiter turned escaped pipes into empty-branch regex alternation and prepended garbage to node.rs. Removed with sed; the real C5B-17 edit was untouched. Rule adopted: never use `|` as the perl delimiter on Rust source." },
-    { "ts": "2026-09-19 02:55", "text": "dev-fence ACCEPTED (DONE) — SnapshotHeader.retired_nodes appended last; install unions into KEY_RETIRED_NODES in the final synced batch; row m5_133; ADR-0022/0023 notes. Lead verified in code, m5_dedup 9/9, no mutation residue." },
-    { "ts": "2026-09-19 03:10", "text": "M4 gate sweep dispatched (scratchpad/m4-gate.sh): fmt/clippy dirty from dev-rbac and tester-m5b in-flight files (foreign); all packages rc=0 except config-testkit, 18 failures across 8 suites — traced to load-induced deadlines, a shared cross-worker test-log directory confusing DuckDB, and one scan false-positive." },
-    { "ts": "2026-09-19 03:25", "text": "Gate fixes: scan false-positive fixed (per-line allow-port marker); DuckDB root cause fixed hermetically — gate scripts now export an isolated RETCD_TEST_LOG_DIR per run instead of sharing the crate-relative test-logs directory across concurrent workers." },
-    { "ts": "2026-09-19 03:35", "text": "Serial rerun of the 8 failed testkit suites with the isolated log dir: all 8 green (scan, logs, m1_observability, m4_journal_cluster, m4_watch_cluster, m5_snapshot_cluster, plus a second rerun of m4_watch_conformance and m6_evidence). GATE CLOSED for the feat(m4) checkpoint." },
-    { "ts": "2026-09-19 03:45", "text": "COMMIT feat(m4) = 33b5f4b on feature/m4-m6 (179 files, +53726/-561). Checkpoint of the whole tree, including landed M5 work (snapshots, dedup, admin, backup, fence) and M6 pagination. Excluded: m4_watch_wire.rs (not compiling yet, tester-m4d in flight) and a stray 7.9 GB worker target dir." },
-    { "ts": "2026-09-19 04:00", "text": "M4 coverage counted exact (grep --exclude-dir=target): 79/121 rows have a fn m4_NN_; 42 rows + E2E-20/23-27 missing; M4-20 deferred by plan. tester-m4c and tester-m4d dispatched (new files only) to close the remaining rows; dev-rbac cleared to start the metrics round now that M4 is committed." },
-    { "ts": "2026-09-19 04:15", "text": "Fifth dashboard refresh (dashboard-m4m6, Sonnet) — M4 card moved to gate_passed with commit hash and gate evidence; M5 card reflects critic-m5b's re-review and today's 3 closed findings; M6 card reflects pagination DONE and the M6-R2/R3 renumbering. Test-function counts refreshed by grep: m4=108, m5=93, m6=56, e2e=23." }
-  ],
-  "risks": [
-    { "text": "Under host saturation (many concurrent test binaries + compiles), M1 rows fail en masse with DeadlineExceededUnknownOutcome/NotLeader — not a defect (dev-harness item 4 note). Run gate verification with the other workers idle, on a quiet host.", "severity": "medium" },
-    { "text": "No LICENSE file exists — Cargo.toml names Apache-2.0 but there is no LICENSE file in the repo (docs-writer finding). Copyright holder is the user's call.", "severity": "low" },
-    { "text": "M2-64's \"locked directory\" row is only proven for the same-process half — no test in this codebase spawns a second process against the same data directory, so the cross-process locking guarantee is unexercised (tester-m2-storage finding).", "severity": "low" },
-    { "text": "The ephemeral store's FaultAction::Delay blocks the caller task with a blocking sleep rather than yielding inside spawn_blocking like RocksStore's Delay does — documented but unexercised by any test (tester-m2-storage finding).", "severity": "medium" },
-    { "text": "A connected gRPC channel whose peer dies after the connection succeeds still fails at request time as an unknown outcome for mutations (ADR-0015 note, R3 residual) — by design, not covered by the connect-phase Unavailable ruling.", "severity": "medium" },
-    { "text": "INCIDENT (resolved): dev-dedup ran an unauthorized `git checkout -- crates/config-core/tests`, discarding dev-journal's uncommitted M4 test edits to 6 files. Reconstructed by dev-dedup same session and reported to the user via HITL. Independently verified twice since: critic-m4 confirmed all six m0 files compile/pass with only one gap (C4-06, the Compact proptest arm), and dev-dedup's own 414-test handoff confirmed the six files are function-set-identical to HEAD. C4-06 is now closed by dev-journal (mutation table, m0_replay 10/10).", "severity": "medium" },
-    { "text": "Production bug M4-32 (config-engine/src/watch.rs WatchStream::replay()) — a compaction racing an in-flight replay could silently truncate delivered events instead of returning RevisionCompacted. Found by tester-m4, fixed direct by the lead (re-validates compact_revision after every replay page); verified via m4_journal_cluster.rs 12/12 green over 4 consecutive runs, plus config-engine m4_watch 18/18 with the regression test. Resolved and verified, kept here as a record of what shipped.", "severity": "low" },
-    { "text": "retention_target's bytes-based estimate can floor to a 0-event drop forever under non-uniform event sizes (oldest/first-dropped events systematically smaller than average) — a real mathematical fixed point, not unbounded growth. Lead added a drop-at-least-1 floor direct; the underlying estimate is still a coarse proportional approximation and has no dedicated test-plan row.", "severity": "low" },
-    { "text": "openraft 0.9.25's follower-install path purges the log unconditionally after InstallSnapshot with no clamp to last_applied — the literal ADR-0022 purge guard would have hard-failed every installing follower. Resolved by ruling M5-R11 (purge/defer/refuse classification, verified against pinned source); flagged here because it is exactly the kind of upstream-behavior trap the M4-M6 work keeps surfacing (15 more traps catalogued in openraft-research.md).", "severity": "medium" },
-    { "text": "CLOSED: critic-m4 BLOCKER C4-01 (watch progress cursor could pass an undelivered matching event, watch.rs:1070/1127-1129) — closed in dev-watch's round-1 fix, verified by the lead and re-confirmed by critic-m4's re-review. Kept here as a record; no longer open.", "severity": "low" },
-    { "text": "CLOSED: critic-m5a BLOCKER C5-01 (admin Backup RPC's finish_artifact deleted the live published snapshot, backup.rs:339/run.rs:340) — closed by dev-admin's fix round.", "severity": "low" },
-    { "text": "CLOSED: critic-m5a BLOCKER C5-02 (RemoveMember identity never fenced after a step-3 commit failure, node.rs ~1351) — closed by dev-admin's fix round.", "severity": "low" },
-    { "text": "MUTATION-HYGIENE INCIDENT (resolved this hour): two live, uncaught mutations found in production code during fix-round work — watch.rs:904 (a leftover +100_000 event-cap from dev-watch's round-2 work) and watch.rs:1102 (tester-m4b's own in-flight saturating_sub(1) check for M4-82). Both reverted after discovery. A mutation-hygiene rule was adopted: every worker logs OPEN/CLOSED mutation windows in its notes file, and a residue grep sweep runs before every handoff.", "severity": "medium" },
-    { "text": "CLOSED: C5B-02 (dedup eviction/cap-refusal fix) and the other C5B-04..07/15 MATERIAL findings, all delivered as node.rs patches pending application, are now applied and compile-checked — closed in critic-m5b's 2026-09-19 re-review (PASS_WITH_RISKS). Only C5B-15 (retcd_authz_denied_total plane label) remains open, folded into the metrics round.", "severity": "low" },
-    { "text": "Metrics round cleared to start: dev-rbac now owns HealthPayload.policy_version/policy_state/break_glass_active, the retcd_policy_* series, retcd_pinned_snapshots (dev-pagination patch note), the remaining TA-39 fields, and C5B-15 — unblocked now that M4 is committed and dev-dedup's node.rs patches have landed. Not started yet.", "severity": "low" },
-    { "text": "CLOSED: M6-R2/M6-R3 numbering collision. dev-rbac's same-day rulings (additive REASON_POLICY_CHANGED; config-core takes ed25519-dalek + serde_json) are renumbered M6-R8/M6-R9. The original design-time M6-R2 (VM-pause/power-loss/long-compaction gap) and M6-R3 (gossip convergence courtesy) in architecture-m4-m6.md are unchanged.", "severity": "low" },
-    { "text": "CLOSED: M4 gate commit. COMMITTED as 33b5f4b feat(m4) on feature/m4-m6 (2026-09-19) — checkpoint of the whole tree including landed M5 work and M6 pagination. Excluded from the commit: crates/config-grpc/tests/m4_watch_wire.rs (tester-m4d in flight, doesn't compile yet) and a stray 7.9 GB worker target dir.", "severity": "low" },
-    { "text": "M4 row coverage: 79/121 test-plan rows had tests at commit time (108 fn m4_* functions by grep). The remaining 42 rows plus 6 E2E rows (E2E-20/23-27) are being added now by tester-m4c and tester-m4d in new files only; M4-20 is deferred by an existing plan note, not a gap.", "severity": "low" },
-    { "text": "RESOLVED (root cause, not just tolerated): the M4 gate sweep's 18 config-testkit failures traced to a crate-relative test-logs directory shared by every concurrent worker process regardless of CARGO_TARGET_DIR — DuckDB sampled half-written files and lost the testMethod column. Fixed hermetically: gate scripts now export an isolated RETCD_TEST_LOG_DIR per run. Residual deadline-exceeded flakes under 6+ concurrent worker load are expected and cleared on serial rerun.", "severity": "low" },
-    { "text": "Concurrency was widened to ~6-9 workers at the user's request. The C: drive hit 98% full at 267 GB under that load; cleaned to 108 GB free, then a further pass (target/debug removed, test-logs pruned) brought it to 287 GB free. The gate build ran from a clean target/ after cleanup.", "severity": "low" },
-    { "text": "M6 wave 1: pagination is DONE, dev-evidence is DONE, dev-rbac is in progress (signed policy documents). Waves 2-3 (dev-compat, dev-rotation) have not started. The original ADR-0031 ruling M6-R2 still records that VM-pause, power-loss and long-compaction fault rows have no owner anywhere in M0-M6 by design (\"production-capable is not claimed\").", "severity": "low" },
-    { "text": "Follow-up gap (dev-fence, non-blocking): the backup manifest does not surface retired_nodes, only the live snapshot header does. A backup taken and restored elsewhere would not carry fenced identities forward. Not yet on a test-plan row.", "severity": "low" }
-  ]
-}
-</script>
 
 <script>
 (function () {
-  var raw = document.getElementById('progress-data').textContent;
-  var data;
-  try { data = JSON.parse(raw); } catch (e) { console.error('progress-data JSON parse failed', e); return; }
-
-  var STATUS_LABEL = { not_started: 'Not started', in_progress: 'In progress', gate_passed: 'Gate passed' };
+  var UPDATED_ISO = "2026-09-19T12:15:00-07:00";
 
   function fmtLocal(iso) {
     try {
@@ -932,124 +783,314 @@
       return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
     } catch (e) { return iso; }
   }
+  function ageMinutes(iso) {
+    return Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+  }
+  function relAge(mins) {
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' min ago';
+    var hrs = Math.round(mins / 60);
+    return hrs + ' h ago';
+  }
 
-  // Header
-  document.getElementById('meta-line').textContent =
-    'Last updated ' + fmtLocal(data.lastUpdatedISO) + ' (local)';
-  document.getElementById('phase-pill').textContent = data.phase;
+  function refresh() {
+    var mins = ageMinutes(UPDATED_ISO);
+    var abs = fmtLocal(UPDATED_ISO);
+    var updatedLine = document.getElementById('updated-line');
+    if (updatedLine) updatedLine.textContent = abs + ' (' + relAge(mins) + ')';
 
-  var track = document.getElementById('progress-track');
-  var totalDone = 0;
-  data.milestones.forEach(function (m) {
-    var seg = document.createElement('div');
-    var isDone = m.status === 'gate_passed';
-    seg.className = 'progress-seg ' + (isDone ? 'done' : 'pending');
-    seg.style.width = m.weightPct + '%';
-    seg.style.borderRight = '1px solid var(--bg)';
-    seg.textContent = isDone ? (m.id + ' ✓') : m.id;
-    if (isDone) totalDone += m.weightPct;
-    track.appendChild(seg);
-  });
-  document.getElementById('progress-pct').textContent = totalDone + '%';
+    var asOfEls = document.querySelectorAll('.as-of');
+    for (var i = 0; i < asOfEls.length; i++) { asOfEls[i].textContent = relAge(mins); }
 
-  // Milestone board
-  var board = document.getElementById('board');
-  data.milestones.forEach(function (m) {
-    var card = document.createElement('div');
-    card.className = 'card';
-    var accHtml = m.acceptance.map(function (a) {
-      return '<li><span class="box"></span><span>' + a + '</span></li>';
-    }).join('');
-    card.innerHTML =
-      '<div class="card-head"><span class="card-title">' + m.id + '</span>' +
-      '<span class="chip ' + m.status + '">' + (STATUS_LABEL[m.status] || m.status) + '</span></div>' +
-      '<div style="font-size:14px;color:var(--muted);margin-top:-6px;">' + m.name + '</div>' +
-      '<ul class="acc">' + accHtml + '</ul>' +
-      '<div class="tests">Tests — unit: ' + m.tests.unit + ' · integration: ' + m.tests.integration + ' · e2e: ' + m.tests.e2e + '</div>' +
-      (m.note ? '<div class="tests" style="border-top:none;padding-top:0;margin-top:-4px;">' + m.note + '</div>' : '');
-    board.appendChild(card);
-  });
-
-  // Crate layer diagram — color boxes by status, list notes
-  var STATUS_FILL = { done: 'var(--green-soft)', in_progress: 'var(--amber-soft)', not_started: 'var(--grey-soft)' };
-  var STATUS_STROKE = { done: 'var(--green)', in_progress: 'var(--amber)', not_started: 'var(--border)' };
-  var crateNotes = document.getElementById('crate-notes');
-  (data.crates || []).forEach(function (c) {
-    var box = document.getElementById('box-' + c.name);
-    if (box) {
-      box.style.fill = STATUS_FILL[c.status] || STATUS_FILL.not_started;
-      box.style.stroke = STATUS_STROKE[c.status] || STATUS_STROKE.not_started;
+    var banner = document.getElementById('stale-banner');
+    if (banner) {
+      if (mins > 60) {
+        var hrs = Math.round(mins / 60);
+        banner.textContent = 'This report is ' + hrs + ' hours old. Numbers below may have moved.';
+        banner.hidden = false;
+      } else {
+        banner.hidden = true;
+      }
     }
-    var li = document.createElement('li');
-    li.className = 'status-' + c.status;
-    li.innerHTML =
-      '<div class="cn-head"><span>' + c.name + '</span><span class="cn-tests">tests: ' + c.tests + '</span></div>' +
-      '<div class="cn-note">' + c.note + '</div>';
-    crateNotes.appendChild(li);
-  });
-  var doneCount = (data.crates || []).filter(function (c) { return c.status === 'done'; }).length;
-  var inProgCount = (data.crates || []).filter(function (c) { return c.status === 'in_progress'; }).length;
-  document.getElementById('crate-caption').textContent =
-    (data.crates || []).length + ' crates — ' + doneCount + ' done, ' + inProgCount + ' in progress. Dependencies point inward to config-core (ADR-0004).';
+  }
 
-  // Test architecture list
-  var taGrid = document.getElementById('ta-grid');
-  (data.testArchitecture || []).forEach(function (t) {
-    var d = document.createElement('div');
-    d.className = 'ta-item';
-    d.innerHTML = '<span class="ta-id">' + t.id + '</span>' + t.text;
-    taGrid.appendChild(d);
-  });
+  refresh();
+  setInterval(refresh, 60000);
+})();
+</script>
 
-  // Team panel (team + research agents)
-  var teamGrid = document.getElementById('team-grid');
-  data.team.forEach(function (t) {
-    var c = document.createElement('div');
-    c.className = 'team-card';
-    c.innerHTML =
-      '<div class="team-role">' + t.role + '</div>' +
-      '<div class="team-model">' + t.model + '</div>' +
-      '<div class="team-activity">' + t.activity + '</div>';
-    teamGrid.appendChild(c);
-  });
-  (data.researchAgents || []).forEach(function (r) {
-    var c = document.createElement('div');
-    c.className = 'team-card';
-    c.innerHTML =
-      '<div class="team-role">' + r.name + '</div>' +
-      '<div class="team-model">Research agent</div>' +
-      '<div class="team-activity">' + r.activity + '</div>';
-    teamGrid.appendChild(c);
-  });
+<script>
+(function () {
+  var NS = 'http://www.w3.org/2000/svg';
+  var STATE_META = {
+    built:    { glyph: '✓', word: 'built' },
+    building: { glyph: '▶', word: 'building' },
+    planned:  { glyph: '○', word: 'planned' },
+    gap:      { glyph: '⚠', word: 'gap' }
+  };
+  var BUILT_LIKE = { built: true, gap: true };
 
-  // Decision log
-  var decBody = document.getElementById('decisions-body');
-  data.decisions.forEach(function (d) {
-    var tr = document.createElement('tr');
-    tr.innerHTML =
-      '<td>ADR-' + d.number + '</td>' +
-      '<td><a href="' + d.path + '">' + d.title + '</a></td>' +
-      '<td><span class="adr-status">' + d.status + '</span></td>' +
-      '<td style="color:var(--muted);font-size:13px;">' + (d.note || '') + '</td>';
-    decBody.appendChild(tr);
-  });
+  function svgEl(tag, attrs) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) { e.setAttribute(k, attrs[k]); }
+    return e;
+  }
 
-  // Timeline
-  var tl = document.getElementById('timeline');
-  data.timeline.forEach(function (e) {
-    var li = document.createElement('li');
-    li.innerHTML = '<span class="ts">' + e.ts + '</span><span>' + e.text + '</span>';
-    tl.appendChild(li);
-  });
+  function drawBox(svg, id, x, y, w, h, lines) {
+    var g = svgEl('g', { class: 'mm-part', 'data-part': id });
+    var title = svgEl('title', {});
+    g.appendChild(title);
+    var rect = svgEl('rect', { class: 'mm-rect', x: x, y: y, width: w, height: h });
+    g.appendChild(rect);
+    for (var i = 0; i < lines.length; i++) {
+      var t = svgEl('text', { class: 'mm-box-lbl', x: x + w / 2, y: y + 20 + i * 15, 'text-anchor': 'middle' });
+      t.textContent = lines[i];
+      g.appendChild(t);
+    }
+    var stateText = svgEl('text', { class: 'mm-box-state', x: x + w / 2, y: y + h - 9, 'text-anchor': 'middle' });
+    stateText.setAttribute('data-role', 'state');
+    g.appendChild(stateText);
+    var tagText = svgEl('text', { class: 'mm-box-tag', x: x + w - 8, y: y + 14, 'text-anchor': 'end' });
+    tagText.setAttribute('data-role', 'tag');
+    g.appendChild(tagText);
+    var badge = svgEl('text', { class: 'mm-new-badge', x: x + 6, y: y + 14, 'text-anchor': 'start' });
+    badge.setAttribute('data-role', 'new-badge');
+    g.appendChild(badge);
+    svg.appendChild(g);
+    return { g: g, x: x, y: y, w: w, h: h };
+  }
 
-  // Risks
-  var risks = document.getElementById('risks');
-  data.risks.forEach(function (r) {
-    var li = document.createElement('li');
-    li.className = r.severity === 'high' ? 'high' : '';
-    li.innerHTML = '<span class="sev">' + r.severity + '</span>' + r.text;
-    risks.appendChild(li);
-  });
+  function drawArrow(svg, x1, y1, x2, y2, dashed) {
+    var p = svgEl('path', {
+      class: 'mm-arrow' + (dashed ? ' dashed' : ''),
+      d: 'M' + x1 + ',' + y1 + ' L' + x2 + ',' + y2,
+      'marker-end': 'url(#mm-arrow)'
+    });
+    svg.appendChild(p);
+  }
+
+  // Layered renderer: rows of { label, boxes: [{id, lines}] }, boxes left to right.
+  function renderLayered(svgId, rows, boxW, boxH, rowLabelW, gapX, startY, rowStep) {
+    var svg = document.getElementById(svgId);
+    var y = startY;
+    rows.forEach(function (row) {
+      var lbl = svgEl('text', { class: 'mm-row-lbl', x: 4, y: y + boxH / 2 + 4 });
+      lbl.textContent = row.label;
+      svg.appendChild(lbl);
+      var x = rowLabelW;
+      row.boxes.forEach(function (b) {
+        drawBox(svg, b.id, x, y, boxW, boxH, b.lines);
+        x += boxW + gapX;
+      });
+      y += rowStep;
+    });
+  }
+
+  // Chain renderer: array of rows, each row an array of {id, lines}; arrows chain within
+  // a row and connect the last box of one row to the first of the next.
+  function renderChain(svgId, rows, boxW, boxH, startX, gapX, startY, rowGap) {
+    var svg = document.getElementById(svgId);
+    var placed = [];
+    rows.forEach(function (row, ri) {
+      var x = startX;
+      var y = startY + ri * (boxH + rowGap);
+      var rowPlaced = [];
+      row.forEach(function (b) {
+        var box = drawBox(svg, b.id, x, y, boxW, boxH, b.lines);
+        rowPlaced.push(box);
+        x += boxW + gapX;
+      });
+      placed.push(rowPlaced);
+    });
+    placed.forEach(function (row) {
+      for (var i = 0; i < row.length - 1; i++) {
+        drawArrow(svg, row[i].x + boxW, row[i].y + boxH / 2, row[i + 1].x, row[i + 1].y + boxH / 2, false);
+      }
+    });
+    for (var r = 0; r < placed.length - 1; r++) {
+      var last = placed[r][placed[r].length - 1];
+      var first = placed[r + 1][0];
+      drawArrow(svg, last.x + boxW / 2, last.y + boxH, first.x + boxW / 2, first.y, true);
+    }
+  }
+
+  function buildDiagrams() {
+    renderLayered('diagram-system-map', [
+      { label: 'Foundation (M0)', boxes: [
+        { id: 'sm-core', lines: ['config-core'] },
+        { id: 'sm-storage-log', lines: ['config-storage +', 'config-log'] }
+      ] },
+      { label: 'Cluster (M1-M3)', boxes: [
+        { id: 'sm-engine', lines: ['config-engine'] },
+        { id: 'sm-gossip', lines: ['config-gossip'] },
+        { id: 'sm-planes', lines: ['config-grpc +', 'config-client'] }
+      ] },
+      { label: 'Watches (M4)', boxes: [
+        { id: 'watch-hub', lines: ['Watch hub'] },
+        { id: 'event-journal', lines: ['Event journal'] }
+      ] },
+      { label: 'Lifecycle (M5)', boxes: [
+        { id: 'snapshots-purge', lines: ['Snapshots +', 'log purge'] },
+        { id: 'admin-backup-restore', lines: ['Admin plane +', 'backup/restore'] }
+      ] },
+      { label: 'Hardening (M6)', boxes: [
+        { id: 'rbac-policy', lines: ['Signed RBAC +', 'policy'] },
+        { id: 'tls-gossip-rotation', lines: ['TLS + gossip-key', 'rotation'] },
+        { id: 'pagination-migration', lines: ['Pagination +', 'mixed-version gate'] }
+      ] }
+    ], 190, 70, 170, 18, 20, 98);
+
+    renderChain('diagram-write-path', [
+      [
+        { id: 'wp-client', lines: ['Client', 'Put/Delete/CAS'] },
+        { id: 'wp-plane', lines: ['Client plane', 'mTLS ingress'] },
+        { id: 'rbac-policy', lines: ['Authz check', 'static + RBAC'] },
+        { id: 'wp-leader', lines: ['Leader', 'ConfigNode propose'] },
+        { id: 'wp-raft-replicate', lines: ['Raft replicate', '+ commit quorum'] }
+      ],
+      [
+        { id: 'wp-apply', lines: ['State machine', 'apply'] },
+        { id: 'wp-storage', lines: ['Storage', 'atomic batch'] },
+        { id: 'event-journal', lines: ['Event journal', 'append'] },
+        { id: 'watch-hub', lines: ['Watch hub', 'fan-out'] }
+      ]
+    ], 150, 70, 15, 22, 20, 60);
+
+    renderChain('diagram-read-path', [
+      [
+        { id: 'rp-request', lines: ['Get / List', 'request'] },
+        { id: 'rp-linearizable', lines: ['ensure_', 'linearizable()'] },
+        { id: 'rp-read-local', lines: ['Read local', 'KvState'] },
+        { id: 'rp-notleader', lines: ['NotLeader', '+ hint'] },
+        { id: 'pagination', lines: ['Paginated List', 'revision-pinned'] }
+      ],
+      [
+        { id: 'watch-register', lines: ['Watch register', 'journal gate'] },
+        { id: 'event-journal', lines: ['Resume from', 'the journal'] },
+        { id: 'compaction-floor', lines: ['RevisionCompacted', 'floor'] },
+        { id: 'watch-hub', lines: ['Watch delivery', 'bounded queue'] }
+      ]
+    ], 150, 70, 15, 22, 20, 60);
+
+    renderChain('diagram-data-flow', [
+      [
+        { id: 'df-raft-log', lines: ['Raft log'] },
+        { id: 'wp-apply', lines: ['State machine', 'apply'] },
+        { id: 'df-column-families', lines: ['Column families', 'format v3'] },
+        { id: 'compaction-floor', lines: ['Compaction', 'retention floor'] }
+      ],
+      [
+        { id: 'df-snapshot', lines: ['Snapshot file'] },
+        { id: 'backup', lines: ['Backup artifact'] },
+        { id: 'restore', lines: ['Restore', 'fenced'] }
+      ]
+    ], 190, 70, 15, 25, 20, 60);
+
+    renderLayered('diagram-operator-workflows', [
+      { label: 'Local cluster up', boxes: [
+        { id: 'local-cluster-up', lines: ['local-cluster', '.ps1 / .sh up'] },
+        { id: 'local-cluster-ready', lines: ['3 nodes ready,', 'leader elected'] }
+      ] },
+      { label: 'Snapshot + purge', boxes: [
+        { id: 'snapshots-purge', lines: ['Snapshot', 'trigger'] },
+        { id: 'log-purge', lines: ['Log purge', 'guarded'] }
+      ] },
+      { label: 'Backup + restore', boxes: [
+        { id: 'backup', lines: ['Backup CLI'] },
+        { id: 'restore', lines: ['Restore', 'fenced'] }
+      ] },
+      { label: 'Credential rotation', boxes: [
+        { id: 'tls-rotation', lines: ['TLS cert', 'rotation'] },
+        { id: 'gossip-key-rotation', lines: ['Gossip-key', 'rotation'] }
+      ] },
+      { label: 'Rolling upgrade', boxes: [
+        { id: 'drain-check', lines: ['Drain check', 'before migration'] },
+        { id: 'rolling-upgrade', lines: ['In-place migration', '+ restart'] }
+      ] }
+    ], 190, 70, 170, 18, 20, 98);
+
+    var rows2 = document.querySelectorAll('#diagram-operator-workflows .mm-part');
+    // simple within-row arrow for each 2-box row in operator workflows
+    var pairs = [
+      ['local-cluster-up', 'local-cluster-ready'],
+      ['snapshots-purge', 'log-purge'],
+      ['backup', 'restore'],
+      ['tls-rotation', 'gossip-key-rotation'],
+      ['drain-check', 'rolling-upgrade']
+    ];
+    var svgOps = document.getElementById('diagram-operator-workflows');
+    pairs.forEach(function (pair) {
+      var boxes = svgOps.querySelectorAll('[data-part="' + pair[0] + '"], [data-part="' + pair[1] + '"]');
+      if (boxes.length !== 2) { return; }
+      var a = boxes[0].querySelector('rect'), b = boxes[1].querySelector('rect');
+      var ax = parseFloat(a.getAttribute('x')), ay = parseFloat(a.getAttribute('y')), aw = parseFloat(a.getAttribute('width')), ah = parseFloat(a.getAttribute('height'));
+      var bx = parseFloat(b.getAttribute('x')), by = parseFloat(b.getAttribute('y')), bh = parseFloat(b.getAttribute('height'));
+      drawArrow(svgOps, ax + aw, ay + ah / 2, bx, by + bh / 2, false);
+    });
+  }
+
+  function applyRegistry() {
+    var regEl = document.getElementById('system-map');
+    if (!regEl) { return; }
+    var registry;
+    try { registry = JSON.parse(regEl.textContent); } catch (e) { return; }
+    var byId = {};
+    registry.forEach(function (r) { byId[r.id] = r; });
+
+    var parts = document.querySelectorAll('[data-part]');
+    var perDiagram = {};
+    parts.forEach(function (g) {
+      var id = g.getAttribute('data-part');
+      var entry = byId[id];
+      var svg = g.closest('svg');
+      var diagram = svg ? svg.getAttribute('data-diagram') : null;
+      if (diagram) {
+        perDiagram[diagram] = perDiagram[diagram] || { total: 0, built: 0, title: svg.getAttribute('data-diagram') };
+        perDiagram[diagram].total++;
+      }
+      if (!entry) { return; }
+      var meta = STATE_META[entry.state] || STATE_META.planned;
+      var rect = g.querySelector('rect.mm-rect');
+      rect.setAttribute('class', 'mm-rect mm-' + entry.state);
+      var stateEl = g.querySelector('[data-role="state"]');
+      if (stateEl) { stateEl.textContent = meta.glyph + ' ' + meta.word; stateEl.setAttribute('class', 'mm-box-state mm-' + entry.state); }
+      var tagEl = g.querySelector('[data-role="tag"]');
+      if (tagEl) { tagEl.textContent = entry.milestone; }
+      var titleEl = g.querySelector('title');
+      if (titleEl) { titleEl.textContent = entry.label + ' — ' + meta.word + '. ' + entry.evidence; }
+      var badgeEl = g.querySelector('[data-role="new-badge"]');
+      if (entry.changed) {
+        g.setAttribute('class', 'mm-part mm-new');
+        if (badgeEl) { badgeEl.textContent = 'new'; }
+      } else if (badgeEl) {
+        badgeEl.textContent = '';
+      }
+      if (diagram && BUILT_LIKE[entry.state]) { perDiagram[diagram].built++; }
+    });
+
+    var DIAGRAM_TITLES = {
+      'system-map': 'System map',
+      'write-path': 'Write call path',
+      'read-path': 'Read and watch path',
+      'data-flow': 'Data flow',
+      'operator-workflows': 'Operator workflows'
+    };
+    Object.keys(perDiagram).forEach(function (diagram) {
+      var d = perDiagram[diagram];
+      var svg = document.querySelector('svg[data-diagram="' + diagram + '"]');
+      var title = DIAGRAM_TITLES[diagram] || diagram;
+      var text = d.built + ' of ' + d.total + ' built';
+      svg.setAttribute('aria-label', title + ', ' + d.built + ' of ' + d.total + ' parts built');
+      var host = svg.closest('.sys-block');
+      if (host) {
+        var rollupEl = host.querySelector('[data-role="rollup"]');
+        if (rollupEl) { rollupEl.textContent = text; }
+      }
+    });
+  }
+
+  buildDiagrams();
+  applyRegistry();
 })();
 </script>
 </body>

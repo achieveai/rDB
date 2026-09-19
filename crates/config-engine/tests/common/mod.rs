@@ -134,6 +134,11 @@ impl Cluster {
     /// The M6 policy rows need a *shared* authorizer object, not just a shared decision: the
     /// test adopts a new document through the same handle the node holds, which is what makes
     /// a reload observable without restarting anything (ADR-0027).
+    ///
+    /// Wired as `AuthzKind::SignedPolicy`, which is the only model whose presence the node
+    /// re-reads from its authorizer: a node left at the default `Development` kind would report
+    /// `Authz::Development` from `capabilities()` and would stay ready with no document at all,
+    /// so neither M6-38 nor M6-27 could be stated against it.
     pub async fn formed_with_authorizer(
         n: u64,
         authorizer: Arc<dyn config_core::Authorizer>,
@@ -143,7 +148,7 @@ impl Cluster {
             RaftTimers::default(),
             |_| Arc::new(NoGossip),
             |_| Arc::clone(&authorizer),
-            |_| {},
+            |cfg| cfg.authz_kind = config_engine::AuthzKind::SignedPolicy,
         )
         .await;
         cluster.form().await;

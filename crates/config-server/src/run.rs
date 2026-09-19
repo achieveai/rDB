@@ -128,14 +128,30 @@ pub struct ReadyLine {
     pub health: Option<String>,
 }
 
+/// What `--capabilities` prints: the [`Capabilities`] contract plus this run's schema triple.
+///
+/// Flattened rather than nested so every key `Capabilities` has keeps the exact name and place
+/// it had before M6 — the report is a machine-readable contract that operator tooling already
+/// parses, and moving its fields under a wrapper to add one would be a breaking change for the
+/// benefit of a field nothing had asked for yet (ADR-0030 M6-87).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CapabilitiesReport {
+    /// The unchanged M0–M5 capability contract.
+    #[serde(flatten)]
+    pub capabilities: Capabilities,
+    /// What this run can read and write (ADR-0030). Operator-facing only: nothing in the
+    /// cluster reads it back.
+    pub schema: config_core::SchemaTriple,
+}
+
 /// Compute the capability report from configuration alone, opening nothing (`--capabilities`).
 ///
 /// Deliberately duplicated from `ConfigNode::capabilities` rather than obtained from a started
 /// node: the whole point of the flag is to answer without a store, a listener, or a lock on
 /// the data directory. E2E-02 asserts the two agree, which is what keeps the duplication
 /// honest.
-pub fn capabilities_without_opening(cfg: &ServerConfig, cli: &Cli) -> Capabilities {
-    Capabilities {
+pub fn capabilities_without_opening(cfg: &ServerConfig, cli: &Cli) -> CapabilitiesReport {
+    let capabilities = Capabilities {
         durability: if cli.unsafe_no_sync {
             Durability::PersistentUnverified
         } else {
@@ -162,6 +178,10 @@ pub fn capabilities_without_opening(cfg: &ServerConfig, cli: &Cli) -> Capabiliti
         } else {
             Dedup::Unsupported
         },
+    };
+    CapabilitiesReport {
+        capabilities,
+        schema: cli.schema(),
     }
 }
 
@@ -204,6 +224,10 @@ struct NodeBackend {
     paginator: Arc<config_engine::Paginator>,
     /// The signed-policy reload seam (M6, ADR-0027). `None` under every other `authz.mode`.
     policy: Option<Arc<crate::policy::PolicyLoader>>,
+    /// The TLS reload seam (M6, ADR-0028). `None` under `tls.mode = "insecure"`.
+    tls: Option<Arc<config_grpc::TlsRotator>>,
+    /// The gossip keyring seam (M6, ADR-0028). `None` when gossip is off or unencrypted.
+    gossip: Option<Arc<GossipNode>>,
 }
 
 impl ClientBackend for NodeBackend {
@@ -220,8 +244,8 @@ impl ClientBackend for NodeBackend {
     /// The client plane is the only place that sees a certificate and the node is the only
     /// place that keeps counters, so without this the health endpoint reports zero rejections
     /// no matter how many certificates the listener turned away.
-    fn record_authn_rejection(&self) {
-        self.node.record_authn_rejection();
+    fn record_authn_rejection(&self, reason: config_engine::AuthnRejectReason) {
+        self.node.record_authn_rejection(reason);
     }
 }
 
@@ -457,6 +481,115 @@ impl config_grpc::AdminBackend for NodeBackend {
                 detail: format!("{}: {rejected}", rejected.reason()),
             })
     }
+
+    /// M6-42: re-read the configured TLS files now, without waiting for a poll tick
+    /// (ADR-0028).
+    async fn reload_tls(
+        &self,
+    ) -> Result<Vec<config_grpc::TlsPlaneReload>, config_engine::AdminError> {
+        let Some(rotator) = self.tls.clone() else {
+            return Err(config_engine::AdminError::Unavailable {
+                reason: format!(
+                    "{}: this node runs tls.mode = \"insecure\" and has no credentials to rotate",
+                    config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED
+                ),
+            });
+        };
+        // Three file reads, so not on a runtime worker — the same reasoning as `reload_policy`.
+        tokio::task::spawn_blocking(move || rotator.reload("rpc"))
+            .await
+            .map_err(|e| config_engine::AdminError::Unavailable {
+                reason: format!("the tls reload task did not complete: {e}"),
+            })?
+            .map_err(|refused| config_engine::AdminError::InvalidArgument {
+                detail: format!("{}: {refused}", refused.reason()),
+            })
+    }
+
+    /// M6-57..M6-59: one step of a gossip key rotation on this node (ADR-0028).
+    ///
+    /// The key is parsed here rather than at the transport, against the same
+    /// [`crate::config::parse_gossip_key`] that validates `gossip.secret_key_hex` — one
+    /// definition of what a gossip key is, so an operator cannot install over the wire
+    /// something their configuration file would have refused.
+    async fn rotate_gossip_key(
+        &self,
+        op: config_grpc::GossipKeyOp,
+        key_hex: &str,
+        force: bool,
+    ) -> Result<config_grpc::GossipKeyringView, config_engine::AdminError> {
+        let Some(gossip) = self.gossip.clone() else {
+            return Err(config_engine::AdminError::Unavailable {
+                reason: format!(
+                    "{}: this node runs no encrypted gossip",
+                    config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED
+                ),
+            });
+        };
+        // The refusal names the key only by shape, never by value: an error string is the one
+        // place a mistyped key would otherwise end up in a log.
+        let key = crate::config::parse_gossip_key(key_hex).map_err(|_| {
+            config_engine::AdminError::InvalidArgument {
+                detail: "invalid_gossip_key: key_hex must be 64 hex characters (an AES-256 key)"
+                    .to_string(),
+            }
+        })?;
+
+        let keyring = match op {
+            config_grpc::GossipKeyOp::Add => gossip.add_gossip_key(&key).await,
+            config_grpc::GossipKeyOp::Use => gossip.use_gossip_key(&key).await,
+            config_grpc::GossipKeyOp::Remove => gossip.remove_gossip_key(&key, force).await,
+        }
+        .map_err(gossip_rotation_error)?;
+
+        Ok(config_grpc::GossipKeyringView {
+            primary_fingerprint: config_gossip::fingerprint_hex(keyring.primary),
+            accepted_fingerprints: keyring
+                .accepted
+                .into_iter()
+                .map(config_gossip::fingerprint_hex)
+                .collect(),
+        })
+    }
+}
+
+/// Map a keyring refusal onto the admin plane's error vocabulary.
+///
+/// Both refusals become `InvalidArgument` with a greppable reason prefix rather than new
+/// [`config_engine::AdminError`] variants: the admin error type is the membership plane's
+/// vocabulary, and a gossip keyring is not membership. What a caller branches on is the
+/// prefix, which is stable.
+fn gossip_rotation_error(e: config_gossip::GossipError) -> config_engine::AdminError {
+    match e {
+        // The one refusal an operator may legitimately overrule, so it is worth telling apart.
+        still_needed @ config_gossip::GossipError::GossipKeyStillNeeded { .. } => {
+            config_engine::AdminError::InvalidArgument {
+                detail: format!("gossip_key_still_needed: {still_needed}"),
+            }
+        }
+        refused @ config_gossip::GossipError::Keyring(_) => {
+            config_engine::AdminError::InvalidArgument {
+                detail: format!("gossip_keyring_refused: {refused}"),
+            }
+        }
+        // Advertising failed after the keyring already changed. Reported as unavailable, not
+        // as invalid: the step *was* taken here, and what failed is telling the cluster — which
+        // the next `update_hint` will do anyway.
+        other => config_engine::AdminError::Unavailable {
+            reason: format!("gossip_advertise_failed: {other}"),
+        },
+    }
+}
+
+/// Rotate `handle`'s credentials with the rest of this node's, from now on.
+///
+/// A no-op under `tls.mode = "insecure"`, where there is no rotator and the handle carries no
+/// credentials — written as one helper because both planes register identically and a second
+/// copy of it is a second place for the two to drift apart.
+fn register_plane(rotator: &Option<Arc<config_grpc::TlsRotator>>, handle: Option<&ServerHandle>) {
+    if let (Some(rotator), Some(source)) = (rotator, handle.and_then(ServerHandle::credentials)) {
+        rotator.register(source);
+    }
 }
 
 /// Everything a running daemon holds, in the order it must be torn down.
@@ -475,6 +608,13 @@ struct Running {
     /// The signed-policy poller and the notify that stops it (M6, ADR-0027).
     policy_shutdown: Option<Arc<tokio::sync::Notify>>,
     policy_task: Option<tokio::task::JoinHandle<()>>,
+    /// The TLS file poller and the notify that stops it (M6, ADR-0028).
+    ///
+    /// Held separately from the policy pair rather than merged into one "pollers" list: they
+    /// stop at different points of the teardown, because a plane still draining requests is a
+    /// plane that must not have its credentials replaced underneath it.
+    tls_shutdown: Option<Arc<tokio::sync::Notify>>,
+    tls_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Start, serve, and shut down. Returns the process exit code.
@@ -550,11 +690,14 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
 
     // ---- 6. start and form ------------------------------------------------------------
     let (gossip_node, gossip_endpoint, gossip_source) =
-        start_gossip(&cfg, &peer_endpoint, &client_endpoint).await?;
+        start_gossip(&cfg, &peer_endpoint, &client_endpoint, cli.schema()).await?;
 
     let mut node_cfg = NodeConfig::new(identity, peer_endpoint.clone());
     node_cfg.client_endpoint = Some(client_endpoint.clone());
     node_cfg.raft = cfg.raft;
+    // `--compat-schema` reaches the engine here and nowhere else: the gate, the health payload
+    // and the peer-plane header all read `NodeConfig::schema` (ADR-0030).
+    node_cfg.schema = cli.schema();
     node_cfg.authz_kind = policy.kind;
     node_cfg.transport_security = tls.transport_security();
     node_cfg.limits.watch = cfg.watch_limits;
@@ -579,6 +722,27 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     let limits = node_cfg.limits;
 
     let transport = GrpcPeerTransport::new(tls.clone(), config_engine::NetFault::new(), limits);
+    // The same transport, kept concretely. The node only ever wants a `dyn PeerTransport`, but
+    // a rotation has to reach `reload`, which is not on that trait — nothing in the engine has
+    // any business replacing credentials.
+    let peer_dial = Arc::clone(&transport);
+    // Present exactly when this node serves mutual TLS: `config::validate` produces
+    // `tls_material` and `tls_reload` from the same match arm, and `insecure` produces neither.
+    // Built from the profile the planes are about to serve, not from a second translation of
+    // `[tls]`: `tls_mode` above is the one place a `TlsMaterial` becomes an `MtlsConfig`, so a
+    // reload cannot end up compiling the same files into a different profile than boot did.
+    let tls_rotator = match (&cfg.tls_reload, &tls) {
+        (Some(files), TlsMode::MutualTls(serving)) => Some(config_grpc::TlsRotator::new(
+            config_grpc::TlsFiles {
+                ca: files.ca.clone(),
+                cert: files.cert.clone(),
+                key: files.key.clone(),
+            },
+            serving.clone(),
+            peer_dial,
+        )),
+        _ => None,
+    };
     let node = ConfigNode::start(
         node_cfg,
         storage.clone(),
@@ -600,6 +764,8 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         health_task: None,
         policy_shutdown: None,
         policy_task: None,
+        tls_shutdown: None,
+        tls_task: None,
     };
 
     if let Some(verified) = verified {
@@ -628,6 +794,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         }
     };
     running.peer_server = Some(peer_server);
+    register_plane(&tls_rotator, running.peer_server.as_ref());
 
     // One backend value behind two traits, so the admin plane and the client plane can never
     // disagree about which node they are talking to (OQ-43: the admin service is co-located on
@@ -649,6 +816,14 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         backup: cfg.backup.clone(),
         paginator: Arc::clone(&paginator),
         policy: policy.loader.clone(),
+        tls: tls_rotator.clone(),
+        // Only when the keyring exists: a node gossiping in plaintext has nothing to rotate,
+        // and answering `RotateGossipKey` with a success would say otherwise.
+        gossip: running
+            .gossip
+            .as_ref()
+            .filter(|gossip| gossip.keyring().is_some())
+            .map(Arc::clone),
     });
     // M6-40: under signed mode the admin set is the active document's, re-read on every call;
     // `[authz] admins` is not consulted at all, and startup said so.
@@ -680,6 +855,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         }
     };
     running.client_server = Some(client_server);
+    register_plane(&tls_rotator, running.client_server.as_ref());
 
     if let Some(listener) = health_listener {
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -689,6 +865,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
                 node: running.node.clone(),
                 pagination: Some(Arc::clone(&paginator)),
                 policy: policy.loader.clone(),
+                tls: tls_rotator.clone(),
             },
             Arc::clone(&notify),
             cfg.metrics_enabled,
@@ -702,8 +879,30 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     // on a node with none (M6-11, ADR-0027).
     if let Some(loader) = &policy.loader {
         let notify = Arc::new(tokio::sync::Notify::new());
-        running.policy_task = Some(loader.spawn_poller(Arc::clone(&notify)));
+        // Convergence needs both halves, so it is wired only when gossip is running: with it
+        // off there is no way to learn what the other voters hold, and claiming convergence
+        // from silence is the one answer that is never safe (ADR-0027 §15.3).
+        let convergence = running.gossip.as_ref().map(|gossip| {
+            Arc::new(crate::policy::GossipPolicyVersions::new(
+                Arc::clone(gossip),
+                running.node.clone(),
+            )) as Arc<dyn crate::policy::ClusterPolicyVersions>
+        });
+        running.policy_task = Some(loader.spawn_poller(Arc::clone(&notify), convergence));
         running.policy_shutdown = Some(notify);
+    }
+
+    // The TLS poller starts here for the same reason, and one step later than the planes it
+    // rotates: both are registered by now, so the first tick cannot replace one plane's
+    // credentials on a node whose other plane is still binding.
+    if let (Some(rotator), Some(files)) = (&tls_rotator, &cfg.tls_reload) {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        running.tls_task = Some(crate::rotation::spawn_tls_poller(
+            rotator,
+            files.watch_files,
+            Arc::clone(&notify),
+        ));
+        running.tls_shutdown = Some(notify);
     }
 
     // ---- 8. announce -----------------------------------------------------------------
@@ -754,6 +953,9 @@ fn open_store(
     let options = RocksOptions {
         sync_writes: !cli.unsafe_no_sync,
         create_if_missing: true,
+        // A `--compat-schema 1` node must refuse a newer directory rather than serve it while
+        // advertising the older schema (ADR-0030, OQ-65).
+        max_format_version: cli.schema().format_version,
     };
     if cli.unsafe_no_sync {
         tracing::warn!(
@@ -1026,6 +1228,7 @@ async fn start_gossip(
     cfg: &ServerConfig,
     peer_endpoint: &str,
     client_endpoint: &str,
+    schema: config_core::SchemaTriple,
 ) -> Result<
     (
         Option<Arc<GossipNode>>,
@@ -1040,6 +1243,21 @@ async fn start_gossip(
     let mut gcfg = GossipConfig::new(cfg.identity.cluster_id, cfg.identity.node_id, bind_addr);
     gcfg.seeds = cfg.gossip_seeds.clone();
     gcfg.secret_key = cfg.gossip_secret_key;
+    gcfg.accepted_keys = cfg.gossip_accepted_keys.clone();
+    // Advisory only (ADR-0003 §19.9): an operator watching a rolling upgrade can see which
+    // nodes are still old without querying each one, but no decision is ever taken from it.
+    gcfg.extras = Some(config_gossip::HintExtras {
+        schema: Some(schema),
+        // Left unset deliberately: `GossipNode::start` fills this slot from the keyring it
+        // builds, so the advertised fingerprints and the keys actually installed cannot
+        // disagree (ADR-0028). Setting it here would be a second, staler answer.
+        accepted_gossip_keys: None,
+        // Not filled here: gossip starts before the policy loader does, so there is no
+        // version to advertise yet. `None` reads as "lagging" everywhere, which is the
+        // fail-closed answer for the moments before the poller's first convergence pass
+        // re-advertises the real one through `update_extras` (C6R-02, lead ruling M6-R18).
+        policy_version: None,
+    });
     let hint = ObservedPeerHint {
         cluster_id: cfg.identity.cluster_id,
         recovery_epoch: cfg.identity.recovery_epoch,
@@ -1137,6 +1355,8 @@ async fn shutdown(running: Running) {
         health_task,
         policy_shutdown,
         policy_task,
+        tls_shutdown,
+        tls_task,
     } = running;
 
     // The poller first: it takes the journal gate, and a reload landing mid-drain would revoke
@@ -1145,6 +1365,15 @@ async fn shutdown(running: Running) {
         notify.notify_waiters();
     }
     if let Some(task) = policy_task {
+        task.abort();
+        let _ = task.await;
+    }
+    // And the TLS poller, before the planes drain: replacing a listener's credentials while it
+    // is finishing its last handshakes would be a rotation nobody asked for.
+    if let Some(notify) = tls_shutdown {
+        notify.notify_waiters();
+    }
+    if let Some(task) = tls_task {
         task.abort();
         let _ = task.await;
     }
@@ -1179,4 +1408,44 @@ async fn shutdown(running: Running) {
     // `shutdown_complete` is logged by `main` after the runtime itself has stopped: OpenRaft's
     // tick loop logs as it is cancelled, and a "final line" that another task can still write
     // after is not a final line (ADR-0018 §4, E2E-09).
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M6-87, the `--capabilities` half: the schema triple is an added *top-level* key.
+    ///
+    /// Asserted on the serialized shape rather than the struct because `#[serde(flatten)]` is
+    /// the whole claim: a wrapper field would compile, pass every type check, and silently
+    /// break the operator tooling that reads `durability` and friends at the root.
+    #[test]
+    fn capabilities_report_adds_schema_without_moving_anything() {
+        let report = CapabilitiesReport {
+            capabilities: Capabilities::EPHEMERAL_DEVELOPMENT,
+            schema: config_core::CURRENT_SCHEMA,
+        };
+        let json: serde_json::Value = serde_json::to_value(&report).expect("the report serializes");
+        let flat: serde_json::Value = serde_json::to_value(Capabilities::EPHEMERAL_DEVELOPMENT)
+            .expect("the contract serializes");
+
+        let object = json.as_object().expect("a JSON object");
+        for (key, value) in flat.as_object().expect("a JSON object") {
+            assert_eq!(
+                object.get(key),
+                Some(value),
+                "`{key}` must keep the name and place it had before M6"
+            );
+        }
+        assert_eq!(
+            object.len(),
+            flat.as_object().expect("a JSON object").len() + 1,
+            "exactly one key is added: {json}"
+        );
+        assert_eq!(
+            object.get("schema"),
+            Some(&serde_json::to_value(config_core::CURRENT_SCHEMA).expect("a triple")),
+            "and it is the schema triple this run advertises"
+        );
+    }
 }

@@ -54,6 +54,7 @@ pub mod manifest;
 pub mod memstore;
 pub mod poll;
 pub mod ports;
+pub mod rotation;
 pub mod scan;
 pub mod tls;
 
@@ -65,4 +66,5 @@ pub use conformance::{ConformanceConfig, ConformanceReport, ScenarioResult};
 pub use manifest::{Manifest, ManifestFixture, ManifestPaths, Tamper, Voter};
 pub use memstore::MemStore;
 pub use poll::{election_timeout_multiple, poll_until, poll_until_async, TestTimers, Timeout};
+pub use rotation::{gossip_key_hex, Plane, RotationError, TlsFile, TlsFiles};
 pub use tls::{CertOverrides, CertPair, CertPaths, CertProfile, TlsFixture};

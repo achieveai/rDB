@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "name": "security-matrix-version-skew",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
+    "dirty": true,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-09-19T19:20:13Z",
+    "duration_ms": 700,
+    "seed": 27958,
+    "scale_factor": 0.3333333333333333,
+    "full_scale": false
+  },
+  "values": {
+    "advertised_future_command_schema": 3,
+    "ahead_min_command_schema": 2,
+    "min_schema_observations": [
+      {
+        "leader": 1,
+        "min_command_schema": 1,
+        "min_format_version": 1,
+        "phase": "mixed_settled",
+        "repeat": 0
+      },
+      {
+        "leader": 1,
+        "min_command_schema": 1,
+        "min_format_version": 1,
+        "phase": "mixed_after_refusals",
+        "repeat": 0
+      },
+      {
+        "leader": 1,
+        "min_command_schema": 2,
+        "min_format_version": 3,
+        "phase": "ahead_settled",
+        "repeat": 0
+      }
+    ],
+    "mixed_min_command_schema": 1,
+    "nodes_lost_to_an_unrecognised_advertisement": 0,
+    "refusals_by_feature": {
+      "compact": 1,
+      "dedup": 1,
+      "retire_node": 1
+    },
+    "repeats": 1,
+    "this_build_command_schema": 2
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

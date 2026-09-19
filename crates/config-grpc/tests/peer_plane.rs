@@ -252,6 +252,7 @@ async fn m1_grpc_16_unknown_payload_encoding_is_invalid_argument() {
             // against the retired encoding must be refused, not silently mis-decoded.
             payload_encoding: RETIRED_PAYLOAD_ENCODING_JSON,
             payload: Default::default(),
+            schema: None,
         })
         .await
         .expect_err("an unknown encoding must be refused before decoding");
@@ -267,6 +268,7 @@ async fn m1_grpc_16_unknown_payload_encoding_is_invalid_argument() {
             to_node_id: 2,
             payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: payload.into(),
+            schema: None,
         })
         .await
         .expect_err("a vote payload on the append_entries rpc is a protocol error");
@@ -323,6 +325,7 @@ async fn m1_grpc_17_install_snapshot_is_served_from_m5() {
         to_node_id: 2,
         payload_encoding: PAYLOAD_ENCODING_POSTCARD,
         payload,
+        schema: None,
     };
 
     // An undecodable payload is a payload problem now, not an unimplemented method.
@@ -469,6 +472,7 @@ async fn m5_grpc_retired_sender_is_refused_before_the_payload_is_decoded() {
             to_node_id: 2,
             payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: bytes::Bytes::from_static(b"not a postcard PeerRequest"),
+            schema: None,
         })
         .await
         .expect_err("a retired sender must be refused");

@@ -18,11 +18,11 @@ use std::time::Duration;
 use common::{key, put_request, Cluster};
 use config_core::policy::{document_hash, grant, SignedPolicy, SignedPolicyAuthorizer};
 use config_core::{
-    Action, Authorizer, Grant, MutationEvent, PolicyDocument, Principal, PrincipalKind, WatchItem,
-    WatchRequest, WatchStream, REASON_POLICY_CHANGED, REASON_POLICY_CONVERGING,
+    Action, Authorizer, Authz, Grant, MutationEvent, PolicyDocument, Principal, PrincipalKind,
+    WatchItem, WatchRequest, WatchStream, REASON_POLICY_CHANGED, REASON_POLICY_CONVERGING,
 };
 use config_engine::watch::testing::GateHook;
-use config_engine::TerminationReason;
+use config_engine::{AuthzKind, TerminationReason};
 use futures::StreamExt;
 
 /// A failure bound, never a success bound.
@@ -316,14 +316,21 @@ async fn m6_30_watch_on_a_newly_granted_prefix_is_not_retroactively_opened() {
 
 /// M6-31: the ordering claim, driven rather than observed.
 ///
-/// [`GateHook::BeforeLiveDrain`] parks the delivery task with the pre-rotation batch already in
-/// its broadcast receiver. Releasing it *after* the rotation puts the stream in the exact state
-/// the claim is about: events it is entitled to, and a policy that has moved. The assertion is
-/// that it enqueues **none** of them — the revocation is checked on the enqueue path, so it wins
-/// against anything already buffered, not merely against what arrives later.
+/// [`GateHook::BeforeLiveSend`] parks the delivery task with the pre-rotation batch **received**
+/// and nothing yet offered to the queue. Rotating while it is parked puts the stream in the exact
+/// state the claim is about: events it is entitled to, in hand, and a policy that has moved. The
+/// assertion is that it enqueues **none** of them — the revocation is checked on the enqueue
+/// path, so it wins against what the stream is already holding, not merely against what arrives
+/// later.
 ///
-/// Ten repeats, zero inversions. The interleaving is forced, so a single repeat would already be
-/// meaningful; the repeats are what catch an implementation that is ordered only by luck.
+/// The hook is *inside* the receive arm on purpose. Parking at `BeforeLiveDrain` leaves the task
+/// in `select!` with two ready arms, and the `select!` picks at random: removing the enqueue-path
+/// check then still passed about a third of runs, because the promptness arm took the stream down
+/// first (C6R-08). Here the receive arm has provably already won, so the only thing that can end
+/// the stream before the first enqueue is the check this row exists to assert.
+///
+/// Ten repeats over ten fresh clusters. The interleaving is forced, so one repeat is already
+/// meaningful; the repeats cover the scheduling the hook does not pin down.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m6_31_watch_termination_ordering_is_asserted_from_the_journal() {
     for repeat in 0..10 {
@@ -331,16 +338,18 @@ async fn m6_31_watch_termination_ordering_is_asserted_from_the_journal() {
         let start = write(&cluster, "old/a").await;
         let gate = cluster.node(1).watch_hub().testing();
 
-        let pass = gate.pause(GateHook::BeforeLiveDrain);
         let mut stream = cluster
             .node(1)
             .watch(&app(), watch_request("old/", start))
             .await
             .expect("a granted prefix opens");
-        gate.wait_arrived(GateHook::BeforeLiveDrain).await;
 
+        // Armed before the write that produces the batch, so the arrival cannot be missed.
+        let pass = gate.pause(GateHook::BeforeLiveSend);
         // Buffered, entitled to, and evaluated entirely under v7.
         let buffered = write(&cluster, "old/b").await;
+        gate.wait_arrived(GateHook::BeforeLiveSend).await;
+
         rotate(&cluster, &authorizer, v8()).await;
         gate.release(pass);
 
@@ -356,4 +365,66 @@ async fn m6_31_watch_termination_ordering_is_asserted_from_the_journal() {
         );
         cluster.shutdown().await;
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// §3.7 — what a node reports, and what it does, while it holds no document
+// ---------------------------------------------------------------------------------------
+
+/// M6-38 and the client half of M6-25: the capability report, readiness and the client refusal
+/// all follow the document the authorizer holds *now*, not the one it held at start.
+///
+/// A node wired for signed mode whose first load failed must recover when a valid document
+/// arrives, without a restart (M6-27's in-process half, C6R-01) — the daemon row that drives the
+/// same recovery through real files is `config-server/tests/m6_rbac.rs`. And while it holds none,
+/// a client request is refused as [`ConfigError::Unavailable`]: the node is declining traffic,
+/// not deciding that this principal may not do this (ADR-0027, C6R-05).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_38_capabilities_and_readiness_follow_the_live_document() {
+    let authorizer = Arc::new(SignedPolicyAuthorizer::new(false));
+    let cluster =
+        Cluster::formed_with_authorizer(1, Arc::clone(&authorizer) as Arc<dyn Authorizer>).await;
+    let node = cluster.node(1);
+
+    assert_eq!(
+        node.capabilities().authz,
+        Authz::SignedPolicy {
+            policy_version: None
+        },
+        "a signed-mode node with no document names its model and reports no version"
+    );
+    assert!(
+        !node.is_ready(),
+        "a node with no document in force is not ready to serve"
+    );
+    let refused = node
+        .put(&app(), put_request("old/a", "v"))
+        .await
+        .expect_err("a node holding no document serves nothing");
+    assert!(
+        matches!(refused, config_core::ConfigError::Unavailable { .. }),
+        "no valid policy is an availability refusal, not an authorization one, got {refused:?}"
+    );
+
+    // The document arrives through the handle the node already holds: no restart, no reseat.
+    authorizer.adopt(v7()).expect("the first adoption");
+
+    assert_eq!(
+        node.capabilities().authz,
+        Authz::SignedPolicy {
+            policy_version: Some(7)
+        },
+        "the capability report carries the live version, or it is a capability that lies"
+    );
+    assert!(node.is_ready(), "the arriving document restores readiness");
+    let payload = node.health_payload().await;
+    assert_eq!(payload.policy_version, Some(7));
+    assert_eq!(
+        payload.authz_kind,
+        AuthzKind::SignedPolicy,
+        "health reports the model in force, not the one the startup load produced"
+    );
+    // And it genuinely serves now.
+    write(&cluster, "old/a").await;
+    cluster.shutdown().await;
 }

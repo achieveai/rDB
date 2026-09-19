@@ -78,6 +78,105 @@ impl std::fmt::Display for NodeRole {
     }
 }
 
+/// Why a caller's transport identity could not be established (ADR-0026, ADR-0028).
+///
+/// A **closed** set, deliberately. These values are a metric label, and a label whose values
+/// come from an error string grows without bound the first time a dependency rewords a
+/// message — which turns a counter into a cardinality leak and an alert into noise. Anything
+/// this set cannot name is [`AuthnRejectReason::HandshakeFailed`], and widening the set is a
+/// decision taken here rather than one a rustls release can take for us.
+///
+/// The transport is the only layer that sees a certificate and the engine is the only layer
+/// that keeps counters, so the reason crosses that boundary as this type rather than as a
+/// string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AuthnRejectReason {
+    /// Mutual TLS is required and the client presented no certificate at all.
+    NoClientCertificate,
+    /// The client's certificate is not signed by a CA in this listener's bundle, or does not
+    /// name what it was presented for. The reason a rotation that drops a CA too early
+    /// produces (M6-45, M6-53).
+    UntrustedClientCa,
+    /// The connecting peer refused *our* server certificate as untrusted. Recorded on the
+    /// listening side, which is where the refusal is observable: the accept fails with the
+    /// client's `unknown_ca` alert rather than with a verification failure of its own.
+    UntrustedServerCa,
+    /// The presented certificate is outside its validity window.
+    CertificateExpired,
+    /// A certificate was presented and verified, but it carries no rEtcd identity this
+    /// listener will accept — no `retcd://` SAN, a SAN for another cluster, or a Common Name
+    /// on a listener that does not allow one (ADR-0011).
+    NoUsableIdentity,
+    /// The caller is a retired node presenting a still-valid certificate (ADR-0023, spec §21).
+    ///
+    /// The one reason that is not a TLS outcome: the certificate verified and the identity was
+    /// derived, and the node was then refused because membership retired it. Named separately
+    /// because the operator response is the opposite of every other value here — nothing is
+    /// wrong with the credential, and reissuing one would not help.
+    IdentityRetired,
+    /// The handshake failed for a reason this set does not name.
+    HandshakeFailed,
+}
+
+impl AuthnRejectReason {
+    /// Stable snake_case name for the `reason` log field and metric label.
+    ///
+    /// Every value here is part of the metric contract: renaming one silently retires a time
+    /// series and any alert built on it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            AuthnRejectReason::NoClientCertificate => "no_client_certificate",
+            AuthnRejectReason::UntrustedClientCa => "untrusted_client_ca",
+            AuthnRejectReason::UntrustedServerCa => "untrusted_server_ca",
+            AuthnRejectReason::CertificateExpired => "certificate_expired",
+            AuthnRejectReason::NoUsableIdentity => "no_usable_identity",
+            AuthnRejectReason::IdentityRetired => "identity_retired",
+            AuthnRejectReason::HandshakeFailed => "handshake_failed",
+        }
+    }
+
+    /// This reason's slot in a per-reason counter array.
+    ///
+    /// The array is indexed rather than mapped so that recording a rejection on a refused
+    /// handshake is one relaxed atomic add and no allocation: the refusal path is exactly the
+    /// path an attacker can drive.
+    pub const fn index(self) -> usize {
+        match self {
+            AuthnRejectReason::NoClientCertificate => 0,
+            AuthnRejectReason::UntrustedClientCa => 1,
+            AuthnRejectReason::UntrustedServerCa => 2,
+            AuthnRejectReason::CertificateExpired => 3,
+            AuthnRejectReason::NoUsableIdentity => 4,
+            AuthnRejectReason::IdentityRetired => 5,
+            AuthnRejectReason::HandshakeFailed => 6,
+        }
+    }
+
+    /// How many reasons there are, for sizing a counter array.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Every reason, so an exporter can emit a zero for the ones that have not happened yet.
+    ///
+    /// A counter that only appears after its first increment makes `rate()` over a healthy
+    /// window return nothing at all, which reads as "no data" rather than "no rejections".
+    /// Ordered by [`AuthnRejectReason::index`], so `ALL[r.index()] == r`.
+    pub const ALL: [AuthnRejectReason; 7] = [
+        AuthnRejectReason::NoClientCertificate,
+        AuthnRejectReason::UntrustedClientCa,
+        AuthnRejectReason::UntrustedServerCa,
+        AuthnRejectReason::CertificateExpired,
+        AuthnRejectReason::NoUsableIdentity,
+        AuthnRejectReason::IdentityRetired,
+        AuthnRejectReason::HandshakeFailed,
+    ];
+}
+
+impl std::fmt::Display for AuthnRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A cheap synchronous snapshot of one node's Raft and storage state (test plan TA-6).
 ///
 /// `raft_log_len` and `membership_voter_ids` are load-bearing, not decorative: they are how a
@@ -145,14 +244,20 @@ pub struct NodeMetrics {
     /// is recorded by the transport through [`crate::ConfigNode::record_authn_rejection`],
     /// because the engine never sees a certificate; the peer-plane half is recorded by the
     /// engine itself, which is where the `identity_retired` fence lives.
+    /// **Derived**, never counted: the sum of [`NodeMetrics::authn_rejected_by_reason`].
     pub authn_rejected: u64,
-    /// The peer-plane share of [`NodeMetrics::authn_rejected`].
+    /// The same rejections split by `(plane, reason)`, which is how `/metrics` labels them
+    /// (ADR-0026, ADR-0028).
     ///
-    /// Held separately because `/metrics` labels the family by plane (ADR-0026) and a single
-    /// undivided counter forced the exporter to publish every sample as `plane="client"` — so
-    /// a fenced peer, which is a membership event, appeared in an operator's dashboard as a
-    /// client authentication failure and sent them looking at certificates.
-    pub authn_rejected_peer: u64,
+    /// This is the storage; the total above is its sum. One counter per label combination and
+    /// a derived total cannot drift apart, whereas a total kept alongside its own breakdown
+    /// eventually disagrees with it — usually on the one code path that forgot the second
+    /// increment, which is the path an incident is about.
+    ///
+    /// Engine-counted reasons only. A handshake that never produced a principal is counted by
+    /// the listener that refused it and arrives on
+    /// [`MetricsReport::authn_rejected_transport`].
+    pub authn_rejected_by_reason: Vec<(&'static str, AuthnRejectReason, u64)>,
 }
 
 /// What authorization policy a node is actually holding (M3-42).
@@ -280,6 +385,16 @@ pub struct HealthPayload {
     /// Which authorization model is in force — including `missing` and `invalid`, which
     /// [`config_core::Capabilities::authz`] cannot express.
     pub authz_kind: AuthzKind,
+    /// What this node itself advertises on all three planes (M6, ADR-0030).
+    pub schema: config_core::SchemaTriple,
+    /// The lowest schema any committed voter is known to have — `None` on a node that is not
+    /// the leader (M6-R12).
+    ///
+    /// Only a leader calls every voter on the peer plane, so only a leader has an answer. A
+    /// follower is called *by* the leader and calls nobody, so the most it could report is the
+    /// leader's own triple, which is not a minimum over anything. Reporting `None` says that
+    /// honestly rather than publishing a number computed from one sample.
+    pub cluster_min_schema: Option<config_core::SchemaTriple>,
     /// How the client plane is protected.
     pub transport_security: TransportSecurity,
     /// The policy this node holds, identically on every node given the same document (M3-42).
@@ -478,6 +593,19 @@ pub struct MetricsReport {
     pub cert_expiry_seconds: BTreeMap<String, i64>,
     /// Age of the most recent successful backup, when the daemon knows (ADR-0024).
     pub backup_age_seconds: Option<u64>,
+    /// Handshake-stage authentication rejections, as `(plane, reason, count)`.
+    ///
+    /// Daemon-filled, because a handshake that failed never reached the engine: no principal
+    /// was derived, no RPC was dispatched, and the only layer that saw the failure is the
+    /// listener. Merged with [`NodeMetrics::authn_rejected_by_reason`] into one exported
+    /// family, so an operator sees one counter for "a caller could not authenticate" whichever
+    /// stage refused it.
+    pub authn_rejected_transport: Vec<(&'static str, AuthnRejectReason, u64)>,
+    /// TLS reload outcomes, when the daemon rotates credentials (M6, ADR-0028).
+    ///
+    /// `None` under `tls.mode = "insecure"`, which omits the series rather than exporting a
+    /// zero that would read as "rotation is wired and has never run".
+    pub tls: Option<TlsMetrics>,
     /// Revision-pinned list snapshots this node is holding (M6, ADR-0029, TA-39).
     ///
     /// Daemon-filled, like the three environment facts above: the paginator is built by the
@@ -519,6 +647,21 @@ pub struct PolicyMetrics {
     /// whole process lifetime (OQ-57), so an operator must be able to alert on a node that is
     /// still running with it set.
     pub break_glass_active: bool,
+}
+
+/// What this node's credential rotation has done since it started (M6, ADR-0028).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsMetrics {
+    /// Reloads that actually replaced the served credentials.
+    ///
+    /// A poll that finds the same bytes is not one of these. Counting unchanged polls would
+    /// make the counter a clock — it would tick once per `tls.watch_files_secs` on a node that
+    /// has never rotated — and an alert on "no rotation in 90 days" would never fire.
+    pub reloads: u64,
+    /// Refused reloads by reason, seeded with every token
+    /// [`crate::metrics::TlsMetrics`]'s producer can emit so an unused reason reports `0`
+    /// rather than being absent.
+    pub reload_failures: BTreeMap<&'static str, u64>,
 }
 
 /// A Prometheus text-exposition writer that emits each metric's `HELP`/`TYPE` exactly once.
@@ -995,21 +1138,39 @@ impl MetricsReport {
             "counter",
             "connections whose transport identity could not be established",
         );
-        // One family, one label, two truthful samples (ADR-0026). The client share is the
-        // remainder rather than its own counter so that the total stays exactly what
-        // `/health` reports: the two can never drift apart by construction.
-        e.sample(
-            "retcd_authn_rejected_total",
-            &[("node_id", node_id.as_str()), ("plane", "client")],
-            self.node
-                .authn_rejected
-                .saturating_sub(self.node.authn_rejected_peer) as f64,
-        );
-        e.sample(
-            "retcd_authn_rejected_total",
-            &[("node_id", node_id.as_str()), ("plane", "peer")],
-            self.node.authn_rejected_peer as f64,
-        );
+        // One family fed from two layers (ADR-0026, ADR-0028): the listener counts the callers
+        // whose handshake failed, and the engine counts the ones that handshook and were then
+        // refused an identity. An operator asking "can my clients authenticate?" does not know
+        // or care which stage said no, so they are summed here rather than exported as two
+        // families that every query would have to add up by hand.
+        let mut rejections: BTreeMap<(&'static str, AuthnRejectReason), u64> = BTreeMap::new();
+        for (plane, reason, count) in self
+            .node
+            .authn_rejected_by_reason
+            .iter()
+            .chain(self.authn_rejected_transport.iter())
+        {
+            *rejections.entry((plane, *reason)).or_default() += count;
+        }
+        // Every combination, including the ones at zero: a counter that appears only after its
+        // first increment makes `rate()` over a healthy window return no data at all, which a
+        // dashboard draws as a gap rather than as a flat line at zero.
+        for plane in ["client", "peer"] {
+            for reason in AuthnRejectReason::ALL {
+                e.sample(
+                    "retcd_authn_rejected_total",
+                    &[
+                        ("node_id", node_id.as_str()),
+                        ("plane", plane),
+                        ("reason", reason.as_str()),
+                    ],
+                    rejections
+                        .get(&(plane, reason))
+                        .copied()
+                        .unwrap_or_default() as f64,
+                );
+            }
+        }
 
         e.metric(
             "retcd_authz_denied_total",
@@ -1115,6 +1276,28 @@ impl MetricsReport {
                     "retcd_cert_expiry_seconds",
                     &[("node_id", node_id.as_str()), ("plane", plane)],
                     *seconds as f64,
+                );
+            }
+        }
+
+        if let Some(tls) = &self.tls {
+            e.metric(
+                "retcd_tls_reloads_total",
+                "counter",
+                "TLS credential reloads that replaced the served material (ADR-0028)",
+            );
+            e.sample("retcd_tls_reloads_total", &node, tls.reloads as f64);
+
+            e.metric(
+                "retcd_tls_reload_failures_total",
+                "counter",
+                "TLS credential reloads refused, by reason (ADR-0028)",
+            );
+            for (reason, count) in &tls.reload_failures {
+                e.sample(
+                    "retcd_tls_reload_failures_total",
+                    &[("node_id", node_id.as_str()), ("reason", reason)],
+                    *count as f64,
                 );
             }
         }

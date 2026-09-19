@@ -52,6 +52,20 @@ pub struct Cli {
     #[arg(long)]
     pub unsafe_no_sync: bool,
 
+    /// Behave as a node of an older command schema (ADR-0030, M6-94).
+    ///
+    /// `1` makes this node advertise, gate and refuse exactly as a pre-M4 build does: it
+    /// proposes no command that needs schema 2, refuses to decode one that does, and refuses
+    /// to open a data directory written by a newer build. It exists so that a mixed-version
+    /// cluster — the normal state of a rolling upgrade — is runnable in CI against one binary
+    /// rather than only against two releases that cannot both be built from this tree.
+    ///
+    /// Only `1` is accepted: the flag pins a node *below* current, so naming the current
+    /// schema would be a no-op and naming a future one would be a claim this build cannot
+    /// honour.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1))]
+    pub compat_schema: Option<u16>,
+
     /// Accept a signed policy document whose version is at or below the active one (ADR-0027).
     ///
     /// The emergency exit for "the good document is the old one". Version monotonicity is the
@@ -185,6 +199,18 @@ pub enum Command {
 }
 
 impl Cli {
+    /// The schema triple this run advertises and enforces (ADR-0030).
+    ///
+    /// One accessor rather than a `compat_schema.is_some()` test at each use, so the store
+    /// ceiling, the node's advertisement and the capability report cannot drift apart.
+    #[must_use]
+    pub fn schema(&self) -> config_core::SchemaTriple {
+        match self.compat_schema {
+            Some(_) => config_core::COMPAT_SCHEMA_1,
+            None => config_core::CURRENT_SCHEMA,
+        }
+    }
+
     /// Split `--log-field k=v` arguments into pairs.
     ///
     /// Only the first `=` splits, so a value may contain one.

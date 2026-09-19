@@ -121,6 +121,95 @@ pub trait AdminBackend: Send + Sync {
             ),
         })
     }
+
+    /// Re-read the configured TLS PEM files now and serve what they hold (M6, ADR-0028).
+    ///
+    /// Defaulted for the same reason [`AdminBackend::reload_policy`] is: a node running
+    /// `tls.mode = "insecure"` has no credentials to rotate, and neither has an embedder that
+    /// never wired any.
+    async fn reload_tls(&self) -> Result<Vec<TlsPlaneReload>, AdminError> {
+        Err(AdminError::Unavailable {
+            reason: format!(
+                "{UNAVAILABLE_FEATURE_NOT_ACTIVATED}: this node does not serve TLS credentials"
+            ),
+        })
+    }
+
+    /// Take one step of a gossip key rotation on this node (M6, ADR-0028).
+    ///
+    /// `key_hex` arrives unparsed so that one definition of "a gossip key" — the daemon's, the
+    /// same one its configuration file is validated against — decides what is accepted, rather
+    /// than this crate growing a second.
+    ///
+    /// Defaulted: a node with gossip disabled, or with gossip unencrypted, has no keyring.
+    async fn rotate_gossip_key(
+        &self,
+        _op: GossipKeyOp,
+        _key_hex: &str,
+        _force: bool,
+    ) -> Result<GossipKeyringView, AdminError> {
+        Err(AdminError::Unavailable {
+            reason: format!(
+                "{UNAVAILABLE_FEATURE_NOT_ACTIVATED}: this node runs no encrypted gossip"
+            ),
+        })
+    }
+}
+
+/// What one plane's credentials are after a [`AdminBackend::reload_tls`] attempt.
+///
+/// One per plane rather than one per node: the planes hold separate credentials and can
+/// legitimately end a reload in different states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsPlaneReload {
+    /// `"client"`, `"peer"` or `"peer_dial"`.
+    pub plane: &'static str,
+    /// `"reloaded"` or `"unchanged"`.
+    pub outcome: &'static str,
+    /// How many times this plane's credentials have been replaced since the node started.
+    pub generation: u64,
+    /// Lowercase hex fingerprint of the served leaf certificate. Never the certificate.
+    pub cert_fingerprint: String,
+    /// The served leaf's `notAfter`, in seconds since the Unix epoch.
+    pub cert_expiry_unix: i64,
+}
+
+/// Which step of a gossip key rotation to take (M6, ADR-0028).
+///
+/// The wire enum's `UNSPECIFIED` has no counterpart here on purpose: it is refused at the
+/// handler, so a backend is never handed a step nobody chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GossipKeyOp {
+    /// Accept the key on receive.
+    Add,
+    /// Sign outgoing gossip with it.
+    Use,
+    /// Stop accepting it.
+    Remove,
+}
+
+impl GossipKeyOp {
+    /// The audit `op` this step is recorded under.
+    ///
+    /// One token per step rather than a shared `gossip_key_rotate`: the three differ in what
+    /// they risk, and an audit trail that cannot tell "started accepting a key" from "stopped
+    /// accepting one" is not an audit trail of a rotation.
+    pub fn audit_op(self) -> &'static str {
+        match self {
+            Self::Add => "gossip_key_add",
+            Self::Use => "gossip_key_use",
+            Self::Remove => "gossip_key_remove",
+        }
+    }
+}
+
+/// A node's gossip keyring, in fingerprints (M6, ADR-0028).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipKeyringView {
+    /// Fingerprint of the key outgoing gossip is signed with.
+    pub primary_fingerprint: String,
+    /// Fingerprints of every key accepted on receive, primary first.
+    pub accepted_fingerprints: Vec<String>,
 }
 
 /// What one [`AdminBackend::reload_policy`] attempt left active.
@@ -603,6 +692,83 @@ impl AdminService for AdminSvc {
         )
         .await
     }
+
+    /// M6-42: admin-only, immediate, and reported per plane.
+    ///
+    /// Carries no payload, so there is nothing here to validate: the node reloads the paths its
+    /// own configuration names. A reload that no plane could serve leaves every plane on the
+    /// material it already had and answers with an error, never with a success naming what did
+    /// not happen.
+    async fn reload_tls(
+        &self,
+        request: Request<pb::ReloadTlsRequest>,
+    ) -> Result<Response<pb::TlsInfo>, Status> {
+        self.dispatch(
+            Audit {
+                op: "reload_tls",
+                target_node: 0,
+            },
+            request,
+            |backend, _| async move {
+                let planes = backend.reload_tls().await?;
+                Ok(pb::TlsInfo {
+                    planes: planes
+                        .into_iter()
+                        .map(|p| pb::TlsPlaneInfo {
+                            plane: p.plane.to_string(),
+                            outcome: p.outcome.to_string(),
+                            generation: p.generation,
+                            cert_fingerprint: p.cert_fingerprint,
+                            cert_expiry_unix: p.cert_expiry_unix,
+                        })
+                        .collect(),
+                })
+            },
+        )
+        .await
+    }
+
+    /// M6-57..M6-59: admin-only, node-local, and audited per step.
+    ///
+    /// The step is read before [`AdminSvc::dispatch`] runs so the audit line names which step
+    /// was attempted even when the caller is refused. An unset step is refused here rather than
+    /// defaulted, because every default would be someone's wrong guess: adding a key is
+    /// harmless, promoting one can partition the cluster.
+    ///
+    /// `key_hex` is never logged, never echoed in an error and never audited — the fingerprints
+    /// in the reply are what an operator follows a rotation by (ADR-0028).
+    async fn rotate_gossip_key(
+        &self,
+        request: Request<pb::RotateGossipKeyRequest>,
+    ) -> Result<Response<pb::GossipKeyringInfo>, Status> {
+        let op = match pb::GossipKeyOp::try_from(request.get_ref().op) {
+            Ok(pb::GossipKeyOp::Add) => GossipKeyOp::Add,
+            Ok(pb::GossipKeyOp::Use) => GossipKeyOp::Use,
+            Ok(pb::GossipKeyOp::Remove) => GossipKeyOp::Remove,
+            Ok(pb::GossipKeyOp::Unspecified) | Err(_) => {
+                return Err(mark_rejected(Status::invalid_argument(
+                    "unknown_gossip_key_op: op must be one of add, use or remove",
+                )))
+            }
+        };
+        let key_hex = request.get_ref().key_hex.clone();
+        let force = request.get_ref().force;
+        self.dispatch(
+            Audit {
+                op: op.audit_op(),
+                target_node: 0,
+            },
+            request,
+            move |backend, _| async move {
+                let keyring = backend.rotate_gossip_key(op, &key_hex, force).await?;
+                Ok(pb::GossipKeyringInfo {
+                    primary_fingerprint: keyring.primary_fingerprint,
+                    accepted_fingerprints: keyring.accepted_fingerprints,
+                })
+            },
+        )
+        .await
+    }
 }
 
 /// Build the tonic service so it can be added to the **client plane's** router (OQ-43).
@@ -637,10 +803,8 @@ pub fn serve_admin_plane(
     admins: AdminAllowlist,
 ) -> Result<crate::server::ServerHandle, crate::error::GrpcError> {
     let svc = admin_service(backend, tls.clone(), cluster_id, admins);
-    let router = tls
-        .apply_server(tonic::transport::Server::builder())?
-        .add_service(svc);
-    crate::server::spawn("admin", router, listener)
+    let router = tonic::transport::Server::builder().add_service(svc);
+    crate::server::spawn("admin", router, listener, &tls)
 }
 
 /// A backup path check shared by the plane and the CLI: refuse anything that is not a

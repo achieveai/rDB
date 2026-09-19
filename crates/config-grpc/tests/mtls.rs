@@ -26,7 +26,8 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use serde_json::Value;
-use tokio::net::TcpListener;
+use tokio::io::AsyncReadExt;
+use tokio::net::{TcpListener, TcpStream};
 use tonic::transport::{Channel, ClientTlsConfig};
 
 use support::{cluster, log_lines, start_client_plane, FakeSink, FakeStore, CLUSTER};
@@ -670,4 +671,62 @@ async fn m3_81_a_certificate_with_no_client_identity_is_counted_as_an_authn_reje
 
     server.handle.shutdown().await.expect("clean shutdown");
     node.stop().await.expect("stop");
+}
+
+/// M6-45: a handshake that never progresses is ended by the listener, counted, and closed.
+///
+/// The unauthenticated path is the one an attacker reaches without a certificate, so it is the
+/// one that has to be bounded: a client that completes TCP and then says nothing costs a task
+/// and a descriptor for as long as it cares to stay silent. This drives exactly that shape and
+/// asserts both halves of the bound — the socket is closed, and the expiry is counted under
+/// `handshake_failed` on the listener's own source, which is what a dashboard reads.
+///
+/// Waited on by reading to EOF rather than by sleeping past the timeout: the listener records
+/// the rejection before it drops the socket, so a read that returns zero bytes is proof the
+/// counter has already moved.
+#[retcd_test]
+async fn m6_45_a_stalled_handshake_is_bounded_and_counted() {
+    /// Short enough to keep the row quick, and two orders of magnitude under [`DEADLINE`], so
+    /// what is asserted is "the listener gave up", never "the machine was slow".
+    const STALLED: Duration = Duration::from_millis(250);
+
+    let ca = new_ca("retcd-test-ca");
+    let (server_cert, server_key) = issue(&ca, "server", None);
+    let server = start_client_plane(
+        FakeStore::new(),
+        TlsMode::MutualTls(mtls(&ca, server_cert, server_key).with_handshake_timeout(STALLED)),
+    )
+    .await;
+    let credentials = server
+        .handle
+        .credentials()
+        .expect("an mTLS listener owns the material it serves");
+
+    let mut stalled = TcpStream::connect(&server.endpoint)
+        .await
+        .expect("the listener accepts TCP before it knows who is calling");
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(DEADLINE, stalled.read(&mut byte))
+        .await
+        .expect("a stalled handshake must be dropped well inside the test deadline")
+        .expect("read the closed socket");
+    assert_eq!(
+        read, 0,
+        "the listener must close a handshake that never arrived, not answer on it"
+    );
+
+    let rejections = credentials.rejections();
+    let timed_out = rejections
+        .iter()
+        .find(|(plane, reason, _)| {
+            *plane == "client" && *reason == config_engine::AuthnRejectReason::HandshakeFailed
+        })
+        .map(|(_, _, count)| *count);
+    assert_eq!(
+        timed_out,
+        Some(1),
+        "the expiry must be counted where every other refusal is: {rejections:#?}"
+    );
+
+    server.handle.shutdown().await.expect("clean shutdown");
 }

@@ -788,7 +788,7 @@ fn adr_metric_table() -> Vec<(String, String, Vec<String>)> {
 /// Omitted rather than exported as zero, because "not measured" and "measured as zero" must not
 /// look alike on a dashboard. The list is here as well as in the ADR so that exporting one of
 /// them *fails this row* until the ADR note is corrected too.
-const NOT_EXPORTED: [&str; 10] = [
+const NOT_EXPORTED: [&str; 9] = [
     // No commit-to-apply span exists to time.
     "retcd_commit_latency_seconds",
     // RocksDB properties and a stall listener the frozen storage layer does not read.
@@ -800,11 +800,14 @@ const NOT_EXPORTED: [&str; 10] = [
     "retcd_watch_lag",
     // The gossip layer surfaces no suspicion event.
     "retcd_gossip_suspicions_total",
-    // Environment facts the daemon does not gather: a free-space syscall, X.509 `notAfter`
-    // parsing, and the backup command's own bookkeeping. `alerts.md` lists all three as
-    // not-yet-armed, with substitutes.
+    // Environment facts the daemon does not gather: a free-space syscall and the backup
+    // command's own bookkeeping. `alerts.md` lists both as not-yet-armed, with substitutes.
+    //
+    // `retcd_cert_expiry_seconds` left this list in M6. ADR-0028's rotator reads the served
+    // leaf's `notAfter` on every scrape, and this harness serves mutual TLS, so the series is
+    // now exported here — which is why removing it from this list is itself the assertion that
+    // it was armed.
     "retcd_rocks_disk_free_bytes",
-    "retcd_cert_expiry_seconds",
     "retcd_backup_age_seconds",
 ];
 

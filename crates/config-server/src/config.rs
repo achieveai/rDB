@@ -105,6 +105,15 @@ pub struct TlsSection {
     /// under that name.
     #[serde(default)]
     pub allow_common_name_principals: bool,
+    /// How often the three paths above are re-read while the node runs (M6, ADR-0028).
+    /// Default 30 s.
+    ///
+    /// Spelled with the unit, unlike ADR-0028's `tls.watch_files`, so it reads the same way as
+    /// every other interval in this file (`authz.poll_interval_secs`,
+    /// `retention.check_interval_secs`): an operator should not have to guess whether a bare
+    /// number is seconds or a boolean.
+    #[serde(default)]
+    pub watch_files_secs: Option<u64>,
 }
 
 /// `[authz]` — the static allowlist policy file (ADR-0012).
@@ -326,8 +335,18 @@ pub struct GossipSection {
     pub seeds: Vec<String>,
     /// AES-256 gossip key as 64 hex characters. Absent disables encryption, which is
     /// single-host development only (spec §15.1).
+    ///
+    /// The key this node *signs* with. A rotation moves this one last (M6, ADR-0028).
     #[serde(default)]
     pub secret_key_hex: Option<String>,
+    /// Further AES-256 keys, 64 hex characters each, this node accepts on receive without
+    /// ever signing with them (M6, ADR-0028).
+    ///
+    /// A rotation cannot move the signing key first: a node that started signing with a key
+    /// its peers have not accepted yet is a node its peers cannot hear. So the new key is
+    /// added here across the cluster first, and only then promoted to `secret_key_hex`.
+    #[serde(default)]
+    pub accepted_key_hex: Vec<String>,
 }
 
 /// `[watch]` — watch delivery caps (M4, ADR-0020). Omitted fields keep the engine defaults.
@@ -477,6 +496,12 @@ pub struct ServerConfig {
     pub tls_mode: TlsModeName,
     /// PEM material for `mutual`.
     pub tls_material: Option<TlsMaterial>,
+    /// Where that material came from, and how often to re-read it (M6, ADR-0028).
+    ///
+    /// `Some` exactly when [`ServerConfig::tls_material`] is `Some`: both are produced by the
+    /// same arm of the same match, because there is nothing to reload on a node that serves
+    /// no certificate.
+    pub tls_reload: Option<TlsReload>,
     /// The allowlist policy file, if the document names one.
     pub policy_path: Option<PathBuf>,
     /// The signed-policy configuration, present only under `authz.mode = "signed"` (M6).
@@ -487,8 +512,11 @@ pub struct ServerConfig {
     pub raft: config_engine::RaftTimers,
     /// Gossip seeds.
     pub gossip_seeds: Vec<SocketAddr>,
-    /// Gossip encryption key.
+    /// Gossip encryption key: the one this node signs with.
     pub gossip_secret_key: Option<[u8; 32]>,
+    /// Further gossip keys this node accepts on receive (M6, ADR-0028). Empty is the M5
+    /// behaviour.
+    pub gossip_accepted_keys: Vec<[u8; 32]>,
     /// Watch delivery caps, folded into the limits this node enforces.
     pub watch_limits: WatchLimits,
     /// Default progress-frame interval for streams that do not ask for one.
@@ -542,6 +570,24 @@ impl std::fmt::Debug for TlsMaterial {
             )
             .finish()
     }
+}
+
+/// Where the mutual-TLS PEMs were read from, and how often to re-read them (M6, ADR-0028).
+///
+/// Held apart from [`TlsMaterial`] on purpose. `TlsMaterial` is compared by value to decide
+/// whether a poll actually found new material, so it must contain the bytes and *only* the
+/// bytes — a path or an interval inside it would still compare equal on every poll, but it
+/// would make "are these the same credentials?" a question about more than the credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsReload {
+    /// `tls.ca`, resolved.
+    pub ca: PathBuf,
+    /// `tls.cert`, resolved.
+    pub cert: PathBuf,
+    /// `tls.key`, resolved.
+    pub key: PathBuf,
+    /// `tls.watch_files_secs`, defaulted.
+    pub watch_files: Duration,
 }
 
 /// Resolved paths of the three bootstrap-manifest files.
@@ -644,13 +690,35 @@ fn validate(
                     "common_name_principals_enabled"
                 );
             }
-            Some(TlsMaterial {
+            let material = TlsMaterial {
                 ca_pem: read_bytes("tls.ca", &ca)?,
                 cert_pem: read_bytes("tls.cert", &cert)?,
                 key_pem: read_bytes("tls.key", &key)?,
                 allow_common_name_principals: file.tls.allow_common_name_principals,
-            })
+            };
+            let watch_files = match file.tls.watch_files_secs {
+                Some(0) => {
+                    return Err(ConfigFileError::Invalid(
+                        "tls.watch_files_secs must be greater than zero".to_string(),
+                    ))
+                }
+                Some(v) => Duration::from_secs(v),
+                None => DEFAULT_TLS_WATCH_FILES,
+            };
+            Some((
+                material,
+                TlsReload {
+                    ca,
+                    cert,
+                    key,
+                    watch_files,
+                },
+            ))
         }
+    };
+    let (tls_material, tls_reload) = match tls_material {
+        Some((material, reload)) => (Some(material), Some(reload)),
+        None => (None, None),
     };
 
     let manifest = file.manifest.as_ref().map(|m| ManifestFiles {
@@ -687,6 +755,20 @@ fn validate(
         .as_deref()
         .map(parse_gossip_key)
         .transpose()?;
+    let mut gossip_accepted_keys = Vec::with_capacity(file.gossip.accepted_key_hex.len());
+    for hex in &file.gossip.accepted_key_hex {
+        gossip_accepted_keys.push(parse_gossip_key(hex)?);
+    }
+    if gossip_secret_key.is_none() && !gossip_accepted_keys.is_empty() {
+        // Refused rather than ignored: the keys would be installed on a keyring that never
+        // encrypts anything, so the node would look mid-rotation while actually gossiping in
+        // plaintext — the one state an operator rotating keys must not be lied to about.
+        return Err(ConfigFileError::Invalid(
+            "gossip.accepted_key_hex requires gossip.secret_key_hex; accepted keys do nothing \
+             on a node that is not encrypting (ADR-0028)"
+                .to_string(),
+        ));
+    }
 
     let mut watch_limits = WatchLimits::default();
     if let Some(v) = file.watch.max_streams_per_node {
@@ -902,12 +984,14 @@ fn validate(
         health_listen,
         tls_mode: file.tls.mode,
         tls_material,
+        tls_reload,
         policy_path: file.authz.policy.as_deref().map(|p| resolve(base, p)),
         signed_policy,
         manifest,
         raft,
         gossip_seeds,
         gossip_secret_key,
+        gossip_accepted_keys,
         watch_limits,
         watch_progress_interval,
         retention,
@@ -920,6 +1004,13 @@ fn validate(
         backup,
     })
 }
+
+/// Default re-read interval for the TLS PEM files (ADR-0028: "default 30 s").
+///
+/// Longer than the policy poller's 10 s because the two answer different questions: a policy
+/// change is an authorization change an operator wants in force now, while a certificate
+/// rotation is scheduled work that an operator can also force immediately through `ReloadTls`.
+const DEFAULT_TLS_WATCH_FILES: Duration = Duration::from_secs(30);
 
 /// Default poll interval for the signed policy files (D6.1).
 const DEFAULT_POLICY_POLL_SECS: u64 = 10;
@@ -1119,7 +1210,7 @@ fn read_token_key(path: &Path) -> Result<[u8; 32], ConfigFileError> {
     Ok(out)
 }
 
-fn parse_gossip_key(hex: &str) -> Result<[u8; 32], ConfigFileError> {
+pub(crate) fn parse_gossip_key(hex: &str) -> Result<[u8; 32], ConfigFileError> {
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ConfigFileError::Invalid(
             "gossip.secret_key_hex must be 64 hex characters (an AES-256 key)".into(),

@@ -28,6 +28,7 @@ mod health;
 mod logging;
 mod manifest;
 mod policy;
+mod rotation;
 mod run;
 
 use clap::Parser;

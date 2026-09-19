@@ -267,8 +267,19 @@ pub struct SnapshotHeader {
     /// node re-admits it at the peer plane and through `AddLearner`.
     ///
     /// Appended last, and consumed by unioning it into the receiver's set — never by replacing
-    /// it — so an install can only ever widen the fence (see `rocks::apply_snapshot_records`).
+    /// it - so an install can only ever widen the fence (see `rocks::apply_snapshot_records`).
     pub retired_nodes: BTreeSet<NodeId>,
+    /// The highest `command_schema` the captured state had ever applied (M6, ADR-0030 M6-R15).
+    ///
+    /// Carried for the same reason as `retired_nodes`, and consumed the same way - by `max`
+    /// rather than by assignment. A node caught up by an install has the *state* a schema-2
+    /// command produced; without this it would not have the *proof* that the cluster is past
+    /// activation, and the gate would refuse the next such command whenever a voter happened
+    /// to be unreachable.
+    ///
+    /// Appended last. `command_schema` above is the builder's envelope generation, which is a
+    /// property of the binary; this is a property of the applied state.
+    pub max_applied_command_schema: u16,
 }
 
 impl SnapshotHeader {
@@ -856,6 +867,7 @@ mod offline_keys {
     pub(super) const CLUSTER_REVISION: &[u8] = b"cluster_revision";
     pub(super) const COMPACT_REVISION: &[u8] = b"compact_revision";
     pub(super) const RETIRED_NODES: &[u8] = b"retired_nodes";
+    pub(super) const MAX_COMMAND_SCHEMA: &[u8] = b"max_command_schema";
 }
 
 /// Read one postcard-encoded `state_meta` value out of an offline store.
@@ -944,6 +956,11 @@ pub fn export_snapshot(
     // error: an empty set widens nothing when the snapshot is installed (M5-R21).
     let retired_nodes: BTreeSet<NodeId> =
         offline_meta(&db, data_dir, offline_keys::RETIRED_NODES)?.unwrap_or_default();
+    // Absent on a store that has only ever applied schema-1 commands, which is what
+    // `COMMAND_SCHEMA_V1` means, so the default is the fact rather than a guess.
+    let max_applied_command_schema: u16 =
+        offline_meta(&db, data_dir, offline_keys::MAX_COMMAND_SCHEMA)?
+            .unwrap_or(config_core::COMMAND_SCHEMA_V1);
 
     let mut cfs: Vec<String> = cf_names
         .iter()
@@ -991,6 +1008,7 @@ pub fn export_snapshot(
         bytes: payload_bytes,
         created_unix_ms,
         retired_nodes,
+        max_applied_command_schema,
     };
 
     // Written through a `.tmp` beside the destination and renamed, so a reader never observes

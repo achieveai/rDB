@@ -157,7 +157,7 @@ pub struct PolicySignature {
 impl PolicySignature {
     /// Encode this envelope for the `authz.policy_sig_file`.
     pub fn encode(&self) -> Result<Vec<u8>, PolicyRejected> {
-        postcard::to_stdvec(self).map_err(|e| PolicyRejected::Malformed {
+        postcard::to_stdvec(self).map_err(|e| PolicyRejected::ParseError {
             detail: format!("policy signature did not encode: {e}"),
         })
     }
@@ -246,8 +246,8 @@ pub enum PolicyRejected {
         incoming: u64,
     },
     /// The document bytes are not a parsable policy document.
-    #[error("malformed")]
-    Malformed {
+    #[error("parse_error")]
+    ParseError {
         /// The parser's description. Never contains a key, a value or key material.
         detail: String,
     },
@@ -268,7 +268,7 @@ impl PolicyRejected {
             Self::PolicyFileMissing => "policy_file_missing",
             Self::VersionBinding => "version_binding",
             Self::Rollback { .. } => "rollback",
-            Self::Malformed { .. } => "malformed",
+            Self::ParseError { .. } => "parse_error",
         }
     }
 
@@ -284,7 +284,7 @@ impl PolicyRejected {
         "policy_file_missing",
         "version_binding",
         "rollback",
-        "malformed",
+        "parse_error",
     ];
 }
 
@@ -302,7 +302,7 @@ impl PolicyRejected {
 /// 1. decode the envelope — a malformed file is `signature_invalid`;
 /// 2. look the signer up by name — an unknown name is `untrusted_signer`;
 /// 3. verify `sign(hash ‖ version_le)` — a failure is `signature_invalid`;
-/// 4. parse the document body — a half-written or corrupt body is `malformed`;
+/// 4. parse the document body — a half-written or corrupt body is `parse_error`;
 /// 5. compare the signed version with the body's — a disagreement is `version_binding`;
 /// 6. compare the signed hash with `sha256(bytes)` — a disagreement is `hash_mismatch`.
 ///
@@ -333,7 +333,7 @@ pub fn verify_policy(
         .map_err(|_| PolicyRejected::SignatureInvalid)?;
 
     let document: PolicyDocument =
-        serde_json::from_slice(doc_bytes).map_err(|e| PolicyRejected::Malformed {
+        serde_json::from_slice(doc_bytes).map_err(|e| PolicyRejected::ParseError {
             detail: e.to_string(),
         })?;
 
@@ -615,7 +615,16 @@ impl SignedPolicyAuthorizer {
             });
         }
 
-        let previous = active.signed.document.clone();
+        // The baseline is the oldest document this node has not yet retired, not simply the one
+        // going out of force. Two adoptions inside one convergence window (v1 -> v2 -> v3) leave
+        // voters spread across all three, so narrowing against v2 alone would let a prefix that
+        // v2 first granted take effect while a voter still on v1 denies it — the early expansion
+        // §15.3 forbids (C6R-07). Once `note_cluster_min_version` clears the baseline there is
+        // nothing older left to narrow from, and the document going out of force is the baseline.
+        let previous = match (&active.previous, active.converged) {
+            (Some(oldest), false) => oldest.clone(),
+            _ => active.signed.document.clone(),
+        };
         let changed = changed_prefixes(&previous, &incoming.document);
         let to = incoming.document.version;
         *guard = Some(Active {
@@ -631,6 +640,27 @@ impl SignedPolicyAuthorizer {
             to,
             break_glass: is_rollback,
         })
+    }
+
+    /// Whether [`Self::adopt`] would put `incoming` in force *in place of* an active document.
+    ///
+    /// `false` when there is nothing active yet (the first adoption replaces nothing), when the
+    /// bytes are identical to what is already in force, and when `adopt` is about to refuse the
+    /// document as a rollback.
+    ///
+    /// Exists so the daemon's loader can skip the watch revocation it otherwise performs *before*
+    /// `adopt`: revoking for a document that `adopt` then refuses would turn one stale file on
+    /// disk into a watch outage that repeats every poll tick (C6R-03). Asking here rather than
+    /// re-deriving the condition at the seam keeps both decisions on one implementation.
+    pub fn adopt_would_replace(&self, incoming: &SignedPolicy) -> bool {
+        let guard = self.active.read().unwrap_or_else(|e| e.into_inner());
+        let Some(active) = guard.as_ref() else {
+            return false;
+        };
+        if active.signed.hash == incoming.hash {
+            return false;
+        }
+        incoming.document.version > active.signed.document.version || self.break_glass
     }
 
     /// The active document, cloned. `None` when no valid document is loaded.

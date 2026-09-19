@@ -137,10 +137,20 @@ pub struct ApplyEffects {
     pub dedup_cap_refusals: u64,
     /// A node id newly added to the retired set, if this command added one.
     pub retired_node: Option<NodeId>,
+    /// The new value of [`KvState::max_applied_command_schema`], if this command raised it
+    /// (M6, ADR-0030 ruling M6-R15).
+    pub max_command_schema: Option<u16>,
 }
 
 impl ApplyEffects {
-    /// Whether anything here needs writing.
+    /// Whether any dedup or retirement side effect needs writing.
+    ///
+    /// Deliberately does **not** consider [`ApplyEffects::max_command_schema`]: that field is
+    /// not a side effect of the command's *meaning* but a record that this node decoded the
+    /// envelope at all (M6-R15), and the storage layer writes it from its own `Option` rather
+    /// than behind this test. Folding it in here would also make a dedup-bearing command look
+    /// non-empty on a store with deduplication switched off, which is exactly the distinction
+    /// this predicate exists to draw (M5-108).
     pub fn is_empty(&self) -> bool {
         self.dedup_inserted.is_none()
             && self.dedup_removed.is_empty()
@@ -178,6 +188,15 @@ pub struct KvState {
     dedup: BTreeMap<DedupIndexKey, DedupRecord>,
     /// Node ids that have been removed and may never rejoin (M5, ADR-0023, M5-R4).
     retired_nodes: BTreeSet<NodeId>,
+    /// The highest `command_schema` this state machine has ever applied (M6, ADR-0030 ruling
+    /// M6-R15).
+    ///
+    /// Durable, monotonic proof that this node can decode that generation of the envelope —
+    /// it applied one. The schema gate reads it so that an unreachable voter delays only the
+    /// *first* activation of a feature and never re-gates a cluster that is already using it;
+    /// without it, one node going down after a failover turns into a write outage
+    /// (regression found on `m4_88`).
+    max_applied_command_schema: u16,
     /// Deduplication lookups that returned a retained outcome, since this state was built
     /// (`retcd_dedup_hits_total`), with the two eviction counters beside it
     /// (`retcd_dedup_evictions_total{reason}`, ADR-0026).
@@ -234,6 +253,7 @@ impl KvState {
             compact_revision: 0,
             dedup: BTreeMap::new(),
             retired_nodes: BTreeSet::new(),
+            max_applied_command_schema: crate::COMMAND_SCHEMA_V1,
             dedup_hits: 0,
             dedup_window_evictions: 0,
             dedup_trim_evictions: 0,
@@ -259,6 +279,7 @@ impl KvState {
             compact_revision: 0,
             dedup: BTreeMap::new(),
             retired_nodes: BTreeSet::new(),
+            max_applied_command_schema: crate::COMMAND_SCHEMA_V1,
             dedup_hits: 0,
             dedup_window_evictions: 0,
             dedup_trim_evictions: 0,
@@ -320,6 +341,21 @@ impl KvState {
     /// un-retires one.
     pub fn restore_retired_nodes(&mut self, nodes: impl IntoIterator<Item = NodeId>) {
         self.retired_nodes.extend(nodes);
+    }
+
+    /// Restore the durable activation watermark read back from `state_meta/max_command_schema`
+    /// on open, or carried by an installed snapshot (M6, ADR-0030 M6-R15).
+    ///
+    /// Unioned by `max`, like [`KvState::restore_retired_nodes`] and for the same reason: the
+    /// fact recorded is "this state has already carried that generation", and nothing can make
+    /// that untrue afterwards. Lowering it would re-gate a cluster that is already activated.
+    pub fn restore_max_applied_command_schema(&mut self, schema: u16) {
+        self.max_applied_command_schema = self.max_applied_command_schema.max(schema);
+    }
+
+    /// The highest `command_schema` ever applied here (M6, ADR-0030 M6-R15).
+    pub fn max_applied_command_schema(&self) -> u16 {
+        self.max_applied_command_schema
     }
 
     /// Node ids that have been removed from the cluster and may never rejoin (M5, ADR-0023).
@@ -534,6 +570,15 @@ impl KvState {
                 "rejected replicated command at apply time"
             );
             return CommandResponse::Rejected { reason };
+        }
+        // Recorded before the command is evaluated, and for every command that gets this far,
+        // because the fact being recorded is that this node *decoded* the entry — which a
+        // rejected or deduplicated command proves just as well as an applied one (M6-R15).
+        if let Some(gate) = crate::schema::command_gate(cmd) {
+            if gate.command_schema > self.max_applied_command_schema {
+                self.max_applied_command_schema = gate.command_schema;
+                effects.max_command_schema = Some(gate.command_schema);
+            }
         }
         // Handled before the revision-exhaustion guard: neither maintenance command allocates
         // a revision, so a machine that has exhausted the revision space must still be able to

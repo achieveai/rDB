@@ -5,6 +5,8 @@ The rEtcd node daemon. One process = one node: a `config-engine` node behind the
 `config-log`.
 
 Normative behaviour is ADR-0018 (daemon lifecycle and CLI). This file is the operator view.
+For a one-command local cluster instead of hand-writing the files below, see
+[`docs/quickstart-local.md`](../../docs/quickstart-local.md).
 
 ## Running
 

@@ -145,3 +145,26 @@ not allow anyone to claim about production readiness.
 ## Notes
 
 None yet.
+
+### Note (2026-09-19, critic-m6 gate review): gaps recorded at the M6 gate
+
+Closed before the gate: BLOCKER-1 (v1 watermark stamp keyed on the marker, ADR-0021 note 6,
+ruling M6-R22); MATERIAL-1 (gossip key removal now refused while any peer still signs with the
+key, ruling M6-R21); MATERIAL-2 (TLS handshake bounded by `MtlsConfig::handshake_timeout`,
+10 s default, and an in-flight cap of 256); MATERIAL-3 (testkit refusal prefix realigned with
+the daemon).
+
+Left open, owned by the next milestone, none of them a production claim:
+
+- The handshake timeout is a start-up value. The TLS rotator rebuilds `MtlsConfig` from
+  `TlsFiles`, so a configurable timeout must be threaded through `read_material` before it can
+  be exposed in `[tls]`. Evidence for the bound stops at the `config-grpc` listener row
+  `m6_45_a`; no daemon-level row drives it.
+- At the in-flight cap the accept loop waits on the semaphore, so excess connections queue in
+  the kernel backlog rather than being refused.
+- The drain predicate's clause (a) is a decode check, not a semantic one (ADR-0021 note 5).
+- M6-33 (`policy_version_ref` always `None`), M6-35 (no `restore_policy_mismatch` line), and a
+  continuation page served by a follower returning `Node` without a leader hint remain as
+  logged in the M6 test plan.
+- The policy signature payload carries no domain-separation tag; ADR-0027's dated note forbids
+  key reuse across payload types until one is introduced.

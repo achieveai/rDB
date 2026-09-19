@@ -25,7 +25,10 @@ that touch it (M6-R1 belongs to ADR-0029; M6-R3 belongs here).
   version is bound **into** the signature, not merely alongside it. A validly-signed document
   whose signature-payload version disagrees with the body's `version` field is refused
   (`reason="version_binding"`); without this a signed v5 document could be relabelled and replayed
-  as v9.
+  as v9. (As built, 2026-09-19: the payload carries no domain-separation tag — it is exactly
+  `hash ‖ version_le`, 40 bytes — so a policy trust key MUST NOT be reused for any other rEtcd
+  or operator signing surface. Adding a tag later is a flag day for every signed document, which
+  is why the constraint is written down rather than retrofitted.)
 - A tampered body (`reason="hash_mismatch"`), an untrusted signer (`reason="untrusted_signer"`,
   distinct from a malformed signature so an operator can tell "wrong key" from "corrupt file"), a
   missing signature or document file (`reason="signature_file_missing"` /
@@ -262,3 +265,87 @@ already used for `disk_free_bytes` and `cert_expiry_seconds`. Under `authz.mode 
 policy series are not exported at all rather than exported as zero, so a deployment that never
 opted into signed policy cannot be confused on a dashboard with one whose document failed to load.
 `docs/testing` records this in `m5_observability.rs`'s `SIGNED_MODE_ONLY` list.
+
+## Implementation note (2026-09-19, lead ruling M6-R14: the M6 default stays `static`)
+
+The decision list above rules that **the M6 daemon default flips `authz.mode` to `"signed"`**.
+That is **reversed for M6**, by lead ruling M6-R14, and deferred to the GA cut where it ships with
+the upgrade note this ADR already asks for. Three reasons, in order of weight:
+
+1. A fresh daemon started with no `[authz]` section at all would boot **permanently unready** —
+   signed mode with no `policy_file` is refused at config load (see above), so the default would
+   turn "start the binary and look at it" into a configuration error. That is the right posture for
+   a fleet mid-upgrade and the wrong one for a first run.
+2. Static mode is *also* fail-closed. It denies every principal it does not name and it denies
+   everything when its file is missing or unparsable, so the flip buys signature verification, not
+   the difference between open and closed. The security argument for flipping early is weaker than
+   the decision list implies.
+3. M6-36 requires the M3 release to stay byte-for-byte reproducible under `static`. Keeping it the
+   default keeps that row a property of the shipped default rather than of a flag.
+
+Consequence, recorded because it is not free: nothing in the automated suite scrapes a signed-mode
+`/metrics` by default. `config-server/tests/m6_rbac.rs::m6_16_health_and_metrics_publish_the_signed_policy`
+starts a signed-mode daemon on purpose and asserts the five `retcd_policy_*` / `retcd_break_glass_active`
+families by name, which is what keeps `m5_observability.rs`'s `SIGNED_MODE_ONLY` exclusion honest.
+
+## Implementation note (2026-09-19, the authorization model is read at runtime, not latched)
+
+`NodeConfig.authz_kind` records the model a node was **wired** with. For signed mode that is only a
+startup snapshot, so `ConfigNode` derives the model in force from its authorizer on every read:
+`SignedPolicy` when `policy_version()` is `Some`, `NoValidPolicy` when it is `None`. Readiness, the
+health payload, the capability report and the one authorization seam all go through that derivation.
+
+Without it, a node whose startup load failed would deny every request and stay unready for the
+lifetime of the process even after the operator fixed the file and the poller adopted it — the
+repair for a running, replicating node would be a restart. The watch hub's `authz_ready` latch is
+set for signed mode at start for the same reason: the signed authorizer denies every event while it
+holds no document, so the latch would add nothing except a state the node could not leave.
+
+Two consequences worth naming:
+
+- The capability report and the policy summary in `/health` both carry the **live** version
+  (`AuthzKind::to_capability(authorizer.policy_version())`). A capability that can lie is worse than
+  no capability at all (ADR-0016).
+- A client request refused because there is no valid document returns `Unavailable`, not
+  `PermissionDenied`: the node is declining traffic, not deciding that this principal may not do
+  this. The static models' `Missing`/`Invalid` keep M3's `PermissionDenied`, where the operator did
+  configure something and got it wrong.
+
+## Implementation note (2026-09-19, the revocation is pre-checked against the outcome)
+
+`PolicyLoader::attempt` revokes before it adopts, which is the ordering this ADR requires — but it
+now asks `SignedPolicyAuthorizer::adopt_would_replace` first and skips the revocation entirely when
+the document is byte-identical to the active one, or when `adopt` is about to refuse it as a
+rollback. The poller re-reads the files every `poll_interval`, so without the pre-check one stale
+file left on disk revokes every overlapping watch and takes the journal gate once per tick, for as
+long as nobody notices it — a refusal would have become a rolling watch outage. The predicate lives
+on the authorizer rather than at the seam so that it and `adopt` cannot drift apart.
+
+## Implementation note (2026-09-19, the convergence baseline is the oldest un-converged document)
+
+`Active.previous` holds the **oldest** document this node has not yet retired, not simply the one
+going out of force. Two adoptions inside one convergence window (a 10 s poll against a 30 s
+objective makes that ordinary) leave voters spread across all the versions involved, so narrowing
+against only the immediately previous document would let a grant introduced two hops ago take
+effect while a voter on the oldest still denies it. `note_cluster_min_version` clears the baseline
+when every voter has reported, and from then on the document going out of force is the baseline
+again.
+
+## How convergence completes (2026-09-19)
+
+`policy_version` is field 2 of ADR-0030's `HintExtras` trailer, so every node advertises the version
+it holds in its gossip metadata. The daemon's policy poller drives one convergence pass on the same
+tick as the reload: it advertises its own version first, then takes the minimum reported by the
+*committed voters* and hands it to `note_cluster_min_version`. A voter whose metadata is missing or
+undecodable reports nothing, and nothing sorts below every version, so an unknown voter counts as
+lagging and the narrowing continues — fail-closed on absence, as §15.3 requires. The transition is
+reported once, which is what makes `policy_converged` exactly one line per node per version.
+
+The advertisement is re-published rather than fixed at gossip start: `GossipNode::update_extras`
+edits one slot of the trailer and re-runs the advertisement, so a rotation reaches peers without a
+restart (lead ruling M6-R18). A node with gossip disabled has no source of cluster versions and
+therefore stays `Converging` until it restarts, which is the documented cost of turning gossip off.
+
+This is a convergence courtesy and not a security boundary: gossip confers no authority (§19.9), so
+a forged advertisement can end the narrowing early but can never grant access neither document
+grants (M6-23, OQ-56).

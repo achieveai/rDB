@@ -185,6 +185,9 @@ const KEY_JOURNAL_STATS: &[u8] = b"journal_stats";
 /// a peer plane that forgot a retirement across a restart would re-admit an identity the
 /// cluster deliberately expelled.
 const KEY_RETIRED_NODES: &[u8] = b"retired_nodes";
+
+/// The highest `command_schema` this state machine has ever applied (M6, ADR-0030 M6-R15).
+const KEY_MAX_COMMAND_SCHEMA: &[u8] = b"max_command_schema";
 /// The provenance of a restored data directory (M5, ADR-0024), `postcard(RestoredFrom)`.
 /// Written once, by the offline `restore_into_fresh_store`, and never by a running node: it
 /// records the identity the data came *from*, which is by construction not the identity this
@@ -250,7 +253,8 @@ pub enum StorageOpenError {
         /// The version stamped in the directory; `0` means a store written before the marker
         /// existed, whose format cannot be established at all.
         found: u32,
-        /// The only version this build reads and writes ([`FORMAT_VERSION`]).
+        /// The newest version this open would accept — [`FORMAT_VERSION`] ordinarily, or the
+        /// lower ceiling a `--compat-schema` node imposed (`RocksOptions::max_format_version`).
         supported: u32,
         /// The directory.
         path: PathBuf,
@@ -283,8 +287,8 @@ pub enum StorageOpenError {
         expected: Vec<String>,
     },
 
-    /// A legacy-format directory still holds Raft log entries, so it cannot be upgraded in
-    /// place (ADR-0021 note 4, ruling M5-R19).
+    /// A legacy-format directory still holds Raft log entries this build cannot carry across an
+    /// in-place upgrade (ADR-0021 note 4, ruling M5-R19 as amended by ruling M6-R20).
     ///
     /// Migration rewrites `state_meta` and adds column families; it does **not** rewrite the
     /// log, and it cannot: a log entry is a `postcard` encoding of `Entry<TypeConfig>`, whose
@@ -293,19 +297,26 @@ pub enum StorageOpenError {
     /// worse -- decodes into a different command. Refusing the open is the only answer that
     /// cannot silently apply the wrong mutation.
     ///
-    /// The fix names itself: on the *old* build, drain the log (trigger a snapshot, then let
-    /// purge run), shut down, and upgrade the now-empty directory.
+    /// What makes an entry *carriable* is asked of the entry, not of the marker (M6-R20, and
+    /// see [`scan_log_for_upgrade`]): it must decode under this build, and it must already be
+    /// applied. A residual of applied, decodable entries -- which is all OpenRaft's purge ever
+    /// leaves behind -- is not an obstacle and never was.
+    ///
+    /// The fix names itself: on the *old* build, let the node finish applying, drain what is
+    /// left (trigger a snapshot, then let purge run), shut down, and upgrade the directory.
     #[error(
-        "data directory {path} is on-disk format version {format} and still holds \
-             {log_entries} Raft log entrie(s); an in-place upgrade cannot decode them \
-             (the log payload is positional and unversioned). Fix: on the previous build, \
-             trigger a snapshot and let log purge drain the log, shut the node down, then \
-             start this build against the drained directory"
+        "data directory {path} is on-disk format version {format} and {log_entries} of its \
+             Raft log entrie(s) cannot be carried across an in-place upgrade -- this build \
+             either cannot decode them or has not applied them (the log payload is positional \
+             and unversioned). Fix: on the previous build, let the node catch up so nothing is \
+             unapplied, trigger a snapshot and let log purge drain the rest, shut the node \
+             down, then start this build against the drained directory"
     )]
     UpgradeRequiresDrainedLog {
         /// The legacy version stamped in the directory.
         format: u32,
-        /// How many entries the `raft_log` column family still holds.
+        /// How many of the `raft_log` column family's retained entries block the upgrade --
+        /// not how many it holds. An applied, decodable entry is carried, not counted.
         log_entries: u64,
         /// The directory.
         path: PathBuf,
@@ -354,13 +365,22 @@ pub struct RocksOptions {
     pub sync_writes: bool,
     /// Whether a directory with no database in it may be created.
     pub create_if_missing: bool,
+    /// The newest on-disk format this open may accept (ADR-0030, OQ-65).
+    ///
+    /// [`FORMAT_VERSION`] for an ordinary build. A node pinned to an older schema with
+    /// `--compat-schema` lowers it, which makes the open refuse a directory written by a newer
+    /// build — exactly what a genuine build of that age would do. Serving a newer directory
+    /// while advertising an older schema is the silent-divergence case this exists to prevent.
+    pub max_format_version: u32,
 }
 
 impl RocksOptions {
-    /// The production profile: full sync, create a fresh directory when absent.
+    /// The production profile: full sync, create a fresh directory when absent, read every
+    /// format this build understands.
     pub const DEFAULT: Self = Self {
         sync_writes: true,
         create_if_missing: true,
+        max_format_version: FORMAT_VERSION,
     };
 }
 
@@ -843,23 +863,57 @@ impl RocksStore {
         // A directory with a `CURRENT` file already holds a database, so its column families
         // are a fact to verify rather than something to create.
         let existing = dir.join("CURRENT").exists();
+        // Which column families the directory really has. Kept past the probe because the
+        // v1 watermark stamp below keys on the *layout*, not the marker (M6-R22).
+        let mut layout = CfLayout::Current;
         if existing {
+            // The marker is read before *anything* else about the layout, because it is the
+            // only fact that can tell an operator "this directory is newer than this build"
+            // (OQ-65, M6-98). Read after `verify_column_families`, a directory from a newer
+            // build reports a missing column family instead — a true statement that names the
+            // wrong problem and points at the wrong fix. The probe takes a read-only handle,
+            // so it can neither create the family nor destroy the evidence.
+            // Deliberately not `?`: a directory that is missing a *core* family cannot be
+            // probed at all, and that case belongs to `verify_column_families` below, which
+            // names the family. Holding the result lets the nested arm raise the very same
+            // error at the very same point it always did.
+            let marker = probe_format_version(dir, &path);
+            if let Ok(Some(found)) = marker {
+                if found > options.max_format_version {
+                    return Err(StorageOpenError::UnsupportedFormat {
+                        found,
+                        supported: options.max_format_version,
+                        path: path.clone(),
+                    })
+                    .inspect_err(|_| {
+                        tracing::error!(
+                            path = %path.display(),
+                            format_version = found,
+                            max_format_version = options.max_format_version,
+                            "store_format_too_new"
+                        );
+                    });
+                }
+            }
+
             // A family that is absent is either a legitimately older directory or a current one
             // someone deleted a family out of. The marker settles which, and it must be read
             // *before* the writable open, whose `create_missing_column_families` would
             // manufacture the family and destroy the evidence (M4-95).
-            let (missing, marker_of_that_layout) = match verify_column_families(dir, &path)? {
+            layout = verify_column_families(dir, &path)?;
+            let (missing, marker_of_that_layout) = match layout {
                 CfLayout::Current => (None, FORMAT_VERSION),
                 CfLayout::LegacyV2 => (Some(CF_DEDUP), FORMAT_VERSION_V2),
                 CfLayout::LegacyV1 => (Some(CF_EVENTS), FORMAT_VERSION_V1),
             };
             if let Some(missing) = missing {
-                match probe_format_version(dir, &path)? {
+                match marker? {
                     Some(found) if found == marker_of_that_layout => {
-                        // Ruling M5-R19: migration upgrades state, never history. Refused here
-                        // -- still read-only, nothing created -- so the directory the operator
-                        // has to go back and drain is byte-for-byte the one they left.
-                        refuse_if_undrained(&path, found, probe_log_entries(dir, &path)?)?;
+                        // Rulings M5-R19/M6-R20: migration upgrades state, never history, and
+                        // history it cannot carry is refused. Refused here -- still read-only,
+                        // nothing created -- so the directory the operator has to go back and
+                        // drain is byte-for-byte the one they left.
+                        refuse_if_undrained(&path, found, probe_log_for_upgrade(dir, &path)?)?;
                     }
                     found => {
                         return Err(StorageOpenError::MissingColumnFamily {
@@ -890,8 +944,9 @@ impl RocksStore {
         // First, before a single stored byte is decoded: every value below is a serde encoding
         // whose layout this version selects, so reading them out of a directory written in
         // another format is exactly the silent misinterpretation the marker exists to prevent.
-        let format_action = check_format_version(&db, &path)?;
-        // Ruling M5-R19. A legacy directory may only be upgraded once its log is drained.
+        let format_action = check_format_version(&db, &path, options.max_format_version)?;
+        // Rulings M5-R19/M6-R20. A legacy directory may only be upgraded once every entry its
+        // log still holds is one this build can carry: decodable, and already applied.
         // This runs before the open batch, so a refused directory is left exactly as it was
         // found -- still readable by the build that wrote it, which is the build that has to
         // drain it.
@@ -899,7 +954,7 @@ impl RocksStore {
         // column families are all current but whose marker is still legacy. The realistic
         // case -- a legacy CF set -- is refused before `open_db` ran at all.
         if let FormatAction::Migrate { from } = format_action {
-            refuse_if_undrained(&path, from, count_log_entries(&db, &path)?)?;
+            refuse_if_undrained(&path, from, scan_log_for_upgrade(&db, &path)?)?;
         }
         // Created here rather than at the end so a fault injected *during* the migration is
         // counted on the same counters the test later inspects (M4-14, M4-18).
@@ -962,9 +1017,28 @@ impl RocksStore {
             }
         }
         if format_action != FormatAction::Proceed {
-            open_batch.put_cf(state_meta, KEY_FORMAT_VERSION, FORMAT_VERSION.to_le_bytes());
+            // The ceiling, not [`FORMAT_VERSION`]: a `--compat-schema` node must leave behind a
+            // directory it can itself reopen, and stamping a marker above its own ceiling would
+            // make its very next start refuse its own data (ADR-0030, OQ-65).
+            open_batch.put_cf(
+                state_meta,
+                KEY_FORMAT_VERSION,
+                options.max_format_version.to_le_bytes(),
+            );
         }
-        if matches!(format_action, FormatAction::Migrate { from } if from == FORMAT_VERSION_V1) {
+        // Keyed on what the directory holds, not on `from` alone (M6-R22). A build pinned with
+        // `--compat-schema 1` stamps marker 1 over the *current* column families, journal
+        // included (ADR-0030), so marker 1 no longer proves the history is unresumable.
+        // Stamping `cluster_revision` as the watermark over a populated journal would refuse
+        // every watch resume and historical read below it, silently and for good
+        // (`restore_compact_revision` unions by max). The watermark is stamped only when the
+        // journal cannot resume anything: the v1 layout (no `events` family yet), or an
+        // `events` family with nothing in it -- which is also what a v1 directory looks like
+        // on the retry after a crash between `open_db` creating the families and this batch
+        // (M4-14, M4-18).
+        if matches!(format_action, FormatAction::Migrate { from } if from == FORMAT_VERSION_V1)
+            && (layout == CfLayout::LegacyV1 || journal_is_empty(&db))
+        {
             // Ruling R1: the watermark is stamped from *this node's* `cluster_revision`, as a
             // local open-time write, not a replicated command. The pre-v2 history has no
             // journal, so every revision at or below it is unresumable here — and mid-rolling
@@ -1004,7 +1078,7 @@ impl RocksStore {
                     node_id = identity.node_id.0,
                     path = %path.display(),
                     from,
-                    to = FORMAT_VERSION,
+                    to = options.max_format_version,
                     "format_migrated"
                 );
                 open_boundary(&*faults, &counters, Boundary::AfterStateBatch, &path)?;
@@ -1477,12 +1551,19 @@ enum FormatAction {
 /// from a directory that already holds data, which makes it a store written before the marker
 /// existed (`found: 0`) whose layout cannot be established at all (test plan M2-66..M2-68).
 /// A *newer* version is refused for the same reason in the other direction: a v2 build has no
-/// way to know which of v3's bytes it would misread (M4-20).
+/// way to know which of v3's bytes it would misread (M4-20). `ceiling` is what "newer" means
+/// on this open — [`FORMAT_VERSION`] ordinarily, lower for a `--compat-schema` node. The
+/// pre-open probe in [`RocksStore::open`] already refuses a too-new marker (OQ-65); this stays
+/// as the backstop for the shape the probe cannot see and as the decision for the other arms.
 ///
 /// The marker is read as raw little-endian bytes rather than through [`read_meta`]: a marker
 /// encoded in the format it exists to police could not be read back across the very change it
 /// is meant to detect.
-fn check_format_version(db: &DB, path: &Path) -> Result<FormatAction, StorageOpenError> {
+fn check_format_version(
+    db: &DB,
+    path: &Path,
+    ceiling: u32,
+) -> Result<FormatAction, StorageOpenError> {
     let handle =
         db.cf_handle(CF_STATE_META)
             .ok_or_else(|| StorageOpenError::MissingColumnFamily {
@@ -1498,7 +1579,7 @@ fn check_format_version(db: &DB, path: &Path) -> Result<FormatAction, StorageOpe
         })?;
     let unsupported = |found| StorageOpenError::UnsupportedFormat {
         found,
-        supported: FORMAT_VERSION,
+        supported: ceiling,
         path: path.to_path_buf(),
     };
 
@@ -1512,7 +1593,10 @@ fn check_format_version(db: &DB, path: &Path) -> Result<FormatAction, StorageOpe
                 }
             })?);
             match found {
-                FORMAT_VERSION => Ok(FormatAction::Proceed),
+                // `ceiling` rather than [`FORMAT_VERSION`] so that a node pinned by
+                // `--compat-schema` treats its own generation as current and migrates nothing.
+                f if f == ceiling => Ok(FormatAction::Proceed),
+                f if f > ceiling => Err(unsupported(f)),
                 FORMAT_VERSION_V1 | FORMAT_VERSION_V2 => Ok(FormatAction::Migrate { from: found }),
                 _ => Err(unsupported(found)),
             }
@@ -1522,44 +1606,111 @@ fn check_format_version(db: &DB, path: &Path) -> Result<FormatAction, StorageOpe
     }
 }
 
-/// Refuse an in-place upgrade of a directory whose Raft log has not been drained.
+/// What a legacy directory's retained Raft log means for an in-place upgrade.
 ///
-/// The marker in `state_meta` says how `state_meta` and the column-family set are laid out,
-/// and migration can rewrite both. It says nothing useful about the *log*, because a log entry
-/// is `postcard::to_stdvec(&Entry<TypeConfig>)` and `Entry`'s payload is a `Command` -- a type
-/// this build owns and has widened since (M5 added the dedup stamp to `Put`/`Delete`, a trim
+/// Produced by [`scan_log_for_upgrade`], consumed by [`refuse_if_undrained`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LogUpgradeScan {
+    /// Entries this build refuses to carry across the upgrade.
+    blocking: u64,
+    /// The lowest blocking index and why, so the refusal names one concrete entry rather than
+    /// only a count. `None` exactly when `blocking` is zero.
+    first: Option<(u64, &'static str)>,
+}
+
+/// Why one retained entry blocks the upgrade. These strings reach an operator through
+/// `upgrade_requires_drained_log{reason}`, so they are constants for the same reason the
+/// [`config_core::error`] reason strings are.
+const BLOCKED_UNDECODABLE: &str = "undecodable";
+/// See [`BLOCKED_UNDECODABLE`].
+const BLOCKED_UNAPPLIED: &str = "unapplied";
+
+/// Decide whether a legacy directory's Raft log may be carried across an in-place upgrade.
+///
+/// The marker in `state_meta` says how `state_meta` and the column-family set are laid out, and
+/// migration can rewrite both. It says nothing about the *log*, because a log entry is
+/// `postcard::to_stdvec(&Entry<TypeConfig>)` and `Entry`'s payload is a `Command` -- a type this
+/// build owns and has widened since (M5 added the dedup stamp to `Put`/`Delete`, a trim
 /// watermark to `Compact`, and `RetireNode` outright). `postcard` is positional and carries no
-/// per-field tag, so those older bytes are not "an old version of a command this build can
-/// read"; they are a different grammar. The best case is a decode error on the first replay,
-/// the worst is a decode that succeeds into a different mutation.
+/// per-field tag, so bytes written by a narrower build are not "an old version of a command this
+/// build can read"; they are a different grammar. The best case is a decode error on the first
+/// replay, the worst is a decode that succeeds into a different mutation.
 ///
-/// So the contract (ADR-0021 note 4, ruling M5-R19) is: migration upgrades state, never
-/// history. An operator drains the log on the build that can still read it -- snapshot, let
-/// purge run -- and then upgrades an empty log. The counted scan is affordable because it only
-/// happens on the single open that finds a legacy marker.
-fn count_log_entries(db: &DB, path: &Path) -> Result<u64, StorageOpenError> {
+/// Ruling M5-R19 originally used the marker as a *proxy* for "a narrower build wrote this log"
+/// and refused any non-empty log. Ruling **M6-R20 (2026-09-19)** retires that proxy, for two
+/// reasons found against real daemons:
+///
+/// * it is false in the one case ADR-0030 cares about. A current binary started with
+///   `--compat-schema 1` lowers [`RocksOptions::max_format_version`] to 1 and stamps marker 1 --
+///   over log entries it wrote itself, in the current grammar, because this build has no
+///   schema-1 command encoder (ADR-0030 as-built). The marker records the *ceiling* the writer
+///   ran under, never the grammar it wrote.
+/// * "empty" is unreachable. OpenRaft's purge leaves a residual tail behind the snapshot it
+///   keeps, so no sequence of operator actions drains the log to exactly zero, and the
+///   documented rolling upgrade could never be performed.
+///
+/// So the question is asked directly instead, of each retained entry:
+///
+/// 1. **does it decode** as `Entry<TypeConfig>` under this build? This is the literal claim the
+///    refusal's own message makes, tested rather than inferred.
+/// 2. **is it at or below `last_applied`?** Decodability is not proof of meaning: a positional
+///    decode can succeed into a *different* command. An entry at or below `last_applied` has
+///    already had its effect and will never be applied here again, so a lucky decode cannot
+///    reach the state machine; an entry above it is one this build is going to **execute**, and
+///    by apply time there is no way back.
+///
+/// An empty log satisfies both, so every directory the old predicate admitted is still admitted.
+/// The scan is affordable because it only happens on the single open that finds a legacy marker;
+/// it reads, and never rewrites, so spec §17's bound on in-place rewrites is untouched.
+fn scan_log_for_upgrade(db: &DB, path: &Path) -> Result<LogUpgradeScan, StorageOpenError> {
     let Some(handle) = db.cf_handle(CF_RAFT_LOG) else {
         // A directory without the family at all has no history by definition. The
         // missing-family error belongs to `verify_column_families`, not here.
-        return Ok(0);
+        return Ok(LogUpgradeScan::default());
     };
-    let mut entries: u64 = 0;
+    // Absent means nothing has ever been applied, which makes every retained entry unapplied --
+    // the strictest reading, and the right one for a directory that never reached a snapshot.
+    let last_applied: Option<LogId<RaftNodeId>> = read_meta(db, CF_STATE_META, KEY_LAST_APPLIED)
+        .map_err(|detail| StorageOpenError::Corrupt {
+            what: "state_meta/last_applied".to_string(),
+            path: path.to_path_buf(),
+            detail,
+        })?;
+    let applied_through = last_applied.map_or(0, |id| id.index);
+
+    let mut scan = LogUpgradeScan::default();
     for item in db.iterator_cf(handle, IteratorMode::Start) {
-        item.map_err(|e| StorageOpenError::Backend {
+        let (key, value) = item.map_err(|e| StorageOpenError::Backend {
             path: path.to_path_buf(),
             detail: format!("cannot scan the raft log while checking for an upgrade: {e}"),
         })?;
-        entries += 1;
+        // An unreadable key is history this build cannot place, which is strictly worse than an
+        // entry it cannot decode; it counts as blocking rather than being skipped.
+        let index = decode_index(&key);
+        let reason = if postcard::from_bytes::<Entry<TypeConfig>>(&value).is_err() {
+            Some(BLOCKED_UNDECODABLE)
+        } else if index.is_none_or(|i| i > applied_through) {
+            Some(BLOCKED_UNAPPLIED)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            scan.blocking += 1;
+            if scan.first.is_none() {
+                scan.first = Some((index.unwrap_or(0), reason));
+            }
+        }
     }
-    Ok(entries)
+    Ok(scan)
 }
 
-/// Count a legacy directory's log entries *without* a writable handle.
+/// Scan a legacy directory's log *without* a writable handle.
 ///
 /// Same reason as [`probe_format_version`]: [`open_db`] would create the missing column family
 /// before anything could refuse, and a refused directory has to stay openable by the build that
-/// is going to drain it. The v1 family list is enough — `raft_log` is in every layout.
-fn probe_log_entries(dir: &Path, path: &Path) -> Result<u64, StorageOpenError> {
+/// is going to drain it. The v1 family list is enough — `raft_log` is in every layout, and
+/// `last_applied` lives in `state_meta`, which is too.
+fn probe_log_for_upgrade(dir: &Path, path: &Path) -> Result<LogUpgradeScan, StorageOpenError> {
     let mut opts = Options::default();
     opts.create_if_missing(false);
     opts.create_missing_column_families(false);
@@ -1569,24 +1720,30 @@ fn probe_log_entries(dir: &Path, path: &Path) -> Result<u64, StorageOpenError> {
             detail: format!("cannot probe the raft log: {e}"),
         }
     })?;
-    count_log_entries(&db, path)
+    scan_log_for_upgrade(&db, path)
 }
 
-/// Turn a non-zero legacy log count into the typed refusal, and log it once.
-fn refuse_if_undrained(path: &Path, from: u32, log_entries: u64) -> Result<(), StorageOpenError> {
-    if log_entries == 0 {
+/// Turn a blocking legacy log into the typed refusal, and log it once.
+fn refuse_if_undrained(
+    path: &Path,
+    from: u32,
+    scan: LogUpgradeScan,
+) -> Result<(), StorageOpenError> {
+    let Some((index, reason)) = scan.first else {
         return Ok(());
-    }
+    };
     tracing::error!(
         path = %path.display(),
         from,
         to = FORMAT_VERSION,
-        log_entries,
+        log_entries = scan.blocking,
+        first_blocking_index = index,
+        reason,
         "upgrade_requires_drained_log"
     );
     Err(StorageOpenError::UpgradeRequiresDrainedLog {
         format: from,
-        log_entries,
+        log_entries: scan.blocking,
         path: path.to_path_buf(),
     })
 }
@@ -1609,6 +1766,22 @@ fn holds_persisted_state(db: &DB) -> bool {
         || db
             .cf_handle(CF_RAFT_LOG)
             .is_some_and(|h| db.iterator_cf(h, IteratorMode::Start).next().is_some())
+}
+
+/// Whether the `events` journal holds no entry at all. Absent family counts as empty: it is
+/// the v1 layout, which has no journal to resume from.
+///
+/// Safety of the empty-journal branch in `open_inner` rests on reachability, not on a check
+/// (critic-m6, M6-R22): the stamp it enables is a raise that `restore_compact_revision`
+/// unions by `max`, so it must never fire on a directory whose journal was merely trimmed.
+/// It cannot: retention trims through `Compact`, which is schema-gated and undecodable to a
+/// pinned build, so a marker-1 directory has never been trimmed; a trimmed current directory
+/// cannot be reopened pinned (the pre-open probe refuses marker 3 above ceiling 1, M6-98);
+/// and snapshot installs repopulate the journal. What remains empty is a true v1 directory,
+/// a crashed-mid-migration retry of one, or a store at `cluster_revision == 0`.
+fn journal_is_empty(db: &DB) -> bool {
+    db.cf_handle(CF_EVENTS)
+        .is_none_or(|h| db.iterator_cf(h, IteratorMode::Start).next().is_none())
 }
 
 fn read_meta<T: serde::de::DeserializeOwned>(
@@ -1720,6 +1893,9 @@ fn load_state(db: &DB, path: &Path, limits: Limits) -> Result<Loaded, StorageOpe
     let retired_nodes: BTreeSet<NodeId> = read_meta(db, CF_STATE_META, KEY_RETIRED_NODES)
         .map_err(|d| corrupt("state_meta/retired_nodes", d))?
         .unwrap_or_default();
+    let max_applied_command_schema: u16 = read_meta(db, CF_STATE_META, KEY_MAX_COMMAND_SCHEMA)
+        .map_err(|d| corrupt("state_meta/max_command_schema", d))?
+        .unwrap_or(config_core::COMMAND_SCHEMA_V1);
     let restored_from: Option<config_core::RestoredFrom> =
         read_meta(db, CF_STATE_META, KEY_RESTORED_FROM)
             .map_err(|d| corrupt("state_meta/restored_from", d))?;
@@ -1736,6 +1912,7 @@ fn load_state(db: &DB, path: &Path, limits: Limits) -> Result<Loaded, StorageOpe
             kv.restore_compact_revision(compact_revision);
             kv.restore_dedup(dedup);
             kv.restore_retired_nodes(retired_nodes);
+            kv.restore_max_applied_command_schema(max_applied_command_schema);
             kv
         },
         journal_stats,
@@ -2442,6 +2619,23 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
                                         })?;
                                     batch.put_cf(s.cf(CF_STATE_META), KEY_RETIRED_NODES, encoded);
                                 }
+                                // M6-R15: written in the same synced batch as the command it
+                                // describes, so a node can never come back claiming to have
+                                // applied a generation whose entry did not survive with it.
+                                if let Some(schema) = effects.max_command_schema {
+                                    let encoded = postcard::to_stdvec(&schema).map_err(|e| {
+                                        io_error(
+                                            ErrorSubject::StateMachine,
+                                            ErrorVerb::Write,
+                                            format!("cannot encode max command schema: {e}"),
+                                        )
+                                    })?;
+                                    batch.put_cf(
+                                        s.cf(CF_STATE_META),
+                                        KEY_MAX_COMMAND_SCHEMA,
+                                        encoded,
+                                    );
+                                }
                                 // The event is the exact record delta: it carries the key, the
                                 // value and both revisions, so the CF write needs no second
                                 // lookup into `KvState`.
@@ -2824,6 +3018,8 @@ struct CapturedView {
     /// the same lock as the revisions above, so the header describes one applied state rather
     /// than two moments stitched together.
     retired_nodes: BTreeSet<NodeId>,
+    /// The activation watermark at capture (M6-R15), taken under the same lock.
+    max_applied_command_schema: u16,
     /// The checkpoint directory. Removed once the export finishes, successfully or not.
     checkpoint: PathBuf,
 }
@@ -2865,6 +3061,7 @@ fn capture_view(s: &RocksShared) -> Result<CapturedView, StorageError<RaftNodeId
         cluster_revision: sm.kv.cluster_revision(),
         compact_revision: sm.kv.compact_revision(),
         retired_nodes: sm.kv.retired_nodes().clone(),
+        max_applied_command_schema: sm.kv.max_applied_command_schema(),
         checkpoint,
     })
 }
@@ -3098,6 +3295,7 @@ fn export_into_file(
         bytes: payload_bytes,
         created_unix_ms: view.created_unix_ms,
         retired_nodes: view.retired_nodes.clone(),
+        max_applied_command_schema: view.max_applied_command_schema,
     };
 
     let tmp = snapshot::tmp_path(&s.path, &view.snapshot_id);
@@ -3325,6 +3523,9 @@ struct InstalledState {
     /// the snapshot header carried (M5-R21). Returned rather than re-read afterwards for the
     /// same reason as `dedup` — the final batch has just written exactly these ids.
     retired: BTreeSet<NodeId>,
+    /// The receiver's activation watermark after the install: its own, raised by the header's
+    /// (M6-R15). Unioned by `max` for the same reason `retired` is unioned by set union.
+    max_command_schema: u16,
 }
 
 /// Phase two of an install: clear the data column families, stream the records in, and commit
@@ -3500,6 +3701,26 @@ fn apply_snapshot_records(
         KEY_RETIRED_NODES,
         encode("retired_nodes", postcard::to_stdvec(&retired))?,
     );
+    // The same union, for the same reason, on the same batch (M6-R15): an install can raise
+    // the activation watermark but never lower it, so a node that has already proved it
+    // decodes a generation does not un-prove it by catching up from an older builder.
+    let max_command_schema = {
+        let local: u16 = read_meta(db, CF_STATE_META, KEY_MAX_COMMAND_SCHEMA)
+            .map_err(|detail| SnapshotFileError::Malformed {
+                file: snap_file.display().to_string(),
+                detail: format!("state_meta/max_command_schema did not decode: {detail}"),
+            })?
+            .unwrap_or(config_core::COMMAND_SCHEMA_V1);
+        local.max(header.max_applied_command_schema)
+    };
+    last.put_cf(
+        meta_cf,
+        KEY_MAX_COMMAND_SCHEMA,
+        encode(
+            "max_command_schema",
+            postcard::to_stdvec(&max_command_schema),
+        )?,
+    );
     last.put_cf(
         meta_cf,
         KEY_CURRENT_SNAPSHOT,
@@ -3534,6 +3755,7 @@ fn apply_snapshot_records(
         records,
         dedup,
         retired,
+        max_command_schema,
     })
 }
 
@@ -3696,6 +3918,7 @@ fn install_received(
         // and whatever this node already held (M5-R21). Mirroring that exact value here is
         // what makes a restart immediately after this install reconstruct the same fence.
         kv.restore_retired_nodes(installed.retired);
+        kv.restore_max_applied_command_schema(installed.max_command_schema);
         sm.kv = kv;
         sm.last_applied = installed.last_applied;
         sm.membership = installed.membership;

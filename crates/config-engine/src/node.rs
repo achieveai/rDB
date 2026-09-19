@@ -8,11 +8,12 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use config_core::{
-    Action, Authorizer, Capabilities, ClusterIdentity, Command, CommandResponse, ConfigError,
-    Decision, Dedup, DeleteRequest, GetRequest, GetResponse, GossipObservationSource,
+    command_gate, Action, Authorizer, Capabilities, ClusterIdentity, Command, CommandResponse,
+    ConfigError, Decision, Dedup, DeleteRequest, GetRequest, GetResponse, GossipObservationSource,
     IdentityMismatch, KvState, LeaderHint, Limits, ListRequest, ListResponse, Liveness,
-    MutationResponse, NodeId, ObservedPeerHint, Pagination, Principal, PutRequest, WatchRequest,
-    WatchResumption, WatchRetention, WatchStream,
+    MutationResponse, NodeId, ObservedPeerHint, Pagination, Principal, PutRequest, SchemaTriple,
+    WatchRequest, WatchResumption, WatchRetention, WatchStream, CURRENT_SCHEMA,
+    UNAVAILABLE_FEATURE_NOT_ACTIVATED,
 };
 use config_log::TraceContext;
 use config_storage::{
@@ -24,16 +25,17 @@ use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
 use crate::admin::{AdminError, MembershipReport, ReplicationProgress, SnapshotTriggered};
-use crate::config::{NodeConfig, StorageHandle};
+use crate::config::{AuthzKind, NodeConfig, StorageHandle};
 use crate::error::{EngineError, FormationError, FormationPlan, Timeout};
 use crate::hint::{validate_hint, HintVerdict};
 use crate::metrics::{
-    Health, HealthPayload, LatencyHistogram, LogIdView, MembershipView, MetricsReport, NodeMetrics,
-    NodeRole, OpLatencies, PolicySummary,
+    AuthnRejectReason, Health, HealthPayload, LatencyHistogram, LogIdView, MembershipView,
+    MetricsReport, NodeMetrics, NodeRole, OpLatencies, PolicySummary,
 };
 use crate::network::EngineNetworkFactory;
 use crate::transport::{
-    PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSink, PeerTransport,
+    PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSchemas, PeerSink,
+    PeerTransport,
 };
 use crate::watch::{retention_target, JournalView, LeaderClock, WatchHub, WatchStats};
 
@@ -113,12 +115,15 @@ pub(crate) struct NodeInner {
     /// allowlist is checked in the transport, before any engine call, so only the transport
     /// can report these — exactly as with `authn_rejected`.
     authz_denied_admin: AtomicU64,
-    /// Client connections whose transport identity could not be established (M3-81). The
-    /// engine never sees a certificate, so only the transport can count these.
-    authn_rejected: AtomicU64,
-    /// The peer-plane share of `authn_rejected`, so `/metrics` can label the family by plane
+    /// Client-plane authentication rejections, one counter per reason (M3-81, ADR-0028).
+    ///
+    /// Indexed by `AuthnRejectReason::index`. Per reason rather than one total with a
+    /// breakdown beside it: the total `/health` reports is the sum of these, so the two cannot
+    /// disagree. The engine never sees a certificate, so only the transport can report them.
+    authn_rejected_client: [AtomicU64; AuthnRejectReason::COUNT],
+    /// The peer plane's counters, kept apart so `/metrics` can label the family by plane
     /// truthfully instead of attributing a fenced peer to the client plane (ADR-0026).
-    authn_rejected_peer: AtomicU64,
+    authn_rejected_peer: [AtomicU64; AuthnRejectReason::COUNT],
     /// Watch fan-out, the journal gate, and the admission counters (ADR-0020).
     ///
     /// The same `Arc` the store was opened with as its `AppliedBatchSink`: the hub only sees
@@ -151,6 +156,25 @@ pub(crate) struct NodeInner {
     proposal_latency: OpLatencies,
     /// Linearizable read barrier latency (`retcd_linearizable_read_latency_seconds`).
     read_latency: LatencyHistogram,
+    /// What each peer last advertised on the peer plane (M6, ADR-0030).
+    ///
+    /// Shared with [`crate::network::EngineNetwork`], which is the only writer: the minimum is
+    /// computed from answers this node actually received, never from gossip (M6-102).
+    peer_schemas: Arc<PeerSchemas>,
+    /// Whether `feature_activated` has already been logged in this process (M6-100, M6-123).
+    ///
+    /// Per-process and monotonic, with no on-disk marker: activation is a *derived* fact about
+    /// the committed voter set, so a restart recomputes it from the same inputs and reaches the
+    /// same answer. ADR-0030's Consequences already permit a new leader logging it once more
+    /// after a failover, which is what "per node per activation" means in M6-123.
+    schema_activated: AtomicBool,
+    /// The minimum each gated feature was last refused at, so a refusal is logged once per
+    /// window rather than once per request (M6-90, M6-123).
+    ///
+    /// Keyed by feature and valued by the minimum that refused it: a window is a period during
+    /// which the computed minimum does not move, which is exactly the period over which a
+    /// second line would tell an operator nothing new.
+    gate_logged_at: Mutex<BTreeMap<&'static str, u16>>,
 }
 
 /// A running rEtcd node: one OpenRaft instance, one store, one authorizer.
@@ -209,6 +233,12 @@ impl ConfigNode {
             ));
         }
 
+        // Seeded with this node's own schema: the leader never calls itself on the peer plane,
+        // so without this it would read its own entry as the schema-1 default and could never
+        // reach a minimum of 2 (M6-96).
+        let peer_schemas = Arc::new(PeerSchemas::default());
+        peer_schemas.record(identity.node_id, cfg.schema);
+
         // Child of whatever span the caller is in, so under `#[retcd_test]` every line this
         // node ever emits — including from OpenRaft's own core task — carries `testMethod`.
         let span = tracing::info_span!(
@@ -239,6 +269,8 @@ impl ConfigNode {
             transport,
             span: span.clone(),
             traces: Arc::clone(&traces),
+            schema: cfg.schema,
+            peer_schemas: Arc::clone(&peer_schemas),
         };
 
         // Hand-matched per store kind rather than dispatched through a wrapper: `Raft::new` is
@@ -285,8 +317,8 @@ impl ConfigNode {
             background: Mutex::new(None),
             authz_denied: AtomicU64::new(0),
             authz_denied_admin: AtomicU64::new(0),
-            authn_rejected: AtomicU64::new(0),
-            authn_rejected_peer: AtomicU64::new(0),
+            authn_rejected_client: std::array::from_fn(|_| AtomicU64::new(0)),
+            authn_rejected_peer: std::array::from_fn(|_| AtomicU64::new(0)),
             retention: cfg_watch_retention,
             clock: watch.clock(),
             watch,
@@ -297,10 +329,20 @@ impl ConfigNode {
             gossip_endpoint_mismatch: AtomicU64::new(0),
             proposal_latency: OpLatencies::default(),
             read_latency: LatencyHistogram::default(),
+            peer_schemas,
+            schema_activated: AtomicBool::new(false),
+            gate_logged_at: Mutex::new(BTreeMap::new()),
         });
         inner
             .watch
-            .set_authz_ready(inner.cfg.authz_kind.is_present());
+            // Signed mode is always "ready" for the hub's purposes, because its authorizer
+            // is itself fail-closed: with no document every event is denied, and a document can
+            // arrive later without a restart. A latch set once at startup would keep denying
+            // after the document arrived (M6-27, C6R-01). The static models' latch is the truth
+            // for their whole lifetime.
+            .set_authz_ready(
+                inner.cfg.authz_kind.is_present() || inner.cfg.authz_kind.is_signed_mode(),
+            );
         inner
             .watch
             .attach(&inner.reader, Arc::clone(&inner.authorizer), span.clone());
@@ -504,6 +546,56 @@ impl ConfigNode {
         self.inner.reader.last_applied().map_or(0, |id| id.index)
     }
 
+    /// What this node advertises on all three planes (M6, ADR-0030).
+    #[must_use]
+    pub fn local_schema(&self) -> SchemaTriple {
+        self.inner.cfg.schema
+    }
+
+    /// The lowest schema any committed voter is known to have, or `None` off the leader.
+    ///
+    /// Computed from committed membership plus the peer-plane answers this node has actually
+    /// received — never from gossip, which any node can be made to say anything on (M6-102,
+    /// OQ-63). **Voters only**: a learner that lags the cluster's schema must not hold a
+    /// feature back, or M5's learner-replacement flow could never run during an upgrade
+    /// (M6-88).
+    ///
+    /// `None` off the leader, because only a leader calls every voter; see the field docs on
+    /// [`HealthPayload::cluster_min_schema`].
+    #[must_use]
+    pub fn cluster_min_schema(&self) -> Option<SchemaTriple> {
+        self.inner.cluster_min_schema()
+    }
+
+    /// Refuse `cmd` unless every committed voter can decode it (M6-90..M6-92, ADR-0030 A7).
+    ///
+    /// Called on the propose path, before `client_write`, and **never** at apply time: once an
+    /// entry is committed, a voter that cannot decode it has no recovery — it can neither skip
+    /// it nor read it. That asymmetry is the whole reason the gate is a safety property rather
+    /// than an optimisation.
+    pub fn schema_gate(&self, cmd: &Command) -> Result<(), ConfigError> {
+        self.inner.schema_gate(cmd)
+    }
+
+    /// Propose `cmd` with the schema gate **skipped** — harness only (test-plan row M6-101).
+    ///
+    /// Behind the `testing` feature, which `config-server` never enables, so a released daemon
+    /// does not contain this function at all. It exists because M6-101 has to reach a state no
+    /// supported path can produce: a committed entry the gate would have refused. That entry is
+    /// the thing [`ConfigNode::schema_gate`] exists to prevent, and the only honest way to show
+    /// why apply cannot be the place to stop it is to put one there and watch apply take it.
+    #[cfg(feature = "testing")]
+    pub async fn propose_skipping_the_schema_gate(&self, cmd: Command) -> Result<(), ConfigError> {
+        self.inner
+            .raft
+            .client_write(cmd)
+            .await
+            .map(|_| ())
+            .map_err(|e| ConfigError::Unavailable {
+                reason: e.to_string(),
+            })
+    }
+
     /// The deterministic hash of applied replicated state (test plan TA-2). Two nodes with
     /// the same applied prefix hash identically.
     pub fn state_hash(&self) -> [u8; 32] {
@@ -602,7 +694,9 @@ impl ConfigNode {
             applied_commands: m.applied_commands,
             durability: inner.storage.durability(),
             ready: inner.is_ready(),
-            authz_kind: inner.cfg.authz_kind,
+            authz_kind: inner.authz_kind(),
+            schema: inner.cfg.schema,
+            cluster_min_schema: inner.cluster_min_schema(),
             transport_security: inner.cfg.transport_security,
             policy: inner.policy_summary(),
             restored_from: inner.reader.restored_from(),
@@ -678,6 +772,8 @@ impl ConfigNode {
             disk_free_bytes: None,
             cert_expiry_seconds: BTreeMap::new(),
             backup_age_seconds: None,
+            authn_rejected_transport: Vec::new(),
+            tls: None,
             pagination: None,
             policy: None,
         }
@@ -701,8 +797,12 @@ impl ConfigNode {
     /// problems with different fixes.
     /// Records the **client-plane** share only; the peer plane's `identity_retired` fence is
     /// counted inside the engine, where that check lives.
-    pub fn record_authn_rejection(&self) {
-        self.inner.authn_rejected.fetch_add(1, Ordering::Relaxed);
+    ///
+    /// `reason` is a closed set rather than a string because it becomes a metric label, and a
+    /// label fed from an error message grows a new time series every time a dependency rewords
+    /// one (ADR-0026).
+    pub fn record_authn_rejection(&self, reason: AuthnRejectReason) {
+        self.inner.authn_rejected_client[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one admin-plane refusal by the `[authz] admins` allowlist (ADR-0023, C5B-15).
@@ -727,7 +827,14 @@ impl ConfigNode {
             watch_resumption: WatchResumption::Retained {
                 compact_revision_visible: true,
             },
-            authz: self.inner.cfg.authz_kind.into(),
+            // The live model and the live version, not the startup snapshot: a signed node
+            // that adopted its first document after boot advertises `SignedPolicy` with that
+            // version, and one that lost its document advertises no version. A capability that
+            // can lie is worse than no capability at all (ADR-0016, M6-38, C6R-04).
+            authz: self
+                .inner
+                .authz_kind()
+                .to_capability(self.inner.authorizer.policy_version()),
             transport_security: self.inner.cfg.transport_security,
             pagination: Pagination::Unsupported,
             // M5: reported from the enforced limits, never from a build flag - a node whose
@@ -1057,6 +1164,7 @@ impl NodeInner {
     fn metrics(&self) -> NodeMetrics {
         let m = self.raft.metrics().borrow().clone();
         let membership = m.membership_config;
+        let authn_rejected_by_reason = self.authn_rejections();
         NodeMetrics {
             node_id: NodeId(m.id),
             role: role_of(m.state),
@@ -1073,9 +1181,35 @@ impl NodeInner {
             millis_since_quorum_ack: m.millis_since_quorum_ack,
             authz_denied: self.authz_denied.load(Ordering::Relaxed),
             authz_denied_admin: self.authz_denied_admin.load(Ordering::Relaxed),
-            authn_rejected: self.authn_rejected.load(Ordering::Relaxed),
-            authn_rejected_peer: self.authn_rejected_peer.load(Ordering::Relaxed),
+            authn_rejected: authn_rejected_by_reason
+                .iter()
+                .map(|(_, _, count)| count)
+                .sum(),
+            authn_rejected_by_reason,
         }
+    }
+
+    /// Every engine-counted authentication rejection as `(plane, reason, count)`.
+    ///
+    /// Both planes and every reason, including the ones at zero: the exporter needs a sample
+    /// for a reason that has never fired, or a `rate()` over a healthy window returns nothing
+    /// at all and a dashboard draws a gap where a flat line belongs.
+    fn authn_rejections(&self) -> Vec<(&'static str, AuthnRejectReason, u64)> {
+        [
+            ("client", &self.authn_rejected_client),
+            ("peer", &self.authn_rejected_peer),
+        ]
+        .into_iter()
+        .flat_map(|(plane, counters)| {
+            AuthnRejectReason::ALL.into_iter().map(move |reason| {
+                (
+                    plane,
+                    reason,
+                    counters[reason.index()].load(Ordering::Relaxed),
+                )
+            })
+        })
+        .collect()
     }
 
     /// The policy this node holds, as the health payload reports it (M3-42).
@@ -1085,9 +1219,12 @@ impl NodeInner {
     /// count for one of those would be the exact "looks guarded, is not" reading ADR-0016
     /// exists to prevent.
     fn policy_summary(&self) -> PolicySummary {
-        let kind = self.cfg.authz_kind;
+        let kind = self.authz_kind();
         PolicySummary {
-            kind: kind.into(),
+            // The live version, exactly as `capabilities()` reports it: the summary's whole job
+            // is to answer "are these processes enforcing the same policy?" across a fleet,
+            // and a `None` on a node that holds a document answers a different one (C6R-04).
+            kind: kind.to_capability(self.authorizer.policy_version()),
             grants: match kind {
                 crate::AuthzKind::StaticAllowlist => self.cfg.policy_grants,
                 _ => 0,
@@ -1461,6 +1598,13 @@ impl NodeInner {
     /// Replicate `RetireNode` and check that the state machine actually retired the id.
     async fn propose_retire(&self, node_id: NodeId) -> Result<(), AdminError> {
         let cmd = Command::RetireNode { node_id };
+        // M6-91: the whole operation is refused rather than half-performed. `RemoveNodes` has
+        // already been proposed by the caller, so a gate that let the fence through only
+        // sometimes would leave an id out of membership but still able to talk.
+        self.schema_gate(&cmd)
+            .map_err(|e| AdminError::Unavailable {
+                reason: e.to_string(),
+            })?;
         match tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await {
             // The fence may or may not have committed. Reporting it as retryable is correct
             // *because* `RetireNode` is idempotent: re-issuing it changes nothing.
@@ -1549,11 +1693,29 @@ impl NodeInner {
         self.hint_for(NodeId(leader))
     }
 
+    /// The authorization model in force **right now**.
+    ///
+    /// [`crate::NodeConfig::authz_kind`] records what the node was *wired* with, which for signed
+    /// mode is only a startup snapshot: a node that booted with no valid document adopts one the
+    /// moment the loader finds it, and must then become ready without a restart (M6-27). Signed
+    /// mode therefore reads presence from the authorizer, the only thing that knows whether a
+    /// document is in force; every other model is fixed by the configuration (C6R-01).
+    fn authz_kind(&self) -> AuthzKind {
+        if !self.cfg.authz_kind.is_signed_mode() {
+            return self.cfg.authz_kind;
+        }
+        if self.authorizer.policy_version().is_some() {
+            AuthzKind::SignedPolicy
+        } else {
+            AuthzKind::NoValidPolicy
+        }
+    }
+
     /// Whether this node will serve client traffic at all: membership known, storage not
     /// poisoned, and an authorization model actually in force (OQ-19).
     fn is_ready(&self) -> bool {
         !self.is_stopped()
-            && self.cfg.authz_kind.is_present()
+            && self.authz_kind().is_present()
             && !self.storage.is_poisoned()
             && self.committed_membership().is_formed()
     }
@@ -1572,9 +1734,10 @@ impl NodeInner {
                 reason: format!("raft core stopped: {fatal}"),
             };
         }
-        if !self.cfg.authz_kind.is_present() {
+        let authz_kind = self.authz_kind();
+        if !authz_kind.is_present() {
             return Health::Unavailable {
-                reason: format!("authorization policy is {}", self.cfg.authz_kind),
+                reason: format!("authorization policy is {authz_kind}"),
             };
         }
         if self.storage.is_poisoned() {
@@ -1648,12 +1811,12 @@ impl NodeInner {
         action: Action,
         key_or_prefix: &[u8],
     ) -> Result<(), ConfigError> {
-        let decision = if self.cfg.authz_kind.is_present() {
+        let authz_kind = self.authz_kind();
+        let decision = if authz_kind.is_present() {
             self.authorizer.authorize(principal, action, key_or_prefix)
         } else {
             Decision::deny(format!(
-                "node is not ready to authorize: policy is {}",
-                self.cfg.authz_kind
+                "node is not ready to authorize: policy is {authz_kind}"
             ))
         };
         config_core::audit(
@@ -1661,12 +1824,24 @@ impl NodeInner {
             action,
             key_or_prefix,
             &decision,
-            self.cfg.authz_kind.into(),
+            authz_kind.to_capability(self.authorizer.policy_version()),
         );
         match decision {
             Decision::Allow => Ok(()),
             Decision::Deny { reason } => {
                 self.authz_denied.fetch_add(1, Ordering::Relaxed);
+                // A signed-mode node holding no valid document is *declining traffic*, not
+                // deciding that this principal may not do this — it has no document to decide
+                // from. `PermissionDenied` would tell the client its identity is wrong and to
+                // stop retrying, when the correct reading is "ask another node, or wait for the
+                // document" (ADR-0027, M6-25). The static models keep M3's `PermissionDenied`:
+                // there the operator configured something and got it wrong, which is a decision.
+                // The counter increments either way; the refusal happened at this seam.
+                if authz_kind == AuthzKind::NoValidPolicy {
+                    return Err(ConfigError::Unavailable {
+                        reason: format!("no valid policy in force ({reason})"),
+                    });
+                }
                 Err(ConfigError::PermissionDenied {
                     detail: format!(
                         "principal {:?} may not {:?} key_hex={} ({reason})",
@@ -1729,6 +1904,10 @@ impl NodeInner {
         // Before replication, so the entry is already labelled when the apply path (which runs
         // on OpenRaft's own state-machine task, outside this span) reaches it, and when the
         // replication task builds the `AppendEntries` that carries it to the followers.
+        // OQ-64: a dedup-bearing mutation is refused, never applied without its record. A
+        // client that was told "applied" would believe it holds a retained request identity it
+        // does not hold, and would resubmit on the strength of it (ADR-0015, §16).
+        self.schema_gate(&cmd)?;
         if let Some(trace) = TraceContext::current() {
             self.traces.record(&cmd, &trace.trace_id);
         }
@@ -1985,6 +2164,7 @@ impl NodeInner {
             up_to_revision,
             dedup_trim_below: None,
         };
+        self.schema_gate(&cmd)?;
         match tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await {
             Err(_) => Err(ConfigError::DeadlineExceededUnknownOutcome),
             Ok(Ok(resp)) => match resp.data {
@@ -2102,11 +2282,126 @@ impl NodeInner {
             up_to_revision: up_to,
             dedup_trim_below,
         };
+        // M6-90: retention is simply not enforced while the gate is shut. The journal then
+        // grows within the budget its own admission control already polices and alerts on,
+        // which is the honest failure — a silently-skipped compaction would be an unbounded
+        // resource with nothing to show for it.
+        if self.schema_gate(&cmd).is_err() {
+            return;
+        }
         if let Ok(Err(e)) =
             tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await
         {
             tracing::warn!(up_to, error = %e, "compaction proposal failed");
         }
+    }
+
+    /// The lowest schema any committed voter is known to have (M6-R4, OQ-63, M6-88).
+    fn cluster_min_schema(&self) -> Option<SchemaTriple> {
+        if self.metrics().role != NodeRole::Leader {
+            return None;
+        }
+        let voters = self.committed_membership().voters;
+        // `min` over observed triples, so the answer is always a schema some voter actually
+        // has. A field-wise blend could describe a build that does not exist and claim support
+        // no voter has.
+        voters.iter().map(|v| self.peer_schemas.get(*v)).min()
+    }
+
+    /// The highest `command_schema` this node's own applied state has ever carried.
+    ///
+    /// Durable and monotonic (ADR-0030 ruling M6-R15): a state machine that applied a
+    /// schema-2 entry has proved it decodes that generation, and nothing later can make that
+    /// untrue. Read from the state machine rather than cached, because a snapshot install can
+    /// raise it without this process applying anything.
+    fn max_applied_command_schema(&self) -> u16 {
+        let mut out: u16 = config_core::COMMAND_SCHEMA_V1;
+        self.reader
+            .with_state(&mut |s| out = s.max_applied_command_schema());
+        out
+    }
+
+    /// Refuse a command no committed voter set can carry yet (ADR-0030 A7).
+    fn schema_gate(&self, cmd: &Command) -> Result<(), ConfigError> {
+        let Some(gate) = command_gate(cmd) else {
+            return Ok(());
+        };
+        // Ruling M6-R15. Activation is a property of the *replicated state*, not of who is
+        // answering right now: once an entry of this generation is in the applied state, every
+        // voter that has it has already decoded it, and a voter that has not is fenced by its
+        // own decode refusal when it returns. Checking this first is what stops one voter going
+        // down after a failover from turning into a write outage — the unreachable voter is
+        // unknown, an unknown voter reads as the oldest schema, and that would otherwise
+        // re-gate a cluster that has been using the feature for weeks.
+        if self.max_applied_command_schema() >= gate.command_schema {
+            return Ok(());
+        }
+        // Off the leader there is no minimum to judge against, and the proposal is about to be
+        // refused by Raft with a leader hint — a strictly more useful answer than a gate
+        // verdict computed from the one peer a follower ever hears from.
+        let Some(min) = self.cluster_min_schema() else {
+            return Ok(());
+        };
+        if min.command_schema >= gate.command_schema {
+            return Ok(());
+        }
+        self.note_feature_gated(gate.feature, min);
+        Err(ConfigError::Unavailable {
+            reason: UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string(),
+        })
+    }
+
+    /// Log a refusal once per window per feature (M6-90, M6-123).
+    ///
+    /// A "window" is a period over which the computed minimum does not move: a second line at
+    /// the same minimum tells an operator nothing the first did not, and the gate sits on the
+    /// retention timer's path, which fires forever. Keyed on the value rather than on a clock
+    /// so the rate limit is deterministic and needs no timer of its own.
+    fn note_feature_gated(&self, feature: &'static str, min: SchemaTriple) {
+        let mut logged = self
+            .gate_logged_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if logged.insert(feature, min.command_schema) == Some(min.command_schema) {
+            return;
+        }
+        drop(logged);
+        tracing::warn!(
+            feature,
+            cluster_min_schema = min.command_schema,
+            schema = self.cfg.schema.command_schema,
+            "feature_gated"
+        );
+    }
+
+    /// Latch and announce activation exactly once per process (M6-96, M6-100, M6-123).
+    ///
+    /// Sampled by the background ticker rather than by the gate: activation is a fact about the
+    /// voter set, and an operator must see it when the last old voter is replaced, not only
+    /// when something later happens to want a gated feature.
+    fn sample_schema_activation(&self) {
+        let Some(min) = self.cluster_min_schema() else {
+            return;
+        };
+        // Either route into the announcement, matching the gate: the durable watermark is the
+        // same proof of activation there and here (M6-R15).
+        if min.command_schema < CURRENT_SCHEMA.command_schema
+            && self.max_applied_command_schema() < CURRENT_SCHEMA.command_schema
+        {
+            return;
+        }
+        if self
+            .schema_activated
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        tracing::info!(
+            schema = self.cfg.schema.command_schema,
+            cluster_min_schema = min.command_schema,
+            voters = self.committed_membership().voters.len(),
+            "feature_activated"
+        );
     }
 
     /// Sample the leader this node believes in, counting a transition (ADR-0026).
@@ -2309,6 +2604,7 @@ async fn background_loop(
                 let Some(node) = inner.upgrade() else { return };
                 node.poll_gossip();
                 node.sample_leader();
+                node.sample_schema_activation();
             }
             changed = metrics.changed() => {
                 if changed.is_err() {
@@ -2343,6 +2639,10 @@ async fn background_loop(
 
 #[async_trait]
 impl PeerSink for NodeInner {
+    fn local_schema(&self) -> SchemaTriple {
+        self.cfg.schema
+    }
+
     async fn handle(
         &self,
         meta: PeerEnvelopeMeta,
@@ -2381,10 +2681,10 @@ impl PeerSink for NodeInner {
                 rpc = req.kind(),
                 "peer_identity_rejected"
             );
-            // Both: `authn_rejected` stays the whole-node total `/health` reports, and the
-            // peer counter is what lets the exporter say `plane="peer"` and mean it.
-            self.authn_rejected.fetch_add(1, Ordering::Relaxed);
-            self.authn_rejected_peer.fetch_add(1, Ordering::Relaxed);
+            // The peer array, so the exporter can say `plane="peer"` and mean it. The total
+            // `/health` reports is the sum over both arrays, so this one add is enough.
+            self.authn_rejected_peer[AuthnRejectReason::IdentityRetired.index()]
+                .fetch_add(1, Ordering::Relaxed);
             return Err(PeerReject::Retired { node_id: meta.from });
         }
         if self.is_stopped() {

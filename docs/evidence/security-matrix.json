@@ -10,20 +10,20 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "33b5f4be7de0e1bb2ed68f5b9adc1a59a250bc75",
+    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T10:12:23Z",
-    "duration_ms": 910,
+    "utc": "2026-09-19T19:20:11Z",
+    "duration_ms": 800,
     "seed": 27958,
     "scale_factor": 0.3333333333333333,
     "full_scale": false
   },
   "values": {
-    "cases_driven": 7,
+    "cases_driven": 8,
     "cases_enumerated": 12,
     "membership_unchanged": true,
     "repeats": 1,
@@ -32,20 +32,21 @@
         "case": "wrong_node_id",
         "driven": true,
         "outcome": "refused or ignored; nothing written",
-        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-6mRGYG\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=07070707070707070707070707070707 epoch=1 node=99]",
+        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-fNujpc\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=07070707070707070707070707070707 epoch=1 node=99]",
         "repeat": 0
       },
       {
         "case": "wrong_cluster_id",
         "driven": true,
         "outcome": "refused or ignored; nothing written",
-        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-6mRGYG\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=abababababababababababababababab epoch=1 node=3]",
+        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-fNujpc\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=abababababababababababababababab epoch=1 node=3]",
         "repeat": 0
       },
       {
         "case": "wrong_cert_identity",
-        "driven": false,
-        "reason": "driven by the M3 peer-plane rows (m3_peer_mtls.rs, m3_client_mtls.rs) against a mutual-TLS cluster; this row records the case rather than duplicating a suite that already owns it",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "refused on the peer plane: reason=untrusted_client_ca, delta=1",
         "repeat": 0
       },
       {
@@ -77,7 +78,7 @@
       {
         "case": "gossip_key_rotation",
         "driven": false,
-        "reason": "ADR-0028 rotation lands with dev-rotation in wave 3",
+        "reason": "this row's cluster runs unencrypted gossip, which has no keyring to rotate; `m6_110_evidence_security_matrix_gossip` owns the encrypted one",
         "repeat": 0
       },
       {
@@ -90,7 +91,7 @@
       {
         "case": "version_skew",
         "driven": false,
-        "reason": "ADR-0030 schema gating lands with dev-compat in wave 2",
+        "reason": "driven by `m6_111_evidence_security_matrix_version_skew`, which needs two                  purpose-built clusters of its own; this row records the case rather than                  rebuilding them inside the matrix",
         "repeat": 0
       },
       {

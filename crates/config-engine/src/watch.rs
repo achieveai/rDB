@@ -41,6 +41,7 @@ use config_core::{
     Action, Authorizer, ConfigError, LeaderHint, MutationEvent, Principal, WatchItem, WatchLimits,
     WatchRequest, WatchStream,
 };
+use config_log::TraceContext;
 use config_storage::{AppliedBatch, AppliedBatchSink, StateReader};
 use futures_core::Stream;
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -223,7 +224,7 @@ pub mod testing {
     use super::{HookSlot, WatchHub};
     use std::sync::Arc;
 
-    /// The four release points a test may park a registration at.
+    /// The five release points a test may park a registration at.
     ///
     /// They are crossed in this order, exactly once each, per registration.
     /// `BeforeHighWater` and `AfterRegister` are **inside** the serialized journal gate —
@@ -244,6 +245,15 @@ pub mod testing {
         BeforeReplay,
         /// Outside the gate, before buffered live items above `H` are drained.
         BeforeLiveDrain,
+        /// Outside the gate, inside the live loop: a batch has been **received** and none of
+        /// its events has been offered to the queue yet.
+        ///
+        /// The one point at which "this stream holds events it is entitled to, and the policy
+        /// then moves" is a fact rather than a race. Parking at [`GateHook::BeforeLiveDrain`]
+        /// instead leaves the delivery task in `select!`, where the rotation's own arm and the
+        /// receive arm are both ready and the winner is chosen at random — so a missing
+        /// enqueue-path check survives roughly a third of runs (C6R-08).
+        BeforeLiveSend,
     }
 
     /// A token proving a hook was armed, returned by [`GateHandle::pause`].
@@ -291,6 +301,15 @@ pub mod testing {
             self.slot(pass.0).release();
         }
 
+        /// The current watch policy epoch, which every `on_policy_change` increments.
+        ///
+        /// The only way to state "this reload revoked nothing": a stale or byte-identical
+        /// document on disk must leave the epoch exactly where it was, however many times the
+        /// poller re-reads it (C6R-03).
+        pub fn policy_epoch(&self) -> u64 {
+            self.hub.policy_tx.borrow().epoch
+        }
+
         /// How many times `hook` has been crossed, parked or not.
         pub fn count(&self, hook: GateHook) -> u64 {
             self.slot(hook).crossed()
@@ -302,6 +321,7 @@ pub mod testing {
                 GateHook::AfterRegister => &self.hub.hooks.after_register,
                 GateHook::BeforeReplay => &self.hub.hooks.before_replay,
                 GateHook::BeforeLiveDrain => &self.hub.hooks.before_live_drain,
+                GateHook::BeforeLiveSend => &self.hub.hooks.before_live_send,
             }
         }
     }
@@ -416,6 +436,7 @@ struct Hooks {
     after_register: HookSlot,
     before_replay: HookSlot,
     before_live_drain: HookSlot,
+    before_live_send: HookSlot,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1009,7 +1030,20 @@ impl WatchHub {
         let (tx, rx) = mpsc::channel(self.limits.queue_events.max(1) as usize);
         let occupancy = Arc::new(AtomicU64::new(0));
 
-        attached.span.in_scope(|| {
+        // The node span was built at `ConfigNode::start` with no caller above it, so entering
+        // it *replaces* the request scope instead of extending it: both lifecycle lines then
+        // came out with no `trace_id` and the stream a client opened could not be joined to
+        // the trace that opened it (M4-120). The caller's context is still current here —
+        // `ConfigStore::watch` runs instrumented by the plane that accepted the request — so
+        // it is read now and re-declared on a child of the node span. Same hop, same ids:
+        // node-level fields and the caller's trace both survive. No context (a direct
+        // library call, or a foreign subscriber) leaves the previous behaviour untouched.
+        let stream_span = match TraceContext::current() {
+            Some(ctx) => attached.span.in_scope(|| ctx.span("watch")),
+            None => attached.span.clone(),
+        };
+
+        stream_span.in_scope(|| {
             tracing::info!(
                 principal = %principal.name,
                 prefix_hex = %prefix_hex(&prefix),
@@ -1041,7 +1075,7 @@ impl WatchHub {
             last_revision: start_after,
             _admission: admission,
         };
-        tokio::spawn(task.run().instrument_with(attached.span.clone()));
+        tokio::spawn(task.run().instrument_with(stream_span));
 
         Ok(Box::pin(QueueStream { rx, occupancy }))
     }
@@ -1298,6 +1332,11 @@ impl Delivery {
                 }
                 received = self.receiver.recv() => match received {
                     Ok(batch) => {
+                        // A no-op outside tests. Crossed after the batch is in hand and
+                        // before any of it is offered to the queue, so a test can move the
+                        // policy underneath a stream that provably already holds the events
+                        // (M6-31, C6R-08).
+                        self.hub.hooks.before_live_send.cross().await;
                         for event in &batch.events {
                             // The exact replay/live boundary: replay covered `(R, H]`, so
                             // anything at or below `H` was already delivered from the

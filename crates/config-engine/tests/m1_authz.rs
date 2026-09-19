@@ -290,7 +290,7 @@ async fn m3_81_denials_and_authentication_rejections_are_counted_separately() {
         .expect("reads are allowed");
     assert_eq!(node.metrics().authz_denied, 1);
 
-    node.record_authn_rejection();
+    node.record_authn_rejection(config_engine::AuthnRejectReason::NoUsableIdentity);
     assert_eq!(node.metrics().authn_rejected, 1);
     assert_eq!(
         node.metrics().authz_denied,

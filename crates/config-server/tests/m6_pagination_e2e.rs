@@ -105,6 +105,7 @@ async fn e2e_m6_wiring_a_pinned_walk_returns_every_key_once_and_ignores_a_mid_wa
         list: Some(ListTuning {
             max_pinned_snapshots: 4,
             ttl_seconds: 60,
+            token_key_file: None,
         }),
         ..harness.node_options()
     };

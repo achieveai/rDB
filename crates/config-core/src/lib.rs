@@ -40,6 +40,7 @@ pub mod hint;
 pub mod identity;
 pub mod limits;
 pub mod policy;
+pub mod schema;
 pub mod state;
 pub mod store;
 pub mod types;
@@ -71,6 +72,10 @@ pub use policy::{
     changed_prefixes, evaluate_converging, verify_policy, Adoption, PolicyDocument, PolicyRejected,
     PolicySignature, PolicyState, SignedPolicy, SignedPolicyAuthorizer, VerifyingKey,
     REASON_NO_VALID_POLICY,
+};
+pub use schema::{
+    command_gate, GateRequirement, SchemaError, SchemaTriple, COMMAND_SCHEMA_V1, COMMAND_SCHEMA_V2,
+    COMPAT_SCHEMA_1, CURRENT_SCHEMA, FEATURE_COMPACT, FEATURE_DEDUP, FEATURE_RETIRE_NODE,
 };
 pub use state::{
     dedup_index_key_from_storage, dedup_storage_key, ApplyEffects, DedupIndexKey, DedupRecord,

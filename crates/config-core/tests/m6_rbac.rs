@@ -552,6 +552,55 @@ fn m6_19_unchanged_prefixes_are_unaffected_during_convergence() {
     );
 }
 
+/// M6-17, three hops: the baseline a converging node narrows against is the **oldest** document
+/// it has not yet retired, not merely the one going out of force (C6R-07).
+///
+/// v7 -> v8 -> v9 inside one convergence window. `/grow/` is denied by v7, granted by v8, and
+/// untouched between v8 and v9 — so `changed_prefixes(v8, v9)` is empty. A node that kept only v8
+/// as its baseline would evaluate `/grow/` against v9 alone and allow it, while a voter still on
+/// v7 denies it: exactly the early expansion §15.3 forbids. A 10 s poll against a 30 s
+/// convergence objective makes two adoptions in one window an ordinary occurrence, not a corner.
+#[config_log::retcd_test]
+fn m6_17_chained_adoptions_narrow_against_the_oldest_unconverged_document() {
+    let ops = signing_key(1);
+    let authorizer = SignedPolicyAuthorizer::new(false);
+    let v7 = doc(7, &[("app", "/same/")], &["root"]);
+    let v8 = doc(8, &[("app", "/same/"), ("app", "/grow/")], &["root"]);
+    // Identical grants to v8: only the version and the issue time move.
+    let v9 = doc(9, &[("app", "/same/"), ("app", "/grow/")], &["root"]);
+    assert!(
+        changed_prefixes(&v8, &v9).is_empty(),
+        "the second hop must change no prefix, or the row proves nothing about the baseline"
+    );
+
+    adopt(&authorizer, &v7, &ops).expect("v7 adopts");
+    adopt(&authorizer, &v8, &ops).expect("v8 adopts");
+    adopt(&authorizer, &v9, &ops).expect("v9 adopts");
+
+    assert!(authorizer.is_converging(), "no voter has reported v9 yet");
+    assert_eq!(
+        deny_reason(&authorizer.authorize(&app(), Action::Write, b"/grow/k")),
+        REASON_POLICY_CONVERGING,
+        "a grant introduced by v8 must not take effect before the cluster has left v7"
+    );
+    // The unchanged prefix is untouched throughout: the baseline widens the blast radius to
+    // what actually changed since v7, not to the whole document.
+    assert!(allowed(&authorizer.authorize(
+        &app(),
+        Action::Read,
+        b"/same/k"
+    )));
+
+    assert!(
+        authorizer.note_cluster_min_version(Some(9)),
+        "the last voter's report completes convergence"
+    );
+    assert!(
+        allowed(&authorizer.authorize(&app(), Action::Write, b"/grow/k")),
+        "once every voter is on v9 the new grant takes effect"
+    );
+}
+
 /// M6-21: convergence completes when the last voter reports, exactly once, and the narrowing
 /// ends — `/new/` opens and `/old/` stays closed.
 #[config_log::retcd_test]

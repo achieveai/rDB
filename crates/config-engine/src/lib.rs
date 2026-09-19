@@ -57,9 +57,9 @@ pub use hint::{
     REASON_EPOCH_MISMATCH, REASON_NOT_FORMED, REASON_SELF_CLAIM, REASON_UNKNOWN_NODE,
 };
 pub use metrics::{
-    Health, HealthPayload, HistogramSnapshot, LatencyHistogram, LogIdView, MembershipView,
-    MetricsReport, NodeMetrics, NodeRole, OpLatencies, PolicyMetrics, PolicySummary,
-    LATENCY_BUCKETS_SECONDS,
+    AuthnRejectReason, Health, HealthPayload, HistogramSnapshot, LatencyHistogram, LogIdView,
+    MembershipView, MetricsReport, NodeMetrics, NodeRole, OpLatencies, PolicyMetrics,
+    PolicySummary, TlsMetrics, LATENCY_BUCKETS_SECONDS,
 };
 pub use netfault::NetFault;
 pub use node::ConfigNode;

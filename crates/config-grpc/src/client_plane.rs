@@ -22,6 +22,7 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use config_core::{ClusterId, ConfigError, ConfigStore, Limits, Principal};
+use config_engine::AuthnRejectReason;
 use config_log::TraceContext;
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
@@ -59,7 +60,13 @@ pub trait ClientBackend: Send + Sync {
     /// It is *not* an authorization denial: no principal was derived, so no `Authorizer` was
     /// consulted and no audit line was written. The default does nothing, which is right for a
     /// backend with nothing to count.
-    fn record_authn_rejection(&self) {}
+    ///
+    /// `reason` becomes the `reason` label on `retcd_authn_rejected_total` (ADR-0026), which is
+    /// why it is a closed enum and not the status message: a label fed from a message grows a
+    /// new time series every time the message is reworded.
+    fn record_authn_rejection(&self, reason: AuthnRejectReason) {
+        let _ = reason;
+    }
 }
 
 impl<F> ClientBackend for F
@@ -135,7 +142,11 @@ impl ConfigSvc {
         let principal = match self.principal(&request) {
             Ok(principal) => principal,
             Err(status) => {
-                self.backend.record_authn_rejection();
+                // The handshake succeeded — this caller's certificate verified — and the
+                // certificate still carries no identity this listener will accept. Handshake
+                // failures never reach here; the listener counts those (ADR-0028).
+                self.backend
+                    .record_authn_rejection(AuthnRejectReason::NoUsableIdentity);
                 span.in_scope(|| {
                     tracing::warn!(
                         rpc = op,
@@ -310,8 +321,7 @@ pub fn serve_client_plane(
         server_span: tracing::Span::current(),
     };
     let cap = client_plane_message_limit(&limits);
-    let router = tls
-        .apply_server(tonic::transport::Server::builder())?
+    let router = tonic::transport::Server::builder()
         .add_service(
             ConfigServiceServer::new(svc)
                 .max_decoding_message_size(cap)
@@ -321,5 +331,5 @@ pub fn serve_client_plane(
         // certificate profile, same cluster binding, one more allowlist (M5, OQ-43).
         // `None` leaves the port exactly as it was before M5.
         .add_optional_service(admin);
-    spawn("client", router, listener)
+    spawn("client", router, listener, &tls)
 }

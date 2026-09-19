@@ -48,7 +48,7 @@ use std::time::Duration;
 use config_core::{
     AllowAll, Authorizer, Capabilities, ClusterId, ClusterIdentity, ConfigStore, Durability,
     GossipObservationSource, Limits, Liveness, NodeId, ObservedPeerHint, Principal, RecoveryEpoch,
-    StaticAllowlist, WatchRequest, WatchRetention,
+    SchemaTriple, StaticAllowlist, WatchRequest, WatchRetention,
 };
 use config_engine::watch::testing::GateHandle;
 use config_engine::{
@@ -99,6 +99,7 @@ impl StorageKind {
             StorageKind::Rocks(spec) => Some(RocksOptions {
                 sync_writes: spec.sync_writes,
                 create_if_missing,
+                ..RocksOptions::DEFAULT
             }),
         }
     }
@@ -358,6 +359,37 @@ pub struct ClusterConfig {
     ///
     /// Only meaningful for a persistent [`StorageKind`].
     pub data_dirs: BTreeMap<NodeId, PathBuf>,
+
+    /// Nodes that run at an older schema than this build (ADR-0030, test plan §6).
+    ///
+    /// A node absent from the map runs at [`config_core::CURRENT_SCHEMA`]. This is how a
+    /// mixed-version cluster is assembled in CI without a second binary: the pinned node
+    /// advertises the older triple, refuses to decode a command that needs the newer one, and
+    /// refuses to open a store past its ceiling — which is every behaviour a real old build
+    /// would show.
+    ///
+    /// Shared and mutable because a rolling upgrade *is* the change of this map: the row
+    /// rewrites one entry and restarts that node, which is precisely what an operator does
+    /// with a new binary (M6-95). Use [`Cluster::set_schema`] rather than reaching in.
+    pub compat_schema: Arc<Mutex<BTreeMap<NodeId, SchemaTriple>>>,
+
+    /// The AES-256 key every node's gossip is encrypted with (M6, ADR-0028).
+    ///
+    /// `None` — the default — runs gossip in the clear, which is what every row before M6 was
+    /// written against and what a single-host test needs. A key here is the *precondition* for
+    /// a keyring: `memberlist` builds one only when there is a primary key, so without this
+    /// [`GossipNode::keyring`] is `None` and every rotation step is refused as "gossip is not
+    /// encrypted on this node". Only meaningful with [`GossipKind::Real`].
+    pub gossip_key: Option<[u8; 32]>,
+
+    /// Whether each node's mutual-TLS material is served from files on disk (M6, ADR-0028).
+    ///
+    /// `false` — the default — hands each plane the fixture's material in memory, exactly as
+    /// every row before M6 got it. `true` writes the same bytes to a per-node directory and
+    /// builds a [`config_grpc::TlsRotator`] over them, which is what makes
+    /// [`Cluster::rotate_files`] and [`Cluster::reload_tls`] possible. Inert on an insecure
+    /// cluster: there is no material to write.
+    pub tls_from_files: bool,
 }
 
 impl std::fmt::Debug for ClusterConfig {
@@ -382,6 +414,7 @@ impl Default for ClusterConfig {
         Self {
             nodes: 3,
             storage: StorageKind::Ephemeral,
+            compat_schema: Arc::new(Mutex::new(BTreeMap::new())),
             gossip: GossipKind::Disabled,
             form: true,
             limits: Limits::DEFAULT,
@@ -411,11 +444,23 @@ impl Default for ClusterConfig {
             snapshot: SnapshotConfig::DISABLED,
             promote_max_lag: config_engine::DEFAULT_PROMOTE_MAX_LAG,
             data_dirs: BTreeMap::new(),
+            gossip_key: None,
+            tls_from_files: false,
         }
     }
 }
 
 impl ClusterConfig {
+    /// The schema triple node `id` runs at.
+    pub fn schema(&self, id: NodeId) -> SchemaTriple {
+        self.compat_schema
+            .lock()
+            .expect("compat schema map poisoned")
+            .get(&id)
+            .copied()
+            .unwrap_or(config_core::CURRENT_SCHEMA)
+    }
+
     /// The Raft timers derived from [`ClusterConfig::timers`].
     pub fn raft_timers(&self) -> RaftTimers {
         RaftTimers {
@@ -484,6 +529,26 @@ impl ClusterBuilder {
     /// cluster it is given, and a node whose SAN names another cluster is rejected.
     pub fn mutual_tls(mut self, seed: u64) -> Self {
         self.cfg.tls = ClusterTls::mutual(self.cfg.cluster_id, seed);
+        self
+    }
+
+    /// Mutual TLS from a fresh fixture, served from PEM files on disk (M6, ADR-0028).
+    ///
+    /// [`ClusterBuilder::mutual_tls`] plus [`ClusterConfig::tls_from_files`]: the same material
+    /// the in-memory form serves, written to a per-node directory a rotation can rewrite. This
+    /// is the constructor every §4.1/§4.2 rotation row starts from, because
+    /// [`Cluster::rotate_files`] and [`Cluster::reload_tls`] are meaningless without files.
+    pub fn rotatable_tls(mut self, seed: u64) -> Self {
+        self.cfg.tls = ClusterTls::mutual(self.cfg.cluster_id, seed);
+        self.cfg.tls_from_files = true;
+        self
+    }
+
+    /// Encrypt gossip with `key`, giving every node a rotatable keyring (M6, ADR-0028).
+    ///
+    /// Only meaningful with [`GossipKind::Real`]: there is no keyring without a gossip node.
+    pub fn gossip_key(mut self, key: [u8; 32]) -> Self {
+        self.cfg.gossip_key = Some(key);
         self
     }
 
@@ -574,6 +639,18 @@ impl ClusterBuilder {
     /// `dir` is the caller's to create, populate and delete — see [`ClusterConfig::data_dirs`].
     pub fn data_dir(mut self, id: NodeId, dir: impl Into<PathBuf>) -> Self {
         self.cfg.data_dirs.insert(id, dir.into());
+        self
+    }
+
+    /// Run node `id` at `schema` instead of this build's own (ADR-0030, test plan §6).
+    ///
+    /// See [`ClusterConfig::compat_schema`]. Typically `config_core::COMPAT_SCHEMA_1`.
+    pub fn compat_schema(self, id: NodeId, schema: SchemaTriple) -> Self {
+        self.cfg
+            .compat_schema
+            .lock()
+            .expect("compat schema map poisoned")
+            .insert(id, schema);
         self
     }
 
@@ -794,6 +871,12 @@ struct RunningNode {
     peer_server: ServerHandle,
     client_server: ServerHandle,
     gossip: Option<Arc<GossipNode>>,
+    /// The one thing that can replace this node's TLS credentials, with both listeners and
+    /// the peer dialler registered on it (M6, ADR-0028).
+    ///
+    /// `None` unless [`ClusterConfig::tls_from_files`]: a node serving material that was never
+    /// written anywhere has nothing to re-read.
+    tls: Option<Arc<config_grpc::TlsRotator>>,
 }
 
 /// One cluster member, running or stopped, plus the identity that survives a restart.
@@ -807,6 +890,21 @@ struct NodeSlot {
     /// Where this node's persistent data lives, for `StorageKind::Rocks`. Stable across a
     /// restart — that is the whole point.
     data_dir: Option<PathBuf>,
+    /// Where this node's PEM set lives, for [`ClusterConfig::tls_from_files`].
+    ///
+    /// On the slot rather than on [`RunningNode`] for exactly the reason `data_dir` is: a
+    /// restart must come back holding the material the *operator* last wrote, not the material
+    /// the node first started with. A row that rotates files while a node is down and then
+    /// starts it (M6-52..M6-54) is that case.
+    tls_files: Option<config_grpc::TlsFiles>,
+    /// Owns the directory `tls_files` names; dropped with the slot.
+    _tls_dir: Option<Arc<tempfile::TempDir>>,
+    /// The node's gossip node, reachable from the admin backend (M6-57..M6-61).
+    ///
+    /// Shared rather than read off [`RunningNode::gossip`], because the backend is built while
+    /// the node starts and the gossip node is stood up several steps later — see
+    /// [`Cluster::start_real_gossip`].
+    gossip_node: Arc<RwLock<Option<Arc<GossipNode>>>>,
     running: Option<RunningNode>,
 }
 
@@ -816,6 +914,10 @@ struct NodeSlot {
 /// it just binds the transport-derived principal to the local node.
 struct NodeBackend {
     node: ConfigNode,
+    /// This node's rotator, when it serves material from files (M6, ADR-0028).
+    tls: Option<Arc<config_grpc::TlsRotator>>,
+    /// This node's gossip node, when one has been started.
+    gossip: Arc<RwLock<Option<Arc<GossipNode>>>>,
 }
 
 impl ClientBackend for NodeBackend {
@@ -828,8 +930,8 @@ impl ClientBackend for NodeBackend {
     /// The default is a no-op, which would leave `HealthPayload::authn_rejected` reading zero
     /// however many certificates the listener turned away — an oracle that can only ever say
     /// "fine".
-    fn record_authn_rejection(&self) {
-        self.node.record_authn_rejection();
+    fn record_authn_rejection(&self, reason: config_engine::AuthnRejectReason) {
+        self.node.record_authn_rejection(reason);
     }
 }
 
@@ -893,6 +995,82 @@ impl AdminBackend for NodeBackend {
             reason: "this harness node has no backup configuration; the backup artifact is \
                      covered by config-server's own rows"
                 .to_string(),
+        })
+    }
+
+    /// Re-read this node's PEM files and serve what they hold (M6-41, ADR-0028).
+    ///
+    /// Word for word what `config-server`'s backend does, including the `spawn_blocking` and
+    /// the `{reason}: {detail}` error shape, because M6-41's whole claim is that the RPC an
+    /// operator calls reaches the rotation a daemon would run.
+    async fn reload_tls(
+        &self,
+    ) -> Result<Vec<config_grpc::TlsPlaneReload>, config_engine::AdminError> {
+        let Some(rotator) = self.tls.clone() else {
+            return Err(config_engine::AdminError::Unavailable {
+                reason: format!(
+                    "{}: this harness node serves no TLS material from files",
+                    config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED
+                ),
+            });
+        };
+        // The blocking pool does not inherit a span, and `tls_reloaded` is emitted inside
+        // `reload`, so without this the harness's own rotation lines would land outside the
+        // running test's log file and every row that reads them would see an empty log.
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
+            rotator.reload("rpc")
+        })
+        .await
+        .map_err(|e| config_engine::AdminError::Unavailable {
+            reason: format!("the tls reload task did not complete: {e}"),
+        })?
+        .map_err(|refused| config_engine::AdminError::InvalidArgument {
+            detail: format!("{}: {refused}", refused.reason()),
+        })
+    }
+
+    /// One step of a gossip key rotation on this node (M6-57..M6-61, ADR-0028).
+    async fn rotate_gossip_key(
+        &self,
+        op: config_grpc::GossipKeyOp,
+        key_hex: &str,
+        force: bool,
+    ) -> Result<config_grpc::GossipKeyringView, config_engine::AdminError> {
+        let gossip = self
+            .gossip
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(gossip) = gossip else {
+            return Err(config_engine::AdminError::Unavailable {
+                reason: format!(
+                    "{}: this harness node runs no gossip",
+                    config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED
+                ),
+            });
+        };
+        let key = crate::rotation::parse_gossip_key(key_hex).ok_or_else(|| {
+            config_engine::AdminError::InvalidArgument {
+                detail: "invalid_gossip_key: key_hex must be 64 hex characters (an AES-256 key)"
+                    .to_string(),
+            }
+        })?;
+        let keyring = match op {
+            config_grpc::GossipKeyOp::Add => gossip.add_gossip_key(&key).await,
+            config_grpc::GossipKeyOp::Use => gossip.use_gossip_key(&key).await,
+            config_grpc::GossipKeyOp::Remove => gossip.remove_gossip_key(&key, force).await,
+        }
+        .map_err(crate::rotation::gossip_rotation_error)?;
+
+        Ok(config_grpc::GossipKeyringView {
+            primary_fingerprint: config_gossip::fingerprint_hex(keyring.primary),
+            accepted_fingerprints: keyring
+                .accepted
+                .into_iter()
+                .map(config_gossip::fingerprint_hex)
+                .collect(),
         })
     }
 }
@@ -1023,7 +1201,11 @@ impl Cluster {
                     .map(|root| root.path().join(format!("node-{}", id.0)))
             });
 
-            let transport = peer_transport_for(&cfg, id, &netfault);
+            let tls = provision_tls_files(&cfg, id);
+            let tls_files = tls.as_ref().map(|(_, files)| files.clone());
+            let gossip_node = Arc::new(RwLock::new(None));
+
+            let transport = peer_transport_for(&cfg, id, &netfault, tls_files.as_ref());
 
             let running = start_running(
                 &cfg,
@@ -1031,10 +1213,12 @@ impl Cluster {
                 &span,
                 Arc::clone(&faults),
                 Arc::clone(&gossip_source) as Arc<dyn GossipObservationSource>,
+                Arc::clone(&gossip_node),
                 transport,
                 peer_listener,
                 client_listener,
                 data_dir.as_deref(),
+                tls_files.as_ref(),
                 Duration::ZERO,
                 cfg.gossip_poll,
             )
@@ -1051,6 +1235,9 @@ impl Cluster {
                     faults,
                     gossip_source,
                     data_dir,
+                    tls_files,
+                    _tls_dir: tls.map(|(dir, _)| dir),
+                    gossip_node,
                     running: Some(running),
                 },
             );
@@ -1127,6 +1314,18 @@ impl Cluster {
                 "127.0.0.1:0".parse().expect("loopback ephemeral addr"),
             );
             gcfg.seeds = seeds.clone();
+            // A keyring exists only where there is a primary key, so this is the whole of what
+            // makes M6-57..M6-61 possible (ADR-0028). `GossipNode::start` derives the
+            // advertised fingerprints from the keyring it builds, so nothing else is wired.
+            gcfg.secret_key = self.cfg.gossip_key;
+            // Advisory, exactly as the daemon advertises it (ADR-0030 M6-85).
+            gcfg.extras = Some(config_gossip::HintExtras {
+                schema: Some(self.cfg.schema(id)),
+                accepted_gossip_keys: None,
+                // As the daemon advertises it at gossip start: this cluster runs no policy
+                // loader, so nothing here ever re-advertises a version (C6R-02).
+                policy_version: None,
+            });
             let hint = ObservedPeerHint {
                 cluster_id: identity.cluster_id,
                 recovery_epoch: identity.recovery_epoch,
@@ -1153,8 +1352,17 @@ impl Cluster {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(Arc::clone(&node) as Arc<dyn GossipObservationSource>);
             let mut slots = self.lock();
-            if let Some(running) = slots.get_mut(&id).and_then(|s| s.running.as_mut()) {
-                running.gossip = Some(node);
+            if let Some(slot) = slots.get_mut(&id) {
+                // Two homes, one value: `RunningNode` owns the shutdown, and the slot's handle
+                // is what the admin backend reads — it was built before this node existed
+                // (M6-57..M6-61).
+                *slot
+                    .gossip_node
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&node));
+                if let Some(running) = slot.running.as_mut() {
+                    running.gossip = Some(node);
+                }
             }
         }
     }
@@ -1500,6 +1708,18 @@ impl Cluster {
         self.node(id).state_hash()
     }
 
+    /// Node `id`'s live [`GossipNode`], when the cluster was built with [`GossipKind::Real`].
+    ///
+    /// Exposed for the one row that has to read what is *advertised* rather than what the
+    /// observation source reports (ADR-0030 M6-85): the source returns decoded hints, and the
+    /// question there is about the bytes.
+    pub fn gossip_node(&self, id: NodeId) -> Option<Arc<GossipNode>> {
+        self.lock()
+            .get(&id)
+            .and_then(|slot| slot.running.as_ref())
+            .and_then(|running| running.gossip.clone())
+    }
+
     /// Node `id`'s health payload — the cross-process state oracle (TA-17).
     pub async fn health(&self, id: NodeId) -> HealthPayload {
         self.node(id).health_payload().await
@@ -1525,11 +1745,14 @@ impl Cluster {
                 .unwrap_or_else(|| panic!("node {id} has no data directory (Ephemeral storage)"));
             (dir, slot.identity, slot.span.clone())
         };
-        let options = self
+        let mut options = self
             .cfg
             .storage
             .rocks_options(false)
             .expect("a data directory implies Rocks storage");
+        // The same ceiling the node was started with, so a reopen is subject to the same
+        // refusal as a cold start (M6-95).
+        options.max_format_version = self.cfg.schema(id).format_version;
         RocksStore::open_with(
             &dir,
             identity,
@@ -2002,6 +2225,24 @@ impl Cluster {
         }
     }
 
+    /// Node `id`'s rotator, when it serves its material from files (M6, ADR-0028).
+    ///
+    /// `pub(crate)` because everything a row needs from it is on [`crate::rotation`]: handing
+    /// a test the rotator itself would let it rotate a node without going through either of
+    /// the two routes production has (the RPC and the poller), which is the one thing these
+    /// rows exist to exercise.
+    pub(crate) fn tls_rotator(&self, id: NodeId) -> Option<Arc<config_grpc::TlsRotator>> {
+        self.lock()
+            .get(&id)
+            .and_then(|slot| slot.running.as_ref())
+            .and_then(|running| running.tls.clone())
+    }
+
+    /// Where node `id`'s PEM set lives, when it has one.
+    pub(crate) fn tls_files_of(&self, id: NodeId) -> Option<config_grpc::TlsFiles> {
+        self.lock().get(&id).and_then(|slot| slot.tls_files.clone())
+    }
+
     /// The TLS fixture every node of this cluster was issued from.
     ///
     /// Panics on an insecure cluster: a row that asks for certificate material has already
@@ -2055,6 +2296,138 @@ impl Cluster {
     /// Clear every block, delay, and drop rule.
     pub fn heal(&self) {
         self.netfault.unblock_all();
+    }
+
+    /// Cut node `id`'s gossip off from the rest of the cluster (M6-60).
+    ///
+    /// [`Cluster::isolate`]/[`Cluster::heal`] work through [`NetFault`], which only sits in
+    /// front of the peer-plane TCP transport ("M1 has no NetFault seam on the gossip
+    /// transport" — see [`Cluster::netfault`]'s docs). Real gossip runs over its own UDP
+    /// socket that nothing here intercepts, so the closest in-process approximation is to stop
+    /// the node's [`GossipNode`] outright: it sends and receives nothing until
+    /// [`Cluster::gossip_heal`] brings it back, which is observably the same thing every other
+    /// node sees during a genuine partition too (their failure detector times out the same
+    /// missed probes either way). This does not touch the peer plane, so Raft replication on
+    /// `id` is unaffected.
+    ///
+    /// Panics if `id` runs no gossip (build with `ClusterBuilder::gossip(GossipKind::Real)`).
+    pub async fn gossip_isolate(&self, id: NodeId) {
+        let node = {
+            let slots = self.lock();
+            let slot = slots
+                .get(&id)
+                .unwrap_or_else(|| panic!("node {id} was never configured"));
+            let mut guard = slot
+                .gossip_node
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.take()
+        };
+        let Some(node) = node else {
+            panic!(
+                "node {id} runs no gossip; build the cluster with ClusterBuilder::gossip(GossipKind::Real)"
+            )
+        };
+        node.shutdown().await;
+        if let Some(running) = self.lock().get_mut(&id).and_then(|s| s.running.as_mut()) {
+            running.gossip = None;
+        }
+    }
+
+    /// Reverse [`Cluster::gossip_isolate`]: start a fresh gossip node for `id`, seeded off any
+    /// currently-gossiping peer, and rejoin it to the cluster (M6-60).
+    ///
+    /// The new node is built from `id`'s original [`ClusterConfig::gossip_key`], exactly as
+    /// [`Cluster::start_real_gossip`] builds every node's keyring at cluster start. That is
+    /// only correct because this call is the other half of [`Cluster::gossip_isolate`]: `id`
+    /// received no `RotateGossipKey` traffic while it was cut off (nothing could reach it), so
+    /// its keyring when it left is identical to a fresh one derived from the same secret key.
+    /// This is not a general-purpose keyring snapshot/restore — a row that rotates `id`'s own
+    /// keyring and *then* isolates it would not be reconstructed correctly by this call.
+    ///
+    /// Panics if no other configured node is currently gossiping to seed from, or if the fresh
+    /// node fails to start.
+    pub async fn gossip_heal(&self, id: NodeId) {
+        let (identity, span, source, peer_ep, client_ep) = {
+            let slots = self.lock();
+            let slot = slots
+                .get(&id)
+                .unwrap_or_else(|| panic!("node {id} was never configured"));
+            (
+                slot.identity,
+                slot.span.clone(),
+                Arc::clone(&slot.gossip_source),
+                slot.peer_addr.to_string(),
+                slot.client_addr.to_string(),
+            )
+        };
+        let seeds: Vec<SocketAddr> = self
+            .ids()
+            .into_iter()
+            .filter(|other| *other != id)
+            .filter_map(|other| self.gossip_node(other).map(|n| n.advertise_addr()))
+            .collect();
+        assert!(
+            !seeds.is_empty(),
+            "gossip_heal({id}) needs at least one other node still gossiping to seed from"
+        );
+        let mut gcfg = GossipConfig::new(
+            identity.cluster_id,
+            id,
+            "127.0.0.1:0".parse().expect("loopback ephemeral addr"),
+        );
+        gcfg.seeds = seeds.clone();
+        gcfg.secret_key = self.cfg.gossip_key;
+        gcfg.extras = Some(config_gossip::HintExtras {
+            schema: Some(self.cfg.schema(id)),
+            accepted_gossip_keys: None,
+            policy_version: None,
+        });
+        let hint = ObservedPeerHint {
+            cluster_id: identity.cluster_id,
+            recovery_epoch: identity.recovery_epoch,
+            node_id: id,
+            peer_endpoint: peer_ep,
+            client_endpoint: Some(client_ep),
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: 1,
+            zone: None,
+            liveness: Liveness::Alive,
+        };
+        let guard = span.enter();
+        let node = GossipNode::start(gcfg, hint)
+            .await
+            .unwrap_or_else(|e| panic!("healed gossip node {id} failed to start: {e}"));
+        drop(guard);
+        let node = Arc::new(node);
+        // `GossipNode::start` already retries its own join internally
+        // (`GossipConfig::join_attempts`: 3 attempts, 250ms apart), which is enough to survive
+        // an occasional dropped UDP probe. It is deliberately *not* retried at length here: if
+        // `id` was isolated across a live key rotation on its peers, it comes back decrypting
+        // with a key its peers no longer send with, and `join_many` fails with "no installed
+        // keys could decrypt the message" on every attempt, forever — no amount of retrying
+        // fixes that from in here. A caller in that shape must first hand `id` the missed key
+        // (e.g. `gossip_add_key`/`gossip_use_key`) and only then retry the join itself, via the
+        // `GossipNode` this call installs below (`Cluster::gossip_node`); see M6-60.
+        let join_deadline = tokio::time::Instant::now() + self.deadline(1);
+        while node.peers().is_empty() && tokio::time::Instant::now() < join_deadline {
+            node.join(&seeds).await;
+        }
+        *source
+            .real
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(Arc::clone(&node) as Arc<dyn GossipObservationSource>);
+        let mut slots = self.lock();
+        if let Some(slot) = slots.get_mut(&id) {
+            *slot
+                .gossip_node
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&node));
+            if let Some(running) = slot.running.as_mut() {
+                running.gossip = Some(node);
+            }
+        }
     }
 
     /// Runtime control over gossip observations.
@@ -2292,6 +2665,10 @@ impl Cluster {
             peer_endpoint = %peer_addr,
             client_endpoint = %client_addr,
         );
+        // A provisioned node gets the same PEM set a configured one does, minted for its own
+        // id: a learner joining a rotatable cluster must be rotatable too, or the one node
+        // that cannot follow a rotation is the one that joined during it.
+        let tls = provision_tls_files(&self.cfg, id);
         slots.insert(
             id,
             NodeSlot {
@@ -2302,6 +2679,9 @@ impl Cluster {
                 faults: Arc::new(NoFaults) as Arc<dyn FaultInjector>,
                 gossip_source: Arc::new(SharedGossipSource::new()),
                 data_dir,
+                tls_files: tls.as_ref().map(|(_, files)| files.clone()),
+                _tls_dir: tls.map(|(dir, _)| dir),
+                gossip_node: Arc::new(RwLock::new(None)),
                 running: None,
             },
         );
@@ -2364,6 +2744,15 @@ impl Cluster {
         let _ = running.node.stop().await;
         if let Some(gossip) = &running.gossip {
             gossip.shutdown().await;
+            // The admin backend reads this handle; a shut-down gossip node left in it would
+            // let a restarted node's `RotateGossipKey` reach a keyring nobody is gossiping
+            // with any more.
+            if let Some(slot) = self.lock().get_mut(&id) {
+                *slot
+                    .gossip_node
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            }
         }
         let _ = running.client_server.shutdown().await;
         let _ = running.peer_server.shutdown().await;
@@ -2391,7 +2780,18 @@ impl Cluster {
     /// The M2 identity rows (M2-42..M2-46) assert on the store half and M2-17 on the engine
     /// half, so both must be reachable rather than a panic inside the harness.
     pub async fn try_start_node(&self, id: NodeId) -> Result<(), NodeStartError> {
-        let (identity, span, faults, source, peer_addr, client_addr, data_dir, already) = {
+        let (
+            identity,
+            span,
+            faults,
+            source,
+            gossip_node,
+            peer_addr,
+            client_addr,
+            data_dir,
+            tls_files,
+            already,
+        ) = {
             let slots = self.lock();
             let slot = slots
                 .get(&id)
@@ -2401,9 +2801,11 @@ impl Cluster {
                 slot.span.clone(),
                 Arc::clone(&slot.faults),
                 Arc::clone(&slot.gossip_source),
+                Arc::clone(&slot.gossip_node),
                 slot.peer_addr,
                 slot.client_addr,
                 slot.data_dir.clone(),
+                slot.tls_files.clone(),
                 slot.running.is_some(),
             )
         };
@@ -2420,10 +2822,12 @@ impl Cluster {
             &span,
             faults,
             source as Arc<dyn GossipObservationSource>,
-            peer_transport_for(&self.cfg, id, &self.netfault),
+            gossip_node,
+            peer_transport_for(&self.cfg, id, &self.netfault, tls_files.as_ref()),
             peer_listener,
             client_listener,
             data_dir.as_deref(),
+            tls_files.as_ref(),
             self.deadline(4),
             self.poll_interval(),
         )
@@ -2443,6 +2847,19 @@ impl Cluster {
     /// mutation must still be there. On [`StorageKind::Ephemeral`] it keeps the documented M1
     /// semantics — the node comes back empty and is re-replicated (M1-43, M2-10).
     ///
+    /// Change the schema node `id` will run at from its **next start** (ADR-0030 M6-95).
+    ///
+    /// Takes effect on the next [`Cluster::start_node`] or [`Cluster::restart`] and never on a
+    /// running node: a binary's compatibility level is fixed for the life of the process, and a
+    /// harness that could change it in place would be testing something no deployment can do.
+    pub fn set_schema(&self, id: NodeId, schema: SchemaTriple) {
+        self.cfg
+            .compat_schema
+            .lock()
+            .expect("compat schema map poisoned")
+            .insert(id, schema);
+    }
+
     /// `stop_node` drops the `ConfigNode` and the store it owns. If a test is still holding a
     /// clone from [`Cluster::node`] or [`Cluster::rocks_store`], the lock is not released and
     /// this returns [`NodeStartError::Storage`] carrying [`StorageOpenError::Locked`] rather
@@ -2512,10 +2929,12 @@ async fn start_running(
     span: &tracing::Span,
     faults: Arc<dyn FaultInjector>,
     gossip: Arc<dyn GossipObservationSource>,
-    transport: Arc<dyn config_engine::PeerTransport>,
+    gossip_node: Arc<RwLock<Option<Arc<GossipNode>>>>,
+    transport: Arc<GrpcPeerTransport>,
     peer_listener: TcpListener,
     client_listener: TcpListener,
     data_dir: Option<&Path>,
+    tls_files: Option<&config_grpc::TlsFiles>,
     lock_deadline: Duration,
     lock_interval: Duration,
 ) -> Result<RunningNode, NodeStartError> {
@@ -2536,7 +2955,14 @@ async fn start_running(
         cfg.limits.watch,
         Arc::clone(&cfg.clock) as Arc<dyn config_engine::LeaderClock>,
     );
-    let store: StorageHandle = match (data_dir, cfg.storage.rocks_options(true)) {
+    let schema = cfg.schema(identity.node_id);
+    // A pinned node must refuse a directory written past its ceiling, exactly as the daemon's
+    // `--compat-schema 1` does (ADR-0030 OQ-65, M6-98).
+    let rocks_options = cfg.storage.rocks_options(true).map(|mut options| {
+        options.max_format_version = schema.format_version;
+        options
+    });
+    let store: StorageHandle = match (data_dir, rocks_options) {
         (Some(dir), Some(options)) => open_rocks(
             dir,
             identity,
@@ -2564,6 +2990,7 @@ async fn start_running(
     // not the peer one. Without this the hint is undialable by a client (engine delta §4.2).
     node_cfg.client_endpoint = Some(client_endpoint);
     node_cfg.raft = cfg.raft_timers();
+    node_cfg.schema = schema;
     node_cfg.limits = cfg.limits;
     node_cfg.read_timeout = cfg.read_timeout;
     node_cfg.write_timeout = cfg.write_timeout;
@@ -2577,12 +3004,20 @@ async fn start_running(
         .with_snapshots(cfg.snapshot)
         .expect("a valid snapshot policy on the cluster configuration");
     node_cfg.promote_max_lag = cfg.promote_max_lag;
-    let serving = cfg.tls.serving_mode(
-        identity.node_id,
-        cfg.node_cert_overrides
-            .get(&identity.node_id)
-            .unwrap_or(&NO_CERT_OVERRIDES),
-    );
+    // Read back from disk rather than re-derived, so the material the planes serve is
+    // whatever the operator (or a `rotate_files` call while this node was down) last wrote.
+    // `TlsFixture::issue_with` is deterministic in `(cluster_id, seed, label)`, so on a node
+    // whose files nobody has touched these are byte-identical to the in-memory form — the
+    // file path is a different route to the same bytes, not a different certificate.
+    let serving = match tls_files {
+        Some(files) => TlsMode::MutualTls(read_tls_files(files)),
+        None => cfg.tls.serving_mode(
+            identity.node_id,
+            cfg.node_cert_overrides
+                .get(&identity.node_id)
+                .unwrap_or(&NO_CERT_OVERRIDES),
+        ),
+    };
     let authorizer: Arc<dyn Authorizer> = match &cfg.authz {
         AuthzKind::AllowAll => Arc::new(AllowAll),
         AuthzKind::StaticAllowlist(policy) => {
@@ -2637,12 +3072,25 @@ async fn start_running(
     let node = ConfigNode::start(
         node_cfg,
         store.clone(),
-        transport,
+        Arc::clone(&transport) as Arc<dyn config_engine::PeerTransport>,
         gossip,
         authorizer,
         watch,
     )
     .await?;
+
+    // Built before either plane, because a plane's `CredentialSource` only exists once it is
+    // serving and the two planes start several steps apart. The dialler is passed in whole:
+    // rotating what a node serves without rotating what it dials leaves its peers disagreeing
+    // about who it is (ADR-0028).
+    let rotator = match (tls_files, &serving) {
+        (Some(files), TlsMode::MutualTls(mtls)) => Some(config_grpc::TlsRotator::new(
+            files.clone(),
+            mtls.clone(),
+            Arc::clone(&transport),
+        )),
+        _ => None,
+    };
 
     let peer_server = serve_peer_plane(
         node.peer_handler(),
@@ -2656,9 +3104,16 @@ async fn start_running(
         cfg.limits,
     )
     .expect("peer plane listening on its bound listener");
+    if let (Some(rotator), Some(credentials)) = (&rotator, peer_server.credentials()) {
+        rotator.register(credentials);
+    }
     // One backend value behind both traits, exactly as `config-server` wires it: the admin
     // plane and the client plane can then never disagree about which node they address.
-    let backend = Arc::new(NodeBackend { node: node.clone() });
+    let backend = Arc::new(NodeBackend {
+        node: node.clone(),
+        tls: rotator.clone(),
+        gossip: gossip_node,
+    });
     // Mounted unconditionally, like the daemon's. An empty `admins` set is not "no admin
     // plane", it is a closed one — the safe reading of an absent key, and a state a row can
     // assert on only if the service is actually there to refuse.
@@ -2677,6 +3132,9 @@ async fn start_running(
         admin,
     )
     .expect("client plane listening on its bound listener");
+    if let (Some(rotator), Some(credentials)) = (&rotator, client_server.credentials()) {
+        rotator.register(credentials);
+    }
     drop(guard);
 
     Ok(RunningNode {
@@ -2685,7 +3143,81 @@ async fn start_running(
         peer_server,
         client_server,
         gossip: None,
+        tls: rotator,
     })
+}
+
+/// Read a node's PEM set back off disk into the profile its planes serve.
+///
+/// The two fields that are *not* in the PEM — the dialled server domain and the Common-Name
+/// gate — are restored to exactly what [`ClusterTls::serving_mode`] hands an in-memory node,
+/// so a file-backed node and an in-memory one serve the same profile. `TlsRotator` carries
+/// them forward across every later reload from its own template, which is M6-48's structural
+/// half.
+///
+/// Panics rather than returning: these are files the harness wrote itself, and a row that
+/// wants a *refused* reload writes bad material and calls [`Cluster::reload_tls`], which is
+/// the path that reports it.
+pub(crate) fn read_tls_files(files: &config_grpc::TlsFiles) -> config_grpc::MtlsConfig {
+    let read = |what: &str, path: &Path| {
+        std::fs::read(path)
+            .unwrap_or_else(|e| panic!("the harness wrote {what} at {}: {e}", path.display()))
+    };
+    config_grpc::MtlsConfig::new(
+        read("tls.ca", &files.ca),
+        read("tls.cert", &files.cert),
+        read("tls.key", &files.key),
+    )
+    .with_common_name_principals(true)
+}
+
+/// Write node `id`'s mutual-TLS material to a fresh directory, for a rotatable cluster.
+///
+/// `None` unless [`ClusterConfig::tls_from_files`] is set on a mutual-TLS cluster: an insecure
+/// node has no material, and an in-memory one has no files to re-read. The bytes are exactly
+/// what [`ClusterTls::serving_mode`] would have handed the planes, `node_cert_overrides`
+/// included, so making a cluster rotatable changes the route the material takes and not the
+/// material.
+///
+/// One directory per node, held by the [`NodeSlot`]: a rotation is per node — that is the
+/// whole of §4.2, where two nodes rotate and a third does not.
+fn provision_tls_files(
+    cfg: &ClusterConfig,
+    id: NodeId,
+) -> Option<(Arc<tempfile::TempDir>, config_grpc::TlsFiles)> {
+    if !cfg.tls_from_files {
+        return None;
+    }
+    let TlsMode::MutualTls(mtls) = cfg.tls.serving_mode(
+        id,
+        cfg.node_cert_overrides
+            .get(&id)
+            .unwrap_or(&NO_CERT_OVERRIDES),
+    ) else {
+        return None;
+    };
+    let dir = crate::fs::temp_dir();
+    let files = config_grpc::TlsFiles {
+        ca: dir.path().join("ca.pem"),
+        cert: dir.path().join("node.cert.pem"),
+        key: dir.path().join("node.key.pem"),
+    };
+    write_tls_files(&files, &mtls);
+    Some((Arc::new(dir), files))
+}
+
+/// Replace the three PEM files `files` names with `mtls`'s material.
+///
+/// The cert and the key go down before the CA bundle, and each is written whole: a partly
+/// written *set* is what a poller can legitimately catch, and the rotator refuses it, but a
+/// partly written *file* here would make a row about the CA bundle fail on the key instead.
+pub(crate) fn write_tls_files(files: &config_grpc::TlsFiles, mtls: &config_grpc::MtlsConfig) {
+    let write = |path: &Path, bytes: &[u8]| {
+        std::fs::write(path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    };
+    write(&files.cert, &mtls.cert_pem);
+    write(&files.key, &mtls.key_pem);
+    write(&files.ca, &mtls.ca_pem);
 }
 
 /// The `CertOverrides` a node with no entry in the map gets: none.
@@ -2709,14 +3241,24 @@ static NO_CERT_OVERRIDES: CertOverrides = CertOverrides {
 /// A `server_domain` baked into the fixture's `MtlsConfig` is a no-op on the peer plane, so the
 /// plain `mtls()` profile is what goes in. Every transport shares the one cluster-wide
 /// [`NetFault`], which is what keeps `partition`/`isolate`/`heal` working.
+///
+/// Returns the concrete type rather than `Arc<dyn PeerTransport>` because a rotation has to
+/// reach `GrpcPeerTransport::reload`, which is not on the trait and must not be: replacing
+/// credentials is a property of *this* transport, not of every transport the engine can run on
+/// (M6-49, ADR-0028). Callers that only need the trait cast at the call.
+///
+/// `tls_files`, when a node serves from disk, is read instead of re-derived, for the same
+/// reason the listeners read it: the dialler presents the identity the operator last wrote.
 fn peer_transport_for(
     cfg: &ClusterConfig,
     from: NodeId,
     netfault: &NetFault,
-) -> Arc<dyn config_engine::PeerTransport> {
-    let tls = match &cfg.tls {
-        ClusterTls::Insecure => TlsMode::Insecure,
-        ClusterTls::MutualTls(fixture) => TlsMode::MutualTls(
+    tls_files: Option<&config_grpc::TlsFiles>,
+) -> Arc<GrpcPeerTransport> {
+    let tls = match (tls_files, &cfg.tls) {
+        (Some(files), ClusterTls::MutualTls(_)) => TlsMode::MutualTls(read_tls_files(files)),
+        (_, ClusterTls::Insecure) => TlsMode::Insecure,
+        (None, ClusterTls::MutualTls(fixture)) => TlsMode::MutualTls(
             fixture
                 .issue_with(
                     CertProfile::node(from),
@@ -2729,7 +3271,6 @@ fn peer_transport_for(
         ),
     };
     GrpcPeerTransport::new(tls, netfault.clone(), cfg.limits)
-        as Arc<dyn config_engine::PeerTransport>
 }
 
 /// Open a RocksDB data directory, retrying only while it is still `Locked`.

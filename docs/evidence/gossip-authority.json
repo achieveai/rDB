@@ -10,14 +10,14 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "33b5f4be7de0e1bb2ed68f5b9adc1a59a250bc75",
+    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T10:12:24Z",
-    "duration_ms": 411,
+    "utc": "2026-09-19T19:20:13Z",
+    "duration_ms": 334,
     "seed": 27958,
     "scale_factor": 0.05,
     "full_scale": false

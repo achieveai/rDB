@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use config_core::{ClusterIdentity, NodeId};
+use config_core::{ClusterIdentity, NodeId, SchemaTriple};
 use config_log::TraceContext;
 use config_storage::{RaftNode, RaftNodeId, TraceRegistry, TypeConfig};
 use openraft::error::{Fatal, NetworkError, RPCError, RaftError, RemoteError, Unreachable};
@@ -28,7 +28,7 @@ use openraft::raft::{
 use tracing::Instrument;
 
 use crate::transport::{
-    PeerEnvelopeMeta, PeerRequest, PeerResponse, PeerTransport, TransportError,
+    PeerEnvelopeMeta, PeerRequest, PeerResponse, PeerSchemas, PeerTransport, TransportError,
 };
 use std::sync::Arc;
 
@@ -38,6 +38,10 @@ pub(crate) struct EngineNetworkFactory {
     pub(crate) transport: Arc<dyn PeerTransport>,
     pub(crate) span: tracing::Span,
     pub(crate) traces: Arc<TraceRegistry>,
+    /// What this node advertises to its peers (ADR-0030).
+    pub(crate) schema: SchemaTriple,
+    /// Where each peer's answer is recorded, shared with the node that computes the minimum.
+    pub(crate) peer_schemas: Arc<PeerSchemas>,
 }
 
 impl RaftNetworkFactory<TypeConfig> for EngineNetworkFactory {
@@ -51,6 +55,8 @@ impl RaftNetworkFactory<TypeConfig> for EngineNetworkFactory {
             transport: Arc::clone(&self.transport),
             span: self.span.clone(),
             traces: Arc::clone(&self.traces),
+            schema: self.schema,
+            peer_schemas: Arc::clone(&self.peer_schemas),
         }
     }
 }
@@ -63,6 +69,8 @@ pub(crate) struct EngineNetwork {
     transport: Arc<dyn PeerTransport>,
     span: tracing::Span,
     traces: Arc<TraceRegistry>,
+    schema: SchemaTriple,
+    peer_schemas: Arc<PeerSchemas>,
 }
 
 impl EngineNetwork {
@@ -114,8 +122,9 @@ impl EngineNetwork {
     ) -> Result<PeerResponse, TransportError> {
         let rpc = req.kind();
         let meta = self.meta(&req);
-        self.transport
-            .send(meta, &self.endpoint, req, deadline)
+        let (response, peer_schema) = self
+            .transport
+            .send_with_schema(meta, &self.endpoint, req, deadline, self.schema)
             .instrument(tracing::debug_span!(
                 "peer_rpc",
                 rpc,
@@ -123,7 +132,13 @@ impl EngineNetwork {
                 endpoint = %self.endpoint,
             ))
             .instrument(self.span.clone())
-            .await
+            .await?;
+        // Only an answer counts. A peer that did not reply tells us nothing new, and its last
+        // known schema — or the schema-1 default — is what the gate must keep using (M6-89).
+        if let Some(schema) = peer_schema {
+            self.peer_schemas.record(self.target, schema);
+        }
+        Ok(response)
     }
 }
 

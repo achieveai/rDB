@@ -79,9 +79,11 @@ externally, so it is held to at least as strict a rule as a log line, not a loos
 | `retcd_gossip_reachable` | gauge | `node_id`, `peer_id` | `GossipObservationSource` (existing M1 surface, ADR-0003) |
 | `retcd_gossip_suspicions_total` | counter | `node_id` | memberlist suspicion events |
 | `retcd_gossip_endpoint_mismatch_total` | counter | `node_id` | advertised-vs-committed endpoint mismatch (spec §18.2 names this explicitly) |
-| `retcd_authn_rejected_total` | counter | `node_id`, `plane` | existing `HealthPayload::authn_rejected` counter (ADR-0018), also exported as a metric |
+| `retcd_authn_rejected_total` | counter | `node_id`, `plane`, `reason` | `reason` ∈ `AuthnRejectReason::ALL`; the handshake stage's share is counted by the listener and the identity stage's by the engine, summed into one family (ADR-0028; `reason` added 2026-09-19) |
 | `retcd_authz_denied_total` | counter | `node_id`, `plane` | existing `authz_denied` counter (ADR-0018) |
 | `retcd_cert_expiry_seconds` | gauge | `node_id`, `plane` | time until the currently loaded leaf certificate's `notAfter` |
+| `retcd_tls_reloads_total` | counter | `node_id` | credential reloads that replaced the served material; an unchanged poll is not one (ADR-0028) |
+| `retcd_tls_reload_failures_total` | counter | `node_id`, `reason` | refused reloads, seeded from `RotationError::ALL_REASONS` (ADR-0028) |
 | `retcd_backup_age_seconds` | gauge | `node_id` | now − most recent successful `Backup`/`backup` CLI run recorded in `state_meta` (ADR-0024) |
 | `retcd_pinned_snapshots` | gauge | `node_id` | revision-pinned list snapshots held open for continuations (ADR-0029, `Paginator::stats().len`) |
 | `retcd_policy_version` | gauge | `node_id` | active signed policy document version (ADR-0027) |
@@ -185,7 +187,7 @@ because "not measured" and "measured as zero" must not look alike on a dashboard
 | per-family values for the `cf` label on `retcd_rocks_mem_bytes` | Same cause: the label is emitted, but pinned to `cf="all"`, because the store reports one whole-store figure rather than one per family |
 | `retcd_watch_queued_bytes`, `retcd_watch_lag` | `WatchStats` is aggregate; per-stream figures need a per-stream registry. The high-cardinality design the Consequences accept is therefore also not exercised |
 | `retcd_gossip_suspicions_total` | The gossip layer surfaces no suspicion event |
-| `retcd_rocks_disk_free_bytes`, `retcd_cert_expiry_seconds`, `retcd_backup_age_seconds` | Environment facts the daemon does not gather: a free-space syscall, X.509 `notAfter` parsing, and the backup command's own bookkeeping. `docs/runbooks/alerts.md` lists all three as not-yet-armed, with substitutes |
+| `retcd_rocks_disk_free_bytes`, `retcd_backup_age_seconds` | Environment facts the daemon does not gather: a free-space syscall and the backup command's own bookkeeping. `docs/runbooks/alerts.md` lists both as not-yet-armed, with substitutes. `retcd_cert_expiry_seconds` was the third until M6 armed it (see the 2026-09-19 rotation note below) |
 
 **3. Series exported that the table does not list.** `retcd_cluster_revision`,
 `retcd_dedup_max_records`, `retcd_log_purges_total{outcome}`, `retcd_rocks_level0_files`,
@@ -259,3 +261,38 @@ C5B-05 — the counter is what an operator watches, the flag is what a client ch
 `retcd_dedup_max_records` remains the configured ceiling, so `retcd_dedup_records` approaching it
 is the leading indicator and `retcd_dedup_cap_refusals_total` moving is the confirmation that
 retry safety has lapsed for somebody.
+
+### Note (2026-09-19, dev-rotation): the rotation series are armed, and `reason` is now a label
+
+Three things changed when ADR-0028's rotation machinery landed.
+
+**`retcd_cert_expiry_seconds` is populated.** It is no longer an environment fact nobody gathers.
+`TlsRotator` reads the served leaf's `notAfter` through `x509-parser` and `/health` fills the
+series on every scrape, so the gauge tracks the certificate the node is *serving* rather than the
+one it read at boot. It is omitted entirely under `tls.mode = "insecure"`, because a node with no
+certificate has no expiry and exporting a zero would read as "expires now". `alerts.md`'s
+not-yet-armed section loses this row and its two alert rows become live.
+
+**`retcd_authn_rejected_total` gained a `reason` label.** The 2026-09-18 note above split the
+family by plane and derived the client share as a remainder. That remainder is gone: the storage
+is now one counter per `(plane, reason)` and every total — the exported samples, and
+`HealthPayload::authn_rejected` — is a sum over them. A total kept beside its own breakdown
+eventually disagrees with it, on the one code path that forgot the second increment.
+
+The label also closed a real gap. A refused **handshake** never produced a principal, never
+reached a backend and was therefore counted nowhere: `untrusted_client_ca` — the reason a
+rotation that drops a CA too early produces, and the one M6-45 turns on — was logged and lost.
+The listener's `CredentialSource` now counts what its accept loop refuses, and the daemon merges
+those into the same family. One family rather than two, because an operator asking "can my
+clients authenticate?" does not know which stage said no.
+
+`AuthnRejectReason` gained `IdentityRetired` for the peer-plane fence. It is the one value that
+is not a TLS outcome, and it is named rather than folded into `handshake_failed` because the
+operator response is the opposite: the credential is fine and reissuing one would not help.
+
+**Two new families.** `retcd_tls_reloads_total` counts reloads that *replaced* the material — an
+unchanged poll is deliberately not one, or the counter would tick once per
+`tls.watch_files_secs` on a node that has never rotated and an alert on "no rotation in 90 days"
+could never fire. `retcd_tls_reload_failures_total{reason}` is seeded from
+`RotationError::ALL_REASONS`, so a reason that has not fired reports zero rather than being
+absent.

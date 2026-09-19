@@ -130,12 +130,19 @@ impl PolicyLoader {
 
         let from = self.authorizer.policy_version();
         let hash_hex = hex(&signed.hash);
-        // Before the adoption, never after: see the module header. Skipped when there is no
-        // active document, because there is then no stream that could have been opened under
-        // one and nothing whose grants could have changed.
-        if let Some(old) = self.authorizer.active_document() {
-            let new = signed.document.clone();
-            self.hub.on_policy_change(&old, &new);
+        // Before the adoption, never after: see the module header. Only when the adoption will
+        // actually replace an active document, though — the revocation bumps the watch policy
+        // epoch and takes the journal gate, and the poller runs this every tick. A first load
+        // has no stream that could have been opened under an older document; a byte-identical
+        // re-write changes nothing; and a rollback `adopt` is about to refuse must not revoke
+        // anything at all, or one stale file on disk becomes a watch outage that repeats every
+        // poll interval (C6R-03).
+        if self.authorizer.adopt_would_replace(&signed) {
+            let old = self
+                .authorizer
+                .active_document()
+                .expect("adopt_would_replace is false without an active document");
+            self.hub.on_policy_change(&old, &signed.document);
         }
         let adoption = self.authorizer.adopt(signed)?;
 
@@ -181,10 +188,8 @@ impl PolicyLoader {
 
     /// What the health payload publishes: the active version, or why there is none (M6-16).
     ///
-    /// Not yet called: `HealthPayload` lives in `config-engine::metrics`, which is being changed
-    /// by another workstream, so M6-16/M6-25 land in the metrics round together with
-    /// `retcd_policy_reload_failures_total`. The accessors exist now because the state they
-    /// report is produced here and nowhere else.
+    /// Filled in by the daemon's health handler rather than by the engine: only the loader knows
+    /// *why* the last load failed, because only it holds the files.
     pub fn state(&self) -> PolicyState {
         let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
         self.authorizer.state(attempts.last_rejection.as_ref())
@@ -218,14 +223,50 @@ impl PolicyLoader {
         &self.authorizer
     }
 
+    /// One convergence pass: tell the authorizer what the cluster is known to hold (D6.1).
+    ///
+    /// Separate from [`Self::reload`] because the two answer different questions — "has the
+    /// document on disk moved?" and "has the rest of the cluster caught up with the one already
+    /// in force?" — and only the second needs to see other nodes. Logs `policy_converged`
+    /// exactly once per version, because `note_cluster_min_version` reports the *transition*
+    /// rather than the state (M6-21, M6-119).
+    pub async fn observe_convergence(&self, source: &dyn ClusterPolicyVersions) {
+        // Publish before reading. A node that adopted on this very tick is already answering
+        // under the new document, so the cluster is entitled to know; and doing it in the other
+        // order would make every node wait a whole extra interval for the last one to speak.
+        if let Some(version) = self.authorizer.policy_version() {
+            source.advertise(version).await;
+        }
+        let view = source.view().await;
+        if !self
+            .authorizer
+            .note_cluster_min_version(view.min_reported())
+        {
+            return;
+        }
+        tracing::info!(
+            version = self.authorizer.policy_version().unwrap_or_default(),
+            voters_reporting = view.voters_reporting(),
+            voters_total = view.voters.len(),
+            "policy_converged"
+        );
+    }
+
     /// Re-read the files every `authz.poll_interval` until `shutdown` fires (D6.1).
     ///
     /// Bounded polling rather than a filesystem watch: a watch is a per-platform API with
     /// per-platform silent-failure modes, and the recovery an operator needs is "it picks the
     /// file up within a known bound", which a timer states and a watch only implies.
+    ///
+    /// `convergence` is the cluster's advertised versions, when this node has a source for
+    /// them. It rides the same tick as the reload rather than a timer of its own: both answer
+    /// "is this node's policy still current?", and one timer is one thing for an operator to
+    /// reason about. `None` leaves the authorizer converging until it restarts, which is what
+    /// a node with gossip disabled has always done.
     pub fn spawn_poller(
         self: &Arc<Self>,
         shutdown: Arc<tokio::sync::Notify>,
+        convergence: Option<Arc<dyn ClusterPolicyVersions>>,
     ) -> tokio::task::JoinHandle<()> {
         let loader = Arc::clone(self);
         let interval = self.cfg.poll_interval;
@@ -234,6 +275,12 @@ impl PolicyLoader {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The first tick completes immediately and startup has already loaded once.
             ticker.tick().await;
+            // One convergence pass before the first interval, so the version this node booted
+            // with reaches the wire at once rather than a poll interval late: `run` advertises
+            // no version at gossip start, because the trailer is built before the policy is.
+            if let Some(source) = &convergence {
+                loader.observe_convergence(source.as_ref()).await;
+            }
             loop {
                 tokio::select! {
                     biased;
@@ -250,9 +297,156 @@ impl PolicyLoader {
                     // The blocking pool is gone, which only happens during shutdown.
                     return;
                 }
+                // After the reload, never before: a document adopted on this tick is one this
+                // node now holds, and asking whether the cluster has caught up with the
+                // previous one would answer a question nobody asked.
+                if let Some(source) = &convergence {
+                    loader.observe_convergence(source.as_ref()).await;
+                }
             }
         }))
     }
+}
+
+/// The daemon's [`ClusterPolicyVersions`]: gossip for what each node says, committed
+/// membership for who has to say it.
+///
+/// The two halves come from different places on purpose. Gossip is advisory and a node may
+/// advertise anything, so it is only ever allowed to *end* a narrowing that is already
+/// fail-closed; membership is the authoritative statement of who counts, and it comes from
+/// Raft (ADR-0003, ADR-0027 §15.3, OQ-56).
+pub struct GossipPolicyVersions {
+    gossip: Arc<config_gossip::GossipNode>,
+    node: config_engine::ConfigNode,
+    /// The version last put on the wire, so a tick that changes nothing broadcasts nothing.
+    ///
+    /// Reset to `None` when an advertisement fails, which is what makes the next tick retry
+    /// instead of believing a broadcast that never happened.
+    advertised: Mutex<Option<u64>>,
+}
+
+impl GossipPolicyVersions {
+    /// Build the source. Only the daemon can: it is the one place that holds both.
+    pub fn new(gossip: Arc<config_gossip::GossipNode>, node: config_engine::ConfigNode) -> Self {
+        Self {
+            gossip,
+            node,
+            advertised: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ClusterPolicyVersions for GossipPolicyVersions {
+    async fn view(&self) -> ClusterPolicyView {
+        let voters = self
+            .node
+            .membership_report()
+            .membership
+            .voters
+            .into_iter()
+            .collect();
+        let mut reported = BTreeMap::new();
+        for meta in self.gossip.member_meta().await {
+            // A meta that does not decode is a peer this build cannot read, which is the same
+            // thing as a peer that has not reported: it is left out, and counts as lagging.
+            let Ok(hint) = config_gossip::decode_hint(&meta) else {
+                continue;
+            };
+            if let Some(version) =
+                config_gossip::decode_hint_extras(&meta).and_then(|extras| extras.policy_version)
+            {
+                reported.insert(hint.node_id, version);
+            }
+        }
+        ClusterPolicyView { voters, reported }
+    }
+
+    async fn advertise(&self, version: u64) {
+        {
+            let mut advertised = self.advertised.lock().unwrap_or_else(|e| e.into_inner());
+            if *advertised == Some(version) {
+                return;
+            }
+            *advertised = Some(version);
+        }
+        // Only this field: `accepted_gossip_keys` belongs to the key rotation and `schema` to
+        // the mixed-version gate, and a whole-value write here would revert either of them
+        // mid-flight (ruling M6-R18).
+        if let Err(error) = self
+            .gossip
+            .update_extras(|extras| extras.policy_version = Some(version))
+            .await
+        {
+            *self.advertised.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            tracing::warn!(
+                %error,
+                version,
+                "gossip could not advertise this node's policy version; peers will keep                  treating it as lagging until the next poll"
+            );
+        }
+    }
+}
+
+/// What the convergence rule sees of the cluster, in one snapshot.
+///
+/// Deliberately not a gossip type. The rule is "every voter holds a version at least as new as
+/// the one in force", and what it needs is the voter set and the versions — not the wire format
+/// they arrived in. Keeping the two apart is what lets the rule be tested without a cluster,
+/// and keeps the advisory transport out of a decision it must never take on its own
+/// (ADR-0027 §15.3, OQ-56).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterPolicyView {
+    /// The voters this node expects to hear from, including itself.
+    pub voters: Vec<config_core::NodeId>,
+    /// The version each node currently advertises. A voter absent from this map has not
+    /// reported one.
+    pub reported: BTreeMap<config_core::NodeId, u64>,
+}
+
+impl ClusterPolicyView {
+    /// The lowest version *every* voter is known to hold, or `None` when any voter is silent.
+    ///
+    /// Absence is lagging, never "probably fine": failing open on a voter this node has not
+    /// heard from is the exact bug the converging clause exists to prevent (M6-22). An empty
+    /// voter set is silence too, so a node that knows of no voters never converges.
+    ///
+    /// `Option`'s own ordering does the work — `None` sorts below every `Some` — so one `min`
+    /// covers both "somebody is silent" and "somebody is behind".
+    pub fn min_reported(&self) -> Option<u64> {
+        self.voters
+            .iter()
+            .map(|voter| self.reported.get(voter).copied())
+            .min()
+            .flatten()
+    }
+
+    /// How many voters have reported a version, for the `policy_converged` line (M6-119).
+    pub fn voters_reporting(&self) -> usize {
+        self.voters
+            .iter()
+            .filter(|voter| self.reported.contains_key(voter))
+            .count()
+    }
+}
+
+/// One snapshot of who must report and what they advertise.
+///
+/// A trait because the production source joins two things this module has no business knowing
+/// about — committed membership and the gossip trailer — while the rule itself must stay
+/// testable without either.
+#[async_trait::async_trait]
+pub trait ClusterPolicyVersions: Send + Sync {
+    /// The current view. Cheap; called once per poll tick.
+    async fn view(&self) -> ClusterPolicyView;
+
+    /// Say that this node now holds `version`.
+    ///
+    /// The other half of the same fact: a node that reads its peers' versions without
+    /// publishing its own would leave every *other* node converging forever. Idempotent — the
+    /// caller states the version on every tick and the implementation decides whether anything
+    /// has to go on the wire.
+    async fn advertise(&self, version: u64);
 }
 
 /// Read a policy file, mapping "not there" onto the caller's typed reason.
@@ -271,4 +465,213 @@ fn hex(bytes: &[u8; 32]) -> String {
         let _ = write!(s, "{b:02x}");
         s
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! C6R-03: what a reload does to open watches when the file on disk has *not* moved on.
+    //!
+    //! A loader, a real [`WatchHub`] and two real files — no node and no cluster, because the
+    //! question is entirely about the order of two calls the loader makes. The watch policy epoch
+    //! is the observable: `on_policy_change` is the only thing that increments it, so "the epoch
+    //! did not move" is exactly "no stream was revoked and the journal gate was not taken".
+
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use config_core::policy::{document_hash, grant, signature_payload, PolicySignature};
+    use config_core::{Action, Limits, PolicyDocument};
+    use config_engine::{SystemClock, WatchHub};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    use super::*;
+
+    const KEY_NAME: &str = "ops";
+
+    /// A loader over a fresh temp directory, plus the hub it revokes through.
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        key: SigningKey,
+        loader: Arc<PolicyLoader>,
+        hub: Arc<WatchHub>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("a temp directory");
+            let key = SigningKey::from_bytes(&[0x5C; 32]);
+            let policy_file = dir.path().join("policy.json");
+            let signature_file = dir.path().join("policy.json.sig");
+            let hub = WatchHub::new(Limits::default().watch, Arc::new(SystemClock));
+            let loader = PolicyLoader::new(
+                SignedPolicyConfig {
+                    policy_file,
+                    signature_file,
+                    trust_keys: vec![(KEY_NAME.to_string(), key.verifying_key())],
+                    poll_interval: Duration::from_secs(10),
+                },
+                Arc::new(SignedPolicyAuthorizer::new(false)),
+                Arc::clone(&hub),
+            );
+            Self {
+                _dir: dir,
+                key,
+                loader,
+                hub,
+            }
+        }
+
+        /// Write a document at `version` granting `app` read+write on each prefix.
+        fn write(&self, version: u64, prefixes: &[&str]) {
+            let document = PolicyDocument {
+                version,
+                issued_unix_ms: 1_700_000_000_000 + version,
+                grants: prefixes
+                    .iter()
+                    .map(|p| grant("app", p, &[Action::Read, Action::Write]))
+                    .collect(),
+                admins: vec!["root".to_string()],
+            };
+            let bytes = serde_json::to_vec(&document).expect("a document serializes");
+            let hash = document_hash(&bytes);
+            let envelope = PolicySignature {
+                envelope_version: config_core::policy::POLICY_SIGNATURE_VERSION,
+                key_name: KEY_NAME.to_string(),
+                version,
+                hash,
+                signature: self
+                    .key
+                    .sign(&signature_payload(&hash, version))
+                    .to_bytes()
+                    .to_vec(),
+            }
+            .encode()
+            .expect("an envelope encodes");
+            std::fs::write(&self.loader.cfg.signature_file, envelope).expect("write the signature");
+            std::fs::write(&self.loader.cfg.policy_file, bytes).expect("write the document");
+        }
+
+        fn epoch(&self) -> u64 {
+            self.hub.testing().policy_epoch()
+        }
+    }
+
+    /// C6R-03, the identical half: a file that has not changed is a no-op however often the
+    /// poller re-reads it. Bumping the epoch every tick would revoke a stream whose prefix the
+    /// `skipped` branch covers, and would take the journal gate once per poll interval forever.
+    #[config_log::retcd_test]
+    fn an_unchanged_file_leaves_the_watch_epoch_alone_across_repeated_polls() {
+        let fixture = Fixture::new();
+        fixture.write(1, &["/a/"]);
+        fixture.loader.reload("startup").expect("v1 loads");
+        let after_first = fixture.epoch();
+        assert_eq!(
+            after_first, 0,
+            "a first adoption replaces nothing, so it revokes nothing"
+        );
+
+        for tick in 0..3 {
+            let reload = fixture
+                .loader
+                .reload("poll")
+                .expect("an unchanged file reloads");
+            assert_eq!(reload.outcome, "unchanged", "tick {tick}");
+            assert_eq!(
+                fixture.epoch(),
+                after_first,
+                "tick {tick}: a byte-identical document must not revoke a single watch"
+            );
+        }
+    }
+
+    /// C6R-03, the refused half: a rollback `adopt` will refuse must not revoke anything on its
+    /// way to being refused. Otherwise one stale file left on disk is a watch outage that repeats
+    /// every poll interval for as long as nobody notices it.
+    #[config_log::retcd_test]
+    fn a_refused_rollback_leaves_the_watch_epoch_alone_across_repeated_polls() {
+        let fixture = Fixture::new();
+        fixture.write(2, &["/a/"]);
+        fixture.loader.reload("startup").expect("v2 loads");
+        let before = fixture.epoch();
+
+        // A redeploy of the superseded document: verifies perfectly, and `adopt` refuses it.
+        fixture.write(1, &["/a/", "/b/"]);
+        for tick in 0..3 {
+            let rejection = fixture
+                .loader
+                .reload("poll")
+                .expect_err("a rollback is refused");
+            assert_eq!(rejection.reason(), "rollback", "tick {tick}");
+            assert_eq!(
+                fixture.epoch(),
+                before,
+                "tick {tick}: nothing was adopted, so nothing may have been revoked"
+            );
+        }
+        assert_eq!(
+            fixture.loader.authorizer.policy_version(),
+            Some(2),
+            "the active document is untouched by the refusals"
+        );
+
+        // And a genuine forward change still revokes, so the pre-check narrowed nothing else.
+        fixture.write(3, &["/a/", "/b/"]);
+        fixture.loader.reload("poll").expect("v3 adopts");
+        assert_eq!(
+            fixture.epoch(),
+            before + 1,
+            "a real change revokes exactly once"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // C6R-02: the convergence rule, without a cluster.
+    //
+    // `ClusterPolicyView` is the whole decision, so these exercise it directly: what the
+    // gossip trailer had to travel through to get here is a separate question, covered by the
+    // cluster rows (M6-20, M6-21).
+
+    use super::ClusterPolicyView;
+    use config_core::NodeId;
+
+    fn view(voters: &[u64], reported: &[(u64, u64)]) -> ClusterPolicyView {
+        ClusterPolicyView {
+            voters: voters.iter().map(|id| NodeId(*id)).collect(),
+            reported: reported
+                .iter()
+                .map(|(id, version)| (NodeId(*id), *version))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_silent_voter_counts_as_lagging_not_as_agreement() {
+        // Node 3 has reported nothing. Reading that as "probably fine" is the failure mode
+        // §15.3's converging clause exists to prevent (M6-22).
+        let v = view(&[1, 2, 3], &[(1, 8), (2, 8)]);
+        assert_eq!(v.min_reported(), None);
+        assert_eq!(v.voters_reporting(), 2);
+    }
+
+    #[test]
+    fn the_minimum_is_taken_over_voters_only() {
+        // A learner or a departed node advertising an old version must not hold the cluster
+        // back: only voters decide, because only voters evaluate the policy.
+        let v = view(&[1, 2], &[(1, 8), (2, 9), (3, 4)]);
+        assert_eq!(v.min_reported(), Some(8));
+        assert_eq!(v.voters_reporting(), 2);
+    }
+
+    #[test]
+    fn a_node_that_knows_of_no_voters_never_converges() {
+        // Fail closed on an empty membership: "nobody disagrees" is not "everybody agrees".
+        assert_eq!(view(&[], &[(1, 8)]).min_reported(), None);
+    }
+
+    #[test]
+    fn every_voter_reporting_the_new_version_converges() {
+        let v = view(&[1, 2, 3], &[(1, 8), (2, 8), (3, 8)]);
+        assert_eq!(v.min_reported(), Some(8));
+        assert_eq!(v.voters_reporting(), 3);
+    }
 }

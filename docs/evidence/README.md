@@ -49,7 +49,9 @@ build problem, not evidence.
 | `rpo-rto.json` | M6-106 | one backup/restore measurement: state size, export, verify, restore and first-read durations, and the recovery-point window the run left behind |
 | `partition-matrix.json` | M6-107 | every three-node partition arrangement: writes accepted and rejected per side, time to a leader after the heal, convergence time |
 | `crash-matrix.json` | M6-108 | a crash at every durability boundary the harness can drive, with crossings and recovery duration; the snapshot, install and purge boundaries are listed as not driven, with the reason |
-| `security-matrix.json` | M6-109, M6-110 | the §20 "Gossip and identity" cases: what was refused, with what reason, and that membership and data were untouched |
+| `security-matrix.json` | M6-109 | the §20 "Gossip and identity" cases: what was refused, with what reason, and that membership and data were untouched |
+| `security-matrix-gossip.json` | M6-110 | the gossip-only subset of the same matrix (stale packets, poisoned endpoint, all seeds unavailable, false suspicion, one-way loss, gossip key rotation): a separate file because M6-109 and M6-110 run concurrently in one binary (TA-61: one writer per file). Gossip key rotation is enumerated but not driven — ADR-0028 rotation had not landed on this branch when this row was written (2026-09-19); the artifact records the case as not driven, with the reason |
+| `security-matrix-version-skew.json` | M6-111 | a mixed-version cluster (a `--compat-schema 1` voter, a voter advertising a future `command_schema`, this build between them): the propose-time refusals, the ordinary writes that still serve, and the minimum the leader settled on; a separate file because M6-109 and M6-111 run concurrently in one binary (TA-61: one writer per file) |
 | `gossip-authority.json` | M6-112 | a hostile gossip soak under a write load, and the before/after equality of membership, cluster id, recovery epoch and data |
 
 ## What this project does not cover

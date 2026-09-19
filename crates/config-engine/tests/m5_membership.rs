@@ -592,7 +592,7 @@ async fn m5_removal_fences_an_id_that_is_already_out_of_membership() {
     );
 }
 
-/// The two `retcd_authn_rejected_total` samples on one node, read out of a real scrape.
+/// One node's `retcd_authn_rejected_total`, summed per plane across every `reason`.
 struct AuthnByPlane {
     client: f64,
     peer: f64,
@@ -610,16 +610,27 @@ async fn authn_rejected_by_plane(cluster: &Cluster, node_id: NodeId) -> AuthnByP
         .render_prometheus();
     let sample = |plane: &str| -> f64 {
         let needle = format!("plane=\"{plane}\"");
-        let line = text
+        // Summed, not matched: the family gained a `reason` label in M6 (ADR-0028), so a plane
+        // is several samples rather than one, and taking the first would silently assert over
+        // whichever reason sorts earliest - a counter that never moves.
+        let mut found = false;
+        let total = text
             .lines()
-            .find(|l| l.starts_with("retcd_authn_rejected_total{") && l.contains(&needle))
-            .unwrap_or_else(|| {
-                panic!("no retcd_authn_rejected_total sample for plane {plane:?} in:\n{text}")
-            });
-        line.rsplit(' ')
-            .next()
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or_else(|| panic!("unparsable sample line {line:?}"))
+            .filter(|l| l.starts_with("retcd_authn_rejected_total{") && l.contains(&needle))
+            .map(|line| {
+                found = true;
+                line.rsplit(' ')
+                    .next()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or_else(|| panic!("unparsable sample line {line:?}"))
+            })
+            .sum();
+        assert!(
+            found,
+            "no retcd_authn_rejected_total sample for plane {plane:?} in:
+{text}"
+        );
+        total
     };
     AuthnByPlane {
         client: sample("client"),

@@ -116,7 +116,7 @@ Each is a closed-set token on `policy_rejected` and on
 | `version_binding` | the envelope's version does not match the document's | the signature file belongs to a different document |
 | `hash_mismatch` | the document was edited after signing | re-sign the exact bytes being deployed |
 | `rollback` | the document's version is at or below the active one | bump the version; a genuine rollback is the break-glass runbook |
-| `malformed` | the document did not parse | fix the JSON |
+| `parse_error` | the document did not parse | fix the JSON |
 
 ## Rotating the signing key
 

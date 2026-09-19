@@ -32,14 +32,14 @@
 //! flag says. Falling back there would let a peer node's certificate log in as a client under
 //! its CN, which is the separation of the two planes undone.
 
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use config_core::{ClusterId, NodeId, Principal, PrincipalKind};
+use sha2::{Digest, Sha256};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 use tonic::Status;
 use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
-
-use crate::error::GrpcError;
 
 /// PEM material for one mutual-TLS endpoint.
 ///
@@ -74,7 +74,24 @@ pub struct MtlsConfig {
     /// deliberate trade for CAs that cannot mint URI SANs, and narrows the cluster binding
     /// this module otherwise guarantees on both planes.
     pub allow_common_name_principals: bool,
+    /// How long an accepted connection may take to complete the TLS handshake before the
+    /// listener drops it and counts it (listener only; a dialler's bound is its own connect
+    /// timeout).
+    ///
+    /// The unauthenticated path's bound: until the handshake completes, the peer has proved
+    /// nothing, so the task and the descriptor it holds are owed to a client that may never
+    /// speak. [`DEFAULT_HANDSHAKE_TIMEOUT`] is generous enough that no real client on a slow
+    /// link reaches it, which is what makes an expiry safe to count as a refusal.
+    pub handshake_timeout: std::time::Duration,
 }
+
+/// How long a listener waits for a TLS handshake it has accepted (ADR-0028, M6-45).
+///
+/// Ten seconds: two orders of magnitude above a loopback or same-datacentre handshake and well
+/// above a slow WAN one, so the only connections it ends are the ones that were never going to
+/// finish. A shorter bound would start refusing real clients on a congested link; a longer one
+/// leaves an unauthenticated socket parked for no benefit.
+pub const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl MtlsConfig {
     /// Build from PEM material, verifying the dialed server against its own host name.
@@ -85,7 +102,18 @@ impl MtlsConfig {
             key_pem,
             server_domain: None,
             allow_common_name_principals: false,
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    /// Bound accepted handshakes at `timeout` instead of [`DEFAULT_HANDSHAKE_TIMEOUT`].
+    ///
+    /// Read once, when the listener starts: a reload replaces the material a handshake is
+    /// performed against, never the bound on how long one may take.
+    #[must_use]
+    pub fn with_handshake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
     }
 
     /// Verify dialed servers against `domain` instead of the endpoint host.
@@ -181,6 +209,7 @@ impl std::fmt::Debug for MtlsConfig {
                 "allow_common_name_principals",
                 &self.allow_common_name_principals,
             )
+            .field("handshake_timeout", &self.handshake_timeout)
             .finish()
     }
 }
@@ -212,19 +241,6 @@ impl TlsMode {
         match self {
             Self::Insecure => "http",
             Self::MutualTls(_) => "https",
-        }
-    }
-
-    /// Apply this mode to a tonic server builder.
-    pub fn apply_server(
-        &self,
-        builder: tonic::transport::Server,
-    ) -> Result<tonic::transport::Server, GrpcError> {
-        match self {
-            Self::Insecure => Ok(builder),
-            Self::MutualTls(cfg) => builder
-                .tls_config(cfg.server_tls_config())
-                .map_err(|e| GrpcError::Tls(e.to_string())),
         }
     }
 }
@@ -275,6 +291,56 @@ pub fn parse_san_uri(uri: &str) -> Option<CertIdentity> {
         }),
         _ => None,
     }
+}
+
+/// The two facts an operator needs about a certificate this node is serving (M6, ADR-0028).
+///
+/// Neither is sensitive, and that is the point: a subject DN, a serial or a SAN would name the
+/// principal the certificate belongs to, and these values are exported as metric labels and
+/// printed in admin replies (M6-62).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertFacts {
+    /// Lowercase hex of the first eight bytes of `sha256(der)`.
+    ///
+    /// Enough to tell one deployed certificate from another when comparing nodes mid-rotation,
+    /// and not a value anything authenticates on.
+    pub fingerprint: String,
+    /// `notAfter`, in seconds since the Unix epoch.
+    pub not_after_unix: i64,
+}
+
+/// Read [`CertFacts`] off a leaf certificate, or `None` if the DER does not parse.
+///
+/// `None` rather than an error: this is reporting, not admission. A certificate this node is
+/// already serving has been through rustls' own parser, so a failure here means the reporting
+/// path disagrees with the serving path — which must not take a working listener down.
+pub fn cert_facts_from_der(der: &[u8]) -> Option<CertFacts> {
+    let (_, cert) = X509Certificate::from_der(der).ok()?;
+    let digest = Sha256::digest(der);
+    let fingerprint = digest[..8]
+        .iter()
+        .fold(String::with_capacity(16), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        });
+    Some(CertFacts {
+        fingerprint,
+        not_after_unix: cert.validity().not_after.timestamp(),
+    })
+}
+
+/// Fingerprint every certificate in a PEM bundle, in file order.
+///
+/// What a rotation log line names its trust anchors by (M6-120). Fingerprints rather than
+/// subjects for the same reason [`CertFacts`] carries none: the line is written on a path an
+/// operator greps, and a CA subject is the one field in a bundle that identifies an
+/// organisation. Unparseable blocks are skipped rather than reported — the bundle has already
+/// been through rustls by the time anything logs it.
+pub fn ca_fingerprints(pem: &[u8]) -> Vec<String> {
+    rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+        .filter_map(|der| cert_facts_from_der(der.ok()?.as_ref()))
+        .map(|facts| facts.fingerprint)
+        .collect()
 }
 
 /// Every URI SAN a DER certificate asserts, verbatim.

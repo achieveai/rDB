@@ -41,9 +41,11 @@ numbers: almost every condition here is normal for a few seconds.
 | `retcd_gossip_reachable` | `== 0` for a known peer for 5m | warning | [learner-replacement.md](learner-replacement.md) |
 | `retcd_gossip_endpoint_mismatch_total` | `increase(...[1h]) > 0` | warning | [learner-replacement.md](learner-replacement.md) |
 | `retcd_authn_rejected_total` | `increase(...[5m]) > 10` | warning | [learner-replacement.md](learner-replacement.md) |
+| `retcd_authn_rejected_total` | `increase(...{reason="untrusted_client_ca"}[5m]) > 0` | warning | [credential-rotation.md](credential-rotation.md) |
 | `retcd_authz_denied_total` | `increase(...[5m]) > 50` | warning | [learner-replacement.md](learner-replacement.md) |
-| `retcd_cert_expiry_seconds` | `< 14d` | warning | [backup-restore.md](backup-restore.md) |
-| `retcd_cert_expiry_seconds` | `< 48h` | critical | [backup-restore.md](backup-restore.md) |
+| `retcd_cert_expiry_seconds` | `< 14d` | warning | [credential-rotation.md](credential-rotation.md) |
+| `retcd_cert_expiry_seconds` | `< 48h` | critical | [credential-rotation.md](credential-rotation.md) |
+| `retcd_tls_reload_failures_total` | `increase(...[15m]) > 0` | warning | [credential-rotation.md](credential-rotation.md) |
 | `retcd_backup_age_seconds` | `>` 2x the backup interval | warning | [backup-restore.md](backup-restore.md) |
 | `retcd_backup_age_seconds` | `> 48h` | critical | [backup-restore.md](backup-restore.md) |
 
@@ -75,18 +77,20 @@ the row is an absolute-value comparison. `rate()` and quantiles do not apply.
 **`retcd_gossip_reachable`** is a per-peer gauge. Alert on a peer you expect to exist; the
 series simply disappears for a peer that has been removed.
 
-## Alerts that cannot fire yet (M5)
+## Alerts that cannot fire yet
 
-Three metrics in the table are declared by ADR-0026 and rendered by the exporter, but nothing
-populates them as of M5, so their series are **omitted** from a scrape rather than exported as
-zero. Their rows above are written but will never fire. Until they are wired, cover them
-elsewhere:
+Two metrics in the table are declared by ADR-0026 and rendered by the exporter, but nothing
+populates them, so their series are **omitted** from a scrape rather than exported as zero.
+Their rows above are written but will never fire. Until they are wired, cover them elsewhere:
 
 | Metric | Why unset | Cover it with |
 |---|---|---|
 | `retcd_rocks_disk_free_bytes` | Needs a platform free-space syscall the daemon does not make | Host filesystem monitoring on `[node] data_dir`'s volume |
-| `retcd_cert_expiry_seconds` | Needs X.509 `notAfter` parsing the TLS layer does not do | Certificate expiry monitoring outside rEtcd (M6, ADR-0028, owns rotation) |
 | `retcd_backup_age_seconds` | Needs the backup command's own bookkeeping | The backup job's exit status and its artifact timestamps |
+
+`retcd_cert_expiry_seconds` was the third of these until M6 (ADR-0028). It is now populated on
+any node running `tls.mode = "mutual"`, and still omitted under `tls.mode = "insecure"` — a node
+with no certificate has no expiry, and a zero there would read as "expires now".
 
 An alert that silently never fires is worse than no alert, so configure the substitutes rather
 than assuming these rows cover you.

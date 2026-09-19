@@ -48,4 +48,8 @@ futures = { workspace = true }
 # expected digest is derived from the fixture rather than pasted in as a constant that would
 # rot the moment the fixture changed.
 sha2 = { workspace = true }
+# Test-only: E2E-43 hand-builds a raw `AdminServiceClient` for `RotateGossipKey`, which
+# `config_client::AdminClient` does not wrap (mirrors `config-testkit/src/rotation.rs`'s own
+# `admin_rpc` helper, which cannot be reused directly — it dials an in-process harness).
+tonic = { workspace = true }
 # `tempfile` is a normal dependency (restore staging); the tests use the same one.

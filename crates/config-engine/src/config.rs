@@ -89,13 +89,25 @@ pub enum AuthzKind {
 impl AuthzKind {
     /// Whether an authorization model is actually in force.
     ///
-    /// `false` makes the node unready and turns every client call into
-    /// [`config_core::ConfigError::PermissionDenied`].
+    /// `false` makes the node unready. A static model's client calls then fail with
+    /// [`config_core::ConfigError::PermissionDenied`]; signed mode's fail with
+    /// [`config_core::ConfigError::Unavailable`], because a node with no valid document is
+    /// declining traffic rather than making an authorization decision (ADR-0027, M6-25).
     pub const fn is_present(self) -> bool {
         matches!(
             self,
             AuthzKind::Development | AuthzKind::StaticAllowlist | AuthzKind::SignedPolicy
         )
+    }
+
+    /// Whether this model's presence is decided at runtime rather than at startup.
+    ///
+    /// Signed mode is the only one: a node wired for it is [`AuthzKind::SignedPolicy`] or
+    /// [`AuthzKind::NoValidPolicy`] according to whether its authorizer holds a document *right
+    /// now*, and a document can arrive — or a rotation can be refused — long after start. Every
+    /// other model is fixed by the configuration and answers from it (M6-27, C6R-01).
+    pub const fn is_signed_mode(self) -> bool {
+        matches!(self, AuthzKind::SignedPolicy | AuthzKind::NoValidPolicy)
     }
 
     /// Stable snake_case name for log and health fields.
@@ -181,6 +193,12 @@ pub struct NodeConfig {
     pub gossip_poll: Duration,
     /// Which authorization model is active, for [`config_core::Capabilities`].
     pub authz_kind: AuthzKind,
+    /// What this node advertises and enforces on all three planes (M6, ADR-0030).
+    ///
+    /// [`config_core::CURRENT_SCHEMA`] for an ordinary node; [`config_core::COMPAT_SCHEMA_1`]
+    /// for one started with `--compat-schema 1`, which then proposes no command that needs the
+    /// newer envelope and holds the cluster minimum down for every other voter (M6-89).
+    pub schema: config_core::SchemaTriple,
     /// How many grant rules the allowlist this node was wired with holds (M3-42).
     ///
     /// Supplied rather than derived: the node holds an `Arc<dyn Authorizer>`, and a trait
@@ -240,6 +258,7 @@ impl NodeConfig {
             write_timeout: Duration::from_secs(10),
             gossip_poll: Duration::from_secs(1),
             authz_kind: AuthzKind::Development,
+            schema: config_core::CURRENT_SCHEMA,
             policy_grants: 0,
             policy_document_sha256: None,
             transport_security: TransportSecurity::Insecure,

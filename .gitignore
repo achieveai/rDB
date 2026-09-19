@@ -3,3 +3,4 @@
 **/*.jsonl
 /.claude/scratchpad/
 *.duckdb
+/.local-cluster/

@@ -133,4 +133,22 @@ impl PeerTransport for InProcTransport {
             })
             .await
     }
+
+    async fn send_with_schema(
+        &self,
+        meta: PeerEnvelopeMeta,
+        endpoint: &str,
+        req: PeerRequest,
+        deadline: Duration,
+        schema: config_core::SchemaTriple,
+    ) -> Result<(PeerResponse, Option<config_core::SchemaTriple>), TransportError> {
+        // The caller's schema goes nowhere: an in-process call has no envelope to carry it, and
+        // only the *answer* feeds the minimum (M6-86). Read before the call so a peer that
+        // fails the call still reports the schema it would have answered with — the routing
+        // table, not the reply, is what an in-process peer's advertisement lives in.
+        let _ = schema;
+        let peer_schema = self.route(endpoint).map(|handler| handler.local_schema());
+        let response = self.send(meta, endpoint, req, deadline).await?;
+        Ok((response, peer_schema))
+    }
 }

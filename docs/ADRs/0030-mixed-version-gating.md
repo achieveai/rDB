@@ -106,8 +106,8 @@ lead ruling that resolves the one contradiction test-plan-m6 §15 raised against
   `format_version=1` snapshot applied to a v2-capable node) is accepted: v2 is defined to be able to
   read v1's format, so a v2 node restoring from an older snapshot is a normal, forward-compatible
   path, not a gated one.
-- 0.9.25 is stated as the wire floor (A8): this project makes no claim about interoperating with any
-  other openraft version, mixed or otherwise. §17's requirement to "stage mixed versions before
+- `=0.9.25` is stated as the wire floor (A8): this project makes no claim about interoperating with
+  any other openraft version, mixed or otherwise. §17's requirement to "stage mixed versions before
   upgrading" is discharged for the Raft layer by there being exactly one supported openraft version
   in any deployment this project ships — the mixed-version problem this ADR solves is entirely
   about this project's own schema and command versions, not about openraft's wire protocol.
@@ -144,4 +144,102 @@ lead ruling that resolves the one contradiction test-plan-m6 §15 raised against
 
 ## Notes
 
-None yet.
+### Implementation note — 2026-09-19 (as built)
+
+The decision above is implemented as written except where this section says otherwise. Each
+deviation is recorded because it changes what a reader of the decision would expect to find in the
+code, not because the decision changed.
+
+#### Ruling M6-R15: activation is durable state, not a per-process latch
+
+`cluster_min_schema` as first built made *any* unreachable voter fatal to writes, not just to the
+first activation. A three-voter cluster that had been running schema-2 commands for weeks would
+refuse every one of them the moment a voter went down and a new leader was elected, because the new
+leader had heard from nobody and an unknown voter conservatively counts as schema 1. That turns a
+single-node outage into a write outage, which no part of this ADR intended.
+
+Activation is therefore durable:
+
+- The state machine records the maximum command schema it has ever applied. It lives in a small
+  key (`max_command_schema`) in the state column family, and it travels with snapshots in
+  `SnapshotHeader.max_applied_command_schema`, appended last and unioned with the local value on
+  install — the same shape `retired_nodes` uses (ruling M5-R21).
+- `schema_gate` passes when **either** the node's own durable maximum is already at or above the
+  command's required schema, **or** every known voter reports at or above it. The second clause is
+  the original computation and is what proposes the very first schema-2 entry; the first clause is
+  what keeps a steady-state cluster serving.
+- An unknown or unreachable voter therefore blocks only the *first* activation, never steady state.
+  This is safe in exactly the way the compat-1 contract already promises: a voter that applied a
+  schema-2 entry has proven it can decode one, and a schema-1 voter that missed the commit fences
+  itself on its own decode refusal when it returns.
+- The `feature_activated` log line keeps its M6-R12 semantics: at most one per node per process, so
+  a new leader may legitimately log it once more.
+
+#### Deviations from the decision as written
+
+- **No `PeerEnvelopeMeta` field.** The peer-plane triple is carried by defaulted trait methods and
+  `PeerEnvelope.schema` (proto field 7) rather than by a new metadata struct; adding a struct for
+  one optional field would have rewritten every existing envelope construction site for no gain.
+- **`--capabilities` is flattened, not wrapped.** `CapabilitiesReport` serializes `Capabilities`
+  with `#[serde(flatten)]` and adds one `schema` key. Nesting the existing contract under a wrapper
+  to add a field would break operator tooling that already parses it.
+- **`HINT_WIRE_VERSION` stays 1.** The gossip triple rides in a postcard trailer
+  (`HintExtras`) appended after the hint, in the slack the decoder has always ignored — see
+  `crates/config-gossip/src/meta.rs`. Bumping the version would have made every v1 hint
+  *rejected*, which contradicts this ADR's own "a v1 hint decodes to `None`" requirement, and the
+  gossip plane is advisory (ADR-0003) so nothing reads the field for a decision anyway.
+- **No schema-1 command encoder.** `--compat-schema 1` refuses to *decode* a schema-2 envelope and
+  never proposes one; it does not re-encode schema-2 commands into a schema-1 shape, because no
+  such shape exists for the commands the gate covers.
+- **`StorageOpenError::UnsupportedFormat` is reused** for a directory past the build's ceiling,
+  rather than adding a `FormatTooNew` variant. The existing variant already names both the found
+  and the supported version, which is the whole operator-facing content of the refusal.
+
+#### The rolling upgrade runs the documented drain
+
+An in-place format upgrade of a directory that still holds Raft log entries is refused (ADR-0021
+note 4, ruling M5-R19): the log payload is positional and unversioned, so the newer build cannot
+decode what the older one wrote. The M6-95/96/97 fixtures therefore perform the documented operator
+procedure — trigger a snapshot on the old build, let purge drain the log, stop, then start the new
+build — instead of treating the refusal as an obstacle. That makes those rows a rehearsal of the
+published upgrade runbook rather than a test of a path operators are told not to take.
+
+#### Ruling M6-R20 (2026-09-19): the drain gate had made this ADR's own rolling upgrade impossible
+
+The paragraph above is superseded in one respect, and the correction belongs here because the
+defect was introduced by *this* ADR's `--compat-schema` design meeting ADR-0021's gate.
+
+`--compat-schema 1` pins the store ceiling to `format_version` 1, and `RocksStore::open` stamps
+**the ceiling**, not `FORMAT_VERSION` — deliberately, so a pinned node can reopen its own
+directory (see "the store-open ordering fix" above). But the pinned node has no schema-1 command
+encoder, so what it actually writes into `raft_log` is current-grammar entries under a marker
+that says 1. Restarting it without the flag therefore hit ADR-0021's in-place migration, and
+M5-R19's predicate — marker legacy **and** log non-empty — refused a log the same binary had
+just written.
+
+That refusal could not be worked around, because its documented fix cannot terminate: OpenRaft's
+purge retains a tail behind the snapshot it keeps, and tester-m6c measured a residual of exactly
+2 entries across 6 runs under every `[snapshot]` tuning with confirmed convergence between
+attempts. E2E-42 was structurally unreachable, and so was every in-place format migration.
+
+**M6-R20 amends M5-R19** (recorded in full as ADR-0021 note 5): "drained" is now a property of
+the retained entries, not of the marker — every retained entry must decode under this build
+*and* sit at or below `last_applied`. An applied, decodable residual is carried across the
+upgrade. Anything undecodable, or anything this build would still have to **execute**, is
+refused exactly as before, with the same error variant and log line.
+
+**Consequences for this ADR's procedure.** The rolling upgrade is now performable, and its
+operator step is: quiesce the node so nothing is left unapplied, snapshot and let purge run,
+stop, then start the new build. The M6-95/96/97 fixtures' drain step is still correct and is
+still a rehearsal of the runbook; it simply no longer has to reach an empty log. The rollback
+boundary, the propose-time gate, `cluster_min_schema`, and the `feature_activated` semantics of
+M6-R12/M6-R15 are untouched by this ruling.
+
+#### Ruling M6-R22 (2026-09-19): ceiling stamping had a second marker-as-proxy casualty
+
+Stamping the ceiling rather than `FORMAT_VERSION` (OQ-65) means a `--compat-schema 1`
+directory looks, by its marker, like a pre-journal v1 directory. M6-R20 fixed the drain gate
+that misread it; the v1 `compact_revision` stamp (ADR-0021 ruling R1) misread it the same way
+and set the upgraded node's watermark to its own revision. Recorded in full as ADR-0021 note 6.
+Rule going forward: any code that must know what a directory *contains* asks
+`verify_column_families` for the layout; the marker answers only "which build wrote this".

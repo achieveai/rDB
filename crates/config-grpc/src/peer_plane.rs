@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 
-use config_core::{ClusterId, Limits, NodeId, RecoveryEpoch};
+use config_core::{ClusterId, Limits, NodeId, RecoveryEpoch, SchemaTriple};
 use config_engine::transport::{
     PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PAYLOAD_ENCODING_POSTCARD,
 };
@@ -237,8 +237,34 @@ impl PeerSvc {
             to_node_id: from.0,
             payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: payload.into(),
+            // Stamped from this node, like the identity fields above and for the same reason:
+            // the caller is entitled to learn what the node it addressed can actually read
+            // (ADR-0030 M6-86), and an echoed value would tell it only what it already thought.
+            schema: Some(schema_to_pb(self.handler.local_schema())),
         }))
     }
+}
+
+/// Put a triple on the wire.
+pub(crate) fn schema_to_pb(schema: SchemaTriple) -> pb::SchemaTriple {
+    pb::SchemaTriple {
+        format_version: schema.format_version,
+        command_schema: u32::from(schema.command_schema),
+        proto_rev: schema.proto_rev,
+    }
+}
+
+/// Read a triple off the wire, or `None` when the peer did not send one.
+///
+/// A `command_schema` that does not fit a `u16` cannot be a level this build knows, so it is
+/// saturated rather than wrapped: wrapping could turn a huge unknown number into a small
+/// *known* one and unlock a feature (M6-111's "unknown is not permission").
+pub(crate) fn schema_from_pb(schema: Option<&pb::SchemaTriple>) -> Option<SchemaTriple> {
+    schema.map(|s| SchemaTriple {
+        format_version: s.format_version,
+        command_schema: u16::try_from(s.command_schema).unwrap_or(u16::MAX),
+        proto_rev: s.proto_rev,
+    })
 }
 
 #[tonic::async_trait]
@@ -295,14 +321,12 @@ pub fn serve_peer_plane(
         server_span: tracing::Span::current(),
     };
     let cap = peer_plane_message_limit(&limits);
-    let router = tls
-        .apply_server(tonic::transport::Server::builder())?
-        .add_service(
-            PeerServiceServer::new(svc)
-                .max_decoding_message_size(cap)
-                .max_encoding_message_size(cap),
-        );
-    spawn("peer", router, listener)
+    let router = tonic::transport::Server::builder().add_service(
+        PeerServiceServer::new(svc)
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(cap),
+    );
+    spawn("peer", router, listener, &tls)
 }
 
 /// Decode a [`PeerResponse`] out of an answering envelope (used by the transport client).

@@ -10,25 +10,25 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "33b5f4be7de0e1bb2ed68f5b9adc1a59a250bc75",
+    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T10:11:57Z",
-    "duration_ms": 7996,
+    "utc": "2026-09-19T19:19:46Z",
+    "duration_ms": 6697,
     "seed": 27958,
     "scale_factor": 0.1,
     "full_scale": false
   },
   "values": {
     "apply_latency_ms": {
-      "baseline_p50": 28.353,
-      "baseline_p99": 110.416,
-      "loaded_max": 49.448,
-      "loaded_p50": 26.131,
-      "loaded_p99": 39.501
+      "baseline_p50": 23.783,
+      "baseline_p99": 49.93,
+      "loaded_max": 38.111,
+      "loaded_p50": 22.699,
+      "loaded_p99": 33.208
     },
     "apply_p99_within_2x_baseline": true,
     "delivered_events_server": 1218,

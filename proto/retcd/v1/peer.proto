@@ -31,4 +31,18 @@ message PeerEnvelope {
   uint32 payload_encoding = 5;
   // Serde-encoded openraft request (on the way in) or response (on the way out).
   bytes payload = 6;
+  // What the sender can read and write (ADR-0030 M6-86). Absent from a pre-M6 peer, which is
+  // read as the oldest schema this release knows rather than as the current one: an unknown
+  // peer must never be able to unlock a feature by saying nothing.
+  SchemaTriple schema = 7;
+}
+
+// The three independently movable compatibility axes of one build (ADR-0030).
+message SchemaTriple {
+  // On-disk layout generation (config-storage's format marker).
+  uint32 format_version = 1;
+  // Command envelope generation the sender can decode. The only field the gate consults.
+  uint32 command_schema = 2;
+  // gRPC surface revision the sender serves.
+  uint32 proto_rev = 3;
 }

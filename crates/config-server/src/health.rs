@@ -39,6 +39,26 @@ pub struct Sources {
     pub pagination: Option<Arc<Paginator>>,
     /// The signed-policy loader, when `authz.mode = "signed"`.
     pub policy: Option<Arc<PolicyLoader>>,
+    /// The TLS rotator, when this node serves mutual TLS (M6, ADR-0028).
+    ///
+    /// The third daemon-owned source, for the same reason as the other two: the engine never
+    /// sees a certificate, so `retcd_cert_expiry_seconds` can only be filled from here. `None`
+    /// under `tls.mode = "insecure"`, which omits the series rather than exporting a zero that
+    /// would read as "expires now".
+    pub tls: Option<Arc<config_grpc::TlsRotator>>,
+}
+
+/// Now, in seconds since the Unix epoch.
+///
+/// A gauge of "seconds until expiry" needs a wall clock, not a monotonic one: `notAfter` is an
+/// absolute instant and the answer has to survive the machine being suspended. A clock set
+/// before 1970 reports 0 rather than panicking — a nonsense reading is still better than a
+/// scrape that fails.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Largest request head this endpoint will read before giving up. A health probe's request is
@@ -126,6 +146,11 @@ async fn handle(
         let mut report = sources.node.metrics_report().await;
         report.pagination = sources.pagination.as_ref().map(|p| p.stats());
         report.policy = sources.policy.as_ref().map(|loader| loader.metrics());
+        if let Some(rotator) = &sources.tls {
+            report.cert_expiry_seconds = rotator.expiry_seconds(unix_now());
+            report.authn_rejected_transport = rotator.authn_rejections();
+            report.tls = Some(rotator.metrics());
+        }
         let body = report.render_prometheus().into_bytes();
         // The version parameter is not decoration: a scraper uses it to pick its parser, and
         // omitting it makes some scrapers fall back to a format this is not.

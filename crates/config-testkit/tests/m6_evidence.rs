@@ -23,16 +23,20 @@
 //! | M6-106 | `m6_106_evidence_backup_restore_rpo_rto` | `rpo-rto.json` |
 //! | M6-107 | `m6_107_evidence_partition_matrix` | `partition-matrix.json` |
 //! | M6-108 | `m6_108_evidence_crash_matrix` | `crash-matrix.json` |
-//! | M6-109/110 | `m6_109_evidence_security_matrix` | `security-matrix.json` |
+//! | M6-109 | `m6_109_evidence_security_matrix` | `security-matrix.json` |
+//! | M6-110 | `m6_110_evidence_security_matrix_gossip` | `security-matrix-gossip.json` |
+//! | M6-111 | `m6_111_evidence_security_matrix_version_skew` | `security-matrix-version-skew.json` |
 //! | M6-112 | `m6_112_evidence_gossip_cannot_mutate_membership_or_configuration` | `gossip-authority.json` |
 //! | M6-113 | `m6_113_evidence_files_validate_against_the_schema` | — (validator) |
 //! | M6-114 | `m6_114_evidence_gate_rule_is_enforced_both_ways` | — (validator) |
 //! | M6-115 | `m6_115_scale_factor_tracks_reality` | — (helper contract) |
 //! | M6-116 | `m6_116_evidence_carries_no_production_claim` | — (validator) |
 //!
-//! M6-111 (version skew) is **not** in this file: it needs `SchemaTriple` and `--compat-schema`,
-//! which land with ADR-0030 in the next wave. `security_cases()` still enumerates the case, and
-//! the artifact records it as not driven, so the gap is visible rather than absent.
+//! M6-111 (version skew) is its own row and its own artifact. The plan's OQ-68 folded it into
+//! M6-109's file because ADR-0030 had not landed yet; now that it has, a shared file would need
+//! two writers in one concurrently-run binary, which is exactly what TA-61's one-file-one-row
+//! rule forbids. `security_cases()` still enumerates the case in M6-109's matrix, pointing at
+//! the row that drives it.
 //!
 //! The three validator rows deliberately assert over *whatever is in `docs/evidence/` when they
 //! run* plus a synthetic artifact they build themselves: `cargo test` runs this binary's tests
@@ -56,6 +60,8 @@ use config_testkit::evidence::{
     security_cases, RunInfo, SecurityCase,
 };
 use config_testkit::poll::poll_until_async;
+use config_testkit::rotation::Plane;
+use config_testkit::tls::{CertProfile, TlsFixture};
 use futures::StreamExt;
 use support::{get_req, put_req};
 
@@ -106,6 +112,19 @@ const GOSSIP_SOAK_INJECTIONS_REDUCED: usize = 200;
 
 /// Seed every row stamps into its artifact.
 const SEED: u64 = 0x6D36;
+
+/// The principal the security matrix's rotation case acts as; on the admin allowlist.
+const MATRIX_ADMIN: &str = "ops";
+
+/// The gossip key a rotation repeat starts from, and the one it rotates to.
+///
+/// One key per repeat rather than one pair reused: the matrix runs each case `repeats` times
+/// against the same cluster, and a second run of "rotate K1 to K2" against a cluster already on
+/// K2 would be asserting nothing. Repeat `r` rotates `gossip_key(r)` to `gossip_key(r + 1)`, so
+/// every repeat is a real rotation and the cluster's starting key is `gossip_key(0)`.
+fn gossip_key(repeat: usize) -> [u8; 32] {
+    [0x30u8.wrapping_add(repeat as u8); 32]
+}
 
 /// Pick the full-scale or reduced-scale constant for this run.
 fn at_scale<T>(full: T, reduced: T) -> T {
@@ -916,8 +935,8 @@ async fn m6_108_evidence_crash_matrix() {
 /// untouched. Recorded: per case, whether it was driven, the refusal reason, and what the
 /// cluster looked like before and after.
 ///
-/// `version_skew` is enumerated and recorded as not driven: it needs ADR-0030's `SchemaTriple`
-/// and `--compat-schema`, which land in the next wave.
+/// `version_skew` is enumerated here and driven by M6-111, which needs clusters this row cannot
+/// build in passing.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m6_109_evidence_security_matrix() {
     let run = RunInfo::start(SEED);
@@ -925,9 +944,16 @@ async fn m6_109_evidence_security_matrix() {
     let cases = security_cases();
     assert_eq!(cases.len(), 12, "the §20 security matrix is twelve cases");
 
+    // Mutual TLS, because the matrix's Expected column asks for
+    // `retcd_authn_rejected_total{plane, reason}` and there is no such counter on a plaintext
+    // listener. `rotatable_tls` rather than plain mTLS so the per-plane counters are reachable
+    // through the rotator (`Cluster::tls_authn_rejections`), which is the only thing this row
+    // uses the file-backed material for.
     let cluster = Cluster::builder()
         .nodes(3)
         .storage(StorageKind::Rocks(RocksSpec::NO_SYNC))
+        .rotatable_tls(SEED)
+        .admins([MATRIX_ADMIN])
         .gossip(GossipKind::Real)
         .start()
         .await;
@@ -986,6 +1012,21 @@ async fn m6_109_evidence_security_matrix() {
         values,
         run.scaled(MATRIX_REPEATS_FULL_SECURITY as f64, repeats as f64),
     );
+}
+
+/// Node `id`'s peer-plane rejection counters, or `None` when the cluster serves no file-backed
+/// TLS material (the counters live on the rotator).
+fn peer_rejections(
+    cluster: &Cluster,
+    id: NodeId,
+) -> Option<Vec<(config_engine::AuthnRejectReason, u64)>> {
+    let all = cluster.try_tls_authn_rejections(id)?;
+    Some(
+        all.into_iter()
+            .filter(|(plane, _, _)| *plane == "peer")
+            .map(|(_, reason, count)| (reason, count))
+            .collect(),
+    )
 }
 
 /// Drive one security case and describe what happened, for the artifact.
@@ -1094,20 +1135,132 @@ async fn drive_security_case(
             cluster.gossip().clear();
             Some(format!("formed cluster kept leader {leader_now}"))
         }
-        SecurityCase::WrongCertIdentity
-        | SecurityCase::WrongDestinationBinding
-        | SecurityCase::DuplicateNodeId => {
+        // The one identity case this row drives itself, because it is the one that moves the
+        // counter the Expected column names. Everything about the offered certificate is right
+        // except its issuer: same cluster id, same node domain, same key usages.
+        SecurityCase::WrongCertIdentity => {
+            let victim = cluster.ids()[0];
+            let Some(before) = peer_rejections(cluster, victim) else {
+                return not_driven(
+                    "this row's cluster serves no file-backed TLS material, so the per-plane \
+                     rejection counters are unreachable",
+                );
+            };
+            let impostor = TlsFixture::other_ca(cluster.fixture().cluster_id(), SEED)
+                .issue(CertProfile::node(victim));
+            // One TCP connection and one handshake, which is what makes "exactly one" an
+            // assertion rather than a hope: a gRPC client would re-dial on failure.
+            let _served = cluster
+                .probe_handshake(victim, Plane::Peer, &impostor)
+                .await;
+            let moved = poll_until_async(cluster.deadline(10), cluster.poll_interval(), || async {
+                let now = peer_rejections(cluster, victim)?;
+                (now != before).then_some(now)
+            })
+            .await
+            .unwrap_or_else(|t| {
+                panic!(
+                    "the peer listener must count the handshake it refused: {t}; counters now \
+                     {:?}",
+                    peer_rejections(cluster, victim)
+                )
+            });
+            let deltas: Vec<_> = moved
+                .iter()
+                .zip(&before)
+                .filter(|((_, now), (_, was))| now > was)
+                .map(|((reason, now), (_, was))| (*reason, now - was))
+                .collect();
+            assert_eq!(
+                deltas.len(),
+                1,
+                "one refusal belongs under one reason: {deltas:?}"
+            );
+            assert_eq!(
+                deltas[0],
+                (config_engine::AuthnRejectReason::UntrustedClientCa, 1),
+                "retcd_authn_rejected_total{{plane=\"peer\", reason=\"untrusted_client_ca\"}} \
+                 must increment by exactly one. The reason is the half an operator acts on, \
+                 and the catch-all `handshake_failed` sends them looking for a protocol fault: \
+                 {deltas:?}"
+            );
+            Some(format!(
+                "refused on the peer plane: reason={}, delta=1",
+                deltas[0].0
+            ))
+        }
+        SecurityCase::WrongDestinationBinding | SecurityCase::DuplicateNodeId => {
             return not_driven(
                 "driven by the M3 peer-plane rows (m3_peer_mtls.rs, m3_client_mtls.rs) against a \
                  mutual-TLS cluster; this row records the case rather than duplicating a suite \
                  that already owns it",
             );
         }
+        // The §4.3 rotation, run end to end against whichever of the two matrix rows brought an
+        // encrypted keyring with it (M6-110 does; M6-109 deliberately does not, so it records
+        // the case rather than paying for a second encrypted cluster).
         SecurityCase::GossipKeyRotation => {
-            return not_driven("ADR-0028 rotation lands with dev-rotation in wave 3");
+            let ids = cluster.running_ids();
+            if cluster.gossip_keyring(ids[0]).is_none() {
+                return not_driven(
+                    "this row's cluster runs unencrypted gossip, which has no keyring to \
+                     rotate; `m6_110_evidence_security_matrix_gossip` owns the encrypted one",
+                );
+            }
+            let (from, to) = (gossip_key(repeat), gossip_key(repeat + 1));
+            for stage in ["add", "use"] {
+                for id in &ids {
+                    let done = match stage {
+                        "add" => cluster.gossip_add_key(*id, &to, MATRIX_ADMIN).await,
+                        _ => cluster.gossip_use_key(*id, &to, MATRIX_ADMIN).await,
+                    };
+                    done.unwrap_or_else(|e| panic!("node {id} failed the {stage} stage: {e}"));
+                }
+            }
+            // The removal reads what peers *advertise*, which lands a gossip round after they
+            // changed it; retried rather than waited out, exactly as an operator would.
+            for id in &ids {
+                let node = *id;
+                poll_until_async(
+                    cluster.deadline(20),
+                    cluster.poll_interval(),
+                    || async move {
+                        cluster
+                            .gossip_remove_key(node, &from, false, MATRIX_ADMIN)
+                            .await
+                            .ok()
+                    },
+                )
+                .await
+                .unwrap_or_else(|t| panic!("node {node} never completed the removal: {t}"));
+            }
+            let primary = cluster
+                .gossip_keyring(ids[0])
+                .expect("the keyring is still there")
+                .primary;
+            for id in &ids {
+                let ring = cluster
+                    .gossip_keyring(*id)
+                    .unwrap_or_else(|| panic!("node {id} lost its keyring mid-rotation"));
+                assert_eq!(
+                    ring.primary, primary,
+                    "node {id} signs with a different key"
+                );
+                assert_eq!(
+                    ring.accepted.len(),
+                    1,
+                    "node {id} still accepts a retired key: {ring:?}"
+                );
+            }
+            Some(format!(
+                "rotated to a new primary across {} nodes",
+                ids.len()
+            ))
         }
         SecurityCase::VersionSkew => {
-            return not_driven("ADR-0030 schema gating lands with dev-compat in wave 2");
+            return not_driven(
+                "driven by `m6_111_evidence_security_matrix_version_skew`, which needs two                  purpose-built clusters of its own; this row records the case rather than                  rebuilding them inside the matrix",
+            );
         }
     };
 
@@ -1118,6 +1271,109 @@ async fn drive_security_case(
         "outcome": "refused or ignored; nothing written",
         "reason": refusal,
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// M6-110 — security matrix: gossip cases, own artifact
+// ---------------------------------------------------------------------------------------
+
+/// M6-110: the §20 gossip-only subset of the security matrix, in its own artifact.
+///
+/// `SecurityCase` and `drive_security_case` are `m6_109`'s own helpers, defined immediately
+/// above in this file, and already implement every gossip case this row needs — this row reuses
+/// them rather than duplicating the driving logic, which is also why the invariants it checks
+/// (leader/membership/data untouched) match `m6_109`'s exactly. Asserted: the five driven cases
+/// (`StalePackets`, `PoisonedEndpoint`, `AllSeedsUnavailable`, `FalseSuspicion`, `OneWayLoss`)
+/// leave the leader, committed membership and the anchor key untouched. Recorded: per case,
+/// whether it was driven and why not when it was skipped.
+///
+/// Writes its own `security-matrix-gossip.json` rather than `m6_109`'s `security-matrix.json`:
+/// TA-61 is one file per writing row, and this row runs concurrently with `m6_109` in the same
+/// `cargo test` invocation, so sharing a path would mean two writers racing one file.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_110_evidence_security_matrix_gossip() {
+    let run = RunInfo::start(SEED);
+    let repeats = at_scale(MATRIX_REPEATS_FULL_SECURITY, MATRIX_REPEATS_REDUCED);
+    let cases = [
+        SecurityCase::StalePackets,
+        SecurityCase::PoisonedEndpoint,
+        SecurityCase::AllSeedsUnavailable,
+        SecurityCase::FalseSuspicion,
+        SecurityCase::OneWayLoss,
+        SecurityCase::GossipKeyRotation,
+    ];
+
+    // Encrypted gossip and an admin allowlist, because this is the row that owns the §4.3
+    // rotation case: `RotateGossipKey` is an admin RPC over the mutual-TLS client plane, and
+    // `memberlist` has no keyring at all on a node whose gossip is in the clear.
+    let cluster = Cluster::builder()
+        .nodes(3)
+        .storage(StorageKind::Rocks(RocksSpec::NO_SYNC))
+        .rotatable_tls(SEED)
+        .admins([MATRIX_ADMIN])
+        .gossip(GossipKind::Real)
+        .gossip_key(gossip_key(0))
+        .start()
+        .await;
+    let leader = cluster.leader().await;
+    cluster
+        .client(leader)
+        // Same key `drive_security_case` itself reads back for `StalePackets`/`OneWayLoss`
+        // (defined above, shared with `m6_109`) — each test owns its own `Cluster`, so there is
+        // no real collision, only a shared literal.
+        .put(put_req("sec/anchor", "1"))
+        .await
+        .expect("anchor write");
+    let membership_before = cluster.membership();
+    let hash_before = cluster.state_hashes();
+
+    let mut rows = Vec::new();
+    let mut driven = 0usize;
+    for case in &cases {
+        for repeat in 0..repeats {
+            let row = drive_security_case(&cluster, *case, repeat).await;
+            if row["driven"] == serde_json::Value::Bool(true) {
+                driven += 1;
+            }
+            rows.push(row);
+        }
+    }
+
+    let membership_after = cluster.membership();
+    assert_eq!(
+        format!("{membership_before:?}"),
+        format!("{membership_after:?}"),
+        "the gossip security matrix changed committed membership; §19.9 says nothing outside \
+         Raft may"
+    );
+    let anchor = cluster
+        .client(cluster.leader().await)
+        .get(get_req("sec/anchor"))
+        .await
+        .expect("anchor still readable");
+    assert!(
+        anchor.record.is_some(),
+        "the anchor key did not survive the gossip security matrix"
+    );
+    assert_eq!(
+        hash_before.len(),
+        cluster.state_hashes().len(),
+        "a node left the cluster during the gossip security matrix"
+    );
+    cluster.shutdown().await;
+
+    let values = serde_json::json!({
+        "cases_enumerated": cases.len(),
+        "cases_driven": driven,
+        "repeats": repeats,
+        "membership_unchanged": true,
+        "rows": rows,
+    });
+    evidence::write_evidence(
+        "security-matrix-gossip",
+        values,
+        run.scaled(MATRIX_REPEATS_FULL_SECURITY as f64, repeats as f64),
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1380,4 +1636,276 @@ fn sample_artifact() -> evidence::Artifact {
         values: serde_json::json!({ "probe": 1 }),
         disclaimer: evidence::DISCLAIMER.to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// M6-111 — security matrix: version skew
+// ---------------------------------------------------------------------------------------
+
+/// The voter pinned to the old build's schema, as in `m6_compat_cluster.rs`.
+const SKEW_OLD: NodeId = NodeId(3);
+/// The voter that advertises a schema this build has never heard of.
+const SKEW_FUTURE: NodeId = NodeId(2);
+
+/// A schema from the future, advertised by a node that is otherwise this binary.
+///
+/// Only `command_schema` is raised. Raising `format_version` too would make the node refuse to
+/// open its own store, so the row would fail for a reason that has nothing to do with skew; and
+/// the question M6-111 asks is about the field the gate reads, which is this one.
+const SKEW_FUTURE_SCHEMA: config_core::SchemaTriple = config_core::SchemaTriple {
+    format_version: config_core::CURRENT_SCHEMA.format_version,
+    command_schema: 3,
+    proto_rev: config_core::CURRENT_SCHEMA.proto_rev,
+};
+
+/// A cluster with deduplication on, so the M6-92 probe is a real one.
+fn skew_cluster() -> config_testkit::cluster::ClusterBuilder {
+    Cluster::builder()
+        .nodes(3)
+        .storage(StorageKind::Ephemeral)
+        .gossip(GossipKind::Real)
+        .limits(Limits {
+            dedup: config_core::DedupLimits::ENABLED,
+            ..Limits::DEFAULT
+        })
+}
+
+/// The leader's computed minimum, or `None` if this node is not the leader.
+fn min_schema(cluster: &Cluster, leader: NodeId) -> Option<config_core::SchemaTriple> {
+    cluster
+        .try_node(leader)
+        .and_then(|n| n.cluster_min_schema())
+}
+
+/// Wait until the leader's minimum settles on `expected`, and return the leader.
+async fn skew_min_settles(cluster: &Cluster, expected: u16) -> NodeId {
+    let leader = cluster.leader().await;
+    cluster
+        .wait_for(
+            &format!("the leader's cluster_min_schema to reach {expected}"),
+            cluster.deadline(4),
+            || min_schema(cluster, leader).filter(|m| m.command_schema == expected),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("the leader never observed every voter's schema: {t:?}"));
+    leader
+}
+
+/// One recorded sample of the leader's view, for the artifact.
+fn min_sample(cluster: &Cluster, leader: NodeId, phase: &str, repeat: usize) -> serde_json::Value {
+    let min = min_schema(cluster, leader);
+    serde_json::json!({
+        "phase": phase,
+        "repeat": repeat,
+        "leader": leader.0,
+        "min_command_schema": min.map(|m| m.command_schema),
+        "min_format_version": min.map(|m| m.format_version),
+    })
+}
+
+/// M6-111: `SecurityCase::VersionSkew`, driven.
+///
+/// Two clusters, because "version skew" is two different hazards wearing one name.
+///
+/// The first is the documented mixed cluster: one voter at `--compat-schema 1`, one voter
+/// advertising an unknown *future* schema, and this build in between. The v2 feature set must
+/// stay shut — the M6-90..M6-92 conditions, re-asserted here against the real client and admin
+/// planes rather than against the engine — and the future advertisement must not open it. An
+/// old voter and a future voter are the same thing to a leader: a peer whose build it cannot
+/// vouch for.
+///
+/// The second removes the old voter from the picture entirely and leaves two of three voters
+/// claiming schema 3. The activation that follows must stop at **this build's** schema. A
+/// minimum that tracked the advertisement instead would let a leader propose an envelope no
+/// voter in the cluster — including itself — can encode, which is ADR-0030 A7's failure in its
+/// purest form: the entry commits and nothing downstream can refuse it.
+///
+/// **Asserted:** the v2 feature set stays gated while a schema-1 voter is present; an unknown
+/// higher schema neither raises the computed minimum nor unlocks a feature; every node stays up
+/// and keeps serving across both clusters, including through an unrecognised advertisement on
+/// the gossip wire. **Recorded:** the observed minimum over time, and the refusals by feature.
+///
+/// Writes `docs/evidence/security-matrix-version-skew.json`. Deliberately its own artifact
+/// rather than a section of `security-matrix.json`: TA-61's rule is one writer per file, and
+/// `m6_109` runs concurrently with this row in the same binary.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_111_evidence_security_matrix_version_skew() {
+    let run = RunInfo::start(SEED);
+    let repeats = at_scale(MATRIX_REPEATS_FULL_SECURITY, MATRIX_REPEATS_REDUCED);
+    let mut observations = Vec::new();
+    let mut refusals: BTreeMap<String, usize> = BTreeMap::new();
+
+    // ---- the mixed cluster: old voter, future voter, this build ------------------------
+    let cluster = skew_cluster()
+        .compat_schema(SKEW_OLD, config_core::COMPAT_SCHEMA_1)
+        .compat_schema(SKEW_FUTURE, SKEW_FUTURE_SCHEMA)
+        .start()
+        .await;
+    let leader = skew_min_settles(&cluster, config_core::COMMAND_SCHEMA_V1).await;
+    observations.push(min_sample(&cluster, leader, "mixed_settled", 0));
+
+    // An unrecognised advertisement is data, not an event: it decodes to the triple that was
+    // written, and the reader hands it on rather than failing. This is the first place a peer
+    // from the future could take a node down, and it is asserted on the bytes.
+    let bytes = config_gossip::encode_hint_with_extras(
+        &cluster.gossip().truthful_hint(SKEW_FUTURE),
+        Some(&config_gossip::HintExtras {
+            schema: Some(SKEW_FUTURE_SCHEMA),
+            ..config_gossip::HintExtras::default()
+        }),
+    )
+    .expect("a hint carrying a future schema still encodes");
+    assert_eq!(
+        config_gossip::decode_hint_extras(&bytes).and_then(|e| e.schema),
+        Some(SKEW_FUTURE_SCHEMA),
+        "a future schema must survive the gossip wire as itself, not as an error"
+    );
+
+    let victim = cluster
+        .ids()
+        .into_iter()
+        .find(|id| *id != leader && *id != SKEW_OLD)
+        .expect("a node that is neither the leader nor the pinned voter");
+    for repeat in 0..repeats {
+        // Ordinary traffic is untouched: gating the v2 set must not stop a mixed cluster
+        // serving, or no operator could ever run the upgrade this row describes.
+        cluster
+            .client(leader)
+            .put(put_req(&format!("skew/{repeat}"), "v"))
+            .await
+            .unwrap_or_else(|e| panic!("a schema-1 write is never gated: {e}"));
+
+        // M6-90: compaction.
+        let compact = cluster
+            .compact_now(1)
+            .await
+            .expect_err("compact needs schema 2 on every voter");
+        assert_eq!(
+            compact,
+            config_core::ConfigError::Unavailable {
+                reason: config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string()
+            },
+            "expected the reserved gate reason"
+        );
+        *refusals
+            .entry(config_core::FEATURE_COMPACT.to_string())
+            .or_default() += 1;
+
+        // M6-91: retirement. Refused whole, never half-performed.
+        let retire = cluster
+            .node(leader)
+            .remove_member(victim)
+            .await
+            .expect_err("retire_node needs schema 2 on every voter");
+        assert!(
+            retire
+                .to_string()
+                .contains(config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED),
+            "the admin refusal must carry the reserved reason: {retire}"
+        );
+        *refusals
+            .entry(config_core::FEATURE_RETIRE_NODE.to_string())
+            .or_default() += 1;
+
+        // M6-92: a dedup-bearing mutation (OQ-64).
+        let dedup_req = config_core::PutRequest {
+            key: support::key(&format!("skew/dedup/{repeat}")),
+            value: support::key("v"),
+            expected_mod_revision: None,
+            dedup: Some(config_core::DedupKey::new([0x5a; 16], repeat as u64 + 1)),
+        };
+        let dedup = cluster
+            .client(leader)
+            .put(dedup_req)
+            .await
+            .expect_err("a dedup-bearing mutation needs schema 2 on every voter");
+        assert_eq!(
+            dedup,
+            config_core::ConfigError::Unavailable {
+                reason: config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string()
+            }
+        );
+        *refusals
+            .entry(config_core::FEATURE_DEDUP.to_string())
+            .or_default() += 1;
+
+        observations.push(min_sample(&cluster, leader, "mixed_after_refusals", repeat));
+    }
+
+    // The future advertisement never moved the minimum off the oldest voter.
+    let mixed_min = min_schema(&cluster, leader).expect("the leader still leads");
+    assert_eq!(
+        mixed_min,
+        config_core::COMPAT_SCHEMA_1,
+        "a voter claiming schema {} must not raise a minimum the oldest voter sets",
+        SKEW_FUTURE_SCHEMA.command_schema
+    );
+    assert_eq!(
+        cluster.running_ids().len(),
+        3,
+        "a node went down during the skew, which an advertisement must never cause"
+    );
+    cluster.shutdown().await;
+
+    // ---- two voters from the future, and nothing older --------------------------------
+    let ahead = skew_cluster()
+        .compat_schema(SKEW_FUTURE, SKEW_FUTURE_SCHEMA)
+        .compat_schema(SKEW_OLD, SKEW_FUTURE_SCHEMA)
+        .start()
+        .await;
+    let ahead_leader = skew_min_settles(&ahead, config_core::COMMAND_SCHEMA_V2).await;
+    observations.push(min_sample(&ahead, ahead_leader, "ahead_settled", 0));
+    let ahead_min = min_schema(&ahead, ahead_leader).expect("the leader still leads");
+    assert_eq!(
+        ahead_min,
+        config_core::CURRENT_SCHEMA,
+        "with two voters claiming {}, the minimum is still this build's own triple: a leader \
+         may never compute a level it cannot itself encode",
+        SKEW_FUTURE_SCHEMA.command_schema
+    );
+
+    // And the activation that follows is a real one, so the assertion above is not vacuous.
+    for i in 0..4 {
+        ahead
+            .client(ahead_leader)
+            .put(put_req(&format!("ahead/{i}"), "v"))
+            .await
+            .unwrap_or_else(|e| panic!("write {i} against a healthy quorum: {e}"));
+    }
+    ahead
+        .compact_now(2)
+        .await
+        .expect("every voter is at or above schema 2, so compaction is activated");
+    assert!(
+        ahead
+            .client(ahead_leader)
+            .get(get_req("ahead/0"))
+            .await
+            .expect("a read after compaction")
+            .record
+            .is_some(),
+        "compaction sheds history, never state"
+    );
+    assert_eq!(
+        ahead.running_ids().len(),
+        3,
+        "a node went down while two voters advertised a schema it does not know"
+    );
+    ahead.shutdown().await;
+
+    let values = serde_json::json!({
+        "repeats": repeats,
+        "advertised_future_command_schema": SKEW_FUTURE_SCHEMA.command_schema,
+        "mixed_min_command_schema": mixed_min.command_schema,
+        "ahead_min_command_schema": ahead_min.command_schema,
+        "this_build_command_schema": config_core::CURRENT_SCHEMA.command_schema,
+        "refusals_by_feature": refusals,
+        "min_schema_observations": observations,
+        "nodes_lost_to_an_unrecognised_advertisement": 0,
+    });
+    evidence::write_evidence(
+        "security-matrix-version-skew",
+        values,
+        run.scaled(MATRIX_REPEATS_FULL_SECURITY as f64, repeats as f64),
+    );
 }

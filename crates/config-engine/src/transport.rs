@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use config_core::{ClusterId, NodeId, RecoveryEpoch};
+use config_core::{
+    ClusterId, NodeId, RecoveryEpoch, SchemaTriple, COMPAT_SCHEMA_1, CURRENT_SCHEMA,
+};
 use config_log::TraceContext;
 use config_storage::{RaftNodeId, TypeConfig};
 use openraft::raft::{
@@ -133,6 +135,67 @@ pub trait PeerTransport: Send + Sync {
         req: PeerRequest,
         deadline: Duration,
     ) -> Result<PeerResponse, TransportError>;
+
+    /// The same call, carrying this node's schema and returning the peer's (ADR-0030, M6-86).
+    ///
+    /// A defaulted method rather than a field on [`PeerEnvelopeMeta`]: that struct is
+    /// constructed literally in a dozen places across four crates, most of them owned by other
+    /// work, and a new field would be a mechanical edit in every one of them for a value only
+    /// the peer plane reads.
+    ///
+    /// The default answers `None`, which every caller must read as "schema 1" rather than as an
+    /// error — that is exactly how a genuinely older peer behaves, and the safe direction
+    /// (M6-86, M6-89).
+    async fn send_with_schema(
+        &self,
+        meta: PeerEnvelopeMeta,
+        endpoint: &str,
+        req: PeerRequest,
+        deadline: Duration,
+        schema: SchemaTriple,
+    ) -> Result<(PeerResponse, Option<SchemaTriple>), TransportError> {
+        let _ = schema;
+        self.send(meta, endpoint, req, deadline)
+            .await
+            .map(|response| (response, None))
+    }
+}
+
+/// The schema each peer was last observed to advertise, on the peer plane only.
+///
+/// Leader-local and never replicated (OQ-63, M6-R4). An entry is never removed: a voter the
+/// leader can no longer reach keeps its last-known value, so an unreachable old voter holds the
+/// minimum *down* rather than dropping out of it. Divergence is therefore only ever in the safe
+/// direction — the leader under-reports what the cluster supports and refuses a feature it
+/// might have been allowed to use, which costs a compaction, where the other direction costs
+/// the cluster an undecodable committed entry (M6-89).
+#[derive(Debug, Default)]
+pub struct PeerSchemas {
+    seen: std::sync::Mutex<std::collections::BTreeMap<NodeId, SchemaTriple>>,
+}
+
+impl PeerSchemas {
+    /// Record what `node` advertised on its last answer.
+    pub fn record(&self, node: NodeId, schema: SchemaTriple) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node, schema);
+    }
+
+    /// What `node` last advertised, or [`COMPAT_SCHEMA_1`] if it never has.
+    ///
+    /// Never `Option`: a voter that has not answered, or that answered without a schema field,
+    /// is indistinguishable from a build too old to have one, and both must gate the same way.
+    #[must_use]
+    pub fn get(&self, node: NodeId) -> SchemaTriple {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .copied()
+            .unwrap_or(COMPAT_SCHEMA_1)
+    }
 }
 
 /// Why the receiving engine refused a peer call before handing it to OpenRaft.
@@ -207,6 +270,14 @@ pub trait PeerSink: Send + Sync {
         let _ = node_id;
         false
     }
+
+    /// The schema this node stamps on its peer-plane answers (ADR-0030, M6-86).
+    ///
+    /// Defaulted for the same reason as [`PeerTransport::send_with_schema`]: a sink that does
+    /// not override it is simply a node of the current build.
+    fn local_schema(&self) -> SchemaTriple {
+        CURRENT_SCHEMA
+    }
 }
 
 /// Cheap, cloneable handle to a node's [`PeerSink`]; what `config-grpc`'s `PeerService`
@@ -232,6 +303,12 @@ impl PeerHandler {
     /// Whether the node this handle belongs to has fenced `node_id` out (M5, ADR-0023).
     pub fn is_retired(&self, node_id: NodeId) -> bool {
         self.0.is_retired(node_id)
+    }
+
+    /// The schema the node behind this handle advertises (M6, ADR-0030).
+    #[must_use]
+    pub fn local_schema(&self) -> SchemaTriple {
+        self.0.local_schema()
     }
 }
 

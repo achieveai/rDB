@@ -108,30 +108,41 @@ index with the sender's. That is correct — the index is replicated state — b
 ## Upgrading a node from an older on-disk format
 
 An M4 (format v2) data directory **cannot be upgraded in place while its Raft log still holds
-entries**. Starting the new build against one fails at open with
-`UpgradeRequiresDrainedLog`, naming the directory and the number of entries in the way.
+entries the new build cannot carry**. Starting the new build against one fails at open with
+`UpgradeRequiresDrainedLog`, naming the directory and how many entries are in the way, plus a
+`reason` of `undecodable` or `unapplied` on the `upgrade_requires_drained_log` line.
 
 That refusal is deliberate and the directory is left untouched, so the previous build can still
 open it. The log payload is a positional encoding of a command type this release widened; there
 is no version field in it to dispatch on, so replaying those entries under the new build would at
 best fail and at worst apply a *different* mutation (ADR-0021 note 4).
 
+**An ordinary purge residual is not in the way.** OpenRaft always retains a tail of entries
+behind the snapshot it keeps, and waiting for the log to reach zero entries would wait forever.
+Ruling M6-R20 (ADR-0021 note 5) says what "in the way" actually means: an entry blocks the
+upgrade only if the new build cannot decode it, or if it sits **above** `last_applied` — i.e.
+the new build would still have to execute it. Applied, decodable entries are carried across.
+
 **Procedure, on the node being upgraded:**
 
-1. On the **old** build, trigger a snapshot (`retcdctl admin trigger-snapshot`, or wait for the
-   automatic one) and confirm `snapshot_built`.
-2. Let log purge run and confirm `purged` with an `upto_index` at the snapshot's last index.
-   `retcd_raft_purged_index` should reach `retcd_raft_applied_index`.
-3. Stop the node.
-4. Start the new build against the same directory. It migrates the state, creates the `dedup`
+1. On the **old** build, stop sending that node new work and let it catch up:
+   `retcd_raft_applied_index` must reach `retcd_raft_last_log_index`. This is the step that
+   clears the `unapplied` reason; a node stopped mid-replay is refused, correctly.
+2. Trigger a snapshot (`retcdctl admin trigger-snapshot`, or wait for the automatic one) and
+   confirm `snapshot_built`.
+3. Let log purge run and confirm `purged`. Do **not** wait for `retcd_raft_purged_index` to
+   reach `retcd_raft_applied_index` exactly — a residual is expected and is not a problem.
+4. Stop the node.
+5. Start the new build against the same directory. It migrates the state, creates the `dedup`
    family, and starts with an empty dedup window — correct, because a v2 directory retained no
    request ids.
 
 **Verify.** `format_migrated` with `from=2 to=3`, the node rejoins, and `retcd_dedup_records`
 begins from 0 on that node while the other voters' value is unchanged. Do one node at a time.
 
-If you cannot drain the log — the node is too far behind to snapshot, or it will not start —
-treat it as a lost node and rebuild it as a fresh learner instead
+If you cannot clear the blockers — the node will not catch up, the node will not start, or
+the refusal's `reason` is `undecodable` and stays that way — treat it as a lost node and rebuild
+it as a fresh learner instead
 ([learner-replacement.md](learner-replacement.md)). Do not hand-edit the directory.
 
 ## What dedup does not do

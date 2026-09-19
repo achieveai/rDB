@@ -93,6 +93,10 @@ the CA-is-not-revocation deviation the test plan's §15 review raised.
     naming the peer(s) in the typed refusal, unless the operator passes `--force`. Removing a key
     a peer still needs would silently exile that peer from the gossip mesh — refusing by default
     turns that into a visible, overridable decision rather than a surprise outage.
+    (As built, 2026-09-19, ruling M6-R21: the refusal also covers a peer that advertises the
+    target key as its *primary* — the key it is still signing with — because between the `add`
+    sweep and the `use` sweep every peer holds both keys and the sole-key test alone would let
+    a removal exile all of them.)
   - Whichever path is implemented, the pinned-source verification finding itself is recorded (one
     line, in the release notes and in this ADR's Notes section once known) so a later reader does
     not have to re-derive which path is live.
@@ -104,10 +108,12 @@ the CA-is-not-revocation deviation the test plan's §15 review raised.
   only if its certificate chains to a still-trusted root at the moment it reconnects — a voter that
   was offline for an entire add/use/remove cycle and comes back on the now-removed CA is refused
   with a typed error, not silently allowed back on stale trust.
-- Certificate expiry is exposed as `retcd_cert_expiry_seconds{plane, subject}`, computed from the
-  injectable clock (not wall-clock reads scattered through the codebase), warning once per subject
+- Certificate expiry is exposed as `retcd_cert_expiry_seconds{plane}`, computed from the
+  injectable clock (not wall-clock reads scattered through the codebase), warning once per plane
   per 30-day threshold crossing rather than once per scrape — a metric that pages an operator every
-  fifteen seconds is not actionable.
+  fifteen seconds is not actionable. (As built, 2026-09-19: the `subject` label this bullet
+  originally carried does not exist. ADR-0026 declares `node_id` and `plane`, and a subject DN is
+  exactly what the secret-hygiene bullet below keeps out of a label.)
 - No log line, metric label, health payload, or error message ever contains a private key, a
   gossip key, or raw certificate bytes — fingerprints (SHA-256 of the DER/key bytes) only, the same
   redaction discipline ADR-0003's `GossipConfig` already applies to its shared key, extended here
@@ -145,4 +151,122 @@ the CA-is-not-revocation deviation the test plan's §15 review raised.
 
 ## Notes
 
-None yet.
+### 2026-09-19 — as-built (dev-rotation)
+
+**Finding A — the gossip keyring path is the implemented one.** The pinned memberlist 0.8.5 does
+expose a live keyring: `Memberlist::keyring()` (`memberlist-core-0.8.5/src/api.rs:55`, behind the
+`encryption` feature this workspace enables) hands back a `Keyring` whose `insert` / `use_key` /
+`remove` / `primary_key` / `keys` (`src/keyring.rs`) are read by the encrypt path per send
+(`src/network.rs:123`) and by the decrypt path per receive (`src/network.rs:351`). Mutations
+therefore take effect live, with no restart and no reconstruction of the node. The
+`gossip.secondary_key` staged-restart fallback described above is **not** implemented, and the
+`GossipKeyring { primary, accepted }` capability shape is. The library already enforces two of
+this ADR's rules for free — `use_key` requires a prior `insert`, and `remove` refuses the primary
+— so rEtcd's own refusal (OQ-61) sits on top of them rather than re-implementing them.
+
+**Finding B — the TLS handshake moved into this crate.** tonic 0.12.3's `ServerTlsConfig` gives no
+seam for replacing credentials on a live listener, so `config-grpc/src/server.rs` now runs the
+`tokio_rustls` acceptor itself and feeds the accepted streams to tonic as an incoming stream.
+Verified against the pinned tonic source and then empirically: `TlsConnectInfo::peer_certs` still
+populates, so principal derivation (ADR-0011, ADR-0012) is untouched — the whole `config-grpc`
+mTLS integration suite passes unchanged. `TlsMode::apply_server` was **removed** rather than kept
+as a no-op: a method that silently did nothing would be a trap for the next person to add a plane.
+
+**Where the rotator lives (ruling M6-R19).** `config_grpc::rotation::TlsRotator`, not the
+daemon. It was written in `config-server` first and moved, because `config-server` declares only
+`[[bin]]`: nothing in the workspace can depend on it, so the test plan's harness at
+`crates/config-testkit/src/rotation.rs` was unbuildable as specified (TA-57). The move is also
+the honest placement — everything a rotation manipulates (`CredentialSource`, `Credentials`,
+`GrpcPeerTransport`, `MtlsConfig`) is `config-grpc`'s, and rotation belongs beside the acceptor
+it rotates. What stayed in the daemon is the schedule: `tls.watch_files_secs` is a configuration
+key, and a transport library that spawned its own timer would be a library with an opinion about
+a file it was never handed. `TlsFiles { ca, cert, key }` names what to re-read and deliberately
+carries no interval.
+
+**`RwLock`, not `ArcSwap`.** The swap is `RwLock<Arc<Credentials>>` plus an `AtomicU64`
+generation. A dependency bought for one pointer swap on a path that runs once per rotation is not
+worth its supply-chain surface; the read side clones an `Arc` under a read lock, which a handshake
+already dwarfs.
+
+**TA-65 deviation — two pollers, one shape.** This ADR and ADR-0027 each specify a poller. They
+are implemented as two tasks (`crate::policy::PolicyLoader::spawn_poller`,
+`crate::rotation::TlsRotator::spawn_poller`) sharing one shape — `tokio::time::interval` with
+`MissedTickBehavior::Delay`, a `biased` select on a shutdown `Notify`, and the blocking read on
+`spawn_blocking` — rather than one task doing both. They stop at different points of the teardown:
+the policy poller takes the journal gate, while the TLS poller must not replace a listener's
+credentials while it is draining.
+
+**Config key name.** `tls.watch_files_secs`, not this ADR's `tls.watch_files`. Every other
+interval in the node document carries its unit (`authz.poll_interval_secs`,
+`retention.check_interval_secs`), and a bare `watch_files` reads like a boolean. Zero is refused
+rather than treated as "disabled"; `ReloadTls` is how an operator rotates on demand.
+
+**Direct `tokio-rustls` / `rustls-pemfile` dependencies.** Both are declared with
+`default-features = false` so they cannot select a crypto provider, leaving tonic's choice the
+only one in the build. **Residual risk:** a future bump that changes rustls' default provider
+selection could produce a process with two providers registered and handshakes failing at
+runtime rather than at compile time. What catches it is the mTLS suites —
+`crates/config-testkit/tests/m3_client_mtls.rs`, `m3_peer_mtls.rs`, and
+`crates/config-grpc/tests/` — none of which can pass without a working handshake.
+
+**The advertised key set is derived, never configured.** `GossipNode::start` fills
+`HintExtras::accepted_gossip_keys` from the keyring it has just built, and every keyring mutation
+re-advertises through `update_extras` (ruling M6-R18). No caller supplies the value. A node
+advertising a set its keyring did not match would make a rotation impossible to follow safely,
+since an operator promotes a key precisely because every peer claims to accept it.
+
+**M6-59 refusal shape.** `AdminError::InvalidArgument` with the greppable detail prefix
+`gossip_key_still_needed:`, rather than a new `AdminError` variant: that enum is the membership
+plane's vocabulary and a gossip keyring is not membership. Callers branch on the prefix.
+
+### 2026-09-19 — as-built (dev-rotation-harness): the in-process rows
+
+`crates/config-testkit/tests/m6_rotation.rs` implements §4.1 (M6-41..M6-48), §4.4
+(M6-62..M6-64) and four of §4.3 (M6-57, M6-58, M6-59, M6-61) against this ADR's code. Five
+things the rows established that this ADR did not say, and one defect they found.
+
+**OQ-59 is answered by observation, not by an assertion.** No row names an acceptor type. What
+the rows read is a fingerprint off a real TLS handshake (`Cluster::served_leaf_fingerprint`,
+TA-57), and it agrees with what `ReloadTls` reports and with the `tls_reloaded` log line. The
+choice `config-grpc` actually made — `tokio-rustls` accepting into a channel that tonic serves,
+with `CredentialSource` read per connection — is therefore recorded here rather than pinned by a
+test, which is what M6-56 was for. M6-56 itself is not implemented.
+
+**A reload reports three planes, and the third is the dialler.** `client`, `peer` and
+`peer_dial`. Rotating what a node serves without rotating what it dials would leave its peers
+disagreeing about who it is the moment the old anchor is dropped, so the three move together
+under one RPC (OQ-60's decision, as built).
+
+**A rotation is only safe inside an overlap window, and the rows are written that way.** Every
+row that rotates a leaf first widens every node's trust anchors. This is §15.1's procedure; it
+is stated here because a reader of `ReloadTls` alone could reasonably conclude that rotating one
+node is a local operation, and it is not.
+
+**`Credentials::compile` does not check validity dates.** An expired leaf is *serveable* as far
+as the reload path is concerned; it is refused at handshake time by the peer, as
+`CertificateError::Expired`. A reload therefore cannot be relied on to catch an operator
+deploying an already-expired certificate — what catches that is
+`retcd_cert_expiry_seconds` going negative and the `cert_expiring` warning, whose
+`days_remaining` is deliberately signed for exactly this reason.
+
+**The CN-principal gate is not re-readable from disk, structurally.** `TlsRotator::read_material`
+rebuilds every profile from the `MtlsConfig` template captured at start and replaces only the
+three PEM byte fields, so no file write can flip `allow_common_name_principals`. M6-48 asserts
+this directly, because a flag a file write could flip would be a file-write privilege escalation.
+
+**Defect found and fixed: `BadSignature` was reported as `handshake_failed`.**
+`classify_handshake_failure` (`config-grpc/src/server.rs`) mapped only
+`CertificateError::{UnknownIssuer, NotValidForName}` to `AuthnRejectReason::UntrustedClientCa`.
+webpki returns `BadSignature` when a presented chain *names* a trusted anchor but is not signed
+by it — which is the ordinary shape of a CA rotation, because a re-issued CA normally keeps its
+subject DN. The operator-visible fact is "this client's certificate does not chain to anything I
+trust", and reporting it as the catch-all `handshake_failed` sends them looking for a protocol
+fault instead. `BadSignature` now joins that arm. The gap survived M3 because no row anywhere
+asserted the `reason` label for the wrong-CA case; M6-45 and M6-109 now both do, and a mutation
+that reverts the fix fails M6-109.
+
+**Duplication to keep in step.** `config-server` has only a `[[bin]]` target, so
+`config-testkit/src/rotation.rs` restates `parse_gossip_key` and the
+`gossip_key_still_needed:` / `gossip_keyring_refused:` error mapping rather than calling them. A
+divergence between the two would show up as M6-59 passing in-process while E2E-43 fails on the
+daemon.

@@ -234,8 +234,8 @@ impl ClientBackend for NodeBackend {
         self.store.clone()
     }
 
-    fn record_authn_rejection(&self) {
-        self.node.record_authn_rejection();
+    fn record_authn_rejection(&self, reason: config_engine::AuthnRejectReason) {
+        self.node.record_authn_rejection(reason);
     }
 }
 

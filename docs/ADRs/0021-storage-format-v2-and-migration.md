@@ -274,3 +274,97 @@ entry — the pre-M5 `Command` layout, mirrored in the test so the row outlives 
 asserts the typed refusal, that the refused directory still reads as v2 with no `dedup` family,
 and that the documented drain-then-upgrade fix then works. The row also asserts, rather than
 assumes, that those M4 bytes do not decode under the current `Entry<TypeConfig>`.
+
+### Note 5 (2026-09-19, M6 finding, lead ruling M6-R20): "drained" is a property of the entries, not of the marker
+
+Note 4's contract is kept. Its **predicate** is replaced, because M6 found it was both unsound
+in one direction and unsatisfiable in the other.
+
+**Unsound.** Note 4 refuses on "the marker is legacy and the log is non-empty", using the marker
+as a proxy for "a build with a narrower `Command` wrote this log". ADR-0030 broke that proxy.
+A current binary started with `--compat-schema 1` lowers `RocksOptions::max_format_version` to 1
+and — by the deliberate design recorded in ADR-0030 and in `open_inner`'s own comment — stamps
+*that ceiling*, not `FORMAT_VERSION`, so it can reopen its own directory. It then writes log
+entries in the **current** grammar, because this build has no schema-1 command encoder
+(ADR-0030 as-built: "No schema-1 command encoder"). The marker records the ceiling the writer
+ran under; it has never recorded the grammar it wrote. On the next start without the flag, note
+4's predicate refused a log the very same binary had just written and could decode perfectly.
+
+**Unsatisfiable.** Note 4's fix — "trigger a snapshot and let log purge drain the log" — cannot
+reach an empty log. OpenRaft's purge deliberately retains a tail behind the snapshot it keeps;
+tester-m6c measured a residual of exactly 2 entries across 6 independent runs under every
+`[snapshot]` tuning (`logs_since_last`, `logs_to_keep`, `purge_batch_size`), with full state
+convergence confirmed between attempts. Consequence: **every** in-place format migration, 1→2
+and 2→3 alike, was unreachable outside test fixtures that write the directory by hand, and
+ADR-0030's rolling upgrade (E2E-42) was blocked on a precondition no operator can satisfy.
+
+**The amended predicate.** An in-place upgrade proceeds when, for every entry the `raft_log`
+family still retains, both of the following hold:
+
+1. the entry **decodes** as `Entry<TypeConfig>` under this build; and
+2. the entry's index is **at or below `state_meta/last_applied`** (absent `last_applied` means
+   nothing has been applied, so every retained entry fails this clause).
+
+Anything else is refused, with the same `StorageOpenError::UpgradeRequiresDrainedLog { format,
+log_entries, path }` and the same `upgrade_requires_drained_log` line. `log_entries` now counts
+the entries that *block* the upgrade rather than every entry retained — an applied, decodable
+residual is carried, not counted — and the line gains `first_blocking_index` and a `reason`
+of `undecodable` or `unapplied`.
+
+**Why these two clauses and not one.**
+
+- Clause 1 is the literal claim note 4's own error message makes ("an in-place upgrade cannot
+  decode them"), asked of the bytes instead of inferred from a marker. It is exact: bytes a
+  narrower build wrote fail it, bytes this build wrote pass it.
+- Clause 2 is what a decode check alone would lose. A positional decode that *succeeds* is not
+  proof that the bytes mean the same command — that is note 4's own unobserved worst case. An
+  entry at or below `last_applied` has already had its effect and will never be applied on this
+  node again, so a lucky decode cannot reach the state machine. An entry above it is one this
+  build is going to **execute**, and by apply time there is no way back. Clause 2 is therefore
+  the blast-radius bound, and clause 1 is the decodability test; neither subsumes the other.
+
+An empty log satisfies both clauses, so every directory note 4 admitted is still admitted. The
+scan still runs only on the single open that finds a legacy marker, still runs against a
+read-only handle in the prologue (so a refused directory is byte-for-byte the one the operator
+left), and still only reads — spec §17's bound on unbounded in-place rewrites is untouched.
+
+**The operator procedure, restated.** On the previous build: let the node catch up so nothing is
+unapplied, trigger a snapshot and let log purge drain what it can, shut the node down, then
+start the new build against the directory. The difference from note 4 is that this procedure now
+*terminates* — it no longer waits for a zero the purge will never produce. The message wording
+changed to match; it still names `snapshot`, `purge` and `drained`.
+
+**What did not change.** Note 4's contract, its read-only placement, its backstop after the
+writable open, its scope over every `FormatAction::Migrate`, and the refusal of a genuinely
+older-grammar log. M5-127 and M5-71 both seed an entry that fails clause 1, and both still
+refuse with `log_entries: 1` and unchanged assertions — clause 1 is load-bearing for M5-127
+(whose seeded entry sits at an applied index) and clause 2 for M5-71 (whose hand-built directory
+has no `last_applied` at all). That the two pre-existing rows keep their exact numbers under the
+new predicate is the evidence that it is the one they were always reaching for.
+
+**Verified by** `m6_r20_a_pinned_directory_with_an_applied_log_residual_migrates` and
+`m6_r20_b_an_unapplied_entry_still_refuses_the_migration`
+(`crates/config-storage/tests/m6_compat_open.rs`), alongside the unchanged M5-127 and M5-71.
+
+### Note 6 (2026-09-19, critic-m6 BLOCKER-1, lead ruling M6-R22): the v1 watermark stamp keys on the layout, not the marker
+
+Ruling R1 stamps `compact_revision = cluster_revision` on the v1 → current migration, because
+a v1 directory has no journal and none of its history can be resumed. The as-built code keyed
+that stamp on `FormatAction::Migrate { from: 1 }`, which is derived from the **marker**.
+
+ADR-0030 made the marker an unreliable proxy for the layout: a build pinned with
+`--compat-schema 1` stamps marker 1 over the **current** column families, journal included.
+Restarting such a node without the flag took the v1 clause and set its watermark to its own
+revision. Every watch resume and historical read below that revision was then refused on that
+node, silently (the watermark is outside `state_hash` by design), and for good
+(`restore_compact_revision` unions by `max`). This is exactly the rolling upgrade E2E-42
+documents. No row caught it: M6-98c migrates an empty directory and M6-R20(a) asserted
+`cluster_revision` but not `compact_revision`.
+
+**Amendment.** The stamp fires only when the marker says 1 *and* the journal cannot resume
+anything: either `verify_column_families` reports the v1 layout (no `events` family), or the
+`events` family exists but is empty. The empty case is what a real v1 directory looks like on
+the retry after a crash between `open_db` creating the families and the migration batch
+(M4-14, M4-18), so it must still be stamped. A directory with a populated journal keeps
+whatever watermark it has. M6-R20(a) now asserts `compact_revision == 0` after the pinned-then-upgraded
+open. R1's contract is unchanged for real v1 directories.

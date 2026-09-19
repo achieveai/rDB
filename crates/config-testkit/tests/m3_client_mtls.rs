@@ -445,6 +445,7 @@ async fn m3_25_client_cert_cannot_be_used_on_peer_plane() {
                 to_node_id: target.0,
                 payload_encoding: 1,
                 payload: b"{}".to_vec().into(),
+                schema: None,
             };
             let result = client.vote(tonic::Request::new(envelope)).await;
             assert!(
