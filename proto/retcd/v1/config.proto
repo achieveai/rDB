@@ -1,0 +1,72 @@
+// rEtcd client plane (DesignSpec-01 §6.2, ADR-0010).
+//
+// Field numbers are normative and must never be reused. Watch RPCs/messages are
+// deliberately not declared in this release; the spec pre-assigns their tags for a later
+// milestone (M4). The authenticated principal is derived only from mTLS transport identity,
+// never from a field.
+//
+// Trace context travels in gRPC metadata (ADR-0013):
+//   retcd-trace-id, retcd-parent-span, retcd-request-id
+// NotLeader responses (FAILED_PRECONDITION) carry metadata:
+//   retcd-leader-node-id, retcd-leader-endpoint
+syntax = "proto3";
+
+package retcd.v1;
+
+service ConfigService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc List(ListRequest) returns (ListResponse);
+  rpc Put(PutRequest) returns (MutationResponse);
+  rpc Delete(DeleteRequest) returns (MutationResponse);
+}
+
+message Record {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 create_revision = 3;
+  uint64 mod_revision = 4;
+}
+
+message GetRequest { bytes key = 1; }
+
+message GetResponse {
+  optional Record record = 1;
+  uint64 read_revision = 2;
+}
+
+message ListRequest {
+  bytes prefix = 1;
+  uint32 max_items = 2;
+  uint64 max_bytes = 3;
+}
+
+message ListResponse {
+  repeated Record records = 1;
+  uint64 read_revision = 2;
+  bool truncated = 3;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  optional uint64 expected_mod_revision = 3;
+}
+
+message DeleteRequest {
+  bytes key = 1;
+  optional uint64 expected_mod_revision = 2;
+}
+
+enum MutationOutcome {
+  MUTATION_OUTCOME_UNSPECIFIED = 0;
+  APPLIED = 1;
+  CONFLICT = 2;
+  NOT_FOUND = 3;
+}
+
+message MutationResponse {
+  MutationOutcome outcome = 1;
+  uint64 revision = 2;
+  bool exists = 3;
+  uint64 current_mod_revision = 4;
+}

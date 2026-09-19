@@ -1,0 +1,27 @@
+[package]
+name = "config-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd client implementations of ConfigStore: remote GrpcClient with bounded leader-hint following"
+
+[dependencies]
+config-core = { workspace = true }
+config-grpc = { workspace = true }
+config-log = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+config-log = { workspace = true }
+# Dev-only, and deliberately circular: `config-testkit` depends on this crate, so cargo allows
+# the edge only for tests. `TlsFixture` is where the node/client certificate shape is defined
+# (URI SAN plus the `peer_server_domain` DNS SAN), and a second hand-rolled fixture here would
+# be a second definition of the thing these tests exist to check.
+config-testkit = { workspace = true }
+serde_json = { workspace = true }
+tokio-stream = { workspace = true }

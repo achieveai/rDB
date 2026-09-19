@@ -1,0 +1,34 @@
+// rEtcd peer (Raft) plane (ADR-0010).
+//
+// OpenRaft request/response types are carried as opaque serde-encoded bytes; the envelope
+// binds every call to a cluster identity so a node can reject traffic from a foreign cluster,
+// epoch, or misaddressed node before decoding (ADR-0011). The peer plane is always mTLS in
+// production; the peer certificate SAN is `retcd://<cluster_id>/node/<node_id>` and must match
+// `from_node_id` / `cluster_id` of the envelope.
+//
+// InstallSnapshot exists because the OpenRaft network trait requires it; this release never
+// triggers snapshots (ADR-0008) and the server answers UNIMPLEMENTED.
+syntax = "proto3";
+
+package retcd.v1;
+
+service PeerService {
+  rpc AppendEntries(PeerEnvelope) returns (PeerEnvelope);
+  rpc Vote(PeerEnvelope) returns (PeerEnvelope);
+  rpc InstallSnapshot(PeerEnvelope) returns (PeerEnvelope);
+}
+
+message PeerEnvelope {
+  // 32 lowercase hex chars (ClusterId).
+  string cluster_id = 1;
+  uint32 recovery_epoch = 2;
+  uint64 from_node_id = 3;
+  uint64 to_node_id = 4;
+  // Payload encoding. One encoding per protocol version, never negotiated: a receiver accepts
+  // exactly the tag it speaks and refuses every other with INVALID_ARGUMENT.
+  //   1 = serde_json (retired: expanded byte strings up to 4x)
+  //   2 = postcard    (this release)
+  uint32 payload_encoding = 5;
+  // Serde-encoded openraft request (on the way in) or response (on the way out).
+  bytes payload = 6;
+}

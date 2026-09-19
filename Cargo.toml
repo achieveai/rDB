@@ -1,0 +1,90 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/config-log-macros",
+    "crates/config-log",
+    "crates/config-core",
+    "crates/config-gossip",
+    "crates/config-storage",
+    "crates/config-engine",
+    "crates/config-grpc",
+    "crates/config-client",
+    "crates/config-testkit",
+    "crates/config-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/gautambhakar/rEtcd"
+
+[workspace.dependencies]
+# --- internal ---
+config-log-macros = { path = "crates/config-log-macros" }
+config-log = { path = "crates/config-log" }
+config-core = { path = "crates/config-core" }
+config-storage = { path = "crates/config-storage" }
+config-engine = { path = "crates/config-engine" }
+config-gossip = { path = "crates/config-gossip" }
+config-grpc = { path = "crates/config-grpc" }
+config-client = { path = "crates/config-client" }
+config-testkit = { path = "crates/config-testkit" }
+
+# --- pinned per ADR-0002 / ADR-0003 ---
+# `loosen-follower-log-revert` is deliberately NOT here: it is a dev-dependency feature of
+# config-engine and config-testkit only, so `cargo build` keeps openraft's log-revert
+# assertion and only test binaries relax it (ADR-0008 note).
+openraft = { version = "=0.9.25", features = ["serde", "storage-v2"] }
+memberlist = { version = "=0.8.5", default-features = false, features = ["tokio", "tcp", "encryption", "crc32", "metrics"] }
+smol_str = "0.3"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+
+# --- common ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "signal", "io-util"] }
+futures = "0.3"
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry"] }
+tracing-appender = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+uuid = { version = "1", features = ["v4"] }
+# `tls-roots` is deliberately absent: a rEtcd peer or client trusts exactly the CA the
+# operator configured (ADR-0010), never the host's ambient root store.
+tonic = { version = "0.12", features = ["tls"] }
+tonic-build = "0.12"
+prost = "0.13"
+protox = "0.7"
+# `bindgen-runtime` is a build-script-only feature: it makes `clang-sys` load `libclang.dll`
+# through `libloading` at build time (honouring `LIBCLANG_PATH`, ADR-0017) instead of linking it
+# as a load-time import. Without it the `librocksdb-sys` build script cannot start on Windows
+# (`STATUS_DLL_NOT_FOUND`). It changes nothing about the compiled database.
+rocksdb = { version = "0.23", default-features = false, features = ["lz4", "bindgen-runtime"] }
+rcgen = "0.13"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+proptest = "1"
+tempfile = "3"
+x509-parser = "0.16"
+tokio-stream = { version = "0.1", features = ["net"] }
+sha2 = "0.10"
+hex = "0.4"
+
+[profile.dev]
+# RocksDB is unusably slow unoptimized; optimize deps only.
+opt-level = 0
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test]
+opt-level = 0
+[profile.test.package."*"]
+opt-level = 2

@@ -1,0 +1,39 @@
+[package]
+name = "config-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd daemon: the runnable node binary (ADR-0018) composing config-engine, config-grpc, config-gossip and config-storage"
+
+[[bin]]
+name = "config-server"
+path = "src/main.rs"
+
+[dependencies]
+config-core = { workspace = true }
+config-engine = { workspace = true }
+config-gossip = { workspace = true }
+config-grpc = { workspace = true }
+config-log = { workspace = true }
+config-storage = { workspace = true }
+clap = { workspace = true }
+# `pkcs8` is not needed here: the daemon only *verifies* a manifest signature from 32 raw
+# public-key bytes, so the default feature set is enough.
+ed25519-dalek = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+config-client = { workspace = true }
+config-testkit = { workspace = true }
+# Test-only: M3-66 recomputes the SHA-256 the daemon publishes for its policy document, so the
+# expected digest is derived from the fixture rather than pasted in as a constant that would
+# rot the moment the fixture changed.
+sha2 = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name = "config-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rEtcd structured JSONL logging, trace context propagation, and test context (ADR-0013)"
+
+[dependencies]
+config-log-macros = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
