@@ -6,6 +6,21 @@ use std::time::Duration;
 use config_core::{Authz, ClusterIdentity, Durability, Limits, TransportSecurity};
 use config_storage::{EphemeralStore, RocksStore, StateReader};
 
+/// How many log entries one `AppendEntries` may carry (`openraft::Config::max_payload_entries`).
+///
+/// OpenRaft's own default is 300, which under [`config_core::Limits::max_request_bytes`] would
+/// let a single RPC reach hundreds of megabytes. A transport has to size its receive cap for the
+/// largest message the leader can legally build, so this constant is the term that makes that
+/// cap finite and small (`config_grpc::peer_plane_message_limit`). Lowering it costs at most an
+/// extra round trip per 16 entries when a follower is catching up; leaving it at 300 costs a
+/// wedged replication stream, because an over-size `AppendEntries` is rejected and OpenRaft
+/// retries it forever.
+///
+/// Kept at 16 after the peer payload moved to postcard (ADR-0010, fix-round follow-up): the
+/// binary encoding shrank the *cap*, not the per-RPC cost of receiving a full batch, and 16
+/// maximum-size commands per `AppendEntries` is already more than a real write burst produces.
+pub const MAX_PAYLOAD_ENTRIES: u64 = 16;
+
 /// Raft timing, in milliseconds.
 ///
 /// The defaults are the Windows-safe values from the OpenRaft research note: OpenRaft ticks at
@@ -214,6 +229,9 @@ impl NodeConfig {
 
     /// Build the OpenRaft config this node runs with.
     ///
+    /// `max_payload_entries` is [`MAX_PAYLOAD_ENTRIES`] rather than OpenRaft's default; see
+    /// that constant for why the transport's receive cap depends on it.
+    ///
     /// # Why the log is never purged
     ///
     /// `SnapshotPolicy::Never` is the load-bearing setting: OpenRaft only ever purges below a
@@ -230,6 +248,7 @@ impl NodeConfig {
             election_timeout_min: self.raft.election_min_ms,
             election_timeout_max: self.raft.election_max_ms,
             snapshot_policy: openraft::SnapshotPolicy::Never,
+            max_payload_entries: MAX_PAYLOAD_ENTRIES,
             max_in_snapshot_log_to_keep: u64::MAX,
             purge_batch_size: 1,
             enable_tick: true,

@@ -5,11 +5,11 @@ mod support;
 
 use std::time::Duration;
 
-use config_core::{ClusterId, NodeId, RecoveryEpoch};
+use config_core::{ClusterId, Limits, NodeId, RecoveryEpoch};
 use config_engine::netfault::NetFault;
 use config_engine::transport::{
     PeerEnvelopeMeta, PeerRequest, PeerResponse, PeerTransport, TransportError,
-    PAYLOAD_ENCODING_JSON,
+    PAYLOAD_ENCODING_POSTCARD,
 };
 use config_grpc::pb;
 use config_grpc::pb::peer_service_client::PeerServiceClient;
@@ -23,6 +23,8 @@ use tokio::net::TcpListener;
 use support::{cluster, FakeSink, CLUSTER};
 
 const DEADLINE: Duration = Duration::from_secs(5);
+/// The `payload_encoding` tag of the retired serde-JSON encoding (ADR-0010, fix-round note).
+const RETIRED_PAYLOAD_ENCODING_JSON: u32 = 1;
 const OTHER_CLUSTER: &str = "ffffffffffffffffffffffffffffffff";
 
 fn meta(cluster_id: ClusterId, from: u64, to: u64) -> PeerEnvelopeMeta {
@@ -54,8 +56,14 @@ async fn start_peer_plane_as(
         .expect("bind ephemeral peer-plane port");
     // ADR-0013: the plane's lines name the node it serves for (see `support::node_span`).
     let handle = support::node_span(sink.node_id.0).in_scope(|| {
-        serve_peer_plane(sink.handler(), listener, TlsMode::Insecure, identity)
-            .expect("serve peer plane")
+        serve_peer_plane(
+            sink.handler(),
+            listener,
+            TlsMode::Insecure,
+            identity,
+            Limits::DEFAULT,
+        )
+        .expect("serve peer plane")
     });
     let endpoint = handle.local_addr().to_string();
     (handle, endpoint)
@@ -65,7 +73,7 @@ async fn start_peer_plane_as(
 async fn m1_grpc_10_vote_round_trips_through_the_peer_plane() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (handle, endpoint) = start_peer_plane(&sink).await;
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new(), Limits::DEFAULT);
 
     let sent = meta(cluster(), 1, 2);
     let response = transport
@@ -101,7 +109,7 @@ async fn m1_grpc_10_vote_round_trips_through_the_peer_plane() {
 async fn m1_grpc_11_wrong_cluster_id_is_rejected_as_identity() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new(), Limits::DEFAULT);
 
     let foreign: ClusterId = OTHER_CLUSTER.parse().unwrap();
     let error = transport
@@ -123,7 +131,7 @@ async fn m1_grpc_11_wrong_cluster_id_is_rejected_as_identity() {
 async fn m1_grpc_12_wrong_destination_node_is_rejected_as_identity() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new(), Limits::DEFAULT);
 
     let error = transport
         .send(meta(cluster(), 1, 3), &endpoint, vote(), DEADLINE)
@@ -138,7 +146,7 @@ async fn m1_grpc_12_wrong_destination_node_is_rejected_as_identity() {
 
 #[retcd_test]
 async fn m1_grpc_13_a_closed_port_is_unreachable_not_a_remote_error() {
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new(), Limits::DEFAULT);
     let mut stolen = Vec::new();
 
     // Naming a closed port means binding an ephemeral one and releasing it — but a test
@@ -177,7 +185,7 @@ async fn m1_grpc_14_a_blocked_pair_fails_without_dialing() {
 
     let faults = NetFault::new();
     faults.block(NodeId(1), NodeId(2));
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults.clone());
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults.clone(), Limits::DEFAULT);
 
     let error = transport
         .send(meta(cluster(), 1, 2), &endpoint, vote(), DEADLINE)
@@ -210,7 +218,7 @@ async fn m1_grpc_15_a_dropped_response_is_a_network_error() {
 
     let faults = NetFault::new();
     faults.drop_response(NodeId(1), NodeId(2));
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults);
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults, Limits::DEFAULT);
 
     let error = transport
         .send(meta(cluster(), 1, 2), &endpoint, vote(), DEADLINE)
@@ -240,7 +248,9 @@ async fn m1_grpc_16_unknown_payload_encoding_is_invalid_argument() {
             recovery_epoch: 0,
             from_node_id: 1,
             to_node_id: 2,
-            payload_encoding: PAYLOAD_ENCODING_JSON + 1,
+            // The serde-JSON tag this protocol spoke before it moved to postcard: a peer built
+            // against the retired encoding must be refused, not silently mis-decoded.
+            payload_encoding: RETIRED_PAYLOAD_ENCODING_JSON,
             payload: Default::default(),
         })
         .await
@@ -248,14 +258,14 @@ async fn m1_grpc_16_unknown_payload_encoding_is_invalid_argument() {
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
 
     // A well-formed envelope carrying the wrong request kind is refused too.
-    let payload = serde_json::to_vec(&vote()).unwrap();
+    let payload = postcard::to_allocvec(&vote()).unwrap();
     let status = raw
         .append_entries(pb::PeerEnvelope {
             cluster_id: CLUSTER.to_string(),
             recovery_epoch: 0,
             from_node_id: 1,
             to_node_id: 2,
-            payload_encoding: PAYLOAD_ENCODING_JSON,
+            payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: payload.into(),
         })
         .await
@@ -303,7 +313,7 @@ async fn m1_grpc_17_install_snapshot_is_unimplemented_in_this_release() {
             recovery_epoch: 0,
             from_node_id: 1,
             to_node_id: 2,
-            payload_encoding: PAYLOAD_ENCODING_JSON,
+            payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: Default::default(),
         })
         .await
@@ -327,7 +337,7 @@ async fn m1_grpc_18_an_answer_from_the_wrong_identity_is_rejected() {
         ..honest
     };
     let (_handle, endpoint) = start_peer_plane_as(&sink, impostor).await;
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new());
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new(), Limits::DEFAULT);
 
     let error = transport
         .send(meta(cluster(), 1, 2), &endpoint, vote(), DEADLINE)
@@ -381,7 +391,7 @@ async fn m1_grpc_19_an_injected_delay_is_charged_to_the_call_deadline() {
     // The subject of the test, not a synchronization sleep: the deadline is a tenth of it, so
     // the call must fail on time however fast the machine is.
     faults.delay(NodeId(1), NodeId(2), Duration::from_secs(30));
-    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults);
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, faults, Limits::DEFAULT);
 
     let started = std::time::Instant::now();
     let error = transport

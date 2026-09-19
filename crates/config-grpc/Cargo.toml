@@ -11,8 +11,8 @@ config-engine = { workspace = true }
 config-log = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+postcard = { workspace = true }
 prost = { workspace = true }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
@@ -30,3 +30,4 @@ config-storage = { workspace = true }
 openraft = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }

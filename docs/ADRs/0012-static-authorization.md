@@ -24,3 +24,17 @@
 
 - M3: unlisted principal → `PERMISSION_DENIED`; wrong prefix → `PERMISSION_DENIED`; missing policy
   file → readiness false.
+
+## Note (2026-09-18, fix round): the CN fallback above is opt-in (F-015)
+
+The "(SAN URI …, CN fallback)" in the Decision is now conditional. A Common Name carries no
+cluster id, so it cannot be checked against the listener's cluster the way a `retcd://` SAN is
+(ADR-0010, ADR-0011); under a CA shared across an organisation that made any CN-only
+certificate a principal here, whichever cluster it was minted for, bounded only by the
+allowlist. The fallback therefore runs only when the listener sets
+`MtlsConfig::allow_common_name_principals` (daemon key `tls.allow_common_name_principals`,
+default `false`, logged as `common_name_principals_enabled` at `warn` when enabled). It exists
+for CAs that cannot mint URI SANs and is a deliberate narrowing of the cluster binding, not a
+default. Everything else here is unchanged: identity still never comes from a request field,
+and a certificate asserting a non-client `retcd://` identity is still refused rather than read
+as its CN. Covered by M3-88.

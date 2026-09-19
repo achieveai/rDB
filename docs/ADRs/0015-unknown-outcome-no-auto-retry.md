@@ -79,7 +79,7 @@ was refused, or whose endpoint was not listening, arrived at `classify` as an un
 and was reported as `DeadlineExceededUnknownOutcome`. The first version of this ADR accepted
 that under "safety is preferred to precision". In M3 it stopped being free. §4.2's negative
 rows — a client pointed at an untrusted certificate, a stopped node, an impostor at a hinted
-endpoint (M3-54, M3-62, M3-64) — are all *demonstrably* pre-submission, and reporting them as
+endpoint (M3-54, M3-18, M3-64) — are all *demonstrably* pre-submission, and reporting them as
 unknown sent a caller off to run the read-back-then-CAS recovery recipe for a mutation that
 provably never left the process. A recovery procedure that runs when nothing happened teaches
 operators to ignore it.
@@ -194,3 +194,12 @@ Consequences accepted:
 Verified by `config-client`'s `m3_client_65` row: a client holding an expired certificate,
 against a server whose CA it trusts, gets `Unavailable` from a `put`, with `sends == 0`, no
 call reaching the store, bounded reconnects, and a `client connect attempt failed` line.
+
+## Note (2026-09-18, fix round): a fatal Raft core on the write path is an unknown outcome
+
+`config-engine` mapped every non-storage `Fatal` to `Unavailable`, on both the read and the
+write path. openraft returns `Fatal::Stopped`/`Fatal::Panicked` through the `client_write` reply
+channel, which the core only drops *after* the proposal was enqueued, so the entry may already
+be committed — and `Unavailable` tells the caller it was rejected before entering the log. The
+write path now answers `DeadlineExceededUnknownOutcome`; the read path keeps `Unavailable`,
+because `ensure_linearizable` submits nothing. `Fatal::StorageError` stays `FatalStorage` on both.

@@ -711,8 +711,8 @@ async fn m3_73_manifest_is_not_authority_after_formation() {
 ///
 /// The row's expected outcome is "a typed error; no `Raft::initialize`". That expectation
 /// assumes the daemon holds a voter set of its own to compare the manifest against. It does
-/// not, and by design: **in the daemon the manifest *is* the formation plan** (ADR-0018 §7
-/// note). The `FormationPlan` handed to `Raft::initialize` is built directly from
+/// not, and by design: **in the daemon the manifest *is* the formation plan** (ADR-0018,
+/// "the manifest is the formation plan" note). The `FormationPlan` handed to `Raft::initialize` is built directly from
 /// `verified.voters`, so "does the manifest match the plan?" is not a question that can be
 /// asked. What the daemon actually defends is narrower and stated in the ADR: its own id must
 /// be listed, the endpoints the manifest publishes for it must equal the ones it bound, and

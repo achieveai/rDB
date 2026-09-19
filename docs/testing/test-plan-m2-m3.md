@@ -467,12 +467,15 @@ Store-level tests (`crates/config-storage/tests/m2_store_log.rs`) — no cluster
 | M2-57 | enospc_on_state_batch_is_fatal | `Fail(NoSpace)` on `BeforeStateBatch` | same; the mutation is **not** acknowledged as `APPLIED` | |
 | M2-58 | fatal_node_stops_acknowledging | after M2-57 | the other two nodes elect a leader and keep committing; the fatal node acknowledges nothing and is not counted in quorum | §19.12 bounded rejection |
 | M2-59 | fatal_node_does_not_continue_optimistically | after M2-57 | subsequent `get`/`put`/`list` on the fatal node all return `FatalStorage`, never a stale success; the node never re-enters `Ready` without a restart | `health()` stays `Fatal` for 10 × election timeout |
-| M2-60 | corrupt_log_entry_detected_on_open | store-level: write garbage bytes into a `raft_log` CF value, reopen | typed `StorageError` naming the log index; node does not start; no panic; exit code 3 for the daemon | |
+| M2-60 | corrupt_log_entry_detected_on_open | store-level: write garbage bytes into a `raft_log` CF value, reopen | typed `StorageError` naming the log index; node does not start; no panic; exit code 3 for the daemon | the daemon clause is E2E-19: a second `config-server` on a held data directory exits 3 with one `msg="startup_failed"`, `reason="storage_open_failed"` line |
 | M2-61 | corrupt_state_meta_detected_on_open | store-level: corrupt `state_meta/last_applied` | typed `StorageError`; startup refused | |
 | M2-62 | missing_column_family_fails_clearly | create a DB with only `raft_log`, reopen expecting all four CFs | typed `StorageOpenError::MissingColumnFamily{name}` naming the missing CF; **not** a RocksDB string error leaked to the caller, and not a silent auto-create (auto-creating `kv` on a DB that has data elsewhere is silent data loss) | assert the error's `Display` names `kv`, `raft_meta`, `state_meta` as appropriate |
 | M2-63 | unknown_extra_column_family_rejected_or_documented | create a DB with an extra `events` CF (the M4 name) and open with the M2 set | per OQ-13: default is **reject with a typed error** naming the unexpected CF, because an `events` CF means the directory belongs to a later schema version (§17 migration rule) | |
 | M2-64 | locked_data_dir_fails_clearly | open the same dir twice in one process, and from a second process | typed `StorageOpenError::Locked{path}`; no hang, no 10-minute retry loop | this is the single most common Windows restart-test failure; make the error legible |
 | M2-65 | blocking_rocksdb_does_not_starve_raft | inject a 2 s stall on `BeforeStateBatch` (Proceed-after-delay) on a follower | the leader keeps heartbeating, no election occurs, `current_term` unchanged; the stall is absorbed by `spawn_blocking` (ADR-0008) | `current_term` before == after; leader unchanged |
+| M2-66 | format_version_stamped_on_first_open | store-level: open a fresh directory, read `state_meta/format_version` raw, then reopen | the marker is exactly `FORMAT_VERSION` as a bare little-endian `u32`, written in the same synced batch as the identity bind; the reopen is an ordinary success and leaves the marker untouched | ADR-0008 note 2026-09-18 (F-030); the marker is a gate, not a one-shot |
+| M2-67 | unsupported_format_version_refused | store-level: stamp `state_meta/format_version = 2`, reopen | typed `StorageOpenError::UnsupportedFormat{found: 2, supported: 1}`; startup refused before any stored value is decoded; exit code 3 for the daemon (`reason="storage_open_failed"`, per M2-60/E2E-19 mapping) | `Display` names both versions; no best-effort decode of an unknown layout |
+| M2-68 | missing_format_version_on_non_empty_store_refused | store-level: append an entry, delete `state_meta/format_version`, reopen | typed `StorageOpenError::UnsupportedFormat{found: 0, supported: 1}` — a pre-marker store is refused, never adopted into the current format | `found: 0` is reserved for "written before the marker existed"; an *empty* unstamped directory is stamped instead (M2-66) |
 
 ---
 
@@ -506,7 +509,7 @@ MutualTls(fixture), authz: StaticAllowlist(policy), .. })`. Every TLS row uses `
 | ID | Name | Action | Expected | Oracle / log assertion |
 |---|---|---|---|---|
 | M3-15 | principal_from_san_uri | client cert SAN `retcd://<cid>/client/svc-a`; call `get` | server derives `Principal{name:"svc-a", kind:Client}` | Q9: the request line carries `principal="svc-a"` |
-| M3-16 | principal_cn_fallback | client cert with no SAN, CN `svc-b` | `Principal{name:"svc-b", kind:Client}` (ADR-0012 "CN fallback") | as above |
+| M3-16 | principal_cn_fallback | client cert with no SAN, CN `svc-b` | `Principal{name:"svc-b", kind:Client}` (ADR-0012 "CN fallback") — on a listener that set `allow_common_name_principals`, which the harness does; that it is **not** the default is M3-88 | as above |
 | M3-17 | client_cert_wrong_cluster_id_rejected | client SAN `retcd://<other>/client/svc-a` | `Unauthenticated`; request not executed | `reason="cluster_id_mismatch"` |
 | M3-18 | client_cert_other_ca_rejected | client cert from an unrelated CA | handshake fails; `Unauthenticated` | |
 | M3-19 | client_cert_expired_rejected | expired client cert | `Unauthenticated` | |
@@ -601,7 +604,7 @@ Policy under test (written by the fixture):
 | M3-71 | expired_manifest_rejected | `expires_at` in the past | rejected with `msg="manifest_expired"` carrying `expires_at` and `now`; no sleeping | §4.3 |
 | M3-72 | manifest_cluster_id_must_match_node_identity | node configured for cluster A, manifest for cluster B | `IdentityMismatch` before formation | joins M2-48 |
 | M3-73 | manifest_is_not_authority_after_formation | after formation, rewrite the manifest with a different endpoint for node 2 and restart node 1 | node 1 uses the **committed membership** endpoint; the manifest change is ignored (a `warn` may record the divergence); replication to node 2 never breaks | §4.3 "after formation, committed Raft membership is authoritative" |
-| M3-74 | manifest_node_set_must_match_formation_plan | manifest lists nodes {1,2,4}; formation plan {1,2,3} | typed error; no `Raft::initialize` | |
+| M3-74 | manifest_node_set_must_match_formation_plan | manifest lists nodes {1,2,4}; formation plan {1,2,3} | formation proceeds with the manifest voter set {1,2,4}: the manifest **is** the formation plan (ADR-0018 note "the manifest is the formation plan"); own-id, endpoint, signature and expiry checks still refuse | `m3_74_manifest_node_set_must_match_formation_plan` asserts membership {1,2,4} |
 
 ### 4.9 Trace context and audit over gRPC (ADR-0013; §15.2; §18.2)
 
@@ -614,6 +617,22 @@ Policy under test (written by the fixture):
 | M3-79 | audit_line_per_mutation | a put and a delete | one `level="info"` audit line each with `principal`, `op`, `key_hex`, `outcome`, `revision`; **no** `value` field | §18.2 "audit mutations without values" |
 | M3-80 | no_value_or_credential_in_logs_over_grpc | write a value containing `SENSITIVE_SENTINEL_VALUE`; also pass a cert and policy through the daemon config | Q3 (M0-M1 plan) returns zero rows against the M3 logs, including the daemon logs; additionally no PEM block (`-----BEGIN`) and no private key bytes appear anywhere | Q3 + Q11 |
 | M3-81 | authn_authz_failure_metrics | run M3-17..M3-26 | each failure increments an authn/authz failure counter exposed in `NodeMetrics`/health, and emits exactly one `warn` line | §18.2 required metric |
+
+### 4.10 Transport payload sizing (ADR-0010 fix-round note; §7.1, §10.2)
+
+Ids start at M3-86 because OQ-23 reserves M3-82..M3-85 for certificate rotation should it be
+pulled into M3.
+
+| ID | Name | Action | Expected | Oracle |
+|---|---|---|---|---|
+| M3-86 | max_size_value_replicates_to_every_voter | `put` a `max_value_bytes` value of `0xFF` bytes on a 3-node cluster | `APPLIED`, and every voter's applied state holds the value; the `AppendEntries` carrying it (~4× the raw size once serde-JSON encoded) is neither rejected nor retried | `config_grpc::peer_plane_message_limit` is above tonic's 4 MiB default; without it replication wedges and the put ends `DeadlineExceededUnknownOutcome` |
+| M3-87 | oversize_list_reply_is_truncated_not_unavailable | `list` a prefix whose reply fills a `max_list_bytes` budget set above 4 MiB | the gRPC client gets `truncated = true` and a page larger than 4 MiB, not `Unavailable` | `config_grpc::client_plane_message_limit`; without it the server's own encoder refuses with "encoded message length too large" |
+
+### 4.11 Common Name principals are opt-in (ADR-0010/ADR-0012 fix-round notes; F-015)
+
+| ID | Name | Action | Expected | Oracle |
+|---|---|---|---|---|
+| M3-88 | common_name_principals_are_refused_unless_enabled | present a client certificate from the shared test CA that asserts **no** `retcd://` SAN, whose CN is a name the cluster grants (i.e. indistinguishable from one the same CA minted for a neighbouring cluster), to a listener with `allow_common_name_principals` unset, then to one with it set | unset: `UNAUTHENTICATED` and the store sees no call; set: served with `Principal{name: CN, kind: Certificate}` | `config_grpc::tls::principal_from_certs`; a Common Name carries no cluster id, so with the gate forced open the first half of the row passes a foreign cluster's certificate through — `m3_88_common_name_principals_are_refused_unless_enabled` in `config-grpc/tests/mtls.rs` |
 
 ---
 
@@ -644,6 +663,7 @@ file, certs, allowlist and manifest into each; `DaemonProcess::spawn` × 3 with 
 | E2E-16 | crash_kill_loses_no_acknowledged_mutation | loop 5×: write 3 keys, `kill()` a random-but-seeded node, respawn it, wait for catch-up | every acknowledged revision is readable at the end; `state_hash` identical on all three; no log hole in any node's `raft_log` (checked by reopening each store read-only after shutdown) | the seed is printed on failure |
 | E2E-17 | no_fixed_ports_and_clean_temp_dirs | any E2E test | every bound port came from the ready line; a source scan of `crates/config-server/tests/**` finds no literal port; after the test the `TempDir` is gone and no `config-server` process survives | anti-flake rules 4, 5 + TA-20.4 |
 | E2E-18 | full_suite_parity_on_target_host | CI job: `cargo test --workspace` (M0+M1+M2+M3+E2E) on the target VM/disk class | all green in one run, within the §2 budget; the job name and host class are recorded in the run log | §21 M3 line 5 — this is the release gate itself |
+| E2E-19 | locked_data_dir_exits_storage_code | start node 1 with `--form` and wait for ready; spawn a second `config-server` on the **same config and data directory**, with its own `--log-dir` | the second process exits **3** (not 2), prints no ready line, and logs exactly one `msg="startup_failed"` with `reason="storage_open_failed"`; the holder keeps serving `/health` and still stops cleanly with exit 0 | ADR-0018 §5 — the only row that observes exit code 3 at process level; covers M2-60's daemon clause and M2-64's second-process half |
 
 ---
 

@@ -23,7 +23,7 @@ pub use fault::{Boundary, FaultAction, FaultCounters, FaultInjector, NoFaults};
 pub use reader::StateReader;
 pub use rocks::{
     RocksLog, RocksOptions, RocksSm, RocksStore, StorageOpenError, CF_KV, CF_RAFT_LOG,
-    CF_RAFT_META, CF_STATE_META, COLUMN_FAMILIES,
+    CF_RAFT_META, CF_STATE_META, COLUMN_FAMILIES, FORMAT_VERSION,
 };
 pub use trace::{fingerprint, CommandFingerprint, TraceRegistry, TRACE_REGISTRY_CAPACITY};
 pub use types::{RaftNode, RaftNodeId, TypeConfig};

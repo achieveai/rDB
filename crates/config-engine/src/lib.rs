@@ -13,7 +13,7 @@
 //! # Shape
 //!
 //! ```text
-//!   client  ──▶ DirectClient ──▶ ConfigNode ──▶ Raft ──▶ EphemeralStore
+//!   client  ──▶ DirectClient ──▶ ConfigNode ──▶ Raft ──▶ StorageHandle::Ephemeral | ::Rocks
 //!                                    │            │
 //!                                    │            └─▶ EngineNetwork ─▶ PeerTransport ─▶ peer
 //!                                    └─▶ peer_handler() ◀── PeerTransport ◀── peer
@@ -43,7 +43,7 @@ pub mod node;
 pub mod testing;
 pub mod transport;
 
-pub use config::{AuthzKind, NodeConfig, RaftTimers, StorageHandle};
+pub use config::{AuthzKind, NodeConfig, RaftTimers, StorageHandle, MAX_PAYLOAD_ENTRIES};
 pub use direct::DirectClient;
 pub use error::{EngineError, FormationError, FormationPlan, Timeout};
 pub use hint::{

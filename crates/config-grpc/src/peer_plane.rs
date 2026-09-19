@@ -1,6 +1,6 @@
 //! The Raft peer plane: `PeerService` over tonic (ADR-0010, ADR-0011).
 //!
-//! OpenRaft payloads travel as opaque serde-JSON bytes inside a [`pb::PeerEnvelope`] whose
+//! OpenRaft payloads travel as opaque postcard bytes inside a [`pb::PeerEnvelope`] whose
 //! header fields bind the call to a cluster identity. The order of checks here is the
 //! security property: encoding tag, cluster id shape, then — under mutual TLS — the
 //! certificate's claimed node identity, and only then is the payload deserialized. A node
@@ -12,9 +12,9 @@
 
 use std::time::Instant;
 
-use config_core::{ClusterId, NodeId, RecoveryEpoch};
+use config_core::{ClusterId, Limits, NodeId, RecoveryEpoch};
 use config_engine::transport::{
-    PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PAYLOAD_ENCODING_JSON,
+    PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PAYLOAD_ENCODING_POSTCARD,
 };
 use config_log::TraceContext;
 use tokio::net::TcpListener;
@@ -22,6 +22,7 @@ use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::error::GrpcError;
+use crate::limits::peer_plane_message_limit;
 use crate::pb;
 use crate::pb::peer_service_server::{PeerService, PeerServiceServer};
 use crate::server::{spawn, ServerHandle};
@@ -133,11 +134,12 @@ impl PeerSvc {
         };
 
         let env = request.get_ref();
-        if env.payload_encoding != PAYLOAD_ENCODING_JSON {
+        if env.payload_encoding != PAYLOAD_ENCODING_POSTCARD {
             return Err(reject(
                 "bad_payload_encoding",
                 Status::invalid_argument(format!(
-                    "unsupported payload_encoding {}; this release speaks {PAYLOAD_ENCODING_JSON}",
+                    "unsupported payload_encoding {}; this release speaks \
+                     {PAYLOAD_ENCODING_POSTCARD}",
                     env.payload_encoding
                 )),
             ));
@@ -159,7 +161,7 @@ impl PeerSvc {
         }
 
         let env = request.into_inner();
-        let req: PeerRequest = match serde_json::from_slice(&env.payload) {
+        let req: PeerRequest = match postcard::from_bytes(&env.payload) {
             Ok(req) => req,
             Err(e) => {
                 return Err(reject(
@@ -202,7 +204,7 @@ impl PeerSvc {
         });
 
         let response = result.map_err(|r| status_from_reject(&r))?;
-        let payload = serde_json::to_vec(&response)
+        let payload = postcard::to_allocvec(&response)
             .map_err(|e| Status::internal(format!("peer response encode failed: {e}")))?;
 
         Ok(Response::new(pb::PeerEnvelope {
@@ -213,7 +215,7 @@ impl PeerSvc {
             recovery_epoch: self.identity.recovery_epoch.0,
             from_node_id: self.identity.node_id.0,
             to_node_id: from.0,
-            payload_encoding: PAYLOAD_ENCODING_JSON,
+            payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: payload.into(),
         }))
     }
@@ -252,11 +254,17 @@ impl PeerService for PeerSvc {
 ///
 /// `identity` is stamped onto every response envelope so a caller can verify that the node it
 /// addressed is the node that answered (ADR-0011).
+///
+/// `limits` must be the caps this node enforces; it sizes the codec so the largest
+/// `AppendEntries` a leader may legally build is one this node can receive
+/// ([`peer_plane_message_limit`]). Every voter must be configured with identical limits
+/// anyway, so this is the same number on both ends of every peer link.
 pub fn serve_peer_plane(
     handler: PeerHandler,
     listener: TcpListener,
     tls: TlsMode,
     identity: PeerIdentity,
+    limits: Limits,
 ) -> Result<ServerHandle, GrpcError> {
     let svc = PeerSvc {
         handler,
@@ -264,19 +272,24 @@ pub fn serve_peer_plane(
         identity,
         server_span: tracing::Span::current(),
     };
+    let cap = peer_plane_message_limit(&limits);
     let router = tls
         .apply_server(tonic::transport::Server::builder())?
-        .add_service(PeerServiceServer::new(svc));
+        .add_service(
+            PeerServiceServer::new(svc)
+                .max_decoding_message_size(cap)
+                .max_encoding_message_size(cap),
+        );
     spawn("peer", router, listener)
 }
 
 /// Decode a [`PeerResponse`] out of an answering envelope (used by the transport client).
 pub(crate) fn decode_response(env: &pb::PeerEnvelope) -> Result<PeerResponse, String> {
-    if env.payload_encoding != PAYLOAD_ENCODING_JSON {
+    if env.payload_encoding != PAYLOAD_ENCODING_POSTCARD {
         return Err(format!(
             "peer answered with payload_encoding {}",
             env.payload_encoding
         ));
     }
-    serde_json::from_slice(&env.payload).map_err(|e| format!("undecodable peer response: {e}"))
+    postcard::from_bytes(&env.payload).map_err(|e| format!("undecodable peer response: {e}"))
 }

@@ -21,7 +21,7 @@ use config_core::{
 use config_log::retcd_test;
 use config_storage::{
     Boundary, FaultAction, FaultInjector, NoFaults, RaftNodeId, RocksOptions, RocksStore,
-    StorageOpenError, TypeConfig, CF_RAFT_LOG, CF_STATE_META,
+    StorageOpenError, TypeConfig, CF_RAFT_LOG, CF_STATE_META, FORMAT_VERSION,
 };
 use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, RaftLogReader, Vote};
@@ -1426,5 +1426,133 @@ async fn m2_storage_26_log_cf_keys_contiguous_after_crash_at_every_boundary() {
                 "raft_log keys must be contiguous after a crash at {boundary}: {keys:?}"
             );
         }
+    }
+}
+
+// --- on-disk format version (M2-66..M2-68) ----------------------------------------------
+
+/// Reopen `dir` raw, run `f` against the `state_meta` CF, and drop the handle again.
+///
+/// Every persisted value except `state_meta/format_version` is a `postcard` encoding of a type
+/// `config-storage` does not own, so the marker is the only thing standing between an OpenRaft
+/// upgrade and a silently misread store. These rows tamper with it directly, which means
+/// bypassing `RocksStore` — and on Windows the raw handle must be gone before the next open.
+fn with_raw_state_meta(dir: &Path, f: impl FnOnce(&rocksdb::DB, &rocksdb::ColumnFamily)) {
+    let db = rocksdb::DB::open_cf(
+        &rocksdb::Options::default(),
+        dir,
+        config_storage::COLUMN_FAMILIES,
+    )
+    .expect("reopen raw to touch state_meta");
+    let cf = db.cf_handle(CF_STATE_META).expect("state_meta cf");
+    f(&db, cf);
+}
+
+fn read_format_marker(dir: &Path) -> Option<Vec<u8>> {
+    let mut found = None;
+    with_raw_state_meta(dir, |db, cf| {
+        found = db
+            .get_cf(cf, b"format_version")
+            .expect("read state_meta/format_version");
+    });
+    found
+}
+
+/// M2-66 `format_version_stamped_on_first_open`: a fresh directory is stamped with
+/// [`FORMAT_VERSION`] as a bare little-endian `u32`, and reopening the stamped directory is an
+/// ordinary success — the marker is a gate, not a one-shot.
+#[retcd_test]
+async fn m2_storage_27_format_version_stamped_on_first_open_and_reopen_succeeds() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(open_plain(tmp.path()));
+
+    assert_eq!(
+        read_format_marker(tmp.path()).as_deref(),
+        Some(&FORMAT_VERSION.to_le_bytes()[..]),
+        "a first open must stamp state_meta/format_version = {FORMAT_VERSION} (LE u32)"
+    );
+
+    let store = open_plain(tmp.path());
+    assert_eq!(store.identity(), identity());
+    drop(store);
+
+    assert_eq!(
+        read_format_marker(tmp.path()).as_deref(),
+        Some(&FORMAT_VERSION.to_le_bytes()[..]),
+        "reopening must not rewrite or drop the marker"
+    );
+}
+
+/// M2-67 `unsupported_format_version_refused`: a directory stamped with a version this build
+/// does not write is refused by a typed [`StorageOpenError::UnsupportedFormat`] naming both
+/// versions — never a best-effort decode of bytes whose layout is unknown.
+#[retcd_test]
+async fn m2_storage_28_unsupported_format_version_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(open_plain(tmp.path()));
+    with_raw_state_meta(tmp.path(), |db, cf| {
+        db.put_cf(cf, b"format_version", 2u32.to_le_bytes())
+            .expect("stamp a future format version");
+    });
+
+    let err = RocksStore::open(
+        tmp.path(),
+        identity(),
+        Limits::DEFAULT,
+        Arc::new(NoFaults),
+        Span::none(),
+    )
+    .expect_err("a directory in another on-disk format must refuse startup");
+    match &err {
+        StorageOpenError::UnsupportedFormat {
+            found, supported, ..
+        } => {
+            assert_eq!(*found, 2, "the stamped version is reported verbatim");
+            assert_eq!(*supported, FORMAT_VERSION);
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
+    }
+    let text = err.to_string();
+    assert!(
+        text.contains('2') && text.contains(&FORMAT_VERSION.to_string()),
+        "the message must name both versions for the operator: {text}"
+    );
+}
+
+/// M2-68 `missing_format_version_on_non_empty_store_refused`: a store that already holds data
+/// but carries no marker was written before the marker existed, so its layout cannot be
+/// established. It is refused with `found: 0` rather than being adopted into the current
+/// format — adopting it is exactly the silent misread the marker exists to prevent.
+#[retcd_test]
+async fn m2_storage_29_missing_format_version_on_non_empty_store_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    {
+        let s = open_plain(tmp.path());
+        s.log_store()
+            .blocking_append(vec![put(1, 1, "/m2/68/a", "v")])
+            .await
+            .unwrap();
+    }
+    with_raw_state_meta(tmp.path(), |db, cf| {
+        db.delete_cf(cf, b"format_version")
+            .expect("simulate a pre-marker store");
+    });
+
+    let err = RocksStore::open(
+        tmp.path(),
+        identity(),
+        Limits::DEFAULT,
+        Arc::new(NoFaults),
+        Span::none(),
+    )
+    .expect_err("an unstamped store holding data must refuse startup");
+    match &err {
+        StorageOpenError::UnsupportedFormat {
+            found, supported, ..
+        } => {
+            assert_eq!(*found, 0, "a pre-marker store reports version 0");
+            assert_eq!(*supported, FORMAT_VERSION);
+        }
+        other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
 }

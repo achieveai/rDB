@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use config_core::{
     Capabilities, ClusterId, ClusterIdentity, ConfigError, ConfigStore, DeleteRequest, GetRequest,
-    GetResponse, ListRequest, ListResponse, MutationResponse, NodeId, Principal, PutRequest,
-    RecoveryEpoch,
+    GetResponse, Limits, ListRequest, ListResponse, MutationResponse, NodeId, Principal,
+    PutRequest, RecoveryEpoch,
 };
 use config_engine::transport::{
     PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSink,
@@ -249,8 +249,9 @@ pub async fn start_client_plane_with(
         .await
         .expect("bind ephemeral client-plane port");
     let node_id = u64::from(listener.local_addr().expect("addr").port());
-    let handle = node_span(node_id)
-        .in_scope(|| serve_client_plane(backend, listener, tls, cluster_id).expect("serve"));
+    let handle = node_span(node_id).in_scope(|| {
+        serve_client_plane(backend, listener, tls, cluster_id, Limits::DEFAULT).expect("serve")
+    });
     let endpoint = handle.local_addr().to_string();
     TestServer { handle, endpoint }
 }
@@ -276,8 +277,14 @@ pub async fn start_client_plane_for(
         .expect("bind ephemeral client-plane port");
     let node_id = u64::from(listener.local_addr().expect("addr").port());
     let handle = node_span(node_id).in_scope(|| {
-        serve_client_plane(Arc::new(FakeBackend(store)), listener, tls, cluster_id)
-            .expect("serve client plane")
+        serve_client_plane(
+            Arc::new(FakeBackend(store)),
+            listener,
+            tls,
+            cluster_id,
+            Limits::DEFAULT,
+        )
+        .expect("serve client plane")
     });
     let endpoint = handle.local_addr().to_string();
     TestServer { handle, endpoint }

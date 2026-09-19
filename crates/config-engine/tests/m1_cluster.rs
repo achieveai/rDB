@@ -522,6 +522,37 @@ async fn m1_smoke_direct_client_conformance() {
     cluster.shutdown().await;
 }
 
+/// This run's lines of a test's own JSONL file, parsed.
+///
+/// The per-test file lives in a stable `target/test-logs` directory and is opened in **append**
+/// mode, so it accumulates across `cargo test` runs: without this filter a line written by a
+/// *previous* run could satisfy an assertion about this one. `testRun` — minted once per test
+/// process — is what keeps each run judged on its own output.
+///
+/// A malformed line panics rather than being skipped: a line the JSONL layer wrote and a test
+/// cannot parse is a defect in the layer, not noise to filter away.
+fn this_run_log_lines(method: &str) -> Vec<serde_json::Value> {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSONL line {l}: {e}")))
+        .filter(|l: &serde_json::Value| l["testRun"] == config_log::testing::test_run_id())
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "this run wrote no log lines to {}",
+        path.display()
+    );
+    lines
+}
+
 /// ADR-0013: every line this cluster emits is attributable to this test and to a node.
 ///
 /// Checked by reading the test's own JSONL file rather than by asserting on a mock writer —
@@ -536,27 +567,8 @@ async fn m1_obs_engine_and_raft_lines_carry_test_and_node_identity() {
         .await;
     cluster.shutdown().await;
 
-    let path = config_log::layer::test_file_path(
-        &config_log::testing::test_log_dir(),
-        module_path!(),
-        "m1_obs_engine_and_raft_lines_carry_test_and_node_identity",
-    );
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-    let lines: Vec<serde_json::Value> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad JSONL line {l}: {e}")))
-        // The file accumulates across `cargo test` runs; judge only this run's lines.
-        .filter(|l: &serde_json::Value| l["testRun"] == config_log::testing::test_run_id())
-        .collect();
-    assert!(
-        !lines.is_empty(),
-        "no log lines were written to {}",
-        path.display()
-    );
-
     let method = "m1_obs_engine_and_raft_lines_carry_test_and_node_identity";
+    let lines = this_run_log_lines(method);
     assert!(
         lines.iter().all(|l| l["testMethod"] == method),
         "a line in this test's file belongs to another test"
@@ -673,18 +685,11 @@ async fn m1_19_a_hijacked_gossip_endpoint_never_reaches_a_client_hint() {
 
     cluster.shutdown().await;
 
-    let path = config_log::layer::test_file_path(
-        &config_log::testing::test_log_dir(),
-        module_path!(),
-        "m1_19_a_hijacked_gossip_endpoint_never_reaches_a_client_hint",
-    );
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     // Node 1 refuses the hint about itself as `self_claim`; the peers refuse it as an endpoint
     // mismatch. It is the peers' line that proves committed membership overrode gossip.
-    let rejected = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+    let lines = this_run_log_lines("m1_19_a_hijacked_gossip_endpoint_never_reaches_a_client_hint");
+    let rejected = lines
+        .iter()
         .find(|l| {
             l["@m"] == "gossip_hint_rejected"
                 && l["peer_node_id"] == 1

@@ -66,8 +66,8 @@ open questions OQ-15..OQ-19 asked for these rulings.
 
    | Stage | Refusals | Listeners |
    | --- | --- | --- |
-   | Pre-bind | `--log-field` parse, TOML load/validation, `tls.mode = "insecure"` without `--allow-insecure-dev`, `AllowAll` without `--dev-allow-all`, logging setup, manifest read, manifest Ed25519 signature, `expires_at`, clock failure, cluster id / recovery epoch / own-id-in-voters | none bound |
-   | Post-bind, pre-serve | manifest endpoint match against the addresses actually bound (this needs the real ports, so it cannot be checked earlier when `port = 0`), store open/replay, already-formed, not-a-voter, store-not-fresh, formation | bound, not accepting |
+   | Pre-bind | `--log-field` parse, TOML load/validation, `tls.mode = "insecure"` without `--allow-insecure-dev`, `AllowAll` without `--dev-allow-all`, logging setup, manifest read, manifest Ed25519 signature, `expires_at`, clock failure, cluster id / recovery epoch / own-id-in-voters, store open (identity mismatch, lock, missing column family) | none bound |
+   | Post-bind, pre-serve | manifest endpoint match against the addresses actually bound (this needs the real ports, so it cannot be checked earlier when `port = 0`), log replay, already-formed, not-a-voter, store-not-fresh, formation | bound, not accepting |
    | Serving | — | both planes accepting; ready line printed |
 
    A listener that is bound but not yet served leaves the connection in the accept backlog; the
@@ -79,7 +79,7 @@ open questions OQ-15..OQ-19 asked for these rulings.
    `ready=false`.
 7. **Manifest verification.** Ed25519 signature is checked over the exact `manifest.toml`
    bytes before any field is parsed for use; `expires_at` is checked against the system clock
-   (the only clock use in the system). Cluster id, recovery epoch, own node id, and endpoints
+   (the only behaviour-affecting clock read). Cluster id, recovery epoch, own node id, and endpoints
    must match the config.
 8. **No child processes.** `Child::kill()` on Windows does not reach grandchildren.
 
@@ -170,7 +170,7 @@ What the daemon does defend is everything it can check locally:
   read is a rejection, not a zero timestamp.
 - **Per-peer SAN node-id checks at replication** — a peer that presents a certificate whose
   SAN does not name the node id it claims is refused at dial time, every time, by
-  `config-grpc` (ADR-0012). This is the check that actually constrains who joins, and it does
+  `config-grpc` (ADR-0011, ADR-0010). This is the check that actually constrains who joins, and it does
   not depend on the manifest at all.
 
 A forged manifest therefore cannot enlist a node into a cluster it has no certificate for, and

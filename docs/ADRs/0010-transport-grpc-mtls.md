@@ -126,3 +126,110 @@ certificate starts at the dialling side.** An operator looking only at the accep
 for a peer that "cannot connect" will find nothing, and the absence is not evidence that the
 connection was never attempted. Revisit if tonic exposes handshake errors, or when a listener
 that terminates TLS itself is needed for another reason.
+
+## Note (2026-09-18, fix round): gRPC message caps are derived from `Limits`, not defaulted
+
+Neither plane configured a codec cap, so tonic's 4 MiB receive default applied to both servers
+and both clients — a number below what this system legally produces, on both planes.
+
+**Peer plane.** OpenRaft payloads travel as serde JSON (`PAYLOAD_ENCODING_JSON`), and
+`serde_json` renders `bytes::Bytes` as an array of decimal numbers: a `0xFF` byte becomes
+`255,`, four wire bytes for one. A single `Put` of a `max_value_bytes` (1 MiB) value is
+therefore already ~4.2 MiB of `AppendEntries`. The follower answered `OUT_OF_RANGE`, which
+`map_status` classifies as `TransportError::Remote` and OpenRaft treats as retryable — so
+replication did not fail, it **wedged**, and the write surfaced as
+`DeadlineExceededUnknownOutcome` (ADR-0015) forever.
+
+**Client plane.** `Limits::max_list_bytes` is 8 MiB and a `List` reply is filled to that budget
+*before* `truncated` is set, so an over-cap prefix produced `Unavailable` where §10.2 promises a
+truncated page.
+
+Both caps are now computed in `config_grpc::limits` and applied to the generated server *and*
+client types in both directions:
+
+    MESSAGE_FRAMING_SLACK_BYTES = 1 MiB      (one formula, both planes)
+    JSON_EXPANSION_FACTOR       = 4          (serde-JSON worst case for a byte string)
+
+    client_plane_message_limit(l) = l.max_list_bytes + MESSAGE_FRAMING_SLACK_BYTES
+    peer_plane_message_limit(l)   = JSON_EXPANSION_FACTOR * l.max_request_bytes
+                                    * MAX_PAYLOAD_ENTRIES + MESSAGE_FRAMING_SLACK_BYTES
+
+Derived, not literal, so raising a cap in `config-core` cannot leave the transport behind; and
+generous in one direction only, because an over-large cap costs a bound nobody reaches while an
+under-large one costs a wedged replication stream. `Limits` is consequently threaded into
+`serve_client_plane`, `serve_peer_plane`, `GrpcPeerTransport::new` and
+`GrpcClientOptions::limits` — it is used for codec sizing there and for nothing else; every
+limit is still enforced below the transport.
+
+**`max_payload_entries = 16`** (`config_engine::MAX_PAYLOAD_ENTRIES`, was OpenRaft's default of
+300). The peer cap has to bound the largest `AppendEntries` a leader may legally build, and that
+is `max_payload_entries` max-size commands; at 300 the honest cap would be ~2.4 GiB, which is not
+a cap. 16 keeps it at 128 MiB + slack and costs at most one extra round trip per 16 entries while
+a follower catches up. The constant lives next to the config that sets it so the batch size and
+the cap cannot drift apart.
+
+**Known, not fixed here: a max-size value is slow, not just large.** Encoding 1 MiB as a JSON
+number array, moving 4.2 MiB and decoding it does not finish inside OpenRaft's per-RPC budget —
+which is `heartbeat_interval`, 250 ms in the harness default — in an unoptimized build. Rows
+M3-86/M3-87 therefore run with a 1000 ms heartbeat. Sizing the caps correctly is necessary but
+not sufficient for megabyte values; a production deployment that intends to carry them needs a
+heartbeat interval sized for the payload, or a peer encoding that does not expand bytes 4× (this
+note deliberately does not redesign that encoding).
+
+### Follow-up (2026-09-18, same fix round): the peer payload encoding is postcard, not serde JSON
+
+The paragraph above closed the *cap* defect and left the *encoding* defect open, with the
+consequence written down: a maximum-size value was slow as well as large, so rows M3-86/M3-87
+had to run on a 1000 ms heartbeat. That is now fixed at the source.
+
+`PeerRequest` / `PeerResponse` are carried as **postcard**
+(`config_engine::transport::PAYLOAD_ENCODING_POSTCARD = 2`) instead of serde JSON. Postcard is a
+compact, non-self-describing binary serde format that writes a byte string as a length varint
+followed by the bytes themselves: a 1 MiB value is ~1 MiB on the wire rather than ~4.2 MiB of
+decimal digits, and neither end pays to render or parse those digits. It is already the format
+`config-storage` persists `Entry<TypeConfig>` with, so the OpenRaft types are known to round-trip
+through it.
+
+**One encoding per protocol version, never a negotiation.** The `payload_encoding` envelope field
+is kept, and a receiver accepts exactly tag `2` and refuses every other value with
+`INVALID_ARGUMENT` before decoding — including tag `1`, the retired serde-JSON encoding. A node
+from the previous build is therefore turned away by a typed refusal instead of handing bytes to a
+decoder that would misread them. The JSON path is deleted rather than kept alongside: two live
+encodings would mean two code paths, two sets of size arithmetic, and a downgrade an attacker
+could ask for. Peer plane compatibility across this change is a cluster-wide restart, which is
+what a pre-release protocol change is allowed to cost.
+
+The peer cap loses its expansion factor accordingly:
+
+    peer_plane_message_limit(l) = l.max_request_bytes * MAX_PAYLOAD_ENTRIES
+                                  + MESSAGE_FRAMING_SLACK_BYTES
+
+which is 33 MiB at `Limits::DEFAULT`, down from 129 MiB. There is no binary-overhead factor
+because there is nothing to multiply: postcard's framing is a handful of varint bytes per field,
+and the 1 MiB slack swallows that many thousands of times over. `MAX_PAYLOAD_ENTRIES` stays at
+16 — the smaller cap does not make a bigger batch cheaper to receive, and 16 max-size commands
+per `AppendEntries` is already more than a real write burst produces.
+
+**Consequence for the rows.** M3-86/M3-87 run on the harness's default 250 ms heartbeat again;
+the 1000 ms override is gone. The caveat the previous note recorded — "a production deployment
+that intends to carry megabyte values needs a heartbeat sized for the payload" — no longer
+applies at the default limits, because one maximum-size entry now fits inside the default
+per-RPC budget in an unoptimized build. It would return for a deployment that raises
+`max_request_bytes` far above 2 MiB; the budget is still `heartbeat_interval` per
+`AppendEntries`, and that is the number to size against.
+
+## Note (2026-09-18, fix round): the Common Name fallback is opt-in (F-015)
+
+This ADR's cluster binding — "signed by our CA" is not "minted for our cluster" — has one hole
+that the SAN grammar cannot close: a certificate that asserts no `retcd://` SAN at all has no
+cluster id anywhere in it, so the Common Name it falls back to cannot be checked against the
+listener's cluster. Under the shared CA this ADR assumes, a CN-only certificate minted for a
+neighbouring cluster was therefore accepted here as that CN, bounded only by the allowlist.
+
+The fallback is now gated by `MtlsConfig::allow_common_name_principals`, default `false`, which
+the daemon reads from `tls.allow_common_name_principals` and logs as
+`common_name_principals_enabled` at `warn` when it is on. With the gate shut a CN-only client
+certificate is refused on the same `UNAUTHENTICATED` path as a certificate carrying no identity
+at all. Nothing about certificates that *do* assert a `retcd://` SAN changes: a node identity,
+a foreign cluster or a URI the grammar rejects is still refused outright, at either setting. The
+peer plane never had a CN fallback and still does not. Covered by M3-88.

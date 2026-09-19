@@ -950,7 +950,7 @@ impl NodeInner {
                     reason: e.to_string(),
                 })
             }
-            Ok(Err(RaftError::Fatal(fatal))) => Err(fatal_to_config_error(fatal)),
+            Ok(Err(RaftError::Fatal(fatal))) => Err(write_fatal_to_config_error(fatal)),
         }
     }
 
@@ -1011,7 +1011,7 @@ impl NodeInner {
                     reason: format!("quorum not reached for a linearizable read: {e}"),
                 })
             }
-            Ok(Err(RaftError::Fatal(fatal))) => Err(fatal_to_config_error(fatal)),
+            Ok(Err(RaftError::Fatal(fatal))) => Err(read_fatal_to_config_error(fatal)),
             Ok(Ok(_read_log_id)) => {
                 let mut project = Some(project);
                 let mut out = None;
@@ -1185,7 +1185,13 @@ fn role_of(state: ServerState) -> NodeRole {
     }
 }
 
-fn fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
+/// `Fatal` on the **read** path: nothing was submitted, so the request is plainly retryable.
+///
+/// `ensure_linearizable` has no side effect on the log, so a Raft core that stopped or panicked
+/// while the barrier was outstanding leaves nothing behind — `Unavailable` (resubmittable) is
+/// the honest answer. See [`write_fatal_to_config_error`] for why the write path cannot say
+/// the same thing.
+fn read_fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
     match fatal {
         Fatal::StorageError(e) => ConfigError::FatalStorage {
             detail: e.to_string(),
@@ -1193,6 +1199,29 @@ fn fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
         other => ConfigError::Unavailable {
             reason: other.to_string(),
         },
+    }
+}
+
+/// `Fatal` on the **write** path: the proposal may already have committed, so the outcome is
+/// unknown (ADR-0015).
+///
+/// openraft delivers `Fatal::Stopped`/`Fatal::Panicked` through the `client_write` reply
+/// channel, which the Raft core only drops *after* the proposal has been enqueued. The entry
+/// may therefore be committed and applied while the caller sees the error. Reporting it as
+/// `Unavailable` — whose contract is "rejected before entering the log",
+/// `is_safe_to_resubmit() == true` — would invite a replay of a mutation that already took
+/// effect. ADR-0015 permits "resubmittable" only when the mutation provably did not commit,
+/// so every non-storage `Fatal` here becomes [`ConfigError::DeadlineExceededUnknownOutcome`]
+/// and the caller runs the read-back-then-CAS recovery recipe.
+///
+/// `Fatal::StorageError` keeps its `FatalStorage` mapping: it is an internal-class failure of
+/// this node, not a retry decision for the client.
+fn write_fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
+    match fatal {
+        Fatal::StorageError(e) => ConfigError::FatalStorage {
+            detail: e.to_string(),
+        },
+        Fatal::Stopped | Fatal::Panicked => ConfigError::DeadlineExceededUnknownOutcome,
     }
 }
 
@@ -1341,5 +1370,31 @@ mod tests {
             StatusClass::Internal,
             "a broken state-machine contract is an internal failure, not a retryable one"
         );
+    }
+
+    /// F-021: openraft hands `Fatal::Stopped`/`Fatal::Panicked` back through the `client_write`
+    /// reply channel, which it only drops after the proposal was enqueued — so the entry may be
+    /// committed. ADR-0015 lets a mutation be called resubmittable only when it provably did not
+    /// commit, so the write path must not answer `Unavailable` here the way the read path does.
+    #[test]
+    fn a_fatal_on_the_write_path_is_never_resubmittable() {
+        for fatal in [Fatal::Stopped, Fatal::Panicked] {
+            let error = write_fatal_to_config_error(fatal.clone());
+            assert!(
+                !error.is_safe_to_resubmit(),
+                "{fatal:?} arrives after the proposal was enqueued; replaying could apply it \
+                 twice: {error:?}"
+            );
+            assert_eq!(
+                error.kind(),
+                StatusClass::DeadlineExceeded,
+                "the outcome is unknown, so the caller must read back and CAS (ADR-0015)"
+            );
+            // The same `Fatal` on a read is retryable: `ensure_linearizable` submits nothing.
+            assert!(
+                read_fatal_to_config_error(fatal).is_safe_to_resubmit(),
+                "a read has no outcome to be uncertain about"
+            );
+        }
     }
 }

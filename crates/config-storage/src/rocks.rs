@@ -11,12 +11,24 @@
 //! | `raft_log` | log index `u64` **big-endian** | `Entry<TypeConfig>` |
 //! | `raft_meta` | `vote`, `committed`, `last_purged` | `Vote` / `LogId` |
 //! | `kv` | user key bytes | [`Record`] |
-//! | `state_meta` | `identity`, `cluster_revision`, `last_applied`, `membership` | serialized |
+//! | `state_meta` | `format_version`, `identity`, `cluster_revision`, `last_applied`, `membership` | serialized (`format_version` excepted, see below) |
 //!
 //! Values are [`postcard`]-encoded. The canonical bytes of a [`Command`](config_core::Command)
 //! are *not* what is stored: a log entry is an OpenRaft `Entry`, whose payload carries the
 //! command via serde (ADR-0007 permits exactly this, and the determinism oracle remains
 //! `Command::encode`).
+//!
+//! # On-disk format version (ADR-0008 note of 2026-09-18)
+//!
+//! Because the stored values are serde encodings of *foreign* types (`Entry<TypeConfig>`,
+//! `Vote`, `LogId`, `Membership`), an OpenRaft upgrade or any field reorder silently changes
+//! the byte layout. [`FORMAT_VERSION`] is therefore stamped at `state_meta/format_version` on
+//! the first open and verified on every later one; a mismatch is
+//! [`StorageOpenError::UnsupportedFormat`], never a best-effort decode.
+//!
+//! The marker itself is the one value that is **not** postcard-encoded — it is a bare
+//! little-endian `u32`, because a marker written in the format it exists to police could not
+//! be read back across the very change it is meant to detect.
 //!
 //! Big-endian index keys are load-bearing: they make RocksDB's bytewise key order the log
 //! order, so a range scan and a "last entry" seek are both correct without a secondary index.
@@ -91,8 +103,16 @@ pub const CF_RAFT_LOG: &str = "raft_log";
 pub const CF_RAFT_META: &str = "raft_meta";
 /// Materialized user records, keyed by the user key bytes.
 pub const CF_KV: &str = "kv";
-/// State-machine metadata (`identity`, `cluster_revision`, `last_applied`, `membership`).
+/// State-machine metadata (`format_version`, `identity`, `cluster_revision`, `last_applied`,
+/// `membership`).
 pub const CF_STATE_META: &str = "state_meta";
+
+/// The on-disk format this build writes and is the only one it will open.
+///
+/// Bump this whenever the persisted bytes change shape — which includes an OpenRaft upgrade or
+/// any serde field addition, removal, or reorder in a persisted type, since every value except
+/// this marker is a `postcard` encoding of such a type (ADR-0008 note of 2026-09-18).
+pub const FORMAT_VERSION: u32 = 1;
 
 /// Exactly the column families an M2 data directory may contain (ADR-0008 §9.2).
 ///
@@ -104,6 +124,7 @@ const KEY_VOTE: &[u8] = b"vote";
 const KEY_COMMITTED: &[u8] = b"committed";
 const KEY_LAST_PURGED: &[u8] = b"last_purged";
 const KEY_IDENTITY: &[u8] = b"identity";
+const KEY_FORMAT_VERSION: &[u8] = b"format_version";
 const KEY_LAST_APPLIED: &[u8] = b"last_applied";
 const KEY_MEMBERSHIP: &[u8] = b"membership";
 const KEY_CLUSTER_REVISION: &[u8] = b"cluster_revision";
@@ -136,6 +157,26 @@ pub enum StorageOpenError {
         path: PathBuf,
         /// The backend's description.
         detail: String,
+    },
+
+    /// The directory was written in a different on-disk format than this build understands.
+    ///
+    /// Every persisted value except the marker itself is a `postcard` encoding of a type this
+    /// build does not own (`Entry<TypeConfig>`, `Vote`, `LogId`, `Membership`), so a mismatch
+    /// means the bytes may decode into *plausible but wrong* state. Refusing is the only safe
+    /// answer (ADR-0008 note of 2026-09-18, test plan M2-66..M2-68).
+    #[error(
+        "data directory {path} is on-disk format version {found}; \
+             this build supports only version {supported}"
+    )]
+    UnsupportedFormat {
+        /// The version stamped in the directory; `0` means a store written before the marker
+        /// existed, whose format cannot be established at all.
+        found: u32,
+        /// The only version this build reads and writes ([`FORMAT_VERSION`]).
+        supported: u32,
+        /// The directory.
+        path: PathBuf,
     },
 
     /// An expected column family is absent. Auto-creating it on a directory that already holds
@@ -561,6 +602,11 @@ impl RocksStore {
 
         let db = open_db(dir, &path)?;
 
+        // First, before a single stored byte is decoded: every value below is a serde encoding
+        // whose layout this version selects, so reading them out of a directory written in
+        // another format is exactly the silent misinterpretation the marker exists to prevent.
+        let stamp_format = check_format_version(&db, &path)?;
+
         let stored_identity: Option<ClusterIdentity> = read_meta(&db, CF_STATE_META, KEY_IDENTITY)
             .map_err(|detail| StorageOpenError::Corrupt {
                 what: "state_meta/identity".to_string(),
@@ -568,6 +614,17 @@ impl RocksStore {
                 detail,
             })?;
 
+        let state_meta =
+            db.cf_handle(CF_STATE_META)
+                .ok_or_else(|| StorageOpenError::MissingColumnFamily {
+                    name: CF_STATE_META.to_string(),
+                    path: path.clone(),
+                    expected: COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+                })?;
+
+        // One synced batch binds the identity and stamps the format version, so a directory can
+        // never come back from a first open carrying one of them without the other.
+        let mut open_batch = WriteBatch::default();
         match stored_identity {
             Some(stored) if stored != identity => {
                 tracing::error!(
@@ -598,27 +655,26 @@ impl RocksStore {
                 );
             }
             None => {
-                let cf = db.cf_handle(CF_STATE_META).ok_or_else(|| {
-                    StorageOpenError::MissingColumnFamily {
-                        name: CF_STATE_META.to_string(),
-                        path: path.clone(),
-                        expected: COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
-                    }
-                })?;
                 let encoded =
                     postcard::to_stdvec(&identity).map_err(|e| StorageOpenError::Backend {
                         path: path.clone(),
                         detail: format!("cannot encode identity: {e}"),
                     })?;
-                let mut w = WriteOptions::default();
-                w.set_sync(true);
-                let mut batch = WriteBatch::default();
-                batch.put_cf(cf, KEY_IDENTITY, encoded);
-                db.write_opt(batch, &w)
-                    .map_err(|e| StorageOpenError::Backend {
-                        path: path.clone(),
-                        detail: format!("cannot write identity: {e}"),
-                    })?;
+                open_batch.put_cf(state_meta, KEY_IDENTITY, encoded);
+            }
+        }
+        if stamp_format {
+            open_batch.put_cf(state_meta, KEY_FORMAT_VERSION, FORMAT_VERSION.to_le_bytes());
+        }
+        if !open_batch.is_empty() {
+            let mut w = WriteOptions::default();
+            w.set_sync(true);
+            db.write_opt(open_batch, &w)
+                .map_err(|e| StorageOpenError::Backend {
+                    path: path.clone(),
+                    detail: format!("cannot write open metadata: {e}"),
+                })?;
+            if stored_identity.is_none() {
                 tracing::info!(
                     cluster_id = %identity.cluster_id,
                     node_id = identity.node_id.0,
@@ -652,6 +708,7 @@ impl RocksStore {
             recovery_epoch = identity.recovery_epoch.0,
             path = %path.display(),
             fresh,
+            format_version = FORMAT_VERSION,
             durability = ?durability,
             last_applied = loaded.last_applied.map(|l| l.index),
             last_log_index = loaded.last_log_id.map(|l| l.index),
@@ -877,6 +934,77 @@ fn verify_column_families(dir: &Path, path: &Path) -> Result<(), StorageOpenErro
         }
     }
     Ok(())
+}
+
+/// Decide what a directory's `state_meta/format_version` marker means for this build.
+///
+/// `Ok(false)` — the marker is present and is [`FORMAT_VERSION`]; proceed.
+/// `Ok(true)` — the directory holds nothing yet, so the caller must stamp the marker.
+/// `Err(UnsupportedFormat)` — the marker names another version, or is absent from a directory
+/// that already holds data, which makes it a store written before the marker existed
+/// (`found: 0`) whose layout cannot be established at all (test plan M2-66..M2-68).
+///
+/// The marker is read as raw little-endian bytes rather than through [`read_meta`]: a marker
+/// encoded in the format it exists to police could not be read back across the very change it
+/// is meant to detect.
+fn check_format_version(db: &DB, path: &Path) -> Result<bool, StorageOpenError> {
+    let handle =
+        db.cf_handle(CF_STATE_META)
+            .ok_or_else(|| StorageOpenError::MissingColumnFamily {
+                name: CF_STATE_META.to_string(),
+                path: path.to_path_buf(),
+                expected: COLUMN_FAMILIES.iter().map(|s| s.to_string()).collect(),
+            })?;
+    let raw = db
+        .get_cf(handle, KEY_FORMAT_VERSION)
+        .map_err(|e| StorageOpenError::Backend {
+            path: path.to_path_buf(),
+            detail: format!("cannot read format version: {e}"),
+        })?;
+    let unsupported = |found| StorageOpenError::UnsupportedFormat {
+        found,
+        supported: FORMAT_VERSION,
+        path: path.to_path_buf(),
+    };
+
+    match raw {
+        Some(bytes) => {
+            let found = u32::from_le_bytes(bytes.as_slice().try_into().map_err(|_| {
+                StorageOpenError::Corrupt {
+                    what: "state_meta/format_version".to_string(),
+                    path: path.to_path_buf(),
+                    detail: format!("expected 4 little-endian bytes, found {}", bytes.len()),
+                }
+            })?);
+            if found == FORMAT_VERSION {
+                Ok(false)
+            } else {
+                Err(unsupported(found))
+            }
+        }
+        None if holds_persisted_state(db) => Err(unsupported(0)),
+        None => Ok(true),
+    }
+}
+
+/// Whether the directory already holds values whose byte layout the format version selects.
+///
+/// Only used to tell a brand-new directory (stamp the marker) from a pre-marker store (refuse
+/// it), so it probes the cheapest witnesses rather than scanning: the binding written on a
+/// first open, the vote written before any append, the first log key, and the applied pointer
+/// written with every state batch. Nothing persists without at least one of them.
+fn holds_persisted_state(db: &DB) -> bool {
+    let has = |cf: &str, key: &[u8]| {
+        db.cf_handle(cf)
+            .and_then(|h| db.get_cf(h, key).ok().flatten())
+            .is_some()
+    };
+    has(CF_STATE_META, KEY_IDENTITY)
+        || has(CF_STATE_META, KEY_LAST_APPLIED)
+        || has(CF_RAFT_META, KEY_VOTE)
+        || db
+            .cf_handle(CF_RAFT_LOG)
+            .is_some_and(|h| db.iterator_cf(h, IteratorMode::Start).next().is_some())
 }
 
 fn read_meta<T: serde::de::DeserializeOwned>(

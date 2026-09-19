@@ -161,8 +161,14 @@ impl Node {
         // `in_scope`, not a guard held across an await: the span has to be current when the
         // serving task is spawned, and nothing else (ADR-0013).
         let handle = tracing::info_span!("fake_node", node_id).in_scope(|| {
-            serve_client_plane(Arc::new(OneStore(store.clone())), listener, tls, cluster_id)
-                .expect("serve client plane")
+            serve_client_plane(
+                Arc::new(OneStore(store.clone())),
+                listener,
+                tls,
+                cluster_id,
+                Limits::DEFAULT,
+            )
+            .expect("serve client plane")
         });
         let endpoint = handle.local_addr().to_string();
         Node {

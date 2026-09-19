@@ -111,3 +111,45 @@ only follow a lost disk — which identity binding (ADR-0011) treats as an opera
 must be handled explicitly, not absorbed by a relaxed assertion. Nothing in the M2+ production
 path depends on the feature, and the scoping above is what keeps that true by construction
 rather than by review.
+
+### Note (2026-09-18): on-disk `format_version` (rv-schema F-030)
+
+**What is actually stored.** Every value in the four column families is a `postcard` encoding:
+`raft_log` holds `Entry<TypeConfig>`, `raft_meta` holds `Vote` / `LogId`, `kv` holds `Record`,
+`state_meta` holds the identity, applied pointer and `Membership`. Four of those types belong to
+OpenRaft, not to this repository. `CommandV1` (ADR-0007) is the envelope *inside* an entry's
+payload, not the layout of a stored record — an earlier reading of ADR-0007 that made
+`Command::encode()` the on-disk log format was wrong and has been corrected there and in
+`config-core/src/command.rs`.
+
+**Why that needs a marker.** An OpenRaft upgrade, or any serde field addition, removal, or
+reorder in a persisted type, changes the byte layout with no change in this repository's own
+source. `postcard` is not self-describing and tolerates trailing bytes, so the failure mode is
+not a decode error but a *plausible wrong value* — a store that opens cleanly and replays
+different state.
+
+**Decision.** `state_meta/format_version` carries a bare little-endian `u32`, currently
+`config_storage::FORMAT_VERSION = 1`. It is deliberately **not** `postcard`-encoded: a marker
+written in the format it polices could not be read back across the change it exists to detect.
+
+- First open of an empty directory stamps the marker in the *same* `set_sync(true)` `WriteBatch`
+  that binds the identity, so a directory can never carry one without the other.
+- Marker present and `== 1` → open proceeds.
+- Marker present and `!= 1` → `StorageOpenError::UnsupportedFormat { found, supported }`.
+- Marker absent from a directory that already holds data (identity, vote, a log entry, or the
+  applied pointer) → the same refusal with `found: 0`: a pre-marker store whose format cannot be
+  established. The check runs before any stored value is decoded.
+- `run.rs` needs no change: `open_store` routes only `IdentityMismatch` to exit 2, and every
+  other `StorageOpenError` to `Fatal::storage("storage_open_failed")` → exit 3.
+
+**When to bump.** Raising the `openraft` dependency, or changing the serde shape of `Command`,
+`CommandResponse`, `RaftNode`, `Record`, `ClusterIdentity` or anything else reachable from a
+persisted value, is a **format bump**: increment `FORMAT_VERSION` in the same change. Shipping
+new bytes under version 1 is the one failure this note exists to prevent.
+
+**`EphemeralStore` is exempt.** It persists nothing — its log and state machine die with the
+process — so there is no stored byte layout to version and no directory to refuse. The marker is
+a `RocksStore` concept only.
+
+**Rows.** Test plan M2-66 (first open stamps 1, reopen succeeds), M2-67 (stamped 2 → refusal),
+M2-68 (marker deleted from a non-empty store → refusal with `found: 0`).

@@ -95,6 +95,13 @@ pub struct TlsSection {
     /// This node's private key PEM. Required for `mutual`.
     #[serde(default)]
     pub key: Option<PathBuf>,
+    /// Let a client certificate that asserts no `retcd://` SAN authenticate under its Common
+    /// Name (client plane only, ADR-0012). Off unless written, and it is written only for a CA
+    /// that cannot mint URI SANs: a Common Name carries no cluster id, so with this on a
+    /// CN-only certificate minted by the shared CA for *another* cluster authenticates here
+    /// under that name.
+    #[serde(default)]
+    pub allow_common_name_principals: bool,
 }
 
 /// `[authz]` — the static allowlist policy file (ADR-0012).
@@ -215,6 +222,10 @@ pub struct TlsMaterial {
     pub cert_pem: Vec<u8>,
     /// This node's private key.
     pub key_pem: Vec<u8>,
+    /// `tls.allow_common_name_principals`, carried here because it describes the same mutual
+    /// profile the PEM does and is meaningless without one: it becomes
+    /// [`config_grpc::MtlsConfig::allow_common_name_principals`] on the client plane.
+    pub allow_common_name_principals: bool,
 }
 
 /// `Debug` prints sizes, never key bytes.
@@ -224,6 +235,10 @@ impl std::fmt::Debug for TlsMaterial {
             .field("ca_pem_bytes", &self.ca_pem.len())
             .field("cert_pem_bytes", &self.cert_pem.len())
             .field("key_pem_bytes", &self.key_pem.len())
+            .field(
+                "allow_common_name_principals",
+                &self.allow_common_name_principals,
+            )
             .finish()
     }
 }
@@ -315,10 +330,24 @@ fn validate(
             let ca = required_path("tls.ca", base, file.tls.ca.as_deref())?;
             let cert = required_path("tls.cert", base, file.tls.cert.as_deref())?;
             let key = required_path("tls.key", base, file.tls.key.as_deref())?;
+            if file.tls.allow_common_name_principals {
+                // Not a refusal — it is a supported profile for a CA that cannot mint URI SANs
+                // — but it narrows the cluster binding the rest of ADR-0011/ADR-0012 rests on,
+                // so it must be visible in the log rather than only in the file, exactly like
+                // `insecure_transport_enabled` (ADR-0010).
+                tracing::warn!(
+                    detail = "tls.allow_common_name_principals = true; a client certificate \
+                              asserting no retcd:// SAN is served under its Common Name, which \
+                              carries no cluster id — a CN-only certificate the shared CA \
+                              minted for another cluster authenticates here (ADR-0012)",
+                    "common_name_principals_enabled"
+                );
+            }
             Some(TlsMaterial {
                 ca_pem: read_bytes("tls.ca", &ca)?,
                 cert_pem: read_bytes("tls.cert", &cert)?,
                 key_pem: read_bytes("tls.key", &key)?,
+                allow_common_name_principals: file.tls.allow_common_name_principals,
             })
         }
     };
@@ -579,6 +608,34 @@ mode = "insecure"
         let text = minimal("") + &format!("\n[gossip]\nsecret_key_hex = \"{}\"\n", "ab".repeat(32));
         let cfg = parse(&text, None, true).expect("64 hex characters");
         assert_eq!(cfg.gossip_secret_key, Some([0xab; 32]));
+    }
+
+    /// F-015: the Common Name fallback is a written-down decision, not a default. An operator
+    /// who never heard of the key must get the bound-to-a-cluster behaviour.
+    #[test]
+    fn the_common_name_principal_gate_is_shut_unless_the_document_opens_it() {
+        let file: ServerConfigFile = toml::from_str(&minimal("")).expect("minimal document");
+        assert!(
+            !file.tls.allow_common_name_principals,
+            "a document that does not mention the key must not enable it"
+        );
+
+        // It reaches the validated material, which is what the client plane is built from.
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in ["ca.pem", "node.cert.pem", "node.key.pem"] {
+            std::fs::write(dir.path().join(name), b"-----BEGIN-----\n").expect("write pem");
+        }
+        let text = minimal("allow_common_name_principals = true")
+            .replace("mode = \"insecure\"", "mode = \"mutual\"")
+            + "ca = \"ca.pem\"\ncert = \"node.cert.pem\"\nkey = \"node.key.pem\"\n";
+        let file: ServerConfigFile = toml::from_str(&text).expect("the key belongs to [tls]");
+        let cfg = validate(file, dir.path(), None, false).expect("a complete mutual document");
+        assert!(
+            cfg.tls_material
+                .expect("mutual mode carries material")
+                .allow_common_name_principals,
+            "the gate the document opened must reach the profile the planes are served with"
+        );
     }
 
     #[test]

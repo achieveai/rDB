@@ -17,8 +17,13 @@ survives upgrades, and never depends on serde container ordering or platform det
   `value len u32 LE | value (Put only) | has_expected u8 | expected_mod_revision u64 LE`.
   No floats, no maps, no optional trailing fields; unknown version → typed decode error.
 - The same struct also derives `serde::{Serialize, Deserialize}` because OpenRaft 0.9 requires
-  serde on `D`/`R` under its `serde` feature; the **canonical bytes** (used for determinism
-  tests and for on-disk log storage in M2) come from `Command::encode()`.
+  serde on `D`/`R` under its `serde` feature. `CommandV1` is the **envelope carried inside a
+  Raft entry's payload**, not the byte layout of a stored record: what M2 writes to
+  `raft_log` is `postcard(Entry<TypeConfig>)`, whose `EntryPayload::Normal` holds the
+  `Command` via that serde derive (`config-storage/src/rocks.rs` module docs; ADR-0008 note of
+  2026-09-18 covers the resulting on-disk format version). `Command::encode()` remains the
+  **canonical bytes** wherever command identity is the question — determinism tests, the replay
+  oracle, and the command fingerprint — and is what a future record-level encoding would use.
 - Responses (`R = CommandResponse`) carry the `MutationOutcome`, revision, and the
   `MutationEvent` (in memory only).
 - Apply must not use wall clock, randomness, environment, unordered iteration, or I/O.

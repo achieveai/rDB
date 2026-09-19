@@ -18,8 +18,9 @@
 //!
 //! There are none. [`NoSnapshots`] is the `SnapshotBuilder`, `get_current_snapshot` returns
 //! `None`, and `install_snapshot` is an error. This is safe only because the engine runs with
-//! `SnapshotPolicy::Never`, `max_in_snapshot_log_to_keep = 0` and never triggers a purge, so
-//! a follower can always be caught up from the leader's log.
+//! `SnapshotPolicy::Never`, `max_in_snapshot_log_to_keep = u64::MAX` (see
+//! `NodeConfig::openraft_config`) and never triggers a purge, so a follower can always be
+//! caught up from the leader's log.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

@@ -18,11 +18,19 @@
 //!
 //! # The Common Name fallback, and its exact limit
 //!
-//! A certificate that asserts **no** `retcd://` URI SAN at all falls back to its Common Name,
-//! which covers CAs that cannot mint URI SANs. A certificate that asserts one and means
-//! something else by it — a node identity, another cluster, a URI our grammar rejects — is
-//! refused outright. Falling back there would let a peer node's certificate log in as a
-//! client under its CN, which is the separation of the two planes undone.
+//! A certificate that asserts **no** `retcd://` URI SAN at all *may* fall back to its Common
+//! Name, which covers CAs that cannot mint URI SANs — but only on a listener that sets
+//! [`MtlsConfig::allow_common_name_principals`]. A Common Name carries no cluster id, so the
+//! check above cannot run on it: under a shared CA, a CN-only certificate minted for a
+//! neighbouring cluster is indistinguishable from one minted for this one and would
+//! authenticate here as that CN, bounded only by the allowlist. The fallback is therefore off
+//! by default, and with it off a CN-only certificate is refused exactly like a certificate
+//! carrying no identity at all.
+//!
+//! A certificate that asserts a `retcd://` SAN and means something else by it — a node
+//! identity, another cluster, a URI our grammar rejects — is refused outright whatever the
+//! flag says. Falling back there would let a peer node's certificate log in as a client under
+//! its CN, which is the separation of the two planes undone.
 
 use std::str::FromStr;
 
@@ -57,6 +65,15 @@ pub struct MtlsConfig {
     /// addressed to a different member. This field therefore configures the client plane
     /// only.
     pub server_domain: Option<String>,
+    /// Whether a client certificate with no `retcd://` SAN may authenticate under its Common
+    /// Name (client plane only; see the module docs).
+    ///
+    /// `false` by default, and that default is the security property: a Common Name carries
+    /// no cluster id, so this listener cannot tell a CN-only certificate minted for its own
+    /// cluster from one the same CA minted for a neighbouring cluster. Turning it on is a
+    /// deliberate trade for CAs that cannot mint URI SANs, and narrows the cluster binding
+    /// this module otherwise guarantees on both planes.
+    pub allow_common_name_principals: bool,
 }
 
 impl MtlsConfig {
@@ -67,12 +84,20 @@ impl MtlsConfig {
             cert_pem,
             key_pem,
             server_domain: None,
+            allow_common_name_principals: false,
         }
     }
 
     /// Verify dialed servers against `domain` instead of the endpoint host.
     pub fn with_server_domain(mut self, domain: impl Into<String>) -> Self {
         self.server_domain = Some(domain.into());
+        self
+    }
+
+    /// Accept a Common Name as the client principal when the certificate asserts no
+    /// `retcd://` SAN; see [`MtlsConfig::allow_common_name_principals`] for what that costs.
+    pub fn with_common_name_principals(mut self, allow: bool) -> Self {
+        self.allow_common_name_principals = allow;
         self
     }
 
@@ -152,6 +177,10 @@ impl std::fmt::Debug for MtlsConfig {
             .field("cert_pem_bytes", &self.cert_pem.len())
             .field("key_pem_bytes", &self.key_pem.len())
             .field("server_domain", &self.server_domain)
+            .field(
+                "allow_common_name_principals",
+                &self.allow_common_name_principals,
+            )
             .finish()
     }
 }
@@ -297,9 +326,15 @@ pub fn common_name_from_der(der: &[u8]) -> Option<String> {
 /// `expected_cluster` is this listener's cluster. A `retcd://` client SAN naming a different
 /// cluster is refused rather than accepted under its Common Name, and so is a node SAN: see
 /// the module docs for why the fallback stops there.
+///
+/// `allow_common_name_principals` is this listener's
+/// [`MtlsConfig::allow_common_name_principals`]. With it `false` — the default — a certificate
+/// asserting no `retcd://` SAN is refused instead of being served under its Common Name,
+/// because a Common Name cannot be checked against `expected_cluster`.
 pub fn principal_from_certs(
     certs: &[impl AsRef<[u8]>],
     expected_cluster: ClusterId,
+    allow_common_name_principals: bool,
 ) -> Result<Principal, Status> {
     let leaf = certs
         .first()
@@ -312,10 +347,19 @@ pub fn principal_from_certs(
         .collect();
 
     if asserted.is_empty() {
-        return match common_name_from_der(leaf) {
+        // One refusal for the whole branch, whether the gate is shut or the certificate has no
+        // Common Name either: the holder already knows what it presented, and a prober must
+        // not be able to read this listener's gate setting off the message.
+        let common_name = if allow_common_name_principals {
+            common_name_from_der(leaf)
+        } else {
+            None
+        };
+        return match common_name {
             Some(cn) => Ok(Principal::new(cn, PrincipalKind::Certificate)),
             None => Err(Status::unauthenticated(
-                "client certificate carries no retcd SAN URI and no common name",
+                "client certificate carries no retcd SAN URI and no principal could be derived \
+                 from it",
             )),
         };
     }

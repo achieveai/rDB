@@ -33,6 +33,9 @@ tracing = { workspace = true }
 # Test-only: a same-id restart on a fresh EphemeralStore is a legal log revert here, and
 # openraft's debug_assert would otherwise abort the leader (ADR-0008 note).
 openraft = { workspace = true, features = ["loosen-follower-log-revert"] }
+# Test-only: the hand-built peer envelopes below carry a postcard payload, the peer plane's
+# only accepted encoding (ADR-0010, fix-round note).
+postcard = { workspace = true }
 # Test-only: the M3 peer-plane rows (M3-09..M3-11) dial `PeerService` directly with a
 # hand-built envelope to prove the engine's identity checks are independent of the
 # certificate presented — something no `Cluster` method does on a caller's behalf.

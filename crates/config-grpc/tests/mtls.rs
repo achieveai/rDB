@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use config_core::{NodeId, PrincipalKind, RecoveryEpoch};
+use config_core::{Limits, NodeId, PrincipalKind, RecoveryEpoch};
 use config_engine::netfault::NetFault;
 use config_engine::transport::{PeerEnvelopeMeta, PeerRequest, PeerTransport, TransportError};
 use config_grpc::pb::config_service_client::ConfigServiceClient;
@@ -217,13 +217,20 @@ async fn m1_grpc_23_peer_certificate_identity_must_match_the_envelope() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let server_tls = TlsMode::MutualTls(mtls(&ca, server_cert, server_key));
     let handle = support::node_span(sink.node_id.0).in_scope(|| {
-        serve_peer_plane(sink.handler(), listener, server_tls, sink.identity())
-            .expect("serve peer plane")
+        serve_peer_plane(
+            sink.handler(),
+            listener,
+            server_tls,
+            sink.identity(),
+            Limits::DEFAULT,
+        )
+        .expect("serve peer plane")
     });
     let endpoint = handle.local_addr().to_string();
 
     let client_tls = TlsMode::MutualTls(mtls(&ca, node1_cert, node1_key));
-    let transport: Arc<GrpcPeerTransport> = GrpcPeerTransport::new(client_tls, NetFault::new());
+    let transport: Arc<GrpcPeerTransport> =
+        GrpcPeerTransport::new(client_tls, NetFault::new(), Limits::DEFAULT);
 
     let vote = || PeerRequest::Vote(VoteRequest::new(Vote::new(3, 1), None));
     let meta = |from: u64| PeerEnvelopeMeta {
@@ -320,9 +327,11 @@ async fn m1_grpc_25_a_node_certificate_is_not_a_client_principal() {
     let (cn_only_cert, cn_only_key) = issue(&ca, "legacy-svc", None);
 
     let store = FakeStore::new();
+    // The gate is deliberately *open* here: this row is about where the fallback stops even
+    // when it is available at all. Whether it is available by default is M3-88's row.
     let server = start_client_plane(
         store.clone(),
-        TlsMode::MutualTls(mtls(&ca, server_cert, server_key)),
+        TlsMode::MutualTls(mtls(&ca, server_cert, server_key).with_common_name_principals(true)),
     )
     .await;
 
@@ -347,8 +356,8 @@ async fn m1_grpc_25_a_node_certificate_is_not_a_client_principal() {
     }
     assert_eq!(store.call_count(), 0);
 
-    // A certificate that asserts no retcd URI at all still gets the fallback, so the check is
-    // narrow rather than a blanket refusal.
+    // A certificate that asserts no retcd URI at all still gets the fallback on this listener,
+    // so the check is narrow rather than a blanket refusal.
     let channel = tls_channel(&server.endpoint, &mtls(&ca, cn_only_cert, cn_only_key))
         .await
         .expect("handshake");
@@ -361,6 +370,68 @@ async fn m1_grpc_25_a_node_certificate_is_not_a_client_principal() {
     let principals = store.seen_principals();
     assert_eq!(principals.len(), 1);
     assert_eq!(principals[0].name, "legacy-svc");
+    assert_eq!(principals[0].kind, PrincipalKind::Certificate);
+}
+
+/// M3-88 (F-015): the Common Name fallback is off unless the listener opts in.
+///
+/// A Common Name says nothing about which cluster a certificate was minted for, so the cluster
+/// check every `retcd://` identity goes through has nothing to run against. Under a CA shared
+/// across an organisation — the case ADR-0011 exists for — a CN-only certificate issued for a
+/// *neighbouring* cluster's `svc-a` is therefore byte-indistinguishable from one issued for
+/// this cluster's `svc-a`, and was served as that principal, bounded only by the allowlist.
+/// Hence: refused by default, and the escape hatch for CAs that cannot mint URI SANs has to be
+/// asked for.
+#[retcd_test]
+async fn m3_88_common_name_principals_are_refused_unless_enabled() {
+    let ca = new_ca("retcd-test-ca");
+    let (server_cert, server_key) = issue(&ca, "server", None);
+    // The shared CA, no SAN at all, and a CN this cluster's allowlist would grant. Nothing on
+    // this certificate says which cluster asked for it — including when the answer is "the
+    // other one".
+    let (cn_cert, cn_key) = issue(&ca, "svc-a", None);
+    let key = || pb::GetRequest {
+        key: Bytes::from_static(b"/app/a"),
+    };
+
+    let store = FakeStore::new();
+    let closed = start_client_plane(
+        store.clone(),
+        TlsMode::MutualTls(mtls(&ca, server_cert.clone(), server_key.clone())),
+    )
+    .await;
+    let channel = tls_channel(
+        &closed.endpoint,
+        &mtls(&ca, cn_cert.clone(), cn_key.clone()),
+    )
+    .await
+    .expect("the CA is trusted, so the handshake succeeds");
+    let status = ConfigServiceClient::new(channel)
+        .get(key())
+        .await
+        .expect_err("a certificate with no cluster binding must not be served by default");
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert_eq!(
+        store.call_count(),
+        0,
+        "the store must never see a principal derived from a common name by default"
+    );
+
+    let open = start_client_plane(
+        store.clone(),
+        TlsMode::MutualTls(mtls(&ca, server_cert, server_key).with_common_name_principals(true)),
+    )
+    .await;
+    let channel = tls_channel(&open.endpoint, &mtls(&ca, cn_cert, cn_key))
+        .await
+        .expect("handshake");
+    ConfigServiceClient::new(channel)
+        .get(key())
+        .await
+        .expect("an opt-in listener still serves a SAN-less certificate under its common name");
+    let principals = store.seen_principals();
+    assert_eq!(principals.len(), 1);
+    assert_eq!(principals[0].name, "svc-a");
     assert_eq!(principals[0].kind, PrincipalKind::Certificate);
 }
 
@@ -459,6 +530,7 @@ async fn m3_grpc_50_a_peer_dial_is_verified_against_the_node_the_envelope_addres
             honest_listener,
             TlsMode::MutualTls(mtls(&ca, honest_cert, honest_key)),
             honest_sink.identity(),
+            Limits::DEFAULT,
         )
         .expect("serve honest peer plane")
     });
@@ -474,6 +546,7 @@ async fn m3_grpc_50_a_peer_dial_is_verified_against_the_node_the_envelope_addres
             impostor_listener,
             TlsMode::MutualTls(mtls(&ca, impostor_cert, impostor_key)),
             impostor_sink.identity(),
+            Limits::DEFAULT,
         )
         .expect("serve impostor peer plane")
     });
@@ -485,6 +558,7 @@ async fn m3_grpc_50_a_peer_dial_is_verified_against_the_node_the_envelope_addres
     let transport: Arc<GrpcPeerTransport> = GrpcPeerTransport::new(
         TlsMode::MutualTls(mtls(&ca, node1_cert, node1_key)),
         NetFault::new(),
+        Limits::DEFAULT,
     );
 
     let vote = || PeerRequest::Vote(VoteRequest::new(Vote::new(3, 1), None));

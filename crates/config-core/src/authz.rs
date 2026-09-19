@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PrincipalKind {
     /// Derived from an mTLS client certificate on the client plane — SAN URI
-    /// `retcd://<cluster_id>/client/<name>`, with CN as a fallback.
+    /// `retcd://<cluster_id>/client/<name>`; the CN is consulted only when the listener
+    /// opts in via `tls.allow_common_name_principals` (ADR-0010 note of 2026-09-18).
     Certificate,
     /// A committed cluster node authenticated on the Raft peer plane.
     Peer,

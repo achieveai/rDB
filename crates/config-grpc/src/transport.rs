@@ -30,15 +30,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use config_core::NodeId;
+use config_core::{Limits, NodeId};
 use config_engine::netfault::NetFault;
 use config_engine::transport::{
     PeerEnvelopeMeta, PeerRequest, PeerResponse, PeerTransport, TransportError,
-    PAYLOAD_ENCODING_JSON,
+    PAYLOAD_ENCODING_POSTCARD,
 };
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
+use crate::limits::peer_plane_message_limit;
 use crate::pb;
 use crate::pb::peer_service_client::PeerServiceClient;
 use crate::peer_plane::decode_response;
@@ -52,6 +53,12 @@ pub struct GrpcPeerTransport {
     tls: TlsMode,
     faults: NetFault,
     channels: Mutex<HashMap<ChannelKey, Channel>>,
+    /// Codec cap applied to every peer stub, derived once from the node's [`Limits`].
+    ///
+    /// Held as the resolved byte count rather than as the `Limits` it came from: the
+    /// derivation belongs to [`peer_plane_message_limit`], and doing it per call would only
+    /// invite the two ends to drift.
+    message_limit: usize,
 }
 
 impl std::fmt::Debug for GrpcPeerTransport {
@@ -69,11 +76,16 @@ impl std::fmt::Debug for GrpcPeerTransport {
 impl GrpcPeerTransport {
     /// Build a transport. `faults` is [`NetFault::default`] in production (permanently
     /// transparent) and the harness's shared switchboard in tests.
-    pub fn new(tls: TlsMode, faults: NetFault) -> Arc<Self> {
+    ///
+    /// `limits` must be the caps this cluster enforces: they size the stub's codec so an
+    /// `AppendEntries` the leader may legally build is one the follower answers instead of
+    /// rejecting as over-size — a rejection OpenRaft would retry forever.
+    pub fn new(tls: TlsMode, faults: NetFault, limits: Limits) -> Arc<Self> {
         Arc::new(Self {
             tls,
             faults,
             channels: Mutex::new(HashMap::new()),
+            message_limit: peer_plane_message_limit(&limits),
         })
     }
 
@@ -123,7 +135,7 @@ impl GrpcPeerTransport {
         req: PeerRequest,
     ) -> Result<PeerResponse, TransportError> {
         let kind = req.kind();
-        let payload = serde_json::to_vec(&req)
+        let payload = postcard::to_allocvec(&req)
             .map_err(|e| TransportError::Remote(format!("peer request encode failed: {e}")))?;
 
         let envelope = pb::PeerEnvelope {
@@ -131,7 +143,7 @@ impl GrpcPeerTransport {
             recovery_epoch: meta.recovery_epoch.0,
             from_node_id: meta.from.0,
             to_node_id: meta.to.0,
-            payload_encoding: PAYLOAD_ENCODING_JSON,
+            payload_encoding: PAYLOAD_ENCODING_POSTCARD,
             payload: payload.into(),
         };
 
@@ -142,7 +154,9 @@ impl GrpcPeerTransport {
             }
         }
 
-        let mut client = PeerServiceClient::new(self.channel(meta, endpoint)?);
+        let mut client = PeerServiceClient::new(self.channel(meta, endpoint)?)
+            .max_decoding_message_size(self.message_limit)
+            .max_encoding_message_size(self.message_limit);
         let call = async move {
             match kind {
                 "append_entries" => client.append_entries(request).await,

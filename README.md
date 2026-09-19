@@ -181,9 +181,9 @@ toolchain, daemon lifecycle, and more.
 | Milestone | Status (2026-09-18) |
 |---|---|
 | M0 — deterministic state-machine laboratory | Committed (`7014701`). |
-| M1 — three-node distributed core | Delivered; test-plan rows M1-01..49 covered; gate commit pending critic review. |
-| M2 — persistence and restart correctness | `RocksStore` and the M2 harness delivered; M2 test rows in progress. |
-| M3 — safe remote use baseline (first release gate) | `config-server` daemon, TLS/manifest fixtures and E2E-01..17 delivered; M3 harness rows pending. |
+| M1 — three-node distributed core | Delivered in `01a58b8`; test-plan rows M1-01..49 covered. |
+| M2 — persistence and restart correctness | Delivered in `01a58b8`; `RocksStore` and the M2 harness delivered. |
+| M3 — safe remote use baseline (first release gate) | Delivered in `01a58b8`; `config-server` daemon, TLS/manifest fixtures and E2E-01..17 delivered. |
 
 Each gate commit follows a critic review of that milestone's code and tests. The progress
 dashboard at [`docs/progress/index.html`](docs/progress/index.html) carries the live state.

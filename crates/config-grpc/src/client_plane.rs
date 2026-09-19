@@ -19,13 +19,14 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 
-use config_core::{ClusterId, ConfigError, ConfigStore, Principal};
+use config_core::{ClusterId, ConfigError, ConfigStore, Limits, Principal};
 use config_log::TraceContext;
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
 use tracing::Instrument;
 
 use crate::error::{mark_rejected, status_from_error, GrpcError};
+use crate::limits::client_plane_message_limit;
 use crate::pb;
 use crate::pb::config_service_server::{ConfigService, ConfigServiceServer};
 use crate::server::{spawn, ServerHandle};
@@ -84,12 +85,16 @@ struct ConfigSvc {
 impl ConfigSvc {
     /// Derive the caller's principal from the transport, never from the message.
     fn principal<T>(&self, request: &Request<T>) -> Result<Principal, Status> {
-        match self.tls {
+        match &self.tls {
             TlsMode::Insecure => Ok(Principal::development()),
-            TlsMode::MutualTls(_) => match request.peer_certs() {
+            TlsMode::MutualTls(cfg) => match request.peer_certs() {
                 Some(certs) if !certs.is_empty() => {
                     let der: Vec<&[u8]> = certs.iter().map(|c| c.as_ref()).collect();
-                    principal_from_certs(&der, self.cluster_id)
+                    principal_from_certs(
+                        &der,
+                        self.cluster_id,
+                        cfg.allow_common_name_principals,
+                    )
                 }
                 _ => Err(Status::unauthenticated(
                     "mutual TLS is required on this listener but no client certificate was presented",
@@ -215,12 +220,17 @@ impl ConfigService for ConfigSvc {
 /// certificate must carry a `retcd://<cluster_id>/client/<name>` SAN for *that* cluster
 /// (ADR-0011). Under [`TlsMode::Insecure`] it is unused — there is no certificate to check.
 ///
+/// `limits` must be the caps this node enforces. It is not used to validate anything here —
+/// that happens below the transport — only to size the codec so a reply this node is entitled
+/// to build is a reply it is able to send ([`client_plane_message_limit`]).
+///
 /// Requires a current Tokio runtime; the library never creates one (spec §6.3).
 pub fn serve_client_plane(
     backend: Arc<dyn ClientBackend>,
     listener: TcpListener,
     tls: TlsMode,
     cluster_id: ClusterId,
+    limits: Limits,
 ) -> Result<ServerHandle, GrpcError> {
     let svc = ConfigSvc {
         backend,
@@ -228,8 +238,13 @@ pub fn serve_client_plane(
         cluster_id,
         server_span: tracing::Span::current(),
     };
+    let cap = client_plane_message_limit(&limits);
     let router = tls
         .apply_server(tonic::transport::Server::builder())?
-        .add_service(ConfigServiceServer::new(svc));
+        .add_service(
+            ConfigServiceServer::new(svc)
+                .max_decoding_message_size(cap)
+                .max_encoding_message_size(cap),
+        );
     spawn("client", router, listener)
 }

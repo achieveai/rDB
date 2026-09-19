@@ -329,6 +329,7 @@ async fn m3_54_hint_target_identity_validated_before_use() {
         target_listener,
         config_grpc::TlsMode::MutualTls(fixture.node_mtls(NodeId(2))),
         CLUSTER,
+        config_core::Limits::DEFAULT,
     )
     .expect("target listener starts");
     let target_endpoint = target_addr.to_string();
@@ -347,6 +348,7 @@ async fn m3_54_hint_target_identity_validated_before_use() {
         follower_listener,
         config_grpc::TlsMode::MutualTls(fixture.node_mtls(NodeId(1))),
         CLUSTER,
+        config_core::Limits::DEFAULT,
     )
     .expect("follower listener starts");
     let follower_endpoint = follower_addr.to_string();
@@ -473,6 +475,7 @@ async fn m3_55_hint_is_committed_endpoint_not_gossip() {
             request_deadline: cluster.config().read_timeout,
             tls: config_client::TlsMode::MutualTls(pair),
             expected_capabilities: None,
+            limits: cluster.config().limits,
         },
     )
     .expect("a TLS client over the cluster's own client endpoints")

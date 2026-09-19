@@ -231,7 +231,13 @@ impl ClusterTls {
             ClusterTls::MutualTls(fixture) => TlsMode::MutualTls(
                 fixture
                     .issue_with(CertProfile::node(id), overrides.clone())
-                    .mtls(),
+                    .mtls()
+                    // The harness serves the CN-fallback profile because two rows are *about*
+                    // that fallback — M3-16 and the §4.2 smoke row both present a certificate
+                    // with no SAN URI — and a harness that refused it could not express them.
+                    // That the fallback is off unless a listener asks for it is M3-88's row,
+                    // against a listener the row builds itself (F-015).
+                    .with_common_name_principals(true),
             ),
         }
     }
@@ -1460,6 +1466,7 @@ impl Cluster {
                 request_deadline: self.cfg.read_timeout,
                 tls: TlsMode::Insecure,
                 expected_capabilities: None,
+                limits: self.cfg.limits,
             },
         )
         .expect("a client over the cluster's own client endpoints")
@@ -1545,6 +1552,7 @@ impl Cluster {
                 request_deadline: self.cfg.read_timeout,
                 tls,
                 expected_capabilities: None,
+                limits: self.cfg.limits,
             },
         )?;
         // Without the cluster id a mutual-TLS client cannot name the node a hint points at
@@ -2087,6 +2095,7 @@ async fn start_running(
             recovery_epoch: identity.recovery_epoch,
             node_id: identity.node_id,
         },
+        cfg.limits,
     )
     .expect("peer plane listening on its bound listener");
     let client_server = serve_client_plane(
@@ -2094,6 +2103,7 @@ async fn start_running(
         client_listener,
         serving,
         identity.cluster_id,
+        cfg.limits,
     )
     .expect("client plane listening on its bound listener");
     drop(guard);
@@ -2147,7 +2157,8 @@ fn peer_transport_for(
                 .mtls(),
         ),
     };
-    GrpcPeerTransport::new(tls, netfault.clone()) as Arc<dyn config_engine::PeerTransport>
+    GrpcPeerTransport::new(tls, netfault.clone(), cfg.limits)
+        as Arc<dyn config_engine::PeerTransport>
 }
 
 /// Open a RocksDB data directory, retrying only while it is still `Locked`.

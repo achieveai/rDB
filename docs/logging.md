@@ -60,7 +60,8 @@ them carry them:
   (`config_log::testing::test_run_id()`), shared by every test in that run. This is the field
   that lets you filter out stale lines from earlier runs — see the "latest run only" recipe
   below.
-- `testNode` — set inside a multi-node in-process cluster test, when applicable.
+- `testNode` — reserved, not emitted in M0-M3 (set inside a multi-node in-process cluster test,
+  when applicable).
 
 ## Where files land
 

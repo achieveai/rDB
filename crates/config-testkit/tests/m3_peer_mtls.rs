@@ -28,7 +28,7 @@
 mod support;
 
 use config_core::{ClusterId, ConfigStore, NodeId};
-use config_engine::transport::{PeerRequest, PAYLOAD_ENCODING_JSON};
+use config_engine::transport::{PeerRequest, PAYLOAD_ENCODING_POSTCARD};
 use config_testkit::cluster::{AuthzKind, Cluster, PoisonSpec, StorageKind};
 use config_testkit::tls::{CertOverrides, CertProfile, TlsFixture};
 use openraft::raft::VoteRequest;
@@ -130,13 +130,13 @@ async fn raw_peer_call(
         .await
         .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
 
-    let payload = serde_json::to_vec(&req).expect("a dummy vote request encodes");
+    let payload = postcard::to_allocvec(&req).expect("a dummy vote request encodes");
     let envelope = config_grpc::pb::PeerEnvelope {
         cluster_id: cluster_id_hdr.to_string(),
         recovery_epoch: recovery_epoch_hdr,
         from_node_id: from_hdr,
         to_node_id: to_hdr,
-        payload_encoding: PAYLOAD_ENCODING_JSON,
+        payload_encoding: PAYLOAD_ENCODING_POSTCARD,
         payload: payload.into(),
     };
     let mut client = config_grpc::pb::peer_service_client::PeerServiceClient::new(channel);
@@ -814,14 +814,14 @@ async fn m3_12_peer_client_cert_required() {
         }
         Ok(channel) => {
             let mut client = config_grpc::pb::peer_service_client::PeerServiceClient::new(channel);
-            let payload = serde_json::to_vec(&dummy_vote(3)).expect("a dummy vote encodes");
+            let payload = postcard::to_allocvec(&dummy_vote(3)).expect("a dummy vote encodes");
             let status = client
                 .vote(tonic::Request::new(config_grpc::pb::PeerEnvelope {
                     cluster_id: CLUSTER.to_string(),
                     recovery_epoch: 1,
                     from_node_id: 3,
                     to_node_id: target.0,
-                    payload_encoding: PAYLOAD_ENCODING_JSON,
+                    payload_encoding: PAYLOAD_ENCODING_POSTCARD,
                     payload: payload.into(),
                 }))
                 .await

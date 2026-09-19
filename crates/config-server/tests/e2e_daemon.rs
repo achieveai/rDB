@@ -1092,6 +1092,66 @@ async fn e2e_18_endpoint_mismatch_never_serves_a_client() {
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// E2E-19
+// ---------------------------------------------------------------------------------------
+
+/// A second daemon on a data directory another daemon already holds exits **3**, not 2
+/// (M2-60's daemon clause; the second-process half of M2-64).
+///
+/// Exit 3 is the one ADR-0018 code no other process-level row observes: every refusal this
+/// suite covers is a `2` ("you asked for something I will not do"), while `3` is "the disk let
+/// us down". The cheapest honest way to produce one is RocksDB's own `LOCK` file. `open_store`
+/// is step 1 of `run.rs`, before any socket exists, so the second process fails without ever
+/// binding a port — which is also why it can reuse the first node's configuration verbatim.
+///
+/// The second daemon gets its own log directory so that its `startup_failed` line is read from
+/// a file the still-running first daemon is not appending to while the assertion runs.
+#[retcd_test]
+async fn e2e_19_locked_data_dir_exits_storage_code() {
+    const METHOD: &str = "e2e_19_locked_data_dir_exits_storage_code";
+    let harness = Harness::with_nodes(METHOD, &[1]).await;
+    let mut holder = harness.start(0, true);
+
+    // The same configuration file, so the same data directory and the same node identity:
+    // only the log directory and the shutdown file this run would watch are its own.
+    let mut second = harness.nodes[0].clone();
+    second.log_dir = harness.root().join("second-open-logs");
+    second.shutdown_file = harness.root().join("second-open-stop");
+    let mut spec = harness.spec(0);
+    spec.log_dir = second.log_dir.clone();
+    spec.shutdown_file = second.shutdown_file.clone();
+
+    let (code, stdout, stderr) = daemon::run_to_completion(&spec);
+    assert_eq!(
+        code,
+        Some(3),
+        "a locked data directory must exit 3, not refuse and not hang; stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a daemon that never opened its store prints no ready line: {stdout:?}"
+    );
+
+    let refusals = support::startup_failed_lines(&second, METHOD);
+    assert_eq!(
+        refusals.len(),
+        1,
+        "expected exactly one startup_failed line; got {refusals:#?}"
+    );
+    assert_eq!(
+        support::log_field(&refusals[0], "reason"),
+        Some("storage_open_failed"),
+        "the refusal must name the storage open failure: {:#?}",
+        refusals[0]
+    );
+
+    // The holder was never disturbed: it still serves, and it still stops cleanly (exit 0).
+    let alive = support::health(holder.health_endpoint()).await;
+    assert_eq!(alive.node_id, harness.nodes[0].node_id);
+    holder.stop_gracefully(startup_deadline()).await;
+}
+
 /// The spawn helper must never leave a child alive once its handle is dropped (TA-20.4).
 #[retcd_test]
 async fn e2e_17b_drop_kills_the_child() {

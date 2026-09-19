@@ -1,12 +1,12 @@
-//! Signed bootstrap manifest verification (ADR-0018 §7, ADR-0011 §4.3, test plan TA-19).
+//! Signed bootstrap manifest verification (ADR-0018 §7, spec §4.3, ADR-0011, test plan TA-19).
 //!
 //! The order of the three checks is the security property:
 //!
 //! 1. **Signature over the exact `manifest.toml` bytes**, before a single field is parsed. A
 //!    daemon that parsed first would be interpreting an attacker's document in order to
 //!    decide whether to trust it.
-//! 2. **`expires_at` against the system clock.** This is the only clock read in rEtcd; the
-//!    state machine stays clock-free (TA-9).
+//! 2. **`expires_at` against the system clock.** This is the only behaviour-affecting clock
+//!    read in rEtcd; the state machine stays clock-free (TA-9).
 //! 3. **Agreement with this node's configuration**: cluster id, recovery epoch, own node id
 //!    present, and own endpoints equal to the ones this node is about to advertise.
 //!

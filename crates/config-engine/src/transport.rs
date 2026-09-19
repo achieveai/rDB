@@ -20,7 +20,14 @@ use openraft::raft::{
 use serde::{Deserialize, Serialize};
 
 /// Payload encoding tag carried in `PeerEnvelope.payload_encoding`.
-pub const PAYLOAD_ENCODING_JSON: u32 = 1;
+///
+/// One encoding per protocol version, never a negotiation: a receiver accepts exactly this
+/// tag and refuses everything else with `INVALID_ARGUMENT`, so a peer built against a
+/// different encoding is turned away by a typed refusal instead of handing bytes to a decoder
+/// that will misread them. Tag `1` was serde JSON and is retired — JSON rendered
+/// `bytes::Bytes` as an array of decimal numbers, expanding a payload up to 4x on the wire
+/// (ADR-0010, fix-round note).
+pub const PAYLOAD_ENCODING_POSTCARD: u32 = 2;
 
 /// An OpenRaft request addressed to a peer.
 #[derive(Serialize, Deserialize)]

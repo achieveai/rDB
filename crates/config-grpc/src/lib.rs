@@ -23,14 +23,15 @@
 //!
 //! Protobuf is compiled at build time by `protox` — a pure-Rust compiler — so no `protoc`
 //! binary is needed on any developer or CI machine (ADR-0017). OpenRaft payloads travel as
-//! opaque serde-JSON inside [`pb::PeerEnvelope`]; the envelope's identity fields are checked
-//! before the payload is decoded (ADR-0011).
+//! opaque postcard bytes inside [`pb::PeerEnvelope`] — a binary serde format that carries a
+//! byte string as itself rather than expanding it, so a megabyte value stays a megabyte on the
+//! wire; the envelope's identity fields are checked before the payload is decoded (ADR-0011).
 //!
 //! # Example: serving a store over the client plane
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use config_core::{ClusterId, ConfigStore, Principal};
+//! use config_core::{ClusterId, ConfigStore, Limits, Principal};
 //! use config_grpc::{serve_client_plane, ClientBackend, TlsMode};
 //!
 //! struct OneStore(Arc<dyn ConfigStore>);
@@ -48,6 +49,7 @@
 //!     listener,
 //!     TlsMode::Insecure,
 //!     cluster_id,
+//!     Limits::DEFAULT,
 //! )?;
 //! println!("serving on {}", handle.local_addr());
 //! handle.shutdown().await?;
@@ -73,6 +75,7 @@ mod convert;
 
 pub mod client_plane;
 pub mod error;
+pub mod limits;
 pub mod peer_plane;
 pub mod server;
 pub mod tls;
@@ -83,6 +86,9 @@ pub use error::{
     code_for, error_from_status, is_server_rejection, leader_hint, mark_rejected,
     status_from_error, GrpcError, HEADER_CONFLICT_EXISTS, HEADER_CONFLICT_MOD_REVISION,
     HEADER_LEADER_ENDPOINT, HEADER_LEADER_NODE_ID, HEADER_OUTCOME, OUTCOME_REJECTED,
+};
+pub use limits::{
+    client_plane_message_limit, peer_plane_message_limit, MESSAGE_FRAMING_SLACK_BYTES,
 };
 pub use peer_plane::{serve_peer_plane, status_from_reject, PeerIdentity};
 pub use server::ServerHandle;

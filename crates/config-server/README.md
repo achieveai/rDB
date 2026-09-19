@@ -54,6 +54,7 @@ mode = "mutual"                                # "mutual" | "insecure"
 ca = "ca.pem"                                  # required for "mutual"
 cert = "node.cert.pem"
 key = "node.key.pem"
+allow_common_name_principals = false            # default; see below
 
 [authz]
 policy = "policy.toml"                         # optional; see below
@@ -74,6 +75,14 @@ secret_key_hex = "…64 hex characters…"         # AES-256 key; absent means n
 ```
 
 Port `0` binds an ephemeral port; the ready line reports what the OS assigned.
+
+`tls.allow_common_name_principals` lets a **client** certificate that asserts no `retcd://` SAN
+authenticate under its Common Name. It is `false` unless the document says otherwise, because a
+Common Name carries no cluster id: with it on, a CN-only certificate that the shared CA minted
+for a *neighbouring* cluster authenticates here under that name, bounded only by the allowlist
+(ADR-0012). Turn it on only for a CA that cannot mint URI SANs; the node logs
+`common_name_principals_enabled` at `warn` when it is on. The peer plane has no such fallback
+at any setting.
 
 ### Authorization policy
 
@@ -100,9 +109,11 @@ can connect immediately.
 
 ## Health endpoint
 
-`GET /health` returns `HealthPayload` as JSON: ids, counts, revisions, enums, the `ready` flag
-and the `state_hash_hex` digest. No keys and no values, which is why it needs no
-authentication — but it is still bound to loopback only. Any other path is `404`.
+`GET /health` returns `HealthPayload` as JSON: ids, counts, revisions, enums, the `ready` flag,
+the `state_hash_hex` digest, the `policy` summary (`kind`, `grants`, `policy_hash_hex`), and the
+`authz_denied` / `authn_rejected` counters. No keys and no values, which is why it needs no
+authentication — but it is still bound to loopback only. The payload never carries principal
+names or key prefixes. Any other path is `404`.
 
 ## Exit codes
 

@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use config_core::{
     Authz, Capabilities, ClusterId, ConfigError, ConfigStore, Dedup, DeleteRequest, Durability,
-    GetRequest, GetResponse, ListRequest, ListResponse, MutationResponse, NodeId, Pagination,
-    PutRequest, WatchResumption,
+    GetRequest, GetResponse, Limits, ListRequest, ListResponse, MutationResponse, NodeId,
+    Pagination, PutRequest, WatchResumption,
 };
 use config_grpc::pb::config_service_client::ConfigServiceClient;
 use config_grpc::{error_from_status, is_server_rejection, pb, peer_server_domain};
@@ -146,6 +146,15 @@ pub struct GrpcClientOptions {
     /// sets this; otherwise the client reports the conservative profile described on
     /// [`GrpcClient::capabilities`].
     pub expected_capabilities: Option<Capabilities>,
+    /// The caps the servers this client talks to enforce.
+    ///
+    /// Used for one thing: sizing the gRPC codec. A `List` reply is filled to
+    /// [`config_core::Limits::max_list_bytes`] before the server sets `truncated`, which is
+    /// larger than the 4 MiB tonic would otherwise accept — a client left at the default
+    /// reports `Unavailable` for a page the protocol says it is owed
+    /// ([`config_grpc::client_plane_message_limit`]). It is *not* a client-side validation
+    /// knob: every limit is enforced by the server.
+    pub limits: Limits,
 }
 
 impl Default for GrpcClientOptions {
@@ -155,6 +164,7 @@ impl Default for GrpcClientOptions {
             request_deadline: Duration::from_secs(5),
             tls: TlsMode::Insecure,
             expected_capabilities: None,
+            limits: Limits::DEFAULT,
         }
     }
 }
@@ -601,7 +611,10 @@ impl GrpcClient {
             // working on a call whose answer can no longer be delivered (ADR-0015).
             wire.set_timeout(remaining);
 
-            let client = ConfigServiceClient::new(channel);
+            let cap = config_grpc::client_plane_message_limit(&self.opts.limits);
+            let client = ConfigServiceClient::new(channel)
+                .max_decoding_message_size(cap)
+                .max_encoding_message_size(cap);
             // Counted here, on a connection that exists: `sends` is what a caller reasons
             // about when it asks whether a mutation could have been applied, and a connect
             // attempt that never produced a request must not answer that question yes.

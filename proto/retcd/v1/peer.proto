@@ -24,7 +24,10 @@ message PeerEnvelope {
   uint32 recovery_epoch = 2;
   uint64 from_node_id = 3;
   uint64 to_node_id = 4;
-  // Payload encoding: 1 = serde_json (default for this release).
+  // Payload encoding. One encoding per protocol version, never negotiated: a receiver accepts
+  // exactly the tag it speaks and refuses every other with INVALID_ARGUMENT.
+  //   1 = serde_json (retired: expanded byte strings up to 4x)
+  //   2 = postcard    (this release)
   uint32 payload_encoding = 5;
   // Serde-encoded openraft request (on the way in) or response (on the way out).
   bytes payload = 6;

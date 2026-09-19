@@ -8,7 +8,8 @@
 //!
 //! 1. **Open the store.** `RocksStore::open` is where an identity mismatch, a locked
 //!    directory or a missing column family is detected. It happens before any socket exists,
-//!    so a wrong data directory exits 2 without ever having been reachable (ADR-0011).
+//!    so a directory bound to another identity exits 2 and an unopenable one (locked, missing
+//!    column family) exits 3, without either ever having been reachable (ADR-0011, ADR-0018).
 //! 2. **Verify the manifest** (with `--form`), except the endpoint check. A forged or expired
 //!    manifest must not reach a listener either.
 //! 3. **Load the policy.** Missing or invalid without `--dev-allow-all` starts the node
@@ -266,7 +267,11 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         node_cfg = node_cfg.with_policy_document(document);
     }
 
-    let transport = GrpcPeerTransport::new(tls.clone(), config_engine::NetFault::new());
+    // Read out before `node_cfg` is moved into the node: both planes and the peer transport
+    // size their codecs from the same caps this node enforces (ADR-0010 fix-round note).
+    let limits = node_cfg.limits;
+
+    let transport = GrpcPeerTransport::new(tls.clone(), config_engine::NetFault::new(), limits);
     let node = ConfigNode::start(
         node_cfg,
         storage.clone(),
@@ -304,6 +309,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
             recovery_epoch: identity.recovery_epoch,
             node_id: identity.node_id,
         },
+        limits,
     ) {
         Ok(handle) => handle,
         Err(e) => {
@@ -320,6 +326,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         client_listener,
         tls,
         identity.cluster_id,
+        limits,
     ) {
         Ok(handle) => handle,
         Err(e) => {
@@ -510,11 +517,16 @@ fn deny_everything() -> Arc<dyn Authorizer> {
 /// drifted apart, and answering "then serve plaintext" would be the worst possible reading.
 fn tls_mode(cfg: &ServerConfig) -> Result<TlsMode, Fatal> {
     match (cfg.tls_mode, &cfg.tls_material) {
-        (TlsModeName::Mutual, Some(material)) => Ok(TlsMode::MutualTls(MtlsConfig::new(
-            material.ca_pem.clone(),
-            material.cert_pem.clone(),
-            material.key_pem.clone(),
-        ))),
+        (TlsModeName::Mutual, Some(material)) => Ok(TlsMode::MutualTls(
+            MtlsConfig::new(
+                material.ca_pem.clone(),
+                material.cert_pem.clone(),
+                material.key_pem.clone(),
+            )
+            // `tls.allow_common_name_principals`: shut unless the document opened it;
+            // `config::validate` has already logged `common_name_principals_enabled` if so.
+            .with_common_name_principals(material.allow_common_name_principals),
+        )),
         (TlsModeName::Mutual, None) => Err(Fatal::rejected(
             "invalid_config",
             "tls.mode = \"mutual\" without ca/cert/key material; refusing to start rather than \

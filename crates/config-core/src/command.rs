@@ -18,9 +18,12 @@
 //! "identical command sequence" and "identical bytes" mean the same thing.
 //!
 //! [`Command`] also derives `serde::{Serialize, Deserialize}` because OpenRaft 0.9 requires
-//! serde on its `D`/`R` types. That derive is a structural convenience only — the canonical
-//! bytes used for determinism assertions and for on-disk log storage always come from
-//! [`Command::encode`].
+//! serde on its `D`/`R` types. The encoding above is the envelope *inside* a Raft entry's
+//! payload, not the layout of a stored record: the M2 store writes `postcard(Entry<TypeConfig>)`
+//! whose payload carries the command through that derive (`config-storage`'s `rocks.rs` module
+//! docs; ADR-0008 note of 2026-09-18). [`Command::encode`] is the canonical form wherever
+//! command *identity* is the question — determinism assertions, the replay oracle, and the
+//! command fingerprint.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

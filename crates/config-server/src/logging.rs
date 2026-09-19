@@ -13,7 +13,7 @@
 //! `config_log::init` installs a complete registry and accepts no extra layer, so the daemon
 //! assembles filter + `JsonlLayer` + [`ConstFieldsLayer`] itself.
 //!
-//! Layer order is load-bearing: the `JsonlLayer`s come first so that `Layered` calls their
+//! Layer order is load-bearing: the `JsonlLayer` comes first so that `Layered` calls its
 //! `on_new_span` before [`ConstFieldsLayer`]'s, which then merges into the map that is already
 //! there instead of being overwritten by it.
 //!
