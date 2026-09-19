@@ -808,6 +808,22 @@ const NOT_EXPORTED: [&str; 10] = [
     "retcd_backup_age_seconds",
 ];
 
+/// Table series that exist only under `authz.mode = "signed"` (ADR-0027, M6).
+///
+/// Not "never exported" — every one of them is exported by a signed-mode node, and M6's own
+/// rows assert that. This harness runs the M3/M5 static allowlist, which has no document, no
+/// version and no reload to fail, and exporting `retcd_policy_version 0` there would put a
+/// deployment that never opted into signed policy on the same dashboard panel as one whose
+/// document failed to load. Listing them here rather than in `NOT_EXPORTED` keeps that
+/// distinction readable: these are conditional, those are unimplemented.
+const SIGNED_MODE_ONLY: [&str; 5] = [
+    "retcd_policy_version",
+    "retcd_policy_converged_version",
+    "retcd_policy_rollbacks_total",
+    "retcd_policy_reload_failures_total",
+    "retcd_break_glass_active",
+];
+
 /// Series the exporter emits that ADR-0026's table does not list (note item 3). Each is a value
 /// already held for another reason; they are additive and contradict nothing in the table.
 const EXTRA_EXPORTED: [&str; 8] = [
@@ -889,7 +905,9 @@ async fn m5_110_required_metric_names_are_present() {
     let mut expected: BTreeSet<String> = table
         .iter()
         .map(|(name, _, _)| name.clone())
-        .filter(|name| !NOT_EXPORTED.contains(&name.as_str()))
+        .filter(|name| {
+            !NOT_EXPORTED.contains(&name.as_str()) && !SIGNED_MODE_ONLY.contains(&name.as_str())
+        })
         .collect();
     expected.extend(EXTRA_EXPORTED.iter().map(|s| (*s).to_string()));
     let got: BTreeSet<String> = declared.keys().cloned().collect();

@@ -10,14 +10,14 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "7d524ac3d08fc3a6f9b7f02e67412a4e12ac5887",
+    "git_sha": "33b5f4be7de0e1bb2ed68f5b9adc1a59a250bc75",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T09:12:57Z",
-    "duration_ms": 9115,
+    "utc": "2026-09-19T10:12:05Z",
+    "duration_ms": 8124,
     "seed": 27958,
     "scale_factor": 0.2,
     "full_scale": false
@@ -32,7 +32,7 @@
     "rows": [
       {
         "arrangement": "split_1|2_3",
-        "convergence_ms": 0,
+        "convergence_ms": 1,
         "leader_after": 1,
         "minority": [
           1
@@ -44,7 +44,7 @@
       },
       {
         "arrangement": "split_1_2|3",
-        "convergence_ms": 521,
+        "convergence_ms": 519,
         "leader_after": 1,
         "minority": [
           3
@@ -56,7 +56,7 @@
       },
       {
         "arrangement": "split_1_3|2",
-        "convergence_ms": 466,
+        "convergence_ms": 517,
         "leader_after": 1,
         "minority": [
           2
@@ -68,7 +68,7 @@
       },
       {
         "arrangement": "oneway_1_2",
-        "convergence_ms": 519,
+        "convergence_ms": 516,
         "leader_after": 1,
         "minority": [],
         "repeat": 0,
@@ -78,7 +78,7 @@
       },
       {
         "arrangement": "oneway_1_3",
-        "convergence_ms": 515,
+        "convergence_ms": 521,
         "leader_after": 1,
         "minority": [],
         "repeat": 0,
@@ -108,7 +108,7 @@
       },
       {
         "arrangement": "oneway_3_1",
-        "convergence_ms": 52,
+        "convergence_ms": 53,
         "leader_after": 1,
         "minority": [],
         "repeat": 0,
@@ -118,7 +118,7 @@
       },
       {
         "arrangement": "oneway_3_2",
-        "convergence_ms": 52,
+        "convergence_ms": 51,
         "leader_after": 1,
         "minority": [],
         "repeat": 0,
@@ -140,19 +140,19 @@
       },
       {
         "arrangement": "isolate_2",
-        "convergence_ms": 525,
+        "convergence_ms": 518,
         "leader_after": 1,
         "minority": [
           2
         ],
         "repeat": 0,
-        "time_to_leader_ms": 3,
+        "time_to_leader_ms": 0,
         "writes_accepted": 1,
         "writes_rejected": 2
       },
       {
         "arrangement": "isolate_3",
-        "convergence_ms": 516,
+        "convergence_ms": 517,
         "leader_after": 1,
         "minority": [
           3

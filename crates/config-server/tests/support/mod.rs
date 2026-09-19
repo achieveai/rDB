@@ -526,6 +526,24 @@ pub struct Health {
     pub authz_denied: u64,
     /// Client connections whose identity could not be established since start.
     pub authn_rejected: u64,
+    /// The replicated compaction watermark (TA-39).
+    pub compact_revision: u64,
+    /// Oldest retained journal revision, or `None` when the journal is empty.
+    pub journal_oldest_revision: Option<u64>,
+    /// Newest retained journal revision, or `None` when the journal is empty.
+    pub journal_newest_revision: Option<u64>,
+    /// Digest over the retained journal above the watermark, as 64 lowercase hex characters.
+    pub journal_hash: String,
+    /// Watch streams open on this node right now.
+    pub watch_streams_open: usize,
+    /// Active signed policy version, `None` under the static allowlist (M6-16).
+    pub policy_version: Option<u64>,
+    /// Why there is no active policy, or which versions this node is converging between.
+    ///
+    /// Raw JSON for the same reason `membership_log_id` is: the shape belongs to
+    /// `config_core::policy::PolicyState`, and mirroring its variants here would make this
+    /// file a second, drifting definition of the same enum.
+    pub policy_state: Option<serde_json::Value>,
 }
 
 /// The `policy` object inside [`Health`], mirroring `config_engine::PolicySummary`.

@@ -1498,7 +1498,7 @@ async fn e2e_38_dedup_resubmit_after_leader_kill_at_process_level() {
         &harness,
         endpoints,
         PRINCIPAL,
-        &nodes[survivor].client_endpoint().to_string(),
+        nodes[survivor].client_endpoint(),
         WINDOW_REQUESTS,
     )
     .with_dedup([0x38; 16]);
@@ -1516,7 +1516,7 @@ async fn e2e_38_dedup_resubmit_after_leader_kill_at_process_level() {
         .await
         .expect("the warm-up write applies");
     assert_eq!(warmup.outcome, MutationOutcome::Applied);
-    let before = support::health(&nodes[survivor].health_endpoint().to_string()).await;
+    let before = support::health(nodes[survivor].health_endpoint()).await;
 
     let put_task = tokio::spawn({
         let client = client.clone();
@@ -1581,7 +1581,7 @@ async fn e2e_38_dedup_resubmit_after_leader_kill_at_process_level() {
         &harness,
         vec![nodes[new_leader].client_endpoint().to_string()],
         PRINCIPAL,
-        &nodes[new_leader].client_endpoint().to_string(),
+        nodes[new_leader].client_endpoint(),
         WINDOW_REQUESTS,
     );
     let listed = read_client

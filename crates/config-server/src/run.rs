@@ -241,6 +241,12 @@ const BACKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[async_trait::async_trait]
 impl config_grpc::AdminBackend for NodeBackend {
+    /// Forward the admin plane's allowlist refusals to the node's counter (C5B-15), so
+    /// `retcd_authz_denied_total{plane="admin"}` is a fact rather than a declared label.
+    fn record_authz_denial(&self) {
+        self.node.record_admin_authz_denial();
+    }
+
     fn cluster_id(&self) -> config_core::ClusterId {
         self.node.identity().cluster_id
     }
@@ -641,7 +647,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         node: running.node.clone(),
         storage: running.storage.clone(),
         backup: cfg.backup.clone(),
-        paginator,
+        paginator: Arc::clone(&paginator),
         policy: policy.loader.clone(),
     });
     // M6-40: under signed mode the admin set is the active document's, re-read on every call;
@@ -679,7 +685,11 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         let notify = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn(config_log::testing::in_current_span(health::serve(
             listener,
-            running.node.clone(),
+            health::Sources {
+                node: running.node.clone(),
+                pagination: Some(Arc::clone(&paginator)),
+                policy: policy.loader.clone(),
+            },
             Arc::clone(&notify),
             cfg.metrics_enabled,
         )));

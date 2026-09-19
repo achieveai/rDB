@@ -185,4 +185,80 @@ that touch it (M6-R1 belongs to ADR-0029; M6-R3 belongs here).
 
 ## Notes
 
-None yet.
+## Implementation note (2026-09-19, signature envelope)
+
+The detached signature is an envelope, not a bare 64-byte signature:
+`{envelope_version, key_name, version, hash, signature}`, postcard-encoded (ADR-0007). A bare
+signature cannot produce the four distinguishable refusals this ADR requires — every failure
+collapses into "verify returned false". The envelope names the signer and repeats the version and
+hash the signer committed to, so each refusal has exactly one cause:
+
+| step | failure | reason |
+|---|---|---|
+| decode / envelope version / 64-byte length | malformed file | `signature_invalid` |
+| `key_name` absent from `[authz] trust_keys` | valid signature, wrong signer | `untrusted_signer` |
+| `verify_strict(sha256(doc) ‖ version_le)` | corrupt or forged signature | `signature_invalid` |
+| `envelope.version != document.version` | relabelled or swapped signature file | `version_binding` |
+| `sha256(doc_bytes) != envelope.hash` | edited document body | `hash_mismatch` |
+
+Naming the key in the envelope weakens nothing: verification still runs against the configured key
+**bytes**, so an attacker who names a trusted key simply reaches `signature_invalid` one step
+later. Version binding is checked *before* the hash so that M6-05's "swap two validly-signed
+documents' signature files" lands on `version_binding` rather than on `signature_invalid`; both are
+refusals and nothing is adopted on either path. Reason tokens are the closed set
+`PolicyRejected::ALL_REASONS`, which is also what seeds
+`retcd_policy_reload_failures_total{reason}`.
+
+## Implementation note (2026-09-19, lead ruling M6-R8)
+
+Watch termination on a policy change does **not** add a `policy_changed: bool` field to
+`ConfigError::PermissionDenied`. That variant is constructed at 30-odd sites across four crates
+this milestone did not otherwise touch. Instead the refusal carries the additive closed-set detail
+constant `config_core::REASON_POLICY_CHANGED` (`"policy_changed"`), built by
+`ConfigError::policy_changed()`, and `config-grpc` maps that token — together with
+`policy_converging` and `token_principal` — onto the `retcd-reason` trailer. Clients therefore read
+a machine-readable token rather than a bool, and the mapping is a closed allowlist so an ordinary
+prose denial never leaks its wording onto the wire. `ConfigError::permission_denied_reason()`
+recovers the token from the node's wrapped detail (`node.rs` re-wraps an authorizer's reason as
+`principal ... may not ... (reason)`), which is why the extraction is a method on the error rather
+than a substring match at each call site.
+
+## Implementation note (2026-09-19, lead ruling M6-R9)
+
+`config-core` takes two new dependencies for this ADR: `ed25519-dalek` (verification only, no
+signing) and `serde_json` (the document's canonical text form). Both are pure computation with no
+clock, filesystem, network or unordered collection, so ADR-0004's purity rule is preserved; the
+`m0_purity::m0_59` dependency allowlist is widened for exactly those two names with a justification
+comment. Signing lives entirely outside the process — rEtcd verifies documents, it never issues
+them.
+
+## Implementation note (2026-09-19, reload without a node seam)
+
+`ConfigNode` holds one `Arc<dyn Authorizer>` for its lifetime. Rather than widen that seam,
+`SignedPolicyAuthorizer` is internally mutable (`RwLock<Option<Active>>`): the same trait object
+stays installed and `adopt()` swaps its interior, so a reload needs no change in `node.rs`,
+`run.rs` or the `Authorizer` call signature. `authorize` takes one read guard, which keeps the
+trait's "pure and cheap" contract.
+
+Ordering for M6-28/M6-31 is enforced at the daemon seam that can see both halves:
+`PolicyLoader::attempt` calls `WatchHub::on_policy_change(&old, &new)` **before**
+`SignedPolicyAuthorizer::adopt`. Inside the hub the guarantee has three parts — a stream reads the
+policy epoch inside the journal gate at registration, `send_event` re-checks that epoch
+synchronously before **every** enqueue (this is the hard guarantee, because `on_applied` does not
+take the gate), and a `select!` arm exists only for promptness on an idle stream. A stream that
+missed two rotations cannot know what the intermediate document changed — a `watch` channel keeps
+only the latest value — so it terminates unconditionally, which is the fail-closed direction.
+
+`Authorizer` gained two **defaulted** methods, `policy_version()` and `admin_set()`, rather than
+required ones: a model that carries no version must report its absence, not a placeholder, and
+defaulting them left `AllowAll` and `StaticAllowlist` untouched.
+
+## Implementation note (2026-09-19, health and metrics split)
+
+`HealthPayload.policy_version` is filled by the engine, which holds the authorizer.
+`HealthPayload.policy_state` and the whole `retcd_policy_*` family are filled by the **daemon**,
+because only the loader that owns the files knows *why* the last load failed — the same split
+already used for `disk_free_bytes` and `cert_expiry_seconds`. Under `authz.mode = "static"` the
+policy series are not exported at all rather than exported as zero, so a deployment that never
+opted into signed policy cannot be confused on a dashboard with one whose document failed to load.
+`docs/testing` records this in `m5_observability.rs`'s `SIGNED_MODE_ONLY` list.

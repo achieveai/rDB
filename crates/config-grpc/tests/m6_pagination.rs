@@ -303,10 +303,25 @@ async fn m6_76_77_binding_mismatches_keep_their_own_statuses() {
             }
             other => panic!("{error:?} came back as {other:?}"),
         }
-        assert!(
-            status.metadata().get(HEADER_REASON).is_none(),
-            "only an expiry carries the expiry trailer"
-        );
+        // `retcd-reason` is not expiry-only: ADR-0027 maps the closed set of machine-readable
+        // denials (`token_principal` among them) onto the same trailer, so the principal case
+        // names its reason there and the prefix case, an `InvalidArgument`, carries none (M6-R10).
+        let trailer = status
+            .metadata()
+            .get(HEADER_REASON)
+            .map(|v| v.to_str().expect("ascii trailer").to_string());
+        if code == Code::PermissionDenied {
+            assert_eq!(
+                trailer.as_deref(),
+                Some(reason),
+                "a machine-readable denial names its reason on the trailer"
+            );
+        } else {
+            assert!(
+                trailer.is_none(),
+                "an invalid-argument mismatch carries no reason trailer: {trailer:?}"
+            );
+        }
     }
 }
 

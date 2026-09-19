@@ -15,13 +15,13 @@
 //! is an engine type the authorizer cannot see. So the sequencing lives at the seam that can
 //! see both, which is this one.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use config_core::policy::{Adoption, PolicyRejected, PolicyState, SignedPolicyAuthorizer};
 use config_core::Authorizer;
-use config_engine::WatchHub;
+use config_engine::{PolicyMetrics, WatchHub};
 use config_grpc::PolicyReload;
 
 use crate::config::SignedPolicyConfig;
@@ -37,17 +37,33 @@ pub struct PolicyLoader {
     hub: Arc<WatchHub>,
     /// Serializes whole reload attempts. Not a lock on the authorizer, which has its own.
     reloading: Mutex<Attempts>,
-    failures: AtomicU64,
 }
 
 /// What the last attempts left behind, for health and for the no-storm rule.
-#[derive(Default)]
 struct Attempts {
     /// The most recent refusal, or `None` if the last attempt succeeded.
     ///
     /// Health reports it so an operator sees *why* a node is stuck on an old version without
     /// having to correlate log lines across a fleet.
     last_rejection: Option<PolicyRejected>,
+    /// Refused reloads by reason, seeded with every token so an unhit reason exports `0`
+    /// rather than vanishing from the series (ADR-0026's closed-set rule).
+    failures: BTreeMap<&'static str, u64>,
+    /// Rollbacks `--break-glass-policy-rollback` permitted (M6-09).
+    rollbacks: u64,
+}
+
+impl Default for Attempts {
+    fn default() -> Self {
+        Self {
+            last_rejection: None,
+            failures: PolicyRejected::ALL_REASONS
+                .iter()
+                .map(|reason| (*reason, 0))
+                .collect(),
+            rollbacks: 0,
+        }
+    }
 }
 
 impl PolicyLoader {
@@ -62,7 +78,6 @@ impl PolicyLoader {
             authorizer,
             hub,
             reloading: Mutex::new(Attempts::default()),
-            failures: AtomicU64::new(0),
         })
     }
 
@@ -79,10 +94,15 @@ impl PolicyLoader {
         let mut attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = self.attempt(source);
         match &outcome {
-            Ok(_) => attempts.last_rejection = None,
+            Ok((_, break_glass)) => {
+                attempts.last_rejection = None;
+                if *break_glass {
+                    attempts.rollbacks += 1;
+                }
+            }
             Err(rejection) => {
                 attempts.last_rejection = Some(rejection.clone());
-                self.failures.fetch_add(1, Ordering::Relaxed);
+                *attempts.failures.entry(rejection.reason()).or_insert(0) += 1;
                 tracing::error!(
                     reason = rejection.reason(),
                     source,
@@ -92,11 +112,15 @@ impl PolicyLoader {
                 );
             }
         }
-        outcome
+        outcome.map(|(reload, _)| reload)
     }
 
     /// One read-verify-revoke-adopt sequence, without the bookkeeping.
-    fn attempt(&self, source: &'static str) -> Result<PolicyReload, PolicyRejected> {
+    ///
+    /// The second half of the pair is whether break-glass was what permitted the adoption; it
+    /// is returned rather than put on [`PolicyReload`] because the RPC response has no field
+    /// for it and only the rollback counter needs it.
+    fn attempt(&self, source: &'static str) -> Result<(PolicyReload, bool), PolicyRejected> {
         let document = read(&self.cfg.policy_file, PolicyRejected::PolicyFileMissing)?;
         let signature = read(
             &self.cfg.signature_file,
@@ -118,13 +142,16 @@ impl PolicyLoader {
         Ok(match adoption {
             // Byte-identical to what is already active. Reported, not logged: a poller that
             // wrote an audit line every tick would drown the one that matters (M6-11).
-            Adoption::Unchanged => PolicyReload {
-                from,
-                to: from.unwrap_or_default(),
-                hash_hex,
-                outcome: "unchanged",
-                reason: "identical_hash",
-            },
+            Adoption::Unchanged => (
+                PolicyReload {
+                    from,
+                    to: from.unwrap_or_default(),
+                    hash_hex,
+                    outcome: "unchanged",
+                    reason: "identical_hash",
+                },
+                false,
+            ),
             Adoption::Adopted {
                 from,
                 to,
@@ -138,13 +165,16 @@ impl PolicyLoader {
                     break_glass,
                     "policy_loaded"
                 );
-                PolicyReload {
-                    from,
-                    to,
-                    hash_hex,
-                    outcome: "reloaded",
-                    reason: "",
-                }
+                (
+                    PolicyReload {
+                        from,
+                        to,
+                        hash_hex,
+                        outcome: "reloaded",
+                        reason: "",
+                    },
+                    break_glass,
+                )
             }
         })
     }
@@ -155,22 +185,32 @@ impl PolicyLoader {
     /// by another workstream, so M6-16/M6-25 land in the metrics round together with
     /// `retcd_policy_reload_failures_total`. The accessors exist now because the state they
     /// report is produced here and nowhere else.
-    #[allow(
-        dead_code,
-        reason = "wired by the M6 metrics round (M6-16, M6-25, M6-34, M6-38)"
-    )]
     pub fn state(&self) -> PolicyState {
         let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
         self.authorizer.state(attempts.last_rejection.as_ref())
     }
 
-    /// Refused reloads since start, for `retcd_policy_reload_failures_total` (M6-13).
-    #[allow(
-        dead_code,
-        reason = "wired by the M6 metrics round (M6-16, M6-25, M6-34, M6-38)"
-    )]
-    pub fn failures(&self) -> u64 {
-        self.failures.load(Ordering::Relaxed)
+    /// What `/metrics` publishes about this node's policy (ADR-0027, ADR-0026).
+    ///
+    /// Assembled here rather than in the engine because the reload counters belong to the
+    /// loader that owns the files; the engine holds only the authorizer.
+    pub fn metrics(&self) -> PolicyMetrics {
+        let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self.authorizer.state(attempts.last_rejection.as_ref());
+        // Converging means some voter is still on `from`, so `from` is the newest version the
+        // whole cluster is known to hold — which is exactly what the gauge claims.
+        let converged_version = match &state {
+            PolicyState::Active { version } => Some(*version),
+            PolicyState::Converging { from, .. } => Some(*from),
+            PolicyState::NoValidPolicy { .. } => None,
+        };
+        PolicyMetrics {
+            version: self.authorizer.policy_version(),
+            converged_version,
+            rollbacks: attempts.rollbacks,
+            reload_failures: attempts.failures.clone(),
+            break_glass_active: self.authorizer.break_glass_active(),
+        }
     }
 
     /// The shared authorizer, for the admin plane's admin set and the capability report.

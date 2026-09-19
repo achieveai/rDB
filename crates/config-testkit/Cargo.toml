@@ -33,6 +33,12 @@ tracing = { workspace = true }
 # Test-only: a same-id restart on a fresh EphemeralStore is a legal log revert here, and
 # openraft's debug_assert would otherwise abort the leader (ADR-0008 note).
 openraft = { workspace = true, features = ["loosen-follower-log-revert"] }
+# Test-only: M4-75 asserts on the wire-encoded bytes of a `Progress` frame (no key/value bytes
+# anywhere in it), not on the struct's `Debug`. `config-grpc`'s generated `pb` types implement
+# `prost::Message`, but `prost` itself is only pulled in as a `tonic-build` *build*-dependency
+# of `config-grpc` (tonic 0.12's `codegen` module does not re-export it), so it is not
+# otherwise reachable here.
+prost = { workspace = true }
 # Test-only: the hand-built peer envelopes below carry a postcard payload, the peer plane's
 # only accepted encoding (ADR-0010, fix-round note).
 postcard = { workspace = true }

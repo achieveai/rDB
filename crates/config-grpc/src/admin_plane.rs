@@ -93,6 +93,13 @@ pub trait AdminBackend: Send + Sync {
     /// Build a snapshot now.
     async fn trigger_snapshot(&self) -> Result<SnapshotTriggered, AdminError>;
 
+    /// Record one allowlist refusal on the node's counter (C5B-15).
+    ///
+    /// Defaulted to a no-op so a test backend need not care, exactly as
+    /// `ClientBackend::record_authn_rejection` is. A real backend forwards it to
+    /// `ConfigNode::record_admin_authz_denial`.
+    fn record_authz_denial(&self) {}
+
     /// Write a signed backup triple into `dest_dir` **on this node**.
     async fn backup(
         &self,
@@ -307,6 +314,7 @@ impl AdminSvc {
         // The allowlist is checked before the handler runs, so a non-admin principal never
         // reaches consensus and never learns whether the id it named exists.
         if !self.admins.permits(&principal) {
+            self.backend.record_authz_denial();
             return Err(refuse(
                 principal.name.as_str(),
                 "not_an_admin",

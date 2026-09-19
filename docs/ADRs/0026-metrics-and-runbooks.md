@@ -83,6 +83,12 @@ externally, so it is held to at least as strict a rule as a log line, not a loos
 | `retcd_authz_denied_total` | counter | `node_id`, `plane` | existing `authz_denied` counter (ADR-0018) |
 | `retcd_cert_expiry_seconds` | gauge | `node_id`, `plane` | time until the currently loaded leaf certificate's `notAfter` |
 | `retcd_backup_age_seconds` | gauge | `node_id` | now − most recent successful `Backup`/`backup` CLI run recorded in `state_meta` (ADR-0024) |
+| `retcd_pinned_snapshots` | gauge | `node_id` | revision-pinned list snapshots held open for continuations (ADR-0029, `Paginator::stats().len`) |
+| `retcd_policy_version` | gauge | `node_id` | active signed policy document version (ADR-0027) |
+| `retcd_policy_converged_version` | gauge | `node_id` | newest version every known voter has reported (ADR-0027) |
+| `retcd_policy_rollbacks_total` | counter | `node_id` | rollbacks permitted by `--break-glass-policy-rollback` (ADR-0027) |
+| `retcd_policy_reload_failures_total` | counter | `node_id`, `reason` | refused reloads, seeded from `PolicyRejected::ALL_REASONS` (ADR-0027) |
+| `retcd_break_glass_active` | gauge | `node_id` | 1 while this process runs with `--break-glass-policy-rollback` (OQ-57) |
 
 `HealthPayload` (ADR-0018) and this metric list intentionally overlap for a handful of series
 (`authn_rejected`, `authz_denied`) — the health payload remains the single-node JSON snapshot a test

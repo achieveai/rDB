@@ -7,12 +7,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use config_core::policy::PolicyState;
 use config_core::{
     Authz, ClusterIdentity, Durability, LeaderHint, NodeId, RecoveryEpoch, RestoredFrom,
     TransportSecurity,
 };
 use config_storage::{DedupStats, StorageMetrics};
 
+use crate::pagination::PinStats;
 use crate::watch::WatchStats;
 use serde::Serialize;
 
@@ -124,6 +126,17 @@ pub struct NodeMetrics {
     /// `retcd.audit` `deny` line exists for each of these; the counter is what makes "a spike
     /// of refusals" assertable without parsing a log.
     pub authz_denied: u64,
+    /// Admin-plane calls refused by the `[authz] admins` allowlist, since start (ADR-0023,
+    /// review finding C5B-15).
+    ///
+    /// A separate counter rather than a second increment of `authz_denied`, because the two
+    /// are different authorizations: `authz_denied` is the keyspace policy deciding what a
+    /// principal may do to a key, and this one is the allowlist deciding whether a principal
+    /// may reach the admin surface at all. They have different policies, different operators
+    /// and different responses, and `retcd_authz_denied_total` already declares a `plane`
+    /// label to tell them apart — a label that, until this counter existed, only ever carried
+    /// one value.
+    pub authz_denied_admin: u64,
     /// Connections whose transport identity could not be established, since start, across
     /// **both** planes.
     ///
@@ -281,6 +294,33 @@ pub struct HealthPayload {
     /// Client connections whose identity could not be established since start. See
     /// [`NodeMetrics::authn_rejected`].
     pub authn_rejected: u64,
+    /// The replicated compaction watermark: no journal event at or below it is retained
+    /// (M4, ADR-0019, test plan TA-39).
+    pub compact_revision: u64,
+    /// Oldest revision still in the retained journal, or `None` when the journal is empty.
+    ///
+    /// `Option` rather than a zero, because there is no revision 0 and an empty journal must
+    /// not be reported as one that begins at the beginning of time.
+    pub journal_oldest_revision: Option<u64>,
+    /// Newest revision in the retained journal, or `None` when it is empty.
+    pub journal_newest_revision: Option<u64>,
+    /// Digest over the retained journal above the compaction watermark, as 64 lowercase hex
+    /// characters (TA-31). Two nodes holding the same retained events print the same string,
+    /// which is what makes "the journal survived the restart" one cross-process assertion.
+    pub journal_hash: String,
+    /// Watch streams registered on this node right now.
+    pub watch_streams_open: usize,
+    /// The signed policy version in force, or `None` under the static allowlist and on a node
+    /// that holds no valid document (M6, ADR-0027, M6-16).
+    pub policy_version: Option<u64>,
+    /// Why there is no active policy, or which versions this node is converging between.
+    ///
+    /// Filled by the daemon, which is the only layer that knows *why* the last load failed:
+    /// the engine holds the authorizer, not the files. `None` on an embedded node and under
+    /// the static allowlist. It carries versions and a closed-set reason and nothing else —
+    /// this payload is unauthenticated on loopback (OQ-16), so it never carries a grant, a
+    /// principal or any key material.
+    pub policy_state: Option<PolicyState>,
 }
 
 impl HealthPayload {
@@ -438,6 +478,47 @@ pub struct MetricsReport {
     pub cert_expiry_seconds: BTreeMap<String, i64>,
     /// Age of the most recent successful backup, when the daemon knows (ADR-0024).
     pub backup_age_seconds: Option<u64>,
+    /// Revision-pinned list snapshots this node is holding (M6, ADR-0029, TA-39).
+    ///
+    /// Daemon-filled, like the three environment facts above: the paginator is built by the
+    /// server from its `[list]` section and handed to the client plane, so the engine node
+    /// has no handle on it. `None` omits the series rather than exporting a zero, so "this
+    /// build has no paginator" and "this node holds no pins" stay distinguishable.
+    pub pagination: Option<PinStats>,
+    /// The signed policy this node is enforcing (M6, ADR-0027).
+    ///
+    /// Daemon-filled for the same reason: the reload counters live with the loader that owns
+    /// the files. `None` under the static allowlist, which exports no policy series at all.
+    pub policy: Option<PolicyMetrics>,
+}
+
+/// What one node's signed-policy lifecycle looks like right now (M6, ADR-0027).
+///
+/// Versions, counts and closed-set reason tokens only. Like [`PolicySummary`], it must never
+/// carry a grant, a principal or a key prefix: `/metrics` sits on the same unauthenticated
+/// loopback listener as `/health` (OQ-16, ADR-0026).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PolicyMetrics {
+    /// The version this node is enforcing, or `None` when it holds no valid document.
+    pub version: Option<u64>,
+    /// The newest version every voter this node knows of has reported.
+    ///
+    /// Equal to `version` once convergence completes; lower while the intersection is in
+    /// force. This is the gauge an alert watches, because a cluster stuck mid-convergence
+    /// denies changed prefixes indefinitely (M6-21).
+    pub converged_version: Option<u64>,
+    /// Rollbacks performed because `--break-glass-policy-rollback` permitted them (M6-09).
+    pub rollbacks: u64,
+    /// Refused reloads by reason, seeded with every token in
+    /// [`config_core::policy::PolicyRejected::ALL_REASONS`] so a reason that has never fired
+    /// reports `0` rather than being absent.
+    pub reload_failures: BTreeMap<&'static str, u64>,
+    /// Whether this process was started with `--break-glass-policy-rollback`.
+    ///
+    /// A gauge rather than a log line only: the flag disarms rollback protection for the
+    /// whole process lifetime (OQ-57), so an operator must be able to alert on a node that is
+    /// still running with it set.
+    pub break_glass_active: bool,
 }
 
 /// A Prometheus text-exposition writer that emits each metric's `HELP`/`TYPE` exactly once.
@@ -935,11 +1016,93 @@ impl MetricsReport {
             "counter",
             "authorization decisions refused",
         );
-        e.sample(
-            "retcd_authz_denied_total",
-            &[("node_id", node_id.as_str()), ("plane", "client")],
-            self.node.authz_denied as f64,
-        );
+        // Two planes, two policies: `authz_denied` is the keyspace policy deciding what a
+        // principal may do to a key; `authz_denied_admin` is the `[authz] admins` allowlist
+        // deciding whether a principal may reach the admin surface at all (C5B-15). The
+        // `plane` label was declared from the start and, until the second sample existed,
+        // only ever carried one value.
+        for (plane, value) in [
+            ("client", self.node.authz_denied),
+            ("admin", self.node.authz_denied_admin),
+        ] {
+            e.sample(
+                "retcd_authz_denied_total",
+                &[("node_id", node_id.as_str()), ("plane", plane)],
+                value as f64,
+            );
+        }
+
+        // ---- revision-pinned pagination (M6, ADR-0029) ----
+        if let Some(pins) = &self.pagination {
+            e.metric(
+                "retcd_pinned_snapshots",
+                "gauge",
+                "revision-pinned list snapshots held open for continuations (ADR-0029)",
+            );
+            e.sample("retcd_pinned_snapshots", &node, pins.len as f64);
+        }
+
+        // ---- signed policy lifecycle (M6, ADR-0027) ----
+        //
+        // The whole block is conditional: a node under the static allowlist has no version to
+        // report, and exporting `retcd_policy_version 0` there would put every M3-style
+        // deployment on the same dashboard panel as a signed node that failed to load.
+        if let Some(policy) = &self.policy {
+            // Absent, not zero: "no valid policy" is a different state from "version 0", and
+            // an alert on a stuck rotation must be able to tell them apart.
+            if let Some(version) = policy.version {
+                e.metric(
+                    "retcd_policy_version",
+                    "gauge",
+                    "signed policy document version this node is enforcing (ADR-0027)",
+                );
+                e.sample("retcd_policy_version", &node, version as f64);
+            }
+            if let Some(converged) = policy.converged_version {
+                e.metric(
+                    "retcd_policy_converged_version",
+                    "gauge",
+                    "newest policy version every known voter has reported; below \
+                     retcd_policy_version while changed prefixes are intersected",
+                );
+                e.sample("retcd_policy_converged_version", &node, converged as f64);
+            }
+
+            e.metric(
+                "retcd_policy_rollbacks_total",
+                "counter",
+                "policy rollbacks permitted by --break-glass-policy-rollback (ADR-0027)",
+            );
+            e.sample(
+                "retcd_policy_rollbacks_total",
+                &node,
+                policy.rollbacks as f64,
+            );
+
+            e.metric(
+                "retcd_policy_reload_failures_total",
+                "counter",
+                "policy reloads refused, by reason; the active document is retained",
+            );
+            for (reason, value) in &policy.reload_failures {
+                e.sample(
+                    "retcd_policy_reload_failures_total",
+                    &[("node_id", node_id.as_str()), ("reason", reason)],
+                    *value as f64,
+                );
+            }
+
+            e.metric(
+                "retcd_break_glass_active",
+                "gauge",
+                "1 while this process runs with --break-glass-policy-rollback (OQ-57)",
+            );
+            e.sample(
+                "retcd_break_glass_active",
+                &node,
+                u64::from(policy.break_glass_active) as f64,
+            );
+        }
 
         if !self.cert_expiry_seconds.is_empty() {
             e.metric(

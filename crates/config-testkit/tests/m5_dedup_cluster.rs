@@ -80,6 +80,7 @@ use config_core::{
 };
 use config_storage::Boundary;
 use config_testkit::cluster::{Cluster, RocksSpec, StorageKind};
+use config_testkit::poll::TestTimers;
 use futures::StreamExt;
 use support::{put_req, ScriptedInjector};
 
@@ -92,11 +93,33 @@ const CLIENT_DEADLINE: Duration = Duration::from_secs(2);
 /// (M5-106) that do not need a release handshake. Matches `m3_unknown_outcome.rs`'s `STALL`.
 const FIXED_STALL: Duration = Duration::from_secs(6);
 
+/// The fastest legal timers (matches `m1_cluster.rs`'s `FAST`), needed so M5-104's real
+/// election reliably lands inside a single [`CLIENT_DEADLINE`] window.
+///
+/// `GrpcClient::attempts` reads `self.pinned` fresh per top-level call and never carries a
+/// hint across calls (module doc), so the automatic resubmit's very first hint check — which
+/// happens the instant the original attempt's own `request_deadline` elapses, with no
+/// coordination from this test in between — is the *only* chance `survivor` has to already
+/// know the new leader. With the harness default election timeout (750-1500 ms, observed in
+/// this environment to sometimes need several backed-off rounds once isolation drops a 3-node
+/// cluster to a 2-voter quorum — a real openraft `election_timeout` well past 2 s was seen more
+/// than once in a single run), that convergence routinely loses the race against
+/// `CLIENT_DEADLINE`. A faster election is also a stronger claim here, not a weaker one: it
+/// makes the row prove recovery under a *tighter* timing budget, the same justification
+/// `m1_cluster.rs` gives `FAST`.
+const FAST: TestTimers = TestTimers {
+    heartbeat: Duration::from_millis(50),
+    election_timeout_min: Duration::from_millis(150),
+    election_timeout_max: Duration::from_millis(300),
+};
+
 /// A 3-node Rocks cluster with bounded dedup enabled at `window_requests`, plaintext client
 /// plane, and one [`ScriptedInjector`] per node so a row can stall or pause a specific leader's
 /// own apply. Mirrors `m3_unknown_outcome.rs::stalling_cluster`, generalized to
 /// `ScriptedInjector` (M5-104 needs the pause/release handshake that a plain sleep cannot give).
-async fn dedup_cluster(window_requests: u32) -> (Cluster, BTreeMap<NodeId, std::sync::Arc<ScriptedInjector>>) {
+async fn dedup_cluster(
+    window_requests: u32,
+) -> (Cluster, BTreeMap<NodeId, std::sync::Arc<ScriptedInjector>>) {
     let injectors: BTreeMap<NodeId, std::sync::Arc<ScriptedInjector>> = (1..=3)
         .map(NodeId)
         .map(|id| (id, ScriptedInjector::new()))
@@ -104,6 +127,7 @@ async fn dedup_cluster(window_requests: u32) -> (Cluster, BTreeMap<NodeId, std::
     let mut builder = Cluster::builder()
         .nodes(3)
         .storage(StorageKind::Rocks(RocksSpec::DEFAULT))
+        .timers(FAST)
         .limits(Limits {
             dedup: DedupLimits {
                 enabled: true,
@@ -114,7 +138,10 @@ async fn dedup_cluster(window_requests: u32) -> (Cluster, BTreeMap<NodeId, std::
         })
         .timeouts(CLIENT_DEADLINE, CLIENT_DEADLINE);
     for (&id, inj) in &injectors {
-        builder = builder.faults(id, inj.clone() as std::sync::Arc<dyn config_storage::FaultInjector>);
+        builder = builder.faults(
+            id,
+            inj.clone() as std::sync::Arc<dyn config_storage::FaultInjector>,
+        );
     }
     let cluster = builder.start().await;
     (cluster, injectors)
@@ -333,7 +360,10 @@ async fn m5_104_client_with_dedup_resubmits_once_after_unknown_outcome() {
         .wait_for(
             "the automatic resubmit's own first send has started, proving attempt 1 already \
              timed out on its own clock",
-            cluster.deadline(6),
+            // Client-round-trip-bound, not election-bound: call 1's own failure is paced by
+            // `CLIENT_DEADLINE` (its `request_deadline`), so `cluster.deadline(n)` (raft-timer
+            // derived, and shrunk far below 2s by `FAST`) would under-budget this wait.
+            CLIENT_DEADLINE * 3,
             || (client.stats().sends >= 3).then_some(()),
         )
         .await
@@ -506,12 +536,7 @@ async fn m5_107_dedup_hit_is_stable_across_a_leader_change() {
         .await
         .unwrap_or_else(|t| panic!("{t}"));
 
-    let hits_before = cluster
-        .node(new_leader)
-        .metrics_report()
-        .await
-        .dedup
-        .hits;
+    let hits_before = cluster.node(new_leader).metrics_report().await.dedup.hits;
 
     let client2 = cluster.grpc_client(new_leader);
     let second = client2
@@ -525,12 +550,7 @@ async fn m5_107_dedup_hit_is_stable_across_a_leader_change() {
         "the record is replicated state, not leader-local: {second:?}"
     );
 
-    let hits_after = cluster
-        .node(new_leader)
-        .metrics_report()
-        .await
-        .dedup
-        .hits;
+    let hits_after = cluster.node(new_leader).metrics_report().await.dedup.hits;
     assert_eq!(hits_after, hits_before + 1, "retcd_dedup_hits_total");
     assert_eq!(
         cluster.metrics(new_leader).cluster_revision,
@@ -565,11 +585,7 @@ async fn m5_132_replay_outside_the_window_is_not_auto_replayed() {
     let client_id = [0x32; 16];
 
     let original = client
-        .put(put_with_key(
-            "/m5-132/k",
-            "v",
-            DedupKey::new(client_id, 1),
-        ))
+        .put(put_with_key("/m5-132/k", "v", DedupKey::new(client_id, 1)))
         .await
         .expect("the original application succeeds");
     assert_eq!(original.outcome, MutationOutcome::Applied);
@@ -588,11 +604,7 @@ async fn m5_132_replay_outside_the_window_is_not_auto_replayed() {
 
     let before_revision = cluster.metrics(leader).cluster_revision;
     let replay = client
-        .put(put_with_key(
-            "/m5-132/k",
-            "v",
-            DedupKey::new(client_id, 1),
-        ))
+        .put(put_with_key("/m5-132/k", "v", DedupKey::new(client_id, 1)))
         .await;
     let detail = match replay {
         Err(ConfigError::InvalidArgument { detail }) => detail,

@@ -64,8 +64,8 @@ anti-flake = §12; gate checklist = §13; open questions = §14; contradictions 
 
 | Area | Path |
 |---|---|
-| Policy document unit + signature tests | `crates/config-core/tests/m6_policy_doc.rs` |
-| M6 RBAC lifecycle gates | `tests/m6_policy.rs` |
+| Policy document unit + signature tests | `crates/config-core/tests/m6_rbac.rs` |
+| M6 RBAC lifecycle gates | `crates/config-engine/tests/m6_rbac.rs`, `crates/config-grpc/tests/m6_rbac.rs`, `crates/config-server/src/config.rs` unit tests |
 | M6 rotation gates (TLS, peer, gossip key, expiry) | `tests/m6_rotation.rs` |
 | M6 pagination gates | `tests/m6_pagination.rs`, `crates/config-storage/tests/m6_store_pin.rs` |
 | M6 mixed-version gates | `tests/m6_mixed_version.rs` |
@@ -368,7 +368,7 @@ the gate run.
 | Layer | Runner | Fault tools | Per-test budget |
 |---|---|---|---|
 | Policy document unit | `cargo test -p config-core` | `PolicyFixture` | < 5 s |
-| M6 RBAC lifecycle | `tests/m6_policy.rs` | `PolicyFixture`, `GossipControl`, `NetFault` | < 30 s |
+| M6 RBAC lifecycle | `*/tests/m6_rbac.rs` | `PolicyFixture`, `GossipControl`, `NetFault` | < 30 s |
 | M6 rotation | `tests/m6_rotation.rs` | `TlsFixture`, `CredentialSource`, `GossipKeyring` | < 45 s |
 | M6 pagination | `tests/m6_pagination.rs` | `PinRegistry`, token forger, `NetFault` | < 20 s |
 | M6 mixed-version | `tests/m6_mixed_version.rs` | `--compat-schema`, golden bytes | < 45 s |
@@ -482,6 +482,41 @@ on node 1 only, then on node 2, then on node 3.
 | M6-38 | capabilities_report_the_active_authz_model | scrape capabilities in both modes | `Authz::SignedPolicy{policy_version: Some(8)}` vs `Authz::StaticAllowlist`; a signed-mode node with no valid policy reports `SignedPolicy{policy_version: None}` and is unready | TA-66; ADR-0016 "a capability that can lie is worse than no capability at all" |
 | M6-39 | embedded_client_principal_is_non_forgeable_under_signed_policy | construct a direct embedded client scoped to principal `app`; issue requests carrying a different principal name in ordinary request fields | the engine evaluates against `app` regardless; there is no request field, header or builder method that can change it after construction; a compile-level assertion shows the principal is not part of the request type | §15.2/§15.3 closing paragraph, carried into M6. The M3 row asserted this for the allowlist; the signed path must not reintroduce a request-supplied principal |
 | M6-40 | admin_set_comes_only_from_the_signed_document | a principal in `authz.admins` of a **config file** but not in the document's `admins` | the admin RPC is denied; the only source of admin identity under `authz.mode = "signed"` is the signed document (D6.1's `admins: [principal]`); the config-file allowlist is ignored and its presence is logged once as a configuration warning | otherwise the signature buys nothing: an attacker with file-write access to the TOML gets admin without touching the signed artifact |
+
+### 3.9 Implementation status (dev-rbac, 2026-09-19)
+
+Row to test, by the name the test actually carries. Every file below is `m6_rbac.rs` in that
+crate's `tests/` directory, except the configuration rows, which are unit tests in
+`crates/config-server/src/config.rs` because configuration validation is a pure function and a
+daemon spawn would assert nothing extra.
+
+| Rows | Where | Tests |
+|---|---|---|
+| M6-01..M6-06 | config-core | `m6_01_good_signature_loads_and_activates`, `m6_02_bad_signature_is_refused_and_denies_everything`, `m6_03_signature_by_an_untrusted_key_is_refused`, `m6_04_tampered_document_body_is_refused`, `m6_05_version_is_bound_to_the_document_hash`, `m6_06_trust_key_set_is_a_set_not_a_single_key` |
+| M6-07..M6-10 | config-core | `m6_07_rollback_is_refused_by_default`, `m6_08_equal_version_is_refused_unless_identical`, `m6_09_and_m6_10_break_glass_allows_rollback_and_is_not_sticky` |
+| M6-12 | config-grpc | `m6_12_reload_policy_is_immediate_for_an_admin`, `m6_12_reload_policy_is_refused_for_a_non_admin_and_does_not_reload`, `m6_12_a_refused_document_is_an_error_not_an_outcome` |
+| M6-13 | config-core | `m6_13_a_failed_reload_keeps_the_active_policy` |
+| M6-17..M6-19 | config-core | `m6_17_intersection_never_expands_early`, `m6_18_intersection_narrows_immediately`, `m6_19_unchanged_prefixes_are_unaffected_during_convergence` |
+| M6-21..M6-24 | config-core | `m6_21_convergence_completes_when_the_last_voter_reports`, `m6_22_unknown_voter_version_counts_as_lagging`, `m6_23_gossip_cannot_be_used_to_expand_access`, `m6_24_intersection_is_a_subset_property_over_generated_documents` |
+| M6-25 | config-grpc | `m6_25_no_valid_policy_closes_the_admin_plane` |
+| M6-28..M6-31 | config-engine | `m6_28_watch_on_a_changed_prefix_terminates_before_any_new_version_event`, `m6_29_watch_on_an_unchanged_prefix_survives_a_policy_change`, `m6_30_watch_on_a_newly_granted_prefix_is_not_retroactively_opened`, `m6_31_watch_termination_ordering_is_asserted_from_the_journal` |
+| M6-30 (wire half) | config-grpc | `m6_30_policy_converging_reaches_the_wire_as_a_reason_trailer`, `m6_30_a_wrapped_denial_still_carries_its_reason` |
+| M6-36, M6-37 | config-server `config.rs` | `signed_mode_accepts_a_policy_file_and_one_trust_key`, `signed_mode_names_every_missing_field_in_one_error`, `the_signed_fields_are_refused_under_static_mode`, `a_trust_key_must_be_a_usable_ed25519_public_key`, `duplicate_and_empty_trust_key_names_are_refused`, `a_zero_poll_interval_is_refused_and_a_set_one_is_honoured` |
+| M6-39, M6-40 | config-core, config-grpc | `m6_39_embedded_client_principal_is_non_forgeable_under_signed_policy`, `m6_40_admin_set_comes_only_from_the_signed_document` (both crates), `m6_40_the_admin_set_follows_the_active_document` |
+
+**Not yet covered, and why.** Each needs a three-daemon harness with a policy fixture, a
+`TestTimers`-driven poll tick and, for two of them, the restore path — none of which existed when
+the rows above landed. The production behaviour each asserts *is* implemented (`PolicyLoader`
+polling and its no-storm rule, typed missing-file reasons, readiness and the capability report);
+what is missing is the process-level assertion.
+
+| Rows | Reason |
+|---|---|
+| M6-11, M6-14, M6-15 | need the daemon harness plus a `PolicyFixture` that can write a document in two chunks between poll ticks |
+| M6-16, M6-38 | health and capability assertions at process level; the payload fields and the exporter landed with the M6 metrics round, the E2E rows did not |
+| M6-20, M6-26, M6-27 | need three daemons at different policy versions |
+| M6-32 | the page-token half is dev-pagination's `PageTokenExpired{reason="policy_version"}`; the policy half is here |
+| M6-33..M6-35 | backup/restore binding; the manifest field is the backup owner's |
 
 ---
 

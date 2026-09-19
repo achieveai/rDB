@@ -1078,6 +1078,7 @@ dependencies = [
  "futures",
  "openraft",
  "postcard",
+ "prost",
  "rcgen",
  "rocksdb",
  "serde",

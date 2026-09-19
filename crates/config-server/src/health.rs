@@ -18,9 +18,28 @@
 
 use std::sync::Arc;
 
-use config_engine::ConfigNode;
+use config_engine::{ConfigNode, Paginator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::policy::PolicyLoader;
+
+/// Everything the two routes read from.
+///
+/// The node answers most of both payloads. The other two are the daemon's own: the paginator
+/// is built from `[list]` and handed to the client plane, and the policy loader owns the files
+/// the engine never sees — so the engine can report the active policy *version* but not why a
+/// load failed (ADR-0027, M6-16). Both are `Option` because a build without them must omit the
+/// series rather than export a zero that reads as a measurement.
+#[derive(Clone)]
+pub struct Sources {
+    /// The node itself.
+    pub node: ConfigNode,
+    /// The revision-pinned list paginator, when this daemon built one.
+    pub pagination: Option<Arc<Paginator>>,
+    /// The signed-policy loader, when `authz.mode = "signed"`.
+    pub policy: Option<Arc<PolicyLoader>>,
+}
 
 /// Largest request head this endpoint will read before giving up. A health probe's request is
 /// a few hundred bytes; anything larger is not one.
@@ -37,7 +56,7 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 /// idle".
 pub async fn serve(
     listener: TcpListener,
-    node: ConfigNode,
+    sources: Sources,
     shutdown: Arc<tokio::sync::Notify>,
     metrics_enabled: bool,
 ) {
@@ -49,9 +68,9 @@ pub async fn serve(
         };
         match accepted {
             Ok((stream, _peer)) => {
-                let node = node.clone();
+                let sources = sources.clone();
                 tokio::spawn(config_log::testing::in_current_span(async move {
-                    if let Err(e) = handle(stream, node, metrics_enabled).await {
+                    if let Err(e) = handle(stream, sources, metrics_enabled).await {
                         tracing::debug!(error = %e, "health connection ended early");
                     }
                 }));
@@ -68,7 +87,7 @@ pub async fn serve(
 
 async fn handle(
     mut stream: TcpStream,
-    node: ConfigNode,
+    sources: Sources,
     metrics_enabled: bool,
 ) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(512);
@@ -93,7 +112,9 @@ async fn handle(
     let path = target.split('?').next().unwrap_or_default();
 
     let response = if method == "GET" && path == "/health" {
-        let payload = node.health_payload().await;
+        let mut payload = sources.node.health_payload().await;
+        // Only the loader knows *why* the last load failed, so only it can fill this (M6-16).
+        payload.policy_state = sources.policy.as_ref().map(|loader| loader.state());
         match serde_json::to_vec(&payload) {
             Ok(body) => http_response(200, "OK", "application/json", &body),
             Err(e) => {
@@ -102,7 +123,10 @@ async fn handle(
             }
         }
     } else if method == "GET" && path == "/metrics" && metrics_enabled {
-        let body = node.metrics_report().await.render_prometheus().into_bytes();
+        let mut report = sources.node.metrics_report().await;
+        report.pagination = sources.pagination.as_ref().map(|p| p.stats());
+        report.policy = sources.policy.as_ref().map(|loader| loader.metrics());
+        let body = report.render_prometheus().into_bytes();
         // The version parameter is not decoration: a scraper uses it to pick its parser, and
         // omitting it makes some scrapers fall back to a format this is not.
         http_response(200, "OK", "text/plain; version=0.0.4; charset=utf-8", &body)

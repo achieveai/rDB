@@ -109,6 +109,10 @@ pub(crate) struct NodeInner {
     background: Mutex<Option<JoinHandle<()>>>,
     /// Authorization decisions refused, counted in the one authorize seam (M3-81).
     authz_denied: AtomicU64,
+    /// Admin-plane calls refused by the `[authz] admins` allowlist (ADR-0023, C5B-15). The
+    /// allowlist is checked in the transport, before any engine call, so only the transport
+    /// can report these — exactly as with `authn_rejected`.
+    authz_denied_admin: AtomicU64,
     /// Client connections whose transport identity could not be established (M3-81). The
     /// engine never sees a certificate, so only the transport can count these.
     authn_rejected: AtomicU64,
@@ -280,6 +284,7 @@ impl ConfigNode {
             accepted_hints: Mutex::new(BTreeMap::new()),
             background: Mutex::new(None),
             authz_denied: AtomicU64::new(0),
+            authz_denied_admin: AtomicU64::new(0),
             authn_rejected: AtomicU64::new(0),
             authn_rejected_peer: AtomicU64::new(0),
             retention: cfg_watch_retention,
@@ -574,6 +579,11 @@ impl ConfigNode {
         let membership = inner.committed_membership();
         let (node_id, cluster_id, recovery_epoch) =
             HealthPayload::identity_fields(&inner.cfg.identity);
+        // Read straight from the store rather than through `journal_view`, which collapses an
+        // empty journal's bounds onto zero: the payload distinguishes "empty" from "starts at
+        // the beginning", and a zero would answer a different question than the one TA-39 asks.
+        let journal = inner.reader.journal_stats().ok();
+        let compact_revision = self.compact_revision();
         HealthPayload {
             node_id,
             cluster_id,
@@ -598,6 +608,17 @@ impl ConfigNode {
             restored_from: inner.reader.restored_from(),
             authz_denied: m.authz_denied,
             authn_rejected: m.authn_rejected,
+            compact_revision,
+            journal_oldest_revision: journal.as_ref().and_then(|j| j.oldest_revision),
+            journal_newest_revision: journal.as_ref().and_then(|j| j.newest_revision),
+            journal_hash: hex32(&self.journal_hash(compact_revision)),
+            watch_streams_open: inner.watch.stats().streams_open,
+            // The engine knows the version because it holds the authorizer; it does not know
+            // *why* a load failed, because it does not hold the files. The daemon fills
+            // `policy_state` (M6-16) exactly as it fills the three environment facts on
+            // `MetricsReport`.
+            policy_version: inner.authorizer.policy_version(),
+            policy_state: None,
         }
     }
 
@@ -657,6 +678,8 @@ impl ConfigNode {
             disk_free_bytes: None,
             cert_expiry_seconds: BTreeMap::new(),
             backup_age_seconds: None,
+            pagination: None,
+            policy: None,
         }
     }
 
@@ -680,6 +703,18 @@ impl ConfigNode {
     /// counted inside the engine, where that check lives.
     pub fn record_authn_rejection(&self) {
         self.inner.authn_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one admin-plane refusal by the `[authz] admins` allowlist (ADR-0023, C5B-15).
+    ///
+    /// Same seam and same reason as [`ConfigNode::record_authn_rejection`]: the allowlist is
+    /// enforced in the transport so a non-admin never reaches consensus, and the node is the
+    /// only place that keeps counters. Without this, `retcd_authz_denied_total{plane="admin"}`
+    /// reads zero no matter how many admin calls were turned away.
+    pub fn record_admin_authz_denial(&self) {
+        self.inner
+            .authz_denied_admin
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// What this node actually guarantees (ADR-0016).
@@ -1037,6 +1072,7 @@ impl NodeInner {
             running_state_ok: m.running_state.is_ok(),
             millis_since_quorum_ack: m.millis_since_quorum_ack,
             authz_denied: self.authz_denied.load(Ordering::Relaxed),
+            authz_denied_admin: self.authz_denied_admin.load(Ordering::Relaxed),
             authn_rejected: self.authn_rejected.load(Ordering::Relaxed),
             authn_rejected_peer: self.authn_rejected_peer.load(Ordering::Relaxed),
         }

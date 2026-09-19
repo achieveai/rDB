@@ -58,7 +58,8 @@ pub use hint::{
 };
 pub use metrics::{
     Health, HealthPayload, HistogramSnapshot, LatencyHistogram, LogIdView, MembershipView,
-    MetricsReport, NodeMetrics, NodeRole, OpLatencies, PolicySummary, LATENCY_BUCKETS_SECONDS,
+    MetricsReport, NodeMetrics, NodeRole, OpLatencies, PolicyMetrics, PolicySummary,
+    LATENCY_BUCKETS_SECONDS,
 };
 pub use netfault::NetFault;
 pub use node::ConfigNode;

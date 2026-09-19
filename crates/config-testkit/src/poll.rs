@@ -111,10 +111,24 @@ impl TestTimers {
     };
 
     /// `n` times the worst-case election timeout, e.g. `10 * election_timeout` for "no leader
-    /// was ever elected" (test plan §6 rule 3 example).
+    /// was ever elected" (test plan §6 rule 3 example), stretched by [`deadline_scale`].
     pub fn multiple(&self, n: u32) -> Duration {
-        self.election_timeout_max * n
+        self.election_timeout_max * n * deadline_scale()
     }
+}
+
+/// Wall-clock deadlines assume the host can actually run the cluster. `RETCD_TEST_DEADLINE_SCALE`
+/// (an integer, default `1`) stretches every derived deadline for an oversubscribed or
+/// instrumented host without touching the Raft timers, which keep their real values so the rows
+/// still test the real thing. A deadline is a bound on how long a poll may wait for an observed
+/// state, never a sleep, so stretching it changes only how patient a row is, not what it asserts.
+/// The gate scripts set it; an idle developer host needs nothing.
+pub fn deadline_scale() -> u32 {
+    std::env::var("RETCD_TEST_DEADLINE_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1)
+        .max(1)
 }
 
 impl Default for TestTimers {
