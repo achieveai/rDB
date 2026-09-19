@@ -20,7 +20,7 @@ use config_core::{
 };
 use config_log::retcd_test;
 use config_storage::{
-    Boundary, FaultAction, FaultInjector, NoFaults, RaftNodeId, RocksOptions, RocksStore,
+    Boundary, FaultAction, FaultInjector, NoFaults, NoopSink, RaftNodeId, RocksOptions, RocksStore,
     StorageOpenError, TypeConfig, CF_RAFT_LOG, CF_STATE_META, FORMAT_VERSION,
 };
 use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
@@ -61,6 +61,7 @@ fn put_cmd(key: &str, value: &str) -> Command {
         key: Bytes::copy_from_slice(key.as_bytes()),
         value: Bytes::copy_from_slice(value.as_bytes()),
         expected_mod_revision: None,
+        dedup: None,
     }
 }
 
@@ -245,7 +246,9 @@ async fn m2_storage_04_missing_or_unexpected_column_family_is_typed() {
         other => panic!("expected MissingColumnFamily, got {other:?}"),
     }
 
-    // An `events` CF means the directory belongs to a later schema version (spec §17).
+    // An unallocated CF means the directory belongs to a later schema version (spec §17).
+    // `events` played this role until M4 and `dedup` until M5; both are real families now, so
+    // the assertion moves on to a name no milestone has claimed.
     let extra = tempfile::tempdir().unwrap();
     drop(open_plain(extra.path()));
     {
@@ -254,7 +257,7 @@ async fn m2_storage_04_missing_or_unexpected_column_family_is_typed() {
         opts.create_missing_column_families(true);
         let descriptors: Vec<rocksdb::ColumnFamilyDescriptor> = config_storage::COLUMN_FAMILIES
             .iter()
-            .chain(std::iter::once(&"events"))
+            .chain(std::iter::once(&"future"))
             .map(|n| rocksdb::ColumnFamilyDescriptor::new(*n, rocksdb::Options::default()))
             .collect();
         let db = rocksdb::DB::open_cf_descriptors(&opts, extra.path(), descriptors)
@@ -270,7 +273,7 @@ async fn m2_storage_04_missing_or_unexpected_column_family_is_typed() {
     )
     .expect_err("a later schema version must be refused");
     match &err {
-        StorageOpenError::UnexpectedColumnFamily { name, .. } => assert_eq!(name, "events"),
+        StorageOpenError::UnexpectedColumnFamily { name, .. } => assert_eq!(name, "future"),
         other => panic!("expected UnexpectedColumnFamily, got {other:?}"),
     }
 }
@@ -438,6 +441,7 @@ async fn m2_storage_09_applied_state_reloads_with_the_same_state_hash() {
         Command::Delete {
             key: Bytes::from_static(b"/z"),
             expected_mod_revision: None,
+            dedup: None,
         },
         put_cmd("/a", "2"),
         put_cmd("/b", ""),
@@ -625,17 +629,20 @@ async fn m2_storage_13_every_boundary_is_crossed_in_order() {
         .await
         .unwrap();
 
-    assert_eq!(recorder.0.lock().unwrap().clone(), Boundary::ALL.to_vec());
+    assert_eq!(
+        recorder.0.lock().unwrap().clone(),
+        WRITE_PATH_BOUNDARIES.to_vec()
+    );
     let counters = s.counters();
-    for b in Boundary::ALL {
+    for b in WRITE_PATH_BOUNDARIES {
         assert_eq!(counters.get(b), 1, "{b} crossed exactly once");
     }
-    assert_eq!(counters.total(), 8);
+    assert_eq!(counters.total(), 9);
 }
 
 #[retcd_test]
 async fn m2_storage_14_fail_at_each_boundary_leaves_the_store_usable() {
-    for boundary in Boundary::ALL {
+    for boundary in WRITE_PATH_BOUNDARIES {
         let tmp = tempfile::tempdir().unwrap();
         let s = open_at(tmp.path(), FailAt::new(boundary, FaultAction::Fail));
 
@@ -681,6 +688,24 @@ struct CrashExpectation {
     cluster_revision: u64,
 }
 
+/// The boundaries the vote / append / apply workload below actually crosses.
+///
+/// The M5 snapshot, install and purge boundaries are not in this list because this workload
+/// never builds, receives or purges anything — arming a crash on one of them would assert that
+/// a boundary "was reached" when nothing could have reached it. They are driven by
+/// `m5_snapshot.rs` instead, which performs the operations that cross them.
+const WRITE_PATH_BOUNDARIES: [Boundary; 9] = [
+    Boundary::BeforeVoteSync,
+    Boundary::AfterVoteSync,
+    Boundary::BeforeLogAppend,
+    Boundary::AfterLogAppend,
+    Boundary::BeforeLogFlush,
+    Boundary::AfterLogFlush,
+    Boundary::BeforeStateBatch,
+    Boundary::AfterStateBatch,
+    Boundary::AfterStateBatchBeforePublish,
+];
+
 fn crash_expectation(boundary: Boundary) -> CrashExpectation {
     match boundary {
         // The new vote never reached the disk: the node keeps the vote it can remember.
@@ -717,8 +742,22 @@ fn crash_expectation(boundary: Boundary) -> CrashExpectation {
             last_applied: 2,
             cluster_revision: 2,
         },
-        // The whole batch — record, revision, last_applied — is durable.
-        Boundary::AfterStateBatch => CrashExpectation {
+        // The whole batch — record, revision, last_applied, journal — is durable. The publish
+        // boundary sits after the write, so crashing at either leaves the same disk.
+        // Not crossed by this workload; `WRITE_PATH_BOUNDARIES` is what the matrix iterates.
+        // Listed rather than folded into a wildcard so that adding a boundary to the enum
+        // forces a decision here instead of silently inheriting someone else's expectation.
+        Boundary::BeforeSnapshotTmpSync
+        | Boundary::AfterSnapshotRename
+        | Boundary::BeforeCurrentSnapshotMeta
+        | Boundary::BeforeInstallMarker
+        | Boundary::AfterInstallDropCf
+        | Boundary::BeforeInstallFinalBatch
+        | Boundary::BeforePurge
+        | Boundary::AfterPurge => {
+            panic!("{boundary} is an M5 boundary; see m5_snapshot.rs")
+        }
+        Boundary::AfterStateBatch | Boundary::AfterStateBatchBeforePublish => CrashExpectation {
             vote_term: 5,
             entry_present: Some(true),
             last_applied: 3,
@@ -796,7 +835,7 @@ async fn poisoned_call_results(s: &RocksStore) -> Vec<(&'static str, Result<(), 
             r(s.state_machine()
                 .install_snapshot(
                     &openraft::SnapshotMeta::default(),
-                    Box::new(std::io::Cursor::new(Vec::new())),
+                    Box::new(tokio::fs::File::from_std(tempfile::tempfile().unwrap())),
                 )
                 .await)
             .await,
@@ -810,7 +849,7 @@ async fn poisoned_call_results(s: &RocksStore) -> Vec<(&'static str, Result<(), 
 
 #[retcd_test]
 async fn m2_storage_15_crash_at_each_boundary_poisons_then_reopens_consistently() {
-    for boundary in Boundary::ALL {
+    for boundary in WRITE_PATH_BOUNDARIES {
         let tmp = tempfile::tempdir().unwrap();
 
         // Seed: vote at term 1, entries 1..=2 appended and applied.
@@ -913,9 +952,14 @@ async fn m2_storage_15_crash_at_each_boundary_poisons_then_reopens_consistently(
 
 #[retcd_test]
 async fn m2_storage_16_crash_matrix_covers_every_boundary() {
-    // Guards against a silently-dropped boundary when the enum grows (test plan M2-27).
-    assert_eq!(Boundary::ALL.len(), 8);
-    for b in Boundary::ALL {
+    // Guards against a silently-dropped boundary when the enum grows (test plan M2-27). The
+    // enum reached seventeen at M5; nine of them are on the write path this file drives, and
+    // the other eight are driven by `m5_snapshot.rs`. Both halves are asserted, so a new
+    // variant cannot be absorbed into either set unnoticed.
+    assert_eq!(Boundary::ALL.len(), 17);
+    assert_eq!(WRITE_PATH_BOUNDARIES.len(), 9);
+    for b in WRITE_PATH_BOUNDARIES {
+        assert!(Boundary::ALL.contains(&b), "{b} is missing from ALL");
         let _ = crash_expectation(b);
     }
 }
@@ -979,6 +1023,7 @@ async fn m2_storage_18_sync_disabled_downgrades_the_capability() {
             sync_writes: false,
             ..RocksOptions::DEFAULT
         },
+        Arc::new(NoopSink),
     )
     .expect("store opens without sync");
 
@@ -998,31 +1043,28 @@ async fn m2_storage_18_sync_disabled_downgrades_the_capability() {
         .unwrap();
     assert_eq!(s.sync_count(), 0, "no fsync was performed");
     // The boundaries still exist, so an injector behaves identically in either mode.
-    assert_eq!(s.counters().total(), 8);
+    assert_eq!(s.counters().total(), 9);
 }
 
+/// M2-37 as amended at M5: snapshots are no longer "unsupported", so what this row now asserts
+/// is the part that never changed — a store with no snapshot answers `Ok(None)` rather than an
+/// error, and an `install_snapshot` that nothing opened a receive slot for is refused instead
+/// of guessing which file it meant. The build path itself is exercised by `m5_snapshot.rs`.
 #[retcd_test]
 async fn m2_storage_19_snapshots_are_unsupported_but_never_panic() {
-    use openraft::RaftSnapshotBuilder;
-
     let tmp = tempfile::tempdir().unwrap();
     let s = open_plain(tmp.path());
     let mut sm = s.state_machine();
     assert!(sm.get_current_snapshot().await.unwrap().is_none());
-    assert!(sm.begin_receiving_snapshot().await.is_ok());
-    assert!(sm
-        .get_snapshot_builder()
-        .await
-        .build_snapshot()
-        .await
-        .is_err());
-    assert!(sm
-        .install_snapshot(
+    assert!(
+        sm.install_snapshot(
             &openraft::SnapshotMeta::default(),
-            Box::new(std::io::Cursor::new(Vec::new()))
+            Box::new(tokio::fs::File::from_std(tempfile::tempfile().unwrap()))
         )
         .await
-        .is_err());
+        .is_err(),
+        "an install with no receive slot has no file to install"
+    );
 }
 
 // --- logging -----------------------------------------------------------------------------
@@ -1080,8 +1122,8 @@ async fn m2_storage_20_boundary_lines_carry_test_method_and_node_id() {
         .collect();
     assert_eq!(
         boundaries.len(),
-        4,
-        "one line per After* boundary crossed (vote, append, flush, state batch)"
+        5,
+        "one line per After* boundary crossed (vote, append, flush, state batch, publish)"
     );
     for line in &boundaries {
         assert_eq!(
@@ -1102,7 +1144,8 @@ async fn m2_storage_20_boundary_lines_carry_test_method_and_node_id() {
             "after_vote_sync",
             "after_log_append",
             "after_log_flush",
-            "after_state_batch"
+            "after_state_batch",
+            "after_state_batch_before_publish"
         ]
     );
 
@@ -1386,7 +1429,7 @@ async fn m2_storage_25_corrupt_state_meta_last_applied_detected_on_open() {
 /// through the harness.
 #[retcd_test]
 async fn m2_storage_26_log_cf_keys_contiguous_after_crash_at_every_boundary() {
-    for boundary in Boundary::ALL {
+    for boundary in WRITE_PATH_BOUNDARIES {
         let tmp = tempfile::tempdir().unwrap();
         {
             let s = open_at(tmp.path(), FailAt::new(boundary, FaultAction::Crash));
@@ -1491,7 +1534,7 @@ async fn m2_storage_28_unsupported_format_version_refused() {
     let tmp = tempfile::tempdir().unwrap();
     drop(open_plain(tmp.path()));
     with_raw_state_meta(tmp.path(), |db, cf| {
-        db.put_cf(cf, b"format_version", 2u32.to_le_bytes())
+        db.put_cf(cf, b"format_version", 4u32.to_le_bytes())
             .expect("stamp a future format version");
     });
 
@@ -1507,14 +1550,14 @@ async fn m2_storage_28_unsupported_format_version_refused() {
         StorageOpenError::UnsupportedFormat {
             found, supported, ..
         } => {
-            assert_eq!(*found, 2, "the stamped version is reported verbatim");
+            assert_eq!(*found, 4, "the stamped version is reported verbatim");
             assert_eq!(*supported, FORMAT_VERSION);
         }
         other => panic!("expected UnsupportedFormat, got {other:?}"),
     }
     let text = err.to_string();
     assert!(
-        text.contains('2') && text.contains(&FORMAT_VERSION.to_string()),
+        text.contains('4') && text.contains(&FORMAT_VERSION.to_string()),
         "the message must name both versions for the operator: {text}"
     );
 }

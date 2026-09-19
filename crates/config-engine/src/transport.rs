@@ -165,6 +165,18 @@ pub enum PeerReject {
     /// The transport identity (mTLS SAN) does not match `from` (M3).
     #[error("transport identity mismatch: {0}")]
     IdentityMismatch(String),
+    /// The sender's node id was retired by a committed `RetireNode` (M5, ADR-0023,
+    /// spec §21 "stale identities cannot rejoin").
+    ///
+    /// Distinct from [`PeerReject::IdentityMismatch`] on purpose: the certificate is
+    /// genuine and the envelope is consistent — M5 fences the *identity*, not the key
+    /// material, and certificate revocation is M6 (ADR-0028). An operator reading
+    /// `identity_mismatch` here would go looking for a PKI fault that does not exist.
+    #[error("node {node_id} is retired: identity_retired")]
+    Retired {
+        /// The fenced sender.
+        node_id: NodeId,
+    },
     /// The node is not running (stopped or not yet started).
     #[error("node not running")]
     NotRunning,
@@ -182,6 +194,19 @@ pub trait PeerSink: Send + Sync {
         meta: PeerEnvelopeMeta,
         req: PeerRequest,
     ) -> Result<PeerResponse, PeerReject>;
+
+    /// Whether `node_id` has been fenced out by a committed `RetireNode` (M5, ADR-0023).
+    ///
+    /// Exposed separately from [`PeerSink::handle`] so the transport can refuse a retired
+    /// sender **before** deserializing its payload: the point of the fence is that a retired
+    /// node never gets to hand this process bytes that OpenRaft will interpret. `handle`
+    /// re-checks it, because the in-process transport does not go through a codec at all.
+    ///
+    /// Synchronous and cheap: it reads applied state under the store's lock.
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        let _ = node_id;
+        false
+    }
 }
 
 /// Cheap, cloneable handle to a node's [`PeerSink`]; what `config-grpc`'s `PeerService`
@@ -202,6 +227,11 @@ impl PeerHandler {
         req: PeerRequest,
     ) -> Result<PeerResponse, PeerReject> {
         self.0.handle(meta, req).await
+    }
+
+    /// Whether the node this handle belongs to has fenced `node_id` out (M5, ADR-0023).
+    pub fn is_retired(&self, node_id: NodeId) -> bool {
+        self.0.is_retired(node_id)
     }
 }
 

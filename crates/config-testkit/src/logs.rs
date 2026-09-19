@@ -63,7 +63,7 @@ pub fn test_logs_glob() -> String {
     if !dir.ends_with('/') {
         dir.push('/');
     }
-    dir.push_str("**/*.jsonl");
+    dir.push_str("*/*.jsonl");
     dir
 }
 

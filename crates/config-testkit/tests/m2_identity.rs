@@ -297,8 +297,14 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::
     Ok(())
 }
 
-/// M2-47: identity survives a crash at every one of the 8 boundaries — written once on first
-/// open, never rewritten by any apply, vote, or log write afterward.
+/// M2-47: identity survives a crash at every one of the M2-M4 boundaries — written once on
+/// first open, never rewritten by any apply, vote, or log write afterward.
+///
+/// Iterates `support::DRIVEABLE_BOUNDARIES`, not `Boundary::ALL`: this row's only drivers are
+/// an ordinary put and a vote-triggering isolate, neither of which can ever cross one of M5's
+/// snapshot/install/purge boundaries (see that constant's doc comment) — those get their own
+/// identity-survival coverage from dev-snapshot's M5 rows, driven by a snapshot/install/purge
+/// workload instead.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m2_47_identity_survives_crash_at_every_boundary() {
     let (cluster, scripts) = rocks_cluster_with_scripts(3).await;
@@ -306,7 +312,7 @@ async fn m2_47_identity_survives_crash_at_every_boundary() {
     cluster.leader().await;
     let identity_before = cluster.identity(id);
 
-    for boundary in Boundary::ALL {
+    for boundary in support::DRIVEABLE_BOUNDARIES {
         // Target node 1 specifically regardless of its current role: `crash_on_nth` only fires
         // when this node itself crosses the boundary, and a plain put always crosses the
         // append/flush/state-batch boundaries on the leader, so pointing every put at node 1
@@ -364,6 +370,7 @@ async fn m2_47_identity_survives_crash_at_every_boundary() {
             let _ = cluster
                 .client(leader)
                 .put(config_core::PutRequest {
+                    dedup: None,
                     key: bytes::Bytes::copy_from_slice(format!("/m2/47/{boundary}").as_bytes()),
                     value: bytes::Bytes::copy_from_slice(b"v"),
                     expected_mod_revision: None,

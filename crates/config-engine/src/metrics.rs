@@ -4,10 +4,16 @@
 //! harness, the health endpoint, and eventually the gRPC surface.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use config_core::{
-    Authz, ClusterIdentity, Durability, LeaderHint, NodeId, RecoveryEpoch, TransportSecurity,
+    Authz, ClusterIdentity, Durability, LeaderHint, NodeId, RecoveryEpoch, RestoredFrom,
+    TransportSecurity,
 };
+use config_storage::{DedupStats, StorageMetrics};
+
+use crate::watch::WatchStats;
 use serde::Serialize;
 
 use crate::config::AuthzKind;
@@ -118,13 +124,22 @@ pub struct NodeMetrics {
     /// `retcd.audit` `deny` line exists for each of these; the counter is what makes "a spike
     /// of refusals" assertable without parsing a log.
     pub authz_denied: u64,
-    /// Client connections whose transport identity could not be established, since start.
+    /// Connections whose transport identity could not be established, since start, across
+    /// **both** planes.
     ///
     /// *Authentication*, not authorization: the caller never became a principal, so no
-    /// authorization decision was reached and no audit line was written. Recorded by the
-    /// transport through [`crate::ConfigNode::record_authn_rejection`], because the engine
-    /// never sees a certificate.
+    /// authorization decision was reached and no audit line was written. The client-plane half
+    /// is recorded by the transport through [`crate::ConfigNode::record_authn_rejection`],
+    /// because the engine never sees a certificate; the peer-plane half is recorded by the
+    /// engine itself, which is where the `identity_retired` fence lives.
     pub authn_rejected: u64,
+    /// The peer-plane share of [`NodeMetrics::authn_rejected`].
+    ///
+    /// Held separately because `/metrics` labels the family by plane (ADR-0026) and a single
+    /// undivided counter forced the exporter to publish every sample as `plane="client"` — so
+    /// a fenced peer, which is a membership event, appeared in an operator's dashboard as a
+    /// client authentication failure and sent them looking at certificates.
+    pub authn_rejected_peer: u64,
 }
 
 /// What authorization policy a node is actually holding (M3-42).
@@ -256,6 +271,11 @@ pub struct HealthPayload {
     pub transport_security: TransportSecurity,
     /// The policy this node holds, identically on every node given the same document (M3-42).
     pub policy: PolicySummary,
+    /// Where this node's data directory was restored from, when it was restored at all
+    /// (M5, ADR-0024). `null` for a directory that grew its own state, which is every node
+    /// that has never been through a fenced restore - so a non-null value on a node the
+    /// operator did not restore is itself the finding.
+    pub restored_from: Option<RestoredFrom>,
     /// Authorization decisions refused since start. See [`NodeMetrics::authz_denied`].
     pub authz_denied: u64,
     /// Client connections whose identity could not be established since start. See
@@ -272,4 +292,702 @@ impl HealthPayload {
             identity.recovery_epoch,
         )
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Prometheus exposition (M5, ADR-0026)
+// ---------------------------------------------------------------------------------------
+
+/// Bucket upper bounds, in seconds, shared by every latency histogram (ADR-0026).
+///
+/// One set for all three histograms on purpose: an operator comparing proposal latency with
+/// read latency in the same dashboard panel compares equal buckets, and a recording rule
+/// written against one works against the others.
+pub const LATENCY_BUCKETS_SECONDS: [f64; 12] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
+
+/// A lock-free latency histogram over [`LATENCY_BUCKETS_SECONDS`].
+///
+/// Observations come from the request path, which is hot and must not contend: each one is a
+/// linear scan of twelve bucket bounds and two relaxed atomic adds. `sum_micros` is integer
+/// microseconds rather than a float, because a float has no atomic form and a lock here would
+/// put a mutex on every write.
+#[derive(Debug, Default)]
+pub struct LatencyHistogram {
+    buckets: [AtomicU64; LATENCY_BUCKETS_SECONDS.len()],
+    count: AtomicU64,
+    sum_micros: AtomicU64,
+}
+
+impl LatencyHistogram {
+    /// Record one observation.
+    pub fn observe(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs_f64();
+        for (i, bound) in LATENCY_BUCKETS_SECONDS.iter().enumerate() {
+            if seconds <= *bound {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_micros
+            .fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Read the histogram out in the cumulative form Prometheus exposes.
+    ///
+    /// The per-bucket counters above are *exclusive*; `le` buckets are cumulative, so the read
+    /// side accumulates. Doing it here rather than on every observation keeps the hot path at
+    /// one increment.
+    pub fn snapshot(&self) -> HistogramSnapshot {
+        let mut cumulative = [0u64; LATENCY_BUCKETS_SECONDS.len()];
+        let mut running = 0u64;
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            running += bucket.load(Ordering::Relaxed);
+            cumulative[i] = running;
+        }
+        HistogramSnapshot {
+            cumulative,
+            count: self.count.load(Ordering::Relaxed),
+            sum_seconds: self.sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+        }
+    }
+}
+
+/// One [`LatencyHistogram`] read at a point in time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HistogramSnapshot {
+    /// Observations at or below each [`LATENCY_BUCKETS_SECONDS`] bound, cumulative.
+    pub cumulative: [u64; LATENCY_BUCKETS_SECONDS.len()],
+    /// Total observations, which is also the `+Inf` bucket.
+    pub count: u64,
+    /// Total observed seconds.
+    pub sum_seconds: f64,
+}
+
+/// Write-path latency, split by the `op` label ADR-0026 requires.
+#[derive(Debug, Default)]
+pub struct OpLatencies {
+    /// `op="put"`.
+    pub put: LatencyHistogram,
+    /// `op="delete"`.
+    pub delete: LatencyHistogram,
+}
+
+impl OpLatencies {
+    /// The histogram for `op`, or `None` for an operation that is not a proposal.
+    pub fn for_op(&self, op: &str) -> Option<&LatencyHistogram> {
+        match op {
+            "put" => Some(&self.put),
+            "delete" => Some(&self.delete),
+            _ => None,
+        }
+    }
+
+    /// Both histograms, labelled, for a scrape.
+    pub fn snapshot(&self) -> BTreeMap<&'static str, HistogramSnapshot> {
+        BTreeMap::from([
+            ("put", self.put.snapshot()),
+            ("delete", self.delete.snapshot()),
+        ])
+    }
+}
+
+/// Everything one scrape needs, gathered once (ADR-0026 "Metric list").
+///
+/// A plain value struct rather than a process-global registry: the daemon builds one per
+/// scrape from the node it owns, so two nodes in one process — which every integration test
+/// runs — cannot write into each other's series, the failure a global registry has by
+/// construction.
+///
+/// The last three fields are the ones the **engine cannot know**: free space on the data
+/// directory's volume, certificate expiry, and the age of the last backup are facts about a
+/// daemon's environment rather than about a Raft node, so the daemon fills them and an
+/// embedder without a daemon leaves them out rather than having the engine guess.
+#[derive(Debug, Clone)]
+pub struct MetricsReport {
+    /// Raft and apply state.
+    pub node: NodeMetrics,
+    /// RocksDB, snapshot, and purge counters — `None` for an ephemeral store, which has no
+    /// disk to report on.
+    pub storage: Option<StorageMetrics>,
+    /// The bounded dedup index (M5, ADR-0025).
+    pub dedup: DedupStats,
+    /// Compactions applied on this node (ADR-0019).
+    pub compactions: u64,
+    /// Watch admission, delivery, and termination counters (ADR-0020).
+    pub watch: WatchStats,
+    /// Observed reachability of each peer, from the advisory gossip source (ADR-0003).
+    pub gossip_reachable: BTreeMap<NodeId, bool>,
+    /// Gossip hints refused because they disagreed with committed membership.
+    pub gossip_endpoint_mismatch: u64,
+    /// Observed leadership transitions on this node.
+    pub leader_changes: u64,
+    /// Leader-only: how far each peer is behind the leader's last log index.
+    pub peer_lag: BTreeMap<NodeId, u64>,
+    /// Last index this node knows to be committed.
+    pub commit_index: Option<u64>,
+    /// Submit-to-commit latency of client writes, by `op`.
+    pub proposal_latency: BTreeMap<&'static str, HistogramSnapshot>,
+    /// Linearizable read barrier latency (ADR-0009).
+    pub read_latency: HistogramSnapshot,
+    /// Free bytes on the data directory's volume, when the daemon measured it.
+    pub disk_free_bytes: Option<u64>,
+    /// Seconds until each plane's loaded leaf certificate expires, when the daemon knows.
+    pub cert_expiry_seconds: BTreeMap<String, i64>,
+    /// Age of the most recent successful backup, when the daemon knows (ADR-0024).
+    pub backup_age_seconds: Option<u64>,
+}
+
+/// A Prometheus text-exposition writer that emits each metric's `HELP`/`TYPE` exactly once.
+struct Exposition {
+    out: String,
+    current: Option<&'static str>,
+}
+
+impl Exposition {
+    fn new() -> Self {
+        Self {
+            out: String::with_capacity(8 * 1024),
+            current: None,
+        }
+    }
+
+    fn metric(&mut self, name: &'static str, kind: &str, help: &str) {
+        if self.current != Some(name) {
+            self.out.push_str("# HELP ");
+            self.out.push_str(name);
+            self.out.push(' ');
+            self.out.push_str(help);
+            self.out.push('\n');
+            self.out.push_str("# TYPE ");
+            self.out.push_str(name);
+            self.out.push(' ');
+            self.out.push_str(kind);
+            self.out.push('\n');
+            self.current = Some(name);
+        }
+    }
+
+    /// One sample. Labels are written in the order given, so two samples of one metric always
+    /// carry their labels in the same order.
+    fn sample(&mut self, name: &str, labels: &[(&str, &str)], value: f64) {
+        self.out.push_str(name);
+        if !labels.is_empty() {
+            self.out.push('{');
+            for (i, (key, value)) in labels.iter().enumerate() {
+                if i > 0 {
+                    self.out.push(',');
+                }
+                self.out.push_str(key);
+                self.out.push_str("=\"");
+                escape_label_value(value, &mut self.out);
+                self.out.push('"');
+            }
+            self.out.push('}');
+        }
+        self.out.push(' ');
+        self.out.push_str(&format_value(value));
+        self.out.push('\n');
+    }
+}
+
+/// Prometheus label-value escaping: backslash, double quote, and newline.
+///
+/// ADR-0026's redaction rule keeps keys, values, and anything off the allowlist out of labels
+/// in the first place; this is the mechanical backstop, so a reason string that ever gained a
+/// quote cannot break the exposition into something a scraper misparses.
+fn escape_label_value(value: &str, out: &mut String) {
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+}
+
+/// Render a value the way the exposition format wants it: integers without a decimal point,
+/// everything else with enough digits to resolve a microsecond.
+fn format_value(value: f64) -> String {
+    if value.fract() == 0.0 && value.abs() < 9.007_199_254_740_992e15 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:.6}")
+    }
+}
+
+impl MetricsReport {
+    /// Render the Prometheus text exposition format (ADR-0026; content type
+    /// `text/plain; version=0.0.4`).
+    ///
+    /// Every series carries `node_id`, because a scrape of three nodes in one process — what
+    /// an integration test runs — must not collapse three nodes' series into one.
+    pub fn render_prometheus(&self) -> String {
+        let node_id = self.node.node_id.0.to_string();
+        let node = [("node_id", node_id.as_str())];
+        let mut e = Exposition::new();
+
+        // ---- Raft ----
+        e.metric(
+            "retcd_raft_leader",
+            "gauge",
+            "1 when this node is the leader it knows about, 0 otherwise",
+        );
+        let is_leader = u64::from(self.node.current_leader == Some(self.node.node_id));
+        e.sample("retcd_raft_leader", &node, is_leader as f64);
+
+        e.metric("retcd_raft_role", "gauge", "1 for this node's current role");
+        for role in [
+            NodeRole::Learner,
+            NodeRole::Follower,
+            NodeRole::Candidate,
+            NodeRole::Leader,
+            NodeRole::Shutdown,
+        ] {
+            e.sample(
+                "retcd_raft_role",
+                &[("node_id", node_id.as_str()), ("role", role.as_str())],
+                u64::from(self.node.role == role) as f64,
+            );
+        }
+
+        e.metric("retcd_raft_term", "gauge", "current Raft term");
+        e.sample("retcd_raft_term", &node, self.node.current_term as f64);
+
+        e.metric(
+            "retcd_raft_leader_changes_total",
+            "counter",
+            "observed leadership transitions since this node started",
+        );
+        e.sample(
+            "retcd_raft_leader_changes_total",
+            &node,
+            self.leader_changes as f64,
+        );
+
+        e.metric(
+            "retcd_raft_commit_index",
+            "gauge",
+            "last log index known to be committed",
+        );
+        e.sample(
+            "retcd_raft_commit_index",
+            &node,
+            self.commit_index.unwrap_or(0) as f64,
+        );
+
+        e.metric(
+            "retcd_raft_applied_index",
+            "gauge",
+            "last log index applied to the state machine",
+        );
+        e.sample(
+            "retcd_raft_applied_index",
+            &node,
+            self.node.last_applied.map_or(0, |l| l.index) as f64,
+        );
+
+        e.metric(
+            "retcd_raft_purged_index",
+            "gauge",
+            "highest durably purged log index (ADR-0022)",
+        );
+        e.sample(
+            "retcd_raft_purged_index",
+            &node,
+            self.storage.as_ref().map_or(0, |s| s.purged_index) as f64,
+        );
+
+        e.metric(
+            "retcd_raft_peer_lag",
+            "gauge",
+            "leader-only: entries this peer is behind the leader's last log index",
+        );
+        for (peer, lag) in &self.peer_lag {
+            let peer_id = peer.0.to_string();
+            e.sample(
+                "retcd_raft_peer_lag",
+                &[("node_id", node_id.as_str()), ("peer_id", &peer_id)],
+                *lag as f64,
+            );
+        }
+
+        e.metric(
+            "retcd_cluster_revision",
+            "gauge",
+            "public cluster revision applied here (ADR-0005), not a log index",
+        );
+        e.sample(
+            "retcd_cluster_revision",
+            &node,
+            self.node.cluster_revision as f64,
+        );
+
+        // ---- latencies ----
+        for (op, hist) in &self.proposal_latency {
+            render_histogram(
+                &mut e,
+                "retcd_proposal_latency_seconds",
+                "client write submit-to-commit latency",
+                &[("node_id", node_id.as_str()), ("op", op)],
+                hist,
+            );
+        }
+        render_histogram(
+            &mut e,
+            "retcd_linearizable_read_latency_seconds",
+            "linearizable read barrier latency (ADR-0009)",
+            &node,
+            &self.read_latency,
+        );
+
+        // ---- storage (ADR-0022) ----
+        if let Some(s) = &self.storage {
+            e.metric(
+                "retcd_rocks_mem_bytes",
+                "gauge",
+                "RocksDB memory in bytes; cf=\"all\" until per-family properties are read",
+            );
+            e.sample(
+                "retcd_rocks_mem_bytes",
+                &[
+                    ("node_id", node_id.as_str()),
+                    ("cf", "all"),
+                    ("kind", "memtable"),
+                ],
+                s.rocks_memtable_bytes as f64,
+            );
+            e.sample(
+                "retcd_rocks_mem_bytes",
+                &[
+                    ("node_id", node_id.as_str()),
+                    ("cf", "all"),
+                    ("kind", "table_readers"),
+                ],
+                s.rocks_table_readers_bytes as f64,
+            );
+
+            e.metric(
+                "retcd_rocks_level0_files",
+                "gauge",
+                "files at level 0, the number that precedes a write stall",
+            );
+            e.sample(
+                "retcd_rocks_level0_files",
+                &node,
+                s.rocks_level0_files as f64,
+            );
+
+            e.metric(
+                "retcd_rocks_write_stopped",
+                "gauge",
+                "1 while RocksDB is stopping writes",
+            );
+            e.sample(
+                "retcd_rocks_write_stopped",
+                &node,
+                s.rocks_write_stopped as f64,
+            );
+
+            e.metric(
+                "retcd_snapshot_age_seconds",
+                "gauge",
+                "age of the current published snapshot",
+            );
+            e.sample(
+                "retcd_snapshot_age_seconds",
+                &node,
+                s.snapshot_age_ms as f64 / 1000.0,
+            );
+
+            e.metric(
+                "retcd_snapshot_bytes",
+                "gauge",
+                "size of the current published snapshot",
+            );
+            e.sample("retcd_snapshot_bytes", &node, s.snapshot_size_bytes as f64);
+
+            e.metric(
+                "retcd_snapshot_build_duration_seconds",
+                "gauge",
+                "duration of the most recent successful snapshot build",
+            );
+            e.sample(
+                "retcd_snapshot_build_duration_seconds",
+                &node,
+                s.snapshot_build_duration_ms as f64 / 1000.0,
+            );
+
+            e.metric(
+                "retcd_snapshot_builds_total",
+                "counter",
+                "snapshot builds that returned successfully",
+            );
+            e.sample(
+                "retcd_snapshot_builds_total",
+                &node,
+                s.snapshot_builds as f64,
+            );
+
+            e.metric(
+                "retcd_snapshot_builds_in_flight",
+                "gauge",
+                "builds started and not yet published or failed; stuck above zero means wedged",
+            );
+            e.sample(
+                "retcd_snapshot_builds_in_flight",
+                &node,
+                s.snapshot_builds_in_flight as f64,
+            );
+
+            e.metric(
+                "retcd_snapshot_installs_total",
+                "counter",
+                "snapshots received from a leader, by outcome",
+            );
+            for (outcome, value) in [
+                ("success", s.snapshot_installs),
+                ("validation_failed", s.snapshot_install_failures),
+                ("crash_recovered", s.snapshot_install_redos),
+            ] {
+                e.sample(
+                    "retcd_snapshot_installs_total",
+                    &[("node_id", node_id.as_str()), ("outcome", outcome)],
+                    value as f64,
+                );
+            }
+
+            e.metric(
+                "retcd_log_purges_total",
+                "counter",
+                "log purge calls, by outcome (ADR-0022)",
+            );
+            for (outcome, value) in [
+                ("purged", s.purges),
+                ("deferred", s.purge_deferrals),
+                ("refused", s.purge_refusals),
+            ] {
+                e.sample(
+                    "retcd_log_purges_total",
+                    &[("node_id", node_id.as_str()), ("outcome", outcome)],
+                    value as f64,
+                );
+            }
+        }
+
+        if let Some(free) = self.disk_free_bytes {
+            e.metric(
+                "retcd_rocks_disk_free_bytes",
+                "gauge",
+                "free bytes on the data directory's volume",
+            );
+            e.sample("retcd_rocks_disk_free_bytes", &node, free as f64);
+        }
+
+        // ---- watches (ADR-0020) ----
+        e.metric(
+            "retcd_watch_streams",
+            "gauge",
+            "watch streams currently registered",
+        );
+        e.sample("retcd_watch_streams", &node, self.watch.streams_open as f64);
+
+        e.metric(
+            "retcd_watch_queued_bytes_max",
+            "gauge",
+            "largest per-stream queued byte budget observed since start",
+        );
+        e.sample(
+            "retcd_watch_queued_bytes_max",
+            &node,
+            self.watch.queue_bytes_max as f64,
+        );
+
+        e.metric(
+            "retcd_watch_terminations_total",
+            "counter",
+            "watch streams terminated, by ADR-0020 reason",
+        );
+        for (reason, count) in &self.watch.terminated_by_reason {
+            e.sample(
+                "retcd_watch_terminations_total",
+                &[("node_id", node_id.as_str()), ("reason", reason.as_str())],
+                *count as f64,
+            );
+        }
+
+        e.metric(
+            "retcd_compactions_total",
+            "counter",
+            "replicated compactions applied here (ADR-0019)",
+        );
+        e.sample("retcd_compactions_total", &node, self.compactions as f64);
+
+        // ---- dedup (ADR-0025) ----
+        e.metric(
+            "retcd_dedup_hits_total",
+            "counter",
+            "mutations answered from a retained deduplication record",
+        );
+        e.sample("retcd_dedup_hits_total", &node, self.dedup.hits as f64);
+
+        e.metric(
+            "retcd_dedup_records",
+            "gauge",
+            "deduplication records currently retained",
+        );
+        e.sample("retcd_dedup_records", &node, self.dedup.records as f64);
+
+        e.metric(
+            "retcd_dedup_max_records",
+            "gauge",
+            "configured global cap; at it, writes still apply but are not recorded",
+        );
+        e.sample(
+            "retcd_dedup_max_records",
+            &node,
+            self.dedup.max_records as f64,
+        );
+
+        // Two reasons, and both are records that were actually dropped (C5B-04). `global_cap`
+        // used to be reported here from the trim counter, which made every compaction look
+        // like cap pressure; the cap's real event is a *refusal*, exported below.
+        e.metric(
+            "retcd_dedup_evictions_total",
+            "counter",
+            "deduplication records dropped, by reason",
+        );
+        for (reason, value) in [
+            ("window", self.dedup.window_evictions),
+            ("trim", self.dedup.trim_evictions),
+        ] {
+            e.sample(
+                "retcd_dedup_evictions_total",
+                &[("node_id", node_id.as_str()), ("reason", reason)],
+                value as f64,
+            );
+        }
+
+        e.metric(
+            "retcd_dedup_cap_refusals_total",
+            "counter",
+            "mutations applied whose outcome the global record cap refused to retain; \
+             a resubmission of one of these will apply a second time",
+        );
+        e.sample(
+            "retcd_dedup_cap_refusals_total",
+            &node,
+            self.dedup.cap_refusals as f64,
+        );
+
+        // ---- gossip, authn/authz, certificates, backups ----
+        e.metric(
+            "retcd_gossip_reachable",
+            "gauge",
+            "1 when the advisory gossip source last saw this peer as reachable (ADR-0003)",
+        );
+        for (peer, reachable) in &self.gossip_reachable {
+            let peer_id = peer.0.to_string();
+            e.sample(
+                "retcd_gossip_reachable",
+                &[("node_id", node_id.as_str()), ("peer_id", &peer_id)],
+                u64::from(*reachable) as f64,
+            );
+        }
+
+        e.metric(
+            "retcd_gossip_endpoint_mismatch_total",
+            "counter",
+            "gossip hints refused because they disagreed with committed membership",
+        );
+        e.sample(
+            "retcd_gossip_endpoint_mismatch_total",
+            &node,
+            self.gossip_endpoint_mismatch as f64,
+        );
+
+        e.metric(
+            "retcd_authn_rejected_total",
+            "counter",
+            "connections whose transport identity could not be established",
+        );
+        // One family, one label, two truthful samples (ADR-0026). The client share is the
+        // remainder rather than its own counter so that the total stays exactly what
+        // `/health` reports: the two can never drift apart by construction.
+        e.sample(
+            "retcd_authn_rejected_total",
+            &[("node_id", node_id.as_str()), ("plane", "client")],
+            self.node
+                .authn_rejected
+                .saturating_sub(self.node.authn_rejected_peer) as f64,
+        );
+        e.sample(
+            "retcd_authn_rejected_total",
+            &[("node_id", node_id.as_str()), ("plane", "peer")],
+            self.node.authn_rejected_peer as f64,
+        );
+
+        e.metric(
+            "retcd_authz_denied_total",
+            "counter",
+            "authorization decisions refused",
+        );
+        e.sample(
+            "retcd_authz_denied_total",
+            &[("node_id", node_id.as_str()), ("plane", "client")],
+            self.node.authz_denied as f64,
+        );
+
+        if !self.cert_expiry_seconds.is_empty() {
+            e.metric(
+                "retcd_cert_expiry_seconds",
+                "gauge",
+                "seconds until the loaded leaf certificate expires; negative once expired",
+            );
+            for (plane, seconds) in &self.cert_expiry_seconds {
+                e.sample(
+                    "retcd_cert_expiry_seconds",
+                    &[("node_id", node_id.as_str()), ("plane", plane)],
+                    *seconds as f64,
+                );
+            }
+        }
+
+        if let Some(age) = self.backup_age_seconds {
+            e.metric(
+                "retcd_backup_age_seconds",
+                "gauge",
+                "age of the most recent successful backup (ADR-0024)",
+            );
+            e.sample("retcd_backup_age_seconds", &node, age as f64);
+        }
+
+        e.out
+    }
+}
+
+/// Emit one histogram: cumulative `le` buckets, `+Inf`, `_sum`, and `_count`.
+fn render_histogram(
+    e: &mut Exposition,
+    name: &'static str,
+    help: &str,
+    labels: &[(&str, &str)],
+    hist: &HistogramSnapshot,
+) {
+    e.metric(name, "histogram", help);
+    let bucket = format!("{name}_bucket");
+    for (i, bound) in LATENCY_BUCKETS_SECONDS.iter().enumerate() {
+        let bound = format!("{bound}");
+        let mut with_le: Vec<(&str, &str)> = labels.to_vec();
+        with_le.push(("le", &bound));
+        e.sample(&bucket, &with_le, hist.cumulative[i] as f64);
+    }
+    let mut with_inf: Vec<(&str, &str)> = labels.to_vec();
+    with_inf.push(("le", "+Inf"));
+    e.sample(&bucket, &with_inf, hist.count as f64);
+    e.sample(&format!("{name}_sum"), labels, hist.sum_seconds);
+    e.sample(&format!("{name}_count"), labels, hist.count as f64);
 }

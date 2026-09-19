@@ -43,7 +43,7 @@
   CAS conflict. Both `NotLeader` and `Conflict` map to `FAILED_PRECONDITION` (§6.2), so the
   client needs a structured marker instead of parsing prose. No key or value bytes travel in
   metadata or status messages.
-- `PeerService.InstallSnapshot` answers `UNIMPLEMENTED` without decoding (ADR-0008: no snapshots).
+- `PeerService.InstallSnapshot` answered `UNIMPLEMENTED` without decoding through M4 (ADR-0008: no snapshots). **From M5 it is served** and wired to `Raft::install_snapshot` (ADR-0022; note 2026-09-18, dev-admin). The reserved-tag pattern stays for other unshipped RPCs.
 - `MtlsConfig.server_domain` optionally names the DNS identity used for peer dialing, because
   committed endpoints are `host:port` while certificates carry names.
 - `GrpcClientOptions.max_hint_follows = 3` means at most three follows, four sends per call.
@@ -233,3 +233,41 @@ certificate is refused on the same `UNAUTHENTICATED` path as a certificate carry
 at all. Nothing about certificates that *do* assert a `retcd://` SAN changes: a node identity,
 a foreign cluster or a URI the grammar rejects is still refused outright, at either setting. The
 peer plane never had a CN fallback and still does not. Covered by M3-88.
+
+## Note (2026-09-18, M6)
+
+M6 adds restart-free credential rotation on both planes this ADR defines: `ReloadTls` (admin RPC)
+plus `tls.watch_files` polling swap server certificate and trusted-root material behind an atomic
+resolver, and the peer plane reloads both its server *and* client credentials since it both
+accepts and dials. Certificate selection moves behind a swappable seam so it works whether tonic's
+own server builder hosts it or a hyper + `tokio-rustls` acceptor feeds tonic's generated `Routes`
+— this ADR's transport surface is unchanged either way. CA rotation is add-new-CA → issue-new-leaf
+→ remove-old-CA, explicitly **not** revocation (no CRL/OCSP); see ADR-0028 for the full decision,
+including the still-unverified memberlist 0.8.5 gossip-keyring question this ADR's peer plane does
+not touch. Nothing about the identity derivation, error mapping, or message-cap arithmetic
+recorded above changes.
+
+## Note (2026-09-18, M4 implementation)
+
+M4 adds the first server-streaming RPC to the client plane, `Watch`, and it fits this ADR's
+existing surface with two additions and no changes:
+
+- **Two new trailers.** `retcd-min-revision` accompanies `OUT_OF_RANGE` (a cursor at or below
+  `compact_revision`) and carries the first revision still retained; `retcd-resumable`
+  accompanies `RESOURCE_EXHAUSTED` and is `true` when the client fell behind and `false` when it
+  hit an admission cap. Both are machine-readable because the two `RESOURCE_EXHAUSTED` cases call
+  for opposite reactions — reconnect at the last delivered revision, or back off — and a client
+  that had to parse the message text would break the first time the wording changed. There is no
+  `retcd-reason` trailer: the status code plus these two values already determine the reaction,
+  and a third spelling of the same fact is a third thing that can disagree.
+- **`OUT_OF_RANGE`.** The status table gains one row, `StatusClass::OutOfRange`, for
+  `ConfigError::RevisionCompacted`. It is not `FAILED_PRECONDITION`: the request was well-formed
+  and the cluster is healthy; the *cursor* names history that no longer exists.
+
+Identity is derived per **stream**, from that connection's certificate, exactly as it is derived
+per request for the unary RPCs — so two streams on one node authorize independently. A terminal
+error may arrive either from the `Watch` call itself or as the stream's last item, because only
+the server knows which side of registration a failure fell on; both shapes decode through the
+same `error_from_status` table, so a caller sees one typed error either way. The message-cap
+arithmetic is unchanged: a watch frame carries one event and is bounded by the same `max_*_bytes`
+caps a `Get` response is.

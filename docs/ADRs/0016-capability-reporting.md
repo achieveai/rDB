@@ -19,3 +19,15 @@
 
 - M1 test asserts `durability=Ephemeral`, `watch_resumption=Unsupported`, `authz=Development`
   for the ephemeral, allow-all node.
+
+## Note (2026-09-18, M6)
+
+Two fields grow a variant, both breaking changes to an existing public enum, made deliberately
+rather than incidentally: `Authz` gains `SignedPolicy { policy_version: Option<u64> }` alongside
+`Development`/`StaticAllowlist` (ADR-0027) — `None` while the node holds no valid signed policy,
+matching this ADR's standing rule that a capability which can lie is worse than none; `Pagination`
+gains `RevisionPinned { max_pinned: u32, ttl_ms: u64 }`, replacing `Unsupported` (ADR-0029). This
+is the first note appended to this ADR; `WatchResumption::Retained` grew the enum at M4
+(ADR-0019/0020) without one being added here. `Dedup` grows to `Bounded { window_requests: u32 }` at M5 (ADR-0025) and is reported only once the
+`dedup` column family exists and the leader enforces the window, per the same standing rule. Recorded here going forward so a capability-enum change is never
+silent.

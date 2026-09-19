@@ -1,0 +1,113 @@
+{
+  "schema": 1,
+  "name": "security-matrix",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "7d524ac3d08fc3a6f9b7f02e67412a4e12ac5887",
+    "dirty": true,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-09-19T09:13:18Z",
+    "duration_ms": 950,
+    "seed": 27958,
+    "scale_factor": 0.3333333333333333,
+    "full_scale": false
+  },
+  "values": {
+    "cases_driven": 7,
+    "cases_enumerated": 12,
+    "membership_unchanged": true,
+    "repeats": 1,
+    "rows": [
+      {
+        "case": "wrong_node_id",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-YGqnDC\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=07070707070707070707070707070707 epoch=1 node=99]",
+        "repeat": 0
+      },
+      {
+        "case": "wrong_cluster_id",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-YGqnDC\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=abababababababababababababababab epoch=1 node=3]",
+        "repeat": 0
+      },
+      {
+        "case": "wrong_cert_identity",
+        "driven": false,
+        "reason": "driven by the M3 peer-plane rows (m3_peer_mtls.rs, m3_client_mtls.rs) against a mutual-TLS cluster; this row records the case rather than duplicating a suite that already owns it",
+        "repeat": 0
+      },
+      {
+        "case": "wrong_destination_binding",
+        "driven": false,
+        "reason": "driven by the M3 peer-plane rows (m3_peer_mtls.rs, m3_client_mtls.rs) against a mutual-TLS cluster; this row records the case rather than duplicating a suite that already owns it",
+        "repeat": 0
+      },
+      {
+        "case": "stale_packets",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "stale hints never reached Raft",
+        "repeat": 0
+      },
+      {
+        "case": "poisoned_endpoint",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "hint ignored; 0 peers before",
+        "repeat": 0
+      },
+      {
+        "case": "duplicate_node_id",
+        "driven": false,
+        "reason": "driven by the M3 peer-plane rows (m3_peer_mtls.rs, m3_client_mtls.rs) against a mutual-TLS cluster; this row records the case rather than duplicating a suite that already owns it",
+        "repeat": 0
+      },
+      {
+        "case": "gossip_key_rotation",
+        "driven": false,
+        "reason": "ADR-0028 rotation lands with dev-rotation in wave 3",
+        "repeat": 0
+      },
+      {
+        "case": "all_seeds_unavailable",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "formed cluster kept leader 1",
+        "repeat": 0
+      },
+      {
+        "case": "version_skew",
+        "driven": false,
+        "reason": "ADR-0030 schema gating lands with dev-compat in wave 2",
+        "repeat": 0
+      },
+      {
+        "case": "false_suspicion",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "suspicion is advisory",
+        "repeat": 0
+      },
+      {
+        "case": "one_way_loss",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "cluster kept serving: true",
+        "repeat": 0
+      }
+    ]
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

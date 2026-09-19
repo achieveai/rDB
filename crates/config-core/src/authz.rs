@@ -8,8 +8,9 @@
 //! authenticated one.
 //!
 //! [`Authorizer`] is deliberately small. M3 ships a static, deployment-managed allowlist that
-//! grants read/write over whole prefixes; the signed, versioned policy lifecycle is M6 scope
-//! and is not anticipated here.
+//! grants read/write over whole prefixes; M6 adds the signed, versioned document in
+//! [`crate::policy`]. Both models share the *matching* rule below — they differ in how the
+//! document is trusted, not in what a grant means.
 
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +156,76 @@ pub trait Authorizer: Send + Sync {
     ///
     /// Must be pure and cheap: it is called on the request path, once per request.
     fn authorize(&self, principal: &Principal, action: Action, key_or_prefix: &[u8]) -> Decision;
+
+    /// The version of the signed document this model is enforcing (M6, ADR-0027).
+    ///
+    /// `None` for every model that carries no version — [`AllowAll`] and [`StaticAllowlist`] —
+    /// which is why it is a defaulted method rather than a new required one: a model without a
+    /// version must report its absence, not a placeholder number. Surfaced in the capability
+    /// report, the health payload and the page token's binding.
+    fn policy_version(&self) -> Option<u64> {
+        None
+    }
+
+    /// The admin set this model itself carries, when it carries one (M6, ADR-0027, M6-40).
+    ///
+    /// `None` means "this model has no opinion", and the deployment's own `[authz] admins` list
+    /// applies — the M3 and M5 behaviour. `Some` means the model is authoritative and the
+    /// configuration file's list must be ignored: otherwise the signature buys nothing, since
+    /// file-write access to the TOML would grant admin without touching a signed artifact.
+    fn admin_set(&self) -> Option<Vec<String>> {
+        None
+    }
+}
+
+/// Whether a principal's identity was actually established by the transport.
+///
+/// Defense in depth for every grant-matching model: a grant names a *verified* identity, so an
+/// unverified [`PrincipalKind::Development`] principal must never match one by name alone, even
+/// if a misconfigured insecure listener sits next to a policy-bearing node.
+pub(crate) fn is_verified_kind(kind: PrincipalKind) -> bool {
+    matches!(
+        kind,
+        PrincipalKind::Certificate | PrincipalKind::Peer | PrincipalKind::Embedded
+    )
+}
+
+/// The refusal for a principal whose identity the transport never verified.
+pub(crate) fn deny_unverified_kind(principal: &Principal) -> Decision {
+    Decision::deny(format!(
+        "principal {:?} has unverified kind {:?}; a grant requires a verified identity",
+        principal.name, principal.kind
+    ))
+}
+
+/// The refusal for a verified principal that no grant covers.
+///
+/// One wording for both authorization models, because an operator reading an audit line should
+/// not have to know which model produced it to read the sentence.
+pub(crate) fn deny_no_grant(principal: &str, action: Action) -> Decision {
+    Decision::deny(format!(
+        "principal {principal:?} has no {action:?} grant containing the requested key or prefix"
+    ))
+}
+
+/// Whether any grant names `principal`, includes `action`, and has a prefix that **contains**
+/// `key_or_prefix`.
+///
+/// Containment rather than overlap is the load-bearing part: allowing a `List` of `/app/`
+/// because it overlaps a grant on `/app/a/` would let the caller enumerate every other tenant's
+/// keys. Shared by [`StaticAllowlist`] and by the signed document's evaluator so the two models
+/// cannot drift on the one rule they must agree about.
+pub(crate) fn grants_allow(
+    grants: &[Grant],
+    principal: &str,
+    action: Action,
+    key_or_prefix: &[u8],
+) -> bool {
+    grants.iter().any(|grant| {
+        grant.principal == principal
+            && grant.access.contains(&action)
+            && key_or_prefix.starts_with(grant.prefix.as_bytes())
+    })
 }
 
 /// An authorizer that permits everything.
@@ -237,30 +308,13 @@ impl StaticAllowlist {
 
 impl Authorizer for StaticAllowlist {
     fn authorize(&self, principal: &Principal, action: Action, key_or_prefix: &[u8]) -> Decision {
-        // Defense in depth: a grant names a *verified* identity. An unverified
-        // `Development` principal must never match a grant by name alone, even if a
-        // misconfigured insecure listener sits next to an allowlist node.
-        if !matches!(
-            principal.kind,
-            PrincipalKind::Certificate | PrincipalKind::Peer | PrincipalKind::Embedded
-        ) {
-            return Decision::deny(format!(
-                "principal {:?} has unverified kind {:?}; static allowlist requires a verified identity",
-                principal.name, principal.kind
-            ));
+        if !is_verified_kind(principal.kind) {
+            return deny_unverified_kind(principal);
         }
-        let allowed = self.policy.grants.iter().any(|grant| {
-            grant.principal == principal.name
-                && grant.access.contains(&action)
-                && key_or_prefix.starts_with(grant.prefix.as_bytes())
-        });
-        if allowed {
+        if grants_allow(&self.policy.grants, &principal.name, action, key_or_prefix) {
             Decision::Allow
         } else {
-            Decision::deny(format!(
-                "principal {:?} has no {:?} grant containing the requested key or prefix",
-                principal.name, action
-            ))
+            deny_no_grant(&principal.name, action)
         }
     }
 }

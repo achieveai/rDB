@@ -49,3 +49,38 @@ survives upgrades, and never depends on serde container ordering or platform det
   each `(key, value, create_revision, mod_revision)` length-prefixed in key order; excludes
   last_applied and membership) ships unconditionally in `config-core`; it is the replay
   determinism oracle. `sha2` is therefore a normal dependency of `config-core`.
+
+## Note (2026-09-18, M4): envelope v2
+
+`Command`'s envelope version moves from `1` to `2` at M4. Variant `Compact { up_to_revision }` is
+added (`op = 3`); `op = 4` is reserved for a later `RetireNode` variant. The fixed-layout,
+no-floats, no-maps discipline above is unchanged; a v1 decoder rejects a `version = 2` entry with
+its existing typed decode error. Full detail, golden bytes, and the on-disk `format_version`
+interaction: ADR-0019, ADR-0021.
+
+### Note (2026-09-18, M4 implementation): the shipped v2 layout
+
+`COMMAND_ENVELOPE_VERSION = 2`. `Command::Compact { up_to_revision: u64 }` is `op = 3`; its
+payload is the bare `u64` little-endian watermark and nothing else. Full encoding, 15 bytes:
+
+```
+52 43 4d 44  02 00  03  <up_to_revision u64 LE>
+```
+
+with `up_to_revision = 7` giving
+`52 43 4d 44 02 00 03 07 00 00 00 00 00 00 00` (golden, `m4_01_compact_envelope_golden_bytes`).
+
+The version field remains `u16` little-endian, as shipped at M0 - the ADR's prose says "version
+byte", but changing the width would be a second, unrelated layout change riding along with this
+one, and `COMMAND_VERSION` had no users outside `config-core` to justify the churn. The constant
+was renamed to `COMMAND_ENVELOPE_VERSION` for clarity.
+
+No-slack decoding is unchanged and is asserted for the new variant: trailing bytes are
+`TrailingBytes`, a short payload is `Truncated { field: "up_to_revision" }`, `op = 0` and `op = 4`
+are both `UnknownOp`, and a v1 envelope is rejected by the v2 decoder exactly as a v2 envelope is
+rejected by a v1 decoder (`m4_02`, `m4_03`, `m4_04`).
+
+`Compact` returns `CommandResponse::Compacted { compact_revision }`, which reports the watermark
+**after** applying - the unchanged one when the entry was a monotonic no-op. `Command::key()`
+returns an empty `Bytes` for it rather than widening the accessor to `Option<&Bytes>`, which
+would have churned five crates for a variant that has no key by construction.

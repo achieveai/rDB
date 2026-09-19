@@ -1,9 +1,9 @@
 // rEtcd client plane (DesignSpec-01 §6.2, ADR-0010).
 //
-// Field numbers are normative and must never be reused. Watch RPCs/messages are
-// deliberately not declared in this release; the spec pre-assigns their tags for a later
-// milestone (M4). The authenticated principal is derived only from mTLS transport identity,
-// never from a field.
+// Field numbers are normative and must never be reused. The Watch RPC and its messages are
+// declared as of M4 (ADR-0020); every tag they use is newly allocated inside newly declared
+// messages, so no existing tag moved and no retired tag was reused. The authenticated
+// principal is derived only from mTLS transport identity, never from a field.
 //
 // Trace context travels in gRPC metadata (ADR-0013):
 //   retcd-trace-id, retcd-parent-span, retcd-request-id
@@ -18,6 +18,13 @@ service ConfigService {
   rpc List(ListRequest) returns (ListResponse);
   rpc Put(PutRequest) returns (MutationResponse);
   rpc Delete(DeleteRequest) returns (MutationResponse);
+  // M4 (spec §11, ADR-0020). Leader-served: a follower answers FAILED_PRECONDITION with the
+  // existing retcd-leader-* metadata rather than opening a stream.
+  //
+  // Terminal statuses beyond the M1-M3 table:
+  //   OUT_OF_RANGE         + retcd-min-revision: `u64`   (the cursor is below compact_revision)
+  //   RESOURCE_EXHAUSTED   + retcd-resumable: true|false (queue/lag = true, admission = false)
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
 }
 
 message Record {
@@ -38,23 +45,60 @@ message ListRequest {
   bytes prefix = 1;
   uint32 max_items = 2;
   uint64 max_bytes = 3;
+  // M6 revision-pinned pagination (ADR-0029). Explicit presence, because absence and
+  // emptiness mean different things here:
+  //
+  //   absent      -> the M0-M3 call, byte-for-byte: no pin, no HMAC, no next_page_token.
+  //   present,  "" -> start a pinned walk; the response carries a cursor if there is more.
+  //   present, set -> continue the walk that cursor came from, at its pinned revision.
+  //
+  // Opting in is what creates a pin, so an existing caller pays nothing for this feature.
+  optional bytes page_token = 4;
 }
 
 message ListResponse {
   repeated Record records = 1;
   uint64 read_revision = 2;
   bool truncated = 3;
+  // Present only on a paginated response that has more to give. The bytes are opaque and
+  // authenticated; a client stores and returns them without interpreting them, and should
+  // treat them as sensitive at rest (they carry the last key of this page).
+  //
+  // Terminal statuses beyond the M1-M5 table:
+  //   FAILED_PRECONDITION + retcd-reason: mac|expired|evicted|node|policy_version|token_version
+  //   INVALID_ARGUMENT    + "prefix_mismatch"  (the prefix changed between pages)
+  //   PERMISSION_DENIED   + "token_principal"  (the token was issued to someone else)
+  optional bytes next_page_token = 4;
+}
+
+// A client-supplied deduplication key (M5, ADR-0025). The principal half is **not** here and
+// cannot be: the leader binds the authenticated identity at propose time, and a principal
+// field on the wire would let one client address another's namespace.
+message DedupKey {
+  // Caller-chosen client namespace: exactly 16 bytes, typically a UUID minted once per client
+  // process. Any other length is INVALID_ARGUMENT.
+  bytes client_id = 1;
+  // Caller-assigned, strictly increasing per (principal, client_id). A resubmission at or
+  // below the retained floor is INVALID_ARGUMENT (request_id_not_monotonic), never a second
+  // application.
+  uint64 request_id = 2;
 }
 
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
   optional uint64 expected_mod_revision = 3;
+  // M5 (ADR-0025). Absent is the M0-M4 contract: nothing is retained and a resubmission
+  // applies again. Present against a node reporting dedup unsupported is applied exactly as
+  // an M4 node would apply it.
+  optional DedupKey dedup = 4;
 }
 
 message DeleteRequest {
   bytes key = 1;
   optional uint64 expected_mod_revision = 2;
+  // M5 (ADR-0025). See PutRequest.dedup.
+  optional DedupKey dedup = 3;
 }
 
 enum MutationOutcome {
@@ -69,4 +113,53 @@ message MutationResponse {
   uint64 revision = 2;
   bool exists = 3;
   uint64 current_mod_revision = 4;
+  // M5 (ADR-0025): true when this response was replayed from a retained deduplication record
+  // rather than produced by a fresh application. The other four fields are then the original
+  // application's, byte for byte - including its revision, which is below the current
+  // cluster revision.
+  bool dedup_hit = 5;
+  // M5 (ADR-0025): true when a deduplication record now retains this outcome, so the caller
+  // may safely resubmit the same request_id inside the window. False when the request carried
+  // no dedup key, when the node has dedup off, and - the case callers must handle - when the
+  // global record cap refused the record: the mutation applied, but a resubmission would
+  // apply a second time. This is the field ADR-0015's bounded-retry exception turns on.
+  bool dedup_recorded = 6;
+}
+
+
+// ---- M4: Watch (ADR-0020) -------------------------------------------------------------
+
+message WatchRequest {
+  bytes prefix = 1;
+  // Deliver events with revision > start_after_revision. 0 means "from the start of retained
+  // history"; it is not the same as "from now".
+  uint64 start_after_revision = 2;
+  // Absent takes the node's configured default. An explicit 0, or a value outside the node's
+  // accepted range, is INVALID_ARGUMENT.
+  optional uint32 progress_interval_ms = 3;
+}
+
+message WatchResponse {
+  oneof body {
+    Event event = 1;
+    Progress progress = 2;
+  }
+}
+
+message Event {
+  uint64 revision = 1;
+  bytes key = 2;
+  oneof change {
+    // `put.mod_revision` always equals `revision`; `put.key` always equals `key`.
+    Record put = 3;
+    Deleted delete = 4;
+  }
+}
+
+// A tombstone carries no value: a delete event must never re-transmit the bytes it removed.
+message Deleted {}
+
+// A cursor advance with no key material at all (spec §11.3).
+message Progress {
+  uint64 revision = 1;
 }

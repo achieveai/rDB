@@ -20,6 +20,7 @@ use config_testkit::cluster::{Cluster, ClusterConfig, NodeStartError, RocksSpec,
 
 fn put_req(k: &str, v: &str) -> PutRequest {
     PutRequest {
+        dedup: None,
         key: Bytes::copy_from_slice(k.as_bytes()),
         value: Bytes::copy_from_slice(v.as_bytes()),
         expected_mod_revision: None,

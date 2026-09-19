@@ -7,15 +7,28 @@
 
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 /// rEtcd node daemon.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "config-server", version, about, long_about = None)]
 pub struct Cli {
+    /// The offline subcommand to run instead of the daemon (M5, TA-47).
+    ///
+    /// Absent means "be a node". Every subcommand is offline by construction: it opens no
+    /// listener, joins no cluster, and never touches a running node's data directory — which
+    /// is how `restore` satisfies spec §14 step 1 ("block ordinary client traffic") without
+    /// any coordination at all, because the process that would serve traffic does not exist.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
     /// Path to the node's TOML configuration file.
-    #[arg(long, value_name = "FILE")]
-    pub config: PathBuf,
+    ///
+    /// Required to run as a node. The `backup` subcommand accepts it as a source of
+    /// `[backup]` key paths; the other two take every input as a flag, so a recovery never
+    /// depends on a configuration file that may itself have been lost.
+    #[arg(long, value_name = "FILE", global = true)]
+    pub config: Option<PathBuf>,
 
     /// Form the cluster from the signed bootstrap manifest, then serve.
     ///
@@ -38,6 +51,19 @@ pub struct Cli {
     /// Run RocksDB without fsync. Capabilities then report `PersistentUnverified` (OQ-15).
     #[arg(long)]
     pub unsafe_no_sync: bool,
+
+    /// Accept a signed policy document whose version is at or below the active one (ADR-0027).
+    ///
+    /// The emergency exit for "the good document is the old one". Version monotonicity is the
+    /// defence against replaying a previously valid, previously signed document, so it cannot
+    /// be lifted from the network, from the policy files, or from the configuration file —
+    /// only by an operator restarting the process with this flag.
+    ///
+    /// **Process-scoped, not one-shot** (OQ-57): while it is set every rollback is permitted
+    /// and each one emits its own audit line. A one-shot flag would stop working halfway
+    /// through a multi-step recovery, which is the worst moment to discover a semantic.
+    #[arg(long)]
+    pub break_glass_policy_rollback: bool,
 
     /// Shut down gracefully as soon as this file exists.
     ///
@@ -62,6 +88,100 @@ pub struct Cli {
     /// Directory for this node's JSONL log file.
     #[arg(long, value_name = "DIR", default_value = "logs")]
     pub log_dir: PathBuf,
+}
+
+/// The offline subcommands (M5, TA-47, ADR-0024).
+///
+/// Their exit codes extend ADR-0018 §5 rather than replacing it: `0` success, `2` any
+/// refusal, `3` a store that could not be opened, `4` an incomplete artifact. `4` exists
+/// because "you pointed me at the wrong directory" and "this artifact is not trustworthy"
+/// call for different operator actions, and an unattended verification script has to tell
+/// them apart without parsing prose.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Command {
+    /// Export a signed backup triple from a **stopped** data directory.
+    Backup {
+        /// The data directory to back up. Must not be in use by a running node.
+        #[arg(long, value_name = "DIR")]
+        data_dir: PathBuf,
+        /// Where the three files are written. Created if it does not exist.
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+        /// Stem the three files share. Defaults to `backup-<unix-millis>`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Ed25519 signing seed, 32 raw bytes. Overrides `[backup] signing_key_file`.
+        #[arg(long, value_name = "FILE")]
+        signing_key: Option<PathBuf>,
+        /// AES-256 key, 32 raw bytes. Overrides `[backup] encryption_key_file`.
+        #[arg(long, value_name = "FILE")]
+        encryption_key: Option<PathBuf>,
+    },
+
+    /// Check a backup triple's signature, format and checksum.
+    VerifyBackup {
+        /// Directory holding the triple.
+        #[arg(long, value_name = "DIR")]
+        from: PathBuf,
+        /// Which triple, when the directory holds more than one.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Ed25519 verifying key, 32 raw bytes. Required: there is no implicit trust store.
+        #[arg(long, value_name = "FILE")]
+        trust_key: Option<PathBuf>,
+        /// AES-256 key, 32 raw bytes. Without it an encrypted artifact's signature is still
+        /// checked, but its checksum cannot be.
+        #[arg(long, value_name = "FILE")]
+        encryption_key: Option<PathBuf>,
+    },
+
+    /// Restore a verified backup into a fresh data directory under a **new** identity.
+    ///
+    /// The new cluster id and the advanced recovery epoch are not conveniences: they are what
+    /// makes spec §19.11 hold structurally. The peer plane already refuses any RPC whose
+    /// cluster id does not match, so once the identity is guaranteed to differ, the old
+    /// cluster and the restored one cannot exchange a single log entry — with no
+    /// restore-specific code path anywhere in the engine.
+    Restore {
+        /// Directory holding the verified backup triple.
+        #[arg(long, value_name = "DIR")]
+        from: PathBuf,
+        /// Which triple, when the directory holds more than one.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The fresh data directory to create. Must not exist, or must be empty.
+        #[arg(long, value_name = "DIR")]
+        data_dir: PathBuf,
+        /// The **new** cluster id, 32 lowercase hex characters. Must differ from the source's.
+        #[arg(long, value_name = "HEX")]
+        cluster_id: String,
+        /// The **new** recovery epoch. Must be strictly greater than the source's.
+        #[arg(long, value_name = "N")]
+        recovery_epoch: u32,
+        /// This node's id in the new cluster.
+        #[arg(long, value_name = "ID")]
+        node_id: u64,
+        /// A fresh ADR-0011 bootstrap manifest for the **new** cluster.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+        /// The bootstrap manifest's detached signature. Defaults to `<manifest>.sig`.
+        ///
+        /// Deviation from TA-47's flag list, which names only `--manifest`: the bootstrap
+        /// manifest is a signed triple (ADR-0011) and restore performs the same verification
+        /// `--form` does, so the other two members have to be nameable. They default to the
+        /// conventional neighbours, so the common case is still one flag.
+        #[arg(long, value_name = "FILE")]
+        manifest_sig: Option<PathBuf>,
+        /// The bootstrap manifest's signing public key. Defaults to `<manifest>.pub`.
+        #[arg(long, value_name = "FILE")]
+        manifest_key: Option<PathBuf>,
+        /// Ed25519 verifying key for the **backup** manifest, 32 raw bytes. Required.
+        #[arg(long, value_name = "FILE")]
+        trust_key: Option<PathBuf>,
+        /// AES-256 key, 32 raw bytes. Required when the backup is encrypted.
+        #[arg(long, value_name = "FILE")]
+        encryption_key: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -122,6 +242,7 @@ mod tests {
         assert!(!cli.allow_insecure_dev);
         assert!(!cli.dev_allow_all);
         assert!(!cli.unsafe_no_sync);
+        assert!(!cli.break_glass_policy_rollback);
         assert!(!cli.form);
         assert!(!cli.capabilities);
     }

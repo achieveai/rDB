@@ -16,20 +16,25 @@
 //!
 //! # Snapshots
 //!
-//! There are none. [`NoSnapshots`] is the `SnapshotBuilder`, `get_current_snapshot` returns
-//! `None`, and `install_snapshot` is an error. This is safe only because the engine runs with
-//! `SnapshotPolicy::Never`, `max_in_snapshot_log_to_keep = u64::MAX` (see
-//! `NodeConfig::openraft_config`) and never triggers a purge, so a follower can always be
-//! caught up from the leader's log.
+//! There are none, and at M5 that became a property the engine has to enforce rather than a
+//! configuration everyone happens to share. [`NoSnapshots`] is the `SnapshotBuilder`,
+//! `get_current_snapshot` returns `None`, and both `begin_receiving_snapshot` and
+//! `install_snapshot` are errors — and OpenRaft treats a `build_snapshot` error as *fatal*
+//! (research §1.5). So `ConfigNode::start` forces [`crate::SnapshotConfig::DISABLED`] for an
+//! ephemeral handle regardless of what the node was configured with: `SnapshotPolicy::Never`
+//! plus `max_in_snapshot_log_to_keep = u64::MAX` means no build is ever requested and no purge
+//! is ever scheduled, so a follower can always be caught up from the leader's log.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use config_core::{ClusterIdentity, CommandResponse, Durability, KvState, Limits};
+use bytes::Bytes;
+use config_core::{
+    ClusterIdentity, CommandResponse, Durability, KvState, Limits, MutationEvent, Record,
+};
 use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, LogState, OptionalSend, RaftLogReader,
@@ -38,7 +43,11 @@ use openraft::{
 use tracing::Span;
 
 use crate::fault::{Boundary, FaultAction, FaultCounters, FaultInjector};
-use crate::reader::StateReader;
+use crate::journal::{
+    compact_target, event_bytes, journal_hash, AppliedBatch, AppliedBatchSink, CompactGuard,
+    JournalStats, NoopSink,
+};
+use crate::reader::{MapPin, PinnedView, StateReader, StorageReadError};
 use crate::trace::TraceRegistry;
 use crate::types::{RaftNode, RaftNodeId, TypeConfig};
 use crate::util::{io_error, key_hex, outcome_name};
@@ -58,12 +67,20 @@ struct SmInner {
     kv: KvState,
     last_applied: Option<LogId<RaftNodeId>>,
     membership: StoredMembership<RaftNodeId, RaftNode>,
+    /// The retained event journal (M4, D4.1), keyed by public revision.
+    ///
+    /// A `BTreeMap` rather than a `Vec`, for the same reason `KvState` uses one: compaction
+    /// deletes a prefix range and every read is an ordered range scan, so key order has to be
+    /// revision order by construction. It is **not** a second semantics — every assertion the
+    /// RocksDB journal answers, this answers identically (test plan M4-11).
+    journal: BTreeMap<u64, MutationEvent>,
 }
 
 struct Shared {
     identity: ClusterIdentity,
     faults: Arc<dyn FaultInjector>,
     counters: Arc<FaultCounters>,
+    sink: Arc<dyn AppliedBatchSink>,
     span: Span,
     traces: Arc<TraceRegistry>,
     poisoned: AtomicBool,
@@ -184,17 +201,22 @@ impl EphemeralStore {
     /// (spec §7.1). `span` is the engine's node span; every trait method runs inside it so
     /// lines emitted from OpenRaft's core task still carry `node_id` and `testMethod`
     /// (ADR-0013).
+    /// `sink` is told about every applied batch, in order, once it is "durable" — which for an
+    /// in-memory store means "visible under the state lock". [`NoopSink`] is the choice for a
+    /// store with nothing watching; see [`EphemeralStore::new_without_sink`].
     pub fn new(
         identity: ClusterIdentity,
         limits: Limits,
         faults: Arc<dyn FaultInjector>,
         span: Span,
+        sink: Arc<dyn AppliedBatchSink>,
     ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 identity,
                 faults,
                 counters: Arc::new(FaultCounters::default()),
+                sink,
                 span,
                 traces: Arc::new(TraceRegistry::new()),
                 poisoned: AtomicBool::new(false),
@@ -204,9 +226,24 @@ impl EphemeralStore {
                     kv: KvState::with_limits(limits),
                     last_applied: None,
                     membership: StoredMembership::default(),
+                    journal: BTreeMap::new(),
                 }),
             }),
         }
+    }
+
+    /// An [`EphemeralStore`] whose applied batches go nowhere ([`NoopSink`]).
+    ///
+    /// For tests and tools that exercise storage without a watch hub. It is a named
+    /// constructor rather than a defaulted argument so "nothing is listening to this store"
+    /// is a decision visible at the call site.
+    pub fn new_without_sink(
+        identity: ClusterIdentity,
+        limits: Limits,
+        faults: Arc<dyn FaultInjector>,
+        span: Span,
+    ) -> Self {
+        Self::new(identity, limits, faults, span, Arc::new(NoopSink))
     }
 
     /// The log store handle to hand to `Raft::new`.
@@ -598,13 +635,24 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
 
             let mut out = Vec::with_capacity(entries.len());
             let mut commands = 0u64;
+            let mut published: Vec<Arc<MutationEvent>> = Vec::new();
+            let mut compacted_to: Option<u64> = None;
+            let mut last_index = 0u64;
+            let applied_revision;
+
+            // Opened before the critical section and closed after the batch is visible, so a
+            // cursor validation either sees the whole deletion or none of it. A guard, not a
+            // matched pair of calls, because every `?` below must still close the bracket.
+            let compact_guard =
+                compact_target(&entries).map(|up_to| CompactGuard::open(&*self.shared.sink, up_to));
             {
-                // One critical section for the whole batch: kv, last_applied and membership
-                // move together, mirroring the M2 atomic `WriteBatch`.
+                // One critical section for the whole batch: kv, the journal, last_applied and
+                // membership move together, mirroring the M2 atomic `WriteBatch`.
                 let mut sm = self.shared.sm();
                 for entry in entries {
                     let log_id = entry.log_id;
                     sm.last_applied = Some(log_id);
+                    last_index = log_id.index;
                     let response = match entry.payload {
                         EntryPayload::Blank => {
                             tracing::debug!(
@@ -639,6 +687,21 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                             commands += 1;
                             let trace_id = self.shared.traces.lookup(&cmd);
                             let response = sm.kv.apply(&cmd);
+                            // The journal moves inside the same critical section as the KV
+                            // change: the durability claim is that the two cannot be observed
+                            // apart, and a lock released between them would allow exactly that.
+                            if let Some(event) = response.event() {
+                                sm.journal.insert(event.revision, event.clone());
+                                published.push(Arc::new(event.clone()));
+                            }
+                            if let CommandResponse::Compacted { compact_revision } = &response {
+                                let watermark = *compact_revision;
+                                // `split_off` keeps the retained suffix and drops the prefix; a
+                                // `retain` would walk the surviving majority of the journal on
+                                // every compaction instead of the part being deleted.
+                                sm.journal = sm.journal.split_off(&watermark.saturating_add(1));
+                                compacted_to = Some(watermark);
+                            }
                             let (outcome, revision) = match &response {
                                 CommandResponse::Mutation { response, .. } => {
                                     (outcome_name(response.outcome), response.revision)
@@ -647,6 +710,12 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                                     ("rejected", sm.kv.cluster_revision())
                                 }
                                 CommandResponse::Noop => ("noop", sm.kv.cluster_revision()),
+                                CommandResponse::Compacted { compact_revision } => {
+                                    ("compacted", *compact_revision)
+                                }
+                                CommandResponse::Retired { .. } => {
+                                    ("retired", sm.kv.cluster_revision())
+                                }
                             };
                             tracing::debug!(
                                 log_index = log_id.index,
@@ -664,6 +733,7 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                     };
                     out.push(response);
                 }
+                applied_revision = sm.kv.cluster_revision();
                 // Inside the critical section, with `last_applied`: an observer that has seen
                 // the applied index move must also see the command that moved it, or a test
                 // that waits on the index and then reads the count races the apply path.
@@ -677,6 +747,28 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
                 ErrorSubject::StateMachine,
                 ErrorVerb::Write,
             )?;
+            // TA-28: the durable-but-unpublished window, named so a test can crash inside it
+            // and prove the events survive to be replayed rather than being lost with the hub.
+            self.shared.boundary(
+                Boundary::AfterStateBatchBeforePublish,
+                ErrorSubject::StateMachine,
+                ErrorVerb::Write,
+            )?;
+            // Once per batch, empty or not: "applied up to R, no matching events" is what
+            // advances an idle stream's progress cursor.
+            self.shared.sink.on_applied(AppliedBatch {
+                applied_revision,
+                last_applied_index: last_index,
+                events: published,
+                compacted_to,
+            });
+            // Closed only after the publish. The effective floor travels in `compacted_to`,
+            // so releasing the gate before `on_applied` would let a registration run between
+            // the release and the publish, read a stale floor, and admit a cursor into a
+            // range whose journal entries this batch has already deleted (C4-09). The cost is
+            // that the fan-out happens inside the bracket; the fan-out is a broadcast send,
+            // which does not block on any consumer.
+            drop(compact_guard);
             Ok(out)
         })
     }
@@ -687,26 +779,26 @@ impl RaftStateMachine<TypeConfig> for EphemeralSm {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<RaftNodeId>> {
-        // A crashed store must not hand OpenRaft a buffer to stream a snapshot into: the
-        // whole point of poisoning is that *every* later call fails, and a store that
-        // accepted a snapshot after a crash would look like it had recovered.
+    ) -> Result<Box<tokio::fs::File>, StorageError<RaftNodeId>> {
+        // There is nowhere to put it. `SnapshotData = tokio::fs::File` means receiving a
+        // snapshot means creating a file, and a store whose entire premise is "no files"
+        // has no directory to create it in and no way to make its contents outlive the
+        // process. Refusing here is honest; inventing a temporary file would let a cluster
+        // configured with snapshots *appear* to replicate to an ephemeral node and then lose
+        // the state at exit (ADR-0016, `Durability::Ephemeral`).
         self.shared.span.clone().in_scope(|| {
-            if self.shared.is_poisoned() {
-                return Err(io_error(
-                    ErrorSubject::Snapshot(None),
-                    ErrorVerb::Write,
-                    "storage is poisoned by an injected crash".to_string(),
-                ));
-            }
-            Ok(Box::new(Cursor::new(Vec::new())))
+            Err(io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                "the ephemeral store cannot receive snapshots (SnapshotPolicy::Never)".to_string(),
+            ))
         })
     }
 
     async fn install_snapshot(
         &mut self,
         _meta: &SnapshotMeta<RaftNodeId, RaftNode>,
-        _snapshot: Box<Cursor<Vec<u8>>>,
+        _snapshot: Box<tokio::fs::File>,
     ) -> Result<(), StorageError<RaftNodeId>> {
         Err(io_error(
             ErrorSubject::Snapshot(None),
@@ -737,10 +829,45 @@ struct EphemeralReader {
     shared: Arc<Shared>,
 }
 
+impl EphemeralReader {
+    /// Refuse every journal read once an injected crash poisoned the store.
+    ///
+    /// An empty or short answer from a poisoned store is indistinguishable from a complete one,
+    /// and a watch that resumed off it would silently skip revisions — exactly the loss the
+    /// journal exists to prevent.
+    fn live(&self) -> Result<(), StorageReadError> {
+        if self.shared.is_poisoned() {
+            return Err(StorageReadError::Poisoned);
+        }
+        Ok(())
+    }
+}
+
+/// The ephemeral store's pinned snapshot: the record map, copied once, behind an `Arc`.
+///
 impl StateReader for EphemeralReader {
     fn with_state(&self, f: &mut dyn FnMut(&KvState)) {
         let sm = self.shared.sm();
         f(&sm.kv);
+    }
+
+    fn pin(&self, at_least_revision: u64) -> Result<Option<PinnedView>, StorageReadError> {
+        self.live()?;
+        let sm = self.shared.sm();
+        let revision = sm.kv.cluster_revision();
+        debug_assert!(
+            revision >= at_least_revision,
+            "applied state never moves backwards"
+        );
+        let records: BTreeMap<Bytes, Record> = sm
+            .kv
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
+        // The map and the revision are read under one lock, so the view cannot observe a
+        // revision that its records do not already reflect.
+        drop(sm);
+        Ok(Some(MapPin::view(revision, records)))
     }
 
     fn last_applied(&self) -> Option<LogId<RaftNodeId>> {
@@ -749,5 +876,58 @@ impl StateReader for EphemeralReader {
 
     fn membership(&self) -> StoredMembership<RaftNodeId, RaftNode> {
         self.shared.sm().membership.clone()
+    }
+
+    fn compact_revision(&self) -> Result<u64, StorageReadError> {
+        self.live()?;
+        Ok(self.shared.sm().kv.compact_revision())
+    }
+
+    fn read_events(
+        &self,
+        from_exclusive: u64,
+        to_inclusive: u64,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<MutationEvent>, StorageReadError> {
+        self.live()?;
+        if from_exclusive >= to_inclusive || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sm = self.shared.sm();
+        // `limit` is applied *after* the prefix filter, so a narrow watch behind a wide batch
+        // still makes progress instead of spending its whole budget on events it discards.
+        Ok(sm
+            .journal
+            .range(from_exclusive.saturating_add(1)..=to_inclusive)
+            .map(|(_, event)| event)
+            .filter(|event| event.key.starts_with(prefix))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn journal_stats(&self) -> Result<JournalStats, StorageReadError> {
+        self.live()?;
+        let sm = self.shared.sm();
+        Ok(JournalStats {
+            oldest_revision: sm.journal.keys().next().copied(),
+            newest_revision: sm.journal.keys().next_back().copied(),
+            count: sm.journal.len() as u64,
+            bytes: sm.journal.values().map(event_bytes).sum(),
+        })
+    }
+
+    fn journal_hash(&self, from_exclusive: u64) -> Result<[u8; 32], StorageReadError> {
+        self.live()?;
+        let sm = self.shared.sm();
+        // Collected because the digest is length-prefixed and `Range` is not `ExactSizeIterator`;
+        // the vector holds borrows, not copies of the events.
+        let retained: Vec<&MutationEvent> = sm
+            .journal
+            .range(from_exclusive.saturating_add(1)..)
+            .map(|(_, event)| event)
+            .collect();
+        Ok(journal_hash(retained.into_iter()))
     }
 }

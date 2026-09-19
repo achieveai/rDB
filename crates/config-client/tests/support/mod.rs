@@ -13,7 +13,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use config_core::{
     Capabilities, ClusterId, ConfigError, ConfigStore, DeleteRequest, GetRequest, GetResponse,
-    Limits, ListRequest, ListResponse, MutationResponse, Principal, PutRequest,
+    Limits, ListRequest, ListResponse, MutationResponse, Principal, PutRequest, WatchItem,
+    WatchRequest, WatchStream,
 };
 use config_grpc::{pb, serve_client_plane, ClientBackend, ServerHandle, TlsMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -94,6 +95,16 @@ impl FakeStore {
 /// against a double that refuses what a node refuses.
 #[async_trait]
 impl ConfigStore for FakeStore {
+    /// Scripted like every other call: the stream carries whatever `answer` would have
+    /// returned, then ends. Enough for the transport rows, which are about *opening* a watch
+    /// and about what the client does with a termination, never about delivery order.
+    async fn watch(&self, _request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.answer().await?;
+        Ok(Box::pin(tokio_stream::iter(Vec::<
+            Result<WatchItem, ConfigError>,
+        >::new())))
+    }
+
     async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
         config_core::validate_get(&request, &Limits::DEFAULT)?;
         self.answer().await.map(|_| GetResponse {
@@ -167,6 +178,9 @@ impl Node {
                 tls,
                 cluster_id,
                 Limits::DEFAULT,
+                // No admin plane on the fake node: these rows exercise the data plane, and a
+                // service nothing calls would only add a way for them to fail.
+                None,
             )
             .expect("serve client plane")
         });
@@ -309,6 +323,23 @@ pub struct SpyService(pub Arc<DeadlineSpy>);
 
 #[tonic::async_trait]
 impl pb::config_service_server::ConfigService for SpyService {
+    type WatchStream =
+        futures_core::stream::BoxStream<'static, Result<pb::WatchResponse, tonic::Status>>;
+
+    async fn watch(
+        &self,
+        request: tonic::Request<pb::WatchRequest>,
+    ) -> Result<tonic::Response<Self::WatchStream>, tonic::Status> {
+        self.0.record(&request);
+        // A watch that opens and immediately ends. The spy exists to observe *headers* — the
+        // deadline the client set, or did not set — so the stream's content is beside the
+        // point and an empty one cannot hang a test.
+        self.0
+            .answer::<Self::WatchStream>()
+            .await
+            .map(|_| tonic::Response::new(Box::pin(tokio_stream::empty()) as Self::WatchStream))
+    }
+
     async fn get(
         &self,
         request: tonic::Request<pb::GetRequest>,

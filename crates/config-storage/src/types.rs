@@ -1,7 +1,5 @@
 //! OpenRaft type configuration shared by every store, the engine, and the transport.
 
-use std::io::Cursor;
-
 use config_core::{Command, CommandResponse};
 use serde::{Deserialize, Serialize};
 
@@ -60,14 +58,22 @@ openraft::declare_raft_types!(
     /// * `R = CommandResponse` — exactly one per applied entry, including `Noop` for blank and
     ///   membership entries.
     /// * `Node = RaftNode` — the committed peer *and* client endpoints of a voter.
-    /// * Snapshots are never built or installed in this release (`SnapshotPolicy::Never`).
+    /// * `SnapshotData = tokio::fs::File` — a snapshot is a *file*, never a buffer.
+    ///
+    /// The last point is a correctness constraint, not a preference (ADR-0022, research trap
+    /// T4). With `Cursor<Vec<u8>>` every build, every transfer and every install materialises
+    /// the entire state machine in memory on both ends at once, so the largest snapshot a
+    /// cluster can move is bounded by the smallest node's spare RAM — and it fails by OOM-ing
+    /// a follower mid-transfer rather than by refusing. `tokio::fs::File` makes the same
+    /// operations stream, at the cost of `begin_receiving_snapshot` having to create the
+    /// receive file before OpenRaft hands it any bytes.
     pub TypeConfig:
         D = Command,
         R = CommandResponse,
         NodeId = RaftNodeId,
         Node = RaftNode,
         Entry = openraft::Entry<TypeConfig>,
-        SnapshotData = Cursor<Vec<u8>>,
+        SnapshotData = tokio::fs::File,
         Responder = openraft::impls::OneshotResponder<TypeConfig>,
         AsyncRuntime = openraft::TokioRuntime,
 );

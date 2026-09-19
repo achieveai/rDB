@@ -390,7 +390,11 @@ async fn m3_46_capabilities_cli_matches_runtime() {
         serde_json::from_str(lines[0]).expect("the capability report is JSON");
 
     // Fields no live channel can re-derive: pinned to the documented unconditional literals.
-    assert_eq!(reported["watch_resumption"], "Unsupported");
+    assert_eq!(
+        reported["watch_resumption"],
+        serde_json::json!({ "Retained": { "compact_revision_visible": true } }),
+        "M4: the daemon serves resumable watches and surfaces its compaction floor"
+    );
     assert_eq!(reported["pagination"], "Unsupported");
     assert_eq!(reported["dedup"], "Unsupported");
 
@@ -635,6 +639,7 @@ async fn m3_73_manifest_is_not_authority_after_formation() {
     let client = cluster_client(&harness, &nodes);
     let before = client
         .put(PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/m3-73/before"),
             value: Bytes::from_static(b"v"),
             expected_mod_revision: None,
@@ -666,6 +671,7 @@ async fn m3_73_manifest_is_not_authority_after_formation() {
     // all three nodes' actual state hash.
     let after = client
         .put(PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/m3-73/after"),
             value: Bytes::from_static(b"v2"),
             expected_mod_revision: None,

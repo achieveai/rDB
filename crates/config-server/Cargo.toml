@@ -16,13 +16,22 @@ config-gossip = { workspace = true }
 config-grpc = { workspace = true }
 config-log = { workspace = true }
 config-storage = { workspace = true }
+aes-gcm = { workspace = true }
 clap = { workspace = true }
 # `pkcs8` is not needed here: the daemon only *verifies* a manifest signature from 32 raw
 # public-key bytes, so the default feature set is enough.
 ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Restore stages an encrypted artifact's *decrypted* snapshot before handing it to the storage
+# layer. That staged copy is the whole state machine in the clear, so it needs a random name,
+# 0600 on Unix, and removal on every exit path — not `temp_dir().join(predictable)`.
+tempfile = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
@@ -32,8 +41,11 @@ tracing-subscriber = { workspace = true }
 bytes = { workspace = true }
 config-client = { workspace = true }
 config-testkit = { workspace = true }
+# Test-only: E2E-21/E2E-22 drive `TrackedWatch` (a `Stream`) directly against a real daemon
+# process, so they need `StreamExt::next` the same way `config-testkit`'s watch tests do.
+futures = { workspace = true }
 # Test-only: M3-66 recomputes the SHA-256 the daemon publishes for its policy document, so the
 # expected digest is derived from the fixture rather than pasted in as a constant that would
 # rot the moment the fixture changed.
 sha2 = { workspace = true }
-tempfile = { workspace = true }
+# `tempfile` is a normal dependency (restore staging); the tests use the same one.

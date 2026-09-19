@@ -26,6 +26,7 @@ const SEED: u64 = 0x5eed_0064;
 
 fn put() -> PutRequest {
     PutRequest {
+        dedup: None,
         key: Bytes::from_static(b"/app/a"),
         value: Bytes::from_static(b"v"),
         expected_mod_revision: None,

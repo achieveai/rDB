@@ -62,7 +62,8 @@ pub fn status_from_reject(reject: &PeerReject) -> Status {
         PeerReject::WrongCluster { .. }
         | PeerReject::WrongEpoch { .. }
         | PeerReject::WrongDestination { .. }
-        | PeerReject::IdentityMismatch(_) => Status::unauthenticated(reject.to_string()),
+        | PeerReject::IdentityMismatch(_)
+        | PeerReject::Retired { .. } => Status::unauthenticated(reject.to_string()),
         PeerReject::NotRunning => Status::unavailable(reject.to_string()),
         PeerReject::Raft(detail) => Status::internal(detail.clone()),
     }
@@ -159,6 +160,25 @@ impl PeerSvc {
         if let Err(status) = self.check_transport_identity(&request, cluster_id, from) {
             return Err(reject("identity_mismatch", status));
         }
+        // The fence, checked **before** the payload is deserialized (M5, ADR-0023, TA-51).
+        // A retired node holds a genuine certificate and builds a consistent envelope, so
+        // nothing above this line turns it away; the point of the check is that it never gets
+        // to hand this process bytes OpenRaft will interpret. The engine re-checks it, for
+        // the in-process transport that has no codec at all.
+        if self.handler.is_retired(from) {
+            span.in_scope(|| {
+                tracing::warn!(
+                    reason = "identity_retired",
+                    node_id = from.0,
+                    rpc = expected,
+                    "peer_identity_rejected"
+                )
+            });
+            return Err(reject(
+                "identity_retired",
+                status_from_reject(&PeerReject::Retired { node_id: from }),
+            ));
+        }
 
         let env = request.into_inner();
         let req: PeerRequest = match postcard::from_bytes(&env.payload) {
@@ -237,16 +257,18 @@ impl PeerService for PeerSvc {
         self.call("vote", request).await
     }
 
-    /// The OpenRaft network trait requires this RPC; this release never triggers a snapshot
-    /// (ADR-0008), so the server answers `UNIMPLEMENTED` without decoding the payload — the
-    /// answer documented in `peer.proto`.
+    /// Served from M5 on (ADR-0022, D5.2).
+    ///
+    /// A learner added to a cluster whose leader has already purged the log it would need
+    /// cannot be caught up by `AppendEntries` at all; the snapshot install is the only path,
+    /// which is why this RPC stopped answering `UNIMPLEMENTED` when snapshots landed. It
+    /// goes through the same [`PeerSvc::call`] as the other two, so a retired or foreign
+    /// sender is refused on exactly the same terms.
     async fn install_snapshot(
         &self,
-        _request: Request<pb::PeerEnvelope>,
+        request: Request<pb::PeerEnvelope>,
     ) -> Result<Response<pb::PeerEnvelope>, Status> {
-        Err(Status::unimplemented(
-            "InstallSnapshot is not served in this release (ADR-0008)",
-        ))
+        self.call("install_snapshot", request).await
     }
 }
 

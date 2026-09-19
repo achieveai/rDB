@@ -298,8 +298,17 @@ async fn m1_grpc_16_unknown_payload_encoding_is_invalid_argument() {
     }
 }
 
+/// M1-GRPC-17, restated by M5: `InstallSnapshot` is **served**, on the same terms as the
+/// other two RPCs.
+///
+/// Until M5 this RPC answered `UNIMPLEMENTED` without decoding anything, because the release
+/// triggered no snapshots (ADR-0008). ADR-0022 made snapshot install the only way to catch up
+/// a learner whose leader has already purged the log it needs, so the claim inverts. The row
+/// asserts it through the refusals rather than by round-tripping a snapshot: what matters
+/// here is that the RPC runs the shared `PeerSvc::call` pipeline — decode, kind check,
+/// identity — and not a shortcut of its own.
 #[retcd_test]
-async fn m1_grpc_17_install_snapshot_is_unimplemented_in_this_release() {
+async fn m1_grpc_17_install_snapshot_is_served_from_m5() {
     let sink = FakeSink::new(cluster(), NodeId(2));
     let (_handle, endpoint) = start_peer_plane(&sink).await;
 
@@ -307,18 +316,34 @@ async fn m1_grpc_17_install_snapshot_is_unimplemented_in_this_release() {
         .await
         .expect("peer plane accepts connections");
 
+    let envelope = |payload: bytes::Bytes| pb::PeerEnvelope {
+        cluster_id: CLUSTER.to_string(),
+        recovery_epoch: 0,
+        from_node_id: 1,
+        to_node_id: 2,
+        payload_encoding: PAYLOAD_ENCODING_POSTCARD,
+        payload,
+    };
+
+    // An undecodable payload is a payload problem now, not an unimplemented method.
     let status = raw
-        .install_snapshot(pb::PeerEnvelope {
-            cluster_id: CLUSTER.to_string(),
-            recovery_epoch: 0,
-            from_node_id: 1,
-            to_node_id: 2,
-            payload_encoding: PAYLOAD_ENCODING_POSTCARD,
-            payload: Default::default(),
-        })
+        .install_snapshot(envelope(Default::default()))
         .await
-        .expect_err("snapshots are never served in this release (ADR-0008)");
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
+        .expect_err("an empty payload is not a snapshot");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    // A *vote* payload on this RPC trips the kind check, which only exists downstream of
+    // decoding — so reaching it proves the envelope was decoded rather than short-circuited.
+    let status = raw
+        .install_snapshot(envelope(postcard::to_allocvec(&vote()).unwrap().into()))
+        .await
+        .expect_err("a vote payload on install_snapshot is a protocol error");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+    assert!(
+        sink.seen_metas().is_empty(),
+        "neither refusal should have reached the handler"
+    );
 }
 
 /// ADR-0011: the responder stamps its **own** identity, and the caller checks it.
@@ -417,4 +442,73 @@ async fn m1_grpc_19_an_injected_delay_is_charged_to_the_call_deadline() {
         sink.seen_metas().is_empty(),
         "the call never got past the delay, so the peer never saw it"
     );
+}
+
+/// M5/TA-51: the peer plane refuses a retired sender before it decodes the payload.
+///
+/// The envelope carries bytes that are not a valid postcard `PeerRequest`. A plane that
+/// decoded first would answer `bad_payload_encoding`, which would still look like a refusal
+/// in a log — while having already handed a fenced node's bytes to a deserializer. The whole
+/// value of the fence is that it sits above that line, so this row asserts the *reason*, not
+/// merely that something was refused.
+#[retcd_test]
+async fn m5_grpc_retired_sender_is_refused_before_the_payload_is_decoded() {
+    let sink = FakeSink::new(cluster(), NodeId(2));
+    sink.retire(NodeId(1));
+    let (_handle, endpoint) = start_peer_plane(&sink).await;
+
+    let mut raw = PeerServiceClient::connect(format!("http://{endpoint}"))
+        .await
+        .expect("peer plane accepts connections");
+
+    let status = raw
+        .vote(pb::PeerEnvelope {
+            cluster_id: CLUSTER.to_string(),
+            recovery_epoch: 0,
+            from_node_id: 1,
+            to_node_id: 2,
+            payload_encoding: PAYLOAD_ENCODING_POSTCARD,
+            payload: bytes::Bytes::from_static(b"not a postcard PeerRequest"),
+        })
+        .await
+        .expect_err("a retired sender must be refused");
+
+    // `Unauthenticated`, the same status every other identity refusal carries, and
+    // deliberately not `InvalidArgument`: `GrpcPeerTransport` maps this status to
+    // `TransportError::IdentityRejected`, which OpenRaft treats as unreachable and backs off
+    // from. A retired node must back off — and it must not conclude that its *payload* was the
+    // problem and rebuild it. The `reason` field below is what separates the fence from a PKI
+    // fault for the operator reading the log; the status code is what shapes the sender.
+    assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    assert!(
+        sink.seen_metas().is_empty(),
+        "a retired sender must never reach the handler"
+    );
+
+    let rejected: Vec<_> = support::log_lines(
+        module_path!(),
+        "m5_grpc_retired_sender_is_refused_before_the_payload_is_decoded",
+    )
+    .into_iter()
+    .filter(|v| v.get("@m").and_then(Value::as_str) == Some("peer rpc rejected"))
+    .collect();
+    assert_eq!(
+        rejected.len(),
+        1,
+        "expected one refusal line: {rejected:#?}"
+    );
+    assert_eq!(
+        rejected[0].get("reason").and_then(Value::as_str),
+        Some("identity_retired"),
+        "the refusal must name the fence, not the payload: {:#?}",
+        rejected[0]
+    );
+
+    // And a sender that was never retired still gets through the same plane, so the row is
+    // about the fence rather than about the plane being broken.
+    let transport = GrpcPeerTransport::new(TlsMode::Insecure, NetFault::new(), Limits::DEFAULT);
+    transport
+        .send(meta(cluster(), 4, 2), &endpoint, vote(), DEADLINE)
+        .await
+        .expect("an un-retired sender round trips");
 }

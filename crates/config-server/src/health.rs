@@ -1,9 +1,13 @@
 //! The loopback health endpoint (OQ-16, ADR-0018 §2).
 //!
-//! `GET /health` returns [`config_engine::HealthPayload`] as JSON, plus nothing else. The
-//! payload is ids, counts, revisions, enums and a digest — no keys and no values — which is
-//! why it can be served without authentication (§15.2). It is still bound to loopback only;
-//! the address is rejected at configuration time otherwise.
+//! `GET /health` returns [`config_engine::HealthPayload`] as JSON; `GET /metrics` returns the
+//! ADR-0026 Prometheus exposition. Both payloads are ids, counts, revisions, enums and digests
+//! — no keys and no values — which is why neither needs authentication (§15.2). Both are still
+//! bound to loopback only; the address is rejected at configuration time otherwise.
+//!
+//! `/metrics` shares this listener rather than opening its own port: a second listener is a
+//! second thing to bind, firewall and get wrong for one text route, and a deployment that
+//! wants off-box scraping fronts this one with its own proxy (ADR-0026).
 //!
 //! # Why HTTP is written by hand
 //!
@@ -26,7 +30,17 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 ///
 /// Returns when the shutdown signal fires; in-flight responses are already written by then,
 /// because each connection is answered and closed in one short task.
-pub async fn serve(listener: TcpListener, node: ConfigNode, shutdown: Arc<tokio::sync::Notify>) {
+///
+/// `metrics_enabled` switches `GET /metrics` off at the route: the path then 404s exactly
+/// like any other unknown path, so a scraper sees a missing endpoint rather than an endpoint
+/// that answers with nothing - the difference between "not exported here" and "exported and
+/// idle".
+pub async fn serve(
+    listener: TcpListener,
+    node: ConfigNode,
+    shutdown: Arc<tokio::sync::Notify>,
+    metrics_enabled: bool,
+) {
     loop {
         let accepted = tokio::select! {
             biased;
@@ -37,7 +51,7 @@ pub async fn serve(listener: TcpListener, node: ConfigNode, shutdown: Arc<tokio:
             Ok((stream, _peer)) => {
                 let node = node.clone();
                 tokio::spawn(config_log::testing::in_current_span(async move {
-                    if let Err(e) = handle(stream, node).await {
+                    if let Err(e) = handle(stream, node, metrics_enabled).await {
                         tracing::debug!(error = %e, "health connection ended early");
                     }
                 }));
@@ -52,7 +66,11 @@ pub async fn serve(listener: TcpListener, node: ConfigNode, shutdown: Arc<tokio:
     }
 }
 
-async fn handle(mut stream: TcpStream, node: ConfigNode) -> std::io::Result<()> {
+async fn handle(
+    mut stream: TcpStream,
+    node: ConfigNode,
+    metrics_enabled: bool,
+) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     // Read until the end of the request head; a health probe sends no body.
@@ -83,6 +101,11 @@ async fn handle(mut stream: TcpStream, node: ConfigNode) -> std::io::Result<()> 
                 http_response(500, "Internal Server Error", "text/plain", b"error")
             }
         }
+    } else if method == "GET" && path == "/metrics" && metrics_enabled {
+        let body = node.metrics_report().await.render_prometheus().into_bytes();
+        // The version parameter is not decoration: a scraper uses it to pick its parser, and
+        // omitting it makes some scrapers fall back to a format this is not.
+        http_response(200, "OK", "text/plain; version=0.0.4; charset=utf-8", &body)
     } else {
         http_response(404, "Not Found", "text/plain", b"not found")
     };

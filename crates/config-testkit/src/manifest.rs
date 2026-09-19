@@ -55,6 +55,13 @@ pub struct Voter {
     pub peer: String,
     /// Client-plane endpoint (`host:port`) a leader hint may name.
     pub client: String,
+    /// `"voter"` (the default) or `"learner"` (ADR-0023, M5).
+    ///
+    /// `None` writes no `role` key at all, which is what keeps every M0–M3 manifest fixture
+    /// byte-identical to what it was before the field existed — and `role` absent is exactly
+    /// what the daemon reads as `"voter"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 impl Voter {
@@ -64,7 +71,18 @@ impl Voter {
             node_id: node_id.0,
             peer: peer.into(),
             client: client.into(),
+            role: None,
         }
+    }
+
+    /// The same entry with `role = "learner"`.
+    ///
+    /// A learner-role entry says what a node *may become*, never what it is: only a committed
+    /// Raft entry changes membership (ADR-0023), so a node holding one waits idle until an
+    /// operator calls `AddLearner` against the leader.
+    pub fn as_learner(mut self) -> Self {
+        self.role = Some("learner".to_string());
+        self
     }
 
     /// This voter's id.

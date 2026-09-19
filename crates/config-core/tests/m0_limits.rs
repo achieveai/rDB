@@ -8,8 +8,8 @@ mod common;
 
 use common::{b, put_req};
 use config_core::{
-    Command, CommandResponse, DeleteRequest, KvState, Limits, MutationOutcome, PutRequest,
-    StatusClass,
+    Command, CommandResponse, DedupLimits, DeleteRequest, KvState, Limits, MutationOutcome,
+    PutRequest, StatusClass, WatchLimits,
 };
 
 #[config_log::retcd_test]
@@ -56,8 +56,9 @@ fn m0_36_request_cap_boundary() {
         max_value_bytes: 4 * 1024 * 1024,
         ..Limits::DEFAULT
     };
-    // A Put envelope is 24 bytes of framing plus key and value.
-    let value_len = 2 * 1024 * 1024 - 24 - 1;
+    // A Put envelope is 25 bytes of framing (24 through M4, plus M5's one-byte `has_dedup`
+    // flag, which is the whole group when no dedup key is attached) plus key and value.
+    let value_len = 2 * 1024 * 1024 - 25 - 1;
 
     let at_cap = put_req(b"k", &vec![0u8; value_len]);
     let over_cap = put_req(b"k", &vec![0u8; value_len + 1]);
@@ -83,6 +84,7 @@ fn m0_37_empty_key_rejected() {
         &DeleteRequest {
             key: b(b""),
             expected_mod_revision: None,
+            dedup: None,
         },
         &limits,
     )
@@ -101,6 +103,7 @@ fn m0_38_empty_value_allowed() {
         key: b(b"k"),
         value: b(b""),
         expected_mod_revision: None,
+        dedup: None,
     };
     assert!(config_core::validate_put(&req, &limits).is_ok());
 
@@ -132,6 +135,7 @@ fn m0_39_oversize_reaching_apply_is_rejected() {
         key: b(b"k"),
         value: b(&[0u8; 64]),
         expected_mod_revision: None,
+        dedup: None,
     };
     let response = state.apply(&Command::decode(&oversize.encode()).expect("well-formed envelope"));
 
@@ -159,6 +163,8 @@ fn m0_71_default_limits_match_spec() {
             max_request_bytes: 2_097_152,
             max_list_items: 1000,
             max_list_bytes: 8_388_608,
+            dedup: DedupLimits::DISABLED,
+            watch: WatchLimits::DEFAULT,
         }
     );
 }

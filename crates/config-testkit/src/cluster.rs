@@ -48,20 +48,22 @@ use std::time::Duration;
 use config_core::{
     AllowAll, Authorizer, Capabilities, ClusterId, ClusterIdentity, ConfigStore, Durability,
     GossipObservationSource, Limits, Liveness, NodeId, ObservedPeerHint, Principal, RecoveryEpoch,
-    StaticAllowlist,
+    StaticAllowlist, WatchRequest, WatchRetention,
 };
+use config_engine::watch::testing::GateHandle;
 use config_engine::{
-    ConfigNode, FormationPlan, HealthPayload, NetFault, NodeConfig, NodeMetrics, NodeRole,
-    RaftTimers, StorageHandle,
+    ConfigNode, FormationPlan, HealthPayload, JournalView, ManualClock, NetFault, NodeConfig,
+    NodeMetrics, NodeRole, RaftTimers, StorageHandle, TrackedWatch, WatchHub, WatchStats,
 };
 use config_gossip::{GossipConfig, GossipNode};
 use config_grpc::peer_plane::PeerIdentity;
 use config_grpc::{
-    serve_client_plane, serve_peer_plane, ClientBackend, GrpcPeerTransport, ServerHandle, TlsMode,
+    admin_service, serve_client_plane, serve_peer_plane, AdminAllowlist, AdminBackend,
+    BackupArtifact, ClientBackend, GrpcPeerTransport, ServerHandle, TlsMode,
 };
 use config_storage::{
     EphemeralStore, FaultCounters, FaultInjector, NoFaults, RocksOptions, RocksStore,
-    StorageOpenError,
+    SnapshotConfig, StorageOpenError,
 };
 use tokio::net::TcpListener;
 
@@ -314,6 +316,48 @@ pub struct ClusterConfig {
     pub write_timeout: Duration,
     /// How often each node polls its gossip source.
     pub gossip_poll: Duration,
+    /// Journal retention ceilings the leader compacts against (M4, ADR-0019).
+    ///
+    /// The default is *no* automatic compaction: a row that wants one sets a ceiling or calls
+    /// [`Cluster::compact_now`], and every other row is spared a background task that could
+    /// delete the history it is asserting on.
+    pub retention: WatchRetention,
+    /// Default progress-frame interval for streams that do not ask for one.
+    pub watch_progress_interval: Duration,
+    /// The clock the leader's retention task reads (M4, test plan TA-36).
+    ///
+    /// A [`ManualClock`] by default, so an age-based row advances time explicitly instead of
+    /// sleeping — and so no row can compact because a test machine was slow (anti-flake rule
+    /// 3). Reachable as [`Cluster::leader_clock`].
+    pub clock: Arc<ManualClock>,
+    /// Principal names permitted on the admin plane (`[authz] admins`, M5, ADR-0023, OQ-43).
+    ///
+    /// Empty by default, which is exactly what an absent configuration key means to
+    /// [`AdminAllowlist`]: **no** principal may call the admin surface. The service itself is
+    /// always mounted, as `config-server` mounts it, so a row can assert the closed default
+    /// rather than an absent endpoint.
+    pub admins: BTreeSet<String>,
+    /// When a snapshot is built, how much snapshot-covered log survives it, and how many
+    /// snapshot files are kept (M5, ADR-0022).
+    ///
+    /// [`SnapshotConfig::DISABLED`] by default, so no row pays for a background build it did
+    /// not ask for, and so every existing caller keeps the `SnapshotPolicy::Never` behaviour
+    /// it was written against. `NodeConfig::effective_snapshot` forces `DISABLED` on an
+    /// ephemeral store regardless, so setting this on a non-Rocks cluster is inert, not fatal.
+    pub snapshot: SnapshotConfig,
+    /// How far behind the leader a learner may still be and still be promotable (M5,
+    /// ADR-0023, `[membership] promote_max_lag`).
+    pub promote_max_lag: u64,
+    /// Data directories supplied by the caller, overriding `<data_root>/node-{id}`.
+    ///
+    /// The seam a row needs when a node must open a directory that already holds a store
+    /// somebody else wrote — above all a directory produced by
+    /// `config_storage::restore_into_fresh_store` standing up as a genesis member (M5-92,
+    /// OQ-45). The directory's lifetime belongs to the caller, so it is **not** deleted with
+    /// the cluster; use a `tempfile::TempDir` held for the length of the test.
+    ///
+    /// Only meaningful for a persistent [`StorageKind`].
+    pub data_dirs: BTreeMap<NodeId, PathBuf>,
 }
 
 impl std::fmt::Debug for ClusterConfig {
@@ -328,6 +372,7 @@ impl std::fmt::Debug for ClusterConfig {
             .field("authz", &self.authz)
             .field("cluster_id", &self.cluster_id)
             .field("faulty_nodes", &self.faults.keys().collect::<Vec<_>>())
+            .field("retention", &self.retention)
             .finish()
     }
 }
@@ -352,6 +397,20 @@ impl Default for ClusterConfig {
             read_timeout: Duration::from_secs(2),
             write_timeout: Duration::from_secs(2),
             gossip_poll: Duration::from_millis(100),
+            // Every ceiling off: the journal grows for the length of a test and nothing
+            // deletes an event a row has not finished asserting on.
+            retention: WatchRetention {
+                max_age: Duration::ZERO,
+                max_revisions: 0,
+                max_bytes: 0,
+                check_interval: Duration::from_millis(50),
+            },
+            watch_progress_interval: config_engine::DEFAULT_PROGRESS_INTERVAL,
+            clock: Arc::new(ManualClock::new()),
+            admins: BTreeSet::new(),
+            snapshot: SnapshotConfig::DISABLED,
+            promote_max_lag: config_engine::DEFAULT_PROMOTE_MAX_LAG,
+            data_dirs: BTreeMap::new(),
         }
     }
 }
@@ -462,6 +521,59 @@ impl ClusterBuilder {
     pub fn timeouts(mut self, read: Duration, write: Duration) -> Self {
         self.cfg.read_timeout = read;
         self.cfg.write_timeout = write;
+        self
+    }
+
+    /// Journal retention ceilings the leader's compaction task compacts against (M4, TA-32).
+    ///
+    /// The default is every ceiling off (see [`ClusterConfig::default`]'s doc comment), so a
+    /// row only needs this when it is specifically testing age/count/byte-driven compaction
+    /// (M4-33..M4-36) — every other row is spared a background task that could delete history
+    /// it has not finished asserting on.
+    pub fn retention(mut self, retention: WatchRetention) -> Self {
+        self.cfg.retention = retention;
+        self
+    }
+
+    /// The clock the leader's retention task reads for age-based compaction (M4, TA-33).
+    ///
+    /// Defaults to a fresh [`ManualClock`] reading zero. A row that wants to *share* a clock
+    /// across two separately-built clusters (uncommon) passes its own; the ordinary case is
+    /// just reading it back with [`Cluster::leader_clock`] after `start()`.
+    pub fn leader_clock(mut self, clock: ManualClock) -> Self {
+        self.cfg.clock = Arc::new(clock);
+        self
+    }
+
+    /// The principals permitted on the admin plane (M5-49..M5-53, ADR-0023).
+    ///
+    /// Replaces the set rather than adding to it, so a row states the whole allowlist in one
+    /// place. Leaving it unset keeps the closed default: every admin call is denied.
+    pub fn admins<S: Into<String>>(mut self, names: impl IntoIterator<Item = S>) -> Self {
+        self.cfg.admins = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Enable snapshot building and log purge with an explicit policy (M5, ADR-0022).
+    ///
+    /// Only meaningful on [`StorageKind::ROCKS`]; an ephemeral node forces
+    /// [`SnapshotConfig::DISABLED`] because a failed `build_snapshot` is fatal to OpenRaft.
+    pub fn snapshot(mut self, snapshot: SnapshotConfig) -> Self {
+        self.cfg.snapshot = snapshot;
+        self
+    }
+
+    /// The promotion lag ceiling every node runs with (M5, ADR-0023, A5).
+    pub fn promote_max_lag(mut self, max: u64) -> Self {
+        self.cfg.promote_max_lag = max;
+        self
+    }
+
+    /// Open node `id`'s store in `dir` instead of the harness-allocated `<root>/node-{id}`.
+    ///
+    /// `dir` is the caller's to create, populate and delete — see [`ClusterConfig::data_dirs`].
+    pub fn data_dir(mut self, id: NodeId, dir: impl Into<PathBuf>) -> Self {
+        self.cfg.data_dirs.insert(id, dir.into());
         self
     }
 
@@ -721,6 +833,70 @@ impl ClientBackend for NodeBackend {
     }
 }
 
+/// The same value behind the admin plane (M5, ADR-0023, OQ-43): every method forwards to the
+/// node, so a harness admin call and a `config-server` admin call reach identical code.
+///
+/// The one deliberate difference from the daemon's backend is [`AdminBackend::backup`], which
+/// reports `Unavailable`. Writing a signed backup triple is `config-server`'s
+/// `backup::finish_artifact` — signing keys, manifests, encryption — none of which a
+/// `config-testkit` cluster is configured with, and duplicating it here would give the rows
+/// that matter (`crates/config-server/tests/m5_backup_cli.rs`) a second, weaker oracle. The
+/// refusal is still a *reachable* method, which is what M5-50's "every admin RPC" needs: the
+/// allowlist is consulted before the backend, so a denied call never gets this far.
+#[async_trait::async_trait]
+impl AdminBackend for NodeBackend {
+    fn cluster_id(&self) -> ClusterId {
+        self.node.identity().cluster_id
+    }
+
+    fn membership_report(&self) -> config_engine::MembershipReport {
+        self.node.membership_report()
+    }
+
+    async fn add_learner(
+        &self,
+        node_id: NodeId,
+        peer_endpoint: String,
+        client_endpoint: String,
+    ) -> Result<Option<config_engine::LogIdView>, config_engine::AdminError> {
+        self.node
+            .add_learner(node_id, peer_endpoint, client_endpoint)
+            .await
+    }
+
+    async fn promote_voter(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<config_engine::LogIdView>, config_engine::AdminError> {
+        self.node.promote_voter(node_id).await
+    }
+
+    async fn remove_member(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<config_engine::LogIdView>, config_engine::AdminError> {
+        self.node.remove_member(node_id).await
+    }
+
+    async fn trigger_snapshot(
+        &self,
+    ) -> Result<config_engine::SnapshotTriggered, config_engine::AdminError> {
+        self.node.trigger_snapshot().await
+    }
+
+    async fn backup(
+        &self,
+        _dest_dir: PathBuf,
+        _name: Option<String>,
+    ) -> Result<BackupArtifact, config_engine::AdminError> {
+        Err(config_engine::AdminError::Unavailable {
+            reason: "this harness node has no backup configuration; the backup artifact is \
+                     covered by config-server's own rows"
+                .to_string(),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Cluster
 // ---------------------------------------------------------------------------------------
@@ -734,6 +910,11 @@ pub struct Cluster {
     /// Owns every node's data directory. Dropped last, after `shutdown` has closed the stores,
     /// because Windows will not delete a directory RocksDB still has open (TA-16.3).
     data_root: Option<tempfile::TempDir>,
+    /// Last `compact_revision` observed per node by [`Cluster::assert_journal_invariants`]
+    /// (test plan §3.8): the monotonicity half of that helper's contract needs a baseline from
+    /// a *previous* call, since a single snapshot cannot tell "never regresses" from "just
+    /// compacted for the first time".
+    journal_baseline: Mutex<BTreeMap<NodeId, u64>>,
 }
 
 impl std::fmt::Debug for Cluster {
@@ -743,6 +924,23 @@ impl std::fmt::Debug for Cluster {
             .field("running", &self.running_ids())
             .field("netfault", &self.netfault)
             .finish()
+    }
+}
+
+/// A registered, authorized watch stream whose consumer never polls it (test plan TA-35.3).
+///
+/// Produced by [`Cluster::stalled_stream`]. A real stream through the real queue — opened
+/// exactly like any other watch — just never driven, so it fills its queue/byte budget under
+/// concurrent writes precisely as a genuinely slow client would. Dropping it early is itself a
+/// meaningful action (M4-63's "disconnected consumer"); holding it is what M4-62/M4-64's "apply
+/// never blocks" rows need while they drive a workload.
+pub struct StalledStream {
+    _watch: TrackedWatch,
+}
+
+impl std::fmt::Debug for StalledStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StalledStream").finish_non_exhaustive()
     }
 }
 
@@ -816,9 +1014,14 @@ impl Cluster {
                 .get(&id)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(NoFaults) as Arc<dyn FaultInjector>);
-            let data_dir = data_root
-                .as_ref()
-                .map(|root| root.path().join(format!("node-{}", id.0)));
+            // A caller-supplied directory wins over the harness-allocated one, and wins even
+            // when there is no `data_root` to allocate from — that is the whole point of
+            // handing the harness a directory somebody else wrote (M5-92).
+            let data_dir = cfg.data_dirs.get(&id).cloned().or_else(|| {
+                data_root
+                    .as_ref()
+                    .map(|root| root.path().join(format!("node-{}", id.0)))
+            });
 
             let transport = peer_transport_for(&cfg, id, &netfault);
 
@@ -867,6 +1070,7 @@ impl Cluster {
             netfault,
             gossip,
             data_root,
+            journal_baseline: Mutex::new(BTreeMap::new()),
         };
 
         cluster.configure_gossip().await;
@@ -1333,6 +1537,10 @@ impl Cluster {
             Arc::new(NoFaults),
             tracing::info_span!(parent: span, "reopened_store", node_id = id.0),
             options,
+            // A store opened only to be *inspected* publishes to nothing: this is the
+            // crash-recovery reader, not a running node, and a hub attached here would have no
+            // reader and no authorizer behind it.
+            Arc::new(config_storage::NoopSink),
         )
     }
 
@@ -1413,6 +1621,213 @@ impl Cluster {
             .collect()
     }
 
+    // ------------------------------- watches (M4) -------------------------------
+
+    /// Open a watch on node `id` through its embedded client, as the development principal.
+    ///
+    /// Direct rather than gRPC on purpose: a row that is about the *engine* — a replay
+    /// boundary, an admission limit, a gate interleaving — should fail because the engine is
+    /// wrong, not because a codec is. The gRPC half of the same row uses
+    /// [`Cluster::watch_grpc`], and the conformance suite runs both.
+    pub async fn watch(
+        &self,
+        id: NodeId,
+        request: WatchRequest,
+    ) -> Result<TrackedWatch, config_core::ConfigError> {
+        self.watch_as(id, Principal::development(), request).await
+    }
+
+    /// Open a watch on node `id` as `principal` (test plan M4-103).
+    pub async fn watch_as(
+        &self,
+        id: NodeId,
+        principal: Principal,
+        request: WatchRequest,
+    ) -> Result<TrackedWatch, config_core::ConfigError> {
+        self.node(id)
+            .direct_client(principal)
+            .watch_tracked(request)
+            .await
+    }
+
+    /// Open a watch on node `id` over the wire, as the development principal.
+    ///
+    /// The client is pinned and makes exactly one attempt: a watch never shops for a leader
+    /// (ADR-0015, test plan M4-108), so a row that expects `NotLeader` gets `NotLeader`.
+    pub async fn watch_grpc(
+        &self,
+        id: NodeId,
+        request: WatchRequest,
+    ) -> Result<TrackedWatch, config_core::ConfigError> {
+        self.grpc_client(id).watch_tracked(request).await
+    }
+
+    /// Node `id`'s watch counters.
+    pub fn watch_stats(&self, id: NodeId) -> WatchStats {
+        self.node(id).watch_stats()
+    }
+
+    /// Node `id`'s journal-gate test seam (test plan TA-30).
+    ///
+    /// The one way a row can pin a registration or a compaction at a named point and assert
+    /// what the other one does — without which "registration and compaction are serialized"
+    /// would only ever be tested by racing them and hoping (anti-flake rule 1).
+    pub fn gate(&self, id: NodeId) -> GateHandle {
+        self.node(id).watch_hub().testing()
+    }
+
+    /// What node `id` currently retains, as its retention task sees it.
+    pub fn journal(&self, id: NodeId) -> JournalView {
+        self.node(id).journal_view()
+    }
+
+    /// Node `id`'s compaction floor: the oldest revision a watch may still resume from.
+    pub fn compact_revision(&self, id: NodeId) -> u64 {
+        self.node(id).compact_revision()
+    }
+
+    /// The clock every node's retention task reads.
+    ///
+    /// Shared across the cluster, which is right for a harness: a row that advances it is
+    /// saying "time passed", not "time passed on node 2".
+    pub fn leader_clock(&self) -> Arc<ManualClock> {
+        Arc::clone(&self.cfg.clock)
+    }
+
+    /// Propose a compaction to `up_to` through the normal write path and wait for it to apply.
+    ///
+    /// Goes to the leader, because compaction is a replicated command like any other: a
+    /// follower proposing one would be the split-brain the whole design forbids (ADR-0019).
+    pub async fn compact_now(&self, up_to: u64) -> Result<u64, config_core::ConfigError> {
+        self.compact_now_as(&Principal::development(), up_to).await
+    }
+
+    /// [`Cluster::compact_now`], authorizing as `principal` instead of the insecure
+    /// [`Principal::development`] identity.
+    ///
+    /// Compaction checks `Action::Write` against the empty prefix — "the whole keyspace"
+    /// (`config_engine::node::NodeInner::propose_compact`) — so under a real
+    /// [`AuthzKind::Static`] policy, `Principal::development()` is refused outright (its kind
+    /// is never a verified one, ADR-0012) and even a verified principal needs a grant whose
+    /// prefix is `""`. A row exercising compaction under mTLS/static-authz (e.g. M4-98's watch
+    /// conformance fixture) calls this with such a principal instead.
+    pub async fn compact_now_as(
+        &self,
+        principal: &Principal,
+        up_to: u64,
+    ) -> Result<u64, config_core::ConfigError> {
+        let leader = self.leader().await;
+        self.node(leader).propose_compact(principal, up_to).await
+    }
+
+    /// Register a real, authorized watch on node `id` and hand it back **without ever
+    /// polling it** (test plan TA-35.3).
+    ///
+    /// A row that needs "apply never blocks on a slow watcher" (M4-62..M4-71) holds the
+    /// returned [`StalledStream`] for as long as the queue should keep filling, then either
+    /// drops it (simulating a disconnected consumer, M4-63) or lets the hub terminate it for
+    /// overload and observes that termination through [`Cluster::watch_stats`].
+    ///
+    /// Deliberately `async fn -> Result<..>` rather than the harness sketch's bare
+    /// `fn -> StalledStream` (test plan §6): registration itself is async and fallible (an
+    /// admission or authorization denial must be observable, not panicked past), and a
+    /// "stalled" stream is only interesting once it is actually registered.
+    pub async fn stalled_stream(
+        &self,
+        id: NodeId,
+        principal: Principal,
+        request: WatchRequest,
+    ) -> Result<StalledStream, config_core::ConfigError> {
+        let watch = self.watch_as(id, principal, request).await?;
+        Ok(StalledStream { _watch: watch })
+    }
+
+    /// The shared crash-matrix assertion for every M4 journal fault row (test plan §3.8,
+    /// M4-89..M4-96): every running node's retained journal is contiguous from
+    /// `compact_revision + 1` through its own `cluster_revision`, every node's `journal_hash`
+    /// agrees above the cluster's highest `compact_revision` (TA-31 — below their own
+    /// watermarks, two correct nodes are entitled to differ), and no node's `compact_revision`
+    /// has regressed since the last call on this `Cluster`.
+    ///
+    /// Call after `wait_applied_all`/`wait_converged` so "contiguous" is checked against
+    /// settled state, not a node still catching up.
+    pub fn assert_journal_invariants(&self) {
+        let ids = self.running_ids();
+        assert!(
+            !ids.is_empty(),
+            "assert_journal_invariants: no running nodes to check"
+        );
+
+        let mut baseline = self
+            .journal_baseline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut max_compact = 0u64;
+        for id in &ids {
+            let cr = self.node(*id).compact_revision();
+            if let Some(&prev) = baseline.get(id) {
+                assert!(
+                    cr >= prev,
+                    "node {id}: compact_revision regressed from {prev} to {cr}"
+                );
+            }
+            baseline.insert(*id, cr);
+            max_compact = max_compact.max(cr);
+
+            let stats = self.node(*id).journal_view();
+            if stats.count > 0 {
+                assert_eq!(
+                    stats.oldest_revision,
+                    cr + 1,
+                    "node {id}: retained journal must start at compact_revision+1"
+                );
+                let reader = self.store(*id).reader();
+                let cluster_revision = reader.cluster_revision();
+                assert_eq!(
+                    stats.newest_revision, cluster_revision,
+                    "node {id}: retained journal must run up to cluster_revision"
+                );
+                let events = reader
+                    .read_events(cr, cluster_revision, &[], usize::MAX)
+                    .unwrap_or_else(|e| panic!("node {id}: read_events for invariant check: {e}"));
+                assert_eq!(
+                    events.len() as u64,
+                    stats.count,
+                    "node {id}: journal_stats().count disagrees with read_events' own count"
+                );
+                let mut prev_rev = cr;
+                for ev in &events {
+                    assert!(
+                        ev.revision > prev_rev,
+                        "node {id}: journal revisions must be strictly ascending with no gap"
+                    );
+                    prev_rev = ev.revision;
+                }
+                assert_eq!(
+                    prev_rev, cluster_revision,
+                    "node {id}: retained journal has a gap before cluster_revision"
+                );
+            }
+        }
+        drop(baseline);
+
+        let hashes: Vec<(NodeId, [u8; 32])> = ids
+            .iter()
+            .map(|id| (*id, self.node(*id).journal_hash(max_compact)))
+            .collect();
+        if let Some((_, first)) = hashes.first() {
+            for (id, h) in &hashes {
+                assert_eq!(
+                    h, first,
+                    "node {id}: journal_hash above the shared compact_revision floor \
+                     ({max_compact}) disagrees with node {}",
+                    hashes[0].0
+                );
+            }
+        }
+    }
+
     // ------------------------------- clients -------------------------------
 
     /// A [`ConfigStore`] over node `id`'s embedded client, authorized as the development
@@ -1481,6 +1896,23 @@ impl Cluster {
     pub fn grpc_client_multi_tls(&self, principal_name: &str) -> config_client::GrpcClient {
         self.try_grpc_client_multi_tls(principal_name)
             .expect("a TLS client over the cluster's own client endpoints")
+    }
+
+    /// An admin-plane client over node `id`'s client listener, presenting `principal_name`'s
+    /// certificate (test plan TA-45).
+    ///
+    /// The admin service shares the client-plane listener and its certificate profile (OQ-43),
+    /// so this is deliberately the *same* connection an ordinary data client would make — the
+    /// only thing separating the two is [`ClusterConfig::admins`]. Panics on an insecure
+    /// cluster, like every other `*_tls` constructor here.
+    pub fn admin(&self, id: NodeId, principal_name: &str) -> config_client::AdminClient {
+        config_client::AdminClient::new(self.grpc_client_tls(id, principal_name))
+    }
+
+    /// [`Cluster::admin`] pointed at whichever node is leader now (TA-45).
+    pub async fn admin_at_leader(&self, principal_name: &str) -> config_client::AdminClient {
+        let leader = self.leader().await;
+        self.admin(leader, principal_name)
     }
 
     /// [`Cluster::grpc_client_multi_tls`], pinned to node `id`.
@@ -1824,6 +2256,101 @@ impl Cluster {
         )
     }
 
+    // ------------------------------- provisioning -------------------------------
+
+    /// Add a slot for a **new** node id, bound and configured but not started (test plan
+    /// TA-46).
+    ///
+    /// `data_dir` decides what the node will open on its first
+    /// [`Cluster::try_start_node`]: `None` allocates a fresh directory under the cluster's own
+    /// data root, `Some(dir)` points the new identity at a directory that already exists. The
+    /// second form is what M5-70's "new node id over an old data directory" half needs, and
+    /// the refusal it asserts happens at store open — which is why this deliberately stops
+    /// short of starting the node.
+    ///
+    /// The id is harness-allocated (one past the highest configured id, never reused), so no
+    /// row writes a literal id for a node that did not exist at `start` (anti-flake rule 30).
+    /// Gossip sees the new node only once it starts, exactly like a configured one.
+    async fn provision_slot(&self, data_dir: Option<PathBuf>) -> NodeId {
+        let (peer_listener, peer_addr) = ephemeral_listener().await;
+        let (client_listener, client_addr) = ephemeral_listener().await;
+        // Bound only to reserve the addresses; `try_start_node` rebinds them for real. Holding
+        // them open would make that rebind fail rather than wait.
+        drop(peer_listener);
+        drop(client_listener);
+
+        let mut slots = self.lock();
+        let id = NodeId(slots.keys().last().map_or(1, |last| last.0 + 1));
+        let data_dir = data_dir.or_else(|| {
+            self.data_root
+                .as_ref()
+                .map(|root| root.path().join(format!("node-{}", id.0)))
+        });
+        let span = tracing::info_span!(
+            "cluster_node",
+            node_id = id.0,
+            peer_endpoint = %peer_addr,
+            client_endpoint = %client_addr,
+        );
+        slots.insert(
+            id,
+            NodeSlot {
+                identity: self.cfg.identity(id),
+                peer_addr,
+                client_addr,
+                span,
+                faults: Arc::new(NoFaults) as Arc<dyn FaultInjector>,
+                gossip_source: Arc::new(SharedGossipSource::new()),
+                data_dir,
+                running: None,
+            },
+        );
+        id
+    }
+
+    /// A fresh node id with a fresh data directory, provisioned but not started (TA-46).
+    pub async fn provision(&self) -> NodeId {
+        self.provision_slot(None).await
+    }
+
+    /// A fresh node id pointed at node `from`'s **existing** data directory (TA-46, M5-70).
+    ///
+    /// `from` must be stopped before the new id is started, or the new open meets RocksDB's
+    /// exclusive `LOCK` instead of the identity check the row is about.
+    ///
+    /// Panics if `from` has no directory — an ephemeral cluster has nothing to reuse.
+    pub async fn provision_reusing_dir(&self, from: NodeId) -> NodeId {
+        let dir = {
+            let slots = self.lock();
+            slots
+                .get(&from)
+                .unwrap_or_else(|| panic!("node {from} was never configured"))
+                .data_dir
+                .clone()
+                .unwrap_or_else(|| {
+                    panic!("node {from} has no data directory to reuse; use StorageKind::ROCKS")
+                })
+        };
+        self.provision_slot(Some(dir)).await
+    }
+
+    /// A fresh node id whose directory `seed` gets to write before the node ever opens it
+    /// (TA-46's `provision_v1_dir`, generalized).
+    ///
+    /// The directory is created first and handed to `seed`, which is the only window in which
+    /// a row can put bytes this build would refuse — a legacy-format store above all (M5-71).
+    /// Seeding is the caller's because it needs a raw `rocksdb` handle, which the harness
+    /// library deliberately does not depend on.
+    ///
+    /// Panics if the cluster's storage is not persistent.
+    pub async fn provision_seeded_dir(&self, seed: impl FnOnce(&Path)) -> NodeId {
+        let id = self.provision_slot(None).await;
+        let dir = self.data_dir(id);
+        std::fs::create_dir_all(&dir).expect("the provisioned data directory");
+        seed(&dir);
+        id
+    }
+
     // ------------------------------- lifecycle -------------------------------
 
     /// Stop node `id`: shut down its Raft instance and both of its gRPC servers, so peers see
@@ -2002,6 +2529,13 @@ async fn start_running(
         .to_string();
 
     let store_span = tracing::info_span!(parent: span, "store", node_id = identity.node_id.0);
+    // The hub is the store's `AppliedBatchSink`, so it exists before the store does and long
+    // before the node (ADR-0020). A harness that built it later would have to re-attach it,
+    // and a batch applied in the gap would be invisible to every watcher.
+    let watch = WatchHub::new(
+        cfg.limits.watch,
+        Arc::clone(&cfg.clock) as Arc<dyn config_engine::LeaderClock>,
+    );
     let store: StorageHandle = match (data_dir, cfg.storage.rocks_options(true)) {
         (Some(dir), Some(options)) => open_rocks(
             dir,
@@ -2012,10 +2546,18 @@ async fn start_running(
             options,
             lock_deadline,
             lock_interval,
+            Arc::clone(&watch) as Arc<dyn config_storage::AppliedBatchSink>,
         )
         .await?
         .into(),
-        _ => EphemeralStore::new(identity, cfg.limits, Arc::clone(&faults), store_span).into(),
+        _ => EphemeralStore::new(
+            identity,
+            cfg.limits,
+            Arc::clone(&faults),
+            store_span,
+            Arc::clone(&watch) as Arc<dyn config_storage::AppliedBatchSink>,
+        )
+        .into(),
     };
     let mut node_cfg = NodeConfig::new(identity, peer_endpoint);
     // The client plane listens on its own socket, so a leader hint must name *that* address,
@@ -2027,6 +2569,14 @@ async fn start_running(
     node_cfg.write_timeout = cfg.write_timeout;
     node_cfg.gossip_poll = cfg.gossip_poll;
     node_cfg.transport_security = cfg.tls.transport_security();
+    node_cfg.watch_retention = cfg.retention;
+    node_cfg.watch_progress_interval = cfg.watch_progress_interval;
+    // `with_snapshots` rather than a field assignment: it is the call that enforces the
+    // three-knob latch, and a half-applied policy (build forever, purge never) is silent.
+    node_cfg = node_cfg
+        .with_snapshots(cfg.snapshot)
+        .expect("a valid snapshot policy on the cluster configuration");
+    node_cfg.promote_max_lag = cfg.promote_max_lag;
     let serving = cfg.tls.serving_mode(
         identity.node_id,
         cfg.node_cert_overrides
@@ -2084,7 +2634,15 @@ async fn start_running(
     // `ConfigNode::start` and both `serve_*` calls capture `Span::current()`, so they must be
     // made with the node span entered — otherwise their lines lose `node_id` and `testMethod`.
     let guard = span.enter();
-    let node = ConfigNode::start(node_cfg, store.clone(), transport, gossip, authorizer).await?;
+    let node = ConfigNode::start(
+        node_cfg,
+        store.clone(),
+        transport,
+        gossip,
+        authorizer,
+        watch,
+    )
+    .await?;
 
     let peer_server = serve_peer_plane(
         node.peer_handler(),
@@ -2098,12 +2656,25 @@ async fn start_running(
         cfg.limits,
     )
     .expect("peer plane listening on its bound listener");
+    // One backend value behind both traits, exactly as `config-server` wires it: the admin
+    // plane and the client plane can then never disagree about which node they address.
+    let backend = Arc::new(NodeBackend { node: node.clone() });
+    // Mounted unconditionally, like the daemon's. An empty `admins` set is not "no admin
+    // plane", it is a closed one — the safe reading of an absent key, and a state a row can
+    // assert on only if the service is actually there to refuse.
+    let admin = Some(admin_service(
+        Arc::clone(&backend) as Arc<dyn AdminBackend>,
+        serving.clone(),
+        identity.cluster_id,
+        AdminAllowlist::new(cfg.admins.iter().cloned()),
+    ));
     let client_server = serve_client_plane(
-        Arc::new(NodeBackend { node: node.clone() }) as Arc<dyn ClientBackend>,
+        backend as Arc<dyn ClientBackend>,
         client_listener,
         serving,
         identity.cluster_id,
         cfg.limits,
+        admin,
     )
     .expect("client plane listening on its bound listener");
     drop(guard);
@@ -2177,6 +2748,7 @@ async fn open_rocks(
     options: RocksOptions,
     deadline: Duration,
     interval: Duration,
+    sink: Arc<dyn config_storage::AppliedBatchSink>,
 ) -> Result<RocksStore, StorageOpenError> {
     let attempt = |_: ()| {
         RocksStore::open_with(
@@ -2186,6 +2758,7 @@ async fn open_rocks(
             Arc::clone(&faults),
             span.clone(),
             options,
+            Arc::clone(&sink),
         )
     };
     match attempt(()) {

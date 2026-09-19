@@ -96,7 +96,10 @@ fn reject_to_transport_error(reject: PeerReject) -> TransportError {
         PeerReject::WrongCluster { .. }
         | PeerReject::WrongEpoch { .. }
         | PeerReject::WrongDestination { .. }
-        | PeerReject::IdentityMismatch(_) => TransportError::IdentityRejected(reject.to_string()),
+        | PeerReject::IdentityMismatch(_)
+        // A retired sender is fenced out, not flaky: the sender backs off exactly as it does
+        // for a cluster mismatch, and its log says which (M5, ADR-0023).
+        | PeerReject::Retired { .. } => TransportError::IdentityRejected(reject.to_string()),
         // The peer exists but is not serving: backoff, exactly as for a closed port.
         PeerReject::NotRunning => TransportError::Unreachable(reject.to_string()),
         PeerReject::Raft(_) => TransportError::Remote(reject.to_string()),

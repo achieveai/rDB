@@ -9,6 +9,7 @@ description = "rEtcd gRPC transport: client plane, Raft peer plane, TLS profiles
 config-core = { workspace = true }
 config-engine = { workspace = true }
 config-log = { workspace = true }
+futures-core = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 postcard = { workspace = true }

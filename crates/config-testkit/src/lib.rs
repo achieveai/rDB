@@ -47,6 +47,7 @@
 
 pub mod cluster;
 pub mod conformance;
+pub mod evidence;
 pub mod fs;
 pub mod logs;
 pub mod manifest;

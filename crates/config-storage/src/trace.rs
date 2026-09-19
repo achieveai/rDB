@@ -146,6 +146,7 @@ mod tests {
             key: Bytes::from(key.to_string()),
             value: Bytes::from(value.to_string()),
             expected_mod_revision: None,
+            dedup: None,
         }
     }
 
@@ -159,6 +160,7 @@ mod tests {
             fingerprint(&Command::Delete {
                 key: Bytes::from_static(b"/a"),
                 expected_mod_revision: None,
+                dedup: None,
             })
         );
     }

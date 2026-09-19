@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "name": "rpo-rto",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "7d524ac3d08fc3a6f9b7f02e67412a4e12ac5887",
+    "dirty": true,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-09-19T09:11:18Z",
+    "duration_ms": 99537,
+    "seed": 27958,
+    "scale_factor": 0.03125,
+    "full_scale": false
+  },
+  "values": {
+    "artifact_bytes": 67723005,
+    "backup_ms": 3393,
+    "backup_revision": 8192,
+    "generate_ms": 84600,
+    "measured_path": "config_storage::snapshot::export_snapshot + SnapshotReader::verify_to_end + restore_into_fresh_store + RocksStore::open (the legs config-server's backup/restore CLI wraps)",
+    "new_cluster": "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d",
+    "not_measured": [
+      "aes_gcm_encryption",
+      "ed25519_manifest_signature",
+      "cli_exit_codes"
+    ],
+    "not_measured_reason": "config-server has no library target, so its CLI wrappers are unreachable from config-testkit",
+    "objectives_claimed": false,
+    "objectives_note": "spec §12.2's 60 min RPO / 60 min RTO remain provisional planning assumptions; this row measures, it does not claim them",
+    "records": 8192,
+    "restore_ms": 5175,
+    "restored_from_cluster": "07070707070707070707070707070707",
+    "restored_records": {
+      "kv": 8192
+    },
+    "rpo_window_ms": 3988,
+    "rpo_window_mutations": 25,
+    "rpo_window_mutations_recovered": 0,
+    "rto_components_total_ms": 13980,
+    "skipped_records": {
+      "events": 8192
+    },
+    "state_bytes": 33554432,
+    "time_to_first_read_ms": 407,
+    "verify_ms": 5005
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

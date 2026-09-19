@@ -173,6 +173,7 @@ fn m0_10_delete_expected_zero_invalid_at_edge() {
     let req = DeleteRequest {
         key: b(b"k"),
         expected_mod_revision: Some(0),
+        dedup: None,
     };
 
     let err = config_core::validate_delete(&req, &Limits::DEFAULT)
@@ -236,6 +237,7 @@ fn m0_14_delete_expected_zero_reaches_apply() {
     let crafted = Command::Delete {
         key: b(b"k"),
         expected_mod_revision: Some(0),
+        dedup: None,
     };
     // It really does survive the wire form; edge validation is the only thing that stops it.
     let decoded = Command::decode(&crafted.encode()).expect("the envelope itself is well formed");

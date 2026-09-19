@@ -238,8 +238,46 @@ impl Harness {
              key = \"node.key.pem\"\n"
                 .to_string()
         };
-        let authz_block = match &options.policy {
-            Some(path) => format!("\n[authz]\npolicy = {}\n", toml_path(path)),
+        // `admins` is emitted only when a row asked for it, so every existing row's document is
+        // byte-identical to what it was before the admin plane existed.
+        let admins_key = if options.admins.is_empty() {
+            String::new()
+        } else {
+            let names = options
+                .admins
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("admins = [{names}]\n")
+        };
+        let authz_block = match (&options.policy, admins_key.is_empty()) {
+            (Some(path), _) => format!("\n[authz]\npolicy = {}\n{admins_key}", toml_path(path)),
+            (None, false) => format!("\n[authz]\n{admins_key}"),
+            (None, true) => String::new(),
+        };
+        let backup_block = match &options.backup_signing_key {
+            Some(path) => format!("\n[backup]\nsigning_key_file = {}\n", toml_path(path)),
+            None => String::new(),
+        };
+        // Like `[snapshot]`: absent writes no section at all, so every pre-M6 row's document
+        // is byte-identical to what it was before pagination existed.
+        let list_block = match &options.list {
+            Some(l) => format!(
+                "
+[list]
+max_pinned_snapshots = {}
+ttl_seconds = {}
+",
+                l.max_pinned_snapshots, l.ttl_seconds
+            ),
+            None => String::new(),
+        };
+        let snapshot_block = match &options.snapshot {
+            Some(s) => format!(
+                "\n[snapshot]\nlogs_since_last = {}\nlogs_to_keep = {}\npurge_batch_size = {}\n",
+                s.logs_since_last, s.logs_to_keep, s.purge_batch_size
+            ),
             None => String::new(),
         };
         let manifest_block = match &options.manifest {
@@ -266,6 +304,9 @@ impl Harness {
              {tls_block}\
              {authz_block}\
              {manifest_block}\
+             {backup_block}\
+             {snapshot_block}\
+             {list_block}\
              \n[raft]\n\
              heartbeat_ms = {HEARTBEAT_MS}\n\
              election_min_ms = {ELECTION_MIN_MS}\n\
@@ -368,6 +409,46 @@ pub struct NodeOptions {
     pub manifest: Option<ManifestPaths>,
     /// `node.recovery_epoch`.
     pub recovery_epoch: u32,
+    /// `[authz] admins` — principals allowed on the admin plane (M5, ADR-0023).
+    ///
+    /// Empty by default, which writes no key at all: an empty allowlist denies every admin
+    /// RPC, which is the posture every pre-M5 row was already running under.
+    pub admins: Vec<String>,
+    /// `[backup] signing_key_file` — required before the admin plane will serve `Backup`.
+    pub backup_signing_key: Option<PathBuf>,
+    /// `[snapshot]` — build and purge aggressively enough that a row can observe both.
+    ///
+    /// Absent writes no section at all, so every pre-M5 row keeps the daemon's own defaults:
+    /// a snapshot every few thousand entries, which no E2E row is long enough to reach.
+    pub snapshot: Option<SnapshotTuning>,
+    /// `[list]` — revision-pinned pagination bounds (M6, ADR-0029).
+    ///
+    /// Absent keeps the daemon defaults (64 pins, 60 s), which is what every pre-M6 row ran
+    /// under. A row sets it only when the *bounds themselves* are what it is exercising.
+    pub list: Option<ListTuning>,
+}
+
+/// The `[list]` knobs an E2E row needs to observe a pin being held, evicted or expired.
+#[derive(Debug, Clone, Copy)]
+pub struct ListTuning {
+    /// Snapshots this node holds open at once.
+    pub max_pinned_snapshots: u32,
+    /// How long one survives unread.
+    pub ttl_seconds: u64,
+}
+
+/// The `[snapshot]` knobs a row needs to make a leader snapshot and purge within its lifetime.
+///
+/// The three move together because `config_storage::SnapshotConfig` refuses a half-applied
+/// change (ADR-0022); writing them as a unit is the only shape the daemon accepts.
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotTuning {
+    /// Build once committed is this far past the current snapshot.
+    pub logs_since_last: u64,
+    /// Snapshot-covered entries to retain rather than purge.
+    pub logs_to_keep: u64,
+    /// Minimum entries a purge must be able to remove before one is scheduled.
+    pub purge_batch_size: u64,
 }
 
 /// The suite's allowlist: `svc-a` may read and write everything, and nobody else is named.

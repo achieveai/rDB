@@ -54,9 +54,16 @@ async fn m2_49_rocks_reports_persistent() {
     let cluster = Cluster::start(3, StorageKind::ROCKS).await;
     cluster.leader().await;
 
+    // M4-111/M4-113 (test plan §3.10): a Rocks-backed node has the `events` CF and serves
+    // watches, so it must report `Retained`, not `Unsupported` — this literal was M3's and
+    // went stale the moment M4 landed. `MemStore`/`Ephemeral` still report `Unsupported`
+    // (`memstore.rs`, `m2_50_ephemeral_never_persistent` below): "a capability that can lie is
+    // worse than no capability" applies to the honest-but-outdated case too.
     let expected = config_core::Capabilities {
         durability: Durability::Persistent,
-        watch_resumption: config_core::WatchResumption::Unsupported,
+        watch_resumption: config_core::WatchResumption::Retained {
+            compact_revision_visible: true,
+        },
         authz: config_core::Authz::Development,
         transport_security: config_core::TransportSecurity::Insecure,
         pagination: config_core::Pagination::Unsupported,

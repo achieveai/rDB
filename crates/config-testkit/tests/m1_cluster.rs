@@ -42,6 +42,7 @@ fn key(s: &str) -> Bytes {
 
 fn put_req(k: &str, v: &str) -> PutRequest {
     PutRequest {
+        dedup: None,
         key: key(k),
         value: key(v),
         expected_mod_revision: None,
@@ -61,6 +62,7 @@ fn list_req(prefix: &str) -> ListRequest {
 
 fn delete_req(k: &str) -> DeleteRequest {
     DeleteRequest {
+        dedup: None,
         key: key(k),
         expected_mod_revision: None,
     }

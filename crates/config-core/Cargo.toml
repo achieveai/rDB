@@ -10,11 +10,21 @@ bytes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+futures-core = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+# The page-token envelope uses the command envelope's own postcard convention (ADR-0007,
+# ADR-0029); the workspace already pins it for the replicated log.
+postcard = { workspace = true }
+# M6 signed policy documents (ADR-0027, lead ruling M6-R9). Verification only — no signing key
+# type is ever constructed here — and a pure computation with no clock, no I/O and no runtime,
+# which is the same category as `sha2`. `serde_json` is the document's on-disk encoding: an
+# operator reviews and signs this file by hand, which rules out a binary format.
+ed25519-dalek = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 config-log = { workspace = true }
+futures = { workspace = true }
 proptest = { workspace = true }
-serde_json = { workspace = true }
 hex = { workspace = true }

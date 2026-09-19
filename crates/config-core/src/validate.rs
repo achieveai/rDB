@@ -135,23 +135,47 @@ pub fn validate_command(cmd: &Command, limits: &Limits) -> Result<(), ConfigErro
             key,
             value,
             expected_mod_revision,
-        } => validate_put(
-            &PutRequest {
-                key: key.clone(),
-                value: value.clone(),
-                expected_mod_revision: *expected_mod_revision,
-            },
-            limits,
-        ),
+            ..
+        } => {
+            validate_put(
+                &PutRequest {
+                    key: key.clone(),
+                    value: value.clone(),
+                    expected_mod_revision: *expected_mod_revision,
+                    dedup: None,
+                },
+                limits,
+            )?;
+            // The rebuilt request carries no dedup group, so `validate_put` measured a
+            // one-byte flag where the replicated entry may carry a 57-byte stamp (M5-R17).
+            // Measure the command as it actually reached the log, so a crafted or replayed
+            // over-cap entry is refused here exactly as the edge would have refused it
+            // (finding C5B-06).
+            validate_request_size(cmd, limits)
+        }
         Command::Delete {
             key,
             expected_mod_revision,
-        } => validate_delete(
-            &DeleteRequest {
-                key: key.clone(),
-                expected_mod_revision: *expected_mod_revision,
-            },
-            limits,
-        ),
+            ..
+        } => {
+            validate_delete(
+                &DeleteRequest {
+                    key: key.clone(),
+                    expected_mod_revision: *expected_mod_revision,
+                    dedup: None,
+                },
+                limits,
+            )?;
+            validate_request_size(cmd, limits)
+        }
+        // A `Compact` carries no key, no value, and no CAS guard, so there is nothing the
+        // request validators apply to. Its watermark is not validated here either: an
+        // out-of-range one is *clamped* deterministically inside `KvState::apply`, not
+        // rejected, because a rejection would make an honest leader's proposal fail whenever a
+        // follower's applied revision lagged the leader's at proposal time (test plan M4-26).
+        // Only the encoded size is checked, for the same reason as every other command.
+        // `RetireNode` joins `Compact` here for the same reason: a fixed-size maintenance
+        // command with no key, no value and no CAS guard. Only the encoded size is checked.
+        Command::Compact { .. } | Command::RetireNode { .. } => validate_request_size(cmd, limits),
     }
 }

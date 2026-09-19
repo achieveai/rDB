@@ -7,6 +7,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::command::DedupKey;
+
 /// One stored key/value pair with its revision metadata (spec §7.2).
 ///
 /// `create_revision` is the revision of the `Put` that created the key **after absence**, so
@@ -89,6 +91,12 @@ pub struct PutRequest {
     /// CAS guard: `None` is unconditional, `Some(0)` is create-only, and `Some(n > 0)`
     /// requires the key's current `mod_revision` to equal `n` (ADR-0006).
     pub expected_mod_revision: Option<u64>,
+    /// Bounded deduplication key (M5, ADR-0025). `None` — the default — is exactly the M0–M4
+    /// behaviour: no record is retained and a resubmission applies a second time.
+    ///
+    /// The principal half of the effective key is **not** here and cannot be supplied by a
+    /// caller; the leader binds it from the authenticated session.
+    pub dedup: Option<DedupKey>,
 }
 
 /// Remove one key, optionally guarded by a compare-and-swap (spec §6.2 `DeleteRequest`).
@@ -100,6 +108,8 @@ pub struct DeleteRequest {
     /// `mod_revision` to equal `n`. `Some(0)` is **invalid** for `Delete` — use an
     /// unconditional delete or a positive known revision (spec §7.3).
     pub expected_mod_revision: Option<u64>,
+    /// Bounded deduplication key (M5, ADR-0025). See [`PutRequest::dedup`].
+    pub dedup: Option<DedupKey>,
 }
 
 /// Application outcome of a mutation (spec §6.2 `MutationOutcome`).
@@ -141,6 +151,26 @@ pub struct MutationResponse {
     pub exists: bool,
     /// The key's `mod_revision` at the point the outcome was decided, or `0` when absent.
     pub current_mod_revision: u64,
+    /// Whether a retained deduplication record answered this submission instead of a fresh
+    /// application (M5, ADR-0025).
+    ///
+    /// The only field that describes *this* submission rather than the outcome: on a hit the
+    /// other four are the original application's, byte for byte, including a `revision` below
+    /// the current cluster revision. A pre-M5 build, and an M5 build with `[dedup]` off,
+    /// always answer `false`.
+    pub dedup_hit: bool,
+    /// Whether a deduplication record now retains this outcome, so the caller may safely
+    /// resubmit the same `request_id` inside the window (M5, ADR-0025, review finding C5B-05).
+    ///
+    /// This is the field a client has to read before it retries. `dedup_hit` answers "was this
+    /// a duplicate?", which is history; `dedup_recorded` answers "will a resubmission be
+    /// recognized?", which is the only question ADR-0015's bounded-retry exception turns on.
+    /// It is `false` when the request carried no dedup key, when the node has `[dedup]` off,
+    /// and -- the case that matters -- when the global `max_records` cap was already reached:
+    /// the mutation applied normally, but nothing retains it, so a resubmission would apply a
+    /// *second* time. A caller that assumed a recorded outcome because it sent a key would
+    /// double-apply exactly there.
+    pub dedup_recorded: bool,
 }
 
 impl MutationResponse {
@@ -152,6 +182,8 @@ impl MutationResponse {
             revision,
             exists: true,
             current_mod_revision: revision,
+            dedup_hit: false,
+            dedup_recorded: false,
         }
     }
 
@@ -163,6 +195,8 @@ impl MutationResponse {
             revision,
             exists: false,
             current_mod_revision: revision,
+            dedup_hit: false,
+            dedup_recorded: false,
         }
     }
 
@@ -173,6 +207,8 @@ impl MutationResponse {
             revision: cluster_revision,
             exists,
             current_mod_revision,
+            dedup_hit: false,
+            dedup_recorded: false,
         }
     }
 
@@ -183,6 +219,8 @@ impl MutationResponse {
             revision: cluster_revision,
             exists: false,
             current_mod_revision: 0,
+            dedup_hit: false,
+            dedup_recorded: false,
         }
     }
 

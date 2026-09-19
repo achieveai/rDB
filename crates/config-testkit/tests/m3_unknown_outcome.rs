@@ -393,6 +393,7 @@ async fn m3_62_cas_recovery_recipe_works() {
     assert_eq!(observed.value, support::key("v"));
 
     let cas = config_core::PutRequest {
+        dedup: None,
         key: support::key("/m3-62"),
         value: support::key("v2"),
         expected_mod_revision: Some(observed.mod_revision),
@@ -467,6 +468,7 @@ async fn m3_63_retry_storm_does_not_multiply_mutations() {
         let client = cluster.grpc_client(leader);
         handles.push(tokio::spawn(async move {
             let req = config_core::PutRequest {
+                dedup: None,
                 key: support::key("/m3-63"),
                 value: support::key(&format!("v-{i}")),
                 expected_mod_revision: Some(expected),
@@ -621,6 +623,7 @@ async fn m3_65_deadline_exceeded_maps_to_grpc_deadline() {
         .expect("an mTLS client connects to the client plane");
     let mut raw = config_grpc::pb::config_service_client::ConfigServiceClient::new(channel);
     let mut request = tonic::Request::new(config_grpc::pb::PutRequest {
+        dedup: None,
         key: support::key("/m3-65"),
         value: support::key("v"),
         expected_mod_revision: None,

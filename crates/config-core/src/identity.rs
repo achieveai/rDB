@@ -116,6 +116,34 @@ impl fmt::Display for ClusterIdentity {
     }
 }
 
+/// The provenance marker a restored data directory carries (M5, ADR-0026 runbooks,
+/// ADR-0023 recovery).
+///
+/// Written once when an operator restores a backup into a fresh data directory, and surfaced
+/// in the health payload thereafter: an operator looking at a node has to be able to tell a
+/// node that recovered its own state from a node that was *seeded from someone else's*
+/// snapshot, without reading a deployment log. `recovery_epoch` is the plain `u32` of
+/// [`RecoveryEpoch`] so the marker stays a flat, postcard-stable record.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Debug)]
+pub struct RestoredFrom {
+    /// The cluster the restored snapshot belonged to.
+    pub cluster_id: ClusterId,
+    /// The recovery epoch recorded in that snapshot.
+    pub recovery_epoch: u32,
+    /// The last revision the restored snapshot contained.
+    pub revision: u64,
+}
+
+impl fmt::Display for RestoredFrom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "cluster={} epoch={} revision={}",
+            self.cluster_id, self.recovery_epoch, self.revision
+        )
+    }
+}
+
 /// Raised when storage was created for a different identity (ADR-0011).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("storage identity mismatch: stored [{stored}] configured [{configured}]")]

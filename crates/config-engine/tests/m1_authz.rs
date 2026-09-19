@@ -127,6 +127,7 @@ async fn m1_27_a_denied_mutation_never_reaches_the_raft_log() {
             .delete(DeleteRequest {
                 key: key("/a/k"),
                 expected_mod_revision: None,
+                dedup: None,
             })
             .await
             .unwrap_err(),
@@ -207,6 +208,7 @@ async fn m1_obs_a_node_without_a_policy_is_unready_and_denies_every_call() {
             .delete(DeleteRequest {
                 key: key("/a/k"),
                 expected_mod_revision: None,
+                dedup: None,
             })
             .await
             .unwrap_err(),

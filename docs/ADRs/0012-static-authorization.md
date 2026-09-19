@@ -38,3 +38,15 @@ for CAs that cannot mint URI SANs and is a deliberate narrowing of the cluster b
 default. Everything else here is unchanged: identity still never comes from a request field,
 and a certificate asserting a non-client `retcd://` identity is still refused rather than read
 as its CN. Covered by M3-88.
+
+## Note (2026-09-18, M6)
+
+M6 adds `authz.mode = static | signed` alongside the `StaticAllowlist`/`AllowAll` model this ADR
+defines. `static` is this ADR's behavior, byte-for-byte unchanged — same grammar, same
+prefix-containment `List` rule, same fail-closed-on-missing-policy readiness gate — and remains
+fully supported. The M6 **daemon default** flips to `signed`: an ed25519-signed, versioned policy
+document with bounded polling, an admin `ReloadPolicy` RPC, gossip-advertised convergence, and a
+fail-closed intersection rule during a rollout (ADR-0027 is the owning decision). Principal
+derivation itself — mTLS-only, never a request field, the CN-fallback gate from the note above —
+is unchanged and is reused as-is by signed mode; ADR-0027 governs only how the *grants* a
+principal is checked against are loaded, versioned, and rotated.

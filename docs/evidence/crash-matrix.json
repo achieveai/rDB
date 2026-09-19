@@ -1,0 +1,146 @@
+{
+  "schema": 1,
+  "name": "crash-matrix",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "7d524ac3d08fc3a6f9b7f02e67412a4e12ac5887",
+    "dirty": true,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-09-19T09:13:07Z",
+    "duration_ms": 11447,
+    "seed": 27958,
+    "scale_factor": 0.2,
+    "full_scale": false
+  },
+  "values": {
+    "boundaries_driven": 9,
+    "boundaries_enumerated": 17,
+    "crash_cycles": 9,
+    "repeats": 1,
+    "rows": [
+      {
+        "boundary": "before_vote_sync",
+        "crossings": 3,
+        "driven": true,
+        "recovery_ms": 3388,
+        "repeat": 0,
+        "target": 2
+      },
+      {
+        "boundary": "after_vote_sync",
+        "crossings": 1,
+        "driven": true,
+        "recovery_ms": 4279,
+        "repeat": 0,
+        "target": 2
+      },
+      {
+        "boundary": "before_log_append",
+        "crossings": 4,
+        "driven": true,
+        "recovery_ms": 559,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "after_log_append",
+        "crossings": 2,
+        "driven": true,
+        "recovery_ms": 550,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "before_log_flush",
+        "crossings": 1,
+        "driven": true,
+        "recovery_ms": 547,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "after_log_flush",
+        "crossings": 1,
+        "driven": true,
+        "recovery_ms": 541,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "before_state_batch",
+        "crossings": 2,
+        "driven": true,
+        "recovery_ms": 246,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "after_state_batch",
+        "crossings": 2,
+        "driven": true,
+        "recovery_ms": 181,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "after_state_batch_before_publish",
+        "crossings": 1,
+        "driven": true,
+        "recovery_ms": 231,
+        "repeat": 0,
+        "target": 1
+      },
+      {
+        "boundary": "before_snapshot_tmp_sync",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "after_snapshot_rename",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "before_current_snapshot_meta",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "before_install_marker",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "after_install_drop_cf",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "before_install_final_batch",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "before_purge",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      },
+      {
+        "boundary": "after_purge",
+        "driven": false,
+        "reason": "not reachable from a plain put or a vote: this boundary is crossed only while building, installing or purging a snapshot (M5 owns those rows)"
+      }
+    ]
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

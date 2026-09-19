@@ -1,0 +1,186 @@
+// rEtcd admin plane (DesignSpec-01 §13.2, §19.8, §19.9; ADR-0023, ADR-0024).
+//
+// Field numbers are normative and must never be reused.
+//
+// `AdminService` is served on the **client-plane** listener (mTLS, ADR-0010), not on a third
+// listener: a separate privileged port would mean a second certificate profile, a second port
+// to fence and a second surface to test, for no isolation the `[authz] admins` allowlist does
+// not already provide over mTLS (OQ-43). Only a principal named in that allowlist may call any
+// method here; every other authenticated principal is refused PERMISSION_DENIED before the
+// handler runs, carrying the usual `retcd-outcome: rejected` marker.
+//
+// Every mutating method requires the receiving node to be the current leader and answers
+// FAILED_PRECONDITION with the existing `retcd-leader-node-id` / `retcd-leader-endpoint`
+// metadata otherwise (ADR-0009). `GetMembership` is served everywhere but marks itself
+// non-authoritative off the leader.
+//
+// `ReloadPolicy` (ADR-0027) is declared below. Still reserved for M6 and deliberately not
+// declared yet: `ReloadTls` and `RotateGossipKey` (ADR-0028). Nothing below may reuse a name
+// they will want.
+//
+// There is deliberately **no** RPC that changes an existing node's endpoint. `ChangeMembers::
+// SetNodes` can leave two disjoint quorums each believing they hold the updated address
+// (research §3.5), so an endpoint change is remove-then-re-add-as-a-fresh-learner, enforced at
+// this API boundary by the absence of the operation (ADR-0023, M5-63).
+syntax = "proto3";
+
+package retcd.v1;
+
+service AdminService {
+  rpc GetMembership(GetMembershipRequest) returns (MembershipReport);
+  rpc AddLearner(AddLearnerRequest) returns (AdminAck);
+  rpc PromoteVoter(NodeRef) returns (AdminAck);
+  rpc RemoveMember(NodeRef) returns (AdminAck);
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (SnapshotInfo);
+  rpc Backup(BackupRequest) returns (BackupInfo);
+  rpc ReloadPolicy(ReloadPolicyRequest) returns (PolicyInfo);
+}
+
+// A Raft log id, as the admin plane reports it. Named `AdminLogId` rather than `LogId` because
+// every message in this package shares one namespace with `config.proto` and `peer.proto`.
+message AdminLogId {
+  uint64 term = 1;
+  uint64 index = 2;
+}
+
+message GetMembershipRequest {}
+
+// What one node believes about membership right now.
+//
+// `authoritative` is false off the leader: `replication` is empty there (openraft populates the
+// replication map only on a leader, research §3.3), so a catch-up polling loop that ignored the
+// flag would conclude a learner had not started replicating at all.
+message MembershipReport {
+  // Committed voter ids, ascending.
+  repeated uint64 voters = 1;
+  // Committed member ids that are not voters, ascending.
+  repeated uint64 learners = 2;
+  // Configs in the *effective* membership: 1 uniform, 2 joint. Anything above 1 means a
+  // `change_membership` was interrupted between its two round trips (trap T8) and the documented
+  // repair is to re-issue the same call (ADR-0023).
+  uint32 joint_config_len = 3;
+  optional AdminLogId membership_log_id = 4;
+  // Node ids that a committed `RetireNode` has fenced. They can never be re-added.
+  repeated uint64 retired = 5;
+  // Per-peer replication progress. Populated only on the leader.
+  repeated ReplicationEntry replication = 6;
+  // The leader's own last log index, the other half of the catch-up predicate. 0 off the leader.
+  uint64 leader_last_log_index = 7;
+  optional uint64 current_leader = 8;
+  // True only when this node was the leader at the instant it answered.
+  bool authoritative = 9;
+  // Committed peer and client endpoints of every member.
+  repeated MemberEndpoints endpoints = 10;
+  // `membership.promote_max_lag` as this node is configured, so a caller polls against the
+  // threshold the server will actually apply rather than one it guessed.
+  uint64 promote_max_lag = 11;
+}
+
+message ReplicationEntry {
+  uint64 node_id = 1;
+  // Highest log index this peer has acknowledged. Absent when the leader has not heard from it.
+  optional uint64 matched_index = 2;
+  // `leader_last_log_index - matched_index`, saturating at 0.
+  uint64 lag = 3;
+}
+
+message MemberEndpoints {
+  uint64 node_id = 1;
+  string peer = 2;
+  string client = 3;
+}
+
+// Both endpoints are required: a voter this learner may become has to be nameable in a leader
+// hint, and a hint names the **client** plane (ADR-0009). A learner added with only its peer
+// address would produce a hint no client can dial.
+message AddLearnerRequest {
+  uint64 node_id = 1;
+  string peer_endpoint = 2;
+  string client_endpoint = 3;
+  // The cluster the caller believes it is administering, as 32 lowercase hex characters.
+  // Checked against this node's bound identity before anything is proposed (ADR-0023): an
+  // operator pointed at the wrong cluster gets a refusal, not a learner in the wrong place.
+  string cluster_id = 4;
+}
+
+message NodeRef {
+  uint64 node_id = 1;
+}
+
+// A membership operation that was committed.
+//
+// It carries no catch-up claim, deliberately. `Raft::add_learner`'s blocking wait result is
+// logged and discarded upstream (trap T7), so an acknowledgement that implied "and it has
+// caught up" would be repeating a bug rather than reporting a fact. Catch-up is proven only by
+// polling `GetMembership`.
+message AdminAck {
+  uint64 node_id = 1;
+  optional AdminLogId membership_log_id = 2;
+}
+
+message TriggerSnapshotRequest {}
+
+// The outcome of a `TriggerSnapshot` (OQ-44).
+//
+// `already_in_progress` is a field rather than an error status because "a build was already
+// running" is a normal answer. It must still never be reported as a bare `OK`: openraft's own
+// trigger returns `false` and does nothing in that case (trap T13), and an admin plane that
+// passed that silence on would tell an operator a snapshot had been requested when none had.
+message SnapshotInfo {
+  // Empty when the build had not published by the time this call returned, which is not a
+  // failure — the build is still running and `GetMembership` will show it.
+  string snapshot_id = 1;
+  optional AdminLogId last_log_id = 2;
+  bool already_in_progress = 3;
+}
+
+// Build a backup artifact triple on the **server's** filesystem (ADR-0024).
+//
+// `dest_dir` is a path on the node, not on the caller: the snapshot is built from the node's own
+// consistent view and streamed straight to disk there, never through this RPC.
+message BackupRequest {
+  string dest_dir = 1;
+  // Stem of the three artifact files. Empty means the server picks one from the revision and
+  // the wall clock.
+  string name = 2;
+}
+
+message BackupInfo {
+  string name = 1;
+  // File names within `dest_dir`, not full paths.
+  string snapshot_file = 2;
+  string manifest_file = 3;
+  string signature_file = 4;
+  // Lowercase hex SHA-256 of the **plaintext** snapshot, exactly as the manifest records it.
+  string sha256 = 5;
+  uint64 revision = 6;
+  uint64 size_bytes = 7;
+  bool encrypted = 8;
+}
+
+// Re-read the signed policy document and its signature now, instead of waiting for the next
+// `authz.poll_interval` tick (ADR-0027, §15.3).
+//
+// It carries no payload. The paths are the node's configuration, not the caller's to choose: an
+// RPC that named a file would let an admin principal load a document from anywhere the server
+// process can read, which is a different privilege from "rotate the configured policy".
+message ReloadPolicyRequest {}
+
+// What the active policy is after a reload attempt.
+//
+// A *refused* document is an error status, not an outcome here: the reason travels in the
+// `retcd-reason` trailer and the active policy is unchanged (M6-13). This message describes only
+// the two ways a reload can succeed.
+message PolicyInfo {
+  // The version that was active before the call. Absent when none was.
+  optional uint64 from_version = 1;
+  // The version active now. Equal to `from_version` when `outcome` is "unchanged".
+  uint64 version = 2;
+  // Lowercase hex SHA-256 of the active document's bytes.
+  string hash_hex = 3;
+  // "reloaded" or "unchanged".
+  string outcome = 4;
+  // Why nothing changed, when `outcome` is "unchanged" — currently only "identical_hash".
+  // Empty on "reloaded".
+  string reason = 5;
+}

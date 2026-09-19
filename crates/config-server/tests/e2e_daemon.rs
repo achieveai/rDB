@@ -17,10 +17,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_client::{GrpcClient, GrpcClientOptions, TlsMode};
-use config_core::{ConfigError, ConfigStore, GetRequest, ListRequest, MutationOutcome, PutRequest};
+use config_core::{
+    ConfigError, ConfigStore, GetRequest, ListRequest, MutationOutcome, PutRequest, WatchItem,
+    WatchRequest,
+};
 use config_log::retcd_test;
 use config_testkit::poll::{poll_until_async, Timeout};
 use config_testkit::{conformance, ConformanceConfig};
+use futures::StreamExt;
 use tracing::Instrument;
 
 use support::{
@@ -107,6 +111,7 @@ async fn put_keys(client: &GrpcClient, prefix: &str, count: usize) -> Vec<u64> {
     for i in 0..count {
         let response = client
             .put(PutRequest {
+                dedup: None,
                 key: Bytes::from(format!("{prefix}{i}")),
                 value: Bytes::from(format!("v{i}")),
                 expected_mod_revision: None,
@@ -189,7 +194,11 @@ async fn e2e_02_capabilities_from_cli() {
     assert_eq!(reported["durability"], "Persistent");
     assert_eq!(reported["authz"], "StaticAllowlist");
     assert_eq!(reported["transport_security"], "MutualTls");
-    assert_eq!(reported["watch_resumption"], "Unsupported");
+    assert_eq!(
+        reported["watch_resumption"],
+        serde_json::json!({ "Retained": { "compact_revision_visible": true } }),
+        "M4: the daemon serves resumable watches and surfaces its compaction floor"
+    );
     assert!(
         !harness.nodes[0].data_dir.exists(),
         "--capabilities must not create the data directory"
@@ -675,6 +684,7 @@ async fn e2e_13_unlisted_principal_denied_at_process_level() {
     );
     let error = client
         .put(PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/k/denied"),
             value: Bytes::from_static(b"v"),
             expected_mod_revision: None,
@@ -793,6 +803,7 @@ async fn e2e_15_unknown_outcome_at_process_level() {
     let put = tokio::spawn(async move {
         inflight
             .put(PutRequest {
+                dedup: None,
                 key: Bytes::from_static(b"/k/inflight"),
                 value: Bytes::from_static(b"v"),
                 expected_mod_revision: None,
@@ -1173,4 +1184,412 @@ async fn e2e_17b_drop_kills_the_child() {
     let mut node = DaemonProcess::spawn(spec);
     node.wait_ready(startup_deadline())
         .expect("the store was released when the previous handle dropped");
+}
+
+// ---------------------------------------------------------------------------------------
+// E2E-21 / E2E-22 (test plan §5) — watch across real process failures
+// ---------------------------------------------------------------------------------------
+//
+// Scoped to their core claim only: `HealthPayload` (crates/config-engine/src/metrics.rs) never
+// gained TA-39's `compact_revision` / `journal_oldest_revision` / `journal_newest_revision` /
+// `journal_hash` / `watch_streams_open` fields (confirmed absent by grep across
+// crates/config-server/src and crates/config-engine/src — those identifiers only appear inside
+// `node.rs`/`watch.rs` internals and one unrelated capabilities literal in
+// `config-server/src/run.rs`), and `support::Health` mirrors that same gap. E2E-21's and
+// E2E-22's secondary claims about cross-checking the journal watermark via `/health` are
+// therefore not implementable without a `src/` change; see the handoff's harness-patch note.
+// The delivery/resumability claim that *is* the point of both rows needs none of that.
+
+/// A watch open from `0` (`TrackedWatch` itself is `config_grpc::TrackedWatch`, not
+/// re-exported through `config_client` — named opaquely here rather than pulling in a whole
+/// extra dev-dependency just to spell it).
+async fn watch_from_start(
+    client: &GrpcClient,
+    prefix: &str,
+) -> impl futures::Stream<Item = Result<WatchItem, ConfigError>> + Unpin {
+    client
+        .watch_tracked(WatchRequest {
+            prefix: Bytes::from(prefix.to_string()),
+            start_after_revision: 0,
+            progress_interval: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("watch {prefix} from 0: {e}"))
+}
+
+/// Collect event revisions (ignoring `Progress`) until `last` is seen, or the deadline expires.
+async fn collect_until(
+    stream: &mut (impl futures::Stream<Item = Result<WatchItem, ConfigError>> + Unpin),
+    last: u64,
+    deadline: Duration,
+) -> Vec<u64> {
+    let mut delivered = Vec::new();
+    let outcome = tokio::time::timeout(deadline, async {
+        loop {
+            match stream.next().await {
+                Some(Ok(WatchItem::Event(e))) => {
+                    let revision = e.revision;
+                    delivered.push(revision);
+                    if revision == last {
+                        return;
+                    }
+                }
+                Some(Ok(WatchItem::Progress { .. })) => {}
+                other => panic!("unexpected watch item while collecting to {last}: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "only {} events arrived before the deadline (wanted up to revision {last})",
+        delivered.len()
+    );
+    delivered
+}
+
+/// E2E-21: a watch open on the leader survives the leader process being killed by ending
+/// (whatever the exact wire-level error — a hard process kill drops the transport, which is
+/// not guaranteed to arrive as a clean typed `ConfigError` the way an in-process termination
+/// does), and resuming on the new leader from the last delivered revision loses nothing.
+#[retcd_test]
+async fn e2e_21_watch_across_a_leader_kill() {
+    let harness = Harness::new("e2e_21_watch_across_a_leader_kill").await;
+    let mut nodes = harness.start_all();
+    let health = wait_formed(&nodes).await;
+    let leader = leader_index(&health, &nodes);
+
+    let write_client = cluster_client(&harness, &nodes);
+    let first = put_keys(&write_client, "/e21/", 10).await;
+    assert_eq!(first.last(), Some(&10));
+
+    let watch_client = client_for(
+        &harness,
+        vec![nodes[leader].client_endpoint().to_string()],
+        PRINCIPAL,
+    );
+    let mut stream = watch_from_start(&watch_client, "/e21/").await;
+    let mut delivered = collect_until(&mut stream, 10, deadline(10)).await;
+    assert_eq!(delivered, (1..=10).collect::<Vec<u64>>());
+
+    let killed = nodes[leader].node_id();
+    nodes[leader].kill();
+
+    // The stream must end one way or another — it must never hang past the deadline, and it
+    // must never silently keep claiming to be live against a dead process.
+    let ended = tokio::time::timeout(deadline(10), async {
+        loop {
+            match stream.next().await {
+                Some(Err(_)) | None => return,
+                Some(Ok(WatchItem::Progress { .. })) => {}
+                Some(Ok(WatchItem::Event(e))) => panic!(
+                    "a dead leader's connection kept delivering events (revision {})",
+                    e.revision
+                ),
+            }
+        }
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the watch stream never ended after its leader process was killed"
+    );
+
+    let survivors: Vec<String> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != leader)
+        .map(|(_, n)| n.health_endpoint().to_string())
+        .collect();
+    let survivor_health = wait_for_all(&survivors, "a new leader to appear", |payloads| {
+        payloads
+            .iter()
+            .all(|p| p.current_leader.is_some_and(|l| l != killed))
+    })
+    .await;
+    let new_leader_id = survivor_health[0]
+        .current_leader
+        .expect("a formed survivor set has a leader");
+    let new_leader = nodes
+        .iter()
+        .position(|n| n.node_id() == new_leader_id)
+        .expect("the new leader is one of the spawned nodes");
+
+    // `write_client` was built over all three original endpoints, including the one just
+    // killed — unlike E2E-07's follower kill (where the surviving leader is still one of the
+    // client's endpoints and its cached hint stays valid), a *leader* kill leaves every hint
+    // that client holds pointing at a dead process. A fresh client scoped to the survivors
+    // is the same idiom already used below for `resume_client`.
+    let survivor_write_client = client_for(
+        &harness,
+        nodes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != leader)
+            .map(|(_, n)| n.client_endpoint().to_string())
+            .collect(),
+        PRINCIPAL,
+    );
+    let more = put_keys(&survivor_write_client, "/e21/", 5).await;
+    assert_eq!(more, vec![11, 12, 13, 14, 15]);
+
+    let resume_client = client_for(
+        &harness,
+        vec![nodes[new_leader].client_endpoint().to_string()],
+        PRINCIPAL,
+    );
+    let resume_from = *delivered
+        .last()
+        .expect("at least one event delivered before the kill");
+    let mut resumed = resume_client
+        .watch_tracked(WatchRequest {
+            prefix: Bytes::from("/e21/"),
+            start_after_revision: resume_from,
+            progress_interval: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("re-watching on the new leader at {resume_from}: {e}"));
+    delivered.extend(collect_until(&mut resumed, 15, deadline(10)).await);
+
+    assert_eq!(
+        delivered,
+        (1..=15).collect::<Vec<u64>>(),
+        "the union of both streams must cover every revision with no gap across the leader kill"
+    );
+}
+
+/// E2E-22: a watch open on the (untouched) leader is completely undisturbed by a follower
+/// process being killed — no termination, no gap, writes continue on the surviving quorum of
+/// two exactly as E2E-07 already proves for plain reads/writes.
+#[retcd_test]
+async fn e2e_22_watch_survives_follower_kill() {
+    let harness = Harness::new("e2e_22_watch_survives_follower_kill").await;
+    let mut nodes = harness.start_all();
+    let health = wait_formed(&nodes).await;
+    let leader = leader_index(&health, &nodes);
+    let victim = (leader + 1) % nodes.len();
+    assert_ne!(
+        victim, leader,
+        "the victim must be a follower, not the leader"
+    );
+
+    let write_client = cluster_client(&harness, &nodes);
+    let watch_client = client_for(
+        &harness,
+        vec![nodes[leader].client_endpoint().to_string()],
+        PRINCIPAL,
+    );
+    let mut stream = watch_from_start(&watch_client, "/e22/").await;
+
+    let first = put_keys(&write_client, "/e22/", 5).await;
+    let mut delivered =
+        collect_until(&mut stream, *first.last().expect("5 puts"), deadline(10)).await;
+    assert_eq!(delivered, (1..=5).collect::<Vec<u64>>());
+
+    nodes[victim].kill();
+    assert!(
+        !nodes[victim].is_running(),
+        "the killed follower must be gone"
+    );
+
+    // The leader's own watch hub state never changes here (no leader loss, no compaction, no
+    // overload), and the surviving quorum of two keeps applying writes (E2E-07), so the stream
+    // must keep delivering them with no interruption.
+    let more = put_keys(&write_client, "/e22/", 5).await;
+    assert_eq!(more, vec![6, 7, 8, 9, 10]);
+    delivered.extend(collect_until(&mut stream, 10, deadline(10)).await);
+
+    assert_eq!(
+        delivered,
+        (1..=10).collect::<Vec<u64>>(),
+        "a follower kill must never interrupt or gap a live watch on the untouched leader"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// E2E-38 (review finding C5B-09) — the process-level form of M5-104
+// ---------------------------------------------------------------------------------------
+
+/// A dedup-enabled client over `endpoints`, pinned to `pin`, presenting `principal`'s
+/// certificate.
+///
+/// `client_for` cannot be reused as-is: it leaves `expected_capabilities` at `None`
+/// (`GrpcClientOptions::default()`), which makes the client report the conservative
+/// `Dedup::Unsupported` profile regardless of what the daemon is actually configured with, and
+/// `GrpcClient::dedup_retry_allowed` reads only that configured belief — there is no
+/// capability-discovery RPC (spec §6.2). `window_requests` must match the `[dedup]` block this
+/// row writes into every node's config below.
+fn dedup_client_for(
+    harness: &Harness,
+    endpoints: Vec<String>,
+    principal: &str,
+    pin: &str,
+    window_requests: u32,
+) -> GrpcClient {
+    let opts = GrpcClientOptions {
+        request_deadline: deadline(2),
+        tls: TlsMode::MutualTls(harness.tls.client_mtls(principal)),
+        expected_capabilities: Some(config_core::Capabilities {
+            dedup: config_core::Dedup::Bounded { window_requests },
+            ..config_core::Capabilities::EPHEMERAL_DEVELOPMENT
+        }),
+        ..GrpcClientOptions::default()
+    };
+    GrpcClient::connect(endpoints, opts)
+        .expect("the client plane endpoints are well formed")
+        .with_cluster_id(harness.cluster_id)
+        .pinned(pin)
+        .expect("pin is one of the configured endpoints")
+}
+
+/// E2E-38: a dedup-enabled client issues a put with a short deadline while the leader process
+/// is killed; it must resubmit the same `request_id` once to the new leader and observe the
+/// key applied exactly once. The process-level form of M5-104
+/// (`crates/config-testkit/tests/m5_dedup_cluster.rs`); contrast with E2E-15, which must still
+/// show no automatic replay without dedup.
+///
+/// **Harness gap, worked around without touching `crates/config-server/src` or
+/// `tests/support`:** `support::NodeOptions` has no `[dedup]` field.
+/// `Harness::write_node_files` runs once per node at construction and `Harness::start_all`
+/// spawns from the already-written config file without re-rendering it (read in
+/// `crates/config-server/tests/support/mod.rs`), so a raw `[dedup]` block appended to each
+/// node's rendered config here, before `start_all`, takes effect with no product or harness
+/// change.
+///
+/// **Why the client is pinned at a survivor, not the leader, and why the channel is warmed
+/// first:** `GrpcClient::attempts` never updates `self.pinned` between separate top-level
+/// calls, so a client pinned directly at the node about to be killed has nothing left to hint
+/// it toward the new leader once that node is gone — the automatic resubmit is one-shot, not a
+/// loop, so it would just fail again. Pinning at a survivor instead means both the initial
+/// hint-follow (survivor -> leader) and the automatic resubmit (survivor -> new leader) go
+/// through a live node. Warming the leader's cached channel with a harmless prior write
+/// removes the timing dependency between "the kill" and "the connect phase": `GrpcClient::
+/// channel` returns a cached channel without re-dialling, so the test put always reaches
+/// `attempts()`'s submit phase (never the connect phase, which — unlike a submit-phase failure
+/// — maps to plain `Unavailable` and is not eligible for the dedup retry), regardless of
+/// exactly when the kill lands relative to the request.
+#[retcd_test]
+async fn e2e_38_dedup_resubmit_after_leader_kill_at_process_level() {
+    const WINDOW_REQUESTS: u32 = 64;
+    let harness = Harness::new("e2e_38_dedup_resubmit_after_leader_kill_at_process_level").await;
+    for node in &harness.nodes {
+        let mut document =
+            std::fs::read_to_string(&node.config).expect("read the rendered node config");
+        document.push_str(&format!(
+            "\n[dedup]\nenabled = true\nwindow_requests = {WINDOW_REQUESTS}\nmax_records = 10000\n"
+        ));
+        std::fs::write(&node.config, document).expect("append the [dedup] section");
+    }
+
+    let mut nodes = harness.start_all();
+    let health = wait_formed(&nodes).await;
+    let leader = leader_index(&health, &nodes);
+    let survivor = (leader + 1) % nodes.len();
+    assert_ne!(
+        survivor, leader,
+        "the pin must be a follower, not the leader"
+    );
+
+    let endpoints: Vec<String> = nodes
+        .iter()
+        .map(|n| n.client_endpoint().to_string())
+        .collect();
+    let client = dedup_client_for(
+        &harness,
+        endpoints,
+        PRINCIPAL,
+        &nodes[survivor].client_endpoint().to_string(),
+        WINDOW_REQUESTS,
+    )
+    .with_dedup([0x38; 16]);
+
+    // Warm-up: an ordinary write through this same client caches both the survivor's and the
+    // leader's channel (the hint-follow dials the leader), so the real test put below never
+    // revisits the connect phase.
+    let warmup = client
+        .put(PutRequest {
+            dedup: None,
+            key: Bytes::from_static(b"/e38/warmup"),
+            value: Bytes::from_static(b"v"),
+            expected_mod_revision: None,
+        })
+        .await
+        .expect("the warm-up write applies");
+    assert_eq!(warmup.outcome, MutationOutcome::Applied);
+    let before = support::health(&nodes[survivor].health_endpoint().to_string()).await;
+
+    let put_task = tokio::spawn({
+        let client = client.clone();
+        async move {
+            client
+                .put(PutRequest {
+                    dedup: None,
+                    key: Bytes::from_static(b"/e38/k"),
+                    value: Bytes::from_static(b"v"),
+                    expected_mod_revision: None,
+                })
+                .await
+        }
+    });
+
+    let killed = nodes[leader].node_id();
+    nodes[leader].kill();
+
+    let survivors: Vec<String> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != leader)
+        .map(|(_, n)| n.health_endpoint().to_string())
+        .collect();
+    let survivor_health = wait_for_all(&survivors, "a new leader to appear", |payloads| {
+        payloads
+            .iter()
+            .all(|p| p.current_leader.is_some_and(|l| l != killed))
+    })
+    .await;
+    let new_leader_id = survivor_health[0]
+        .current_leader
+        .expect("a formed survivor set has a leader");
+    let new_leader = nodes
+        .iter()
+        .position(|n| n.node_id() == new_leader_id)
+        .expect("the new leader is one of the spawned nodes");
+
+    let result = put_task
+        .await
+        .expect("the put task does not panic")
+        .expect("the automatic resubmit recovers against the new leader");
+    assert_eq!(result.outcome, MutationOutcome::Applied, "{result:?}");
+    assert!(
+        result.dedup_hit || result.dedup_recorded,
+        "the resubmit must be recognized, one way or another, by the retained record: {result:?}"
+    );
+
+    let after = wait_for_all(
+        &[nodes[new_leader].health_endpoint().to_string()],
+        "the new leader to reflect exactly one more applied command",
+        |payloads| payloads[0].cluster_revision == before.cluster_revision + 1,
+    )
+    .await;
+    assert_eq!(
+        after[0].cluster_revision,
+        before.cluster_revision + 1,
+        "the key must be applied exactly once cluster-wide"
+    );
+
+    let read_client = dedup_client_for(
+        &harness,
+        vec![nodes[new_leader].client_endpoint().to_string()],
+        PRINCIPAL,
+        &nodes[new_leader].client_endpoint().to_string(),
+        WINDOW_REQUESTS,
+    );
+    let listed = read_client
+        .list(ListRequest {
+            prefix: Bytes::from_static(b"/e38/k"),
+            ..Default::default()
+        })
+        .await
+        .expect("list succeeds on the new leader");
+    assert_eq!(listed.records.len(), 1, "{listed:?}");
 }

@@ -15,29 +15,42 @@ use std::sync::Arc;
 
 use common::{get_request, identity, key, principal, put_request};
 use config_core::{ConfigStore, Durability, NoGossip};
-use config_engine::{ConfigNode, FormationPlan, InProcTransport, RaftTimers, StorageHandle};
+use config_engine::{
+    ConfigNode, FormationPlan, InProcTransport, RaftTimers, StorageHandle, WatchHub,
+};
 use config_storage::{NoFaults, RocksStore, TypeConfig};
 use openraft::storage::{RaftLogStorage, RaftLogStorageExt, RaftStateMachine};
 use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId};
 
 /// Open the store at `dir` the way a daemon does: **before** the node exists, so an open
 /// failure is the daemon's to report and never becomes a half-started node (ADR-0011).
-fn open_store(dir: &Path) -> RocksStore {
-    RocksStore::open(
+fn open_store(dir: &Path, sink: Arc<WatchHub>) -> RocksStore {
+    RocksStore::open_with(
         dir,
         identity(1),
         config_core::Limits::DEFAULT,
         Arc::new(NoFaults),
         tracing::info_span!("store", node_id = 1u64),
+        config_storage::RocksOptions::DEFAULT,
+        sink as Arc<dyn config_storage::AppliedBatchSink>,
     )
     .unwrap_or_else(|e| panic!("open {}: {e}", dir.display()))
+}
+
+/// A hub for one incarnation of the node, with this build's default caps.
+fn watch_hub() -> Arc<WatchHub> {
+    WatchHub::with_defaults(config_core::Limits::DEFAULT.watch)
 }
 
 /// Start a single-voter node on `store`, forming it only if it is not already formed.
 ///
 /// A restart must **not** re-form: the membership is in the store, and forming again would be
 /// the wiped-node-overwrites-the-cluster failure ADR-0011 exists to prevent.
-async fn start_node(store: RocksStore, transport: Arc<InProcTransport>) -> ConfigNode {
+async fn start_node(
+    store: RocksStore,
+    transport: Arc<InProcTransport>,
+    watch: Arc<WatchHub>,
+) -> ConfigNode {
     let identity = identity(1);
     let timers = RaftTimers::default();
     let mut cfg = common::node_config(identity, timers);
@@ -49,6 +62,7 @@ async fn start_node(store: RocksStore, transport: Arc<InProcTransport>) -> Confi
         Arc::clone(&transport) as Arc<dyn config_engine::PeerTransport>,
         Arc::new(NoGossip),
         Arc::new(config_core::AllowAll),
+        watch,
     )
     .await
     .expect("node start on rocks");
@@ -86,6 +100,7 @@ async fn start_node(store: RocksStore, transport: Arc<InProcTransport>) -> Confi
 async fn start_node_for_replay_only(
     store: RocksStore,
     transport: Arc<InProcTransport>,
+    watch: Arc<WatchHub>,
 ) -> ConfigNode {
     let identity = identity(1);
     let timers = RaftTimers::default();
@@ -97,6 +112,7 @@ async fn start_node_for_replay_only(
         Arc::clone(&transport) as Arc<dyn config_engine::PeerTransport>,
         Arc::new(NoGossip),
         Arc::new(config_core::AllowAll),
+        watch,
     )
     .await
     .expect("node start on rocks");
@@ -143,10 +159,11 @@ async fn m2_engine_01_rocks_restart_reads_back() {
     let dir = tempfile::tempdir().expect("temp dir");
 
     let (revision, state_hash) = {
-        let store = open_store(dir.path());
+        let watch = watch_hub();
+        let store = open_store(dir.path(), watch.clone());
         assert!(store.is_fresh(), "a new directory must open fresh");
         let transport = Arc::new(InProcTransport::new(config_engine::NetFault::new()));
-        let node = start_node(store, transport).await;
+        let node = start_node(store, transport, watch).await;
 
         assert_eq!(
             node.capabilities().durability,
@@ -164,7 +181,8 @@ async fn m2_engine_01_rocks_restart_reads_back() {
     };
 
     // Second incarnation: same directory, nothing carried over but the bytes on disk.
-    let store = open_store(dir.path());
+    let watch = watch_hub();
+    let store = open_store(dir.path(), watch.clone());
     assert!(
         !store.is_fresh(),
         "the reopened store lost its vote, log and applied state"
@@ -183,7 +201,7 @@ async fn m2_engine_01_rocks_restart_reads_back() {
     );
 
     let transport = Arc::new(InProcTransport::new(config_engine::NetFault::new()));
-    let node = start_node(store, transport).await;
+    let node = start_node(store, transport, watch).await;
 
     assert!(
         node.committed_membership().is_formed(),
@@ -235,7 +253,8 @@ async fn m2_engine_01_rocks_restart_reads_back() {
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m2_engine_02_read_committed_drives_replay_window() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let store = open_store(dir.path());
+    let watch = watch_hub();
+    let store = open_store(dir.path(), watch.clone());
 
     let entries: Vec<Entry<TypeConfig>> = (0..7u64).map(blank_entry).collect();
     store
@@ -255,7 +274,7 @@ async fn m2_engine_02_read_committed_drives_replay_window() {
         .expect("committed = the 7th entry (index 6)");
 
     let transport = Arc::new(InProcTransport::new(config_engine::NetFault::new()));
-    let node = start_node_for_replay_only(store, transport).await;
+    let node = start_node_for_replay_only(store, transport, watch).await;
 
     let indexes = replayed_blank_indexes("m2_engine_02_read_committed_drives_replay_window");
     // The phase-1 `apply(entries[..3])` call above also logs 3 "applied non-command entry"
@@ -285,7 +304,8 @@ async fn m2_engine_02_read_committed_drives_replay_window() {
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m2_engine_03_replay_chunked_over_64_entries() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let store = open_store(dir.path());
+    let watch = watch_hub();
+    let store = open_store(dir.path(), watch.clone());
 
     let entries: Vec<Entry<TypeConfig>> = (0..200u64).map(blank_entry).collect();
     store
@@ -300,7 +320,7 @@ async fn m2_engine_03_replay_chunked_over_64_entries() {
         .expect("committed = the 200th entry (index 199)");
 
     let transport = Arc::new(InProcTransport::new(config_engine::NetFault::new()));
-    let node = start_node_for_replay_only(store, transport).await;
+    let node = start_node_for_replay_only(store, transport, watch).await;
 
     let replayed = replayed_blank_indexes("m2_engine_03_replay_chunked_over_64_entries");
     let expected: Vec<u64> = (0..200u64).collect();

@@ -40,3 +40,8 @@ postcard = { workspace = true }
 # hand-built envelope to prove the engine's identity checks are independent of the
 # certificate presented — something no `Cluster` method does on a caller's behalf.
 tonic = { workspace = true }
+# Test-only: M5-17 and M5-71 have to write into a node's data directory *before* or *between*
+# its opens — deleting a published snapshot pointer, hand-building a v1-format store — which is
+# by design unreachable through `RocksStore`. The library itself deliberately does not depend
+# on rocksdb; only these rows do.
+rocksdb = { workspace = true }

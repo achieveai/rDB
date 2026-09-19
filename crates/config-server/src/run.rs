@@ -11,7 +11,8 @@
 //!    so a directory bound to another identity exits 2 and an unopenable one (locked, missing
 //!    column family) exits 3, without either ever having been reachable (ADR-0011, ADR-0018).
 //! 2. **Verify the manifest** (with `--form`), except the endpoint check. A forged or expired
-//!    manifest must not reach a listener either.
+//!    manifest must not reach a listener either, and neither must one that gives this node
+//!    `role = "learner"`: a learner is added by a leader, never formed (ADR-0023).
 //! 3. **Load the policy.** Missing or invalid without `--dev-allow-all` starts the node
 //!    *unready* — it is not a startup failure, because a node that cannot authorize still
 //!    has to replicate (ADR-0018 §6).
@@ -52,6 +53,7 @@ use config_storage::{NoFaults, RocksOptions, RocksStore, StorageOpenError};
 use serde::Serialize;
 use tokio::net::TcpListener;
 
+use crate::backup;
 use crate::cli::Cli;
 use crate::config::{ServerConfig, TlsModeName};
 use crate::{health, manifest};
@@ -139,14 +141,27 @@ pub fn capabilities_without_opening(cfg: &ServerConfig, cli: &Cli) -> Capabiliti
         } else {
             Durability::Persistent
         },
-        watch_resumption: WatchResumption::Unsupported,
+        // M4: this daemon retains an event journal and exposes its compaction floor, so a
+        // resuming watcher can tell "you are behind" from "your cursor is gone" (ADR-0020).
+        watch_resumption: WatchResumption::Retained {
+            compact_revision_visible: true,
+        },
         authz: authz_kind(cfg, cli).into(),
         transport_security: match cfg.tls_mode {
             TlsModeName::Mutual => TransportSecurity::MutualTls,
             TlsModeName::Insecure => TransportSecurity::Insecure,
         },
         pagination: Pagination::Unsupported,
-        dedup: Dedup::Unsupported,
+        // M5: read from `[dedup]` rather than pinned off, because this function's contract is
+        // that it agrees with the started node's own report (E2E-02) — and the started node
+        // reports `Bounded` as soon as the section enables it (ADR-0025, ADR-0016).
+        dedup: if cfg.dedup.enabled {
+            Dedup::Bounded {
+                window_requests: cfg.dedup.window_requests,
+            }
+        } else {
+            Dedup::Unsupported
+        },
     }
 }
 
@@ -159,6 +174,11 @@ pub fn capabilities_without_opening(cfg: &ServerConfig, cli: &Cli) -> Capabiliti
 fn authz_kind(cfg: &ServerConfig, cli: &Cli) -> AuthzKind {
     if cli.dev_allow_all {
         AuthzKind::Development
+    } else if cfg.signed_policy.is_some() {
+        // The strictest honest answer before the files are read: configuration validation has
+        // already proved the paths and the trust keys exist, but not that the document on disk
+        // verifies (M6-37, M6-38).
+        AuthzKind::SignedPolicy
     } else if cfg.policy_path.is_some() {
         AuthzKind::StaticAllowlist
     } else {
@@ -172,11 +192,27 @@ fn authz_kind(cfg: &ServerConfig, cli: &Cli) -> AuthzKind {
 /// this node and nothing else (ADR-0012: a request field can never influence identity).
 struct NodeBackend {
     node: ConfigNode,
+    /// The store the admin plane's `Backup` RPC exports from (M5, ADR-0024).
+    storage: StorageHandle,
+    /// Key material for that export. Never logged; only whether a key is present is reported.
+    backup: crate::config::BackupKeys,
+    /// The node's pinned-pagination path (M6, ADR-0029).
+    ///
+    /// One per daemon, shared by every handle this backend hands out: the pin table is the
+    /// node's bounded resource, so two principals walking the same revision must share one
+    /// snapshot rather than hold two against `list.max_pinned_snapshots`.
+    paginator: Arc<config_engine::Paginator>,
+    /// The signed-policy reload seam (M6, ADR-0027). `None` under every other `authz.mode`.
+    policy: Option<Arc<crate::policy::PolicyLoader>>,
 }
 
 impl ClientBackend for NodeBackend {
     fn store_for(&self, principal: Principal) -> Arc<dyn config_core::ConfigStore> {
-        Arc::new(self.node.direct_client(principal))
+        Arc::new(
+            self.node
+                .direct_client(principal)
+                .with_pagination(Arc::clone(&self.paginator)),
+        )
     }
 
     /// Forward the plane's authentication refusals to the node's counter (M3-81).
@@ -186,6 +222,234 @@ impl ClientBackend for NodeBackend {
     /// no matter how many certificates the listener turned away.
     fn record_authn_rejection(&self) {
         self.node.record_authn_rejection();
+    }
+}
+
+/// How long the admin-plane `Backup` RPC waits for the snapshot it triggered to be published.
+///
+/// A backup is not a request the caller can usefully retry into a tighter loop, so the bound is
+/// generous; what matters is that it *is* bounded, because a build that never publishes would
+/// otherwise hold the RPC open until the client gave up and left the operator with no answer.
+const BACKUP_BUILD_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How often the `Backup` RPC re-reads the store's published snapshot while waiting.
+///
+/// There is no publication notification to await — the store publishes from OpenRaft's own
+/// build task — so this polls. The interval is small enough to be invisible next to the build
+/// it is waiting on and large enough to cost nothing.
+const BACKUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[async_trait::async_trait]
+impl config_grpc::AdminBackend for NodeBackend {
+    fn cluster_id(&self) -> config_core::ClusterId {
+        self.node.identity().cluster_id
+    }
+
+    fn membership_report(&self) -> config_engine::MembershipReport {
+        self.node.membership_report()
+    }
+
+    async fn add_learner(
+        &self,
+        node_id: config_core::NodeId,
+        peer_endpoint: String,
+        client_endpoint: String,
+    ) -> Result<Option<config_engine::LogIdView>, config_engine::AdminError> {
+        self.node
+            .add_learner(node_id, peer_endpoint, client_endpoint)
+            .await
+    }
+
+    async fn promote_voter(
+        &self,
+        node_id: config_core::NodeId,
+    ) -> Result<Option<config_engine::LogIdView>, config_engine::AdminError> {
+        self.node.promote_voter(node_id).await
+    }
+
+    async fn remove_member(
+        &self,
+        node_id: config_core::NodeId,
+    ) -> Result<Option<config_engine::LogIdView>, config_engine::AdminError> {
+        self.node.remove_member(node_id).await
+    }
+
+    async fn trigger_snapshot(
+        &self,
+    ) -> Result<config_engine::SnapshotTriggered, config_engine::AdminError> {
+        self.node.trigger_snapshot().await
+    }
+
+    /// Write a signed backup triple into `dest_dir` **on this node** (ADR-0024, M5-76).
+    ///
+    /// A snapshot is built fresh rather than reusing whatever `current_snapshot` happens to be
+    /// on disk: a backup is a point-in-time export on its own schedule, independent of the Raft
+    /// snapshot policy's cadence. That fresh snapshot is then *copied* into `dest_dir` as a
+    /// scratch file, because the node still owns the published one. Everything after — hash,
+    /// manifest,
+    /// signature, optional encryption — is the same [`crate::backup::finish_artifact`] the
+    /// offline CLI runs, which is what makes the two paths differ only in `node_id` and
+    /// `created_unix_ms`.
+    async fn backup(
+        &self,
+        dest_dir: PathBuf,
+        name: Option<String>,
+    ) -> Result<config_grpc::BackupArtifact, config_engine::AdminError> {
+        let store = match &self.storage {
+            StorageHandle::Rocks(store) => store.clone(),
+            // Every other handle, present and future: a store that cannot build a snapshot
+            // cannot be backed up, and saying so is better than exporting something weaker
+            // than the artifact ADR-0024 describes.
+            _ => {
+                return Err(config_engine::AdminError::Unavailable {
+                    reason: "this node's store cannot build a snapshot, so there is nothing to \
+                             back up"
+                        .to_string(),
+                })
+            }
+        };
+        // Both inputs come off the network, so both are checked before anything is built.
+        // `dest_dir` must already be a directory — a server that creates directories wherever a
+        // caller names one is a filesystem write primitive with an allowlist in front of it —
+        // and `name` is a file *stem*, so it must not be able to escape `dest_dir` (C5-03).
+        config_grpc::check_backup_dir(&dest_dir)?;
+        let name = match &name {
+            Some(n) => backup::validate_name(n)
+                .map_err(|e| config_engine::AdminError::InvalidArgument {
+                    detail: format!("{}: {e}", e.reason()),
+                })?
+                .to_string(),
+            None => backup::default_name(),
+        };
+        let keys = backup::KeyFiles {
+            signing_key: self.backup.signing_key.as_deref(),
+            encryption_key: self.backup.encryption_key.as_deref(),
+            trust_key: None,
+        };
+
+        // Trigger, then wait for a *newer* snapshot than the one that was current when the
+        // call arrived. Comparing ids rather than indexes is what makes an idle cluster work:
+        // a build at an unchanged last_log_id still gets a fresh id (ADR-0022), so an operator
+        // taking two backups of a quiet cluster gets two fresh exports rather than a hang.
+        let before = store.snapshot_meta().map(|m| m.snapshot_id);
+        self.node.trigger_snapshot().await?;
+        let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
+        let meta = loop {
+            match store.snapshot_meta() {
+                Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break meta,
+                _ if tokio::time::Instant::now() >= deadline => {
+                    return Err(config_engine::AdminError::Unavailable {
+                        reason: format!(
+                            "no snapshot was published within {}s of the trigger",
+                            BACKUP_BUILD_DEADLINE.as_secs()
+                        ),
+                    })
+                }
+                _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
+            }
+        };
+
+        let snap_path = config_storage::snapshot::snap_path(store.path(), &meta.snapshot_id);
+        // Blocking file work — hashing and, for an encrypted backup, sealing a whole snapshot
+        // — off the reactor. Leaving it inline would stall every other RPC this worker thread
+        // is driving for as long as the artifact takes to write.
+        let signing_key = keys.signing_key.map(Path::to_path_buf);
+        let encryption_key = keys.encryption_key.map(Path::to_path_buf);
+        let joined = tokio::task::spawn_blocking(move || {
+            // Copied to a scratch file inside `dest_dir` first, exactly as the offline path
+            // exports to one. Handing the node's *live* `<id>.snap` to `finish_artifact`
+            // coupled the artifact to a file the node still owns: the published snapshot can be
+            // replaced or purged mid-read, and anything that consumed the path would unlink the
+            // file `state_meta/current_snapshot` names, after which openraft's next
+            // `InstallSnapshot` fails with "snapshot not found". The copy costs one pass over
+            // the snapshot and removes both hazards (C5-01, M5-76).
+            let scratch = dest_dir.join(format!("{name}.snap.tmp"));
+            let outcome = (|| -> Result<backup::BackupOutcome, backup::BackupError> {
+                std::fs::copy(&snap_path, &scratch).map_err(|e| backup::BackupError::Store {
+                    what: "source",
+                    path: snap_path.display().to_string(),
+                    detail: format!("cannot stage a copy at {}: {e}", scratch.display()),
+                })?;
+                let header = config_storage::snapshot::SnapshotReader::open(&scratch)
+                    .map_err(|e| backup::BackupError::Store {
+                        what: "source",
+                        path: scratch.display().to_string(),
+                        detail: e.to_string(),
+                    })?
+                    .header()
+                    .clone();
+                let keys = backup::KeyFiles {
+                    signing_key: signing_key.as_deref(),
+                    trust_key: None,
+                    encryption_key: encryption_key.as_deref(),
+                };
+                backup::finish_artifact(&header, &scratch, &dest_dir, &name, &keys)
+            })();
+            // This task created the scratch file, so this task removes it — on both paths.
+            let _ = std::fs::remove_file(&scratch);
+            outcome
+        })
+        .await;
+        let outcome = match joined {
+            Ok(Ok(outcome)) => outcome,
+            // A refusal keeps its stable `reason` on the wire, so an operator scripting the
+            // RPC branches on the same string the CLI prints.
+            Ok(Err(e)) => {
+                return Err(config_engine::AdminError::InvalidArgument {
+                    detail: format!("{}: {e}", e.reason()),
+                })
+            }
+            Err(e) => {
+                return Err(config_engine::AdminError::Unavailable {
+                    reason: format!("the backup task did not complete: {e}"),
+                })
+            }
+        };
+
+        tracing::info!(
+            cluster_id = %outcome.cluster_id,
+            revision = outcome.revision,
+            sha256 = %outcome.sha256,
+            dest = %outcome.snapshot_file.display(),
+            encrypted = outcome.encrypted,
+            "backup_created"
+        );
+        let (snapshot_file, manifest_file, signature_file) =
+            backup::BackupManifest::file_names(&outcome.name);
+        Ok(config_grpc::BackupArtifact {
+            name: outcome.name,
+            snapshot_file,
+            manifest_file,
+            signature_file,
+            sha256: outcome.sha256,
+            revision: outcome.revision,
+            size_bytes: outcome.size_bytes,
+            encrypted: outcome.encrypted,
+        })
+    }
+
+    /// M6-12: re-read the signed policy now, without waiting for a poll tick (ADR-0027).
+    ///
+    /// The admin plane has already checked the caller against the **currently active**
+    /// document's `admins`; this method only does the work.
+    async fn reload_policy(&self) -> Result<config_grpc::PolicyReload, config_engine::AdminError> {
+        let Some(loader) = self.policy.clone() else {
+            return Err(config_engine::AdminError::Unavailable {
+                reason: format!(
+                    "{}: this node is not running authz.mode = \"signed\"",
+                    config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED
+                ),
+            });
+        };
+        // File reads and the journal gate, so not on a runtime worker.
+        tokio::task::spawn_blocking(move || loader.reload("rpc"))
+            .await
+            .map_err(|e| config_engine::AdminError::Unavailable {
+                reason: format!("the policy reload task did not complete: {e}"),
+            })?
+            .map_err(|rejected| config_engine::AdminError::InvalidArgument {
+                detail: format!("{}: {rejected}", rejected.reason()),
+            })
     }
 }
 
@@ -202,6 +466,9 @@ struct Running {
     gossip: Option<Arc<GossipNode>>,
     health_shutdown: Option<Arc<tokio::sync::Notify>>,
     health_task: Option<tokio::task::JoinHandle<()>>,
+    /// The signed-policy poller and the notify that stops it (M6, ADR-0027).
+    policy_shutdown: Option<Arc<tokio::sync::Notify>>,
+    policy_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Start, serve, and shut down. Returns the process exit code.
@@ -209,7 +476,16 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     let identity = cfg.identity;
 
     // ---- 1. store -------------------------------------------------------------------
-    let storage = open_store(&cfg, &cli)?;
+    // The hub is built *before* the store because the store publishes applied batches into
+    // it: it is the store's `AppliedBatchSink`, so it cannot be created from a node that does
+    // not exist yet. It learns the reader and the authorizer later, in `ConfigNode::start`
+    // (ADR-0020).
+    let watch = config_engine::WatchHub::with_defaults(cfg.watch_limits);
+    let storage = open_store(
+        &cfg,
+        &cli,
+        Arc::clone(&watch) as Arc<dyn config_storage::AppliedBatchSink>,
+    )?;
 
     // ---- 2. manifest (everything that does not need a bound port) ---------------------
     let verified = if cli.form {
@@ -219,16 +495,31 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
                 "--form requires a [manifest] section naming path, sig and signing_key_pub",
             )
         })?;
-        Some(
-            manifest::verify_document(files, &identity)
-                .map_err(|e| Fatal::rejected("manifest_rejected", e))?,
-        )
+        let verified = manifest::verify_document(files, &identity)
+            .map_err(|e| Fatal::rejected("manifest_rejected", e))?;
+        // A learner-role manifest says what this node may become, not what it is (ADR-0023).
+        // Only a committed Raft entry adds a member, so a node holding one waits idle until an
+        // operator calls `AddLearner` against the leader — and `--form` against it is a mistake
+        // worth refusing loudly, because the alternative is a second cluster with one voter in
+        // it. Refused here, before the planes bind, so such a node never serves anyone.
+        if verified.self_is_learner {
+            return Err(Fatal::rejected(
+                "learner_cannot_form",
+                format!(
+                    "the manifest gives node {} role \"learner\"; a learner is added by the \
+                     leader through AddLearner, never by forming. Start this node without \
+                     --form.",
+                    identity.node_id
+                ),
+            ));
+        }
+        Some(verified)
     } else {
         None
     };
 
     // ---- 3. policy -------------------------------------------------------------------
-    let policy = load_authorizer(&cfg, &cli);
+    let policy = load_authorizer(&cfg, &cli, &watch);
 
     // ---- 4. bind ---------------------------------------------------------------------
     let tls = tls_mode(&cfg)?;
@@ -260,6 +551,16 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     node_cfg.raft = cfg.raft;
     node_cfg.authz_kind = policy.kind;
     node_cfg.transport_security = tls.transport_security();
+    node_cfg.limits.watch = cfg.watch_limits;
+    // Replicated policy (ADR-0025): the engine enforces it inside apply, so it has to come
+    // from the same document the store was sized from.
+    node_cfg.limits.dedup = cfg.dedup;
+    node_cfg.watch_retention = cfg.retention;
+    node_cfg.watch_progress_interval = cfg.watch_progress_interval;
+    node_cfg.promote_max_lag = cfg.promote_max_lag;
+    node_cfg = node_cfg
+        .with_snapshots(cfg.snapshot)
+        .map_err(|e| Fatal::rejected("invalid_config", format!("[snapshot]: {e}")))?;
     // The engine cannot count grants through `Arc<dyn Authorizer>` and never sees the file, so
     // both facts the health endpoint publishes have to be handed to it here (M3-42).
     node_cfg = node_cfg.with_policy_grants(policy.grants);
@@ -278,6 +579,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         transport as Arc<dyn config_engine::PeerTransport>,
         gossip_source,
         policy.authorizer,
+        watch,
     )
     .await
     .map_err(node_start_fatal)?;
@@ -290,6 +592,8 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         gossip: gossip_node,
         health_shutdown: None,
         health_task: None,
+        policy_shutdown: None,
+        policy_task: None,
     };
 
     if let Some(verified) = verified {
@@ -319,14 +623,49 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     };
     running.peer_server = Some(peer_server);
 
+    // One backend value behind two traits, so the admin plane and the client plane can never
+    // disagree about which node they are talking to (OQ-43: the admin service is co-located on
+    // the client-plane mTLS listener, not given a port of its own).
+    // Built here rather than inside the node: the pin table's bounds are the operator's
+    // (`[list]`), and the node has no business reading the daemon's configuration document.
+    // The clock is the real one — the deterministic `ManualClock` exists for the tests, which
+    // construct their own `Paginator` (anti-flake rule 33).
+    let paginator = Arc::new(config_engine::Paginator::new(
+        identity.node_id,
+        running.storage.reader(),
+        Arc::new(config_engine::SystemClock),
+        limits,
+        cfg.list.clone(),
+    ));
+    let backend = Arc::new(NodeBackend {
+        node: running.node.clone(),
+        storage: running.storage.clone(),
+        backup: cfg.backup.clone(),
+        paginator,
+        policy: policy.loader.clone(),
+    });
+    // M6-40: under signed mode the admin set is the active document's, re-read on every call;
+    // `[authz] admins` is not consulted at all, and startup said so.
+    let admins = match &policy.loader {
+        Some(loader) => config_grpc::AdminAllowlist::from_signed_policy(Arc::clone(
+            loader.authorizer(),
+        )
+            as Arc<dyn Authorizer>),
+        None => config_grpc::AdminAllowlist::new(cfg.admins.clone()),
+    };
+    let admin = Some(config_grpc::admin_service(
+        Arc::clone(&backend) as Arc<dyn config_grpc::AdminBackend>,
+        tls.clone(),
+        identity.cluster_id,
+        admins,
+    ));
     let client_server = match serve_client_plane(
-        Arc::new(NodeBackend {
-            node: running.node.clone(),
-        }) as Arc<dyn ClientBackend>,
+        backend as Arc<dyn ClientBackend>,
         client_listener,
         tls,
         identity.cluster_id,
         limits,
+        admin,
     ) {
         Ok(handle) => handle,
         Err(e) => {
@@ -342,9 +681,19 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
             listener,
             running.node.clone(),
             Arc::clone(&notify),
+            cfg.metrics_enabled,
         )));
         running.health_shutdown = Some(notify);
         running.health_task = Some(task);
+    }
+
+    // The policy poller starts only once the planes are up: a node that never finished
+    // starting has nothing to rotate, and a reload that raced formation would revoke watches
+    // on a node with none (M6-11, ADR-0027).
+    if let Some(loader) = &policy.loader {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        running.policy_task = Some(loader.spawn_poller(Arc::clone(&notify)));
+        running.policy_shutdown = Some(notify);
     }
 
     // ---- 8. announce -----------------------------------------------------------------
@@ -387,7 +736,11 @@ fn announce(ready: &ReadyLine) {
     let _ = std::io::stdout().flush();
 }
 
-fn open_store(cfg: &ServerConfig, cli: &Cli) -> Result<StorageHandle, Fatal> {
+fn open_store(
+    cfg: &ServerConfig,
+    cli: &Cli,
+    sink: Arc<dyn config_storage::AppliedBatchSink>,
+) -> Result<StorageHandle, Fatal> {
     let options = RocksOptions {
         sync_writes: !cli.unsafe_no_sync,
         create_if_missing: true,
@@ -403,10 +756,11 @@ fn open_store(cfg: &ServerConfig, cli: &Cli) -> Result<StorageHandle, Fatal> {
     match RocksStore::open_with(
         &cfg.data_dir,
         cfg.identity,
-        config_core::Limits::DEFAULT,
+        limits(cfg),
         Arc::new(NoFaults),
         span,
         options,
+        sink,
     ) {
         Ok(store) => Ok(store.into()),
         Err(e @ StorageOpenError::IdentityMismatch { .. }) => {
@@ -416,16 +770,35 @@ fn open_store(cfg: &ServerConfig, cli: &Cli) -> Result<StorageHandle, Fatal> {
     }
 }
 
+/// The caps this node enforces, as the store must also see them.
+///
+/// The store is opened before `NodeConfig` exists, so the watch caps have to be folded in
+/// here too: a store sized from `Limits::DEFAULT` and an engine sized from the document would
+/// disagree about the same node (ADR-0010).
+fn limits(cfg: &ServerConfig) -> config_core::Limits {
+    let mut limits = config_core::Limits::DEFAULT;
+    limits.watch = cfg.watch_limits;
+    limits.dedup = cfg.dedup;
+    limits
+}
+
 /// Load the allowlist policy, or record honestly why there is none.
 ///
 /// Never fatal: `Missing` and `Invalid` are *failed* authorization, and a node with failed
 /// authorization still replicates while denying every client call (OQ-19).
-fn load_authorizer(cfg: &ServerConfig, cli: &Cli) -> LoadedPolicy {
+fn load_authorizer(
+    cfg: &ServerConfig,
+    cli: &Cli,
+    watch: &Arc<config_engine::WatchHub>,
+) -> LoadedPolicy {
     if cli.dev_allow_all {
         tracing::warn!(
             "authorization is --dev-allow-all: every request is permitted (development only)"
         );
         return LoadedPolicy::without_document(Arc::new(AllowAll), AuthzKind::Development);
+    }
+    if cfg.signed_policy.is_some() {
+        return load_signed_policy(cfg, cli, watch);
     }
     let Some(path) = cfg.policy_path.as_deref() else {
         tracing::warn!(
@@ -457,6 +830,7 @@ fn load_authorizer(cfg: &ServerConfig, cli: &Cli) -> LoadedPolicy {
                 kind: AuthzKind::StaticAllowlist,
                 grants: grants as u64,
                 document: Some(text.into_bytes()),
+                loader: None,
             }
         }
         Err(e) => {
@@ -469,8 +843,63 @@ fn load_authorizer(cfg: &ServerConfig, cli: &Cli) -> LoadedPolicy {
                 // holding one identical broken file is a different incident from a fleet
                 // holding several different ones.
                 document: Some(text.into_bytes()),
+                loader: None,
             }
         }
+    }
+}
+
+/// The `authz.mode = "signed"` branch of [`load_authorizer`] (M6, ADR-0027).
+///
+/// The first load happens **here**, before any listener is bound, so a node is either serving a
+/// verified document or visibly unready — never briefly open under no policy at all. A refusal
+/// is not fatal, for the same reason a missing static allowlist is not: the peer plane and
+/// consensus are authorized separately (§15.3 bullet 5), and a policy outage must not be a
+/// consensus outage.
+fn load_signed_policy(
+    cfg: &ServerConfig,
+    cli: &Cli,
+    watch: &Arc<config_engine::WatchHub>,
+) -> LoadedPolicy {
+    let signed = cfg
+        .signed_policy
+        .clone()
+        .expect("callers check this branch first");
+    if !cfg.admins.is_empty() {
+        // Once, at startup, and loudly: under signed mode the admin set comes only from the
+        // document's own `admins` list (M6-40). An operator who believes this key is granting
+        // admin has a security expectation the node does not meet.
+        tracing::warn!(
+            configured = cfg.admins.len(),
+            "authz.admins is ignored under authz.mode = \"signed\"; the admin set comes only \
+             from the signed document"
+        );
+    }
+    let authorizer = Arc::new(config_core::SignedPolicyAuthorizer::new(
+        cli.break_glass_policy_rollback,
+    ));
+    if cli.break_glass_policy_rollback {
+        tracing::warn!(
+            "--break-glass-policy-rollback is set: a signed document at or below the active \
+             version will be accepted for the lifetime of this process"
+        );
+    }
+    let loader =
+        crate::policy::PolicyLoader::new(signed, Arc::clone(&authorizer), Arc::clone(watch));
+    // Synchronous on purpose: nothing else is running yet, so nothing can hold the journal
+    // gate, and readiness must be decided before step 4 binds anything.
+    let kind = match loader.reload("startup") {
+        Ok(_) => AuthzKind::SignedPolicy,
+        Err(_) => AuthzKind::NoValidPolicy,
+    };
+    LoadedPolicy {
+        authorizer: authorizer as Arc<dyn Authorizer>,
+        kind,
+        // Grant *rules* are a static-allowlist concept; the signed document publishes its
+        // version and hash instead, which is what an operator correlates across a fleet.
+        grants: 0,
+        document: None,
+        loader: Some(loader),
     }
 }
 
@@ -486,6 +915,8 @@ struct LoadedPolicy {
     /// The exact document bytes, when a document was read. `None` means there was nothing to
     /// hash, not that the hash was dropped.
     document: Option<Vec<u8>>,
+    /// The reload seam, under `authz.mode = "signed"` only (M6).
+    loader: Option<Arc<crate::policy::PolicyLoader>>,
 }
 
 impl LoadedPolicy {
@@ -497,6 +928,7 @@ impl LoadedPolicy {
             kind,
             grants: 0,
             document: None,
+            loader: None,
         }
     }
 }
@@ -633,6 +1065,9 @@ async fn form(
     verified: &manifest::VerifiedManifest,
     identity: &ClusterIdentity,
 ) -> Result<(), Fatal> {
+    // The learner-role refusal is not here: it runs in `run` as soon as the manifest is
+    // verified, before either plane binds, so a node holding such a manifest never serves an
+    // RPC on its way to exiting 2.
     let plan = FormationPlan::with_client_endpoints(
         identity,
         verified
@@ -690,8 +1125,19 @@ async fn shutdown(running: Running) {
         gossip,
         health_shutdown,
         health_task,
+        policy_shutdown,
+        policy_task,
     } = running;
 
+    // The poller first: it takes the journal gate, and a reload landing mid-drain would revoke
+    // streams the planes are already shutting down.
+    if let Some(notify) = policy_shutdown {
+        notify.notify_waiters();
+    }
+    if let Some(task) = policy_task {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(notify) = health_shutdown {
         notify.notify_waiters();
     }

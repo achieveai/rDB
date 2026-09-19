@@ -53,20 +53,27 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use config_core::{
-    Authz, Capabilities, ClusterId, ConfigError, ConfigStore, Dedup, DeleteRequest, Durability,
-    GetRequest, GetResponse, Limits, ListRequest, ListResponse, MutationResponse, NodeId,
-    Pagination, PutRequest, WatchResumption,
+    Authz, Capabilities, ClusterId, ConfigError, ConfigStore, Dedup, DedupKey, DeleteRequest,
+    Durability, GetRequest, GetResponse, Limits, ListPage, ListRequest, ListResponse,
+    MutationResponse, NodeId, PageRequest, Pagination, PutRequest, Record, WatchItem, WatchRequest,
+    WatchResumption, WatchStream,
 };
 use config_grpc::pb::config_service_client::ConfigServiceClient;
-use config_grpc::{error_from_status, is_server_rejection, pb, peer_server_domain};
+use config_grpc::{
+    error_from_status, is_server_rejection, pb, peer_server_domain, watch_item_from_pb,
+    TrackedWatch,
+};
 use config_log::TraceContext;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Status;
@@ -186,6 +193,12 @@ pub struct ClientStats {
     /// "reconnect on `Unavailable` before submission" stays bounded (ADR-0015, M3-64). Nothing
     /// was submitted on any of these, so none of them appears in `sends`.
     pub reconnects: u64,
+    /// Watch streams this client opened (M4, test plan TA-38.2).
+    ///
+    /// Paired with "the client never re-opens a terminated stream": this counter equals the
+    /// number of explicit [`GrpcClient::watch_tracked`] calls the caller made, and any excess
+    /// is an automatic resume the library is not allowed to perform.
+    pub watch_opens: u64,
 }
 
 #[derive(Debug, Default)]
@@ -193,6 +206,37 @@ struct Counters {
     sends: AtomicU64,
     hint_follows: AtomicU64,
     reconnects: AtomicU64,
+    watch_opens: AtomicU64,
+}
+
+/// One client process's deduplication namespace and its id sequence (M5, ADR-0025).
+///
+/// `client_id` names the namespace; `next` mints the ids inside it. The seed is
+/// `unix_ms << 20`, so a client process that restarts without durable state resumes above
+/// every id it minted before: the monotonic rule is per `(principal, client_id)` and lives on
+/// the server, so a sequence that restarted at 1 would be refused as non-monotonic until it
+/// caught up. The 20 low bits leave room for ~1M requests inside one millisecond tick.
+#[derive(Debug)]
+struct DedupSession {
+    client_id: [u8; 16],
+    next: AtomicU64,
+}
+
+impl DedupSession {
+    fn new(client_id: [u8; 16]) -> Self {
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            client_id,
+            next: AtomicU64::new(unix_ms << 20),
+        }
+    }
+
+    fn mint(&self) -> DedupKey {
+        DedupKey::new(self.client_id, self.next.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 /// A remote [`ConfigStore`] over the rEtcd client plane.
@@ -208,6 +252,12 @@ pub struct GrpcClient {
     /// `hint_identity_unverified` is a configuration mistake, not an event: one line per
     /// client says it, and a per-request line would bury the log it is meant to warn in.
     warned_unverified_hint: Arc<AtomicBool>,
+    /// The deduplication namespace and id sequence, when the caller asked for one (M5).
+    ///
+    /// Shared behind an `Arc` so that cloning a client keeps one sequence: two clones minting
+    /// the same `request_id` under one `client_id` would make the second look like a duplicate
+    /// of the first.
+    dedup: Option<Arc<DedupSession>>,
 }
 
 impl GrpcClient {
@@ -242,6 +292,7 @@ impl GrpcClient {
             capabilities,
             counters: Arc::new(Counters::default()),
             warned_unverified_hint: Arc::new(AtomicBool::new(false)),
+            dedup: None,
         })
     }
 
@@ -271,6 +322,46 @@ impl GrpcClient {
         self.cluster_id
     }
 
+    /// Stamp every mutation with a bounded deduplication key under `client_id` (M5, ADR-0025).
+    ///
+    /// Two things change. A mutation that does not already carry a key is stamped with a
+    /// freshly minted one, and a mutation that comes back
+    /// [`ConfigError::DeadlineExceededUnknownOutcome`] is resubmitted **once with the same
+    /// id** - but only when the client believes the server retains records, which under
+    /// `GrpcClientOptions::expected_capabilities` means an explicitly configured
+    /// [`Dedup::Bounded`]. The default conservative capabilities report `Unsupported`, so a
+    /// client that has not been told the server deduplicates does not retry, and ADR-0015
+    /// holds exactly as in M4.
+    ///
+    /// The retry is not a softening of ADR-0015: that rule forbids replaying an unknown
+    /// outcome *because a replay could apply twice*. Resubmitting the same
+    /// `(principal, client_id, request_id)` to a node that retains it cannot - the second
+    /// submission is either the first one's original outcome or its first application. One
+    /// retry, not a loop: a second unknown outcome is a state the caller has to reason about.
+    ///
+    /// **Size the server's window against this client's concurrency.** [`Self::clone`] shares
+    /// one id sequence, so several in-flight mutations mint consecutive ids and arrive in
+    /// whatever order the network delivers them. The server admits those gaps (ADR-0025, note
+    /// of 2026-09-19): an id it does not retain but which sits above its oldest retained id was
+    /// never applied. That proof needs the window to still hold the pair's older ids, so a
+    /// caller with `n` mutations outstanding wants `dedup.window_requests >= n`. Below that the
+    /// server is still safe - it refuses rather than applying twice - but a legitimate request
+    /// can come back `request_id_not_monotonic`.
+    pub fn with_dedup(mut self, client_id: [u8; 16]) -> Self {
+        self.dedup = Some(Arc::new(DedupSession::new(client_id)));
+        self
+    }
+
+    /// The deduplication namespace this client stamps mutations with, if any.
+    pub fn dedup_client_id(&self) -> Option<[u8; 16]> {
+        self.dedup.as_ref().map(|d| d.client_id)
+    }
+
+    /// Whether resubmitting an unknown outcome is safe against the configured server.
+    fn dedup_retry_allowed(&self) -> bool {
+        self.dedup.is_some() && matches!(self.capabilities.dedup, Dedup::Bounded { .. })
+    }
+
     /// Send to `endpoint` first instead of the first configured one.
     ///
     /// Used by tests that deliberately address a follower, and by an embedder that prefers a
@@ -295,12 +386,75 @@ impl GrpcClient {
         &self.endpoints
     }
 
+    // ---------------- watches (M4, spec §11, ADR-0020) ----------------
+
+    /// Open a watch stream against the pinned endpoint.
+    ///
+    /// # No hint following, no automatic resume
+    ///
+    /// Unlike every unary call, this makes **one** attempt against one endpoint. A watch is a
+    /// long-lived subscription whose caller holds state — its last delivered revision — and a
+    /// library that silently moved that subscription to another node, or re-opened it after a
+    /// termination, would be deciding on the caller's behalf what to do about a gap it cannot
+    /// see. ADR-0015's no-automatic-replay rule applies to streams as well: a `NotLeader`
+    /// hint, a resumable `ResourceExhausted`, and a `RevisionCompacted` are all surfaced to
+    /// the caller, and [`ClientStats::watch_opens`] counts exactly the calls the caller made
+    /// (test plan M4-106, M4-107, M4-108).
+    ///
+    /// No per-request deadline is set on the RPC: the connect phase is bounded by the
+    /// client's budget, but a watch that delivers nothing for an hour on an idle prefix is
+    /// working correctly, and a deadline would end it.
+    pub async fn watch_tracked(&self, request: WatchRequest) -> Result<TrackedWatch, ConfigError> {
+        let ctx = TraceContext::current_or_root().child();
+        let span = ctx.span("watch");
+        self.watch_attempt(request, ctx).instrument(span).await
+    }
+
+    async fn watch_attempt(
+        &self,
+        request: WatchRequest,
+        ctx: TraceContext,
+    ) -> Result<TrackedWatch, ConfigError> {
+        let endpoint = self.pinned.clone();
+        let channel = self
+            .channel(&endpoint, None, self.opts.request_deadline)
+            .await?;
+        let cap = config_grpc::client_plane_message_limit(&self.opts.limits);
+        let mut client = ConfigServiceClient::new(channel)
+            .max_decoding_message_size(cap)
+            .max_encoding_message_size(cap);
+
+        let mut wire = tonic::Request::new(pb::WatchRequest::from(&request));
+        for (key, value) in ctx.to_headers() {
+            if let Ok(value) = value.parse() {
+                wire.metadata_mut().insert(key, value);
+            }
+        }
+
+        self.counters.sends.fetch_add(1, Ordering::Relaxed);
+        self.counters.watch_opens.fetch_add(1, Ordering::Relaxed);
+        match client.watch(wire).await {
+            Ok(response) => Ok(TrackedWatch::new(Box::pin(WatchItems {
+                inner: response.into_inner(),
+            }))),
+            Err(status) => {
+                if transport_minted(&status) {
+                    self.forget_channel(&endpoint, None);
+                }
+                // `is_mutation: false`: opening a watch writes nothing, so an interrupted
+                // attempt has no outcome to be unsure about.
+                Err(classify(&status, false))
+            }
+        }
+    }
+
     /// Send, hint-follow and reconnect counters since construction.
     pub fn stats(&self) -> ClientStats {
         ClientStats {
             sends: self.counters.sends.load(Ordering::Relaxed),
             hint_follows: self.counters.hint_follows.load(Ordering::Relaxed),
             reconnects: self.counters.reconnects.load(Ordering::Relaxed),
+            watch_opens: self.counters.watch_opens.load(Ordering::Relaxed),
         }
     }
 
@@ -672,6 +826,77 @@ impl GrpcClient {
             }
         }
     }
+
+    /// Walk a prefix one pinned page at a time (M6, ADR-0029).
+    ///
+    /// The walk is the unit of consistency, not the call: every page it yields observes the
+    /// revision the first page pinned, so a client that concatenates them sees one state of
+    /// the cluster rather than a stitch of several. That is the whole reason to prefer it over
+    /// repeated [`ConfigStore::list`] calls with a moving prefix.
+    ///
+    /// `request.max_items` and `request.max_bytes` size each *page*; the walk itself is
+    /// unbounded. A server that does not paginate refuses the first call with
+    /// [`ConfigError::Unavailable`] rather than serving an unpinned walk, and a walk that
+    /// outlived the server's pin TTL or was evicted fails with
+    /// [`ConfigError::PageTokenExpired`] — both of which are the caller's to restart, because
+    /// only the caller knows whether a restarted walk is still useful to it.
+    pub fn list_pages(&self, request: ListRequest) -> PageWalk<'_> {
+        PageWalk {
+            client: self,
+            request,
+            next_page_token: Some(Bytes::new()),
+        }
+    }
+}
+
+/// An in-progress paginated `List` (M6, ADR-0029), created by [`GrpcClient::list_pages`].
+///
+/// Holds the continuation token and nothing else: the pinned snapshot lives on the server, so
+/// dropping a walk abandons it there and it is released by the server's TTL. There is no
+/// `close` to forget to call, and none to fail.
+///
+/// It is a plain `async` cursor rather than a `Stream` because a caller almost always wants
+/// the page boundary — the token expiry and the revision are per page, and a flattened item
+/// stream would hide both.
+pub struct PageWalk<'a> {
+    client: &'a GrpcClient,
+    request: ListRequest,
+    /// `None` once the server returned a page with no cursor, which is how a walk ends.
+    next_page_token: Option<Bytes>,
+}
+
+impl PageWalk<'_> {
+    /// The next page, or `None` when the walk is finished.
+    ///
+    /// An error ends the walk: the token that produced it is not retried, because every reason
+    /// a page token is refused — expiry, eviction, a different node — is one that repeating the
+    /// same token cannot fix.
+    pub async fn next_page(&mut self) -> Option<Result<ListPage, ConfigError>> {
+        let token = self.next_page_token.take()?;
+        let page = match self
+            .client
+            .list_page(PageRequest::resume(self.request.clone(), token))
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => return Some(Err(error)),
+        };
+        self.next_page_token = page.next_page_token.clone();
+        Some(Ok(page))
+    }
+
+    /// Drain the walk into one vector.
+    ///
+    /// Convenience for a caller that paginates only to stay inside the per-response cap, not
+    /// because it wants to stream. It buffers the whole prefix, so it is the wrong call for a
+    /// prefix that does not fit in memory — use [`PageWalk::next_page`] there.
+    pub async fn collect_all(&mut self) -> Result<Vec<Record>, ConfigError> {
+        let mut out = Vec::new();
+        while let Some(page) = self.next_page().await {
+            out.extend(page?.items);
+        }
+        Ok(out)
+    }
 }
 
 /// A short suffix naming the identity a dial was pinned to, for an error message.
@@ -804,27 +1029,60 @@ impl ConfigStore for GrpcClient {
         Ok(response.into())
     }
 
-    async fn put(&self, request: PutRequest) -> Result<MutationResponse, ConfigError> {
-        let response: pb::MutationResponse = self
+    async fn list_page(&self, request: PageRequest) -> Result<ListPage, ConfigError> {
+        let response: pb::ListResponse = self
             .execute(
-                "put",
-                true,
-                pb::PutRequest::from(request),
-                |mut c, r| async move { c.put(r).await },
+                "list_page",
+                false,
+                pb::ListRequest::from(request),
+                |mut c, r| async move { c.list(r).await },
             )
             .await?;
+        Ok(response.into())
+    }
+
+    async fn put(&self, mut request: PutRequest) -> Result<MutationResponse, ConfigError> {
+        if request.dedup.is_none() {
+            request.dedup = self.dedup.as_ref().map(|d| d.mint());
+        }
+        let wire = pb::PutRequest::from(request);
+        let response: pb::MutationResponse = match self
+            .execute("put", true, wire.clone(), |mut c, r| async move {
+                c.put(r).await
+            })
+            .await
+        {
+            Err(ConfigError::DeadlineExceededUnknownOutcome) if self.dedup_retry_allowed() => {
+                self.execute("put", true, wire, |mut c, r| async move { c.put(r).await })
+                    .await?
+            }
+            other => other?,
+        };
         response.try_into()
     }
 
-    async fn delete(&self, request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
-        let response: pb::MutationResponse = self
-            .execute(
-                "delete",
-                true,
-                pb::DeleteRequest::from(request),
-                |mut c, r| async move { c.delete(r).await },
-            )
-            .await?;
+    async fn delete(&self, mut request: DeleteRequest) -> Result<MutationResponse, ConfigError> {
+        if request.dedup.is_none() {
+            request.dedup = self.dedup.as_ref().map(|d| d.mint());
+        }
+        let wire = pb::DeleteRequest::from(request);
+        let response: pb::MutationResponse = match self
+            .execute("delete", true, wire.clone(), |mut c, r| async move {
+                c.delete(r).await
+            })
+            .await
+        {
+            Err(ConfigError::DeadlineExceededUnknownOutcome) if self.dedup_retry_allowed() => {
+                self.execute(
+                    "delete",
+                    true,
+                    wire,
+                    |mut c, r| async move { c.delete(r).await },
+                )
+                .await?
+            }
+            other => other?,
+        };
         response.try_into()
     }
 
@@ -836,5 +1094,351 @@ impl ConfigStore for GrpcClient {
     /// that the server is ephemeral.
     fn capabilities(&self) -> Capabilities {
         self.capabilities
+    }
+
+    async fn watch(&self, request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.watch_tracked(request)
+            .await
+            .map(|tracked| Box::pin(tracked) as WatchStream)
+    }
+}
+
+/// One `Watch` response stream, translated back into [`WatchItem`]s.
+///
+/// The server's terminal status arrives here as the stream's last item, and is read with the
+/// same [`classify`] table every unary call uses — so a `RevisionCompacted` that ended a
+/// stream and one that refused to open it are the same value to the caller.
+struct WatchItems {
+    inner: tonic::Streaming<pb::WatchResponse>,
+}
+
+impl futures_core::Stream for WatchItems {
+    type Item = Result<WatchItem, ConfigError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(response))) => Poll::Ready(Some(watch_item_from_pb(response))),
+            Poll::Ready(Some(Err(status))) => Poll::Ready(Some(Err(classify(&status, false)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// admin plane (M5, ADR-0023, TA-45)
+// ---------------------------------------------------------------------------------------
+
+/// What one node believes about membership, as the admin plane reported it.
+///
+/// A plain snapshot rather than a handle: everything here was true at the instant the node
+/// answered, and a caller polling for catch-up must re-ask rather than re-read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminMembership {
+    /// Committed voter ids, ascending.
+    pub voters: Vec<NodeId>,
+    /// Committed member ids that are not voters, ascending.
+    pub learners: Vec<NodeId>,
+    /// Configs in the effective membership: 1 uniform, 2 joint. Above 1 means a
+    /// `change_membership` was interrupted between its two round trips and the documented
+    /// repair is to re-issue the same call.
+    pub joint_config_len: u32,
+    /// `(term, index)` of the membership entry, if one has been committed.
+    pub membership_log_id: Option<(u64, u64)>,
+    /// Node ids a committed `RetireNode` has fenced. They can never be re-added.
+    pub retired: Vec<NodeId>,
+    /// `(matched_index, lag)` per peer. Empty off the leader.
+    pub replication: BTreeMap<NodeId, (Option<u64>, u64)>,
+    /// The leader's own last log index; `0` off the leader.
+    pub leader_last_log_index: u64,
+    /// Who the answering node believes the leader is.
+    pub current_leader: Option<NodeId>,
+    /// True only when the answering node was the leader at the instant it answered.
+    ///
+    /// A catch-up loop that ignored this would read an empty `replication` map off a follower
+    /// and conclude the learner had never started replicating.
+    pub authoritative: bool,
+    /// Committed `(peer, client)` endpoints of every member.
+    pub endpoints: BTreeMap<NodeId, (String, String)>,
+    /// The promotion threshold the answering node will actually apply, so a caller polls
+    /// against the server's number rather than one it guessed.
+    pub promote_max_lag: u64,
+}
+
+impl AdminMembership {
+    /// How far behind the leader `node_id` is, if the answering node knew.
+    pub fn lag_of(&self, node_id: NodeId) -> Option<u64> {
+        self.replication.get(&node_id).map(|(_, lag)| *lag)
+    }
+
+    /// Whether `node_id` is within [`AdminMembership::promote_max_lag`] of the leader.
+    ///
+    /// Advisory only: the leader re-evaluates the same predicate when `PromoteVoter` arrives,
+    /// because anything a client computed is already stale by the time the RPC lands.
+    pub fn is_caught_up(&self, node_id: NodeId) -> bool {
+        self.lag_of(node_id)
+            .is_some_and(|lag| lag <= self.promote_max_lag)
+    }
+}
+
+/// A committed membership operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminAck {
+    /// The node the operation was about.
+    pub node_id: NodeId,
+    /// `(term, index)` of the membership entry it committed, when there was one.
+    ///
+    /// It carries no catch-up claim, deliberately: OpenRaft's `add_learner` blocking wait is
+    /// logged and discarded internally, so an acknowledgement that implied "and it has caught
+    /// up" would be repeating a bug rather than reporting a fact. Catch-up is proven only by
+    /// polling [`AdminClient::get_membership`].
+    pub membership_log_id: Option<(u64, u64)>,
+}
+
+/// The outcome of a `TriggerSnapshot`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotTrigger {
+    /// Empty when the build had not published by the time the call returned, which is not a
+    /// failure — the build is still running.
+    pub snapshot_id: Option<String>,
+    /// `(term, index)` the published snapshot covers.
+    pub last_log_id: Option<(u64, u64)>,
+    /// A build was already running, so this call started nothing.
+    pub already_in_progress: bool,
+}
+
+/// A backup artifact the server wrote on its own filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupInfo {
+    /// The stem the three files share.
+    pub name: String,
+    /// File names inside `dest_dir`, not full paths.
+    pub snapshot_file: String,
+    /// The manifest's file name.
+    pub manifest_file: String,
+    /// The detached signature's file name.
+    pub signature_file: String,
+    /// Lowercase hex SHA-256 of the plaintext snapshot.
+    pub sha256: String,
+    /// The revision the snapshot covers.
+    pub revision: u64,
+    /// Size of the `.snap` as written.
+    pub size_bytes: u64,
+    /// Whether that file is ciphertext.
+    pub encrypted: bool,
+}
+
+/// The admin plane, over the same mutual-TLS client-plane channel as [`GrpcClient`] (OQ-43).
+///
+/// Held separately from `GrpcClient` rather than folded into it because the two surfaces have
+/// different authorization: a principal on the data-plane policy is not thereby an admin, and
+/// a type that offered `remove_member` next to `put` would make that distinction invisible at
+/// the call site.
+///
+/// Every mutating method is leader-only and surfaces `ConfigError::NotLeader { hint }` off the
+/// leader rather than following the hint. Admin operations are not idempotent in the way a
+/// `get` is — a silently retried `RemoveMember` against a node that has since been re-added
+/// would be a different operation from the one the operator ordered — so ADR-0015's
+/// no-automatic-replay rule applies here in full.
+#[derive(Debug, Clone)]
+pub struct AdminClient {
+    inner: GrpcClient,
+}
+
+impl AdminClient {
+    /// Wrap a connected client. The channel, TLS profile and budget are the client's.
+    pub fn new(inner: GrpcClient) -> Self {
+        Self { inner }
+    }
+
+    /// The endpoint admin calls are sent to.
+    pub fn endpoint(&self) -> &str {
+        self.inner.pinned_endpoint()
+    }
+
+    /// The underlying client, for an embedder that wants its stats or its endpoint set.
+    pub fn client(&self) -> &GrpcClient {
+        &self.inner
+    }
+
+    async fn connect(
+        &self,
+    ) -> Result<pb::admin_service_client::AdminServiceClient<Channel>, ConfigError> {
+        let channel = self
+            .inner
+            .channel(
+                self.inner.pinned_endpoint(),
+                None,
+                self.inner.opts.request_deadline,
+            )
+            .await?;
+        Ok(pb::admin_service_client::AdminServiceClient::new(channel))
+    }
+
+    /// One admin call: open the span, stamp the trace headers, map the status.
+    ///
+    /// `is_mutation` is false for every admin method including the mutating ones, and that is
+    /// deliberate: [`classify`]'s mutation branch exists to turn a transport failure into
+    /// `DeadlineExceededUnknownOutcome` for a *key* write, whose outcome a caller recovers by
+    /// re-reading the key. A membership change has no such read, and its recovery is
+    /// `GetMembership`, so reporting `Unavailable` and letting the operator look is both
+    /// truer and more useful.
+    async fn call<T, F, Fut>(&self, op: &'static str, f: F) -> Result<T, ConfigError>
+    where
+        F: FnOnce(pb::admin_service_client::AdminServiceClient<Channel>) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<T>, Status>>,
+    {
+        let ctx = TraceContext::current_or_root().child();
+        let span = ctx.span(op);
+        async move {
+            let client = self.connect().await?;
+            match f(client).await {
+                Ok(response) => Ok(response.into_inner()),
+                Err(status) => Err(classify(&status, false)),
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Everything the addressed node knows about membership.
+    ///
+    /// Served everywhere, but only [`AdminMembership::authoritative`] answers are worth
+    /// polling for catch-up.
+    pub async fn get_membership(&self) -> Result<AdminMembership, ConfigError> {
+        let report = self
+            .call("admin_get_membership", |mut c| async move {
+                c.get_membership(pb::GetMembershipRequest {}).await
+            })
+            .await?;
+        Ok(AdminMembership {
+            voters: report.voters.into_iter().map(NodeId).collect(),
+            learners: report.learners.into_iter().map(NodeId).collect(),
+            joint_config_len: report.joint_config_len,
+            membership_log_id: report.membership_log_id.map(|l| (l.term, l.index)),
+            retired: report.retired.into_iter().map(NodeId).collect(),
+            replication: report
+                .replication
+                .into_iter()
+                .map(|e| (NodeId(e.node_id), (e.matched_index, e.lag)))
+                .collect(),
+            leader_last_log_index: report.leader_last_log_index,
+            current_leader: report.current_leader.map(NodeId),
+            authoritative: report.authoritative,
+            endpoints: report
+                .endpoints
+                .into_iter()
+                .map(|e| (NodeId(e.node_id), (e.peer, e.client)))
+                .collect(),
+            promote_max_lag: report.promote_max_lag,
+        })
+    }
+
+    /// Add a learner at both of its endpoints (leader-only).
+    ///
+    /// `cluster_id` is sent and checked server-side against the node's bound identity, so an
+    /// operator pointed at the wrong cluster gets a refusal rather than a learner in the wrong
+    /// place.
+    pub async fn add_learner(
+        &self,
+        cluster_id: ClusterId,
+        node_id: NodeId,
+        peer_endpoint: impl Into<String>,
+        client_endpoint: impl Into<String>,
+    ) -> Result<AdminAck, ConfigError> {
+        let request = pb::AddLearnerRequest {
+            node_id: node_id.0,
+            peer_endpoint: peer_endpoint.into(),
+            client_endpoint: client_endpoint.into(),
+            cluster_id: cluster_id.to_string(),
+        };
+        let ack = self
+            .call("admin_add_learner", |mut c| async move {
+                c.add_learner(request).await
+            })
+            .await?;
+        Ok(ack_from_pb(ack))
+    }
+
+    /// Promote a caught-up learner to voter (leader-only).
+    ///
+    /// The catch-up predicate is evaluated on the leader at the moment this arrives, not here:
+    /// anything a client measured is already stale by the time the call lands, and a promotion
+    /// decided on stale replication data is exactly the availability hole the bound exists to
+    /// prevent.
+    pub async fn promote_voter(&self, node_id: NodeId) -> Result<AdminAck, ConfigError> {
+        let ack = self
+            .call("admin_promote_voter", |mut c| async move {
+                c.promote_voter(pb::NodeRef { node_id: node_id.0 }).await
+            })
+            .await?;
+        Ok(ack_from_pb(ack))
+    }
+
+    /// Remove a member and fence its identity forever (leader-only).
+    ///
+    /// On success the removed node is in the committed `retired` set, and every peer refuses
+    /// its RPCs from then on. There is no un-retire: a node that is coming back comes back
+    /// with a new id, a fresh directory and a new certificate.
+    pub async fn remove_member(&self, node_id: NodeId) -> Result<AdminAck, ConfigError> {
+        let ack = self
+            .call("admin_remove_member", |mut c| async move {
+                c.remove_member(pb::NodeRef { node_id: node_id.0 }).await
+            })
+            .await?;
+        Ok(ack_from_pb(ack))
+    }
+
+    /// Ask the addressed node to build a snapshot now.
+    pub async fn trigger_snapshot(&self) -> Result<SnapshotTrigger, ConfigError> {
+        let info = self
+            .call("admin_trigger_snapshot", |mut c| async move {
+                c.trigger_snapshot(pb::TriggerSnapshotRequest {}).await
+            })
+            .await?;
+        Ok(SnapshotTrigger {
+            snapshot_id: Some(info.snapshot_id).filter(|id| !id.is_empty()),
+            last_log_id: info.last_log_id.map(|l| (l.term, l.index)),
+            already_in_progress: info.already_in_progress,
+        })
+    }
+
+    /// Write a signed backup triple into `dest_dir` **on the addressed node** (leader-only).
+    ///
+    /// `dest_dir` is a path on the server, not on the caller: the snapshot is built from the
+    /// node's own consistent view and streamed straight to its disk, never back through this
+    /// RPC.
+    pub async fn backup(
+        &self,
+        dest_dir: impl Into<String>,
+        name: Option<String>,
+    ) -> Result<BackupInfo, ConfigError> {
+        let request = pb::BackupRequest {
+            dest_dir: dest_dir.into(),
+            name: name.unwrap_or_default(),
+        };
+        let info = self
+            .call(
+                "admin_backup",
+                |mut c| async move { c.backup(request).await },
+            )
+            .await?;
+        Ok(BackupInfo {
+            name: info.name,
+            snapshot_file: info.snapshot_file,
+            manifest_file: info.manifest_file,
+            signature_file: info.signature_file,
+            sha256: info.sha256,
+            revision: info.revision,
+            size_bytes: info.size_bytes,
+            encrypted: info.encrypted,
+        })
+    }
+}
+
+fn ack_from_pb(ack: pb::AdminAck) -> AdminAck {
+    AdminAck {
+        node_id: NodeId(ack.node_id),
+        membership_log_id: ack.membership_log_id.map(|l| (l.term, l.index)),
     }
 }

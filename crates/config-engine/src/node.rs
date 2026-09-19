@@ -1,7 +1,7 @@
 //! The node: OpenRaft lifecycle, explicit formation, the client entry points, and the
 //! peer-plane server side (spec §6.3, §8.1, §10.1, §13.1; ADR-0009, ADR-0011, ADR-0015).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -10,26 +10,32 @@ use async_trait::async_trait;
 use config_core::{
     Action, Authorizer, Capabilities, ClusterIdentity, Command, CommandResponse, ConfigError,
     Decision, Dedup, DeleteRequest, GetRequest, GetResponse, GossipObservationSource,
-    IdentityMismatch, KvState, LeaderHint, Limits, ListRequest, ListResponse, MutationResponse,
-    NodeId, ObservedPeerHint, Pagination, Principal, PutRequest, WatchResumption,
+    IdentityMismatch, KvState, LeaderHint, Limits, ListRequest, ListResponse, Liveness,
+    MutationResponse, NodeId, ObservedPeerHint, Pagination, Principal, PutRequest, WatchRequest,
+    WatchResumption, WatchRetention, WatchStream,
 };
 use config_log::TraceContext;
-use config_storage::{RaftNode, RaftNodeId, StateReader, TraceRegistry, TypeConfig};
+use config_storage::{
+    RaftNode, RaftNodeId, StateReader, StorageMetrics, TraceRegistry, TypeConfig,
+};
 use openraft::error::{CheckIsLeaderError, ClientWriteError, Fatal, InitializeError, RaftError};
-use openraft::{Raft, ServerState};
+use openraft::{ChangeMembers, Raft, ServerState};
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span};
 
+use crate::admin::{AdminError, MembershipReport, ReplicationProgress, SnapshotTriggered};
 use crate::config::{NodeConfig, StorageHandle};
 use crate::error::{EngineError, FormationError, FormationPlan, Timeout};
 use crate::hint::{validate_hint, HintVerdict};
 use crate::metrics::{
-    Health, HealthPayload, LogIdView, MembershipView, NodeMetrics, NodeRole, PolicySummary,
+    Health, HealthPayload, LatencyHistogram, LogIdView, MembershipView, MetricsReport, NodeMetrics,
+    NodeRole, OpLatencies, PolicySummary,
 };
 use crate::network::EngineNetworkFactory;
 use crate::transport::{
     PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSink, PeerTransport,
 };
+use crate::watch::{retention_target, JournalView, LeaderClock, WatchHub, WatchStats};
 
 /// How often a bounded wait re-checks its predicate when the metrics channel is quiet.
 /// Small enough to keep test deadlines tight, large enough not to spin (test plan §6 rule 2).
@@ -37,6 +43,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Maximum key bytes rendered into a `key_hex` log field (ADR-0013).
 const KEY_HEX_MAX_BYTES: usize = 32;
+
+/// Leader-local `(revision, receipt_ms)` samples the retention task keeps.
+///
+/// One sample per `check_interval`, so 1,024 of them cover the default 24 h policy many
+/// times over at the default 60 s cadence; the oldest are dropped first.
+const MAX_RETENTION_SAMPLES: usize = 1024;
 
 fn key_hex(key: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -100,6 +112,41 @@ pub(crate) struct NodeInner {
     /// Client connections whose transport identity could not be established (M3-81). The
     /// engine never sees a certificate, so only the transport can count these.
     authn_rejected: AtomicU64,
+    /// The peer-plane share of `authn_rejected`, so `/metrics` can label the family by plane
+    /// truthfully instead of attributing a fenced peer to the client plane (ADR-0026).
+    authn_rejected_peer: AtomicU64,
+    /// Watch fan-out, the journal gate, and the admission counters (ADR-0020).
+    ///
+    /// The same `Arc` the store was opened with as its `AppliedBatchSink`: the hub only sees
+    /// applied batches because storage publishes into it, so a node whose store was opened
+    /// with a different sink would replay history and then go silent.
+    watch: Arc<WatchHub>,
+    /// When the leader proposes a `Compact` (ADR-0019).
+    retention: WatchRetention,
+    /// The leader's clock. Read only by the retention task; `apply` has no clock (TA-33).
+    clock: Arc<dyn LeaderClock>,
+    /// Leader-local `(revision, receipt_ms)` samples, newest last.
+    ///
+    /// Not state-machine state: not hashed, not persisted, not replicated. A new leader
+    /// starts empty and therefore proposes no age-based compaction of history it did not
+    /// see arrive (test plan M4-28, M4-29).
+    receipts: Mutex<Vec<(u64, u64)>>,
+    retention_task: Mutex<Option<JoinHandle<()>>>,
+    /// Observed leadership transitions, and the leader they were observed against
+    /// (`retcd_raft_leader_changes_total`, ADR-0026).
+    ///
+    /// Sampled by the background ticker that already polls gossip, rather than derived at
+    /// scrape time: a counter that only moved when somebody scraped would miss every change
+    /// between two scrapes, which is the flapping this metric exists to show.
+    leader_changes: AtomicU64,
+    last_seen_leader: Mutex<Option<NodeId>>,
+    /// Gossip hints refused because they disagreed with committed membership (spec 18.2,
+    /// `retcd_gossip_endpoint_mismatch_total`).
+    gossip_endpoint_mismatch: AtomicU64,
+    /// Client-write submit-to-commit latency, by op (`retcd_proposal_latency_seconds`).
+    proposal_latency: OpLatencies,
+    /// Linearizable read barrier latency (`retcd_linearizable_read_latency_seconds`).
+    read_latency: LatencyHistogram,
 }
 
 /// A running rEtcd node: one OpenRaft instance, one store, one authorizer.
@@ -138,11 +185,12 @@ impl ConfigNode {
     ///
     /// Requires a current Tokio runtime; the library never creates one (spec §6.3).
     pub async fn start(
-        cfg: NodeConfig,
+        mut cfg: NodeConfig,
         storage: StorageHandle,
         transport: Arc<dyn PeerTransport>,
         gossip: Arc<dyn GossipObservationSource>,
         authorizer: Arc<dyn Authorizer>,
+        watch: Arc<WatchHub>,
     ) -> Result<ConfigNode, EngineError> {
         tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
 
@@ -166,6 +214,14 @@ impl ConfigNode {
             recovery_epoch = identity.recovery_epoch.0,
         );
 
+        // The snapshot policy is settled here, against the store that has to honour it: an
+        // ephemeral store cannot build a snapshot, and OpenRaft treats a failed build as fatal
+        // (M5, ADR-0022). The store is told the part it owns — how many published files to
+        // retain — because nothing else in the system knows the policy at open time.
+        cfg.snapshot = cfg.effective_snapshot(&storage);
+        if let StorageHandle::Rocks(store) = &storage {
+            store.configure_snapshots(&cfg.snapshot);
+        }
         let raft_config = Arc::new(
             cfg.openraft_config()
                 .validate()
@@ -210,6 +266,7 @@ impl ConfigNode {
         }
         .map_err(|e| EngineError::Raft(e.to_string()))?;
 
+        let cfg_watch_retention = cfg.watch_retention;
         let inner = Arc::new(NodeInner {
             reader: storage.reader(),
             cfg,
@@ -224,7 +281,31 @@ impl ConfigNode {
             background: Mutex::new(None),
             authz_denied: AtomicU64::new(0),
             authn_rejected: AtomicU64::new(0),
+            authn_rejected_peer: AtomicU64::new(0),
+            retention: cfg_watch_retention,
+            clock: watch.clock(),
+            watch,
+            receipts: Mutex::new(Vec::new()),
+            retention_task: Mutex::new(None),
+            leader_changes: AtomicU64::new(0),
+            last_seen_leader: Mutex::new(None),
+            gossip_endpoint_mismatch: AtomicU64::new(0),
+            proposal_latency: OpLatencies::default(),
+            read_latency: LatencyHistogram::default(),
         });
+        inner
+            .watch
+            .set_authz_ready(inner.cfg.authz_kind.is_present());
+        inner
+            .watch
+            .attach(&inner.reader, Arc::clone(&inner.authorizer), span.clone());
+
+        let retention_handle =
+            tokio::spawn(retention_loop(Arc::downgrade(&inner)).instrument(span.clone()));
+        *inner
+            .retention_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(retention_handle);
 
         let handle = tokio::spawn(
             background_loop(
@@ -383,6 +464,19 @@ impl ConfigNode {
         {
             handle.abort();
         }
+        if let Some(handle) = self
+            .inner
+            .retention_task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+        }
+        // Before OpenRaft shuts down, so an open stream ends with `Unavailable` (the node is
+        // going away) rather than racing the metrics watcher into `NotLeader` (a redirect to
+        // somewhere it could usefully reconnect). M4-85 is exactly that distinction.
+        self.inner.watch.shutdown();
         let res = self
             .inner
             .raft
@@ -501,8 +595,76 @@ impl ConfigNode {
             authz_kind: inner.cfg.authz_kind,
             transport_security: inner.cfg.transport_security,
             policy: inner.policy_summary(),
+            restored_from: inner.reader.restored_from(),
             authz_denied: m.authz_denied,
             authn_rejected: m.authn_rejected,
+        }
+    }
+
+    /// Gather everything one `/metrics` scrape needs (M5, ADR-0026).
+    ///
+    /// Async because the commit index lives on OpenRaft's core task, like
+    /// [`ConfigNode::health_payload`]. Everything else is a counter read or a synchronous
+    /// state read, so a scrape costs one round trip to the core and no locks a request path
+    /// waits on.
+    ///
+    /// Left for the daemon to fill: `disk_free_bytes`, `cert_expiry_seconds`, and
+    /// `backup_age_seconds` are facts about an environment — a filesystem, a certificate file,
+    /// a backup directory — not about a Raft node, and the engine has no handle on any of
+    /// them. Each is an `Option`/empty map whose series is *omitted* rather than exported as a
+    /// zero, because "no free-space reading" and "no free space" must not look alike on a
+    /// dashboard. As of M5 the daemon leaves all three unset: free space needs a platform
+    /// syscall, expiry needs X.509 parsing the TLS layer does not do today, and backup age
+    /// belongs to the backup command's own bookkeeping. The three alerts in
+    /// `docs/runbooks/alerts.md` that would use them are documented as not-yet-armed.
+    pub async fn metrics_report(&self) -> MetricsReport {
+        let inner = &self.inner;
+        let commit_index = inner
+            .raft
+            .with_raft_state(|st| st.committed.map(|l| l.index))
+            .await
+            .ok()
+            .flatten();
+        let m = inner.metrics();
+        // Off the leader this map is empty by construction (`MembershipReport::replication`),
+        // so a follower exports no `retcd_raft_peer_lag` series at all rather than exporting
+        // zeros that would read as "every peer is caught up".
+        let peer_lag = inner
+            .membership_report()
+            .replication
+            .into_iter()
+            .map(|(id, progress)| (id, progress.lag))
+            .collect();
+        let gossip_reachable = inner
+            .gossip
+            .peers()
+            .into_iter()
+            .map(|hint| (hint.node_id, matches!(hint.liveness, Liveness::Alive)))
+            .collect();
+        MetricsReport {
+            node: m,
+            storage: self.storage_metrics(),
+            dedup: inner.reader.dedup_stats(),
+            compactions: inner.reader.compactions(),
+            watch: inner.watch.stats(),
+            gossip_reachable,
+            gossip_endpoint_mismatch: inner.gossip_endpoint_mismatch.load(Ordering::Relaxed),
+            leader_changes: inner.leader_changes.load(Ordering::Relaxed),
+            peer_lag,
+            commit_index,
+            proposal_latency: inner.proposal_latency.snapshot(),
+            read_latency: inner.read_latency.snapshot(),
+            disk_free_bytes: None,
+            cert_expiry_seconds: BTreeMap::new(),
+            backup_age_seconds: None,
+        }
+    }
+
+    /// RocksDB, snapshot, and purge counters, or `None` for an ephemeral store.
+    pub fn storage_metrics(&self) -> Option<StorageMetrics> {
+        match &self.inner.storage {
+            StorageHandle::Rocks(s) => Some(s.metrics()),
+            StorageHandle::Ephemeral(_) => None,
         }
     }
 
@@ -514,6 +676,8 @@ impl ConfigNode {
     /// was consulted and no audit line was written. The two counters are kept apart for that
     /// reason: "who are you" failing and "you may not" failing are different operator
     /// problems with different fixes.
+    /// Records the **client-plane** share only; the peer plane's `identity_retired` fence is
+    /// counted inside the engine, where that check lives.
     pub fn record_authn_rejection(&self) {
         self.inner.authn_rejected.fetch_add(1, Ordering::Relaxed);
     }
@@ -522,11 +686,26 @@ impl ConfigNode {
     pub fn capabilities(&self) -> Capabilities {
         Capabilities {
             durability: self.inner.storage.durability(),
-            watch_resumption: WatchResumption::Unsupported,
+            // M4: the journal is retained and its watermark is visible to a client, both as
+            // `RevisionCompacted { minimum_available_revision }` and in the health payload
+            // (ADR-0016, ADR-0020).
+            watch_resumption: WatchResumption::Retained {
+                compact_revision_visible: true,
+            },
             authz: self.inner.cfg.authz_kind.into(),
             transport_security: self.inner.cfg.transport_security,
             pagination: Pagination::Unsupported,
-            dedup: Dedup::Unsupported,
+            // M5: reported from the enforced limits, never from a build flag - a node whose
+            // `[dedup]` section is absent or disabled is an M4 build as far as a client can
+            // tell, and one that has it on advertises the window a resubmission survives
+            // (ADR-0016, ADR-0025, M5-108).
+            dedup: if self.inner.cfg.limits.dedup.enabled {
+                Dedup::Bounded {
+                    window_requests: self.inner.cfg.limits.dedup.window_requests,
+                }
+            } else {
+                Dedup::Unsupported
+            },
         }
     }
 
@@ -651,6 +830,181 @@ impl ConfigNode {
             .instrument(span)
             .await
     }
+
+    // ---------------- watches (spec §11, ADR-0019, ADR-0020) ----------------
+
+    /// Watch one prefix from a resume cursor (spec §11.2).
+    ///
+    /// The seven steps of §11.2, in the order the test plan pins them:
+    ///
+    /// 1. validate the request and authorize the prefix (M4-49: a denial must precede the
+    ///    admission slot, or an unauthorized caller could exhaust the node's stream budget);
+    /// 2. confirm leadership with `ensure_linearizable` (M4-84: a follower consumes no slot);
+    /// 3. admit the stream against the node and per-principal caps;
+    /// 4. under the serialized journal gate, validate the cursor against `compact_revision`,
+    ///    capture the high-water revision `H`, and subscribe to the live fan-out;
+    /// 5. replay the journal's `(R, H]` in pages, prefix-filtered and re-authorized per event;
+    /// 6. buffer live items above `H` while replay runs;
+    /// 7. drain the buffer and switch to live delivery.
+    ///
+    /// Steps 1-2 live here because only the node owns the authorizer seam and the Raft
+    /// handle; steps 3-7 are [`crate::watch::WatchHub`].
+    ///
+    /// ADR-0020 lists admission *before* the leader check. It is done after it here, because
+    /// the plan's own rows require a follower to consume no admission slot, and confirming
+    /// leadership is the cheaper of the two ways to satisfy that.
+    pub async fn watch(
+        &self,
+        principal: &Principal,
+        req: WatchRequest,
+    ) -> Result<WatchStream, ConfigError> {
+        let span = self.inner.op_span("watch");
+        self.inner
+            .watch_inner(principal, req)
+            .instrument(span)
+            .await
+    }
+
+    /// This node's watch counters (test plan TA-34).
+    pub fn watch_stats(&self) -> WatchStats {
+        self.inner.watch.stats()
+    }
+
+    /// The hub itself, for the gate hooks the deterministic-interleaving rows drive
+    /// (test plan TA-30).
+    pub fn watch_hub(&self) -> &Arc<WatchHub> {
+        &self.inner.watch
+    }
+
+    /// The replicated compaction watermark: no event at or below it is retained.
+    pub fn compact_revision(&self) -> u64 {
+        self.inner.reader.compact_revision().unwrap_or(0)
+    }
+
+    /// A digest over retained journal events above `from_exclusive` (test plan TA-31).
+    ///
+    /// Separate from [`ConfigNode::state_hash`], which keeps its M1/M2 definition: a
+    /// node-local v1-to-v2 migration stamp makes `compact_revision` differ across a rolling
+    /// upgrade, and folding it into `state_hash` would break every existing row.
+    pub fn journal_hash(&self, from_exclusive: u64) -> [u8; 32] {
+        self.inner
+            .reader
+            .journal_hash(from_exclusive)
+            .unwrap_or([0u8; 32])
+    }
+
+    /// Retained-journal shape: oldest and newest revision, count and bytes.
+    pub fn journal_view(&self) -> JournalView {
+        self.inner.reader.journal_stats().map_or(
+            JournalView {
+                oldest_revision: 0,
+                newest_revision: 0,
+                count: 0,
+                bytes: 0,
+            },
+            |s| JournalView {
+                // `None` means "empty", and `JournalView` says the same thing with a
+                // zero — there is no revision 0, so the two spellings cannot be confused.
+                oldest_revision: s.oldest_revision.unwrap_or(0),
+                newest_revision: s.newest_revision.unwrap_or(0),
+                count: s.count,
+                bytes: s.bytes,
+            },
+        )
+    }
+
+    /// Propose a compaction through the ordinary write path (test plan TA-36).
+    ///
+    /// There is deliberately no back door that writes `compact_revision` on one node: a
+    /// watermark that did not travel through the log would make "followers compacted
+    /// identically" pass vacuously.
+    pub async fn propose_compact(
+        &self,
+        principal: &Principal,
+        up_to_revision: u64,
+    ) -> Result<u64, ConfigError> {
+        self.inner.propose_compact(principal, up_to_revision).await
+    }
+
+    // ---------------- admin plane (M5, ADR-0023) ----------------
+
+    /// Everything one node knows about membership: committed voters, effective learners, the
+    /// joint-config length, the retired set, and — on the leader — per-peer replication
+    /// progress (test plan TA-45).
+    ///
+    /// Synchronous and lock-light: it reads the metrics watch channel and the applied state,
+    /// so an operator may poll it as tightly as they like while waiting for a learner.
+    pub fn membership_report(&self) -> MembershipReport {
+        self.inner.membership_report()
+    }
+
+    /// How many log entries `node_id` is behind this leader, or `None` when this node is not
+    /// the leader or has heard nothing from that peer.
+    ///
+    /// The **only** admissible catch-up oracle (architecture A5, research trap T7): a
+    /// `Raft::add_learner(blocking = true)` that returns `Ok` proves nothing, because
+    /// openraft logs and discards the wait's result.
+    pub fn replication_lag(&self, node_id: NodeId) -> Option<u64> {
+        self.inner.membership_report().lag_of(node_id)
+    }
+
+    /// Ids a committed `RetireNode` has fenced out of this cluster for good (ADR-0023).
+    pub fn retired_nodes(&self) -> BTreeSet<NodeId> {
+        self.inner.retired_nodes()
+    }
+
+    /// Add `node_id` as a **learner** at the given endpoints (spec §13.2, ADR-0023).
+    ///
+    /// Non-blocking on purpose: openraft's blocking form waits for catch-up and then throws
+    /// the wait's result away (trap T7), so an `Ok` from it would be an acknowledgement that
+    /// looked like a promise. Catch-up is proven only by polling
+    /// [`ConfigNode::membership_report`].
+    ///
+    /// Refuses a retired id — the readmission half of the fence, without which network
+    /// fencing alone would let a retired node be invited back in (test plan M5-62).
+    pub async fn add_learner(
+        &self,
+        node_id: NodeId,
+        peer_endpoint: String,
+        client_endpoint: String,
+    ) -> Result<Option<LogIdView>, AdminError> {
+        self.inner
+            .add_learner(node_id, peer_endpoint, client_endpoint)
+            .await
+    }
+
+    /// Promote a caught-up learner to voter (ADR-0023, A5).
+    ///
+    /// The lag predicate is evaluated **here, live, on the leader** at the moment of the
+    /// call, against `RaftMetrics.replication` — not against anything the caller passed in.
+    pub async fn promote_voter(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
+        self.inner.promote_voter(node_id).await
+    }
+
+    /// Remove `node_id` and fence its identity (lead ruling M5-R5).
+    ///
+    /// Three replicated steps, in this order and no other:
+    /// 1. `RemoveVoters({id})` with `retain = true` — the id becomes a learner, which is the
+    ///    only shape `RemoveNodes` will accept next;
+    /// 2. `RemoveNodes({id})` — it leaves membership entirely;
+    /// 3. `Command::RetireNode { id }` — replicated state that every node, including one that
+    ///    was partitioned while steps 1 and 2 happened, will refuse to talk to afterwards.
+    ///
+    /// Idempotent: re-issuing it against an already-removed, already-retired id is a no-op
+    /// (test plan M5-67).
+    pub async fn remove_member(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
+        self.inner.remove_member(node_id).await
+    }
+
+    /// Ask this node to build a snapshot now (ADR-0022, OQ-44).
+    ///
+    /// Answers [`SnapshotTriggered::AlreadyInProgress`] rather than a silent `Ok` when a
+    /// build is already running: openraft's own trigger returns `false` and does nothing in
+    /// that case (trap T13), and an admin plane that passed that silence on would be telling
+    /// an operator a snapshot had been requested when none had.
+    pub async fn trigger_snapshot(&self) -> Result<SnapshotTriggered, AdminError> {
+        self.inner.trigger_snapshot().await
+    }
 }
 
 impl NodeInner {
@@ -684,6 +1038,7 @@ impl NodeInner {
             millis_since_quorum_ack: m.millis_since_quorum_ack,
             authz_denied: self.authz_denied.load(Ordering::Relaxed),
             authn_rejected: self.authn_rejected.load(Ordering::Relaxed),
+            authn_rejected_peer: self.authn_rejected_peer.load(Ordering::Relaxed),
         }
     }
 
@@ -737,6 +1092,405 @@ impl NodeInner {
             m.nodes().map(|(id, node)| (*id, node.clone())),
             *m.log_id(),
         )
+    }
+
+    // ---------------- admin plane (M5, ADR-0023) ----------------
+
+    /// The replicated retired set, read from applied state.
+    ///
+    /// Applied state rather than a node-local cache: "stale identities cannot rejoin" has to
+    /// hold on every node a retired node might dial, including one that was partitioned while
+    /// the removal happened, so the fence travels through the log like any other fact.
+    fn retired_nodes(&self) -> BTreeSet<NodeId> {
+        let mut out = BTreeSet::new();
+        self.reader
+            .with_state(&mut |s| out = s.retired_nodes().clone());
+        out
+    }
+
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        let mut retired = false;
+        self.reader
+            .with_state(&mut |s| retired = s.is_retired(node_id));
+        retired
+    }
+
+    /// Refuse unless this node is the leader *now*, with the best hint it can prove.
+    ///
+    /// A pre-check, not the authority: `change_membership` re-checks on the core task and
+    /// answers `ForwardToLeader` if leadership moved in between. Doing it here first turns
+    /// the common case into one cheap refusal carrying a followable hint, instead of a round
+    /// trip through the Raft core.
+    fn require_leader(&self) -> Result<(), AdminError> {
+        if self.is_stopped() {
+            return Err(AdminError::Unavailable {
+                reason: "stopped".to_string(),
+            });
+        }
+        let metrics = self.raft.metrics();
+        let (state, leader) = {
+            let m = metrics.borrow();
+            (m.state, m.current_leader)
+        };
+        let me = self.cfg.identity.node_id;
+        if matches!(state, ServerState::Leader) && leader == Some(me.0) {
+            return Ok(());
+        }
+        Err(AdminError::NotLeader {
+            hint: leader.map(NodeId).and_then(|id| self.hint_for(id)),
+        })
+    }
+
+    fn membership_report(&self) -> MembershipReport {
+        let m = self.raft.metrics().borrow().clone();
+        let me = self.cfg.identity.node_id;
+        let authoritative =
+            matches!(m.state, ServerState::Leader) && m.current_leader == Some(me.0);
+        let effective = m.membership_config;
+        let voters: BTreeSet<NodeId> = effective.voter_ids().map(NodeId).collect();
+        let mut learners = BTreeSet::new();
+        let mut effective_endpoints = BTreeMap::new();
+        for (id, node) in effective.nodes() {
+            let id = NodeId(*id);
+            if !voters.contains(&id) {
+                learners.insert(id);
+            }
+            effective_endpoints.insert(id, (node.peer.clone(), node.client.clone()));
+        }
+        let leader_last_log_index = if authoritative {
+            m.last_log_index.unwrap_or(0)
+        } else {
+            0
+        };
+        // `replication` is `Some` only on a leader (research §3.3). Off the leader the map is
+        // left empty and `authoritative` is false, so a poller cannot read "no entries" as
+        // "nothing is replicating".
+        let replication = match (&m.replication, authoritative) {
+            (Some(map), true) => map
+                .iter()
+                .filter(|(id, _)| NodeId(**id) != me)
+                .map(|(id, matched)| {
+                    let matched_index = matched.map(|l| l.index);
+                    (
+                        NodeId(*id),
+                        ReplicationProgress {
+                            matched_index,
+                            lag: leader_last_log_index.saturating_sub(matched_index.unwrap_or(0)),
+                        },
+                    )
+                })
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        MembershipReport {
+            membership: self.committed_membership(),
+            learners,
+            joint_config_len: effective.membership().get_joint_config().len(),
+            retired: self.retired_nodes(),
+            replication,
+            leader_last_log_index,
+            current_leader: m.current_leader.map(NodeId),
+            authoritative,
+            promote_max_lag: self.cfg.promote_max_lag,
+            effective_endpoints,
+            effective_membership_log_id: (*effective.log_id()).map(view),
+        }
+    }
+
+    /// Turn a membership-change failure into an [`AdminError`].
+    ///
+    /// `ForwardToLeader` becomes `NotLeader` with the hint the *error* named rather than the
+    /// one this node last believed: leadership moved, and the fresher of the two answers is
+    /// the one that came back with the refusal.
+    fn membership_error(
+        &self,
+        e: RaftError<RaftNodeId, ClientWriteError<RaftNodeId, RaftNode>>,
+    ) -> AdminError {
+        match e {
+            RaftError::APIError(ClientWriteError::ForwardToLeader(f)) => AdminError::NotLeader {
+                hint: f.leader_id.map(NodeId).and_then(|id| self.hint_for(id)),
+            },
+            RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
+                AdminError::Raft(e.to_string())
+            }
+            RaftError::Fatal(fatal) => AdminError::Fatal(fatal.to_string()),
+        }
+    }
+
+    /// One `admin_op_local` line per attempt (ADR-0013, m5-interfaces).
+    ///
+    /// Deliberately **not** named `admin_op`. ADR-0023 requires exactly one `admin_op` audit
+    /// record per operation and that record must name the principal, which only the admin
+    /// plane knows: an engine-level line called `admin_op` produced a second, principal-less
+    /// record for every gRPC call, so a log search for "who removed node 3" returned two hits
+    /// and one of them could not answer the question.
+    ///
+    /// The engine still emits its own line, because an embedder that drives these calls
+    /// directly — the in-process test harness, a future embedded control plane — would
+    /// otherwise leave no trail at all. `admin_op_local` says exactly what it is: the engine
+    /// saw this operation, and it carries no principal by construction.
+    fn audit_admin<T>(
+        &self,
+        op: &'static str,
+        target: Option<NodeId>,
+        result: &Result<T, AdminError>,
+    ) {
+        let target_node = target.map_or(0, |n| n.0);
+        match result {
+            Ok(_) => self.span.in_scope(|| {
+                tracing::info!(op, target_node, outcome = "ok", "admin_op_local");
+            }),
+            Err(e) => self.span.in_scope(|| {
+                tracing::warn!(
+                    op,
+                    target_node,
+                    outcome = "rejected",
+                    reason = e.reason(),
+                    detail = %e,
+                    "admin_op_local"
+                );
+            }),
+        }
+    }
+
+    async fn add_learner(
+        &self,
+        node_id: NodeId,
+        peer_endpoint: String,
+        client_endpoint: String,
+    ) -> Result<Option<LogIdView>, AdminError> {
+        let result = self
+            .add_learner_inner(node_id, peer_endpoint, client_endpoint)
+            .await;
+        self.audit_admin("add_learner", Some(node_id), &result);
+        result
+    }
+
+    async fn add_learner_inner(
+        &self,
+        node_id: NodeId,
+        peer_endpoint: String,
+        client_endpoint: String,
+    ) -> Result<Option<LogIdView>, AdminError> {
+        self.require_leader()?;
+        if node_id == self.cfg.identity.node_id {
+            return Err(AdminError::InvalidArgument {
+                detail: "already_a_member: this node is the leader it was asked to add".to_string(),
+            });
+        }
+        if peer_endpoint.trim().is_empty() || client_endpoint.trim().is_empty() {
+            return Err(AdminError::InvalidArgument {
+                detail: "endpoint_required: a learner needs both a peer and a client endpoint"
+                    .to_string(),
+            });
+        }
+        // Before anything is proposed: a retired id must never re-enter membership, not even
+        // as a learner (M5-62).
+        if self.is_retired(node_id) {
+            return Err(AdminError::Retired { node_id });
+        }
+        if self
+            .membership_report()
+            .membership
+            .voters
+            .contains(&node_id)
+        {
+            return Err(AdminError::InvalidArgument {
+                detail: format!("already_a_voter: node {node_id} is already a voter"),
+            });
+        }
+        // `blocking = false`: the blocking form waits for catch-up and then logs and discards
+        // the wait's outcome (trap T7), so its `Ok` would be indistinguishable from a wait
+        // that timed out.
+        let node = RaftNode::new(peer_endpoint, client_endpoint);
+        match self.raft.add_learner(node_id.0, node, false).await {
+            Ok(resp) => Ok(Some(view(resp.log_id))),
+            Err(e) => Err(self.membership_error(e)),
+        }
+    }
+
+    async fn promote_voter(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
+        let result = self.promote_voter_inner(node_id).await;
+        self.audit_admin("promote_voter", Some(node_id), &result);
+        result
+    }
+
+    async fn promote_voter_inner(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
+        self.require_leader()?;
+        if self.is_retired(node_id) {
+            return Err(AdminError::Retired { node_id });
+        }
+        let report = self.membership_report();
+        if report.membership.voters.contains(&node_id) {
+            // Idempotent: the promotion this call asked for has already been committed.
+            return Ok(report
+                .membership
+                .membership_log_id
+                .map(|(t, i)| LogIdView::new(t, i)));
+        }
+        if !report.learners.contains(&node_id) {
+            return Err(AdminError::NotAMember { node_id });
+        }
+        if report.is_joint() {
+            return Err(AdminError::Unavailable {
+                reason: "joint_config_in_flight: re-issue the interrupted membership change first"
+                    .to_string(),
+            });
+        }
+        // A5/OQ-50: the predicate is `matched >= leader_last_log_index - promote_max_lag`,
+        // read live from this leader's replication map. A peer the leader has not heard from
+        // has no matched index at all, which is the maximum possible lag, not zero.
+        let max = self.cfg.promote_max_lag;
+        let lag = report
+            .lag_of(node_id)
+            .unwrap_or(report.leader_last_log_index);
+        if lag > max {
+            return Err(AdminError::Lagging { node_id, lag, max });
+        }
+        let change = ChangeMembers::AddVoterIds(BTreeSet::from([node_id.0]));
+        // `retain` is irrelevant to an addition, and `true` is the value that never demotes
+        // anything by accident.
+        match self.raft.change_membership(change, true).await {
+            Ok(resp) => Ok(Some(view(resp.log_id))),
+            Err(e) => Err(self.membership_error(e)),
+        }
+    }
+
+    async fn remove_member(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
+        let result = self.remove_member_inner(node_id).await;
+        self.audit_admin("remove_member", Some(node_id), &result);
+        result
+    }
+
+    async fn remove_member_inner(&self, node_id: NodeId) -> Result<Option<LogIdView>, AdminError> {
+        self.require_leader()?;
+        if node_id == self.cfg.identity.node_id {
+            return Err(AdminError::InvalidArgument {
+                detail: "cannot_remove_self: step down first, then remove this node from the \
+                         new leader"
+                    .to_string(),
+            });
+        }
+        let report = self.membership_report();
+        let is_voter = report.membership.voters.contains(&node_id);
+        let is_member = is_voter || report.learners.contains(&node_id);
+        if !is_member && report.retired.contains(&node_id) {
+            // Already removed and already fenced. Re-issuing must be a no-op, because that is
+            // how an operator recovers from a crash part-way through the sequence (M5-67).
+            return Ok(None);
+        }
+        // `!is_member && !retired` is deliberately **not** `NotAMember`: it is the state a
+        // leader is left in when step 2 committed and step 3 did not — the id is out of
+        // membership and its identity is still unfenced, which is the one intermediate state
+        // that is actually dangerous. Refusing here would make the recovery `propose_retire`
+        // itself tells the operator to run ("re-issue RemoveMember") permanently impossible,
+        // so the call falls through to step 3 and finishes the sequence.
+        //
+        // The cost is that removing an id which was never a member now fences it instead of
+        // reporting a typo. That is the right trade: after step 2 commits there is no evidence
+        // left that distinguishes the two cases, and fencing an id nobody used is harmless and
+        // idempotent, whereas leaving a removed node unfenced is not.
+
+        // Step 1 — demote. `retain = true` is not a preference: `RemoveNodes` refuses an id
+        // that is still a voter with `LearnerNotFound`, so the id has to survive step 1 as a
+        // learner for step 2 to be able to remove it at all (ruling M5-R5).
+        if is_voter {
+            let change = ChangeMembers::RemoveVoters(BTreeSet::from([node_id.0]));
+            if let Err(e) = self.raft.change_membership(change, true).await {
+                return Err(self.membership_error(e));
+            }
+        }
+        // Step 2 — drop the node entirely, so nothing replicates to it any more. Its log id
+        // is the one reported, because it is the entry that actually ended the membership.
+        // Skipped when the id is already out of membership: that is the resumed-sequence case
+        // above, and `RemoveNodes` against an absent id is an error, not a no-op.
+        let last = if is_member {
+            let change = ChangeMembers::RemoveNodes(BTreeSet::from([node_id.0]));
+            match self.raft.change_membership(change, false).await {
+                Ok(resp) => Some(view(resp.log_id)),
+                Err(e) => return Err(self.membership_error(e)),
+            }
+        } else {
+            report
+                .membership
+                .membership_log_id
+                .map(|(t, i)| LogIdView::new(t, i))
+        };
+        // Step 3 — fence the identity through the log, so a node that was partitioned during
+        // steps 1 and 2 still refuses to talk to it afterwards.
+        self.propose_retire(node_id).await?;
+        Ok(last)
+    }
+
+    /// Replicate `RetireNode` and check that the state machine actually retired the id.
+    async fn propose_retire(&self, node_id: NodeId) -> Result<(), AdminError> {
+        let cmd = Command::RetireNode { node_id };
+        match tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await {
+            // The fence may or may not have committed. Reporting it as retryable is correct
+            // *because* `RetireNode` is idempotent: re-issuing it changes nothing.
+            Err(_) => Err(AdminError::Unavailable {
+                reason: "retire_not_confirmed: the RetireNode entry did not commit before the \
+                         write deadline; re-issue RemoveMember"
+                    .to_string(),
+            }),
+            Ok(Ok(resp)) => match resp.data {
+                CommandResponse::Retired { .. } => Ok(()),
+                CommandResponse::Rejected { reason } => {
+                    Err(AdminError::InvalidArgument { detail: reason })
+                }
+                other => Err(AdminError::Fatal(format!(
+                    "the state machine answered {other:?} for a RetireNode entry"
+                ))),
+            },
+            Ok(Err(e)) => Err(self.membership_error(e)),
+        }
+    }
+
+    async fn trigger_snapshot(&self) -> Result<SnapshotTriggered, AdminError> {
+        let result = self.trigger_snapshot_inner().await;
+        self.audit_admin("trigger_snapshot", None, &result);
+        result
+    }
+
+    async fn trigger_snapshot_inner(&self) -> Result<SnapshotTriggered, AdminError> {
+        if self.is_stopped() {
+            return Err(AdminError::Unavailable {
+                reason: "stopped".to_string(),
+            });
+        }
+        // Checked before the trigger, not after: openraft's own trigger returns `false` and
+        // does nothing while a build is in flight, and swallows that `false` (trap T13).
+        // Asking the store first is the only way to tell "requested" from "ignored".
+        if self.storage.snapshot_builds_in_flight() > 0 {
+            return Ok(SnapshotTriggered::AlreadyInProgress);
+        }
+        let before = self.reader.snapshot_meta().map(|m| m.snapshot_id);
+        self.raft
+            .trigger()
+            .snapshot()
+            .await
+            .map_err(|e| AdminError::Fatal(e.to_string()))?;
+        // A bounded wait for the build to publish, so the caller gets the snapshot's identity
+        // rather than a promise. Timing out is not a failure: the build is still running, and
+        // `GetMembership`/`/health` will show it when it lands.
+        let deadline = Instant::now() + self.cfg.write_timeout;
+        loop {
+            if let Some(meta) = self.reader.snapshot_meta() {
+                if Some(&meta.snapshot_id) != before.as_ref() {
+                    return Ok(SnapshotTriggered::Started {
+                        snapshot_id: Some(meta.snapshot_id),
+                        last_log_id: meta.last_log_id.map(view),
+                    });
+                }
+            }
+            if Instant::now() >= deadline {
+                return Ok(SnapshotTriggered::Started {
+                    snapshot_id: None,
+                    last_log_id: None,
+                });
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     /// The committed **client-plane** endpoint of `node_id`, as a client-followable hint.
@@ -900,6 +1654,9 @@ impl NodeInner {
     ) -> Result<MutationResponse, ConfigError> {
         let started = Instant::now();
         let result = self.mutate_inner(principal, key.as_ref(), build).await;
+        if let Some(hist) = self.proposal_latency.for_op(op) {
+            hist.observe(started.elapsed());
+        }
         self.log_outcome(
             OutcomeLine::write(op),
             principal,
@@ -919,6 +1676,15 @@ impl NodeInner {
     ) -> Result<MutationResponse, ConfigError> {
         let cmd = build()?;
         self.authorize(principal, Action::Write, key)?;
+        // ADR-0025 "Principal binding": the leader overwrites the stamp's principal from the
+        // session it authenticated, unconditionally and before the entry is proposed. Whatever
+        // the caller put there is discarded, so one principal can never address another's
+        // `client_id` namespace, and every voter applies the same bound stamp deterministically
+        // from the committed entry (M5-101).
+        let cmd = match cmd.dedup() {
+            Some(_) => cmd.bind_principal(config_core::principal_hash(&principal.name)),
+            None => cmd,
+        };
         if self.is_stopped() {
             return Err(ConfigError::Unavailable {
                 reason: "stopped".to_string(),
@@ -941,6 +1707,17 @@ impl NodeInner {
                     Err(ConfigError::InvalidArgument { detail: reason })
                 }
                 CommandResponse::Noop => Err(noop_for_command_entry()),
+                // `Compact` is proposed by `propose_compact`, which reads the response
+                // itself; anything that reached *here* asked for a mutation and got a
+                // compaction acknowledgement, which is a state machine bug, not a rejection.
+                CommandResponse::Compacted { .. } | CommandResponse::Retired { .. } => {
+                    Err(ConfigError::FatalStorage {
+                        detail: "a mutation command was answered with a maintenance \
+                                 acknowledgement; the entry is committed and applied, so this \
+                                 outcome must not be resubmitted"
+                            .to_string(),
+                    })
+                }
             },
             Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f)))) => {
                 Err(self.not_leader(f.leader_id.map(NodeId)))
@@ -972,6 +1749,7 @@ impl NodeInner {
         let result = self
             .read_inner(principal, key_or_prefix.as_ref(), validate, project)
             .await;
+        self.read_latency.observe(started.elapsed());
         self.log_outcome(
             OutcomeLine::read(op),
             principal,
@@ -1088,6 +1866,232 @@ impl NodeInner {
         }
     }
 
+    /// Steps 1-3 of §11.2; the hub owns 4-7.
+    async fn watch_inner(
+        &self,
+        principal: &Principal,
+        req: WatchRequest,
+    ) -> Result<WatchStream, ConfigError> {
+        let progress_interval =
+            crate::watch::validate_watch(&req, &self.cfg.limits, self.cfg.watch_progress_interval)?;
+        self.authorize(principal, Action::Read, req.prefix.as_ref())?;
+        if self.is_stopped() {
+            return Err(ConfigError::Unavailable {
+                reason: "stopped".to_string(),
+            });
+        }
+        match tokio::time::timeout(self.cfg.read_timeout, self.raft.ensure_linearizable()).await {
+            Err(_) => {
+                return Err(ConfigError::Unavailable {
+                    reason: "read deadline exceeded before the linearizable barrier".to_string(),
+                })
+            }
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f)))) => {
+                return Err(self.not_leader(f.leader_id.map(NodeId)))
+            }
+            Ok(Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(e)))) => {
+                return Err(ConfigError::Unavailable {
+                    reason: format!("quorum not reached for a linearizable read: {e}"),
+                })
+            }
+            Ok(Err(RaftError::Fatal(fatal))) => return Err(read_fatal_to_config_error(fatal)),
+            // A quorum just confirmed this node is the leader, which is a stronger statement
+            // than the metrics watcher's eventual view - publish it so the stream this call
+            // is about to open does not terminate on a stale `NotLeader`.
+            Ok(Ok(_read_log_id)) => self.watch.note_leader(),
+        }
+        self.watch
+            .open(
+                principal,
+                req.prefix,
+                req.start_after_revision,
+                progress_interval,
+            )
+            .await
+    }
+
+    /// Tell the hub what the metrics watcher just saw.
+    fn publish_leader_state(&self, leader: Option<NodeId>) {
+        if self.is_stopped() {
+            self.watch.shutdown();
+            return;
+        }
+        match leader {
+            Some(id) if id == self.cfg.identity.node_id => self.watch.note_leader(),
+            Some(id) => self.watch.note_not_leader(self.hint_for(id)),
+            None => self.watch.note_not_leader(None),
+        }
+    }
+
+    /// Propose `Compact` through `client_write`, exactly like any other command.
+    async fn propose_compact(
+        &self,
+        principal: &Principal,
+        up_to_revision: u64,
+    ) -> Result<u64, ConfigError> {
+        // Compaction deletes retained history, so it is a write in the authorization model
+        // even though it allocates no revision: the empty prefix is the whole keyspace.
+        self.authorize(principal, Action::Write, b"")?;
+        if self.is_stopped() {
+            return Err(ConfigError::Unavailable {
+                reason: "stopped".to_string(),
+            });
+        }
+        // An operator-triggered compaction never trims the deduplication table (C5B-17).
+        // The retention timer is ADR-0025's only trim mechanism because its watermark comes
+        // from `retention_target`, which honours `min_revisions` and `max_age` and so gives
+        // the runbook's sizing advice an age floor to stand on. An operator-supplied
+        // `up_to_revision` has no such floor: `compact(current_revision)` would release every
+        // record at once and silently void ADR-0015's bounded-retry exception for every client
+        // with a mutation in flight. Nothing is lost by keeping the records — a duplicate is
+        // answered from the stored response, never from the history this command deletes.
+        let cmd = Command::Compact {
+            up_to_revision,
+            dedup_trim_below: None,
+        };
+        match tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await {
+            Err(_) => Err(ConfigError::DeadlineExceededUnknownOutcome),
+            Ok(Ok(resp)) => match resp.data {
+                CommandResponse::Compacted { compact_revision } => Ok(compact_revision),
+                CommandResponse::Rejected { reason } => {
+                    Err(ConfigError::InvalidArgument { detail: reason })
+                }
+                CommandResponse::Mutation { .. }
+                | CommandResponse::Noop
+                | CommandResponse::Retired { .. } => Err(noop_for_command_entry()),
+            },
+            Ok(Err(RaftError::APIError(ClientWriteError::ForwardToLeader(f)))) => {
+                Err(self.not_leader(f.leader_id.map(NodeId)))
+            }
+            Ok(Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e)))) => {
+                Err(ConfigError::Unavailable {
+                    reason: e.to_string(),
+                })
+            }
+            Ok(Err(RaftError::Fatal(fatal))) => Err(write_fatal_to_config_error(fatal)),
+        }
+    }
+
+    /// One pass of the leader-only retention policy (ADR-0019, test plan TA-33).
+    ///
+    /// Everything here is leader-local: the receipt samples, the clock, and the decision.
+    /// `apply` sees only the resulting replicated `Compact` command, which is why two voters
+    /// configured with different retention still hold identical state.
+    async fn evaluate_retention(&self) {
+        if self.is_stopped() {
+            return;
+        }
+        let leader = self.raft.metrics().borrow().current_leader.map(NodeId);
+        if leader != Some(self.cfg.identity.node_id) {
+            // A node that is not the leader keeps no receipts: a new leader must start with
+            // an empty age map rather than inherit one it never observed (M4-29).
+            self.receipts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            return;
+        }
+
+        let applied = self.reader.cluster_revision();
+        let now_ms = self.clock.now_ms();
+        let oldest_within_max_age = {
+            let mut receipts = self.receipts.lock().unwrap_or_else(|e| e.into_inner());
+            if receipts.last().is_none_or(|(rev, _)| *rev < applied) {
+                receipts.push((applied, now_ms));
+            }
+            if receipts.len() > MAX_RETENTION_SAMPLES {
+                let excess = receipts.len() - MAX_RETENTION_SAMPLES;
+                receipts.drain(..excess);
+            }
+            let cutoff = now_ms.saturating_sub(self.retention.max_age.as_millis() as u64);
+            // Every revision at or below the newest sample taken before `cutoff` is older
+            // than `max_age`; the next one up is the oldest still within policy.
+            receipts
+                .iter()
+                .rev()
+                .find(|(_, ms)| *ms <= cutoff)
+                .map_or(0, |(rev, _)| rev.saturating_add(1))
+        };
+
+        let Ok(stats) = self.reader.journal_stats() else {
+            return;
+        };
+        let view = JournalView {
+            oldest_revision: stats.oldest_revision.unwrap_or(0),
+            newest_revision: stats.newest_revision.unwrap_or(0),
+            count: stats.count,
+            bytes: stats.bytes,
+        };
+        let compact_revision = self.reader.compact_revision().unwrap_or(0);
+        let Some((up_to, reason)) = retention_target(
+            view,
+            &self.retention,
+            compact_revision,
+            oldest_within_max_age,
+        ) else {
+            return;
+        };
+        // C5B-02: the same timer that trims history trims the deduplication table. ADR-0025
+        // gives the global cap no other way to shrink — `dedup_trim_below` is only ever
+        // carried by `Compact` — and until this line nothing ever proposed one, so
+        // `dedup.max_records` was a limit that could be reached and never released.
+        //
+        // The watermark is `up_to + 1`, which is "every record whose revision's history this
+        // same command is about to delete". Tying the two together rather than inventing a
+        // second rule is deliberate:
+        //
+        // * it is leader-local and timer-driven, so `apply` gains no wall-clock dependency
+        //   and the trim stays deterministic (ADR-0025's requirement, ADR-0019's property);
+        // * it is never more aggressive than history compaction, so a record can only be
+        //   dropped once the revision it answers with is itself unreadable — a trim that ran
+        //   ahead of history would let a resubmission inside the client's own retry window
+        //   (ADR-0015) apply a second time, which is the failure deduplication exists to
+        //   prevent;
+        // * `oldest_within_max_age` was the tempting alternative and is wrong: under
+        //   `max_age = 0` it evaluates to the newest applied revision, which would trim
+        //   records the instant they were written.
+        //
+        // `None` when deduplication is off or nothing is being compacted: a cluster that
+        // retains no records must not start carrying a watermark in every `Compact` it
+        // proposes.
+        let dedup_trim_below =
+            (self.cfg.limits.dedup.enabled && up_to > 0).then(|| up_to.saturating_add(1));
+        tracing::info!(
+            up_to,
+            reason = reason.as_str(),
+            dedup_trim_below,
+            "compaction_proposed"
+        );
+        let cmd = Command::Compact {
+            up_to_revision: up_to,
+            dedup_trim_below,
+        };
+        if let Ok(Err(e)) =
+            tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await
+        {
+            tracing::warn!(up_to, error = %e, "compaction proposal failed");
+        }
+    }
+
+    /// Sample the leader this node believes in, counting a transition (ADR-0026).
+    ///
+    /// A *transition*, not a term change: an election that returns the same leader is not a
+    /// leadership change an operator cares about, and counting one would make the alert fire
+    /// on every heartbeat gap.
+    fn sample_leader(&self) {
+        let current = self.metrics().current_leader;
+        let mut last = self
+            .last_seen_leader
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *last != current {
+            if current.is_some() {
+                self.leader_changes.fetch_add(1, Ordering::Relaxed);
+            }
+            *last = current;
+        }
+    }
+
     /// One pass over the advisory gossip source (ADR-0003).
     fn poll_gossip(&self) {
         let membership = self.committed_membership();
@@ -1104,13 +2108,17 @@ impl NodeInner {
                     );
                     accepted.insert(hint.node_id, hint);
                 }
-                HintVerdict::Rejected { reason } => tracing::warn!(
-                    reason,
-                    peer_node_id = hint.node_id.0,
-                    peer_cluster_id = %hint.cluster_id,
-                    peer_endpoint = %hint.peer_endpoint,
-                    "gossip_hint_rejected"
-                ),
+                HintVerdict::Rejected { reason } => {
+                    self.gossip_endpoint_mismatch
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        reason,
+                        peer_node_id = hint.node_id.0,
+                        peer_cluster_id = %hint.cluster_id,
+                        peer_endpoint = %hint.peer_endpoint,
+                        "gossip_hint_rejected"
+                    );
+                }
             }
         }
         *self
@@ -1225,8 +2233,27 @@ fn write_fatal_to_config_error(fatal: Fatal<RaftNodeId>) -> ConfigError {
     }
 }
 
-/// Background observer: polls advisory gossip on a timer and logs Raft state transitions.
+/// The leader-only retention task (ADR-0019).
 ///
+/// Holds a `Weak`, so it never keeps the node alive, and is aborted outright by
+/// [`ConfigNode::stop`].
+async fn retention_loop(inner: Weak<NodeInner>) {
+    let interval = match inner.upgrade() {
+        Some(node) => node.retention.check_interval,
+        None => return,
+    };
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The first tick of a tokio interval completes immediately, and a compaction proposal
+    // before the node has applied anything is noise.
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        let Some(node) = inner.upgrade() else { return };
+        node.evaluate_retention().await;
+    }
+}
+
 /// Holds a `Weak`, so it never keeps the node alive; it exits when the last [`ConfigNode`]
 /// is dropped, and is aborted outright by [`ConfigNode::stop`].
 async fn background_loop(
@@ -1245,6 +2272,7 @@ async fn background_loop(
             _ = ticker.tick() => {
                 let Some(node) = inner.upgrade() else { return };
                 node.poll_gossip();
+                node.sample_leader();
             }
             changed = metrics.changed() => {
                 if changed.is_err() {
@@ -1262,6 +2290,11 @@ async fn background_loop(
                 }
                 if now.1 != last.1 {
                     tracing::info!(old = ?last.1, new = ?now.1, "raft leader changed");
+                }
+                // Watches are leader-served (§11.1), so every leadership observation is a
+                // termination decision for the streams this node holds.
+                if let Some(node) = inner.upgrade() {
+                    node.publish_leader_state(now.1.map(NodeId));
                 }
                 if now.2 != last.2 {
                     tracing::info!(old = last.2, new = now.2, "raft term changed");
@@ -1300,6 +2333,24 @@ impl PeerSink for NodeInner {
                 got: meta.to,
             });
         }
+        // The fence (M5, ADR-0023, spec §21). Checked after the identity binding and before
+        // anything is handed to OpenRaft: a retired node holds a genuine certificate and a
+        // consistent envelope, so nothing above this line refuses it. Checked on *every*
+        // node rather than only the leader, because the retired node will dial whichever
+        // peer answers first.
+        if self.is_retired(meta.from) {
+            tracing::warn!(
+                reason = "identity_retired",
+                node_id = meta.from.0,
+                rpc = req.kind(),
+                "peer_identity_rejected"
+            );
+            // Both: `authn_rejected` stays the whole-node total `/health` reports, and the
+            // peer counter is what lets the exporter say `plane="peer"` and mean it.
+            self.authn_rejected.fetch_add(1, Ordering::Relaxed);
+            self.authn_rejected_peer.fetch_add(1, Ordering::Relaxed);
+            return Err(PeerReject::Retired { node_id: meta.from });
+        }
         if self.is_stopped() {
             return Err(PeerReject::NotRunning);
         }
@@ -1336,14 +2387,25 @@ impl PeerSink for NodeInner {
                     .await
                     .map(PeerResponse::Vote)
                     .map_err(|e| PeerReject::Raft(e.to_string())),
-                PeerRequest::InstallSnapshot(_) => {
-                    Err(PeerReject::Raft("snapshots unsupported".to_string()))
-                }
+                // Wired from M5 on: a learner whose log the leader has already purged can
+                // only be caught up by a snapshot install (D5.2), so refusing this RPC
+                // would make learner replacement impossible on exactly the cluster that
+                // needs it. Chunk reassembly and the vote check are openraft's.
+                PeerRequest::InstallSnapshot(rpc) => self
+                    .raft
+                    .install_snapshot(rpc)
+                    .await
+                    .map(PeerResponse::InstallSnapshot)
+                    .map_err(|e| PeerReject::Raft(e.to_string())),
             }
         }
         .instrument(span)
         .instrument(self.span.clone())
         .await
+    }
+
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        NodeInner::is_retired(self, node_id)
     }
 }
 
