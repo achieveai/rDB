@@ -1,60 +1,454 @@
 {
   "agents": [
-    { "id": "m6-gate", "role": "Lead", "milestone": "M6", "task": "Full workspace gate, run 3.", "status": "finished", "start": "2026-09-19T12:05", "end": "2026-09-19T13:15" },
-
-    { "id": "critic-m6", "role": "Critics", "milestone": "M6", "task": "Delta review passed with risks. Gate clear, all findings closed.", "status": "finished" },
-    { "id": "dev-m6-fixes", "role": "Developers", "milestone": "M6", "task": "Closed 3 material and 5 advisory critic-m6 findings.", "status": "finished" },
-    { "id": "tester-m6d", "role": "Testers", "milestone": "M6", "task": "Landed E2E-41, 42, 43, 45. Lead-verified.", "status": "finished" },
-    { "id": "tester-m6e", "role": "Testers", "milestone": "M6", "task": "Grew m6_rotation.rs to 24 rows.", "status": "finished" },
-    { "id": "dev-migration", "role": "Developers", "milestone": "M6", "task": "Landed the M6-R20 drain fix. Lead-verified.", "status": "finished" },
-    { "id": "dev-quickstart", "role": "Developers", "milestone": "M6", "task": "Local-cluster scripts and quickstart doc, verified end to end.", "status": "finished" },
-    { "id": "dev-rotation-harness", "role": "Developers", "milestone": "M6", "task": "Testkit rotation support, 15 rows in m6_rotation.rs.", "status": "finished" },
-    { "id": "tester-m6c", "role": "Testers", "milestone": "M6", "task": "E2E-40, E2E-44, E2E-46, a third clean E2E-47 run.", "status": "finished" },
-    { "id": "tester-m6b", "role": "Testers", "milestone": "M6", "task": "M6-110 gossip matrix. Found the E2E-44 root cause.", "status": "finished" },
-    { "id": "dev-rotation", "role": "Developers", "milestone": "M6", "task": "TLS and gossip-key rotation, ADR-0028.", "status": "finished" },
-    { "id": "dev-rbac", "role": "Developers", "milestone": "M6", "task": "Signed RBAC wiring, gossip convergence M6-20/21.", "status": "finished" },
-    { "id": "tester-m6a", "role": "Testers", "milestone": "M6", "task": "m6_policy_daemon.rs, 10 rows.", "status": "finished" },
-    { "id": "dev-compat", "role": "Developers", "milestone": "M6", "task": "Mixed-version schema gate, ADR-0030.", "status": "finished" },
-    { "id": "dev-pagination", "role": "Developers", "milestone": "M6", "task": "Revision-pinned pagination wired into run.rs.", "status": "finished" },
-    { "id": "dev-evidence", "role": "Developers", "milestone": "M6", "task": "12 evidence rows under docs/evidence.", "status": "finished" },
-    { "id": "tester-m5b", "role": "Testers", "milestone": "M5", "task": "Dedup cluster rows, E2E-38.", "status": "finished" },
-    { "id": "dev-harness", "role": "Developers", "milestone": "M5", "task": "Closed testkit gaps from tester-m5a, 12 rows.", "status": "finished" },
-    { "id": "tester-m4d", "role": "Testers", "milestone": "M4", "task": "gRPC, wire, and E2E M4 rows.", "status": "finished" },
-    { "id": "tester-m4c", "role": "Testers", "milestone": "M4", "task": "Cluster and observability M4 rows, 22 rows.", "status": "finished" },
-    { "id": "dev-fence", "role": "Developers", "milestone": "M5", "task": "Retired-node fencing carried into snapshots.", "status": "finished" },
-    { "id": "critic-m5b", "role": "Critics", "milestone": "M5", "task": "Dedup and metrics re-review, passed with risks.", "status": "finished" },
-    { "id": "critic-m5a", "role": "Critics", "milestone": "M5", "task": "Snapshot and admin review, 2 blockers closed.", "status": "finished" },
-    { "id": "dev-admin", "role": "Developers", "milestone": "M5", "task": "Admin plane, backup/restore, two-step RemoveMember.", "status": "finished" },
-    { "id": "dev-dedup", "role": "Developers", "milestone": "M5", "task": "Bounded request deduplication, format v3.", "status": "finished" },
-    { "id": "dev-snapshot", "role": "Developers", "milestone": "M5", "task": "Snapshot build and install, safe purge.", "status": "finished" },
-    { "id": "tester-m5a", "role": "Testers", "milestone": "M5", "task": "M5 snapshot and admin rows, 19 tests.", "status": "finished" },
-    { "id": "tester-m4b", "role": "Testers", "milestone": "M4", "task": "Remaining M4 rows, E2E-21 and E2E-22.", "status": "finished" },
-    { "id": "tester-m4", "role": "Testers", "milestone": "M4", "task": "First M4 wave. Found production bug M4-32.", "status": "finished" },
-    { "id": "critic-m4", "role": "Critics", "milestone": "M4", "task": "Final verdict passed, 178 tests.", "status": "finished" },
-    { "id": "dev-watch", "role": "Developers", "milestone": "M4", "task": "Watch hub, serialized gate, two fix rounds.", "status": "finished" },
-    { "id": "dev-journal", "role": "Developers", "milestone": "M4", "task": "Event journal, replicated compaction.", "status": "finished" },
-    { "id": "doc-m5-metrics", "role": "Docs", "milestone": "M5", "task": "Metric-name alignment against ADR-0026.", "status": "finished" },
-    { "id": "planner-m4", "role": "Testers", "milestone": "M4", "task": "test-plan-m4.md, 121 rows.", "status": "finished" },
-    { "id": "planner-m5", "role": "Testers", "milestone": "M5", "task": "test-plan-m5.md, 133 rows.", "status": "finished" },
-    { "id": "planner-m6", "role": "Testers", "milestone": "M6", "task": "test-plan-m6.md, 132 rows.", "status": "finished" },
-    { "id": "adr-m4", "role": "Lead", "milestone": "M4", "task": "ADR-0019, 0020, 0021.", "status": "finished" },
-    { "id": "adr-m5", "role": "Lead", "milestone": "M5", "task": "ADR-0022 through 0026.", "status": "finished" },
-    { "id": "adr-m6", "role": "Lead", "milestone": "M6", "task": "ADR-0027 through 0031.", "status": "finished" },
-    { "id": "research-openraft", "role": "Lead", "milestone": "M1", "task": "A 15-trap catalogue, folded into the architecture brief.", "status": "finished" },
-    { "id": "research-memberlist", "role": "Lead", "milestone": "M1", "task": "Memberlist 0.8.5 API verified from source.", "status": "finished" },
-    { "id": "dev-core", "role": "Developers", "milestone": "M0", "task": "config-core, state machine, CAS, validation.", "status": "finished" },
-    { "id": "dev-gossip", "role": "Developers", "milestone": "M1", "task": "Memberlist adapter, advisory-only.", "status": "finished" },
-    { "id": "dev-gossip-fix", "role": "Developers", "milestone": "M1", "task": "Closed both critic-gossip blockers.", "status": "finished" },
-    { "id": "dev-engine", "role": "Developers", "milestone": "M1", "task": "Storage and engine base, ConfigNode.", "status": "finished" },
-    { "id": "dev-rocks", "role": "Developers", "milestone": "M2", "task": "RocksStore, 34 tests.", "status": "finished" },
-    { "id": "dev-grpc", "role": "Developers", "milestone": "M3", "task": "config-grpc, config-client base.", "status": "finished" },
-    { "id": "dev-grpc-fix", "role": "Developers", "milestone": "M3", "task": "Closed critic-grpc's blocker and 9 material findings.", "status": "finished" },
-    { "id": "dev-engine-fix", "role": "Developers", "milestone": "M1", "task": "Closed critic-engine's blocker and 7 material findings.", "status": "finished" },
-    { "id": "dev-testkit", "role": "Developers", "milestone": "M2", "task": "Testkit base, conformance suite.", "status": "finished" },
-    { "id": "critic-core", "role": "Critics", "milestone": "M0", "task": "M0 architecture review.", "status": "finished" },
-    { "id": "critic-gossip", "role": "Critics", "milestone": "M1", "task": "M1 architecture review.", "status": "finished" },
-    { "id": "critic-grpc", "role": "Critics", "milestone": "M3", "task": "M3 architecture review.", "status": "finished" },
-    { "id": "critic-engine", "role": "Critics", "milestone": "M1", "task": "M1 architecture review.", "status": "finished" },
-    { "id": "tester-m3", "role": "Testers", "milestone": "M3", "task": "M3 rows across mTLS, authz, conformance.", "status": "finished" }
+    {
+      "id": "rev-wave",
+      "role": "Critics",
+      "milestone": "M6",
+      "task": "Six-reviewer branch review: temp code, silent failures, coverage, security, compat, errors. Zero blockers, 19 findings.",
+      "status": "finished",
+      "start": "2026-09-19T13:30",
+      "end": "2026-09-19T15:00"
+    },
+    {
+      "id": "fix-policy",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Wired bind_policy_version into the daemon; M6-32 drives a real adoption. Poller panics now log.",
+      "status": "finished",
+      "start": "2026-09-19T15:05",
+      "end": "2026-09-19T16:30"
+    },
+    {
+      "id": "fix-admin",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Signed admin set gated on a verified principal kind (M6-R23). Rotation recovery field.",
+      "status": "finished",
+      "start": "2026-09-19T15:05",
+      "end": "2026-09-19T16:30"
+    },
+    {
+      "id": "fix-compat",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Schema decode fence wired on apply and snapshot install; schema_gate clause 1 qualified by answered triples.",
+      "status": "finished",
+      "start": "2026-09-19T15:05",
+      "end": "2026-09-19T16:40"
+    },
+    {
+      "id": "lead-flakes",
+      "role": "Lead",
+      "milestone": "M6",
+      "task": "Both gate failures diagnosed. m6_20 was a torn /health payload, fixed. m4_69 was a missing gate script, written.",
+      "status": "finished",
+      "start": "2026-09-19T17:35",
+      "end": "2026-09-19T17:55"
+    },
+    {
+      "id": "lead-commit",
+      "role": "Lead",
+      "milestone": "M6",
+      "task": "Fix pass and progress tooling committed: 61df7bd, 6f925bb.",
+      "status": "finished",
+      "start": "2026-09-19T17:55",
+      "end": "2026-09-19T17:58"
+    },
+    {
+      "id": "progress-pipeline",
+      "role": "Docs",
+      "milestone": "M6",
+      "task": "Two refresh bugs fixed: a rebuild never recorded the refresh, and the page rendered before its stamp advanced.",
+      "status": "finished",
+      "start": "2026-09-19T17:40",
+      "end": "2026-09-19T17:52"
+    },
+    {
+      "id": "m6-gate",
+      "role": "Lead",
+      "milestone": "M6",
+      "task": "Full workspace gate, run 3.",
+      "status": "finished",
+      "start": "2026-09-19T12:05",
+      "end": "2026-09-19T13:15"
+    },
+    {
+      "id": "critic-m6",
+      "role": "Critics",
+      "milestone": "M6",
+      "task": "Delta review passed with risks. Gate clear, all findings closed.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-m6-fixes",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Closed 3 material and 5 advisory critic-m6 findings.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m6d",
+      "role": "Testers",
+      "milestone": "M6",
+      "task": "Landed E2E-41, 42, 43, 45. Lead-verified.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m6e",
+      "role": "Testers",
+      "milestone": "M6",
+      "task": "Grew m6_rotation.rs to 24 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-migration",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Landed the M6-R20 drain fix. Lead-verified.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-quickstart",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Local-cluster scripts and quickstart doc, verified end to end.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-rotation-harness",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Testkit rotation support, 15 rows in m6_rotation.rs.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m6c",
+      "role": "Testers",
+      "milestone": "M6",
+      "task": "E2E-40, E2E-44, E2E-46, a third clean E2E-47 run.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m6b",
+      "role": "Testers",
+      "milestone": "M6",
+      "task": "M6-110 gossip matrix. Found the E2E-44 root cause.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-rotation",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "TLS and gossip-key rotation, ADR-0028.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-rbac",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Signed RBAC wiring, gossip convergence M6-20/21.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m6a",
+      "role": "Testers",
+      "milestone": "M6",
+      "task": "m6_policy_daemon.rs, 10 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-compat",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Mixed-version schema gate, ADR-0030.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-pagination",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "Revision-pinned pagination wired into run.rs.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-evidence",
+      "role": "Developers",
+      "milestone": "M6",
+      "task": "12 evidence rows under docs/evidence.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m5b",
+      "role": "Testers",
+      "milestone": "M5",
+      "task": "Dedup cluster rows, E2E-38.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-harness",
+      "role": "Developers",
+      "milestone": "M5",
+      "task": "Closed testkit gaps from tester-m5a, 12 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m4d",
+      "role": "Testers",
+      "milestone": "M4",
+      "task": "gRPC, wire, and E2E M4 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m4c",
+      "role": "Testers",
+      "milestone": "M4",
+      "task": "Cluster and observability M4 rows, 22 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-fence",
+      "role": "Developers",
+      "milestone": "M5",
+      "task": "Retired-node fencing carried into snapshots.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-m5b",
+      "role": "Critics",
+      "milestone": "M5",
+      "task": "Dedup and metrics re-review, passed with risks.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-m5a",
+      "role": "Critics",
+      "milestone": "M5",
+      "task": "Snapshot and admin review, 2 blockers closed.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-admin",
+      "role": "Developers",
+      "milestone": "M5",
+      "task": "Admin plane, backup/restore, two-step RemoveMember.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-dedup",
+      "role": "Developers",
+      "milestone": "M5",
+      "task": "Bounded request deduplication, format v3.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-snapshot",
+      "role": "Developers",
+      "milestone": "M5",
+      "task": "Snapshot build and install, safe purge.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m5a",
+      "role": "Testers",
+      "milestone": "M5",
+      "task": "M5 snapshot and admin rows, 19 tests.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m4b",
+      "role": "Testers",
+      "milestone": "M4",
+      "task": "Remaining M4 rows, E2E-21 and E2E-22.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m4",
+      "role": "Testers",
+      "milestone": "M4",
+      "task": "First M4 wave. Found production bug M4-32.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-m4",
+      "role": "Critics",
+      "milestone": "M4",
+      "task": "Final verdict passed, 178 tests.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-watch",
+      "role": "Developers",
+      "milestone": "M4",
+      "task": "Watch hub, serialized gate, two fix rounds.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-journal",
+      "role": "Developers",
+      "milestone": "M4",
+      "task": "Event journal, replicated compaction.",
+      "status": "finished"
+    },
+    {
+      "id": "doc-m5-metrics",
+      "role": "Docs",
+      "milestone": "M5",
+      "task": "Metric-name alignment against ADR-0026.",
+      "status": "finished"
+    },
+    {
+      "id": "planner-m4",
+      "role": "Testers",
+      "milestone": "M4",
+      "task": "test-plan-m4.md, 121 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "planner-m5",
+      "role": "Testers",
+      "milestone": "M5",
+      "task": "test-plan-m5.md, 133 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "planner-m6",
+      "role": "Testers",
+      "milestone": "M6",
+      "task": "test-plan-m6.md, 132 rows.",
+      "status": "finished"
+    },
+    {
+      "id": "adr-m4",
+      "role": "Lead",
+      "milestone": "M4",
+      "task": "ADR-0019, 0020, 0021.",
+      "status": "finished"
+    },
+    {
+      "id": "adr-m5",
+      "role": "Lead",
+      "milestone": "M5",
+      "task": "ADR-0022 through 0026.",
+      "status": "finished"
+    },
+    {
+      "id": "adr-m6",
+      "role": "Lead",
+      "milestone": "M6",
+      "task": "ADR-0027 through 0031.",
+      "status": "finished"
+    },
+    {
+      "id": "research-openraft",
+      "role": "Lead",
+      "milestone": "M1",
+      "task": "A 15-trap catalogue, folded into the architecture brief.",
+      "status": "finished"
+    },
+    {
+      "id": "research-memberlist",
+      "role": "Lead",
+      "milestone": "M1",
+      "task": "Memberlist 0.8.5 API verified from source.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-core",
+      "role": "Developers",
+      "milestone": "M0",
+      "task": "config-core, state machine, CAS, validation.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-gossip",
+      "role": "Developers",
+      "milestone": "M1",
+      "task": "Memberlist adapter, advisory-only.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-gossip-fix",
+      "role": "Developers",
+      "milestone": "M1",
+      "task": "Closed both critic-gossip blockers.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-engine",
+      "role": "Developers",
+      "milestone": "M1",
+      "task": "Storage and engine base, ConfigNode.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-rocks",
+      "role": "Developers",
+      "milestone": "M2",
+      "task": "RocksStore, 34 tests.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-grpc",
+      "role": "Developers",
+      "milestone": "M3",
+      "task": "config-grpc, config-client base.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-grpc-fix",
+      "role": "Developers",
+      "milestone": "M3",
+      "task": "Closed critic-grpc's blocker and 9 material findings.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-engine-fix",
+      "role": "Developers",
+      "milestone": "M1",
+      "task": "Closed critic-engine's blocker and 7 material findings.",
+      "status": "finished"
+    },
+    {
+      "id": "dev-testkit",
+      "role": "Developers",
+      "milestone": "M2",
+      "task": "Testkit base, conformance suite.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-core",
+      "role": "Critics",
+      "milestone": "M0",
+      "task": "M0 architecture review.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-gossip",
+      "role": "Critics",
+      "milestone": "M1",
+      "task": "M1 architecture review.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-grpc",
+      "role": "Critics",
+      "milestone": "M3",
+      "task": "M3 architecture review.",
+      "status": "finished"
+    },
+    {
+      "id": "critic-engine",
+      "role": "Critics",
+      "milestone": "M1",
+      "task": "M1 architecture review.",
+      "status": "finished"
+    },
+    {
+      "id": "tester-m3",
+      "role": "Testers",
+      "milestone": "M3",
+      "task": "M3 rows across mTLS, authz, conformance.",
+      "status": "finished"
+    }
   ]
 }
