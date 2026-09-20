@@ -1,0 +1,2 @@
+# Archive is generated history: collapse it in PR diffs.
+docs/archive/** linguist-generated=true -diff

@@ -1,0 +1,69 @@
+{
+  "from": { "ledger_line": 505, "git_head": "4f6f7e5" },
+  "to": { "ledger_line": 677, "git_head": "4f6f7e5" },
+  "items": [
+    {
+      "kind": "verdict",
+      "milestone": "M6",
+      "summary": "6 reviewers passed branch review. No blockers. 19 findings.",
+      "evidence": "ledger:517-518",
+      "parts": ["rbac-policy", "tls-gossip-rotation", "pagination-migration"]
+    },
+    {
+      "kind": "ruling",
+      "milestone": "M6",
+      "summary": "Signed admin names require verified caller verification.",
+      "evidence": "ledger:542-548",
+      "parts": ["rbac-policy"]
+    },
+    {
+      "kind": "decision",
+      "milestone": "M6",
+      "summary": "User approved: wire decode fence. Write M6-32 and M6-126.",
+      "evidence": "ledger:521-522",
+      "parts": ["pagination-migration", "rbac-policy"]
+    },
+    {
+      "kind": "dispatch",
+      "milestone": "M6",
+      "summary": "Three workers dispatched to fix review findings.",
+      "evidence": "ledger:524-533",
+      "parts": ["rbac-policy", "tls-gossip-rotation", "pagination-migration"]
+    },
+    {
+      "kind": "handoff",
+      "milestone": "M6",
+      "summary": "Authorization fix landed. One finding closed. Verified.",
+      "evidence": "ledger:570-576",
+      "parts": ["rbac-policy"]
+    },
+    {
+      "kind": "handoff",
+      "milestone": "M6",
+      "summary": "Policy fix landed. One finding closed. Verified.",
+      "evidence": "ledger:598-610",
+      "parts": ["pagination-migration"]
+    },
+    {
+      "kind": "handoff",
+      "milestone": "M6",
+      "summary": "Schema fix landed. Two findings closed. Verified.",
+      "evidence": "ledger:627-645",
+      "parts": ["pagination-migration"]
+    },
+    {
+      "kind": "note",
+      "milestone": "M6",
+      "summary": "Two test-infrastructure defects found and fixed.",
+      "evidence": "ledger:655-669",
+      "parts": ["pagination-migration", "rbac-policy", "tls-gossip-rotation"]
+    },
+    {
+      "kind": "gate",
+      "milestone": "M6",
+      "summary": "Fmt and clippy clean. Cargo test pending.",
+      "evidence": "ledger:676-677",
+      "parts": ["rbac-policy", "tls-gossip-rotation", "pagination-migration"]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+%% title: Data flow
+%% caption: Column families hold live state; snapshot, backup and restore move bytes to disk.
+%% open: active
+%% milestones: M1 M2 M4 M5
+flowchart TB
+  subgraph DF1["Log to disk"]
+    direction LR
+    @{df-raft-log}
+    @{wp-apply}
+    @{df-column-families}
+    @{compaction-floor}
+    @{df-raft-log} -->|feeds committed entries| @{wp-apply}
+    @{wp-apply} -->|writes one atomic batch| @{df-column-families}
+    @{df-column-families} -->|advances the compact floor| @{compaction-floor}
+  end
+  subgraph DF2["Snapshot, backup, restore"]
+    direction LR
+    @{df-snapshot}
+    @{backup}
+    @{restore}
+    @{df-snapshot} -->|packages into a backup| @{backup}
+    @{backup} -->|verifies, then loads| @{restore}
+  end
+  DF1 -->|"snapshot taken on demand"| DF2
