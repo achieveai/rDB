@@ -90,10 +90,11 @@ pub struct SchemaTriple {
 /// older peer could *fail* on, and M6 produced none. Bumping it here and not in
 /// [`COMPAT_SCHEMA_1`] would be worse than leaving it: `--compat-schema 1` pins the envelope
 /// and the store ceiling, it does not remove a service from the gRPC surface, so the pinned
-/// node would then advertise a protocol revision it is in fact serving past. The axis is
-/// consequently not discriminating today, and that is an accurate report rather than a gap —
-/// it is read by nothing but [`SchemaTriple::gate_key`]'s last tie-breaker, which exists to
-/// make the order total (module docs), not to gate anything.
+/// node would then advertise a protocol revision it is in fact serving past. The axis
+/// consequently gates nothing today, which is an accurate report rather than a gap.
+/// [`SchemaTriple::gate_key`] uses it only as a last tie-breaker, to make the order total
+/// (module docs). It is still carried on the peer wire and printed by
+/// [`Display`](std::fmt::Display).
 pub const CURRENT_SCHEMA: SchemaTriple = SchemaTriple {
     format_version: 3,
     command_schema: COMMAND_SCHEMA_V2,

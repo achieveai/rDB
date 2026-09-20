@@ -255,13 +255,9 @@ async fn m3_44_daemon_accepts_insecure_with_flag_and_warns() {
 
 /// The two dev gates are one fact, not two: `--dev-allow-all` is refused on its own.
 ///
-/// A new row, not in the plan (lead ruling, 2026-09-19). Until it existed the two flags were
-/// independent, so a node could present real mutual TLS on both planes while authorizing every
-/// request that arrived over it — a build indistinguishable from a production one in its
-/// certificates, its health payload's `transport_security` and its logs, and open to anyone the
-/// CA has ever issued to. Coupling them makes "this is a development build" a single thing an
-/// operator can check. Both local-cluster scripts already pass the pair, so nothing that ran
-/// before this row stops running (ADR-0012, ADR-0018 §2).
+/// A new row, not in the plan (lead ruling, 2026-09-19). See `Cli::check_dev_gates` for why the
+/// pair is one fact. Both local-cluster scripts already pass it, so nothing that ran before
+/// this row stops running (ADR-0012, ADR-0018 §2).
 #[retcd_test]
 async fn dev_allow_all_is_refused_without_allow_insecure_dev() {
     let harness = Harness::new("dev_allow_all_is_refused_without_allow_insecure_dev").await;

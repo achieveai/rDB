@@ -67,13 +67,13 @@ pub struct TlsFiles {
 
 /// Why a rotation could not be carried out.
 ///
-/// Both variants are raised by the pre-checks — reading the three files and compiling them once
-/// — which run before any plane is touched, so in practice a refusal is a refusal to change and
-/// every plane keeps serving exactly what it served before (M6-46).
+/// `Read` comes only from the pre-checks — reading the three files and compiling them once,
+/// before any plane is touched — so a `Read` refusal is a refusal to change, and every plane
+/// keeps serving exactly what it served before (M6-46).
 ///
-/// That is a statement about where these are raised, not an invariant of the swap loop. Each
-/// plane recompiles the same bytes as it takes them, so a plane can in principle refuse after an
-/// earlier plane has already swapped, leaving the node briefly split across two generations. The
+/// `Unusable` comes from that same pre-check compile *and* again from each plane as it takes
+/// the material, so a plane can refuse after an earlier one has already swapped, leaving the
+/// node briefly split across two generations. The
 /// window is very small — the bytes have already compiled once — and it is deliberately
 /// recoverable rather than prevented: the rotator does not record the new material as served
 /// unless every plane took it, so the next reload, RPC or poll, retries the whole set instead of

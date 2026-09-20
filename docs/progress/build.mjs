@@ -164,13 +164,6 @@ function main() {
   fs.writeFileSync(outPath, html, 'utf8');
   console.log(`Wrote ${relPath(outPath)}`);
 
-  // Publishing the live pieces to the real page *is* the refresh, however it was spelled. The
-  // early return that used to sit under `--out` meant the one command AGENTS.md documents
-  // rebuilt the page and advanced nothing: the page then showed the previous run's timestamp,
-  // and `changes.json` was never rotated, so the next scout re-reported items already on the
-  // page. A report that cannot say when it was built is the one thing a status page must do.
-  // Rebuilding an archived snapshot (`--src`) or writing a scratch copy elsewhere is not a
-  // refresh and must not move the watermark.
   // Only after the page is on disk: a failed write must not consume changes it never showed.
   if (pending) commitMeta(srcDir, pending);
 }
@@ -426,11 +419,9 @@ function indexParts(partsDoc) {
   return byId;
 }
 
-// Cross-field consistency (added at main's request, replaces the old "the page must
-// never contradict itself" rule now that no agent reads index.html). Rule 7 from that
-// request ("risk severity blocker implies a milestone is blocked or at-risk") has no
-// home in SCHEMA.md: risk `severity` is low|medium|high (no "blocker") and milestone
-// `chip` has no "at-risk" value, so it is skipped; see handoff.
+// Cross-field consistency, rules 1-6 only. A seventh rule -- "a blocker-severity risk implies
+// a blocked or at-risk milestone" -- has no vocabulary to stand on: risk `severity` is
+// low|medium|high with no "blocker", and milestone `chip` has no "at-risk" value (SCHEMA.md).
 const FINISHED_CHIPS = new Set(['Done', 'Gate passed']);
 const BUILT_OK_STAGES = new Set(['test', 'review', 'gate']);
 

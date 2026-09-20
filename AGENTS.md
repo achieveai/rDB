@@ -36,5 +36,7 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   patience they were accepted with and fails rows that are not broken.
 - The scale stretches deadlines only. Raft timers keep their real values, so the rows still
   test the real thing. Any value you set in the environment wins over the script's default.
-- Never run two cargo test invocations against one target directory; they block on the same
-  build lock and each burns its own deadlines waiting.
+- Never run two cargo invocations against one target directory. The second does not merely wait:
+  observed 2026-09-19, a second gate started while the first was running failed to link with
+  `LNK1104: cannot open file ...m6_rotation.exe`, because the first run was executing the binary
+  the second was trying to overwrite. The failure looks like a build error, not a collision.

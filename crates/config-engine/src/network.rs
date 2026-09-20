@@ -137,13 +137,10 @@ impl EngineNetwork {
         // nothing new, and its last known schema — or the schema-1 default — is what the gate
         // must keep using (M6-89); the `?` above has already returned in that case.
         //
-        // An answer that carried no schema field is recorded as [`COMPAT_SCHEMA_1`] rather
-        // than left absent, because it is the strongest evidence the peer plane can produce
-        // about a genuinely pre-M6 build: it replied, and it has no triple to name. Leaving it
-        // absent would make it indistinguishable from a voter the leader has never heard from,
-        // and the gate's steady-state clause treats those two oppositely on purpose (F-014) —
-        // an unreachable voter must not re-gate a running cluster, an answering old voter
-        // must. Absence therefore means strictly "no answer" (`PeerSchemas::observed`).
+        // An answer carrying no schema field is recorded as [`COMPAT_SCHEMA_1`], not left
+        // absent: it replied and has no triple to name, which is the strongest evidence of a
+        // pre-M6 build. Absence must keep meaning strictly "no answer" — see
+        // `PeerSchemas::observed` for why the gate treats the two oppositely (F-014).
         self.peer_schemas
             .record(self.target, peer_schema.unwrap_or(COMPAT_SCHEMA_1));
         Ok(response)

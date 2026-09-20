@@ -29,9 +29,9 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-.rtargets/gate}"
 # Incremental artifacts are worthless for a full clean gate and cost disk on every run.
 export CARGO_INCREMENTAL=0
 export RETCD_TEST_DEADLINE_SCALE="${RETCD_TEST_DEADLINE_SCALE:-3}"
-# One log root per invocation. The DuckDB assertions union every file they glob before they
-# filter, so a sibling binary still writing into a shared root collapses the read for all of
-# them — which presents as a logging bug, not a concurrency one.
+# One log root per invocation, inside the private target dir, so one gate run's logs never mix
+# with another's. Separating the binaries *within* a run is already config-log's job: it writes
+# each into a test_run_id subdirectory under this root.
 export RETCD_TEST_LOG_DIR="${RETCD_TEST_LOG_DIR:-$PWD/$CARGO_TARGET_DIR/test-logs/$(date +%Y%m%d-%H%M%S)-$$}"
 
 stage="${1:-all}"

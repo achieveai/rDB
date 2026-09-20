@@ -2333,11 +2333,9 @@ impl NodeInner {
 
     /// Whether a committed voter has *answered* naming a schema below `command_schema`.
     ///
-    /// Positive evidence only: a voter the leader has never heard from is absent from
-    /// `peer_schemas` and reports nothing, which is why this asks
-    /// [`PeerSchemas::observed`](crate::transport::PeerSchemas::observed) rather than `get` —
-    /// `get` would read an unreachable voter as schema 1 and turn every silent voter into a
-    /// blocker, which is the write outage ruling M6-R15 was written to end.
+    /// Positive evidence only, so it asks
+    /// [`PeerSchemas::observed`](crate::transport::PeerSchemas::observed) rather than `get`:
+    /// `get` reads an unreachable voter as schema 1, turning every silent voter into a blocker.
     fn a_voter_reports_below(&self, command_schema: u16) -> bool {
         self.committed_membership()
             .voters
@@ -2366,8 +2364,7 @@ impl NodeInner {
         // one direction ADR-0030's safety property forbids, and would turn E2E-42's rehearsal
         // into that node's outage rather than a refused proposal.
         //
-        // So the watermark clause holds only while no voter contradicts it. An unreachable
-        // voter contradicts nothing (see `a_voter_reports_below`) and steady state survives.
+        // So the clause holds only while no voter contradicts it; silence is not contradiction.
         if self.max_applied_command_schema() >= gate.command_schema
             && !self.a_voter_reports_below(gate.command_schema)
         {
@@ -2420,11 +2417,10 @@ impl NodeInner {
         let Some(min) = self.cluster_min_schema() else {
             return;
         };
-        // Either route into the announcement, matching the gate exactly: the durable watermark
-        // is the same proof of activation there and here (M6-R15), and it carries the same
-        // qualification (F-014). Mirroring the predicate rather than restating half of it is
-        // the point — a `feature_activated` line an operator reads while the gate is in fact
-        // refusing the feature is worse than no line at all.
+        // The same two routes `schema_gate` takes, spelled here against `CURRENT_SCHEMA`: same
+        // watermark proof (M6-R15), same qualification (F-014). Two spellings of one rule, so
+        // keep them in step — a `feature_activated` line an operator reads while the gate is
+        // refusing that feature is worse than no line at all.
         if min.command_schema < CURRENT_SCHEMA.command_schema
             && (self.max_applied_command_schema() < CURRENT_SCHEMA.command_schema
                 || self.a_voter_reports_below(CURRENT_SCHEMA.command_schema))

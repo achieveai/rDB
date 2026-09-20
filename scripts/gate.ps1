@@ -48,9 +48,9 @@ if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = '.rtargets/gate' }
 # Incremental artifacts are worthless for a full clean gate and cost disk on every run.
 $env:CARGO_INCREMENTAL = '0'
 if (-not $env:RETCD_TEST_DEADLINE_SCALE) { $env:RETCD_TEST_DEADLINE_SCALE = '3' }
-# One log root per invocation. The DuckDB assertions union every file they glob before they
-# filter, so a sibling binary still writing into a shared root collapses the read for all of
-# them - which presents as a logging bug, not a concurrency one.
+# One log root per invocation, inside the private target dir, so one gate run's logs never mix
+# with another's. Separating the binaries *within* a run is already config-log's job: it writes
+# each into a test_run_id subdirectory under this root.
 if (-not $env:RETCD_TEST_LOG_DIR) {
     $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
     $env:RETCD_TEST_LOG_DIR = Join-Path $PWD "$($env:CARGO_TARGET_DIR)/test-logs/$stamp-$PID"

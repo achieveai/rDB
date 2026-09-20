@@ -726,8 +726,10 @@ impl SignedPolicyAuthorizer {
     /// One guard, two fields, deliberately. Taking them from two reads lets a reload land in
     /// between and publish a payload this node never occupied — `Converging { from: 7, to: 8 }`
     /// beside `policy_version: 7`. An operator cannot tell that apart from a real inconsistency,
-    /// and an alert keyed on both fields fires on a state that did not exist. Any caller needing
-    /// both must come here rather than pair [`Self::state`] with [`Authorizer::policy_version`].
+    /// and an alert keyed on both fields fires on a state that did not exist. [`Self::state`] is
+    /// this call with the version dropped. Both halves stay separately reachable, so nothing
+    /// enforces the pairing rule: reading `state` alongside [`Authorizer::policy_version`]
+    /// re-opens the tear, and only this convention stands between the two.
     pub fn state_and_version(
         &self,
         rejected: Option<&PolicyRejected>,

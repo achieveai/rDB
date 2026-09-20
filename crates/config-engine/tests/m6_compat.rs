@@ -556,7 +556,10 @@ fn workspace_root() -> std::path::PathBuf {
 /// Finding F-015 added the one refusal that *is* possible on this path, and it sits above
 /// `KvState` rather than inside it: `RocksStore`'s apply loop asks the configured pin before
 /// handing the command to the state machine, so a pinned node errors instead of applying
-/// (`config-storage`'s `m6_compat_open.rs`). It does not weaken fact 1 or this row — the
+/// (`config-storage`'s `m6_compat_open.rs`). The assertion below is narrower than it reads:
+/// it checks that the propose-time `schema_gate` is not duplicated on the apply path, not
+/// that the apply path is unfenced — the F-015 fence is spelled `refuse_command`. It does
+/// not weaken fact 1 or this row — the
 /// fence's outcome is a stopped node, which is the honest report of an unrecoverable log and
 /// not a route around it. It does mean the cluster used here, whose nodes run on
 /// `EphemeralStore`, is the fixture that still shows the unfenced behaviour, which is what
@@ -805,14 +808,11 @@ fn m6_90b_every_v2_only_command_is_gated_and_no_other_is() {
 
 /// F-014 `an_old_voter_admitted_after_activation_re_gates_the_feature`.
 ///
-/// Ruling M6-R15 let the durable watermark alone open the gate, so that one voter going down
-/// after a failover could not turn into a write outage. Its justification for ignoring the
-/// live voter set was that "a schema-1 voter that missed the commit fences itself on its own
-/// decode refusal when it returns" — which is true of a voter that *missed* the entry, and is
-/// not true of this one. This voter missed nothing. It joined afterwards, it is answering, and
-/// it has told the leader in its own `AppendEntries` reply that it cannot carry this
-/// generation. Proposing anyway would be ADR-0030's one forbidden direction: over-reporting,
-/// activating a feature a voter cannot actually decode.
+/// M6-R15 let the durable watermark alone open the gate, justified by a schema-1 voter that
+/// missed the commit fencing itself on its own decode refusal. This voter missed nothing: it
+/// joined after activation, it is answering, and its `AppendEntries` reply says it cannot
+/// carry this generation. Proposing anyway is ADR-0030's one forbidden direction —
+/// over-reporting a feature a voter cannot decode.
 ///
 /// This is the E2E-42 shape — the published rolling upgrade run backwards, which is what a
 /// node replacement or a rollback looks like — so getting it wrong turns a rehearsal into that
@@ -873,9 +873,8 @@ async fn f014_an_old_voter_admitted_after_activation_re_gates_the_feature() {
 /// F-014 companion: `PeerSchemas` keeps the three answers a gate must tell apart.
 ///
 /// M6-89b asserts what `get` collapses — every unknown reads as schema 1 — which is right for
-/// `get`'s callers and is exactly what the steady-state clause must not do. The clause needs
-/// "never answered" to be distinguishable from "answered, and it is old", because it treats
-/// them oppositely: the first must not re-gate a running cluster, the second must.
+/// `get`'s callers and is exactly what the steady-state clause must not do
+/// (`PeerSchemas::observed`).
 #[retcd_test]
 fn f014b_peer_schemas_distinguishes_silence_from_an_old_answer() {
     let seen = config_engine::transport::PeerSchemas::default();
