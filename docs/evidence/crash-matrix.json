@@ -10,14 +10,14 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "4f6f7e586d20c0265c677c054354d844dbdb901a",
+    "git_sha": "ff5c821785b05d4ff415e2fd7cf1e4cd059b5890",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-20T00:51:27Z",
-    "duration_ms": 10199,
+    "utc": "2026-09-20T00:56:42Z",
+    "duration_ms": 10692,
     "seed": 27958,
     "scale_factor": 0.2,
     "full_scale": false
@@ -32,7 +32,7 @@
         "boundary": "before_vote_sync",
         "crossings": 3,
         "driven": true,
-        "recovery_ms": 2715,
+        "recovery_ms": 3407,
         "repeat": 0,
         "target": 2
       },
@@ -40,7 +40,7 @@
         "boundary": "after_vote_sync",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 4352,
+        "recovery_ms": 3907,
         "repeat": 0,
         "target": 2
       },
@@ -48,7 +48,7 @@
         "boundary": "before_log_append",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 534,
+        "recovery_ms": 531,
         "repeat": 0,
         "target": 2
       },
@@ -56,7 +56,7 @@
         "boundary": "after_log_append",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 540,
+        "recovery_ms": 559,
         "repeat": 0,
         "target": 2
       },
@@ -64,7 +64,7 @@
         "boundary": "before_log_flush",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 566,
+        "recovery_ms": 538,
         "repeat": 0,
         "target": 2
       },
@@ -72,7 +72,7 @@
         "boundary": "after_log_flush",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 535,
+        "recovery_ms": 542,
         "repeat": 0,
         "target": 2
       },
@@ -80,7 +80,7 @@
         "boundary": "before_state_batch",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 202,
+        "recovery_ms": 190,
         "repeat": 0,
         "target": 2
       },
@@ -88,7 +88,7 @@
         "boundary": "after_state_batch",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 237,
+        "recovery_ms": 249,
         "repeat": 0,
         "target": 2
       },
@@ -96,7 +96,7 @@
         "boundary": "after_state_batch_before_publish",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 245,
+        "recovery_ms": 247,
         "repeat": 0,
         "target": 2
       },

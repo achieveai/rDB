@@ -668,13 +668,15 @@ classDef changed stroke-width:4px;</pre>
       <div class="lane">
         <div class="lane-head">Lead <span class="lane-count">0 active</span></div>
         <ul>
-          <li class="lane-card finished"><span class="lane-st">✓ done</span> Full workspace gate, run 3.<span class="lane-when">m6-gate · finished 13:15</span></li>
+          <li class="lane-card finished"><span class="lane-st">✓ done</span> Fix pass and progress tooling committed: 61df7bd, 6f925bb.<span class="lane-when">lead-commit · finished 17:58</span></li>
+          <li class="lane-card finished"><span class="lane-st">✓ done</span> Both gate failures diagnosed. m6_20 was a torn /health payload, fixed. m4_69 was a missing gate script, written.<span class="lane-when">lead-flakes · finished 17:55</span></li>
         </ul>
       </div>
       <div class="lane">
         <div class="lane-head">Developers <span class="lane-count">0 active</span></div>
         <ul>
-          <li class="lane-idle">Idle</li>
+          <li class="lane-card finished"><span class="lane-st">✓ done</span> Schema decode fence wired on apply and snapshot install; schema_gate clause 1 qualified by answered triples.<span class="lane-when">fix-compat · finished 16:40</span></li>
+          <li class="lane-card finished"><span class="lane-st">✓ done</span> Wired bind_policy_version into the daemon; M6-32 drives a real adoption. Poller panics now log.<span class="lane-when">fix-policy · finished 16:30</span></li>
         </ul>
       </div>
       <div class="lane">
@@ -686,18 +688,25 @@ classDef changed stroke-width:4px;</pre>
       <div class="lane">
         <div class="lane-head">Critics <span class="lane-count">0 active</span></div>
         <ul>
-          <li class="lane-idle">Idle</li>
+          <li class="lane-card finished"><span class="lane-st">✓ done</span> Six-reviewer branch review: temp code, silent failures, coverage, security, compat, errors. Zero blockers, 19 findings.<span class="lane-when">rev-wave · finished 15:00</span></li>
         </ul>
       </div>
       <div class="lane">
         <div class="lane-head">Docs <span class="lane-count">0 active</span></div>
         <ul>
-          <li class="lane-idle">Idle</li>
+          <li class="lane-card finished"><span class="lane-st">✓ done</span> Two refresh bugs fixed: a rebuild never recorded the refresh, and the page rendered before its stamp advanced.<span class="lane-when">progress-pipeline · finished 17:52</span></li>
         </ul>
       </div>
     </div>
-    <details class="finished"><summary>Finished (55)</summary>
+    <details class="finished"><summary>Finished (62)</summary>
       <ul>
+        <li><span class="fn">rev-wave</span>: Six-reviewer branch review: temp code, silent failures, coverage, security, compat, errors. Zero blockers, 19 findings.</li>
+        <li><span class="fn">fix-policy</span>: Wired bind_policy_version into the daemon; M6-32 drives a real adoption. Poller panics now log.</li>
+        <li><span class="fn">fix-admin</span>: Signed admin set gated on a verified principal kind (M6-R23). Rotation recovery field.</li>
+        <li><span class="fn">fix-compat</span>: Schema decode fence wired on apply and snapshot install; schema_gate clause 1 qualified by answered triples.</li>
+        <li><span class="fn">lead-flakes</span>: Both gate failures diagnosed. m6_20 was a torn /health payload, fixed. m4_69 was a missing gate script, written.</li>
+        <li><span class="fn">lead-commit</span>: Fix pass and progress tooling committed: 61df7bd, 6f925bb.</li>
+        <li><span class="fn">progress-pipeline</span>: Two refresh bugs fixed: a rebuild never recorded the refresh, and the page rendered before its stamp advanced.</li>
         <li><span class="fn">m6-gate</span>: Full workspace gate, run 3.</li>
         <li><span class="fn">critic-m6</span>: Delta review passed with risks. Gate clear, all findings closed.</li>
         <li><span class="fn">dev-m6-fixes</span>: Closed 3 material and 5 advisory critic-m6 findings.</li>
@@ -923,7 +932,7 @@ classDef changed stroke-width:4px;</pre>
 
 <script>
 (function () {
-  var UPDATED_ISO = "2026-09-20T00:51:21.476Z";
+  var UPDATED_ISO = "2026-09-20T00:56:24.749Z";
 
   function fmtLocal(iso) {
     try {
