@@ -243,3 +243,87 @@ that misread it; the v1 `compact_revision` stamp (ADR-0021 ruling R1) misread it
 and set the upgraded node's watermark to its own revision. Recorded in full as ADR-0021 note 6.
 Rule going forward: any code that must know what a directory *contains* asks
 `verify_column_families` for the layout; the marker answers only "which build wrote this".
+
+#### Findings F-014 and F-015 (2026-09-19): the fence was documentation, and the gate had already been written as though it existed
+
+Two of this ADR's statements were not true of the code, and they were untrue *together* —
+which is why they are recorded as one amendment and were fixed in one change.
+
+**F-015: `--compat-schema 1` did not refuse to decode anything.** `COMPAT_SCHEMA_1`'s contract
+above, and the as-built note's "refuses to *decode* a schema-2 envelope", described
+`SchemaTriple::decode_command` and `SchemaTriple::admits`. Neither had a caller outside the
+test suite. The apply path took the command straight from the entry, applied it, and — by
+ruling M6-R15's own mechanism — raised the node's durable `max_applied_command_schema` to 2
+while the node went on advertising the schema-1 triple on all three planes. The node's
+advertisement, which is the only input every gate decision in this ADR rests on, became
+something the node itself had falsified.
+
+A second route reached the same state without any gate being involved. Snapshot install
+validated `SnapshotHeader.command_schema` against the *build's* envelope constant rather than
+against the pin — a value a pinned process meets by definition — so a pinned node accepted a
+newer generation's snapshot, and `apply_snapshot_records` unioned the header's watermark into
+its own. Catching a lagging node up is the ordinary operator path, so this route needed nothing
+to go wrong at all. This answers the question this ADR's snapshot paragraph left open: the
+refusal it promises did not exist anywhere.
+
+Both are closed by the same fence. `RocksOptions` gains `command_schema`, the sibling of
+`max_format_version` on the other axis this ADR gates, set from `--compat-schema` exactly as
+the format ceiling already was. The apply path asks it before handing a command to the state
+machine, and snapshot install asks it before touching a column family. The refusal is the
+existing `SchemaError::CommandTooNew` text, surfaced as the storage error a log entry this
+build cannot read already produces; there is no new error variant. `refuse_command` in
+`config-core`'s `schema` module is now the single expression of the rule, and `admits`,
+`decode_command` and the fence are all wrappers over it, so the gate and the fence cannot come
+to disagree about what a pinned node accepts.
+
+The fence's outcome for a pinned node is a stopped node. That is correct and is what A7 has
+said since this ADR was written: a committed entry a voter cannot decode has no recovery path,
+so the honest report is that this build cannot carry this log. The operator's answer is to stop
+pinning it.
+
+**F-014: clause 1 of `schema_gate` ignored a voter that had told the truth.** Ruling M6-R15
+added the durable-watermark clause and justified reading it *before* the live voter set with
+the sentence "a schema-1 voter that missed the commit fences itself on its own decode refusal
+when it returns" — the fence of F-015, which did not exist. It is also only true of a voter
+that *missed* the entry. A voter added or restarted at `--compat-schema 1` after activation
+missed nothing: it is answering, and it has named schema 1 in its own `AppendEntries` reply.
+Clause 1 ignored it permanently, so the cluster kept proposing a generation that voter cannot
+decode. That is over-reporting, the one direction the safety property above forbids, and it is
+the downgrade and node-replacement direction of E2E-42 — so wiring F-015's fence without this
+would have converted the published rehearsal into that node's outage.
+
+Clause 1 is kept and qualified: it holds only while no committed voter has **answered** naming
+a schema below the gate. An unreachable voter answers nothing and therefore still does not
+block, which is M6-R15's outage fix intact. `sample_schema_activation` carries the same
+qualification, so the `feature_activated` line cannot claim a feature the gate is refusing.
+
+Making that predicate expressible required one distinction the peer plane was collapsing.
+`PeerSchemas::get` reads every unknown voter as `COMPAT_SCHEMA_1`, which is right for its
+callers and is exactly what the steady-state clause must not do, so `PeerSchemas::observed`
+returns the `Option` and `get` is now expressed through it. Absence had to be made to mean
+strictly "no answer": the peer plane previously recorded nothing for a peer that answered
+*without* a schema field, which is the genuinely pre-M6 build, and leaving it absent would have
+made the real old-build case the only one the gate ignored. Such an answer is now recorded as
+`COMPAT_SCHEMA_1` at the recording site.
+
+**Also corrected in passing.** `StorageOpenError::UpgradeRequiresDrainedLog` named a remedy —
+trigger a snapshot, let purge drain the rest — that the only released build writing a
+`format_version` 1 directory cannot perform, having neither a snapshot engine nor an admin
+plane (F-016). The format-1 arm now leads with rejoining as a fresh learner, which works on any
+build, and still names the drain for the other producer of a marker-1 directory, this build
+pinned (OQ-65, ruling M6-R22). `CURRENT_SCHEMA.proto_rev` stays 1, deliberately, and now says
+why: M6's gRPC additions are all new fields and new services that an older peer parses and
+never calls, and `--compat-schema 1` removes no service from the surface, so bumping one triple
+and not the other would make the pinned node advertise a revision it is in fact serving past
+(F-017).
+
+**Verification.** `f014_an_old_voter_admitted_after_activation_re_gates_the_feature` and
+`f014b_peer_schemas_distinguishes_silence_from_an_old_answer` in
+`crates/config-engine/tests/m6_compat.rs`;
+`f015_a_pinned_store_refuses_to_apply_a_committed_schema_2_command` in
+`crates/config-storage/tests/m6_compat_open.rs`;
+`f015_a_pinned_node_refuses_a_snapshot_built_by_a_newer_generation` in
+`crates/config-storage/tests/m5_snapshot.rs`;
+`an_answer_without_a_schema_field_is_recorded_as_schema_1` in
+`crates/config-engine/src/network.rs`. M6-89 and M6-R15's rows pass unchanged, which is the
+evidence that the qualification did not cost the outage fix.

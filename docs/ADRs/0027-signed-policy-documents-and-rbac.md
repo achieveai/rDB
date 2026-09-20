@@ -349,3 +349,52 @@ therefore stays `Converging` until it restarts, which is the documented cost of 
 This is a convergence courtesy and not a security boundary: gossip confers no authority (§19.9), so
 a forged advertisement can end the narrowing early but can never grant access neither document
 grants (M6-23, OQ-56).
+
+## Implementation note (2026-09-19, lead ruling M6-R23: a signed admin name requires a verified caller)
+
+The final review of `feature/m4-m6` found that `AdminAllowlist::permits`
+(`crates/config-grpc/src/admin_plane.rs`) matched on `principal.name` alone, identically for a
+`Static` and a `Signed` source, while the grant path already ran every principal through
+`config_core::authz::is_verified_kind`. Admins skipped the gate that grants do not.
+
+**Ruling: the verified-kind gate applies to a `Signed` admin set, and not to a `Static` one.**
+
+The asymmetry is the point, and it follows from what each source is:
+
+- A **signed** `admins` list is the whole reason this ADR left the admin plane on the client-plane
+  listener rather than splitting off a second mTLS port (see above: "the signed document already
+  carries a stronger admin-identity guarantee"). Honouring a cryptographically verified admin name
+  for a caller the transport never authenticated destroys exactly that argument. Under
+  `authz.mode = "signed"` with an insecure listener, every caller arrives as
+  `Principal::development()` named `dev`, so a document listing `dev` — or any name an operator
+  happens to have chosen — opens the whole admin plane to an unauthenticated caller. The signature
+  would be buying nothing, which is the same failure this ADR already refuses for a config-file
+  `admins` list under signed mode.
+- A **static** `admins` list stays exempt under ADR-0023 ruling 4, unchanged. There, `dev` must
+  appear verbatim in `[authz] admins` before an insecure node serves a single admin RPC, so the
+  operator has already said out loud that this is a development node. That is a deliberate
+  affordance with a local, visible switch; it is not a name a remote document can assert.
+
+The gate is therefore one condition, not two: the admin set's *source* decides, never the
+listener's TLS mode. A rule that read "signed, unless the listener is insecure" would make the
+security property depend on a second, unrelated fact, and would leave the reader unable to answer
+"does a signed admin name bind to an unverified caller?" without also knowing the transport.
+
+Consequence, accepted: signed RBAC and an insecure listener no longer combine to give admin
+access. Two existing rows (`m6_25`, `m6_40_the_admin_set_follows_the_active_document`) exercised
+that combination and move to the mTLS harness, where the principal carries
+`PrincipalKind::Certificate`. This is the better test: it asserts the property the ADR claims
+rather than a configuration the project now declares invalid. `is_verified_kind` becomes `pub` in
+`config-core` so the admin path can apply the same predicate as the grant path rather than
+duplicating it.
+
+The local-cluster script is unaffected: it runs `--dev-allow-all` with `--allow-insecure-dev`
+(`scripts/local-cluster.sh`), which is `AllowAll` authorization and never reaches the allowlist.
+
+**Release note owed.** `authz.mode = "signed"` on an insecure listener is now a dead
+configuration: the document's `admins` list binds to nobody, because no caller on that listener
+carries a verified kind. An operator running that combination loses admin access on upgrade, with
+`PermissionDenied` and the existing `not_an_admin` refusal reason. It belongs in the release
+notes beside the `authz.mode` default flip this ADR already flags. The remedy is either mTLS
+(the supported posture for signed RBAC) or `authz.mode = "static"` with an explicit
+`admins = ["dev"]`, which ADR-0023 ruling 4 still honours.

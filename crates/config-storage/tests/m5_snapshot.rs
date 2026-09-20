@@ -1227,3 +1227,71 @@ async fn m5_82a_restore_streams_a_large_snapshot_in_bounded_batches() {
         assert_eq!(s.reader().cluster_revision(), header.cluster_revision);
     }
 }
+
+/// F-015 `a_pinned_node_refuses_a_snapshot_built_by_a_newer_generation`.
+///
+/// The install path's companion to the apply-path fence in `m6_compat_open.rs`, and the answer
+/// to the question ADR-0030's snapshot paragraph left open: the refusal it describes did not
+/// exist. `validate_snapshot_file` compared the header against this *build's* constants, which
+/// a pinned node meets by definition, so the snapshot installed — and `apply_snapshot_records`
+/// then unioned the header's `max_applied_command_schema` into the local one. That made
+/// install the second route by which a node advertising schema 1 could come back claiming to
+/// have applied schema 2 without ever having decoded a schema-2 command, and unlike the apply
+/// path it needed no gate bug to reach: catching a lagging node up is the ordinary path.
+///
+/// The check is on `command_schema` rather than on `format_version` because that is the axis
+/// the watermark rides on, and it covers the format axis anyway: every snapshot this build
+/// writes stamps the header from `COMMAND_ENVELOPE_VERSION`, so a pinned node turns away the
+/// whole generation.
+#[retcd_test]
+async fn f015_a_pinned_node_refuses_a_snapshot_built_by_a_newer_generation() {
+    let src_dir = tempfile::tempdir().expect("temp dir");
+    let dst_dir = tempfile::tempdir().expect("temp dir");
+
+    let src = open_plain(src_dir.path());
+    seed(&src, 3).await;
+    let meta = build(&src).await.expect("the newer node publishes");
+
+    let dst = RocksStore::open_with(
+        dst_dir.path(),
+        identity_for(7, 2),
+        Limits::DEFAULT,
+        Arc::new(NoFaults),
+        Span::none(),
+        config_storage::RocksOptions {
+            max_format_version: 1,
+            command_schema: config_core::COMMAND_SCHEMA_V1,
+            ..config_storage::RocksOptions::DEFAULT
+        },
+        Arc::new(config_storage::NoopSink),
+    )
+    .expect("a pinned node opens its own fresh directory");
+
+    let refused = transfer(&src, &dst, &meta, |_| {})
+        .await
+        .expect_err("a pinned node must refuse a newer generation's snapshot");
+    assert!(
+        refused.contains("command schema") || refused.contains("command_schema"),
+        "the refusal must name the axis it refused on, got {refused:?}"
+    );
+
+    // The install left nothing behind: no state, and above all no raised watermark. A node
+    // that accepted the header's claim here would go on advertising schema 1 while reporting
+    // a durable maximum of 2, and every gate decision the cluster made afterwards would rest
+    // on that contradiction.
+    let mut watermark = 0u16;
+    dst.reader()
+        .with_state(&mut |s| watermark = s.max_applied_command_schema());
+    assert_eq!(
+        watermark,
+        config_core::COMMAND_SCHEMA_V1,
+        "a refused install must not raise the durable activation watermark"
+    );
+    assert_eq!(
+        dst.reader().cluster_revision(),
+        0,
+        "and none of the refused snapshot's records landed"
+    );
+    drop(src);
+    drop(dst);
+}

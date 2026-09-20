@@ -249,6 +249,10 @@ fn start(cli: Cli) -> Result<ExitCode, Fatal> {
     let log_fields = cli
         .log_fields()
         .map_err(|e| Fatal::rejected("invalid_log_field", e))?;
+    // Before the document is even read: a refused safety gate must not depend on a config file
+    // being present or parseable (ADR-0018 §5's pre-bind class).
+    cli.check_dev_gates()
+        .map_err(|e| Fatal::rejected("invalid_dev_gate", e))?;
 
     let config_path = cli.config.clone().ok_or_else(|| {
         Fatal::rejected(

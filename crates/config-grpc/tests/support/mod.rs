@@ -23,8 +23,14 @@ use config_engine::transport::{
     PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSink,
 };
 use config_engine::{ConfigNode, InProcTransport, NetFault, NodeConfig, StorageHandle};
-use config_grpc::{serve_client_plane, ClientBackend, PeerIdentity, ServerHandle, TlsMode};
+use config_grpc::{
+    serve_client_plane, ClientBackend, MtlsConfig, PeerIdentity, ServerHandle, TlsMode,
+};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
+};
 use tokio::net::TcpListener;
+use tonic::transport::{Channel, ClientTlsConfig};
 
 /// The cluster every test in this crate serves, unless it is testing a mismatch.
 pub const CLUSTER: &str = "0123456789abcdef0123456789abcdef";
@@ -423,6 +429,92 @@ impl PeerSink for FakeSink {
             ))),
         }
     }
+}
+
+/// Certificates name the server by DNS; every test listener is reached at 127.0.0.1.
+pub const SERVER_DNS: &str = "retcd.test";
+
+/// A throwaway certificate authority and the material to sign leaves with it.
+///
+/// Here rather than in one test binary because more than one plane now needs a *verified*
+/// principal: lead ruling M6-R23 makes `PrincipalKind::Certificate` the only way to exercise a
+/// signed admin set, so `m6_rbac.rs` needs the same issuing helpers `mtls.rs` has always had.
+pub struct Ca {
+    pub pem: String,
+    cert: rcgen::Certificate,
+    key: KeyPair,
+}
+
+/// A self-signed CA named `common_name`.
+pub fn new_ca(common_name: &str) -> Ca {
+    let key = KeyPair::generate().expect("ca key");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+        KeyUsagePurpose::DigitalSignature,
+    ];
+    let cert = params.self_signed(&key).expect("self-signed ca");
+    Ca {
+        pem: cert.pem(),
+        cert,
+        key,
+    }
+}
+
+/// An end-entity certificate signed by `ca`, naming `san_uri` plus the server DNS name.
+pub fn issue(ca: &Ca, common_name: &str, san_uri: Option<&str>) -> (String, String) {
+    issue_named(ca, common_name, san_uri, &[SERVER_DNS.to_string()])
+}
+
+/// [`issue`] with the DNS SANs spelled out, for the rows that pin a peer's domain.
+pub fn issue_named(
+    ca: &Ca,
+    common_name: &str,
+    san_uri: Option<&str>,
+    dns_names: &[String],
+) -> (String, String) {
+    let key = KeyPair::generate().expect("leaf key");
+    let mut params = CertificateParams::new(dns_names.to_vec()).expect("leaf params");
+    params
+        .distinguished_name
+        .push(DnType::CommonName, common_name);
+    if let Some(uri) = san_uri {
+        params
+            .subject_alt_names
+            .push(SanType::URI(Ia5String::try_from(uri).expect("ascii uri")));
+    }
+    let cert = params
+        .signed_by(&key, &ca.cert, &ca.key)
+        .expect("ca signs leaf");
+    (cert.pem(), key.serialize_pem())
+}
+
+/// The [`MtlsConfig`] that trusts `ca` and presents `cert_pem`/`key_pem`.
+pub fn mtls(ca: &Ca, cert_pem: String, key_pem: String) -> MtlsConfig {
+    MtlsConfig::new(
+        ca.pem.clone().into_bytes(),
+        cert_pem.into_bytes(),
+        key_pem.into_bytes(),
+    )
+    .with_server_domain(SERVER_DNS)
+}
+
+/// Dial `endpoint` over TLS while verifying the certificate against [`SERVER_DNS`].
+pub async fn tls_channel(
+    endpoint: &str,
+    tls: &MtlsConfig,
+) -> Result<Channel, tonic::transport::Error> {
+    let config: ClientTlsConfig = tls.client_tls_config();
+    Channel::from_shared(format!("https://{endpoint}"))
+        .expect("valid authority")
+        .tls_config(config)?
+        .connect()
+        .await
 }
 
 /// Every `rpc`-ish JSONL line this test wrote, scoped to this process's run.

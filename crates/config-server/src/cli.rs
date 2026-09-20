@@ -45,6 +45,8 @@ pub struct Cli {
     pub allow_insecure_dev: bool,
 
     /// The only way allow-all authorization is accepted (ADR-0012).
+    ///
+    /// Accepted only alongside `--allow-insecure-dev`; see [`Cli::check_dev_gates`].
     #[arg(long)]
     pub dev_allow_all: bool,
 
@@ -211,6 +213,31 @@ impl Cli {
         }
     }
 
+    /// Refuse the one safety-gate combination that describes an impossible posture.
+    ///
+    /// The two dev gates used to be independent, so a node could serve real mutual TLS on both
+    /// planes while authorizing every request that arrived over it: production-shaped in its
+    /// certificates, in `transport_security`, and in every log line, yet open to anyone the CA
+    /// has ever issued to. Requiring the pair makes "this is a development build" one fact an
+    /// operator can check rather than two they have to correlate (lead ruling, 2026-09-19;
+    /// ADR-0012, ADR-0018 §2). It costs nothing that worked before: both local-cluster scripts
+    /// already pass the pair, and so does ADR-0027's own description of them.
+    ///
+    /// Checked here rather than in [`crate::config`] because it reads no part of the document;
+    /// it is reported through the same pre-bind refusal path, so it still exits 2 before any
+    /// listener, store or log file exists.
+    pub fn check_dev_gates(&self) -> Result<(), String> {
+        if self.dev_allow_all && !self.allow_insecure_dev {
+            return Err(
+                "--dev-allow-all requires --allow-insecure-dev; refusing to authorize \
+                        every request on a node that otherwise presents itself as a secured one \
+                        (ADR-0012)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Split `--log-field k=v` arguments into pairs.
     ///
     /// Only the first `=` splits, so a value may contain one.
@@ -271,5 +298,34 @@ mod tests {
         assert!(!cli.break_glass_policy_rollback);
         assert!(!cli.form);
         assert!(!cli.capabilities);
+        assert!(cli.check_dev_gates().is_ok());
+    }
+
+    #[test]
+    fn dev_allow_all_is_only_accepted_alongside_allow_insecure_dev() {
+        let alone = parse(&["--config", "n.toml", "--dev-allow-all"]);
+        let refusal = alone
+            .check_dev_gates()
+            .expect_err("allow-all authorization on a TLS-secured node is refused");
+        assert!(
+            refusal.contains("--allow-insecure-dev"),
+            "the refusal names the flag that would have allowed it: {refusal}"
+        );
+
+        let paired = parse(&[
+            "--config",
+            "n.toml",
+            "--dev-allow-all",
+            "--allow-insecure-dev",
+        ]);
+        assert!(
+            paired.check_dev_gates().is_ok(),
+            "the pair is the supported development posture, and both local-cluster scripts use it"
+        );
+
+        // The other gate keeps standing on its own: `tls.mode = \"insecure\"` with a real policy
+        // is a legitimate configuration, and coupling must not have made it a refusal.
+        let insecure_only = parse(&["--config", "n.toml", "--allow-insecure-dev"]);
+        assert!(insecure_only.check_dev_gates().is_ok());
     }
 }

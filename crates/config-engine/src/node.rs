@@ -2289,10 +2289,20 @@ impl NodeInner {
         if self.schema_gate(&cmd).is_err() {
             return;
         }
-        if let Ok(Err(e)) =
-            tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await
-        {
-            tracing::warn!(up_to, error = %e, "compaction proposal failed");
+        // F-006: the timeout arm is logged, not discarded. To the retention timer a proposal
+        // that never returned and one that returned an error are the same event — history was
+        // not trimmed — and the timed-out case is the one an operator most needs to see,
+        // because it is what a wedged leader looks like from here. Both arms keep the one
+        // message name so an alert rule matches either (ADR-0026).
+        match tokio::time::timeout(self.cfg.write_timeout, self.raft.client_write(cmd)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(up_to, error = %e, "compaction proposal failed"),
+            Err(_) => tracing::warn!(
+                up_to,
+                error = "timeout",
+                timeout_ms = self.cfg.write_timeout.as_millis() as u64,
+                "compaction proposal failed"
+            ),
         }
     }
 
@@ -2321,19 +2331,46 @@ impl NodeInner {
         out
     }
 
+    /// Whether a committed voter has *answered* naming a schema below `command_schema`.
+    ///
+    /// Positive evidence only: a voter the leader has never heard from is absent from
+    /// `peer_schemas` and reports nothing, which is why this asks
+    /// [`PeerSchemas::observed`](crate::transport::PeerSchemas::observed) rather than `get` —
+    /// `get` would read an unreachable voter as schema 1 and turn every silent voter into a
+    /// blocker, which is the write outage ruling M6-R15 was written to end.
+    fn a_voter_reports_below(&self, command_schema: u16) -> bool {
+        self.committed_membership()
+            .voters
+            .iter()
+            .filter_map(|v| self.peer_schemas.observed(*v))
+            .any(|s| s.command_schema < command_schema)
+    }
+
     /// Refuse a command no committed voter set can carry yet (ADR-0030 A7).
     fn schema_gate(&self, cmd: &Command) -> Result<(), ConfigError> {
         let Some(gate) = command_gate(cmd) else {
             return Ok(());
         };
-        // Ruling M6-R15. Activation is a property of the *replicated state*, not of who is
-        // answering right now: once an entry of this generation is in the applied state, every
-        // voter that has it has already decoded it, and a voter that has not is fenced by its
-        // own decode refusal when it returns. Checking this first is what stops one voter going
-        // down after a failover from turning into a write outage — the unreachable voter is
-        // unknown, an unknown voter reads as the oldest schema, and that would otherwise
-        // re-gate a cluster that has been using the feature for weeks.
-        if self.max_applied_command_schema() >= gate.command_schema {
+        // Ruling M6-R15, narrowed by finding F-014. Activation is a property of the
+        // *replicated state*, not of who is answering right now: once an entry of this
+        // generation is in the applied state, every voter that has it has already decoded it.
+        // That is what stops one voter going down after a failover from turning into a write
+        // outage, and it is why the durable watermark is consulted before the live minimum.
+        //
+        // But the watermark is a fact about the *past* voter set. M6-R15 justified ignoring
+        // the present one by saying a voter that missed the commit "is fenced by its own
+        // decode refusal when it returns" — true only now that F-015 wired that fence, and
+        // true only of a voter that *missed* the entry. A voter added or restarted at
+        // `--compat-schema 1` after activation has not missed anything; it has told the leader
+        // it cannot decode this generation. Proposing anyway would over-report, which is the
+        // one direction ADR-0030's safety property forbids, and would turn E2E-42's rehearsal
+        // into that node's outage rather than a refused proposal.
+        //
+        // So the watermark clause holds only while no voter contradicts it. An unreachable
+        // voter contradicts nothing (see `a_voter_reports_below`) and steady state survives.
+        if self.max_applied_command_schema() >= gate.command_schema
+            && !self.a_voter_reports_below(gate.command_schema)
+        {
             return Ok(());
         }
         // Off the leader there is no minimum to judge against, and the proposal is about to be
@@ -2383,10 +2420,14 @@ impl NodeInner {
         let Some(min) = self.cluster_min_schema() else {
             return;
         };
-        // Either route into the announcement, matching the gate: the durable watermark is the
-        // same proof of activation there and here (M6-R15).
+        // Either route into the announcement, matching the gate exactly: the durable watermark
+        // is the same proof of activation there and here (M6-R15), and it carries the same
+        // qualification (F-014). Mirroring the predicate rather than restating half of it is
+        // the point — a `feature_activated` line an operator reads while the gate is in fact
+        // refusing the feature is worse than no line at all.
         if min.command_schema < CURRENT_SCHEMA.command_schema
-            && self.max_applied_command_schema() < CURRENT_SCHEMA.command_schema
+            && (self.max_applied_command_schema() < CURRENT_SCHEMA.command_schema
+                || self.a_voter_reports_below(CURRENT_SCHEMA.command_schema))
         {
             return;
         }

@@ -82,6 +82,18 @@ pub struct SchemaTriple {
 ///
 /// `format_version` is 3 because M5 added the dedup column family; `command_schema` is 2
 /// because M4/M5 added `Compact`, `RetireNode` and the dedup group to the envelope.
+///
+/// `proto_rev` stays 1 through M6, deliberately (finding F-017). M6 did grow the gRPC
+/// surface — the admin service, the RBAC fields, revision-pinned pagination — but every one
+/// of those additions is a new protobuf field or a new service, which a peer built before it
+/// still parses and simply never calls. `proto_rev` names a revision of the surface that an
+/// older peer could *fail* on, and M6 produced none. Bumping it here and not in
+/// [`COMPAT_SCHEMA_1`] would be worse than leaving it: `--compat-schema 1` pins the envelope
+/// and the store ceiling, it does not remove a service from the gRPC surface, so the pinned
+/// node would then advertise a protocol revision it is in fact serving past. The axis is
+/// consequently not discriminating today, and that is an accurate report rather than a gap —
+/// it is read by nothing but [`SchemaTriple::gate_key`]'s last tie-breaker, which exists to
+/// make the order total (module docs), not to gate anything.
 pub const CURRENT_SCHEMA: SchemaTriple = SchemaTriple {
     format_version: 3,
     command_schema: COMMAND_SCHEMA_V2,
@@ -113,10 +125,7 @@ impl SchemaTriple {
     /// Whether this build can carry `cmd`.
     #[must_use]
     pub fn admits(&self, cmd: &Command) -> bool {
-        match command_gate(cmd) {
-            Some(gate) => self.command_schema >= gate.command_schema,
-            None => true,
-        }
+        refuse_command(self.command_schema, cmd).is_none()
     }
 
     /// Decode a command envelope, refusing one this schema could not have produced.
@@ -131,16 +140,39 @@ impl SchemaTriple {
     /// particular `Put` a schema-2 command, not the header.
     pub fn decode_command(&self, buf: &[u8]) -> Result<Command, SchemaError> {
         let cmd = Command::decode(buf)?;
-        match command_gate(&cmd) {
-            Some(gate) if gate.command_schema > self.command_schema => {
-                Err(SchemaError::CommandTooNew {
-                    feature: gate.feature,
-                    required: gate.command_schema,
-                    supported: self.command_schema,
-                })
-            }
-            _ => Ok(cmd),
+        match refuse_command(self.command_schema, &cmd) {
+            Some(err) => Err(err),
+            None => Ok(cmd),
         }
+    }
+}
+
+/// The refusal a build pinned to `command_schema` owes `cmd`, or `None` when it may carry it.
+///
+/// The one expression of "may this generation carry this command"; [`SchemaTriple::admits`]
+/// and [`SchemaTriple::decode_command`] are both thin wrappers over it, and so is the apply
+/// path's fence (`config-storage`'s `rocks.rs`, ADR-0030 finding F-015). Three separate
+/// spellings of the comparison is how the fence and the gate come to disagree about what a
+/// pinned node accepts, which is the failure ADR-0030 is entirely about.
+///
+/// It takes the `u16` rather than a whole [`SchemaTriple`] because its newest caller holds
+/// only that one axis: `RocksOptions::command_schema` is the pin the storage layer is given,
+/// and assembling a triple around it to ask this question would be exactly the field-wise
+/// blend the module docs forbid — a value describing a build that does not exist.
+///
+/// It takes a decoded [`Command`] rather than bytes because the apply path never sees the
+/// envelope: a Raft entry stores `postcard(Entry<TypeConfig>)` and its payload reaches apply
+/// through `Command`'s serde derive (`command` module docs), so by then the only question
+/// left to ask is about the shape.
+#[must_use]
+pub fn refuse_command(command_schema: u16, cmd: &Command) -> Option<SchemaError> {
+    match command_gate(cmd) {
+        Some(gate) if gate.command_schema > command_schema => Some(SchemaError::CommandTooNew {
+            feature: gate.feature,
+            required: gate.command_schema,
+            supported: command_schema,
+        }),
+        _ => None,
     }
 }
 

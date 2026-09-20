@@ -203,6 +203,29 @@ impl std::io::Write for Tee {
     }
 }
 
+/// Report a background poller that stopped without being asked to.
+///
+/// `spawn_blocking(...).await` hands back a `JoinError` in two quite different situations: the
+/// blocking pool is gone, which only happens once the runtime is shutting down, and **the
+/// closure panicked**. The second is the dangerous one — the node keeps serving traffic and
+/// keeps reporting its policy and TLS material as current, while nothing is re-reading either
+/// file ever again — so it gets an `error` line naming the dead poller. A clean shutdown stays
+/// silent, because `shutdown_complete` already reports that.
+///
+/// The panic's own payload is deliberately not echoed into the line: ADR-0013 keeps arbitrary
+/// runtime strings out of the log, and the default panic hook has already written the message
+/// and location to stderr for whoever is reading it.
+pub fn poller_stopped(poller: &'static str, error: &tokio::task::JoinError) {
+    if error.is_panic() {
+        tracing::error!(
+            poller,
+            detail = "the poller's closure panicked; this node keeps serving traffic but will \
+                      never re-read these files again until it is restarted",
+            "poller_stopped"
+        );
+    }
+}
+
 /// The process root span: the one span every daemon line descends from.
 pub fn process_span(identity: &ClusterIdentity) -> tracing::Span {
     tracing::info_span!(
@@ -212,4 +235,114 @@ pub fn process_span(identity: &ClusterIdentity) -> tracing::Span {
         cluster_id = %identity.cluster_id,
         recovery_epoch = identity.recovery_epoch.0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    //! F-003: a poller that stopped because its own closure panicked has to be distinguishable,
+    //! in the log, from one that stopped because the runtime is going away. Both arrive as a
+    //! `JoinError` from the same `await`, and treating the pair as one silent case is what left
+    //! a node serving traffic with a dead policy or TLS poller and nothing in the log.
+
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    /// A `MakeWriter` that keeps everything written to it, so a test can read back the line a
+    /// `tracing` macro produced.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("the capture buffer").clone())
+                .expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture buffer")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Everything `body` logged, against a subscriber of this test's own.
+    ///
+    /// Thread-local rather than global: the test binary already installed one subscriber, and
+    /// `with_default` takes precedence over it for the duration of the call.
+    fn captured(body: impl FnOnce()) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        sink.text()
+    }
+
+    /// A string no line of this module contains, so "the payload did not reach the log" is a
+    /// claim about the payload rather than about a phrase that happens to appear twice.
+    const PAYLOAD: &str = "PANIC-PAYLOAD-4b19c7";
+
+    /// A real `JoinError` from a blocking closure that panicked, which is what a panicking
+    /// poller hands its `await`. The default panic hook prints the payload to stderr while this
+    /// runs; that is the behaviour under test, not noise to be suppressed.
+    #[tokio::test]
+    async fn a_panicked_poller_is_named_in_the_log() {
+        let error = tokio::task::spawn_blocking(|| panic!("{PAYLOAD}"))
+            .await
+            .expect_err("a panicking closure joins as an error");
+        assert!(error.is_panic(), "the fixture produced the wrong JoinError");
+
+        let logged = captured(|| poller_stopped("policy", &error));
+        assert!(
+            logged.contains("poller_stopped") && logged.contains("policy"),
+            "a poller that died of a panic must say so, by name: {logged:?}"
+        );
+        assert!(
+            !logged.contains(PAYLOAD),
+            "the panic payload stays out of the log (ADR-0013): {logged:?}"
+        );
+    }
+
+    /// The other half of the same `JoinError`: nothing to report, because the process is on its
+    /// way out and `shutdown_complete` already says so.
+    ///
+    /// Produced by aborting a task rather than by dropping a runtime: a `spawn_blocking` closure
+    /// cannot be aborted once it is running, so there is no way to manufacture the real
+    /// pool-is-gone error in-process. What both share — and all this branch reads — is that
+    /// `is_panic()` is false.
+    #[tokio::test]
+    async fn a_poller_that_stopped_without_panicking_logs_nothing() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let error = handle.await.expect_err("an aborted task joins as an error");
+        assert!(
+            !error.is_panic(),
+            "the fixture produced the wrong JoinError"
+        );
+
+        let logged = captured(|| poller_stopped("tls", &error));
+        assert!(
+            logged.is_empty(),
+            "an ordinary shutdown must not look like a fault: {logged:?}"
+        );
+    }
 }

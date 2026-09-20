@@ -44,12 +44,11 @@ pub fn spawn_tls_poller(
             }
             let poll = Arc::clone(&rotator);
             // Blocking: three file reads. On the blocking pool for the same reason the policy
-            // loader's reload is, and an error from it means the pool is gone, which only
-            // happens during shutdown.
-            if tokio::task::spawn_blocking(move || poll.reload("poll"))
-                .await
-                .is_err()
-            {
+            // loader's reload is, and an error from it is either the pool being gone during
+            // shutdown or the reload panicking — a node that keeps serving on credentials it
+            // will never rotate again (F-003).
+            if let Err(error) = tokio::task::spawn_blocking(move || poll.reload("poll")).await {
+                crate::logging::poller_stopped("tls", &error);
                 return;
             }
         }

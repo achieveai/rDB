@@ -10,14 +10,14 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
+    "git_sha": "4f6f7e586d20c0265c677c054354d844dbdb901a",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T19:20:01Z",
-    "duration_ms": 10093,
+    "utc": "2026-09-20T00:51:27Z",
+    "duration_ms": 10199,
     "seed": 27958,
     "scale_factor": 0.2,
     "full_scale": false
@@ -32,7 +32,7 @@
         "boundary": "before_vote_sync",
         "crossings": 3,
         "driven": true,
-        "recovery_ms": 2667,
+        "recovery_ms": 2715,
         "repeat": 0,
         "target": 2
       },
@@ -40,65 +40,65 @@
         "boundary": "after_vote_sync",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 4269,
+        "recovery_ms": 4352,
         "repeat": 0,
         "target": 2
       },
       {
         "boundary": "before_log_append",
-        "crossings": 4,
+        "crossings": 2,
         "driven": true,
-        "recovery_ms": 563,
+        "recovery_ms": 534,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "after_log_append",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 582,
+        "recovery_ms": 540,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "before_log_flush",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 575,
+        "recovery_ms": 566,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "after_log_flush",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 541,
+        "recovery_ms": 535,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "before_state_batch",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 187,
+        "recovery_ms": 202,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "after_state_batch",
         "crossings": 2,
         "driven": true,
-        "recovery_ms": 235,
+        "recovery_ms": 237,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "after_state_batch_before_publish",
         "crossings": 1,
         "driven": true,
-        "recovery_ms": 238,
+        "recovery_ms": 245,
         "repeat": 0,
-        "target": 1
+        "target": 2
       },
       {
         "boundary": "before_snapshot_tmp_sync",

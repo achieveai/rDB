@@ -803,13 +803,22 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     // (`[list]`), and the node has no business reading the daemon's configuration document.
     // The clock is the real one — the deterministic `ManualClock` exists for the tests, which
     // construct their own `Paginator` (anti-flake rule 33).
-    let paginator = Arc::new(config_engine::Paginator::new(
+    let mut paginator = config_engine::Paginator::new(
         identity.node_id,
         running.storage.reader(),
         Arc::new(config_engine::SystemClock),
         limits,
         cfg.list.clone(),
-    ));
+    );
+    // Only under signed policy: a static allowlist has no version to change, so leaving the
+    // paginator's cell at its "no signed policy" default is the truth there. Under signed mode
+    // the binding is what makes `PageTokenExpiredReason::PolicyVersion` reachable at all — an
+    // unbound paginator seals `None` into every token and honours a walk started under grants
+    // the node has since replaced (M6-32, ADR-0027 §15.3, ADR-0029).
+    if let Some(loader) = &policy.loader {
+        paginator.bind_policy_version(loader.policy_version_cell());
+    }
+    let paginator = Arc::new(paginator);
     let backend = Arc::new(NodeBackend {
         node: running.node.clone(),
         storage: running.storage.clone(),
@@ -954,8 +963,11 @@ fn open_store(
         sync_writes: !cli.unsafe_no_sync,
         create_if_missing: true,
         // A `--compat-schema 1` node must refuse a newer directory rather than serve it while
-        // advertising the older schema (ADR-0030, OQ-65).
+        // advertising the older schema (ADR-0030, OQ-65) — and the same argument applied one
+        // level down: it must also refuse an individual command its pinned schema does not
+        // admit, which the storage layer can only enforce if it is told what the pin is.
         max_format_version: cli.schema().format_version,
+        command_schema: cli.schema().command_schema,
     };
     if cli.unsafe_no_sync {
         tracing::warn!(

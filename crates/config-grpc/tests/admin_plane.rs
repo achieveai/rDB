@@ -1,5 +1,5 @@
 //! Admin-plane transport behaviour: the `[authz] admins` allowlist and the one `admin_op`
-//! audit record (test plan M5-50, M5-51, M5-52; ADR-0023, OQ-43).
+//! audit record (test plan M5-50, M5-51, M5-52, M6-126; ADR-0023, OQ-43).
 //!
 //! These run against a scripted [`FakeAdmin`] rather than a Raft node, so a failure here is
 //! unambiguously an authorization or audit defect and never a consensus one. The allowlist is
@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use config_core::{ClusterId, NodeId};
 use config_engine::{AdminError, LogIdView, MembershipReport, SnapshotTriggered};
 use config_grpc::pb::admin_service_client::AdminServiceClient;
-use config_grpc::{pb, AdminAllowlist, AdminBackend, BackupArtifact, TlsMode};
+use config_grpc::{pb, AdminAllowlist, AdminBackend, BackupArtifact, TlsMode, TlsPlaneReload};
 use config_log::retcd_test;
 use tokio::net::TcpListener;
 use tonic::transport::Channel;
@@ -109,6 +109,16 @@ impl AdminBackend for FakeAdmin {
         self.hit();
         Err(AdminError::Unavailable {
             reason: "the fake backend builds no artifacts".to_string(),
+        })
+    }
+
+    /// Overridden only to be *counted*, which is what makes M6-126's refused path a real
+    /// assertion: the trait default would also answer with an error, so a denied caller and a
+    /// caller whose rotation ran and failed would be indistinguishable from the wire alone.
+    async fn reload_tls(&self) -> Result<Vec<TlsPlaneReload>, AdminError> {
+        self.hit();
+        Err(AdminError::Unavailable {
+            reason: "the fake backend serves no TLS credentials".to_string(),
         })
     }
 }
@@ -341,4 +351,51 @@ async fn m5_52_an_empty_allowlist_denies_every_method() {
         ops.iter().all(|o| o["reason"] == "not_an_admin"),
         "every refusal names the allowlist: {ops:?}"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// M6-126 — the `ReloadTls` share of "every M6 admin operation is audited"
+// -------------------------------------------------------------------------------------------
+
+/// M6-126, `ReloadTls`: a non-admin is refused, the rotation never runs, and the refusal leaves
+/// exactly one `admin_op{op="reload_tls", outcome="rejected"}` record.
+///
+/// M6-126 spans six RPCs; this is the credential-rotation one, which belongs here because this
+/// file owns the `admin_op` shape. It is asserted separately from M5-51's `RemoveMember`
+/// because a wrongly-permitted `ReloadTls` is the harder one to notice afterwards: it returns
+/// no version an operator can compare, only new material on three planes, so the proof that the
+/// refusal held has to be that the backend was never reached.
+#[retcd_test]
+async fn m6_126_reload_tls_is_denied_for_a_non_admin_and_audited() {
+    let backend = FakeAdmin::new();
+    // Somebody else is an admin, so this is a genuine allowlist miss rather than the
+    // empty-allowlist case M5-52 covers.
+    let server = start(Arc::clone(&backend), &["svc-operator"]).await;
+    let mut client = dial(&server.endpoint).await;
+
+    let status = client
+        .reload_tls(pb::ReloadTlsRequest {})
+        .await
+        .expect_err("a non-admin must not rotate this node's credentials");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(
+        backend.calls(),
+        0,
+        "the allowlist is checked before the handler, so no plane re-read its PEM files"
+    );
+    assert_eq!(
+        status.metadata().get("retcd-outcome").map(|v| v.as_bytes()),
+        Some(b"rejected".as_slice()),
+        "a refusal carries the outcome marker every other plane stamps"
+    );
+
+    let ops = admin_ops(
+        module_path!(),
+        "m6_126_reload_tls_is_denied_for_a_non_admin_and_audited",
+    );
+    assert_eq!(ops.len(), 1, "one refusal, one record: {ops:?}");
+    assert_eq!(ops[0]["op"], "reload_tls");
+    assert_eq!(ops[0]["outcome"], "rejected");
+    assert_eq!(ops[0]["reason"], "not_an_admin");
+    assert_eq!(ops[0]["principal"], DEV);
 }

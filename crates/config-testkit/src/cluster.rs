@@ -1751,8 +1751,9 @@ impl Cluster {
             .rocks_options(false)
             .expect("a data directory implies Rocks storage");
         // The same ceiling the node was started with, so a reopen is subject to the same
-        // refusal as a cold start (M6-95).
+        // refusal as a cold start (M6-95), on both axes ADR-0030 pins (F-015).
         options.max_format_version = self.cfg.schema(id).format_version;
+        options.command_schema = self.cfg.schema(id).command_schema;
         RocksStore::open_with(
             &dir,
             identity,
@@ -2956,10 +2957,12 @@ async fn start_running(
         Arc::clone(&cfg.clock) as Arc<dyn config_engine::LeaderClock>,
     );
     let schema = cfg.schema(identity.node_id);
-    // A pinned node must refuse a directory written past its ceiling, exactly as the daemon's
-    // `--compat-schema 1` does (ADR-0030 OQ-65, M6-98).
+    // A pinned node must refuse a directory written past its ceiling, and refuse a command
+    // generation past its pin, exactly as the daemon's `--compat-schema 1` does (ADR-0030
+    // OQ-65 and finding F-015; M6-98).
     let rocks_options = cfg.storage.rocks_options(true).map(|mut options| {
         options.max_format_version = schema.format_version;
+        options.command_schema = schema.command_schema;
         options
     });
     let store: StorageHandle = match (data_dir, rocks_options) {

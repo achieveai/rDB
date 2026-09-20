@@ -168,3 +168,94 @@ Left open, owned by the next milestone, none of them a production claim:
   logged in the M6 test plan.
 - The policy signature payload carries no domain-separation tag; ADR-0027's dated note forbids
   key reuse across payload types until one is introduced.
+
+### Note (2026-09-19, final branch review): what the review closed, and what it did not
+
+Six independent reviewers read `feature/m4-m6` at the M6 delta plus branch-wide cross-cutting
+checks. All returned PASS_WITH_RISKS with no blocker. Nineteen findings; the lead verified the
+consequential ones against the code rather than against the reports.
+
+Two were genuine product gaps rather than review noise, and both were the same shape — a
+documented behaviour with no product caller:
+
+- `Paginator::bind_policy_version` had exactly one caller in the repository and it was a test. The
+  daemon never bound the cell, so every page token sealed `policy_version: None` and
+  `PageTokenExpiredReason::PolicyVersion` could not fire in a running node. Test row M6-32 had
+  never been written, which is why nothing caught it. Closed: `PolicyLoader` owns the cell and
+  publishes it at its single adopt point, `run.rs` binds it, and M6-32 drives a real adoption.
+- `SchemaTriple::decode_command` and `::admits` had no product callers at all, while ADR-0030 and
+  the `COMPAT_SCHEMA_1` doc both claimed a pinned node "refuses to decode" a newer command. Worse,
+  the mixed-version gate's first clause cited that refusal as its reason for skipping the voter
+  check, so an unenforced sentence was load-bearing for the gate's safety argument. Closed
+  together, because wiring the fence alone would have turned the documented upgrade rehearsal into
+  a stopped node. See ADR-0030's as-built amendment, which also records snapshot install as a
+  second, independent route to the same state.
+
+One ordering fact is worth stating because it looks like a bug and is not. The policy version the
+daemon publishes to page tokens is republished *after* `Authorizer::adopt` returns, so for a few
+instructions it reads older than the version `/health` reports. That lag is deliberate and is the
+safe direction: a token minted in the window seals the old version and is refused on resume — one
+extra expiry, never a missed one. Publishing it first would seal the new version onto a walk
+authorized under the old grants.
+
+**Still open, owned by the next milestone, none of them a production claim:**
+
+- M6-126 is covered for `ReloadTls` only. The six-op assembly row — one run covering
+  `ReloadPolicy`, `ReloadTls`, gossip add/use/remove and break-glass rollback together — spans
+  three workstreams' test files and has no owner yet.
+- M6-82 releases pins by TTL plus a later walk rather than on disconnect, so an idle node holds
+  pins past the TTL. M6-81 dropped its compaction half: no row holds a pin across a compaction.
+  M6-72 was repurposed to a `NoPin` refusal, leaving the ephemeral/rocks parity claim unowned.
+- A signed policy document carries no cluster identity. One shared operations key across two
+  clusters means each accepts the other's document, and a higher version from the wrong cluster
+  adopts without tripping the rollback refusal. The TLS path does check `expected_cluster`.
+  Either add an optional `cluster_id` and one comparison, or state the trust-key scope rule in
+  ADR-0027.
+- `config-server/src/policy.rs` drops undecodable peer policy hints silently, so a wire regression
+  would pin the cluster in `Converging` with no way to tell lag from unreadable. Putting
+  `voters_reporting` / `voters_total` in the `Converging` health payload would close it.
+- `TlsRotator::try_reload` swaps planes in a loop and returns on the first failure, so a failure
+  raised inside the loop leaves earlier planes already swapped. The window is narrow and
+  self-correcting — the record of what is being served is written only when every plane took the
+  material, so the next reload retries all of them. The type doc, the failure log and
+  `docs/runbooks/credential-rotation.md` now say this instead of claiming nothing changed; the
+  behaviour itself is unchanged.
+- The policy version floor is process-scoped, so after a restart an older validly-signed document
+  re-adopts with no downgrade signal.
+- Shutdown aborts the TLS and policy pollers rather than joining them. A poller parked in
+  `spawn_blocking` cannot be stopped by `abort`, so its closure can still complete a credential
+  swap during the drain. Believed harmless — the listeners are stopping and sessions keep their
+  handshake material — but the comment claims an ordering the abort does not provide.
+- `config-grpc/src/transport.rs` panics on a poisoned mutex while the adjacent `rotation.rs`
+  recovers with `into_inner`. Neither is reachable from attacker-controlled input; the two modules
+  simply disagree about what a poisoned lock means.
+- A daemon-level row for the schema fence is not stageable without enabling `config-engine`'s
+  `testing` feature in `config-testkit/Cargo.toml`. The fence is proven at the storage layer
+  instead, driving a real `RocksStore` state machine.
+
+## Note (2026-09-19, the two gate failures)
+
+The branch review's gate run finished with 1023 passed and two failures, `m6_20` and `m4_69`.
+Both were called pre-existing flakes. Neither was a flake.
+
+**`m6_20` was a product defect.** `/health` filled `policy_version` from the engine's read of
+the authorizer and `policy_state` from a second read taken by the loader, with an `.await`
+between them. A reload landing in the gap published `Converging { from: 7, to: 8 }` beside
+`policy_version: 7` — a state the node never occupied. An operator cannot distinguish that
+from a real inconsistency, and an alert keyed on both fields fires on nothing. The row was
+correct to fail. `SignedPolicyAuthorizer::state_and_version` now returns both under one guard
+and `/health` and `/metrics` both use it; no test was changed, which is the tell. Widening the
+row's predicate would have buried the defect, and that was the tempting fix.
+
+**`m4_69` was a missing script.** `RETCD_TEST_DEADLINE_SCALE` scales every derived deadline,
+and `poll.rs` stated that the gate scripts set it. No gate script was committed. Every
+acceptance run this milestone used scale 3, set by hand, so the repository could not reproduce
+the conditions its own rows were accepted under; a bare `cargo test --workspace` gave a
+2,000-event capacity row a third of its intended patience and it reached 1,802 events.
+`scripts/gate.sh` and `scripts/gate.ps1` now set the scale, a private target directory and a
+fresh log root, and `AGENTS.md` points at them.
+
+Both have the shape this branch kept producing: a documented behaviour with nothing behind it.
+The other two instances were `bind_policy_version` and the schema decode fence. Worth stating
+plainly, because a sentence in a doc comment reads exactly like an enforced invariant and the
+only way to tell them apart is to look for the caller.

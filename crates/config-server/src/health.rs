@@ -134,7 +134,15 @@ async fn handle(
     let response = if method == "GET" && path == "/health" {
         let mut payload = sources.node.health_payload().await;
         // Only the loader knows *why* the last load failed, so only it can fill this (M6-16).
-        payload.policy_state = sources.policy.as_ref().map(|loader| loader.state());
+        // Both fields come from one read: the engine already filled `policy_version` from the
+        // same authorizer, and keeping that value would pair it with a `policy_state` read later
+        // — the torn payload M6-20 catches. Overwriting is sound because the loader and the
+        // engine share one `Arc<SignedPolicyAuthorizer>`, so this is the same fact, read once.
+        if let Some(loader) = sources.policy.as_ref() {
+            let (state, version) = loader.state_and_version();
+            payload.policy_state = Some(state);
+            payload.policy_version = version;
+        }
         match serde_json::to_vec(&payload) {
             Ok(body) => http_response(200, "OK", "application/json", &body),
             Err(e) => {

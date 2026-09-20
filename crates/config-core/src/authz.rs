@@ -183,7 +183,11 @@ pub trait Authorizer: Send + Sync {
 /// Defense in depth for every grant-matching model: a grant names a *verified* identity, so an
 /// unverified [`PrincipalKind::Development`] principal must never match one by name alone, even
 /// if a misconfigured insecure listener sits next to a policy-bearing node.
-pub(crate) fn is_verified_kind(kind: PrincipalKind) -> bool {
+///
+/// Public because the admin allowlist applies the same rule to a *signed* document's `admins`
+/// list (ADR-0027 ruling M6-R23): a cryptographically verified admin name binds only to a
+/// cryptographically verified caller. A static allowlist stays exempt under ADR-0023 ruling 4.
+pub fn is_verified_kind(kind: PrincipalKind) -> bool {
     matches!(
         kind,
         PrincipalKind::Certificate | PrincipalKind::Peer | PrincipalKind::Embedded

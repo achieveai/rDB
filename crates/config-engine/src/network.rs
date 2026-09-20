@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use config_core::{ClusterIdentity, NodeId, SchemaTriple};
+use config_core::{ClusterIdentity, NodeId, SchemaTriple, COMPAT_SCHEMA_1};
 use config_log::TraceContext;
 use config_storage::{RaftNode, RaftNodeId, TraceRegistry, TypeConfig};
 use openraft::error::{Fatal, NetworkError, RPCError, RaftError, RemoteError, Unreachable};
@@ -133,11 +133,19 @@ impl EngineNetwork {
             ))
             .instrument(self.span.clone())
             .await?;
-        // Only an answer counts. A peer that did not reply tells us nothing new, and its last
-        // known schema — or the schema-1 default — is what the gate must keep using (M6-89).
-        if let Some(schema) = peer_schema {
-            self.peer_schemas.record(self.target, schema);
-        }
+        // Only an answer counts, and every answer counts. A peer that did not reply tells us
+        // nothing new, and its last known schema — or the schema-1 default — is what the gate
+        // must keep using (M6-89); the `?` above has already returned in that case.
+        //
+        // An answer that carried no schema field is recorded as [`COMPAT_SCHEMA_1`] rather
+        // than left absent, because it is the strongest evidence the peer plane can produce
+        // about a genuinely pre-M6 build: it replied, and it has no triple to name. Leaving it
+        // absent would make it indistinguishable from a voter the leader has never heard from,
+        // and the gate's steady-state clause treats those two oppositely on purpose (F-014) —
+        // an unreachable voter must not re-gate a running cluster, an answering old voter
+        // must. Absence therefore means strictly "no answer" (`PeerSchemas::observed`).
+        self.peer_schemas
+            .record(self.target, peer_schema.unwrap_or(COMPAT_SCHEMA_1));
         Ok(response)
     }
 }
@@ -240,5 +248,87 @@ impl RaftNetwork<TypeConfig> for EngineNetwork {
             PeerResponse::InstallSnapshot(r) => Ok(r),
             other => Err(wrong_variant(self.target, "install_snapshot", other.kind())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config_core::{ClusterId, RecoveryEpoch, CURRENT_SCHEMA};
+    use openraft::Vote;
+
+    /// A peer that answers every call and never names a schema — the shape of a build older
+    /// than ADR-0030, reproduced by simply *not* overriding `send_with_schema`.
+    struct SchemalessPeer;
+
+    #[async_trait::async_trait]
+    impl PeerTransport for SchemalessPeer {
+        async fn send(
+            &self,
+            _meta: PeerEnvelopeMeta,
+            _endpoint: &str,
+            req: PeerRequest,
+            _deadline: Duration,
+        ) -> Result<PeerResponse, TransportError> {
+            let PeerRequest::Vote(v) = req else {
+                unreachable!("this stub is only ever asked to vote")
+            };
+            Ok(PeerResponse::Vote(VoteResponse {
+                vote: v.vote,
+                vote_granted: true,
+                last_log_id: None,
+            }))
+        }
+    }
+
+    fn network(peer_schemas: Arc<PeerSchemas>) -> EngineNetwork {
+        EngineNetwork {
+            identity: ClusterIdentity {
+                cluster_id: ClusterId::from_bytes([1u8; 16]),
+                recovery_epoch: RecoveryEpoch(0),
+                node_id: NodeId(1),
+            },
+            target: NodeId(2),
+            endpoint: "inproc://2".to_string(),
+            transport: Arc::new(SchemalessPeer),
+            span: tracing::Span::none(),
+            traces: Arc::new(TraceRegistry::new()),
+            schema: CURRENT_SCHEMA,
+            peer_schemas,
+        }
+    }
+
+    /// F-014 third case: a reachable voter that answers *without* a schema field is recorded,
+    /// as schema 1, rather than left absent.
+    ///
+    /// This is the case the gate's steady-state clause would otherwise get exactly backwards.
+    /// Absence means "never answered" and deliberately does not block a cluster that has
+    /// already activated the feature (ruling M6-R15); a genuinely pre-M6 voter is the opposite
+    /// — it is present, it is replicating, and it cannot decode the generation. Leaving it
+    /// absent would make the real old-build case the *only* one the gate ignores, which is
+    /// worse than the bug F-014 closes, because the `--compat-schema` case is a rehearsal and
+    /// this one is production.
+    #[tokio::test]
+    async fn an_answer_without_a_schema_field_is_recorded_as_schema_1() {
+        let seen = Arc::new(PeerSchemas::default());
+        let net = network(Arc::clone(&seen));
+        assert_eq!(
+            seen.observed(NodeId(2)),
+            None,
+            "nothing is known before the first answer"
+        );
+
+        net.call(
+            PeerRequest::Vote(VoteRequest::new(Vote::new(1, 1), None)),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("the stub always answers");
+
+        assert_eq!(
+            seen.observed(NodeId(2)),
+            Some(COMPAT_SCHEMA_1),
+            "an answer always records something, so absence can mean only `no answer`"
+        );
     }
 }

@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use config_core::policy::{Adoption, PolicyRejected, PolicyState, SignedPolicyAuthorizer};
@@ -37,6 +38,15 @@ pub struct PolicyLoader {
     hub: Arc<WatchHub>,
     /// Serializes whole reload attempts. Not a lock on the authorizer, which has its own.
     reloading: Mutex<Attempts>,
+    /// The active version, republished for readers that cannot hold the authorizer.
+    ///
+    /// The paginator is the one such reader: a page token seals the version it was minted
+    /// under, and a walk that outlived a policy change must be refused rather than continued
+    /// under grants that no longer exist (M6-32, M6-71; ADR-0029). It binds this cell through
+    /// [`PolicyLoader::policy_version_cell`], so the loader's single adopt point is also the
+    /// single point at which outstanding tokens stop being honoured. `0` is the "no signed
+    /// policy" encoding the paginator already uses, because a document's version is `>= 1`.
+    version_cell: Arc<AtomicU64>,
 }
 
 /// What the last attempts left behind, for health and for the no-storm rule.
@@ -78,6 +88,7 @@ impl PolicyLoader {
             authorizer,
             hub,
             reloading: Mutex::new(Attempts::default()),
+            version_cell: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -145,6 +156,23 @@ impl PolicyLoader {
             self.hub.on_policy_change(&old, &signed.document);
         }
         let adoption = self.authorizer.adopt(signed)?;
+        // Immediately after the adoption, and only here: this is the one statement in the daemon
+        // that can change the version in force, so republishing it here is what makes every
+        // outstanding page token expire at the instant the grants behind it do (M6-32). A
+        // refused attempt never reaches this line, which is why a rollback the authorizer turns
+        // down does not invalidate a walk.
+        //
+        // The order matters and is not interchangeable. This store *follows* `adopt`, so for a
+        // few instructions the cell reads older than `Authorizer::policy_version()` — which is
+        // what `/health` reports. A token minted inside that window therefore seals the *old*
+        // version and is refused on resume: one extra expiry, never a missed one. Publishing the
+        // cell first would invert that into the unsafe direction, sealing the new version onto a
+        // walk whose pages were authorized under the old grants, and `PolicyVersion` would then
+        // accept exactly the token M6-32 exists to refuse.
+        self.version_cell.store(
+            self.authorizer.policy_version().unwrap_or_default(),
+            Ordering::Relaxed,
+        );
 
         Ok(match adoption {
             // Byte-identical to what is already active. Reported, not logged: a poller that
@@ -186,13 +214,16 @@ impl PolicyLoader {
         })
     }
 
-    /// What the health payload publishes: the active version, or why there is none (M6-16).
+    /// What the health payload publishes: the active version and the state behind it (M6-16).
     ///
     /// Filled in by the daemon's health handler rather than by the engine: only the loader knows
-    /// *why* the last load failed, because only it holds the files.
-    pub fn state(&self) -> PolicyState {
+    /// *why* the last load failed, because only it holds the files. The two come from one read
+    /// of the authorizer — filling them separately let a reload slip between and publish a
+    /// payload this node never occupied; see `SignedPolicyAuthorizer::state_and_version` (M6-20).
+    pub fn state_and_version(&self) -> (PolicyState, Option<u64>) {
         let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
-        self.authorizer.state(attempts.last_rejection.as_ref())
+        self.authorizer
+            .state_and_version(attempts.last_rejection.as_ref())
     }
 
     /// What `/metrics` publishes about this node's policy (ADR-0027, ADR-0026).
@@ -201,7 +232,9 @@ impl PolicyLoader {
     /// loader that owns the files; the engine holds only the authorizer.
     pub fn metrics(&self) -> PolicyMetrics {
         let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
-        let state = self.authorizer.state(attempts.last_rejection.as_ref());
+        let (state, version) = self
+            .authorizer
+            .state_and_version(attempts.last_rejection.as_ref());
         // Converging means some voter is still on `from`, so `from` is the newest version the
         // whole cluster is known to hold — which is exactly what the gauge claims.
         let converged_version = match &state {
@@ -210,7 +243,7 @@ impl PolicyLoader {
             PolicyState::NoValidPolicy { .. } => None,
         };
         PolicyMetrics {
-            version: self.authorizer.policy_version(),
+            version,
             converged_version,
             rollbacks: attempts.rollbacks,
             reload_failures: attempts.failures.clone(),
@@ -221,6 +254,15 @@ impl PolicyLoader {
     /// The shared authorizer, for the admin plane's admin set and the capability report.
     pub fn authorizer(&self) -> &Arc<SignedPolicyAuthorizer> {
         &self.authorizer
+    }
+
+    /// The cell `Paginator::bind_policy_version` binds (M6-32, ADR-0029).
+    ///
+    /// Handed out as the shared `Arc` rather than as a value: the paginator is built once, at
+    /// startup, and a copy taken then would keep honouring tokens minted under grants a later
+    /// reload has already replaced.
+    pub fn policy_version_cell(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.version_cell)
     }
 
     /// One convergence pass: tell the authorizer what the cluster is known to hold (D6.1).
@@ -290,11 +332,11 @@ impl PolicyLoader {
                 let poll = Arc::clone(&loader);
                 // The reload blocks on file I/O and on the journal gate; a runtime worker is
                 // the wrong thread for both.
-                if tokio::task::spawn_blocking(move || poll.reload("poll"))
-                    .await
-                    .is_err()
-                {
-                    // The blocking pool is gone, which only happens during shutdown.
+                if let Err(error) = tokio::task::spawn_blocking(move || poll.reload("poll")).await {
+                    // Either the blocking pool is gone, which only happens during shutdown, or
+                    // the reload itself panicked — the case that leaves a ready node silently
+                    // never reloading its policy again (F-003).
+                    crate::logging::poller_stopped("policy", &error);
                     return;
                 }
                 // After the reload, never before: a document adopted on this tick is one this
@@ -320,8 +362,7 @@ pub struct GossipPolicyVersions {
     node: config_engine::ConfigNode,
     /// The version last put on the wire, so a tick that changes nothing broadcasts nothing.
     ///
-    /// Reset to `None` when an advertisement fails, which is what makes the next tick retry
-    /// instead of believing a broadcast that never happened.
+    /// Written only once a broadcast has actually returned; see [`advertise_once`].
     advertised: Mutex<Option<u64>>,
 }
 
@@ -363,22 +404,14 @@ impl ClusterPolicyVersions for GossipPolicyVersions {
     }
 
     async fn advertise(&self, version: u64) {
-        {
-            let mut advertised = self.advertised.lock().unwrap_or_else(|e| e.into_inner());
-            if *advertised == Some(version) {
-                return;
-            }
-            *advertised = Some(version);
-        }
         // Only this field: `accepted_gossip_keys` belongs to the key rotation and `schema` to
         // the mixed-version gate, and a whole-value write here would revert either of them
         // mid-flight (ruling M6-R18).
-        if let Err(error) = self
-            .gossip
-            .update_extras(|extras| extras.policy_version = Some(version))
-            .await
-        {
-            *self.advertised.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let broadcast = || {
+            self.gossip
+                .update_extras(|extras| extras.policy_version = Some(version))
+        };
+        if let Err(error) = advertise_once(&self.advertised, version, broadcast).await {
             tracing::warn!(
                 %error,
                 version,
@@ -386,6 +419,31 @@ impl ClusterPolicyVersions for GossipPolicyVersions {
             );
         }
     }
+}
+
+/// Put `version` on the wire through `broadcast`, unless it is already there.
+///
+/// `advertised` is written **after** the broadcast returns, never before. The difference only
+/// shows up when the caller is cancelled at the await — today that is the shutdown abort in
+/// `run`, where the consequence is nil — but the failure it prevents is permanent: a cell left
+/// holding a version that never reached the wire makes every later tick take the early return,
+/// so `ClusterPolicyView::min_reported` counts this node as lagging forever and its peers'
+/// clients see `policy_converging` (F-019). The poller calls this sequentially, so the widened
+/// window costs at most one redundant broadcast.
+async fn advertise_once<E, F>(
+    advertised: &Mutex<Option<u64>>,
+    version: u64,
+    broadcast: impl FnOnce() -> F,
+) -> Result<(), E>
+where
+    F: std::future::Future<Output = Result<(), E>>,
+{
+    if *advertised.lock().unwrap_or_else(|e| e.into_inner()) == Some(version) {
+        return Ok(());
+    }
+    broadcast().await?;
+    *advertised.lock().unwrap_or_else(|e| e.into_inner()) = Some(version);
+    Ok(())
 }
 
 /// What the convergence rule sees of the cluster, in one snapshot.
@@ -621,6 +679,65 @@ mod tests {
             fixture.epoch(),
             before + 1,
             "a real change revokes exactly once"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------
+    // F-019: what the cell that suppresses a redundant broadcast is allowed to remember.
+
+    /// A cancellation at the await must leave the cell exactly as it found it, so the next
+    /// tick retries rather than believing a broadcast that never happened. Mutation check:
+    /// moving `advertise_once`'s write back above `broadcast().await` fails the second
+    /// assertion, which is the defect this row closes.
+    #[tokio::test]
+    async fn a_cancelled_advertisement_is_retried_and_a_settled_one_is_not() {
+        let advertised = Mutex::new(None);
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let count = || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+        };
+
+        // Cancelled at the await: `timeout` polls the broadcast once — enough for it to be a
+        // real attempt — and then drops it, which is what an abort does to this future.
+        let cancelled = tokio::time::timeout(Duration::ZERO, {
+            advertise_once::<(), _>(&advertised, 7, || {
+                count();
+                std::future::pending()
+            })
+        })
+        .await;
+        assert!(cancelled.is_err(), "the broadcast never completed");
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "it was attempted once");
+        assert_eq!(
+            *advertised.lock().expect("the advertised cell"),
+            None,
+            "a broadcast that was cancelled did not reach the wire, so nothing may be remembered"
+        );
+
+        advertise_once::<(), _>(&advertised, 7, || {
+            count();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("the retry succeeds");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "the next tick retries the version the cancelled attempt never delivered"
+        );
+
+        // And the no-storm rule the cell exists for is untouched: a settled version is not
+        // broadcast again.
+        advertise_once::<(), _>(&advertised, 7, || {
+            count();
+            std::future::ready(Ok(()))
+        })
+        .await
+        .expect("an already-advertised version is a no-op");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "a version already on the wire puts nothing further on it"
         );
     }
 

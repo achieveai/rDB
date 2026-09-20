@@ -10,14 +10,14 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
+    "git_sha": "4f6f7e586d20c0265c677c054354d844dbdb901a",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T19:20:11Z",
-    "duration_ms": 800,
+    "utc": "2026-09-20T00:51:33Z",
+    "duration_ms": 994,
     "seed": 27958,
     "scale_factor": 0.3333333333333333,
     "full_scale": false
@@ -32,14 +32,14 @@
         "case": "wrong_node_id",
         "driven": true,
         "outcome": "refused or ignored; nothing written",
-        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-fNujpc\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=07070707070707070707070707070707 epoch=1 node=99]",
+        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-EixeQl\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=07070707070707070707070707070707 epoch=1 node=99]",
         "repeat": 0
       },
       {
         "case": "wrong_cluster_id",
         "driven": true,
         "outcome": "refused or ignored; nothing written",
-        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-fNujpc\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=abababababababababababababababab epoch=1 node=3]",
+        "reason": "storage identity mismatch at C:\\Users\\gautamb\\AppData\\Local\\Temp\\retcd-testkit-EixeQl\\node-3: stored [cluster=07070707070707070707070707070707 epoch=1 node=3] configured [cluster=abababababababababababababababab epoch=1 node=3]",
         "repeat": 0
       },
       {

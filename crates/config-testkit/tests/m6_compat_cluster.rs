@@ -568,11 +568,17 @@ async fn m6_97_the_first_v2_command_is_the_rollback_boundary() {
 
 /// M6-103 `snapshot_compatibility_across_the_boundary`.
 ///
-/// Asserted at the point this build can actually refuse: a pinned node's *store ceiling*. The
-/// snapshot header's own `command_schema` check compares against the binary's envelope
-/// constant, which is the same value in a `--compat-schema 1` process, so it cannot express
-/// the policy; the directory a restore produces can, and that is the directory the pinned node
-/// would have to open. See the row's annotation in the plan.
+/// Asserted here at a pinned node's *store ceiling*: the restore path produces a directory,
+/// and a directory is what a pinned node has to open.
+///
+/// This row's original annotation said the snapshot header's own `command_schema` check could
+/// not express the policy, because it compared against the binary's envelope constant, which
+/// is unchanged in a `--compat-schema 1` process. That was true and is the defect finding
+/// F-015 closed: the check now compares against `RocksOptions::command_schema`, so the *live*
+/// install path refuses too, and does so before a column family is touched. The two halves are
+/// complementary — this row covers the restored-directory route, and `config-storage`'s
+/// `m5_snapshot.rs` covers the transfer-and-install route, which is the one that could
+/// otherwise raise a pinned node's durable activation watermark.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m6_103_snapshot_compatibility_across_the_boundary() {
     let cluster = Cluster::builder()

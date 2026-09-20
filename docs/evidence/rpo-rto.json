@@ -10,23 +10,23 @@
     "disk_class": "unknown"
   },
   "build": {
-    "git_sha": "e54c6ef1a206dbaf8fcedfbd8a8ae09f636ebbfb",
+    "git_sha": "4f6f7e586d20c0265c677c054354d844dbdb901a",
     "dirty": true,
     "profile": "debug",
     "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
   },
   "run": {
-    "utc": "2026-09-19T19:19:46Z",
-    "duration_ms": 54142,
+    "utc": "2026-09-20T00:51:27Z",
+    "duration_ms": 52513,
     "seed": 27958,
     "scale_factor": 0.03125,
     "full_scale": false
   },
   "values": {
     "artifact_bytes": 67723006,
-    "backup_ms": 2799,
+    "backup_ms": 2863,
     "backup_revision": 8192,
-    "generate_ms": 40718,
+    "generate_ms": 40005,
     "measured_path": "config_storage::snapshot::export_snapshot + SnapshotReader::verify_to_end + restore_into_fresh_store + RocksStore::open (the legs config-server's backup/restore CLI wraps)",
     "new_cluster": "6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d6d",
     "not_measured": [
@@ -38,21 +38,21 @@
     "objectives_claimed": false,
     "objectives_note": "spec §12.2's 60 min RPO / 60 min RTO remain provisional planning assumptions; this row measures, it does not claim them",
     "records": 8192,
-    "restore_ms": 4989,
+    "restore_ms": 4391,
     "restored_from_cluster": "07070707070707070707070707070707",
     "restored_records": {
       "kv": 8192
     },
-    "rpo_window_ms": 3271,
+    "rpo_window_ms": 3294,
     "rpo_window_mutations": 25,
     "rpo_window_mutations_recovered": 0,
-    "rto_components_total_ms": 12668,
+    "rto_components_total_ms": 11773,
     "skipped_records": {
       "events": 8192
     },
     "state_bytes": 33554432,
-    "time_to_first_read_ms": 320,
-    "verify_ms": 4560
+    "time_to_first_read_ms": 300,
+    "verify_ms": 4219
   },
   "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
 }

@@ -189,12 +189,30 @@ impl PeerSchemas {
     /// is indistinguishable from a build too old to have one, and both must gate the same way.
     #[must_use]
     pub fn get(&self, node: NodeId) -> SchemaTriple {
+        self.observed(node).unwrap_or(COMPAT_SCHEMA_1)
+    }
+
+    /// What `node` advertised on its last answer, or `None` if it has never answered.
+    ///
+    /// The distinction [`PeerSchemas::get`] deliberately collapses, kept available for the one
+    /// caller that must not collapse it: the propose-time gate's steady-state clause (ADR-0030
+    /// ruling M6-R15 as narrowed by finding F-014). An *unreachable* voter must not re-gate a
+    /// cluster that has been running the feature for weeks — that is the write outage M6-R15
+    /// exists to prevent — while a voter that has answered and named a schema below the gate
+    /// must block it, because the leader has positive evidence it could not decode the entry.
+    /// Collapsing the two, as `get` does, makes those two cases one, and only one of them can
+    /// then be served.
+    ///
+    /// Absence means strictly "no answer": [`PeerSchemas::record`]'s caller writes
+    /// [`COMPAT_SCHEMA_1`] for an answer that carried no schema field, so a reachable pre-M6
+    /// voter is an entry here, not a gap.
+    #[must_use]
+    pub fn observed(&self, node: NodeId) -> Option<SchemaTriple> {
         self.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&node)
             .copied()
-            .unwrap_or(COMPAT_SCHEMA_1)
     }
 }
 

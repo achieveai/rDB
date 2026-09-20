@@ -11,10 +11,14 @@
 //!    committed and applied by the same node that is serving the walk, and the walk still
 //!    reports its original revision and never shows the new key.
 //!
-//! This is a **new** row, not the plan's E2E-44. E2E-44 is the *failover* case — kill the
-//! leader mid-walk and present the token to its successor — and it is still uncovered; the row
-//! below deliberately keeps one leader, because the mid-walk-write claim is only sharp when the
-//! node serving the walk is the node applying the write.
+//! The first row is a **new** one, not the plan's E2E-44. E2E-44 is the *failover* case — kill
+//! the leader mid-walk and present the token to its successor — and it is still uncovered; the
+//! row below deliberately keeps one leader, because the mid-walk-write claim is only sharp when
+//! the node serving the walk is the node applying the write.
+//!
+//! The second row is the test plan's **M6-32**, which needs the same two things this file
+//! already assembles — a real `[list]` section and a real client walk — plus a real signed-policy
+//! adoption. See its own doc comment for why it cannot live in `config-engine`.
 //!
 //! Anti-flake: no fixed sleeps and no literal ports — every address comes from the harness's
 //! reserved listeners, and every wait is a bounded poll derived from the cluster's own timers.
@@ -26,11 +30,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use config_client::{GrpcClient, GrpcClientOptions, TlsMode};
-use config_core::{ConfigStore, ListRequest, MutationOutcome, PutRequest};
+use config_core::{
+    ConfigError, ConfigStore, ListRequest, MutationOutcome, PageRequest, PageTokenExpiredReason,
+    PutRequest,
+};
 use config_log::retcd_test;
 use config_testkit::poll::{poll_until_async, Timeout};
 
-use support::{deadline, DaemonProcess, Harness, Health, ListTuning, NodeOptions, PRINCIPAL};
+use support::{
+    deadline, DaemonProcess, Harness, Health, ListTuning, NodeOptions, PolicyFixture, PRINCIPAL,
+};
 
 /// Keys written under [`PREFIX`]. Comfortably more than three pages, so a walk that silently
 /// served one wide `List` would be visible as a single page rather than as a short read.
@@ -85,6 +94,38 @@ async fn wait_formed(nodes: &[DaemonProcess]) {
     }
 }
 
+/// Write [`POPULATION`] keys under [`PREFIX`], so that a walk of [`PAGE`] records paginates.
+async fn seed_prefix(client: &GrpcClient) {
+    for index in 0..POPULATION {
+        let response = client
+            .put(PutRequest {
+                key: key(index),
+                value: Bytes::from_static(b"v"),
+                expected_mod_revision: None,
+                dedup: None,
+            })
+            .await
+            .expect("the granted principal may write");
+        assert_eq!(response.outcome, MutationOutcome::Applied);
+    }
+}
+
+/// Poll `endpoint`'s health until it reports `version` as the active signed policy.
+///
+/// The observable for "the daemon has adopted the document that is now on disk": `/health`
+/// publishes the authorizer's own version, so waiting on it waits on the adoption itself rather
+/// than on the poll interval elapsing (M6-16).
+async fn wait_policy_version(endpoint: &str, version: u64) {
+    let result = poll_until_async(deadline(10), Duration::from_millis(50), || async {
+        (support::health(endpoint).await.policy_version == Some(version)).then_some(())
+    })
+    .await;
+    if let Err(Timeout { elapsed, .. }) = result {
+        let last = support::health(endpoint).await;
+        panic!("policy version {version} was not adopted within {elapsed:?}; health was {last:#?}");
+    }
+}
+
 fn key(index: usize) -> Bytes {
     // Zero padded so byte order and numeric order agree; the walk's ordering claim would be
     // vacuous against `/m6/10` sorting before `/m6/2`.
@@ -127,18 +168,7 @@ async fn e2e_m6_wiring_a_pinned_walk_returns_every_key_once_and_ignores_a_mid_wa
     wait_formed(&nodes).await;
     let client = cluster_client(&harness, &nodes);
 
-    for index in 0..POPULATION {
-        let response = client
-            .put(PutRequest {
-                key: key(index),
-                value: Bytes::from_static(b"v"),
-                expected_mod_revision: None,
-                dedup: None,
-            })
-            .await
-            .expect("the granted principal may write");
-        assert_eq!(response.outcome, MutationOutcome::Applied);
-    }
+    seed_prefix(&client).await;
 
     let request = ListRequest {
         prefix: Bytes::from(PREFIX),
@@ -219,4 +249,95 @@ async fn e2e_m6_wiring_a_pinned_walk_returns_every_key_once_and_ignores_a_mid_wa
     for node in &mut nodes {
         node.stop_gracefully(deadline(10)).await;
     }
+}
+
+/// How often the M6-32 node re-reads its policy files. One second, so the bounded poll for the
+/// adoption is short; the wait is still derived from a deadline, never slept through.
+const POLICY_POLL_SECS: u64 = 1;
+
+/// M6-32: a page token minted under one signed policy document is refused, by name, once the
+/// daemon has adopted the next one (ADR-0027 §15.3, ADR-0029).
+///
+/// `config-engine`'s M6-71 proves the paginator's own rule by storing into the shared cell
+/// directly, which is the only thing a library row can do. What only a process can show is that
+/// the daemon *binds* that cell at all: until this row existed `Paginator::bind_policy_version`
+/// had no caller outside that one test, so every token a running node minted sealed
+/// `policy_version: None` and `PageTokenExpiredReason::PolicyVersion` was unreachable in
+/// production. The adoption here is therefore a real one — a newly signed document dropped on
+/// disk and picked up by the node's own poller — and the token is a real one, minted by the
+/// daemon and carried back over the client plane.
+#[retcd_test]
+async fn m6_32_a_policy_adoption_invalidates_an_outstanding_page_token() {
+    const METHOD: &str = "m6_32_a_policy_adoption_invalidates_an_outstanding_page_token";
+    let harness = Harness::with_nodes(METHOD, &[1]).await;
+    let fixture = PolicyFixture::new(harness.root());
+    fixture.write(1, &[""], &["root"]);
+    let options = NodeOptions {
+        // Signed mode and the static allowlist are mutually exclusive (M6-37), so the harness
+        // default policy has to be cleared rather than merely overridden.
+        policy: None,
+        signed_policy: Some(fixture.authz(POLICY_POLL_SECS)),
+        // A TTL far longer than this row takes, so an expiry can never stand in for the
+        // policy-version refusal the row is about.
+        list: Some(ListTuning {
+            max_pinned_snapshots: 4,
+            ttl_seconds: 600,
+            token_key_file: None,
+        }),
+        ..harness.node_options()
+    };
+    harness.write_node_files(&harness.nodes[0], &options);
+
+    let mut node = harness.start(0, true);
+    let nodes = std::slice::from_ref(&node);
+    wait_formed(nodes).await;
+    let endpoint = node.health_endpoint().to_string();
+    let client = cluster_client(&harness, nodes);
+    seed_prefix(&client).await;
+
+    let request = ListRequest {
+        prefix: Bytes::from(PREFIX),
+        max_items: PAGE,
+        max_bytes: 0,
+    };
+    let first = client
+        .list_page(PageRequest::first(request.clone()))
+        .await
+        .expect("the daemon serves the first page");
+    let token = first
+        .next_page_token
+        .expect("the seeded population does not fit in one page, so page one has a cursor");
+
+    // The adoption: a second signed document, with the same grants, reaching the node the way an
+    // operator's deploy would. Same grants on purpose — a narrowed one would let a plain
+    // `PermissionDenied` pass for the refusal this row is about.
+    fixture.write(2, &[""], &["root"]);
+    wait_policy_version(&endpoint, 2).await;
+
+    // `/health` reports the *authorizer's* version, which the daemon publishes one statement
+    // before it republishes the version page tokens are sealed against (see the ordering note in
+    // `config-server/src/policy.rs`; the lag is deliberate and is the safe direction). So health
+    // reaching 2 does not by itself prove the token path has caught up, and a single shot here
+    // would flake if the reload thread were descheduled across this request. The token is a
+    // sealed value, so resending it is free, and once the refusal appears it is permanent.
+    let error = poll_until_async(deadline(5), Duration::from_millis(20), || async {
+        client
+            .list_page(PageRequest::resume(request.clone(), token.clone()))
+            .await
+            .err()
+    })
+    .await
+    .expect("the page token outlived the policy adoption that /health had already reported");
+    assert!(
+        matches!(
+            error,
+            ConfigError::PageTokenExpired {
+                reason: PageTokenExpiredReason::PolicyVersion
+            }
+        ),
+        "the grants the walk started under are no longer in force, and the refusal has to say \
+         so by name rather than as an eviction or a node mismatch: {error:?}"
+    );
+
+    node.stop_gracefully(deadline(10)).await;
 }

@@ -21,9 +21,16 @@ Each artifact repeats the same sentence in its `disclaimer` field, emitted by on
 - `run.scale_factor` is `achieved / requested`: what the run actually reached, never what it was
   configured to reach. `run.full_scale` is the derived boolean. A row that could not reach its
   configured scale says so.
-- `host` and `build` describe the machine and the commit generically — OS, core count, git
-  revision, whether the tree was dirty — so a reader can tell whether two artifacts are
-  comparable.
+- `host` and `build` describe the machine and the commit — OS, core count, `hostname` as the
+  machine reported it, git revision, whether the tree was dirty — so a reader can tell whether
+  two artifacts are comparable. `hostname` is the developer or CI machine name verbatim, not a
+  generic label: check it before publishing an artifact outside the team.
+- The artifacts committed here were written by whichever run last produced them, so their
+  `git_sha` is the commit that run stood on and not necessarily the tip of the branch you are
+  reading, and `dirty: true` records that that tree had uncommitted changes. Running the suite
+  rewrites every file in this directory in place, which leaves the working tree dirty; that is
+  the intended behaviour, not a failure. Re-run and re-commit when you want the numbers to
+  speak for a specific commit.
 
 ## Running the suite
 

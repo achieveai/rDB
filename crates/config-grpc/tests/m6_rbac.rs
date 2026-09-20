@@ -1,10 +1,14 @@
 //! `ReloadPolicy` on the admin plane, and where its admin set comes from (M6-12, M6-40;
-//! ADR-0027, OQ-58).
+//! ADR-0027, OQ-58, lead ruling M6-R23).
 //!
 //! Scripted backend, no consensus and no filesystem: the claims here are transport claims —
 //! who is allowed to call, against which document, and what the refusal looks like on the wire.
 //! The loading and verification behind the RPC is `config-core`'s (`m6_rbac.rs` there) and the
 //! daemon's.
+//!
+//! The rows that expect a signed admin entry to *admit* somebody run over mutual TLS. M6-R23
+//! binds such an entry to a verified principal kind, so the insecure listener — where every
+//! caller is `Principal::development()` — can only exercise the refusal half.
 
 mod support;
 
@@ -24,6 +28,12 @@ use tonic::Code;
 
 /// The principal an insecure listener reports. See `admin_plane.rs` for why that is sound.
 const DEV: &str = "dev";
+
+/// A certificate-borne principal the signed rows admit.
+const ROTATOR: &str = "rotator";
+
+/// A certificate-borne principal that no document here names.
+const OPS: &str = "ops";
 
 /// A backend whose `reload_policy` is scripted and counted.
 ///
@@ -118,19 +128,21 @@ struct AdminServer {
 }
 
 async fn start(backend: Arc<FakeAdmin>, admins: AdminAllowlist) -> AdminServer {
+    start_with_tls(backend, admins, TlsMode::Insecure).await
+}
+
+async fn start_with_tls(
+    backend: Arc<FakeAdmin>,
+    admins: AdminAllowlist,
+    tls: TlsMode,
+) -> AdminServer {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind an ephemeral admin-plane port");
     let node_id = u64::from(listener.local_addr().expect("addr").port());
     let handle = support::node_span(node_id).in_scope(|| {
-        config_grpc::serve_admin_plane(
-            backend,
-            listener,
-            TlsMode::Insecure,
-            support::cluster(),
-            admins,
-        )
-        .expect("serve the admin plane")
+        config_grpc::serve_admin_plane(backend, listener, tls, support::cluster(), admins)
+            .expect("serve the admin plane")
     });
     let endpoint = handle.local_addr().to_string();
     AdminServer {
@@ -143,6 +155,45 @@ async fn client(server: &AdminServer) -> AdminServiceClient<Channel> {
     AdminServiceClient::connect(format!("http://{}", server.endpoint))
         .await
         .expect("dial the admin plane")
+}
+
+/// A mutual-TLS admin plane, and a client that reaches it as a *verified* principal named
+/// `client_name`.
+///
+/// Every signed-admin row runs here rather than on the insecure listener: lead ruling M6-R23
+/// binds a signed `admins` entry to a verified principal kind, so an insecure listener — where
+/// every caller is `Principal::development()` — can no longer exercise one. Returning the
+/// dialled client alongside the server keeps the certificate that produced the principal and
+/// the assertion about it in the same place.
+async fn start_signed_mtls(
+    backend: Arc<FakeAdmin>,
+    admins: AdminAllowlist,
+    client_name: &str,
+) -> (AdminServer, AdminServiceClient<Channel>) {
+    let ca = support::new_ca("retcd-m6-rbac-ca");
+    let (server_cert, server_key) = support::issue(&ca, "admin-plane", None);
+    let (client_cert, client_key) = support::issue(
+        &ca,
+        "fallback-cn",
+        Some(&format!(
+            "retcd://{}/client/{client_name}",
+            support::CLUSTER
+        )),
+    );
+    let server = start_with_tls(
+        backend,
+        admins,
+        TlsMode::MutualTls(support::mtls(&ca, server_cert, server_key)),
+    )
+    .await;
+    let channel = support::tls_channel(
+        &server.endpoint,
+        &support::mtls(&ca, client_cert, client_key),
+    )
+    .await
+    .expect("the admin plane completes a mutual-TLS handshake");
+    let client = AdminServiceClient::new(channel);
+    (server, client)
 }
 
 fn reloaded() -> PolicyReload {
@@ -262,20 +313,24 @@ async fn m6_12_a_refused_document_is_an_error_not_an_outcome() {
 
 /// M6-40: under signed mode the admin set is the active document's `admins`, and a principal
 /// that a configuration file would have listed is not one.
+///
+/// Over mutual TLS so that the *document* is what refuses the caller. On the insecure listener
+/// M6-R23's kind gate would refuse first, and this row would keep passing even if the document's
+/// admin set had stopped being consulted at all.
 #[retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_40_admin_set_comes_only_from_the_signed_document() {
     let backend = FakeAdmin::new(Some(reloaded()));
     // The document names somebody else. `dev` — who a `[authz] admins` entry would have
     // admitted — is not in it.
-    let authorizer = signed_authorizer(7, &["ops"]);
-    let server = start(
+    let authorizer = signed_authorizer(7, &[OPS]);
+    let (_server, mut client) = start_signed_mtls(
         Arc::clone(&backend),
         AdminAllowlist::from_signed_policy(Arc::clone(&authorizer) as Arc<dyn Authorizer>),
+        DEV,
     )
     .await;
 
-    let status = client(&server)
-        .await
+    let status = client
         .reload_policy(pb::ReloadPolicyRequest {})
         .await
         .expect_err("dev is not in the document's admins");
@@ -285,36 +340,85 @@ async fn m6_40_admin_set_comes_only_from_the_signed_document() {
 
 /// The set is re-read on every call, not captured at construction: a rotation that adds an
 /// admin takes effect on the next request, and one that removes an admin does too.
+///
+/// Runs over mutual TLS because the caller has to be admitted at the end, and M6-R23 admits a
+/// signed admin name only for a verified principal.
 #[retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_40_the_admin_set_follows_the_active_document() {
     let backend = FakeAdmin::new(Some(reloaded()));
-    let authorizer = signed_authorizer(7, &["ops"]);
-    let server = start(
+    let authorizer = signed_authorizer(7, &[OPS]);
+    let (_server, mut client) = start_signed_mtls(
         Arc::clone(&backend),
         AdminAllowlist::from_signed_policy(Arc::clone(&authorizer) as Arc<dyn Authorizer>),
+        ROTATOR,
     )
     .await;
 
-    client(&server)
-        .await
+    client
         .reload_policy(pb::ReloadPolicyRequest {})
         .await
-        .expect_err("dev is not an admin under version 7");
+        .expect_err("the rotator is not an admin under version 7");
 
-    // Version 8 adds `dev`. Adopted through the same handle the plane holds — which is the
-    // whole reason the authorizer has interior mutability.
+    // Version 8 adds the rotator. Adopted through the same handle the plane holds — which is
+    // the whole reason the authorizer has interior mutability.
     authorizer
-        .adopt(document(8, &["ops", DEV], Vec::new()))
+        .adopt(document(8, &[OPS, ROTATOR], Vec::new()))
         .expect("a forward adoption");
 
-    let info = client(&server)
-        .await
+    let info = client
         .reload_policy(pb::ReloadPolicyRequest {})
         .await
-        .expect("dev is an admin under version 8")
+        .expect("the rotator is an admin under version 8")
         .into_inner();
     assert_eq!(info.outcome, "reloaded");
     assert_eq!(backend.reloads(), 1);
+}
+
+/// F-013 / lead ruling M6-R23: a signed `admins` entry does not bind a principal whose identity
+/// the transport never verified, even when the name matches exactly.
+///
+/// Both halves run against the *same* document naming the *same* string. The only difference is
+/// how the caller arrived, which is the whole claim: `dev` over an insecure listener is
+/// `PrincipalKind::Development` and is refused, while a certificate carrying the same name is
+/// `PrincipalKind::Certificate` and is admitted. Without the second half this row would also
+/// pass if `permits` had simply stopped matching the name.
+///
+/// This is the gate the grant path has always applied (`config_core::is_verified_kind`, used by
+/// both `StaticAllowlist` and the signed evaluator); before this fix the admin path skipped it,
+/// so signed RBAC on an insecure listener handed the entire admin plane to an unauthenticated
+/// caller — the failure ADR-0027 already refuses for a config-file `admins` list.
+#[retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_40_a_signed_admin_name_does_not_bind_an_unverified_principal() {
+    let backend = FakeAdmin::new(Some(reloaded()));
+    let authorizer = signed_authorizer(9, &[DEV]);
+    let allowlist =
+        || AdminAllowlist::from_signed_policy(Arc::clone(&authorizer) as Arc<dyn Authorizer>);
+
+    let insecure = start(Arc::clone(&backend), allowlist()).await;
+    let status = client(&insecure)
+        .await
+        .reload_policy(pb::ReloadPolicyRequest {})
+        .await
+        .expect_err("an unverified `dev` must not inherit the document's `dev` admin entry");
+    assert_eq!(status.code(), Code::PermissionDenied);
+    assert_eq!(
+        backend.reloads(),
+        0,
+        "the refusal is decided before the handler, so no policy was rotated"
+    );
+
+    let (_secure, mut verified) = start_signed_mtls(Arc::clone(&backend), allowlist(), DEV).await;
+    let info = verified
+        .reload_policy(pb::ReloadPolicyRequest {})
+        .await
+        .expect("the same name, presented by certificate, is the admin the document names")
+        .into_inner();
+    assert_eq!(info.outcome, "reloaded");
+    assert_eq!(
+        backend.reloads(),
+        1,
+        "exactly the verified caller got through"
+    );
 }
 
 /// A signed-mode node with no valid document has no admin set at all, so the plane is closed.
@@ -322,6 +426,10 @@ async fn m6_40_the_admin_set_follows_the_active_document() {
 /// The fail-closed reading, and the one that matters during an incident: a node that lost its
 /// policy must not become a node whose admin plane is open to whoever the configuration file
 /// happened to list.
+///
+/// The caller arrives over mutual TLS so that the *absent document* is the only thing refusing
+/// it. On the insecure listener the M6-R23 kind gate would refuse first, and the row would pass
+/// even if a missing document had started admitting everybody.
 #[retcd_test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_25_no_valid_policy_closes_the_admin_plane() {
     let backend = FakeAdmin::new(Some(reloaded()));
@@ -332,10 +440,9 @@ async fn m6_25_no_valid_policy_closes_the_admin_plane() {
         allowlist.is_empty(),
         "no document means no admins, not an unconstrained plane"
     );
-    let server = start(Arc::clone(&backend), allowlist).await;
+    let (_server, mut client) = start_signed_mtls(Arc::clone(&backend), allowlist, OPS).await;
 
-    let status = client(&server)
-        .await
+    let status = client
         .reload_policy(pb::ReloadPolicyRequest {})
         .await
         .expect_err("a node with no valid policy admits nobody");

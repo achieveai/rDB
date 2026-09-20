@@ -22,52 +22,18 @@ use config_grpc::{
 use config_log::{retcd_test, TraceContext};
 use openraft::raft::VoteRequest;
 use openraft::Vote;
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, KeyUsagePurpose, SanType,
-};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
-use tonic::transport::{Channel, ClientTlsConfig};
 
-use support::{cluster, log_lines, start_client_plane, FakeSink, FakeStore, CLUSTER};
+use support::{
+    cluster, issue, issue_named, log_lines, mtls, new_ca, start_client_plane, tls_channel, Ca,
+    FakeSink, FakeStore, CLUSTER, SERVER_DNS,
+};
 
 const DEADLINE: Duration = Duration::from_secs(5);
 /// A cluster this listener does not serve.
 const OTHER_CLUSTER: &str = "ffffffffffffffffffffffffffffffff";
-/// Certificates name the server by DNS; the listener is reached at 127.0.0.1.
-const SERVER_DNS: &str = "retcd.test";
-
-struct Ca {
-    pem: String,
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-fn new_ca(common_name: &str) -> Ca {
-    let key = KeyPair::generate().expect("ca key");
-    let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    params.key_usages = vec![
-        KeyUsagePurpose::KeyCertSign,
-        KeyUsagePurpose::CrlSign,
-        KeyUsagePurpose::DigitalSignature,
-    ];
-    let cert = params.self_signed(&key).expect("self-signed ca");
-    Ca {
-        pem: cert.pem(),
-        cert,
-        key,
-    }
-}
-
-/// An end-entity certificate signed by `ca`, naming `san_uri` plus the server DNS name.
-fn issue(ca: &Ca, common_name: &str, san_uri: Option<&str>) -> (String, String) {
-    issue_named(ca, common_name, san_uri, &[SERVER_DNS.to_string()])
-}
 
 /// A node certificate shaped exactly like the one `config-testkit` issues: the peer URI SAN
 /// *and* the DNS SAN [`peer_server_domain`] pins. `dns_node` is the identity the DNS name
@@ -82,47 +48,6 @@ fn issue_node(ca: &Ca, uri_node: u64, dns_node: u64) -> (String, String) {
             SERVER_DNS.to_string(),
         ],
     )
-}
-
-fn issue_named(
-    ca: &Ca,
-    common_name: &str,
-    san_uri: Option<&str>,
-    dns_names: &[String],
-) -> (String, String) {
-    let key = KeyPair::generate().expect("leaf key");
-    let mut params = CertificateParams::new(dns_names.to_vec()).expect("leaf params");
-    params
-        .distinguished_name
-        .push(DnType::CommonName, common_name);
-    if let Some(uri) = san_uri {
-        params
-            .subject_alt_names
-            .push(SanType::URI(Ia5String::try_from(uri).expect("ascii uri")));
-    }
-    let cert = params
-        .signed_by(&key, &ca.cert, &ca.key)
-        .expect("ca signs leaf");
-    (cert.pem(), key.serialize_pem())
-}
-
-fn mtls(ca: &Ca, cert_pem: String, key_pem: String) -> MtlsConfig {
-    MtlsConfig::new(
-        ca.pem.clone().into_bytes(),
-        cert_pem.into_bytes(),
-        key_pem.into_bytes(),
-    )
-    .with_server_domain(SERVER_DNS)
-}
-
-/// Dial `endpoint` over TLS while verifying the certificate against `SERVER_DNS`.
-async fn tls_channel(endpoint: &str, tls: &MtlsConfig) -> Result<Channel, tonic::transport::Error> {
-    let config: ClientTlsConfig = tls.client_tls_config();
-    Channel::from_shared(format!("https://{endpoint}"))
-        .expect("valid authority")
-        .tls_config(config)?
-        .connect()
-        .await
 }
 
 #[retcd_test]

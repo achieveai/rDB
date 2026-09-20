@@ -253,6 +253,44 @@ async fn m3_44_daemon_accepts_insecure_with_flag_and_warns() {
     );
 }
 
+/// The two dev gates are one fact, not two: `--dev-allow-all` is refused on its own.
+///
+/// A new row, not in the plan (lead ruling, 2026-09-19). Until it existed the two flags were
+/// independent, so a node could present real mutual TLS on both planes while authorizing every
+/// request that arrived over it — a build indistinguishable from a production one in its
+/// certificates, its health payload's `transport_security` and its logs, and open to anyone the
+/// CA has ever issued to. Coupling them makes "this is a development build" a single thing an
+/// operator can check. Both local-cluster scripts already pass the pair, so nothing that ran
+/// before this row stops running (ADR-0012, ADR-0018 §2).
+#[retcd_test]
+async fn dev_allow_all_is_refused_without_allow_insecure_dev() {
+    let harness = Harness::new("dev_allow_all_is_refused_without_allow_insecure_dev").await;
+    let node = &harness.nodes[0];
+    // A perfectly ordinary mutual-TLS document: the refusal is about the flag pair alone, which
+    // is the whole point — this is the combination that used to start and serve.
+    let mut spec = harness.spec(0);
+    spec.dev_allow_all = true;
+
+    let (code, stdout, stderr) = daemon::run_to_completion(&spec);
+    assert_eq!(
+        code,
+        Some(2),
+        "a refused flag combination exits 2 (ADR-0018 §5); stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused daemon must print no ready line, got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("--allow-insecure-dev"),
+        "the refusal must name the flag that would have allowed it: {stderr}"
+    );
+    assert!(
+        !node.data_dir.exists(),
+        "the gate runs before the store is opened"
+    );
+}
+
 // =====================================================================================
 // M3-45 — a daemon with no policy and no --dev-allow-all (ADR-0018 §6, OQ-19)
 // =====================================================================================

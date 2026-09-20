@@ -302,15 +302,14 @@ pub enum StorageOpenError {
     /// applied. A residual of applied, decodable entries -- which is all OpenRaft's purge ever
     /// leaves behind -- is not an obstacle and never was.
     ///
-    /// The fix names itself: on the *old* build, let the node finish applying, drain what is
-    /// left (trigger a snapshot, then let purge run), shut down, and upgrade the directory.
+    /// The fix depends on which build wrote the directory, so the message does too -- see
+    /// [`drained_log_remedy`], and finding F-016 for why naming only the drain was wrong.
     #[error(
         "data directory {path} is on-disk format version {format} and {log_entries} of its \
              Raft log entrie(s) cannot be carried across an in-place upgrade -- this build \
              either cannot decode them or has not applied them (the log payload is positional \
-             and unversioned). Fix: on the previous build, let the node catch up so nothing is \
-             unapplied, trigger a snapshot and let log purge drain the rest, shut the node \
-             down, then start this build against the drained directory"
+             and unversioned). Fix: {}",
+        drained_log_remedy(.format)
     )]
     UpgradeRequiresDrainedLog {
         /// The legacy version stamped in the directory.
@@ -353,6 +352,39 @@ pub enum StorageOpenError {
     },
 }
 
+/// The operator procedure that actually clears [`StorageOpenError::UpgradeRequiresDrainedLog`]
+/// on a directory stamped `format`.
+///
+/// Finding F-016: the single message this replaced told every operator to "trigger a snapshot
+/// and let log purge drain the rest", which is unperformable on the only build that ships a
+/// `format_version` 1 directory. That build is M0-M3 (`main`, 7d524ac): it has no snapshot
+/// engine and no admin plane, so there is nothing to trigger and nothing to purge with. An
+/// error that names a remedy the reader cannot carry out is worse than one that names none,
+/// because it sends them looking for a command that does not exist.
+///
+/// The `format` 1 arm therefore names the path that works on any build: discard the directory
+/// and let the node rejoin as a fresh learner, which is ADR-0023's node-replacement flow and
+/// needs nothing from the old binary at all. The second sentence is for the other producer of
+/// a marker-1 directory -- this build running `--compat-schema 1`, which stamps its *ceiling*
+/// (OQ-65, ruling M6-R22) -- where the drain is available and is much the cheaper answer.
+///
+/// `format` 2 keeps the original wording: every build that writes that marker is an M4-or-later
+/// build from this line, which does have both.
+fn drained_log_remedy(format: &u32) -> &'static str {
+    if *format == FORMAT_VERSION_V1 {
+        "the build that writes an on-disk format version 1 directory has no snapshot engine \
+         and no admin plane, so its log cannot be drained in place -- move this node's data \
+         directory aside and let it rejoin the cluster as a fresh learner from a surviving \
+         member, which needs nothing from the older build. If instead this directory was \
+         written by this build under `--compat-schema 1`, restart it pinned, let it finish \
+         applying, trigger a snapshot and let log purge drain the rest, then retry unpinned"
+    } else {
+        "on the previous build, let the node catch up so nothing is unapplied, trigger a \
+         snapshot and let log purge drain the rest, shut the node down, then start this build \
+         against the drained directory"
+    }
+}
+
 /// Tuning knobs for [`RocksStore::open_with`].
 ///
 /// The only field that changes a *guarantee* is [`RocksOptions::sync_writes`]; everything else
@@ -372,15 +404,26 @@ pub struct RocksOptions {
     /// build — exactly what a genuine build of that age would do. Serving a newer directory
     /// while advertising an older schema is the silent-divergence case this exists to prevent.
     pub max_format_version: u32,
+    /// The newest command generation this open may decode and apply (ADR-0030, finding F-015).
+    ///
+    /// [`config_core::CURRENT_SCHEMA`]'s value for an ordinary build. A node pinned with
+    /// `--compat-schema` lowers it, which makes the apply path refuse a committed command of a
+    /// newer generation, and makes an incoming snapshot built by a newer node be refused
+    /// rather than installed. The sibling of [`RocksOptions::max_format_version`] on the other
+    /// axis ADR-0030 gates, and it exists here for the same reason: the pin is per-process
+    /// *configuration*, so no build constant can stand in for it, and without it a pinned node
+    /// applies a generation it is simultaneously advertising it cannot read.
+    pub command_schema: u16,
 }
 
 impl RocksOptions {
     /// The production profile: full sync, create a fresh directory when absent, read every
-    /// format this build understands.
+    /// format and every command generation this build understands.
     pub const DEFAULT: Self = Self {
         sync_writes: true,
         create_if_missing: true,
         max_format_version: FORMAT_VERSION,
+        command_schema: config_core::CURRENT_SCHEMA.command_schema,
     };
 }
 
@@ -424,6 +467,9 @@ struct RocksShared {
     path: PathBuf,
     identity: ClusterIdentity,
     sync_writes: bool,
+    /// The pin from [`RocksOptions::command_schema`], kept for the life of the store because
+    /// both fences that need it run long after `open`: the apply path and snapshot install.
+    command_schema: u16,
     faults: Arc<dyn FaultInjector>,
     counters: Arc<FaultCounters>,
     /// Told about every durable batch, on the apply thread. See [`AppliedBatchSink`].
@@ -1114,7 +1160,7 @@ impl RocksStore {
         let install_redos = match loaded.install_in_progress.clone() {
             None => 0,
             Some(marker) => {
-                redo_install(&db, &path, &identity, &marker)?;
+                redo_install(&db, &path, &identity, options.command_schema, &marker)?;
                 loaded = load_state(&db, &path, limits)?;
                 1
             }
@@ -1174,6 +1220,7 @@ impl RocksStore {
                 path,
                 identity,
                 sync_writes: options.sync_writes,
+                command_schema: options.command_schema,
                 faults,
                 counters,
                 sink,
@@ -2577,6 +2624,32 @@ impl RaftStateMachine<TypeConfig> for RocksSm {
                             }
                             EntryPayload::Normal(cmd) => {
                                 commands += 1;
+                                // F-015: the decode refusal ADR-0030's `--compat-schema`
+                                // contract promises, at the only place left that can perform
+                                // it. A Raft entry is `postcard(Entry<TypeConfig>)` and its
+                                // payload reaches here through `Command`'s serde derive, so
+                                // `SchemaTriple::decode_command` never runs on this path and
+                                // never could — by the time the entry is in hand there is no
+                                // envelope left to refuse, only a shape.
+                                //
+                                // Refusing is the whole point and stopping the node is the
+                                // correct outcome, not a regrettable one: a pinned node that
+                                // applied this entry would raise its own durable
+                                // `max_applied_command_schema` (ruling M6-R15) while still
+                                // advertising the older triple, and every gate decision the
+                                // cluster makes afterwards would rest on that node's lie. An
+                                // erroring apply is a `Fatal` to OpenRaft, which is the
+                                // honest report: this build cannot carry this log, and the
+                                // operator's answer is to stop pinning it.
+                                if let Some(refusal) =
+                                    config_core::refuse_command(s.command_schema, &cmd)
+                                {
+                                    return Err(io_error(
+                                        ErrorSubject::Log(log_id),
+                                        ErrorVerb::Read,
+                                        refusal.to_string(),
+                                    ));
+                                }
                                 let trace_id = s.traces.lookup(&cmd);
                                 // `apply_with_effects` reports what the *state* did to its
                                 // dedup index and retired set, so the batch below mirrors those
@@ -3468,6 +3541,7 @@ fn sweep_partial_receives(dir: &Path) {
 fn validate_snapshot_file(
     path: &Path,
     identity: &ClusterIdentity,
+    command_schema: u16,
 ) -> Result<SnapshotHeader, SnapshotFileError> {
     let reader = SnapshotReader::open(path)?;
     let header = reader.header().clone();
@@ -3477,10 +3551,20 @@ fn validate_snapshot_file(
             supported: FORMAT_VERSION,
         });
     }
-    if header.command_schema > config_core::COMMAND_ENVELOPE_VERSION {
+    // The *configured* ceiling, not the build constant (F-015). Compared against the build
+    // constant this check could never fire for a pinned node, and install was therefore the
+    // second way — alongside the unfenced apply path — for such a node to reach
+    // `max_applied_command_schema` 2 without ever having decoded a schema-2 command:
+    // `apply_snapshot_records` unions the header's watermark into the local one, so the node
+    // came back claiming a generation it had never read. Refusing here is what makes
+    // ADR-0030's "a v2 leader's snapshot offered to a `--compat-schema 1` node is refused"
+    // true. The format axis rides along: every snapshot this build writes stamps
+    // `command_schema` from `COMMAND_ENVELOPE_VERSION`, so a pinned node turns away the whole
+    // generation rather than only the newer-format half of it.
+    if header.command_schema > command_schema {
         return Err(SnapshotFileError::UnsupportedCommandSchema {
             found: header.command_schema,
-            supported: config_core::COMMAND_ENVELOPE_VERSION,
+            supported: command_schema,
         });
     }
     if header.cluster_id != identity.cluster_id || header.recovery_epoch != identity.recovery_epoch
@@ -3806,7 +3890,7 @@ fn install_received(
         s.snapshot_install_failures.fetch_add(1, Ordering::SeqCst);
     };
 
-    let header = match validate_snapshot_file(&recv_path, &s.identity) {
+    let header = match validate_snapshot_file(&recv_path, &s.identity, s.command_schema) {
         Ok(header) => header,
         Err(e) => {
             abort(s, &recv_path);
@@ -3978,6 +4062,7 @@ fn redo_install(
     db: &DB,
     path: &Path,
     identity: &ClusterIdentity,
+    command_schema: u16,
     marker: &StoredSnapshot,
 ) -> Result<(), StorageOpenError> {
     let file = snapshot::snapshot_dir(path).join(&marker.file_name);
@@ -3991,7 +4076,7 @@ fn redo_install(
         path: path.to_path_buf(),
         detail,
     };
-    validate_snapshot_file(&file, identity).map_err(|e| corrupt(e.to_string()))?;
+    validate_snapshot_file(&file, identity, command_schema).map_err(|e| corrupt(e.to_string()))?;
     apply_snapshot_records(db, path, &file, marker, None, true, |_| Ok(()))
         .map_err(|e| corrupt(e.to_string()))?;
     tracing::warn!(

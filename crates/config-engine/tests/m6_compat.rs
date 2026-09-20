@@ -110,14 +110,13 @@ fn eager_retention() -> WatchRetention {
     }
 }
 
-/// M6-88 `cluster_min_schema_is_computed_from_committed_voters_only`.
+/// Three running nodes, of which [`OLD`] is pinned to schema 1, in a cluster formed from the
+/// other two — so the old node is reachable and replicable but **not** a member.
 ///
-/// A learner that lags the cluster's schema must not hold a feature back. If it did, M5's
-/// learner-replacement flow — add a learner, catch it up, promote it, retire the old node —
-/// could never be run during an upgrade, because the replacement node would gate the very
-/// commands the flow needs.
-#[retcd_test(flavor = "multi_thread", worker_threads = 4)]
-async fn m6_88_cluster_min_schema_is_computed_from_committed_voters_only() {
+/// The one shape in which a cluster can reach `cluster_min_schema` 2 with an old node standing
+/// by to join it, which is what M6-88 and the F-014 row below both need. Returns the leader,
+/// already settled at schema 2.
+async fn cluster_with_old_outside_membership() -> (Cluster, NodeId) {
     let cluster = Cluster::start_with_gossip_and_tweak(
         3,
         RaftTimers::default(),
@@ -142,15 +141,20 @@ async fn m6_88_cluster_min_schema_is_computed_from_committed_voters_only() {
     // The minimum is leader-local, so there has to be a leader before it means anything.
     cluster.wait_leader().await;
     let leader = min_schema_settles(&cluster, COMMAND_SCHEMA_V2).await;
-    let node = cluster.get_node(leader);
+    (cluster, leader)
+}
 
-    node.add_learner(
-        OLD,
-        InProcTransport::endpoint(OLD),
-        InProcTransport::endpoint(OLD),
-    )
-    .await
-    .expect("adding the old node as a learner");
+/// Add [`OLD`] as a learner and wait until the leader is replicating to it.
+async fn add_old_as_learner(cluster: &Cluster, leader: NodeId) {
+    cluster
+        .get_node(leader)
+        .add_learner(
+            OLD,
+            InProcTransport::endpoint(OLD),
+            InProcTransport::endpoint(OLD),
+        )
+        .await
+        .expect("adding the old node as a learner");
     cluster
         .wait_for("the learner is replicating", cluster.elections(4), |c| {
             c.get_node(leader)
@@ -160,6 +164,38 @@ async fn m6_88_cluster_min_schema_is_computed_from_committed_voters_only() {
                 .then_some(())
         })
         .await;
+}
+
+/// Promote [`OLD`] and wait until the membership change is committed.
+async fn promote_old_to_voter(cluster: &Cluster, leader: NodeId) {
+    cluster
+        .get_node(leader)
+        .promote_voter(OLD)
+        .await
+        .expect("promoting the learner");
+    cluster
+        .wait_for("the promotion commits", cluster.elections(4), |c| {
+            c.get_node(leader)
+                .committed_membership()
+                .voters
+                .contains(&OLD)
+                .then_some(())
+        })
+        .await;
+}
+
+/// M6-88 `cluster_min_schema_is_computed_from_committed_voters_only`.
+///
+/// A learner that lags the cluster's schema must not hold a feature back. If it did, M5's
+/// learner-replacement flow — add a learner, catch it up, promote it, retire the old node —
+/// could never be run during an upgrade, because the replacement node would gate the very
+/// commands the flow needs.
+#[retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_88_cluster_min_schema_is_computed_from_committed_voters_only() {
+    let (cluster, leader) = cluster_with_old_outside_membership().await;
+    let node = cluster.get_node(leader);
+
+    add_old_as_learner(&cluster, leader).await;
 
     // The learner is being replicated to — so the leader has heard its schema — and the
     // minimum still ignores it.
@@ -173,18 +209,7 @@ async fn m6_88_cluster_min_schema_is_computed_from_committed_voters_only() {
         "the fixture is only meaningful while the old node is not a voter"
     );
 
-    node.promote_voter(OLD)
-        .await
-        .expect("promoting the learner");
-    cluster
-        .wait_for("the promotion commits", cluster.elections(4), |c| {
-            c.get_node(leader)
-                .committed_membership()
-                .voters
-                .contains(&OLD)
-                .then_some(())
-        })
-        .await;
+    promote_old_to_voter(&cluster, leader).await;
 
     // The same node, the same schema, the same leader — only its membership changed.
     assert_eq!(
@@ -519,14 +544,23 @@ fn workspace_root() -> std::path::PathBuf {
 /// 1. **Apply has nowhere to put a refusal.** `KvState::apply_with_effects` returns a
 ///    `CommandResponse`, not a `Result`. That is asserted by *type* below, which is stronger
 ///    than any string search: if apply ever grew an error channel, this row stops compiling.
-/// 2. **So apply takes it.** Forced past the gate, a schema-2 entry commits and applies on
-///    every voter, including the pinned one, silently and completely. Nothing refuses it,
-///    because nothing *can*.
+/// 2. **So the state machine takes it.** Forced past the gate, a schema-2 entry commits and
+///    applies on every voter, including the pinned one, silently and completely. `KvState`
+///    refuses nothing, because it *cannot*.
 /// 3. **And a real old binary could not have.** The same bytes are undecodable under schema 1
 ///    — and a log payload that will not decode is a storage fault, not a refusal a cluster can
 ///    route around, because the entry is already committed and can neither be skipped nor read.
 ///
 /// The ordinary path (M6-90..M6-92) never reaches apply at all; that is the whole point.
+///
+/// Finding F-015 added the one refusal that *is* possible on this path, and it sits above
+/// `KvState` rather than inside it: `RocksStore`'s apply loop asks the configured pin before
+/// handing the command to the state machine, so a pinned node errors instead of applying
+/// (`config-storage`'s `m6_compat_open.rs`). It does not weaken fact 1 or this row — the
+/// fence's outcome is a stopped node, which is the honest report of an unrecoverable log and
+/// not a route around it. It does mean the cluster used here, whose nodes run on
+/// `EphemeralStore`, is the fixture that still shows the unfenced behaviour, which is what
+/// keeps facts 2 and 3 observable.
 #[retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m6_101_the_gate_is_on_propose_not_on_apply() {
     // -- Source: the apply path holds no gate to fall back on. ---------------------------
@@ -767,4 +801,101 @@ fn m6_90b_every_v2_only_command_is_gated_and_no_other_is() {
     };
     assert!(config_core::command_gate(&plain).is_none());
     assert!(COMPAT_SCHEMA_1.admits(&plain));
+}
+
+/// F-014 `an_old_voter_admitted_after_activation_re_gates_the_feature`.
+///
+/// Ruling M6-R15 let the durable watermark alone open the gate, so that one voter going down
+/// after a failover could not turn into a write outage. Its justification for ignoring the
+/// live voter set was that "a schema-1 voter that missed the commit fences itself on its own
+/// decode refusal when it returns" — which is true of a voter that *missed* the entry, and is
+/// not true of this one. This voter missed nothing. It joined afterwards, it is answering, and
+/// it has told the leader in its own `AppendEntries` reply that it cannot carry this
+/// generation. Proposing anyway would be ADR-0030's one forbidden direction: over-reporting,
+/// activating a feature a voter cannot actually decode.
+///
+/// This is the E2E-42 shape — the published rolling upgrade run backwards, which is what a
+/// node replacement or a rollback looks like — so getting it wrong turns a rehearsal into that
+/// node's outage rather than a refused proposal.
+///
+/// Note the pinned voter's store here is `EphemeralStore`, which carries no apply-path fence;
+/// that is deliberate, and it is what lets this row observe the *gate* in isolation. The fence
+/// itself is exercised against a real store in `config-storage`'s `m6_compat_open.rs`.
+#[retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn f014_an_old_voter_admitted_after_activation_re_gates_the_feature() {
+    let (cluster, leader) = cluster_with_old_outside_membership().await;
+
+    // Something to compact, then the activation itself: a committed `Compact` is what raises
+    // every voter's durable `max_applied_command_schema` to 2.
+    for i in 0..3 {
+        cluster
+            .put(leader, &format!("/f014/{i}"), "v")
+            .await
+            .expect("an ungated write");
+    }
+    cluster
+        .get_node(leader)
+        .propose_compact(&principal(), 1)
+        .await
+        .expect("a uniformly current cluster activates schema 2");
+
+    // The gate is now open on the watermark alone, which is the state M6-R15 created and this
+    // row is about. Asserted rather than assumed: without it the refusal below could be the
+    // trivial one.
+    cluster
+        .get_node(leader)
+        .propose_compact(&principal(), 2)
+        .await
+        .expect("the gate stays open while every voter is current");
+
+    // The old node joins. Nothing else changes — same leader, same log, same durable
+    // watermark of 2 on every voter that has one.
+    add_old_as_learner(&cluster, leader).await;
+    promote_old_to_voter(&cluster, leader).await;
+    let settled = min_schema_settles(&cluster, COMMAND_SCHEMA_V1).await;
+    assert_eq!(settled, leader, "the fixture needs the leader to be stable");
+
+    let err = cluster
+        .get_node(leader)
+        .propose_compact(&principal(), 3)
+        .await
+        .expect_err("a voter that has advertised schema 1 must re-gate the feature");
+    assert_eq!(
+        err,
+        ConfigError::Unavailable {
+            reason: UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string()
+        },
+        "and it must be the same transient refusal the pre-activation path uses (M6-93)"
+    );
+    cluster.shutdown().await;
+}
+
+/// F-014 companion: `PeerSchemas` keeps the three answers a gate must tell apart.
+///
+/// M6-89b asserts what `get` collapses — every unknown reads as schema 1 — which is right for
+/// `get`'s callers and is exactly what the steady-state clause must not do. The clause needs
+/// "never answered" to be distinguishable from "answered, and it is old", because it treats
+/// them oppositely: the first must not re-gate a running cluster, the second must.
+#[retcd_test]
+fn f014b_peer_schemas_distinguishes_silence_from_an_old_answer() {
+    let seen = config_engine::transport::PeerSchemas::default();
+
+    assert_eq!(
+        seen.observed(NodeId(7)),
+        None,
+        "silence is not an answer, however the gate later chooses to read it"
+    );
+    assert_eq!(
+        seen.get(NodeId(7)),
+        COMPAT_SCHEMA_1,
+        "`get`'s conservative collapse is unchanged by the new accessor"
+    );
+
+    // A node that answered and named schema 1 is a *fact*, not a default, and must not be
+    // confusable with the row above.
+    seen.record(NodeId(7), COMPAT_SCHEMA_1);
+    assert_eq!(seen.observed(NodeId(7)), Some(COMPAT_SCHEMA_1));
+
+    seen.record(NodeId(8), CURRENT_SCHEMA);
+    assert_eq!(seen.observed(NodeId(8)), Some(CURRENT_SCHEMA));
 }

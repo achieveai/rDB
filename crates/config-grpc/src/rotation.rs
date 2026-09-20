@@ -67,8 +67,17 @@ pub struct TlsFiles {
 
 /// Why a rotation could not be carried out.
 ///
-/// Every variant leaves every plane serving exactly what it served before: the new material is
-/// compiled before anything is swapped, so a refusal is always a refusal to change.
+/// Both variants are raised by the pre-checks — reading the three files and compiling them once
+/// — which run before any plane is touched, so in practice a refusal is a refusal to change and
+/// every plane keeps serving exactly what it served before (M6-46).
+///
+/// That is a statement about where these are raised, not an invariant of the swap loop. Each
+/// plane recompiles the same bytes as it takes them, so a plane can in principle refuse after an
+/// earlier plane has already swapped, leaving the node briefly split across two generations. The
+/// window is very small — the bytes have already compiled once — and it is deliberately
+/// recoverable rather than prevented: the rotator does not record the new material as served
+/// unless every plane took it, so the next reload, RPC or poll, retries the whole set instead of
+/// computing "unchanged" and leaving the split in place.
 #[derive(Debug, thiserror::Error)]
 pub enum RotationError {
     /// One of the configured PEM files could not be read.
@@ -184,7 +193,9 @@ impl TlsRotator {
     ///
     /// # Errors
     ///
-    /// [`RotationError`], in which case nothing changed anywhere.
+    /// [`RotationError`]. See its type documentation for what a refusal leaves behind: a
+    /// pre-check failure changes nothing, and the swap loop's much rarer failure is recovered by
+    /// the next call rather than prevented.
     pub fn reload(&self, source: &'static str) -> Result<Vec<TlsPlaneReload>, RotationError> {
         self.try_reload(source).inspect_err(|error| {
             *self
@@ -198,12 +209,19 @@ impl TlsRotator {
             // the two attempted it to find the line.
             tracing::warn!(
                 source,
-                // A refusal is node-wide by construction: nothing is swapped until the whole
-                // set has compiled, so no plane is ever left in a different state than the
-                // others (M6-46).
+                // `plane` is required on this line by M6-120 and `"all"` is the value
+                // docs/runbooks/credential-rotation.md tells an operator to grep for, so both
+                // stay. It scopes the line to the node — the counterpart of the per-plane
+                // `tls_reloaded` lines below — and it is *not* an assertion that every plane is
+                // untouched: `try_reload` propagates a plane's refusal with `?`, so a failure
+                // there can follow an earlier plane's swap (see [`RotationError`]).
                 plane = "all",
                 reason = error.reason(),
                 detail = %error,
+                // `recovery` rather than a count: nothing here knows how many planes had taken
+                // the material when one refused, and the useful thing to tell an operator
+                // reading this line is what happens next, which is the same either way.
+                recovery = "the next reload retries every plane",
                 "tls_reload_failed"
             );
         })

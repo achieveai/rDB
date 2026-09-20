@@ -25,7 +25,7 @@ Everything else goes to the log file.
 | `--form` | Form the cluster from the signed bootstrap manifest, then serve. A second `--form` against a store that is already formed exits `2`. |
 | `--capabilities` | Print the capability report as JSON and exit `0`. Opens no store, binds no listener, takes no lock, writes no log. |
 | `--allow-insecure-dev` | The only way `tls.mode = "insecure"` is accepted (ADR-0010). |
-| `--dev-allow-all` | The only way allow-all authorization is accepted (ADR-0012). |
+| `--dev-allow-all` | The only way allow-all authorization is accepted (ADR-0012). Refused on its own: it requires `--allow-insecure-dev` alongside it, so "this is a dev node" is one fact rather than two independent ones. Exits `2` before the config file is read. |
 | `--unsafe-no-sync` | Run RocksDB without fsync. Capabilities then report `PersistentUnverified`. |
 | `--shutdown-file <FILE>` | Shut down gracefully as soon as this file exists (polled every 100 ms). Windows has no `SIGTERM`. |
 | `--health-listen <ADDR>` | Serve `GET /health` as plaintext HTTP here. Loopback addresses only; anything else is refused at validation. |

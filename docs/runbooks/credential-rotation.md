@@ -107,9 +107,18 @@ before and is still `ready`.
 | `tls_file_unreadable` | one of `tls.ca`, `tls.cert`, `tls.key` could not be read |
 | `tls_material_unusable` | the set read, and does not compile: a key that does not match its certificate, a malformed PEM, a chain that does not reach the configured CA |
 
-Both are logged as `tls_reload_failed{source, plane="all", reason, detail}` and counted by
-`retcd_tls_reload_failures_total{reason}`. `plane="all"` is literal: a refusal is node-wide by
-construction, so no plane is ever left in a different state than the others.
+Both are logged as `tls_reload_failed{source, plane="all", reason, recovery, detail}` and counted
+by `retcd_tls_reload_failures_total{reason}`. Grep for the literal `plane="all"`; it is the stable
+label for a rotation refusal and does not name a specific plane.
+
+`plane="all"` does **not** promise that nothing changed. Both reasons above are raised by the
+pre-checks, before any plane is touched, and those are node-wide. But `try_reload` swaps the planes
+in a loop, so a failure raised *inside* that loop returns after an earlier plane has already taken
+the new material. The window is narrow — the same bytes compiled successfully moments earlier — and
+it is self-correcting rather than sticky: the node's record of what it is serving is only written
+once every plane took the material, so the next reload retries all of them. That is what the
+`recovery` field says. If a refusal ever surprises you, re-run the reload rather than assuming the
+node is untouched.
 
 The poller keeps polling after a failure. A half-written file is a transient condition, and
 stopping the poller would turn it into a permanent refusal to rotate.

@@ -25,7 +25,8 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use config_core::{
-    Authorizer, ClusterId, ConfigError, NodeId, Principal, UNAVAILABLE_FEATURE_NOT_ACTIVATED,
+    is_verified_kind, Authorizer, ClusterId, ConfigError, NodeId, Principal,
+    UNAVAILABLE_FEATURE_NOT_ACTIVATED,
 };
 use config_engine::admin::{AdminError, MembershipReport, SnapshotTriggered};
 use config_engine::metrics::LogIdView;
@@ -278,12 +279,32 @@ impl AdminAllowlist {
     }
 
     /// Whether `principal` may call the admin plane. Exact match, by contract.
+    ///
+    /// A **signed** admin set additionally requires a verified principal kind — the same
+    /// [`is_verified_kind`] predicate every grant is already checked against, rather than a
+    /// second copy of the rule (lead ruling M6-R23). A signed `admins` list is the whole reason
+    /// ADR-0027 left the admin plane on the client-plane listener instead of splitting off a
+    /// second mTLS port, so honouring one of its names for a caller the transport never
+    /// authenticated would buy the signature nothing: under an insecure listener every caller
+    /// arrives as `dev`, and a document naming `dev` would open the entire plane.
+    ///
+    /// A **static** set stays exempt under ADR-0023 ruling 4. There `dev` must appear verbatim
+    /// in `[authz] admins` before an insecure node serves a single admin RPC, so the operator
+    /// has already said out loud that this is a development node — a local, visible switch, not
+    /// a name a remote document can assert.
+    ///
+    /// The *source* decides and the listener's TLS mode never does: one condition, so a reader
+    /// can answer "does a signed admin name bind to an unverified caller?" without also knowing
+    /// the transport (M6-R23).
     pub fn permits(&self, principal: &Principal) -> bool {
         match &self.0 {
             AdminSource::Static(names) => names.contains(principal.name.as_str()),
-            AdminSource::Signed(authorizer) => authorizer
-                .admin_set()
-                .is_some_and(|admins| admins.iter().any(|n| n == &principal.name)),
+            AdminSource::Signed(authorizer) => {
+                is_verified_kind(principal.kind)
+                    && authorizer
+                        .admin_set()
+                        .is_some_and(|admins| admins.iter().any(|n| n == &principal.name))
+            }
         }
     }
 

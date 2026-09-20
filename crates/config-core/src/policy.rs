@@ -721,25 +721,40 @@ impl SignedPolicyAuthorizer {
         false
     }
 
-    /// This node's policy state, for the health payload.
-    pub fn state(&self, rejected: Option<&PolicyRejected>) -> PolicyState {
+    /// This node's policy state and the version it serves, read together (M6-20).
+    ///
+    /// One guard, two fields, deliberately. Taking them from two reads lets a reload land in
+    /// between and publish a payload this node never occupied — `Converging { from: 7, to: 8 }`
+    /// beside `policy_version: 7`. An operator cannot tell that apart from a real inconsistency,
+    /// and an alert keyed on both fields fires on a state that did not exist. Any caller needing
+    /// both must come here rather than pair [`Self::state`] with [`Authorizer::policy_version`].
+    pub fn state_and_version(
+        &self,
+        rejected: Option<&PolicyRejected>,
+    ) -> (PolicyState, Option<u64>) {
         let guard = self.active.read().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            None => PolicyState::NoValidPolicy {
+        let Some(active) = guard.as_ref() else {
+            let state = PolicyState::NoValidPolicy {
                 reason: rejected
                     .map_or(PolicyRejected::PolicyFileMissing.reason(), |r| r.reason())
                     .to_string(),
+            };
+            return (state, None);
+        };
+        let version = active.signed.document.version;
+        let state = match (&active.previous, active.converged) {
+            (Some(previous), false) => PolicyState::Converging {
+                from: previous.version,
+                to: version,
             },
-            Some(active) => match (&active.previous, active.converged) {
-                (Some(previous), false) => PolicyState::Converging {
-                    from: previous.version,
-                    to: active.signed.document.version,
-                },
-                _ => PolicyState::Active {
-                    version: active.signed.document.version,
-                },
-            },
-        }
+            _ => PolicyState::Active { version },
+        };
+        (state, Some(version))
+    }
+
+    /// This node's policy state, for callers that do not also need the version.
+    pub fn state(&self, rejected: Option<&PolicyRejected>) -> PolicyState {
+        self.state_and_version(rejected).0
     }
 }
 
