@@ -153,3 +153,19 @@ a `RocksStore` concept only.
 
 **Rows.** Test plan M2-66 (first open stamps 1, reopen succeeds), M2-67 (stamped 2 → refusal),
 M2-68 (marker deleted from a non-empty store → refusal with `found: 0`).
+
+### Note (2026-09-18, M5): `dedup` CF allocated; snapshots directory under `data_dir`
+
+The `dedup` column family named in §9.2 as reserved-but-not-created ("added through explicit later
+schema migrations when... M5 optional deduplication begin[s]") is created starting at M5, per
+ADR-0025, following the same format-bump template ADR-0021 established for `events`. `RocksStore`
+now has five column families in the M5+ layout: `raft_log`, `raft_meta`, `kv`, `state_meta`,
+`events` (ADR-0019/ADR-0021), `dedup` (ADR-0025).
+
+Raft snapshot files (ADR-0022) and backup artifacts (ADR-0024) are **not** RocksDB column families;
+they are separate files under `<data_dir>/snapshots/` — a plain OS directory sibling to the RocksDB
+instance's own directory, not inside it, so RocksDB's own file management never iterates over or
+interferes with snapshot files. `<data_dir>/snapshots/*.snap` holds published Raft snapshots
+(retain-last-2, ADR-0022); backup artifacts are written to an operator-supplied destination
+directory (`--out`/`Backup{dest_dir}`, ADR-0024), never under `<data_dir>` by default, since a
+backup is meant to survive the loss of `data_dir` entirely.

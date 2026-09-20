@@ -26,3 +26,16 @@ Status values: `Proposed` | `Accepted` | `Superseded by ADR-NNNN` | `Deprecated`
 | [0016](0016-capability-reporting.md) | Capability reporting | Accepted |
 | [0017](0017-build-toolchain.md) | Build toolchain: MSVC, LLVM for RocksDB, no `protoc` | Accepted |
 | [0018](0018-daemon-lifecycle-and-cli.md) | Daemon lifecycle and CLI surface: flags, ready line, shutdown triggers, exit codes | Accepted |
+| [0019](0019-event-journal-and-replicated-compaction.md) | Event journal, same-batch write, and replicated compaction | Accepted |
+| [0020](0020-watch-delivery-and-isolation.md) | Watch delivery, the journal/compaction gate, and stream isolation | Accepted |
+| [0021](0021-storage-format-v2-and-migration.md) | Storage format v2, bounded migration, and refusal matrix | Accepted |
+| [0022](0022-snapshots-and-log-purge.md) | Snapshots and log purge | Accepted |
+| [0023](0023-admin-plane-learner-lifecycle-and-fencing.md) | Admin plane, learner lifecycle, and fencing | Accepted |
+| [0024](0024-backup-and-fenced-restore.md) | Backup and fenced restore | Accepted |
+| [0025](0025-bounded-request-deduplication.md) | Bounded request deduplication | Accepted |
+| [0026](0026-metrics-and-runbooks.md) | Metrics facade, exporter, and runbooks | Accepted |
+| [0027](0027-signed-policy-documents-and-rbac.md) | Signed policy documents and distributed RBAC lifecycle | Accepted |
+| [0028](0028-tls-and-gossip-key-rotation.md) | TLS and gossip key rotation | Accepted |
+| [0029](0029-revision-pinned-pagination.md) | Revision-pinned pagination | Accepted |
+| [0030](0030-mixed-version-gating.md) | Mixed-version gating for schema and command upgrades | Accepted |
+| [0031](0031-evidence-and-known-gaps.md) | Evidence artifacts and known gaps | Accepted |

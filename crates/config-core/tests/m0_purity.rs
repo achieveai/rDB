@@ -89,7 +89,16 @@ fn m0_59_dependency_surface_is_minimal() {
 
     // `bytes`, `serde`, `thiserror` and `sha2` carry the data model and the determinism
     // oracle; `async-trait` is what makes `ConfigStore` object-safe; `tracing` is a facade
-    // with no runtime of its own (ADR-0013). Nothing else may enter.
+    // with no runtime of its own (ADR-0013); `futures-core` is the bare `Stream` trait the M4
+    // watch surface is typed in — a trait definition, not an executor; `postcard` is the
+    // project's canonical encoding (ADR-0007) and is what the M6 page token's sealed body is
+    // written in (ADR-0029) — a pure `serde` codec with no runtime, no I/O and no allocator
+    // requirement, which is the same category as `serde` itself. `ed25519-dalek` and
+    // `serde_json` entered at M6 for the signed policy document (ADR-0027, lead ruling M6-R9 of
+    // 2026-09-19): verification is a pure computation over bytes the caller supplies and
+    // `serde_json` is a pure `serde` codec, so both are the same category as `sha2` and
+    // `postcard` — no clock, no I/O, no runtime, nothing apply can observe. Nothing else may
+    // enter.
     let allowed = [
         "bytes",
         "serde",
@@ -97,6 +106,10 @@ fn m0_59_dependency_surface_is_minimal() {
         "async-trait",
         "tracing",
         "sha2",
+        "futures-core",
+        "postcard",
+        "ed25519-dalek",
+        "serde_json",
     ];
     for name in &deps {
         assert!(
@@ -179,6 +192,7 @@ fn m0_60_apply_signature_is_sync_and_total() {
                 key: bytes::Bytes::from_static(b"k"),
                 value: bytes::Bytes::from_static(b"v"),
                 expected_mod_revision: None,
+                dedup: None,
             },
         )
     }
@@ -191,6 +205,7 @@ fn m0_60_apply_signature_is_sync_and_total() {
     let response = state.apply(&Command::Delete {
         key: bytes::Bytes::new(),
         expected_mod_revision: Some(0),
+        dedup: None,
     });
     assert!(matches!(response, CommandResponse::Rejected { .. }));
 }
@@ -221,6 +236,7 @@ fn m0_61_no_unordered_iteration_in_output() {
             key: bytes::Bytes::from(key.into_bytes()),
             value: bytes::Bytes::from(n.to_le_bytes().to_vec()),
             expected_mod_revision: None,
+            dedup: None,
         });
     }
 

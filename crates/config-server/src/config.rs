@@ -12,8 +12,11 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::Duration;
 
-use config_core::{ClusterId, ClusterIdentity, NodeId, RecoveryEpoch};
+use config_core::{
+    ClusterId, ClusterIdentity, DedupLimits, NodeId, RecoveryEpoch, WatchLimits, WatchRetention,
+};
 use serde::Deserialize;
 
 /// Why a configuration document was refused. Every variant is exit code 2.
@@ -102,6 +105,15 @@ pub struct TlsSection {
     /// under that name.
     #[serde(default)]
     pub allow_common_name_principals: bool,
+    /// How often the three paths above are re-read while the node runs (M6, ADR-0028).
+    /// Default 30 s.
+    ///
+    /// Spelled with the unit, unlike ADR-0028's `tls.watch_files`, so it reads the same way as
+    /// every other interval in this file (`authz.poll_interval_secs`,
+    /// `retention.check_interval_secs`): an operator should not have to guess whether a bare
+    /// number is seconds or a boolean.
+    #[serde(default)]
+    pub watch_files_secs: Option<u64>,
 }
 
 /// `[authz]` — the static allowlist policy file (ADR-0012).
@@ -112,6 +124,179 @@ pub struct AuthzSection {
     /// unready unless `--dev-allow-all` was given (ADR-0018 §6).
     #[serde(default)]
     pub policy: Option<PathBuf>,
+    /// Principals allowed to call the admin plane (M5, ADR-0023, OQ-43).
+    ///
+    /// A separate list from the data-plane policy because the two answer different questions:
+    /// the policy says who may read and write keys, this says who may change the shape of the
+    /// cluster. Absent means *nobody*, and `--dev-allow-all` does **not** open it — an
+    /// allow-all development gate for keys is a different risk from an allow-all gate for
+    /// `RemoveMember`.
+    #[serde(default)]
+    pub admins: Vec<String>,
+    /// Which authorization model this node serves (M6, ADR-0027). Default: `static`.
+    #[serde(default)]
+    pub mode: AuthzModeName,
+    /// The signed policy document. Required by `mode = "signed"`.
+    #[serde(default)]
+    pub policy_file: Option<PathBuf>,
+    /// The detached signature envelope. Defaults to `policy_file` with `.sig` appended.
+    #[serde(default)]
+    pub signature_file: Option<PathBuf>,
+    /// Public keys a document may be signed by. Required, and non-empty, by `mode = "signed"`.
+    #[serde(default)]
+    pub trust_keys: Vec<TrustKeyEntry>,
+    /// How often the files are re-read. Default 10 s (D6.1).
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+}
+
+/// `[authz] mode` (M6, ADR-0027).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthzModeName {
+    /// M3's `StaticAllowlist` over `[authz] policy`. The default, so the M3 release stays
+    /// reproducible byte for byte (M6-36).
+    #[default]
+    Static,
+    /// The signed document of ADR-0027.
+    Signed,
+}
+
+/// One entry of `[authz] trust_keys` (M6, ADR-0027).
+///
+/// A *set*, not a single key: a rotation needs the old and the new signer to both verify for
+/// as long as documents signed by either may still be deployed (M6-06).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustKeyEntry {
+    /// The name the signature envelope selects this key by. Unique within the list.
+    pub name: String,
+    /// The ed25519 public key as 64 lowercase hex characters.
+    ///
+    /// Inline rather than a path: a public key is not a secret, and a key the operator can read
+    /// in the same file as the mode it enables is a key they are likelier to review.
+    pub public_key: String,
+}
+
+/// Everything `authz.mode = "signed"` needs, validated (M6, ADR-0027).
+///
+/// Its mere existence is the mode: a node that reached `run` with `Some(_)` here has a policy
+/// file, a signature path and at least one parsed trust key, because the alternative was exit
+/// code 2 (M6-37). A node that starts in signed mode with no trust keys would fail closed on
+/// every request — an outage disguised as a configuration nicety.
+#[derive(Debug, Clone)]
+pub struct SignedPolicyConfig {
+    /// The document.
+    pub policy_file: PathBuf,
+    /// The detached signature envelope.
+    pub signature_file: PathBuf,
+    /// Trusted signers, by envelope key name. Non-empty, and free of duplicate names.
+    pub trust_keys: Vec<(String, config_core::VerifyingKey)>,
+    /// How often the files are re-read (D6.1's bounded polling).
+    pub poll_interval: Duration,
+}
+
+/// `[membership]` — the learner lifecycle knobs (M5, ADR-0023).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipSection {
+    /// How far behind the leader's last log index a learner may still be and be promoted.
+    ///
+    /// Evaluated live on the leader at `PromoteVoter` time (A5/OQ-50); it is not a timer and
+    /// not a stored value, so changing it changes the next promotion and nothing else.
+    #[serde(default)]
+    pub promote_max_lag: Option<u64>,
+}
+
+/// `[snapshot]` — build and purge policy (M5, ADR-0022).
+///
+/// The three OpenRaft knobs move together or not at all; `config_storage::SnapshotConfig`
+/// refuses a half-applied change rather than silently doing nothing, which is why this section
+/// is validated as a unit instead of field by field.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotSection {
+    /// Build a snapshot once committed has advanced this far past the current one. `0`
+    /// disables snapshotting, which also requires `logs_to_keep` to be absent.
+    #[serde(default)]
+    pub logs_since_last: Option<u64>,
+    /// How many snapshot-covered log entries to retain rather than purge.
+    #[serde(default)]
+    pub logs_to_keep: Option<u64>,
+    /// Minimum number of entries a purge must be able to remove before one is scheduled.
+    #[serde(default)]
+    pub purge_batch_size: Option<u64>,
+    /// How many published `.snap` files to keep, including the current one.
+    #[serde(default)]
+    pub retain_snapshots: Option<usize>,
+}
+
+/// `[metrics]` — the Prometheus endpoint on the health listener (M5, ADR-0026).
+///
+/// There is no separate address: `/metrics` is served by the same loopback listener as
+/// `/health`, under the same posture (ADR-0018 §2). A deployment that wants it scraped from
+/// off-box fronts it with its own proxy rather than having the daemon open a second port.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// Serve `GET /metrics`. Absent is `true`: the endpoint carries no key material and its
+    /// labels are the ADR-0026 allowlist, so an operator who configured a health listener has
+    /// already accepted the surface it is served on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// `[dedup]` — bounded request deduplication (M5, ADR-0025).
+///
+/// **Replicated policy, not a node-local knob.** The window and the cap decide whether a
+/// resubmission is a hit, a fresh application, or an `InvalidArgument`, and that decision is
+/// made inside the state machine. Every voter must therefore carry the same three values;
+/// two voters configured differently would answer the same duplicate differently and diverge.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedupSection {
+    /// Retain deduplication records at all. Absent is `false` — the conservative default
+    /// (M5-108): the `dedup` column family stays empty and the node reports
+    /// `Dedup::Unsupported`, which is exactly how an M4 build behaves.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Retained request ids per `(principal, client_id)`.
+    #[serde(default)]
+    pub window_requests: Option<u32>,
+    /// Retained records across every principal and client id combined.
+    #[serde(default)]
+    pub max_records: Option<u64>,
+}
+
+/// `[backup]` — key material for the backup artifact triple (M5, ADR-0024).
+///
+/// Every file is raw bytes: a 32-byte Ed25519 signing seed, a 32-byte Ed25519 verifying key,
+/// a 32-byte AES-256 key. Nothing here is ever logged; the daemon reports only whether a key
+/// is configured.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSection {
+    /// Signs `<name>.manifest.json`. Required for the admin plane's `Backup` RPC.
+    #[serde(default)]
+    pub signing_key_file: Option<PathBuf>,
+    /// Verifies a manifest signature. Only the CLI uses it; the daemon never verifies its own.
+    #[serde(default)]
+    pub trust_key_file: Option<PathBuf>,
+    /// Encrypts the `.snap` with AES-256-GCM. Absent means the snapshot is written in
+    /// plaintext and the Ed25519 signature protects integrity only, not secrecy.
+    #[serde(default)]
+    pub encryption_key_file: Option<PathBuf>,
+}
+
+/// The backup key material, with every path resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackupKeys {
+    /// Ed25519 signing seed.
+    pub signing_key: Option<PathBuf>,
+    /// Ed25519 verifying key.
+    pub trust_key: Option<PathBuf>,
+    /// AES-256 key.
+    pub encryption_key: Option<PathBuf>,
 }
 
 /// `[manifest]` — the signed bootstrap manifest, required for `--form`.
@@ -150,8 +335,94 @@ pub struct GossipSection {
     pub seeds: Vec<String>,
     /// AES-256 gossip key as 64 hex characters. Absent disables encryption, which is
     /// single-host development only (spec §15.1).
+    ///
+    /// The key this node *signs* with. A rotation moves this one last (M6, ADR-0028).
     #[serde(default)]
     pub secret_key_hex: Option<String>,
+    /// Further AES-256 keys, 64 hex characters each, this node accepts on receive without
+    /// ever signing with them (M6, ADR-0028).
+    ///
+    /// A rotation cannot move the signing key first: a node that started signing with a key
+    /// its peers have not accepted yet is a node its peers cannot hear. So the new key is
+    /// added here across the cluster first, and only then promoted to `secret_key_hex`.
+    #[serde(default)]
+    pub accepted_key_hex: Vec<String>,
+}
+
+/// `[watch]` — watch delivery caps (M4, ADR-0020). Omitted fields keep the engine defaults.
+///
+/// These are *caps*, not sizing hints: a stream that exceeds one is terminated rather than
+/// allowed to grow, because the memory a watcher can pin on this node has to be bounded by
+/// something the operator chose (spec §11.4).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchSection {
+    /// Concurrent watch streams this node will serve at once.
+    #[serde(default)]
+    pub max_streams_per_node: Option<u32>,
+    /// Concurrent watch streams one principal will be served at once.
+    #[serde(default)]
+    pub max_streams_per_principal: Option<u32>,
+    /// Undelivered events one stream may hold before it is terminated.
+    #[serde(default)]
+    pub queue_events: Option<u32>,
+    /// Undelivered event bytes one stream may hold before it is terminated.
+    #[serde(default)]
+    pub queue_bytes: Option<u64>,
+    /// Applied batches the node fans out to watchers before a slow one is declared lagged.
+    #[serde(default)]
+    pub live_buffer_batches: Option<u32>,
+    /// Default progress-frame interval for streams that do not ask for one, milliseconds.
+    #[serde(default)]
+    pub progress_interval_ms: Option<u64>,
+}
+
+/// `[list]` — revision-pinned pagination (M6, ADR-0029). Omitted fields keep the defaults.
+///
+/// The two numbers bound what a walk can cost this node: how many snapshots may be held open
+/// at once, and how long one may sit idle before it is released. They are caps rather than
+/// guarantees — a client whose walk is evicted or expires is told so and restarts it — because
+/// the alternative is letting an abandoned walk pin state until the process dies (§19.12).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListSection {
+    /// Pinned snapshots held open on this node at once, across all clients.
+    #[serde(default)]
+    pub max_pinned_snapshots: Option<u32>,
+    /// How long a pinned snapshot survives without being read, seconds.
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+    /// File holding the 32-byte page-token HMAC key, as 64 hex characters.
+    ///
+    /// Absent means a fresh random key per process, which is the honest default: a page token
+    /// is already bound to the node that minted it and to that process's start time, so it
+    /// could not outlive a restart even with a stable key. Naming a file is for an operator
+    /// who wants the key under their own rotation policy, not for continuity across restarts.
+    #[serde(default)]
+    pub token_key_file: Option<PathBuf>,
+}
+
+/// `[retention]` — when the leader proposes a compaction (M4, ADR-0019).
+///
+/// Every field is a ceiling on the *retained* event journal, and the leader compacts to the
+/// oldest revision that satisfies all of them. Leaving the section out keeps the engine
+/// defaults; setting a field to `0` disables that particular ceiling, which is the only way to
+/// say "never compact for this reason" without also saying it for the others.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionSection {
+    /// Oldest retained event age, seconds.
+    #[serde(default)]
+    pub max_age_secs: Option<u64>,
+    /// Retained event count.
+    #[serde(default)]
+    pub max_revisions: Option<u64>,
+    /// Retained event bytes.
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
+    /// How often the leader evaluates the ceilings, seconds.
+    #[serde(default)]
+    pub check_interval_secs: Option<u64>,
 }
 
 /// The whole configuration document, as written.
@@ -176,6 +447,30 @@ pub struct ServerConfigFile {
     /// `[gossip]`.
     #[serde(default)]
     pub gossip: GossipSection,
+    /// `[watch]`.
+    #[serde(default)]
+    pub watch: WatchSection,
+    /// `[retention]`.
+    #[serde(default)]
+    pub retention: RetentionSection,
+    /// `[list]`.
+    #[serde(default)]
+    pub list: ListSection,
+    /// `[membership]`.
+    #[serde(default)]
+    pub membership: MembershipSection,
+    /// `[snapshot]`.
+    #[serde(default)]
+    pub snapshot: SnapshotSection,
+    /// `[backup]`.
+    #[serde(default)]
+    pub backup: BackupSection,
+    /// `[metrics]`.
+    #[serde(default)]
+    pub metrics: MetricsSection,
+    /// `[dedup]`.
+    #[serde(default)]
+    pub dedup: DedupSection,
 }
 
 /// The validated configuration the daemon actually runs on.
@@ -201,16 +496,50 @@ pub struct ServerConfig {
     pub tls_mode: TlsModeName,
     /// PEM material for `mutual`.
     pub tls_material: Option<TlsMaterial>,
+    /// Where that material came from, and how often to re-read it (M6, ADR-0028).
+    ///
+    /// `Some` exactly when [`ServerConfig::tls_material`] is `Some`: both are produced by the
+    /// same arm of the same match, because there is nothing to reload on a node that serves
+    /// no certificate.
+    pub tls_reload: Option<TlsReload>,
     /// The allowlist policy file, if the document names one.
     pub policy_path: Option<PathBuf>,
+    /// The signed-policy configuration, present only under `authz.mode = "signed"` (M6).
+    pub signed_policy: Option<SignedPolicyConfig>,
     /// The bootstrap manifest files, if the document names them.
     pub manifest: Option<ManifestFiles>,
     /// Raft timers.
     pub raft: config_engine::RaftTimers,
     /// Gossip seeds.
     pub gossip_seeds: Vec<SocketAddr>,
-    /// Gossip encryption key.
+    /// Gossip encryption key: the one this node signs with.
     pub gossip_secret_key: Option<[u8; 32]>,
+    /// Further gossip keys this node accepts on receive (M6, ADR-0028). Empty is the M5
+    /// behaviour.
+    pub gossip_accepted_keys: Vec<[u8; 32]>,
+    /// Watch delivery caps, folded into the limits this node enforces.
+    pub watch_limits: WatchLimits,
+    /// Default progress-frame interval for streams that do not ask for one.
+    pub watch_progress_interval: Duration,
+    /// Journal retention ceilings the leader compacts against.
+    pub retention: WatchRetention,
+    /// Principals permitted on the admin plane (M5, OQ-43). Empty means the plane is closed.
+    pub admins: Vec<String>,
+    /// Promotion catch-up bound (M5, A5/OQ-50).
+    pub promote_max_lag: u64,
+    /// Snapshot build and purge policy (M5, ADR-0022).
+    pub snapshot: config_storage::SnapshotConfig,
+    /// Backup key material (M5, ADR-0024).
+    pub backup: BackupKeys,
+    /// Whether the health listener also serves `GET /metrics` (M5, ADR-0026).
+    pub metrics_enabled: bool,
+    /// Bounded deduplication policy, folded into the limits this node enforces (M5,
+    /// ADR-0025).
+    pub dedup: DedupLimits,
+    /// Revision-pinned pagination policy (M6, ADR-0029).
+    ///
+    /// Parsed and validated here; `run.rs` builds the node's one `Paginator` from it.
+    pub list: config_engine::PaginationConfig,
 }
 
 /// PEM bytes for the mutual-TLS profile, read once at validation time.
@@ -241,6 +570,24 @@ impl std::fmt::Debug for TlsMaterial {
             )
             .finish()
     }
+}
+
+/// Where the mutual-TLS PEMs were read from, and how often to re-read them (M6, ADR-0028).
+///
+/// Held apart from [`TlsMaterial`] on purpose. `TlsMaterial` is compared by value to decide
+/// whether a poll actually found new material, so it must contain the bytes and *only* the
+/// bytes — a path or an interval inside it would still compare equal on every poll, but it
+/// would make "are these the same credentials?" a question about more than the credentials.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsReload {
+    /// `tls.ca`, resolved.
+    pub ca: PathBuf,
+    /// `tls.cert`, resolved.
+    pub cert: PathBuf,
+    /// `tls.key`, resolved.
+    pub key: PathBuf,
+    /// `tls.watch_files_secs`, defaulted.
+    pub watch_files: Duration,
 }
 
 /// Resolved paths of the three bootstrap-manifest files.
@@ -343,13 +690,35 @@ fn validate(
                     "common_name_principals_enabled"
                 );
             }
-            Some(TlsMaterial {
+            let material = TlsMaterial {
                 ca_pem: read_bytes("tls.ca", &ca)?,
                 cert_pem: read_bytes("tls.cert", &cert)?,
                 key_pem: read_bytes("tls.key", &key)?,
                 allow_common_name_principals: file.tls.allow_common_name_principals,
-            })
+            };
+            let watch_files = match file.tls.watch_files_secs {
+                Some(0) => {
+                    return Err(ConfigFileError::Invalid(
+                        "tls.watch_files_secs must be greater than zero".to_string(),
+                    ))
+                }
+                Some(v) => Duration::from_secs(v),
+                None => DEFAULT_TLS_WATCH_FILES,
+            };
+            Some((
+                material,
+                TlsReload {
+                    ca,
+                    cert,
+                    key,
+                    watch_files,
+                },
+            ))
         }
+    };
+    let (tls_material, tls_reload) = match tls_material {
+        Some((material, reload)) => (Some(material), Some(reload)),
+        None => (None, None),
     };
 
     let manifest = file.manifest.as_ref().map(|m| ManifestFiles {
@@ -386,6 +755,225 @@ fn validate(
         .as_deref()
         .map(parse_gossip_key)
         .transpose()?;
+    let mut gossip_accepted_keys = Vec::with_capacity(file.gossip.accepted_key_hex.len());
+    for hex in &file.gossip.accepted_key_hex {
+        gossip_accepted_keys.push(parse_gossip_key(hex)?);
+    }
+    if gossip_secret_key.is_none() && !gossip_accepted_keys.is_empty() {
+        // Refused rather than ignored: the keys would be installed on a keyring that never
+        // encrypts anything, so the node would look mid-rotation while actually gossiping in
+        // plaintext — the one state an operator rotating keys must not be lied to about.
+        return Err(ConfigFileError::Invalid(
+            "gossip.accepted_key_hex requires gossip.secret_key_hex; accepted keys do nothing \
+             on a node that is not encrypting (ADR-0028)"
+                .to_string(),
+        ));
+    }
+
+    let mut watch_limits = WatchLimits::default();
+    if let Some(v) = file.watch.max_streams_per_node {
+        watch_limits.max_streams_per_node = v;
+    }
+    if let Some(v) = file.watch.max_streams_per_principal {
+        watch_limits.max_streams_per_principal = v;
+    }
+    if let Some(v) = file.watch.queue_events {
+        watch_limits.queue_events = v;
+    }
+    if let Some(v) = file.watch.queue_bytes {
+        watch_limits.queue_bytes = v;
+    }
+    if let Some(v) = file.watch.live_buffer_batches {
+        watch_limits.live_buffer_batches = v;
+    }
+    // A zero anywhere here is a configuration that cannot serve a single watcher, and it is
+    // far better to refuse at startup than to have every `Watch` fail at runtime with a limit
+    // nobody meant to set.
+    for (key, value) in [
+        (
+            "max_streams_per_node",
+            u64::from(watch_limits.max_streams_per_node),
+        ),
+        (
+            "max_streams_per_principal",
+            u64::from(watch_limits.max_streams_per_principal),
+        ),
+        ("queue_events", u64::from(watch_limits.queue_events)),
+        ("queue_bytes", watch_limits.queue_bytes),
+        (
+            "live_buffer_batches",
+            u64::from(watch_limits.live_buffer_batches),
+        ),
+    ] {
+        if value == 0 {
+            return Err(ConfigFileError::Invalid(format!(
+                "watch.{key} must be greater than zero"
+            )));
+        }
+    }
+    if watch_limits.max_streams_per_principal > watch_limits.max_streams_per_node {
+        return Err(ConfigFileError::Invalid(format!(
+            "watch.max_streams_per_principal ({}) cannot exceed watch.max_streams_per_node ({})",
+            watch_limits.max_streams_per_principal, watch_limits.max_streams_per_node
+        )));
+    }
+
+    let watch_progress_interval = match file.watch.progress_interval_ms {
+        None => config_engine::DEFAULT_PROGRESS_INTERVAL,
+        Some(ms) => {
+            let interval = Duration::from_millis(ms);
+            if interval < config_engine::MIN_PROGRESS_INTERVAL
+                || interval > config_engine::MAX_PROGRESS_INTERVAL
+            {
+                return Err(ConfigFileError::Invalid(format!(
+                    "watch.progress_interval_ms must be between {} and {}, got {ms}",
+                    config_engine::MIN_PROGRESS_INTERVAL.as_millis(),
+                    config_engine::MAX_PROGRESS_INTERVAL.as_millis()
+                )));
+            }
+            interval
+        }
+    };
+
+    let mut retention = WatchRetention::default();
+    if let Some(v) = file.retention.max_age_secs {
+        retention.max_age = Duration::from_secs(v);
+    }
+    if let Some(v) = file.retention.max_revisions {
+        retention.max_revisions = v;
+    }
+    if let Some(v) = file.retention.max_bytes {
+        retention.max_bytes = v;
+    }
+    if let Some(v) = file.retention.check_interval_secs {
+        if v == 0 {
+            return Err(ConfigFileError::Invalid(
+                "retention.check_interval_secs must be greater than zero".to_string(),
+            ));
+        }
+        retention.check_interval = Duration::from_secs(v);
+    }
+
+    // An admin principal named twice, or named empty, is a configuration mistake worth
+    // surfacing: the allowlist is an exact-match set, so a duplicate is silently absorbed and
+    // an empty name can never match a certificate subject.
+    let mut admins = file.authz.admins.clone();
+    admins.sort();
+    if admins.iter().any(|a| a.trim().is_empty()) {
+        return Err(ConfigFileError::Invalid(
+            "authz.admins contains an empty principal name".to_string(),
+        ));
+    }
+    if admins.windows(2).any(|w| w[0] == w[1]) {
+        return Err(ConfigFileError::Invalid(
+            "authz.admins lists the same principal twice".to_string(),
+        ));
+    }
+    let signed_policy = signed_policy(base, &file.authz)?;
+
+    let promote_max_lag = file
+        .membership
+        .promote_max_lag
+        .unwrap_or(config_engine::DEFAULT_PROMOTE_MAX_LAG);
+
+    let mut snapshot = config_storage::SnapshotConfig::default();
+    if let Some(v) = file.snapshot.logs_since_last {
+        snapshot.logs_since_last = v;
+    }
+    if let Some(v) = file.snapshot.logs_to_keep {
+        snapshot.logs_to_keep = v;
+    }
+    if let Some(v) = file.snapshot.purge_batch_size {
+        snapshot.purge_batch_size = v;
+    }
+    if let Some(v) = file.snapshot.retain_snapshots {
+        snapshot.retain_snapshots = v;
+    }
+    // `logs_since_last = 0` is how an operator disables snapshotting, and the latch requires
+    // `logs_to_keep = u64::MAX` to go with it. Writing the one without the other is the silent
+    // unbounded-log trap `SnapshotConfig::validate` exists to catch, so the sentinel is
+    // supplied here rather than demanded of the operator.
+    if file.snapshot.logs_since_last == Some(0) && file.snapshot.logs_to_keep.is_none() {
+        snapshot.logs_to_keep = u64::MAX;
+    }
+    snapshot
+        .validate()
+        .map_err(|e| ConfigFileError::Invalid(format!("[snapshot]: {e}")))?;
+
+    let backup = BackupKeys {
+        signing_key: file
+            .backup
+            .signing_key_file
+            .as_deref()
+            .map(|p| resolve(base, p)),
+        trust_key: file
+            .backup
+            .trust_key_file
+            .as_deref()
+            .map(|p| resolve(base, p)),
+        encryption_key: file
+            .backup
+            .encryption_key_file
+            .as_deref()
+            .map(|p| resolve(base, p)),
+    };
+
+    let metrics_enabled = file.metrics.enabled.unwrap_or(true);
+
+    let mut dedup = DedupLimits::DISABLED;
+    dedup.enabled = file.dedup.enabled.unwrap_or(false);
+    if let Some(v) = file.dedup.window_requests {
+        dedup.window_requests = v;
+    }
+    if let Some(v) = file.dedup.max_records {
+        dedup.max_records = v;
+    }
+    // Refused at startup rather than at apply time: a zero window retains nothing, so every
+    // resubmission would apply a second time on a node that advertises `Dedup::Bounded` — the
+    // one promise the section exists to make. The cap is refused for the same reason.
+    if dedup.enabled {
+        if dedup.window_requests == 0 {
+            return Err(ConfigFileError::Invalid(
+                "dedup.window_requests must be greater than zero when dedup is enabled".into(),
+            ));
+        }
+        if dedup.max_records == 0 {
+            return Err(ConfigFileError::Invalid(
+                "dedup.max_records must be greater than zero when dedup is enabled".into(),
+            ));
+        }
+        if u64::from(dedup.window_requests) > dedup.max_records {
+            return Err(ConfigFileError::Invalid(format!(
+                "dedup.window_requests ({}) cannot exceed dedup.max_records ({}): one client \
+                 could not fill its own window",
+                dedup.window_requests, dedup.max_records
+            )));
+        }
+    }
+
+    let mut list = config_engine::PaginationConfig::new(random_token_key());
+    if let Some(path) = file.list.token_key_file.as_deref() {
+        list.token_key = read_token_key(&resolve(base, path))?;
+    }
+    if let Some(v) = file.list.max_pinned_snapshots {
+        list.max_pinned = v;
+    }
+    if let Some(v) = file.list.ttl_seconds {
+        list.ttl = Duration::from_secs(v);
+    }
+    // Both refused at startup: zero pins means the first page of every walk is also its last
+    // with no way to continue, and a zero TTL expires a token before the client can present
+    // it. Either would advertise `Pagination::RevisionPinned` for a surface that cannot work.
+    if list.max_pinned == 0 {
+        return Err(ConfigFileError::Invalid(
+            "list.max_pinned_snapshots must be greater than zero".into(),
+        ));
+    }
+    if list.ttl.is_zero() {
+        return Err(ConfigFileError::Invalid(
+            "list.ttl_seconds must be greater than zero".into(),
+        ));
+    }
 
     Ok(ServerConfig {
         identity,
@@ -396,12 +984,150 @@ fn validate(
         health_listen,
         tls_mode: file.tls.mode,
         tls_material,
+        tls_reload,
         policy_path: file.authz.policy.as_deref().map(|p| resolve(base, p)),
+        signed_policy,
         manifest,
         raft,
         gossip_seeds,
         gossip_secret_key,
+        gossip_accepted_keys,
+        watch_limits,
+        watch_progress_interval,
+        retention,
+        admins,
+        promote_max_lag,
+        metrics_enabled,
+        dedup,
+        list,
+        snapshot,
+        backup,
     })
+}
+
+/// Default re-read interval for the TLS PEM files (ADR-0028: "default 30 s").
+///
+/// Longer than the policy poller's 10 s because the two answer different questions: a policy
+/// change is an authorization change an operator wants in force now, while a certificate
+/// rotation is scheduled work that an operator can also force immediately through `ReloadTls`.
+const DEFAULT_TLS_WATCH_FILES: Duration = Duration::from_secs(30);
+
+/// Default poll interval for the signed policy files (D6.1).
+const DEFAULT_POLICY_POLL_SECS: u64 = 10;
+
+/// Validate `[authz]` under `mode = "signed"` (M6-37, ADR-0027).
+///
+/// Every missing field is named in **one** error rather than one per run: an operator fixing a
+/// configuration by restarting until the message changes is an operator who will get the last
+/// field wrong at 3am.
+fn signed_policy(
+    base: &Path,
+    authz: &AuthzSection,
+) -> Result<Option<SignedPolicyConfig>, ConfigFileError> {
+    if authz.mode != AuthzModeName::Signed {
+        // Named in static mode, the signed fields are a configuration that does nothing — and a
+        // node whose operator believes it is verifying signatures when it is not is exactly the
+        // failure ADR-0027 exists to prevent.
+        if authz.policy_file.is_some() || !authz.trust_keys.is_empty() {
+            return Err(ConfigFileError::Invalid(
+                "authz.policy_file and authz.trust_keys require authz.mode = \"signed\"; under \
+                 the default static mode they would be read by nothing"
+                    .to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+
+    let mut missing = Vec::new();
+    if authz.policy_file.is_none() {
+        missing.push("authz.policy_file");
+    }
+    if authz.trust_keys.is_empty() {
+        missing.push("authz.trust_keys");
+    }
+    if !missing.is_empty() {
+        return Err(ConfigFileError::Invalid(format!(
+            "authz.mode = \"signed\" requires {}; a node in signed mode without them fails \
+             closed on every request",
+            missing.join(" and ")
+        )));
+    }
+
+    let policy_file = resolve(base, authz.policy_file.as_deref().expect("checked above"));
+    let signature_file = match authz.signature_file.as_deref() {
+        Some(path) => resolve(base, path),
+        // `<policy>.sig`, not `<policy stem>.sig`: the two files travel together and a stem
+        // rule would collide the moment a deployment has `policy.json` and `policy.yaml`.
+        None => {
+            let mut name = policy_file.clone().into_os_string();
+            name.push(".sig");
+            PathBuf::from(name)
+        }
+    };
+
+    let mut trust_keys = Vec::with_capacity(authz.trust_keys.len());
+    let mut names = std::collections::BTreeSet::new();
+    for entry in &authz.trust_keys {
+        if entry.name.trim().is_empty() {
+            return Err(ConfigFileError::Invalid(
+                "authz.trust_keys contains an entry with an empty name".to_string(),
+            ));
+        }
+        if !names.insert(entry.name.as_str()) {
+            return Err(ConfigFileError::Invalid(format!(
+                "authz.trust_keys lists the key name {:?} twice; the signature envelope selects \
+                 a key by name, so a duplicate makes the choice ambiguous",
+                entry.name
+            )));
+        }
+        trust_keys.push((entry.name.clone(), verifying_key(entry)?));
+    }
+
+    let poll_interval = Duration::from_secs(match authz.poll_interval_secs {
+        Some(0) => {
+            return Err(ConfigFileError::Invalid(
+                "authz.poll_interval_secs must be greater than zero".to_string(),
+            ))
+        }
+        Some(v) => v,
+        None => DEFAULT_POLICY_POLL_SECS,
+    });
+
+    Ok(Some(SignedPolicyConfig {
+        policy_file,
+        signature_file,
+        trust_keys,
+        poll_interval,
+    }))
+}
+
+/// Parse one `[authz] trust_keys` entry's hex into a verifying key.
+fn verifying_key(entry: &TrustKeyEntry) -> Result<config_core::VerifyingKey, ConfigFileError> {
+    let invalid = |detail: &str| {
+        ConfigFileError::Invalid(format!(
+            "authz.trust_keys entry {:?}: {detail}; expected 64 hex characters of an ed25519 \
+             public key",
+            entry.name
+        ))
+    };
+    let raw = hex_32(entry.public_key.trim()).ok_or_else(|| invalid("not 32 bytes of hex"))?;
+    // A 32-byte string is not automatically a point on the curve, and a key that cannot verify
+    // anything must be refused here rather than at the first policy load — which happens after
+    // the listeners are bound.
+    config_core::VerifyingKey::from_bytes(&raw).map_err(|e| invalid(&e.to_string()))
+}
+
+/// Decode exactly 32 bytes of hex, or nothing.
+fn hex_32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
+        let text = std::str::from_utf8(pair).ok()?;
+        *slot = u8::from_str_radix(text, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// Loopback, including an IPv4-mapped IPv6 loopback — `::ffff:127.0.0.1` is the same machine
@@ -447,7 +1173,44 @@ fn read_bytes(what: &str, path: &Path) -> Result<Vec<u8>, ConfigFileError> {
     })
 }
 
-fn parse_gossip_key(hex: &str) -> Result<[u8; 32], ConfigFileError> {
+/// A page-token signing key for a process that was not given one.
+///
+/// Random rather than derived from the node identity: two nodes deriving the same key would
+/// let a token minted on one be *opened* on the other, and the node check would then be the
+/// only thing between a client and a walk over a snapshot that does not exist there.
+fn random_token_key() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    rand::Rng::fill(&mut rand::thread_rng(), &mut key);
+    key
+}
+
+/// Read `list.token_key_file`: 64 hex characters, whitespace around them ignored.
+///
+/// Hex rather than raw bytes for the same reason `gossip.secret_key_hex` is: a key an operator
+/// can paste, diff and rotate without a binary editor. The error never echoes the file's
+/// contents.
+fn read_token_key(path: &Path) -> Result<[u8; 32], ConfigFileError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigFileError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let hex = text.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ConfigFileError::Invalid(format!(
+            "list.token_key_file ({}) must hold 64 hex characters (a 256-bit HMAC key)",
+            path.display()
+        )));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16).expect("checked hex") as u8;
+        let lo = (chunk[1] as char).to_digit(16).expect("checked hex") as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+pub(crate) fn parse_gossip_key(hex: &str) -> Result<[u8; 32], ConfigFileError> {
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ConfigFileError::Invalid(
             "gossip.secret_key_hex must be 64 hex characters (an AES-256 key)".into(),
@@ -642,5 +1405,217 @@ mode = "insecure"
     fn node_id_zero_is_refused() {
         let text = minimal("").replace("node_id = 1", "node_id = 0");
         assert!(parse(&text, None, true).is_err());
+    }
+
+    /// M6: `[list]` defaults, overrides, and the two values that would advertise a pagination
+    /// surface that cannot work.
+    #[test]
+    fn the_list_section_sizes_pagination_and_refuses_useless_values() {
+        let default = parse(&minimal(""), None, true).expect("gate open");
+        assert_eq!(default.list.max_pinned, 64);
+        assert_eq!(default.list.ttl, Duration::from_secs(60));
+
+        let tuned = parse(
+            &minimal(
+                "
+[list]
+max_pinned_snapshots = 8
+ttl_seconds = 15
+",
+            ),
+            None,
+            true,
+        )
+        .expect("gate open");
+        assert_eq!(tuned.list.max_pinned, 8);
+        assert_eq!(tuned.list.ttl, Duration::from_secs(15));
+
+        for bad in ["max_pinned_snapshots = 0", "ttl_seconds = 0"] {
+            let error = parse(
+                &minimal(&format!(
+                    "
+[list]
+{bad}
+"
+                )),
+                None,
+                true,
+            )
+            .expect_err("a walk that cannot continue is refused at startup");
+            assert!(error.to_string().contains("greater than zero"), "{error}");
+        }
+
+        // Two processes must not be able to open each other's tokens by accident.
+        let other = parse(&minimal(""), None, true).expect("gate open");
+        assert_ne!(default.list.token_key, other.list.token_key);
+    }
+
+    // -----------------------------------------------------------------------------------
+    // M6-37 — `[authz] mode = "signed"` is validated before anything binds
+    // -----------------------------------------------------------------------------------
+
+    /// RFC 8032 §7.1 test vector 1's public key: a real point on the curve, so a refusal of a
+    /// document carrying it is never "the key was malformed".
+    const GOOD_KEY: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    fn signed(extra: &str) -> String {
+        minimal(&format!("\n[authz]\nmode = \"signed\"\n{extra}\n"))
+    }
+
+    fn key_entry(name: &str) -> String {
+        format!("[[authz.trust_keys]]\nname = \"{name}\"\npublic_key = \"{GOOD_KEY}\"\n")
+    }
+
+    /// The happy path, so every refusal below is attributable to the one field it removes.
+    #[test]
+    fn signed_mode_accepts_a_policy_file_and_one_trust_key() {
+        let cfg = parse(
+            &signed(&format!("policy_file = \"p.json\"\n{}", key_entry("ops"))),
+            None,
+            true,
+        )
+        .expect("a complete signed section");
+        let signed = cfg
+            .signed_policy
+            .expect("signed mode builds a policy config");
+        assert_eq!(signed.policy_file, Path::new("./p.json"));
+        // `<policy>.sig`, not `<stem>.sig`: the default has to be derivable by an operator
+        // holding only the policy path.
+        assert_eq!(signed.signature_file, Path::new("./p.json.sig"));
+        assert_eq!(signed.trust_keys.len(), 1);
+        assert_eq!(signed.trust_keys[0].0, "ops");
+        assert_eq!(signed.poll_interval, Duration::from_secs(10));
+    }
+
+    /// M6-37: a signed section missing *both* required fields names *both* of them.
+    ///
+    /// One error per restart is the failure mode this row exists to prevent: an operator who
+    /// fixes `policy_file`, restarts, and only then learns about `trust_keys` has taken two
+    /// outages to read one message.
+    #[test]
+    fn signed_mode_names_every_missing_field_in_one_error() {
+        let error = parse(&signed(""), None, true).expect_err("signed mode needs its inputs");
+        let text = error.to_string();
+        assert!(text.contains("authz.policy_file"), "{text}");
+        assert!(text.contains("authz.trust_keys"), "{text}");
+
+        // And each one alone names only itself, so the message tracks the document.
+        let only_key = parse(&signed(&key_entry("ops")), None, true)
+            .expect_err("a trust key without a document is not a policy");
+        assert!(
+            only_key.to_string().contains("authz.policy_file"),
+            "{only_key}"
+        );
+        assert!(
+            !only_key.to_string().contains("authz.trust_keys"),
+            "the key that *is* present must not be reported missing: {only_key}"
+        );
+
+        let only_doc = parse(&signed("policy_file = \"p.json\"\n"), None, true)
+            .expect_err("a document nobody can verify is not a signed policy");
+        assert!(
+            only_doc.to_string().contains("authz.trust_keys"),
+            "{only_doc}"
+        );
+    }
+
+    /// The signed fields under the default static mode are a refusal, not a no-op.
+    ///
+    /// An operator who writes `policy_file` and forgets `mode = "signed"` believes signatures
+    /// are being checked. Ignoring the key would leave them believing it.
+    #[test]
+    fn the_signed_fields_are_refused_under_static_mode() {
+        let error = parse(
+            &minimal("\n[authz]\npolicy_file = \"p.json\"\n"),
+            None,
+            true,
+        )
+        .expect_err("signed fields under static mode");
+        assert!(error.to_string().contains("signed"), "{error}");
+
+        // Static mode without them is unchanged from M3: no policy config at all (M6-36).
+        let cfg = parse(&minimal(""), None, true).expect("gate open");
+        assert!(cfg.signed_policy.is_none());
+    }
+
+    /// A trust key that cannot verify anything is refused here, not at the first load.
+    ///
+    /// The first load happens after the listeners bind, so accepting a malformed key would
+    /// turn a typo into a node that starts, serves nothing, and looks healthy while doing it.
+    #[test]
+    fn a_trust_key_must_be_a_usable_ed25519_public_key() {
+        for bad in [
+            String::new(),
+            "not-hex".to_string(),
+            "zz".repeat(32),
+            "ab".repeat(31),
+        ] {
+            let text = signed(&format!(
+                "policy_file = \"p.json\"
+[[authz.trust_keys]]
+name = \"ops\"
+\n                 public_key = \"{bad}\"
+"
+            ));
+            let error = parse(&text, None, true)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} must be refused as a trust key"));
+            assert!(
+                error.to_string().contains("ed25519"),
+                "the refusal must say what a trust key is: {error}"
+            );
+        }
+    }
+
+    /// Two keys under the same name make the envelope's key selection ambiguous.
+    #[test]
+    fn duplicate_and_empty_trust_key_names_are_refused() {
+        let dup = parse(
+            &signed(&format!(
+                "policy_file = \"p.json\"\n{}{}",
+                key_entry("ops"),
+                key_entry("ops")
+            )),
+            None,
+            true,
+        )
+        .expect_err("a duplicate key name");
+        assert!(dup.to_string().contains("twice"), "{dup}");
+
+        let empty = parse(
+            &signed(&format!("policy_file = \"p.json\"\n{}", key_entry(" "))),
+            None,
+            true,
+        )
+        .expect_err("an unnamed key");
+        assert!(empty.to_string().contains("empty name"), "{empty}");
+    }
+
+    /// A zero poll interval is a busy loop over two files, not "poll as fast as possible".
+    #[test]
+    fn a_zero_poll_interval_is_refused_and_a_set_one_is_honoured() {
+        let error = parse(
+            &signed(&format!(
+                "policy_file = \"p.json\"\npoll_interval_secs = 0\n{}",
+                key_entry("ops")
+            )),
+            None,
+            true,
+        )
+        .expect_err("zero is not an interval");
+        assert!(error.to_string().contains("greater than zero"), "{error}");
+
+        let cfg = parse(
+            &signed(&format!(
+                "policy_file = \"p.json\"\npoll_interval_secs = 3\nsignature_file = \"s.bin\"\n{}",
+                key_entry("ops")
+            )),
+            None,
+            true,
+        )
+        .expect("a set interval and an explicit signature path");
+        let signed = cfg.signed_policy.expect("signed mode");
+        assert_eq!(signed.poll_interval, Duration::from_secs(3));
+        assert_eq!(signed.signature_file, Path::new("./s.bin"));
     }
 }

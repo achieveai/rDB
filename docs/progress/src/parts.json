@@ -1,0 +1,49 @@
+{
+  "parts": [
+    { "id": "sm-core", "label": "config-core", "milestone": "M0", "state": "built", "evidence": "Records, requests, Command, CAS. m0_replay green; critic-core PASS_WITH_RISKS closed." },
+    { "id": "sm-log", "label": "config-log (+ macros)", "milestone": "M0", "state": "built", "evidence": "JSONL tracing, trace context, #[retcd_test] macro. ADR-0013, commit 8bc683a. Folds the config-log-macros proc-macro crate, its only dependent." },
+    { "id": "sm-storage", "label": "config-storage", "milestone": "M2", "state": "built", "evidence": "OpenRaft TypeConfig, EphemeralStore, RocksStore. M2 gate commit 01a58b8." },
+    { "id": "sm-engine", "label": "config-engine", "milestone": "M1", "state": "built", "evidence": "OpenRaft lifecycle. M1 gate commit 01a58b8, 27 of 27 rows." },
+    { "id": "sm-gossip", "label": "config-gossip", "milestone": "M1", "state": "built", "evidence": "Memberlist adapter, advisory-only. critic-gossip blockers closed pre-gate." },
+    { "id": "sm-grpc", "label": "config-grpc", "milestone": "M3", "state": "built", "evidence": "Client, peer, admin gRPC planes, TLS profiles. M3 gate commit 7d524ac, ADR-0010." },
+    { "id": "sm-client", "label": "config-client", "milestone": "M3", "state": "built", "evidence": "Remote ConfigStore client, bounded leader-hint follow. M3 gate commit 7d524ac, ADR-0009." },
+    { "id": "sm-server", "label": "config-server", "milestone": "M3", "state": "built", "evidence": "rEtcd node daemon binary composing engine, grpc, gossip, storage. M3 merge 7d524ac, ADR-0018." },
+    { "id": "sm-testkit", "label": "config-testkit", "milestone": "M0", "state": "built", "evidence": "ConfigStore conformance suite, cluster test harness. M0 merge 7014701, ADR-0014." },
+    { "id": "watch-hub", "label": "Watch hub", "milestone": "M4", "state": "built", "evidence": "Bounded per-stream queues, resume, delivery. M4 gate commit 33b5f4b, critic-m4 FINAL PASS." },
+    { "id": "event-journal", "label": "Event journal", "milestone": "M4", "state": "built", "evidence": "Journal gate, replicated retention compaction. M4 gate commit 33b5f4b." },
+    { "id": "snapshots-purge", "label": "Snapshots + log purge", "milestone": "M5", "state": "built", "evidence": "Consistent snapshot, guarded purge. M5 gate commit e54c6ef, ruling M5-R11." },
+    { "id": "admin-backup-restore", "label": "Admin plane + backup/restore", "milestone": "M5", "state": "gap", "evidence": "Learner lifecycle, fencing, backup/restore. M5 gate commit e54c6ef. Known gaps: backup policy_version_ref always None (M6-33); no restore_policy_mismatch log line (M6-35)." },
+    { "id": "rbac-policy", "label": "Signed RBAC + policy", "milestone": "M6", "state": "gap", "evidence": "Signed policy documents, gossip convergence, verified-caller binding. m6_rbac 20/20, M6-R23 ruling. Known gaps: cluster identity on signed docs (ADR-0031); policy version floor process-scoped (ADR-0031)." },
+    { "id": "tls-gossip-rotation", "label": "TLS + gossip-key rotation", "milestone": "M6", "state": "gap", "evidence": "Certificate and gossip-key rotation. m6_rotation.rs 24 of 24. Known gaps: handshake timeout not rotator-configurable (ADR-0031); try_reload partial plane swap on error (ADR-0031)." },
+    { "id": "pagination-migration", "label": "Pagination + mixed-version gate", "milestone": "M6", "state": "built", "evidence": "Revision-pinned pagination, format migration gate, decode fence wired. Policy-version binding (M6-32), snapshot-install route confirmed. m6_pagination_e2e green, E2E-42 rolling upgrade 8x green." },
+
+    { "id": "wp-client", "label": "Client, Put/Delete/CAS", "milestone": "M0", "state": "built", "evidence": "Client request shapes. M0 gate, config-core conformance." },
+    { "id": "wp-plane", "label": "Client plane, mTLS ingress", "milestone": "M3", "state": "built", "evidence": "Identity-checked client listener. M3 gate commit 7d524ac." },
+    { "id": "wp-leader", "label": "Leader, ConfigNode propose", "milestone": "M1", "state": "built", "evidence": "Propose path on the leader. M1 gate commit 01a58b8." },
+    { "id": "wp-raft-replicate", "label": "Raft replicate + commit", "milestone": "M1", "state": "built", "evidence": "OpenRaft replication and quorum commit. M1 gate commit 01a58b8." },
+    { "id": "wp-apply", "label": "State machine apply", "milestone": "M5", "state": "built", "evidence": "Deterministic apply, dedup principal bind. M5 gate commit e54c6ef, ruling M5-R16." },
+    { "id": "wp-storage", "label": "Storage, atomic batch", "milestone": "M2", "state": "built", "evidence": "One synced RocksDB batch per apply. M2 gate commit 01a58b8." },
+
+    { "id": "rp-request", "label": "Get / List request", "milestone": "M0", "state": "built", "evidence": "Read request shapes. M0 gate." },
+    { "id": "rp-linearizable", "label": "ensure_linearizable()", "milestone": "M0", "state": "built", "evidence": "Leadership confirmed by quorum before read. ADR-0009, M0-M1 gates." },
+    { "id": "rp-read-local", "label": "Read local KvState", "milestone": "M0", "state": "built", "evidence": "Returns record and read_revision. M0 gate." },
+    { "id": "rp-notleader", "label": "NotLeader + hint", "milestone": "M3", "state": "built", "evidence": "Follower redirects with a committed member hint. M3 gate commit 7d524ac." },
+    { "id": "pagination", "label": "Paginated List, revision-pinned", "milestone": "M6", "state": "building", "evidence": "Six-reason PageTokenExpired, ruling M6-R7. m6_pagination_e2e green. Known gap: a follower continuation page has no leader hint." },
+    { "id": "watch-register", "label": "Watch register, journal gate", "milestone": "M4", "state": "built", "evidence": "Validate, capture H, subscribe. M4 gate commit 33b5f4b, ruling M4-R11." },
+    { "id": "compaction-floor", "label": "RevisionCompacted floor", "milestone": "M4", "state": "built", "evidence": "Typed error below the watermark, never a silent hole. M4 gate commit 33b5f4b." },
+
+    { "id": "df-raft-log", "label": "Raft log", "milestone": "M1", "state": "built", "evidence": "Positional postcard Command entries. M1-M2 gates." },
+    { "id": "df-column-families", "label": "Column families, format v3", "milestone": "M5", "state": "built", "evidence": "kv, events, dedup, state_meta. M5 gate commit e54c6ef, ruling M5-R16." },
+    { "id": "df-snapshot", "label": "Snapshot file", "milestone": "M5", "state": "built", "evidence": "Consistent view, fsync file and dir. M5 gate commit e54c6ef, ruling M5-R1." },
+    { "id": "backup", "label": "Backup artifact", "milestone": "M5", "state": "gap", "evidence": "Manifest and signature, TA-47 exit codes. M5 gate commit e54c6ef. Known gap: policy_version_ref always None (M6-33)." },
+    { "id": "restore", "label": "Restore, fenced", "milestone": "M5", "state": "gap", "evidence": "New identity only, state_meta/restored_from. M5 gate commit e54c6ef, ruling M5-R14. Known gap: no restore_policy_mismatch log line (M6-35)." },
+
+    { "id": "local-cluster-up", "label": "local-cluster up", "milestone": "M6", "state": "built", "evidence": "One-command 3-node dev cluster. Lead ran end to end, 3 of 3 ready, health JSON ok, clean teardown." },
+    { "id": "local-cluster-ready", "label": "3 nodes ready, leader elected", "milestone": "M6", "state": "built", "evidence": "Same run as local-cluster-up. Lead-verified, dev-quickstart ACCEPTED." },
+    { "id": "log-purge", "label": "Log purge, guarded", "milestone": "M5", "state": "built", "evidence": "Never crosses last_applied or the snapshot boundary. M5 gate commit e54c6ef, ruling M5-R11." },
+    { "id": "tls-rotation", "label": "TLS cert rotation", "milestone": "M6", "state": "building", "evidence": "ReloadTls admin RPC, file-watch poller. m6_rotation.rs rows landed. Known gap: handshake timeout not rotator-configurable." },
+    { "id": "gossip-key-rotation", "label": "Gossip-key rotation", "milestone": "M6", "state": "building", "evidence": "Staged two-key overlap window. m6_rotation.rs 24 of 24, ruling M6-R21 refusal guard." },
+    { "id": "drain-check", "label": "Drain check before migration", "milestone": "M6", "state": "building", "evidence": "Every retained entry decodes and is applied. m6_compat_open green, ruling M6-R20. Known gap: decode-only, not a semantic check." },
+    { "id": "rolling-upgrade", "label": "Rolling upgrade, v1 to v3", "milestone": "M6", "state": "building", "evidence": "In-place format migration then restart. E2E-42, 8 of 8 green. No M6 gate commit yet." }
+  ]
+}

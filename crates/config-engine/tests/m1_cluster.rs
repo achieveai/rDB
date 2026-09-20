@@ -412,7 +412,11 @@ async fn m1_37_capabilities_are_exactly_the_m1_profile() {
     let cluster = Cluster::formed(3).await;
     let expected = Capabilities {
         durability: Durability::Ephemeral,
-        watch_resumption: WatchResumption::Unsupported,
+        // M4 (ADR-0020): every node now serves resumable watches and publishes its compaction
+        // floor, so this is the one capability M1 pinned that M4 deliberately moved.
+        watch_resumption: WatchResumption::Retained {
+            compact_revision_visible: true,
+        },
         authz: Authz::Development,
         transport_security: TransportSecurity::Insecure,
         pagination: Pagination::Unsupported,
@@ -486,6 +490,7 @@ async fn m1_smoke_direct_client_conformance() {
             key: key("/a/one"),
             value: key("nope"),
             expected_mod_revision: Some(99),
+            dedup: None,
         })
         .await
         .expect("CAS conflict is Ok");
@@ -496,6 +501,7 @@ async fn m1_smoke_direct_client_conformance() {
         .delete(DeleteRequest {
             key: key("/a/two"),
             expected_mod_revision: None,
+            dedup: None,
         })
         .await
         .expect("delete");
@@ -513,6 +519,7 @@ async fn m1_smoke_direct_client_conformance() {
         .delete(DeleteRequest {
             key: key("/a/one"),
             expected_mod_revision: Some(0),
+            dedup: None,
         })
         .await
         .unwrap_err();

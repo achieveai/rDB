@@ -1,0 +1,270 @@
+// rEtcd admin plane (DesignSpec-01 §13.2, §19.8, §19.9; ADR-0023, ADR-0024).
+//
+// Field numbers are normative and must never be reused.
+//
+// `AdminService` is served on the **client-plane** listener (mTLS, ADR-0010), not on a third
+// listener: a separate privileged port would mean a second certificate profile, a second port
+// to fence and a second surface to test, for no isolation the `[authz] admins` allowlist does
+// not already provide over mTLS (OQ-43). Only a principal named in that allowlist may call any
+// method here; every other authenticated principal is refused PERMISSION_DENIED before the
+// handler runs, carrying the usual `retcd-outcome: rejected` marker.
+//
+// Every mutating method requires the receiving node to be the current leader and answers
+// FAILED_PRECONDITION with the existing `retcd-leader-node-id` / `retcd-leader-endpoint`
+// metadata otherwise (ADR-0009). `GetMembership` is served everywhere but marks itself
+// non-authoritative off the leader.
+//
+// `ReloadPolicy` (ADR-0027), `ReloadTls` and `RotateGossipKey` (ADR-0028) are all declared
+// below; the M6 reservation that held their names is now spent.
+//
+// There is deliberately **no** RPC that changes an existing node's endpoint. `ChangeMembers::
+// SetNodes` can leave two disjoint quorums each believing they hold the updated address
+// (research §3.5), so an endpoint change is remove-then-re-add-as-a-fresh-learner, enforced at
+// this API boundary by the absence of the operation (ADR-0023, M5-63).
+syntax = "proto3";
+
+package retcd.v1;
+
+service AdminService {
+  rpc GetMembership(GetMembershipRequest) returns (MembershipReport);
+  rpc AddLearner(AddLearnerRequest) returns (AdminAck);
+  rpc PromoteVoter(NodeRef) returns (AdminAck);
+  rpc RemoveMember(NodeRef) returns (AdminAck);
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (SnapshotInfo);
+  rpc Backup(BackupRequest) returns (BackupInfo);
+  rpc ReloadPolicy(ReloadPolicyRequest) returns (PolicyInfo);
+  rpc ReloadTls(ReloadTlsRequest) returns (TlsInfo);
+  rpc RotateGossipKey(RotateGossipKeyRequest) returns (GossipKeyringInfo);
+}
+
+// A Raft log id, as the admin plane reports it. Named `AdminLogId` rather than `LogId` because
+// every message in this package shares one namespace with `config.proto` and `peer.proto`.
+message AdminLogId {
+  uint64 term = 1;
+  uint64 index = 2;
+}
+
+message GetMembershipRequest {}
+
+// What one node believes about membership right now.
+//
+// `authoritative` is false off the leader: `replication` is empty there (openraft populates the
+// replication map only on a leader, research §3.3), so a catch-up polling loop that ignored the
+// flag would conclude a learner had not started replicating at all.
+message MembershipReport {
+  // Committed voter ids, ascending.
+  repeated uint64 voters = 1;
+  // Committed member ids that are not voters, ascending.
+  repeated uint64 learners = 2;
+  // Configs in the *effective* membership: 1 uniform, 2 joint. Anything above 1 means a
+  // `change_membership` was interrupted between its two round trips (trap T8) and the documented
+  // repair is to re-issue the same call (ADR-0023).
+  uint32 joint_config_len = 3;
+  optional AdminLogId membership_log_id = 4;
+  // Node ids that a committed `RetireNode` has fenced. They can never be re-added.
+  repeated uint64 retired = 5;
+  // Per-peer replication progress. Populated only on the leader.
+  repeated ReplicationEntry replication = 6;
+  // The leader's own last log index, the other half of the catch-up predicate. 0 off the leader.
+  uint64 leader_last_log_index = 7;
+  optional uint64 current_leader = 8;
+  // True only when this node was the leader at the instant it answered.
+  bool authoritative = 9;
+  // Committed peer and client endpoints of every member.
+  repeated MemberEndpoints endpoints = 10;
+  // `membership.promote_max_lag` as this node is configured, so a caller polls against the
+  // threshold the server will actually apply rather than one it guessed.
+  uint64 promote_max_lag = 11;
+}
+
+message ReplicationEntry {
+  uint64 node_id = 1;
+  // Highest log index this peer has acknowledged. Absent when the leader has not heard from it.
+  optional uint64 matched_index = 2;
+  // `leader_last_log_index - matched_index`, saturating at 0.
+  uint64 lag = 3;
+}
+
+message MemberEndpoints {
+  uint64 node_id = 1;
+  string peer = 2;
+  string client = 3;
+}
+
+// Both endpoints are required: a voter this learner may become has to be nameable in a leader
+// hint, and a hint names the **client** plane (ADR-0009). A learner added with only its peer
+// address would produce a hint no client can dial.
+message AddLearnerRequest {
+  uint64 node_id = 1;
+  string peer_endpoint = 2;
+  string client_endpoint = 3;
+  // The cluster the caller believes it is administering, as 32 lowercase hex characters.
+  // Checked against this node's bound identity before anything is proposed (ADR-0023): an
+  // operator pointed at the wrong cluster gets a refusal, not a learner in the wrong place.
+  string cluster_id = 4;
+}
+
+message NodeRef {
+  uint64 node_id = 1;
+}
+
+// A membership operation that was committed.
+//
+// It carries no catch-up claim, deliberately. `Raft::add_learner`'s blocking wait result is
+// logged and discarded upstream (trap T7), so an acknowledgement that implied "and it has
+// caught up" would be repeating a bug rather than reporting a fact. Catch-up is proven only by
+// polling `GetMembership`.
+message AdminAck {
+  uint64 node_id = 1;
+  optional AdminLogId membership_log_id = 2;
+}
+
+message TriggerSnapshotRequest {}
+
+// The outcome of a `TriggerSnapshot` (OQ-44).
+//
+// `already_in_progress` is a field rather than an error status because "a build was already
+// running" is a normal answer. It must still never be reported as a bare `OK`: openraft's own
+// trigger returns `false` and does nothing in that case (trap T13), and an admin plane that
+// passed that silence on would tell an operator a snapshot had been requested when none had.
+message SnapshotInfo {
+  // Empty when the build had not published by the time this call returned, which is not a
+  // failure — the build is still running and `GetMembership` will show it.
+  string snapshot_id = 1;
+  optional AdminLogId last_log_id = 2;
+  bool already_in_progress = 3;
+}
+
+// Build a backup artifact triple on the **server's** filesystem (ADR-0024).
+//
+// `dest_dir` is a path on the node, not on the caller: the snapshot is built from the node's own
+// consistent view and streamed straight to disk there, never through this RPC.
+message BackupRequest {
+  string dest_dir = 1;
+  // Stem of the three artifact files. Empty means the server picks one from the revision and
+  // the wall clock.
+  string name = 2;
+}
+
+message BackupInfo {
+  string name = 1;
+  // File names within `dest_dir`, not full paths.
+  string snapshot_file = 2;
+  string manifest_file = 3;
+  string signature_file = 4;
+  // Lowercase hex SHA-256 of the **plaintext** snapshot, exactly as the manifest records it.
+  string sha256 = 5;
+  uint64 revision = 6;
+  uint64 size_bytes = 7;
+  bool encrypted = 8;
+}
+
+// Re-read the signed policy document and its signature now, instead of waiting for the next
+// `authz.poll_interval` tick (ADR-0027, §15.3).
+//
+// It carries no payload. The paths are the node's configuration, not the caller's to choose: an
+// RPC that named a file would let an admin principal load a document from anywhere the server
+// process can read, which is a different privilege from "rotate the configured policy".
+message ReloadPolicyRequest {}
+
+// What the active policy is after a reload attempt.
+//
+// A *refused* document is an error status, not an outcome here: the reason travels in the
+// `retcd-reason` trailer and the active policy is unchanged (M6-13). This message describes only
+// the two ways a reload can succeed.
+message PolicyInfo {
+  // The version that was active before the call. Absent when none was.
+  optional uint64 from_version = 1;
+  // The version active now. Equal to `from_version` when `outcome` is "unchanged".
+  uint64 version = 2;
+  // Lowercase hex SHA-256 of the active document's bytes.
+  string hash_hex = 3;
+  // "reloaded" or "unchanged".
+  string outcome = 4;
+  // Why nothing changed, when `outcome` is "unchanged" — currently only "identical_hash".
+  // Empty on "reloaded".
+  string reason = 5;
+}
+
+// Re-read the configured TLS PEM files now, instead of waiting for the next
+// `tls.watch_files_secs` tick (ADR-0028, §15.3).
+//
+// Payload-free for the same reason `ReloadPolicyRequest` is: the paths are the node's
+// configuration, not the caller's to choose. An RPC that named a file would let an admin
+// principal make this node serve a certificate from anywhere its process can read, which is a
+// different privilege from "rotate the configured credentials".
+message ReloadTlsRequest {}
+
+// What each of this node's TLS credentials is serving after a reload attempt.
+//
+// Per plane, because they can legitimately disagree: a reload that produces material the client
+// plane accepts and the peer dialler refuses has to be visible as exactly that, not flattened
+// into one verdict. A reload that no plane could serve is an error status instead, so nothing
+// here describes a failure.
+message TlsInfo {
+  repeated TlsPlaneInfo planes = 1;
+}
+
+// One plane's credentials.
+message TlsPlaneInfo {
+  // "client", "peer" (inbound) or "peer_dial" (outbound).
+  string plane = 1;
+  // "reloaded" or "unchanged".
+  string outcome = 2;
+  // How many times this plane's credentials have been replaced since the node started. Lets an
+  // operator tell a reload that did nothing from a reply they are reading twice.
+  uint64 generation = 3;
+  // Lowercase hex SHA-256 of the served leaf certificate's DER, truncated to eight bytes.
+  // A fingerprint, never the certificate: this is a field an operator reads off a terminal.
+  string cert_fingerprint = 4;
+  // `notAfter` of the served leaf, as seconds since the Unix epoch.
+  int64 cert_expiry_unix = 5;
+}
+
+// Which step of a gossip key rotation to take (ADR-0028).
+//
+// A closed enum rather than a string, because the three steps are not interchangeable and the
+// order between them is the whole safety property: every node must accept a key before any node
+// signs with it, and the old key may only be dropped once nothing still needs it.
+enum GossipKeyOp {
+  // Never valid. A request that leaves this unset is refused rather than guessed at.
+  GOSSIP_KEY_OP_UNSPECIFIED = 0;
+  // Accept the key on receive. Safe to run node by node, in any order.
+  GOSSIP_KEY_OP_ADD = 1;
+  // Sign outgoing gossip with the key. Refused unless it was added here first.
+  GOSSIP_KEY_OP_USE = 2;
+  // Stop accepting the key. Refused while a peer accepts it and nothing else.
+  GOSSIP_KEY_OP_REMOVE = 3;
+}
+
+// Take one step of a gossip key rotation on this node (ADR-0028).
+//
+// Node-local: gossip is advisory and carries no consensus, so there is nothing to replicate and
+// an operator sweeps the cluster one node at a time. The reply reports this node only.
+message RotateGossipKeyRequest {
+  // Which step to take.
+  GossipKeyOp op = 1;
+  // The AES-256 key as 64 lowercase hex characters.
+  //
+  // The key itself, because installing a key is the point and a fingerprint cannot be
+  // installed. It is why this RPC exists only on the mTLS client plane behind the `[authz]
+  // admins` allowlist, and why no log line, audit record or error message derived from this
+  // request ever contains this field — they carry its fingerprint instead.
+  string key_hex = 2;
+  // Remove the key even though a peer still accepts it and nothing else.
+  //
+  // Only meaningful with GOSSIP_KEY_OP_REMOVE. What it overrides is a check against advertised
+  // membership, which can legitimately be stale: a decommissioned node lingers there until the
+  // failure detector times it out.
+  bool force = 3;
+}
+
+// The keys this node's gossip keyring holds after the call.
+//
+// Fingerprints only. There is no request that reads a gossip key back out of a node.
+message GossipKeyringInfo {
+  // Fingerprint of the key outgoing gossip is signed with.
+  string primary_fingerprint = 1;
+  // Fingerprints of every key accepted on receive, primary first.
+  repeated string accepted_fingerprints = 2;
+}

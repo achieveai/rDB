@@ -75,6 +75,10 @@ mod static_source;
 
 pub use config::GossipConfig;
 pub use error::{GossipError, HintDecodeError};
-pub use meta::{decode_hint, encode_hint, HINT_WIRE_VERSION, MAX_HINT_BYTES};
-pub use node::GossipNode;
+pub use meta::{
+    decode_hint, decode_hint_extras, encode_hint, encode_hint_with_extras, fingerprint_hex,
+    gossip_key_fingerprint, AcceptedGossipKeys, GossipKeyFingerprint, HintExtras,
+    HINT_WIRE_VERSION, MAX_ADVERTISED_GOSSIP_KEYS, MAX_HINT_BYTES,
+};
+pub use node::{GossipKeyring, GossipNode};
 pub use static_source::StaticObservationSource;

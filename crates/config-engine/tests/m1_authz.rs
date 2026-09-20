@@ -127,6 +127,7 @@ async fn m1_27_a_denied_mutation_never_reaches_the_raft_log() {
             .delete(DeleteRequest {
                 key: key("/a/k"),
                 expected_mod_revision: None,
+                dedup: None,
             })
             .await
             .unwrap_err(),
@@ -207,6 +208,7 @@ async fn m1_obs_a_node_without_a_policy_is_unready_and_denies_every_call() {
             .delete(DeleteRequest {
                 key: key("/a/k"),
                 expected_mod_revision: None,
+                dedup: None,
             })
             .await
             .unwrap_err(),
@@ -288,7 +290,7 @@ async fn m3_81_denials_and_authentication_rejections_are_counted_separately() {
         .expect("reads are allowed");
     assert_eq!(node.metrics().authz_denied, 1);
 
-    node.record_authn_rejection();
+    node.record_authn_rejection(config_engine::AuthnRejectReason::NoUsableIdentity);
     assert_eq!(node.metrics().authn_rejected, 1);
     assert_eq!(
         node.metrics().authz_denied,

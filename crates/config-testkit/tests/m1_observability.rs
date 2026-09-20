@@ -18,18 +18,32 @@ fn my_log_lines(method: &str) -> Vec<serde_json::Value> {
 // M1-37/M1-38/M1-39 — capability reporting (ADR-0016)
 // =====================================================================================
 
-/// M1-37: the ephemeral, allow-all M1 node reports exactly the `EPHEMERAL_DEVELOPMENT`
-/// profile — one struct equality, so adding a field to `Capabilities` without updating this
-/// assertion is a compile error, not a silently-passing test.
+/// M1-37: the ephemeral, allow-all M1 node reports exactly the M1 profile — one struct
+/// equality, so adding a field to `Capabilities` without updating this assertion is a compile
+/// error, not a silently-passing test.
+///
+/// This was `Capabilities::EPHEMERAL_DEVELOPMENT` verbatim through M3. M4 changed what a real
+/// `ConfigNode` reports for `watch_resumption`: `ConfigNode::capabilities()`
+/// (`config-engine/src/node.rs`) now reports `Retained` unconditionally, because the M4
+/// in-memory journal (a `BTreeMap<u64, MutationEvent>`, test plan M4-11
+/// `ephemeral_journal_parity`) backs watches on the ephemeral store exactly as it does on
+/// Rocks — only the *store itself* (`config_testkit::memstore::MemStore`, which keeps no
+/// journal at all) still earns `EPHEMERAL_DEVELOPMENT`'s `Unsupported`. A live cluster node is
+/// never a bare `MemStore`, so this row now builds its own expected value instead of reusing
+/// that constant, matching `m2_observability.rs::m2_49_rocks_reports_persistent` and
+/// `m3_capabilities.rs::m3_45_capabilities_exact_values_m3`.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m1_37_capabilities_exact_values_m1() {
     let cluster = Cluster::start(3, StorageKind::Ephemeral).await;
     cluster.leader().await;
 
-    assert_eq!(
-        cluster.capabilities(NodeId(1)),
-        Capabilities::EPHEMERAL_DEVELOPMENT
-    );
+    let expected = Capabilities {
+        watch_resumption: config_core::WatchResumption::Retained {
+            compact_revision_visible: true,
+        },
+        ..Capabilities::EPHEMERAL_DEVELOPMENT
+    };
+    assert_eq!(cluster.capabilities(NodeId(1)), expected);
 
     cluster.shutdown().await;
 }

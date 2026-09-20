@@ -39,28 +39,53 @@ pub mod error;
 pub mod hint;
 pub mod identity;
 pub mod limits;
+pub mod policy;
+pub mod schema;
 pub mod state;
 pub mod store;
 pub mod types;
 pub mod validate;
 
 pub use authz::{
-    audit, Action, AllowAll, AllowlistPolicy, Authorizer, Decision, Grant, Principal,
-    PrincipalKind, StaticAllowlist,
+    audit, is_verified_kind, Action, AllowAll, AllowlistPolicy, Authorizer, Decision, Grant,
+    Principal, PrincipalKind, StaticAllowlist,
 };
 pub use capabilities::{
     Authz, Capabilities, Dedup, Durability, Pagination, TransportSecurity, WatchResumption,
 };
 pub use command::{
-    Command, CommandResponse, DecodeError, MutationEvent, MutationEventKind, COMMAND_MAGIC,
-    COMMAND_VERSION, OP_DELETE, OP_PUT,
+    principal_hash, Command, CommandResponse, DecodeError, DedupKey, DedupStamp, MutationEvent,
+    MutationEventKind, COMMAND_ENVELOPE_VERSION, COMMAND_MAGIC, OP_COMPACT, OP_DELETE, OP_PUT,
+    OP_RETIRE_NODE,
 };
-pub use error::{ConfigError, LeaderHint, StatusClass};
+pub use error::{
+    ConfigError, LeaderHint, PageTokenExpiredReason, StatusClass, REASON_POLICY_CHANGED,
+    REASON_POLICY_CONVERGING, REASON_PREFIX_MISMATCH, REASON_TOKEN_PRINCIPAL,
+    UNAVAILABLE_FEATURE_NOT_ACTIVATED,
+};
 pub use hint::{GossipObservationSource, Liveness, NoGossip, ObservedPeerHint};
-pub use identity::{ClusterId, ClusterIdentity, IdentityMismatch, NodeId, RecoveryEpoch};
-pub use limits::{Limits, LIST_RECORD_OVERHEAD_BYTES};
-pub use state::KvState;
-pub use store::ConfigStore;
+pub use identity::{
+    ClusterId, ClusterIdentity, IdentityMismatch, NodeId, RecoveryEpoch, RestoredFrom,
+};
+pub use limits::{DedupLimits, Limits, WatchLimits, WatchRetention, LIST_RECORD_OVERHEAD_BYTES};
+pub use policy::{
+    changed_prefixes, evaluate_converging, verify_policy, Adoption, PolicyDocument, PolicyRejected,
+    PolicySignature, PolicyState, SignedPolicy, SignedPolicyAuthorizer, VerifyingKey,
+    REASON_NO_VALID_POLICY,
+};
+pub use schema::{
+    command_gate, refuse_command, GateRequirement, SchemaError, SchemaTriple, COMMAND_SCHEMA_V1,
+    COMMAND_SCHEMA_V2, COMPAT_SCHEMA_1, CURRENT_SCHEMA, FEATURE_COMPACT, FEATURE_DEDUP,
+    FEATURE_RETIRE_NODE,
+};
+pub use state::{
+    dedup_index_key_from_storage, dedup_storage_key, ApplyEffects, DedupIndexKey, DedupRecord,
+    KvState,
+};
+pub use store::{
+    bind_hash, open_token, seal_token, token_fingerprint, ConfigStore, ListPage, PageRequest,
+    PageToken, WatchItem, WatchRequest, WatchStream, PAGE_TOKEN_VERSION,
+};
 pub use types::{
     DeleteRequest, GetRequest, GetResponse, ListRequest, ListResponse, MutationOutcome,
     MutationResponse, PutRequest, Record,

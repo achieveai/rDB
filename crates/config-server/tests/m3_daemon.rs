@@ -253,6 +253,40 @@ async fn m3_44_daemon_accepts_insecure_with_flag_and_warns() {
     );
 }
 
+/// The two dev gates are one fact, not two: `--dev-allow-all` is refused on its own.
+///
+/// A new row, not in the plan (lead ruling, 2026-09-19). See `Cli::check_dev_gates` for why the
+/// pair is one fact. Both local-cluster scripts already pass it, so nothing that ran before
+/// this row stops running (ADR-0012, ADR-0018 §2).
+#[retcd_test]
+async fn dev_allow_all_is_refused_without_allow_insecure_dev() {
+    let harness = Harness::new("dev_allow_all_is_refused_without_allow_insecure_dev").await;
+    let node = &harness.nodes[0];
+    // A perfectly ordinary mutual-TLS document: the refusal is about the flag pair alone, which
+    // is the whole point — this is the combination that used to start and serve.
+    let mut spec = harness.spec(0);
+    spec.dev_allow_all = true;
+
+    let (code, stdout, stderr) = daemon::run_to_completion(&spec);
+    assert_eq!(
+        code,
+        Some(2),
+        "a refused flag combination exits 2 (ADR-0018 §5); stderr:\n{stderr}"
+    );
+    assert!(
+        stdout.trim().is_empty(),
+        "a refused daemon must print no ready line, got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("--allow-insecure-dev"),
+        "the refusal must name the flag that would have allowed it: {stderr}"
+    );
+    assert!(
+        !node.data_dir.exists(),
+        "the gate runs before the store is opened"
+    );
+}
+
 // =====================================================================================
 // M3-45 — a daemon with no policy and no --dev-allow-all (ADR-0018 §6, OQ-19)
 // =====================================================================================
@@ -390,7 +424,11 @@ async fn m3_46_capabilities_cli_matches_runtime() {
         serde_json::from_str(lines[0]).expect("the capability report is JSON");
 
     // Fields no live channel can re-derive: pinned to the documented unconditional literals.
-    assert_eq!(reported["watch_resumption"], "Unsupported");
+    assert_eq!(
+        reported["watch_resumption"],
+        serde_json::json!({ "Retained": { "compact_revision_visible": true } }),
+        "M4: the daemon serves resumable watches and surfaces its compaction floor"
+    );
     assert_eq!(reported["pagination"], "Unsupported");
     assert_eq!(reported["dedup"], "Unsupported");
 
@@ -635,6 +673,7 @@ async fn m3_73_manifest_is_not_authority_after_formation() {
     let client = cluster_client(&harness, &nodes);
     let before = client
         .put(PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/m3-73/before"),
             value: Bytes::from_static(b"v"),
             expected_mod_revision: None,
@@ -666,6 +705,7 @@ async fn m3_73_manifest_is_not_authority_after_formation() {
     // all three nodes' actual state hash.
     let after = client
         .put(PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/m3-73/after"),
             value: Bytes::from_static(b"v2"),
             expected_mod_revision: None,

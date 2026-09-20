@@ -26,12 +26,23 @@ use tracing::{debug, info, trace, warn, Instrument, Span};
 
 use crate::config::GossipConfig;
 use crate::error::{GossipError, HintDecodeError};
-use crate::meta::{decode_hint, encode_hint};
+use crate::meta::{
+    decode_hint, decode_hint_extras, encode_hint_with_extras, fingerprint_hex,
+    gossip_key_fingerprint, AcceptedGossipKeys, GossipKeyFingerprint,
+};
 
 /// Depth of the membership-event channel. Events only *wake* the refresher, which then
 /// rebuilds the snapshot from authoritative membership, so a full channel loses nothing but
 /// timeliness.
 const EVENT_CHANNEL_DEPTH: usize = 256;
+
+/// How many times `start` re-runs the whole bind when the caller asked for an ephemeral port
+/// (`bind_addr` port `0`). memberlist picks the port by binding TCP first, retrying that up to
+/// ten times, and then binds UDP on the *same* port with no retry at all — so on a busy host a
+/// port that was free for TCP can already be held for UDP by another process, and the start
+/// fails for nothing the caller did. Retrying the whole bind is the only way to ask for a new
+/// pair; a fixed port is not retried, because a taken fixed port is the caller's problem.
+const EPHEMERAL_BIND_ATTEMPTS: u32 = 8;
 
 type GossipTransport = TokioNetTransport<SmolStr, TokioSocketAddrResolver, TokioTcp>;
 type TransportOptions = NetTransportOptions<SmolStr, TokioSocketAddrResolver, TokioTcp>;
@@ -172,6 +183,22 @@ pub struct GossipNode {
     join_attempts: u32,
     join_retry_delay: Duration,
     broadcast_timeout: Duration,
+    /// Advisory trailer re-applied on every re-advertisement (ADR-0030).
+    ///
+    /// Behind a lock because two of its slots change while the node runs and neither owner can
+    /// see the other's: `schema` is fixed at start, but `accepted_gossip_keys` moves with a key
+    /// rotation (ADR-0028) and `policy_version` with a document rotation (ADR-0027). Each owner
+    /// therefore edits **its own field** through [`GossipNode::update_extras`] rather than
+    /// replacing the whole value, which is the only shape under which two rotations in flight
+    /// at once cannot silently undo each other (ruling M6-R18).
+    extras: Mutex<Option<crate::HintExtras>>,
+    /// The last hint advertised, so the trailer can be re-encoded without one being supplied.
+    ///
+    /// A meta change only reaches peers when memberlist re-advertises and bumps the node's
+    /// incarnation; writing new bytes into the delegate alone would leave every peer on the
+    /// old trailer until something else happened to re-advertise. So changing a slot means
+    /// re-running the advertisement, and that needs the hint the node is currently publishing.
+    last_hint: Mutex<ObservedPeerHint>,
 }
 
 impl fmt::Debug for GossipNode {
@@ -199,7 +226,9 @@ impl GossipNode {
     /// [`GossipError::HintTooLarge`] if `self_hint` does not fit the 512-byte metadata budget
     /// (checked here because `memberlist` would otherwise panic),
     /// [`GossipError::Config`] for an unusable label, and [`GossipError::Start`] if the
-    /// socket cannot be bound.
+    /// socket cannot be bound — for an ephemeral port only after [`EPHEMERAL_BIND_ATTEMPTS`]
+    /// whole-bind attempts, because memberlist's own port-0 pick is free for TCP, not for the
+    /// UDP socket it then binds on the same port.
     pub async fn start(
         cfg: GossipConfig,
         self_hint: ObservedPeerHint,
@@ -211,9 +240,23 @@ impl GossipNode {
             bind = %cfg.bind_addr,
         );
         let outer = span.clone();
-        async move { Self::start_instrumented(cfg, self_hint, span).await }
-            .instrument(outer)
-            .await
+        let ephemeral = cfg.bind_addr.port() == 0;
+        async move {
+            let mut attempt = 1;
+            loop {
+                match Self::start_instrumented(cfg.clone(), self_hint.clone(), span.clone()).await {
+                    Err(GossipError::Start(e))
+                        if ephemeral && attempt < EPHEMERAL_BIND_ATTEMPTS =>
+                    {
+                        tracing::debug!(attempt, error = %e, "gossip_ephemeral_bind_retry");
+                        attempt += 1;
+                    }
+                    result => return result,
+                }
+            }
+        }
+        .instrument(outer)
+        .await
     }
 
     async fn start_instrumented(
@@ -221,8 +264,25 @@ impl GossipNode {
         self_hint: ObservedPeerHint,
         span: Span,
     ) -> Result<Self, GossipError> {
+        // The advertised key set is derived from the keyring this node is about to build, not
+        // asked of the caller. A node advertising a set its keyring does not match would make a
+        // rotation impossible to follow safely — an operator promoting a key because every peer
+        // claims to accept it needs that claim to be the keyring's, not a copy of it somebody
+        // forgot to update (ADR-0028).
+        let mut cfg = cfg;
+        if let Some(primary) = cfg.secret_key {
+            let advertised = AcceptedGossipKeys::new(
+                std::iter::once(primary)
+                    .chain(cfg.accepted_keys.iter().copied())
+                    .map(|key| gossip_key_fingerprint(&key)),
+            );
+            cfg.extras
+                .get_or_insert_with(crate::HintExtras::default)
+                .accepted_gossip_keys = Some(advertised);
+        }
+
         // Enforce the metadata budget before memberlist can panic on it.
-        let encoded = encode_hint(&self_hint)?;
+        let encoded = encode_hint_with_extras(&self_hint, cfg.extras.as_ref())?;
 
         let self_id = SmolStr::new(cfg.node_id.to_string());
         let mut transport_opts = TransportOptions::new(self_id.clone());
@@ -245,6 +305,12 @@ impl GossipNode {
         if let Some(key) = cfg.secret_key {
             opts = opts
                 .with_primary_key(SecretKey::Aes256(key))
+                .with_secret_keys(
+                    cfg.accepted_keys
+                        .iter()
+                        .map(|k| SecretKey::Aes256(*k))
+                        .collect(),
+                )
                 .with_encryption_algo(EncryptionAlgorithm::NoPadding)
                 .with_gossip_verify_incoming(true)
                 .with_gossip_verify_outgoing(true);
@@ -293,6 +359,8 @@ impl GossipNode {
             join_attempts: cfg.join_attempts,
             join_retry_delay: cfg.join_retry_delay,
             broadcast_timeout: cfg.broadcast_timeout,
+            extras: Mutex::new(cfg.extras),
+            last_hint: Mutex::new(self_hint),
         };
 
         info!(
@@ -368,8 +436,12 @@ impl GossipNode {
     pub async fn update_hint(&self, hint: ObservedPeerHint) -> Result<(), GossipError> {
         let span = self.span.clone();
         async move {
-            let encoded = encode_hint(&hint)?;
+            let encoded = {
+                let extras = self.extras.lock().unwrap_or_else(|e| e.into_inner());
+                encode_hint_with_extras(&hint, extras.as_ref())?
+            };
             let size = encoded.len();
+            *self.last_hint.lock().unwrap_or_else(|e| e.into_inner()) = hint;
             self.delegate.set(encoded);
             self.inner
                 .update_node(self.broadcast_timeout)
@@ -380,6 +452,37 @@ impl GossipNode {
         }
         .instrument(span)
         .await
+    }
+
+    /// Change one slot of the advisory trailer and re-advertise (ruling M6-R18).
+    ///
+    /// A closure over the live value rather than a whole-value setter, because more than one
+    /// owner writes this struct while the node runs — `accepted_gossip_keys` on a key rotation
+    /// (ADR-0028), `policy_version` on a document rotation (ADR-0027) — and a setter would let
+    /// whichever wrote second quietly revert the other. Each caller edits only its own field.
+    ///
+    /// A trailer that has never been set starts from [`HintExtras::default`], so a node
+    /// configured without one can still begin advertising a slot later.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::update_hint`], whose path this takes: the new trailer is advertised with the
+    /// hint already in force, so a slot that pushes the metadata past the budget leaves the
+    /// previously advertised bytes untouched.
+    pub async fn update_extras(
+        &self,
+        edit: impl FnOnce(&mut crate::HintExtras) + Send,
+    ) -> Result<(), GossipError> {
+        {
+            let mut extras = self.extras.lock().unwrap_or_else(|e| e.into_inner());
+            edit(extras.get_or_insert_with(crate::HintExtras::default));
+        }
+        let hint = self
+            .last_hint
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.update_hint(hint).await
     }
 
     /// Leave the cluster gracefully, then stop the listeners and the refresher.
@@ -422,6 +525,206 @@ impl GossipNode {
     /// This node's stable id.
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// The gossip keys this node holds, or `None` when gossip on this node is unencrypted
+    /// (M6, ADR-0028).
+    pub fn keyring(&self) -> Option<GossipKeyring> {
+        self.inner.keyring().map(GossipKeyring::read)
+    }
+
+    /// Accept `key` on receive from now on, without signing with it.
+    ///
+    /// The first step of a rotation, and the only one that is safe to run node by node: a node
+    /// that merely accepts one more key can still be understood by every peer, so a half-done
+    /// sweep leaves a working cluster. Idempotent — `memberlist` treats re-adding a key it
+    /// already holds as a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::Keyring`] if gossip is unencrypted here, or
+    /// [`GossipError::HintTooLarge`]/[`GossipError::Advertise`] from re-advertising the
+    /// changed fingerprints — in which case the key **is** installed and only the
+    /// advertisement failed, so the operator is told rather than left believing nothing
+    /// happened.
+    pub async fn add_gossip_key(&self, key: &[u8; 32]) -> Result<GossipKeyring, GossipError> {
+        let keyring = self.require_keyring()?;
+        keyring.insert(SecretKey::Aes256(*key));
+        self.publish_keyring("added", gossip_key_fingerprint(key))
+            .await
+    }
+
+    /// Sign outgoing gossip with `key` from now on.
+    ///
+    /// The second step, and the dangerous one: run it before every peer accepts `key` and those
+    /// peers stop being able to read this node. `memberlist` refuses a key that was never added
+    /// here, which enforces the add-before-use half of that rule locally; the other half —
+    /// every *peer* having added it — is what [`GossipKeyring::accepted`] is advertised for.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::Keyring`] if gossip is unencrypted here or `key` was never added,
+    /// otherwise as [`Self::add_gossip_key`].
+    pub async fn use_gossip_key(&self, key: &[u8; 32]) -> Result<GossipKeyring, GossipError> {
+        let keyring = self.require_keyring()?;
+        let fingerprint = gossip_key_fingerprint(key);
+        keyring.use_key(key.as_slice()).map_err(|e| {
+            GossipError::Keyring(format!(
+                "cannot sign with gossip key {}: {e}",
+                fingerprint_hex(fingerprint)
+            ))
+        })?;
+        self.publish_keyring("promoted", fingerprint).await
+    }
+
+    /// Stop accepting `key`, completing the rotation.
+    ///
+    /// Refused while any advertised peer is still signing with `key` — because it accepts
+    /// nothing else, or because it has added the replacement but not yet promoted it (ruling
+    /// M6-R21). In both states this node would go deaf to that peer: after the removal nothing
+    /// here can decrypt what it sends. `force` overrules the check, which is what an operator
+    /// retiring a key after a node has been decommissioned needs, since a departed peer can
+    /// linger in the membership list until the failure detector catches up.
+    ///
+    /// # Errors
+    ///
+    /// [`GossipError::GossipKeyStillNeeded`] for the refusal above,
+    /// [`GossipError::Keyring`] if gossip is unencrypted here or `key` is the one being signed
+    /// with (`memberlist` refuses to remove the primary), otherwise as
+    /// [`Self::add_gossip_key`].
+    pub async fn remove_gossip_key(
+        &self,
+        key: &[u8; 32],
+        force: bool,
+    ) -> Result<GossipKeyring, GossipError> {
+        let keyring = self.require_keyring()?;
+        let fingerprint = gossip_key_fingerprint(key);
+        if !force {
+            let peers = self.peers_still_needing(fingerprint).await;
+            if peers > 0 {
+                return Err(GossipError::GossipKeyStillNeeded {
+                    fingerprint: fingerprint_hex(fingerprint),
+                    peers,
+                });
+            }
+        }
+        keyring.remove(key.as_slice()).map_err(|e| {
+            GossipError::Keyring(format!(
+                "cannot remove gossip key {}: {e}",
+                fingerprint_hex(fingerprint)
+            ))
+        })?;
+        self.publish_keyring("removed", fingerprint).await
+    }
+
+    /// The live keyring, or the refusal to give when gossip is not encrypted here.
+    fn require_keyring(&self) -> Result<&memberlist::keyring::Keyring, GossipError> {
+        self.inner.keyring().ok_or_else(|| {
+            GossipError::Keyring(
+                "gossip is not encrypted on this node; there is no keyring to rotate".to_string(),
+            )
+        })
+    }
+
+    /// How many advertised peers still need `fingerprint` — accept it and nothing else, or are
+    /// still signing with it (ruling M6-R21).
+    ///
+    /// Both clauses are the same outage seen from two stages of a rotation: a peer with no
+    /// other key cannot be read at all after the removal, and a peer that has added the new key
+    /// but not yet promoted it still *sends* under the old one, so it cannot be read either.
+    /// The second clause is the one an operator trips, because `add` and `remove` both look
+    /// node-local while only the `use` sweep changes what a peer signs with.
+    ///
+    /// Read from the peers' advertised metadata on demand rather than from the observation
+    /// snapshot, because the snapshot deliberately carries only [`ObservedPeerHint`] — the
+    /// advisory trailer is not part of what the Raft path is allowed to see. A peer that
+    /// advertises no trailer at all is not counted: it is running a build from before ADR-0028
+    /// and has never been told about a second key, so there is nothing here to protect.
+    ///
+    /// This node's own advertisement is skipped (critic-m6 delta N1): the caller is the one
+    /// removing the key, so counting itself would report one peer too many and, before the
+    /// `use` step, turn the keyring's own primary refusal into a peer refusal.
+    async fn peers_still_needing(&self, fingerprint: GossipKeyFingerprint) -> usize {
+        self.inner
+            .members()
+            .await
+            .iter()
+            .filter(|member| member.id() != &self.shared.self_id)
+            .map(|member| member.meta().as_bytes().to_vec())
+            .filter_map(|meta| decode_hint_extras(&meta))
+            .filter_map(|extras| extras.accepted_gossip_keys)
+            .filter(|keys| keys.is_sole(fingerprint) || keys.is_primary(fingerprint))
+            .count()
+    }
+
+    /// Re-advertise the changed key set and log the stage the rotation reached.
+    ///
+    /// The advertisement is the point: a rotation is a cluster-wide operation driven by an
+    /// operator who can only see what nodes publish, so a key added here that nobody can see
+    /// was added is a key they cannot safely promote.
+    async fn publish_keyring(
+        &self,
+        stage: &'static str,
+        key_fingerprint: GossipKeyFingerprint,
+    ) -> Result<GossipKeyring, GossipError> {
+        let state = self.keyring().ok_or_else(|| {
+            GossipError::Keyring("gossip keyring disappeared mid-rotation".to_string())
+        })?;
+        let advertised = AcceptedGossipKeys::new(state.accepted.iter().copied());
+        self.update_extras(|extras| extras.accepted_gossip_keys = Some(advertised))
+            .await?;
+        info!(
+            stage,
+            key_fingerprint = %fingerprint_hex(key_fingerprint),
+            primary = %fingerprint_hex(state.primary),
+            accepted_keys = state.accepted.len(),
+            "gossip_key_rotated"
+        );
+        Ok(state)
+    }
+
+    /// The raw metadata every member currently advertises, this node included.
+    ///
+    /// Deliberately raw: it is asserted by a test against what is *on the wire* (ADR-0030
+    /// M6-85), and handing back decoded values would assert this crate's decoder against
+    /// itself instead of against the bytes a peer actually published. [`Self::keyring`]'s
+    /// removal check reads it too, and decodes only the one slot it owns.
+    pub async fn member_meta(&self) -> Vec<Vec<u8>> {
+        self.inner
+            .members()
+            .await
+            .iter()
+            .map(|member| member.meta().as_bytes().to_vec())
+            .collect()
+    }
+}
+
+/// What a node's gossip keyring holds, in fingerprints (M6, ADR-0028).
+///
+/// Fingerprints and never key bytes: this value is logged, advertised in the gossip trailer and
+/// returned over the admin plane, so every one of its fields has to be safe to publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GossipKeyring {
+    /// The key outgoing gossip is signed with.
+    pub primary: GossipKeyFingerprint,
+    /// Every key accepted on receive, primary first — a superset of [`Self::primary`], because
+    /// a node always accepts what it signs with. "Primary first" is `memberlist`'s ordering,
+    /// recorded UNVERIFIED by ruling M6-R5 and evidenced here by `m6_57`, which asserts
+    /// `accepted[0] == primary` after a promotion; the removal refusal reads slot 0, so the
+    /// claim is load-bearing rather than decorative (ruling M6-R21).
+    pub accepted: Vec<GossipKeyFingerprint>,
+}
+
+impl GossipKeyring {
+    /// Read the live `memberlist` keyring into fingerprints.
+    fn read(keyring: &memberlist::keyring::Keyring) -> Self {
+        Self {
+            primary: gossip_key_fingerprint(keyring.primary_key().as_ref()),
+            accepted: keyring
+                .keys()
+                .map(|key| gossip_key_fingerprint(key.as_ref()))
+                .collect(),
+        }
     }
 }
 

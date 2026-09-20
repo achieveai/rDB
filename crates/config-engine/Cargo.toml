@@ -5,11 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "rEtcd node engine: OpenRaft lifecycle, formation, linearizable reads, peer transport contract, NetFault"
 
+[features]
+# Harness-only back doors, for test-plan rows that must reach a state no supported path can
+# produce (M6-101). Never enabled by the daemon: `config-server` depends on this crate without
+# it, so the code below is not even compiled into a release binary.
+testing = []
+
 [dependencies]
 bytes = { workspace = true }
 config-core = { workspace = true }
 config-log = { workspace = true }
 config-storage = { workspace = true }
+futures-core = { workspace = true }
 openraft = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -19,6 +26,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# This crate's own integration tests, and only they, get the harness back doors.
+config-engine = { path = ".", features = ["testing"] }
+futures = { workspace = true }
 # Test-only: a same-id restart on a fresh EphemeralStore is a legal log revert here, and
 # openraft's debug_assert would otherwise abort the leader (ADR-0008 note, M1-43).
 openraft = { workspace = true, features = ["loosen-follower-log-revert"] }

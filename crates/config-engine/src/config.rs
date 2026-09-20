@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use config_core::{Authz, ClusterIdentity, Durability, Limits, TransportSecurity};
-use config_storage::{EphemeralStore, RocksStore, StateReader};
+use config_core::{Authz, ClusterIdentity, Durability, Limits, TransportSecurity, WatchRetention};
+use config_storage::{EphemeralStore, RocksStore, SnapshotConfig, StateReader};
 
 /// How many log entries one `AppendEntries` may carry (`openraft::Config::max_payload_entries`).
 ///
@@ -71,6 +71,15 @@ pub enum AuthzKind {
     Development,
     /// The deployment-managed static prefix allowlist.
     StaticAllowlist,
+    /// The signed, versioned RBAC document (M6, spec §15.3, ADR-0027).
+    SignedPolicy,
+    /// `authz.mode = "signed"` is configured and no document could be loaded or validated.
+    ///
+    /// Distinct from [`AuthzKind::Missing`]/[`AuthzKind::Invalid`], which describe the *static*
+    /// model's failures: a signed-mode node in this state must still report
+    /// [`Authz::SignedPolicy`] with no version, because reporting `StaticAllowlist` would name a
+    /// model it is not running (ADR-0016, test plan M6-38).
+    NoValidPolicy,
     /// A policy was required and none was supplied.
     Missing,
     /// A policy was supplied but could not be parsed or validated.
@@ -80,10 +89,25 @@ pub enum AuthzKind {
 impl AuthzKind {
     /// Whether an authorization model is actually in force.
     ///
-    /// `false` makes the node unready and turns every client call into
-    /// [`config_core::ConfigError::PermissionDenied`].
+    /// `false` makes the node unready. A static model's client calls then fail with
+    /// [`config_core::ConfigError::PermissionDenied`]; signed mode's fail with
+    /// [`config_core::ConfigError::Unavailable`], because a node with no valid document is
+    /// declining traffic rather than making an authorization decision (ADR-0027, M6-25).
     pub const fn is_present(self) -> bool {
-        matches!(self, AuthzKind::Development | AuthzKind::StaticAllowlist)
+        matches!(
+            self,
+            AuthzKind::Development | AuthzKind::StaticAllowlist | AuthzKind::SignedPolicy
+        )
+    }
+
+    /// Whether this model's presence is decided at runtime rather than at startup.
+    ///
+    /// Signed mode is the only one: a node wired for it is [`AuthzKind::SignedPolicy`] or
+    /// [`AuthzKind::NoValidPolicy`] according to whether its authorizer holds a document *right
+    /// now*, and a document can arrive — or a rotation can be refused — long after start. Every
+    /// other model is fixed by the configuration and answers from it (M6-27, C6R-01).
+    pub const fn is_signed_mode(self) -> bool {
+        matches!(self, AuthzKind::SignedPolicy | AuthzKind::NoValidPolicy)
     }
 
     /// Stable snake_case name for log and health fields.
@@ -91,8 +115,29 @@ impl AuthzKind {
         match self {
             AuthzKind::Development => "development",
             AuthzKind::StaticAllowlist => "static_allowlist",
+            AuthzKind::SignedPolicy => "signed_policy",
+            AuthzKind::NoValidPolicy => "no_valid_policy",
             AuthzKind::Missing => "missing",
             AuthzKind::Invalid => "invalid",
+        }
+    }
+
+    /// The capability this model reports, given the version it is currently enforcing (M6).
+    ///
+    /// The version is a parameter rather than a field on the enum because the enum describes the
+    /// *model* a node was wired with, which never changes, while the version changes on every
+    /// reload. Passing it here is what lets `ConfigNode::capabilities` report the live number
+    /// from its authorizer instead of a stale one captured at startup — a capability that can lie
+    /// is worse than no capability at all (ADR-0016, M6-38).
+    pub const fn to_capability(self, policy_version: Option<u64>) -> Authz {
+        match self {
+            AuthzKind::Development => Authz::Development,
+            AuthzKind::SignedPolicy | AuthzKind::NoValidPolicy => {
+                Authz::SignedPolicy { policy_version }
+            }
+            AuthzKind::StaticAllowlist | AuthzKind::Missing | AuthzKind::Invalid => {
+                Authz::StaticAllowlist
+            }
         }
     }
 }
@@ -108,14 +153,12 @@ impl From<AuthzKind> for Authz {
     /// models a node can *enforce*, and those two mean it enforces none. They report
     /// [`Authz::StaticAllowlist`], the deny-everything end of the scale, so a capability
     /// reader can never mistake a policy-less node for a permissive one. The honest,
-    /// unambiguous answer is [`crate::HealthPayload::authz_kind`], which keeps all four.
+    /// unambiguous answer is [`crate::HealthPayload::authz_kind`], which keeps all six.
+    ///
+    /// Reports no policy version, because a bare [`AuthzKind`] does not carry one. A caller that
+    /// holds the authorizer uses [`AuthzKind::to_capability`] instead.
     fn from(k: AuthzKind) -> Self {
-        match k {
-            AuthzKind::Development => Authz::Development,
-            AuthzKind::StaticAllowlist | AuthzKind::Missing | AuthzKind::Invalid => {
-                Authz::StaticAllowlist
-            }
-        }
+        k.to_capability(None)
     }
 }
 
@@ -150,6 +193,12 @@ pub struct NodeConfig {
     pub gossip_poll: Duration,
     /// Which authorization model is active, for [`config_core::Capabilities`].
     pub authz_kind: AuthzKind,
+    /// What this node advertises and enforces on all three planes (M6, ADR-0030).
+    ///
+    /// [`config_core::CURRENT_SCHEMA`] for an ordinary node; [`config_core::COMPAT_SCHEMA_1`]
+    /// for one started with `--compat-schema 1`, which then proposes no command that needs the
+    /// newer envelope and holds the cluster minimum down for every other voter (M6-89).
+    pub schema: config_core::SchemaTriple,
     /// How many grant rules the allowlist this node was wired with holds (M3-42).
     ///
     /// Supplied rather than derived: the node holds an `Arc<dyn Authorizer>`, and a trait
@@ -170,6 +219,30 @@ pub struct NodeConfig {
     pub transport_security: TransportSecurity,
     /// OpenRaft's `cluster_name`, used only in its own log lines.
     pub cluster_name: String,
+    /// When the leader proposes a `Compact` (M4, ADR-0019).
+    ///
+    /// Leader-local policy, not replicated state: two voters with different retention differ
+    /// only in when they would propose, and `Compact` itself is replicated.
+    pub watch_retention: WatchRetention,
+    /// The progress interval a `Watch` request gets when it asks for none (M4, ADR-0020).
+    pub watch_progress_interval: Duration,
+    /// When a snapshot is built, how much snapshot-covered log survives it, and how many
+    /// snapshot files are kept (M5, ADR-0022).
+    ///
+    /// Defaults to [`SnapshotConfig::DISABLED`], not to the production profile. An enabled
+    /// policy is only safe on a store that can actually build, install and serve a snapshot,
+    /// and [`crate::ConfigNode::start`] enforces that rather than trusting the caller: see
+    /// [`NodeConfig::effective_snapshot`].
+    pub snapshot: SnapshotConfig,
+    /// How far behind the leader a learner may still be and still be promotable (M5,
+    /// ADR-0023, architecture A5, `[membership] promote_max_lag`).
+    ///
+    /// Leader-local policy, like [`NodeConfig::watch_retention`]: it decides whether *this*
+    /// node will propose a promotion, and the promotion itself is an ordinary replicated
+    /// membership change. Evaluated live at promote time against `RaftMetrics.replication`,
+    /// never against a cached figure — the only catch-up oracle openraft offers is the
+    /// leader's own replication map (research §3.3, OQ-50).
+    pub promote_max_lag: u64,
 }
 
 impl NodeConfig {
@@ -185,10 +258,52 @@ impl NodeConfig {
             write_timeout: Duration::from_secs(10),
             gossip_poll: Duration::from_secs(1),
             authz_kind: AuthzKind::Development,
+            schema: config_core::CURRENT_SCHEMA,
             policy_grants: 0,
             policy_document_sha256: None,
             transport_security: TransportSecurity::Insecure,
             cluster_name: "retcd".to_string(),
+            watch_retention: WatchRetention::DEFAULT,
+            watch_progress_interval: crate::watch::DEFAULT_PROGRESS_INTERVAL,
+            snapshot: SnapshotConfig::DISABLED,
+            promote_max_lag: crate::admin::DEFAULT_PROMOTE_MAX_LAG,
+        }
+    }
+
+    /// Enable snapshots and log purge with an explicit policy (M5).
+    ///
+    /// Refuses a configuration whose three OpenRaft knobs disagree, because the interesting
+    /// half-application is *silent*: `LogsSinceLast(n)` with `logs_to_keep = u64::MAX` builds
+    /// snapshots forever and never purges anything, with no error and an unbounded log.
+    pub fn with_snapshots(
+        mut self,
+        snapshot: SnapshotConfig,
+    ) -> Result<Self, config_storage::SnapshotConfigError> {
+        snapshot.validate()?;
+        self.snapshot = snapshot;
+        Ok(self)
+    }
+
+    /// The snapshot policy this node will actually run with, given the store it runs on.
+    ///
+    /// An [`StorageHandle::Ephemeral`] store cannot build, receive or serve a snapshot, and
+    /// OpenRaft treats a failed `build_snapshot` as **fatal** — so a snapshot policy on an
+    /// ephemeral node is not a degraded configuration, it is a node that shuts down the first
+    /// time `LogsSinceLast` fires. Forcing [`SnapshotConfig::DISABLED`] here (and warning) is
+    /// the difference between a test harness that ignores an inapplicable setting and one that
+    /// dies of it.
+    pub fn effective_snapshot(&self, storage: &StorageHandle) -> SnapshotConfig {
+        match storage {
+            StorageHandle::Rocks(_) => self.snapshot,
+            StorageHandle::Ephemeral(_) => {
+                if self.snapshot.enabled() {
+                    tracing::warn!(
+                        reason = "ephemeral_storage",
+                        "snapshot policy ignored; this store cannot build snapshots"
+                    );
+                }
+                SnapshotConfig::DISABLED
+            }
         }
     }
 
@@ -232,25 +347,45 @@ impl NodeConfig {
     /// `max_payload_entries` is [`MAX_PAYLOAD_ENTRIES`] rather than OpenRaft's default; see
     /// that constant for why the transport's receive cap depends on it.
     ///
-    /// # Why the log is never purged
+    /// # Snapshots and purge move together (M5, ADR-0022)
     ///
-    /// `SnapshotPolicy::Never` is the load-bearing setting: OpenRaft only ever purges below a
-    /// snapshot, so with no snapshot `calc_purge_upto` returns `None` and `purge` is never
-    /// called. `max_in_snapshot_log_to_keep = u64::MAX` is belt and braces for the same
-    /// invariant — if a snapshot ever did appear, it would ask to keep every entry that
-    /// snapshot covers rather than none of them (ADR-0008). The previous value of `0` read as
-    /// "keep nothing", which is the opposite of what a store with no `install_snapshot` can
-    /// survive.
+    /// Three OpenRaft settings decide whether this node ever builds a snapshot and whether it
+    /// ever deletes a log entry, and they are **one** decision, not three:
+    ///
+    /// * `snapshot_policy` — `Never` when [`SnapshotConfig::logs_since_last`] is `0`,
+    ///   `LogsSinceLast(n)` otherwise. With `Never` no snapshot is ever built, so
+    ///   `calc_purge_upto` has nothing to purge below and `purge` is never called at all.
+    /// * `max_in_snapshot_log_to_keep` — `u64::MAX` is the second half of the M0–M4 latch:
+    ///   `calc_purge_upto` subtracts it with `saturating_sub`, so the purge end lands on `0`
+    ///   and nothing is scheduled *even if* a snapshot somehow existed.
+    /// * `purge_batch_size` — a **minimum**, not a chunk size: no purge happens until at least
+    ///   this many entries would go.
+    ///
+    /// Changing one without the others is the failure worth naming: `LogsSinceLast(n)` with
+    /// `u64::MAX` retention builds snapshots forever and purges nothing, silently, with an
+    /// unbounded log. [`SnapshotConfig::validate`] refuses that combination at configuration
+    /// time, which is why [`NodeConfig::with_snapshots`] returns a `Result`.
     pub fn openraft_config(&self) -> openraft::Config {
         openraft::Config {
             cluster_name: self.cluster_name.clone(),
             heartbeat_interval: self.raft.heartbeat_ms,
             election_timeout_min: self.raft.election_min_ms,
             election_timeout_max: self.raft.election_max_ms,
-            snapshot_policy: openraft::SnapshotPolicy::Never,
+            snapshot_policy: if self.snapshot.enabled() {
+                openraft::SnapshotPolicy::LogsSinceLast(self.snapshot.logs_since_last)
+            } else {
+                openraft::SnapshotPolicy::Never
+            },
             max_payload_entries: MAX_PAYLOAD_ENTRIES,
-            max_in_snapshot_log_to_keep: u64::MAX,
-            purge_batch_size: 1,
+            // Capped at one request's worth of bytes, not left at openraft's 3 MiB default
+            // (M5). The peer codec is sized from `max_request_bytes * MAX_PAYLOAD_ENTRIES`
+            // (`config_grpc::peer_plane_message_limit`), so a chunk no larger than a single
+            // request provably fits inside it on every node — and a chunk that does not fit
+            // fails the transfer at the codec, after the leader has already read it.
+            snapshot_max_chunk_size: (self.limits.max_request_bytes as u64)
+                .min(openraft::Config::default().snapshot_max_chunk_size),
+            max_in_snapshot_log_to_keep: self.snapshot.logs_to_keep,
+            purge_batch_size: self.snapshot.purge_batch_size,
             enable_tick: true,
             enable_heartbeat: true,
             enable_elect: true,
@@ -358,6 +493,31 @@ impl StorageHandle {
         match self {
             StorageHandle::Ephemeral(s) => s.traces(),
             StorageHandle::Rocks(s) => s.traces(),
+        }
+    }
+
+    /// How many snapshot builds this store has started and not yet finished (M5, OQ-44).
+    ///
+    /// Derived rather than held as a gauge, because the store counts events, not states:
+    /// builds *started* minus the ones that published minus the ones that failed. Installs
+    /// publish through the same counter, so they are subtracted back out — an install is not
+    /// a build, and counting it as one would make `TriggerSnapshot` claim a build was running
+    /// on a node that had merely received one.
+    ///
+    /// Saturating throughout: the three counters are read without a lock, so a build that
+    /// publishes between two loads must round to "nothing in flight" rather than underflow.
+    pub fn snapshot_builds_in_flight(&self) -> u64 {
+        match self {
+            // No builder, so never building (`NoSnapshots`).
+            StorageHandle::Ephemeral(_) => 0,
+            StorageHandle::Rocks(s) => {
+                let m = s.metrics();
+                let published_by_builds =
+                    m.snapshot_publications.saturating_sub(m.snapshot_installs);
+                s.snapshot_build_calls()
+                    .saturating_sub(published_by_builds)
+                    .saturating_sub(m.snapshot_build_failures)
+            }
         }
     }
 }

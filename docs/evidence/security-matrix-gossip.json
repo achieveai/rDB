@@ -1,0 +1,76 @@
+{
+  "schema": 1,
+  "name": "security-matrix-gossip",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "ff5c821785b05d4ff415e2fd7cf1e4cd059b5890",
+    "dirty": true,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-09-20T00:56:42Z",
+    "duration_ms": 1002,
+    "seed": 27958,
+    "scale_factor": 0.3333333333333333,
+    "full_scale": false
+  },
+  "values": {
+    "cases_driven": 6,
+    "cases_enumerated": 6,
+    "membership_unchanged": true,
+    "repeats": 1,
+    "rows": [
+      {
+        "case": "stale_packets",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "stale hints never reached Raft",
+        "repeat": 0
+      },
+      {
+        "case": "poisoned_endpoint",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "hint ignored; 0 peers before",
+        "repeat": 0
+      },
+      {
+        "case": "all_seeds_unavailable",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "formed cluster kept leader 1",
+        "repeat": 0
+      },
+      {
+        "case": "false_suspicion",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "suspicion is advisory",
+        "repeat": 0
+      },
+      {
+        "case": "one_way_loss",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "cluster kept serving: true",
+        "repeat": 0
+      },
+      {
+        "case": "gossip_key_rotation",
+        "driven": true,
+        "outcome": "refused or ignored; nothing written",
+        "reason": "rotated to a new primary across 3 nodes",
+        "repeat": 0
+      }
+    ]
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

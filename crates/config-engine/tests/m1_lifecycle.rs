@@ -86,6 +86,7 @@ async fn m1_40_node_lifecycle_configure_start_client_health_stop() {
                 .delete(config_core::DeleteRequest {
                     key: common::key("/a/k"),
                     expected_mod_revision: None,
+                    dedup: None,
                 })
                 .await
                 .err(),
@@ -136,11 +137,13 @@ fn m1_41_library_creates_no_global_runtime() {
     );
     let outside = poll_once_off_runtime(async {
         let identity = identity(1);
+        let watch = config_engine::WatchHub::with_defaults(config_core::Limits::DEFAULT.watch);
         let store = EphemeralStore::new(
             identity,
             config_core::Limits::DEFAULT,
             Arc::new(NoFaults),
             tracing::Span::none(),
+            Arc::clone(&watch) as Arc<dyn config_storage::AppliedBatchSink>,
         );
         ConfigNode::start(
             NodeConfig::new(identity, InProcTransport::endpoint(identity.node_id)),
@@ -148,6 +151,7 @@ fn m1_41_library_creates_no_global_runtime() {
             Arc::new(InProcTransport::new(config_engine::NetFault::new())),
             Arc::new(NoGossip),
             Arc::new(config_core::AllowAll),
+            watch,
         )
         .await
     });

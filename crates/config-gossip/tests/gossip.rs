@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 use config_core::hint::{GossipObservationSource, Liveness, ObservedPeerHint};
 use config_core::identity::{ClusterId, NodeId, RecoveryEpoch};
 use config_gossip::{
-    decode_hint, encode_hint, GossipConfig, GossipError, GossipNode, HintDecodeError,
-    StaticObservationSource, HINT_WIRE_VERSION, MAX_HINT_BYTES,
+    decode_hint, decode_hint_extras, encode_hint, gossip_key_fingerprint, AcceptedGossipKeys,
+    GossipConfig, GossipError, GossipNode, HintDecodeError, HintExtras, StaticObservationSource,
+    HINT_WIRE_VERSION, MAX_HINT_BYTES,
 };
 
 const KEY_A: [u8; 32] = [0x11; 32];
@@ -139,6 +140,39 @@ async fn poll_until(limit: Duration, interval: Duration, mut check: impl FnMut()
     }
 }
 
+/// [`poll_until`] for a condition that has to `await` to answer — `member_meta` is async
+/// because it asks memberlist for the current member list.
+async fn poll_until_async<Check, Answer>(
+    limit: Duration,
+    interval: Duration,
+    mut check: Check,
+) -> bool
+where
+    Check: FnMut() -> Answer,
+    Answer: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + limit;
+    loop {
+        if check().await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(interval).await; // testkit:allow-sleep
+    }
+}
+
+/// What `observer` currently believes node `id` advertises in its advisory trailer.
+async fn trailer_for(observer: &GossipNode, id: u64) -> Option<HintExtras> {
+    observer
+        .member_meta()
+        .await
+        .into_iter()
+        .find(|meta| decode_hint(meta).is_ok_and(|hint| hint.node_id == NodeId(id)))
+        .and_then(|meta| decode_hint_extras(&meta))
+}
+
 /// Assert `check` never becomes true for `limit`.
 async fn stays_false(limit: Duration, interval: Duration, mut check: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + limit;
@@ -234,6 +268,85 @@ async fn m1_gossip_01_two_nodes_observe_each_other() {
         "updated hint did not propagate within {:?}{}",
         t.converge(),
         snapshots(&[("a", &a), ("b", &b)])
+    );
+
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
+/// Ruling M6-R18: one owner changes one slot of the advisory trailer while the node runs, the
+/// change reaches the peers, and the slots that owner does not own are left exactly as they
+/// were.
+///
+/// Both halves are the point. Without the re-advertisement a node would keep publishing the
+/// trailer it booted with — the whole reason `policy_version` is on the wire is that it moves
+/// (ADR-0027 §15.3) — and without the closure form the second of two rotations in flight would
+/// silently revert the first (ADR-0028's key set and ADR-0027's version change independently).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_r18_update_extras_changes_one_slot_and_re_advertises() {
+    let t = TestTimers::fast();
+    let a = GossipNode::start(t.config(cluster(), 1, KEY_A), hint(1))
+        .await
+        .expect("node a starts");
+
+    // Derived, not chosen. `GossipNode::start` fills this slot from the keyring it builds, so
+    // the only value node b can advertise is the fingerprint of the key it gossips with
+    // (ADR-0028). It still serves this row's purpose — a slot whose owner is not the caller of
+    // `update_extras` — and it now also proves the two cannot be set to disagree.
+    let keys = AcceptedGossipKeys::new([gossip_key_fingerprint(&KEY_A)]);
+    let booted = HintExtras {
+        schema: Some(config_core::CURRENT_SCHEMA),
+        accepted_gossip_keys: Some(keys),
+        policy_version: None,
+    };
+    let mut cfg_b = t.config(cluster(), 2, KEY_A);
+    cfg_b.seeds = vec![a.advertise_addr()];
+    cfg_b.extras = Some(booted);
+    let b = GossipNode::start(cfg_b, hint(2))
+        .await
+        .expect("node b starts");
+
+    let seen = poll_until_async(t.converge(), t.poll_interval(), || async {
+        trailer_for(&a, 2).await == Some(booted)
+    })
+    .await;
+    assert!(
+        seen,
+        "node a never saw node b's booted trailer within {:?}{}",
+        t.converge(),
+        snapshots(&[("a", &a), ("b", &b)])
+    );
+
+    b.update_extras(|extras| extras.policy_version = Some(8))
+        .await
+        .expect("re-advertise the changed trailer");
+
+    let propagated = poll_until_async(t.converge(), t.poll_interval(), || async {
+        trailer_for(&a, 2)
+            .await
+            .and_then(|extras| extras.policy_version)
+            == Some(8)
+    })
+    .await;
+    assert!(
+        propagated,
+        "the changed policy_version did not propagate within {:?}{}",
+        t.converge(),
+        snapshots(&[("a", &a), ("b", &b)])
+    );
+
+    let extras = trailer_for(&a, 2)
+        .await
+        .expect("node a holds node b's trailer");
+    assert_eq!(
+        extras.schema,
+        Some(config_core::CURRENT_SCHEMA),
+        "a slot this caller does not own must survive its edit"
+    );
+    assert_eq!(
+        extras.accepted_gossip_keys,
+        Some(keys),
+        "and so must the other owner's, or two rotations in flight would undo each other"
     );
 
     b.shutdown().await;
@@ -689,4 +802,246 @@ fn a10_recovery_epoch_round_trips_over_the_gossip_wire() {
         enc_max.len()
     );
     assert_eq!(decode_hint(&enc_max).expect("decode"), at_max);
+}
+
+/// M6-57/M6-58: a key must be accepted before it can be signed with, and the keyring says so.
+///
+/// One node is enough for the ordering rule: `use_key` is refused for a key that was never
+/// added *here*, which is the half of ADR-0028's add-before-use rule that a node can enforce on
+/// its own. The other half — every peer having added it — is what the advertised fingerprints
+/// exist for, and M6-58's cluster row covers that.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_57_a_gossip_key_must_be_accepted_before_it_is_signed_with() {
+    let timers = TestTimers::fast();
+    let old = [0x11; 32];
+    let new = [0x22; 32];
+    let node = GossipNode::start(timers.config(cluster(), 1, old), hint(1))
+        .await
+        .expect("start");
+
+    let before = node.keyring().expect("an encrypted node has a keyring");
+    assert_eq!(before.accepted.len(), 1, "{before:#?}");
+
+    let refused = node
+        .use_gossip_key(&new)
+        .await
+        .expect_err("a key nobody added cannot be signed with");
+    assert!(
+        matches!(refused, GossipError::Keyring(ref detail) if !detail.contains("22")),
+        "the refusal must name the key by fingerprint, never by value: {refused}"
+    );
+
+    let added = node.add_gossip_key(&new).await.expect("add");
+    assert_eq!(added.primary, before.primary, "adding does not promote");
+    assert_eq!(added.accepted.len(), 2, "{added:#?}");
+
+    let promoted = node.use_gossip_key(&new).await.expect("use");
+    assert_ne!(promoted.primary, before.primary, "{promoted:#?}");
+    assert_eq!(
+        promoted.accepted.len(),
+        2,
+        "promoting swaps which key signs, it does not drop the other: {promoted:#?}"
+    );
+    assert_eq!(
+        promoted.accepted[0], promoted.primary,
+        "the primary is advertised first, so a peer comparing sets sees it first: {promoted:#?}"
+    );
+
+    node.shutdown().await;
+}
+
+/// M6-59: a key a peer has nothing else to fall back on is not removable without `force`.
+///
+/// Two nodes, mid-rotation, in exactly the state that makes the removal dangerous. Node 1 has
+/// finished its half — it holds both keys and signs with the new one. Node 2 has not started:
+/// it holds only the old key. Node 1 can still *read* node 2, which signs with the old key node
+/// 1 still accepts, so node 2's advertisement is visible and says that old key is all it has.
+/// Dropping it there is what would make node 2 unreadable, and that is the refusal.
+///
+/// `force` is the escape hatch for the case the check cannot distinguish: a peer that is gone
+/// but has not yet timed out of the membership list looks exactly like a peer that is behind.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_59_removing_the_last_key_a_peer_accepts_is_refused() {
+    let timers = TestTimers::fast();
+    let old = [0x33; 32];
+    let new = [0x44; 32];
+
+    let one = GossipNode::start(timers.config(cluster(), 1, old), hint(1))
+        .await
+        .expect("start 1");
+    let mut two_cfg = timers.config(cluster(), 2, old);
+    two_cfg.seeds = vec![one.advertise_addr()];
+    let two = GossipNode::start(two_cfg, hint(2)).await.expect("start 2");
+    assert!(
+        poll_until(timers.converge(), timers.poll_interval(), || find(
+            &one.peers(),
+            2
+        )
+        .is_some_and(|h| h.liveness == Liveness::Alive))
+        .await,
+        "node 2 never became visible within {:?}{}",
+        timers.converge(),
+        snapshots(&[("one", &one), ("two", &two)])
+    );
+
+    // Node 1 finishes its half of the rotation; node 2 has not begun its own.
+    one.add_gossip_key(&new).await.expect("add");
+    one.use_gossip_key(&new).await.expect("use");
+
+    let refused = one
+        .remove_gossip_key(&old, false)
+        .await
+        .expect_err("node 2 accepts nothing else");
+    assert!(
+        matches!(refused, GossipError::GossipKeyStillNeeded { peers, .. } if peers >= 1),
+        "expected the sole-key refusal, got {refused}"
+    );
+    assert!(
+        !refused.to_string().contains("33"),
+        "the refusal names the key by fingerprint, never by value: {refused}"
+    );
+
+    // The operator who knows that peer is gone says so, and the removal goes through.
+    let after = one.remove_gossip_key(&old, true).await.expect("forced");
+    assert_eq!(after.accepted.len(), 1, "{after:#?}");
+    assert_eq!(after.accepted[0], after.primary, "{after:#?}");
+
+    two.shutdown().await;
+    one.shutdown().await;
+}
+
+/// M6-R21: a key a peer is still *signing* with is not removable either, not just a key that
+/// peer has nothing else to fall back on.
+///
+/// The window this covers is the one an operator actually lands in. After the `add` sweep and
+/// before the `use` sweep every peer advertises both keys — `is_sole` is false everywhere —
+/// while every peer is still signing with the old one. Removing it there makes this node deaf
+/// to all of them, which is the outage the refusal exists to prevent, so the refusal has to
+/// read the peer's advertised primary and not only its set size.
+///
+/// Node 2 is driven through the two sweeps one stage at a time: `add` (refusal must hold),
+/// then `use` (removal must be allowed). Both halves are asserted against what node 1 can
+/// *see*, so the row proves the refusal reads the wire rather than local state.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_r21_removing_a_key_a_peer_still_signs_with_is_refused() {
+    let timers = TestTimers::fast();
+    let old = [0x3a; 32];
+    let new = [0x4b; 32];
+    let new_fingerprint = gossip_key_fingerprint(&new);
+
+    let one = GossipNode::start(timers.config(cluster(), 1, old), hint(1))
+        .await
+        .expect("start 1");
+    let mut two_cfg = timers.config(cluster(), 2, old);
+    two_cfg.seeds = vec![one.advertise_addr()];
+    let two = GossipNode::start(two_cfg, hint(2)).await.expect("start 2");
+    assert!(
+        poll_until(timers.converge(), timers.poll_interval(), || find(
+            &one.peers(),
+            2
+        )
+        .is_some_and(|h| h.liveness == Liveness::Alive))
+        .await,
+        "node 2 never became visible within {:?}{}",
+        timers.converge(),
+        snapshots(&[("one", &one), ("two", &two)])
+    );
+
+    // The `add` sweep completes everywhere: both nodes hold both keys, both still sign with
+    // the old one, and node 1 then finishes its own half by promoting the new key.
+    two.add_gossip_key(&new).await.expect("add on 2");
+    one.add_gossip_key(&new).await.expect("add on 1");
+    one.use_gossip_key(&new).await.expect("use on 1");
+    assert!(
+        poll_until_async(timers.converge(), timers.poll_interval(), || async {
+            trailer_for(&one, 2)
+                .await
+                .and_then(|extras| extras.accepted_gossip_keys)
+                .is_some_and(|keys| keys.len() == 2)
+        })
+        .await,
+        "node 1 never saw node 2 advertise both keys within {:?}{}",
+        timers.converge(),
+        snapshots(&[("one", &one), ("two", &two)])
+    );
+
+    let refused = one
+        .remove_gossip_key(&old, false)
+        .await
+        .expect_err("node 2 is still signing with the old key");
+    assert!(
+        matches!(refused, GossipError::GossipKeyStillNeeded { peers, .. } if peers >= 1),
+        "expected the still-needed refusal mid-sweep, got {refused}"
+    );
+
+    // The `use` sweep completes: node 2 now signs with the new key and the old one is only a
+    // fallback, which is exactly when dropping it is safe.
+    two.use_gossip_key(&new).await.expect("use on 2");
+    assert!(
+        poll_until_async(timers.converge(), timers.poll_interval(), || async {
+            trailer_for(&one, 2)
+                .await
+                .and_then(|extras| extras.accepted_gossip_keys)
+                .is_some_and(|keys| keys.iter().next() == Some(new_fingerprint))
+        })
+        .await,
+        "node 1 never saw node 2 promote the new key within {:?}{}",
+        timers.converge(),
+        snapshots(&[("one", &one), ("two", &two)])
+    );
+
+    let after = one
+        .remove_gossip_key(&old, false)
+        .await
+        .expect("every peer has completed the use sweep");
+    assert_eq!(after.accepted.len(), 1, "{after:#?}");
+    assert_eq!(after.accepted[0], after.primary, "{after:#?}");
+
+    two.shutdown().await;
+    one.shutdown().await;
+}
+
+/// The trailer a peer reads must be the keyring, not a copy of it that a rotation forgot to
+/// update. Asserted off `member_meta`, which is the bytes actually advertised.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_58_a_rotation_advertises_the_keys_it_now_accepts() {
+    let timers = TestTimers::fast();
+    let node = GossipNode::start(timers.config(cluster(), 1, [0x55; 32]), hint(1))
+        .await
+        .expect("start");
+
+    let keyring = node.add_gossip_key(&[0x66; 32]).await.expect("add");
+    let meta = node.member_meta().await;
+    let trailer = decode_hint_extras(meta.first().expect("this node advertises"))
+        .and_then(|extras| extras.accepted_gossip_keys)
+        .expect("a trailer after a rotation");
+    assert_eq!(
+        trailer,
+        AcceptedGossipKeys::new(keyring.accepted.iter().copied()),
+        "the advertised set must be the keyring's, in the keyring's order"
+    );
+
+    node.shutdown().await;
+}
+
+/// A node gossiping in plaintext has no keyring, and says so rather than reporting an empty one.
+/// "No keys" and "encryption is off" are different operator problems.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+async fn m6_60_an_unencrypted_node_has_no_keyring_to_rotate() {
+    let timers = TestTimers::fast();
+    let mut cfg = timers.config(cluster(), 1, [0x77; 32]);
+    cfg.secret_key = None;
+    let node = GossipNode::start(cfg, hint(1)).await.expect("start");
+
+    assert!(node.keyring().is_none());
+    let refused = node
+        .add_gossip_key(&[0x88; 32])
+        .await
+        .expect_err("nothing to add a key to");
+    assert!(
+        matches!(refused, GossipError::Keyring(ref detail) if detail.contains("not encrypted")),
+        "{refused}"
+    );
+
+    node.shutdown().await;
 }

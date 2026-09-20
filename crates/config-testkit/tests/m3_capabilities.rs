@@ -37,11 +37,16 @@ async fn m3_45_capabilities_exact_values_m3() {
         .expect("a leader elects");
 
     let caps = cluster.capabilities(leader);
+    // M4-111/M4-113 (test plan §3.10): Rocks + M4 reports `Retained`; this literal predates M4
+    // and went stale the moment the journal/watch surface landed. See the parallel fix and note
+    // in `m2_observability.rs::m2_49_rocks_reports_persistent`.
     assert_eq!(
         caps,
         Capabilities {
             durability: Durability::Persistent,
-            watch_resumption: WatchResumption::Unsupported,
+            watch_resumption: WatchResumption::Retained {
+                compact_revision_visible: true,
+            },
             authz: Authz::StaticAllowlist,
             transport_security: TransportSecurity::MutualTls,
             pagination: Pagination::Unsupported,

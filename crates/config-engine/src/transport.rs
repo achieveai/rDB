@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use config_core::{ClusterId, NodeId, RecoveryEpoch};
+use config_core::{
+    ClusterId, NodeId, RecoveryEpoch, SchemaTriple, COMPAT_SCHEMA_1, CURRENT_SCHEMA,
+};
 use config_log::TraceContext;
 use config_storage::{RaftNodeId, TypeConfig};
 use openraft::raft::{
@@ -133,6 +135,85 @@ pub trait PeerTransport: Send + Sync {
         req: PeerRequest,
         deadline: Duration,
     ) -> Result<PeerResponse, TransportError>;
+
+    /// The same call, carrying this node's schema and returning the peer's (ADR-0030, M6-86).
+    ///
+    /// A defaulted method rather than a field on [`PeerEnvelopeMeta`]: that struct is
+    /// constructed literally in a dozen places across four crates, most of them owned by other
+    /// work, and a new field would be a mechanical edit in every one of them for a value only
+    /// the peer plane reads.
+    ///
+    /// The default answers `None`, which every caller must read as "schema 1" rather than as an
+    /// error — that is exactly how a genuinely older peer behaves, and the safe direction
+    /// (M6-86, M6-89).
+    async fn send_with_schema(
+        &self,
+        meta: PeerEnvelopeMeta,
+        endpoint: &str,
+        req: PeerRequest,
+        deadline: Duration,
+        schema: SchemaTriple,
+    ) -> Result<(PeerResponse, Option<SchemaTriple>), TransportError> {
+        let _ = schema;
+        self.send(meta, endpoint, req, deadline)
+            .await
+            .map(|response| (response, None))
+    }
+}
+
+/// The schema each peer was last observed to advertise, on the peer plane only.
+///
+/// Leader-local and never replicated (OQ-63, M6-R4). An entry is never removed: a voter the
+/// leader can no longer reach keeps its last-known value, so an unreachable old voter holds the
+/// minimum *down* rather than dropping out of it. Divergence is therefore only ever in the safe
+/// direction — the leader under-reports what the cluster supports and refuses a feature it
+/// might have been allowed to use, which costs a compaction, where the other direction costs
+/// the cluster an undecodable committed entry (M6-89).
+#[derive(Debug, Default)]
+pub struct PeerSchemas {
+    seen: std::sync::Mutex<std::collections::BTreeMap<NodeId, SchemaTriple>>,
+}
+
+impl PeerSchemas {
+    /// Record what `node` advertised on its last answer.
+    pub fn record(&self, node: NodeId, schema: SchemaTriple) {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(node, schema);
+    }
+
+    /// What `node` last advertised, or [`COMPAT_SCHEMA_1`] if it never has.
+    ///
+    /// Never `Option`: a voter that has not answered, or that answered without a schema field,
+    /// is indistinguishable from a build too old to have one, and both must gate the same way.
+    #[must_use]
+    pub fn get(&self, node: NodeId) -> SchemaTriple {
+        self.observed(node).unwrap_or(COMPAT_SCHEMA_1)
+    }
+
+    /// What `node` advertised on its last answer, or `None` if it has never answered.
+    ///
+    /// The distinction [`PeerSchemas::get`] deliberately collapses, kept available for the one
+    /// caller that must not collapse it: the propose-time gate's steady-state clause (ADR-0030
+    /// ruling M6-R15 as narrowed by finding F-014). An *unreachable* voter must not re-gate a
+    /// cluster that has been running the feature for weeks — that is the write outage M6-R15
+    /// exists to prevent — while a voter that has answered and named a schema below the gate
+    /// must block it, because the leader has positive evidence it could not decode the entry.
+    /// Collapsing the two, as `get` does, makes those two cases one, and only one of them can
+    /// then be served.
+    ///
+    /// Absence means strictly "no answer": [`PeerSchemas::record`]'s caller writes
+    /// [`COMPAT_SCHEMA_1`] for an answer that carried no schema field, so a reachable pre-M6
+    /// voter is an entry here, not a gap.
+    #[must_use]
+    pub fn observed(&self, node: NodeId) -> Option<SchemaTriple> {
+        self.seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&node)
+            .copied()
+    }
 }
 
 /// Why the receiving engine refused a peer call before handing it to OpenRaft.
@@ -165,6 +246,18 @@ pub enum PeerReject {
     /// The transport identity (mTLS SAN) does not match `from` (M3).
     #[error("transport identity mismatch: {0}")]
     IdentityMismatch(String),
+    /// The sender's node id was retired by a committed `RetireNode` (M5, ADR-0023,
+    /// spec §21 "stale identities cannot rejoin").
+    ///
+    /// Distinct from [`PeerReject::IdentityMismatch`] on purpose: the certificate is
+    /// genuine and the envelope is consistent — M5 fences the *identity*, not the key
+    /// material, and certificate revocation is M6 (ADR-0028). An operator reading
+    /// `identity_mismatch` here would go looking for a PKI fault that does not exist.
+    #[error("node {node_id} is retired: identity_retired")]
+    Retired {
+        /// The fenced sender.
+        node_id: NodeId,
+    },
     /// The node is not running (stopped or not yet started).
     #[error("node not running")]
     NotRunning,
@@ -182,6 +275,27 @@ pub trait PeerSink: Send + Sync {
         meta: PeerEnvelopeMeta,
         req: PeerRequest,
     ) -> Result<PeerResponse, PeerReject>;
+
+    /// Whether `node_id` has been fenced out by a committed `RetireNode` (M5, ADR-0023).
+    ///
+    /// Exposed separately from [`PeerSink::handle`] so the transport can refuse a retired
+    /// sender **before** deserializing its payload: the point of the fence is that a retired
+    /// node never gets to hand this process bytes that OpenRaft will interpret. `handle`
+    /// re-checks it, because the in-process transport does not go through a codec at all.
+    ///
+    /// Synchronous and cheap: it reads applied state under the store's lock.
+    fn is_retired(&self, node_id: NodeId) -> bool {
+        let _ = node_id;
+        false
+    }
+
+    /// The schema this node stamps on its peer-plane answers (ADR-0030, M6-86).
+    ///
+    /// Defaulted for the same reason as [`PeerTransport::send_with_schema`]: a sink that does
+    /// not override it is simply a node of the current build.
+    fn local_schema(&self) -> SchemaTriple {
+        CURRENT_SCHEMA
+    }
 }
 
 /// Cheap, cloneable handle to a node's [`PeerSink`]; what `config-grpc`'s `PeerService`
@@ -202,6 +316,17 @@ impl PeerHandler {
         req: PeerRequest,
     ) -> Result<PeerResponse, PeerReject> {
         self.0.handle(meta, req).await
+    }
+
+    /// Whether the node this handle belongs to has fenced `node_id` out (M5, ADR-0023).
+    pub fn is_retired(&self, node_id: NodeId) -> bool {
+        self.0.is_retired(node_id)
+    }
+
+    /// The schema the node behind this handle advertises (M6, ADR-0030).
+    #[must_use]
+    pub fn local_schema(&self) -> SchemaTriple {
+        self.0.local_schema()
     }
 }
 

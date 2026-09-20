@@ -1,9 +1,13 @@
 //! The loopback health endpoint (OQ-16, ADR-0018 §2).
 //!
-//! `GET /health` returns [`config_engine::HealthPayload`] as JSON, plus nothing else. The
-//! payload is ids, counts, revisions, enums and a digest — no keys and no values — which is
-//! why it can be served without authentication (§15.2). It is still bound to loopback only;
-//! the address is rejected at configuration time otherwise.
+//! `GET /health` returns [`config_engine::HealthPayload`] as JSON; `GET /metrics` returns the
+//! ADR-0026 Prometheus exposition. Both payloads are ids, counts, revisions, enums and digests
+//! — no keys and no values — which is why neither needs authentication (§15.2). Both are still
+//! bound to loopback only; the address is rejected at configuration time otherwise.
+//!
+//! `/metrics` shares this listener rather than opening its own port: a second listener is a
+//! second thing to bind, firewall and get wrong for one text route, and a deployment that
+//! wants off-box scraping fronts this one with its own proxy (ADR-0026).
 //!
 //! # Why HTTP is written by hand
 //!
@@ -14,9 +18,48 @@
 
 use std::sync::Arc;
 
-use config_engine::ConfigNode;
+use config_engine::{ConfigNode, Paginator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::policy::PolicyLoader;
+
+/// Everything the two routes read from.
+///
+/// The node answers most of both payloads. The other two are the daemon's own: the paginator
+/// is built from `[list]` and handed to the client plane, and the policy loader owns the files
+/// the engine never sees — so the engine can report the active policy *version* but not why a
+/// load failed (ADR-0027, M6-16). Both are `Option` because a build without them must omit the
+/// series rather than export a zero that reads as a measurement.
+#[derive(Clone)]
+pub struct Sources {
+    /// The node itself.
+    pub node: ConfigNode,
+    /// The revision-pinned list paginator, when this daemon built one.
+    pub pagination: Option<Arc<Paginator>>,
+    /// The signed-policy loader, when `authz.mode = "signed"`.
+    pub policy: Option<Arc<PolicyLoader>>,
+    /// The TLS rotator, when this node serves mutual TLS (M6, ADR-0028).
+    ///
+    /// The third daemon-owned source, for the same reason as the other two: the engine never
+    /// sees a certificate, so `retcd_cert_expiry_seconds` can only be filled from here. `None`
+    /// under `tls.mode = "insecure"`, which omits the series rather than exporting a zero that
+    /// would read as "expires now".
+    pub tls: Option<Arc<config_grpc::TlsRotator>>,
+}
+
+/// Now, in seconds since the Unix epoch.
+///
+/// A gauge of "seconds until expiry" needs a wall clock, not a monotonic one: `notAfter` is an
+/// absolute instant and the answer has to survive the machine being suspended. A clock set
+/// before 1970 reports 0 rather than panicking — a nonsense reading is still better than a
+/// scrape that fails.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Largest request head this endpoint will read before giving up. A health probe's request is
 /// a few hundred bytes; anything larger is not one.
@@ -26,7 +69,17 @@ const MAX_REQUEST_BYTES: usize = 8 * 1024;
 ///
 /// Returns when the shutdown signal fires; in-flight responses are already written by then,
 /// because each connection is answered and closed in one short task.
-pub async fn serve(listener: TcpListener, node: ConfigNode, shutdown: Arc<tokio::sync::Notify>) {
+///
+/// `metrics_enabled` switches `GET /metrics` off at the route: the path then 404s exactly
+/// like any other unknown path, so a scraper sees a missing endpoint rather than an endpoint
+/// that answers with nothing - the difference between "not exported here" and "exported and
+/// idle".
+pub async fn serve(
+    listener: TcpListener,
+    sources: Sources,
+    shutdown: Arc<tokio::sync::Notify>,
+    metrics_enabled: bool,
+) {
     loop {
         let accepted = tokio::select! {
             biased;
@@ -35,9 +88,9 @@ pub async fn serve(listener: TcpListener, node: ConfigNode, shutdown: Arc<tokio:
         };
         match accepted {
             Ok((stream, _peer)) => {
-                let node = node.clone();
+                let sources = sources.clone();
                 tokio::spawn(config_log::testing::in_current_span(async move {
-                    if let Err(e) = handle(stream, node).await {
+                    if let Err(e) = handle(stream, sources, metrics_enabled).await {
                         tracing::debug!(error = %e, "health connection ended early");
                     }
                 }));
@@ -52,7 +105,11 @@ pub async fn serve(listener: TcpListener, node: ConfigNode, shutdown: Arc<tokio:
     }
 }
 
-async fn handle(mut stream: TcpStream, node: ConfigNode) -> std::io::Result<()> {
+async fn handle(
+    mut stream: TcpStream,
+    sources: Sources,
+    metrics_enabled: bool,
+) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     // Read until the end of the request head; a health probe sends no body.
@@ -75,7 +132,17 @@ async fn handle(mut stream: TcpStream, node: ConfigNode) -> std::io::Result<()> 
     let path = target.split('?').next().unwrap_or_default();
 
     let response = if method == "GET" && path == "/health" {
-        let payload = node.health_payload().await;
+        let mut payload = sources.node.health_payload().await;
+        // Only the loader knows *why* the last load failed, so only it can fill this (M6-16).
+        // Both fields come from one read: the engine already filled `policy_version` from the
+        // same authorizer, and keeping that value would pair it with a `policy_state` read later
+        // — the torn payload M6-20 catches. Overwriting is sound because the loader and the
+        // engine share one `Arc<SignedPolicyAuthorizer>`, so this is the same fact, read once.
+        if let Some(loader) = sources.policy.as_ref() {
+            let (state, version) = loader.state_and_version();
+            payload.policy_state = Some(state);
+            payload.policy_version = version;
+        }
         match serde_json::to_vec(&payload) {
             Ok(body) => http_response(200, "OK", "application/json", &body),
             Err(e) => {
@@ -83,6 +150,19 @@ async fn handle(mut stream: TcpStream, node: ConfigNode) -> std::io::Result<()> 
                 http_response(500, "Internal Server Error", "text/plain", b"error")
             }
         }
+    } else if method == "GET" && path == "/metrics" && metrics_enabled {
+        let mut report = sources.node.metrics_report().await;
+        report.pagination = sources.pagination.as_ref().map(|p| p.stats());
+        report.policy = sources.policy.as_ref().map(|loader| loader.metrics());
+        if let Some(rotator) = &sources.tls {
+            report.cert_expiry_seconds = rotator.expiry_seconds(unix_now());
+            report.authn_rejected_transport = rotator.authn_rejections();
+            report.tls = Some(rotator.metrics());
+        }
+        let body = report.render_prometheus().into_bytes();
+        // The version parameter is not decoration: a scraper uses it to pick its parser, and
+        // omitting it makes some scrapers fall back to a format this is not.
+        http_response(200, "OK", "text/plain; version=0.0.4; charset=utf-8", &body)
     } else {
         http_response(404, "Not Found", "text/plain", b"not found")
     };

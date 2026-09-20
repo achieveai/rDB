@@ -8,7 +8,7 @@
 mod common;
 
 use common::b;
-use config_core::{Command, DecodeError, COMMAND_MAGIC, COMMAND_VERSION};
+use config_core::{Command, DecodeError, COMMAND_ENVELOPE_VERSION, COMMAND_MAGIC};
 use proptest::prelude::*;
 
 fn hex_of(bytes: &[u8]) -> String {
@@ -19,18 +19,19 @@ fn hex_of(bytes: &[u8]) -> String {
         .join(" ")
 }
 
-/// `Put { key: b"a", value: b"b", expected: None }` — 26 bytes.
+/// `Put { key: b"a", value: b"b", expected: None, dedup: None }` — 83 bytes: 26 as in
+/// envelope v1 plus the 57-byte dedup group M5 appended (ADR-0025).
 const GOLDEN_PUT_NO_EXPECTED: &str =
-    "52 43 4d 44 01 00 01 01 00 00 00 61 01 00 00 00 62 00 00 00 00 00 00 00 00 00";
+    "52 43 4d 44 02 00 01 01 00 00 00 61 01 00 00 00 62 00 00 00 00 00 00 00 00 00 00";
 
 /// Same command with `has_expected = 1` and `expected = 7`.
 const GOLDEN_PUT_EXPECTED_7: &str =
-    "52 43 4d 44 01 00 01 01 00 00 00 61 01 00 00 00 62 01 07 00 00 00 00 00 00 00";
+    "52 43 4d 44 02 00 01 01 00 00 00 61 01 00 00 00 62 01 07 00 00 00 00 00 00 00 00";
 
-/// `Delete { key: b"a", expected: Some(7) }` — 21 bytes, per the OQ-1 decision recorded in
+/// `Delete { key: b"a", expected: Some(7) }` — 22 bytes, per the OQ-1 decision recorded in
 /// ADR-0007 Clarifications.
 const GOLDEN_DELETE_EXPECTED_7: &str =
-    "52 43 4d 44 01 00 02 01 00 00 00 61 01 07 00 00 00 00 00 00 00";
+    "52 43 4d 44 02 00 02 01 00 00 00 61 01 07 00 00 00 00 00 00 00 00";
 
 #[config_log::retcd_test]
 fn m0_40_encode_golden_put_no_expected() {
@@ -38,12 +39,13 @@ fn m0_40_encode_golden_put_no_expected() {
         key: b(b"a"),
         value: b(b"b"),
         expected_mod_revision: None,
+        dedup: None,
     };
 
     let bytes = cmd.encode();
 
     assert_eq!(hex_of(&bytes), GOLDEN_PUT_NO_EXPECTED);
-    assert_eq!(bytes.len(), 26);
+    assert_eq!(bytes.len(), 27);
     assert_eq!(bytes.len(), cmd.encoded_len());
     assert_eq!(&bytes[0..4], &COMMAND_MAGIC);
     assert_eq!(Command::decode(&bytes).unwrap(), cmd);
@@ -55,6 +57,7 @@ fn m0_41_encode_golden_put_expected_7() {
         key: b(b"a"),
         value: b(b"b"),
         expected_mod_revision: Some(7),
+        dedup: None,
     };
 
     let bytes = cmd.encode();
@@ -62,7 +65,7 @@ fn m0_41_encode_golden_put_expected_7() {
     assert_eq!(hex_of(&bytes), GOLDEN_PUT_EXPECTED_7);
     assert_eq!(
         bytes.len(),
-        26,
+        27,
         "the expected revision field is present either way"
     );
     assert_eq!(Command::decode(&bytes).unwrap(), cmd);
@@ -75,16 +78,17 @@ fn m0_42_encode_golden_delete() {
     let cmd = Command::Delete {
         key: b(b"a"),
         expected_mod_revision: Some(7),
+        dedup: None,
     };
 
     let bytes = cmd.encode();
 
     assert_eq!(hex_of(&bytes), GOLDEN_DELETE_EXPECTED_7);
-    assert_eq!(bytes.len(), 21);
+    assert_eq!(bytes.len(), 22);
     assert_eq!(Command::decode(&bytes).unwrap(), cmd);
 
     // The rejected candidate: a `00 00 00 00` value length between the key and has_expected.
-    let rejected = "52 43 4d 44 01 00 02 01 00 00 00 61 00 00 00 00 01 07 00 00 00 00 00 00 00";
+    let rejected = "52 43 4d 44 02 00 02 01 00 00 00 61 00 00 00 00 01 07 00 00 00 00 00 00 00 00";
     assert_ne!(
         hex_of(&bytes),
         rejected,
@@ -106,6 +110,7 @@ fn m0_43_decode_rejects_bad_magic() {
         key: b(b"a"),
         value: b(b"b"),
         expected_mod_revision: None,
+        dedup: None,
     }
     .encode();
     bytes[0] = b'X';
@@ -120,14 +125,15 @@ fn m0_44_decode_rejects_unknown_version() {
     let mut bytes = Command::Delete {
         key: b(b"a"),
         expected_mod_revision: None,
+        dedup: None,
     }
     .encode();
-    bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+    bytes[4..6].copy_from_slice(&3u16.to_le_bytes());
 
     let err = Command::decode(&bytes).expect_err("a future version must not be guessed at");
 
-    assert_eq!(err, DecodeError::UnsupportedVersion(2));
-    assert_eq!(COMMAND_VERSION, 1);
+    assert_eq!(err, DecodeError::UnsupportedVersion(3));
+    assert_eq!(COMMAND_ENVELOPE_VERSION, 2);
 }
 
 #[config_log::retcd_test]
@@ -135,13 +141,14 @@ fn m0_45_decode_rejects_unknown_op() {
     let mut bytes = Command::Delete {
         key: b(b"a"),
         expected_mod_revision: None,
+        dedup: None,
     }
     .encode();
-    bytes[6] = 0x03;
+    bytes[6] = 0x05;
 
     let err = Command::decode(&bytes).expect_err("an unknown op must not decode");
 
-    assert_eq!(err, DecodeError::UnknownOp(3));
+    assert_eq!(err, DecodeError::UnknownOp(5));
 }
 
 /// A canonical encoding admits no slack in either direction: every short prefix is an error,
@@ -152,6 +159,7 @@ fn m0_46_decode_rejects_truncated_and_overlong() {
         key: b(b"abc"),
         value: b(b"defg"),
         expected_mod_revision: Some(11),
+        dedup: None,
     };
     let bytes = cmd.encode();
 
@@ -177,7 +185,7 @@ fn m0_46_decode_rejects_truncated_and_overlong() {
 fn m0_47_decode_rejects_length_overflow() {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&COMMAND_MAGIC);
-    bytes.extend_from_slice(&COMMAND_VERSION.to_le_bytes());
+    bytes.extend_from_slice(&COMMAND_ENVELOPE_VERSION.to_le_bytes());
     bytes.push(1); // Put
     bytes.extend_from_slice(&u32::MAX.to_le_bytes());
     bytes.extend_from_slice(&[0u8; 9]);
@@ -199,11 +207,13 @@ fn m0_50_encode_is_canonical_and_stable() {
         key: bytes::Bytes::from(b"key".to_vec()),
         value: bytes::Bytes::from(String::from("value").into_bytes()),
         expected_mod_revision: Some(42),
+        dedup: None,
     };
     let sliced = Command::Put {
         key: bytes::Bytes::from_static(b"__key__").slice(2..5),
         value: bytes::Bytes::copy_from_slice(b"value"),
         expected_mod_revision: Some(42),
+        dedup: None,
     };
 
     assert_eq!(owned, sliced);
@@ -215,7 +225,8 @@ fn m0_50_encode_is_canonical_and_stable() {
         hex_of(
             &Command::Delete {
                 key: b(b"a"),
-                expected_mod_revision: Some(7)
+                expected_mod_revision: Some(7),
+                dedup: None,
             }
             .encode()
         ),
@@ -230,6 +241,7 @@ fn m0_51_serde_is_not_the_canonical_form() {
     let cmd = Command::Delete {
         key: b(b"a"),
         expected_mod_revision: Some(7),
+        dedup: None,
     };
 
     let canonical = cmd.encode();
@@ -264,11 +276,13 @@ fn command_strategy() -> impl Strategy<Value = Command> {
                 key: bytes::Bytes::from(key),
                 value: bytes::Bytes::from(value),
                 expected_mod_revision,
+                dedup: None,
             }),
         (prop::collection::vec(any::<u8>(), 0..1024), expected).prop_map(
             |(key, expected_mod_revision)| Command::Delete {
                 key: bytes::Bytes::from(key),
                 expected_mod_revision,
+                dedup: None,
             }
         ),
     ]
@@ -315,10 +329,12 @@ fn non_canonical_expected_is_rejected() {
     let mut bytes = Command::Delete {
         key: b(b"a"),
         expected_mod_revision: None,
+        dedup: None,
     }
     .encode();
-    let tail = bytes.len() - 8;
-    bytes[tail..].copy_from_slice(&9u64.to_le_bytes());
+    // The expected revision sits ahead of the absent dedup group's single flag byte.
+    let tail = bytes.len() - 8 - 1;
+    bytes[tail..tail + 8].copy_from_slice(&9u64.to_le_bytes());
 
     assert_eq!(
         Command::decode(&bytes),
@@ -328,6 +344,7 @@ fn non_canonical_expected_is_rejected() {
     let mut bad_flag = Command::Delete {
         key: b(b"a"),
         expected_mod_revision: None,
+        dedup: None,
     }
     .encode();
     bad_flag[12] = 2;

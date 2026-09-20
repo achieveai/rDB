@@ -21,6 +21,7 @@ pub fn put(key: &[u8], value: &[u8]) -> Command {
         key: b(key),
         value: b(value),
         expected_mod_revision: None,
+        dedup: None,
     }
 }
 
@@ -30,6 +31,7 @@ pub fn put_cas(key: &[u8], value: &[u8], expected: u64) -> Command {
         key: b(key),
         value: b(value),
         expected_mod_revision: Some(expected),
+        dedup: None,
     }
 }
 
@@ -38,6 +40,7 @@ pub fn del(key: &[u8]) -> Command {
     Command::Delete {
         key: b(key),
         expected_mod_revision: None,
+        dedup: None,
     }
 }
 
@@ -46,6 +49,7 @@ pub fn del_cas(key: &[u8], expected: u64) -> Command {
     Command::Delete {
         key: b(key),
         expected_mod_revision: Some(expected),
+        dedup: None,
     }
 }
 
@@ -55,6 +59,7 @@ pub fn put_req(key: &[u8], value: &[u8]) -> PutRequest {
         key: b(key),
         value: b(value),
         expected_mod_revision: None,
+        dedup: None,
     }
 }
 

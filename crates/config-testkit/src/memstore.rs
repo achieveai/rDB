@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use config_core::{
     validate_delete, validate_list, validate_put, Capabilities, Command, CommandResponse,
     ConfigError, ConfigStore, DeleteRequest, GetRequest, GetResponse, KvState, Limits, ListRequest,
-    ListResponse, MutationResponse, PutRequest,
+    ListResponse, MutationResponse, PutRequest, WatchRequest, WatchStream,
 };
 
 /// An in-memory, single-process [`ConfigStore`] over [`KvState`] (spec/TA-10 reference impl).
@@ -102,11 +102,31 @@ fn to_mutation_result(resp: CommandResponse) -> Result<MutationResponse, ConfigE
         CommandResponse::Noop => Err(ConfigError::invalid_argument(
             "apply produced Noop for a Command, which KvState::apply never does",
         )),
+        CommandResponse::Compacted { .. } => Err(ConfigError::invalid_argument(
+            "apply produced Compacted for a mutation Command; this store keeps no journal",
+        )),
+        CommandResponse::Retired { .. } => Err(ConfigError::invalid_argument(
+            "apply produced Retired for a mutation Command; this store has no membership",
+        )),
     }
 }
 
 #[async_trait]
 impl ConfigStore for MemStore {
+    /// Refused, honestly and permanently.
+    ///
+    /// This store keeps no event journal — it is the *pure* half of the conformance suite,
+    /// there to prove that the shared checks describe `KvState` and not a cluster — so it
+    /// reports [`WatchResumption::Unsupported`] and must behave the way that claim promises.
+    /// Returning an empty stream instead would let a watch row pass here while proving nothing
+    /// (spec §11, ADR-0016: a capability that can lie is worse than no capability).
+    async fn watch(&self, _request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        self.injected_failure()?;
+        Err(ConfigError::invalid_argument(
+            "this store reports WatchResumption::Unsupported and serves no watches",
+        ))
+    }
+
     async fn get(&self, request: GetRequest) -> Result<GetResponse, ConfigError> {
         self.injected_failure()?;
         self.validate_get_key(&request.key)?;

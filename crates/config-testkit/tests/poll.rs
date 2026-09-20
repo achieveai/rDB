@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use config_testkit::election_timeout_multiple;
-use config_testkit::poll::{poll_until, poll_until_async, TestTimers};
+use config_testkit::poll::{deadline_scale, poll_until, poll_until_async, TestTimers};
 
 #[config_log::retcd_test]
 async fn poll_until_returns_as_soon_as_the_predicate_succeeds() {
@@ -82,9 +82,12 @@ async fn poll_until_async_polls_an_async_predicate() {
 #[config_log::retcd_test]
 fn election_timeout_multiple_is_derived_not_literal() {
     let n = 10;
+    // Every derived deadline is stretched by `RETCD_TEST_DEADLINE_SCALE`, so the assertion is
+    // about derivation and is made relative to the scale this process was started with.
+    let scale = deadline_scale();
     assert_eq!(
         election_timeout_multiple(n),
-        TestTimers::DEFAULT.election_timeout_max * n,
+        TestTimers::DEFAULT.election_timeout_max * n * scale,
         "the free function must derive from TestTimers, not hardcode a duration"
     );
 
@@ -93,7 +96,7 @@ fn election_timeout_multiple_is_derived_not_literal() {
         election_timeout_min: Duration::from_millis(100),
         election_timeout_max: Duration::from_millis(200),
     };
-    assert_eq!(custom.multiple(3), Duration::from_millis(600));
+    assert_eq!(custom.multiple(3), Duration::from_millis(600) * scale);
 }
 
 /// The crate root re-exports `poll_until` for convenience; prove it is callable from there.

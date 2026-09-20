@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -34,6 +34,7 @@ pub fn key(s: &str) -> Bytes {
 
 pub fn put_req(k: &str, v: &str) -> PutRequest {
     PutRequest {
+        dedup: None,
         key: key(k),
         value: key(v),
         expected_mod_revision: None,
@@ -53,6 +54,7 @@ pub fn list_req(prefix: &str) -> ListRequest {
 
 pub fn delete_req(k: &str) -> DeleteRequest {
     DeleteRequest {
+        dedup: None,
         key: key(k),
         expected_mod_revision: None,
     }
@@ -189,18 +191,116 @@ pub async fn settled_leader(cluster: &Cluster, deadline: std::time::Duration) ->
 /// `Mutex<BTreeMap<..>>`: `before()` runs on the Raft core's storage path (`FaultInjector`'s
 /// own contract says "must be cheap and non-blocking"), and arming happens from a different
 /// task while the store may be mid-crossing, so the state has to be lock-free.
+/// One slot per [`Boundary::ALL`] entry, sized off the enum's own live length rather than a
+/// literal — `Boundary::ALL` grew from 8 (M2/M3) to 9 (M4, `AfterStateBatchBeforePublish`) to
+/// 17 (M5's snapshot/install/purge boundaries) on this branch, and a hardcoded `8` here indexed
+/// out of bounds the moment any test armed or crossed one of the newer boundaries — even one
+/// this file never mentions, because `before()`/`after()` runs on *every* crossing for *every*
+/// node built with a `ScriptedInjector` (`FaultInjector`'s contract), M4/M5 boundaries
+/// included.
+const BOUNDARY_COUNT: usize = Boundary::ALL.len();
+
+/// The boundaries an ordinary put/vote-isolate driver in this suite (M2-19..M2-29, M2-47)
+/// actually crosses: the original M2/M3 set plus M4's `AfterStateBatchBeforePublish` (TA-28).
+///
+/// `Boundary::ALL` also carries M5's eight snapshot/install/purge boundaries now (see
+/// [`BOUNDARY_COUNT`]'s doc comment), and none of those are reachable by a plain KV put or a
+/// vote-triggering isolate — nothing in these M2/M4 rows ever builds, installs or purges a
+/// snapshot. A row that armed `crash_on_nth` on one of those and then drove a put would wait
+/// out its whole deadline for a crossing that can never happen, which is exactly what
+/// `m2_28_repeated_crash_cycles_no_vote_regression` and `m2_47_identity_survives_crash_at_every_boundary`
+/// did the first time they iterated `Boundary::ALL` directly after M5 landed its boundaries.
+/// M5's own rows exercise M5's own boundaries; this suite exercises this list.
+pub const DRIVEABLE_BOUNDARIES: [Boundary; 9] = [
+    Boundary::BeforeVoteSync,
+    Boundary::AfterVoteSync,
+    Boundary::BeforeLogAppend,
+    Boundary::AfterLogAppend,
+    Boundary::BeforeLogFlush,
+    Boundary::AfterLogFlush,
+    Boundary::BeforeStateBatch,
+    Boundary::AfterStateBatch,
+    Boundary::AfterStateBatchBeforePublish,
+];
+
+/// The `action` slot code for [`ScriptedInjector::pause_on_nth`].
+///
+/// Not a [`FaultAction`]: `FaultAction` is `config-storage`'s vocabulary and a pause is not a
+/// fault at all — the crossing proceeds, just later, at a moment the test names. Keeping it a
+/// harness-private code means the store's enum does not grow a variant that only a test can
+/// produce.
+const ACTION_PAUSE: u8 = 3;
+
+/// One end of a [`ScriptedInjector::pause_on_nth`] handshake, held by the test.
+///
+/// Deliberately the same primitive as `crates/config-storage/tests/m5_snapshot.rs`'s `PauseAt`
+/// — a pair of `sync_channel(1)`s — rather than a `FaultAction::Delay`: a duration is a sleep,
+/// and a sleep long enough to be reliable is long enough to be slow (anti-flake rule 1). What
+/// this adds over that fixture is that it rides the existing per-boundary arming bookkeeping,
+/// so a row can pause the *n*-th crossing rather than only the first, and can arm a pause on
+/// one boundary while a crash is armed on another.
+///
+/// **Rocks only.** `RocksShared::run` consults every boundary inside `spawn_blocking`, so the
+/// wait parks a blocking-pool thread. The ephemeral store crosses boundaries on the runtime's
+/// own workers, where blocking would stall the node under test rather than pause it.
+pub struct PauseHandle {
+    reached_rx: Mutex<std::sync::mpsc::Receiver<()>>,
+    release_tx: std::sync::mpsc::SyncSender<()>,
+}
+
+impl PauseHandle {
+    /// Wait until the paused operation is sitting on the boundary.
+    ///
+    /// Awaits a `spawn_blocking` receive, so the test's own runtime keeps turning while the
+    /// store's thread is parked.
+    pub async fn reached(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            me.reached_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv()
+                .expect("the paused operation reaches the armed boundary")
+        })
+        .await
+        .expect("the wait task joins");
+    }
+
+    /// Let the paused operation continue.
+    ///
+    /// A no-op if it already continued — which it only can if this handle was dropped, since
+    /// the pause holds until exactly one of the two happens.
+    pub fn release(&self) {
+        let _ = self.release_tx.send(());
+    }
+}
+
+/// The injector-side half of one armed pause: signal `reached`, then block until `release`.
+///
+/// Named because the inline tuple-in-a-map trips clippy::type_complexity.
+type PauseSlot = (
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 #[derive(Default)]
 pub struct ScriptedInjector {
-    seen: [AtomicU64; 8],
+    seen: [AtomicU64; BOUNDARY_COUNT],
     /// `0` means "disarmed". Armed to the 1-based crossing count to fire on.
-    at: [AtomicU64; 8],
+    at: [AtomicU64; BOUNDARY_COUNT],
     /// `0` = [`FaultAction::Fail`], `1` = [`FaultAction::Crash`], `2` = [`FaultAction::Delay`]
-    /// (duration in the matching `delay_ms` slot). Only meaningful while `at` for the same
-    /// index is nonzero.
-    action: [AtomicU8; 8],
+    /// (duration in the matching `delay_ms` slot), [`ACTION_PAUSE`] = block on the matching
+    /// `pauses` entry. Only meaningful while `at` for the same index is nonzero.
+    action: [AtomicU8; BOUNDARY_COUNT],
     /// Delay duration in milliseconds. Only meaningful while `action` for the same index is
     /// `2` and `at` is nonzero.
-    delay_ms: [AtomicU64; 8],
+    delay_ms: [AtomicU64; BOUNDARY_COUNT],
+    /// The injector's half of each armed pause, keyed by [`Boundary::index`].
+    ///
+    /// A `Mutex` rather than another atomic array because the payload is a channel pair, and
+    /// it is never touched on the fast path: `before()` reads `at` first and only reaches this
+    /// map on the one crossing that actually fires.
+    pauses: Mutex<BTreeMap<usize, PauseSlot>>,
 }
 
 impl ScriptedInjector {
@@ -209,17 +309,21 @@ impl ScriptedInjector {
     }
 
     fn arm(&self, boundary: Boundary, n: u64, action: FaultAction) {
-        assert!(n >= 1, "crossings are 1-based; n=0 can never fire");
-        let i = boundary.index();
-        // `seen`/`action`/`delay_ms` first, `at` last: `at` is what makes `before()` look at
-        // the other three, so a reader that observes it armed always observes a fresh set with
-        // it.
-        self.seen[i].store(0, Ordering::SeqCst);
         let (code, delay_ms) = match action {
             FaultAction::Crash => (1, 0),
             FaultAction::Delay(d) => (2, d.as_millis() as u64),
             FaultAction::Fail | FaultAction::Proceed => (0, 0),
         };
+        self.arm_code(boundary, n, code, delay_ms);
+    }
+
+    fn arm_code(&self, boundary: Boundary, n: u64, code: u8, delay_ms: u64) {
+        assert!(n >= 1, "crossings are 1-based; n=0 can never fire");
+        let i = boundary.index();
+        // `seen`/`action`/`delay_ms` first, `at` last: `at` is what makes `before()` look at
+        // the other three, so a reader that observes it armed always observes a fresh set with
+        // it. The `pauses` entry is installed before this is called, for the same reason.
+        self.seen[i].store(0, Ordering::SeqCst);
         self.delay_ms[i].store(delay_ms, Ordering::SeqCst);
         self.action[i].store(code, Ordering::SeqCst);
         self.at[i].store(n, Ordering::SeqCst);
@@ -241,9 +345,34 @@ impl ScriptedInjector {
         self.arm(boundary, n, FaultAction::Delay(delay));
     }
 
-    /// Cancel any armed rule for `boundary`. A no-op if none is armed.
+    /// Block the `n`-th crossing (1-based) of `boundary` until the returned handle is released
+    /// or dropped, then proceed. One-shot.
+    ///
+    /// The seam TA-43 asks for, expressed in the vocabulary this file already has rather than
+    /// a second injector type: it holds an operation open at a named instant so a row can
+    /// drive a *second* operation against the first while it is provably mid-flight (M5-01,
+    /// M5-02, M5-14). See [`PauseHandle`] for why this is Rocks-only.
+    pub fn pause_on_nth(&self, boundary: Boundary, n: u64) -> Arc<PauseHandle> {
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        self.pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(boundary.index(), (reached_tx, release_rx));
+        self.arm_code(boundary, n, ACTION_PAUSE, 0);
+        Arc::new(PauseHandle {
+            reached_rx: Mutex::new(reached_rx),
+            release_tx,
+        })
+    }
+
+    /// Cancel any armed rule for `boundary`, pause included. A no-op if none is armed.
     pub fn disarm(&self, boundary: Boundary) {
         self.at[boundary.index()].store(0, Ordering::SeqCst);
+        self.pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&boundary.index());
     }
 
     /// Cancel every armed rule.
@@ -272,6 +401,26 @@ impl FaultInjector for ScriptedInjector {
                 2 => FaultAction::Delay(Duration::from_millis(
                     self.delay_ms[i].load(Ordering::SeqCst),
                 )),
+                ACTION_PAUSE => {
+                    // Taken out of the map before waiting, so `release()` — which touches only
+                    // its own sender — can never contend with this lock.
+                    let slot = self
+                        .pauses
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&i);
+                    if let Some((reached_tx, release_rx)) = slot {
+                        // A dropped handle means the test is gone (it finished, or it
+                        // panicked). Proceeding is the only safe answer: waiting would park a
+                        // blocking-pool thread forever, and dropping the runtime waits for
+                        // blocking tasks, so the failure would surface as a hang instead of
+                        // the assertion that really failed.
+                        if reached_tx.send(()).is_ok() {
+                            let _ = release_rx.recv();
+                        }
+                    }
+                    FaultAction::Proceed
+                }
                 _ => FaultAction::Fail,
             };
         }

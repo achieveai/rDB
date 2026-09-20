@@ -1,0 +1,10 @@
+{
+  "risks": [
+    { "text": "Every backup has a policy_version_ref that is always None.", "owner": "lead", "severity": "low", "closing": "M6-33, product backlog after the M6 gate." },
+    { "text": "The restore_policy_mismatch log line is never emitted.", "owner": "lead", "severity": "low", "closing": "M6-35, product backlog after the M6 gate." },
+    { "text": "A follower continuation page carries no leader hint.", "owner": "lead", "severity": "low", "closing": "Product backlog after the M6 gate." },
+    { "text": "The C drive ran low twice today, corrupting build artifacts.", "owner": "lead", "severity": "medium", "closing": "Purged. Check free space before treating a linker failure as a defect." },
+    { "text": "Concurrent agents hit Windows ephemeral-port exhaustion on rotation tests.", "owner": "lead", "severity": "low", "closing": "Known environment constraint, not a code defect." },
+    { "text": "M6 evidence rows are reduced-scale, never a production claim.", "owner": "lead", "severity": "low", "closing": "Restated per ADR-0031 on every refresh." }
+  ]
+}

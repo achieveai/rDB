@@ -10,8 +10,20 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-/// A durability boundary inside a store. The eight boundaries are distinct instants: log
-/// append is write-then-explicit-sync so `AfterLogAppend` and `BeforeLogFlush` differ.
+/// A durability boundary inside a store. The seventeen boundaries are distinct instants: log
+/// append is write-then-explicit-sync so `AfterLogAppend` and `BeforeLogFlush` differ, since
+/// M4 the durable-but-unpublished window has a name of its own (TA-28), and since M5 every
+/// step of snapshot publication, snapshot install and log purge is separately crashable
+/// (TA-41, lead ruling M5-R2).
+///
+/// # Adding a variant
+///
+/// [`Boundary::ALL`] is the single source of truth: it is the crossing order, the index into
+/// [`FaultCounters`], and what every coverage assertion iterates. Nothing in the workspace
+/// pattern-matches the enum exhaustively — deliberately, so a new milestone's boundary cannot
+/// break a test file it does not own (M4 tester ruling). A new variant therefore needs three
+/// edits here and nothing anywhere else: the variant, its entry in `ALL`, and its arms in
+/// [`Boundary::index`] and [`Boundary::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Boundary {
     /// Before the vote is made durable (`save_vote`).
@@ -30,11 +42,86 @@ pub enum Boundary {
     BeforeStateBatch,
     /// After the state batch was written and synced.
     AfterStateBatch,
+    /// Between the durable state batch and the watch hub being told about it (M4, TA-28).
+    ///
+    /// The window this names is the reason the journal exists: the batch — KV change *and*
+    /// journal event — is on disk, but no watcher has seen it. A crash here must be
+    /// recoverable by replaying from the journal after restart, which is spec §21 M4's "no
+    /// silent loss" in its strictest form (test plan M4-06, M4-91).
+    ///
+    /// Crossed exactly once per applied batch, strictly after [`Boundary::AfterStateBatch`] and
+    /// strictly before the publish, and never inside the store's write batch.
+    AfterStateBatchBeforePublish,
+
+    // ---------------------------------------------------------------------------------
+    // M5 — snapshot publication (ADR-0022 "Publish ordering", test plan M5-10..M5-15)
+    // ---------------------------------------------------------------------------------
+    /// The snapshot body is fully written to `<id>.tmp` but no fsync has been issued.
+    ///
+    /// A crash here must leave **no** publication: the `.tmp` file is not a snapshot, the
+    /// previous `current_snapshot` still stands, and nothing may have been purged against the
+    /// build that was in flight (M5-11).
+    BeforeSnapshotTmpSync,
+
+    /// `<id>.tmp` has been fsynced and renamed to `<id>.snap`; the directory fsync and the
+    /// `state_meta/current_snapshot` batch have not happened.
+    ///
+    /// The rename is deliberately **not** the publication point — the meta batch is — so a
+    /// crash here leaves a complete but unreferenced `.snap` that is never served (M5-12).
+    AfterSnapshotRename,
+
+    /// The directory entry has been synced; the `state_meta/current_snapshot` batch has not
+    /// been written.
+    ///
+    /// The sharpest form of invariant §19.7: a crash here must leave `purges() == 0` for this
+    /// build, because OpenRaft schedules `Command::PurgeLog` the instant `build_snapshot`
+    /// returns `Ok`, and `Ok` is only allowed to mean *published* (research trap T2, M5-13).
+    BeforeCurrentSnapshotMeta,
+
+    // ---------------------------------------------------------------------------------
+    // M5 — snapshot install (ADR-0022 "Install: two-phase", test plan M5-30..M5-33)
+    // ---------------------------------------------------------------------------------
+    /// The received stream has been validated and durably renamed to `<id>.snap`, but
+    /// `state_meta/install_in_progress` has not been written.
+    ///
+    /// Everything before this point is side-effect-free with respect to applied state, so a
+    /// crash here must leave the old state machine completely untouched (M5-30).
+    BeforeInstallMarker,
+
+    /// The install marker is durable and the data column families have been dropped and
+    /// recreated, but none of the snapshot's records have been streamed back in yet.
+    ///
+    /// The dangerous window: the state machine is empty and only the marker plus the retained
+    /// `.snap` can rebuild it. Reopening must redo the install rather than come up empty
+    /// (M5-31).
+    AfterInstallDropCf,
+
+    /// Every record has been streamed in, but the single synced batch that publishes
+    /// `last_applied`, membership, the revisions, `current_snapshot` **and** deletes the
+    /// marker has not been written.
+    ///
+    /// That batch must be atomic with the marker deletion, or a crash between the two loops
+    /// forever (M5-32).
+    BeforeInstallFinalBatch,
+
+    // ---------------------------------------------------------------------------------
+    // M5 — log purge (lead ruling M5-R2, which overrides test-plan OQ-41/M5-23)
+    // ---------------------------------------------------------------------------------
+    /// Before `RaftLogStorage::purge` deletes anything.
+    ///
+    /// Purge used to borrow [`Boundary::BeforeLogFlush`], which was harmless while purge never
+    /// ran and fatal to M5's accounting once it does — a crash attributed to a log flush that
+    /// was really a purge. M5-R2 gives purge its own pair.
+    BeforePurge,
+
+    /// After the synced range-delete-plus-`last_purged` batch returned, before the caller is
+    /// told.
+    AfterPurge,
 }
 
 impl Boundary {
     /// All boundaries in crossing order.
-    pub const ALL: [Boundary; 8] = [
+    pub const ALL: [Boundary; 17] = [
         Boundary::BeforeVoteSync,
         Boundary::AfterVoteSync,
         Boundary::BeforeLogAppend,
@@ -43,6 +130,15 @@ impl Boundary {
         Boundary::AfterLogFlush,
         Boundary::BeforeStateBatch,
         Boundary::AfterStateBatch,
+        Boundary::AfterStateBatchBeforePublish,
+        Boundary::BeforeSnapshotTmpSync,
+        Boundary::AfterSnapshotRename,
+        Boundary::BeforeCurrentSnapshotMeta,
+        Boundary::BeforeInstallMarker,
+        Boundary::AfterInstallDropCf,
+        Boundary::BeforeInstallFinalBatch,
+        Boundary::BeforePurge,
+        Boundary::AfterPurge,
     ];
 
     /// Position of this boundary in [`Boundary::ALL`]; the index into [`FaultCounters`].
@@ -56,6 +152,15 @@ impl Boundary {
             Boundary::AfterLogFlush => 5,
             Boundary::BeforeStateBatch => 6,
             Boundary::AfterStateBatch => 7,
+            Boundary::AfterStateBatchBeforePublish => 8,
+            Boundary::BeforeSnapshotTmpSync => 9,
+            Boundary::AfterSnapshotRename => 10,
+            Boundary::BeforeCurrentSnapshotMeta => 11,
+            Boundary::BeforeInstallMarker => 12,
+            Boundary::AfterInstallDropCf => 13,
+            Boundary::BeforeInstallFinalBatch => 14,
+            Boundary::BeforePurge => 15,
+            Boundary::AfterPurge => 16,
         }
     }
 
@@ -70,6 +175,15 @@ impl Boundary {
             Boundary::AfterLogFlush => "after_log_flush",
             Boundary::BeforeStateBatch => "before_state_batch",
             Boundary::AfterStateBatch => "after_state_batch",
+            Boundary::AfterStateBatchBeforePublish => "after_state_batch_before_publish",
+            Boundary::BeforeSnapshotTmpSync => "before_snapshot_tmp_sync",
+            Boundary::AfterSnapshotRename => "after_snapshot_rename",
+            Boundary::BeforeCurrentSnapshotMeta => "before_current_snapshot_meta",
+            Boundary::BeforeInstallMarker => "before_install_marker",
+            Boundary::AfterInstallDropCf => "after_install_drop_cf",
+            Boundary::BeforeInstallFinalBatch => "before_install_final_batch",
+            Boundary::BeforePurge => "before_purge",
+            Boundary::AfterPurge => "after_purge",
         }
     }
 }
@@ -138,7 +252,7 @@ pub trait FaultInjector: Send + Sync {
 /// over zero crossings proves nothing).
 #[derive(Debug, Default)]
 pub struct FaultCounters {
-    counts: [AtomicU64; 8],
+    counts: [AtomicU64; Boundary::ALL.len()],
 }
 
 impl FaultCounters {

@@ -30,7 +30,7 @@ fn identity() -> ClusterIdentity {
 }
 
 fn store(faults: Arc<dyn FaultInjector>) -> EphemeralStore {
-    EphemeralStore::new(identity(), Limits::DEFAULT, faults, Span::none())
+    EphemeralStore::new_without_sink(identity(), Limits::DEFAULT, faults, Span::none())
 }
 
 fn plain_store() -> EphemeralStore {
@@ -67,6 +67,7 @@ fn put(term: u64, index: u64, key: &str, value: &str) -> Entry<TypeConfig> {
             key: Bytes::copy_from_slice(key.as_bytes()),
             value: Bytes::copy_from_slice(value.as_bytes()),
             expected_mod_revision: None,
+            dedup: None,
         }),
     }
 }
@@ -107,6 +108,23 @@ impl FaultInjector for FailAt {
 /// Records every boundary it is asked about, in order.
 #[derive(Default)]
 struct Recorder(Mutex<Vec<Boundary>>);
+
+/// The boundaries the vote / append / apply workload crosses.
+///
+/// Not `Boundary::ALL`: since M5 that also holds the snapshot, install and purge boundaries,
+/// which this store never crosses — it has no snapshots at all — so asserting that a fault
+/// armed on one of them fires would be asserting the impossible.
+const WRITE_PATH_BOUNDARIES: [Boundary; 9] = [
+    Boundary::BeforeVoteSync,
+    Boundary::AfterVoteSync,
+    Boundary::BeforeLogAppend,
+    Boundary::AfterLogAppend,
+    Boundary::BeforeLogFlush,
+    Boundary::AfterLogFlush,
+    Boundary::BeforeStateBatch,
+    Boundary::AfterStateBatch,
+    Boundary::AfterStateBatchBeforePublish,
+];
 
 impl FaultInjector for Recorder {
     fn before(&self, boundary: Boundary) -> FaultAction {
@@ -242,20 +260,24 @@ async fn state_hash_matches_a_standalone_kv_state() {
             key: Bytes::from_static(b"/z"),
             value: Bytes::from_static(b"9"),
             expected_mod_revision: None,
+            dedup: None,
         },
         Command::Put {
             key: Bytes::from_static(b"/a"),
             value: Bytes::from_static(b"1"),
             expected_mod_revision: Some(0),
+            dedup: None,
         },
         Command::Delete {
             key: Bytes::from_static(b"/z"),
             expected_mod_revision: None,
+            dedup: None,
         },
         Command::Put {
             key: Bytes::from_static(b"/a"),
             value: Bytes::from_static(b"2"),
             expected_mod_revision: None,
+            dedup: None,
         },
     ];
 
@@ -295,18 +317,18 @@ async fn every_boundary_is_crossed_in_order() {
         .unwrap();
 
     let seen = recorder.0.lock().unwrap().clone();
-    assert_eq!(seen, Boundary::ALL.to_vec());
+    assert_eq!(seen, WRITE_PATH_BOUNDARIES.to_vec());
 
     let counters = s.counters();
-    for b in Boundary::ALL {
+    for b in WRITE_PATH_BOUNDARIES {
         assert_eq!(counters.get(b), 1, "{b} crossed exactly once");
     }
-    assert_eq!(counters.total(), 8);
+    assert_eq!(counters.total(), 9);
 }
 
 #[retcd_test]
 async fn fail_at_each_boundary_returns_an_error_and_the_store_keeps_working() {
-    for boundary in Boundary::ALL {
+    for boundary in WRITE_PATH_BOUNDARIES {
         let s = store(FailAt::new(boundary, FaultAction::Fail));
 
         // Drive all eight boundaries; exactly the operation owning `boundary` must fail.
@@ -429,7 +451,7 @@ async fn poisoned_call_results(s: &EphemeralStore) -> Vec<(&'static str, Result<
             r(s.state_machine()
                 .install_snapshot(
                     &openraft::SnapshotMeta::default(),
-                    Box::new(std::io::Cursor::new(Vec::new())),
+                    Box::new(tokio::fs::File::from_std(tempfile::tempfile().unwrap())),
                 )
                 .await)
             .await,
@@ -448,7 +470,11 @@ async fn snapshots_are_unsupported_but_never_panic() {
     // A *healthy* store has no snapshot and says so with `Ok(None)`. Only a poisoned one
     // errors here — the poison check must not become an unconditional refusal.
     assert!(sm.get_current_snapshot().await.unwrap().is_none());
-    assert!(sm.begin_receiving_snapshot().await.is_ok());
+    // Receiving is refused, not accepted-then-lost: since M5 `SnapshotData` is a file, and an
+    // ephemeral store has no directory to put one in and nothing that would outlive the
+    // process if it did. `ConfigNode::start` forces `SnapshotConfig::DISABLED` for this store,
+    // so nothing reaches here in a correctly wired node.
+    assert!(sm.begin_receiving_snapshot().await.is_err());
     let mut builder = sm.get_snapshot_builder().await;
     use openraft::RaftSnapshotBuilder;
     assert!(builder.build_snapshot().await.is_err());

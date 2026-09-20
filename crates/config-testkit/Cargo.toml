@@ -26,6 +26,19 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# TA-57: `served_leaf_fingerprint` must read the leaf off a *real* handshake rather than ask
+# the node what it thinks it is serving, which needs a rustls client with a verifier that
+# captures the peer chain. Not a new vendor: `config-grpc` already serves its planes with it,
+# and `default-features = false` keeps the crypto provider whatever tonic selected.
+tokio-rustls = { version = "0.26", default-features = false }
+# Parsing the observer's own PEM into the DER rustls wants. Same version `config-grpc` reads
+# its served material with.
+rustls-pemfile = "2"
+# `ReloadTls` and `RotateGossipKey` have no `config_client::AdminClient` method, so the two
+# rotation RPCs are driven through the generated stub, as `config-grpc/tests/m6_rbac.rs` does.
+# Was a dev-dependency; dev-dependencies inherit `[dependencies]`, so the M3 rows that used it
+# are unaffected.
+tonic = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 
@@ -33,10 +46,17 @@ tracing = { workspace = true }
 # Test-only: a same-id restart on a fresh EphemeralStore is a legal log revert here, and
 # openraft's debug_assert would otherwise abort the leader (ADR-0008 note).
 openraft = { workspace = true, features = ["loosen-follower-log-revert"] }
+# Test-only: M4-75 asserts on the wire-encoded bytes of a `Progress` frame (no key/value bytes
+# anywhere in it), not on the struct's `Debug`. `config-grpc`'s generated `pb` types implement
+# `prost::Message`, but `prost` itself is only pulled in as a `tonic-build` *build*-dependency
+# of `config-grpc` (tonic 0.12's `codegen` module does not re-export it), so it is not
+# otherwise reachable here.
+prost = { workspace = true }
 # Test-only: the hand-built peer envelopes below carry a postcard payload, the peer plane's
 # only accepted encoding (ADR-0010, fix-round note).
 postcard = { workspace = true }
-# Test-only: the M3 peer-plane rows (M3-09..M3-11) dial `PeerService` directly with a
-# hand-built envelope to prove the engine's identity checks are independent of the
-# certificate presented — something no `Cluster` method does on a caller's behalf.
-tonic = { workspace = true }
+# Test-only: M5-17 and M5-71 have to write into a node's data directory *before* or *between*
+# its opens — deleting a published snapshot pointer, hand-building a v1-format store — which is
+# by design unreachable through `RocksStore`. The library itself deliberately does not depend
+# on rocksdb; only these rows do.
+rocksdb = { workspace = true }

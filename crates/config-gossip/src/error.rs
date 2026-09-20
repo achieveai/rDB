@@ -40,6 +40,32 @@ pub enum GossipError {
     /// Re-advertising the local hint failed.
     #[error("failed to re-advertise local hint: {0}")]
     Advertise(String),
+
+    /// A keyring operation was refused (M6, ADR-0028).
+    ///
+    /// Covers both this node having no keyring at all — gossip is unencrypted, so there is
+    /// nothing to rotate — and `memberlist`'s own refusals: promoting a key that was never
+    /// added, or removing the key currently being signed with.
+    #[error("gossip keyring: {0}")]
+    Keyring(String),
+
+    /// Removing this key would leave a peer that is still signing with it unreachable
+    /// (M6-59, OQ-61, ruling M6-R21).
+    ///
+    /// Separate from [`GossipError::Keyring`] because it is the one keyring refusal an
+    /// operator may legitimately overrule: the peers counted here may be nodes that are gone
+    /// and have not yet timed out, in which case the removal is safe and `force` says so.
+    #[error(
+        "gossip key {fingerprint} is still needed by {peers} peer(s) — it is the only key they \
+         accept, or the key they are still signing with; removing it would make them \
+         unreachable. Complete the add and use sweeps there first, or override with force"
+    )]
+    GossipKeyStillNeeded {
+        /// Hex fingerprint of the key that was to be removed. Never the key itself.
+        fingerprint: String,
+        /// How many advertised peers accept that key and nothing else, or still sign with it.
+        peers: usize,
+    },
 }
 
 /// A peer advertised metadata this node could not decode.

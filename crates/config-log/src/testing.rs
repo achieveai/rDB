@@ -35,9 +35,32 @@ pub fn test_run_id() -> &'static str {
     TEST_RUN.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
-/// Locate `<workspace>/target/test-logs` from the running test binary, honoring
+/// Locate `<cargo target dir>/test-logs` from the running test binary, honoring
 /// `RETCD_TEST_LOG_DIR`.
+///
+/// The build directory is not always called `target`. Anyone running with `CARGO_TARGET_DIR`
+/// set — a second agent, or a second shell keeping its build out of the way — gets a
+/// differently named root, and a resolver that only looks for that literal name silently
+/// falls back to a *relative* `target/test-logs` under whatever the current directory happens
+/// to be. Several runs then share one directory, and a single truncated `.jsonl` left in it
+/// breaks `read_json_auto(union_by_name = true)` for every log assertion in the workspace —
+/// a failure that reads as a logging bug and is really a stale neighbour's file.
+///
+/// So resolve positionally as well: a test binary always sits at
+/// `<target>/<profile>/deps/<name>`, whatever `<target>` is called. The name check stays
+/// first because it still answers correctly for the ordinary layout.
+///
+/// The answer is then scoped by [`test_run_id`], so one test binary never reads into another
+/// binary's files. Without that, every process in a workspace run shares one tree: the DuckDB
+/// glob unions every file before the `testRun` filter is applied, so a neighbour still being
+/// written truncates mid-object and collapses the read for all of them. The `testRun` column
+/// stays as the in-file check; this makes the directory agree with it.
 pub fn test_log_dir() -> PathBuf {
+    test_log_root().join(test_run_id())
+}
+
+/// The shared root every run writes a [`test_run_id`] directory into.
+fn test_log_root() -> PathBuf {
     if let Ok(d) = std::env::var("RETCD_TEST_LOG_DIR") {
         return PathBuf::from(d);
     }
@@ -45,6 +68,13 @@ pub fn test_log_dir() -> PathBuf {
         for anc in exe.ancestors() {
             if anc.file_name().is_some_and(|n| n == "target") {
                 return anc.join("test-logs");
+            }
+        }
+        for anc in exe.ancestors() {
+            if anc.file_name().is_some_and(|n| n == "deps") {
+                if let Some(root) = anc.parent().and_then(std::path::Path::parent) {
+                    return root.join("test-logs");
+                }
             }
         }
     }

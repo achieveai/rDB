@@ -72,6 +72,7 @@ async fn m1_grpc_01_every_config_error_maps_to_its_normative_status_code() {
         (
             ConfigError::ResourceExhausted {
                 detail: "value 2 MiB > 1 MiB".into(),
+                resumable: false,
             },
             Code::ResourceExhausted,
         ),
@@ -171,6 +172,7 @@ async fn m1_grpc_03_conflict_and_not_found_outcomes_arrive_as_ok_responses() {
     store.set_mutation(MutationResponse::conflict(9, true, 4));
     let response = client
         .put(pb::PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/a"),
             value: Bytes::from_static(b"v"),
             expected_mod_revision: Some(3),
@@ -188,6 +190,7 @@ async fn m1_grpc_03_conflict_and_not_found_outcomes_arrive_as_ok_responses() {
     store.set_mutation(MutationResponse::not_found(9));
     let response = client
         .delete(pb::DeleteRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/missing"),
             expected_mod_revision: None,
         })
@@ -309,7 +312,10 @@ async fn m1_grpc_06_status_mapping_round_trips_every_variant() {
             current_mod_revision: 12,
         },
         ConfigError::NotFound,
-        ConfigError::ResourceExhausted { detail: "x".into() },
+        ConfigError::ResourceExhausted {
+            detail: "x".into(),
+            resumable: false,
+        },
         ConfigError::Unauthenticated { detail: "x".into() },
         ConfigError::PermissionDenied { detail: "x".into() },
         ConfigError::InvalidArgument { detail: "x".into() },
@@ -425,6 +431,9 @@ async fn m1_grpc_08_every_request_field_reaches_the_store() {
             prefix: Bytes::from_static(b"/app/"),
             max_items: 33,
             max_bytes: 4096,
+            // Absent, not empty: this is the M0-M3 call, which must keep behaving exactly as
+            // it did before pagination existed (M6, ADR-0029).
+            page_token: None,
         })
         .await
         .expect("list");
@@ -435,6 +444,7 @@ async fn m1_grpc_08_every_request_field_reaches_the_store() {
 
     client
         .put(pb::PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/put"),
             value: Bytes::from_static(b"value-bytes"),
             expected_mod_revision: Some(17),
@@ -452,6 +462,7 @@ async fn m1_grpc_08_every_request_field_reaches_the_store() {
 
     client
         .delete(pb::DeleteRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/delete"),
             expected_mod_revision: Some(5),
         })
@@ -464,6 +475,7 @@ async fn m1_grpc_08_every_request_field_reaches_the_store() {
     // `None` is a different precondition from `Some(0)` and must not collapse into it.
     client
         .put(pb::PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/put"),
             value: Bytes::from_static(b"v"),
             expected_mod_revision: None,
@@ -510,6 +522,7 @@ async fn m1_grpc_09_every_response_field_reaches_the_caller() {
             prefix: Bytes::from_static(b"/app/"),
             max_items: 1,
             max_bytes: 0,
+            page_token: None,
         })
         .await
         .expect("list")
@@ -525,6 +538,7 @@ async fn m1_grpc_09_every_response_field_reaches_the_caller() {
     store.set_mutation(MutationResponse::conflict(30, true, 29));
     let response = client
         .put(pb::PutRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/a"),
             value: Bytes::from_static(b"v"),
             expected_mod_revision: Some(1),
@@ -538,6 +552,7 @@ async fn m1_grpc_09_every_response_field_reaches_the_caller() {
     store.set_mutation(MutationResponse::not_found(31));
     let response = client
         .delete(pb::DeleteRequest {
+            dedup: None,
             key: Bytes::from_static(b"/app/missing"),
             expected_mod_revision: None,
         })

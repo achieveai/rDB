@@ -26,6 +26,7 @@ fn options() -> GrpcClientOptions {
 
 fn put() -> PutRequest {
     PutRequest {
+        dedup: None,
         key: Bytes::from_static(b"/app/a"),
         value: Bytes::from_static(b"v"),
         expected_mod_revision: None,

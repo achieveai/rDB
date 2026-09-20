@@ -13,7 +13,8 @@ use config_core::{
     Action, AllowAll, AllowlistPolicy, Authorizer, Authz, Capabilities, ConfigError, ConfigStore,
     Dedup, DeleteRequest, Durability, GetRequest, GetResponse, Grant, KvState, LeaderHint,
     ListRequest, ListResponse, MutationResponse, NodeId, Pagination, Principal, PrincipalKind,
-    PutRequest, StaticAllowlist, StatusClass, TransportSecurity, WatchResumption,
+    PutRequest, StaticAllowlist, StatusClass, TransportSecurity, WatchRequest, WatchResumption,
+    WatchStream,
 };
 
 /// TA-12: the whole struct is compared in one assertion, so an added field is a visible
@@ -285,6 +286,15 @@ impl ConfigStore for SingleNodeStore {
             .ok_or_else(|| ConfigError::invalid_argument("rejected at apply"))
     }
 
+    /// This store keeps no event journal, and its capability report says so
+    /// ([`WatchResumption::Unsupported`]). Refusing here is the honest answer: a stream that
+    /// replayed nothing would look like "no events yet" to a caller.
+    async fn watch(&self, _request: WatchRequest) -> Result<WatchStream, ConfigError> {
+        Err(ConfigError::Unavailable {
+            reason: config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string(),
+        })
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities::EPHEMERAL_DEVELOPMENT
     }
@@ -307,6 +317,7 @@ fn config_store_is_object_safe_and_principal_free() {
                 key: bytes::Bytes::from_static(b"k"),
                 value: bytes::Bytes::from_static(b"v"),
                 expected_mod_revision: None,
+                dedup: None,
             })
             .await
             .expect("put succeeds");
@@ -320,6 +331,7 @@ fn config_store_is_object_safe_and_principal_free() {
             .delete(DeleteRequest {
                 key: bytes::Bytes::from_static(b"k"),
                 expected_mod_revision: Some(0),
+                dedup: None,
             })
             .await
             .expect_err("expected = 0 is invalid for Delete");

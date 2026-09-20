@@ -53,6 +53,7 @@ fn max_size_value() -> Bytes {
 
 fn put_value(k: &str, value: Bytes) -> PutRequest {
     PutRequest {
+        dedup: None,
         key: key(k),
         value,
         expected_mod_revision: None,

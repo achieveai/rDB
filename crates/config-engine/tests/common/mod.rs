@@ -59,6 +59,7 @@ pub fn put_request(k: &str, v: &str) -> PutRequest {
         key: key(k),
         value: key(v),
         expected_mod_revision: None,
+        dedup: None,
     }
 }
 
@@ -90,21 +91,92 @@ impl Cluster {
     }
 
     /// Start `n` nodes, giving each one the advisory gossip source `gossip(id)` returns.
+    /// [`Cluster::formed`] on nodes that enforce `limits` rather than [`Limits::DEFAULT`].
+    ///
+    /// Exists for the M4 admission rows: a cap of 1000 streams is the right production default
+    /// and the wrong test fixture, and lowering it per test beats opening a thousand streams.
+    pub async fn formed_with_limits(n: u64, limits: config_core::Limits) -> Cluster {
+        let cluster = Cluster::start_with_gossip_and_tweak(
+            n,
+            RaftTimers::default(),
+            |_| Arc::new(NoGossip),
+            move |cfg| {
+                cfg.limits = limits;
+            },
+        )
+        .await;
+        cluster.form().await;
+        cluster.wait_leader().await;
+        cluster.wait_formed().await;
+        cluster
+    }
+
     pub async fn start_with_gossip(
         n: u64,
         timers: RaftTimers,
         gossip: impl Fn(NodeId) -> Arc<dyn GossipObservationSource>,
+    ) -> Cluster {
+        Self::start_with_gossip_and_tweak(n, timers, gossip, |_| {}).await
+    }
+
+    /// [`Cluster::start_with_gossip`] with a last-minute change to every node's config.
+    pub async fn start_with_gossip_and_tweak(
+        n: u64,
+        timers: RaftTimers,
+        gossip: impl Fn(NodeId) -> Arc<dyn GossipObservationSource>,
+        tweak: impl Fn(&mut NodeConfig),
+    ) -> Cluster {
+        Self::start_full(n, timers, gossip, |_| Arc::new(AllowAll), tweak).await
+    }
+
+    /// Start, form and wait for a leader on nodes that authorize through `authorizer`.
+    ///
+    /// The M6 policy rows need a *shared* authorizer object, not just a shared decision: the
+    /// test adopts a new document through the same handle the node holds, which is what makes
+    /// a reload observable without restarting anything (ADR-0027).
+    ///
+    /// Wired as `AuthzKind::SignedPolicy`, which is the only model whose presence the node
+    /// re-reads from its authorizer: a node left at the default `Development` kind would report
+    /// `Authz::Development` from `capabilities()` and would stay ready with no document at all,
+    /// so neither M6-38 nor M6-27 could be stated against it.
+    pub async fn formed_with_authorizer(
+        n: u64,
+        authorizer: Arc<dyn config_core::Authorizer>,
+    ) -> Cluster {
+        let cluster = Cluster::start_full(
+            n,
+            RaftTimers::default(),
+            |_| Arc::new(NoGossip),
+            |_| Arc::clone(&authorizer),
+            |cfg| cfg.authz_kind = config_engine::AuthzKind::SignedPolicy,
+        )
+        .await;
+        cluster.form().await;
+        cluster.wait_leader().await;
+        cluster.wait_formed().await;
+        cluster
+    }
+
+    /// The one place a cluster's nodes are constructed; every other starter narrows it.
+    async fn start_full(
+        n: u64,
+        timers: RaftTimers,
+        gossip: impl Fn(NodeId) -> Arc<dyn GossipObservationSource>,
+        authorizer: impl Fn(NodeId) -> Arc<dyn config_core::Authorizer>,
+        tweak: impl Fn(&mut NodeConfig),
     ) -> Cluster {
         let faults = NetFault::new();
         let transport = Arc::new(InProcTransport::new(faults.clone()));
         let mut nodes = BTreeMap::new();
         let mut stores = BTreeMap::new();
         for id in 1..=n {
-            let (node, store) = start_one(
+            let (node, store) = start_one_with(
                 identity(id),
                 timers,
                 Arc::clone(&transport),
                 gossip(NodeId(id)),
+                authorizer(NodeId(id)),
+                &tweak,
             )
             .await;
             transport.register(NodeId(id), node.peer_handler());
@@ -350,6 +422,7 @@ impl Cluster {
                 DeleteRequest {
                     key: key(k),
                     expected_mod_revision: None,
+                    dedup: None,
                 },
             )
             .await
@@ -461,20 +534,25 @@ pub async fn start_one_with(
     authorizer: Arc<dyn config_core::Authorizer>,
     tweak: impl FnOnce(&mut NodeConfig),
 ) -> (ConfigNode, EphemeralStore) {
-    let store = EphemeralStore::new(
-        identity,
-        config_core::Limits::DEFAULT,
-        Arc::new(NoFaults),
-        tracing::info_span!("store", node_id = identity.node_id.0),
-    );
     let mut cfg = node_config(identity, timers);
     tweak(&mut cfg);
+    // Built before the store, because the store publishes into it (ADR-0020). `tweak` has
+    // already run, so a test that lowered the watch caps gets a hub that enforces its values.
+    let watch = config_engine::WatchHub::with_defaults(cfg.limits.watch);
+    let store = EphemeralStore::new(
+        identity,
+        cfg.limits,
+        Arc::new(NoFaults),
+        tracing::info_span!("store", node_id = identity.node_id.0),
+        Arc::clone(&watch) as Arc<dyn config_storage::AppliedBatchSink>,
+    );
     let node = ConfigNode::start(
         cfg,
         StorageHandle::from(store.clone()),
         transport,
         gossip,
         authorizer,
+        watch,
     )
     .await
     .expect("node start");

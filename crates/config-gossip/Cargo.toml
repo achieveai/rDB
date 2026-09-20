@@ -9,6 +9,10 @@ description = "rEtcd memberlist adapter exposing advisory ObservedPeerHint data 
 config-core = { workspace = true }
 memberlist = { workspace = true }
 postcard = { workspace = true }
+serde = { workspace = true }
+# Gossip keys are identified in logs, in the hint trailer and on the admin plane by a
+# truncated SHA-256 rather than by their bytes (ADR-0028). Already a workspace dependency.
+sha2 = { workspace = true }
 smol_str = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

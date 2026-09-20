@@ -597,35 +597,103 @@ async fn m2_26_crash_after_state_batch() {
 // Matrix-level rows (M2-27, M2-28, M2-29)
 // =====================================================================================
 
-/// M2-27: the crash matrix in this file (and M2-28/M2-29 below) covers `Boundary::ALL`, and
-/// `ALL` has exactly the 8 boundaries ADR-0008/TA-13 names — a compile-time guard against a
-/// silently-dropped boundary the day the enum grows. The exhaustive `match` is the actual
-/// guard: adding a ninth `Boundary` variant fails this file to compile until every arm below is
-/// updated for it.
+/// M2-27 / M4-96: the crash matrix in this file (and M2-28/M2-29 below, plus the M4 journal
+/// matrix in `m4_journal_boundary.rs`) covers `Boundary::ALL`. M4 grew the enum from 8 to 9
+/// with `AfterStateBatchBeforePublish` (TA-28); M5 added eight more concurrently on this same
+/// branch (snapshot publish/install/purge boundaries — `config-storage/src/fault.rs`), taking
+/// `ALL` to 17. Per the lead's M4 tester ruling, this row deliberately does **not** use an
+/// exhaustive `match` over `Boundary` any more — a match that must list every variant would
+/// fail to compile every time either milestone lands a new one, on a file this row does not
+/// own. Coverage is asserted by iterating `Boundary::ALL` and checking each boundary is
+/// nameable/usable (`Debug`), not by exhaustive pattern matching. M4-96 pins the count M4
+/// actually shipped against (9 boundaries at the point M4's fault-injection rows were written);
+/// this row tracks the live total, which now includes M5's boundaries too — M4 does not add
+/// fault-injection rows for those, that is dev-snapshot's/M5's work.
 #[test]
 fn m2_27_crash_boundary_table_is_exhaustive() {
     assert_eq!(
         Boundary::ALL.len(),
-        8,
-        "Boundary::ALL grew or shrank; the crash matrix above (M2-19..M2-26) needs a matching row"
+        17,
+        "Boundary::ALL grew or shrank; the crash matrix above (M2-19..M2-26, M4-89..M4-96) \
+         needs a matching row for any new *M4* boundary. M4 added AfterStateBatchBeforePublish \
+         (TA-28) taking the count to 9; M5 added eight snapshot/install/purge boundaries \
+         (BeforeSnapshotTmpSync, AfterSnapshotRename, BeforeCurrentSnapshotMeta, \
+         BeforeInstallMarker, AfterInstallDropCf, BeforeInstallFinalBatch, BeforePurge, \
+         AfterPurge) taking it to 17 — those are dev-snapshot's rows, not this file's. If this \
+         fires again, update the expected count here to match config_storage::Boundary::ALL's \
+         live length, not the (nonexistent) match shape below."
     );
+    // No exhaustive match over `Boundary`: a per-variant match arm would fail to compile every
+    // time M4 or the concurrent M5 wave adds a boundary, on a file this row does not own.
+    // Every boundary just needs to be distinct and formattable — proven by iterating
+    // `Boundary::ALL` (a wildcard-shaped loop, not per-variant arms), matching TA-28.3's "the
+    // hook is consulted on every crossing" without naming each one.
+    let mut seen = std::collections::BTreeSet::new();
     for b in Boundary::ALL {
-        match b {
-            Boundary::BeforeVoteSync
-            | Boundary::AfterVoteSync
-            | Boundary::BeforeLogAppend
-            | Boundary::AfterLogAppend
-            | Boundary::BeforeLogFlush
-            | Boundary::AfterLogFlush
-            | Boundary::BeforeStateBatch
-            | Boundary::AfterStateBatch => {}
-        }
+        let rendered = format!("{b:?}");
+        assert!(
+            !rendered.is_empty(),
+            "Boundary::{b:?} must be Debug-formattable"
+        );
+        assert!(
+            seen.insert(rendered),
+            "Boundary::ALL contains a duplicate: {b:?}"
+        );
+    }
+    assert_eq!(
+        seen.len(),
+        Boundary::ALL.len(),
+        "Boundary::ALL must have no duplicates"
+    );
+}
+
+/// M4-96: `boundary_table_is_exhaustive` — cites M2-27 by ID (test plan §3.8) so the pair
+/// cannot drift silently. Originally pinned to exactly 9 (M4's own count: the original 8 plus
+/// `AfterStateBatchBeforePublish`); M5 landed eight more boundaries concurrently on this same
+/// branch (see M2-27's doc comment above), so this row now asserts what M4-96 actually cares
+/// about — that M4's own boundary is present and every M4 fault-injection row (M4-89..M4-95)
+/// still has a nameable target — rather than a total this file does not own past M4's slice.
+#[test]
+fn m4_96_boundary_table_is_exhaustive() {
+    assert!(
+        Boundary::ALL.len() >= 9,
+        "Boundary::ALL must contain at least the 9 boundaries M4 shipped against \
+         (found {}); M2-27 in this file tracks the live total",
+        Boundary::ALL.len()
+    );
+    assert!(
+        Boundary::ALL.contains(&Boundary::AfterStateBatchBeforePublish),
+        "M4-96 requires the M4 boundary to be present in Boundary::ALL"
+    );
+    // The 8 boundaries before it (M2/M3) and the M4 one itself must all still be reachable by
+    // name — M5's additions are exercised by dev-snapshot's own rows, not here.
+    let m4_and_earlier = [
+        Boundary::BeforeVoteSync,
+        Boundary::AfterVoteSync,
+        Boundary::BeforeLogAppend,
+        Boundary::AfterLogAppend,
+        Boundary::BeforeLogFlush,
+        Boundary::AfterLogFlush,
+        Boundary::BeforeStateBatch,
+        Boundary::AfterStateBatch,
+        Boundary::AfterStateBatchBeforePublish,
+    ];
+    assert_eq!(m4_and_earlier.len(), 9);
+    for b in m4_and_earlier {
+        assert!(
+            Boundary::ALL.contains(&b),
+            "M4-96: {b:?} (M2/M3/M4 boundary) missing from Boundary::ALL"
+        );
     }
 }
 
 /// A small seeded linear-congruential sequence — no external `rand` dependency for ten indices.
 /// The seed is fixed and printed in every panic message, so a failure names exactly which
 /// boundary in which position broke, and the run is exactly reproducible.
+///
+/// Draws from [`support::DRIVEABLE_BOUNDARIES`], not `Boundary::ALL`: this row's driver is an
+/// ordinary put or a vote-triggering isolate, which cannot cross any of M5's snapshot boundaries
+/// (see that constant's doc comment).
 fn seeded_boundaries(seed: u64, n: usize) -> Vec<Boundary> {
     let mut state = seed;
     (0..n)
@@ -633,8 +701,8 @@ fn seeded_boundaries(seed: u64, n: usize) -> Vec<Boundary> {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            let idx = ((state >> 33) % Boundary::ALL.len() as u64) as usize;
-            Boundary::ALL[idx]
+            let idx = ((state >> 33) % support::DRIVEABLE_BOUNDARIES.len() as u64) as usize;
+            support::DRIVEABLE_BOUNDARIES[idx]
         })
         .collect()
 }

@@ -31,6 +31,42 @@ pub struct ManifestVoter {
     pub peer: String,
     /// Client-plane endpoint a leader hint may name.
     pub client: String,
+    /// `"voter"` (the default) or `"learner"` (ADR-0023).
+    ///
+    /// Additive: absent means `"voter"`, so every ADR-0011 manifest written before M5 parses
+    /// unchanged. A learner-role entry tells a node what it *may become*, never what it is —
+    /// only a committed Raft entry changes membership — so a node whose own entry says
+    /// `learner` refuses to form and waits to be added by the leader.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+/// Refuse a manifest carrying a role nobody defined.
+///
+/// Every entry is checked, not just the reading node's: [`ManifestVoter::is_learner`] reads
+/// anything that is not `"learner"` as a voter, so an unchecked typo (`role = "leaner"`) would
+/// quietly put a node into the formation plan that the document meant to leave out.
+fn check_roles(voters: &[ManifestVoter]) -> Result<(), ManifestError> {
+    for entry in voters {
+        match entry.role.as_deref() {
+            None | Some("voter") | Some("learner") => {}
+            Some(role) => {
+                return Err(ManifestError::Mismatch(format!(
+                    "manifest gives node {} role {role:?}; the only roles are \"voter\" and \
+                     \"learner\"",
+                    entry.node_id
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+impl ManifestVoter {
+    /// Whether this entry carries `role = "learner"`.
+    fn is_learner(&self) -> bool {
+        self.role.as_deref() == Some("learner")
+    }
 }
 
 /// The manifest document.
@@ -104,8 +140,16 @@ pub struct VerifiedManifest {
     pub cluster_id: ClusterId,
     /// The recovery epoch it creates at.
     pub recovery_epoch: RecoveryEpoch,
-    /// `(node_id, peer endpoint, client endpoint)` for every voter, ascending by id.
+    /// `(node_id, peer endpoint, client endpoint)` for every **voter-role** entry, ascending by
+    /// id. A learner-role entry is deliberately absent: it is not part of the genesis
+    /// configuration, and putting it here would form a cluster that counts it toward quorum.
     pub voters: Vec<(NodeId, String, String)>,
+    /// This node's own `(peer, client)` endpoints as the manifest publishes them, whatever its
+    /// role. Held separately because a learner-role node is not in `voters` and still has to
+    /// have its bound addresses checked.
+    pub own_endpoints: (String, String),
+    /// Whether this node's own entry carries `role = "learner"` (ADR-0023).
+    pub self_is_learner: bool,
 }
 
 /// Read and verify a bootstrap manifest, and check everything that does not depend on a bound
@@ -194,29 +238,50 @@ pub fn verify_document(
         return Err(ManifestError::Mismatch("manifest names no voters".into()));
     }
 
-    let mut voters: Vec<(NodeId, String, String)> = manifest
-        .voters
-        .iter()
-        .map(|v| (NodeId(v.node_id), v.peer.clone(), v.client.clone()))
-        .collect();
-    voters.sort_by_key(|(id, _, _)| *id);
-    if voters.windows(2).any(|w| w[0].0 == w[1].0) {
+    // Uniqueness is checked over *every* entry, not only the voter-role ones: an id that
+    // appeared once as a voter and once as a learner would otherwise slip through and then
+    // disagree with itself about what it is.
+    let mut ids: Vec<NodeId> = manifest.voters.iter().map(|v| NodeId(v.node_id)).collect();
+    ids.sort();
+    if ids.windows(2).any(|w| w[0] == w[1]) {
         return Err(ManifestError::Mismatch(
             "manifest lists the same node id twice".into(),
         ));
     }
 
-    if !voters.iter().any(|(id, _, _)| *id == identity.node_id) {
-        return Err(ManifestError::Mismatch(format!(
-            "manifest does not list this node ({}) as a voter",
-            identity.node_id
-        )));
+    let own = manifest
+        .voters
+        .iter()
+        .find(|v| NodeId(v.node_id) == identity.node_id)
+        .ok_or_else(|| {
+            ManifestError::Mismatch(format!(
+                "manifest does not list this node ({})",
+                identity.node_id
+            ))
+        })?;
+    check_roles(&manifest.voters)?;
+    let self_is_learner = own.is_learner();
+    let own_endpoints = (own.peer.clone(), own.client.clone());
+
+    let mut voters: Vec<(NodeId, String, String)> = manifest
+        .voters
+        .iter()
+        .filter(|v| !v.is_learner())
+        .map(|v| (NodeId(v.node_id), v.peer.clone(), v.client.clone()))
+        .collect();
+    voters.sort_by_key(|(id, _, _)| *id);
+    if voters.is_empty() {
+        return Err(ManifestError::Mismatch(
+            "manifest names no voters; a manifest of learners creates nothing".into(),
+        ));
     }
 
     Ok(VerifiedManifest {
         cluster_id,
         recovery_epoch: RecoveryEpoch(manifest.recovery_epoch),
         voters,
+        own_endpoints,
+        self_is_learner,
     })
 }
 
@@ -232,20 +297,11 @@ pub fn check_endpoints(
     peer_endpoint: &str,
     client_endpoint: &str,
 ) -> Result<(), ManifestError> {
-    let own = manifest
-        .voters
-        .iter()
-        .find(|(id, _, _)| *id == identity.node_id)
-        .ok_or_else(|| {
-            ManifestError::Mismatch(format!(
-                "manifest does not list this node ({}) as a voter",
-                identity.node_id
-            ))
-        })?;
-    if own.1 != peer_endpoint || own.2 != client_endpoint {
+    let own = &manifest.own_endpoints;
+    if own.0 != peer_endpoint || own.1 != client_endpoint {
         return Err(ManifestError::Mismatch(format!(
             "manifest gives node {} peer {:?} / client {:?}, but this node serves {:?} / {:?}",
-            identity.node_id, own.1, own.2, peer_endpoint, client_endpoint
+            identity.node_id, own.0, own.1, peer_endpoint, client_endpoint
         )));
     }
     Ok(())
@@ -317,6 +373,33 @@ mod tests {
         ] {
             assert_eq!(parse_rfc3339_utc(bad), None, "{bad:?}");
         }
+    }
+
+    /// A role nobody defined is a refusal, wherever in the document it appears.
+    ///
+    /// The `"leaner"` case is the one that matters: silently reading it as a voter would form a
+    /// cluster counting a node the operator meant to leave out of quorum.
+    #[test]
+    fn only_voter_and_learner_are_roles() {
+        let entry = |node_id: u64, role: Option<&str>| ManifestVoter {
+            node_id,
+            peer: "127.0.0.1:1".to_string(),
+            client: "127.0.0.1:2".to_string(),
+            role: role.map(str::to_string),
+        };
+        let ok = [
+            entry(1, None),
+            entry(2, Some("voter")),
+            entry(3, Some("learner")),
+        ];
+        assert!(check_roles(&ok).is_ok());
+
+        // Second entry, so the check cannot be passing merely because it looks at the first.
+        let bad = [entry(1, None), entry(2, Some("leaner"))];
+        let err = check_roles(&bad).expect_err("an undefined role must be refused");
+        let text = err.to_string();
+        assert!(text.contains("node 2"), "{text}");
+        assert!(text.contains("leaner"), "{text}");
     }
 
     #[test]

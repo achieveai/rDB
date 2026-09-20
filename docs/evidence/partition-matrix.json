@@ -1,0 +1,168 @@
+{
+  "schema": 1,
+  "name": "partition-matrix",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "ff5c821785b05d4ff415e2fd7cf1e4cd059b5890",
+    "dirty": true,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-09-20T00:56:43Z",
+    "duration_ms": 8219,
+    "seed": 27958,
+    "scale_factor": 0.2,
+    "full_scale": false
+  },
+  "values": {
+    "acknowledged_mutations": 22,
+    "acknowledged_mutations_lost": 0,
+    "arrangements": 12,
+    "arrangements_expected": 12,
+    "duplicate_revisions": 0,
+    "repeats": 1,
+    "rows": [
+      {
+        "arrangement": "split_1|2_3",
+        "convergence_ms": 0,
+        "leader_after": 1,
+        "minority": [
+          1
+        ],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 0,
+        "writes_rejected": 3
+      },
+      {
+        "arrangement": "split_1_2|3",
+        "convergence_ms": 518,
+        "leader_after": 1,
+        "minority": [
+          3
+        ],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "split_1_3|2",
+        "convergence_ms": 515,
+        "leader_after": 1,
+        "minority": [
+          2
+        ],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "oneway_1_2",
+        "convergence_ms": 518,
+        "leader_after": 1,
+        "minority": [],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "oneway_1_3",
+        "convergence_ms": 520,
+        "leader_after": 1,
+        "minority": [],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "oneway_2_1",
+        "convergence_ms": 51,
+        "leader_after": 1,
+        "minority": [],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "oneway_2_3",
+        "convergence_ms": 52,
+        "leader_after": 1,
+        "minority": [],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "oneway_3_1",
+        "convergence_ms": 51,
+        "leader_after": 1,
+        "minority": [],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "oneway_3_2",
+        "convergence_ms": 51,
+        "leader_after": 1,
+        "minority": [],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "isolate_1",
+        "convergence_ms": 0,
+        "leader_after": 1,
+        "minority": [
+          1
+        ],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 0,
+        "writes_rejected": 3
+      },
+      {
+        "arrangement": "isolate_2",
+        "convergence_ms": 523,
+        "leader_after": 1,
+        "minority": [
+          2
+        ],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      },
+      {
+        "arrangement": "isolate_3",
+        "convergence_ms": 519,
+        "leader_after": 1,
+        "minority": [
+          3
+        ],
+        "repeat": 0,
+        "time_to_leader_ms": 0,
+        "writes_accepted": 1,
+        "writes_rejected": 2
+      }
+    ]
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

@@ -1,0 +1,12 @@
+%% title: Component dependencies
+%% caption: Arrows point from a crate to the crate it uses, and say what for. Every crate also uses config-core and config-log, and config-testkit uses them all; those arrows are left out.
+%% open: always
+%% milestones: M0 M1 M2 M3
+flowchart TB
+  @{sm-server} -->|serves client and admin planes| @{sm-grpc}
+  @{sm-server} -->|starts gossip membership| @{sm-gossip}
+  @{sm-server} -->|runs the node engine| @{sm-engine}
+  @{sm-server} -->|opens the RocksDB store| @{sm-storage}
+  @{sm-client} -->|dials gRPC transport| @{sm-grpc}
+  @{sm-grpc} -->|carries peer and admin calls for| @{sm-engine}
+  @{sm-engine} -->|keeps Raft log and state in| @{sm-storage}

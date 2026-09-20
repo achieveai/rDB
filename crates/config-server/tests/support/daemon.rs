@@ -57,6 +57,12 @@ pub struct DaemonSpec {
     pub unsafe_no_sync: bool,
     /// `--capabilities`.
     pub capabilities: bool,
+    /// `--break-glass-policy-rollback` (M6, ADR-0027). Process-scoped, not one-shot (OQ-57):
+    /// every rollback is permitted for the lifetime of a process spawned with this set.
+    pub break_glass_policy_rollback: bool,
+    /// `--compat-schema N` (M6, ADR-0030). Only `1` is accepted by the binary; `None` omits the
+    /// flag entirely, which is every pre-E2E-42 row's argv, byte for byte.
+    pub compat_schema: Option<u16>,
     /// Repeated `--log-field k=v`. The harness always passes `testModule`/`testMethod` so the
     /// cross-process DuckDB joins work (OQ-18).
     pub log_fields: Vec<(String, String)>,
@@ -79,6 +85,8 @@ impl DaemonSpec {
             dev_allow_all: false,
             unsafe_no_sync: false,
             capabilities: false,
+            break_glass_policy_rollback: false,
+            compat_schema: None,
             log_fields: Vec::new(),
         }
     }
@@ -103,10 +111,18 @@ impl DaemonSpec {
             ("--dev-allow-all", self.dev_allow_all),
             ("--unsafe-no-sync", self.unsafe_no_sync),
             ("--capabilities", self.capabilities),
+            (
+                "--break-glass-policy-rollback",
+                self.break_glass_policy_rollback,
+            ),
         ] {
             if on {
                 args.push(flag.into());
             }
+        }
+        if let Some(schema) = self.compat_schema {
+            args.push("--compat-schema".into());
+            args.push(schema.to_string());
         }
         for (k, v) in &self.log_fields {
             args.push("--log-field".into());
@@ -247,6 +263,19 @@ impl DaemonProcess {
     /// This node's id.
     pub fn node_id(&self) -> u64 {
         self.ready().node_id
+    }
+
+    /// This child process's OS process id.
+    ///
+    /// A row that proves a reload never restarts the daemon (E2E-41) reads this before and
+    /// after, rather than trusting that "no `wait_ready` was called again" implies "the same
+    /// process": a PID is the one thing the OS itself guarantees does not survive an exit/respawn
+    /// cycle.
+    pub fn pid(&self) -> u32 {
+        self.child
+            .as_ref()
+            .expect("the process has not been reaped")
+            .id()
     }
 
     /// Everything the child has written to stdout so far.

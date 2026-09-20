@@ -5,6 +5,8 @@ The rEtcd node daemon. One process = one node: a `config-engine` node behind the
 `config-log`.
 
 Normative behaviour is ADR-0018 (daemon lifecycle and CLI). This file is the operator view.
+For a one-command local cluster instead of hand-writing the files below, see
+[`docs/quickstart-local.md`](../../docs/quickstart-local.md).
 
 ## Running
 
@@ -23,7 +25,7 @@ Everything else goes to the log file.
 | `--form` | Form the cluster from the signed bootstrap manifest, then serve. A second `--form` against a store that is already formed exits `2`. |
 | `--capabilities` | Print the capability report as JSON and exit `0`. Opens no store, binds no listener, takes no lock, writes no log. |
 | `--allow-insecure-dev` | The only way `tls.mode = "insecure"` is accepted (ADR-0010). |
-| `--dev-allow-all` | The only way allow-all authorization is accepted (ADR-0012). |
+| `--dev-allow-all` | The only way allow-all authorization is accepted (ADR-0012). Refused on its own: it requires `--allow-insecure-dev` alongside it, so "this is a dev node" is one fact rather than two independent ones. Exits `2` before the config file is read. |
 | `--unsafe-no-sync` | Run RocksDB without fsync. Capabilities then report `PersistentUnverified`. |
 | `--shutdown-file <FILE>` | Shut down gracefully as soon as this file exists (polled every 100 ms). Windows has no `SIGTERM`. |
 | `--health-listen <ADDR>` | Serve `GET /health` as plaintext HTTP here. Loopback addresses only; anything else is refused at validation. |
@@ -72,9 +74,40 @@ election_max_ms = 1500
 [gossip]                                       # optional
 seeds = ["127.0.0.1:7313"]
 secret_key_hex = "…64 hex characters…"         # AES-256 key; absent means no encryption
+
+[watch]                                        # optional; engine defaults otherwise
+max_streams_per_node = 1000                    # concurrent watch streams this node serves
+max_streams_per_principal = 100                # concurrent watch streams one principal gets
+queue_events = 1024                            # undelivered events one stream may hold
+queue_bytes = 16777216                         # undelivered event bytes one stream may hold
+live_buffer_batches = 256                      # applied batches fanned out before a slow
+                                               #   stream is declared lagged
+progress_interval_ms = 5000                    # default for streams that ask for none;
+                                               #   100 … 3600000
+
+[retention]                                    # optional; every ceiling off by default
+max_age_secs = 86400                           # 0 (or absent) disables this ceiling
+max_revisions = 1000000                        # 0 (or absent) disables this ceiling
+max_bytes = 1073741824                         # 0 (or absent) disables this ceiling
+check_interval_secs = 60                       # how often the leader evaluates the ceilings
 ```
 
 Port `0` binds an ephemeral port; the ready line reports what the OS assigned.
+
+`[watch]` bounds what one watcher can pin on this node. A stream that exceeds `queue_events` or
+`queue_bytes` is **terminated**, not slowed: `apply` must never wait on a network consumer
+(spec §19 invariant 12), so the only way to bound memory is to end the stream and let the
+client reconnect at its last delivered revision. Every value must be greater than zero, and
+`max_streams_per_principal` may not exceed `max_streams_per_node`; a document that breaks
+either is exit code 2 rather than a node that refuses every `Watch` at runtime.
+
+`[retention]` is the only thing that deletes history. Each ceiling is independent and a `0` (or
+an omitted key) **disables** that one — leaving the whole section out means the journal is never
+compacted, because silently deleting a watcher's resume point is not a reasonable default for a
+setting nobody wrote. Only the leader evaluates them, and it does so by proposing an ordinary
+`Compact` command through the log, so every voter compacts at the same revision (ADR-0019). A
+client whose cursor falls below the resulting floor gets `OUT_OF_RANGE` carrying
+`retcd-min-revision`, and recovers with the list-to-watch flow (spec §11.2).
 
 `tls.allow_common_name_principals` lets a **client** certificate that asserts no `retcd://` SAN
 authenticate under its Common Name. It is `false` unless the document says otherwise, because a

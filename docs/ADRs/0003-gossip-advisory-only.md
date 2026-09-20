@@ -124,3 +124,17 @@ actually guarded by the golden byte vector in `config-gossip/tests/gossip.rs`
 (`m1_gossip_09_hint_wire_format_golden_bytes`), which failed on this change and was updated
 deliberately. The epoch is a postcard varint, so the 512-byte `MAX_HINT_BYTES` budget is
 unaffected even at `u32::MAX` — asserted by `a10_recovery_epoch_round_trips_over_the_gossip_wire`.
+
+### Note (2026-09-19, M6 gate): an ephemeral gossip port is bound up to eight times
+
+`memberlist-net 0.8.5` resolves a port-`0` bind by binding TCP first (ten tries) and then
+binding UDP on **the same port** with no retry. A port that was free for TCP can already be
+held for UDP by any other process, and on a busy host that happens: the M6 gate run lost
+E2E-43 twice to a node 0 whose ready line carried no gossip address, because
+`GossipNode::start` had failed and the daemon, per this ADR, continued without gossip.
+
+`GossipNode::start` now re-runs the whole bind up to `EPHEMERAL_BIND_ATTEMPTS` (8) times when
+`bind_addr` asks for port `0` and the failure is `GossipError::Start`; each retry is logged at
+debug as `gossip_ephemeral_bind_retry`. A fixed port is never retried: a taken fixed port is
+the operator's configuration, not the host's luck. The daemon's degrade-to-no-gossip behaviour
+is unchanged; only the odds of hitting it for a reason the operator cannot see have dropped.

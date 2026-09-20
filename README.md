@@ -104,6 +104,14 @@ Full flag reference, TOML schema, authorization policy format, and the health en
 [`crates/config-server/README.md`](crates/config-server/README.md) — that is the canonical
 operator doc; this section only orients you to it.
 
+### Local cluster in one command
+
+For local development, `scripts/local-cluster.ps1 up` (PowerShell) or
+`scripts/local-cluster.sh up` (Git Bash/Linux) generates a 3-node insecure dev cluster,
+starts it, and waits for a leader — no hand-written TOML required. `down` stops it, `status`
+re-checks health, `logs -Node/--node <n>` tails a node's JSONL, `clean` removes it. See
+[`docs/quickstart-local.md`](docs/quickstart-local.md).
+
 ## Embedding the library
 
 An embedding application builds a `ConfigNode` directly instead of running the daemon. This is
@@ -178,12 +186,15 @@ toolchain, daemon lifecycle, and more.
 
 ## Milestone status
 
-| Milestone | Status (2026-09-18) |
+| Milestone | Status (2026-09-19) |
 |---|---|
 | M0 — deterministic state-machine laboratory | Committed (`7014701`). |
 | M1 — three-node distributed core | Delivered in `01a58b8`; test-plan rows M1-01..49 covered. |
 | M2 — persistence and restart correctness | Delivered in `01a58b8`; `RocksStore` and the M2 harness delivered. |
 | M3 — safe remote use baseline (first release gate) | Delivered in `01a58b8`; `config-server` daemon, TLS/manifest fixtures and E2E-01..17 delivered. |
+| M4 — resumable watches | Gate passed, commit `33b5f4b`; watch hub, event journal, retention compaction, envelope v2 (ADR-0019..0021). |
+| M5 — operable lifecycle | Gate passed, commit `e54c6ef`; snapshots, log purge, admin plane, backup/restore, bounded dedup (ADR-0022..0026). |
+| M6 — production hardening (features-local) | Gate passed on `feature/m4-m6`; signed RBAC, TLS and gossip-key rotation, revision-pinned pagination, mixed-version gate, evidence rows, one-command local cluster (ADR-0027..0031). Evidence rows are dev-host artifacts, not production claims. |
 
 Each gate commit follows a critic review of that milestone's code and tests. The progress
 dashboard at [`docs/progress/index.html`](docs/progress/index.html) carries the live state.

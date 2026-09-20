@@ -203,3 +203,23 @@ channel, which the core only drops *after* the proposal was enqueued, so the ent
 be committed — and `Unavailable` tells the caller it was rejected before entering the log. The
 write path now answers `DeadlineExceededUnknownOutcome`; the read path keeps `Unavailable`,
 because `ensure_linearizable` submits nothing. `Fatal::StorageError` stays `FatalStorage` on both.
+
+## Note (2026-09-18, M5): automatic replay is permitted only with dedup enabled within the window
+
+The rule at the top of this ADR — the client library never automatically re-sends a mutation whose
+outcome is unknown — is unchanged as a default and unchanged for any client that has not opted in
+to ADR-0025's bounded request deduplication. This note records the one narrow amendment ADR-0025
+makes: automatic replay of a `DeadlineExceededUnknownOutcome` mutation is permitted **if and only
+if** both hold —
+
+1. the client called `with_dedup(client_id)` (ADR-0025) for that mutation, so the original
+   submission carried a `DedupKey`; and
+2. the replay is attempted within `dedup.window_requests` of the original `request_id` for that
+   `(principal, client_id)` pair.
+
+Under those two conditions, the leader's dedup lookup (ADR-0025) recognizes the replay as the same
+`(principal, client_id, request_id)` and returns the original outcome rather than double-applying
+the mutation — the replay is therefore safe by construction, not merely likely safe. Outside those
+two conditions — no dedup key, or a replay attempted after the window has closed — this ADR's
+original rule stands without exception: no automatic replay, and the documented recovery is still
+read-back-then-CAS. See ADR-0025 for the full mechanism.

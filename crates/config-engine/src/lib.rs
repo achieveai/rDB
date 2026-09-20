@@ -32,6 +32,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod admin;
 pub mod config;
 pub mod direct;
 pub mod error;
@@ -40,9 +41,14 @@ pub mod metrics;
 pub mod netfault;
 mod network;
 pub mod node;
+pub mod pagination;
 pub mod testing;
 pub mod transport;
+pub mod watch;
 
+pub use admin::{
+    AdminError, MembershipReport, ReplicationProgress, SnapshotTriggered, DEFAULT_PROMOTE_MAX_LAG,
+};
 pub use config::{AuthzKind, NodeConfig, RaftTimers, StorageHandle, MAX_PAYLOAD_ENTRIES};
 pub use direct::DirectClient;
 pub use error::{EngineError, FormationError, FormationPlan, Timeout};
@@ -51,12 +57,20 @@ pub use hint::{
     REASON_EPOCH_MISMATCH, REASON_NOT_FORMED, REASON_SELF_CLAIM, REASON_UNKNOWN_NODE,
 };
 pub use metrics::{
-    Health, HealthPayload, LogIdView, MembershipView, NodeMetrics, NodeRole, PolicySummary,
+    AuthnRejectReason, Health, HealthPayload, HistogramSnapshot, LatencyHistogram, LogIdView,
+    MembershipView, MetricsReport, NodeMetrics, NodeRole, OpLatencies, PolicyMetrics,
+    PolicySummary, TlsMetrics, LATENCY_BUCKETS_SECONDS,
 };
 pub use netfault::NetFault;
 pub use node::ConfigNode;
+pub use pagination::{PaginationConfig, Paginator, PinStats, PinTable};
 pub use testing::InProcTransport;
 pub use transport::{
     PeerEnvelopeMeta, PeerHandler, PeerReject, PeerRequest, PeerResponse, PeerSink, PeerTransport,
     TransportError,
+};
+pub use watch::{
+    JournalView, LeaderClock, ManualClock, PolicyChange, RetentionReason, StreamId, SystemClock,
+    TerminationReason, TrackedWatch, WatchHub, WatchStats, DEFAULT_PROGRESS_INTERVAL,
+    MAX_PROGRESS_INTERVAL, MIN_PROGRESS_INTERVAL,
 };

@@ -15,12 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = root.join("retcd/v1/config.proto");
     let peer = root.join("retcd/v1/peer.proto");
+    let admin = root.join("retcd/v1/admin.proto");
 
     println!("cargo:rerun-if-changed={}", root.display());
     println!("cargo:rerun-if-changed={}", config.display());
     println!("cargo:rerun-if-changed={}", peer.display());
+    println!("cargo:rerun-if-changed={}", admin.display());
 
-    let fds = protox::compile([&config, &peer], [&root])?;
+    let fds = protox::compile([&config, &peer, &admin], [&root])?;
 
     tonic_build::configure()
         .build_client(true)

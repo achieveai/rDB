@@ -73,6 +73,7 @@ async fn m3_51_not_leader_hint_over_grpc_mtls() {
 
     let mut client = config_grpc::pb::config_service_client::ConfigServiceClient::new(channel);
     let request = tonic::Request::new(config_grpc::pb::PutRequest {
+        dedup: None,
         key: Bytes::from_static(b"/m3-51"),
         value: Bytes::from_static(b"v"),
         expected_mod_revision: None,
@@ -226,6 +227,12 @@ impl HintingStore {
 
 #[async_trait::async_trait]
 impl config_core::ConfigStore for HintingStore {
+    async fn watch(
+        &self,
+        _request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, ConfigError> {
+        Err(self.err())
+    }
     async fn get(
         &self,
         _request: config_core::GetRequest,
@@ -265,6 +272,13 @@ struct CountingStore {
 
 #[async_trait::async_trait]
 impl config_core::ConfigStore for CountingStore {
+    async fn watch(
+        &self,
+        request: config_core::WatchRequest,
+    ) -> Result<config_core::WatchStream, ConfigError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.watch(request).await
+    }
     async fn get(
         &self,
         request: config_core::GetRequest,
@@ -330,6 +344,8 @@ async fn m3_54_hint_target_identity_validated_before_use() {
         config_grpc::TlsMode::MutualTls(fixture.node_mtls(NodeId(2))),
         CLUSTER,
         config_core::Limits::DEFAULT,
+        // No admin plane: these listeners exist to exercise hint following (M3-58).
+        None,
     )
     .expect("target listener starts");
     let target_endpoint = target_addr.to_string();
@@ -349,6 +365,8 @@ async fn m3_54_hint_target_identity_validated_before_use() {
         config_grpc::TlsMode::MutualTls(fixture.node_mtls(NodeId(1))),
         CLUSTER,
         config_core::Limits::DEFAULT,
+        // No admin plane: these listeners exist to exercise hint following (M3-58).
+        None,
     )
     .expect("follower listener starts");
     let follower_endpoint = follower_addr.to_string();

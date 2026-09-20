@@ -138,6 +138,7 @@ async fn raw_peer_call(
         to_node_id: to_hdr,
         payload_encoding: PAYLOAD_ENCODING_POSTCARD,
         payload: payload.into(),
+        schema: None,
     };
     let mut client = config_grpc::pb::peer_service_client::PeerServiceClient::new(channel);
     client.vote(tonic::Request::new(envelope)).await?;
@@ -549,15 +550,29 @@ async fn m3_08_peer_plaintext_connection_rejected() {
     // that nothing was refused at the application layer. A connection that got as far as the
     // handler would show up as either a `from` outside the membership or a rejection line.
     let members: Vec<String> = cluster.ids().iter().map(|id| id.0.to_string()).collect();
-    let peer_lines = my_log_lines_since(module_path!(), METHOD, since);
-    let peer_lines: Vec<_> = peer_lines
-        .iter()
-        .filter(|row| {
-            field(row, "@logger")
-                .map(|l| l.starts_with("config_grpc::peer"))
-                .unwrap_or(false)
-        })
-        .collect();
+    // The members keep heartbeating, but an acceptor that refuses the probe in a few
+    // milliseconds leaves a window shorter than one heartbeat interval, so "what landed since
+    // the baseline" can legitimately be nothing yet. Wait for the next legitimate peer-plane
+    // line instead of asserting on that window (anti-flake rule 1; M6 gate, 2026-09-19).
+    let peer_lines: Vec<serde_json::Value> = cluster
+        .wait_for(
+            "a peer-plane log line since the baseline",
+            cluster.deadline(2),
+            || {
+                let lines: Vec<serde_json::Value> =
+                    my_log_lines_since(module_path!(), METHOD, since)
+                        .into_iter()
+                        .filter(|row| {
+                            field(row, "@logger")
+                                .map(|l| l.starts_with("config_grpc::peer"))
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                (!lines.is_empty()).then_some(lines)
+            },
+        )
+        .await
+        .unwrap_or_default();
     let foreign: Vec<_> = peer_lines
         .iter()
         .filter(|row| {
@@ -570,7 +585,7 @@ async fn m3_08_peer_plaintext_connection_rejected() {
         "a plaintext connection reached the peer plane ({outcome}); lines: {foreign:#?}"
     );
     config_testkit::logs::assert_nonempty(
-        &peer_lines.iter().map(|r| (*r).clone()).collect::<Vec<_>>(),
+        &peer_lines,
         "peer-plane traffic between the real members (an empty log would make the check above vacuous)",
     );
 
@@ -823,6 +838,7 @@ async fn m3_12_peer_client_cert_required() {
                     to_node_id: target.0,
                     payload_encoding: PAYLOAD_ENCODING_POSTCARD,
                     payload: payload.into(),
+                    schema: None,
                 }))
                 .await
                 .err()

@@ -46,6 +46,25 @@ pub const HEADER_LEADER_ENDPOINT: &str = "retcd-leader-endpoint";
 pub const HEADER_CONFLICT_EXISTS: &str = "retcd-conflict-exists";
 /// Metadata key carrying `current_mod_revision` for a [`ConfigError::Conflict`].
 pub const HEADER_CONFLICT_MOD_REVISION: &str = "retcd-conflict-mod-revision";
+/// Metadata key carrying `minimum_available_revision` for a
+/// [`ConfigError::RevisionCompacted`] (M4, ADR-0020, lead ruling R9).
+///
+/// `OUT_OF_RANGE` has exactly one meaning in this system, so the header is the number the
+/// client needs rather than a second copy of the reason — the code already carries that.
+pub const HEADER_MIN_REVISION: &str = "retcd-min-revision";
+/// Metadata key carrying `resumable` for a [`ConfigError::ResourceExhausted`] (M4).
+///
+/// Load-bearing: an admission refusal and a slow-consumer termination share
+/// `RESOURCE_EXHAUSTED`, and only this header tells a client whether reconnecting at its last
+/// delivered revision is the right move or a retry storm.
+pub const HEADER_RESUMABLE: &str = "retcd-resumable";
+
+/// Why a continuation token was refused (M6, ADR-0029).
+///
+/// One of [`config_core::PageTokenExpiredReason`]'s snake_case strings, and the same closed
+/// set the `page_token_rejected` log line and the pin registry's counters use, so a client's
+/// branch, an operator's alert and a test assertion cannot drift apart (test plan Q-30).
+pub const HEADER_REASON: &str = "retcd-reason";
 
 /// Failures of the transport itself, as opposed to a semantic [`ConfigError`].
 #[derive(Debug, thiserror::Error)]
@@ -88,8 +107,28 @@ pub const fn code_for(class: StatusClass) -> Code {
         StatusClass::PermissionDenied => Code::PermissionDenied,
         StatusClass::Unauthenticated => Code::Unauthenticated,
         StatusClass::Internal => Code::Internal,
+        StatusClass::OutOfRange => Code::OutOfRange,
     }
 }
+
+/// The [`ConfigError::PermissionDenied`] reasons that are part of the wire contract.
+///
+/// A closed set on purpose: each one is a *state* the client can act on — retry once the
+/// cluster converges, re-list and restart a watch, mint a fresh page token — rather than a
+/// description of who was denied what. Adding a member here is an API change.
+const MACHINE_READABLE_DENIALS: [&str; 3] = [
+    config_core::REASON_POLICY_CHANGED,
+    config_core::REASON_POLICY_CONVERGING,
+    config_core::REASON_TOKEN_PRINCIPAL,
+];
+
+/// The [`ConfigError::Unavailable`] reasons that are part of the wire contract.
+///
+/// Closed for the same reason as [`MACHINE_READABLE_DENIALS`]: most `Unavailable` reasons are
+/// operator prose about *this* node's state, while this one is a cluster-wide fact the client
+/// can act on — the feature is off until the slowest voter is upgraded, so retrying the same
+/// call in a second is pointless (ADR-0030 M6-93).
+const MACHINE_READABLE_UNAVAILABLE: [&str; 1] = [config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED];
 
 /// Map a semantic error onto the wire.
 ///
@@ -108,6 +147,38 @@ pub fn status_from_error(err: &ConfigError) -> Status {
                 hint.node_id.0.to_string(),
             );
             insert_ascii(&mut status, HEADER_LEADER_ENDPOINT, hint.endpoint.clone());
+        }
+        ConfigError::RevisionCompacted {
+            minimum_available_revision,
+        } => {
+            insert_ascii(
+                &mut status,
+                HEADER_MIN_REVISION,
+                minimum_available_revision.to_string(),
+            );
+        }
+        ConfigError::ResourceExhausted { resumable, .. } => {
+            insert_ascii(&mut status, HEADER_RESUMABLE, resumable.to_string());
+        }
+        ConfigError::PageTokenExpired { reason } => {
+            insert_ascii(&mut status, HEADER_REASON, reason.to_string());
+        }
+        ConfigError::PermissionDenied { .. } => {
+            // Only the closed set below reaches the trailer. Most denials carry operator prose
+            // naming the principal and the key, and copying prose into a header that clients
+            // branch on would turn a log message into an API — and leak the key hex while
+            // doing it.
+            if let Some(reason) = err
+                .permission_denied_reason()
+                .filter(|r| MACHINE_READABLE_DENIALS.contains(r))
+            {
+                insert_ascii(&mut status, HEADER_REASON, reason.to_string());
+            }
+        }
+        ConfigError::Unavailable { reason } => {
+            if MACHINE_READABLE_UNAVAILABLE.contains(&reason.as_str()) {
+                insert_ascii(&mut status, HEADER_REASON, reason.clone());
+            }
         }
         ConfigError::Conflict {
             exists,
@@ -171,7 +242,20 @@ pub fn error_from_status(status: &Status) -> ConfigError {
     let detail = status.message().to_string();
     match status.code() {
         Code::InvalidArgument => ConfigError::InvalidArgument { detail },
-        Code::ResourceExhausted => ConfigError::ResourceExhausted { detail },
+        Code::ResourceExhausted => ConfigError::ResourceExhausted {
+            detail,
+            // Absent means "not resumable": treating an unmarked exhaustion as resumable
+            // would turn a peer that does not speak this header into a reconnect loop.
+            resumable: meta_str(status, HEADER_RESUMABLE) == Some("true"),
+        },
+        Code::OutOfRange => ConfigError::RevisionCompacted {
+            // A server always sends the header. Without it the only safe reading is "nothing
+            // is available", which sends the caller to the list-then-watch flow — the exact
+            // recovery the error asks for.
+            minimum_available_revision: meta_str(status, HEADER_MIN_REVISION)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        },
         Code::NotFound => ConfigError::NotFound,
         Code::DeadlineExceeded => ConfigError::DeadlineExceededUnknownOutcome,
         Code::PermissionDenied => ConfigError::PermissionDenied { detail },
@@ -190,6 +274,14 @@ pub fn error_from_status(status: &Status) -> ConfigError {
 }
 
 fn failed_precondition(status: &Status) -> ConfigError {
+    // Checked before the conflict and leader-hint readings: a page-token refusal carries
+    // neither of their headers, and the fall-through below is `NotLeader`, which would send a
+    // client chasing a leader over a cursor that simply expired.
+    if let Some(reason) =
+        meta_str(status, HEADER_REASON).and_then(config_core::PageTokenExpiredReason::from_trailer)
+    {
+        return ConfigError::PageTokenExpired { reason };
+    }
     if let Some(rev) = meta_str(status, HEADER_CONFLICT_MOD_REVISION).and_then(|v| v.parse().ok()) {
         return ConfigError::Conflict {
             exists: meta_str(status, HEADER_CONFLICT_EXISTS) == Some("true"),
@@ -228,5 +320,48 @@ pub fn leader_hint(status: &Status) -> Option<LeaderHint> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M6-93, the wire half: the schema gate's refusal is `UNAVAILABLE` *and* machine-readable.
+    ///
+    /// The trailer is the whole contract. A client that can only read the message text has to
+    /// match on prose to tell "the cluster is mid-upgrade, back off" from "this node is
+    /// briefly busy, retry now", and prose is not an API (ADR-0030 M6-93).
+    #[test]
+    fn the_schema_gate_refusal_carries_its_reason_trailer() {
+        let status = status_from_error(&ConfigError::Unavailable {
+            reason: config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED.to_string(),
+        });
+
+        assert_eq!(status.code(), Code::Unavailable, "a transient class");
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_REASON)
+                .and_then(|v| v.to_str().ok()),
+            Some(config_core::UNAVAILABLE_FEATURE_NOT_ACTIVATED)
+        );
+    }
+
+    /// The other half of the closed allowlist: ordinary `Unavailable` prose stays out of it.
+    ///
+    /// Without this, the arm above would be indistinguishable from "copy every reason into a
+    /// header", which is how an operator-facing string becomes something clients branch on.
+    #[test]
+    fn an_ordinary_unavailable_reason_stays_out_of_the_trailer() {
+        let status = status_from_error(&ConfigError::Unavailable {
+            reason: "this node has no snapshot to serve yet".to_string(),
+        });
+
+        assert_eq!(status.code(), Code::Unavailable);
+        assert!(
+            status.metadata().get(HEADER_REASON).is_none(),
+            "only the closed set reaches the trailer"
+        );
     }
 }

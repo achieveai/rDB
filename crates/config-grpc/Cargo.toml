@@ -9,6 +9,7 @@ description = "rEtcd gRPC transport: client plane, Raft peer plane, TLS profiles
 config-core = { workspace = true }
 config-engine = { workspace = true }
 config-log = { workspace = true }
+futures-core = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 postcard = { workspace = true }
@@ -16,6 +17,15 @@ prost = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+# The rotating acceptor (ADR-0028) needs the rustls types directly. Not a new vendor: both
+# already arrive with `tonic`'s `tls` feature, and `default-features = false` keeps the crypto
+# provider whatever tonic selected rather than letting this crate pick a second one.
+tokio-rustls = { version = "0.26", default-features = false }
+rustls-pemfile = "2"
+# A served certificate is reported and alerted on by its fingerprint and its `notAfter`
+# (ADR-0026, ADR-0028), both of which are read off the same DER this crate already parses for
+# SANs. Already a workspace dependency.
+sha2 = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 x509-parser = { workspace = true }
@@ -26,6 +36,13 @@ tonic-build = { workspace = true }
 
 [dev-dependencies]
 config-log = { workspace = true }
+# The rotator's unit tests write real PEM files, because re-reading files is the behaviour
+# under test (ADR-0028).
+tempfile = { workspace = true }
+# "Warns once per crossing" is a statement about emitted events, so the test counts the events
+# rather than the latch that suppresses them — a latch assertion passes even with the
+# suppression removed. Already a workspace dependency, used by `config-log`.
+tracing-subscriber = { workspace = true }
 config-storage = { workspace = true }
 openraft = { workspace = true }
 rcgen = { workspace = true }

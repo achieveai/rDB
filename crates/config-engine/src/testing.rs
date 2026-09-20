@@ -96,7 +96,10 @@ fn reject_to_transport_error(reject: PeerReject) -> TransportError {
         PeerReject::WrongCluster { .. }
         | PeerReject::WrongEpoch { .. }
         | PeerReject::WrongDestination { .. }
-        | PeerReject::IdentityMismatch(_) => TransportError::IdentityRejected(reject.to_string()),
+        | PeerReject::IdentityMismatch(_)
+        // A retired sender is fenced out, not flaky: the sender backs off exactly as it does
+        // for a cluster mismatch, and its log says which (M5, ADR-0023).
+        | PeerReject::Retired { .. } => TransportError::IdentityRejected(reject.to_string()),
         // The peer exists but is not serving: backoff, exactly as for a closed port.
         PeerReject::NotRunning => TransportError::Unreachable(reject.to_string()),
         PeerReject::Raft(_) => TransportError::Remote(reject.to_string()),
@@ -129,5 +132,23 @@ impl PeerTransport for InProcTransport {
                 }
             })
             .await
+    }
+
+    async fn send_with_schema(
+        &self,
+        meta: PeerEnvelopeMeta,
+        endpoint: &str,
+        req: PeerRequest,
+        deadline: Duration,
+        schema: config_core::SchemaTriple,
+    ) -> Result<(PeerResponse, Option<config_core::SchemaTriple>), TransportError> {
+        // The caller's schema goes nowhere: an in-process call has no envelope to carry it, and
+        // only the *answer* feeds the minimum (M6-86). Read before the call so a peer that
+        // fails the call still reports the schema it would have answered with — the routing
+        // table, not the reply, is what an in-process peer's advertisement lives in.
+        let _ = schema;
+        let peer_schema = self.route(endpoint).map(|handler| handler.local_schema());
+        let response = self.send(meta, endpoint, req, deadline).await?;
+        Ok((response, peer_schema))
     }
 }

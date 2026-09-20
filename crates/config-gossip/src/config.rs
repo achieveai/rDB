@@ -35,9 +35,17 @@ pub struct GossipConfig {
     /// errors: static Raft seeds remain the only mandatory bootstrap path (ADR-0003).
     pub seeds: Vec<SocketAddr>,
 
-    /// AES-256 gossip key. `None` disables encryption and is intended for single-host tests
-    /// only; production deployments must set it (spec §15.1).
+    /// AES-256 gossip key this node *signs* with. `None` disables encryption and is intended
+    /// for single-host tests only; production deployments must set it (spec §15.1).
     pub secret_key: Option<[u8; 32]>,
+
+    /// Further AES-256 keys this node accepts on receive without ever signing with them
+    /// (M6, ADR-0028).
+    ///
+    /// Only meaningful alongside [`GossipConfig::secret_key`]: with no primary key there is no
+    /// keyring to install them on and nothing is encrypted at all. They are the first half of a
+    /// rotation — every node accepts the new key before any node starts signing with it.
+    pub accepted_keys: Vec<[u8; 32]>,
 
     /// Failure-detector probe interval.
     pub probe_interval: Duration,
@@ -62,6 +70,11 @@ pub struct GossipConfig {
     /// Timeout for the leave and update broadcasts issued by
     /// [`crate::GossipNode::shutdown`] and [`crate::GossipNode::update_hint`].
     pub broadcast_timeout: Duration,
+
+    /// Advisory fields appended after the hint body (ADR-0030).
+    ///
+    /// `None` advertises exactly the bytes every earlier build advertised.
+    pub extras: Option<crate::HintExtras>,
 }
 
 impl GossipConfig {
@@ -78,6 +91,7 @@ impl GossipConfig {
             advertise_addr: None,
             seeds: Vec::new(),
             secret_key: None,
+            accepted_keys: Vec::new(),
             probe_interval: Duration::from_millis(200),
             probe_timeout: Duration::from_millis(200),
             gossip_interval: Duration::from_millis(100),
@@ -85,6 +99,7 @@ impl GossipConfig {
             join_attempts: 3,
             join_retry_delay: Duration::from_millis(250),
             broadcast_timeout: Duration::from_secs(2),
+            extras: None,
         }
     }
 }
@@ -106,6 +121,7 @@ impl fmt::Debug for GossipConfig {
                     "<none>"
                 },
             )
+            .field("accepted_keys", &self.accepted_keys.len())
             .field("probe_interval", &self.probe_interval)
             .field("probe_timeout", &self.probe_timeout)
             .field("gossip_interval", &self.gossip_interval)

@@ -10,13 +10,17 @@ config-core = { workspace = true }
 config-grpc = { workspace = true }
 config-log = { workspace = true }
 async-trait = { workspace = true }
+# The continuation token is opaque `Bytes` on the `ConfigStore` contract (M6, ADR-0029), so
+# `PageWalk` has to name the type it carries between pages.
+bytes = { workspace = true }
+futures-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
+futures = { workspace = true }
 config-log = { workspace = true }
 # Dev-only, and deliberately circular: `config-testkit` depends on this crate, so cargo allows
 # the edge only for tests. `TlsFixture` is where the node/client certificate shape is defined

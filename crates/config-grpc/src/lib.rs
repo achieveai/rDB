@@ -50,6 +50,8 @@
 //!     TlsMode::Insecure,
 //!     cluster_id,
 //!     Limits::DEFAULT,
+//!     // `Some(admin_service(..))` co-locates the M5 admin plane on this same listener.
+//!     None,
 //! )?;
 //! println!("serving on {}", handle.local_addr());
 //! handle.shutdown().await?;
@@ -71,26 +73,41 @@ pub mod pb {
     tonic::include_proto!("retcd.v1");
 }
 
-mod convert;
+pub mod convert;
 
+pub mod admin_plane;
 pub mod client_plane;
+pub mod credentials;
 pub mod error;
 pub mod limits;
 pub mod peer_plane;
+pub mod rotation;
 pub mod server;
+/// Certificate material for this crate's own unit tests; never compiled into a release.
+#[cfg(test)]
+mod testing;
 pub mod tls;
 pub mod transport;
 
-pub use client_plane::{serve_client_plane, ClientBackend};
+pub use admin_plane::{
+    admin_service, check_backup_dir, serve_admin_plane, AdminAllowlist, AdminBackend, AdminSvc,
+    BackupArtifact, GossipKeyOp, GossipKeyringView, PolicyReload, TlsPlaneReload,
+};
+pub use client_plane::{serve_client_plane, ClientBackend, WatchResponses};
+pub use config_engine::watch::TrackedWatch;
+pub use convert::{watch_item_from_pb, watch_request_from_pb};
+pub use credentials::{CredentialSource, Credentials};
 pub use error::{
     code_for, error_from_status, is_server_rejection, leader_hint, mark_rejected,
     status_from_error, GrpcError, HEADER_CONFLICT_EXISTS, HEADER_CONFLICT_MOD_REVISION,
-    HEADER_LEADER_ENDPOINT, HEADER_LEADER_NODE_ID, HEADER_OUTCOME, OUTCOME_REJECTED,
+    HEADER_LEADER_ENDPOINT, HEADER_LEADER_NODE_ID, HEADER_MIN_REVISION, HEADER_OUTCOME,
+    HEADER_REASON, HEADER_RESUMABLE, OUTCOME_REJECTED,
 };
 pub use limits::{
     client_plane_message_limit, peer_plane_message_limit, MESSAGE_FRAMING_SLACK_BYTES,
 };
 pub use peer_plane::{serve_peer_plane, status_from_reject, PeerIdentity};
+pub use rotation::{RotationError, TlsFiles, TlsRotator};
 pub use server::ServerHandle;
 pub use tls::{peer_server_domain, CertIdentity, MtlsConfig, TlsMode};
 pub use transport::GrpcPeerTransport;
