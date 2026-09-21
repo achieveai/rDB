@@ -39,14 +39,14 @@ plan, and that re-derivation is stated here rather than implied.
 
 | Gate | What it gates | M7 (spike) | Later | Form at its owning milestone | Owner |
 |---|---|---|---|---|---|
-| V1 | Atomic recovery | **claimed, simulated** | M8 adapter subset | M7: deterministic seeded histories, memory storage, injected crash at every modelled boundary. M8: real RocksDB, still not power-loss. | foundation + kernel-b |
+| V1 | Atomic recovery | **claimed, simulated — all three clauses, one of them narrowly** | M8 adapter subset | M7: deterministic seeded histories, memory storage, injected crash at every modelled boundary. Clauses 1–2 (zero partial transactions; every recovered value in declared contiguous lineage) by INV-ATOM and INV-LIN. Clause 3, **no false durable watermark**, only in the modelled sense: a `Durable` ack must be preceded by a `durability_advance{outcome=Synced}` on the same node, exercised by `StorageOp::FalseDurable`. This is watermark *bookkeeping* honesty in a memory engine — it is **not** fsync honesty, a lying device, or power loss, none of which M7 touches. M8: real RocksDB, `sync_wal_through`, still not power-loss. | foundation + kernel-b |
 | V2 | Fencing model | **claimed, model only** | M9 real, M12 platform | M7: INV-AUTH over modelled grant/renew/freeze/CAS races and ±100 ms skew, violation mode included. Real clock, VM pause and suspend stay unqualified. | kernel-a |
-| V3 | Replica loss and recovery | **claimed, simulated** | M10 real cluster | M7: every unequal-prefix pairing and all three lone-survivor choices, in-process. M10: multi-process RF3. | kernel-b |
+| V3 | Replica loss and recovery | **claimed, simulated** | M10 real cluster | M7: every unequal-prefix pairing and all three lone-survivor choices, in-process. The threshold's **degraded-write half** — "degraded writes require both survivors; loss of either stops writes" (spec §8.3) — is checked by INV-PUB against the `required_copy_set` pinned by `config_version`, with a required coverage cell for the `DEGRADED_RF2` quorum rule, **not** by a one-regular-ACK rule. M10: multi-process RF3. | kernel-b |
 | V4 | Retries and outcomes | **claimed, simulated** | M9 real | M7: INV-DEDUP over the modelled 24 h retention via time jumps. | kernel-a |
 | V5 | Lifecycle (move/split) | not in scope | M11 | pending | placement |
 | V6 | Actor effects | not in scope | M13 | pending | actor |
 | V7 | Normal load | not in scope | M12 | pending — needs Linux NVMe hosts | performance |
-| V8 | Lag protection | **claimed, simulated** | M10 real | M7: INV-LAG over virtual scheduling — warn 1 s, pause ≤2.1 s, exact barrier plus 5 s hysteresis. | kernel-b |
+| V8 | Lag protection | **claimed, simulated — split between two owners** | M10 real | M7, oracle half (INV-LAG): transition legality — no `Healthy` after `Paused` without a `Resuming` that hits `resume_barrier_seq` exactly with lag <250 ms for 5 s (spec §6.2's resume row; the validation plan omits the 250 ms and the spec binds); unsafe age never reset by a `config_version` change; no publish while paused. M7, kernel half (kernel-b L1 rows): the 1 s warn / 2 s pause ladder, which depends on the harness's ≤50 ms health-evaluation cadence and is not judgeable from the trace. Neither half alone is V8. | kernel-b + verification |
 | V9 | Balancing | not in scope | M11 | pending | placement |
 | V10 | Recovery load | not in scope | M12 | pending — RTO is a provisional objective, not a guarantee | replication + performance |
 | V11 | Resource envelope | not in scope | M12 | pending | storage/runtime |
@@ -55,8 +55,25 @@ plan, and that re-derivation is stated here rather than implied.
 | V14 | Large blobs | not in scope | M8 | pending | storage + replication |
 | V15 | Merge safety | not in scope | M8 | pending | storage |
 
-**M7's claim, in one sentence, for anyone quoting it:** V1, V3, V4 and V8 simulated; V2 as a model;
-V12 as a message/record subset. Nothing else, and none of it on real hardware.
+**M7's claim, in one sentence, for anyone quoting it:** V1, V3, V4 and V8 simulated, each with the
+qualifier in its `Form` cell; V2 as a model; V12 as a message/record subset. Nothing else, and none
+of it on real hardware.
+
+Spike §7's safety table carries one row that is not a V-gate: **multi-partition isolation** — "a
+blocked partition does not block other partition progress under fair scheduling" (spec §5.2, §5.3;
+P1's "freezes only its partition"). It is **in M7** (ruling V-R8), checked by INV-ISO over a
+two-partition topology under an explicitly healed schedule, with one required coverage cell. Named
+here because it sits beside V1/V2/V8/V12 in the spike's own table and would otherwise be invisible
+in this map.
+
+**The M7 budget figures are host-qualified acceptance targets, not measured speeds.** Spike §7 says
+this of its own budgets ("proposed acceptance targets, not previously observed speeds") and requires
+measurement on one recorded CI worker. The recorded worker for M7 is a shared Windows Server 2022 VM
+running up to six concurrent agent builds. So the 1,000-history/60 s figure is **recorded** in the PR
+corpus and **asserted** only in the extended gate (ruling V-R11), via
+`CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` —
+the plain gate command compiles workspace members unoptimized and cannot produce the number. If the
+target is missed, spike §7's rule applies and the revision is written here. Never lower an assertion.
 
 Rows for V5–V7 and V9–V15 are `pending` because this ADR refuses to invent a threshold for an
 experiment nobody has designed yet. Each is filled by the milestone that owns it, as an amendment.
@@ -80,7 +97,7 @@ rDB-specific additions, all inside `values` so the schema itself is untouched:
 
 | Artifact | `values` keys |
 |---|---|
-| `rdb-m7-campaign.json` | `seeds`, `max_events`, `events_total`, `invariants{id -> proven\|unavailable\|violated}`, `mutations{id -> catching_row}`, `wall_ms`, `compile_ms_excluded` |
+| `rdb-m7-campaign.json` | `seeds`, `max_events`, `events_total`, `invariants{id -> proven\|unavailable\|violated}`, `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`\|`release`) |
 | `rdb-m7-coverage.json` | `guard_outcomes{cell -> count}`, `fault_boundaries{cell -> count}`, `pairwise{pair -> count}`, `required_missing[]` |
 
 Two rDB-specific rules, both consequences of the spike plan:
@@ -141,8 +158,11 @@ Stated plainly so it cannot be quoted out of context, in the same register as rE
 
 - A summary line can no longer say "V3 passed" without its form. That is the point, and it will read
   as under-claiming compared to a plain gate name. Under-claiming is the intended direction.
-- Reusing rEtcd's `write_evidence()` couples `rdb-*` test code to a `config-*` test helper. See
-  Verification and the open question below — the helper may need to move to a shared location.
+- Reusing rEtcd's `write_evidence()` couples `rdb-*` test code to a `config-*` test helper.
+  Settled by ruling V-R5: `rdb-sim` takes `config-testkit` as a **dev-dependency** and reuses the
+  helper as is. The banned direction is `config-* -> rdb-*`; this is the other one. No `config-*`
+  file changes, and no second disclaimer constant — which is the failure ADR-0031 wrote the shared
+  helper to prevent.
 - Running the campaign at reduced scale on every ordinary `scripts/gate.sh` costs CI time. Accepted:
   the alternative is a suite that only runs when someone remembers, which is where coverage rots.
 - Nine of fifteen gates stay `pending` for months. A reader will ask why the ADR exists this early.
@@ -160,6 +180,11 @@ M7 (filled):
 - A gate-rule row mirroring rEtcd M6-114: reduced scale by default, full on `RETCD_EVIDENCE=1`,
   build fails on `full_scale: false` during an explicit full run.
 - An `SPIKE_REQUIRE_ALL=1` row: any invariant reporting `unavailable` fails the gate.
+- A degraded-RF2 publication row: a publish under `DEGRADED_RF2` satisfied by fewer acks than the
+  pinned `required_copy_set` is a violation (V3's degraded half, spec §8.3).
+- A false-durable row: `StorageOp::FalseDurable` trips INV-PUB's durability-grounding clause
+  (V1 clause 3, in its modelled sense).
+- A multi-partition isolation row: INV-ISO under a healed schedule (spike §7 safety table).
 - A no-production-claim row mirroring rEtcd M6-116: grep `docs/evidence/rdb-*.json` and every rDB
   document for a claim that a later-milestone gate has been met.
 
