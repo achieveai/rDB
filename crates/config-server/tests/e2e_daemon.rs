@@ -578,9 +578,16 @@ async fn e2e_10_cross_process_trace_correlation() {
 
     // The same join, expressed the way test plan §7 Q10 expresses it: one DuckDB query over
     // the three separate daemon log directories at once.
+    //
+    // Over a snapshot, not the live tree. The three daemons are child processes and they are
+    // still running here, so their log files are open for writing and each is far below
+    // DuckDB's 16 MiB read buffer — the exact regime `logs::LogSnapshot` documents, in which a
+    // read of a growing file fails intermittently with an out-of-range offset. `wait_for_all`
+    // above has already put the lines this asserts on into those files, so freezing them now
+    // loses nothing the query needs.
+    let relation = config_testkit::logs::relation_for_tree(harness.root());
     let rows = config_testkit::logs::query(&format!(
-        "SELECT node_id, count(*) AS lines          FROM read_json_auto('{glob}', union_by_name=true)          WHERE trace_id = '{trace_id}' GROUP BY node_id ORDER BY node_id",
-        glob = harness.logs_glob(),
+        "SELECT node_id, count(*) AS lines          FROM {relation}          WHERE trace_id = '{trace_id}' GROUP BY node_id ORDER BY node_id",
     ));
     config_testkit::logs::assert_nonempty(&rows, "trace lines joined across the daemon logs");
     assert_eq!(

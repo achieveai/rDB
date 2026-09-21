@@ -85,39 +85,64 @@ const READ_OPTIONS: &str = "union_by_name=true, map_inference_threshold=-1";
 /// A test's own JSONL file is still being appended to while the test queries it: the nodes it
 /// started keep logging inside its span, and so do the other tests running in parallel in the
 /// same binary. Handing DuckDB a path that is open for writing is where log assertions went
-/// intermittently red under a whole-workspace `scripts/gate.sh`, with an IO error that names
-/// the file and a byte offset:
+/// intermittently red under `scripts/gate.sh`, with an IO error that names the file and a byte
+/// offset:
 ///
 /// ```text
 /// IO Error: Could not read file ".../m1_47_trace_id_spans_leader_and_both_followers.jsonl"
 /// (error in ReadFile(location: 218862478, nr_bytes: 16777212)): Reached the end of the file.
 /// ```
 ///
-/// Read that offset carefully before chasing it: it is what DuckDB *attempted*, not the file's
-/// size. The file in that failure finished at 862_679 bytes, 253x smaller than the offset.
+/// ## What the glob actually matches
 ///
-/// An earlier version of this comment added "and 50x smaller than every file the glob matched
-/// put together". That was wrong, and wrong in the direction that made the fault look
-/// unexplainable. Measured on a real whole-workspace root: **1157 files, 2.93 GB**. The offset
-/// is 14x *smaller* than the glob's total, not larger than it, and **two files in the same glob
-/// are bigger than the offset** (533 MB and 480 MB). The 50x came from summing only the six
-/// files in `m1_observability/` — 3.88 MB, the directory the failing file sits in — instead of
-/// the 1157 the `*/*.jsonl` glob actually matches. 218_862_478 / 4_071_941 = 53.7.
+/// Settle this first, because two earlier readings of this fault both got it wrong and both
+/// conclusions followed from it. The glob is **run-scoped**: `<log root>/<test_run_id>/*/*.jsonl`,
+/// and `test_run_id` is one fresh uuid per test *binary*. For `m1_observability` it matched
+/// **6 files, 4_096_523 bytes**, largest 874_323. A whole-workspace gate root does hold ~1050
+/// files and ~3.0 GB — but spread over **107 sibling run directories**, one per binary, and the
+/// glob never reaches a single one of them. So the 533 MB and 480 MB files that live in that
+/// root are not "files in the same glob": they belong to `m4_watch_faults_cluster` and
+/// `m6_evidence`, and nothing `m1_observability` runs can see them.
 ///
-/// With the real figures, a plain explanation is back on the table and should be checked before
-/// anyone calls this a CLI mystery: an offset valid inside one of those 500 MB files, applied to
-/// a 863 KB one in the same scan. That is a hypothesis, not a finding — nobody has proved it.
+/// The offset is therefore genuinely outside everything the scan could address — 53x the whole
+/// glob — and it is not evidence about any file's size in either direction. Do not go looking
+/// for a huge log; there isn't one.
 ///
-/// What *is* measured is the ingredient. The same 1157-file, 2.93 GB root, same CLI (v1.3.2),
-/// same options, **6 runs out of 6 clean** (4_175_207 rows, ~13 s each) once nothing holds a
-/// file open. Note what that does and does not license: it says an open writer is necessary, and
-/// it says nothing about why. The earlier "three files appended to a gigabyte each, right 20 out
-/// of 20" does not license even that much — with no small file in the set, there was nothing for
-/// a large offset to land outside of, so it could not have reproduced this fault either way.
+/// ## The mechanism, measured
 ///
-/// So the mechanism is not the fix's warrant; the absence of the ingredient is. A snapshot is a
-/// closed file of fixed length, and the copy is taken by this process, which already owns the
-/// writer — no retry loop, no sleep, and no assertion weakened to tolerate a bad read.
+/// It reproduces with no Rust, no cluster and no openraft: plain writers appending ~750-byte
+/// JSON lines to `<dir>/<module>/*.jsonl`, then the same `duckdb` CLI (v1.3.2) with the same
+/// options, querying while they append. The discriminator is **per-file size**, and the cliff
+/// sits at DuckDB's JSON read buffer — note `nr_bytes: 16777212`, which is 16 MiB minus the 4
+/// bytes of yyjson padding. Three files, one constant append rate, queried repeatedly as they
+/// grew past it:
+///
+/// ```text
+///   0- 9 MB   16/16 queries failed
+///  10-19 MB    8/15 failed
+///  20-59 MB    0/54 failed
+/// ```
+///
+/// File *count* is not the mechanism, only more chances per query: at ~2.6 MB each, 1 file
+/// failed 5/30, 2 files 27/30, 3 files 29/30, 6 files 29/30. That is also why appending to
+/// gigabyte-scale files never reproduced it (20/20 and 25/25 clean in two earlier attempts) —
+/// every file in those runs was far above the buffer, so the run had no exposed file in it.
+///
+/// Two shapes appear. Sometimes the requested offset is exactly the file's length at that
+/// instant: the scan consumed the file to the EOF it had measured, then asked for one more full
+/// buffer at that offset instead of stopping. Sometimes it runs away entirely — `location:
+/// 86109658` against a 5.6 MB file. Either way the file is smaller than one buffer, which is the
+/// case for **every per-test log this workspace writes**. This is the normal regime here, not an
+/// exotic one, and that is why the row was flaky rather than rare.
+///
+/// What is deliberately *not* claimed: why the CLI's bookkeeping goes wrong. The size cliff and
+/// the ingredient are measured; the cause inside DuckDB is not, and nothing here depends on it.
+/// The control is direct — the same harness, copying each file to its length-at-open before
+/// querying, ran **60/60 clean**.
+///
+/// So the fix removes the ingredient. A snapshot is a closed file of fixed length, and the copy
+/// is taken by this process, which already owns the writer — no retry loop, no sleep, and no
+/// assertion weakened to tolerate a bad read.
 pub struct LogSnapshot {
     dir: PathBuf,
     relation: String,
@@ -286,6 +311,46 @@ pub fn relation_for_current_test(module: &str, method: &str) -> LogSnapshot {
     let dest = dir.join("own.jsonl");
     freeze(&src, &dest);
     LogSnapshot::new(dir, &dest)
+}
+
+/// A snapshot of every `*.jsonl` under `root`, at any depth, and the relation over it.
+///
+/// For logs that are **not** under the test log root and so have no `testRun` scoping of their
+/// own: `config-server`'s E2E rows start real daemon child processes and read the files those
+/// processes write into a per-test temp tree. Those daemons are still running when the row
+/// queries them, which is the same hazard [`LogSnapshot`] documents — and a daemon log is a
+/// few hundred KB, far below the 16 MiB buffer, so it sits in the exposed regime.
+///
+/// Relative paths are preserved inside the snapshot, so a `<node>/<file>.jsonl` layout still
+/// reads as one relation. Panics if `root` holds no `.jsonl` file at all: an empty relation
+/// would make every assertion over it vacuously true (test plan §6 rule 11).
+#[must_use]
+pub fn relation_for_tree(root: &Path) -> LogSnapshot {
+    let dir = snapshot_dir();
+    let snapshot = LogSnapshot::new(dir.clone(), &dir.join("**").join("*.jsonl"));
+    let mut found = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                freeze(&path, &dir.join(rel));
+                found += 1;
+            }
+        }
+    }
+    assert!(
+        found > 0,
+        "no .jsonl files under {} to query — an empty relation must not read as a pass",
+        root.display()
+    );
+    snapshot
 }
 
 /// A `WHERE` clause fragment restricting rows to this process's test run:
