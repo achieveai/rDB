@@ -49,11 +49,15 @@ created the entry. `now` arrives on `HealthEval { now }`. Nothing reads a clock.
 the same event because `outstanding_unsafe_bytes` (§6) is the sum over the queue and has no other
 source; spec §6.2 asks for age and bytes separately, so the event carries both.
 
-The **required copies are all configured regular copies, including the primary itself.** That is
-not a technicality: a primary whose own WAL flush has stalled while both secondaries are healthy is
-a real and common exposure, and a definition that excluded self would report zero unsafe age
-through it. The set that excludes self is a different set, used for the ACK predicate (ADR-0005
-§5), and the two are named apart in the design.
+The **required copies are all configured regular copies, including the primary itself, minus any
+copy marked `diverged`** (ADR-0005 §5). Including self is not a technicality: a primary whose own
+WAL flush has stalled while both secondaries are healthy is a real and common exposure, and a
+definition that excluded self would report zero unsafe age through it. Excluding a diverged copy is
+not either: a copy proved to be on another history can neither satisfy the resume barrier nor be
+waited for, and leaving it in the set made the barrier unsatisfiable forever with nothing saying
+why. The set that also excludes self is a different set, used for the ACK predicate (ADR-0005 §5),
+and the three are named apart in the design. The durable views over this set are computed by R1
+and arrive on `DurableAdvanced { per_predicate }`; this module does not recompute them.
 
 **`unsafe_age` is not the only age, and it is not the one the 250 ms resume threshold reads.**
 There are two quantities:
@@ -63,12 +67,28 @@ There are two quantities:
 | `unsafe_age` | exposure: how long the oldest applied record has gone without being durable everywhere required | `LocalApplied` / `DurableAdvanced` | warn (1,000 ms), pause (2,000 ms) |
 | `replication_lag` | liveness: how stale our freshest evidence is that every required copy is keeping up | `PeerProgress { copy, tick }` | resume (250 ms) |
 
-`replication_lag(now) = now − min over required copies of last_progress_tick`. The split is forced.
-During `Paused` admission is rejected, so the unsafe queue drains, and the very condition that fires
-`Paused → Reprotecting` is that the barrier went durable — at which point `unsafe_age` is 0. A
-`Reprotecting` phase that waited for `unsafe_age < 250 ms` would be waiting for something already
-true, and the 5-second hold would degenerate into a bare sleep that proves nothing about the
-stream's health. Reading `replication_lag` makes the hold prove what it is for.
+```text
+lag_domain()         = current predicate's copies − self − lost
+replication_lag(now) = max over c in lag_domain() of (now − peer_progress[c]), absent entry = ∞
+```
+
+The split is forced. During `Paused` admission is rejected, so the unsafe queue drains, and the
+very condition that fires `Paused → Reprotecting` is that the barrier went durable — at which point
+`unsafe_age` is 0. A `Reprotecting` phase that waited for `unsafe_age < 250 ms` would be waiting for
+something already true, and the 5-second hold would degenerate into a bare sleep that proves nothing
+about the stream's health. Reading `replication_lag` makes the hold prove what it is for.
+
+Three decisions make that line evaluable, each fixing a gap in the earlier draft. **The state
+exists:** `peer_progress: Map<CopyId, Tick>` is written only by `PeerProgress`, which R1 emits for
+every ACK that passes its admission rules (an emitter outside R1 could only guess which ACKs were
+accepted). **The domain is peers:** the earlier draft took the minimum over the required copies,
+which include self; a primary sends no ACK to itself, so self had no entry, the minimum was
+undefined and the partition never resumed. Liveness of peers is what the hold measures, so the
+domain is this module's own pinned predicate minus self, and minus the copies R1 has reported lost
+(`CopyLost`, ADR-0005 §5) — the durable barrier already excludes those, and a lag domain that kept
+them would hold open a pause the barrier says is over. **Absence is infinite lag:** a copy never
+heard from since the pause blocks resume, fail-closed, exactly as an unretained digest fails the
+publication predicate in ADR-0005 §5. `AdmissionState` names the copy holding the maximum.
 
 The `None => 0` arm **is** the idle rule. There is no idle detector, no last-activity timestamp and
 no heuristic, because age is only defined when something is outstanding. Spec §6.2's "idle
@@ -105,11 +125,13 @@ by itself produce a locally acknowledged write, because publication still requir
 `qualifies_now(cand.seq)` holds at publication time and the candidate's digest matches.
 
 L1 also stops admission when no regular secondary qualifies. That arm and guard B read **the same
-underlying fact**: R1's qualifying-copy set, computed once from the pinned configuration. R1 emits
-an edge-triggered `QualificationChanged` effect when that set changes value; L1 and P1 both receive
-it as an event, and P1 additionally reads the predicate live at publication time. That is one guard
-evaluated at two moments, not two independent guards. A bug in R1's qualifying-set computation
-defeats both.
+underlying fact**: R1's qualifying predicate over its qualifying-copy set, computed once from the
+pinned configuration. R1 emits an edge-triggered `QualificationChanged` effect when that predicate
+changes value; L1 and P1 both receive it as an event, and P1 additionally reads the predicate live
+at publication time. Its `direction` is the only field either consumer branches on; the copy list,
+the count and the cause ride along as trace fields, for the log and for nothing else. That is one
+guard evaluated at two moments, not two independent guards. A bug in R1's qualifying-set
+computation defeats both.
 
 The edge detection belongs to **R1**, not to the harness: the set is R1's own derived view, and a
 detector living outside it would be a second, lagging copy of the same rule. The harness observes
@@ -127,12 +149,23 @@ ACK locally", and the validation plan treats it as one: the property tests on `q
 Because the arm is shared, it must be **edge-triggered, not polled**: L1 pauses on
 `QualificationChanged`, not on the next `HealthEval`. Waiting for the next evaluation would put up
 to one cadence between the last secondary going away and admission stopping, which is the delay
-spec §6.2 forbids. `HealthEval` re-reads the flag as a backstop against a missed edge.
+spec §6.2 forbids.
+
+**There is no `HealthEval` backstop.** An earlier revision said the evaluation "re-reads the flag as
+a backstop against a missed edge". It cannot: the flag is a cached boolean whose only writer is the
+edge, and re-reading it re-applies the last edge rather than detecting a missed one. The risk is
+stated plainly instead — a dropped `Lost` edge leaves admission open until the next edge — and it
+is bounded outside this module: the interface layer's dispatcher is deterministic and never drops
+an effect (ADR-0003), so the edge is lossless by construction, and the verification team's
+dispatcher-level mutation (drop or delay one routed effect; the oracle must catch an admission after
+the loss) is the guard that the construction holds. A staleness rule was considered and rejected:
+the edge is emitted only on change, so an idle partition produces none, and a rule that paused on
+"no edge for *n* ms" would falsely pause exactly the idle partitions §6.2 says must not be.
 
 ### 4. States and transitions
 
 ```text
--- on QualificationChanged (edge), re-checked on every HealthEval (backstop):
+-- on QualificationChanged { Lost } only (edge; nothing re-checks it):
 no qualifying regular secondary     : *  -> Paused        [immediate, not age-gated]
 
 -- on HealthEval:
@@ -146,8 +179,13 @@ Paused,  every active predicate durable through resume_barrier
 Reprotecting, replication_lag <  250 ms, below_since == None : below_since = Some(now)
 Reprotecting, replication_lag >= 250 ms                      : below_since = None  [restarts]
 Reprotecting, now - below_since >= 5000 ms         :    -> Healthy, SetAdmission(Allow)
-Reprotecting, required copy lost or barrier invalid:    -> Paused
+Reprotecting, barrier invalidated (new predicate not durable through it) :  -> Paused
 ```
+
+A copy lost while `Reprotecting` needs no arm of its own: a loss that takes the floor arrives as
+`QualificationChanged { Lost }` and is the first arm; a loss that leaves the floor arrives as
+`CopyLost` and only shrinks the lag domain (§1), and any remaining peer not yet heard from holds
+the partition through the infinite-lag rule.
 
 The qualification term also gates `Paused → Reprotecting`: handing admission back to a partition
 that still cannot replicate would be the same bug arriving by the resume path.
@@ -212,7 +250,8 @@ three-term budget.
 AdmissionState {
   allow, reason,                          // PROTECTION_PAUSED
   oldest_unsafe_age, oldest_unsafe_seq,   // exposure
-  replication_lag,                        // liveness
+  replication_lag, stalest_copy,          // liveness, and which peer holds the maximum
+  lost_copies,                            // copies R1 reported lost; a pause on fewer copies is visible
   paused_prefix, resume_barrier,
   required_config_versions,               // every active predicate
   outstanding_unsafe_bytes,               // sum of bytes over the unsafe queue
@@ -244,11 +283,16 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
   qualifying-copy set. Only the age half is independent. Evaluating the shared half twice is still
   worth its cost, but the residual risk is real and is carried by tests on R1's qualifying-set
   computation rather than by architecture.
-- L1 gains an input it did not have: `QualificationChanged`, emitted by R1. The alternative — L1
-  querying R1 — would give one kernel module a synchronous dependency on another, so the fact
-  arrives as an event like everything else. The cost is that R1 must emit on every edge, including
-  ones that are not ACKs (a boot change, a membership change); missing one leaves L1 stale until
-  the next `HealthEval` backstop.
+- L1 gains three inputs it did not have, all emitted by R1: `QualificationChanged`, `PeerProgress`
+  and `CopyLost`. The alternative — L1 querying R1 — would give one kernel module a synchronous
+  dependency on another, so every fact arrives as an event like everything else. The cost is that
+  R1 must emit on every predicate edge, including ones that are not ACKs (a boot change, a
+  membership change); a missed or dropped `Lost` edge leaves admission open until the next edge,
+  with no backstop in this module (§3). That is carried by the dispatcher's no-drop property and
+  the verification team's mutation of it, not by L1.
+- Resume can now be held by a copy that has simply never reported since the pause. That is the
+  fail-closed reading of "lag below 250 ms for 5 s" and it is intended; the exported
+  `stalest_copy` is what tells an operator which copy to look at.
 - The thresholds are §6.2's initial defaults for validation, not observed guarantees. They are
   configuration, and V8 measures them rather than assuming them.
 
@@ -260,6 +304,10 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
 | Admission rejected by 2.1 s | Kernel row: flip in the same step as `unsafe_age >= 2000`. Harness row: eval cadence ≤ 50 ms. Integration row: nothing admitted after wall tick 2,100 ms, end to end — **V8** |
 | No success without a qualifying secondary | Kill every regular secondary at t=0: admission rejects on the `QualificationChanged` edge, not at 2 s and not on the next eval; P1 independently refuses to publish — **V8** |
 | Resume reads liveness, not exposure | Reach `Reprotecting` with an empty unsafe queue, then stall a required copy's progress: the 5 s hold restarts instead of completing |
+| A peer never heard from blocks resume | Reach `Reprotecting` with one peer absent from `peer_progress`: `replication_lag` is infinite, `stalest_copy` names it, no `HealthEval` resumes; deliver one `PeerProgress` for it and resume follows 5 s later |
+| Self is not in the lag domain | Primary sends no ACK to itself; with both peers reporting, `Reprotecting` completes — the earlier definition over a set containing self never did |
+| A lost copy leaves the lag domain | `CopyLost { C, Diverged }` during `Reprotecting` with the floor intact: the hold continues over the remaining peers and completes; `lost_copies` exports `[C]` |
+| A dropped `Lost` edge is caught outside L1 | Verification's dispatcher mutation drops the routed `QualificationChanged { Lost }`; the oracle reports an `Admitted` after the loss; no L1 row claims to catch this |
 | The primary counts as a required copy | Stall the primary's flush with both secondaries healthy: `unsafe_age` rises and the partition pauses |
 | `next_interesting_tick` is sound | Property: for every state, no `HealthEval` strictly before the returned tick changes the state |
 | Idle never pauses | No transactions, advance virtual time by an hour: state stays `Healthy` |

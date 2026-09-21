@@ -71,11 +71,15 @@ primary" becomes a property of the type rather than a sentence someone has to ho
 `authority_utc_ms` is carried alongside `authority_tick` because the tick is monotonic and §7.2's
 inequality is stated against wall time; it cannot be re-derived from a monotonic reading.
 
-`FenceCredential { partition, prior_generation, prior_owner_epoch, prior_grant_id,
-control_revision }` is the wire-carryable subset used to authorise recovery catch-up (§7). It
-deliberately omits `decision_tick` and the revocation evidence: those are A1's grounds for granting
-the proof, not a receiver's grounds for accepting a record, and a smaller credential is one a
-receiver cannot start re-deriving authority decisions from.
+`FenceCredential { partition, prior_generation, prior_owner_epoch, control_revision, recoverer }`
+is the wire-carryable subset used to authorise recovery catch-up (§7), plus the copy id of the node
+F1 is running on. It deliberately omits `decision_tick` and the revocation evidence: those are A1's
+grounds for granting the proof, not a receiver's grounds for accepting a record, and a smaller
+credential is one a receiver cannot start re-deriving authority decisions from. It also omits
+`prior_grant_id`, which the proof carries but no receiver can compare — a receiver's authority view
+comes from `partitions/{id}`, which holds no grant id (§1). `recoverer` is what makes the credential
+non-replayable: a receiver admits recovery records only from the transport-authenticated peer the
+credential names.
 
 ### 3. `VerifiedInventory`: the typestate that deletes "longest wins"
 
@@ -261,10 +265,20 @@ pure, so a shortfall is a returned value: `Barrier` stays in phase and waits for
 node is not yet the owner in `partitions/{id}` — that CAS is the next step — so the normal append
 ladder's epoch and primary-peer rules would reject every record it sends. Records therefore travel
 as `RecoveryAppend { fence: FenceCredential, envelope }` and the receiver substitutes three rules
-(ADR-0005 §2): the fence's `prior_owner_epoch` and `prior_grant_id` both match the receiver's
-current authority view, the fence's `control_revision` is at least the receiver's last seen
-`partitions/{id}` revision, and the sender is any regular member of the pinned config. Ancestry and
-digest validation are untouched: a fence does not license overwriting a divergent suffix.
+(ADR-0005 §2): the fence's `prior_owner_epoch` matches the receiver's current authority view, the
+fence's `control_revision` is at least the receiver's last seen `partitions/{id}` revision, and the
+sender is the copy the credential names as `recoverer` and a regular member of the pinned config.
+Ancestry and digest validation are untouched: a fence does not license overwriting a divergent
+suffix.
+
+**Catch-up after commit runs on historical envelopes.** Once the new root is committed, a copy
+behind the cutoff and the rebuild target below both still need the records under the predecessor
+generation, and those records carry that generation forever (the field is digest-covered). ADR-0005
+§2's historical-envelope rule admits them: at or below the root's `base_seq`, under
+`predecessor_generation`, they skip the authority rows and are decided by the chain plus the root
+anchor (`base_digest` at `base_seq`). Without that rule `Rebuilding` was unreachable for exactly the
+copies it exists to rebuild. M7 admits one generation back; a target older than that gets
+`SnapshotCatchupRequired` and waits for spec §10.1.
 
 **`Committed` is not the end state.** Two of the three modes below are explicitly temporary, and the
 phase that ends them is `Rebuilding { required, proofs, cutoff }` → `ActivationProposed` → `Active`.
@@ -387,6 +401,8 @@ consumer does not handle.
 | One CAS, one key | The effect vector from `Proposing` contains exactly one `ControlCas`, targeting `partitions/{id}` |
 | A lost CAS response does not promote | `QuorumLost` leaves the node `Blocked`; it never proceeds as owner and requires a fresh fencing proof to retry |
 | Recovery catch-up is fence-gated | A `RecoveryAppend` with a superseded fence is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append would be |
+| A credential names its holder | A second regular member replaying a captured credential is rejected `NOT_A_MEMBER` |
+| Rebuild reaches `CopyCaughtUp` across the generation change | Copy at seq 50, root at `base_seq = 100`: records 51..100 under the predecessor generation are accepted, `CopyCaughtUp` fires at `(100, base_digest)`, and the copy's proof then passes `try_new` — **V3** |
 | RF2 degraded requires both | With one regular secondary, losing it stops admission; no one-copy fallback path exists — **V3** |
 | All three lone-survivor choices | Old primary, secondary 1, secondary 2 each as sole survivor: read-only mode, correct declared cutoff, `uncertain` set when a higher prefix was advertised — **V3** |
 | Three-copy rebuild barrier | `ACTIVE` only after `RecoveryBarrier::try_new` succeeds over three `DurableProof`s at the **same** cutoff digest; three proofs at three different histories are rejected — **V3** |

@@ -113,16 +113,37 @@ appends fail rule 6 as `STALE_EPOCH`. `AuthorityView` still carries `authority_g
 logging and rejection reasons, never as a comparison key. `UNKNOWN_GRANT` is consequently not an R1
 rejection reason and does not belong in spec §5.4's error table.
 
-**Recovery traffic uses a different rules 5–7.** During ADR-0009's `Synchronizing` phase the sender
+**Recovery traffic uses a different rules 6–7.** During ADR-0009's `Synchronizing` phase the sender
 is not yet the owner in `partitions/{id}`, so rules 6 and 7 as written reject every record it sends.
 A `RecoveryAppend { fence: FenceCredential, envelope }` reuses rules 1–5, 8 and 9 verbatim and
-replaces 6 and 7 with: `fence.prior_owner_epoch` and `fence.prior_grant_id` both equal the
-receiver's `AuthorityView` (else `STALE_FENCE`); `fence.control_revision >=` the receiver's last
-seen `partitions/{id}` revision (else `STALE_FENCE`); and the authenticated peer is **any regular
-member** of the pinned config rather than the primary. Both halves of the first check come from the
-single `partitions/{id}` read the recoverer performed when it fenced, so there is no cross-key join
-and the objection above does not apply. Rule 9 runs unchanged: a fence does not license overwriting
-a divergent suffix.
+replaces 6 and 7 with three checks: `fence.prior_owner_epoch` equals the receiver's
+`AuthorityView.owner_epoch` (else `STALE_FENCE`); `fence.control_revision >=` the receiver's last
+seen `partitions/{id}` revision (else `STALE_FENCE`); and the authenticated peer **is
+`fence.recoverer`** and that copy is a regular member of the pinned config (else `NOT_A_MEMBER`).
+The epoch plus the monotone revision is the whole "your fence is at least as new as anything I have
+seen" check. An earlier draft also compared a `prior_grant_id`; it is withdrawn for the reason given
+two paragraphs up — the receiver's view is derived from `partitions/{id}`, which holds no grant id,
+so the conjunct either rejected all recovery traffic or required the forbidden join. The
+`recoverer` binding is what stops a second regular member from replaying a captured credential with
+its own compatible-prefix records; rule 9 stops a *conflicting* suffix, not an unauthorised
+extension, so the peer check has to name the holder. Rule 9 runs unchanged: a fence does not license
+overwriting a divergent suffix.
+
+**Historical envelopes are admitted by chain and root anchor, not by the authority rules.** After a
+recovery commits generation *g+1* with `base_seq = c`, a copy behind *c* and a rebuild target both
+still need records written under *g*, and those records carry *g* forever — `generation`,
+`owner_epoch` and `config_version` are digest-covered, so nothing can be re-stamped. Rules 5, 6 and 7
+would reject every one of them. So, evaluated after rule 4: an envelope with `seq <= history_floor`
+and `generation == lineage.predecessor_generation` **skips rules 5, 6 and 7** and is decided by rules
+1–4, 8 and 9 plus the sender check (the primary of the pinned config for `Append`; `fence.recoverer`
+for `RecoveryAppend`). Rule 9 gains one clause for it: at `seq == lineage.base_seq` the record's
+digest must equal `lineage.base_digest`, else quarantine `DIVERGENT_HISTORY`. That clause is why
+skipping the authority rules is safe: the committed root pins the base pair, the chain anchors every
+record below it, and rule 9 decides. `history_floor` is receiver state written only by
+`Recovered(RecoveryResult)`, equal to the new root's `base_seq`, and zero on a fresh partition, so
+the rule is inert until a recovery has committed. M7 admits one generation of history; a copy more
+than one recovery behind needs `SnapshotCatchupRequired` (§6), which the primary emits before
+sending a record the receiver would reject.
 
 **A replica never learns authority from the data path.** Rules 5 and 6 reject *higher* generations
 and epochs rather than adopting them. New epochs arrive from A1's `AuthorityView`; new generations
@@ -137,8 +158,10 @@ The history digest store is queried through a **three-valued** lookup, not an eq
 lookup(seq) -> Match | Differs { stored } | NotRetained
 ```
 
-`NotRetained` means no digest is held for that seq — the store keeps a full window above a retained
-`history_floor` and a sparse ladder below it, so absence is routine. **Only `Differs` is evidence.**
+`NotRetained` means no digest is held for that seq — the store keeps a digest for every record it
+still retains and a sparse ladder of rungs (fixed stride plus the root's base pair) where records
+have been dropped, so absence is routine. Retention is the storage adapter's policy; the ladder
+mirrors it. **Only `Differs` is evidence.**
 Collapsing `NotRetained` into "not equal" makes ordinary history truncation indistinguishable from
 divergence, and quarantine is not recoverable without a new lineage root (§5 below), so that
 collapse converts a retention policy into a permanent outage.
@@ -228,6 +251,25 @@ restart with a new boot id, because a copy that proved it disagreed has not stop
 rebooting. `NotRetained` is neither: the ACK is dropped as unverifiable and a snapshot catch-up is
 requested, because a slow copy ACKing below the primary's retained floor is not a disagreement.
 
+**A diverged copy is out of every derived set, including the durable ones.** Its later ACKs are
+dropped (`DIVERGED_COPY`) and its watermarks freeze. Three sets are defined once:
+`configured_regulars()` (the config's regular members, including the primary),
+`required_copies()` (the same **minus diverged** — the domain of `min_required_durable()` and
+`all_durable_through()`, which feed ADR-0006's barrier and ADR-0009's), and `regular_secondaries()`
+(`required_copies()` minus self — the ACK predicate's domain). An earlier draft left `diverged` in
+`required_copies()`, and both readings failed: counting its ACKs let a copy on another history
+satisfy the resume barrier; not counting them froze `all_durable_through` forever and the partition
+paused with nothing saying why. The step that marks a copy `diverged` emits, in order:
+`DivergenceDetected`, an `Alert { CopyDiverged }`, `CopyLost { copy, reason: Diverged }` (consumed
+by ADR-0006's lag domain and ADR-0009's rebuild phase), `QualificationChanged { Lost }` if the
+predicate flipped, and — only when the floor is gone, `regular_secondaries().count() <
+min_regular_acks` — `BlockPartition { reason: DivergenceRequiresOperator, diverged }`, which is
+`PartitionMode::Blocked` plus a named alert. Quarantine is terminal in M7, so a pause caused by
+divergence has no data-path exit; `BlockPartition` says so rather than leaving a permanent pause
+that looks like lag. The exit is an operator removing the diverged copies from membership and
+fencing. With a floor remaining, the partition continues on the remaining copies with the alert
+raised; committing the degraded membership is the planner's (spec §9), not M7's.
+
 The seam handed to P1 is a **live predicate, not a watermark**:
 
 ```text
@@ -245,14 +287,25 @@ look qualified on the seq comparison alone.
 
 Alongside the predicate, R1 emits **`QualificationChanged { lineage, config_version, at_seq,
 direction: Gained | Lost, qualified_copies, qualified_ack_count, cause, tick }`** as an effect of
-the step in which the qualifying set changes value — an ACK crossing the threshold, a
-`DivergenceDetected`, a `STALE_BOOT` or control-announced boot change, or a membership/threshold
-change. `Gained` and `Lost` are the two shapes P1 needs: a `Lost` at `at_seq` tells P1 to discard a
-remembered `true` rather than act on it, on every one of those causes. It never substitutes for the
-predicate — P1 re-evaluates `qualifies_now(cand.seq)` at publication time regardless — and it is
-never a retraction: a `Lost` arriving after a publication is a recorded fact, because publication is
+the step in which **the predicate `qualifies_now(head)` changes value** — an ACK crossing the
+threshold, a `DivergenceDetected`, a `STALE_BOOT` or control-announced boot change, or a
+membership/threshold change, each only when the boolean flipped. **`direction` is the only decision
+field.** `qualified_copies`, `qualified_ack_count` and `cause` are trace fields: they make the log
+row explain itself, and no consumer branches on them — P1 re-evaluates the predicate live and reads
+none of them; L1 reads `direction` and nothing else. A change to the set that leaves the predicate
+where it was (two secondaries, threshold one, one diverges) emits no event: P1 needs none, and L1
+learns of the lost copy through `CopyLost` for the one thing it uses it for, the lag domain. The
+ACK rules that drop an ACK for regressed or inconsistent watermarks drop the ACK, not the copy, and
+watermarks never retreat, so they cannot change the set and `cause` has no variant for them.
+`Gained` and `Lost` are the two shapes P1 needs: a `Lost` at `at_seq` tells P1 to discard a
+remembered `true` rather than act on it, on every one of those causes; kernel-a's `Disqualified
+{ seq }` is `direction == Lost` with `at_seq`. It never substitutes for the predicate — P1
+re-evaluates `qualifies_now(cand.seq)` at publication time regardless — and it is never a
+retraction: a `Lost` arriving after a publication is a recorded fact, because publication is
 irreversible (§5.3). Edge detection lives in R1 because the qualifying set is R1's own derived view;
-a detector elsewhere would be a second, lagging copy of the same rule.
+a detector elsewhere would be a second, lagging copy of the same rule. R1 also emits `PeerProgress
+{ copy, tick }` for every ACK that passes all of the rules above, which is ADR-0006's liveness
+input; a dropped ACK emits none, because an ACK that proved nothing is not evidence of liveness.
 
 An earlier draft made this a monotone `qualified_through_seq` watermark, on the argument that
 recomputing after `DivergenceDetected` would retract publication and violate spec §5.3's "a lost
@@ -385,6 +438,12 @@ does not describe.
 | Catch-up never overwrites divergence | `NEED_PREFIX` with a retained-but-mismatched head digest sends no envelopes and raises divergence |
 | Every reply is handled | Exhaustive match over `AppendOutcome` with no wildcard arm; a compile error if a variant is added |
 | Recovery traffic is fence-gated, not epoch-gated | A `RecoveryAppend` whose fence names a superseded epoch or an older control revision is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append |
+| A captured credential cannot be replayed | A second regular member sends a `RecoveryAppend` with a credential naming another node as `recoverer`: rejected `NOT_A_MEMBER`, no state change |
+| Historical records catch a copy up across a generation change | Copy at seq 50; root committed with `base_seq = 100` under predecessor *g*; envelopes 51..100 carrying *g* are accepted and the copy reaches `CopyCaughtUp` at `(100, base_digest)`; 101 under *g+1* passes the normal ladder; a record at 100 whose digest is not `base_digest` quarantines — **gate V3** |
+| One generation of history only | A copy needing records older than `predecessor_generation` receives `SnapshotCatchupRequired`, never `STALE_GENERATION` |
+| A diverged copy leaves the durable views | RF3, threshold 1: copy C diverges; `all_durable_through` and `min_required_durable` ignore C, a later ACK from C is dropped `DIVERGED_COPY`, the step emitted `Alert` + `CopyLost` and no `QualificationChanged` |
+| Divergence with no floor blocks, never silently pauses | Then copy B diverges: effect vector in index order `DivergenceDetected`, `Alert`, `CopyLost`, `QualificationChanged { Lost }`, `BlockPartition { DivergenceRequiresOperator, [C, B] }` — **gate V3** |
+| Set change without a predicate flip emits nothing | RF3, threshold 1, one copy diverges: no `QualificationChanged` in the effect vector; `qualifies_now(head)` still true |
 | Unequal secondary prefixes converge | Every unequal pairing catches up by suffix and reaches equal head digests — **gate V3** |
 | `sync_wal_through` ordering | M1 models the write-order mutex; D1 enforces it natively and tests rejection of the disabled write modes |
 
