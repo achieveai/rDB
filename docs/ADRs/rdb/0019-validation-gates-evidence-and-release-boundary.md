@@ -41,12 +41,12 @@ plan, and that re-derivation is stated here rather than implied.
 |---|---|---|---|---|---|
 | V1 | Atomic recovery | **claimed, simulated — all three clauses, one of them narrowly** | M8 adapter subset | M7: deterministic seeded histories, memory storage, injected crash at every modelled boundary. Clauses 1–2 (zero partial transactions; every recovered value in declared contiguous lineage) by INV-ATOM and INV-LIN. Clause 3, **no false durable watermark**, only in the modelled sense: a `Durable` ack must be preceded by a `durability_advance{outcome=Synced}` on the same node, exercised by `StorageOp::FalseDurable`. This is watermark *bookkeeping* honesty in a memory engine — it is **not** fsync honesty, a lying device, or power loss, none of which M7 touches. M8: real RocksDB, `sync_wal_through`, still not power-loss. | foundation + kernel-b |
 | V2 | Fencing model | **claimed, model only** | M9 real, M12 platform | M7: INV-AUTH over modelled grant/renew/freeze/CAS races and ±100 ms skew, violation mode included. Real clock, VM pause and suspend stay unqualified. | kernel-a |
-| V3 | Replica loss and recovery | **claimed, simulated** | M10 real cluster | M7: every unequal-prefix pairing and all three lone-survivor choices, in-process. The threshold's **degraded-write half** — "degraded writes require both survivors; loss of either stops writes" (spec §8.3) — is checked by INV-PUB against the `required_copy_set` pinned by `config_version`, with a required coverage cell for the `DEGRADED_RF2` quorum rule, **not** by a one-regular-ACK rule. M10: multi-process RF3. | kernel-b |
+| V3 | Replica loss and recovery | **claimed, simulated** | M10 real cluster | M7: every unequal-prefix pairing and all three lone-survivor choices, in-process. The threshold's **degraded-write half** — "degraded writes require both survivors; loss of either stops writes" (spec §8.3) — is checked by INV-PUB against the `required_copy_set` pinned by `config_version`, with a required coverage cell for the `DEGRADED_RF2` quorum rule — a rule the oracle **derives** from `required_copy_set.len()` on the pinning `protection_state` (two nodes is `DEGRADED_RF2`, three is RF3; ruling V-R20), never a trace field — **not** by a one-regular-ACK rule. M10: multi-process RF3. | kernel-b |
 | V4 | Retries and outcomes | **claimed, simulated** | M9 real | M7: INV-DEDUP over the modelled 24 h retention via time jumps. | kernel-a |
 | V5 | Lifecycle (move/split) | not in scope | M11 | pending | placement |
 | V6 | Actor effects | not in scope | M13 | pending | actor |
 | V7 | Normal load | not in scope | M12 | pending — needs Linux NVMe hosts | performance |
-| V8 | Lag protection | **claimed, simulated — split between two owners** | M10 real | M7, oracle half (INV-LAG): transition legality — no `Healthy` after `Paused` without a `Resuming` during which every node in the `required_copy_set` pinned at `paused_prefix_seq` is durable through `resume_barrier_seq`, the barrier is hit exactly, and lag <250 ms for 5 s (spec §6.2's resume row: "All configured regular copies durable through paused prefix"; the validation plan omits the 250 ms and the spec binds); unsafe age never reset by a `config_version` change; no `admission_decision{outcome=Admitted}` at or after the first `protection_state{state=Paused}` and before the next `state=Healthy`. M7, kernel half (kernel-b L1 rows): the 1 s warn / 2 s pause ladder, which depends on the harness's ≤50 ms health-evaluation cadence and is not judgeable from the trace. Neither half alone is V8. | kernel-b + verification |
+| V8 | Lag protection | **claimed, simulated — split between two owners** | M10 real | M7, oracle half (INV-LAG): transition legality — no `Healthy` after `Paused` without a `Resuming` during which every node in the `required_copy_set` pinned at `paused_prefix_seq` is durable through `resume_barrier_seq`, the barrier is hit exactly, and lag <250 ms for 5 s (spec §6.2's resume row: "All configured regular copies durable through paused prefix"; the validation plan omits the 250 ms and the spec binds); unsafe age never reset by a `config_version` change; no `admission_decision{outcome=Admitted}` at or after the first `protection_state{phase=Paused}` and before the next `phase=Healthy`. M7, kernel half (kernel-b L1 rows): the 1 s warn / 2 s pause ladder, which depends on the harness's ≤50 ms health-evaluation cadence and is not judgeable from the trace. Neither half alone is V8. | kernel-b + verification |
 | V9 | Balancing | not in scope | M11 | pending | placement |
 | V10 | Recovery load | not in scope | M12 | pending — RTO is a provisional objective, not a guarantee | replication + performance |
 | V11 | Resource envelope | not in scope | M12 | pending | storage/runtime |
@@ -99,9 +99,9 @@ rDB-specific additions, all inside `values` so the schema itself is untouched:
 
 | Artifact | Written by | `values` keys |
 |---|---|---|
-| `rdb-m7-campaign.json` | a **debug** campaign run (the handoff gate) | `seeds`, `max_events`, `events_total`, `invariants{id -> {status: proven\|unavailable\|violated, reason?: capability(<package>)\|not_armed, seeds_armed}}` (one object per invariant; `reason` is present only when `status` is `unavailable`), `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`), `slipped` per minimized fixture (`true` when the fault-boundary set differs before and after shrinking; the boundary set is reported, never part of the reducer's acceptance predicate) |
+| `rdb-m7-campaign.json` | a **debug** campaign run (the handoff gate) | `seeds`, `max_events`, `events_total`, `invariants{id -> {status: proven\|unavailable\|violated, reason?: capability(<package>)\|not_armed, seeds_armed}}` (one object per invariant; `reason` is present only when `status` is `unavailable`, and in the artifact it is this one string form — the JSONL log line carries `reason` and a separate `package` field instead, a bijection; ruling V-R20), `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`), `slipped` per minimized fixture (`true` when the fault-boundary set differs before and after shrinking; the boundary set is reported, never part of the reducer's acceptance predicate) |
 | `rdb-m7-campaign-release.json` | a **release** campaign run (the 1,000-history command and the M7 release gate, §2.1) | the same keys, with `profile` = `release`. **This is the only artifact that may be cited for the 1,000-history budget** (ruling V-R17). |
-| `rdb-m7-coverage.json` | every campaign run | `guard_outcomes{cell -> count}`, `fault_boundaries{cell -> count}`, `pairwise{pair -> count}`, `required_missing[]`, `unavailable_cells{cell -> package}` (required cells whose producing op needs a provider hook the build reports `unavailable`; excluded from `required_missing[]` by that capability entry, never by editing the required list) |
+| `rdb-m7-coverage.json` | every campaign run | `guard_outcomes{cell -> count}`, `fault_boundaries{cell -> count}`, `pairwise{pair -> count}`, `required_missing[]`, `unavailable_cells{cell -> package}` (required cells whose emitting provider package — keyed per fault family, not only the two hook cells — reports `unavailable` in this build; excluded from `required_missing[]` by that capability entry, never by editing the required list), `coverage_gated: bool` (`true` when `SPIKE_SEEDS >= N` and the required-cell gate applied; `false` for a smaller corpus, which records and never fails on `required_missing`) |
 
 The campaign artifact's name is chosen by the build profile (`cfg!(debug_assertions)`), not by an
 environment variable, so the debug and release commands can never overwrite each other's file and
@@ -117,27 +117,44 @@ Three rDB-specific rules, all consequences of the spike plan:
 
 - **An invariant is `proven`, `unavailable` or `violated` — never silently absent — and
   `unavailable` carries its reason** (ruling V-R16). `proven` means the checker **armed** on at
-  least one seed and saw no violation; `seeds_armed` records on how many. `unavailable` with reason
+  least one seed and saw no violation; `seeds_armed` records on how many. A checker's `armed()` is
+  its state **at the end of the fold**, not a latch: a checker that armed and then disarmed reports
+  `armed() == false` and a per-seed verdict of `not_armed`, and both the run's `proven` and its
+  `seeds_armed` count only seeds whose per-seed verdict is `proven` — so `proven` implies
+  `seeds_armed > 0` by definition (ruling V-R20). `unavailable` with reason
   `capability(<package>)` means a package the checker needs reported itself unwired at trace start;
   with reason `not_armed` it means every needed package was wired and the checker never reached the
-  situation its clause quantifies over (a zero-event trace, an unhealed schedule, an exhausted
-  liveness budget, an idle sibling partition). **Both reasons report and never pass.** The campaign
-  binary may still exit 0, but the artifact says `unavailable` with the reason, and the gate fails
-  when `SPIKE_REQUIRE_ALL=1` and any invariant is not `proven`. **`proven` with `seeds_armed == 0`
-  is a gate failure in every run**, whatever `SPIKE_REQUIRE_ALL` says: the runner's fold cannot
-  produce it, so its presence means the runner is wrong. This is the `full_scale: false` mechanic
-  applied to capability and to arming rather than to scale.
+  situation its clause quantifies over (a trace with no events after the `capability` block, an
+  unhealed schedule, an exhausted liveness budget, an idle sibling partition). **Both reasons
+  report and never pass.** The campaign binary may still exit 0, but the artifact says
+  `unavailable` with the reason, and the gate fails when `SPIKE_REQUIRE_ALL=1` and any invariant
+  is not `proven`. **`proven` with `seeds_armed == 0` is a gate failure in every run**, whatever
+  `SPIKE_REQUIRE_ALL` says: the runner's fold cannot produce it, so its presence means the runner
+  is wrong. And **every invariant whose needed packages all report `wired` must have
+  `seeds_armed > 0` on the default corpus**, in every run (ruling V-R20): the V-R19 schedule is
+  deterministic, so a wired checker that never arms is a generator regression, and the handoff
+  gate — not only the hand-run release gate — is where it fails. During M7 this clause covers no
+  invariant until kernel packages land, and the row says so. This is the `full_scale: false`
+  mechanic applied to capability and to arming rather than to scale.
 - **`capability{package, state}` is derived from the crate's wiring, never a literal** (ruling
   V-R18). The dispatcher builds the trace-start capability block from `Module::capability(&self)`
   over every module (foundation, K-F-10) and emits one event per package from that report. No
   hand-maintained table: a landed package cannot stay `unavailable` by omission, and an unlanded
   one cannot be declared `wired` by edit.
 - **Coverage is counted cells, never a percentage.** A named required cell with zero hits fails the
-  run. Spike §7: percentage coverage alone cannot waive a missing invariant. Required fault
-  boundaries are **scheduled** across the corpus by the generator (seed `i` attempts boundary
-  `i mod N` over foundation's closed `BoundaryId` set; ruling V-R19), so hitting them is a property
-  of the seed list, not of luck; a hook-gated cell whose provider package reports `unavailable` is
-  listed under `unavailable_cells`, not `required_missing`.
+  run **when the corpus has at least N seeds** (`SPIKE_SEEDS >= N`, N = the size of the closed
+  `BoundaryId` set — always true for the default corpus and both release commands; ruling V-R20).
+  A smaller corpus cannot attempt every boundary by construction, so it records coverage, writes
+  `coverage_gated: false`, and never fails on `required_missing`. Spike §7: percentage coverage
+  alone cannot waive a missing invariant. Required fault boundaries are **scheduled** across the
+  corpus by the generator (seed `i` attempts boundary `i mod N` over foundation's closed
+  `BoundaryId` set; ruling V-R19), so hitting them is a property of the seed list, not of luck.
+  Every required cell is keyed on the package whose provider emits its `fault_injected`, **per
+  fault family** (Network, Time and Control on H1; Storage on M1; Client and Recovery on I1,
+  provisionally, with foundation's handoff naming the emitter per member; ruling V-R20): a cell
+  whose emitting package reports `unavailable` is listed under `unavailable_cells`, not
+  `required_missing`, so I1 landing before H1 or M1 cannot fail every Network and Storage cell as
+  missing.
 
 #### 2.1 Commands
 
@@ -230,10 +247,13 @@ M7 (filled):
   the gate, and the failure names the reason.
 - A `seeds_armed` row: over the default corpus, every `proven` invariant has `seeds_armed > 0`; a
   `proven` status with `seeds_armed == 0` fails the run under every setting of
-  `SPIKE_REQUIRE_ALL` (V-R16).
-- A two-reasons row: a zero-event trace and a trace with `capability{package=P1,
-  state=Unavailable}` yield `unavailable` with reasons `not_armed` and `capability(P1)`
-  respectively, and neither is `proven`.
+  `SPIKE_REQUIRE_ALL` (V-R16); and every invariant whose needed packages all report `wired` in
+  this build has `seeds_armed > 0`, with the row naming per checker the scheduled boundary or op
+  that arms it (V-R20). A synthetic fold of {healed-then-exhausted, healed-then-exhausted} yields
+  `unavailable(not_armed)` with `seeds_armed = 0`, never `proven`.
+- A two-reasons row: a trace with no events after its ten `capability{state=Wired}` lines, and a
+  trace with `capability{package=P1, state=Unavailable}`, yield `unavailable` with reasons
+  `not_armed` and `capability(P1)` respectively, and neither is `proven`.
 - A capability-derivation row: the trace-start `capability` events equal, one for one, the report
   `Module::capability(&self)` returns over every module; a module whose `step` answers `Ok`
   reports `wired` and one whose `step` answers `Unavailable` reports `unavailable`, both asserted
@@ -247,9 +267,11 @@ M7 (filled):
   `proven` (V-R18).
 - A scheduled-boundary row: for every corpus of at least N seeds, every member of foundation's
   closed `BoundaryId` set is attempted by the generator, and `required_missing[]` is empty except
-  for cells listed under `unavailable_cells` (V-R19).
-- A degraded-RF2 publication row: a publish under `DEGRADED_RF2` satisfied by fewer acks than the
-  pinned `required_copy_set` is a violation (V3's degraded half, spec §8.3).
+  for cells listed under `unavailable_cells` (V-R19); a corpus of fewer than N seeds writes
+  `coverage_gated: false` and does not fail on `required_missing` (V-R20).
+- A degraded-RF2 publication row: a publish under `DEGRADED_RF2` — the rule derived from a
+  two-node `required_copy_set` — satisfied by fewer acks than the pinned set is a violation (V3's
+  degraded half, spec §8.3).
 - A false-durable row: `StorageOp::FalseDurable` trips INV-PUB's durability-grounding clause
   (V1 clause 3, in its modelled sense).
 - A multi-partition isolation row: INV-ISO under a healed schedule (spike §7 safety table).
@@ -273,3 +295,10 @@ M8–M13: pending. Each milestone adds its rows and amends its table row in plac
   V-R16..V-R19): §2 gained the two `unavailable` reasons and the `seeds_armed` rule, the release
   artifact `rdb-m7-campaign-release.json`, the capability-derivation rule, the scheduled-boundary
   rule and §2.1's three commands; §1's budget paragraph now cites §2.1. Status stays Proposed.
+- 2026-09-20, verification correction round 3 (critic T-23, T-24, T-25, T-28, T-30, T-35; ruling
+  V-R20): §1's V3 row says the quorum rule is derived from `required_copy_set.len()`, never a
+  trace field; §1's V8 row uses the landed field name `phase`; §2 rule 1 makes `armed()`
+  end-of-fold state, `seeds_armed` a count of `proven` seeds, and adds the wired-implies-armed
+  clause; §2 rule 3 scopes the required-cell gate to `SPIKE_SEEDS >= N` and keys every cell on
+  its emitting package per family; the artifact table gains `coverage_gated` and the one-form
+  `reason` note; Verification rows updated to match. Status stays Proposed.
