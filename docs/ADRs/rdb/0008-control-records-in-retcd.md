@@ -158,17 +158,36 @@ comparison, and the fail-closed classification of unknown outcomes — all rDB c
 
 ### 7. Requirements on the M7 fake control store (foundation owns the file)
 
-The fake must be able to produce, under scenario control:
+Amended after review (the first version asked for two behaviours that test the fake rather than
+the kernel, and omitted the two that break the grant state machine). The fake must be able to
+produce, under scenario control:
 
-1. `CasConflict { exists, current }` **without the value**.
-2. `Unknown` as a completion distinct from `Unavailable` and from `CasConflict`.
-3. All five watch terminations in the table above, plus `Progress`.
-4. The guarantee that a non-terminated watch has no silent gap (so a test that asserts "no reload
-   happened" is meaningful).
-5. `Unavailable` on reads, including inside a generous caller deadline.
+1. `CasConflict { exists, current }` **without the value**. Drives a real kernel path: the loser
+   must read.
+2. `Unknown` as a completion distinct from `Unavailable` and from `CasConflict`. Drives the
+   ADR-0015 classification.
+3. All five watch terminations in the table above, plus `Progress`. This is what exposed the
+   missing `resumable: false` transition in the authority table.
+4. **Restated as a kernel assertion, not a property of the fixture:** *no coherent family reload
+   occurs unless a termination was delivered.* The original wording ("a non-terminated watch has
+   no silent gap") is a negative property of the fake, assertable only by inspecting the fake.
+   What the gate needs is the kernel-side consequence, and that is observable in the trace.
+5. **Deleted.** It asked for `Unavailable` "inside a generous caller deadline", but the seam
+   carries no deadline — a control read effect is a key and an operation id — so the kernel cannot
+   distinguish "inside" from "outside" and the requirement collapses into 2. The underlying fact
+   (ADR-0009 bounds the barrier by the server's own `read_timeout`, independent of the caller's
+   deadline) is real, but it is an M9 binding property, not something the M7 seam can express.
 6. A coherent family read returning a `snapshot_revision` that a subsequent watch can resume from.
+   Drives the gap-reload path.
+7. **A control completion delivered arbitrarily late — after the grant's expiry has passed.**
+   This is the resurrection case ADR-rdb-0007 §3 forbids, and it is not producible under 1–6.
+8. **A control effect that never completes at all (a dropped operation).** This is the case that
+   exposes whether an expiry fence is suppressed by an in-flight renewal. Without it, the single
+   most important safety row in the release-blocking gate cannot be driven.
 
-If the fake is friendlier than this on any of the six, gate V2's evidence is invalid.
+7 and 8 are exactly what V2's "late messages and restart" clause asks for, and the first six
+could not produce either. If the fake is friendlier than this on any of the seven remaining
+requirements, gate V2's evidence is invalid.
 
 ## Consequences
 
@@ -205,7 +224,10 @@ Rows in `docs/testing/test-plan-m7-kernel-a.md` (`M7A-NN`); tests in
 | Gap forces coherent reload | inject `RevisionCompacted` and `LaggedResumable` ⇒ family reload + re-watch from `snapshot_revision`; assert no partial reconciliation |
 | Admission-limit gap is not a reload loop | inject `resumable: false` ⇒ backoff, bounded reload attempts |
 | Control-quorum loss denies | `Unavailable` on reads and writes ⇒ no new grant, no promotion; existing service ends at conservative local expiry (feeds **V2**) |
-| Fake fidelity | a conformance test over the six requirements in §7, asserted against the fake itself so a later relaxation is caught |
+| No reload without a termination | a kernel-side assertion over a trace with a healthy watch: the effect log contains no `ReadFamily`. Replaces the "fake has no silent gap" row, which could only be checked by inspecting the fixture |
+| Late completion after expiry | deliver a renewal's `APPLIED` after the conservative expiry has passed: assert the node is fenced and that the completion changes nothing (§7 requirement 7; shared row with ADR-rdb-0007) |
+| Dropped control operation | issue a renewal whose completion never arrives: assert the expiry fence still fires, a superseding authority view is published, and the partition queue drains (§7 requirement 8) |
+| Fake fidelity | a conformance test over the requirements in §7, asserted against the fake itself so a later relaxation is caught. Requirement 4 is asserted on the kernel trace instead, and requirement 5 no longer exists |
 
 ## References
 

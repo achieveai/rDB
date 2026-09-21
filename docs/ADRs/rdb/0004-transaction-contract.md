@@ -55,6 +55,25 @@ This ADR fixes the contract for the M7 correctness spike. It does not describe a
 Every key in a transaction MUST share the request's `(tenant, affinity_id)`. A violation is
 `CROSS_AFFINITY`, evaluated **before** any state is read and before any sequence is allocated.
 
+**How `(tenant, affinity_id)` is derived from a key, because "shares" is not checkable
+otherwise.** A key is the triple `(tenant, affinity_id, user_key)`. The tenant and affinity
+components are **structural prefix components, not part of the user key namespace**: a caller
+cannot construct a `user_key` whose bytes are reinterpreted as a different tenant or affinity
+group, and two keys differing only in their `user_key` always share the group. The check is then
+a component comparison, not a parse. Team foundation (C0) owns the canonical encoding and must
+supply one known-answer vector for the extraction, because whatever the first test author invents
+would otherwise become the de facto contract.
+
+**`affinity_id` is client-supplied and validated; `tenant` is server-bound.** The asymmetry is
+deliberate and is the same one ADR-0025 draws for `principal`. `tenant` is bound from the
+authenticated caller and never read from the message, so a caller cannot address another tenant's
+namespace by asserting a field. `affinity_id` *is* read from the message — it is a routing and
+grouping choice inside the caller's own tenant, not an authorization boundary — and every key in
+the request must match it, which is what check 3 enforces. A caller reaching another affinity
+group **inside its own tenant** is therefore possible by construction and is not a privilege
+escalation; if that ever needs to be an authorization boundary, it becomes a server-bound field
+and this paragraph is the place that changes.
+
 Routing is separate and later: `affinity_hash(tenant, affinity_id)` must resolve to this
 partition, or the answer is `NOT_PRIMARY` / `ROUTE_CHANGED`. The distinction matters to the
 caller — `CROSS_AFFINITY` means "this request can never succeed anywhere, change it";
@@ -87,13 +106,26 @@ Then, serialized at the partition queue (§5.2 step 2):
 | # | Step | Result |
 |---|---|---|
 | 11 | dedup lookup | hit + same digest ⇒ retained result replayed verbatim; hit + different digest ⇒ `REQUEST_ID_REUSE`; miss ⇒ continue |
-| 12 | evaluate `conditions[]` | failure ⇒ `CONDITION_FAILED`, **no sequence allocated** |
-| 13 | build deterministic after-images and `record_digest` | — |
-| 14 | authority admits at `Checkpoint::StorageDispatch` | denial ⇒ cancel, **no sequence allocated** |
+| 12 | evaluate `conditions[]` | failure ⇒ `CONDITION_FAILED`, **no sequence reserved** |
+| 13 | **reserve** the sequence (read the counter, do not advance it); build deterministic after-images and `record_digest` over the envelope | the reservation is local and discardable |
+| 14 | authority admits at `Checkpoint::StorageDispatch` | denial ⇒ discard the reservation, **counter unchanged** |
+| 15 | emit the storage batch | **the reservation commits here**: the counter advances and the digest chain extends |
 
-**The sequence number is allocated at dispatch (step 14), not at admission.** No path therefore
-has to un-allocate one, and "a rejected transaction allocates nothing" is true by construction —
-the same property ADR-0006 already relies on in rEtcd, where a rejected CAS allocates no revision.
+**The sequence is reserved at step 13 and committed at step 15 — never at completion.** The
+distinction is not pedantry. `record_digest` is the digest of the record envelope, which carries
+the sequence and the previous digest (§6.1: "same sequence / different digest quarantines the
+stream"), so the digest cannot be built before the sequence is known — a pipeline that claims to
+allocate *after* step 13 is not implementable as written. Narrowing the digest preimage to exclude
+the sequence is not available either: binding position is what makes it a chain. Reserve-then-commit
+gives a computable step 13 and keeps "a rejected transaction allocates nothing" true by
+construction — the same property ADR-0006 already relies on in rEtcd, where a rejected CAS
+allocates no revision.
+
+**Invariant: a lineage never reuses a reserved sequence, including after an ambiguous batch.** A
+batch that completes with an error or ambiguously does **not** roll the counter back, because the
+batch may have landed at that sequence. What prevents reuse is the partition freeze (§7), not the
+counter. This is stated because the counter looks like the enforcement and is not; an implementer
+who "fixes" the missing rollback reopens the hole.
 
 ### 4. Dedup key, scope and retention
 
@@ -112,12 +144,54 @@ Three rules adopted from rEtcd's ADR-0025 rather than re-derived:
   ADR-0025's `DedupRecord` keeps the whole response for exactly this reason.
 - **Age is a counter, not a timestamp.** Retention is "at least 24 hours" (§5.3), but the kernel
   has no clock. Each retained entry records the `seq` at which it was written; trimming arrives as
-  an event carrying a watermark (`DedupTrim { below: Seq }`), computed outside the kernel. This is
-  ADR-0025's `applied_revision` discipline, transposed from revisions to sequences.
+  an event carrying a watermark, computed outside the kernel. This is ADR-0025's `applied_revision`
+  discipline, transposed from revisions to sequences.
 
-Beyond retention, **absence is not evidence.** A status query for an expired identity returns
-`STATUS_EXPIRED`, never "not executed" (§5.3, §8.1). There is no `NOT_EXECUTED` value in the
-result type to return by accident.
+**The request digest covers the semantic request and nothing else.** Preimage, normatively:
+`tenant`, `affinity_id`, `api_version`, `conditions[]`, `mutations[]`. **Excluded:** `deadline`,
+`client_id`, `request_id`, `expected_generation`, and every routing or transport field.
+
+- `deadline` must be excluded because §5.1 transmits it as a *remaining duration*, so it
+  necessarily differs on every retry of the same logical request. With `deadline` in the preimage,
+  §5.4's own mandatory retry path becomes `LEASE_EXPIRED` → same identity → different digest →
+  `REQUEST_ID_REUSE`, which §5.4 classifies as "reconcile or fail; never transparent replay". The
+  contract would produce a conflict error on its own happy path and V4 would fail on a *correct*
+  client.
+- `client_id` and `request_id` are excluded because they are the dedup **key**, not the payload.
+- `expected_generation` is excluded because check 5 returns `GENERATION_CHANGED` ahead of the
+  dedup lookup, so it can never reach the comparison.
+- The preimage must not be narrowed further. A preimage that omits part of `mutations[]` or
+  `conditions[]` lets a genuinely changed payload replay a retained result, which is the opposite
+  failure and the worse one.
+
+C0 owns canonical hashing and must supply one known-answer vector: the same semantic request with
+two different remaining deadlines hashes to the same digest.
+
+**Trims are generation-qualified.** `DedupTrim { generation, below: Seq }`, plus
+`RetireGeneration { generation }` for dropping a whole old generation. A bare sequence watermark
+does not work: the dedup and status indexes span generations, and recovery may rebase the sequence
+counter **downward** (§8.1, D6 — a shorter selected prefix is allowed), so new-generation
+sequences overlap old-generation ones and one watermark cannot order them. It would either drop
+minutes-old old-generation entries — breaking §8.1's 24 h queryability and turning a legitimate
+`RECOVERED_APPLIED` into `STATUS_EXPIRED` — or never match them, which is unbounded growth with no
+capacity error. Both directions are live.
+
+**Absence is not evidence, and the status answer is a total function.** Given a query naming an
+identity and a generation:
+
+| State | Answer |
+|---|---|
+| the identity is present | its recorded outcome |
+| absent; the generation is retained (present in the retention floor map) | `UNKNOWN_OUTCOME` |
+| absent; the generation has been retired, or was never retained | `STATUS_EXPIRED` |
+
+Three states, three answers, no default. Without the per-generation floor and the retired-generation
+set, an absent identity was indistinguishable between trimmed, never submitted and lost in
+recovery, and this ADR prescribed two different answers for that one observable state. Both are
+spec-legal (§5.3, §8.1), which is exactly why it is decided here rather than discovered during
+implementation: V4 measures whether a client SDK can implement §5.4 as a total function.
+
+There is no `NOT_EXECUTED` value in the result type to return by accident.
 
 ### 5. Error categories and their retry rules (§5.4, normative)
 
@@ -172,7 +246,10 @@ costs one status query, a false definitive rejection costs correctness.
 - Allocating the sequence at dispatch means the admission path cannot report a `seq` in a
   rejection. Accepted: a rejection has no sequence to report.
 - Reusing `PROTECTION_PAUSED` for a freeze caused by an unresolved transaction is a naming
-  compromise; its retry rule is correct, its name says lag protection. Open for review.
+  compromise; its retry rule is correct, its name says lag protection. Settled: kept.
+- The dedup and status indexes now carry a per-generation retention floor and a retired-generation
+  set. That is two small maps, and they are what make the absent-identity answer decidable; they
+  are not an optimisation and must not be dropped as one.
 - Dedup retention is enforced outside the kernel. If the trim watermark is never produced, entries
   accumulate without bound. The bound is an environment responsibility, and the test plan must
   cover a missing-trim case rather than assuming one arrives.
@@ -187,11 +264,16 @@ the `M7A-NN` prefix; each row is one named test in `rdb-sim/tests/transaction.rs
 | Same request has one effect | submit, drop the reply, resubmit with the same identity and digest: one sequence allocated, one history entry, byte-identical result |
 | Changed payload rejects | same identity, different `request_digest` ⇒ `REQUEST_ID_REUSE`, no sequence allocated |
 | Cross-affinity rejects pre-admission | a mutation whose key carries a different `affinity_id` ⇒ `CROSS_AFFINITY`; state hash unchanged |
-| Local apply never returns success | exhaustive scan of the transaction module's reply constructors; no successful variant exists. Plus: a trace in which no ACK ever arrives produces no success |
+| Local apply never returns success | **a type, not a test.** The transaction module's reply effect carries a rejection enum with no successful variant, so "the transaction module cannot construct a success" is a compile-time fact. Behavioural companion row: a trace in which no ACK ever arrives produces no success |
 | Admission order is normative | a request violating checks 2, 3 and 5 simultaneously reports the check-2 error, deterministically, across shuffled event orders |
 | Condition failure allocates nothing | `CONDITION_FAILED` leaves `next_seq` and the state hash unchanged |
 | Retained result replayed verbatim | a retained `CONDITION_FAILED` replays as `CONDITION_FAILED` even after the state it tested has changed |
-| Retention boundary | status inside retention ⇒ `Published`/`RecoveredApplied`; after trim ⇒ `STATUS_EXPIRED`; never "not executed" (spike §6, F1/T1/P1) |
+| Retention boundary | status inside retention ⇒ `Published`/`RecoveredApplied`; trimmed within a live generation ⇒ `UNKNOWN_OUTCOME`; retired generation ⇒ `STATUS_EXPIRED`; never "not executed". All three answers asserted against the §4 table (spike §6, F1/T1/P1) |
+| Digest survives a legitimate retry | the same semantic request submitted twice with different remaining deadlines produces one digest, one effect and a verbatim replayed result — **not** `REQUEST_ID_REUSE` |
+| Affinity extraction is specified | C0's known-answer vector for `(tenant, affinity_id, user_key)`, plus the `CROSS_AFFINITY` row built on it |
+| Sequence reservation is discardable | a dispatch-checkpoint denial leaves the counter and the digest chain exactly as they were; an ambiguous batch leaves the counter advanced and the partition frozen |
+| Generation-qualified trim | trim the new generation aggressively while the old generation's sequences overlap it: assert no old-generation entry is dropped and that `RetireGeneration` is the only thing that drops one |
+| Unbounded growth is explicit | a trace with no trim event at all: assert a stated capacity policy or an explicit `OVERLOADED`, never silent growth |
 | Generation reconciliation | a mutating retry across a recovery boundary requires explicit reconciliation even while status remains queryable (spike §6, F1/T1) |
 | Batch error freezes | injected batch failure at every boundary ⇒ `UNKNOWN_OUTCOME` + partition frozen, never a definitive rejection (feeds V1) |
 
