@@ -141,7 +141,7 @@ Stated plainly so it cannot be quoted out of context, in the same register as rE
 
 - A summary line can no longer say "V3 passed" without its form. That is the point, and it will read
   as under-claiming compared to a plain gate name. Under-claiming is the intended direction.
-- Reusing rEtcd's `write_evidence()` couples `partdb-*` test code to a `config-*` test helper. See
+- Reusing rEtcd's `write_evidence()` couples `rdb-*` test code to a `config-*` test helper. See
   Verification and the open question below — the helper may need to move to a shared location.
 - Running the campaign at reduced scale on every ordinary `scripts/gate.sh` costs CI time. Accepted:
   the alternative is a suite that only runs when someone remembers, which is where coverage rots.
