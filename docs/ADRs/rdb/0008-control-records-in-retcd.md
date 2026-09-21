@@ -226,7 +226,7 @@ Rows in `docs/testing/test-plan-m7-kernel-a.md` (`M7A-NN`); tests in
 | Control-quorum loss denies | `Unavailable` on reads and writes ⇒ no new grant, no promotion; existing service ends at conservative local expiry (feeds **V2**) |
 | No reload without a termination | a kernel-side assertion over a trace with a healthy watch: the effect log contains no `ReadFamily`. Replaces the "fake has no silent gap" row, which could only be checked by inspecting the fixture |
 | Late completion after expiry | deliver a renewal's `APPLIED` after the conservative expiry has passed: assert the node is fenced and that the completion changes nothing (§7 requirement 7; shared row with ADR-rdb-0007) |
-| Dropped control operation | issue a renewal whose completion never arrives: assert the expiry fence still fires, a superseding authority view is published, the transaction queue drains **and the publication module's waiting readers drain at the fence** (§7 requirement 8; both consumers of the fence, not one) |
+| Dropped control operation | issue a renewal whose completion never arrives: assert the expiry fence still fires, a superseding authority view is published **already past its horizon** (`valid_through_tick` is the previous tick, past-horizon reason `Expired`), the transaction queue drains **and the publication module's waiting readers drain at the fence** (§7 requirement 8; both consumers of the fence, not one; shared row with ADR-rdb-0007 "Every fence publishes an already-past view") |
 | Fake fidelity | a conformance test over the requirements in §7, asserted against the fake itself so a later relaxation is caught. Requirement 4 is asserted on the kernel trace instead, and requirement 5 no longer exists |
 
 ## References

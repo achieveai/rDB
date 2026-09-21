@@ -97,7 +97,7 @@ First failure wins, in this order, so that one trace always produces one reason:
 | 5 | `expected_generation` matches | `GENERATION_CHANGED` | nothing was written |
 | 6 | authority admits at `Checkpoint::Admission` | `LEASE_EXPIRED` etc. | nothing was written |
 | 7 | partition queue not frozen | `PROTECTION_PAUSED` | nothing was written **by this request** |
-| 8 | lag protection not paused (L1) | `PROTECTION_PAUSED` | nothing was written **by this request** |
+| 8 | L1's admission state allows (`AdmissionState.allow`; the reply is its `reason`) | `PROTECTION_PAUSED`, or `DIVERGENCE_REQUIRES_OPERATOR` while the partition is blocked | nothing was written **by this request** |
 | 9 | queue below cap | `OVERLOADED` | nothing was written |
 | 10 | structural validation | `INVALID_ARGUMENT` | nothing was written |
 
@@ -205,6 +205,7 @@ There is no `NOT_EXECUTED` value in the result type to return by accident.
 | `GENERATION_CHANGED`, `REQUEST_ID_REUSE` | reconcile or fail; never transparent replay | ambiguous / conflicting |
 | `STATUS_EXPIRED` | retention passed; absence proves nothing | ambiguous |
 | `INCOMPATIBLE_VERSION`, `CORRUPT_HISTORY` | quarantine / reject; operator or rollout action | reject |
+| `DIVERGENCE_REQUIRES_OPERATOR` | the partition is blocked (ADR-rdb-0009, B-R26): no data-path exit; retry after the operator removes the diverged copies and fences; **do not assume an already-admitted request failed** | no admission *for this submission* |
 
 The load-bearing line, and the reason this ADR is gated by V4: **only pre-admission rejection
 proves no mutation.** Everything after the local atomic batch is `UNKNOWN_OUTCOME` until a status
@@ -269,6 +270,9 @@ the `M7A-NN` prefix; each row is one named test in `rdb-sim/tests/transaction.rs
 | Condition failure allocates nothing | `CONDITION_FAILED` leaves `next_seq` and the state hash unchanged |
 | Retained result replayed verbatim | a retained `CONDITION_FAILED` replays as `CONDITION_FAILED` even after the state it tested has changed |
 | Retention boundary | status inside retention ⇒ `Published`/`RecoveredApplied`; trimmed within a live generation ⇒ `UNKNOWN_OUTCOME`; retired generation ⇒ `STATUS_EXPIRED`; never "not executed". All three answers asserted against the §4 table (spike §6, F1/T1/P1) |
+| Recovery folds status by sequence, not by presence | recover with a cutoff below the highest published sequence (a loss-accepting recovery, ADR-rdb-0009) and query three identities present in the predecessor generation's status index: one at or below the retained cutoff ⇒ `RECOVERED_APPLIED` with the retained result; one at or above the discarded sequence ⇒ `UNKNOWN_OUTCOME`; and, in a second trace with the loss marked uncertain, the retained one too ⇒ `UNKNOWN_OUTCOME`. A present identity whose bytes were dropped never answers success (spike §6, F1/T1/P1; kernel-b §5.8's three-way rule) |
+| Publication binds the digest | after the apply, hand the replication module a history whose digest at the candidate's sequence differs from `record_digest` (and, in a second trace, one that has not retained that sequence): assert no publication, no `Published` status, no reply, the candidate still pending, and a predicate-false fact naming the digest conjunct; then supply the matching history and assert the publication follows (ADR-rdb-0009 §3.5's third conjunct, evaluated by the publisher) |
+| Published while frozen retains dedup in both orders | freeze the queue for an authority loss (resp. a storage fence) while a batch is dispatched; complete the batch; deliver `Published{seq}` — and in a second trace deliver `Published{seq}` *before* the freeze lands on the queue: assert the dedup record is retained in both, the queue's freeze cause is unchanged, and the unresolved sequence was the batch's (ADR-rdb-0007 "A freeze keeps its cause") |
 | Digest survives a legitimate retry | the same semantic request submitted twice with different remaining deadlines produces one digest, one effect and a verbatim replayed result — **not** `REQUEST_ID_REUSE` |
 | Affinity extraction is specified | C0's known-answer vector for `(tenant, affinity_id, user_key)`, plus the `CROSS_AFFINITY` row built on it |
 | Sequence reservation is discardable | a dispatch-checkpoint denial leaves the counter and the digest chain exactly as they were; so does a partition freeze that lands between the dispatch check and its answer (the pre-apply request is rejected, no storage batch is emitted); an ambiguous batch leaves the counter advanced and the partition frozen |

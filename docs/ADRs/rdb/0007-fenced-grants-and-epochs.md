@@ -82,9 +82,13 @@ this paragraph is normative rather than advisory.
   - **The same rule governs the acquisition CAS.** A first grant is written with an `E` too, and
     that `E` is the input to another node's `C_auth > E + ε + δ` — the one number in the system
     that crosses machines. With no valid, fresh sample the node issues no acquisition CAS and
-    stays without a grant; it does not write an `E` it could not compute. Bounded-clock mode
-    being *unconfigured* is a different condition: with a valid sample the node acquires
-    normally and then denies every check until a bound is established (§3, §4).
+    stays without a grant; it does not write an `E` it could not compute. **A rejected sample
+    retracts the one before it**: a sample that fails the acceptance guard (invalid, future-stamped,
+    over the bound, or a backward jump) while no grant is held leaves the node with *no* sample,
+    not with the last good one, so `E_new` cannot be derived from a reading the guard just
+    discredited and the next acquisition attempt issues no CAS until a fresh sample is accepted.
+    Bounded-clock mode being *unconfigured* is a different condition: with a valid sample the node
+    acquires normally and then denies every check until a bound is established (§3, §4).
 - **The locally held "last renewed" anchor is the dispatch tick too.** The local conjunct in §4 is
   a bound on elapsed-since-commit, so it must anchor at a *lower* bound on the commit. Setting it
   at completion under-counts by the round trip; setting it to "now" when adopting a delayed
@@ -249,11 +253,15 @@ view rather than waiting to be asked, the entry check can be live at no cost in 
 `valid_through_tick` is the last tick at which the full admission rule (§4, both conjuncts, with
 the *effective* ε of the sample the authority module holds) would still admit. The authority
 module republishes the view whenever that horizon moves — on every committed renewal, on every
-accepted clock sample (a wider sample bound shortens it), on every partition lineage change — and
-on every fence, where the horizon is set to the current tick. The entry check is therefore a
-conservative horizon test, never more permissive than the rule it stands in for, and stale only
-by the delivery of one pushed view. Its deny reasons are a subset of the round-trip form's (the
-view names which bound expired), so the client-error mapping stays total.
+grant adoption, on every accepted clock sample (a wider sample bound shortens it), on every
+partition lineage change — and on every fence, where the view is **already past its horizon**:
+`valid_through_tick` is the previous tick (saturating at zero) and the view's past-horizon reason
+is the fence reason itself, so a consumer that evaluates the fenced view at the fence tick denies
+at once and names why. A horizon *at* the current tick would admit for one more tick after the
+fence, which is one tick of two lineages admitting. The entry check is therefore a conservative
+horizon test, never more permissive than the rule it stands in for, and stale only by the
+delivery of one pushed view. Its deny reasons are a subset of the round-trip form's (the view
+names which bound expired, or which fence fired), so the client-error mapping stays total.
 
 **A carried-forward decision is accepted only if it is the one that was asked for, and was
 decided under authority at least as new as the consumer's.** Comparing lineage alone is
@@ -343,13 +351,19 @@ Rows land in `docs/testing/test-plan-m7-kernel-a.md` (`M7A-NN`), tests in
 | Stale sample denies without fencing | withhold samples past `max_sample_age_ticks` but **inside `grant_duration_ms − δ` of the last committed renewal**: every checkpoint denies with `ClockSampleStale`, the state stays `Held`, and a fresh valid sample restores admission within one tick — no grant id is consumed. Companion: withhold samples past `grant_duration_ms` and assert the `Expired` fence (§3: persistent staleness ends in expiry) |
 | Unbounded mode does not burn grant ids | boot with a **valid sample** but bounded-clock mode unconfigured, run for many renewal intervals: assert admission is refused throughout with `ClockUnbounded` and that the number of grant ids acquired is exactly one |
 | No sample, no acquisition | boot with **no valid sample** (none, `valid = false`, over the bound, or stale): assert zero acquisition CASes are issued and the node stays without a grant; deliver a valid sample and assert exactly one CAS follows (§2: the `E_new` rule governs acquisition) |
+| A rejected sample retracts the good one | unheld: deliver a valid sample, then one that fails the guard (each of: `valid = false`, future-stamped, over the bound, backward jump), then the acquisition tick: assert a sample-rejected fact, **zero** acquisition CASes, and that a subsequent valid sample yields exactly one CAS (§2: the retraction rule; the same four rejections in `Held` fence, per the clock-bound row) |
 | Admission horizon follows the sample | widen the sample's `epsilon_ms` mid-trace: assert a superseding authority view is pushed and the entry-check admission boundary moves within one tick of the sample; then widen it past the bound and assert the terminal fence |
-| Expiry fences with a renewal outstanding | dispatch a renewal, drop its completion, advance past the conservative expiry: assert a node-scoped fence, a superseding authority view at the current tick, and that a late `APPLIED` for that renewal changes nothing |
+| Expiry fences with a renewal outstanding | dispatch a renewal, drop its completion, advance past the conservative expiry: assert a node-scoped fence, a superseding authority view whose `valid_through_tick` is the *previous* tick and whose past-horizon reason is `Expired`, and that a late `APPLIED` for that renewal changes nothing |
+| Every fence publishes an already-past view | for each fence reason in §3's table (node- and partition-scoped alike): assert the paired view has `valid_through_tick == fence_tick − 1` (zero at tick zero) and a past-horizon reason equal to the fence reason, and that an entry check evaluated against that view at the fence tick denies with that same reason (§5) |
 | Renewed expiry does not run away | ten minutes of healthy 500 ms renewals: assert `E` never exceeds `dispatch_utc + grant_duration_ms`, and that the takeover wait after a freeze is bounded by the grant duration plus ε + δ |
 | Adoption does not restart the local window | renewal returns `Unknown`; deliver the read-back after the original `E`: assert admission stops at the original bound and does not restart |
 | Fence scope is honoured | a local storage failure on one partition: assert the other partitions of the same node keep admitting and that the grant is not consumed |
 | Stale authority answer is dropped | request a checkpoint, fence with `Expired`, then deliver the pre-fence `Admit`: assert no publication, no reply, and one dropped-answer fact; repeat with a duplicated answer; **repeat with the decision and the fence at the same tick** — the answer's authority sequence is below the fence's view and it is dropped (§5) |
-| Freeze stops a pre-apply dispatch | fence between the dispatch check and its answer, then deliver the `Admit`: assert no storage batch effect, the sequence counter unchanged, one definitive rejection reply, and the partition queue drained; the companion with a *post-apply* candidate asserts the candidate is kept and resolves as unknown (§5) |
+| Freeze stops a pre-apply dispatch | fence between the dispatch check and its answer, then deliver the `Admit`: assert no storage batch effect, the sequence counter unchanged, one definitive rejection reply, and the partition queue drained (§5) |
+| Post-apply candidate under a lost authority is accepted, not dropped | fence while a storage batch is dispatched, then complete the batch: assert the transaction module keeps the inflight and emits the candidate; assert the publication module — frozen for the authority loss — records status `Unknown` for the identity, arms the post-apply deadline, and at the deadline sends exactly one `Unknown` reply **and stays frozen for the authority loss** (not for an unresolved transaction); assert a status query for the identity answers `Unknown` throughout, never absence (§5) |
+| A freeze keeps its cause across the batch completion | fence with a batch dispatched; complete the batch (`Ok`, then in a second trace `Err`): assert the transaction queue's freeze cause is still the authority loss (resp. storage fence) after the completion, not "unresolved transaction", and that the inflight's sequence is recorded as the unresolved one; then deliver `Published{seq}` and assert the dedup record is retained and the queue stays frozen for the original cause (§5; ADR-rdb-0004 "Published while frozen") |
+| Publishing from the unresolved freeze reopens; from an authority loss it does not | trace A: deadline fires in `Serving` (queue frozen for the unresolved transaction), then the late `Admit` publishes — assert the publication module returns to `Serving` and the next fresh read is answered. Trace B: same but the freeze cause is an authority loss — assert the publication happens (the write is durable) and the mode is unchanged; only a recovery install reopens it (§5) |
+| Blocked is sticky under a publication deny | block the partition (divergence), then deliver a partition-scoped `Deny` and, in a second trace, an `Admit` under a moved lineage for its pending candidate: assert status `Unknown`, the quarantine fact, waiters drained, and that the mode is still `Blocked` with the operator reason — not frozen for an authority loss (§5; B-R29) |
 | Fence reaches the publication module | fence with a pending candidate and queued fresh readers: assert the readers are drained at the fence, not at the post-apply deadline, and that the module is frozen without any recheck outstanding |
 | Reply checkpoint outlives publication | publish, delay the reply-checkpoint answer past the post-apply deadline, then deliver `Admit`: assert exactly one terminal reply for the identity and a status query answering `Published` throughout; repeat with `Deny` and assert no reply and status `Published` |
 | Adopted authority comes only from lineage installs | the dispatcher's `StepCtx` lineage equals the last `AdoptAuthority` for that partition at every step, and `AdoptAuthority` is emitted only by the coherent partitions load, a partition-record change and the post-recovery install — never by a watch event or a grant renewal |
