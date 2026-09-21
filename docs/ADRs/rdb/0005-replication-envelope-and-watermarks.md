@@ -243,6 +243,17 @@ conjunct is required: without it the predicate says "enough copies are at or pas
 about *which* history they are at, which after a generation change lets an old-lineage candidate
 look qualified on the seq comparison alone.
 
+Alongside the predicate, R1 emits **`QualificationChanged { lineage, config_version, at_seq,
+direction: Gained | Lost, qualified_copies, qualified_ack_count, cause, tick }`** as an effect of
+the step in which the qualifying set changes value — an ACK crossing the threshold, a
+`DivergenceDetected`, a `STALE_BOOT` or control-announced boot change, or a membership/threshold
+change. `Gained` and `Lost` are the two shapes P1 needs: a `Lost` at `at_seq` tells P1 to discard a
+remembered `true` rather than act on it, on every one of those causes. It never substitutes for the
+predicate — P1 re-evaluates `qualifies_now(cand.seq)` at publication time regardless — and it is
+never a retraction: a `Lost` arriving after a publication is a recorded fact, because publication is
+irreversible (§5.3). Edge detection lives in R1 because the qualifying set is R1's own derived view;
+a detector elsewhere would be a second, lagging copy of the same rule.
+
 An earlier draft made this a monotone `qualified_through_seq` watermark, on the argument that
 recomputing after `DivergenceDetected` would retract publication and violate spec §5.3's "a lost
 client reply does not reverse publication". **That argument was wrong and the watermark is

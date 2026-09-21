@@ -105,10 +105,16 @@ by itself produce a locally acknowledged write, because publication still requir
 `qualifies_now(cand.seq)` holds at publication time and the candidate's digest matches.
 
 L1 also stops admission when no regular secondary qualifies. That arm and guard B read **the same
-underlying fact**: R1's qualifying-copy set, computed once from the pinned configuration. L1
-receives it as an edge-triggered `QualificationChanged` event; P1 reads it live. That is one guard
+underlying fact**: R1's qualifying-copy set, computed once from the pinned configuration. R1 emits
+an edge-triggered `QualificationChanged` effect when that set changes value; L1 and P1 both receive
+it as an event, and P1 additionally reads the predicate live at publication time. That is one guard
 evaluated at two moments, not two independent guards. A bug in R1's qualifying-set computation
 defeats both.
+
+The edge detection belongs to **R1**, not to the harness: the set is R1's own derived view, and a
+detector living outside it would be a second, lagging copy of the same rule. The harness observes
+nothing here; the interface layer only routes the effect to L1 and P1, and the effect-to-event hop
+is part of the `admission_propagation` budget in §5.
 
 So the honest statement is: **one guard against age bugs, one shared guard against ACK-set bugs.**
 Evaluating the shared guard at admission *and* at publication is still worth doing — it is exactly
@@ -238,9 +244,11 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
   qualifying-copy set. Only the age half is independent. Evaluating the shared half twice is still
   worth its cost, but the residual risk is real and is carried by tests on R1's qualifying-set
   computation rather than by architecture.
-- L1 gains an input it did not have: `QualificationChanged` from H1. The alternative — L1 querying
-  R1 — would give the kernel an I/O dependency, so the fact arrives as an event like everything
-  else, and H1 owns emitting it on the right edges.
+- L1 gains an input it did not have: `QualificationChanged`, emitted by R1. The alternative — L1
+  querying R1 — would give one kernel module a synchronous dependency on another, so the fact
+  arrives as an event like everything else. The cost is that R1 must emit on every edge, including
+  ones that are not ACKs (a boot change, a membership change); missing one leaves L1 stale until
+  the next `HealthEval` backstop.
 - The thresholds are §6.2's initial defaults for validation, not observed guarantees. They are
   configuration, and V8 measures them rather than assuming them.
 
