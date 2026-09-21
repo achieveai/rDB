@@ -502,3 +502,219 @@ Predecessor: ../retcd-m0-m3-implementation/ledger.md. main = 7d524ac (M0-M3 merg
 - 2026-09-19T13:20 docs-progress-skills DONE: conductor skill rewritten (83 lines) + progress-evidence/system-picture/status-board/accessible-style skills; agents progress-scout, progress-architect (new, haiku), progress-reporter renamed to progress-tracker (haiku). Rule map: 74/74 rules homed. Its open gap (no whole-page contradiction check) closed by 6 cross-field rules in build.mjs (rule 7 has no SCHEMA vocab; skipped).
 - 2026-09-19T13:20 dev-progress-build DONE_WITH_RISKS: build.mjs + migrated src pieces (27.7 KB JSON). Could not verify Mermaid render. Lead verified with headless Edge --dump-dom: 6/7 diagrams were Mermaid error boxes. Lead fixes in build.mjs: accTitle after diagram-type line; var(--x) resolved at load (Mermaid rejects var() in classDef/theme); one inline class + `class ... changed;` statement; page template regex needed doubled backslashes; pre content HTML-escaped (raw <br/> was eaten); hatch pattern injected post-render for building; cluster colours from tokens; pending gate box border grey dashed (3:1). Validators added: bare part id on arrow line; part-to-part arrow across subgraphs (Mermaid drops direction LR). .mmd files rewritten: flowchart TB, rows as `direction LR` subgraphs, arrows inside rows, rows linked by subgraph id or ~~~. Result: 6 flowchart + 1 gantt render, 0 errors, light+dark screenshots, two builds byte-identical. index.html untouched. Side-by-side sent to user.
 - 2026-09-19T13:50 User look-check feedback (HITL, chose "tune"): read/watch link unclear; data-flow roll-up hid gaps; operator workflows unreadable; gantt swim lanes useless; no component dependency DAG with labeled arrows. Lead (build.mjs): %% caption required, bold part name + glyph/word/milestone line, arrows keep |labels|, honest roll-up ("5 of 7 built, 2 with gaps"), any non-built diagram opens, max 4 parts per subgraph, max 16 per diagram (was 12), swim lanes = HTML column per role (gantt removed). SCHEMA + system-picture/status-board skills updated. architect-redraw (Sonnet): new 01b-component-dependencies (crate DAG), read path shows List returns R -> watch resumes from R (DesignSpec 11.2, ADR-0020), workflows as operator jobs, split sm-storage-log/sm-planes, added sm-server/sm-testkit. Lead trimmed DAG to 7 labeled arrows (core/log/testkit arrows noted in caption) and restored full system map (5 rows, 16 parts). 7 flowcharts render, 0 errors, builds byte-identical. Both reports opened in in-app browser (static pre-drawn preview at docs/progress/.preview/new.html; in-app browser runs no scripts on local files). index.html untouched.
+
+## 2026-09-19 14:00 — new report live; skill ready for next session; archive built (plan progress-archive-plan.md rev 2, APPROVED)
+- User: "Love the new report". Real build done; index.html = new page. Timer re-created: cron 081c2e0c `23,53 * * * *` (session-only, 7-day expiry).
+- build.mjs: `--verify [file]` (headless Edge, "N of N drawn, 0 errors", exit 1 on miss, writes script-free .preview/index.html, adds exclude line). Reads docs/progress/config.json `work_dir` (ledger + refresh log); a new ledger path resets meta ledger.line to 0. Negative test: broken diagram -> 7 of 8, exit 1.
+- Conductor skill: "Start here: new session" (5 steps), verify/show section, Mermaid traps, archive step in timer prompt.
+- Archive: docs/progress/archive.mjs (zero LLM, secret scan, --milestone/--work/--dry-run) -> docs/archive/ (1.4 MB: M6 snapshot + 67 notes from 6 conversation folders + INDEX incl. 7 older pages in git). `.ignore` hides it from default rg; `.gitattributes` linguist-generated -diff; AGENTS.md "Archive" section; CLAUDE.md = @AGENTS.md; skill progress-archive.
+- Decisions A-D approved: index.html untracked (`git rm --cached`, .gitignore line); no backfill; 9 GB tester-m6d-target deleted; AGENTS.md/CLAUDE.md created. .preview moved from .gitignore to .git/info/exclude (user feedback).
+- Proof: snapshot rebuild --verify 7/7; default rg 0 archive hits, explicit 10; no-config fallback -> .scratchpad/archive + exclude, git status clean; secret scan refused fake key (exit 1); new work_dir -> line 0 then 4.
+- Nothing committed. Stale cargo test (pid 138188, since 00:22, config-engine/grpc) still running; not touched.
+
+## 2026-09-19 — final review adjudicated, fixes dispatched
+
+All 6 reviewers returned PASS_WITH_RISKS, 0 blockers. 19 findings collected in
+review-final-findings.md. Lead independently verified F-007, F-013, F-014, F-015 by grep/read
+rather than trusting the reports.
+
+User decisions (HITL): wire the decode fence (not narrow the docs); write M6-32 + M6-126 only;
+couple --dev-allow-all to --allow-insecure-dev.
+
+Merge-blocking lane (being fixed now, 3 workers, disjoint crates, own CARGO_TARGET_DIR each):
+- w1 fix-policy  -> config-server/**: F-007 (bind_policy_version never wired + M6-32 row),
+                    F-003 (JoinError panic), F-019 (advertise cancel window), dev-flag coupling.
+- w2 fix-authz   -> config-grpc/**: F-013 (admin allowlist skips is_verified_kind) + M6-126 row,
+                    F-004/F-018 (rotation "nothing changed" claim).
+- w3 fix-schema  -> config-core schema/state, config-engine/node.rs, config-storage/rocks.rs:
+                    F-015 (decode fence has no product caller) + F-014 (schema_gate clause 1
+                    over-permissive) must land together, F-016, F-017, F-006, ADR-0030 as-built.
+Lead: docs/evidence/README.md host/build wording corrected (F-001, F-002). ADR-0031 note pending
+until the workers land.
+
+Follow-up lane (recorded, not fixed): F-005, F-008, F-009, F-010, F-011, F-012, and questions
+Q2 (policy version floor is process-scoped across restarts), Q4 (snapshot install validates
+against build constants — handed to w3 to answer), Q5 (abort cannot stop a parked spawn_blocking),
+Q6 (transport panics on poisoned mutex, rotation recovers).
+
+### Lead rulings during the fix pass
+
+**M6-R23 (recorded in ADR-0027):** the verified-kind gate applies to a *signed* admin set, not to a
+static one. The admin set's SOURCE decides, never the listener's TLS mode. Rejected the "signed
+only when not insecure" variant: two conditions means a reader cannot answer "does a signed admin
+name bind to an unverified caller?" without also knowing the transport. Consequence accepted:
+signed RBAC + insecure listener no longer gives admin access; m6_25 and m6_40 move to the mTLS
+harness. Static stays exempt under ADR-0023 ruling 4. Lead landed the config-core export
+(authz.rs is_verified_kind -> pub, lib.rs:50 re-export); `cargo check -p config-core` clean in 48s.
+
+**F-014 three-way peer schema (lead correction to w3's ASK 3):** an `observed() -> Option` accessor
+alone is NOT enough. network.rs:137-140 records behind `if let Some(schema) = peer_schema`, and
+reaching that line means the peer ANSWERED (no answer returns Err earlier). So a genuinely pre-M6
+peer — answers, carries no schema field — gets no entry at all and would read as "unknown, does not
+block". That is worse than the bug, because it is the real old-build case rather than the
+--compat-schema rehearsal. Ruling: record on every answer (`peer_schema.unwrap_or(COMPAT_SCHEMA_1)`),
+so absence means strictly "no answer". Three-way: no answer -> no block (M6-R15/M6-89);
+answered below the gate -> block; answered with no field -> block.
+
+**Confirmed, was review question Q4:** the snapshot-install refusal ADR-0030 claims does not exist.
+validate_snapshot_file (rocks.rs:3474,3480) tests against BUILD constants, and
+apply_snapshot_records (3707-3714) then raises the durable watermark by max. Second mechanism by
+which a pinned node reaches watermark 2 without applying a schema-2 entry. Closed by the same fence
+(RocksOptions.command_schema); to be recorded in ADR-0030's as-built amendment.
+
+Cross-worker dependency: RocksOptions gains `command_schema` (w3, config-storage); the struct
+literal at run.rs:953-959 has no ..Default, so w1 adds `command_schema: cli.schema().command_schema`.
+config-server will not compile between the two halves. config-testkit does not depend on
+config-server, so w3 is unblocked. No workspace-wide cargo test until all three land.
+
+### w2 fix-authz landed (verified by lead)
+
+F-013 closed per M6-R23: permits gates the Signed arm on config_core::is_verified_kind, Static
+untouched. Verified by reading admin_plane.rs:281-300 and both new rows. Worker ran a non-vacuity
+probe (predicate -> true gave exactly one failure, the new row; predicate restored) and confirmed
+the two static rows still pass. cargo test -p config-grpc: 91 passed 0 failed, fmt + clippy clean,
+and -p config-server m6_rbac/m6_policy_daemon 15 passed.
+
+Rows added: m6_40_a_signed_admin_name_does_not_bind_an_unverified_principal (same document, same
+name "dev": insecure -> PermissionDenied and 0 reloads; mTLS Certificate -> admitted, 1 reload),
+m6_126_reload_tls_is_denied_for_a_non_admin_and_audited.
+
+Deviations accepted: a third row (m6_40_admin_set_comes_only_from_the_signed_document) also moved
+to mTLS for the same reason; cert helpers hoisted from tests/mtls.rs into tests/support/mod.rs
+(net -83 lines); plane="all" KEPT because test row M6-120 and the runbook both grep the literal,
+with a new constant `recovery` field instead of a swap count.
+
+Lead closed the docs half the worker could not own:
+- docs/runbooks/credential-rotation.md — deleted the false "no plane is ever left in a different
+  state than the others"; now separates the node-wide pre-check refusals from the in-loop partial
+  swap, and documents the `recovery` field and the retry.
+- docs/ADRs/0027 — added the release note owed: authz.mode="signed" on an insecure listener is now
+  a dead configuration; remedy is mTLS or static + admins=["dev"].
+- docs/testing/test-plan-m6.md M6-126 — annotated the ReloadTls share as landed, the six-op
+  assembly row as still open. ALSO corrected the row's own text: it demanded outcome="denied" but
+  ADR-0023 ruling 5 settled on "rejected" and the code has always emitted "rejected", so the row as
+  written could never have passed. Stale plan text, found by the fix.
+
+### w1 fix-policy landed (verified by lead)
+
+F-007 closed WITHOUT touching pagination.rs: bind_policy_version already took a shared
+Arc<AtomicU64>, only a caller was missing. PolicyLoader owns version_cell, stored at the single
+adopt point; run.rs:819 binds it, and only when policy.loader is Some (a static allowlist has no
+version, so None is the truth there). Row m6_32_a_policy_adoption_invalidates_an_outstanding_page_token
+in config-server/tests/m6_pagination_e2e.rs drives a REAL adoption (signed doc on disk, node's own
+poller), not a hand-set atomic. Red-first confirmed: before the binding the resume succeeded.
+F-003: logging::poller_stopped branches on JoinError::is_panic, error-logs, panic payload
+deliberately not echoed (ADR-0013). F-019: advertise_once writes the cell only after Ok; mutation
+check confirmed. Dev flags: Cli::check_dev_gates in main::start before the config file is read, so
+the refusal does not depend on a parseable document; broke zero rows and zero scripts.
+cargo test -p config-server 136 passed 0 failed; -p config-engine all ok; fmt + clippy clean.
+
+**Lead follow-up on the disclosed race.** The worker flagged that /health reports the authorizer's
+version, published one statement BEFORE version_cell, and judged the flake not worth machinery.
+I checked the ordering and it is not merely acceptable, it is REQUIRED: the cell must lag. A token
+minted in that window seals the OLD version and is refused on resume — one extra expiry, never a
+missed one. Publishing the cell first would invert it, sealing the NEW version onto a walk
+authorized under the old grants, and PolicyVersion would then accept exactly the token M6-32
+exists to refuse. So: product unchanged, the ordering rationale written into policy.rs, and the
+TEST hardened instead — the resume now retries the sealed token on a 5s bounded deadline with a
+failure message that names the real cause. Verified green: 2 passed, 0 failed.
+Also closed the worker's out-of-scope note: crates/config-server/README.md now documents the
+--dev-allow-all coupling.
+
+Cross-worker: config-server compiled clean, so w3's RocksOptions.command_schema field and w1's
+run.rs literal line are both in. Only w3 still running.
+
+### w3 fix-schema landed (verified by lead)
+
+F-015 + F-014 closed together, as required. New public surface, disclosed and justified:
+`config_core::schema::refuse_command(command_schema, &Command) -> Option<SchemaError>`. Neither
+existing entry point fitted — decode_command can never sit on the apply path (a log entry is
+postcard(Entry<TypeConfig>), so the Command arrives already decoded), and `admits` takes &self on
+a SchemaTriple while storage holds only the one axis; synthesising a triple there would be the
+field-wise blend the schema docs forbid. `admits` and `decode_command` are now thin wrappers over
+it, so the previously-dead pair finally has an exercised core. No new error variant.
+
+Red proofs recorded for every row, which is what makes this trustworthy:
+- f014_an_old_voter_admitted_after_activation_re_gates_the_feature — un-qualified clause 1 gave
+  "the Compact was accepted and returned revision 3".
+- f015_a_pinned_store_refuses_to_apply_a_committed_schema_2_command — neutered fence gave
+  "[Compacted { compact_revision: 1 }]".
+- f015_a_pinned_node_refuses_a_snapshot_built_by_a_newer_generation — check reverted to the build
+  constant gave "()".
+M6-89 and both M6-R15 rows pass unchanged. Three-way peer distinction implemented per the lead
+correction, with an_answer_without_a_schema_field_is_recorded_as_schema_1 covering the third state.
+
+Snapshot install: closed with the same fence rather than by amending the ADR. It was a SECOND,
+independent route to watermark 2 on a pinned node. One pin now serves both routes.
+
+EphemeralStore deliberately carries no fence, so engine-level rows still observe the propose-time
+gate in isolation (m6_101 facts 2 and 3 stay observable). Documented rather than weakened.
+Not stageable: a daemon-level F-015 row needs config-engine's `testing` feature enabled in
+config-testkit/Cargo.toml (propose_skipping_the_schema_gate is cfg'd behind it). Recorded, not done.
+
+### Lead: two test-infrastructure defects found while gating
+
+1. **My own.** The M6-32 hardening I wrote used `tokio::time::sleep`, which config-testkit's
+   `scan` row forbids workspace-wide. w3 found it and attributed it to dev-pagination; it was mine.
+   Replaced with the existing `poll_until_async(deadline(5), ...)` helper. scan 4/4 green,
+   m6_pagination_e2e 2/2 green.
+2. **Pre-existing, real.** `config_log::testing::test_log_dir()` located the log directory by
+   walking ancestors for a directory literally named `target`. Under any CARGO_TARGET_DIR it found
+   none and fell back to a RELATIVE `target/test-logs` under the package dir — shared by every run,
+   378 accumulated .jsonl files, and one truncated file collapses duckdb's
+   read_json_auto(union_by_name=true) for every log assertion in the workspace. It looks like a
+   logging bug and is a stale neighbour's file. Now resolved positionally as well: a test binary
+   always sits at <target>/<profile>/deps/<name>, so the grandparent of `deps` is the build root
+   under any name. Verified: logs, m1_observability, m4_observability green under .rtargets/lead.
+   This matters beyond this session — any agent or shell using its own target dir hit it.
+
+Still open (recorded, not fixed): parallel test BINARIES share one test-logs dir, and the duckdb
+glob unions every file before the testRun WHERE filter is applied, so a neighbour's mid-write file
+can still break a log-query row. Pre-existing; the previous M6 gate survived it. Proper fix is to
+scope the glob by run id rather than filtering after the read.
+
+Gate so far: cargo fmt --all --check clean; cargo clippy --workspace --all-targets -D warnings
+clean. Full cargo test --workspace --no-fail-fast running.
+
+## 2026-09-19 — the two "flakes" were not flakes
+
+- m6_20: torn /health payload. health.rs read policy_version (engine) and policy_state (loader)
+  from the same authorizer at two instants with an await between. Added
+  `SignedPolicyAuthorizer::state_and_version` (one read guard); PolicyLoader::state collapsed
+  into `state_and_version`; health.rs and PolicyLoader::metrics both use it. No test changed.
+  clippy caught the now-dead `PolicyLoader::state` and it was removed rather than allowed.
+- m4_69: RETCD_TEST_DEADLINE_SCALE existed, poll.rs claimed "the gate scripts set it", and no
+  gate script was committed. Wrote scripts/gate.sh + scripts/gate.ps1 (fmt/lint/test stages,
+  scale 3, private CARGO_TARGET_DIR, fresh RETCD_TEST_LOG_DIR per invocation, env wins over
+  defaults). Documented in AGENTS.md. Both recorded in ADR-0031.
+- Progress build rule 1 relaxed: a finished chip required every acceptance mark "proven", which
+  pushed the tracker to flip three marks whose own evidence named a scope limit (watch capacity
+  at 100 not 1000, 8 of 17 crash boundaries, RPO/RTO measures primitives not the CLI). Rule now
+  rejects only "open"/"failed"; risk marks already require evidence and render as a warning.
+  Marks restored. The validator was making the report lie to satisfy it.
+- User decisions (HITL, from Kay9): fix both flakes; commit the fix pass AND the progress
+  tooling.
+- Progress pipeline had two real bugs, found because Gautam said the report looked stale and it
+  was, in the only way that counts — the visible stamp:
+  1. `--out` returned early, before `advanceMeta`. The one command AGENTS.md documents rebuilt
+     the page and advanced nothing: no new stamp, no rotation of changes.json, watermark stuck
+     at ledger.line=505. Only a bare `build.mjs` refreshed. Now any publish of the live pieces
+     to the canonical page refreshes; `--src` (archive rebuild) and a scratch `--out` path do
+     not. Guard checked both ways.
+  2. `renderPage` ran before the stamp advanced, so every page ever built carried the *previous*
+     run's timestamp. Split `advanceMeta` into `nextMeta` (pure) and `commitMeta` (writes);
+     the stamp is folded into `pieces.meta` before render, committed only after the page is on
+     disk, so a failed write cannot consume changes it never showed.
+  Lesson worth keeping: I verified the refresh by reading meta.json and the refresh log, both of
+  which said it worked. The artifact the user actually looks at said otherwise. Verify the
+  thing that is read, not the thing that is written.
+- Gate after the flake fixes: scripts/gate.sh at scale 3, exit 0, "gate: all OK" — fmt, clippy
+  and the full workspace suite. m4_69 and m6_20 both pass. Per-suite totals not captured: I
+  piped the run through `tail -60`, so only the last 60 lines survived. Log the whole run next
+  time; a pass with no count is weaker evidence than it looks.
+- A second gate launched against the same target dir while the first was still running failed
+  with LNK1104 on m6_rotation.exe — the linker could not overwrite a binary the first run was
+  executing. Exactly the collision scripts/gate.sh warns about in its own comments, caused by me
+  ten minutes after writing them.
+- Committed: 61df7bd (fix pass + gate scripts), 6f925bb (progress pipeline, archive, AGENTS.md),
+  ff5c821 (work lane). Branch feature/m4-m6, local, unpushed.

@@ -10,6 +10,7 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | Folder (date-milestone-commit) |
 |---|
 | progress/2026-09-19-M6-4f6f7e5 |
+| progress/2026-09-20-M6-c3fe56b |
 
 ## Work notes
 
@@ -73,6 +74,9 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | work/retcd-m4-m6-implementation/progress-refresh-log.md | Progress report refresh log |
 | work/retcd-m4-m6-implementation/progress-rule-map.md | Rule map: SKILL.before.md -> new homes |
 | work/retcd-m4-m6-implementation/progress-skills-split-plan.md | Plan: split the report skill into one skill per component |
+| work/retcd-m4-m6-implementation/review-brief.md | Final review brief: rEtcd feature/m4-m6 vs main (read this first) |
+| work/retcd-m4-m6-implementation/review-final-findings.md | Final review of feature/m4-m6: collected findings |
+| work/retcd-m4-m6-implementation/review-m6-files.txt | crates/config-core/src/lib.rs |
 | work/retcd-m4-m6-implementation/SKILL.before.md | Accessible progress report |
 | work/retcd-m4-m6-implementation/tester-m4b-handoff.md | tester-m4b handoff (draft, in progress) |
 | work/retcd-m4-m6-implementation/tester-m5a-notes.md | tester-m5a — M5 test rows: snapshots, purge, membership, fencing, backup/restore |
@@ -82,6 +86,7 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | work/retcd-m4-m6-implementation/tester-m6c-notes.md | tester-m6c notes |
 | work/retcd-m4-m6-implementation/tester-m6d-notes.md | tester-m6d notes — E2E-45, E2E-41, E2E-43 |
 | work/retcd-m4-m6-implementation/tester-m6e-notes.md | tester-m6e — M6 test plan §4.2 rotation rows (M6-49..M6-56, M6-60) — working notes |
+| work/retcd-m4-m6-implementation/w1-config-server-findings/checklist.md | w1 — config-server review findings |
 
 ## Older report pages in git history
 
@@ -89,6 +94,8 @@ View one: `git show <commit>:docs/progress/index.html > old.html`.
 
 | Commit | Date | Subject |
 |---|---|---|
+| 31904f8 | 2026-09-19 | docs: record the gate result and the target-dir collision in the ledger |
+| 6f925bb | 2026-09-19 | chore(progress): dashboard pipeline, archive tooling and agent instructions |
 | 4f6f7e5 | 2026-09-19 | feat(m6): signed RBAC, TLS/gossip-key rotation, mixed-version gate, evidence, local cluster |
 | e54c6ef | 2026-09-19 | feat(m5): snapshots, log purge, admin plane, backup/restore, bounded dedup; M6 rbac + pagination |
 | 33b5f4b | 2026-09-19 | feat(m4): watch hub, journal gate, retention compaction, envelope v2; M5/M6 in progress |
