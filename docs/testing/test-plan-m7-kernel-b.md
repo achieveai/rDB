@@ -7,7 +7,7 @@ Authority order: charter (`teams/kernel-b/charter.md`) > ledger rulings (B-R3..B
 > `docs/ADRs/rdb/0005`, `0006`, `0009` > `teams/kernel-b/design.md` (architect design, correction round 1
 applied; round 2 in progress) > `teams/kernel-b/critic-design.md` re-review (K-B-35..41, QC-10..14).
 Companion: `docs/testing/test-plan-m7-verification.md` (foundation plan; format model, taxonomy §2,
-anti-flake rules §11, gate checklist §13). This plan continues its Q-row numbering at Q-41.
+anti-flake rules §11, gate checklist §13). This plan continues its Q-row numbering at Q-46 (kernel-a owns Q-41..Q-45, ruling B-R30).
 
 Row prefix `M7B-NN`. One row is one named test `m7b_NN_<name>`. Numbering is flat across the three
 test files (architect handoff Q10 default). Held rows carry placeholder ids `M7B-H<n>` and become the next
@@ -34,7 +34,7 @@ row; a row that finds one missing reports `Unavailable`, never a pass (verificat
 | BA-1 | Kernel modules are pure: `step(&mut self, ctx: &StepCtx, ev: &Event) -> Result<Vec<Effect>, RdbError>`; no clock, randomness or I/O; every decision is in the returned vector. Rows assert effect-vector contents and order by index. | every unit row |
 | BA-2 | `Ignored { reason }` is an effect, never silence. An event with no other effect still yields one `Ignored`. | M7B-02, 44, 61, 64 |
 | BA-3 | Watermarks are three newtypes `ReceivedSeq`, `AppliedSeq`, `DurableSeq` with no conversion between them (B-R13). `DurableProof { partition, seq: DurableSeq, digest }` is a plain public struct. A row that needs a durable value builds a `DurableSeq`; a compile error in a row is a design defect, not a test failure (no trybuild rows, B-R19). | M7B-22, 24, 99 |
-| BA-4 | Log-line contract. Each module emits one structured line per decision with `@m` in {`append_decision`, `ack_decision`, `qualification`, `catchup_step`, `protection_transition`, `recovery_phase`, `selection`, `barrier_check`, `source_unavailable`}. Fields: `partition`, `generation`, `owner_epoch`, `config_version`, `tick`, `outcome`, plus `seq`/`copy`/`reason` where the decision has one. Never key or value bytes; digests are logged as hex of at most 8 bytes. Sim rows read these lines through `RETCD_TEST_LOG_DIR` JSONL. | Q-41..Q-46 |
+| BA-4 | Log-line contract. Each module emits one structured line per decision with `@m` in {`append_decision`, `ack_decision`, `qualification`, `catchup_step`, `protection_transition`, `recovery_phase`, `selection`, `barrier_check`, `source_unavailable`}. Fields: `partition`, `generation`, `owner_epoch`, `config_version`, `tick`, `outcome`, plus `seq`/`copy`/`reason` where the decision has one. Never key or value bytes; digests are logged as hex of at most 8 bytes. Sim rows read these lines through `RETCD_TEST_LOG_DIR` JSONL. | Q-46..Q-51 |
 | BA-5 | Fixture location. Kernel-b builders live in `crates/rdb-sim/tests/support/kernel_b/mod.rs` (`golden_append()`, `golden_ack()`, `three_copy_config()`, `rf2_config()`, `proof_set()`, `survivor_set()`). `tests/support/mod.rs` registers it (foundation owns that file; handoff Q4). Fallback until registered: in-file builders at the top of each test file. | every row |
 | BA-6 | Near-miss twin. Every rejecting row differs from the golden fixture in exactly one field; the row text names the field. Rows that pin ladder order (M7B-15, M7B-33) mutate two fields and assert only the earlier code is reported. | §3, §4, §7 |
 | BA-7 | Numbers are recorded, not asserted, in the PR default. Timing rows assert virtual ticks only; wall-clock appears in the JSONL for the campaign class and nowhere in an `assert!`. | M7B-65..68, 80 |
@@ -97,7 +97,7 @@ outcome, (b) no state field changed (`assert_eq!(rx_before, rx_after)` on a `Clo
 | M7B-28 | `m7b_28_recovered_is_the_only_clearer_of_quarantine` | D §3.3 "only clearer"; B-R17 | quarantined receiver; feed every non-`Recovered` event kind (Append, Committed, Flushed, PinnedConfig, ControlBoot, HealthEval) | `quarantine` still set after each; only `Recovered` clears it | unit | none |
 | M7B-29 | `m7b_29_recovered_never_raises_durable` | D §3.3 "durable takes min"; 0005 §3 | `durable_seq 12`, `Recovered{cutoff 40}` | `durable_seq == DurableSeq(12)`; twin of M7B-27 (cutoff above durable instead of below) | unit | none |
 
-Q-rows for this section (DuckDB over `RETCD_TEST_LOG_DIR`): see §11, Q-41..Q-43.
+Q-rows for this section (DuckDB over `RETCD_TEST_LOG_DIR`): see §11, Q-46..Q-48.
 
 ## 4. R1 ProgressTracker: ACK rules 1–9 (M7B-30..45)
 
@@ -132,10 +132,10 @@ progress {11, 11, 10}, digest_at_buffered d11}`, primary's ladder has `d11` at 1
 | M7B-46 | `m7b_46_qualifies_now_is_live_and_exclusion_bites_at_re_evaluation` | D §3.5 `qualifies_now(seq)` live, B-R21 no monotone watermark; 0005 §5; §3.5 "ACK-then-exclude" (unit half) | RF3 `min_regular_acks 1`; B ACKs 98; then B diverges (M7B-41 path) | `qualifies_now(98) == true` before; `false` after; `qualifies_now(97) == true` after only if C ACKed 97 (assert both branches); no stored watermark field exists on the tracker (struct has no `qualified_through`) | unit | none |
 | M7B-47 | `m7b_47_ack_then_exclude_98_not_published_97_kept` | D §3.5 replacement row 1 (K-B-09); 0005 §5; 0006 §3 | sim: B ACKs 98, C ACKed 97, B diverges before P1 evaluates 98 | P1's publish decision for 98 is refused (`qualifies_now(98) == false` at publication); 97 stays published; L1 sees exactly one `QualificationChanged{Lost}` if and only if C did not ACK 98 | sim | A:P1 QualifiedPrefix |
 | M7B-48 | `m7b_48_digest_binding_rejects_an_ack_at_the_right_seq_wrong_history` | D §3.5 replacement row 2 (digest binding); 0005 §5 | B ACKs seq 11 with `digest_at_buffered` ≠ primary's `digest_at(11)` | `qualifies_now(11) == false`; `qualified_copies(11)` excludes B; the ACK itself was dropped by rule 9 (`Differs`); twin of M7B-30 by digest only | unit | none |
-| M7B-49 | `m7b_49_two_of_two_needs_both_acks` | D §3.5 replacement row 3 (K-B-11); 0005 §5; B-R3 | `min_regular_acks 2`, secondaries B, C; ACK from B at N only | `qualifies_now(N) == false`; `qualified_ack_count(N) == 1`; after C's ACK `true`; threshold read from `PartitionConfig.min_regular_acks` (no second constant: grep row Q-44) | unit | none |
+| M7B-49 | `m7b_49_two_of_two_needs_both_acks` | D §3.5 replacement row 3 (K-B-11); 0005 §5; B-R3 | `min_regular_acks 2`, secondaries B, C; ACK from B at N only | `qualifies_now(N) == false`; `qualified_ack_count(N) == 1`; after C's ACK `true`; threshold read from `PartitionConfig.min_regular_acks` (no second constant: grep row Q-49) | unit | none |
 | M7B-50 | `m7b_50_primary_as_laggard_lowers_min_required_durable` | D §3.5 replacement row 4 (K-B-13); 0005 §5; 0006 §1 | B, C durable through 20; primary's own `durable_seq == 12` | `min_required_durable() == DurableSeq(12)`; `all_durable_through(13) == false`; `required_copies()` contains self | unit | none |
 | M7B-51 | `m7b_51_rf2_degraded_is_one_of_one_and_stops_on_loss` | B-R3 "min_regular_acks 1-of-1, never zero"; D §3.5; charter DO-NOT "no one-copy ACK fallback" | `rf2_config()` `{A regular, B regular}`, `min_regular_acks 1`; B ACKs N; then B diverges | `qualifies_now(N)` true then false; effect vector on loss includes `QualificationChanged{Lost}` and `BlockPartition{DivergenceRequiresOperator, [B]}` (floor gone: 0 < 1); no write qualifies afterwards | unit | none |
-| M7B-52 | `m7b_52_config_with_min_regular_acks_zero_is_rejected` | B-R3 "never zero"; D §3.5; handoff Q3 | `PinnedConfig{min_regular_acks 0}` | `Ignored{INVALID_CONFIG}` (or constructor `Err`); config not pinned; previous config still in force | unit | F:C0 field (handoff Q3) |
+| M7B-52 | `m7b_52_config_with_min_regular_acks_zero_is_rejected` | B-R3 "never zero"; D §3.5; handoff Q3 | `PinnedConfig{min_regular_acks 0}` | `Ignored{INVALID_CONFIG}` (or constructor `Err`); config not pinned; previous config still in force | unit | foundation ask (B-R30): `PartitionConfig.min_regular_acks`, default 1, 0 rejected |
 | M7B-53 | `m7b_53_qualified_ack_count_never_counts_shadow_diverged_or_self` | D §7 "property test"; §3.5; BA-9 | enumerate all 2^4 subsets of `{self, shadow D, diverged B, regular C}` having ACKed N | `qualified_ack_count(N) == 1` iff C in subset, else 0, for all 16 cases | unit | none |
 | M7B-54 | `m7b_54_diverged_copy_leaves_the_durable_views_and_empty_floor_blocks` | D §3.5 two rows "Diverged copy leaves the durable views" and "Divergence with no remaining floor" (B-R26, B-R29); 0005 §5; 0006 §1 | RF3 `min_regular_acks 1`, A durable N+5; C diverges at N; then B diverges | after C: `all_durable_through(N+5) == true`, `min_required_durable()` ignores C, C's later ACK `DIVERGED_COPY`, no `QualificationChanged`, no `BlockPartition`. After B: effects in index order `[DivergenceDetected(B), Alert, CopyLost(B), QualificationChanged{Lost}, BlockPartition{DivergenceRequiresOperator, diverged: [C, B]}]`; `required_copies() == {A}` | unit | none |
 
@@ -147,7 +147,7 @@ progress {11, 11, 10}, digest_at_buffered d11}`, primary's ladder has `d11` at 1
 | M7B-56 | `m7b_56_retention_is_checked_before_ancestry_below_floor_means_snapshot` | D §3.6 "retention before ancestry"; 0005 §4; K-B-27 | `NeedPrefix{from 3, head_digest x}`, ladder `lookup(2) == NotRetained` | `SnapshotCatchupRequired{B, barrier}`; no `DivergenceDetected`; no envelopes | unit | none |
 | M7B-57 | `m7b_57_differs_at_head_is_divergence_and_sends_nothing` | D §3.6 `Differs` arm + full vector (B-R29); 0005 §4 | `NeedPrefix{from 11, head_digest ≠ ladder[10]}` retained | effects begin `[DivergenceDetected(B), Alert{CopyDiverged}, CopyLost{B}]`; no `SendEnvelopes`; twin of M7B-55 by digest only, of M7B-56 by retention only | unit | none |
 | M7B-58 | `m7b_58_probe_rounds_are_capped_at_four_then_snapshot` | D §3.6 `probe_rounds` (K-B-27); 0005 §4 | B answers each `ProbeDigestAt` with a `NeedPrefix` at a lower seq, five times | rounds 1–4 emit `ProbeDigestAt`; round 5 emits `SnapshotCatchupRequired`; `probe_rounds[B] == 4`; no quarantine | unit | none |
-| M7B-59 | `m7b_59_every_append_outcome_variant_reaches_a_named_handler` | D §3.6 outcome table; D §7 "no `_ =>`" ; 0005 §4 | feed one `AppendOutcome` of every variant to the cursor | `Busy` → re-send deferred to next progress event; `QUARANTINED` → `CopyQuarantined`; `NEED_LINEAGE`/`NEED_CONFIG`/`UNKNOWN_EPOCH` → `CopyAheadOnControl`; `TOO_LARGE` → `Ignored{TOO_LARGE}`; `STALE_*` → cursor stopped `BehindOnControl`; `STALE_FENCE` → `Ignored{RECOVERY_ONLY}`; `AlreadyHave` → advance; `NeedPrefix` → step 1; `ProbeDigestAt` → probe; source grep confirms no wildcard arm (Q-45) | unit | F:C0 outcome enum (handoff Q2) |
+| M7B-59 | `m7b_59_every_append_outcome_variant_reaches_a_named_handler` | D §3.6 outcome table; D §7 "no `_ =>`" ; 0005 §4 | feed one `AppendOutcome` of every variant to the cursor | `Busy` → re-send deferred to next progress event; `QUARANTINED` → `CopyQuarantined`; `NEED_LINEAGE`/`NEED_CONFIG`/`UNKNOWN_EPOCH` → `CopyAheadOnControl`; `TOO_LARGE` → `Ignored{TOO_LARGE}`; `STALE_*` → cursor stopped `BehindOnControl`; `STALE_FENCE` → `Ignored{RECOVERY_ONLY}`; `AlreadyHave` → advance; `NeedPrefix` → step 1; `ProbeDigestAt` → probe; source grep confirms no wildcard arm (Q-50) | unit | foundation ask (B-R30): `AppendOutcome` additive extension |
 | M7B-60 | `m7b_60_busy_is_resent_on_the_next_progress_event_not_a_timer` | D §3.6 `Busy` handler; 0005 §4 | `Busy{accepted_through 10}` then `HealthEval` ticks x3, then `ProgressAck{11}` | no `SendEnvelopes` on any tick; exactly one `SendEnvelopes{12..=12}` on the ACK | unit | none |
 | M7B-61 | `m7b_61_cursor_ignores_timer_events_with_a_reason` | D §3.6 "cursor has no timers"; BA-2 | `HealthEval` to the cursor | effects `== [Ignored{NOT_A_CURSOR_EVENT}]` | unit | none |
 | M7B-62 | `m7b_62_replication_end_to_end_duplicate_gap_and_forged_ack` | S §5 R1 verbatim: "Canonical append, ancestry validation, independent copy progress and catch-up. Duplicate append idempotent; gap/digest mismatch rejected; lost/malicious ACK cannot advance progress"; D §3 whole; 0005 §2–§5 | sim: three copies, 200 appends, `NetworkOp::Duplicate` on 20 frames, `Drop` on 10, one `ForgeAck`, one digest flip on a frame to C | all three copies end at `(200, d200)`; C quarantined `CORRUPT_HISTORY` at the flipped seq and never advances past it; `qualifies_now(200)` true via B; JSONL: every duplicate → `AlreadyHave`, every gap → `NeedPrefix`, forged → `FORGED_ACK`; no `Ignored{}` with an unknown reason | sim | F:H1, F:T1 |
@@ -181,7 +181,7 @@ reads a clock (BA-7). `LocalApplied{seq, bytes, tick}` seeds the queue.
 | M7B-80 | `m7b_80_next_interesting_tick_is_sound_in_healthy_warn_and_idle` | D §4.7 `next_interesting_tick`; K-B-21; D §7 "no HealthEval before it changes state" | for each of `Healthy` (queue front at 0), `Warn`, empty queue: read `h = next_interesting_tick()`; feed `HealthEval` at every tick in `now..h` (stride 1) | state and `AdmissionState` unchanged for every tick before `h`; at `h` the state changes; empty queue returns `None`; the `Reprotecting` arm is M7B-H9 (held) | unit | none |
 | M7B-81 | `m7b_81_warn_returns_to_healthy_when_age_drops_below_warn` | D §4.4 `Warn, unsafe_age < warn_ms -> Healthy`; 0006 §2 | `Warn` at 1000; `DurableAdvanced` drains seq 1; `HealthEval{1001}` | `Healthy`; effects `== [ProtectionCleared]` (or `Ignored` if design names none: recorded) | unit | none |
 | M7B-82 | `m7b_82_protection_is_fresh_at_promotion_and_inert_on_secondaries` | D §4.7 "runs on the primary only", "constructed fresh at Recovered"; K-B-30 | secondary instance fed `LocalApplied` x3 and `HealthEval{5000}`; then `Recovered` promoting it | secondary: `Healthy`, queue empty, effects only `Ignored{NOT_PRIMARY}`; after `Recovered`: new instance `Healthy`, `unsafe_queue.len() == 0`, `active_predicates == [pinned]` | unit | none |
-| M7B-83 | `m7b_83_health_eval_never_re_allows_admission_by_itself` | D §4.4 (no `Paused -> Healthy` arm; `Allow` only from `Reprotecting`); 0006 §4 | `Paused`; feed `HealthEval` at 0, 50, …, 60_000 with no `DurableAdvanced` | never `Reprotecting`/`Healthy`; no `SetAdmission(Allow)` in any effect vector; note K-B-40: no backstop arm exists either (Q-46 grep) | unit | none |
+| M7B-83 | `m7b_83_health_eval_never_re_allows_admission_by_itself` | D §4.4 (no `Paused -> Healthy` arm; `Allow` only from `Reprotecting`); 0006 §4 | `Paused`; feed `HealthEval` at 0, 50, …, 60_000 with no `DurableAdvanced` | never `Reprotecting`/`Healthy`; no `SetAdmission(Allow)` in any effect vector; note K-B-40: no backstop arm exists either (Q-51 grep) | unit | none |
 
 ## 8. F1 lineage and recovery (M7B-84..119)
 
@@ -240,7 +240,7 @@ index. Ticks are virtual.
 |---|---|---|---|---|---|---|
 | M7B-113 | `m7b_113_stale_owner_after_commit_is_quarantined_without_length_comparison` | D §5.7; spec §8.1 "never overrides a newer committed root, even with a longer suffix"; 0009 §7 | `Committed{root}`; `StaleOwnerReturned(inv{head 500}, tick 9000)` | effects `== [QuarantineSuffix{copy A, from predecessor_cutoff+1, until 9000 + retention_ms}, RebuildFromAuthoritative{A, root}]`; `select_prefix` not called (`SelectSpy` 0); phase unchanged | unit | none |
 | M7B-114 | `m7b_114_same_node_before_commit_is_an_ordinary_survivor` | D §5.7 "the discriminator is the phase"; 0009 §7 | same inventory delivered in `Collecting` | it is verified and eligible; twin of M7B-113 by phase only | unit | none |
-| M7B-115 | `m7b_115_retain_suffix_uses_the_event_tick_and_no_delete_exists` | D §5.7 `ev.tick` (K-B-25), "no deletion effect exists in M7"; spec §8.4 | `StaleOwnerReturned` at ticks 100 and 200 | `until_tick` is 100 + r and 200 + r respectively; `Effect` enum has no `Delete*` variant (Q-47 grep) | unit | none |
+| M7B-115 | `m7b_115_retain_suffix_uses_the_event_tick_and_no_delete_exists` | D §5.7 `ev.tick` (K-B-25), "no deletion effect exists in M7"; spec §8.4 | `StaleOwnerReturned` at ticks 100 and 200 | `until_tick` is 100 + r and 200 + r respectively; `Effect` enum has no `Delete*` variant (Q-52 grep) | unit | none |
 | M7B-116 | `m7b_116_no_merge_union_or_delete_in_recovery_source` | charter DO-NOT list; D §5.9 | grep `crates/rdb-core/src/recovery.rs` | no identifier matching `merge|union|delete|longest_by_len` outside comments; a `LengthSpy` hook is the only seq-length read and it is never reached from `select_prefix` | unit | none |
 | M7B-117 | `m7b_117_recovery_result_carries_bounds_mode_and_status_map` | D §5.8 `RecoveryResult`; 0009 §7; K-B-19 | after M7B-106 | fields: `new_generation`, `mode: PartitionMode`, `barrier`, `loss`, `retained_status_map{discarded_from, uncertain == loss.uncertain}`, `authority_view`, `pinned_config`, `control_revision`; no client-ACK field exists | unit | none |
 | M7B-118 | `m7b_118_verified_shadow_source_is_never_leader` | D §5.2 shadows never recover; §5.4 `select_leader`; 0009 §5 | shadow D with the longest verified prefix, candidates all eligible | `select_prefix` may pick D's history as source; `select_leader` returns a regular; `CatchUpBeforeGrant{from D, ..}` | unit | none |
@@ -255,7 +255,7 @@ order) when released. Each row names the finding it waits on.
 
 | Id | Waits on | Test | Proves | Fixture | Assertion | Class | Dependency |
 |---|---|---|---|---|---|---|---|
-| M7B-H1 | K-B-35 (B-R24) | `m7b_h1_recovery_append_5r_epoch_alone_and_6r_revision` | D §3.2a rows 5R, 6R; 0005 §2 recovery paragraph; 0009 §2 | golden `RecoveryAppend{fence{prior_owner_epoch e, control_revision r, recoverer B'}, env}` from authenticated recoverer B'; deltas `prior_owner_epoch e-1`; `control_revision r-1` | both → `STALE_FENCE`, unchanged; `FenceCredential` has no `prior_grant_id` field (compile-time absence recorded by Q-48 grep); the golden passes to step 8 | unit | A:A1 FenceCredential |
+| M7B-H1 | K-B-35 (B-R24) | `m7b_h1_recovery_append_5r_epoch_alone_and_6r_revision` | D §3.2a rows 5R, 6R; 0005 §2 recovery paragraph; 0009 §2 | golden `RecoveryAppend{fence{prior_owner_epoch e, control_revision r, recoverer B'}, env}` from authenticated recoverer B'; deltas `prior_owner_epoch e-1`; `control_revision r-1` | both → `STALE_FENCE`, unchanged; `FenceCredential` has no `prior_grant_id` field (compile-time absence recorded by Q-53 grep); the golden passes to step 8 | unit | A:A1 FenceCredential |
 | M7B-H2 | K-B-36 | `m7b_h2_replayed_fence_credential_from_a_second_member_is_not_a_member` | D §3.2a row 6R′; 0005 §2 "A captured credential cannot be replayed"; 0009 §7 | credential naming recoverer B'; sender label = authenticated regular C with well-formed compatible records | `NOT_A_MEMBER`; no state change; twin: same credential, sender B' → accepted; second twin: credential names shadow D, sender D → `NOT_A_MEMBER` | unit | A:A1, F:T1 label forgery |
 | M7B-H3 | K-B-35/36 | `m7b_h3_recovery_append_reuses_rows_0_to_4_7_and_8_unchanged` | D §3.2a "rows 0,1,2,3,4,7,8 reused verbatim"; "cannot overwrite a divergent suffix by waving a fence" | golden `RecoveryAppend` with the M7B-02..07, 14, 18, 20 deltas | identical outcomes to the `Append` rows; `DIVERGENT_HISTORY` quarantines under recovery too; quarantined receiver still `QUARANTINED` (row 0 not bypassed) | unit | A:A1 |
 | M7B-H4 | K-B-37 (B-R25) | `m7b_h4_historical_envelopes_reach_copy_caught_up_and_root_anchor_quarantines` | D §3.2 "Historical envelopes" + test row; §3.6 steps 1a/2; 0005 §2 two verification rows; 0009 §7 | copy at 50 under *g*; `Recovered{root base_seq 100, base_digest d100, predecessor_generation g}`; receive 51..100 as `Append` carrying *g* from the pinned primary; then 101 under *g+1* | 51..100 accepted (rows 4–6 skipped, sender check ran); primary cursor emits `CopyCaughtUp{copy, (100, d100)}` exactly once; 101 passes the normal ladder; twin: record 100 with digest ≠ `d100` → `DIVERGENT_HISTORY` quarantine; twin: 51 under *g-1* → `STALE_GENERATION` (two generations back not admitted) | unit | none |
@@ -270,7 +270,7 @@ order) when released. Each row names the finding it waits on.
 | M7B-H9 | K-B-41 | `m7b_h9_next_interesting_tick_reprotecting_arm` | D §4.7 `below_since + resume_hold_ms` | `Reprotecting{below_since Some(10_100)}` | `next_interesting_tick() == Some(15_100)`; no `HealthEval` in `10_100..15_100` changes state (M7B-80 method); `below_since None` → `None` or next cadence (recorded) | unit | none |
 | M7B-H10 | K-B-40 (B-R28) | `m7b_h10_dropped_lost_edge_is_not_caught_by_health_eval` | D §4.1 "there is no HealthEval backstop"; 0006 §3 "A dropped Lost edge is caught outside L1" | `qualifies_now_at_head == true` in L1 while R1's predicate is false (edge dropped by a test-only lossy dispatcher) | L1 stays `Healthy` through `HealthEval` x100 (documents the risk, not a fix); the guard is I1's lossless dispatcher (B-R23) and verification's mutation row (V-R9), cross-referenced, not re-asserted here | unit | none |
 | M7B-H11 | K-B-39 (B-R27) | `m7b_h11_set_change_without_a_predicate_flip_emits_nothing` | D §3.4 "emitted iff qualifies_now(head) changed value"; 0005 §5 "Set change without a predicate flip emits nothing"; 0006 §3 | RF3, `min_regular_acks 1`, B and C both ACKed head; B diverges | effects `[DivergenceDetected(B), Alert, CopyLost(B)]` and no `QualificationChanged`; `qualifies_now(head)` still true; twin: C had not ACKed → `QualificationChanged{Lost}` present (M7B-54 second half) | unit | none |
-| M7B-H11a | K-B-39 | `m7b_h11a_qualification_changed_has_two_directions_and_trace_fields_only` | B-R27 "no third variant"; D §3.4 field list | the emitted event from H11's twin | `direction ∈ {Gained, Lost}` (enum has 2 variants, Q-49); `lineage`, `config_version`, `at_seq`, `qualified_copies`, `qualified_ack_count`, `cause`, `tick` present; L1 (M7B-70) and P1 branch on none of them | unit | A:P1 (branching check on their side) |
+| M7B-H11a | K-B-39 | `m7b_h11a_qualification_changed_has_two_directions_and_trace_fields_only` | B-R27 "no third variant"; D §3.4 field list | the emitted event from H11's twin | `direction ∈ {Gained, Lost}` (enum has 2 variants, Q-54); `lineage`, `config_version`, `at_seq`, `qualified_copies`, `qualified_ack_count`, `cause`, `tick` present; L1 (M7B-70) and P1 branch on none of them | unit | A:P1 (branching check on their side) |
 | M7B-H12 | K-B-37 + M7B-92 second half | `m7b_h12_two_survivor_synchronization_converges_on_the_selected_prefix` | S §5 F1 verbatim second clause "two-survivor synchronization"; D §5.1 `Synchronizing`; §3.2a; §3.6 | sim: A dead; B head 100, C head 80, compatible; fence to B | `Selected{holder B, cutoff 100}`; C receives 81..100 as `RecoveryAppend` (M7B-H1 path); `SyncWalThrough{C, 100}`; barrier `Ok` on `{B, C}`; one CAS; `Committed{DegradedRf2}`; C's head `(100, d100)` | sim | A:A1, F:H1, F:M1 |
 | M7B-H13 | K-B-37 | `m7b_h13_three_copy_rebuild_end_to_end` | S §5 F1 "three-copy rebuild barrier"; D §5.6a; spec §8.4 | sim: lone survivor B (`ReadOnly`); placement supplies C', D' as data; catch-up via historical envelopes | `CopyCaughtUp` x2; `SyncWalThrough` x2; `DurableAt` x3 (incl. B); `ActivationProposed`; `Committed{Active}`; `SetAdmission(Allow)` only after that commit; JSONL `recovery_phase` sequence recorded | sim | F:H1, F:M1, control placement data |
 
@@ -298,23 +298,23 @@ control_revision, recoverer }` landing in C0 (design §7 V12 dependency); until 
 | §3.5 four replacement rows | M7B-47, 48, 49, 50 |
 | B-R26 diverged-copy views and empty floor | M7B-54, 41 |
 
-## 11. Q-rows: DuckDB over the JSONL (Q-41..Q-49)
+## 11. Q-rows: DuckDB over the JSONL (Q-46..Q-54)
 
-Continue the verification plan's numbering. Each query runs over `RETCD_TEST_LOG_DIR/**/*.jsonl` and
-is a named test in the same file as the rows it checks (`m7b_q41_...`). Source greps use `rg` through
+Continue the numbering after kernel-a's Q-41..Q-45 (ruling B-R30). Each query runs over
+`RETCD_TEST_LOG_DIR/**/*.jsonl` and is a named test in the same file as the rows it checks (`m7b_q46_...`). Source greps use `rg` through
 `std::process::Command` and are unit class.
 
 | Id | Query / grep | Expected | Backs |
 |---|---|---|---|
-| Q-41 | `SELECT outcome, count(*) FROM lines WHERE m='append_decision' GROUP BY outcome` for M7B-62 | every outcome in the D §3.2 ladder appears at least once except quarantine codes other than `CORRUPT_HISTORY`; no `outcome` outside the enum | M7B-62 |
-| Q-42 | `SELECT count(*) FROM lines WHERE m='append_decision' AND seq=30 AND outcome LIKE 'durable%'` for M7B-26 | 0 | M7B-26 |
-| Q-43 | any line with a `key` or `value` field, or a `digest` longer than 16 hex chars | 0 rows (BA-4 "never key or value bytes") | all sim rows |
-| Q-44 | `rg -n "min_regular_acks" crates/rdb-core/src` | every read is through `PartitionConfig`; no integer literal threshold in `replication.rs`/`protection.rs` | M7B-49 |
-| Q-45 | `rg -n "_ =>" crates/rdb-core/src/replication.rs` inside the `AppendOutcome` match | 0 hits | M7B-59 |
-| Q-46 | `rg -n -i "backstop|re-read.*flag" crates/rdb-core/src/protection.rs` | only comments stating there is no backstop (K-B-40) | M7B-83, H10 |
-| Q-47 | `rg -n "Delete" crates/rdb-core/src/recovery.rs crates/rdb-core/src/contracts` | no `Effect` variant named `Delete*` | M7B-115 |
-| Q-48 | `rg -n "prior_grant_id" crates/rdb-core/src` | hits only inside kernel-a's `FencingProof` | M7B-H1 |
-| Q-49 | `rg -n "enum Direction" -A 4 crates/rdb-core/src/contracts` | exactly two variants `Gained`, `Lost` | M7B-H11a |
+| Q-46 | `SELECT outcome, count(*) FROM lines WHERE m='append_decision' GROUP BY outcome` for M7B-62 | every outcome in the D §3.2 ladder appears at least once except quarantine codes other than `CORRUPT_HISTORY`; no `outcome` outside the enum | M7B-62 |
+| Q-47 | `SELECT count(*) FROM lines WHERE m='append_decision' AND seq=30 AND outcome LIKE 'durable%'` for M7B-26 | 0 | M7B-26 |
+| Q-48 | any line with a `key` or `value` field, or a `digest` longer than 16 hex chars | 0 rows (BA-4 "never key or value bytes") | all sim rows |
+| Q-49 | `rg -n "min_regular_acks" crates/rdb-core/src` | every read is through `PartitionConfig`; no integer literal threshold in `replication.rs`/`protection.rs` | M7B-49 |
+| Q-50 | `rg -n "_ =>" crates/rdb-core/src/replication.rs` inside the `AppendOutcome` match | 0 hits | M7B-59 |
+| Q-51 | `rg -n -i "backstop|re-read.*flag" crates/rdb-core/src/protection.rs` | only comments stating there is no backstop (K-B-40) | M7B-83, H10 |
+| Q-52 | `rg -n "Delete" crates/rdb-core/src/recovery.rs crates/rdb-core/src/contracts` | no `Effect` variant named `Delete*` | M7B-115 |
+| Q-53 | `rg -n "prior_grant_id" crates/rdb-core/src` | hits only inside kernel-a's `FencingProof` | M7B-H1 |
+| Q-54 | `rg -n "enum Direction" -A 4 crates/rdb-core/src/contracts` | exactly two variants `Gained`, `Lost` | M7B-H11a |
 
 ## 12. Anti-flake rules (M7B-A1..A6)
 
@@ -336,7 +336,7 @@ Carried from the verification plan §11 A1..A8 and added:
 | M7B-47, H11a | `QualifiedPrefix` consumer, P1 publish decision | kernel-a P1 | P1 consumes `qualifies_now` |
 | M7B-68 | I1/T1 admission path | kernel-a I1, foundation T1 | admission propagation wired |
 | M7B-84, H1..H3, H12 | `FencingProof`, `FenceCredential` | kernel-a A1, C0 | C0 lands `FenceCredential` |
-| M7B-52, 59 | `PartitionConfig.min_regular_acks`, `AppendOutcome` full enum | C0 (lead) | handoff Q2/Q3 |
+| M7B-52, 59 | `PartitionConfig.min_regular_acks`, `AppendOutcome` full enum | foundation ask (B-R30) | foundation lands both contract items |
 | M7B-67 | `HealthEval` cadence | foundation H1 | H1 scheduler emits `HealthEval` |
 | M7B-H13 | placement data | control/I1 | placement supplied as data |
 
@@ -347,10 +347,10 @@ Carried from the verification plan §11 A1..A8 and added:
 - [ ] V1: M7B-23, 25, 26, 104 pass.
 - [ ] V3: M7B-92, 97, 111, 112 pass; M7B-H12, H13 pass once released.
 - [ ] V8: M7B-65, 66, 67, 68, 71, 75, 80 pass; M7B-H8 passes once released.
-- [ ] V12: Q-48, Q-49 and the C0 additive check from the verification plan §13 pass.
+- [ ] V12: Q-53, Q-54 and the C0 additive check from the verification plan §13 pass.
 - [ ] `tok=$(printf 'part'; printf 'db'); rg -i "$tok" docs/testing/test-plan-m7-kernel-b.md crates/rdb-sim/tests` returns nothing.
 - [ ] No `proptest` dependency in `rdb-sim` (V-R1).
-- [ ] JSONL under `RETCD_TEST_LOG_DIR` passes Q-43.
+- [ ] JSONL under `RETCD_TEST_LOG_DIR` passes Q-48.
 
 ## 15. Row counts
 
@@ -364,7 +364,7 @@ Carried from the verification plan §11 A1..A8 and added:
 | §8 F1 (84–119) | 34 | 2 | 0 | 36 |
 | Active total | 110 | 9 | 0 | 119 |
 | §9 held (H1–H13 incl. H7a/b, H8a/b, H11a; 18 rows) | 16 | 2 | 0 | 18 |
-| Q-rows (Q-41..Q-49) | 9 | 0 | 0 | 9 |
+| Q-rows (Q-46..Q-54) | 9 | 0 | 0 | 9 |
 
 Campaign class is empty by design: the PR default records numbers and the verification plan owns
 multi-seed campaigns. A seeded campaign over M7B-62 and M7B-96 is proposed in the handoff (question Q8).
