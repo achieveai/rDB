@@ -39,6 +39,13 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   `Unavailable` on types that have already landed. One plan named a commit predating the
   contracts entirely. Re-reading the table is a convention; this makes it a red build. When it
   fires, re-read section 15 against the files it lists, then move the marker.
+- What it does not check: the stage compares the basis, not the table. A plan passes with a
+  fresh hash and a table nobody re-read, because moving a marker is one edit. It catches the
+  plan that forgot; it cannot catch the author who skipped. Set the marker after the re-read,
+  never to clear the build. Raised as kernel-a R14 on 2026-09-20.
+- The marker is a whole line and nothing else, `<!-- drift-basis: <sha> -->`. A plan that quotes
+  the string in prose or in a command transcript still has one marker; the check reads only the
+  declared format, so showing your work in section 15 is safe.
 - It exists for the environment it sets, not for the cargo lines. Cluster rows were accepted
   with `RETCD_TEST_DEADLINE_SCALE=3`, a private `CARGO_TARGET_DIR` and a fresh
   `RETCD_TEST_LOG_DIR`; a bare `cargo test` on a loaded host gives capacity rows a third of the
