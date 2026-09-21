@@ -151,11 +151,11 @@ async fn m1_47_trace_id_spans_leader_and_both_followers() {
         .expect("all nodes to catch up");
     assert_eq!(put.outcome, config_core::MutationOutcome::Applied);
 
-    let glob = config_testkit::logs::test_logs_glob();
+    let relation = config_testkit::logs::test_logs_relation();
     let filter = config_testkit::logs::current_run_filter();
     let sql = format!(
         "WITH lines AS (
-            SELECT * FROM read_json_auto('{glob}', union_by_name=true)
+            SELECT * FROM {relation}
             WHERE testMethod = '{METHOD}' AND {filter}
         ),
         w AS (
@@ -242,7 +242,7 @@ async fn m1_48_every_log_line_carries_test_context() {
         .expect("put, so this test's own file has real config_engine lines to check");
     cluster.shutdown().await;
 
-    let glob = config_testkit::logs::test_logs_glob();
+    let lines = config_testkit::logs::test_logs_relation();
     let run = config_testkit::logs::current_run_filter();
 
     // (1) node context, this run only.
@@ -250,7 +250,7 @@ async fn m1_48_every_log_line_carries_test_context() {
         "SELECT coalesce(testModule, '<null>') AS m,
                 coalesce(testMethod, '<null>') AS t,
                 \"@logger\", \"@l\", \"@m\", count(*) AS n
-         FROM read_json_auto('{glob}', union_by_name=true)
+         FROM {lines}
          WHERE {run} AND node_id IS NULL AND {NODE_SCOPED}
          GROUP BY ALL
          ORDER BY n DESC"
@@ -267,7 +267,7 @@ async fn m1_48_every_log_line_carries_test_context() {
                 coalesce(testMethod, '<null>') AS t,
                 coalesce(testRun, '<null>') AS r,
                 \"@logger\", \"@l\", \"@m\", count(*) AS n
-         FROM read_json_auto('{glob}', union_by_name=true)
+         FROM {lines}
          WHERE (testModule IS NULL OR testMethod IS NULL OR testRun IS NULL) AND {NODE_SCOPED}
          GROUP BY ALL
          ORDER BY n DESC"
@@ -282,7 +282,7 @@ async fn m1_48_every_log_line_carries_test_context() {
     // wrong would pass both assertions above vacuously.
     let node_scoped_lines = config_testkit::logs::query(&format!(
         "SELECT count(*) AS n
-         FROM read_json_auto('{glob}', union_by_name=true)
+         FROM {lines}
          WHERE {run} AND {NODE_SCOPED}"
     ));
     config_testkit::logs::assert_nonempty(&node_scoped_lines, "node-scoped lines in this run");

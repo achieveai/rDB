@@ -102,14 +102,38 @@ visible in review:
 These are a test crate's own lines, not trace events, so they sit outside the `TraceKind` vocabulary
 by right. They keep the spellings the Q-rows already string-match:
 
-| `@m` | Fields | Read by |
-|---|---|---|
-| `capability` | `package`, `state` | Q-58 (`caps = 3` on every row), and it already exists |
-| `m7f_02 chain vector` | `first`, `flipped`, `second`, `second_after` | Q-59 |
-| `m7f_19 manifest` | `overridden`, `nodes`, `event_cap` | Q-62 |
-| `control interaction` | `op`, `outcome`, `termination`, `gap` | Q-63 |
-| `m7f_21 hop` | `emitted_tick`, `completion_tick` | Q-64 |
-| *(any seam line)* | `seam`, one of the six seam strings Q-61 fixes | Q-61 |
+Status below is measured, not assumed: every row was run on 2026-09-21 against the foundation
+developer's own run (`.rtargets/dev-foundation/test-logs`, 1310 files).
+
+| `@m` the Q-row matches | Emitted today | Q-row | Status |
+|---|---|---|---|
+| `capability` | `capability`, 162 lines | Q-58 | works, with the caveat below |
+| `m7f_02 chain vector` | same, 9 lines | Q-59 | works |
+| `m7f_19 manifest` | `m7f_19` | Q-62 | **0 rows** — the message has no ` manifest` suffix |
+| `control interaction` | *(nothing)* | Q-63 | **0 rows** — never emitted |
+| `m7f_21 hop` | `m7f_21` | Q-64 | **0 rows** — the message has no ` hop` suffix |
+| a `seam` field | *(no such field)* | Q-61 | **binder error** — `seam` does not exist anywhere |
+
+Four of foundation's seven queries are dead, three of them on a string that does not match by a
+single word. Either the emitting line or the query moves; they were written apart and never run
+against each other. Q-61 is the one that cannot be fixed by a rename, because no line carries a
+`seam` field at all — the six-string set it asserts has no source.
+
+Q-58's caveat is its own defect. Its glob spans both crates' logs, so it counts rdb-core's
+`contracts` and `seams` binaries, which have no `support::preamble()` by design and correctly show
+`caps = 0`. Run as written under a gate it reports 25 false failures; all 24 real `rdb-sim` rows
+have `caps = 3`. The row needs a module filter, not a fix to the code it is accusing.
+
+The fields each line should carry, once the messages agree:
+
+| `@m` | Fields |
+|---|---|
+| `capability` | `package`, `state` |
+| `m7f_02 chain vector` | `first`, `flipped`, `second`, `second_after` |
+| `m7f_19 manifest` | `overridden`, `nodes`, `event_cap` |
+| `control interaction` | `op`, `outcome`, `termination`, `gap` |
+| `m7f_21 hop` | `emitted_tick`, `completion_tick` |
+| *(any seam line)* | `seam`, one of the six seam strings Q-61 fixes |
 
 Q-61 asserts the distinct `seam` set **equals** its six-string list, so a seventh seam string in the
 log fails the row and a missing one fails it too. That is deliberate and it is the only place the
@@ -165,6 +189,34 @@ idea, `authority::Checkpoint` with five variants and `trace::AuthorityGate` with
 it in favour of the `KA-4` log line. That resolution inverts under this ruling: verification's Q-36
 reads `authority_decision.gate`, which is `AuthorityGate`, and that is the spelling that reaches the
 log. `authority::Checkpoint` stays a kernel-internal enum asserted through effects.
+
+## Every Q-row needs `map_inference_threshold=-1`
+
+All 37 query rows across the four plans are written as
+`read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true)`. Under a gate run that
+relation collapses to a single `json` column and every named column fails to bind:
+
+```text
+Binder Error: Referenced column "testMethod" not found in FROM clause!
+Candidate bindings: "json"
+```
+
+DuckDB types an object with more than 200 distinct keys as a `MAP`, and the count is over the
+**union** of field names across every file the glob matches — not the width of any one object. A
+single 300-key object binds fine; 300 files contributing one key each do not. One log root held
+1310 files on 2026-09-21, so this fires on exactly the runs a Q-row is for, and not on the narrow
+single-suite run an author tests the query against.
+
+Add `map_inference_threshold=-1` to the `read_json_auto` call in every Q-row. In Rust, call
+`config_testkit::logs::test_logs_relation()` rather than building the call by hand;
+`crates/config-testkit/tests/logs.rs` carries a positive control that goes red if the option is
+dropped. The failure names a column, so without this note the next person reads it as a typo.
+
+Two further things a Q-row author should know about the glob. `**/*.jsonl` also matches the
+`_untagged-<pid>.jsonl` process files at the run root, whose lines carry no `testMethod`; a
+`WHERE testMethod = ?` drops them, but a `count(*)` does not. And a query against a file the
+current test is still writing races the writer and fails with `Reached the end of the file` —
+the byte offset in that message is the offset attempted, not the file size.
 
 ## Field discipline, all tiers
 

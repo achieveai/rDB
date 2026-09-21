@@ -25,6 +25,28 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   Check them with `node docs/progress/build.mjs --check`, then `--verify`.
 - `docs/progress/config.json` key `work_dir` names the live notes folder (ledger and refresh log).
 
+## Querying the logs with DuckDB
+
+- Tests write one JSONL file per test under `RETCD_TEST_LOG_DIR`, at
+  `<run_id>/<testModule>/<testMethod>.jsonl`, with `@t`, `@l`, `@m`, `@logger`, `application` and
+  the test context (`testModule`, `testMethod`, `testRun`). Lines outside a test span go to
+  `_untagged-<pid>.jsonl` at the run root, so a `**/*.jsonl` glob picks those up too.
+- Build the relation with `config_testkit::logs::test_logs_relation()`, never by hand. It carries
+  `map_inference_threshold=-1`, and that option is load-bearing: DuckDB infers an object with more
+  than 200 distinct keys as a `MAP`, which at the top level collapses the whole relation to one
+  `json` column, and then every named column fails to bind with
+  `Binder Error: Referenced column "testMethod" not found ... Candidate bindings: "json"`.
+- The threshold counts the **union** of field names across every file the glob matches, not the
+  width of one object. A single 300-key object still binds; 300 files contributing one key each do
+  not. So a query works against one suite's logs and fails against a whole-workspace gate run,
+  which is the run where a log query is actually wanted. Observed 2026-09-21 at 1310 files under
+  one root. Because the error names a column, it reads like a typo in the query rather than a limit.
+  `crates/config-testkit/tests/logs.rs` holds a positive control that fails if the option is dropped.
+- Querying a file the current test is still writing races the writer and fails with
+  `IO Error: ... Reached the end of the file`. The byte offset in that message is what DuckDB
+  attempted, not the file's size — do not read it as evidence of a huge log. To read your own
+  output without DuckDB, use `logs::lines_for_current_test`.
+
 ## Running the gate
 
 - `scripts/gate.sh` (or `scripts/gate.ps1`) runs fmt, deps, drift, clippy and the workspace

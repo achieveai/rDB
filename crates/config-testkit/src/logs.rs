@@ -67,6 +67,31 @@ pub fn test_logs_glob() -> String {
     dir
 }
 
+/// The full `read_json_auto(...)` relation over every test JSONL file, with the options a query
+/// against a shared log root needs. Prefer this to building the call from [`test_logs_glob`]:
+/// the options are the point, and a caller that writes the call by hand forgets them.
+///
+/// `map_inference_threshold=-1` is the load-bearing one. DuckDB infers an object with more than
+/// 200 distinct keys as a `MAP` rather than a `STRUCT`, and at the top level that collapses the
+/// whole relation to a single `json` column. Every named column then fails to bind:
+///
+/// ```text
+/// Binder Error: Referenced column "testMethod" not found in FROM clause!
+/// Candidate bindings: "json"
+/// ```
+///
+/// The threshold is on the *union* of field names across every file the glob matches, so a
+/// query is fine against one suite's logs and fails against a whole-workspace gate run — which
+/// is the run where a log query is actually wanted. Observed 2026-09-21 at 1310 files under one
+/// root. The failure names a column, so it reads like a typo in the query rather than a limit.
+#[must_use]
+pub fn test_logs_relation() -> String {
+    format!(
+        "read_json_auto('{}', union_by_name=true, map_inference_threshold=-1)",
+        test_logs_glob()
+    )
+}
+
 /// A `WHERE` clause fragment restricting rows to this process's test run:
 /// `testRun = '<id>'`.
 pub fn current_run_filter() -> String {
