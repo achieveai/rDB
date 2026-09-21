@@ -4,7 +4,7 @@
       "id": "dev-oracle-m7",
       "role": "Developers",
       "milestone": "M7",
-      "task": "Verification oracle and scenario generator for test harness.",
+      "task": "Verification oracle and scenario generator. Define three INV-LIN row IDs for oracle tests.",
       "status": "running"
     },
     {

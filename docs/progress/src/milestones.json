@@ -362,19 +362,19 @@
       "tests": "399 test functions planned: kernel-a 164 rows, kernel-b 145 rows, verification 90 rows. Foundation test plan in progress.",
       "status": [
         {
-          "lead": "Design reviews closed.",
-          "text": "All four team designs passed architect and critic gates.",
-          "evidence": "3eec5e9, ac9956d, dd81431"
+          "lead": "Wave 2 committed.",
+          "text": "Foundation code and four kernel contracts landed. Gate passed: 146 tests, fmt clean, clippy clean.",
+          "evidence": "f616ddf; ledger:692-708"
         },
         {
-          "lead": "Foundation development started.",
-          "text": "C0 codec request digest control key decode implemented.",
-          "evidence": "8a23b1d"
+          "lead": "Two decisions held for Gautam.",
+          "text": "Funding approval at recommended level and shrink-budget acceptance awaiting decision.",
+          "evidence": "ledger:725-728"
         },
         {
-          "lead": "Test planning in progress.",
-          "text": "Kernel-a plan completed: 174 rows. Foundation plan round 6 advanced. Verification plan passed.",
-          "evidence": "db4f60e, 9cd75d2, dd81431"
+          "lead": "Design issue opened.",
+          "text": "Contract CB-7 opened: closed ErrorKind cannot carry kernel-B drop reasons.",
+          "evidence": "ledger:751-762"
         }
       ],
       "history": [

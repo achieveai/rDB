@@ -8,7 +8,7 @@
     { "id": "sm-grpc", "label": "config-grpc", "milestone": "M3", "state": "built", "evidence": "Client, peer, admin gRPC planes, TLS profiles. M3 gate commit 7d524ac, ADR-0010." },
     { "id": "sm-client", "label": "config-client", "milestone": "M3", "state": "built", "evidence": "Remote ConfigStore client, bounded leader-hint follow. M3 gate commit 7d524ac, ADR-0009." },
     { "id": "sm-server", "label": "config-server", "milestone": "M3", "state": "built", "evidence": "rEtcd node daemon binary composing engine, grpc, gossip, storage. M3 merge 7d524ac, ADR-0018." },
-    { "id": "sm-testkit", "label": "config-testkit", "milestone": "M0", "state": "built", "evidence": "ConfigStore conformance suite, cluster test harness. M0 merge 7014701, ADR-0014. DuckDB workspace log query fix f5419a5, ledger:631." },
+    { "id": "sm-testkit", "label": "config-testkit", "milestone": "M0", "state": "built", "evidence": "ConfigStore conformance suite, cluster test harness. M0 merge 7014701, ADR-0014. DuckDB 16 MiB buffer cliff fixed b660fd6, 60 of 60 snapshot." },
     { "id": "watch-hub", "label": "Watch hub", "milestone": "M4", "state": "built", "evidence": "Bounded per-stream queues, resume, delivery. M4 gate commit 33b5f4b, critic-m4 FINAL PASS." },
     { "id": "event-journal", "label": "Event journal", "milestone": "M4", "state": "built", "evidence": "Journal gate, replicated retention compaction. M4 gate commit 33b5f4b." },
     { "id": "snapshots-purge", "label": "Snapshots + log purge", "milestone": "M5", "state": "built", "evidence": "Consistent snapshot, guarded purge. M5 gate commit e54c6ef, ruling M5-R11." },
@@ -46,9 +46,9 @@
     { "id": "drain-check", "label": "Drain check before migration", "milestone": "M6", "state": "building", "evidence": "Every retained entry decodes and is applied. m6_compat_open green, ruling M6-R20. Known gap: decode-only, not a semantic check." },
     { "id": "rolling-upgrade", "label": "Rolling upgrade, v1 to v3", "milestone": "M6", "state": "building", "evidence": "In-place format migration then restart. E2E-42, 8 of 8 green. No M6 gate commit yet." },
 
-    { "id": "rdb-foundation", "label": "Foundation C0 contracts + sim", "milestone": "M7", "state": "building", "evidence": "C0 codec 8a23b1d, contracts 6893442. Foundation plan round 6: M7F-38 re-derived 9cd75d2. CB-5 BlockReason widening adopted. Test rows: 49 (gate clean)." },
-    { "id": "rdb-kernel-a", "label": "Kernel-A design verified", "milestone": "M7", "state": "building", "evidence": "Design review 3eec5e9; test plan dispatch 553b29b. Q-17 rule established 6091e97. Kernel-A plan round 5 completed. Rows: 174 (db4f60e). Log-field contract 78fffa0, ledger:611. KA-4 does not hold for unwritten variants." },
-    { "id": "rdb-kernel-b", "label": "Kernel-B design verified", "milestone": "M7", "state": "building", "evidence": "Design review ac9956d, 1248357, 9c9b1f9; test plan dispatch 6ff5a3d." },
-    { "id": "rdb-verification", "label": "Verification design passed", "milestone": "M7", "state": "building", "evidence": "Design and test plan review dd81431, 37e85a5, 1114bc7. Q-17 rule established 6091e97. Log-field contract 78fffa0, ledger:611." }
+    { "id": "rdb-foundation", "label": "Foundation C0 contracts + sim", "milestone": "M7", "state": "building", "evidence": "Tier-1 serialiser f616ddf unblocked 19 cross-team log rows. Plan round 6: M7F-38. CB-5 BlockReason widening. Test rows: 49." },
+    { "id": "rdb-kernel-a", "label": "Kernel-A design verified", "milestone": "M7", "state": "building", "evidence": "Authority slice landed f616ddf (watch, coherent-resync). Plan round 5: Q-17 rule 6091e97. Rows: 174 (db4f60e). Log-field contract 78fffa0." },
+    { "id": "rdb-kernel-b", "label": "Kernel-B design verified", "milestone": "M7", "state": "building", "evidence": "Design review ac9956d. Test plan dispatch 6ff5a3d. CB-7 gap: KernelEffect::Ignored reason field needs drop vocabulary." },
+    { "id": "rdb-verification", "label": "Verification design passed", "milestone": "M7", "state": "building", "evidence": "Oracle, grammar corrections landed f616ddf. Design review dd81431. Q-17 rule 6091e97. Log-field contract 78fffa0, ledger:611." }
   ]
 }

@@ -59,6 +59,18 @@
       "owner": "lead",
       "severity": "medium",
       "closing": "Foundation advances through contract backlog in priority order."
+    },
+    {
+      "text": "Contract CB-7 opened: closed ErrorKind cannot carry kernel-B drop reasons.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Design resolution and implementation of contract CB-7."
+    },
+    {
+      "text": "Five of seven AckRejectReason cells have no producer. RoleMismatch and Unverifiable lack coverage.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Coverage cells defined in kernel test planning."
     }
   ]
 }

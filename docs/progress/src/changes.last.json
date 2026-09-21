@@ -1,5 +1,48 @@
 {
-  "from": { "ledger_line": 664, "git_head": "f5419a5" },
-  "to": { "ledger_line": 664, "git_head": "f5419a5" },
-  "items": []
+  "from": { "ledger_line": 665, "git_head": "f5419a5" },
+  "to": { "ledger_line": 771, "git_head": "9a6dc2b" },
+  "items": [
+    {
+      "kind": "commit",
+      "milestone": "M7",
+      "summary": "Three teams landed M7 wave 2: serialiser, four contracts, authority mapped. Gate passed: 146 tests, seams 10, verification 83.",
+      "evidence": "f616ddf; ledger:692-708",
+      "parts": ["rdb-core", "rdb-sim"]
+    },
+    {
+      "kind": "verdict",
+      "milestone": "M7",
+      "summary": "CB-7 opened. Ignored effect's error field cannot express kernel-b's drop reasons. Field is a closed set of client-facing error kinds.",
+      "evidence": "ledger:751-757",
+      "parts": ["rdb-core"]
+    },
+    {
+      "kind": "risk",
+      "milestone": "M7",
+      "summary": "KernelEffect's Copy derive blocks BlockPartition, which requires a Vec<CopyId>. Both issues folded into CB-7.",
+      "evidence": "ledger:759-762",
+      "parts": ["rdb-core"]
+    },
+    {
+      "kind": "gate",
+      "milestone": "M7",
+      "summary": "All four drift plans re-based to latest commit. M7F-37 was never written. Code evolved to 8 variants, test followed, prose lagged.",
+      "evidence": "9a6dc2b; ledger:692-771",
+      "parts": ["rdb-core"]
+    },
+    {
+      "kind": "decision",
+      "milestone": "M7",
+      "summary": "G-13 funding decision and F5 shrink-budget acceptance are held at M7 gate.",
+      "evidence": "ledger:725-728",
+      "parts": []
+    },
+    {
+      "kind": "verdict",
+      "milestone": "M6",
+      "summary": "DuckDB JSON failure is a 16 MiB read buffer cliff on small files. Snapshot control passed 60 of 60.",
+      "evidence": "b660fd6",
+      "parts": ["config-testkit"]
+    }
+  ]
 }
