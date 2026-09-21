@@ -47,6 +47,18 @@
       "owner": "lead",
       "severity": "low",
       "closing": "Gate script assigns each run a private target directory; concurrent gates need separate ones."
+    },
+    {
+      "text": "Four foundation capabilities return Unavailable: M7F-05, Network send, Cluster suspend, harness replay.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Foundation team implements stubs or full versions to unblock kernel test rows."
+    },
+    {
+      "text": "Fifteen contract asks queued for second foundation round from three teams.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Foundation advances through contract backlog in priority order."
     }
   ]
 }

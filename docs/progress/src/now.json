@@ -1,5 +1,5 @@
 {
-  "where": "Gate passes complete. Production hardening branch awaiting commit decision.",
+  "where": "M7 develop started. Foundation code committed; design reviews passed; test planning underway.",
   "blocked": "Nothing.",
-  "next": "User decision: commit the fix pass and dashboard tooling."
+  "next": "Foundation critic and test planners advance; four capabilities owed until M7-F-05."
 }

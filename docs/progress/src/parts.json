@@ -44,6 +44,11 @@
     { "id": "tls-rotation", "label": "TLS cert rotation", "milestone": "M6", "state": "building", "evidence": "ReloadTls admin RPC, file-watch poller. m6_rotation.rs rows landed. Known gap: handshake timeout not rotator-configurable." },
     { "id": "gossip-key-rotation", "label": "Gossip-key rotation", "milestone": "M6", "state": "building", "evidence": "Staged two-key overlap window. m6_rotation.rs 24 of 24, ruling M6-R21 refusal guard." },
     { "id": "drain-check", "label": "Drain check before migration", "milestone": "M6", "state": "building", "evidence": "Every retained entry decodes and is applied. m6_compat_open green, ruling M6-R20. Known gap: decode-only, not a semantic check." },
-    { "id": "rolling-upgrade", "label": "Rolling upgrade, v1 to v3", "milestone": "M6", "state": "building", "evidence": "In-place format migration then restart. E2E-42, 8 of 8 green. No M6 gate commit yet." }
+    { "id": "rolling-upgrade", "label": "Rolling upgrade, v1 to v3", "milestone": "M6", "state": "building", "evidence": "In-place format migration then restart. E2E-42, 8 of 8 green. No M6 gate commit yet." },
+
+    { "id": "rdb-foundation", "label": "Foundation C0 contracts + sim", "milestone": "M7", "state": "building", "evidence": "C0 codec 8a23b1d, contracts seed and harness commit 6893442. Gate clean: format, clippy, 49 tests." },
+    { "id": "rdb-kernel-a", "label": "Kernel-A design verified", "milestone": "M7", "state": "building", "evidence": "Design review 3eec5e9; test plan dispatch 553b29b." },
+    { "id": "rdb-kernel-b", "label": "Kernel-B design verified", "milestone": "M7", "state": "building", "evidence": "Design review ac9956d, 1248357, 9c9b1f9; test plan dispatch 6ff5a3d." },
+    { "id": "rdb-verification", "label": "Verification design passed", "milestone": "M7", "state": "building", "evidence": "Design and test plan review dd81431, 37e85a5, 1114bc7." }
   ]
 }

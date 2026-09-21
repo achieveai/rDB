@@ -1,6 +1,41 @@
 {
   "agents": [
     {
+      "id": "dev-oracle-m7",
+      "role": "Developers",
+      "milestone": "M7",
+      "task": "Verification oracle and scenario generator for test harness.",
+      "status": "running"
+    },
+    {
+      "id": "critic-foundation",
+      "role": "Critics",
+      "milestone": "M7",
+      "task": "Foundation code review. Four capabilities owed: M7F-05, Network send, Cluster suspend, harness replay.",
+      "status": "running"
+    },
+    {
+      "id": "planner-foundation",
+      "role": "Testers",
+      "milestone": "M7",
+      "task": "Foundation test plan design and row definition.",
+      "status": "running"
+    },
+    {
+      "id": "planner-kernel-a",
+      "role": "Testers",
+      "milestone": "M7",
+      "task": "Kernel-A test plan correction round after design review.",
+      "status": "running"
+    },
+    {
+      "id": "planner-kernel-b",
+      "role": "Testers",
+      "milestone": "M7",
+      "task": "Kernel-B test plan correction round after design review.",
+      "status": "running"
+    },
+    {
       "id": "rev-wave",
       "role": "Critics",
       "milestone": "M6",

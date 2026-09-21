@@ -1,0 +1,13 @@
+%% title: M7 rDB architecture
+%% caption: M7 adds rDB: foundation C0, kernel A and B designs, verification coverage.
+%% open: always
+%% milestones: M7
+flowchart TB
+  subgraph L4["Correctness, M7"]
+    direction LR
+    @{rdb-foundation}
+    @{rdb-kernel-a}
+    @{rdb-kernel-b}
+    @{rdb-verification}
+    @{rdb-foundation} ~~~ @{rdb-kernel-a} ~~~ @{rdb-kernel-b} ~~~ @{rdb-verification}
+  end

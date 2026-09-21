@@ -331,6 +331,57 @@
         "Branch review: 6 reviewers passed with risks. 0 blockers, 19 findings. Fixes landed in tree.",
         "Gate run 3: fmt clean, clippy clean, cargo test 1023 passed, 2 pre-existing flakes."
       ]
+    },
+    {
+      "id": "M7",
+      "title": "rDB correctness spike",
+      "chip": "In progress",
+      "stage": "develop",
+      "acceptance": [
+        {
+          "text": "Foundation module C0 contracts pass codec and storage tests.",
+          "mark": "open",
+          "evidence": ""
+        },
+        {
+          "text": "Kernel-A ordering and consistency properties are validated.",
+          "mark": "open",
+          "evidence": ""
+        },
+        {
+          "text": "Kernel-B state recovery and durability pass test suite.",
+          "mark": "open",
+          "evidence": ""
+        },
+        {
+          "text": "Verification oracle detects real-world divergence.",
+          "mark": "open",
+          "evidence": ""
+        }
+      ],
+      "tests": "399 test functions planned: kernel-a 164 rows, kernel-b 145 rows, verification 90 rows. Foundation test plan in progress.",
+      "status": [
+        {
+          "lead": "Design reviews closed.",
+          "text": "All four team designs passed architect and critic gates.",
+          "evidence": "3eec5e9, ac9956d, dd81431"
+        },
+        {
+          "lead": "Foundation development started.",
+          "text": "C0 codec request digest control key decode implemented.",
+          "evidence": "8a23b1d"
+        },
+        {
+          "lead": "Test planning in progress.",
+          "text": "Kernel-a and kernel-b test plans advanced after design review. Verification plan passed review. Foundation plan being written.",
+          "evidence": "553b29b, 6ff5a3d, dd81431"
+        }
+      ],
+      "history": [
+        "Architect passed all four team designs; no gaps identified.",
+        "Critic passed design records for kernel-a, kernel-b, and verification.",
+        "Test planner issued kernel-a test plan; kernel-b test plan advanced; verification plan completed and passed review."
+      ]
     }
   ]
 }
