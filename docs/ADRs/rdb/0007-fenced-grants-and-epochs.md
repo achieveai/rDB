@@ -79,6 +79,12 @@ this paragraph is normative rather than advisory.
     control round trip.
   - When the clock sample is invalid or stale there is **no `E_new`**, so no renewal CAS is
     issued at all. A grant is never extended on a number we cannot justify.
+  - **The same rule governs the acquisition CAS.** A first grant is written with an `E` too, and
+    that `E` is the input to another node's `C_auth > E + ε + δ` — the one number in the system
+    that crosses machines. With no valid, fresh sample the node issues no acquisition CAS and
+    stays without a grant; it does not write an `E` it could not compute. Bounded-clock mode
+    being *unconfigured* is a different condition: with a valid sample the node acquires
+    normally and then denies every check until a bound is established (§3, §4).
 - **The locally held "last renewed" anchor is the dispatch tick too.** The local conjunct in §4 is
   a bound on elapsed-since-commit, so it must anchor at a *lower* bound on the commit. Setting it
   at completion under-counts by the round trip; setting it to "now" when adopting a delayed
@@ -146,6 +152,14 @@ two produced two real defects in the first draft: a node with no established bou
 and burn a grant id per tick, and one late clock sample would terminally fence a healthy primary
 and drain its queue. The maximum sample age is therefore its own configured constant at **at
 least twice the sample period**, not a reuse of the renewal interval.
+
+The deny-versus-fence distinction is about the **immediate** outcome. A stale sample also
+withholds renewals (§2: no sample, no `E_new`), so if staleness persists the local anchor stops
+advancing and within `grant_duration_ms − δ` of the last committed renewal the node fences with
+the expiry trigger above. Persistent staleness ends in an expiry fence; a transient one ends in a
+fresh sample. Any test that asserts "stale sample, still held" must place its assertion inside
+that window and name `grant_duration_ms` in its bound, because the deadline scale stretches the
+row's patience and not the grant.
 
 **Automatic promotion is disabled when error bounds cannot be established.** Verified external
 machine fencing is the fallback — *not* an assumption that an unreachable machine is dead (§7.2).
@@ -229,16 +243,31 @@ from an earlier checkpoint is carried forward so the later one can prove the lin
 other three are request/answer round trips.** The distinction matters for evidence, not for
 semantics: a checkpoint that reads a decision its caller already held is a cached read, and a
 test that supplies that decision is a test of the fixture. Because a fence pushes a superseding
-view rather than waiting to be asked, the entry check can be live at no cost in messages. Its
-deny-reason set is identical to the round-trip form's, so the client-error mapping stays total.
+view rather than waiting to be asked, the entry check can be live at no cost in messages.
 
-**A carried-forward decision is accepted only if it is the one that was asked for.** Comparing
-lineage alone is insufficient: a fence whose reason is expiry, clock uncertainty, suspension or a
-frozen record leaves the lineage identical, so a decision computed before that fence and
-delivered after it would pass a lineage comparison. Every consumer therefore also requires the
-answer's correlation identity to match the outstanding request and its decision tick to be no
-earlier than the tick the check was requested at. Non-matching and duplicate answers are dropped
-and recorded, never applied.
+**The pushed view carries a horizon, and the horizon is computed, not guessed.** The view's
+`valid_through_tick` is the last tick at which the full admission rule (§4, both conjuncts, with
+the *effective* ε of the sample the authority module holds) would still admit. The authority
+module republishes the view whenever that horizon moves — on every committed renewal, on every
+accepted clock sample (a wider sample bound shortens it), on every partition lineage change — and
+on every fence, where the horizon is set to the current tick. The entry check is therefore a
+conservative horizon test, never more permissive than the rule it stands in for, and stale only
+by the delivery of one pushed view. Its deny reasons are a subset of the round-trip form's (the
+view names which bound expired), so the client-error mapping stays total.
+
+**A carried-forward decision is accepted only if it is the one that was asked for, and was
+decided under authority at least as new as the consumer's.** Comparing lineage alone is
+insufficient: a fence whose reason is expiry, clock uncertainty, suspension or a frozen record
+leaves the lineage identical, so a decision computed before that fence and delivered after it
+would pass a lineage comparison. Comparing ticks is insufficient too: a fence has no tick of its
+own, so a decision and a fence at the same tick are indistinguishable by tick. The authority
+module therefore keeps a monotone **authority sequence**, bumped on every fence and on every
+grant, epoch or generation change, and stamps it on every decision and every pushed view. A
+consumer accepts an answer only if its correlation identity matches the outstanding request and
+its authority sequence is not below that of the newest view the consumer holds. Non-matching,
+older and duplicate answers are dropped and recorded, never applied. A fence that lands between a
+dispatch check and its answer also stops the dispatch itself: the pre-apply request is discarded
+as a definitive non-admission, and the dispatch row requires the partition queue to be open.
 
 **A recheck is a filter, never a proof.** A process can be paused between the recheck and the
 physical effect; that window cannot be closed by adding checks. What makes the design safe is the
@@ -311,13 +340,20 @@ Rows land in `docs/testing/test-plan-m7-kernel-a.md` (`M7A-NN`), tests in
 | Unknown CAS outcome fails closed | control completion `Unknown` for a renewal ⇒ `E` unchanged, read issued, and admission stops at the *old* `E − ε − δ` |
 | Clock-bound violation fails closed | sample with `valid = false`, a sample whose own `epsilon_ms` exceeds `ε_bound`, a future-stamped sample, and a backward jump: all four deny with `ClockUnbounded` and self-fence |
 | Sample ε is the one used | a valid sample at exactly `ε_bound` admits against `E − eff_eps − δ` with the **wider** margin; assert the admission boundary moves with the sample, not with the configured constant |
-| Stale sample denies without fencing | withhold samples past `max_sample_age_ticks`: every checkpoint denies with `ClockSampleStale`, the state stays `Held`, and a fresh valid sample restores admission within one tick — no grant id is consumed |
-| Unbounded mode does not burn grant ids | boot with no established bound, run for many renewal intervals: assert admission is refused throughout and that the number of grant ids acquired is one |
+| Stale sample denies without fencing | withhold samples past `max_sample_age_ticks` but **inside `grant_duration_ms − δ` of the last committed renewal**: every checkpoint denies with `ClockSampleStale`, the state stays `Held`, and a fresh valid sample restores admission within one tick — no grant id is consumed. Companion: withhold samples past `grant_duration_ms` and assert the `Expired` fence (§3: persistent staleness ends in expiry) |
+| Unbounded mode does not burn grant ids | boot with a **valid sample** but bounded-clock mode unconfigured, run for many renewal intervals: assert admission is refused throughout with `ClockUnbounded` and that the number of grant ids acquired is exactly one |
+| No sample, no acquisition | boot with **no valid sample** (none, `valid = false`, over the bound, or stale): assert zero acquisition CASes are issued and the node stays without a grant; deliver a valid sample and assert exactly one CAS follows (§2: the `E_new` rule governs acquisition) |
+| Admission horizon follows the sample | widen the sample's `epsilon_ms` mid-trace: assert a superseding authority view is pushed and the entry-check admission boundary moves within one tick of the sample; then widen it past the bound and assert the terminal fence |
 | Expiry fences with a renewal outstanding | dispatch a renewal, drop its completion, advance past the conservative expiry: assert a node-scoped fence, a superseding authority view at the current tick, and that a late `APPLIED` for that renewal changes nothing |
 | Renewed expiry does not run away | ten minutes of healthy 500 ms renewals: assert `E` never exceeds `dispatch_utc + grant_duration_ms`, and that the takeover wait after a freeze is bounded by the grant duration plus ε + δ |
 | Adoption does not restart the local window | renewal returns `Unknown`; deliver the read-back after the original `E`: assert admission stops at the original bound and does not restart |
 | Fence scope is honoured | a local storage failure on one partition: assert the other partitions of the same node keep admitting and that the grant is not consumed |
-| Stale authority answer is dropped | request a checkpoint, fence with `Expired`, then deliver the pre-fence `Admit`: assert no publication, no reply, and one dropped-answer fact; repeat with a duplicated answer |
+| Stale authority answer is dropped | request a checkpoint, fence with `Expired`, then deliver the pre-fence `Admit`: assert no publication, no reply, and one dropped-answer fact; repeat with a duplicated answer; **repeat with the decision and the fence at the same tick** — the answer's authority sequence is below the fence's view and it is dropped (§5) |
+| Freeze stops a pre-apply dispatch | fence between the dispatch check and its answer, then deliver the `Admit`: assert no storage batch effect, the sequence counter unchanged, one definitive rejection reply, and the partition queue drained; the companion with a *post-apply* candidate asserts the candidate is kept and resolves as unknown (§5) |
+| Fence reaches the publication module | fence with a pending candidate and queued fresh readers: assert the readers are drained at the fence, not at the post-apply deadline, and that the module is frozen without any recheck outstanding |
+| Reply checkpoint outlives publication | publish, delay the reply-checkpoint answer past the post-apply deadline, then deliver `Admit`: assert exactly one terminal reply for the identity and a status query answering `Published` throughout; repeat with `Deny` and assert no reply and status `Published` |
+| Adopted authority comes only from lineage installs | the dispatcher's `StepCtx` lineage equals the last `AdoptAuthority` for that partition at every step, and `AdoptAuthority` is emitted only by the coherent partitions load, a partition-record change and the post-recovery install — never by a watch event or a grant renewal |
+| External fence event carries the binding | the six-field `ExternalFenceVerified` event with every field matching a frozen linearizable read produces the authorization; each single-field mismatch produces the rejection fact naming that field |
 | External fence is bound, not trusted | three rows: evidence naming the wrong prior epoch; evidence with no prior linearizable read; evidence for an unfrozen grant. Assert no takeover authorization in all three |
 | Takeover authorization is at most once | hold the inequality true and advance many ticks: assert exactly one authorization per `(partition, prior owner epoch)` |
 | Pause / suspend fails closed | `ProcessResumed` beyond tolerance ⇒ terminal self-fence; a fresh grant id is required to serve again |
