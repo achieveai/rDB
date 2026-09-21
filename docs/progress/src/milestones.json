@@ -373,8 +373,8 @@
         },
         {
           "lead": "Test planning in progress.",
-          "text": "Kernel-a and kernel-b test plans advanced after design review. Verification plan passed review. Foundation plan being written.",
-          "evidence": "553b29b, 6ff5a3d, dd81431"
+          "text": "Kernel-a plan completed: 174 rows. Foundation plan round 6 advanced. Verification plan passed.",
+          "evidence": "db4f60e, 9cd75d2, dd81431"
         }
       ],
       "history": [

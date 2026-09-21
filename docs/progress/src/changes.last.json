@@ -1,48 +1,5 @@
 {
-  "from": { "ledger_line": 721, "git_head": "f796083" },
-  "to": { "ledger_line": 721, "git_head": "9c9b1f9" },
-  "items": [
-    {
-      "kind": "commit",
-      "milestone": "M7",
-      "summary": "C0 codec request digest control key decode implemented.",
-      "evidence": "8a23b1d",
-      "parts": ["rdb-foundation"]
-    },
-    {
-      "kind": "verdict",
-      "milestone": "M7",
-      "summary": "Kernel-A design records passed critic review.",
-      "evidence": "3eec5e9",
-      "parts": ["rdb-kernel-a"]
-    },
-    {
-      "kind": "dispatch",
-      "milestone": "M7",
-      "summary": "Kernel-A test plan issued after design review.",
-      "evidence": "553b29b",
-      "parts": ["rdb-kernel-a"]
-    },
-    {
-      "kind": "verdict",
-      "milestone": "M7",
-      "summary": "Kernel-B design records passed critic review.",
-      "evidence": "ac9956d, 1248357, 9c9b1f9",
-      "parts": ["rdb-kernel-b"]
-    },
-    {
-      "kind": "dispatch",
-      "milestone": "M7",
-      "summary": "Kernel-B test plan advanced after design review.",
-      "evidence": "6ff5a3d",
-      "parts": ["rdb-kernel-b"]
-    },
-    {
-      "kind": "verdict",
-      "milestone": "M7",
-      "summary": "Verification design and test plan passed review.",
-      "evidence": "dd81431, 37e85a5, 1114bc7",
-      "parts": ["rdb-verification"]
-    }
-  ]
+  "from": { "ledger_line": 664, "git_head": "f5419a5" },
+  "to": { "ledger_line": 664, "git_head": "f5419a5" },
+  "items": []
 }
