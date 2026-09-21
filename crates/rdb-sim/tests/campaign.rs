@@ -63,7 +63,7 @@ fn m7v_56_coverage_required_lists_are_enumerated_from_their_enums() {
     assert_eq!(coverage::REQUIRED.len(), 29);
 
     // Each of the closed axes has one cell per variant.
-    assert_eq!(coverage::ACK_REJECT_REASONS.len(), 7);
+    assert_eq!(coverage::ACK_REJECT_REASONS.len(), 14);
     assert_eq!(coverage::RECOVERY_MODES.len(), 3);
     assert_eq!(coverage::PROTECTION_PHASES.len(), 4);
     assert_eq!(coverage::REPLICA_ROLES.len(), 3);
@@ -77,6 +77,18 @@ fn m7v_56_coverage_required_lists_are_enumerated_from_their_enums() {
         AckRejectReason::StaleConfig,
         AckRejectReason::ForgedIdentity,
         AckRejectReason::IncompatibleVersion,
+        // The seven of ask CB-3. Five have no scenario that produces them yet, and they are
+        // named here anyway: this loop is the *name* guard and the count above is the *arity*
+        // guard, so a variant that exists and is unreachable still has to own a cell. Whether
+        // anything drives it is `M7V-55`'s question, answered per package by the capability
+        // entry — all fourteen are `unavailable(R1)` in M7.
+        AckRejectReason::StaleGeneration,
+        AckRejectReason::RoleMismatch,
+        AckRejectReason::InconsistentProgress,
+        AckRejectReason::RegressedProgress,
+        AckRejectReason::Unverifiable,
+        AckRejectReason::Diverged,
+        AckRejectReason::NotAMember,
     ] {
         assert!(
             coverage::ACK_REJECT_REASONS.contains(&reason),

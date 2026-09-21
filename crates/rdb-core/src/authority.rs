@@ -7,19 +7,32 @@
 //! # What is wired (2026-09-21)
 //!
 //! The **watch and coherent-resync slice** of team kernel-a `design.md` §2.4, and nothing else.
-//! It is the part of A1 that the landed [`EffectKind`] can express: every effect it emits is a
-//! [`EffectKind::Control`], which is one of the six variants that exist.
+//! Every effect it emits is an [`EffectKind::Control`], one of the seven variants that exist.
 //!
-//! The rest of §2.4 — the authority gates, the fence, the pushed view — is **not** wired, and
-//! not because it is unwritten. `design.md` §2.2 gives A1 eight effect kinds; five of them
-//! (`Decide(AuthorityDecision)`, `Fence`, `PublishAuthorityView`, `FenceProven`, `Fact`) have no
-//! [`EffectKind`] variant to travel in, and `Check { checkpoint, lineage, correlation }` has no
-//! [`crate::contracts::event::EventKind`] variant to arrive in.
-//! [`crate::contracts::authority::AuthorityDecision`],
-//! [`crate::contracts::authority::AuthorityView`], [`crate::contracts::authority::Verdict`] and
-//! [`crate::contracts::authority::DenyReason`] are landed types with **no consumer anywhere in
-//! the workspace**. Wiring those gates is a C0 contract change, not a kernel-a change, and a
-//! kernel that faked them locally would be the "fake success" spike §8 forbids.
+//! The rest of §2.4 — the authority gates, the fence, the pushed view — is **not** wired. It is
+//! not waiting on a contract, though: rounds 1–5 of this module recorded it as blocked on a C0
+//! gap, and the lead's C0 ruling is that the gap was a **mapping, not a widening**. `design.md`
+//! §2.2 gives A1 eight effect kinds and all eight have a carrier:
+//!
+//! - `Fence` **is** [`ControlEffect::Cas`] on `ControlKey::Partition`/`Grant`. Bump the epoch and
+//!   the prior owner's own CAS fails on `expected` — that is what fencing is, and a dedicated
+//!   variant would be a second way to say it.
+//! - `PublishAuthorityView` is that same CAS plus [`ControlEffect::Watch`]/[`ControlEffect::Reload`].
+//!   A dedicated variant would bypass the read-after-watch rule `on_watched` enforces below.
+//! - `Decide(AuthorityDecision)` is [`crate::contracts::trace::TraceKind::AuthorityDecision`].
+//! - `Fact(..)` is [`crate::contracts::event::KernelEffect::Ignored`] (ruling A-R24).
+//! - `Check { checkpoint, lineage, correlation }` was **refused** an `EventKind` variant: a gate
+//!   is a point in a code path, not a deliverable event.
+//!
+//! So what is left is kernel-a's own work, and naming it a contract gap is what kept it parked.
+//!
+//! One caution on the types this module re-exports.
+//! [`crate::contracts::authority::AuthorityView`] and
+//! [`crate::contracts::authority::DenyReason`] genuinely have no consumer outside this crate.
+//! [`crate::contracts::authority::AuthorityDecision`] looks the same and is not:
+//! [`crate::contracts::trace::TraceKind::AuthorityDecision`] is a different type with the same
+//! last word, and it is consumed by the sim oracle in four places. Round 5 read the collision as
+//! one unused type and reported it as dead; grep the qualified path, not the bare name.
 //!
 //! # The rule this slice exists to hold
 //!

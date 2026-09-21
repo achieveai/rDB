@@ -89,7 +89,16 @@ pub const ADMISSION_REASONS: &[ErrorKind] = &[
 ];
 
 /// Every `AckRejectReason`, enumerated.
-pub const ACK_REJECT_REASONS: [AckRejectReason; 7] = [
+///
+/// Widened 7 → 14 with the enum itself (ask CB-3, lead ruling B-R33 Q-B-8). Five of the seven
+/// added have no scenario that produces them yet — `StaleGeneration`, `RoleMismatch`,
+/// `RegressedProgress`, `Unverifiable`, `NotAMember`; `InconsistentProgress` is `M7V-70` and
+/// `Diverged` is `M7V-80`. Listing all fourteen anyway is the rule this module states at the
+/// top: a cell leaves `required_missing[]` **through its package's capability entry, never by
+/// being dropped from the enumeration.** All fourteen are `unavailable(R1)` in M7, so none is
+/// red today and all five gaps surface the round R1 is wired. Shortening this list to the
+/// reachable seven would close `M7V-56`'s equality by hiding the question.
+pub const ACK_REJECT_REASONS: [AckRejectReason; 14] = [
     AckRejectReason::Gap,
     AckRejectReason::DigestMismatch,
     AckRejectReason::StaleEpoch,
@@ -97,6 +106,13 @@ pub const ACK_REJECT_REASONS: [AckRejectReason; 7] = [
     AckRejectReason::StaleConfig,
     AckRejectReason::ForgedIdentity,
     AckRejectReason::IncompatibleVersion,
+    AckRejectReason::StaleGeneration,
+    AckRejectReason::RoleMismatch,
+    AckRejectReason::InconsistentProgress,
+    AckRejectReason::RegressedProgress,
+    AckRejectReason::Unverifiable,
+    AckRejectReason::Diverged,
+    AckRejectReason::NotAMember,
 ];
 
 /// Every `RecoveryMode`, enumerated.
