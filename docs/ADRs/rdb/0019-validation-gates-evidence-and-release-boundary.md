@@ -134,7 +134,9 @@ Three rDB-specific rules, all consequences of the spike plan:
   `seeds_armed > 0` on the default corpus**, in every run (ruling V-R20): the V-R19 schedule is
   deterministic, so a wired checker that never arms is a generator regression, and the handoff
   gate — not only the hand-run release gate — is where it fails. During M7 this clause covers no
-  invariant until kernel packages land, and the row says so. This is the `full_scale: false`
+  invariant until kernel packages land, and the row says so. INV-VER is excluded from this clause
+  until a producing `ScenarioOp` or `BoundaryId` exists (ruling V-R21; the excluded set is listed
+  in the verification design and is INV-VER only today). This is the `full_scale: false`
   mechanic applied to capability and to arming rather than to scale.
 - **`capability{package, state}` is derived from the crate's wiring, never a literal** (ruling
   V-R18). The dispatcher builds the trace-start capability block from `Module::capability(&self)`
