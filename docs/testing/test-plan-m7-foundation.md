@@ -1,9 +1,14 @@
+<!-- drift-basis: ec610f4 -->
+
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
 **Status:** Proposed (test-planner deliverable, round 1). Written against the **landed code at
-`6893442`** ("foundation correction round 1"), read on 2026-09-20. Where the design and the crate
-disagree, the **crate wins in a row's literals** and the **design wins in a row's meaning**; the
-whole list of disagreements is §15.
+`ec610f4`** ("K-F-39 partition config refuses a zero threshold on decode"), the newest commit to
+touch `crates/rdb-core/src/contracts/` as of 2026-09-20. The rows were first written against
+`6893442` ("foundation correction round 1") and **re-read against `ec610f4`** before the basis
+line above was added; §15's last block records what moved and which rows changed. Where the
+design and the crate disagree, the **crate wins in a row's literals** and the **design wins in a
+row's meaning**; the whole list of disagreements is §15.
 **Date:** 2026-09-20
 **Scope:** rDB milestone M7, spike packages **C0** (contracts and codec), **H1** (harness and sim
 seams), **M1** (storage model), **I1** (replay runner, dispatcher, trace and manifest). Crates
@@ -50,7 +55,7 @@ and its §15 drift-table shape. `docs/testing/test-plan-m7-kernel-a.md` and
 
 - **Developers.** §1 is the contract on `rdb-core`'s contracts and `rdb-sim`'s providers. §3–§11
   are the backlog; the **Test** column is the exact function name. 49 of the 74 functions already
-  exist at `6893442` and are marked **landed** — do not rewrite them, and do not add a parallel
+  exist at `ec610f4` and are marked **landed** — do not rewrite them, and do not add a parallel
   name next to one.
 - **Testers.** The row id prefixes the test function name (`m7f_18_short_flush_reports_and_keeps_the_shorter_prefix`),
   because §12's DuckDB queries and §16's gate map both work by string match. The one exception is
@@ -232,7 +237,7 @@ ignored; watch gap forces reload.*
 | M7F-20(a) | `m7f_20_plan_read_unavailable_hits_the_next_get_only` **landed** | ruling F-R3/F-R5; design §5 `ControlOp::PlanReadUnavailable` | `PlanReadUnavailable` injected, then two `Get`s | the first completes `Value { outcome: Unavailable }`, the second completes with the store's **real** answer (`Found`). A one-shot fault that stuck would silently disable every later read in the scenario | sim | none |
 | M7F-20(b) | `m7f_20_a_dropped_completion_leaves_no_trace_of_completing` **landed** | design §5 `ControlOp::DropCompletion`; ADR-rdb-0008 §7 item 8 | a CAS submitted, then `DropCompletion { node }` | `complete()` returns nothing, `drain_interactions()` is empty — **but** `store.revision() == Revision(1)`: the write landed and the answer was lost. That asymmetry is the whole point; a kernel that treats "I asked" as "I have it" is caught here | sim | none |
 | M7F-43 | `m7f_43_a_stale_timer_version_never_fires` **owed** | **charter H1 acceptance** ("stale timer version ignored"); design §4.2 `TimerVersion` | `Clock::arm(node, id, v1, t)`, `cancel(node, id, v1)`, `arm(node, id, v2, t)`; then `due(t)` | `due(t)` yields exactly one `TimerFired` and it carries `v2`; a `cancel` at a version that is **not** the armed one removes nothing (a kernel may cancel a timer it has already re-armed, and the newer arm must survive); `arm` at a version at or below the armed one is `SimError::Config { field: "version" }`, so a stale fire can never be produced by the environment in the first place; `next_deadline()` is the minimum over armed timers | unit | none |
-| M7F-47 | `m7f_47_the_scheduler_order_is_total_over_tick_and_event_id` **owed** | design §5 `Scheduler`; ADR-rdb-0003 decision 4 "one total order"; FA-4. Split out of `M7F-05` (numbering note): the landed `Scheduler` is the single thing every `sim` row in this plan runs on, and until this row exists nothing points at it | `Scheduler::schedule` of events built in a deliberately scrambled order, including two at one tick with different `EventId`, and one at a tick already passed | `pop()` returns them in `(at, event_id)` order, never insertion order; `now()` advances to each popped tick and never backwards; a schedule **before** `now` is `SimError::Config { field: "at" }` and a duplicate `(tick, event_id)` is `SimError::Config { field: "event_id" }` — one id is one event, and overwriting one would lose it silently; `next_event_id()` is strictly increasing across the run. Buildable today against `6893442`; it depends on nothing that is `Unavailable`, which is exactly why it was separated from the replay claim | unit | none |
+| M7F-47 | `m7f_47_the_scheduler_order_is_total_over_tick_and_event_id` **owed** | design §5 `Scheduler`; ADR-rdb-0003 decision 4 "one total order"; FA-4. Split out of `M7F-05` (numbering note): the landed `Scheduler` is the single thing every `sim` row in this plan runs on, and until this row exists nothing points at it | `Scheduler::schedule` of events built in a deliberately scrambled order, including two at one tick with different `EventId`, and one at a tick already passed | `pop()` returns them in `(at, event_id)` order, never insertion order; `now()` advances to each popped tick and never backwards; a schedule **before** `now` is `SimError::Config { field: "at" }` and a duplicate `(tick, event_id)` is `SimError::Config { field: "event_id" }` — one id is one event, and overwriting one would lose it silently; `next_event_id()` is strictly increasing across the run. Buildable today against `ec610f4`; it depends on nothing that is `Unavailable`, which is exactly why it was separated from the replay claim | unit | none |
 
 ---
 
@@ -285,7 +290,7 @@ non-vacuous would be code that exists for a test.
 
 ## 8. The owed seams: explicit `Unavailable`, never a fake success
 
-Four capabilities are **not built** at `6893442` and the lead disclosed them at the commit gate:
+Four capabilities are **not built** at `ec610f4` and the lead disclosed them at the commit gate:
 `M7F-05`, `Network::send`, `Cluster::suspend`, `harness::replay`. Each has a row **now**, and each
 row's assertion *is* that the capability refuses by name and does nothing — not that it will one
 day work. This is the only kind of row that can catch the failure mode spike §8 exists to prevent:
@@ -312,10 +317,14 @@ clause becomes the negative half of the same row, never a second row and never a
 by the runner") names four well-formedness checks it wants to apply *through I1's validator* to
 both recorded and hand-built traces, and says in its own assertion column: *"if I1 exposes no
 validator the row runs the envelope checks only and reports `Unavailable{Capability(I1)}` for the
-rest"*. At `6893442` **there is no validator** — `harness::trace` has `Recorder`, `write_jsonl` and
+rest"*. At `ec610f4` **there is no validator** — `harness::trace` has `Recorder`, `write_jsonl` and
 `read_jsonl`, and nothing that checks a trace's shape beyond `deny_unknown_fields` and the schema
 version. These six rows are that validator, and they are the reason M7V-88 can stop being partly
 vacuous.
+
+**Authorised by the lead on 2026-09-20** (§18 Q-4): a foundation ask recorded before this plan
+existed, raised after the charters were written rather than outside their scope. These six ids do
+not retire.
 
 The surface: `harness::trace::validate(&Trace) -> Result<(), TraceDefect>` — one function, one
 error enum with one variant per check, and the **same** function applied to a `Trace` whichever way
@@ -363,14 +372,16 @@ Lead ruling **B-R30**: *Q2 (AppendOutcome additive extension, closes K-F-34) and
 
 | Id | Test | Proves | Fixture | Assertion | Class | Dependency |
 |---|---|---|---|---|---|---|
-| M7F-39 | `b_r30_min_regular_acks_defaults_to_one_and_refuses_zero` **landed** | B-R30 Q3; spec §5.2; design §4.6 | `PartitionConfig::new(..)`, `with_min_regular_acks(0)`, `with_min_regular_acks(2)`, and `validate()` | the default is `1`; `with_min_regular_acks(0)` is `RdbError::InvalidArgument { field: "min_regular_acks" }`; `validate()` refuses a zero **by every path**, including a configuration deserialised from a control record, so a zero threshold — which would acknowledge a write nobody holds — cannot arrive at all. **Name note:** this is the one landed function whose name does not carry an `m7f_` prefix. It is adopted as landed; renaming it is a code edit this plan does not own (§18 Q-2) | unit | none |
+| M7F-39 | `b_r30_min_regular_acks_defaults_to_one_and_refuses_zero` **landed** | B-R30 Q3; spec §5.2; design §4.6 | `PartitionConfig::new(..)`, `with_min_regular_acks(0)`, `with_min_regular_acks(2)`, and `validate()` | the default is `1`; `with_min_regular_acks(0)` is `RdbError::InvalidArgument { field: "min_regular_acks" }`; `with_min_regular_acks(2)` is accepted. This row owns the **constructor** path; the **decode** path is `M7F-48` and `M7F-49`, which landed later at `ec610f4` and made "by every path" structural rather than a claim. Together the three are what stops a zero threshold — which would acknowledge a write nobody holds — arriving at all. **Name note:** one of three landed functions whose name carries no `m7f_` prefix, adopted as landed; renaming is a code edit this plan does not own (§18 Q-2) | unit | none |
+| M7F-48 | `k_f_39_a_zero_threshold_is_refused_on_deserialisation` **landed at `ec610f4`** | finding **K-F-39**; B-R30 Q3; spec §5.2. The invariant is now **structural on the decode path**, not a convention a caller has to remember | a serialised RF3 `PartitionConfig` with `min_regular_acks` overwritten to `0` on the wire, fed to `serde_json::from_value` | the decode **fails**, and the refusal **names `min_regular_acks`**. `M7F-39` proves the constructor refuses a zero; this proves the *wire* cannot smuggle one past it. Before `ec610f4` a zero arriving in a control record was refused only if someone remembered to call `validate` after decoding, and a forgotten call is invisible in review — a configuration acknowledging writes nobody holds, reached by the one path that does not go through the constructor | unit | none |
+| M7F-49 | `k_f_39_a_valid_threshold_deserialises` **landed at `ec610f4`** | finding **K-F-39**; §2 rule 2 | the same RF3 configuration at `min_regular_acks = 2`, serialised and decoded | the decode **succeeds**, `decoded == two` field for field, and `decoded.validate()` is `Ok(())`. `M7F-48`'s accepting twin, differing in exactly one fact — the threshold value. Without it `M7F-48` would pass against a `try_from` that rejected every configuration, which is a decoder that has stopped working rather than one that has started checking | unit | none |
 | M7F-40 | `m7f_40_append_reject_names_every_ladder_row_once` **owed** | B-R30 Q2 / K-F-34; kernel-b design §3.2 ladder; ADR-rdb-0005 §2 | every landed `AppendReject` variant, constructed once each | the **sixteen** variants — `Quarantined`, `IncompatibleVersion`, `TooLarge`, `WrongPartition`, `StaleGeneration`, `NeedLineage`, `StaleEpoch`, `UnknownEpoch`, `StaleConfig`, `NeedConfig`, `NotAMember`, `CorruptHistory`, `DivergentHistory`, `NeedPrefix`, `StaleFence`, `Unauthenticated` — are pairwise distinct, and the set is asserted by **equality against a literal list in the row body**, so a variant added or removed fails here. Sixteen is the **code's** count: `design.md` §4.8 shows five (§15), and a row written from the design would assert a five-name set, pass, and never notice the other eleven. The row does **not** assert a ladder order: that is kernel-b's `M7B-15`. It asserts that foundation shipped one name per ladder row and no synonym. Four of kernel-b's asks (`NeedPrefix.head_digest`, `AckRejectReason` +7, the non-reject `AppendOutcome` variants, the `Kernel` carrier pair) are **not** in this set and are dev-foundation-r2's queue (§14) | unit | none |
 
 ### 10.3 `TraceHeader.provenance`, for verification
 
 Lead ruling **V-R20 (2)**: *header provenance (critic F18) routed to foundation now.* The
 verification plan's §12 still lists `M7V-46`'s header half under "C0 + `provenance`" against
-`8a23b1d`; at `6893442` `Provenance` has landed and that dependency is discharged (§15).
+`8a23b1d`; at `ec610f4` `Provenance` has landed and that dependency is discharged (§15).
 
 | Id | Test | Proves | Fixture | Assertion | Class | Dependency |
 |---|---|---|---|---|---|---|
@@ -393,7 +404,7 @@ half a check.
 |---|---|---|---|---|---|---|
 | M7F-27 | `m7f_27_deps_gate_passes_on_this_workspace` **landed (stage)** | ADR-rdb-0002 decision 2; ruling F-R11 (K-F-32) | this workspace, unmodified | `scripts/gate.sh deps` prints `== deps` then `gate: deps OK` and **exits 0**; `pwsh -NoProfile -File scripts/gate.ps1 deps` does the same. The positive control: without it the negative row passes on a stage that fails on everything | script | none |
 | M7F-28 | `m7f_28_deps_gate_fails_a_config_to_rdb_dev_dependency_edge` **landed (stage)** | ADR-rdb-0002 decision 2 "**in any dependency kind**"; ruling F-R11 | a throwaway workspace **outside this repository**: `crates/config-bad` **dev-dep**ending on `crates/rdb-oops`, with copies of both gate scripts. Nothing is added to the working tree | `gate.sh deps` prints `deps: config-bad depends on rdb-oops (dev)` then `deps: config-* must never depend on rdb-* (rdb ADR-0002)` on stderr and **exits 1**; `gate.ps1 deps` prints the same line and throws, **exit 1**. The `(dev)` is the point of the row: a dev-dependency is the edge that arrives first — a test helper reaching for an `rdb-*` type — and it is the one a `[dependencies]`-only check would miss. Twin: the same fixture with the edge removed exits 0 | script | none |
-| M7F-42 | `m7f_42_rdb_core_has_no_live_io_and_no_unordered_iteration` **owed** | **charter I1 acceptance** ("no live I/O in core tests"); ADR-rdb-0002 decisions 3, 5, 7; FA-1, FA-4 | the repository, at the paths ADR-rdb-0002 names | (1) `crates/rdb-core/Cargo.toml` `[dependencies]` is **exactly** `bytes`, `serde`, `thiserror`, `tracing`, `sha2` and contains no `config-*`; (2) no `Instant::now`, `SystemTime`, `rand`, `std::fs`, `std::net`, `std::thread` or `async` in `crates/rdb-core/src`; (3) the ADR's own command, `grep -rn "HashMap" crates/rdb-core/src crates/rdb-sim/src \| grep -v -E ':[[:space:]]*//'`, prints nothing and exits 1 — **with** the comment filter, because the unfiltered form finds three doc-comment hits that forbid the type (K-F-31: an earlier ADR revision claimed otherwise and was wrong). The only I/O in either crate is `harness::trace`'s `std::fs`, which the row allows by path and by nothing else | script | none |
+| M7F-42 | `m7f_42_rdb_core_has_no_live_io_and_no_unordered_iteration` **owed** | **charter I1 acceptance** ("no live I/O in core tests"); ADR-rdb-0002 decisions 3, 5, 7; FA-1, FA-4 | the repository, at the paths ADR-rdb-0002 names | (1) `crates/rdb-core/Cargo.toml` **`[dependencies]`** is **exactly** `bytes`, `serde`, `thiserror`, `tracing`, `sha2` and contains no `config-*`. The row reads that section alone, and the distinction is load-bearing in both directions: `[dev-dependencies]` legitimately holds `config-log`, `config-log-macros`, `hex` and — added at `ec610f4` — `serde_json`, and a check that grepped the whole file would fail on all four for no reason. The reverse edge is the one ADR-rdb-0002 forbids: `rdb-core` dev-depending on `config-log` is required for `#[retcd_test]` and is fine; a `config-*` crate depending on `rdb-*` is not, and that is `M7F-27`/`M7F-28`'s job, not this row's; (2) no `Instant::now`, `SystemTime`, `rand`, `std::fs`, `std::net`, `std::thread` or `async` in `crates/rdb-core/src`; (3) the ADR's own command, `grep -rn "HashMap" crates/rdb-core/src crates/rdb-sim/src \| grep -v -E ':[[:space:]]*//'`, prints nothing and exits 1 — **with** the comment filter, because the unfiltered form finds three doc-comment hits that forbid the type (K-F-31: an earlier ADR revision claimed otherwise and was wrong). The only I/O in either crate is `harness::trace`'s `std::fs`, which the row allows by path and by nothing else | script | none |
 
 ---
 
@@ -411,7 +422,7 @@ variable takes effect.
 | Id | Query | Expected | Rows it serves |
 |---|---|---|---|
 | **Q-58** | `SELECT testModule, testMethod, count(*) FILTER (WHERE "@m" = 'capability') AS caps, count(*) AS lines FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) GROUP BY 1, 2 ORDER BY 1, 2;` | one line per `rdb-sim` test function; `caps = 3` on **every** one of them; `lines >= 3`. A row with `caps = 0` is a row that forgot `support::preamble()`; a row missing from the listing is a row that is not `#[retcd_test]`. This is the K-F-30 evidence, and the restatement of the architect's `Q-F-1` | M7F-22, FA-5, every `rdb-sim` row |
-| **Q-59** | `SELECT testMethod, first, flipped, second, second_after FROM read_json_auto('<target>/test-logs/*/contracts/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_02 chain vector' QUALIFY row_number() OVER (PARTITION BY testMethod ORDER BY "@t" DESC) = 1;` | four **distinct** digest hex values, read out of the log rather than out of an assertion message. Observed at `6893442`: `f2ef0c89…`, `e5a8fc16…`, `f1c60eac…`, `593437df…` (dev-notes §6, `Q-C0-1`) | M7F-02(a) |
+| **Q-59** | `SELECT testMethod, first, flipped, second, second_after FROM read_json_auto('<target>/test-logs/*/contracts/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_02 chain vector' QUALIFY row_number() OVER (PARTITION BY testMethod ORDER BY "@t" DESC) = 1;` | four **distinct** digest hex values, read out of the log rather than out of an assertion message. Observed at `6893442` and unchanged at `ec610f4`: `f2ef0c89…`, `e5a8fc16…`, `f1c60eac…`, `593437df…` (dev-notes §6, `Q-C0-1`) | M7F-02(a) |
 | **Q-60** | `SELECT testMethod, count(*) AS lines FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) GROUP BY 1 ORDER BY 1;` then, on the same relation, `SELECT * WHERE regexp_matches(CAST(to_json(COLUMNS(*)) AS VARCHAR), '"(key\|value)":\s*"[^"]')` over the non-reserved columns | the first lists the rows that ran; the second returns **nothing**. The team rule is "never a key or a value byte": a key is a length, a value is a length, a digest is hex. Worth running after **every** change to a test file, because a `tracing::info!(?key)` added in debugging is invisible in review and permanent in the log (dev-notes §6, `Q-C0-2`) | FA-5, every row |
 | **Q-61** | `SELECT testMethod, seam, count(*) FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) WHERE seam IS NOT NULL GROUP BY 1, 2 ORDER BY 2;` | one line per `(row, seam)` pair for the owed seams, and the **set of distinct `seam` values equals** `{harness::replay::replay, sim::network::Network::send, sim::cluster::Cluster::suspend, harness::dispatch::deliver::send, harness::dispatch::deliver::store, harness::dispatch::deliver::timer}`. A seam string in the log that is not in that set is a seam with no row; a set member with no line is a row that stopped asserting its seam. This is Q-row half of `M7F-26` clause 2 | M7F-05, M7F-23, M7F-24, M7F-25, M7F-26 |
 | **Q-62** | `SELECT testMethod, overridden, nodes, event_cap FROM read_json_auto('<target>/test-logs/*/dispatch/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_19 manifest';` | one line per manifest resolved; `overridden` is `[]` for the defaults case and exactly `["PauseAge"]` for the one-override case. Reading it from the log rather than from the assertion is what makes a campaign report and its trace checkable against each other later | M7F-19 |
@@ -457,7 +468,7 @@ Same three mechanisms the verification plan §12 uses, chosen by what is missing
 | M7F-05, M7F-25, M7F-30 … M7F-35 | **I1** — the replay runner and the trace validator | 8 rows. `M7F-05` and `M7F-25` assert the refusal today and flip to the positive assertion in place. `M7F-30…35` cannot be written against a `validate` that does not exist; they are **listed as missing** by §16's gate map, which is red while the count is non-zero. Verification's `M7V-88` is partly vacuous until they land, and their plan says so |
 | M7F-23, M7F-24 | **H1** — `Network::send` and `Cluster::suspend` | 2 rows, both asserting the refusal now. `Cluster::suspend` also gates kernel-a's monotonic admission rule, because `NodeLifecycle::Resumed` is the only way a module learns it was stopped |
 | M7F-26 | **H1 + I1** | its clause (1) is buildable today (the three `deliver` seams refuse by name); clauses (2) and (3) are the completeness check and shrink as seams land |
-| M7F-47, M7F-43, M7F-44, M7F-45, M7F-46, M7F-29, M7F-36, M7F-37, M7F-38, M7F-40, M7F-41, M7F-42 | **nothing** — owed work, not blocked work | 12 rows that can be written against `6893442` today. They are owed because no one has written them, which is a different status from blocked and is counted separately in §17 |
+| M7F-47, M7F-43, M7F-44, M7F-45, M7F-46, M7F-29, M7F-36, M7F-37, M7F-38, M7F-40, M7F-41, M7F-42 | **nothing** — owed work, not blocked work | 12 rows that can be written against `ec610f4` today. They are owed because no one has written them, which is a different status from blocked and is counted separately in §17 |
 | M7F-07's kernel half | **kernel-b R1** | the environment half is landed here; kernel-b's `M7B-26` asserts that no kernel watermark moved, and cites this row by id |
 | M7F-36, M7F-37, M7F-38 behaviour | **kernel-a A1** | foundation owes the shape; the authority rules are kernel-a's (ADR-rdb-0007) and their rows are `M7A-*` |
 | M7F-40 behaviour | **kernel-b R1** | foundation owes one name per ladder row; the ladder **order** is `M7B-15` |
@@ -468,7 +479,7 @@ Same three mechanisms the verification plan §12 uses, chosen by what is missing
 
 ## 15. Source state at the time of writing, and the drift from it
 
-Every row in this plan is written against the **landed code at `6893442`**
+Every row in this plan is written against the **landed code at `ec610f4`**
 (`crates/rdb-core/src/contracts/`, `crates/rdb-sim/src/`, `crates/rdb-*/tests/`,
 `scripts/gate.{sh,ps1}`), read on 2026-09-20. The design it proves is `teams/foundation/design.md`
 correction round 1 and ADRs `docs/ADRs/rdb/0000`, `0002`, `0003`. Where the design's vocabulary and
@@ -476,7 +487,7 @@ the crate's differ, the **crate wins in a row's literals** and the **design wins
 meaning**. This table is the whole list. A row that names a design word not in this table and not
 in the crate is a defect, not a preference.
 
-| Design / handoff / plan says | Landed at `6893442` | What the rows do |
+| Design / handoff / plan says | Landed at `ec610f4` | What the rows do |
 |---|---|---|
 | design §5 `Scheduler::next` | `Scheduler::pop` | `M7F-47` spells `pop`. Clippy's `should_implement_trait` refuses a `next(&mut self)` that is not `Iterator::next`, and `-D warnings` makes that a build failure |
 | design §5 `ControlStore::complete(now) -> Vec<(NodeId, Tick, ControlEvent)>` | `-> Vec<Completion>`, a named struct with five fields | rows read `completion.node`, `.at`, `.correlation`, not tuple positions. A 5-tuple at the call site is unreadable |
@@ -487,17 +498,43 @@ in the crate is a defect, not a preference.
 | design **§4.1** lists `EventKind` with **six** variants | **seven**: `Client`, `Node`, `Transport`, `Storage`, `Control`, `Timer`, and `ExternalFenceVerified { .. }` as a **direct arm**, added by ruling A-R23 item 5 | `M7F-37` asserts the seven-variant total match by exhaustive `match` with no `_` arm. Flagged by the foundation critic's round 2: a total match written from the design **will not compile**, and a match written with a wildcard would compile and silently stop catching the eighth variant. `ExternalFenceVerified` is an `EventKind` arm and not a `NodeLifecycle` member, so a verified external fence arrives through the scheduler like any other event |
 | design **§4.8** shows the `AppendReject` ladder with **five** variants | **sixteen** | `M7F-40` asserts sixteen, by equality against a literal list in the row body. Flagged by the foundation critic's round 2: the code is right and the document is wrong. A row written from the design would assert a five-name set, pass against a sixteen-variant enum for the five it knew, and never notice the other eleven |
 | design **§4.6** `PartitionConfig` | four fields — `partition`, `config_version`, `members`, `min_regular_acks` — behind `#[serde(try_from = "UnvalidatedPartitionConfig")]` | `M7F-39` (landed) is written against the landed shape. The `try_from` is why that row can claim the zero is refused **by every path** rather than only by the constructor: `validate` is the single place the rule is stated, and a field added to `PartitionConfig` and not to the unvalidated twin fails to compile in the conversion, so the two cannot drift apart unnoticed. Flagged by the critic's round 2 |
-| the three shapes above are being reconciled by a **scoped architect round** on `design.md` §4.1, §4.6, §4.8 and §4.10 | — | this plan does **not** wait for it. Every row above is written from the code at `6893442`, which the assignment declares to be truth, so the reconciliation cannot change a row — only the document those rows cite. The critic checked `design.md` **§8's row table** specifically and found it accurate, so §8 is cited as written |
+| the three shapes above are being reconciled by a **scoped architect round** on `design.md` §4.1, §4.6, §4.8 and §4.10 | — | this plan does **not** wait for it. Every row above is written from the code, which the assignment declares to be truth, so the reconciliation cannot change a row — only the document those rows cite. The critic checked `design.md` **§8's row table** specifically and found it accurate, so §8 is cited as written |
+
+### 15.1 Rebase from `6893442` to `ec610f4`
+
+The rows were written against `6893442`. `ec610f4` is the newest commit to touch
+`crates/rdb-core/src/contracts/` and is this plan's declared basis. Re-read before the basis line
+was added, rather than assumed to be a no-op — and it was **not** one. Verified:
+
+```
+$ git log --oneline -2 -- crates/rdb-core/src/contracts/
+ec610f4 fix(rdb-core): K-F-39 partition config refuses a zero threshold on decode
+6893442 feat(rdb): foundation correction round 1 (K-F-01..38, F-R6..F-R12 closed)
+$ git diff --stat 6893442 ec610f4 -- crates/rdb-core/src/contracts/
+ crates/rdb-core/src/contracts/membership.rs | 45 +++++++++++++++++++++++++++--
+```
+
+| What moved at `ec610f4` | Effect on this plan |
+|---|---|
+| `PartitionConfig` gained `#[serde(try_from = "UnvalidatedPartitionConfig")]` and a private shadow struct whose `TryFrom` calls the existing `validate` (finding **K-F-39**) | **the four public fields are unchanged**, so no row's literals move. The shape rows (`M7F-39`) and every row that builds a configuration through `support::rf3_config()` are unaffected. What changed is that the decode path is now structural: "refused by every path" stopped being a claim about caller discipline and became a property of the type |
+| **two new landed test functions** in `crates/rdb-core/tests/seams.rs`: `k_f_39_a_zero_threshold_is_refused_on_deserialisation` and `k_f_39_a_valid_threshold_deserialises` | **rows added**: `M7F-48` and `M7F-49` (§10.2). They are a refusing row and its accepting twin, which §2 rule 2 would have required anyway. Landed test functions: 49 → **51**. `seams.rs`: 4 → **6** |
+| `crates/rdb-core/Cargo.toml` gained `serde_json` — in **`[dev-dependencies]`**, with the comment "a concrete serde format, so the deserialisation seams can be tested end to end" | **`M7F-42` clause 1 still holds and was made explicit.** `[dependencies]` is still exactly the five ADR-rdb-0002 names. A row that grepped the whole manifest instead of that one section would now fail on `serde_json` — and on `config-log`, which `rdb-core` has dev-depended on since the start and legitimately may: ADR-rdb-0002 forbids `config-* → rdb-*`, not the reverse |
+| naming | there are now **three** landed functions without an `m7f_` prefix — `b_r30_…` and the two `k_f_39_…`. §18 Q-2 covers all three; §17's count commands match all three prefixes |
+| everything else in `contracts/` | unchanged. Every other §15 row above was re-read at `ec610f4` and still holds: `EventKind` is seven variants, `AppendReject` is sixteen, `TraceKind::ProtectionState` has seven fields and no `quorum_rule`, `Provenance` and `OpSkipped` are present, and there is still no `harness::trace::validate` |
+
+Not part of this basis: `crates/rdb-sim/tests/support/oracle.rs` and `support/scenarios.rs` are
+modified in the working tree beyond `ec610f4`. Those are **team verification's** files, not
+foundation's, and no row here reads them.
 | developer-handoff R1.3 row K-F-37: "`Digest::of` **refuses** an over-long part" | `digest.rs` does a plain `(part.len() as u64)` widening with a comment; it refuses nothing | no row asserts a refusal. The cast is lossless on every target this workspace builds for; the comment states why it is a cast and not a clamp (a clamp would give two different lengths one prefix, which is the collision the prefix exists to prevent). The handoff line overstates what landed |
 | kernel-b design §1.1: `record_digest = blake3(…)`, parts ordered `partition_id, prev_digest, seq, generation, owner_epoch, config_version, …` | **SHA-256** (ADR-rdb-0002 decision 6), parts ordered `prev_digest, partition, generation, owner_epoch, seq, config_version, …` | §4 is the order the rows pin. The **set** of eleven is identical and is what F-R6 ruled; the **order** is design §4.8's, with `prev_digest` first so no later field can displace the chain link (B-R9). BLAKE3's default build compiles assembly through `cc`, which the spike's budget rules out; the digest is a contract value, so changing it later is a new ADR with a number |
 | design §8 row M7F-20 "`PlanReadUnavailable` affects one `Get`" | two landed functions; the second is `m7f_20_a_dropped_completion_leaves_no_trace_of_completing` | `M7F-20(a)` and `(b)`. `DropCompletion` had no row in design §8 and has one here |
 | design §8 row M7F-22 "the three `Capability` **trace events**" | `support::preamble()` writes three `capability` **JSONL log lines** through `tracing`; `TraceKind::Capability` exists but no row emits one into a `Trace` yet | `M7F-22` and `Q-58` are written against the JSONL lines. The trace-event form is I1's, and `M7F-32` is where a trace's capability block first gets checked |
 | charter owned artifacts: `crates/rdb-sim/tests/{sim,memory,harness,replay}.rs` | landed: `harness.rs`, `control.rs`, `dispatch.rs`, `storage.rs` | the file mapping keeps the landed four and adds the charter's `sim.rs` and `replay.rs` for the rows that need them. `memory.rs` is **not** added: `storage.rs` is its content under another name, and a second file would split M1's rows for nothing |
 | the landed test name prefix `m7f_` | one function is named `b_r30_min_regular_acks_defaults_to_one_and_refuses_zero` | adopted as-is under row `M7F-39`. §18 Q-2 asks whether to rename it |
-| verification plan §12: "`op_skipped` — not in the landed `TraceKind` at `8a23b1d`", and "`M7V-46`'s header half is `Unavailable` until `provenance` lands" | both **landed** at `6893442`: `TraceKind::OpSkipped { scenario_op_index: u32, reason: SkipReason }` and `TraceHeader.provenance: Provenance` | both dependencies are **discharged**. `M7V-22`, `M7V-46`'s header half and `M7V-88`'s `op_skipped` clause can stop reporting `Unavailable{Capability(C0)}`. Foundation's side is `M7F-11(a)` and `M7F-41`; verification's §12 and §15 need the corresponding edit, which this plan does not own |
+| verification plan §12: "`op_skipped` — not in the landed `TraceKind` at `8a23b1d`", and "`M7V-46`'s header half is `Unavailable` until `provenance` lands" | both **landed** at `6893442` and unchanged at `ec610f4`: `TraceKind::OpSkipped { scenario_op_index: u32, reason: SkipReason }` and `TraceHeader.provenance: Provenance` | both dependencies are **discharged**. `M7V-22`, `M7V-46`'s header half and `M7V-88`'s `op_skipped` clause can stop reporting `Unavailable{Capability(C0)}`. Foundation's side is `M7F-11(a)` and `M7F-41`; verification's §12 and §15 need the corresponding edit, which this plan does not own |
 | verification plan §4 `M7V-88`: "through I1's validator" | **no validator exists** — `harness::trace` has `Recorder`, `write_jsonl`, `read_jsonl` and nothing that checks shape | §9 (`M7F-30…35`) is that validator. Until it lands `M7V-88` runs its envelope checks only and reports `Unavailable{Capability(I1)}` for the rest, exactly as their row says |
 | ledger B-R30: "kernel-b renumbers its nine Q rows to **Q-46..Q-54**; foundation takes **Q-55+**" | kernel-b's committed plan uses **Q-46…Q-57** (§11 header, §16 count, round-4 delta "+1 Q-row — Q-57") | foundation starts at **Q-58**. The rule "never reuse a number from another team" wins over the stale allocation. §18 Q-1 |
-| design §8 / `architect-handoff` §10.6: `M7F-05` "owed", covering **both** the scheduler's total order and byte-identical replay | still owed; `harness::replay::replay` returns `Unavailable`, while `Scheduler` is fully landed | **split.** `M7F-05` keeps the replay claim — that is the half the ledger's 22:06 entry cites — and the scheduler takes the new id `M7F-47`. One id may not mean one blocked claim and one buildable claim at once: the buildable row would be hidden behind the blocked one in §14 and §16, and the landed `Scheduler`, which every `sim` row here runs on, would have no row pointing at it. The charter's H1 line "byte-identical trace twice" is **not met** at `6893442` and §16 says so |
+| design §8 / `architect-handoff` §10.6: `M7F-05` "owed", covering **both** the scheduler's total order and byte-identical replay | still owed; `harness::replay::replay` returns `Unavailable`, while `Scheduler` is fully landed | **split.** `M7F-05` keeps the replay claim — that is the half the ledger's 22:06 entry cites — and the scheduler takes the new id `M7F-47`. One id may not mean one blocked claim and one buildable claim at once: the buildable row would be hidden behind the blocked one in §14 and §16, and the landed `Scheduler`, which every `sim` row here runs on, would have no row pointing at it. The charter's H1 line "byte-identical trace twice" is **not met** at `ec610f4` and §16 says so |
 | design §4.8: "the goldens re-pinned after the R1 preimage change" | the two chain goldens moved (`0d31b22c…`, `cf811143…`); the request golden and the 188-byte envelope golden **did not** | recorded, not asserted by a row. That the request golden did not move is the check that F-R6 touched only the record preimage. `ENVELOPE_VERSION` stays `1` because no envelope has been persisted outside a test |
 | team rules: logs land under `RETCD_TEST_LOG_DIR` | the env-prefix form **has no effect on this host** under Git Bash; `config_log::testing::test_log_root` falls back to the test binary's path, which is the documented fallback | §12's queries are written against the fallback glob `<target>/test-logs/*/**/*.jsonl`. `M7F-22(b)` resolves its own path through `test_file_path(&test_log_dir(), ..)`, so it follows the fallback and does not depend on the variable |
 | charter I1 acceptance: "an **unregistered handler** fails explicitly" | there is no registry: six named fields indexed by an infallible `match` (K-F-28) | restated as `M7F-01(b)`: an event routed to an unwired module yields `Unavailable` with **no effect** and never panics. A registry built to make one row non-vacuous would be code that exists for a test |
@@ -509,7 +546,7 @@ in the crate is a defect, not a preference.
 Every acceptance line from `teams/foundation/charter.md` §ACCEPTANCE, mapped to the rows that
 carry it. A line whose rows are all `Unavailable` or owed is **not met**, and says so.
 
-| Package | Criterion (charter wording) | Rows | State at `6893442` |
+| Package | Criterion (charter wording) | Rows | State at `ec610f4` |
 |---|---|---|---|
 | **C0** | the crate compiles | `scripts/gate.sh test -p rdb-core`; ADR-rdb-0002 Verification | **met** |
 | **C0** | identity and envelope vectors are known-answer tests | M7F-02(a)…(k), M7F-04(a)…(f), M7F-03(a)…(d), M7F-29 | **met for the landed 21**; `M7F-29` (eleven-part completeness) owed |
@@ -525,14 +562,14 @@ carry it. A line whose rows are all `Unavailable` or owed is **not met**, and sa
 | **M1** | buffered and durable prefixes are **distinct** | M7F-06(a), M7F-07, M7F-18(a) | **met** — and FA-3 keeps them unconvertible |
 | **M1** | `sync_wal_through` modelled with the **write-order mutex** | M7F-46 (+ M7F-18(a)) | **partly met** — a short answer is injectable and asserted; the interleaved-commit ordering clause is owed |
 | **I1** | unregistered handler fails explicitly | M7F-01(a)(b)(c) — restated under K-F-28 (§15) | **met** |
-| **I1** | **no live I/O** in core tests | M7F-42 | **owed** — the facts hold at `6893442`; no row asserts them |
+| **I1** | **no live I/O** in core tests | M7F-42 | **owed** — the facts hold at `ec610f4`; no row asserts them |
 | **I1** | minimized trace replays | M7F-05, M7F-25 | **not met** — `Unavailable`; the rows assert the refusal |
 | **I1** | result manifest records **resolved budgets** | M7F-19 (+ Q-62) | **met** — including which budgets were overridden |
 | **I1** | (round-1 additions) authority triple filled mechanically; header round trip; zero-tick hop; one JSONL per test | M7F-09, M7F-11(a)(b), M7F-21(a)(b), M7F-22(a)(b), Q-58 | **met** |
-| **all** | row ids `M7F-NN` prefix every test name | §17's count commands | **met with one exception**, `M7F-39` (§15, §18 Q-2) |
+| **all** | row ids `M7F-NN` prefix every test name | §17's count commands | **met with three exceptions**, `M7F-39`, `M7F-48`, `M7F-49` — landed names kept verbatim (§15.1, §18 Q-2) |
 | **all** | `scripts/gate.sh all` green for the workspace at handoff (cold build, `CARGO_TARGET_DIR=.rtargets/foundation`) | the four gate commands above; `deps` by M7F-27 / M7F-28 | **met at the round-1 commit**; the lead verified fmt, clippy, 49 tests, `deps` |
 | **cross-team** | A-R23's five for kernel-a | M7F-36, M7F-37, M7F-38, and M7F-09 for item 4 | shapes **landed**; rows owed |
-| **cross-team** | B-R30's items for kernel-b | M7F-39 (landed), M7F-40 | Q3 **met**; Q2's name set owed. CB-1…CB-4 are **r2**, not here (§14) |
+| **cross-team** | B-R30's items for kernel-b | M7F-39, M7F-48, M7F-49 (all landed), M7F-40 | Q3 **met on both the constructor and the decode path** — the decode half became structural at `ec610f4` under finding K-F-39; Q2's name set owed. CB-1…CB-4 are **r2**, not here (§14) |
 | **cross-team** | `TraceHeader.provenance` for verification | M7F-11(a) (landed), M7F-41 | **met**; `M7F-41`'s no-bare-seed clause owed |
 | **cross-team** | the I1 trace validator `M7V-88` depends on | M7F-30 … M7F-35 | **not met** — no validator exists (§9, §15) |
 | **gate** | `config-*` never depends on `rdb-*`, in any dependency kind | M7F-27, M7F-28 | **met** — positive and negative, on both scripts |
@@ -553,28 +590,33 @@ eight I1 rows in §14.
 | §7 I1 dispatcher, trace, manifest | 6 | 11 | 11 | 0 | 1 | 10 | 0 |
 | §8 owed seams (M7F-23…26; M7F-05 counted in §5) | 4 | 4 | 0 | 4 | 3 | 1 | 0 |
 | §9 I1 trace validator | 6 | 6 | 0 | 6 | 6 | 0 | 0 |
-| §10 cross-team shapes | 6 | 6 | 1 | 5 | 6 | 0 | 0 |
+| §10 cross-team shapes (incl. M7F-48, M7F-49) | 8 | 8 | 3 | 5 | 8 | 0 | 0 |
 | §11 deps gate and purity | 3 | 3 | 2 | 1 | 0 | 0 | 3 |
-| **Total** | **47** | **74** | **51** | **23** | **52** | **19** | **3** |
+| **Total** | **49** | **76** | **53** | **23** | **54** | **19** | **3** |
 | Q-rows (Q-58 … Q-64) | 7 | — | — | — | — | — | — |
 
-Row id set: `M7F-01` … `M7F-47`, contiguous, no duplicates. The **51 landed** are 49 cargo test
+Row id set: `M7F-01` … `M7F-49`, contiguous, no duplicates. The **53 landed** are 51 cargo test
 functions plus the 2 landed gate stages (`M7F-27`, `M7F-28`), which are `script` class and not
-cargo tests. The 49 are the 49 the lead verified green at the `6893442` commit (`contracts` 21,
-`seams` 4, `control` 7, `dispatch` 6, `harness` 5, `storage` 6).
+cargo tests. The 51 are the 49 the lead verified green at `6893442` (`contracts` 21, `seams` 4,
+`control` 7, `dispatch` 6, `harness` 5, `storage` 6) plus the 2 that landed at `ec610f4`
+(`seams` 4 → 6), which §15.1 records.
 
 **Commands that prove the counts** (run them from the repository root; expected output in
 brackets):
 
 ```sh
-# 1. Row ids in this plan: contiguous 01..47, no duplicates.
-grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | wc -l          # [47]
-grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | head -1        # [M7F-01]
-grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | tail -1        # [M7F-47]
+# 0. The declared drift basis is the newest commit to touch the contracts directory.
+grep -o 'drift-basis: [0-9a-f]*' docs/testing/test-plan-m7-foundation.md          # [drift-basis: ec610f4]
+git log --format=%h -1 -- crates/rdb-core/src/contracts/                          # [ec610f4]
 
-# 2. No gap: the set equals the span. No id beyond M7F-47 may appear anywhere in the file,
+# 1. Row ids in this plan: contiguous 01..49, no duplicates.
+grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | wc -l          # [49]
+grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | head -1        # [M7F-01]
+grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | tail -1        # [M7F-49]
+
+# 2. No gap: the set equals the span. No id beyond M7F-49 may appear anywhere in the file,
 #    which is why the r2 forward-references in section 14 name no number.
-seq -f 'M7F-%02g' 1 47 > /tmp/expect
+seq -f 'M7F-%02g' 1 49 > /tmp/expect
 grep -o 'M7F-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | diff - /tmp/expect   # [no output]
 
 # 3. Q-rows: seven, Q-58..Q-64, none reused from another team.
@@ -584,13 +626,14 @@ grep -o 'Q-[0-9][0-9]' docs/testing/test-plan-m7-foundation.md | sort -u | tr '\
 grep -o '\*\*Q-[0-9][0-9]\*\*' docs/testing/test-plan-m7-foundation.md | sort -u | wc -l    # [7]
 grep -o '\*\*Q-[0-9][0-9]\*\*' docs/testing/test-plan-m7-foundation.md | sort -u | head -1  # [**Q-58**]
 
-# 4. Landed test functions, by file.
-grep -c '^fn m7f_\|^fn b_r30_' crates/rdb-core/tests/contracts.rs crates/rdb-core/tests/seams.rs \
+# 4. Landed test functions, by file. The pattern matches all three landed prefixes:
+#    m7f_ (48 of them), b_r30_ (1) and k_f_ (2). See section 18 Q-2 on the three exceptions.
+grep -cE '^fn (m7f_|b_r30_|k_f_)' crates/rdb-core/tests/contracts.rs crates/rdb-core/tests/seams.rs \
       crates/rdb-sim/tests/harness.rs crates/rdb-sim/tests/control.rs \
-      crates/rdb-sim/tests/dispatch.rs crates/rdb-sim/tests/storage.rs   # [21 4 5 7 6 6 = 49]
+      crates/rdb-sim/tests/dispatch.rs crates/rdb-sim/tests/storage.rs   # [21 6 5 7 6 6 = 51]
 
 # 5. Every landed function name appears in this plan.
-grep -h '^fn m7f_\|^fn b_r30_' crates/rdb-*/tests/*.rs | sed 's/^fn //; s/().*//' | sort -u \
+grep -hE '^fn (m7f_|b_r30_|k_f_)' crates/rdb-*/tests/*.rs | sed 's/^fn //; s/().*//' | sort -u \
   | while read -r n; do grep -q "$n" docs/testing/test-plan-m7-foundation.md || echo "MISSING $n"; done   # [no output]
 
 # 6. No legacy prefix anywhere in this plan.
@@ -604,9 +647,9 @@ tok=$(printf 'part'; printf 'db'); grep -i "$tok" docs/testing/test-plan-m7-foun
 | # | Question | Default (implement this if the lead does not answer first) |
 |---|---|---|
 | **Q-1** | My assignment says foundation's Q-rows **start at Q-57** and that kernel-b holds Q-46…Q-56. The committed kernel-b plan (`docs/testing/test-plan-m7-kernel-b.md` §11 header, §16 count, and its round-4 delta line "**+1 Q-row** — Q-57") holds **Q-46…Q-57**. Ledger B-R30 says something different again ("kernel-b … Q-46..Q-54; foundation takes Q-55+"). Which allocation is current? | **Foundation starts at Q-58.** The hard rule is "never reuse a number from another team", and kernel-b's Q-57 is committed at HEAD. Taking Q-57 would give one number two meanings across two plans, which is worse than leaving Q-55/Q-56/Q-57 stranded. If the lead prefers a compact allocation, the cheap fix is for kernel-b to renumber Q-57, not for this plan to collide with it — but that is their file, not mine |
-| **Q-2** | One landed test function is named `b_r30_min_regular_acks_defaults_to_one_and_refuses_zero`, with no `m7f_` prefix. §16's "row ids prefix every test name" therefore has one exception, and §12's queries and §16's gate map both work by string match. Rename it to `m7f_39_min_regular_acks_defaults_to_one_and_refuses_zero`? | **Adopt the landed name, row `M7F-39`.** The name is descriptive, cites its ruling, and is green; renaming it is a code edit this plan does not own and would break nothing but also fix nothing. The `grep` in §17 command 4 matches both prefixes, so the count stays mechanical. If the lead wants uniformity, it is one `Edit` in `seams.rs` and one line here |
+| **Q-2** | **Three** landed test functions carry no `m7f_` prefix: `b_r30_min_regular_acks_defaults_to_one_and_refuses_zero` (`M7F-39`) and, since `ec610f4`, `k_f_39_a_zero_threshold_is_refused_on_deserialisation` (`M7F-48`) and `k_f_39_a_valid_threshold_deserialises` (`M7F-49`). §16's "row ids prefix every test name" therefore has three exceptions, and §12's queries and §16's gate map both work by string match. Rename them? | **Adopt the landed names.** Each is descriptive and cites the ruling or finding that produced it, and all three are green; renaming is a code edit this plan does not own, and it would break nothing but also fix nothing. §17 command 4 matches all three prefixes, so the counts stay mechanical. If the lead wants uniformity it is three `Edit`s in `seams.rs` and three lines here — but note the cost is asymmetric: a rename breaks the `@m` values already written into the JSONL logs by `tracing::info!(…, "b_r30")` and `…, "k_f_39")`, which §12's queries would then miss silently |
 | **Q-3** | Thirty-eight landed functions sit under eleven frozen `M7F-NN` ids, which is why §3–§7 use sub-case letters. Should the plan instead **renumber** so that one id is exactly one function? | **Keep the frozen ids and use sub-case letters.** `M7F-05` and `M7F-07` are cited by id from the ledger and from kernel-b's `M7B-26`; `M7F-01`…`M7F-22` are cited from `architect-handoff.md` §10.6 and from `design.md` §8. Renumbering would silently repoint four documents. The letters are the verification plan's own device (`M7V-03(a)`/`(b)`, `M7V-08(a)`/`(b)`) |
-| **Q-4** | §9's validator (`harness::trace::validate`) is a **new surface in `rdb-sim`** that no charter line names. The charter's I1 acceptance says "minimized trace replays", not "a validator exists". It is here because verification's `M7V-88` names it and reports `Unavailable{Capability(I1)}` without it. Is the surface authorised? | **Yes, one function and one error enum, in `harness::trace`.** It is the smallest thing that makes `M7V-88` non-vacuous, and it is the *same* code path for recorded and hand-built traces, which is the whole content of the row (`M7F-35` asserts there is exactly one). If the lead refuses the surface, `M7F-30`…`M7F-35` are withdrawn as a block, their ids are **retired, not reused**, and verification's `M7V-88` stays partly vacuous with that reason recorded in their §12 |
+| **Q-4** | ~~§9's validator (`harness::trace::validate`) is a **new surface in `rdb-sim`** that no charter line names. Is it authorised?~~ | **Closed — approved by the lead, 2026-09-20.** It is a real foundation ask, recorded before this plan existed, and it exists because a verification row needs it; no charter line names it because it was raised after the charters were written, not because it is out of scope. `M7F-30`…`M7F-35` **stand and their ids do not retire.** The surface is one function and one error enum in `harness::trace`, and the *same* code path for recorded and hand-built traces (`M7F-35` asserts there is exactly one) |
 | **Q-5** | Rows `M7F-27`, `M7F-28` and `M7F-42` are `script` class — a gate stage and two greps, not cargo tests. The other three plans have no such class. Should they be cargo tests instead (a test that shells out to `cargo metadata`)? | **Keep them `script`.** A cargo test that shells out to `cargo metadata` would be a second cargo invocation inside a running cargo, against the same target directory — the exact `AGENTS.md` hazard, and the failure would look like a link error rather than a collision (A7). The stage already exists, runs in `all`, and both scripts are covered. The cost is that `M7F-28`'s negative fixture lives outside the repository and is rebuilt by hand; §11 states the fixture so it is reproducible |
 | **Q-6** | `M7F-26` clause 3 greps `crates/rdb-sim/src` for `SimError::unavailable(` and compares the count to a literal list in the row body. That couples a test to a source-file shape. Acceptable? | **Yes, and it is the point.** Clause 2 alone drifts silently: a seam added without a row leaves the observed set smaller than the code's, and the row still passes. The grep is the only clause that fails when the *code* grows a seam nobody wrote a row for. If the lead objects to a grep in a test, the fallback is to move clause 3 into `M7F-42` (already `script` class), which keeps the check and loses the locality |
 | **Q-7** | Four kernel asks (CB-1…CB-4) and kernel-a's ask 9 were queued to **dev-foundation-r2** after round 1 was committed. This plan does not cover them and §14 says so. Should it pre-allocate ids for them now? | **No — allocate the next free ids when r2 lands.** Ids are stable from the moment they are written, and a row written against an ask whose shape is still being decided (CB-1 and CB-4 are "one decision", per the lead's 20:15 entry) would be renumbered or retired within a day. §14 names them so nothing is lost |

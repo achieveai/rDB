@@ -66,13 +66,23 @@ for plan in "${plans[@]}"; do
     continue
   fi
 
+  # A marker is a whole line and nothing else. Matching the bare substring instead counted
+  # foundation's section 15.1 twice on 2026-09-20: the plan quotes the grep command it used to
+  # verify its own marker, and the transcript of that command contains the string. Showing your
+  # work is the behaviour this check wants, so the check reads only the declared format.
+  marker_re='^[[:space:]]*<!--[[:space:]]*drift-basis:[[:space:]]*[0-9a-fA-F]\{7,40\}[[:space:]]*-->[[:space:]]*$'
+
   # One marker per plan. Two would mean two answers to one question.
-  count="$(grep -c 'drift-basis:' "$plan" || true)"
+  count="$(grep -c "$marker_re" "$plan" || true)"
 
   if [ "$count" -eq 0 ]; then
     echo "drift: $name: no basis marker." >&2
     echo "       Add one line naming the commit the plan's section 15 was written against:" >&2
     echo "       <!-- drift-basis: ${current:0:7} -->" >&2
+    if grep -q 'drift-basis:' "$plan"; then
+      echo "       ('drift-basis:' does appear in this file, but not as a line of its own." >&2
+      echo "        A marker is the whole line; anything else is prose about a marker.)" >&2
+    fi
     bad=1
     continue
   fi
@@ -83,7 +93,7 @@ for plan in "${plans[@]}"; do
     continue
   fi
 
-  basis="$(grep -o 'drift-basis: *[0-9a-fA-F]\{7,40\}' "$plan" | grep -o '[0-9a-fA-F]\{7,40\}')"
+  basis="$(grep "$marker_re" "$plan" | grep -o '[0-9a-fA-F]\{7,40\}' | head -1)"
 
   if ! git cat-file -e "$basis^{commit}" 2>/dev/null; then
     echo "drift: $name: basis $basis is not a commit in this repository" >&2
