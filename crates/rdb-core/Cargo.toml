@@ -21,3 +21,5 @@ sha2 = { workspace = true }
 config-log = { workspace = true }
 config-log-macros = { workspace = true }
 hex = { workspace = true }
+# A concrete serde format, so the deserialisation seams can be tested end to end.
+serde_json = { workspace = true }

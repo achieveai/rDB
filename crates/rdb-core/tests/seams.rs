@@ -7,6 +7,7 @@
 //! | M7F-16 | `copy_of` is `None` for an authenticated peer whose node is a member but whose boot differs (K-F-21) |
 //! | M7F-17 | `required_regular` counts two on RF3 and zero on a lone survivor; `primary` is the one primary (K-F-23) |
 //! | B-R30 | `PartitionConfig.min_regular_acks` defaults to 1; zero is refused at construction; two is accepted |
+//! | K-F-39 | Deserialising a `PartitionConfig` refuses a zero `min_regular_acks` and accepts a valid one |
 
 use config_log::retcd_test;
 use rdb_core::contracts::errors::RdbError;
@@ -204,4 +205,34 @@ fn b_r30_min_regular_acks_defaults_to_one_and_refuses_zero() {
         })
     );
     tracing::info!(default = PartitionConfig::DEFAULT_MIN_REGULAR_ACKS, "b_r30");
+}
+
+/// Finding K-F-39: the threshold invariant is structural on the decode path, not a convention
+/// a caller has to remember. A control record carrying zero is refused by the type.
+#[retcd_test]
+fn k_f_39_a_zero_threshold_is_refused_on_deserialisation() {
+    let mut wire = serde_json::to_value(rf3()).expect("a configuration serialises");
+    wire["min_regular_acks"] = serde_json::json!(0);
+
+    let refusal = serde_json::from_value::<PartitionConfig>(wire)
+        .expect_err("zero acknowledgements is not a threshold, whatever the wire says")
+        .to_string();
+    assert!(
+        refusal.contains("min_regular_acks"),
+        "the refusal names the field it refused, got {refusal:?}"
+    );
+    tracing::info!(refusal = %refusal, "k_f_39");
+}
+
+/// Finding K-F-39: the same decode path still accepts a configuration that holds the invariant.
+#[retcd_test]
+fn k_f_39_a_valid_threshold_deserialises() {
+    let two = rf3().with_min_regular_acks(2).expect("two is a threshold");
+    let wire = serde_json::to_value(&two).expect("a configuration serialises");
+
+    let decoded =
+        serde_json::from_value::<PartitionConfig>(wire).expect("two is a threshold on decode too");
+    assert_eq!(decoded, two, "a valid configuration round-trips unchanged");
+    assert_eq!(decoded.validate(), Ok(()));
+    tracing::info!(min_regular_acks = decoded.min_regular_acks, "k_f_39");
 }

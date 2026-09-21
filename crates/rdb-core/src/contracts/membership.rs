@@ -6,7 +6,7 @@
 //! here (2026-09-20) and that is the right home: if the simulator owned it, a forged-identity
 //! test would be testing the simulator's lookup rather than the kernel's.
 //!
-//! Three rules are structural rather than commented:
+//! Four rules are structural rather than commented:
 //!
 //! * [`PartitionConfig::copy_of`] returns `None` for an unauthenticated
 //!   [`crate::contracts::transport::PeerLabel`]. A kernel module that only ever learns a copy id
@@ -16,6 +16,9 @@
 //! * The required-copy set is derived from [`PartitionConfig::config_version`], never from a
 //!   node's current name or liveness. Spec §6.2: "Membership changes cannot erase old exposure",
 //!   and "no timer reset merely because a replica was renamed/replaced".
+//! * [`PartitionConfig`] deserialises through [`PartitionConfig::validate`], so a decoded
+//!   configuration cannot carry a zero acknowledgement threshold (finding K-F-39). The
+//!   invariant is enforced by the type, not by remembering to call `validate` after a decode.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,7 +54,11 @@ pub struct Member {
 }
 
 /// The membership of one partition, pinned by a configuration version.
+///
+/// Deserialisation goes through [`PartitionConfig::validate`] (finding K-F-39), so a decoded
+/// configuration holds the threshold invariant by construction rather than by convention.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UnvalidatedPartitionConfig")]
 pub struct PartitionConfig {
     /// The partition.
     pub partition: PartitionId,
@@ -65,6 +72,37 @@ pub struct PartitionConfig {
     /// [`Self::validate`] refuses it, because "no acknowledgement required" is the spec §5.2
     /// rule with the safety taken out. The default is [`Self::DEFAULT_MIN_REGULAR_ACKS`].
     pub min_regular_acks: u8,
+}
+
+/// [`PartitionConfig`]'s wire shape, before [`PartitionConfig::validate`] has run.
+///
+/// Serde's `try_from` needs a type it may build while the invariant is still unknown, so the
+/// fields are repeated here and nowhere else. The rule itself is not repeated: the conversion
+/// below calls `validate`, the one place that states it. A field added to `PartitionConfig`
+/// and not to this struct fails to compile in that conversion, so the two cannot drift apart
+/// unnoticed.
+#[derive(Deserialize)]
+#[serde(rename = "PartitionConfig")]
+struct UnvalidatedPartitionConfig {
+    partition: PartitionId,
+    config_version: ConfigVersion,
+    members: Vec<Member>,
+    min_regular_acks: u8,
+}
+
+impl TryFrom<UnvalidatedPartitionConfig> for PartitionConfig {
+    type Error = RdbError;
+
+    fn try_from(wire: UnvalidatedPartitionConfig) -> Result<Self, Self::Error> {
+        let config = Self {
+            partition: wire.partition,
+            config_version: wire.config_version,
+            members: wire.members,
+            min_regular_acks: wire.min_regular_acks,
+        };
+        config.validate()?;
+        Ok(config)
+    }
 }
 
 impl PartitionConfig {
@@ -103,8 +141,9 @@ impl PartitionConfig {
     /// # Errors
     ///
     /// [`RdbError::InvalidArgument`] with `field: "min_regular_acks"` when the threshold is
-    /// zero. A configuration deserialised from a control record goes through this too, so a
-    /// zero cannot arrive by any path.
+    /// zero. Deserialisation is routed through here by
+    /// `impl TryFrom<UnvalidatedPartitionConfig> for PartitionConfig` and the `try_from`
+    /// container attribute (finding K-F-39), so a decoded configuration cannot carry a zero.
     pub fn validate(&self) -> Result<(), RdbError> {
         if self.min_regular_acks == 0 {
             return Err(RdbError::InvalidArgument {
