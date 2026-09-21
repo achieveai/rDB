@@ -70,10 +70,12 @@ in this map.
 this of its own budgets ("proposed acceptance targets, not previously observed speeds") and requires
 measurement on one recorded CI worker. The recorded worker for M7 is a shared Windows Server 2022 VM
 running up to six concurrent agent builds. So the 1,000-history/60 s figure is **recorded** in the PR
-corpus and **asserted** only in the extended gate (ruling V-R11), via
-`CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` —
-the plain gate command compiles workspace members unoptimized and cannot produce the number. If the
-target is missed, spike §7's rule applies and the revision is written here. Never lower an assertion.
+corpus and **asserted** only in a gate run (ruling V-R11), via the release command in §2.1
+(`RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim
+--test campaign`) — the plain gate command compiles workspace members unoptimized and cannot
+produce the number, and only the release artifact `rdb-m7-campaign-release.json` may be cited for
+it (ruling V-R17). If the target is missed, spike §7's rule applies and the revision is written
+here. Never lower an assertion.
 
 Rows for V5–V7 and V9–V15 are `pending` because this ADR refuses to invent a threshold for an
 experiment nobody has designed yet. Each is filled by the milestone that owns it, as an amendment.
@@ -95,19 +97,64 @@ rDB adopts rEtcd ADR-0031 unchanged:
 
 rDB-specific additions, all inside `values` so the schema itself is untouched:
 
-| Artifact | `values` keys |
-|---|---|
-| `rdb-m7-campaign.json` | `seeds`, `max_events`, `events_total`, `invariants{id -> proven\|unavailable\|violated}`, `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`\|`release`), `slipped` per minimized fixture (`true` when the fault-boundary set differs before and after shrinking; the boundary set is reported, never part of the reducer's acceptance predicate) |
-| `rdb-m7-coverage.json` | `guard_outcomes{cell -> count}`, `fault_boundaries{cell -> count}`, `pairwise{pair -> count}`, `required_missing[]` |
+| Artifact | Written by | `values` keys |
+|---|---|---|
+| `rdb-m7-campaign.json` | a **debug** campaign run (the handoff gate) | `seeds`, `max_events`, `events_total`, `invariants{id -> {status: proven\|unavailable\|violated, reason?: capability(<package>)\|not_armed, seeds_armed}}` (one object per invariant; `reason` is present only when `status` is `unavailable`), `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`), `slipped` per minimized fixture (`true` when the fault-boundary set differs before and after shrinking; the boundary set is reported, never part of the reducer's acceptance predicate) |
+| `rdb-m7-campaign-release.json` | a **release** campaign run (the 1,000-history command and the M7 release gate, §2.1) | the same keys, with `profile` = `release`. **This is the only artifact that may be cited for the 1,000-history budget** (ruling V-R17). |
+| `rdb-m7-coverage.json` | every campaign run | `guard_outcomes{cell -> count}`, `fault_boundaries{cell -> count}`, `pairwise{pair -> count}`, `required_missing[]`, `unavailable_cells{cell -> package}` (required cells whose producing op needs a provider hook the build reports `unavailable`; excluded from `required_missing[]` by that capability entry, never by editing the required list) |
 
-Two rDB-specific rules, both consequences of the spike plan:
+The campaign artifact's name is chosen by the build profile (`cfg!(debug_assertions)`), not by an
+environment variable, so the debug and release commands can never overwrite each other's file and
+a debug `wall_ms` cannot land in the file the milestone cites. Two files rather than one file
+keyed by profile because ADR-0031's schema carries one `host`, one `build` and one `run{}` per
+file, and a debug run and a release run differ in exactly those fields; folding them would put two
+`run{}` blocks inside `values` and would require `write_evidence` to read-modify-write a file left
+by an earlier run, which the shared helper does not do (ruling V-R5: reused as is) and which would
+make the artifact depend on a stale file of unknown provenance. The M6-113 conformance row and the
+M6-116 no-production-claim grep already operate per file.
 
-- **An invariant is `proven`, `unavailable` or `violated` — never silently absent.** While a kernel
-  package is unwired its invariants report `unavailable`. The campaign binary may still exit 0, but
-  the artifact says `unavailable` and the gate script fails when `SPIKE_REQUIRE_ALL=1`. This is the
-  `full_scale: false` mechanic applied to capability rather than to scale.
+Three rDB-specific rules, all consequences of the spike plan:
+
+- **An invariant is `proven`, `unavailable` or `violated` — never silently absent — and
+  `unavailable` carries its reason** (ruling V-R16). `proven` means the checker **armed** on at
+  least one seed and saw no violation; `seeds_armed` records on how many. `unavailable` with reason
+  `capability(<package>)` means a package the checker needs reported itself unwired at trace start;
+  with reason `not_armed` it means every needed package was wired and the checker never reached the
+  situation its clause quantifies over (a zero-event trace, an unhealed schedule, an exhausted
+  liveness budget, an idle sibling partition). **Both reasons report and never pass.** The campaign
+  binary may still exit 0, but the artifact says `unavailable` with the reason, and the gate fails
+  when `SPIKE_REQUIRE_ALL=1` and any invariant is not `proven`. **`proven` with `seeds_armed == 0`
+  is a gate failure in every run**, whatever `SPIKE_REQUIRE_ALL` says: the runner's fold cannot
+  produce it, so its presence means the runner is wrong. This is the `full_scale: false` mechanic
+  applied to capability and to arming rather than to scale.
+- **`capability{package, state}` is derived from the crate's wiring, never a literal** (ruling
+  V-R18). The dispatcher builds the trace-start capability block from `Module::capability(&self)`
+  over every module (foundation, K-F-10) and emits one event per package from that report. No
+  hand-maintained table: a landed package cannot stay `unavailable` by omission, and an unlanded
+  one cannot be declared `wired` by edit.
 - **Coverage is counted cells, never a percentage.** A named required cell with zero hits fails the
-  run. Spike §7: percentage coverage alone cannot waive a missing invariant.
+  run. Spike §7: percentage coverage alone cannot waive a missing invariant. Required fault
+  boundaries are **scheduled** across the corpus by the generator (seed `i` attempts boundary
+  `i mod N` over foundation's closed `BoundaryId` set; ruling V-R19), so hitting them is a property
+  of the seed list, not of luck; a hook-gated cell whose provider package reports `unavailable` is
+  listed under `unavailable_cells`, not `required_missing`.
+
+#### 2.1 Commands
+
+Three commands, one per purpose (rulings V-R11, V-R17, V-R18). No `scripts/` change is made by
+team verification; wiring the gate into `gate.sh` is a foundation item after F-R11 lands, and until
+then the M7 release gate is run by hand and its artifact is the evidence.
+
+| Purpose | Command | Artifact |
+|---|---|---|
+| Handoff gate: default 64-seed corpus, debug | `CARGO_TARGET_DIR=.rtargets/verification scripts/gate.sh test -p rdb-sim --test oracle --test scenarios --test campaign` | `rdb-m7-campaign.json`, `full_scale: false` |
+| The 1,000-history number: warm release, full configured scale | `RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` | `rdb-m7-campaign-release.json`, `full_scale: true` |
+| **M7 release gate** — the run whose green is the milestone claim in §1 | `SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` | `rdb-m7-campaign-release.json` with every invariant `proven` and `seeds_armed > 0`, or a failure naming the invariant and its reason |
+
+`.rtargets/campaign` is reserved for the release commands (AGENTS.md: never two cargo invocations
+against one target directory). The full configured scale under `RETCD_EVIDENCE=1` is
+`SPIKE_SEEDS=1000 SPIKE_MAX_EVENTS=2000` as checked-in constants; the 10,000-history extended run
+overrides `SPIKE_SEEDS` explicitly and asserts spike §7's 10-minute budget, not the 60 s one.
 
 A failing seed writes `validation/<run-id>/` with the schema-versioned event stream, the original
 and minimized scenario and the failure signature (spike §7). That directory is a reproducer, not
@@ -179,7 +226,28 @@ M7 (filled):
 - An evidence-schema conformance row over `docs/evidence/rdb-*.json` mirroring rEtcd M6-113.
 - A gate-rule row mirroring rEtcd M6-114: reduced scale by default, full on `RETCD_EVIDENCE=1`,
   build fails on `full_scale: false` during an explicit full run.
-- An `SPIKE_REQUIRE_ALL=1` row: any invariant reporting `unavailable` fails the gate.
+- An `SPIKE_REQUIRE_ALL=1` row: any invariant reporting `unavailable` — for either reason — fails
+  the gate, and the failure names the reason.
+- A `seeds_armed` row: over the default corpus, every `proven` invariant has `seeds_armed > 0`; a
+  `proven` status with `seeds_armed == 0` fails the run under every setting of
+  `SPIKE_REQUIRE_ALL` (V-R16).
+- A two-reasons row: a zero-event trace and a trace with `capability{package=P1,
+  state=Unavailable}` yield `unavailable` with reasons `not_armed` and `capability(P1)`
+  respectively, and neither is `proven`.
+- A capability-derivation row: the trace-start `capability` events equal, one for one, the report
+  `Module::capability(&self)` returns over every module; a module whose `step` answers `Ok`
+  reports `wired` and one whose `step` answers `Unavailable` reports `unavailable`, both asserted
+  positively; no literal `CapabilityState::Wired` appears in the harness outside the report
+  builder (V-R18).
+- A two-artifacts row: the debug and release commands in §2.1 write `rdb-m7-campaign.json` and
+  `rdb-m7-campaign-release.json` respectively, both exist after both commands, their `profile`
+  values differ, and only the release one is cited for the 1,000-history figure (V-R17).
+- A release-gate row: the M7 release gate command in §2.1 is the one named in the plan's checklist
+  for "zero violations once kernel packages land", and it fails while any invariant is not
+  `proven` (V-R18).
+- A scheduled-boundary row: for every corpus of at least N seeds, every member of foundation's
+  closed `BoundaryId` set is attempted by the generator, and `required_missing[]` is empty except
+  for cells listed under `unavailable_cells` (V-R19).
 - A degraded-RF2 publication row: a publish under `DEGRADED_RF2` satisfied by fewer acks than the
   pinned `required_copy_set` is a violation (V3's degraded half, spec §8.3).
 - A false-durable row: `StorageOp::FalseDurable` trips INV-PUB's durability-grounding clause
@@ -201,4 +269,7 @@ M8–M13: pending. Each milestone adds its rows and amends its table row in plac
 
 ## Notes
 
-None yet.
+- 2026-09-20, verification correction round 2 (critic T-01, T-12, T-13, T-14; rulings
+  V-R16..V-R19): §2 gained the two `unavailable` reasons and the `seeds_armed` rule, the release
+  artifact `rdb-m7-campaign-release.json`, the capability-derivation rule, the scheduled-boundary
+  rule and §2.1's three commands; §1's budget paragraph now cites §2.1. Status stays Proposed.
