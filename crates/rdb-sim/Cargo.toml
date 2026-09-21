@@ -1,0 +1,23 @@
+[package]
+name = "rdb-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rDB deterministic simulation environment (M7): scheduler, manual clock, controlled network, fake control store, memory storage, trace and replay"
+
+[dependencies]
+rdb-core = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+# The canonical trace and the run manifest are JSON. Both are read by DuckDB in failure triage
+# (team rules), and a binary trace would need its own reader before anyone could debug anything.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# Facade only; the subscriber is installed by `config-log` in test binaries (ADR-0013).
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `#[retcd_test]` expands to `::config_log::testing::test_span(..)`, so both are needed.
+# This is the allowed direction: `rdb-*` may depend on `config-*` (rdb ADR-0002).
+config-log = { workspace = true }
+config-log-macros = { workspace = true }
