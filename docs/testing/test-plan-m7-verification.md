@@ -201,6 +201,24 @@ Tests use `#[retcd_test]` from `config-log-macros`, so JSONL lands under `RETCD_
 Log fields, not sentences. **Never key or value bytes** — a key is a `key_id`, a value is a
 `(value_version, digest)`. The Q-rows in §10 are written against exactly these lines:
 
+> **Held, and owed by verification: none of the eleven lines in this table is emitted yet.**
+> This table is item 2 of `docs/testing/m7-log-fields.md`, verification's debt, and it unblocks
+> **Q-34, Q-38, Q-39 and Q-40**. Measured 2026-09-21 by DuckDB (`map_inference_threshold=-1`)
+> over an 86-file log root from this package's own run: the emitted vocabulary is `capability`
+> 249, `test started` 83, `test finished` 83, and **all eleven `@m` values below return zero
+> lines**. Verification emits no log line of its own.
+>
+> **Blocked on item 1**, foundation's tier-1 `TraceEvent` serialiser. Nine of the eleven are the
+> campaign runner's and the runner is I1-dependent; `invariant_status`, `capability_seen` and
+> `trace_header` are derivable from `Oracle::judge`'s `Report` today and are the first candidates
+> once item 1 lands.
+>
+> **Why this is recorded rather than left implicit.** `invariant_status.seeds_armed` is this
+> plan's own named defence against a vacuous pass — a `proven` row with `seeds_armed = 0` fails
+> the run under Q-34 — and it has no producer. `coverage_shortfall` is the same shape for Q-38.
+> Until both exist, a zero-row result on Q-34 or Q-38..Q-40 is indistinguishable from a clean
+> run, so those four Q-rows are **dark, not green**, and must not be read as passing.
+
 | `@m` | Fields |
 |---|---|
 | `invariant_status` | `checker`, `status` (`proven`/`unavailable`/`violated`), `reason` (`capability` or `not_armed`; null when not `unavailable`), `package` (the `PackageId` when `reason = capability`; null otherwise), `seeds_armed` (the number of seeds whose per-seed verdict was `Proven` — **load-bearing**, V-R16 and V-R20 (6): `proven` with `seeds_armed = 0` is a runner bug and fails the run). **Two surfaces, one meaning (critic T-30, ruling V-R20 (5)):** the log line carries `reason` + `package` as two fields; the artifact (`rdb-m7-campaign*.json`, ADR-rdb-0019 §2) carries the one string `reason: "capability(<package>)"` or `"not_armed"`. Q-34 projects both log fields |
@@ -619,6 +637,12 @@ script.
 
 Numbering continues rEtcd's Q-series (M6 ended at Q-33) because the log directory is shared. Each
 query is what a developer runs **first** when the named rows go red. Fields are VA-7's contract.
+
+> **Q-34 and Q-38..Q-40 return zero rows today, and that is not a clean run.** The lines they read
+> are VA-7's eleven, none of which has a producer yet — see the held note in VA-7 for the
+> measurement and the dependency on foundation's tier-1 serialiser. Q-35..Q-37 read tier-1 trace
+> events and are dark for the same reason. Read a zero-row result from any of these as
+> *unavailable*, never as *passing*.
 
 ### Q-34 — which checker fired, on what, and was anything merely unavailable (any M7V row)
 

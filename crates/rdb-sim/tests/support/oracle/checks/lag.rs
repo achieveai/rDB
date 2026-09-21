@@ -8,6 +8,10 @@
 //! | (b) | `unsafe_age_reset_across_config_version` | the unsafe-age timer never falls across a `config_version` change without a retirement barrier |
 //! | (c) | `admitted_while_paused` | pausing is an **admission** gate (critic F20) |
 //!
+//! Every clause here is about the event's **own** partition. Lag protection never reaches across
+//! partitions; that is the property INV-ISO exists to assert separately, and no clause below
+//! reads a partition other than `event.partition`.
+//!
 //! Clause (a)'s quantifier is **every** member of the pinned set (critic F8). INV-PUB reads the
 //! same `required_copy_set` field with the opposite quantifier — one qualifying member — and the
 //! two readers deliberately share no helper (§4 convention 3): a single `copy_set_satisfied()`
@@ -25,7 +29,7 @@
 //! P1's independent decision. Row M7V-40 is the regression guard, and it asserts a clean verdict
 //! on exactly the shape that clause would have reported.
 
-use rdb_core::contracts::ids::{NodeId, PartitionId, ReplicaRole, Seq};
+use rdb_core::contracts::ids::{NodeId, ReplicaRole, Seq};
 use rdb_core::contracts::trace::{AdmissionOutcome, ProtectionPhase, TraceEvent, TraceKind};
 
 use super::Checker;
@@ -255,11 +259,4 @@ fn render(nodes: &[NodeId]) -> String {
         .map(|node| node.0.to_string())
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// The partition a clause is about is always the event's own: lag protection never reaches
-/// across partitions, which is the property INV-ISO exists to assert separately.
-#[allow(dead_code)]
-fn _partition_is_local(event: &TraceEvent) -> PartitionId {
-    event.partition
 }

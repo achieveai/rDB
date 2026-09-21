@@ -35,6 +35,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::storage::{Batch, Namespace, Write};
 use rdb_core::contracts::time::{ControlTime, Tick};
+use rdb_core::contracts::trace::{ControlOutcomeKind, TraceKind};
 use rdb_core::contracts::txn::TxnRequest;
 use rdb_core::contracts::version::API_VERSION;
 use rdb_sim::harness::environment_capabilities;
@@ -56,6 +57,53 @@ pub const ROOT_DIGEST: Digest = Digest::ROOT;
 pub fn preamble() {
     for (package, state) in environment_capabilities() {
         tracing::info!(?package, ?state, "capability");
+    }
+}
+
+/// Log one `control interaction` line per drained interaction, for Q-63.
+///
+/// Tier 3 of `docs/testing/m7-log-fields.md`: a test-local line, not a trace event, so it keeps
+/// the spelling Q-63 string-matches. Note that `control interaction` here and
+/// `control_interaction` in tier 1 are two different lines — the first is this fixture line, the
+/// second is the serialised [`rdb_core::contracts::trace::TraceKind::ControlInteraction`]. Q-63
+/// reads this one.
+///
+/// `termination` and `gap` are flattened out of
+/// [`ControlOutcomeKind::Terminated`] rather than left inside the debug rendering of `outcome`,
+/// because Q-63 groups by all four and asserts `gap = true` for exactly `RevisionCompacted` and
+/// `ResourceExhaustedResumable`. A `gap` buried in a string cannot be grouped on.
+pub fn log_control_interactions(interactions: &[TraceKind]) {
+    for interaction in interactions {
+        let TraceKind::ControlInteraction { op, outcome, .. } = interaction else {
+            continue;
+        };
+        let (name, termination, gap) = match outcome {
+            ControlOutcomeKind::Terminated { termination, gap } => {
+                ("Terminated", Some(format!("{termination:?}")), Some(*gap))
+            }
+            other => (outcome_name(other), None, None),
+        };
+        tracing::info!(
+            op = ?op,
+            outcome = name,
+            termination = termination.as_deref().unwrap_or(""),
+            gap = gap.unwrap_or(false),
+            "control interaction"
+        );
+    }
+}
+
+/// The bare variant name, so Q-63 can `GROUP BY` it.
+const fn outcome_name(outcome: &ControlOutcomeKind) -> &'static str {
+    match outcome {
+        ControlOutcomeKind::Committed => "Committed",
+        ControlOutcomeKind::Conflict => "Conflict",
+        ControlOutcomeKind::Unknown => "Unknown",
+        ControlOutcomeKind::Unavailable => "Unavailable",
+        ControlOutcomeKind::Found => "Found",
+        ControlOutcomeKind::Absent => "Absent",
+        ControlOutcomeKind::Progress => "Progress",
+        ControlOutcomeKind::Terminated { .. } => "Terminated",
     }
 }
 

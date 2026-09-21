@@ -18,7 +18,8 @@ mod report;
 use std::collections::BTreeSet;
 
 use config_log::retcd_test;
-use rdb_core::contracts::errors::ErrorKind;
+use rdb_core::contracts::errors::{Capability, ErrorKind, RdbError};
+use rdb_core::contracts::event::{Effect, Event, Module, ModuleName, StepCtx};
 use rdb_core::contracts::ids::ReplicaRole;
 use rdb_core::contracts::trace::{
     AckRejectReason, BoundaryId, CapabilityState, PackageId, ProtectionPhase, RecoveryMode,
@@ -243,9 +244,11 @@ fn m7v_82_capability_state_is_derived_from_the_modules_own_report_never_a_litera
     );
 
     // The other direction: a module that overrides `capability()` reports Wired. Without this
-    // half, a report hardwired to `Unavailable` would pass the clause above.
-    assert_eq!(Wired.capability(), CapabilityState::Wired);
-    assert_eq!(Defaulted.capability(), CapabilityState::Unavailable);
+    // half, a report hardwired to `Unavailable` would pass the clause above. Both doubles
+    // implement the real `Module` trait, so `Defaulted` reads the trait's own default rather
+    // than a literal restated here — flipping that default in `rdb-core` turns this red.
+    assert_eq!(Module::capability(&Wired), CapabilityState::Wired);
+    assert_eq!(Module::capability(&Defaulted), CapabilityState::Unavailable);
 
     // The environment packages are derived the same way, and M1 really is wired, so the two
     // directions are both exercised without a stub.
@@ -298,18 +301,43 @@ fn m7v_82_capability_state_is_derived_from_the_modules_own_report_never_a_litera
 }
 
 /// A module that claims to be wired, and one that takes the trait's default.
+///
+/// Both implement the real [`Module`] trait, so `Defaulted::capability` is answered by
+/// `Module::capability`'s own default in `rdb-core` and nothing here restates the value.
+/// Inherent methods returning the literals the row asserts would make that half of M7V-82(a)
+/// unfalsifiable: flipping the default in `rdb-core` must turn `Defaulted`'s assertion red.
 struct Wired;
 struct Defaulted;
 
-impl Wired {
+impl Module for Wired {
+    fn name(&self) -> ModuleName {
+        ModuleName::Authority
+    }
+
     fn capability(&self) -> CapabilityState {
         CapabilityState::Wired
     }
+
+    fn step(&mut self, _ctx: &StepCtx<'_>, _event: &Event) -> Result<Vec<Effect>, RdbError> {
+        Err(RdbError::unavailable(
+            Capability::Authority,
+            "a test double for the capability report; it never steps",
+        ))
+    }
 }
 
-impl Defaulted {
-    const fn capability(&self) -> CapabilityState {
-        CapabilityState::Unavailable
+impl Module for Defaulted {
+    fn name(&self) -> ModuleName {
+        ModuleName::Recovery
+    }
+
+    // `capability()` is deliberately not overridden. That absence is the assertion.
+
+    fn step(&mut self, _ctx: &StepCtx<'_>, _event: &Event) -> Result<Vec<Effect>, RdbError> {
+        Err(RdbError::unavailable(
+            Capability::Recovery,
+            "a test double for the capability report; it never steps",
+        ))
     }
 }
 

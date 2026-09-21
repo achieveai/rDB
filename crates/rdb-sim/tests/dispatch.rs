@@ -16,25 +16,64 @@ use bytes::Bytes;
 use config_log::retcd_test;
 use config_log::testing::test_log_dir;
 use rdb_core::contracts::control::{ControlEffect, ControlEvent, ControlKey};
-use rdb_core::contracts::event::{Budgets, Effect, EffectKind, EventKind, ModuleName};
+use rdb_core::contracts::errors::ErrorKind;
+use rdb_core::contracts::event::{
+    Budgets, Effect, EffectKind, EventKind, KernelEffect, ModuleName,
+};
 use rdb_core::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, ReplicaRole,
-    ScenarioId,
+    BootId, ConfigVersion, CorrelationId, Generation, MessageId, NodeId, OwnerEpoch, PartitionId,
+    ReplicaRole, ScenarioId, SnapshotHandle, TimerId, TimerVersion,
 };
-use rdb_core::contracts::time::Tick;
+use rdb_core::contracts::storage::StoreEffect;
+use rdb_core::contracts::time::{Tick, TimerEffect};
 use rdb_core::contracts::trace::{
-    BudgetName, CapabilityState, PackageId, Provenance, TopologyEntry, TraceHeader, TraceKind,
+    BudgetName, CapabilityState, PackageId, Provenance, RunManifest, TopologyEntry, Trace,
+    TraceHeader, TraceKind,
 };
+use rdb_core::contracts::transport::{Frame, SendEffect};
 use rdb_core::contracts::version::TRACE_SCHEMA_VERSION;
 use rdb_sim::harness::dispatch::{Adopted, Dispatcher, HOP_BUDGET_MILLIS};
 use rdb_sim::harness::manifest::{resolve, BudgetOverride};
+use rdb_sim::harness::replay::replay;
 use rdb_sim::harness::trace::{read_jsonl, write_jsonl, Recorder, Site};
+use rdb_sim::sim::cluster::Cluster;
 use rdb_sim::sim::control::{ControlOp, ControlStore};
+use rdb_sim::sim::network::Network;
 use rdb_sim::sim::scheduler::Scheduler;
 use rdb_sim::SimError;
 
 const NODE: NodeId = NodeId(1);
 const BOOT: BootId = BootId(1);
+
+/// Q-62's line: one per manifest resolved (`docs/testing/m7-log-fields.md`, tier 3).
+///
+/// `overridden` is logged as JSON rather than as a count, because Q-62 asserts it is `[]` for
+/// the defaults case and exactly `["PauseAge"]` for the one-override case — a count of 1 is true
+/// of every single override and would pass on the wrong budget. `tracing` renders anything
+/// composite through `Debug`, which would give `[PauseAge]`, so the JSON is built here.
+fn log_manifest(manifest: &RunManifest) {
+    let overridden = serde_json::to_string(&manifest.overridden).expect("budget names serialise");
+    tracing::info!(
+        overridden = %overridden,
+        nodes = manifest.nodes,
+        event_cap = manifest.event_cap,
+        "m7f_19 manifest"
+    );
+}
+
+/// Q-64's line: the tick an effect was emitted at and the tick its completion landed on.
+///
+/// Both ticks, not the difference: Q-64 computes `completion_tick - emitted_tick` itself and
+/// asserts it is exactly 0 or exactly [`HOP_BUDGET_MILLIS`], never 49 or 51. Logging a
+/// pre-computed hop would let a wrong pair of ticks produce a right difference.
+fn log_hop(emitted: Tick, completion: Tick) {
+    tracing::info!(
+        emitted_tick = emitted.0,
+        completion_tick = completion.0,
+        hop_budget_millis = HOP_BUDGET_MILLIS,
+        "m7f_21 hop"
+    );
+}
 
 fn adopt(partition: u32, generation: u64, owner_epoch: u64, config_version: u64) -> Effect {
     Effect {
@@ -246,6 +285,7 @@ fn m7f_19_the_manifest_lists_exactly_the_overridden_budgets() {
     let cluster = support::cluster();
 
     let defaults = resolve(&cluster, 500, &[]).expect("defaults");
+    log_manifest(&defaults);
     assert_eq!(defaults.budgets, Budgets::SPEC_DEFAULTS);
     assert!(defaults.overridden.is_empty());
     assert_eq!(defaults.nodes, 4);
@@ -260,7 +300,7 @@ fn m7f_19_the_manifest_lists_exactly_the_overridden_budgets() {
         }],
     )
     .expect("one override");
-    tracing::info!(overridden = one.overridden.len(), "m7f_19");
+    log_manifest(&one);
     assert_eq!(one.overridden, vec![BudgetName::PauseAge]);
     assert_eq!(one.budgets.pause_age_millis, 9_999);
     let mut expected = Budgets::SPEC_DEFAULTS;
@@ -332,6 +372,7 @@ fn m7f_21_the_effect_to_event_hop_costs_zero_ticks_and_a_delay_costs_exactly_the
         .deliver(NODE, BOOT, vec![create(1)], &mut control, &mut scheduler)
         .expect("deliver");
     let completion = scheduler.pop().expect("the completion is queued");
+    log_hop(t, completion.at);
     assert_eq!(completion.at, t, "zero-tick hop");
     assert_eq!(completion.node, NODE);
     assert_eq!(completion.boot, BOOT);
@@ -354,12 +395,7 @@ fn m7f_21_the_effect_to_event_hop_costs_zero_ticks_and_a_delay_costs_exactly_the
         .deliver(NODE, BOOT, vec![create(2)], &mut control, &mut scheduler)
         .expect("deliver again");
     let delayed = scheduler.pop().expect("the delayed completion is queued");
-    tracing::info!(
-        t = t.0,
-        delayed_at = delayed.at.0,
-        hop_budget_millis = HOP_BUDGET_MILLIS,
-        "m7f_21"
-    );
+    log_hop(t, delayed.at);
     assert_eq!(delayed.at, t.plus_millis(HOP_BUDGET_MILLIS));
     assert_eq!(delayed.correlation, CorrelationId(2));
     assert_eq!(scheduler.now(), delayed.at, "time jumped to the deadline");
@@ -405,4 +441,125 @@ fn m7f_21_an_unwired_provider_is_refused_by_name_after_earlier_effects_land() {
         Generation(1),
         "the adoption before the refused effect was carried out"
     );
+    tracing::info!(seam = "harness::dispatch::deliver::timer", "m7f_21 seam");
+}
+
+/// M7F-26: every unbuilt seam refuses by its own name, and logs that name.
+///
+/// Two claims in one row. The assertion half is that nothing is owed silently: each seam returns
+/// [`SimError::Unavailable`] carrying the string a reader can grep for, rather than a bare error
+/// or a fake success. The log half is Q-61's only source — it asserts the **set** of distinct
+/// `seam` values, so a seam with no row fails it and a row that stopped asserting its seam fails
+/// it too.
+///
+/// Before this row existed the `seam` field appeared on no line anywhere, so Q-61 was not
+/// returning zero rows — it was a binder error on a column that had no source.
+#[retcd_test]
+fn m7f_26_every_unbuilt_seam_refuses_by_its_own_name() {
+    support::preamble();
+    let mut seams: Vec<&'static str> = Vec::new();
+
+    // I1: replay is owed.
+    let trace = Trace {
+        header: header(Provenance::Generated { seed: 1 }),
+        events: Vec::new(),
+    };
+    seams.push(seam_of(replay(&trace).map(|_| ())));
+
+    // H1: the network and the cluster lifecycle are owed.
+    let mut network = Network::new();
+    seams.push(seam_of(
+        network.send(NodeId(1), NodeId(2), frame()).map(|_| ()),
+    ));
+    let mut cluster = Cluster::new(support::cluster()).expect("a four-node cluster");
+    seams.push(seam_of(cluster.suspend(NodeId(1), 10)));
+
+    // I1: the four effect kinds the dispatcher has no provider for.
+    for effect in [
+        EffectKind::Send(send_effect()),
+        EffectKind::Store(store_effect()),
+        EffectKind::Timer(timer_effect()),
+        EffectKind::Kernel(KernelEffect::Ignored {
+            reason: ErrorKind::Unavailable,
+        }),
+    ] {
+        let mut dispatcher = Dispatcher::new();
+        let mut control = ControlStore::new();
+        let mut scheduler = Scheduler::new();
+        let refused = dispatcher.deliver(
+            NODE,
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(1),
+                from: ModuleName::Authority,
+                partition: PartitionId(1),
+                kind: effect,
+            }],
+            &mut control,
+            &mut scheduler,
+        );
+        seams.push(seam_of(refused));
+        assert_eq!(scheduler.queued(), 0, "a refused effect queues nothing");
+    }
+
+    for seam in &seams {
+        tracing::info!(seam, "m7f_26 seam");
+    }
+
+    let mut distinct = seams.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct,
+        [
+            "harness::dispatch::deliver::kernel",
+            "harness::dispatch::deliver::send",
+            "harness::dispatch::deliver::store",
+            "harness::dispatch::deliver::timer",
+            "harness::replay::replay",
+            "sim::cluster::Cluster::suspend",
+            "sim::network::Network::send",
+        ],
+        "the seam vocabulary Q-61 pins, sorted"
+    );
+}
+
+/// One frame to nobody in particular. The body is empty: a seam row proves the refusal, and a
+/// payload would be a payload in a test that has no use for one.
+fn frame() -> Frame {
+    Frame {
+        id: MessageId(1),
+        protocol: 1,
+        config: ConfigVersion(1),
+        body: bytes::Bytes::new(),
+    }
+}
+
+fn send_effect() -> SendEffect {
+    SendEffect::Unicast {
+        to: NodeId(2),
+        frame: frame(),
+    }
+}
+
+fn store_effect() -> StoreEffect {
+    StoreEffect::Release {
+        handle: SnapshotHandle(1),
+    }
+}
+
+const fn timer_effect() -> TimerEffect {
+    TimerEffect::Cancel {
+        id: TimerId(1),
+        version: TimerVersion(1),
+    }
+}
+
+/// The seam an owed call refused with. Fails the row on a call that unexpectedly succeeded,
+/// because a seam that quietly started working is how a row stops testing anything.
+fn seam_of(result: Result<(), SimError>) -> &'static str {
+    match result.expect_err("an unbuilt seam must refuse") {
+        SimError::Unavailable { seam } => seam,
+        other => panic!("an unbuilt seam must refuse as Unavailable, got {other:?}"),
+    }
 }

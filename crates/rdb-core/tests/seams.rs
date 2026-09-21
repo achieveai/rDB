@@ -8,12 +8,20 @@
 //! | M7F-17 | `required_regular` counts two on RF3 and zero on a lone survivor; `primary` is the one primary (K-F-23) |
 //! | B-R30 | `PartitionConfig.min_regular_acks` defaults to 1; zero is refused at construction; two is accepted |
 //! | K-F-39 | Deserialising a `PartitionConfig` refuses a zero `min_regular_acks` and accepts a valid one |
+//! | M7F-53 | CB-1: `EventKind::Kernel` / `EffectKind::Kernel` are one carrier pair, and an exhaustive match over either names it |
+//! | M7F-54 | CB-4: `AppendOutcome` is one enum over the accepted, the three non-reject outcomes and the reject ladder |
+//! | M7F-55 | CB-2: `AppendReject::NeedPrefix` carries `head_digest` beside `have`, so the cursor can prove divergence |
+//! | M7F-56 | CB-3: `AckRejectReason` carries the landed seven plus kernel-b's seven |
 
 use config_log::retcd_test;
-use rdb_core::contracts::errors::RdbError;
-use rdb_core::contracts::ids::{BootId, ConfigVersion, NodeId, PartitionId, ReplicaRole};
+use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::envelope::{AppendOutcome, AppendReject};
+use rdb_core::contracts::errors::{ErrorKind, RdbError};
+use rdb_core::contracts::event::{EffectKind, EventKind, KernelEffect, KernelEvent};
+use rdb_core::contracts::ids::{BootId, ConfigVersion, NodeId, PartitionId, ReplicaRole, Seq};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::time::{ClockVerdict, ControlTime, Tick};
+use rdb_core::contracts::trace::AckRejectReason;
 use rdb_core::contracts::transport::PeerLabel;
 
 const fn member(copy: u8, node: u32, boot: u64, role: ReplicaRole) -> Member {
@@ -235,4 +243,183 @@ fn k_f_39_a_valid_threshold_deserialises() {
     assert_eq!(decoded, two, "a valid configuration round-trips unchanged");
     assert_eq!(decoded.validate(), Ok(()));
     tracing::info!(min_regular_acks = decoded.min_regular_acks, "k_f_39");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The round-2 contract asks: CB-1 … CB-4 (kernel-b `architect-handoff.md` §15)
+// ---------------------------------------------------------------------------------------------
+
+/// M7F-53 (CB-1): the kernel carrier pair, on both enums, matched exhaustively.
+///
+/// Kernel-b's §15 calls CB-1 and CB-4 "one shape decision". The shape chosen for both is the one
+/// `AppendReject` already uses: **one carrier variant holding an enum the consuming team owns**,
+/// rather than a flat variant per kernel fact. A flat spelling would put ~130 kernel-b rows'
+/// worth of variants in foundation's file and make every addition a foundation edit.
+///
+/// Both matches are exhaustive with **no `_` arm**. A wildcard would compile forever and stop
+/// catching the next variant silently, which is the whole failure this row exists for.
+#[retcd_test]
+fn m7f_53_the_kernel_carrier_pair_is_one_variant_on_each_enum() {
+    let event = EventKind::Kernel(KernelEvent::PeerProgress {
+        peer: NodeId(2),
+        contiguous_seq: Seq(9),
+    });
+    let effect = EffectKind::Kernel(KernelEffect::Ignored {
+        reason: ErrorKind::Unavailable,
+    });
+
+    let event_named = match &event {
+        EventKind::Client(_) => "client",
+        EventKind::Node(_) => "node",
+        EventKind::Transport(_) => "transport",
+        EventKind::Storage(_) => "storage",
+        EventKind::Control(_) => "control",
+        EventKind::Timer(_) => "timer",
+        EventKind::ExternalFenceVerified { .. } => "external_fence_verified",
+        EventKind::Kernel(_) => "kernel",
+    };
+    let effect_named = match &effect {
+        EffectKind::Send(_) => "send",
+        EffectKind::Store(_) => "store",
+        EffectKind::Control(_) => "control",
+        EffectKind::Timer(_) => "timer",
+        EffectKind::Reply(_) => "reply",
+        EffectKind::AdoptAuthority { .. } => "adopt_authority",
+        EffectKind::Kernel(_) => "kernel",
+    };
+
+    assert_eq!(event_named, "kernel");
+    assert_eq!(effect_named, "kernel");
+
+    // The carried enums are kernel-b's to grow, so a consumer's match must stay open. This is
+    // the machine-readable half of "variants owned by kernel-b".
+    let reason = match &effect {
+        EffectKind::Kernel(KernelEffect::Ignored { reason }) => Some(*reason),
+        _ => None,
+    };
+    assert_eq!(reason, Some(ErrorKind::Unavailable));
+    tracing::info!(event_named, effect_named, "m7f_53 carrier pair");
+}
+
+/// M7F-54 (CB-4): `AppendOutcome` is **one enum**, not `Result<Accepted, AppendReject>`.
+///
+/// The ask asked foundation to state which. One enum, because the three non-reject outcomes are
+/// neither an acceptance nor a refusal: a `Result` would have to nest a second enum inside `Ok`
+/// to carry them, and the cursor would then match twice to answer one question. One enum keeps
+/// the cursor's match total over the whole ladder, which is the discipline `AppendReject`'s
+/// sixteen variants already have.
+#[retcd_test]
+fn m7f_54_append_outcome_is_one_enum_over_the_whole_ladder() {
+    let busy = AppendOutcome::Busy {
+        accepted_through: Seq(7),
+    };
+    let already = AppendOutcome::AlreadyHave;
+    let probe = AppendOutcome::ProbeDigestAt { seq: Seq(9) };
+    let rejected = AppendOutcome::Rejected(AppendReject::Quarantined);
+
+    // Exhaustive, no `_` arm: a sixth outcome has to be read here before it can be ignored.
+    let name = |outcome: &AppendOutcome| match outcome {
+        AppendOutcome::Accepted(_) => "accepted",
+        AppendOutcome::Busy { .. } => "busy",
+        AppendOutcome::AlreadyHave => "already_have",
+        AppendOutcome::ProbeDigestAt { .. } => "probe_digest_at",
+        AppendOutcome::Rejected(_) => "rejected",
+    };
+
+    assert_eq!(name(&busy), "busy");
+    assert_eq!(name(&already), "already_have");
+    assert_eq!(name(&probe), "probe_digest_at");
+    assert_eq!(name(&rejected), "rejected");
+
+    // The three drive the cursor: re-send from `accepted_through`, advance, answer a probe.
+    assert!(matches!(
+        busy,
+        AppendOutcome::Busy {
+            accepted_through: Seq(7)
+        }
+    ));
+    assert!(matches!(
+        probe,
+        AppendOutcome::ProbeDigestAt { seq: Seq(9) }
+    ));
+    tracing::info!(outcomes = 5, "m7f_54 append outcome");
+}
+
+/// M7F-55 (CB-2): `NeedPrefix` carries the head digest beside the sequence.
+///
+/// With `have` alone the cursor knows where to resume and cannot tell "you are behind" from
+/// "your history and mine disagree" — the one-writer path (K-B-52) loses one of its two inputs.
+/// So two rejects at the same `have` with different digests must not compare equal; that
+/// inequality is the whole content of the field.
+#[retcd_test]
+fn m7f_55_need_prefix_carries_the_head_digest_beside_have() {
+    let behind = AppendReject::NeedPrefix {
+        have: Seq(4),
+        head_digest: Digest::ROOT,
+    };
+    let diverged = AppendReject::NeedPrefix {
+        have: Seq(4),
+        head_digest: Digest([7; 32]),
+    };
+
+    assert_ne!(
+        behind, diverged,
+        "same position, different history: the digest is what tells them apart"
+    );
+    let AppendReject::NeedPrefix { have, head_digest } = behind else {
+        panic!("NeedPrefix carries both fields");
+    };
+    assert_eq!(have, Seq(4));
+    assert_eq!(head_digest, Digest::ROOT);
+    tracing::info!(have = have.0, "m7f_55 need prefix");
+}
+
+/// M7F-56 (CB-3): `AckRejectReason` carries the landed seven plus kernel-b's seven.
+///
+/// §3.4's ladder has eleven drop reasons and the landed enum carried seven of them, none of
+/// which was one of the seven asked for. Without the widening a row cannot tell "dropped
+/// because diverged" from "dropped because stale", which is the entire content of kernel-b's
+/// rows 1d and 9.
+///
+/// Asserted against a literal list rather than a count. A count passes when a variant is
+/// renamed, and renaming one is exactly how an oracle stops seeing a reason it used to fold.
+#[retcd_test]
+fn m7f_56_ack_reject_reason_carries_fourteen_named_reasons() {
+    let all = [
+        AckRejectReason::Gap,
+        AckRejectReason::DigestMismatch,
+        AckRejectReason::StaleEpoch,
+        AckRejectReason::StaleBoot,
+        AckRejectReason::StaleConfig,
+        AckRejectReason::ForgedIdentity,
+        AckRejectReason::IncompatibleVersion,
+        AckRejectReason::StaleGeneration,
+        AckRejectReason::RoleMismatch,
+        AckRejectReason::InconsistentProgress,
+        AckRejectReason::RegressedProgress,
+        AckRejectReason::Unverifiable,
+        AckRejectReason::Diverged,
+        AckRejectReason::NotAMember,
+    ];
+
+    let mut names: Vec<String> = all
+        .iter()
+        .map(|reason| {
+            serde_json::to_value(reason)
+                .expect("serialises")
+                .to_string()
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), 14, "fourteen distinct reasons, no alias");
+
+    // `StaleGeneration` and `NotAMember` are also `AppendReject` variants. Same words, different
+    // enum, different meaning: one is why a replica refused an append, the other why the
+    // primary would not count an acknowledgement. Kept deliberately, not by accident.
+    assert_ne!(
+        serde_json::to_value(AckRejectReason::NotAMember).expect("serialises"),
+        serde_json::to_value(AckRejectReason::Diverged).expect("serialises"),
+    );
+    tracing::info!(reasons = names.len(), "m7f_56 ack reject reason");
 }

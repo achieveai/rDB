@@ -10,6 +10,10 @@
 //!   `boot` (critic F9 — a host crash may discard every unflushed suffix, so a returning
 //!   buffered-only holder is *not* evidence the data survived).
 //!
+//! A **holder** throughout is a `(node, boot)` pair, never a bare node. Two acknowledgements
+//! from one node across a restart are two boots and one copy (K-F-22), which is what makes
+//! clause (b)'s "returned under a different `boot`" checkable at all.
+//!
 //! Loss **at or below** the declared cutoff is never permitted: the cutoff is exactly the
 //! promise about what survives. Loss above it is the declared truncated suffix and is expected.
 //!
@@ -19,7 +23,7 @@
 
 use std::collections::BTreeMap;
 
-use rdb_core::contracts::ids::{BootId, NodeId, Seq};
+use rdb_core::contracts::ids::Seq;
 use rdb_core::contracts::trace::{DurabilityClass, QueriedSource, TraceEvent, TraceKind, Version};
 
 use super::Checker;
@@ -152,8 +156,3 @@ fn first_regression(
             .map(|(published, seq)| (*key, *published, *seq))
     })
 }
-
-/// Named for the doc comment above: a holder is a `(node, boot)` pair, never a bare node.
-/// Two acknowledgements from one node across a restart are two boots and one copy (K-F-22).
-#[allow(dead_code)]
-type Holder = (NodeId, BootId);

@@ -389,6 +389,62 @@ verification plan's §12 still lists `M7V-46`'s header half under "C0 + `provena
 
 ---
 
+### 10.4 The round-2 rows — `M7F-50` … `M7F-56`
+
+The ids §14 and §18 Q-7 promised: "when r2 lands the rest take the next free ids, beginning
+immediately after this plan's last row". The last row was `M7F-49`.
+
+`M7F-50` … `M7F-52` are the **tier-1 serialiser** (`crates/rdb-sim/tests/harness.rs`), which is
+the row-level form of `docs/testing/m7-log-fields.md` tier 1. `M7F-53` … `M7F-56` are the four
+contract asks **CB-1** … **CB-4** (`crates/rdb-core/tests/seams.rs`), written so kernel-b's
+`Q-46`/`Q-47` can be written against them.
+
+| Id | Test | Proves | Fixture | Assertion | Class | Dependency |
+|---|---|---|---|---|---|---|
+| M7F-50 | `m7f_50_one_trace_event_becomes_one_flattened_jsonl_line` **landed** | tier 1 of `m7-log-fields.md`: one `TraceEvent` is one JSONL line, and its variant fields are **top-level**, not nested under a wrapper | a `TraceKind::TopologyChange` in a full envelope | `@m` is the snake-cased variant name, `@l` is `Information`, all six envelope fields (`event_id`, `logical_tick`, `partition`, `node`, `boot`, `correlation`) are present, `config_version` is top-level, and **no** `kind` or `TopologyChange` key exists. The last clause is the one that fails if the serialiser ever reverts to serde's external tagging, which would bind as one nested column and make every tier-1 Q-row address it by path | unit | none |
+| M7F-51 | `m7f_51_tuple_and_struct_fields_keep_their_json_shape` **landed** | why the serialiser is not a `tracing::info!`: `tracing` renders any composite through `Debug`, giving a **string** | a `TopologyChange` carrying `Vec<(NodeId, ReplicaRole)>` and a `Publish` carrying `Vec<AckEvidence>` | `nodes` is a list of two-element lists and `ack_evidence` is a list of structs — so DuckDB indexes `nodes[1][2]` and `ack_evidence[1].durability`. Against a `Debug` rendering both are one opaque varchar and every field-level assertion becomes a substring match | unit | none |
+| M7F-52 | `m7f_52_serialised_lines_land_in_a_tagged_file_under_the_test_log_root` **landed** | the lines are reachable by the same glob the Q-rows use, and carry the test context DuckDB groups by | two events written through `write_log_jsonl` | the file holds exactly 2 lines and **no header line**; each carries its `@m`, and `testModule`, `testMethod`, `testRun`, `application`; and no line carries `key`, `value`, `payload` or `key_bytes`. The last clause is `Q-60` as a row — and it nearly fired for real: verification's scenario grammar had a field named `payload`, which would have reached tier 2 and tripped this assertion. That is the row working; verification renamed the field to `digest_id` | unit | none |
+| M7F-53 | `m7f_53_the_kernel_carrier_pair_is_one_variant_on_each_enum` **landed** | **CB-1**: `EventKind::Kernel(KernelEvent)` and `EffectKind::Kernel(KernelEffect)` | one value of each enum | both matched **exhaustively with no `_` arm**, so an eighth `EventKind` fails to compile rather than passing silently (the §15 `ExternalFenceVerified` lesson). The carried enum is matched **openly**, because it is `#[non_exhaustive]`: foundation owns the carrier, kernel-b owns the variants, and the attribute is the machine-readable form of that split | unit | none |
+| M7F-54 | `m7f_54_append_outcome_is_one_enum_over_the_whole_ladder` **landed** | **CB-4**: `AppendOutcome` is one enum — `Accepted`, `Busy`, `AlreadyHave`, `ProbeDigestAt`, `Rejected` — not `Result<AppendAck, AppendReject>` | one value of each of the five arms | a closure matching all five exhaustively. The shape decision is the assertion: a `Result` would nest a second enum inside `Ok` and make the cursor match twice to learn one fact. kernel-b's §15 calls CB-1 and CB-4 one shape decision; this row and `M7F-53` are that decision spelled the same way twice | unit | none |
+| M7F-55 | `m7f_55_need_prefix_carries_the_head_digest_beside_have` **landed** | **CB-2**: `AppendReject::NeedPrefix { have, head_digest }` (B-R30 Q2 as amended by B-R33 Q-B-4) | two `NeedPrefix` at the **same** `have`, differing only in `head_digest` | the two values differ. With `have` alone the cursor cannot tell "you are behind" from "your history and mine disagree", and `K-B-52` loses one of its two inputs. The equal `have` is what makes the digest the only thing under test | unit | none |
+| M7F-56 | `m7f_56_ack_reject_reason_carries_fourteen_named_reasons` **landed** | **CB-3**: `AckRejectReason` widened from seven to fourteen | all fourteen variants serialised | the sorted, de-duplicated set of names equals a **literal fourteen-name list**, not a count. A count of 14 passes against any fourteen names, including a rename; the list is what makes a rename a failure. Consequence outside this plan: verification's `M7V-56` set-equality row goes red until seven coverage cells are added on their side — see §10.5 | unit | none |
+
+### 10.5 Conflict 2, and the authority carrier gap — two C0 decisions
+
+**Conflict 2 — `AckRejectReason` widened, `M7V-56` goes red. Decided, not escalated.**
+`M7V-56` enumerates required coverage cells from the enum itself, so widening the enum by seven
+makes it demand seven cells nobody has written. That is **the row working**, not a conflict: it is
+designed to fail on an un-celled widening, and a widening that did not trip it would mean the row
+never checked anything. The cost is seven coverage cells in verification's own file. Those are
+verification's edit and are **not** made here.
+
+**The authority carrier gap — `Decide`, `Fence`, `PublishAuthorityView`, `EventKind::Check`.**
+kernel-a reported all four missing and asked for three new `EffectKind` variants. **Ruling: no
+widening. All four map onto landed surfaces**, so the answer is a documented mapping.
+
+| Asked for | Where it already lives | Why a new variant would be worse |
+|---|---|---|
+| `Fence { scope, reason }` | `ControlEffect::Cas { key, expected, value }` on `ControlKey::Partition` (which holds "owner, owner epoch, generation") or `ControlKey::Grant` (which holds "authority generation, allowed boot UUID, expiry"). `authority.rs:130 fn control` already wraps it | a fence **is** the CAS — bump the epoch and the prior owner's own CAS fails on `expected`. A `Fence` effect beside it would be a *notification* of a fence, leaving the actual fencing to something else and creating two places that claim to fence. `scope` is which `ControlKey` is CAS'd; `reason` is `AuthorityOutcome::Fenced` on the trace |
+| `PublishAuthorityView` | the same CAS; consumers learn it through `ControlEffect::Watch` / `Reload` on `ControlPrefix::Partitions`, which `Authority::on_watched` turns into a linearizable `Get` per change | it would be a **second path** by which a kernel learns authority, bypassing the read-after-watch rule that `on_watched` exists to enforce — "a watch event never widens rights", `design.md` §2.4 property 3. Refusing it protects an invariant |
+| `Decide` | `TraceKind::AuthorityDecision` (`trace.rs:790`), carrying `gate: AuthorityGate`, `outcome: AuthorityOutcome`, `owner_node`, `owner_epoch`, `grant`, `grant_boot`, `generation`, `authority_seq` and three ticks | a decision is a state transition plus an observation, not an effect on the world. The observation surface is complete: `AuthorityGate` names exactly spec §5.2's four revalidation points and `AuthorityOutcome` carries `Valid`/`Expired`/`Fenced`/`Uncertain` |
+| `EventKind::Check` | nothing, deliberately | `AuthorityGate` enumerates four points **in a code path**, not four deliverable events. An `EventKind::Check` would invent an arrival for a function call, and would let a row drive a gate without traversing the path that gate protects — a row that passes without exercising the thing it names |
+
+So the premise in `Authority::capability()` — "the four authority gates … cannot be expressed
+against the landed `EffectKind` at all" — is **false**, and it is the comment that produced the
+ask. That comment is in `crates/rdb-core/src/authority.rs`, which is kernel-a's file; this plan
+records the mapping and does not edit it.
+
+Two notes on the ask itself. The lead's message proposed filing any residual gap as **CB-5**;
+`CB-5` is already taken, by `BlockReason` widened with `NoEligibleRegular`, `ControlUnavailable`
+and `ControlUnknown` under ruling B-R34 (§14, and `M7F-38` arm 2 is held on it). A duplicate ask
+id is the kind of drift this milestone has already been bitten by, so if a residual gap is ever
+found it takes **CB-6**. And one correction to the report that prompted this: `AuthorityDecision`
+is **not** unconsumed — verification's oracle reads it in `tests/support/oracle/checks/authority.rs`,
+`oracle/model.rs`, `scenarios/mutate.rs` and `tests/oracle.rs`. `AuthorityView` and `DenyReason`
+genuinely have no consumer outside `contracts/authority.rs`, `src/authority.rs` and `lib.rs`.
+
+---
+
 ## 11. The `deps` gate stage, and purity
 
 **ADR-rdb-0002 decision 2** forbids `config-* → rdb-*` **in any dependency kind**, and lead ruling
@@ -422,9 +478,11 @@ variable takes effect.
 | Id | Query | Expected | Rows it serves |
 |---|---|---|---|
 | **Q-58** | `SELECT testModule, testMethod, count(*) FILTER (WHERE "@m" = 'capability') AS caps, count(*) AS lines FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) GROUP BY 1, 2 ORDER BY 1, 2;` | one line per `rdb-sim` test function; `caps = 3` on **every** one of them; `lines >= 3`. A row with `caps = 0` is a row that forgot `support::preamble()`; a row missing from the listing is a row that is not `#[retcd_test]`. This is the K-F-30 evidence, and the restatement of the architect's `Q-F-1` | M7F-22, FA-5, every `rdb-sim` row |
-| **Q-59** | `SELECT testMethod, first, flipped, second, second_after FROM read_json_auto('<target>/test-logs/*/contracts/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_02 chain vector' QUALIFY row_number() OVER (PARTITION BY testMethod ORDER BY "@t" DESC) = 1;` | four **distinct** digest hex values, read out of the log rather than out of an assertion message. Observed at `6893442` and unchanged at `ec610f4`: `f2ef0c89…`, `e5a8fc16…`, `f1c60eac…`, `593437df…` (dev-notes §6, `Q-C0-1`) | M7F-02(a) |
-| **Q-60** | `SELECT testMethod, count(*) AS lines FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) GROUP BY 1 ORDER BY 1;` then, on the same relation, `SELECT * WHERE regexp_matches(CAST(to_json(COLUMNS(*)) AS VARCHAR), '"(key\|value)":\s*"[^"]')` over the non-reserved columns | the first lists the rows that ran; the second returns **nothing**. The team rule is "never a key or a value byte": a key is a length, a value is a length, a digest is hex. Worth running after **every** change to a test file, because a `tracing::info!(?key)` added in debugging is invisible in review and permanent in the log (dev-notes §6, `Q-C0-2`) | FA-5, every row |
-| **Q-61** | `SELECT testMethod, seam, count(*) FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) WHERE seam IS NOT NULL GROUP BY 1, 2 ORDER BY 2;` | one line per `(row, seam)` pair for the owed seams, and the **set of distinct `seam` values equals** `{harness::replay::replay, sim::network::Network::send, sim::cluster::Cluster::suspend, harness::dispatch::deliver::send, harness::dispatch::deliver::store, harness::dispatch::deliver::timer}`. A seam string in the log that is not in that set is a seam with no row; a set member with no line is a row that stopped asserting its seam. This is Q-row half of `M7F-26` clause 2 | M7F-05, M7F-23, M7F-24, M7F-25, M7F-26 |
+| **Q-59** | `SELECT testMethod, first, flipped, second, second_after FROM read_json_auto('<target>/test-logs/*/contracts/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_02 chain vector' QUALIFY row_number() OVER (PARTITION BY testMethod ORDER BY "@t" DESC) = 1;` | four **distinct** digest hex values, read out of the log rather than out of an assertion message. Observed on 2026-09-21 at `ec610f4`: `0d31b22c…`, `df1fbfe5…`, `cf811143…`, `fed0e2e8…` (dev-notes §6, `Q-C0-1`). The four values this row carried until 2026-09-21 — `f2ef0c89…`, `e5a8fc16…`, `f1c60eac…`, `593437df…` — were the **pre-`6893442`** goldens. `git log -S` shows `6893442` both removed `f2ef0c89` from and added `0d31b22c` to `crates/rdb-core/tests/contracts.rs`, under the F-R6 preimage change §15.1 already records; the row text was not re-read when the rebase moved the basis marker to `ec610f4`. `m7f_02_record_digest_chains_prev_digest` has passed against the landed goldens throughout, so **nothing was ever broken** — the recorded expectation was. This is the `drift` stage's blind spot in AGENTS.md, in the wild: moving the marker is one edit, re-reading the table is another, and only the first is checked | M7F-02(a) |
+| **Q-60** | three statements on one relation, built with `union_by_name = true, map_inference_threshold = -1`. **(a)** `SELECT testMethod, count(*) AS lines FROM rel GROUP BY 1 ORDER BY 1;` **(b)** `SELECT count(*) FROM (DESCRIBE rel) WHERE column_name IN ('key','value','payload');` **(c)** `SELECT count(*) AS leak_rows FROM rel WHERE regexp_matches(CAST(to_json(rel) AS VARCHAR), '"(key\|value\|payload)":\s*"[^"]');` | (a) lists the rows that ran; (b) and (c) return **zero**. The team rule is "never a key or a value byte": a key is a length, a value is a length, a digest is hex. Worth running after **every** change to a test file, because a `tracing::info!(?key)` added in debugging is invisible in review and permanent in the log (dev-notes §6, `Q-C0-2`) | FA-5, every row |
+| **Q-60 note 1** | why (b) and (c) are two statements, and why (c) says `to_json(rel)` and not `to_json(COLUMNS(*))` | The form this row carried until 2026-09-21 named the columns directly, so on a **clean** run it failed with `Binder Error: Referenced column "key" not found` — the column exists only once something has leaked, so the query errored in exactly the case it is meant to report as passing, and a green run was indistinguishable from a typo. Found by kernel-a running Q-45, which is the same template. (b) is kernel-a's fix — `DESCRIBE` is a column list, so it binds whether or not the column exists. (c) is additional: `to_json(rel)` renders the whole row, so it binds on any schema and catches a leak **by value**, which a column-name check cannot — a field named `k` holding a key byte passes (b) and fails (c). Both are kept because they fail on different defects. A `0` from either is only meaningful with its positive control: run (c)'s regex against the literal `{"key": "user-key-bytes"}` and watch it return 1 |
+| **Q-60 note 2** | `test started` / `test finished` belong to no tier | `config_log::testing` emits both for every `#[retcd_test]`, at `@logger = 'config_log::testing'` — 146 of each in the 2026-09-21 run, exactly two per test. They are **tier 0, harness lifecycle**: not a trace event, not a fixture line, owned by `config-*` and not by any M7 team. They are in no table in `docs/testing/m7-log-fields.md`, which is the defect; a query that counts "lines per test" includes them and is off by two per row unless it says otherwise. Excluded by `@logger`, never by `@m`. Flagged for the lead: `m7-log-fields.md` is a shared document and this note does not edit it |
+| **Q-61** | `SELECT testMethod, seam, count(*) FROM read_json_auto('<target>/test-logs/*/**/*.jsonl', union_by_name = true) WHERE seam IS NOT NULL GROUP BY 1, 2 ORDER BY 2;` | one line per `(row, seam)` pair for the owed seams, and the **set of distinct `seam` values equals** `{harness::replay::replay, sim::network::Network::send, sim::cluster::Cluster::suspend, harness::dispatch::deliver::send, harness::dispatch::deliver::store, harness::dispatch::deliver::timer, harness::dispatch::deliver::kernel}` — **seven** since 2026-09-21, six before. The seventh arrived with CB-1: `EffectKind::Kernel` is a new arm on the dispatcher's exhaustive match, and it refuses by name rather than being absorbed, because absorbing it would drop a kernel-b effect silently (ruling B-R28). A seam string in the log that is not in that set is a seam with no row; a set member with no line is a row that stopped asserting its seam. This is Q-row half of `M7F-26` clause 2, and `M7F-26` asserts the same seven by value | M7F-05, M7F-23, M7F-24, M7F-25, M7F-26 |
 | **Q-62** | `SELECT testMethod, overridden, nodes, event_cap FROM read_json_auto('<target>/test-logs/*/dispatch/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_19 manifest';` | one line per manifest resolved; `overridden` is `[]` for the defaults case and exactly `["PauseAge"]` for the one-override case. Reading it from the log rather than from the assertion is what makes a campaign report and its trace checkable against each other later | M7F-19 |
 | **Q-63** | `SELECT op, outcome, termination, gap, count(*) FROM read_json_auto('<target>/test-logs/*/control/*.jsonl', union_by_name = true) WHERE "@m" = 'control interaction' GROUP BY 1, 2, 3, 4 ORDER BY 1, 2;` | every completed control effect appears exactly once, with its `ControlOpKind` and `ControlOutcomeKind`; `gap = true` only for `RevisionCompacted` and `ResourceExhaustedResumable`, `gap = false` for `ResourceExhaustedFatal`, `NotLeader` and `Unavailable`. A `FamilyReload` with no matching `Terminated` line above it in the same run is the ADR-rdb-0008 §7 item 4 bug (A-R15) | M7F-10, M7F-12, M7F-20 |
 | **Q-64** | `SELECT testMethod, emitted_tick, completion_tick, completion_tick - emitted_tick AS hop FROM read_json_auto('<target>/test-logs/*/dispatch/*.jsonl', union_by_name = true) WHERE "@m" = 'm7f_21 hop';` | `hop = 0` for every undelayed effect and `hop = 50` for the `DelayCompletion { by_millis: 50 }` case — **exactly**, never 49 or 51. Recorded, not only asserted, because kernel-b's 2,100 ms pause budget is built on `admission_propagation ≤ 50 ms` and a future change to the drain order would move this number before it broke a row | M7F-21 |
@@ -594,15 +652,26 @@ eight I1 rows in §14.
 | §8 owed seams (M7F-23…26; M7F-05 counted in §5) | 4 | 4 | 0 | 4 | 3 | 1 | 0 |
 | §9 I1 trace validator | 6 | 6 | 0 | 6 | 6 | 0 | 0 |
 | §10 cross-team shapes (incl. M7F-48, M7F-49) | 8 | 8 | 3 | 5 | 8 | 0 | 0 |
+| §10.4 round-2 rows (M7F-50 … M7F-56) | 7 | 7 | 7 | 0 | 7 | 0 | 0 |
 | §11 deps gate and purity | 3 | 3 | 2 | 1 | 0 | 0 | 3 |
-| **Total** | **49** | **76** | **53** | **23** | **54** | **19** | **3** |
+| **Total** | **56** | **83** | **60** | **23** | **61** | **19** | **3** |
 | Q-rows (Q-58 … Q-64) | 7 | — | — | — | — | — | — |
 
-Row id set: `M7F-01` … `M7F-49`, contiguous, no duplicates. The **53 landed** are 51 cargo test
+Row id set: `M7F-01` … `M7F-56`, contiguous, no duplicates. The **60 landed** are 58 cargo test
 functions plus the 2 landed gate stages (`M7F-27`, `M7F-28`), which are `script` class and not
-cargo tests. The 51 are the 49 the lead verified green at `6893442` (`contracts` 21, `seams` 4,
-`control` 7, `dispatch` 6, `harness` 5, `storage` 6) plus the 2 that landed at `ec610f4`
-(`seams` 4 → 6), which §15.1 records.
+cargo tests. The 58 are the 49 the lead verified green at `6893442` (`contracts` 21, `seams` 4,
+`control` 7, `dispatch` 6, `harness` 5, `storage` 6), plus the 2 that landed at `ec610f4`
+(`seams` 4 → 6) which §15.1 records, plus the **7 round-2 rows** of §10.4 (`harness` 5 → 8 for
+`M7F-50`…`M7F-52`; `seams` 6 → 10 for `M7F-53`…`M7F-56`).
+
+Round 2 also gave `M7F-26` its test function,
+`m7f_26_every_unbuilt_seam_refuses_by_its_own_name`, which drives all **seven** seams and asserts
+the distinct set by value. It is **not** counted as landed above and `M7F-26` stays owed in §8 and
+`Unavailable` in §14: only its clause (1), the three `deliver` seams refusing by name, is
+assertable today, and clauses (2) and (3) are the completeness check that shrinks as H1 and I1
+land. The function is the row upgraded in place, never a second name, per §14's mechanism — so
+when a seam lands, its line moves from the refusal set to the positive assertion inside this same
+function.
 
 **Commands that prove the counts** (run them from the repository root; expected output in
 brackets):

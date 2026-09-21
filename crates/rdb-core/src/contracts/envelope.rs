@@ -581,10 +581,52 @@ pub enum AppendReject {
     NeedPrefix {
         /// The highest contiguous sequence the replica holds.
         have: Seq,
+        /// The digest at `have`.
+        ///
+        /// Ask CB-2 (lead ruling B-R30 Q2 as amended by B-R33 Q-B-4). With `have` alone the
+        /// cursor knows where to resume and cannot tell "you are behind" from "your history and
+        /// mine disagree": two replicas at the same sequence on different lineages are
+        /// indistinguishable, and the one-writer path (K-B-52) loses one of its two inputs.
+        head_digest: Digest,
     },
     /// §3.2a rows 5R/6R: the recovery append's fence names an epoch or control revision this
     /// replica has already moved past.
     StaleFence,
     /// The sender was not authenticated. Rejected before any state is touched.
     Unauthenticated,
+}
+
+/// Everything a replica can answer an append with (ask CB-4; lead rulings B-R30 Q2 and B-R33,
+/// closing finding K-F-34).
+///
+/// # One enum, not `Result<AppendAck, AppendReject>`
+///
+/// The ask asked foundation to say which, so: **one enum.** The three non-reject outcomes are
+/// neither an acceptance nor a refusal. A `Result` would have to nest a second enum inside `Ok`
+/// to carry them, and the cursor would match twice to answer one question — once on the
+/// `Result`, once on whatever `Ok` held. One enum keeps the cursor's match total over the whole
+/// ladder in one place, which is the discipline [`AppendReject`]'s sixteen variants already have,
+/// and it is the same shape as [`crate::contracts::event::EventKind::Kernel`]: one carrier, the
+/// variants owned by the team that reads them. Kernel-b's §15 calls CB-1 and CB-4 one shape
+/// decision; this is that decision, spelled the same way twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AppendOutcome {
+    /// The append was taken. Carries the acknowledgement the primary counts.
+    Accepted(AppendAck),
+    /// The replica is applying and cannot take more yet. The cursor re-sends from here rather
+    /// than treating a refusal as a failure.
+    Busy {
+        /// The highest sequence the replica has accepted, so the sender resumes from it.
+        accepted_through: Seq,
+    },
+    /// The replica already holds this record, at this digest. Idempotent: the cursor advances
+    /// and nothing is applied twice.
+    AlreadyHave,
+    /// The replica is answering a digest probe rather than an append.
+    ProbeDigestAt {
+        /// The sequence probed.
+        seq: Seq,
+    },
+    /// The validation ladder refused it. The reason is the ladder's first failure.
+    Rejected(AppendReject),
 }

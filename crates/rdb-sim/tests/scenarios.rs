@@ -145,16 +145,22 @@ fn m7v_43_generator_same_seed_and_version_yields_an_identical_scenario() {
         let second = gen::scenario(seed, budget, topology.clone());
         assert_eq!(first, second, "seed {seed} is not deterministic");
 
-        // The environment must not be an input. Pollute it and generate again.
-        std::env::set_var("SPIKE_SEEDS", "9999");
-        std::env::set_var("SPIKE_SHRINK_STEPS", "1");
-        let third = gen::scenario(seed, budget, topology.clone());
+        // Serialised too, because the D4 fixture compares scenarios as JSON and a field that
+        // round-trips unstably would be a difference this row cannot see.
         assert_eq!(
             serde_json::to_string(&first).unwrap(),
-            serde_json::to_string(&third).unwrap(),
-            "seed {seed} changed after the environment changed"
+            serde_json::to_string(&second).unwrap(),
+            "seed {seed} does not serialise stably"
         );
     }
+
+    // The environment must not be an input. This row used to prove that by calling
+    // `std::env::set_var` and generating again — which anti-flake rule 6 forbids, and rightly:
+    // cargo runs these functions on parallel threads of one process, so mutating the process
+    // environment races every other thread's reads. It is `unsafe` in edition 2024 for that
+    // reason. The claim is carried by the source half below instead, which is the stronger
+    // statement anyway: the behavioural version could only falsify the two names it happened to
+    // set, while the grep falsifies **any** environment read.
 
     // The source half: no `std::env` read inside the generator (M7V-01's mechanism).
     let source = std::fs::read_to_string(

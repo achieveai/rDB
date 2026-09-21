@@ -239,6 +239,15 @@ impl Dispatcher {
                 EffectKind::Timer(_) => {
                     return Err(SimError::unavailable("harness::dispatch::deliver::timer"));
                 }
+                // A kernel-to-kernel fact (ask CB-1). Like `AdoptAuthority` it asks the
+                // environment for nothing — but unlike it, the environment is not its consumer:
+                // another module is, and no module is wired. Refused by name rather than
+                // absorbed, because absorbing it would drop a kernel-b effect silently
+                // (ruling B-R28) and every row asserting one would pass on a dispatcher that
+                // never delivered it.
+                EffectKind::Kernel(_) => {
+                    return Err(SimError::unavailable("harness::dispatch::deliver::kernel"));
+                }
             }
         }
         self.pump(control, scheduler)

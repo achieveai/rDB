@@ -129,8 +129,10 @@ pub enum ClientOp {
         client: ClientId,
         /// The request identity.
         request: RequestId,
-        /// The payload identity. A retry with a different one is `ChangedDigest`.
-        payload: u64,
+        /// The request body's identity — an abstract id, never bytes. A retry carrying a
+        /// different one is `ChangedDigest`. Named `digest_id` rather than `payload` because
+        /// `Scenario` derives `Serialize` and VA-7 forbids a log field called `payload`.
+        digest_id: u64,
         /// The affinity group. A foreign one is `CROSS_AFFINITY`.
         affinity: u64,
         /// The generation the caller expects. A stale one is `OldGeneration`.
@@ -167,8 +169,9 @@ pub enum ClientOp {
         client: ClientId,
         /// The request.
         request: RequestId,
-        /// The payload identity. Different from the original is `ChangedDigest`.
-        payload: u64,
+        /// The request body's identity — an abstract id, never bytes. Different from the
+        /// original is `ChangedDigest`. See `ClientSubmit::digest_id` on the name.
+        digest_id: u64,
     },
     /// Lose the success reply after publication. Never retracts the publication (spec §5.3).
     DropReply {

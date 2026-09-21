@@ -28,11 +28,12 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::authority::EvidenceRef;
 use crate::contracts::control::{ControlEffect, ControlEvent};
 use crate::contracts::digest::Digest;
-use crate::contracts::errors::{Capability, RdbError};
+use crate::contracts::errors::{Capability, ErrorKind, RdbError};
 use crate::contracts::ids::{
     BootId, ConfigVersion, CorrelationId, EventId, Generation, NodeId, OwnerEpoch, PartitionId,
-    RequestIdentity, Revision,
+    RequestIdentity, Revision, Seq,
 };
+use crate::contracts::membership::CopyId;
 use crate::contracts::storage::{SnapshotRead, StorageEvent, StoreEffect};
 use crate::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::{CapabilityState, ReadServiceOutcome, Version};
@@ -183,6 +184,68 @@ pub enum EventKind {
         /// Opaque handle to the external evidence.
         evidence: EvidenceRef,
     },
+    /// A fact one kernel module hands another (ask CB-1; lead ruling B-R33 Q-B-1).
+    ///
+    /// The carrier half of the pair with [`EffectKind::Kernel`]. See [`KernelEvent`].
+    Kernel(KernelEvent),
+}
+
+/// Kernel-internal events, carried by [`EventKind::Kernel`].
+///
+/// # Whose variants these are
+///
+/// Foundation owns the **carrier**; team kernel-b owns the **variants** (ask CB-1: "carrier pair
+/// in C0, variants owned by kernel-b"). The shape is the one [`crate::contracts::envelope::AppendReject`]
+/// already uses — one variant holding an enum the consuming team fills — rather than a flat
+/// variant per kernel fact, which would put roughly 130 rows' worth of names in this file and
+/// make every addition a foundation edit.
+///
+/// `#[non_exhaustive]` is the machine-readable form of that ownership: a consumer's `match` must
+/// keep a catch-all until the list settles, so kernel-b can land a variant without breaking
+/// every reader at once. It is also what makes the `From` shim in the ask's workaround a seam
+/// rather than a rewrite.
+///
+/// Only the variants that need no absent type are here. `SetAdmission` and `Recovered`, both on
+/// kernel-b's list, wait on `AdmissionState` (ask KA-4) and `RecoveryResult` (ask KA-3); neither
+/// is in this round, and inventing their fields would be foundation deciding kernel-b's shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum KernelEvent {
+    /// A peer reported how far it has taken this lineage.
+    PeerProgress {
+        /// The reporting peer.
+        peer: NodeId,
+        /// The highest contiguous sequence it holds.
+        contiguous_seq: Seq,
+    },
+    /// A copy is no longer eligible to serve this partition.
+    CopyLost {
+        /// Which copy.
+        copy: CopyId,
+    },
+}
+
+/// Kernel-internal effects, carried by [`EffectKind::Kernel`].
+///
+/// The effect half of CB-1's pair. Ownership and the `#[non_exhaustive]` reasoning are the same
+/// as [`KernelEvent`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum KernelEffect {
+    /// The module handled the event and deliberately did nothing.
+    ///
+    /// Required, not decorative (lead rulings A-R24 and B-R33): an empty effect vector is
+    /// indistinguishable from an unhandled event, so "nothing happened" has to be something a
+    /// row can assert rather than an absence it has to trust.
+    Ignored {
+        /// Why nothing was done.
+        reason: ErrorKind,
+    },
+    /// An operator-visible condition the kernel wants surfaced.
+    Alert {
+        /// What the condition is.
+        reason: ErrorKind,
+    },
 }
 
 /// What a module hands back to a client.
@@ -276,6 +339,11 @@ pub enum EffectKind {
         /// The membership pin now in force.
         config_version: ConfigVersion,
     },
+    /// A fact this module hands another kernel module (ask CB-1; lead ruling B-R33 Q-B-1).
+    ///
+    /// The carrier half of the pair with [`EventKind::Kernel`]. See [`KernelEffect`]. Like
+    /// [`Self::AdoptAuthority`] it has no completion event: it asks the environment for nothing.
+    Kernel(KernelEffect),
 }
 
 /// The spec's timing and retention numbers, resolved once.

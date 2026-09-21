@@ -287,7 +287,30 @@ pub enum DurabilityClass {
     Durable,
 }
 
-/// Why a replica refused an append, as the oracle sees it.
+/// Why a replica refused an append, or why the primary would not count an acknowledgement, as
+/// the oracle sees it.
+///
+/// Fourteen reasons: the seven this enum landed with, plus the seven of ask CB-3 (lead ruling
+/// B-R33 Q-B-8). Kernel-b's §3.4 ladder has eleven drop reasons and none of the seven it named
+/// was among the landed set, so before the widening a row could not tell "dropped because
+/// diverged" from "dropped because stale" — which is the entire content of its rows 1d and 9.
+///
+/// # On the "closed set" in verification §3.5
+///
+/// Verification's `trace-requirements.md` §3.5 writes this enum as a closed set of the landed
+/// seven and `M7V-56` asserts set equality against its coverage lists, so this widening turns
+/// that row red. That is the row working, not a conflict: `M7V-56` exists to fail on a variant
+/// nobody wrote a coverage cell for. The cost is seven coverage cells in verification's own
+/// file, which is verification's edit and is **not** made here. Until it is, `M7V-56` is red and
+/// should be read as "seven cells owed", not as a contract dispute.
+///
+/// # Two names that also exist on `AppendReject`
+///
+/// `StaleGeneration` and `NotAMember` are also
+/// [`crate::contracts::envelope::AppendReject`] variants. Same words, different enum, different
+/// meaning: there, why a replica refused an append; here, why an acknowledgement does not count.
+/// Kept deliberately rather than by accident — renaming either would make kernel-b's rows and
+/// the oracle's folds disagree about which ladder they are reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AckRejectReason {
     /// The predecessor is missing.
@@ -304,6 +327,20 @@ pub enum AckRejectReason {
     ForgedIdentity,
     /// An unknown mandatory version, refused before the body was decoded.
     IncompatibleVersion,
+    /// The acknowledgement names a lineage older than the one being replicated.
+    StaleGeneration,
+    /// The acknowledging replica's role cannot qualify this acknowledgement.
+    RoleMismatch,
+    /// The reported progress contradicts itself — a durable position ahead of a buffered one.
+    InconsistentProgress,
+    /// The reported progress went backwards from what this peer last reported.
+    RegressedProgress,
+    /// The acknowledgement carries no evidence that can be checked.
+    Unverifiable,
+    /// The acknowledging replica's history disagrees with the primary's at a retained position.
+    Diverged,
+    /// The acknowledging node is not a member of the pinned configuration.
+    NotAMember,
 }
 
 /// How a `sync_wal_through` ended.

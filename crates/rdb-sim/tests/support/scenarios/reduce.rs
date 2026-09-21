@@ -41,7 +41,21 @@ pub struct ShrinkBudget {
     pub steps: u32,
     /// How many distinct signatures to shrink at all. The rest are recorded unminimized.
     pub max_failures: u32,
-    /// Aggregate re-runs per run, across every failure.
+    /// The aggregate re-run bound for a whole run, across every failure.
+    ///
+    /// **`ddmin` cannot enforce this on its own, and does not claim to.** It starts `steps = 0`
+    /// per call and compares against `total` inside that one call, so with the
+    /// [`Self::DEFAULT`] values (`steps: 2_000`, `total: 20_000`) [`BudgetSpent::Total`] is
+    /// unreachable from a single reduction. The aggregate is the **caller's** obligation: the
+    /// I1 runner decrements `total` by the steps each reduction spent before starting the next,
+    /// and stops shrinking when it reaches zero. Nothing in this module can do that, because
+    /// nothing here sees more than one failure.
+    ///
+    /// Stated rather than fixed (review F5): adding the accumulator here would put
+    /// cross-failure state in a function the plan defines as per-signature. M7V-48 pins the
+    /// per-call half — with `steps: u32::MAX, total: 10` the bound does fire — so the field is
+    /// not vacuous, only narrower than its name suggests. **The runner's contract must carry
+    /// the decrement**; until I1 lands, critic F11's "N failing seeds, uncapped" is open.
     pub total: u32,
 }
 

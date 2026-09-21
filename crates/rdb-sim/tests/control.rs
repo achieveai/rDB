@@ -94,6 +94,7 @@ fn m7f_10_every_completion_records_a_control_interaction() {
         interactions = interactions.len(),
         "m7f_10"
     );
+    support::log_control_interactions(&interactions);
 
     assert_eq!(completions.len(), 4, "cas, get, terminated watch, reload");
     assert_eq!(
@@ -162,8 +163,10 @@ fn m7f_10_every_completion_records_a_control_interaction() {
         })
         .expect("terminate fatally");
     assert_eq!(store.complete(Tick::ZERO).len(), 1);
+    let interactions = store.drain_interactions();
+    support::log_control_interactions(&interactions);
     assert_eq!(
-        store.drain_interactions(),
+        interactions,
         vec![TraceKind::ControlInteraction {
             op: ControlOpKind::Watch,
             key: None,
@@ -446,8 +449,10 @@ fn m7f_20_plan_read_unavailable_hits_the_next_get_only() {
         ),
         "the plan is consumed by one read"
     );
+    let interactions = store.drain_interactions();
+    support::log_control_interactions(&interactions);
     assert_eq!(
-        store.drain_interactions(),
+        interactions,
         vec![
             TraceKind::ControlInteraction {
                 op: ControlOpKind::Cas,

@@ -1,6 +1,6 @@
 //! INV-LIN — lineage (spec §8.1, §8.2; V3).
 //!
-//! Four clauses, every one of them a hash-map lookup against a fact the oracle already recorded.
+//! Five clauses, every one of them a hash-map lookup against a fact the oracle already recorded.
 //! The oracle **never** derives the pairwise-compatibility relation: that is F1's job, and
 //! re-deriving it here would be the second implementation of the protocol the charter excludes.
 //!
@@ -10,6 +10,14 @@
 //! | `digest_conflict_without_quarantine` | one `(generation, seq)` never carries two `entry_digest` values without a `quarantine{DigestConflict}` **and** a `recovery_decision{mode=Quarantine}` — divergence never auto-merges |
 //! | `cutoff_below_an_available_recorded_prefix` | no reachable source reported a `(generation, seq)` above the selected cutoff whose `reported_digest` equals the digest the oracle already recorded there |
 //! | `recovery_root_without_predecessor` | a recovery root cites a real `predecessor_generation` and `predecessor_cutoff` |
+//! | `cutoff_above_selected_source` | the selected cutoff is never above the prefix the selected source itself reported |
+//!
+//! The last two are beyond the plan's M7V-16..M7V-19. `cutoff_above_selected_source` returns
+//! **before** the `cutoff_below_an_available_recorded_prefix` loop in the same
+//! `recovery_decision` arm, and [`crate::support::oracle::Oracle::judge`] keeps the first
+//! violation per invariant, so the order decides which rule a seed's signature names.
+//! `lin_the_two_cutoff_clauses_do_not_shadow_each_other` in `tests/oracle.rs` pins both
+//! directions of that.
 //!
 //! The conflict clause is scoped to `batch_apply.entry_digest` values (critic T-03 option (i)).
 //! A `recovery_decision.queried_sources[].reported_digest` that disagrees with a recorded

@@ -1571,6 +1571,157 @@ fn m7v_19_lin_cutoff_is_clean_when_the_longer_source_is_unreachable_or_mismatche
 }
 
 // ------------------------------------------------------------------------------------------
+// INV-LIN, the two clauses beyond the plan
+//
+// `recovery_root_without_predecessor` and `cutoff_above_selected_source` are checker code the
+// plan's M7V-16..M7V-19 never asked for. Review F2 found both unexercised. They are kept rather
+// than deleted — each states a real §8.1 obligation, and deleting a correct clause to close a
+// coverage finding trades a weaker oracle for a tidier table — so each gets the trip and the
+// near-miss every other clause has. No row id, because the plan does not own them.
+// ------------------------------------------------------------------------------------------
+
+/// A lineage root that names itself a recovery, with whatever predecessor fields are passed.
+fn orphan_recovery_root(
+    predecessor_generation: Option<Generation>,
+    predecessor_cutoff: Option<Seq>,
+) -> TraceKind {
+    TraceKind::LineageRoot {
+        generation: Generation(2),
+        owner_epoch: OwnerEpoch(2),
+        base_seq: Seq::ZERO,
+        base_digest: digest_at(Generation(2), Seq::ZERO),
+        predecessor_generation,
+        predecessor_cutoff,
+        source: LineageSource::Recovery,
+    }
+}
+
+#[retcd_test]
+fn lin_a_recovery_root_that_cites_no_predecessor_violates() {
+    support::preamble();
+
+    // `source=Recovery` *is* the claim that a predecessor was cut off. A root that makes the
+    // claim without the fields leaves a cutoff nothing can check — including
+    // `cutoff_below_an_available_recorded_prefix`, which is why this clause exists.
+    for missing in [
+        orphan_recovery_root(None, None),
+        // The `||` disjunct: half a citation is still not one.
+        orphan_recovery_root(Some(GEN_1), None),
+        orphan_recovery_root(None, Some(Seq(6))),
+    ] {
+        let trace = base("lin-recovery-root-orphan")
+            .in_generation(Generation(2))
+            .push(missing)
+            .build();
+        violated(
+            &judge(&trace),
+            Invariant::Lin,
+            "recovery_root_without_predecessor",
+        );
+    }
+
+    // Near-miss (a): the same root, both fields present.
+    let cited = base("lin-recovery-root-cited")
+        .in_generation(Generation(2))
+        .push(recovery_root(Generation(2), GEN_1, Seq(6)))
+        .build();
+    proven(&judge(&cited), Invariant::Lin);
+
+    // Near-miss (b): an *initial* root legitimately has neither field. The clause is scoped to
+    // `LineageSource::Recovery`; a version that dropped the scope would fire on every fixture in
+    // this file, and this is the row that says so.
+    let initial = base("lin-initial-root").push(initial_root(GEN_1)).build();
+    proven(&judge(&initial), Invariant::Lin);
+}
+
+#[retcd_test]
+fn lin_a_cutoff_above_the_selected_sources_prefix_violates() {
+    support::preamble();
+
+    let decision = |case: &str, reported: Option<Seq>| {
+        base(case)
+            .in_generation(Generation(7))
+            .push(initial_root(Generation(7)))
+            .at(1)
+            .push(recovery(
+                &[source(
+                    N2,
+                    B1,
+                    true,
+                    reported.map(|seq| (Generation(7), seq)),
+                )],
+                Some(N2),
+                Seq(6),
+                RecoveryMode::TwoSurvivor,
+            ))
+            .build()
+    };
+
+    // Trip: the selected source reported seq 3 and the decision cut at seq 6. The cutoff names a
+    // prefix the source it was selected from does not have.
+    violated(
+        &judge(&decision("lin-cutoff-above", Some(Seq(3)))),
+        Invariant::Lin,
+        "cutoff_above_selected_source",
+    );
+
+    // Near-miss, the boundary: `reported_seq == selected_cutoff_seq` is legal — the cutoff is the
+    // source's whole prefix, not above it. A `<=` in place of the `<` fails here.
+    proven(
+        &judge(&decision("lin-cutoff-boundary", Some(Seq(6)))),
+        Invariant::Lin,
+    );
+
+    // Near-miss: a source that reported no prefix is neither above nor below the cutoff.
+    proven(&judge(&decision("lin-cutoff-silent", None)), Invariant::Lin);
+}
+
+#[retcd_test]
+fn lin_the_two_cutoff_clauses_do_not_shadow_each_other() {
+    support::preamble();
+
+    // Both clauses live in the `RecoveryDecision` arm and `cutoff_above_selected_source` returns
+    // before the loop that carries M7V-18's clause. `Oracle::judge` keeps the **first** violation
+    // per invariant, so which one a seed's signature names is a fact about ordering, not taste.
+    // Pinned here so a reorder in `lineage.rs` is a red row rather than a changed signature.
+    let contested = |case: &str, selected_reported: Seq| {
+        base(case)
+            .in_generation(Generation(7))
+            .push(initial_root(Generation(7)))
+            .at(1)
+            .apply(Seq(9), &[(K1, 9)], ApplyOutcome::Applied)
+            .at(2)
+            .push(recovery(
+                &[
+                    source(N2, B1, true, Some((Generation(7), selected_reported))),
+                    source(N3, B1, true, Some((Generation(7), Seq(9)))),
+                ],
+                Some(N2),
+                Seq(6),
+                RecoveryMode::TwoSurvivor,
+            ))
+            .build()
+    };
+
+    // Both conditions hold: N2 is below the cutoff, N3 is above it with the recorded digest.
+    // The first clause wins.
+    violated(
+        &judge(&contested("lin-cutoff-both", Seq(3))),
+        Invariant::Lin,
+        "cutoff_above_selected_source",
+    );
+
+    // The converse, and the one M7V-18 depends on: with the selected source *not* below the
+    // cutoff, the first clause stands aside and the loop reaches N3. If it did not, M7V-18 would
+    // be passing against the wrong clause.
+    violated(
+        &judge(&contested("lin-cutoff-only-below", Seq(6))),
+        Invariant::Lin,
+        "cutoff_below_an_available_recorded_prefix",
+    );
+}
+
+// ------------------------------------------------------------------------------------------
 // INV-DEDUP — M7V-24, M7V-25, M7V-26
 // ------------------------------------------------------------------------------------------
 
@@ -2505,7 +2656,7 @@ fn m7v_71_every_named_mutation_has_a_catching_row() {
 // ------------------------------------------------------------------------------------------
 
 #[retcd_test]
-fn m7v_85_without_rule_has_exactly_one_call_site() {
+fn m7v_85_without_rule_has_no_call_site_until_m7v_23() {
     support::preamble();
     // Built at run time. Spelling the call syntax out as a literal would make this row's own
     // source a call site and fail it on itself.

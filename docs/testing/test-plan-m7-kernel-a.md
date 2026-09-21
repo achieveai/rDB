@@ -131,15 +131,74 @@ captures every `Effect::PublishAuthorityView` A1 emits and can hand any one of t
 `past_horizon` (design §1.7); the fixture exposes `admission_horizon()` from `authority/clock.rs`
 so M7A-143 can compare the pushed value against the formula.
 
-### KA-4 — the log-line contract (owner: kernel-a; ADR-0013 field discipline)
+### KA-4 — the two assertion surfaces (owner: kernel-a; lead ruling **L-R54**, 2026-09-21; ADR-0013 field discipline)
 
-Every kernel decision logs one line with `@m` in the closed set
-`{authority_state, fence, deny, check, answer, admit, dedup, batch, candidate, qualification,
-publish, reply, status, quarantine, clock_sample, event_count}` and fields
-`node, partition, generation, grant_id, boot_id, tick, reason, scope, checkpoint, correlation,
-request_id_hash, seq, digest_hex, outcome, testMethod`. Fields, not sentences. **Never key or
-value bytes, never a payload**: `digest_hex` is the request digest, `request_id_hash` is a hash
-of the identity. Q-45 (§9) fails on any line that carries a `key` or `value` field.
+**Rewritten under L-R54.** Rounds 1–5 of this plan said "every kernel decision logs one line with
+`@m` in the closed set `{authority_state, fence, deny, check, answer, admit, dedup, batch,
+candidate, qualification, publish, reply, status, quarantine, clock_sample, event_count}`". That
+does not hold, for two independent reasons, and every row built on it asserted nothing:
+
+1. **A pure kernel cannot log.** ADR-rdb-0002 §58 and ADR-rdb-0003 §44: `rdb-core` has no clock, no
+   I/O, no randomness, no async. `lib.rs`'s own header says it. A line emitted from inside
+   `AuthorityKernel::step` is a rule violation, so an assertion that reads one can never pass and
+   the row that carries it is unfalsifiable in the same way `M7A-32` was (§15 rows 12–14).
+2. **Fourteen of the sixteen names do not exist.** Only `publish` and `quarantine` are landed
+   `TraceKind` variants. `dedup` is `dedup_record`, `admit` is `admission_decision`, `batch` is
+   `batch_apply`, `reply` is `client_outcome_reported`, and `authority_state`/`deny`/`answer`/
+   `check` all collapse onto the one variant `authority_decision`. `fence`, `candidate`,
+   `qualification`, `status`, `clock_sample` and `event_count` correspond to nothing.
+
+This is kernel-b's `BA-4` (design §7), which read the same rule correctly first. **There are exactly
+two surfaces a kernel-a row may assert on, and no third:**
+
+**Surface 1 — the returned effect vector.** `Driver<K>` feeds one `Event` and gets `Vec<Effect>`
+back as a value (KA-1). This surface needs nothing from any other team, is available today, and is
+*stronger* than a log line, because it is what the kernel actually returns rather than a commentary
+on it. It is the default surface. Every kernel-a fact with no landed `TraceKind` variant asserts
+here.
+
+**Surface 2 — the sim-recorded `TraceEvent`, serialised to JSONL by foundation's tier-1 serialiser.**
+A kernel-internal fact reaches the log **only** if `TraceKind` has a variant for it. There are 24
+landed variants (`rdb-core/src/contracts/trace.rs`), and that list is the entire legal `@m`
+vocabulary — see `docs/testing/m7-log-fields.md` tier 1. `@m` is the variant name in snake_case;
+envelope fields (`event_id`, `logical_tick`, `partition`, `node`, `boot`, `correlation`) and the
+variant's own fields are flattened under their landed names. Nothing is renamed, so a query names
+the field the contract declares.
+
+**The mapping, stated once.** Every checkpoint this plan names in prose resolves through this table;
+a row cites the surface, not a `@m` string it invented.
+
+| What the plan calls it | Landed surface | Spelling |
+|---|---|---|
+| `admit` | 2 | `admission_decision` — `outcome: AdmissionOutcome`, `reason: Option<ErrorKind>`, `admitted_seq`, `paused`, `config_version` |
+| `check` / `answer` / `deny` / `authority_state` | 2 | **all four are `authority_decision`** — `gate: AuthorityGate`, `outcome: AuthorityOutcome`, `authority_seq`, `decision_tick`, `expiry_tick`, `owner_node`, `grant`, `generation`. A deny is `outcome ∈ {Expired, Fenced, Uncertain}`; there is no separate deny line |
+| `dedup` | 2 | `dedup_record` — `action: DedupAction` (`Store \| Hit \| ReuseReject \| Expire`), `request_digest`, `result_digest`, `retained_until_tick` |
+| `batch` | 2 | `batch_apply` — `seq`, `predecessor_seq`, `entry_digest`, `outcome: ApplyOutcome` |
+| `publish` | 2 | `publish` — `seq`, `published_digest`, `ack_evidence`, `authority_recheck: EventRef` |
+| `reply` | 2 | **`client_outcome_reported`** — `request`, `outcome: ClientOutcome`, `seq`, `result_digest`, **`delivered: bool`**. The lost reply is `delivered = false`, not an absent line, which is why M7A-104 and M7A-131 are now falsifiable |
+| `quarantine` | 2 | `quarantine` — `reason: QuarantineReason`, `generation`, `seq`, `sources` |
+| `fence` | **1** | `Effect::Fence { scope, reason, view }`. **No `TraceKind` variant carries a fence reason or a `FenceScope`** — `authority_decision.outcome` has four members and none of them is a `FreezeCause` or a `DenyReason`. Foundation ask **KA-ASK-1**; rows report `Unavailable` on the log half until it lands, never a pass |
+| `clock_sample` | **1** | the `AuthorityEvent::Clock(ClockSample)` the row fed in, and the effect it produced. Foundation ask **KA-ASK-2** |
+| `candidate` / `qualification` | **1** | P1's effect vector and `PubKernel::{published_seq, mode, status}` (KA-1, KA-8). No variant, no ask — the effect surface is complete for these |
+| `status` | **1** | `ReplyEffect::Status { identity, status: TxnStatus }` in the returned vector (KA-9, M7A-118) |
+| `event_count` | neither | not a kernel fact. `step` inputs and effects are **counted by the fixture** and recorded in the campaign artifact `kernel_a.events_per_txn` (M7A-137). It was never a log line and asserting one was a category error |
+
+**The two foundation asks, and what they are worth.** `KA-ASK-1` (a fence trace variant) and
+`KA-ASK-2` (a clock-sample trace variant) are the only two places where the effect vector is
+genuinely weaker than a line would be, because the authority *timeline across ticks* is hard to
+read from per-step vectors alone. Both are asks, not assumptions: until a variant lands, the row
+asserts surface 1 and Q-41's fence half reports `Unavailable` naming the ask. **Never a pass.**
+
+**Lead ruling A-R24 is unchanged in substance** (§13 Q-6): a "nothing happens" arm emits a
+`Fact(..)`, because an empty effect vector is indistinguishable from an unhandled event. What
+changes is where it is read — the `Fact` is asserted **in the returned vector**, not queried back
+out of a log line that was never going to exist.
+
+**Field discipline, absolute, on both surfaces.** Never a key byte, never a value byte, never a
+payload. A key is a `KeyId` or a length; a value is a `(value_version, digest)`; a digest is hex of
+at most 8 bytes; an identity is a `request_id_hash`. Q-45 (§9) fails the run on any line carrying a
+`key`, `value` or `payload` field, and it is worth running after every edit to a test file — a
+`tracing::info!(?key)` added while debugging is invisible in review and permanent in the log.
 
 ### KA-5 — three binaries, one target directory, one gate line (owner: kernel-a; AGENTS.md)
 
@@ -456,7 +515,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-115 | `status_never_proves_nonexecution` | §4.3 invariant 5 · KA-7 · KA-9 (TD-10) | exhaustive match over `Outcome`; and the wire side: every `ReplyEffect::Status` P1 emits across the whole `publication` binary | five members, no `NotExecuted`; absent identity in a live gen ⇒ `Unknown`. Wire half: **no P1 status answer carries `TxnStatus::Unresolved{seq}`** — it is T1's answer for a queue behind a freeze and P1 has no state that maps to it (KA-9). This is the row that goes red if a later milestone makes the member reachable from `StatusIndex` | unit | none |
 | M7A-116 | `recovery_folds_status_by_sequence_not_by_presence` | §4.4 `fold_recovered` (K-A-52) · ADR 0004 "Recovery folds status by sequence, not by presence" · spec §8.1 "may report RECOVERED_APPLIED … never claim the client received the original reply" | `Recovered(r)` carrying `RetainedStatusMap{retained_through: k, discarded_from: Some(k + 1), uncertain: false}` and three identities — one at `seq k − 1`, one at `seq k`, one at `seq k + 2`; second trace, one fact changed: the same map with `uncertain: true` | trace 1: `k − 1` and `k` answer `RecoveredApplied{result}`; `k + 2` answers `Unknown` (`seq >= discarded_from`) — **not** a blanket `RecoveredApplied`, and no entry answers `Published{..}` for the old generation. Trace 2: **all three** answer `Unknown`. In both traces `StatusExpired` is **not produced** — the row asserts it is absent, because M7 never discards below `retained_through` | unit | K-A-52; kernel-b F1 recovery event |
 | M7A-117 | `generation_reconciliation_folds_previous_generation` | ADR 0004 "generation reconciliation" · spike §6 F1/T1 | dedup + status of gen g at recovery into g+1 | gen g's retained digests are consulted for a retry in g+1 (replay, not re-execute); results are `RecoveredApplied` | sim | kernel-b F1 |
-| M7A-118 | `status_reply_effect_carries_outcome_not_bytes` | KA-4 · KA-9 · spec §5.4 | `ClientEvent::Status` | `ReplyEffect::Status{identity, status}` — the landed shape (§15 drift row 2), with `status` the `TxnStatus` that KA-9's table maps the state-side `Outcome` to; the log line has `status`, `request_id_hash`, no payload field. **No snapshot anywhere in this row** — `ReplyEffect::Status` and `TxnStatus` are both landed, so it runs today (TD-14; §15 row 2 said so while §11 held it, and the two contradicted each other) | unit | KA-9 |
+| M7A-118 | `status_reply_effect_carries_outcome_not_bytes` | KA-4 · KA-9 · spec §5.4 | `ClientEvent::Status` | `ReplyEffect::Status{identity, status}` — the landed shape (§15 drift row 2), with `status` the `TxnStatus` that KA-9's table maps the state-side `Outcome` to; **asserted in the returned effect vector (KA-4 surface 1), which is where it lives** — `status` is one of the six names with no `TraceKind` variant, so round 5's "the log line has `status`, `request_id_hash`, no payload field" described a line nothing emits. The redaction half survives and is stronger on this surface: the row matches `ReplyEffect::Status` exhaustively, so a payload field could not be added without failing compilation. **No snapshot anywhere in this row** — `ReplyEffect::Status` and `TxnStatus` are both landed, so it runs today (TD-14; §15 row 2 said so while §11 held it, and the two contradicted each other) | unit | KA-9 |
 
 ---
 
@@ -483,13 +542,13 @@ predate any run, are marked provisional, and only until the first green run.
 
 | ID | Name | Proves | Input | Assertion | Class | Dep |
 |---|---|---|---|---|---|---|
-| M7A-131 | `a1_p1_expire_authority_between_publication_and_reply` | charter A1/P1 adversarial "expire authority between publication and reply" · ADR 0007 "late old dispatch quarantine only" · §4.2 step 6 | A1+T1+P1 wired; seq 5 passes `Publication`; `Tick` lapses the local window before `Check{Reply}` is answered | `Fence{Node, Expired}` with its view; `AuthorityAnswer{Deny(Expired), Reply, c'}` ⇒ `Fact(ReplyWithheld)`; **zero** `Reply` with result; `awaiting_reply` empty; `Status == Published{result}`; `published_seq == 5`; Q-43 shows one `publish` and zero `reply` lines for the identity | sim | K-A-40 |
+| M7A-131 | `a1_p1_expire_authority_between_publication_and_reply` | charter A1/P1 adversarial "expire authority between publication and reply" · ADR 0007 "late old dispatch quarantine only" · §4.2 step 6 | A1+T1+P1 wired; seq 5 passes `Publication`; `Tick` lapses the local window before `Check{Reply}` is answered | `Fence{Node, Expired}` with its view; `AuthorityAnswer{Deny(Expired), Reply, c'}` ⇒ `Fact(ReplyWithheld)`; **zero** `ReplyEffect` carrying a result in the returned vector; `awaiting_reply` empty; `Status == Published{result}`; `published_seq == 5`. **Log half rewritten under L-R54:** Q-43 shows one `publish` and one **`client_outcome_reported` with `delivered = false`** for that `correlation`. Round 5 asserted "zero `reply` lines", and since nothing emits a `reply` line the zero half was true in every possible run including a kernel that never withheld anything — the same vacuous class as M7A-32. `delivered = false` is a positive fact a broken kernel cannot produce by doing nothing. `Unavailable` on the log half until foundation's tier-1 serialiser lands; the effect half runs today and carries the row. **Quiesce before querying** (§9 rule 5): this is a `sim` row asserting on lines the driver is still emitting, so it drains the driver to a fixed point before it opens a `LogSnapshot` — the snapshot reader is fast enough that a row relying on read latency for ordering fails, as `m1_47` did 10 runs out of 10 | sim | K-A-40 |
 | M7A-132 | `a1_p1_delayed_old_dispatch_after_pause_quarantined_bytes_only` | charter adversarial "delayed old dispatch after pause … leaves quarantined bytes only" · ADR 0007 "late old dispatch quarantine only" · §2.5 "epoch is the safety" | `StorageBatch{seq 5}` dispatched; `NodeLifecycle::Resumed{gap > tolerance}` before `BatchCompleted`; the batch completes after the fence | `Fact(Quarantined{g, 5})`; no `Publish`; no `Reply` with result; **and** the O1/M1 namespace inventory shows every byte written by seq 5 under the fenced epoch's namespace and none under a live one (A-R22) | sim | M1 namespace inventory + O1 (`M7V-15`) |
 | M7A-133 | `a1_p1_delayed_old_dispatch_after_reboot_quarantined_bytes_only` | same clause, "reboot" (one fact vs M7A-132: `Rebooted{other boot}`) | as M7A-132 | as M7A-132 with `BootMismatch` | sim | M1 + O1 |
 | M7A-134 | `a1_p1_delayed_old_dispatch_after_new_generation_quarantined_bytes_only` | same clause, "new generation" (one fact: `Found{authority_generation: ours+1}` on the renewal read) | as M7A-132 | as M7A-132 with `AuthorityGenerationChanged` | sim | M1 + O1 |
 | M7A-135 | `f1_t1_p1_retention_boundary_recovered_applied_then_unknown` | spike §6 F1/T1/P1 · spec §8.1 · ADR 0004 retention boundary · §4.4 `fold_recovered` (K-A-52) | commit seq 5 in gen g; recover into g+1 with `RetainedStatusMap{retained_through: 5, discarded_from: None, uncertain: false}`; retry ⇒ `RECOVERED_APPLIED`; `RetireGeneration{g}`; retry again; a `DedupTrim` below 5 in a live gen instead | first answer `RecoveredApplied{result}`; after `RetireGeneration{g}` the answer is **`StatusExpired`**, not `Unknown` (TD-06): `design.md` line 1889 returns `Outcome::StatusExpired` for a retired generation, ADR 0004's retention-boundary row says `STATUS_EXPIRED`, and M7A-113's third case and M7A-114 both assert it — a retired generation is the one path that *does* produce it. The round-3 text said `Unknown` here and contradicted four other places; this is a correction, not a reopening of Q-13. The never-produced claim is **narrowed to the `fold_recovered` paths**, where it is true and where M7A-116 and M7A-172 carry it: nothing is discarded below `retained_through`, so the fold's third arm is not reached from a recovery map M7 can build. `DedupTrim` path (live generation, entry trimmed) ⇒ `Unknown`; never a second execution of seq 5's mutation. Loss-accepting variant in the same test (one fact: `uncertain: true` on the recovery map) ⇒ the first retry answers `Unknown` instead of `RecoveredApplied` | sim | K-A-52; kernel-b F1 |
 | M7A-136 | `f1_t1_generation_reconciliation_no_double_apply` | spike §6 F1/T1 · ADR 0004 "generation reconciliation" | as M7A-117 with the client retrying **during** recovery | the retry waits or replays; the mutation is applied exactly once across both generations (oracle INV-DEDUP) | sim | kernel-b F1 + O1 |
-| M7A-137 | `event_budget_per_fault_free_transaction_recorded` | §2.5 "roughly 14–16 events per fault-free transaction" as a Q1 budget suspect · hard rule 1 · A-R24 (count `step` inputs **and** effects, record both) | verification's shared corpus report, fault-free seeds only | per transaction, `step_inputs` and `effects` are both **recorded** in the artifact (`kernel_a.events_per_txn.{inputs,effects}.{min,p50,max}`) and logged (KA-4 `event_count`); the per-node `PublishAuthorityView` rate is recorded separately (`kernel_a.view_pushes_per_s`); nothing asserted in the PR default. §14 gives the re-derivation | campaign | Q1 shared report |
+| M7A-137 | `event_budget_per_fault_free_transaction_recorded` | §2.5 "roughly 14–16 events per fault-free transaction" as a Q1 budget suspect · hard rule 1 · A-R24 (count `step` inputs **and** effects, record both) | verification's shared corpus report, fault-free seeds only | per transaction, `step_inputs` and `effects` are both **recorded** in the artifact (`kernel_a.events_per_txn.{inputs,effects}.{min,p50,max}`) — **counted by the fixture over `step` inputs and returned effects, never logged.** Round 5 said "and logged (KA-4 `event_count`)"; there is no `event_count` line and there could not be one, because the count is a property of the driver's history, not of any one kernel decision (L-R54). The per-node `PublishAuthorityView` rate is recorded separately (`kernel_a.view_pushes_per_s`); nothing asserted in the PR default. §14 gives the re-derivation | campaign | Q1 shared report |
 
 ---
 
@@ -606,85 +665,251 @@ one goes red.
 
 ## 9. Log-based assertions (DuckDB over `$RETCD_TEST_LOG_DIR`) — Q-41 … Q-45
 
-Numbering continues after verification's `Q-40` (§13 Q-1). Fields are KA-4's contract. Each query
-is what a developer runs **first** when the named rows go red.
+Numbering continues after verification's `Q-40` (§13 Q-1). **Rewritten under lead ruling L-R54
+alongside KA-4** (2026-09-21): every `@m` below is a landed `TraceKind` variant in snake_case, every
+column is a field the contract actually declares, and the facts with no variant moved to the effect
+vector — see KA-4's mapping table. Each query is what a developer runs **first** when the named rows
+go red.
 
-### Q-41 — the authority timeline of one node: state, fence reason, scope, tick (any §3 row)
+**Two mechanical rules that apply to all five, and to every Q-row in the other three plans.**
+
+1. **Never build the relation by hand, and never point DuckDB at a live file.** Call
+   `config_testkit::logs::relation_for_current_test(module, method)` when the `WHERE` names one
+   `testMethod` — which is Q-41 through Q-44 — and `test_logs_relation()` only for Q-45, whose
+   `LIKE 'm7a_%'` spans the suite. Both return a **`LogSnapshot`**: a private frozen copy of the
+   files, the `read_json_auto(..)` call over that copy, and a `Drop` that deletes it. Put the value
+   straight in the `FROM` clause and keep it alive until `query` returns.
+   `relation_for_current_test` copies one file instead of the suite's, and the logging layer routes
+   a line by its own `testModule`/`testMethod`, so that one file holds every row such a query can
+   match. The SQL below is written out only so the shape is readable.
+2. **`map_inference_threshold=-1` is mandatory**, and the helpers carry it. Without it DuckDB types
+   the relation as a `MAP` once the **union** of field names across every matched file exceeds 200,
+   collapsing the whole relation to one `json` column, and every named column fails with
+   `Binder Error: Referenced column "testMethod" not found ... Candidate bindings: "json"`. The
+   count is over the union across files, not the width of one object, so a query works against one
+   suite and fails against the gate run it is actually for. **Measured 2026-09-21:** a
+   whole-workspace log root is **1157 files, 2.93 GB, 4.18 M rows**, read clean in ~13 s, with a
+   bimodal distribution — about a thousand sub-MB files beside a 533 MB and a 480 MB outlier.
+   `crates/config-testkit/tests/logs.rs` holds a positive control that goes red if the option is
+   dropped.
+3. **A zero-row return is not a pass, and two separate things can cause one here.** Every tier-1
+   row depends on foundation's `TraceEvent` → JSONL serialiser, which is **not landed**
+   (`m7-log-fields.md` "what is owed", item 1); until it lands these queries return zero rows and a
+   zero-row return is indistinguishable from a clean run. A row whose only assertion is a Q-row
+   therefore reports `Unavailable — foundation tier-1 trace serialiser`, never a pass. The
+   effect-vector half of each row runs today and is where the real assertion lives.
+4. **`config-testkit` is not reachable from `rdb-sim` yet — foundation ask `KA-ASK-3`.**
+   `crates/rdb-sim/Cargo.toml` dev-dependencies are `config-log` and `config-log-macros` only, so
+   `config_testkit::logs::*` does not resolve in `tests/authority.rs`. This is the allowed
+   dependency direction (rdb ADR-0002: `rdb-*` may use `config-*`, never the reverse), so it is one
+   line — but it is deliberately **not** added here, because until item 3 lands the helper would
+   serve a query with nothing to read. Add it in the same change that lands the serialiser.
+5. **Waiting for a log line is a wait, not a side effect of the reader.** A row that asserts on
+   lines a live component is still emitting must poll for them first, or shut the component down
+   before querying. `m1_47` asserted on `apply` lines nothing waited for and passed only because
+   spawning the DuckDB CLI took ~200 ms; against the snapshot reader it failed 10 runs out of 10.
+   The snapshot is fast, so this plan's **`sim` rows are exactly the ones at risk** — M7A-85, 93,
+   97, 98, 102, 117 and M7A-131..136. Each of those either quiesces the driver before its query or
+   names the effect it polls for; a `sim` row that does neither is incomplete for the same reason a
+   bad row without a twin is (KA-6).
+
+### Q-41 — the authority timeline of one node: gate, outcome, tick (any §3 row)
 
 ```sql
-SELECT tick, node, "@m" AS msg, reason, scope, grant_id, generation
-FROM read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true)
-WHERE testMethod = ? AND "@m" IN ('authority_state','fence','clock_sample')
-ORDER BY node, tick;
+SELECT logical_tick, node, owner_node, gate, outcome, authority_seq, grant, generation,
+       valid_from_tick, expiry_tick, decision_tick
+FROM relation_for_current_test(?, ?)  -- LogSnapshot: frozen copy, map_inference_threshold=-1, dropped after
+WHERE testMethod = ? AND "@m" = 'authority_decision'
+ORDER BY owner_node, authority_seq;
 ```
 
-**Assertions:** at most one `fence` with `scope='node'` per `(node, grant_id)`; every
-`scope='node'` fence is followed by no `authority_state='held'` for that `grant_id`; a
-`fence{reason='Expired'}` is preceded by a `clock_sample` or a renewal gap that explains it.
-**First diagnosis:** a `fence{reason='ClockSampleStale'}` is a defect by construction (A-R12:
-stale denies only) — look at M7A-43 before anything else.
+**Assertions (log half):** `authority_seq` is **strictly increasing per `owner_node`** — that is
+what the field is for (A-R23, design §1.2), and it lets a stale decision be told from a later one
+without comparing ticks; every `outcome='Valid'` has `valid_from_tick ≤ decision_tick < expiry_tick`;
+no `outcome='Valid'` for a `grant` that has already produced an `Expired` or `Fenced` at the same or
+a lower `authority_seq`; `outcome='Uncertain'` never accompanies a gate that let work through
+(fail closed, spec §7.2).
 
-### Q-42 — checkpoints per transaction, and the event budget (M7A-60, M7A-66, M7A-137)
+**Assertions (effect half, runs today):** the fence itself. `Effect::Fence { scope, reason, view }`
+is **surface 1** — at most one `Fence{scope: Node}` per `(node, grant_id)` across the driver's
+whole effect history, and no `AuthorityState::Held` in `AuthorityKernel::state()` for that
+`grant_id` afterwards.
+
+**What changed and why.** Round 5 read `@m IN ('authority_state','fence','clock_sample')` with
+columns `reason, scope, grant_id, tick`. None of the three messages exists; `authority_decision`
+carries **no** `reason` and **no** `scope`, because `AuthorityOutcome` has four members
+(`Valid | Expired | Fenced | Uncertain`) and none of them is a `DenyReason` or a `FenceScope`. So
+the fence-reason and fence-scope assertions cannot be made on the log at all. They are **foundation
+ask KA-ASK-1**, and until a variant lands this row's fence half reports `Unavailable` naming it.
+`clock_sample` is **KA-ASK-2**, same treatment.
+**First diagnosis, unchanged in substance:** a fence whose reason is a stale clock sample is a
+defect by construction (A-R12: stale denies, never fences) — look at M7A-43 before anything else.
+Read it off the `Effect::Fence` reason in the driver, not the log.
+
+### Q-42 — the four authority gates per transaction (M7A-60, M7A-66, M7A-137)
 
 ```sql
-SELECT request_id_hash, seq,
-       count(*) FILTER (WHERE "@m"='check' AND checkpoint='StorageDispatch') AS dispatch_checks,
-       count(*) FILTER (WHERE "@m"='check' AND checkpoint='Publication')     AS pub_checks,
-       count(*) FILTER (WHERE "@m"='check' AND checkpoint='Reply')           AS reply_checks,
-       count(*) FILTER (WHERE "@m"='check' AND checkpoint='Admission')       AS admission_msgs,
-       max(event_count) AS events
-FROM read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true)
-WHERE testMethod = ?
-GROUP BY ALL ORDER BY seq;
+SELECT correlation,
+       count(*) FILTER (WHERE gate='Admission')   AS admission_msgs,
+       count(*) FILTER (WHERE gate='Dispatch')    AS dispatch_checks,
+       count(*) FILTER (WHERE gate='Publication') AS pub_checks,
+       count(*) FILTER (WHERE gate='Reply')       AS reply_checks
+FROM relation_for_current_test(?, ?)
+WHERE testMethod = ? AND "@m" = 'authority_decision'
+GROUP BY ALL ORDER BY correlation;
 ```
 
 **Assertions:** `admission_msgs == 0` for every transaction (A-R16: the admission checkpoint is
-synchronous and sends nothing); `dispatch_checks`, `pub_checks`, `reply_checks` each `≤ 1` on a
-fault-free path (a late ACK, M7A-92, may make `pub_checks == 2`); `events` recorded, not asserted.
+synchronous and sends nothing, so it never becomes a recorded decision); `dispatch_checks`,
+`pub_checks`, `reply_checks` each `≤ 1` on a fault-free path (a late ACK, M7A-92, may make
+`pub_checks == 2`).
+
+**What changed and why — this is §15 drift row 6, and round 5 had it inverted.** The filter was
+`"@m"='check' AND checkpoint='StorageDispatch'`. `checkpoint` is not a logged field: the logged
+field is `authority_decision.gate`, whose type is **`trace::AuthorityGate`** with four members
+`Admission | Dispatch | Publication | Reply`. There is no `StorageDispatch` and no `OutboxDispatch`
+in it. `authority::Checkpoint`'s five members — the spelling round 5 chose — stay a **kernel-internal
+enum asserted through the effect vector** and never reach a log line. Verification's Q-36 reads
+`authority_decision.gate` and is the other reason this is the spelling that wins. Variants serialise
+PascalCase, so the string is `'Dispatch'`, capital D.
+**`max(event_count)` is gone.** There is no `event_count` line and there never could be one (KA-4).
+M7A-137's budget is counted by the fixture over `step` inputs and returned effects and recorded in
+the campaign artifact `kernel_a.events_per_txn.{inputs,effects}.{min,p50,max}` — recorded, not
+asserted, exactly as §14 derives it.
+**Grouping moved from `request_id_hash` to `correlation`**: `authority_decision` carries neither a
+request id nor a `seq`; `correlation` is the envelope field whose entire job is tying a request to
+its applies, publication and outcome.
 
 ### Q-43 — one request's lifecycle, and the exactly-one-reply rule (M7A-72, M7A-101, M7A-104, M7A-131)
 
 ```sql
-SELECT request_id_hash, "@m" AS msg, count(*) AS n, min(tick) AS first_tick, max(tick) AS last_tick
-FROM read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true)
+SELECT correlation, "@m" AS msg, count(*) AS n,
+       min(logical_tick) AS first_tick, max(logical_tick) AS last_tick,
+       bool_or(delivered) AS any_delivered
+FROM relation_for_current_test(?, ?)
 WHERE testMethod = ?
-  AND "@m" IN ('admit','dedup','batch','candidate','qualification','publish','reply','status','quarantine')
-GROUP BY ALL ORDER BY request_id_hash, first_tick;
+  AND "@m" IN ('admission_decision','dedup_record','batch_apply','publish','quarantine',
+               'client_outcome_reported')
+GROUP BY ALL ORDER BY correlation, first_tick;
 ```
 
-**Assertions:** `reply ≤ 1` per identity; `publish ≤ 1`; a `dedup{outcome='hit'}` has no `batch`
-after it; a `quarantine` has no `publish` for the same `seq`. **First diagnosis:** `reply == 0`
-with `publish == 1` is the lost-reply case (M7A-104, M7A-131) — it is correct, and `status` must
-show `Published`.
+**Assertions:** `client_outcome_reported ≤ 1` per `correlation`; `publish ≤ 1`; a
+`dedup_record{action='Hit'}` has no `batch_apply` after it; a `quarantine` has no `publish` for the
+same `seq`.
+
+**What changed and why — and this is where the last vacuous row died.** The old `@m` list held
+`admit, dedup, batch, candidate, qualification, publish, reply, status, quarantine`; six of the nine
+do not exist. The one that matters is **`reply`**: M7A-131 asserted "one `publish` and **zero**
+`reply` lines for the identity", and since no `reply` line is ever emitted by anything, the zero
+half passed on every run including a broken one. That is the same defect class as M7A-32 and
+M7F-38. The landed variant is **`client_outcome_reported`**, and it carries **`delivered: bool`**,
+which models the lost reply properly: the row now asserts **one `client_outcome_reported` with
+`delivered = false`**, not the absence of a line. Absence proved nothing; `delivered = false` is a
+positive fact a broken kernel cannot produce by doing nothing.
+`candidate` and `qualification` have no variant and move to the effect vector (KA-4); `status` is
+`ReplyEffect::Status` in the returned vector (KA-9, M7A-118).
+**First diagnosis, restated on the real fields:** `client_outcome_reported{delivered=false}` with
+`publish == 1` is the lost-reply case (M7A-104, M7A-131) — it is **correct**, and
+`PubKernel::status()` must still answer `Published{result}`.
 
 ### Q-44 — quarantined writes against the namespace inventory (M7A-132..M7A-134)
 
 ```sql
-SELECT q.generation, q.seq, q.tick AS quarantined_at, i.namespace_epoch, i.live
-FROM read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true) q
-JOIN read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true) i
-  ON i.testMethod = q.testMethod AND i."@m"='storage_inventory' AND i.seq = q.seq
-WHERE q.testMethod = ? AND q."@m"='quarantine';
+SELECT correlation, generation, seq, reason, sources, logical_tick AS quarantined_at
+FROM relation_for_current_test(?, ?)
+WHERE testMethod = ? AND "@m" = 'quarantine'
+ORDER BY seq;
 ```
 
-**Assertions:** every joined inventory row has `live = false` and `namespace_epoch` equal to the
-fenced epoch. The `storage_inventory` line is M1's (verification `M7V-15` / foundation); until it
-exists the query returns no rows and the three rows report `unavailable` (§11).
+**Status: the inventory half is `Unavailable`, and the join is deleted rather than left to return
+zero rows.** Round 5 joined against `"@m"='storage_inventory'`. **`storage_inventory` is not a
+`TraceKind` variant, not a tier-2 runner message and not a tier-3 fixture line** — it is in none of
+the three closed lists in `m7-log-fields.md`, so it is not merely unlanded, it is unspecified. A
+join against it returns zero rows forever and reports a clean sheet, which is the defect this plan
+keeps finding. What survives is the half that is real: the `quarantine` lines themselves.
+
+**Assertions (log half):** one `quarantine` per quarantined `seq`, with `generation` equal to the
+fenced generation and `reason` the expected `QuarantineReason`.
+**Assertions (effect half, runs today):** the write never became visible — `PubKernel::published_seq()`
+never reaches that `seq`, and no `publish` effect names it.
+**Unavailable until:** M1's namespace inventory line is **specified** (a `TraceKind` variant or a
+named tier-3 line) and then emitted — verification `M7V-15` / foundation. M7A-132..134 report
+`Unavailable` naming that, and assert their effect half meanwhile (§11).
 
 ### Q-45 — the redaction rule and field discipline (every M7A row; KA-4)
 
-```sql
-SELECT "@m", count(*) AS n
-FROM read_json_auto('$RETCD_TEST_LOG_DIR/**/*.jsonl', union_by_name=true)
-WHERE testMethod LIKE 'm7a_%'
-  AND (key IS NOT NULL OR value IS NOT NULL OR payload IS NOT NULL
-       OR "@m" NOT IN ('authority_state','fence','deny','check','answer','admit','dedup','batch',
-                        'candidate','qualification','publish','reply','status','quarantine',
-                        'clock_sample','event_count'))
-GROUP BY ALL;
+**Two statements, not one, and the split is the fix.** Round 5 wrote a single query whose `WHERE`
+began `key IS NOT NULL OR value IS NOT NULL OR payload IS NOT NULL`. **Run 2026-09-21 against a real
+kernel-a log root, that query does not return zero rows — it fails to bind:**
+
+```text
+Binder Error: Referenced column "key" not found in FROM clause!
+Candidate bindings: "thread"
 ```
 
-**Assertion:** zero rows.
+A column only exists in the relation if some line in the glob carries it. So the redaction clause
+binds **only when something has already leaked**, and errors on every clean run. That is backwards,
+and it is dangerous in a specific way: the next person reads `Binder Error` as a typo, deletes the
+clause, and deletes the check. Statement (a) below tests the **column list** instead of the values,
+which is strictly stronger — a `key` column full of nulls is still a `key` column that a later line
+will fill — and it cannot fail to bind.
+
+```sql
+-- (a) No redacted column may EXIST in the relation. Assertion: zero rows.
+SELECT column_name
+FROM (DESCRIBE SELECT * FROM test_logs_relation())
+WHERE lower(column_name) IN ('key','value','payload','keys','values','payloads');
+```
+
+`key_id`, `mutation_keys`, `condition_keys`, `key_versions`, `value_version` and `result_digest` are
+**not** matched and must not be: an id, a count and a digest are exactly what the field discipline
+says a key and a value are reduced to. The list is of the bare names only.
+
+```sql
+-- (b) Every message is in the closed vocabulary. Assertion: zero rows.
+SELECT "@m", count(*) AS n
+FROM test_logs_relation()
+WHERE testMethod LIKE 'm7a_%'
+  AND "@logger" NOT LIKE 'config_log::%'
+  AND ("@m" NOT IN (
+         -- tier 1: the 24 landed TraceKind variants, snake_case
+         'admission_decision','authority_decision','batch_apply','capability',
+         'client_outcome_reported','client_submit','control_interaction','dedup_record',
+         'durability_advance','family_reload','fault_injected','lineage_root','op_skipped',
+         'protection_state','publish','quarantine','read','recovery_decision','replication_ack',
+         'replication_ack_delivered','replication_send','schedule_phase_changed','topology_change',
+         'version_check',
+         -- tier 2: the campaign runner's eleven verdict lines (verification VA-7)
+         'invariant_status','violation','capability_seen','coverage_cell','coverage_shortfall',
+         'coverage_unavailable','shrink_step','shrink_result','campaign_run','mutation_caught',
+         'trace_header',
+         -- tier 3: foundation's test-local fixture lines
+         'm7f_02 chain vector','m7f_19 manifest','control interaction','m7f_21 hop'));
+```
+
+**Assertion:** zero rows from each statement.
+
+**The `@logger` exclusion is the second correction, and it is also measured.** `config_log`'s test
+harness emits `test started` and `test finished` for **every** `#[retcd_test]` — 4 of each in the
+4-row authority run on 2026-09-21. Neither is in tier 1, 2 or 3, and neither should be: they are the
+harness's own span lines, not rDB's. Without `"@logger" NOT LIKE 'config_log::%'` the vocabulary
+half flags all eight and Q-45 fails the suite on a clean run. Round 5's list had no exclusion because
+it had never been run.
+
+**What changed in the vocabulary, and why.** The `NOT IN` list used to be KA-4's sixteen invented
+names. Under that list **every real line a kernel-a test can produce was a violation** and every line
+it permitted was one nothing emits, so the row would have failed the whole suite the moment tier 1
+landed. The list is now the closed vocabulary of `m7-log-fields.md`: tier 1's 24 variants, tier 2's
+eleven runner messages, tier 3's fixture lines. A line outside it is a defect in either the emitter
+or this list, and the fix is one edit in one place. Kernel-b's Q-48 and foundation's Q-60 run the
+same check over their own prefixes, **and both carry the same two defects** — they were written from
+the same template and neither has been run. Worth fixing there in the same change.
+
+**Evidence, 2026-09-21** (log root `.rtargets/kernel-a/test-logs/20260921-012816-140475`, 5 files,
+16 KB, the 4 authority rows). Statement (a): 0 rows. Statement (b): 0 rows. Statement (a) is proven
+live by a positive control — pointed at a crafted line carrying `key` and `value`, it names both
+columns rather than returning empty, so a zero here is a fact about the logs and not about the
+query.
 
 ---
 
@@ -1015,7 +1240,7 @@ re-derived in round 4 by the critic as well as the planner, both agreeing, and a
 | 3 | Node lifecycle | `ProcessResumed` / reboot described in prose (§2.1) | `NodeLifecycle::Resumed{suspended_millis}` and `Rebooted{boot}` | M7A-47..M7A-49 compile against the landed variants; `resume_gap_tolerance_ticks` is still unnamed in the design (§13 Q-5, A-R24 accepted the name) |
 | 4 | Read reply | F-R7 asserts `ReplyEffect::Read`; design §4.2 reads return a snapshot handle, and M7A-107/108/111 write that as `Read{corr, snapshot}` | `Read` **landed** (`event.rs:218`) but as `{identity: RequestIdentity, outcome: ReadServiceOutcome, value: Option<(Version, Digest)>}`, with `ReadServiceOutcome{Served, WaitedAtBarrier, Rejected(ErrorKind)}` (`trace.rs:362`). `ids.rs:96` still has only `SnapshotHandle(u64)` — **no `SnapshotId::at`** | This is a **shape** drift, not an absence; the round-3 table recorded it as an absence because it was reading `8a23b1d`. The rows keep their assertions and gain a mapping: `corr` → `identity`, the served/barrier distinction → `outcome`, the returned value → `value`. The snapshot identity has no landed home, so M7A-107..M7A-109, M7A-111 and M7A-118 stay in §11 on `SnapshotId::at` alone. §13 Q-9 is re-opened on the shape, not on the variant |
 | 5 | Control op delay, and where `FencingProof` lives | ADR 0008 §7 items 7 and 8 need an arbitrarily late completion and a completion that never arrives; design §1.7 makes `FencingProof` the seam kernel-b's F1 accepts as `FenceProven`, and §2.6 has A1 produce it | `ControlOp` has **eight** variants; the last two are `DelayCompletion{node, by_millis}` and `DropCompletion{node}`, whose doc comments name ADR 0008 §7 items 7 and 8 directly. `ExternalFenceVerified.evidence` landed as `EvidenceRef([u8; 32])` — the opaque *input* handle, **not** the proof. **No type named `FencingProof` exists anywhere in `crates/`** | Two dispositions, and they are different. The control-op half is **closed**: M7A-124 and M7A-125 name the landed ops instead of a scheduler workaround, and §13 Q-8 closes with them. The `FencingProof` half is **not a C0 gap at all** — it is A1's own emitted struct, and A1 is the package under test, so M7A-51..M7A-57 and M7A-149..M7A-151 are gated by "A1 landed" like every other A1 row. Round 3 held them on "C0 `FencingProof`", which named the wrong owner; the correction is TD-07's, not a new finding. What **is** owed at the seam is agreement on its shape, because kernel-b consumes it: that belongs in the cross-team seam freeze, and the six-field binding it carries (K-A-37) is already landed on the input side |
-| 6 | Checkpoint spelling — **two** landed enums | §2.5 and KA-4 name the checkpoints in prose; Q-42's query filters `checkpoint='StorageDispatch'` | `authority::Checkpoint` has **five** variants — `Admission, StorageDispatch, Publication, Reply, OutboxDispatch`. `trace::AuthorityGate` has **four** — `Admission, Dispatch, Publication, Reply`. They are different spellings of an overlapping idea, and `AuthorityGate` has no `OutboxDispatch` | The round-3 table said Q-42's query "matches the landed spelling" and named only `AuthorityGate::Dispatch`, which is the enum Q-42 does **not** filter on (TD-09). The KA-4 log line carries `authority::Checkpoint`, so `checkpoint='StorageDispatch'` is right as written. No row asserts `AuthorityGate`. If the two are ever unified, Q-42's string moves with the log field, not the row — and whichever survives must keep a fifth `OutboxDispatch`, or M7A-156 loses its checkpoint |
+| 6 | Checkpoint spelling — **two** landed enums, and round 5 picked the wrong one | §2.5 and KA-4 name the checkpoints in prose; round 5's Q-42 filtered `"@m"='check' AND checkpoint='StorageDispatch'` | `authority::Checkpoint` has **five** variants — `Admission, StorageDispatch, Publication, Reply, OutboxDispatch`. `trace::AuthorityGate` has **four** — `Admission, Dispatch, Publication, Reply`. They are different spellings of an overlapping idea, and `AuthorityGate` has no `OutboxDispatch` | **Corrected 2026-09-21 under lead ruling L-R54 — this row was inverted, and both halves of the inversion mattered.** Round 5 concluded "the KA-4 log line carries `authority::Checkpoint`, so `checkpoint='StorageDispatch'` is right as written". There is no KA-4 log line: `rdb-core` is pure and cannot emit one (ADR-rdb-0002 §58, ADR-rdb-0003 §44), so the enum that "reaches the log" was never `authority::Checkpoint` and could not be. **The spelling that reaches the log is `trace::AuthorityGate`**, as the field `authority_decision.gate`, and verification's **Q-36 already reads exactly that** — so the plan asserting `authority::Checkpoint` in a query meant the two plans read the same fact under two names, one of which does not exist. Round 5 also wrote "no row asserts `AuthorityGate`", which was true and was the symptom, not the defence. **Resolution:** Q-42 filters `"@m"='authority_decision' AND gate='Dispatch'` (PascalCase, four members, no `StorageDispatch`). `authority::Checkpoint` keeps its five members and stays a **kernel-internal enum asserted through the effect vector** (KA-4 surface 1) — including `OutboxDispatch`, which M7A-156 needs and which no trace variant has, so M7A-156 asserts its checkpoint on the returned effects and loses nothing. The two enums are **not** to be unified: one is the kernel's own state, the other is the recorded claim, and collapsing them would make the recorded claim self-certifying |
 | 7 | Clock sample at the seam | §1.7 and §2.3 consume `ClockSample{at, utc_ms, epsilon_ms, valid}` | time arrives as `StepCtx.now` plus `ControlTime{estimate: Tick, error_millis: u64, bound_established: bool, sampled_at: Tick}` — **four** fields, not the three the round-3 table listed | **Foundation contract request 9 from kernel-a**, restated against the landed four fields: I1 in `rdb-sim` builds the sample with `at = ct.sampled_at` (**not** `now`), `utc_ms` from `ct.estimate`, `epsilon_ms = ct.error_millis`, `valid = ct.bound_established` and nothing else; samples delivered **even when the bound is not established**; **no staleness filtering at the seam**. The `at = sampled_at` clause is the load-bearing one: a seam that stamped the sample at its delivery tick would make every sample age zero and M7A-43's stale sample unreachable. §13 Q-12; the clock rows (M7A-38..46, 143, 146, 148, 165) depend on it |
 | 8 | Grant read shorthand | §2.2/§2.4 and M7A-16..M7A-21 write the renewal read as `Value{Grant, Found{grant_id, boot_id, frozen, authority_generation}}` | `ReadOutcome::Found{revision: Revision, value: Bytes}` (`control.rs:230`), plus `Absent{as_of}` and `Unavailable`. The four named fields are inside the **encoded** body, and no `GrantRecord` type exists in `rdb-core` | The round-3 table recorded a drift here that does not exist — it claimed `ReadOutcome::Found{revision, value}` was the *design* shorthand against an unnamed landed shape, when `{revision, value}` **is** the landed shape, and it cited M7A-107..M7A-111, which never assert those fields (TD-08). The real shorthand is the grant read, and the real rows are M7A-16..M7A-21: they hand A1 the encoded bytes and assert A1's own decode, so no contract type is owed. The decode target is A1's, not foundation's, and `K-F-39`'s zero-threshold refusal is the precedent for decoding strictly |
 | 9 | Staleness threshold: unit and boundary | §2.3 and this plan's §2 budget table name `max_sample_age_ticks` (2000), and §14 recorded a `>` vs `≥` contradiction as open | `ControlTime::is_stale(self, now, max_sample_age_millis)` returns `sampled_at.0 > now.0 \|\| now.0 - sampled_at.0 > max_sample_age_millis` — **millis**, and strict `>` | Two facts. (a) The landed parameter is in milliseconds where the plan names ticks; the rows do not change, because the fixture sets one tick per millisecond, but the name in §2's budget table is the plan's, not the crate's. (b) The strict `>` settles §14 contradiction 4 in favour of the rows already written: M7A-46's `age == 2000` is **not** stale and M7A-43's 2001 is. The landed doc comment also puts the judgement "in the kernel and not in whichever environment filled the sample in", which is exactly the no-filtering-at-the-seam half of row 7 |
@@ -1024,9 +1249,12 @@ re-derived in round 4 by the critic as well as the planner, both agreeing, and a
 | 12 | **The family read: design's `ReadFamily` is the landed `Reload`** | §2.4's watch-gap rows say "`⇒ ReadFamily + re-Watch`", and rounds 1–4 of this plan wrote that as `Control(Get{family})` in five rows | `ControlEffect` has **four** variants: `Cas{key: ControlKey, ..}`, `Get{key: ControlKey}`, `Watch{prefix: ControlPrefix, from}`, `Reload{prefix: ControlPrefix}` (`control.rs:329-363`). `ControlKey` (`:25-44`) has **no family member** — `ClusterSchema, Node, Grant, Partition, Route, Operation, PlannerGrant` — and `ControlPrefix` is a separate type by deliberate construction (K-F-19: typing the family position with the record type "let a single-record key be passed where a family was meant"). `Reload`'s own doc: *"Team kernel-a's `ReadFamily { prefix }` binds to this"* | **Not a drift at all — a plan error, and the worst-shaped kind (TD-12, the round-3 blocker).** `ReadFamily` binds to `Reload`; `Control(Get{family})` is refused by the compiler. Four of the five rows (M7A-28, M7A-31, M7A-123, M7A-126) were compile errors a developer fixes in a minute. **M7A-32 was not**: its whole assertion was `count of Control(Get{family}) == 0`, which is zero in *every* run, including a kernel that reloads on every watch event — the exact bug ADR 0008 §7 item 4 exists to catch — so it went green for ever while §12 reported that item covered. A test that cannot fail is worse than a missing one, because the missing one is visible. M7A-32 is rewritten to count `Control(Reload{..})` with a positive control arm; M7A-31 and M7A-129 no longer assert the same count twice. Recorded here so the next re-read does not rediscover the binding. `Get{grant}` / `Get{partition}` (M7A-30, M7A-57) need no change — those are real `ControlKey`s |
 | 13 | **Watch resume is exclusive, on both sides of the seam** | M7A-28 and M7A-123 re-watched at `from: snapshot_revision + 1` | `ControlEffect::Watch` doc: delivers changes **after** `from`. `FamilySnapshot.snapshot_revision` doc: it "is what the resumed watch **starts after**, which is what makes reload and re-watch a closed loop rather than a race." And foundation's fake **implements** it that way: `sim/control.rs:233` filters `*revision > watch.cursor`, with `cursor: *from` set at `:367` | **Settled from source, not left as an assumption (TD-18).** `from = snapshot_revision` is the closed loop. `from = snapshot_revision + 1` delivers changes strictly after `snapshot_revision + 1` and silently drops any change at exactly that revision — a one-revision gap in the resync path, opened by the row that certifies the path has no gap, and invisible unless a fixture places a change there. M7A-28 now places one. The critic marked this inconclusive on the grounds that no watch implementation exists in `rdb-sim`; **one does**, at `sim/control.rs:218-262`, and it agrees with the doc, so the disposition is "fixed and confirmed", not "fixed and assumed". Nothing is owed at the seam |
 | 14 | **`RetainedStatusMap` — a standing re-derivation, not a closed risk** | §4.4's `fold_recovered` and M7A-116 / M7A-135 / M7A-172 build `RetainedStatusMap{retained_through, discarded_from, uncertain}` by hand (K-A-52) | `grep -rn "RetainedStatusMap" crates/` ⇒ **zero hits** at `ec610f4`. No landed type constrains the shape | Round 4's risk R15 asked whether the landed type could make M7A-172's `discarded_from: None` sub-case unconstructable. It cannot: nothing has landed, the row builds the map by hand (its Input says "direct table test of `fold_recovered`"), and §11 holds it on kernel-b F1's recovery event, correctly. **R15 converts into a standing condition rather than closing: when F1 lands `RetainedStatusMap`, re-derive this sub-case first.** If F1 declares `discarded_from: Revision` rather than `Option<Revision>`, the `None` arm disappears and M7A-172's third sub-case must be **deleted with a stated reason**, never left to fail silently — it is the only construction in the plan that reaches K-A-52's `else` arm, so deleting it also removes the plan's only coverage of `StatusExpired` from the fold and that consequence is the thing to record when it happens |
+| 15 | **The four authority gates have no carrier — A1's central seam cannot be expressed** | design §2.2 gives A1 eight effect kinds and a `Check { checkpoint, lineage, correlation }` event; §1.2 is the authority-decision seam the whole of §3 asserts through | `EffectKind` has seven variants: `Send`, `Store`, `Control`, `Timer`, `Reply`, `AdoptAuthority`, `Kernel`. **None of them carries a `Decide(AuthorityDecision)`, a `Fence { scope, reason }` or a `PublishAuthorityView(AuthorityView)`**, and `EventKind` has no variant that delivers a `Check`. `FencingProof` does not exist as a type at all. `AuthorityDecision`, `AuthorityView`, `Verdict`, `DenyReason` and `Checkpoint` are landed in `contracts/authority.rs` and **have no consumer anywhere in the workspace** — `grep` finds them only in their own module, `lib.rs`'s re-export list and one doc comment | **BLOCKER, and it is a C0 contract gap, not a kernel-a defect.** Found 2026-09-21 by the developer on trying to write §3. L-R54 rules that a fact with no `TraceKind` variant "asserts the returned effect vector instead" — but for the fence, the deny and the pushed view the effect vector has no variant either, so **both** of KA-4's surfaces are unavailable and the ruling leaves these rows genuinely undecided. This is not a case of a row being hard to write: `Authority::step` cannot receive a revalidation request or return a decision, so §3's gate rows, every `Fence` row, every `PublishAuthorityView` row and all of §8.1–§8.6 are **`Unavailable` naming this row**, not merely unwritten. Escalated to the lead. Note the one half that *did* close while this was being written: `Fact(..)` now has a carrier in `KernelEffect::Ignored` (see the re-read note below), which is the same shape of fix these five need. What is expressible today, and is therefore what the developer built, is the **`Control` slice** — the watch and coherent-resync rows, whose every effect is a `ControlEffect` |
 
-None of these fourteen is a reason to lower an assertion (hard rule "never lower an assertion").
+None of these **fifteen** is a reason to lower an assertion (hard rule "never lower an assertion").
 Rows that cannot compile yet are listed in §11 and report `unavailable`; they never report green.
+Row 15 is the largest single block of `unavailable` in this plan's history and it is recorded as a
+blocker precisely so that no row in §3 reports green by asserting something weaker instead.
 
 **Re-read discipline, and what round 4 got wrong about it.** This table is only as fresh as its
 last re-read, which is why the basis is now a gate stage rather than a convention. When
@@ -1042,6 +1270,27 @@ that survived it lived in **§1** (KA-1's three-field `ControlTime`, KA-2's node
 as open) and **the row cells themselves** (five rows naming an effect shape that cannot exist).
 The drift stage compares the basis commit; §15's re-read checked §15; and every round-5 finding
 fell between the two.
+
+**Developer re-read, 2026-09-21 (kernel-a developer, under L-R54). The marker did not move, and
+that is a finding rather than a formality.** `git log -1 -- crates/rdb-core/src/contracts` still
+answers `ec610f4`, so the declared basis is correct and `scripts/drift-check.sh` is green on it.
+§15 rows 1–14 were re-derived against the contract files; row 6 was **inverted** and is corrected
+above. But the check passing is not the same as the table being fresh, for a reason round 5 could
+not have seen:
+
+**`crates/rdb-core/src/contracts/event.rs` has uncommitted working-tree changes**, made by team
+foundation while this re-read was in progress, adding `EffectKind::Kernel(KernelEffect)` and
+`KernelEffect::{Ignored { reason }, Alert { reason }}` under lead rulings **A-R24** and **B-R33**.
+`EffectKind` now has **seven** variants, not six. The drift stage compares *commits*, so it is
+blind to this by construction: the moment foundation commits, the basis is stale and every row that
+names an effect shape must be re-derived. **Whoever lands that commit moves the marker, after
+re-reading — not with it.**
+
+The change matters to this plan immediately, and in kernel-a's favour: `KernelEffect::Ignored` is
+the carrier for design §2.2's `Fact(..)`, which had none. Lead ruling A-R24 answered kernel-a's Q-6
+with "emit a `Fact`", and until this landed that ruling named a shape the contract could not
+express. It can now, and `Fact(..)` asserts as `EffectKind::Kernel(KernelEffect::Ignored { reason })`
+on KA-4 surface 1. What it does **not** resolve is §15 row 15 below.
 
 So the discipline is: **re-read a claim wherever it lives, not only in the drift table.** A landed
 type named in §1, in a §11 hold, in a §14 contradiction or in a row's Input or Assertion is a

@@ -9,7 +9,9 @@
 //! queried instead of grepped.
 
 use std::io::{BufRead, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use serde_json::{Map, Value};
 
 use rdb_core::contracts::ids::{BootId, CorrelationId, EventId, NodeId, PartitionId};
 use rdb_core::contracts::time::Tick;
@@ -139,6 +141,212 @@ fn write_line<T: serde::Serialize>(out: &mut impl Write, value: &T) -> Result<()
             op: "write",
             kind: error.kind(),
         })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tier 1: the query shape
+// ---------------------------------------------------------------------------------------------
+
+/// `@l` on every tier-1 line — the level name `config-log` writes for `tracing::info!`.
+const LOG_LEVEL: &str = "Information";
+/// `@logger` on every tier-1 line.
+const LOG_TARGET: &str = "rdb_sim::harness::trace";
+
+/// The test identity a tier-1 line carries, so a query's `WHERE testMethod = ?` reaches it.
+///
+/// The same three names `config-log`'s root span records (`config_log::testing::test_span`),
+/// spelled the same way, because a Q-row filters both kinds of line with one predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogTags<'a> {
+    /// `testModule` — the emitting test's `module_path!()`.
+    pub test_module: &'a str,
+    /// `testMethod` — the emitting test's function name.
+    pub test_method: &'a str,
+    /// `testRun` — `config_log::testing::test_run_id()`.
+    pub test_run: &'a str,
+    /// `application` — `retcd-tests` under the test subscriber.
+    pub application: &'a str,
+}
+
+impl<'a> LogTags<'a> {
+    /// What `config-log` sets `application` to in a test binary.
+    pub const TEST_APPLICATION: &'static str = "retcd-tests";
+
+    /// Tags for a test row, with `application` set to [`LogTags::TEST_APPLICATION`].
+    #[must_use]
+    pub const fn new(test_module: &'a str, test_method: &'a str, test_run: &'a str) -> Self {
+        Self {
+            test_module,
+            test_method,
+            test_run,
+            application: Self::TEST_APPLICATION,
+        }
+    }
+}
+
+/// One [`TraceEvent`] as one JSONL line in the shape the DuckDB query rows read
+/// (`docs/testing/m7-log-fields.md`, tier 1).
+///
+/// `@m` is the [`TraceKind`] variant in snake_case, the envelope sits under its landed names,
+/// and the variant's own fields are flattened beside them under their serde names. A tuple field
+/// stays a list of two-element lists and a struct field stays a list of structs; verification's
+/// Q-35 indexes both, so neither is flattened or renamed.
+///
+/// # Why this is not a `tracing::info!`
+///
+/// The contract asks for one `tracing` event per recorded [`TraceEvent`]. That cannot carry this
+/// shape. `tracing` field names are `&'static str` fixed at the call site, so 24 variants with
+/// different field sets cannot come from one call; and `config-log`'s visitor has only the
+/// scalar `record_*` methods, so anything composite arrives through `Debug` and is stored as a
+/// **string** — `nodes` would land as `"[(NodeId(1), Primary)]"` rather than as a list DuckDB
+/// can index. Emitting the line here keeps the shape the queries were written against.
+///
+/// # Why not [`write_jsonl`]
+///
+/// That is the replay round trip: a header line and externally tagged events that
+/// [`read_jsonl`] parses straight back. It is byte-shaped for a reader, not column-shaped for a
+/// query, and changing it would break replay. This is a separate path over the same events.
+///
+/// # Errors
+///
+/// [`SimError::Io`] on `serialize` if a [`TraceKind`] ever stops being an externally tagged
+/// struct variant — a unit or tuple variant has no fields to flatten, and silently emitting a
+/// line with no columns would make every query over it read as a clean run.
+pub fn log_line(event: &TraceEvent) -> Result<Map<String, Value>, SimError> {
+    let Value::Object(tagged) = json(&event.kind)? else {
+        return Err(malformed_kind());
+    };
+    let mut tagged = tagged.into_iter();
+    let (Some((variant, fields)), None) = (tagged.next(), tagged.next()) else {
+        return Err(malformed_kind());
+    };
+    let Value::Object(fields) = fields else {
+        return Err(malformed_kind());
+    };
+
+    let mut line = Map::new();
+    line.insert("@m".to_owned(), Value::from(snake_case(&variant)));
+    line.insert("@l".to_owned(), Value::from(LOG_LEVEL));
+    line.insert("@logger".to_owned(), Value::from(LOG_TARGET));
+    for (name, value) in fields {
+        line.insert(name, value);
+    }
+    // The envelope goes in last on purpose: it is the identity of the line, and a variant field
+    // that one day shares one of these six names must not be able to take it over.
+    line.insert("event_id".to_owned(), json(&event.event_id)?);
+    line.insert("logical_tick".to_owned(), Value::from(event.logical_tick));
+    line.insert("partition".to_owned(), json(&event.partition)?);
+    line.insert("node".to_owned(), json(&event.node)?);
+    line.insert("boot".to_owned(), json(&event.boot)?);
+    line.insert("correlation".to_owned(), json(&event.correlation)?);
+    Ok(line)
+}
+
+/// Where the tier-1 lines for one test go: the test's own directory under the log root, in a
+/// file beside `config-log`'s.
+///
+/// A separate file, not `config-log`'s own. Two writers holding one appending handle is the
+/// same class of hazard as two cargo runs sharing a target directory, and it would surface as a
+/// torn line in somebody else's query rather than as a failure here. The name still ends
+/// `.jsonl` and still sits at `<run>/<module>/`, which is what
+/// `config_testkit::logs::test_logs_relation` walks and what the `**/*.jsonl` glob in every
+/// Q-row matches.
+///
+/// Note that `config_testkit::logs::relation_for_current_test` names `<method>.jsonl` exactly,
+/// so it does **not** see these lines; a query for them wants the run-wide relation with a
+/// `WHERE testMethod = ?`.
+#[must_use]
+pub fn log_jsonl_path(test_log_dir: &Path, test_module: &str, test_method: &str) -> PathBuf {
+    test_log_dir
+        .join(sanitize(&test_module.replace("::", ".")))
+        .join(format!("{}.trace.jsonl", sanitize(test_method)))
+}
+
+/// Append one tier-1 line per event to `path`, each tagged with `tags`.
+///
+/// Appends rather than truncates so a row may record in stages, and so this never silently
+/// discards lines a previous call wrote.
+///
+/// # Errors
+///
+/// [`SimError::Io`] naming the operation that failed, or propagated from [`log_line`].
+pub fn write_log_jsonl(
+    events: &[TraceEvent],
+    tags: &LogTags<'_>,
+    path: &Path,
+) -> Result<(), SimError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| SimError::Io {
+            op: "create_dir_all",
+            kind: error.kind(),
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| SimError::Io {
+            op: "open",
+            kind: error.kind(),
+        })?;
+    let mut out = BufWriter::new(file);
+    for event in events {
+        let mut line = log_line(event)?;
+        line.insert("application".to_owned(), Value::from(tags.application));
+        line.insert("testModule".to_owned(), Value::from(tags.test_module));
+        line.insert("testMethod".to_owned(), Value::from(tags.test_method));
+        line.insert("testRun".to_owned(), Value::from(tags.test_run));
+        write_line(&mut out, &Value::Object(line))?;
+    }
+    out.flush().map_err(|error| SimError::Io {
+        op: "flush",
+        kind: error.kind(),
+    })
+}
+
+fn json<T: serde::Serialize>(value: &T) -> Result<Value, SimError> {
+    serde_json::to_value(value).map_err(|_| SimError::Io {
+        op: "serialize",
+        kind: std::io::ErrorKind::InvalidData,
+    })
+}
+
+fn malformed_kind() -> SimError {
+    SimError::Io {
+        op: "serialize",
+        kind: std::io::ErrorKind::InvalidData,
+    }
+}
+
+/// `ClientOutcomeReported` -> `client_outcome_reported`: the `@m` vocabulary the query rows name.
+fn snake_case(variant: &str) -> String {
+    let mut out = String::with_capacity(variant.len() + 4);
+    for (index, ch) in variant.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if index != 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The same path-component rule `config-log`'s layer applies, so the tier-1 file lands in the
+/// directory `config-log` routed that test's own lines to and one `WHERE` reaches both.
+fn sanitize(component: &str) -> String {
+    component
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Read a trace back from JSONL.
