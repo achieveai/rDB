@@ -27,9 +27,18 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
 
 ## Running the gate
 
-- `scripts/gate.sh` (or `scripts/gate.ps1`) runs fmt, clippy and the workspace tests. Use it
-  instead of bare `cargo test --workspace`. One stage at a time: `scripts/gate.sh lint`; extra
-  cargo arguments pass through: `scripts/gate.sh test -p config-testkit --test m4_watch_faults_cluster`.
+- `scripts/gate.sh` (or `scripts/gate.ps1`) runs fmt, deps, drift, clippy and the workspace
+  tests. Use it instead of bare `cargo test --workspace`. One stage at a time:
+  `scripts/gate.sh lint`; extra cargo arguments pass through:
+  `scripts/gate.sh test -p config-testkit --test m4_watch_faults_cluster`.
+- The `drift` stage checks the M7 test plans, not the code. Each plan's section 15 says which
+  contract commit it was written against, in a marker line `<!-- drift-basis: <sha> -->`, and
+  the stage fails when that commit is no longer the newest one to touch
+  `crates/rdb-core/src/contracts`. It exists because on 2026-09-20 all four teams held a stale
+  basis at the same time, and the failure is silent and always over-holds: a plan reports rows
+  `Unavailable` on types that have already landed. One plan named a commit predating the
+  contracts entirely. Re-reading the table is a convention; this makes it a red build. When it
+  fires, re-read section 15 against the files it lists, then move the marker.
 - It exists for the environment it sets, not for the cargo lines. Cluster rows were accepted
   with `RETCD_TEST_DEADLINE_SCALE=3`, a private `CARGO_TARGET_DIR` and a fresh
   `RETCD_TEST_LOG_DIR`; a bare `cargo test` on a loaded host gives capacity rows a third of the

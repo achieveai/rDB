@@ -20,8 +20,8 @@
 # how the reverse edge would arrive first.
 #
 # Usage:
-#   scripts/gate.sh                      fmt + deps + clippy + test
-#   scripts/gate.sh fmt|deps|lint|test   one stage
+#   scripts/gate.sh                            fmt + deps + drift + clippy + test
+#   scripts/gate.sh fmt|deps|drift|lint|test   one stage
 #   scripts/gate.sh test -p config-engine --test m4_watch    extra args go to cargo
 
 set -euo pipefail
@@ -45,6 +45,11 @@ stage="${1:-all}"
 echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE logs=$RETCD_TEST_LOG_DIR"
 
 run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
+# The second non-cargo check. Every M7 test plan says which contract commit it was written
+# against; this fails when that commit is no longer the newest one to touch the contracts.
+# All four teams held a stale basis at once on 2026-09-20, and a stale basis always over-holds:
+# rows report Unavailable on types that have already landed. See scripts/drift-check.sh.
+run_drift() { scripts/drift-check.sh; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
 run_test() { echo "== test";   cargo test --workspace --no-fail-fast "$@"; }
 # perl with JSON::PP ships with every Git for Windows and every Linux perl; no jq needed.
@@ -69,12 +74,13 @@ run_deps() {
 }
 
 case "$stage" in
-  fmt)  run_fmt ;;
-  deps) run_deps ;;
-  lint) run_lint ;;
-  test) run_test "$@" ;;
-  all)  run_fmt && run_deps && run_lint && run_test ;;
-  *)    echo "unknown stage: $stage (expected fmt, deps, lint, test or all)" >&2; exit 1 ;;
+  fmt)   run_fmt ;;
+  deps)  run_deps ;;
+  drift) run_drift ;;
+  lint)  run_lint ;;
+  test)  run_test "$@" ;;
+  all)   run_fmt && run_deps && run_drift && run_lint && run_test ;;
+  *)     echo "unknown stage: $stage (expected fmt, deps, drift, lint, test or all)" >&2; exit 1 ;;
 esac
 
 echo "gate: $stage OK"

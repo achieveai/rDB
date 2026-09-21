@@ -20,10 +20,17 @@
     rdb-* dependency of any kind, dev and build included, because a dev-dependency is how the
     reverse edge would arrive first.
 
+    The drift stage is the second non-cargo check. Every M7 test plan declares the contract
+    commit its section 15 was written against; this fails when that commit is no longer the
+    newest one to touch crates/rdb-core/src/contracts. All four teams held a stale basis at
+    once on 2026-09-20, and a stale basis always over-holds: rows report Unavailable on types
+    that have already landed. The rule lives in scripts/drift-check.sh and this script calls
+    it rather than restating it, because two copies of a rule drift apart.
+
     Kept in sync with scripts/gate.sh.
 
 .PARAMETER Stage
-    fmt, deps, lint, test, or all (the default).
+    fmt, deps, drift, lint, test, or all (the default).
 
 .PARAMETER CargoArgs
     Extra arguments passed through to cargo, for narrowing a test stage.
@@ -38,7 +45,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'deps', 'lint', 'test', 'all')]
+    [ValidateSet('fmt', 'deps', 'drift', 'lint', 'test', 'all')]
     [string]$Stage = 'all',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$CargoArgs = @()
@@ -87,8 +94,22 @@ function Test-Deps {
     }
 }
 
+function Test-Drift {
+    # One implementation of the rule, in scripts/drift-check.sh. Restating it here in
+    # PowerShell would be a second source of truth, which is the thing the drift table itself
+    # keeps getting wrong.
+    $bash = (Get-Command bash -ErrorAction SilentlyContinue).Source
+    if (-not $bash) {
+        # Not skipped. A gate that quietly drops a check is worse than one that stops.
+        throw 'drift: bash not found. It ships with Git for Windows, which this repo already requires.'
+    }
+    & $bash 'scripts/drift-check.sh'
+    if ($LASTEXITCODE -ne 0) { throw "drift: check failed (exit $LASTEXITCODE)" }
+}
+
 if ($Stage -in 'fmt', 'all')  { Write-Host '== fmt';    Invoke-Cargo @('fmt', '--all', '--check') }
 if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
+if ($Stage -in 'drift', 'all') { Test-Drift }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
 if ($Stage -in 'test', 'all') { Write-Host '== test';   Invoke-Cargo (@('test', '--workspace', '--no-fail-fast') + $CargoArgs) }
 
