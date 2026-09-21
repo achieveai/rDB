@@ -13,10 +13,13 @@
 
 use config_core::policy::{
     changed_prefixes, evaluate_converging, grant, signature_payload, verify_policy, Adoption,
-    PolicyDocument, PolicyRejected, PolicySignature, PolicyState, SignedPolicyAuthorizer,
-    POLICY_SIGNATURE_VERSION, REASON_NO_VALID_POLICY, REASON_POLICY_CONVERGING,
+    PolicyDocument, PolicyRejected, PolicySignature, PolicyState, SignedPolicy,
+    SignedPolicyAuthorizer, POLICY_SIGNATURE_VERSION, REASON_NO_VALID_POLICY,
+    REASON_POLICY_CONVERGING,
 };
-use config_core::{Action, Authorizer, Decision, Principal, PrincipalKind, VerifyingKey};
+use config_core::{
+    Action, Authorizer, ClusterId, Decision, Principal, PrincipalKind, VerifyingKey,
+};
 use ed25519_dalek::{Signer, SigningKey};
 use proptest::prelude::*;
 
@@ -36,7 +39,28 @@ fn trust(entries: &[(&str, &SigningKey)]) -> Vec<(String, VerifyingKey)> {
         .collect()
 }
 
-/// A document with one read+write grant per `(principal, prefix)` pair.
+/// The cluster this suite's node belongs to.
+const THIS_CLUSTER: ClusterId = ClusterId::from_bytes([0xC1; 16]);
+/// A different cluster, for the G-06 rows.
+const OTHER_CLUSTER: ClusterId = ClusterId::from_bytes([0xC2; 16]);
+
+/// [`verify_policy`] as this suite's node would call it.
+///
+/// Every pre-G-06 row is about signatures, versions and hashes, and none of them is about the
+/// cluster — so they say so once, here, rather than repeating the argument. The rows that *are*
+/// about the cluster call [`verify_policy`] directly with the cluster they mean.
+fn verify(
+    doc_bytes: &[u8],
+    sig_bytes: &[u8],
+    trust_keys: &[(String, VerifyingKey)],
+) -> Result<SignedPolicy, PolicyRejected> {
+    verify_policy(doc_bytes, sig_bytes, trust_keys, THIS_CLUSTER)
+}
+
+/// A document with one read+write grant per `(principal, prefix)` pair, naming no cluster.
+///
+/// Unscoped, because that is what every document signed before G-06 looks like, and because a
+/// fixture that quietly scoped itself would stop the legacy rows below proving anything.
 fn doc(version: u64, grants: &[(&str, &str)], admins: &[&str]) -> PolicyDocument {
     PolicyDocument {
         version,
@@ -46,6 +70,20 @@ fn doc(version: u64, grants: &[(&str, &str)], admins: &[&str]) -> PolicyDocument
             .map(|(principal, prefix)| grant(principal, prefix, &[Action::Read, Action::Write]))
             .collect(),
         admins: admins.iter().map(|a| (*a).to_string()).collect(),
+        cluster_id: None,
+    }
+}
+
+/// The same document, issued for `cluster`.
+fn doc_for(
+    cluster: ClusterId,
+    version: u64,
+    grants: &[(&str, &str)],
+    admins: &[&str],
+) -> PolicyDocument {
+    PolicyDocument {
+        cluster_id: Some(cluster),
+        ..doc(version, grants, admins)
     }
 }
 
@@ -117,7 +155,7 @@ fn m6_01_good_signature_loads_and_activates() {
     let bytes = encode(&document);
     let signature = sign(&bytes, "ops", &ops, 7);
 
-    let signed = verify_policy(&bytes, &signature, &trust(&[("ops", &ops)]))
+    let signed = verify(&bytes, &signature, &trust(&[("ops", &ops)]))
         .expect("an honestly signed document verifies");
     assert_eq!(signed.document, document);
     assert_eq!(signed.hash, config_core::policy::document_hash(&bytes));
@@ -160,7 +198,7 @@ fn m6_02_bad_signature_is_refused_and_denies_everything() {
         Vec::new(),
     ] {
         assert_eq!(
-            verify_policy(&bytes, &broken, &trust(&[("ops", &ops)])).unwrap_err(),
+            verify(&bytes, &broken, &trust(&[("ops", &ops)])).unwrap_err(),
             PolicyRejected::SignatureInvalid
         );
     }
@@ -169,7 +207,7 @@ fn m6_02_bad_signature_is_refused_and_denies_everything() {
     let mut forged = PolicySignature::decode(&sign(&bytes, "ops", &ops, 7)).expect("decodes");
     forged.signature = vec![0u8; 64];
     assert_eq!(
-        verify_policy(
+        verify(
             &bytes,
             &forged.encode().expect("encodes"),
             &trust(&[("ops", &ops)])
@@ -206,7 +244,7 @@ fn m6_03_signature_by_an_untrusted_key_is_refused() {
     // Signed perfectly, by a key nobody configured, and naming itself honestly.
     let signature = sign(&bytes, "attacker", &attacker, 7);
     assert_eq!(
-        verify_policy(&bytes, &signature, &trust(&[("ops", &ops)])).unwrap_err(),
+        verify(&bytes, &signature, &trust(&[("ops", &ops)])).unwrap_err(),
         PolicyRejected::UntrustedSigner
     );
 
@@ -214,7 +252,7 @@ fn m6_03_signature_by_an_untrusted_key_is_refused() {
     // configured key, so the refusal simply moves one step later.
     let impostor = sign(&bytes, "ops", &attacker, 7);
     assert_eq!(
-        verify_policy(&bytes, &impostor, &trust(&[("ops", &ops)])).unwrap_err(),
+        verify(&bytes, &impostor, &trust(&[("ops", &ops)])).unwrap_err(),
         PolicyRejected::SignatureInvalid
     );
 }
@@ -233,7 +271,7 @@ fn m6_04_tampered_document_body_is_refused() {
     let tampered = encode(&doc(7, &[("app", "/")], &[]));
     assert_ne!(tampered, bytes);
     assert_eq!(
-        verify_policy(&tampered, &signature, &trust(&[("ops", &ops)])).unwrap_err(),
+        verify(&tampered, &signature, &trust(&[("ops", &ops)])).unwrap_err(),
         PolicyRejected::HashMismatch
     );
 
@@ -266,7 +304,7 @@ fn m6_05_version_is_bound_to_the_document_hash() {
         config_core::policy::document_hash(&bytes),
     );
     assert_eq!(
-        verify_policy(&bytes, &relabelled, &keys).unwrap_err(),
+        verify(&bytes, &relabelled, &keys).unwrap_err(),
         PolicyRejected::VersionBinding
     );
 
@@ -275,14 +313,14 @@ fn m6_05_version_is_bound_to_the_document_hash() {
     let v9 = encode(&doc(9, &[("app", "/b/")], &[]));
     let sig7 = sign(&v7, "ops", &ops, 7);
     let sig9 = sign(&v9, "ops", &ops, 9);
-    assert!(verify_policy(&v7, &sig7, &keys).is_ok());
-    assert!(verify_policy(&v9, &sig9, &keys).is_ok());
+    assert!(verify(&v7, &sig7, &keys).is_ok());
+    assert!(verify(&v9, &sig9, &keys).is_ok());
     assert_eq!(
-        verify_policy(&v7, &sig9, &keys).unwrap_err(),
+        verify(&v7, &sig9, &keys).unwrap_err(),
         PolicyRejected::VersionBinding
     );
     assert_eq!(
-        verify_policy(&v9, &sig7, &keys).unwrap_err(),
+        verify(&v9, &sig7, &keys).unwrap_err(),
         PolicyRejected::VersionBinding
     );
 
@@ -293,7 +331,7 @@ fn m6_05_version_is_bound_to_the_document_hash() {
     let mut naive = PolicySignature::decode(&sig7).expect("decodes");
     naive.signature = ops.sign(&hash).to_bytes().to_vec();
     assert_eq!(
-        verify_policy(&v7, &naive.encode().expect("encodes"), &keys).unwrap_err(),
+        verify(&v7, &naive.encode().expect("encodes"), &keys).unwrap_err(),
         PolicyRejected::SignatureInvalid
     );
 }
@@ -308,12 +346,281 @@ fn m6_06_trust_key_set_is_a_set_not_a_single_key() {
     let signature = sign(&bytes, "ops-next", &ops_next, 7);
 
     let both = trust(&[("ops", &ops), ("ops-next", &ops_next)]);
-    assert!(verify_policy(&bytes, &signature, &both).is_ok());
+    assert!(verify(&bytes, &signature, &both).is_ok());
 
     let only_ops = trust(&[("ops", &ops)]);
     assert_eq!(
-        verify_policy(&bytes, &signature, &only_ops).unwrap_err(),
+        verify(&bytes, &signature, &only_ops).unwrap_err(),
         PolicyRejected::UntrustedSigner
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Gap G-06 — which cluster a signed document was issued for
+// ---------------------------------------------------------------------------------------
+
+/// G-06: a document signed by a trusted key but issued for **another cluster** is refused, and
+/// the refusal is not a version refusal.
+///
+/// The attack this closes needs no forged signature. One operations key trusted by two clusters
+/// was enough: cluster B's document verified on cluster A, and because `adopt` only ever asked
+/// "is this version higher?", a higher-versioned foreign document replaced A's grants and
+/// admins with B's, cleanly and unlogged.
+///
+/// Both halves are asserted, and the second is the one that keeps the fix honest. It is not
+/// enough that the document is refused — it has to be refused for a reason an operator can act
+/// on. `rollback` and `version_binding` both say "re-issue it at a higher version", which is
+/// the worst possible advice here.
+///
+/// Mutation check: deleting the cluster comparison in `verify_policy` turns the first assertion
+/// into an `Ok`, which is the defect itself.
+#[config_log::retcd_test]
+fn g06_a_document_issued_for_another_cluster_is_refused() {
+    let ops = signing_key(1);
+    // Higher-versioned and wider than anything this node holds: under the defect, exactly the
+    // document that would have taken over.
+    let foreign = doc_for(OTHER_CLUSTER, 99, &[("app", "/")], &["intruder"]);
+    let bytes = encode(&foreign);
+    let signature = sign(&bytes, "ops", &ops, 99);
+    let keys = trust(&[("ops", &ops)]);
+
+    assert_eq!(
+        verify_policy(&bytes, &signature, &keys, THIS_CLUSTER).unwrap_err(),
+        PolicyRejected::ClusterMismatch {
+            expected: THIS_CLUSTER,
+            document: OTHER_CLUSTER,
+        },
+        "a validly signed document for another cluster must not verify here"
+    );
+
+    let reason = verify_policy(&bytes, &signature, &keys, THIS_CLUSTER)
+        .unwrap_err()
+        .reason();
+    assert_eq!(reason, "cluster_mismatch");
+    assert_ne!(
+        reason,
+        PolicyRejected::Rollback {
+            active: 1,
+            incoming: 1
+        }
+        .reason(),
+        "a cluster refusal must not read as a version refusal: the operator actions differ"
+    );
+    assert_ne!(reason, PolicyRejected::VersionBinding.reason());
+
+    // The same bytes on the cluster they were issued for verify, which is what makes the
+    // refusal above a statement about scope rather than about the document being broken.
+    verify_policy(&bytes, &signature, &keys, OTHER_CLUSTER)
+        .expect("the document is valid on its own cluster");
+}
+
+/// G-06: a document that names no cluster at all still verifies and still adopts.
+///
+/// This is the compatibility half, and it is the reason the field could be added without a flag
+/// day: the signature covers the document *bytes*, so a document written before the field
+/// existed hashes exactly as it always did and verifies exactly as it always did. If this row
+/// fails, every signed document in every deployment became invalid on upgrade.
+///
+/// The warning an operator gets about it is the daemon's to emit — it has the log — and is
+/// asserted in `config-server`'s `an_unscoped_document_adopts_and_warns`. What is asserted here
+/// is the fact that warning is derived from, which is that the document carries no cluster.
+#[config_log::retcd_test]
+fn g06_a_legacy_unscoped_document_still_verifies_and_adopts() {
+    let ops = signing_key(1);
+    let legacy = doc(7, &[("app", "/a/")], &["root"]);
+    let bytes = encode(&legacy);
+    let signature = sign(&bytes, "ops", &ops, 7);
+
+    let signed = verify_policy(&bytes, &signature, &trust(&[("ops", &ops)]), THIS_CLUSTER)
+        .expect("a document predating the cluster field still verifies");
+    assert_eq!(
+        signed.document.cluster_id, None,
+        "this is the fact the daemon's warning is derived from"
+    );
+
+    let authorizer = SignedPolicyAuthorizer::new(false);
+    assert!(matches!(
+        authorizer.adopt(signed).expect("it adopts"),
+        Adoption::Adopted { to: 7, .. }
+    ));
+    assert!(allowed(&authorizer.authorize(
+        &app(),
+        Action::Read,
+        b"/a/k"
+    )));
+}
+
+/// G-06: the cluster travels as the hex an operator reads, and a document that is not that hex
+/// is a parse error rather than a silently unscoped document.
+///
+/// The second half is the one worth having. `Option<ClusterId>` with a lenient decoder would
+/// turn a typo in the one field that scopes the document into "no scope at all" — a fail-open
+/// on the exact field added to fail closed.
+#[config_log::retcd_test]
+fn g06_the_cluster_is_reviewable_hex_and_a_bad_one_is_refused() {
+    let scoped = doc_for(THIS_CLUSTER, 7, &[("app", "/a/")], &[]);
+    let text = String::from_utf8(encode(&scoped)).expect("json is utf-8");
+    assert!(
+        text.contains(&format!("\"cluster_id\":\"{THIS_CLUSTER}\"")),
+        "an operator signs this file by hand and must be able to read the field: {text}"
+    );
+    assert_eq!(
+        serde_json::from_str::<PolicyDocument>(&text).expect("it round-trips"),
+        scoped
+    );
+
+    let mangled = text.replace(&THIS_CLUSTER.to_string(), "not-a-cluster-id");
+    let error = serde_json::from_str::<PolicyDocument>(&mangled)
+        .expect_err("a cluster id that is not 32 hex characters is not a cluster id");
+    assert!(
+        error.to_string().contains("invalid cluster id"),
+        "the deserializer says which field is wrong: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Gap G-09 — the version floor outlives the process
+// ---------------------------------------------------------------------------------------
+
+/// G-09 (core half): with a seeded floor, a fresh authorizer refuses a **strictly older**
+/// document, and says so with a reason distinct from an ordinary rollback.
+///
+/// The durable half — that the floor is actually read back off a disk — is
+/// `config-server`'s `a_restart_refuses_a_document_below_the_persisted_floor`. This row is the
+/// rule that one proves is wired up. The positive control that says where the rule stops is
+/// `g09_a_restart_against_an_equal_floor_is_an_ordinary_load`, and it is not optional: the
+/// first version of this row asserted that `version == floor` was *also* refused, which would
+/// have made every signed-policy node refuse its own unchanged document on every restart.
+///
+/// Mutation check: deleting the `below_floor` branch in `adopt`'s no-active-document arm makes
+/// every `unwrap_err` here an `Adopted`.
+#[config_log::retcd_test]
+fn g09_a_seeded_floor_refuses_an_older_document_at_the_first_adoption() {
+    let ops = signing_key(1);
+    let authorizer = SignedPolicyAuthorizer::new(false);
+    authorizer.seed_version_floor(7);
+
+    for version in [0, 5, 6] {
+        assert_eq!(
+            adopt(&authorizer, &doc(version, &[("app", "/")], &[]), &ops).unwrap_err(),
+            PolicyRejected::RollbackFloor {
+                floor: 7,
+                incoming: version
+            },
+            "version {version} is below the floor"
+        );
+    }
+    assert_eq!(
+        authorizer.policy_version(),
+        None,
+        "a refused first adoption leaves the node with no policy, not with the refused one"
+    );
+
+    // And forward still works, or the fix would be a node that can never load a policy again.
+    assert!(matches!(
+        adopt(&authorizer, &doc(8, &[("app", "/a/")], &[]), &ops).expect("v8 is above the floor"),
+        Adoption::Adopted {
+            from: None,
+            to: 8,
+            ..
+        }
+    ));
+    assert_eq!(
+        authorizer.version_floor(),
+        8,
+        "the floor follows what is in force"
+    );
+}
+
+/// G-09, the positive control: a restart that reloads the document it was already serving is an
+/// ordinary load, not a rollback.
+///
+/// This is the most common event the floor sees — every healthy restart is exactly this — and
+/// the first version of the floor refused it, because `below_floor` was `to <= floor`. The
+/// effect was not a subtle one: a signed-policy node would have come up `NoValidPolicy` and
+/// denied every client call after any restart, which is a worse outage than the rollback the
+/// floor exists to prevent. Found by `e2e_46_daemon_break_glass_rollback_is_audited`, which
+/// asserts `break_glass: false` on a restart's first adoption and therefore noticed that the
+/// restart was being classified as a break-glass rollback.
+///
+/// Two things are asserted, and the second is the one that guards the audit trail: the document
+/// adopts, and it adopts *without* `break_glass`. A restart that rolled nothing back must not
+/// leave a line claiming an operator forced a rollback — a false entry in a security audit log
+/// is worse than a missing one, because it is acted upon.
+///
+/// Mutation check: restoring `to <= floor` makes the first assertion fail with
+/// `RollbackFloor { floor: 7, incoming: 7 }`.
+#[config_log::retcd_test]
+fn g09_a_restart_against_an_equal_floor_is_an_ordinary_load() {
+    let ops = signing_key(1);
+    let authorizer = SignedPolicyAuthorizer::new(false);
+    authorizer.seed_version_floor(7);
+
+    assert!(
+        matches!(
+            adopt(&authorizer, &doc(7, &[("app", "/a/")], &[]), &ops)
+                .expect("a node reloads the version it was already serving"),
+            Adoption::Adopted {
+                from: None,
+                to: 7,
+                break_glass: false
+            }
+        ),
+        "an ordinary restart is an ordinary load, with no break-glass in the audit line"
+    );
+    assert_eq!(authorizer.policy_version(), Some(7));
+    assert_eq!(
+        authorizer.version_floor(),
+        7,
+        "reloading the same version leaves the floor where it was"
+    );
+}
+
+/// G-09: an unseeded authorizer behaves exactly as it did before the floor existed.
+///
+/// A zero floor means "nothing durable is known", not "version zero was served". Reading it the
+/// other way would make a fresh node refuse a `version: 0` document, which is a behaviour change
+/// nobody asked for and which would surface as a node that cannot bootstrap.
+#[config_log::retcd_test]
+fn g09_an_unseeded_floor_changes_nothing() {
+    let ops = signing_key(1);
+    let authorizer = SignedPolicyAuthorizer::new(false);
+    assert_eq!(authorizer.version_floor(), 0);
+    assert!(matches!(
+        adopt(&authorizer, &doc(0, &[("app", "/a/")], &[]), &ops).expect("a fresh node adopts"),
+        Adoption::Adopted {
+            from: None,
+            to: 0,
+            ..
+        }
+    ));
+}
+
+/// G-09: break-glass crosses the durable floor, and moves it down to what it installed.
+///
+/// Both halves are the fix. Letting break-glass through is what keeps the escape hatch working
+/// across a restart. Moving the floor *down* is what stops the next restart refusing the
+/// document the operator deliberately installed — without it, break-glass would have to be left
+/// set forever, which is precisely the state ADR-0027's audit trail exists to make temporary.
+#[config_log::retcd_test]
+fn g09_break_glass_crosses_the_floor_and_resets_it() {
+    let ops = signing_key(1);
+    let authorizer = SignedPolicyAuthorizer::new(true);
+    authorizer.seed_version_floor(7);
+
+    assert_eq!(
+        adopt(&authorizer, &doc(3, &[("app", "/a/")], &[]), &ops).expect("break-glass crosses it"),
+        Adoption::Adopted {
+            from: None,
+            to: 3,
+            break_glass: true
+        },
+        "the audit trail must say break-glass was what permitted this"
+    );
+    assert_eq!(
+        authorizer.version_floor(),
+        3,
+        "the floor follows the version in force, or the next restart refuses it again"
     );
 }
 
@@ -329,8 +636,8 @@ fn adopt(
 ) -> Result<Adoption, PolicyRejected> {
     let bytes = encode(document);
     let signature = sign(&bytes, "ops", key, document.version);
-    let signed = verify_policy(&bytes, &signature, &trust(&[("ops", key)]))
-        .expect("the fixture signs honestly");
+    let signed =
+        verify(&bytes, &signature, &trust(&[("ops", key)])).expect("the fixture signs honestly");
     authorizer.adopt(signed)
 }
 
@@ -461,7 +768,7 @@ fn m6_13_a_failed_reload_keeps_the_active_policy() {
     let signature = sign(&bytes, "ops", &ops, 9);
     let tampered = encode(&doc(9, &[("app", "/")], &[]));
     assert_eq!(
-        verify_policy(&tampered, &signature, &trust(&[("ops", &ops)])).unwrap_err(),
+        verify(&tampered, &signature, &trust(&[("ops", &ops)])).unwrap_err(),
         PolicyRejected::HashMismatch
     );
     assert_eq!(authorizer.policy_version(), Some(8));
@@ -709,6 +1016,7 @@ fn document_strategy(version: u64) -> impl Strategy<Value = PolicyDocument> {
             })
             .collect(),
         admins: Vec::new(),
+        cluster_id: None,
     })
 }
 

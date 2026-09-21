@@ -234,6 +234,7 @@ fn document_bytes(version: u64, prefixes: &[&str], admins: &[&str]) -> Vec<u8> {
             })
             .collect(),
         admins: admins.iter().map(|a| (*a).to_string()).collect(),
+        cluster_id: None,
     };
     serde_json::to_vec(&document).expect("a policy document serializes")
 }

@@ -9,7 +9,9 @@
 //! # Three separate things, deliberately not merged
 //!
 //! * [`verify_policy`] decides whether a pile of bytes is a document this node may consider. It
-//!   never adopts anything.
+//!   never adopts anything. "May consider" includes *which cluster the document was issued for*:
+//!   a signed document naming another cluster is refused here, because that is a property of the
+//!   document alone and has nothing to do with what is already in force (ADR-0027, G-06).
 //! * [`SignedPolicyAuthorizer::adopt`] decides whether a *verified* document may replace the
 //!   active one. Version monotonicity and the break-glass escape live there, not in verification:
 //!   a document can be perfectly signed and still be a rollback.
@@ -27,6 +29,7 @@
 //! convergence objective, not of authorization safety, and ADR-0027 says so out loud.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use bytes::Bytes;
@@ -39,6 +42,7 @@ use crate::authz::{
     deny_no_grant, deny_unverified_kind, grants_allow, is_verified_kind, Action, Authorizer,
     Decision, Grant, Principal,
 };
+use crate::identity::ClusterId;
 
 /// Envelope version of the detached signature file this build writes and accepts.
 ///
@@ -98,6 +102,57 @@ pub struct PolicyDocument {
     /// grant admin without ever touching a signed artifact (ADR-0027, M6-40).
     #[serde(default)]
     pub admins: Vec<String>,
+    /// Which cluster this document was issued for (ADR-0027 as amended, gap G-06).
+    ///
+    /// The signature says *who* issued the document; without this field it does not say *what
+    /// for*. One operations key trusted by two clusters therefore made each cluster's document
+    /// verify on the other, and a higher-versioned foreign document replaced the grant set and
+    /// the admin set with no refusal, because nothing knew a cluster boundary had been crossed.
+    /// The transport plane has always checked this (`config-grpc`'s `expected_cluster`); the
+    /// authorization plane was the one surface that did not.
+    ///
+    /// Optional, and `#[serde(default)]`, so every document signed before this field existed is
+    /// still valid: the signature covers the document *bytes*, so a document that does not
+    /// mention the field hashes exactly as it always did. `None` means legacy-unscoped and is
+    /// warned about on adoption; `Some` must equal the node's own cluster or the document is
+    /// refused as [`PolicyRejected::ClusterMismatch`]. Nothing about
+    /// [`signature_payload`] changes, and nothing needed to.
+    ///
+    /// Carried as the same 32-character lowercase hex an operator reads everywhere else
+    /// ([`ClusterId`]'s `Display`), not as `ClusterId`'s own serde form, which is a
+    /// sixteen-element byte sequence — unreviewable in a file whose whole purpose is to be
+    /// reviewed by hand before it is signed. A value that is not that hex is refused by the
+    /// deserializer as an ordinary [`PolicyRejected::ParseError`], which is why malformed
+    /// scoping needs no refusal reason of its own.
+    #[serde(default, with = "cluster_id_hex")]
+    pub cluster_id: Option<ClusterId>,
+}
+
+/// [`PolicyDocument::cluster_id`] as hex text rather than as a byte sequence.
+mod cluster_id_hex {
+    use std::str::FromStr;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::ClusterId;
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<ClusterId>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        value.map(|id| id.to_string()).serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ClusterId>, D::Error> {
+        let Some(text) = Option::<String>::deserialize(deserializer)? else {
+            return Ok(None);
+        };
+        ClusterId::from_str(&text)
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl PolicyDocument {
@@ -245,6 +300,38 @@ pub enum PolicyRejected {
         /// The version that was refused.
         incoming: u64,
     },
+    /// The incoming version is at or below the **durable** floor this node recorded before it
+    /// restarted, and no break-glass authorization was given (gap G-09).
+    ///
+    /// Deliberately not [`PolicyRejected::Rollback`], which it otherwise resembles. The two
+    /// call for different operator actions and describe different events: `rollback` means a
+    /// running node was handed something older than what it is already serving, and clears by
+    /// fixing the file; `rollback_floor` means a *restarted* node was handed something older
+    /// than what it served before the restart, which is the case that used to be accepted
+    /// silently and is the one worth paging on. An operator who cannot tell them apart cannot
+    /// tell a stale deploy from a downgrade attempt across a restart.
+    #[error("rollback_floor")]
+    RollbackFloor {
+        /// The highest version this node is known to have served.
+        floor: u64,
+        /// The version that was refused.
+        incoming: u64,
+    },
+    /// The document is validly signed by a trusted key but names a different cluster
+    /// (gap G-06).
+    ///
+    /// Distinct from every version reason on purpose: a version refusal says "not yet" or
+    /// "not again", and an operator's fix is to re-issue at a higher version. This one says
+    /// the document is for somebody else's cluster, and re-issuing it higher would make things
+    /// worse. Reaching this reason also means the signature and the hash already checked out,
+    /// so it is a statement about a genuine, intact document — not about a corrupt one.
+    #[error("cluster_mismatch")]
+    ClusterMismatch {
+        /// The cluster this node belongs to.
+        expected: ClusterId,
+        /// The cluster the document names.
+        document: ClusterId,
+    },
     /// The document bytes are not a parsable policy document.
     #[error("parse_error")]
     ParseError {
@@ -268,6 +355,8 @@ impl PolicyRejected {
             Self::PolicyFileMissing => "policy_file_missing",
             Self::VersionBinding => "version_binding",
             Self::Rollback { .. } => "rollback",
+            Self::RollbackFloor { .. } => "rollback_floor",
+            Self::ClusterMismatch { .. } => "cluster_mismatch",
             Self::ParseError { .. } => "parse_error",
         }
     }
@@ -276,7 +365,7 @@ impl PolicyRejected {
     ///
     /// The closed set `retcd_policy_reload_failures_total` seeds its counters from, so a reason
     /// that never fires still reports `0` rather than being absent.
-    pub const ALL_REASONS: [&'static str; 8] = [
+    pub const ALL_REASONS: [&'static str; 10] = [
         "hash_mismatch",
         "untrusted_signer",
         "signature_invalid",
@@ -284,6 +373,8 @@ impl PolicyRejected {
         "policy_file_missing",
         "version_binding",
         "rollback",
+        "rollback_floor",
+        "cluster_mismatch",
         "parse_error",
     ];
 }
@@ -304,16 +395,29 @@ impl PolicyRejected {
 /// 3. verify `sign(hash ‖ version_le)` — a failure is `signature_invalid`;
 /// 4. parse the document body — a half-written or corrupt body is `parse_error`;
 /// 5. compare the signed version with the body's — a disagreement is `version_binding`;
-/// 6. compare the signed hash with `sha256(bytes)` — a disagreement is `hash_mismatch`.
+/// 6. compare the signed hash with `sha256(bytes)` — a disagreement is `hash_mismatch`;
+/// 7. compare the document's cluster with `expected_cluster` — a disagreement is
+///    `cluster_mismatch`.
 ///
 /// Version binding is checked **before** the hash so that swapping two validly-signed documents'
 /// signature files reports the relabelling it actually is, rather than the hash mismatch it also
 /// happens to be. Nothing is adopted on any of these paths, so the ordering trades no safety for
 /// the better diagnosis.
+///
+/// The cluster check is **last**, after the hash, for the same kind of reason: only once the
+/// body is known to be the body that was signed is "this document was issued for another
+/// cluster" a true statement rather than a guess about corrupt bytes. Running it earlier would
+/// let a mangled document be reported as somebody else's.
+///
+/// `expected_cluster` is this node's own cluster, the same value the transport plane checks a
+/// certificate's SAN against. A document carrying no cluster at all predates the field and is
+/// accepted — see [`PolicyDocument::cluster_id`] for why that is not a hole that can be widened
+/// by an attacker. A caller that wants to warn about one reads `document.cluster_id`.
 pub fn verify_policy(
     doc_bytes: &[u8],
     sig_bytes: &[u8],
     trust_keys: &[(String, VerifyingKey)],
+    expected_cluster: ClusterId,
 ) -> Result<SignedPolicy, PolicyRejected> {
     let envelope = PolicySignature::decode(sig_bytes)?;
 
@@ -344,6 +448,15 @@ pub fn verify_policy(
     let hash = document_hash(doc_bytes);
     if hash != envelope.hash {
         return Err(PolicyRejected::HashMismatch);
+    }
+
+    if let Some(document_cluster) = document.cluster_id {
+        if document_cluster != expected_cluster {
+            return Err(PolicyRejected::ClusterMismatch {
+                expected: expected_cluster,
+                document: document_cluster,
+            });
+        }
     }
 
     Ok(SignedPolicy {
@@ -542,6 +655,26 @@ pub struct SignedPolicyAuthorizer {
     /// worse. Every rollback it permits is individually audited by the caller.
     break_glass: bool,
     active: RwLock<Option<Active>>,
+    /// The version this node last had in force, as far as anything durable knows (gap G-09).
+    ///
+    /// The rollback refusal below reads the *active* document, and at every process start there
+    /// is no active document, so `adopt` used to accept whatever it was first handed. An older
+    /// but validly signed document — from a backup, from git history, from an operator's home
+    /// directory — therefore re-adopted across a restart with no refusal and no downgrade
+    /// signal, and no signing key was needed to do it. This is the seed that closes that: the
+    /// daemon reads a durable cell at startup, hands it to [`Self::seed_version_floor`], and
+    /// the first-adoption branch refuses at or below it.
+    ///
+    /// It records **the version in force**, not the highest ever seen. That distinction is what
+    /// makes break-glass work with one rule instead of two: a break-glass rollback to v1 over
+    /// v5 leaves the floor at 1, so the next restart accepts the document the operator
+    /// deliberately installed rather than refusing it. Without an active document and without
+    /// break-glass the floor only ever rises, which is the ordinary case.
+    ///
+    /// Zero means "nothing durable is known", not "version zero was served": a fresh node and a
+    /// node whose storage cannot keep a floor both sit here, and both accept their first
+    /// document exactly as they did before.
+    floor: AtomicU64,
 }
 
 /// The active document plus what is needed to narrow against the previous one.
@@ -559,11 +692,33 @@ struct Active {
 
 impl SignedPolicyAuthorizer {
     /// Build an authorizer holding no document yet. A node in this state is unready.
+    ///
+    /// The version floor starts at zero — "nothing durable is known". A caller with a durable
+    /// record of what this node last served says so with [`Self::seed_version_floor`].
     pub fn new(break_glass: bool) -> Self {
         Self {
             break_glass,
             active: RwLock::new(None),
+            floor: AtomicU64::new(0),
         }
+    }
+
+    /// Tell this authorizer what version the node last had in force (gap G-09).
+    ///
+    /// Called once, before the first [`Self::adopt`], by the caller that owns the durable cell.
+    /// Separate from [`Self::new`] rather than a constructor argument because the durable read
+    /// belongs to the daemon and this crate reads no files by design — and because every
+    /// existing caller that has no floor to offer keeps working unchanged.
+    pub fn seed_version_floor(&self, floor: u64) {
+        self.floor.store(floor, Ordering::Relaxed);
+    }
+
+    /// The version in force as the floor records it, for the caller that persists it.
+    ///
+    /// Read after a successful [`Self::adopt`]. The write belongs to the caller for the same
+    /// reason the read does: this crate touches no files, no clock and no network.
+    pub fn version_floor(&self) -> u64 {
+        self.floor.load(Ordering::Relaxed)
     }
 
     /// Whether this process was started with `--break-glass-policy-rollback`.
@@ -583,22 +738,54 @@ impl SignedPolicyAuthorizer {
     pub fn adopt(&self, incoming: SignedPolicy) -> Result<Adoption, PolicyRejected> {
         let mut guard = self.active.write().unwrap_or_else(|e| e.into_inner());
         let Some(active) = guard.as_ref() else {
+            // No active document, which is the state every process start begins in — so this
+            // is the branch a restart goes through, and the one that used to accept anything.
+            // The durable floor is the only thing standing between a node and an older but
+            // validly signed document here (gap G-09).
+            //
+            // A zero floor means nothing durable is known and is *not* treated as "version
+            // zero was served": a fresh node must still accept its first document, including
+            // the `version: 0` a hand-built document can carry.
+            //
+            // The comparison is **strict**, and that is load-bearing. `to == floor` is the
+            // ordinary restart: a node reloading the very document it was already serving,
+            // which is what every restart of a healthy node does. Refusing it would mean a
+            // signed-policy node could never restart — it would come up `NoValidPolicy` and
+            // deny every client call, turning a security control into a guaranteed outage on
+            // the most routine operation there is. The live path has the same shape for the
+            // same reason: `adopt` returns `Unchanged` for an identical document rather than
+            // calling it a rollback.
+            //
+            // What strictness leaves open: a *different* document carrying the same version as
+            // the floor is accepted here, where a running node would refuse it (`m6_08`, equal
+            // version refused unless the hash is identical), because the cell records a version
+            // and not a hash. That gap is narrower than it looks — every document is signature
+            // checked first, so reaching it already requires the signing key, and anyone
+            // holding that key can issue `floor + 1` with any content and need not wait for a
+            // restart at all. It is an inconsistency between the two paths, not an extra
+            // capability.
+            let floor = self.floor.load(Ordering::Relaxed);
+            let to = incoming.document.version;
+            let below_floor = floor > 0 && to < floor;
+            if below_floor && !self.break_glass {
+                return Err(PolicyRejected::RollbackFloor {
+                    floor,
+                    incoming: to,
+                });
+            }
             *guard = Some(Active {
                 changed: Vec::new(),
                 previous: None,
                 converged: true,
                 signed: incoming,
             });
-            let to = guard
-                .as_ref()
-                .expect("just installed")
-                .signed
-                .document
-                .version;
+            self.floor.store(to, Ordering::Relaxed);
             return Ok(Adoption::Adopted {
                 from: None,
                 to,
-                break_glass: false,
+                // Break-glass is reported exactly when it is what permitted the adoption, so
+                // the caller audits a restart-time downgrade the same way it audits a live one.
+                break_glass: below_floor,
             });
         };
 
@@ -635,6 +822,10 @@ impl SignedPolicyAuthorizer {
             // and no other node has reported it yet.
             converged: false,
         });
+        // The floor follows the version in force, up or down. Down only happens under
+        // break-glass, and it has to: a floor left above a deliberately installed older
+        // document would refuse that document at the next restart.
+        self.floor.store(to, Ordering::Relaxed);
         Ok(Adoption::Adopted {
             from: Some(from),
             to,

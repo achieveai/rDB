@@ -398,3 +398,112 @@ carries a verified kind. An operator running that combination loses admin access
 notes beside the `authz.mode` default flip this ADR already flags. The remedy is either mTLS
 (the supported posture for signed RBAC) or `authz.mode = "static"` with an explicit
 `admins = ["dev"]`, which ADR-0023 ruling 4 still honours.
+
+## Implementation note (2026-09-20, the document names its cluster and the floor is durable)
+
+Two properties this ADR assumed but did not hold. Both were found by gap triage, recorded as G-06
+and G-09, and both are fixed here.
+
+**A document now names the cluster it was issued for (G-06).** `PolicyDocument` gains
+`cluster_id: Option<ClusterId>`, serialised as hex text so the JSON stays hand-reviewable, and
+`verify_policy` refuses a document naming a different cluster with the new reason
+`cluster_mismatch`. Without it, one ops key trusted by two clusters was enough for a
+higher-versioned document issued for cluster B to adopt cleanly on cluster A — every signature
+check passing, because every signature check was genuinely valid. The check lives in
+`verify_policy` rather than in `adopt` because which cluster a document was issued for is a
+property of the document alone, independent of what is already in force, and that is the division
+of responsibility this ADR already draws between the two.
+
+The field needed no change to `signature_payload`: the payload covers `document_hash`, and the
+hash covers the document bytes, so a new field is already inside what the signature protects. The
+wider envelope question is gap G-05 and is deliberately still open; it is a flag day and is not
+taken here.
+
+The field is optional and `None` means *legacy-unscoped*: such a document still verifies and still
+adopts, so no existing deployment breaks on upgrade, and adopting one logs `policy_unscoped` at
+`warn` once per adoption — not once per poll, because a warning that repeats for the life of a
+deployment is a warning nobody reads. That line is the only place an operator can learn that this
+node would also accept another cluster's document signed by the same key. Re-issuing every
+document with a `cluster_id` is owed before the unscoped path can be removed.
+
+**The rollback floor is now durable (G-09).** It was in-memory only, so `adopt` returned
+`Adopted { from: None }` at every process start and a restart would accept a signed document the
+running node had already refused. Rollback protection therefore lasted exactly as long as the
+process. The floor is now a `policy_version_floor` cell in the existing `state_meta` column
+family — the same shape as `max_command_schema`, absent-tolerant, absent meaning `0`, so no format
+bump and no migration. A restart refuses a document at or below the recorded floor with the new
+reason `rollback_floor`, distinct from `rollback` so a refusal caused by durable state is
+distinguishable in the log from an ordinary version refusal.
+
+The floor records *the version in force*, not the maximum ever seen, so break-glass moves it down
+as a consequence of one rule rather than needing a second mechanism. It is written after a
+successful adoption, never before: writing first would raise the floor for a document `adopt` then
+refuses. The residual risk is a crash between adoption and write, which leaves the floor one
+version stale and re-opens the old behaviour for exactly one restart.
+
+**The comparison is strict, and "at or below" was a bug.** The floor was first written to refuse a
+document *at or below* it. That phrasing reads correctly and is wrong, because the version a node
+last served is the version its own file still holds: the first thing every healthy restart does is
+offer the floor straight back. The inclusive comparison therefore refused it, and a signed-policy
+node would have come up `NoValidPolicy` and denied every client call after any restart — a worse
+and far more likely outage than the rollback the floor exists to prevent. It was caught by
+`e2e_46_daemon_break_glass_rollback_is_audited`, which asserts `break_glass: false` on a restart's
+first adoption and so noticed the restart being classified as a break-glass rollback. The live
+path has the same shape for the same reason: `adopt` returns `Unchanged` for an identical document
+rather than calling it a rollback.
+
+**Window left open by the strict comparison, accepted.** A *different* document carrying the same
+version as the floor is accepted at a restart, where a running node would refuse it — `m6_08`
+refuses an equal version unless the hash is identical — because the cell records a version and not
+a hash. The exact fix is to store `(version, hash)` and refuse `to < floor || (to == floor && hash
+!= floor_hash)`, which would mirror the in-memory rule across a restart.
+
+It was not taken, on two grounds. First, it is an inconsistency between the two paths rather than
+an extra capability: every document is signature-checked before the floor is consulted at all, so
+reaching this window already requires the signing key, and anyone holding that key can issue
+`floor + 1` with any content they like and need not wait for a restart. Second, the argument for
+doing it *now* was that the cell is new and changing its shape later would cost a migration — but
+`state_meta` cells are absent-tolerant by construction, which is the same property that let this
+floor be added without a format bump in the first place. A later `policy_version_floor_hash` cell
+would read absent as "only the version is known" and fall back to the strict comparison, so the
+later cost is the same as the cost now. Closing it is therefore a free choice at any time, and was
+deferred rather than rejected.
+
+A node whose store cannot hold a floor at all — `StorageHandle::Ephemeral`, and any future variant,
+since the enum is `#[non_exhaustive]` and the mapping fails closed to "cannot" — keeps the previous
+in-memory behaviour unchanged. That is stated rather than hidden: with no durable store there is
+nowhere to put the floor, and inventing one would claim a guarantee the node cannot keep.
+
+**Known limit, carried rather than closed: a restore resets the floor (G-13).** `state_meta` is
+not carried in a snapshot body, so a directory restored from a backup starts at floor `0` and an
+old signed document adopts. G-09 ships with that bypass. It is recorded as a separate gap, with
+the fix being to seed the floor from the backup manifest's `policy_version_ref` at restore, and it
+is called out prominently at `RocksStore::policy_version_floor` so it is read by anyone relying on
+the floor as a security control rather than only by anyone reading this ADR.
+
+**Exposure accepted: an unreadable floor does not stop the node (lead ruling, 2026-09-20).** If
+reading the cell fails, the node logs `policy_floor_unreadable` at `error` and starts anyway. For
+that boot, and only if an attacker can also present a validly signed older document, the older
+document will adopt. One boot, requires the signing key, logged loudly.
+
+The alternative considered was to treat an unreadable floor as `u64::MAX`: refuse every document
+that boot, so the node starts unready and denies client calls while still replicating. That fails
+closed on authorization without failing closed on consensus, and it is a one-line change in
+`PolicyLoader::new`. It was not taken for two reasons. Operationally it produces a very confusing
+failure — a node refusing its current, valid, correctly-signed policy because of an unrelated disk
+read. More seriously, the failure mode is not independent across nodes: a disk fault is, but a
+*code* fault in the read path — a decode change, a new format, a bug — is not, and the strict
+option would then refuse every document on every node at once and take the whole cluster's client
+plane down, triggered by a read that has nothing to do with consensus. A security control that
+converts its own bugs into a cluster-wide outage is a bad trade for closing a one-boot window that
+already requires the signing key.
+
+This is a judgement call held loosely. It is recorded at this length so the next person revisits
+it on the argument rather than rediscovering it.
+
+**Metric owed.** An `error` log line is thin for a security control that has silently weakened.
+The right surface already exists and the precedent is exact: `PolicyMetrics::break_glass_active`
+is a gauge rather than a log line precisely because it disarms rollback protection for the life of
+the process. An unreadable floor has the same shape for the life of the boot, so it belongs beside
+it as a `PolicyMetrics` field. It is not added here because `config-engine` was owned by another
+change in this wave.

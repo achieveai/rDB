@@ -17,15 +17,58 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use config_core::policy::{Adoption, PolicyRejected, PolicyState, SignedPolicyAuthorizer};
-use config_core::Authorizer;
-use config_engine::{PolicyMetrics, WatchHub};
+use config_core::{Authorizer, ClusterId};
+use config_engine::{PolicyMetrics, StorageHandle, WatchHub};
 use config_grpc::PolicyReload;
 
 use crate::config::SignedPolicyConfig;
+
+/// Where the daemon keeps the policy version it last had in force (M6, ADR-0027, gap G-09).
+///
+/// A trait rather than a `RocksStore`, for one reason that matters and one that is convenient.
+/// The reason that matters: the floor is the whole of G-09's fix, so a test has to be able to
+/// drive it through something it fully controls — including a store that *fails* to persist.
+/// The convenience: an ephemeral store has no durable state to keep a floor in, and the daemon
+/// says so by holding `None` rather than by implementing a cell that forgets.
+pub trait PolicyVersionFloor: Send + Sync {
+    /// The version this node last had in force; `0` when nothing is recorded.
+    fn policy_version_floor(&self) -> Result<u64, String>;
+    /// Record `version` as the version now in force.
+    fn set_policy_version_floor(&self, version: u64) -> Result<(), String>;
+}
+
+impl PolicyVersionFloor for config_storage::RocksStore {
+    fn policy_version_floor(&self) -> Result<u64, String> {
+        config_storage::RocksStore::policy_version_floor(self)
+    }
+
+    fn set_policy_version_floor(&self, version: u64) -> Result<(), String> {
+        config_storage::RocksStore::set_policy_version_floor(self, version)
+    }
+}
+
+/// The durable floor this node's store can keep, if any (M6, gap G-09).
+///
+/// Lives here rather than in the startup sequence so the mapping from a store kind to a floor
+/// is stated once, beside the trait it produces.
+pub fn version_floor(storage: &StorageHandle) -> Option<Arc<dyn PolicyVersionFloor>> {
+    match storage {
+        StorageHandle::Rocks(store) => Some(Arc::new(store.clone())),
+        // An ephemeral store loses everything on restart, so there is no restart across which
+        // a floor could mean anything. The daemon never opens one — `open_store` builds only a
+        // `RocksStore` — and this arm exists because the handle is an enum, not because a node
+        // can reach it.
+        StorageHandle::Ephemeral(_) => None,
+        // `StorageHandle` is `#[non_exhaustive]`: a store kind added later has to say for
+        // itself whether it can keep a floor, and failing closed to "cannot" is the answer that
+        // preserves today's behaviour rather than silently claiming durability.
+        _ => None,
+    }
+}
 
 /// Everything the daemon needs to keep one node's policy current.
 ///
@@ -47,6 +90,23 @@ pub struct PolicyLoader {
     /// single point at which outstanding tokens stop being honoured. `0` is the "no signed
     /// policy" encoding the paginator already uses, because a document's version is `>= 1`.
     version_cell: Arc<AtomicU64>,
+    /// This node's own cluster, checked against every document's `cluster_id` (gap G-06).
+    ///
+    /// The same value the transport plane calls `expected_cluster`. Held by the loader rather
+    /// than by the authorizer because it is a property of *verification*, and verification is
+    /// the step the loader owns.
+    expected_cluster: ClusterId,
+    /// Where the version floor is kept across a restart (gap G-09).
+    ///
+    /// `None` when this node's store cannot keep one, which leaves the pre-G-09 behaviour
+    /// exactly as it was rather than pretending to a guarantee.
+    floor: Option<Arc<dyn PolicyVersionFloor>>,
+    /// Set once, at construction, when the floor existed but could not be read (gap G-09).
+    ///
+    /// Distinct from `floor.is_none()`: having nowhere to keep a floor is a configuration, and
+    /// failing to read one that should be there is a fault. Only the second is worth alerting
+    /// on, and only the second means rollback protection was expected and is absent.
+    floor_unreadable: AtomicBool,
 }
 
 /// What the last attempts left behind, for health and for the no-storm rule.
@@ -78,17 +138,46 @@ impl Default for Attempts {
 
 impl PolicyLoader {
     /// Build a loader over `cfg`, adopting into `authorizer` and revoking through `hub`.
+    ///
+    /// `expected_cluster` is this node's own cluster (gap G-06) and `floor` is where the
+    /// version it last had in force is kept (gap G-09). The floor is read **here**, not at the
+    /// first reload: it has to be in the authorizer before `adopt` is ever called, because the
+    /// branch it guards is the one a process start goes through.
+    ///
+    /// An unreadable floor is logged and treated as absent. Failing startup on it would turn a
+    /// single unreadable cell into an outage, which is the opposite of what ADR-0027 asks for
+    /// everywhere else on this path — but it does mean this node is, for one boot, back to the
+    /// behaviour G-09 describes, so the line says so in those words.
     pub fn new(
         cfg: SignedPolicyConfig,
         authorizer: Arc<SignedPolicyAuthorizer>,
         hub: Arc<WatchHub>,
+        expected_cluster: ClusterId,
+        floor: Option<Arc<dyn PolicyVersionFloor>>,
     ) -> Arc<Self> {
+        let mut unreadable = false;
+        match floor.as_ref().map(|f| f.policy_version_floor()) {
+            Some(Ok(recorded)) => authorizer.seed_version_floor(recorded),
+            Some(Err(error)) => {
+                unreadable = true;
+                tracing::error!(
+                    %error,
+                    detail = "this node cannot tell what policy version it last served, so an \
+                              older signed document will be accepted this boot",
+                    "policy_floor_unreadable"
+                );
+            }
+            None => {}
+        }
         Arc::new(Self {
             cfg,
             authorizer,
             hub,
             reloading: Mutex::new(Attempts::default()),
             version_cell: Arc::new(AtomicU64::new(0)),
+            expected_cluster,
+            floor,
+            floor_unreadable: AtomicBool::new(unreadable),
         })
     }
 
@@ -137,10 +226,17 @@ impl PolicyLoader {
             &self.cfg.signature_file,
             PolicyRejected::SignatureFileMissing,
         )?;
-        let signed = config_core::verify_policy(&document, &signature, &self.cfg.trust_keys)?;
+        let signed = config_core::verify_policy(
+            &document,
+            &signature,
+            &self.cfg.trust_keys,
+            self.expected_cluster,
+        )?;
 
         let from = self.authorizer.policy_version();
         let hash_hex = hex(&signed.hash);
+        // Read before `adopt` takes ownership of the document, reported only if it adopts.
+        let adopted_cluster_is_unscoped = signed.document.cluster_id.is_none();
         // Before the adoption, never after: see the module header. Only when the adoption will
         // actually replace an active document, though — the revocation bumps the watch policy
         // epoch and takes the journal gate, and the poller runs this every tick. A first load
@@ -192,6 +288,28 @@ impl PolicyLoader {
                 to,
                 break_glass,
             } => {
+                // Persisted here, immediately after the adoption and only on this arm: an
+                // `Unchanged` re-read moved nothing, and a refusal never reaches this far.
+                // After, not before, because writing first would raise the floor for a
+                // document `adopt` might then refuse — and a floor above a version this node
+                // never served would refuse a document it should accept at the next restart.
+                // The cost of that order is a crash in between, which leaves the floor one
+                // version stale and re-opens G-09 for exactly one restart.
+                self.persist_floor();
+                if adopted_cluster_is_unscoped {
+                    // Once per adoption, not once per poll: an unchanged file does not reach
+                    // this arm. The document is genuine and trusted — it simply predates the
+                    // field — so this is a warning about what is *not* being checked, which is
+                    // the only place an operator can learn that this node would also accept
+                    // another cluster's document signed by the same key (gap G-06).
+                    tracing::warn!(
+                        version = to,
+                        source,
+                        detail = "this signed policy document names no cluster, so it is not \
+                                  bound to this one; re-issue it with a cluster_id",
+                        "policy_unscoped"
+                    );
+                }
                 tracing::info!(
                     version = to,
                     previous_version = from,
@@ -212,6 +330,30 @@ impl PolicyLoader {
                 )
             }
         })
+    }
+
+    /// Write the version now in force to the durable floor (gap G-09).
+    ///
+    /// A failed write is logged, never fatal. The node is serving a document it verified and
+    /// adopted, and refusing to serve it because a bookkeeping write failed would turn a
+    /// degraded disk into an authorization outage — the same "fails closed means does not
+    /// adopt, not forgets what it had" rule ADR-0027 applies to the document itself. The
+    /// consequence is stated in the line rather than left to be inferred: until the write
+    /// succeeds, this node would accept an older document after a restart.
+    fn persist_floor(&self) {
+        let Some(floor) = self.floor.as_ref() else {
+            return;
+        };
+        let version = self.authorizer.version_floor();
+        if let Err(error) = floor.set_policy_version_floor(version) {
+            tracing::error!(
+                %error,
+                version,
+                detail = "the policy version floor was not persisted, so a restart would \
+                          accept a document older than the one now in force",
+                "policy_floor_not_persisted"
+            );
+        }
     }
 
     /// What the health payload publishes: the active version and the state behind it (M6-16).
@@ -248,6 +390,7 @@ impl PolicyLoader {
             rollbacks: attempts.rollbacks,
             reload_failures: attempts.failures.clone(),
             break_glass_active: self.authorizer.break_glass_active(),
+            floor_unreadable: self.floor_unreadable.load(Ordering::Relaxed),
         }
     }
 
@@ -280,6 +423,21 @@ impl PolicyLoader {
             source.advertise(version).await;
         }
         let view = source.view().await;
+        // Said while convergence is *failing*, which is the only time it is useful. The
+        // `policy_converged` line below carries the same two numbers, but it is emitted after
+        // convergence succeeds — so on the stall this exists to diagnose, it never arrives.
+        // Emitted only when a meta actually failed to decode, so a healthy cluster's log is
+        // byte-identical to what it was (gap G-07).
+        if view.undecodable > 0 {
+            tracing::warn!(
+                undecodable = view.undecodable,
+                voters_reporting = view.voters_reporting(),
+                voters_total = view.voters.len(),
+                detail = "these peers count as lagging, so convergence will not complete while \
+                          this lasts; it is a wire-format problem, not a slow peer",
+                "policy_hint_undecodable"
+            );
+        }
         if !self
             .authorizer
             .note_cluster_min_version(view.min_reported())
@@ -387,20 +545,12 @@ impl ClusterPolicyVersions for GossipPolicyVersions {
             .voters
             .into_iter()
             .collect();
-        let mut reported = BTreeMap::new();
-        for meta in self.gossip.member_meta().await {
-            // A meta that does not decode is a peer this build cannot read, which is the same
-            // thing as a peer that has not reported: it is left out, and counts as lagging.
-            let Ok(hint) = config_gossip::decode_hint(&meta) else {
-                continue;
-            };
-            if let Some(version) =
-                config_gossip::decode_hint_extras(&meta).and_then(|extras| extras.policy_version)
-            {
-                reported.insert(hint.node_id, version);
-            }
+        let (reported, undecodable) = read_reported_versions(self.gossip.member_meta().await);
+        ClusterPolicyView {
+            voters,
+            reported,
+            undecodable,
         }
-        ClusterPolicyView { voters, reported }
     }
 
     async fn advertise(&self, version: u64) {
@@ -419,6 +569,37 @@ impl ClusterPolicyVersions for GossipPolicyVersions {
             );
         }
     }
+}
+
+/// Split a round of gossip metas into the versions they report and the ones that did not
+/// decode (M6, gap G-07).
+///
+/// A free function over the raw metas, rather than a loop inside `view`, because the counting
+/// is the entire fix and a fix nothing can drive is not one: a wire regression is exactly the
+/// situation in which no cluster is available to reproduce it. Given the bytes, this is a pure
+/// function and a plain test can hand it a garbage meta.
+///
+/// The semantics are **unchanged**, deliberately. An undecodable peer is still left out of
+/// `reported` and still counts as lagging, because a peer this build cannot read has told this
+/// node nothing and "probably fine" is the exact failure the converging clause exists to
+/// prevent. The count is reported, not acted on.
+fn read_reported_versions(
+    metas: impl IntoIterator<Item = Vec<u8>>,
+) -> (BTreeMap<config_core::NodeId, u64>, usize) {
+    let mut reported = BTreeMap::new();
+    let mut undecodable = 0;
+    for meta in metas {
+        let Ok(hint) = config_gossip::decode_hint(&meta) else {
+            undecodable += 1;
+            continue;
+        };
+        if let Some(version) =
+            config_gossip::decode_hint_extras(&meta).and_then(|extras| extras.policy_version)
+        {
+            reported.insert(hint.node_id, version);
+        }
+    }
+    (reported, undecodable)
 }
 
 /// Put `version` on the wire through `broadcast`, unless it is already there.
@@ -460,6 +641,15 @@ pub struct ClusterPolicyView {
     /// The version each node currently advertises. A voter absent from this map has not
     /// reported one.
     pub reported: BTreeMap<config_core::NodeId, u64>,
+    /// Peers whose gossip meta this build could not decode at all (M6, gap G-07).
+    ///
+    /// Counted, not identified: a meta that does not decode has no trustworthy node id in it
+    /// to name. These peers are already inside "has not reported", so this number never
+    /// changes a decision — it exists so that a cluster stuck in `Converging` can be told apart
+    /// from one that is merely waiting. Without it, a wire-format regression and an ordinary
+    /// lagging voter produce byte-identical observable state, and the stall has no diagnostic
+    /// at all.
+    pub undecodable: usize,
 }
 
 impl ClusterPolicyView {
@@ -538,7 +728,7 @@ mod tests {
     use std::time::Duration;
 
     use config_core::policy::{document_hash, grant, signature_payload, PolicySignature};
-    use config_core::{Action, Limits, PolicyDocument};
+    use config_core::{Action, ClusterIdentity, Limits, PolicyDocument, RecoveryEpoch};
     use config_engine::{SystemClock, WatchHub};
     use ed25519_dalek::{Signer, SigningKey};
 
@@ -546,9 +736,14 @@ mod tests {
 
     const KEY_NAME: &str = "ops";
 
+    /// The cluster this fixture's node belongs to.
+    const THIS_CLUSTER: ClusterId = ClusterId::from_bytes([0xC1; 16]);
+    /// A different cluster, for the G-06 row.
+    const OTHER_CLUSTER: ClusterId = ClusterId::from_bytes([0xC2; 16]);
+
     /// A loader over a fresh temp directory, plus the hub it revokes through.
     struct Fixture {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         key: SigningKey,
         loader: Arc<PolicyLoader>,
         hub: Arc<WatchHub>,
@@ -556,7 +751,20 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_floor(None)
+        }
+
+        /// The same fixture, with somewhere durable to keep the version floor (gap G-09).
+        fn with_floor(floor: Option<Arc<dyn PolicyVersionFloor>>) -> Self {
             let dir = tempfile::tempdir().expect("a temp directory");
+            Self::in_dir(dir, floor)
+        }
+
+        /// A second loader over an existing directory: what a restart looks like from here.
+        ///
+        /// The files stay where they are and everything in memory is rebuilt — a fresh
+        /// authorizer with no active document, which is precisely the state G-09 is about.
+        fn in_dir(dir: tempfile::TempDir, floor: Option<Arc<dyn PolicyVersionFloor>>) -> Self {
             let key = SigningKey::from_bytes(&[0x5C; 32]);
             let policy_file = dir.path().join("policy.json");
             let signature_file = dir.path().join("policy.json.sig");
@@ -570,9 +778,11 @@ mod tests {
                 },
                 Arc::new(SignedPolicyAuthorizer::new(false)),
                 Arc::clone(&hub),
+                THIS_CLUSTER,
+                floor,
             );
             Self {
-                _dir: dir,
+                dir,
                 key,
                 loader,
                 hub,
@@ -581,6 +791,12 @@ mod tests {
 
         /// Write a document at `version` granting `app` read+write on each prefix.
         fn write(&self, version: u64, prefixes: &[&str]) {
+            self.write_for(None, version, prefixes);
+        }
+
+        /// The same, issued for `cluster`. `None` is a document that names no cluster, which is
+        /// what every document signed before G-06 looks like.
+        fn write_for(&self, cluster: Option<ClusterId>, version: u64, prefixes: &[&str]) {
             let document = PolicyDocument {
                 version,
                 issued_unix_ms: 1_700_000_000_000 + version,
@@ -589,6 +805,7 @@ mod tests {
                     .map(|p| grant("app", p, &[Action::Read, Action::Write]))
                     .collect(),
                 admins: vec!["root".to_string()],
+                cluster_id: cluster,
             };
             let bytes = serde_json::to_vec(&document).expect("a document serializes");
             let hash = document_hash(&bytes);
@@ -612,6 +829,400 @@ mod tests {
         fn epoch(&self) -> u64 {
             self.hub.testing().policy_epoch()
         }
+    }
+
+    /// Counts emitted events whose `message` field is exactly `name`.
+    ///
+    /// The same shape as `config-grpc`'s `WarnCounter`, and for the reason its doc comment
+    /// gives: asserting a private flag would pass on an implementation whose line never reached
+    /// a subscriber, and the line *is* what the operator has.
+    #[derive(Clone)]
+    struct EventCounter {
+        name: &'static str,
+        seen: Arc<AtomicU64>,
+    }
+
+    impl EventCounter {
+        fn new(name: &'static str) -> Self {
+            Self {
+                name,
+                seen: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn count(&self) -> u64 {
+            self.seen.load(Ordering::Relaxed)
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut message = Message(None);
+            event.record(&mut message);
+            if message.0.as_deref() == Some(self.name) {
+                self.seen.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Install `counter` for the duration of the returned guard.
+    fn counting(counter: &EventCounter) -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(counter.clone()))
+    }
+
+    /// A real `RocksStore` in `dir`, which is what makes the G-09 row a durability claim
+    /// rather than a claim about an in-memory counter.
+    fn store(dir: &Path) -> Arc<dyn PolicyVersionFloor> {
+        Arc::new(
+            config_storage::RocksStore::open(
+                dir,
+                ClusterIdentity {
+                    cluster_id: THIS_CLUSTER,
+                    recovery_epoch: RecoveryEpoch(0),
+                    node_id: NodeId(1),
+                },
+                Limits::DEFAULT,
+                Arc::new(config_storage::NoFaults),
+                tracing::Span::none(),
+            )
+            .expect("a fresh data directory opens"),
+        )
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Gap G-06: which cluster the daemon will accept a document from.
+
+    /// G-06: the daemon refuses a document issued for another cluster, and the refusal reaches
+    /// the log under its own reason rather than as a version problem.
+    ///
+    /// The loader half of the row `config-core` proves at the verification level. It exists
+    /// separately because the defect was that the daemon never told `verify_policy` which
+    /// cluster it was: a correct check nothing passes an argument to is not a check.
+    ///
+    /// Mutation check: passing any other value than the node's own cluster at the
+    /// `verify_policy` call site makes the second half adopt.
+    #[config_log::retcd_test]
+    fn a_document_for_another_cluster_is_refused_by_the_loader() {
+        let fixture = Fixture::new();
+        fixture.write_for(Some(THIS_CLUSTER), 1, &["/a/"]);
+        fixture.loader.reload("startup").expect("our own v1 loads");
+
+        // Higher-versioned, wider, and signed by the same trusted key — the document that used
+        // to take over.
+        fixture.write_for(Some(OTHER_CLUSTER), 99, &["/"]);
+        let rejection = fixture
+            .loader
+            .reload("poll")
+            .expect_err("another cluster's document is not ours to adopt");
+        assert_eq!(rejection.reason(), "cluster_mismatch");
+        assert_ne!(
+            rejection.reason(),
+            "rollback",
+            "the two call for different operator actions and must not share a reason"
+        );
+        assert_eq!(
+            fixture.loader.authorizer.policy_version(),
+            Some(1),
+            "the refusal left our own document in force"
+        );
+        assert_eq!(
+            fixture.loader.metrics().reload_failures["cluster_mismatch"],
+            1,
+            "the refusal is counted under its own label, so an alert rule can name it"
+        );
+    }
+
+    /// G-06: a document that names no cluster adopts, and the operator is told it is unscoped.
+    ///
+    /// Both halves matter and they pull against each other. Adopting is what keeps every
+    /// already-signed document valid — without it the fix is a flag day. Warning is the only
+    /// way an operator learns that this node would also accept another cluster's document
+    /// signed by the same key, which is the residue G-06 leaves behind until every document is
+    /// re-issued.
+    ///
+    /// The warning is asserted by counting the emitted event, not by reading a field: a test
+    /// that read the field would pass on a build whose line never reached a subscriber.
+    #[config_log::retcd_test]
+    fn an_unscoped_document_adopts_and_warns() {
+        let fixture = Fixture::new();
+        let unscoped = EventCounter::new("policy_unscoped");
+
+        {
+            let _guard = counting(&unscoped);
+            fixture.write_for(None, 1, &["/a/"]);
+            fixture
+                .loader
+                .reload("startup")
+                .expect("a legacy document loads");
+            assert_eq!(
+                unscoped.count(),
+                1,
+                "adopting an unscoped document warns once"
+            );
+
+            // Three more polls over the same file. A warning once per poll interval for the
+            // rest of the deployment's life is a warning nobody reads.
+            for _ in 0..3 {
+                fixture.loader.reload("poll").expect("unchanged");
+            }
+            assert_eq!(unscoped.count(), 1, "an unchanged file must not re-warn");
+
+            // And a scoped document adopting afterwards says nothing, so the line means what
+            // it says rather than "a reload happened".
+            fixture.write_for(Some(THIS_CLUSTER), 2, &["/a/", "/b/"]);
+            fixture.loader.reload("poll").expect("v2 adopts");
+            assert_eq!(unscoped.count(), 1, "a scoped document is not warned about");
+        }
+
+        assert_eq!(fixture.loader.authorizer.policy_version(), Some(2));
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Gap G-09: the version floor outlives the process.
+
+    /// G-09: after a restart, a validly signed document **below** the version this node last
+    /// served is refused — and the refusal goes through a real `RocksStore` on disk.
+    ///
+    /// **This is the row that matters.** The defect needed no key and no forgery: `adopt`
+    /// returned `Adopted { from: None }` unconditionally whenever nothing was active, which is
+    /// every process start, so an old file was enough to revert the grant set and the admin set
+    /// across a restart, logged as an ordinary adoption.
+    ///
+    /// The restart is simulated by dropping every in-memory thing — the store, the authorizer
+    /// and the loader — and rebuilding them over the same directory. Nothing is carried across
+    /// but the files, so the only way v3 can be refused is if the floor was read back off the
+    /// disk. A test that seeded the authorizer directly would prove the rule and nothing about
+    /// durability, which is the half that was missing.
+    #[config_log::retcd_test]
+    fn a_restart_refuses_a_document_below_the_persisted_floor() {
+        let data = tempfile::tempdir().expect("a data directory");
+
+        // ---- first boot: serve v5 ----
+        let dir = {
+            let fixture = Fixture::with_floor(Some(store(data.path())));
+            fixture.write(5, &["/a/"]);
+            fixture.loader.reload("startup").expect("v5 loads");
+            assert_eq!(fixture.loader.authorizer.policy_version(), Some(5));
+            fixture.dir
+        };
+
+        // ---- restart: everything in memory is gone, the directory is not ----
+        let restarted = Fixture::in_dir(dir, Some(store(data.path())));
+
+        // An attacker, or a careless deploy, puts the old document back. It is genuinely
+        // signed by the trusted key; nothing about it is forged. `/` is wider than `/a/`, so
+        // an adoption would be an actual privilege change and not a cosmetic one.
+        for version in [3, 4] {
+            restarted.write(version, &["/"]);
+            let rejection = restarted
+                .loader
+                .reload("startup")
+                .expect_err("a document at or below the persisted floor must be refused");
+            assert_eq!(
+                rejection,
+                PolicyRejected::RollbackFloor {
+                    floor: 5,
+                    incoming: version
+                },
+                "v{version} after a restart"
+            );
+            assert_ne!(
+                rejection.reason(),
+                "rollback",
+                "a downgrade across a restart must be distinguishable in the log from a \
+                 downgrade offered to a running node: only one of them means the control was \
+                 bypassed"
+            );
+            assert_eq!(
+                restarted.loader.authorizer.policy_version(),
+                None,
+                "and it is refused rather than adopted-then-corrected"
+            );
+        }
+
+        // Forward still works, or the fix would be a node that can never load a policy again.
+        restarted.write(6, &["/a/"]);
+        restarted
+            .loader
+            .reload("poll")
+            .expect("v6 is above the floor");
+        assert_eq!(restarted.loader.authorizer.policy_version(), Some(6));
+    }
+
+    /// G-09, the positive control: a restart that reloads the document it was already serving
+    /// loads ordinarily, through the same real `RocksStore`.
+    ///
+    /// The row that was missing, and whose absence let a BLOCKER ship into the wave. The floor
+    /// was written as "refuse at or below", which reads correctly and is wrong: the version a
+    /// node last served is the version its own file still holds, so the first thing every
+    /// healthy restart does is offer the floor back. Refusing it meant a signed-policy node
+    /// could never restart.
+    ///
+    /// Observed as `e2e_46_daemon_break_glass_rollback_is_audited` at `e2e_daemon.rs:2221`:
+    ///
+    /// ```text
+    /// the restart itself is a first load, not a rollback: {"break_glass": true, ...}
+    /// ```
+    ///
+    /// The break-glass node survived only because its flag let it through the refusal — and it
+    /// was then audited as having used break-glass to force a rollback it never performed.
+    ///
+    /// `rollbacks` is the assertion that pins the audit trail here, because it is the
+    /// loader-level consequence of the `break_glass` flag `attempt` returns (`policy.rs:189`).
+    /// Under the defect it would have ticked once per restart, so
+    /// `retcd_policy_rollbacks_total` — the gauge an operator alerts on to find a node that was
+    /// forced backwards — would have counted every ordinary restart in the fleet.
+    #[config_log::retcd_test]
+    fn a_restart_against_an_equal_floor_is_an_ordinary_load() {
+        let data = tempfile::tempdir().expect("a data directory");
+
+        let dir = {
+            let fixture = Fixture::with_floor(Some(store(data.path())));
+            fixture.write(5, &["/a/"]);
+            fixture.loader.reload("startup").expect("v5 loads");
+            fixture.dir
+        };
+
+        // The file is untouched: this is the same v5 document, which is what a restart finds.
+        let restarted = Fixture::in_dir(dir, Some(store(data.path())));
+        restarted
+            .loader
+            .reload("startup")
+            .expect("a node reloads the document it was already serving");
+
+        assert_eq!(restarted.loader.authorizer.policy_version(), Some(5));
+        assert_eq!(
+            restarted.loader.authorizer.version_floor(),
+            5,
+            "and the floor stays where it was"
+        );
+        assert_eq!(
+            restarted.loader.metrics().rollbacks,
+            0,
+            "an ordinary restart is not a rollback, and must not be counted as one"
+        );
+    }
+
+    /// G-09: a floor that exists but cannot be read is visible as a gauge, not only as a log
+    /// line.
+    ///
+    /// The node starts anyway — see `PolicyLoader::new` and ADR-0027 — so for this boot it is
+    /// back to the pre-G-09 behaviour and a validly signed older document would be accepted. An
+    /// `error` line is too thin for that: it has to be something an alert can watch, for the
+    /// same reason `break_glass_active` is a gauge rather than a log line.
+    ///
+    /// Both halves are asserted, and the second is the one that makes this a test. A gauge
+    /// wired to a constant `true` would pass an assertion that only ever checks the failing
+    /// case, which is the usual way a metric like this ships broken.
+    ///
+    /// Cheap because `PolicyVersionFloor` is a trait rather than a concrete `RocksStore`: a
+    /// failing store is three lines, with no fault injection and no disk involved.
+    ///
+    /// Mutation check: clearing `floor_unreadable` unconditionally in `metrics()` fails the
+    /// first assertion and nothing else.
+    #[config_log::retcd_test]
+    fn an_unreadable_floor_is_visible_as_a_gauge_not_only_a_log_line() {
+        /// A store whose cell is there but unreadable — a corrupt value, a decode change, a
+        /// bug in the read path. Not the same as having no store at all.
+        struct Unreadable;
+        impl PolicyVersionFloor for Unreadable {
+            fn policy_version_floor(&self) -> Result<u64, String> {
+                Err("the floor cell could not be decoded".to_string())
+            }
+            fn set_policy_version_floor(&self, _version: u64) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let broken = Fixture::with_floor(Some(Arc::new(Unreadable)));
+        assert!(
+            broken.loader.metrics().floor_unreadable,
+            "a floor that could not be read is on the gauge an operator alerts on"
+        );
+
+        let data = tempfile::tempdir().expect("a data directory");
+        let healthy = Fixture::with_floor(Some(store(data.path())));
+        assert!(
+            !healthy.loader.metrics().floor_unreadable,
+            "and a node whose floor read fine does not raise it — without this half the gauge \
+             could be stuck at 1 and still pass"
+        );
+    }
+
+    /// G-09: with nowhere durable to keep the floor, the loader behaves exactly as it did
+    /// before the floor existed.
+    ///
+    /// The `None` arm is what an ephemeral store gets. It has to stay a plain no-op: a loader
+    /// that refused to start, or that failed a reload, because there was no cell to write would
+    /// turn a store kind the daemon does not even open into a startup failure.
+    #[config_log::retcd_test]
+    fn without_a_durable_floor_a_restart_is_unchanged() {
+        let data = tempfile::tempdir().expect("a directory");
+        let dir = {
+            let fixture = Fixture::with_floor(None);
+            fixture.write(5, &["/a/"]);
+            fixture.loader.reload("startup").expect("v5 loads");
+            fixture.dir
+        };
+        drop(data);
+
+        let restarted = Fixture::in_dir(dir, None);
+        restarted.write(3, &["/"]);
+        restarted
+            .loader
+            .reload("startup")
+            .expect("nothing durable knows better, so this is the pre-G-09 behaviour");
+        assert_eq!(restarted.loader.authorizer.policy_version(), Some(3));
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Gap G-07: a peer hint this build cannot read.
+
+    /// G-07: a gossip meta that does not decode is counted, so a stalled convergence can be
+    /// told apart from a slow one.
+    ///
+    /// The drop itself is correct and is left alone: a peer this build cannot read has told
+    /// this node nothing, and treating that as agreement is the failure the converging clause
+    /// exists to prevent. What was wrong is that it was *invisible* — a wire-format regression
+    /// and an ordinary lagging voter produced identical observable state, and the cluster sat
+    /// in `Converging` with nothing anywhere to say why.
+    ///
+    /// Mutation check: dropping the `undecodable += 1` makes the second assertion read zero
+    /// while the first still passes, which is exactly the pre-fix behaviour.
+    #[test]
+    fn an_undecodable_hint_is_counted_rather_than_silently_dropped() {
+        // Two metas this build cannot read at all: an empty one, and one whose wire version
+        // byte names a format that does not exist.
+        let (reported, undecodable) = read_reported_versions(vec![Vec::new(), vec![0xFF, 0x01]]);
+        assert!(
+            reported.is_empty(),
+            "an unreadable peer still reports nothing, which is the semantics G-07 must not \
+             change"
+        );
+        assert_eq!(
+            undecodable, 2,
+            "and the fact that it was unreadable rather than silent is now visible"
+        );
+
+        // A round with nothing wrong counts nothing, so the number means what it says.
+        assert_eq!(read_reported_versions(Vec::<Vec<u8>>::new()).1, 0);
     }
 
     /// C6R-03, the identical half: a file that has not changed is a no-op however often the
@@ -758,6 +1369,7 @@ mod tests {
                 .iter()
                 .map(|(id, version)| (NodeId(*id), *version))
                 .collect(),
+            undecodable: 0,
         }
     }
 

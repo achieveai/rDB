@@ -160,8 +160,20 @@ pub fn status_from_error(err: &ConfigError) -> Status {
         ConfigError::ResourceExhausted { resumable, .. } => {
             insert_ascii(&mut status, HEADER_RESUMABLE, resumable.to_string());
         }
-        ConfigError::PageTokenExpired { reason } => {
+        ConfigError::PageTokenExpired { reason, hint } => {
             insert_ascii(&mut status, HEADER_REASON, reason.to_string());
+            // The same two trailers `NotLeader` uses, on the one page-token refusal that can
+            // name a better node (G-04). One vocabulary for "go here instead", so a client
+            // that already follows hints needs no new code — and `reason` is untouched, so a
+            // client that does not is unaffected.
+            if let Some(hint) = hint {
+                insert_ascii(
+                    &mut status,
+                    HEADER_LEADER_NODE_ID,
+                    hint.node_id.0.to_string(),
+                );
+                insert_ascii(&mut status, HEADER_LEADER_ENDPOINT, hint.endpoint.clone());
+            }
         }
         ConfigError::PermissionDenied { .. } => {
             // Only the closed set below reaches the trailer. Most denials carry operator prose
@@ -274,13 +286,17 @@ pub fn error_from_status(status: &Status) -> ConfigError {
 }
 
 fn failed_precondition(status: &Status) -> ConfigError {
-    // Checked before the conflict and leader-hint readings: a page-token refusal carries
-    // neither of their headers, and the fall-through below is `NotLeader`, which would send a
-    // client chasing a leader over a cursor that simply expired.
+    // Checked first, and `reason` is what decides: since G-04 a page-token refusal *may* also
+    // carry the two leader-hint headers, so reading those first would rebuild it as
+    // `NotLeader` and send a client chasing a leader over a cursor that simply expired. The
+    // hint rides along on the refusal it belongs to rather than replacing it.
     if let Some(reason) =
         meta_str(status, HEADER_REASON).and_then(config_core::PageTokenExpiredReason::from_trailer)
     {
-        return ConfigError::PageTokenExpired { reason };
+        return ConfigError::PageTokenExpired {
+            reason,
+            hint: leader_hint(status),
+        };
     }
     if let Some(rev) = meta_str(status, HEADER_CONFLICT_MOD_REVISION).and_then(|v| v.parse().ok()) {
         return ConfigError::Conflict {
@@ -362,6 +378,83 @@ mod tests {
         assert!(
             status.metadata().get(HEADER_REASON).is_none(),
             "only the closed set reaches the trailer"
+        );
+    }
+
+    /// G-04, the wire half: a `node` refusal carrying a hint survives the round trip whole.
+    ///
+    /// Both directions, because the two are what make the hint usable: the trailers have to be
+    /// the same two `NotLeader` uses, and `failed_precondition` has to keep reading `reason`
+    /// first — a status that now carries leader trailers must still come back as
+    /// `PageTokenExpired` and not be mistaken for a `NotLeader`.
+    #[test]
+    fn a_page_token_refusal_carries_its_leader_hint_both_ways() {
+        let hint = config_core::LeaderHint {
+            node_id: config_core::NodeId(3),
+            endpoint: "10.0.0.3:2379".to_string(),
+        };
+        let status = status_from_error(&ConfigError::PageTokenExpired {
+            reason: config_core::PageTokenExpiredReason::Node,
+            hint: Some(hint.clone()),
+        });
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_REASON)
+                .and_then(|v| v.to_str().ok()),
+            Some("node"),
+            "the reason a client that ignores hints still reads"
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_LEADER_NODE_ID)
+                .and_then(|v| v.to_str().ok()),
+            Some("3")
+        );
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_LEADER_ENDPOINT)
+                .and_then(|v| v.to_str().ok()),
+            Some("10.0.0.3:2379")
+        );
+
+        assert_eq!(
+            error_from_status(&status),
+            ConfigError::PageTokenExpired {
+                reason: config_core::PageTokenExpiredReason::Node,
+                hint: Some(hint),
+            },
+            "a refusal with a hint must not come back as a NotLeader"
+        );
+    }
+
+    /// The additive half: a hintless refusal is byte-for-byte what it always was.
+    #[test]
+    fn a_hintless_page_token_refusal_is_unchanged_on_the_wire() {
+        let status = status_from_error(&ConfigError::page_token_expired(
+            config_core::PageTokenExpiredReason::Evicted,
+        ));
+
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(
+            status
+                .metadata()
+                .get(HEADER_REASON)
+                .and_then(|v| v.to_str().ok()),
+            Some("evicted")
+        );
+        assert!(
+            status.metadata().get(HEADER_LEADER_NODE_ID).is_none()
+                && status.metadata().get(HEADER_LEADER_ENDPOINT).is_none(),
+            "no hint, no trailers"
+        );
+        assert_eq!(
+            error_from_status(&status),
+            ConfigError::page_token_expired(config_core::PageTokenExpiredReason::Evicted)
         );
     }
 }

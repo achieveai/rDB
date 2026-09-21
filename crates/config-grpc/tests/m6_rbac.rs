@@ -221,6 +221,7 @@ fn document(version: u64, admins: &[&str], grants: Vec<Grant>) -> SignedPolicy {
         issued_unix_ms: version,
         grants,
         admins: admins.iter().map(|a| (*a).to_string()).collect(),
+        cluster_id: None,
     };
     let bytes = serde_json::to_vec(&document).expect("a policy document serializes");
     SignedPolicy {

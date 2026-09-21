@@ -109,5 +109,9 @@ pub use limits::{
 pub use peer_plane::{serve_peer_plane, status_from_reject, PeerIdentity};
 pub use rotation::{RotationError, TlsFiles, TlsRotator};
 pub use server::ServerHandle;
-pub use tls::{peer_server_domain, CertIdentity, MtlsConfig, TlsMode};
+// `DEFAULT_HANDSHAKE_TIMEOUT` is re-exported at the root rather than left at `tls::` because
+// it stopped being an internal constant when `[tls] handshake_timeout_ms` gained it as a
+// documented default (G-01): the daemon's configuration validator now names it, and a default
+// an operator reads about should sit beside the type it defaults a field of.
+pub use tls::{peer_server_domain, CertIdentity, MtlsConfig, TlsMode, DEFAULT_HANDSHAKE_TIMEOUT};
 pub use transport::GrpcPeerTransport;

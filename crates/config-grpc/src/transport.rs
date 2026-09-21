@@ -24,6 +24,25 @@
 //!
 //! The answer's identity fields are checked before its payload is decoded: see [`PeerTransport`]
 //! below and `PeerIdentity` on the serving side.
+//!
+//! # A poisoned lock is recovered, not fatal
+//!
+//! Every lock below is taken with `unwrap_or_else(|e| e.into_inner())`, which is the same
+//! convention [`crate::rotation`] uses on its own locks. The two modules sit on one credential
+//! path and previously disagreed — this one panicked where the rotator carried on — so a single
+//! panic elsewhere would have been a local failure to the rotator and a node outage here.
+//!
+//! Recovery is sound rather than merely convenient, because neither guarded value has an
+//! invariant a panic can leave half-built. `dial` is one `Arc<MtlsConfig>` replaced by a single
+//! assignment. The cache's only multi-step edit clears the map *before* it records the new
+//! generation, so an edit interrupted between the two leaves an empty map under a stale
+//! generation: the next dial finds the generation still stale, clears an already-empty map and
+//! re-dials. That is the safe end of the range, and it is the only intermediate state reachable
+//! — the dangerous one, a fresh generation over stale channels, is not written in that order.
+//!
+//! What panicking would add is therefore not safety but blast radius: every later peer dial, and
+//! [`GrpcPeerTransport::cached_endpoints`] with them, would panic too, permanently, on a node
+//! whose Raft transport was otherwise healthy.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -89,10 +108,10 @@ impl std::fmt::Debug for GrpcPeerTransport {
         f.debug_struct("GrpcPeerTransport")
             .field("tls", &self.tls)
             .field("generation", &self.generation())
-            .field(
-                "endpoints",
-                &self.channels.lock().map(|c| c.channels.len()).unwrap_or(0),
-            )
+            // The same recovery as every other lock in this module, rather than the `0` a
+            // third spelling used to print: a poisoned cache still knows how many channels it
+            // holds, and a diagnostic that silently reads zero is worse than no diagnostic.
+            .field("endpoints", &self.cached_endpoints())
             .finish()
     }
 }
@@ -129,7 +148,7 @@ impl GrpcPeerTransport {
     pub fn cached_endpoints(&self) -> usize {
         self.channels
             .lock()
-            .expect("channel cache poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .channels
             .len()
     }
@@ -164,7 +183,7 @@ impl GrpcPeerTransport {
         Credentials::compile(mtls.clone())?;
 
         let generation = {
-            let mut dial = self.dial.lock().expect("dial credentials poisoned");
+            let mut dial = self.dial.lock().unwrap_or_else(|e| e.into_inner());
             *dial = Arc::new(mtls);
             // Inside the lock, so no dial can pair the new material with the old generation.
             self.generation.fetch_add(1, Ordering::AcqRel) + 1
@@ -181,7 +200,7 @@ impl GrpcPeerTransport {
         let key: ChannelKey = (endpoint.to_string(), meta.to);
         let generation = self.generation();
         {
-            let mut cache = self.channels.lock().expect("channel cache poisoned");
+            let mut cache = self.channels.lock().unwrap_or_else(|e| e.into_inner());
             if cache.generation != generation {
                 cache.channels.clear();
                 cache.generation = generation;
@@ -197,7 +216,7 @@ impl GrpcPeerTransport {
         if matches!(self.tls, TlsMode::MutualTls(_)) {
             // Read from the live material, not from the mode: the mode holds what this node
             // started with, which a rotation has since replaced.
-            let dial = Arc::clone(&self.dial.lock().expect("dial credentials poisoned"));
+            let dial = Arc::clone(&self.dial.lock().unwrap_or_else(|e| e.into_inner()));
             // The envelope names the node we mean to reach, so that is the name TLS verifies.
             let domain = peer_server_domain(&meta.cluster_id, meta.to);
             ep = ep
@@ -207,7 +226,7 @@ impl GrpcPeerTransport {
                 })?;
         }
         let channel = ep.connect_lazy();
-        let mut cache = self.channels.lock().expect("channel cache poisoned");
+        let mut cache = self.channels.lock().unwrap_or_else(|e| e.into_inner());
         // Another dial may have reloaded while this one was building its endpoint. Caching a
         // channel from a superseded generation would defeat the invalidation above, so it is
         // simply not cached — the call still proceeds on the channel it built.
@@ -468,6 +487,52 @@ mod tests {
             matches!(error, GrpcError::Tls(ref detail) if detail.contains("insecure")),
             "expected the insecure refusal, got {error:?}"
         );
+    }
+
+    /// A poisoned lock is a recovered condition here, exactly as it is in [`crate::rotation`],
+    /// and not a node-wide outage.
+    ///
+    /// Poisoned deliberately by unwinding out of a held guard, which is the only way to reach
+    /// the state at all — no path in this module panics while holding either lock. Both are
+    /// then exercised: a dial must still be built, still be cached, and a reload must still
+    /// replace the material.
+    #[tokio::test]
+    async fn a_poisoned_lock_does_not_take_the_transport_down() {
+        let fixture = TlsFixture::new();
+        let transport = GrpcPeerTransport::new(
+            TlsMode::MutualTls(fixture.server_material()),
+            NetFault::new(),
+            Limits::DEFAULT,
+        );
+
+        poison(&transport.channels);
+        poison(&transport.dial);
+        assert!(transport.channels.is_poisoned() && transport.dial.is_poisoned());
+
+        // Every accessor, in the order a live node would reach them.
+        assert_eq!(transport.cached_endpoints(), 0);
+        transport
+            .channel(&meta(), "peer-2.invalid:1")
+            .expect("a poisoned cache must not stop a dial");
+        assert_eq!(transport.cached_endpoints(), 1);
+        assert_eq!(
+            transport.reload(fixture.server_material()).expect("reload"),
+            1,
+            "a poisoned dial lock must not stop a rotation"
+        );
+    }
+
+    /// Unwind out of a held guard, which is the only way to poison a lock.
+    ///
+    /// The panic is caught here rather than allowed to fail the test: a poisoned lock is the
+    /// *precondition* of the row above, not its subject. Run on this thread rather than a
+    /// spawned one so the deliberate panic's message goes to the harness's captured output
+    /// instead of to the gate's stderr, where it would read as a failure.
+    fn poison<T>(lock: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("the lock is not poisoned yet");
+            panic!("deliberate: poisoning this lock is the precondition under test");
+        }));
     }
 
     /// The classification table OpenRaft's retry policy reads, asserted without a socket.

@@ -1646,9 +1646,12 @@ fn e44_key(prefix: &str, index: usize) -> Bytes {
 /// guard rather than on some other path to the same error variant.
 ///
 /// Asserted: continuing the original walk's token after the leader is killed fails with
-/// `ConfigError::PageTokenExpired { reason: PageTokenExpiredReason::Node }` — the pin cannot
-/// exist on any node but the one that minted it, whether or not that node happens to still be
-/// leader (`Paginator::open` runs the node-id check before any leadership check at all). A
+/// `ConfigError::PageTokenExpired { reason: PageTokenExpiredReason::Node, .. }` — the pin
+/// cannot exist on any node but the one that minted it, whether or not that node happens to
+/// still be leader (`Paginator::open` runs the node-id check before any leadership check at
+/// all). The `..` is G-04's `hint`: the refusal may now carry a leader hint, and this row
+/// deliberately does not assert on it — the minting node is dead, so whatever hint the
+/// survivor attaches names a node other than the one the token was bound to. A
 /// freshly restarted walk against the surviving cluster returns a complete, self-consistent
 /// snapshot — every page reports the same (new) revision, no key is missing, and no key is
 /// duplicated.
@@ -1747,7 +1750,10 @@ async fn e2e_44_daemon_pagination_across_a_leader_failover() {
         "continuing a token minted by the killed leader must fail once no live node holds its pin",
     );
     match error {
-        ConfigError::PageTokenExpired { reason } => {
+        // `..` and not the hint: this row is about the `node` reason surviving G-04, which
+        // added a leader hint beside it. Binding the hint here would make an additive change
+        // look like a behaviour change in the row that exists to prove it is not one.
+        ConfigError::PageTokenExpired { reason, .. } => {
             assert_eq!(
                 reason,
                 PageTokenExpiredReason::Node,
@@ -2342,6 +2348,7 @@ fn e40_write_policy(dir: &std::path::Path, version: u64, grants: &[(&str, &str)]
             })
             .collect(),
         admins: Vec::new(),
+        cluster_id: None,
     };
     let bytes = serde_json::to_vec(&document).expect("a policy document serializes");
     let hash = config_core::policy::document_hash(&bytes);

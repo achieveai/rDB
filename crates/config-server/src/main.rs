@@ -198,6 +198,7 @@ fn run_offline(command: Command, cli: &Cli) -> Result<String, backup::BackupErro
             manifest_key,
             trust_key,
             encryption_key,
+            active_policy_version,
         } => {
             let keys = backup::KeyFiles {
                 signing_key: None,
@@ -214,8 +215,25 @@ fn run_offline(command: Command, cli: &Cli) -> Result<String, backup::BackupErro
                 manifest,
                 manifest_sig: manifest_sig.as_deref(),
                 manifest_key: manifest_key.as_deref(),
+                active_policy_version: *active_policy_version,
             };
             let outcome = backup::restore(&request, &keys)?;
+            // M6-35. Emitted **before** `restore_completed`, so the divergence is read in the
+            // order it was decided rather than as a footnote to a success. ADR-0027 specifies
+            // `warn`; these subcommands install no tracing subscriber, so the severity travels
+            // as a field on the record rather than as a log level that would not exist.
+            // Never a refusal: an independently supplied policy may legitimately be older,
+            // newer or unrelated, and refusing would make a restore depend on an artifact the
+            // backup does not contain.
+            if let Some(divergence) = outcome.policy_divergence {
+                audit_line(serde_json::json!({
+                    "msg": "restore_policy_mismatch",
+                    "level": "warn",
+                    "source": "cli",
+                    "manifest_version": divergence.manifest_version,
+                    "active_version": divergence.active_version,
+                }));
+            }
             // M5-81. The one record that says a new authority was minted, and the only place
             // both identities appear together: afterwards the store knows only the new one and
             // the artifact knows only the old one, so nothing else can ever be correlated back.

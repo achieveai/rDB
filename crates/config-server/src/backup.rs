@@ -92,7 +92,18 @@ pub struct BackupManifest {
     pub counts: BTreeMap<String, u64>,
     /// Lowercase hex SHA-256 of the **plaintext** `.snap`.
     pub sha256: String,
-    /// Reserved for M6 policy versioning (ADR-0027); `null` until then.
+    /// The signed policy document that was in force when the backup was taken (ADR-0027, M6-33).
+    ///
+    /// A **reference**, never a copy: §15.3 says an artifact references but does not contain or
+    /// override the external RBAC artifact, so this is a version number and nothing else — no
+    /// grants, no principals, no document body. Nothing checks it at restore, because the
+    /// independently supplied policy may legitimately be older, newer or unrelated; it exists so
+    /// a recovering operator can tell which document the data was authorized under.
+    ///
+    /// `null` when the exporting process had no active policy to name: a static-mode node, a
+    /// signed-mode node holding no valid document, and — until the policy version floor is
+    /// durable (gap G-09) — every backup taken by the offline CLI, which reads a stopped data
+    /// directory and runs no policy loader.
     pub policy_version_ref: Option<u64>,
     /// Wall-clock export time.
     pub created_unix_ms: u64,
@@ -266,7 +277,12 @@ pub fn backup_offline(
     let header = config_storage::snapshot::export_snapshot(data_dir, &plaintext)
         .map_err(|e| store_error("source", data_dir, e))?;
 
-    let finished = finish_artifact(&header, &plaintext, out_dir, &name, keys);
+    // `None`, and not a guess: this process opened a **stopped** data directory and runs no
+    // policy loader, so there is no active document for it to name. Recording a version it
+    // cannot observe would be worse than recording none — the field is read by an operator
+    // mid-recovery, and a wrong breadcrumb is followed. The durable policy version floor
+    // (gap G-09) is what would let this path answer honestly.
+    let finished = finish_artifact(&header, &plaintext, out_dir, &name, keys, None);
     // Removed here, by the function that created it, on *both* paths. Leaving it behind on
     // failure would be worse than untidy: a `.snap` with no manifest is indistinguishable from
     // a triple whose manifest was deleted, and TA-47 gives those two different exit codes.
@@ -287,12 +303,19 @@ pub fn backup_offline(
 /// names and openraft's next `InstallSnapshot` failed with "snapshot not found". Whoever
 /// creates the scratch file removes it — [`backup_offline`] for the CLI, the caller in
 /// `run.rs` for the RPC.
+///
+/// `policy_version` is the active signed policy version, or `None` where the calling process
+/// has none to name. It is a parameter rather than something this function discovers because
+/// only the caller holds the policy loader, and a backup writer that reached for global state
+/// to find one would bind the artifact to whichever policy happened to be loaded in the
+/// process rather than to the one the exported data was authorized under (M6-33, ADR-0027).
 pub fn finish_artifact(
     header: &SnapshotHeader,
     plaintext: &Path,
     out_dir: &Path,
     name: &str,
     keys: &KeyFiles<'_>,
+    policy_version: Option<u64>,
 ) -> Result<BackupOutcome, BackupError> {
     let (snap_name, manifest_name, sig_name) = BackupManifest::file_names(name);
     let snap_path = out_dir.join(&snap_name);
@@ -325,7 +348,7 @@ pub fn finish_artifact(
             .map_err(|e| BackupError::refused("malformed_manifest", e))?,
         counts: header.counts.clone(),
         sha256: sha256.clone(),
-        policy_version_ref: None,
+        policy_version_ref: policy_version,
         created_unix_ms: header.created_unix_ms,
         encrypted: encryption_key.is_some(),
     };
@@ -745,6 +768,51 @@ pub struct RestoreRequest<'a> {
     pub manifest_sig: Option<&'a Path>,
     /// Its signing public key; defaults to `<manifest>.pub`.
     pub manifest_key: Option<&'a Path>,
+    /// The signed policy version the restored node will run under, when the operator knows it.
+    ///
+    /// Supplied rather than discovered: restore deliberately reads no configuration file — a
+    /// recovery must not depend on a document that may have been lost with the cluster — so
+    /// this process has no policy loader and no `[authz]` section to read one from.
+    ///
+    /// `None` means "do not compare", which is the behaviour a restore had before M6-35. It is
+    /// never a gate either way: §15.3 says an artifact references but does not override the
+    /// RBAC artifact, so a divergence is reported and the restore proceeds.
+    pub active_policy_version: Option<u64>,
+}
+
+/// A backup whose manifest names a different policy version than the restored node will run
+/// under (M6-35, ADR-0027).
+///
+/// Both halves are carried rather than a bare "they differ" flag, because the operator-facing
+/// question is *which* two documents diverged, and the answer is not recoverable afterwards:
+/// the restored store knows only the new authority and the artifact knows only the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyDivergence {
+    /// The version recorded in the backup manifest at export time.
+    pub manifest_version: u64,
+    /// The version the restored node will run under.
+    pub active_version: u64,
+}
+
+/// Whether a restore crossed a policy version boundary worth reporting.
+///
+/// Silent unless **both** versions are known and they differ. An unknown version on either side
+/// is not a divergence but an absence: a manifest predating M6-33, or an operator who did not
+/// pass `--active-policy-version`. Reporting those as a mismatch would teach an operator to
+/// ignore the line on every ordinary recovery, which is how a real divergence goes unread.
+fn policy_divergence(
+    manifest_version: Option<u64>,
+    active_version: Option<u64>,
+) -> Option<PolicyDivergence> {
+    match (manifest_version, active_version) {
+        (Some(manifest_version), Some(active_version)) if manifest_version != active_version => {
+            Some(PolicyDivergence {
+                manifest_version,
+                active_version,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// What a completed restore established, for the `restore_completed` audit line (M5-81).
@@ -762,6 +830,13 @@ pub struct RestoreOutcome {
     pub revision: u64,
     /// Records written, per column family.
     pub written: std::collections::BTreeMap<String, u64>,
+    /// The policy version boundary this restore crossed, if any (M6-35).
+    ///
+    /// Returned rather than logged here: the offline subcommands install no tracing subscriber,
+    /// so a `tracing::warn!` in this module would compile, read like an audit trail, and emit
+    /// nothing. The caller writes it to the same JSONL stderr channel `restore_completed`
+    /// already uses.
+    pub policy_divergence: Option<PolicyDivergence>,
 }
 
 /// Verify a backup and write it into a fresh data directory under a **new** identity.
@@ -917,6 +992,12 @@ pub fn restore(
         new_epoch: req.recovery_epoch,
         revision: report.revision,
         written: report.written,
+        // Computed after the restore succeeded, so a refused restore reports no divergence:
+        // nothing was minted, so there is no new authority for the artifact to diverge from.
+        policy_divergence: policy_divergence(
+            manifest.policy_version_ref,
+            req.active_policy_version,
+        ),
     })
 }
 
@@ -1014,6 +1095,29 @@ mod tests {
         let b = encrypt(&key, b"same").expect("encrypts");
         assert_ne!(a, b, "a fixed nonce would make GCM catastrophically unsafe");
         assert_ne!(a[..NONCE_LEN], b[..NONCE_LEN]);
+    }
+
+    /// M6-35's rule, stated once and checked in every direction: a divergence needs two known
+    /// versions that disagree, and nothing else counts.
+    #[test]
+    fn a_policy_divergence_needs_two_known_versions_that_differ() {
+        assert_eq!(
+            policy_divergence(Some(8), Some(3)),
+            Some(PolicyDivergence {
+                manifest_version: 8,
+                active_version: 3,
+            })
+        );
+        assert_eq!(policy_divergence(Some(8), Some(8)), None, "agreement");
+        // A manifest predating M6-33, and an operator who did not name a version: absences,
+        // not divergences. Reporting them would make the line noise on ordinary recoveries.
+        assert_eq!(
+            policy_divergence(None, Some(3)),
+            None,
+            "no manifest version"
+        );
+        assert_eq!(policy_divergence(Some(8), None), None, "no active version");
+        assert_eq!(policy_divergence(None, None), None, "neither side known");
     }
 
     #[test]

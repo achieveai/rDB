@@ -112,7 +112,7 @@ pub const CF_RAFT_META: &str = "raft_meta";
 /// Materialized user records, keyed by the user key bytes.
 pub const CF_KV: &str = "kv";
 /// State-machine metadata (`format_version`, `identity`, `cluster_revision`, `compact_revision`,
-/// `journal_stats`, `last_applied`, `membership`).
+/// `journal_stats`, `last_applied`, `membership`, `policy_version_floor`).
 pub const CF_STATE_META: &str = "state_meta";
 
 /// The retained event journal, keyed by big-endian public revision (M4, ADR-0019).
@@ -188,6 +188,13 @@ const KEY_RETIRED_NODES: &[u8] = b"retired_nodes";
 
 /// The highest `command_schema` this state machine has ever applied (M6, ADR-0030 M6-R15).
 const KEY_MAX_COMMAND_SCHEMA: &[u8] = b"max_command_schema";
+/// The signed policy version this node last had in force (M6, ADR-0027, gap G-09),
+/// `postcard(u64)`. Node-local and not replicated: which policy document a node serves is a
+/// local decision about a local file, and the cell exists only so that decision survives a
+/// restart. Absent means nothing is known, which is what a directory written by any earlier
+/// build says — so no format bump and no migration, exactly as [`KEY_MAX_COMMAND_SCHEMA`] was
+/// added at M6.
+const KEY_POLICY_VERSION_FLOOR: &[u8] = b"policy_version_floor";
 /// The provenance of a restored data directory (M5, ADR-0024), `postcard(RestoredFrom)`.
 /// Written once, by the offline `restore_into_fresh_store`, and never by a running node: it
 /// records the identity the data came *from*, which is by construction not the identity this
@@ -1294,6 +1301,58 @@ impl RocksStore {
     /// The data directory.
     pub fn path(&self) -> &Path {
         &self.shared.path
+    }
+
+    /// The signed policy version this node last had in force (M6, ADR-0027, gap G-09).
+    ///
+    /// `0` means the cell has never been written: a fresh directory, or one written by a build
+    /// that predates the cell. The caller treats that as "nothing known" and accepts its first
+    /// document, which is what every node did before this existed.
+    ///
+    /// # Known limit: a restore resets this floor (gap G-13)
+    ///
+    /// **Read this before relying on the floor as a security control.** `state_meta` is not
+    /// carried in a snapshot body ([`crate::snapshot`]'s `NON_DATA_CFS`), and
+    /// `restore_into_fresh_store` writes only the keys it is given. So a directory restored
+    /// from a backup starts here at `0`, and the downgrade this cell exists to refuse succeeds
+    /// once across that restore: an operator who restores an old backup and supplies an old
+    /// signed document gets it adopted with no refusal.
+    ///
+    /// That is a **known limit, not a design intent**. The floor closes the plain-restart path,
+    /// which is the routine one; it does not close the restore path. Closing it needs the
+    /// restore to seed this cell from the backup manifest's `policy_version_ref`, which is
+    /// tracked separately and is not what this cell does today.
+    pub fn policy_version_floor(&self) -> Result<u64, String> {
+        Ok(
+            read_meta(&self.shared.db, CF_STATE_META, KEY_POLICY_VERSION_FLOOR)?
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Record `version` as the policy version now in force (M6, ADR-0027, gap G-09).
+    ///
+    /// Synced, because a floor that a crash can lose is a floor that a crash can be used to
+    /// clear. Written in its own batch and never folded into an apply: it records a decision
+    /// about a local file, and a Raft apply records a decision the cluster made.
+    ///
+    /// The value replaces rather than maximises, and that is deliberate — see
+    /// `SignedPolicyAuthorizer`'s `floor` field. A break-glass rollback has to be able to move
+    /// this down, or the next restart refuses the document the operator deliberately installed.
+    pub fn set_policy_version_floor(&self, version: u64) -> Result<(), String> {
+        if self.shared.is_poisoned() {
+            return Err("store is poisoned".to_string());
+        }
+        let encoded = postcard::to_stdvec(&version).map_err(|e| e.to_string())?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(
+            self.shared.cf(CF_STATE_META),
+            KEY_POLICY_VERSION_FLOOR,
+            encoded,
+        );
+        self.shared
+            .db
+            .write_opt(batch, &self.shared.write_options(true))
+            .map_err(|e| e.to_string())
     }
 
     /// Whether the directory was empty when it was opened and nothing has been written since.

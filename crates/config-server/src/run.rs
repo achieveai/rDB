@@ -385,6 +385,12 @@ impl config_grpc::AdminBackend for NodeBackend {
         // is driving for as long as the artifact takes to write.
         let signing_key = keys.signing_key.map(Path::to_path_buf);
         let encryption_key = keys.encryption_key.map(Path::to_path_buf);
+        // M6-33: the version this node is enforcing right now, read before the export is
+        // staged, so the artifact names the document the exported data was authorized under.
+        // `None` under static mode and on a signed-mode node holding no valid document — a
+        // manifest that named a version this node was not enforcing would be a breadcrumb an
+        // operator follows to the wrong document.
+        let policy_version = self.policy.as_ref().and_then(|l| l.state_and_version().1);
         let joined = tokio::task::spawn_blocking(move || {
             // Copied to a scratch file inside `dest_dir` first, exactly as the offline path
             // exports to one. Handing the node's *live* `<id>.snap` to `finish_artifact`
@@ -413,7 +419,7 @@ impl config_grpc::AdminBackend for NodeBackend {
                     trust_key: None,
                     encryption_key: encryption_key.as_deref(),
                 };
-                backup::finish_artifact(&header, &scratch, &dest_dir, &name, &keys)
+                backup::finish_artifact(&header, &scratch, &dest_dir, &name, &keys, policy_version)
             })();
             // This task created the scratch file, so this task removes it — on both paths.
             let _ = std::fs::remove_file(&scratch);
@@ -665,7 +671,13 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     };
 
     // ---- 3. policy -------------------------------------------------------------------
-    let policy = load_authorizer(&cfg, &cli, &watch);
+    let policy = load_authorizer(
+        &cfg,
+        &cli,
+        &watch,
+        identity.cluster_id,
+        crate::policy::version_floor(&storage),
+    );
 
     // ---- 4. bind ---------------------------------------------------------------------
     let tls = tls_mode(&cfg)?;
@@ -1014,6 +1026,8 @@ fn load_authorizer(
     cfg: &ServerConfig,
     cli: &Cli,
     watch: &Arc<config_engine::WatchHub>,
+    expected_cluster: config_core::ClusterId,
+    floor: Option<Arc<dyn crate::policy::PolicyVersionFloor>>,
 ) -> LoadedPolicy {
     if cli.dev_allow_all {
         tracing::warn!(
@@ -1022,7 +1036,7 @@ fn load_authorizer(
         return LoadedPolicy::without_document(Arc::new(AllowAll), AuthzKind::Development);
     }
     if cfg.signed_policy.is_some() {
-        return load_signed_policy(cfg, cli, watch);
+        return load_signed_policy(cfg, cli, watch, expected_cluster, floor);
     }
     let Some(path) = cfg.policy_path.as_deref() else {
         tracing::warn!(
@@ -1084,6 +1098,8 @@ fn load_signed_policy(
     cfg: &ServerConfig,
     cli: &Cli,
     watch: &Arc<config_engine::WatchHub>,
+    expected_cluster: config_core::ClusterId,
+    floor: Option<Arc<dyn crate::policy::PolicyVersionFloor>>,
 ) -> LoadedPolicy {
     let signed = cfg
         .signed_policy
@@ -1108,8 +1124,13 @@ fn load_signed_policy(
              version will be accepted for the lifetime of this process"
         );
     }
-    let loader =
-        crate::policy::PolicyLoader::new(signed, Arc::clone(&authorizer), Arc::clone(watch));
+    let loader = crate::policy::PolicyLoader::new(
+        signed,
+        Arc::clone(&authorizer),
+        Arc::clone(watch),
+        expected_cluster,
+        floor,
+    );
     // Synchronous on purpose: nothing else is running yet, so nothing can hold the journal
     // gate, and readiness must be decided before step 4 binds anything.
     let kind = match loader.reload("startup") {
@@ -1181,7 +1202,13 @@ fn tls_mode(cfg: &ServerConfig) -> Result<TlsMode, Fatal> {
             )
             // `tls.allow_common_name_principals`: shut unless the document opened it;
             // `config::validate` has already logged `common_name_principals_enabled` if so.
-            .with_common_name_principals(material.allow_common_name_principals),
+            .with_common_name_principals(material.allow_common_name_principals)
+            // `tls.handshake_timeout_ms`, or the ADR-0028 default when the document is
+            // silent. Set here, on the profile `TlsRotator` captures as its template, so
+            // `read_material`'s clone carries it through every rotation: a rotation replaces
+            // the material a handshake is performed against, never the bound on how long one
+            // may take (G-01).
+            .with_handshake_timeout(material.handshake_timeout),
         )),
         (TlsModeName::Mutual, None) => Err(Fatal::rejected(
             "invalid_config",

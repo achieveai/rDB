@@ -48,6 +48,7 @@ fn signed(version: u64, grants: Vec<Grant>) -> SignedPolicy {
         issued_unix_ms: version,
         grants,
         admins: vec!["ops".to_string()],
+        cluster_id: None,
     };
     let bytes = serde_json::to_vec(&document).expect("a policy document serializes");
     SignedPolicy {
