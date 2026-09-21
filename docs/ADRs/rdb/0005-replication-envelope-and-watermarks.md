@@ -119,15 +119,19 @@ A `RecoveryAppend { fence: FenceCredential, envelope }` reuses rules 1–5, 8 an
 replaces 6 and 7 with three checks: `fence.prior_owner_epoch` equals the receiver's
 `AuthorityView.owner_epoch` (else `STALE_FENCE`); `fence.control_revision >=` the receiver's last
 seen `partitions/{id}` revision (else `STALE_FENCE`); and the authenticated peer **is
-`fence.recoverer`** and that copy is a regular member of the pinned config (else `NOT_A_MEMBER`).
+`fence.sender`** and that copy is a regular member of the pinned config (else `NOT_A_MEMBER`).
 The epoch plus the monotone revision is the whole "your fence is at least as new as anything I have
 seen" check. An earlier draft also compared a `prior_grant_id`; it is withdrawn for the reason given
 two paragraphs up — the receiver's view is derived from `partitions/{id}`, which holds no grant id,
-so the conjunct either rejected all recovery traffic or required the forbidden join. The
-`recoverer` binding is what stops a second regular member from replaying a captured credential with
-its own compatible-prefix records; rule 9 stops a *conflicting* suffix, not an unauthorised
-extension, so the peer check has to name the holder. Rule 9 runs unchanged: a fence does not license
-overwriting a divergent suffix.
+so the conjunct either rejected all recovery traffic or required the forbidden join. The `sender`
+binding is what stops a second regular member from replaying a captured credential with its own
+compatible-prefix records; rule 9 stops a *conflicting* suffix, not an unauthorised extension, so
+the peer check has to name a holder. It names the **sender of this transfer**, not the recovering
+node: the recovery state machine mints one credential per transfer source — the `from` of each
+catch-up it orders (ADR-0009 §4, §7) — because the records that fill a lagging copy come from the
+selected prefix holder, and spec §8.3 requires that holder to be able to feed a leader elected
+elsewhere. A credential bound to the recovering node rejected exactly that transfer. Rule 9 runs
+unchanged: a fence does not license overwriting a divergent suffix.
 
 **Historical envelopes are admitted by chain and root anchor, not by the authority rules.** After a
 recovery commits generation *g+1* with `base_seq = c`, a copy behind *c* and a rebuild target both
@@ -135,7 +139,7 @@ still need records written under *g*, and those records carry *g* forever — `g
 `owner_epoch` and `config_version` are digest-covered, so nothing can be re-stamped. Rules 5, 6 and 7
 would reject every one of them. So, evaluated after rule 4: an envelope with `seq <= history_floor`
 and `generation == lineage.predecessor_generation` **skips rules 5, 6 and 7** and is decided by rules
-1–4, 8 and 9 plus the sender check (the primary of the pinned config for `Append`; `fence.recoverer`
+1–4, 8 and 9 plus the sender check (the primary of the pinned config for `Append`; `fence.sender`
 for `RecoveryAppend`). Rule 9 gains one clause for it: at `seq == lineage.base_seq` the record's
 digest must equal `lineage.base_digest`, else quarantine `DIVERGENT_HISTORY`. That clause is why
 skipping the authority rules is safe: the committed root pins the base pair, the chain anchors every
@@ -144,6 +148,21 @@ record below it, and rule 9 decides. `history_floor` is receiver state written o
 the rule is inert until a recovery has committed. M7 admits one generation of history; a copy more
 than one recovery behind needs `SnapshotCatchupRequired` (§6), which the primary emits before
 sending a record the receiver would reject.
+
+**The anchor is looked up on every copy, not adopted from the control message.** The rule above
+rests on one premise: a copy that holds `base_seq` holds `base_digest`. Row 9 checks it on arrival
+for a copy that is *behind* the cutoff, because that copy receives the record at `base_seq`. A copy
+at or above the cutoff never does, and `Recovered` reaches every surviving copy, including one that
+was unreachable during discovery and so was never in the recovery's pairwise ancestry check. An
+earlier draft had `Recovered` overwrite such a copy's head with the root's pair; a copy that had
+taken a stale owner's suffix before learning of the fence would then ACK a digest it never held,
+pass rule 9 as `Match`, and serve an off-history range under the new root, qualified. So
+`Recovered` performs `lookup(cutoff_seq)` on the receiver's own ladder first: `Match` adopts the
+pair; `Differs` quarantines `DIVERGENT_HISTORY` and installs only the lineage, config, authority
+and floor — the copy is evidence and a rebuild target, never a holder, and its ACKs are dropped;
+`NotRetained` truncates to the highest retained rung at or below the cutoff and takes the behind
+path, where catch-up re-verifies by chain and row 9 checks the anchor when it arrives. `Match` is
+the only arm that adopts.
 
 **A replica never learns authority from the data path.** Rules 5 and 6 reject *higher* generations
 and epochs rather than adopting them. New epochs arrive from A1's `AuthorityView`; new generations
@@ -266,9 +285,22 @@ predicate flipped, and — only when the floor is gone, `regular_secondaries().c
 min_regular_acks` — `BlockPartition { reason: DivergenceRequiresOperator, diverged }`, which is
 `PartitionMode::Blocked` plus a named alert. Quarantine is terminal in M7, so a pause caused by
 divergence has no data-path exit; `BlockPartition` says so rather than leaving a permanent pause
-that looks like lag. The exit is an operator removing the diverged copies from membership and
-fencing. With a floor remaining, the partition continues on the remaining copies with the alert
-raised; committing the degraded membership is the planner's (spec §9), not M7's.
+that looks like lag. It has two consumers: the publication module enters its `Blocked` mode (the
+mode table in kernel-a's publication design §4.1/§4.2, commit 785e41b; it drains waiting readers,
+keeps the pending candidate, is sticky against a later freeze, and reports `Blocked` to a mode
+query rather than `Frozen`), and the lag module (ADR-0006 §4) records the block so that its
+admission state reports `DIVERGENCE_REQUIRES_OPERATOR` rather than `PROTECTION_PAUSED` — a client
+told "retry later" for a condition nothing on the data path will change is the silent pause in a
+different coat. The exit is an operator removing the diverged copies from membership and fencing.
+With a floor remaining, the partition continues on the remaining copies with the alert raised;
+committing the degraded membership is the planner's (spec §9), not M7's.
+
+**`diverged` has one writer.** Divergence is proved at two sites — rule 9 on an ACK, and the
+catch-up cursor when a `NeedPrefix` head digest `Differs` — but the mark and the vector above are
+the tracker's. The cursor emits `DivergenceDetected` and nothing else; it is routed back to the
+tracker as an event, which sets the mark (idempotently) and emits the rest once. Whichever end
+proved it, the trace carries one alert and one `CopyLost` per copy, and the index-order rows below
+have one answer.
 
 The seam handed to P1 is a **live predicate, not a watermark**:
 
@@ -438,7 +470,10 @@ does not describe.
 | Catch-up never overwrites divergence | `NEED_PREFIX` with a retained-but-mismatched head digest sends no envelopes and raises divergence |
 | Every reply is handled | Exhaustive match over `AppendOutcome` with no wildcard arm; a compile error if a variant is added |
 | Recovery traffic is fence-gated, not epoch-gated | A `RecoveryAppend` whose fence names a superseded epoch or an older control revision is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append |
-| A captured credential cannot be replayed | A second regular member sends a `RecoveryAppend` with a credential naming another node as `recoverer`: rejected `NOT_A_MEMBER`, no state change |
+| A captured credential cannot be replayed | A second regular member sends a `RecoveryAppend` with a credential naming another node as `sender`: rejected `NOT_A_MEMBER`, no state change |
+| The designated sender is admitted wherever it sends | Holder ≠ leader: records from the holder under a credential with `sender == holder` are accepted at the elected leader and at every lagging holder; the two-survivor case with the recovering node holding the shorter prefix likewise — **gate V3** |
+| The root anchor is checked on a non-participant | A copy divergent at or below the cutoff that missed discovery receives `Recovered`: quarantined `DIVERGENT_HISTORY`, never `Match` on rule 9, never qualifies; a copy with `NotRetained` at the cutoff truncates and catches up by chain — **gate V3** |
+| Divergence proved on the catch-up side has one vector | `NeedPrefix` head digest `Differs`: the cursor emits `DivergenceDetected` only; the tracker's step emits exactly one `Alert` and one `CopyLost` and sets `diverged`; the copy's next ACK is dropped `DIVERGED_COPY` |
 | Historical records catch a copy up across a generation change | Copy at seq 50; root committed with `base_seq = 100` under predecessor *g*; envelopes 51..100 carrying *g* are accepted and the copy reaches `CopyCaughtUp` at `(100, base_digest)`; 101 under *g+1* passes the normal ladder; a record at 100 whose digest is not `base_digest` quarantines — **gate V3** |
 | One generation of history only | A copy needing records older than `predecessor_generation` receives `SnapshotCatchupRequired`, never `STALE_GENERATION` |
 | A diverged copy leaves the durable views | RF3, threshold 1: copy C diverges; `all_durable_through` and `min_required_durable` ignore C, a later ACK from C is dropped `DIVERGED_COPY`, the step emitted `Alert` + `CopyLost` and no `QualificationChanged` |

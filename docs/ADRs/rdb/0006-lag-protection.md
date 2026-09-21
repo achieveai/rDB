@@ -165,8 +165,17 @@ the edge is emitted only on change, so an idle partition produces none, and a ru
 ### 4. States and transitions
 
 ```text
+-- at construction (Recovered):        Paused { paused_prefix = cutoff, resume_barrier = cutoff },
+                                       qualifies flag false, SetAdmission(Reject)
+
 -- on QualificationChanged { Lost } only (edge; nothing re-checks it):
 no qualifying regular secondary     : *  -> Paused        [immediate, not age-gated]
+
+-- on BlockPartition { reason }:
+any                                 : record the reason; -> Paused if not already;
+                                      SetAdmission(Reject(DIVERGENCE_REQUIRES_OPERATOR))
+                                      [Paused -> Reprotecting unreachable from here: the
+                                       qualification term can never hold again under this config]
 
 -- on HealthEval:
 Healthy, unsafe_age >= 2000 ms      :    -> Paused
@@ -186,6 +195,20 @@ A copy lost while `Reprotecting` needs no arm of its own: a loss that takes the 
 `QualificationChanged { Lost }` and is the first arm; a loss that leaves the floor arrives as
 `CopyLost` and only shrinks the lag domain (§1), and any remaining peer not yet heard from holds
 the partition through the infinite-lag rule.
+
+**The instance starts `Paused`.** At `Recovered` the replication module zeroes every peer's
+progress, so the qualification predicate starts false and the first edge it can emit is `Gained`.
+A module constructed `Healthy` would admit until the age pause with no qualifying secondary, and the
+`Lost` arm above would never fire, because there is no `Lost` to fire it. Starting `Paused` with
+the flag false makes the first `Gained` plus the durable barrier walk the module through
+`Reprotecting` like any other resume — fail-closed, and one fewer initial state to argue about.
+
+**A block is not a pause.** `BlockPartition` (ADR-0005 §5) can arrive in a step with no `Lost` —
+the predicate may already be false, including before the first `Gained` — so the module does not
+assume an earlier arm paused it. It records the reason, pauses if it was not paused, and from then
+on reports `DIVERGENCE_REQUIRES_OPERATOR` instead of `PROTECTION_PAUSED` in the admission state
+(§6). The two are different client answers: one says retry, the other says nothing on the data path
+will change this. The block is cleared only by a new instance at the next `Recovered`.
 
 The qualification term also gates `Paused → Reprotecting`: handing admission back to a partition
 that still cannot replicate would be the same bug arriving by the resume path.
@@ -248,7 +271,7 @@ three-term budget.
 
 ```text
 AdmissionState {
-  allow, reason,                          // PROTECTION_PAUSED
+  allow, reason,                          // PROTECTION_PAUSED, or DIVERGENCE_REQUIRES_OPERATOR once blocked
   oldest_unsafe_age, oldest_unsafe_seq,   // exposure
   replication_lag, stalest_copy,          // liveness, and which peer holds the maximum
   lost_copies,                            // copies R1 reported lost; a pause on fewer copies is visible
@@ -283,8 +306,8 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
   qualifying-copy set. Only the age half is independent. Evaluating the shared half twice is still
   worth its cost, but the residual risk is real and is carried by tests on R1's qualifying-set
   computation rather than by architecture.
-- L1 gains three inputs it did not have, all emitted by R1: `QualificationChanged`, `PeerProgress`
-  and `CopyLost`. The alternative — L1 querying R1 — would give one kernel module a synchronous
+- L1 gains four inputs it did not have, all emitted by R1: `QualificationChanged`, `PeerProgress`,
+  `CopyLost` and `BlockPartition`. The alternative — L1 querying R1 — would give one kernel module a synchronous
   dependency on another, so every fact arrives as an event like everything else. The cost is that
   R1 must emit on every predicate edge, including ones that are not ACKs (a boot change, a
   membership change); a missed or dropped `Lost` edge leaves admission open until the next edge,
@@ -308,6 +331,8 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
 | Self is not in the lag domain | Primary sends no ACK to itself; with both peers reporting, `Reprotecting` completes — the earlier definition over a set containing self never did |
 | A lost copy leaves the lag domain | `CopyLost { C, Diverged }` during `Reprotecting` with the floor intact: the hold continues over the remaining peers and completes; `lost_copies` exports `[C]` |
 | A dropped `Lost` edge is caught outside L1 | Verification's dispatcher mutation drops the routed `QualificationChanged { Lost }`; the oracle reports an `Admitted` after the loss; no L1 row claims to catch this |
+| The module starts closed | Fresh instance at `Recovered`: `Paused`, `SetAdmission(Reject)` at construction, no admission before the first `Gained` and the durable barrier; then `Reprotecting` and the 5 s hold as usual |
+| A block reads as a block | `BlockPartition` with no prior `Lost` (predicate already false, or before the first `Gained`): the module is `Paused`, `reason == DIVERGENCE_REQUIRES_OPERATOR`, and no later `HealthEval` or `Gained` resumes it |
 | The primary counts as a required copy | Stall the primary's flush with both secondaries healthy: `unsafe_age` rises and the partition pauses |
 | `next_interesting_tick` is sound | Property: for every state, no `HealthEval` strictly before the returned tick changes the state |
 | Idle never pauses | No transactions, advance virtual time by an hour: state stays `Healthy` |

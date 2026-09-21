@@ -71,15 +71,19 @@ primary" becomes a property of the type rather than a sentence someone has to ho
 `authority_utc_ms` is carried alongside `authority_tick` because the tick is monotonic and §7.2's
 inequality is stated against wall time; it cannot be re-derived from a monotonic reading.
 
-`FenceCredential { partition, prior_generation, prior_owner_epoch, control_revision, recoverer }`
-is the wire-carryable subset used to authorise recovery catch-up (§7), plus the copy id of the node
-F1 is running on. It deliberately omits `decision_tick` and the revocation evidence: those are A1's
+`FenceCredential { partition, prior_generation, prior_owner_epoch, control_revision, sender }` is
+the wire-carryable subset used to authorise recovery catch-up (§7), plus the copy id of the source
+of one transfer. It deliberately omits `decision_tick` and the revocation evidence: those are A1's
 grounds for granting the proof, not a receiver's grounds for accepting a record, and a smaller
 credential is one a receiver cannot start re-deriving authority decisions from. It also omits
 `prior_grant_id`, which the proof carries but no receiver can compare — a receiver's authority view
-comes from `partitions/{id}`, which holds no grant id (§1). `recoverer` is what makes the credential
+comes from `partitions/{id}`, which holds no grant id (§1). `sender` is what makes the credential
 non-replayable: a receiver admits recovery records only from the transport-authenticated peer the
-credential names.
+credential names. It names the sender of *this* transfer, not the recovering node, and F1 mints one
+credential per transfer source — the `from` of each catch-up it orders (§4, §7). An earlier draft
+bound it to the recovering node; that rejected every transfer whose source was the selected prefix
+holder on another node, which is the transfer spec §8.3 requires when the holder cannot lead, and
+the plain two-survivor case whenever the fenced node holds the shorter prefix.
 
 ### 3. `VerifiedInventory`: the typestate that deletes "longest wins"
 
@@ -171,7 +175,9 @@ select_leader(&SelectedLineage, &[Candidate])  -> Option<CopyId>      // eligibi
 `Candidate { copy_id, primary_eligible, healthy, within_capacity, has_valid_grant }` arrives as
 data; F1 contains no placement logic. Spec §8.3: the longest-prefix survivor "does not win merely by
 being longest." If it cannot lead, F1 emits `CatchUpBeforeGrant { from: holder, to: leader, through:
-cutoff }` and only then proposes ownership.
+cutoff, credential }` and only then proposes ownership. The credential is minted for this transfer
+with `sender = holder` (§2): the holder is the peer the leader's receiver will authenticate, and a
+credential naming anyone else rejects the transfer this sentence of the spec exists for.
 
 ### 5. Divergence quarantines; there is no merge function
 
@@ -231,7 +237,8 @@ is recorded as unavailable rather than silently absent.
 ### 7. The barrier is durable, by construction
 
 ```text
-Selected      -> Synchronizing : catch holders up through cutoff_seq (RecoveryAppend, ADR-0005 §2)
+Selected      -> Synchronizing : catch holders up through cutoff_seq (RecoveryAppend, ADR-0005 §2;
+                                 one FenceCredential per source, sender = that source)
 Synchronizing -> Barrier       : SyncWalThrough per required copy; collect DurableProof
 Barrier       -> Proposing     : RecoveryBarrier::try_new(proofs, required, cutoff, cutoff_digest)?
 Proposing     -> Committed     : one control CAS of the new root on partitions/{id}
@@ -267,7 +274,7 @@ ladder's epoch and primary-peer rules would reject every record it sends. Record
 as `RecoveryAppend { fence: FenceCredential, envelope }` and the receiver substitutes three rules
 (ADR-0005 §2): the fence's `prior_owner_epoch` matches the receiver's current authority view, the
 fence's `control_revision` is at least the receiver's last seen `partitions/{id}` revision, and the
-sender is the copy the credential names as `recoverer` and a regular member of the pinned config.
+sender is the copy the credential names as `sender` and a regular member of the pinned config.
 Ancestry and digest validation are untouched: a fence does not license overwriting a divergent
 suffix.
 
@@ -288,6 +295,17 @@ check for activation is exactly how `READ_ONLY` would become `ACTIVE` on three c
 three different histories. Activation commits by the same single CAS on `partitions/{id}`,
 conditioned on the revision from the recovery commit, so a competing writer produces a conflict
 rather than an activation over someone else's decision.
+
+**A copy lost during `Rebuilding` stalls the rebuild; it never shrinks `required`.** The
+replication module reports a divergence as `CopyLost` (ADR-0005 §5). If the copy is one of
+`required`, `Rebuilding` drops its proof, emits `Alert { RebuildStalled, copy }` and stays, with
+`required` unchanged — so no later `DurableAt` can reach `ActivationProposed` until that copy or a
+replacement proves the barrier. Both alternatives fail: dropping the proof with no alert leaves the
+phase stuck silently on `NoProofFrom` forever, and shrinking `required` lets `try_new` pass over two
+copies, which is `READ_ONLY` becoming `ACTIVE` on two — the accident this paragraph exists to
+prevent. The exit is outside F1: placement supplies a replacement copy as data (not built in M7),
+or an operator fences and a fresh recovery selects over what remains. A copy outside `required` is
+ignored here; it was never going to prove anything.
 
 **`ControlCasResult` has three arms.** `Committed { revision }` proceeds. `Conflict` re-reads the
 record: a different owner at a newer epoch means this node was overtaken and it blocks, re-entering
@@ -401,7 +419,9 @@ consumer does not handle.
 | One CAS, one key | The effect vector from `Proposing` contains exactly one `ControlCas`, targeting `partitions/{id}` |
 | A lost CAS response does not promote | `QuorumLost` leaves the node `Blocked`; it never proceeds as owner and requires a fresh fencing proof to retry |
 | Recovery catch-up is fence-gated | A `RecoveryAppend` with a superseded fence is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append would be |
-| A credential names its holder | A second regular member replaying a captured credential is rejected `NOT_A_MEMBER` |
+| A credential names its sender | A second regular member replaying a captured credential is rejected `NOT_A_MEMBER` |
+| Holder ≠ leader transfers land | The selected holder cannot lead: `CatchUpBeforeGrant` from the holder, credential `sender == holder`, every record accepted at the elected leader; the two-survivor case with the fenced node shorter likewise — **V3** |
+| A lost copy stalls the rebuild, loudly | `CopyLost` of a required copy during `Rebuilding`: one `Alert { RebuildStalled }`, `required` unchanged, no `ActivationProposed` on any later `DurableAt` — **V3** |
 | Rebuild reaches `CopyCaughtUp` across the generation change | Copy at seq 50, root at `base_seq = 100`: records 51..100 under the predecessor generation are accepted, `CopyCaughtUp` fires at `(100, base_digest)`, and the copy's proof then passes `try_new` — **V3** |
 | RF2 degraded requires both | With one regular secondary, losing it stops admission; no one-copy fallback path exists — **V3** |
 | All three lone-survivor choices | Old primary, secondary 1, secondary 2 each as sole survivor: read-only mode, correct declared cutoff, `uncertain` set when a higher prefix was advertised — **V3** |
