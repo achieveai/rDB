@@ -42,10 +42,26 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   which is the run where a log query is actually wanted. Observed 2026-09-21 at 1310 files under
   one root. Because the error names a column, it reads like a typo in the query rather than a limit.
   `crates/config-testkit/tests/logs.rs` holds a positive control that fails if the option is dropped.
-- Querying a file the current test is still writing races the writer and fails with
-  `IO Error: ... Reached the end of the file`. The byte offset in that message is what DuckDB
-  attempted, not the file's size — do not read it as evidence of a huge log. To read your own
-  output without DuckDB, use `logs::lines_for_current_test`.
+- Never point DuckDB at a file a test is still writing. `test_logs_relation()` and
+  `relation_for_current_test(module, method)` both hand back a `LogSnapshot`: a private copy of
+  the files, the `read_json_auto(...)` call over the copy, and a `Drop` that deletes it. Put the
+  value straight in a `FROM` clause and keep it alive until `query` returns. Prefer
+  `relation_for_current_test` whenever the `WHERE` names one `testMethod` — the layer routes a
+  line by its own `testModule`/`testMethod`, so that one file holds every row such a query can
+  match, and it copies one file instead of the suite's.
+- The failure the snapshot removes is `IO Error: ... Reached the end of the file`. The byte
+  offset in that message is what DuckDB attempted, not the file's size — do not read it as
+  evidence of a huge log. On 2026-09-21 the offset was 218862478 against a file that finished at
+  862679 bytes, 50x larger than every file the glob matched put together. Growth alone does not
+  explain it and does not reproduce: three files appended to a gigabyte each, queried 20 times
+  through the same CLI (v1.3.2) and options, were right 20/20. The snapshot works by removing
+  the ingredient — a file somebody still has open — not by knowing what the CLI does with one.
+- Waiting for a log line is a wait, not a side effect of the reader. `m1_47` asserted on `apply`
+  lines that land after the index they wait on, and passed only because spawning the `duckdb`
+  CLI took ~200ms; against a snapshot it failed 10/10 immediately. If a row asserts on lines a
+  live cluster is still emitting, poll for them with `cluster.wait_for` first — or shut the
+  cluster down before querying, as `m1_48` and `m4_119` do.
+- To read your own output without DuckDB at all, use `logs::lines_for_current_test`.
 
 ## Running the gate
 

@@ -22,7 +22,10 @@ fn logs_query_reads_this_tests_own_jsonl_file() {
     );
 
     // Then the same thing through DuckDB, which is what real M1 log assertions use.
-    let lines = config_testkit::logs::test_logs_relation();
+    let lines = config_testkit::logs::relation_for_current_test(
+        module_path!(),
+        "logs_query_reads_this_tests_own_jsonl_file",
+    );
     let filter = config_testkit::logs::current_run_filter();
     let sql = format!(
         "SELECT count(*) AS n FROM {lines} \
@@ -141,7 +144,9 @@ fn a_wide_log_relation_needs_the_map_inference_threshold_option() {
 
     // The helper the rest of the workspace calls must carry the option it was added for.
     assert!(
-        config_testkit::logs::test_logs_relation().contains("map_inference_threshold=-1"),
+        config_testkit::logs::test_logs_relation()
+            .relation()
+            .contains("map_inference_threshold=-1"),
         "test_logs_relation must carry the option; the two arms above are why"
     );
 }

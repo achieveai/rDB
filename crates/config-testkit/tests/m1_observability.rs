@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use config_core::{Authz, Capabilities, Durability, NodeId};
 use config_testkit::cluster::{Cluster, StorageKind};
 
-use support::{field, get_req, put_req};
+use support::{field, field_u64, get_req, put_req};
 
 fn my_log_lines(method: &str) -> Vec<serde_json::Value> {
     support::my_log_lines(module_path!(), method)
@@ -151,7 +151,29 @@ async fn m1_47_trace_id_spans_leader_and_both_followers() {
         .expect("all nodes to catch up");
     assert_eq!(put.outcome, config_core::MutationOutcome::Applied);
 
-    let relation = config_testkit::logs::test_logs_relation();
+    // `wait_applied_all` waits on the *index* each node reports; this row asserts on the
+    // `apply` *lines*, which land a little after it. Nothing used to wait for them: the row
+    // passed because spawning the `duckdb` CLI and letting it glob the suite took longer than
+    // the followers did, and it failed the moment the reader got faster. Wait for the evidence
+    // instead, bounded by the same deadline as every other wait here — the assertions below
+    // are unchanged, and a node that never logs one still fails, now by timeout.
+    cluster
+        .wait_for(
+            "all three nodes to log their apply line",
+            cluster.deadline(10),
+            || {
+                let nodes: BTreeSet<u64> = my_log_lines(METHOD)
+                    .iter()
+                    .filter(|row| field(row, "op") == Some("apply"))
+                    .filter_map(|row| field_u64(row, "node_id"))
+                    .collect();
+                (nodes.len() == 3).then_some(())
+            },
+        )
+        .await
+        .expect("three nodes to log an apply line");
+
+    let relation = config_testkit::logs::relation_for_current_test(module_path!(), METHOD);
     let filter = config_testkit::logs::current_run_filter();
     let sql = format!(
         "WITH lines AS (

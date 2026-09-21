@@ -23,7 +23,7 @@ use bytes::Bytes;
 use config_core::{ConfigError, MutationEvent, Principal, WatchItem, WatchRequest};
 use config_log::TraceContext;
 use config_testkit::cluster::{Cluster, RocksSpec, StorageKind};
-use config_testkit::logs::{assert_nonempty, current_run_filter, query, test_logs_relation};
+use config_testkit::logs::{assert_nonempty, current_run_filter, query, relation_for_current_test};
 use futures::StreamExt;
 use support::{field, field_u64, my_log_lines, put_req};
 use tracing::Instrument;
@@ -224,8 +224,10 @@ async fn m4_117_compaction_lines_pair_up() {
     }
 
     // The query surface named in the row's oracle (Q16) must also be able to see this — not
-    // just `my_log_lines`, which only reads this test's own per-method file.
-    let lines = test_logs_relation();
+    // just `my_log_lines`, which parses the same file with serde and never exercises the SQL
+    // the oracle is written in. Same rows, different reader: the file scope is identical
+    // because the layer routes every line this `WHERE` could match into this one file.
+    let lines = relation_for_current_test(module_path!(), METHOD);
     let filter = current_run_filter();
     // Scoped to `config_engine::watch` for `compaction_applied` for the same reason as the
     // `my_log_lines` filter above: `config_core::state` logs a debug-level line under the
