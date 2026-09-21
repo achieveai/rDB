@@ -12,6 +12,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::digest::{Digest, Domain};
 use crate::contracts::ids::{
     AffinityId, Generation, OwnerEpoch, PartitionId, RequestIdentity, Seq,
 };
@@ -35,6 +36,116 @@ pub struct TxnRequest {
     pub conditions: Vec<Condition>,
     /// Mutations, applied as one atomic batch.
     pub mutations: Vec<Mutation>,
+}
+
+impl TxnRequest {
+    /// Digest of the **semantic** request: what this transaction asks for, with nothing about
+    /// how it travelled (lead ruling A-R18, 2026-09-20).
+    ///
+    /// Covered, each one length-prefixed part inside [`Domain::Request`], in this order:
+    ///
+    /// 1. `identity.tenant`
+    /// 2. `affinity`
+    /// 3. `conditions`, count-prefixed, in order
+    /// 4. `mutations`, count-prefixed, in order
+    /// 5. `api_version`
+    ///
+    /// Excluded, and each for a reason:
+    ///
+    /// * `remaining_millis` — a retry carries a *smaller* remaining duration by construction, so
+    ///   a deadline in the preimage would make every honest retry look like a new payload and
+    ///   report `REQUEST_ID_REUSE` (spec §5.3). This is the vector row M7F-02 asserts.
+    /// * `identity.client` and `identity.request` — they are the dedup key the digest is
+    ///   compared *under*. Folding them in would make the comparison vacuous.
+    /// * `expected_generation` — an admission check evaluated before anything is mutated
+    ///   (spec §5.3), not part of what the caller asked to write.
+    ///
+    /// Infallible: every length here is bounded by a `u32` that the request could not have been
+    /// admitted with if it overflowed, and a count that does not fit is saturated rather than
+    /// refused, because a digest is a comparison value and not a wire format.
+    #[must_use]
+    pub fn request_digest(&self) -> Digest {
+        let mut conditions = Vec::new();
+        conditions.extend_from_slice(&saturating_count(self.conditions.len()).to_le_bytes());
+        for condition in &self.conditions {
+            match condition {
+                Condition::VersionEquals { key, version } => {
+                    conditions.push(1);
+                    push_blob(&mut conditions, key);
+                    conditions.extend_from_slice(&version.to_le_bytes());
+                }
+                Condition::Absent { key } => {
+                    conditions.push(2);
+                    push_blob(&mut conditions, key);
+                }
+                Condition::Present { key } => {
+                    conditions.push(3);
+                    push_blob(&mut conditions, key);
+                }
+            }
+        }
+
+        let mut mutations = Vec::new();
+        mutations.extend_from_slice(&saturating_count(self.mutations.len()).to_le_bytes());
+        for mutation in &self.mutations {
+            match mutation {
+                Mutation::Put {
+                    key,
+                    value,
+                    expected_version,
+                } => {
+                    mutations.push(1);
+                    push_blob(&mut mutations, key);
+                    push_blob(&mut mutations, value);
+                    push_expected_version(&mut mutations, *expected_version);
+                }
+                Mutation::Delete {
+                    key,
+                    expected_version,
+                } => {
+                    mutations.push(2);
+                    push_blob(&mut mutations, key);
+                    push_expected_version(&mut mutations, *expected_version);
+                }
+            }
+        }
+
+        Digest::of(
+            Domain::Request,
+            &[
+                &self.identity.tenant.0.to_le_bytes(),
+                &self.affinity.0.to_le_bytes(),
+                &conditions,
+                &mutations,
+                &self.api_version.to_le_bytes(),
+            ],
+        )
+    }
+}
+
+/// A `u32` length prefix, then the bytes. Every variable-length field inside a digest part is
+/// prefixed so two different field splits cannot share a preimage (kernel-b finding K-B-08).
+fn push_blob(out: &mut Vec<u8>, blob: &Bytes) {
+    out.extend_from_slice(&saturating_count(blob.len()).to_le_bytes());
+    out.extend_from_slice(blob);
+}
+
+/// `0` and nothing, or `1` and the version. A tag rather than a sentinel, because version zero
+/// is a real version.
+fn push_expected_version(out: &mut Vec<u8>, expected: Option<u64>) {
+    match expected {
+        None => out.push(0),
+        Some(version) => {
+            out.push(1);
+            out.extend_from_slice(&version.to_le_bytes());
+        }
+    }
+}
+
+/// A count as a `u32`, saturating. A request with more than four billion mutations cannot be
+/// admitted, and a digest has no error channel to report one on.
+fn saturating_count(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 /// A precondition on one key.

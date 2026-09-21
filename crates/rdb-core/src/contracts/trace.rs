@@ -227,9 +227,14 @@ pub enum ReadRequestKind {
     ActorRead,
 }
 
-/// How a read ended.
+/// How a read was *served*.
+///
+/// Named apart from [`crate::contracts::control::ReadOutcome`] on purpose (lead ruling F-R4,
+/// 2026-09-20). That one is what the control store said about a record; this one is how the data
+/// plane served a reader. Module paths kept them apart, but a trace field and a control field in
+/// the same function would not have, and the oracle folds both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum ReadOutcome {
+pub enum ReadServiceOutcome {
     /// Served from the published prefix.
     Served,
     /// Waited at the barrier for the in-flight transaction, then served.
@@ -736,8 +741,8 @@ pub enum TraceKind {
         observed_key_versions: Vec<(KeyId, Version)>,
         /// Whether the partition is in read-only recovery.
         recovery_mode: bool,
-        /// How it ended.
-        outcome: ReadOutcome,
+        /// How it was served.
+        outcome: ReadServiceOutcome,
     },
 
     /// A dedup record moved.

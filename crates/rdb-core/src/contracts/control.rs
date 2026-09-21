@@ -6,12 +6,14 @@
 //! atomic multi-record change must stage inert records and flip one pointer.
 //!
 //! Watches invalidate caches; they never grant authority. A gap forces a coherent reload from a
-//! recorded revision — [`ControlEvent::WatchGap`] exists so that "I missed something" is a value
-//! the kernel must handle, not a silence it can ignore.
+//! recorded revision — [`ControlEvent::WatchTerminated`] carrying a
+//! [`WatchTermination::is_gap`] termination exists so that "I missed something" is a value the
+//! kernel must handle, not a silence it can ignore.
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::errors::RdbError;
 use crate::contracts::ids::{NodeId, OperationId, PartitionId, RangeId, Revision};
 
 /// The authoritative record families of spec §7.1.
@@ -57,6 +59,57 @@ impl ControlKey {
             Self::Route(range) => format!("routes/{}", range.0),
             Self::Operation(operation) => format!("operations/{}", operation.0),
             Self::PlannerGrant => "planner/grant".to_owned(),
+        }
+    }
+
+    /// The inverse of [`Self::encode`], exactly.
+    ///
+    /// Total and strict: a key this build does not recognise is a typed refusal, never a guess
+    /// at which family it belonged to. Strictness is the point — a store key that almost parses
+    /// is how a watch delivers a record into the wrong cache.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] for an unknown family, a missing or trailing segment, or an
+    /// id that is not a plain decimal fitting its width.
+    pub fn decode(key: &str) -> Result<Self, RdbError> {
+        const FIELD: &str = "control_key";
+
+        match key {
+            "cluster/schema" => return Ok(Self::ClusterSchema),
+            "planner/grant" => return Ok(Self::PlannerGrant),
+            _ => {}
+        }
+
+        let (family, id) = key
+            .split_once('/')
+            .ok_or(RdbError::InvalidArgument { field: FIELD })?;
+        if id.contains('/') {
+            return Err(RdbError::InvalidArgument { field: FIELD });
+        }
+
+        // `str::parse` accepts a leading `+`; the encoder never writes one, so neither does the
+        // decoder accept one. A round trip that is not the identity is a key family that moved.
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(RdbError::InvalidArgument { field: FIELD });
+        }
+
+        let narrow = || {
+            id.parse::<u32>()
+                .map_err(|_| RdbError::InvalidArgument { field: FIELD })
+        };
+        let wide = || {
+            id.parse::<u64>()
+                .map_err(|_| RdbError::InvalidArgument { field: FIELD })
+        };
+
+        match family {
+            "nodes" => Ok(Self::Node(NodeId(narrow()?))),
+            "grants" => Ok(Self::Grant(NodeId(narrow()?))),
+            "partitions" => Ok(Self::Partition(PartitionId(narrow()?))),
+            "routes" => Ok(Self::Route(RangeId(narrow()?))),
+            "operations" => Ok(Self::Operation(OperationId(wide()?))),
+            _ => Err(RdbError::InvalidArgument { field: FIELD }),
         }
     }
 }

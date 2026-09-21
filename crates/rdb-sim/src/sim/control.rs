@@ -14,7 +14,7 @@
 //! | 2. `Unknown` is distinct from `Unavailable` and from `Conflict` | three separate `CasOutcome` variants; [`ControlOp::PlanCas`] forces any of them |
 //! | 3. all five typed watch terminations, plus a progress tick | [`ControlOp::TerminateWatch`], [`ControlOp::EmitProgress`] |
 //! | 4. ~~no silent gap~~ | **kernel-side assertion, not a fake property** (A-R15). [`ControlOp::EmitWatch`] delivers contiguously and a gap is only ever a termination, so "the kernel reloaded without being told to" is an assertion the oracle makes against the trace — the fake cannot enforce it and does not try |
-//! | 5. ~~`Unavailable` inside a generous deadline~~ | **deleted** (A-R15) |
+//! | 5. `Unavailable` inside a generous deadline | **restored** by lead ruling F-R3, after A-R15 had deleted it: [`ControlOp::PlanReadUnavailable`] |
 //! | 6. a coherent family read with a resumable `snapshot_revision` | [`ControlStore::snapshot_family`] |
 //! | 7. a completion delivered arbitrarily late, after the grant expired | [`ControlOp::DelayCompletion`] |
 //! | 8. a control effect that never completes at all | [`ControlOp::DropCompletion`] |
@@ -47,6 +47,19 @@ pub enum ControlOp {
         /// What the next CAS will report.
         outcome: CasOutcome,
     },
+    /// Force the next linearizable read to report
+    /// [`rdb_core::contracts::control::ReadOutcome::Unavailable`], whatever the record holds.
+    ///
+    /// Lead ruling F-R3 (2026-09-20) restored this injection point, which A-R15 had removed with
+    /// ADR-rdb-0008 §7 item 5. The behaviour is real, not a courtesy: rEtcd bounds its read
+    /// barrier by the server's own `read_timeout`, independent of the caller's (rEtcd ADR-0009),
+    /// so a read comes back unavailable well inside a generous deadline. Package A1's rows need
+    /// it because a grant holder that treats an unavailable read as "probably still mine" keeps
+    /// writing after it has lost the control plane.
+    ///
+    /// Carries no outcome parameter: `Found` and `Absent` follow from the store's own state, and
+    /// this is the one answer that cannot.
+    PlanReadUnavailable,
     /// Deliver the pending watch changes to `node`, contiguously.
     EmitWatch {
         /// The watcher.
