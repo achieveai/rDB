@@ -66,6 +66,11 @@ A secondary checks, in this order, and stops at the first failure:
 3. size and mutation count within declared bounds → `TOO_LARGE` (before any hashing)
 4. partition → `WRONG_PARTITION`
 5. generation: lower → `STALE_GENERATION`; higher → `NEED_LINEAGE`
+5a. `lease_id` equals the grant id in `AuthorityView` → `UNKNOWN_GRANT`. This is the
+   superseded-authority gate: spec §7.1 binds a grant id to an authority generation and §7.2 says an
+   authority-generation change invalidates cached grants, so a superseded authority's appends fail
+   here without the envelope needing a new field. Checked before the epoch comparison, because a
+   superseded authority makes an epoch meaningless rather than merely stale
 6. owner epoch: lower → `STALE_EPOCH`; higher → `UNKNOWN_EPOCH`
 7. config version and membership: the transport's authenticated peer must be that config's primary
    → `STALE_CONFIG` / `NEED_CONFIG` / `NOT_A_MEMBER`
@@ -133,7 +138,20 @@ own recorded digest at `ack.buffered_applied_seq`.
 
 That last check is what makes a forged ACK useless even with a stolen identity: the ACK is bound to
 the primary's own history. A mismatch is not "ignore" — it is `DivergenceDetected`, and that copy
-leaves every qualifying set.
+leaves the qualifying set **for every sequence not yet qualified**.
+
+The seam handed to P1 is `QualifiedPrefix { lineage, config_version, qualified_through_seq }`, and
+`qualified_through_seq` is a **monotone watermark within a lineage**, not a recomputation. It
+advances by `max`; only a new lineage root (ADR-0009 §1) resets it, to `base_seq`. Excluding a
+diverged copy therefore bites forward and never backwards. The reason is spec §5.3: "a lost client
+reply does not reverse publication." If a copy ACKs seq 100, the prefix qualifies, P1 publishes, and
+that copy is *later* excluded, recomputing the predicate would retract the prefix to 99 — telling P1
+to un-publish something a client may already have been told succeeded. The correct response to "a
+copy that acknowledged seq 100 now disagrees about it" is `DivergenceDetected` plus a fenced
+recovery, where ADR-0009 re-decides the history against the committed root and may declare a cutoff
+and a new generation. Loss becomes nameable rather than silent. Safety is preserved by refusing new
+success — `qualifies_now` goes false, and ADR-0006's `no qualifying regular secondary` arm pauses
+admission — not by rewriting old success.
 
 Two consequences fall out of computing the predicate from configuration, with no branch to forget:
 
@@ -214,7 +232,8 @@ does not describe.
 | Whole batch or none | `BatchFailed` injected at every boundary: accept head resets, no partial suffix survives — **gate V1** |
 | No false durable watermark | `FlushFailed` and partial flush advance nothing; `DurableProof` unconstructible otherwise — **gate V1** |
 | Lost or forged ACK cannot advance progress | Forged peer label, wrong epoch/config/boot, regressed watermarks and wrong head digest each rejected by a named test |
-| Shadows never qualify | Shadow ACK at a higher seq does not make `qualifies(seq)` true |
+| Shadows never qualify | Shadow ACK at a higher seq does not advance `qualified_through_seq` |
+| `qualified_through_seq` never regresses in a lineage | Cross-team row: a copy that ACKed seq N is excluded by `DivergenceDetected`; the watermark stays at N and `qualifies_now(N+1)` goes false |
 | No one-copy fallback in RF2 | With `min_regular_acks = 1` of 1, losing the copy stops admission — **gate V3** |
 | Catch-up never overwrites divergence | `NEED_PREFIX` with a mismatched head digest sends no envelopes and raises divergence |
 | Unequal secondary prefixes converge | Every unequal pairing catches up by suffix and reaches equal head digests — **gate V3** |

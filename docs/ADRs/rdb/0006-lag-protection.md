@@ -73,7 +73,7 @@ which set is *newest*, never which exposures are *outstanding*.
 **Guard A (this module):** admission. L1 emits `SetAdmission(Reject(PROTECTION_PAUSED))`.
 
 **Guard B (ADR-0005 / P1):** publication. P1 refuses to publish without
-`ReplicationResult::qualifies(seq)`, computed from the pinned configuration's regular secondaries.
+`QualifiedPrefix` reaching that seq, computed from the pinned configuration's regular secondaries.
 
 Neither is permitted to rely on the other. The consequence is the point: a bug in L1's age
 arithmetic cannot produce a locally acknowledged write. It can only produce an availability fault,
