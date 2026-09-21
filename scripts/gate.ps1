@@ -111,6 +111,14 @@ if ($Stage -in 'fmt', 'all')  { Write-Host '== fmt';    Invoke-Cargo @('fmt', '-
 if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
 if ($Stage -in 'drift', 'all') { Test-Drift }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
-if ($Stage -in 'test', 'all') { Write-Host '== test';   Invoke-Cargo (@('test', '--workspace', '--no-fail-fast') + $CargoArgs) }
+if ($Stage -in 'test', 'all') {
+    Write-Host '== test'
+    # `--workspace` is dropped when the caller names a package: cargo ignores `-p` after
+    # `--workspace` rather than rejecting it, so a scoped run silently became the whole
+    # workspace (observed 2026-09-21). Same rule as gate.sh.
+    $scoped = $CargoArgs | Where-Object { $_ -eq '-p' -or $_ -like '-p*' -or $_ -eq '--package' -or $_ -like '--package=*' }
+    $scope = if ($scoped) { @() } else { @('--workspace') }
+    Invoke-Cargo (@('test') + $scope + @('--no-fail-fast') + $CargoArgs)
+}
 
 Write-Host "gate: $Stage OK"

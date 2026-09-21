@@ -51,7 +51,20 @@ run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
 # rows report Unavailable on types that have already landed. See scripts/drift-check.sh.
 run_drift() { scripts/drift-check.sh; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
-run_test() { echo "== test";   cargo test --workspace --no-fail-fast "$@"; }
+# `--workspace` is dropped when the caller names a package. Cargo treats `--workspace -p x` as
+# the workspace: the `-p` is not an error, it is ignored, and a "scoped" run on 2026-09-21 ran
+# rdb-sim's suite under the name `-p config-server`. The wrapper's exit code also hid cargo's
+# behind a `| tail`; that half is the caller's, this half is the script's.
+run_test() {
+  echo "== test"
+  local scope=(--workspace)
+  for arg in "$@"; do
+    case "$arg" in
+      -p|--package|-p*|--package=*) scope=() ;;
+    esac
+  done
+  cargo test "${scope[@]}" --no-fail-fast "$@"
+}
 # perl with JSON::PP ships with every Git for Windows and every Linux perl; no jq needed.
 run_deps() {
   echo "== deps"

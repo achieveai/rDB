@@ -30,7 +30,12 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
 - `scripts/gate.sh` (or `scripts/gate.ps1`) runs fmt, deps, drift, clippy and the workspace
   tests. Use it instead of bare `cargo test --workspace`. One stage at a time:
   `scripts/gate.sh lint`; extra cargo arguments pass through:
-  `scripts/gate.sh test -p config-testkit --test m4_watch_faults_cluster`.
+  `scripts/gate.sh test -p config-testkit --test m4_watch_faults_cluster`. A `-p` drops the
+  script's `--workspace`; before 2026-09-21 it did not, and cargo ignores `-p` after
+  `--workspace` without a word, so every "scoped" run was the whole workspace.
+- Read cargo's exit code, not the pipeline's. `gate.sh test ... | grep | tail` reports `tail`'s
+  status, and on 2026-09-21 a run that ended `error: 8 targets failed` showed exit 0 that way.
+  Send full output to a file and read the file.
 - The `drift` stage checks the M7 test plans, not the code. Each plan's section 15 says which
   contract commit it was written against, in a marker line `<!-- drift-basis: <sha> -->`, and
   the stage fails when that commit is no longer the newest one to touch
