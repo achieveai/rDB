@@ -150,7 +150,10 @@ milestone.
   (ADR-rdb-0002 decision 5), and by replay equality, which a wall clock breaks immediately.
 - `SnapshotRead` being a trait object means a module cannot be generic over storage. That is the
   intent: one read surface, one set of assertions.
-- The simulator's providers hold state and are neither `Copy` nor `const`. A scheduler that could
+- The simulator's providers hold state and none of them is `Copy`. (`const fn` survives on four
+  single-field accessors — `Scheduler::now`, `Clock::now`, `ControlStore::revision`,
+  `Cluster::config` — which is harmless; an earlier revision of this bullet said "neither `Copy`
+  nor `const`", which the landed code does not bear out.) A scheduler that could
   be silently copied would duplicate its queue rather than alias it, invisibly at the call site
   (K-F-29).
 - A crash image carries both watermarks per partition, `durable` and `applied`. A process crash
@@ -175,8 +178,11 @@ milestone.
 - Row M7F-21 (owed by package I1): an effect emitted at tick *t* is delivered to the next step at
   tick *t*; with `ControlOp::DelayCompletion { by_millis: 50 }` its completion lands at exactly
   *t + 50* (decision 9).
-- `harness::replay::replay` returns `ReplayOutcome::Identical` for a recorded trace, and
-  `Unreplayable` for one whose schema or generator version differs.
+- Replay (owed by package I1): `harness::replay::replay` is to return `ReplayOutcome::Identical`
+  for a recorded trace, and `Unreplayable` for one whose schema or generator version differs.
+  Today it is `Err(SimError::unavailable("harness::replay::replay"))` unconditionally
+  (`crates/rdb-sim/src/harness/replay.rs:44–46`), and `m7f_22` names it among the owed seams. This
+  bullet carried no marker in an earlier revision and so read as a verified fact (K-F-42).
 - No panicking stub and no clock in the kernel, with doc-comment hits excluded. Both commands
   print nothing and exit 1 (observed 2026-09-20); without the second filter each finds only
   comments that explain why the thing is absent, which is what an earlier revision of these
