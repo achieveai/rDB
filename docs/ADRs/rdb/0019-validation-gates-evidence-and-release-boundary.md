@@ -46,7 +46,7 @@ plan, and that re-derivation is stated here rather than implied.
 | V5 | Lifecycle (move/split) | not in scope | M11 | pending | placement |
 | V6 | Actor effects | not in scope | M13 | pending | actor |
 | V7 | Normal load | not in scope | M12 | pending — needs Linux NVMe hosts | performance |
-| V8 | Lag protection | **claimed, simulated — split between two owners** | M10 real | M7, oracle half (INV-LAG): transition legality — no `Healthy` after `Paused` without a `Resuming` that hits `resume_barrier_seq` exactly with lag <250 ms for 5 s (spec §6.2's resume row; the validation plan omits the 250 ms and the spec binds); unsafe age never reset by a `config_version` change; no publish while paused. M7, kernel half (kernel-b L1 rows): the 1 s warn / 2 s pause ladder, which depends on the harness's ≤50 ms health-evaluation cadence and is not judgeable from the trace. Neither half alone is V8. | kernel-b + verification |
+| V8 | Lag protection | **claimed, simulated — split between two owners** | M10 real | M7, oracle half (INV-LAG): transition legality — no `Healthy` after `Paused` without a `Resuming` during which every node in the `required_copy_set` pinned at `paused_prefix_seq` is durable through `resume_barrier_seq`, the barrier is hit exactly, and lag <250 ms for 5 s (spec §6.2's resume row: "All configured regular copies durable through paused prefix"; the validation plan omits the 250 ms and the spec binds); unsafe age never reset by a `config_version` change; no `admission_decision{outcome=Admitted}` at or after the first `protection_state{state=Paused}` and before the next `state=Healthy`. M7, kernel half (kernel-b L1 rows): the 1 s warn / 2 s pause ladder, which depends on the harness's ≤50 ms health-evaluation cadence and is not judgeable from the trace. Neither half alone is V8. | kernel-b + verification |
 | V9 | Balancing | not in scope | M11 | pending | placement |
 | V10 | Recovery load | not in scope | M12 | pending — RTO is a provisional objective, not a guarantee | replication + performance |
 | V11 | Resource envelope | not in scope | M12 | pending | storage/runtime |
@@ -97,7 +97,7 @@ rDB-specific additions, all inside `values` so the schema itself is untouched:
 
 | Artifact | `values` keys |
 |---|---|
-| `rdb-m7-campaign.json` | `seeds`, `max_events`, `events_total`, `invariants{id -> proven\|unavailable\|violated}`, `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`\|`release`) |
+| `rdb-m7-campaign.json` | `seeds`, `max_events`, `events_total`, `invariants{id -> proven\|unavailable\|violated}`, `mutations{id -> catching_row}`, `wall_ms`, `shrink_ms` (separate — reducer time is not campaign time), `compile_ms_excluded`, `profile` (`debug`\|`release`), `slipped` per minimized fixture (`true` when the fault-boundary set differs before and after shrinking; the boundary set is reported, never part of the reducer's acceptance predicate) |
 | `rdb-m7-coverage.json` | `guard_outcomes{cell -> count}`, `fault_boundaries{cell -> count}`, `pairwise{pair -> count}`, `required_missing[]` |
 
 Two rDB-specific rules, both consequences of the spike plan:
