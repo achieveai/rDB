@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::ids::{
     AppliedSeq, BatchId, DurableSeq, FlushTicket, Generation, PartitionId, Seq, SnapshotHandle,
 };
+use crate::contracts::trace::Version;
 
 /// Which family of records a key belongs to.
 ///
@@ -174,8 +175,12 @@ pub enum StorageEvent {
     Flushed {
         /// The flush this completes.
         ticket: FlushTicket,
-        /// The prefixes now confirmed on disk, never wider than what the flush captured. The only
-        /// place a [`DurableSeq`] enters the kernel.
+        /// The prefixes the engine **actually** confirmed on disk — the environment's answer, not
+        /// an echo of what was captured. Never wider than the capture, and allowed to be
+        /// narrower: a sync that covered less than the kernel asked for reports the shorter
+        /// prefix here (finding K-F-25), and a kernel that advanced to the captured value
+        /// instead would be advancing on its own belief. The only place a [`DurableSeq`] enters
+        /// the kernel.
         durable: Vec<DurablePrefix>,
     },
     /// The flush errored or completed partially. No watermark moves.
@@ -216,6 +221,17 @@ pub trait SnapshotRead {
 
     /// The value stored at `key` in `ns`, or `None`.
     fn get(&self, ns: Namespace, key: &[u8]) -> Option<Bytes>;
+
+    /// The version of the record at `key` in `ns`, or `None` when there is no record.
+    ///
+    /// What [`crate::contracts::txn::Condition::VersionEquals`] and
+    /// [`crate::contracts::txn::Mutation::Put`]'s `expected_version` are evaluated against
+    /// (finding K-F-04: the engine had the version and the kernel could not reach it). A version
+    /// is the sequence of the transaction that last wrote the record, so it is monotonic within
+    /// a lineage. A deleted record has no version, exactly as it has no value: `version` is
+    /// `Some` if and only if [`SnapshotRead::get`] is. The type is the trace's
+    /// [`Version`], so the seam and the oracle agree on what a version is.
+    fn version(&self, ns: Namespace, key: &[u8]) -> Option<Version>;
 
     /// Up to `limit` records from `ns` at or after `from`, in ascending key order.
     fn scan(&self, ns: Namespace, from: &[u8], limit: usize) -> Vec<(Bytes, Bytes)>;

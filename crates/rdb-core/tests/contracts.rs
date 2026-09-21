@@ -8,7 +8,7 @@
 //!
 //! | Row | Claim |
 //! |---|---|
-//! | M7F-02 | `record_digest` chains `prev_digest`, binds partition and lease, separates field boundaries; `request_digest` ignores the remaining deadline |
+//! | M7F-02 | `record_digest` chains `prev_digest`, binds the partition, is invariant under `protocol_version` and `lease_id` (F-R6), separates field boundaries; `request_digest` ignores the remaining deadline |
 //! | M7F-03 | `ControlKey::encode`/`decode` for every spec §7.1 key family |
 //! | M7F-04 | envelope round trip, golden bytes, and an unknown mandatory version refused before any body decode |
 //!
@@ -150,21 +150,17 @@ fn m7f_02_record_digest_separates_field_boundaries() {
     );
 }
 
-/// Finding K-B-07: the preimage binds the partition and the grant.
+/// Finding K-B-07: the preimage binds the partition.
 ///
 /// `ProbeDigestReply` and `InventoryReply` carry raw `(seq, digest)` pairs that never pass the
-/// append ladder, so nothing but the digest itself ties a ladder rung to its partition. And with
-/// `lease_id` covered, the history records which grant produced each entry.
+/// append ladder, so nothing but the digest itself ties a ladder rung to its partition.
 #[retcd_test]
-fn m7f_02_record_digest_binds_partition_and_lease() {
+fn m7f_02_record_digest_binds_partition() {
     let base = envelope(1, Digest::ROOT, b"k", b"v");
     let base_digest = base.compute_record_digest().expect("base digest");
 
     let mut other_partition = envelope(1, Digest::ROOT, b"k", b"v");
     other_partition.header.partition = PartitionId(8);
-
-    let mut other_lease = envelope(1, Digest::ROOT, b"k", b"v");
-    other_lease.lease_id = LeaseId(43);
 
     assert_ne!(
         base_digest,
@@ -173,10 +169,56 @@ fn m7f_02_record_digest_binds_partition_and_lease() {
             .expect("other partition"),
         "partition_id is part of the preimage (K-B-07)"
     );
-    assert_ne!(
+}
+
+/// Ruling F-R6 (findings K-F-01, K-F-02): `protocol_version` is out of the preimage.
+///
+/// A digest chain is compared across node ages. If the envelope's wire version were hashed, a
+/// node that re-encoded a record under a newer wire format would compute a different digest for
+/// the same history, and recovery would call an upgrade a divergence (design §4.8).
+#[retcd_test]
+fn m7f_02_record_digest_is_invariant_under_protocol_version() {
+    let base = envelope(1, Digest::ROOT, b"k", b"v");
+    let base_digest = base.compute_record_digest().expect("base digest");
+
+    let mut other_version = envelope(1, Digest::ROOT, b"k", b"v");
+    other_version.header.protocol_version = ENVELOPE_VERSION + 1;
+
+    assert_eq!(
+        base_digest,
+        other_version
+            .compute_record_digest()
+            .expect("other version"),
+        "protocol_version is framing, not history (F-R6)"
+    );
+}
+
+/// Ruling F-R6 again: `lease_id` is out of the preimage.
+///
+/// The grant that produced an entry is a fact about the primary, not about the history. Two
+/// secondaries that received one entry under two grant renewals hold one history, and a chain
+/// that hashed the lease would report a divergence at every renewal (design §4.8). The epoch
+/// stays in: an entry's `owner_epoch` is what the fence checks.
+#[retcd_test]
+fn m7f_02_record_digest_is_invariant_under_lease_id() {
+    let base = envelope(1, Digest::ROOT, b"k", b"v");
+    let base_digest = base.compute_record_digest().expect("base digest");
+
+    let mut other_lease = envelope(1, Digest::ROOT, b"k", b"v");
+    other_lease.lease_id = LeaseId(43);
+
+    assert_eq!(
         base_digest,
         other_lease.compute_record_digest().expect("other lease"),
-        "lease_id is part of the preimage (K-B-07)"
+        "lease_id is the grant, not the history (F-R6)"
+    );
+
+    let mut other_epoch = envelope(1, Digest::ROOT, b"k", b"v");
+    other_epoch.header.owner_epoch = OwnerEpoch(6);
+    assert_ne!(
+        base_digest,
+        other_epoch.compute_record_digest().expect("other epoch"),
+        "owner_epoch stays in the preimage"
     );
 }
 
@@ -294,7 +336,9 @@ fn m7f_02_domains_do_not_collide() {
 /// The known answer proper: a fixed envelope hashes to a fixed 32 bytes, for ever.
 ///
 /// This is the vector a second implementation, or a later refactor, is checked against. A change
-/// here is a protocol change and must move [`ENVELOPE_VERSION`].
+/// here is a protocol change and must move [`ENVELOPE_VERSION`]. Re-pinned once, in correction
+/// round 1, when ruling F-R6 took `protocol_version` and `lease_id` out of the preimage; the
+/// envelope's golden bytes did not move, because the wire format did not.
 #[retcd_test]
 fn m7f_02_record_digest_golden() {
     let first = envelope(1, Digest::ROOT, b"k", b"v0");
@@ -304,12 +348,12 @@ fn m7f_02_record_digest_golden() {
 
     assert_eq!(
         first_digest.to_hex(),
-        "f2ef0c89b39c2b72e30ceacaa4f30ac845a2f085802764a6847714238828c0ca",
+        "0d31b22c883fd531d0b037044aebbf9f577d2b55a6633eee612fbfe75ee429f0",
         "entry 1 golden"
     );
     assert_eq!(
         second_digest.to_hex(),
-        "f1c60eacfc9bbf51b094470589b601f91e100abf93ba9fe39544fe0238afa199",
+        "cf81114353a593748af1e9d5eba6a445636912c2fe4f4de2828e4d9a761c3358",
         "entry 2 golden"
     );
 }

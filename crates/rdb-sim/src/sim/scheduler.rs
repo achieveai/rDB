@@ -7,11 +7,10 @@
 //! The queue jumps to the next scheduled tick. It never advances through idle milliseconds, so a
 //! twenty-four-hour dedup expiry costs the same as a one-millisecond timer.
 //!
-//! # Seed state
-//!
-//! Signatures only; every method returns [`SimError::Unavailable`]. Package H1 lands the queue.
-//! It will be a `BTreeMap<(Tick, EventId), Event>` — never a binary heap, whose tie order among
-//! equal keys is unspecified, and never a `HashMap`.
+//! A `BTreeMap<(Tick, EventId), Event>` — never a binary heap, whose tie order among equal keys
+//! is unspecified, and never a `HashMap`.
+
+use std::collections::BTreeMap;
 
 use rdb_core::contracts::event::Event;
 use rdb_core::contracts::ids::EventId;
@@ -20,61 +19,82 @@ use rdb_core::contracts::time::Tick;
 use crate::error::SimError;
 
 /// The ordered event queue.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Scheduler;
+///
+/// Holds its state and is not `Copy` (finding K-F-29): a silent copy of a scheduler would
+/// duplicate the queue rather than alias it, invisibly at the call site.
+#[derive(Debug)]
+pub struct Scheduler {
+    now: Tick,
+    next_id: EventId,
+    queue: BTreeMap<(Tick, EventId), Event>,
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Scheduler {
     /// An empty queue at [`Tick::ZERO`].
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            now: Tick::ZERO,
+            next_id: EventId(0),
+            queue: BTreeMap::new(),
+        }
     }
 
     /// Current logical time: the tick of the last event taken, or [`Tick::ZERO`].
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Unavailable`] until package H1 lands the queue.
-    pub const fn now(&self) -> Result<Tick, SimError> {
-        Err(SimError::unavailable("sim::scheduler::Scheduler::now"))
+    #[must_use]
+    pub const fn now(&self) -> Tick {
+        self.now
     }
 
     /// Allocate the next event id. Strictly increasing for the life of the run.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Unavailable`] until package H1 lands the queue.
-    pub const fn next_event_id(&mut self) -> Result<EventId, SimError> {
-        Err(SimError::unavailable(
-            "sim::scheduler::Scheduler::next_event_id",
-        ))
+    pub const fn next_event_id(&mut self) -> EventId {
+        let id = self.next_id;
+        self.next_id = EventId(id.0 + 1);
+        id
     }
 
     /// Queue an event.
     ///
     /// # Errors
     ///
-    /// [`SimError::Config`] when the event is scheduled before [`Scheduler::now`], which would
-    /// reorder the past. [`SimError::Unavailable`] until package H1 lands the queue.
-    pub fn schedule(&mut self, _event: Event) -> Result<(), SimError> {
-        Err(SimError::unavailable("sim::scheduler::Scheduler::schedule"))
+    /// [`SimError::Config`] naming `at` when the event is scheduled before [`Scheduler::now`],
+    /// which would reorder the past, and naming `event_id` when an event with the same tick and
+    /// id is already queued — one id is one event, and overwriting it would lose one silently.
+    pub fn schedule(&mut self, event: Event) -> Result<(), SimError> {
+        if event.at < self.now {
+            return Err(SimError::Config { field: "at" });
+        }
+        let key = (event.at, event.id);
+        if self.queue.contains_key(&key) {
+            return Err(SimError::Config { field: "event_id" });
+        }
+        self.queue.insert(key, event);
+        Ok(())
     }
 
-    /// Take the next event, advancing logical time to its tick.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Unavailable`] until package H1 lands the queue.
-    pub const fn next(&mut self) -> Result<Option<Event>, SimError> {
-        Err(SimError::unavailable("sim::scheduler::Scheduler::next"))
+    /// Take the next event, advancing logical time to its tick: the jump to the next deadline
+    /// (spike §6). Idle milliseconds are never ticked through.
+    pub fn pop(&mut self) -> Option<Event> {
+        let ((at, _), event) = self.queue.pop_first()?;
+        self.now = at;
+        Some(event)
     }
 
     /// How many events are queued.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Unavailable`] until package H1 lands the queue.
-    pub const fn queued(&self) -> Result<usize, SimError> {
-        Err(SimError::unavailable("sim::scheduler::Scheduler::queued"))
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// The tick of the next queued event, or `None` when the queue is empty.
+    #[must_use]
+    pub fn next_tick(&self) -> Option<Tick> {
+        self.queue.keys().next().map(|(at, _)| *at)
     }
 }

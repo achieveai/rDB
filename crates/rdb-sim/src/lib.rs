@@ -21,17 +21,17 @@
 //! |---|---|---|
 //! | [`sim`] | H1 | scheduler, clock and timers, network, fake control store, cluster |
 //! | [`storage`] | M1 | ordered memory engine, crash images, snapshots |
-//! | [`harness`] | I1 | effect dispatch, canonical trace, replay |
+//! | [`harness`] | I1 | effect dispatch, canonical trace, run manifest, replay |
 //! | [`error`] | H1 | the environment's own error type |
 //!
-//! # Seed state (2026-09-20)
+//! # State (2026-09-20, correction round 1)
 //!
-//! The types and signatures are the contract. Behaviour that is not built yet returns an
-//! explicit [`error::SimError::Unavailable`] rather than pretending (spike §8), and nothing here
-//! calls `todo!()` — a panic would abort the campaign runner instead of letting it report which
-//! package is missing. Two things *are* built, because three other teams need them to compile
-//! against: [`harness::dispatch::Dispatcher`]'s registry and capability report, and
-//! [`storage::snapshot::EmptySnapshot`].
+//! Behaviour that is not built yet returns an explicit [`error::SimError::Unavailable`] rather
+//! than pretending (spike §8), and nothing here calls `todo!()` — a panic would abort the
+//! campaign runner instead of letting it report which package is missing. What is still owed:
+//! network delivery ([`sim::network::Network::send`]), node suspension
+//! ([`sim::cluster::Cluster::suspend`]) and replay ([`harness::replay::replay`]).
+//! [`harness::environment_capabilities`] is the same list as three values.
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 

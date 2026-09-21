@@ -4,9 +4,13 @@
 //! (spike §1). A configuration with fewer than three regular copies is *allowed to be built* so
 //! that failure states can be exercised — and must reject writes, not quietly accept them.
 //!
-//! # Seed state
+//! # State
 //!
-//! The configuration types are real; stepping the cluster is package H1.
+//! The configuration types, [`ClusterConfig::validate`], [`Cluster::new`], [`Cluster::stop`]
+//! and [`Cluster::start`] are real. [`Cluster::suspend`] is owed: it needs the scheduler to
+//! deliver [`rdb_core::contracts::event::NodeLifecycle::Resumed`], and says so.
+
+use std::collections::BTreeMap;
 
 use rdb_core::contracts::ids::{BootId, ConfigVersion, NodeId, PartitionId, ReplicaRole};
 use rdb_core::contracts::membership::PartitionConfig;
@@ -50,66 +54,167 @@ pub struct ClusterConfig {
 impl ClusterConfig {
     /// Check the topology is internally consistent before anything runs.
     ///
-    /// Rejects duplicate node ids, a partition whose members name an absent node, duplicate
-    /// copy slots, and more than one primary. It does **not** reject an under-replicated
-    /// partition: that is a legal scenario whose correct behaviour is to refuse writes.
+    /// Rejects nodes out of order or duplicated, partitions out of order or duplicated, a spec
+    /// whose config names another partition, a config [`PartitionConfig::validate`] refuses,
+    /// members out of slot order or with a duplicate slot, a member naming an absent node, and
+    /// more than one primary. It does **not** reject an under-replicated partition: that is a
+    /// legal scenario whose correct behaviour is to refuse writes.
     ///
     /// # Errors
     ///
-    /// [`SimError::Config`] naming the offending field. [`SimError::Unavailable`] until package
-    /// H1 lands the checks.
-    pub const fn validate(&self) -> Result<(), SimError> {
-        Err(SimError::unavailable(
-            "sim::cluster::ClusterConfig::validate",
-        ))
+    /// [`SimError::Config`] naming the offending field.
+    pub fn validate(&self) -> Result<(), SimError> {
+        if !self
+            .nodes
+            .windows(2)
+            .all(|pair| pair[0].node < pair[1].node)
+        {
+            return Err(SimError::Config { field: "nodes" });
+        }
+        if !self
+            .partitions
+            .windows(2)
+            .all(|pair| pair[0].partition < pair[1].partition)
+        {
+            return Err(SimError::Config {
+                field: "partitions",
+            });
+        }
+        for spec in &self.partitions {
+            if spec.config.partition != spec.partition {
+                return Err(SimError::Config { field: "partition" });
+            }
+            if spec.config.validate().is_err() {
+                return Err(SimError::Config {
+                    field: "min_regular_acks",
+                });
+            }
+            let members = &spec.config.members;
+            if !members.windows(2).all(|pair| pair[0].copy < pair[1].copy) {
+                return Err(SimError::Config { field: "members" });
+            }
+            if members
+                .iter()
+                .any(|member| !self.nodes.iter().any(|node| node.node == member.node))
+            {
+                return Err(SimError::Config { field: "member" });
+            }
+            if members
+                .iter()
+                .filter(|member| member.role == ReplicaRole::Primary)
+                .count()
+                > 1
+            {
+                return Err(SimError::Config { field: "primary" });
+            }
+        }
+        Ok(())
     }
 
-    /// Every node holding a copy of `partition` in `role`.
-    ///
-    /// # Errors
-    ///
-    /// [`SimError::Unavailable`] until package H1 lands the topology.
-    pub const fn copies(
-        &self,
-        _partition: PartitionId,
-        _role: ReplicaRole,
-    ) -> Result<Vec<NodeId>, SimError> {
-        Err(SimError::unavailable("sim::cluster::ClusterConfig::copies"))
+    /// Every node holding a copy of `partition` in `role`, in slot order. Empty for an unknown
+    /// partition.
+    #[must_use]
+    pub fn copies(&self, partition: PartitionId, role: ReplicaRole) -> Vec<NodeId> {
+        self.partitions
+            .iter()
+            .filter(|spec| spec.partition == partition)
+            .flat_map(|spec| spec.config.members.iter())
+            .filter(|member| member.role == role)
+            .map(|member| member.node)
+            .collect()
     }
 }
 
 /// The running topology.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Cluster;
+///
+/// Holds its state and is not `Copy` (finding K-F-29).
+#[derive(Debug)]
+pub struct Cluster {
+    config: ClusterConfig,
+    /// Each node's current boot.
+    boots: BTreeMap<NodeId, BootId>,
+    /// Stopped nodes, and whether the stop was a host crash.
+    stopped: BTreeMap<NodeId, bool>,
+    /// The next boot id to hand out: above every boot the configuration named.
+    next_boot: BootId,
+}
 
 impl Cluster {
-    /// Build a cluster from a validated configuration.
+    /// Build a cluster from a configuration, validating it first.
     ///
     /// # Errors
     ///
-    /// Whatever [`ClusterConfig::validate`] returns. [`SimError::Unavailable`] until package H1
-    /// lands the topology.
-    pub fn new(_config: ClusterConfig) -> Result<Self, SimError> {
-        Err(SimError::unavailable("sim::cluster::Cluster::new"))
+    /// Whatever [`ClusterConfig::validate`] returns.
+    pub fn new(config: ClusterConfig) -> Result<Self, SimError> {
+        config.validate()?;
+        let boots: BTreeMap<NodeId, BootId> = config
+            .nodes
+            .iter()
+            .map(|node| (node.node, node.boot))
+            .collect();
+        let next_boot = BootId(boots.values().map(|boot| boot.0).max().unwrap_or(0) + 1);
+        Ok(Self {
+            config,
+            boots,
+            stopped: BTreeMap::new(),
+            next_boot,
+        })
+    }
+
+    /// The configuration this cluster was built from.
+    #[must_use]
+    pub const fn config(&self) -> &ClusterConfig {
+        &self.config
+    }
+
+    /// The node's current boot, or `None` for a node the configuration does not name.
+    #[must_use]
+    pub fn boot(&self, node: NodeId) -> Option<BootId> {
+        self.boots.get(&node).copied()
+    }
+
+    /// Whether the node is stopped, and if so whether by a host crash.
+    #[must_use]
+    pub fn stopped(&self, node: NodeId) -> Option<bool> {
+        self.stopped.get(&node).copied()
     }
 
     /// Stop a node's process. Buffered-but-unflushed state may survive a process stop; a host
-    /// stop discards it (spike §6).
+    /// stop discards it (spike §6). Which is which is
+    /// [`crate::storage::crash_image::CrashImage::of`]'s job; this records the fact.
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 lands the topology.
-    pub const fn stop(&mut self, _node: NodeId, _host_crash: bool) -> Result<(), SimError> {
-        Err(SimError::unavailable("sim::cluster::Cluster::stop"))
+    /// [`SimError::Config`] naming `node` for an unknown node, or `stopped` for one already
+    /// stopped.
+    pub fn stop(&mut self, node: NodeId, host_crash: bool) -> Result<(), SimError> {
+        if !self.boots.contains_key(&node) {
+            return Err(SimError::Config { field: "node" });
+        }
+        if self.stopped.contains_key(&node) {
+            return Err(SimError::Config { field: "stopped" });
+        }
+        self.stopped.insert(node, host_crash);
+        Ok(())
     }
 
-    /// Start a stopped node under a fresh [`BootId`].
+    /// Start a stopped node under a fresh [`BootId`], strictly above every boot seen so far.
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 lands the topology.
-    pub const fn start(&mut self, _node: NodeId) -> Result<BootId, SimError> {
-        Err(SimError::unavailable("sim::cluster::Cluster::start"))
+    /// [`SimError::Config`] naming `node` for an unknown node, or `stopped` for one that is not
+    /// stopped.
+    pub fn start(&mut self, node: NodeId) -> Result<BootId, SimError> {
+        if !self.boots.contains_key(&node) {
+            return Err(SimError::Config { field: "node" });
+        }
+        if self.stopped.remove(&node).is_none() {
+            return Err(SimError::Config { field: "stopped" });
+        }
+        let boot = self.next_boot;
+        self.next_boot = BootId(boot.0 + 1);
+        self.boots.insert(node, boot);
+        Ok(boot)
     }
 
     /// Suspend a node for `millis` of logical time, then resume it.
@@ -120,8 +225,8 @@ impl Cluster {
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 lands the topology.
-    pub const fn suspend(&mut self, _node: NodeId, _millis: u64) -> Result<(), SimError> {
+    /// [`SimError::Unavailable`] until package H1 wires the resume event into the scheduler.
+    pub fn suspend(&mut self, _node: NodeId, _millis: u64) -> Result<(), SimError> {
         Err(SimError::unavailable("sim::cluster::Cluster::suspend"))
     }
 }

@@ -82,7 +82,7 @@ impl Deadline {
 /// *unknown*, and unknown must deny.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ControlTime {
-    /// The best estimate of the authority clock.
+    /// The best estimate of the authority clock, as of `sampled_at`.
     pub estimate: Tick,
     /// Maximum error of `estimate`, in milliseconds. This is spec §7.2's `epsilon`.
     pub error_millis: u64,
@@ -90,6 +90,14 @@ pub struct ControlTime {
     /// reboot or an authority-generation change clears it, and a node with no established bound
     /// must stop accepting requests (spec §7.2).
     pub bound_established: bool,
+    /// The logical tick at which this sample was taken (lead ruling A-R12, finding K-F-15).
+    ///
+    /// An estimate established long ago is not an estimate; without this field a bound stayed
+    /// `established` for ever and [`ControlTime::compare`] was confident exactly when it should
+    /// not have been. Staleness is judged by [`ControlTime::is_stale`] against the caller's
+    /// `now` and the caller's maximum sample age (kernel-a's A1 passes its own budget), so the
+    /// rule lives in the kernel and not in whichever environment filled the sample in.
+    pub sampled_at: Tick,
 }
 
 /// How a bounded-clock comparison came out.
@@ -107,14 +115,34 @@ pub enum ClockVerdict {
 }
 
 impl ControlTime {
-    /// Compare this estimate against `instant`, widened by `margin_millis` on both sides.
+    /// Whether this sample is too old to trust at `now`.
+    ///
+    /// A sample taken in the future of `now` is not younger than zero; it is a caller error and
+    /// is treated as stale, because the safe answer to "which way did time go?" is deny.
+    #[must_use]
+    pub const fn is_stale(self, now: Tick, max_sample_age_millis: u64) -> bool {
+        self.sampled_at.0 > now.0 || now.0 - self.sampled_at.0 > max_sample_age_millis
+    }
+
+    /// Compare this estimate against `instant`, widened by `margin_millis` on both sides, as
+    /// judged at `now` with a sample no older than `max_sample_age_millis`.
     ///
     /// `margin_millis` is spec §7.2's dispatch margin `delta`. Lives here rather than in the
     /// authority module because publication, recovery and the protection timer all need the same
     /// comparison, and one of them getting the sign wrong is a fencing violation.
+    ///
+    /// Three inputs make it [`ClockVerdict::Uncertain`] before any arithmetic: no established
+    /// bound, a stale sample ([`Self::is_stale`], ruling A-R12: stale denies, and denies only —
+    /// it never fences, and the next fresh sample recovers), and saturation.
     #[must_use]
-    pub const fn compare(self, instant: Tick, margin_millis: u64) -> ClockVerdict {
-        if !self.bound_established {
+    pub const fn compare(
+        self,
+        now: Tick,
+        max_sample_age_millis: u64,
+        instant: Tick,
+        margin_millis: u64,
+    ) -> ClockVerdict {
+        if !self.bound_established || self.is_stale(now, max_sample_age_millis) {
             return ClockVerdict::Uncertain;
         }
         let slack = self.error_millis.saturating_add(margin_millis);

@@ -71,6 +71,10 @@ pub enum RetryRule {
 /// `&'static str` cannot be deserialised. Traces, oracle checkpoints and log fields therefore
 /// carry the kind, which is stable, ordered and round-trippable. Same shape as
 /// `config_core::ConfigError::kind`.
+///
+/// One name per spec §5.4 error, plus [`Self::Unavailable`], which §5.4 does not define: it is
+/// the spike's own "not wired in this build" answer (spike §8), and it is in this set because a
+/// trace has to be able to say it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ErrorKind {
     /// [`RdbError::NotPrimary`].
@@ -325,11 +329,17 @@ impl RdbError {
     ///
     /// Only pre-admission rejection proves it (spec §5.4 takeaway). An oracle that needs to know
     /// "could this request have had an effect?" asks here rather than matching variants itself.
+    ///
+    /// [`RetryRule::NotWired`] is **not** proof (finding K-F-26). An unwired module has not
+    /// mutated anything, but the module that returned `Unavailable` may not be the only one the
+    /// event reached, and the answer a caller acts on must not depend on which package landed
+    /// first. `Unavailable` is a build-state report, not a protocol decision, and it proves
+    /// nothing about the request.
     #[must_use]
     pub const fn proves_no_mutation(&self) -> bool {
         matches!(
             self.retry_rule(),
-            RetryRule::Definitive | RetryRule::BoundedJitter | RetryRule::NotWired
+            RetryRule::Definitive | RetryRule::BoundedJitter
         )
     }
 

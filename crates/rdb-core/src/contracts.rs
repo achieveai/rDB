@@ -18,7 +18,9 @@
 //! | [`control`] | single-record CAS and a watch that may gap | §7.1 |
 //! | [`transport`] | untrusted, unordered delivery | §6.1 |
 //! | [`trace`] | what the harness declares and the oracle folds | spike §4, §6 |
+//! | [`authority`] | the authority decision and view; the shared partition mode | §7.2, §7.3 |
 
+pub mod authority;
 pub mod control;
 pub mod digest;
 pub mod envelope;

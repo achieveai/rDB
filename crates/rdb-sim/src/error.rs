@@ -39,6 +39,26 @@ pub enum SimError {
         /// Which bound: events, ticks or histories.
         bound: &'static str,
     },
+
+    /// A trace file could not be read or written.
+    ///
+    /// The kind and the operation, not the `std::io::Error`: that type is neither `Clone` nor
+    /// `PartialEq`, and a campaign compares its errors.
+    #[error("trace i/o failed during {op}: {kind:?}")]
+    Io {
+        /// What was being done. A static name.
+        op: &'static str,
+        /// What the operating system said.
+        kind: std::io::ErrorKind,
+    },
+
+    /// A trace file has a line this build cannot read: not JSON, not this schema's shape, or
+    /// a field this build does not know (`deny_unknown_fields` on the header).
+    #[error("trace line {line} is not readable by this build")]
+    Malformed {
+        /// One-based line number in the file. The header is line 1.
+        line: u64,
+    },
 }
 
 impl SimError {

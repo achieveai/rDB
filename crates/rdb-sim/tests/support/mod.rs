@@ -12,21 +12,33 @@
 //!
 //! `#![allow(dead_code)]` because each test binary uses a different subset, and without it every
 //! test file would warn about the helpers it happens not to call.
+//!
+//! Every row in this crate is a `#[retcd_test]` (finding K-F-30) and opens with [`preamble`],
+//! so each row's JSONL file starts with the three environment `Capability` lines (Q-F-1). Log
+//! fields are ids, counts and digests; never a key or value byte (team rules).
 
 #![allow(dead_code)]
 
 pub mod oracle;
 pub mod scenarios;
 
+use bytes::Bytes;
+use rdb_core::contracts::control::ControlEffect;
 use rdb_core::contracts::digest::Digest;
-use rdb_core::contracts::event::{Budgets, ClientEvent, Event, EventKind, StepCtx};
-use rdb_core::contracts::ids::{
-    AffinityId, BootId, ClientId, ConfigVersion, CorrelationId, EventId, Generation, NodeId,
-    OwnerEpoch, PartitionId, RequestId, RequestIdentity, TenantId,
+use rdb_core::contracts::event::{
+    Budgets, ClientEvent, Effect, EffectKind, Event, EventKind, ModuleName, StepCtx,
 };
+use rdb_core::contracts::ids::{
+    AffinityId, BatchId, BootId, ClientId, ConfigVersion, CorrelationId, EventId, Generation,
+    NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId, RequestIdentity, Seq, TenantId,
+};
+use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+use rdb_core::contracts::storage::{Batch, Namespace, Write};
 use rdb_core::contracts::time::{ControlTime, Tick};
 use rdb_core::contracts::txn::TxnRequest;
 use rdb_core::contracts::version::API_VERSION;
+use rdb_sim::harness::environment_capabilities;
+use rdb_sim::sim::cluster::{ClusterConfig, NodeSpec, PartitionSpec};
 use rdb_sim::storage::snapshot::EmptySnapshot;
 
 /// The budgets every row runs under unless it says otherwise.
@@ -35,7 +47,19 @@ pub const BUDGETS: Budgets = Budgets::SPEC_DEFAULTS;
 /// An empty snapshot of a fresh engine, for stepping a module with no data behind it.
 pub const SNAPSHOT: EmptySnapshot = EmptySnapshot::new();
 
-/// A minimal context on node 1, partition 1, generation 1, at tick zero.
+/// The all-zero digest, for rows that must pass a digest they do not care about.
+pub const ROOT_DIGEST: Digest = Digest::ROOT;
+
+/// Log the three environment packages' capability states, one line each, as the first thing a
+/// row does. What Q-F-1 counts, and the row-level form of
+/// [`rdb_core::contracts::trace::TraceKind::Capability`].
+pub fn preamble() {
+    for (package, state) in environment_capabilities() {
+        tracing::info!(?package, ?state, "capability");
+    }
+}
+
+/// A minimal context on node 1, partition 1, generation 1, at tick zero, sampled now.
 ///
 /// The one place a test builds a [`StepCtx`]. Borrows `SNAPSHOT` and `BUDGETS`, which are
 /// `const`, so no test owns simulator state it did not ask for.
@@ -47,6 +71,7 @@ pub fn ctx() -> StepCtx<'static> {
             estimate: Tick::ZERO,
             error_millis: 0,
             bound_established: true,
+            sampled_at: Tick::ZERO,
         },
         node: NodeId(1),
         boot: BootId(1),
@@ -88,5 +113,76 @@ pub fn probe_event() -> Event {
     }
 }
 
-/// The all-zero digest, for rows that must pass a digest they do not care about.
-pub const ROOT_DIGEST: Digest = Digest::ROOT;
+/// A control effect from the authority module on partition 1 under `correlation`.
+#[must_use]
+pub fn control_effect(correlation: u64, control: ControlEffect) -> Effect {
+    Effect {
+        correlation: CorrelationId(correlation),
+        from: ModuleName::Authority,
+        partition: PartitionId(1),
+        kind: EffectKind::Control(control),
+    }
+}
+
+/// One batch at `seq` in `generation` on partition 1, putting `key` to `value` in the user
+/// namespace.
+#[must_use]
+pub fn batch(generation: u64, seq: u64, key: &'static [u8], value: &'static [u8]) -> Batch {
+    Batch {
+        id: BatchId(seq),
+        partition: PartitionId(1),
+        generation: Generation(generation),
+        seq: Seq(seq),
+        writes: vec![Write {
+            ns: Namespace::User,
+            key: Bytes::from_static(key),
+            value: Some(Bytes::from_static(value)),
+        }],
+    }
+}
+
+/// An RF3 configuration for partition 1: node 1 primary, nodes 2 and 3 regular, node 4 shadow.
+#[must_use]
+pub fn rf3_config() -> PartitionConfig {
+    PartitionConfig::new(
+        PartitionId(1),
+        ConfigVersion(1),
+        vec![
+            member(0, 1, ReplicaRole::Primary),
+            member(1, 2, ReplicaRole::RegularSecondary),
+            member(2, 3, ReplicaRole::RegularSecondary),
+            member(3, 4, ReplicaRole::Shadow),
+        ],
+    )
+}
+
+/// A member in slot `copy` on node `node` at boot 1.
+#[must_use]
+pub const fn member(copy: u8, node: u32, role: ReplicaRole) -> Member {
+    Member {
+        copy: CopyId(copy),
+        node: NodeId(node),
+        boot: BootId(1),
+        role,
+    }
+}
+
+/// Four nodes, one RF3 partition. The topology most rows run on.
+#[must_use]
+pub fn cluster() -> ClusterConfig {
+    ClusterConfig {
+        nodes: (1..=4)
+            .map(|node| NodeSpec {
+                node: NodeId(node),
+                boot: BootId(1),
+                failure_domain: u16::try_from(node).expect("small"),
+                core_sets: 1,
+            })
+            .collect(),
+        partitions: vec![PartitionSpec {
+            partition: PartitionId(1),
+            config: rf3_config(),
+        }],
+        initial_config_version: ConfigVersion(1),
+    }
+}

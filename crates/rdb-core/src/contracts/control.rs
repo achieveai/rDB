@@ -43,7 +43,79 @@ pub enum ControlKey {
     PlannerGrant,
 }
 
+/// One record family of spec §7.1, as a watch or a coherent read scopes it.
+///
+/// A separate type from [`ControlKey`] on purpose (finding K-F-19). A key names one record; a
+/// prefix names every record of one family. Typing the family position with the record type let
+/// a single-record key be passed where a family was meant and made every watch a watch on the
+/// whole store, so each kernel saw every other family's changes and had to filter them. With
+/// this type the compiler refuses the first and the seam never offers the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlPrefix {
+    /// The single `cluster/schema` record.
+    ClusterSchema,
+    /// `nodes/`.
+    Nodes,
+    /// `grants/`.
+    Grants,
+    /// `partitions/`.
+    Partitions,
+    /// `routes/`.
+    Routes,
+    /// `operations/`.
+    Operations,
+    /// The single `planner/grant` record.
+    PlannerGrant,
+}
+
+impl ControlPrefix {
+    /// The store prefix every key of the family starts with, exactly. A single-record family's
+    /// prefix is the record's whole key.
+    #[must_use]
+    pub const fn encode(self) -> &'static str {
+        match self {
+            Self::ClusterSchema => "cluster/schema",
+            Self::Nodes => "nodes/",
+            Self::Grants => "grants/",
+            Self::Partitions => "partitions/",
+            Self::Routes => "routes/",
+            Self::Operations => "operations/",
+            Self::PlannerGrant => "planner/grant",
+        }
+    }
+
+    /// Whether `key` is a record of this family.
+    #[must_use]
+    pub const fn contains(self, key: ControlKey) -> bool {
+        // `PartialEq` is not `const`; a `match` on the pair is, and it is total.
+        matches!(
+            (self, key),
+            (Self::ClusterSchema, ControlKey::ClusterSchema)
+                | (Self::Nodes, ControlKey::Node(_))
+                | (Self::Grants, ControlKey::Grant(_))
+                | (Self::Partitions, ControlKey::Partition(_))
+                | (Self::Routes, ControlKey::Route(_))
+                | (Self::Operations, ControlKey::Operation(_))
+                | (Self::PlannerGrant, ControlKey::PlannerGrant)
+        )
+    }
+}
+
 impl ControlKey {
+    /// The family this record belongs to.
+    #[must_use]
+    pub const fn prefix(self) -> ControlPrefix {
+        match self {
+            Self::ClusterSchema => ControlPrefix::ClusterSchema,
+            Self::Node(_) => ControlPrefix::Nodes,
+            Self::Grant(_) => ControlPrefix::Grants,
+            Self::Partition(_) => ControlPrefix::Partitions,
+            Self::Route(_) => ControlPrefix::Routes,
+            Self::Operation(_) => ControlPrefix::Operations,
+            Self::PlannerGrant => ControlPrefix::PlannerGrant,
+        }
+    }
+
     /// The canonical store key, exactly as spec §7.1 names the family.
     ///
     /// Total and allocation-bounded. Ids are decimal because the key families in §7.1 are
@@ -131,9 +203,13 @@ pub enum CasOutcome {
     /// every loser must follow with a linearizable read. Leaking the winning content here would
     /// let the kernel take a shortcut that does not exist against the real store.
     Conflict {
-        /// Whether the record exists at all.
+        /// Whether the record exists at all. `false` with `expected: Some(_)` means it was
+        /// deleted; `true` with `expected: None` means someone else created it first.
         exists: bool,
-        /// Its current revision. Meaningless when `exists` is false.
+        /// The store revision the comparison was made at. When `exists` is `false` this is the
+        /// revision the absence was observed at, not a revision of the record — the same
+        /// meaning as [`ReadOutcome::Absent`]'s `as_of`, so a loser's follow-up read has a
+        /// revision to fence against either way.
         current: Revision,
     },
     /// The outcome is unknown: the write may or may not have landed. Never auto-replayed
@@ -159,8 +235,15 @@ pub enum ReadOutcome {
         /// Its body.
         value: Bytes,
     },
-    /// The record does not exist.
-    Absent,
+    /// The record does not exist, as of the store revision the read was served at.
+    ///
+    /// The revision is what makes an absent read *usable* (finding K-F-20): a create-only CAS
+    /// that follows it is keyed on this observation, and a CAS keyed on an absence observed at a
+    /// stale revision must lose to whoever created the record since.
+    Absent {
+        /// The store revision the read was linearized at.
+        as_of: Revision,
+    },
     /// The store could not answer. A deny, never a stale read.
     Unavailable,
 }
@@ -184,6 +267,10 @@ pub enum WatchTermination {
     /// reload in a loop.
     ResourceExhaustedFatal,
     /// Leadership moved. Re-establish, and read before believing anything.
+    ///
+    /// Carries no hint (finding K-F-36, ADVISORY). ADR-rdb-0008 §4 pairs this with a
+    /// `validated_hint` the watcher must not believe without a read; the kernel rule is "read
+    /// before believing anything" whether a hint arrives or not, so a hint has no consumer.
     NotLeader,
     /// The node stopped or the hub shut down. Treated as control-quorum loss for admission.
     Unavailable,
@@ -204,15 +291,30 @@ impl WatchTermination {
     }
 }
 
-/// One observed change on the watch stream.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One observed change on the watch stream: which record, at which revision, and nothing else.
+///
+/// Structural on purpose (finding K-F-13, ADR-rdb-0008 §4). A watch invalidates a cache; it
+/// never delivers the record, because a record delivered on a stream that is allowed to gap and
+/// to be delivered late is a record the kernel would act on without a linearizable read. The
+/// kernel follows a change with [`ControlEffect::Get`] or [`ControlEffect::Reload`], and
+/// those are what carry bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ControlChange {
     /// Which record changed.
     pub key: ControlKey,
     /// The revision it changed at.
     pub revision: Revision,
-    /// The new body, or `None` when the record was deleted.
-    pub value: Option<Bytes>,
+}
+
+/// One record as a coherent family read returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRecord {
+    /// The record.
+    pub key: ControlKey,
+    /// The revision it was last written at.
+    pub revision: Revision,
+    /// Its body.
+    pub value: Bytes,
 }
 
 /// Where a watch has been consumed to. Resume points at this, never at a wall-clock instant.
@@ -239,16 +341,24 @@ pub enum ControlEffect {
         /// The record.
         key: ControlKey,
     },
-    /// Start or resume a watch from `from`.
+    /// Start or resume a watch on one family, delivering changes after `from`.
+    ///
+    /// Scoped to a [`ControlPrefix`], never to the whole store (finding K-F-19). Kernel-a's
+    /// "watch grants and partitions" is two of these.
     Watch {
+        /// The family to watch.
+        prefix: ControlPrefix,
         /// The revision to resume after.
         from: Revision,
     },
-    /// Reload a coherent manifest after a gap, and resume from its recorded revision
-    /// (spec §7.1).
+    /// Read one whole family coherently at one revision: the only sanctioned answer to a gap
+    /// (spec §7.1), and the read a kernel makes before it believes a watch.
+    ///
+    /// Completes as [`ControlEvent::FamilySnapshot`], whose `snapshot_revision` is what the
+    /// resumed watch starts after. Team kernel-a's `ReadFamily { prefix }` binds to this.
     Reload {
-        /// The record family to reload.
-        key: ControlKey,
+        /// The family to read.
+        prefix: ControlPrefix,
     },
 }
 
@@ -272,6 +382,8 @@ pub enum ControlEvent {
     /// A contiguous run of changes, ending at `cursor`. Nothing between the previous cursor and
     /// this one was skipped.
     Watched {
+        /// The family the watch is on.
+        prefix: ControlPrefix,
         /// Where the stream is now consumed to.
         cursor: WatchCursor,
         /// The changes, in revision order.
@@ -280,12 +392,16 @@ pub enum ControlEvent {
     /// A liveness tick carrying only a revision: the cache-freshness watermark. Conveys no
     /// authority and no record content.
     WatchProgress {
+        /// The family the watch is on.
+        prefix: ControlPrefix,
         /// The revision the stream has reached with nothing to report.
         revision: Revision,
     },
     /// The stream ended. Whether anything was missed is [`WatchTermination::is_gap`], not an
     /// inference from the stream going quiet.
     WatchTerminated {
+        /// The family the watch was on.
+        prefix: ControlPrefix,
         /// The revision the watcher had reached.
         from: Revision,
         /// Why it ended.
@@ -297,11 +413,11 @@ pub enum ControlEvent {
     /// `snapshot_revision` is what the resumed watch starts after, which is what makes reload
     /// and re-watch a closed loop rather than a race.
     FamilySnapshot {
-        /// A representative key of the family that was reloaded.
-        family: ControlKey,
+        /// The family that was read.
+        prefix: ControlPrefix,
         /// The revision the whole snapshot is coherent at.
         snapshot_revision: Revision,
         /// Every record in the family at that revision, in [`ControlKey`] order.
-        records: Vec<ControlChange>,
+        records: Vec<ControlRecord>,
     },
 }

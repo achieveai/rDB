@@ -12,9 +12,12 @@
 //! unauthenticated peer, and [`rdb_core::contracts::ids::ReplicaRole::may_qualify_ack`] answers
 //! the role question — never from a `cfg` branch or a test-only guard in kernel code.
 //!
-//! # Seed state
+//! # State
 //!
-//! The fault vocabulary is real; delivery is package H1.
+//! The fault vocabulary is real and [`Network::inject`] records it; link state is kept.
+//! Delivery ([`Network::send`]) is still owed by package H1 and says so.
+
+use std::collections::BTreeMap;
 
 use rdb_core::contracts::ids::{MessageId, NodeId, ReplicaRole};
 use rdb_core::contracts::transport::{Frame, PeerLabel};
@@ -122,31 +125,95 @@ pub enum NetworkOp {
     },
 }
 
+/// One frame the network has accepted and not yet delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlight {
+    /// Sender.
+    pub from: NodeId,
+    /// Recipient.
+    pub to: NodeId,
+    /// The identity the frame will be delivered under.
+    pub label: PeerLabel,
+    /// The frame.
+    pub frame: Frame,
+}
+
 /// The controlled network.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct Network;
+///
+/// Holds its state and is not `Copy` (finding K-F-29). Every map is a `BTreeMap`: iteration
+/// order is part of the trace.
+#[derive(Debug, Default)]
+pub struct Network {
+    /// Link state, keyed by the ordered pair. A link never set is up.
+    links: BTreeMap<(NodeId, NodeId), LinkState>,
+    /// Frames accepted and not yet delivered.
+    in_flight: Vec<InFlight>,
+    /// Per-frame plans not yet consumed, in injection order.
+    planned: Vec<NetworkOp>,
+    next_message: MessageId,
+}
 
 impl Network {
     /// A network with every link up and no faults scheduled.
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Apply one scenario operation.
     ///
+    /// [`NetworkOp::SetLink`] takes effect at once; every other operation is a plan for a future
+    /// frame and is kept, in order, until that frame is sent.
+    ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 lands delivery.
-    pub const fn inject(&mut self, _op: NetworkOp) -> Result<(), SimError> {
-        Err(SimError::unavailable("sim::network::Network::inject"))
+    /// [`SimError::Config`] naming `link` for a link from a node to itself.
+    pub fn inject(&mut self, op: NetworkOp) -> Result<(), SimError> {
+        match op {
+            NetworkOp::SetLink { a, b, state } => {
+                if a == b {
+                    return Err(SimError::Config { field: "link" });
+                }
+                self.links.insert(Self::pair(a, b), state);
+                Ok(())
+            }
+            NetworkOp::PlanNext { .. }
+            | NetworkOp::ForgeAck { .. }
+            | NetworkOp::ForgeNext { .. } => {
+                self.planned.push(op);
+                Ok(())
+            }
+        }
+    }
+
+    /// The state of the link between two nodes. Up unless set otherwise.
+    #[must_use]
+    pub fn link(&self, a: NodeId, b: NodeId) -> LinkState {
+        self.links
+            .get(&Self::pair(a, b))
+            .copied()
+            .unwrap_or(LinkState::Up)
+    }
+
+    /// The plans not yet consumed, in injection order.
+    #[must_use]
+    pub fn planned(&self) -> &[NetworkOp] {
+        &self.planned
+    }
+
+    /// The frames accepted and not yet delivered.
+    #[must_use]
+    pub fn in_flight(&self) -> &[InFlight] {
+        &self.in_flight
     }
 
     /// Hand a frame to the network. Returns the identity the frame was sent under.
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 lands delivery.
+    /// [`SimError::Unavailable`] until package H1 lands delivery: accepting a frame without a
+    /// delivery event behind it would be a send that silently never arrives, which is a fault
+    /// the scenario must ask for by name ([`Delivery::Drop`]), never a default.
     pub fn send(
         &mut self,
         _from: NodeId,
@@ -154,5 +221,22 @@ impl Network {
         _frame: Frame,
     ) -> Result<MessageId, SimError> {
         Err(SimError::unavailable("sim::network::Network::send"))
+    }
+
+    /// Allocate a message id for a frame this network delivers. Reserved for the delivery
+    /// path; strictly increasing.
+    #[allow(dead_code)]
+    fn next_message_id(&mut self) -> MessageId {
+        let id = self.next_message;
+        self.next_message = MessageId(id.0 + 1);
+        id
+    }
+
+    const fn pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
+        if a.0 <= b.0 {
+            (a, b)
+        } else {
+            (b, a)
+        }
     }
 }

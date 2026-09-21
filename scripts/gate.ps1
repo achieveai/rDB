@@ -15,10 +15,15 @@
     the rows still test the real thing; a deadline here is a bound on how long a poll may wait
     for an observed state, never a sleep. See crates/config-testkit/src/poll.rs.
 
+    The deps stage is the one non-cargo check: rdb-* may depend on config-*, never the reverse
+    (rdb ADR-0002). It reads `cargo metadata` and fails on any config-* package that names an
+    rdb-* dependency of any kind, dev and build included, because a dev-dependency is how the
+    reverse edge would arrive first.
+
     Kept in sync with scripts/gate.sh.
 
 .PARAMETER Stage
-    fmt, lint, test, or all (the default).
+    fmt, deps, lint, test, or all (the default).
 
 .PARAMETER CargoArgs
     Extra arguments passed through to cargo, for narrowing a test stage.
@@ -33,7 +38,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'lint', 'test', 'all')]
+    [ValidateSet('fmt', 'deps', 'lint', 'test', 'all')]
     [string]$Stage = 'all',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$CargoArgs = @()
@@ -63,7 +68,27 @@ function Invoke-Cargo([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "cargo $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
 }
 
+function Test-Deps {
+    $json = & cargo metadata --format-version 1 --no-deps
+    if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+    $meta = $json | ConvertFrom-Json
+    $bad = @()
+    foreach ($pkg in $meta.packages) {
+        if ($pkg.name -notlike 'config-*') { continue }
+        foreach ($dep in $pkg.dependencies) {
+            if ($dep.name -notlike 'rdb-*') { continue }
+            $kind = if ($dep.kind) { $dep.kind } else { 'normal' }
+            $bad += "deps: $($pkg.name) depends on $($dep.name) ($kind)"
+        }
+    }
+    if ($bad.Count -gt 0) {
+        $bad | ForEach-Object { [Console]::Error.WriteLine($_) }
+        throw 'deps: config-* must never depend on rdb-* (rdb ADR-0002)'
+    }
+}
+
 if ($Stage -in 'fmt', 'all')  { Write-Host '== fmt';    Invoke-Cargo @('fmt', '--all', '--check') }
+if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
 if ($Stage -in 'test', 'all') { Write-Host '== test';   Invoke-Cargo (@('test', '--workspace', '--no-fail-fast') + $CargoArgs) }
 

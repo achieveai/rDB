@@ -96,7 +96,8 @@ pub struct ReplicationEnvelope {
     /// The fixed prefix. Duplicated into the struct rather than flattened so that a decoded
     /// envelope carries the header a receiver already validated.
     pub header: EnvelopeHeader,
-    /// The lease backing the sender's grant.
+    /// The lease backing the sender's grant. On the wire, not in the record digest (design
+    /// §4.8): a rebuild re-replicates an entry under a new grant and the entry is the same entry.
     pub lease_id: LeaseId,
     /// Digest of the record at `seq - 1`. [`Digest::ROOT`] at the start of a lineage. This is
     /// the ancestry check: same sequence with a different `prev_digest` quarantines the stream.
@@ -128,34 +129,11 @@ impl ReplicationEnvelope {
     /// replicas could agree at sequence 5 while disagreeing at sequence 3, and "select the
     /// longest compatible prefix" would select an incompatible one.
     ///
-    /// Committed input order. Each numbered item is **one length-prefixed part** inside
-    /// [`Domain::Record`], so no two different field splits can produce one preimage (team
-    /// kernel-b finding K-B-08):
-    ///
-    /// 1. `prev_digest` — the chain link, first so no later field can displace it
-    /// 2. `protocol_version`
-    /// 3. `partition`
-    /// 4. `generation`
-    /// 5. `config_version`
-    /// 6. `owner_epoch`
-    /// 7. `seq`
-    /// 8. `lease_id`
-    /// 9. `request_identity` (tenant, client, request)
-    /// 10. `request_digest`
-    /// 11. `conditions_result`, count-prefixed, in order
-    /// 12. `mutations`, count-prefixed, in batch order
-    /// 13. `result`
-    ///
-    /// `partition` and `lease_id` are covered on purpose (finding K-B-07): `ProbeDigestReply`
-    /// and `InventoryReply` carry raw `(seq, digest)` pairs that never pass the append ladder, so
-    /// the digest is the only thing that binds a ladder rung to its partition, and with the lease
-    /// covered the history records which grant produced each entry.
-    ///
-    /// `protocol_version` is covered too, and that does **not** rewrite history across an
-    /// upgrade: the version hashed is the one stored in this record's own header, which travels
-    /// with the record, not the version of the build recomputing it. A node of any age therefore
-    /// recomputes the same digest for an old record, and only records *written* under a new
-    /// version differ — which is what a version bump means.
+    /// The preimage — which fields, in which order, and why two header fields are left out — is
+    /// the one frozen in team foundation's `design.md` §4.8 (lead ruling F-R6, 2026-09-20). It
+    /// is stated once, there; this body implements it and the M7F-02 vectors pin it. Each part is
+    /// **one length-prefixed part** inside [`Domain::Record`], so no two different field splits
+    /// can produce one preimage (team kernel-b finding K-B-08).
     ///
     /// `record_digest` itself is excluded, obviously, and `body_len` is excluded because it is a
     /// framing artefact rather than content.
@@ -173,13 +151,11 @@ impl ReplicationEnvelope {
             Domain::Record,
             &[
                 &self.prev_digest.0,
-                &self.header.protocol_version.to_le_bytes(),
                 &self.header.partition.0.to_le_bytes(),
                 &self.header.generation.0.to_le_bytes(),
-                &self.header.config_version.0.to_le_bytes(),
                 &self.header.owner_epoch.0.to_le_bytes(),
                 &self.header.seq.0.to_le_bytes(),
-                &self.lease_id.0.to_le_bytes(),
+                &self.header.config_version.0.to_le_bytes(),
                 &identity,
                 &self.request_digest.0,
                 &conditions,
@@ -539,29 +515,76 @@ pub struct AppendAck {
 }
 
 /// Why a replica refused an append (spec §6.1).
+///
+/// One variant per failure the R1 validation ladder can return (team kernel-b `design.md`
+/// §3.2 rows 0–8 and §3.2a rows 5R–6R′; lead ruling B-R30 closing finding K-F-34), in ladder
+/// order. The names are kernel-b's, spelled in Rust. The ladder is ordered and first failure
+/// wins, so a row names exactly one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AppendReject {
-    /// The replica is missing the predecessor. Never a speculative out-of-order apply.
-    NeedPrefix {
-        /// The highest contiguous sequence the replica holds.
-        have: Seq,
+    /// Row 0: the receiver is quarantined. No state change, ever.
+    Quarantined,
+    /// Row 1: the protocol version is unknown or mandatory-incompatible.
+    IncompatibleVersion,
+    /// Row 2: bytes or mutation count outside the declared bounds. Refused before any hashing.
+    TooLarge,
+    /// Row 3: the envelope names another partition.
+    WrongPartition,
+    /// Row 4, `<`: the sender's generation is older than the lineage this replica serves.
+    StaleGeneration {
+        /// The generation the replica considers current.
+        current: Generation,
     },
-    /// Same sequence, different digest. The stream is quarantined; this is corruption or a
-    /// fencing violation, not a tie (spec §8.1).
-    DigestMismatch {
-        /// Where the histories disagree.
-        at: Seq,
+    /// Row 4, `>`: the sender's generation is newer. A secondary never learns a generation from
+    /// the data path; generations are installed through control.
+    NeedLineage {
+        /// The generation the replica considers current.
+        current: Generation,
     },
-    /// The sender's epoch is not current on this replica.
+    /// Row 5, `<`: the sender's epoch is not current on this replica.
     StaleEpoch {
         /// The epoch the replica considers current.
         current: OwnerEpoch,
     },
-    /// The sender's membership configuration is not the one this replica is pinned to.
-    IncompatibleConfig {
+    /// Row 5, `>`: the sender's epoch is newer. Never learned from an append.
+    UnknownEpoch {
+        /// The epoch the replica considers current.
+        current: OwnerEpoch,
+    },
+    /// Row 6, `<`: the sender's membership configuration is older than the one this replica is
+    /// pinned to.
+    StaleConfig {
         /// The configuration the replica considers current.
         current: ConfigVersion,
     },
+    /// Row 6, `>`: the sender's membership configuration is newer than the pinned one.
+    NeedConfig {
+        /// The configuration the replica considers current.
+        current: ConfigVersion,
+    },
+    /// Row 6 (and §3.2a row 6R′): the authenticated peer is not the primary of the pinned
+    /// configuration — or, for a recovery append, not the recoverer the fence names, or not a
+    /// regular member. A replayed recovery credential lands here.
+    NotAMember,
+    /// Row 7: the recomputed `record_digest` differs from the carried one. Quarantines.
+    CorruptHistory {
+        /// The sequence of the corrupt record.
+        at: Seq,
+    },
+    /// Row 8: same sequence, different digest — a chain break against retained history.
+    /// Quarantines; this is corruption or a fencing violation, not a tie (spec §8.1).
+    DivergentHistory {
+        /// Where the histories disagree.
+        at: Seq,
+    },
+    /// Row 8: the replica is missing the predecessor. Never a speculative out-of-order apply.
+    NeedPrefix {
+        /// The highest contiguous sequence the replica holds.
+        have: Seq,
+    },
+    /// §3.2a rows 5R/6R: the recovery append's fence names an epoch or control revision this
+    /// replica has already moved past.
+    StaleFence,
     /// The sender was not authenticated. Rejected before any state is touched.
     Unauthenticated,
 }

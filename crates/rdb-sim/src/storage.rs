@@ -12,10 +12,6 @@
 //! 3. **False durability is injectable.** [`StorageOp::FalseDurable`] reports a flush as
 //!    successful without syncing. Spike §6 requires that no durable watermark can advance on it,
 //!    and the kernel must refuse it through the ordinary typed-watermark rule, not a test-only branch.
-//!
-//! # Seed state
-//!
-//! The fault vocabulary and [`self::snapshot::EmptySnapshot`] are real. The engine is M1.
 
 pub mod crash_image;
 pub mod memory;
@@ -30,7 +26,9 @@ use rdb_core::contracts::storage::StorageFault;
 /// shrinker and the coverage matrix enumerate operations, and methods cannot be enumerated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StorageOp {
-    /// Fail the next operation of the matching kind on `node`.
+    /// Fail the next operation of the matching kind on `node`: [`StorageFault::WriteFailed`] or
+    /// [`StorageFault::Corrupt`] fails the next commit, [`StorageFault::FlushFailed`] the next
+    /// flush.
     Fail {
         /// The engine.
         node: NodeId,
@@ -53,8 +51,9 @@ pub enum StorageOp {
     /// prefix the flush claimed. The correct kernel behaviour is that no durable watermark
     /// advances and no publication rests on it: a [`rdb_core::contracts::ids::DurableSeq`] only
     /// ever comes back from a real sync, inside
-    /// [`rdb_core::contracts::storage::StorageEvent::Flushed`], and a false flush produces none. If a kernel module advances on this, the run ends at boundary
-    /// [`rdb_core::contracts::trace::BoundaryId::FalseDurableWatermark`].
+    /// [`rdb_core::contracts::storage::StorageEvent::Flushed`], and a false flush produces none —
+    /// the flush completes with an empty `durable`. If a kernel module advances on this, the run
+    /// ends at boundary [`rdb_core::contracts::trace::BoundaryId::FalseDurableWatermark`].
     ///
     /// Deliberately *not* modelled as a fault the engine reports: the whole point is that it
     /// looks like a success from the outside.
@@ -64,4 +63,30 @@ pub enum StorageOp {
         /// The prefix the flush will claim.
         through: AppliedSeq,
     },
+    /// Make the next flush on `node` sync less than it was asked for (finding K-F-25).
+    ///
+    /// The flush completes as a real success, but every captured prefix is truncated to
+    /// `through`, and [`rdb_core::contracts::storage::StorageEvent::Flushed`]'s `durable` reports
+    /// the truncated prefix — the environment's answer, not an echo of the capture. A kernel
+    /// that advanced to what it captured instead of what came back would be advancing on its
+    /// own belief.
+    ShortFlush {
+        /// The engine.
+        node: NodeId,
+        /// The highest sequence the flush will actually sync.
+        through: AppliedSeq,
+    },
+}
+
+impl StorageOp {
+    /// The engine the operation targets.
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        match self {
+            Self::Fail { node, .. }
+            | Self::Crash { node, .. }
+            | Self::FalseDurable { node, .. }
+            | Self::ShortFlush { node, .. } => node,
+        }
+    }
 }

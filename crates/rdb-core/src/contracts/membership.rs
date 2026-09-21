@@ -6,17 +6,20 @@
 //! here (2026-09-20) and that is the right home: if the simulator owned it, a forged-identity
 //! test would be testing the simulator's lookup rather than the kernel's.
 //!
-//! Two rules are structural rather than commented:
+//! Three rules are structural rather than commented:
 //!
 //! * [`PartitionConfig::copy_of`] returns `None` for an unauthenticated
 //!   [`crate::contracts::transport::PeerLabel`]. A kernel module that only ever learns a copy id
 //!   through this function cannot act on a forged peer, whatever it forgot to check.
+//! * A member has exactly one [`BootId`], and `copy_of` matches node **and** boot. A restarted
+//!   node is not a copy until a new configuration names its new boot (finding K-F-21).
 //! * The required-copy set is derived from [`PartitionConfig::config_version`], never from a
 //!   node's current name or liveness. Spec §6.2: "Membership changes cannot erase old exposure",
 //!   and "no timer reset merely because a replica was renamed/replaced".
 
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::errors::RdbError;
 use crate::contracts::ids::{BootId, ConfigVersion, NodeId, PartitionId, ReplicaRole};
 use crate::contracts::transport::PeerLabel;
 
@@ -37,9 +40,12 @@ pub struct Member {
     pub copy: CopyId,
     /// The node currently filling it.
     pub node: NodeId,
-    /// The process lifetime that was admitted to the slot, when one has been observed. A frame
-    /// from a different boot of the same node is not from this member.
-    pub boot: Option<BootId>,
+    /// The process lifetime that fills it. Not optional (finding K-F-21): the value comes from
+    /// where it exists in the real system — the `nodes/{id}` control record carries the boot
+    /// UUID (spec §7.1), and the membership the control provider activates
+    /// ([`crate::contracts::trace::TraceKind::TopologyChange`]) names it. A frame from a
+    /// different boot of the same node is not from this member.
+    pub boot: BootId,
     /// What the slot is allowed to do for the protection predicate.
     pub role: ReplicaRole,
 }
@@ -53,32 +59,108 @@ pub struct PartitionConfig {
     pub config_version: ConfigVersion,
     /// The copies, in ascending [`CopyId`] order.
     pub members: Vec<Member>,
+    /// How many regular-secondary acknowledgements qualify a write (lead ruling B-R30; team
+    /// kernel-b `design.md` §3.5 `qualifies_now`). Read from the pinned configuration by R1 and
+    /// consumed by P1, so there is no second, independently maintained threshold. Never zero:
+    /// [`Self::validate`] refuses it, because "no acknowledgement required" is the spec §5.2
+    /// rule with the safety taken out. The default is [`Self::DEFAULT_MIN_REGULAR_ACKS`].
+    pub min_regular_acks: u8,
 }
 
 impl PartitionConfig {
+    /// The threshold a configuration carries unless it says otherwise: one qualifying regular
+    /// secondary, spec §5.2's `BufferedOnTwo`.
+    pub const DEFAULT_MIN_REGULAR_ACKS: u8 = 1;
+
+    /// A configuration at the default threshold.
+    #[must_use]
+    pub fn new(
+        partition: PartitionId,
+        config_version: ConfigVersion,
+        members: Vec<Member>,
+    ) -> Self {
+        Self {
+            partition,
+            config_version,
+            members,
+            min_regular_acks: Self::DEFAULT_MIN_REGULAR_ACKS,
+        }
+    }
+
+    /// The same configuration with an explicit threshold, refused when it is zero.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] naming `min_regular_acks` — see [`Self::validate`].
+    pub fn with_min_regular_acks(mut self, min_regular_acks: u8) -> Result<Self, RdbError> {
+        self.min_regular_acks = min_regular_acks;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Whether the configuration is one the kernel may act on.
+    ///
+    /// # Errors
+    ///
+    /// [`RdbError::InvalidArgument`] with `field: "min_regular_acks"` when the threshold is
+    /// zero. A configuration deserialised from a control record goes through this too, so a
+    /// zero cannot arrive by any path.
+    pub fn validate(&self) -> Result<(), RdbError> {
+        if self.min_regular_acks == 0 {
+            return Err(RdbError::InvalidArgument {
+                field: "min_regular_acks",
+            });
+        }
+        Ok(())
+    }
+
     /// The member an authenticated peer is, or `None`.
     ///
     /// Returns `None` when the peer is unauthenticated, when its node is not in this
-    /// configuration, or when the member's admitted boot is known and differs. Those three are
+    /// configuration, or when the member's boot differs from the peer's. Those three are
     /// deliberately one answer: each of them means "this frame is not from a copy of this
     /// configuration", and splitting them would invite a caller to treat one of them as
     /// recoverable.
+    ///
+    /// The boot match is the fail-closed half of finding K-F-21. A peer always names a boot,
+    /// and a reincarnated node — same [`NodeId`], new [`BootId`] — is not the copy it used to
+    /// be: matching it anyway would credit the new incarnation with its former self's
+    /// acknowledgements. It becomes a copy again only when a new configuration names its new
+    /// boot (ADR-rdb-0007).
     #[must_use]
     pub fn copy_of(&self, peer: &PeerLabel) -> Option<&Member> {
         if !peer.authenticated {
             return None;
         }
-        self.members.iter().find(|member| {
-            member.node == peer.node && member.boot.is_none_or(|boot| boot == peer.boot)
-        })
+        self.members
+            .iter()
+            .find(|member| member.node == peer.node && member.boot == peer.boot)
     }
 
-    /// The copies whose acknowledgement may qualify a transaction: primary and regular
-    /// secondaries, never shadows.
+    /// The primary, or `None` when the configuration names none.
+    ///
+    /// A configuration with no primary is legal to build — that is the state between a fence
+    /// and the next grant — and a caller that needs one must say so.
+    #[must_use]
+    pub fn primary(&self) -> Option<&Member> {
+        self.members
+            .iter()
+            .find(|member| member.role == ReplicaRole::Primary)
+    }
+
+    /// The regular secondaries: the copies whose acknowledgement the primary waits for.
+    ///
+    /// Excludes the primary (finding K-F-23). Spec §5.2's RF3 rule is "durable on the primary
+    /// and acknowledged by two *secondaries*"; an implementation that counted "two of this set"
+    /// with the primary inside it would be satisfied by the primary plus one secondary, which
+    /// is off by one in the direction that loses writes. Excludes shadows too: a shadow's
+    /// acknowledgement never qualifies anything (spec §5.2). [`Self::primary`] is the separate
+    /// accessor, and [`ReplicaRole::may_qualify_ack`] is a different question — whether a
+    /// role's acknowledgement counts at all — which stays true for the primary.
     pub fn required_regular(&self) -> impl Iterator<Item = &Member> {
         self.members
             .iter()
-            .filter(|member| member.role.may_qualify_ack())
+            .filter(|member| member.role == ReplicaRole::RegularSecondary)
     }
 
     /// The member filling a slot, or `None` when the slot is not in this configuration.

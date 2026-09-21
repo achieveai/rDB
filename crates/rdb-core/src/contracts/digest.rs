@@ -60,7 +60,11 @@ impl Digest {
         hasher.update(DIGEST_MAGIC);
         hasher.update([domain as u8]);
         for part in parts {
-            hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+            // A `usize` is at most 64 bits on every target this workspace builds for, so the
+            // cast is lossless. It is a cast and not a `try_from(..).unwrap_or(u64::MAX)`
+            // because a clamp would silently give two different lengths one prefix, which is the
+            // collision the prefix exists to prevent (finding K-F-37).
+            hasher.update((part.len() as u64).to_le_bytes());
             hasher.update(part);
         }
         Self(hasher.finalize().into())

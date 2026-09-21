@@ -28,12 +28,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::control::{ControlKey, ControlPrefix, WatchTermination};
 use crate::contracts::digest::Digest;
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::event::Budgets;
 use crate::contracts::ids::{
     BootId, ClientId, ConfigVersion, CorrelationId, EventId, Generation, GrantId, NodeId,
-    OwnerEpoch, PartitionId, ReplicaRole, RequestId, Seq, TenantId,
+    OwnerEpoch, PartitionId, ReplicaRole, RequestId, Revision, ScenarioId, Seq, TenantId,
 };
 
 /// A key, as a stable small integer assigned by the scenario generator.
@@ -60,35 +61,159 @@ pub type EventRef = EventId;
 // ---------------------------------------------------------------------------------------------
 
 /// One node's place in the topology, recorded once in the header.
+///
+/// Field order is the sort order of [`TraceHeader::topology`] — `(partition, node)` — so the
+/// derived [`Ord`] and the documented order are one thing (finding K-F-38).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TopologyEntry {
-    /// The node.
-    pub node: NodeId,
     /// The partition this entry is about.
     pub partition: PartitionId,
+    /// The node.
+    pub node: NodeId,
     /// What it is allowed to do for the protection predicate.
     pub role: ReplicaRole,
     /// The membership configuration this placement belongs to.
     pub config_version: ConfigVersion,
 }
 
-/// Everything a replay or a report needs before the first event.
+/// Where a scenario came from (finding K-F-09; team verification `trace-requirements.md` §1).
+///
+/// Never a bare seed. A reduced or authored scenario is not in the generator's image, so
+/// replaying its seed reproduces nothing; the checked-in event stream is the reproducer
+/// (ADR-rdb-0003 decision 6), and this says which of the three ways the stream was made.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Provenance {
+    /// The generator produced it from a seed.
+    Generated {
+        /// The seed. For the report; never sufficient for replay on its own.
+        seed: u64,
+    },
+    /// The reducer shrank it from another scenario.
+    Reduced {
+        /// The scenario it was shrunk from.
+        parent: ScenarioId,
+    },
+    /// A person wrote it.
+    Authored {
+        /// The case name, as the author gave it. A test name, never key or value bytes.
+        case: String,
+    },
+}
+
+/// Which field of [`Budgets`] a name refers to. One member per field, in field order, so the
+/// manifest can say which budgets a run overrode without a string that can be misspelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BudgetName {
+    /// [`Budgets::warn_age_millis`].
+    WarnAge,
+    /// [`Budgets::pause_age_millis`].
+    PauseAge,
+    /// [`Budgets::resume_lag_millis`].
+    ResumeLag,
+    /// [`Budgets::resume_hold_millis`].
+    ResumeHold,
+    /// [`Budgets::grant_millis`].
+    Grant,
+    /// [`Budgets::renew_millis`].
+    Renew,
+    /// [`Budgets::clock_error_millis`].
+    ClockError,
+    /// [`Budgets::dispatch_margin_millis`].
+    DispatchMargin,
+    /// [`Budgets::dedup_retention_millis`].
+    DedupRetention,
+    /// [`Budgets::discovery_window_millis`].
+    DiscoveryWindow,
+}
+
+impl BudgetName {
+    /// Every budget, in [`Budgets`] field order. A resolver that walks this cannot skip one.
+    pub const ALL: [Self; 10] = [
+        Self::WarnAge,
+        Self::PauseAge,
+        Self::ResumeLag,
+        Self::ResumeHold,
+        Self::Grant,
+        Self::Renew,
+        Self::ClockError,
+        Self::DispatchMargin,
+        Self::DedupRetention,
+        Self::DiscoveryWindow,
+    ];
+
+    /// The value this name selects in `budgets`.
+    #[must_use]
+    pub const fn get(self, budgets: &Budgets) -> u64 {
+        match self {
+            Self::WarnAge => budgets.warn_age_millis,
+            Self::PauseAge => budgets.pause_age_millis,
+            Self::ResumeLag => budgets.resume_lag_millis,
+            Self::ResumeHold => budgets.resume_hold_millis,
+            Self::Grant => budgets.grant_millis,
+            Self::Renew => budgets.renew_millis,
+            Self::ClockError => budgets.clock_error_millis,
+            Self::DispatchMargin => budgets.dispatch_margin_millis,
+            Self::DedupRetention => budgets.dedup_retention_millis,
+            Self::DiscoveryWindow => budgets.discovery_window_millis,
+        }
+    }
+
+    /// Set the value this name selects in `budgets`.
+    pub const fn set(self, budgets: &mut Budgets, millis: u64) {
+        match self {
+            Self::WarnAge => budgets.warn_age_millis = millis,
+            Self::PauseAge => budgets.pause_age_millis = millis,
+            Self::ResumeLag => budgets.resume_lag_millis = millis,
+            Self::ResumeHold => budgets.resume_hold_millis = millis,
+            Self::Grant => budgets.grant_millis = millis,
+            Self::Renew => budgets.renew_millis = millis,
+            Self::ClockError => budgets.clock_error_millis = millis,
+            Self::DispatchMargin => budgets.dispatch_margin_millis = millis,
+            Self::DedupRetention => budgets.dedup_retention_millis = millis,
+            Self::DiscoveryWindow => budgets.discovery_window_millis = millis,
+        }
+    }
+}
+
+/// The resolved run: what a scenario actually ran under (finding K-F-27; spike §7 "the
+/// manifest records resolved budgets").
+///
+/// Plain data in the contract crate, because the header carries it and the header is here; no
+/// simulator type crosses the crate boundary. `overridden` is the field that matters: a
+/// campaign row that fails under an override must not be mistaken for one that fails under
+/// defaults — the `RETCD_TEST_DEADLINE_SCALE` lesson from the rEtcd gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunManifest {
+    /// The thresholds the run resolved to.
+    pub budgets: Budgets,
+    /// Which of them differ from [`Budgets::SPEC_DEFAULTS`], in [`BudgetName::ALL`] order.
+    pub overridden: Vec<BudgetName>,
+    /// How many nodes the topology has.
+    pub nodes: u8,
+    /// The event budget the run was bounded by.
+    pub event_cap: u32,
+}
+
+/// Everything a replay or a report needs before the first event.
+///
+/// `deny_unknown_fields` on purpose (team verification `trace-requirements.md` §1): a header
+/// field this build does not know is a header from another build, and reading it as if it were
+/// this one is how a fixture passes for the wrong reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceHeader {
     /// [`crate::contracts::version::TRACE_SCHEMA_VERSION`] at record time. A bump invalidates
     /// checked-in fixtures on purpose.
     pub schema_version: u16,
-    /// The seed the scenario was generated from. For the report and the reproducer; never
-    /// sufficient for replay on its own.
-    pub seed: u64,
     /// The scenario generator's version. Two generators at one seed are two different runs.
     pub generator_version: u16,
-    /// Digest of the resolved run configuration. The configuration itself goes in the run
-    /// manifest, which is the harness's artifact — a simulator config type has no business in
-    /// the contract crate.
-    pub config_digest: Digest,
-    /// The thresholds this run actually resolved (spike §7: the manifest records them).
-    pub budgets: Budgets,
+    /// Where the scenario came from. Never a bare seed (finding K-F-09).
+    pub provenance: Provenance,
+    /// The resolved run: budgets, which were overridden, node count and event cap.
+    pub config: RunManifest,
+    /// How many partitions the topology has.
+    pub partitions: u8,
     /// Node roles and configuration versions, in ascending `(partition, node)` order.
     ///
     /// The **initial snapshot only** (lead ruling V-R12, 2026-09-20). Every later membership
@@ -474,14 +599,87 @@ pub struct QueriedSource {
 }
 
 /// One acknowledgement a publication rested on.
+///
+/// Team verification's §3.7 four-tuple (finding K-F-22): two acknowledgements from one node
+/// across a restart are two boots, and the checker counts one copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AckEvidence {
     /// Who acknowledged.
     pub node: NodeId,
+    /// Its process lifetime when it did.
+    pub boot: BootId,
     /// In what role. A shadow entry here must never qualify the publication.
     pub role: ReplicaRole,
     /// How strongly.
     pub durability: DurabilityClass,
+}
+
+/// The acknowledgement rule in force when a write was acknowledged (finding K-F-07; team
+/// verification §3.14).
+///
+/// Not carried on [`TraceKind::ProtectionState`]: lead ruling V-R20 (2026-09-20) has the
+/// oracle derive it from `required_copy_set` and the membership in force, so the kernel cannot
+/// declare a rule its acknowledgements did not follow. The enum is the oracle's vocabulary for
+/// that derivation and for the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum QuorumRule {
+    /// Three copies: durable on the primary and acknowledged by two secondaries (spec §5.2).
+    Rf3,
+    /// Two survivors: both required for every acknowledgement (spec §8.3).
+    DegradedRf2,
+}
+
+/// Why a scenario operation was not applied (finding K-F-08; team verification §3.16a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SkipReason {
+    /// The thing the operation referred to no longer exists — a reducer removed the request it
+    /// was a retry of, or the node it targeted.
+    ReferentGone,
+    /// The run's bound was reached before the operation's turn.
+    OutOfBudget,
+}
+
+/// Which control-store operation a [`TraceKind::ControlInteraction`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlOpKind {
+    /// [`crate::contracts::control::ControlEffect::Cas`].
+    Cas,
+    /// [`crate::contracts::control::ControlEffect::Get`].
+    Get,
+    /// [`crate::contracts::control::ControlEffect::Watch`], or an event on the stream it opened.
+    Watch,
+    /// [`crate::contracts::control::ControlEffect::Reload`].
+    Reload,
+}
+
+/// How a control-store operation came out, as the environment declares it.
+///
+/// One closed set over the three control outcome types, so the oracle folds one field. A
+/// termination carries its [`WatchTermination`] and, spelled out, whether it was a gap — the
+/// oracle must not have to know which terminations gap (ADR-rdb-0008 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlOutcomeKind {
+    /// A CAS committed.
+    Committed,
+    /// A CAS lost.
+    Conflict,
+    /// A CAS may or may not have landed.
+    Unknown,
+    /// The store could not be reached.
+    Unavailable,
+    /// A read found the record.
+    Found,
+    /// A read found no record.
+    Absent,
+    /// A watch progress tick, or a contiguous run of changes.
+    Progress,
+    /// A watch ended.
+    Terminated {
+        /// Why.
+        termination: WatchTermination,
+        /// [`WatchTermination::is_gap`] of it, so the oracle reads a field rather than a rule.
+        gap: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -571,6 +769,10 @@ pub enum TraceKind {
         expiry_tick: u64,
         /// When the decision was taken.
         decision_tick: u64,
+        /// The decision's position in A1's per-node monotonic sequence (lead ruling A-R23;
+        /// team kernel-a `design.md` §1.2). Strictly increasing per node, so the oracle can
+        /// tell a stale decision from a later one without comparing ticks.
+        authority_seq: u64,
         /// How it came out.
         outcome: AuthorityOutcome,
     },
@@ -589,8 +791,6 @@ pub enum TraceKind {
         predecessor_digest: Digest,
         /// This record's digest.
         entry_digest: Digest,
-        /// Digest of the whole logical state after applying.
-        state_digest_after: Digest,
         /// The batch identity.
         batch: u64,
         /// The after-image identity for every key the batch touched, deletes included as a
@@ -701,8 +901,6 @@ pub enum TraceKind {
         seq: Seq,
         /// Digest of the record at that position.
         published_digest: Digest,
-        /// Digest of the whole published logical state.
-        published_state_digest: Digest,
         /// The acknowledgements this publication rested on.
         ack_evidence: Vec<AckEvidence>,
         /// The `AuthorityDecision` at the publication gate that authorised it. An explicit
@@ -906,6 +1104,53 @@ pub enum TraceKind {
         package: PackageId,
         /// Wired or unavailable.
         state: CapabilityState,
+    },
+
+    /// A scenario operation was not applied (finding K-F-08; team verification §3.16a).
+    ///
+    /// Its own kind on purpose: a reducer artifact is not a [`BoundaryId`], or the coverage
+    /// matrix gains a cell nobody can interpret. Not read by a checker; read by the reducer.
+    /// Without it a deduplicated retry that produces nothing is indistinguishable from a
+    /// request never submitted.
+    OpSkipped {
+        /// Its index in the scenario's operation list, the same index
+        /// [`Self::FaultInjected`] carries.
+        scenario_op_index: u32,
+        /// Why.
+        reason: SkipReason,
+    },
+
+    /// A control-store interaction completed, and how (finding K-F-06).
+    ///
+    /// **Environment-owned**, like [`Self::TopologyChange`]: emitted by the H1 control
+    /// provider as it completes the effect, so the kernel cannot lie about what the store said.
+    /// A watch termination arrives here with its `gap`, which is what
+    /// [`Self::FamilyReload`] refers back to.
+    ControlInteraction {
+        /// Which operation.
+        op: ControlOpKind,
+        /// The record, for a CAS or a read.
+        key: Option<ControlKey>,
+        /// The family, for a watch or a reload.
+        prefix: Option<ControlPrefix>,
+        /// How it came out.
+        outcome: ControlOutcomeKind,
+    },
+
+    /// A coherent reload of one family (finding K-F-06).
+    ///
+    /// Emitted by the kernel module that asked for it, because the *decision* to reload is the
+    /// thing under test. `after_termination` is the explicit back-reference to the
+    /// [`Self::ControlInteraction`] whose termination justified it, and `None` is the bug:
+    /// ADR-rdb-0008 §7 item 4 as amended by lead ruling A-R15 — no reload unless a termination
+    /// was delivered first — is two events the oracle relates by a back-reference, not a search.
+    FamilyReload {
+        /// The family reloaded.
+        prefix: ControlPrefix,
+        /// The revision the snapshot was coherent at, and the resumed watch starts after.
+        snapshot_revision: Revision,
+        /// The termination that justified it, by its `event_id`.
+        after_termination: Option<EventRef>,
     },
 }
 

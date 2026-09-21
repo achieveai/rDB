@@ -5,16 +5,39 @@
 //!
 //! | Module | What it owns |
 //! |---|---|
-//! | [`self::dispatch`] | the module registry and the capability report |
-//! | [`self::trace`] | recording [`rdb_core::contracts::trace::Trace`] and writing JSONL |
+//! | [`self::dispatch`] | the module table, the adopted authority triple, and the effect-to-event hop |
+//! | [`self::trace`] | recording [`rdb_core::contracts::trace::Trace`] and reading and writing JSONL |
+//! | [`self::manifest`] | resolving a run's budgets into [`rdb_core::contracts::trace::RunManifest`] |
 //! | [`self::replay`] | re-running a recorded trace and proving the result is identical |
 //!
-//! # Seed state
+//! # State
 //!
-//! [`self::dispatch::Dispatcher`] is real: it registers the six kernel modules and reports each
-//! one's capability. That is what lets every team run a row today and watch it flip from
-//! `Unavailable` to `Wired` as their package lands. Recording and replay are I1.
+//! Dispatch, recording and the manifest are real. Replay is owed and says so.
+//! [`environment_capabilities`] is the honest summary the rows log.
 
 pub mod dispatch;
+pub mod manifest;
 pub mod replay;
 pub mod trace;
+
+use rdb_core::contracts::trace::{CapabilityState, PackageId};
+
+/// What the three environment packages report about themselves, in package order.
+///
+/// The same rule as [`rdb_core::contracts::event::Module::capability`]: `Wired` is claimed only
+/// when nothing in the package still answers [`crate::error::SimError::Unavailable`].
+///
+/// * H1 — `Unavailable`: [`crate::sim::network::Network::send`] and
+///   [`crate::sim::cluster::Cluster::suspend`] are owed. The scheduler, clock, control store
+///   and cluster lifecycle are real.
+/// * M1 — `Wired`: the memory engine, crash images and snapshots are real.
+/// * I1 — `Unavailable`: [`self::replay::replay`] is owed. Dispatch, recording and the manifest
+///   are real.
+#[must_use]
+pub const fn environment_capabilities() -> [(PackageId, CapabilityState); 3] {
+    [
+        (PackageId::H1, CapabilityState::Unavailable),
+        (PackageId::M1, CapabilityState::Wired),
+        (PackageId::I1, CapabilityState::Unavailable),
+    ]
+}

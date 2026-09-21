@@ -25,14 +25,17 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::contracts::authority::EvidenceRef;
 use crate::contracts::control::{ControlEffect, ControlEvent};
+use crate::contracts::digest::Digest;
 use crate::contracts::errors::{Capability, RdbError};
 use crate::contracts::ids::{
     BootId, ConfigVersion, CorrelationId, EventId, Generation, NodeId, OwnerEpoch, PartitionId,
-    RequestIdentity,
+    RequestIdentity, Revision,
 };
 use crate::contracts::storage::{SnapshotRead, StorageEvent, StoreEffect};
 use crate::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
+use crate::contracts::trace::{CapabilityState, ReadServiceOutcome, Version};
 use crate::contracts::transport::{SendEffect, TransportEvent};
 use crate::contracts::txn::{TxnRequest, TxnResult, TxnStatus};
 
@@ -143,8 +146,8 @@ pub enum NodeLifecycle {
     },
 }
 
-/// The six sources an event can come from. There is no seventh: anything else would be a
-/// hidden input.
+/// The sources an event can come from. There is no other: anything else would be a hidden
+/// input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventKind {
     /// A client request.
@@ -159,6 +162,27 @@ pub enum EventKind {
     Control(ControlEvent),
     /// A timer fired. May be stale; the kernel checks the version.
     Timer(TimerFired),
+    /// Spec §7.2's fallback: an operator or platform mechanism verified that the prior
+    /// machine is fenced (lead ruling A-R23; team kernel-a `design.md` §2.2).
+    ///
+    /// Never synthesised from unreachability; it only ever arrives from outside — operator
+    /// tooling at M9, the scenario at M7. It carries the six binding fields so the A1 guard
+    /// compares them against its own takeover state rather than against a value filled in
+    /// from that state (finding K-A-37).
+    ExternalFenceVerified {
+        /// The partition being taken over.
+        partition: PartitionId,
+        /// The lineage the prior owner served.
+        prior_generation: Generation,
+        /// The epoch the prior owner held.
+        prior_owner_epoch: OwnerEpoch,
+        /// The prior owner's process lifetime.
+        prior_boot_id: BootId,
+        /// The control revision at which a linearizable read found the grant frozen.
+        control_revision: Revision,
+        /// Opaque handle to the external evidence.
+        evidence: EvidenceRef,
+    },
 }
 
 /// What a module hands back to a client.
@@ -186,6 +210,20 @@ pub enum ReplyEffect {
         /// [`RdbError::proves_no_mutation`].
         error: RdbError,
     },
+    /// A read was answered (lead ruling F-R7, 2026-09-20).
+    ///
+    /// Reads are pure lookups against [`StepCtx::snapshot`], but the *answer* still leaves the
+    /// kernel as an effect, and it leaves as its own variant so a served read and a published
+    /// write are never the same shape in the trace.
+    Read {
+        /// Who asked.
+        identity: RequestIdentity,
+        /// How the read was served, in the trace's own vocabulary.
+        outcome: ReadServiceOutcome,
+        /// The value found, as its version and digest — never bytes, so the effect can be
+        /// recorded as it is. `None` when the key is absent or the read was rejected.
+        value: Option<(Version, Digest)>,
+    },
 }
 
 /// One thing the environment must do.
@@ -201,8 +239,13 @@ pub struct Effect {
     pub kind: EffectKind,
 }
 
-/// The five things a kernel module may ask for. Matching [`EventKind`] one for one is deliberate:
-/// every request has exactly one completion channel, and none of them is "return a value".
+/// The things a kernel module may ask for.
+///
+/// The first five match [`EventKind`] one for one, and that is deliberate: every request has
+/// exactly one completion channel, and none of them is "return a value". The sixth,
+/// [`Self::AdoptAuthority`], has no completion event because it asks the environment for nothing.
+/// It is the kernel *declaring* which lineage it now serves, and the dispatcher consumes it
+/// mechanically (lead ruling F-R10, 2026-09-20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectKind {
     /// Send a frame.
@@ -215,6 +258,24 @@ pub enum EffectKind {
     Timer(TimerEffect),
     /// Answer a client.
     Reply(ReplyEffect),
+    /// The kernel has adopted a new lineage, epoch or membership pin for this partition.
+    ///
+    /// The **only** thing that changes [`StepCtx::generation`], [`StepCtx::owner_epoch`] and
+    /// [`StepCtx::config_version`]. The dispatcher stores the last adopted triple per partition
+    /// and fills the next context from it — a lookup, never a rule. Which CAS outcome means "the
+    /// epoch is now N" is a protocol decision, and it stays in the module that emits this
+    /// (finding K-F-05: the alternative was `rdb-sim` deciding it, which the charter forbids).
+    AdoptAuthority {
+        /// The partition adopted for (lead ruling A-R23: per partition, not per dispatcher).
+        /// A1 serves many partitions from one grant and names each one it adopts.
+        partition: PartitionId,
+        /// The lineage now served.
+        generation: Generation,
+        /// The epoch now believed current.
+        owner_epoch: OwnerEpoch,
+        /// The membership pin now in force.
+        config_version: ConfigVersion,
+    },
 }
 
 /// The spec's timing and retention numbers, resolved once.
@@ -222,7 +283,10 @@ pub enum EffectKind {
 /// Every value here is a threshold the spec states in milliseconds. They live in one struct
 /// because a scenario may legitimately shrink them to keep a history short, and a module that
 /// hard-coded `2000` would silently ignore that — and because a run's resolved budgets are part
-/// of the result manifest (spike §7).
+/// of the result manifest (spike §7; [`crate::contracts::trace::RunManifest`] names each field
+/// through [`crate::contracts::trace::BudgetName`], one member per field). The clock sample age
+/// is deliberately not here: it is the caller's budget to
+/// [`crate::contracts::time::ControlTime::compare`], and kernel-a's A1 passes its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budgets {
     /// Unsafe-age warning threshold (spec §6.2: 1,000 ms).
@@ -268,6 +332,11 @@ impl Budgets {
 ///
 /// Deliberately small. Anything added here is an ambient input, and every ambient input is a way
 /// for two runs of the same event log to diverge.
+///
+/// Three of these fields are not ambient at all: `generation`, `owner_epoch` and
+/// `config_version` are whatever the kernel last declared through
+/// [`EffectKind::AdoptAuthority`] for this partition, copied back by the dispatcher. Before the
+/// first adoption they are zero, which no grant ever names.
 pub struct StepCtx<'a> {
     /// Current logical time.
     pub now: Tick,
@@ -279,11 +348,12 @@ pub struct StepCtx<'a> {
     pub boot: BootId,
     /// The partition being stepped.
     pub partition: PartitionId,
-    /// The lineage it is serving.
+    /// The lineage it is serving — the last [`EffectKind::AdoptAuthority`] for this partition.
     pub generation: Generation,
-    /// The owner epoch it believes is current.
+    /// The owner epoch it believes is current — the last [`EffectKind::AdoptAuthority`].
     pub owner_epoch: OwnerEpoch,
-    /// The membership configuration the required-copy predicate is pinned to.
+    /// The membership configuration the required-copy predicate is pinned to — the last
+    /// [`EffectKind::AdoptAuthority`].
     pub config_version: ConfigVersion,
     /// A read-only view at the published prefix.
     pub snapshot: &'a dyn SnapshotRead,
@@ -301,6 +371,18 @@ pub struct StepCtx<'a> {
 pub trait Module {
     /// Which module this is.
     fn name(&self) -> ModuleName;
+
+    /// Whether this module is wired in this build.
+    ///
+    /// Non-mutating, and answered positively: the default is
+    /// [`CapabilityState::Unavailable`], and a module says `Wired` by overriding this, never by
+    /// happening not to return `Unavailable` from a probe step (finding K-F-10 — the probe
+    /// stepped every module with an event the protocol never sent, mutated whatever state it had
+    /// and discarded the effects). The harness emits the answer as
+    /// [`crate::contracts::trace::TraceKind::Capability`] at trace start.
+    fn capability(&self) -> CapabilityState {
+        CapabilityState::Unavailable
+    }
 
     /// Handle one event and return everything the environment must do, in order.
     ///

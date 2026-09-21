@@ -58,6 +58,12 @@ dense_id! {
     Generation(u64);
     /// Owner epoch inside a generation; bumped on every ownership transition (spec §7.3).
     OwnerEpoch(u64);
+    /// The authority generation carried on a grant record (spec §7.1 `grants/{node}`), bumped by
+    /// the planner on every fence. Distinct from [`Generation`], which is a *partition history*
+    /// incarnation, and from [`OwnerEpoch`], which is scoped inside one of those: a grant
+    /// holder compares this to detect that its right was re-issued under it (lead ruling F-R8,
+    /// 2026-09-20; team kernel-a's `AuthorityDecision.authority_generation`).
+    AuthorityGeneration(u64);
     /// Pins the required-copy set. Membership changes bump it so an old exposure predicate
     /// cannot be erased by renaming a replica (spec §6.2).
     ConfigVersion(u64);
@@ -105,6 +111,9 @@ dense_id! {
     /// Identifies one generator choice point in a trace, so a reducer can shrink a specific
     /// decision rather than a whole seed (spike §4, trace seam).
     ChoiceId(u32);
+    /// Identifies one scenario in a campaign, so a reduced scenario can name the one it was
+    /// shrunk from ([`crate::contracts::trace::Provenance::Reduced`]).
+    ScenarioId(u64);
 }
 
 impl Seq {

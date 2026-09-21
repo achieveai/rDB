@@ -14,9 +14,14 @@
 #
 # Kept in sync with scripts/gate.ps1.
 #
+# The deps stage is the one non-cargo check: `rdb-*` may depend on `config-*`, never the
+# reverse (rdb ADR-0002). It reads `cargo metadata` and fails on any `config-*` package that
+# names an `rdb-*` dependency of any kind, dev and build included, because a dev-dependency is
+# how the reverse edge would arrive first.
+#
 # Usage:
-#   scripts/gate.sh                 fmt + clippy + test
-#   scripts/gate.sh fmt|lint|test   one stage
+#   scripts/gate.sh                      fmt + deps + clippy + test
+#   scripts/gate.sh fmt|deps|lint|test   one stage
 #   scripts/gate.sh test -p config-engine --test m4_watch    extra args go to cargo
 
 set -euo pipefail
@@ -42,13 +47,34 @@ echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE logs=$RETC
 run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
 run_test() { echo "== test";   cargo test --workspace --no-fail-fast "$@"; }
+# perl with JSON::PP ships with every Git for Windows and every Linux perl; no jq needed.
+run_deps() {
+  echo "== deps"
+  cargo metadata --format-version 1 --no-deps | perl -MJSON::PP -e '
+    local $/;
+    my $meta = decode_json(<STDIN>);
+    my $bad = 0;
+    for my $pkg (@{ $meta->{packages} }) {
+      next unless $pkg->{name} =~ /^config-/;
+      for my $dep (@{ $pkg->{dependencies} }) {
+        next unless $dep->{name} =~ /^rdb-/;
+        my $kind = $dep->{kind} // "normal";
+        print STDERR "deps: $pkg->{name} depends on $dep->{name} ($kind)\n";
+        $bad = 1;
+      }
+    }
+    print STDERR "deps: config-* must never depend on rdb-* (rdb ADR-0002)\n" if $bad;
+    exit $bad;
+  '
+}
 
 case "$stage" in
   fmt)  run_fmt ;;
+  deps) run_deps ;;
   lint) run_lint ;;
   test) run_test "$@" ;;
-  all)  run_fmt && run_lint && run_test ;;
-  *)    echo "unknown stage: $stage (expected fmt, lint, test or all)" >&2; exit 1 ;;
+  all)  run_fmt && run_deps && run_lint && run_test ;;
+  *)    echo "unknown stage: $stage (expected fmt, deps, lint, test or all)" >&2; exit 1 ;;
 esac
 
 echo "gate: $stage OK"
