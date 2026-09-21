@@ -52,10 +52,24 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
 - The failure the snapshot removes is `IO Error: ... Reached the end of the file`. The byte
   offset in that message is what DuckDB attempted, not the file's size — do not read it as
   evidence of a huge log. On 2026-09-21 the offset was 218862478 against a file that finished at
-  862679 bytes, 50x larger than every file the glob matched put together. Growth alone does not
-  explain it and does not reproduce: three files appended to a gigabyte each, queried 20 times
-  through the same CLI (v1.3.2) and options, were right 20/20. The snapshot works by removing
-  the ingredient — a file somebody still has open — not by knowing what the CLI does with one.
+  862679 bytes.
+- Know the size of a real log root before you reason about one. Measured: a whole-workspace run
+  leaves **1157 files and 2.93 GB**, 4.18 million rows, read clean in ~13 s. The mean file is
+  2.7 MB but the distribution is bimodal — about a thousand sub-MB files beside a 533 MB
+  `m4_69_queue_cap_does_not_leak_between_streams.jsonl` and a 480 MB
+  `m6_106_evidence_backup_restore_rpo_rto.jsonl`. Both of those are larger than the failing
+  offset, so that offset is an ordinary position inside the glob, not an impossible one.
+- This note previously said the offset was "50x larger than every file the glob matched put
+  together", and used that to conclude growth could not explain the fault. It was arithmetic on
+  the wrong set: 3.88 MB, the six files in `m1_observability/`, rather than the 1157 the
+  `*/*.jsonl` glob matches. The offset is in fact 14x *smaller* than the glob's total. Treat the
+  mechanism as unknown, not as ruled out.
+- What is actually measured is the ingredient, not the mechanism: the same 1157-file root, same
+  CLI (v1.3.2) and options, is clean 6 runs out of 6 once no process holds a file open. That
+  says an open writer is necessary and says nothing about why. The older "three files appended
+  to a gigabyte each, right 20/20" says less still — with no small file in the set there was
+  nothing for a large offset to land outside of, so it could not have reproduced this either way.
+  The snapshot works by removing the ingredient, not by knowing what the CLI does with one.
 - Waiting for a log line is a wait, not a side effect of the reader. `m1_47` asserted on `apply`
   lines that land after the index they wait on, and passed only because spawning the `duckdb`
   CLI took ~200ms; against a snapshot it failed 10/10 immediately. If a row asserts on lines a

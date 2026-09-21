@@ -94,12 +94,26 @@ const READ_OPTIONS: &str = "union_by_name=true, map_inference_threshold=-1";
 /// ```
 ///
 /// Read that offset carefully before chasing it: it is what DuckDB *attempted*, not the file's
-/// size. The file in that failure finished at 862_679 bytes — 253x smaller than the offset, and
-/// 50x smaller than every file the glob matched put together — so DuckDB was not simply
-/// overrunning a file that grew under it. Reading a growing file is fine on its own: three
-/// files appended to a gigabyte each, queried 20 times through the same CLI (v1.3.2) and the
-/// same options, came back right 20 times out of 20. Whatever the CLI does wrong here, it needs
-/// a file somebody still has open, and none of it can happen to a file nobody is writing.
+/// size. The file in that failure finished at 862_679 bytes, 253x smaller than the offset.
+///
+/// An earlier version of this comment added "and 50x smaller than every file the glob matched
+/// put together". That was wrong, and wrong in the direction that made the fault look
+/// unexplainable. Measured on a real whole-workspace root: **1157 files, 2.93 GB**. The offset
+/// is 14x *smaller* than the glob's total, not larger than it, and **two files in the same glob
+/// are bigger than the offset** (533 MB and 480 MB). The 50x came from summing only the six
+/// files in `m1_observability/` — 3.88 MB, the directory the failing file sits in — instead of
+/// the 1157 the `*/*.jsonl` glob actually matches. 218_862_478 / 4_071_941 = 53.7.
+///
+/// With the real figures, a plain explanation is back on the table and should be checked before
+/// anyone calls this a CLI mystery: an offset valid inside one of those 500 MB files, applied to
+/// a 863 KB one in the same scan. That is a hypothesis, not a finding — nobody has proved it.
+///
+/// What *is* measured is the ingredient. The same 1157-file, 2.93 GB root, same CLI (v1.3.2),
+/// same options, **6 runs out of 6 clean** (4_175_207 rows, ~13 s each) once nothing holds a
+/// file open. Note what that does and does not license: it says an open writer is necessary, and
+/// it says nothing about why. The earlier "three files appended to a gigabyte each, right 20 out
+/// of 20" does not license even that much — with no small file in the set, there was nothing for
+/// a large offset to land outside of, so it could not have reproduced this fault either way.
 ///
 /// So the mechanism is not the fix's warrant; the absence of the ingredient is. A snapshot is a
 /// closed file of fixed length, and the copy is taken by this process, which already owns the
