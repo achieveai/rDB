@@ -235,6 +235,40 @@ A batch that fails or completes ambiguously yields `UNKNOWN_OUTCOME` and fences 
 "provably did not land" from "unknown". The asymmetry is deliberate: a false `UNKNOWN_OUTCOME`
 costs one status query, a false definitive rejection costs correctness.
 
+**Amended 2026-09-20 (kernel-a Q-17): a batch error retains no dedup entry, and the retry rule
+governs the same identity — not the dedup lookup's miss rule.** A batch that completes `Err` or
+`Incomplete`, whether the queue was `Open` or already frozen for an authority loss, emits no
+candidate; no `Published{seq}` ever arrives for it, so no dedup entry is retained for its identity.
+That absence is not a licence to execute the identity again. Two rules already in this ADR decide
+what happens instead, and neither reaches the dedup lookup:
+
+- **For the caller**, §5's `UNKNOWN_OUTCOME` row: query status with the same identity, never a new
+  request id. The status answer is the §4 table — `UNKNOWN_OUTCOME` while the generation is
+  retained, and after recovery whatever the "Recovery folds status by sequence" row folds for the
+  batch's sequence — never absence-as-nonexecution. The caller leaves that loop only by explicit
+  reconciliation under the new generation (§5.3: a lost-generation transaction is never silently
+  retried as a new effect).
+- **For the kernel**, §3's order. A resubmission under the same identity is refused at check 7
+  while the partition is frozen, with the retry-after-recovery error for the freeze cause
+  (`PROTECTION_PAUSED` or `LEASE_EXPIRED`; the §5 rule is the same for both: do not assume an
+  already-admitted request failed). The only exit from that freeze is a recovery install into a
+  new generation, after which the same resubmission is refused at check 5 with
+  `GENERATION_CHANGED`. Both checks precede step 11, so within the generation that dispatched the
+  batch the identity never reaches the dedup lookup again, and step 11's "miss ⇒ continue" never
+  applies to it. Neither refusal reserves a sequence or emits a storage batch; the counter stays
+  advanced, per the invariant in §3.
+
+Why the miss rule cannot govern here: "no retained entry ⇒ fresh execution" reads the in-memory
+index, which is written only at publication, while the batch itself carried the dedup record in the
+same atomic write as the data (§4) — and `Err` does not say that write failed (the paragraph
+above). A kernel that executed a same-identity resubmission on the index miss would run the
+mutation a second time, at a new sequence, over storage that may already hold it at the first;
+that is the duplicate effect V4 exists to catch, and the oracle's `absence_reported_as_nonexecution`
+rule is the same fact seen from the observer's side. It could only do so by admitting through a
+frozen queue or by skipping the generation check, each a separate violation of §3. So the M7A-169
+near-miss twin asserts a refusal, not a re-execution: no `RetainDedup`, the resubmission refused at
+check 7 with the freeze's mapped error, zero `StorageBatch`, `next_seq` unchanged.
+
 ## Consequences
 
 - The caller-visible contract is decidable from the error alone. A client SDK can implement the
@@ -272,7 +306,7 @@ the `M7A-NN` prefix; each row is one named test in `rdb-sim/tests/transaction.rs
 | Retention boundary | status inside retention ⇒ `Published`/`RecoveredApplied`; trimmed within a live generation ⇒ `UNKNOWN_OUTCOME`; retired generation ⇒ `STATUS_EXPIRED`; never "not executed". All three answers asserted against the §4 table (spike §6, F1/T1/P1) |
 | Recovery folds status by sequence, not by presence | recover with a cutoff below the highest published sequence (a loss-accepting recovery, ADR-rdb-0009) and query three identities present in the predecessor generation's status index: one at or below the retained cutoff ⇒ `RECOVERED_APPLIED` with the retained result; one at or above the discarded sequence ⇒ `UNKNOWN_OUTCOME`; and, in a second trace with the loss marked uncertain, the retained one too ⇒ `UNKNOWN_OUTCOME`. A present identity whose bytes were dropped never answers success (spike §6, F1/T1/P1; kernel-b §5.8's three-way rule) |
 | Publication binds the digest | after the apply, hand the replication module a history whose digest at the candidate's sequence differs from `record_digest` (and, in a second trace, one that has not retained that sequence): assert no publication, no `Published` status, no reply, the candidate still pending, and a predicate-false fact naming the digest conjunct; then supply the matching history and assert the publication follows (ADR-rdb-0009 §3.5's third conjunct, evaluated by the publisher) |
-| Published while frozen retains dedup in both orders | freeze the queue for an authority loss (resp. a storage fence) while a batch is dispatched; complete the batch; deliver `Published{seq}` — and in a second trace deliver `Published{seq}` *before* the freeze lands on the queue: assert the dedup record is retained in both, the queue's freeze cause is unchanged, and the unresolved sequence was the batch's (ADR-rdb-0007 "A freeze keeps its cause") |
+| Published while frozen retains dedup in both orders | freeze the queue for an authority loss (resp. a storage fence) while a batch is dispatched; complete the batch; deliver `Published{seq}` — and in a second trace deliver `Published{seq}` *before* the freeze lands on the queue: assert the dedup record is retained in both, the queue's freeze cause is unchanged, and the unresolved sequence was the batch's (ADR-rdb-0007 "A freeze keeps its cause"). **Amended 2026-09-20 (Q-17):** in a third trace complete the batch `Err` while frozen, then resubmit the same identity: assert no dedup record is retained, the resubmission is refused before the dedup lookup with the freeze's mapped retry-after-recovery error, no sequence is reserved, no storage batch is emitted, and the counter stays advanced — the retry rule (§5, `UNKNOWN_OUTCOME` ⇒ status query) governs, never step 11's miss rule (§7) |
 | Digest survives a legitimate retry | the same semantic request submitted twice with different remaining deadlines produces one digest, one effect and a verbatim replayed result — **not** `REQUEST_ID_REUSE` |
 | Affinity extraction is specified | C0's known-answer vector for `(tenant, affinity_id, user_key)`, plus the `CROSS_AFFINITY` row built on it |
 | Sequence reservation is discardable | a dispatch-checkpoint denial leaves the counter and the digest chain exactly as they were; so does a partition freeze that lands between the dispatch check and its answer (the pre-apply request is rejected, no storage batch is emitted); an ambiguous batch leaves the counter advanced and the partition frozen |
