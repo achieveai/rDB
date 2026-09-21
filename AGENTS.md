@@ -77,6 +77,33 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   cluster down before querying, as `m1_48` and `m4_119` do.
 - To read your own output without DuckDB at all, use `logs::lines_for_current_test`.
 
+## Several agents, one working tree
+
+- This repository is often worked by several agents at once, all in the same checkout. So a
+  cargo result describes **the tree at that instant, not HEAD**, and a build error you did not
+  cause is more likely somebody's red-before-green than a defect.
+- Before blaming another team for a build failure, ask what is committed. `git status <path>`
+  and `git show HEAD:<path>` answer that. **`git log -- <path>` does not**: it names the last
+  commit to *touch* a file, so for a line that was never committed it returns a plausible,
+  innocent commit and reads like an attribution. On 2026-09-21 a reviewer reported an E0432 in
+  `crates/rdb-sim/tests/harness.rs` against a commit from the previous day; the failing import
+  named four symbols another agent was adding at that moment, tests first.
+- To get a result about HEAD without disturbing anyone, export it and build the export:
+
+  ```sh
+  git archive HEAD | tar -x -C /tmp/headcheck
+  cd /tmp/headcheck && CARGO_TARGET_DIR=$PWD/.t cargo clippy --all-targets -- -D warnings
+  ```
+
+  14 MB and a few seconds, tracked files only, working tree never read or written. Give it its
+  own `CARGO_TARGET_DIR` inside the export, and keep the path short — a deep temp path plus
+  Rust's own nesting reaches Windows' `MAX_PATH`. Delete the export afterwards.
+- **Never `git stash`, `reset`, `checkout`, `restore` or `clean` to get a clean tree here.** One
+  of those discards every other agent's uncommitted work, and their handoffs are the only record
+  that it existed. There is no undo. The export above is the substitute, and it is cheaper.
+- The same point-in-time flaw bites evidence, not just blame. Ground a claim about what a commit
+  contains on `git show --name-only <sha>`, not on a grep of the working tree.
+
 ## Running the gate
 
 - `scripts/gate.sh` (or `scripts/gate.ps1`) runs fmt, deps, drift, clippy and the workspace
