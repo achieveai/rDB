@@ -174,8 +174,8 @@ no qualifying regular secondary     : *  -> Paused        [immediate, not age-ga
 -- on BlockPartition { reason }:
 any                                 : record the reason; -> Paused if not already;
                                       SetAdmission(Reject(DIVERGENCE_REQUIRES_OPERATOR))
-                                      [Paused -> Reprotecting unreachable from here: the
-                                       qualification term can never hold again under this config]
+                                      [the resume arm requires "not blocked"; no exit inside
+                                       this instance]
 
 -- on HealthEval:
 Healthy, unsafe_age >= 2000 ms      :    -> Paused
@@ -184,6 +184,7 @@ Warn,    unsafe_age >= 2000 ms      :    -> Paused
 Warn,    unsafe_age <  1000 ms      :    -> Healthy
 Paused,  every active predicate durable through resume_barrier
          AND a regular secondary qualifies
+         AND not blocked
                                     :    -> Reprotecting { below_since: None }
 Reprotecting, replication_lag <  250 ms, below_since == None : below_since = Some(now)
 Reprotecting, replication_lag >= 250 ms                      : below_since = None  [restarts]
@@ -208,7 +209,11 @@ the predicate may already be false, including before the first `Gained` — so t
 assume an earlier arm paused it. It records the reason, pauses if it was not paused, and from then
 on reports `DIVERGENCE_REQUIRES_OPERATOR` instead of `PROTECTION_PAUSED` in the admission state
 (§6). The two are different client answers: one says retry, the other says nothing on the data path
-will change this. The block is cleared only by a new instance at the next `Recovered`.
+will change this. The block is cleared only by a new instance at the next `Recovered`, and the
+resume arm checks it rather than assuming it: the operator remedy the alert names is a membership
+change that adds a regular copy, which arrives without a `Recovered`; once that copy ACKs at head
+the qualification term holds again, and without the conjunct this module would admit while the
+publication module stays blocked — writes replicated but never publishable.
 
 The qualification term also gates `Paused → Reprotecting`: handing admission back to a partition
 that still cannot replicate would be the same bug arriving by the resume path.
@@ -333,6 +338,7 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
 | A dropped `Lost` edge is caught outside L1 | Verification's dispatcher mutation drops the routed `QualificationChanged { Lost }`; the oracle reports an `Admitted` after the loss; no L1 row claims to catch this |
 | The module starts closed | Fresh instance at `Recovered`: `Paused`, `SetAdmission(Reject)` at construction, no admission before the first `Gained` and the durable barrier; then `Reprotecting` and the 5 s hold as usual |
 | A block reads as a block | `BlockPartition` with no prior `Lost` (predicate already false, or before the first `Gained`): the module is `Paused`, `reason == DIVERGENCE_REQUIRES_OPERATOR`, and no later `HealthEval` or `Gained` resumes it |
+| A membership change does not unblock | `BlockPartition`, then a config change adding a regular copy that ACKs at head: `Gained` arrives, every predicate is durable through the barrier, and the module still stays `Paused` with admission unchanged |
 | The primary counts as a required copy | Stall the primary's flush with both secondaries healthy: `unsafe_age` rises and the partition pauses |
 | `next_interesting_tick` is sound | Property: for every state, no `HealthEval` strictly before the returned tick changes the state |
 | Idle never pauses | No transactions, advance virtual time by an hour: state stays `Healthy` |

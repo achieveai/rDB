@@ -297,7 +297,9 @@ conditioned on the revision from the recovery commit, so a competing writer prod
 rather than an activation over someone else's decision.
 
 **A copy lost during `Rebuilding` stalls the rebuild; it never shrinks `required`.** The
-replication module reports a divergence as `CopyLost` (ADR-0005 §5). If the copy is one of
+replication module reports a divergence as `CopyLost` (ADR-0005 §5) — whether proved by an ACK, by
+catch-up, or by the copy having been quarantined at `Recovered` and answering every append
+`QUARANTINED`; the last does not wait for an ACK the copy may never send. If the copy is one of
 `required`, `Rebuilding` drops its proof, emits `Alert { RebuildStalled, copy }` and stays, with
 `required` unchanged — so no later `DurableAt` can reach `ActivationProposed` until that copy or a
 replacement proves the barrier. Both alternatives fail: dropping the proof with no alert leaves the
@@ -422,6 +424,7 @@ consumer does not handle.
 | A credential names its sender | A second regular member replaying a captured credential is rejected `NOT_A_MEMBER` |
 | Holder ≠ leader transfers land | The selected holder cannot lead: `CatchUpBeforeGrant` from the holder, credential `sender == holder`, every record accepted at the elected leader; the two-survivor case with the fenced node shorter likewise — **V3** |
 | A lost copy stalls the rebuild, loudly | `CopyLost` of a required copy during `Rebuilding`: one `Alert { RebuildStalled }`, `required` unchanged, no `ActivationProposed` on any later `DurableAt` — **V3** |
+| A quarantined required copy stalls the same way | `Recovered` quarantines a copy in `required` (its digest at the cutoff differs); it never ACKs; the rebuild still raises exactly one `Alert { RebuildStalled }`, `required` unchanged, no `ActivationProposed` on any later `DurableAt` — **V3** |
 | Rebuild reaches `CopyCaughtUp` across the generation change | Copy at seq 50, root at `base_seq = 100`: records 51..100 under the predecessor generation are accepted, `CopyCaughtUp` fires at `(100, base_digest)`, and the copy's proof then passes `try_new` — **V3** |
 | RF2 degraded requires both | With one regular secondary, losing it stops admission; no one-copy fallback path exists — **V3** |
 | All three lone-survivor choices | Old primary, secondary 1, secondary 2 each as sole survivor: read-only mode, correct declared cutoff, `uncertain` set when a higher prefix was advertised — **V3** |
