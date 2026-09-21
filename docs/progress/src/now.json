@@ -1,5 +1,5 @@
 {
   "where": "M7 in progress. Wave 2 code landed. Four drift markers re-based. Gate: fmt 0, clippy 0, 146 tests.",
-  "blocked": "Nothing.",
+  "blocked": "CB-7 (kernel-b needs ErrorKind mapping), G-13 (funding), F5 (shrink bound).",
   "next": "Gautam decides G-13 funding and F5 shrink acceptance."
 }

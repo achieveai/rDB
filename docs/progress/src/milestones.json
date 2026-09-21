@@ -382,6 +382,66 @@
         "Critic passed design records for kernel-a, kernel-b, and verification.",
         "Test planner issued kernel-a test plan; kernel-b test plan advanced; verification plan completed and passed review."
       ]
+    },
+    {
+      "id": "M8",
+      "title": "Storage and value layer",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M9",
+      "title": "Embedded API and live control",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M10",
+      "title": "Replication and recovery, real cluster",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M11",
+      "title": "Placement, transfer, split",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M12",
+      "title": "Qualification",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M13",
+      "title": "Actor adapter",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
     }
   ]
 }
