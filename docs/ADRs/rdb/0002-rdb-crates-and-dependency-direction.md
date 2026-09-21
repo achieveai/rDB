@@ -43,8 +43,17 @@ feature precisely because that is true.
    are reserved here so nobody invents a different scheme.
 
 2. **The arrow.** `rdb-sim -> rdb-core`. `rdb-* -> config-*` is permitted. **`config-* -> rdb-*` is
-   forbidden, always.** `rdb-core` in fact depends on no `config-*` crate at all; `rdb-sim` takes
-   `config-log` and `config-log-macros` as dev-dependencies only, for JSONL test logging.
+   forbidden, always.** `rdb-core`'s `[dependencies]` name no `config-*` crate; both `rdb-core`
+   and `rdb-sim` take `config-log` and `config-log-macros` as **dev-dependencies only**, for JSONL
+   test logging through `#[retcd_test]`. `rdb-core` also dev-depends on `hex`, for the golden
+   digest vectors in its contract tests. Dev-dependencies do not reach a consumer of the crate,
+   so the purity rule in decision 3 is about `[dependencies]` alone.
+
+   The forbidden direction is checked mechanically, not by review (correction round 1, finding
+   K-F-32, lead ruling F-R11): `scripts/gate.sh deps` and `scripts/gate.ps1 deps` read
+   `cargo metadata --format-version 1` and fail when any package whose name starts with
+   `config-` lists a dependency whose name starts with `rdb-`, in any dependency kind. `all`
+   runs it. Cargo itself accepts a reversed edge; the gate does not.
 
 3. **`rdb-core` is pure**, in ADR-0004's exact sense: no clock, no I/O, no randomness, no async, no
    thread spawning, no global state. `#![deny(missing_docs)]` and `#![forbid(unsafe_code)]`. Its
@@ -81,8 +90,12 @@ feature precisely because that is true.
   ADR, and the envelope version exists to carry the change.
 - `rdb-core` cannot log through `config-log` in its non-test code. It emits `tracing` events and
   the binary decides the subscriber, which is what a pure crate should do anyway.
-- The forbidden direction is a convention, not a compiler error. Cargo would happily accept a
-  reversed edge. It is checked by review and by the crate list in this ADR.
+- The forbidden direction is not a compiler error — Cargo would accept a reversed edge — but it
+  is a gate error. The `deps` stage in decision 2 fails the workspace gate on any
+  `config-* -> rdb-*` edge, so the invariant that is cheap to check and expensive to undo is
+  checked on every run rather than by review. An earlier revision of this ADR called it "a
+  convention, checked by review"; that was corrected before four teams started writing in
+  parallel (K-F-32).
 
 ## Verification
 
@@ -92,8 +105,14 @@ feature precisely because that is true.
 - `cargo fmt --all --check` prints no diff. Observed 2026-09-20.
 - `crates/rdb-core/Cargo.toml` `[dependencies]` contains exactly the five crates listed in decision
   5, and no `config-*` entry.
-- No `config-*` crate's `Cargo.toml` names an `rdb-*` dependency.
-- `grep -rn "HashMap" crates/rdb-core/src crates/rdb-sim/src` finds nothing.
+- `scripts/gate.sh deps` exits 0: no `config-*` package depends on an `rdb-*` package. The same
+  check by hand: `cargo metadata --format-version 1 --no-deps` lists no package named `config-*`
+  whose `dependencies[].name` starts with `rdb-`.
+- No `HashMap` in code. The command that reproduces, with the doc-comment hits excluded:
+  `grep -rn "HashMap" crates/rdb-core/src crates/rdb-sim/src | grep -v -E ':[[:space:]]*//'`
+  prints nothing and exits 1. Without the second filter it finds three hits, all in `//!` or `///`
+  comments that forbid the type (observed 2026-09-20; an earlier revision of this bullet claimed
+  the unfiltered command found nothing, which it did not — K-F-31).
 
 ## References
 
