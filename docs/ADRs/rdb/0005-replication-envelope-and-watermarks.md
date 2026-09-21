@@ -300,7 +300,11 @@ committing the degraded membership is the planner's (spec §9), not M7's.
 **`diverged` has one writer.** Divergence is proved at two sites — rule 9 on an ACK, and the
 catch-up cursor when a `NeedPrefix` head digest `Differs` — but the mark and the vector above are
 the tracker's. The cursor emits `DivergenceDetected` and nothing else; it is routed back to the
-tracker as an event, which sets the mark (idempotently) and emits the rest once. The cursor's other
+tracker as an event, which sets the mark (idempotently) and emits the rest once — *the rest*: on
+the routed path the tracker does not re-emit the detection event it was just handed, because that
+event is already the proof's trace and re-emitting it would only buy an idempotent second step.
+The vector is therefore one effect shorter when the divergence was proved by catch-up than when it
+was proved by an ACK. The cursor's other
 proof — a receiver answering `QUARANTINED`, which it reports as `CopyQuarantined` — is consumed by
 the same arm with the same effects, because a copy that rejects every append may never ACK again
 and the mark cannot wait on rule 9. Whichever end proved it, the trace carries one alert and one

@@ -45,7 +45,9 @@ unsafe_age(now) = match unsafe_queue.front() {
 
 `unsafe_queue` holds, in sequence order, every locally applied transaction not yet durable on the
 required copies. `applied_at` is stamped by the `LocalApplied { seq, bytes, tick }` event that
-created the entry. `now` arrives on `HealthEval { now }`. Nothing reads a clock. `bytes` rides on
+created the entry. `now` arrives with the evaluation event — a timer firing on this module's
+cadence, read from the step context, never from the timer's own `scheduled_at`, which is when the
+timer was armed rather than when it fired. Nothing reads a clock. `bytes` rides on
 the same event because `outstanding_unsafe_bytes` (§6) is the sum over the queue and has no other
 source; spec §6.2 asks for age and bytes separately, so the event carries both.
 
@@ -191,6 +193,17 @@ Reprotecting, replication_lag >= 250 ms                      : below_since = Non
 Reprotecting, now - below_since >= 5000 ms         :    -> Healthy, SetAdmission(Allow)
 Reprotecting, barrier invalidated (new predicate not durable through it) :  -> Paused
 ```
+
+`Reprotecting` is this document's name for the state; the trace enum's name for it is
+`ProtectionPhase::Resuming`, and a test reading a `protection_state` line sees `Resuming`. The
+other three phases map by name. The internal name is kept because it says what the phase is for;
+the mapping is written down once so that a row asserting on absence (no resume happened) cannot
+pass merely by spelling the state the way this document does.
+
+This module reads no partition mode. Refusing writes while a partition is read-only after a
+lone-survivor recovery is the transaction and publication modules' freeze (ADR-0009 §7), not an
+admission decision here — so this module can resume before a rebuild activates, and a test that
+expects it to hold admission until the three-copy barrier is asserting against the wrong module.
 
 A copy lost while `Reprotecting` needs no arm of its own: a loss that takes the floor arrives as
 `QualificationChanged { Lost }` and is the first arm; a loss that leaves the floor arrives as

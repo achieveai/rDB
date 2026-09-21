@@ -262,6 +262,18 @@ Coverage (every required copy has a proof), reach (`proof.seq >= cutoff`), bindi
 a *different* history is not durable at our cutoff, and without that check the barrier reintroduces
 "longest wins by number" one layer down.
 
+**Activation is announced, not just written.** `Rebuilding` ends in a second CAS on
+`partitions/{id}` that flips the record to `ACTIVE`, and on `Committed(revision)` the module
+re-emits its own result with `mode: Active` — the same struct as the recovery commit, the same
+lineage and cutoff, the new revision. Every consumer already has a total arm for that result and
+each arm is idempotent on the rows that did not change, so the mode change needs no new event in
+three modules. It is not optional: the transaction and publication modules leave
+`Frozen { RecoveryReadOnly }` only on that result, so a rebuild that commits without announcing
+itself leaves a fully protected partition refusing writes for the reason it no longer has. Lag
+protection is not a consumer of the mode at all — it resumes on qualification, the durable barrier
+and its hold, and may legitimately do so before the activation commits; the mode contract is the
+other modules' guard, not its.
+
 `RecoveryBarrier` still cannot be built from a sequence number — only from `DurableProof` values,
 which only the storage seam mints (ADR-0005 §4). Spec §8.1's "buffered complete entries from a live
 survivor may be retained, but must be fsynced before the recovery barrier is committed" is the type;
@@ -309,10 +321,17 @@ prevent. The exit is outside F1: placement supplies a replacement copy as data (
 or an operator fences and a fresh recovery selects over what remains. A copy outside `required` is
 ignored here; it was never going to prove anything.
 
-**`ControlCasResult` has three arms.** `Committed { revision }` proceeds. `Conflict` re-reads the
+**The CAS result has four arms.** It arrives as `ControlEvent::CasResult { key, outcome }` and the
+outcome is C0's `CasOutcome`: `Committed(revision)`, `Conflict { exists, current }`, `Unavailable`
+and `Unknown`. An earlier draft of this ADR named the last two together as `QuorumLost`; they are
+separated because they tell an operator different things. `Unavailable` — the control plane could
+not be reached — and `Unknown` — the request went out and the answer was lost — both block:
+`Blocked { ControlUnavailable }` and `Blocked { ControlUnknown }`. Neither retries blind, and
+`Unknown` is the more dangerous of the two to retry, because the CAS is more likely to have landed.
+`Committed { revision }` proceeds. `Conflict` re-reads the
 record: a different owner at a newer epoch means this node was overtaken and it blocks, re-entering
 recovery only through a fresh fencing proof; an unchanged record means a lost response and one
-re-propose is allowed. `QuorumLost` blocks unconditionally — the CAS may have landed, and a recovery
+re-propose is allowed. Neither unreachable arm may proceed — the CAS may have landed, and a recovery
 that does not know whether it is the owner must not act as if it were.
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
@@ -419,7 +438,8 @@ consumer does not handle.
 | Failure recorded before a shorter prefix is chosen | Effect-vector index assertion: `RecordSourceUnavailable` precedes `SelectPrefix` |
 | Buffered entries are fsynced before the barrier | `RecoveryBarrier::try_new` rejects a missing proof, a proof below the cutoff and a proof bound to another digest, each by a named test; a `FlushFailed` blocks commit — **V1, V3** |
 | One CAS, one key | The effect vector from `Proposing` contains exactly one `ControlCas`, targeting `partitions/{id}` |
-| A lost CAS response does not promote | `QuorumLost` leaves the node `Blocked`; it never proceeds as owner and requires a fresh fencing proof to retry |
+| A lost CAS response does not promote | `Unavailable` and `Unknown` each leave the node `Blocked` under their own reason; neither proceeds as owner, and both require a fresh fencing proof to retry |
+| A successful rebuild leaves read-only mode | After the activation CAS commits, the recovery module re-emits its result with `mode: Active`; the transaction and publication modules leave `Frozen { RecoveryReadOnly }` on it. Without that emission a rebuilt partition stays read-only forever — **V3** |
 | Recovery catch-up is fence-gated | A `RecoveryAppend` with a superseded fence is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append would be |
 | A credential names its sender | A second regular member replaying a captured credential is rejected `NOT_A_MEMBER` |
 | Holder ≠ leader transfers land | The selected holder cannot lead: `CatchUpBeforeGrant` from the holder, credential `sender == holder`, every record accepted at the elected leader; the two-survivor case with the fenced node shorter likewise — **V3** |
