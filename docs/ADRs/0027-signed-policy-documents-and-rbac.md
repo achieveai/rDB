@@ -409,7 +409,9 @@ and G-09, and both are fixed here.
 `verify_policy` refuses a document naming a different cluster with the new reason
 `cluster_mismatch`. Without it, one ops key trusted by two clusters was enough for a
 higher-versioned document issued for cluster B to adopt cleanly on cluster A — every signature
-check passing, because every signature check was genuinely valid. The check lives in
+check passing, because every signature check was genuinely valid. This principle is also why G-13
+below does not gate a restore on the backup's policy version: the same reasoning that refuses a
+foreign cluster's document refuses a foreign cluster's version number. The check lives in
 `verify_policy` rather than in `adopt` because which cluster a document was issued for is a
 property of the document alone, independent of what is already in force, and that is the division
 of responsibility this ADR already draws between the two.
@@ -474,12 +476,91 @@ since the enum is `#[non_exhaustive]` and the mapping fails closed to "cannot" �
 in-memory behaviour unchanged. That is stated rather than hidden: with no durable store there is
 nowhere to put the floor, and inventing one would claim a guarantee the node cannot keep.
 
-**Known limit, carried rather than closed: a restore resets the floor (G-13).** `state_meta` is
-not carried in a snapshot body, so a directory restored from a backup starts at floor `0` and an
-old signed document adopts. G-09 ships with that bypass. It is recorded as a separate gap, with
-the fix being to seed the floor from the backup manifest's `policy_version_ref` at restore, and it
-is called out prominently at `RocksStore::policy_version_floor` so it is read by anyone relying on
-the floor as a security control rather than only by anyone reading this ADR.
+**Known limit, carried deliberately: a restore resets the floor (G-13).** `state_meta` is not
+carried in a snapshot body, so a directory restored from a backup starts at floor `0` and an old
+signed document adopts. G-09 ships with that bypass. It is called out at
+`RocksStore::policy_version_floor` so it is read by anyone relying on the floor as a security
+control rather than only by anyone reading this ADR.
+
+**Amended 2026-09-22: the fix this entry originally named cannot be built, and is withdrawn.** It
+said to seed the floor from the backup manifest's `policy_version_ref` at restore. The manifest
+exists only on the CLI restore path, and that path refuses a reused cluster id with
+`cluster_id_reused` (`config-server/src/backup.rs:880`, proven by `m5_admin.rs:763`). The library
+entry point `config_storage::restore_into_fresh_store` carries neither that refusal nor a manifest
+— its own doc comment at `snapshot.rs:1146-1149` says the refusals "are enforced by the CLI before
+this is called" — so it is not a site where this fix could be built either. The reference a
+restore could read is therefore always from a foreign lineage, whose version numbering is
+independent of the restored cluster's. Seeding it compares two unrelated integers: a legitimate
+new-lineage document, naturally at version 1, is refused as a rollback, and the node boots with no
+valid policy and denies every request. It is recoverable — the policy poller adopts a
+higher-numbered document without a restart — but the refusal reports only the token
+`rollback_floor`, never the two numbers it holds, so the operator is not told which version would
+be accepted; and the one actionable-looking error names `[authz] admins`, which signed mode does
+not consult (`run.rs:849`).
+
+**This is the same thing G-06 above exists to prevent.** G-06 refuses a document issued for
+another cluster precisely because one cluster's version numbers must not carry authority into
+another. A floor seeded across the same boundary is that defect wearing the other hat. Nothing in
+the original G-13 entry reconciled them.
+
+**`policy_version_ref` is evidence, not a gate**, which is what the `backup.rs:96-100` and
+`cli.rs:202-210` doc comments on the field have always said. Those two comments are **not**
+retired; they were correct and the charter was not. G-13 is therefore closed as a **design
+decision** rather than left open as a gap awaiting the withdrawn fix.
+
+**The residual exposure, stated plainly.** An operator who restores an old backup *and* supplies a
+correspondingly old signed document gets it adopted, with no refusal. That requires the signing key
+and a deliberate act, it is the same window that exists today, and nothing here widens it. Closing
+it needs a mechanism that does not depend on comparing version numbers across lineages; none is
+proposed here.
+
+**Restore-time policy evidence (G-13, chartered scope — NOT YET BUILT as of 2026-09-22).** Three
+changes, none a gate. All three are diagnostics, and none of them alters what the version gate
+accepts or refuses.
+
+> **Read this as a commitment, not as a description of shipped behaviour.** None of the three
+> exists in code at the time of writing. This entry is stated here because the withdrawn charter
+> above left a hole and an ADR that says only "the old fix is wrong" is worse than one that says
+> what replaces it. Anyone verifying the code against this ADR should expect all three to be
+> absent, and anyone citing it as coverage is citing a plan.
+>
+> The distinction matters because this very ADR's G-13 entry sat for a milestone as a chartered
+> fix nobody had built or checked, and the checking is what found it unbuildable. A forward
+> statement that does not label itself as forward becomes a stale gap list within one milestone.
+
+1. **The rollback refusal reports the numbers it already holds.** `PolicyRejected::RollbackFloor`
+   carries `floor` and `incoming` (`config-core/src/policy.rs:314-319`) and is emitted as the bare
+   token `"rollback_floor"` (`:358`), so neither number reaches the operator. A refusal that will
+   not say which version it would accept is the whole of the difficulty this gap actually causes.
+   **The token itself is pinned**: `ALL_REASONS` (`:368-379`) is a fixed `[&'static str; 10]` and
+   is the closed metric-label set, so this adds fields beside the token and never renames it.
+2. **The durable floor gets a reading that distinguishes absent from zero.**
+   `RocksStore::policy_version_floor` is `.unwrap_or_default()`, so "never seeded" and "seeded to
+   0" are one value, and G-13's founding premise was unmeasurable for as long as it has been
+   written down. `policy_version_floor_cell() -> Result<Option<u64>, String>` makes it checkable,
+   surfaced as one new field on `/health` beside `policy_state` and `policy_version`. `/health` is
+   chosen because it is the surface that still answers in the state actually reproduced: a booted
+   daemon in deny-all with the admin plane refusing. Note that `state_and_version`
+   (`config-server/src/health.rs:141-144`) reads one `Arc` and does **not** touch the floor; the
+   new field is read from the store's cell, and the M6-20 anti-tearing rationale does not extend
+   to it.
+3. **The offline backup path records the floor it can now read.** Both comments that justify its
+   `null` condition it on gap **G-09** (`backup.rs:103-107`, `:280-284`), and G-09 has closed: the
+   cell is durable at `config-storage/src/rocks.rs:197`. The value is read by a standalone
+   `snapshot::offline_policy_version_floor()` and lands in the **manifest**, where
+   `policy_version_ref` already lives — it does **not** ride back on `SnapshotHeader`, because
+   postcard is positional and that declaration is the on-disk layout (`snapshot.rs:210-221`).
+   The floor and the ref are not the same concept, and **they diverge on the main offline case**:
+   the floor is written after a successful adoption, so the crash window documented above leaves
+   it one version stale. That goes in the doc comment rather than being papered over.
+
+**Left open on purpose: the sentinel is still on the gate.** The new accessor gives a *reader* a
+true `Option<u64>`; the control reads `floor > 0 && to < floor`, where `floor > 0` is itself the
+absent-versus-zero sentinel, at the end of a chain the accessor does not cut. So `/health` reports
+the durable cell and the gate enforces on the in-memory atomic, and the two can disagree. Closing
+that changes a security control's behaviour, which is a different kind of change from adding
+evidence; folding it into the amendment that rules G-13 *not a gate* would repeat the mistake this
+amendment corrects. It is tracked as its own item with its own review.
 
 **Exposure accepted: an unreadable floor does not stop the node (lead ruling, 2026-09-20).** If
 reading the cell fails, the node logs `policy_floor_unreadable` at `error` and starts anyway. For

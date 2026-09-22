@@ -101,9 +101,19 @@ pub struct BackupManifest {
     /// a recovering operator can tell which document the data was authorized under.
     ///
     /// `null` when the exporting process had no active policy to name: a static-mode node, a
-    /// signed-mode node holding no valid document, and — until the policy version floor is
-    /// durable (gap G-09) — every backup taken by the offline CLI, which reads a stopped data
-    /// directory and runs no policy loader.
+    /// signed-mode node holding no valid document, and — for now — every backup taken by the
+    /// offline CLI, which reads a stopped data directory and runs no policy loader.
+    ///
+    /// **The offline half's stated reason has expired (2026-09-22).** It read "until the policy
+    /// version floor is durable (gap G-09)". G-09 has closed: the floor cell is durable at
+    /// `config_storage::RocksStore`'s `KEY_POLICY_VERSION_FLOOR`, and the offline path can reach
+    /// it off its read-only handle. Wiring that is tracked under ADR-0027's G-13 amendment. Until
+    /// it lands the offline value stays `None`, but no longer because nothing durable exists.
+    ///
+    /// When it does land, note what it will hold: the **floor**, meaning the version this node
+    /// last had in force, which is not the same as the document in force when the backup was
+    /// taken. They coincide for a cleanly stopped node and diverge for a crashed one, which is
+    /// the case the offline path exists for. This field is evidence and nothing enforces on it.
     pub policy_version_ref: Option<u64>,
     /// Wall-clock export time.
     pub created_unix_ms: u64,
@@ -280,8 +290,14 @@ pub fn backup_offline(
     // `None`, and not a guess: this process opened a **stopped** data directory and runs no
     // policy loader, so there is no active document for it to name. Recording a version it
     // cannot observe would be worse than recording none — the field is read by an operator
-    // mid-recovery, and a wrong breadcrumb is followed. The durable policy version floor
-    // (gap G-09) is what would let this path answer honestly.
+    // mid-recovery, and a wrong breadcrumb is followed.
+    //
+    // This used to name gap G-09 as what would let the path answer honestly. G-09 has closed
+    // (2026-09-22) and the durable floor is readable from here, so the remaining `None` is
+    // unlanded work under ADR-0027's G-13 amendment rather than a missing mechanism. The
+    // caution above still applies to the value that will replace it: the floor is the version
+    // last *in force*, which diverges from the document a backup was taken under whenever the
+    // node crashed between adoption and the floor write.
     let finished = finish_artifact(&header, &plaintext, out_dir, &name, keys, None);
     // Removed here, by the function that created it, on *both* paths. Leaving it behind on
     // failure would be worse than untidy: a `.snap` with no manifest is indistinguishable from

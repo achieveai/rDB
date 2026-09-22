@@ -163,9 +163,8 @@ Left open, owned by the next milestone, none of them a production claim:
 - At the in-flight cap the accept loop waits on the semaphore, so excess connections queue in
   the kernel backlog rather than being refused.
 - The drain predicate's clause (a) is a decode check, not a semantic one (ADR-0021 note 5).
-- M6-33 (`policy_version_ref` always `None`), M6-35 (no `restore_policy_mismatch` line), and a
-  continuation page served by a follower returning `Node` without a leader hint remain as
-  logged in the M6 test plan.
+- A continuation page served by a follower returns `Node` without a leader hint. Still open,
+  as logged in the M6 test plan.
 - The policy signature payload carries no domain-separation tag; ADR-0027's dated note forbids
   key reuse across payload types until one is introduced.
 
@@ -259,3 +258,37 @@ Both have the shape this branch kept producing: a documented behaviour with noth
 The other two instances were `bind_policy_version` and the schema decode fence. Worth stating
 plainly, because a sentence in a doc comment reads exactly like an enforced invariant and the
 only way to tell them apart is to look for the caller.
+
+## Note (2026-09-22): the gap list outlived two of its gaps
+
+M6-33 and M6-35 were removed from the "left open" list above. Neither was forgotten; both had
+already been worked, and leaving them listed cost more than dropping them would have.
+
+**M6-35 is closed.** `restore_policy_mismatch` exists and carries both versions
+(`crates/config-server/src/main.rs:228-236`), with two rows behind it:
+`m6_35_restore_records_a_policy_divergence_without_blocking` and
+`m6_35_restore_says_nothing_when_the_policy_versions_agree`
+(`crates/config-server/tests/m6_backup_policy.rs:367`, `:397`). Both landed in `096bbfa`.
+
+**M6-33 is closed on the admin plane** — the manifest carries the active policy version, row at
+`m6_backup_policy.rs:324` — and the offline CLI still writes `null`. `096bbfa` called that
+"narrows the gap, it does not close it", which was right on the day. It is no longer the same
+gap: both doc comments that justify the `null`
+(`crates/config-server/src/backup.rs:103-107` and `:280-284`) condition it on **gap G-09**, and
+G-09 closed in that same commit. The floor cell is durable at
+`crates/config-storage/src/rocks.rs:197`, and `export_snapshot` already reads seven other
+`state_meta` cells off its read-only handle (`crates/config-storage/src/snapshot.rs:938-951`,
+`offline_keys` at `:863-871`). The remaining work is tracked with the ADR-0027 G-13 amendment,
+not here.
+
+**Update, later the same day:** the ADR-0027 amendment landed its prose, and those two doc
+comments are no longer stale — each now says that G-09 has closed and that the remaining `None`
+is unlanded work rather than a missing mechanism. The *code* change is still unbuilt; ADR-0027's
+G-13 entry labels itself as a commitment for exactly that reason.
+
+**Why this note exists rather than a silent deletion.** M7 specified two pieces of work against
+these entries and a critic caught both before either was built. One of them was then withdrawn
+on the strength of half of a doc comment, which was also wrong. A closed gap left on a gap list
+is not harmless bookkeeping: it is a standing invitation to specify work that is already done,
+and the invitation was accepted twice in one day. A gap is checked against source before work is
+specified on it, and the entry is retired in the same change that closes it.

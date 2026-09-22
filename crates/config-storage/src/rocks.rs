@@ -1318,15 +1318,35 @@ impl RocksStore {
     /// once across that restore: an operator who restores an old backup and supplies an old
     /// signed document gets it adopted with no refusal.
     ///
-    /// That is a **known limit, not a design intent**. The floor closes the plain-restart path,
-    /// which is the routine one; it does not close the restore path. Closing it needs the
-    /// restore to seed this cell from the backup manifest's `policy_version_ref`, which is
-    /// tracked separately and is not what this cell does today.
+    /// That is a **known limit, carried deliberately**. The floor closes the plain-restart path,
+    /// which is the routine one; it does not close the restore path.
+    ///
+    /// **Amended 2026-09-22 (ADR-0027, G-13).** An earlier version of this comment said closing
+    /// it needs the restore to seed this cell from the backup manifest's `policy_version_ref`.
+    /// That fix is **withdrawn**, not merely untracked. The manifest exists only on the CLI
+    /// restore path, and that path refuses a reused cluster id, so the reference it could seed
+    /// from is always a foreign lineage's — an independent numbering system. Seeding it refuses
+    /// a legitimate new-lineage document at version 1 as a rollback and boots the node into
+    /// deny-all. `policy_version_ref` is **evidence, not a gate**. Closing the restore path needs
+    /// a mechanism that does not compare version numbers across lineages, and none is proposed.
+    ///
+    /// Note also that this accessor flattens `None` to `0`; the floor as it is actually on disk
+    /// is [`Self::policy_version_floor_cell`]. The `floor > 0` test in `config-core`'s version
+    /// gate is that same sentinel, and it is on the control rather than here.
     pub fn policy_version_floor(&self) -> Result<u64, String> {
-        Ok(
-            read_meta(&self.shared.db, CF_STATE_META, KEY_POLICY_VERSION_FLOOR)?
-                .unwrap_or_default(),
-        )
+        Ok(self.policy_version_floor_cell()?.unwrap_or_default())
+    }
+
+    /// The floor cell exactly as it is on disk: `None` when it has never been written.
+    ///
+    /// [`Self::policy_version_floor`] folds both of those into `0`, and the gate it feeds reads
+    /// `floor > 0 && ..`, so from outside the store a directory that was never seeded and one
+    /// seeded to zero are the same observable. That is fine for the gate — both mean "accept
+    /// the first document" — and not fine for anyone diagnosing a node that came up
+    /// `no_valid_policy`, because the first question there is whether a floor is present at
+    /// all. This is the read path that can answer it; the gate's semantics are unchanged.
+    pub fn policy_version_floor_cell(&self) -> Result<Option<u64>, String> {
+        read_meta(&self.shared.db, CF_STATE_META, KEY_POLICY_VERSION_FLOOR)
     }
 
     /// Record `version` as the policy version now in force (M6, ADR-0027, gap G-09).

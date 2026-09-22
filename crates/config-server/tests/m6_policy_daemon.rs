@@ -46,6 +46,29 @@
 //!   ops belong to dev-rotation/dev-rbac's own files; assembling all six here risked incomplete,
 //!   flaky coverage of RPCs this file does not otherwise exercise.
 //!
+//! ## Correction (lead, 2026-09-22): three of those six reasons have expired
+//!
+//! The list above is left as written — it was true on 2026-09-19 and it is a signed scope
+//! decision, not a status board. What has changed since:
+//!
+//! * **M6-33 and M6-35 are no longer product gaps on the admin plane.** Commit `096bbfa` made
+//!   the admin-plane manifest carry the active policy version, and `restore_policy_mismatch`
+//!   now exists at `crates/config-server/src/main.rs:228-236`. The "confirmed by grep" above
+//!   was accurate when run and has been false since. Rows landed in
+//!   `crates/config-server/tests/m6_backup_policy.rs:324`, `:367` and `:397`.
+//! * **M6-33's offline half is still open, for a reason that has also expired.** The offline CLI
+//!   writes `null`, and both comments justifying it condition that on gap G-09
+//!   (`backup.rs:103-107`, `:280-284`). G-09 closed in the same commit. Tracked with the
+//!   ADR-0027 G-13 amendment.
+//! * **M6-34's fixture was built on 2026-09-22** — a real daemon against a restored directory
+//!   under a second cluster identity, which is what this note records as absent. It exists as a
+//!   scratch reproduction only and is **not** a committed fixture or a row; do not cite it as
+//!   coverage.
+//!
+//! The reason this correction is here rather than an edit above: the stale entries were read as
+//! current twice in one day and work was specified against them both times. A gap is checked
+//! against source before work is specified on it.
+//!
 //! Also out of this file's assigned scope for this pass: **M6-110** (evidence,
 //! `config-testkit/tests/m6_evidence.rs`) and **E2E-40/42/44/45/46/47**
 //! (`config-server/tests/e2e_daemon.rs`) were not attempted this session; see the handoff.
