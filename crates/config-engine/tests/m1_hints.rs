@@ -171,10 +171,18 @@ fn ta7_an_accepted_hint_carries_nothing_a_caller_could_route_on() {
     );
     assert!(accepted.is_accepted());
     assert_eq!(accepted.reason(), None);
-    // `HintVerdict::Accepted` is a unit variant: there is no endpoint to be tempted by.
+    // The whole verdict is an optional reason string and nothing else, so an accepted one has
+    // no room for an endpoint. Until 2026-09-21 this line read
+    // `size_of_val(&accepted) == size_of::<HintVerdict>()`, which is true of every sized value
+    // in Rust whatever it holds — the row asserted nothing and would have passed with a
+    // routable field added (M0/M1 manual tester, candidate 1). Comparing against
+    // `Option<&'static str>` instead is a claim that can fail: a payload on either variant
+    // makes the enum wider than the reason it exists to carry. `HintVerdict::Accepted` gaining
+    // a field is also a compile error in `a10_...` below, which names the variant by path.
     assert_eq!(
-        std::mem::size_of_val(&accepted),
-        std::mem::size_of::<HintVerdict>()
+        std::mem::size_of::<HintVerdict>(),
+        std::mem::size_of::<Option<&'static str>>(),
+        "an accepted hint must carry no payload: the verdict is a reason or nothing"
     );
 }
 
