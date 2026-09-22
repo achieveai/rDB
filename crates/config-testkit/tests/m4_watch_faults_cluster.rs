@@ -258,6 +258,15 @@ async fn m4_23_compact_produces_no_event() {
 /// (leader-only) logging and an unchanged `compact_revision` on followers can observe from
 /// outside — the age map itself has no public accessor by design (it is private,
 /// leader-local, in-memory bookkeeping; see `NodeInner::receipts`).
+///
+/// **Measured 2026-09-21: this row does not catch the thing it is named for; its twin does.**
+/// Removing the leader-only gate in `NodeInner::evaluate_retention` (`node.rs:2200`), so that
+/// followers build an age map too, leaves this row **green** while `m4_29` below fails. The
+/// indirect observable is the reason: a follower cannot propose a compaction, so giving it an
+/// age map moves nothing this row can read, however long it waits. The 200ms is therefore not
+/// the weak part — no wait would make this assertion able to see the fault. Treat `m4_29` as
+/// the row that holds the leader-only rule, and read this one as what it can honestly claim:
+/// a follower's compaction watermark does not move on its own.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m4_28_follower_has_no_age_map() {
     let clock = ManualClock::new();
@@ -618,6 +627,19 @@ fn seed_principal() -> Principal {
 /// express (OQ-32: no revocation path exists in M4). `authorized()` cannot diverge from the
 /// prefix filter for any event this scenario can construct; the prefix filter is the real
 /// dependency this row's oracle observes.
+///
+/// **Re-measured 2026-09-21, and the argument above needs a second leg now that M6 has
+/// landed.** M6 made policy reloadable, so a document *can* arrive or roll back mid-watch
+/// without a restart (`node.rs:337-344`; `set_authz_ready` is called once at startup and never
+/// flipped). That retires the "non-reloadable" premise. Revocation is still enforced — but by
+/// the `PolicyChanged` termination path at `watch.rs:1449`, not by `authorized()`, and
+/// `m6_28_watch_on_a_changed_prefix_terminates_before_any_new_version_event` is the row that
+/// proves it. The equivalence survives, for a different reason than the one written above.
+///
+/// What no row covers either way: bypassing §11.3's per-event `authorized()` call outright
+/// leaves this file's 22 rows **and** `config-engine`'s `m6_rbac` 5 rows all green. It is
+/// defence in depth behind a mechanism that is tested, so this is a coverage gap rather than a
+/// live hole — but nothing would notice if the call were removed by accident.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m4_47_authorization_checked_per_event() {
     let cluster = Cluster::builder()
