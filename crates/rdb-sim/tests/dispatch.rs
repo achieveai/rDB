@@ -21,8 +21,8 @@ use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, EventKind, KernelEffect, ModuleName,
 };
 use rdb_core::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, Generation, MessageId, NodeId, OwnerEpoch, PartitionId,
-    ReplicaRole, ScenarioId, SnapshotHandle, TimerId, TimerVersion,
+    BootId, ConfigVersion, CorrelationId, EventId, Generation, MessageId, NodeId, OwnerEpoch,
+    PartitionId, ReplicaRole, ScenarioId, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::storage::StoreEffect;
 use rdb_core::contracts::time::{Tick, TimerEffect};
@@ -36,6 +36,7 @@ use rdb_sim::harness::dispatch::{Adopted, Dispatcher, HOP_BUDGET_MILLIS};
 use rdb_sim::harness::manifest::{resolve, BudgetOverride};
 use rdb_sim::harness::replay::replay;
 use rdb_sim::harness::trace::{read_jsonl, write_jsonl, Recorder, Site};
+use rdb_sim::sim::clock::Clock;
 use rdb_sim::sim::cluster::Cluster;
 use rdb_sim::sim::control::{ControlOp, ControlStore};
 use rdb_sim::sim::network::Network;
@@ -562,4 +563,85 @@ fn seam_of(result: Result<(), SimError>) -> &'static str {
         SimError::Unavailable { seam } => seam,
         other => panic!("an unbuilt seam must refuse as Unavailable, got {other:?}"),
     }
+}
+
+/// M7F-47, second row — two events at one tick pop in ascending `EventId` order.
+///
+/// Manual-tester finding F2, 2026-09-21. `sim/scheduler.rs`'s own doc states the contract —
+/// ordered by `(tick, event_id)`, and "the id is not decoration": spike §6 needs equal-time
+/// events to have a stable order, because H1's acceptance claim is that one event log replays to
+/// a byte-identical trace. Nothing scheduled two events at the same tick and checked the order.
+/// Inverting the tie-break to `(at, u64::MAX - id)` left the whole workspace green, 147/147.
+///
+/// Scheduling the higher id first is the point: a queue that happens to preserve insertion order
+/// would pass a test that inserted them in the order it expected back.
+#[retcd_test]
+fn m7f_47_two_events_at_one_tick_pop_in_ascending_event_id_order() {
+    support::preamble();
+    let mut scheduler = Scheduler::new();
+    let at = Tick(500);
+
+    for id in [EventId(9), EventId(2), EventId(5)] {
+        scheduler
+            .schedule(rdb_core::contracts::event::Event {
+                id,
+                at,
+                ..support::probe_event()
+            })
+            .expect("three distinct ids at one tick are three events");
+    }
+
+    let popped: Vec<EventId> = std::iter::from_fn(|| scheduler.pop())
+        .map(|e| e.id)
+        .collect();
+    assert_eq!(
+        popped,
+        vec![EventId(2), EventId(5), EventId(9)],
+        "equal-tick events are ordered by id, ascending — they were scheduled 9, 2, 5, so an \
+         insertion-ordered queue would answer 9, 2, 5 and a descending tie-break 9, 5, 2"
+    );
+}
+
+/// M7F-47, third row — a timer re-armed at the same or a lower version is refused.
+///
+/// Manual-tester finding F3, 2026-09-21, and the wider finding is the one worth keeping: **no
+/// test file in this crate referenced `Clock`, `.arm(`, `.due(` or `.cancel(` at all**, so
+/// H1's "stale timer version is ignored" claim had no subject. Deleting `arm`'s version guard
+/// outright left the workspace green.
+///
+/// Half of H1's claim is the kernel's ("the kernel ignores a stale fire") and cannot be tested
+/// while every kernel module is unwired — `m7f_01` is the row that says so. This row asserts the
+/// half foundation owns: the environment must not let a stale re-arm overwrite a live one, or
+/// the fire the kernel is supposed to reject never carries a stale version in the first place.
+#[retcd_test]
+fn m7f_47_a_timer_rearmed_at_the_same_or_lower_version_is_refused() {
+    support::preamble();
+    let mut clock = Clock::new(0);
+    let id = TimerId(1);
+    let armed = Tick(100);
+
+    clock
+        .arm(NODE, id, TimerVersion(2), armed)
+        .expect("the first arm of a timer is always accepted");
+
+    for stale in [TimerVersion(2), TimerVersion(1)] {
+        assert_eq!(
+            clock.arm(NODE, id, stale, Tick(900)),
+            Err(rdb_sim::SimError::Config { field: "version" }),
+            "a re-arm at version {stale:?} is not above the armed version 2, and accepting it \
+             would let a fire carrying a stale version pass the kernel's own check"
+        );
+    }
+
+    let fired = clock.due(Tick(1_000));
+    assert_eq!(
+        fired.len(),
+        1,
+        "one timer was armed, so exactly one fires — a refused re-arm must not queue a second"
+    );
+    assert_eq!(
+        (fired[0].1.version, fired[0].1.scheduled_at),
+        (TimerVersion(2), armed),
+        "the surviving arm is the original: version 2 at tick 100, not either refused re-arm"
+    );
 }

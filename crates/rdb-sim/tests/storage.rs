@@ -11,11 +11,14 @@
 
 mod support;
 
+use bytes::Bytes;
 use config_log::retcd_test;
 use rdb_core::contracts::ids::{
-    AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, SnapshotHandle,
+    AppliedSeq, BatchId, DurableSeq, Generation, NodeId, PartitionId, Seq, SnapshotHandle,
 };
-use rdb_core::contracts::storage::{CapturedPrefix, Namespace, SnapshotRead, StorageFault};
+use rdb_core::contracts::storage::{
+    Batch, CapturedPrefix, Namespace, SnapshotRead, StorageFault, Write,
+};
 use rdb_sim::storage::crash_image::{CrashImage, SurvivingPrefix};
 use rdb_sim::storage::memory::MemoryEngine;
 use rdb_sim::storage::snapshot::EmptySnapshot;
@@ -276,5 +279,70 @@ fn m7f_18_misdirected_faults_are_refused_at_injection() {
             fault: StorageFault::FlushFailed,
         }),
         Err(rdb_sim::SimError::Config { field: "fault" })
+    );
+}
+
+/// M7F-06, second row — a failed commit keeps **none** of a multi-write batch.
+///
+/// Manual-tester finding F4, 2026-09-21, and the finding is about the fixture, not the row.
+/// `MemoryEngine::commit`'s doc states "whole batch or none: a planned failure is decided before
+/// the first write". Every existing row that commits builds its batch with `support::batch`,
+/// which constructs **exactly one** write. A one-write batch cannot tell "whole batch or none"
+/// from "first write or none", so moving the fault check from before the loop to inside it — so
+/// that write 0 lands and write 1 fails — left the whole workspace green, 149/149.
+///
+/// This row therefore builds its `Batch` directly instead of through the helper. Two writes are
+/// the minimum that can distinguish the two readings, and asserting on **both** keys is the
+/// point: checking only the second would pass against the very mutation that leaks the first.
+#[retcd_test]
+fn m7f_06_a_failed_commit_keeps_none_of_a_multi_write_batch() {
+    support::preamble();
+    let mut engine = MemoryEngine::new(NODE);
+
+    engine
+        .inject(StorageOp::Fail {
+            node: NODE,
+            fault: StorageFault::WriteFailed,
+        })
+        .expect("a write fault is plannable on this engine");
+
+    let batch = Batch {
+        id: BatchId(1),
+        partition: PARTITION,
+        generation: GENERATION,
+        seq: Seq(1),
+        writes: vec![
+            Write {
+                ns: Namespace::User,
+                key: Bytes::from_static(b"first"),
+                value: Some(Bytes::from_static(b"1")),
+            },
+            Write {
+                ns: Namespace::User,
+                key: Bytes::from_static(b"second"),
+                value: Some(Bytes::from_static(b"2")),
+            },
+        ],
+    };
+
+    assert_eq!(
+        engine.commit(batch),
+        Err(StorageFault::WriteFailed),
+        "the planned fault is the commit's answer"
+    );
+
+    for key in [b"first".as_slice(), b"second".as_slice()] {
+        assert_eq!(
+            engine.version_of(PARTITION, Namespace::User, key),
+            None,
+            "a failed commit touches nothing, so {} must not exist — a fault decided inside \
+             the write loop instead of before it leaks every write ahead of the failing one",
+            String::from_utf8_lossy(key)
+        );
+    }
+    assert_eq!(
+        engine.buffered_applied(PARTITION, GENERATION),
+        AppliedSeq(0),
+        "and the applied watermark never moved"
     );
 }
