@@ -504,3 +504,76 @@ fn m7a_33_admission_cap_is_exactly_three() {
         "M7A-33: reaching the cap never provokes a reload"
     );
 }
+
+/// M7A-28, second row — the resumed watch starts after the *snapshot* revision, and `M7A-28`
+/// alone cannot tell that from the stale cursor.
+///
+/// Manual-tester finding K7, 2026-09-21. `M7A-28`'s closing assertion compares the resumed
+/// `Watch { from }` against `driver.kernel.cursor(prefix)` — the kernel's own state. A mutation
+/// that makes [`on_family_snapshot`] keep the pre-gap cursor instead of adopting the snapshot
+/// revision moves **both** sides of that equality together, so the row passes while resuming at
+/// a revision the snapshot is not coherent at. The tester applied exactly that mutation: `M7A-28`
+/// stayed green.
+///
+/// This is the same defect shape as K4 one row below: an assertion that reads its expected value
+/// out of the thing under test. The fix is the same — get the expectation from somewhere the
+/// mutation does not reach. Here that is the cursor captured *before* the gap, plus unrelated
+/// committed writes that force the snapshot revision strictly past it. Without those writes the
+/// two revisions coincide in this fixture and the row is vacuous for a second reason.
+#[retcd_test]
+fn m7a_28_resumed_watch_uses_the_snapshot_revision_not_the_stale_cursor() {
+    support::preamble();
+    let mut driver = Driver::new();
+    driver.become_held();
+    let _ = driver.take_reloads();
+
+    // The expectation, taken before the mutation's reach: where each family's watch stood when
+    // the stream was healthy.
+    let stale: Vec<(ControlPrefix, Revision)> = [ControlPrefix::Grants, ControlPrefix::Partitions]
+        .into_iter()
+        .filter_map(|prefix| driver.kernel.cursor(prefix).map(|at| (prefix, at)))
+        .collect();
+    assert!(
+        !stale.is_empty(),
+        "the row is only a test if some family had a cursor to go stale"
+    );
+
+    // Commit changes the kernel is never shown, so the store's revision runs ahead of every
+    // cursor above. This is what makes the two candidate answers different values.
+    for i in 0..8_u32 {
+        driver.create(ControlKey::Partition(PartitionId(7_000 + i)), b"p");
+        driver.discard_completions();
+    }
+
+    let reload_effects = driver.terminate(WatchTermination::ResourceExhaustedResumable);
+    assert!(
+        !driver.take_gapped_families().is_empty(),
+        "a gap must actually have been delivered"
+    );
+
+    let rewatch = driver.submit_and_complete(&reload_effects);
+    let resumed: Vec<_> = rewatch
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Watch { prefix, from }) => Some((*prefix, *from)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !resumed.is_empty(),
+        "the reload must be followed by a resumed watch, or the gap is never closed"
+    );
+
+    for (prefix, from) in resumed {
+        let Some((_, was)) = stale.iter().copied().find(|(p, _)| *p == prefix) else {
+            continue;
+        };
+        assert!(
+            from > was,
+            "the resumed watch on {prefix:?} starts after the snapshot revision, not the cursor \
+             it held before the gap: resumed from {from:?}, stale cursor was {was:?}. Eight \
+             committed writes separate them, so equality here means the snapshot revision was \
+             never adopted"
+        );
+    }
+}
