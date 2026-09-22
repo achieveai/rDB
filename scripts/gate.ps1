@@ -20,6 +20,12 @@
     rdb-* dependency of any kind, dev and build included, because a dev-dependency is how the
     reverse edge would arrive first.
 
+    The purity stage is the third non-cargo check, and row M7F-42: rdb-core's [dependencies]
+    are the five ADR-rdb-0002 names, nothing under crates/rdb-core/src reaches a clock, a
+    random source, the filesystem, the network, a thread or async, and no HashMap sits on a
+    path a trace reaches. It lives in scripts/purity-check.sh and this script calls it, for
+    the same reason the drift stage does.
+
     The drift stage is the second non-cargo check. Every M7 test plan declares the contract
     commit its section 15 was written against; this fails when that commit is no longer the
     newest one to touch crates/rdb-core/src/contracts. All four teams held a stale basis at
@@ -30,7 +36,7 @@
     Kept in sync with scripts/gate.sh.
 
 .PARAMETER Stage
-    fmt, deps, drift, lint, test, or all (the default).
+    fmt, deps, drift, purity, lint, test, or all (the default).
 
 .PARAMETER CargoArgs
     Extra arguments passed through to cargo, for narrowing a test stage.
@@ -45,7 +51,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('fmt', 'deps', 'drift', 'lint', 'test', 'all')]
+    [ValidateSet('fmt', 'deps', 'drift', 'purity', 'lint', 'test', 'all')]
     [string]$Stage = 'all',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$CargoArgs = @()
@@ -94,22 +100,28 @@ function Test-Deps {
     }
 }
 
-function Test-Drift {
-    # One implementation of the rule, in scripts/drift-check.sh. Restating it here in
-    # PowerShell would be a second source of truth, which is the thing the drift table itself
-    # keeps getting wrong.
+# `$Name` rather than `$Stage`, which would shadow this script's own parameter.
+function Invoke-BashCheck([string]$Script, [string]$Name) {
+    # One implementation of each rule, in its own shell script. Restating either of them here in
+    # PowerShell would be a second source of truth, which is the thing both checks exist to
+    # catch: the drift table itself keeps getting it wrong.
     $bash = (Get-Command bash -ErrorAction SilentlyContinue).Source
     if (-not $bash) {
         # Not skipped. A gate that quietly drops a check is worse than one that stops.
-        throw 'drift: bash not found. It ships with Git for Windows, which this repo already requires.'
+        throw "${Name}: bash not found. It ships with Git for Windows, which this repo already requires."
     }
-    & $bash 'scripts/drift-check.sh'
-    if ($LASTEXITCODE -ne 0) { throw "drift: check failed (exit $LASTEXITCODE)" }
+    & $bash $Script
+    if ($LASTEXITCODE -ne 0) { throw "${Name}: check failed (exit $LASTEXITCODE)" }
 }
+
+function Test-Drift { Invoke-BashCheck 'scripts/drift-check.sh' 'drift' }
+
+function Test-Purity { Invoke-BashCheck 'scripts/purity-check.sh' 'purity' }
 
 if ($Stage -in 'fmt', 'all')  { Write-Host '== fmt';    Invoke-Cargo @('fmt', '--all', '--check') }
 if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
 if ($Stage -in 'drift', 'all') { Test-Drift }
+if ($Stage -in 'purity', 'all') { Test-Purity }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
 if ($Stage -in 'test', 'all') {
     Write-Host '== test'

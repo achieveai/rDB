@@ -20,8 +20,8 @@
 # how the reverse edge would arrive first.
 #
 # Usage:
-#   scripts/gate.sh                            fmt + deps + drift + clippy + test
-#   scripts/gate.sh fmt|deps|drift|lint|test   one stage
+#   scripts/gate.sh                                   fmt + deps + drift + purity + clippy + test
+#   scripts/gate.sh fmt|deps|drift|purity|lint|test   one stage
 #   scripts/gate.sh test -p config-engine --test m4_watch    extra args go to cargo
 
 set -euo pipefail
@@ -50,6 +50,10 @@ run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
 # All four teams held a stale basis at once on 2026-09-20, and a stale basis always over-holds:
 # rows report Unavailable on types that have already landed. See scripts/drift-check.sh.
 run_drift() { scripts/drift-check.sh; }
+# The third non-cargo check, row M7F-42: rdb-core is a pure fold and no trace path is
+# unordered. The rule lives in scripts/purity-check.sh, for the reason the drift stage gives
+# above — two copies of a rule drift apart.
+run_purity() { scripts/purity-check.sh; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
 # `--workspace` is dropped when the caller names a package. Cargo treats `--workspace -p x` as
 # the workspace: the `-p` is not an error, it is ignored, and a "scoped" run on 2026-09-21 ran
@@ -90,10 +94,11 @@ case "$stage" in
   fmt)   run_fmt ;;
   deps)  run_deps ;;
   drift) run_drift ;;
+  purity) run_purity ;;
   lint)  run_lint ;;
   test)  run_test "$@" ;;
-  all)   run_fmt && run_deps && run_drift && run_lint && run_test ;;
-  *)     echo "unknown stage: $stage (expected fmt, deps, drift, lint, test or all)" >&2; exit 1 ;;
+  all)   run_fmt && run_deps && run_drift && run_purity && run_lint && run_test ;;
+  *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, test or all)" >&2; exit 1 ;;
 esac
 
 echo "gate: $stage OK"
