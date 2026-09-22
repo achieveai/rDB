@@ -109,6 +109,27 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   14 MB and a few seconds, tracked files only, working tree never read or written. Give it its
   own `CARGO_TARGET_DIR` inside the export, and keep the path short — a deep temp path plus
   Rust's own nesting reaches Windows' `MAX_PATH`. Delete the export afterwards.
+- **"Afterwards" means after whoever is working in it has finished.** An export is somebody's
+  workspace: their mutation backups, their run logs, the evidence their report rests on. On
+  2026-09-21 the lead re-exported a tester's directory at a newer commit while that tester was
+  mid-run; `rm -rf` reported `Device or resource busy` and removed everything except the one
+  file cargo still held, so the export was neither the old one nor a clean new one. Give each
+  agent its own path, write the basis commit into the export (`echo <sha> > EXPORT_BASIS`) so a
+  report can cite it, and re-export only on that agent's word. An agent that has no git access
+  asks the lead for the export rather than copying the working tree, which carries everyone
+  else's uncommitted changes.
+- **Delete only your own export path, and only your own.** The same fault happened twice on
+  2026-09-21, the second time by an agent that finished, took a sibling's directory for a stray,
+  and removed it while that agent's build was live. A brief that ends "delete the export when
+  done" must name one path and forbid the rest; a directory that looks stale gets reported, not
+  removed. A partially removed export is the dangerous state: it still looks like a checkout, so
+  the next command runs against a tree that is neither basis.
+- **A run that abandons a local cluster must still bring it down.** `scripts/local-cluster.sh
+  down` then `clean`, before anything deletes the directory: the daemons outlive the agent and
+  the directory, and the next run's port collision looks like a build failure. Check with
+  `tasklist //FI "IMAGENAME eq config-server.exe"`. On this host `mongod` holds 27021 and 27031,
+  so a dev cluster near `--base-port 27000` can collide with something that is not rEtcd's —
+  identify a listener before assuming it is yours, and never kill one you have not identified.
 - **Never `git stash`, `reset`, `checkout`, `restore` or `clean` to get a clean tree here.** One
   of those discards every other agent's uncommitted work, and their handoffs are the only record
   that it existed. There is no undo. The export above is the substitute, and it is cheaper.
