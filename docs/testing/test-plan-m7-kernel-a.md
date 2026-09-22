@@ -354,7 +354,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-21 | `renewal_read_same_grant_same_boot_no_fence` | twin of M7A-19 and M7A-20 (one fact each: `boot_id: ours`, `authority_generation: ours`) | `Found{grant_id: ours, boot_id: ours, authority_generation: ours, frozen: false}` | no `Fence`; `record_revision` updated | unit | none |
 | M7A-22 | `fenced_then_cas_applied_late_renewal_ignored` | §2.4 `Fenced \| CasApplied ⇒ Fact(LateRenewalIgnored)` · ADR 0008 §7 item 7 | `Fenced{Expired}`; `CasResult{Committed(50)}` for the outstanding renewal | effects = `[Fact(LateRenewalIgnored)]`; state still `Fenced`; `expiry_utc_ms` not written | unit | none |
 | M7A-23 | `fenced_is_terminal_until_new_grant_id` | §2.1 "Fenced terminal; exit only via new grant id" | `Fenced`; `RenewDue`, `Tick`, `ClockSample(valid)`, `Watched` ×N | zero `Cas` effects; state `Fenced` through all; only a fresh `AcquireDue` (new grant id) produces a create-only `Cas` | unit | none |
-| M7A-24 | `unbounded_mode_does_not_burn_grant_ids` | ADR 0007 "Unbounded mode does not burn grant ids" (amended round 2: **with a valid sample**, exactly one id) · §2.3 two-condition paragraph · K-A-07 | `Unheld`, `ClockView{mode: Unbounded}` **with** a valid fresh sample; `AcquireDue`, then 20 renewal intervals of `RenewDue`/`Tick` | exactly **one** create-only `Cas` (the `E_new` rule allows acquisition); every checkpoint answers `Deny(ClockUnbounded)` throughout; no second grant id is ever requested (no fence-and-reacquire loop). The **no-sample** condition is M7A-148 (zero CASes) | unit | K-A-36 |
+| M7A-24 | `unbounded_mode_does_not_burn_grant_ids` | ADR 0007 "Unbounded mode does not burn grant ids" (amended round 2: **with a valid sample**, exactly one id) · §2.3 two-condition paragraph · K-A-07 | `Unheld`, `ClockView{mode: Unbounded}` **with** a valid fresh sample; `AcquireDue`, then 20 renewal intervals of `RenewDue`/`Tick` | exactly **one** create-only `Cas` (the `E_new` rule allows acquisition); every checkpoint answers **`Deny(ClockModeUnbounded)`** throughout — *re-pointed by A-R42*, since `ClockUnbounded` is now the fence-reachable half and this row's whole subject is the configured mode, which must not fence; no second grant id is ever requested (no fence-and-reacquire loop). The **no-sample** condition is M7A-148 (zero CASes). **Not written as of 2026-09-22** — the census shows zero `m7a_24_*` functions, so "does M7A-24 pass now" has no answer; `crates/rdb-core/tests/authority_clock_mode.rs` covers the held-grant half of the same claim in the meantime and is not a substitute for this row's grant-id count | unit | K-A-36 |
 | M7A-25 | `local_storage_failure_fences_partition_stays_held` | §2.4 `LocalStorageFailure ⇒ Fence{Partition, LocalStorageFenced}` · ADR 0007 §3 partition scope | `Held`; `LocalStorageFailure{p1}` | `Fence{Partition(p1), LocalStorageFenced}`; `storage_fenced == {p1}`; state `Held`; `may_admit(p2) == Allow` | unit | none |
 | M7A-26 | `revoke_epoch_persist_then_fence_epoch_revoked` | §2.4 `RevokeEpochRequested ⇒ PersistEpochRevocation`; `EpochRevocationPersisted ⇒ Fence{Partition, EpochRevoked}` · ADR 0007 §3 "epoch revoked via durable drain" | `RevokeEpochRequested{p1, e3}`; then `EpochRevocationPersisted{p1, e3}` | first: effects = `[Store(PersistEpochRevocation)]`, no `Fence`; second: `Fence{Partition(p1), EpochRevoked}`; `revoked_epochs ∋ (p1, e3)` (twin: the first half alone) | unit | none |
 | M7A-27 | `renewed_expiry_no_runaway_ten_minutes` | ADR 0007 "renewed expiry no runaway (10 min of renewals)" · A-R11 | 1,200 × (`ClockSample`, `RenewDue`, `Committed`) at 500 ms cadence, ε 20 | at every step `expiry_utc_ms ≤ extrapolated_utc(dispatch tick) + 3000`; the sequence of `E` is monotone with step exactly 500 ms | unit | none |
@@ -366,7 +366,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-28 | `watch_gap_revision_compacted_read_family_and_rewatch` | §2.4 "WatchGap RevisionCompacted ⇒ ReadFamily + re-Watch" · ADR 0007 "coherent watch resync" · ADR 0008 §7 item 3 | `Held`; `TerminateWatch{node, termination: RevisionCompacted{minimum_available_revision}}`; then the fake's `FamilySnapshot{prefix, snapshot_revision: r, records}` completion | **two steps, in this order.** At the termination: effects = `[Control(Reload{prefix})]` — the family read is `Reload`, never `Get{family}`, which `ControlKey` cannot express (TD-12; KA-2). At the snapshot: effects = `[Control(Watch{prefix, from: r})]` — **`from: r`, not `r + 1`** (TD-18). `from` is **exclusive** on both sides of the seam: `ControlEffect::Watch`'s doc says it delivers changes *after* `from`, `FamilySnapshot.snapshot_revision` is documented as what the resumed watch *starts after*, and foundation's fake filters `*revision > watch.cursor` at `sim/control.rs:233`. `from: r + 1` would therefore silently drop a change at exactly `r + 1` — a one-revision gap opened by the row that certifies the resync path has none, and one no fixture notices unless it places a change at that revision. The row places one there, so the `+1` spelling is red | unit | none |
 | M7A-29 | `watch_gap_lagged_resumable_read_family_and_rewatch` | §2.4 "LaggedResumable" (one fact vs M7A-28: termination kind) | `TerminateWatch{ResourceExhaustedResumable}` | same effect shape as M7A-28 | unit | none |
 | M7A-30 | `watch_not_leader_or_unavailable_read_and_backoff_no_read_family` | §2.4 "NotLeader\|Unavailable ⇒ Read + backoff" | `TerminateWatch{node, NotLeader}` and, in the same test, `TerminateWatch{node, Unavailable}` | effects = `[Control(Get{Grant(us)}), Timer(backoff)]` — `Get` of one record, which is what `ControlKey` names; **zero `Control(Reload{..})`**, the family read these two terminations must *not* trigger (`WatchTermination::is_gap` is false for both); state `Held` | unit | none |
-| M7A-31 | `watch_admission_refused_fact_bounded_backoff_no_reload_loop` | §2.4 "AdmissionRefused ⇒ Fact + bounded backoff, no ReadFamily, cap" · ADR 0008 "admission-limit not reload loop" | `TerminateWatch{node, ResourceExhaustedFatal}` ×20 | each: `[Fact(AdmissionRefused), Timer(backoff_n)]`; `backoff_n` non-decreasing and `backoff_20 == cap`. **The reload count is M7A-129's**, asserted once, not twice: round 4 wrote "zero `Get{family}`; zero `Reload`" here, of which the first conjunct was unconstructable (TD-12) and the second duplicated M7A-129, leaving M7A-129 with nothing of its own. This row now owns the backoff shape and the cap; M7A-129 owns the count | unit | none |
+| M7A-31 | `m7a_31_watch_admission_refusal_backs_off_and_never_reloads` **and** `m7a_31_watch_admission_cap_is_exactly_three_and_latches` (`crates/rdb-sim/tests/authority.rs`) | §2.4 "AdmissionRefused ⇒ Fact + bounded backoff, no ReadFamily, cap" · ADR 0008 "admission-limit not reload loop" · lead rulings A-R41, A-R44 | `TerminateWatch{node, ResourceExhaustedFatal}`, repeated. One call ends **both** watched families, so the shared counter advances by 2 per call and the cap is judged per family within a call | **Two rows, because the ruled vectors differ and one of them is an absence.** Under cap: `[Ignored(Authority(AdmissionRefused)), Timer(Arm WatchBackoff)]` — **no** immediate `Watch`, which is the assertion that had no subject until `AuthorityTimer::WatchBackoff` was built. At cap: `[Fact(WatchAdmissionExhausted)]` with **no** `Timer` and no `Watch` — *the absent re-arm is the claim*, and no `Ignored` either, since the fact and `AdmissionRefused` are one arm apart precisely so this cannot pass on the under-cap reason. Back-off shape: non-decreasing over attempts 0..20 and `backoff_20 == cap`, asserted against `Authority::watch_backoff_millis` **plus** the two attempts the event path reaches — the cap latches at 3, so 20 refusals are undrivable and asserting only the two reachable ones would be a claim about a curve from two of its points. Positive control: firing the armed timer re-watches both families, so the row proves a back-off and not a stop. **Three spellings, contract wins**: `design.md:1087` says `WatchAdmissionRefused` (in no contract at all), this plan said `Fact(AdmissionRefused)`, the landed name is `AuthorityIgnoreReason::AdmissionRefused` — an *ignore reason*, never a fact. Second homograph on this one row; the first is §2.4's input `WatchGap{AdmissionRefused}`, really `WatchTermination::ResourceExhaustedFatal`. **The reload count is M7A-129's**, asserted once, not twice: round 4 wrote "zero `Get{family}`; zero `Reload`" here, of which the first conjunct was unconstructable (TD-12) and the second duplicated M7A-129. This row owns the backoff shape, the cap and the latch; M7A-129 owns the count | unit | none |
 | M7A-32 | `no_read_family_without_a_termination` | ADR 0008 §7 item 4 as restated by A-R15, verbatim: *"no coherent family reload occurs unless a termination was delivered"* · ADR 0008 §4 "a stream that has not terminated has **not** silently skipped an event" | **two arms in one test, on one kernel.** Arm 1 (negative): `Held` and watching; 200 `EmitWatch` deliveries carrying real `ControlChange`s across both families, interleaved with 50 `EmitProgress`, and **no** `TerminateWatch` at any point. Arm 2 (positive control, same kernel, immediately after): one `TerminateWatch{node, RevisionCompacted{..}}` | **Arm 1: count of `Control(Reload{..})` emitted across all 250 events == 0.** Arm 2: **exactly 1**, for the terminated family only. Both numbers are stated because both are load-bearing. Zero is correct in arm 1 because `Reload` is the sanctioned answer to a **gap**, and the only thing that declares a gap is `WatchTermination::is_gap` — rEtcd's stream does not skip silently (ADR 0008 §4), so a live stream has nothing to reload against; a kernel that reloads on a `Watched` or a `WatchProgress` turns cache invalidation into a poll and is the exact defect the ADR item exists to catch. **Round 4 asserted this count over `Control(Get{family})`, a shape `ControlKey` cannot express, so it was zero in every possible run — including the reload-on-every-event run — and §12 reported the ADR item covered while nothing tested it (TD-12, the blocker).** Arm 2 exists so the counter is proven live **inside this test**: without it a `Reload` count of zero is again unfalsifiable by inspection, since a row cannot tell a kernel that never reloads from a metric that never moves. M7A-28 asserts the shape of the arm-2 reload; this row asserts only that it happened exactly once and that arm 1 produced none | unit | none |
 | M7A-33 | `watch_resync_state_equals_uninterrupted_watch` | ADR 0007 "coherent watch resync" | two kernels: A gets events 1..10 uninterrupted; B gets 1..5, `RevisionCompacted`, `FamilySnapshot` at revision of event 8, re-watch 9..10 | A's and B's `served`, `revoked_epochs`, `partitions_revision` are equal after event 10 | unit | none |
 | M7A-34 | `watch_event_never_grants` | ADR 0008 "watch never grants" · §2.4 | `Unheld`; `Watched{prefix: grants, changes: [ControlChange{key: Grant(us), revision: r}]}` where the record at `r` **does** name us as owner (TD-17: `Found{owner: us}` is a read answer, not a watch payload — the point of the row is that A1 cannot see it until it reads) | effects = `[Control(Get{Grant(us)})]`; state `Unheld`; `may_admit() == Deny(NoGrant)` — A1 is still `Unheld` **after** the change that would have made it the owner, because only the `Get` answer grants | unit | none |
@@ -390,7 +390,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-47 | `process_resumed_gap_over_tolerance_fences` | §2.4 `ProcessResumed gap > tolerance ⇒ fence` · ADR 0007 "pause/suspend" · charter "pause/suspend fail closed" · spec §7.2 | `NodeLifecycle::Resumed{gap: tolerance + 1}` | `Fence{Node, ProcessSuspended}` (twin: M7A-48) | unit | C0 `NodeLifecycle`; §13 Q-5 |
 | M7A-48 | `process_resumed_gap_within_tolerance_no_fence` | twin of M7A-47 (one fact: `gap: tolerance`) | as M7A-47 | no `Fence`; state `Held` | unit | C0 |
 | M7A-49 | `boot_observed_mismatch_fences_boot_mismatch` | §2.4 `BootObserved mismatch ⇒ fence` · ADR 0007 §3 "reboot / boot UUID" | `NodeLifecycle::Rebooted{boot_id: other}` | `Fence{Node, BootMismatch}` (twin: same boot id ⇒ nothing, in the same test) | unit | C0 |
-| M7A-50 | `fence_scope_table_seven_node_two_partition` | ADR 0007 §3 fence trigger table with Scope column · ADR 0007 "fence scope" · KA-7 | one fresh `Held` kernel per trigger: clock over bound, backward jump, resume gap, reboot, authority-generation change, grant frozen/revoked/absent/other id, conservative expiry; epoch revoked (persisted), local storage failure | each trigger emits exactly one `Fence`; the seven emit `scope: Node` and leave state `Fenced`; the two emit `scope: Partition(p)` and leave state `Held`; the match over `DenyReason` is exhaustive | unit | none |
+| M7A-50 | `fence_scope_table_seven_node_two_partition` | ADR 0007 §3 fence trigger table with Scope column · ADR 0007 "fence scope" · KA-7 | one fresh `Held` kernel per trigger: clock over bound, backward jump, resume gap, reboot, authority-generation change, grant frozen/revoked/absent/other id, conservative expiry; epoch revoked (persisted), local storage failure | each trigger emits exactly one `Fence`; the seven emit `scope: Node` and leave state `Fenced`; the two emit `scope: Partition(p)` and leave state `Held`. **Plus the A-R33b membership split, restated for A-R42: exactly 10 of `DenyReason`'s 16 variants are reachable as a fence and the other six are deny-only.** Deny-only: `NoGrant`, `ExpiryUnproven`, **`ClockModeUnbounded`**, `ClockSampleStale`, `SelfFenced`, `ControlUnavailable`. Was 10 of 15 with five deny-only; A-R42 split `ClockUnbounded` and the new half is deny-only, so the **fence-reachable count does not move** — that is the point of the ruling, and a row that reported 11 would be reporting the defect. Three caveats the row must carry, none of which it may paper over: (a) per A-R44 `SelfFenced`, `ControlUnavailable` and `ExpiryUnproven` have **zero producers in this build**, so for those three "never a fence reason" is unfalsifiable and the row says *unreachable*, not *deny-only*; (b) `NoGrant` and `ClockSampleStale` are genuinely produced and carry their half; (c) `ClockModeUnbounded` is genuinely produced and **is** falsifiable — `crates/rdb-core/tests/authority_clock_mode.rs` is the standing guard, so this row may assert it rather than merely list it. Round 4's "the match over `DenyReason` is exhaustive" is withdrawn: it could not compile against the ten that exist | unit | none |
 
 ### 3.5 Takeover and `FencingProof` (design §2.6; ADR 0007; spec §7.3)
 
@@ -955,9 +955,359 @@ The membership of this table is checked in **both** directions now: a row is hel
 dependency it actually names in its Input or Assertion, and a row that names an absent type is in
 the table. M7A-105 joined under that rule and M7A-111 and M7A-118 left under it.
 
+### Lead rulings A-R25 … A-R30 — A1's vocabulary, clock and state (2026-09-22)
+
+Ruled on a survey whose load-bearing citations I re-read myself. What each ruling costs foundation
+is stated, because the whole point of the arm shape is that the answer is *almost always nothing*.
+
+- **A-R25 — one arm, not six flat variants.** `KernelEvent::Authority(AuthorityEvent)` and
+  `KernelEffect::Authority(AuthorityEffect)`, both leaves in `contracts/authority.rs`, variants
+  owned by kernel-a. This is not a new pattern: `contracts/ignore.rs:24-27` already states the
+  rule — *"a kernel adds a reason name by appending one variant to its own leaf enum. It never
+  edits `event.rs`"* — and its arm table already names `KernelIgnoredReason::Authority` as
+  kernel-a's. Foundation conceded this ownership one level down; one level up is consistent.
+  **Foundation's cost: two lines, once.** Four of the six design names need no variant at all —
+  `AcquireDue`/`RenewDue` are `EventKind::Timer(TimerFired{id, version, ..})` with `TimerVersion`
+  as the stale-timer discriminator, `LocalStorageFailure` is `StorageEvent::CommitFailed{fault:
+  WriteFailed}` (whose doc at `storage.rs:143` already says *"the partition fences"*),
+  `ProcessResumed`/`BootObserved` are `NodeLifecycle::{Resumed, Rebooted}`, and
+  `ExternalFenceVerified` landed whole.
+- **A-R25b — the positive facts do not go through `Ignored`.** `LineageLoaded`, `LineageChanged`,
+  `LineageInstalled`, `Adopted`, `DrainProof`, `RecoveryObserved`, `AcquireLost`, `RenewLost`,
+  `RenewUnknown` are **0 hits** in `contracts/authority.rs` and none is among
+  `AuthorityIgnoreReason`'s variants. They get `AuthorityEffect::Fact(AuthorityFact)` on the same
+  arm. Spelling them `Ignored` would contradict that variant's own doc — *"deliberately did
+  nothing"* — and collapse the homograph separation `ignore.rs` exists to provide. Zero extra
+  foundation cost: the arm is already bought. `KernelEffect::Alert{reason: ErrorKind}` is refused
+  outright — design §3.4 maps **13 of 15** `DenyReason`s onto `LEASE_EXPIRED`, so `Alert` cannot
+  tell M7A-43 from M7A-36, and those two are written as explicit one-fact twins.
+- **A-R26 — `PersistEpochRevocation{partition, epoch}` is a foundation `StoreEffect` variant.**
+  The one genuine foundation ask beyond the arm. `StoreEffect` has exactly `Commit`/`Flush`/
+  `Snapshot`/`Release` (`storage.rs:113-135`), and `Batch` requires `seq` and `generation`, which
+  an epoch revocation has neither of. It must be durable and **local** (spec §7.3 step 2), so a
+  `ControlEffect::Cas` is the wrong seam. Not on `AuthorityEffect`: that would make `rdb-sim`
+  route a kernel fact to storage, which the charter forbids. Gates M7A-26.
+- **A-R27 — no clock event and no tick event. This reverses Q-12.** Q-12 said I1 converts a
+  sample and delivers it as an event, reasoning *"A1 must not depend on the environment's type"*
+  (`design.md:846`). **That reason does not hold:** `Module::step` already takes `StepCtx`, which
+  is foundation's type, and A1 discards it today at `src/authority.rs:331`. `StepCtx` carries
+  `now: Tick` and `control_time: ControlTime`, and `ControlTime{estimate, error_millis,
+  bound_established, sampled_at}` (`time.rs:84-101`) is **field for field** the design's
+  `ClockSample{utc_ms, epsilon_ms, valid, at}`. A new event would be a second copy of
+  `ctx.control_time`. A1 reads `ctx` on every step, holds `Option<ClockSample>` as its own state
+  (the retraction rule and the backward-jump comparison both need the previous sample), and arms
+  its own timer for the periodic wake the expiry rows already require. **Rows M7A-38..M7A-46,
+  M7A-143, M7A-146, M7A-148 reword**: "a sample with `valid:false` is delivered at tick 100"
+  becomes "a timer fires at tick 100 with `ctx.control_time.bound_established == false`". The one
+  thing `ctx` cannot express is two distinct samples between consecutive steps; no row needs it.
+- **A-R28 — fence observability: `AuthorityEffect::Fence{scope, reason}`, *and* a data-carrying
+  `Fenced`.** See the withdrawn C0 mapping in the table below for why widening
+  `ControlEffect::Cas` has no subject. A state accessor alone is also insufficient, and the design
+  says so at `design.md:709`: `Fenced` carries **no scope field** because the two partition-scoped
+  fences (`LocalStorageFailure`, `EpochRevocationPersisted`) stay in `Held` — so M7A-06, M7A-25,
+  M7A-26 and M7A-50's partition column can never reach `state()`, and no accessor can count
+  "exactly one `Fence`" or assert K-A-49's ordered pairing with `PublishAuthorityView`. Both, then:
+  the effect for the 11 fence rows and the pairing, the state for M7A-16's `Fenced{reason:
+  Revoked}`. **Cost:** `AuthorityState` becomes data-carrying, which drops `#[derive(Copy)]` at
+  `src/authority.rs:75` and un-`const`s `state()` at `:110`. Accepted.
+- **A-R29 — both `may_admit()` and the `Check`→`Answer` pair. The C0 refusal is scoped, not
+  reversed.** Design §2.5's table makes only `Admission` synchronous — *"evaluated against the
+  last `AuthorityView` A1 pushed"*, deliberately, to remove two events per transaction from the Q1
+  budget. The other three checkpoints are spelled in that same table as *"async `Check` effect /
+  `AuthorityAnswer` event pair"*, and they cross a module boundary: A1, T1 and P1 are separate
+  `Module` impls stepped independently, so there is no function call for the refusal's "four
+  points in a code path" premise to be about. `may_admit` takes `&self`, not `&Held`, so a row can
+  call it while `Unheld` and get a deny. Also refused: `Decide` → `TraceKind::AuthorityDecision`.
+  `EffectKind` has no trace variant, and `AuthorityOutcome` has four variants against
+  `DenyReason`'s fifteen — M7A-59's `Deny(ControlUnavailable)` and M7A-43's `Deny(ClockSampleStale)`
+  would be indistinguishable.
+- **A-R30 — the eleven accessors are nine *new state items*, not a view pass.** `FenceScope`,
+  `ServedLineage`, `ClockView`, `ClockMode`, `ClockSample`, `AuthorityEvent`, `AuthorityEffect`,
+  `AuthorityFact` are all **0 hits** in `crates/`. A1 holds three fields today. This is a build.
+  `partitions_revision` is the one that looks like a view over the landed
+  `cursor(ControlPrefix::Partitions)` and is not: the cursor is moved by three call sites, while
+  `partitions_revision` is only the last coherent snapshot revision and exists to **ignore** an
+  older watch event (`design.md:737-739`). They coincide for one instant after a snapshot, which
+  is why M7A-04 would pass against the cursor today and the guard would still be unimplementable.
+- **A-R31 — there is no `Takeover` event, and none is owed. The gap is one missing §2.4 row.**
+  M7A-51, M7A-55 and M7A-57 name `Takeover{prior_*, frozen, proven}` as *input* and M7A-55 says
+  "two `Takeover` **events**". Design §2.6 makes `Takeover` **state**, and a K-A-39 sweep already
+  fixed *where* it lives without ever saying what creates an entry. I located the gap exactly:
+  `design.md:1049` handles the partitions family snapshot **"per partition owned by us"**, and
+  §2.4 has **no row at all** for a partition the snapshot shows owned by somebody else — which is
+  precisely the takeover candidate. They are silently dropped. The fix is one row, not a carrier:
+  on `Control(FamilyOk{partitions prefix})`, for each partition whose record names an owner that
+  is not us, emit `Control(Read{grants/{part.owner}})` and remember `(op, partition,
+  part.generation, part.owner_epoch)`. §2.6's existing first row then fires on that `ReadOk` and
+  creates `takeover[p]` **whole** — two `prior_*` fields correlated from the pending read, two
+  (`prior_grant_id`, `prior_boot_id`) from the grant record. No new event, no `Option` fields on
+  `Takeover`, and the pending-read map keyed by `OpId` is the mechanism A1 already uses twice for
+  `acquire.op` and `renewal.op`. Watch events on the same prefix re-read the key
+  (`design.md:1050`), so a planner-driven takeover arrives by the same path — the planner writes
+  the partition record. **Row re-wording owed**: M7A-55's "two `Takeover` events" becomes two
+  grant-record `ReadOk`s for two partitions, under §8.7's rule that a sustained finding re-words a
+  row and never removes it. **Scope caveat:** §2.6 says "the node *or planner* that intends to take
+  over". In M7, A1 is the node; if a later milestone makes the planner the actor, it is not A1 and
+  this ruling does not constrain it.
+### Lead rulings A-R33 … A-R37 — corrections from the reach gate (2026-09-22)
+
+The Manual Tester's reach spec (`teams/kernel-a/reach-spec.md`) disproved a premise of mine and
+found defects in three rulings above. I verified each before ruling; the counts below are mine,
+from the design, not from the spec.
+
+- **A-R33 — the fence census is 13 rows over 10 pairs, split 7 node / 3 partition. A-R28's
+  "eleven" and M7A-50's "seven node two partition" are both withdrawn.** Counted by extracting
+  every `Fence{` in `design.md` §2.4: **13 occurrences, 10 distinct (scope, reason) pairs.** Node
+  takes seven reasons — `Revoked`, `Frozen`, `BootMismatch`, `AuthorityGenerationChanged`,
+  `Expired`, `ClockUnbounded`, `ProcessSuspended`. Partition takes **three**, not two:
+  `LocalStorageFenced`, `EpochRevoked`, **and `GenerationChanged`** (`design.md:1054` and `:1055`),
+  which is M7A-06's entire subject and was missing from M7A-50's trigger list. Two pairs have two
+  separate triggers each (`GenerationChanged` at :1054/:1055, `ClockUnbounded` at :1092/:1095), so
+  a fixture asserting "exactly one `Fence`" per trigger needs **16** fresh kernels, not 13 and not
+  10. Three different numbers for one table, and I published a fourth.
+- **A-R33b — M7A-50 is rewritten to the row the tester proposed, which is strictly better.** Its
+  "exhaustive match over `DenyReason`" could not compile against the ten that exist. The
+  replacement claim: **exactly 10 of `DenyReason`'s 15 variants are reachable as a fence; the
+  other five are deny-only.** I enumerated both sides. Deny-only: **`NoGrant`, `ExpiryUnproven`,
+  `ClockSampleStale`, `SelfFenced`, `ControlUnavailable`** — each coherent (you cannot fence for
+  having no grant; `SelfFenced` is the state *after* a fence, not a reason for one). This can come
+  out wrong in **both** directions — a reason that silently becomes fenceable, or one that stops
+  being — which the old wording could not.
+- **A-R34 — WITHDRAWN. The tester was right and my correction of it was unsound.** I wrote that
+  B1's *"no record type exists anywhere in `crates/` (grep ⇒ 0)"* was wrong because `GrantRecord`
+  is in `crates/rdb-core/src/authority/grant.rs`. It is — **untracked, absent at `HEAD`,
+  `git status` shows `?? crates/rdb-core/src/authority/`**, written by the A1 developer during the
+  same window the tester was grepping. The tester's zero was true when the tester looked. I
+  checked the working tree and read another agent's in-flight work as evidence against the agent
+  who looked before it landed. **This is the trap AGENTS.md devotes a section to**, and I wrote a
+  fresh paragraph of that section earlier the same day about a claim being *"true or false
+  depending on which tree you read, and nothing warns you which one you are holding."* Then I did
+  it, and used the result to tell a worker it was wrong. **A finding that a worker's search was
+  wrong needs the tree it searched, not the tree you have.** What survives: `PartitionRecord` was
+  genuinely absent and is now built beside `GrantRecord` (`authority/partition.rs`). B1 is closed —
+  by construction, not by refutation.
+- **A-R35 — A-R27 reworded the Input half of nine rows and left the Assertion half, and that is my
+  defect.** M7A-43 asserts `effects = [Fact(AdmissionSuspended)]` *exactly*. Under A-R27 the
+  trigger is a timer fire, which also re-arms, so a **correct** kernel fails that row on day one.
+  Every §3.4 row whose Input I moved to a timer must have its expected effect vector re-derived to
+  include the re-arm. Changing an input without re-deriving the assertion is the same class of
+  error as moving a drift marker without re-reading the table: one edit, and the check now passes
+  or fails for a reason nobody chose.
+- **A-R36 — B4 is right and A-R32 was too narrow.** §2.3 needs **four** thresholds, not one:
+  `resume_gap_tolerance_millis`, `max_sample_age_millis`, `clock_rate_ppm`,
+  `clock_sample_period_ms`. All four go in `Budgets`. Splitting them across `Budgets` and private
+  consts is exactly how a constant drifts out from under a dozen rows that never mention it.
+- **A-R37 — the tester's premise check stands, and it was mine to have made.** I briefed it that
+  "set up a stale clock is a `StepCtx` construction problem, and if you cannot construct one you
+  cannot drive nine rows". `StepCtx` is a plain struct, ten public fields, **no
+  `#[non_exhaustive]`**, and both references are satisfiable from test locals. It is fully
+  constructible today with no developer help. The nine-row fear was unfounded; the frozen
+  `support::ctx()` is a fixture problem the tester owns. **BLOCKING items B2, B5, B6, B7, B8 and
+  B9 are accepted as written** and fold into the developer's phase-1 reach.
+- **A-R37b — M7A-16's state half compares a value with itself, and the tester caught it against a
+  ruling of mine.** A-R28 gave the row both an effect and a state observation, but both `reason`s
+  originate in the same `fence(scope, reason)` argument. It still earns its place — it proves the
+  fence *wrote* the state rather than only emitting — but it must be written and reviewed as **one
+  check, not two**. One check dressed as two is how a vacuous row survives a reviewer.
+
+- **A-R38 — A-R36 opened a silent drift of its own, and `BudgetName` must close it.** Verified:
+  `BudgetName::ALL` is `[Self; 10]` (`contracts/trace.rs`) and `Budgets` now has **14** fields.
+  `trace.rs`'s own doc says *"One member per field, in field order"*. Because `get`/`set` match on
+  `Self` rather than on the struct, **nothing fails to compile** — the four A-R36 thresholds are
+  simply un-overridable by a scenario and absent from `RunManifest.overridden`. That is precisely
+  the drift A-R36 exists to prevent, arriving through a door A-R36 opened: I ruled four constants
+  into `Budgets` without checking what enumerates `Budgets`. Extend `BudgetName` to 14 in field
+  order. Also: **`clock_sample_period_ms` is renamed `clock_sample_period_millis`** — I spelled it
+  `_ms` in A-R36 while ruling in the same breath that `_millis` is this codebase's spelling, and
+  the developer implemented my typo verbatim rather than silently correcting it, which was right.
+- **A-R39 — the fence table has two honest counts, and a fixture must use the call-site one.**
+  A-R33 said 13, counted from `design.md` §2.4 prose. The developer counts **14** from the built
+  call sites: `Expired` has two (`!local_ok`, `utc_ok == Expired`), `Revoked` two (`Absent`,
+  `classify` mismatch), `BootMismatch` two (`Rebooted`, `classify`), partition `GenerationChanged`
+  two, and one each for the remaining six. **Both are right about different things** — the prose
+  names transitions, the code names emission points, and a row asserting "exactly one `Fence` per
+  trigger" is about emission points. **The fixture count is 14 fresh kernels, not 16 and not 13.**
+  The 7/3 scope split is unchanged and matches the code exactly. Anyone quoting a number here
+  states which of the two they counted; that is now three separate ways this one table has been
+  miscounted, twice by me.
+- **A-R40 — the timer loop cannot close, and it is foundation's seam.** `harness::dispatch::deliver`
+  returns `SimError::unavailable` for `EffectKind::Send`, `Store`, `Timer` and `Kernel`
+  (`dispatch.rs:271`, `:274`, `:277`, `:286`). A1 now emits `Timer(Arm)` on every clock wake,
+  `Store(PersistEpochRevocation)`, and every `Kernel(Authority(..))` fact. A tester can **inspect**
+  these in the returned vector but cannot **route** them, so no armed wake ever fires back. Phase-1
+  reach survives — every fence is driven by an event the tester hands in directly — but every
+  phase-2 row that needs a timer to come back is blocked on this, and no row should be written
+  around it. Owed by foundation, not by kernel-a. **Dispatched 2026-09-22** as ledger L-R142: the
+  mechanism was already built and already tested (`sim/clock.rs:121-186`, row `M7F-43`); only the
+  wire was missing. Two halves — the dispatcher routes `Arm`/`Cancel` into the clock, *and* the run
+  loop drains `Clock::due` and consults `next_deadline()` before concluding `QueueEmpty`. Doing only
+  the first makes the refusal rows go red while no timer ever fires, which reads like the change
+  working. Seven refusable seams become six — the `timer` seam under `harness::dispatch::deliver`
+  is retired — and every assertion that named it is re-pointed at a still-unwired seam, never
+  deleted. **Landed 2026-09-22.** Named the long way round here on purpose, following the
+  convention the foundation dev set in `m7f_26`'s doc: a grep for the live seam vocabulary must
+  not hit a sentence about a seam that no longer exists.
+
+- **A-R46 — the blocker moved to the `kernel` seam, and it bites kernel-a hardest.** Full
+  reasoning in ledger L-R145; dispatched. With the timer wired, six `rdb-sim` rows now stop at the
+  `kernel` seam under `harness::dispatch::deliver`. **A1 is a pure kernel — every effect it emits
+  is `EffectKind::Kernel`** — so no kernel-a row can run through the loop at all. The tester
+  already worked around it by driving `step` directly, which is sufficient for unit rows and
+  forecloses every scenario-level one. Ruled in principle: `KernelEffect::Ignored` and `Alert`
+  have **no module consumer by design** — `Ignored` exists precisely so a row can assert that
+  nothing happened (A-R24, B-R33), and a dispatcher that refuses it defeats the variant — so they
+  are **recorded**; `SetAdmission`, `Recovered`, `QualificationChanged` and `Authority(..)` are
+  each the emitted half of a `KernelEvent` (R-S6), have a real unwired consumer, and **stay
+  refused by name**, which is what B-R28 is about. Not ruled and being measured rather than
+  inferred: which variant A1 emits first. If `Authority(..)`, kernel-a's loop-level rows are
+  blocked on routing facts to consumers that do not exist, which is bigger than a dispatcher arm.
+  **Until this closes, write kernel-a rows against `step` directly and do not claim loop-level
+  coverage.**
+
+- **A-R41 — the three unhoused names are ruled 2-1, and kernel-a never needed to ask.** Full
+  reasoning in ledger L-R143. `NotOurs` and `LineageUnchanged` → `AuthorityIgnoreReason`, as the
+  developer recommended; `LineageUnchanged` above all because it and `AuthorityFact::LineageChanged`
+  would otherwise be alphabetically adjacent unit variants differing by a negation prefix, the
+  easiest pair in this vocabulary to assert as each other. `WatchAdmissionExhausted` →
+  **`AuthorityFact`**, against the recommendation: §2.4's at-cap row *latches* — it stops re-arming
+  until externally reset — and latching is an act. The developer cites `AdmissionRefused` as its
+  twin and concludes they belong together; the twinning is what makes that dangerous, because as
+  adjacent unit variants a row asserting the cap passes on the under-cap reason, which is the exact
+  mechanism that cost this scope half its credited work. **Kernel-a appends all three itself**:
+  `contracts/ignore.rs` and `AuthorityFact`'s own doc both say a kernel owns its leaf's variants and
+  never waits on foundation for the append. Consequence: **M7A-31 must be rewritten as two rows** —
+  under-cap carrying `Ignored(Authority(AdmissionRefused))`, at-cap `[Fact(WatchAdmissionExhausted)]`
+  with **no** re-arm, the absence being the claim. *(Corrected the same day by A-R44: the under-cap
+  vector is not `[…, Timer(..)]`. `AuthorityTimer::WatchBackoff` is declared and unbuilt
+  — `authority.rs:1532` returns `unavailable("…the timed watch re-arm (today the re-arm is
+  immediate)")` — so the row's "bounded backoff, non-decreasing, `backoff_20 == cap`" has no
+  subject yet. The `Fact(…)` → `Ignored(…)` wrapper correction stands.)*
+
+- **A-R42 — MATERIAL. `ClockMode::Unbounded` must not fence; the code does.** Found by the A1
+  manual tester, verified at the source. Full reasoning in ledger L-R144. `utc_ok` returns
+  `Err(ClockUnbounded)` both for the configured *mode* (`authority/clock.rs:225`) and for
+  `ClockFault::Terminal` (`:233`), and `revalidate` (`authority.rs:867`) fences on that value
+  without being able to tell them apart. `ClockMode`'s own doc cites spec §7.2 to say the mode
+  *"does **not** fence"*, and `ClockFault` exists precisely to keep Terminal and Stale apart
+  because *"collapsing them terminally fenced a healthy primary"* — **`utc_ok` re-collapses what
+  `ClockFault` just split.** The architect already rejected this exact reading once for the
+  *renewal* guard (`architect-handoff.md:497`, the K-A-07 loop); the fence guard still has it.
+  Ruled: **split the `DenyReason`** — a deny-only reason for the mode, `ClockUnbounded` keeping the
+  no-sample and `Terminal` cases. Not a caller-side mode check, which re-creates the shape that
+  caused this. **`DenyReason` 15 → 16, deny-only 5 → 6; `M7A-50` asserts those counts by value.**
+  The `sample == None` side is deliberately unruled — state which side it is on, with a citation.
+
+  **CLOSED 2026-09-22 by the A1 developer.** The new reason is `DenyReason::ClockModeUnbounded`;
+  `utc_ok`'s mode branch returns it and `revalidate` falls through on it beside `ClockSampleStale`.
+  Counts on disk: **16 variants, 10 fence-reachable, 6 deny-only** — the fence count did not move,
+  which is the check that the split went the right way.
+
+  **The `sample == None` side is decided: it stays on `ClockUnbounded` and keeps fencing**, with
+  the citation written into `authority/clock.rs` at the branch. It is not a third case that
+  happens to share a name — *it is how the rejected-sample fence fires at all*. `absorb_sample`
+  retracts a rejected sample and returns no fence of its own ("the fence is the conjunct row's,
+  one frame up"), so the no-sample branch is the only thing that ends a grant for a sample with no
+  bound, a future stamp, an error over the ceiling, or a backward jump — all four ADR-rdb-0007 §3
+  triggers. `ClockView::retract`'s own doc (K-A-50) says the subsystem "has declared its bound
+  gone", which reads `Terminal`. Moving it to the deny-only reason would silently disarm four
+  triggers and the rows that assert them: M7A-40, M7A-41, M7A-42 and M7A-165 each assert
+  `Fence{Node, ClockUnbounded}` **and** `clock.sample == None` in the same breath. It also cannot
+  fire on a node that never had a sample — `revalidate` returns before it unless `Held`, and a
+  grant is only entered through an `e_new` a sample produced — so no-sample-while-held always
+  means a sample was retracted.
+
+  Evidence: `crates/rdb-core/tests/authority_clock_mode.rs`, two functions, deliberately not
+  `m7a_*` (they guard a ruling, not a plan row). Against the unfixed code the mode row failed with
+  `left: [ClockUnbounded] / right: []`; after the split both pass. The second function is the
+  other direction of the split — a bound-less *sample* in bounded mode still fences
+  `ClockUnbounded` and still retracts — because a fix that merely stopped fencing would pass the
+  first and break an ADR-rdb-0007 §3 trigger.
+  **This also settles A-R39 at 14, not 15**: the tester's extra `set_clock_mode` route is this
+  defect's fingerprint and disappears with the fix. 14 guard branches over 9 syntactic
+  `self.fence(` call sites, 7 node / 3 partition, all 10 fenceable reasons observed firing.
+
+- **A-R43 — two more unmarked stand-ins, and no row may be written on them.** `authority.rs:1560`
+  and `:1565` emit `Ignored(StaleTimer)` for `Resumed{suspended_millis <= tol}` and
+  `Rebooted{boot == held.boot}`. Neither is about a timer; both mean *this lifecycle event is not
+  a discontinuity*. Unlike A-R41's three, these carry **no marker at the site**, so a row written
+  against them looks correct and is not. Kernel-a appends two real `AuthorityIgnoreReason`
+  variants itself. **M7A-48 and M7A-49's twin wait for the real names.**
+
+- **A-R44 — the zero-producer set, and what may still be claimed.** Verified by grep over all four
+  A1 source files. `SelfFenced`, `ControlUnavailable`, `ExpiryUnproven`, `LateRenewalIgnored`,
+  `AcquireWithheld`, `RenewalWithheld` have **zero** producers; `AdmissionRefused` has one
+  occurrence and it is a doc line. So: **M7A-50 may not call three of its five "deny-only"** —
+  they are *unreachable in this build*, and a claim that a reason is never a fence reason cannot
+  come out wrong when nothing produces it. Its fence half (10 reasons, one trigger each) is fully
+  falsifiable and carries the row. **M7A-59 is unwritable as A-R29 spells it** —
+  `ReadOutcome::Unavailable` yields `Ignored(AdmissionSuspended)`, not `Deny(ControlUnavailable)`.
+  Watch the homograph: `design.md` §2.4's `WatchGap{AdmissionRefused}` names an *input* that is
+  really `WatchTermination::ResourceExhaustedFatal`; `AdmissionRefused` is an output name in
+  `AuthorityIgnoreReason` and nothing else. Write rows against the contract's spelling.
+
+- **A-R45 — A-R35 generalises off timers: pin `ctx.control_time` too.** Measured by the tester:
+  one trigger gives `len=2, views=1` when the sample is unchanged and `len=3, views=2` when it
+  moves, with the fence at index 0 or 1. `revalidate` publishes before a *routed* handler fences,
+  so moving the publish below the conjuncts prevents `[Publish, Fence, Publish]` only for the
+  fences `revalidate` raises itself — not for the 10 a handler raises. **Any row asserting an
+  exact effect vector pins the sample across the step.** The B8 pairing claim holds either way.
+
+- **A-R32 — `resume_gap_tolerance` is settled, and the recommended *name* is wrong.** §13's
+  standing convention is "the recommendation is the default", and Q-5 recommends
+  `resume_gap_tolerance_ticks` defaulting to `renew_interval_ms` (500). So M7A-47..M7A-49 were
+  never blocked on design — only on nobody landing the constant. Two corrections. It is a **new
+  `Budgets` field**, not a reuse of `renew_millis`: the two have no reason to move together, and
+  reusing one makes an operator's renewal tuning silently retune suspend detection. And it is
+  **`resume_gap_tolerance_millis`**, not `_ticks` — `NodeLifecycle::Resumed` carries
+  `suspended_millis` and `Budgets` is in millis throughout, so the `_ticks` spelling would put a
+  unit conversion nobody specified between the event and its own threshold. Default 500.
+
+**Rulings A-R41 … A-R51: what they release and re-word (working tree 2026-09-22, uncommitted;
+lead ledger L-R146 … L-R152).** Re-derive against `HEAD` once these land in a commit.
+
+- **A-R41 and A-R43 landed.** The real names are in `AuthorityIgnoreReason`: `NotOurs`,
+  `LineageUnchanged`, `BootUnchanged`, `ResumeGapWithinTolerance`, `PartitionReadSuperseded`,
+  `UnmatchedCompletion`, plus `AuthorityFact::WatchAdmissionExhausted`. Both `StaleTimer`
+  stand-ins are gone. **M7A-48 and M7A-49's twin are released.**
+- **M7A-33 is no longer miscredited, it is owed.** The two functions that asserted M7A-31's claim
+  are now named `m7a_31_*`. `M7A-28` stays on the census `MISCREDITED` list. Census at that
+  instant: kernel-a 3 of 174. Re-run `scripts/m7-census.sh kernel-a` before quoting it.
+- **M7A-31 re-worded to two rows**, as its row cell now names. The `Timer(..)` half of the effect
+  list is still unchecked.
+- **A-R42.** `ClockMode::Unbounded` denies with `ClockModeUnbounded` and does **not** fence. A
+  missing sample (`sample == None`) still fences `ClockUnbounded`. The grant is not lost in
+  unbounded mode: renewal is guarded on the sample, not the mode. `DenyReason` has 16 variants, 10
+  fence-reachable and 6 deny-only. **M7A-50** counts 10 and 6. Its deny-only claim covers only the
+  reasons that have a producer (A-R44).
+- **A-R47.** Only a completion that matches an outstanding Acquire by correlation grants a hold.
+  An unmatched commit answers `Ignored(UnmatchedCompletion)`. Harness rows that relied on the
+  one-event `CasResult → Held` shortcut now drive the Acquire first.
+- **A-R48 and A-R48b.** Each partition keeps its installed revision. A single read adopts only
+  if it is newer, otherwise `Ignored(PartitionReadSuperseded)`. A snapshot still replaces
+  (A-R37), except entries strictly newer than it. Removal leaves a tombstone revision that an
+  older read cannot pass.
+- **A-R49 and A-R50.** In the simulator, `AuthorityEffect::Fact` is recorded as
+  `KernelNote::AuthorityFact`. `Answer`, `Fence`, `PublishAuthorityView` and `FenceProven` stay
+  refused by name under `harness::dispatch::deliver::kernel`. A harness run that stops `Refused`
+  at the first grant is expected. It is not a defect.
+- **A-R51, the takeover side (design.md §2.6a, amended).** `PartitionRecord` gains
+  `lifecycle: PartitionLifecycle { Serving, Fencing, FencingDrained }`. A takeover is created
+  only for a partition that is not `Serving`, because a freeze is node-scoped. Rejection is
+  `Ignored(ExternalFenceRejected { mismatch: ExternalFenceMismatch })`, checked in the order
+  Partition, NotFrozen, PriorGeneration, PriorOwnerEpoch, PriorBootId, ControlRevision. A repeat
+  after a proof is `Ignored(TakeoverAlreadyAuthorized)`. The proof comes from an end-of-step
+  sweep. There is no `Tick` event. **Re-words owed:**
+  - **M7A-53:** `Fact(TakeoverDeferred)` → `Ignored(TakeoverDeferred)`.
+  - **M7A-55:** "two `Takeover` events" → two proving inputs for one entry. The second answers
+    `TakeoverAlreadyAuthorized`.
+  - **M7A-150:** payload `{field}` → `{mismatch}`, because `NotFrozen` is not a field.
+  - **M7A-57:** a DurableDrain proof also requires a frozen read. It fires on `FencingDrained`.
+  - **These rows stay unwritten** until the §3.4 build lands and the manual tester signs off.
+    That build is partial in the working tree.
+
 | Rows | Unavailable until | Note |
 |---|---|---|
-| M7A-47..M7A-49 | **design** — `resume_gap_tolerance_ticks` is still unnamed (§13 Q-5) | the *type* landed: `NodeLifecycle::{Resumed{suspended_millis}, Rebooted{boot}}`, `event.rs:136`. Only the tolerance constant is missing |
+| M7A-47..M7A-49 | ~~**design** — `resume_gap_tolerance_ticks` is still unnamed (§13 Q-5)~~ — **released by A-R32** | the *type* landed: `NodeLifecycle::{Resumed{suspended_millis}, Rebooted{boot}}`, `event.rs:136`. These were never blocked on design: §13's convention is "the recommendation is the default", so Q-5's answer stood unread. Now a named `Budgets` field, `resume_gap_tolerance_millis`, default 500 — **`_millis` not `_ticks`**, because the event carries `suspended_millis` and `Budgets` is in millis, and a separate field rather than `renew_millis` reused |
 | M7A-158..M7A-160 | **kernel-b** `BlockPartition{reason}` event and `RecoveryResult.mode` (B-R29) | `BlockReason::DivergenceRequiresOperator{diverged}` and `PartitionMode::Blocked{reason}` both landed in `contracts/authority.rs`; neither carrier type exists yet |
 | M7A-107, M7A-108, M7A-109, M7A-105 | **C0** `SnapshotId::at` — and the `ReplyEffect::Read` **shape** these rows assert | `Read` landed (F-R7, `event.rs:281`) but as `{identity, outcome: ReadServiceOutcome, value: Option<(Version, Digest)>}`, not the `{corr, snapshot}` these rows name. `ids.rs:96` has only `SnapshotHandle(u64)`; `grep -rn SnapshotId crates/` ⇒ zero hits. §15 row 4; §13 Q-16 carries the shape. **Membership corrected under TD-14**: M7A-105 asserts `snapshot SnapshotId::at(g, 5)` and was not held at all, so it joins; M7A-111 and M7A-118 assert no snapshot and leave (below) |
 | M7A-91..M7A-96 | **kernel-b** `QualificationChanged` type (B-R27 shape) | P1 rows drive the type by hand; no R1 needed |
@@ -970,7 +1320,7 @@ the table. M7A-105 joined under that rule and M7A-111 and M7A-118 left under it.
 | M7A-58, M7A-137 | **Q1** shared corpus report | read verification's `OnceLock` report; never start a second corpus |
 | M7A-165..M7A-174 | **the first green run** (present-provisional; wording follows design round 3/4 text that nothing has executed) | §8.7; a sustained finding re-words the row, never removes it. §8.1–§8.6 were cleared by critic-kernel-a round 3 and are no longer listed here |
 | M7A-91..M7A-96, M7A-103, M7A-106, M7A-152..M7A-155, M7A-170, M7A-173 | **KA-8** — the scripted `ReplicationView` fake (ours, §1) | no external dependency: the fake is part of the P1 fixture, `digest_at` defaults to `Match` and `qualifies_now` to false |
-| §3's four gate rows, every `Fence` row, every `PublishAuthorityView` row, §8.1–§8.6 | **this plan** — a behavioural rewrite onto the C0 mapping, **not** a contract wait | §15 row 15. Until `f616ddf` these were held on a C0 gap in `EffectKind`/`EventKind`. That gap is **ruled closed as a mapping, not a widening**: `Fence` is `ControlEffect::Cas` on `ControlKey::Partition`/`Grant`, `PublishAuthorityView` is that CAS plus `Watch`/`Reload`, `Decide` is `TraceKind::AuthorityDecision`, and `EventKind::Check` is refused. **No new variants are owed by foundation.** The rows now wait on kernel-a rewriting them onto the two landed KA-4 surfaces, and report `unavailable` naming that rewrite |
+| §3's four gate rows, every `Fence` row, every `PublishAuthorityView` row, §8.1–§8.6 | **A1's carrier arm** — rulings A-R25 and A-R28 below. ~~a behavioural rewrite onto the C0 mapping~~ | **The C0 mapping in this cell is withdrawn (A-R28).** It said `Fence` is `ControlEffect::Cas` on `ControlKey::Partition`/`Grant`. Verified against kernel-a `design.md` §2.4: a `Cas` is *emitted* on exactly two transitions, `Unheld \| AcquireDue` (:1027) and `Held \| RenewDue` (:1072). **Neither is a fence**, and every other `Cas` in §2.4 is an arriving `CasApplied`/`CasConflict`, not an effect. The mapping is right for the planner fencing *another* node; every M7A fence row is A1 fencing *itself*, where there is no CAS to widen. A row rewritten onto it asserts a CAS that never fires. These rows now wait on `AuthorityEffect::Fence{scope, reason}` per A-R28 |
 | `proven` for the three packages | **A1, T1, P1 landed** — A1 **partially landed** at `f616ddf` | `crates/rdb-core/src/authority.rs` now implements the §2.4 watch and coherent-resync slice with a real `Module::step` (§15 row 16), so M7A-28, M7A-31..M7A-33, M7A-123, M7A-126 and M7A-129 have a subject to run against. The gates, the fence and the pushed view are **not** wired. Every other A1 row stays `unavailable`, never green |
 
 **Cleared by the re-read at `ec610f4`, carried and re-confirmed at `f616ddf`** — these rows were held on "not in the crate today" for a
@@ -1246,6 +1596,30 @@ to re-derive that they are:
   `#[non_exhaustive]` and their **variants are kernel-b's**, so a kernel-a `match` on either keeps
   a catch-all.
 
+  **Drift re-read 2026-09-22 — two clauses of this bullet are stale, and the correction is in
+  kernel-a's favour.** Re-read at `f616ddf` first: every citation above resolves there exactly
+  (`event.rs:190`, `:346`, `:234-249`, `:153-191`, `:313-347`), so the bullet was true as written.
+  Ask **CB-7** is now landing **uncommitted** in `crates/rdb-core/src/contracts/` — `event.rs`,
+  `contracts/authority.rs` and a new `contracts/ignore.rs` — and changes two things this bullet
+  says. (i) **`Ignored`'s reason is no longer an `ErrorKind`.** It is `KernelIgnoredReason` (new
+  `contracts/ignore.rs:77`), a five-arm carrier: `Error(ErrorKind)`, `AppendRejected(AppendReject)`,
+  `AckRejected(AckRejectReason)`, `Authority(AuthorityIgnoreReason)`, `Replica(ReplicaIgnoreReason)`.
+  `Alert{reason: ErrorKind}` is unchanged. (ii) **"their variants are kernel-b's" is now wrong for
+  the reason vocabulary, and kernel-a owns a leaf of its own.** `AuthorityIgnoreReason`
+  (`contracts/authority.rs:257`, 27 variants, `#[non_exhaustive]`) is **kernel-a's** — its doc says
+  kernel-a adds a variant by editing that enum and nothing else, not `event.rs`, not the carrier,
+  and without waiting on foundation or kernel-b. The `KernelEvent` / `KernelEffect` **variant** sets
+  are still kernel-b's, so the catch-all rule stands for those two. (iii) Neither inner enum is
+  `Copy` any more, which is what lets `AuthorityIgnoreReason::Blocked { reason: BlockReason }` carry
+  a `Vec<CopyId>`. **None of this moves the marker**: `git log -1 -- crates/rdb-core/src/contracts`
+  is still `f616ddf` because CB-7 is not committed. It moves when dev-foundation-r3 commits, and
+  this bullet's `event.rs` spans move with it. **Re-open each span individually; do not shift them
+  by a constant.** An earlier revision of this bullet said "+21 in the working tree today".
+  Measured 2026-09-22 against both versions, the real offsets are `:190`→`:191` (+1),
+  `:213`→`:217` (+4), `:232`→`:246` (+14), `:234`→`:248` (+14), `:346`→`:368` (+22) — CB-7 inserts
+  at three separate points, so the offset is piecewise. `+21` is near the last one, which is why
+  it read as plausible. Kernel-b's §15 carries the same correction.
+
 Alongside them `crates/rdb-core/src/authority.rs` was rewritten (+302/−16) — kernel-a's own module,
 not a contract — and that is **row 16** below.
 
@@ -1286,12 +1660,12 @@ re-derived in round 4 by the critic as well as the planner, both agreeing, and a
 | 7 | Clock sample at the seam | §1.7 and §2.3 consume `ClockSample{at, utc_ms, epsilon_ms, valid}` | time arrives as `StepCtx.now` plus `ControlTime{estimate: Tick, error_millis: u64, bound_established: bool, sampled_at: Tick}` — **four** fields, not the three the round-3 table listed | **Foundation contract request 9 from kernel-a**, restated against the landed four fields: I1 in `rdb-sim` builds the sample with `at = ct.sampled_at` (**not** `now`), `utc_ms` from `ct.estimate`, `epsilon_ms = ct.error_millis`, `valid = ct.bound_established` and nothing else; samples delivered **even when the bound is not established**; **no staleness filtering at the seam**. The `at = sampled_at` clause is the load-bearing one: a seam that stamped the sample at its delivery tick would make every sample age zero and M7A-43's stale sample unreachable. §13 Q-12; the clock rows (M7A-38..46, 143, 146, 148, 165) depend on it |
 | 8 | Grant read shorthand | §2.2/§2.4 and M7A-16..M7A-21 write the renewal read as `Value{Grant, Found{grant_id, boot_id, frozen, authority_generation}}` | `ReadOutcome::Found{revision: Revision, value: Bytes}` (`control.rs:230`), plus `Absent{as_of}` and `Unavailable`. The four named fields are inside the **encoded** body, and no `GrantRecord` type exists in `rdb-core` | The round-3 table recorded a drift here that does not exist — it claimed `ReadOutcome::Found{revision, value}` was the *design* shorthand against an unnamed landed shape, when `{revision, value}` **is** the landed shape, and it cited M7A-107..M7A-111, which never assert those fields (TD-08). The real shorthand is the grant read, and the real rows are M7A-16..M7A-21: they hand A1 the encoded bytes and assert A1's own decode, so no contract type is owed. The decode target is A1's, not foundation's, and `K-F-39`'s zero-threshold refusal is the precedent for decoding strictly |
 | 9 | Staleness threshold: unit and boundary | §2.3 and this plan's §2 budget table name `max_sample_age_ticks` (2000), and §14 recorded a `>` vs `≥` contradiction as open | `ControlTime::is_stale(self, now, max_sample_age_millis)` returns `sampled_at.0 > now.0 \|\| now.0 - sampled_at.0 > max_sample_age_millis` — **millis**, and strict `>` | Two facts. (a) The landed parameter is in milliseconds where the plan names ticks; the rows do not change, because the fixture sets one tick per millisecond, but the name in §2's budget table is the plan's, not the crate's. (b) The strict `>` settles §14 contradiction 4 in favour of the rows already written: M7A-46's `age == 2000` is **not** stale and M7A-43's 2001 is. The landed doc comment also puts the judgement "in the kernel and not in whichever environment filled the sample in", which is exactly the no-filtering-at-the-seam half of row 7 |
-| 10 | `DenyReason` membership | §2.2 and the fence-trigger discussion have at times named a `ConfigVersionChanged` deny | `DenyReason` has **15** variants: `NoGrant, Frozen, Revoked, EpochRevoked, Expired, ExpiryUnproven, ClockUnbounded, ClockSampleStale, ProcessSuspended, BootMismatch, AuthorityGenerationChanged, GenerationChanged, SelfFenced, ControlUnavailable, LocalStorageFenced`. **`ConfigVersionChanged` is in neither the crate nor any ADR** | M7A-166 enumerated it and is corrected under TD-03 to the nine ADR 0007 §3 triggers by the `DenyReason` each produces, with M7A-50's scope split (seven node-terminal, two partition — `EpochRevoked` and `LocalStorageFenced`). A config-version change reaches the rows through `AuthorityView.config_version`, which did land, not through a deny reason. Two further membership facts the re-read turned up, both recorded rather than resolved: **(a)** ADR 0007 §3's *backward clock jump* trigger has no reason of its own, so M7A-166 folds it onto `ClockUnbounded` and a future `ClockWentBackward` would split that row in two — a seam question for foundation, not a finding; **(b)** `GenerationChanged` and `AuthorityGenerationChanged` are separate landed variants and the rows keep them separate, lineage from authority |
+| 10 | `DenyReason` membership | §2.2 and the fence-trigger discussion have at times named a `ConfigVersionChanged` deny | `DenyReason` has **16** variants: `NoGrant, Frozen, Revoked, EpochRevoked, Expired, ExpiryUnproven, ClockUnbounded, ClockModeUnbounded, ClockSampleStale, ProcessSuspended, BootMismatch, AuthorityGenerationChanged, GenerationChanged, SelfFenced, ControlUnavailable, LocalStorageFenced`. **Which tree you are reading decides this number**: 15 at `HEAD`, 16 in the working tree, where A-R42 split the configured-mode denial out of `ClockUnbounded`. AGENTS.md's own warning applies to this cell — re-derive it against `crates/rdb-core/src/contracts/authority.rs` rather than quoting it, and note that the drift-basis marker below does **not** move for an uncommitted contract change, so the `drift` stage cannot tell you this happened. **`ConfigVersionChanged` is in neither the crate nor any ADR** | M7A-166 enumerated it and is corrected under TD-03 to the nine ADR 0007 §3 triggers by the `DenyReason` each produces, with M7A-50's scope split (seven node-terminal, two partition — `EpochRevoked` and `LocalStorageFenced`). A config-version change reaches the rows through `AuthorityView.config_version`, which did land, not through a deny reason. Two further membership facts the re-read turned up, both recorded rather than resolved: **(a)** ADR 0007 §3's *backward clock jump* trigger has no reason of its own, so M7A-166 folds it onto `ClockUnbounded` and a future `ClockWentBackward` would split that row in two — a seam question for foundation, not a finding; **(b)** `GenerationChanged` and `AuthorityGenerationChanged` are separate landed variants and the rows keep them separate, lineage from authority |
 | 11 | `past_horizon` optionality | §1.7 describes a horizon that may be absent before any fence | `AuthorityView.past_horizon: DenyReason` — a bare field, **not** an `Option` | M7A-166 is corrected under TD-04 to drop the `Some(..)`/`None` wrapping; its negative half becomes "no fence produces a `past_horizon` other than its own reason". K-A-49's fence view `(fence_tick − 1, past_horizon = fence reason)` needs no option, and the six fence-view rows corrected in round 3 already read it that way |
 | 12 | **The family read: design's `ReadFamily` is the landed `Reload`** | §2.4's watch-gap rows say "`⇒ ReadFamily + re-Watch`", and rounds 1–4 of this plan wrote that as `Control(Get{family})` in five rows | `ControlEffect` has **four** variants: `Cas{key: ControlKey, ..}`, `Get{key: ControlKey}`, `Watch{prefix: ControlPrefix, from}`, `Reload{prefix: ControlPrefix}` (`control.rs:329-363`). `ControlKey` (`:25-44`) has **no family member** — `ClusterSchema, Node, Grant, Partition, Route, Operation, PlannerGrant` — and `ControlPrefix` is a separate type by deliberate construction (K-F-19: typing the family position with the record type "let a single-record key be passed where a family was meant"). `Reload`'s own doc: *"Team kernel-a's `ReadFamily { prefix }` binds to this"* | **Not a drift at all — a plan error, and the worst-shaped kind (TD-12, the round-3 blocker).** `ReadFamily` binds to `Reload`; `Control(Get{family})` is refused by the compiler. Four of the five rows (M7A-28, M7A-31, M7A-123, M7A-126) were compile errors a developer fixes in a minute. **M7A-32 was not**: its whole assertion was `count of Control(Get{family}) == 0`, which is zero in *every* run, including a kernel that reloads on every watch event — the exact bug ADR 0008 §7 item 4 exists to catch — so it went green for ever while §12 reported that item covered. A test that cannot fail is worse than a missing one, because the missing one is visible. M7A-32 is rewritten to count `Control(Reload{..})` with a positive control arm; M7A-31 and M7A-129 no longer assert the same count twice. Recorded here so the next re-read does not rediscover the binding. `Get{grant}` / `Get{partition}` (M7A-30, M7A-57) need no change — those are real `ControlKey`s |
 | 13 | **Watch resume is exclusive, on both sides of the seam** | M7A-28 and M7A-123 re-watched at `from: snapshot_revision + 1` | `ControlEffect::Watch` doc: delivers changes **after** `from`. `FamilySnapshot.snapshot_revision` doc: it "is what the resumed watch **starts after**, which is what makes reload and re-watch a closed loop rather than a race." And foundation's fake **implements** it that way: `sim/control.rs:233` filters `*revision > watch.cursor`, with `cursor: *from` set at `:367` | **Settled from source, not left as an assumption (TD-18).** `from = snapshot_revision` is the closed loop. `from = snapshot_revision + 1` delivers changes strictly after `snapshot_revision + 1` and silently drops any change at exactly that revision — a one-revision gap in the resync path, opened by the row that certifies the path has no gap, and invisible unless a fixture places a change there. M7A-28 now places one. The critic marked this inconclusive on the grounds that no watch implementation exists in `rdb-sim`; **one does**, at `sim/control.rs:218-262`, and it agrees with the doc, so the disposition is "fixed and confirmed", not "fixed and assumed". Nothing is owed at the seam |
 | 14 | **`RetainedStatusMap` — a standing re-derivation, not a closed risk** | §4.4's `fold_recovered` and M7A-116 / M7A-135 / M7A-172 build `RetainedStatusMap{retained_through, discarded_from, uncertain}` by hand (K-A-52) | `grep -rn "RetainedStatusMap" crates/` ⇒ **zero hits** at `f616ddf`. No landed type constrains the shape | Round 4's risk R15 asked whether the landed type could make M7A-172's `discarded_from: None` sub-case unconstructable. It cannot: nothing has landed, the row builds the map by hand (its Input says "direct table test of `fold_recovered`"), and §11 holds it on kernel-b F1's recovery event, correctly. **R15 converts into a standing condition rather than closing: when F1 lands `RetainedStatusMap`, re-derive this sub-case first.** If F1 declares `discarded_from: Revision` rather than `Option<Revision>`, the `None` arm disappears and M7A-172's third sub-case must be **deleted with a stated reason**, never left to fail silently — it is the only construction in the plan that reaches K-A-52's `else` arm, so deleting it also removes the plan's only coverage of `StatusExpired` from the fold and that consequence is the thing to record when it happens |
-| 15 | **The four authority gates have no carrier — closed at this basis as a mapping, not a widening** | design §2.2 gives A1 eight effect kinds and a `Check { checkpoint, lineage, correlation }` event; §1.2 is the authority-decision seam the whole of §3 asserts through | `EffectKind` has **seven** variants — `Send`, `Store`, `Control`, `Timer`, `Reply`, `AdoptAuthority`, `Kernel` (`event.rs:313-347`; `Kernel` landed *at this basis*, `event.rs:346`) — and `EventKind` **eight** (`event.rs:153-191`; `Kernel` at `:190`). **Still none of them carries a `Decide(AuthorityDecision)`, a `Fence { scope, reason }` or a `PublishAuthorityView(AuthorityView)`, and no `EventKind` variant delivers a `Check`.** `FencingProof` does not exist as a type (`grep -rn FencingProof crates/` ⇒ 0). The `contracts::authority` **structs** `AuthorityDecision` (`authority.rs:99`), `AuthorityView` (`:159`), `Verdict` (`:87`) and `Checkpoint` (`:23`) are reachable only through `lib.rs:48`'s re-export and the doc links at `src/authority.rs:15-21`; `DenyReason` (`:50`) the same | **BLOCKER — CLOSED at `f616ddf`, and one of this row's own claims was wrong.** *(a) The claim that was wrong.* Round 5 wrote that these five types "**have no consumer anywhere in the workspace**". That is false as stated, and a **name collision** hid it: `trace::TraceKind::AuthorityDecision` (`trace.rs:790`) is a different type with the same words, and it **is** consumed — `rdb-sim/tests/support/oracle/checks/authority.rs:40`, `oracle/model.rs:121` and `:550`, `scenarios/mutate.rs:110`, `tests/oracle.rs:149`, four files, folding on `gate`/`outcome`/the grant window. The narrow claim that survives is about the `contracts::authority` structs, and it is now written that way in the Landed column. Corrected under the lead's standing note on this row: `AuthorityView` and `DenyReason` genuinely are consumerless; `AuthorityDecision` never was. *(b) The blocker.* Routed by L-R60 as ask **CB-5** rather than ruled over foundation, and **ruled at this basis as a mapping, not a widening**: **`Fence` IS `ControlEffect::Cas`** on `ControlKey::Partition` / `ControlKey::Grant` (`control.rs:331-339`) — bump the epoch and the prior owner's CAS fails on `expected: Option<Revision>`; **`PublishAuthorityView` is that same CAS plus `Watch`/`Reload`**, because a dedicated variant would bypass the read-after-watch rule `on_watched` enforces; **`Decide` is `TraceKind::AuthorityDecision`** (`trace.rs:790`, gate spelled `AuthorityGate`, `trace.rs:244`); and **`EventKind::Check` is refused** — gates are points in a code path, not deliverable events. **No new variants were added for kernel-a and none are owed. This table must not claim any are.** *(c) What that leaves owed — a plan edit, not a contract wait.* §3's gate rows, every `Fence` row, every `PublishAuthorityView` row and §8.1–§8.6 are **no longer `Unavailable` on a C0 gap**; they are owed a **behavioural rewrite** onto the two landed KA-4 surfaces — the returned effect vector (now including `EffectKind::Kernel(KernelEffect::Ignored{reason})` for design §2.2's `Fact(..)`, A-R24) and the sim-recorded `TraceEvent`. Until that rewrite lands those rows report `unavailable` naming **this row's rewrite**, never green, and never by asserting something weaker. The `Control` slice — the watch and coherent-resync rows — was always expressible and is now **built**: see row 16 |
+| 15 | **The four authority gates have no carrier — closed at this basis as a mapping, not a widening** | design §2.2 gives A1 eight effect kinds and a `Check { checkpoint, lineage, correlation }` event; §1.2 is the authority-decision seam the whole of §3 asserts through | `EffectKind` has **seven** variants — `Send`, `Store`, `Control`, `Timer`, `Reply`, `AdoptAuthority`, `Kernel` (`event.rs:313-347`; `Kernel` landed *at this basis*, `event.rs:346`) — and `EventKind` **eight** (`event.rs:153-191`; `Kernel` at `:190`). **Still none of them carries a `Decide(AuthorityDecision)`, a `Fence { scope, reason }` or a `PublishAuthorityView(AuthorityView)`, and no `EventKind` variant delivers a `Check`.** `FencingProof` does not exist as a type (`grep -rn FencingProof crates/` ⇒ 0). The `contracts::authority` **structs** `AuthorityDecision` (`authority.rs:99`), `AuthorityView` (`:159`), `Verdict` (`:87`) and `Checkpoint` (`:23`) are reachable only through `lib.rs:48`'s re-export and the doc links at `src/authority.rs:15-21`; `DenyReason` (`:50`) the same | **BLOCKER — CLOSED at `f616ddf`, and one of this row's own claims was wrong.** *(a) The claim that was wrong.* Round 5 wrote that these five types "**have no consumer anywhere in the workspace**". That is false as stated, and a **name collision** hid it: `trace::TraceKind::AuthorityDecision` (`trace.rs:790`) is a different type with the same words, and it **is** consumed — `rdb-sim/tests/support/oracle/checks/authority.rs:40`, `oracle/model.rs:121` and `:550`, `scenarios/mutate.rs:110`, `tests/oracle.rs:149`, four files, folding on `gate`/`outcome`/the grant window. The narrow claim that survives is about the `contracts::authority` structs, and it is now written that way in the Landed column. Corrected under the lead's standing note on this row: `AuthorityView` and `DenyReason` genuinely are consumerless; `AuthorityDecision` never was. *(b) The blocker.* Routed by L-R60 as ask **CB-5** rather than ruled over foundation, and **ruled at this basis as a mapping, not a widening**: **`Fence` IS `ControlEffect::Cas`** on `ControlKey::Partition` / `ControlKey::Grant` (`control.rs:331-339`) — bump the epoch and the prior owner's CAS fails on `expected: Option<Revision>`; **`PublishAuthorityView` is that same CAS plus `Watch`/`Reload`**, because a dedicated variant would bypass the read-after-watch rule `on_watched` enforces; **`Decide` is `TraceKind::AuthorityDecision`** (`trace.rs:790`, gate spelled `AuthorityGate`, `trace.rs:244`); and **`EventKind::Check` is refused** — gates are points in a code path, not deliverable events. ~~**No new variants were added for kernel-a and none are owed. This table must not claim any are.**~~ **WITHDRAWN 2026-09-22 by lead rulings A-R25 and A-R28 — see §11. Do not act on this cell.** Two of the three mappings it asserts have no subject. *`Fence` is not a CAS*: kernel-a `design.md` §2.4 emits `ControlEffect::Cas` on exactly two transitions, `Unheld | AcquireDue` (:1027) and `Held | RenewDue` (:1072), and neither is a fence — the mapping is right for the *planner* fencing another node, while every M7A fence row is A1 fencing *itself*, where there is no CAS to widen. *`Decide` is not `TraceKind::AuthorityDecision`*: `EffectKind` has no trace variant, `Module::step` returns `Vec<Effect>`, and `AuthorityOutcome` has four variants against `DenyReason`'s fifteen, so M7A-59's `Deny(ControlUnavailable)` and M7A-43's `Deny(ClockSampleStale)` would be indistinguishable. *`EventKind::Check` is refused* — that half **holds, but only for `Checkpoint::Admission`**: design §2.5's table makes `Admission` synchronous on purpose and spells the other three checkpoints as an *"async `Check` effect / `AuthorityAnswer` event pair"*, and they cross a module boundary, so there is no code path for "points in a code path" to be about. The sentence this strikethrough replaces is the reason eleven rows were parked on a rewrite that could never have gone green; a cell written in the voice of a closed ruling stops being re-derived. Foundation's actual bill is one carrier arm plus one `StoreEffect` variant, landed 2026-09-22. *(c) What that leaves owed — a plan edit, not a contract wait.* §3's gate rows, every `Fence` row, every `PublishAuthorityView` row and §8.1–§8.6 are **no longer `Unavailable` on a C0 gap**; they are owed a **behavioural rewrite** onto the two landed KA-4 surfaces — the returned effect vector (now including `EffectKind::Kernel(KernelEffect::Ignored{reason})` for design §2.2's `Fact(..)`, A-R24) and the sim-recorded `TraceEvent`. Until that rewrite lands those rows report `unavailable` naming **this row's rewrite**, never green, and never by asserting something weaker. The `Control` slice — the watch and coherent-resync rows — was always expressible and is now **built**: see row 16.<br>**Drift re-read 2026-09-22 — (c)'s rewrite target gains a vocabulary, and the debt stays kernel-a's.** Re-read at `f616ddf`: every claim in this row still holds there — `EffectKind` seven (`event.rs:313-347`), `EventKind` eight (`:153-191`), no `Decide` / `Fence` / `PublishAuthorityView` / `Check` variant, `grep -rn FencingProof crates/` ⇒ **0** (re-run 2026-09-22, still 0), and the four `contracts::authority` structs at `:99`, `:159`, `:87`, `:23` reachable only through the `lib.rs` re-export. Ask **CB-7**, **uncommitted** in the tree today, changes what the `Ignored` carrier can say: the reason is now `KernelIgnoredReason` (`contracts/ignore.rs:77`), whose `Authority` arm carries **`AuthorityIgnoreReason`** (`contracts/authority.rs:257`) — **27 variants that kernel-a owns and kernel-a alone edits.** Ten of the names this plan asserts with a payload brace land as unit variants for kernel-a to widen in its own leaf; only `Blocked { reason: BlockReason }` has its payload spelled, and it reuses the same `BlockReason` that `PartitionMode::Blocked` carries, so a row that sets up a block and asserts the ignore compares one value against itself. **What this does and does not change here.** It does **not** reopen the blocker — the L-R60 mapping stands and no new `EffectKind` variant is owed. It does mean the §3 / §8.1–§8.6 rewrite this row owes can pin an `Ignored` reason **by value** in kernel-a's own vocabulary instead of leaving the reason open or forcing it onto a client-facing `ErrorKind`, which was the one thing that would have made the rewrite weaker than the rows it replaces. The rewrite is still owed and those rows still report `unavailable` naming it. One rule the rewrite must carry, from `ignore.rs`'s own doc: **kernel-a never destructures `Replica(_)`** and kernel-b never destructures `Authority(_)` — `#[non_exhaustive]` buys nothing in-crate, so this is convention backed by a type boundary, not by the compiler. Marker unmoved: CB-7 is not committed, so `git log -1 -- crates/rdb-core/src/contracts` is still `f616ddf` |
 | 16 | **`crates/rdb-core/src/authority.rs` landed — A1's watch slice is real, and it is kernel-a's own** | §2.4's watch and coherent-resync behaviour, asserted by M7A-28, M7A-31..M7A-33, M7A-123, M7A-126, M7A-129 against a module the plan described but nothing implemented | Rewritten at this basis, **+302/−16**. `Authority` is no longer a unit struct: it holds `state: AuthorityState`, `cursors: BTreeMap<ControlPrefix, Revision>` and `watch_refused_attempts: u32` (`authority.rs:75-82`). New: `pub enum AuthorityState{Unheld, Held, Fenced}` (`:63-71`); `pub const WATCH_ADMISSION_ATTEMPT_CAP: u32 = 3` (`:56`); accessors `state()` (`:97`), `watch_refused_attempts()` (`:103`), `cursor(prefix)` (`:109`); the total `ControlKey → ControlPrefix` map `family_of()` (`:117`); handlers `on_watched` (`:145`), `on_terminated` (`:162`), `on_family_snapshot` (`:217`), `on_control` (`:235`). `impl Module` is **real**: `capability()` (`:310`) and `step()` (`:318`) returning `Result<Vec<Effect>, RdbError>`, not a stub. `crates/rdb-sim/tests/authority.rs` landed with it | **Not a drift against the plan — the plan's subject arriving.** Three consequences, all of them things a row can now open rather than assume. **(a)** `ControlEffect::Reload` is emitted from **exactly one** match arm, the `ControlEvent::WatchTerminated` arm guarded by `termination.is_gap()` (module doc, `authority.rs:34-37`), which is the ADR-rdb-0008 §7 item 4 rule M7A-32 asserts — and M7A-32's positive-control arm now has a real counter to move. **(b)** `WATCH_ADMISSION_ATTEMPT_CAP = 3` and `watch_refused_attempts()` are the landed spelling of M7A-33's back-off bound; the row names the constant rather than a literal. **(c)** `state()` and `cursor(prefix)` are the fixture accessors KA-1 asks for, so the watch rows assert state without a test-only field. **One stale claim inside the landed file, recorded not fixed (not this plan's file):** its module doc at `authority.rs:11` still says `EffectKind::Control` is "one of the **six** variants that exist" — seven landed in the same commit. Reported to the owner; no M7A row depends on the count |
 
 None of these **sixteen** is a reason to lower an assertion (hard rule "never lower an assertion").
