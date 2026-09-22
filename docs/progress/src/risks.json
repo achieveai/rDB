@@ -1,76 +1,58 @@
 {
   "risks": [
     {
-      "text": "Every backup has a policy_version_ref that is always None.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "M6-33, product backlog after the M6 gate."
-    },
-    {
-      "text": "The restore_policy_mismatch log line is never emitted.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "M6-35, product backlog after the M6 gate."
-    },
-    {
-      "text": "A follower continuation page carries no leader hint.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "Product backlog after the M6 gate."
-    },
-    {
-      "text": "The C drive ran low twice today, corrupting build artifacts.",
-      "owner": "lead",
-      "severity": "medium",
-      "closing": "Purged. Check free space before treating a linker failure as a defect."
-    },
-    {
-      "text": "Concurrent agents hit Windows ephemeral-port exhaustion on rotation tests.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "Known environment constraint, not a code defect."
-    },
-    {
-      "text": "M6 evidence rows are reduced-scale, never a production claim.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "Restated per ADR-0031 on every refresh."
-    },
-    {
-      "text": "m4_69 failed the gate before the deadline scale was set by a script.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "Closed. scripts/gate.sh sets RETCD_TEST_DEADLINE_SCALE=3 and the row passes; a bare cargo test still gives it a third of its patience."
-    },
-    {
-      "text": "Concurrent gates against the same target directory cause linker collision.",
-      "owner": "lead",
-      "severity": "low",
-      "closing": "Gate script assigns each run a private target directory; concurrent gates need separate ones."
-    },
-    {
-      "text": "Four foundation capabilities return Unavailable: M7F-05, Network send, Cluster suspend, harness replay.",
+      "text": "Kernel-b has not started. It holds 148 of the 345 owed M7 rows, so it is the long pole.",
       "owner": "lead",
       "severity": "high",
-      "closing": "Foundation team implements stubs or full versions to unblock kernel test rows."
+      "closing": "Start kernel-b once kernel-a phase 2 hands off and its contract asks are answered."
     },
     {
-      "text": "Fifteen contract asks queued for second foundation round from three teams.",
-      "owner": "lead",
-      "severity": "medium",
-      "closing": "Foundation advances through contract backlog in priority order."
-    },
-    {
-      "text": "Contract CB-7 opened: closed ErrorKind cannot carry kernel-B drop reasons.",
+      "text": "Kernel-a has 3 of 174 rows. Its reach gate passed, and phase 2 is being built now.",
       "owner": "lead",
       "severity": "high",
-      "closing": "Design resolution and implementation of contract CB-7."
+      "closing": "Phase 2 lands, the tester re-gates, then rows follow."
     },
     {
-      "text": "Five of seven AckRejectReason cells have no producer. RoleMismatch and Unverifiable lack coverage.",
+      "text": "About 6,200 lines of M7 code are uncommitted in a shared tree. One bad command could lose them.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Commit in reviewed slices once Gautam approves. No agent may stash, reset or clean."
+    },
+    {
+      "text": "The simulator still refuses four kernel-a effect kinds. So a simulated run stops at the first grant.",
       "owner": "lead",
       "severity": "medium",
-      "closing": "Coverage cells defined in kernel test planning."
+      "closing": "Ignored, alert and fact effects are now recorded. The rest stay refused by ruling until publication is built."
+    },
+    {
+      "text": "A test name is not its claim. The census counts functions that exist, not what they assert.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "The MISCREDITED list holds such ids as owed until the claim is true on disk. M7A-28 is still on it."
+    },
+    {
+      "text": "The drift check will fail for all four test plans when the contract changes commit.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Re-read each plan's section 15 against the contracts, then move its marker. Never move a marker just to pass."
+    },
+    {
+      "text": "The new purity check script is untracked, but both gate scripts already call it.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "The script and both gate script edits land in one commit."
+    },
+    {
+      "text": "Five of seven acknowledgement reject reasons have nothing that produces them.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Kernel-b builds the producers, or the plan marks those cells unreachable."
+    },
+    {
+      "text": "The C drive fills during parallel builds and corrupts build output.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Check free space before blaming a linker failure. Delete only your own build folder."
     }
   ]
 }

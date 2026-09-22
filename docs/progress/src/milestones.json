@@ -339,14 +339,14 @@
       "stage": "develop",
       "acceptance": [
         {
-          "text": "Foundation module C0 contracts pass codec and storage tests.",
-          "mark": "open",
-          "evidence": ""
+          "text": "Foundation contracts, clock and run loop work end to end.",
+          "mark": "risk",
+          "evidence": "census: 50 of 56 landed, 6 exempt, 0 owed. Uncommitted. Kernel effects still refused by the run loop."
         },
         {
           "text": "Kernel-A ordering and consistency properties are validated.",
           "mark": "open",
-          "evidence": ""
+          "evidence": "Reach gate passed 2026-09-22; rows not yet written."
         },
         {
           "text": "Kernel-B state recovery and durability pass test suite.",
@@ -359,28 +359,33 @@
           "evidence": ""
         }
       ],
-      "tests": "399 test functions planned: kernel-a 164 rows, kernel-b 145 rows, verification 90 rows. Foundation test plan in progress.",
+      "tests": "118 of 469 row ids landed. Foundation 50 of 56, kernel-a 3 of 174, kernel-b 0 of 148, verification 65 of 91.",
       "status": [
         {
-          "lead": "Wave 2 committed.",
-          "text": "Foundation code and four kernel contracts landed. Gate passed: 146 tests, fmt clean, clippy clean.",
-          "evidence": "f616ddf; ledger:692-708"
+          "lead": "Kernel-a reach passed.",
+          "text": "The tester drove all 14 fence triggers by hand. They found a real clock fencing defect, now fixed.",
+          "evidence": "ledger L-R144; census 2026-09-22 working tree"
         },
         {
-          "lead": "Two decisions held for Gautam.",
-          "text": "Funding approval at recommended level and shrink-budget acceptance awaiting decision.",
-          "evidence": "ledger:725-728"
+          "lead": "Timers wired into the run loop.",
+          "text": "Armed timers now fire back into the loop. Kernel effects are the next seam, being built now.",
+          "evidence": "ledger L-R145"
         },
         {
-          "lead": "Design issue opened.",
-          "text": "Contract CB-7 opened: closed ErrorKind cannot carry kernel-B drop reasons.",
-          "evidence": "ledger:751-762"
+          "lead": "Nothing committed since the 21st.",
+          "text": "About 6,200 lines of M7 work wait in the tree for review and commit.",
+          "evidence": "git diff --stat HEAD -- crates: 24 files, +6231"
         }
       ],
       "history": [
         "Architect passed all four team designs; no gaps identified.",
         "Critic passed design records for kernel-a, kernel-b, and verification.",
-        "Test planner issued kernel-a test plan; kernel-b test plan advanced; verification plan completed and passed review."
+        "Test planner issued kernel-a test plan; kernel-b test plan advanced; verification plan completed and passed review.",
+        "Wave 2 committed: foundation code and four kernel contracts landed, 146 tests green.",
+        "PR drafted against foundation scope, halted when dashboard correctly reported M7 incomplete.",
+        "CB-8 fencing branch verified unreachable; doc defect in urgency premise corrected.",
+        "Run loop built first, on Gautam's call. Foundation rows followed, and none are owed now.",
+        "Kernel-a miscredit found: half its credited rows asserted other rows' claims. Two were renamed onto the right id."
       ]
     },
     {

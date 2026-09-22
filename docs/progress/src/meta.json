@@ -1,10 +1,10 @@
 {
-  "updated": "2026-09-21T09:21:32.252Z",
+  "updated": "2026-09-22T19:51:58.362Z",
   "ledger": {
     "path": ".claude/scratchpad/conversation_memories/rdb-partition-database/ledger.md",
-    "line": 795
+    "line": 4453
   },
-  "git_head": "6f5fa19",
+  "git_head": "395d535",
   "part_states": {
     "sm-core": "built",
     "sm-log": "built",
@@ -47,9 +47,14 @@
     "gossip-key-rotation": "building",
     "drain-check": "building",
     "rolling-upgrade": "building",
-    "rdb-foundation": "building",
+    "rdb-serialiser": "building",
+    "rdb-contracts": "building",
+    "rdb-sim-clock": "building",
+    "rdb-harness-caps": "gap",
+    "rdb-authority": "building",
     "rdb-kernel-a": "building",
-    "rdb-kernel-b": "building",
-    "rdb-verification": "building"
+    "rdb-kernel-b": "planned",
+    "rdb-oracle": "building",
+    "rdb-campaign": "gap"
   }
 }

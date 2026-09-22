@@ -951,8 +951,16 @@ function renderSystemPicture(diagrams, partsById, oldPartStates, activeMilestone
       <span class="mm-lg-item"><span class="mm-sw gap"></span>⚠ gap — built, with a logged known gap</span>
     </div>`;
 
-  const blocks = diagrams.map((d, i) => {
-    const t = transformMermaid(d.src, partsById, oldPartStates);
+  // The page shows the active milestone only. Earlier diagrams live in the archive snapshots;
+  // with no active milestone (between gates) every diagram shows.
+  const shown = diagrams
+    .map((d, i) => ({ t: transformMermaid(d.src, partsById, oldPartStates), i }))
+    .filter(({ t }) => !activeMilestoneId || t.milestones.includes(activeMilestoneId));
+  const hidden = diagrams.length - shown.length;
+  const archiveNote = hidden ? `
+    <p class="diagram-lead">${hidden} diagrams for earlier milestones are in the archive, under docs/archive/progress.</p>` : '';
+
+  const blocks = shown.map(({ t, i }) => {
     const id = `diagram-${i}`;
     const isAlways = t.open === 'always';
     // Anything not fully built stays open: a collapsed "all good" view must not hide a gap.
@@ -978,7 +986,7 @@ function renderSystemPicture(diagrams, partsById, oldPartStates, activeMilestone
 
   return `
   <section id="section-system-picture">
-    <h2 class="section-title">System picture</h2>${legend}${blocks}
+    <h2 class="section-title">System picture</h2>${legend}${blocks}${archiveNote}
   </section>`;
 }
 
@@ -1042,17 +1050,20 @@ function renderMilestones(milestones, activeMilestone) {
     </div>`;
   }
 
-  const cards = milestones.map(renderMilestoneCard).join('\n');
+  // Only the active milestone gets a card; the strip above already shows every other one.
+  const cards = (activeMilestone ? [activeMilestone] : milestones).map(renderMilestoneCard).join('\n');
+  const title = activeMilestone ? 'This milestone' : 'Milestones';
   return `
   <section id="section-milestones">
-    <h2 class="section-title">Milestones</h2>${legend}${pipeline}
+    <h2 class="section-title">${esc(title)}</h2>${activeMilestone ? '' : legend}${pipeline}
     <div class="board">
 ${cards}
     </div>
   </section>`;
 }
 
-function renderActiveWork(agents, activeMilestoneId) {
+function renderActiveWork(allAgents, activeMilestoneId) {
+  const agents = activeMilestoneId ? allAgents.filter((a) => a.milestone === activeMilestoneId) : allAgents;
   const finished = agents.filter((a) => a.status === 'finished');
 
   const lanesBlock = buildSwimLanes(agents);
@@ -1126,7 +1137,7 @@ ${renderActiveWork(p.work.agents || [], activeMilestoneId)}
 ${renderRisks(p.risks.risks || [])}
 ${renderReference(p.reference)}
 
-  <footer>rEtcd progress report. Source of truth: the M4-M6 ledger. Regenerated after each milestone gate or critic verdict.</footer>
+  <footer>rEtcd progress report for the active milestone. Source of truth: the ledger named in config.json. Earlier milestones: docs/archive/progress.</footer>
 </div>
 
 <script>
