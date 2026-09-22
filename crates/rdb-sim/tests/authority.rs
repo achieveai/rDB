@@ -451,3 +451,56 @@ fn m7a_28_gap_termination_reloads_then_rewatches() {
         );
     }
 }
+
+/// M7A-33, second row — `WATCH_ADMISSION_ATTEMPT_CAP` is exactly 3, not merely "some cap".
+///
+/// `m7a_33` drives its own tail loop with `while ... < WATCH_ADMISSION_ATTEMPT_CAP`, so it
+/// re-derives the cap from the same constant it is meant to check and cannot notice the constant
+/// itself moving to 2 or to 4 (manual-tester finding K4, 2026-09-21). This row hardcodes the expected
+/// counts instead of reading them back from the constant, so a changed cap value fails it.
+///
+/// `become_held` leaves both `Grants` and `Partitions` watched, and `watch_refused_attempts` is
+/// one counter shared by every family (see `Driver::terminations`'s doc comment: one `terminate`
+/// ends every open watch). So each `terminate` call advances the shared counter by 2, once per
+/// family, and the cap is checked separately for each family's own increment within that call.
+#[retcd_test]
+fn m7a_33_admission_cap_is_exactly_three() {
+    support::preamble();
+    let mut driver = Driver::new();
+    driver.become_held();
+    let _ = driver.take_reloads();
+
+    // Call 1 carries the counter through 1, then 2 (one increment per watched family). Both are
+    // below the cap of 3, so both families re-arm.
+    let reopened_1 = driver.terminate(WatchTermination::ResourceExhaustedFatal);
+    assert_eq!(
+        driver.kernel.watch_refused_attempts(),
+        2,
+        "M7A-33: one call terminates both watched families, advancing the shared counter by 2"
+    );
+    assert_eq!(
+        reopened_1.len(),
+        2,
+        "M7A-33: attempts 1 and 2 are both below the cap of 3, so both families re-arm"
+    );
+    driver.reopen(&reopened_1);
+
+    // Call 2 carries the counter through 3, then 4. The cap is exactly 3: both increments on
+    // this call land at or past it, so neither family re-arms.
+    let reopened_2 = driver.terminate(WatchTermination::ResourceExhaustedFatal);
+    assert_eq!(
+        driver.kernel.watch_refused_attempts(),
+        4,
+        "M7A-33: the counter keeps advancing regardless of the cap"
+    );
+    assert!(
+        reopened_2.is_empty(),
+        "M7A-33: the cap is exactly 3 -- attempts 3 and 4 on this call are both at or past \
+         it, so neither family re-arms"
+    );
+    assert_eq!(
+        driver.take_reloads(),
+        Vec::<ControlPrefix>::new(),
+        "M7A-33: reaching the cap never provokes a reload"
+    );
+}
