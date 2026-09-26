@@ -45,8 +45,8 @@ pub mod replication;
 pub mod transaction;
 
 pub use contracts::authority::{
-    AuthorityDecision, AuthorityView, BlockReason, Checkpoint, DenyReason, EvidenceRef, Lineage,
-    PartitionMode, Verdict,
+    AuthorityDecision, AuthorityIgnoreReason, AuthorityView, BlockReason, Checkpoint, DenyReason,
+    EvidenceRef, FenceCredential, FencingProof, Lineage, PartitionMode, Revocation, Verdict,
 };
 pub use contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
@@ -65,7 +65,16 @@ pub use contracts::ids::{
     RequestId, RequestIdentity, Revision, ScenarioId, Seq, SnapshotHandle, TenantId, TimerId,
     TimerVersion,
 };
+pub use contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 pub use contracts::membership::{CopyId, Member, PartitionConfig};
+pub use contracts::protection::{AdmissionState, ReplicationLag};
+pub use contracts::qualification::{
+    QualificationCause, QualificationChanged, QualificationDirection,
+};
+pub use contracts::recovery::{
+    CommittedRoot, DurableProof, InventoryOutcome, LossRecord, MissingProof, RecoveryBarrier,
+    RecoveryResult, RetainedStatusMap, SelectedLineage, UnavailableReason,
+};
 pub use contracts::storage::{
     Batch, CapturedPrefix, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault,
     StoreEffect, Write,

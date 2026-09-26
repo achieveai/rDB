@@ -1,0 +1,3923 @@
+//! F1 lineage and recovery, driven through `Module::step` and F1's pure selection functions.
+//!
+//! The plan rows (`m7b_NN_*`, team kernel-b test plan §8 and §9) are the last section, written
+//! after the manual tester's thumbs-up (B-R45b). Everything above them is scaffolding and the
+//! ruling rows of the B-R41/B-R45 gates, the tester's `tester_*` rows included; a scaffold names
+//! the plan row it prepared.
+//!
+//! F1 rows that are not here, each for one reason: M7B-96, 104, 136 and 137 are sim rows
+//! (rdb-sim, F:H1/F:M1). M7B-116's spy clause says length is never read from `select_prefix`,
+//! which design §5.4 contradicts, so it waits on a re-word. M7B-112 and 138 assert R1's receiver,
+//! not F1. M7B-108 (re-worded by B-R49), 97 and 113 are the last rows in the file; the last two
+//! read `SelectionSpy`, F1's `LengthSpy`/`SelectSpy` seam.
+//!
+//! A1's `FenceProven` is not routed to F1 by the sim yet (lead ruling on B-R35), so every test
+//! builds its `FencingProof` directly and delivers it as `RecoveryEvent::FenceProven`.
+//!
+//! Histories are modelled as digests: every copy shares branch 0 up to its fork point, and a
+//! copy on branch `n` has a different digest at every sequence after the fork. Two copies on
+//! different branches past their fork are divergent by construction.
+
+use config_log::retcd_test;
+
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::AuthorityTimer;
+use rdb_core::contracts::authority::{
+    AuthorityView, BlockReason, DenyReason, FencingProof, Lineage, PartitionMode, Revocation,
+};
+use rdb_core::contracts::control::{
+    CasOutcome, ControlEffect, ControlEvent, ControlKey, ReadOutcome,
+};
+use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::errors::RdbError;
+use rdb_core::contracts::event::{
+    Budgets, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, NodeLifecycle,
+    StepCtx,
+};
+use rdb_core::contracts::ids::{
+    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, Generation,
+    GrantId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, SnapshotHandle, TimerId,
+    TimerVersion,
+};
+use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
+use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+use rdb_core::contracts::recovery::{
+    Candidate, CommittedRoot, DivergenceEvidence, DurableProof, InventoryOutcome, LineageAnchor,
+    LossRecord, MissingProof, RecoveryBarrier, RecoveryEffect, RecoveryEvent, RecoveryPlan,
+    RecoveryResult, RetainedStatusMap, SelectedLineage, SurvivorInventory, UnavailableReason,
+};
+use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
+use rdb_core::contracts::trace::{QuarantineReason, Version};
+use rdb_core::recovery::lineage::{
+    select_leader, select_prefix, select_prefix_spied, verify_ancestry, Rejected, SelectionOutcome,
+    SelectionSpy, VerifiedInventory,
+};
+use rdb_core::recovery::{
+    mode_for, new_root, Recovery, RecoveryPhase, DISCOVERY_TIMER, MAX_WINDOW_EXTENSIONS,
+};
+
+use std::collections::BTreeSet;
+
+use bytes::Bytes;
+
+// ---------------------------------------------------------------------------------------------
+// Fixture: primary A, regular B and C (optional shadow D); prior lineage (7, 1); root at seq 10.
+// ---------------------------------------------------------------------------------------------
+
+const PARTITION: PartitionId = PartitionId(1);
+const A: CopyId = CopyId(1);
+const B: CopyId = CopyId(2);
+const C: CopyId = CopyId(3);
+const D: CopyId = CopyId(4);
+const C1: ConfigVersion = ConfigVersion(1);
+const PRIOR_GEN: Generation = Generation(7);
+const PRIOR_EPOCH: OwnerEpoch = OwnerEpoch(1);
+const BASE: u64 = 10;
+const CONTROL_REV: Revision = Revision(5);
+const RETENTION: u64 = 60_000;
+const WINDOW: u64 = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+const BUDGETS: Budgets = Budgets::SPEC_DEFAULTS;
+const CORRELATION: CorrelationId = CorrelationId(42);
+
+struct NoSnapshot;
+
+impl SnapshotRead for NoSnapshot {
+    fn handle(&self) -> SnapshotHandle {
+        SnapshotHandle(0)
+    }
+    fn at(&self) -> Seq {
+        Seq::ZERO
+    }
+    fn generation(&self) -> Generation {
+        Generation(0)
+    }
+    fn get(&self, _ns: Namespace, _key: &[u8]) -> Option<Bytes> {
+        None
+    }
+    fn version(&self, _ns: Namespace, _key: &[u8]) -> Option<Version> {
+        None
+    }
+    fn scan(&self, _ns: Namespace, _from: &[u8], _limit: usize) -> Vec<(Bytes, Bytes)> {
+        Vec::new()
+    }
+}
+
+const SNAPSHOT: NoSnapshot = NoSnapshot;
+
+fn ctx(now: u64) -> StepCtx<'static> {
+    StepCtx {
+        now: Tick(now),
+        control_time: ControlTime {
+            estimate: Tick(now),
+            error_millis: 0,
+            bound_established: true,
+            sampled_at: Tick(now),
+        },
+        node: NodeId(1),
+        boot: BootId(1),
+        partition: PARTITION,
+        generation: PRIOR_GEN,
+        owner_epoch: PRIOR_EPOCH,
+        config_version: C1,
+        snapshot: &SNAPSHOT,
+        budgets: &BUDGETS,
+    }
+}
+
+/// The digest at `seq` on `branch`. Branch 0 is the shared history.
+fn dg(branch: u8, seq: u64) -> Digest {
+    let mut bytes = [0u8; 32];
+    bytes[0] = branch;
+    bytes[1..9].copy_from_slice(&seq.to_be_bytes());
+    Digest(bytes)
+}
+
+/// The digest at `seq` of a history that leaves branch 0 after `fork`.
+fn on(branch: u8, fork: u64, seq: u64) -> Digest {
+    if seq <= fork {
+        dg(0, seq)
+    } else {
+        dg(branch, seq)
+    }
+}
+
+fn prior() -> Lineage {
+    Lineage {
+        partition: PARTITION,
+        generation: PRIOR_GEN,
+        owner_epoch: PRIOR_EPOCH,
+    }
+}
+
+fn root() -> Lineage {
+    Lineage {
+        partition: PARTITION,
+        generation: Generation(8),
+        owner_epoch: OwnerEpoch(2),
+    }
+}
+
+fn anchor() -> LineageAnchor {
+    LineageAnchor {
+        lineage: prior(),
+        base_seq: Seq(BASE),
+        base_digest: dg(0, BASE),
+    }
+}
+
+/// A full ladder from the root to `head` on `branch`, leaving branch 0 after `fork`.
+fn inv_on(copy: CopyId, head: u64, branch: u8, fork: u64) -> SurvivorInventory {
+    SurvivorInventory {
+        copy,
+        anchor_seen: anchor(),
+        head: (Seq(head), on(branch, fork, head)),
+        ladder: (BASE..=head)
+            .map(|s| (Seq(s), on(branch, fork, s)))
+            .collect(),
+        quarantined: None,
+    }
+}
+
+/// A full ladder on the shared history.
+fn inv(copy: CopyId, head: u64) -> SurvivorInventory {
+    inv_on(copy, head, 0, u64::MAX)
+}
+
+/// Only the root and the head: a pairwise check against it needs a probe.
+fn sparse(copy: CopyId, head: u64) -> SurvivorInventory {
+    SurvivorInventory {
+        ladder: vec![(Seq(BASE), dg(0, BASE))],
+        ..inv(copy, head)
+    }
+}
+
+fn member(copy: CopyId, role: ReplicaRole) -> Member {
+    Member {
+        copy,
+        node: NodeId(u32::from(copy.0)),
+        boot: BootId(1),
+        role,
+    }
+}
+
+fn candidate(copy: CopyId) -> Candidate {
+    Candidate {
+        copy,
+        primary_eligible: true,
+        healthy: true,
+        within_capacity: true,
+        has_valid_grant: true,
+    }
+}
+
+/// `{A primary, B, C regular}` plus `extra`, every member a viable candidate.
+fn plan(extra: &[Member]) -> RecoveryPlan {
+    let mut members = vec![
+        member(A, ReplicaRole::Primary),
+        member(B, ReplicaRole::RegularSecondary),
+        member(C, ReplicaRole::RegularSecondary),
+    ];
+    members.extend_from_slice(extra);
+    let candidates = members.iter().map(|m| candidate(m.copy)).collect();
+    RecoveryPlan {
+        anchor: anchor(),
+        config: PartitionConfig::new(PARTITION, C1, members),
+        candidates,
+        rebuild_required: [A, B, C].into_iter().collect(),
+        authority_view: AuthorityView {
+            lineage: prior(),
+            grant_id: GrantId(3),
+            boot_id: BootId(1),
+            authority_generation: AuthorityGeneration(1),
+            config_version: C1,
+            authority_seq: 1,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon: DenyReason::NoGrant,
+        },
+        retention_millis: RETENTION,
+    }
+}
+
+fn proof() -> FencingProof {
+    FencingProof {
+        partition: PARTITION,
+        prior_generation: PRIOR_GEN,
+        prior_owner_epoch: PRIOR_EPOCH,
+        prior_grant_id: GrantId(2),
+        prior_boot_id: BootId(1),
+        revocation: Revocation::DurableDrain {
+            ack_revision: Revision(4),
+        },
+        control_revision: CONTROL_REV,
+        decision_tick: Tick(100),
+    }
+}
+
+fn proven(copy: CopyId, seq: u64, digest: Digest) -> DurableProof {
+    DurableProof {
+        copy,
+        partition: PARTITION,
+        seq: DurableSeq(seq),
+        digest,
+    }
+}
+
+fn durable(copy: CopyId, seq: u64, digest: Digest) -> RecoveryEvent {
+    RecoveryEvent::DurableAt(proven(copy, seq, digest))
+}
+
+fn caught_up(copy: CopyId, head: u64, digest: Digest) -> RecoveryEvent {
+    RecoveryEvent::CopyCaughtUp {
+        copy,
+        head: Seq(head),
+        digest,
+    }
+}
+
+/// A plan anchored on the new root at seq 20: what a later recovery would be given.
+fn replan() -> RecoveryPlan {
+    RecoveryPlan {
+        anchor: LineageAnchor {
+            lineage: root(),
+            base_seq: Seq(20),
+            base_digest: dg(0, 20),
+        },
+        ..plan(&[])
+    }
+}
+
+/// A fence proved against the new root, (8, 2). It read control after the peer's commit, so its
+/// revision is newer than anything the first run saw (ruling A-5).
+fn refence() -> FencingProof {
+    FencingProof {
+        prior_generation: Generation(8),
+        prior_owner_epoch: OwnerEpoch(2),
+        control_revision: Revision(7),
+        ..proof()
+    }
+}
+
+/// A survivor already on the new root (8, 2) at base 20: a peer's recovery committed first.
+fn on_new_root(copy: CopyId, head: u64) -> SurvivorInventory {
+    SurvivorInventory {
+        copy,
+        anchor_seen: replan().anchor,
+        head: (Seq(head), dg(0, head)),
+        ladder: (20..=head).map(|s| (Seq(s), dg(0, s))).collect(),
+        quarantined: None,
+    }
+}
+
+/// The record the recovery CAS writes: A leads the new root, serving.
+fn record(owner: CopyId) -> PartitionRecord {
+    PartitionRecord {
+        partition: PARTITION,
+        owner: NodeId(u32::from(owner.0)),
+        generation: Generation(8),
+        owner_epoch: OwnerEpoch(2),
+        config_version: C1,
+        lifecycle: PartitionLifecycle::Serving,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Effect helpers
+// ---------------------------------------------------------------------------------------------
+
+fn r(effect: RecoveryEffect) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::Recovery(effect))
+}
+
+fn ign(reason: ReplicaIgnoreReason) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::Ignored {
+        reason: KernelIgnoredReason::Replica(reason),
+    })
+}
+
+fn arm(version: u64, at: u64) -> EffectKind {
+    EffectKind::Timer(TimerEffect::Arm {
+        id: DISCOVERY_TIMER,
+        version: TimerVersion(version),
+        at: Tick(at),
+    })
+}
+
+fn cas(expected: Revision, owner: CopyId) -> EffectKind {
+    EffectKind::Control(ControlEffect::Cas {
+        key: ControlKey::Partition(PARTITION),
+        expected: Some(expected),
+        value: Some(record(owner).encode()),
+    })
+}
+
+fn selected(cutoff: u64, source: CopyId) -> EffectKind {
+    r(RecoveryEffect::Selected(SelectedLineage {
+        root: root(),
+        cutoff_seq: Seq(cutoff),
+        cutoff_digest: dg(0, cutoff),
+        source,
+    }))
+}
+
+fn catch_up(from: CopyId, to: CopyId, through: u64) -> EffectKind {
+    r(RecoveryEffect::CatchUp {
+        from,
+        to,
+        through: Seq(through),
+        credential: proof().credential_for(from),
+    })
+}
+
+fn sync(copy: CopyId, cutoff: u64) -> EffectKind {
+    r(RecoveryEffect::SyncWalThrough {
+        copy,
+        cutoff: Seq(cutoff),
+    })
+}
+
+fn lost(copy: CopyId, reason: UnavailableReason) -> EffectKind {
+    r(RecoveryEffect::RecordSourceUnavailable { copy, reason })
+}
+
+fn block(reason: BlockReason) -> EffectKind {
+    r(RecoveryEffect::BlockPromotion { reason })
+}
+
+fn fired(version: u64) -> EventKind {
+    EventKind::Timer(TimerFired {
+        id: DISCOVERY_TIMER,
+        version: TimerVersion(version),
+        scheduled_at: Tick(0),
+    })
+}
+
+fn lose(copy: CopyId) -> EventKind {
+    EventKind::Kernel(KernelEvent::CopyLost { copy })
+}
+
+fn cas_result(outcome: CasOutcome) -> EventKind {
+    EventKind::Control(ControlEvent::CasResult {
+        key: ControlKey::Partition(PARTITION),
+        outcome,
+    })
+}
+
+fn read_result(outcome: ReadOutcome) -> EventKind {
+    EventKind::Control(ControlEvent::Value {
+        key: ControlKey::Partition(PARTITION),
+        outcome,
+    })
+}
+
+/// The `Recovered` result in `effects`; exactly one.
+fn recovered(effects: &[EffectKind]) -> RecoveryResult {
+    let found: Vec<&RecoveryResult> = effects
+        .iter()
+        .filter_map(|e| match e {
+            EffectKind::Kernel(KernelEffect::Recovered(result)) => Some(&**result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one Recovered in {effects:?}");
+    found[0].clone()
+}
+
+fn has_selected(effects: &[EffectKind]) -> bool {
+    effects.iter().any(|e| {
+        matches!(
+            e,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::Selected(_)))
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------------------------
+
+/// One F1 instance plus a log of every effect it emitted.
+struct F1 {
+    module: Recovery,
+    log: Vec<EffectKind>,
+}
+
+impl F1 {
+    fn new() -> Self {
+        Self {
+            module: Recovery::new(),
+            log: Vec::new(),
+        }
+    }
+
+    /// Step `kind` with the context at `now` and the event arriving at `at`.
+    fn try_at(&mut self, now: u64, at: u64, kind: EventKind) -> Result<Vec<EffectKind>, RdbError> {
+        let event = Event {
+            id: EventId(now),
+            at: Tick(at),
+            node: NodeId(1),
+            boot: BootId(1),
+            partition: PARTITION,
+            correlation: CORRELATION,
+            kind,
+        };
+        let effects = self.module.step(&ctx(now), &event)?;
+        assert!(!effects.is_empty(), "BA-2: never an empty effect vector");
+        let kinds: Vec<EffectKind> = effects
+            .into_iter()
+            .map(|effect| {
+                assert_eq!(effect.correlation, CORRELATION);
+                assert_eq!(effect.partition, PARTITION);
+                effect.kind
+            })
+            .collect();
+        self.log.extend(kinds.iter().cloned());
+        Ok(kinds)
+    }
+
+    /// `kind` is not F1's: `step` declines it with `Unavailable` and state does not move.
+    fn declines(&mut self, now: u64, kind: EventKind) {
+        let phase = self.phase();
+        let answer = self.try_at(now, now, kind);
+        assert!(
+            matches!(answer, Err(RdbError::Unavailable { .. })),
+            "expected a decline, got {answer:?}"
+        );
+        assert_eq!(self.phase(), phase, "a decline moves nothing");
+    }
+
+    fn at(&mut self, now: u64, at: u64, kind: EventKind) -> Vec<EffectKind> {
+        self.try_at(now, at, kind)
+            .expect("an F1 input is never refused")
+    }
+
+    fn step(&mut self, now: u64, kind: EventKind) -> Vec<EffectKind> {
+        self.at(now, now, kind)
+    }
+
+    fn rec(&mut self, now: u64, input: RecoveryEvent) -> Vec<EffectKind> {
+        self.step(now, EventKind::Kernel(KernelEvent::Recovery(input)))
+    }
+
+    fn report(&mut self, now: u64, inventory: SurvivorInventory) -> Vec<EffectKind> {
+        self.rec(now, RecoveryEvent::InventoryReported(Box::new(inventory)))
+    }
+
+    fn phase(&self) -> RecoveryPhase {
+        self.module.phase()
+    }
+
+    /// How many control CAS effects the run has emitted.
+    fn cas_count(&self) -> usize {
+        self.log
+            .iter()
+            .filter(|e| matches!(e, EffectKind::Control(ControlEffect::Cas { .. })))
+            .count()
+    }
+}
+
+/// Planned on `plan` and fenced at tick 0.
+fn fenced_on(plan: RecoveryPlan) -> F1 {
+    let mut f1 = F1::new();
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan)));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    f1
+}
+
+/// Planned (with `extra` members) and fenced at tick 0.
+fn fenced(extra: &[Member]) -> F1 {
+    fenced_on(plan(extra))
+}
+
+/// Fenced, `inventories` reported, `failed` copies failed; returns the window-close effects.
+fn closed(
+    extra: &[Member],
+    inventories: Vec<SurvivorInventory>,
+    failed: &[CopyId],
+) -> (F1, Vec<EffectKind>) {
+    let mut f1 = fenced(extra);
+    for inventory in inventories {
+        f1.report(10, inventory);
+    }
+    for &copy in failed {
+        f1.rec(10, RecoveryEvent::InventoryFailed { copy });
+    }
+    let close = f1.step(WINDOW, fired(1));
+    (f1, close)
+}
+
+/// All three copies at head `head`: selection needs no catch-up and goes straight to the barrier.
+fn at_barrier(head: u64) -> F1 {
+    let (f1, close) = closed(&[], vec![inv(A, head), inv(B, head), inv(C, head)], &[]);
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier, "{close:?}");
+    f1
+}
+
+/// At the barrier, every copy durable at `head`: the recovery CAS is in flight.
+fn proposing(head: u64) -> F1 {
+    let mut f1 = at_barrier(head);
+    for copy in [A, B, C] {
+        f1.rec(3_000, durable(copy, head, dg(0, head)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    f1
+}
+
+/// A alone survived at head 20 and committed at revision 9 in `ReadOnly`.
+fn lone_committed() -> F1 {
+    lone_committed_with_result().0
+}
+
+/// [`lone_committed`], and the `Recovered` result its commit emitted.
+fn lone_committed_with_result() -> (F1, RecoveryResult) {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20)], &[B, C]);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.mode, PartitionMode::ReadOnly);
+    (f1, result)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-104/§5.6 mode table.
+#[retcd_test]
+fn mode_table_counts_eligible_regulars() {
+    assert_eq!(
+        mode_for(0),
+        PartitionMode::Blocked {
+            reason: BlockReason::NoEligibleRegular
+        }
+    );
+    assert_eq!(mode_for(1), PartitionMode::ReadOnly);
+    assert_eq!(mode_for(2), PartitionMode::DegradedRf2);
+    assert_eq!(mode_for(3), PartitionMode::Active);
+    assert_eq!(mode_for(4), PartitionMode::Active);
+}
+
+/// Q4: the new root is the next generation and the next owner epoch.
+#[retcd_test]
+fn new_root_is_next_generation_and_epoch() {
+    assert_eq!(new_root(&proof()), root());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Idle and the fence (§2.1)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-84: `Idle` leaves only on a `FencingProof`.
+#[retcd_test]
+fn idle_takes_nothing_but_a_fence() {
+    let mut f1 = F1::new();
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan(&[]))));
+    let not_fenced = vec![ign(ReplicaIgnoreReason::NotFenced)];
+    assert_eq!(f1.report(1, inv(A, 20)), not_fenced);
+    assert_eq!(f1.rec(2, durable(A, 20, dg(0, 20))), not_fenced);
+    assert_eq!(f1.step(3, fired(1)), not_fenced);
+    assert_eq!(f1.step(5, lose(B)), not_fenced);
+    assert_eq!(f1.phase(), RecoveryPhase::Idle);
+}
+
+#[retcd_test]
+fn plan_is_recorded_and_a_fence_without_one_is_invalid_config() {
+    let mut f1 = F1::new();
+    assert_eq!(
+        f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof()))),
+        vec![ign(ReplicaIgnoreReason::InvalidConfig)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Idle);
+    assert_eq!(
+        f1.rec(1, RecoveryEvent::Plan(Box::new(plan(&[])))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+}
+
+/// Scaffolds M7B-85/86: every member is queried, and the window is anchored to the fence's
+/// arrival tick — not to `ctx.now`, not to `proof.decision_tick`.
+#[retcd_test]
+fn fence_queries_every_member_and_anchors_the_window_at_arrival() {
+    let mut f1 = F1::new();
+    f1.rec(
+        0,
+        RecoveryEvent::Plan(Box::new(plan(&[member(D, ReplicaRole::Shadow)]))),
+    );
+    let effects = f1.at(
+        900,
+        700,
+        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(Box::new(
+            proof(),
+        )))),
+    );
+    assert_eq!(
+        effects,
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C, D]
+            }),
+            arm(1, 700 + WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+/// `step` refuses a kind F1 never takes rather than answering it.
+#[retcd_test]
+fn step_refuses_a_kind_f1_never_takes() {
+    let mut f1 = F1::new();
+    let refused = f1.try_at(
+        0,
+        0,
+        EventKind::Node(NodeLifecycle::Resumed {
+            suspended_millis: 5,
+        }),
+    );
+    assert!(
+        matches!(refused, Err(RdbError::Unavailable { .. })),
+        "{refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The window (§5.2, §5.5)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-87: a fire before the deadline, or of an older version, is stale; another
+/// module's timer is not F1's at all.
+#[retcd_test]
+fn only_the_current_due_timer_closes_the_window() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
+    assert_eq!(f1.step(WINDOW - 1, fired(1)), stale);
+    assert_eq!(f1.step(WINDOW, fired(0)), stale);
+    let other = EventKind::Timer(TimerFired {
+        id: TimerId(DISCOVERY_TIMER.0 + 1),
+        version: TimerVersion(1),
+        scheduled_at: Tick(WINDOW),
+    });
+    f1.declines(WINDOW, other);
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    assert!(has_selected(&f1.step(WINDOW, fired(1))));
+}
+
+/// Scaffolds M7B-88/89: a stale-lineage or quarantined survivor is recorded, never selected, and
+/// its later reports are refused.
+#[retcd_test]
+fn stale_lineage_and_quarantined_survivors_are_recorded_unavailable() {
+    let mut f1 = fenced(&[]);
+    let stale = SurvivorInventory {
+        anchor_seen: LineageAnchor {
+            lineage: Lineage {
+                generation: Generation(6),
+                ..prior()
+            },
+            ..anchor()
+        },
+        ..inv(B, 40)
+    };
+    assert_eq!(
+        f1.report(10, stale),
+        vec![lost(B, UnavailableReason::StaleLineage)]
+    );
+    let quarantined = SurvivorInventory {
+        quarantined: Some(QuarantineReason::CorruptHistory),
+        ..inv(C, 40)
+    };
+    assert_eq!(
+        f1.report(11, quarantined),
+        vec![lost(C, UnavailableReason::Quarantined)]
+    );
+    assert_eq!(
+        f1.report(12, inv(B, 40)),
+        vec![ign(ReplicaIgnoreReason::NotASource)]
+    );
+    assert_eq!(
+        f1.report(13, inv(CopyId(9), 40)),
+        vec![ign(ReplicaIgnoreReason::NotASource)]
+    );
+    assert_eq!(
+        f1.report(14, inv(A, 20)),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    let close = f1.step(WINDOW, fired(1));
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            sync(A, 20),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+}
+
+/// Scaffolds M7B-90: a survivor whose history does not contain the committed root diverged.
+#[retcd_test]
+fn a_root_mismatch_quarantines_at_once_and_quarantine_is_terminal() {
+    let mut f1 = fenced(&[]);
+    let mut wrong = inv(B, 20);
+    wrong.ladder[0].1 = dg(9, BASE);
+    assert_eq!(
+        f1.report(10, wrong),
+        vec![
+            r(RecoveryEffect::Quarantine(
+                DivergenceEvidence::RootMismatch {
+                    copy: B,
+                    base_seq: Seq(BASE),
+                    expected: dg(0, BASE),
+                    found: Some(dg(9, BASE)),
+                }
+            )),
+            block(BlockReason::DivergenceRequiresOperator { diverged: vec![B] }),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+    let terminal = vec![ign(ReplicaIgnoreReason::QuarantinedTerminal)];
+    assert_eq!(f1.step(WINDOW, fired(1)), terminal);
+    assert_eq!(
+        f1.rec(WINDOW, RecoveryEvent::FenceProven(Box::new(proof()))),
+        terminal
+    );
+}
+
+/// Scaffolds M7B-91/92: the longest compatible prefix wins, and every shorter regular is sent it.
+#[retcd_test]
+fn window_close_selects_the_longest_compatible_prefix() {
+    let (f1, close) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            catch_up(A, B, 20),
+            catch_up(A, C, 20),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+}
+
+/// The longest history is not the answer when it is not compatible: divergence is never
+/// broken by length. Enumerates every fork point and head pair in a small fixed range.
+#[retcd_test]
+fn a_divergent_pair_quarantines_for_every_fork_and_length() {
+    for fork in BASE..=13 {
+        for head_a in fork + 1..=16 {
+            for head_b in fork + 1..=16 {
+                let (f1, close) = closed(
+                    &[],
+                    vec![inv_on(A, head_a, 1, fork), inv_on(B, head_b, 2, fork)],
+                    &[C],
+                );
+                assert!(
+                    !has_selected(&close),
+                    "fork {fork} {head_a}/{head_b}: {close:?}"
+                );
+                assert!(
+                    close.iter().any(|e| matches!(
+                        e,
+                        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::Quarantine(
+                            DivergenceEvidence::Pairwise { .. }
+                        )))
+                    )),
+                    "fork {fork} {head_a}/{head_b}: {close:?}"
+                );
+                assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+            }
+        }
+    }
+}
+
+/// The pairwise evidence names the shorter head, and both digests there. The block names the
+/// copies sorted by id (ruling A-2, B-R45), whichever side of the evidence they are on.
+#[retcd_test]
+fn divergence_evidence_names_the_shorter_head() {
+    let (_, close) = closed(&[], vec![inv_on(A, 20, 1, 12), inv_on(B, 15, 2, 12)], &[C]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::Quarantine(DivergenceEvidence::Pairwise {
+                seq: Seq(15),
+                a: (B, dg(2, 15)),
+                b: (A, dg(1, 15)),
+            })),
+            block(BlockReason::DivergenceRequiresOperator {
+                diverged: vec![A, B]
+            }),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Probes (§5.4)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-93: a missing ladder rung is probed once per `(copy, seq)`, in order, and the
+/// wait is bounded by a re-armed timer.
+#[retcd_test]
+fn missing_rungs_are_probed_once_each() {
+    let (f1, close) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 17)], &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::ProbeDigestAt {
+                copy: A,
+                seq: Seq(15)
+            }),
+            r(RecoveryEffect::ProbeDigestAt {
+                copy: A,
+                seq: Seq(17)
+            }),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+
+    let (_, close) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
+    let probes = close
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt { .. }))
+            )
+        })
+        .count();
+    assert_eq!(probes, 1, "deduplicated: {close:?}");
+}
+
+/// A matching answer completes selection; the probed copy stays the source.
+#[retcd_test]
+fn a_matching_probe_answer_completes_selection() {
+    let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
+    assert_eq!(
+        f1.rec(
+            2_100,
+            RecoveryEvent::ProbeAnswered {
+                copy: A,
+                seq: Seq(15),
+                digest: dg(0, 15)
+            }
+        ),
+        vec![
+            selected(20, A),
+            catch_up(A, B, 20),
+            catch_up(A, C, 20),
+            arm(3, 2_100 + WINDOW),
+        ]
+    );
+}
+
+/// A mismatching answer is divergence, never a tie-break.
+#[retcd_test]
+fn a_mismatching_probe_answer_quarantines() {
+    let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
+    let effects = f1.rec(
+        2_100,
+        RecoveryEvent::ProbeAnswered {
+            copy: A,
+            seq: Seq(15),
+            digest: dg(5, 15),
+        },
+    );
+    assert!(!has_selected(&effects), "{effects:?}");
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+}
+
+/// An unanswerable probe, or the probe deadline, drops that source before selecting.
+#[retcd_test]
+fn an_unanswered_probe_drops_the_source() {
+    let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
+    assert_eq!(
+        f1.rec(
+            2_100,
+            RecoveryEvent::ProbeUnavailable {
+                copy: A,
+                seq: Seq(15)
+            }
+        ),
+        vec![
+            lost(A, UnavailableReason::Stalled),
+            selected(15, B),
+            sync(B, 15),
+            sync(C, 15),
+            arm(3, 2_100 + WINDOW),
+        ]
+    );
+
+    let (mut f1, _) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
+    assert_eq!(
+        f1.step(2 * WINDOW - 1, fired(2)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2))[..2],
+        [lost(A, UnavailableReason::Stalled), selected(15, B)]
+    );
+}
+
+/// Divergence already visible between two full ladders is found before any probe is sent.
+#[retcd_test]
+fn divergence_is_found_before_probes_are_sent() {
+    let (_, close) = closed(
+        &[],
+        vec![sparse(A, 20), inv(B, 15), inv_on(C, 17, 3, 12)],
+        &[],
+    );
+    assert!(
+        !close.iter().any(|e| matches!(
+            e,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt { .. }))
+        )),
+        "{close:?}"
+    );
+    assert_eq!(close[0], r(RecoveryEffect::CloseWindow));
+    assert!(matches!(
+        close[1],
+        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::Quarantine(
+            DivergenceEvidence::Pairwise { .. }
+        )))
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Extensions and stalled sources (§5.5)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-94/95: a stalled source is recorded, and always before `CloseWindow`.
+#[retcd_test]
+fn a_stalled_source_is_recorded_before_the_window_closes() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    let transfer = |received| RecoveryEvent::TransferProgress {
+        copy: C,
+        advertised_seq: Seq(30),
+        received_seq: Seq(received),
+    };
+    assert_eq!(
+        f1.rec(100, transfer(5)),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(f1.step(WINDOW, fired(1)), vec![arm(2, 2 * WINDOW)]);
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![
+            lost(C, UnavailableReason::Stalled),
+            lost(B, UnavailableReason::Stalled),
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            sync(A, 20),
+            arm(3, 3 * WINDOW),
+        ]
+    );
+}
+
+/// A source advertising no more than the best verified head never extends the window.
+#[retcd_test]
+fn a_source_behind_the_best_head_does_not_extend() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    f1.report(10, inv(B, 20));
+    f1.rec(
+        100,
+        RecoveryEvent::TransferProgress {
+            copy: C,
+            advertised_seq: Seq(20),
+            received_seq: Seq(15),
+        },
+    );
+    let close = f1.step(WINDOW, fired(1));
+    assert_eq!(
+        close[..2],
+        [
+            lost(C, UnavailableReason::Stalled),
+            r(RecoveryEffect::CloseWindow)
+        ]
+    );
+}
+
+/// Scaffolds M7B-96: at most three extensions; discovery closes by 8 s however fast a source
+/// is still delivering, and the unfinished source is recorded.
+#[retcd_test]
+fn three_extensions_then_the_window_closes() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    for (i, deadline) in [WINDOW, 2 * WINDOW, 3 * WINDOW].into_iter().enumerate() {
+        let received = 5 * (i as u64 + 1);
+        f1.rec(
+            deadline - 100,
+            RecoveryEvent::TransferProgress {
+                copy: C,
+                advertised_seq: Seq(30),
+                received_seq: Seq(received),
+            },
+        );
+        assert_eq!(
+            f1.step(deadline, fired(i as u64 + 1)),
+            vec![arm(i as u64 + 2, deadline + WINDOW)]
+        );
+    }
+    f1.rec(
+        4 * WINDOW - 100,
+        RecoveryEvent::TransferProgress {
+            copy: C,
+            advertised_seq: Seq(30),
+            received_seq: Seq(20),
+        },
+    );
+    assert_eq!(4 * WINDOW, 8_000);
+    assert_eq!(
+        f1.step(4 * WINDOW, fired(4)),
+        vec![
+            lost(B, UnavailableReason::Stalled),
+            lost(C, UnavailableReason::Stalled),
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            sync(A, 20),
+            arm(5, 5 * WINDOW),
+        ]
+    );
+}
+
+/// Before commit a returning owner is one more survivor (M7B-114's pre-commit half).
+#[retcd_test]
+fn a_returning_owner_before_commit_is_an_inventory() {
+    let mut f1 = fenced(&[]);
+    assert_eq!(
+        f1.rec(10, RecoveryEvent::StaleOwnerReturned(Box::new(inv(A, 20)))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leader and catch-up (§5.4, §5.6)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-97/98: a shadow may hold the longest prefix, but never leads and never counts;
+/// the leader that lags is caught up before its grant.
+#[retcd_test]
+fn a_shadow_never_leads_and_a_lagging_leader_catches_up_before_grant() {
+    let shadow = [member(D, ReplicaRole::Shadow)];
+    let (_, close) = closed(
+        &shadow,
+        vec![inv(A, 18), inv(B, 18), inv(C, 18), inv(D, 25)],
+        &[],
+    );
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(25, D),
+            r(RecoveryEffect::CatchUpBeforeGrant {
+                from: D,
+                to: A,
+                through: Seq(25),
+                credential: proof().credential_for(D),
+            }),
+            catch_up(D, B, 25),
+            catch_up(D, C, 25),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+}
+
+/// Q5: with no viable regular the recovery blocks rather than promoting anyone.
+#[retcd_test]
+fn no_viable_leader_blocks() {
+    let mut f1 = F1::new();
+    let mut unhealthy = plan(&[]);
+    for candidate in &mut unhealthy.candidates {
+        candidate.healthy = false;
+    }
+    f1.rec(0, RecoveryEvent::Plan(Box::new(unhealthy)));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    f1.report(10, inv(A, 20));
+    let close = f1.step(WINDOW, fired(1));
+    assert_eq!(close.last(), Some(&block(BlockReason::NoEligibleRegular)));
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::NoEligibleRegular)
+    );
+}
+
+/// No survivor at all blocks, and a fresh fence restarts discovery.
+#[retcd_test]
+fn nothing_verified_blocks_until_a_fresh_fence() {
+    let (mut f1, close) = closed(&[], Vec::new(), &[A, B, C]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            block(BlockReason::NoEligibleRegular)
+        ]
+    );
+    assert_eq!(
+        f1.report(WINDOW + 1, inv(A, 20)),
+        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+    );
+    assert_eq!(
+        f1.rec(9_000, RecoveryEvent::FenceProven(Box::new(proof()))),
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C]
+            }),
+            arm(2, 9_000 + WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Synchronise and the barrier (§5.6)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-99/100: catch-up completes, then every required copy syncs its WAL through the
+/// cutoff; a copy that was not behind is not required to report.
+#[retcd_test]
+fn synchronise_then_sync_every_required_copy() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
+    let caught = |copy| RecoveryEvent::CopyCaughtUp {
+        copy,
+        head: Seq(20),
+        digest: dg(0, 20),
+    };
+    assert_eq!(
+        f1.rec(2_100, caught(A)),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(
+        f1.rec(2_200, caught(B)),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        f1.rec(2_300, caught(C)),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+}
+
+/// Scaffolds M7B-101/102: the barrier is built by `RecoveryBarrier::try_new` only — a short proof
+/// or a proof bound to another digest does not count, and one CAS is proposed once it holds.
+#[retcd_test]
+fn the_barrier_needs_every_required_copy_durable_at_the_cutoff() {
+    let mut f1 = at_barrier(20);
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(3_000, durable(A, 20, dg(0, 20))), not_durable);
+    assert_eq!(
+        f1.rec(3_001, durable(B, 19, dg(0, 19))),
+        not_durable,
+        "short"
+    );
+    // Past the cutoff but not bound to its digest. A foreign digest at the cutoff itself is
+    // divergence, not a missing proof (ruling A-4).
+    assert_eq!(
+        f1.rec(3_002, durable(C, 21, dg(0, 21))),
+        not_durable,
+        "mis-bound"
+    );
+    assert_eq!(
+        f1.rec(3_003, durable(CopyId(9), 20, dg(0, 20))),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(f1.rec(3_004, durable(B, 20, dg(0, 20))), not_durable);
+    assert_eq!(
+        f1.rec(3_005, durable(C, 20, dg(0, 20))),
+        vec![cas(CONTROL_REV, A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+}
+
+/// Lead addition to Q1: the commit CAS writes one record on `partitions/{id}`, `Serving`.
+#[retcd_test]
+fn the_commit_cas_writes_a_serving_record_on_the_partition_key() {
+    let f1 = proposing(20);
+    assert_eq!(f1.cas_count(), 1);
+    let Some(EffectKind::Control(ControlEffect::Cas {
+        key,
+        value: Some(body),
+        ..
+    })) = f1.log.last()
+    else {
+        panic!("the last effect is the CAS: {:?}", f1.log.last());
+    };
+    assert_eq!(*key, ControlKey::Partition(PARTITION));
+    let written = PartitionRecord::decode(body).expect("A1's codec reads it");
+    assert_eq!(written.lifecycle, PartitionLifecycle::Serving);
+    assert_eq!(written, record(A));
+}
+
+/// Scaffolds M7B-103/104: `Committed` emits one `Recovered` carrying everything decided.
+#[retcd_test]
+fn a_committed_cas_emits_the_recovery_result() {
+    let mut f1 = proposing(20);
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.fenced_prior, proof());
+    assert_eq!(
+        result.inventories,
+        vec![
+            InventoryOutcome::Verified { copy: A },
+            InventoryOutcome::Verified { copy: B },
+            InventoryOutcome::Verified { copy: C },
+        ]
+    );
+    assert_eq!(result.selected.root, root());
+    assert_eq!(result.selected.cutoff_seq, Seq(20));
+    assert_eq!(result.new_generation, Generation(8));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.loss.queried, vec![A, B, C]);
+    assert!(result.loss.unavailable.is_empty());
+    assert!(!result.loss.uncertain);
+    assert_eq!(result.committed.revision, Revision(9));
+    assert_eq!(result.committed.pinned_config, plan(&[]).config);
+    assert_eq!(
+        result.committed.authority_view.lineage,
+        root(),
+        "Q3: lineage overwritten"
+    );
+    assert_eq!(result.committed.authority_view.grant_id, GrantId(3));
+    assert_eq!(result.retained_status_map.predecessor_generation, PRIOR_GEN);
+    assert_eq!(result.retained_status_map.discarded_from, None);
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert_eq!(f1.cas_count(), 1);
+}
+
+/// An advertised suffix nobody delivered makes the loss uncertain, and the status map says where
+/// the discarded range starts.
+#[retcd_test]
+fn an_undelivered_suffix_is_uncertain_loss() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    f1.report(10, inv(B, 20));
+    f1.rec(
+        20,
+        RecoveryEvent::TransferProgress {
+            copy: C,
+            advertised_seq: Seq(30),
+            received_seq: Seq(0),
+        },
+    );
+    f1.step(WINDOW, fired(1));
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_000, durable(B, 20, dg(0, 20)));
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.mode, PartitionMode::DegradedRf2);
+    assert_eq!(result.loss.highest_advertised_seq, Seq(30));
+    assert!(result.loss.uncertain);
+    assert_eq!(
+        result.loss.unavailable,
+        vec![(C, UnavailableReason::Stalled)]
+    );
+    assert_eq!(result.retained_status_map.discarded_from, Some(Seq(21)));
+    assert!(result.retained_status_map.uncertain);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The four CAS arms (§5.6)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-105/106: `Unavailable` and `Unknown` block with distinct reasons and are never
+/// re-proposed blind.
+#[retcd_test]
+fn unavailable_and_unknown_block_distinctly_and_never_retry() {
+    for (outcome, reason) in [
+        (CasOutcome::Unavailable, BlockReason::ControlUnavailable),
+        (CasOutcome::Unknown, BlockReason::ControlUnknown),
+    ] {
+        let mut f1 = proposing(20);
+        assert_eq!(
+            f1.step(3_100, cas_result(outcome)),
+            vec![block(reason.clone())]
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason));
+        f1.declines(3_200, cas_result(CasOutcome::Committed(Revision(9))));
+        assert_eq!(f1.cas_count(), 1, "never re-proposed");
+    }
+}
+
+/// Proposing with the one CAS answered `Conflict`: the re-read is in flight.
+fn rereading() -> F1 {
+    let mut f1 = proposing(20);
+    assert_eq!(
+        f1.step(
+            3_100,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(6),
+            })
+        ),
+        vec![EffectKind::Control(ControlEffect::Get {
+            key: ControlKey::Partition(PARTITION)
+        })]
+    );
+    f1
+}
+
+fn found(value: Bytes) -> EventKind {
+    read_result(ReadOutcome::Found {
+        revision: Revision(6),
+        value,
+    })
+}
+
+/// Rulings F-f (B-R41) and F-g (B-R45), re-derived from the former
+/// `a_conflict_over_anything_but_a_newer_owner_is_contention`: a conflict re-reads, and a record
+/// at an older or equal epoch with other content, a withdrawn record, or unreadable bytes is
+/// contention. The prior owner still there, our owner at the prior epoch: none is re-proposed.
+#[retcd_test]
+fn a_conflict_over_an_older_or_equal_epoch_is_contention() {
+    let prior_record = PartitionRecord {
+        owner: NodeId(9),
+        generation: PRIOR_GEN,
+        owner_epoch: PRIOR_EPOCH,
+        ..record(A)
+    };
+    let ours_at_the_prior_epoch = PartitionRecord {
+        owner_epoch: PRIOR_EPOCH,
+        ..record(A)
+    };
+    for read in [
+        found(prior_record.encode()),
+        found(ours_at_the_prior_epoch.encode()),
+        found(Bytes::from_static(b"not a record")),
+        read_result(ReadOutcome::Absent { as_of: Revision(6) }),
+    ] {
+        let mut f1 = rereading();
+        assert_eq!(
+            f1.step(3_200, read.clone()),
+            vec![block(BlockReason::CasContention)],
+            "{read:?}"
+        );
+        assert_eq!(f1.cas_count(), 1, "never re-proposed: {read:?}");
+    }
+}
+
+/// Q2 and rulings F-f, F-g: a record at an epoch newer than the prior is a peer that recovered
+/// first, whoever it names as owner, our own leader included.
+#[retcd_test]
+fn a_conflict_over_a_newer_epoch_is_overtaken() {
+    let newer = PartitionRecord {
+        owner: NodeId(2),
+        generation: Generation(9),
+        ..record(A)
+    };
+    let ours_later = PartitionRecord {
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    for current in [newer, ours_later] {
+        let mut f1 = rereading();
+        assert_eq!(
+            f1.step(3_200, found(current.encode())),
+            vec![block(BlockReason::OvertakenByPeer)],
+            "{current:?}"
+        );
+    }
+    let mut f1 = rereading();
+    assert_eq!(
+        f1.step(3_200, read_result(ReadOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)]
+    );
+}
+
+/// Ruling F-g (B-R45), re-derived from the former `a_conflict_over_our_own_record_is_the_cas_landing`:
+/// `Conflict` is definitive, so our own bytes on the re-read are a peer's identical decision,
+/// never our CAS landing. No `Recovered`, no second CAS; the peer's result is the only one.
+#[retcd_test]
+fn identical_bytes_on_the_re_read_are_a_peers_decision() {
+    let mut f1 = rereading();
+    assert_eq!(
+        f1.step(3_200, found(record(A).encode())),
+        vec![block(BlockReason::OvertakenByPeer)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+    assert_eq!(f1.cas_count(), 1);
+}
+
+/// The sim offers every control answer to every module. F1 answers only its own pending CAS or
+/// re-read on `partitions/{id}`, and declines everything else like any module without that input.
+#[retcd_test]
+fn control_answers_f1_did_not_request_are_declined() {
+    let committed = cas_result(CasOutcome::Committed(Revision(9)));
+    let other_key = |key| {
+        EventKind::Control(ControlEvent::CasResult {
+            key,
+            outcome: CasOutcome::Committed(Revision(9)),
+        })
+    };
+    // Nothing requested: Idle, and every phase before the barrier holds.
+    let mut idle = F1::new();
+    idle.declines(1, committed.clone());
+    let mut collecting = fenced(&[]);
+    collecting.declines(10, committed.clone());
+    // A CAS is pending: a read nobody asked for, another partition, another key.
+    let mut f1 = proposing(20);
+    f1.declines(3_100, read_result(ReadOutcome::Unavailable));
+    f1.declines(3_100, other_key(ControlKey::Partition(PartitionId(2))));
+    f1.declines(3_100, other_key(ControlKey::ClusterSchema));
+    // A re-read is pending: a CAS answer is no longer awaited.
+    f1.step(
+        3_200,
+        cas_result(CasOutcome::Conflict {
+            exists: true,
+            current: Revision(6),
+        }),
+    );
+    f1.declines(3_300, committed.clone());
+    assert_eq!(f1.cas_count(), 1);
+    // Committed and fully protected: nothing is pending.
+    let mut done = proposing(20);
+    done.step(3_100, committed.clone());
+    done.declines(3_200, committed);
+}
+
+/// Another module's timer is declined in every phase, never answered as stale.
+#[retcd_test]
+fn another_modules_timer_is_declined() {
+    let foreign = EventKind::Timer(TimerFired {
+        id: AuthorityTimer::Acquire.id(),
+        version: TimerVersion(1),
+        scheduled_at: Tick(0),
+    });
+    F1::new().declines(0, foreign.clone());
+    fenced(&[]).declines(WINDOW, foreign.clone());
+    proposing(20).declines(3_100, foreign);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Degraded modes (§5.6 mode table)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-107: a lone survivor commits `ReadOnly` and starts rebuilding.
+#[retcd_test]
+fn a_lone_survivor_commits_read_only() {
+    let f1 = lone_committed();
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(
+        f1.module.rebuild_required(),
+        Some(&[A, B, C].into_iter().collect())
+    );
+}
+
+/// Scaffolds M7B-108: two survivors must both be durable — no one-copy fallback.
+#[retcd_test]
+fn two_survivors_both_must_be_durable() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 20)], &[C]);
+    assert_eq!(
+        f1.rec(3_000, durable(A, 20, dg(0, 20))),
+        vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(
+        f1.rec(3_001, durable(B, 20, dg(0, 20))),
+        vec![cas(CONTROL_REV, A)]
+    );
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.mode, PartitionMode::DegradedRf2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// After commit: returning owner, rebuild, activation (§5.6a, §5.7)
+// ---------------------------------------------------------------------------------------------
+
+/// Scaffolds M7B-114/115: after commit a returning owner is quarantined and rebuilt from the
+/// root, however long its history; retention runs from the event's arrival.
+#[retcd_test]
+fn a_returning_owner_after_commit_never_overrides() {
+    let mut f1 = proposing(20);
+    f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    let effects = f1.at(
+        50_500,
+        50_000,
+        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::StaleOwnerReturned(
+            Box::new(inv(A, 99)),
+        ))),
+    );
+    assert_eq!(
+        effects,
+        vec![
+            r(RecoveryEffect::QuarantineSuffix {
+                copy: A,
+                from: Seq(21),
+                until: Tick(50_000 + RETENTION),
+            }),
+            r(RecoveryEffect::RebuildFromAuthoritative {
+                copy: A,
+                root: LineageAnchor {
+                    lineage: root(),
+                    base_seq: Seq(20),
+                    base_digest: dg(0, 20),
+                },
+            }),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert_eq!(f1.cas_count(), 1);
+}
+
+/// Scaffolds M7B-109..112: rebuild proves a three-copy barrier through `try_new`, then one
+/// activation CAS conditioned on the commit revision re-emits `Recovered{mode: Active}`.
+#[retcd_test]
+fn rebuild_activates_through_a_three_copy_barrier() {
+    let mut f1 = lone_committed();
+    let caught = |copy, head| RecoveryEvent::CopyCaughtUp {
+        copy,
+        head: Seq(head),
+        digest: dg(0, head),
+    };
+    assert_eq!(
+        f1.rec(4_000, caught(B, 20)),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+    assert_eq!(
+        f1.rec(4_001, caught(C, 22)),
+        vec![sync(C, 20)],
+        "the point is pinned"
+    );
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(4_100, durable(A, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.rec(4_101, durable(B, 20, dg(0, 20))), not_durable);
+    assert_eq!(
+        f1.rec(4_102, durable(C, 21, dg(0, 21))),
+        not_durable,
+        "past the point"
+    );
+    assert_eq!(
+        f1.rec(4_103, durable(C, 20, dg(0, 20))),
+        vec![cas(Revision(9), A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    let result = recovered(&f1.step(4_200, cas_result(CasOutcome::Committed(Revision(11)))));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, Revision(11));
+    assert_eq!(
+        result.selected.cutoff_seq,
+        Seq(20),
+        "lineage and cutoff do not move"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert_eq!(f1.module.rebuild_required(), None);
+}
+
+/// Scaffolds M7B-113: a lost copy stalls the rebuild loudly and never shrinks `required`.
+#[retcd_test]
+fn a_lost_copy_stalls_the_rebuild_and_never_shrinks_it() {
+    let mut f1 = lone_committed();
+    f1.rec(
+        4_000,
+        RecoveryEvent::CopyCaughtUp {
+            copy: B,
+            head: Seq(20),
+            digest: dg(0, 20),
+        },
+    );
+    f1.rec(4_100, durable(B, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(4_200, lose(B)),
+        vec![r(RecoveryEffect::RebuildStalled { copy: B })]
+    );
+    assert_eq!(
+        f1.step(4_201, lose(B)),
+        vec![ign(ReplicaIgnoreReason::NotASource)],
+        "advisory 21: one alert per loss"
+    );
+    assert_eq!(
+        f1.step(4_202, lose(D)),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(
+        f1.module.rebuild_required(),
+        Some(&[A, B, C].into_iter().collect())
+    );
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(4_300, durable(A, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.rec(4_301, durable(C, 20, dg(0, 20))), not_durable);
+    assert_eq!(
+        f1.rec(4_302, durable(B, 20, dg(0, 20))),
+        not_durable,
+        "a lost copy's proof is refused"
+    );
+    assert_eq!(f1.cas_count(), 1);
+}
+
+/// The activation CAS answers the same four arms: `Unknown` blocks.
+#[retcd_test]
+fn an_unknown_activation_blocks() {
+    let mut f1 = lone_committed();
+    f1.rec(
+        4_000,
+        RecoveryEvent::CopyCaughtUp {
+            copy: B,
+            head: Seq(20),
+            digest: dg(0, 20),
+        },
+    );
+    for copy in [A, B, C] {
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(
+        f1.step(4_200, cas_result(CasOutcome::Unknown)),
+        vec![block(BlockReason::ControlUnknown)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
+    );
+}
+
+/// Committed and fully protected: rebuild inputs have nothing to act on.
+#[retcd_test]
+fn an_active_commit_ignores_rebuild_inputs() {
+    let mut f1 = proposing(20);
+    f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(
+        f1.rec(4_000, durable(A, 20, dg(0, 20))),
+        vec![ign(ReplicaIgnoreReason::OutOfPhase)]
+    );
+    assert_eq!(
+        f1.step(4_000, fired(1)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// B-R41: the tester's NOT YET gate, one section per ruling
+// ---------------------------------------------------------------------------------------------
+
+fn incomplete(missing: Vec<CopyId>) -> BlockReason {
+    BlockReason::BarrierIncomplete { missing }
+}
+
+fn has_query(effects: &[EffectKind]) -> bool {
+    effects.first()
+        == Some(&r(RecoveryEffect::QueryInventory {
+            copies: vec![A, B, C],
+        }))
+}
+
+/// Ruling F-b(i): a fence proves the lineage the plan is anchored on, or it is not this plan's
+/// fence.
+#[retcd_test]
+fn a_fence_must_prove_the_plans_anchor() {
+    let mut f1 = F1::new();
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan(&[]))));
+    let newer_epoch = FencingProof {
+        prior_owner_epoch: OwnerEpoch(2),
+        ..proof()
+    };
+    let other_partition = FencingProof {
+        partition: PartitionId(2),
+        ..proof()
+    };
+    for wrong in [refence(), newer_epoch, other_partition] {
+        assert_eq!(
+            f1.rec(1, RecoveryEvent::FenceProven(Box::new(wrong))),
+            vec![ign(ReplicaIgnoreReason::InvalidConfig)]
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Idle);
+    }
+    assert!(has_query(
+        &f1.rec(2, RecoveryEvent::FenceProven(Box::new(proof())))
+    ));
+}
+
+/// Ruling F-b(ii): a survivor already on a newer root of this partition means a peer recovered
+/// first, so this plan is stale. It blocks, and never selects around the newer root. Newer is
+/// `(generation, owner_epoch)` compared in that order. An older root, or another partition's,
+/// is only stale lineage.
+#[retcd_test]
+fn a_survivor_on_a_newer_root_means_the_plan_is_stale() {
+    let newer_generation = Lineage {
+        generation: Generation(8),
+        ..prior()
+    };
+    let newer_epoch = Lineage {
+        owner_epoch: OwnerEpoch(2),
+        ..prior()
+    };
+    for newer in [root(), newer_generation, newer_epoch] {
+        let mut f1 = fenced(&[]);
+        f1.report(10, inv(A, 20));
+        let mut ahead = on_new_root(B, 30);
+        ahead.anchor_seen.lineage = newer;
+        assert_eq!(
+            f1.report(11, ahead),
+            vec![block(BlockReason::OvertakenByPeer)],
+            "{newer:?}"
+        );
+        assert_eq!(
+            f1.phase(),
+            RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+        );
+        assert!(!has_selected(&f1.log));
+    }
+    let mut f1 = fenced(&[]);
+    let mut foreign = inv(B, 30);
+    foreign.anchor_seen.lineage = Lineage {
+        partition: PartitionId(2),
+        ..root()
+    };
+    assert_eq!(
+        f1.report(10, foreign),
+        vec![lost(B, UnavailableReason::StaleLineage)]
+    );
+}
+
+/// Ruling F-b(iii): Blocked holds a replacement plan, so the fresh fence runs on the new anchor
+/// and never on the stale one.
+#[retcd_test]
+fn blocked_holds_a_new_plan_for_a_fresh_fence() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, on_new_root(B, 30));
+    let overtaken = RecoveryPhase::Blocked(BlockReason::OvertakenByPeer);
+    assert_eq!(f1.phase(), overtaken);
+    assert_eq!(
+        f1.rec(9_000, RecoveryEvent::FenceProven(Box::new(refence()))),
+        vec![ign(ReplicaIgnoreReason::InvalidConfig)],
+        "the held plan is still the stale one"
+    );
+    assert_eq!(
+        f1.rec(9_001, RecoveryEvent::Plan(Box::new(replan()))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(f1.phase(), overtaken, "a plan is held, not acted on");
+    assert_eq!(
+        f1.rec(9_002, RecoveryEvent::FenceProven(Box::new(refence()))),
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C]
+            }),
+            arm(2, 9_002 + WINDOW),
+        ]
+    );
+    assert_eq!(
+        f1.report(9_010, on_new_root(B, 30)),
+        vec![ign(ReplicaIgnoreReason::Recorded)],
+        "checked against the new anchor"
+    );
+}
+
+/// Closed with A's ladder lacking the base rung (only its head and one stride rung); B and C are
+/// full at 20. Selection probes A at the base.
+fn baseless_closed() -> F1 {
+    let baseless = SurvivorInventory {
+        ladder: vec![(Seq(16), dg(0, 16))],
+        ..inv(A, 20)
+    };
+    let (f1, close) = closed(&[], vec![baseless, inv(B, 20), inv(C, 20)], &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::ProbeDigestAt {
+                copy: A,
+                seq: Seq(BASE)
+            }),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    f1
+}
+
+/// Ruling F-c (design §5.2): a ladder without the base rung is probed at the base. The absence
+/// is never taken as compatibility and never as divergence; the answer decides.
+#[retcd_test]
+fn a_missing_base_rung_is_probed_never_assumed() {
+    let answer = |digest| RecoveryEvent::ProbeAnswered {
+        copy: A,
+        seq: Seq(BASE),
+        digest,
+    };
+    let mut f1 = baseless_closed();
+    assert_eq!(
+        f1.rec(2_100, answer(dg(0, BASE))),
+        vec![
+            selected(20, A),
+            sync(A, 20),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 2_100 + WINDOW),
+        ]
+    );
+
+    let mut f1 = baseless_closed();
+    assert_eq!(
+        f1.rec(2_100, answer(dg(9, BASE))),
+        vec![
+            r(RecoveryEffect::Quarantine(
+                DivergenceEvidence::RootMismatch {
+                    copy: A,
+                    base_seq: Seq(BASE),
+                    expected: dg(0, BASE),
+                    found: Some(dg(9, BASE)),
+                }
+            )),
+            block(BlockReason::DivergenceRequiresOperator { diverged: vec![A] }),
+        ]
+    );
+
+    let mut f1 = baseless_closed();
+    assert_eq!(
+        f1.rec(
+            2_100,
+            RecoveryEvent::ProbeUnavailable {
+                copy: A,
+                seq: Seq(BASE)
+            }
+        ),
+        vec![
+            lost(A, UnavailableReason::Stalled),
+            selected(20, B),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 2_100 + WINDOW),
+        ]
+    );
+}
+
+/// Ruling F-c: a head below the base cannot hold the root. The copy is stale and recorded
+/// unavailable, not divergent.
+#[retcd_test]
+fn a_head_below_the_base_is_ineligible_not_divergent() {
+    let mut f1 = fenced(&[]);
+    assert_eq!(
+        f1.report(10, inv(A, BASE - 2)),
+        vec![lost(A, UnavailableReason::StaleLineage)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+}
+
+/// Ruling F-d (spec §8.4 step 5): when the point pins, every required copy is asked to make it
+/// durable. That includes the holders, not only the copy that caught up.
+#[retcd_test]
+fn rebuild_asks_every_required_copy_to_prove_the_point() {
+    let mut f1 = lone_committed();
+    assert_eq!(
+        f1.rec(4_000, caught_up(B, 22, dg(0, 22))),
+        vec![sync(A, 22), sync(B, 22), sync(C, 22)]
+    );
+    assert_eq!(
+        f1.rec(4_001, caught_up(C, 22, dg(0, 22))),
+        vec![sync(C, 22)]
+    );
+    f1.rec(4_100, durable(A, 22, dg(0, 22)));
+    f1.rec(4_101, durable(B, 22, dg(0, 22)));
+    assert_eq!(
+        f1.rec(4_102, durable(C, 22, dg(0, 22))),
+        vec![cas(Revision(9), A)]
+    );
+}
+
+/// Ruling F-e: the rebuild point is never below the committed cutoff. A short catch-up is still
+/// owed and pins nothing, so proofs below the cutoff never activate.
+#[retcd_test]
+fn the_rebuild_point_is_never_below_the_cutoff() {
+    let mut f1 = lone_committed();
+    assert_eq!(
+        f1.rec(4_000, caught_up(B, 5, dg(0, 5))),
+        vec![ign(ReplicaIgnoreReason::Outstanding)]
+    );
+    for copy in [A, B, C] {
+        assert_eq!(
+            f1.rec(4_100, durable(copy, 5, dg(0, 5))),
+            vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+        );
+    }
+    assert_eq!(f1.cas_count(), 1);
+    assert_eq!(
+        f1.rec(4_200, caught_up(B, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+}
+
+/// Ruling F-e: at the cutoff the digest must be the committed one. Anything else is a copy that
+/// does not hold the root.
+#[retcd_test]
+fn a_foreign_digest_at_the_cutoff_is_divergence() {
+    let mut f1 = lone_committed();
+    assert_eq!(
+        f1.rec(4_000, caught_up(B, 20, dg(4, 20))),
+        vec![
+            r(RecoveryEffect::Quarantine(
+                DivergenceEvidence::RootMismatch {
+                    copy: B,
+                    base_seq: Seq(20),
+                    expected: dg(0, 20),
+                    found: Some(dg(4, 20)),
+                }
+            )),
+            block(BlockReason::DivergenceRequiresOperator { diverged: vec![B] }),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+}
+
+/// Ruling F-e: a pin is never replaced. A second digest at the rebuild point is divergence,
+/// whether it arrives as a catch-up or as a proof.
+#[retcd_test]
+fn two_digests_at_the_rebuild_point_are_divergence() {
+    let pairwise = |a: (CopyId, Digest), b: (CopyId, Digest), diverged: Vec<CopyId>| {
+        vec![
+            r(RecoveryEffect::Quarantine(DivergenceEvidence::Pairwise {
+                seq: Seq(22),
+                a,
+                b,
+            })),
+            block(BlockReason::DivergenceRequiresOperator { diverged }),
+        ]
+    };
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 22, dg(0, 22)));
+    assert_eq!(
+        f1.rec(4_001, caught_up(C, 22, dg(4, 22))),
+        pairwise((B, dg(0, 22)), (C, dg(4, 22)), vec![B, C])
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 22, dg(4, 22)));
+    assert_eq!(
+        f1.rec(4_100, durable(A, 22, dg(0, 22))),
+        pairwise((B, dg(4, 22)), (A, dg(0, 22)), vec![A, B]),
+        "sorted by copy id (ruling A-2)"
+    );
+}
+
+/// Advisory 14: a catch-up short of `through` is still owed, and the barrier is not asked for.
+#[retcd_test]
+fn a_catch_up_short_of_the_cutoff_is_still_owed() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 20)], &[]);
+    assert_eq!(
+        f1.rec(2_100, caught_up(B, 15, dg(0, 15))),
+        vec![ign(ReplicaIgnoreReason::Outstanding)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+    assert_eq!(
+        f1.rec(2_200, caught_up(B, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+}
+
+/// Ruling F-a: before commit a lost required copy ends the wait at once and names it. Nothing is
+/// proposed, and `required` does not shrink to fit.
+#[retcd_test]
+fn a_lost_required_copy_blocks_before_commit() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 20)], &[]);
+    assert_eq!(
+        f1.step(2_100, lose(D)),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+    assert_eq!(
+        f1.step(2_101, lose(C)),
+        vec![block(incomplete(vec![C]))],
+        "C was not behind, but the barrier needs it"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(incomplete(vec![C])));
+
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(3_001, lose(D)),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(f1.step(3_002, lose(B)), vec![block(incomplete(vec![B]))]);
+    assert_eq!(f1.cas_count(), 0);
+}
+
+/// Ruling F-a: the wait after selection is bounded by a re-armed discovery timer. At the deadline
+/// the copies still owing their catch-up, or a proof that reaches and binds, are named.
+#[retcd_test]
+fn the_wait_after_selection_is_bounded() {
+    let (mut f1, close) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
+    assert_eq!(close.last(), Some(&arm(2, 2 * WINDOW)));
+    f1.rec(2_100, caught_up(C, 20, dg(0, 20)));
+    let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
+    assert_eq!(f1.step(2 * WINDOW - 1, fired(2)), stale);
+    assert_eq!(f1.step(2 * WINDOW, fired(1)), stale);
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![block(incomplete(vec![B]))]
+    );
+
+    // B falls short of the cutoff; C reaches past it but does not bind to the cutoff digest. A
+    // foreign digest at the cutoff itself would be divergence (ruling A-4), not a missing proof.
+    let mut f1 = at_barrier(20);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_001, durable(B, 19, dg(0, 19)));
+    f1.rec(3_002, durable(C, 21, dg(0, 21)));
+    assert_eq!(f1.step(2 * WINDOW - 1, fired(2)), stale);
+    assert_eq!(
+        f1.step(2 * WINDOW, fired(2)),
+        vec![block(incomplete(vec![B, C]))]
+    );
+    assert_eq!(f1.cas_count(), 0);
+}
+
+/// Rulings F-f and F-g on the activation CAS: its prior is the committed record's epoch, so a
+/// peer at a newer epoch overtakes it, and so do bytes identical to our proposal, which here sit
+/// at that same epoch. Any other record is contention.
+#[retcd_test]
+fn an_activation_conflict_classifies_by_epoch() {
+    let peer = |owner_epoch| PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch,
+        ..record(A)
+    };
+    for (current, reason) in [
+        (peer(OwnerEpoch(3)), BlockReason::OvertakenByPeer),
+        (record(A), BlockReason::OvertakenByPeer),
+        (peer(OwnerEpoch(2)), BlockReason::CasContention),
+    ] {
+        let mut f1 = lone_committed();
+        f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+        for copy in [A, B, C] {
+            f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+        }
+        assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+        f1.step(
+            4_200,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(12),
+            }),
+        );
+        assert_eq!(f1.step(4_300, found(current.encode())), vec![block(reason)]);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tester rows (manual tester, mutation gaps), ported from the F1 gate export. Not plan rows; no
+// m7b_ name. Two answers moved with B-R41, and each says which ruling moved it.
+// ---------------------------------------------------------------------------------------------
+
+/// Kills M07. A copy whose ladder lacks the base rung has no ancestry evidence; it is never
+/// selected on that ladder alone (design §5.2: "never assumes compatibility from the absence").
+#[retcd_test]
+fn tester_a_copy_without_base_evidence_is_never_selected_unverified() {
+    let mut f1 = fenced(&[]);
+    f1.report(
+        10,
+        SurvivorInventory {
+            ladder: vec![(Seq(16), dg(0, 16))],
+            ..inv(A, 20)
+        },
+    );
+    f1.report(10, inv(B, 20));
+    f1.report(10, inv(C, 20));
+    let close = f1.step(WINDOW, fired(1));
+    assert!(
+        !f1.log.contains(&selected(20, A)),
+        "selected on no ancestry evidence: {:?}",
+        f1.log
+    );
+    assert!(!close.contains(&selected(20, A)));
+    assert_eq!(f1.cas_count(), 0);
+}
+
+/// Kills M08. A prefix holder without a valid grant does not lead; the first viable candidate
+/// does, and its transfer is `CatchUpBeforeGrant` (spec §8.3).
+#[retcd_test]
+fn tester_a_holder_without_a_valid_grant_does_not_lead() {
+    let mut f1 = F1::new();
+    let mut p = plan(&[]);
+    p.candidates[0].has_valid_grant = false;
+    f1.rec(0, RecoveryEvent::Plan(Box::new(p)));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    for inventory in [inv(A, 20), inv(B, 18), inv(C, 18)] {
+        f1.report(10, inventory);
+    }
+    let close = f1.step(WINDOW, fired(1));
+    assert!(
+        close.contains(&r(RecoveryEffect::CatchUpBeforeGrant {
+            from: A,
+            to: B,
+            through: Seq(20),
+            credential: proof().credential_for(A),
+        })),
+        "{close:?}"
+    );
+}
+
+/// Kills M25. A viable prefix holder leads even when placement lists it last. Ruling F-a adds the
+/// trailing `Arm`: the wait after selection is bounded.
+#[retcd_test]
+fn tester_a_viable_holder_leads_whatever_the_candidate_order() {
+    let mut f1 = F1::new();
+    let mut p = plan(&[]);
+    p.candidates.reverse();
+    f1.rec(0, RecoveryEvent::Plan(Box::new(p)));
+    f1.rec(0, RecoveryEvent::FenceProven(Box::new(proof())));
+    for inventory in [inv(A, 20), inv(B, 18), inv(C, 18)] {
+        f1.report(10, inventory);
+    }
+    assert_eq!(
+        f1.step(WINDOW, fired(1)),
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            catch_up(A, B, 20),
+            catch_up(A, C, 20),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+}
+
+/// Kills M22. A `DegradedRf2` commit rebuilds too: the third copy's catch-up is answered. Ruling
+/// F-d moves the answer: the pin asks every required copy, holders included, to prove the point.
+#[retcd_test]
+fn tester_a_degraded_rf2_commit_rebuilds_the_third_copy() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 20)], &[C]);
+    f1.rec(3_000, durable(A, 20, dg(0, 20)));
+    f1.rec(3_000, durable(B, 20, dg(0, 20)));
+    let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(recovered(&effects).mode, PartitionMode::DegradedRf2);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(
+        f1.rec(4_000, caught_up(C, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// B-R45: the re-gate's F-g and advisories A-1 to A-5, one row per ruling
+// ---------------------------------------------------------------------------------------------
+
+/// The quarantine and the block that names `diverged`.
+fn quarantined(evidence: DivergenceEvidence, diverged: Vec<CopyId>) -> Vec<EffectKind> {
+    vec![
+        r(RecoveryEffect::Quarantine(evidence)),
+        block(BlockReason::DivergenceRequiresOperator { diverged }),
+    ]
+}
+
+/// `copy` reported a foreign digest, `dg(7, 20)`, at the committed cutoff 20.
+fn off_the_cutoff(copy: CopyId) -> Vec<EffectKind> {
+    quarantined(
+        DivergenceEvidence::RootMismatch {
+            copy,
+            base_seq: Seq(20),
+            expected: dg(0, 20),
+            found: Some(dg(7, 20)),
+        },
+        vec![copy],
+    )
+}
+
+/// Ruling A-1: a proof is judged the same whenever it lands. At the committed cutoff it must carry
+/// the cutoff digest, before the pin or after, wherever the point is. A proof held before the pin
+/// is judged against the pin when it lands.
+#[retcd_test]
+fn a_proof_is_judged_whenever_it_arrives() {
+    let mut f1 = lone_committed();
+    assert_eq!(f1.rec(4_000, durable(A, 20, dg(7, 20))), off_the_cutoff(A));
+
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 25, dg(0, 25)));
+    assert_eq!(f1.rec(4_100, durable(C, 20, dg(7, 20))), off_the_cutoff(C));
+
+    let mut f1 = lone_committed();
+    assert_eq!(
+        f1.rec(4_000, durable(A, 22, dg(4, 22))),
+        vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(
+        f1.rec(4_100, caught_up(B, 22, dg(0, 22))),
+        quarantined(
+            DivergenceEvidence::Pairwise {
+                seq: Seq(22),
+                a: (B, dg(0, 22)),
+                b: (A, dg(4, 22)),
+            },
+            vec![A, B]
+        )
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+}
+
+/// Ruling A-2: the block names each diverged copy once, even a copy that contradicts its own pin.
+#[retcd_test]
+fn a_copy_that_contradicts_its_own_pin_is_named_once() {
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 25, dg(0, 25)));
+    assert_eq!(
+        f1.rec(4_100, durable(B, 25, dg(7, 25))),
+        quarantined(
+            DivergenceEvidence::Pairwise {
+                seq: Seq(25),
+                a: (B, dg(0, 25)),
+                b: (B, dg(7, 25)),
+            },
+            vec![B]
+        )
+    );
+}
+
+/// Ruling A-3: a copy already recorded lost never chooses the rebuild point. Its catch-up is
+/// refused, and the point is pinned by a live copy.
+#[retcd_test]
+fn a_lost_copy_never_sets_the_rebuild_point() {
+    let mut f1 = lone_committed();
+    f1.step(4_000, lose(B));
+    assert_eq!(
+        f1.rec(4_100, caught_up(B, 25, dg(0, 25))),
+        vec![ign(ReplicaIgnoreReason::NotASource)]
+    );
+    assert_eq!(
+        f1.rec(4_200, caught_up(C, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+    );
+}
+
+/// Ruling A-4: before commit, a foreign digest at the cutoff quarantines, from a catch-up or a
+/// proof, the same as after commit (F-e). It is never read as a copy still owing its proof. A
+/// copy the barrier does not need is not judged, as after commit.
+#[retcd_test]
+fn before_commit_a_foreign_digest_at_the_cutoff_is_divergence() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 20)], &[]);
+    assert_eq!(
+        f1.rec(2_050, caught_up(D, 20, dg(7, 20))),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(
+        f1.rec(2_100, caught_up(B, 20, dg(7, 20))),
+        off_the_cutoff(B)
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+
+    let mut f1 = at_barrier(20);
+    assert_eq!(f1.rec(3_000, durable(B, 20, dg(7, 20))), off_the_cutoff(B));
+    assert_eq!(f1.cas_count(), 0);
+}
+
+/// Ruling A-5: once a peer's decision blocks the run, a fence read no later than that decision is
+/// refused by name; only a fence proven after it re-fences. The decision is seen either as a
+/// survivor on a newer root (floor: the run's own fence read) or on the CAS re-read (floor: the
+/// read's revision).
+#[retcd_test]
+fn after_overtaken_only_a_newer_fence_refences() {
+    let at = |revision| {
+        RecoveryEvent::FenceProven(Box::new(FencingProof {
+            control_revision: Revision(revision),
+            ..proof()
+        }))
+    };
+    let refused = vec![ign(ReplicaIgnoreReason::RecoveryBlocked)];
+    let overtaken = RecoveryPhase::Blocked(BlockReason::OvertakenByPeer);
+
+    let mut f1 = fenced(&[]);
+    f1.report(10, on_new_root(B, 30));
+    assert_eq!(
+        f1.rec(20, at(CONTROL_REV.0)),
+        refused,
+        "the old fence, replayed"
+    );
+    assert_eq!(f1.phase(), overtaken);
+    assert!(has_query(&f1.rec(30, at(CONTROL_REV.0 + 1))));
+
+    let mut f1 = rereading();
+    f1.step(3_200, found(record(A).encode()));
+    for revision in [CONTROL_REV.0, 6] {
+        assert_eq!(f1.rec(3_300, at(revision)), refused, "read at {revision}");
+        assert_eq!(f1.phase(), overtaken);
+    }
+    assert!(has_query(&f1.rec(3_400, at(7))));
+}
+
+/// Ruling D-1 (B-R45b), ported from the tester's `probe_dz_g2`: on either CAS path the floor is
+/// the newer of the run's own fence read and the re-read. A peer's record read at a revision older
+/// than our fence still refuses our own fence, replayed; only a fence past both re-fences.
+#[retcd_test]
+fn a_re_read_older_than_our_fence_never_lowers_the_floor() {
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let fence_at = |revision| {
+        RecoveryEvent::FenceProven(Box::new(FencingProof {
+            control_revision: Revision(revision),
+            ..proof()
+        }))
+    };
+    let mut activation = lone_committed();
+    activation.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    for copy in [A, B, C] {
+        activation.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    activation.step(
+        4_200,
+        cas_result(CasOutcome::Conflict {
+            exists: true,
+            current: Revision(12),
+        }),
+    );
+    for (path, mut f1) in [
+        ("recovery CAS", rereading()),
+        ("activation CAS", activation),
+    ] {
+        let stale_read = read_result(ReadOutcome::Found {
+            revision: Revision(3),
+            value: peer.encode(),
+        });
+        assert_eq!(
+            f1.step(4_300, stale_read),
+            vec![block(BlockReason::OvertakenByPeer)],
+            "{path}"
+        );
+        assert_eq!(
+            f1.rec(4_400, fence_at(CONTROL_REV.0)),
+            vec![ign(ReplicaIgnoreReason::RecoveryBlocked)],
+            "{path}: our own fence, replayed"
+        );
+        assert_eq!(
+            f1.phase(),
+            RecoveryPhase::Blocked(BlockReason::OvertakenByPeer),
+            "{path}"
+        );
+        assert!(
+            has_query(&f1.rec(4_500, fence_at(CONTROL_REV.0 + 1))),
+            "{path}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tester rows from the B-R41 re-gate (manual tester, mutation gaps). Not plan rows; no m7b_ name.
+// ---------------------------------------------------------------------------------------------
+
+/// Kills re-gate G03 and G04. "Newer" is the same partition and `(generation, owner_epoch)`
+/// greater, generation first (ruling F-b(ii)). The plan's own lineage seen at another base is not
+/// newer.
+#[retcd_test]
+fn tester_b_a_newer_anchor_orders_generation_before_epoch() {
+    let seen = |generation: u64, epoch: u64, base: u64| SurvivorInventory {
+        anchor_seen: LineageAnchor {
+            lineage: Lineage {
+                partition: PARTITION,
+                generation: Generation(generation),
+                owner_epoch: OwnerEpoch(epoch),
+            },
+            base_seq: Seq(base),
+            base_digest: dg(0, base),
+        },
+        ..inv(A, 30)
+    };
+    let overtaken = vec![block(BlockReason::OvertakenByPeer)];
+    let stale = vec![lost(A, UnavailableReason::StaleLineage)];
+    for (inventory, want) in [
+        (seen(8, 0, BASE), overtaken),
+        (seen(6, 9, BASE), stale.clone()),
+        (seen(7, 1, 12), stale),
+    ] {
+        let mut f1 = fenced(&[]);
+        assert_eq!(f1.report(10, inventory), want);
+    }
+}
+
+/// Kills re-gate G05. A head exactly at the base is verified, not ineligible (ruling F-c: only a
+/// head below the base is).
+#[retcd_test]
+fn tester_b_a_head_at_the_base_is_verified() {
+    let mut f1 = fenced(&[]);
+    assert_eq!(
+        f1.report(10, inv(B, BASE)),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+}
+
+/// Kills re-gate G16. A short catch-up is `Outstanding` only for a copy still owed one; any other
+/// copy is `NotRequired`.
+#[retcd_test]
+fn tester_b_a_short_catch_up_from_a_copy_not_owed_is_not_required() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
+    assert_eq!(
+        f1.rec(2_100, caught_up(A, 15, dg(0, 15))),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tester rows from the B-R45 delta check (manual tester, mutation gaps). Not plan rows; no m7b_
+// name.
+// ---------------------------------------------------------------------------------------------
+
+/// Kills delta H12. A fence for another lineage is not this plan's fence, whatever its revision:
+/// the lineage check runs before the floor (ruling B-R45a Q4).
+#[retcd_test]
+fn tester_b_b_the_lineage_check_runs_before_the_floor() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, on_new_root(B, 25));
+    f1.rec(20, RecoveryEvent::Plan(Box::new(replan())));
+    assert_eq!(
+        f1.rec(30, RecoveryEvent::FenceProven(Box::new(proof()))),
+        vec![ign(ReplicaIgnoreReason::InvalidConfig)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+}
+
+/// Kills delta H21. A report that breaks both the pin and the committed cutoff is named
+/// `Pairwise` (ruling B-R45a Q6).
+#[retcd_test]
+fn tester_b_b_a_report_breaking_pin_and_cutoff_is_pairwise() {
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    let evidence = DivergenceEvidence::Pairwise {
+        seq: Seq(20),
+        a: (B, dg(0, 20)),
+        b: (C, dg(7, 20)),
+    };
+    assert_eq!(
+        f1.rec(4_100, caught_up(C, 20, dg(7, 20))),
+        vec![
+            r(RecoveryEffect::Quarantine(evidence)),
+            block(BlockReason::DivergenceRequiresOperator {
+                diverged: vec![B, C]
+            }),
+        ]
+    );
+}
+
+/// Kills delta H23. A copy recorded lost is judged for divergence before it is refused as a
+/// source (ruling A-3).
+#[retcd_test]
+fn tester_b_b_a_lost_copy_is_judged_before_it_is_refused() {
+    let mut f1 = lone_committed();
+    f1.step(4_000, lose(C));
+    let evidence = DivergenceEvidence::RootMismatch {
+        copy: C,
+        base_seq: Seq(20),
+        expected: dg(0, 20),
+        found: Some(dg(7, 20)),
+    };
+    assert_eq!(
+        f1.rec(4_100, caught_up(C, 20, dg(7, 20))),
+        vec![
+            r(RecoveryEffect::Quarantine(evidence)),
+            block(BlockReason::DivergenceRequiresOperator { diverged: vec![C] }),
+        ]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan rows, team kernel-b test plan §8.1: phases, inventory and ancestry (M7B-84..91)
+// ---------------------------------------------------------------------------------------------
+
+fn fence_event() -> EventKind {
+    EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(Box::new(
+        proof(),
+    ))))
+}
+
+fn verified(reports: &[SurvivorInventory]) -> Vec<VerifiedInventory> {
+    reports
+        .iter()
+        .map(|report| verify_ancestry(&anchor(), report).expect("on the committed root"))
+        .collect()
+}
+
+fn is_quarantine(effect: &EffectKind) -> bool {
+    matches!(
+        effect,
+        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::Quarantine(_)))
+    )
+}
+
+fn is_probe(effect: &EffectKind) -> bool {
+    matches!(
+        effect,
+        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt { .. }))
+    )
+}
+
+/// M7B-84 (D §5.1, §2.1, ADR 0009 §1): `Idle` leaves on a fence and on nothing else. The plan's
+/// fourth input, a `CasResult`, is declined rather than answered `NotFenced`: F1 has no CAS
+/// pending, and a control answer it did not request is not its input at all (the decline rule,
+/// `control_answers_f1_did_not_request_are_declined`). Either way `Idle` holds.
+#[retcd_test]
+fn m7b_84_idle_accepts_only_fence_proven() {
+    let mut f1 = F1::new();
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan(&[]))));
+    let not_fenced = vec![ign(ReplicaIgnoreReason::NotFenced)];
+    assert_eq!(f1.report(1, inv(A, 20)), not_fenced);
+    let deadline_now = EventKind::Timer(TimerFired {
+        id: DISCOVERY_TIMER,
+        version: TimerVersion(1),
+        scheduled_at: Tick(2),
+    });
+    assert_eq!(f1.step(2, deadline_now), not_fenced);
+    assert_eq!(f1.rec(3, durable(A, 20, dg(0, 20))), not_fenced);
+    f1.declines(4, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(f1.phase(), RecoveryPhase::Idle);
+    assert_eq!(
+        f1.step(5, fence_event()),
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C]
+            }),
+            arm(1, 5 + WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+/// M7B-85 (D §5.5, ADR 0009 §3): the window runs from the fence's arrival tick. Stepped at 900
+/// but arrived at 700, so the deadline is 2700, not 2900; 2699 does not close it, 2700 does.
+#[retcd_test]
+fn m7b_85_window_is_anchored_to_the_arrival_tick() {
+    assert_eq!(WINDOW, 2_000);
+    let mut f1 = F1::new();
+    f1.rec(0, RecoveryEvent::Plan(Box::new(plan(&[]))));
+    assert_eq!(
+        f1.at(900, 700, fence_event()),
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C]
+            }),
+            arm(1, 2_700),
+        ]
+    );
+    for copy in [A, B, C] {
+        f1.report(1_000, inv(copy, 20));
+    }
+    assert_eq!(
+        f1.step(2_699, fired(1)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    assert_eq!(f1.step(2_700, fired(1))[0], r(RecoveryEffect::CloseWindow));
+}
+
+/// B, whose history is `ineligible_b`, reports beside A and C at 20; the run commits on A and C.
+/// B's head is the longest, so a selection that read it would pick B.
+fn commit_without_b(ineligible_b: SurvivorInventory) -> (F1, RecoveryResult) {
+    let (mut f1, close) = closed(&[], vec![inv(A, 20), ineligible_b, inv(C, 20)], &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            sync(A, 20),
+            sync(C, 20),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    for copy in [A, C] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    (f1, result)
+}
+
+/// M7B-86 (D §5.3 step 1, ADR 0009 §4): a survivor on another lineage is ineligible, never
+/// divergent. It is recorded as lost, and its longer head is not in the selection input.
+#[retcd_test]
+fn m7b_86_stale_lineage_is_ineligible_not_divergence() {
+    let stale = SurvivorInventory {
+        anchor_seen: LineageAnchor {
+            lineage: Lineage {
+                generation: Generation(6),
+                ..prior()
+            },
+            ..anchor()
+        },
+        ..inv(B, 40)
+    };
+    assert_eq!(
+        verify_ancestry(&anchor(), &stale),
+        Err(Rejected::Ineligible(UnavailableReason::StaleLineage))
+    );
+    let (f1, result) = commit_without_b(stale);
+    assert_eq!(
+        result.loss.unavailable,
+        vec![(B, UnavailableReason::StaleLineage)]
+    );
+    assert!(!f1.log.iter().any(is_quarantine), "no divergence");
+}
+
+/// M7B-87 (D §5.3 step 2, B-R17): a quarantined survivor is ineligible and kept as evidence.
+/// Twin of M7B-86 by one field.
+#[retcd_test]
+fn m7b_87_quarantined_survivor_is_ineligible_and_kept_as_evidence() {
+    let quarantined = SurvivorInventory {
+        quarantined: Some(QuarantineReason::CorruptHistory),
+        ..inv(B, 40)
+    };
+    assert_eq!(
+        verify_ancestry(&anchor(), &quarantined),
+        Err(Rejected::Ineligible(UnavailableReason::Quarantined))
+    );
+    let (_, result) = commit_without_b(quarantined);
+    assert_eq!(
+        result.inventories,
+        vec![
+            InventoryOutcome::Verified { copy: A },
+            InventoryOutcome::Ineligible {
+                copy: B,
+                reason: UnavailableReason::Quarantined,
+            },
+            InventoryOutcome::Verified { copy: C },
+        ]
+    );
+    assert_eq!(
+        result.loss.unavailable,
+        vec![(B, UnavailableReason::Quarantined)]
+    );
+}
+
+/// M7B-88 (D §5.3 step 3, ADR 0009 §4): a digest at `base_seq` other than the root's is
+/// divergence. The run quarantines and never selects.
+#[retcd_test]
+fn m7b_88_root_mismatch_is_divergence() {
+    let mut wrong = inv(B, 20);
+    wrong.ladder[0].1 = dg(9, BASE);
+    let evidence = DivergenceEvidence::RootMismatch {
+        copy: B,
+        base_seq: Seq(BASE),
+        expected: dg(0, BASE),
+        found: Some(dg(9, BASE)),
+    };
+    assert_eq!(
+        verify_ancestry(&anchor(), &wrong),
+        Err(Rejected::Divergence(evidence))
+    );
+    let (f1, _) = closed(&[], vec![inv(A, 20), wrong, inv(C, 20)], &[]);
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+    assert!(!has_selected(&f1.log), "{:?}", f1.log);
+}
+
+/// M7B-89 (D §5.3 "the pairwise loop is the only guard", D §7, BA-9): two histories sharing the
+/// root and forking above it never select, whichever is longer. BA-9's first option, enumerated
+/// instead of seeded: every fork from the root to 29 and every pair of heads above it to 30,
+/// 2870 pairs. The bounds go to the test's JSONL.
+#[retcd_test]
+fn m7b_89_divergent_above_root_pairs_never_select() {
+    const TOP: u64 = 30;
+    let mut pairs = 0;
+    for fork in BASE..TOP {
+        for head_a in fork + 1..=TOP {
+            for head_b in fork + 1..=TOP {
+                let both = verified(&[inv_on(A, head_a, 1, fork), inv_on(B, head_b, 2, fork)]);
+                let outcome = select_prefix(&both, root());
+                assert!(
+                    matches!(
+                        outcome,
+                        SelectionOutcome::Divergence(DivergenceEvidence::Pairwise { .. })
+                    ),
+                    "fork {fork}, heads {head_a}/{head_b}: {outcome:?}"
+                );
+                pairs += 1;
+            }
+        }
+    }
+    assert_eq!(pairs, 2_870);
+    tracing::info!(
+        pairs,
+        fork_from = BASE,
+        top = TOP,
+        "m7b_89 enumerated divergent pairs"
+    );
+}
+
+/// The M7B-90 fixture: A and D full ladders at 40, B and C sparse at 50. A and D each need B's and
+/// C's digest at 40, so `(B, 40)` and `(C, 40)` are each asked for twice. `d` is D's history.
+fn probe_fixture(d: SurvivorInventory) -> (Vec<SurvivorInventory>, [Member; 1]) {
+    (
+        vec![inv(A, 40), sparse(B, 50), sparse(C, 50), d],
+        [member(D, ReplicaRole::RegularSecondary)],
+    )
+}
+
+/// M7B-90 (D §5.4 `NeedProbes`, ADR 0009 §4): the probes a selection needs are deduplicated,
+/// sorted and sent in one vector, and the run stays collecting.
+#[retcd_test]
+fn m7b_90_needed_probes_are_deduplicated_sorted_and_batched() {
+    let (reports, extra) = probe_fixture(inv(D, 40));
+    assert_eq!(
+        select_prefix(&verified(&reports), root()),
+        SelectionOutcome::NeedProbes(vec![(B, Seq(40)), (C, Seq(40))])
+    );
+    let (f1, close) = closed(&extra, reports, &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::ProbeDigestAt {
+                copy: B,
+                seq: Seq(40)
+            }),
+            r(RecoveryEffect::ProbeDigestAt {
+                copy: C,
+                seq: Seq(40)
+            }),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+}
+
+/// M7B-91 (D §5.4 order): divergence is decided before probes are sent. Twin of M7B-90 by one
+/// digest: D's head digest at 40 is off A's history, while B and C still owe probes.
+#[retcd_test]
+fn m7b_91_divergence_is_decided_before_probes_are_sent() {
+    let (reports, extra) = probe_fixture(inv_on(D, 40, 3, 39));
+    let evidence = DivergenceEvidence::Pairwise {
+        seq: Seq(40),
+        a: (A, dg(0, 40)),
+        b: (D, dg(3, 40)),
+    };
+    assert_eq!(
+        select_prefix(&verified(&reports), root()),
+        SelectionOutcome::Divergence(evidence)
+    );
+    let (f1, close) = closed(&extra, reports, &[]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::Quarantine(evidence)),
+            block(BlockReason::DivergenceRequiresOperator {
+                diverged: vec![A, D]
+            }),
+        ]
+    );
+    assert!(!f1.log.iter().any(is_probe), "{:?}", f1.log);
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan rows, §8.2: selection, window and leader (M7B-92..98)
+// ---------------------------------------------------------------------------------------------
+
+/// M7B-92 (spec §5 F1; charter "all unequal secondary prefix pairings"; D §5.4; gate V3): with the
+/// old primary A gone, every unequal pairing of B and C over heads {10, 20, 30} selects the longer
+/// at its head, and the loss is certain because nothing was advertised past it. The
+/// synchronization half is M7B-136 (sim).
+#[retcd_test]
+fn m7b_92_all_unequal_secondary_prefix_pairings_select_longest_compatible() {
+    let heads = [10, 20, 30];
+    let mut pairings = 0;
+    for head_b in heads {
+        for head_c in heads.into_iter().filter(|head| *head != head_b) {
+            let (holder, behind, cutoff) = if head_b > head_c {
+                (B, C, head_b)
+            } else {
+                (C, B, head_c)
+            };
+            let (mut f1, close) = closed(&[], vec![inv(B, head_b), inv(C, head_c)], &[A]);
+            assert_eq!(
+                close[..3],
+                [
+                    r(RecoveryEffect::CloseWindow),
+                    selected(cutoff, holder),
+                    catch_up(holder, behind, cutoff),
+                ],
+                "B {head_b}, C {head_c}"
+            );
+            f1.rec(2_100, caught_up(behind, cutoff, dg(0, cutoff)));
+            for copy in [B, C] {
+                f1.rec(2_200, durable(copy, cutoff, dg(0, cutoff)));
+            }
+            let result = recovered(&f1.step(2_300, cas_result(CasOutcome::Committed(Revision(9)))));
+            assert_eq!(result.selected.source, holder);
+            assert_eq!(result.loss.cutoff_seq, Seq(cutoff));
+            assert!(!result.loss.uncertain, "B {head_b}, C {head_c}");
+            pairings += 1;
+        }
+    }
+    assert_eq!(pairings, 6);
+}
+
+/// M7B-93 (D §5.4 loop `Collecting -> NeedProbes -> Collecting -> Selected`): the first step asks
+/// for a probe and stays collecting; a `Match` answer selects, a `Differs` answer is divergence.
+#[retcd_test]
+fn m7b_93_collecting_loop_probe_then_select() {
+    for matches in [true, false] {
+        let (mut f1, close) = closed(&[], vec![sparse(A, 20), inv(B, 15), inv(C, 15)], &[]);
+        assert_eq!(
+            close,
+            vec![
+                r(RecoveryEffect::CloseWindow),
+                r(RecoveryEffect::ProbeDigestAt {
+                    copy: A,
+                    seq: Seq(15)
+                }),
+                arm(2, 2 * WINDOW),
+            ]
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+        let answer = if matches { dg(0, 15) } else { dg(5, 15) };
+        let effects = f1.rec(
+            2_100,
+            RecoveryEvent::ProbeAnswered {
+                copy: A,
+                seq: Seq(15),
+                digest: answer,
+            },
+        );
+        if matches {
+            assert_eq!(effects[0], selected(20, A));
+            assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+        } else {
+            assert_eq!(
+                effects,
+                vec![
+                    r(RecoveryEffect::Quarantine(DivergenceEvidence::Pairwise {
+                        seq: Seq(15),
+                        a: (B, dg(0, 15)),
+                        b: (A, dg(5, 15)),
+                    })),
+                    block(BlockReason::DivergenceRequiresOperator {
+                        diverged: vec![A, B]
+                    }),
+                ]
+            );
+            assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+        }
+    }
+}
+
+fn transfer(copy: CopyId, received: u64) -> RecoveryEvent {
+    RecoveryEvent::TransferProgress {
+        copy,
+        advertised_seq: Seq(30),
+        received_seq: Seq(received),
+    }
+}
+
+/// M7B-94 (D §5.5 ordering; spec §6 "record source failure before choosing a shorter prefix"):
+/// B and C transfer through three extensions; in the fourth window B still moves and C has
+/// stopped. At the capped deadline both are recorded, each before `CloseWindow` in the same
+/// vector, and the loss is uncertain because 30 was advertised past the cutoff at 20.
+#[retcd_test]
+fn m7b_94_stalled_sources_are_recorded_before_close_by_effect_index() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    for window in 1..=3u64 {
+        let deadline = window * WINDOW;
+        f1.rec(deadline - 100, transfer(B, 5 * window));
+        f1.rec(deadline - 100, transfer(C, 5 * window));
+        assert_eq!(
+            f1.step(deadline, fired(window)),
+            vec![arm(window + 1, deadline + WINDOW)]
+        );
+    }
+    f1.rec(4 * WINDOW - 100, transfer(B, 20));
+    let close = f1.step(4 * WINDOW, fired(4));
+    let index = |effect: &EffectKind| close.iter().position(|e| e == effect);
+    let closed_at = index(&r(RecoveryEffect::CloseWindow)).expect("the window closes");
+    for copy in [B, C] {
+        let recorded = index(&lost(copy, UnavailableReason::Stalled));
+        assert!(
+            recorded.is_some_and(|at| at < closed_at),
+            "{copy:?}: {close:?}"
+        );
+    }
+    let every_record_first = close.iter().enumerate().all(|(at, effect)| {
+        !matches!(
+            effect,
+            EffectKind::Kernel(KernelEffect::Recovery(
+                RecoveryEffect::RecordSourceUnavailable { .. }
+            ))
+        ) || at < closed_at
+    });
+    assert!(every_record_first, "{close:?}");
+    f1.rec(9_000, durable(A, 20, dg(0, 20)));
+    let result = recovered(&f1.step(9_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(result.loss.highest_advertised_seq, Seq(30));
+    assert!(result.loss.uncertain);
+}
+
+/// M7B-95 (D §5.5 `MAX_WINDOW_EXTENSIONS = 3`, ADR 0009 §3): B advertises past the best head and
+/// delivers one record per window. The deadlines at 2000, 4000 and 6000 extend by 2000 each; the
+/// one at 8000 closes, exactly then and not a tick before.
+#[retcd_test]
+fn m7b_95_window_extends_at_most_three_times_then_closes() {
+    assert_eq!(MAX_WINDOW_EXTENSIONS, 3);
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    for (extension, deadline) in [(1, 2_000), (2, 4_000), (3, 6_000)] {
+        f1.rec(deadline - 100, transfer(B, extension));
+        assert_eq!(
+            f1.step(deadline, fired(extension)),
+            vec![arm(extension + 1, deadline + 2_000)],
+            "extension {extension}"
+        );
+    }
+    f1.rec(7_900, transfer(B, 4));
+    assert_eq!(
+        f1.step(7_999, fired(4)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+    assert_eq!(
+        f1.step(8_000, fired(4)),
+        vec![
+            lost(B, UnavailableReason::Stalled),
+            lost(C, UnavailableReason::Stalled),
+            r(RecoveryEffect::CloseWindow),
+            selected(20, A),
+            sync(A, 20),
+            arm(5, 10_000),
+        ]
+    );
+}
+
+/// M7B-98 (D §5.4 `select_leader`, `CatchUpBeforeGrant`; spec §8.3): B holds the prefix but may
+/// not lead, so C is caught up before its grant and nothing is proposed in that step. The
+/// proposal names C, and comes after C's catch-up and the barrier (M7B-99..102): `ProposeOwnership`
+/// is the landed `ControlEffect::Cas` on `partitions/{id}`.
+#[retcd_test]
+fn m7b_98_holder_that_cannot_lead_gets_catch_up_before_grant() {
+    let mut holder_cannot_lead = plan(&[]);
+    holder_cannot_lead.candidates = vec![
+        Candidate {
+            primary_eligible: false,
+            ..candidate(B)
+        },
+        candidate(C),
+    ];
+    let mut f1 = fenced_on(holder_cannot_lead);
+    f1.report(10, inv(B, 30));
+    f1.report(10, inv(C, 20));
+    f1.rec(10, RecoveryEvent::InventoryFailed { copy: A });
+    assert_eq!(
+        f1.step(WINDOW, fired(1)),
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(30, B),
+            r(RecoveryEffect::CatchUpBeforeGrant {
+                from: B,
+                to: C,
+                through: Seq(30),
+                credential: proof().credential_for(B),
+            }),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    assert_eq!(f1.cas_count(), 0);
+    assert_eq!(
+        f1.rec(2_100, caught_up(C, 30, dg(0, 30))),
+        vec![sync(B, 30), sync(C, 30)]
+    );
+    f1.rec(2_200, durable(B, 30, dg(0, 30)));
+    assert_eq!(
+        f1.rec(2_300, durable(C, 30, dg(0, 30))),
+        vec![cas(CONTROL_REV, C)]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan rows, §8.3: barrier, CAS and modes (M7B-99..112)
+// ---------------------------------------------------------------------------------------------
+
+/// The barrier rows' required set, `{B, C}`, cut at `(50, d50)`.
+fn barrier_over_b_and_c(proofs: &[DurableProof]) -> Result<RecoveryBarrier, MissingProof> {
+    RecoveryBarrier::try_new(proofs, &BTreeSet::from([B, C]), Seq(50), dg(0, 50))
+}
+
+/// A gone, B and C at 50: the run waits at the barrier with `required {B, C}`.
+fn b_and_c_at_the_barrier() -> F1 {
+    let (f1, _) = closed(&[], vec![inv(B, 50), inv(C, 50)], &[A]);
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    f1
+}
+
+/// M7B-99 (D §5.6 `try_new` Ok, ADR 0009 §6): a complete proof set bound to the cutoff builds the
+/// barrier, and the barrier holds exactly what it was built from.
+#[retcd_test]
+fn m7b_99_try_new_accepts_a_complete_bound_proof_set() {
+    let proofs = [proven(B, 50, dg(0, 50)), proven(C, 50, dg(0, 50))];
+    let barrier = barrier_over_b_and_c(&proofs).expect("complete and bound");
+    assert_eq!(barrier.cutoff(), Seq(50));
+    assert_eq!(barrier.cutoff_digest(), dg(0, 50));
+    assert_eq!(barrier.required(), [B, C]);
+    assert_eq!(barrier.proofs(), proofs);
+    assert!(barrier.proofs().iter().all(|p| p.seq == DurableSeq(50)));
+}
+
+/// M7B-100 (D §5.6 `NoProofFrom`, D §7 "fallible ctor tested failing"): without C's proof there is
+/// no barrier, and the run stays at it.
+#[retcd_test]
+fn m7b_100_try_new_rejects_a_missing_required_copy() {
+    assert_eq!(
+        barrier_over_b_and_c(&[proven(B, 50, dg(0, 50))]),
+        Err(MissingProof::NoProofFrom(C))
+    );
+    let mut f1 = b_and_c_at_the_barrier();
+    assert_eq!(
+        f1.rec(3_000, durable(B, 50, dg(0, 50))),
+        vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    assert_eq!(f1.cas_count(), 0);
+}
+
+/// M7B-101 (D §5.6 `ProofBelowCutoff`): durable at 49 says nothing about 50.
+#[retcd_test]
+fn m7b_101_try_new_rejects_a_proof_below_cutoff() {
+    assert_eq!(
+        barrier_over_b_and_c(&[proven(B, 50, dg(0, 50)), proven(C, 49, dg(0, 49))]),
+        Err(MissingProof::ProofBelowCutoff {
+            copy: C,
+            proof_seq: DurableSeq(49),
+            cutoff: Seq(50),
+        })
+    );
+}
+
+/// M7B-102 (D §5.6 `ProofDigestMismatch`, "durable at different histories"): twin of M7B-99 by one
+/// digest.
+#[retcd_test]
+fn m7b_102_try_new_rejects_a_proof_with_the_wrong_digest() {
+    assert_eq!(
+        barrier_over_b_and_c(&[proven(B, 50, dg(0, 50)), proven(C, 50, dg(7, 50))]),
+        Err(MissingProof::ProofDigestMismatch {
+            copy: C,
+            proof_digest: dg(7, 50),
+            cutoff_digest: dg(0, 50),
+        })
+    );
+}
+
+/// M7B-103 (D §5.6 `UnknownCopy`): a proof from outside `required` refuses the set, even though B
+/// and C are complete.
+#[retcd_test]
+fn m7b_103_try_new_rejects_a_proof_from_an_unknown_copy() {
+    assert_eq!(
+        barrier_over_b_and_c(&[
+            proven(B, 50, dg(0, 50)),
+            proven(C, 50, dg(0, 50)),
+            proven(D, 50, dg(0, 50)),
+        ]),
+        Err(MissingProof::UnknownCopy(D))
+    );
+}
+
+/// M7B-105 (D §5.1 "one CAS on `partitions/{id}`", ADR 0009 §5, ADR 0008): the proof that completes
+/// the barrier emits one control effect, the CAS on the partition key conditioned on the fence's
+/// revision, and the run never writes another key.
+#[retcd_test]
+fn m7b_105_commit_is_one_cas_on_the_partition_record() {
+    let mut f1 = at_barrier(20);
+    for copy in [A, B] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(
+        f1.rec(3_001, durable(C, 20, dg(0, 20))),
+        vec![cas(CONTROL_REV, A)]
+    );
+    let keys: Vec<&ControlKey> = f1
+        .log
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Control(ControlEffect::Cas { key, .. } | ControlEffect::Get { key }) => {
+                Some(key)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, [&ControlKey::Partition(PARTITION)]);
+}
+
+/// M7B-106 (D §5.1 `Committed` arm; landed `CasOutcome::Committed(revision)`): the run is
+/// committed, the revision flows into the result, and `Recovered` is the step's one effect.
+#[retcd_test]
+fn m7b_106_cas_committed_enters_committed_with_mode() {
+    let mut f1 = proposing(20);
+    let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    let result = recovered(&effects);
+    assert_eq!(result.committed.revision, Revision(9));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+}
+
+/// A fence proved against the plan's anchor that read control at `revision`.
+fn fence_read_at(revision: u64) -> RecoveryEvent {
+    RecoveryEvent::FenceProven(Box::new(FencingProof {
+        control_revision: Revision(revision),
+        ..proof()
+    }))
+}
+
+/// M7B-107 (D §5.1 `Conflict` arm, ADR 0009 §5): a conflict whose re-read shows another owner at a
+/// newer epoch is overtaken. Blocked holds against every input but a fresh fence, which re-enters
+/// by the M7B-84 door.
+#[retcd_test]
+fn m7b_107_cas_conflict_with_newer_owner_is_overtaken() {
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let mut f1 = rereading();
+    assert_eq!(
+        f1.step(3_200, found(peer.encode())),
+        vec![block(BlockReason::OvertakenByPeer)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+    assert_eq!(
+        f1.report(3_300, inv(A, 20)),
+        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+    );
+    assert!(has_query(&f1.rec(3_400, fence_read_at(7))));
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+/// M7B-109 and M7B-146 share this: `outcome` answers the recovery CAS; the run blocks for
+/// `reason`, emits no CAS in that step and never re-proposes on anything short of a fresh fence.
+fn control_blocks_without_retry(outcome: CasOutcome, reason: &BlockReason) {
+    let mut f1 = proposing(20);
+    assert_eq!(
+        f1.step(3_100, cas_result(outcome)),
+        vec![block(reason.clone())]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason.clone()));
+    let refused = vec![ign(ReplicaIgnoreReason::RecoveryBlocked)];
+    assert_eq!(f1.rec(3_200, durable(A, 20, dg(0, 20))), refused);
+    assert_eq!(f1.step(3_300, fired(3)), refused);
+    assert_eq!(f1.report(3_400, inv(B, 20)), refused);
+    f1.declines(3_500, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(f1.cas_count(), 1, "never re-proposed");
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason.clone()));
+    assert!(has_query(&f1.rec(3_600, fence_read_at(7))));
+}
+
+/// M7B-109 (D §5.1 `Unavailable` arm "never retry blind"; ADR 0009 §5): twin of M7B-146 by the
+/// outcome arm.
+#[retcd_test]
+fn m7b_109_cas_unavailable_blocks_without_blind_retry() {
+    control_blocks_without_retry(CasOutcome::Unavailable, &BlockReason::ControlUnavailable);
+}
+
+/// The type name of `value`'s type.
+fn type_of<T>(_: &T) -> &'static str {
+    std::any::type_name::<T>()
+}
+
+/// M7B-110 (D §5.6 mode table, BA-8): 3, 2 and 1 eligible regulars commit `Active`,
+/// `DegradedRf2` and `ReadOnly`; none blocks with `NoEligibleRegular`, a reason an operator can
+/// tell from divergence and from the control plane being down. `RecoveryResult.mode` is the shared
+/// `PartitionMode`. The plan's other two carriers carry no mode on today's code: L1 is mode-blind
+/// by ruling T-B-03, and A1's `PartitionRecord` has none.
+#[retcd_test]
+fn m7b_110_mode_is_derived_from_eligible_regular_count() {
+    let runs: [(&[CopyId], &[CopyId], PartitionMode); 3] = [
+        (&[A, B, C], &[], PartitionMode::Active),
+        (&[A, B], &[C], PartitionMode::DegradedRf2),
+        (&[A], &[B, C], PartitionMode::ReadOnly),
+    ];
+    for (survivors, failed, mode) in runs {
+        let (mut f1, _) = closed(
+            &[],
+            survivors.iter().map(|copy| inv(*copy, 20)).collect(),
+            failed,
+        );
+        for copy in survivors {
+            f1.rec(3_000, durable(*copy, 20, dg(0, 20)));
+        }
+        let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+        assert_eq!(result.mode, mode, "{survivors:?}");
+        assert_eq!(
+            type_of(&result.mode),
+            std::any::type_name::<PartitionMode>()
+        );
+    }
+    let none = BlockReason::NoEligibleRegular;
+    let (f1, close) = closed(&[], Vec::new(), &[A, B, C]);
+    assert_eq!(close.last(), Some(&block(none.clone())));
+    assert_eq!(f1.phase(), RecoveryPhase::Blocked(none.clone()));
+    assert_eq!(
+        mode_for(0),
+        PartitionMode::Blocked {
+            reason: none.clone()
+        }
+    );
+    for other in [
+        BlockReason::DivergenceRequiresOperator {
+            diverged: Vec::new(),
+        },
+        BlockReason::ControlUnavailable,
+        BlockReason::ControlUnknown,
+    ] {
+        assert_ne!(none, other);
+    }
+}
+
+/// M7B-111 (charter "all three lone-survivor choices"; D §5.6; spec §8.4; gate V3): whichever copy
+/// survives alone, it holds the prefix at its own head and the partition commits `ReadOnly`. The
+/// old primary's head, 100, is known from its transfer advertisement, so a shorter lone survivor's
+/// loss is uncertain. The plan's `recovery_mode` is T1's read-trace field, not an F1 output; F1's
+/// half of it is `mode == ReadOnly` (the row's own scope note, T-B-03 / Q-B-2).
+#[retcd_test]
+fn m7b_111_all_three_lone_survivor_choices_are_read_only_until_the_barrier() {
+    for (survivor, head) in [(A, 100), (B, 90), (C, 80)] {
+        let mut f1 = fenced(&[]);
+        f1.report(10, inv(survivor, head));
+        for other in [A, B, C].into_iter().filter(|copy| *copy != survivor) {
+            f1.rec(
+                10,
+                if other == A {
+                    RecoveryEvent::TransferProgress {
+                        copy: A,
+                        advertised_seq: Seq(100),
+                        received_seq: Seq(0),
+                    }
+                } else {
+                    RecoveryEvent::InventoryFailed { copy: other }
+                },
+            );
+        }
+        let close = f1.step(WINDOW, fired(1));
+        assert!(close.contains(&selected(head, survivor)), "{close:?}");
+        f1.rec(3_000, durable(survivor, head, dg(0, head)));
+        let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+        assert_eq!(result.mode, PartitionMode::ReadOnly, "{survivor:?}");
+        assert_eq!(result.selected.source, survivor);
+        assert_eq!(result.selected.cutoff_seq, Seq(head));
+        assert_eq!(result.loss.highest_advertised_seq, Seq(100));
+        assert_eq!(result.loss.uncertain, survivor != A, "{survivor:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan rows, §8.4: stale owner, retention, result (M7B-113..119)
+// ---------------------------------------------------------------------------------------------
+
+/// M7B-114 (D §5.7 "the discriminator is the phase", ADR 0009 §7): before commit, a returning
+/// owner is one more survivor. Its report is verified, and being the longest it is selected and
+/// leads.
+#[retcd_test]
+fn m7b_114_same_node_before_commit_is_an_ordinary_survivor() {
+    let returning = inv(A, 500);
+    assert!(verify_ancestry(&anchor(), &returning).is_ok());
+    let mut f1 = fenced(&[]);
+    assert_eq!(
+        f1.rec(10, RecoveryEvent::StaleOwnerReturned(Box::new(returning))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    f1.report(10, inv(B, 20));
+    f1.report(10, inv(C, 20));
+    assert_eq!(
+        f1.step(WINDOW, fired(1)),
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(500, A),
+            catch_up(A, B, 500),
+            catch_up(A, C, 500),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+}
+
+/// The identifiers of the variants of every `pub enum *Effect*` declared at the top level of
+/// `source`: a line indented four spaces, starting upper-case, inside the enum's braces.
+fn effect_variants(source: &str) -> Vec<&str> {
+    let mut variants = Vec::new();
+    let mut inside = false;
+    for line in source.lines() {
+        if line.starts_with("pub enum ") && line.contains("Effect") {
+            inside = true;
+        } else if line == "}" {
+            inside = false;
+        } else if let Some(body) = line.strip_prefix("    ").filter(|_| inside) {
+            if body.starts_with(|c: char| c.is_ascii_uppercase()) {
+                variants.extend(body.split(|c: char| !c.is_alphanumeric()).next());
+            }
+        }
+    }
+    variants
+}
+
+/// M7B-115 (D §5.7 `ev.tick` (K-B-25), "no deletion effect exists in M7"; spec §8.4): the
+/// retention window runs from the event's own tick, not the step's, and no effect can delete.
+/// The Q-52 grep, in the test: F1's source never says `Delete`, and no `*Effect*` enum in the
+/// contracts has a `Delete*` variant (`txn::Mutation::Delete` is a client write, not an effect).
+#[retcd_test]
+fn m7b_115_retain_suffix_uses_the_event_tick_and_no_delete_exists() {
+    for at in [100, 200] {
+        let mut f1 = proposing(20);
+        f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+        let returned = RecoveryEvent::StaleOwnerReturned(Box::new(inv(A, 99)));
+        let effects = f1.at(
+            50_000,
+            at,
+            EventKind::Kernel(KernelEvent::Recovery(returned)),
+        );
+        assert_eq!(
+            effects[0],
+            r(RecoveryEffect::QuarantineSuffix {
+                copy: A,
+                from: Seq(21),
+                until: Tick(at + RETENTION),
+            })
+        );
+    }
+    let f1_source = [
+        include_str!("../src/recovery.rs"),
+        include_str!("../src/recovery/commit.rs"),
+        include_str!("../src/recovery/emit.rs"),
+        include_str!("../src/recovery/inventory.rs"),
+        include_str!("../src/recovery/lineage.rs"),
+        include_str!("../src/recovery/rebuild.rs"),
+    ];
+    assert!(f1_source.iter().all(|source| !source.contains("Delete")));
+    let variants: Vec<&str> = [
+        include_str!("../src/contracts/authority.rs"),
+        include_str!("../src/contracts/control.rs"),
+        include_str!("../src/contracts/event.rs"),
+        include_str!("../src/contracts/recovery.rs"),
+        include_str!("../src/contracts/storage.rs"),
+        include_str!("../src/contracts/time.rs"),
+        include_str!("../src/contracts/transport.rs"),
+    ]
+    .into_iter()
+    .flat_map(effect_variants)
+    .collect();
+    for known in ["QuarantineSuffix", "Recovered", "Cas", "Arm"] {
+        assert!(variants.contains(&known), "the scan misses {known}");
+    }
+    let deleting: Vec<&&str> = variants
+        .iter()
+        .filter(|v| v.starts_with("Delete"))
+        .collect();
+    assert!(deleting.is_empty(), "{deleting:?}");
+}
+
+/// M7B-117 (D §5.8 `RecoveryResult`, ADR 0009 §7, K-B-19): the result carries the bounds, the mode
+/// and the status map, with the status map's uncertainty equal to the loss's. Every struct is
+/// destructured without `..`, so a field added to any of them (a client-ACK field included) stops
+/// this row compiling until it is asserted here.
+#[retcd_test]
+fn m7b_117_recovery_result_carries_bounds_mode_and_status_map() {
+    let mut f1 = fenced(&[]);
+    f1.report(10, inv(A, 20));
+    f1.report(10, inv(B, 20));
+    f1.rec(20, transfer(C, 0));
+    f1.step(WINDOW, fired(1));
+    for copy in [A, B] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    let RecoveryResult {
+        fenced_prior,
+        inventories,
+        selected,
+        new_generation,
+        mode,
+        barrier,
+        loss,
+        committed,
+        retained_status_map,
+    } = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(fenced_prior, proof());
+    assert_eq!(inventories.len(), 3);
+    assert_eq!(new_generation, Generation(8));
+    assert_eq!(new_generation, selected.root.generation);
+    assert_eq!(mode, PartitionMode::DegradedRf2);
+    assert_eq!(
+        (barrier.cutoff(), barrier.required()),
+        (Seq(20), &[A, B][..])
+    );
+    let LossRecord {
+        queried,
+        unavailable,
+        cutoff_seq,
+        highest_advertised_seq,
+        uncertain,
+    } = loss;
+    assert_eq!(queried, [A, B, C]);
+    assert_eq!(unavailable, [(C, UnavailableReason::Stalled)]);
+    assert_eq!((cutoff_seq, highest_advertised_seq), (Seq(20), Seq(30)));
+    assert!(uncertain);
+    let RetainedStatusMap {
+        predecessor_generation,
+        predecessor_cutoff,
+        retained_through,
+        discarded_from,
+        uncertain: status_uncertain,
+    } = retained_status_map;
+    assert_eq!(predecessor_generation, PRIOR_GEN);
+    assert_eq!((predecessor_cutoff, retained_through), (Seq(20), Seq(20)));
+    assert_eq!(discarded_from, Some(Seq(21)));
+    assert_eq!(status_uncertain, uncertain);
+    let CommittedRoot {
+        revision,
+        pinned_config,
+        authority_view,
+    } = committed;
+    assert_eq!(revision, Revision(9));
+    assert_eq!(pinned_config, plan(&[]).config);
+    assert_eq!(authority_view.lineage, root());
+}
+
+/// M7B-118 (D §5.2 shadows never recover, §5.4 `select_leader`, ADR 0009 §5): shadow D holds the
+/// longest verified prefix and every candidate flag is set. The prefix is D's; the leader is a
+/// regular, and D sends the prefix to it before its grant.
+#[retcd_test]
+fn m7b_118_verified_shadow_source_is_never_leader() {
+    let shadow = [member(D, ReplicaRole::Shadow)];
+    let reports = vec![inv(A, 18), inv(B, 18), inv(C, 18), inv(D, 25)];
+    let SelectionOutcome::Selected(chosen) = select_prefix(&verified(&reports), root()) else {
+        panic!("four compatible histories select");
+    };
+    assert_eq!(chosen.source, D);
+    let candidates = plan(&shadow).candidates;
+    assert!(
+        candidates.contains(&candidate(D)),
+        "D is viable by every flag"
+    );
+    assert_eq!(
+        select_leader(&chosen, &candidates, &BTreeSet::from([A, B, C])),
+        Some(A)
+    );
+    let (_, close) = closed(&shadow, reports, &[]);
+    assert!(
+        close.contains(&r(RecoveryEffect::CatchUpBeforeGrant {
+            from: D,
+            to: A,
+            through: Seq(25),
+            credential: proof().credential_for(D),
+        })),
+        "{close:?}"
+    );
+}
+
+/// M7B-119 (B-R6/B-R17, D §5.1, ADR 0009 §4): `Quarantined` answers every F1 input
+/// `QuarantinedTerminal`, a fresh fence included, and never leaves. A control answer F1 did not
+/// request is not an F1 input, so it is declined, as in every phase.
+#[retcd_test]
+fn m7b_119_quarantined_phase_is_terminal_in_m7() {
+    let (mut f1, _) = closed(&[], vec![inv_on(A, 20, 1, 12), inv_on(B, 15, 2, 12)], &[C]);
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+    let recovery_inputs = [
+        RecoveryEvent::Plan(Box::new(plan(&[]))),
+        fence_read_at(CONTROL_REV.0),
+        fence_read_at(7),
+        RecoveryEvent::InventoryReported(Box::new(inv(C, 20))),
+        RecoveryEvent::InventoryFailed { copy: C },
+        transfer(C, 5),
+        RecoveryEvent::ProbeAnswered {
+            copy: A,
+            seq: Seq(15),
+            digest: dg(0, 15),
+        },
+        RecoveryEvent::ProbeUnavailable {
+            copy: A,
+            seq: Seq(15),
+        },
+        caught_up(B, 20, dg(0, 20)),
+        durable(A, 20, dg(0, 20)),
+        RecoveryEvent::StaleOwnerReturned(Box::new(inv(A, 20))),
+    ];
+    let inputs = recovery_inputs
+        .into_iter()
+        .map(|input| EventKind::Kernel(KernelEvent::Recovery(input)))
+        .chain([lose(C), fired(1), fired(2)]);
+    for (tick, input) in (4_000..).zip(inputs) {
+        assert_eq!(
+            f1.step(tick, input.clone()),
+            vec![ign(ReplicaIgnoreReason::QuarantinedTerminal)],
+            "{input:?}"
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+    }
+    f1.declines(5_000, cas_result(CasOutcome::Committed(Revision(9))));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan rows, §9: rebuild and activation (M7B-126..128, 146, 148)
+// ---------------------------------------------------------------------------------------------
+
+/// [`lone_committed`] rebuilt: B caught up, all three proofs in, the activation CAS in flight.
+/// Also returns the `ReadOnly` result the recovery commit emitted.
+fn activating() -> (F1, RecoveryResult) {
+    let (mut f1, read_only) = lone_committed_with_result();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    for copy in [A, B, C] {
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    (f1, read_only)
+}
+
+fn is_recovered(effect: &EffectKind) -> bool {
+    matches!(effect, EffectKind::Kernel(KernelEffect::Recovered(_)))
+}
+
+/// M7B-126 (D §5.6a, ADR 0009 §7/§8, spec §8.3/§8.4): from `ReadOnly`, each catch-up syncs its copy
+/// through the rebuild point; two proofs of three are not a barrier; a proof bound to another
+/// digest is not one either; the third proof proposes one CAS conditioned on the recovery commit's
+/// revision, and only its `Committed` activates. A `Conflict` re-reads and never activates over
+/// the decision it finds. The twin's proof sits past the point: at the point itself a foreign
+/// digest is divergence (ruling A-4), so only `try_new`'s binding check can refuse it there.
+#[retcd_test]
+fn m7b_126_rebuilding_reaches_activation_only_through_try_new() {
+    let mut f1 = lone_committed();
+    assert!(f1
+        .rec(4_000, caught_up(B, 20, dg(0, 20)))
+        .contains(&sync(B, 20)));
+    assert_eq!(
+        f1.rec(4_001, caught_up(C, 20, dg(0, 20))),
+        vec![sync(C, 20)]
+    );
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    let required = BTreeSet::from([A, B, C]);
+    let two = [proven(A, 20, dg(0, 20)), proven(B, 20, dg(0, 20))];
+    assert_eq!(
+        RecoveryBarrier::try_new(&two, &required, Seq(20), dg(0, 20)),
+        Err(MissingProof::NoProofFrom(C))
+    );
+    assert_eq!(f1.rec(4_100, durable(A, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.rec(4_101, durable(B, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    let mis_bound = proven(C, 21, dg(0, 21));
+    assert_eq!(
+        RecoveryBarrier::try_new(&[two[0], two[1], mis_bound], &required, Seq(20), dg(0, 20)),
+        Err(MissingProof::ProofDigestMismatch {
+            copy: C,
+            proof_digest: dg(0, 21),
+            cutoff_digest: dg(0, 20),
+        })
+    );
+    assert_eq!(
+        f1.rec(4_102, RecoveryEvent::DurableAt(mis_bound)),
+        not_durable
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(
+        f1.rec(4_103, durable(C, 20, dg(0, 20))),
+        vec![cas(Revision(9), A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    let activated = recovered(&f1.step(4_200, cas_result(CasOutcome::Committed(Revision(11)))));
+    assert_eq!(activated.mode, PartitionMode::Active);
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+
+    let (mut f1, _) = activating();
+    let conflict = CasOutcome::Conflict {
+        exists: true,
+        current: Revision(12),
+    };
+    assert_eq!(
+        f1.step(4_200, cas_result(conflict)),
+        vec![EffectKind::Control(ControlEffect::Get {
+            key: ControlKey::Partition(PARTITION)
+        })]
+    );
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let read = read_result(ReadOutcome::Found {
+        revision: Revision(12),
+        value: peer.encode(),
+    });
+    assert_eq!(
+        f1.step(4_300, read),
+        vec![block(BlockReason::OvertakenByPeer)]
+    );
+    assert_eq!(f1.log.iter().filter(|e| is_recovered(e)).count(), 1);
+}
+
+/// M7B-127 (D §5.6a `DegradedRf2` required = the third copy and both holders; spec §8.3): a
+/// `DegradedRf2` commit stays below `Active` through any number of ticks, and leaves only through
+/// the three-copy barrier's `ActivationProposed -> Committed`. `HealthEval` is not a landed event;
+/// the ticks arrive as F1's own timer.
+#[retcd_test]
+fn m7b_127_degraded_rf2_leaves_only_on_the_rebuild_barrier() {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 20)], &[C]);
+    for copy in [A, B] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    let degraded = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(degraded.mode, PartitionMode::DegradedRf2);
+    assert_eq!(
+        f1.module.rebuild_required(),
+        Some(&BTreeSet::from([A, B, C]))
+    );
+    for tick in 1..=50 {
+        assert_eq!(
+            f1.step(3_100 + tick * 1_000, fired(tick)),
+            vec![ign(ReplicaIgnoreReason::StaleTimer)]
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    }
+    f1.declines(60_000, cas_result(CasOutcome::Committed(Revision(10))));
+    f1.rec(60_100, caught_up(C, 20, dg(0, 20)));
+    for copy in [A, B, C] {
+        f1.rec(60_200, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    assert_eq!(f1.log.iter().filter(|e| is_recovered(e)).count(), 1);
+    let active = recovered(&f1.step(60_300, cas_result(CasOutcome::Committed(Revision(11)))));
+    assert_eq!(active.mode, PartitionMode::Active);
+}
+
+/// M7B-128 (D §5.6a `CopyLost` arm, "never shrinks `required`"; ADR 0009 §7; K-B-43): losing B
+/// after its proof stalls the rebuild once and loudly, keeps B required, forgets B's proof and
+/// refuses it re-sent, so no later proof activates. The plan's `Alert{RebuildStalled}` is the
+/// landed `RecoveryEffect::RebuildStalled`. Twin: losing D, which is not required, is
+/// `Ignored{NotRequired}`, never an empty vector (BA-2).
+#[retcd_test]
+fn m7b_128_copy_lost_during_rebuilding_stalls_loudly_and_never_shrinks_required() {
+    let stalled = |f1: &F1| {
+        f1.log
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    EffectKind::Kernel(KernelEffect::Recovery(
+                        RecoveryEffect::RebuildStalled { .. }
+                    ))
+                )
+            })
+            .count()
+    };
+    let everyone = BTreeSet::from([A, B, C]);
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    f1.rec(4_100, durable(A, 20, dg(0, 20)));
+    f1.rec(4_101, durable(B, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(4_200, lose(B)),
+        vec![r(RecoveryEffect::RebuildStalled { copy: B })]
+    );
+    assert_eq!(f1.module.rebuild_required(), Some(&everyone));
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(4_300, durable(C, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.rec(4_301, durable(B, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!((f1.cas_count(), stalled(&f1)), (1, 1));
+
+    let mut f1 = lone_committed();
+    assert_eq!(
+        f1.step(4_200, lose(D)),
+        vec![ign(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(f1.module.rebuild_required(), Some(&everyone));
+    assert_eq!(stalled(&f1), 0);
+}
+
+/// M7B-146 (D §5.1 `Unknown` arm: the CAS is more likely to have landed, so a blind retry is
+/// worse; ADR 0009 §5): `ControlUnknown`, by value distinct from `ControlUnavailable`, with no CAS
+/// and no re-proposal short of a fresh fence. Twin of M7B-109 by the outcome arm. The activation
+/// CAS answers `Unknown` the same way: no activation over a CAS that may have landed.
+#[retcd_test]
+fn m7b_146_cas_unknown_blocks_and_is_the_worse_case_to_retry() {
+    assert_ne!(BlockReason::ControlUnknown, BlockReason::ControlUnavailable);
+    control_blocks_without_retry(CasOutcome::Unknown, &BlockReason::ControlUnknown);
+    let (mut f1, _) = activating();
+    assert_eq!(
+        f1.step(4_200, cas_result(CasOutcome::Unknown)),
+        vec![block(BlockReason::ControlUnknown)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
+    );
+    assert_eq!(
+        f1.rec(4_300, durable(C, 20, dg(0, 20))),
+        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+    );
+    assert_eq!(f1.cas_count(), 2, "the recovery CAS and one activation CAS");
+    assert_eq!(f1.log.iter().filter(|e| is_recovered(e)).count(), 1);
+}
+
+/// M7B-148 (D §5.1 `ActivationProposed --CasResult--> Committed{Active}`, "re-emit `Recovered`";
+/// ADR 0009; T-B-03 / Q-B-2): the activation's `Committed(revision)` step re-emits `Recovered`
+/// with `mode: Active` and that revision. It differs from the `ReadOnly` result in exactly
+/// `mode`, `control_revision` and `barrier`. F1 never emits `SetAdmission`: admission is L1's.
+#[retcd_test]
+fn m7b_148_activation_commit_re_emits_recovered_with_mode_active() {
+    let (mut f1, read_only) = activating();
+    let effects = f1.step(4_200, cas_result(CasOutcome::Committed(Revision(11))));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    let active = recovered(&effects);
+    assert_eq!(active.mode, PartitionMode::Active);
+    assert_eq!(active.committed.revision, Revision(11));
+    assert_ne!(active.barrier, read_only.barrier);
+    assert_eq!(active.barrier.required(), [A, B, C]);
+    let mut only_those_three = active;
+    only_those_three.mode = read_only.mode.clone();
+    only_those_three.committed.revision = read_only.committed.revision;
+    only_those_three.barrier = read_only.barrier.clone();
+    assert_eq!(only_those_three, read_only);
+    assert!(!f1
+        .log
+        .iter()
+        .any(|e| matches!(e, EffectKind::Kernel(KernelEffect::SetAdmission(_)))));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Plan rows landed by B-R49: M7B-108 as re-worded, and M7B-97 and 113 on F1's selection spy
+// ---------------------------------------------------------------------------------------------
+
+/// M7B-108 (D §5.1 `Conflict` row; ADR 0009 §5; rulings F-f, F-g, B-R49): a conflict whose re-read
+/// finds an older or equal epoch with other content is `CasContention` at once, and F1 never
+/// proposes again. There is one CAS, and none after it on any later input, a repeated conflict
+/// and re-read included, until a fresh fence. Twin of M7B-107 by the re-read result. The
+/// activation CAS answers the same way: one activation CAS, and no second `Recovered`.
+#[retcd_test]
+fn m7b_108_cas_conflict_unchanged_record_never_reproposes() {
+    let conflict = |current| {
+        cas_result(CasOutcome::Conflict {
+            exists: true,
+            current: Revision(current),
+        })
+    };
+    let other_content = |owner_epoch| PartitionRecord {
+        owner: NodeId(9),
+        owner_epoch,
+        ..record(A)
+    };
+    let contention = RecoveryPhase::Blocked(BlockReason::CasContention);
+    for epoch in [OwnerEpoch(0), PRIOR_EPOCH] {
+        let current = other_content(epoch);
+        let mut f1 = rereading();
+        assert_eq!(
+            f1.step(3_200, found(current.encode())),
+            vec![block(BlockReason::CasContention)],
+            "{current:?}"
+        );
+        assert_eq!(f1.phase(), contention);
+        f1.declines(3_300, conflict(6));
+        f1.declines(3_301, found(current.encode()));
+        assert_eq!(
+            f1.report(3_400, inv(A, 20)),
+            vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+        );
+        assert_eq!(f1.cas_count(), 1, "never re-proposed: {current:?}");
+        assert!(has_query(&f1.rec(3_500, fence_read_at(7))));
+        assert_eq!(f1.cas_count(), 1);
+    }
+
+    for epoch in [OwnerEpoch(1), OwnerEpoch(2)] {
+        let current = other_content(epoch);
+        let (mut f1, _) = activating();
+        f1.step(4_200, conflict(12));
+        assert_eq!(
+            f1.step(4_300, found(current.encode())),
+            vec![block(BlockReason::CasContention)],
+            "{current:?}"
+        );
+        assert_eq!(f1.phase(), contention);
+        f1.declines(4_400, conflict(12));
+        assert_eq!(
+            f1.rec(4_500, durable(C, 20, dg(0, 20))),
+            vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+        );
+        assert_eq!(
+            f1.cas_count(),
+            2,
+            "the recovery CAS and one activation CAS: {current:?}"
+        );
+        assert_eq!(f1.log.iter().filter(|e| is_recovered(e)).count(), 1);
+    }
+}
+
+/// M7B-97 (charter "divergent digest at the same position quarantines and blocks promotion";
+/// D §5.3/§5.4; ADR 0009 §4; charter DO-NOT "no transaction-wise union"): B and C both head 50,
+/// equal below 30 and different from 30 up. Their equal length is never consulted: selection
+/// returns the pair's divergence with no length read on the spy, where the compatible twin reads
+/// length exactly once. The run quarantines, never selects, never proposes, and stays there.
+#[retcd_test]
+fn m7b_97_divergent_digest_at_the_same_position_quarantines_and_blocks_promotion() {
+    let forked = vec![inv(B, 50), inv_on(C, 50, 1, 29)];
+    let evidence = DivergenceEvidence::Pairwise {
+        seq: Seq(50),
+        a: (B, dg(0, 50)),
+        b: (C, dg(1, 50)),
+    };
+    let mut spy = SelectionSpy::new();
+    assert_eq!(
+        select_prefix_spied(&verified(&forked), root(), &mut spy),
+        SelectionOutcome::Divergence(evidence)
+    );
+    assert_eq!(spy.length_reads(), 0, "length never consulted");
+    let mut twin = SelectionSpy::new();
+    let compatible = verified(&[inv(B, 50), inv(C, 50)]);
+    assert!(matches!(
+        select_prefix_spied(&compatible, root(), &mut twin),
+        SelectionOutcome::Selected(_)
+    ));
+    assert_eq!(twin.length_reads(), 1, "the spy sees the one length read");
+
+    let (mut f1, close) = closed(&[], forked, &[A]);
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            r(RecoveryEffect::Quarantine(evidence)),
+            block(BlockReason::DivergenceRequiresOperator {
+                diverged: vec![B, C]
+            }),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+    assert_eq!(
+        (f1.module.spy().selections(), f1.module.spy().length_reads()),
+        (1, 0)
+    );
+    for copy in [B, C] {
+        f1.rec(3_000, durable(copy, 50, dg(0, 50)));
+    }
+    f1.declines(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert!(!has_selected(&f1.log), "{:?}", f1.log);
+    assert_eq!(f1.cas_count(), 0, "promotion stays blocked");
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+}
+
+/// M7B-113 (D §5.7; spec §8.1 "never overrides a newer committed root, even with a longer
+/// suffix"; ADR 0009 §7): after commit, a returning owner with a far longer head (500 over a
+/// cutoff of 20) is quarantined from the predecessor cutoff and rebuilt from the committed root,
+/// and selection never runs for it: the spy holds the run's one selection before and after. The
+/// phase does not move.
+#[retcd_test]
+fn m7b_113_stale_owner_after_commit_is_quarantined_without_length_comparison() {
+    let mut f1 = proposing(20);
+    let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    let before = f1.module.spy();
+    assert_eq!(
+        (before.selections(), before.length_reads()),
+        (1, 1),
+        "the run's one selection"
+    );
+    let phase = f1.phase();
+    let returned = RecoveryEvent::StaleOwnerReturned(Box::new(inv(A, 500)));
+    assert_eq!(
+        f1.at(
+            9_000,
+            9_000,
+            EventKind::Kernel(KernelEvent::Recovery(returned))
+        ),
+        vec![
+            r(RecoveryEffect::QuarantineSuffix {
+                copy: A,
+                from: result.retained_status_map.predecessor_cutoff.next(),
+                until: Tick(9_000 + RETENTION),
+            }),
+            r(RecoveryEffect::RebuildFromAuthoritative {
+                copy: A,
+                root: LineageAnchor {
+                    lineage: result.selected.root,
+                    base_seq: Seq(20),
+                    base_digest: dg(0, 20),
+                },
+            }),
+        ]
+    );
+    assert_eq!(f1.module.spy(), before, "select_prefix not called");
+    assert_eq!(f1.phase(), phase);
+}

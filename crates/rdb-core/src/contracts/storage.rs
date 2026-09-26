@@ -19,7 +19,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::ids::{
-    AppliedSeq, BatchId, DurableSeq, FlushTicket, Generation, PartitionId, Seq, SnapshotHandle,
+    AppliedSeq, BatchId, DurableSeq, FlushTicket, Generation, OwnerEpoch, PartitionId, Seq,
+    SnapshotHandle,
 };
 use crate::contracts::trace::Version;
 
@@ -131,6 +132,36 @@ pub enum StoreEffect {
     Release {
         /// The handle to drop.
         handle: SnapshotHandle,
+    },
+    /// Record, irrevocably and **locally**, that this partition's epoch will never be served
+    /// again — even after a restart (spec §7.3 step 2; lead ruling A-R26).
+    ///
+    /// # Why it is a store effect and not one of the three alternatives
+    ///
+    /// Not a [`Batch`] through [`Self::Commit`]: a batch requires a `seq` and a `generation`, and
+    /// an epoch revocation has neither. It is not a position in a partition's history; it is a
+    /// statement about what that history may never resume.
+    ///
+    /// Not a [`crate::contracts::control::ControlEffect::Cas`]: spec §7.3 step 2 counts an
+    /// acknowledgement only if **a restart cannot restore that epoch**, which is a property of
+    /// this node's disk. A control record proves what the cluster agreed, not what survives here.
+    ///
+    /// Not a variant of kernel-a's own
+    /// [`crate::contracts::authority::AuthorityEffect`]: that would leave `rdb-sim` reading a
+    /// kernel fact and deciding to write it to storage, and deciding is the one thing the charter
+    /// keeps out of the harness.
+    ///
+    /// Its completion is **not** a [`StorageEvent`]: every variant of that enum is keyed by a
+    /// [`BatchId`], a [`FlushTicket`] or a [`SnapshotHandle`], and this effect carries none of
+    /// the three. It comes back as
+    /// [`crate::contracts::authority::AuthorityEvent::EpochRevocationPersisted`], carrying the
+    /// same partition and epoch, and the fence it authorises fires only then (team kernel-a
+    /// `design.md` §2.4).
+    PersistEpochRevocation {
+        /// The partition whose epoch is being revoked.
+        partition: PartitionId,
+        /// The epoch that will never be served again.
+        epoch: OwnerEpoch,
     },
 }
 

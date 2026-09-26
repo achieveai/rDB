@@ -57,7 +57,12 @@ pub struct Member {
 ///
 /// Deserialisation goes through [`PartitionConfig::validate`] (finding K-F-39), so a decoded
 /// configuration holds the threshold invariant by construction rather than by convention.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `PartialOrd`, `Ord` and `Hash` are derived for the carrier's sake, not because anything
+/// reads the ordinal: a pinned configuration rides inside
+/// [`crate::contracts::recovery::CommittedRoot`], hence inside
+/// [`crate::contracts::recovery::RecoveryResult`], hence inside
+/// [`crate::contracts::event::KernelEvent`], which derives all three.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "UnvalidatedPartitionConfig")]
 pub struct PartitionConfig {
     /// The partition.
@@ -141,14 +146,27 @@ impl PartitionConfig {
     /// # Errors
     ///
     /// [`RdbError::InvalidArgument`] with `field: "min_regular_acks"` when the threshold is
-    /// zero. Deserialisation is routed through here by
+    /// zero, and with `field: "members"` when two members share a [`CopyId`] or a [`NodeId`]
+    /// (lead ruling B-R43). Deserialisation is routed through here by
     /// `impl TryFrom<UnvalidatedPartitionConfig> for PartitionConfig` and the `try_from`
-    /// container attribute (finding K-F-39), so a decoded configuration cannot carry a zero.
+    /// container attribute (finding K-F-39), so a decoded configuration cannot carry either.
+    ///
+    /// Why the member rule: [`Self::copy_of`] maps one authenticated peer to one member. A copy
+    /// id listed twice, or two copies on one node, lets one node's acknowledgement stand for
+    /// two copies — found by the R1 slice-3 manual tester, where one ACK qualified a write at
+    /// two of two. Spec §6.1's distinct-machine rule is the same fact from the placement side.
     pub fn validate(&self) -> Result<(), RdbError> {
         if self.min_regular_acks == 0 {
             return Err(RdbError::InvalidArgument {
                 field: "min_regular_acks",
             });
+        }
+        let mut copies = std::collections::BTreeSet::new();
+        let mut nodes = std::collections::BTreeSet::new();
+        for member in &self.members {
+            if !copies.insert(member.copy) || !nodes.insert(member.node) {
+                return Err(RdbError::InvalidArgument { field: "members" });
+            }
         }
         Ok(())
     }

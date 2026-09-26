@@ -21,11 +21,13 @@ use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::{EnvelopeHeader, ReplicationEnvelope, ENVELOPE_MAGIC};
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
+use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
     AffinityId, ClientId, ConfigVersion, Generation, LeaseId, NodeId, OperationId, OwnerEpoch,
     PartitionId, RangeId, RequestId, RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::storage::{Namespace, Write};
+use rdb_core::contracts::trace::BudgetName;
 use rdb_core::contracts::txn::{Condition, ConditionOutcome, Mutation, Outcome, TxnRequest};
 use rdb_core::contracts::version::{VersionedArtifact, API_VERSION, ENVELOPE_VERSION};
 
@@ -641,4 +643,231 @@ fn m7f_04_decode_refuses_a_foreign_frame_and_trailing_bytes() {
             .kind(),
         ErrorKind::InvalidArgument
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M7F-29 — the completeness check the vectors above cannot make
+// ---------------------------------------------------------------------------------------------
+
+/// M7F-29: the record preimage has exactly eleven parts, and the four excluded fields stay out.
+///
+/// **What turns this red:** adding a twelfth part to `ReplicationEnvelope::compute_record_digest`
+/// — say a `&self.lease_id.0.to_le_bytes()` between the identity and the request digest — which
+/// moves `lease_id` out of the excluded list and makes the mover count twelve; or dropping one of
+/// the eleven, say `header.config_version`, which makes it ten. Adding a field to
+/// `ReplicationEnvelope` or to `EnvelopeHeader` without deciding which side of the preimage it
+/// falls on fails to compile, at the exhaustive destructuring below.
+///
+/// Every M7F-02 vector above pins one property of one field, and a golden pins one encoding.
+/// None of them can fail on a *twelfth* field: a part folded quietly into the preimage changes
+/// no assertion that was not written about it, and the two goldens are recomputed by whoever
+/// added it. Here the count is the assertion — §4's eleven in, four out, fifteen accounted for
+/// (design §4.8 under ruling F-R6; ADR-rdb-0002 decision 6).
+///
+/// The four excluded are `protocol_version`, `lease_id`, `body_len` and `record_digest` itself.
+/// Only the first three are mutated: `record_digest` is the output, so "mutating it" is
+/// `m7f_02_record_digest_excludes_itself_and_body_len`'s sealing assertion rather than a
+/// fourteenth-and-a-half input here. Eleven plus three is the fourteen assertions this row owes.
+#[retcd_test]
+fn m7f_29_the_record_preimage_has_exactly_eleven_parts() {
+    let base = envelope(9, Digest([0x11; 32]), b"key", b"value");
+
+    // Fifteen fields, named once each with no `..`. A sixteenth stops this test compiling, which
+    // is the point at which somebody has to say whether it belongs in the preimage.
+    let ReplicationEnvelope {
+        header:
+            EnvelopeHeader {
+                protocol_version: _,
+                partition: _,
+                generation: _,
+                config_version: _,
+                owner_epoch: _,
+                seq: _,
+                body_len: _,
+            },
+        lease_id: _,
+        prev_digest: _,
+        request_identity: _,
+        request_digest: _,
+        conditions_result: _,
+        mutations: _,
+        result: _,
+        record_digest: _,
+    } = &base;
+
+    let expected = base.compute_record_digest().expect("base digest");
+
+    /// One part of §4's table: the field's name, and the smallest edit that changes it.
+    ///
+    /// Non-capturing, so each is a plain `fn` pointer and the two tables read as data.
+    type Mutation = (&'static str, fn(&mut ReplicationEnvelope));
+
+    // §4, parts 1 … 11, in the order `compute_record_digest` hashes them.
+    let in_preimage: [Mutation; 11] = [
+        ("prev_digest", |e| e.prev_digest = Digest([0x99; 32])),
+        ("header.partition", |e| e.header.partition = PartitionId(8)),
+        ("header.generation", |e| e.header.generation = Generation(4)),
+        ("header.owner_epoch", |e| {
+            e.header.owner_epoch = OwnerEpoch(6)
+        }),
+        ("header.seq", |e| e.header.seq = Seq(10)),
+        ("header.config_version", |e| {
+            e.header.config_version = ConfigVersion(12);
+        }),
+        ("request_identity", |e| {
+            e.request_identity.request = RequestId(4);
+        }),
+        ("request_digest", |e| e.request_digest = Digest([0xAC; 32])),
+        ("conditions_result", |e| {
+            e.conditions_result = vec![ConditionOutcome::NotMet];
+        }),
+        ("mutations", |e| {
+            e.mutations[0].value = Some(Bytes::from_static(b"other"));
+        }),
+        ("result", |e| e.result = Outcome::RecoveredApplied),
+    ];
+
+    // §4's excluded table, minus `record_digest`, which is the output.
+    let excluded: [Mutation; 3] = [
+        ("header.protocol_version", |e| {
+            e.header.protocol_version = ENVELOPE_VERSION + 1;
+        }),
+        ("lease_id", |e| e.lease_id = LeaseId(43)),
+        ("header.body_len", |e| e.header.body_len = 4_096),
+    ];
+
+    let mut moved = Vec::new();
+    for (name, mutate) in in_preimage {
+        let mut mutated = envelope(9, Digest([0x11; 32]), b"key", b"value");
+        mutate(&mut mutated);
+        assert_ne!(
+            mutated.compute_record_digest().expect("mutated digest"),
+            expected,
+            "`{name}` is part {} of the eleven; editing it must move the digest",
+            moved.len() + 1
+        );
+        moved.push(name);
+    }
+
+    let mut held = Vec::new();
+    for (name, mutate) in excluded {
+        let mut mutated = envelope(9, Digest([0x11; 32]), b"key", b"value");
+        mutate(&mut mutated);
+        assert_eq!(
+            mutated.compute_record_digest().expect("mutated digest"),
+            expected,
+            "`{name}` is excluded from the preimage; editing it must leave the digest alone"
+        );
+        held.push(name);
+    }
+
+    assert_eq!(moved.len(), 11, "eleven parts go in (§4), got {moved:?}");
+    assert_eq!(
+        held.len(),
+        3,
+        "three of the four excluded are editable inputs (§4), got {held:?}"
+    );
+    assert_eq!(
+        moved.len() + held.len() + 1,
+        15,
+        "eleven in, four out — the `+ 1` is `record_digest`, the output"
+    );
+
+    // The two composite parts carry more than one scalar, and a part that dropped one of its
+    // scalars would still move under the single edit above. Each sub-field, on its own:
+    // identity is tenant ‖ client ‖ request (§4 part 7), a write is ns ‖ key ‖ value (part 10).
+    let sub_parts: [Mutation; 5] = [
+        ("request_identity.tenant", |e| {
+            e.request_identity.tenant = TenantId(9);
+        }),
+        ("request_identity.client", |e| {
+            e.request_identity.client = ClientId(9);
+        }),
+        ("mutations[0].ns", |e| e.mutations[0].ns = Namespace::Meta),
+        ("mutations[0].key", |e| {
+            e.mutations[0].key = Bytes::from_static(b"other-key");
+        }),
+        ("mutations[0].value", |e| e.mutations[0].value = None),
+    ];
+    for (name, mutate) in sub_parts {
+        let mut mutated = envelope(9, Digest([0x11; 32]), b"key", b"value");
+        mutate(&mut mutated);
+        assert_ne!(
+            mutated.compute_record_digest().expect("mutated digest"),
+            expected,
+            "`{name}` is inside a composite part and must still reach the digest"
+        );
+    }
+
+    tracing::info!(
+        parts = moved.len(),
+        excluded = held.len(),
+        "m7f_29 record preimage"
+    );
+}
+
+/// `BudgetName` covers every `Budgets` field, and the coverage is enforced by the compiler.
+///
+/// Not an M7 row — a guard for lead ruling A-R38, written the day the hole it closes was found.
+/// On 2026-09-22 ruling A-R36 added four clock thresholds to [`Budgets`] so they could not drift
+/// apart as private constants, and left `BudgetName::ALL` at ten. Nothing failed to compile:
+/// `get` and `set` match on `BudgetName`, never on [`Budgets`], so a field with no member is
+/// simply un-overridable by a scenario and missing from `RunManifest.overridden`. The ruling
+/// that existed to prevent a drift produced one through its own blind side, within the hour.
+///
+/// The destructure below is the part that does the work. A `Budgets` field added tomorrow makes
+/// **this file stop compiling**, which is the only signal that arrives before the damage — a
+/// length assertion alone would compare `ALL` with a number a careless edit updates in the same
+/// keystroke that broke it. The round trip is the second half: a member that exists but reads or
+/// writes the wrong field is invisible to any count.
+#[retcd_test]
+fn budget_name_covers_every_budgets_field() {
+    let mut budgets = Budgets::SPEC_DEFAULTS;
+
+    // Exhaustive by construction: adding a field to `Budgets` breaks this line.
+    let Budgets {
+        warn_age_millis: _,
+        pause_age_millis: _,
+        resume_lag_millis: _,
+        resume_hold_millis: _,
+        grant_millis: _,
+        renew_millis: _,
+        resume_gap_tolerance_millis: _,
+        clock_sample_period_millis: _,
+        max_sample_age_millis: _,
+        clock_rate_ppm: _,
+        clock_error_millis: _,
+        dispatch_margin_millis: _,
+        dedup_retention_millis: _,
+        discovery_window_millis: _,
+    } = budgets;
+
+    assert_eq!(
+        BudgetName::ALL.len(),
+        14,
+        "one member per `Budgets` field; the destructure above names the fields"
+    );
+
+    // Each member reads back exactly what it wrote, and writes nothing else. A member wired to
+    // the wrong field passes a count and fails here.
+    for (index, name) in BudgetName::ALL.iter().copied().enumerate() {
+        let probe = 7_000 + index as u64;
+        name.set(&mut budgets, probe);
+        assert_eq!(
+            name.get(&budgets),
+            probe,
+            "{name:?} must read back the value it set"
+        );
+        for other in BudgetName::ALL.iter().copied() {
+            if other != name {
+                assert_ne!(
+                    other.get(&budgets),
+                    probe,
+                    "{other:?} moved when {name:?} was set: two members share one field"
+                );
+            }
+        }
+    }
+
+    tracing::info!(members = BudgetName::ALL.len(), "budget name coverage");
 }

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::ids::{
     AffinityId, Generation, GrantId, NodeId, PartitionId, RequestIdentity, Seq,
 };
+use crate::contracts::membership::CopyId;
 use crate::contracts::version::VersionedArtifact;
 
 /// A capability that a build may not have wired yet.
@@ -72,9 +73,10 @@ pub enum RetryRule {
 /// carry the kind, which is stable, ordered and round-trippable. Same shape as
 /// `config_core::ConfigError::kind`.
 ///
-/// One name per spec §5.4 error, plus [`Self::Unavailable`], which §5.4 does not define: it is
-/// the spike's own "not wired in this build" answer (spike §8), and it is in this set because a
-/// trace has to be able to say it.
+/// One name per spec §5.4 error, plus two this set carries that §5.4 does not define:
+/// [`Self::Unavailable`], the spike's own "not wired in this build" answer (spike §8), and
+/// [`Self::DivergenceRequiresOperator`] (lead ruling R-S2). Both are here because a trace, and
+/// in the second case a client reply, has to be able to say them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum ErrorKind {
     /// [`RdbError::NotPrimary`].
@@ -111,6 +113,13 @@ pub enum ErrorKind {
     IncompatibleVersion,
     /// [`RdbError::StatusExpired`].
     StatusExpired,
+    /// [`RdbError::DivergenceRequiresOperator`].
+    ///
+    /// Not a spec §5.4 row either. It is the client layer of
+    /// [`crate::contracts::authority::BlockReason::DivergenceRequiresOperator`] — see
+    /// [`crate::contracts::authority::BlockReason::client_error_kind`], which is the one place
+    /// the two are mapped onto each other.
+    DivergenceRequiresOperator,
     /// [`RdbError::Unavailable`].
     Unavailable,
 }
@@ -262,6 +271,25 @@ pub enum RdbError {
         identity: RequestIdentity,
     },
 
+    /// The partition is [`crate::contracts::authority::PartitionMode::Blocked`] because a
+    /// divergence left no durable floor under the pinned configuration (lead rulings B-R26,
+    /// R-S2).
+    ///
+    /// The client layer of
+    /// [`crate::contracts::authority::BlockReason::DivergenceRequiresOperator`]. Distinct from
+    /// [`Self::ProtectionPaused`] in the one way a caller acts on: a pause says *retry later*,
+    /// this says *nothing on the data path will change this*. Team kernel-a `design.md` §1.6
+    /// requires T1 to reply the reason L1 handed it rather than a hard-coded code, precisely so
+    /// the two answers stay different.
+    #[error("partition {partition:?} blocked: divergence requires operator")]
+    DivergenceRequiresOperator {
+        /// The partition that was addressed.
+        partition: PartitionId,
+        /// The copies whose history diverged, so the reply names them — the same list
+        /// [`crate::contracts::authority::BlockReason::DivergenceRequiresOperator`] carries.
+        diverged: Vec<CopyId>,
+    },
+
     /// The capability is not wired in this build. Explicit by design (spike §8).
     #[error("{capability:?} unavailable: {reason}")]
     Unavailable {
@@ -294,6 +322,7 @@ impl RdbError {
             Self::CorruptHistory { .. } => ErrorKind::CorruptHistory,
             Self::IncompatibleVersion { .. } => ErrorKind::IncompatibleVersion,
             Self::StatusExpired { .. } => ErrorKind::StatusExpired,
+            Self::DivergenceRequiresOperator { .. } => ErrorKind::DivergenceRequiresOperator,
             Self::Unavailable { .. } => ErrorKind::Unavailable,
         }
     }
@@ -320,7 +349,13 @@ impl RdbError {
             | Self::StaleContinuation => RetryRule::Reconcile,
             Self::CorruptHistory { .. }
             | Self::IncompatibleVersion { .. }
-            | Self::StatusExpired { .. } => RetryRule::Quarantine,
+            | Self::StatusExpired { .. }
+            // Operator action, not a retry — which is the whole difference between this and
+            // `ProtectionPaused`'s `RetryAfterRecovery`. It is deliberately not `Definitive`
+            // even though admission refused: `Definitive` promises nothing was mutated, and a
+            // blocked partition proves nothing about the request that arrived before it
+            // blocked.
+            | Self::DivergenceRequiresOperator { .. } => RetryRule::Quarantine,
             Self::Unavailable { .. } => RetryRule::NotWired,
         }
     }

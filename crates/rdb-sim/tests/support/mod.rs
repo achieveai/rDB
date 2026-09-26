@@ -111,6 +111,13 @@ const fn outcome_name(outcome: &ControlOutcomeKind) -> &'static str {
 ///
 /// The one place a test builds a [`StepCtx`]. Borrows `SNAPSHOT` and `BUDGETS`, which are
 /// `const`, so no test owns simulator state it did not ask for.
+///
+/// **Its `control_time` is a frozen placeholder, not a clock.** Nothing ages, nothing skews, and
+/// a row that asserts anything about clock bounds or sample staleness against this value is
+/// asserting against a constant. Go through
+/// [`rdb_sim::harness::dispatch::Dispatcher::ctx_for`] instead: it fills `control_time` from a
+/// real [`rdb_sim::sim::clock::Clock`] the dispatcher owns, which
+/// [`rdb_sim::harness::dispatch::Dispatcher::clock_mut`] lets a scenario perturb.
 #[must_use]
 pub fn ctx() -> StepCtx<'static> {
     StepCtx {

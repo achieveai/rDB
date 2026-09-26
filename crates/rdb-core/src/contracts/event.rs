@@ -25,15 +25,19 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::authority::EvidenceRef;
+use crate::contracts::authority::{AuthorityEffect, AuthorityEvent, BlockReason, EvidenceRef};
 use crate::contracts::control::{ControlEffect, ControlEvent};
 use crate::contracts::digest::Digest;
 use crate::contracts::errors::{Capability, ErrorKind, RdbError};
 use crate::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, EventId, Generation, NodeId, OwnerEpoch, PartitionId,
-    RequestIdentity, Revision, Seq,
+    BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, Generation, NodeId, OwnerEpoch,
+    PartitionId, RequestIdentity, Revision, Seq,
 };
-use crate::contracts::membership::CopyId;
+use crate::contracts::ignore::KernelIgnoredReason;
+use crate::contracts::membership::{CopyId, PartitionConfig};
+use crate::contracts::protection::AdmissionState;
+use crate::contracts::qualification::QualificationChanged;
+use crate::contracts::recovery::{RecoveryEffect, RecoveryEvent, RecoveryResult};
 use crate::contracts::storage::{SnapshotRead, StorageEvent, StoreEffect};
 use crate::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::{CapabilityState, ReadServiceOutcome, Version};
@@ -205,10 +209,31 @@ pub enum EventKind {
 /// every reader at once. It is also what makes the `From` shim in the ask's workaround a seam
 /// rather than a rewrite.
 ///
-/// Only the variants that need no absent type are here. `SetAdmission` and `Recovered`, both on
-/// kernel-b's list, wait on `AdmissionState` (ask KA-4) and `RecoveryResult` (ask KA-3); neither
-/// is in this round, and inventing their fields would be foundation deciding kernel-b's shapes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Not `Copy`: see [`KernelEffect`] for the argument, which applies here identically. Kernel-b's
+/// plan names the likely first payload — `CopyLost` needs a reason, because a row must be able to
+/// tell divergence from lag.
+///
+/// # Both halves of a carrier, or neither (lead ruling R-S6)
+///
+/// [`Self::SetAdmission`], [`Self::Recovered`] and [`Self::QualificationChanged`] each have a
+/// twin on [`KernelEffect`], because each is *emitted* by one kernel and *delivered* to another:
+/// under the dispatcher's model a fact leaves as an [`EffectKind::Kernel`] and arrives as an
+/// [`EventKind::Kernel`]. An earlier round named only the event half of the first two, which is
+/// a carrier-completeness gap rather than a shape question — the emitting kernel had no way to
+/// say the thing the receiving kernel could hear.
+///
+/// Kernel-b's L1 inputs were closed on 2026-09-22 (lead ruling B-R34): `PeerProgress` and
+/// `CopyLost` gained their [`KernelEffect`] twins, and `LocalApplied`, `DurableAdvanced` and
+/// `BlockPartition` arrived with both halves. `ConfigChanged` and `TransitionBarrierConfirmed`
+/// have the event half only: the membership transition is the control plane's, not a kernel's,
+/// so no kernel emits them and the environment delivers them.
+///
+/// R1's divergence carriers followed (lead ruling B-R36): `DivergenceDetected` and
+/// `CopyQuarantined` have both halves, because the catch-up cursor emits them and the tracker
+/// receives them. `SnapshotCatchupRequired` is effect-only.
+/// The catch-up cursor's `SendEnvelopes`, `CopyAheadOnControl` and `CopyCaughtUp` followed as
+/// effects only (lead ruling B-R40); `CopyCaughtUp` reaches F1 through `KernelEvent::Recovery`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum KernelEvent {
     /// A peer reported how far it has taken this lineage.
@@ -223,13 +248,117 @@ pub enum KernelEvent {
         /// Which copy.
         copy: CopyId,
     },
+    /// L1 published a new admission state (team kernel-b `design.md` §4.5).
+    ///
+    /// Delivered to T1, which reads `allow` and `reason` and passes the rest to telemetry. The
+    /// payload is the whole eleven-field [`AdmissionState`], not a two-variant verdict: the
+    /// exposure and liveness fields are the operator's view of *why* admission is where it is,
+    /// and a reply that carried only the verdict would leave them with no way to ask.
+    SetAdmission(AdmissionState),
+    /// F1 finished a recovery (team kernel-b `design.md` §5.8).
+    ///
+    /// The only event that rewrites a receiver wholesale. Also the only announcement that a
+    /// rebuilt partition has returned to [`crate::contracts::authority::PartitionMode::Active`],
+    /// which is why it is emitted a second time at the end of a rebuild rather than only at the
+    /// commit.
+    ///
+    /// **Boxed**, and not as a style choice. [`RecoveryResult`] is 592 bytes — it carries a
+    /// [`crate::contracts::authority::FencingProof`], a
+    /// [`crate::contracts::membership::PartitionConfig`], an
+    /// [`crate::contracts::authority::AuthorityView`] and four `Vec`s — where the next largest
+    /// variant of this enum is 112. Unboxed it sets the size of [`KernelEvent`], hence of
+    /// [`EventKind`], hence of every [`Event`] in the run queue, including the overwhelming
+    /// majority that are a timer firing. A recovery happens once per fencing; a `Timer` happens
+    /// every 50 ms.
+    Recovered(Box<RecoveryResult>),
+    /// R1's publish predicate changed value (team kernel-b `design.md` §4.1).
+    ///
+    /// Delivered to L1, whose `no_qualifying_secondary` arm fires on this and on nothing else,
+    /// and to P1, which uses it as a wake-up in front of its own live recheck.
+    QualificationChanged(QualificationChanged),
+    /// A fact one of A1's peers hands the authority module (lead ruling A-R25).
+    ///
+    /// Kernel-a's arm, and the same shape as [`KernelIgnoredReason::Authority`] one level down:
+    /// foundation owns the arm, kernel-a owns the variants, and adding one is an edit to
+    /// [`AuthorityEvent`] alone. The twin is [`KernelEffect::Authority`], so this is a carrier
+    /// with both halves (lead ruling R-S6).
+    Authority(AuthorityEvent),
+    /// The primary applied a record locally; it is not yet durable on every required copy
+    /// (team kernel-b `design.md` §4.1, §4.3). Creates L1's unsafe entry, stamped at the
+    /// event's tick. Delivered to L1 and to R1. The twin is [`KernelEffect::LocalApplied`].
+    ///
+    /// It is also how R1 learns the primary's own history (lead ruling B-R47, closing
+    /// B-R36-Q1): the tracker grows its own `received`, `applied` and digest ladder from it,
+    /// and bounds every ACK by them. That bound is sound only because of an ordering rule:
+    /// **the primary emits this once per sequence, in sequence order, and before that record
+    /// is shipped to any copy.** No copy can then acknowledge a record the tracker has not
+    /// heard of, so an ACK past the primary's own head is a copy holding a tail the primary
+    /// never had, not a race.
+    LocalApplied {
+        /// The record's sequence.
+        seq: Seq,
+        /// Its encoded size, summed into [`AdmissionState::outstanding_unsafe_bytes`] (K-B-22).
+        bytes: u64,
+        /// The record's [`crate::contracts::envelope::ReplicationEnvelope::record_digest`]:
+        /// the value R1's ladder holds at `seq`. L1 does not read it.
+        record_digest: Digest,
+    },
+    /// R1's durable views moved (team kernel-b `design.md` §4.3, §4.4): for each active
+    /// protection predicate, the highest sequence durable on every copy of it. Delivered to L1.
+    DurableAdvanced {
+        /// `(config_version, all_durable_through)` for each active predicate.
+        per_predicate: Vec<(ConfigVersion, DurableSeq)>,
+    },
+    /// A new membership configuration was pinned (team kernel-b `design.md` §4.3). Delivered to
+    /// L1, which pushes a predicate and never resets an age, and to R1's tracker.
+    ///
+    /// Event half only: the control plane changes membership, not a kernel.
+    ConfigChanged(PartitionConfig),
+    /// A membership transition's durable barrier and lineage checkpoint are confirmed, so the
+    /// predicate pinned at `config_version` may retire (team kernel-b `design.md` §4.3).
+    ///
+    /// Event half only, for the same reason as [`Self::ConfigChanged`].
+    TransitionBarrierConfirmed {
+        /// The retiring predicate's configuration.
+        config_version: ConfigVersion,
+        /// The barrier the transition was confirmed through.
+        through_seq: Seq,
+    },
+    /// R1 found no durable floor left under the pinned configuration (team kernel-b
+    /// `design.md` §3.4 effect 4, §4.4; K-B-46). Delivered to L1 and P1.
+    BlockPartition(BlockReason),
+    /// Package F1's inputs (team kernel-b `design.md` §5; lead ruling B-R35). Kernel-b owns the
+    /// leaf, the same shape as [`Self::Authority`].
+    Recovery(RecoveryEvent),
+    /// The catch-up cursor proved divergence; the tracker marks it (team kernel-b `design.md`
+    /// §3.4, K-B-45; lead ruling B-R36).
+    DivergenceDetected {
+        /// The copy that disagrees.
+        copy: CopyId,
+    },
+    /// The catch-up cursor saw a `Quarantined` answer (§3.6, K-B-52; lead ruling B-R36). The
+    /// tracker consumes it exactly as [`Self::DivergenceDetected`].
+    CopyQuarantined {
+        /// The quarantined copy.
+        copy: CopyId,
+    },
 }
 
 /// Kernel-internal effects, carried by [`EffectKind::Kernel`].
 ///
 /// The effect half of CB-1's pair. Ownership and the `#[non_exhaustive]` reasoning are the same
 /// as [`KernelEvent`]'s.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// # Not `Copy` (ask CB-7)
+///
+/// This enum carries two promises that contradict each other if both are kept. `#[non_exhaustive]`
+/// says *kernel-b may add a variant without foundation's involvement*; `#[derive(Copy)]` says
+/// *every variant that will ever exist has a `Copy` payload*. The second silently conditions the
+/// first — kernel-b may add a variant provided foundation approves its payload's traits, which is
+/// the wait CB-1 was asked to remove. `Copy` is the one that goes, and the cost is already
+/// measured: `BlockPartition { reason: BlockReason }` is a variant kernel-b is blocked on today,
+/// and it is blocked on this derive rather than on a missing name.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum KernelEffect {
     /// The module handled the event and deliberately did nothing.
@@ -238,13 +367,145 @@ pub enum KernelEffect {
     /// indistinguishable from an unhandled event, so "nothing happened" has to be something a
     /// row can assert rather than an absence it has to trust.
     Ignored {
-        /// Why nothing was done.
-        reason: ErrorKind,
+        /// Why nothing was done, in the vocabulary of whichever kernel is speaking.
+        ///
+        /// Not an [`ErrorKind`] (ask CB-7): that is spec §5.4's client-facing set, and between
+        /// them the two kernel teams name 43 distinct reasons, none of which is a client answer.
+        /// See [`KernelIgnoredReason`] for whose names are whose.
+        reason: KernelIgnoredReason,
     },
     /// An operator-visible condition the kernel wants surfaced.
     Alert {
         /// What the condition is.
+        ///
+        /// Stays an [`ErrorKind`], and that is a narrowing of what `Alert` means rather than an
+        /// oversight: an operator-visible condition *is* client-facing vocabulary, which is what
+        /// makes it different from [`Self::Ignored`], where a kernel is talking to itself.
         reason: ErrorKind,
+    },
+    /// L1 publishes a new admission state (team kernel-b `design.md` §4.5).
+    ///
+    /// The emitted half of [`KernelEvent::SetAdmission`] (lead ruling R-S6). L1 emits one at
+    /// construction — it starts `Paused` — and on every edge thereafter.
+    SetAdmission(AdmissionState),
+    /// F1 publishes a finished recovery (team kernel-b `design.md` §5.8).
+    ///
+    /// The emitted half of [`KernelEvent::Recovered`] (lead ruling R-S6), and boxed for the
+    /// same reason — see that variant.
+    Recovered(Box<RecoveryResult>),
+    /// R1 publishes a change in the publish predicate (team kernel-b `design.md` §4.1).
+    ///
+    /// The emitted half of [`KernelEvent::QualificationChanged`] (lead ruling R-S6). Emitted
+    /// from `step(ProgressTracker, ..)` when and only when the predicate changes value, so the
+    /// edge stays synchronous with the acknowledgement that caused it.
+    QualificationChanged(QualificationChanged),
+    /// A fact the authority module hands its peers (lead ruling A-R25).
+    ///
+    /// The emitted half of [`KernelEvent::Authority`] (lead ruling R-S6), and kernel-a's leaf in
+    /// the same sense [`KernelIgnoredReason::Authority`] is one level down. Note that
+    /// [`AuthorityEffect::Fact`] — not [`Self::Ignored`] — carries what A1 *did*: the two
+    /// vocabularies are separate enums on separate arms, because "deliberately did nothing" and
+    /// "installed a lineage" are not the same kind of statement (lead ruling A-R25b).
+    Authority(AuthorityEffect),
+    /// R1 publishes a peer's progress. The emitted half of [`KernelEvent::PeerProgress`].
+    PeerProgress {
+        /// The reporting peer.
+        peer: NodeId,
+        /// The highest contiguous sequence it holds.
+        contiguous_seq: Seq,
+    },
+    /// R1 publishes a lost copy. The emitted half of [`KernelEvent::CopyLost`].
+    CopyLost {
+        /// Which copy.
+        copy: CopyId,
+    },
+    /// A record was applied locally on the primary. The emitted half of
+    /// [`KernelEvent::LocalApplied`].
+    LocalApplied {
+        /// The record's sequence.
+        seq: Seq,
+        /// Its encoded size.
+        bytes: u64,
+        /// The record's digest, as R1's ladder holds it.
+        record_digest: Digest,
+    },
+    /// R1 publishes its durable views. The emitted half of [`KernelEvent::DurableAdvanced`].
+    DurableAdvanced {
+        /// `(config_version, all_durable_through)` for each active predicate.
+        per_predicate: Vec<(ConfigVersion, DurableSeq)>,
+    },
+    /// R1 blocks the partition. The emitted half of [`KernelEvent::BlockPartition`].
+    BlockPartition(BlockReason),
+    /// L1 crossed the warn threshold (team kernel-b `design.md` §4.4 `Healthy -> Warn`; plan
+    /// row M7B-65).
+    ///
+    /// Not a [`Self::SetAdmission`]: admission does not change at warn, and `SetAdmission` is
+    /// emitted on admission edges only. Operator-facing, so no kernel receives it and it has
+    /// no event twin.
+    ProtectionWarn {
+        /// The oldest record not yet durable on every required copy.
+        oldest_unsafe_seq: Seq,
+        /// Its age in milliseconds at the evaluation that crossed the threshold.
+        age_ms: u64,
+    },
+    /// Package F1's outputs (team kernel-b `design.md` §5; lead ruling B-R35). The emitted half
+    /// of [`KernelEvent::Recovery`] in the sense that both are F1's vocabulary; most variants are
+    /// requests to the environment rather than facts for another kernel.
+    Recovery(RecoveryEffect),
+    /// R1 proved `copy` holds a different history (team kernel-b `design.md` §3.4 rule 9,
+    /// §3.6 `Differs`; lead ruling B-R36). From the tracker it opens the divergence vector; from
+    /// the catch-up cursor it is the whole effect, routed back to the tracker as its event twin.
+    DivergenceDetected {
+        /// The copy that disagrees.
+        copy: CopyId,
+    },
+    /// The catch-up cursor saw `copy` answer `Quarantined` (§3.6, K-B-52; lead ruling B-R36).
+    /// Routed to the tracker, which consumes it exactly as `DivergenceDetected`.
+    CopyQuarantined {
+        /// The quarantined copy.
+        copy: CopyId,
+    },
+    /// Re-sending records cannot bring `copy` up to date (§3.4 rule 9 `NotRetained`, §3.6
+    /// steps 1 and 1a, the probe cap; lead ruling B-R36). M7 emits the signal only. No kernel
+    /// receives it, so it has no event twin.
+    SnapshotCatchupRequired {
+        /// The copy.
+        copy: CopyId,
+        /// The primary's head when the need was found.
+        barrier: Seq,
+    },
+    /// Catch-up (team kernel-b `design.md` §3.6 step 2; lead ruling B-R40): the host reads the
+    /// canonical envelopes `from..=through` from this primary's log and unicasts them to `copy`,
+    /// unchanged. R1 holds no record bytes. `from == through` in M7, because one record is in
+    /// flight at a time.
+    ///
+    /// Also the answer to a `ProbeDigestAt { seq }` (`from == through == seq`): the record carries
+    /// its digest, and the receiver's own ladder does the comparison, so no digest frame exists.
+    SendEnvelopes {
+        /// The copy being caught up.
+        copy: CopyId,
+        /// The first sequence to send.
+        from: Seq,
+        /// The last sequence to send, inclusive.
+        through: Seq,
+    },
+    /// The copy answered `NeedLineage`, `NeedConfig` or `UnknownEpoch`: it has seen control this
+    /// primary has not, so the cursor stopped (§3.6; lead ruling B-R40).
+    CopyAheadOnControl {
+        /// The copy that is ahead.
+        copy: CopyId,
+    },
+    /// The ACK that closed the gap: `copy` holds the primary's head (§3.6; lead ruling B-R40).
+    /// Emitted once per catch-up. F1's `Rebuilding` consumes it (§5.6a) as
+    /// [`crate::contracts::recovery::RecoveryEvent::CopyCaughtUp`], whose fields these mirror
+    /// name for name; that routing lands with F1's sim wiring.
+    CopyCaughtUp {
+        /// The copy that caught up.
+        copy: CopyId,
+        /// The head it reached.
+        head: Seq,
+        /// The primary's digest at `head`.
+        digest: Digest,
     },
 }
 
@@ -369,6 +630,39 @@ pub struct Budgets {
     pub grant_millis: u64,
     /// Grant renewal interval (spec §7.2: 500 ms).
     pub renew_millis: u64,
+    /// The longest scheduler suspension that does **not** end a grant (lead ruling A-R32;
+    /// team kernel-a `design.md` §2.4, the `Held | ProcessResumed` row). 500 ms.
+    ///
+    /// Compared against [`NodeLifecycle::Resumed::suspended_millis`], which is why it is spelled
+    /// `_millis` rather than `_ticks`: the event and its own threshold are in the same unit and
+    /// no conversion sits between them.
+    ///
+    /// A **separate** field rather than a reuse of [`Self::renew_millis`], although the spec
+    /// value is the same number. The two have no reason to move together, and sharing one would
+    /// make an operator's renewal tuning silently retune suspend detection.
+    pub resume_gap_tolerance_millis: u64,
+    /// How often A1 expects a fresh bounded-clock sample (team kernel-a `design.md` §2.1). 500 ms.
+    ///
+    /// Its own threshold and **not** a reuse of [`Self::renew_millis`] (finding K-A-07), although
+    /// the spec gives both the same number: sampling the clock and renewing a grant are
+    /// independent rates, and an operator who retunes one has not asked to retune the other.
+    pub clock_sample_period_millis: u64,
+    /// The oldest clock sample A1 will admit on. Four sample periods, so one late sample is not
+    /// an event.
+    ///
+    /// A sample older than this **denies** and never fences (lead ruling A-R12): the next fresh
+    /// sample restores admission. At two periods every ordinary scheduling hiccup would suspend
+    /// admission for no safety gain.
+    pub max_sample_age_millis: u64,
+    /// Assumed bound on the local tick rate's error against UTC, in parts per million. 500.
+    ///
+    /// Assumption 3 of rDB ADR-rdb-0007 §4. It is what lets an *aged* sample still be usable: the
+    /// sample's own error covers the instant it was taken, and this covers the interval since.
+    ///
+    /// Not a duration, and the only member of this struct that is not milliseconds — which is why
+    /// it is spelled `_ppm`. [`crate::contracts::trace::BudgetName`] reads every member as a
+    /// `u64`, so the unit lives in the name or nowhere.
+    pub clock_rate_ppm: u64,
     /// Verified maximum clock error, spec §7.2's `epsilon` (100 ms).
     pub clock_error_millis: u64,
     /// Dispatch margin, spec §7.2's `delta` (100 ms).
@@ -389,6 +683,10 @@ impl Budgets {
         resume_hold_millis: 5_000,
         grant_millis: 3_000,
         renew_millis: 500,
+        resume_gap_tolerance_millis: 500,
+        clock_sample_period_millis: 500,
+        max_sample_age_millis: 2_000,
+        clock_rate_ppm: 500,
         clock_error_millis: 100,
         dispatch_margin_millis: 100,
         dedup_retention_millis: 24 * 60 * 60 * 1_000,

@@ -303,6 +303,31 @@ impl ControlStore {
         }
     }
 
+    /// Write `value` at `key` before the run starts: the control plane as the scenario found it.
+    ///
+    /// A real create-only commit, not a back door. It takes the next revision and enters the
+    /// watch history like any other write. So a later reload lists it at that revision, and a
+    /// later [`ControlOp::Compact`] can trim it. It records no
+    /// [`TraceKind::ControlInteraction`], because no module asked for it. It is an input, and
+    /// inputs live in [`crate::harness::run::RunPlan`], not in the trace (lead ruling L-R103).
+    ///
+    /// Added for lead ruling B-R39. A1 installs a partition only from a coherent snapshot that
+    /// lists a record naming it as owner. An empty store gives A1 nothing to serve and nothing to
+    /// publish.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Config`] naming `control_records` when `key` already holds a record. A plan
+    /// that seeds one key twice is a typo, and a silent overwrite would hide it.
+    pub fn seed(&mut self, key: ControlKey, value: Bytes) -> Result<Revision, SimError> {
+        match self.apply_cas(key, None, Some(value)) {
+            CasOutcome::Committed(revision) => Ok(revision),
+            _ => Err(SimError::Config {
+                field: "control_records",
+            }),
+        }
+    }
+
     /// Hand a control effect to the store on behalf of `node`.
     ///
     /// The outcome is decided now, against the store's current state — the store is

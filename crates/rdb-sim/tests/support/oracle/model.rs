@@ -81,11 +81,24 @@ pub enum TraceEventKind {
     ControlInteraction,
     /// [`TraceKind::FamilyReload`].
     FamilyReload,
+    /// [`TraceKind::ModuleDispatch`].
+    ///
+    /// Added 2026-09-22 with the variant, by package I1 rather than by this file's owner, and
+    /// **only because `of` below is exhaustive on purpose and the workspace would not compile
+    /// without it.** No checker reads this kind yet; it mirrors the contract and nothing more.
+    ModuleDispatch,
+    /// [`TraceKind::KernelNoted`].
+    ///
+    /// Added 2026-09-22 with the variant (lead ruling A-R46), by foundation rather than by this
+    /// file's owner, and **only because `of` below is exhaustive on purpose and the workspace
+    /// would not compile without it.** No checker reads this kind yet; it mirrors the contract
+    /// and nothing more.
+    KernelNoted,
 }
 
 impl TraceEventKind {
     /// Every kind, in [`TraceKind`] declaration order.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 26] = [
         Self::ClientSubmit,
         Self::AdmissionDecision,
         Self::AuthorityDecision,
@@ -110,6 +123,8 @@ impl TraceEventKind {
         Self::OpSkipped,
         Self::ControlInteraction,
         Self::FamilyReload,
+        Self::ModuleDispatch,
+        Self::KernelNoted,
     ];
 
     /// The kind of `kind`. Exhaustive on purpose: no `_` arm.
@@ -140,6 +155,8 @@ impl TraceEventKind {
             TraceKind::OpSkipped { .. } => Self::OpSkipped,
             TraceKind::ControlInteraction { .. } => Self::ControlInteraction,
             TraceKind::FamilyReload { .. } => Self::FamilyReload,
+            TraceKind::ModuleDispatch { .. } => Self::ModuleDispatch,
+            TraceKind::KernelNoted { .. } => Self::KernelNoted,
         }
     }
 
@@ -171,6 +188,8 @@ impl TraceEventKind {
             Self::OpSkipped => "op_skipped",
             Self::ControlInteraction => "control_interaction",
             Self::FamilyReload => "family_reload",
+            Self::ModuleDispatch => "module_dispatch",
+            Self::KernelNoted => "kernel_noted",
         }
     }
 }

@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::contracts::control::{ControlKey, ControlPrefix, WatchTermination};
 use crate::contracts::digest::Digest;
 use crate::contracts::errors::ErrorKind;
-use crate::contracts::event::Budgets;
+use crate::contracts::event::{Budgets, ModuleName};
 use crate::contracts::ids::{
     BootId, ClientId, ConfigVersion, CorrelationId, EventId, Generation, GrantId, NodeId,
     OwnerEpoch, PartitionId, ReplicaRole, RequestId, Revision, ScenarioId, Seq, TenantId,
@@ -116,6 +116,16 @@ pub enum BudgetName {
     Grant,
     /// [`Budgets::renew_millis`].
     Renew,
+    /// [`Budgets::resume_gap_tolerance_millis`].
+    ResumeGapTolerance,
+    /// [`Budgets::clock_sample_period_millis`].
+    ClockSamplePeriod,
+    /// [`Budgets::max_sample_age_millis`].
+    MaxSampleAge,
+    /// [`Budgets::clock_rate_ppm`] — **parts per million, not milliseconds.** The only member
+    /// here that is not a duration. [`Self::set`] takes a bare `u64` and names its parameter
+    /// `value` for that reason; a scenario overriding this one is setting a rate.
+    ClockRatePpm,
     /// [`Budgets::clock_error_millis`].
     ClockError,
     /// [`Budgets::dispatch_margin_millis`].
@@ -128,13 +138,26 @@ pub enum BudgetName {
 
 impl BudgetName {
     /// Every budget, in [`Budgets`] field order. A resolver that walks this cannot skip one.
-    pub const ALL: [Self; 10] = [
+    ///
+    /// **This array does not defend itself.** `get`/`set` match on `Self`, not on [`Budgets`], so
+    /// adding a field to `Budgets` and forgetting a member here compiles cleanly and silently
+    /// makes that field un-overridable by a scenario and absent from `RunManifest.overridden`.
+    /// It happened on 2026-09-22: lead ruling A-R36 added four clock thresholds to `Budgets`
+    /// precisely so they could not drift apart in private constants, and by leaving this array at
+    /// ten produced the same drift through this door instead. The length is asserted against
+    /// `Budgets`'s field count in `contracts.rs`; if you add a field, that assertion is the thing
+    /// that tells you.
+    pub const ALL: [Self; 14] = [
         Self::WarnAge,
         Self::PauseAge,
         Self::ResumeLag,
         Self::ResumeHold,
         Self::Grant,
         Self::Renew,
+        Self::ResumeGapTolerance,
+        Self::ClockSamplePeriod,
+        Self::MaxSampleAge,
+        Self::ClockRatePpm,
         Self::ClockError,
         Self::DispatchMargin,
         Self::DedupRetention,
@@ -151,6 +174,10 @@ impl BudgetName {
             Self::ResumeHold => budgets.resume_hold_millis,
             Self::Grant => budgets.grant_millis,
             Self::Renew => budgets.renew_millis,
+            Self::ResumeGapTolerance => budgets.resume_gap_tolerance_millis,
+            Self::ClockSamplePeriod => budgets.clock_sample_period_millis,
+            Self::MaxSampleAge => budgets.max_sample_age_millis,
+            Self::ClockRatePpm => budgets.clock_rate_ppm,
             Self::ClockError => budgets.clock_error_millis,
             Self::DispatchMargin => budgets.dispatch_margin_millis,
             Self::DedupRetention => budgets.dedup_retention_millis,
@@ -159,18 +186,22 @@ impl BudgetName {
     }
 
     /// Set the value this name selects in `budgets`.
-    pub const fn set(self, budgets: &mut Budgets, millis: u64) {
+    pub const fn set(self, budgets: &mut Budgets, value: u64) {
         match self {
-            Self::WarnAge => budgets.warn_age_millis = millis,
-            Self::PauseAge => budgets.pause_age_millis = millis,
-            Self::ResumeLag => budgets.resume_lag_millis = millis,
-            Self::ResumeHold => budgets.resume_hold_millis = millis,
-            Self::Grant => budgets.grant_millis = millis,
-            Self::Renew => budgets.renew_millis = millis,
-            Self::ClockError => budgets.clock_error_millis = millis,
-            Self::DispatchMargin => budgets.dispatch_margin_millis = millis,
-            Self::DedupRetention => budgets.dedup_retention_millis = millis,
-            Self::DiscoveryWindow => budgets.discovery_window_millis = millis,
+            Self::WarnAge => budgets.warn_age_millis = value,
+            Self::PauseAge => budgets.pause_age_millis = value,
+            Self::ResumeLag => budgets.resume_lag_millis = value,
+            Self::ResumeHold => budgets.resume_hold_millis = value,
+            Self::Grant => budgets.grant_millis = value,
+            Self::Renew => budgets.renew_millis = value,
+            Self::ResumeGapTolerance => budgets.resume_gap_tolerance_millis = value,
+            Self::ClockSamplePeriod => budgets.clock_sample_period_millis = value,
+            Self::MaxSampleAge => budgets.max_sample_age_millis = value,
+            Self::ClockRatePpm => budgets.clock_rate_ppm = value,
+            Self::ClockError => budgets.clock_error_millis = value,
+            Self::DispatchMargin => budgets.dispatch_margin_millis = value,
+            Self::DedupRetention => budgets.dedup_retention_millis = value,
+            Self::DiscoveryWindow => budgets.discovery_window_millis = value,
         }
     }
 }
@@ -1189,6 +1220,72 @@ pub enum TraceKind {
         /// The termination that justified it, by its `event_id`.
         after_termination: Option<EventRef>,
     },
+
+    /// One `(event, module)` offer the run loop made, and how the module answered
+    /// (package I1, 2026-09-22).
+    ///
+    /// **Appended at the end of this enum on purpose.** Inserting a variant in the middle moves
+    /// every `trace.rs:NNN` citation below it silently, and nothing in this repository reports
+    /// that; on 2026-09-22 widening `AckRejectReason` pushed three cited spans down 37 lines and
+    /// every check still passed.
+    ///
+    /// **Why it exists.** Until it did, every variant above was a decision or an observation, and
+    /// the run loop's own work — which module was offered which event, and what came back — was
+    /// nowhere in the value. The measured consequence was that
+    /// `rdb_sim::harness::replay::compare_traces` answered `Identical` for a run that consumed
+    /// three events and one that consumed none, for a deadline-severed run and a completed one,
+    /// and for a run under an injected control fault and one without. A typical run recorded nine
+    /// constant [`Self::Capability`] lines and nothing else, so the comparison every determinism
+    /// claim in M7 rests on could not see the run at all. One record per offer makes the trace a
+    /// function of what the loop did.
+    ///
+    /// **This is the dispatch, never the input** (lead ruling L-R103, 2026-09-22). A trace records
+    /// what a run *did*; the reproducer is `rdb_sim::harness::run::RunPlan`, and the seed, the
+    /// control operations and the limits stay in it. `event` names an event of the *input* stream
+    /// only so that six offers can be attributed to the one pop that caused them.
+    ///
+    /// **A decline is an event, not a silence** (ruling B-R28, nothing is dropped silently). A
+    /// module with no body for an event answers [`DispatchOutcome::Declined`] and the run
+    /// continues; before this variant that continuation left no record, so a loop that swallowed
+    /// refusals and a loop that reported them produced the same trace.
+    ModuleDispatch {
+        /// The scheduler event that was offered.
+        ///
+        /// **Not an [`EventRef`]**, despite the type: this is the id the scheduler allocated in
+        /// the run's own event space, and no [`TraceEvent::event_id`] in this trace carries it.
+        /// A checker must not follow it as a back-reference.
+        event: EventId,
+        /// Which module it was offered to. The six offers for one `event` appear in
+        /// `ModuleName::ALL` order, which is the loop's fixed routing order.
+        module: ModuleName,
+        /// What came back.
+        outcome: DispatchOutcome,
+    },
+
+    /// A kernel module said something whose only consumer is the reader of this trace
+    /// (lead ruling A-R46, 2026-09-22).
+    ///
+    /// **Appended at the end of this enum**, for the reason [`Self::ModuleDispatch`] gives.
+    ///
+    /// Two `KernelEffect` arms have no module consumer by design. `Ignored` exists because "an
+    /// empty effect vector is indistinguishable from an unhandled event" (rulings A-R24, B-R33),
+    /// and `Alert` is for an operator. The dispatcher neither routes nor refuses them; it records
+    /// them here. Refusing them made "the module handled this and did nothing" unreachable through
+    /// the run loop, which defeated the reason `Ignored` exists. The other four `KernelEffect`
+    /// arms are the emitted half of a `KernelEvent` (ruling R-S6), they have a module consumer,
+    /// and they never appear here — with one exception inside `Authority(..)`: its `Fact` arm is
+    /// "for the trace and the oracle" (A-R25b), so it is recorded too (lead ruling A-R49).
+    KernelNoted {
+        /// The scheduler event whose offer produced the effect.
+        ///
+        /// **Not an [`EventRef`]**, for the reason [`Self::ModuleDispatch`]'s `event` gives: an
+        /// id in the run's own event space, never a back-reference into this trace.
+        event: EventId,
+        /// The module that emitted it.
+        module: ModuleName,
+        /// What it said.
+        note: KernelNote,
+    },
 }
 
 /// A whole recorded run.
@@ -1198,4 +1295,95 @@ pub struct Trace {
     pub header: TraceHeader,
     /// What it declared, in `event_id` order.
     pub events: Vec<TraceEvent>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Appended 2026-09-22 (package I1). New material goes below this line, never above it: an
+// insertion anywhere earlier in this file moves every `trace.rs:NNN` citation under it without
+// any tool in this repository noticing.
+// ---------------------------------------------------------------------------------------------
+
+/// How a kernel module answered one offer from the run loop
+/// ([`TraceKind::ModuleDispatch`]).
+///
+/// Three arms because the loop treats three cases differently and a checker has to be able to
+/// tell them apart: an answer continues the run and its effects are delivered, a decline
+/// continues the run and is not a failure, and any other protocol error stops it. Collapsing the
+/// last two into one "did not answer" would put ruling B-R28 — nothing is dropped silently —
+/// behind a shape that cannot express the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DispatchOutcome {
+    /// The module returned `Ok`.
+    ///
+    /// `effects` may be zero, and the distinction matters: a module that answers `Ok(vec![])`
+    /// has *taken* the event and decided to do nothing, which is not what
+    /// [`Self::Declined`] means.
+    Answered {
+        /// How many effects came back, saturating at [`u32::MAX`].
+        effects: u32,
+    },
+    /// The module answered [`crate::contracts::errors::RdbError::Unavailable`]: this build has
+    /// no body for that event at that module. Counted, never fatal.
+    Declined,
+    /// The module answered some other protocol error. The loop stops on it.
+    Errored {
+        /// Which error, as the stable [`ErrorKind`] — never a message, which could carry a key.
+        kind: ErrorKind,
+    },
+}
+
+// Appended 2026-09-22 (lead ruling A-R46).
+
+/// What a kernel module said, in a [`TraceKind::KernelNoted`] record.
+///
+/// The kernel effects with no module consumer, carried as they left the kernel: `Ignored`,
+/// `Alert`, A1's `Fact` ([`Self::AuthorityFact`], lead ruling A-R49) and L1's `ProtectionWarn`
+/// ([`Self::ProtectionWarn`]); plus L1's `SetAdmission` ([`Self::SetAdmission`]), whose consumer
+/// T1 is not yet wired (lead ruling B-R42). The
+/// reasons keep their own types: `Ignored`'s is the kernels' own vocabulary and `Alert`'s is the
+/// client-facing [`ErrorKind`], and folding one into the other would lose the distinction the
+/// `KernelEffect` docs draw between them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum KernelNote {
+    /// The module handled the event and deliberately did nothing.
+    Ignored {
+        /// Why, in the vocabulary of the kernel that said it.
+        reason: crate::contracts::ignore::KernelIgnoredReason,
+    },
+    /// An operator-visible condition.
+    Alert {
+        /// What the condition is.
+        reason: ErrorKind,
+    },
+    /// Something A1 did: the payload of `KernelEffect::Authority(AuthorityEffect::Fact(..))`.
+    ///
+    /// Appended 2026-09-22 (lead ruling A-R49). That arm's own doc says it exists "for the trace
+    /// and the oracle" (A-R25b), so like `Ignored` it has no module consumer by design. Every
+    /// other `AuthorityEffect` arm has one (T1, P1, R1, F1) and is refused, never recorded here.
+    AuthorityFact {
+        /// What A1 did, as it left the kernel.
+        fact: crate::contracts::authority::AuthorityFact,
+    },
+    /// L1's `SetAdmission`: the payload of `KernelEffect::SetAdmission(..)`, as it left the
+    /// kernel.
+    ///
+    /// Appended 2026-09-22 (lead ruling B-R42). Unlike the arms above, this one **has** a module
+    /// consumer — T1's admission gate, through `KernelEvent::SetAdmission` — and T1 is not wired.
+    /// Until it is, the trace is where the edge is kept. Recorded, not refused: L1 emits one on
+    /// becoming live, so a refusal would stop every L1 run at its first step. Whether the note
+    /// stays once T1 receives the event is decided by the ruling that wires T1.
+    SetAdmission {
+        /// What L1 published.
+        state: crate::contracts::protection::AdmissionState,
+    },
+    /// L1's `ProtectionWarn`: the oldest unsafe record crossed the warn age (spec §6.2).
+    ///
+    /// Appended 2026-09-22 (lead ruling B-R42). Operator-facing, and no kernel receives it (the
+    /// `KernelEffect` doc says so), so like `Alert` it has no module consumer by design.
+    ProtectionWarn {
+        /// The oldest record not yet durable on every required copy.
+        oldest_unsafe_seq: crate::contracts::ids::Seq,
+        /// Its age in milliseconds at the evaluation that crossed the threshold.
+        age_ms: u64,
+    },
 }

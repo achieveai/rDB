@@ -13,6 +13,10 @@
 //! | [`membership`] | the pinned copy set; authenticated peer to copy | §6.2 |
 //! | [`envelope`] | the replication envelope and its acknowledgement | §6.1 |
 //! | [`event`] | event/effect: `step(state, event) -> effects` | §5.2 |
+//! | [`ignore`] | why a kernel ignored an event: the namespaced carrier and kernel-b's leaf | §5.2 |
+//! | [`protection`] | what L1 publishes about admission, exposure and liveness | §6.2 |
+//! | [`qualification`] | the publish-predicate edge R1 emits | §6.1, §6.3 |
+//! | [`recovery`] | what F1 decided, what it proved, and what it could not | §8.1, §8.3, §8.4 |
 //! | [`time`] | logical ticks, timers, the bounded-clock estimate | §7.2 |
 //! | [`storage`] | atomic batches, the three typed watermarks, the read view | §5.2, §6.1 |
 //! | [`control`] | single-record CAS and a watch that may gap | §7.1 |
@@ -27,7 +31,11 @@ pub mod envelope;
 pub mod errors;
 pub mod event;
 pub mod ids;
+pub mod ignore;
 pub mod membership;
+pub mod protection;
+pub mod qualification;
+pub mod recovery;
 pub mod storage;
 pub mod time;
 pub mod trace;

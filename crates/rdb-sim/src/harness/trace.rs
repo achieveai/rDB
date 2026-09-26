@@ -8,14 +8,17 @@
 //! [`TraceEvent`] per line. DuckDB reads it directly, which is how a failing campaign gets
 //! queried instead of grepped.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use rdb_core::contracts::ids::{BootId, CorrelationId, EventId, NodeId, PartitionId};
+use rdb_core::contracts::ids::{BootId, CorrelationId, EventId, NodeId, PartitionId, Seq};
 use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{EventRef, Trace, TraceEvent, TraceHeader, TraceKind};
+use rdb_core::contracts::trace::{
+    EventRef, PackageId, SchedulePhase, Trace, TraceEvent, TraceHeader, TraceKind,
+};
 use rdb_core::contracts::version::TRACE_SCHEMA_VERSION;
 
 use crate::error::SimError;
@@ -396,4 +399,285 @@ pub fn read_jsonl(path: &Path) -> Result<Trace, SimError> {
         events.push(event);
     }
     Ok(Trace { header, events })
+}
+
+// ---------------------------------------------------------------------------------------------
+// The validator
+// ---------------------------------------------------------------------------------------------
+
+/// Why a [`Trace`] is not well-formed.
+///
+/// One variant per check in [`validate`], and every variant names the thing that is wrong rather
+/// than saying "invalid": a defect a reader has to go and find in the file by hand is a defect
+/// that gets re-diagnosed on every campaign failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TraceDefect {
+    /// Two events are out of order, or share an `event_id`.
+    ///
+    /// The oracle folds left to right and never sorts (design §4.10), so a non-increasing
+    /// `event_id` is not a cosmetic problem: it silently reorders the history the checkers read.
+    #[error("event_id {found:?} does not follow {previous:?}")]
+    EventIdNotIncreasing {
+        /// The `event_id` of the preceding event.
+        previous: EventId,
+        /// The offending `event_id`.
+        found: EventId,
+    },
+
+    /// A [`TraceKind::Capability`] event after the first ordinary event.
+    ///
+    /// `Capability` is emitted once per package at trace start. A checker that meets a
+    /// capability state it has not seen yet cannot honestly report an unavailable package for
+    /// the events it has already folded.
+    #[error("capability for {package:?} at {event_id:?} is outside the opening block")]
+    CapabilityOutsideOpeningBlock {
+        /// Which package reported late.
+        package: PackageId,
+        /// Where it reported.
+        event_id: EventId,
+    },
+
+    /// A package in [`crate::harness::expected_capability_packages`] never reported.
+    ///
+    /// Without this a campaign cannot tell "no violation" from "nothing ran".
+    #[error("no capability event for {package:?}")]
+    CapabilityMissing {
+        /// The package with no capability line.
+        package: PackageId,
+    },
+
+    /// An event the liveness checker folds, before any [`TraceKind::SchedulePhaseChanged`] to
+    /// [`SchedulePhase::Healed`].
+    ///
+    /// Spike §6 forbids calling an unhealed partition a liveness failure, so liveness is only
+    /// claimed inside a stated phase. A trace that feeds the checker before the phase is stated
+    /// arms it outside one, and nothing downstream can tell.
+    #[error("liveness-folded event at {event_id:?} precedes any healed schedule phase")]
+    LivenessFoldedBeforeHealed {
+        /// Where the folded event is.
+        event_id: EventId,
+    },
+
+    /// A [`TraceKind::ReplicationAck`] whose `from_node` is not the node the envelope carries.
+    ///
+    /// The contract fixes both: `ReplicationAck.from_node` is *"the acknowledging node"*, and the
+    /// variant's own documentation says it is *"emitted at the secondary, where the
+    /// acknowledgement is generated, and the envelope's `node` is therefore the acknowledging
+    /// node"*. Two names for one node, so a trace where they disagree names two acknowledgers for
+    /// one acknowledgement and is a trace the runner could never produce.
+    ///
+    /// It gets its own variant rather than being tolerated because tolerating it is what hid it:
+    /// [`Self::AckAboveLastApply`] keyed on the envelope until 2026-09-22, so a disagreeing
+    /// fixture was reported against the wrong node's applies — a defect that named `NodeId(3)`
+    /// for an acknowledgement `NodeId(2)` had generated and could hold. Catching the
+    /// unrealizable trace is this validator's job; guessing which of the two fields was meant is
+    /// not.
+    #[error("acknowledgement at {event_id:?} is from {from_node:?} on {envelope:?}'s envelope")]
+    AckEmitterDisagreesWithEnvelope {
+        /// Where the acknowledgement is.
+        event_id: EventId,
+        /// The node the envelope names.
+        envelope: NodeId,
+        /// The node the acknowledgement names as its emitter.
+        from_node: NodeId,
+    },
+
+    /// A [`TraceKind::ReplicationAck`] claiming a contiguous prefix the emitting node never
+    /// applied.
+    ///
+    /// M7V-88's realizability rule: `replication_ack.contiguous_seq` is never above the emitting
+    /// node's last `batch_apply.seq`. A fixture that breaks it is one the runner could never
+    /// produce, and a checker tuned to it arms in its unit row and never in a campaign.
+    #[error("{node:?} acknowledged {contiguous_seq:?} having applied only {last_apply:?}")]
+    AckAboveLastApply {
+        /// The emitting node, as the acknowledgement's own `from_node` names it.
+        node: NodeId,
+        /// What it claimed to hold.
+        contiguous_seq: Seq,
+        /// The highest `BatchApply.seq` that node recorded, [`Seq::ZERO`] if it recorded none.
+        last_apply: Seq,
+    },
+}
+
+/// Whether the liveness checker folds this kind of event.
+///
+/// **One variant today, and it is not this module's set to widen.** INV-LIVE belongs to team
+/// verification; `M7V-30` folds "one `inflight` request that never reaches a terminal
+/// `client_outcome`", and [`TraceKind::ClientSubmit`] is that request arriving. When
+/// verification names the rest of the set, it is named here and nowhere else.
+const fn folds_into_liveness(kind: &TraceKind) -> bool {
+    matches!(kind, TraceKind::ClientSubmit { .. })
+}
+
+/// Whether this event states that the schedule has healed.
+const fn arms_liveness(kind: &TraceKind) -> bool {
+    matches!(
+        kind,
+        TraceKind::SchedulePhaseChanged {
+            phase: SchedulePhase::Healed,
+            ..
+        }
+    )
+}
+
+/// Check that a trace is one the runner could have produced.
+///
+/// **One validator, applied to a `Trace` whichever way it was built** (plan §9). A second code
+/// path for hand-built traces would let a fixture be well-formed for the oracle and unrealizable
+/// by the runner, which is the whole reason `M7V-88` exists.
+///
+/// The four checks, in the order a defect is reported:
+///
+/// 1. **`event_id` is a strictly increasing total order.** Everything below folds left to right
+///    and would otherwise be reading a different history than the one recorded. `logical_tick`
+///    is deliberately *not* checked: several events at one tick is the normal case, and the
+///    order is over `event_id`, never over time.
+/// 2. **The capability block opens the trace and is complete.** Every package in
+///    [`crate::harness::expected_capability_packages`] reports, all of them before the first
+///    ordinary event. [`PackageId::C0`] is permitted and not required (ruling F-2): it has no
+///    module and emits no capability line, so requiring it would reject every recorded trace.
+/// 3. **Liveness is only armed inside a stated phase.** An event the liveness checker folds may
+///    not appear before a [`SchedulePhase::Healed`] phase change.
+/// 4. **An acknowledgement names one emitter, and never claims more than that emitter applied.**
+///    Keyed on the acknowledgement's own `from_node` — the contract's *"acknowledging node"* —
+///    and a `from_node` that disagrees with the envelope's `node` is reported before the
+///    sequences are compared at all.
+///
+/// # The third check is inert on today's recorded traces, and that is not a reason to weaken it
+///
+/// [`crate::harness::run::execute`] emits no `SchedulePhaseChanged` and no `ClientSubmit`, so no
+/// recorded trace can trip check 3 yet. The first time the loop can emit a folded event with no
+/// phase change in front of it, every recorded trace becomes invalid at once and this will look
+/// like the check being too strict. It is not: it is the check finding the thing it was written
+/// for (lead ruling F-1, 2026-09-22).
+///
+/// # Errors
+///
+/// The first [`TraceDefect`] found, in the order above.
+pub fn validate(trace: &Trace) -> Result<(), TraceDefect> {
+    let mut previous: Option<EventId> = None;
+    for event in &trace.events {
+        if let Some(previous) = previous {
+            if event.event_id <= previous {
+                return Err(TraceDefect::EventIdNotIncreasing {
+                    previous,
+                    found: event.event_id,
+                });
+            }
+        }
+        previous = Some(event.event_id);
+    }
+
+    capability_block(trace)?;
+    liveness_arming(trace)?;
+    acks_against_applies(trace)
+}
+
+/// Check 2: the capability block opens the trace, and every expected package is in it.
+fn capability_block(trace: &Trace) -> Result<(), TraceDefect> {
+    let mut reported: Vec<PackageId> = Vec::new();
+    let mut seen_ordinary = false;
+    for event in &trace.events {
+        match event.kind {
+            TraceKind::Capability { package, .. } => {
+                if seen_ordinary {
+                    return Err(TraceDefect::CapabilityOutsideOpeningBlock {
+                        package,
+                        event_id: event.event_id,
+                    });
+                }
+                reported.push(package);
+            }
+            _ => seen_ordinary = true,
+        }
+    }
+
+    for package in crate::harness::expected_capability_packages() {
+        if !reported.contains(&package) {
+            return Err(TraceDefect::CapabilityMissing { package });
+        }
+    }
+    Ok(())
+}
+
+/// Check 3: nothing the liveness checker folds appears before the schedule is stated healed.
+fn liveness_arming(trace: &Trace) -> Result<(), TraceDefect> {
+    for event in &trace.events {
+        if arms_liveness(&event.kind) {
+            return Ok(());
+        }
+        if folds_into_liveness(&event.kind) {
+            return Err(TraceDefect::LivenessFoldedBeforeHealed {
+                event_id: event.event_id,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Check 4: an acknowledgement names one emitter, and never a prefix longer than that emitter
+/// applied.
+///
+/// Keyed on the acknowledgement's own **`from_node`**, which the contract calls *"the
+/// acknowledging node"*, and not on the envelope's `node`, which the contract calls only *"the
+/// node"*. M7V-88's rule is about *the emitting node's* last `batch_apply.seq`, and `from_node`
+/// is the field that names it. The envelope carries the same node in any trace the runner could
+/// produce — `ReplicationAck` is emitted at the secondary, where the acknowledgement is
+/// generated — so the two disagreeing is itself unrealizable and is reported first, as
+/// [`TraceDefect::AckEmitterDisagreesWithEnvelope`]. Reported first because the alternative is
+/// what this function used to do: pick one of the two fields and silently answer about the other
+/// node's applies.
+///
+/// **Measured, so nobody re-derives it: past that guard the two fields are equal, so the key
+/// below is a statement of intent and not a behaviour.** Keying the lookup back on `event.node`
+/// with the guard in place leaves all seven rows in `tests/replay.rs` green (probed
+/// 2026-09-22). The guard is what carries the correctness; the key is what stops the next reader
+/// having to work out which field the rule meant. Do not take the green run as licence to put
+/// the envelope back — take it as the reason the guard may not be removed.
+///
+/// A node with no `BatchApply` of its own has applied nothing, so its last is [`Seq::ZERO`] and
+/// any non-zero acknowledgement from it is a prefix it cannot hold.
+///
+/// **That zero-apply rule is the literal M7V-88 rule and it stays, but it is going to bite.**
+/// M1 has snapshots and crash images, so a node that catches up from a snapshot and then
+/// acknowledges a prefix it never applied *in this trace* is foreseeable. The first recorded
+/// trace that does it makes this check red, and that will look like the check being too strict.
+/// It will not be — the same shape as ruling F-1's warning about check 3, one check down.
+///
+/// A [`BTreeMap`] and not a hash map: iteration order is part of this crate's output (crate
+/// rule), and which node a defect names for a trace with several offenders must not depend on a
+/// hasher.
+fn acks_against_applies(trace: &Trace) -> Result<(), TraceDefect> {
+    let mut applied: BTreeMap<NodeId, Seq> = BTreeMap::new();
+    for event in &trace.events {
+        match event.kind {
+            TraceKind::BatchApply { seq, .. } => {
+                let last = applied.entry(event.node).or_insert(Seq::ZERO);
+                *last = (*last).max(seq);
+            }
+            TraceKind::ReplicationAck {
+                from_node,
+                contiguous_seq,
+                ..
+            } => {
+                if from_node != event.node {
+                    return Err(TraceDefect::AckEmitterDisagreesWithEnvelope {
+                        event_id: event.event_id,
+                        envelope: event.node,
+                        from_node,
+                    });
+                }
+                let last = applied.get(&from_node).copied().unwrap_or(Seq::ZERO);
+                if contiguous_seq > last {
+                    return Err(TraceDefect::AckAboveLastApply {
+                        node: from_node,
+                        contiguous_seq,
+                        last_apply: last,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
