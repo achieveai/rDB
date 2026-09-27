@@ -13,6 +13,29 @@
 //! ACKs it is given: the tracker's ACK ladder is the gate, and routing hands the cursor only the
 //! ACKs that ladder admits.
 //!
+//! # Retransmit (lead rulings B-R67, B-R67a)
+//!
+//! A cursor waits for the ACK of the record it sent, and nothing else would ever answer for a
+//! lost one: the keepalive skips a copy whose cursor has a record sent and not ACKed, the same
+//! `unacked` this timer watches (lead ruling B-R67c, item A2). So the cursor keeps the last
+//! record it sent until an ACK answers it (`unacked`), and each fire of the partition's
+//! retransmit timer ([`retransmit_timer`], every [`RETRANSMIT_MS`]) re-sends that record when
+//! nothing moved the cursor since the previous fire. `AlreadyHave` and `Busy` still clear
+//! `outstanding` (design §3.6) and leave `unacked` alone: they are not ACKs, and the ACK after
+//! them can be lost as well. Routing owns the timer, one per partition for every cursor there,
+//! a primary's and a recovery source's alike.
+//!
+//! # Repeats (lead rulings B-R67c, B-R67d and B-R67f)
+//!
+//! A re-send draws a second ACK for a record whenever the first was only slow, so a repeat is
+//! routine. The cursor keeps the high-water mark of the ACKs it took (`acked`). An ACK at or
+//! below it is a repeat unless its digest contradicts one the cursor or the ladder holds for
+//! that position ([`CatchupCursor::repeat`]). Routing never hands a repeat to the cursor: one
+//! at the mark is a liveness report that runs the tracker's rules alone, and one below it
+//! answers `Recorded` and changes nothing (lead ruling B-R67d). And the cursor sends the next
+//! record only for an ACK whose `received` moves past the mark, so one extra ACK never puts a
+//! second copy of every later record on the wire.
+//!
 //! # Not built
 //!
 //! Step 1a, the one-generation limit on historical records (K-B-37, M7B-125 twin b), is not
@@ -21,18 +44,34 @@
 //! handoff question.
 
 use crate::contracts::digest::Digest;
-use crate::contracts::envelope::{AppendOutcome, AppendReject, ReplicaProgress};
+use crate::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
 use crate::contracts::event::{EffectKind, KernelEffect};
-use crate::contracts::ids::Seq;
+use crate::contracts::ids::{PartitionId, Seq, TimerId};
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::CopyId;
 use crate::replication::ignored;
+use crate::replication::primary::REPLICATION_TIMER_BASE;
 use crate::replication::progress::{DigestLadder, DigestLookup};
 
 /// How many probes a copy gets answered before the cursor stops probing and asks for a
 /// snapshot (K-B-27). Without a cap, a copy whose ladder is sparse in a different pattern from
 /// ours could ping-pong forever.
 pub const MAX_PROBE_ROUNDS: u8 = 4;
+
+/// How often a partition's retransmit timer fires while a cursor there has a record it sent and
+/// no ACK has answered (lead rulings B-R67, B-R67a).
+pub const RETRANSMIT_MS: u64 = 100;
+
+/// The first retransmit [`TimerId`]: one per partition, at `base + partition`. It sits `2^40`
+/// above the keepalive block, so it is clear of the keepalive's and every other module's ids for
+/// every partition number, and it is still R1's own block.
+pub const RETRANSMIT_TIMER_BASE: u64 = REPLICATION_TIMER_BASE + (1 << 40);
+
+/// The retransmit timer for `partition`.
+#[must_use]
+pub fn retransmit_timer(partition: PartitionId) -> TimerId {
+    TimerId(RETRANSMIT_TIMER_BASE + u64::from(partition.0))
+}
 
 /// Why a cursor stopped. A stopped cursor sends nothing more. Control starts a new cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +84,62 @@ pub enum Stop {
     AheadOnControl,
     /// A configuration, deployment or recovery-stream fault. The reason was reported.
     Refused,
+}
+
+/// How an ACK repeats what the primary already knows its copy holds ([`Repeat::judge`]): the
+/// cursor's mark when it has one, otherwise the tracker's held progress and proved floor
+/// (lead ruling B-R67f). "Mark" below means that known position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Repeat {
+    /// Every watermark at the high-water mark, with the digest taken there. A liveness report:
+    /// routing runs it through the tracker's rules and never through the cursor (lead ruling
+    /// B-R67d).
+    AtMark,
+    /// At or below the mark on every watermark, and strictly below it on at least one. It
+    /// reports nothing: a late duplicate must not tell L1 a position older than one it has.
+    BelowMark,
+}
+
+impl Repeat {
+    /// How `ack` repeats `known`, the most the primary knows its copy holds, or `None` when it
+    /// does not (lead rulings B-R67c, B-R67d and B-R67f). A repeat's progress is at or below
+    /// `known` on all three watermarks, and no digest contradicts it. At `known`'s own applied
+    /// sequence the digest must be `digest`, the one taken there, when one was; otherwise, and
+    /// below it, the ladder's rung, where `history` holds one. A digest that differs is
+    /// divergence evidence and never a repeat. A re-send draws a second ACK for a record, so a
+    /// repeat is routine, not a fault.
+    #[must_use]
+    pub fn judge(
+        known: ReplicaProgress,
+        digest: Option<Digest>,
+        ack: &AppendAck,
+        history: &DigestLadder,
+    ) -> Option<Self> {
+        let progress = ack.progress;
+        if progress.received > known.received
+            || progress.buffered_applied > known.buffered_applied
+            || progress.durable > known.durable
+        {
+            return None;
+        }
+        let taken = match digest {
+            Some(digest) if progress.buffered_applied == known.buffered_applied => {
+                ack.digest_at_buffered == digest
+            }
+            _ => {
+                let at = Seq(progress.buffered_applied.0);
+                !matches!(
+                    history.lookup(at, ack.digest_at_buffered),
+                    DigestLookup::Differs { .. }
+                )
+            }
+        };
+        taken.then_some(if progress == known {
+            Self::AtMark
+        } else {
+            Self::BelowMark
+        })
+    }
 }
 
 /// One copy's catch-up position on the primary (design §3.6).
@@ -61,6 +156,19 @@ pub struct CatchupCursor {
     /// fire once per catch-up, and never for a copy that was never behind.
     catching_up: bool,
     stopped: Option<Stop>,
+    /// The last record sent that no ACK has answered since (lead ruling B-R67a). Unlike
+    /// `outstanding`, `AlreadyHave` and `Busy` leave it set: they are not ACKs, and the ACK
+    /// that follows them can be lost too. This is what the retransmit timer watches.
+    unacked: Option<Seq>,
+    /// A retransmit fire has passed since the cursor last sent or took an ACK. The next fire
+    /// re-sends `unacked`, so a record is re-sent only after a whole interval with no progress,
+    /// and at most once per fire.
+    waited: bool,
+    /// The high-water mark of the ACKs this cursor took, with the digest the copy reported at its
+    /// applied sequence (lead ruling B-R67c). An ACK at or below it, with no digest that
+    /// contradicts it, is a repeat. The cursor lives in one copy, boot and generation: it is
+    /// dropped on a new boot (M7B-150) and on `Recovered` (B-R48), so the mark does too.
+    acked: Option<(ReplicaProgress, Digest)>,
 }
 
 impl CatchupCursor {
@@ -73,6 +181,9 @@ impl CatchupCursor {
             probe_rounds: 0,
             catching_up: false,
             stopped: None,
+            unacked: None,
+            waited: false,
+            acked: None,
         }
     }
 
@@ -100,6 +211,53 @@ impl CatchupCursor {
         self.stopped
     }
 
+    /// The last record sent that no ACK has answered, while the cursor runs.
+    #[must_use]
+    pub const fn unacked(&self) -> Option<Seq> {
+        match self.stopped {
+            Some(_) => None,
+            None => self.unacked,
+        }
+    }
+
+    /// One fire of the partition's retransmit timer (lead rulings B-R67, B-R67a). A record sent
+    /// and not ACKed is re-sent — the same send, the same sequence — when nothing moved the
+    /// cursor since the previous fire; the first fire after a send or an ACK only marks the
+    /// wait. So a lost ACK costs at most two intervals, and a copy gets at most one re-send per
+    /// interval. The receiver answers a record it holds with `AlreadyHave` and its ACK, so a
+    /// re-send is idempotent there. `None` when there is nothing to re-send yet.
+    pub fn on_retransmit(&mut self) -> Option<EffectKind> {
+        let seq = self.unacked()?;
+        if !self.waited {
+            self.waited = true;
+            return None;
+        }
+        Some(self.envelopes(seq))
+    }
+
+    /// The high-water mark of the ACKs this cursor took, and the digest at its applied
+    /// sequence; `None` before its first (lead ruling B-R67c).
+    #[must_use]
+    pub const fn mark(&self) -> Option<(ReplicaProgress, Digest)> {
+        self.acked
+    }
+
+    /// How `ack` repeats what this cursor already took (lead rulings B-R67c and B-R67d), or
+    /// `None` when it does not, or when the cursor has taken nothing yet: [`Repeat::judge`]
+    /// against the mark and the digest taken there.
+    #[must_use]
+    pub fn repeat(&self, ack: &AppendAck, history: &DigestLadder) -> Option<Repeat> {
+        let (mark, digest) = self.acked?;
+        Repeat::judge(mark, Some(digest), ack, history)
+    }
+
+    /// Start a catch-up the copy has not asked for (a recovery source, lead ruling B-R59): send
+    /// the record at `head`. The copy answers `NeedPrefix` from its own head, and step 1 walks it
+    /// from there; or it holds the record and answers `AlreadyHave` with its ACK.
+    pub fn start(&mut self, head: Seq) -> Vec<EffectKind> {
+        self.send_after(Seq(head.0.saturating_sub(1)), head)
+    }
+
     /// One outcome from the copy. `history` and `head` are the primary's own ladder and
     /// applied head.
     pub fn on_outcome(
@@ -117,7 +275,7 @@ impl CatchupCursor {
             return vec![replica(reason)];
         }
         match outcome {
-            AppendOutcome::Accepted(ack) => self.on_progress(ack.progress, history, head),
+            AppendOutcome::Accepted(ack) => self.on_progress(&ack, history, head),
             // The receiver follows `AlreadyHave` with its current ACK (§3.2), and that ACK moves
             // the cursor. Sending here as well would send every next record twice.
             AppendOutcome::AlreadyHave => {
@@ -139,22 +297,63 @@ impl CatchupCursor {
     }
 
     /// `Accepted`: the copy took a record. Report `CopyCaughtUp` on the ACK that closed the
-    /// gap. Otherwise send the next record.
+    /// gap. Otherwise send the next record, but only for an ACK whose `received` moves past the
+    /// high-water mark (lead ruling B-R67c): an ACK that does not has answered nothing the
+    /// cursor has not already answered, and a send for it would put a second copy of every later
+    /// record on the wire.
     fn on_progress(
         &mut self,
-        progress: ReplicaProgress,
+        ack: &AppendAck,
         history: &DigestLadder,
         head: Seq,
     ) -> Vec<EffectKind> {
-        self.outstanding = None;
-        self.probe_rounds = 0;
+        let progress = ack.progress;
+        let past = self
+            .acked
+            .is_none_or(|(mark, _)| progress.received > mark.received);
+        self.raise_mark(ack);
         if self.catching_up && progress.buffered_applied.0 >= head.0 {
             if let Some(digest) = history.digest_at(head) {
+                self.answered();
                 self.catching_up = false;
                 return vec![self.caught_up(head, digest)];
             }
         }
+        if !past {
+            return vec![replica(ReplicaIgnoreReason::Recorded)];
+        }
+        self.answered();
         self.send_after(Seq(progress.received.0), head)
+    }
+
+    /// An ACK answered the record in flight: nothing is outstanding or unACKed, and the probe
+    /// count starts again.
+    fn answered(&mut self) {
+        self.outstanding = None;
+        self.unacked = None;
+        self.waited = false;
+        self.probe_rounds = 0;
+    }
+
+    /// Raise the high-water mark to `ack` (lead ruling B-R67c). Each watermark keeps its highest
+    /// value, and the digest follows the applied sequence it was reported at.
+    fn raise_mark(&mut self, ack: &AppendAck) {
+        let progress = ack.progress;
+        self.acked = Some(match self.acked {
+            None => (progress, ack.digest_at_buffered),
+            Some((mark, digest)) => (
+                ReplicaProgress {
+                    received: mark.received.max(progress.received),
+                    buffered_applied: mark.buffered_applied.max(progress.buffered_applied),
+                    durable: mark.durable.max(progress.durable),
+                },
+                if progress.buffered_applied > mark.buffered_applied {
+                    ack.digest_at_buffered
+                } else {
+                    digest
+                },
+            ),
+        });
     }
 
     /// Step 1 (`NeedPrefix`). Retention is checked before ancestry (K-B-17): a sequence the
@@ -171,6 +370,7 @@ impl CatchupCursor {
         head: Seq,
     ) -> Vec<EffectKind> {
         self.outstanding = None;
+        self.unacked = None;
         match history.lookup(have, head_digest) {
             DigestLookup::NotRetained => vec![self.snapshot(head)],
             // Emit the proof and nothing else. The tracker writes `diverged` and the rest of
@@ -189,9 +389,12 @@ impl CatchupCursor {
     /// (ruling B-R40, Q-C1). After [`MAX_PROBE_ROUNDS`] answers, ask for a snapshot instead.
     fn on_probe(&mut self, seq: Seq, history: &DigestLadder, head: Seq) -> Vec<EffectKind> {
         if self.probe_rounds >= MAX_PROBE_ROUNDS || history.digest_at(seq).is_none() {
+            self.unacked = None;
             return vec![self.snapshot(head)];
         }
         self.probe_rounds += 1;
+        self.unacked = Some(seq);
+        self.waited = false;
         vec![self.envelopes(seq)]
     }
 
@@ -242,6 +445,8 @@ impl CatchupCursor {
         }
         let next = done.next();
         self.outstanding = Some(next);
+        self.unacked = Some(next);
+        self.waited = false;
         self.catching_up = true;
         vec![self.envelopes(next)]
     }

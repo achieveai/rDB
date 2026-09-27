@@ -221,6 +221,12 @@ impl AppendReceiver {
         self.own.node
     }
 
+    /// The copy this receiver is.
+    #[must_use]
+    pub const fn copy(&self) -> CopyId {
+        self.own.copy
+    }
+
     /// The last record whose batch completed.
     #[must_use]
     pub const fn applied_head(&self) -> Head {

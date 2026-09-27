@@ -44,6 +44,7 @@ use rdb_core::contracts::ids::{
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+use rdb_core::contracts::protection::{AdmissionState, ReplicationLag};
 use rdb_core::contracts::recovery::{
     CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap,
     SelectedLineage,
@@ -51,7 +52,7 @@ use rdb_core::contracts::recovery::{
 use rdb_core::contracts::storage::{
     Batch, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect, Write,
 };
-use rdb_core::contracts::time::{ControlTime, Tick, TimerFired};
+use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{AckRejectReason, CapabilityState, Version};
 use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
 use rdb_core::contracts::txn::Outcome;
@@ -60,7 +61,8 @@ use rdb_core::replication::append::{
     AppendReceiver, Head, HistoryRoot, ReceiverInit, MAX_ENVELOPE_BYTES, MAX_MUTATIONS,
     PROGRESS_KEY, UNSOLICITED,
 };
-use rdb_core::replication::catchup::{CatchupCursor, MAX_PROBE_ROUNDS};
+use rdb_core::replication::catchup::{retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS};
+use rdb_core::replication::primary::{keepalive_timer, KEEPALIVE_MS};
 use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{
     decode_recovery_append, decode_reply, encode_recovery_append, encode_reply, REPLY_MAGIC,
@@ -331,11 +333,16 @@ fn rx(module: &Replication) -> &AppendReceiver {
 }
 
 fn event(kind: EventKind) -> Event {
+    event_at(B, kind)
+}
+
+/// `kind` stepped on `node`, under the boot `label(node)` names.
+fn event_at(node: NodeId, kind: EventKind) -> Event {
     Event {
         id: EventId(1),
         at: Tick(0),
-        node: B,
-        boot: BootId(2),
+        node,
+        boot: BootId(u64::from(node.0)),
         partition: P,
         correlation: CorrelationId(9),
         kind,
@@ -3348,4 +3355,1223 @@ fn m7b_170_a_credentialed_recovery_append_passes_the_frame_fence_from_a_non_prim
         assert_eq!(reply_at(&effects[0], C, FRAME_ID, CONFIG), rejected(want));
         assert_eq!(rx(&module), &before, "{want:?}");
     }
+}
+
+// --- The recovery source (lead rulings B-R59, B-R59a) --------------------------------------
+//
+// F1 asks B (copy 1), which holds 11..=15, to catch C (copy 2, node C) up through 15. Both
+// receivers live in one module, as two nodes do in one dispatcher. The test plays the host:
+// it serves each `SendRecoveryEnvelopes` by reading B's records, wrapping each in the
+// credential and delivering it to C, and it carries C's replies back to B.
+
+/// The credential F1 mints for this transfer: source B, in B's lineage. The revision is not 0,
+/// so a rewrap that rebuilt the credential from defaults would not equal it.
+fn b_credential() -> FenceCredential {
+    fence(1, EPOCH, Revision(7))
+}
+
+/// C's receiver at `(at, d(at))`, durable `at`.
+fn c_receiver_at(at: u64) -> AppendReceiver {
+    AppendReceiver::new(ReceiverInit {
+        config: config(),
+        own: CopyId(2),
+        lineage: authority(GEN, EPOCH),
+        head: head(at),
+        durable: DurableSeq(at),
+    })
+    .expect("C's receiver")
+}
+
+/// B at 15 (ladder 10..=15), and C's receiver at `c_at`.
+fn b_and_c(c_at: u64) -> Replication {
+    let mut module = applied_to(15);
+    module.install_receiver(c_receiver_at(c_at));
+    module
+}
+
+/// F1's routed `CatchUp`, stepped on B.
+fn catch_up(from: u8, to: u8, through: u64, credential: FenceCredential) -> Event {
+    event(EventKind::Kernel(KernelEvent::CatchUp {
+        from: CopyId(from),
+        to: CopyId(to),
+        through: Seq(through),
+        credential,
+    }))
+}
+
+/// `b_and_c(c_at)` after F1 asked B to catch C up through 15.
+fn started(c_at: u64) -> Replication {
+    let mut module = b_and_c(c_at);
+    let effects = step(&mut module, &catch_up(1, 2, 15, b_credential()));
+    assert_eq!(effects, vec![recovery_send(15, 15), retransmit_arm(1, 100)]);
+    module
+}
+
+fn recovery_send(from: u64, through: u64) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+        copy: CopyId(2),
+        from: Seq(from),
+        through: Seq(through),
+        credential: b_credential(),
+    })
+}
+
+/// `ev` stepped on `node` instead.
+fn on(node: NodeId, mut ev: Event) -> Event {
+    ev.node = node;
+    ev.boot = BootId(u64::from(node.0));
+    ev
+}
+
+/// `outcome` in a reply frame from `from`, stepped on `node`.
+fn reply_from_to(from: PeerLabel, node: NodeId, outcome: &AppendOutcome) -> Event {
+    let body = encode_reply(outcome);
+    on(node, framed(from, authority(GEN, EPOCH), CONFIG, body))
+}
+
+/// `outcome` in a reply frame from `from`, stepped on B.
+fn reply_from(from: PeerLabel, outcome: &AppendOutcome) -> Event {
+    reply_from_to(from, B, outcome)
+}
+
+/// C's ACK at `n`, durable 12, carrying `digest` at `n`.
+fn c_ack_with(n: u64, digest: Digest) -> AppendAck {
+    AppendAck {
+        from: C,
+        boot: BootId(3),
+        digest_at_buffered: digest,
+        ..ack(n, n, 12)
+    }
+}
+
+fn c_ack(n: u64) -> AppendAck {
+    c_ack_with(n, d(n))
+}
+
+/// Play the host for one `SendRecoveryEnvelopes`: deliver each record to C wrapped in the
+/// effect's credential, commit what C stages, carry every reply C sends back to B, and return
+/// what B answered.
+fn serve(module: &mut Replication, send: &EffectKind) -> Vec<EffectKind> {
+    let EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+        copy,
+        from,
+        through,
+        credential,
+    }) = send
+    else {
+        panic!("expected a recovery send, got {send:?}");
+    };
+    assert_eq!(*copy, CopyId(2));
+    let records = chain(through.0);
+    let mut at_b = Vec::new();
+    for seq in from.0..=through.0 {
+        let record = &records[usize::try_from(seq).expect("seq") - 1];
+        let body = recovery_body(credential, record);
+        let mut at_c = step(module, &on(C, delivered(label(B), body)));
+        if let [EffectKind::Store(StoreEffect::Commit(batch))] = at_c.as_slice() {
+            at_c = step(module, &on(C, committed(batch.id.0, seq)));
+        }
+        for kind in at_c {
+            let EffectKind::Send(SendEffect::Unicast { to, frame }) = kind else {
+                panic!("C answers only by reply, got {kind:?}");
+            };
+            assert_eq!(to, B, "C answers the source");
+            let ev = event_at(
+                B,
+                EventKind::Transport(TransportEvent::Delivered {
+                    from: label(C),
+                    frame,
+                }),
+            );
+            at_b.extend(step(module, &ev));
+        }
+    }
+    at_b
+}
+
+/// Serve every recovery send B makes, starting from `first`, until B makes none; return every
+/// effect B emitted along the way, `first` included.
+fn serve_all(module: &mut Replication, first: EffectKind) -> Vec<EffectKind> {
+    let mut all = vec![first.clone()];
+    let mut pending = vec![first];
+    while let Some(send) = pending.pop() {
+        let answered = serve(module, &send);
+        pending.extend(
+            answered
+                .iter()
+                .filter(|kind| is_recovery_send(kind))
+                .cloned(),
+        );
+        all.extend(answered);
+    }
+    all
+}
+
+fn is_recovery_send(kind: &EffectKind) -> bool {
+    matches!(
+        kind,
+        EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes { .. })
+    )
+}
+
+fn is_bare_send(kind: &EffectKind) -> bool {
+    matches!(kind, EffectKind::Kernel(KernelEffect::SendEnvelopes { .. }))
+}
+
+fn caught_up_c() -> EffectKind {
+    EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+        copy: CopyId(2),
+        head: Seq(15),
+        digest: d(15),
+    })
+}
+
+/// M7B-175 (lead rulings B-R59, B-R59a). F1's `CatchUp{from B, to C, through 15}` on B starts a
+/// source there, and B walks C from 12 to 15 exactly as a primary's cursor would, each record a
+/// `RecoveryAppend` under F1's credential: the record at 15 first, C's `NeedPrefix{12}`, then
+/// 13, 14 and 15 one at a time, and `CopyCaughtUp{C, 15, d15}` once, on the ACK that closes the
+/// gap. The source is then gone; B's own receiver is untouched; C holds `(15, d15)`.
+#[retcd_test]
+fn m7b_175_a_recovery_source_walks_the_target_to_through_under_the_credential() {
+    let mut module = b_and_c(12);
+    let b_before = rx(&module).clone();
+    let effects = step(&mut module, &catch_up(1, 2, 15, b_credential()));
+    assert_eq!(effects, vec![recovery_send(15, 15), retransmit_arm(1, 100)]);
+    assert_eq!(
+        module
+            .source(B, P, CopyId(2))
+            .map(|source| source.through()),
+        Some(Seq(15))
+    );
+    // The target lacks 13..=15, so it answers the first record with its head.
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![recovery_send(13, 13)]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(13, 13)),
+        vec![recovery_send(14, 14)]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(14, 14)),
+        vec![recovery_send(15, 15)]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![caught_up_c()]
+    );
+    assert!(
+        module.source(B, P, CopyId(2)).is_none(),
+        "dropped once caught up"
+    );
+    assert_eq!(
+        rx(&module),
+        &b_before,
+        "sourcing reads B's ladder and writes nothing"
+    );
+    let c = module.receiver(C, P).expect("C");
+    assert_eq!(c.applied_head(), head(15));
+}
+
+/// M7B-176 (lead ruling B-R59a, first direction). A primary never emits
+/// `SendRecoveryEnvelopes`: A, leading at 15, walks C up from 12 over the same span M7B-175's
+/// source does, and every send it makes is a bare `SendEnvelopes` for C.
+#[retcd_test]
+fn m7b_176_a_primary_never_emits_a_recovery_send() {
+    let mut history = DigestLadder::new();
+    for seq in 1..=15 {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut module = Replication::new();
+    module.install_primary(
+        ProgressTracker::new(TrackerInit {
+            config: config(),
+            own: CopyId(0),
+            lineage: authority(GEN, EPOCH),
+            history,
+            local: ReplicaProgress {
+                received: ReceivedSeq(15),
+                buffered_applied: AppliedSeq(15),
+                durable: DurableSeq(15),
+            },
+        })
+        .expect("A's tracker"),
+    );
+    let need = rejected(AppendReject::NeedPrefix {
+        have: Seq(12),
+        head_digest: d(12),
+    });
+    let mut effects = step(&mut module, &reply_from_to(label(C), A, &need));
+    for n in 13..=15 {
+        let accepted = AppendOutcome::Accepted(c_ack(n));
+        effects.extend(step(&mut module, &reply_from_to(label(C), A, &accepted)));
+    }
+    assert!(!effects.iter().any(is_recovery_send), "{effects:?}");
+    let sends: Vec<_> = effects.iter().filter(|kind| is_bare_send(kind)).collect();
+    let want: Vec<_> = (13..=15)
+        .map(|n| {
+            EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                copy: CopyId(2),
+                from: Seq(n),
+                through: Seq(n),
+            })
+        })
+        .collect();
+    assert_eq!(sends, want.iter().collect::<Vec<_>>());
+    assert!(effects.contains(&caught_up_c()), "{effects:?}");
+}
+
+/// M7B-177 (lead ruling B-R59a, second direction). A source never emits a bare
+/// `SendEnvelopes`, and every recovery send carries F1's credential byte for byte: C from 10 is
+/// walked 11..=15, and each send's credential equals, and encodes to the same bytes as, the one
+/// the `CatchUp` carried.
+#[retcd_test]
+fn m7b_177_a_recovery_source_never_emits_a_bare_send_and_passes_the_credential_through() {
+    let mut module = b_and_c(10);
+    let first = step(&mut module, &catch_up(1, 2, 15, b_credential()));
+    assert_eq!(first[1..], [retransmit_arm(1, 100)], "{first:?}");
+    let effects = serve_all(&mut module, first[0].clone());
+    assert!(!effects.iter().any(is_bare_send), "{effects:?}");
+    let sent: Vec<_> = effects
+        .iter()
+        .filter_map(|kind| match kind {
+            EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+                from, credential, ..
+            }) => Some((from.0, *credential)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sent.iter().map(|(from, _)| *from).collect::<Vec<_>>(),
+        vec![15, 11, 12, 13, 14, 15]
+    );
+    let wire = |credential: &FenceCredential| encode_recovery_append(credential, &[]);
+    for (from, credential) in &sent {
+        assert_eq!(credential, &b_credential(), "send {from}");
+        assert_eq!(wire(credential), wire(&b_credential()), "send {from}");
+    }
+    assert_eq!(effects.last(), Some(&caught_up_c()));
+}
+
+/// Step `ev` into `module`, assert it is answered with exactly `reason` and changes nothing.
+fn catch_up_refused(module: &mut Replication, ev: &Event, reason: ReplicaIgnoreReason) {
+    let before = module.clone();
+    let case = format!("{reason:?}");
+    assert_eq!(step(module, ev), vec![replica(reason)], "{case}");
+    assert_eq!(
+        module, &before,
+        "{case}: a refused catch-up installs nothing"
+    );
+}
+
+/// M7B-178 (lead ruling B-R59a). A `CatchUp` the node cannot source is refused and installs
+/// nothing: `NotASource` when the receiver here is not `from` (C's copy named on B), and when
+/// its head is below `through` (16 on a B at 15); `QuarantinedTerminal` when the receiver is
+/// quarantined. Near-miss: the valid `CatchUp` starts a source.
+#[retcd_test]
+fn m7b_178_a_catch_up_this_copy_cannot_source_is_refused() {
+    let mut module = b_and_c(12);
+    catch_up_refused(
+        &mut module,
+        &catch_up(2, 1, 15, fence(2, EPOCH, Revision(7))),
+        ReplicaIgnoreReason::NotASource,
+    );
+    catch_up_refused(
+        &mut module,
+        &catch_up(1, 2, 16, b_credential()),
+        ReplicaIgnoreReason::NotASource,
+    );
+    let mut quarantined = b_and_c(12);
+    let fork = envelope(16, d(14), b"v");
+    send(&mut quarantined, label(A), &fork);
+    assert!(rx(&quarantined).quarantine().is_some());
+    catch_up_refused(
+        &mut quarantined,
+        &catch_up(1, 2, 15, b_credential()),
+        ReplicaIgnoreReason::QuarantinedTerminal,
+    );
+    // Near-miss.
+    assert_eq!(
+        step(&mut module, &catch_up(1, 2, 15, b_credential())),
+        vec![recovery_send(15, 15), retransmit_arm(1, 100)]
+    );
+    assert!(module.source(B, P, CopyId(2)).is_some());
+}
+
+/// Supporting M7B-178: the other ways a node cannot source, and the target and credential
+/// checks. `NotASource`: no receiver on the node (D), a receiver `Recovered` retired, a
+/// `through` below B's ladder (9), and `through` 0 on a copy at the root. `InvalidConfig`: a
+/// target outside the configuration, the source's own copy, and a credential naming another
+/// source or another partition.
+#[retcd_test]
+fn a_catch_up_with_no_source_here_or_an_invalid_target_or_credential_is_refused() {
+    use ReplicaIgnoreReason::{InvalidConfig, NotASource};
+    use ReplicaRole::{Primary, RegularSecondary, Shadow};
+    let mut module = b_and_c(12);
+    catch_up_refused(
+        &mut module,
+        &on(D, catch_up(1, 2, 15, b_credential())),
+        NotASource,
+    );
+    catch_up_refused(&mut module, &catch_up(1, 2, 9, b_credential()), NotASource);
+    let mut retired = b_and_c(12);
+    step(
+        &mut retired,
+        &recovered(
+            15,
+            d(15),
+            pinned([RegularSecondary, Primary, RegularSecondary, Shadow]),
+        ),
+    );
+    assert!(rx(&retired).retired());
+    catch_up_refused(
+        &mut retired,
+        &catch_up(1, 2, 15, fence_in(NEW_GEN, 1, NEW_EPOCH, REVISION)),
+        NotASource,
+    );
+    let mut at_root = Replication::new();
+    at_root.install_receiver(
+        AppendReceiver::new(ReceiverInit {
+            config: config(),
+            own: CopyId(1),
+            lineage: authority(GEN, EPOCH),
+            head: root_head(),
+            durable: DurableSeq(0),
+        })
+        .expect("B at the root"),
+    );
+    catch_up_refused(&mut at_root, &catch_up(1, 2, 0, b_credential()), NotASource);
+    let other_partition = FenceCredential {
+        partition: PartitionId(9),
+        ..b_credential()
+    };
+    for (ev, case) in [
+        (catch_up(1, 9, 15, b_credential()), "target not a member"),
+        (catch_up(1, 1, 15, b_credential()), "target is the source"),
+        (
+            catch_up(1, 2, 15, fence(2, EPOCH, Revision(7))),
+            "credential names C",
+        ),
+        (
+            catch_up(1, 2, 15, other_partition),
+            "credential for partition 9",
+        ),
+    ] {
+        let before = module.clone();
+        assert_eq!(
+            step(&mut module, &ev),
+            vec![replica(InvalidConfig)],
+            "{case}"
+        );
+        assert_eq!(module, before, "{case}");
+    }
+}
+
+/// M7B-179 (lead ruling B-R59a). `Recovered` drops the source: the cut it was sending towards
+/// may be gone. C's later ACK, and its later `NeedPrefix`, find no source and no primary on B,
+/// so they are declined and change nothing, as every reply to a node with neither is.
+#[retcd_test]
+fn m7b_179_recovered_drops_the_source_and_its_later_replies_reach_nothing() {
+    let mut module = started(12);
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![recovery_send(13, 13)]
+    );
+    step(&mut module, &recovered(15, d(15), takeover_config()));
+    assert!(module.source(B, P, CopyId(2)).is_none());
+    declined(
+        &mut module,
+        &reply_from(label(C), &AppendOutcome::Accepted(c_ack(13))),
+    );
+    let need = rejected(AppendReject::NeedPrefix {
+        have: Seq(12),
+        head_digest: d(12),
+    });
+    declined(&mut module, &reply_from(label(C), &need));
+}
+
+/// Step a reply into a module running a source; assert it is refused with `reason` and changes
+/// nothing.
+fn reply_refused(module: &mut Replication, ev: &Event, reason: AckRejectReason) {
+    let before = module.clone();
+    let case = format!("{reason:?}");
+    assert_eq!(
+        step(module, ev),
+        vec![ignored(KernelIgnoredReason::AckRejected(reason))],
+        "{case}"
+    );
+    assert_eq!(module, &before, "{case}");
+}
+
+/// `started(12)` after C's `NeedPrefix{12}`: record 13 is in flight.
+fn thirteen_in_flight() -> Replication {
+    let mut module = started(12);
+    let need = rejected(AppendReject::NeedPrefix {
+        have: Seq(12),
+        head_digest: d(12),
+    });
+    assert_eq!(
+        step(&mut module, &reply_from(label(C), &need)),
+        vec![recovery_send(13, 13)]
+    );
+    module
+}
+
+/// M7B-180 (lead ruling B-R59a). The source gates the ACKs it is given, as the tracker's ladder
+/// does for a primary's cursor: an ACK labelled with a node other than `to` (D's, for 13) is
+/// `NotAMember`, and C's ACK at 13 carrying another digest is `DigestMismatch`; neither moves
+/// the cursor. Near-miss: C's honest ACK at 13 sends 14.
+#[retcd_test]
+fn m7b_180_the_source_refuses_an_ack_from_another_node_or_with_another_digest() {
+    let mut module = thirteen_in_flight();
+    let from_d = AppendAck {
+        from: D,
+        boot: BootId(4),
+        ..c_ack(13)
+    };
+    reply_refused(
+        &mut module,
+        &reply_from(label(D), &AppendOutcome::Accepted(from_d)),
+        AckRejectReason::NotAMember,
+    );
+    reply_refused(
+        &mut module,
+        &reply_from(label(C), &AppendOutcome::Accepted(c_ack_with(13, d(12)))),
+        AckRejectReason::DigestMismatch,
+    );
+    assert_eq!(
+        step(
+            &mut module,
+            &reply_from(label(C), &AppendOutcome::Accepted(c_ack(13)))
+        ),
+        vec![recovery_send(14, 14)]
+    );
+}
+
+/// Supporting M7B-180: the gate's identity half and its absence half. An unauthenticated label,
+/// and an ACK speaking for D under C's label, are `ForgedIdentity`; an ACK at 16, which B's
+/// ladder does not hold, is `Unverifiable`. None moves the cursor.
+#[retcd_test]
+fn the_source_refuses_a_forged_or_unverifiable_ack() {
+    let mut module = thirteen_in_flight();
+    let unauthenticated = PeerLabel {
+        authenticated: false,
+        ..label(C)
+    };
+    reply_refused(
+        &mut module,
+        &reply_from(unauthenticated, &AppendOutcome::Accepted(c_ack(13))),
+        AckRejectReason::ForgedIdentity,
+    );
+    let for_d = AppendAck {
+        from: D,
+        ..c_ack(13)
+    };
+    reply_refused(
+        &mut module,
+        &reply_from(label(C), &AppendOutcome::Accepted(for_d)),
+        AckRejectReason::ForgedIdentity,
+    );
+    reply_refused(
+        &mut module,
+        &reply_from(label(C), &AppendOutcome::Accepted(c_ack(16))),
+        AckRejectReason::Unverifiable,
+    );
+}
+
+/// Supporting M7B-179: a source whose cursor stops is dropped as well. C refusing the credential
+/// as stale (`StaleFence`) stops it with `RecoveryOnly` — F1 handles the fence — and C's later
+/// ACK reaches nothing.
+#[retcd_test]
+fn a_source_whose_cursor_stops_is_dropped() {
+    let mut module = thirteen_in_flight();
+    assert_eq!(
+        step(
+            &mut module,
+            &reply_from(label(C), &rejected(AppendReject::StaleFence))
+        ),
+        vec![replica(ReplicaIgnoreReason::RecoveryOnly)]
+    );
+    assert!(module.source(B, P, CopyId(2)).is_none());
+    declined(
+        &mut module,
+        &reply_from(label(C), &AppendOutcome::Accepted(c_ack(13))),
+    );
+}
+
+/// M7B-181 (lead ruling B-R59b). A source seeded at 100 on restart holds no rung below 100, so
+/// when C at 80 answers the first record with `NeedPrefix{80}`, B cannot prove 81 follows C's
+/// head. It asks for a snapshot, `SnapshotCatchupRequired{C, 100}`, and sends nothing else: it
+/// never walks from a rung it does not hold. That is the restart liveness gap, made explicit;
+/// seeding a copy from its own storage is the owed fix.
+#[retcd_test]
+fn m7b_181_a_restarted_source_without_the_targets_rung_asks_for_a_snapshot_and_never_walks() {
+    let mut module = Replication::new();
+    module.install_receiver(receiver_at(P, 100, 100));
+    module.install_receiver(c_receiver_at(80));
+    let b_before = rx(&module).clone();
+    let c_before = module.receiver(C, P).expect("C").clone();
+    assert_eq!(
+        step(&mut module, &catch_up(1, 2, 100, b_credential())),
+        vec![recovery_send(100, 100), retransmit_arm(1, 100)]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(100, 100)),
+        vec![EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: CopyId(2),
+            barrier: Seq(100),
+        })]
+    );
+    assert_eq!(rx(&module), &b_before);
+    assert_eq!(module.receiver(C, P), Some(&c_before), "C took nothing");
+}
+
+// --- The keepalive (ADR-rdb-0006 amendment 2026-09-26, lead ruling B-R60) -------------------
+//
+// A leads at 15 (ladder 1..=15) with B and C regular and D a shadow; B and C each hold 15. The
+// test plays the host for A's bare sends: each record goes to its copy's node as an ordinary
+// append from A, and every reply comes back to A. One tick is one millisecond.
+
+/// A primary (copy 0), B and C regular (copies 1 and 2), D a shadow (copy 3).
+fn with_shadow() -> PartitionConfig {
+    use ReplicaRole::{Primary, RegularSecondary as Regular, Shadow};
+    PartitionConfig::new(
+        P,
+        CONFIG,
+        vec![
+            member(0, A, Primary),
+            member(1, B, Regular),
+            member(2, C, Regular),
+            member(3, D, Shadow),
+        ],
+    )
+}
+
+/// A leading at 15 under `with_shadow()`, its ladder 1..=15, and B and C each holding 15.
+fn a_b_c() -> Replication {
+    let mut history = DigestLadder::new();
+    for seq in 1..=15 {
+        history.insert(Seq(seq), d(seq));
+    }
+    let mut module = Replication::new();
+    module.install_primary(
+        ProgressTracker::new(TrackerInit {
+            config: with_shadow(),
+            own: CopyId(0),
+            lineage: authority(GEN, EPOCH),
+            history,
+            local: ReplicaProgress {
+                received: ReceivedSeq(15),
+                buffered_applied: AppliedSeq(15),
+                durable: DurableSeq(15),
+            },
+        })
+        .expect("A's tracker"),
+    );
+    module.install_receiver(receiver_at(P, 15, 15));
+    module.install_receiver(c_receiver_at(15));
+    module
+}
+
+/// L1's `SetAdmission` as routed to R1 on `node`.
+fn admission_on(node: NodeId, allow: bool) -> Event {
+    let state = AdmissionState {
+        allow,
+        reason: (!allow).then_some(ErrorKind::ProtectionPaused),
+        oldest_unsafe_age: 0,
+        oldest_unsafe_seq: Seq(15),
+        replication_lag: ReplicationLag::millis(0),
+        stalest_copy: None,
+        lost_copies: vec![],
+        paused_prefix: Seq(15),
+        resume_barrier: Seq(15),
+        required_config_versions: vec![CONFIG],
+        outstanding_unsafe_bytes: 0,
+    };
+    event_at(node, EventKind::Kernel(KernelEvent::SetAdmission(state)))
+}
+
+fn admission(allow: bool) -> Event {
+    admission_on(A, allow)
+}
+
+/// `P`'s keepalive timer firing on `node` at `version`, scheduled for `at`.
+fn fired_on(node: NodeId, version: u64, at: u64) -> Event {
+    event_at(
+        node,
+        EventKind::Timer(TimerFired {
+            id: keepalive_timer(P),
+            version: TimerVersion(version),
+            scheduled_at: Tick(at),
+        }),
+    )
+}
+
+fn fired(version: u64, at: u64) -> Event {
+    fired_on(A, version, at)
+}
+
+/// `ev` stepped at tick `now`, checking each effect is R1's for `P`.
+fn step_at(module: &mut Replication, now: u64, ev: &Event) -> Vec<EffectKind> {
+    let ctx = StepCtx {
+        now: Tick(now),
+        ..ctx()
+    };
+    let effects = module.step(&ctx, ev).expect("R1 answers");
+    effects
+        .into_iter()
+        .map(|effect| {
+            assert_eq!(
+                (effect.from, effect.partition),
+                (ModuleName::Replication, P)
+            );
+            effect.kind
+        })
+        .collect()
+}
+
+fn arm(version: u64, at: u64) -> EffectKind {
+    EffectKind::Timer(TimerEffect::Arm {
+        id: keepalive_timer(P),
+        version: TimerVersion(version),
+        at: Tick(at),
+    })
+}
+
+fn cancel(version: u64) -> EffectKind {
+    EffectKind::Timer(TimerEffect::Cancel {
+        id: keepalive_timer(P),
+        version: TimerVersion(version),
+    })
+}
+
+/// A's head, 15, to `copy`.
+fn head_to(copy: u8) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::SendEnvelopes {
+        copy: CopyId(copy),
+        from: Seq(15),
+        through: Seq(15),
+    })
+}
+
+/// One keepalive round started at `now`: the head to B and C, never to the shadow D, and the
+/// next arm `KEEPALIVE_MS` later.
+fn round(version: u64, now: u64) -> Vec<EffectKind> {
+    vec![head_to(1), head_to(2), arm(version, now + KEEPALIVE_MS)]
+}
+
+fn replica_answer(reason: ReplicaIgnoreReason) -> Vec<EffectKind> {
+    vec![ignored(KernelIgnoredReason::Replica(reason))]
+}
+
+/// Play the host for A's bare sends: each record goes to its copy's node as an append from A,
+/// what that copy stages is committed, and each reply comes back to A. A node in `silent` drops
+/// what it is sent. Returns what A answered.
+fn host_a(module: &mut Replication, sends: &[EffectKind], silent: &[NodeId]) -> Vec<EffectKind> {
+    let records = chain(15);
+    let mut at_a = Vec::new();
+    for send in sends {
+        let EffectKind::Kernel(KernelEffect::SendEnvelopes {
+            copy,
+            from,
+            through,
+        }) = send
+        else {
+            continue;
+        };
+        let node = match copy.0 {
+            1 => B,
+            2 => C,
+            other => panic!("A sends to no copy {other}"),
+        };
+        if silent.contains(&node) {
+            continue;
+        }
+        for seq in from.0..=through.0 {
+            let record = &records[usize::try_from(seq).expect("seq") - 1];
+            let body = record.encode().expect("encode");
+            let mut at_copy = step(module, &on(node, delivered(label(A), body)));
+            if let [EffectKind::Store(StoreEffect::Commit(batch))] = at_copy.as_slice() {
+                at_copy = step(module, &on(node, committed(batch.id.0, seq)));
+            }
+            for kind in at_copy {
+                let EffectKind::Send(SendEffect::Unicast { to, frame }) = kind else {
+                    panic!("a copy answers only by reply, got {kind:?}");
+                };
+                assert_eq!(to, A, "the copy answers the primary");
+                let ev = event_at(
+                    A,
+                    EventKind::Transport(TransportEvent::Delivered {
+                        from: label(node),
+                        frame,
+                    }),
+                );
+                at_a.extend(step(module, &ev));
+            }
+        }
+    }
+    at_a
+}
+
+/// Every `PeerProgress` in `effects`, in order.
+fn progressed(effects: &[EffectKind]) -> Vec<(NodeId, Seq)> {
+    effects
+        .iter()
+        .filter_map(|kind| match kind {
+            EffectKind::Kernel(KernelEffect::PeerProgress {
+                peer,
+                contiguous_seq,
+            }) => Some((*peer, *contiguous_seq)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_keepalive_output(kind: &EffectKind) -> bool {
+    matches!(kind, EffectKind::Timer(_)) || is_bare_send(kind)
+}
+
+fn keepalive_of(module: &Replication) -> Option<TimerVersion> {
+    module.primary(A, P).expect("A's primary").keepalive()
+}
+
+/// M7B-182 (lead ruling B-R60; ADR-rdb-0006 amendment 2026-09-26). A primary whose admission L1
+/// rejects draws `PeerProgress` from every live regular secondary every `KEEPALIVE_MS`, with no
+/// writes at all. The rejecting `SetAdmission` at 0 sends A's head to B and C at once and arms the
+/// timer for 100; each fire does the same and re-arms 100 later. Each copy answers `AlreadyHave`
+/// and its ACK, and each ACK emits `PeerProgress{peer, 15}`. The shadow D is never sent one.
+#[retcd_test]
+fn m7b_182_a_paused_primary_draws_peer_progress_from_every_live_peer_every_100_ms() {
+    assert_eq!(KEEPALIVE_MS, 100);
+    let mut module = a_b_c();
+    let mut sends = step_at(&mut module, 0, &admission(false));
+    assert_eq!(sends, round(1, 0));
+    for (version, now) in [(1, 100), (2, 200), (3, 300)] {
+        let answered = host_a(&mut module, &sends, &[]);
+        assert_eq!(
+            progressed(&answered),
+            vec![(B, Seq(15)), (C, Seq(15))],
+            "the round before {now}: {answered:?}"
+        );
+        sends = step_at(&mut module, now, &fired(version, now));
+        assert_eq!(sends, round(version + 1, now), "the fire at {now}");
+    }
+    let answered = host_a(&mut module, &sends, &[]);
+    assert_eq!(progressed(&answered), vec![(B, Seq(15)), (C, Seq(15))]);
+}
+
+/// M7B-183 (lead ruling B-R60). The keepalive stops on the allowing `SetAdmission`: that edge
+/// answers exactly the cancel of the armed version, and the fire already in flight is
+/// `StaleTimer`, sends nothing and changes nothing. A second allow has nothing to stop. A new
+/// pause starts a new keepalive under a new version, a repeated reject does not re-arm it, and
+/// the old version stays stale.
+#[retcd_test]
+fn m7b_183_the_keepalive_stops_on_allow_and_a_fire_in_flight_sends_nothing() {
+    let mut module = a_b_c();
+    assert_eq!(step_at(&mut module, 0, &admission(false)), round(1, 0));
+    assert_eq!(step_at(&mut module, 50, &admission(true)), vec![cancel(1)]);
+    assert_eq!(keepalive_of(&module), None);
+    let before = module.clone();
+    assert_eq!(
+        step_at(&mut module, 100, &fired(1, 100)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+    assert_eq!(module, before, "a stale fire changes nothing");
+    assert_eq!(
+        step_at(&mut module, 120, &admission(true)),
+        replica_answer(ReplicaIgnoreReason::NotRequired)
+    );
+    assert_eq!(
+        module, before,
+        "an allow with nothing armed changes nothing"
+    );
+
+    assert_eq!(step_at(&mut module, 150, &admission(false)), round(2, 150));
+    assert_eq!(
+        step_at(&mut module, 160, &admission(false)),
+        replica_answer(ReplicaIgnoreReason::NotRequired),
+        "a repeated reject keeps the cadence"
+    );
+    assert_eq!(
+        step_at(&mut module, 200, &fired(1, 100)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+    assert_eq!(step_at(&mut module, 250, &fired(2, 250)), round(3, 250));
+}
+
+/// M7B-184 (lead ruling B-R60; ADR-rdb-0006 "absence is infinite lag"). A silent peer draws no
+/// `PeerProgress`: with C dropping everything, every round still sends C the head, only B's ACK
+/// comes back, and A never reports progress for C or writes any for it.
+#[retcd_test]
+fn m7b_184_a_silent_peer_draws_no_peer_progress() {
+    let mut module = a_b_c();
+    let mut sends = step_at(&mut module, 0, &admission(false));
+    for (version, now) in [(1, 100), (2, 200), (3, 300)] {
+        let answered = host_a(&mut module, &sends, &[C]);
+        assert_eq!(progressed(&answered), vec![(B, Seq(15))], "{answered:?}");
+        sends = step_at(&mut module, now, &fired(version, now));
+        assert_eq!(
+            sends,
+            round(version + 1, now),
+            "a silent copy is still sent"
+        );
+    }
+    let tracker = module.primary(A, P).expect("A").tracker();
+    assert_eq!(
+        tracker.peer(CopyId(2)).map(|peer| peer.progress),
+        Some(ReplicaProgress::EMPTY),
+        "C proved nothing"
+    );
+}
+
+/// M7B-185 (lead ruling B-R60). A healthy or idle partition sends nothing. A primary L1 has not
+/// paused takes an ACK and an allowing `SetAdmission` and arms no timer and sends no head; a
+/// keepalive fire with nothing armed is `StaleTimer` and changes nothing. A node with no primary
+/// answers both, since R1 is a named consumer, and writes nothing.
+#[retcd_test]
+fn m7b_185_a_healthy_or_idle_partition_sends_nothing() {
+    let mut module = a_b_c();
+    let mut effects = step_at(
+        &mut module,
+        0,
+        &reply_from_to(label(B), A, &AppendOutcome::Accepted(ack(15, 15, 15))),
+    );
+    assert_eq!(progressed(&effects), vec![(B, Seq(15))]);
+    let before = module.clone();
+    let allowed = step_at(&mut module, 10, &admission(true));
+    assert_eq!(allowed, replica_answer(ReplicaIgnoreReason::NotRequired));
+    assert_eq!(module, before);
+    let stale = step_at(&mut module, 100, &fired(1, 100));
+    assert_eq!(stale, replica_answer(ReplicaIgnoreReason::StaleTimer));
+    assert_eq!(module, before);
+    assert_eq!(keepalive_of(&module), None);
+    effects.extend(allowed);
+    effects.extend(stale);
+    assert!(
+        !effects.iter().any(is_keepalive_output),
+        "nothing armed and nothing sent: {effects:?}"
+    );
+
+    let mut elsewhere = self::module();
+    let before = elsewhere.clone();
+    for allow in [false, true] {
+        assert_eq!(
+            step_at(&mut elsewhere, 0, &admission_on(B, allow)),
+            replica_answer(ReplicaIgnoreReason::NotRequired)
+        );
+    }
+    assert_eq!(
+        step_at(&mut elsewhere, 100, &fired_on(B, 1, 100)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+    assert_eq!(elsewhere, before);
+}
+
+/// A keepalive round skips a copy whose cursor is running, whose head it would disturb, and a
+/// diverged copy, whose ACKs rule 1d drops.
+#[retcd_test]
+fn a_keepalive_skips_a_copy_being_caught_up_and_a_diverged_copy() {
+    let mut module = a_b_c();
+    // B asks for the prefix it already holds: its cursor matches at the head, sends nothing and
+    // stays installed, idle. An idle cursor draws no ACK, so the keepalive still sends to B.
+    let at_head = rejected(AppendReject::NeedPrefix {
+        have: Seq(15),
+        head_digest: d(15),
+    });
+    let idle = step(&mut module, &reply_from_to(label(B), A, &at_head));
+    assert!(!idle.iter().any(is_bare_send), "{idle:?}");
+    let cursor = module.primary(A, P).expect("A's primary").cursor(CopyId(1));
+    assert_eq!(cursor.map(CatchupCursor::outstanding), Some(None));
+    let need = rejected(AppendReject::NeedPrefix {
+        have: Seq(12),
+        head_digest: d(12),
+    });
+    let walk = step(&mut module, &reply_from_to(label(C), A, &need));
+    assert_eq!(
+        walk,
+        vec![
+            EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                copy: CopyId(2),
+                from: Seq(13),
+                through: Seq(13),
+            }),
+            retransmit_arm(1, 100),
+        ]
+    );
+    assert_eq!(
+        step_at(&mut module, 0, &admission(false)),
+        vec![head_to(1), arm(1, 100)]
+    );
+    let diverged = event_at(
+        A,
+        EventKind::Kernel(KernelEvent::DivergenceDetected { copy: CopyId(1) }),
+    );
+    step(&mut module, &diverged);
+    assert_eq!(step_at(&mut module, 100, &fired(1, 100)), vec![arm(2, 200)]);
+}
+
+/// A primary a `Recovered` retires cancels its keepalive, and then answers neither the next
+/// `SetAdmission` nor the fire in flight with anything but a no-op.
+#[retcd_test]
+fn a_retired_primary_cancels_its_keepalive() {
+    let mut module = a_b_c();
+    assert_eq!(step_at(&mut module, 0, &admission(false)), round(1, 0));
+    let retiring = on(A, recovered(15, d(15), takeover_config()));
+    let effects = step(&mut module, &retiring);
+    assert!(effects.contains(&cancel(1)), "{effects:?}");
+    assert_eq!(keepalive_of(&module), None);
+    assert_eq!(
+        step_at(&mut module, 100, &fired(1, 100)),
+        replica_answer(ReplicaIgnoreReason::StaleTimer)
+    );
+    assert_eq!(
+        step_at(&mut module, 110, &admission(false)),
+        replica_answer(ReplicaIgnoreReason::NotRequired)
+    );
+}
+
+/// The keepalive timer is one per partition: a fire of another partition's id is not R1's here.
+/// A primary with no record yet has no head to send, and still arms the next round.
+#[retcd_test]
+fn the_keepalive_timer_is_per_partition_and_a_primary_with_no_record_sends_no_head() {
+    assert_ne!(keepalive_timer(P), keepalive_timer(PartitionId(5)));
+    let mut module = a_b_c();
+    let other = event_at(
+        A,
+        EventKind::Timer(TimerFired {
+            id: keepalive_timer(PartitionId(5)),
+            version: TimerVersion(1),
+            scheduled_at: Tick(100),
+        }),
+    );
+    declined(&mut module, &other);
+
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    let mut empty = Replication::new();
+    empty.install_primary(
+        ProgressTracker::new(TrackerInit {
+            config: with_shadow(),
+            own: CopyId(0),
+            lineage: authority(GEN, EPOCH),
+            history,
+            local: ReplicaProgress::EMPTY,
+        })
+        .expect("A at the root"),
+    );
+    assert_eq!(step_at(&mut empty, 0, &admission(false)), vec![arm(1, 100)]);
+}
+
+// --- Lead rulings B-R67, B-R67a: re-sends, at the receiver and at a source ------------------
+
+/// `P`'s retransmit timer firing on `node` at `version`, scheduled for `at`.
+fn retransmit_fired_on(node: NodeId, version: u64, at: u64) -> Event {
+    event_at(
+        node,
+        EventKind::Timer(TimerFired {
+            id: retransmit_timer(P),
+            version: TimerVersion(version),
+            scheduled_at: Tick(at),
+        }),
+    )
+}
+
+fn retransmit_arm(version: u64, at: u64) -> EffectKind {
+    EffectKind::Timer(TimerEffect::Arm {
+        id: retransmit_timer(P),
+        version: TimerVersion(version),
+        at: Tick(at),
+    })
+}
+
+/// M7B-189 (lead ruling B-R67: a re-send is idempotent at the receiver). A re-send is the same
+/// frame again, so the receiver sees a record it already holds. After B took record 11 from A
+/// and committed it, the same bytes again draw exactly `AlreadyHave` and B's current ACK, stage
+/// nothing, and leave B's receiver unchanged. The same holds for a `RecoveryAppend`: C takes
+/// record 13 from B's source under F1's credential, and the same frame again draws
+/// `AlreadyHave` and C's ACK at 13, back to B, and changes nothing on C.
+#[retcd_test]
+fn m7b_189_a_re_sent_record_is_answered_already_have_and_changes_nothing() {
+    let mut module = module();
+    let body = chain(11)[10].encode().expect("encode");
+    let staged = send_bytes(&mut module, label(A), body.clone());
+    let (batch, _, _) = staged_batch(&staged);
+    let acked = step(&mut module, &committed(batch.0, 11));
+    assert_eq!(
+        acked.iter().map(reply_of).collect::<Vec<_>>(),
+        vec![AppendOutcome::Accepted(ack(11, 11, 10))]
+    );
+    let before = rx(&module).clone();
+    let again = send_bytes(&mut module, label(A), body);
+    assert_eq!(
+        again.iter().map(reply_of).collect::<Vec<_>>(),
+        vec![
+            AppendOutcome::AlreadyHave,
+            AppendOutcome::Accepted(ack(11, 11, 10))
+        ]
+    );
+    assert_eq!(rx(&module), &before);
+
+    let mut module = b_and_c(12);
+    let body = recovery_body(&b_credential(), &chain(13)[12]);
+    let staged = step(&mut module, &on(C, delivered(label(B), body.clone())));
+    let (batch, _, _) = staged_batch(&staged);
+    let acked = step(&mut module, &on(C, committed(batch.0, 13)));
+    let to_b = |kinds: &[EffectKind]| -> Vec<AppendOutcome> {
+        kinds
+            .iter()
+            .map(|kind| reply_at(kind, B, FRAME_ID, CONFIG))
+            .collect()
+    };
+    assert_eq!(to_b(&acked), vec![AppendOutcome::Accepted(c_ack(13))]);
+    let before = module.receiver(C, P).expect("C").clone();
+    let again = step(&mut module, &on(C, delivered(label(B), body)));
+    assert_eq!(
+        to_b(&again),
+        vec![
+            AppendOutcome::AlreadyHave,
+            AppendOutcome::Accepted(c_ack(13))
+        ]
+    );
+    assert_eq!(module.receiver(C, P).expect("C"), &before);
+}
+
+/// Deliver record `seq` to C under B's credential and commit it, and lose every reply C sends.
+fn delivered_to_c_reply_lost(module: &mut Replication, seq: u64) {
+    let body = recovery_body(
+        &b_credential(),
+        &chain(seq)[usize::try_from(seq - 1).expect("seq")],
+    );
+    let staged = step(module, &on(C, delivered(label(B), body)));
+    let (batch, _, _) = staged_batch(&staged);
+    let replies = step(module, &on(C, committed(batch.0, seq)));
+    assert_eq!(
+        replies
+            .iter()
+            .map(|kind| reply_at(kind, B, FRAME_ID, CONFIG))
+            .collect::<Vec<_>>(),
+        vec![AppendOutcome::Accepted(c_ack(seq))],
+        "the reply the network loses"
+    );
+}
+
+/// M7B-193 (lead rulings B-R67, B-R59a). A recovery source re-sends as a primary's cursor
+/// does, on the same per-partition timer: C's ACK for record 13 is lost, the first fire re-sends
+/// nothing, and the second re-sends record 13 as the same `SendRecoveryEnvelopes` under the same
+/// credential, byte for byte. C answers it `AlreadyHave` and its ACK, which moves the source on,
+/// and C reaches 15 and is reported caught up once.
+#[retcd_test]
+fn m7b_193_a_source_re_sends_the_same_recovery_send_and_its_target_still_catches_up() {
+    let mut module = b_and_c(12);
+    let first = step_at(&mut module, 0, &catch_up(1, 2, 15, b_credential()));
+    assert_eq!(first, vec![recovery_send(15, 15), retransmit_arm(1, 100)]);
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![recovery_send(13, 13)]
+    );
+    delivered_to_c_reply_lost(&mut module, 13);
+
+    assert_eq!(
+        step_at(&mut module, 100, &retransmit_fired_on(B, 1, 100)),
+        vec![retransmit_arm(2, 200)]
+    );
+    let again = step_at(&mut module, 200, &retransmit_fired_on(B, 2, 200));
+    assert_eq!(again, vec![recovery_send(13, 13), retransmit_arm(3, 300)]);
+    assert_eq!(
+        serve(&mut module, &again[0]),
+        vec![
+            ignored(KernelIgnoredReason::Replica(ReplicaIgnoreReason::Recorded)),
+            recovery_send(14, 14)
+        ]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(14, 14)),
+        vec![recovery_send(15, 15)]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![caught_up_c()]
+    );
+    assert!(module.source(B, P, CopyId(2)).is_none());
+    assert_eq!(module.receiver(C, P).expect("C").applied_head(), head(15));
+    assert_eq!(
+        step_at(&mut module, 300, &retransmit_fired_on(B, 3, 300)),
+        replica_answer(ReplicaIgnoreReason::NotRequired)
+    );
+}
+
+/// M7B-190 (joint gate A3: the survivor of `if self.tracker.retired()` → `if true` in
+/// `Primary::on_recovered`). A primary whose `Recovered` rebuilds it and does not retire it keeps
+/// its keepalive: the step cancels no timer, the armed version is still 1, and the fire of that
+/// version sends a full round and arms the next. Tester probe p9's shape.
+#[retcd_test]
+fn m7b_190_a_primary_recovered_and_not_retired_keeps_its_keepalive() {
+    use ReplicaRole::{Primary, RegularSecondary, Shadow};
+    let mut module = a_b_c();
+    assert_eq!(step_at(&mut module, 0, &admission(false)), round(1, 0));
+    let keep = on(
+        A,
+        recovered(
+            15,
+            d(15),
+            pinned([Primary, RegularSecondary, RegularSecondary, Shadow]),
+        ),
+    );
+    let effects = step(&mut module, &keep);
+    assert!(
+        !effects
+            .iter()
+            .any(|kind| matches!(kind, EffectKind::Timer(TimerEffect::Cancel { .. }))),
+        "{effects:?}"
+    );
+    assert!(!module.primary(A, P).expect("A").tracker().retired());
+    assert_eq!(keepalive_of(&module), Some(TimerVersion(1)));
+    let next = step_at(&mut module, 100, &fired(1, 100));
+    assert_eq!(next, round(2, 100));
+}
+
+/// M7B-201 (lead ruling B-R67c at a recovery source; tester-kb-r1 re-gate M3). C's ACK for
+/// record 13 is late, not lost: the second fire re-sends record 13, then the late ACK moves the
+/// source to 14, then C answers the re-send with `AlreadyHave` and a second ACK for 13. That
+/// ACK is a repeat and sends nothing, so record 14 goes out once, and C still reaches 15.
+#[retcd_test]
+fn m7b_201_a_source_sends_nothing_for_a_repeat_ack_and_never_doubles_its_walk() {
+    let mut module = b_and_c(12);
+    let first = step_at(&mut module, 0, &catch_up(1, 2, 15, b_credential()));
+    assert_eq!(first, vec![recovery_send(15, 15), retransmit_arm(1, 100)]);
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![recovery_send(13, 13)]
+    );
+    delivered_to_c_reply_lost(&mut module, 13);
+    step_at(&mut module, 100, &retransmit_fired_on(B, 1, 100));
+    assert_eq!(
+        step_at(&mut module, 200, &retransmit_fired_on(B, 2, 200)),
+        vec![recovery_send(13, 13), retransmit_arm(3, 300)]
+    );
+    assert_eq!(
+        step(
+            &mut module,
+            &reply_from(label(C), &AppendOutcome::Accepted(c_ack(13)))
+        ),
+        vec![recovery_send(14, 14)],
+        "the late ACK"
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(13, 13)),
+        vec![
+            ignored(KernelIgnoredReason::Replica(ReplicaIgnoreReason::Recorded)),
+            ignored(KernelIgnoredReason::Replica(ReplicaIgnoreReason::Recorded)),
+        ],
+        "the re-send's AlreadyHave and its repeat ACK"
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(14, 14)),
+        vec![recovery_send(15, 15)]
+    );
+    assert_eq!(
+        serve(&mut module, &recovery_send(15, 15)),
+        vec![caught_up_c()]
+    );
+    assert!(module.source(B, P, CopyId(2)).is_none());
 }

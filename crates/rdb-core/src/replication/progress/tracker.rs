@@ -49,6 +49,21 @@ pub struct CopyProgress {
     pub role: ReplicaRole,
     /// Its watermarks as its last admitted ACK stated them. Zero until it proves otherwise.
     pub progress: ReplicaProgress,
+    /// The position a `Recovered` barrier's `DurableAt` proof established for this incarnation
+    /// of the copy: the cutoff on all three watermarks when the barrier requires the copy, zero
+    /// otherwise (lead rulings B-R67e and B-R67f). Each `Recovered` restates it, replacing the
+    /// last, and a restarted copy starts again at zero.
+    ///
+    /// Read **only** by the repeat judgment ([`ProgressTracker::known`]). No watermark, view,
+    /// predicate, qualification, lag or `PeerProgress` ever reads it: those move only on an
+    /// admitted ACK. It exists because a `Recovered` drops the cursor and zeroes the watermarks
+    /// that would have recognised a duplicate ACK from before it.
+    ///
+    /// Why recording an ACK below it is safe: the proof already establishes that the copy holds
+    /// the cutoff durably, on this history, so an ACK at or below it claims nothing the proof has
+    /// not established, and recording it cannot hide a divergence. An ACK above it is not a
+    /// repeat and still reaches the ladder, and one at it is checked against the ladder's rung.
+    proved: ReplicaProgress,
 }
 
 impl CopyProgress {
@@ -59,6 +74,7 @@ impl CopyProgress {
             boot: member.boot,
             role: member.role,
             progress: ReplicaProgress::EMPTY,
+            proved: ReplicaProgress::EMPTY,
         }
     }
 }
@@ -221,6 +237,11 @@ impl ProgressTracker {
     #[must_use]
     pub fn peer(&self, copy: CopyId) -> Option<&CopyProgress> {
         self.peers.get(&copy)
+    }
+
+    /// Every copy any active predicate names, the primary's own included, in copy order.
+    pub fn peers(&self) -> impl Iterator<Item = (CopyId, &CopyProgress)> {
+        self.peers.iter().map(|(copy, peer)| (*copy, peer))
     }
 
     /// Whether `copy` was proved to hold another history.
@@ -394,8 +415,76 @@ impl ProgressTracker {
         Ok((copy, peer))
     }
 
+    /// Lead ruling B-R67c: the copy `ack` speaks for when rules 1–7 admit it — the authenticated
+    /// node, the lineage (generation and epoch), configuration, role and boot this copy is held to
+    /// now, and ordered progress — without asking rule 8 or rule 9. `None` otherwise. Routing asks
+    /// this before it asks whether `ack` repeats what the copy's cursor already took: a repeat is
+    /// a repeat only in the same copy, boot and generation.
+    #[must_use]
+    pub fn identify(&self, from: &PeerLabel, ack: &AppendAck) -> Option<CopyId> {
+        self.rules_one_to_seven(from, ack)
+            .ok()
+            .map(|(copy, _)| copy)
+    }
+
+    /// Lead ruling B-R67d: an ACK that repeats a catch-up cursor's high-water mark exactly — a
+    /// liveness report, as the keepalive's ACK is by design (B-R60). It runs rules 1–9 as a first
+    /// ACK at that position would, and one they admit advances its copy and emits
+    /// `PeerProgress`. Anything else answers `Recorded` and changes nothing: a repeat never
+    /// escalates, and one the ladder cannot verify, below a recovery cutoff, stays unverified
+    /// (lead ruling B-R58c).
+    pub fn on_repeat_at_mark(
+        &mut self,
+        from: &PeerLabel,
+        ack: &AppendAck,
+        tick: Tick,
+    ) -> Vec<EffectKind> {
+        let at = Seq(ack.progress.buffered_applied.0);
+        match self.admit(from, ack) {
+            Ok(copy) if self.history.lookup(at, ack.digest_at_buffered) == DigestLookup::Match => {
+                self.advance(copy, ack.progress, tick)
+            }
+            _ => vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::Recorded,
+            ))],
+        }
+    }
+
+    /// The most the tracker knows `copy` holds, for the repeat judgment only (lead rulings
+    /// B-R67e and B-R67f): each watermark the higher of what its last admitted ACK stated and
+    /// its proved floor. `None` for a copy no active predicate names.
+    #[must_use]
+    pub fn known(&self, copy: CopyId) -> Option<ReplicaProgress> {
+        self.peers.get(&copy).map(|peer| ReplicaProgress {
+            received: peer.progress.received.max(peer.proved.received),
+            buffered_applied: peer
+                .progress
+                .buffered_applied
+                .max(peer.proved.buffered_applied),
+            durable: peer.progress.durable.max(peer.proved.durable),
+        })
+    }
+
     /// Rules 1–8, in order; the first failure wins.
     fn admit(&self, from: &PeerLabel, ack: &AppendAck) -> Result<CopyId, AckRejectReason> {
+        let (copy, held) = self.rules_one_to_seven(from, ack)?;
+        // Rule 8: no watermark retreats.
+        let new = ack.progress;
+        if new.received < held.received
+            || new.buffered_applied < held.buffered_applied
+            || new.durable < held.durable
+        {
+            return Err(AckRejectReason::RegressedProgress);
+        }
+        Ok(copy)
+    }
+
+    /// Rules 1–7, in order; the first failure wins. Names the copy and the progress it holds.
+    fn rules_one_to_seven(
+        &self,
+        from: &PeerLabel,
+        ack: &AppendAck,
+    ) -> Result<(CopyId, ReplicaProgress), AckRejectReason> {
         use AckRejectReason as Reason;
         // Rule 1: the authenticated peer is the node the ACK speaks for, and a copy we track.
         if !from.authenticated || ack.from != from.node {
@@ -432,15 +521,7 @@ impl ProgressTracker {
         if !ordered(&ack.progress) || (inflated && !ahead) {
             return Err(Reason::InconsistentProgress);
         }
-        // Rule 8: no watermark retreats.
-        let (new, held) = (ack.progress, peer.progress);
-        if new.received < held.received
-            || new.buffered_applied < held.buffered_applied
-            || new.durable < held.durable
-        {
-            return Err(Reason::RegressedProgress);
-        }
-        Ok(copy)
+        Ok((copy, peer.progress))
     }
 
     /// All nine rules passed: record the watermarks and report what they changed.
@@ -630,7 +711,9 @@ impl ProgressTracker {
     }
 
     /// The tracker an accepted `result` installs: this copy's own ladder and watermarks cut at
-    /// the cutoff, every other copy at zero, one predicate, nothing diverged.
+    /// the cutoff, every other copy at zero, one predicate, nothing diverged. Each other copy the
+    /// barrier requires gets its proved floor at the cutoff, which only the repeat judgment reads
+    /// (lead ruling B-R67f).
     fn rebuilt(&self, result: &RecoveryResult) -> Self {
         let config = &result.committed.pinned_config;
         let cutoff = result.selected.cutoff_seq;
@@ -650,6 +733,17 @@ impl ProgressTracker {
         };
         let mut rebuilt = Self::seeded(config.clone(), self.own, lineage, history, local);
         rebuilt.adopt_view(&result.committed.authority_view);
+        let barrier = &result.barrier;
+        let floor = ReplicaProgress {
+            received: ReceivedSeq(barrier.cutoff().0),
+            buffered_applied: AppliedSeq(barrier.cutoff().0),
+            durable: DurableSeq(barrier.cutoff().0),
+        };
+        for copy in barrier.required() {
+            if let Some(peer) = rebuilt.peers.get_mut(copy).filter(|_| *copy != self.own) {
+                peer.proved = floor;
+            }
+        }
         rebuilt
     }
 

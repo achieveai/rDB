@@ -30,7 +30,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent};
+use bytes::Bytes;
+use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent, FenceCredential, Lineage};
 use rdb_core::contracts::errors::RdbError;
 use rdb_core::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName,
@@ -58,7 +59,7 @@ use rdb_core::{
     authority::Authority,
     publication::{Publication, ReplicationView},
     recovery::{Recovery, RecoveryPhase},
-    replication::Replication,
+    replication::{wire, Replication},
     transaction::Transaction,
 };
 
@@ -171,6 +172,9 @@ pub struct Dispatcher {
     /// scenario's "inspect survivors" operation (spike §6), read by F1's `QueryInventory` and
     /// `SyncWalThrough` providers.
     survivors: BTreeMap<(PartitionId, CopyId), (NodeId, SurvivorInventory)>,
+    /// Each recovery catch-up routed to a source, by `(partition, target copy, source node)`:
+    /// the F1 that asked, which is where the source's `CopyCaughtUp` goes (B-R59 surface item 4).
+    catch_ups: BTreeMap<(PartitionId, CopyId, NodeId), (NodeId, PartitionId, CorrelationId)>,
     /// The last `RecoveryResult` each F1 emitted, by the emitter's `(node, partition)`: what a
     /// post-commit `SyncWalThrough` is served from (lead ruling B-R55 item 3, M7B-137). After
     /// commit the copies are the pinned configuration's and the cutoff lives in the new
@@ -272,6 +276,7 @@ impl Dispatcher {
             routed: BTreeSet::new(),
             addressed: BTreeMap::new(),
             survivors: BTreeMap::new(),
+            catch_ups: BTreeMap::new(),
             committed: BTreeMap::new(),
             transfer_plans: BTreeMap::new(),
             transfers: BTreeMap::new(),
@@ -759,7 +764,41 @@ impl Dispatcher {
                 return self.publication.step_with(&ctx, event, Some(view));
             }
         }
-        self.module_mut(module).step(&ctx, event)
+        if module != ModuleName::Replication {
+            return self.module_mut(module).step(&ctx, event);
+        }
+        // The catch-ups this step may end: the one it starts, and each already running here.
+        let (node, partition) = (event.node, event.partition);
+        let mut watched: Vec<CopyId> = self
+            .catch_ups
+            .keys()
+            .filter(|(p, copy, n)| {
+                (*p, *n) == (partition, node)
+                    && self.replication.source(node, partition, *copy).is_some()
+            })
+            .map(|(_, copy, _)| *copy)
+            .collect();
+        if let EventKind::Kernel(KernelEvent::CatchUp { to, .. }) = &event.kind {
+            watched.push(*to);
+        }
+        let effects = self.module_mut(module).step(&ctx, event)?;
+        // A catch-up with no source after the step and no `CopyCaughtUp` among its effects will
+        // never be answered: R1 refused to start it (tester-kb-r1 A4, S2), or its cursor stopped
+        // or R1 dropped it (A3). Forget its asker, or a later `CopyCaughtUp` from this node would
+        // go to a stale F1. One that did report keeps its asker until that report is carried out.
+        for copy in watched {
+            let reported = effects.iter().any(|effect| {
+                matches!(
+                    effect.kind,
+                    EffectKind::Kernel(KernelEffect::CopyCaughtUp { copy: caught, .. })
+                        if caught == copy
+                )
+            });
+            if !reported && self.replication.source(node, partition, copy).is_none() {
+                self.catch_ups.remove(&(partition, copy, node));
+            }
+        }
+        Ok(effects)
     }
 
     /// Carry out `effects`, in order, on behalf of `node` at `boot`.
@@ -800,6 +839,13 @@ impl Dispatcher {
     ///   * **Routed**: every arm [`route::event_for`] maps. The event is scheduled at the same
     ///     tick on the same node, partition and correlation, and marked routed, so the run loop
     ///     holds its named consumers to an answer (see [`crate::harness::route`]).
+    ///     Two exceptions pick another node (B-R59): F1's `CatchUp` and `CatchUpBeforeGrant` go,
+    ///     as [`KernelEvent::CatchUp`], to the node the scenario placed the source copy on; and a
+    ///     source's `CopyCaughtUp` goes back to the node of the F1 that asked for it.
+    ///   * **Served**: R1's `SendEnvelopes` (B-R57) and `SendRecoveryEnvelopes` (B-R59) become
+    ///     frames read from the emitting node's own verified history; the recovery form wraps
+    ///     each record with `wire::encode_recovery_append` and signs `Frame.sender` with the
+    ///     credential's prior generation and owner epoch.
     ///   * **Refused by name**: F1's requests with no provider under
     ///     `harness::dispatch::deliver::recovery`, and every arm with no consumer under
     ///     `harness::dispatch::deliver::kernel`.
@@ -1038,7 +1084,7 @@ impl Dispatcher {
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 Some(KernelNote::AuthorityFact { fact: fact.clone() })
             }
-            // Kept in the trace **and** routed to T1 below (lead rulings B-R42, A-R62).
+            // Kept in the trace **and** routed to T1 and R1 below (rulings B-R42, A-R62, B-R60).
             KernelEffect::SetAdmission(state) => Some(KernelNote::SetAdmission {
                 state: state.clone(),
             }),
@@ -1086,6 +1132,38 @@ impl Dispatcher {
                 through,
             } => {
                 return self.send_envelopes(node, *copy, (*first, *through), site, scheduler);
+            }
+            KernelEffect::SendRecoveryEnvelopes {
+                copy,
+                from: first,
+                through,
+                credential,
+            } => {
+                return self.send_recovery_envelopes(
+                    node,
+                    *copy,
+                    (*first, *through),
+                    credential,
+                    site,
+                    scheduler,
+                );
+            }
+            // A source's catch-up is F1's, and F1 may run on another node: its answer goes back
+            // there (B-R59 surface item 4). A primary's goes to F1 on its own node, below.
+            KernelEffect::CopyCaughtUp { copy, head, digest } => {
+                if let Some(asker) = self.catch_ups.remove(&(site.1, *copy, node)) {
+                    let kind =
+                        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp {
+                            copy: *copy,
+                            head: *head,
+                            digest: *digest,
+                        }));
+                    let now = scheduler.now();
+                    let id = self.schedule(scheduler, now, asker, kind)?;
+                    self.routed.insert(id);
+                    return Ok(());
+                }
+                None
             }
             _ => None,
         };
@@ -1168,52 +1246,140 @@ impl Dispatcher {
             .find(|member| member.copy == copy)
             .map(|member| member.node)
             .ok_or(SimError::Config { field: "copy" })?;
-        let boot = self.boots.get(&node).copied().unwrap_or_default();
         for seq in first.0..=through.0 {
-            let seq = Seq(seq);
-            let stored = self
-                .engines
-                .get(&node)
-                .and_then(|engine| engine.history_at(partition, generation, seq));
-            let Some((record, progress)) = stored else {
-                tracing::warn!(
-                    node = node.0,
-                    partition = partition.0,
-                    generation = generation.0,
-                    seq = seq.0,
-                    "send_envelopes: no record at this sequence; nothing sent"
-                );
+            let Some(record) = self.stored_record(node, partition, generation, Seq(seq)) else {
                 return Ok(());
             };
-            if let Err(fault) =
-                crate::storage::history::verified_record(seq, &record, progress.as_ref())
-            {
-                tracing::warn!(
-                    node = node.0,
-                    partition = partition.0,
-                    generation = generation.0,
-                    seq = seq.0,
-                    ?fault,
-                    "send_envelopes: stored record failed its check; nothing sent"
-                );
-                return Ok(());
-            }
-            let frame = Frame {
-                id: rdb_core::contracts::ids::MessageId(self.next_frame),
-                protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
-                config,
-                sender,
-                body: record,
-            };
-            self.next_frame = self.next_frame.wrapping_add(1).max(1);
-            self.send(node, boot, to, &frame, site, scheduler)?;
+            self.send_body(node, to, (config, sender), record, site, scheduler)?;
         }
         Ok(())
     }
 
+    /// R1's `SendRecoveryEnvelopes` (lead rulings B-R59, B-R59a): the recovery source on `node`
+    /// sends records `from..=through` of its own log to `copy`, each as a `RecoveryAppend`
+    /// carrying F1's `credential` byte for byte.
+    ///
+    /// The same read as [`Self::send_envelopes`] — [`MemoryEngine::history_at`], checked, never
+    /// fabricated, nothing sent past a gap — in the lineage the source's receiver holds. Only
+    /// the wrapping differs: the body is [`wire::encode_recovery_append`] over the stored bytes,
+    /// and [`Frame::sender`] is the lineage the credential fences (its partition, prior
+    /// generation and prior owner epoch), which is what the target's rows 5R, 6R and 6R′ check.
+    /// The target's node is the receiver's configuration's node for `copy`. Its replies come
+    /// back to `node` as ordinary reply frames, and R1 routes them to the source.
+    ///
+    /// # Errors
+    ///
+    /// `harness::dispatch::deliver::crash` when `node` is down. [`SimError::Config`] naming
+    /// `send_recovery_envelopes` when no receiver is hosted for `(node, partition)` (R1 emits the
+    /// effect from one, so this is a harness fault); [`SimError::Config`] naming `copy` when its
+    /// configuration has no such copy; whatever [`Self::send`] returns.
+    fn send_recovery_envelopes(
+        &mut self,
+        node: NodeId,
+        copy: CopyId,
+        (first, through): (Seq, Seq),
+        credential: &FenceCredential,
+        site: (NodeId, PartitionId, CorrelationId),
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        self.crash_check(node)?;
+        let partition = site.1;
+        let Some(receiver) = self.replication.receiver(node, partition) else {
+            return Err(SimError::Config {
+                field: "send_recovery_envelopes",
+            });
+        };
+        let generation = receiver.lineage().generation;
+        let config = receiver.config().config_version;
+        let to = receiver
+            .config()
+            .members
+            .iter()
+            .find(|member| member.copy == copy)
+            .map(|member| member.node)
+            .ok_or(SimError::Config { field: "copy" })?;
+        let sender = Lineage {
+            partition: credential.partition,
+            generation: credential.prior_generation,
+            owner_epoch: credential.prior_owner_epoch,
+        };
+        for seq in first.0..=through.0 {
+            let Some(record) = self.stored_record(node, partition, generation, Seq(seq)) else {
+                return Ok(());
+            };
+            let body = wire::encode_recovery_append(credential, &record);
+            self.send_body(node, to, (config, sender), body, site, scheduler)?;
+        }
+        Ok(())
+    }
+
+    /// The checked record `node`'s engine shows at `seq` of `generation`, or `None` with a `warn`
+    /// naming node, partition, generation and sequence: a record the engine does not show, or
+    /// one that fails [`crate::storage::history::verified_record`], is never sent.
+    fn stored_record(
+        &self,
+        node: NodeId,
+        partition: PartitionId,
+        generation: Generation,
+        seq: Seq,
+    ) -> Option<Bytes> {
+        let stored = self
+            .engines
+            .get(&node)
+            .and_then(|engine| engine.history_at(partition, generation, seq));
+        let Some((record, progress)) = stored else {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                seq = seq.0,
+                "send: no record at this sequence; nothing sent"
+            );
+            return None;
+        };
+        if let Err(fault) =
+            crate::storage::history::verified_record(seq, &record, progress.as_ref())
+        {
+            tracing::warn!(
+                node = node.0,
+                partition = partition.0,
+                generation = generation.0,
+                seq = seq.0,
+                ?fault,
+                "send: stored record failed its check; nothing sent"
+            );
+            return None;
+        }
+        Some(record)
+    }
+
+    /// Frame `body` under `(config, sender)` with the next frame id and hand it to the network,
+    /// from `node` under its current boot, to `to`.
+    fn send_body(
+        &mut self,
+        node: NodeId,
+        to: NodeId,
+        (config, sender): (ConfigVersion, Lineage),
+        body: Bytes,
+        site: (NodeId, PartitionId, CorrelationId),
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        let boot = self.boots.get(&node).copied().unwrap_or_default();
+        let frame = Frame {
+            id: rdb_core::contracts::ids::MessageId(self.next_frame),
+            protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
+            config,
+            sender,
+            body,
+        };
+        self.next_frame = self.next_frame.wrapping_add(1).max(1);
+        self.send(node, boot, to, &frame, site, scheduler)
+    }
+
     /// One of F1's outputs (lead ruling A-R64). The six facts are recorded, by an enumerated
-    /// match. Of the seven requests to the environment, `QueryInventory` and `SyncWalThrough`
-    /// have providers ([`Self::query_inventory`], [`Self::sync_wal_through`]); the other five are
+    /// match. Of the seven requests to the environment, four have providers: `QueryInventory`
+    /// ([`Self::query_inventory`]), `SyncWalThrough` ([`Self::sync_wal_through`]), and `CatchUp`
+    /// and `CatchUpBeforeGrant` ([`Self::catch_up`], rulings B-R59, B-R59a). The other three are
     /// refused by name until each has one.
     fn recovery_effect(
         &mut self,
@@ -1245,9 +1411,19 @@ impl Dispatcher {
             RecoveryEffect::SyncWalThrough { copy, cutoff } => {
                 self.sync_wal_through(*copy, *cutoff, site, scheduler)
             }
+            RecoveryEffect::CatchUp {
+                from: source,
+                to,
+                through,
+                credential,
+            }
+            | RecoveryEffect::CatchUpBeforeGrant {
+                from: source,
+                to,
+                through,
+                credential,
+            } => self.catch_up(*source, *to, *through, *credential, site, scheduler),
             RecoveryEffect::ProbeDigestAt { .. }
-            | RecoveryEffect::CatchUp { .. }
-            | RecoveryEffect::CatchUpBeforeGrant { .. }
             | RecoveryEffect::QuarantineSuffix { .. }
             | RecoveryEffect::RebuildFromAuthoritative { .. } => Err(SimError::unavailable(
                 "harness::dispatch::deliver::recovery",
@@ -1280,6 +1456,51 @@ impl Dispatcher {
             }
             self.answer_inventory(*copy, site, now, scheduler)?;
         }
+        Ok(())
+    }
+
+    /// F1's `CatchUp` or `CatchUpBeforeGrant` (lead rulings B-R59, B-R59a): routed, as
+    /// [`KernelEvent::CatchUp`] with the same four fields, to the node holding `source`, where R1
+    /// starts a source-side cursor — or refuses, by its own rules, when that node serves no such
+    /// copy. The holder is the one the scenario placed for `source`, the same map F1's
+    /// `QueryInventory` was answered from, so F1 can only name a copy placed there. The asking F1
+    /// is remembered, so the source's `CopyCaughtUp` goes back to it.
+    ///
+    /// # Errors
+    ///
+    /// `harness::dispatch::deliver::recovery` when no holder was placed for `source`: F1 selected
+    /// a copy this harness never answered for, so there is nowhere honest to send it.
+    fn catch_up(
+        &mut self,
+        source: CopyId,
+        to: CopyId,
+        through: Seq,
+        credential: FenceCredential,
+        site: (NodeId, PartitionId, CorrelationId),
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        let partition = site.1;
+        let Some(&(holder, _)) = self.survivors.get(&(partition, source)) else {
+            return Err(SimError::unavailable(
+                "harness::dispatch::deliver::recovery",
+            ));
+        };
+        // Under the holder's registered boot: a source may have delivered nothing yet, so
+        // `boots` may have no entry for it (as for the members' `Recovered` fan-out).
+        let boot = *self
+            .members
+            .get(&holder)
+            .ok_or(SimError::Config { field: "member" })?;
+        self.catch_ups.insert((partition, to, holder), site);
+        let kind = EventKind::Kernel(KernelEvent::CatchUp {
+            from: source,
+            to,
+            through,
+            credential,
+        });
+        let now = scheduler.now();
+        let id = Self::schedule_on(scheduler, now, holder, boot, partition, site.2, kind)?;
+        self.routed.insert(id);
         Ok(())
     }
 
@@ -2238,7 +2459,7 @@ mod tests {
             scheduler.queued(),
             1,
             "a note asks the environment for nothing; the one event is SetAdmission's, which is \
-             also routed to T1 (A-R62)"
+             also routed to T1 and R1 (A-R62, B-R60)"
         );
     }
 

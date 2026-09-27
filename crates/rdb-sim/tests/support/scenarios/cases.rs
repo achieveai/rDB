@@ -34,6 +34,34 @@ pub const C_ADVERTISED: u64 = 150;
 pub const PLAN_AT: u64 = 2;
 /// The F1/R1 case: the tick C goes silent.
 pub const C_STOPS_AT: u64 = 3_000;
+/// The F1/R1 case: its deadline.
+pub const F1_R1_MAX_TICKS: u64 = 12_000;
+/// The F1/R1 case: the tick discovery closes and L1 pauses. The fence lands at `PLAN_AT + 1` and
+/// C's transfer extends the 2 s window once, so the close is fence + 4 s.
+pub const F1_R1_PAUSED_AT: u64 = PLAN_AT + 1 + 4_000;
+/// The F1/R1 case: pops that are not the steady rate, measured 2026-09-26 on joint-b60b (B-R60 on)
+/// as `events_consumed - rate x (deadline - F1_R1_PAUSED_AT)`, 634.4 from both a 12 000- and a
+/// 24 000-tick run. About 13 pops before the close and ~620 at close + 10, where R1 walks C and A
+/// up from the root (one record per ACK below the cutoff, B-R58c) and F1 rebuilds and activates.
+pub const F1_R1_BASE_POPS: u64 = 635;
+/// The window [`F1_R1_STEADY_POPS_PER_WINDOW`] is counted over.
+pub const F1_R1_RATE_WINDOW: u64 = 2_000;
+/// The F1/R1 case: pops per [`F1_R1_RATE_WINDOW`] ticks once the walk has settled, the most any
+/// window held in both measured runs (260 in all but one, 261 in one). L1 stays `Paused` for
+/// good here (C stops, A is dead), so this is R1's keepalive (one round per 100 ms, B-R60) plus
+/// H1's health cadence (every 50 ms), forever: ruling B-R65 bounds the rate, not the time.
+pub const F1_R1_STEADY_POPS_PER_WINDOW: u64 = 261;
+
+/// The F1/R1 case's event budget for a deadline of `max_ticks`: base plus the steady rate over
+/// the paused span, times 1.5, rounded up (ruling B-R65: a function of the deadline, never flat).
+#[must_use]
+pub const fn f1_r1_max_events(max_ticks: u64) -> u32 {
+    let paused = max_ticks.saturating_sub(F1_R1_PAUSED_AT);
+    let scaled = F1_R1_BASE_POPS * F1_R1_RATE_WINDOW + F1_R1_STEADY_POPS_PER_WINDOW * paused;
+    let budget = (scaled * 3).div_ceil(2 * F1_R1_RATE_WINDOW);
+    assert!(budget <= u32::MAX as u64, "an F1/R1 budget fits a u32");
+    budget as u32
+}
 
 /// Three nodes, one RF3 partition: B primary, C and A regular secondaries.
 #[must_use]
@@ -86,17 +114,11 @@ pub fn case_f1_r1_discovery_window() -> Scenario {
     authored(
         "case_f1_r1_discovery_window",
         Budget {
-            // Popped events, measured at 796 on 2026-09-26 (B-R58b on), 1.5x rounded up:
-            // - ~620 at the close tick + 10: R1 walks C and A up from the root, one record per
-            //   ACK below the cutoff (B-R58c), about 3 pops per record over B_HEAD records each,
-            //   then F1's rebuild and activation. Hops are zero ticks, so all of it lands there.
-            // - ~160 health evaluations: L1 stays Paused, and H1 evaluates it every 50 ms from
-            //   the close (4003) to max_ticks.
-            // - ~16 for placement, fence, discovery and the transfer steps.
-            // The walk scales with B_HEAD and the cadence with max_ticks; change either and
-            // re-measure. The row asserts the run reaches max_ticks, so an overrun is a red.
-            max_events: 1_200,
-            max_ticks: 12_000,
+            // A function of the deadline (ruling B-R65): the base scales with B_HEAD and the
+            // steady rate with the keepalive and health cadences; change any of them and
+            // re-measure both. Row m7v_47 asserts the rate by name, before the budget.
+            max_events: f1_r1_max_events(F1_R1_MAX_TICKS),
+            max_ticks: F1_R1_MAX_TICKS,
         },
         vec![
             ScenarioOp::Recovery(RecoveryOp::Synchronize {
@@ -121,7 +143,7 @@ pub fn case_f1_r1_discovery_window() -> Scenario {
             }),
             ScenarioOp::Time(TimeOp::Pause {
                 node: C_NODE,
-                ticks: 12_000 - C_STOPS_AT,
+                ticks: F1_R1_MAX_TICKS - C_STOPS_AT,
             }),
         ],
     )

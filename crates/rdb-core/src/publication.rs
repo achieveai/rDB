@@ -51,7 +51,7 @@ use crate::contracts::time::TimerEffect;
 use crate::contracts::trace::{CapabilityState, ReadServiceOutcome, Version};
 
 /// The first [`TimerId`] P1 owns. P1 arms one timer per partition, at `base + partition`.
-pub const PUBLICATION_TIMER_BASE: u64 = 0x00D1_0000;
+pub const PUBLICATION_TIMER_BASE: u64 = 0x00D1 << 48;
 
 /// The post-apply deadline timer for `partition`.
 #[must_use]

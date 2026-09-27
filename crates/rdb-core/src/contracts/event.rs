@@ -26,7 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::authority::{
-    AuthorityEffect, AuthorityEvent, BlockReason, Checkpoint, EvidenceRef, Lineage,
+    AuthorityEffect, AuthorityEvent, BlockReason, Checkpoint, EvidenceRef, FenceCredential, Lineage,
 };
 use crate::contracts::control::{ControlEffect, ControlEvent};
 use crate::contracts::digest::Digest;
@@ -351,6 +351,21 @@ pub enum KernelEvent {
         /// The quarantined copy.
         copy: CopyId,
     },
+    /// F1 asks the copy holding the selected prefix to send it (team kernel-b `design.md` §5.6,
+    /// §3.2a; lead rulings B-R59, B-R59a). The routed twin of `RecoveryEffect::CatchUp` and
+    /// `RecoveryEffect::CatchUpBeforeGrant`, delivered to the node of `from`, where R1 starts a
+    /// source-side catch-up cursor. Fields mirror the effect's name for name.
+    CatchUp {
+        /// The copy holding the prefix, which sends it: a `CopyId`, not a sequence (unlike
+        /// [`KernelEffect::SendRecoveryEnvelopes`]'s).
+        from: CopyId,
+        /// The copy to catch up: a `CopyId`.
+        to: CopyId,
+        /// Catch up through this position: a `Seq`.
+        through: Seq,
+        /// Minted with `sender == from` (K-B-42).
+        credential: FenceCredential,
+    },
     /// T1's applied candidate (team kernel-a `design.md` §1.3). Delivered to P1 only. The
     /// twin is [`KernelEffect::AppliedCandidate`].
     ///
@@ -549,6 +564,26 @@ pub enum KernelEffect {
         from: Seq,
         /// The last sequence to send, inclusive.
         through: Seq,
+    },
+    /// Recovery catch-up from the copy that holds the selected prefix (team kernel-b
+    /// `design.md` §3.2a, §5.6; lead rulings B-R59, B-R59a): the host reads the canonical
+    /// envelopes `from..=through` from **this node's own** log and unicasts each to `copy` as a
+    /// `RecoveryAppend` carrying `credential`, byte for byte. R1 holds no record bytes and never
+    /// mints a credential: this one is F1's, passed through unchanged. `from == through` in M7.
+    ///
+    /// Emitted only by the source-side cursor that a routed [`KernelEvent::CatchUp`] starts,
+    /// never by a primary. It is a separate arm from [`Self::SendEnvelopes`] so that a
+    /// credentialed recovery send and a primary's catch-up send are never confusable in a trace
+    /// or a match.
+    SendRecoveryEnvelopes {
+        /// The copy being caught up: a `CopyId`.
+        copy: CopyId,
+        /// The first sequence to send: a `Seq`, not a copy (unlike [`KernelEvent::CatchUp`]'s).
+        from: Seq,
+        /// The last sequence to send, inclusive: a `Seq`.
+        through: Seq,
+        /// F1's credential for this transfer, minted with `sender` = this node's copy (K-B-42).
+        credential: FenceCredential,
     },
     /// The copy answered `NeedLineage`, `NeedConfig` or `UnknownEpoch`: it has seen control this
     /// primary has not, so the cursor stopped (§3.6; lead ruling B-R40).

@@ -13,6 +13,8 @@
 //! `min_regular_acks` 1. Every copy's boot is its node number. The primary has applied 12 and
 //! synced 12, and vouches for 5..=12. B and C have proved nothing yet.
 
+use std::collections::{BTreeMap, VecDeque};
+
 use config_log::retcd_test;
 
 use bytes::Bytes;
@@ -32,10 +34,11 @@ use rdb_core::contracts::ids::{
     AppliedSeq, AuthorityGeneration, BootId, ClientId, ConfigVersion, CorrelationId, DurableSeq,
     EventId, FlushTicket, Generation, GrantId, MessageId, NodeId, OwnerEpoch, PartitionId,
     ReceivedSeq, ReplicaRole, RequestId, RequestIdentity, Revision, Seq, SnapshotHandle, TenantId,
-    TimerVersion,
+    TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
+use rdb_core::contracts::protection::{AdmissionState, ReplicationLag};
 use rdb_core::contracts::qualification::{
     QualificationCause, QualificationChanged, QualificationDirection,
 };
@@ -45,7 +48,7 @@ use rdb_core::contracts::recovery::{
     SelectedLineage, SurvivorInventory,
 };
 use rdb_core::contracts::storage::{DurablePrefix, Namespace, SnapshotRead, StorageEvent};
-use rdb_core::contracts::time::{ControlTime, Tick, TimerFired};
+use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{AckRejectReason, Version};
 use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
 use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
@@ -54,8 +57,10 @@ use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
 use rdb_core::publication::{AppliedCandidate, PubConfig, PubEffect, PubEvent, PubKernel};
 use rdb_core::recovery::{Recovery, RecoveryPhase, DISCOVERY_TIMER};
 use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
-use rdb_core::replication::catchup::{CatchupCursor, MAX_PROBE_ROUNDS};
-use rdb_core::replication::primary::Primary as PrimarySide;
+use rdb_core::replication::catchup::{
+    retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS, RETRANSMIT_MS,
+};
+use rdb_core::replication::primary::{keepalive_timer, Primary as PrimarySide};
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{decode_reply, encode_reply};
 use rdb_core::replication::Replication;
@@ -2150,7 +2155,7 @@ fn catching_up_b() -> Replication {
     let mut module = routed();
     assert_eq!(
         route(&mut module, reply(B, &need_prefix(10))),
-        vec![send(COPY_B, 11)]
+        vec![send(COPY_B, 11), retransmit_arm(1)]
     );
     assert_eq!(
         primary_side(&module)
@@ -2261,7 +2266,7 @@ fn m7b_152_a_copy_that_falls_behind_catches_up_to_the_head_that_moved_under_it()
     route(&mut module, local_applied_event(HEAD + 4));
     assert_eq!(
         route(&mut module, reply(B, &need_prefix(HEAD))),
-        vec![send(COPY_B, HEAD + 1)]
+        vec![send(COPY_B, HEAD + 1), retransmit_arm(1)]
     );
     for seq in HEAD + 1..HEAD + 5 {
         if seq == HEAD + 3 {
@@ -2413,8 +2418,9 @@ fn m7b_151_recovered_answers_the_receiver_first_on_a_node_holding_both_halves() 
 /// Only an ACK the tracker admits reaches a running cursor. The cursor trusts what it is given,
 /// so a forged, diverged or otherwise dropped ACK must not move it.
 ///
-/// First, seven ACKs from B's own label, which `sender()` passes and the ladder drops, each
-/// claiming the progress that would close B's gap: B is at 12, the head at 16, 13 in flight.
+/// First, six ACKs from B's own label, which `sender()` passes and the ladder drops, each
+/// claiming the progress that would close B's gap, and one below what B holds, which is `Recorded`
+/// as a repeat (update B-R67f): B is at 12, the head at 16, 13 in flight.
 /// Each is answered with its drop reason alone and leaves the primary as it was. Handed to the
 /// cursor, the first would report `CopyCaughtUp` for B at 16 (tester probe p16, mutant P07).
 /// Then a forged label and a forked digest, which `sender()` refuses as well.
@@ -2427,7 +2433,7 @@ fn only_an_admitted_ack_reaches_a_running_cursor() {
     }
     assert_eq!(
         route(&mut module, reply(B, &need_prefix(HEAD))),
-        vec![send(COPY_B, HEAD + 1)]
+        vec![send(COPY_B, HEAD + 1), retransmit_arm(1)]
     );
     let closing = |change: &Change| {
         let mut ack = b(top, top, top);
@@ -2459,10 +2465,6 @@ fn only_an_admitted_ack_reaches_a_running_cursor() {
             closing(&move |ack| ack.progress = progress(top - 1, top, top - 1)),
             AckRejectReason::InconsistentProgress,
         ),
-        (
-            b(HEAD - 1, HEAD - 1, HEAD - 1),
-            AckRejectReason::RegressedProgress,
-        ),
     ] {
         let before = primary_side(&module).clone();
         assert_eq!(
@@ -2472,6 +2474,15 @@ fn only_an_admitted_ack_reaches_a_running_cursor() {
         );
         assert_eq!(*primary_side(&module), before, "{reason:?}");
     }
+    // Update (B-R67f): an ACK below what the tracker holds for B, with no mark on B's cursor,
+    // repeats what the primary knows. It is `Recorded` before rule 8 is asked, and it still
+    // reaches neither the cursor nor the tracker.
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&b(HEAD - 1, HEAD - 1, HEAD - 1))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(*primary_side(&module), before);
 
     let mut module = catching_up_b();
     let running = primary_side(&module).cursor(COPY_B).cloned();
@@ -3049,7 +3060,7 @@ fn b_mid_probe() -> (Replication, ProgressTracker) {
     );
     assert_eq!(
         route(&mut module, reply(B, &need_prefix(10))),
-        vec![send(COPY_B, 11)]
+        vec![send(COPY_B, 11), retransmit_arm(1)]
     );
     for _ in 0..3 {
         assert_eq!(
@@ -3549,7 +3560,7 @@ fn m7b_171_a_built_primary_walks_a_copy_that_holds_nothing_from_record_one() {
     );
     assert_eq!(
         route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT))),
-        vec![send(COPY_B, 1)]
+        vec![send(COPY_B, 1), retransmit_arm(1)]
     );
     assert_eq!(
         primary_side(&module)
@@ -3667,7 +3678,7 @@ fn walking_b_from_root() -> Replication {
     let mut module = built_at(3);
     assert_eq!(
         route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT))),
-        vec![send(COPY_B, 1)]
+        vec![send(COPY_B, 1), retransmit_arm(1)]
     );
     module
 }
@@ -3719,10 +3730,12 @@ fn m7b_173_an_in_flight_ack_below_the_cutoff_drives_the_cursor_and_moves_no_wate
     assert!(primary_side(&module).cursor(COPY_B).is_none());
 }
 
-/// M7B-174 (lead ruling B-R58c, rows 2–4). Outside the three bounds an unretained ACK gets
-/// today's answer, `[Ignored(AckRejected(Unverifiable)), SnapshotCatchupRequired]`: an ACK at a
-/// sequence other than the one in flight (ahead of it, or a repeat of the last), and an ACK
-/// with no cursor running. A wrong digest at the cutoff is divergence, and no watermark of B's
+/// M7B-174 (lead ruling B-R58c, rows 2–4, as amended by B-R67c). Outside the three bounds an
+/// unretained ACK gets today's answer, `[Ignored(AckRejected(Unverifiable)), SnapshotCatchupRequired]`:
+/// an ACK ahead of the one in flight, a repeat of the last with another digest, and an ACK with
+/// no cursor running. A repeat of the last with the digest the cursor accepted is not outside
+/// the bounds: it is `Recorded` and changes nothing (B-R67c; it answered a snapshot request
+/// before). A wrong digest at the cutoff is divergence, and no watermark of B's
 /// ever moved.
 #[retcd_test]
 fn m7b_174_an_unretained_ack_outside_the_in_flight_bounds_gets_todays_answer() {
@@ -3740,11 +3753,18 @@ fn m7b_174_an_unretained_ack_outside_the_in_flight_bounds_gets_todays_answer() {
         route(&mut module, accepted(&in_new_root(b(2, 2, 2)))),
         todays
     );
-    // A repeat of the ACK that already moved the cursor: 2 is in flight now.
+    // A repeat of the ACK that already moved the cursor, with another digest: 2 is in flight
+    // now. The matching repeat is `Recorded` and changes nothing (lead ruling B-R67c).
     let mut module = walking_b_from_root();
     route(&mut module, accepted(&in_new_root(b(1, 1, 1))));
+    let before = primary_side(&module).clone();
     assert_eq!(
         route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+    assert_eq!(
+        route(&mut module, accepted(&forked(in_new_root(b(1, 1, 1))))),
         todays
     );
 
@@ -4678,4 +4698,947 @@ fn m7b_144_copy_quarantined_reaches_the_tracker_and_stalls_rebuilding_loudly() {
     assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
     assert_eq!(log.iter().filter(|e| is_stall(e)).count(), 1);
     assert!(!log.iter().any(is_cas), "no activation CAS: {log:?}");
+}
+
+// --- Lead rulings B-R67, B-R67a: a lost catch-up ACK -----------------------------------------
+//
+// Joint-gate B1 (probe S3): one catch-up ACK lost below the cutoff stalled a rebuild for good,
+// because the cursor waited on it and the keepalive skips a copy with a record in flight. R1's
+// catch-up now re-sends: one retransmit timer per partition, every `RETRANSMIT_MS`, re-sending
+// a record the cursor sent and nobody ACKed when nothing moved the cursor since the last fire.
+// The rows below run R1 routed beside a real F1, with the test playing B's and C's receivers.
+
+/// `P`'s retransmit timer firing at `version`.
+fn retransmit_fired(version: u64) -> EventKind {
+    fired_at(retransmit_timer(P), TimerVersion(version))
+}
+
+fn fired_at(id: TimerId, version: TimerVersion) -> EventKind {
+    EventKind::Timer(TimerFired {
+        id,
+        version,
+        scheduled_at: T,
+    })
+}
+
+/// The retransmit arm a step at `T` makes.
+fn retransmit_arm(version: u64) -> EffectKind {
+    EffectKind::Timer(TimerEffect::Arm {
+        id: retransmit_timer(P),
+        version: TimerVersion(version),
+        at: T.plus_millis(RETRANSMIT_MS),
+    })
+}
+
+/// The version of the last arm of `id` in `effects`.
+fn last_arm(effects: &[EffectKind], id: TimerId) -> Option<TimerVersion> {
+    effects.iter().rev().find_map(|effect| match effect {
+        EffectKind::Timer(TimerEffect::Arm {
+            id: armed, version, ..
+        }) if *armed == id => Some(*version),
+        _ => None,
+    })
+}
+
+/// L1's `SetAdmission` as routed to R1.
+fn set_admission(allow: bool) -> EventKind {
+    EventKind::Kernel(KernelEvent::SetAdmission(AdmissionState {
+        allow,
+        reason: (!allow).then_some(ErrorKind::ProtectionPaused),
+        oldest_unsafe_age: 0,
+        oldest_unsafe_seq: Seq(HEAD),
+        replication_lag: ReplicationLag::millis(0),
+        stalest_copy: None,
+        lost_copies: vec![],
+        paused_prefix: Seq(HEAD),
+        resume_barrier: Seq(HEAD),
+        required_config_versions: vec![CONFIG],
+        outstanding_unsafe_bytes: 0,
+    }))
+}
+
+/// How C's ACK for record 2 is lost in [`rebuild_losing_one_ack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Loss {
+    /// C takes record 2, and its ACK never arrives.
+    Ack,
+    /// The network also duplicates record 2. C answers the copy `AlreadyHave`, which arrives,
+    /// and its ACK, which is lost as well. The cursor then has nothing outstanding (design
+    /// §3.6), and record 2 is still unACKed.
+    AfterAlreadyHave,
+    /// Nothing is lost: C's ACK for record 2 is late. It arrives after the retransmit re-sent
+    /// record 2, just before C's answers to that re-send (lead ruling B-R67c).
+    Delay,
+}
+
+/// B's and C's receivers as the test plays them: the head each holds, in F1's new root.
+struct Host {
+    result: RecoveryResult,
+    held: BTreeMap<NodeId, u64>,
+    loss: Loss,
+    lost: bool,
+    /// C's late ACK for record 2, under `Loss::Delay`, until the re-send it trails.
+    late: Option<EventKind>,
+}
+
+impl Host {
+    /// `node`'s ACK at `at`, in the recovered root and pin.
+    fn ack_at(&self, node: NodeId, at: u64) -> EventKind {
+        let mut ack = ack(node, RegularSecondary, at, at, at);
+        ack.generation = self.result.new_generation;
+        ack.owner_epoch = self.result.committed.authority_view.lineage.owner_epoch;
+        ack.config_version = self.result.committed.pinned_config.config_version;
+        accepted(&ack)
+    }
+
+    /// What the copy a bare send names answers it: a record it holds draws `AlreadyHave` and
+    /// its current ACK; the next record is taken and ACKed; a gap draws `NeedPrefix` from its
+    /// head. Any other effect draws nothing.
+    fn answer(&mut self, effect: &EffectKind) -> Vec<EventKind> {
+        let EffectKind::Kernel(KernelEffect::SendEnvelopes {
+            copy,
+            from,
+            through,
+        }) = effect
+        else {
+            return Vec::new();
+        };
+        assert_eq!(from, through, "one record in flight: {effect:?}");
+        let node = match *copy {
+            COPY_B => B,
+            COPY_C => C,
+            other => panic!("A sends only to B and C here, not {other:?}"),
+        };
+        let held = self.held.get(&node).copied().unwrap_or(0);
+        let seq = from.0;
+        if seq <= held {
+            let late = if node == C { self.late.take() } else { None };
+            let mut answers: Vec<_> = late.into_iter().collect();
+            answers.extend([
+                reply(node, &AppendOutcome::AlreadyHave),
+                self.ack_at(node, held),
+            ]);
+            return answers;
+        }
+        if seq > held + 1 {
+            let digest = if held == 0 { Digest::ROOT } else { d(held) };
+            return vec![reply(node, &need_prefix_at(held, digest))];
+        }
+        self.held.insert(node, seq);
+        if (node, seq, self.lost) == (C, 2, false) {
+            self.lost = true;
+            return match self.loss {
+                Loss::Ack => Vec::new(),
+                Loss::AfterAlreadyHave => vec![reply(C, &AppendOutcome::AlreadyHave)],
+                Loss::Delay => {
+                    self.late = Some(self.ack_at(C, 2));
+                    Vec::new()
+                }
+            };
+        }
+        vec![self.ack_at(node, seq)]
+    }
+}
+
+/// Lead ruling B-R67 (joint-gate B1, probe S3), in one story on A. F1 commits `ReadOnly` and
+/// rebuilds A, B and C. `Recovered` builds A's primary at the cutoff, 12, holding rungs 0 and
+/// 12, and B and C, holding nothing, are walked from the root by A's cursors. B's walk is clean.
+/// C's ACK for record 2, below the cutoff, is lost as `loss` says. L1 has said `admission`
+/// (`None`: nothing). Each round the host answers every send, then fires every timer R1 armed
+/// and has not had fired. Every `CopyCaughtUp` goes to F1; then A and each copy caught up
+/// prove the head durable, and a CAS the rebuild proposes commits. Returns F1 and every effect
+/// R1 emitted.
+fn rebuild_losing_one_ack(admission: Option<bool>, loss: Loss) -> (Recovery, Vec<EffectKind>) {
+    let (mut f1, result) = f1_rebuilding();
+    let mut module = Replication::new();
+    let mut log = route(&mut module, recovered_event(&result));
+    assert!(module.primary(A, P).is_some(), "A's primary is built");
+    let mut host = Host {
+        result,
+        held: BTreeMap::new(),
+        loss,
+        lost: false,
+        late: None,
+    };
+    let mut queue = VecDeque::new();
+    if let Some(allow) = admission {
+        queue.extend(route(&mut module, set_admission(allow)));
+    }
+    // Without a keepalive round, B and C answer the stream's last append from their head.
+    if admission != Some(false) {
+        for node in [B, C] {
+            queue.extend(route(
+                &mut module,
+                reply(node, &need_prefix_at(0, Digest::ROOT)),
+            ));
+        }
+    }
+    let mut fired = Vec::new();
+    for _round in 0..8 {
+        while let Some(effect) = queue.pop_front() {
+            for answer in host.answer(&effect) {
+                queue.extend(route(&mut module, answer));
+            }
+            log.push(effect);
+        }
+        for id in [retransmit_timer(P), keepalive_timer(P)] {
+            if let Some(version) = last_arm(&log, id).filter(|v| !fired.contains(&(id, *v))) {
+                fired.push((id, version));
+                queue.extend(route(&mut module, fired_at(id, version)));
+            }
+        }
+        if queue.is_empty() {
+            break;
+        }
+    }
+
+    let caught = caught_up_copies(&log);
+    let mut now = 20_000;
+    for copy in &caught {
+        f1_rec(
+            &mut f1,
+            now,
+            RecoveryEvent::CopyCaughtUp {
+                copy: *copy,
+                head: Seq(HEAD),
+                digest: d(HEAD),
+            },
+        );
+        now += 1;
+    }
+    let mut proposed = false;
+    for copy in std::iter::once(COPY_A).chain(caught) {
+        proposed |= f1_rec(&mut f1, now, f1_durable(copy)).iter().any(is_cas);
+        now += 1;
+    }
+    if proposed {
+        f1_on(
+            &mut f1,
+            now + 100,
+            EventKind::Control(ControlEvent::CasResult {
+                key: ControlKey::Partition(P),
+                outcome: CasOutcome::Committed(Revision(10)),
+            }),
+        );
+    }
+    (f1, log)
+}
+
+/// The copies R1 reported caught up at the head, in order.
+fn caught_up_copies(log: &[EffectKind]) -> Vec<CopyId> {
+    log.iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Kernel(KernelEffect::CopyCaughtUp { copy, head, digest })
+                if (*head, *digest) == (Seq(HEAD), d(HEAD)) =>
+            {
+                Some(*copy)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every bare send in `log`, as `(copy, seq)`.
+fn sends(log: &[EffectKind]) -> Vec<(u8, u64)> {
+    log.iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Kernel(KernelEffect::SendEnvelopes { copy, from, .. }) => {
+                Some((copy.0, from.0))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many times `log` sends C record 2.
+fn twos(log: &[EffectKind]) -> usize {
+    log.iter().filter(|e| **e == send(COPY_C, 2)).count()
+}
+
+/// M7B-186 (lead ruling B-R67; joint-gate B1 under `Reject`, probe S3). The keepalive runs, and
+/// it skips C, whose cursor has record 2 in flight. The retransmit re-sends record 2 once, C
+/// answers `AlreadyHave` and its ACK, the walk goes on, and the rebuild reaches `Committed`.
+/// Record 2 is sent exactly twice: the send and one re-send.
+#[retcd_test]
+fn m7b_186_a_lost_catch_up_ack_under_reject_still_reaches_committed() {
+    let (f1, log) = rebuild_losing_one_ack(Some(false), Loss::Ack);
+    assert!(
+        last_arm(&log, keepalive_timer(P)).is_some(),
+        "the keepalive ran"
+    );
+    assert_eq!(
+        caught_up_copies(&log),
+        vec![COPY_B, COPY_C],
+        "{:?}",
+        sends(&log)
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert_eq!(twos(&log), 2, "{:?}", sends(&log));
+}
+
+/// M7B-187 (lead ruling B-R67; joint-gate B1 under `Allow`, probe S3b). No keepalive runs at
+/// all, so nothing but the retransmit can recover the lost ACK. The rebuild reaches `Committed`,
+/// and record 2 is sent exactly twice.
+#[retcd_test]
+fn m7b_187_a_lost_catch_up_ack_under_allow_still_reaches_committed() {
+    let (f1, log) = rebuild_losing_one_ack(Some(true), Loss::Ack);
+    assert_eq!(last_arm(&log, keepalive_timer(P)), None, "no keepalive");
+    assert_eq!(
+        caught_up_copies(&log),
+        vec![COPY_B, COPY_C],
+        "{:?}",
+        sends(&log)
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert_eq!(twos(&log), 2, "{:?}", sends(&log));
+}
+
+/// M7B-191 (lead ruling B-R67a). The ACK is lost after `AlreadyHave`, under `Allow`.
+/// `AlreadyHave` left the cursor with nothing outstanding, as design §3.6 says it must, but
+/// record 2 is still sent and unACKed, and that is what the timer watches. The rebuild reaches
+/// `Committed`, and R1 sent record 2 exactly twice.
+#[retcd_test]
+fn m7b_191_an_ack_lost_after_already_have_under_allow_still_reaches_committed() {
+    let (f1, log) = rebuild_losing_one_ack(Some(true), Loss::AfterAlreadyHave);
+    assert_eq!(
+        caught_up_copies(&log),
+        vec![COPY_B, COPY_C],
+        "{:?}",
+        sends(&log)
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert_eq!(twos(&log), 2, "{:?}", sends(&log));
+}
+
+/// M7B-188 (lead rulings B-R67, B-R67a: the rate bound). A primary built at cutoff 3 walks B
+/// from the root, and B's ACK for record 1 is lost.
+///
+/// * The first send arms the partition's retransmit timer.
+/// * The first fire finds nothing that has waited a whole interval: it re-sends nothing and
+///   re-arms.
+/// * Each later fire with no ACK progress since the one before re-sends record 1 once: the
+///   same effect as the first send, byte for byte, and one per fire.
+/// * A fire of a version no longer armed is `StaleTimer`.
+/// * After ACK progress, the next fire re-sends nothing though a record is unACKed.
+/// * Once nothing is unACKed, a fire is `NotRequired` and does not re-arm.
+/// * One timer serves every cursor of the partition: B and C both unACKed draw one arm, and one
+///   fire re-sends each once.
+#[retcd_test]
+fn m7b_188_a_re_send_is_the_same_send_once_per_interval_and_only_without_progress() {
+    let mut module = built_at(3);
+    let first = route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT)));
+    assert_eq!(first, vec![send(COPY_B, 1), retransmit_arm(1)]);
+    assert_eq!(
+        route(&mut module, retransmit_fired(1)),
+        vec![retransmit_arm(2)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(2)),
+        vec![first[0].clone(), retransmit_arm(3)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(3)),
+        vec![send(COPY_B, 1), retransmit_arm(4)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(3)),
+        vec![replica(ReplicaIgnoreReason::StaleTimer)]
+    );
+
+    // B answers a re-send, and the ACK moves the cursor to record 2.
+    assert_eq!(
+        route(&mut module, reply(B, &AppendOutcome::AlreadyHave)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 2)
+        ]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(4)),
+        vec![retransmit_arm(5)],
+        "progress since the last fire"
+    );
+    route(&mut module, accepted(&in_new_root(b(2, 2, 2))));
+    let at_cut = route(&mut module, accepted(&in_new_root(b(3, 3, 3))));
+    assert!(at_cut.contains(&caught_up(COPY_B, 3)), "{at_cut:?}");
+    assert_eq!(
+        route(&mut module, retransmit_fired(5)),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(6)),
+        vec![replica(ReplicaIgnoreReason::StaleTimer)]
+    );
+
+    // One timer for the partition, sweeping every cursor.
+    let mut module = built_at(3);
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT))),
+        vec![send(COPY_B, 1), retransmit_arm(1)]
+    );
+    assert_eq!(
+        route(&mut module, reply(C, &need_prefix_at(0, Digest::ROOT))),
+        vec![send(COPY_C, 1)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(1)),
+        vec![retransmit_arm(2)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(2)),
+        vec![send(COPY_B, 1), send(COPY_C, 1), retransmit_arm(3)]
+    );
+}
+
+/// M7B-192 (lead ruling B-R67a, read with B-R58c). The ACK a re-send draws below the cutoff
+/// names a record the cursor sent and nobody ACKed. That is the record in flight as B-R58c means
+/// it, even though the `AlreadyHave` before it left nothing outstanding (design §3.6). It drives
+/// the cursor and nothing else: exactly `[InFlightUnverified, SendEnvelopes{B, 2}]`, and the
+/// tracker is unchanged. A repeat of that ACK, once record 2 is the one sent, is a matching
+/// repeat and answers `Recorded` (lead ruling B-R67c; it answered a snapshot request before).
+/// Near-miss: the same ACK with another digest is not a repeat, and gets today's answer.
+#[retcd_test]
+fn m7b_192_the_ack_a_re_send_draws_below_the_cutoff_still_drives_the_cursor() {
+    let mut module = built_at(3);
+    route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT)));
+    assert_eq!(
+        route(&mut module, reply(B, &AppendOutcome::AlreadyHave)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let cursor = primary_side(&module).cursor(COPY_B).expect("running");
+    assert_eq!(cursor.outstanding(), None, "design §3.6 is unchanged");
+    let before = primary_side(&module).tracker().clone();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 2)
+        ]
+    );
+    assert_eq!(primary_side(&module).tracker(), &before);
+
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        route(&mut module, accepted(&forked(in_new_root(b(1, 1, 1))))),
+        vec![
+            rejected(AckRejectReason::Unverifiable),
+            kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: COPY_B,
+                barrier: Seq(3),
+            }),
+        ]
+    );
+}
+
+// --- Lead ruling B-R67c: the per-cursor ACK high-water mark --------------------------------
+
+/// Every `SendEnvelopes` to `copy` in `log`, as sequence numbers.
+fn sends_to(log: &[EffectKind], copy: CopyId) -> Vec<u64> {
+    log.iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Kernel(KernelEffect::SendEnvelopes { copy: to, from, .. })
+                if *to == copy =>
+            {
+                Some(from.0)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn asks_for_a_snapshot(log: &[EffectKind]) -> bool {
+    log.iter().any(|effect| {
+        matches!(
+            effect,
+            EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired { .. })
+        )
+    })
+}
+
+/// M7B-194 (lead ruling B-R67c; tester-kb-r1 re-gate B2, probe R1). A slow ACK, not a lost one,
+/// below the cutoff. B's ACK for record 1 is still in the network when the second fire re-sends
+/// record 1. Then the answers arrive in their natural order: the original ACK, which moves the
+/// cursor to record 2, then the re-send's `AlreadyHave` and its ACK for record 1. That second
+/// ACK is a repeat: at the high-water mark, with the digest already accepted there. It answers
+/// exactly `Recorded`: no snapshot request, no send, and neither the tracker nor the cursor
+/// changes.
+/// A repeat below the mark is one too, where no rung contradicts it: after B's ACK at 2, a
+/// third ACK for record 1 is `Recorded`.
+#[retcd_test]
+fn m7b_194_a_slow_ack_below_the_cutoff_and_its_re_sends_ack_ask_for_no_snapshot() {
+    let mut module = walking_b_from_root();
+    route(&mut module, retransmit_fired(1));
+    assert_eq!(
+        route(&mut module, retransmit_fired(2)),
+        vec![send(COPY_B, 1), retransmit_arm(3)]
+    );
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 2)
+        ]
+    );
+    assert_eq!(
+        route(&mut module, reply(B, &AppendOutcome::AlreadyHave)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+
+    // Below the mark, where no rung contradicts it: B's ACK at 2 moves the mark, and a third
+    // ACK for record 1, later still, is a repeat as well.
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(2, 2, 2)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 3)
+        ]
+    );
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+}
+
+/// M7B-195 (lead ruling B-R67c: a conflicting repeat is not a repeat). After B's ACK at 1 moved
+/// the cursor, an ACK at 1 whose digest differs from the one accepted there is divergence
+/// evidence, not a repeat: it takes today's path, `[Unverifiable, SnapshotCatchupRequired{B,
+/// 3}]`, below the cutoff. Above it, on the golden tracker, the ladder's rung is the digest taken
+/// there: after B's ACK at 10, an ACK at 9 with another digest is not a repeat either, and gets
+/// today's answer for a watermark that retreats, `RegressedProgress`. Nor is an ACK in another
+/// generation, however well it matches: it is `StaleGeneration`, as rules 1–7 say. Near-misses:
+/// the matching repeat is `Recorded` each time (M7B-194).
+#[retcd_test]
+fn m7b_195_a_repeat_ack_with_another_digest_still_asks_for_a_snapshot() {
+    let mut module = walking_b_from_root();
+    route(&mut module, accepted(&in_new_root(b(1, 1, 1))));
+    let before = primary_side(&module).tracker().clone();
+    assert_eq!(
+        route(&mut module, accepted(&forked(in_new_root(b(1, 1, 1))))),
+        vec![
+            rejected(AckRejectReason::Unverifiable),
+            kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: COPY_B,
+                barrier: Seq(3),
+            }),
+        ]
+    );
+    assert_eq!(primary_side(&module).tracker(), &before);
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    // Another generation: the old root's ACK, digest and progress unchanged.
+    assert_eq!(
+        route(&mut module, accepted(&b(1, 1, 1))),
+        vec![rejected(AckRejectReason::StaleGeneration)]
+    );
+
+    // Above the cutoff, below the mark.
+    let mut module = routed();
+    route(&mut module, reply(B, &need_prefix(8)));
+    route(&mut module, accepted(&b(9, 9, 9)));
+    assert_eq!(
+        sends_to(&route(&mut module, accepted(&b(10, 10, 10))), COPY_B),
+        vec![11]
+    );
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&forked(b(9, 9, 9)))),
+        vec![rejected(AckRejectReason::RegressedProgress)]
+    );
+    assert_eq!(
+        route(&mut module, accepted(&b(9, 9, 9))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+}
+
+/// M7B-196 (lead ruling B-R67c; tester-kb-r1 re-gate M3, probe R2). A slow ACK above the
+/// cutoff: the golden tracker at head 12, B walked from 8. Record 9 is re-sent, and both its ACKs
+/// arrive, the re-send's after the cursor moved on. Every send is then answered once, in order,
+/// until B is caught up. The repeat ACK sits at the mark, so it reports `PeerProgress{B, 9}` and
+/// sends nothing (update B-R67d; under B-R67c it was `Recorded`), and no record after the
+/// re-sent one is sent twice: one duplicate ACK no longer doubles the rest of the walk.
+#[retcd_test]
+fn m7b_196_a_slow_ack_above_the_cutoff_does_not_double_the_rest_of_the_walk() {
+    let mut module = routed();
+    let mut log = route(&mut module, reply(B, &need_prefix(8)));
+    log.extend(route(&mut module, retransmit_fired(1)));
+    log.extend(route(&mut module, retransmit_fired(2)));
+    assert_eq!(sends_to(&log, COPY_B), vec![9, 9]);
+    log.extend(route(&mut module, accepted(&b(9, 9, 9))));
+    log.extend(route(&mut module, reply(B, &AppendOutcome::AlreadyHave)));
+    assert_eq!(
+        route(&mut module, accepted(&b(9, 9, 9))),
+        vec![peer_progress(B, 9)]
+    );
+    let mut queue: VecDeque<EventKind> = VecDeque::new();
+    queue.push_back(accepted(&b(10, 10, 10)));
+    let mut steps = 0;
+    while let Some(kind) = queue.pop_front() {
+        steps += 1;
+        assert!(
+            steps < 32,
+            "the walk does not end: {:?}",
+            sends_to(&log, COPY_B)
+        );
+        let out = route(&mut module, kind);
+        for seq in sends_to(&out, COPY_B) {
+            if seq < HEAD {
+                queue.push_back(accepted(&b(seq, seq, seq)));
+            }
+        }
+        log.extend(out);
+    }
+    assert_eq!(sends_to(&log, COPY_B), vec![9, 9, 10, 11, 12]);
+}
+
+/// M7B-197 (lead ruling B-R67c item A2; tester-kb-r1 re-gate probe R4). The keepalive's "record
+/// in flight" is the retransmit's: sent and not ACKed. Under `Reject`, B's cursor sends record 9
+/// and B answers `AlreadyHave`, whose ACK is lost. `outstanding` is `None` (design §3.6) and
+/// `unacked` is 9, so the next keepalive round sends the head to C and not to B, and B's record
+/// is left to the retransmit.
+#[retcd_test]
+fn m7b_197_the_keepalive_skips_a_copy_whose_record_is_unacked_after_already_have() {
+    let mut module = routed();
+    let paused = route(&mut module, set_admission(false));
+    let version = last_arm(&paused, keepalive_timer(P)).expect("the keepalive armed");
+    route(&mut module, reply(B, &need_prefix(8)));
+    route(&mut module, reply(B, &AppendOutcome::AlreadyHave));
+    let cursor = primary_side(&module).cursor(COPY_B).expect("running");
+    assert_eq!(
+        (cursor.outstanding(), cursor.unacked()),
+        (None, Some(Seq(9)))
+    );
+    let round = route(&mut module, fired_at(keepalive_timer(P), version));
+    assert_eq!(sends_to(&round, COPY_B), Vec::<u64>::new(), "{round:?}");
+    assert_eq!(sends_to(&round, COPY_C), vec![HEAD], "{round:?}");
+}
+
+/// M7B-198 (lead ruling B-R67; tester-kb-r1 re-gate A4, probe R5, mutant U06). The record a
+/// probe answer sends is the record in flight. After `ProbeDigestAt{8}` the cursor sent 8, not
+/// 9, so when that reply is lost the retransmit re-sends 8.
+#[retcd_test]
+fn m7b_198_a_lost_probe_answer_re_sends_the_probed_record() {
+    let mut module = routed();
+    route(&mut module, reply(B, &need_prefix(8)));
+    assert_eq!(
+        sends_to(
+            &route(
+                &mut module,
+                reply(B, &AppendOutcome::ProbeDigestAt { seq: Seq(8) })
+            ),
+            COPY_B
+        ),
+        vec![8]
+    );
+    let mut fires = route(&mut module, retransmit_fired(1));
+    fires.extend(route(&mut module, retransmit_fired(2)));
+    assert_eq!(sends_to(&fires, COPY_B), vec![8], "{fires:?}");
+}
+
+/// M7B-199 (lead ruling B-R67; tester-kb-r1 re-gate A4, probe R6, mutant U08). A `NeedPrefix`
+/// below retention asks for a snapshot and leaves nothing in flight, so the retransmit re-sends
+/// nothing: its next fire is `NotRequired` and does not re-arm, and the one after is stale.
+#[retcd_test]
+fn m7b_199_a_snapshot_request_leaves_nothing_to_re_send() {
+    let mut module = built_at(10);
+    route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT)));
+    let snapshot = route(
+        &mut module,
+        reply(B, &need_prefix_at(5, forked(b(5, 5, 5)).digest_at_buffered)),
+    );
+    assert!(asks_for_a_snapshot(&snapshot), "{snapshot:?}");
+    assert_eq!(
+        route(&mut module, retransmit_fired(1)),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(
+        route(&mut module, retransmit_fired(2)),
+        vec![replica(ReplicaIgnoreReason::StaleTimer)]
+    );
+}
+
+/// M7B-200 (lead ruling B-R67c; tester-kb-r1 re-gate B2 and its blind-spot note: delay, not
+/// loss). The M7B-186 rebuild under `Allow`, with nothing lost: C's ACK for record 2 is only
+/// late. It arrives after the retransmit re-sent record 2, just before C's `AlreadyHave` and
+/// second ACK for it. The rebuild reaches `Committed`; R1 never asks for a snapshot; record 2
+/// goes to C twice, the send and one re-send, and every other record once.
+#[retcd_test]
+fn m7b_200_a_late_catch_up_ack_under_allow_reaches_committed_with_no_snapshot() {
+    let (f1, log) = rebuild_losing_one_ack(Some(true), Loss::Delay);
+    assert!(!asks_for_a_snapshot(&log), "{log:?}");
+    assert_eq!(
+        caught_up_copies(&log),
+        vec![COPY_B, COPY_C],
+        "{:?}",
+        sends(&log)
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    let to_c = sends_to(&log, COPY_C);
+    assert_eq!(twos(&log), 2, "{to_c:?}");
+    for seq in (1..=HEAD).filter(|seq| *seq != 2) {
+        assert_eq!(
+            to_c.iter().filter(|s| **s == seq).count(),
+            1,
+            "record {seq}: {to_c:?}"
+        );
+    }
+}
+
+/// M7B-202 (lead ruling B-R67c: "sends only when the ACK moves past the high-water mark"). An
+/// ACK that raises any one watermark is not a repeat: it takes the ladder, which admits it as it
+/// would any other. But the cursor sends only for one whose `received` moves past the mark. B's
+/// cursor has record 10 in flight after an ACK at `(9, 9, 8)`:
+/// * `(9, 9, 9)` raises only `durable`: the ladder's effects, then `Recorded`; nothing is sent
+///   and record 10 stays unACKed.
+/// * `(10, 9, 9)` raises `received`: the ladder's effects, then record 11.
+/// * `(10, 10, 9)` raises only `buffered_applied`: the ladder's effects, then `Recorded`.
+#[retcd_test]
+fn m7b_202_an_ack_that_raises_a_watermark_but_not_received_reaches_the_tracker_and_sends_nothing() {
+    let mut module = routed();
+    route(&mut module, reply(B, &need_prefix(8)));
+    assert_eq!(
+        sends_to(&route(&mut module, accepted(&b(9, 9, 8))), COPY_B),
+        vec![10]
+    );
+    let mut reference = primary_side(&module).tracker().clone();
+    for (ack, then) in [
+        (b(9, 9, 9), replica(ReplicaIgnoreReason::Recorded)),
+        (b(10, 9, 9), send(COPY_B, 11)),
+        (b(10, 10, 9), replica(ReplicaIgnoreReason::Recorded)),
+    ] {
+        let mut want = deliver(&mut reference, &ack);
+        assert!(
+            matches!(
+                want[0],
+                EffectKind::Kernel(KernelEffect::PeerProgress { .. })
+            ),
+            "the ladder admits {ack:?}: {want:?}"
+        );
+        want.push(then);
+        assert_eq!(route(&mut module, accepted(&ack)), want, "{ack:?}");
+        assert_eq!(primary_side(&module).tracker(), &reference, "{ack:?}");
+        if ack == b(9, 9, 9) {
+            assert_eq!(
+                primary_side(&module)
+                    .cursor(COPY_B)
+                    .expect("running")
+                    .unacked(),
+                Some(Seq(10))
+            );
+        }
+    }
+}
+
+// --- Lead ruling B-R67d: a repeat at the mark is a liveness report ---------------------------
+
+/// Paused, with B's cursor idle at its high-water mark, the head: B asked from the head, its
+/// ACK there moved the cursor, and nothing is unACKed.
+fn paused_with_b_idle_at_the_head() -> (Replication, TimerVersion) {
+    let mut module = routed();
+    let paused = route(&mut module, set_admission(false));
+    let version = last_arm(&paused, keepalive_timer(P)).expect("the keepalive armed");
+    route(&mut module, reply(B, &need_prefix(HEAD)));
+    route(&mut module, accepted(&b(HEAD, HEAD, HEAD)));
+    let cursor = primary_side(&module).cursor(COPY_B).expect("running");
+    assert_eq!((cursor.outstanding(), cursor.unacked()), (None, None));
+    (module, version)
+}
+
+/// M7B-203 (lead ruling B-R67d, read with B-R60). A repeat at the mark is a liveness report. B's
+/// cursor is idle at 12; the keepalive round re-sends the head and B answers `AlreadyHave` and
+/// an ACK at 12: every watermark at the mark, with the digest taken there. It is still split off
+/// before the cursor, so nothing is sent, but it runs the tracker's rules 1–9 and emits exactly
+/// what a first ACK at 12 would against the same tracker: `PeerProgress{B, 12}`. Without it L1's
+/// lag never refreshes and a paused partition never resumes. The cursor is unchanged.
+#[retcd_test]
+fn m7b_203_a_keepalive_ack_at_an_idle_cursors_mark_reports_peer_progress_and_sends_nothing() {
+    let (mut module, version) = paused_with_b_idle_at_the_head();
+    let round = route(&mut module, fired_at(keepalive_timer(P), version));
+    assert_eq!(sends_to(&round, COPY_B), vec![HEAD], "{round:?}");
+    assert_eq!(
+        route(&mut module, reply(B, &AppendOutcome::AlreadyHave)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let cursor = primary_side(&module).cursor(COPY_B).cloned();
+    let mut reference = primary_side(&module).tracker().clone();
+    let keepalive = b(HEAD, HEAD, HEAD);
+    let want = deliver(&mut reference, &keepalive);
+    assert_eq!(want, vec![peer_progress(B, HEAD)]);
+    assert_eq!(route(&mut module, accepted(&keepalive)), want);
+    assert_eq!(primary_side(&module).tracker(), &reference);
+    assert_eq!(primary_side(&module).cursor(COPY_B).cloned(), cursor);
+}
+
+/// M7B-204 (lead ruling B-R67d). A repeat strictly below the mark reports nothing: a late
+/// duplicate must not tell L1 a position older than the one it already has. B's cursor is idle
+/// at 12. A late ACK at 11, and one at 12 whose `durable` is still 11, each answer exactly
+/// `Recorded`: no `PeerProgress`, no send, and neither the tracker nor the cursor changes.
+/// Near-miss: the ACK at the mark itself reports (M7B-203).
+#[retcd_test]
+fn m7b_204_a_late_duplicate_below_an_idle_cursors_mark_is_recorded_and_reports_nothing() {
+    let (mut module, _) = paused_with_b_idle_at_the_head();
+    let before = primary_side(&module).clone();
+    for late in [b(11, 11, 11), b(HEAD, HEAD, 11)] {
+        assert_eq!(
+            route(&mut module, accepted(&late)),
+            vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{late:?}"
+        );
+        assert_eq!(primary_side(&module), &before, "{late:?}");
+    }
+}
+
+// --- Lead rulings B-R67e and B-R67f: a repeat is judged against what the primary knows --------
+
+/// `built_at(3)` after B, root-seeded, was walked to the cutoff: its ACKs at 1 and 2 drove the
+/// cursor unverified, and the one at 3 was verified.
+fn b_walked_to_the_cutoff() -> Replication {
+    let mut module = walking_b_from_root();
+    for seq in 1..=3 {
+        route(&mut module, accepted(&in_new_root(b(seq, seq, seq))));
+    }
+    module
+}
+
+/// A second `Recovered` in the same generation at the same cutoff 3, its barrier naming
+/// `copies`: F1's rebuild re-announcing once B is proved durable there.
+fn recovered_again(copies: &[CopyId]) -> EventKind {
+    recovered_event(&requiring(recovery(3, d(3), pin_with_b()), copies))
+}
+
+/// M7B-205 (lead rulings B-R67e and B-R67f; rdb-sim S4b and the k=7 run of
+/// `rebuild_two_slow_replies_end_as_the_control`). A second `Recovered`, whose barrier proves B
+/// durable at 3, drops B's cursor and starts B's watermarks at zero. A duplicate of B's ACK at 1
+/// from before it then arrives. That ACK is below B's proved floor, so it is a repeat: exactly
+/// `Recorded`, with no snapshot request and no change. The same holds once B's `NeedPrefix` has
+/// made a new cursor that has taken no ACK yet (the k=7 shape): with no mark, the floor still
+/// judges. Near-misses: an ACK at the floor with another digest is divergence, not a repeat; and
+/// a later `Recovered` whose barrier does not name B replaces the floor, so the duplicate gets
+/// today's answer again.
+#[retcd_test]
+fn m7b_205_a_duplicate_ack_right_after_a_recovered_rebuild_is_not_escalated() {
+    let mut module = b_walked_to_the_cutoff();
+    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    let before = primary_side(&module).clone();
+    for late in [b(1, 1, 1), b(2, 2, 2), b(1, 1, 0)] {
+        assert_eq!(
+            route(&mut module, accepted(&in_new_root(late))),
+            vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{late:?}"
+        );
+        assert_eq!(primary_side(&module), &before, "{late:?}");
+    }
+
+    route(&mut module, reply(B, &need_prefix_at(3, d(3))));
+    let cursor = primary_side(&module).cursor(COPY_B).cloned();
+    assert!(cursor.is_some(), "the NeedPrefix made a cursor");
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 0)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+
+    let wrong = forked(in_new_root(b(3, 3, 3)));
+    let effects = route(&mut module, accepted(&wrong));
+    assert_eq!(
+        effects[0],
+        kernel(KernelEffect::DivergenceDetected { copy: COPY_B }),
+        "{effects:?}"
+    );
+
+    // A later `Recovered` restates what is proved, replacing the floor, not raising it: its
+    // barrier does not name B, so B knows nothing and the same duplicate gets today's answer.
+    let mut module = b_walked_to_the_cutoff();
+    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    route(&mut module, recovered_again(&[COPY_A, COPY_C]));
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![
+            rejected(AckRejectReason::Unverifiable),
+            kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: COPY_B,
+                barrier: Seq(3),
+            }),
+        ]
+    );
+}
+
+/// M7B-206 (lead ruling B-R67f). An ACK exactly at B's proved floor, with the digest the ladder
+/// holds there, is a liveness report, not `Recorded`: it takes the ladder and emits exactly what
+/// a reference tracker fed the same ACK emits, `PeerProgress{B, 3}` first.
+#[retcd_test]
+fn m7b_206_an_ack_at_the_proved_floor_takes_the_ladder() {
+    let mut module = b_walked_to_the_cutoff();
+    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    let mut reference = primary_side(&module).tracker().clone();
+    let at_floor = in_new_root(b(3, 3, 3));
+    let want = deliver(&mut reference, &at_floor);
+    assert_eq!(want[0], peer_progress(B, 3), "{want:?}");
+    assert_eq!(route(&mut module, accepted(&at_floor)), want);
+    assert_eq!(primary_side(&module).tracker(), &reference);
+}
+
+/// M7B-207 (lead ruling B-R67f: the floor is read by the repeat judgment only). Two primaries
+/// rebuilt by the same second `Recovered`, except that one barrier proves B durable at 3 and
+/// the other does not. They answer the `Recovered` alike, hold B's watermarks at zero alike,
+/// and answer the same stream of ACKs that are not repeats alike, every `PeerProgress`,
+/// qualification edge and durable view included. The floor moves no watermark and no view.
+#[retcd_test]
+fn m7b_207_the_proved_floor_moves_no_watermark_and_no_view() {
+    let mut proved = b_walked_to_the_cutoff();
+    let mut unproved = b_walked_to_the_cutoff();
+    assert_eq!(
+        route(&mut proved, recovered_again(&[COPY_A, COPY_B, COPY_C])),
+        route(&mut unproved, recovered_again(&[COPY_A, COPY_C]))
+    );
+    for ack in [
+        in_new_root(c(3, 3, 3)),
+        in_new_root(b(3, 3, 3)),
+        in_new_root(b(3, 3, 3)),
+    ] {
+        assert_eq!(
+            route(&mut proved, accepted(&ack)),
+            route(&mut unproved, accepted(&ack)),
+            "{ack:?}"
+        );
+        for copy in [COPY_A, COPY_B, COPY_C] {
+            assert_eq!(
+                primary_side(&proved)
+                    .tracker()
+                    .peer(copy)
+                    .map(|peer| peer.progress),
+                primary_side(&unproved)
+                    .tracker()
+                    .peer(copy)
+                    .map(|peer| peer.progress),
+                "{copy:?} after {ack:?}"
+            );
+        }
+    }
+    assert_eq!(
+        primary_side(&proved)
+            .tracker()
+            .peer(COPY_B)
+            .map(|peer| peer.progress),
+        Some(progress(3, 3, 3))
+    );
 }

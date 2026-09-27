@@ -543,7 +543,8 @@ fn seam_literals_in_src() -> Vec<String> {
 /// each refused under its own name:
 ///
 /// * `deliver::crash` — a planned crash fired; restarting the node is owed.
-/// * `deliver::recovery` — one of F1's five requests with no provider (lead ruling A-R64).
+/// * `deliver::recovery` — one of F1's three requests with no provider, `ProbeDigestAt`,
+///   `QuarantineSuffix` and `RebuildFromAuthoritative` (lead ruling A-R64).
 /// * `run::route` — a routed kernel fact whose named, wired consumer declined it. Permanent, like
 ///   `replay::replay`: continuing would drop the fact (B-R28).
 /// * `Network::forge_ack` — the network does not rewrite reply bodies. **Narrowed 2026-09-26
@@ -1877,7 +1878,10 @@ fn route_every_owed_consumer_still_reports_unavailable() {
 }
 
 /// Lead ruling A-R64(b): none of F1's seven requests to the environment is recorded as a
-/// `RecoveryFact`. Five are refused by name; the two with providers answer.
+/// `RecoveryFact`. Three are refused by name for want of a provider. `QueryInventory` and
+/// `SyncWalThrough` answer. `CatchUp` and `CatchUpBeforeGrant` have a provider (B-R59), but no
+/// copy is placed here, so they are refused by the same name; the placed case is
+/// `provider_catch_up_goes_to_the_node_holding_its_source`.
 #[retcd_test]
 fn provider_no_recovery_request_is_recorded_as_a_fact() {
     use rdb_core::contracts::authority::{FenceCredential, Lineage};
@@ -4021,24 +4025,34 @@ fn forge_ack_waits_for_an_acknowledgement_and_delivers_it_under_the_forged_label
     );
 }
 
-/// Lead ruling L-R177do, through the run loop (unblocks M7B-32). In the rebuild run node 3
-/// acknowledges R1's catch-up to node 1. The forgery takes node 3's first acknowledgement and
-/// delivers it to node 1 as node 2's, `authenticated: false`, body unchanged. **R1's own check**
-/// refuses it — its tracker's rule 1, `AckRejected(ForgedIdentity)` — on node 1, once. The same
-/// run without the forgery notes no forged identity anywhere, so the refusal is the forgery's.
-/// And R1 credits the refused frame with nothing: the run ends exactly where it ends when node
-/// 3's acknowledgement is dropped instead.
+/// Lead ruling L-R177do, through the run loop. In the rebuild run node 3 acknowledges R1's
+/// catch-up to node 1. The forgery takes node 3's first acknowledgement and delivers it to node 1
+/// as node 2's, `authenticated: false`, body unchanged. **R1's own check** refuses it — its
+/// tracker's rule 1, `AckRejected(ForgedIdentity)` — on node 1, once. The same run without the
+/// forgery notes no forged identity anywhere, so the refusal is the forgery's.
+///
+/// The forgery *steals* node 3's acknowledgement, so node 1 never counts it. R1's retransmit
+/// (B-R67) re-sends the unacknowledged record on its timer, node 3 acknowledges again, and the
+/// rebuild ends where the control's does: `Committed`. A refused forgery costs a retransmit
+/// period, not the recovery. This row credits no M7B-32 (lead ruling).
 #[retcd_test]
 fn forge_ack_an_unauthenticated_acknowledgement_reaches_r1_and_r1_refuses_it() {
     use rdb_core::contracts::ignore::KernelIgnoredReason;
     use rdb_core::contracts::trace::AckRejectReason;
-    use rdb_sim::sim::network::Delivery;
+    use rdb_core::recovery::RecoveryPhase;
     support::preamble();
     let run = |op: Option<NetworkOp>| {
         let mut plan = rebuild_plan(Vec::new());
         plan.network_ops.extend(op);
         let mut runner = Runner::new(&plan).expect("a runner");
         let stop = runner.run(plan.limits).expect("the rebuild runs").stop;
+        assert!(
+            matches!(
+                stop,
+                rdb_sim::harness::run::StopReason::DeadlineReached { .. }
+            ),
+            "the rebuild runs to its deadline, never a refusal: {stop:?}"
+        );
         let phase = runner
             .dispatcher()
             .recovery(NODE, PartitionId(1))
@@ -4061,30 +4075,25 @@ fn forge_ack_an_unauthenticated_acknowledgement_reaches_r1_and_r1_refuses_it() {
                 _ => None,
             })
             .collect();
-        (waiting, refused, (stop, phase))
+        (phase, waiting, refused)
     };
-    let (_, control, _) = run(None);
+    let (control_phase, _, control) = run(None);
     assert!(
         control.is_empty(),
         "control: without the forgery nothing is refused as forged: {control:?}"
     );
-    let (_, _, lost_end) = run(Some(NetworkOp::PlanNext {
-        from: NodeId(3),
-        to: NODE,
-        delivery: Delivery::Drop,
-    }));
-    let (waiting, refused, forged_end) = run(Some(NetworkOp::ForgeAck {
+    assert_eq!(
+        control_phase,
+        Some(RecoveryPhase::Committed),
+        "control: the rebuild commits"
+    );
+    let (phase, waiting, refused) = run(Some(NetworkOp::ForgeAck {
         from: NodeId(3),
         to: NODE,
         claimed_node: NodeId(2),
         claimed_role: ReplicaRole::RegularSecondary,
         authenticated: false,
     }));
-    assert_eq!(
-        forged_end, lost_end,
-        "R1 credits the refused frame with nothing: the run ends as if node 3's acknowledgement \
-         were lost"
-    );
     assert!(
         waiting.is_empty(),
         "the forgery took an acknowledgement: {waiting:?}"
@@ -4093,6 +4102,228 @@ fn forge_ack_an_unauthenticated_acknowledgement_reaches_r1_and_r1_refuses_it() {
         refused,
         vec![(NODE, ModuleName::Replication)],
         "delivered to node 1, and refused there by R1's own check, once"
+    );
+    assert_eq!(
+        phase, control_phase,
+        "R1's retransmit recovers the stolen acknowledgement: the rebuild ends as the control's"
+    );
+}
+
+/// What one rebuild run with planned replies left behind.
+struct ReplyRun {
+    stop: rdb_sim::harness::run::StopReason,
+    phase: Option<rdb_core::recovery::RecoveryPhase>,
+    /// Copy 2's receiver on node 3 at the end: its applied head.
+    copy_2_head: Option<(u64, rdb_core::contracts::digest::Digest)>,
+    /// How many copies of each frame from node 3 to node 1 the network delivered, in send order.
+    replies: Vec<u8>,
+    /// Plans the run never spent.
+    waiting: usize,
+}
+
+impl ReplyRun {
+    /// Where the run ended: F1's phase on node 1, and copy 2's head.
+    fn ends(
+        &self,
+    ) -> (
+        Option<&rdb_core::recovery::RecoveryPhase>,
+        Option<&(u64, rdb_core::contracts::digest::Digest)>,
+    ) {
+        (self.phase.as_ref(), self.copy_2_head.as_ref())
+    }
+
+    /// How this run failed to end as `control` did — a refusal, a plan left unspent, or another
+    /// phase or head — or `None`.
+    fn deviation(&self, control: &Self) -> Option<String> {
+        (self.stop.refusal().is_some() || self.waiting > 0 || self.ends() != control.ends()).then(
+            || {
+                format!(
+                    "stop {:?}, {} plans unspent, ends {:?}",
+                    self.stop,
+                    self.waiting,
+                    self.ends()
+                )
+            },
+        )
+    }
+}
+
+/// The rebuild run with node 3's replies to node 1 planned: reply `at` (in send order, from 0)
+/// goes as its `Delivery`, and every reply up to the last planned one that is not named goes at
+/// once, exactly as an unplanned frame would. `PlanNext` decides the next frame on the link, so
+/// the replies in between must be planned through.
+fn rebuild_with_replies(planned: &[(usize, rdb_sim::sim::network::Delivery)]) -> ReplyRun {
+    use rdb_sim::sim::network::Delivery;
+    let last = planned.iter().map(|(at, _)| *at).max();
+    let ops = last.map_or_else(Vec::new, |last| {
+        (0..=last)
+            .map(|at| NetworkOp::PlanNext {
+                from: NodeId(3),
+                to: NODE,
+                delivery: planned
+                    .iter()
+                    .find(|(named, _)| *named == at)
+                    .map_or(Delivery::Deliver { delay_millis: 0 }, |(_, delivery)| {
+                        *delivery
+                    }),
+            })
+            .collect()
+    });
+    let mut plan = rebuild_plan(Vec::new());
+    plan.network_ops.extend(ops);
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let stop = runner.run(plan.limits).expect("the rebuild runs").stop;
+    let dispatcher = runner.dispatcher();
+    ReplyRun {
+        stop,
+        phase: dispatcher
+            .recovery(NODE, PartitionId(1))
+            .map(rdb_core::recovery::Recovery::phase),
+        copy_2_head: dispatcher
+            .replication()
+            .receiver(NodeId(3), PartitionId(1))
+            .map(|receiver| receiver.applied_head())
+            .map(|head| (head.seq.0, head.digest)),
+        replies: dispatcher
+            .network()
+            .transmissions()
+            .iter()
+            .filter(|sent| (sent.from, sent.to) == (NodeId(3), NODE))
+            .map(|sent| sent.copies)
+            .collect(),
+        waiting: dispatcher.network().planned().len(),
+    }
+}
+
+/// The rebuild run with nothing planned: it commits, and node 3 replies to node 1 and loses
+/// nothing.
+fn rebuild_control() -> ReplyRun {
+    use rdb_core::recovery::RecoveryPhase;
+    let control = rebuild_with_replies(&[]);
+    assert_eq!(control.stop.refusal(), None, "control: {:?}", control.stop);
+    assert_eq!(
+        control.phase,
+        Some(RecoveryPhase::Committed),
+        "control: the rebuild commits"
+    );
+    assert!(
+        !control.replies.is_empty() && control.replies.iter().all(|copies| *copies == 1),
+        "control: node 3 replies to node 1 and loses nothing: {:?}",
+        control.replies
+    );
+    control
+}
+
+/// Lead ruling B-R67, end to end (tester-kb-r1 B1, probe S3): one lost reply does not stall a
+/// catch-up. In the rebuild run node 3 holds only a receiver, so its every frame to node 1 is a
+/// reply to R1. The row loses each of them in turn, one per run, and every run ends where the
+/// control's does: `Committed`, with copy 2 at the same head. Some of those replies acknowledge a
+/// record R1's cursor still holds outstanding. Before B-R67 nothing re-sent such a record — the
+/// keepalive skips a copy with one outstanding — so losing its reply idled the rebuild in
+/// `Rebuilding` to any deadline. R1's retransmit re-sends it and node 3 acknowledges again.
+#[retcd_test]
+fn rebuild_a_lost_acknowledgement_is_recovered_by_r1s_retransmit() {
+    use rdb_sim::sim::network::Delivery;
+    support::preamble();
+    let control = rebuild_control();
+    for lost in 0..control.replies.len() {
+        let run = rebuild_with_replies(&[(lost, Delivery::Drop)]);
+        assert_eq!(run.stop.refusal(), None, "reply {lost}: {:?}", run.stop);
+        assert_eq!(run.waiting, 0, "reply {lost}: every plan was spent");
+        let dropped: Vec<usize> = (0..run.replies.len())
+            .filter(|at| run.replies[*at] == 0)
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![lost],
+            "reply {lost} is lost, and nothing else is: {:?}",
+            run.replies
+        );
+        assert_eq!(
+            run.ends(),
+            control.ends(),
+            "reply {lost} of {} lost: R1 recovers it, and the rebuild ends as the control's",
+            control.replies.len()
+        );
+    }
+}
+
+/// Lead rulings B-R67c and B-R67d, end to end (tester-kb-r1 B2, probe S4c): latency alone does
+/// not escalate a rebuild. Nothing is lost and the network duplicates nothing. Reply 1 is slow
+/// (300 ms, past R1's second retransmit fire), and one later reply `k` is slower (600 ms), for
+/// each `k` in turn. R1 re-sends the record whose ACK is slow, so node 3 acknowledges it twice,
+/// and the slow original can land while the cursor is mid-walk. The second ACK repeats what the
+/// cursor already took and is split off before the in-flight check: at the mark it is progress,
+/// below it `Recorded`, never a send or a snapshot. So every run ends where the control's does:
+/// no refusal, `Committed`, copy 2 at the same head. Before the split a repeat reached the
+/// in-flight check as `Unverifiable` and asked for a snapshot the sim does not build.
+#[retcd_test]
+fn rebuild_two_slow_replies_end_as_the_control() {
+    use rdb_sim::sim::network::Delivery;
+    support::preamble();
+    let control = rebuild_control();
+    let slow = |delay_millis: u64| Delivery::Deliver { delay_millis };
+    // Reply 1 slow alone. The runs agree up to each one's reply `k`, so `k` ranges over the
+    // replies this run sends before its deadline.
+    let first = rebuild_with_replies(&[(1, slow(300))]);
+    let mut deviations: Vec<(Option<usize>, String)> = first
+        .deviation(&control)
+        .map(|how| (None, how))
+        .into_iter()
+        .collect();
+    for later in 2..first.replies.len() {
+        let run = rebuild_with_replies(&[(1, slow(300)), (later, slow(600))]);
+        assert!(
+            run.replies.iter().all(|copies| *copies == 1),
+            "reply {later}: nothing is lost or duplicated: {:?}",
+            run.replies
+        );
+        deviations.extend(run.deviation(&control).map(|how| (Some(later), how)));
+    }
+    assert!(
+        deviations.is_empty(),
+        "reply 1 at 300 ms, alone (None) and with reply k at 600 ms, k in 2..{}: every rebuild \
+         ends as the control's {:?}; these did not: {deviations:#?}",
+        first.replies.len(),
+        control.ends()
+    );
+}
+
+/// Lead rulings B-R67c and B-R67d, end to end (tester-kb-r1 probe S4b): a reply the network
+/// duplicates does not escalate a rebuild. Reply 1 arrives twice, the second copy 5 ms or 300 ms
+/// behind the first. The second copy repeats an ACK the cursor already took, so it is split off
+/// as progress or `Recorded`, and the run ends where the control's does. Before the split it was
+/// refused `Unverifiable` and the rebuild stopped on the snapshot request (M7B-174, B-R58c).
+#[retcd_test]
+fn rebuild_a_duplicated_reply_ends_as_the_control() {
+    use rdb_sim::sim::network::Delivery;
+    support::preamble();
+    let control = rebuild_control();
+    let mut deviations = Vec::new();
+    for second_delay_millis in [5, 300] {
+        let run = rebuild_with_replies(&[(
+            1,
+            Delivery::Duplicate {
+                delay_millis: 0,
+                second_delay_millis,
+            },
+        )]);
+        assert_eq!(
+            run.replies.get(1),
+            Some(&2),
+            "reply 1 arrives twice: {:?}",
+            run.replies
+        );
+        deviations.extend(
+            run.deviation(&control)
+                .map(|how| (second_delay_millis, how)),
+        );
+    }
+    assert!(
+        deviations.is_empty(),
+        "reply 1 duplicated 5 or 300 ms apart: every rebuild ends as the control's {:?}; these \
+         did not: {deviations:#?}",
+        control.ends()
     );
 }
 
@@ -4584,10 +4815,42 @@ fn send_envelopes_only_the_primarys_own_engine_is_read() {
         "send_envelopes_only_the_primarys_own_engine_is_read",
         "no record at this sequence",
     );
-    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert_repeats_one_refusal(&warns, (1, 3, None), &report);
+}
+
+/// B-R67b: R1's retransmit re-sends an unanswered record every `RETRANSMIT_MS` and is not
+/// capped, so a record the provider cannot send is refused, and warned about, once per fire.
+/// A row therefore cannot count one warn. It checks that there is at least one, that every one
+/// is the same refusal (`node`, `seq`, and `fault`, or no `fault` for a missing record), and
+/// that there are no more than one per retransmit period over the time the run took, plus the
+/// first send. A provider or cursor that re-sends faster than R1's period breaks the bound.
+fn assert_repeats_one_refusal(
+    warns: &[String],
+    (node, seq, fault): (u64, u64, Option<&str>),
+    report: &rdb_sim::harness::run::RunReport,
+) {
+    use rdb_core::replication::catchup::RETRANSMIT_MS;
+    assert!(!warns.is_empty(), "the refusal is warned at least once");
+    for line in warns {
+        let value: serde_json::Value = serde_json::from_str(line).expect("a JSON log line");
+        assert_eq!(
+            (
+                value["node"].as_u64(),
+                value["seq"].as_u64(),
+                value["fault"].as_str()
+            ),
+            (Some(node), Some(seq), fault),
+            "every warn is the same refusal: {line}"
+        );
+    }
+    // The run's clock starts at tick 0 and a tick is a millisecond.
+    let elapsed = report.last_tick.0;
+    let bound = elapsed / RETRANSMIT_MS + 1;
+    let count = u64::try_from(warns.len()).expect("a count");
     assert!(
-        warns[0].contains("\"seq\":3") && warns[0].contains("\"node\":1"),
-        "{warns:?}"
+        count <= bound,
+        "{count} warns in {elapsed} ms: more than one per {RETRANSMIT_MS} ms retransmit, plus \
+         the first send ({bound})"
     );
 }
 
@@ -4683,11 +4946,7 @@ fn send_envelopes_a_tampered_value_under_its_old_digest_is_not_sent() {
         "send_envelopes_a_tampered_value_under_its_old_digest_is_not_sent",
         "failed its check",
     );
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(
-        warns[0].contains("DigestMismatch") && warns[0].contains("\"seq\":2"),
-        "{warns:?}"
-    );
+    assert_repeats_one_refusal(&warns, (1, 2, Some("DigestMismatch")), &report);
 }
 
 /// H02 (s04): key 2 holds record 3's bytes and its progress record is forged to (2, digest 3).
@@ -4711,8 +4970,7 @@ fn send_envelopes_a_record_under_the_wrong_key_is_not_sent() {
         "send_envelopes_a_record_under_the_wrong_key_is_not_sent",
         "failed its check",
     );
-    assert_eq!(warns.len(), 1, "{warns:?}");
-    assert!(warns[0].contains("WrongSeq"), "{warns:?}");
+    assert_repeats_one_refusal(&warns, (1, 2, Some("WrongSeq")), &report);
 }
 
 /// M01 (s07): across two inheritances (generation 2 from 1 at 2, generation 3 from 2 at 4), a
@@ -5186,5 +5444,846 @@ fn canonical_history_from_the_wrong_digest_is_refused_by_a_receiver_at_that_cuto
             })
         )),
         "{effects:?}"
+    );
+}
+
+/// Ruling B-R60, through the run loop: L1's `SetAdmission` is routed to R1 on the same node,
+/// and R1's keepalive runs exactly while admission is rejected.
+///
+/// The spine. `Recovered` lands on node 1 and L1 goes live `Paused` — admission rejected at
+/// birth. R1 took the `Recovered` first (it is offered to R1 ahead of L1), so a primary is there
+/// to start the keepalive. From then on, every 100 ms, the primary sends its head to the two
+/// regular secondaries, nodes 2 and 3, and never to the shadow, node 4. Their answers are what
+/// let L1 resume. When L1 admits, R1 cancels the keepalive and node 1 sends nothing more.
+///
+/// Every event is offered to all six modules, so R1 would hear `SetAdmission` even unrouted.
+/// What the route adds is the edge: R1 is a **named** consumer, offered straight after T1, so a
+/// decline by R1 stops the run. The offer order is the part of that the trace shows, and it is
+/// asserted here.
+#[retcd_test]
+fn route_l1s_admission_reaches_r1_whose_keepalive_runs_exactly_while_paused() {
+    use rdb_core::replication::primary::KEEPALIVE_MS;
+    support::preamble();
+    let plan = spine_plan();
+    let mut runner = Runner::new(&plan).expect("a runner");
+    // (tick, keepalive version, node 1's sends so far), sampled every 5 ms.
+    let mut samples = Vec::new();
+    for tick in (0..=8_000).step_by(5) {
+        let stop = runner
+            .run(RunLimits {
+                max_events: 100_000,
+                deadline: Tick(tick),
+            })
+            .expect("the spine runs")
+            .stop;
+        assert!(
+            matches!(
+                stop,
+                rdb_sim::harness::run::StopReason::DeadlineReached { .. }
+            ),
+            "the spine is work until each deadline, never a refusal: {stop:?}"
+        );
+        let dispatcher = runner.dispatcher();
+        let keepalive = dispatcher
+            .replication()
+            .primary(NODE, PartitionId(1))
+            .and_then(rdb_core::replication::primary::Primary::keepalive);
+        samples.push((tick, keepalive, dispatcher.network().transmissions().len()));
+    }
+    let sent: Vec<(NodeId, NodeId)> = runner
+        .dispatcher()
+        .network()
+        .transmissions()
+        .iter()
+        .map(|sent| (sent.from, sent.to))
+        .collect();
+    let trace = runner.finish().expect("a trace");
+
+    let admissions: Vec<(u64, NodeId, bool)> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::SetAdmission { state },
+                ..
+            } => Some((event.logical_tick, event.node, state.allow)),
+            _ => None,
+        })
+        .collect();
+    let [(paused, NODE, false), (allowed, NODE, true)] = admissions[..] else {
+        panic!("node 1 pauses at birth and later admits, once each: {admissions:?}");
+    };
+
+    // Each round: the first sample that shows a new version, and node 1's sends since the last.
+    let mut rounds = Vec::new();
+    for pair in samples.windows(2) {
+        let [(_, before, from), (tick, after, to)] = pair else {
+            unreachable!("windows of two");
+        };
+        if after.is_some() && after != before {
+            let mut targets: Vec<NodeId> = sent[*from..*to]
+                .iter()
+                .filter(|(sender, _)| *sender == NODE)
+                .map(|(_, target)| *target)
+                .collect();
+            targets.sort();
+            rounds.push((*tick, *after, targets));
+        }
+    }
+    assert!(rounds.len() >= 2, "the keepalive runs: {rounds:?}");
+    assert!(
+        rounds[0].0 >= paused && rounds[0].0 - paused < 5,
+        "the first round is the pause itself: paused at {paused}, {rounds:?}"
+    );
+    for (index, (tick, version, targets)) in rounds.iter().enumerate() {
+        assert_eq!(
+            *version,
+            Some(TimerVersion(u64::try_from(index + 1).expect("small"))),
+            "one version per round"
+        );
+        assert_eq!(
+            targets,
+            &vec![NodeId(2), NodeId(3)],
+            "round at {tick}: the head to each regular secondary, never to the shadow"
+        );
+        assert!(*tick <= allowed + 5, "no round after admission: {tick}");
+    }
+    assert!(
+        rounds
+            .windows(2)
+            .all(|pair| pair[1].0 - pair[0].0 == KEEPALIVE_MS),
+        "every {KEEPALIVE_MS} ms: {rounds:?}"
+    );
+    let after_allow: Vec<_> = samples
+        .iter()
+        .filter(|(tick, _, _)| *tick >= allowed + 5)
+        .collect();
+    assert!(
+        after_allow
+            .iter()
+            .all(|(_, keepalive, _)| keepalive.is_none()),
+        "admission cancels the keepalive"
+    );
+    let sends_then = after_allow.first().expect("samples after admission").2;
+    assert!(
+        sent[sends_then..].iter().all(|(sender, _)| *sender != NODE),
+        "and node 1 sends nothing more: {:?}",
+        &sent[sends_then..]
+    );
+
+    // The route: the two `SetAdmission` events are offered to T1, then R1, then the rest.
+    let mut offers: std::collections::BTreeMap<EventId, (u64, Vec<(ModuleName, bool)>)> =
+        std::collections::BTreeMap::new();
+    for event in &trace.events {
+        if let TraceKind::ModuleDispatch {
+            event: id,
+            module,
+            outcome,
+        } = &event.kind
+        {
+            offers
+                .entry(*id)
+                .or_insert_with(|| (event.logical_tick, Vec::new()))
+                .1
+                .push((*module, matches!(outcome, DispatchOutcome::Answered { .. })));
+        }
+    }
+    let routed: Vec<(u64, bool)> = offers
+        .values()
+        .filter(|(_, offered)| {
+            offered
+                .iter()
+                .map(|(module, _)| *module)
+                .collect::<Vec<_>>()
+                == [
+                    ModuleName::Transaction,
+                    ModuleName::Replication,
+                    ModuleName::Authority,
+                    ModuleName::Publication,
+                    ModuleName::Protection,
+                    ModuleName::Recovery,
+                ]
+        })
+        .map(|(tick, offered)| (*tick, offered[1].1))
+        .collect();
+    assert_eq!(
+        routed,
+        vec![(paused, true), (allowed, true)],
+        "each SetAdmission offered to T1 then R1, and R1 answered it"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// F1's catch-up through a source that is not the primary (lead rulings B-R59, B-R59a): the
+// request goes to the source's node, the source's records go out as recovery appends signed
+// with the credential, and the source's `CopyCaughtUp` comes back to the F1 that asked.
+// ------------------------------------------------------------------------------------------
+
+/// A credential minted for copy `sender`, with a prior generation (2) and owner epoch (3) that no
+/// lineage in these rows carries, so a frame signed from anything but the credential shows in
+/// both fields. In a real recovery the source's receiver is at the credential's prior generation;
+/// they differ here only to tell the two sources apart (tester-kb-r1 A2, survivor S03).
+fn catch_up_credential(sender: u8) -> rdb_core::contracts::authority::FenceCredential {
+    rdb_core::contracts::authority::FenceCredential {
+        partition: PartitionId(1),
+        prior_generation: Generation(2),
+        prior_owner_epoch: OwnerEpoch(3),
+        control_revision: rdb_core::contracts::ids::Revision(1),
+        sender: CopyId(sender),
+    }
+}
+
+/// B-R59 surface items 1 and 4. Both of F1's catch-up requests reach R1, as
+/// `KernelEvent::CatchUp` with the same four fields, on the node the scenario placed the source
+/// on, and are held to R1's answer. The source's `CopyCaughtUp` then goes back to the asking F1's
+/// node, once; a second one from the same source has no asker left and stays on its own node.
+/// A source the scenario never placed is refused by name, and nothing is scheduled.
+#[retcd_test]
+fn provider_catch_up_goes_to_the_node_holding_its_source() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    support::preamble();
+    let credential = catch_up_credential(1);
+    let requests = [
+        RecoveryEffect::CatchUp {
+            from: CopyId(1),
+            to: CopyId(2),
+            through: Seq(2),
+            credential,
+        },
+        RecoveryEffect::CatchUpBeforeGrant {
+            from: CopyId(1),
+            to: CopyId(2),
+            through: Seq(2),
+            credential,
+        },
+    ];
+    for request in requests {
+        let mut dispatcher = with_survivor();
+        let mut scheduler = Scheduler::new();
+        deliver_on(
+            &mut dispatcher,
+            &mut scheduler,
+            NODE,
+            effect_from(
+                ModuleName::Recovery,
+                EffectKind::Kernel(KernelEffect::Recovery(request.clone())),
+            ),
+        )
+        .expect("a provider");
+        let routed = scheduler.pop().expect("the request is routed");
+        assert_eq!(
+            (routed.at, routed.node, routed.boot, routed.partition),
+            (Tick(0), PEER, PEER_BOOT, PartitionId(1)),
+            "{request:?}: at once, to the source's node under its boot"
+        );
+        assert_eq!(routed.correlation, CorrelationId(1), "{request:?}");
+        assert_eq!(
+            routed.kind,
+            EventKind::Kernel(KernelEvent::CatchUp {
+                from: CopyId(1),
+                to: CopyId(2),
+                through: Seq(2),
+                credential,
+            }),
+            "{request:?}"
+        );
+        assert!(dispatcher.take_routed(routed.id), "held to R1's answer");
+        assert_eq!(scheduler.queued(), 0, "one request, one event");
+
+        let caught_up = || {
+            effect_from(
+                ModuleName::Replication,
+                EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+                    copy: CopyId(2),
+                    head: Seq(2),
+                    digest: digest(2),
+                }),
+            )
+        };
+        let answer = EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::CopyCaughtUp {
+            copy: CopyId(2),
+            head: Seq(2),
+            digest: digest(2),
+        }));
+        deliver_on(&mut dispatcher, &mut scheduler, PEER, caught_up()).expect("routed");
+        let back = scheduler.pop().expect("the answer is routed");
+        assert_eq!(
+            (back.node, back.boot, back.kind.clone()),
+            (NODE, BOOT, answer.clone()),
+            "{request:?}: to the F1 that asked"
+        );
+        assert!(dispatcher.take_routed(back.id), "held to F1's answer");
+        deliver_on(&mut dispatcher, &mut scheduler, PEER, caught_up()).expect("routed");
+        let again = scheduler.pop().expect("routed");
+        assert_eq!(
+            (again.node, again.kind),
+            (PEER, answer),
+            "{request:?}: the asker is answered once; a repeat stays on the source's node"
+        );
+    }
+
+    let mut dispatcher = with_survivor();
+    let mut scheduler = Scheduler::new();
+    let unplaced = RecoveryEffect::CatchUp {
+        from: CopyId(3),
+        to: CopyId(2),
+        through: Seq(2),
+        credential: catch_up_credential(3),
+    };
+    assert_eq!(
+        deliver_on(
+            &mut dispatcher,
+            &mut scheduler,
+            NODE,
+            effect_from(
+                ModuleName::Recovery,
+                EffectKind::Kernel(KernelEffect::Recovery(unplaced)),
+            ),
+        ),
+        Err(SimError::Unavailable {
+            seam: "harness::dispatch::deliver::recovery"
+        }),
+        "a source nobody placed has no node to go to"
+    );
+    assert_eq!(scheduler.queued(), 0, "and nothing is sent anywhere");
+}
+
+/// B-R59 surface item 2. R1's `SendRecoveryEnvelopes` on the source's node becomes one unicast
+/// per record, to the node of the copy being caught up. Each body is
+/// `wire::encode_recovery_append` over the credential and the source's own stored bytes, and
+/// each `Frame.sender` is the credential's prior lineage, not the source receiver's. The records
+/// are read in the source receiver's own generation. A range is inclusive: asking through 2 sends
+/// 2 (tester-kb-r1 A1, survivor S04). A record the engine does not hold stops the range, as for
+/// `SendEnvelopes`; a node with no receiver is refused by name.
+#[retcd_test]
+fn provider_send_recovery_envelopes_unicasts_stored_records_signed_by_the_credential() {
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::ids::DurableSeq;
+    use rdb_core::contracts::transport::TransportEvent;
+    use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+    use rdb_core::replication::wire::{decode_recovery_append, RECOVERY_MAGIC};
+    support::preamble();
+    let history = send_history(2);
+    let mut dispatcher = two_nodes();
+    for batch in history.batches.clone() {
+        dispatcher.preload(PEER, batch).expect("a preload");
+    }
+    let credential = catch_up_credential(1);
+    let request = |through: u64| {
+        effect_from(
+            ModuleName::Replication,
+            EffectKind::Kernel(KernelEffect::SendRecoveryEnvelopes {
+                copy: CopyId(0),
+                from: Seq(1),
+                through: Seq(through),
+                credential,
+            }),
+        )
+    };
+    let mut scheduler = Scheduler::new();
+    assert_eq!(
+        deliver_on(&mut dispatcher, &mut scheduler, PEER, request(2)),
+        Err(SimError::Config {
+            field: "send_recovery_envelopes"
+        }),
+        "no receiver on the source's node, so no configuration to address the copy by"
+    );
+    assert_eq!(scheduler.queued(), 0);
+
+    dispatcher.replication_mut().install_receiver(
+        AppendReceiver::new(ReceiverInit {
+            config: support::rf3_config(),
+            own: CopyId(1),
+            lineage: send_lineage(),
+            head: Head {
+                seq: Seq(2),
+                digest: history.digest(2),
+            },
+            durable: DurableSeq(2),
+        })
+        .expect("a receiver at 2"),
+    );
+    let stored: Vec<Bytes> = (1..=2)
+        .map(|seq| {
+            dispatcher
+                .engine(PEER)
+                .expect("an engine")
+                .history_at(PartitionId(1), Generation(1), Seq(seq))
+                .expect("a stored record")
+                .0
+        })
+        .collect();
+    let drain = |scheduler: &mut Scheduler| {
+        let mut sent = Vec::new();
+        while let Some(arrival) = scheduler.pop() {
+            assert_eq!(
+                (arrival.node, arrival.boot),
+                (NODE, BOOT),
+                "to copy 0's node"
+            );
+            let EventKind::Transport(TransportEvent::Delivered { from, frame }) = arrival.kind
+            else {
+                panic!("an arrival, not {:?}", arrival.kind);
+            };
+            assert_eq!((from.node, from.boot), (PEER, PEER_BOOT), "from the source");
+            assert_eq!(
+                frame.config,
+                ConfigVersion(1),
+                "the source receiver's configuration"
+            );
+            assert_eq!(
+                frame.sender,
+                Lineage {
+                    partition: PartitionId(1),
+                    generation: Generation(2),
+                    owner_epoch: OwnerEpoch(3),
+                },
+                "signed with the credential's prior lineage"
+            );
+            assert_eq!(
+                &frame.body[..4],
+                RECOVERY_MAGIC,
+                "a recovery append on the wire"
+            );
+            let (carried, envelope) =
+                decode_recovery_append(&frame.body).expect("a recovery append");
+            assert_eq!(carried, credential, "carrying the credential unchanged");
+            sent.push(envelope);
+        }
+        sent
+    };
+    deliver_on(&mut dispatcher, &mut scheduler, PEER, request(2)).expect("served");
+    assert_eq!(
+        drain(&mut scheduler),
+        stored,
+        "through 2: records 1 and 2, in order, byte for byte, the last one included"
+    );
+    deliver_on(&mut dispatcher, &mut scheduler, PEER, request(3)).expect("served");
+    assert_eq!(
+        drain(&mut scheduler),
+        stored,
+        "through 3: the same two; nothing stands in for the missing 3"
+    );
+}
+
+/// tester-kb-r1 A4 (S2): a catch-up R1 refuses leaves no asker behind. Node 2 holds copy 1's
+/// placed survivor but serves no receiver, so R1 there refuses F1's `CatchUp` (`NotASource`)
+/// and starts nothing. A later `CopyCaughtUp` from node 2 then answers no catch-up of F1 on
+/// node 1, and goes to node 2's own F1 like any other.
+#[retcd_test]
+fn provider_a_refused_catch_up_leaves_no_asker_behind() {
+    use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
+    support::preamble();
+    let mut plan = RunPlan::new(support::cluster());
+    for seq in 1..=2 {
+        plan.preloads
+            .push((PEER, support::batch(1, seq, b"k", b"v")));
+    }
+    plan.survivors.push((PEER, PartitionId(1), survivor(1, 2)));
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let kernel = |from: ModuleName, kind: KernelEffect| Effect {
+        correlation: CorrelationId(1),
+        from,
+        partition: PartitionId(1),
+        kind: EffectKind::Kernel(kind),
+    };
+    let limits = |deadline: u64| RunLimits {
+        max_events: 50,
+        deadline: Tick(deadline),
+    };
+
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![kernel(
+                ModuleName::Recovery,
+                KernelEffect::Recovery(RecoveryEffect::CatchUp {
+                    from: CopyId(1),
+                    to: CopyId(2),
+                    through: Seq(2),
+                    credential: catch_up_credential(1),
+                }),
+            )],
+        )
+        .expect("routed to node 2");
+    let first = runner.run(limits(5)).expect("the run itself does not fail");
+    assert!(
+        matches!(first.stop, rdb_sim::harness::run::StopReason::QueueEmpty),
+        "{:?}",
+        first.stop
+    );
+    let refused = runner.recorded().iter().any(|event| {
+        event.node == PEER
+            && matches!(
+                &event.kind,
+                TraceKind::KernelNoted {
+                    module: ModuleName::Replication,
+                    note: KernelNote::Ignored {
+                        reason: KernelIgnoredReason::Replica(ReplicaIgnoreReason::NotASource)
+                    },
+                    ..
+                }
+            )
+    });
+    assert!(refused, "precondition: R1 on node 2 refused the catch-up");
+
+    let before = runner.recorded().len();
+    runner
+        .carry_out(
+            PEER,
+            BOOT,
+            vec![kernel(
+                ModuleName::Replication,
+                KernelEffect::CopyCaughtUp {
+                    copy: CopyId(2),
+                    head: Seq(2),
+                    digest: digest(2),
+                },
+            )],
+        )
+        .expect("routed");
+    let second = runner
+        .run(limits(10))
+        .expect("the run itself does not fail");
+    assert!(
+        matches!(second.stop, rdb_sim::harness::run::StopReason::QueueEmpty),
+        "{:?}",
+        second.stop
+    );
+    let heard_on: std::collections::BTreeSet<NodeId> = runner.recorded()[before..]
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::ModuleDispatch { .. }))
+        .map(|event| event.node)
+        .collect();
+    assert_eq!(
+        heard_on,
+        [PEER].into_iter().collect(),
+        "no asker is left for a refused catch-up: node 2's own F1 hears it"
+    );
+}
+
+/// Node 2 serves copy 1 at 2 from an installed receiver, and holds copy 1's placed survivor. No
+/// catch-up has been asked for yet.
+fn catch_up_setup() -> (Runner, rdb_sim::storage::history::CanonicalHistory) {
+    use rdb_core::contracts::ids::DurableSeq;
+    use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+    let history = send_history(2);
+    let mut plan = RunPlan::new(support::cluster());
+    for batch in history.batches.clone() {
+        plan.preloads.push((PEER, batch));
+    }
+    plan.survivors.push((PEER, PartitionId(1), survivor(1, 2)));
+    let mut runner = Runner::new(&plan).expect("a runner");
+    runner.dispatcher_mut().replication_mut().install_receiver(
+        AppendReceiver::new(ReceiverInit {
+            config: support::rf3_config(),
+            own: CopyId(1),
+            lineage: send_lineage(),
+            head: Head {
+                seq: Seq(2),
+                digest: history.digest(2),
+            },
+            durable: DurableSeq(2),
+        })
+        .expect("a receiver at 2"),
+    );
+    (runner, history)
+}
+
+/// F1 on node 1 asks for copy 2 to be caught up through 2 from copy 1, which the provider routes
+/// to node 2. Carried out, not yet run.
+fn ask_for_catch_up(runner: &mut Runner) {
+    let credential = rdb_core::contracts::authority::FenceCredential {
+        prior_generation: Generation(1),
+        prior_owner_epoch: OwnerEpoch(1),
+        ..catch_up_credential(1)
+    };
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(1),
+                from: ModuleName::Recovery,
+                partition: PartitionId(1),
+                kind: EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::CatchUp {
+                    from: CopyId(1),
+                    to: CopyId(2),
+                    through: Seq(2),
+                    credential,
+                })),
+            }],
+        )
+        .expect("routed to node 2");
+}
+
+/// Node 3, copy 2's holder, answers node 2 with `outcome`. Carried out, not yet run.
+fn node_3_answers(runner: &mut Runner, outcome: &rdb_core::contracts::envelope::AppendOutcome) {
+    use rdb_core::contracts::transport::SendEffect;
+    runner
+        .carry_out(
+            NodeId(3),
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(1),
+                from: ModuleName::Replication,
+                partition: PartitionId(1),
+                kind: EffectKind::Send(SendEffect::Unicast {
+                    to: PEER,
+                    frame: Frame {
+                        body: rdb_core::replication::wire::encode_reply(outcome),
+                        ..frame()
+                    },
+                }),
+            }],
+        )
+        .expect("sent to node 2");
+}
+
+/// A rejection that stops R1's cursor (`Stop::Refused`).
+fn not_a_member() -> rdb_core::contracts::envelope::AppendOutcome {
+    rdb_core::contracts::envelope::AppendOutcome::Rejected(
+        rdb_core::contracts::envelope::AppendReject::NotAMember,
+    )
+}
+
+/// Node 3's ACK of copy 2 at 2, with `digest` there: what finishes the catch-up.
+fn caught_up_at_2(
+    digest: rdb_core::contracts::digest::Digest,
+) -> rdb_core::contracts::envelope::AppendOutcome {
+    use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, ReplicaProgress};
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, ReceivedSeq};
+    let lineage = send_lineage();
+    AppendOutcome::Accepted(AppendAck {
+        partition: lineage.partition,
+        generation: lineage.generation,
+        owner_epoch: lineage.owner_epoch,
+        config_version: ConfigVersion(1),
+        from: NodeId(3),
+        boot: BOOT,
+        role: ReplicaRole::RegularSecondary,
+        progress: ReplicaProgress {
+            received: ReceivedSeq(2),
+            buffered_applied: AppliedSeq(2),
+            durable: DurableSeq(2),
+        },
+        digest_at_buffered: digest,
+    })
+}
+
+/// Whether R1 on node 2 is running a source for copy 2.
+fn source_running(runner: &Runner) -> bool {
+    runner
+        .dispatcher()
+        .replication()
+        .source(PEER, PartitionId(1), CopyId(2))
+        .is_some()
+}
+
+/// A catch-up R1 on node 2 accepted and is running: F1 on node 1 asked it to catch copy 2 up
+/// through 2, and R1 there started a source and sent node 3 a record. The source is still
+/// running when this returns.
+fn running_catch_up() -> (Runner, rdb_sim::storage::history::CanonicalHistory) {
+    let (mut runner, history) = catch_up_setup();
+    ask_for_catch_up(&mut runner);
+    let first = runner
+        .run(catch_up_limits(5))
+        .expect("the run itself does not fail");
+    assert_eq!(first.stop.refusal(), None, "{:?}", first.stop);
+    let sent = runner
+        .dispatcher()
+        .network()
+        .transmissions()
+        .iter()
+        .filter(|sent| (sent.from, sent.to) == (PEER, NodeId(3)))
+        .count();
+    assert!(
+        sent > 0,
+        "precondition: R1 on node 2 accepted and started sending"
+    );
+    assert!(
+        source_running(&runner),
+        "precondition: the source is running"
+    );
+    (runner, history)
+}
+
+fn catch_up_limits(deadline: u64) -> RunLimits {
+    RunLimits {
+        max_events: 200,
+        deadline: Tick(deadline),
+    }
+}
+
+/// Run to `deadline`, never a refusal: the nodes whose modules ran from the first event recorded
+/// after `before`.
+fn heard_on_after(
+    runner: &mut Runner,
+    before: usize,
+    deadline: u64,
+) -> std::collections::BTreeSet<NodeId> {
+    let report = runner
+        .run(catch_up_limits(deadline))
+        .expect("the run itself does not fail");
+    assert_eq!(report.stop.refusal(), None, "{:?}", report.stop);
+    runner.recorded()[before..]
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::ModuleDispatch { .. }))
+        .map(|event| event.node)
+        .collect()
+}
+
+/// Node 2's R1 reports copy 2 caught up at `digest`, carried out by hand, and the run carries
+/// it: the nodes whose modules then ran.
+fn copy_caught_up_heard_on(
+    runner: &mut Runner,
+    digest: rdb_core::contracts::digest::Digest,
+    deadline: u64,
+) -> std::collections::BTreeSet<NodeId> {
+    let before = runner.recorded().len();
+    runner
+        .carry_out(
+            PEER,
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(1),
+                from: ModuleName::Replication,
+                partition: PartitionId(1),
+                kind: EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+                    copy: CopyId(2),
+                    head: Seq(2),
+                    digest,
+                }),
+            }],
+        )
+        .expect("routed");
+    heard_on_after(runner, before, deadline)
+}
+
+/// The twin of `provider_a_refused_catch_up_leaves_no_asker_behind`: a catch-up R1 accepts
+/// keeps its asker. Node 2 serves copy 1 at 2, so R1 there starts a source for copy 2, and a
+/// later `CopyCaughtUp` from node 2 goes back to F1 on node 1.
+#[retcd_test]
+fn provider_an_accepted_catch_up_keeps_its_asker() {
+    support::preamble();
+    let (mut runner, history) = running_catch_up();
+    let heard_on = copy_caught_up_heard_on(&mut runner, history.digest(2), 10);
+    assert!(
+        heard_on.contains(&NODE),
+        "the asker, F1 on node 1, hears it: {heard_on:?}"
+    );
+}
+
+/// A source that finishes reports to its asker, end to end. Node 3 ACKs copy 2 at 2, the
+/// source's cursor reports `CopyCaughtUp`, and R1 drops the finished source **in the same step**.
+/// The step's report is what keeps the asker until the report is carried out to F1 on node 1: a
+/// source gone after the step is forgotten only when it reported nothing.
+#[retcd_test]
+fn provider_a_source_that_finishes_reports_to_its_asker() {
+    support::preamble();
+    let (mut runner, history) = running_catch_up();
+    let before = runner.recorded().len();
+    node_3_answers(&mut runner, &caught_up_at_2(history.digest(2)));
+    let heard_on = heard_on_after(&mut runner, before, 10);
+    assert!(
+        !source_running(&runner),
+        "precondition: R1 on node 2 dropped the finished source"
+    );
+    assert!(
+        heard_on.contains(&NODE),
+        "the asker, F1 on node 1, hears the source's report: {heard_on:?}"
+    );
+}
+
+/// A catch-up still queued keeps its asker through an earlier R1 step on its node. Node 1's
+/// append of record 1 to node 2's receiver is carried out first and F1's `CatchUp` second, so at
+/// the same tick R1 on node 2 answers the append before it has started any source. That step ends
+/// nothing it had not started: only a source running before a step, or the one the step starts,
+/// can be forgotten by it. When node 3 later ACKs copy 2 at 2, F1 on node 1 hears the report.
+#[retcd_test]
+fn provider_a_queued_catch_up_keeps_its_asker_through_an_earlier_r1_step() {
+    use rdb_core::contracts::transport::SendEffect;
+    support::preamble();
+    let (mut runner, history) = catch_up_setup();
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(1),
+                from: ModuleName::Replication,
+                partition: PartitionId(1),
+                kind: EffectKind::Send(SendEffect::Unicast {
+                    to: PEER,
+                    frame: Frame {
+                        body: record_of(&history.batches[0]),
+                        ..frame()
+                    },
+                }),
+            }],
+        )
+        .expect("sent to node 2");
+    ask_for_catch_up(&mut runner);
+    let first = runner
+        .run(catch_up_limits(5))
+        .expect("the run itself does not fail");
+    assert_eq!(first.stop.refusal(), None, "{:?}", first.stop);
+    let answered: Vec<EventId> = runner
+        .recorded()
+        .iter()
+        .filter(|event| event.node == PEER)
+        .filter_map(|event| match event.kind {
+            TraceKind::ModuleDispatch {
+                event,
+                module: ModuleName::Replication,
+                outcome: DispatchOutcome::Answered { .. },
+            } => Some(event),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        answered.len() >= 2,
+        "precondition: R1 on node 2 answered the append, then the catch-up: {answered:?}"
+    );
+    assert!(
+        source_running(&runner),
+        "precondition: the catch-up started after the earlier step"
+    );
+    let before = runner.recorded().len();
+    node_3_answers(&mut runner, &caught_up_at_2(history.digest(2)));
+    let heard_on = heard_on_after(&mut runner, before, 10);
+    assert!(
+        heard_on.contains(&NODE),
+        "the asker, F1 on node 1, hears the source's report: {heard_on:?}"
+    );
+}
+
+/// tester-kb-r1 A3: a source that stops leaves no asker behind. The catch-up of
+/// `running_catch_up` is running when node 3 answers it `NotAMember`, a rejection that stops
+/// R1's cursor, and R1 drops the source. No `CopyCaughtUp` of that catch-up can follow, so a
+/// later one from node 2 answers no catch-up of F1 on node 1 and goes to node 2's own F1 like any
+/// other. A source dropped any other way — `Recovered` for its partition — is the same case to the
+/// harness: the source was running before R1's step and is gone after it, with no
+/// `CopyCaughtUp` among the step's effects.
+#[retcd_test]
+fn provider_a_stopped_source_leaves_no_asker_behind() {
+    support::preamble();
+    let (mut runner, history) = running_catch_up();
+    node_3_answers(&mut runner, &not_a_member());
+    let stopped = runner
+        .run(catch_up_limits(10))
+        .expect("the run itself does not fail");
+    assert_eq!(stopped.stop.refusal(), None, "{:?}", stopped.stop);
+    assert!(
+        !source_running(&runner),
+        "precondition: R1 on node 2 dropped the stopped source"
+    );
+    let heard_on = copy_caught_up_heard_on(&mut runner, history.digest(2), 20);
+    assert_eq!(
+        heard_on,
+        [PEER].into_iter().collect(),
+        "no asker is left for a stopped source: node 2's own F1 hears it"
     );
 }

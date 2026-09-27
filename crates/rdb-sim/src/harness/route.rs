@@ -25,6 +25,15 @@
 //! configuration change ahead of L1. `LocalApplied` reaches L1 and then R1 in the same tick it
 //! was emitted, and ahead of anything the same step shipped (B-R48): the dispatcher schedules
 //! effects in vector order, and the primary emits it before the record it ships.
+//!
+//! L1's `SetAdmission` reaches T1 and R1 (ruling B-R60: R1 runs its keepalive exactly while
+//! admission is rejected). R1 takes a `Recovered` **before** the `SetAdmission(Reject)` L1 emits
+//! for it: `Recovered` is offered to R1 ahead of L1, and L1's answer is a new event scheduled
+//! behind it. Otherwise a partition paused at birth would find no primary to start a keepalive.
+//!
+//! F1's `CatchUp` and `CatchUpBeforeGrant` reach R1 as [`KernelEvent::CatchUp`] at the node that
+//! holds the named source copy (rulings B-R59, B-R59a); the dispatcher picks that node, not this
+//! table. R1's `CopyCaughtUp` from that source goes back to the node of the F1 that asked.
 
 use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent};
 use rdb_core::contracts::event::{KernelEffect, KernelEvent, ModuleName};
@@ -84,11 +93,13 @@ pub enum Arm {
     StatusTrim,
     /// [`KernelEvent::RetireGeneration`].
     RetireGeneration,
+    /// [`KernelEvent::CatchUp`].
+    CatchUp,
 }
 
 impl Arm {
     /// Every arm, in declaration order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 24] = [
         Self::PeerProgress,
         Self::CopyLost,
         Self::SetAdmission,
@@ -112,6 +123,7 @@ impl Arm {
         Self::DedupTrim,
         Self::StatusTrim,
         Self::RetireGeneration,
+        Self::CatchUp,
     ];
 
     /// The arm of `event`, or `None` for an arm added to the `#[non_exhaustive]` enum after this
@@ -143,6 +155,7 @@ impl Arm {
             KernelEvent::DedupTrim { .. } => Self::DedupTrim,
             KernelEvent::StatusTrim { .. } => Self::StatusTrim,
             KernelEvent::RetireGeneration { .. } => Self::RetireGeneration,
+            KernelEvent::CatchUp { .. } => Self::CatchUp,
             _ => return None,
         })
     }
@@ -159,8 +172,10 @@ pub const fn consumers(arm: Arm) -> &'static [ModuleName] {
         // "Delivered to L1" (design §4.1); F1 drops a lost source (§5).
         Arm::CopyLost => &[Protection, Recovery],
         Arm::PeerProgress | Arm::DurableAdvanced => &[Protection],
+        // T1's admission gate, and R1's keepalive (ruling B-R60; ADR-rdb-0006 amendment).
+        Arm::SetAdmission => &[Transaction, Replication],
         // "Delivered to T1" (design §4.5; kernel-a §4.2, §4.4).
-        Arm::SetAdmission | Arm::Published | Arm::DedupTrim => &[Transaction],
+        Arm::Published | Arm::DedupTrim => &[Transaction],
         // R1 rewrites its receiver and primary; L1 rebuilds its state (design §5.8).
         Arm::Recovered => &[Replication, Protection],
         // "Delivered to L1 ... and to P1" (design §4.1); `BlockPartition` likewise.
@@ -179,6 +194,8 @@ pub const fn consumers(arm: Arm) -> &'static [ModuleName] {
         Arm::ConfigChanged => &[Protection, Publication, Replication],
         Arm::Recovery => &[Recovery],
         Arm::DivergenceDetected | Arm::CopyQuarantined => &[Replication],
+        // F1's catch-up request, at the node of its source copy (rulings B-R59, B-R59a).
+        Arm::CatchUp => &[Replication],
         // "T1's applied candidate, for P1" (kernel-a design §1.3). Not R1: R1 learns the
         // history from `LocalApplied` alone, once per seq and in order (B-R47, A-R65).
         Arm::AppliedCandidate | Arm::Publication | Arm::StatusTrim => &[Publication],
@@ -320,8 +337,10 @@ pub fn offer_order(arm: Option<Arm>) -> [ModuleName; 6] {
 /// arms, P1's `Publication(..)` outputs under A-R65.3), which the dispatcher keeps as notes; F1's
 /// requests to the environment, which go to a provider or are refused by name; and every arm with
 /// no consumer this table knows — R1's `SnapshotCatchupRequired` and `CopyAheadOnControl` —
-/// which the dispatcher refuses by name; R1's `SendEnvelopes` has a provider instead (B-R57). `SetAdmission` is routed **and**
-/// noted (ruling B-R42's note stays).
+/// which the dispatcher refuses by name. R1's `SendEnvelopes` (B-R57) and
+/// `SendRecoveryEnvelopes` (B-R59) have providers instead, and so do F1's `CatchUp` and
+/// `CatchUpBeforeGrant`, which the dispatcher routes as [`KernelEvent::CatchUp`] to the source's
+/// node. `SetAdmission` is routed **and** noted (ruling B-R42's note stays).
 #[must_use]
 pub fn event_for(effect: &KernelEffect) -> Option<KernelEvent> {
     Some(match effect {
@@ -472,5 +491,28 @@ mod tests {
     #[test]
     fn an_applied_candidate_is_for_p1_only() {
         assert_eq!(consumers(Arm::AppliedCandidate), [ModuleName::Publication]);
+    }
+
+    /// F1's catch-up reaches R1 by name (B-R59), so R1's decline on it stops the run.
+    #[test]
+    fn a_catch_up_is_for_r1_by_name() {
+        use rdb_core::contracts::authority::FenceCredential;
+        use rdb_core::contracts::event::KernelEvent;
+        use rdb_core::contracts::ids::{Generation, OwnerEpoch, PartitionId, Revision, Seq};
+        use rdb_core::contracts::membership::CopyId;
+        let event = KernelEvent::CatchUp {
+            from: CopyId(1),
+            to: CopyId(2),
+            through: Seq(1),
+            credential: FenceCredential {
+                partition: PartitionId(1),
+                prior_generation: Generation(1),
+                prior_owner_epoch: OwnerEpoch(1),
+                control_revision: Revision(1),
+                sender: CopyId(1),
+            },
+        };
+        assert_eq!(Arm::of(&event), Some(Arm::CatchUp));
+        assert_eq!(consumers(Arm::CatchUp), [ModuleName::Replication]);
     }
 }

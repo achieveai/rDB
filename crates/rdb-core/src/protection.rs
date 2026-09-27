@@ -54,10 +54,10 @@ use state::State;
 
 /// The first [`TimerId`] L1 owns. Every id in `[PROTECTION_TIMER_BASE, +1)` is L1's.
 ///
-/// A reserved block, the same pattern as `authority::AUTHORITY_TIMER_BASE` (`0x00A1_0000`,
-/// four ids), and far from it: the two blocks cannot overlap. L1 arms no timer itself (design
+/// A reserved block, the same pattern as `authority::AUTHORITY_TIMER_BASE` (`0x00A1 << 48`,
+/// four ids), under its own tag: the two blocks cannot overlap. L1 arms no timer itself (design
 /// §4.7); H1 fires this id on the health cadence and a fixture may author it directly.
-pub const PROTECTION_TIMER_BASE: u64 = 0x00B1_0000;
+pub const PROTECTION_TIMER_BASE: u64 = 0x00B1 << 48;
 
 /// The health-evaluation timer: design §4.4's `HealthEval{now}`, with `now` read from
 /// `ctx.now` and never from the firing (T-B-02).

@@ -67,7 +67,7 @@ use lineage::{select_leader, select_prefix_spied, Rejected, SelectionOutcome, Se
 use rebuild::{Rebuild, Refused};
 
 /// The first [`TimerId`] F1 owns. F1 arms one timer, [`DISCOVERY_TIMER`].
-pub const RECOVERY_TIMER_BASE: u64 = 0x00F1_0000;
+pub const RECOVERY_TIMER_BASE: u64 = 0x00F1 << 48;
 
 /// The discovery-window deadline, reused as the probe-wait deadline once the window closes, and
 /// then as the deadline on synchronising and the barrier after selection (ruling F-a), and on each

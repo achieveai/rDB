@@ -48,9 +48,9 @@ pub const PUBLICATION_CORRELATION_BASE: u64 = 0x00D1 << 48;
 /// mints a `SnapshotHandle`; the harness's step-context view, rdb-sim's `STEP_VIEW`
 /// (`u64::MAX`), lies outside the block. The same `0x00D1` tag marks P1's other minted identifiers,
 /// each in its own id space: [`PUBLICATION_CORRELATION_BASE`] (`0x00D1 << 48`) for correlations,
-/// and `PUBLICATION_TIMER_BASE` (`0x00D1_0000`) for timers, beside `AUTHORITY_TIMER_BASE`
-/// (`0x00A1_0000`, `authority.rs`), `PROTECTION_TIMER_BASE` (`0x00B1_0000`, `protection.rs`) and
-/// `RECOVERY_TIMER_BASE` (`0x00F1_0000`, `recovery.rs`).
+/// and `PUBLICATION_TIMER_BASE` (`0x00D1 << 48`) for timers, beside `AUTHORITY_TIMER_BASE`
+/// (`0x00A1 << 48`, `authority.rs`), `PROTECTION_TIMER_BASE` (`0x00B1 << 48`, `protection.rs`)
+/// and `RECOVERY_TIMER_BASE` (`0x00F1 << 48`, `recovery.rs`).
 ///
 /// The counter restarts with the kernel on a new boot. Until storage drops views on a crash, a
 /// restarted counter can reuse a handle a crashed boot leaked.

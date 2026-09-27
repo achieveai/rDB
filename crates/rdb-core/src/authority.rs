@@ -178,7 +178,11 @@ pub const WATCH_BACKOFF_CAP_MILLIS: u64 = 2_000;
 /// [`crate::contracts::time::TimerFired`] of a chosen kind without first making A1 arm one
 /// (lead ruling A-R37, the Manual Tester's B2). Far from zero so that a default-constructed
 /// `TimerId` is not accidentally one of A1's.
-pub const AUTHORITY_TIMER_BASE: u64 = 0x00A1_0000;
+///
+/// Every kernel module's timer block is its tag in bits 48..64 — A1 `0x00A1`, L1 `0x00B1`,
+/// R1 `0x00C1`, P1 `0x00D1`, F1 `0x00F1` — with a kind in bits 32..48 and a partition in bits
+/// 0..32, so no partition moves an id into another module's block (`tests/timer_ids.rs`).
+pub const AUTHORITY_TIMER_BASE: u64 = 0x00A1 << 48;
 
 /// Which of A1's timers a [`TimerId`] is.
 ///

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use config_log::retcd_test;
 use rdb_core::contracts::authority::PartitionMode;
 use rdb_core::contracts::control::ControlKey;
-use rdb_core::contracts::event::Budgets;
+use rdb_core::contracts::event::{Budgets, ModuleName};
 use rdb_core::contracts::ids::{PartitionId, ScenarioId, Seq};
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{LossRecord, RecoveryEffect, UnavailableReason};
@@ -457,7 +457,10 @@ fn oracle_half(run: &ScenarioRun) -> Vec<(Invariant, Verdict)> {
 /// (M7B-137). F1 then re-emits `Recovered` with `mode: Active` and the same loss record
 /// (T-B-03). The same split M7B-104 took at B-R58b.
 ///
-/// L1 stays `Paused` after this (the B-R60 keepalive gap), and nothing here asserts otherwise.
+/// L1 stays `Paused` after this, so R1's B-R60 keepalive runs to the deadline by design. Ruling
+/// B-R65 bounds its rate, not its time: the budget is a function of the deadline
+/// ([`cases::f1_r1_max_events`]), and every full window after the pause holds at most
+/// [`cases::F1_R1_STEADY_POPS_PER_WINDOW`] pops, asserted before the stop reason.
 ///
 /// **Oracle half**: the trace opens with the 9-line capability preamble, the oracle finds
 /// nothing, and every verdict whose package is unwired is `Unavailable{Capability(p)}`.
@@ -467,6 +470,11 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
     let scenario = cases::case_f1_r1_discovery_window();
     assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
     assert!(scenario.max_events_implied() <= scenario.budget.max_events);
+    assert_eq!(
+        scenario.budget.max_events,
+        cases::f1_r1_max_events(scenario.budget.max_ticks),
+        "the budget is a function of the deadline (ruling B-R65), never flat"
+    );
     let lowered = scenario_run::lower(&scenario);
     assert_eq!(lowered.as_ref().err(), None, "the case lowers whole");
 
@@ -479,6 +487,54 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
         census = ?scenario_run::census(trace),
         "m7v_47 f1/r1 run"
     );
+    // The steady rate after the pause, checked before the budget (ruling B-R65): L1 stays
+    // `Paused` for good here, so R1's keepalive (B-R60) runs to the deadline by design, and what
+    // is bounded is its rate. A keepalive that speeds up fails here by name, not as a budget
+    // overrun. One pop is six `ModuleDispatch` lines, so a pop is counted by its Authority offer.
+    let pops_at: BTreeMap<u64, u64> = trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::ModuleDispatch {
+                    module: ModuleName::Authority,
+                    ..
+                }
+            )
+        })
+        .fold(BTreeMap::new(), |mut pops, event| {
+            *pops.entry(event.logical_tick).or_insert(0) += 1;
+            pops
+        });
+    let last_tick = trace.events.iter().map(|event| event.logical_tick).max();
+    let last_tick = last_tick.expect("the run traced something");
+    // Window 0 holds R1's walk at close + 10 and belongs to the base, not the rate.
+    let windows: Vec<(u64, u64)> = (1..)
+        .map(|k| cases::F1_R1_PAUSED_AT + k * cases::F1_R1_RATE_WINDOW)
+        .take_while(|start| start + cases::F1_R1_RATE_WINDOW <= last_tick)
+        .map(|start| {
+            let pops = pops_at
+                .range(start..start + cases::F1_R1_RATE_WINDOW)
+                .map(|(_, pops)| pops)
+                .sum();
+            (start, pops)
+        })
+        .collect();
+    tracing::info!(?windows, last_tick, "m7v_47 f1/r1 steady pops per window");
+    assert!(
+        !windows.is_empty(),
+        "at least one full window after the pause is checked"
+    );
+    for (start, pops) in &windows {
+        assert!(
+            *pops <= cases::F1_R1_STEADY_POPS_PER_WINDOW,
+            "the B-R60 keepalive's rate grew (ruling B-R65): {pops} pops in [{start}, +{}), \
+             measured at most {}",
+            cases::F1_R1_RATE_WINDOW,
+            cases::F1_R1_STEADY_POPS_PER_WINDOW
+        );
+    }
     // A live primary is work until a limit (L1 evaluates every 50 ms), so a run that completes
     // ends at its tick budget, never by exhausting its events or by a refusal.
     assert!(

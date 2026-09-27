@@ -21,32 +21,99 @@
 //! One ACK the tracker drops still reaches a cursor (lead ruling B-R58c): below a recovery
 //! cutoff a built primary holds no rungs, so a copy walked up from the root sends ACKs the
 //! ladder can neither verify nor refute. When such an ACK names exactly the record the copy's
-//! running cursor has in flight, below the anchor, it moves the cursor and nothing else — no
+//! running cursor has in flight — sent and not yet ACKed, even after an `AlreadyHave` (lead
+//! ruling B-R67a) — below the anchor, it moves the cursor and nothing else — no
 //! watermark, no predicate, no `PeerProgress` — and is traced `InFlightUnverified`. The first
 //! ACK the ladder verifies, at the cutoff, moves the watermarks in one step.
+//!
+//! # Keepalive (ADR-rdb-0006 amendment 2026-09-26, lead ruling B-R60)
+//!
+//! One of R1's two timers; the other is the catch-up retransmit. L1 resumes only on `replication_lag < 250 ms` held for 5 s, and lag moves only
+//! on an admitted ACK, while a paused partition takes no writes to ACK. So while L1's last
+//! `SetAdmission` rejected, the primary re-sends its head to every regular secondary every
+//! [`KEEPALIVE_MS`]. A copy that holds it answers `AlreadyHave` and its current ACK, which the
+//! ladder admits like any other, and that emits `PeerProgress`. A silent copy draws nothing, so it
+//! still blocks resume. The keepalive starts on a rejecting `SetAdmission` and stops on the
+//! allowing one; an idle or healthy partition arms nothing and sends nothing.
+//!
+//! A copy whose cursor has a record in flight — sent and not ACKed, even after an `AlreadyHave`
+//! (lead ruling B-R67c, item A2) — is skipped: that record already draws its ACK, and a head it
+//! lacks would draw a `NeedPrefix` that restarts the cursor's step 1 under it. If that ACK is
+//! lost, the retransmit timer re-sends the record, not the keepalive (lead ruling B-R67,
+//! joint-gate B1; see [`crate::replication::catchup`]). An idle cursor, one with nothing
+//! unACKed, does not skip its copy: nothing else will ever ask that copy for an ACK, so skipping
+//! it would hold the partition paused for good.
+//!
+//! # Repeats (lead rulings B-R67c, B-R67d and B-R67f)
+//!
+//! An ACK that repeats what the copy's running cursor already took — rules 1–7 admit it, and
+//! [`CatchupCursor::repeat`] names it — is split off before the in-flight check and never
+//! reaches the cursor: it sends nothing and escalates nothing. The retransmit makes such ACKs
+//! routine: a slow ACK and the re-send's ACK both arrive. Before B-R67c, below a recovery cutoff
+//! the second one asked for a snapshot. A repeat whose digest contradicts the one taken is not a
+//! repeat, and takes the ladder as before.
+//!
+//! With no cursor, or one that has taken no ACK, the repeat is judged against what the tracker
+//! knows instead: the copy's held progress, raised to the floor a `Recovered` barrier proved
+//! for it (lead rulings B-R67e and B-R67f). A `Recovered` drops every cursor and zeroes every
+//! other copy's watermarks, so without the floor a duplicate ACK from before it asked for a
+//! snapshot. The floor is read by this judgment and nothing else.
+//!
+//! A repeat at the mark — every watermark at it, with the digest taken there — is a liveness
+//! report, and the keepalive's ACK is one by design. It runs the tracker's rules 1–9 as a first
+//! ACK there would, and a verified one emits `PeerProgress` (B-R60); one the ladder cannot
+//! verify answers `Recorded`, as a repeat below the cutoff did before
+//! ([`ProgressTracker::on_repeat_at_mark`]). A repeat strictly below the mark answers
+//! `Recorded` and changes nothing: a late duplicate must not tell L1 a position older than the
+//! one it already has.
+//! A shadow never counts toward lag, and a diverged copy's ACKs are dropped at rule 1d, so
+//! neither is sent one.
 
 use std::collections::BTreeMap;
 
 use crate::contracts::authority::AuthorityView;
 use crate::contracts::envelope::{AppendAck, AppendOutcome};
 use crate::contracts::event::{EffectKind, KernelEffect, KernelEvent};
-use crate::contracts::ids::{BootId, NodeId, Seq};
+use crate::contracts::ids::{BootId, NodeId, PartitionId, ReplicaRole, Seq, TimerId, TimerVersion};
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::CopyId;
 use crate::contracts::recovery::RecoveryResult;
 use crate::contracts::storage::DurablePrefix;
-use crate::contracts::time::Tick;
+use crate::contracts::time::{Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::AckRejectReason;
 use crate::contracts::transport::PeerLabel;
-use crate::replication::catchup::CatchupCursor;
+use crate::replication::catchup::{CatchupCursor, Repeat};
 use crate::replication::progress::ProgressTracker;
 use crate::replication::{ignored, wire};
+
+/// The first [`TimerId`] R1 owns: one keepalive timer per partition, at `base + partition`. R1's
+/// block is the tag `0x00C1` in bits 48..64, the scheme A1 (`0x00A1`), L1 (`0x00B1`), P1
+/// (`0x00D1`) and F1 (`0x00F1`) use, so no partition number reaches another module's ids. The
+/// retransmit timers sit `2^40` above it, in the same block
+/// ([`crate::replication::catchup::RETRANSMIT_TIMER_BASE`]).
+pub const REPLICATION_TIMER_BASE: u64 = 0x00C1 << 48;
+
+/// How often a primary whose admission is rejected re-sends its head (ADR-rdb-0006 amendment
+/// 2026-09-26): well inside L1's 250 ms resume lag, so one lost round does not restart the hold.
+pub const KEEPALIVE_MS: u64 = 100;
+
+/// The keepalive timer for `partition`.
+#[must_use]
+pub fn keepalive_timer(partition: PartitionId) -> TimerId {
+    TimerId(REPLICATION_TIMER_BASE + u64::from(partition.0))
+}
 
 /// The tracker for one partition this node leads, and its running catch-up cursors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Primary {
     tracker: ProgressTracker,
     cursors: BTreeMap<CopyId, CatchupCursor>,
+    /// The version of the keepalive timer armed while admission is rejected; `None` while it is
+    /// allowed, or before L1 has said either.
+    keepalive: Option<TimerVersion>,
+    /// The last keepalive version armed. Every arm takes a new one, so a fire from an earlier
+    /// arm is told apart from the one armed now.
+    armed: u64,
 }
 
 impl Primary {
@@ -56,6 +123,8 @@ impl Primary {
         Self {
             tracker,
             cursors: BTreeMap::new(),
+            keepalive: None,
+            armed: 0,
         }
     }
 
@@ -63,6 +132,12 @@ impl Primary {
     #[must_use]
     pub const fn tracker(&self) -> &ProgressTracker {
         &self.tracker
+    }
+
+    /// The keepalive version armed now, while admission is rejected.
+    #[must_use]
+    pub const fn keepalive(&self) -> Option<TimerVersion> {
+        self.keepalive
     }
 
     /// The running cursor for `copy`, if one is.
@@ -77,6 +152,17 @@ impl Primary {
     pub fn on_reply(&mut self, from: &PeerLabel, body: &[u8], tick: Tick) -> Vec<EffectKind> {
         match wire::decode_reply(body) {
             Ok(AppendOutcome::Accepted(ack)) => {
+                match self.repeat(from, &ack) {
+                    Some(Repeat::AtMark) => {
+                        return self.tracker.on_repeat_at_mark(from, &ack, tick)
+                    }
+                    Some(Repeat::BelowMark) => {
+                        return vec![ignored(KernelIgnoredReason::Replica(
+                            ReplicaIgnoreReason::Recorded,
+                        ))]
+                    }
+                    None => {}
+                }
                 if let Some(copy) = self.in_flight_unverified(from, &ack) {
                     let mut effects = vec![ignored(KernelIgnoredReason::AckRejected(
                         AckRejectReason::InFlightUnverified,
@@ -152,9 +238,114 @@ impl Primary {
     /// was chasing a head the new root may have cut (lead ruling B-R48). A copy still behind asks
     /// again, and a copy ahead of the cut gets the tracker's snapshot request instead of a
     /// `CopyCaughtUp` for a head it has passed.
+    ///
+    /// A primary the pin retires stops its keepalive: it leads nothing, and a later
+    /// `SetAdmission` finds no serving primary.
     pub fn on_recovered(&mut self, result: &RecoveryResult, tick: Tick) -> Vec<EffectKind> {
         self.cursors.clear();
-        self.tracker.on_recovered(result, tick)
+        let mut effects = self.tracker.on_recovered(result, tick);
+        if self.tracker.retired() {
+            effects.extend(self.stop_keepalive());
+        }
+        effects
+    }
+
+    /// L1's `SetAdmission`, routed to R1 (ADR-rdb-0006 amendment 2026-09-26). A rejecting one
+    /// starts the keepalive at once: one round now, the next [`KEEPALIVE_MS`] later. An allowing
+    /// one cancels it. Any other is `NotRequired`: the keepalive already runs, or never ran.
+    pub fn on_admission(&mut self, allow: bool, now: Tick) -> Vec<EffectKind> {
+        match (allow, self.keepalive) {
+            (false, None) => self.keepalive_round(now),
+            (true, Some(_)) => self.stop_keepalive().into_iter().collect(),
+            _ => vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::NotRequired,
+            ))],
+        }
+    }
+
+    /// This partition's keepalive timer fired. The version armed now sends a round and arms the
+    /// next; any other is `StaleTimer` and sends nothing: a fire already in flight when the
+    /// keepalive stopped or re-armed.
+    pub fn on_keepalive(&mut self, fired: &TimerFired, now: Tick) -> Vec<EffectKind> {
+        if self.keepalive != Some(fired.version) {
+            return vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::StaleTimer,
+            ))];
+        }
+        self.keepalive_round(now)
+    }
+
+    /// One keepalive round: the head to every copy [`Self::keepalive_targets`] names, then the
+    /// next arm. With no record at all there is no head to send, and the timer still re-arms.
+    fn keepalive_round(&mut self, now: Tick) -> Vec<EffectKind> {
+        let head = self.tracker.head();
+        let mut effects: Vec<_> = if head == Seq::ZERO {
+            Vec::new()
+        } else {
+            self.keepalive_targets()
+                .map(|copy| {
+                    EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                        copy,
+                        from: head,
+                        through: head,
+                    })
+                })
+                .collect()
+        };
+        self.armed += 1;
+        let version = TimerVersion(self.armed);
+        self.keepalive = Some(version);
+        effects.push(EffectKind::Timer(TimerEffect::Arm {
+            id: keepalive_timer(self.tracker.partition()),
+            version,
+            at: now.plus_millis(KEEPALIVE_MS),
+        }));
+        effects
+    }
+
+    /// The copies a keepalive round sends to: every regular secondary of an active predicate
+    /// that has not diverged and has no record in flight on a cursor — sent and not ACKed, as the
+    /// retransmit reads it (lead ruling B-R67c, item A2) — in copy order.
+    fn keepalive_targets(&self) -> impl Iterator<Item = CopyId> + '_ {
+        self.tracker
+            .peers()
+            .filter(|(copy, peer)| {
+                peer.role == ReplicaRole::RegularSecondary
+                    && !self.tracker.is_diverged(*copy)
+                    && self
+                        .cursors
+                        .get(copy)
+                        .is_none_or(|cursor| cursor.unacked().is_none())
+            })
+            .map(|(copy, _)| copy)
+    }
+
+    /// Cancel the keepalive, if one is armed.
+    fn stop_keepalive(&mut self) -> Option<EffectKind> {
+        self.keepalive.take().map(|version| {
+            EffectKind::Timer(TimerEffect::Cancel {
+                id: keepalive_timer(self.tracker.partition()),
+                version,
+            })
+        })
+    }
+
+    /// Whether any running cursor has a record it sent and no ACK has answered: what keeps the
+    /// partition's retransmit timer armed (lead ruling B-R67a).
+    #[must_use]
+    pub fn awaits_ack(&self) -> bool {
+        self.cursors
+            .values()
+            .any(|cursor| cursor.unacked().is_some())
+    }
+
+    /// One fire of the partition's retransmit timer: each cursor's re-send, if it makes one, in
+    /// copy order ([`CatchupCursor::on_retransmit`]).
+    pub fn on_retransmit(&mut self) -> Vec<EffectKind> {
+        self.cursors
+            .values_mut()
+            .filter_map(CatchupCursor::on_retransmit)
+            .collect()
     }
 
     /// A1's `View`: the tracker installs it or refuses it (lead ruling B-R53). No cursor is
@@ -174,10 +365,28 @@ impl Primary {
     /// running, `ack` names exactly the record that cursor has in flight, and the tracker
     /// admits it but holds no rung there, strictly below the anchor. `None` otherwise, and the
     /// ACK takes the ladder as any other does.
+    ///
+    /// "In flight" is the record the cursor sent and no ACK has answered, not `outstanding`
+    /// (lead ruling B-R67a): a re-sent record draws `AlreadyHave`, which clears `outstanding`,
+    /// and then the ACK that must move the cursor.
     fn in_flight_unverified(&self, from: &PeerLabel, ack: &AppendAck) -> Option<CopyId> {
         let copy = self.tracker.unverified_below_anchor(from, ack)?;
-        let in_flight = self.cursors.get(&copy)?.outstanding();
+        let in_flight = self.cursors.get(&copy)?.unacked();
         (in_flight == Some(Seq(ack.progress.buffered_applied.0))).then_some(copy)
+    }
+
+    /// Lead rulings B-R67c and B-R67f: how `ack` repeats what the primary already knows its
+    /// copy holds, in the same copy, boot and generation, or `None`. Rules 1–7 name the copy.
+    /// The known position is the copy's cursor's mark when the cursor has taken an ACK, and
+    /// otherwise the tracker's held progress and proved floor: a repeat must never escalate
+    /// because a `Recovered` dropped the cursor that would have recognised it (B-R67e).
+    fn repeat(&self, from: &PeerLabel, ack: &AppendAck) -> Option<Repeat> {
+        let copy = self.tracker.identify(from, ack)?;
+        let history = self.tracker.history();
+        match self.cursors.get(&copy).and_then(CatchupCursor::mark) {
+            Some((mark, digest)) => Repeat::judge(mark, Some(digest), ack, history),
+            None => Repeat::judge(self.tracker.known(copy)?, None, ack, history),
+        }
     }
 
     /// The node and boot the tracker holds for `copy`: which incarnation of the copy it is.
