@@ -25,16 +25,20 @@
 //! them can be lost as well. Routing owns the timer, one per partition for every cursor there,
 //! a primary's and a recovery source's alike.
 //!
-//! # Repeats (lead rulings B-R67c, B-R67d and B-R67f)
+//! # Repeats (lead rulings B-R67c, B-R67d, B-R67f, B-R67g and B-R67h)
 //!
 //! A re-send draws a second ACK for a record whenever the first was only slow, so a repeat is
 //! routine. The cursor keeps the high-water mark of the ACKs it took (`acked`). An ACK at or
 //! below it is a repeat unless its digest contradicts one the cursor or the ladder holds for
 //! that position ([`CatchupCursor::repeat`]). Routing never hands a repeat to the cursor: one
 //! at the mark is a liveness report that runs the tracker's rules alone, and one below it
-//! answers `Recorded` and changes nothing (lead ruling B-R67d). And the cursor sends the next
-//! record only for an ACK whose `received` moves past the mark, so one extra ACK never puts a
-//! second copy of every later record on the wire.
+//! answers `Recorded` and changes nothing (lead ruling B-R67d). An ACK at the mark's applied
+//! sequence whose only rise is in `durable` (a flush, lead ruling B-R67g) or in `received` up
+//! to the record in flight (staging, lead ruling B-R67h) carries no new content either: the
+//! copy made durable what it already applied, or holds the next record staged and not yet
+//! applied. It is judged at the mark's applied sequence too ([`Repeat::AtApplied`]).
+//! And the cursor sends the next record only for an ACK whose `received` moves past the mark,
+//! so one extra ACK never puts a second copy of every later record on the wire.
 //!
 //! # Not built
 //!
@@ -46,7 +50,7 @@
 use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
 use crate::contracts::event::{EffectKind, KernelEffect};
-use crate::contracts::ids::{PartitionId, Seq, TimerId};
+use crate::contracts::ids::{PartitionId, ReceivedSeq, Seq, TimerId};
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::CopyId;
 use crate::replication::ignored;
@@ -95,6 +99,15 @@ pub enum Repeat {
     /// routing runs it through the tracker's rules and never through the cursor (lead ruling
     /// B-R67d).
     AtMark,
+    /// Applied at the mark's applied sequence, with the digest taken there, and above the mark
+    /// only in `durable` or in `received`, and `received` no further than `bound`, the record in
+    /// flight (lead rulings B-R67g and B-R67h). It carries no new content: a flush ACK reports
+    /// that the copy made durable what it already applied, and an ACK sent while the next record
+    /// is staged — a flush then, or the ACK after `AlreadyHave` for a delayed re-send — reports
+    /// staging state, not content. Rule 7 bounds its `durable` by its applied sequence. Judged
+    /// at the mark: one the ladder verifies takes the ladder as any ACK does; one it cannot
+    /// verify answers `Recorded`, never a snapshot.
+    AtApplied,
     /// At or below the mark on every watermark, and strictly below it on at least one. It
     /// reports nothing: a late duplicate must not tell L1 a position older than one it has.
     BelowMark,
@@ -102,23 +115,31 @@ pub enum Repeat {
 
 impl Repeat {
     /// How `ack` repeats `known`, the most the primary knows its copy holds, or `None` when it
-    /// does not (lead rulings B-R67c, B-R67d and B-R67f). A repeat's progress is at or below
-    /// `known` on all three watermarks, and no digest contradicts it. At `known`'s own applied
-    /// sequence the digest must be `digest`, the one taken there, when one was; otherwise, and
-    /// below it, the ladder's rung, where `history` holds one. A digest that differs is
-    /// divergence evidence and never a repeat. A re-send draws a second ACK for a record, so a
-    /// repeat is routine, not a fault.
+    /// does not (lead rulings B-R67c, B-R67d, B-R67f, B-R67g and B-R67h). A repeat's progress
+    /// is at or below `known` on all three watermarks; or it is at `known`'s applied sequence,
+    /// above `known` in `durable` or `received` or both, with `received` at most `bound`
+    /// ([`Self::AtApplied`]). `bound` is the furthest an honest copy can have staged: the
+    /// record in flight, or one past `known`'s applied sequence when no cursor runs. And no
+    /// digest contradicts it. At `known`'s own applied sequence the digest must be `digest`,
+    /// the one taken there, when one was; otherwise, and below it, the ladder's rung, where
+    /// `history` holds one. A digest that differs is divergence evidence and never a repeat. A
+    /// re-send draws a second ACK for a record, a flush a second ACK for the same content, and
+    /// the next record staged a third, so a repeat is routine, not a fault.
     #[must_use]
     pub fn judge(
         known: ReplicaProgress,
         digest: Option<Digest>,
+        bound: ReceivedSeq,
         ack: &AppendAck,
         history: &DigestLadder,
     ) -> Option<Self> {
         let progress = ack.progress;
-        if progress.received > known.received
-            || progress.buffered_applied > known.buffered_applied
-            || progress.durable > known.durable
+        // Lead ruling B-R67h: `received` above applied is staging state, not content, so a
+        // rise in it, as in `durable`, is judged on applied and the digest.
+        let risen = progress.received > known.received || progress.durable > known.durable;
+        let at_applied = progress.buffered_applied == known.buffered_applied;
+        if progress.buffered_applied > known.buffered_applied
+            || (risen && !(at_applied && progress.received <= bound))
         {
             return None;
         }
@@ -134,7 +155,9 @@ impl Repeat {
                 )
             }
         };
-        taken.then_some(if progress == known {
+        taken.then_some(if risen {
+            Self::AtApplied
+        } else if progress == known {
             Self::AtMark
         } else {
             Self::BelowMark
@@ -242,13 +265,35 @@ impl CatchupCursor {
         self.acked
     }
 
-    /// How `ack` repeats what this cursor already took (lead rulings B-R67c and B-R67d), or
-    /// `None` when it does not, or when the cursor has taken nothing yet: [`Repeat::judge`]
-    /// against the mark and the digest taken there.
+    /// An ACK judged at the mark's applied sequence ([`Repeat::AtApplied`]) that the ladder
+    /// cannot verify: the mark's `durable` rises to the ACK's, never falls, and nothing else
+    /// moves — no send, no `unacked` (lead rulings B-R67g and B-R67h). Applied and the digest
+    /// are the mark's already. `received` is **not** raised: one above the mark is a record
+    /// staged, not applied, and the applied ACK for it must still move the cursor on. A
+    /// reordered older flush keeps the higher `durable`. A cursor that has taken no ACK has no
+    /// mark to raise.
+    pub fn raise_durable(&mut self, ack: &AppendAck) {
+        if let Some((mark, _)) = &mut self.acked {
+            mark.durable = mark.durable.max(ack.progress.durable);
+        }
+    }
+
+    /// The furthest `received` an honest copy can report against `known` while this cursor
+    /// runs: `known`'s own, or the record in flight, whichever is higher (lead ruling B-R67h).
+    /// The copy stages only what the cursor sent it.
+    #[must_use]
+    pub fn staged_bound(&self, known: ReplicaProgress) -> ReceivedSeq {
+        let in_flight = self.unacked().map_or(0, |seq| seq.0);
+        ReceivedSeq(known.received.0.max(in_flight))
+    }
+
+    /// How `ack` repeats what this cursor already took (lead rulings B-R67c, B-R67d and
+    /// B-R67h), or `None` when it does not, or when the cursor has taken nothing yet:
+    /// [`Repeat::judge`] against the mark, the digest taken there, and [`Self::staged_bound`].
     #[must_use]
     pub fn repeat(&self, ack: &AppendAck, history: &DigestLadder) -> Option<Repeat> {
         let (mark, digest) = self.acked?;
-        Repeat::judge(mark, Some(digest), ack, history)
+        Repeat::judge(mark, Some(digest), self.staged_bound(mark), ack, history)
     }
 
     /// Start a catch-up the copy has not asked for (a recovery source, lead ruling B-R59): send

@@ -44,7 +44,7 @@
 //! unACKed, does not skip its copy: nothing else will ever ask that copy for an ACK, so skipping
 //! it would hold the partition paused for good.
 //!
-//! # Repeats (lead rulings B-R67c, B-R67d and B-R67f)
+//! # Repeats (lead rulings B-R67c, B-R67d, B-R67f, B-R67g and B-R67h)
 //!
 //! An ACK that repeats what the copy's running cursor already took — rules 1–7 admit it, and
 //! [`CatchupCursor::repeat`] names it — is split off before the in-flight check and never
@@ -66,6 +66,19 @@
 //! ([`ProgressTracker::on_repeat_at_mark`]). A repeat strictly below the mark answers
 //! `Recorded` and changes nothing: a late duplicate must not tell L1 a position older than the
 //! one it already has.
+//!
+//! An ACK at the mark's applied sequence that rises only in `durable` (a flush, lead ruling
+//! B-R67g) or in `received`, up to the record in flight (staging, lead ruling B-R67h), is judged
+//! at the mark too. The receiver reports `received` as the record it has staged, so its flush
+//! ACK, and the ACK after `AlreadyHave` for a delayed re-send, carry `received` one past
+//! applied whenever the next record is staged. Behind a cursor's mark such ACKs routinely
+//! arrive after the applied ACK already moved the cursor on, and below a recovery cutoff the
+//! ladder has no rung to verify them. Before these rulings they asked for a snapshot. Now one
+//! the ladder cannot verify answers `Recorded` and raises only the mark's `durable`, never its
+//! `received`, so the applied ACK for the staged record still moves the cursor on; one it
+//! verifies takes the ladder as any ACK does; and one whose digest contradicts the mark's, or
+//! that the ladder refutes, escalates as before.
+//!
 //! A shadow never counts toward lag, and a diverged copy's ACKs are dropped at rule 1d, so
 //! neither is sent one.
 
@@ -74,7 +87,9 @@ use std::collections::BTreeMap;
 use crate::contracts::authority::AuthorityView;
 use crate::contracts::envelope::{AppendAck, AppendOutcome};
 use crate::contracts::event::{EffectKind, KernelEffect, KernelEvent};
-use crate::contracts::ids::{BootId, NodeId, PartitionId, ReplicaRole, Seq, TimerId, TimerVersion};
+use crate::contracts::ids::{
+    BootId, NodeId, PartitionId, ReceivedSeq, ReplicaRole, Seq, TimerId, TimerVersion,
+};
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::membership::CopyId;
 use crate::contracts::recovery::RecoveryResult;
@@ -83,7 +98,7 @@ use crate::contracts::time::{Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::AckRejectReason;
 use crate::contracts::transport::PeerLabel;
 use crate::replication::catchup::{CatchupCursor, Repeat};
-use crate::replication::progress::ProgressTracker;
+use crate::replication::progress::{DigestLookup, ProgressTracker};
 use crate::replication::{ignored, wire};
 
 /// The first [`TimerId`] R1 owns: one keepalive timer per partition, at `base + partition`. R1's
@@ -153,15 +168,28 @@ impl Primary {
         match wire::decode_reply(body) {
             Ok(AppendOutcome::Accepted(ack)) => {
                 match self.repeat(from, &ack) {
-                    Some(Repeat::AtMark) => {
+                    Some((_, Repeat::AtMark)) => {
                         return self.tracker.on_repeat_at_mark(from, &ack, tick)
                     }
-                    Some(Repeat::BelowMark) => {
+                    Some((_, Repeat::BelowMark)) => {
                         return vec![ignored(KernelIgnoredReason::Replica(
                             ReplicaIgnoreReason::Recorded,
                         ))]
                     }
-                    None => {}
+                    // Lead rulings B-R67g and B-R67h: a flush ACK, or one sent while the next
+                    // record is staged, that the ladder cannot verify is not new content, and
+                    // never a snapshot. Only the mark's `durable` rises; its `received` must not,
+                    // or the applied ACK for the staged record would not move the cursor on. One
+                    // the ladder verifies, or refutes, takes the ladder below as any ACK does.
+                    Some((copy, Repeat::AtApplied)) if self.unverifiable(&ack) => {
+                        if let Some(cursor) = self.cursors.get_mut(&copy) {
+                            cursor.raise_durable(&ack);
+                        }
+                        return vec![ignored(KernelIgnoredReason::Replica(
+                            ReplicaIgnoreReason::Recorded,
+                        ))];
+                    }
+                    Some((_, Repeat::AtApplied)) | None => {}
                 }
                 if let Some(copy) = self.in_flight_unverified(from, &ack) {
                     let mut effects = vec![ignored(KernelIgnoredReason::AckRejected(
@@ -375,18 +403,38 @@ impl Primary {
         (in_flight == Some(Seq(ack.progress.buffered_applied.0))).then_some(copy)
     }
 
-    /// Lead rulings B-R67c and B-R67f: how `ack` repeats what the primary already knows its
-    /// copy holds, in the same copy, boot and generation, or `None`. Rules 1–7 name the copy.
+    /// Lead rulings B-R67c, B-R67f, B-R67g and B-R67h: how `ack` repeats what the primary
+    /// already knows its copy holds, in the same copy, boot and generation, and the copy it
+    /// speaks for, or `None`. Rules 1–7 name the copy.
     /// The known position is the copy's cursor's mark when the cursor has taken an ACK, and
     /// otherwise the tracker's held progress and proved floor: a repeat must never escalate
-    /// because a `Recovered` dropped the cursor that would have recognised it (B-R67e).
-    fn repeat(&self, from: &PeerLabel, ack: &AppendAck) -> Option<Repeat> {
+    /// because a `Recovered` dropped the cursor that would have recognised it (B-R67e). The
+    /// furthest `received` a staged ACK may report is the running cursor's record in flight
+    /// ([`CatchupCursor::staged_bound`]); with no cursor, one past the known applied sequence,
+    /// because an honest copy following one cursor never stages more than one record ahead.
+    fn repeat(&self, from: &PeerLabel, ack: &AppendAck) -> Option<(CopyId, Repeat)> {
         let copy = self.tracker.identify(from, ack)?;
-        let history = self.tracker.history();
-        match self.cursors.get(&copy).and_then(CatchupCursor::mark) {
-            Some((mark, digest)) => Repeat::judge(mark, Some(digest), ack, history),
-            None => Repeat::judge(self.tracker.known(copy)?, None, ack, history),
-        }
+        let cursor = self.cursors.get(&copy);
+        let (known, digest) = match cursor.and_then(CatchupCursor::mark) {
+            Some((mark, digest)) => (mark, Some(digest)),
+            None => (self.tracker.known(copy)?, None),
+        };
+        let bound = cursor.map_or_else(
+            || {
+                let next = known.buffered_applied.0.saturating_add(1);
+                ReceivedSeq(known.received.0.max(next))
+            },
+            |cursor| cursor.staged_bound(known),
+        );
+        let repeat = Repeat::judge(known, digest, bound, ack, self.tracker.history())?;
+        Some((copy, repeat))
+    }
+
+    /// Whether the ladder holds no rung at `ack`'s applied sequence: it can neither verify
+    /// nor refute it (K-B-01).
+    fn unverifiable(&self, ack: &AppendAck) -> bool {
+        let at = Seq(ack.progress.buffered_applied.0);
+        self.tracker.history().lookup(at, ack.digest_at_buffered) == DigestLookup::NotRetained
     }
 
     /// The node and boot the tracker holds for `copy`: which incarnation of the copy it is.

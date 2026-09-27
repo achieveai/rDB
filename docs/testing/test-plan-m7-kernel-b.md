@@ -1,4 +1,4 @@
-<!-- drift-basis: 3249092 -->
+<!-- drift-basis: bc8b45e -->
 
 # M7 kernel-b test plan: R1 replication, L1 protection, F1 recovery
 
@@ -281,7 +281,7 @@ index. Ticks are virtual.
 | M7B-118 | `m7b_118_verified_shadow_source_is_never_leader` | D §5.2 shadows never recover; §5.4 `select_leader`; 0009 §5 | shadow D with the longest verified prefix, candidates all eligible | `select_prefix` may pick D's history as source; `select_leader` returns a regular; `CatchUpBeforeGrant{from D, ..}` | unit | none |
 | M7B-119 | `m7b_119_quarantined_phase_is_terminal_in_m7` | B-R6/B-R17; D §5.1; 0009 §4 | phase `Quarantined`; feed every event kind including a fresh `FenceProven` | phase unchanged; each yields `Ignored{QUARANTINED_TERMINAL}`; exit only by operator (not modelled) | unit | none |
 
-## 9. Round 3 and round 4 rows (former holds M7B-120..137; round-3 findings M7B-138..142; K-B-51/52 M7B-143..144; K-B-49 M7B-145; round-4 rows M7B-146..148; B-R48b rows M7B-149..150; B-R51 rows M7B-151..152; B-R52 rows M7B-153..156; B-R53 rows M7B-157..163; B-R54 rows M7B-164..165; B-R58 rows M7B-166..174; B-R59 rows M7B-175..181; B-R60 rows M7B-182..185; B-R67 rows M7B-186..193; B-R67c rows M7B-194..202; B-R67d rows M7B-203..204; B-R67e/f rows M7B-205..207)
+## 9. Round 3 and round 4 rows (former holds M7B-120..137; round-3 findings M7B-138..142; K-B-51/52 M7B-143..144; K-B-49 M7B-145; round-4 rows M7B-146..148; B-R48b rows M7B-149..150; B-R51 rows M7B-151..152; B-R52 rows M7B-153..156; B-R53 rows M7B-157..163; B-R54 rows M7B-164..165; B-R58 rows M7B-166..174; B-R59 rows M7B-175..181; B-R60 rows M7B-182..185; B-R67 rows M7B-186..193; B-R67c rows M7B-194..202; B-R67d rows M7B-203..204; B-R67e/f rows M7B-205..207; B-R67g and regate-2 rows M7B-208..211; B-R67h rows M7B-212..216)
 
 Holds lifted (critic-kernel-b-2 round 3: PASS_WITH_RISKS, K-B-42..50 CLOSED). The 18 former
 `M7B-H<n>` rows are re-issued here with real ids, in the H order, re-aligned to the round-3 design
@@ -390,6 +390,15 @@ not spliced into §8 and §7, because ids never move once issued; §10 and §13 
 | M7B-205 | new (rulings B-R67e and B-R67f; rdb-sim S4b and the k=7 run of `rebuild_two_slow_replies_end_as_the_control`) | `m7b_205_a_duplicate_ack_right_after_a_recovered_rebuild_is_not_escalated` | B-R67f: with no cursor mark, a repeat is judged against max(held progress, proved floor); a repeat never escalates because the primary lost the cursor that would have recognised it | golden tracker; B walked to the cutoff 3; a second `Recovered` of the same generation, whose barrier requires A, B and C, drops B's cursor and zeroes B | ACKs `(1,1,1)`, `(2,2,2)`, `(1,1,0)` → each exactly `Recorded`, primary unchanged; after `NeedPrefix{have 3}` makes a cursor with no mark, `(1,1,0)` → exactly `Recorded`, unchanged; a forked ACK at `(3,3,3)` → `DivergenceDetected` first; near-miss: a later `Recovered` requiring only A and C replaces the floor, and `(1,1,1)` → `[Unverifiable, SnapshotCatchupRequired{B,3}]` | unit | none |
 | M7B-206 | new (ruling B-R67f) | `m7b_206_an_ack_at_the_proved_floor_takes_the_ladder` | B-R67f with B-R67d: an ACK at the floor with a matching digest is a liveness report, not `Recorded` | M7B-205's fixture after the second `Recovered` | the ACK at `(3,3,3)` → exactly what a reference tracker fed it emits, `PeerProgress{B,3}` first; tracker equals the reference | unit | none |
 | M7B-207 | new (ruling B-R67f: the floor is read by the repeat judgment only) | `m7b_207_the_proved_floor_moves_no_watermark_and_no_view` | B-R67f: no watermark, view, predicate, qualification, lag or `PeerProgress` reads the floor | two primaries rebuilt alike, except one barrier requires B (floor 3) and the other does not | the `Recovered` effects are equal; ACKs `c(3,3,3)`, `b(3,3,3)`, `b(3,3,3)` give equal effects and equal progress for A, B and C after each; B ends at `(3,3,3)` | unit | none |
+| M7B-208 | new (ruling B-R67g; tester-kb-r1 regate-2 F1, probe `zz_f`) | `m7b_208_a_flush_ack_below_the_cutoff_is_recorded_and_raises_only_the_marks_durable` | B-R67g: a durable-only rise at the mark is not new content; the ladder cannot verify it below the cutoff, so it answers `Recorded`, never a snapshot | primary built at cutoff 3; B walked from the root; B's applied ACK `(1,1,0)` moved the cursor to record 2 | the flush ACK `(1,1,1)`, twice → each exactly `Recorded`; tracker unchanged; the cursor's mark is `(1,1,1)` with the flush's digest; record 2 still unACKed; then `(2,2,1)` → `[InFlightUnverified, SendEnvelopes{B,3,3}]`; the flush overtaken on the wire by `(2,2,1)` → exactly `Recorded`, primary side unchanged. Near-misses: a forked flush → `[Unverifiable, SnapshotCatchupRequired{B,3}]`; `(1,1,1)` after the mark reached `(2,2,0)` (durable above, `received` and applied below) → the same escalation; above the cutoff (golden, B walked from 8, ACK `(9,9,8)`) the flush `(9,9,9)` → what a reference tracker emits (`PeerProgress{B,9}` first) then `Recorded` (M7B-202's pattern), and a forked `(9,9,9)` → `DivergenceDetected` first | unit | none |
+| M7B-209 | new (ruling B-R67g; tester-kb-r1 regate-2 F1 and its retrospective: no instant-durable receiver) | `m7b_209_a_receiver_that_acks_applied_then_flushed_is_walked_below_the_cutoff` | B-R67g end to end with B's real `AppendReceiver`: `on_committed` sends the applied ACK, `on_flushed` the flush ACK | primary built at cutoff 3 (the cutoff digest is the one B computes); B's receiver at the root; each record staged, committed, then flushed; each flush ACK reaches A after its applied ACK moved the cursor on | B's ACKs are exactly `(1,1,0) (1,1,1) (2,2,1) (2,2,2) (3,3,2) (3,3,3)`; records sent `[1, 2, 3]`, each once; no `SnapshotCatchupRequired`, `DivergenceDetected` or `Unverifiable` anywhere; exactly one `CopyCaughtUp{B, 3}`; B ends at `(3,3,3)` | unit | none |
+| M7B-210 | new (ruling B-R67f; tester-kb-r1 regate-2 F2, probe `zz_k4`, mutant K4) | `m7b_210_a_restarted_copy_does_not_inherit_the_proved_floor` | B-R67f: `fresh()` drops the proved floor; a restarted copy proved nothing | M7B-205's fixture after the second `Recovered` (B's floor 3); control re-announces B at boot 22 and config +1; B asks from the root | `NeedPrefix{0}` → `[SendEnvelopes{B,1,1}]`; ACKs 1 and 2 → each `[InFlightUnverified, SendEnvelopes{B,next,next}]`; ACK 3 → `PeerProgress{B,3}` first and `CopyCaughtUp{B,3}` last | unit | none |
+| M7B-211 | new (ruling B-R67d; tester-kb-r1 regate-2 F3, probe `zz_d3`, mutant D3) | `m7b_211_a_verifiable_ack_below_an_unverified_mark_is_recorded_and_reports_nothing` | B-R67d: a repeat strictly below the mark is `Recorded` even where the ladder would verify it | B walked from the root below cutoff 3; the in-flight ACK `(1,1,1)` raised the mark and left the tracker at 0 | a reordered `(1,0,0)` at `ROOT` → exactly `Recorded`, primary side unchanged; after a second `Recovered` (floor 3, tracker 0), `(2,0,0)` at `ROOT` → exactly `Recorded`, unchanged | unit | none |
+| M7B-212 | new (ruling B-R67h; tester-kb-r1 F1b, probe `zz_n1`; F6, mutant T2) | `m7b_212_a_staged_ack_below_the_cutoff_is_recorded_and_raises_only_the_marks_durable` | B-R67h: `received` above applied is staging state, not content; an ACK at the mark's applied sequence with `received` up to the record in flight is judged at the mark, and below the cutoff answers `Recorded`, never a snapshot | primary built at cutoff 3; B walked from the root; B's applied ACK `(1,1,0)` moved the cursor to record 2 | the flush `(2,1,1)` and the post-`AlreadyHave` ACK `(2,1,0)`, and after `(2,2,1)` the flush `(3,2,2)` → each exactly `Recorded`; tracker unchanged; `unacked` unchanged; the mark's `received` and applied unchanged, its `durable` the ACK's; then `(2,2,1)` after `(2,1,1)` → `[InFlightUnverified, SendEnvelopes{B,3,3}]` (no re-send), `(3,2,2)` → `Recorded`, `(3,3,2)` → `PeerProgress{B,3}` first, `CopyCaughtUp{B,3}` last. Near-misses, each `[Unverifiable, SnapshotCatchupRequired{B,3}]`: `(3,1,1)` with record 2 in flight (`received` beyond the bound; kills T2's analogue); a forked `(2,1,1)`; `(3,1,1)` after `(2,2,1)` (applied below the mark's) | unit | none |
+| M7B-213 | new (ruling B-R67h; tester-kb-r1 F7, mutant T1) | `m7b_213_the_marks_durable_takes_a_partial_flush_and_never_falls` | B-R67h: the mark's `durable` takes the ACK's and is a max, so a reordered older ACK never lowers it | as M7B-212 | mark `(2,2,0)`, then the partial flush `(2,2,1)` → `Recorded`, mark `(2,2,1)` (not its applied, 2); mark `(2,2,1)`, then `(3,2,2)` and the older `(3,2,1)` → each `Recorded`, mark `(2,2,2)` after both | unit | none |
+| M7B-214 | new (ruling B-R67h, with B-R67f) | `m7b_214_a_stale_staged_ack_after_a_recovered_is_recorded` | with no cursor, a stale staged ACK is judged against held progress raised to the proved floor | B walked to cutoff 3; a second `Recovered` naming B (floor 3) dropped the cursor | `(3,2,2)` and `(2,1,1)` → each exactly `Recorded`, primary side unchanged; with no cursor the bound is one past the known applied sequence: on the golden primary (ladder from 5, B at 0) `(1,0,0)` → exactly `Recorded`, unchanged, and `(2,0,0)` → `[Unverifiable, SnapshotCatchupRequired{B,12}]` (kills the no-cursor bound mutants) | unit | none |
+| M7B-215 | new (ruling B-R67h; tester-kb-r1 F1b, probe `zz_rwalk` profile 0) | `m7b_215_a_walk_whose_flushes_land_while_the_next_record_is_staged` | B-R67h end to end with B's real `AppendReceiver`: each flush lands while the next record is staged | primary built at cutoff 4 (the cutoff digest is the one B computes); B's receiver at the root; for each record, stage, then the previous record's flush, then commit | B's ACKs are exactly `(1,1,0) (2,1,1) (2,2,1) (3,2,2) (3,3,2) (4,3,3) (4,4,3) (4,4,4)`; each staged ACK → exactly `Recorded`; records sent `[1,2,3,4]`; no `SnapshotCatchupRequired`, `DivergenceDetected` or `Unverifiable`; exactly one `CopyCaughtUp{B,4}`; B ends at `(4,4,4)` | unit | none |
+| M7B-216 | new (ruling B-R67h; tester-kb-r1 F1b, probe `zz_rwalk` profiles 2 and 3) | `m7b_216_a_walk_whose_delayed_re_sends_land_while_the_next_record_is_staged` | B-R67h end to end: a delayed re-send of record s lands while s+1 is staged, and B answers `AlreadyHave` and `(s+1,s,s)` | as M7B-215, flushing right after each commit; B's ACKs for each record are held until the retransmit timer re-sends it; that re-send is held until B stages the next record | the staged ACKs are exactly `(2,1,1) (3,2,2) (4,3,3)`, each → exactly `Recorded`; records sent `[1,1,2,2,3,3,4]`; no `SnapshotCatchupRequired`, `DivergenceDetected` or `Unverifiable`; exactly one `CopyCaughtUp{B,4}`; B ends at `(4,4,4)` | unit | none |
 
 Ordering note: M7B-120..122, 136 and 138 depend on `FenceCredential { partition, prior_generation,
 prior_owner_epoch, control_revision, sender }` landing in C0 (design §7 V12 dependency; ADR-0009 §2);
@@ -767,6 +776,61 @@ Nothing above lowers an assertion. Two corrections land in this round: the long-
 predates this diff and was never a drift *from* `9235bfb`) and round 7's own miscount of
 `KernelEffect`'s variant total. Marker moved below after this re-read, not before it.
 
+**Round-9 re-read (2026-09-27), basis moves `3249092` → `bc8b45e`.** `bc8b45e` ("M7 checkpoint —
+R1 recovery source, lost-ACK retransmit, repeat handling, timer-id blocks") is the newest commit
+touching `crates/rdb-core/src/contracts`. `git diff --stat 3249092 bc8b45e --
+crates/rdb-core/src/contracts` touches exactly one file:
+
+```
+ crates/rdb-core/src/contracts/event.rs | 37 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+```
+
+**This is this plan's own R1 recovery-source wave landing, and it lands exactly the shape M7B-136
+and M7B-175..181 already asserted.** `event.rs` gains a `FenceCredential` import (from
+`contracts::authority`; `FenceCredential` itself is unchanged — `authority.rs` is not in this
+diff, still the frozen five fields at `contracts/authority.rs:474`) and two variants, both
+kernel-b's own leaf, inside the `#[non_exhaustive]` carriers CB-1 built:
+
+- `KernelEvent::CatchUp { from: CopyId, to: CopyId, through: Seq, credential: FenceCredential }`
+  (declared `event.rs:358`) — "F1 asks the copy holding the selected prefix to send it… delivered
+  to the node of `from`, where R1 starts a source-side catch-up cursor" (the type's own doc
+  comment, citing `design.md` §5.6, §3.2a and rulings B-R59/B-R59a).
+- `KernelEffect::SendRecoveryEnvelopes { copy: CopyId, from: Seq, through: Seq, credential:
+  FenceCredential }` (declared `event.rs:578`) — "the host reads the canonical envelopes
+  `from..=through` from this node's own log and unicasts each to `copy` as a `RecoveryAppend`
+  carrying `credential`, byte for byte… a separate arm from `SendEnvelopes` so that a credentialed
+  recovery send and a primary's catch-up send are never confusable" (same doc comment, same
+  rulings, plus B-R67).
+
+Both field lists match, name for name and position for position, what **M7B-175**
+(`CatchUp{from B, to C, through 15, credential}` → `[SendRecoveryEnvelopes{C,15,15,cred}]`) and
+**M7B-136** (`CatchUp{from B, to C, through 100, credential{sender B}}` →
+`SendRecoveryEnvelopes{C, n, n, credential}` per record) already wrote. **No row literal in
+M7B-136 or M7B-175..181 needs an edit.** §9's dependency column already read "none" for all seven
+rows — that was correct only because this commit was expected in the same wave that wrote them;
+this re-read is what turns "expected" into "landed". `KernelEvent` widens 20 → 21 variants (the
+one addition, `CatchUp`); `KernelEffect` widens 23 → 24 (`SendRecoveryEnvelopes`, the one
+addition). `EventKind`/`EffectKind` themselves are untouched at the top level — still eight and
+seven, unaffected because both new variants sit inside the non-exhaustive carriers, not as new
+top-level arms.
+
+**Everything else this table cites shifts by the same insertion, in two pieces, and only where the
+citation sits below the insertion points.** `CatchUp` inserts inside `KernelEvent` (after
+`CopyQuarantined`, before `AppliedCandidate`); `SendRecoveryEnvelopes` inserts inside
+`KernelEffect` (after `SendEnvelopes`, before `CopyAheadOnControl`). Re-opened at `bc8b45e`:
+`KernelEffect` itself (the enum's own declaration) is now `event.rs:439` (was `:424`, +15 — after
+the first insertion, before the second); everything at or below `SendRecoveryEnvelopes` shifts the
+full +35. Nothing this table currently cites sits between those two points or below the second —
+`AckRejectReason`, `BlockReason`, `FencingProof`, `Revocation`, `TraceKind`, `AckEvidence`,
+`SkipReason` and `OpSkipped` are all in `trace.rs`/`authority.rs`, neither of which is in this
+diff, so none of those citations move. `transport::Frame` (`transport.rs`) likewise unaffected.
+
+Nothing above lowers an assertion; it releases nothing new in §13 (M7B-136/175..181 were never
+listed there — they were written "none"-held against a contract expected in this exact commit,
+and that expectation is now confirmed, not a hold lifted). Marker moved below after this re-read,
+not before it.
+
 ## 16. Row counts
 
 | Section | Unit | Sim | Campaign | Total |
@@ -777,8 +841,8 @@ predates this diff and was never a drift *from* `9235bfb`) and round 7's own mis
 | §6 R1 catch-up (55–63) | 8 | 1 | 0 | 9 |
 | §7 L1 (64–83) | 17 | 3 | 0 | 20 |
 | §8 F1 (84–119) | 34 | 2 | 0 | 36 |
-| §9 rounds 3–4 (120–207: 18 former holds, 5 round-3 findings, 2 for K-B-51/52, 1 K-B-49, 3 round-4, 2 B-R48b, 2 B-R51, 4 B-R52, 7 B-R53, 2 B-R54, 9 B-R58, 7 B-R59, 4 B-R60, 8 B-R67, 9 B-R67c, 2 B-R67d, 3 B-R67f) | 84 | 4 | 0 | 88 |
-| Active total | 194 | 13 | 0 | 207 |
+| §9 rounds 3–4 (120–216: 18 former holds, 5 round-3 findings, 2 for K-B-51/52, 1 K-B-49, 3 round-4, 2 B-R48b, 2 B-R51, 4 B-R52, 7 B-R53, 2 B-R54, 9 B-R58, 7 B-R59, 4 B-R60, 8 B-R67, 9 B-R67c, 2 B-R67d, 3 B-R67f, 4 B-R67g and regate-2, 5 B-R67h) | 93 | 4 | 0 | 97 |
+| Active total | 203 | 13 | 0 | 216 |
 | Q-rows (Q-46..Q-57; no provisional rows remain) | 12 | 0 | 0 | 12 |
 
 Round-4 delta (ruling B-R33): **+3 rows** — M7B-146 (CAS `Unknown`, split out of M7B-109 after the
@@ -833,6 +897,23 @@ B-R67e/f delta (2026-09-27): **+3 rows**, M7B-205..207 (rulings B-R67e and B-R67
 - The known position is the cursor's mark if it has one, else the per-watermark max of held progress and the floor. The B-R67d split applies to it unchanged: at it and taken by the ladder, a liveness report (M7B-206); below it, `Recorded` (M7B-205).
 - `only_an_admitted_ack_reaches_a_running_cursor` carries **Update (B-R67f)**: its ACK below what B holds, with no mark on the cursor, is now `Recorded` as a repeat, not `RegressedProgress`. No id moved.
 - Both rdb-sim rows are green unchanged, and a mutant that never sets the floor turns both red.
+
+B-R67g delta (2026-09-27): **+4 rows**, M7B-208..211 (ruling B-R67g; tester-kb-r1 regate-2 F1–F4).
+- F1 (BLOCKER for M7 exit). The receiver ACKs each record twice: `on_committed` sends `(s,s,d)`, then `on_flushed` sends `(s,s,s)`. The flush ACK raises `durable`, so it was not a repeat; the applied ACK had already moved the cursor's `unacked` on, so it was not in flight either; and below a recovery cutoff rule 9 found no rung, so it asked for a snapshot. Every earlier row used a receiver that is durable at once, which hid it.
+- Ruling B-R67g: a durable-only rise is not new content. `received` and applied equal the known position (the cursor's mark, else held progress and the floor), in the same copy, boot and generation, with `durable` above it; rule 7 bounds `durable` by applied. It is judged at the mark: the ladder cannot verify it → `Recorded`, and the mark's `durable` takes the new value (M7B-208); it verifies it → the ladder's path as today, `PeerProgress` then the cursor's `Recorded` (M7B-202 re-checked, unchanged); a digest that contradicts the mark's, or that the ladder refutes → escalates as before (M7B-208). M7B-209 walks B's real receiver.
+- F2: M7B-210 lands probe `zz_k4`. It kills mutant K4 (`fresh()` keeps the floor), which survived every row before.
+- F3: M7B-211 lands probe `zz_d3`. **Correction:** the B-R67d handoff called mutant D3 (a below-mark repeat routed through the at-mark path) equivalent. It is not. The mark can sit above held progress — an in-flight ACK below the cutoff raises the mark and not the tracker, and so does the proved floor — so a below-mark ACK can pass rule 8 and match a rung (the genesis rung at 0), and D3 then emits `PeerProgress` at a stale position. M7B-211 kills it. D5 stays equivalent.
+- F4: since B-R67f, a routed same-boot ACK that is below what the primary knows on every watermark, with no cursor mark, is a repeat and reads `Recorded`, not `RegressedProgress`; held progress never moves either way. `RegressedProgress` stays reachable through routing for a mixed ACK (one watermark above, one below) or a forked one, and rule 8 itself is unchanged: M7B-39 drives the tracker directly, M7B-40 accepts either label, and M7B-195 needs the forked case. ADR-0005's "rejected by a named test" is met by M7B-39.
+
+B-R67h delta (2026-09-27): **+5 rows**, M7B-212..216 (ruling B-R67h; tester-kb-r1 F1b, F6, F7).
+- F1b (BLOCKER for M7 exit). B's receiver reports `received` as the record it has staged. So its flush ACK, and the ACK after `AlreadyHave` for a delayed re-send, carry `(s+1, s, d)` whenever record s+1 is staged. `Repeat::judge` refused it, because `received` was above the mark; it was not in flight, because applied was s and `unacked` s+1; and below a recovery cutoff rule 9 found no rung, so it asked for a snapshot. The tester's async walk of the real receiver escalated in 180 of 1000 runs, and 53 of 1000 even with each flush right after its commit. M7B-209 had modelled one interleaving only.
+- Ruling B-R67h: `received` above applied is staging state, not content. B-R67g's variant is widened and renamed `Repeat::AtApplied`: applied equals the known position K's (the cursor's mark, else held progress and the floor); the digest passes `judge`'s test; `received` is at most the bound (the running cursor's `unacked`, else K's applied + 1, never below K's `received`); rule 7 bounds `durable` by applied, where it was; and `received` or `durable` is above K's. Otherwise nothing changed: both equal is `AtMark` or `BelowMark` as before.
+- Outcome as B-R67g's: the ladder cannot verify it → `Recorded`, and the mark's `durable` becomes the max of its own and the ACK's; its `received` and applied never move, so the applied ACK for the staged record still moves the cursor on (M7B-212). The ladder verifies or refutes it → today's path, unchanged.
+- M7B-215 and M7B-216 walk B's real receiver through the two interleavings. The tester's `zz_n5` (1000 seeds per profile) now reads 0 bad in all four profiles.
+- F6: T2 (the `received` half of the old `at_mark` dropped) is re-expressed against the widened guard as dropping the bound. M7B-212's `(3,1,1)` near-miss kills it.
+- F7: M7B-213 pins a partial flush (kills T1) and a reordered older ACK (kills the no-max mutant).
+- F4 revisited: a mixed ACK at K's applied sequence (`received` above K's, `durable` below) is now `AtApplied`. Below the cutoff it reads `Recorded`; where the ladder verifies it, it still takes the ladder, and rule 8 still names it `RegressedProgress` there. `RegressedProgress` stays reachable through routing for a mixed ACK at another applied sequence, one the ladder verifies, or a forked one (M7B-39, M7B-40, M7B-195 unchanged).
+- The no-cursor bound (K's applied + 1) is pinned by M7B-214 on the golden primary, whose ladder starts at 5: B at 0 with no cursor, `(1,0,0)` now reads `Recorded` (before: `Unverifiable` and a snapshot request) and `(2,0,0)` still escalates. That is a real behaviour change for a copy with no cursor whose known applied sequence has no rung: its staged ACK one record ahead no longer asks for a snapshot. Its own `NeedPrefix` still does.
 
 **Open items.**
 - Owed: an R1 recovery source seeds its cursor from the copy's own storage head (B-R59b item 4; today it is the doc comment above `proved_head`). Owner kernel-b R1, before M7 exit.

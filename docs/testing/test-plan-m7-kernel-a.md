@@ -1,6 +1,6 @@
 # Test Plan — M7, team kernel-a (A1, T1, P1)
 
-<!-- drift-basis: 3249092 -->
+<!-- drift-basis: bc8b45e -->
 
 **Status:** Proposed — test planner deliverable, **correction round 5** (critic-kernel-a round 3
 findings **TD-12..TD-20** applied over round 4's TD-01..TD-11 and round 3's T-A-01..15; §8.7 holds
@@ -1866,6 +1866,30 @@ Nothing above lowers an assertion. Row 6's count corrects a table entry no row d
 gains a real event twin for two effects it already had a mapping for, which narrows the rewrite
 rows 15 already owes rather than reopening it as a blocker. Marker moved below after this re-read,
 not before it.
+
+**Round 9 re-read, 2026-09-27, against `bc8b45e`.** `bc8b45e` ("M7 checkpoint — R1 recovery source,
+lost-ACK retransmit, repeat handling, timer-id blocks") is the newest commit touching
+`crates/rdb-core/src/contracts`, superseding `3249092`. `git diff --stat 3249092 bc8b45e --
+crates/rdb-core/src/contracts` touches exactly one file, `event.rs` (+36/-1) — kernel-b's F1
+recovery-source wave, not kernel-a's. All sixteen rows re-opened at `bc8b45e`, not carried from
+round 8.
+
+- The diff adds a `FenceCredential` import to `event.rs` (from `contracts::authority`, itself
+  unchanged — not in this diff) and two variants inside the `#[non_exhaustive]` carriers: `KernelEvent::CatchUp{from, to, through, credential}` and
+  `KernelEffect::SendRecoveryEnvelopes{copy, from, through, credential}`. `EventKind` and
+  `EffectKind` are unaffected at the top level — still eight and seven, as row 15 and the "not part
+  of any row" note both already state — and neither new variant is kernel-a's to own or assert.
+- **No row in this plan cites a line inside `event.rs`'s `KernelEvent`/`KernelEffect` bodies**, and
+  this diff touches nothing else — `authority.rs`, `publication.rs`, `trace.rs`, `transport.rs`,
+  `txn.rs`, `digest.rs` are all outside it, so rows 5, 6, 10, 11, 15's `AuthorityEvent`/
+  `AuthorityEffect`/`FencingProof`/`Revocation`/`AuthorityIgnoreReason` citations and row 16's
+  `crates/rdb-core/src/authority.rs` citation are all unaffected by construction, the same
+  disposition round 7 and round 8 both record for a file outside their own diffs.
+- Rows 1–4, 7–9, 12–14 name no `contracts/` file touched by this diff either; unaffected.
+
+Nothing above lowers an assertion, and nothing here is a new C0 ask — the two new variants are
+kernel-b's own leaf, landing in a wave this plan does not consume. Marker moved below after this
+re-read, not before it.
 
 **Re-read discipline, and what round 4 got wrong about it.** This table is only as fresh as its
 last re-read, which is why the basis is now a gate stage rather than a convention. When

@@ -1272,7 +1272,36 @@ did; §15.1 is rewritten to match. Rows 1/6/8/21 are line-number corrections; ro
 restate two enums' counts that grew since they were last written here. Marker moved below after
 this re-read, not before it.
 
-<!-- drift-basis: 3249092 -->
+**Round-10 re-read (2026-09-27), basis moves `3249092` → `bc8b45e`.** `bc8b45e` ("M7 checkpoint —
+R1 recovery source, lost-ACK retransmit, repeat handling, timer-id blocks") is the newest commit
+touching `crates/rdb-core/src/contracts`. `git diff --stat 3249092 bc8b45e --
+crates/rdb-core/src/contracts` touches exactly one file, `event.rs` (+36/-1) — kernel-b's F1
+recovery-source wave. Every citation below was re-opened with `git show bc8b45e:<path>`, not the
+working tree.
+
+- **`trace.rs`, `errors.rs`, `authority.rs` and every other file this table cites are untouched by
+  this diff.** Rows 1, 2, 6, 8, 9, 21, 23 and §15.1's eight cells all cite `trace.rs` or
+  `errors.rs`; none of those files moved, so none of those citations move. Row 27
+  (`crates/rdb-core/src/authority.rs`) is outside `contracts/` by construction, same disposition
+  as every prior round.
+- **Row 26 — the trap fires a third time, and stays a non-event for this plan.** `EventKind` and
+  `EffectKind` are unaffected at the top level — still eight and seven; this diff adds two
+  variants, `KernelEvent::CatchUp{from, to, through, credential}` and
+  `KernelEffect::SendRecoveryEnvelopes{copy, from, through, credential}`, both inside the
+  `#[non_exhaustive]` carriers this row already named as unassertable-by-set-equality from outside
+  `rdb-core`. `KernelEvent` goes 20 → 21 variants, `KernelEffect` 23 → 24. Grepped at `bc8b45e`: no
+  row, VA, Q-row or literal in this plan names `CatchUp`, `SendRecoveryEnvelopes` or
+  `FenceCredential` — this plan reads the *trace*, and neither new variant is a trace field.
+  Disposition unchanged — **adopt**.
+- **No new `TraceKind` variant, no new trace field.** This diff does not touch `trace.rs`, so row
+  28's `ModuleDispatch`/`KernelNoted` citations and §15.1's `AckRejectReason` cells are all
+  unaffected — confirmed by the diff's file list, not assumed.
+
+Nothing above lowers an assertion or reopens a closed ask, and nothing here unblocks a verification
+row — this commit is kernel-b's own internal recovery-source vocabulary, and this plan has never
+cited it. Marker moved below after this re-read, not before it.
+
+<!-- drift-basis: bc8b45e -->
 
 **Foundation asks still open after this round: none.** Rows 1 and 21 were the last two, and both
 landed at `6893442` — in foundation's *first* code round, the same round that received them.

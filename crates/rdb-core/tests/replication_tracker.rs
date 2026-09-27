@@ -24,17 +24,19 @@ use rdb_core::contracts::authority::{
 };
 use rdb_core::contracts::control::{CasOutcome, ControlEffect, ControlEvent, ControlKey};
 use rdb_core::contracts::digest::{Digest, Domain};
-use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
+use rdb_core::contracts::envelope::{
+    AppendAck, AppendOutcome, AppendReject, EnvelopeHeader, ReplicaProgress, ReplicationEnvelope,
+};
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
 use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName,
     StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AppliedSeq, AuthorityGeneration, BootId, ClientId, ConfigVersion, CorrelationId, DurableSeq,
-    EventId, FlushTicket, Generation, GrantId, MessageId, NodeId, OwnerEpoch, PartitionId,
-    ReceivedSeq, ReplicaRole, RequestId, RequestIdentity, Revision, Seq, SnapshotHandle, TenantId,
-    TimerId, TimerVersion,
+    AppliedSeq, AuthorityGeneration, BatchId, BootId, ClientId, ConfigVersion, CorrelationId,
+    DurableSeq, EventId, FlushTicket, Generation, GrantId, LeaseId, MessageId, NodeId, OwnerEpoch,
+    PartitionId, ReceivedSeq, ReplicaRole, RequestId, RequestIdentity, Revision, Seq,
+    SnapshotHandle, TenantId, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -47,7 +49,9 @@ use rdb_core::contracts::recovery::{
     RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult, RetainedStatusMap,
     SelectedLineage, SurvivorInventory,
 };
-use rdb_core::contracts::storage::{DurablePrefix, Namespace, SnapshotRead, StorageEvent};
+use rdb_core::contracts::storage::{
+    DurablePrefix, Namespace, SnapshotRead, StorageEvent, StoreEffect, Write,
+};
 use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{AckRejectReason, Version};
 use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
@@ -5640,5 +5644,822 @@ fn m7b_207_the_proved_floor_moves_no_watermark_and_no_view() {
             .peer(COPY_B)
             .map(|peer| peer.progress),
         Some(progress(3, 3, 3))
+    );
+}
+
+// --- B-R67g: a flush ACK is not new content; the floor's reset; below an unverified mark -----
+
+/// B's cursor on a primary built at cutoff 3, after B's applied ACK `(1, 1, 0)` for record 1:
+/// the cursor has moved on, record 2 is in flight, and nothing is durable on B yet.
+fn b_applied_one_below_the_cutoff() -> Replication {
+    let mut module = walking_b_from_root();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 0)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 2)
+        ]
+    );
+    module
+}
+
+/// M7B-208 (lead ruling B-R67g; tester-kb-r1 regate-2 F1, probe `zz_f`). Below the cutoff, B's
+/// flush ACK `(1, 1, 1)` arrives after its applied ACK `(1, 1, 0)` already moved the cursor on
+/// to record 2. It carries no new content, only that B made durable what it applied, and the
+/// ladder has no rung to verify it. It is exactly `Recorded`: no snapshot, no send, the tracker
+/// unchanged, record 2 still the one unACKed, and the mark's `durable` raised to 1, so a
+/// duplicate of the flush is a repeat at the mark. A flush ACK overtaken on the wire by the
+/// next record's applied ACK is below the mark that ACK set: `Recorded`. Near-misses: a flush whose digest contradicts
+/// the mark's still escalates; so does a `durable` rise whose `received` and applied are below
+/// the mark, which is not a flush at it; and above the cutoff, where the ladder verifies it, the flush
+/// takes the ladder as before (M7B-202's pattern): `PeerProgress`, then the cursor's
+/// `Recorded`, and a forked one is divergence.
+#[retcd_test]
+fn m7b_208_a_flush_ack_below_the_cutoff_is_recorded_and_raises_only_the_marks_durable() {
+    let mut module = b_applied_one_below_the_cutoff();
+    let tracker = primary_side(&module).tracker().clone();
+    let flush = in_new_root(b(1, 1, 1));
+    for _ in 0..2 {
+        assert_eq!(
+            route(&mut module, accepted(&flush)),
+            vec![replica(ReplicaIgnoreReason::Recorded)]
+        );
+        assert_eq!(primary_side(&module).tracker(), &tracker);
+        let cursor = primary_side(&module).cursor(COPY_B).expect("running");
+        assert_eq!(
+            cursor.mark(),
+            Some((progress(1, 1, 1), flush.digest_at_buffered))
+        );
+        assert_eq!(cursor.unacked(), Some(Seq(2)));
+    }
+    // The walk goes on from the ACK for record 2.
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(2, 2, 1)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 3)
+        ]
+    );
+
+    // Near-miss: a flush that contradicts the digest the mark took is not a repeat.
+    let mut module = b_applied_one_below_the_cutoff();
+    assert_eq!(
+        route(&mut module, accepted(&forked(in_new_root(b(1, 1, 1))))),
+        vec![
+            rejected(AckRejectReason::Unverifiable),
+            kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: COPY_B,
+                barrier: Seq(3),
+            }),
+        ]
+    );
+
+    // The flush ACK overtaken on the wire by the next record's applied ACK `(2, 2, 1)` is below
+    // the mark that ACK set, with `durable` equal to it: `Recorded`, and nothing changes.
+    let mut module = b_applied_one_below_the_cutoff();
+    route(&mut module, accepted(&in_new_root(b(2, 2, 1))));
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&flush)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+
+    // Near-miss: `durable` above the mark with `received` and applied below it is not a flush
+    // at the mark, and gets today's answer. An honest receiver never sends it: every ACK after
+    // its flush of 1 carries `durable` of at least 1.
+    let mut module = b_applied_one_below_the_cutoff();
+    route(&mut module, accepted(&in_new_root(b(2, 2, 0))));
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        vec![
+            rejected(AckRejectReason::Unverifiable),
+            kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: COPY_B,
+                barrier: Seq(3),
+            }),
+        ]
+    );
+
+    // Above the cutoff the ladder verifies the flush, and it takes the ladder as before.
+    let mut module = routed();
+    route(&mut module, reply(B, &need_prefix(8)));
+    route(&mut module, accepted(&b(9, 9, 8)));
+    let mut reference = primary_side(&module).tracker().clone();
+    let mut want = deliver(&mut reference, &b(9, 9, 9));
+    assert_eq!(want[0], peer_progress(B, 9), "{want:?}");
+    want.push(replica(ReplicaIgnoreReason::Recorded));
+    let forked_flush = route(&mut module.clone(), accepted(&forked(b(9, 9, 9))));
+    assert_eq!(
+        forked_flush[0],
+        kernel(KernelEffect::DivergenceDetected { copy: COPY_B }),
+        "{forked_flush:?}"
+    );
+    assert_eq!(route(&mut module, accepted(&b(9, 9, 9))), want);
+    assert_eq!(primary_side(&module).tracker(), &reference);
+}
+
+/// The new root's record `seq`, chained on `prev` and sealed, as A sends it to B after F1's
+/// takeover. B's real receiver computes its digest, so the cutoff rung is the one it computes.
+fn new_root_record(seq: u64, prev: Digest) -> ReplicationEnvelope {
+    let mut env = ReplicationEnvelope {
+        header: EnvelopeHeader {
+            protocol_version: ENVELOPE_VERSION,
+            partition: P,
+            generation: NEW_GEN,
+            config_version: NEW_CONFIG,
+            owner_epoch: NEW_EPOCH,
+            seq: Seq(seq),
+            body_len: 0,
+        },
+        lease_id: LeaseId(1),
+        prev_digest: prev,
+        request_identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(seq),
+        },
+        request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
+        conditions_result: Vec::new(),
+        mutations: vec![Write {
+            ns: Namespace::User,
+            key: Bytes::from_static(b"k"),
+            value: Some(Bytes::from_static(b"v")),
+        }],
+        result: Outcome::Published,
+        record_digest: Digest::ROOT,
+    };
+    env.record_digest = env.compute_record_digest().expect("digest");
+    env
+}
+
+/// The one reply frame `effects` sends A.
+fn reply_to_a(effects: &[EffectKind]) -> Frame {
+    let [EffectKind::Send(SendEffect::Unicast { to, frame })] = effects else {
+        panic!("one reply: {effects:?}");
+    };
+    assert_eq!(*to, A);
+    frame.clone()
+}
+
+/// M7B-209 (lead ruling B-R67g; tester-kb-r1 regate-2 F1 and its retrospective). A walk whose
+/// copy is B's real `AppendReceiver`, not a model of it. A primary built at cutoff 3 walks B,
+/// which holds nothing, from the root. For each record B stages, storage commits, and B sends
+/// its applied ACK; then storage flushes, and `on_flushed` sends B's flush ACK. Each flush ACK
+/// reaches A after its applied ACK already moved the cursor on, and before the next record is
+/// staged. That is one real interleaving of several: a flush can also land while the next record
+/// is staged (M7B-215), and a delayed re-send can draw an ACK then (M7B-216). B ACKs every
+/// record twice, applied then durable; each record is sent once; nothing asks for a snapshot
+/// or is `Unverifiable`; B is caught up once, at the cutoff; and B's last flush, which the
+/// cutoff rung verifies, leaves B durable at 3.
+#[retcd_test]
+fn m7b_209_a_receiver_that_acks_applied_then_flushed_is_walked_below_the_cutoff() {
+    let mut records: Vec<ReplicationEnvelope> = Vec::new();
+    for seq in 1..=3 {
+        let prev = records.last().map_or(Digest::ROOT, |env| env.record_digest);
+        records.push(new_root_record(seq, prev));
+    }
+    let result = requiring(
+        recovery(3, records[2].record_digest, pin_with_b()),
+        &[COPY_A, COPY_C],
+    );
+    let mut module = Replication::new();
+    route(&mut module, recovered_event(&result));
+    let mut receiver = AppendReceiver::new(ReceiverInit {
+        config: pin_with_b(),
+        own: COPY_B,
+        lineage: result.selected.root,
+        head: Head {
+            seq: Seq::ZERO,
+            digest: Digest::ROOT,
+        },
+        durable: DurableSeq(0),
+    })
+    .expect("B's receiver");
+
+    let mut log = route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT)));
+    let (mut sent, mut acks, mut next) = (Vec::new(), Vec::new(), 0);
+    while let Some(effect) = log.get(next).cloned() {
+        next += 1;
+        let EffectKind::Kernel(KernelEffect::SendEnvelopes {
+            copy,
+            from,
+            through,
+        }) = effect
+        else {
+            continue;
+        };
+        assert_eq!(
+            (copy, from),
+            (COPY_B, through),
+            "one record to B: {effect:?}"
+        );
+        sent.push(from.0);
+        let record = &records[usize::try_from(from.0 - 1).expect("seq")];
+        let append = Frame {
+            id: MessageId(u32::try_from(from.0).expect("seq")),
+            protocol: ENVELOPE_VERSION,
+            config: NEW_CONFIG,
+            sender: result.selected.root,
+            body: record.encode().expect("encode"),
+        };
+        let staged = receiver.on_append(&label(A), &append);
+        let [EffectKind::Store(StoreEffect::Commit(batch))] = staged.as_slice() else {
+            panic!("B stages the record: {staged:?}");
+        };
+        let applied = receiver.on_committed(batch.id).expect("B staged it");
+        let durable = [DurablePrefix {
+            partition: P,
+            generation: NEW_GEN,
+            through: DurableSeq(from.0),
+        }];
+        let flushed = receiver.on_flushed(&durable).expect("B's prefix");
+        for answer in [applied, flushed] {
+            let frame = reply_to_a(&answer);
+            let AppendOutcome::Accepted(ack) = decode_reply(&frame.body).expect("a reply") else {
+                panic!("an ACK: {answer:?}");
+            };
+            acks.push(ack.progress);
+            log.extend(route(
+                &mut module,
+                EventKind::Transport(TransportEvent::Delivered {
+                    from: label(B),
+                    frame,
+                }),
+            ));
+        }
+    }
+
+    assert_eq!(
+        acks,
+        vec![
+            progress(1, 1, 0),
+            progress(1, 1, 1),
+            progress(2, 2, 1),
+            progress(2, 2, 2),
+            progress(3, 3, 2),
+            progress(3, 3, 3),
+        ]
+    );
+    assert_eq!(sent, vec![1, 2, 3]);
+    let escalated = |effect: &&EffectKind| {
+        matches!(
+            effect,
+            EffectKind::Kernel(
+                KernelEffect::SnapshotCatchupRequired { .. }
+                    | KernelEffect::DivergenceDetected { .. }
+                    | KernelEffect::Ignored {
+                        reason: KernelIgnoredReason::AckRejected(AckRejectReason::Unverifiable)
+                    }
+            )
+        )
+    };
+    assert_eq!(log.iter().find(escalated), None, "{log:?}");
+    let caught: Vec<_> = log
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                EffectKind::Kernel(KernelEffect::CopyCaughtUp { .. })
+            )
+        })
+        .collect();
+    assert_eq!(
+        caught,
+        vec![&kernel(KernelEffect::CopyCaughtUp {
+            copy: COPY_B,
+            head: Seq(3),
+            digest: records[2].record_digest,
+        })]
+    );
+    assert_eq!(
+        primary_side(&module)
+            .tracker()
+            .peer(COPY_B)
+            .map(|peer| peer.progress),
+        Some(progress(3, 3, 3))
+    );
+}
+
+/// M7B-210 (lead ruling B-R67f; tester-kb-r1 regate-2 F2, probe `zz_k4`, mutant K4). A
+/// restarted copy does not inherit its old incarnation's proved floor. B is proved durable at
+/// the cutoff 3 by a `Recovered`; control then re-announces B at a new boot, and B, which holds
+/// nothing now, is walked from the root. Its ACKs at 1 and 2 are new content, not repeats of a
+/// floor the old boot proved: each drives the cursor to the next record, and the ACK at 3
+/// verifies at the cutoff rung and catches B up.
+#[retcd_test]
+fn m7b_210_a_restarted_copy_does_not_inherit_the_proved_floor() {
+    let mut module = b_walked_to_the_cutoff();
+    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    let mut pin = pin_with_b();
+    pin.config_version = ConfigVersion(NEW_CONFIG.0 + 1);
+    pin.members[1].boot = BootId(22);
+    route(&mut module, config_event(pin));
+    let restarted = PeerLabel {
+        node: B,
+        boot: BootId(22),
+        authenticated: true,
+    };
+    let at = |seq: u64| {
+        let mut ack = in_new_root(b(seq, seq, seq));
+        ack.boot = BootId(22);
+        ack.config_version = ConfigVersion(NEW_CONFIG.0 + 1);
+        reply_from(restarted, &AppendOutcome::Accepted(ack))
+    };
+    assert_eq!(
+        route(
+            &mut module,
+            reply_from(restarted, &need_prefix_at(0, Digest::ROOT))
+        ),
+        vec![send(COPY_B, 1)]
+    );
+    for seq in 1..3 {
+        assert_eq!(
+            route(&mut module, at(seq)),
+            vec![
+                rejected(AckRejectReason::InFlightUnverified),
+                send(COPY_B, seq + 1)
+            ],
+            "ACK {seq}"
+        );
+    }
+    let last = route(&mut module, at(3));
+    assert_eq!(last[0], peer_progress(B, 3), "{last:?}");
+    assert_eq!(last.last(), Some(&caught_up(COPY_B, 3)), "{last:?}");
+}
+
+/// M7B-211 (lead ruling B-R67d; tester-kb-r1 regate-2 F3, probe `zz_d3`, mutant D3). A repeat
+/// strictly below the mark answers `Recorded` even where the ladder would verify it. Below the
+/// cutoff an in-flight ACK raises the cursor's mark to `(1, 1, 1)` and leaves the tracker at 0.
+/// A reordered earlier ACK `(1, 0, 0)` at the genesis rung is below the mark, passes rule 8,
+/// and the ladder matches it: it is still exactly `Recorded`, with no `PeerProgress` at 0, and
+/// the primary side is unchanged. The same holds below the proved floor after a `Recovered`
+/// (`(2, 0, 0)` at the genesis rung, floor 3, tracker 0). This is why routing a below-mark
+/// repeat through the at-mark path is not equivalent.
+#[retcd_test]
+fn m7b_211_a_verifiable_ack_below_an_unverified_mark_is_recorded_and_reports_nothing() {
+    let mut module = walking_b_from_root();
+    route(&mut module, accepted(&in_new_root(b(1, 1, 1))));
+    let mut early = in_new_root(b(1, 0, 0));
+    early.digest_at_buffered = Digest::ROOT;
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&early)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+
+    let mut module = b_walked_to_the_cutoff();
+    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    let mut early = in_new_root(b(2, 0, 0));
+    early.digest_at_buffered = Digest::ROOT;
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&early)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+}
+
+// --- B-R67h: an ACK sent while the next record is staged is not new content ------------------
+
+/// M7B-212 (lead ruling B-R67h; tester-kb-r1 F1b, probe `zz_n1`). B's real receiver reports
+/// `received` as the record it has staged, so an ACK it sends while the next record is staged
+/// carries `received` one past applied: its flush `(2, 1, 1)`, the ACK `(2, 1, 0)` that follows
+/// `AlreadyHave` for a delayed re-send of record 1, and, one record on, the flush `(3, 2, 2)`.
+/// Below the cutoff the ladder cannot verify any of them. Each is exactly `Recorded`: no
+/// snapshot, no send, the tracker unchanged, `unacked` unchanged, and the mark's `received` and
+/// applied unchanged — only its `durable` takes the ACK's. So the applied ACK for the staged
+/// record still moves the cursor on, with no re-send. Near-misses keep today's escalation:
+/// `received` beyond the record in flight, a forked digest, and applied below the mark's.
+#[retcd_test]
+fn m7b_212_a_staged_ack_below_the_cutoff_is_recorded_and_raises_only_the_marks_durable() {
+    for (shape, before, staged, durable) in [
+        ("a flush while 2 is staged", None, b(2, 1, 1), 1),
+        (
+            "the ACK after AlreadyHave while 2 is staged",
+            None,
+            b(2, 1, 0),
+            0,
+        ),
+        ("a flush while 3 is staged", Some(b(2, 2, 1)), b(3, 2, 2), 2),
+    ] {
+        let mut module = b_applied_one_below_the_cutoff();
+        if let Some(ack) = before {
+            route(&mut module, accepted(&in_new_root(ack)));
+        }
+        let tracker = primary_side(&module).tracker().clone();
+        let cursor = primary_side(&module).cursor(COPY_B).expect("running");
+        let (mark, digest) = cursor.mark().expect("a mark");
+        let unacked = cursor.unacked();
+        assert_eq!(
+            route(&mut module, accepted(&in_new_root(staged))),
+            vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{shape}"
+        );
+        assert_eq!(primary_side(&module).tracker(), &tracker, "{shape}");
+        let cursor = primary_side(&module).cursor(COPY_B).expect("running");
+        let raised = ReplicaProgress {
+            durable: DurableSeq(durable),
+            ..mark
+        };
+        assert_eq!(cursor.mark(), Some((raised, digest)), "{shape}");
+        assert_eq!(cursor.unacked(), unacked, "{shape}");
+    }
+
+    // The walk goes on from the applied ACK for the staged record, with no re-send.
+    let mut module = b_applied_one_below_the_cutoff();
+    route(&mut module, accepted(&in_new_root(b(2, 1, 1))));
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(2, 2, 1)))),
+        vec![
+            rejected(AckRejectReason::InFlightUnverified),
+            send(COPY_B, 3)
+        ]
+    );
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(3, 2, 2)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let last = route(&mut module, accepted(&in_new_root(b(3, 3, 2))));
+    assert_eq!(last[0], peer_progress(B, 3), "{last:?}");
+    assert_eq!(last.last(), Some(&caught_up(COPY_B, 3)), "{last:?}");
+
+    let escalated = vec![
+        rejected(AckRejectReason::Unverifiable),
+        kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: COPY_B,
+            barrier: Seq(3),
+        }),
+    ];
+    // Near-miss: `received` 3 beyond record 2, the one in flight. B stages only what it was
+    // sent, so this is not staging state, and it gets today's answer.
+    let mut module = b_applied_one_below_the_cutoff();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(3, 1, 1)))),
+        escalated
+    );
+    // Near-miss: the staged shape with a digest that contradicts the mark's.
+    let mut module = b_applied_one_below_the_cutoff();
+    assert_eq!(
+        route(&mut module, accepted(&forked(in_new_root(b(2, 1, 1))))),
+        escalated
+    );
+    // Near-miss: applied one below the mark's, `received` above it.
+    let mut module = b_applied_one_below_the_cutoff();
+    route(&mut module, accepted(&in_new_root(b(2, 2, 1))));
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(3, 1, 1)))),
+        escalated
+    );
+}
+
+/// M7B-213 (lead ruling B-R67h; tester-kb-r1 F7, mutant T1). The mark's `durable` takes the
+/// ACK's, and never falls. A partial flush — the mark at `(2, 2, 0)`, then B flushes through 1
+/// only — leaves the mark at `(2, 2, 1)`, not at its applied sequence. And a reordered older
+/// ACK does not lower it: after the flush `(3, 2, 2)` raised it to 2, the earlier ACK
+/// `(3, 2, 1)`, sent after `AlreadyHave` before that flush, is `Recorded` and the mark keeps 2.
+#[retcd_test]
+fn m7b_213_the_marks_durable_takes_a_partial_flush_and_never_falls() {
+    let mut module = b_applied_one_below_the_cutoff();
+    route(&mut module, accepted(&in_new_root(b(2, 2, 0))));
+    let digest = in_new_root(b(2, 2, 1)).digest_at_buffered;
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(2, 2, 1)))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let mark = |module: &Replication| {
+        primary_side(module)
+            .cursor(COPY_B)
+            .and_then(CatchupCursor::mark)
+    };
+    assert_eq!(mark(&module), Some((progress(2, 2, 1), digest)));
+
+    let mut module = b_applied_one_below_the_cutoff();
+    route(&mut module, accepted(&in_new_root(b(2, 2, 1))));
+    for ack in [b(3, 2, 2), b(3, 2, 1)] {
+        assert_eq!(
+            route(&mut module, accepted(&in_new_root(ack))),
+            vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{ack:?}"
+        );
+        assert_eq!(mark(&module), Some((progress(2, 2, 2), digest)), "{ack:?}");
+    }
+}
+
+/// M7B-214 (lead ruling B-R67h, with B-R67f). With no cursor the known position is B's held
+/// progress raised to its proved floor. After a `Recovered` whose barrier proves B at the cutoff
+/// 3 drops B's cursor, the stale staged ACKs B sent on its way there — `(3, 2, 2)` and
+/// `(2, 1, 1)` — are each exactly `Recorded`, and the primary side is unchanged. With no
+/// cursor the bound on a staged `received` is one past the known applied sequence: on the golden
+/// primary, whose ladder starts at 5, B holds 0, so `(1, 0, 0)` is `Recorded` and changes
+/// nothing, and `(2, 0, 0)` is beyond the bound and gets today's answer.
+#[retcd_test]
+fn m7b_214_a_stale_staged_ack_after_a_recovered_is_recorded() {
+    let mut module = b_walked_to_the_cutoff();
+    route(&mut module, recovered_again(&[COPY_A, COPY_B, COPY_C]));
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    for ack in [b(3, 2, 2), b(2, 1, 1)] {
+        let before = primary_side(&module).clone();
+        assert_eq!(
+            route(&mut module, accepted(&in_new_root(ack))),
+            vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{ack:?}"
+        );
+        assert_eq!(primary_side(&module), &before, "{ack:?}");
+    }
+
+    // With no cursor the bound is one past the known applied sequence. On the golden primary B
+    // holds 0 and the ladder starts at 5, so no rung verifies an ACK at 0: `(1, 0, 0)` is
+    // staging state at the known position and is `Recorded`, and `(2, 0, 0)`, two records
+    // ahead, is not, and gets today's answer.
+    let mut module = routed();
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    let before = primary_side(&module).clone();
+    assert_eq!(
+        route(&mut module, accepted(&b(1, 0, 0))),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module), &before);
+    assert_eq!(
+        route(&mut module, accepted(&b(2, 0, 0))),
+        vec![
+            rejected(AckRejectReason::Unverifiable),
+            kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: COPY_B,
+                barrier: Seq(HEAD),
+            }),
+        ]
+    );
+}
+
+/// B's real `AppendReceiver`, holding nothing, beside a primary built at `cutoff` whose cutoff
+/// rung is the one B computes (M7B-209's fixture): the primary, B, the new root's records 1 to
+/// `cutoff`, and the lineage A sends them in.
+fn real_b_at_the_root(
+    cutoff: u64,
+) -> (
+    Replication,
+    AppendReceiver,
+    Vec<ReplicationEnvelope>,
+    Lineage,
+) {
+    let mut records: Vec<ReplicationEnvelope> = Vec::new();
+    for seq in 1..=cutoff {
+        let prev = records.last().map_or(Digest::ROOT, |env| env.record_digest);
+        records.push(new_root_record(seq, prev));
+    }
+    let top = records.last().expect("records").record_digest;
+    let result = requiring(recovery(cutoff, top, pin_with_b()), &[COPY_A, COPY_C]);
+    let mut module = Replication::new();
+    route(&mut module, recovered_event(&result));
+    let receiver = AppendReceiver::new(ReceiverInit {
+        config: pin_with_b(),
+        own: COPY_B,
+        lineage: result.selected.root,
+        head: Head {
+            seq: Seq::ZERO,
+            digest: Digest::ROOT,
+        },
+        durable: DurableSeq(0),
+    })
+    .expect("B's receiver");
+    (module, receiver, records, result.selected.root)
+}
+
+/// Record `seq` of `records` as A's append frame to B.
+fn append_frame(records: &[ReplicationEnvelope], sender: Lineage, seq: u64) -> Frame {
+    Frame {
+        id: MessageId(u32::try_from(seq).expect("seq")),
+        protocol: ENVELOPE_VERSION,
+        config: NEW_CONFIG,
+        sender,
+        body: records[usize::try_from(seq - 1).expect("seq")]
+            .encode()
+            .expect("encode"),
+    }
+}
+
+/// B stages `frame`: the commit it asks storage for.
+fn stage(receiver: &mut AppendReceiver, frame: &Frame) -> BatchId {
+    let staged = receiver.on_append(&label(A), frame);
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = staged.as_slice() else {
+        panic!("B stages the record: {staged:?}");
+    };
+    batch.id
+}
+
+/// B's durable prefix through `seq` in the new root.
+fn flushed_through(seq: u64) -> [DurablePrefix; 1] {
+    [DurablePrefix {
+        partition: P,
+        generation: NEW_GEN,
+        through: DurableSeq(seq),
+    }]
+}
+
+/// Route every reply in B's `effects` to A, in order. Each ACK's progress goes to `acks` with
+/// the primary's answer to it; every effect goes to `log`.
+fn to_a(
+    module: &mut Replication,
+    effects: &[EffectKind],
+    acks: &mut Vec<(ReplicaProgress, Vec<EffectKind>)>,
+    log: &mut Vec<EffectKind>,
+) {
+    for effect in effects {
+        let EffectKind::Send(SendEffect::Unicast { to, frame }) = effect else {
+            panic!("B only replies: {effect:?}");
+        };
+        assert_eq!(*to, A);
+        let answer = route(
+            module,
+            EventKind::Transport(TransportEvent::Delivered {
+                from: label(B),
+                frame: frame.clone(),
+            }),
+        );
+        if let Ok(AppendOutcome::Accepted(ack)) = decode_reply(&frame.body) {
+            acks.push((ack.progress, answer.clone()));
+        }
+        log.extend(answer);
+    }
+}
+
+/// A walk below the cutoff ended well: nothing escalated, B caught up exactly once, at the
+/// cutoff, with the cutoff's digest.
+fn walked_without_escalation(log: &[EffectKind], cutoff: u64, digest: Digest) {
+    let escalated = |effect: &&EffectKind| {
+        matches!(
+            effect,
+            EffectKind::Kernel(
+                KernelEffect::SnapshotCatchupRequired { .. }
+                    | KernelEffect::DivergenceDetected { .. }
+                    | KernelEffect::Ignored {
+                        reason: KernelIgnoredReason::AckRejected(AckRejectReason::Unverifiable)
+                    }
+            )
+        )
+    };
+    assert_eq!(log.iter().find(escalated), None, "{log:?}");
+    let caught: Vec<_> = log
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                EffectKind::Kernel(KernelEffect::CopyCaughtUp { .. })
+            )
+        })
+        .collect();
+    assert_eq!(
+        caught,
+        vec![&kernel(KernelEffect::CopyCaughtUp {
+            copy: COPY_B,
+            head: Seq(cutoff),
+            digest,
+        })]
+    );
+}
+
+/// M7B-215 (lead ruling B-R67h; tester-kb-r1 F1b, probe `zz_rwalk` profile 0). A walk of B's
+/// real receiver in which every flush lands while the next record is staged. A primary built at
+/// cutoff 4 walks B from the root. For each record B stages, the flush of the record before
+/// completes first, then the staged record commits. So B's flush ACKs carry `received` one past
+/// applied: `(2, 1, 1)`, `(3, 2, 2)`, `(4, 3, 3)`. Each of those is exactly `Recorded`; each record
+/// is sent once; nothing escalates; B is caught up once, at the cutoff, and ends durable there.
+#[retcd_test]
+fn m7b_215_a_walk_whose_flushes_land_while_the_next_record_is_staged() {
+    let (mut module, mut receiver, records, sender) = real_b_at_the_root(4);
+    let mut log = route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT)));
+    let (mut acks, mut unflushed, mut next) = (Vec::new(), None, 0);
+    while let Some(effect) = log.get(next).cloned() {
+        next += 1;
+        let &[seq] = sends_to(&[effect], COPY_B).as_slice() else {
+            continue;
+        };
+        let batch = stage(&mut receiver, &append_frame(&records, sender, seq));
+        if let Some(through) = unflushed.take() {
+            let flushed = receiver
+                .on_flushed(&flushed_through(through))
+                .expect("B's prefix");
+            to_a(&mut module, &flushed, &mut acks, &mut log);
+        }
+        let applied = receiver.on_committed(batch).expect("B staged it");
+        to_a(&mut module, &applied, &mut acks, &mut log);
+        unflushed = Some(seq);
+    }
+    let flushed = receiver
+        .on_flushed(&flushed_through(4))
+        .expect("B's prefix");
+    to_a(&mut module, &flushed, &mut acks, &mut log);
+
+    let reported: Vec<_> = acks.iter().map(|(ack, _)| *ack).collect();
+    assert_eq!(
+        reported,
+        vec![
+            progress(1, 1, 0),
+            progress(2, 1, 1),
+            progress(2, 2, 1),
+            progress(3, 2, 2),
+            progress(3, 3, 2),
+            progress(4, 3, 3),
+            progress(4, 4, 3),
+            progress(4, 4, 4),
+        ]
+    );
+    for (ack, answer) in &acks {
+        if ack.received.0 > ack.buffered_applied.0 {
+            assert_eq!(
+                answer,
+                &vec![replica(ReplicaIgnoreReason::Recorded)],
+                "{ack:?}"
+            );
+        }
+    }
+    assert_eq!(sends_to(&log, COPY_B), vec![1, 2, 3, 4]);
+    walked_without_escalation(&log, 4, records[3].record_digest);
+    assert_eq!(
+        primary_side(&module)
+            .tracker()
+            .peer(COPY_B)
+            .map(|peer| peer.progress),
+        Some(progress(4, 4, 4))
+    );
+}
+
+/// M7B-216 (lead ruling B-R67h; tester-kb-r1 F1b, probe `zz_rwalk` profiles 2 and 3). A walk of
+/// B's real receiver in which a delayed re-send of each record lands while the next one is
+/// staged. A primary built at cutoff 4 walks B from the root; B flushes right after each commit.
+/// B's two ACKs for each record are slow, so the retransmit timer re-sends it, and that copy is
+/// slower still: the ACKs move the cursor on, B stages the next record, and only then does the
+/// re-send arrive. B answers it `AlreadyHave` and its current ACK, `(s + 1, s, s)`. Each of those
+/// is exactly `Recorded`; nothing escalates; B is caught up once, at the cutoff; and each record
+/// is sent twice — once, and once re-sent — except the last, which is ACKed at once.
+#[retcd_test]
+fn m7b_216_a_walk_whose_delayed_re_sends_land_while_the_next_record_is_staged() {
+    let (mut module, mut receiver, records, sender) = real_b_at_the_root(4);
+    let mut log = route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT)));
+    let mut armed = last_arm(&log, retransmit_timer(P));
+    let mut acks = Vec::new();
+    let mut batch = stage(&mut receiver, &append_frame(&records, sender, 1));
+    for seq in 1..=4 {
+        let mut replies = receiver.on_committed(batch).expect("B staged it");
+        replies.extend(
+            receiver
+                .on_flushed(&flushed_through(seq))
+                .expect("B's prefix"),
+        );
+        if seq == 4 {
+            to_a(&mut module, &replies, &mut acks, &mut log);
+            break;
+        }
+        // B's ACKs are slow: the retransmit timer re-sends the record, and holds it.
+        let mut resent = Vec::new();
+        for _ in 0..3 {
+            let fired = route(
+                &mut module,
+                fired_at(retransmit_timer(P), armed.expect("armed")),
+            );
+            armed = last_arm(&fired, retransmit_timer(P)).or(armed);
+            resent = sends_to(&fired, COPY_B);
+            log.extend(fired);
+            if !resent.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(resent, vec![seq], "the re-send of {seq}");
+        let before = log.len();
+        to_a(&mut module, &replies, &mut acks, &mut log);
+        armed = last_arm(&log[before..], retransmit_timer(P)).or(armed);
+        assert_eq!(sends_to(&log[before..], COPY_B), vec![seq + 1]);
+        batch = stage(&mut receiver, &append_frame(&records, sender, seq + 1));
+        let late = receiver.on_append(&label(A), &append_frame(&records, sender, seq));
+        let before = log.len();
+        to_a(&mut module, &late, &mut acks, &mut log);
+        armed = last_arm(&log[before..], retransmit_timer(P)).or(armed);
+    }
+
+    let staged: Vec<_> = acks
+        .iter()
+        .filter(|(ack, _)| ack.received.0 > ack.buffered_applied.0)
+        .collect();
+    assert_eq!(
+        staged.iter().map(|(ack, _)| *ack).collect::<Vec<_>>(),
+        vec![progress(2, 1, 1), progress(3, 2, 2), progress(4, 3, 3)]
+    );
+    for (ack, answer) in staged {
+        assert_eq!(
+            answer,
+            &vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{ack:?}"
+        );
+    }
+    assert_eq!(sends_to(&log, COPY_B), vec![1, 1, 2, 2, 3, 3, 4]);
+    walked_without_escalation(&log, 4, records[3].record_digest);
+    assert_eq!(
+        primary_side(&module)
+            .tracker()
+            .peer(COPY_B)
+            .map(|peer| peer.progress),
+        Some(progress(4, 4, 4))
     );
 }

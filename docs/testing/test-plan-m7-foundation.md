@@ -1,4 +1,4 @@
-<!-- drift-basis: 3249092 -->
+<!-- drift-basis: bc8b45e -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -984,6 +984,39 @@ None of the above lowers or falsifies an existing row's assertion. It corrects t
 15.3's own prose (`Checkpoint`, `AuthorityEvent`) and records one enum foundation's own row already
 answered against a stricter list than the type now has (`AckRejectReason` via `M7F-56`). Marker
 moved below after this re-read, not before it.
+
+### 15.5 Rebase from `3249092` to `bc8b45e`
+
+`bc8b45e` ("M7 checkpoint — R1 recovery source, lost-ACK retransmit, repeat handling, timer-id
+blocks") is now the newest commit to touch `crates/rdb-core/src/contracts`. Re-read 2026-09-27,
+via `git show bc8b45e:<path>` — never the working tree.
+
+```
+$ git diff --stat 3249092 bc8b45e -- crates/rdb-core/src/contracts
+ crates/rdb-core/src/contracts/event.rs | 37 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 36 insertions(+), 1 deletion(-)
+```
+
+This is kernel-b's F1 recovery-source wave — the one contract file, two new variants inside the
+carriers CB-1 built. `event.rs` gains a `FenceCredential` import (from `contracts::authority`,
+unchanged in shape — `FenceCredential` is not in this diff) and two variants: `KernelEvent::CatchUp
+{from, to, through, credential}` and `KernelEffect::SendRecoveryEnvelopes {copy, from, through,
+credential}`. Both sit inside the `#[non_exhaustive]` carriers, so `EventKind` and `EffectKind`
+themselves are unchanged — still eight and seven — and no row here that reads either top-level enum
+is touched. `KernelEvent` goes 20 → 21 variants, `KernelEffect` 23 → 24; foundation owns only the
+carrier, kernel-b owns the variant set, exactly as CB-1's own doc comment (`KernelEvent`'s, at
+`event.rs:206`) states.
+
+**No §15 citation in this plan moves.** Every live `event.rs` citation this table carries —
+`ClientEvent::Status` gaining `generation` (`event.rs:105-111`) — sits above `KernelEvent`'s own
+declaration (`event.rs:247`), and both new variants insert *inside* `KernelEvent`/`KernelEffect`,
+well below that point. Re-opened directly: `ClientEvent::Status` is unchanged at
+`event.rs:105-111`. Nothing else in this plan's table cites a line inside `event.rs`'s
+`KernelEvent`/`KernelEffect` bodies, so nothing shifts.
+
+Nothing above lowers or falsifies an existing row's assertion; nothing was previously held on
+either new variant, because neither is a foundation-owned ask. Marker moved below after this
+re-read, not before it.
 
 ---
 
