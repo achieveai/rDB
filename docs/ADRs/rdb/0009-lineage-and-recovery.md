@@ -368,6 +368,13 @@ approval, so the faithful implementation of that sentence is no code at all. Spe
 deleting a suffix and assuming values roll back: replacement happens in a staging namespace with an
 atomic local manifest switch (that mechanism is M8; M7 only guarantees F1 never asks for a delete).
 
+**Amended 2026-09-27 (lead ruling B-R68).** The effect landed as
+`RecoveryEffect::QuarantineSuffix { copy, from, until }` (`contracts/recovery.rs`): `until` is the
+retention end, and the byte count is not carried. No `RetainQuarantinedSuffix` type exists. The
+retention effect is F1's alone. R1's receiver, on a `Recovered` whose digest `Differs`, raises
+`Alert { CorruptHistory }` and emits no retention effect. Retention there means the absence of any
+delete or truncate: the ladder and heads are left untouched (row M7B-139).
+
 ### 10. Loss is recorded, never inferred from client ACKs
 
 ```text
@@ -452,7 +459,7 @@ consumer does not handle.
 | Degraded RF2 leaves degraded only on a barrier | The third copy catching up is not enough: `Rebuilding` stays until its proof passes `try_new`, then one CAS flips the record to `ACTIVE` — **V3** |
 | Quarantine is not cleared by the data path | A quarantined copy stays quarantined across a matching append, a restart and a catch-up; only `Recovered` clears it |
 | Returning stale owner never overrides | Post-commit, a longer-suffix owner is quarantined; its head seq is never compared |
-| Quarantined suffix retained | `RetainQuarantinedSuffix` emitted; no deletion effect exists in the module |
+| Quarantined suffix retained | `QuarantineSuffix` emitted (named `RetainQuarantinedSuffix` before the §9 amendment, B-R68); no deletion effect exists in the module |
 
 ## References
 

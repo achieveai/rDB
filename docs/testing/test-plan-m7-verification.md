@@ -1260,7 +1260,7 @@ multi-point shift `event.rs` carries in kernel-a's and kernel-b's tables.
   `RecoveryFact`, `PublicationFact`, `SurvivorPlaced`, `SyncWithheld`, `SyncProven`,
   `RecoveredFact`, `RecoveredDeferred`, `RecoveredLanded` — so it is **thirteen**, not five, plus
   two new companion enums this row did not previously name, `RecoveredDeferReason` (`Crashed`,
-  `CutOff`) and `SyncWithheldReason` (`NotPlaced`, `Failed`, `Short`, `NoDigest`). Disposition
+  `CutOff`) and `SyncWithheldReason` (`NotPlaced`, `Failed`, `Short`, `NoDigest`; `Stalled` appended 2026-09-27 by ruling B-R70, M7B-156). Disposition
   unchanged — adopt: grepped at `3249092`, no row, VA, Q-row or literal in this plan names
   `DispatchOutcome`, `KernelNote`, `DeclinedOwed`, `RecoveredDeferReason` or `SyncWithheldReason`,
   so nothing here is falsified, only described short. Recorded so the eventual dispatcher-outcome

@@ -1516,6 +1516,11 @@ pub enum SyncWithheldReason {
         /// What the engine holds durable for the copy's lineage.
         durable: crate::contracts::ids::DurableSeq,
     },
-    /// The placed history holds no digest at the cutoff.
+    /// Neither the placed history nor the engine's stored record holds a digest at the cutoff
+    /// (the engine fallback is ruling B-R70, M7B-136).
     NoDigest,
+    /// The sync never completed: the holder's device stopped completing syncs (a stalled flush),
+    /// so it neither succeeded nor failed and nothing became durable. F1's own sync timer reports
+    /// the copy (ruling B-R52); this reason is what lets a reader see why (M7B-156).
+    Stalled,
 }

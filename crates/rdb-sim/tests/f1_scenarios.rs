@@ -5,8 +5,13 @@
 //! one exception is R1's primary after the run (coordinator, B-R54): whether it exists, and at
 //! which lineage, cutoff and copy. No engine state is read.
 //!
-//! Rows here: M7B-104 and M7B-96. M7B-136 and 137 wait on harness ops routed to dev-sim-route (the
-//! `CatchUp` provider; placement as data), per the coordinator's B-R55 reply.
+//! Rows here: M7B-104, M7B-96, M7B-156 and M7B-136. M7B-137's rows live in `tests/dispatch.rs`.
+//! 156 and 136 rest on two provider hooks (lead ruling B-R70): a stalled sync is withheld as
+//! `Stalled`, and a placed survivor caught up past its placed inventory is proven from its engine.
+//!
+//! **M7B-136 is the one exception to "installed by nothing, read from the trace"** (B-R59b): it
+//! installs R1 receivers for B and C by hand, so B can serve as a live recovery source, and reads
+//! C's receiver head after the run.
 //!
 //! **R1 (B-R54):** nothing is installed by hand. R1 builds its primary from F1's `Recovered`, and
 //! each recovering row reads that primary back and asserts it serves the selected lineage from
@@ -20,7 +25,7 @@ mod support;
 use config_log::retcd_test;
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::authority::{
-    AuthorityView, BlockReason, DenyReason, FencingProof, Lineage, Revocation,
+    AuthorityView, BlockReason, DenyReason, FencingProof, Lineage, PartitionMode, Revocation,
 };
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::Digest;
@@ -29,18 +34,27 @@ use rdb_core::contracts::ids::{
     AppliedSeq, AuthorityGeneration, BootId, ConfigVersion, CorrelationId, DurableSeq, Generation,
     GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq,
 };
+use rdb_core::contracts::ids::{MessageId, ReplicaRole};
 use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::membership::PartitionConfig;
 use rdb_core::contracts::recovery::{
     Candidate, LineageAnchor, LossRecord, RecoveryEffect, RecoveryEvent, RecoveryPlan,
-    SurvivorInventory, UnavailableReason,
+    RecoveryResult, SurvivorInventory, UnavailableReason,
 };
+use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
     ControlOpKind, ControlOutcomeKind, KernelNote, SyncWithheldReason, Trace, TraceKind,
 };
+use rdb_core::contracts::transport::{Frame, PeerLabel, TransportEvent};
+use rdb_core::contracts::version::ENVELOPE_VERSION;
+use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent};
 use rdb_sim::harness::trace::validate;
 use rdb_sim::harness::transfer::TransferPlan;
+use rdb_sim::sim::cluster::{ClusterConfig, PartitionSpec};
+use rdb_sim::sim::network::{LinkState, NetworkOp};
+use rdb_sim::storage::history::history_writes;
 use rdb_sim::storage::history::{canonical_history, CanonicalHistory};
 use rdb_sim::storage::StorageOp;
 
@@ -721,4 +735,366 @@ fn m7b_96_f1_r1_cross_package_window_extend_record_then_shorter_prefix() {
         "R1's primary from Recovered"
     );
     oracle_is_clean(trace);
+}
+
+// ---------------------------------------------------------------------------------------------
+// M7B-156
+// ---------------------------------------------------------------------------------------------
+
+/// The copy the rebuild catches up: A, copy 2 on node 3, not placed as a survivor.
+const REBUILT: CopyId = CopyId(2);
+
+/// M7B-156's scenario: M7B-104's run with `op` planned on A's node. A was not a survivor, so its
+/// first sync is the rebuild's: R1's fan-out catches A up after the commit, and F1 then asks
+/// every required copy to prove the cutoff again (M7B-137), A included. The deadline leaves room
+/// for F1's rebuild sync timer (ruling B-R52) to fire after that sync.
+fn rebuild_fault_plan(case: &str, op: StorageOp) -> RunPlan {
+    let mut plan = buffered_b_plan();
+    plan.provenance = rdb_core::contracts::trace::Provenance::Authored {
+        case: String::from(case),
+    };
+    plan.storage_ops = vec![op];
+    plan.limits = RunLimits {
+        max_events: 800,
+        deadline: Tick(12_000),
+    };
+    plan
+}
+
+/// A rebuild whose sync of A met a fault: the recovery committed once and nothing activated; A's
+/// first sync is after the commit and withheld for `reason`; no `SyncProven` for A precedes F1's
+/// `RebuildStalled{A}`, which follows the withheld sync by at least one discovery window. So the
+/// failure is in the trace, no `DurableAt` came of it, and F1 reported the copy: never a silent
+/// run that simply ends.
+fn assert_rebuild_fault_reported(trace: &Trace, reason: SyncWithheldReason) {
+    let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+    let cas = positions(trace, is_recovery_cas);
+    assert_eq!(
+        cas.len(),
+        1,
+        "the recovery's CAS and no activation: {cas:?}"
+    );
+    let a_syncs: Vec<Sync> = syncs(trace)
+        .into_iter()
+        .filter(|s| s.copy == REBUILT)
+        .collect();
+    assert!(!a_syncs.is_empty(), "A was asked to sync");
+    let first = a_syncs[0];
+    assert!(first.index > cas[0], "A's first sync is the rebuild's");
+    assert_eq!(
+        (first.cutoff, first.fate),
+        (Seq(HEAD), SyncFate::Withheld(reason)),
+        "{a_syncs:?}"
+    );
+    let stalls: Vec<(usize, u64)> = facts_at(trace)
+        .into_iter()
+        .filter(|(_, _, effect)| {
+            matches!(effect, RecoveryEffect::RebuildStalled { copy } if *copy == REBUILT)
+        })
+        .map(|(index, tick, _)| (index, tick))
+        .collect();
+    assert!(!stalls.is_empty(), "F1 named A: {:?}", facts_at(trace));
+    let (stalled_at, stall_tick) = stalls[0];
+    assert!(first.index < stalled_at, "the stall follows the sync");
+    let synced_tick = trace.events[first.index].logical_tick;
+    assert!(
+        stall_tick >= synced_tick + window,
+        "at the sync timer's deadline: synced {synced_tick}, stalled {stall_tick}"
+    );
+    assert!(
+        !a_syncs
+            .iter()
+            .any(|s| s.index < stalled_at && matches!(s.fate, SyncFate::Proven { .. })),
+        "no proof for A before the stall: {a_syncs:?}"
+    );
+    oracle_is_clean(trace);
+}
+
+/// M7B-156 (ruling B-R52, sim twin of M7B-153; spike §6 Storage group `FailFlush`, `StallFlush`;
+/// D §5.6a). A rebuild's `SyncWalThrough` meets a failed flush, then, in a second run, a stalled
+/// one. Each time the provider records the sync as withheld (lead ruling A-R67):
+/// `Failed(FlushFailed)` for the failure, `Stalled` for the stall. No `DurableAt` comes of it, and
+/// F1's sync timer names the copy `RebuildStalled` at its deadline.
+#[retcd_test]
+fn m7b_156_a_failed_or_stalled_flush_during_rebuild_is_reported_not_silent() {
+    support::preamble();
+    let failed = run_plan(&rebuild_fault_plan(
+        "m7b-156-fail-flush",
+        StorageOp::Fail {
+            node: A_NODE,
+            fault: StorageFault::FlushFailed,
+        },
+    ));
+    tracing::info!(sync = ?syncs(&failed.trace), facts = ?facts_at(&failed.trace), "m7b_156 fail");
+    assert_rebuild_fault_reported(
+        &failed.trace,
+        SyncWithheldReason::Failed(StorageFault::FlushFailed),
+    );
+
+    let stalled = run_plan(&rebuild_fault_plan(
+        "m7b-156-stall-flush",
+        StorageOp::StallFlush { node: A_NODE },
+    ));
+    tracing::info!(sync = ?syncs(&stalled.trace), facts = ?facts_at(&stalled.trace), "m7b_156 stall");
+    assert_rebuild_fault_reported(&stalled.trace, SyncWithheldReason::Stalled);
+}
+
+// ---------------------------------------------------------------------------------------------
+// M7B-136
+// ---------------------------------------------------------------------------------------------
+
+/// M7B-136: B's head, and C's.
+const B_HEAD_136: u64 = 100;
+const C_HEAD_136: u64 = 80;
+
+/// The prior configuration M7B-136 runs under: A (copy 2, node 3) primary, B and C regular, the
+/// shadow on node 4. Unlike [`support::rf3_config`], B is not primary, so B can host the receiver
+/// its recovery source serves from (ruling B-R59b), and A's label is the one a live append to it
+/// comes from.
+fn a_primary_config() -> PartitionConfig {
+    PartitionConfig::new(
+        PARTITION,
+        ConfigVersion(1),
+        vec![
+            support::member(0, 1, ReplicaRole::RegularSecondary),
+            support::member(1, 2, ReplicaRole::RegularSecondary),
+            support::member(2, 3, ReplicaRole::Primary),
+            support::member(3, 4, ReplicaRole::Shadow),
+        ],
+    )
+}
+
+/// `copy`'s receiver in the prior lineage under [`a_primary_config`], at `(at, d(at))`,
+/// durable `at`. Its ladder holds `at` only.
+fn receiver_at(copy: CopyId, history: &CanonicalHistory, at: u64) -> AppendReceiver {
+    AppendReceiver::new(ReceiverInit {
+        config: a_primary_config(),
+        own: copy,
+        lineage: prior(),
+        head: Head {
+            seq: Seq(at),
+            digest: history.digest(at),
+        },
+        durable: DurableSeq(at),
+    })
+    .expect("a receiver")
+}
+
+/// A's live append of record `seq` to B: the stored bytes of [`history`], delivered on B's node
+/// from A's label in the prior lineage.
+fn append_from_a(at: u64, history: &CanonicalHistory, seq: u64) -> SeedEvent {
+    let (record, _) = history_writes(history.batch(seq), Seq(seq)).expect("a stored record");
+    SeedEvent {
+        at: Tick(at),
+        node: B_NODE,
+        boot: BOOT,
+        partition: PARTITION,
+        correlation: CorrelationId(1_000 + seq),
+        kind: EventKind::Transport(TransportEvent::Delivered {
+            from: PeerLabel {
+                node: A_NODE,
+                boot: BOOT,
+                authenticated: true,
+            },
+            frame: Frame {
+                id: MessageId(u32::try_from(seq).expect("small")),
+                protocol: ENVELOPE_VERSION,
+                config: ConfigVersion(1),
+                sender: prior(),
+                body: record,
+            },
+        }),
+    }
+}
+
+/// M7B-136's scenario (D §7 row "fenced node shorter likewise"). A, the prior primary, is dead:
+/// not placed, and cut off from every other node. B holds 1..=100 and C 1..=80 of the prior lineage,
+/// compatible. B's receiver starts at 80 and takes 81..=100 as live appends from A's label,
+/// seeded on B's node before A is cut off (ruling B-R59b), so its
+/// ladder holds every rung C can name; C's receiver starts at 80. F1 runs on C's node, which holds
+/// the fence.
+///
+/// B's engine is preloaded to 100, not 80: the survivor placed at 100 must be backed by what the
+/// engine holds applied when the run starts (A-R67.3a). The live appends re-commit 81..=100 over
+/// the same bytes. What the ruling needs live is the receiver's ladder, and that is live.
+fn two_survivor_plan() -> (RunPlan, CanonicalHistory) {
+    let history = history(B_HEAD_136);
+    let mut plan = RunPlan::new(ClusterConfig {
+        partitions: vec![PartitionSpec {
+            partition: PARTITION,
+            config: a_primary_config(),
+        }],
+        ..support::cluster()
+    });
+    plan.provenance = rdb_core::contracts::trace::Provenance::Authored {
+        case: String::from("m7b-136-two-survivors"),
+    };
+    plan.control_records = vec![prior_record()];
+    preload(&mut plan, B_NODE, &history);
+    let c_history = CanonicalHistory {
+        start: history.start,
+        batches: history.batches[..usize::try_from(C_HEAD_136).expect("small")].to_vec(),
+        digests: history.digests[..=usize::try_from(C_HEAD_136).expect("small")].to_vec(),
+    };
+    preload(&mut plan, C_NODE, &c_history);
+    plan.preload_durable = vec![
+        (B_NODE, PARTITION, Generation(1), DurableSeq(C_HEAD_136)),
+        (C_NODE, PARTITION, Generation(1), DurableSeq(C_HEAD_136)),
+    ];
+    plan.survivors = vec![
+        (B_NODE, PARTITION, survivor(0, &history, B_HEAD_136)),
+        (C_NODE, PARTITION, survivor(1, &history, C_HEAD_136)),
+    ];
+    plan.network_ops = [B_NODE, C_NODE, NodeId(4)]
+        .into_iter()
+        .map(|b| NetworkOp::SetLink {
+            a: A_NODE,
+            b,
+            state: LinkState::Partitioned,
+        })
+        .collect();
+    let mut seed: Vec<SeedEvent> = (C_HEAD_136 + 1..=B_HEAD_136)
+        .map(|seq| append_from_a(10 * (seq - C_HEAD_136), &history, seq))
+        .collect();
+    let on_c = |at: u64, event: RecoveryEvent| SeedEvent {
+        node: C_NODE,
+        ..recovery_seed(at, event)
+    };
+    seed.push(on_c(
+        300,
+        RecoveryEvent::Plan(Box::new(two_survivor_recovery_plan())),
+    ));
+    seed.push(on_c(301, RecoveryEvent::FenceProven(Box::new(fence()))));
+    plan.seed = seed;
+    plan.limits = RunLimits {
+        max_events: 2_000,
+        deadline: Tick(8_000),
+    };
+    (plan, history)
+}
+
+/// [`recovery_plan`] over [`a_primary_config`]: the plan pins the prior configuration verbatim,
+/// as F1 does (D §5.8), with B, C and A required.
+fn two_survivor_recovery_plan() -> RecoveryPlan {
+    RecoveryPlan {
+        config: a_primary_config(),
+        ..recovery_plan()
+    }
+}
+
+/// M7B-136 (S §5 F1 "two-survivor synchronization"; D §5.1 `Synchronizing`, §5.6
+/// `CatchUp{credential{sender: source}}`; §3.2a; 0009 §7; rulings B-R59, B-R59a, B-R59b).
+///
+/// Read from the run: F1 selects B's 100. C, at 80, is caught up to `(100, d100)` by B's
+/// recovery source: frames flow from B's node to C's and nothing reaches or leaves A's. C's
+/// receiver admits a `RecoveryAppend` only from the copy its credential names (6R′), and B's label
+/// is the only one that sent C anything, so the credential F1 minted names B. Then F1's barrier:
+/// `SyncProven` for B and for C at 100, both before the one recovery CAS, which commits
+/// `DegradedRf2` with a barrier over `{B, C}` at `(100, d100)`. The oracle finds nothing.
+///
+/// Not read here: the `CatchUp` effect itself. The harness routes it as `KernelEvent::CatchUp`
+/// and records no fact for it, so the credential is proved by its effect at C, above.
+#[retcd_test]
+fn m7b_136_two_survivor_synchronization_converges_on_the_selected_prefix() {
+    support::preamble();
+    let (plan, history) = two_survivor_plan();
+    let mut runner = Runner::new(&plan).expect("a runner");
+    for copy in [B, C] {
+        runner
+            .dispatcher_mut()
+            .replication_mut()
+            .install_receiver(receiver_at(copy, &history, C_HEAD_136));
+    }
+    let report = runner.run(plan.limits).expect("the scenario runs");
+    let c_head = runner
+        .dispatcher()
+        .replication()
+        .receiver(C_NODE, PARTITION)
+        .map(AppendReceiver::applied_head);
+    let sent = runner.dispatcher().network().transmissions().to_vec();
+    let trace = runner.finish().expect("a trace");
+    let sync = syncs(&trace);
+    tracing::info!(stop = ?report.stop, ?sync, facts = ?facts_at(&trace), ?c_head, "m7b_136 run");
+    assert_eq!(report.refusal(), None, "{:?}", report.stop);
+    validate(&trace).expect("a well-formed trace");
+
+    // F1 selected B's 100.
+    let selected: Vec<(Seq, CopyId)> = facts(&trace)
+        .into_iter()
+        .filter_map(|effect| match effect {
+            RecoveryEffect::Selected(selected) => Some((selected.cutoff_seq, selected.source)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selected, vec![(Seq(B_HEAD_136), B)]);
+
+    // C was caught up by B, and only by B.
+    let b_to_c = sent
+        .iter()
+        .filter(|t| (t.from, t.to) == (B_NODE, C_NODE) && t.copies == 1)
+        .count();
+    assert!(b_to_c >= 20, "B sent C 81..=100: {sent:?}");
+    assert!(
+        sent.iter()
+            .filter(|t| t.from == A_NODE || t.to == A_NODE)
+            .all(|t| t.copies == 0),
+        "nothing reaches or leaves A: {sent:?}"
+    );
+    assert!(
+        !sent.iter().any(|t| t.to == C_NODE && t.from != B_NODE),
+        "only B's label sent C anything: {sent:?}"
+    );
+    assert_eq!(
+        c_head,
+        Some(Head {
+            seq: Seq(B_HEAD_136),
+            digest: history.digest(B_HEAD_136)
+        }),
+        "C's head is (100, d100)"
+    );
+
+    // The barrier: both proofs at 100, then the one CAS.
+    let cas = positions(&trace, is_recovery_cas);
+    assert_eq!(cas.len(), 1, "one recovery CAS: {sync:?}");
+    let barrier: Vec<(CopyId, Seq, SyncFate)> = sync
+        .iter()
+        .filter(|s| s.index < cas[0])
+        .map(|s| (s.copy, s.cutoff, s.fate))
+        .collect();
+    let proven = SyncFate::Proven {
+        durable: DurableSeq(B_HEAD_136),
+    };
+    assert_eq!(
+        barrier,
+        vec![(B, Seq(B_HEAD_136), proven), (C, Seq(B_HEAD_136), proven)]
+    );
+    assert!(matches!(
+        trace.events[cas[0]].kind,
+        TraceKind::ControlInteraction {
+            outcome: ControlOutcomeKind::Committed,
+            ..
+        }
+    ));
+    let results: Vec<RecoveryResult> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredFact { result },
+                ..
+            } => Some((**result).clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "one Recovered");
+    assert_eq!(results[0].mode, PartitionMode::DegradedRf2);
+    assert_eq!(results[0].barrier.required(), &[B, C][..]);
+    assert_eq!(
+        (
+            results[0].barrier.cutoff(),
+            results[0].barrier.cutoff_digest()
+        ),
+        (Seq(B_HEAD_136), history.digest(B_HEAD_136))
+    );
+    oracle_is_clean(&trace);
 }

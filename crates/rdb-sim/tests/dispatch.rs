@@ -4327,28 +4327,29 @@ fn rebuild_a_duplicated_reply_ends_as_the_control() {
     );
 }
 
-/// Lead ruling L-R177do, through F1's `SyncWalThrough` provider. A stalled sync never answers,
-/// and no [`rdb_core::contracts::recovery::SyncWithheldReason`] says "stalled", so the provider
-/// **refuses by name** rather than withhold under a reason that is not true: the run stops at
-/// `harness::dispatch::deliver::recovery`, on F1's request, with the one capture held. Two
-/// paths: node 2's survivor proof at the barrier, and node 3's rebuilt copy while rebuilding.
-/// The clean run refuses nothing.
+/// Lead ruling B-R70 (superseding L-R177do's refusal), through F1's `SyncWalThrough` provider.
+/// A stalled sync never answers, so the provider **withholds it as stalled**:
+/// [`rdb_core::contracts::trace::SyncWithheldReason::Stalled`] on F1's request, no proof, and the
+/// run goes on so F1's own sync timer can report it (B-R52). The capture stays held. Two paths:
+/// node 2's survivor proof at the barrier, and node 3's rebuilt copy while rebuilding. The clean
+/// run refuses nothing and withholds nothing as stalled.
 #[retcd_test]
-fn recovery_a_stalled_sync_is_refused_by_name_not_withheld() {
+fn recovery_a_stalled_sync_is_withheld_as_stalled_not_refused() {
+    use rdb_core::contracts::trace::SyncWithheldReason;
     use rdb_core::recovery::RecoveryPhase;
     use rdb_sim::harness::run::StopReason;
     support::preamble();
-    let run = |stall: Option<NodeId>| {
+    let run = |stall: Option<(NodeId, CopyId)>| {
         let mut plan = rebuild_plan(Vec::new());
         plan.storage_ops
-            .extend(stall.map(|node| StorageOp::StallFlush { node }));
+            .extend(stall.map(|(node, _)| StorageOp::StallFlush { node }));
         let mut runner = Runner::new(&plan).expect("a runner");
         let stop = runner.run(plan.limits).expect("the rebuild runs").stop;
         let phase = runner
             .dispatcher()
             .recovery(NODE, PartitionId(1))
             .map(rdb_core::recovery::Recovery::phase);
-        let held = stall.map(|node| {
+        let held = stall.map(|(node, _)| {
             runner
                 .dispatcher()
                 .engine(node)
@@ -4356,24 +4357,79 @@ fn recovery_a_stalled_sync_is_refused_by_name_not_withheld() {
                 .stalled_syncs()
                 .len()
         });
-        let refused = match stop {
-            StopReason::Refused { seam, module, .. } => Some((seam, module)),
-            _ => None,
-        };
-        (refused, phase, held)
+        let refused = matches!(stop, StopReason::Refused { .. });
+        let trace = runner.finish().expect("a trace");
+        // Every sync note on F1's node, as (copy, cutoff, stalled?, proven?).
+        let fates: Vec<(CopyId, Seq, bool, bool)> = trace
+            .events
+            .iter()
+            .filter(|event| event.node == NODE)
+            .filter_map(|event| match &event.kind {
+                TraceKind::KernelNoted {
+                    note:
+                        KernelNote::SyncWithheld {
+                            copy,
+                            cutoff,
+                            reason,
+                        },
+                    ..
+                } => Some((
+                    *copy,
+                    *cutoff,
+                    *reason == SyncWithheldReason::Stalled,
+                    false,
+                )),
+                TraceKind::KernelNoted {
+                    note: KernelNote::SyncProven { copy, cutoff, .. },
+                    ..
+                } => Some((*copy, *cutoff, false, true)),
+                _ => None,
+            })
+            .collect();
+        (refused, phase, held, fates)
     };
-    assert_eq!(run(None).0, None, "control: the clean run refuses nothing");
-    let refused = Some(("harness::dispatch::deliver::recovery", ModuleName::Recovery));
-    assert_eq!(
-        run(Some(NodeId(2))),
-        (refused, Some(RecoveryPhase::Barrier), Some(1)),
-        "a survivor's proof stalls: refused at the barrier, its capture held"
+    let (refused, _, _, fates) = run(None);
+    assert!(!refused, "control: the clean run refuses nothing");
+    assert!(
+        fates.iter().all(|(_, _, stalled, _)| !stalled),
+        "control: nothing withheld as stalled: {fates:?}"
     );
-    assert_eq!(
-        run(Some(NodeId(3))),
-        (refused, Some(RecoveryPhase::Rebuilding), Some(1)),
-        "the rebuilt copy's proof stalls: refused while rebuilding, its capture held"
-    );
+    for (node, copy, phase, path) in [
+        (
+            NodeId(2),
+            CopyId(1),
+            RecoveryPhase::Barrier,
+            "a survivor's proof",
+        ),
+        (
+            NodeId(3),
+            CopyId(2),
+            RecoveryPhase::Rebuilding,
+            "the rebuilt copy's proof",
+        ),
+    ] {
+        let (refused, at, held, fates) = run(Some((node, copy)));
+        assert!(!refused, "{path} stalls: not refused");
+        assert_eq!(
+            at.as_ref(),
+            Some(&phase),
+            "{path} stalls: F1 stays in {phase:?}"
+        );
+        assert_eq!(held, Some(1), "{path} stalls: its capture held");
+        let mine: Vec<(Seq, bool, bool)> = fates
+            .iter()
+            .filter(|(c, ..)| *c == copy)
+            .map(|(_, cutoff, stalled, proven)| (*cutoff, *stalled, *proven))
+            .collect();
+        assert!(
+            mine.contains(&(Seq(SPINE_HEAD), true, false)),
+            "{path} stalls: withheld as stalled at the cutoff: {fates:?}"
+        );
+        assert!(
+            mine.iter().all(|(_, _, proven)| !proven),
+            "{path} stalls: never proven: {fates:?}"
+        );
+    }
 }
 
 /// Near miss (lead's condition on B-R55 item 3): copy 2's engine holds a record at the cutoff

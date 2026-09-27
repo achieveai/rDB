@@ -1766,23 +1766,23 @@ impl Dispatcher {
     ///
     /// The durable position is the engine's answer ([`MemoryEngine::durable_through`]) after a
     /// real [`MemoryEngine::sync_wal_through`], never the capture. Every other outcome — a copy
-    /// with no holder, a failed sync, a short or false one, no digest at `cutoff` — yields no
-    /// proof and is recorded as [`KernelNote::SyncWithheld`] with its reason (lead ruling
-    /// A-R67.4), never nothing. F1 answers a missing proof with its own sync timer (B-R52).
+    /// with no holder, a failed sync, a stalled one, a short or false one, no digest at `cutoff`
+    /// — yields no proof and is recorded as [`KernelNote::SyncWithheld`] with its reason (lead
+    /// ruling A-R67.4), never nothing. F1 answers a missing proof with its own sync timer (B-R52).
     /// A proof is recorded as [`KernelNote::SyncProven`] (B-R55a), so each request carries
-    /// exactly one of the two. There are two exceptions, and each stops the run and records
-    /// neither:
+    /// exactly one of the two. There is one exception, and it stops the run and records neither:
     ///
     /// - A crashed holder refuses the effect under `harness::dispatch::deliver::crash`.
-    /// - A holder whose syncs are stalled ([`StorageOp::StallFlush`]) refuses it under
-    ///   `harness::dispatch::deliver::recovery`, because no withheld reason says "stalled" yet
-    ///   (L-R177do).
+    ///
+    /// A holder whose syncs are stalled ([`StorageOp::StallFlush`]) never answers, so its sync
+    /// is withheld as [`SyncWithheldReason::Stalled`] and F1's own sync timer reports the stall
+    /// (lead ruling B-R70, M7B-156).
     ///
     /// Two sources, chosen by where the asking F1 is (lead ruling B-R55 item 3, M7B-137):
     ///
     /// - **Before commit**, the copy is a placed survivor: its holder is where the scenario put
     ///   it, the lineage is the anchor's, and the digest is the one its placed history holds at
-    ///   `cutoff`.
+    ///   `cutoff`, or, past the placed head, the one its engine stores there (B-R70, M7B-136).
     /// - **After commit** (F1 `Committed`, `Rebuilding` or `ActivationProposed`, with its
     ///   `RecoveryResult` recorded), the copy is the pinned configuration's: its holder is that
     ///   configuration's node for it, the lineage is the new generation, and the digest is the
@@ -1831,12 +1831,11 @@ impl Dispatcher {
             generation,
             through: AppliedSeq(cutoff.0),
         }];
-        // A stalled sync never answers, and no `SyncWithheldReason` says so yet: refused by name
-        // rather than withheld under a reason that is not true (L-R177do).
+        // A stalled sync never answers: withheld as stalled, and F1's sync timer reports it
+        // (B-R70, B-R52).
         if engine.stalled_sync(&captured) {
-            return Err(SimError::unavailable(
-                "harness::dispatch::deliver::recovery",
-            ));
+            self.notes.push(withheld(SyncWithheldReason::Stalled));
+            return Ok(());
         }
         if let Err(fault) = engine.sync_wal_through(captured) {
             self.notes.push(withheld(SyncWithheldReason::Failed(fault)));
@@ -1854,7 +1853,9 @@ impl Dispatcher {
                 .ladder
                 .iter()
                 .find(|(rung, _)| *rung == cutoff)
-                .map(|(_, digest)| *digest),
+                .map(|(_, digest)| *digest)
+                // A placed survivor caught up live past its placed inventory (B-R70).
+                .or_else(|| stored_digest(engine, (holder, partition, generation), cutoff)),
             None => stored_digest(engine, (holder, partition, generation), cutoff),
         };
         let Some(digest) = digest else {

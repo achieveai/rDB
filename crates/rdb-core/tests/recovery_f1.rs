@@ -5,13 +5,17 @@
 //! ruling rows of the B-R41/B-R45 gates, the tester's `tester_*` rows included; a scaffold names
 //! the plan row it prepared.
 //!
-//! F1 rows that are not here, each for one reason: M7B-96, 104, 136 and 137 are sim rows
-//! (rdb-sim, F:H1/F:M1). M7B-116's spy clause says length is never read from `select_prefix`,
-//! which design §5.4 contradicts, so it waits on a re-word. M7B-112 and 138 assert R1's receiver,
-//! not F1. M7B-108 (re-worded by B-R49), 97 and 113 come next; the last two read `SelectionSpy`,
-//! F1's `LengthSpy`/`SelectSpy` seam. M7B-153 and 154 (ruling B-R52, the bounded rebuild sync)
-//! are the last rows in the file. M7B-155 was promoted in place from the F-a scaffold, so it sits
-//! with the pre-commit wait rows; M7B-156 is its sim twin (rdb-sim).
+//! F1 rows that are not here, each for one reason: M7B-96, 104, 136, 137 and 156 are sim rows
+//! (rdb-sim, F:H1/F:M1). M7B-108 (re-worded by B-R49), 97 and 113 come next; the last two read
+//! `SelectionSpy`, F1's `LengthSpy`/`SelectSpy` seam. M7B-153 and 154 (ruling B-R52, the bounded
+//! rebuild sync) sit before package 5. M7B-155 was promoted in place from the F-a scaffold, so it
+//! sits with the pre-commit wait rows; M7B-156 is its sim twin (rdb-sim).
+//!
+//! Package 5 is the last section: M7B-116 (re-worded by B-R49b: no merge, union or delete, and
+//! length read only by `longest`), M7B-112 (`DegradedRf2` needs both copies; R1 blocks on losing
+//! either) and M7B-138 (a holder that cannot lead transfers under a credential naming itself).
+//! 112 and 138 cross into R1 through `Replication::step` and `AppendReceiver`, because their
+//! claims end at R1's receiver, not at F1.
 //!
 //! A1's `FenceProven` is not routed to F1 by the sim yet (lead ruling on B-R35), so every test
 //! builds its `FencingProof` directly and delivers it as `RecoveryEvent::FenceProven`.
@@ -58,6 +62,23 @@ use rdb_core::recovery::lineage::{
 use rdb_core::recovery::{
     mode_for, new_root, Recovery, RecoveryPhase, DISCOVERY_TIMER, MAX_WINDOW_EXTENSIONS,
 };
+// M7B-112 and 138 follow F1's output into R1.
+use rdb_core::contracts::authority::FenceCredential;
+use rdb_core::contracts::digest::Domain;
+use rdb_core::contracts::envelope::{
+    AppendAck, AppendOutcome, AppendReject, EnvelopeHeader, ReplicaProgress, ReplicationEnvelope,
+};
+use rdb_core::contracts::ids::{
+    AppliedSeq, BatchId, ClientId, LeaseId, MessageId, ReceivedSeq, RequestId, RequestIdentity,
+    TenantId,
+};
+use rdb_core::contracts::storage::{StorageEvent, StoreEffect, Write};
+use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
+use rdb_core::contracts::txn::Outcome;
+use rdb_core::contracts::version::ENVELOPE_VERSION;
+use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+use rdb_core::replication::wire::{decode_reply, encode_recovery_append, encode_reply};
+use rdb_core::replication::Replication;
 
 use std::collections::BTreeSet;
 
@@ -4271,4 +4292,529 @@ fn m7b_154_a_sync_answered_before_its_deadline_makes_the_timer_stale() {
         cas_result(CasOutcome::Committed(Revision(11))),
     ));
     assert_eq!(active.mode, PartitionMode::Active);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Package 5 rows (plan §8.3, §9): the no-merge scan (M7B-116), and the two rows that follow F1's
+// output into R1 (M7B-112, M7B-138)
+// ---------------------------------------------------------------------------------------------
+
+/// The identifiers in `source` outside `//` comments (doc comments included). A string literal's
+/// words count as identifiers, which only makes the scan stricter.
+fn identifiers(source: &str) -> Vec<&str> {
+    source
+        .lines()
+        .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+        .flat_map(|code| code.split(|c: char| !(c.is_alphanumeric() || c == '_')))
+        .filter(|word| word.starts_with(|c: char| c.is_alphabetic() || c == '_'))
+        .collect()
+}
+
+/// The identifiers the charter's DO-NOT list forbids in F1: anything naming a merge, a union or
+/// a delete, and the length-only chooser `longest_by_len`.
+fn forbidden(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    ["merge", "union", "delete"]
+        .iter()
+        .any(|bad| lower.contains(bad))
+        || lower == "longest_by_len"
+}
+
+/// M7B-116 (charter DO-NOT list; D §5.9; re-worded by lead ruling B-R49b): F1's source names no
+/// merge, union or delete and no `longest_by_len`, outside comments; `max_by` appears once, in
+/// `lineage::longest`, the one place length chooses between survivors; and `select_prefix` reaches
+/// it only after every pair has passed: `length_reads` is 0 on `Divergence` and on `NeedProbes`,
+/// and 1 on `Selected`. The scan reads the files at compile time and checks, at run time, that
+/// `src/recovery/` holds exactly those files, so a new F1 file cannot escape it.
+#[retcd_test]
+fn m7b_116_no_merge_union_or_delete_in_recovery_source() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/recovery");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .expect("F1's source directory")
+        .map(|entry| {
+            entry
+                .expect("a directory entry")
+                .file_name()
+                .into_string()
+                .expect("a UTF-8 name")
+        })
+        .collect();
+    on_disk.sort();
+    assert_eq!(
+        on_disk,
+        [
+            "commit.rs",
+            "emit.rs",
+            "inventory.rs",
+            "lineage.rs",
+            "rebuild.rs"
+        ],
+        "a file added to F1 must be added to this scan"
+    );
+    let lineage_rs = include_str!("../src/recovery/lineage.rs");
+    let f1_source = [
+        ("recovery.rs", include_str!("../src/recovery.rs")),
+        ("commit.rs", include_str!("../src/recovery/commit.rs")),
+        ("emit.rs", include_str!("../src/recovery/emit.rs")),
+        ("inventory.rs", include_str!("../src/recovery/inventory.rs")),
+        ("lineage.rs", lineage_rs),
+        ("rebuild.rs", include_str!("../src/recovery/rebuild.rs")),
+    ];
+
+    // Positive control: the scan sees code and skips comments.
+    let control = identifiers("let x = a.merge_all().max_by_key(k); // union and delete");
+    assert!(control.iter().any(|w| forbidden(w)), "{control:?}");
+    assert!(control.contains(&"max_by_key"), "{control:?}");
+    assert!(!control.contains(&"union"), "{control:?}");
+
+    let mut max_by = 0;
+    for (file, source) in f1_source {
+        let words = identifiers(source);
+        assert!(words.len() > 100, "{file}: the scan read nothing");
+        let bad: Vec<&&str> = words.iter().filter(|w| forbidden(w)).collect();
+        assert!(bad.is_empty(), "{file}: {bad:?}");
+        max_by += words.iter().filter(|w| w.starts_with("max_by")).count();
+    }
+    assert_eq!(max_by, 1, "one length chooser in all of F1");
+    let longest = lineage_rs
+        .split_once("\nfn longest<")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .expect("lineage::longest")
+        .0;
+    assert_eq!(
+        identifiers(longest)
+            .iter()
+            .filter(|w| w.starts_with("max_by"))
+            .count(),
+        1,
+        "and it is in lineage::longest"
+    );
+
+    // The spy: length is read only once every pair has passed.
+    for (reports, outcome_is, reads) in [
+        (vec![inv(B, 30), inv_on(C, 30, 1, 20)], "Divergence", 0),
+        (vec![sparse(B, 30), inv(C, 20)], "NeedProbes", 0),
+        (vec![inv(B, 30), inv(C, 20)], "Selected", 1),
+    ] {
+        let mut spy = SelectionSpy::new();
+        let outcome = select_prefix_spied(&verified(&reports), root(), &mut spy);
+        let kind = match outcome {
+            SelectionOutcome::Divergence(_) => "Divergence",
+            SelectionOutcome::NeedProbes(_) => "NeedProbes",
+            SelectionOutcome::Selected(_) => "Selected",
+            SelectionOutcome::Empty => "Empty",
+        };
+        assert_eq!(kind, outcome_is, "{outcome:?}");
+        assert_eq!(spy.selections(), 1);
+        assert_eq!(spy.length_reads(), reads, "{outcome_is}");
+    }
+}
+
+/// A step of R1 on `node`, returning the effect kinds.
+fn r1_on(module: &mut Replication, node: NodeId, now: u64, kind: EventKind) -> Vec<EffectKind> {
+    let event = Event {
+        id: EventId(now),
+        at: Tick(now),
+        node,
+        boot: BootId(1),
+        partition: PARTITION,
+        correlation: CORRELATION,
+        kind,
+    };
+    module
+        .step(&ctx(now), &event)
+        .expect("R1 answers its own event")
+        .into_iter()
+        .map(|effect| effect.kind)
+        .collect()
+}
+
+fn node_of(copy: CopyId) -> NodeId {
+    NodeId(u32::from(copy.0))
+}
+
+/// `copy`'s own label: the fixture boots every node as 1.
+fn label_of(copy: CopyId) -> PeerLabel {
+    PeerLabel {
+        node: node_of(copy),
+        boot: BootId(1),
+        authenticated: true,
+    }
+}
+
+/// M7B-112's plan: `{primary, secondary}` and nothing else, so two regular copies is the whole
+/// membership. Only `primary` may lead, so the record's owner and the pin's primary are one copy.
+fn rf2_plan(primary: CopyId, secondary: CopyId) -> RecoveryPlan {
+    let mut rf2 = plan(&[]);
+    rf2.config = PartitionConfig::new(
+        PARTITION,
+        C1,
+        vec![
+            member(primary, ReplicaRole::Primary),
+            member(secondary, ReplicaRole::RegularSecondary),
+        ],
+    );
+    rf2.candidates = vec![
+        candidate(primary),
+        Candidate {
+            primary_eligible: false,
+            ..candidate(secondary)
+        },
+    ];
+    rf2.rebuild_required = [primary, secondary].into_iter().collect();
+    rf2
+}
+
+/// `secondary`'s ACK at 20 in the new root, holding `digest` at 20.
+fn rf2_ack(secondary: CopyId, digest: Digest) -> EventKind {
+    let ack = AppendAck {
+        partition: PARTITION,
+        generation: root().generation,
+        owner_epoch: root().owner_epoch,
+        config_version: C1,
+        from: node_of(secondary),
+        boot: BootId(1),
+        role: ReplicaRole::RegularSecondary,
+        progress: ReplicaProgress {
+            received: ReceivedSeq(20),
+            buffered_applied: AppliedSeq(20),
+            durable: DurableSeq(20),
+        },
+        digest_at_buffered: digest,
+    };
+    EventKind::Transport(TransportEvent::Delivered {
+        from: label_of(secondary),
+        frame: Frame {
+            id: MessageId(20),
+            protocol: ENVELOPE_VERSION,
+            config: C1,
+            sender: root(),
+            body: encode_reply(&AppendOutcome::Accepted(ack)),
+        },
+    })
+}
+
+/// M7B-112 (D §5.6 `DegradedRf2` row; B-R3; gate V3 "degraded RF2 requires both"): B and C
+/// survive, both at 20, and F1 commits `DegradedRf2` pinning `min_regular_acks` 1. The commit's
+/// `Recovered` builds R1's primary on B, whose only regular secondary is C: 1 of 1. C's good ACK
+/// qualifies 20; C's forked ACK (the M7B-51 path) loses C, and the same step blocks the partition
+/// and leaves nothing qualifying. The twin swaps the roles (C primary, B its secondary), and
+/// losing B stops writes the same way, so losing either stops writes. The primary's own loss is
+/// not an R1 path: a primary that is gone emits nothing, and a new recovery is F1's input, not
+/// this row's.
+#[retcd_test]
+fn m7b_112_degraded_rf2_requires_both_copies_losing_either_stops_writes() {
+    for (primary, secondary) in [(B, C), (C, B)] {
+        let mut f1 = fenced_on(rf2_plan(primary, secondary));
+        assert_eq!(
+            f1.log[1],
+            r(RecoveryEffect::QueryInventory { copies: vec![B, C] })
+        );
+        f1.report(10, inv(B, 20));
+        f1.report(10, inv(C, 20));
+        assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+        f1.step(WINDOW, fired(1));
+        assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+        f1.rec(3_000, durable(B, 20, dg(0, 20)));
+        assert_eq!(
+            f1.rec(3_001, durable(C, 20, dg(0, 20))),
+            vec![cas(CONTROL_REV, primary)]
+        );
+        let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+        assert_eq!(result.mode, PartitionMode::DegradedRf2);
+        assert_eq!(result.committed.pinned_config.min_regular_acks, 1);
+
+        let mut r1 = Replication::new();
+        r1_on(
+            &mut r1,
+            node_of(primary),
+            4_000,
+            EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
+        );
+        let tracker = |r1: &Replication| {
+            r1.primary(node_of(primary), PARTITION)
+                .expect("the pin's primary is built")
+                .tracker()
+                .clone()
+        };
+        assert_eq!(
+            tracker(&r1).regular_secondaries(),
+            vec![secondary],
+            "1 of 1"
+        );
+        assert!(
+            !tracker(&r1).qualifies_now(Seq(20)),
+            "RF2 needs the secondary"
+        );
+
+        r1_on(
+            &mut r1,
+            node_of(primary),
+            4_100,
+            rf2_ack(secondary, dg(0, 20)),
+        );
+        assert!(tracker(&r1).qualifies_now(Seq(20)), "both hold 20");
+
+        let lost = r1_on(
+            &mut r1,
+            node_of(primary),
+            4_200,
+            rf2_ack(secondary, dg(9, 20)),
+        );
+        let block = EffectKind::Kernel(KernelEffect::BlockPartition(
+            BlockReason::DivergenceRequiresOperator {
+                diverged: vec![secondary],
+            },
+        ));
+        assert!(
+            lost.contains(&EffectKind::Kernel(KernelEffect::CopyLost {
+                copy: secondary
+            })),
+            "{lost:?}"
+        );
+        assert!(lost.contains(&block), "writes stop the same step: {lost:?}");
+        for seq in [1, 20] {
+            assert!(
+                !tracker(&r1).qualifies_now(Seq(seq)),
+                "no one-copy fallback"
+            );
+        }
+    }
+}
+
+/// A sealed record at `seq` in the prior lineage (7, 1) under `C1`, chained on `prev`.
+fn record_at(seq: u64, prev: Digest) -> ReplicationEnvelope {
+    let mut env = ReplicationEnvelope {
+        header: EnvelopeHeader {
+            protocol_version: ENVELOPE_VERSION,
+            partition: PARTITION,
+            generation: PRIOR_GEN,
+            config_version: C1,
+            owner_epoch: PRIOR_EPOCH,
+            seq: Seq(seq),
+            body_len: 0,
+        },
+        lease_id: LeaseId(1),
+        prev_digest: prev,
+        request_identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(seq),
+        },
+        request_digest: Digest::of(Domain::Record, &[&seq.to_le_bytes()]),
+        conditions_result: Vec::new(),
+        mutations: vec![Write {
+            ns: Namespace::User,
+            key: Bytes::from_static(b"k"),
+            value: Some(Bytes::from_static(b"v")),
+        }],
+        result: Outcome::Published,
+        record_digest: Digest::ROOT,
+    };
+    env.record_digest = env.compute_record_digest().expect("digest");
+    env
+}
+
+/// The prior lineage's history 1..=n, so `history(n)[i - 1]` is the record at seq `i`.
+fn history(n: u64) -> Vec<ReplicationEnvelope> {
+    let mut out: Vec<ReplicationEnvelope> = Vec::new();
+    for seq in 1..=n {
+        let prev = out.last().map_or(Digest::ROOT, |env| env.record_digest);
+        out.push(record_at(seq, prev));
+    }
+    out
+}
+
+/// `copy`'s receiver under the plan's config, applied and durable at 20 of [`history`].
+fn receiver_at_20(config: &PartitionConfig, copy: CopyId) -> AppendReceiver {
+    let head = history(20).pop().expect("seq 20");
+    AppendReceiver::new(ReceiverInit {
+        config: config.clone(),
+        own: copy,
+        lineage: prior(),
+        head: Head {
+            seq: Seq(20),
+            digest: head.record_digest,
+        },
+        durable: DurableSeq(20),
+    })
+    .expect("a receiver at 20")
+}
+
+/// `env` as a `RecoveryAppend` from `from`'s label under `credential`, on the credential's
+/// lineage.
+fn recovery_append(
+    from: CopyId,
+    credential: &FenceCredential,
+    env: &ReplicationEnvelope,
+) -> EventKind {
+    EventKind::Transport(TransportEvent::Delivered {
+        from: label_of(from),
+        frame: Frame {
+            id: MessageId(u32::try_from(env.header.seq.0).expect("a small seq")),
+            protocol: ENVELOPE_VERSION,
+            config: C1,
+            sender: Lineage {
+                partition: credential.partition,
+                generation: credential.prior_generation,
+                owner_epoch: credential.prior_owner_epoch,
+            },
+            body: encode_recovery_append(credential, &env.encode().expect("encode")),
+        },
+    })
+}
+
+/// The credential in F1's transfer effect to `to`, whichever of the two transfer kinds it is.
+fn credential_to(effects: &[EffectKind], to: CopyId) -> FenceCredential {
+    let found: Vec<FenceCredential> = effects
+        .iter()
+        .filter_map(|e| match e {
+            EffectKind::Kernel(KernelEffect::Recovery(
+                RecoveryEffect::CatchUpBeforeGrant {
+                    to: dest,
+                    credential,
+                    ..
+                }
+                | RecoveryEffect::CatchUp {
+                    to: dest,
+                    credential,
+                    ..
+                },
+            )) if *dest == to => Some(*credential),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one transfer to {to:?} in {effects:?}");
+    found[0]
+}
+
+/// M7B-138 (D §3.2a row (a), §5.4 `CatchUpBeforeGrant{credential{sender holder}}`; 0005 §2 "the
+/// designated sender is admitted wherever it sends"; 0009 §4 "holder != leader transfers land"):
+/// B holds 30 and may not lead; C leads, D is a lagging regular, both at 20. F1's transfers both
+/// carry a credential naming B, the holder. Under that credential every record 21..=30 sent from
+/// B's label is staged at C and at D: 6R' admits it. The twin is the round-2 shape, a credential
+/// naming F1's own node's copy A: the same record from B's label is `NotAMember` at C and changes
+/// nothing. F1 proposes C only after C's `CopyCaughtUp` at the cutoff and the barrier (M7B-98
+/// continues); D's catch-up alone proposes nothing.
+#[retcd_test]
+fn m7b_138_holder_that_cannot_lead_transfers_under_a_credential_naming_the_holder() {
+    let mut holder_cannot_lead = plan(&[member(D, ReplicaRole::RegularSecondary)]);
+    holder_cannot_lead.candidates = vec![
+        Candidate {
+            primary_eligible: false,
+            ..candidate(B)
+        },
+        candidate(C),
+        candidate(D),
+    ];
+    let config = holder_cannot_lead.config.clone();
+    let mut f1 = fenced_on(holder_cannot_lead);
+    f1.report(10, inv(B, 30));
+    f1.report(10, inv(C, 20));
+    f1.report(10, inv(D, 20));
+    f1.rec(10, RecoveryEvent::InventoryFailed { copy: A });
+    let close = f1.step(WINDOW, fired(1));
+    assert_eq!(
+        close,
+        vec![
+            r(RecoveryEffect::CloseWindow),
+            selected(30, B),
+            r(RecoveryEffect::CatchUpBeforeGrant {
+                from: B,
+                to: C,
+                through: Seq(30),
+                credential: proof().credential_for(B),
+            }),
+            catch_up(B, D, 30),
+            arm(2, 2 * WINDOW),
+        ]
+    );
+    let to_c = credential_to(&close, C);
+    let to_d = credential_to(&close, D);
+    assert_eq!(
+        (to_c.sender, to_d.sender),
+        (B, B),
+        "the holder, not the leader"
+    );
+
+    // Every record B sends under F1's credential is admitted at C and at D.
+    let records = history(30);
+    let mut r1 = Replication::new();
+    for copy in [C, D] {
+        r1.install_receiver(receiver_at_20(&config, copy));
+    }
+    for (copy, credential) in [(C, to_c), (D, to_d)] {
+        for (batch, env) in (0..).zip(&records[20..]) {
+            let seq = env.header.seq;
+            let staged = r1_on(
+                &mut r1,
+                node_of(copy),
+                5_000,
+                recovery_append(B, &credential, env),
+            );
+            match staged.as_slice() {
+                [EffectKind::Store(StoreEffect::Commit(stored))] => {
+                    assert_eq!((stored.generation, stored.seq), (PRIOR_GEN, seq));
+                }
+                other => panic!("{copy:?} did not admit {seq:?}: {other:?}"),
+            }
+            r1_on(
+                &mut r1,
+                node_of(copy),
+                5_001,
+                EventKind::Storage(StorageEvent::Committed {
+                    batch: BatchId(batch),
+                    applied: AppliedSeq(seq.0),
+                }),
+            );
+        }
+        let rx = r1.receiver(node_of(copy), PARTITION).expect("installed");
+        assert_eq!(
+            rx.applied_head(),
+            Head {
+                seq: Seq(30),
+                digest: records[29].record_digest
+            },
+            "{copy:?}"
+        );
+    }
+
+    // The twin: the round-2 shape names F1's own node's copy, A, and B's record is refused.
+    let round_2 = proof().credential_for(A);
+    let mut twin = Replication::new();
+    twin.install_receiver(receiver_at_20(&config, C));
+    let before = twin.receiver(node_of(C), PARTITION).cloned();
+    let refused = r1_on(
+        &mut twin,
+        node_of(C),
+        5_000,
+        recovery_append(B, &round_2, &records[20]),
+    );
+    match refused.as_slice() {
+        [EffectKind::Send(SendEffect::Unicast { to, frame })] => {
+            assert_eq!(*to, node_of(B));
+            assert_eq!(
+                decode_reply(&frame.body).expect("a reply"),
+                AppendOutcome::Rejected(AppendReject::NotAMember)
+            );
+        }
+        other => panic!("expected one refusal, got {other:?}"),
+    }
+    assert_eq!(twin.receiver(node_of(C), PARTITION).cloned(), before);
+
+    // F1: D's catch-up proposes nothing; C's does, after the barrier.
+    f1.rec(6_000, caught_up(D, 30, dg(0, 30)));
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+    assert_eq!(f1.cas_count(), 0);
+    assert_eq!(
+        f1.rec(6_100, caught_up(C, 30, dg(0, 30))),
+        vec![sync(B, 30), sync(C, 30), sync(D, 30)]
+    );
+    assert_eq!(f1.cas_count(), 0);
+    f1.rec(6_200, durable(B, 30, dg(0, 30)));
+    f1.rec(6_200, durable(D, 30, dg(0, 30)));
+    assert_eq!(
+        f1.rec(6_300, durable(C, 30, dg(0, 30))),
+        vec![cas(CONTROL_REV, C)]
+    );
 }

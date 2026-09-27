@@ -455,7 +455,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-83 | `batch_error_freezes_at_every_boundary` | ADR 0004 "batch error freezes at every boundary" · design §7 residual risk "freeze on any batch error" | error injected (a) as `Err` before any write, (b) `Incomplete` after the first mutation, (c) `Err` after the last mutation | all three: `Frozen{LocalStorageFenced}`, `Reply(UNKNOWN_OUTCOME)`; the next `Submit` says `PROTECTION_PAUSED` | unit | none |
 | M7A-84 | `local_apply_never_returns_success_type` | ADR 0004 "local apply never returns success (type)" · charter "local apply never returns success" · §3.3 `TxnEffect::Reply(TxnRejection)` | compile-time: an exhaustive `match` over `TxnRejection` | no success-shaped variant exists; the test is a function that would not compile if one were added | unit | none |
 | M7A-85 | `local_apply_no_ack_no_success_reply` | ADR 0004 "(no-ACK row)" · spec §5.2 steps 4–7 | T1 + P1 wired; `BatchCompleted{Ok}`; **no** `QualificationChanged` ever; 10,000 ticks | zero `Reply` effects carrying a result; `published_seq` unchanged; then `PostApplyDeadline` ⇒ `Reply(UNKNOWN_OUTCOME)` (the only reply) | sim | kernel-b `QualificationChanged` type (absent by design here) |
-| M7A-86 | `one_in_flight_fifo_drains_one_at_a_time` | §3.1 queue, one-in-flight rule · §2.5 | `Submit` A, B, C admitted; A's batch completes at tick 50 | B's `Check{StorageDispatch}` is emitted only after A's `BatchCompleted`; C's after B's; queue order preserved | unit | none |
+| M7A-86 | `one_in_flight_fifo_drains_one_at_a_time` | §3.1 queue, one-in-flight rule · §2.5 | `Submit` A, B, C admitted; A's batch completes at tick 50 | B's `Check{StorageDispatch}` is emitted only after A's `BatchCompleted`; C's after B's; queue order preserved. In the landed T1 one-in-flight ends at A's `Published`, not at its `BatchCompleted` (§3.3: the completion freezes `UnresolvedTransaction` and `Published` reopens and pumps — M7A-161 (a)), so the row asserts no check at the completion and B's check at A's `Published` — later than the bound, never earlier (wave-2 delta in §15) | unit | none |
 
 ### 4.4 Retention: trim, retire, growth (design §3.1, §4.4; ADR 0004; A-R19; spec §5.3)
 
@@ -1940,3 +1940,46 @@ to run on every round:
   than absent because §12 reports it covered. Where the row's own arms cannot show the counter
   moving, it gains a positive-control arm that does (M7A-32, M7A-129). Round 5 swept the whole
   plan on this rule; the sweep and its count are in the handoff.
+
+**Wave-2 delta, 2026-09-27, kernel-a Package A (dev-ka-w2, export of `e693f47`). The marker
+does not move: no contract file changed.** Seven rows landed, each against the landed surface:
+
+- **M7A-148** (`authority_acquisition.rs`). `AuthorityIgnoreReason::AcquireWithheld` and
+  `SampleRejected` landed as unit variants with no reason payload, so the row cannot read
+  `AcquireWithheld{reason}` or `SampleRejected{Invalid|OverBound}` off an effect. It derives the
+  reason from the state the design says produces it: `NoSample` is "no held sample" after the
+  step, `Stale` is a held sample `effective_epsilon` refuses as `ClockFault::Stale`. The claim —
+  two reasons, not four; a rejected sample retracts the good one; a stale one is kept — is
+  asserted whole. Accepted by lead ruling A-R76 item 3. The seam always delivers a sample (Q-12), so case (a)'s "no sample ever" is an
+  unestablished reading, as M7A-165 already spells it.
+- **M7A-144, M7A-146, M7A-147, M7A-86, M7A-89, M7A-90** (`transaction_t1.rs`). The subject of
+  each is T1's admission or its dedup, so each lives with T1 (§8's "the file its subject belongs
+  to"). M7A-144 and M7A-146 take their views from a real A1, not from a written number. M7A-147
+  drives a real P1 beside T1. `Fact(StaleAuthorityView)` asserts as the landed
+  `Ignored(StaleAuthorityView)`.
+- **M7A-86**: the row text is corrected in place (see the row). The bound "only after A's
+  `BatchCompleted`" holds; the landed pump point is A's `Published`.
+- **M7A-90**: Q-4's `retention_cap_entries` landed as `transaction::dedup::RETENTION_CAP_ENTRIES`
+  (65 536), the `dedup_cap` of `Limits::default()`. The row asserts the second disjunct:
+  `OVERLOADED` for every `Submit` past the cap, so `DedupIndex::len()` never exceeds it, and one
+  candidate per retained identity bounds P1's status entries to the same number. **It is over
+  the unit budget**: 3.5 s in an isolated debug build (about 12 s under a loaded gate), down from 236 s. The 236 s was quadratic, from
+  `DedupIndex::older` scanning every entry on each admission. Under lead ruling **A-R76** the
+  lookup now walks generations (one range probe and one point lookup each), with no change in
+  behaviour. The cap and the row are unchanged. **Budget exception granted (lead ruling A-R77,
+  2026-09-27):** filling the index to its default cap is intrinsic to the claim, so M7A-90 alone
+  may exceed the unit budget.
+- **M7A-139 stays sim and stays owed (lead ruling A-R76).** A test that wires T1 and P1 by
+  hand passes even when the production dispatcher does not wire them, and that wiring is the
+  open kernel-a finding. The hand-wired kernel halves are kept under a non-row name,
+  `t1_and_p1_hand_wired_keep_a_dispatched_batch_and_resolve_it_unknown`, beside
+  `the_t1_half_of_m7a_139`. Neither claims the id.
+
+**Left owed:**
+
+- **M7A-139**: above (A-R76 item 1).
+- **M7A-162**: two of its three install points are built. The third, the post-`Recovered`
+  install, is not: `Authority::supported` answers `KernelEvent::Recovered` with `Unavailable`.
+  Its last clause, "the dispatcher's `StepCtx` lineage equals the last `AdoptAuthority`", is a
+  dispatcher claim that needs rdb-sim. Held by A-R76 item 4; it connects to the open
+  investigation of why no sim run reaches a publish.

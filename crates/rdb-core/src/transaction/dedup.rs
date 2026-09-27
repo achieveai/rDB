@@ -97,6 +97,20 @@ pub struct Retained {
     pub applied_at_seq: Seq,
 }
 
+/// The smallest key in `generation`. Every other field of the key is a dense unsigned identity,
+/// whose zero is its minimum, so everything in an older generation sorts below this key.
+const fn first_key(generation: Generation) -> (Generation, AffinityId, RequestIdentity) {
+    (
+        generation,
+        AffinityId(0),
+        RequestIdentity {
+            tenant: TenantId(0),
+            client: ClientId(0),
+            request: RequestId(0),
+        },
+    )
+}
+
 /// `BTreeMap<(Generation, AffinityId, RequestIdentity), Retained>` plus the two structures that
 /// make "absent" a total answer: how far each generation has been trimmed, and which
 /// generations are retired (design §3.1, K-A-12).
@@ -121,6 +135,12 @@ impl DedupIndex {
 
     /// The newest entry for `identity` in a generation **older** than `current` that is not
     /// retired: the generation-reconciliation lookup (spec §8.1).
+    ///
+    /// It runs on every admission, so it walks generations, not entries: one range probe finds
+    /// the next older generation that holds anything, and one point lookup asks it for
+    /// `identity`. The cost is bounded by how many older generations are held. A scan of every
+    /// entry made admission linear in the index, and filling it to [`RETENTION_CAP_ENTRIES`]
+    /// quadratic (lead ruling A-R76, M7A-90).
     #[must_use]
     pub fn older(
         &self,
@@ -128,12 +148,18 @@ impl DedupIndex {
         affinity: AffinityId,
         identity: RequestIdentity,
     ) -> Option<(Generation, &Retained)> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|((g, a, id), _)| *g < current && *a == affinity && *id == identity)
-            .find(|((g, _, _), _)| !self.retired_generations.contains(g))
-            .map(|((g, _, _), retained)| (*g, retained))
+        let mut below = current;
+        while let Some(((generation, _, _), _)) = self.entries.range(..first_key(below)).next_back()
+        {
+            let generation = *generation;
+            if !self.retired_generations.contains(&generation) {
+                if let Some(retained) = self.entries.get(&(generation, affinity, identity)) {
+                    return Some((generation, retained));
+                }
+            }
+            below = generation;
+        }
+        None
     }
 
     /// Retain `retained` for `identity`. A retired generation retains nothing: it is gone by

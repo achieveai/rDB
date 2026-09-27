@@ -44,11 +44,25 @@ use rdb_core::contracts::txn::{
     scoped_key, Condition, Durability, Mutation, Outcome, TxnRequest, TxnResult, KEY_SCOPE_LEN,
 };
 use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_MUTATIONS};
-use rdb_core::transaction::dedup::{dedup_key, dedup_value, Retained, RetainedAnswer, SEED_PAGE};
+use rdb_core::transaction::dedup::{
+    dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, SEED_PAGE,
+};
 use rdb_core::transaction::{
     deny_error, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode, Transaction,
-    TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX,
+    TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX, RETENTION_CAP_ENTRIES,
 };
+
+// The kernels beside T1 in the rows that cross a seam (M7A-144, M7A-146, M7A-147).
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::{Authority, AuthorityTimer};
+use rdb_core::contracts::authority::AuthorityEffect;
+use rdb_core::contracts::control::{
+    CasOutcome, ControlEvent, ControlKey, ControlPrefix, ControlRecord,
+};
+use rdb_core::contracts::event::Effect;
+use rdb_core::contracts::publication::PubMode;
+use rdb_core::contracts::time::{TimerEffect, TimerFired};
+use rdb_core::publication::{post_apply_timer, Publication};
 
 // ---------------------------------------------------------------------------------------------
 // Fixture: node A primary of partition 1 at generation 7, cut at seq 0; one tenant, one group.
@@ -3858,4 +3872,699 @@ fn the_t1_half_of_m7a_139() {
 #[retcd_test]
 fn a_freeze_keeps_a_dispatched_batch_and_its_cause_through_the_completion() {
     the_t1_half_of_m7a_139();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Rows that cross a seam: T1 beside a real A1 or a real P1, hand-wired, one event at a time
+// ---------------------------------------------------------------------------------------------
+
+/// `event` as `kind`, on node A and partition 1, under `correlation`.
+fn on_node_a(now: u64, correlation: u64, kind: EventKind) -> Event {
+    Event {
+        id: EventId(now),
+        at: Tick(now),
+        node: NODE_A,
+        boot: BootId(1),
+        partition: PARTITION,
+        correlation: CorrelationId(correlation),
+        kind,
+    }
+}
+
+/// A sample on M7A-143's authority clock (5 000 000 at tick 0, running with the tick), taken at
+/// `at` with error `error`.
+const fn a1_sample(at: u64, error: u64) -> ControlTime {
+    ControlTime {
+        estimate: Tick(5_000_000 + at),
+        error_millis: error,
+        bound_established: true,
+        sampled_at: Tick(at),
+    }
+}
+
+/// A real A1 on node A. Its views are what T1 is handed, so T1's boundary is judged against the
+/// horizon A1 computes and not against a number a row wrote down.
+struct A1 {
+    a1: Authority,
+    snap: Snap,
+}
+
+impl A1 {
+    /// One step at `now`, holding `sample`.
+    fn step(
+        &mut self,
+        now: u64,
+        sample: ControlTime,
+        correlation: u64,
+        kind: EventKind,
+    ) -> Vec<Effect> {
+        let ctx = StepCtx {
+            control_time: sample,
+            ..ctx(now, NODE_A, &self.snap)
+        };
+        self.a1
+            .step(&ctx, &on_node_a(now, correlation, kind))
+            .expect("an A1 row")
+    }
+
+    /// An event that routes to nothing while `Held`: its step is the clock row's alone.
+    fn progress(&mut self, now: u64, sample: ControlTime) -> Vec<Effect> {
+        self.step(
+            now,
+            sample,
+            now,
+            EventKind::Control(ControlEvent::WatchProgress {
+                prefix: ControlPrefix::Grants,
+                revision: Revision(1),
+            }),
+        )
+    }
+
+    /// M7A-143 (a): acquired at tick 0 under `a1_sample(0, 20)` with the spec budgets, then
+    /// partition 1 installed at tick 1 at T1's lineage (generation 7, epoch 1). Returns the
+    /// install's view, which is `(2000, ClockSampleStale)`: the sample ages out first.
+    fn serving() -> (Self, AuthorityView) {
+        let mut a1 = Self {
+            a1: Authority::new(),
+            snap: Snap::default(),
+        };
+        let sample = a1_sample(0, 20);
+        let due = EventKind::Timer(TimerFired {
+            id: AuthorityTimer::Acquire.id(),
+            version: a1.a1.timer_version(AuthorityTimer::Acquire),
+            scheduled_at: Tick::ZERO,
+        });
+        let _ = a1.step(0, sample, 1, due);
+        let _ = a1.step(
+            0,
+            sample,
+            1,
+            EventKind::Control(ControlEvent::CasResult {
+                key: ControlKey::Grant(NODE_A),
+                outcome: CasOutcome::Committed(Revision(7)),
+            }),
+        );
+        let record = PartitionRecord {
+            partition: PARTITION,
+            owner: NODE_A,
+            generation: GEN,
+            owner_epoch: OwnerEpoch(1),
+            config_version: C1,
+            lifecycle: PartitionLifecycle::Serving,
+        };
+        let effects = a1.step(
+            1,
+            sample,
+            2,
+            EventKind::Control(ControlEvent::FamilySnapshot {
+                prefix: ControlPrefix::Partitions,
+                snapshot_revision: Revision(10),
+                records: vec![ControlRecord {
+                    key: ControlKey::Partition(PARTITION),
+                    revision: Revision(9),
+                    value: record.encode(),
+                }],
+            }),
+        );
+        let [view] = a1_views(&effects)[..] else {
+            panic!("the install publishes partition 1 once: {effects:?}");
+        };
+        assert_eq!(view.lineage, lineage(), "fixture: T1's lineage");
+        (a1, view)
+    }
+}
+
+/// Every view A1 published in `effects`, in order.
+fn a1_views(effects: &[Effect]) -> Vec<AuthorityView> {
+    effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(
+                view,
+            ))) => Some(*view),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every fence A1 raised in `effects`, in order.
+fn a1_fences(effects: &[Effect]) -> Vec<(FenceScope, DenyReason)> {
+    effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Fence {
+                scope,
+                reason,
+            })) => Some((*scope, *reason)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn push(view: AuthorityView) -> Event {
+    kernel(KernelEvent::Authority(AuthorityEvent::View(view)))
+}
+
+/// A live T1 holding `view`: at its `valid_through_tick` a `Submit` is admitted (the step's only
+/// effect is the dispatch check), and one tick later the next is refused in the same step with
+/// `past_horizon`'s code and nothing sent to A1.
+fn assert_boundary_at(view: AuthorityView, what: &str) {
+    let mut h = H::live();
+    assert_eq!(h.step(push(view)), vec![], "{what}: adopted");
+    assert_boundary_in(&mut h, view, what);
+}
+
+/// [`assert_boundary_at`] on a T1 that already holds `view`.
+fn assert_boundary_in(h: &mut H, view: AuthorityView, what: &str) {
+    let through = view.valid_through_tick.0;
+    h.now = through;
+    let _ = h.admit(put(1, b"a", b"1"));
+    h.now = through + 1;
+    assert_eq!(
+        h.step(submit(put(2, b"b", b"2"))),
+        fail(
+            2,
+            deny_error(
+                view.past_horizon,
+                Boundary::PreApply,
+                &h.k().deny_context(identity(2), GEN)
+            )
+        ),
+        "{what}: refused at {}",
+        through + 1
+    );
+    assert_eq!(h.k().queue_len(), 0, "{what}: not queued");
+}
+
+/// M7A-144. K-A-35; `design.md` §3.2's entry check `now <= view.valid_through_tick`, with
+/// `view.past_horizon` as the reason; A-R16.
+///
+/// T1 holds the view A1 published in M7A-143 (a) — `(2000, ClockSampleStale)`, taken from a real
+/// A1 rather than written down. A `Submit` at 2000 is admitted: the dispatch check is the step's
+/// only effect. At 2001 the next is refused in that step `LEASE_EXPIRED` (§3.4 maps
+/// `ClockSampleStale` there), and the reply is the step's only effect, so nothing goes to A1. One
+/// fact between the two: the tick.
+#[retcd_test]
+fn m7a_144_admission_boundary_at_valid_through_tick() {
+    let (_, view) = A1::serving();
+    assert_eq!(
+        (view.valid_through_tick, view.past_horizon),
+        (Tick(2_000), DenyReason::ClockSampleStale),
+        "M7A-143's view"
+    );
+    let mut h = H::live();
+    assert_eq!(h.step(push(view)), vec![]);
+    h.now = 2_000;
+    let _ = h.admit(put(1, b"a", b"1"));
+    h.now = 2_001;
+    assert_eq!(
+        h.step(submit(put(2, b"b", b"2"))),
+        fail(
+            2,
+            RdbError::LeaseExpired {
+                partition: PARTITION,
+                grant: view.grant_id,
+            }
+        )
+    );
+    assert_eq!(h.k().queue_len(), 0);
+}
+
+/// M7A-146. ADR 0007 "Admission horizon follows the sample"; `design.md` §1.7 "a wider
+/// `epsilon_ms` shortens `utc_horizon`".
+///
+/// A1 from M7A-144, `E = 5 003 000`. A sample at 1000 with ε 20 promises through 2879 (the
+/// largest `a` with `a + 1 < 1880` is 1879, under the local window's 2899). The next tick's sample
+/// has ε 90, and **on that step** A1 pushes a superseding view through 2809 (`a + 1 < 1809`):
+/// smaller. T1's boundary follows each view to its tick, and one T1 that held the ε 20 view
+/// adopts the ε 90 one at the same `authority_seq` and moves its boundary to 2809. Then a sample with ε 101, over the
+/// 100 ms bound: `Fence{Node, ClockUnbounded}`, and the view it pushes is
+/// `(fence_tick − 1, ClockUnbounded)` with `authority_seq` moved.
+#[retcd_test]
+fn m7a_146_admission_horizon_follows_the_sample() {
+    let (mut a1, _) = A1::serving();
+
+    let effects = a1.progress(1_000, a1_sample(1_000, 20));
+    let [narrow] = a1_views(&effects)[..] else {
+        panic!("ε 20: one view: {effects:?}");
+    };
+    assert_eq!(narrow.valid_through_tick, Tick(2_879), "ε 20");
+
+    let effects = a1.progress(1_001, a1_sample(1_001, 90));
+    let [wide] = a1_views(&effects)[..] else {
+        panic!("ε 90: a superseding view on the sample's own step: {effects:?}");
+    };
+    assert_eq!(wide.valid_through_tick, Tick(2_809), "ε 90");
+    assert!(wide.valid_through_tick < narrow.valid_through_tick);
+    assert!(wide.authority_seq >= narrow.authority_seq, "it supersedes");
+
+    assert_boundary_at(narrow, "ε 20");
+    assert_boundary_at(wide, "ε 90");
+    // One T1 through the move: it holds ε 20's view, adopts ε 90's (a sample does not bump
+    // `authority_seq`, so an equal seq must replace), and its boundary moves to 2809.
+    let mut h = H::live();
+    assert_eq!(h.step(push(narrow)), vec![]);
+    assert_eq!(
+        h.step(push(wide)),
+        vec![],
+        "the superseding view is adopted"
+    );
+    assert_eq!(h.k().authority(), Some(&wide));
+    assert_boundary_in(&mut h, wide, "ε 20 then ε 90");
+
+    let effects = a1.progress(1_002, a1_sample(1_002, 101));
+    assert_eq!(
+        a1_fences(&effects),
+        vec![(FenceScope::Node, DenyReason::ClockUnbounded)],
+        "ε 101: {effects:?}"
+    );
+    let [fenced] = a1_views(&effects)[..] else {
+        panic!("ε 101: one view: {effects:?}");
+    };
+    assert_eq!(
+        (fenced.valid_through_tick, fenced.past_horizon),
+        (Tick(1_001), DenyReason::ClockUnbounded)
+    );
+    assert!(
+        fenced.authority_seq > wide.authority_seq,
+        "the fence moves the seq"
+    );
+    assert_boundary_at(fenced, "ε 101");
+}
+
+/// M7A-147. `design.md` §3.3 and §4.2, the `AuthorityView` rows: `v.authority_seq < held seq ⇒
+/// StaleAuthorityView`.
+///
+/// T1 and P1 each take a view at `authority_seq` 5 promising through tick 30, then one at 4
+/// promising for ever. Both answer the second `Ignored(StaleAuthorityView)` (the landed spelling
+/// of the plan's `Fact`) and still hold the seq-5 view. T1 judges a `Submit` against seq 5's
+/// horizon: at 31 it is `LEASE_EXPIRED`, which seq 4's would have admitted, and at 30 it is
+/// admitted.
+#[retcd_test]
+fn m7a_147_stale_authority_view_never_replaces_newer() {
+    let newer = view(GEN, 5, 30);
+    let older = view(GEN, 4, u64::MAX);
+    let stale = vec![ignored(AuthorityIgnoreReason::StaleAuthorityView)];
+
+    let mut h = H::live();
+    assert_eq!(h.step(push(newer)), vec![], "T1");
+    assert_eq!(h.step(push(older)), stale, "T1");
+    assert_eq!(h.k().authority(), Some(&newer), "T1 keeps seq 5");
+    h.now = 31;
+    assert_eq!(
+        failed(&h.step(submit(put(1, b"a", b"1")))),
+        ErrorKind::LeaseExpired,
+        "T1 judges against seq 5's horizon"
+    );
+    h.now = 30;
+    let _ = h.admit(put(1, b"a", b"1"));
+
+    let mut p1 = P1::installed();
+    assert_eq!(p1.step(10, push(newer)), vec![], "P1");
+    assert_eq!(p1.step(11, push(older)), stale, "P1");
+    assert_eq!(p1.view().authority, Some(newer), "P1 keeps seq 5");
+}
+
+/// A real P1 on node A, serving T1's lineage from seq 0. No R1 view is scripted, so nothing it
+/// holds ever qualifies or publishes.
+struct P1 {
+    p1: Publication,
+    snap: Snap,
+}
+
+impl P1 {
+    fn installed() -> Self {
+        let mut p1 = Publication::new();
+        let _ = p1.install(NODE_A, BootId(1), lineage(), Seq::ZERO);
+        Self {
+            p1,
+            snap: Snap::default(),
+        }
+    }
+
+    fn step(&mut self, now: u64, mut event: Event) -> Vec<EffectKind> {
+        event.at = Tick(now);
+        let ctx = ctx(now, NODE_A, &self.snap);
+        self.p1
+            .step(&ctx, &event)
+            .expect("a P1 input")
+            .into_iter()
+            .map(|effect| effect.kind)
+            .collect()
+    }
+
+    fn view(&self) -> rdb_core::publication::PubStateView {
+        self.p1.view(NODE_A, PARTITION).expect("installed")
+    }
+}
+
+/// Every reply in `effects` naming `request`.
+fn replies_to(effects: &[EffectKind], request: u64) -> Vec<&ReplyEffect> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Reply(
+                reply @ (ReplyEffect::Failed { identity: who, .. }
+                | ReplyEffect::Transaction { identity: who, .. }),
+            ) if *who == identity(request) => Some(reply),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The kernel halves of M7A-139, hand-wired. **Claims no row** (lead ruling A-R76, 2026-09-27):
+/// M7A-139 is sim class on purpose and stays owed, because this function passes whether or not
+/// the production dispatcher hands T1's candidate to P1 — and that wiring is the open
+/// kernel-a finding. What it pins is that each kernel does its part once the wiring exists.
+///
+/// T1 and P1 hand-wired: T1's candidate is delivered to P1 as the dispatcher would, and the node
+/// fence reaches both. R(1)'s batch is dispatched before the `Freeze{AuthorityLost(Expired)}`.
+/// T1 keeps it in flight through the freeze; `BatchCompleted{Ok}` gives the candidate and
+/// advances `next_seq`; and after it T1's whole mode is `Frozen{AuthorityLost(Expired),
+/// unresolved: Some(seq)}` — the completion set `unresolved` and did not overwrite the cause.
+/// P1 takes the candidate while frozen and arms its deadline; at `PostApplyDeadline` R(1) is
+/// answered `UNKNOWN_OUTCOME`, and that is the only answer R(1) ever gets — never a rejection.
+/// After the deadline P1's mode is `Frozen{AuthorityLost(Expired)}`, and T1's next `Submit` is
+/// `LEASE_EXPIRED`, not `PROTECTION_PAUSED`: the kept cause picks the code.
+#[retcd_test]
+fn t1_and_p1_hand_wired_keep_a_dispatched_batch_and_resolve_it_unknown() {
+    let mut h = H::live();
+    let mut p1 = P1::installed();
+    let mut answers = Vec::new();
+
+    let (batch, _, seq) = h.dispatch(put(1, b"a", b"1"));
+    let freeze = fence(FenceScope::Node, DenyReason::Expired);
+    answers.extend(h.step(freeze.clone()));
+    answers.extend(p1.step(20, freeze));
+    assert!(
+        matches!(h.k().inflight(), Some(Inflight::Dispatched { .. })),
+        "kept through the freeze: {:?}",
+        h.k().inflight()
+    );
+
+    let effects = h.step(committed(batch, seq));
+    let [EffectKind::Kernel(KernelEffect::LocalApplied { .. }), EffectKind::Kernel(KernelEffect::AppliedCandidate(candidate))] =
+        effects.as_slice()
+    else {
+        panic!("the completion gives the candidate: {effects:?}");
+    };
+    assert_eq!(candidate.seq, Seq(seq));
+    assert_eq!(h.k().next_seq(), Seq(seq + 1), "next_seq advanced");
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+            unresolved: Some(Seq(seq)),
+        },
+        "the completion keeps the freeze's cause"
+    );
+
+    let effects = p1.step(30, kernel(KernelEvent::AppliedCandidate(candidate.clone())));
+    let Some((version, at)) = effects.iter().find_map(|effect| match effect {
+        EffectKind::Timer(TimerEffect::Arm { id, version, at })
+            if *id == post_apply_timer(PARTITION) =>
+        {
+            Some((*version, *at))
+        }
+        _ => None,
+    }) else {
+        panic!("P1 arms its post-apply deadline: {effects:?}");
+    };
+    answers.extend(effects);
+
+    let deadline = kernel(KernelEvent::DedupTrim {
+        generation: GEN,
+        below: Seq::ZERO,
+    });
+    let deadline = Event {
+        kind: EventKind::Timer(TimerFired {
+            id: post_apply_timer(PARTITION),
+            version,
+            scheduled_at: at,
+        }),
+        ..deadline
+    };
+    answers.extend(p1.step(at.0, deadline));
+
+    assert_eq!(
+        replies_to(&answers, 1),
+        vec![&ReplyEffect::Failed {
+            identity: identity(1),
+            error: RdbError::UnknownOutcome {
+                partition: PARTITION,
+                identity: identity(1),
+            },
+        }],
+        "UNKNOWN_OUTCOME through P1's deadline, and nothing else: {answers:?}"
+    );
+    assert_eq!(
+        p1.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+        },
+        "P1 keeps the cause"
+    );
+    assert_eq!(
+        failed(&h.step(submit(put(2, b"b", b"2")))),
+        ErrorKind::LeaseExpired,
+        "the kept cause picks the code"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// §4 rows: the queue and the retained outcomes
+// ---------------------------------------------------------------------------------------------
+
+/// The request T1 has in flight, whichever half it is in.
+fn in_flight(h: &H) -> RequestIdentity {
+    match h.k().inflight() {
+        Some(
+            Inflight::AwaitingDispatchCheck { admitted, .. }
+            | Inflight::Dispatched { admitted, .. },
+        ) => admitted.req.identity,
+        None => panic!("nothing in flight"),
+    }
+}
+
+/// M7A-86. `design.md` §3.1's queue and one-in-flight rule; §2.5.
+///
+/// A, B and C are submitted in that order: A is admitted to its check, B and C are queued. Each
+/// in turn is the one in flight, in submission order, and the next one's `StorageDispatch` check
+/// is emitted only after the one ahead of it has completed — not at its `Admit`, and not at its
+/// `BatchCompleted` (A's completes at tick 50), but at its publication, which is what ends
+/// one-in-flight in the landed T1 (§3.3: the completion freezes `UnresolvedTransaction`, and
+/// `Published` reopens and pumps; M7A-161 (a)). The queue shortens by one each time.
+#[retcd_test]
+fn m7a_86_one_in_flight_fifo_drains_one_at_a_time() {
+    let mut h = H::live();
+    let mut next = h.admit(put(1, b"a", b"1"));
+    assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![]);
+    assert_eq!(h.k().queue_len(), 2);
+
+    for request in 1..=3 {
+        assert_eq!(in_flight(&h), identity(request), "FIFO");
+        let effects = h.step(answer(next, 1, Verdict::Admit));
+        let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+            panic!("R({request}): one batch, no check: {effects:?}");
+        };
+        let (id, seq) = (batch.id, batch.seq.0);
+        let digest = h.k().prev_digest();
+        h.now = 50 * request;
+        let effects = h.step(committed(id, seq));
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                EffectKind::Kernel(KernelEffect::AuthorityCheck { .. })
+            )),
+            "R({request}): no check at the completion: {effects:?}"
+        );
+        assert_eq!(h.k().queue_len(), usize::try_from(3 - request).unwrap());
+        assert_eq!(in_flight(&h), identity(request), "still one in flight");
+        let effects = h.step(published(seq, digest, request));
+        if request < 3 {
+            next = only_check(&effects);
+        } else {
+            assert_eq!(effects, vec![], "drained");
+            assert_eq!(h.k().inflight(), None);
+        }
+    }
+}
+
+/// M7A-89. A-R19 "trim never removes a retained outcome the spec requires"; spec §5.3; lead
+/// ruling A-R68 Q2.
+///
+/// R(1)..R(7) resolved at seqs 1..7, so R(7) is retained with `applied_at_seq 7`.
+/// `DedupTrim{g7, below: 7}` keeps it (and drops R(6), as a trim must): a retry replays the
+/// retained result verbatim. `below: 8` drops it, and the same `Submit` is then a **new**
+/// request, admitted to a fresh batch at the next sequence, 8 — past retention, absence proves
+/// nothing. The `Unknown` answer after the trim is P1's `Status`, not this row's (A-R68 Q2).
+#[retcd_test]
+fn m7a_89_trim_never_removes_a_required_retained_outcome() {
+    let mut h = H::live();
+    for request in 1..=7 {
+        let _ = h.resolve(put(request, b"k", b"v"));
+    }
+    let retained = h
+        .k()
+        .dedup()
+        .get(GEN, AFF, identity(7))
+        .expect("R(7) retained")
+        .clone();
+    assert_eq!(retained.applied_at_seq, Seq(7));
+    let RetainedAnswer::Applied(result) = retained.answer else {
+        panic!("R(7) retained as applied: {retained:?}");
+    };
+
+    assert_eq!(h.step(trim(GEN, 7)), vec![]);
+    assert!(
+        h.k().dedup().get(GEN, AFF, identity(7)).is_some(),
+        "below 7 keeps 7"
+    );
+    assert!(
+        h.k().dedup().get(GEN, AFF, identity(6)).is_none(),
+        "below 7 drops 6"
+    );
+    assert_eq!(
+        h.step(submit(put(7, b"k", b"v"))),
+        vec![EffectKind::Reply(ReplyEffect::Transaction {
+            identity: identity(7),
+            result,
+        })],
+        "before the trim: replayed"
+    );
+
+    assert_eq!(h.step(trim(GEN, 8)), vec![]);
+    assert!(
+        h.k().dedup().get(GEN, AFF, identity(7)).is_none(),
+        "below 8 drops 7"
+    );
+    let correlation = h.admit(put(7, b"k", b"v"));
+    let effects = h.step(answer(correlation, 1, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("after the trim: a fresh batch: {effects:?}");
+    };
+    assert_eq!(batch.seq, Seq(8), "at the next sequence");
+}
+
+/// M7A-90. A-R19 growth bounded; ADR 0004 "unbounded growth explicit"; §4.4 (A-R7); §13 Q-4.
+///
+/// Q-4's default is a named constant and `OVERLOADED` past it. The constant is
+/// `RETENTION_CAP_ENTRIES` (65 536), and it is what a default T1 is built with. 100 000 distinct
+/// identities are submitted one after another with **no** trim and no retire: the first 65 536 are
+/// committed and retained, and every one after that is refused `OVERLOADED` at admission — nothing
+/// reserved, no check, no batch. That is Q-4's second disjunct, and `DedupIndex::len()` never
+/// passes the constant. T1 emits exactly one candidate per retained identity, and a candidate is
+/// what P1's status index grows by, so status is held to the same number.
+///
+/// **Over the unit budget: about 3.5 s in a debug build**, because the row keeps the default cap
+/// as §13 Q-4 asks. It took 236 s until `DedupIndex::older` stopped scanning every entry on
+/// each admission (lead ruling A-R76).
+#[retcd_test]
+fn m7a_90_no_trim_bounded_growth_dedup_and_status() {
+    let mut h = H::live();
+    assert_eq!(h.k().limits().dedup_cap, RETENTION_CAP_ENTRIES);
+    let cap = u64::try_from(RETENTION_CAP_ENTRIES).unwrap();
+    let mut candidates = 0_u64;
+    for request in 1..=100_000_u64 {
+        if request <= cap {
+            let (batch, digest, seq) = h.dispatch(put(request, b"k", b"v"));
+            let effects = h.step(committed(batch, seq));
+            candidates += effects
+                .iter()
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        EffectKind::Kernel(KernelEffect::AppliedCandidate(_))
+                    )
+                })
+                .count() as u64;
+            assert_eq!(h.step(published(seq, digest, request)), vec![]);
+        } else {
+            let before = h.k().next_seq();
+            assert_eq!(
+                failed(&h.step(submit(put(request, b"k", b"v")))),
+                ErrorKind::Overloaded,
+                "R({request}), past the cap"
+            );
+            assert_eq!(h.k().next_seq(), before);
+            assert_eq!(h.k().inflight(), None);
+        }
+    }
+    assert_eq!(
+        h.k().dedup().len(),
+        RETENTION_CAP_ENTRIES,
+        "never past the cap"
+    );
+    assert_eq!(
+        candidates, cap,
+        "one candidate, so one status entry, per retained identity"
+    );
+}
+
+/// A condition-failure entry retained at `seq`: the smallest `Retained` there is.
+fn retained_at(seq: u64) -> Retained {
+    Retained {
+        request_digest: Digest::ROOT,
+        answer: RetainedAnswer::ConditionFailed { index: 0 },
+        applied_at_seq: Seq(seq),
+    }
+}
+
+/// The generation-reconciliation lookup (`DedupIndex::older`, spec §8.1) answers with the newest
+/// generation **strictly below** the current one that retained this exact `(affinity, identity)`,
+/// skipping generations that hold only other identities. Claims no row: it pins the lookup's
+/// answers so that making the lookup bounded (lead ruling A-R76) cannot change them. The zero
+/// identity sits at the very first key of a generation, which is where a range bound would slip.
+#[retcd_test]
+fn dedup_older_answers_the_newest_older_generation_holding_that_identity() {
+    let zero = RequestIdentity {
+        tenant: TenantId(0),
+        client: ClientId(0),
+        request: RequestId(0),
+    };
+    let other = AffinityId(AFF.0 + 1);
+    let mut index = DedupIndex::default();
+    // g3: identity 1, the zero identity, and identity 1 under another affinity.
+    index.insert(Generation(3), AFF, identity(1), retained_at(31));
+    index.insert(Generation(3), AffinityId(0), zero, retained_at(30));
+    index.insert(Generation(3), other, identity(1), retained_at(32));
+    // g5: identity 2 and the zero identity. Identity 1 is **not** here.
+    index.insert(Generation(5), AFF, identity(2), retained_at(51));
+    index.insert(Generation(5), AffinityId(0), zero, retained_at(50));
+    // g6: identity 3 only, adjacent to the g7 below which it is found.
+    index.insert(Generation(6), AFF, identity(3), retained_at(63));
+    // g7, the current one: identities 1, 2 and zero.
+    index.insert(Generation(7), AFF, identity(1), retained_at(71));
+    index.insert(Generation(7), AFF, identity(2), retained_at(72));
+    index.insert(Generation(7), AffinityId(0), zero, retained_at(70));
+
+    let older = |index: &DedupIndex, current: u64, affinity: AffinityId, who: RequestIdentity| {
+        index
+            .older(Generation(current), affinity, who)
+            .map(|(g, retained)| (g.0, retained.applied_at_seq.0))
+    };
+    // Past a generation that holds only other identities, down to the one that holds it.
+    assert_eq!(older(&index, 7, AFF, identity(1)), Some((3, 31)));
+    // The generation right below one that misses: g7 holds no identity 3, g6 does.
+    assert_eq!(older(&index, 8, AFF, identity(3)), Some((6, 63)));
+    // The newest older generation wins, and the current one is never an answer.
+    assert_eq!(older(&index, 7, AFF, identity(2)), Some((5, 51)));
+    assert_eq!(older(&index, 8, AFF, identity(2)), Some((7, 72)));
+    assert_eq!(older(&index, 6, AFF, identity(2)), Some((5, 51)));
+    assert_eq!(older(&index, 5, AFF, identity(2)), None);
+    // The first key of a generation: found below, never at, the current generation.
+    assert_eq!(older(&index, 7, AffinityId(0), zero), Some((5, 50)));
+    assert_eq!(older(&index, 5, AffinityId(0), zero), Some((3, 30)));
+    assert_eq!(older(&index, 3, AffinityId(0), zero), None);
+    // The affinity is part of the scope.
+    assert_eq!(older(&index, 7, other, identity(1)), Some((3, 32)));
+    assert_eq!(older(&index, 7, other, identity(2)), None);
+    assert_eq!(older(&index, 7, AFF, identity(9)), None);
+    assert_eq!(older(&index, 0, AFF, identity(1)), None);
+
+    // A retired generation is gone: the lookup falls through to the next one down.
+    index.retire(Generation(5));
+    assert_eq!(older(&index, 7, AffinityId(0), zero), Some((3, 30)));
+    assert_eq!(older(&index, 7, AFF, identity(2)), None);
 }

@@ -1842,3 +1842,210 @@ fn m7a_164_watch_admission_refused_counter_resets_on_healthy_watch() {
 
     assert_eq!(refusal_backoff(&mut kernel, 16), Some(first));
 }
+
+// =============================================================================================
+// Plan row M7A-148, §8.3 of `docs/testing/test-plan-m7-kernel-a.md`: the acquisition guard.
+// =============================================================================================
+
+/// [`ctx`] at `now`, on the same authority clock (`ESTIMATE + tick`), holding a sample taken at
+/// `at` with error `error` and bound `established`.
+fn reading(now: u64, at: u64, error: u64, established: bool) -> StepCtx<'static> {
+    let mut ctx = ctx(now);
+    ctx.control_time = ControlTime {
+        estimate: Tick(ESTIMATE + at),
+        error_millis: error,
+        bound_established: established,
+        sampled_at: Tick(at),
+    };
+    ctx
+}
+
+/// Why an acquisition was withheld: the two reasons K-A-50 leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Withheld {
+    NoSample,
+    Stale,
+}
+
+/// The reason an `AcquireWithheld` at `now` was withheld for.
+///
+/// The landed `AuthorityIgnoreReason::AcquireWithheld` is a unit variant, as `SampleRejected` is
+/// (M7A-165), so the reason is read from the one input `e_new` is a function of: the held sample.
+/// None held is `NoSample`; a held sample that `effective_epsilon` calls stale is `Stale`. A held
+/// sample refused for any other reason is a third withholding reason, which is this row's red.
+fn withheld_reason(kernel: &Authority, now: u64) -> Withheld {
+    match kernel.clock().sample() {
+        None => Withheld::NoSample,
+        Some(sample) => match clock::effective_epsilon(&sample, Tick(now), &BUDGETS) {
+            Err(clock::ClockFault::Stale) => Withheld::Stale,
+            other => panic!("a held sample withholds only as stale: {other:?} for {sample:?}"),
+        },
+    }
+}
+
+/// `AcquireDue` at `step_ctx.now`, asserted withheld: no CAS, the retry re-armed one back-off
+/// later, nothing in flight. Returns the reason and the step's effects.
+fn withheld_at(kernel: &mut Authority, step_ctx: &StepCtx<'_>) -> (Withheld, Vec<Shape>) {
+    let now = step_ctx.now.0;
+    let armed = kernel.timer_version(AuthorityTimer::Acquire);
+    let due = acquire_due(kernel, now, now);
+    let effects = shapes(&kernel.step(step_ctx, &due).expect("AcquireDue"));
+    let [.., Shape::Ignored(AuthorityIgnoreReason::AcquireWithheld), Shape::Arm(AuthorityTimer::Acquire, version, Tick(at))] =
+        effects.as_slice()
+    else {
+        panic!("withheld and re-armed: {effects:?}");
+    };
+    assert_eq!(
+        (*version, *at),
+        (TimerVersion(armed.0 + 1), now + BUDGETS.renew_millis),
+        "the back-off is re-armed"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|shape| matches!(shape, Shape::Cas { .. })),
+        "no CAS: {effects:?}"
+    );
+    assert_eq!(kernel.view().acquire, None, "nothing in flight");
+    (withheld_reason(kernel, now), effects)
+}
+
+/// A fresh, in-bound sample and one more `AcquireDue` at `now`: exactly one create-only CAS
+/// whose `E` is `E_new` at `now`, and its commit enters `Held` with `renewed_at == now`.
+fn acquires_at(kernel: &mut Authority, now: u64) {
+    let due = acquire_due(kernel, now, now);
+    let effects = kernel
+        .step(&reading(now, now, 10, true), &due)
+        .expect("AcquireDue");
+    let cases: Vec<Shape> = shapes(&effects)
+        .into_iter()
+        .filter(|shape| matches!(shape, Shape::Cas { .. }))
+        .collect();
+    let [Shape::Cas {
+        expected: None,
+        record: Some(record),
+    }] = cases.as_slice()
+    else {
+        panic!("one create-only CAS: {effects:?}");
+    };
+    assert_eq!(record.expiry_utc_ms, e_new_at(now), "E == E_new at {now}");
+    kernel
+        .step(
+            &reading(now + 1, now, 10, true),
+            &cas_result(now + 1, now, CasOutcome::Committed(Revision(7))),
+        )
+        .expect("the commit");
+    assert!(kernel.state().is_held(), "the commit adopts");
+    assert_eq!(
+        kernel.view().renewed_at,
+        Some(Tick(now)),
+        "renewed_at is the dispatch tick"
+    );
+}
+
+/// M7A-148. K-A-36; K-A-50; `design.md` §2.4 `Unheld / AcquireDue / e_new is None ⇒
+/// AcquireWithheld`, no CAS, and the `Unheld|Fenced / Clock(s)` reject row; ADR 0007 "No sample,
+/// no acquisition", "A rejected sample retracts the good one".
+///
+/// Four `Unheld` kernels, one per case, each ending in a withheld `AcquireDue` that issues no CAS
+/// and re-arms the back-off:
+///
+/// * (a) no good sample ever. The seam delivers a reading on every step, even without a bound
+///   (§13 Q-12), so "no sample" is an unestablished one, refused on the `AcquireDue` step itself;
+/// * (b) a good sample, then one with no bound: that step is exactly `[SampleRejected]`, and the
+///   good sample is gone;
+/// * (c) a good sample, then one with error 101 (over the 100 ms bound): the same;
+/// * (d) a good sample aged 2001, past `max_sample_age_millis`: withheld, and the sample stays.
+///
+/// Exactly two reasons appear across the four: `NoSample` for (a)–(c) and `Stale` for (d). A
+/// rejected sample leaves no sample behind rather than a reason of its own. Each kernel then takes
+/// a fresh in-bound sample and acquires with exactly one create-only CAS at `E_new`, and the commit
+/// sets `renewed_at` to the dispatch tick. Near-miss twin of (c), one fact (error 100, at the
+/// bound): the sample is adopted and the `AcquireDue` issues the CAS.
+///
+/// Landed spelling: `Ignored(AcquireWithheld)` and `Ignored(SampleRejected)` are unit variants, so
+/// the plan's `{NoSample}` / `{Stale}` / `{Invalid}` / `{OverBound}` payloads are read from the
+/// kernel's held sample by [`withheld_reason`], not from the effect.
+#[retcd_test]
+fn m7a_148_acquire_withheld_reasons_collapse_to_no_sample_and_stale() {
+    let rejected = Shape::Ignored(AuthorityIgnoreReason::SampleRejected);
+    let mut reasons = std::collections::BTreeSet::new();
+
+    // (a) No good sample ever.
+    let mut kernel = Authority::new();
+    let (reason, effects) = withheld_at(&mut kernel, &reading(5, 5, 10, false));
+    assert_eq!(reason, Withheld::NoSample, "(a): {effects:?}");
+    assert_eq!(effects[0], rejected, "(a): the reading itself is refused");
+    reasons.insert(reason);
+    acquires_at(&mut kernel, 300);
+
+    // (b) and (c): a good sample, then one the guard rejects.
+    for (what, error, established) in [("(b) no bound", 10, false), ("(c) error 101", 101, true)] {
+        let mut kernel = Authority::new();
+        kernel
+            .step(&reading(10, 0, 10, true), &probe(10))
+            .expect("the good sample");
+        assert!(kernel.clock().sample().is_some(), "{what}: fixture");
+        let bad = reading(100, 100, error, established);
+        let effects = kernel.step(&bad, &probe(100)).expect("the bad sample");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::SampleRejected)],
+            "{what}"
+        );
+        assert_eq!(
+            kernel.clock().sample(),
+            None,
+            "{what}: the good sample is retracted"
+        );
+        let (reason, effects) = withheld_at(&mut kernel, &reading(200, 100, error, established));
+        assert_eq!(reason, Withheld::NoSample, "{what}: {effects:?}");
+        reasons.insert(reason);
+        acquires_at(&mut kernel, 300);
+    }
+
+    // (d) A good sample, aged past `max_sample_age_millis`.
+    let mut kernel = Authority::new();
+    kernel
+        .step(&reading(10, 0, 10, true), &probe(10))
+        .expect("the good sample");
+    let age = BUDGETS.max_sample_age_millis + 1;
+    let (reason, effects) = withheld_at(&mut kernel, &reading(age, 0, 10, true));
+    assert_eq!(reason, Withheld::Stale, "(d): {effects:?}");
+    assert_eq!(effects.len(), 2, "(d): only the withholding: {effects:?}");
+    assert!(
+        kernel.clock().sample().is_some(),
+        "(d): a stale sample is not retracted"
+    );
+    reasons.insert(reason);
+    acquires_at(&mut kernel, age + 100);
+
+    assert_eq!(
+        reasons,
+        std::collections::BTreeSet::from([Withheld::NoSample, Withheld::Stale]),
+        "exactly two withholding reasons (the helper enum has two variants, so this holds by
+         construction; the per-case asserts above carry the claim)"
+    );
+
+    // Near-miss twin of (c): error 100 is at the bound, so the sample is adopted.
+    let mut kernel = Authority::new();
+    kernel
+        .step(&reading(10, 0, 10, true), &probe(10))
+        .expect("the good sample");
+    let at_bound = reading(100, 100, BUDGETS.clock_error_millis, true);
+    let effects = kernel.step(&at_bound, &probe(100)).expect("the sample");
+    assert_eq!(shapes(&effects), vec![], "twin: adopted, not rejected");
+    assert_eq!(kernel.clock().sample(), Some(at_bound.control_time), "twin");
+    let due = acquire_due(&kernel, 200, 200);
+    let effects = kernel
+        .step(&reading(200, 100, BUDGETS.clock_error_millis, true), &due)
+        .expect("AcquireDue");
+    assert_eq!(
+        shapes(&effects)
+            .iter()
+            .filter(|shape| matches!(shape, Shape::Cas { .. }))
+            .count(),
+        1,
+        "twin: the CAS is issued: {effects:?}"
+    );
+}
