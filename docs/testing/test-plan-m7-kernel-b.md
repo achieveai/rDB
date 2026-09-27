@@ -1,4 +1,4 @@
-<!-- drift-basis: bc8b45e -->
+<!-- drift-basis: 87e681a -->
 
 # M7 kernel-b test plan: R1 replication, L1 protection, F1 recovery
 
@@ -836,6 +836,8 @@ not before it.
 with a doc comment and no serde attribute, like its siblings. No declaration moved; only the lines
 below that enum shift. No row literal in this plan cites a line below it. The marker is **not**
 moved here: this is an uncommitted export, and the marker moves when the lead lands the variant.
+
+Landed in `87e681a`. **Re-read (2026-09-27, lead), basis moves `bc8b45e` → `87e681a`.** `87e681a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat bc8b45e 87e681a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +6 −1: `SyncWithheldReason::Stalled` is appended last (ruling B-R70, M7B-156) and the `NoDigest` doc is reworded (placed history **and** the engine's stored record). No declaration moved; only lines below that enum shift. A grep of this plan for `trace.rs` line citations at or below `:1519` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 ## 16. Row counts
 

@@ -1301,7 +1301,9 @@ Nothing above lowers an assertion or reopens a closed ask, and nothing here unbl
 row — this commit is kernel-b's own internal recovery-source vocabulary, and this plan has never
 cited it. Marker moved below after this re-read, not before it.
 
-<!-- drift-basis: bc8b45e -->
+**Round-11 re-read (2026-09-27, lead), basis moves `bc8b45e` → `87e681a`.** `87e681a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat bc8b45e 87e681a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +6 −1: `SyncWithheldReason::Stalled` is appended last (ruling B-R70, M7B-156) and the `NoDigest` doc is reworded (placed history **and** the engine's stored record). No declaration moved; only lines below that enum shift. A grep of this plan for `trace.rs` line citations at or below `:1519` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+<!-- drift-basis: 87e681a -->
 
 **Foundation asks still open after this round: none.** Rows 1 and 21 were the last two, and both
 landed at `6893442` — in foundation's *first* code round, the same round that received them.

@@ -1,4 +1,4 @@
-<!-- drift-basis: bc8b45e -->
+<!-- drift-basis: 87e681a -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -1017,6 +1017,10 @@ well below that point. Re-opened directly: `ClientEvent::Status` is unchanged at
 Nothing above lowers or falsifies an existing row's assertion; nothing was previously held on
 either new variant, because neither is a foundation-owned ask. Marker moved below after this
 re-read, not before it.
+
+### 15.6 Rebase from `bc8b45e` to `87e681a` (2026-09-27, lead)
+
+`87e681a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat bc8b45e 87e681a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +6 −1: `SyncWithheldReason::Stalled` is appended last (ruling B-R70, M7B-156) and the `NoDigest` doc is reworded (placed history **and** the engine's stored record). No declaration moved; only lines below that enum shift. A grep of this plan for `trace.rs` line citations at or below `:1519` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 ---
 
