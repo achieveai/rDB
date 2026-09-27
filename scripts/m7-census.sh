@@ -137,7 +137,14 @@ is_exempt() {
 # A1/P1 function asserts only that the bridge refuses op 6 (Expire) and parks on I1, and T1/P1 +
 # F1/T1 do not exist yet (teams/verification/dev-verif-handoff.md). The id's function exists; the
 # claim does not. Remove only when all four cases assert their claims.
-MISCREDITED="M7A-28 M7V-47"
+#
+# 2026-09-26, dev-ka-a1 (lead L-R177ek, tester-ka-a1 THUMBS UP) — M7A-28 REMOVED, by making its
+# claim true on disk. Both `m7a_28_*` functions in `crates/rdb-sim/tests/authority.rs` now send
+# `RevisionCompacted`, the row's own input: `m7a_28_watch_gap_revision_compacted_read_family_and_
+# rewatch` asserts `[Reload{prefix}]` then the snapshot's `Watch{from: snapshot_revision}`, and
+# `m7a_28_resumed_watch_uses_the_snapshot_revision_not_the_stale_cursor` terminates with
+# `RevisionCompacted` too. M7A-29 keeps its own function, one fact apart.
+MISCREDITED="M7V-47"
 
 is_miscredited() {
   for m in $MISCREDITED; do [ "$m" = "$1" ] && return 0; done

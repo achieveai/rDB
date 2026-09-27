@@ -52,23 +52,39 @@ fn parked(row: &str, package: PackageId, what: &str) {
 fn m7v_56_coverage_required_lists_are_enumerated_from_their_enums() {
     support::preamble();
 
-    // `BoundaryId`: set **equality**, not containment (V-R19 answers Q-4 that way). The count is
-    // asserted against the landed enum's own arity so a 30th member fails here.
+    // `BoundaryId`: set **equality**, not containment (V-R19 answers Q-4 that way).
     let required: BTreeSet<BoundaryId> = coverage::REQUIRED.iter().copied().collect();
     assert_eq!(
         required.len(),
         coverage::REQUIRED.len(),
         "REQUIRED has a duplicate member"
     );
-    assert_eq!(coverage::REQUIRED.len(), 29);
 
-    // Each of the closed axes has one cell per variant.
-    assert_eq!(coverage::ACK_REJECT_REASONS.len(), 14);
-    assert_eq!(coverage::RECOVERY_MODES.len(), 3);
-    assert_eq!(coverage::PROTECTION_PHASES.len(), 4);
-    assert_eq!(coverage::REPLICA_ROLES.len(), 3);
+    // The arity guard reads the enum, never a literal (ruling V-R23). The literal it replaced
+    // (`ACK_REJECT_REASONS.len() == 14`) stayed green when `AckRejectReason` grew to 15, because
+    // it compared the list with itself. `variants` walks each enum's own variant indices, and the
+    // exhaustive `*_cell` matches in `coverage` make a new variant a compile error first.
+    assert_eq!(coverage::variants::<BoundaryId>(), coverage::REQUIRED);
+    assert_eq!(
+        coverage::variants::<AckRejectReason>(),
+        coverage::ACK_REJECT_REASONS
+    );
+    assert_eq!(
+        coverage::variants::<RecoveryMode>(),
+        coverage::RECOVERY_MODES
+    );
+    assert_eq!(
+        coverage::variants::<ProtectionPhase>(),
+        coverage::PROTECTION_PHASES
+    );
+    assert_eq!(coverage::variants::<ReplicaRole>(), coverage::REPLICA_ROLES);
+    // A positive control on the walk itself: it stops at the enum's end, not early or never.
+    assert_eq!(
+        coverage::variants::<AckRejectReason>().last(),
+        Some(&AckRejectReason::NotAMember)
+    );
 
-    // Enumerated, not counted: every variant this crate can name must appear.
+    // Enumerated, not counted: every variant this crate can name must own its cell.
     for reason in [
         AckRejectReason::Gap,
         AckRejectReason::DigestMismatch,
@@ -78,20 +94,23 @@ fn m7v_56_coverage_required_lists_are_enumerated_from_their_enums() {
         AckRejectReason::ForgedIdentity,
         AckRejectReason::IncompatibleVersion,
         // The seven of ask CB-3. Five have no scenario that produces them yet, and they are
-        // named here anyway: this loop is the *name* guard and the count above is the *arity*
+        // named here anyway: this loop is the *name* guard and `variants` above is the *arity*
         // guard, so a variant that exists and is unreachable still has to own a cell. Whether
         // anything drives it is `M7V-55`'s question, answered per package by the capability
-        // entry — all fourteen are `unavailable(R1)` in M7.
+        // entry — every ack-reject cell gates on R1.
         AckRejectReason::StaleGeneration,
         AckRejectReason::RoleMismatch,
         AckRejectReason::InconsistentProgress,
         AckRejectReason::RegressedProgress,
         AckRejectReason::Unverifiable,
+        // Added with B-R58c; it had no cell until ruling V-R23.
+        AckRejectReason::InFlightUnverified,
         AckRejectReason::Diverged,
         AckRejectReason::NotAMember,
     ] {
-        assert!(
-            coverage::ACK_REJECT_REASONS.contains(&reason),
+        assert_eq!(
+            coverage::ACK_REJECT_REASONS[coverage::ack_reject_cell(reason)],
+            reason,
             "{reason:?} has no coverage cell"
         );
     }
@@ -100,7 +119,10 @@ fn m7v_56_coverage_required_lists_are_enumerated_from_their_enums() {
         RecoveryMode::LoneSurvivorReadOnly,
         RecoveryMode::Quarantine,
     ] {
-        assert!(coverage::RECOVERY_MODES.contains(&mode));
+        assert_eq!(
+            coverage::RECOVERY_MODES[coverage::recovery_mode_cell(mode)],
+            mode
+        );
     }
     for phase in [
         ProtectionPhase::Healthy,
@@ -108,14 +130,20 @@ fn m7v_56_coverage_required_lists_are_enumerated_from_their_enums() {
         ProtectionPhase::Paused,
         ProtectionPhase::Resuming,
     ] {
-        assert!(coverage::PROTECTION_PHASES.contains(&phase));
+        assert_eq!(
+            coverage::PROTECTION_PHASES[coverage::protection_phase_cell(phase)],
+            phase
+        );
     }
     for role in [
         ReplicaRole::Primary,
         ReplicaRole::RegularSecondary,
         ReplicaRole::Shadow,
     ] {
-        assert!(coverage::REPLICA_ROLES.contains(&role));
+        assert_eq!(
+            coverage::REPLICA_ROLES[coverage::replica_role_cell(role)],
+            role
+        );
     }
 
     // `ErrorKind` is wider than the admission axis, so that axis is its own const — a subset by

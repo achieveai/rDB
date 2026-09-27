@@ -2677,6 +2677,63 @@ fn m7a_60_check_answer_pair_echoes_correlation_checkpoint_and_authority_seq() {
     }
 }
 
+/// M7A-61. `design.md` §2.5: `OutboxDispatch` is declared and unused in M7.
+///
+/// The plan allows two answers: `Check{OutboxDispatch}` denies `ControlUnavailable`, **or** the
+/// variant is `#[cfg(feature = "m11")]`-gated (§13 Q-7 recommends the gate). The gate is not
+/// available to this row: `Checkpoint` lives in `crates/rdb-core/src/contracts/authority.rs`,
+/// which kernel-a may not edit, and `OutboxDispatch` compiles in every M7 build. So the code
+/// supports only the first answer, and this row asserts it. Lead ruling A-R77b confirms that
+/// branch: no gate, no contract ask.
+///
+/// Twin, one fact apart: the same kernel, the same lineage, the same tick, at
+/// `StorageDispatch`. That one admits. Without it a deny here could be any of the reasons a
+/// served `p1` might fail, and the row would not show the checkpoint is what decides.
+#[retcd_test]
+fn m7a_61_outbox_dispatch_checkpoint_unused_in_m7() {
+    let mut kernel = serving_p1(3);
+
+    let answer = |kernel: &mut Authority, checkpoint: Checkpoint, id: u64| {
+        let check = event_of(
+            id,
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Check {
+                checkpoint,
+                lineage: p1_at(3),
+                correlation: CorrelationId(id),
+            })),
+        );
+        let effects = kernel
+            .step(&ctx(20), &check)
+            .expect("the check row is built");
+        let [Effect {
+            kind: EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Answer(decision))),
+            ..
+        }] = effects.as_slice()
+        else {
+            panic!("one answer per check: {effects:?}");
+        };
+        (decision.checkpoint, decision.verdict)
+    };
+
+    assert_eq!(
+        answer(&mut kernel, Checkpoint::StorageDispatch, 30),
+        (Checkpoint::StorageDispatch, Verdict::Admit),
+        "M7A-61 twin: a served p1 at a live checkpoint admits, so a deny below is the checkpoint's"
+    );
+    assert_eq!(
+        answer(&mut kernel, Checkpoint::OutboxDispatch, 31),
+        (
+            Checkpoint::OutboxDispatch,
+            Verdict::Deny(DenyReason::ControlUnavailable)
+        ),
+        "M7A-61: the outbox checkpoint is unused in M7, so it never admits"
+    );
+    assert!(
+        kernel.state().is_held(),
+        "M7A-61: a deny, not a fence: the grant is untouched"
+    );
+}
+
 // =============================================================================================
 // Plan rows, §8 of `docs/testing/test-plan-m7-kernel-a.md`: the published horizon.
 // =============================================================================================

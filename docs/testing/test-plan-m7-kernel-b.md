@@ -1,4 +1,4 @@
-<!-- drift-basis: 9235bfb -->
+<!-- drift-basis: 3249092 -->
 
 # M7 kernel-b test plan: R1 replication, L1 protection, F1 recovery
 
@@ -573,7 +573,7 @@ AGENTS.md records, with the wrongness written down in advance instead of discove
 | ladder reason strings `QUARANTINED`, `DIVERGENT_HISTORY`, `CORRUPT_HISTORY`, `STALE_FENCE`, `NOT_A_MEMBER` (and `STALE_GENERATION`, `NEED_LINEAGE`, `NEED_CONFIG`, `UNKNOWN_EPOCH`, `TOO_LARGE`, `WRONG_PARTITION`, `STALE_CONFIG`) | **landed `AppendReject` variants** — the enum went from 5 variants to **16** in `6893442` (`envelope.rs:524`): `Quarantined`, `IncompatibleVersion`, `TooLarge`, `WrongPartition`, `StaleGeneration{..}`, `NeedLineage{..}`, `StaleEpoch{..}`, `UnknownEpoch{..}`, `StaleConfig{..}`, `NeedConfig{..}`, `NotAMember`, `CorruptHistory{..}`, `DivergentHistory{..}`, `NeedPrefix{..}`, `StaleFence`, `Unauthenticated` | **this row was missing from the table until round 5 (T-B-10).** The crate wins in a row's literals, so §3's ladder rows (M7B-02..07, 14, 18, 20, 28, 120..122) spell the **variant**, not the developer string: `AppendReject::Quarantined`, `::DivergentHistory{..}`, `::CorruptHistory{..}`, `::StaleFence`, `::NotAMember`. Rows that additionally assert a *payload* take it from the landed variant. This does **not** touch BA-11, which governs `Ignored{reason}` codes — a different surface: `Ignored{NOT_A_MEMBER}` on M7B-44/145 is the tracker dropping an ACK, not the receiver rejecting an append. **Round-6 correction:** that reason no longer "stays developer-defined" — `Ignored{reason}` is now typed `ErrorKind` (the **NEW** row below), and the tracker's drop *also* has a landed name of its own, `AckRejectReason::NotAMember`, on the trace surface. Three enums now spell `NotAMember` for three different facts; M7B-44/145 assert the **`AckRejectReason`** one and never the `AppendReject` one. Re-read at `f616ddf`: the enum is still **16** variants at `envelope.rs:524`; only `NeedPrefix`'s payload changed.<br>**CB-7 (working tree, 2026-09-22).** Two corrections. (i) The round-6 clause "`Ignored{reason}` is now typed `ErrorKind`" was right at `f616ddf` and is stale in the tree: it is `KernelIgnoredReason` (see the **NEW** row below). (ii) The "three enums spell `NotAMember`" hazard stops being a convention and becomes a type error — under the arms, M7B-44/145 spell `Ignored{reason: KernelIgnoredReason::AckRejected(AckRejectReason::NotAMember)}`, and the `AppendReject` one cannot be written in that position without naming a different arm. A **fourth** `NotAMember`-shaped homograph now exists and the same rule covers it: `AuthorityIgnoreReason::Quarantined` (kernel-a, `contracts/authority.rs`) beside `ReplicaIgnoreReason::QuarantinedTerminal` and `AppendReject::Quarantined`. `AppendReject` is unchanged at **16** variants and `AckRejectReason` at **14** (`trace.rs:315`), both re-read 2026-09-22 |
 | `AppendReject::NeedPrefix{from, head_digest}` | **`NeedPrefix{have: Seq, head_digest: Digest}`** — `envelope.rs:581`, **CB-2 landed at `f616ddf`** | **Closed.** The design wanted `{from, head_digest}`; the crate spells the first field `have`, and the rows already spelled `have` under the old basis, so **nothing in any row's literal moves** — the `head_digest` clause each row already wrote is now the landed field. `have + 1` is still the next seq. All **seven** held rows are released: **M7B-21** (asserts `NeedPrefix{have: 10, head_digest: d10}`), **M7B-55** (`Match` at the head), **M7B-56** (`NotRetained` → snapshot), **M7B-57** (`Differs` at the head → divergence), **M7B-63** (one shape at three producing paths), **M7B-124** (behind-the-cutoff gap), **M7B-140** (routed divergence). `AppendReject` is still **16** variants (`envelope.rs:524`): CB-2 widened a payload, not the enum |
 | `AppendOutcome::{Busy, AlreadyHave, ProbeDigestAt}` | **`envelope::AppendOutcome`, `envelope.rs:613` — CB-4 landed at `f616ddf`**, as **one enum, not `Result<AppendAck, AppendReject>`**: `Accepted(AppendAck)`, `Busy{accepted_through: Seq}`, `AlreadyHave`, `ProbeDigestAt{seq: Seq}`, `Rejected(AppendReject)` | **Closed, with one correction.** The three non-reject spellings are exactly what M7B-16 (`Busy{accepted_through: 10}`), M7B-17 (`AlreadyHave`) and M7B-19 (`ProbeDigestAt{seq: 5}`) already wrote, and M7B-60 needs no change. **M7B-59 and Q-50 do change**: rejections are **nested** under `Rejected(AppendReject)`, so "every variant reaches a named handler" spans **two** matches — one on `AppendOutcome`'s five, one on `AppendReject`'s sixteen — and the row's `QUARANTINED`, `NEED_LINEAGE`, `NEED_CONFIG`, `UNKNOWN_EPOCH`, `TOO_LARGE`, `STALE_*` and `STALE_FENCE` arms all live in the **inner** match. Q-50's "0 hits for `_ =>`" must cover **both** matches or it proves half the claim. `AppendOutcome` is `Copy`, so a handler takes it by value |
-| `PartitionMode::Blocked` | **landed**: `Blocked{reason: BlockReason}`, `authority.rs:212` | every row naming `Blocked` names the reason (BA-8) |
+| `PartitionMode::Blocked` | **landed**: `Blocked{reason: BlockReason}` — `contracts/authority.rs:641` at `3249092` (**round 8 correction**: this cell had never been updated past its original `f616ddf`-era `:212`, through the round-6/round-7 re-reads that moved every other citation in this table; the type and shape are unchanged, only the line was stale) | every row naming `Blocked` names the reason (BA-8) |
 | `BlockReason` with four reasons across §3.5, §5.1 and §5.6 | **landed with one**: `DivergenceRequiresOperator { diverged: Vec<CopyId> }`, `authority.rs:198` | the landed variant also **carries the copy list**, which the design's prose does not show; M7B-142 asserts that payload. `NoEligibleRegular` (M7B-110), `ControlUnavailable` (M7B-109) and `ControlUnknown` (M7B-146) do not exist — **CB-5** (ruling B-R34), and those three rows are `Unavailable` until it lands (§13). The design keeps `Unavailable` and `Unknown` apart deliberately (design.md 1436–1441) and the lead has refused any collapse of the two, so no row merges them. **Re-read at `f616ddf` on 2026-09-21 and unchanged**: `f616ddf` did not touch `crates/rdb-core/src/contracts/authority.rs` (last commit to it is `6893442`), so `BlockReason` is still the one variant at `:198`, **CB-5 stays open under its own name**, and M7B-109/110/146 stay `Unavailable`. The `authority.rs` `f616ddf` rewrote is kernel-a's `crates/rdb-core/src/authority.rs`, which this table never cites. Separately, M7B-142 is now held too — not on CB-5, but on the `Copy` derive (**NEW** row below) |
 | `TraceKind::{append_decision, catchup_step, qualification, barrier_check, source_unavailable, recovery_phase, selection, protection_transition, ack_decision}` | landed: `replication_ack`, `protection_state`, `recovery_decision`, `lineage_root`, `durability_advance`, `quarantine`, … | BA-4 holds the full mapping. The five with no landed variant are asserted on the effect vector instead (design §7's two-surfaces rule); `protection_transition` → `protection_state{phase}` with `Reprotecting` traced as `Resuming` |
 | `AckRejectReason` with eleven §3.4 drop reasons | **fourteen variants, `trace.rs:315` — CB-3 landed at `f616ddf`** (7 → 14): the landed `Gap`, `DigestMismatch`, `StaleEpoch`, `StaleBoot`, `StaleConfig`, `ForgedIdentity`, `IncompatibleVersion`, plus `StaleGeneration`, `RoleMismatch`, `InconsistentProgress`, `RegressedProgress`, `Unverifiable`, `Diverged`, `NotAMember` | **Closed.** Q-46, Q-47, M7B-32 and M7B-62 are released (§13). **The release is wider than §13's four rows.** §4's drop-reason rows named developer strings because no landed variant existed; seven now do, and the crate wins in a row's literals, so these rows spell the **variant** on the `replication_ack{reject_reason}` surface: **M7B-34** `StaleGeneration` (with the already-landed `StaleEpoch`, `StaleConfig`), **M7B-35** `RoleMismatch`, **M7B-38** `InconsistentProgress`, **M7B-39** `RegressedProgress`, **M7B-41** and **M7B-33**'s 1d pair `Diverged`, **M7B-42** `Unverifiable`, **M7B-44** / **M7B-145** `NotAMember`. `FORGED_ACK` stays the landed `ForgedIdentity` (M7B-31, 32). Each of these rows also keeps its BA-2 `Ignored{reason}` effect — two surfaces, not one, and the `Ignored` reason is a **different** vocabulary (see the `Ignored` row below).<br>**`StaleGeneration` and `NotAMember` exist on `AppendReject` too, deliberately** (foundation's doc comment at `trace.rs:313`; lead's round-5 ruling). Same words, different enum, different meaning: on `AppendReject`, why a **replica refused an append**; on `AckRejectReason`, why an **acknowledgement does not count**. **No row may conflate them.** M7B-44's `NotAMember` is the tracker dropping an ACK (`AckRejectReason`); §3's row-13 `NotAMember` is the receiver refusing an append (`AppendReject`). They are different ladders read from the two ends, and a row that asserts one where the other belongs passes for the wrong reason |
@@ -673,6 +673,66 @@ lead to apply in §13.
 Nothing above lowers an assertion; several sections above raise one (M7B-30/41's literals are
 now known-wrong against a landed shape, not merely unheld). Marker moved below after this
 re-read, not before it.
+
+**Round-8 re-read (2026-09-26), basis moves `9235bfb` → `3249092`.** `3249092` ("M7 checkpoint —
+T1, P1, B-R58 route, tracker and verification rows") is the newest commit touching
+`crates/rdb-core/src/contracts` (`git diff --stat 9235bfb 3249092 -- crates/rdb-core/src/contracts`
+touches `authority.rs`, `digest.rs`, `event.rs`, a new `publication.rs`, `trace.rs`, `transport.rs`,
+`txn.rs`). This is T1/P1's wave, landing alongside kernel-b's own B-R58 route. Every citation this
+table carries was re-opened at `3249092` by `git show`, not carried from round 7.
+
+- **`AckRejectReason` widens 14 → 15, and this plan's own rows are already ahead of this table.**
+  `trace.rs:346` still starts the enum; `InFlightUnverified` is inserted at `:374`, between
+  `Unverifiable` and `Diverged`, doc'd "evidence below the primary's anchor, for the record a
+  catch-up cursor has in flight (lead ruling B-R58c)". This is not a fresh gap: **M7B-173**
+  already asserts `AckRejectReason::InFlightUnverified` by name (§4, ruling B-R58c), so the type
+  this table described as "fourteen, unchanged" was already stale against this plan's own body
+  before this re-read, not only against the contract. Recorded here so the drift table catches up
+  to what the rows already knew. No other row in this plan folds on `AckRejectReason`'s count, so
+  nothing else moves.
+- **`BlockReason` unchanged in shape, shifted in line.** Still **7** variants
+  (`DivergenceRequiresOperator{diverged}`, `OvertakenByPeer`, `CasContention`,
+  `ControlUnavailable`, `ControlUnknown`, `NoEligibleRegular`, `BarrierIncomplete{..}`), now
+  `contracts/authority.rs:514` (was `:462`, +52 — the new `Boundary` enum and
+  `DenyReason::client_error_kind` land above it). M7B-142's payload literal is unaffected; only
+  the citation moves.
+- **`FencingProof` and `Revocation` unchanged in shape, same +52 shift.** `FencingProof`
+  (`contracts/authority.rs:316`, was `:264`) still has its frozen 8 fields; `Revocation` (`:366`,
+  was `:314`) still has its 3 arms. M7B-84's transcription and M7B-136/138's dependency on A1's
+  emission are both unaffected — only the line moves.
+- **`trace.rs` shifts +4 below the new `InFlightUnverified` insertion**, a single-point shift
+  distinct from round 7's own +31: `TraceKind` is now `trace.rs:783` (was `:779`); `AckEvidence`
+  is `:678` (was `:674`); `SkipReason` is `:706` (was `:702`); the `OpSkipped` arm is `:1187`
+  (was `:1183`). None of BA-4's mapping changes — no new `TraceKind` variant landed in this diff —
+  so the five effect-vector fallbacks still stand.
+- **`KernelEffect` widens again, and round 7's own count needs a correction alongside it.**
+  Re-opening `event.rs` at `9235bfb` to establish where this round starts from: `KernelEffect`
+  there is **19** variants, not the **16** round 7's note stated — round 7 listed six variants
+  "including" the rest and gave a wrong total for them, a stale count inside this table's own
+  drift note rather than a fresh one this round introduces. At `3249092` `KernelEffect`
+  (`event.rs:424`) is **23** — the four added are `AppliedCandidate(Box<AppliedCandidate>)`,
+  `Published { .. }`, `Publication(PublicationEffect)`, `AuthorityCheck { .. }`, all T1/P1's own
+  and none named by any M7B row. `KernelEvent` (`event.rs:247`) gains the matching four on the
+  event side; kernel-b's own six variants (`PeerProgress`, `CopyLost`, `LocalApplied`,
+  `DurableAdvanced`, `DivergenceDetected`, `CopyQuarantined`, `SnapshotCatchupRequired`,
+  `SendEnvelopes`, `CopyAheadOnControl`, `CopyCaughtUp` — nine, not six; round 7's list was
+  partial, not the count of the type) are untouched in shape. `ReplicaIgnoreReason`
+  (`contracts/ignore.rs`) is **unaffected** — `ignore.rs` is not in this diff — so it stays at
+  **19**, and §13's CB-7 releases stand.
+- **`transport::Frame` gains `sender: crate::contracts::authority::Lineage`**
+  (`transport.rs:45`), doc'd "the lineage the sender holds as it sends... R1 fences a frame on
+  this and on `config` (lead ruling B-R58a)." No row in this table names `Frame` yet, but this is
+  the landed shape B-R58a's route rulings assume; recorded so whoever writes the B-R58a rows opens
+  this field rather than assuming the frame carries only `config`.
+- **Files this table cites that are untouched by this diff**: `envelope.rs`, `control.rs`,
+  `time.rs`, `ids.rs`, `errors.rs`, `membership.rs`, `contracts/ignore.rs`,
+  `contracts/protection.rs`, `contracts/recovery.rs`. Not re-derived line-by-line this round;
+  their citations still stand because their files did not move, not because they were assumed.
+
+Nothing above lowers an assertion. Two corrections land in this round: the long-stale
+`PartitionMode::Blocked` main-table citation (fixed above, in the main table, not here — it
+predates this diff and was never a drift *from* `9235bfb`) and round 7's own miscount of
+`KernelEffect`'s variant total. Marker moved below after this re-read, not before it.
 
 ## 16. Row counts
 

@@ -25,6 +25,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::de::value::{Error as ValueError, U32Deserializer};
+use serde::de::DeserializeOwned;
+
 use rdb_core::contracts::errors::ErrorKind;
 use rdb_core::contracts::ids::ReplicaRole;
 use rdb_core::contracts::trace::{
@@ -98,7 +101,11 @@ pub const ADMISSION_REASONS: &[ErrorKind] = &[
 /// being dropped from the enumeration.** All fourteen are `unavailable(R1)` in M7, so none is
 /// red today and all five gaps surface the round R1 is wired. Shortening this list to the
 /// reachable seven would close `M7V-56`'s equality by hiding the question.
-pub const ACK_REJECT_REASONS: [AckRejectReason; 14] = [
+///
+/// Widened 14 → 15 with `InFlightUnverified` (lead ruling B-R58c; ruling V-R23). The enum grew
+/// and this list did not, and `M7V-56` stayed green because its arity guard was the literal 14.
+/// The guard now reads the enum ([`variants`]) and [`ack_reject_cell`]'s exhaustive `match`.
+pub const ACK_REJECT_REASONS: [AckRejectReason; 15] = [
     AckRejectReason::Gap,
     AckRejectReason::DigestMismatch,
     AckRejectReason::StaleEpoch,
@@ -111,6 +118,7 @@ pub const ACK_REJECT_REASONS: [AckRejectReason; 14] = [
     AckRejectReason::InconsistentProgress,
     AckRejectReason::RegressedProgress,
     AckRejectReason::Unverifiable,
+    AckRejectReason::InFlightUnverified,
     AckRejectReason::Diverged,
     AckRejectReason::NotAMember,
 ];
@@ -136,6 +144,149 @@ pub const REPLICA_ROLES: [ReplicaRole; 3] = [
     ReplicaRole::RegularSecondary,
     ReplicaRole::Shadow,
 ];
+
+/// `BoundaryId` -> its cell: the variant's index in [`REQUIRED`].
+///
+/// One `match` with no `_` arm, so a new `BoundaryId` fails to compile here until it is given a
+/// cell (ruling V-R23). The `cells_agree!` block checks at compile time that the index is its position.
+#[must_use]
+pub const fn boundary_cell(value: BoundaryId) -> usize {
+    match value {
+        BoundaryId::ChangedDigest => 0,
+        BoundaryId::OldGeneration => 1,
+        BoundaryId::LostSuccessReply => 2,
+        BoundaryId::RetainedDedupHit => 3,
+        BoundaryId::ExpiredDedup => 4,
+        BoundaryId::StaleBoot => 5,
+        BoundaryId::StaleEpoch => 6,
+        BoundaryId::StaleConfig => 7,
+        BoundaryId::MissingPredecessor => 8,
+        BoundaryId::AckAfterRevocation => 9,
+        BoundaryId::ForgedIdentity => 10,
+        BoundaryId::SameTickOrder => 11,
+        BoundaryId::GrantSkewWithinBound => 12,
+        BoundaryId::GrantSkewOutsideBound => 13,
+        BoundaryId::DedupWindowJump => 14,
+        BoundaryId::BeforeAtomicCommit => 15,
+        BoundaryId::AfterAtomicCommit => 16,
+        BoundaryId::BeforeFlush => 17,
+        BoundaryId::AfterFlush => 18,
+        BoundaryId::FalseDurableWatermark => 19,
+        BoundaryId::StaleSnapshot => 20,
+        BoundaryId::LostControlQuorum => 21,
+        BoundaryId::InvalidGrant => 22,
+        BoundaryId::PartialStagedMetadata => 23,
+        BoundaryId::WatchGap => 24,
+        BoundaryId::UnequalSecondaryPrefix => 25,
+        BoundaryId::LoneSurvivorChoice => 26,
+        BoundaryId::Divergence => 27,
+        BoundaryId::ReturningStaleOwner => 28,
+    }
+}
+
+/// `AckRejectReason` -> its cell: the variant's index in [`ACK_REJECT_REASONS`].
+///
+/// One `match` with no `_` arm, so a new `AckRejectReason` fails to compile here until it is given a
+/// cell (ruling V-R23). The `cells_agree!` block checks at compile time that the index is its position.
+#[must_use]
+pub const fn ack_reject_cell(value: AckRejectReason) -> usize {
+    match value {
+        AckRejectReason::Gap => 0,
+        AckRejectReason::DigestMismatch => 1,
+        AckRejectReason::StaleEpoch => 2,
+        AckRejectReason::StaleBoot => 3,
+        AckRejectReason::StaleConfig => 4,
+        AckRejectReason::ForgedIdentity => 5,
+        AckRejectReason::IncompatibleVersion => 6,
+        AckRejectReason::StaleGeneration => 7,
+        AckRejectReason::RoleMismatch => 8,
+        AckRejectReason::InconsistentProgress => 9,
+        AckRejectReason::RegressedProgress => 10,
+        AckRejectReason::Unverifiable => 11,
+        AckRejectReason::InFlightUnverified => 12,
+        AckRejectReason::Diverged => 13,
+        AckRejectReason::NotAMember => 14,
+    }
+}
+
+/// `RecoveryMode` -> its cell: the variant's index in [`RECOVERY_MODES`].
+///
+/// One `match` with no `_` arm, so a new `RecoveryMode` fails to compile here until it is given a
+/// cell (ruling V-R23). The `cells_agree!` block checks at compile time that the index is its position.
+#[must_use]
+pub const fn recovery_mode_cell(value: RecoveryMode) -> usize {
+    match value {
+        RecoveryMode::TwoSurvivor => 0,
+        RecoveryMode::LoneSurvivorReadOnly => 1,
+        RecoveryMode::Quarantine => 2,
+    }
+}
+
+/// `ProtectionPhase` -> its cell: the variant's index in [`PROTECTION_PHASES`].
+///
+/// One `match` with no `_` arm, so a new `ProtectionPhase` fails to compile here until it is given a
+/// cell (ruling V-R23). The `cells_agree!` block checks at compile time that the index is its position.
+#[must_use]
+pub const fn protection_phase_cell(value: ProtectionPhase) -> usize {
+    match value {
+        ProtectionPhase::Healthy => 0,
+        ProtectionPhase::Warn => 1,
+        ProtectionPhase::Paused => 2,
+        ProtectionPhase::Resuming => 3,
+    }
+}
+
+/// `ReplicaRole` -> its cell: the variant's index in [`REPLICA_ROLES`].
+///
+/// One `match` with no `_` arm, so a new `ReplicaRole` fails to compile here until it is given a
+/// cell (ruling V-R23). The `cells_agree!` block checks at compile time that the index is its position.
+#[must_use]
+pub const fn replica_role_cell(value: ReplicaRole) -> usize {
+    match value {
+        ReplicaRole::Primary => 0,
+        ReplicaRole::RegularSecondary => 1,
+        ReplicaRole::Shadow => 2,
+    }
+}
+
+/// `list[i]`'s cell is `i` for every `i`: the list holds each cell once, in the match's order.
+macro_rules! cells_agree {
+    ($list:ident, $cell:ident) => {{
+        let mut index = 0;
+        while index < $list.len() {
+            assert!(
+                $cell($list[index]) == index,
+                concat!(stringify!($list), " disagrees with ", stringify!($cell))
+            );
+            index += 1;
+        }
+    }};
+}
+
+/// Compile-time half of the arity guard (ruling V-R23). With the exhaustive matches above, a new
+/// variant is a compile error until it has an arm, and an arm whose index is not its position in
+/// the list fails here. The runtime half is [`variants`], which row **M7V-56** compares with
+/// each list, so an arm added without a list entry is a red too.
+const _: () = {
+    cells_agree!(REQUIRED, boundary_cell);
+    cells_agree!(ACK_REJECT_REASONS, ack_reject_cell);
+    cells_agree!(RECOVERY_MODES, recovery_mode_cell);
+    cells_agree!(PROTECTION_PHASES, protection_phase_cell);
+    cells_agree!(REPLICA_ROLES, replica_role_cell);
+};
+
+/// Every variant of a fieldless enum, in declaration order, read from the enum itself.
+///
+/// Serde's derive numbers the variants from 0 in declaration order and accepts the index as the
+/// variant; the walk stops at the first index the enum refuses. So the count is the enum's arity,
+/// not a literal (ruling V-R23). A variant marked `#[serde(skip)]` would be missed; none of the
+/// enumerated enums has one.
+#[must_use]
+pub fn variants<T: DeserializeOwned>() -> Vec<T> {
+    (0_u32..)
+        .map_while(|index| T::deserialize(U32Deserializer::<ValueError>::new(index)).ok())
+        .collect()
+}
 
 /// The family a boundary belongs to, as spike §6 groups them.
 ///

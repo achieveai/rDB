@@ -1,6 +1,6 @@
 # Test Plan — M7, team kernel-a (A1, T1, P1)
 
-<!-- drift-basis: 9235bfb -->
+<!-- drift-basis: 3249092 -->
 
 **Status:** Proposed — test planner deliverable, **correction round 5** (critic-kernel-a round 3
 findings **TD-12..TD-20** applied over round 4's TD-01..TD-11 and round 3's T-A-01..15; §8.7 holds
@@ -368,7 +368,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-30 | `watch_not_leader_or_unavailable_read_and_backoff_no_read_family` | §2.4 "NotLeader\|Unavailable ⇒ Read + backoff" | `TerminateWatch{node, NotLeader}` and, in the same test, `TerminateWatch{node, Unavailable}` | effects = `[Control(Get{Grant(us)}), Timer(backoff)]` — `Get` of one record, which is what `ControlKey` names; **zero `Control(Reload{..})`**, the family read these two terminations must *not* trigger (`WatchTermination::is_gap` is false for both); state `Held` | unit | none |
 | M7A-31 | `m7a_31_watch_admission_refusal_backs_off_and_never_reloads` **and** `m7a_31_watch_admission_cap_is_exactly_three_and_latches` (`crates/rdb-sim/tests/authority.rs`) | §2.4 "AdmissionRefused ⇒ Fact + bounded backoff, no ReadFamily, cap" · ADR 0008 "admission-limit not reload loop" · lead rulings A-R41, A-R44 | `TerminateWatch{node, ResourceExhaustedFatal}`, repeated. One call ends **both** watched families, so the shared counter advances by 2 per call and the cap is judged per family within a call | **Two rows, because the ruled vectors differ and one of them is an absence.** Under cap: `[Ignored(Authority(AdmissionRefused)), Timer(Arm WatchBackoff)]` — **no** immediate `Watch`, which is the assertion that had no subject until `AuthorityTimer::WatchBackoff` was built. At cap: `[Fact(WatchAdmissionExhausted)]` with **no** `Timer` and no `Watch` — *the absent re-arm is the claim*, and no `Ignored` either, since the fact and `AdmissionRefused` are one arm apart precisely so this cannot pass on the under-cap reason. Back-off shape: non-decreasing over attempts 0..20 and `backoff_20 == cap`, asserted against `Authority::watch_backoff_millis` **plus** the two attempts the event path reaches — the cap latches at 3, so 20 refusals are undrivable and asserting only the two reachable ones would be a claim about a curve from two of its points. Positive control: firing the armed timer re-watches both families, so the row proves a back-off and not a stop. **Three spellings, contract wins**: `design.md:1087` says `WatchAdmissionRefused` (in no contract at all), this plan said `Fact(AdmissionRefused)`, the landed name is `AuthorityIgnoreReason::AdmissionRefused` — an *ignore reason*, never a fact. Second homograph on this one row; the first is §2.4's input `WatchGap{AdmissionRefused}`, really `WatchTermination::ResourceExhaustedFatal`. **The reload count is M7A-129's**, asserted once, not twice: round 4 wrote "zero `Get{family}`; zero `Reload`" here, of which the first conjunct was unconstructable (TD-12) and the second duplicated M7A-129. This row owns the backoff shape, the cap and the latch; M7A-129 owns the count | unit | none |
 | M7A-32 | `no_read_family_without_a_termination` | ADR 0008 §7 item 4 as restated by A-R15, verbatim: *"no coherent family reload occurs unless a termination was delivered"* · ADR 0008 §4 "a stream that has not terminated has **not** silently skipped an event" | **two arms in one test, on one kernel.** Arm 1 (negative): `Held` and watching; 200 `EmitWatch` deliveries carrying real `ControlChange`s across both families, interleaved with 50 `EmitProgress`, and **no** `TerminateWatch` at any point. Arm 2 (positive control, same kernel, immediately after): one `TerminateWatch{node, RevisionCompacted{..}}` | **Arm 1: count of `Control(Reload{..})` emitted across all 250 events == 0.** Arm 2: **exactly 1**, for the terminated family only. Both numbers are stated because both are load-bearing. Zero is correct in arm 1 because `Reload` is the sanctioned answer to a **gap**, and the only thing that declares a gap is `WatchTermination::is_gap` — rEtcd's stream does not skip silently (ADR 0008 §4), so a live stream has nothing to reload against; a kernel that reloads on a `Watched` or a `WatchProgress` turns cache invalidation into a poll and is the exact defect the ADR item exists to catch. **Round 4 asserted this count over `Control(Get{family})`, a shape `ControlKey` cannot express, so it was zero in every possible run — including the reload-on-every-event run — and §12 reported the ADR item covered while nothing tested it (TD-12, the blocker).** Arm 2 exists so the counter is proven live **inside this test**: without it a `Reload` count of zero is again unfalsifiable by inspection, since a row cannot tell a kernel that never reloads from a metric that never moves. M7A-28 asserts the shape of the arm-2 reload; this row asserts only that it happened exactly once and that arm 1 produced none | unit | none |
-| M7A-33 | `watch_resync_state_equals_uninterrupted_watch` | ADR 0007 "coherent watch resync" | two kernels: A gets events 1..10 uninterrupted; B gets 1..5, `RevisionCompacted`, `FamilySnapshot` at revision of event 8, re-watch 9..10 | A's and B's `served`, `revoked_epochs`, `partitions_revision` are equal after event 10 | unit | none |
+| M7A-33 | `watch_resync_state_equals_uninterrupted_watch` | ADR 0007 "coherent watch resync" | two kernels: A gets events 1..10 uninterrupted; B gets 1..5, `RevisionCompacted`, `FamilySnapshot` at revision of event 8, re-watch 9..10 | A's and B's `served`, `revoked_epochs` and `Partitions` cursor are equal after event 10, and so is the verdict for every lineage involved; `partitions_revision` is **not** equal: per A-R30 it is each kernel's last coherent snapshot, so A holds its acquisition load and B holds event 8's | unit | none |
 | M7A-34 | `watch_event_never_grants` | ADR 0008 "watch never grants" · §2.4 | `Unheld`; `Watched{prefix: grants, changes: [ControlChange{key: Grant(us), revision: r}]}` where the record at `r` **does** name us as owner (TD-17: `Found{owner: us}` is a read answer, not a watch payload — the point of the row is that A1 cannot see it until it reads) | effects = `[Control(Get{Grant(us)})]`; state `Unheld`; `may_admit() == Deny(NoGrant)` — A1 is still `Unheld` **after** the change that would have made it the owner, because only the `Get` answer grants | unit | none |
 | M7A-35 | `no_automatic_promotion` | ADR 0007 "no automatic promotion" · charter DO-NOT | `Unheld` secondary; two changes on the grants family — `ControlChange{key: Grant(primary), revision: r1}` (the record at `r1` is frozen) then `{key: Grant(primary), revision: r2}` (the record is deleted at `r2`); 100 ticks; no `AcquireDue` (TD-17: `frozen` and `Absent` are body/read facts, delivered as revisions on the stream) | zero create-only `Cas` effects; the `Get`s A1 issues in response return `Found{frozen}` then `Absent`, and neither promotes it | unit | none |
 
@@ -1786,6 +1786,86 @@ Nothing above lowers an assertion. Row 14 is released from its standing conditio
 re-derivation (not a pass); row 15's mapping-closure stands as a disposition but its evidentiary
 premise ("`FencingProof` does not exist", "no widening") no longer holds and is recorded rather
 than silently carried forward. Marker moved below after this re-read, not before it.
+
+**Round 8 re-read, 2026-09-26, against `3249092`.** `3249092` ("M7 checkpoint — T1, P1, B-R58
+route, tracker and verification rows") is the newest commit touching `crates/rdb-core/src/contracts`,
+superseding `9235bfb`. `git diff --stat 9235bfb 3249092 -- crates/rdb-core/src/contracts` touches
+`authority.rs` (+97), `digest.rs` (+3), `event.rs` (+92), a new `publication.rs` (182 lines),
+`trace.rs` (+132), `transport.rs` (+3) and `txn.rs` (+30). This is T1/P1's wave: a new leaf plus
+fields those two modules needed added to enums foundation and kernel-a already own the carrier of.
+All sixteen rows re-opened at `3249092`, not carried from round 7.
+
+- **Rows 1, 2, 3, 7, 8, 9, 12, 13** — none of `txn.rs`, `event.rs`'s `ReplyEffect`/`NodeLifecycle`
+  region, `time.rs` or `control.rs` is in this diff; re-opened and unchanged.
+- **Row 5** — `EvidenceRef` moved again: `contracts/authority.rs:282` (was `:230`, +52, from the
+  new `Boundary` enum and `DenyReason::client_error_kind` landing above it), unchanged shape.
+  `FencingProof` (below, row 15) also moved but not in shape.
+- **Row 6 — `Checkpoint` gained a sixth variant.** Re-opened at `contracts/authority.rs:25-40`:
+  still six variant slots by the round-7 count, but this diff adds one — `Read`, inserted between
+  `Reply` and `OutboxDispatch`, doc'd "before a primary read is answered (spec §5.3: primary reads
+  pass the same authority gate; lead ruling A-R72)". **Round 7's count of five was current at its
+  own basis and is now stale**; `Checkpoint` is **six** at `3249092`: `Admission, StorageDispatch,
+  Publication, Reply, Read, OutboxDispatch`. No M7A row asserts a closed count over `Checkpoint`
+  (row 6's own disposition already treats it as a kernel-internal enum read through the effect
+  vector, not enumerated), so nothing here is falsified — the correction is to this table's
+  running count, not to a row. `trace::AuthorityGate` is untouched (not in this diff), still four,
+  no `Read` counterpart — recorded in case a future row reaches for one.
+- **Row 10** — `DenyReason` is still **16** variants, now at `contracts/authority.rs:62` (was
+  `:59`, +3, from the doc comment `ClockModeUnbounded` carries growing by three lines).
+  `ConfigVersionChanged` still names nothing in the crate or an ADR. Membership unchanged from
+  round 7; only the citation moved.
+- **Row 11** — `AuthorityView.past_horizon: DenyReason` still a bare field, now inside the struct
+  at `contracts/authority.rs:257-274` (struct at `:257`, was `:205`, +52; field at `:274`) — same
+  shift as `EvidenceRef` above it, both pushed down by the new `Boundary` enum and
+  `client_error_kind`.
+- **Row 14** — `contracts/recovery.rs` is outside this diff; `RetainedStatusMap`'s five-field shape
+  from round 7 is unaffected. The re-derivation round 7 declared due against M7A-116/135/172 is
+  still owed and still not this table's to close.
+- **Row 15 — the carrier widens again, in kernel-a's own favour, and nothing it rests on moved
+  out from under it.** `AuthorityEvent` (`contracts/authority.rs:1080`, was `:998`, +82 from the
+  new `ExternalFenceMismatch`/`FenceScope`/`AuthorityFact` block landing above it — see below)
+  **gains two variants**, now **six** where round 7 read four: `Fence { scope: FenceScope, reason:
+  DenyReason }`, doc'd "twin of `AuthorityEffect::Fence`, delivered to T1 and P1 (finding K-A-41;
+  lead ruling A-R63). Same fields, so the routed event is the emitted effect unchanged", and
+  `View(AuthorityView)`, doc'd "twin of `AuthorityEffect::PublishAuthorityView`, delivered to R1,
+  T1 and P1 (finding K-A-41; lead ruling A-R63)". `AuthorityEffect` (`:1195`, was `:1102`, +93) is
+  **unchanged** at five variants — `Answer, Fence, PublishAuthorityView, FenceProven, Fact`. This
+  is the mapping row 15 accepted at `f616ddf` and the real carrier row 15 found at `9235bfb`
+  **converging**: `Fence` and `PublishAuthorityView` were already effects: an event twin now exists
+  for each, so T1 and P1 (and R1) receive them as `KernelEvent::Authority(AuthorityEvent::Fence)` /
+  `::View` rather than only inferring them from the emitting side. No row here asserts either new
+  variant yet — this is new surface to rewrite onto, not a correction to what a row already
+  asserts, so nothing is falsified. Supporting types this row's text cites all moved and were
+  re-opened rather than assumed: `FencingProof` now `:316` (was `:264`, +52, same fields, still
+  eight — `partition, prior_generation, prior_owner_epoch, prior_grant_id, prior_boot_id,
+  revocation, control_revision, decision_tick`); `Revocation` now `:366` (was `:314`, +52, same
+  three arms); `ExternalFenceMismatch` now `:911` (was `:829`, +82, still six variants);
+  `FenceScope` now `:936` (was `:854`, +82, still two — `Node`, `Partition(PartitionId)`);
+  `AuthorityFact` now `:965` (was `:883`, +82, still ten variants). The +82 group and the +93 on
+  `AuthorityEffect` both trace to the same insertion: the new `Boundary` enum and
+  `DenyReason::client_error_kind` at `authority.rs:117-166` push everything below them, and
+  `AuthorityIgnoreReason` (kernel-a's own leaf, `:686`, now **42** variants — seven more than
+  round 7's 35: `NotForThisCandidate`, `QualificationLost`, `RecheckOutstanding`,
+  `ReadViewNotPublished`, `RecoveredGenerationNotNewer`, `RetireNewerGeneration`,
+  `RetireServedGeneration`, all T1/P1-facing) pushes the rest again below itself. Widening
+  kernel-a's own leaf is this plan's to do, not a drift finding.
+- **Row 16** — `crates/rdb-core/src/authority.rs` (kernel-a's own module) is outside
+  `contracts/`, so this diff does not touch it; unaffected by construction, same as round 7.
+
+Not part of any row: `digest::Domain` gains `ReadValue` (unreferenced), a new leaf
+`contracts/publication.rs` lands whole (kernel-a's own T1/P1 vocabulary — `AppliedCandidate`,
+`FreezeCause`, `PubMode`, `StatusOutcome`, `StatusEntry`, `PublicationEvent`, `PublicationEffect`;
+no row here names any of it yet, and it is the natural home for the rewrite rows 15's own text
+says is owed), `ClientEvent::Status` gains `generation: Option<Generation>`, `KernelEvent`/
+`KernelEffect` gain more T1/P1 variants inside their `#[non_exhaustive]` carriers (no change to
+`EventKind`/`EffectKind` top-level counts, still eight/seven), `transport::Frame` gains
+`sender: Lineage` (B-R58a, kernel-b's row), and `trace::AckRejectReason` widens 14→15
+(`InFlightUnverified`) — verification's row, not this plan's; no M7A row folds on it.
+
+Nothing above lowers an assertion. Row 6's count corrects a table entry no row depended on; row 15
+gains a real event twin for two effects it already had a mapping for, which narrows the rewrite
+rows 15 already owes rather than reopening it as a blocker. Marker moved below after this re-read,
+not before it.
 
 **Re-read discipline, and what round 4 got wrong about it.** This table is only as fresh as its
 last re-read, which is why the basis is now a gate stage rather than a convention. When

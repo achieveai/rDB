@@ -1207,7 +1207,72 @@ Nothing above lowers an assertion or reopens a closed ask. Row 9 is confirmed un
 than assumed unaffected; rows 1/6/8/21/23 are line-number corrections only; row 26's counts are
 promoted from working-tree to committed. Marker moved below after this re-read, not before it.
 
-<!-- drift-basis: 9235bfb -->
+**Round-9 re-read (2026-09-26), basis moves `9235bfb` → `3249092`.** `3249092` ("M7 checkpoint —
+T1, P1, B-R58 route, tracker and verification rows") is the newest commit touching
+`crates/rdb-core/src/contracts` (`git diff --stat 9235bfb 3249092 -- crates/rdb-core/src/contracts`
+touches `authority.rs`, `digest.rs`, `event.rs`, a new `publication.rs`, `trace.rs`, `transport.rs`,
+`txn.rs`). This is T1/P1's wave. Every citation below was re-opened with `git show 3249092:<path>`,
+not the working tree. `trace.rs` moves again, and by a **different** mechanism than either prior
+shift: one new `AckRejectReason` variant, `InFlightUnverified`, is inserted **inside** the enum
+row 23 already tracks, at `trace.rs:374` — this is a single-point shift of **+4** for everything
+below it, not the uniform whole-file +31 the `BudgetName` insertion caused, and not the piecewise,
+multi-point shift `event.rs` carries in kernel-a's and kernel-b's tables.
+
+- **Row 1** — `TraceHeader.provenance` is unaffected: `trace.rs:243`, same as round 8. The
+  insertion point (`AckRejectReason`, `:346`) is below it, so nothing above line 346 in this file
+  moves.
+- **Row 2** — `ProtectionState` unaffected: not in this diff (`trace.rs` region below `:346`
+  containing it — `:1094` at round 8 — is confirmed re-open at `3249092`: `trace.rs:1098` (+4),
+  still 7 fields, still no `quorum_rule`). F-R13 stands.
+- **Row 6** — `AckEvidence` is `trace.rs:678` (was `:674`, +4). Still four fields, unchanged.
+- **Row 8** — `TraceHeader.partitions: u8` is unaffected: `trace.rs:247`, same as round 8 — above
+  the insertion point.
+- **Row 9** — `ErrorKind` (`errors.rs`) is **unaffected**: `errors.rs` is not in this diff.
+  `ADMISSION_REASONS` needs no re-check this round; nothing about the type it subsets moved.
+- **Row 21** — `SkipReason` is `trace.rs:706` (was `:702`, +4); `TraceKind::OpSkipped` arm is
+  `trace.rs:1187` (was `:1183`, +4). Both unchanged in shape.
+- **Row 23 — the enum itself widens, and this is the row that matters most this round.**
+  `AckRejectReason` (`trace.rs:346`, unchanged start — the insertion is inside the enum, not above
+  it) gains an **eighth** reject reason beyond the fourteen CB-3 landed: `InFlightUnverified`
+  (`trace.rs:374`), inserted between `Unverifiable` and `Diverged`, doc'd "evidence below the
+  primary's anchor, for the record a catch-up cursor has in flight (lead ruling B-R58c). No rung
+  can check it yet, so it drives the cursor and moves no watermark; the ACK at the anchor verifies
+  the whole chain below it." **The enum is now fifteen variants, not fourteen.** `M7V-56`'s
+  set-equality assertion is falsified again, by design, the same way CB-3's widening falsified it
+  at `f616ddf` — the row working, not breaking (F-R20 still governs: no weakening to a subset).
+  **§15.1 is rewritten below** to seat this eighth cell and to fix seven citations that were never
+  corrected through two prior line-shifts.
+- **Row 26** — `EventKind`/`EffectKind` unchanged at 8/7 (not in this diff's carrier growth for
+  those two top-level enums). `KernelIgnoredReason` (`contracts/ignore.rs`) and
+  `ReplicaIgnoreReason` (`ignore.rs`) are **unaffected** — `ignore.rs` is not in this diff, so both
+  stay at 5 arms / 19 variants. `AuthorityIgnoreReason` (`contracts/authority.rs:686`) is now
+  **42** variants (was 35) — seven more, all T1/P1-facing (`NotForThisCandidate`,
+  `QualificationLost`, `RecheckOutstanding`, `ReadViewNotPublished`,
+  `RecoveredGenerationNotNewer`, `RetireNewerGeneration`, `RetireServedGeneration`). Disposition
+  unchanged — adopt: no row in this plan asserts set equality over it, so growth here falsifies
+  nothing. The trap named at round 7/8 fires a second time, on the same enum, the same way.
+- **Row 28** — `TraceKind::{ModuleDispatch, KernelNoted}` are appended at the enum's end by
+  design (lead ruling A-R46) and this diff does not touch that region of `trace.rs`, so those two
+  citations are unaffected. Their payload types widen, though, and this row's own text is now
+  stale about both: `DispatchOutcome` (`trace.rs:1319`) gains a fourth variant,
+  `DeclinedOwed` (`:1343`) — an owed edge distinct from `Declined`'s "not mine" — so it is **four**
+  variants, not three. `KernelNote` (`trace.rs:1358`) gains **eight** variants —
+  `RecoveryFact`, `PublicationFact`, `SurvivorPlaced`, `SyncWithheld`, `SyncProven`,
+  `RecoveredFact`, `RecoveredDeferred`, `RecoveredLanded` — so it is **thirteen**, not five, plus
+  two new companion enums this row did not previously name, `RecoveredDeferReason` (`Crashed`,
+  `CutOff`) and `SyncWithheldReason` (`NotPlaced`, `Failed`, `Short`, `NoDigest`). Disposition
+  unchanged — adopt: grepped at `3249092`, no row, VA, Q-row or literal in this plan names
+  `DispatchOutcome`, `KernelNote`, `DeclinedOwed`, `RecoveredDeferReason` or `SyncWithheldReason`,
+  so nothing here is falsified, only described short. Recorded so the eventual dispatcher-outcome
+  or kernel-note row opens the four/thirteen-variant shape rather than the three/five this row
+  used to say.
+
+Nothing above lowers an assertion. Row 23 reopens `M7V-56` red again, by design, the same way CB-3
+did; §15.1 is rewritten to match. Rows 1/6/8/21 are line-number corrections; row 26 and row 28
+restate two enums' counts that grew since they were last written here. Marker moved below after
+this re-read, not before it.
+
+<!-- drift-basis: 3249092 -->
 
 **Foundation asks still open after this round: none.** Rows 1 and 21 were the last two, and both
 landed at `6893442` — in foundation's *first* code round, the same round that received them.
@@ -1227,50 +1292,71 @@ What this plan still waits on is **code**, and it is not a contract ask:
 - **H1 `ForgeAck` and M1 `FalseDurable`** (VA-4, V-R9).
 
 The contract change this section spent four rounds predicting has **landed**: kernel-b's CB-3
-widened `AckRejectReason` 7 → 14 at `f616ddf` (ruling **B-R33 Q-B-8**; drift row 23). `M7V-56`
-asserts **set equality** between the enum and the coverage lists, so it went red — the row
-working, not the row breaking. **Lead ruling F-R20 (2026-09-20 23:08 PDT) is explicit that
-`M7V-56` is not to be weakened to a subset assertion**, and it has not been. The seven cells are
-§15.1 below. `BoundaryId` is still **29** members, re-read at `f616ddf` (`trace.rs:505`; the
-commit did not touch that enum), so `M7V-56`'s other set-equality half is unchanged.
+widened `AckRejectReason` 7 → 14 at `f616ddf` (ruling **B-R33 Q-B-8**; drift row 23), and B-R58c
+widened it again 14 → 15 at `3249092` (round 9, `InFlightUnverified`). `M7V-56`
+asserts **set equality** between the enum and the coverage lists, so it went red both times — the
+row working, not the row breaking. **Lead ruling F-R20 (2026-09-20 23:08 PDT) is explicit that
+`M7V-56` is not to be weakened to a subset assertion**, and it has not been. The eight cells are
+§15.1 below (seven at CB-3, an eighth added round 9). `BoundaryId` is still **29** members, now at
+`trace.rs:540` (round 9 re-derivation — this citation had been carried as `:505`, its `f616ddf`
+value, through both the round-8 +31 shift and this round's +4 shift without moving; the commit did
+not touch that enum's membership, only its line), so `M7V-56`'s other set-equality half is
+unchanged.
 
-### 15.1 The seven `AckRejectReason` cells (CB-3 debt, written 2026-09-21)
+### 15.1 The `AckRejectReason` cells (CB-3 debt, written 2026-09-21; eighth cell added round 9)
 
 **What a cell here is, and what it is not.** A cell names the variant, the **producer** in
 verification's own grammar that can make the kernel emit it, and the **row** that asserts the cell
 is hit. A cell that says "covered" without naming a covering row is not a cell — it is the vacuous
-assertion this team has now confirmed five times, and writing seven of them to make `M7V-56` green
+assertion this team has now confirmed five times, and writing eight of them to make `M7V-56` green
 would be the worst available outcome: a coverage table that lies is worse than a red row. So where
-a variant has no producer or no assertion, the line below says **GAP** and names an owner. **Five
-of the seven are gaps.** That is the honest state of the debt, not a failure to pay it.
+a variant has no producer or no assertion, the line below says **GAP** and names an owner. **Six
+of the eight are gaps.** That is the honest state of the debt, not a failure to pay it.
+
+**Round-9 correction (2026-09-26): the seven line citations below were never re-derived through
+two prior shifts, and this is the exact fault AGENTS.md's "a grep is not a re-read" describes.**
+They were written `:331, :333, :335, :337, :339, :341, :343` against `f616ddf`'s +37 `AckRejectReason`
+widening. Round 8's own text said "none of their line citations depend on this enum's absolute
+position, only its variant names, which did not move" — true of the names, false of the lines: the
+`BudgetName` insertion above this enum shifted the whole file +31 at `9235bfb`, and this table's
+seven citations were never moved to match. They are corrected below to their `3249092` values, and
+an eighth cell is added for `InFlightUnverified`, the variant round 9 found.
 
 **Where each cell is gated.** `replication_ack` is emitted by the replication and progress package
 **R1**, which is not wired in M7. Under design §3.1 / V-R20 (7) a cell whose emitting package
 reports `Unavailable` lands in `coverage_unavailable`, never in `required_missing[]` and never
-deleted from the required list — so **all fourteen reject-reason cells report `unavailable(R1)`
+deleted from the required list — so **all fifteen reject-reason cells report `unavailable(R1)`
 during M7**, the two below that name an additional package report that package first, and
-`M7V-55` does not fail on any of them today. The five gaps come due the round R1 is wired; they
+`M7V-55` does not fail on any of them today. The six gaps come due the round R1 is wired; they
 are recorded now so that round finds them written down rather than discovers them.
 
 | # | Variant (always enum-qualified) | C0 meaning (`contracts/trace.rs`) | Producer in verification's grammar | Covering row | State |
 |---|---|---|---|---|---|
-| 1 | `AckRejectReason::StaleGeneration` (`:331`) | the acknowledgement names a lineage older than the one being replicated | **exists** — `RecoveryOp::SelectPrefix` / `Synchronize` (`grammar.rs:421`, `:426`) bump the lineage (`lineage_root`), then `NetworkOp::Reorder{msg, before}` (`grammar.rs:211`), or `Drop` then a later `Deliver`, lands a pre-bump ACK after it | **GAP — no row asserts it.** The producer is expressible today; the assertion was never written. The nearest neighbours assert the *client* side of a stale lineage (`BoundaryId::OldGeneration`), which is a different surface | GAP · owner **verification test-planner**, directed row in the next planning round (ids from `M7V-91`) |
-| 2 | `AckRejectReason::RoleMismatch` (`:333`) | the acknowledging replica's role cannot qualify this acknowledgement | **GAP in the corpus** — `Topology` takes arbitrary `Placement{role}`, so a `ReplicaRole::Shadow` placement is *expressible*; but `grammar::rf3`, the only constructor and the one the random corpus uses, places `Primary + 2 × RegularSecondary` and **no shadow at all**. The only shadow in this plan is M7V-69's authored `n4`, reached by **forgery**, which is `ForgedIdentity`, not `RoleMismatch` | **GAP** — a genuine (unforged) shadow ACK has no case | GAP · owner **verification architect** (a shadow-bearing topology constructor or a fifth authored case), then test-planner for the row |
-| 3 | `AckRejectReason::InconsistentProgress` (`:335`) | the reported progress contradicts itself — a durable position ahead of a buffered one | **exists** — `StorageOp::FalseDurable{node, through}` (`grammar.rs:352`), boundary `BoundaryId::FalseDurableWatermark`, hook-gated on **M1** | **M7V-70** — it already drives exactly that op; its expectation now also asserts this cell is hit, in the form M7V-69 already uses for `ForgedIdentity` | **cell** · `unavailable(M1)` until the M1 hook lands, then `unavailable(R1)` |
-| 4 | `AckRejectReason::RegressedProgress` (`:337`) | the reported progress went backwards from what this peer last reported | **exists** — `StorageOp::Crash{kind: Host}` then `Reopen{node}` (`grammar.rs:333`, `:342`): the node returns at a new `BootId` having lost its unflushed suffix and reports a lower `contiguous_seq`. Boundary `BoundaryId::StaleBoot` | **GAP on the assertion.** **M7V-29** drives the producing condition and is this plan's INV-LOSS clause (b) row, but it is a **unit** row over a hand-built trace — it does not run the environment and so does not feed the campaign counter. Naming it as the covering row would be the vacuous move | GAP · owner **verification test-planner**, a `sim` sibling of M7V-29 once R1 is wired |
-| 5 | `AckRejectReason::Unverifiable` (`:339`) | the acknowledgement carries no evidence that can be checked | **GAP — no producer.** No arm of `grammar.rs` emits an evidence-free ACK. `NetworkOp::ForgeAck` (`grammar.rs:235`) supplies **false** evidence, which is `ForgedIdentity`; nothing strips evidence | **GAP** | GAP · owner **verification architect** → **lead**. This is the one of the seven whose cost exceeds "write a cell": it needs a new grammar arm or a `ForgeAck` field. F-R20's own clause — "if the seven cells cost materially more than expected, verification brings it back to the lead rather than touching the row" — applies to this one and to no other |
-| 6 | `AckRejectReason::Diverged` (`:341`) | the acknowledging replica's history disagrees with the primary's at a retained position | **exists** — `RecoveryOp::Diverge{partition, seq}` (`grammar.rs:445`), boundary `BoundaryId::Divergence` | **M7V-80** — it already drives a digest disagreement and already asserts the `BoundaryId::Divergence` cell; its expectation now also asserts this cell. The kernel half is kernel-b's §3.4 rule 1d (M7B-41: a later valid ACK from the diverged copy is dropped) | **cell** · `unavailable(F1)` per M7V-80 today, then `unavailable(R1)` |
-| 7 | `AckRejectReason::NotAMember` (`:343`) | the acknowledging node is not a member of the pinned configuration | **partly** — `NetworkOp::ForgeAck{claimed_node}` (`grammar.rs:235`) can name a `NodeId` absent from the `Topology` in force (`rf3` declares `nodes: 3`, so `NodeId(4)` is a stranger), which is **not** M7V-69's case — there `n4` is a *member* with the wrong role. What is **not** expressible: a member that was **removed** and then acked. `Topology` is a header field carrying `config_version_0` and **no `ScenarioOp` changes membership**, so only "a stranger acked" is reachable, never "a former member acked" | **GAP** — the stranger sibling of M7V-69 is not written. **Also unverified:** which of `ForgedIdentity` and `NotAMember` the tracker returns for a stranger's ACK is kernel-b's §3.4 ladder **order**, which this plan cannot read and must not guess | GAP · owner **verification test-planner** for the row; **kernel-b** to state the ladder order before it is written |
+| 1 | `AckRejectReason::StaleGeneration` (`:362`) | the acknowledgement names a lineage older than the one being replicated | **exists** — `RecoveryOp::SelectPrefix` / `Synchronize` (`grammar.rs:421`, `:426`) bump the lineage (`lineage_root`), then `NetworkOp::Reorder{msg, before}` (`grammar.rs:211`), or `Drop` then a later `Deliver`, lands a pre-bump ACK after it | **GAP — no row asserts it.** The producer is expressible today; the assertion was never written. The nearest neighbours assert the *client* side of a stale lineage (`BoundaryId::OldGeneration`), which is a different surface | GAP · owner **verification test-planner**, directed row in the next planning round (ids from `M7V-91`) |
+| 2 | `AckRejectReason::RoleMismatch` (`:364`) | the acknowledging replica's role cannot qualify this acknowledgement | **GAP in the corpus** — `Topology` takes arbitrary `Placement{role}`, so a `ReplicaRole::Shadow` placement is *expressible*; but `grammar::rf3`, the only constructor and the one the random corpus uses, places `Primary + 2 × RegularSecondary` and **no shadow at all**. The only shadow in this plan is M7V-69's authored `n4`, reached by **forgery**, which is `ForgedIdentity`, not `RoleMismatch` | **GAP** — a genuine (unforged) shadow ACK has no case | GAP · owner **verification architect** (a shadow-bearing topology constructor or a fifth authored case), then test-planner for the row |
+| 3 | `AckRejectReason::InconsistentProgress` (`:366`) | the reported progress contradicts itself — a durable position ahead of a buffered one | **exists** — `StorageOp::FalseDurable{node, through}` (`grammar.rs:352`), boundary `BoundaryId::FalseDurableWatermark`, hook-gated on **M1** | **M7V-70** — it already drives exactly that op; its expectation now also asserts this cell is hit, in the form M7V-69 already uses for `ForgedIdentity` | **cell** · `unavailable(M1)` until the M1 hook lands, then `unavailable(R1)` |
+| 4 | `AckRejectReason::RegressedProgress` (`:368`) | the reported progress went backwards from what this peer last reported | **exists** — `StorageOp::Crash{kind: Host}` then `Reopen{node}` (`grammar.rs:333`, `:342`): the node returns at a new `BootId` having lost its unflushed suffix and reports a lower `contiguous_seq`. Boundary `BoundaryId::StaleBoot` | **GAP on the assertion.** **M7V-29** drives the producing condition and is this plan's INV-LOSS clause (b) row, but it is a **unit** row over a hand-built trace — it does not run the environment and so does not feed the campaign counter. Naming it as the covering row would be the vacuous move | GAP · owner **verification test-planner**, a `sim` sibling of M7V-29 once R1 is wired |
+| 5 | `AckRejectReason::Unverifiable` (`:370`) | the acknowledgement carries no evidence that can be checked | **GAP — no producer.** No arm of `grammar.rs` emits an evidence-free ACK. `NetworkOp::ForgeAck` (`grammar.rs:235`) supplies **false** evidence, which is `ForgedIdentity`; nothing strips evidence | **GAP** | GAP · owner **verification architect** → **lead**. This is one of the eight whose cost exceeds "write a cell": it needs a new grammar arm or a `ForgeAck` field. F-R20's own clause — "if the seven cells cost materially more than expected, verification brings it back to the lead rather than touching the row" — applies to this one (and, on the same grounds, to cell 8 below) |
+| 6 | `AckRejectReason::InFlightUnverified` (`:374`) — **new at `3249092`, ask B-R58c** | evidence below the primary's anchor, for the record a catch-up cursor has in flight; no rung can check it yet, so it drives the cursor and moves no watermark — the ACK at the anchor verifies the whole chain below it | **exists** — kernel-b's own M7B-173 already drives this producer and names the variant (`m7b_173_an_in_flight_ack_below_the_cutoff_drives_the_cursor_and_moves_no_watermark`), but that row is kernel-b's file, over kernel-b's fixture, not this plan's campaign grammar. Whether `grammar.rs` can produce an in-flight-below-cutoff ACK independent of kernel-b's unit fixture is not yet checked | **GAP** — no `M7V-` row asserts this cell against the campaign corpus. Do not cite M7B-173 as the covering row: it is a different plan's unit test, the same distinction row 4 already draws for M7V-29 | GAP · owner **verification test-planner**, directed row in the next planning round (ids from `M7V-91`); check `grammar.rs` for a producer before assuming one is owed |
+| 7 | `AckRejectReason::Diverged` (`:376`) | the acknowledging replica's history disagrees with the primary's at a retained position | **exists** — `RecoveryOp::Diverge{partition, seq}` (`grammar.rs:445`), boundary `BoundaryId::Divergence` | **M7V-80** — it already drives a digest disagreement and already asserts the `BoundaryId::Divergence` cell; its expectation now also asserts this cell. The kernel half is kernel-b's §3.4 rule 1d (M7B-41: a later valid ACK from the diverged copy is dropped) | **cell** · `unavailable(F1)` per M7V-80 today, then `unavailable(R1)` |
+| 8 | `AckRejectReason::NotAMember` (`:378`) | the acknowledging node is not a member of the pinned configuration | **partly** — `NetworkOp::ForgeAck{claimed_node}` (`grammar.rs:235`) can name a `NodeId` absent from the `Topology` in force (`rf3` declares `nodes: 3`, so `NodeId(4)` is a stranger), which is **not** M7V-69's case — there `n4` is a *member* with the wrong role. What is **not** expressible: a member that was **removed** and then acked. `Topology` is a header field carrying `config_version_0` and **no `ScenarioOp` changes membership**, so only "a stranger acked" is reachable, never "a former member acked" | **GAP** — the stranger sibling of M7V-69 is not written. **Also unverified:** which of `ForgedIdentity` and `NotAMember` the tracker returns for a stranger's ACK is kernel-b's §3.4 ladder **order**, which this plan cannot read and must not guess | GAP · owner **verification test-planner** for the row; **kernel-b** to state the ladder order before it is written |
+
+Renumbered from the original seven (round 8 and earlier cited them 1–7 in enum declaration order);
+inserting `InFlightUnverified` at its declared position between `Unverifiable` and `Diverged`
+keeps this table's row order matching the enum's, at the cost of `Diverged`/`NotAMember` moving
+from 6/7 to 7/8. No id outside this table refers to a cell by its position number, only by variant
+name, so the renumbering itself corrects nothing and breaks nothing.
 
 **What this does and does not make green.** `M7V-56` asserts set **equality between
 `coverage.rs`'s lists and the enums** — nothing more. It goes green the moment
 `ACK_REJECT_REASONS` in `crates/rdb-sim/tests/support/scenarios/coverage.rs:92` is widened from
-`[AckRejectReason; 7]` to `[AckRejectReason; 14]` with the seven names above. **That edit is code
+`[AckRejectReason; 7]` to `[AckRejectReason; 15]` with the eight names above (round 9: `14` → `15`,
+one more entry, `InFlightUnverified`). **That edit is code
 and is owed to verification's developer; it is not made in this document.** The table above is the
-justification each of those fourteen entries needs in order not to be a lie. The five gaps are
+justification each of those fifteen entries needs in order not to be a lie. The six gaps are
 `M7V-55`'s problem, not `M7V-56`'s: they are `unavailable(R1)` while R1 is unwired, and they
 become `required_missing[]` — a red `M7V-55` — the round it is wired and they are still unwritten.
-Do not read a green `M7V-56` as "the seven are covered".
+Do not read a green `M7V-56` as "the eight are covered".
 
 **Also landed at `f616ddf` and *not* reflected here — flagged, not written.** Verification's own
 developer added three INV-LIN oracle tests in that commit

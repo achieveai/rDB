@@ -430,6 +430,20 @@ fn published_any(effects: &[EffectKind]) -> bool {
         .any(|e| matches!(e, EffectKind::Kernel(KernelEffect::Published { .. })))
 }
 
+/// M7A-115's wire half, checked on every step of every row: no status answer P1 emits anywhere in
+/// this binary is `TxnStatus::Unresolved` (KA-9: it is T1's answer, and P1 has no state for it).
+fn assert_no_status_is_unresolved(effects: &[EffectKind]) {
+    for effect in effects {
+        if let EffectKind::Reply(ReplyEffect::Status {
+            status: status @ TxnStatus::Unresolved { .. },
+            ..
+        }) = effect
+        {
+            panic!("P1 answered a status {status:?}: {effects:?}");
+        }
+    }
+}
+
 /// A snapshot at one position with one key in it.
 struct FixedSnapshot {
     generation: Generation,
@@ -581,6 +595,7 @@ impl Rig {
         self.p1 = p1;
         let effects: Vec<EffectKind> = out?.into_iter().map(|e| e.kind).collect();
         self.assert_only_kept_handles_leave(partition, &effects);
+        assert_no_status_is_unresolved(&effects);
         Ok(effects)
     }
 
@@ -968,6 +983,7 @@ fn step_with_tracker(rig: &mut Rig, tracker: &ProgressTracker, kind: EventKind) 
     rig.p1 = p1;
     let effects: Vec<EffectKind> = out.into_iter().map(|e| e.kind).collect();
     rig.assert_only_kept_handles_leave(P, &effects);
+    assert_no_status_is_unresolved(&effects);
     effects
 }
 
@@ -2252,6 +2268,42 @@ fn a_read_never_serves_a_view_above_the_published_prefix() {
             rejected_read(21, ErrorKind::Unavailable),
         ]
     );
+}
+
+/// Invariant 2, the generation half (tester-p1 F1, gate5 N23): the published position is a
+/// generation **and** a seq, so a view at the published seq under another generation serves
+/// nothing. In both modes that serve: a successor's view over the installed position, and the
+/// predecessor's view over a read-only recovery's cutoff. Twin: the same view under the published
+/// generation is served.
+#[retcd_test]
+fn a_read_never_serves_a_view_from_another_generation() {
+    let others = [Generation(GEN.0 + 1), GEN];
+    for ((label, enter), other) in GATED_MODES.into_iter().zip(others) {
+        let mut rig = Rig::new();
+        enter(&mut rig);
+        let published = rig.view().published;
+        assert_ne!(published.generation, other, "{label}");
+        rig.snapshot.generation = other;
+        rig.snapshot_at(published.seq.0);
+        assert_eq!(
+            rig.admitted(read(21)),
+            vec![
+                ignored(AuthorityIgnoreReason::ReadViewNotPublished),
+                rejected_read(21, ErrorKind::Unavailable),
+            ],
+            "{label}: {other:?} at the published seq is not the published position"
+        );
+        rig.snapshot.generation = published.generation;
+        assert_eq!(
+            rig.admitted(read(22)),
+            vec![read_reply(
+                22,
+                ReadServiceOutcome::Served,
+                Some(value_at(published.seq.0))
+            )],
+            "{label}: twin"
+        );
+    }
 }
 
 /// Steps that take a fresh rig into some mode.
@@ -4463,14 +4515,16 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
     );
 }
 
-/// The `pub fn` items in P1's four source files, sorted, and why none is an applied-prefix
-/// accessor.
+/// The `pub` functions in P1's four source files (any visibility scope, any qualifiers), sorted,
+/// and why none is an applied-prefix accessor.
 ///
 /// - `publication.rs`: the timer id; construction and install; scripting the KA-8 fake; the kernel
 ///   and its view; how many read keys a slot holds; the step.
 /// - `kernel.rs`: the handle arithmetic of P1's block (`publication_snapshot`,
 ///   `is_publication_snapshot`: a number, bound by storage only when P1 asks); construction;
-///   boot, lineage, the **published** position; the view; the step.
+///   boot, lineage, the **published** position; the view; the step. `open_view` (`pub(crate)`)
+///   mints a handle asked for at the **published** position, for a publish and for `install`
+///   (A-R71); storage binds it, and P1 keeps it only if bound there.
 /// - `status.rs`: the KA-9 wire map and the status index. `entry` hands back a status entry: its
 ///   `seq` is the request's own position and its `snapshot` is `None` while pending, so it names no
 ///   view anyone can read.
@@ -4501,6 +4555,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "is_publication_snapshot",
             "lineage",
             "new",
+            "open_view",
             "publication_snapshot",
             "published",
             "view",
@@ -4531,20 +4586,46 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
     ),
 ];
 
-/// The names of the `pub fn` and `pub const fn` items in `source`, sorted.
+/// The trait impls in P1's four source files. A trait method needs no `pub`, so an impl for a P1
+/// type is an accessor [`PUB_FNS`] cannot see. `Module for Publication` is the step, the one way
+/// in; `Default for PubConfig` is configuration; the two `ReplicationView` impls are R1's tracker
+/// and the KA-8 fake, which P1 reads, not P1's own state.
+const TRAIT_IMPLS: [&str; 4] = [
+    "impl Default for PubConfig",
+    "impl Module for Publication",
+    "impl ReplicationView for ProgressTracker",
+    "impl ReplicationView for ScriptedReplication",
+];
+
+/// The names of the `pub` functions in `source`, sorted: any visibility scope (`pub(crate)`) and
+/// any qualifiers (`const`, `async`, `unsafe`, `extern "C"`).
 fn pub_fns(source: &str) -> Vec<&str> {
     let mut names: Vec<&str> = source
         .lines()
         .filter_map(|line| {
-            let line = line.trim_start();
-            let rest = line
-                .strip_prefix("pub fn ")
-                .or_else(|| line.strip_prefix("pub const fn "))?;
-            rest.split(['(', '<']).next()
+            let rest = line.trim_start().strip_prefix("pub")?;
+            let rest = match rest.strip_prefix('(') {
+                Some(scoped) => scoped.split_once(')')?.1,
+                None => rest.strip_prefix(' ')?,
+            };
+            let (qualifiers, name) = rest.split_once("fn ")?;
+            qualifiers
+                .split_whitespace()
+                .all(|q| matches!(q, "const" | "async" | "unsafe" | "extern" | "\"C\""))
+                .then(|| name.split(['(', '<']).next())?
         })
         .collect();
     names.sort_unstable();
     names
+}
+
+/// The `impl … for …` headers in `source`.
+fn trait_impls(source: &str) -> impl Iterator<Item = &str> {
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("impl") && line.contains(" for "))
+        .map(|line| line.trim_end_matches('{').trim_end())
 }
 
 /// M7A-110 (invariant 2, source level): P1 has no accessor for the applied-but-unpublished prefix.
@@ -4553,8 +4634,9 @@ fn pub_fns(source: &str) -> Vec<&str> {
 /// - **Compile error E0027** ("pattern does not mention field") if `PubStateView` or `PendingView`
 ///   gains a field: both are destructured below with no `..`, so a new field (an applied `seq` on
 ///   the pending view, say) cannot land without this row being re-read.
-/// - **Assertion** naming the file if any `pub fn` is added to or removed from P1's four source
-///   files: [`PUB_FNS`] is the whole list, each entry justified.
+/// - **Assertion** naming the file if any `pub` function, whatever its scope or qualifiers, is
+///   added to or removed from P1's four source files: [`PUB_FNS`] is the whole list, each entry
+///   justified. The same for trait impls, whose methods need no `pub`: [`TRAIT_IMPLS`].
 /// - **Assertion** if a view asked for is not at the published position, or a pending candidate's
 ///   status entry names a view.
 #[retcd_test]
@@ -4566,6 +4648,15 @@ fn m7a_110_no_accessor_for_applied_prefix_source_check() {
             "{file}: the pub fn list changed; re-read invariant 2 before extending PUB_FNS"
         );
     }
+    let mut impls: Vec<&str> = PUB_FNS
+        .iter()
+        .flat_map(|(_, source, _)| trait_impls(source))
+        .collect();
+    impls.sort_unstable();
+    assert_eq!(
+        impls, TRAIT_IMPLS,
+        "a trait impl changed; re-read invariant 2 before extending TRAIT_IMPLS"
+    );
 
     let mut rig = Rig::new();
     rig.pending_with_recheck(5);
@@ -4775,7 +4866,8 @@ const fn outcome_name(outcome: &StatusOutcome) -> &'static str {
 /// match over the five outcomes has no `NotExecuted`; an absent identity in a live generation is
 /// `Unknown`; and no P1 status answer is `TxnStatus::Unresolved`: not `to_wire` over all five
 /// outcomes, and not any answer P1 gives across the states it reaches here (pending, published,
-/// absent, never held, no generation named, trimmed, recovered, retired).
+/// absent, never held, no generation named, trimmed, recovered, retired). The plan's "whole
+/// binary" is [`assert_no_status_is_unresolved`], which every `Rig` step runs.
 #[retcd_test]
 fn m7a_115_status_never_proves_nonexecution() {
     let all = [

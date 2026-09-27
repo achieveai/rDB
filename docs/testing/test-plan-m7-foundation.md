@@ -1,4 +1,4 @@
-<!-- drift-basis: 9235bfb -->
+<!-- drift-basis: 3249092 -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -885,6 +885,105 @@ carries for a different +37). `TraceKind::ProtectionState` still exactly seven f
 None of the above changes an existing row's assertion; it releases `M7F-38` arm 2 (CB-5) and
 records that the CB-6 ruling text (outside §15) needs a look. Marker moved below after this
 re-read, not before it.
+
+### 15.4 Rebase from `9235bfb` to `3249092`
+
+`3249092` ("M7 checkpoint — T1, P1, B-R58 route, tracker and verification rows") is now the newest
+commit to touch `crates/rdb-core/src/contracts`. Re-read 2026-09-26, row by row, via
+`git show 3249092:<path>` — never the working tree.
+
+```
+$ git diff --stat 9235bfb 3249092 -- crates/rdb-core/src/contracts
+ crates/rdb-core/src/contracts/authority.rs   |  97 +++++++++++++-
+ crates/rdb-core/src/contracts/digest.rs      |   3 +
+ crates/rdb-core/src/contracts/event.rs       |  92 +++++++++++++-
+ crates/rdb-core/src/contracts/publication.rs | 182 +++++++++++++++++++++++++++ (new)
+ crates/rdb-core/src/contracts/trace.rs       | 132 +++++++++++++++++++
+ crates/rdb-core/src/contracts/transport.rs   |   3 +
+ crates/rdb-core/src/contracts/txn.rs         |  30 ++++-
+```
+
+This is kernel-a's T1/P1 wave — a new leaf (`publication.rs`), plus the fields T1/P1 needed added
+to enums foundation owns the carrier of. None of it touches `envelope.rs`, `membership.rs`,
+`errors.rs`, `control.rs`, `time.rs` or `ids.rs`, so every §15 citation into those files (all of
+§3, §5, §6's `Scheduler`/`ControlStore` rows, `ErrorKind`, `PartitionConfig`) is untouched and not
+re-opened again here.
+
+**Two of this plan's own citations are stale, and both are corrected.**
+
+- **`Checkpoint` (:25) gained a sixth variant, `Read`.** The 15.3 note above says "unchanged at
+  five variants including `OutboxDispatch`" — that was true at `9235bfb` and is false now.
+  `Checkpoint` is `Admission, StorageDispatch, Publication, Reply, Read, OutboxDispatch`
+  (`contracts/authority.rs:25-40`), the new arm doc'd "before a primary read is answered (spec
+  §5.3: primary reads pass the same authority gate; lead ruling A-R72)". No M7F row asserts a
+  count over `Checkpoint`, so nothing here is falsified — the 15.3 sentence is what needed fixing,
+  not a row.
+- **`AuthorityEvent` gained two variants, `Fence` and `View`.** The 15.3 note cites
+  "`AuthorityEvent` (`contracts/authority.rs:998`, four variants — `Check`, `Answer`,
+  `RevokeEpochRequested`, `EpochRevocationPersisted`)"; at `3249092` it is **six**, at
+  `contracts/authority.rs:1080` (+82, from `AuthorityIgnoreReason` growing ahead of it — see
+  below): `Fence { scope: FenceScope, reason: DenyReason }` (twin of `AuthorityEffect::Fence`,
+  delivered to T1 and P1) and `View(AuthorityView)` (twin of `AuthorityEffect::PublishAuthorityView`,
+  delivered to R1, T1 and P1). `AuthorityEffect` itself is unchanged — still five variants, now at
+  `:1195` (was `:1102`). Neither enum is a row's subject here; recorded because 15.3's own text
+  named the old count and would mislead the next reader who trusted it.
+
+**`AuthorityIgnoreReason` grew again — kernel-a's leaf, not policed here.** 15.3 counted 35 (up
+from the 2026-09-22 note's 27); at `3249092` it is **42** — seven more (`NotForThisCandidate`,
+`QualificationLost`, `RecheckOutstanding`, `ReadViewNotPublished`, `RecoveredGenerationNotNewer`,
+`RetireNewerGeneration`, `RetireServedGeneration`), all T1/P1-facing. Foundation owns only the
+`KernelIgnoredReason` arm set (`Error`, `AppendRejected`, `AckRejected`, `Authority`, `Replica`),
+unchanged at five, which is what any `M7F-37`/`M7F-53`-style row over the carrier would assert.
+
+**`AckRejectReason` widened again, past what `M7F-56` was written against.** 15.2 recorded CB-3's
+7→14 widening; at `3249092` it is **15** — `InFlightUnverified` was added between `Unverifiable`
+and `Diverged` (`trace.rs:346-379`), doc'd "evidence below the primary's anchor, for the record a
+catch-up cursor has in flight (lead ruling B-R58c)". `M7F-56` (`seams.rs:443`) asserts a **literal
+fourteen-name list**, not a count derived from the enum, so it is not falsified and needs no code
+edit — but the list no longer names all of the type's variants, same disposition as CB-2's
+`NeedPrefix` payload in 15.2. Consequence outside this plan: this is the second widening
+`M7V-56`'s set-equality assertion must absorb; verification's own §15 records it.
+
+**`BlockReason` and `PartitionMode` are unchanged in shape, only in line.** Both sit after the new
+`Boundary` enum and `DenyReason::client_error_kind` (below), so both shift: `BlockReason` is now
+`contracts/authority.rs:514` (was `:462`), still seven variants; `PartitionMode` is
+`contracts/authority.rs:641` (was `:589`), still four, `Blocked { reason }` among them.
+
+**Everything else is an addition no §15 row names, recorded so the next re-read does not have to
+re-derive that it is inert here:**
+
+- `Checkpoint` gains a sibling, a new `Boundary` enum (`PreApply`, `PostApply`) and
+  `DenyReason::client_error_kind(&self, boundary) -> ErrorKind` (`authority.rs:117-166`) — T1/P1's
+  own admission-to-client-error mapping, parallel to `BlockReason::client_error_kind`. No row here
+  builds a `DenyReason` client error.
+- `digest::Domain` gains `ReadValue = 6` (`digest.rs:39-41`) — one value served by a read, its own
+  domain so a read can never share a preimage with an oracle checkpoint. No M7F row enumerates
+  `Domain`.
+- New file `contracts/publication.rs` — P1's vocabulary (`AppliedCandidate`, `FreezeCause`,
+  `PubMode`, `StatusOutcome`, `StatusEntry`, `PublicationEvent`, `PublicationEffect`). Kernel-a's
+  leaf per its own module doc; no M7F row names any of these types.
+  `ClientEvent::Status` gains a `generation: Option<Generation>` field (`event.rs:105-111`, for
+  M7A-135's retired-vs-never-ran distinction); `KernelEvent` gains `AppliedCandidate`, `Published`,
+  `Publication`, `DedupTrim`, `StatusTrim`, `RetireGeneration`, and `KernelEffect` gains
+  `AppliedCandidate`, `Published`, `Publication`, `AuthorityCheck` — all inside the
+  `#[non_exhaustive]` carriers CB-1 built, so `EventKind`/`EffectKind` themselves are still eight
+  and seven and `M7F-37`/`M7F-53`'s exhaustive top-level matches do not need a look.
+- `transport::Frame` gains a `sender: crate::contracts::authority::Lineage` field (B-R58a's frame
+  fence). No M7F row constructs or matches a `Frame`.
+- `txn.rs` gains `TenantId` to its `ids` import, `pub const KEY_SCOPE_LEN: usize = 12`, and
+  `scoped_key`/`key_scope` (ADR-rdb-0004 §2's structural key prefix). No M7F row calls either
+  function.
+- `trace::DispatchOutcome` gains a fourth variant, `DeclinedOwed` (an owed edge, distinct from
+  `Declined`'s "not mine"); `trace::KernelNote` gains eight variants (`RecoveryFact`,
+  `PublicationFact`, `SurvivorPlaced`, `SyncWithheld`, `SyncProven`, `RecoveredFact`,
+  `RecoveredDeferred`, `RecoveredLanded`) plus two new companion enums, `RecoveredDeferReason` and
+  `SyncWithheldReason`. No M7F row names `DispatchOutcome` or `KernelNote`; verification's row 28
+  is where these are tracked.
+
+None of the above lowers or falsifies an existing row's assertion. It corrects two stale counts in
+15.3's own prose (`Checkpoint`, `AuthorityEvent`) and records one enum foundation's own row already
+answered against a stricter list than the type now has (`AckRejectReason` via `M7F-56`). Marker
+moved below after this re-read, not before it.
 
 ---
 

@@ -332,6 +332,11 @@ pub struct Held {
     revoked_epochs: BTreeSet<(PartitionId, OwnerEpoch)>,
     partitions_revision: Revision,
     storage_fenced: BTreeSet<PartitionId>,
+    /// The last linearizable read of `grants/{node}` answered `Unavailable`, and no quorum has
+    /// answered since. Denies `ControlUnavailable` without ending the grant (`design.md` §2.4
+    /// property 6; M7A-59). Cleared by the next read that finds our record, or by a committed
+    /// renewal, which is itself a quorum answer (A-R78 F1).
+    control_unavailable: bool,
 }
 
 impl Held {
@@ -984,6 +989,9 @@ impl Authority {
         if let Err(reason) = utc_ok(&self.clock, held.expiry_utc_ms, now, budgets) {
             return Verdict::Deny(reason);
         }
+        if held.control_unavailable {
+            return Verdict::Deny(DenyReason::ControlUnavailable);
+        }
         held.partition_deny(lineage)
             .map_or(Verdict::Admit, Verdict::Deny)
     }
@@ -1484,16 +1492,22 @@ impl Authority {
                     ]
                 }
             }
-            // Leadership moved, or the hub went away. Re-establish and read before believing
-            // anything; the cursor is still good, so this is a resume, not a reload.
+            // Leadership moved, or the hub went away. Read our own record before believing
+            // anything, and resume the watch after a back-off (`design.md` §2.4, `Held |
+            // WatchGap{NotLeader|Unavailable}`; M7A-30). The cursor is still good, so this is a
+            // resume from it, never a reload; and it is not an admission refusal.
             WatchTermination::NotLeader | WatchTermination::Unavailable => {
-                vec![Self::control(
-                    event,
-                    ControlEffect::Watch {
-                        prefix,
-                        from: resume,
-                    },
-                )]
+                self.watch_backoff.insert(prefix, resume);
+                let at = ctx.now.plus_millis(Self::watch_backoff_millis(1));
+                vec![
+                    Self::control(
+                        event,
+                        ControlEffect::Get {
+                            key: ControlKey::Grant(ctx.node),
+                        },
+                    ),
+                    self.arm(event, AuthorityTimer::WatchBackoff, at),
+                ]
             }
             // Unreachable: both remaining variants answer `true` to `is_gap` and returned above.
             // Spelled out rather than caught by a wildcard so that a sixth termination variant
@@ -2187,6 +2201,7 @@ impl Authority {
             revoked_epochs: BTreeSet::new(),
             partitions_revision: Revision::default(),
             storage_fenced: BTreeSet::new(),
+            control_unavailable: false,
         });
         self.cursors.insert(ControlPrefix::Grants, revision);
         let renew = self.arm(
@@ -2306,6 +2321,7 @@ impl Authority {
                     held.expiry_utc_ms = renewal.e_new;
                     held.record_revision = revision;
                     held.renewed_at = renewal.dispatched_at;
+                    held.control_unavailable = false;
                 }
                 renewal
             }
@@ -2359,10 +2375,14 @@ impl Authority {
         record: &GrantRecord,
         revision: Revision,
     ) -> Vec<Effect> {
+        let renew_millis = ctx.budgets.renew_millis;
+        // A read found our record: control answers again (M7A-59).
+        if let AuthorityState::Held(held) = &mut self.state {
+            held.control_unavailable = false;
+        }
         let Some(held) = self.state.held() else {
             return Vec::new();
         };
-        let renew_millis = ctx.budgets.renew_millis;
         if revision <= held.record_revision {
             let at = ctx.now.max(held.renewed_at.plus_millis(renew_millis));
             return vec![
@@ -2429,11 +2449,19 @@ impl Authority {
                 Ok(self.fence(ctx, event, FenceScope::Node, DenyReason::Revoked))
             }
             // Control quorum was lost. A **deny**, never "probably still fine" — and never a
-            // fence: the grant has not ended, we simply cannot see it (property 6).
-            ReadOutcome::Unavailable => Ok(vec![Self::ignored(
-                event,
-                AuthorityIgnoreReason::AdmissionSuspended,
-            )]),
+            // fence: the grant has not ended, we simply cannot see it (property 6). The deny is
+            // remembered until a read finds our record (M7A-59; lead ruling A-R77a). Views are
+            // not republished: published service ends at local expiry (ADR-rdb-0008, "Control-
+            // quorum loss denies"), and the deny is a check-time answer only.
+            ReadOutcome::Unavailable => {
+                if let AuthorityState::Held(held) = &mut self.state {
+                    held.control_unavailable = true;
+                }
+                Ok(vec![Self::ignored(
+                    event,
+                    AuthorityIgnoreReason::AdmissionSuspended,
+                )])
+            }
             ReadOutcome::Found { revision, value } => {
                 let Some(record) = GrantRecord::decode(value) else {
                     return Err(RdbError::unavailable(
@@ -2465,6 +2493,15 @@ impl Authority {
                 key: ControlKey::Grant(node),
                 outcome,
             } if *node == ctx.node => self.on_grant_read(ctx, event, outcome),
+
+            // An unheld node still reads what a watch names, and only the read's answer can
+            // grant (TD-17; M7A-34, M7A-35). A watch event carries a revision, never a body, so
+            // it issues the same `Get` a held node would and nothing else: the cursor and the
+            // refusal counter belong to a held node's stream (A-R78 F2).
+            ControlEvent::Watched { changes, .. } if self.state.is_unheld() => Ok(changes
+                .iter()
+                .map(|change| Self::control(event, ControlEffect::Get { key: change.key }))
+                .collect()),
 
             _ if !self.state.is_held() => Ok(Vec::new()),
 
@@ -3240,7 +3277,13 @@ impl Authority {
             authority_seq: self.authority_seq,
             checkpoint,
             correlation,
-            verdict: self.may_admit(ctx, lineage),
+            // `OutboxDispatch` is declared and unused in M7 (`design.md` §2.5; M7A-61). Its
+            // variant cannot be feature-gated from here (§13 Q-7), so it never admits.
+            verdict: if checkpoint == Checkpoint::OutboxDispatch {
+                Verdict::Deny(DenyReason::ControlUnavailable)
+            } else {
+                self.may_admit(ctx, lineage)
+            },
         }
     }
 
