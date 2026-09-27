@@ -269,6 +269,30 @@ frozen queue or by skipping the generation check, each a separate violation of �
 near-miss twin asserts a refusal, not a re-execution: no `RetainDedup`, the resubmission refused at
 check 7 with the freeze's mapped error, zero `StorageBatch`, `next_seq` unchanged.
 
+### 8. Amendment 2026-09-26: a `CONDITION_FAILED` answer lasts one generation (Gautam; lead ruling A-R75)
+
+**The gap.** A `CONDITION_FAILED` allocates nothing and writes nothing (§3 step 12). So its
+retained entry lives only in memory, and every recovery starts from an empty index plus the
+durable seed (A-R73b). After a recovery, on the same node or another one, a duplicate of that
+request misses the index. If its condition now holds, it is admitted. Nothing applies twice. But
+§5's "proves no mutation" is broken for a caller that was already told `CONDITION_FAILED`.
+
+**The decision.**
+- The rdb client SDK **always** sets `expected_generation` on a transaction, and a retry keeps it.
+  A stray duplicate reaching a newer generation is then refused at check 5 with
+  `GENERATION_CHANGED`, before the dedup lookup, and never applies.
+- The wire field stays optional. A raw-wire caller that omits it gets `CONDITION_FAILED` replay
+  within the generation that answered, and not across a recovery. This is a documented caller
+  obligation, like request-id retention in Consequences.
+- The kernel does not change. "Retained result replayed verbatim" (§4, Verification) holds within
+  a generation.
+
+**Rejected.**
+- *Make `expected_generation` required on the wire.* It would be the strongest guarantee, but it
+  breaks the wire contract for no gain over an SDK that always sends it.
+- *Persist condition failures.* One write per failed condition, and it reverses §3 step 12.
+- *Accept silently.* That leaves §5's "proves no mutation" false for the default client.
+
 ## Consequences
 
 - The caller-visible contract is decidable from the error alone. A client SDK can implement the
@@ -313,6 +337,7 @@ the `M7A-NN` prefix; each row is one named test in `rdb-sim/tests/transaction.rs
 | Generation-qualified trim | trim the new generation aggressively while the old generation's sequences overlap it: assert no old-generation entry is dropped and that `RetireGeneration` is the only thing that drops one |
 | Unbounded growth is explicit | a trace with no trim event at all: assert a stated capacity policy or an explicit `OVERLOADED`, never silent growth |
 | Generation reconciliation | a mutating retry across a recovery boundary requires explicit reconciliation even while status remains queryable (spike §6, F1/T1) |
+| A condition failure is not reversed by a duplicate (§8, 2026-09-26) | answer `CONDITION_FAILED` in generation g with `expected_generation = g`; recover to g+1, on the same node and in a second trace on another; make the condition true; re-deliver the same request: `GENERATION_CHANGED`, no sequence, no storage batch, state unchanged. Near-miss twin: the same trace without `expected_generation` is admitted, which pins the documented raw-wire limit. Client half: the SDK's transaction builder always sets `expected_generation` (owed to the client milestone) |
 | Batch error freezes | injected batch failure at every boundary ⇒ `UNKNOWN_OUTCOME` + partition frozen, never a definitive rejection (feeds V1) |
 
 Gate mapping: the retry/outcome rows above are the kernel-side half of **V4**; the batch-atomicity

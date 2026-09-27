@@ -31,6 +31,9 @@ pub enum Checkpoint {
     Publication,
     /// Before the client reply is sent.
     Reply,
+    /// Before a primary read is answered (spec §5.3: primary reads pass the same authority gate;
+    /// lead ruling A-R72).
+    Read,
     /// Declared for spec §11; unused in M7.
     OutboxDispatch,
 }
@@ -112,6 +115,55 @@ pub enum DenyReason {
     ControlUnavailable,
     /// Local storage failed and the partition is fenced (spec §5.2 step 3).
     LocalStorageFenced,
+}
+
+/// Which side of the apply boundary a deny lands on (team kernel-a `design.md` §3.4's last row).
+///
+/// Moved here from `transaction::admission` (lead ruling A-R72a), so every kernel that maps a
+/// deny to a client error names the same boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Boundary {
+    /// Nothing handed to storage: admission, the `StorageDispatch` checkpoint, and a read.
+    PreApply,
+    /// The batch may have landed.
+    PostApply,
+}
+
+impl DenyReason {
+    /// Spec §5.4's client error for this deny, at `boundary` (team kernel-a `design.md` §3.4;
+    /// lead ruling A-R72a).
+    ///
+    /// The mapping is written **here and nowhere else**, the way [`BlockReason::client_error_kind`]
+    /// is, so T1 and P1 cannot answer one deny two ways. Only a local storage fence depends on the
+    /// boundary: before apply nothing was handed to storage, so the partition is paused; after it
+    /// the batch may have landed, so the outcome is unknown.
+    ///
+    /// No wildcard arm on purpose: a variant added to [`DenyReason`] fails this match rather than
+    /// silently becoming `LEASE_EXPIRED`.
+    #[must_use]
+    pub const fn client_error_kind(&self, boundary: Boundary) -> ErrorKind {
+        match self {
+            Self::GenerationChanged => ErrorKind::GenerationChanged,
+            Self::LocalStorageFenced => match boundary {
+                Boundary::PreApply => ErrorKind::ProtectionPaused,
+                Boundary::PostApply => ErrorKind::UnknownOutcome,
+            },
+            Self::NoGrant
+            | Self::Frozen
+            | Self::Revoked
+            | Self::EpochRevoked
+            | Self::Expired
+            | Self::ExpiryUnproven
+            | Self::ClockUnbounded
+            | Self::ClockModeUnbounded
+            | Self::ClockSampleStale
+            | Self::ProcessSuspended
+            | Self::BootMismatch
+            | Self::AuthorityGenerationChanged
+            | Self::SelfFenced
+            | Self::ControlUnavailable => ErrorKind::LeaseExpired,
+        }
+    }
 }
 
 /// How an authority check came out.
@@ -664,10 +716,25 @@ pub enum AuthorityIgnoreReason {
     /// The discontinuity half is [`DenyReason::BootMismatch`], which fences. This is the
     /// near-miss twin of that trigger and the two are one enum apart, not one variant apart.
     BootUnchanged,
-    /// The takeover candidate could not be reached.
+    /// P1 received a candidate in a state where one cannot arrive: a candidate is already
+    /// pending, or the partition is `Frozen{UnresolvedTransaction | RecoveryReadOnly}`. Named so
+    /// the arm is total (team kernel-a `design.md` §4.2; lead ruling A-R63).
     CandidateUnreachable,
-    /// A takeover candidate was considered while this node is not serving the partition.
+    /// P1 accepted a candidate while `Frozen{AuthorityLost | LocalStorageFenced}` or `Blocked`
+    /// (team kernel-a `design.md` §4.2, finding K-A-45; lead ruling A-R63).
     CandidateWhileNotServing,
+    /// A `QualificationChanged` for another seq, lineage or config than the pending candidate
+    /// (team kernel-a `design.md` §4.2; lead ruling A-R63).
+    NotForThisCandidate,
+    /// R1's predicate went false for the pending seq, so the outstanding recheck is dropped
+    /// (team kernel-a `design.md` §4.2; lead ruling B-R21).
+    QualificationLost,
+    /// A second `Gained` while the publication recheck is still outstanding; nothing is asked
+    /// again (lead ruling A-R63).
+    RecheckOutstanding,
+    /// The read view the environment supplied is not the published snapshot, so no value was
+    /// served (team kernel-a `design.md` §4.3 invariant 2: no read sees the raw applied prefix).
+    ReadViewNotPublished,
     /// A dispatch was dropped because the partition froze under it.
     DispatchDroppedByFreeze,
     /// A dispatch was refused because the partition is frozen.
@@ -781,6 +848,21 @@ pub enum AuthorityIgnoreReason {
     /// The discontinuity half is [`DenyReason::ProcessSuspended`], which fences. One enum apart,
     /// for the same reason as [`Self::BootUnchanged`].
     ResumeGapWithinTolerance,
+    /// A `Recovered` named a generation older than the highest this node has already served or
+    /// been demoted from for that partition, or equal to it while this node holds no instance
+    /// of that generation. T1 creates no instance and demotes none: acting on it would re-create
+    /// an instance whose ids collide with the one that served that generation (lead ruling
+    /// A-R73, tester-t1 N2). A same-generation `Recovered` for a held instance, such as F1's
+    /// activation re-emit, is not this case.
+    RecoveredGenerationNotNewer,
+    /// A `RetireGeneration` named a generation newer than the one T1 serves. Recording it retired
+    /// would make that generation retain nothing if this node later serves it, so T1 refuses it
+    /// and retires nothing (lead ruling A-R71, R9).
+    RetireNewerGeneration,
+    /// A `RetireGeneration` named the generation T1 is serving. Retiring it would drop every
+    /// retained identity and open re-execution, so T1 refuses it and keeps the entries (lead
+    /// ruling A-R70, tester-t1 hunt_07).
+    RetireServedGeneration,
     /// A clock sample was rejected.
     SampleRejected,
     /// An answer arrived carrying an authority view older than the one held.
@@ -1046,6 +1128,17 @@ pub enum AuthorityEvent {
         /// The epoch that is now unserveable.
         epoch: OwnerEpoch,
     },
+    /// Twin of [`AuthorityEffect::Fence`], delivered to T1 and P1 (finding K-A-41; lead ruling
+    /// A-R63). Same fields, so the routed event is the emitted effect unchanged.
+    Fence {
+        /// What the fence covers.
+        scope: FenceScope,
+        /// Why.
+        reason: DenyReason,
+    },
+    /// Twin of [`AuthorityEffect::PublishAuthorityView`], delivered to R1, T1 and P1 (finding
+    /// K-A-41; lead ruling A-R63).
+    View(AuthorityView),
 }
 
 /// A fact the authority module hands its peers (lead ruling A-R25).

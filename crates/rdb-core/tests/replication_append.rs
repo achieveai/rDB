@@ -1,10 +1,12 @@
 //! R1 `AppendReceiver`: the design §3.2 validation ladder (and §3.2a's recovery append), and the
 //! §3.3 completion events, reached through `Replication::step`.
 //!
-//! `m7b_<n>_*` functions are the §3 rows, and the receiver's §9 rows (M7B-120, 121, 122,
-//! 124), of `docs/testing/test-plan-m7-kernel-b.md` (written
-//! after tester-kb-r1's slice-1 thumbs-up). Where lead ruling F-4 overrode a plan literal
-//! (M7B-14, 16, 17), the row asserts the ruling and says so. Plain-named functions are not plan
+//! `m7b_<n>_*` functions are the §3 rows, the receiver's §9 rows (M7B-120, 121, 122, 124),
+//! its A1-view rows (M7B-157..160, lead ruling B-R53) and the receiver `Recovered` builds
+//! (M7B-165, lead ruling B-R54) of
+//! `docs/testing/test-plan-m7-kernel-b.md` (written after tester-kb-r1's slice-1 thumbs-up).
+//! Where lead ruling F-4 overrode a plan literal (M7B-14, 16, 17), the row asserts the ruling
+//! and says so. Plain-named functions are not plan
 //! rows: developer scaffolding, supporting guards, and the manual tester's `tester_r1_*` rows.
 //! Every test drives a real `Event` through the module, so "reachable through step" is what
 //! each one proves as well as its ladder row.
@@ -22,7 +24,8 @@ use config_log::retcd_test;
 
 use bytes::Bytes;
 use rdb_core::contracts::authority::{
-    AuthorityView, DenyReason, FenceCredential, FencingProof, Lineage, PartitionMode, Revocation,
+    AuthorityEvent, AuthorityView, DenyReason, FenceCredential, FencingProof, Lineage,
+    PartitionMode, Revocation,
 };
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::{
@@ -42,13 +45,14 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{
-    CommittedRoot, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap, SelectedLineage,
+    CommittedRoot, DurableProof, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap,
+    SelectedLineage,
 };
 use rdb_core::contracts::storage::{
     Batch, DurablePrefix, Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect, Write,
 };
 use rdb_core::contracts::time::{ControlTime, Tick, TimerFired};
-use rdb_core::contracts::trace::{CapabilityState, Version};
+use rdb_core::contracts::trace::{AckRejectReason, CapabilityState, Version};
 use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
 use rdb_core::contracts::txn::Outcome;
 use rdb_core::contracts::version::ENVELOPE_VERSION;
@@ -57,9 +61,9 @@ use rdb_core::replication::append::{
     PROGRESS_KEY, UNSOLICITED,
 };
 use rdb_core::replication::catchup::{CatchupCursor, MAX_PROBE_ROUNDS};
-use rdb_core::replication::progress::DigestLadder;
+use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{
-    decode_reply, encode_recovery_append, encode_reply, REPLY_MAGIC,
+    decode_recovery_append, decode_reply, encode_recovery_append, encode_reply, REPLY_MAGIC,
 };
 use rdb_core::replication::Replication;
 
@@ -257,6 +261,14 @@ fn head(seq: u64) -> Head {
     }
 }
 
+/// The partition's root: where a copy that holds nothing starts.
+fn root_head() -> Head {
+    Head {
+        seq: Seq::ZERO,
+        digest: Digest::ROOT,
+    }
+}
+
 /// B's receiver for `partition` at `(10, d10)`, durable `durable`.
 fn receiver(partition: PartitionId, durable: u64) -> AppendReceiver {
     receiver_at(partition, 10, durable)
@@ -330,13 +342,51 @@ fn event(kind: EventKind) -> Event {
     }
 }
 
+/// `body` from a sender whose authority is the lineage its record was sealed under — for a
+/// recovery append, its credential's — and the golden lineage when the body names none. That
+/// is the honest sender of every in-generation row; a row that separates the two uses
+/// [`framed`].
 fn delivered(from: PeerLabel, body: Bytes) -> Event {
+    let golden = (
+        Lineage {
+            partition: P,
+            generation: GEN,
+            owner_epoch: EPOCH,
+        },
+        CONFIG,
+    );
+    let (sender, config) = match decode_recovery_append(&body) {
+        Ok((fence, _)) => (
+            Lineage {
+                partition: fence.partition,
+                generation: fence.prior_generation,
+                owner_epoch: fence.prior_owner_epoch,
+            },
+            CONFIG,
+        ),
+        Err(_) => ReplicationEnvelope::decode_header(&body).map_or(golden, |header| {
+            (
+                Lineage {
+                    partition: header.partition,
+                    generation: header.generation,
+                    owner_epoch: header.owner_epoch,
+                },
+                header.config_version,
+            )
+        }),
+    };
+    framed(from, sender, config, body)
+}
+
+/// `body` in a frame whose sender holds `sender` under `config` (lead ruling B-R58a).
+fn framed(from: PeerLabel, sender: Lineage, config: ConfigVersion, body: Bytes) -> Event {
     event(EventKind::Transport(TransportEvent::Delivered {
         from,
         frame: Frame {
             id: FRAME_ID,
             protocol: ENVELOPE_VERSION,
-            config: CONFIG,
+            config,
+            sender,
             body,
         },
     }))
@@ -548,9 +598,20 @@ fn asks_new_primary(effects: &[EffectKind], have: u64) {
 
 /// A fence credential naming copy `sender` as the transfer source.
 fn fence(sender: u8, epoch: OwnerEpoch, revision: Revision) -> FenceCredential {
+    fence_in(GEN, sender, epoch, revision)
+}
+
+/// [`fence`] issued in `generation`. The frame carrying it is sent on the credential's lineage
+/// (lead ruling B-R59), so a receiver that adopted a newer generation needs one issued there.
+fn fence_in(
+    generation: Generation,
+    sender: u8,
+    epoch: OwnerEpoch,
+    revision: Revision,
+) -> FenceCredential {
     FenceCredential {
         partition: P,
-        prior_generation: GEN,
+        prior_generation: generation,
         prior_owner_epoch: epoch,
         control_revision: revision,
         sender: CopyId(sender),
@@ -902,6 +963,11 @@ fn first_failure(breaks: &[fn(&mut Broken)]) -> (AppendOutcome, Seq) {
 /// Rows 1 to 8 in order, row 6 as its two halves (configuration, then sender). For every
 /// adjacent pair broken together, only the lower row's code is reported; with the lower field
 /// fixed, the higher row's code appears. The code of row 7 names the seq it was sent at.
+///
+/// Each record here is sent by its honest sender, which `delivered` derives from its header, so
+/// a lineage edit is the frame's as well. That puts partition, generation, epoch, configuration
+/// and sender in the frame fence, which runs before row 2 (lead ruling B-R58a): `TooLarge`
+/// follows `NotAMember`.
 #[retcd_test]
 fn m7b_15_ladder_reports_the_first_failure_and_walks_down_in_order() {
     type Row = (fn(&mut Broken), fn(Seq) -> AppendReject);
@@ -909,10 +975,6 @@ fn m7b_15_ladder_reports_the_first_failure_and_walks_down_in_order() {
         (
             |c| c.env.header.protocol_version += 1,
             |_| AppendReject::IncompatibleVersion,
-        ),
-        (
-            |c| c.env.mutations = vec![c.env.mutations[0].clone(); MAX_MUTATIONS + 1],
-            |_| AppendReject::TooLarge,
         ),
         (
             |c| c.env.header.partition = PartitionId(9),
@@ -931,6 +993,10 @@ fn m7b_15_ladder_reports_the_first_failure_and_walks_down_in_order() {
             |_| AppendReject::StaleConfig { current: CONFIG },
         ),
         (|c| c.from = C, |_| AppendReject::NotAMember),
+        (
+            |c| c.env.mutations = vec![c.env.mutations[0].clone(); MAX_MUTATIONS + 1],
+            |_| AppendReject::TooLarge,
+        ),
         (
             |c| c.corrupt = true,
             |at| AppendReject::CorruptHistory { at },
@@ -1516,8 +1582,6 @@ fn m7b_28_recovered_is_the_only_clearer_of_quarantine() {
 fn recovered_with_a_pin_this_copy_cannot_serve_under_is_invalid() {
     use ReplicaRole::{Primary, RegularSecondary as Regular, Shadow};
     let pins = [
-        // B promoted: the tracker's handover, not the receiver's.
-        pinned([Regular, Primary, Regular, Shadow]),
         // Nobody to ask for the prefix.
         pinned([Regular, Regular, Regular, Shadow]),
         // B dropped, B's copy on another node, another partition.
@@ -1537,7 +1601,10 @@ fn recovered_with_a_pin_this_copy_cannot_serve_under_is_invalid() {
             vec![member(1, B, Regular), member(2, C, Primary)],
         ),
     ];
-    for pin in pins {
+    // Whether each pin retires B (lead ruling B-R58a, F4): one with no primary, or for another
+    // partition, changes nothing; one that names B no serving member on its node retires it
+    // into the new generation, and changes nothing else.
+    for (pin, retires) in pins.into_iter().zip([false, true, true, false]) {
         let mut module = module();
         let before = rx(&module).clone();
         let effects = step(&mut module, &recovered(10, d(10), pin));
@@ -1547,8 +1614,75 @@ fn recovered_with_a_pin_this_copy_cannot_serve_under_is_invalid() {
                 ReplicaIgnoreReason::InvalidConfig
             ))]
         );
-        assert_eq!(rx(&module), &before);
+        let after = rx(&module);
+        assert_eq!(after.retired(), retires);
+        let generation = if retires { NEW_GEN } else { GEN };
+        assert_eq!(after.lineage(), authority(generation, EPOCH));
+        assert_kept(after, &before);
     }
+    // B promoted: the tracker's handover, not the receiver's. The receiver still refuses it, and
+    // `Recovered` builds B's primary beside it only from a barrier that names B (lead ruling
+    // B-R54); this one names nobody, so nothing is built and the refusal says why.
+    let mut module = module();
+    let before = module.clone();
+    let effects = step(
+        &mut module,
+        &recovered(10, d(10), pinned([Regular, Primary, Regular, Shadow])),
+    );
+    assert_eq!(
+        effects,
+        [
+            ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::InvalidConfig
+            )),
+            ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::BarrierNotDurable
+            )),
+        ]
+    );
+    assert!(module.primary(B, P).is_none());
+    assert!(rx(&module).retired());
+    assert_kept(rx(&module), rx(&before));
+
+    // Near-miss: a later pin that names B a secondary on its node clears the flag, and B stages
+    // the new primary's record again.
+    let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
+    asks_new_primary(&effects, 10);
+    assert!(!rx(&module).retired());
+    let (_, generation, seq) = staged_batch(&send(&mut module, label(C), &taken_over(golden())));
+    assert_eq!((generation, seq), (NEW_GEN, Seq(11)));
+}
+
+/// Everything but the generation and the retired flag, which retiring writes, is as `before`.
+fn assert_kept(after: &AppendReceiver, before: &AppendReceiver) {
+    assert_eq!(
+        (
+            after.applied_head(),
+            after.staged(),
+            after.received_seq(),
+            after.durable_seq(),
+            after.quarantine(),
+            after.root(),
+            after.config(),
+            after.history(),
+            after.authority_seq(),
+            after.lineage().owner_epoch,
+            after.last_partition_revision(),
+        ),
+        (
+            before.applied_head(),
+            before.staged(),
+            before.received_seq(),
+            before.durable_seq(),
+            before.quarantine(),
+            before.root(),
+            before.config(),
+            before.history(),
+            before.authority_seq(),
+            before.lineage().owner_epoch,
+            before.last_partition_revision(),
+        )
+    );
 }
 
 #[retcd_test]
@@ -1560,12 +1694,12 @@ fn a_predecessor_record_at_or_below_the_floor_must_match_the_committed_root() {
         module
     };
     // The predecessor's own record 11, carried by the new primary: rows 4-6 do not apply.
-    let effects = send(&mut behind(), label(C), &golden());
+    let effects = sent_now(&mut behind(), C, &golden());
     assert_eq!(staged_batch(&effects), (BatchId(0), NEW_GEN, Seq(11)));
 
     // Its twin: same seq, same generation, chained on the same d10, not the root's record.
     let mut module = behind();
-    let effects = send(&mut module, label(C), &envelope(11, d(10), b"other"));
+    let effects = sent_now(&mut module, C, &envelope(11, d(10), b"other"));
     let proof = AppendReject::DivergentHistory { at: Seq(11) };
     assert_eq!(
         reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
@@ -1580,12 +1714,27 @@ fn a_predecessor_record_at_or_below_the_floor_must_match_the_committed_root() {
         refused_in(&mut behind(), C, NEW_CONFIG, above),
         rejected(AppendReject::StaleGeneration { current: NEW_GEN })
     );
-    // The sender row is never skipped: the old primary cannot deliver history.
+    // The fence is never skipped: the old primary cannot deliver history, on its old authority
+    // or on the new one.
     let history = golden().encode().expect("encode");
     assert_eq!(
         refused_in(&mut behind(), A, NEW_CONFIG, history),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+    let effects = sent_now(&mut behind(), A, &golden());
+    assert_eq!(
+        reply_at(&effects[0], A, FRAME_ID, NEW_CONFIG),
         rejected(AppendReject::NotAMember)
     );
+}
+
+/// `env` sent from `from` on the authority `recovered` installs: `(NEW_GEN, NEW_EPOCH)` under
+/// `NEW_CONFIG`, whatever lineage the record inside was sealed under (lead ruling B-R58a).
+fn sent_now(module: &mut Replication, from: NodeId, env: &ReplicationEnvelope) -> Vec<EffectKind> {
+    step(
+        module,
+        &framed_on(B, from, authority(NEW_GEN, NEW_EPOCH), NEW_CONFIG, env),
+    )
 }
 
 // --- RecoveryAppend (§3.2a) ---------------------------------------------------------------
@@ -1633,12 +1782,15 @@ fn m7b_120_recovery_append_5r_epoch_alone_and_6r_revision() {
     // 6R: after a takeover committed at REVISION, a fence read before it is stale; one read at
     // it is not.
     let env = taken_over(golden());
-    let older = recovery_body(&fence(2, NEW_EPOCH, Revision(REVISION.0 - 1)), &env);
+    let older = recovery_body(
+        &fence_in(NEW_GEN, 2, NEW_EPOCH, Revision(REVISION.0 - 1)),
+        &env,
+    );
     assert_eq!(
         refused_in(&mut recovered_at_ten(), C, NEW_CONFIG, older),
         rejected(AppendReject::StaleFence)
     );
-    let current = recovery_body(&fence(2, NEW_EPOCH, REVISION), &env);
+    let current = recovery_body(&fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION), &env);
     let effects = send_bytes(&mut recovered_at_ten(), label(C), current);
     assert_eq!(staged_batch(&effects), (BatchId(0), NEW_GEN, Seq(11)));
 }
@@ -1647,7 +1799,10 @@ fn m7b_120_recovery_append_5r_epoch_alone_and_6r_revision() {
 /// plays the plan's authenticated regular replayer.
 #[retcd_test]
 fn m7b_121_replayed_fence_credential_from_a_second_member_is_not_a_member() {
-    let for_c = recovery_body(&fence(2, NEW_EPOCH, REVISION), &taken_over(golden()));
+    let for_c = recovery_body(
+        &fence_in(NEW_GEN, 2, NEW_EPOCH, REVISION),
+        &taken_over(golden()),
+    );
     assert_eq!(
         refused_in(&mut recovered_at_ten(), A, NEW_CONFIG, for_c.clone()),
         rejected(AppendReject::NotAMember)
@@ -1656,7 +1811,10 @@ fn m7b_121_replayed_fence_credential_from_a_second_member_is_not_a_member() {
     let effects = send_bytes(&mut recovered_at_ten(), label(C), for_c);
     assert_eq!(staged_batch(&effects), (BatchId(0), NEW_GEN, Seq(11)));
     // Second twin, the membership half: the shadow D, named by its own credential.
-    let for_d = recovery_body(&fence(3, NEW_EPOCH, REVISION), &taken_over(golden()));
+    let for_d = recovery_body(
+        &fence_in(NEW_GEN, 3, NEW_EPOCH, REVISION),
+        &taken_over(golden()),
+    );
     assert_eq!(
         refused_in(&mut recovered_at_ten(), D, NEW_CONFIG, for_d),
         rejected(AppendReject::NotAMember)
@@ -2174,10 +2332,14 @@ fn tester_r1_reply_bytes_match_the_documented_layout() {
 }
 
 /// Tester row (re-gate, B-R37): the shape half runs in row 2, so it wins over rows 3 to 7. A
-/// malformed envelope that is also on the wrong partition, generation, epoch or config, sent by
-/// a copy that is not the primary, or carrying a corrupt digest, is `Ignored(InvalidArgument)`
-/// with no reply and no quarantine. Kills the `well_formed` check moved after row 6 (a reply
-/// leaks) and moved after row 7 (a corrupt malformed envelope quarantines `CorruptHistory`).
+/// malformed envelope, sent in the current primary's frame, whose record is also on the wrong
+/// partition or generation, sealed above its sender's epoch or configuration, or carrying a
+/// corrupt digest, is `Ignored(InvalidArgument)` with no reply and no quarantine. Kills the
+/// `well_formed` check moved after row 6 (a reply leaks) and moved after row 7 (a corrupt
+/// malformed envelope quarantines `CorruptHistory`).
+///
+/// The sender half is the frame fence's since lead ruling B-R58a, and the fence runs before
+/// row 2: a malformed append from a copy that is not the primary is refused `NotAMember`.
 #[retcd_test]
 fn tester_r1_shape_half_runs_in_row_2_before_rows_3_to_7() {
     let smuggling = || {
@@ -2192,7 +2354,8 @@ fn tester_r1_shape_half_runs_in_row_2_before_rows_3_to_7() {
     let malformed_from = |from: NodeId, env: ReplicationEnvelope, case: &str| {
         let mut module = module();
         let before = rx(&module).clone();
-        let effects = send(&mut module, label(from), &env);
+        let golden_frame = framed_on(B, from, authority(GEN, EPOCH), CONFIG, &env);
+        let effects = step(&mut module, &golden_frame);
         assert_eq!(
             effects,
             vec![ignored(KernelIgnoredReason::Error(
@@ -2226,13 +2389,963 @@ fn tester_r1_shape_half_runs_in_row_2_before_rows_3_to_7() {
     );
     malformed_from(
         A,
-        under(smuggling(), GEN, OwnerEpoch(4), CONFIG),
-        "row 5 epoch",
+        under(smuggling(), GEN, NEW_EPOCH, CONFIG),
+        "row 5 epoch above the sender's",
     );
     malformed_from(
         A,
-        under(smuggling(), GEN, EPOCH, ConfigVersion(6)),
-        "row 6 config",
+        under(smuggling(), GEN, EPOCH, NEW_CONFIG),
+        "row 6 config above the sender's",
     );
-    malformed_from(C, smuggling(), "row 6 sender");
+    let effects = step(
+        &mut module(),
+        &framed_on(B, C, authority(GEN, EPOCH), CONFIG, &smuggling()),
+    );
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, CONFIG),
+        rejected(AppendReject::NotAMember)
+    );
+}
+
+// --- A1's view (design §2.2, lead ruling B-R53) --------------------------------------------
+
+/// A1's view of `P` in `generation`, published at `seq`, pinning `epoch` and `config`.
+fn view_of(
+    seq: u64,
+    generation: Generation,
+    epoch: OwnerEpoch,
+    config: ConfigVersion,
+) -> AuthorityView {
+    AuthorityView {
+        lineage: Lineage {
+            partition: P,
+            generation,
+            owner_epoch: epoch,
+        },
+        grant_id: GrantId(2),
+        boot_id: BootId(1),
+        authority_generation: AuthorityGeneration(1),
+        config_version: config,
+        authority_seq: seq,
+        valid_through_tick: Tick(u64::MAX),
+        past_horizon: DenyReason::NoGrant,
+    }
+}
+
+/// `view` as the event R1 receives on B.
+fn viewed(view: AuthorityView) -> Event {
+    event(EventKind::Kernel(KernelEvent::Authority(
+        AuthorityEvent::View(view),
+    )))
+}
+
+/// A view in B's own generation.
+fn view(seq: u64, epoch: OwnerEpoch, config: ConfigVersion) -> Event {
+    viewed(view_of(seq, GEN, epoch, config))
+}
+
+fn replica(reason: ReplicaIgnoreReason) -> EffectKind {
+    ignored(KernelIgnoredReason::Replica(reason))
+}
+
+/// Route `ev` to B and assert it is refused with `reason` and changes nothing.
+fn view_refused(module: &mut Replication, ev: &Event, reason: ReplicaIgnoreReason, case: &str) {
+    let before = rx(module).clone();
+    assert_eq!(step(module, ev), vec![replica(reason)], "{case}");
+    assert_eq!(
+        rx(module),
+        &before,
+        "{case}: a refused view changes nothing"
+    );
+}
+
+/// `(owner_epoch, config_version, authority_seq)` as B holds them.
+fn pin_of(module: &Replication) -> (OwnerEpoch, ConfigVersion, u64) {
+    let rx = rx(module);
+    (
+        rx.lineage().owner_epoch,
+        rx.config().config_version,
+        rx.authority_seq(),
+    )
+}
+
+/// The golden append re-sealed at epoch `epoch` and configuration `config`.
+fn golden_at(epoch: OwnerEpoch, config: ConfigVersion) -> ReplicationEnvelope {
+    under(golden(), GEN, epoch, config)
+}
+
+/// Design §2.2: a secondary learns a newer owner epoch from A1's view, never from an append.
+///
+/// Before the view, an append at epoch 6 is `UnknownEpoch` and changes nothing, twice. The view
+/// (seq 1, epoch 6, config 8) is `Recorded` and moves exactly the epoch, the configuration
+/// version and the seq: the members, heads and watermarks stay. After it, the same append is
+/// staged and its ACK carries epoch 6 under config 8, while an append at the old epoch is now
+/// `StaleEpoch`. A record staged before the view is still ACKed when it commits after it, and a
+/// quarantined copy installs the view and stays quarantined on the same proof.
+#[retcd_test]
+fn m7b_157_a_newer_view_installs_its_epoch_and_an_append_never_does() {
+    let mut module = module();
+    let newer = golden_at(NEW_EPOCH, NEW_CONFIG);
+    for _ in 0..2 {
+        assert_eq!(
+            refused_in(&mut module, A, CONFIG, newer.encode().expect("encode")),
+            rejected(AppendReject::UnknownEpoch { current: EPOCH })
+        );
+        assert_eq!(pin_of(&module), (EPOCH, CONFIG, 0));
+    }
+
+    let before = rx(&module).clone();
+    assert_eq!(
+        step(&mut module, &view(1, NEW_EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(pin_of(&module), (NEW_EPOCH, NEW_CONFIG, 1));
+    let after = rx(&module);
+    assert_eq!(after.config().members, before.config().members);
+    assert_eq!(
+        (after.lineage().partition, after.lineage().generation),
+        (P, GEN)
+    );
+    assert_eq!(
+        (
+            after.applied_head(),
+            after.staged(),
+            after.received_seq(),
+            after.durable_seq(),
+            after.quarantine(),
+            after.root(),
+            after.last_partition_revision(),
+        ),
+        (
+            before.applied_head(),
+            before.staged(),
+            before.received_seq(),
+            before.durable_seq(),
+            before.quarantine(),
+            before.root(),
+            before.last_partition_revision(),
+        )
+    );
+
+    assert_eq!(
+        refused_in(
+            &mut module,
+            A,
+            NEW_CONFIG,
+            golden_at(EPOCH, NEW_CONFIG).encode().expect("encode")
+        ),
+        rejected(AppendReject::StaleEpoch { current: NEW_EPOCH })
+    );
+    let staged = send(&mut module, label(A), &newer);
+    assert_eq!(staged_batch(&staged), (BatchId(0), GEN, Seq(11)));
+    let acked = step(&mut module, &committed(0, 11));
+    assert_eq!(acked.len(), 1, "{acked:?}");
+    let AppendOutcome::Accepted(ack) = reply_at(&acked[0], A, FRAME_ID, NEW_CONFIG) else {
+        panic!("expected an ACK, got {acked:?}");
+    };
+    assert_eq!(
+        (
+            ack.owner_epoch,
+            ack.config_version,
+            ack.progress.buffered_applied
+        ),
+        (NEW_EPOCH, NEW_CONFIG, AppliedSeq(11))
+    );
+
+    // A view keeps a staged record (tester gate C07): 11 staged before the view is still
+    // ACKed when it commits after it.
+    let mut staging = crate::module();
+    let staged = send(&mut staging, label(A), &golden());
+    assert_eq!(staged_batch(&staged), (BatchId(0), GEN, Seq(11)));
+    assert_eq!(
+        step(&mut staging, &view(1, NEW_EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let acked = step(&mut staging, &committed(0, 11));
+    assert_eq!(acked.len(), 1, "{acked:?}");
+    let AppendOutcome::Accepted(ack) = reply_at(&acked[0], A, FRAME_ID, NEW_CONFIG) else {
+        panic!("expected an ACK, got {acked:?}");
+    };
+    assert_eq!(ack.progress.buffered_applied, AppliedSeq(11));
+
+    // Quarantine withholds evidence, not what control says (tester probe q06): a quarantined
+    // copy installs the view and stays quarantined on the same proof.
+    let mut quarantined = crate::module();
+    send(&mut quarantined, label(A), &envelope(11, d(9), b"v"));
+    let proof = rx(&quarantined).quarantine();
+    assert!(proof.is_some());
+    assert_eq!(
+        step(&mut quarantined, &view(1, NEW_EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(pin_of(&quarantined), (NEW_EPOCH, NEW_CONFIG, 1));
+    assert_eq!(rx(&quarantined).quarantine(), proof);
+}
+
+/// The ordering key is `authority_seq` (lead ruling B-R53). Once seq 5 is installed, a view at
+/// seq 5 or 4 is `OutOfOrder` and changes nothing, even though both carry a higher epoch and
+/// configuration, so an append at that epoch stays `UnknownEpoch`. The near-miss twin: seq 6 at
+/// the **same** epoch is a configuration-only bump, and installs.
+#[retcd_test]
+fn m7b_158_a_view_that_is_not_newer_installs_nothing() {
+    let mut module = module();
+    assert_eq!(
+        step(&mut module, &view(5, NEW_EPOCH, CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(pin_of(&module), (NEW_EPOCH, CONFIG, 5));
+
+    let higher = OwnerEpoch(7);
+    for (seq, case) in [(5, "equal seq"), (4, "lower seq")] {
+        view_refused(
+            &mut module,
+            &view(seq, higher, NEW_CONFIG),
+            ReplicaIgnoreReason::OutOfOrder,
+            case,
+        );
+    }
+    assert_eq!(
+        refused_in(
+            &mut module,
+            A,
+            CONFIG,
+            golden_at(higher, CONFIG).encode().expect("encode")
+        ),
+        rejected(AppendReject::UnknownEpoch { current: NEW_EPOCH })
+    );
+
+    assert_eq!(
+        step(&mut module, &view(6, NEW_EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(pin_of(&module), (NEW_EPOCH, NEW_CONFIG, 6));
+}
+
+/// A newer seq that lowers the epoch or the configuration version contradicts itself, and none
+/// of it is installed: not the half that went up, not the seq (lead ruling B-R53). A view of
+/// another generation or partition is `NotRequired`: installing a generation is `Recovered`'s
+/// job. Each leaves B exactly as it was, and a following view at seq 2 still installs, which
+/// shows the refused seq 9 was not kept either.
+#[retcd_test]
+fn m7b_159_an_inconsistent_view_installs_no_part_of_itself() {
+    let mut module = module();
+    assert_eq!(
+        step(&mut module, &view(1, NEW_EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+
+    let other_partition = AuthorityView {
+        lineage: Lineage {
+            partition: PartitionId(9),
+            generation: GEN,
+            owner_epoch: OwnerEpoch(7),
+        },
+        ..view_of(9, GEN, OwnerEpoch(7), ConfigVersion(9))
+    };
+    let cases = [
+        (
+            view(9, EPOCH, ConfigVersion(9)),
+            ReplicaIgnoreReason::OutOfOrder,
+            "lower epoch, higher config",
+        ),
+        (
+            view(9, OwnerEpoch(7), CONFIG),
+            ReplicaIgnoreReason::OutOfOrder,
+            "higher epoch, lower config",
+        ),
+        (
+            viewed(view_of(9, NEW_GEN, OwnerEpoch(7), ConfigVersion(9))),
+            ReplicaIgnoreReason::NotRequired,
+            "newer generation",
+        ),
+        (
+            viewed(view_of(9, Generation(2), OwnerEpoch(7), ConfigVersion(9))),
+            ReplicaIgnoreReason::NotRequired,
+            "older generation",
+        ),
+        (
+            viewed(other_partition),
+            ReplicaIgnoreReason::NotRequired,
+            "another partition",
+        ),
+    ];
+    for (ev, reason, case) in &cases {
+        view_refused(&mut module, ev, reason.clone(), case);
+        assert_eq!(pin_of(&module), (NEW_EPOCH, NEW_CONFIG, 1), "{case}");
+    }
+    assert_eq!(
+        step(&mut module, &view(2, OwnerEpoch(7), NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(pin_of(&module), (OwnerEpoch(7), NEW_CONFIG, 2));
+}
+
+/// Pins the receiver-side risk logged in lead ruling B-R53: a view carries a configuration
+/// **version**, not its members, and a receiver learns members only from `Recovered`.
+///
+/// Control pins config 8 without B, in the same generation. A's tracker holds both predicates
+/// (7 with B, 8 without), and B's view says 8. B then:
+/// 1. accepts A's append at config 8, because its member list is still 7's and names A primary;
+/// 2. ACKs it under config 8;
+/// 3. and A's tracker drops that ACK as `StaleConfig`, because the newest predicate naming B is
+///    7 (K-B-49). The same progress under config 7 is admitted. That is a control on the
+///    tracker's rule 4 alone, not an ACK B can send: without the view, B answers this
+///    8-sealed record `NeedConfig{7}` and never ACKs it (tester probe q02).
+///
+/// So the view cannot make a removed copy count: no quorum is inflated. What it costs is the
+/// removed copy's contribution to the retiring predicate until the barrier retires it.
+#[retcd_test]
+fn m7b_160_a_view_naming_a_config_without_this_copy_keeps_its_ack_out_of_every_count() {
+    let record = golden_at(EPOCH, NEW_CONFIG);
+    assert_eq!(
+        refused_in(&mut module(), A, CONFIG, record.encode().expect("encode")),
+        rejected(AppendReject::NeedConfig { current: CONFIG }),
+        "without the view, B never ACKs the 8-sealed record"
+    );
+    let mut module = module();
+    assert_eq!(
+        step(&mut module, &view(1, EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    let staged = send(&mut module, label(A), &record);
+    assert_eq!(staged_batch(&staged), (BatchId(0), GEN, Seq(11)));
+    let acked = step(&mut module, &committed(0, 11));
+    assert_eq!(acked.len(), 1, "{acked:?}");
+    let AppendOutcome::Accepted(ack) = reply_at(&acked[0], A, FRAME_ID, NEW_CONFIG) else {
+        panic!("expected an ACK, got {acked:?}");
+    };
+    assert_eq!(ack.config_version, NEW_CONFIG);
+
+    let mut history = DigestLadder::new();
+    for seq in 1..=10 {
+        history.insert(Seq(seq), d(seq));
+    }
+    // A holds the record it sent: sealed under config 8, so not `d(11)`.
+    history.insert(Seq(11), record.record_digest);
+    let mut tracker = ProgressTracker::new(TrackerInit {
+        config: config(),
+        own: CopyId(0),
+        lineage: Lineage {
+            partition: P,
+            generation: GEN,
+            owner_epoch: EPOCH,
+        },
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(11),
+            buffered_applied: AppliedSeq(11),
+            durable: DurableSeq(11),
+        },
+    })
+    .expect("A's tracker");
+    let without_b = PartitionConfig::new(
+        P,
+        NEW_CONFIG,
+        vec![
+            member(0, A, ReplicaRole::Primary),
+            member(2, C, ReplicaRole::RegularSecondary),
+        ],
+    );
+    tracker.on_config_changed(&without_b, Tick(0));
+    assert_eq!(
+        tracker
+            .predicates()
+            .iter()
+            .map(|predicate| predicate.config_version)
+            .collect::<Vec<_>>(),
+        vec![CONFIG, NEW_CONFIG]
+    );
+
+    let before = tracker.clone();
+    assert_eq!(
+        tracker.on_ack(&label(B), &ack, Tick(0)),
+        vec![ignored(KernelIgnoredReason::AckRejected(
+            AckRejectReason::StaleConfig
+        ))]
+    );
+    assert_eq!(tracker, before, "a dropped ACK changes nothing");
+    let under_seven = AppendAck {
+        config_version: CONFIG,
+        ..ack
+    };
+    assert_eq!(
+        tracker.on_ack(&label(B), &under_seven, Tick(0)).first(),
+        Some(&EffectKind::Kernel(KernelEffect::PeerProgress {
+            peer: B,
+            contiguous_seq: Seq(11),
+        }))
+    );
+}
+
+// --- Recovered builds R1's side (lead ruling B-R54) --------------------------------------------
+
+/// `ev`, a `Recovered`, with a barrier over copies `copies`, each proved durable at the cutoff,
+/// stepped on `node`.
+fn requiring(mut ev: Event, copies: &[u8], node: NodeId) -> Event {
+    let EventKind::Kernel(KernelEvent::Recovered(result)) = &mut ev.kind else {
+        panic!("not a Recovered: {ev:?}");
+    };
+    let (cutoff, digest) = (result.selected.cutoff_seq, result.selected.cutoff_digest);
+    let proofs: Vec<DurableProof> = copies
+        .iter()
+        .map(|&copy| DurableProof {
+            copy: CopyId(copy),
+            partition: P,
+            seq: DurableSeq(cutoff.0),
+            digest,
+        })
+        .collect();
+    let required = copies.iter().map(|&copy| CopyId(copy)).collect();
+    result.barrier = RecoveryBarrier::try_new(&proofs, &required, cutoff, digest)
+        .expect("every required copy proved");
+    ev.node = node;
+    ev
+}
+
+/// M7B-165. Nothing is installed, and F1's result pins C primary, A and B regular, D a shadow,
+/// with a barrier over B and C. On B, `Recovered` builds B's receiver: exactly what an
+/// installed receiver seeded at the proved cutoff — `(10, d10)`, durable 10 — becomes through
+/// the same rebuild. It asks C for everything after 10, holds the recovered view's epoch and
+/// `authority_seq`, builds no primary, and stages C's next record under the new root.
+///
+/// Near-misses: A, a member the barrier does not name, is seeded at the root holding nothing
+/// (lead ruling B-R54, item 3). It asks C from 0, and C's record 11 is answered `NeedPrefix`
+/// from 0 — never accepted above the prefix A holds — and changes nothing. On C, which the pin
+/// names primary, no receiver is built. D, the shadow, is built too: at the root outside the
+/// barrier, at the cutoff inside it. And on A, which led the old pin, the old primary is kept
+/// but retired (lead ruling B-R58a) and the receiver is built beside it, answering first
+/// (tester probes r02, r03).
+#[retcd_test]
+fn m7b_165_recovered_builds_a_receiver_on_every_other_member_node() {
+    let on = |node| requiring(recovered(10, d(10), takeover_config()), &[1, 2], node);
+    let new_root = Lineage {
+        partition: P,
+        generation: NEW_GEN,
+        owner_epoch: NEW_EPOCH,
+    };
+    let mut reference = Replication::new();
+    reference.install_receiver(
+        AppendReceiver::new(ReceiverInit {
+            config: takeover_config(),
+            own: CopyId(1),
+            lineage: new_root,
+            head: head(10),
+            durable: DurableSeq(10),
+        })
+        .expect("the proved seed"),
+    );
+    let want = step(&mut reference, &on(B));
+
+    let mut module = Replication::new();
+    let effects = step(&mut module, &on(B));
+    assert_eq!(effects, want);
+    asks_new_primary(&effects, 10);
+    assert_eq!(module, reference);
+    assert_eq!(
+        (
+            rx(&module).applied_head(),
+            rx(&module).durable_seq(),
+            rx(&module).lineage(),
+            rx(&module).authority_seq()
+        ),
+        (head(10), DurableSeq(10), new_root, 1)
+    );
+    assert_eq!(rx(&module).config(), &takeover_config());
+    assert!(module.primary(B, P).is_none());
+    let effects = send(&mut module, label(C), &taken_over(golden()));
+    assert_eq!(staged_batch(&effects), (BatchId(0), NEW_GEN, Seq(11)));
+
+    // A: a member the barrier does not name.
+    let from_zero = rejected(AppendReject::NeedPrefix {
+        have: Seq::ZERO,
+        head_digest: Digest::ROOT,
+    });
+    let mut module = Replication::new();
+    let effects = step(&mut module, &on(A));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG), from_zero);
+    let built = module.receiver(A, P).expect("A's receiver").clone();
+    assert_eq!(
+        (
+            built.applied_head(),
+            built.durable_seq(),
+            built.lineage(),
+            built.authority_seq()
+        ),
+        (
+            Head {
+                seq: Seq::ZERO,
+                digest: Digest::ROOT
+            },
+            DurableSeq(0),
+            new_root,
+            1
+        )
+    );
+    let mut append = delivered(label(C), taken_over(golden()).encode().expect("encode"));
+    append.node = A;
+    let effects = step(&mut module, &append);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG), from_zero);
+    assert_eq!(module.receiver(A, P), Some(&built));
+
+    // D, the shadow, is a member too (tester probe r02): at the root outside the barrier, at
+    // the cutoff inside it.
+    for (copies, seed) in [(&[1, 2][..], root_head()), (&[1, 2, 3][..], head(10))] {
+        let mut module = Replication::new();
+        let effects = step(
+            &mut module,
+            &requiring(recovered(10, d(10), takeover_config()), copies, D),
+        );
+        assert_eq!(effects.len(), 1, "{copies:?}: {effects:?}");
+        assert_eq!(
+            reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+            rejected(AppendReject::NeedPrefix {
+                have: seed.seq,
+                head_digest: seed.digest,
+            }),
+            "{copies:?}"
+        );
+        let shadow = module.receiver(D, P).expect("D's receiver");
+        assert_eq!(
+            (
+                shadow.applied_head(),
+                shadow.durable_seq(),
+                shadow.lineage()
+            ),
+            (seed, DurableSeq(seed.seq.0), new_root),
+            "{copies:?}"
+        );
+    }
+
+    // A led the old pin (tester probe r03): its primary is kept, retired, and the receiver the
+    // new pin gives it is built beside it and answers first.
+    let mut history = DigestLadder::new();
+    history.insert(Seq(10), d(10));
+    let old_primary = ProgressTracker::new(TrackerInit {
+        config: config(),
+        own: CopyId(0),
+        lineage: Lineage {
+            partition: P,
+            generation: GEN,
+            owner_epoch: EPOCH,
+        },
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(10),
+            buffered_applied: AppliedSeq(10),
+            durable: DurableSeq(10),
+        },
+    })
+    .expect("A's old primary");
+    let mut module = Replication::new();
+    module.install_primary(old_primary);
+    let kept = module.primary(A, P).cloned();
+    let effects = step(
+        &mut module,
+        &requiring(recovered(10, d(10), takeover_config()), &[0, 2], A),
+    );
+    assert_eq!(effects.len(), 2, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: Seq(10),
+            head_digest: d(10),
+        })
+    );
+    assert_eq!(effects[1], replica(ReplicaIgnoreReason::InvalidConfig));
+    // Kept, but retired (lead ruling B-R58a; M7B-172 pins what that fences): the flag is all
+    // that changed.
+    let retired = module.primary(A, P).expect("kept");
+    assert!(retired.tracker().retired());
+    assert_eq!(
+        format!("{retired:?}").replace("retired: true", "retired: false"),
+        format!("{:?}", kept.as_ref().expect("installed"))
+    );
+    let beside = module.receiver(A, P).expect("A's receiver");
+    assert_eq!(
+        (
+            beside.applied_head(),
+            beside.durable_seq(),
+            beside.lineage()
+        ),
+        (head(10), DurableSeq(10), new_root)
+    );
+
+    // C: the pin's primary.
+    let mut module = Replication::new();
+    step(&mut module, &on(C));
+    assert!(module.receiver(C, P).is_none());
+    assert!(module.primary(C, P).is_some());
+
+    // A pin for another partition, naming B, stepped for P: nothing is built anywhere.
+    let elsewhere = PartitionConfig::new(
+        PartitionId(9),
+        NEW_CONFIG,
+        vec![
+            member(1, B, ReplicaRole::RegularSecondary),
+            member(2, C, ReplicaRole::Primary),
+        ],
+    );
+    let mut module = Replication::new();
+    assert_eq!(
+        step(
+            &mut module,
+            &requiring(recovered(10, d(10), elsewhere), &[1, 2], B)
+        ),
+        [ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::NotRequired
+        ))]
+    );
+    assert_eq!(module, Replication::new());
+}
+
+// --- The frame fence (lead rulings B-R58, B-R58a) ------------------------------------------
+
+/// A sender's authority in `P`.
+fn authority(generation: Generation, epoch: OwnerEpoch) -> Lineage {
+    Lineage {
+        partition: P,
+        generation,
+        owner_epoch: epoch,
+    }
+}
+
+/// `env` in a frame from `from` on `sender`'s authority under `config`, stepped on `node`.
+fn framed_on(
+    node: NodeId,
+    from: NodeId,
+    sender: Lineage,
+    config: ConfigVersion,
+    env: &ReplicationEnvelope,
+) -> Event {
+    let mut ev = framed(label(from), sender, config, env.encode().expect("encode"));
+    ev.node = node;
+    ev
+}
+
+/// Whether any effect sends an ACK.
+fn acks(effects: &[EffectKind]) -> bool {
+    effects.iter().any(|kind| {
+        matches!(kind, EffectKind::Send(SendEffect::Unicast { frame, .. })
+            if matches!(decode_reply(&frame.body), Ok(AppendOutcome::Accepted(_))))
+    })
+}
+
+/// The lineage a reply frame carries: the receiver's own (lead ruling B-R58a, item 3).
+fn reply_sender(kind: &EffectKind) -> Lineage {
+    match kind {
+        EffectKind::Send(SendEffect::Unicast { frame, .. }) => frame.sender,
+        other => panic!("expected a reply, got {other:?}"),
+    }
+}
+
+/// M7B-166 (F4, tester probe r04). F1's result pins B primary where B held a receiver under A.
+/// The receiver is kept, as M7B-151 needs, and answers `InvalidConfig`; but once B's R1 has
+/// adopted generation 4 it is fenced, not live. A's record 11, staged before the result, still
+/// lands in storage and is never ACKed. A, fenced by that result and still on its generation-3
+/// authority, sends record 12: `StaleGeneration{4}`, no `Store`, no ACK, nothing changed, and
+/// the reply carries B's own lineage. A frame claiming generation 4 reaches nothing either, and
+/// a flush of B's generation-4 writes sends A no ACK.
+///
+/// Near-miss, on A, which the result makes a secondary under C: its receiver is the right side.
+/// From the same label, C's frame on generation 3 is `StaleGeneration{4}` and its frame on
+/// generation 4 is staged.
+#[retcd_test]
+fn m7b_166_a_node_that_adopted_a_generation_never_acks_an_older_one() {
+    use ReplicaRole::{Primary, RegularSecondary, Shadow};
+    let b_leads = pinned([RegularSecondary, Primary, RegularSecondary, Shadow]);
+    let mut module = module();
+    let staged = send(&mut module, label(A), &golden());
+    assert_eq!(staged_batch(&staged), (BatchId(0), GEN, Seq(11)));
+    let answer = step(
+        &mut module,
+        &requiring(recovered(10, d(10), b_leads), &[1], B),
+    );
+    assert_eq!(
+        answer.first(),
+        Some(&replica(ReplicaIgnoreReason::InvalidConfig))
+    );
+    assert!(module.primary(B, P).is_some());
+    assert!(rx(&module).retired());
+    assert_eq!(rx(&module).lineage().generation, NEW_GEN);
+    let stale = rejected(AppendReject::StaleGeneration { current: NEW_GEN });
+
+    let withheld = step(&mut module, &committed(0, 11));
+    assert_eq!(
+        withheld,
+        vec![ignored(KernelIgnoredReason::AppendRejected(
+            AppendReject::StaleGeneration { current: NEW_GEN }
+        ))]
+    );
+
+    let twelve = chain(12).pop().expect("seq 12");
+    let before = rx(&module).clone();
+    let zombie = send(&mut module, label(A), &twelve);
+    assert_eq!(zombie.len(), 1, "{zombie:?}");
+    assert_eq!(reply_at(&zombie[0], A, FRAME_ID, CONFIG), stale);
+    assert_eq!(reply_sender(&zombie[0]), before.lineage());
+    assert_eq!(rx(&module), &before);
+
+    let claimed = step(
+        &mut module,
+        &framed_on(
+            B,
+            A,
+            authority(NEW_GEN, NEW_EPOCH),
+            NEW_CONFIG,
+            &taken_over(twelve),
+        ),
+    );
+    assert_eq!(
+        reply_at(&claimed[0], A, FRAME_ID, CONFIG),
+        rejected(AppendReject::NotAMember)
+    );
+    assert_eq!(rx(&module), &before);
+    assert!(!acks(&step(&mut module, &flushed(&[(P, NEW_GEN, 11)]))));
+
+    // Near-miss: A's receiver, built by the result that makes C primary.
+    let mut on_a = Replication::new();
+    step(
+        &mut on_a,
+        &requiring(recovered(10, d(10), takeover_config()), &[0, 2], A),
+    );
+    let refused = step(
+        &mut on_a,
+        &framed_on(A, C, authority(GEN, EPOCH), CONFIG, &golden()),
+    );
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(reply_at(&refused[0], C, FRAME_ID, NEW_CONFIG), stale);
+    let effects = step(
+        &mut on_a,
+        &framed_on(
+            A,
+            C,
+            authority(NEW_GEN, NEW_EPOCH),
+            NEW_CONFIG,
+            &taken_over(golden()),
+        ),
+    );
+    assert_eq!(staged_batch(&effects), (BatchId(0), NEW_GEN, Seq(11)));
+}
+
+/// M7B-167 (F1). The frame's sender and the record's seal are two lineages (lead ruling
+/// B-R58a): the fence reads who is sending now, and a record may be older than its sender.
+///
+/// In one generation: B installs A1's view (epoch 6, config 8), and A, now on epoch 6 under
+/// config 8, sends record 11 it sealed at epoch 5 under 7. It is staged. The same record from a
+/// sender still on epoch 5 is `StaleEpoch{6}`, and from one still on config 7 is
+/// `StaleConfig{8}`; neither changes anything.
+///
+/// Across generations: A, a member the barrier does not name, is seeded at the root. C, on its
+/// generation-4 authority, sends records 1..=10 sealed under generation 3 at epoch 5, and A
+/// stages, applies and ACKs each; then C's own record 11.
+#[retcd_test]
+fn m7b_167_a_current_sender_delivers_records_sealed_under_an_older_lineage() {
+    let viewed = || {
+        let mut module = module();
+        assert_eq!(
+            step(&mut module, &view(1, NEW_EPOCH, NEW_CONFIG)),
+            vec![replica(ReplicaIgnoreReason::Recorded)]
+        );
+        module
+    };
+    let mut module = viewed();
+    let effects = step(
+        &mut module,
+        &framed_on(B, A, authority(GEN, NEW_EPOCH), NEW_CONFIG, &golden()),
+    );
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+    for (sender, config, want) in [
+        (
+            authority(GEN, EPOCH),
+            NEW_CONFIG,
+            AppendReject::StaleEpoch { current: NEW_EPOCH },
+        ),
+        (
+            authority(GEN, NEW_EPOCH),
+            CONFIG,
+            AppendReject::StaleConfig {
+                current: NEW_CONFIG,
+            },
+        ),
+    ] {
+        let mut module = viewed();
+        let before = rx(&module).clone();
+        let effects = step(&mut module, &framed_on(B, A, sender, config, &golden()));
+        assert_eq!(effects.len(), 1, "{effects:?}");
+        assert_eq!(
+            reply_at(&effects[0], A, FRAME_ID, NEW_CONFIG),
+            rejected(want)
+        );
+        assert_eq!(rx(&module), &before);
+    }
+
+    let mut on_a = Replication::new();
+    step(
+        &mut on_a,
+        &requiring(recovered(10, d(10), takeover_config()), &[1, 2], A),
+    );
+    let current = authority(NEW_GEN, NEW_EPOCH);
+    for (batch, env) in (0..).zip(chain(10)) {
+        let seq = env.header.seq;
+        let effects = step(&mut on_a, &framed_on(A, C, current, NEW_CONFIG, &env));
+        assert_eq!(staged_batch(&effects), (BatchId(batch), NEW_GEN, seq));
+        let mut done = committed(batch, seq.0);
+        done.node = A;
+        let acked = step(&mut on_a, &done);
+        assert_eq!(acked.len(), 1, "{acked:?}");
+        let AppendOutcome::Accepted(ack) = reply_at(&acked[0], C, FRAME_ID, NEW_CONFIG) else {
+            panic!("expected an ACK at {seq:?}, got {acked:?}");
+        };
+        assert_eq!(ack.progress.buffered_applied, AppliedSeq(seq.0));
+    }
+    let effects = step(
+        &mut on_a,
+        &framed_on(A, C, current, NEW_CONFIG, &taken_over(golden())),
+    );
+    assert_eq!(staged_batch(&effects), (BatchId(10), NEW_GEN, Seq(11)));
+}
+
+/// M7B-168. The frame fence runs before any record check, and a frame whose sender is not the
+/// current primary is refused on the sender alone, carrying a record B would otherwise take:
+/// another partition, an older or newer generation, an older or newer epoch, an older or newer
+/// configuration, or a label that is not the pinned primary. Each answers its row's reason
+/// against B's current value and changes nothing. The control, the same record from A on the
+/// current authority, is staged.
+#[retcd_test]
+fn m7b_168_a_frame_whose_sender_is_not_the_current_primary_is_refused() {
+    use AppendReject as R;
+    let current = authority(GEN, EPOCH);
+    let cases = [
+        (
+            Lineage {
+                partition: PartitionId(9),
+                ..current
+            },
+            CONFIG,
+            A,
+            R::WrongPartition,
+        ),
+        (
+            authority(Generation(2), EPOCH),
+            CONFIG,
+            A,
+            R::StaleGeneration { current: GEN },
+        ),
+        (
+            authority(NEW_GEN, EPOCH),
+            CONFIG,
+            A,
+            R::NeedLineage { current: GEN },
+        ),
+        (
+            authority(GEN, OwnerEpoch(4)),
+            CONFIG,
+            A,
+            R::StaleEpoch { current: EPOCH },
+        ),
+        (
+            authority(GEN, NEW_EPOCH),
+            CONFIG,
+            A,
+            R::UnknownEpoch { current: EPOCH },
+        ),
+        (
+            current,
+            ConfigVersion(6),
+            A,
+            R::StaleConfig { current: CONFIG },
+        ),
+        (current, NEW_CONFIG, A, R::NeedConfig { current: CONFIG }),
+        (current, CONFIG, C, R::NotAMember),
+    ];
+    for (sender, config, from, want) in cases {
+        let mut module = module();
+        let before = rx(&module).clone();
+        let effects = step(&mut module, &framed_on(B, from, sender, config, &golden()));
+        assert_eq!(effects.len(), 1, "{want:?}: {effects:?}");
+        assert_eq!(
+            reply_at(&effects[0], from, FRAME_ID, CONFIG),
+            rejected(want),
+            "{sender:?} under {config:?} from {from:?}"
+        );
+        assert_eq!(rx(&module), &before, "{want:?}");
+    }
+    let effects = step(&mut module(), &framed_on(B, A, current, CONFIG, &golden()));
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+}
+
+/// M7B-169. After the fence, rows 5 and 6 read the record against its sender: a record may be
+/// sealed at or below the sender's lineage, never above it. From A on the current authority, a
+/// record sealed at epoch 6 is `UnknownEpoch{5}`, one sealed under config 8 is `NeedConfig{7}`,
+/// and one sealed under generation 4 is row 4's `NeedLineage{3}`. None changes anything.
+#[retcd_test]
+fn m7b_169_a_record_sealed_above_its_senders_lineage_is_refused() {
+    use AppendReject as R;
+    for (env, want) in [
+        (
+            under(golden(), GEN, NEW_EPOCH, CONFIG),
+            R::UnknownEpoch { current: EPOCH },
+        ),
+        (
+            under(golden(), GEN, EPOCH, NEW_CONFIG),
+            R::NeedConfig { current: CONFIG },
+        ),
+        (
+            under(golden(), NEW_GEN, EPOCH, CONFIG),
+            R::NeedLineage { current: GEN },
+        ),
+    ] {
+        let mut module = module();
+        let before = rx(&module).clone();
+        let effects = step(
+            &mut module,
+            &framed_on(B, A, authority(GEN, EPOCH), CONFIG, &env),
+        );
+        assert_eq!(effects.len(), 1, "{want:?}: {effects:?}");
+        assert_eq!(reply_at(&effects[0], A, FRAME_ID, CONFIG), rejected(want));
+        assert_eq!(rx(&module), &before, "{want:?}");
+    }
+}
+
+/// M7B-170 (lead ruling B-R59's constraint on B-R58a). A `RecoveryAppend` meets the credential,
+/// not the pinned-primary check: its frame carries the credential's lineage, and C, a regular
+/// copy the credential names, passes the frame fence and is staged. The same frame with a
+/// credential for an older epoch is `StaleFence`, and one whose frame names an older generation
+/// is `StaleGeneration`; neither changes anything.
+#[retcd_test]
+fn m7b_170_a_credentialed_recovery_append_passes_the_frame_fence_from_a_non_primary() {
+    let credential = |epoch| fence(2, epoch, Revision(0));
+    let from_c = |credential: FenceCredential, generation| {
+        framed(
+            label(C),
+            Lineage {
+                partition: credential.partition,
+                generation,
+                owner_epoch: credential.prior_owner_epoch,
+            },
+            CONFIG,
+            recovery_body(&credential, &golden()),
+        )
+    };
+    let effects = step(&mut module(), &from_c(credential(EPOCH), GEN));
+    assert_eq!(staged_batch(&effects), (BatchId(0), GEN, Seq(11)));
+    for (ev, want) in [
+        (
+            from_c(credential(OwnerEpoch(4)), GEN),
+            AppendReject::StaleFence,
+        ),
+        (
+            from_c(credential(EPOCH), Generation(2)),
+            AppendReject::StaleGeneration { current: GEN },
+        ),
+    ] {
+        let mut module = module();
+        let before = rx(&module).clone();
+        let effects = step(&mut module, &ev);
+        assert_eq!(effects.len(), 1, "{want:?}: {effects:?}");
+        assert_eq!(reply_at(&effects[0], C, FRAME_ID, CONFIG), rejected(want));
+        assert_eq!(rx(&module), &before, "{want:?}");
+    }
 }

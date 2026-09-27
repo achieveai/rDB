@@ -1,11 +1,12 @@
 //! The receiver's completion events (design §3.3): storage answering a staged batch or a flush,
-//! and control announcing a committed recovery.
+//! control announcing a committed recovery, and A1 publishing a newer view.
 //!
 //! Each `on_*` returns `None` when the event is not this receiver's — a batch it never staged,
 //! a flush that names none of its prefixes — so the module declines it rather than inventing
 //! an answer. A quarantined receiver still mirrors what storage did, but sends no ACK: its
 //! progress is evidence, never qualification.
 
+use crate::contracts::authority::AuthorityView;
 use crate::contracts::envelope::{AppendOutcome, AppendReject};
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::event::EffectKind;
@@ -13,7 +14,7 @@ use crate::contracts::ids::{BatchId, DurableSeq, MessageId, NodeId, ReceivedSeq,
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::recovery::RecoveryResult;
 use crate::contracts::storage::DurablePrefix;
-use crate::replication::progress::{proved_durable, DigestLookup};
+use crate::replication::progress::{proved_durable, view_refusal, DigestLookup, HeldView};
 
 use super::{ignored, quarantine_alert, AppendReceiver, Head, HistoryRoot, UNSOLICITED};
 
@@ -70,16 +71,31 @@ impl AppendReceiver {
     /// quarantines and moves no head. Otherwise the copy re-anchors on the highest rung it holds
     /// at or below the cutoff — the cutoff pair itself on `Match`, its own older head when it is
     /// behind — and asks the new primary for everything after it.
+    ///
+    /// A pin for another partition, or one naming no primary, is refused and changes nothing.
+    /// A pin that names this copy no serving member on this node — the r04 swap makes it the
+    /// primary, or drops it — retires it (lead ruling B-R58a, F4): it adopts the new generation,
+    /// so the frame fence refuses the old primary's frames `StaleGeneration`, and it sends no
+    /// ACK, not even for a batch already staged. Only a later `Recovered` that pins it a serving
+    /// member clears that.
     pub fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<EffectKind> {
         let config = &result.committed.pinned_config;
+        let invalid = || {
+            vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::InvalidConfig,
+            ))]
+        };
+        let primary = config.primary().map(|p| p.node);
+        let (Some(primary), true) = (primary, config.partition == self.lineage.partition) else {
+            return invalid();
+        };
         let own = config
             .member(self.own.copy)
-            .filter(|_| config.partition == self.lineage.partition)
             .filter(|own| own.node == self.own.node && own.role != ReplicaRole::Primary);
-        let (Some(own), Some(primary)) = (own.copied(), config.primary().map(|p| p.node)) else {
-            return vec![ignored(KernelIgnoredReason::Replica(
-                ReplicaIgnoreReason::InvalidConfig,
-            ))];
+        let Some(own) = own.copied() else {
+            self.lineage.generation = result.new_generation;
+            self.retired = true;
+            return invalid();
         };
         let selected = &result.selected;
         let anchor = match self
@@ -100,9 +116,11 @@ impl AppendReceiver {
         };
         // The rows every arm adopts.
         self.own = own;
-        self.config = config.clone();
+        self.retired = false;
         self.lineage.generation = result.new_generation;
-        self.lineage.owner_epoch = result.committed.authority_view.lineage.owner_epoch;
+        self.adopt_view(&result.committed.authority_view);
+        // The pinned configuration is the whole membership; the view carries only its version.
+        self.config = config.clone();
         self.root = HistoryRoot {
             floor: selected.cutoff_seq,
             base_digest: selected.cutoff_digest,
@@ -126,11 +144,53 @@ impl AppendReceiver {
         vec![self.send(primary, UNSOLICITED, outcome)]
     }
 
-    /// The current ACK to `to`, or — from a quarantined copy — a named refusal to send one.
+    /// A1's `View` (design §2.2, lead ruling B-R53): the only door, besides `Recovered`, by which
+    /// a receiver learns a newer owner epoch or configuration version. An append never opens it:
+    /// row 5 still answers a higher epoch `UnknownEpoch` and learns nothing.
+    ///
+    /// Installs the view when [`view_refusal`] passes it and answers `Recorded`; otherwise
+    /// answers the refusal and changes nothing. A quarantined copy still installs: quarantine
+    /// withholds its evidence, not what control tells it.
+    pub fn on_view(&mut self, view: &AuthorityView) -> Vec<EffectKind> {
+        let held = HeldView {
+            lineage: self.lineage,
+            config_version: self.config.config_version,
+            authority_seq: self.authority_seq,
+        };
+        if let Some(reason) = view_refusal(&held, view) {
+            return vec![ignored(KernelIgnoredReason::Replica(reason))];
+        }
+        self.adopt_view(view);
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::Recorded,
+        ))]
+    }
+
+    /// Take a view's epoch, configuration version and `authority_seq`: the one write both
+    /// `View` and `Recovered` make. The generation is the caller's, because a recovered view
+    /// names the root it recovered from, not the generation it starts.
+    ///
+    /// Only the version moves, not the members: a receiver learns members from `Recovered`
+    /// alone. Within one generation the primary does not change, so row 6's sender half holds.
+    fn adopt_view(&mut self, view: &AuthorityView) {
+        self.lineage.owner_epoch = view.lineage.owner_epoch;
+        self.config.config_version = view.config_version;
+        self.authority_seq = view.authority_seq;
+    }
+
+    /// The current ACK to `to`, or — from a quarantined or retired copy — a named refusal to
+    /// send one. A retired copy names the generation it adopted (lead ruling B-R58a, F4).
     fn ack_or_withhold(&self, to: NodeId, request: MessageId) -> EffectKind {
         if self.quarantine.is_some() {
             return ignored(KernelIgnoredReason::AppendRejected(
                 AppendReject::Quarantined,
+            ));
+        }
+        if self.retired {
+            return ignored(KernelIgnoredReason::AppendRejected(
+                AppendReject::StaleGeneration {
+                    current: self.lineage.generation,
+                },
             ));
         }
         self.send(to, request, AppendOutcome::Accepted(self.current_ack()))

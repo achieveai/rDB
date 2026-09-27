@@ -180,12 +180,23 @@ where
             }
 
             steps += 1;
-            let Some((tuple, faults)) = run(&candidate) else {
+            let outcome = run(&candidate);
+            // Q-39's trajectory line. `checker`/`rule` are the candidate's own, `none` when it
+            // ran clean or did not run, so a run of rejections says why it was rejected.
+            let accepted = matches!(&outcome, Some((tuple, _)) if *tuple == target);
+            tracing::info!(
+                step = steps,
+                ops_before = best.len(),
+                ops_after = candidate.len(),
+                accepted,
+                checker = outcome.as_ref().map_or("none", |(tuple, _)| tuple.checker),
+                rule = outcome.as_ref().map_or("none", |(tuple, _)| tuple.rule),
+                faults = ?outcome.as_ref().map(|(_, faults)| faults),
+                "shrink_step"
+            );
+            let Some((_, faults)) = outcome.filter(|_| accepted) else {
                 continue;
             };
-            if tuple != target {
-                continue;
-            }
             best = candidate;
             faults_after = faults;
             granularity = 2.max(granularity - 1);
@@ -200,6 +211,20 @@ where
             granularity = (granularity * 2).min(best.len());
         }
     }
+
+    // Q-39's result line: `slipped` is computed here from the same two sets the line carries,
+    // so a reader can check `slipped == (faults_before != faults_after)` on the line itself.
+    tracing::info!(
+        signature_slug = %target.slug(),
+        ops_before = scenario.ops.len(),
+        ops_after = best.len(),
+        slipped = faults_before != faults_after,
+        faults_before = ?faults_before,
+        faults_after = ?faults_after,
+        budget_spent = budget_spent.map_or("none", BudgetSpent::name),
+        steps,
+        "shrink_result"
+    );
 
     Reduction {
         minimized: Scenario {

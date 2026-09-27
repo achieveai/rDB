@@ -18,7 +18,9 @@
 //! ```
 //!
 //! Nothing before commit waits forever (ruling F-a): Synchronizing and Barrier block with
-//! `BarrierIncomplete` on a lost required copy or when their deadline passes.
+//! `BarrierIncomplete` on a lost required copy or when their deadline passes. Nor does a rebuild
+//! after it (ruling B-R52): each `SyncWalThrough` arms the timer, and a sync unanswered at its
+//! deadline names its copy in `RebuildStalled` without leaving `Rebuilding`.
 //!
 //! `Idle` leaves only on a `FencingProof` (§2.1). After commit, `select_prefix` is unreachable:
 //! a returning stale owner is quarantined without its length ever being read (§5.7).
@@ -68,7 +70,8 @@ use rebuild::{Rebuild, Refused};
 pub const RECOVERY_TIMER_BASE: u64 = 0x00F1_0000;
 
 /// The discovery-window deadline, reused as the probe-wait deadline once the window closes, and
-/// then as the deadline on synchronising and the barrier after selection (ruling F-a).
+/// then as the deadline on synchronising and the barrier after selection (ruling F-a), and on each
+/// rebuild sync after commit (ruling B-R52).
 pub const DISCOVERY_TIMER: TimerId = TimerId(RECOVERY_TIMER_BASE);
 
 /// The partition mode for a count of eligible regular copies holding the barrier
@@ -305,7 +308,7 @@ impl Recovery {
             Phase::Proposing(decided, barrier, cas) => {
                 Self::proposing(decided, barrier, cas, input, &mut emit)
             }
-            Phase::Committed(committed) => Self::committed(committed, input, &mut emit),
+            Phase::Committed(committed) => self.committed(ctx, committed, input, &mut emit),
         };
         emit.finish()
     }
@@ -627,7 +630,16 @@ impl Recovery {
         }
     }
 
-    fn committed(mut committed: Box<Committed>, input: Input<'_>, emit: &mut Emit<'_>) -> Phase {
+    /// After commit: a returning stale owner, the activation CAS in flight, or the rebuild. Each
+    /// sync the rebuild emits is bounded by the next timer version (ruling B-R52): at its deadline
+    /// the copies that have not proved the point are named, and the rebuild waits on.
+    fn committed(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        mut committed: Box<Committed>,
+        input: Input<'_>,
+        emit: &mut Emit<'_>,
+    ) -> Phase {
         if let Input::Recovery(RecoveryEvent::StaleOwnerReturned(inv)) = input {
             stale_owner(&committed, inv.copy, emit);
             return Phase::Committed(committed);
@@ -657,6 +669,9 @@ impl Recovery {
                     for copy in copies {
                         emit.recovery(RecoveryEffect::SyncWalThrough { copy, cutoff });
                     }
+                    let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
+                    self.arm(deadline, emit);
+                    rebuild.wait_until(deadline);
                 }),
             Input::Recovery(RecoveryEvent::DurableAt(proof)) => {
                 rebuild.durable(*proof).map(|barrier| {
@@ -671,6 +686,21 @@ impl Recovery {
                 .copy_lost(copy)
                 .map(|()| emit.recovery(RecoveryEffect::RebuildStalled { copy }))
                 .map_err(Refused::from),
+            Input::Timer(fired)
+                if rebuild
+                    .deadline()
+                    .is_some_and(|deadline| self.due(ctx, fired, deadline)) =>
+            {
+                let stalled = rebuild.stall();
+                if stalled.is_empty() {
+                    // Every unproven copy was lost, and `CopyLost` already named it.
+                    emit.ignored(ReplicaIgnoreReason::StaleTimer);
+                }
+                for copy in stalled {
+                    emit.recovery(RecoveryEffect::RebuildStalled { copy });
+                }
+                Ok(())
+            }
             _ => {
                 ignore_elsewhere(input, emit);
                 Ok(())

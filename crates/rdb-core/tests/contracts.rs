@@ -28,7 +28,10 @@ use rdb_core::contracts::ids::{
 };
 use rdb_core::contracts::storage::{Namespace, Write};
 use rdb_core::contracts::trace::BudgetName;
-use rdb_core::contracts::txn::{Condition, ConditionOutcome, Mutation, Outcome, TxnRequest};
+use rdb_core::contracts::txn::{
+    key_scope, scoped_key, Condition, ConditionOutcome, Mutation, Outcome, TxnRequest,
+    KEY_SCOPE_LEN,
+};
 use rdb_core::contracts::version::{VersionedArtifact, API_VERSION, ENVELOPE_VERSION};
 
 // ---------------------------------------------------------------------------------------------
@@ -870,4 +873,46 @@ fn budget_name_covers_every_budgets_field() {
     }
 
     tracing::info!(members = BudgetName::ALL.len(), "budget name coverage");
+}
+
+/// ADR-rdb-0004 §2: C0 owns the key-scope encoding and supplies one known-answer vector. The
+/// literal bytes are the contract; a byte-order or width change fails here before it reaches a
+/// stored key.
+#[retcd_test]
+fn scoped_key_known_answer_vector() {
+    let key = scoped_key(TenantId(1), AffinityId(2), b"k");
+    assert_eq!(
+        key.as_ref(),
+        &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, b'k'][..],
+        "tenant u32 BE, then affinity u64 BE, then the user key"
+    );
+    assert_eq!(key_scope(&key), Some((TenantId(1), AffinityId(2))));
+
+    // A key of exactly the prefix width has a scope and an empty user key; one byte shorter has
+    // no scope at all.
+    let bare = scoped_key(TenantId(u32::MAX), AffinityId(u64::MAX), b"");
+    assert_eq!(bare.len(), KEY_SCOPE_LEN);
+    assert_eq!(
+        key_scope(&bare),
+        Some((TenantId(u32::MAX), AffinityId(u64::MAX)))
+    );
+    assert_eq!(key_scope(&bare[..KEY_SCOPE_LEN - 1]), None);
+
+    tracing::info!(len = key.len(), "key scope vector");
+}
+
+/// `KernelEvent` doc: the largest unboxed variant is 112 bytes, and the big payloads are boxed so
+/// that a timer firing does not pay for a recovery. Nothing enforced that until A-R63 added three
+/// cross-kernel carriers, so this pins it: a new unboxed payload that grows every `Event` fails
+/// here instead of silently.
+#[retcd_test]
+fn kernel_event_stays_within_its_size_budget() {
+    use rdb_core::contracts::event::{KernelEffect, KernelEvent};
+    let event = std::mem::size_of::<KernelEvent>();
+    let effect = std::mem::size_of::<KernelEffect>();
+    tracing::info!(event, effect, "kernel carrier sizes");
+    // 112 is the largest unboxed `KernelEvent` payload; 128 is `AuthorityEffect`, which set
+    // `KernelEffect`'s size before A-R63 and still does.
+    assert!(event <= 112, "KernelEvent grew to {event} bytes");
+    assert!(effect <= 128, "KernelEffect grew to {effect} bytes");
 }

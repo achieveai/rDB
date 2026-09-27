@@ -21,6 +21,17 @@
 //!
 //! Row 8 asks the three-valued [`DigestLadder::lookup`]. A digest we never kept answers
 //! [`DigestLookup::NotRetained`], which probes and **never quarantines** (charter DO-NOT).
+//!
+//! # The frame fence runs first
+//!
+//! A frame is judged by who sent it before any record in it is read (lead ruling B-R58a). The
+//! fence reads [`Frame::sender`] and [`Frame::config`] in order: partition; a sender generation
+//! below the adopted one is `StaleGeneration`, and a copy a pin retired fences every frame and
+//! withholds every ACK (F4); sender epoch; config version; and for `RDBE`, the sender must be the
+//! pinned primary. An `RDBF` frame's sender is its credential's lineage, and the credential's
+//! 5R/6R/6R' checks stand in for the pinned-primary check (B-R59). Only then do the record rows
+//! run: row 4 plus the historical rule, then rows 5 and 6 as "at or below the frame's sender"
+//! (F1). Row 8 still decides records at or below the floor.
 
 mod complete;
 
@@ -129,6 +140,12 @@ pub struct AppendReceiver {
     next_batch: BatchId,
     root: HistoryRoot,
     last_partition_revision: Revision,
+    /// The `authority_seq` of the newest A1 view installed (design §2.2); 0 before any.
+    authority_seq: u64,
+    /// A `Recovered` moved this copy off the side it serves (lead ruling B-R58a, F4): the
+    /// generation is adopted, every frame is fenced and no ACK leaves, until a `Recovered` pins
+    /// this copy a serving member again.
+    retired: bool,
 }
 
 /// What the ladder decided. Only `Accept` and `Quarantine` write state.
@@ -187,6 +204,8 @@ impl AppendReceiver {
                 predecessor: None,
             },
             last_partition_revision: Revision(0),
+            authority_seq: 0,
+            retired: false,
         })
     }
 
@@ -262,6 +281,19 @@ impl AppendReceiver {
         self.lineage
     }
 
+    /// The `authority_seq` of the newest A1 view installed; 0 before any.
+    #[must_use]
+    pub const fn authority_seq(&self) -> u64 {
+        self.authority_seq
+    }
+
+    /// Whether a `Recovered` retired this copy: its pin names it no serving member on this node
+    /// (lead ruling B-R58a, F4). A retired copy refuses every frame and sends no ACK.
+    #[must_use]
+    pub const fn retired(&self) -> bool {
+        self.retired
+    }
+
     /// The membership pinned.
     #[must_use]
     pub const fn config(&self) -> &PartitionConfig {
@@ -294,46 +326,32 @@ impl AppendReceiver {
         }
     }
 
-    /// One `Append` frame body from `from`: run the ladder, apply its verdict, return effects.
+    /// One `Append` frame from `from`: run the ladder, apply its verdict, return effects.
     ///
-    /// `request` is the frame's message id; every reply reuses it as the correlation.
-    pub fn on_append(
-        &mut self,
-        from: &PeerLabel,
-        request: MessageId,
-        body: &Bytes,
-    ) -> Vec<EffectKind> {
-        self.receive(from, request, body, false)
+    /// The frame's message id is the correlation every reply reuses; its `sender` and `config`
+    /// are what the frame fence reads (lead ruling B-R58a).
+    pub fn on_append(&mut self, from: &PeerLabel, frame: &Frame) -> Vec<EffectKind> {
+        self.receive(from, frame, false)
     }
 
-    /// One `RecoveryAppend` frame body (design §3.2a): the §3.2 ladder with rows 5 and 6
-    /// replaced by the fence rows 5R, 6R and 6R′.
-    pub fn on_recovery_append(
-        &mut self,
-        from: &PeerLabel,
-        request: MessageId,
-        body: &Bytes,
-    ) -> Vec<EffectKind> {
-        self.receive(from, request, body, true)
+    /// One `RecoveryAppend` frame (design §3.2a): the §3.2 ladder with the sender's epoch,
+    /// configuration and primacy replaced by the fence rows 5R, 6R and 6R′.
+    pub fn on_recovery_append(&mut self, from: &PeerLabel, frame: &Frame) -> Vec<EffectKind> {
+        self.receive(from, frame, true)
     }
 
     /// Both append kinds. An unauthenticated label is refused before row 0 and answered with
     /// `Ignored`, never with a `Send`: a reply to an unverified label is an oracle for whoever
     /// forged it.
-    fn receive(
-        &mut self,
-        from: &PeerLabel,
-        request: MessageId,
-        body: &Bytes,
-        recovery: bool,
-    ) -> Vec<EffectKind> {
+    fn receive(&mut self, from: &PeerLabel, frame: &Frame, recovery: bool) -> Vec<EffectKind> {
         if !from.authenticated {
             return vec![ignored(KernelIgnoredReason::AppendRejected(
                 AppendReject::Unauthenticated,
             ))];
         }
+        let request = frame.id;
         let reply = |outcome| self.send(from.node, request, outcome);
-        match self.validate(from, body, recovery) {
+        match self.validate(from, frame, recovery) {
             Verdict::Reply(outcome) => vec![reply(outcome)],
             Verdict::Duplicate => vec![
                 reply(AppendOutcome::AlreadyHave),
@@ -351,24 +369,28 @@ impl AppendReceiver {
         }
     }
 
-    /// Rows 0–8 of design §3.2 (and §3.2a for a recovery append), in order. Reads state,
-    /// never writes it.
-    fn validate(&self, from: &PeerLabel, body: &Bytes, recovery: bool) -> Verdict {
+    /// Rows 0–8 of design §3.2 (and §3.2a for a recovery append), in order, with the frame
+    /// fence between the wrapper and the envelope (lead ruling B-R58a). Reads state, never
+    /// writes it.
+    fn validate(&self, from: &PeerLabel, frame: &Frame, recovery: bool) -> Verdict {
         let refuse = |reject| Verdict::Reply(AppendOutcome::Rejected(reject));
         // Row 0.
         if self.quarantine.is_some() {
             return refuse(AppendReject::Quarantined);
         }
-        // Row 1, for the recovery wrapper and then for the envelope: each is read and
-        // version-checked before anything after it is touched.
+        // Row 1 for the recovery wrapper: read and version-checked before anything it carries.
         let (fence, body) = if recovery {
-            match decode_recovery_append(body) {
+            match decode_recovery_append(&frame.body) {
                 Ok((fence, envelope)) => (Some(fence), envelope),
                 Err(error) => return decode_failure(&error),
             }
         } else {
-            (None, body.clone())
+            (None, frame.body.clone())
         };
+        if let Some(reject) = self.frame_fence(from, frame, fence.as_ref()) {
+            return refuse(reject);
+        }
+        // Row 1 for the envelope.
         let header = match ReplicationEnvelope::decode_header(&body) {
             Ok(header) => header,
             Err(error) => return decode_failure(&error),
@@ -388,20 +410,17 @@ impl AppendReceiver {
         if !well_formed(&envelope) {
             return Verdict::Malformed(ErrorKind::InvalidArgument);
         }
-        // Row 3, for the envelope and for the credential it travels under.
-        let partition = self.lineage.partition;
-        if header.partition != partition || fence.is_some_and(|f| f.partition != partition) {
+        // Row 3 for the envelope; the fence checked the frame and the credential.
+        if header.partition != self.lineage.partition {
             return refuse(AppendReject::WrongPartition);
         }
-        // Rows 4-6 (or 4, 5R, 6R). A historical record skips them; the sender check never is.
+        // Rows 4-6 on the record. A historical record skips them; the fence never is.
         let historical = self.is_historical(&header);
         if !historical {
-            if let Some(reject) = self.lineage_rows(&header, fence.as_ref()) {
+            let sender = fence.is_none().then_some(frame);
+            if let Some(reject) = self.record_rows(&header, sender) {
                 return refuse(reject);
             }
-        }
-        if !self.sender_admitted(from, fence.as_ref()) {
-            return refuse(AppendReject::NotAMember);
         }
         // Row 7: the digest must be self-consistent before row 8 compares it with anything.
         match envelope.compute_record_digest() {
@@ -418,14 +437,67 @@ impl AppendReceiver {
         header.seq <= self.root.floor && Some(header.generation) == self.root.predecessor
     }
 
-    /// Row 4, then rows 5 and 6's `config_version` half — or, under a fence, rows 5R and 6R.
+    /// The frame fence (lead ruling B-R58a), on the lineage the sender holds as it sends — never
+    /// on the lineage a record inside was sealed under. Row 3 for the frame and the credential;
+    /// the generation; a retired copy (F4); then, for an append, the epoch, the configuration
+    /// and the pinned primary, or, under a credential, rows 5R, 6R and 6R′ (lead ruling B-R59:
+    /// a recovery append comes from the credential's copy, which need not be the primary).
     /// A newer value is never learned from the data path: generations, epochs and
     /// configurations are installed through control.
-    fn lineage_rows(
+    fn frame_fence(
         &self,
-        header: &EnvelopeHeader,
+        from: &PeerLabel,
+        frame: &Frame,
         fence: Option<&FenceCredential>,
     ) -> Option<AppendReject> {
+        use core::cmp::Ordering::{Equal, Greater, Less};
+        let sender = frame.sender;
+        let partition = self.lineage.partition;
+        if sender.partition != partition || fence.is_some_and(|f| f.partition != partition) {
+            return Some(AppendReject::WrongPartition);
+        }
+        // Under a credential, `sender` is the credential's lineage, so a recovery append passes
+        // only when that generation equals the one this receiver adopted: F1 issues the
+        // credential for the generation the receiver adopted at recovery (lead ruling on the
+        // B-R58 assumptions, item 1).
+        let current = self.lineage.generation;
+        match sender.generation.cmp(&current) {
+            Less => return Some(AppendReject::StaleGeneration { current }),
+            Greater => return Some(AppendReject::NeedLineage { current }),
+            Equal => {}
+        }
+        if self.retired {
+            return Some(AppendReject::NotAMember);
+        }
+        if let Some(fence) = fence {
+            // 5R is the epoch alone (K-B-35); 6R the monotone control revision.
+            let overtaken = fence.prior_owner_epoch != self.lineage.owner_epoch
+                || fence.control_revision < self.last_partition_revision;
+            if overtaken {
+                return Some(AppendReject::StaleFence);
+            }
+            return (!self.sender_admitted(from, Some(fence))).then_some(AppendReject::NotAMember);
+        }
+        let current = self.lineage.owner_epoch;
+        match sender.owner_epoch.cmp(&current) {
+            Less => return Some(AppendReject::StaleEpoch { current }),
+            Greater => return Some(AppendReject::UnknownEpoch { current }),
+            Equal => {}
+        }
+        let current = self.config.config_version;
+        match frame.config.cmp(&current) {
+            Less => return Some(AppendReject::StaleConfig { current }),
+            Greater => return Some(AppendReject::NeedConfig { current }),
+            Equal => {}
+        }
+        (!self.sender_admitted(from, None)).then_some(AppendReject::NotAMember)
+    }
+
+    /// Row 4 on the record, then — for an append, whose `sender` is the frame the fence passed
+    /// — rows 5 and 6 as "sealed at or below its sender" (lead ruling B-R58a): a record sealed
+    /// under an older epoch or configuration than the frame's is the current primary's to
+    /// deliver; one sealed above it is not. A recovery append's record keeps row 4 alone.
+    fn record_rows(&self, header: &EnvelopeHeader, sender: Option<&Frame>) -> Option<AppendReject> {
         use core::cmp::Ordering::{Equal, Greater, Less};
         let current = self.lineage.generation;
         match header.generation.cmp(&current) {
@@ -433,24 +505,15 @@ impl AppendReceiver {
             Greater => return Some(AppendReject::NeedLineage { current }),
             Equal => {}
         }
-        if let Some(fence) = fence {
-            // 5R is the epoch alone (K-B-35); 6R the monotone control revision.
-            let overtaken = fence.prior_owner_epoch != self.lineage.owner_epoch
-                || fence.control_revision < self.last_partition_revision;
-            return overtaken.then_some(AppendReject::StaleFence);
+        let frame = sender?;
+        if header.owner_epoch > frame.sender.owner_epoch {
+            return Some(AppendReject::UnknownEpoch {
+                current: self.lineage.owner_epoch,
+            });
         }
-        let current = self.lineage.owner_epoch;
-        match header.owner_epoch.cmp(&current) {
-            Less => return Some(AppendReject::StaleEpoch { current }),
-            Greater => return Some(AppendReject::UnknownEpoch { current }),
-            Equal => {}
-        }
-        let current = self.config.config_version;
-        match header.config_version.cmp(&current) {
-            Less => Some(AppendReject::StaleConfig { current }),
-            Greater => Some(AppendReject::NeedConfig { current }),
-            Equal => None,
-        }
+        (header.config_version > frame.config).then_some(AppendReject::NeedConfig {
+            current: self.config.config_version,
+        })
     }
 
     /// Row 6's sender half: the authenticated peer is the pinned primary. Under a fence, row
@@ -574,6 +637,7 @@ impl AppendReceiver {
                 id: request,
                 protocol: ENVELOPE_VERSION,
                 config: self.config.config_version,
+                sender: self.lineage,
                 body: encode_reply(&outcome),
             },
         })

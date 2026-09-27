@@ -14,10 +14,11 @@
 //!    and the kernel must refuse it through the ordinary typed-watermark rule, not a test-only branch.
 
 pub mod crash_image;
+pub mod history;
 pub mod memory;
 pub mod snapshot;
 
-use rdb_core::contracts::ids::{AppliedSeq, NodeId};
+use rdb_core::contracts::ids::{AppliedSeq, Generation, NodeId, PartitionId, Seq};
 use rdb_core::contracts::storage::StorageFault;
 
 /// An injectable storage fault, as a scenario writes it.
@@ -76,6 +77,62 @@ pub enum StorageOp {
         /// The highest sequence the flush will actually sync.
         through: AppliedSeq,
     },
+    /// A **stalled flush** (lead ruling L-R177do): the device stops completing syncs. An
+    /// `fsync` that hangs on a wedged disk or a saturated I/O queue neither succeeds nor fails;
+    /// it simply never returns.
+    ///
+    /// Not taken by one sync: while it is planned, **every** sync on `node` stalls. The engine
+    /// syncs nothing, no durable watermark moves, and the capture is held in
+    /// [`self::memory::MemoryEngine::stalled_syncs`] for the oracle. A caller asks
+    /// [`self::memory::MemoryEngine::stalled_sync`] before it syncs. The harness then schedules
+    /// no completion for a stalled flush — neither `Flushed` nor `FlushFailed` — and refuses a
+    /// stalled `SyncWalThrough` by name, because no withheld reason says "stalled" yet. Nothing
+    /// releases it inside a run; a crash image does not carry it, so a restarted engine syncs
+    /// again. Sim-only; no kernel path plans or sees it.
+    StallFlush {
+        /// The engine.
+        node: NodeId,
+    },
+    /// A **lost write** (lead ruling B-R58d): a record the engine accepted, and a sync reported
+    /// durable, is not there when it is read back.
+    ///
+    /// Taken by the first sync on `node` at which `generation` of `partition` shows a `History`
+    /// record at `seq`. The engine commits a delete of that record into the lineage the read
+    /// resolves to, and [`self::memory::MemoryEngine::history_at`] takes a later delete as final,
+    /// so every later read, and a crash image, sees nothing there. The sync itself succeeds and
+    /// its durable prefix is unchanged: nothing reports the loss. Sim-only; no kernel path
+    /// plans or sees it.
+    LoseRecord {
+        /// The engine.
+        node: NodeId,
+        /// The partition.
+        partition: PartitionId,
+        /// The generation whose read loses the record.
+        generation: Generation,
+        /// The record's sequence.
+        seq: Seq,
+    },
+    /// A **misdirected write** (lead ruling B-R58d): the record `from` holds at `seq` is written
+    /// into the slot lineage `to` reads at the same sequence, shadowing the record `to` held
+    /// there.
+    ///
+    /// Taken by the first sync on `node` at which `from` shows a `History` record at `seq` and
+    /// `to` is applied through `seq`, so `to`'s own write never lands over it afterwards. The
+    /// batch lands whole — `from`'s record and the `Progress` value committed beside it — so it
+    /// passes its own check ([`self::history::verified_record`]) while being another lineage's
+    /// record. Sim-only; no kernel path plans or sees it.
+    MisfileRecord {
+        /// The engine.
+        node: NodeId,
+        /// The partition.
+        partition: PartitionId,
+        /// The lineage the record belongs to.
+        from: Generation,
+        /// The lineage it is written into. Must differ from `from`.
+        to: Generation,
+        /// The record's sequence.
+        seq: Seq,
+    },
 }
 
 impl StorageOp {
@@ -86,7 +143,10 @@ impl StorageOp {
             Self::Fail { node, .. }
             | Self::Crash { node, .. }
             | Self::FalseDurable { node, .. }
-            | Self::ShortFlush { node, .. } => node,
+            | Self::ShortFlush { node, .. }
+            | Self::StallFlush { node }
+            | Self::LoseRecord { node, .. }
+            | Self::MisfileRecord { node, .. } => node,
         }
     }
 }

@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::contracts::authority::{BlockReason, Lineage};
+use crate::contracts::authority::{AuthorityView, BlockReason, Lineage};
 use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendAck, ReplicaProgress};
 use crate::contracts::errors::RdbError;
@@ -32,7 +32,7 @@ use crate::contracts::trace::AckRejectReason;
 use crate::contracts::transport::PeerLabel;
 use crate::replication::{ignored, quarantine_alert};
 
-use super::{proved_durable, DigestLadder, DigestLookup};
+use super::{proved_durable, view_refusal, DigestLadder, DigestLookup, HeldView};
 
 /// One copy's progress as the primary believes it.
 ///
@@ -99,6 +99,11 @@ pub struct ProgressTracker {
     /// regular copies are on our history from the cutoff". A `LocalApplied` never moves it:
     /// evaluated at the moving head the predicate would go false on every write.
     anchor: Seq,
+    /// The `authority_seq` of the newest A1 view installed (design §2.2); 0 before any.
+    authority_seq: u64,
+    /// A `Recovered` pinned this node something other than the primary (lead ruling on the kept
+    /// primary, B-R58a): it serves nothing until a `Recovered` pins it primary again.
+    retired: bool,
 }
 
 /// The two views a step compares before and after itself. Every edge the tracker reports is a
@@ -169,6 +174,8 @@ impl ProgressTracker {
             diverged: Vec::new(),
             history,
             anchor: Seq(local.buffered_applied.0),
+            authority_seq: 0,
+            retired: false,
         }
     }
 
@@ -339,6 +346,19 @@ impl ProgressTracker {
             ],
         };
         (None, effects)
+    }
+
+    /// Lead ruling B-R58c: the copy `ack` speaks for when rules 1–8 admit it and rule 9 finds
+    /// no rung at its applied sequence, which lies strictly below the anchor — an ACK the ladder
+    /// can neither verify nor refute, for a record the recovery cutoff precedes. `None`
+    /// otherwise. Changes nothing: whether it is the record a cursor has in flight is the
+    /// caller's question.
+    #[must_use]
+    pub fn unverified_below_anchor(&self, from: &PeerLabel, ack: &AppendAck) -> Option<CopyId> {
+        let copy = self.admit(from, ack).ok()?;
+        let at = Seq(ack.progress.buffered_applied.0);
+        let lookup = self.history.lookup(at, ack.digest_at_buffered);
+        (at < self.anchor && lookup == DigestLookup::NotRetained).then_some(copy)
     }
 
     /// Rule 1's identity half and rule 1d, for anything a copy sends us: the authenticated
@@ -561,13 +581,28 @@ impl ProgressTracker {
     /// `Recovered` on a copy that already leads (design §3.4, K-B-02): rebuild from its own
     /// ladder and watermarks under the new root. Every other copy starts at zero and re-proves
     /// its prefix; `diverged` clears here and only here.
+    ///
+    /// A pin for this partition that names this node anything but the primary retires the
+    /// tracker (lead ruling on the kept primary, B-R58a): routing treats it as absent until a
+    /// `Recovered` pins it primary again, and that rebuild starts it unretired.
     pub fn on_recovered(&mut self, result: &RecoveryResult, tick: Tick) -> Vec<EffectKind> {
         if let Some(refusal) = self.refuses(result) {
+            let config = &result.committed.pinned_config;
+            if config.partition == self.lineage.partition && !self.leads(config) {
+                self.retired = true;
+            }
             return vec![refusal];
         }
         let before = self.views();
         *self = self.rebuilt(result);
         self.edges(&before, QualificationCause::ConfigChanged, tick)
+    }
+
+    /// Whether `config` makes this copy the primary, on this node.
+    fn leads(&self, config: &PartitionConfig) -> bool {
+        config
+            .member(self.own)
+            .is_some_and(|member| member.node == self.node() && member.role == ReplicaRole::Primary)
     }
 
     /// The one effect that answers `result` instead of a rebuild: `InvalidConfig` when the pin
@@ -576,10 +611,7 @@ impl ProgressTracker {
     /// corrupt-history alert when it holds another record there.
     fn refuses(&self, result: &RecoveryResult) -> Option<EffectKind> {
         let config = &result.committed.pinned_config;
-        let leads = config.member(self.own).is_some_and(|member| {
-            member.node == self.node() && member.role == ReplicaRole::Primary
-        });
-        if !leads || config.partition != self.lineage.partition {
+        if !self.leads(config) || config.partition != self.lineage.partition {
             return Some(ignored(KernelIgnoredReason::Replica(
                 ReplicaIgnoreReason::InvalidConfig,
             )));
@@ -613,9 +645,54 @@ impl ProgressTracker {
         let lineage = Lineage {
             partition: config.partition,
             generation: result.new_generation,
-            owner_epoch: result.committed.authority_view.lineage.owner_epoch,
+            // Replaced from the view just below: one write for `View` and `Recovered` alike.
+            owner_epoch: self.lineage.owner_epoch,
         };
-        Self::seeded(config.clone(), self.own, lineage, history, local)
+        let mut rebuilt = Self::seeded(config.clone(), self.own, lineage, history, local);
+        rebuilt.adopt_view(&result.committed.authority_view);
+        rebuilt
+    }
+
+    /// A1's `View` on the primary (design §2.2, lead ruling B-R53): installs a newer owner epoch
+    /// and answers `Recorded`, or answers [`view_refusal`]'s reason and changes nothing.
+    ///
+    /// The configuration version is a gate here and never written: the tracker's version is the
+    /// newest predicate's, a whole membership that only `ConfigChanged` pushes. Writing the bare
+    /// number would make that `ConfigChanged` look stale, refuse it, and lose the members and the
+    /// incarnation reset they carry (M7B-150).
+    pub fn on_view(&mut self, view: &AuthorityView) -> Vec<EffectKind> {
+        let held = HeldView {
+            lineage: self.lineage,
+            config_version: self.config().config_version,
+            authority_seq: self.authority_seq,
+        };
+        if let Some(reason) = view_refusal(&held, view) {
+            return vec![ignored(KernelIgnoredReason::Replica(reason))];
+        }
+        self.adopt_view(view);
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::Recorded,
+        ))]
+    }
+
+    /// The `authority_seq` of the newest A1 view installed; 0 before any.
+    #[must_use]
+    pub const fn authority_seq(&self) -> u64 {
+        self.authority_seq
+    }
+
+    /// Whether a `Recovered` retired this primary: its pin names this node something other than
+    /// the primary. Routing treats a retired primary as absent for everything but `Recovered`.
+    #[must_use]
+    pub const fn retired(&self) -> bool {
+        self.retired
+    }
+
+    /// Take a view's epoch and `authority_seq`: the one write `View` and `Recovered` share. The
+    /// generation is the caller's, because a recovered view names the root it recovered from.
+    fn adopt_view(&mut self, view: &AuthorityView) {
+        self.lineage.owner_epoch = view.lineage.owner_epoch;
+        self.authority_seq = view.authority_seq;
     }
 
     /// `Flushed` on the primary: its own durable watermark, which the durable views include

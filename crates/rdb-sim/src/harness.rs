@@ -22,11 +22,14 @@
 //! [`environment_capabilities`] is the honest summary the rows log.
 
 pub mod dispatch;
+pub mod hosted;
 pub mod manifest;
 pub mod protection;
 pub mod replay;
+pub mod route;
 pub mod run;
 pub mod trace;
+pub mod transfer;
 
 use rdb_core::contracts::event::ModuleName;
 use rdb_core::contracts::trace::{CapabilityState, PackageId};
@@ -36,16 +39,22 @@ use rdb_core::contracts::trace::{CapabilityState, PackageId};
 /// The same rule as [`rdb_core::contracts::event::Module::capability`]: `Wired` is claimed only
 /// when nothing in the package still answers [`crate::error::SimError::Unavailable`].
 ///
-/// * H1 — `Unavailable`: [`crate::sim::network::Network::send`] and
-///   [`crate::sim::cluster::Cluster::suspend`] are owed. The scheduler, clock, control store
-///   and cluster lifecycle are real.
+/// * H1 — `Unavailable`: [`crate::sim::network::Network::send`] delivers, drops, duplicates,
+///   delays and partitions under the scenario's plan, and delivers a forged acknowledgement under
+///   its forged label (L-R177do). Two things are owed: a forged acknowledgement whose lie is in its
+///   body (`sim::network::Network::forge_ack`: an authenticated claim to another role), and
+///   [`crate::sim::cluster::Cluster::suspend`]. The scheduler, clock, control store and cluster
+///   lifecycle are real.
 /// * M1 — `Wired`: the memory engine, crash images and snapshots are real.
-/// * I1 — `Unavailable`: four seams are still owed, and they are the effect providers, not
-///   replay. [`self::dispatch::Dispatcher::deliver`] answers
-///   [`crate::error::SimError::Unavailable`] for `harness::dispatch::deliver::send`, `::store`,
-///   `::timer` and `::kernel` — the four effect kinds with no provider — which row `M7F-26`
-///   counts as I1's. Dispatch, recording, the manifest, the run loop ([`self::run::execute`])
-///   and replay from a plan ([`self::replay::replay_run`]) are real.
+/// * I1 — `Unavailable`, and **ready to flip only by ruling** (A-R61 says do not flip it here).
+///   Since 2026-09-26 [`self::dispatch::Dispatcher::deliver`] carries out `Send`, `Store`,
+///   `Timer` and every kernel-to-kernel effect with a consumer, which it routes in the same run
+///   ([`self::route`]). Three delivery seams are still refused by name, which row `M7F-26`
+///   counts as I1's: `harness::dispatch::deliver::crash` (restarting a crashed node),
+///   `::recovery` (F1's requests with no provider) and `::kernel` (R1's arms with no consumer),
+///   plus `harness::run::route`, the stop on a routed fact a wired consumer declined.
+///   Dispatch, recording, the manifest, the run loop ([`self::run::execute`]) and replay from a
+///   plan ([`self::replay::replay_run`]) are real.
 ///
 ///   **This entry is not held back by [`self::replay::replay`].** That function refuses *by
 ///   design and permanently* (lead ruling, 2026-09-22): a [`rdb_core::contracts::trace::Trace`]
@@ -55,11 +64,8 @@ use rdb_core::contracts::trace::{CapabilityState, PackageId};
 ///   on it.
 ///
 ///   Read the rule above as written: `Wired` is claimed only when nothing in the package still
-///   answers `Unavailable`, and the four delivery seams do. It is also the substantive answer
-///   rather than a technicality — the run loop cannot deliver a send, a store, a timer or a
-///   kernel-to-kernel fact, so a campaign over it exercises one module's control path and
-///   nothing else. Flipping this to `Wired` before those four land is the optimistic flip the
-///   rule at the top of this list forbids.
+///   answers `Unavailable`, and the seams above do. Flipping this to `Wired` before they close
+///   is the optimistic flip the rule at the top of this list forbids.
 #[must_use]
 pub const fn environment_capabilities() -> [(PackageId, CapabilityState); 3] {
     [

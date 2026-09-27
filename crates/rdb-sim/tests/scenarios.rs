@@ -1,12 +1,14 @@
 //! Grammar, generator and reducer rows: M7V-42..M7V-46, M7V-49, M7V-59, M7V-83, M7V-84.
 //!
-//! Everything here runs against the grammar as **data**. No row starts the environment, which is
-//! what keeps the whole file unit-class and what lets it stay green while every kernel package is
+//! Everything here runs against the grammar as **data**, with one exception: M7V-47's F1/R1 case
+//! runs through the real runner by way of `support::scenarios::run`, a sim-class row. The rest
+//! start no environment, which keeps them unit-class and green while every kernel package is
 //! unwired.
 //!
-//! The rows that need the I1 runner — M7V-20, M7V-21, M7V-47, M7V-48, M7V-50, M7V-51, M7V-86 —
-//! are present as explicit `Unavailable` reports naming I1. They assert that the package really
-//! is unwired rather than hardcoding it, so the day I1 lands they fail and demand to be written.
+//! The rows that still need the I1 runner — M7V-20, M7V-21, M7V-48, M7V-50, M7V-51, M7V-86, and
+//! M7V-47's other three cases — are present as explicit `Unavailable` reports naming I1. They
+//! assert that the package really is unwired rather than hardcoding it, so the day I1 lands they
+//! fail and demand to be written.
 //! A stub that asserted nothing would be worse than an absence, because it would count as a row.
 
 mod support;
@@ -14,15 +16,27 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 
 use config_log::retcd_test;
-use rdb_core::contracts::ids::{PartitionId, ScenarioId};
-use rdb_core::contracts::trace::{BoundaryId, CapabilityState, PackageId, Provenance};
+use rdb_core::contracts::authority::PartitionMode;
+use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::event::Budgets;
+use rdb_core::contracts::ids::{PartitionId, ScenarioId, Seq};
+use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::recovery::{LossRecord, RecoveryEffect, UnavailableReason};
+use rdb_core::contracts::trace::{
+    BoundaryId, CapabilityState, ControlOpKind, ControlOutcomeKind, KernelNote, PackageId,
+    Provenance, Trace, TraceKind,
+};
 use rdb_sim::harness::environment_capabilities;
+use rdb_sim::harness::run::StopReason;
 
-use support::oracle::{CoreTuple, Unavailable, Verdict};
+use support::oracle::{CoreTuple, Invariant, Unavailable, Verdict};
+use support::scenarios::cases;
 use support::scenarios::coverage::{self, Axis};
 use support::scenarios::gen;
 use support::scenarios::grammar::{self, Budget, Scenario, ScenarioOp, Topology};
 use support::scenarios::reduce::{self, ShrinkBudget};
+use support::scenarios::regress;
+use support::scenarios::run::{self as scenario_run, ScenarioRun};
 
 /// The verdict an unwired package must produce. Read from the landed capability table, never
 /// written down: a row that hardcoded `Unavailable` would keep reporting it after I1 landed.
@@ -359,34 +373,571 @@ fn m7v_46_provenance_is_explicit_and_nothing_carries_a_bare_seed() {
     );
 }
 
+// ------------------------------------------------------------------------------------------
+// M7V-47 — the four mandatory cross-package cases, through the real runner
+// ------------------------------------------------------------------------------------------
+
+/// Every F1 fact with its trace position and tick.
+fn recovery_facts(trace: &Trace) -> Vec<(usize, u64, RecoveryEffect)> {
+    trace
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveryFact { effect },
+                ..
+            } => Some((index, event.logical_tick, effect.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The capability preamble, read from the trace itself rather than from the oracle's model.
+fn preamble_of(trace: &Trace) -> BTreeMap<PackageId, CapabilityState> {
+    let preamble: Vec<(PackageId, CapabilityState)> = trace
+        .events
+        .iter()
+        .map_while(|event| match event.kind {
+            TraceKind::Capability { package, state } => Some((package, state)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        preamble.len(),
+        9,
+        "the runner opens with 3 environment and 6 kernel capability lines"
+    );
+    preamble.into_iter().collect()
+}
+
+/// The oracle half (A-R22, §12): no checker fired, and every invariant whose package the
+/// preamble reports `Unavailable` says exactly `Unavailable{Capability(p)}` for the first such
+/// package it needs — never `Proven`. Returns the verdicts for the log.
+fn oracle_half(run: &ScenarioRun) -> Vec<(Invariant, Verdict)> {
+    let preamble = preamble_of(&run.trace);
+    assert!(
+        run.oracle.is_clean(),
+        "the oracle fired on a real run: {:?}",
+        run.oracle.violations()
+    );
+    for (invariant, verdict) in run.oracle.verdicts() {
+        let unwired = invariant
+            .needs()
+            .iter()
+            .find(|package| preamble.get(package) == Some(&CapabilityState::Unavailable));
+        if let Some(package) = unwired {
+            assert_eq!(
+                verdict,
+                &Verdict::Unavailable(Unavailable::Capability(*package)),
+                "{invariant:?} needs {package:?}, which the preamble reports Unavailable"
+            );
+        }
+    }
+    run.oracle
+        .verdicts()
+        .map(|(invariant, verdict)| (invariant, verdict.clone()))
+        .collect()
+}
+
+/// M7V-47, case F1/R1 (spike §6): the discovery window, run from the grammar through the real
+/// runner and judged by the oracle.
+///
+/// **Kernel half**, read from the trace alone, in two rounds split at the first recovery CAS.
+///
+/// The barrier round, before it, holds the facts M7B-96 asserts on its hand-built plan: the
+/// window extends exactly once (it closes at fence + 2 x window), C is recorded `Stalled` at
+/// that deadline before the close, the close precedes `Selected{100, B}`, and B is the only copy
+/// proven before the CAS, which commits. F1's first `Recovered` follows it, `ReadOnly`, with an
+/// uncertain loss record naming C `Stalled`.
+///
+/// The rebuild round, after it, exists because this topology has secondaries: with the members'
+/// fan-out on (B-R58b), R1 walks C and A up from the root, its `CopyCaughtUp` reaches F1, and
+/// F1's rebuild proves every required copy at the cutoff and commits activation by a second CAS
+/// (M7B-137). F1 then re-emits `Recovered` with `mode: Active` and the same loss record
+/// (T-B-03). The same split M7B-104 took at B-R58b.
+///
+/// L1 stays `Paused` after this (the B-R60 keepalive gap), and nothing here asserts otherwise.
+///
+/// **Oracle half**: the trace opens with the 9-line capability preamble, the oracle finds
+/// nothing, and every verdict whose package is unwired is `Unavailable{Capability(p)}`.
 #[retcd_test]
-fn m7v_47_authored_cross_package_cases_construct_and_run() {
+fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
+    support::preamble();
+    let scenario = cases::case_f1_r1_discovery_window();
+    assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
+    assert!(scenario.max_events_implied() <= scenario.budget.max_events);
+    let lowered = scenario_run::lower(&scenario);
+    assert_eq!(lowered.as_ref().err(), None, "the case lowers whole");
+
+    let run = scenario_run::run(&scenario).expect("lowers");
+    let trace = &run.trace;
+    tracing::info!(
+        stop = ?run.report.stop,
+        events = trace.events.len(),
+        fingerprint = scenario_run::fingerprint(trace),
+        census = ?scenario_run::census(trace),
+        "m7v_47 f1/r1 run"
+    );
+    // A live primary is work until a limit (L1 evaluates every 50 ms), so a run that completes
+    // ends at its tick budget, never by exhausting its events or by a refusal.
+    assert!(
+        matches!(run.report.stop, StopReason::DeadlineReached { deadline, .. }
+            if deadline.0 == scenario.budget.max_ticks),
+        "runs to its tick budget: {:?}",
+        run.report.stop
+    );
+    assert!(run.report.events_consumed <= scenario.budget.max_events);
+
+    // Kernel half.
+    let fence_at = cases::PLAN_AT + 1;
+    let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+    let facts = recovery_facts(trace);
+    let closes: Vec<(usize, u64)> = facts
+        .iter()
+        .filter(|(_, _, effect)| matches!(effect, RecoveryEffect::CloseWindow))
+        .map(|(index, tick, _)| (*index, *tick))
+        .collect();
+    assert_eq!(closes.len(), 1, "one close: {facts:?}");
+    let (closed_at, close_tick) = closes[0];
+    assert_eq!(close_tick, fence_at + 2 * window, "extended exactly once");
+    let c = CopyId(1);
+    let c_lost: Vec<(usize, u64, UnavailableReason)> = facts
+        .iter()
+        .filter_map(|(index, tick, effect)| match effect {
+            RecoveryEffect::RecordSourceUnavailable { copy, reason } if *copy == c => {
+                Some((*index, *tick, *reason))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(c_lost.len(), 1, "C recorded once: {facts:?}");
+    assert_eq!(
+        (c_lost[0].1, c_lost[0].2),
+        (close_tick, UnavailableReason::Stalled)
+    );
+    assert!(c_lost[0].0 < closed_at, "C's failure precedes the close");
+    let selected: Vec<(usize, Seq, CopyId)> = facts
+        .iter()
+        .filter_map(|(index, _, effect)| match effect {
+            RecoveryEffect::Selected(selected) => {
+                Some((*index, selected.cutoff_seq, selected.source))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(selected.len(), 1, "one selection: {facts:?}");
+    assert_eq!(
+        (selected[0].1, selected[0].2),
+        (Seq(cases::B_HEAD), CopyId(0))
+    );
+    assert!(
+        closed_at < selected[0].0,
+        "the close precedes the selection"
+    );
+    // Every `SyncProven` and every recovery CAS, by trace index.
+    let proofs: Vec<(usize, CopyId, Seq)> = trace
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::SyncProven { copy, cutoff, .. },
+                ..
+            } => Some((index, copy, cutoff)),
+            _ => None,
+        })
+        .collect();
+    let cas: Vec<(usize, ControlOutcomeKind)> = trace
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event.kind {
+            TraceKind::ControlInteraction {
+                op: ControlOpKind::Cas,
+                key: Some(ControlKey::Partition(cases::PARTITION)),
+                outcome,
+                ..
+            } => Some((index, outcome)),
+            _ => None,
+        })
+        .collect();
+    let recovered: Vec<(usize, PartitionMode, LossRecord)> = trace
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredFact { result },
+                ..
+            } => Some((index, result.mode.clone(), result.loss.clone())),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?proofs, ?cas, "m7v_47 f1/r1 proofs and CASes");
+    assert_eq!(
+        cas.iter().map(|(_, outcome)| *outcome).collect::<Vec<_>>(),
+        vec![ControlOutcomeKind::Committed; 2],
+        "the recovery's CAS, then activation's, both committed"
+    );
+    let (commit, activate) = (cas[0].0, cas[1].0);
+
+    // Barrier round: everything before the recovery CAS. B alone is proven, after the selection.
+    let barrier: Vec<(usize, CopyId, Seq)> = proofs
+        .iter()
+        .copied()
+        .filter(|(index, _, _)| *index < commit)
+        .collect();
+    assert_eq!(
+        barrier
+            .iter()
+            .map(|(_, copy, cutoff)| (*copy, *cutoff))
+            .collect::<Vec<_>>(),
+        vec![(CopyId(0), Seq(cases::B_HEAD))],
+        "SyncProven{{B, 100}} is the barrier's only proof: {proofs:?}"
+    );
+    assert!(
+        selected[0].0 < barrier[0].0,
+        "the selection precedes B's proof"
+    );
+    assert_eq!(
+        recovered.len(),
+        2,
+        "Recovered, then its re-emission on activation"
+    );
+    let (recovered_at, mode, loss) = &recovered[0];
+    assert!(
+        commit < *recovered_at && *recovered_at < activate,
+        "the first Recovered sits between the two CASes"
+    );
+    assert_eq!(*mode, PartitionMode::ReadOnly, "read-only until activation");
+    assert_eq!(loss.highest_advertised_seq, Seq(cases::C_ADVERTISED));
+    assert_eq!(loss.cutoff_seq, Seq(cases::B_HEAD));
+    assert!(loss.uncertain, "a suffix may have been lost: {loss:?}");
+    assert!(
+        loss.unavailable.contains(&(c, UnavailableReason::Stalled)),
+        "{loss:?}"
+    );
+
+    // Rebuild round: between the two CASes, every required copy is proven at the cutoff. A set,
+    // not a sequence: R1 catches C and A up in whichever order their walks finish, and the
+    // count per copy is R1's business, not this case's.
+    let rebuild: BTreeSet<CopyId> = proofs
+        .iter()
+        .filter(|(index, _, _)| commit < *index && *index < activate)
+        .map(|(_, copy, cutoff)| {
+            assert_eq!(
+                *cutoff,
+                Seq(cases::B_HEAD),
+                "rebuilt at the cutoff: {proofs:?}"
+            );
+            *copy
+        })
+        .collect();
+    assert_eq!(
+        rebuild,
+        [CopyId(0), CopyId(1), CopyId(2)].into_iter().collect(),
+        "the rebuild proves every required copy before activation: {proofs:?}"
+    );
+    let (reemitted_at, mode, reloss) = &recovered[1];
+    assert!(
+        activate < *reemitted_at,
+        "the re-emission follows activation"
+    );
+    assert_eq!(*mode, PartitionMode::Active);
+    assert_eq!(
+        reloss, loss,
+        "activation does not move the loss record (T-B-03)"
+    );
+
+    // Oracle half.
+    let verdicts = oracle_half(&run);
+    tracing::info!(?verdicts, "m7v_47 f1/r1 oracle");
+}
+
+/// M7V-47, case A1/P1 (spike §6): a new generation activates between publication and reply.
+///
+/// Parked, and specific about why. The case constructs, is authored and fits its budget, and
+/// the bridge refuses it **at its second `InspectSurvivors`, by index**: the op that activates
+/// the next generation. The row turns red the day that op lowers, and must then be written with
+/// both halves (A-R22). Re-authored from "expire authority" by lead ruling L-R177dq: an expiry
+/// cannot reach P1's `Admit if !entry.replied` arm, because A1 revalidates first, its `Fence`
+/// precedes the `Answer`, and P1 clears the awaiting reply on that fence. A generation move
+/// denies the reply check without a fence, which is the deny that arm must honour.
+///
+/// Built in dev-verif's slice 2, landing with dev-sim-route's shared hooks: the semantic lines
+/// (`Publish`, `AuthorityDecision`, `ClientOutcomeReported`), a timed op as a segmented run, and
+/// a hop delay on P1's `Reply` check. Still owed:
+///
+/// - B-R60: on a recovered RF3 partition L1 stays `Paused` (`BarrierNotDurable`) after both
+///   secondaries ACK, so T1 answers the write `ProtectionPaused` and P1 is never reached;
+/// - A1 does not install the post-`Recovered` lineage (its own capability comment);
+/// - the bridge lowers neither a second activation nor the `Reply` hop delay the activation
+///   must land inside;
+/// - INV-PUB needs `BatchApply` and `ReplicationAck` lines the sim does not record yet.
+#[retcd_test]
+fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_is_refused_by_name() {
+    support::preamble();
+    let scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+    assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
+    assert!(scenario.max_events_implied() <= scenario.budget.max_events);
+    assert!(matches!(
+        scenario.ops[cases::A1_P1_ACTIVATE_OP],
+        ScenarioOp::Recovery(grammar::RecoveryOp::InspectSurvivors { .. })
+    ));
+    let refused = scenario_run::lower(&scenario).err();
+    assert_eq!(
+        refused.as_ref().map(|refused| refused.op_index),
+        Some(Some(cases::A1_P1_ACTIVATE_OP)),
+        "refused at the activating op, and nowhere earlier: {refused:?}"
+    );
+    parked(
+        "M7V-47",
+        PackageId::I1,
+        "case A1/P1: the bridge refuses its second activation (a second InspectSurvivors)",
+    );
+}
+
+/// M7V-47, the F1/T1/P1 and F1/T1 cases: they wait on T1 (lead ruling A-R73).
+#[retcd_test]
+fn m7v_47_cases_f1_t1_wait_on_t1() {
     support::preamble();
     parked(
         "M7V-47",
         PackageId::I1,
-        "the four mandatory cross-package cases must run, and running needs a runner",
+        "cases F1/T1/P1 retained status 24 h and F1/T1 digest across recovery wait on T1 (A-R73)",
     );
 }
 
 // ------------------------------------------------------------------------------------------
-// M7V-48..M7V-51 — the reducer's behavioural rows
+// M7V-20, M7V-21, M7V-48..M7V-51 — the reducer's behavioural rows
 // ------------------------------------------------------------------------------------------
 
+/// The core tuple [`regress::injected_rf4_copy_set_shape`] fails with. Pinned, so a change in
+/// what the injection reaches is a red here rather than a reducer quietly chasing something else.
+fn injected_tuple() -> CoreTuple {
+    CoreTuple {
+        checker: "INV-PUB",
+        rule: "required_copy_set_shape",
+        partition: cases::PARTITION,
+        role: rdb_core::contracts::ids::ReplicaRole::Primary,
+        event_kind: support::oracle::model::TraceEventKind::ProtectionState,
+    }
+}
+
+/// Where a row writes its fixture pair: under this binary's run directory, two levels down and
+/// `.json`, so the `<run>/*/*.jsonl` log glob never reads a fixture as a log line.
+fn fixture_dir(row: &str) -> std::path::PathBuf {
+    config_log::testing::test_log_dir()
+        .join("reducer")
+        .join(row)
+}
+
+/// This row's own log lines named `message`, read back from its JSONL file. `config-log` writes
+/// with a blocking append, so every line the row emitted is on disk when this runs.
+fn own_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    std::fs::read_to_string(&path)
+        .expect("the row's own JSONL file exists")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("one JSON object"))
+        .filter(|line| line["@m"] == message)
+        .collect()
+}
+
+/// M7V-20. The input is one injected known violation over 40 ops (the RF4 membership; see
+/// [`regress`]), shrunk by the real reducer against the real kernel with the default budgets.
+///
+/// **Parked for one clause, and only that one:** the input names 8 active fault boundaries. The
+/// lowering takes no fault op (every one is `Unlowerable`) and the harness records no
+/// `fault_injected`, so `faults` is `{}` before and after and the reported comparison is between
+/// two empty sets. Assertions (1)–(3) and Q-39's log checks are real.
 #[retcd_test]
 fn m7v_20_reducer_keeps_the_core_signature_and_shrinks() {
     support::preamble();
+    let original = regress::injected_rf4_copy_set_shape();
+    assert_eq!(original.ops.len(), 40, "the row's input is ~40 ops");
+
+    let shrunk = regress::shrink_and_write(&original, &fixture_dir("m7v_20"));
+    assert_eq!(
+        shrunk.before.core,
+        injected_tuple(),
+        "the one violation before shrinking is the injected one"
+    );
+
+    // (1) The core tuple survives shrinking.
+    assert_eq!(
+        shrunk.after.core, shrunk.before.core,
+        "core_tuple(signature_after) == core_tuple(signature_before)"
+    );
+
+    // (2) Strictly fewer ops, and the ratio recorded.
+    let before = original.ops.len();
+    let after = shrunk.reduction.minimized.ops.len();
+    tracing::info!(
+        ops_before = before,
+        ops_after = after,
+        ratio_permille = after * 1_000 / before,
+        steps = shrunk.reduction.steps,
+        "shrink_ratio"
+    );
+    assert!(
+        after < before,
+        "the reducer removed nothing: {after} of {before} ops"
+    );
+    assert!(
+        shrunk.reduction.budget_spent.is_none(),
+        "the default budgets reach a 1-minimal result on 40 ops, got {:?}",
+        shrunk.reduction.budget_spent
+    );
+
+    // (3) `.orig.json` is written, replays from disk, and still fails.
+    let reloaded = regress::load(&shrunk.pair.original).expect("the .orig.json loads");
+    assert_eq!(
+        reloaded, original,
+        "the .orig.json is the unshrunk scenario"
+    );
+    let replayed = scenario_run::run(&reloaded).expect("the .orig.json lowers");
+    assert!(
+        replayed
+            .oracle
+            .violations()
+            .iter()
+            .any(|(_, signature)| signature.core == shrunk.before.core),
+        "the .orig.json replays and still fails with {:?}",
+        shrunk.before.core
+    );
+
+    // `faults`: compared and reported, never the predicate.
+    tracing::info!(
+        faults_before = ?shrunk.reduction.faults_before,
+        faults_after = ?shrunk.reduction.faults_after,
+        signature_faults_before = ?shrunk.before.faults,
+        signature_faults_after = ?shrunk.after.faults,
+        slipped = shrunk.reduction.slipped(),
+        "shrink_faults"
+    );
+
+    // Q-39, read from this row's own lines.
+    let method = "m7v_20_reducer_keeps_the_core_signature_and_shrinks";
+    let steps = own_lines(method, "shrink_step");
+    assert_eq!(
+        steps.len(),
+        usize::try_from(shrunk.reduction.steps).expect("fits"),
+        "one shrink_step line per re-run"
+    );
+    let accepted: Vec<&serde_json::Value> = steps
+        .iter()
+        .filter(|line| line["accepted"] == true)
+        .collect();
+    assert!(!accepted.is_empty(), "a shrink occurred");
+    for line in &accepted {
+        assert!(
+            line["ops_after"].as_u64() < line["ops_before"].as_u64(),
+            "an accepted step shrinks: {line}"
+        );
+        assert_eq!(line["checker"], shrunk.before.core.checker, "{line}");
+        assert_eq!(line["rule"], shrunk.before.core.rule, "{line}");
+    }
+    let results = own_lines(method, "shrink_result");
+    assert_eq!(results.len(), 1, "one shrink_result line per reduction");
+    let result = &results[0];
+    assert_eq!(result["signature_slug"], shrunk.pair.slug);
+    assert_eq!(result["ops_after"].as_u64(), Some(after as u64));
+    assert_eq!(
+        result["ops_after"],
+        accepted.last().expect("non-empty")["ops_after"],
+        "the result's ops_after is the last accepted step's"
+    );
+    assert_eq!(
+        result["slipped"] == true,
+        result["faults_before"] != result["faults_after"],
+        "slipped iff the fault sets differ: {result}"
+    );
+
     parked(
         "M7V-20",
         PackageId::I1,
-        "shrinking re-runs the kernel; the ddmin loop itself is covered by M7V-84",
+        "input clause: 8 active fault boundaries — no fault op lowers and the harness records no \
+         fault_injected, so faults is {} before and after",
     );
 }
 
+/// M7V-21. The fixture is the one M7V-20's path writes — the same scenario through the same
+/// reducer, which is deterministic — written here to this row's own directory and **read back
+/// from disk** before anything runs it.
+///
+/// Determinism is asserted on the whole trace and the whole oracle report, not only on
+/// `oracle_checkpoint_digest`: at this basis the harness writes that field as the constant
+/// `NO_ORACLE_CHECKPOINTS` (`harness::run`), so it is equal across any two runs and proves
+/// nothing on its own. It is still compared, so the row keeps holding when it becomes real.
 #[retcd_test]
 fn m7v_21_minimized_fixture_replays_through_i1_and_fails_the_same_checker() {
     support::preamble();
-    parked("M7V-21", PackageId::I1, "replay needs a runner");
+    let shrunk = regress::shrink_and_write(
+        &regress::injected_rf4_copy_set_shape(),
+        &fixture_dir("m7v_21"),
+    );
+
+    let fixture = regress::load(&shrunk.pair.minimized).expect("the minimized fixture loads");
+    assert_eq!(
+        fixture, shrunk.reduction.minimized,
+        "the JSON round trip is lossless"
+    );
+
+    let first = scenario_run::run(&fixture).expect("the fixture lowers");
+    let second = scenario_run::run(&fixture).expect("the fixture lowers");
+
+    // Violated on the same checker, with the same rule.
+    let target = shrunk.before.core;
+    let invariant = Invariant::ALL
+        .into_iter()
+        .find(|invariant| {
+            matches!(
+                first.oracle.verdict(*invariant),
+                Verdict::Violated(signature) if signature.core.checker == target.checker
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no Violated verdict from {}: {:?}",
+                target.checker,
+                first.oracle.verdicts().collect::<Vec<_>>()
+            )
+        });
+    let Verdict::Violated(signature) = first.oracle.verdict(invariant) else {
+        unreachable!("found above");
+    };
+    assert_eq!(
+        (signature.core.checker, signature.core.rule),
+        (target.checker, target.rule),
+        "the replay fails the same checker with the same rule"
+    );
+
+    // Deterministic across two runs.
+    assert_eq!(
+        first.trace.header.oracle_checkpoint_digest,
+        second.trace.header.oracle_checkpoint_digest
+    );
+    assert_eq!(
+        scenario_run::fingerprint(&first.trace),
+        scenario_run::fingerprint(&second.trace)
+    );
+    assert_eq!(first.trace, second.trace, "two replays record one trace");
+    assert_eq!(first.oracle, second.oracle, "and one oracle report");
+    assert_eq!(first.report, second.report, "and stop the same way");
+    tracing::info!(
+        fingerprint = scenario_run::fingerprint(&first.trace),
+        events = first.trace.events.len(),
+        ops = fixture.ops.len(),
+        slug = %shrunk.pair.slug,
+        "fixture_replayed"
+    );
 }
 
 #[retcd_test]
@@ -416,12 +967,14 @@ fn m7v_48_reducer_stops_at_each_of_the_three_shrink_budgets() {
         "the reducer ran {} steps against a bound of 5",
         reduction.steps
     );
+    assert_eq!(reduction.budget_spent, Some(reduce::BudgetSpent::Steps));
     assert!(
         !reduction.minimized.ops.is_empty(),
         "a spent budget still emits the best candidate so far, never nothing"
     );
 
-    // Total.
+    // Total. No candidate reproduces, which is where ddmin searches longest: an always-accepting
+    // closure reaches one op in fewer than 10 re-runs and never meets the bound at all.
     let reduction = reduce::ddmin(
         &scenario,
         target,
@@ -430,9 +983,52 @@ fn m7v_48_reducer_stops_at_each_of_the_three_shrink_budgets() {
             total: 10,
             ..ShrinkBudget::DEFAULT
         },
-        |ops| (!ops.is_empty()).then(|| (target, BTreeSet::new())),
+        |_| None,
     );
     assert!(reduction.steps <= 10);
+    assert_eq!(reduction.budget_spent, Some(reduce::BudgetSpent::Total));
+
+    // The same two bounds with the real kernel as the executor, on the injected violation: each
+    // stops at its bound, says which, and its best candidate is a scenario that still fails.
+    let injected = regress::injected_rf4_copy_set_shape();
+    let real = regress::sole_violation(&injected).core;
+    for (budget, bound, spent, name) in [
+        (
+            ShrinkBudget {
+                steps: 5,
+                ..ShrinkBudget::DEFAULT
+            },
+            5,
+            reduce::BudgetSpent::Steps,
+            "steps",
+        ),
+        (
+            ShrinkBudget {
+                steps: u32::MAX,
+                total: 10,
+                ..ShrinkBudget::DEFAULT
+            },
+            10,
+            reduce::BudgetSpent::Total,
+            "total",
+        ),
+    ] {
+        let reduction = reduce::ddmin(&injected, real, budget, |ops| {
+            regress::execute(&injected, real, ops)
+        });
+        assert_eq!(reduction.steps, bound, "stops at its own bound");
+        assert_eq!(reduction.budget_spent, Some(spent), "and names it");
+        assert_eq!(spent.name(), name, "the name the artifact carries");
+        assert!(reduction.minimized.ops.len() < injected.ops.len());
+        let best = scenario_run::run(&reduction.minimized).expect("the best candidate lowers");
+        assert!(
+            best.oracle
+                .violations()
+                .iter()
+                .any(|(_, signature)| signature.core == real),
+            "the best candidate so far still fails with the target"
+        );
+    }
 
     // Max failures: three distinct signatures, one shrunk, two recorded unminimized.
     let signatures = [target, other_tuple("INV-LIN"), other_tuple("INV-LOSS")];
@@ -486,35 +1082,98 @@ fn m7v_49_reducer_edits_only_the_scenario_never_a_trace() {
     }
 }
 
+/// M7V-50. [`regress::replay_corpus`] is the whole predicate: pairing, the fixture being exactly
+/// a `Scenario` (so it can carry no expectation), both halves replayed, each failing the
+/// `(checker, rule, partition)` its file name records. It runs over the committed corpus, and
+/// over pairs this row builds so each refusal is seen to fire even while the corpus is empty.
+///
+/// Not asserted, because nothing on disk could show it: that a retirement adds its line to
+/// ADR-rdb-0019's Notes. A deletion leaves no trace for a row to read.
 #[retcd_test]
 fn m7v_50_regressions_replay_every_minimized_and_original_fixture() {
     support::preamble();
 
-    // The pairing half needs no runner, and it is the half a half-deleted pair breaks.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/regressions");
-    let mut minimized: BTreeSet<String> = BTreeSet::new();
-    let mut originals: BTreeSet<String> = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(slug) = name.strip_suffix(".orig.json") {
-                originals.insert(slug.to_owned());
-            } else if let Some(slug) = name.strip_suffix(".json") {
-                minimized.insert(slug.to_owned());
-            }
-        }
-    }
-    assert_eq!(
-        minimized, originals,
-        "every regression fixture is a pair: retirement deletes both files together, and a \
-         half-deleted pair must fail rather than replay one side"
+    // The committed corpus: every pair replayed, both halves, each failing its slug.
+    let committed =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/regressions");
+    let replayed = regress::replay_corpus(&committed).unwrap_or_else(|e| panic!("{e}"));
+    tracing::info!(
+        fixtures = replayed.len(),
+        pairs = replayed.len() / 2,
+        "regression_corpus_replayed"
     );
 
-    parked(
-        "M7V-50",
-        PackageId::I1,
-        "replaying each pair and asserting it still fails its recorded (checker, rule)",
+    // The same predicate on pairs this row builds, so it is exercised whether or not the
+    // committed corpus holds anything, and so each refusal is seen to fire.
+    let shrunk = regress::shrink_and_write(
+        &regress::injected_rf4_copy_set_shape(),
+        &fixture_dir("m7v_50/pair"),
     );
+    let pair = &shrunk.pair;
+    let replayed = regress::replay_corpus(&fixture_dir("m7v_50/pair")).expect("a real pair fails");
+    assert_eq!(
+        replayed
+            .iter()
+            .map(|r| (r.path.clone(), r.core))
+            .collect::<Vec<_>>(),
+        vec![
+            (pair.minimized.clone(), shrunk.before.core),
+            (pair.original.clone(), shrunk.before.core)
+        ],
+        "both halves are replayed, and each fails its recorded (checker, rule)"
+    );
+
+    // A pair that replays clean fails the row. RF3 is the same world without the injection.
+    let clean_dir = fixture_dir("m7v_50/clean");
+    let mut clean = shrunk.reduction.minimized.clone();
+    clean.topology = cases::rf3_partition_1();
+    assert!(scenario_run::run(&clean).expect("lowers").oracle.is_clean());
+    let _ = regress::write_pair(
+        &clean_dir,
+        Some("injected-rf4"),
+        shrunk.before.core,
+        &clean,
+        &clean,
+    );
+    let refused = regress::replay_corpus(&clean_dir).expect_err("a clean replay fails the row");
+    assert!(refused.contains("replays clean"), "{refused}");
+
+    // An expectation field fails the row: the only expectation is `fails`, and it is the name.
+    let expect_dir = fixture_dir("m7v_50/expect");
+    let written = regress::write_pair(
+        &expect_dir,
+        None,
+        shrunk.before.core,
+        &shrunk.reduction.minimized,
+        &shrunk.original,
+    );
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&written.minimized).expect("written above"))
+            .expect("a scenario is a JSON object");
+    value["expect"] = serde_json::Value::from("passes");
+    std::fs::write(&written.minimized, value.to_string()).expect("writable");
+    let refused = regress::replay_corpus(&expect_dir).expect_err("an expectation fails the row");
+    assert!(refused.contains("not a Scenario"), "{refused}");
+
+    // A half-deleted pair fails the row, in either direction.
+    for (half, drop_original) in [("orig", true), ("minimized", false)] {
+        let dir = fixture_dir(&format!("m7v_50/orphan_{half}"));
+        let written = regress::write_pair(
+            &dir,
+            None,
+            shrunk.before.core,
+            &shrunk.reduction.minimized,
+            &shrunk.original,
+        );
+        let gone = if drop_original {
+            &written.original
+        } else {
+            &written.minimized
+        };
+        std::fs::remove_file(gone).expect("this row's own file");
+        let refused = regress::replay_corpus(&dir).expect_err("an orphan fails the row");
+        assert!(refused.contains("half-deleted"), "{refused}");
+    }
 }
 
 #[retcd_test]

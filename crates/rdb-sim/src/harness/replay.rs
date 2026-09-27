@@ -449,16 +449,19 @@ mod tests {
 
         let plan = run_plan();
         let (recorded, first) = execute(&plan).expect("a run");
-        // A1's acquisition ends at its first `PublishAuthorityView`, which the loop refuses until
-        // a consumer kernel exists (lead ruling A-R49). It was `QueueEmpty` before A-R47. Since
-        // finding F2 that view is the partitions install's, on the third pop (B-R39).
-        assert_eq!(
-            first.stop.refusal(),
-            Some("harness::dispatch::deliver::kernel"),
+        // A1's acquisition used to end at its first `PublishAuthorityView`, refused under the
+        // `kernel` seam (A-R49). Since A-R63 that view is routed to its consumers and the run
+        // goes on, renewing, until the deadline. It was `QueueEmpty` before A-R47.
+        assert_eq!(first.stop.refusal(), None, "{:?}", first.stop);
+        assert!(
+            matches!(
+                first.stop,
+                crate::harness::run::StopReason::DeadlineReached { .. }
+            ),
             "{:?}",
             first.stop
         );
-        assert_eq!(first.events_consumed, 3, "{first:?}");
+        assert!(first.events_consumed > 3, "{first:?}");
         assert!(
             recorded
                 .events
@@ -721,11 +724,12 @@ mod tests {
     /// was A1's offer at index 9. The adoption had a fourth effect, `PublishAuthorityView`, until
     /// finding F2.
     ///
-    /// Both runs stop `Refused` at `PublishAuthorityView` (lead ruling A-R49). Since F2 it is the
+    /// Both runs stopped `Refused` at `PublishAuthorityView` (lead ruling A-R49) until A-R63
+    /// routed that view to its consumers; both now run on to the deadline. Since F2 it is the
     /// partitions install's view, one pop after each adoption: the clean run adopts on the
     /// commit, the faulted one on the read-back of the record the store did write. So the store
     /// starts with a record naming node 1 owner (lead ruling B-R39). Neither run is cut short by
-    /// the deadline or the budget.
+    /// the budget.
     #[test]
     fn an_injected_control_fault_and_a_clean_run_diverge() {
         use crate::sim::control::ControlOp;
@@ -741,8 +745,16 @@ mod tests {
             let (trace, report) = execute(&plan).expect("a run");
             assert_eq!(
                 report.stop.refusal(),
-                Some("harness::dispatch::deliver::kernel"),
-                "each run stops at A1's first PublishAuthorityView (A-R49), not at a limit: {:?}",
+                None,
+                "since A-R63 A1's view is routed, not refused, so neither run stops at it: {:?}",
+                report.stop
+            );
+            assert!(
+                matches!(
+                    report.stop,
+                    crate::harness::run::StopReason::DeadlineReached { .. }
+                ),
+                "each run goes on to the deadline, not the budget: {:?}",
                 report.stop
             );
             trace

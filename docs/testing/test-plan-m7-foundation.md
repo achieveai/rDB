@@ -1,4 +1,4 @@
-<!-- drift-basis: f616ddf -->
+<!-- drift-basis: 9235bfb -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -781,6 +781,110 @@ and its proof commands 1, 2, 4 and 5 are likewise still written for the `M7F-01�
 narrative of 58 is one short. Those are §14's and §17's edits, not §15's, and §15 does not make
 them: this subsection records what a row-by-row re-read found, which is the only thing that
 licenses the marker above it.
+
+### 15.3 Rebase from `f616ddf` to `9235bfb`
+
+`9235bfb` ("M7 checkpoint — A1 takeover, kernel-b R1/L1/F1, kernel seam...") is now the newest
+commit to touch `crates/rdb-core/src/contracts`. Re-read 2026-09-26, row by row, via
+`git show 9235bfb:<path>` — never the working tree, which other agents hold uncommitted edits in.
+
+```
+$ git diff --stat f616ddf 9235bfb -- crates/rdb-core/src/contracts
+ crates/rdb-core/src/contracts/authority.rs     | 928 ++++++++
+ crates/rdb-core/src/contracts/errors.rs        |  43 +-
+ crates/rdb-core/src/contracts/event.rs         | 320 ++++-
+ crates/rdb-core/src/contracts/ignore.rs        | 245 +++ (new)
+ crates/rdb-core/src/contracts/membership.rs    |  24 +-
+ crates/rdb-core/src/contracts/protection.rs    | 172 +++ (new)
+ crates/rdb-core/src/contracts/qualification.rs | 105 +++ (new)
+ crates/rdb-core/src/contracts/recovery.rs      | 678 ++++ (new)
+ crates/rdb-core/src/contracts/storage.rs       |  33 +-
+ crates/rdb-core/src/contracts/trace.rs         | 214 ++-
+```
+
+This is the CB-7 commit the §15.2 note above anticipated, landed alongside kernel-b's whole R1/L1/F1
+vocabulary and kernel-a's A1 takeover types — far more than CB-7 alone, which is why the shift below
+is not the "+21" or the piecewise offsets either working-tree note guessed.
+
+**CB-7 is committed, exactly as predicted, and one count grew further in the interval.**
+`KernelEffect::Ignored`'s reason is `KernelIgnoredReason` (`contracts/ignore.rs:77`, still five
+arms: `Error`, `AppendRejected`, `AckRejected`, `Authority`, `Replica`); `KernelEvent` and
+`KernelEffect` are `Clone`, not `Copy` (confirmed: neither derive line at `event.rs` carries
+`Copy` any more). `AuthorityIgnoreReason` (`contracts/authority.rs`, kernel-a's leaf) is now
+**35** variants, not the 27 the 2026-09-22 working-tree reading found — nine more landed between
+that snapshot and this commit (`ExternalFenceRejected{mismatch}`, `GrantRecordNotNewer`,
+`LineageUnchanged`, `NotOurs`, `PartitionReadSuperseded`, `ResumeGapWithinTolerance`, `BootUnchanged`,
+`TakeoverAlreadyAuthorized`, `UnmatchedCompletion`, among others — count taken directly off the
+enum, not carried from the earlier note). `ReplicaIgnoreReason` (kernel-b's leaf,
+`contracts/ignore.rs`) is **19**, not the 12 that reading found. Neither growth is this plan's to
+police — foundation owns only the arm set (`Error`, `AppendRejected`, `AckRejected`, `Authority`,
+`Replica`), unchanged at five, and that is what `M7F-37`/`M7F-53`-style rows over the carrier
+would assert.
+
+**`EventKind` and `EffectKind` are still eight and seven.** `Kernel(KernelEvent)` and
+`Kernel(KernelEffect)` are unchanged as single arms; the growth above is entirely inside the two
+`#[non_exhaustive]` carried enums, which is the shape CB-1 was built for. Re-read at `9235bfb`:
+`EventKind::Kernel` at `event.rs:194`, `EffectKind::Kernel` at `event.rs:607`. Do not carry these
+two line numbers forward by a constant either — `KernelEvent` itself starts at `event.rs:238` and
+`KernelEffect` at `event.rs:363`, and both carriers gained many more variants than CB-7 alone
+(L1's `SetAdmission`, `ProtectionWarn`; F1's whole `Recovery`/`RecoveryEffect` surface; R1's
+`QualificationChanged`, `DivergenceDetected`, `CopyQuarantined`, the catch-up cursor's effects;
+A1's `Authority(AuthorityEvent)` / `Authority(AuthorityEffect)`), so the +21/+22 piecewise offsets
+either earlier note measured no longer apply at all — re-open each span, as both notes already
+warned.
+
+**CB-5 has landed, and it is wider than asked.** `BlockReason` (`contracts/authority.rs:462`) is
+now **seven** variants: `DivergenceRequiresOperator` (unchanged) plus `OvertakenByPeer`,
+`CasContention`, `ControlUnavailable`, `ControlUnknown`, `NoEligibleRegular` — the five ruling
+B-R34 asked for — and a sixth, `BarrierIncomplete { missing: Vec<CopyId> }`, that was not part of
+the original ask (kernel-b's design.md §5.6 mode-table `0` row and barrier-incomplete case, added
+at the seam freeze). `PartitionMode` (`:589`) is still four variants, `Blocked { reason }` among
+them. **`M7F-38` arm 2 is released**: the row can now assert all seven reasons survive the wire by
+value — this is foundation's own row, named in §14's owed list, so the release is recorded here
+for whoever next edits §14.
+
+**The CB-6 question (this plan's own §10-adjacent ruling "no widening, mapping only") is
+overtaken by the commit, and this is the largest finding of this re-read.** That ruling mapped
+kernel-a's `Fence`, `PublishAuthorityView`, `Decide` and `EventKind::Check` asks onto landed
+`ControlEffect`/`TraceKind` surfaces and refused new `EffectKind`/`EventKind` variants for them.
+At `9235bfb` real widened types exist and are **not** the refused top-level variants — they are
+kernel-a's own leaf, nested exactly where CB-7's convention puts a kernel's owned vocabulary:
+`AuthorityEvent` (`contracts/authority.rs:998`, four variants — `Check { checkpoint, lineage,
+correlation }`, `Answer(AuthorityDecision)`, `RevokeEpochRequested`, `EpochRevocationPersisted`)
+carried by `KernelEvent::Authority(AuthorityEvent)`, and `AuthorityEffect` (`:1102`, five
+variants — `Answer`, `Fence { scope, reason }`, `PublishAuthorityView(AuthorityView)`,
+`FenceProven(FencingProof)`, `Fact(AuthorityFact)`) carried by `KernelEffect::Authority
+(AuthorityEffect)`. `FencingProof` (`:264`, 8 fields) and `Revocation` (`:314`, 3 arms:
+`DurableDrain`, `ExpiryProven`, `ExternalFence`) also now exist — the ruling's "`grep -rn
+FencingProof crates/` ⇒ 0" premise no longer holds. This is **not** a correction to this plan's own
+rows (none asserts these types), but it directly falsifies the "no widening" ruling and kernel-a's
+row 15 blocker-closure text that quotes it; both live outside §15 (this plan's §10-adjacent
+section, kernel-a's §15 row 15) and are named here, not edited, per this task's scope. `Checkpoint`
+(`:25`) is unchanged at five variants including `OutboxDispatch`.
+
+**Everything else re-read at `9235bfb` and unchanged in shape, only in line.** `PartitionConfig`'s
+four public fields, still behind `#[serde(try_from = "UnvalidatedPartitionConfig")]`
+(`membership.rs:67`, `validate` at `:158`) — `validate` gained a member-uniqueness check (lead
+ruling B-R43: no two members may share a `CopyId` or a `NodeId`), which is an additional rule, not
+a field count change, so no row's literals move. `ErrorKind` (`errors.rs:81`) is now **19**
+variants, not 18 — `DivergenceRequiresOperator` was added (lead ruling R-S2) as the client layer of
+`BlockReason::DivergenceRequiresOperator`. No M7F row enumerates `ErrorKind` by count, so nothing
+here is falsified; recorded because it is exactly the kind of drift a set-equality row elsewhere
+(verification's `M7V-56`, over a different enum) exists to catch, and this plan should not
+independently assert one over `ErrorKind` without accounting for it. `OpSkipped.scenario_op_index:
+u32` still `u32` (`trace.rs:1183`, was `:1152` — the whole file shifted **+31** below the point
+`BudgetName`'s four new members were inserted, `trace.rs:129-152`; re-open every `trace.rs` span
+below that point rather than shifting by a constant, the same warning verification's §15 already
+carries for a different +37). `TraceKind::ProtectionState` still exactly seven fields, no
+`quorum_rule` (`trace.rs:1094-1109`). `TraceHeader.provenance` (`:243`, was `:212`) and
+`.partitions: u8` (`:247`, was `:216`) — both +31, both otherwise unchanged. `AppendReject` and
+`AppendOutcome` are outside this diff's file list (`envelope.rs` untouched between `f616ddf` and
+`9235bfb`) and are unchanged at sixteen and five. `Scheduler::pop`, `ControlStore::complete`/
+`submit`, and the absence of `harness::trace::validate` are all outside `contracts/` and untouched.
+
+None of the above changes an existing row's assertion; it releases `M7F-38` arm 2 (CB-5) and
+records that the CB-6 ruling text (outside §15) needs a look. Marker moved below after this
+re-read, not before it.
 
 ---
 

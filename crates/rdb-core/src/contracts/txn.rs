@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contracts::digest::{Digest, Domain};
 use crate::contracts::ids::{
-    AffinityId, Generation, OwnerEpoch, PartitionId, RequestIdentity, Seq,
+    AffinityId, Generation, OwnerEpoch, PartitionId, RequestIdentity, Seq, TenantId,
 };
 
 /// A client transaction, scoped to one affinity group (spec §5.1).
@@ -201,6 +201,34 @@ impl Mutation {
             Self::Put { key, .. } | Self::Delete { key, .. } => key,
         }
     }
+}
+
+/// Bytes of a key's structural prefix: the tenant (`u32`, big-endian), then the affinity group
+/// (`u64`, big-endian). ADR-rdb-0004 §2 makes both "structural prefix components, not part of
+/// the user key namespace", and gives C0 the encoding.
+pub const KEY_SCOPE_LEN: usize = 12;
+
+/// The storage key for `user_key` inside `(tenant, affinity)` (ADR-rdb-0004 §2).
+///
+/// Big-endian, so one affinity group is one contiguous key range. The prefix has a fixed width,
+/// so no `user_key` can be read back as a different tenant or group.
+#[must_use]
+pub fn scoped_key(tenant: TenantId, affinity: AffinityId, user_key: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(KEY_SCOPE_LEN + user_key.len());
+    out.extend_from_slice(&tenant.0.to_be_bytes());
+    out.extend_from_slice(&affinity.0.to_be_bytes());
+    out.extend_from_slice(user_key);
+    Bytes::from(out)
+}
+
+/// The `(tenant, affinity)` a key belongs to, or `None` for a key shorter than
+/// [`KEY_SCOPE_LEN`]. It reads the fixed-width components and never parses `user_key`, which is
+/// what makes T1's check 3 (`CROSS_AFFINITY`) a comparison rather than a parse.
+#[must_use]
+pub fn key_scope(key: &[u8]) -> Option<(TenantId, AffinityId)> {
+    let tenant = u32::from_be_bytes(key.get(0..4)?.try_into().ok()?);
+    let affinity = u64::from_be_bytes(key.get(4..KEY_SCOPE_LEN)?.try_into().ok()?);
+    Some((TenantId(tenant), AffinityId(affinity)))
 }
 
 /// Whether a condition held.

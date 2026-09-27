@@ -337,6 +337,32 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
 - The thresholds are §6.2's initial defaults for validation, not observed guarantees. They are
   configuration, and V8 measures them rather than assuming them.
 
+## Amendment 2026-09-26: a paused partition needs a keepalive (Gautam; lead ruling B-R60)
+
+**The gap.** Resume needs `replication_lag < 250 ms` for five continuous seconds, and
+`replication_lag(now) = now − peer_progress[c]` (§1). `peer_progress` moves only on an admitted
+ACK, and ACKs come only from writes. While paused, admission refuses writes. So once the peers
+reach the barrier, the ACKs stop, lag grows past 250 ms, the hold restarts and never completes. The
+partition never takes a write again. This applies to every pause, the recovery start included.
+Unit rows missed it because they script `PeerProgress` every tick. The simulator found it
+(dev-kb-l1 handoff §J: R1 durable view 0, L1 `Paused/BarrierNotDurable` 179 times over 9 s).
+
+**Decision.** While L1 is not `Healthy`, the R1 primary sends each regular secondary a keepalive
+every 100 ms, re-sending its head, so the secondary answers with an ordinary ACK. That ACK passes
+R1's admission rules and emits `PeerProgress` like any other. Nothing else changes: a dead or
+silent peer still blocks resume (fail-closed, §1 "absence is infinite lag"), and the exact
+durable barrier still gates `Paused → Reprotecting`.
+
+- R1 learns L1's state from L1's own `SetAdmission` effect, which the dispatcher also routes to
+  R1. There is no query between the modules (§ Consequences).
+- The keepalive stops on the `SetAdmission(Allow)` edge. A healthy or idle partition sends
+  nothing, so "idle never pauses" and the cost of a thousand idle partitions are unchanged.
+- This amends R1's "no timers" rule (team kernel-b `design.md` §3.6) for this one purpose.
+
+**Rejected:** counting a caught-up peer as zero lag. It needs no R1 change, but a peer that dies
+after catching up would no longer block resume, and a dead replica would flap the partition
+between a 5 s resume and a 2 s pause.
+
 ## Verification
 
 | Claim | How it is proven |
@@ -345,7 +371,8 @@ RPO. Shadow lag does not pause regular writes and gets its own alert (§9.2).
 | Admission rejected by 2.1 s | Kernel row: flip in the same step as `unsafe_age >= 2000`. Harness row: eval cadence ≤ 50 ms. Integration row: nothing admitted after wall tick 2,100 ms, end to end — **V8** |
 | No success without a qualifying secondary | Kill every regular secondary at t=0: admission rejects on the `QualificationChanged` edge, not at 2 s and not on the next eval; P1 independently refuses to publish — **V8** |
 | Resume reads liveness, not exposure | Reach `Reprotecting` with an empty unsafe queue, then stall a required copy's progress: the 5 s hold restarts instead of completing |
-| A peer never heard from blocks resume | Reach `Reprotecting` with one peer absent from `peer_progress`: `replication_lag` is infinite, `stalest_copy` names it, no `HealthEval` resumes; deliver one `PeerProgress` for it and resume follows 5 s later |
+| A peer never heard from blocks resume | Reach `Reprotecting` with one peer absent from `peer_progress`: `replication_lag` is infinite, `stalest_copy` names it, no `HealthEval` resumes; deliver `PeerProgress` for it at least every 250 ms and resume follows 5 s after the first (a single `PeerProgress` does not resume: lag passes 250 ms and the hold restarts — corrected 2026-09-26) |
+| A paused partition resumes with no writes (amendment 2026-09-26) | Recovered RF3 partition, all survivors live, no client writes: R1's keepalive draws ACKs, `PeerProgress` arrives every ≤ 100 ms per peer, and `SetAdmission(Allow)` lands by fence + barrier + 5 s + margin; a Submit then is not refused `PROTECTION_PAUSED`. Near-miss: one peer silent ⇒ never resumes. The keepalive stops on `Allow` |
 | Self is not in the lag domain | Primary sends no ACK to itself; with both peers reporting, `Reprotecting` completes — the earlier definition over a set containing self never did |
 | A lost copy leaves the lag domain | `CopyLost { C, Diverged }` during `Reprotecting` with the floor intact: the hold continues over the remaining peers and completes; `lost_copies` exports `[C]` |
 | A dropped `Lost` edge is caught outside L1 | Verification's dispatcher mutation drops the routed `QualificationChanged { Lost }`; the oracle reports an `Admitted` after the loss; no L1 row claims to catch this |

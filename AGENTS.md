@@ -182,6 +182,11 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   observed 2026-09-19, a second gate started while the first was running failed to link with
   `LNK1104: cannot open file ...m6_rotation.exe`, because the first run was executing the binary
   the second was trying to overwrite. The failure looks like a build error, not a collision.
+- **Never share one target directory between two trees, even one at a time.** Cargo records
+  dep-info paths relative to the workspace, so an export and the live tree look like the same
+  source to it. Observed 2026-09-26: a mutant built in an export was reused by a later live run,
+  because the live file was older than the mutant's rlib. That gave 5 false reds, 3 of them
+  blamed on another team's file. Every copy of the tree gets its own `CARGO_TARGET_DIR`.
 - **A negative compile probe goes outside the workspace, not in your own target directory.** A
   probe that must *fail* to compile — proving two enums cannot be spelled as each other, or that a
   derive is really gone — is a broken **source** file. Under `crates/*/tests/` it breaks every
@@ -282,6 +287,11 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   **Remove an id from `MISCREDITED` only by making its claim true on disk, never to settle a
   count** — and a blocker that dissolved because somebody else's uncommitted work landed under you
   is not the same as one you closed.
+- **A placeholder is not a row either.** An id whose every function calls `parked(..)` is
+  reported as `PARKED` and counted as owed. Such a function asserts only that a package still
+  reports `Unavailable`, and passes. The script detects this from the function body, so no list is
+  kept by hand. Found 2026-09-25: 8 verification ids read as landed this way. Upgrade a parked
+  row in place; it stops being parked once its body stops calling `parked(`.
 - `--strict` exits 1 when a row id exists on disk that no plan declares. That is either a typo in
   a prefix or a row somebody wrote without planning it; both are worth reading.
 - The tree moves while you run it. Several agents share this checkout, so a census names the

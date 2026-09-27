@@ -131,11 +131,35 @@ is_exempt() {
 # M7A-33 itself is now WRITABLE and owed, not blocked: `revoked_epochs` and `partitions_revision`
 # are both on `AuthorityStateView` in the working tree. The old "git grep ... is EMPTY" note above
 # is history. Nobody has written the row; that is a miss, not a blocker.
-MISCREDITED="M7A-28"
+#
+# M7V-47 (added 2026-09-26, lead L-R177da): the row is four mandatory cross-package cases run
+# through the real Runner and judged by the oracle. dev-verif slice 1 made one real (F1/R1); the
+# A1/P1 function asserts only that the bridge refuses op 6 (Expire) and parks on I1, and T1/P1 +
+# F1/T1 do not exist yet (teams/verification/dev-verif-handoff.md). The id's function exists; the
+# claim does not. Remove only when all four cases assert their claims.
+MISCREDITED="M7A-28 M7V-47"
 
 is_miscredited() {
   for m in $MISCREDITED; do [ "$m" = "$1" ] && return 0; done
   return 1
+}
+
+# A PARKED id has functions on disk, but every one of them calls `parked(..)`: it asserts only
+# that the package it needs still reports `Unavailable`, and passes. It is a placeholder, not a
+# row, and the plans say `Unavailable` is never a pass. Detected from the body, not listed by hand,
+# so a row upgraded in place stops being parked the moment its body stops calling `parked(`.
+# Found 2026-09-25 by the scenario audit: eight verification ids read as landed this way.
+parked_ids() {
+  find $TEST_DIRS -name '*.rs' 2>/dev/null | sort | while IFS= read -r f; do
+    awk -v p="$1" '
+      $0 ~ "^fn " p "_[0-9]" { if (cur != "") print cur, state
+                               id = $0; sub("^fn " p "_", "", id); sub("[^0-9].*$", "", id)
+                               cur = toupper(p) "-" id; state = "live"; next }
+      cur != "" && /parked\(/ { state = "parked" }
+      cur != "" && /^}/      { print cur, state; cur = "" }
+      END { if (cur != "") print cur, state }' "$f"
+  done | sort -u | awk '{ s[$1] = s[$1] " " $2 }
+    END { for (i in s) if (s[i] !~ /live/) print i }' | sort -u
 }
 
 # Row ids that have at least one test function on disk, e.g. m7f_43_foo -> M7F-43
@@ -168,12 +192,16 @@ report_scope() {
   # so it falls through into owed below, and keep it to print on its own line.
   : > /tmp/.census_landed.$$
   : > /tmp/.census_miscredited.$$
+  : > /tmp/.census_parked.$$
+  parked_ids "$pfx" > /tmp/.census_parked_all.$$ || true
   while IFS= read -r id; do
     [ -z "$id" ] && continue
     if is_miscredited "$id"; then echo "$id" >> /tmp/.census_miscredited.$$
+    elif grep -qx "$id" /tmp/.census_parked_all.$$; then echo "$id" >> /tmp/.census_parked.$$
     else echo "$id" >> /tmp/.census_landed.$$; fi
   done < /tmp/.census_landed_raw.$$
   n_miscredited=$(wc -l < /tmp/.census_miscredited.$$ | tr -d ' ')
+  n_parked=$(wc -l < /tmp/.census_parked.$$ | tr -d ' ')
 
   n_landed=$(wc -l < /tmp/.census_landed.$$ | tr -d ' ')
   n_declared=$(wc -l < /tmp/.census_declared.$$ | tr -d ' ')
@@ -207,6 +235,11 @@ report_scope() {
     tr '\n' ' ' < /tmp/.census_miscredited.$$
     printf '\n'
   fi
+  if [ "$n_parked" -gt 0 ]; then
+    printf '  row ids PARKED         : %s   (every function only calls parked(); counted as owed) ' "$n_parked"
+    tr '\n' ' ' < /tmp/.census_parked.$$
+    printf '\n'
+  fi
 
   if [ "$n_owed" -gt 0 ]; then
     printf '  owed: '
@@ -231,7 +264,9 @@ report_scope() {
   done
 
   rm -f /tmp/.census_landed.$$ /tmp/.census_declared.$$ /tmp/.census_owed.$$ \
-        /tmp/.census_owed_raw.$$ /tmp/.census_exempt.$$ /tmp/.census_unplanned.$$
+        /tmp/.census_owed_raw.$$ /tmp/.census_exempt.$$ /tmp/.census_unplanned.$$ \
+        /tmp/.census_parked.$$ /tmp/.census_parked_all.$$ /tmp/.census_miscredited.$$ \
+        /tmp/.census_landed_raw.$$
 }
 
 UNPLANNED_SEEN=0

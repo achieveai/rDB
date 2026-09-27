@@ -5,14 +5,14 @@
       "role": "Developers",
       "milestone": "M7",
       "task": "Kernel-a phase 2. Fixed the clock fencing defect. Landed the new names and a real watch backoff. Grant acquire waits for the seam work.",
-      "status": "running"
+      "status": "finished"
     },
     {
       "id": "dev-foundation-kernelseam",
       "role": "Developers",
       "milestone": "M7",
       "task": "Let the run loop record ignored and alert effects from kernels, with a trace line for each.",
-      "status": "running"
+      "status": "finished"
     },
     {
       "id": "tester-a1",

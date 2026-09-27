@@ -23,27 +23,28 @@ use rdb_core::contracts::ids::{
     BootId, ConfigVersion, CorrelationId, EventId, Generation, MessageId, NodeId, OwnerEpoch,
     PartitionId, ReplicaRole, ScenarioId, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
-use rdb_core::contracts::qualification::{
-    QualificationCause, QualificationChanged, QualificationDirection,
-};
+use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::recovery::RecoveryEffect;
+use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::storage::StoreEffect;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
     BudgetName, CapabilityState, DispatchOutcome, KernelNote, PackageId, Provenance, RunManifest,
     TopologyEntry, Trace, TraceHeader, TraceKind,
 };
-use rdb_core::contracts::transport::{Frame, SendEffect};
+use rdb_core::contracts::transport::{Frame, PeerLabel};
 use rdb_core::contracts::version::TRACE_SCHEMA_VERSION;
 use rdb_sim::harness::dispatch::{Adopted, Dispatcher, HOP_BUDGET_MILLIS};
 use rdb_sim::harness::manifest::{resolve, BudgetOverride};
 use rdb_sim::harness::replay::replay;
-use rdb_sim::harness::run::{execute, RunPlan, SeedEvent};
+use rdb_sim::harness::run::{execute, RunLimits, RunPlan, Runner, SeedEvent};
 use rdb_sim::harness::trace::{read_jsonl, write_jsonl, Recorder, Site};
 use rdb_sim::sim::clock::Clock;
 use rdb_sim::sim::cluster::{Cluster, ClusterConfig};
 use rdb_sim::sim::control::{ControlOp, ControlStore};
-use rdb_sim::sim::network::Network;
+use rdb_sim::sim::network::{Network, NetworkOp};
 use rdb_sim::sim::scheduler::Scheduler;
+use rdb_sim::storage::StorageOp;
 use rdb_sim::SimError;
 
 const NODE: NodeId = NodeId(1);
@@ -409,39 +410,52 @@ fn m7f_21_the_effect_to_event_hop_costs_zero_ticks_and_a_delay_costs_exactly_the
 /// An effect whose provider is not wired is refused by name, after everything before it was
 /// carried out; nothing is dropped silently.
 ///
-/// Carried by a `Store` effect since 2026-09-22 (lead ruling A-R40 / L-R142). It was a
-/// `TimerEffect::Cancel` until the timer wheel was wired, and the row is re-pointed rather than
-/// deleted: the claim is that an **unwired** provider refuses *by its own name* after the
-/// effects before it land, and `Timer` was only the example that carried it. `Store` and `Send`
-/// are still owed, so the claim is still owed a subject. Deleting the row because its example
-/// got built is how the guarantee for the remaining seams quietly stops being tested.
+/// **Re-pointed 2026-09-26 (lead ruling A-R61)**, the third time: carried by F1's
+/// `ProbeDigestAt` under `harness::dispatch::deliver::recovery`. It was a `Store` effect from
+/// 2026-09-22 (A-R40 / L-R142) until the store was wired to the memory engine, and a
+/// `TimerEffect::Cancel` before that. The claim is that an **unwired** provider refuses *by its
+/// own name* after the effects before it land; the example is only what carries it. A probe is a
+/// request to the environment that no provider answers yet, which is exactly that claim.
+///
+/// The `Store` that used to carry it is now carried out, and is the positive control here: it is
+/// delivered between the adoption and the probe, and its completion is queued.
 #[retcd_test]
 fn m7f_21_an_unwired_provider_is_refused_by_name_after_earlier_effects_land() {
     support::preamble();
     let mut dispatcher = Dispatcher::new();
     let mut control = ControlStore::new();
     let mut scheduler = Scheduler::new();
-    let store = Effect {
+    let effect = |kind: EffectKind| Effect {
         correlation: CorrelationId(1),
-        from: ModuleName::Authority,
+        from: ModuleName::Recovery,
         partition: PartitionId(1),
-        kind: EffectKind::Store(store_effect()),
+        kind,
     };
+    let snapshot = effect(EffectKind::Store(StoreEffect::Snapshot {
+        handle: SnapshotHandle(1),
+        partition: PartitionId(1),
+    }));
+    let probe = effect(EffectKind::Kernel(KernelEffect::Recovery(
+        RecoveryEffect::ProbeDigestAt {
+            copy: rdb_core::contracts::membership::CopyId(2),
+            seq: Seq(1),
+        },
+    )));
 
     let error = dispatcher
         .deliver(
             NODE,
             BOOT,
-            vec![adopt(1, 1, 1, 1), store],
+            vec![adopt(1, 1, 1, 1), snapshot, probe],
             &mut control,
             &mut scheduler,
         )
-        .expect_err("the store is not wired");
+        .expect_err("no provider answers a digest probe");
 
     assert_eq!(
         error,
         SimError::Unavailable {
-            seam: "harness::dispatch::deliver::store"
+            seam: "harness::dispatch::deliver::recovery"
         }
     );
     assert_eq!(
@@ -449,7 +463,12 @@ fn m7f_21_an_unwired_provider_is_refused_by_name_after_earlier_effects_land() {
         Generation(1),
         "the adoption before the refused effect was carried out"
     );
-    tracing::info!(seam = "harness::dispatch::deliver::store", "m7f_21 seam");
+    assert_eq!(
+        scheduler.queued(),
+        1,
+        "the store effect before it was carried out too, and completed"
+    );
+    tracing::info!(seam = "harness::dispatch::deliver::recovery", "m7f_21 seam");
 }
 
 /// Every distinct seam string literal this crate's `src` contains, in sorted order.
@@ -516,90 +535,148 @@ fn seam_literals_in_src() -> Vec<String> {
 /// Before this row existed the `seam` field appeared on no line anywhere, so Q-61 was not
 /// returning zero rows — it was a binder error on a column that had no source.
 ///
-/// **The set is six, not seven, since 2026-09-22** (lead ruling A-R40 / L-R142): the `timer`
-/// seam under `harness::dispatch::deliver` is gone, because [`Dispatcher::deliver`] routes an
-/// `EffectKind::Timer` to the clock's wheel rather than refusing it. Named the long way round
-/// on purpose, so that a grep for the live seam vocabulary does not hit a sentence about a seam
-/// that no longer exists. The row keeps
-/// every other member and its shape — the claim is about seams that are still owed, and `Send`,
-/// `Store` and `Kernel` still are.
+/// **Re-pointed 2026-09-26 (lead ruling A-R61): the set is seven, and four of them are new.**
+/// `send` and `store` under `harness::dispatch::deliver`, and `Network`'s `send`, are gone:
+/// a `Send` goes through the controlled network and a `Store` through the memory engine. Named
+/// the long way round on purpose, so a grep for the live seam vocabulary does not hit a sentence
+/// about seams that no longer exist. What replaced them is what those providers still cannot do,
+/// each refused under its own name:
 ///
-/// **The `kernel` seam narrowed on 2026-09-22 and stayed in the set** (lead ruling A-R46). It
-/// used to refuse every `EffectKind::Kernel`; it now refuses every arm whose consumer is not
-/// routed: `Recovered`, `QualificationChanged`, R1's and F1's outputs, and every `Authority` arm
-/// but `Fact`. Recorded instead: `Ignored` and `Alert` (A-R46), `Authority`'s `Fact` (A-R49), and
-/// L1's `SetAdmission` and `ProtectionWarn` (B-R42). All refusals share the one literal, so the
-/// count stays six.
+/// * `deliver::crash` — a planned crash fired; restarting the node is owed.
+/// * `deliver::recovery` — one of F1's five requests with no provider (lead ruling A-R64).
+/// * `run::route` — a routed kernel fact whose named, wired consumer declined it. Permanent, like
+///   `replay::replay`: continuing would drop the fact (B-R28).
+/// * `Network::forge_ack` — the network does not rewrite reply bodies. **Narrowed 2026-09-26
+///   (lead ruling L-R177do):** a forgery the frame can carry — a forged label, authenticated or
+///   not — is delivered, and R1 refuses it itself. Only an authenticated forgery whose lie is a
+///   role inside the body is still refused here, and that is now the example.
 ///
-/// The row's `Kernel` example was an `Ignored`, then a `SetAdmission`, and is now a
-/// `QualificationChanged`: each time the arm it used started being recorded. Re-pointed, not
-/// deleted: the claim is that the seam refuses by its own name, and the arm is only the example
-/// that carries it. **The example must be an arm with no routed consumer**, so when L1 or P1
-/// routes `QualificationChanged`, re-point it again rather than delete it. What a recorded arm
-/// now does is asserted by the `i1_scaffolding_*` and `h1_scaffolding_*` rows in
-/// `tests/harness.rs`, and by `harness::dispatch`'s own scaffolding. None carries this row's id,
-/// because none asserts this row's claim.
+/// The `kernel` seam stays, narrowed again: it now refuses only arms with no consumer at all —
+/// R1's `SnapshotCatchupRequired` and `CopyAheadOnControl`. Its example was an `Ignored`, a
+/// `SetAdmission`, a `QualificationChanged`, a `SendEnvelopes` (given its provider by lead ruling
+/// B-R57), and is now a `SnapshotCatchupRequired`: each time, the arm it used started being
+/// recorded, routed or provided.
+/// **The example must be an arm with no consumer.** When one is given a provider, re-point it
+/// again rather than delete it. What a routed arm does is asserted by the `route_*` scaffolding
+/// at the end of this file, which carries no row id because none asserts this row's claim.
 #[retcd_test]
 fn m7f_26_every_unbuilt_seam_refuses_by_its_own_name() {
     support::preamble();
     let mut seams: Vec<&'static str> = Vec::new();
 
-    // I1: replay is owed.
+    // I1: replay from a bare trace refuses, by design and permanently.
     let trace = Trace {
         header: header(Provenance::Generated { seed: 1 }),
         events: Vec::new(),
     };
     seams.push(seam_of(replay(&trace).map(|_| ())));
 
-    // H1: the network and the cluster lifecycle are owed.
+    // H1: a forged acknowledgement whose lie is inside its body — a shadow's ACK claiming to be
+    // a regular secondary under a real credential — and the cluster's suspend.
     let mut network = Network::new();
+    network
+        .inject(NetworkOp::ForgeAck {
+            from: NodeId(1),
+            to: NodeId(2),
+            claimed_node: NodeId(3),
+            claimed_role: ReplicaRole::RegularSecondary,
+            authenticated: true,
+        })
+        .expect("a plan between two distinct nodes");
+    let label = PeerLabel {
+        node: NodeId(1),
+        boot: BOOT,
+        authenticated: true,
+    };
     seams.push(seam_of(
-        network.send(NodeId(1), NodeId(2), frame()).map(|_| ()),
+        network
+            .send(NodeId(1), NodeId(2), label, ack_frame(ReplicaRole::Shadow))
+            .map(drop),
     ));
     let mut cluster = Cluster::new(support::cluster()).expect("a four-node cluster");
     seams.push(seam_of(cluster.suspend(NodeId(1), 10)));
 
-    // I1: the three effect kinds the dispatcher has no provider for. `EffectKind::Timer` was the
-    // fourth until A-R40 wired it. What it does instead is asserted in `harness::dispatch`'s and
-    // `harness::run`'s own scaffolding — a wired kind's claim is what it *does*, and this row is
-    // about what is still owed. For `Kernel`, "owed" means an arm whose consumer is not routed
-    // (A-R46, B-R42); the recorded arms are not owed, so the example is a `QualificationChanged`.
-    for effect in [
-        EffectKind::Send(send_effect()),
-        EffectKind::Store(store_effect()),
-        EffectKind::Kernel(KernelEffect::QualificationChanged(qualification_edge())),
+    // I1: a crash, an unprovided F1 request, and a kernel arm with no consumer, each delivered
+    // alone to a fresh dispatcher.
+    let one = |kind: EffectKind| Effect {
+        correlation: CorrelationId(1),
+        from: ModuleName::Replication,
+        partition: PartitionId(1),
+        kind,
+    };
+    for (crash, effect) in [
+        (
+            true,
+            EffectKind::Store(StoreEffect::Snapshot {
+                handle: SnapshotHandle(1),
+                partition: PartitionId(1),
+            }),
+        ),
+        (
+            false,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::ProbeDigestAt {
+                copy: CopyId(2),
+                seq: Seq(1),
+            })),
+        ),
+        (
+            false,
+            EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+                copy: CopyId(2),
+                barrier: Seq(1),
+            }),
+        ),
     ] {
         let mut dispatcher = Dispatcher::new();
         let mut control = ControlStore::new();
         let mut scheduler = Scheduler::new();
-        let refused = dispatcher.deliver(
-            NODE,
-            BOOT,
-            vec![Effect {
-                correlation: CorrelationId(1),
-                from: ModuleName::Authority,
-                partition: PartitionId(1),
-                kind: effect,
-            }],
-            &mut control,
-            &mut scheduler,
-        );
+        if crash {
+            dispatcher
+                .inject_storage(StorageOp::Crash {
+                    node: NODE,
+                    fault: StorageFault::ProcessCrash,
+                })
+                .expect("a crash on the node's own engine");
+        }
+        let refused =
+            dispatcher.deliver(NODE, BOOT, vec![one(effect)], &mut control, &mut scheduler);
         seams.push(seam_of(refused));
         assert_eq!(scheduler.queued(), 0, "a refused effect queues nothing");
     }
+
+    // I1: a routed fact whose named consumer declines. R1 is the only consumer of a divergence
+    // and has no primary installed, so it declines, and the run stops rather than drop the fact.
+    let mut runner = Runner::new(&RunPlan::new(support::cluster())).expect("a runner");
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![one(EffectKind::Kernel(KernelEffect::DivergenceDetected {
+                copy: CopyId(2),
+            }))],
+        )
+        .expect("a divergence is routed, not refused, at delivery");
+    seams.push(seam_of(
+        runner
+            .run(RunLimits::SMALL)
+            .expect("the run itself does not fail")
+            .into_result()
+            .map(drop),
+    ));
 
     for seam in &seams {
         tracing::info!(seam, "m7f_26 seam");
     }
 
-    /// The seams still owed, sorted. Six since 2026-09-22; seven before, when `Timer` was one.
-    const OWED_SEAMS: [&str; 6] = [
+    /// The seams still refused by name, sorted. Seven since 2026-09-26; six before.
+    const OWED_SEAMS: [&str; 7] = [
+        "harness::dispatch::deliver::crash",
         "harness::dispatch::deliver::kernel",
-        "harness::dispatch::deliver::send",
-        "harness::dispatch::deliver::store",
+        "harness::dispatch::deliver::recovery",
         "harness::replay::replay",
+        "harness::run::route",
         "sim::cluster::Cluster::suspend",
-        "sim::network::Network::send",
+        "sim::network::Network::forge_ack",
     ];
 
     let mut distinct = seams.clone();
@@ -626,43 +703,40 @@ fn frame() -> Frame {
         id: MessageId(1),
         protocol: 1,
         config: ConfigVersion(1),
+        sender: send_lineage(),
         body: bytes::Bytes::new(),
     }
 }
 
-fn send_effect() -> SendEffect {
-    SendEffect::Unicast {
-        to: NodeId(2),
-        frame: frame(),
+/// [`frame`] carrying an acknowledgement: R1's reply, `Accepted`, from node 1 as `role`.
+fn ack_frame(role: ReplicaRole) -> Frame {
+    use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, ReplicaProgress};
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, ReceivedSeq};
+    let lineage = send_lineage();
+    Frame {
+        body: rdb_core::replication::wire::encode_reply(&AppendOutcome::Accepted(AppendAck {
+            partition: lineage.partition,
+            generation: lineage.generation,
+            owner_epoch: lineage.owner_epoch,
+            config_version: ConfigVersion(1),
+            from: NodeId(1),
+            boot: BOOT,
+            role,
+            progress: ReplicaProgress {
+                received: ReceivedSeq(1),
+                buffered_applied: AppliedSeq(1),
+                durable: DurableSeq(0),
+            },
+            digest_at_buffered: rdb_core::contracts::digest::Digest::ROOT,
+        })),
+        ..frame()
     }
 }
 
-fn store_effect() -> StoreEffect {
-    StoreEffect::Release {
-        handle: SnapshotHandle(1),
-    }
-}
-
-/// R1's qualification edge: the payload of the `QualificationChanged` that carries `M7F-26`'s
-/// `kernel` example, an arm whose consumers (L1, P1) are not routed. It replaced a
-/// `SetAdmission`, which lead ruling B-R42 records. The values are irrelevant to a seam row; the
-/// arm is the point.
-fn qualification_edge() -> QualificationChanged {
-    QualificationChanged {
-        lineage: rdb_core::contracts::authority::Lineage {
-            partition: PartitionId(1),
-            generation: Generation(1),
-            owner_epoch: OwnerEpoch(1),
-        },
-        config_version: ConfigVersion(1),
-        at_seq: Seq(0),
-        direction: QualificationDirection::Gained,
-        qualified_copies: vec![rdb_core::contracts::membership::CopyId(2)],
-        qualified_ack_count: 1,
-        cause: QualificationCause::AckAdvanced,
-        tick: Tick::ZERO,
-    }
-}
+// `send_effect()`, `store_effect()` and `qualification_edge()` lived here until 2026-09-26.
+// They were fixtures for `M7F-26`'s `send`, `store` and `kernel` examples; the first two seams
+// are wired and the third example is now a `SendEnvelopes` (A-R61). Removed rather than left
+// dead: they are fixtures, not assertions.
 
 // `timer_effect()` lived here until 2026-09-22. It was a fixture for `M7F-26`'s fourth refusable
 // kind and had no other caller, and `EffectKind::Timer` is no longer refusable (A-R40). Removed
@@ -866,5 +940,4251 @@ fn i1_scaffolding_an_authority_fact_reaches_the_trace_through_the_loop() {
         ),
         "A1 answered that offer with at least the Fact: {:?}",
         dispatch.kind
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Scaffolding for the providers and the kernel routing (dev-sim-route, 2026-09-26). No row
+// ids: each shows one wiring path (effect, provider, completion, module) is reachable, and
+// none asserts a plan row's claim. Rows that do come after a manual tester's thumbs-up.
+// ------------------------------------------------------------------------------------------
+
+/// A second node, under a boot distinct from `BOOT`, so a delivery shows whose boot it carries.
+const PEER: NodeId = NodeId(2);
+const PEER_BOOT: BootId = BootId(7);
+
+fn effect_from(module: ModuleName, kind: EffectKind) -> Effect {
+    Effect {
+        correlation: CorrelationId(1),
+        from: module,
+        partition: PartitionId(1),
+        kind,
+    }
+}
+
+/// `NODE` and `PEER`, both registered.
+fn two_nodes() -> Dispatcher {
+    let mut dispatcher = Dispatcher::new();
+    dispatcher.register_node(NODE, BOOT);
+    dispatcher.register_node(PEER, PEER_BOOT);
+    dispatcher
+}
+
+fn deliver_on(
+    dispatcher: &mut Dispatcher,
+    scheduler: &mut Scheduler,
+    node: NodeId,
+    effect: Effect,
+) -> Result<(), SimError> {
+    let boot = if node == PEER { PEER_BOOT } else { BOOT };
+    dispatcher.deliver(
+        node,
+        boot,
+        vec![effect],
+        &mut ControlStore::new(),
+        scheduler,
+    )
+}
+
+fn send_to(to: NodeId) -> Effect {
+    use rdb_core::contracts::transport::SendEffect;
+    effect_from(
+        ModuleName::Replication,
+        EffectKind::Send(SendEffect::Unicast { to, frame: frame() }),
+    )
+}
+
+fn store(store: StoreEffect) -> Effect {
+    effect_from(ModuleName::Transaction, EffectKind::Store(store))
+}
+
+#[retcd_test]
+fn send_a_planned_delay_delivers_on_the_recipient_under_its_boot() {
+    use rdb_core::contracts::transport::TransportEvent;
+    use rdb_sim::sim::network::Delivery;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    dispatcher
+        .inject_network(NetworkOp::PlanNext {
+            from: NODE,
+            to: PEER,
+            delivery: Delivery::Deliver { delay_millis: 50 },
+        })
+        .expect("a plan between two nodes");
+
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, send_to(PEER)).expect("a send");
+
+    assert_eq!(
+        scheduler.queued(),
+        1,
+        "a delivered frame is scheduled, never dropped silently"
+    );
+    let arrival = scheduler.pop().expect("the frame arrives");
+    assert_eq!(arrival.at, Tick(50), "now plus the planned delay");
+    assert_eq!((arrival.node, arrival.boot), (PEER, PEER_BOOT));
+    assert_eq!(
+        arrival.kind,
+        EventKind::Transport(TransportEvent::Delivered {
+            from: PeerLabel {
+                node: NODE,
+                boot: BOOT,
+                authenticated: true,
+            },
+            frame: frame(),
+        })
+    );
+    assert_eq!(scheduler.queued(), 0, "one frame, one arrival");
+}
+
+#[retcd_test]
+fn send_a_duplicate_arrives_twice_and_a_drop_schedules_nothing_but_is_recorded() {
+    use rdb_sim::sim::network::Delivery;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    for delivery in [
+        Delivery::Duplicate {
+            delay_millis: 0,
+            second_delay_millis: 20,
+        },
+        Delivery::Drop,
+    ] {
+        dispatcher
+            .inject_network(NetworkOp::PlanNext {
+                from: NODE,
+                to: PEER,
+                delivery,
+            })
+            .expect("a plan between two nodes");
+    }
+
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, send_to(PEER)).expect("the duplicate");
+    let ticks: Vec<Tick> = std::iter::from_fn(|| scheduler.pop())
+        .map(|event| event.at)
+        .collect();
+    assert_eq!(
+        ticks,
+        vec![Tick(0), Tick(20)],
+        "two arrivals, at their planned delays"
+    );
+
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, send_to(PEER)).expect("the drop");
+    assert_eq!(scheduler.queued(), 0, "a dropped frame schedules nothing");
+    let last = dispatcher
+        .network()
+        .transmissions()
+        .last()
+        .copied()
+        .expect("the drop is a transmission");
+    assert_eq!((last.copies, last.partitioned), (0, false), "{last:?}");
+    assert_eq!(dispatcher.network().transmissions().len(), 2);
+}
+
+#[retcd_test]
+fn send_a_partition_or_an_unknown_node_fails_back_to_the_sender_now() {
+    use rdb_core::contracts::transport::{LinkFault, TransportEvent};
+    use rdb_sim::sim::network::LinkState;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    dispatcher
+        .inject_network(NetworkOp::SetLink {
+            a: NODE,
+            b: PEER,
+            state: LinkState::Partitioned,
+        })
+        .expect("a link between two nodes");
+
+    for (to, fault) in [
+        (PEER, LinkFault::Partitioned),
+        (NodeId(9), LinkFault::Unreachable),
+    ] {
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, send_to(to)).expect("a failed send");
+        let failed = scheduler.pop().expect("the sender learns");
+        assert_eq!((failed.at, failed.node, failed.boot), (Tick(0), NODE, BOOT));
+        assert_eq!(
+            failed.kind,
+            EventKind::Transport(TransportEvent::SendFailed {
+                id: MessageId(1),
+                fault,
+            }),
+            "to {to:?}"
+        );
+    }
+}
+
+#[retcd_test]
+fn store_a_commit_completes_and_a_planned_failure_says_so() {
+    use rdb_core::contracts::ids::{AppliedSeq, BatchId};
+    use rdb_core::contracts::storage::StorageEvent;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+
+    let commit = store(StoreEffect::Commit(support::batch(1, 1, b"k", b"v")));
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, commit).expect("a commit");
+    assert_eq!(
+        scheduler.pop().map(|event| event.kind),
+        Some(EventKind::Storage(StorageEvent::Committed {
+            batch: BatchId(1),
+            applied: AppliedSeq(1),
+        }))
+    );
+
+    dispatcher
+        .inject_storage(StorageOp::Fail {
+            node: NODE,
+            fault: StorageFault::WriteFailed,
+        })
+        .expect("a planned fault");
+    let commit = store(StoreEffect::Commit(support::batch(1, 2, b"k", b"w")));
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, commit).expect("a failure completes");
+    assert_eq!(
+        scheduler.pop().map(|event| event.kind),
+        Some(EventKind::Storage(StorageEvent::CommitFailed {
+            batch: BatchId(2),
+            fault: StorageFault::WriteFailed,
+        }))
+    );
+}
+
+/// The `Store` provider never marks unflushed data durable: every prefix a `Flushed` carries is
+/// the engine's answer, and a short, false or failed flush moves the engine's own watermark no
+/// further than it synced.
+#[retcd_test]
+fn store_a_flush_reports_only_what_the_engine_synced() {
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, FlushTicket};
+    use rdb_core::contracts::storage::{CapturedPrefix, DurablePrefix, StorageEvent};
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    for seq in 1..=2 {
+        let commit = store(StoreEffect::Commit(support::batch(1, seq, b"k", b"v")));
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, commit).expect("a commit");
+        scheduler.pop();
+    }
+    let flush = |ticket: u64| {
+        store(StoreEffect::Flush {
+            ticket: FlushTicket(ticket),
+            captured: vec![CapturedPrefix {
+                partition: PartitionId(1),
+                generation: Generation(1),
+                through: AppliedSeq(2),
+            }],
+        })
+    };
+    let durable_through = |through: u64| DurablePrefix {
+        partition: PartitionId(1),
+        generation: Generation(1),
+        through: DurableSeq(through),
+    };
+
+    let cases = [
+        (
+            Some(StorageOp::ShortFlush {
+                node: NODE,
+                through: AppliedSeq(1),
+            }),
+            StorageEvent::Flushed {
+                ticket: FlushTicket(1),
+                durable: vec![durable_through(1)],
+            },
+            1,
+        ),
+        (
+            Some(StorageOp::FalseDurable {
+                node: NODE,
+                through: AppliedSeq(2),
+            }),
+            StorageEvent::Flushed {
+                ticket: FlushTicket(2),
+                durable: Vec::new(),
+            },
+            1,
+        ),
+        (
+            Some(StorageOp::Fail {
+                node: NODE,
+                fault: StorageFault::FlushFailed,
+            }),
+            StorageEvent::FlushFailed {
+                ticket: FlushTicket(3),
+                fault: StorageFault::FlushFailed,
+            },
+            1,
+        ),
+        (
+            None,
+            StorageEvent::Flushed {
+                ticket: FlushTicket(4),
+                durable: vec![durable_through(2)],
+            },
+            2,
+        ),
+    ];
+    for (ticket, (fault, answer, durable)) in (1..).zip(cases) {
+        if let Some(op) = fault {
+            dispatcher.inject_storage(op).expect("a planned fault");
+        }
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, flush(ticket)).expect("a flush");
+        assert_eq!(
+            scheduler.pop().map(|event| event.kind),
+            Some(EventKind::Storage(answer)),
+            "flush {ticket}"
+        );
+        assert_eq!(
+            dispatcher
+                .engine(NODE)
+                .expect("the node's engine")
+                .durable(PartitionId(1), Generation(1)),
+            DurableSeq(durable),
+            "flush {ticket}: the engine's own watermark"
+        );
+    }
+}
+
+/// Lead ruling L-R177do, [`StorageOp::StallFlush`] on the engine alone. While it is planned,
+/// every sync stalls: `stalled_sync` answers `true` for each, holds each capture, and nothing
+/// becomes durable. No sync takes it. A crash image does not carry it: the reopened engine
+/// syncs again.
+#[retcd_test]
+fn storage_a_stalled_flush_holds_every_sync_and_makes_nothing_durable() {
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
+    use rdb_core::contracts::storage::CapturedPrefix;
+    use rdb_sim::storage::crash_image::CrashImage;
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let old = Generation(1);
+    let mut engine = MemoryEngine::new(NODE);
+    for batch in send_history(2).batches {
+        engine.commit(batch).expect("a commit");
+    }
+    engine
+        .inject(StorageOp::StallFlush { node: NODE })
+        .expect("a planned stall");
+    let capture = |through: u64| {
+        vec![CapturedPrefix {
+            partition: PartitionId(1),
+            generation: old,
+            through: AppliedSeq(through),
+        }]
+    };
+    assert!(engine.stalled_sync(&capture(1)), "the first sync stalls");
+    assert!(
+        engine.stalled_sync(&capture(2)),
+        "and so does the next: no sync takes a stall"
+    );
+    assert!(engine.has_planned(), "still planned");
+    assert_eq!(
+        engine.stalled_syncs(),
+        &[capture(1), capture(2)][..],
+        "each capture it held, in order"
+    );
+    assert_eq!(
+        engine.durable(PartitionId(1), old),
+        DurableSeq(0),
+        "nothing durable"
+    );
+    let mut reopened = CrashImage::of(&engine, StorageFault::ProcessCrash)
+        .expect("an image")
+        .reopen(NODE);
+    assert!(
+        !reopened.stalled_sync(&capture(2)),
+        "a restarted engine syncs again"
+    );
+    reopened.sync_wal_through(capture(2)).expect("a sync");
+    assert_eq!(reopened.durable(PartitionId(1), old), DurableSeq(2));
+}
+
+/// Lead ruling L-R177do, through the `Store` provider: a flush on a stalled engine is never
+/// answered — no `Flushed`, no `FlushFailed` — and is not silent: the engine holds its capture.
+/// The same flush on the other node, which is not stalled, is answered as usual.
+#[retcd_test]
+fn store_a_stalled_flush_is_never_answered_and_its_capture_is_held() {
+    use rdb_core::contracts::ids::{AppliedSeq, FlushTicket};
+    use rdb_core::contracts::storage::{CapturedPrefix, StorageEvent};
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    let captured = vec![CapturedPrefix {
+        partition: PartitionId(1),
+        generation: Generation(1),
+        through: AppliedSeq(1),
+    }];
+    let flush = store(StoreEffect::Flush {
+        ticket: FlushTicket(1),
+        captured: captured.clone(),
+    });
+    for node in [NODE, PEER] {
+        let commit = store(StoreEffect::Commit(support::batch(1, 1, b"k", b"v")));
+        deliver_on(&mut dispatcher, &mut scheduler, node, commit).expect("a commit");
+        scheduler.pop();
+    }
+    dispatcher
+        .inject_storage(StorageOp::StallFlush { node: NODE })
+        .expect("a planned stall");
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, flush.clone()).expect("a flush");
+    assert_eq!(scheduler.queued(), 0, "a stalled flush is never answered");
+    assert_eq!(
+        dispatcher
+            .engine(NODE)
+            .expect("the node's engine")
+            .stalled_syncs(),
+        &[captured][..],
+        "and not silent: the engine holds its capture"
+    );
+    deliver_on(&mut dispatcher, &mut scheduler, PEER, flush).expect("a flush");
+    assert!(
+        matches!(
+            scheduler.pop().map(|event| event.kind),
+            Some(EventKind::Storage(StorageEvent::Flushed { .. }))
+        ),
+        "the node that is not stalled answers"
+    );
+}
+
+#[retcd_test]
+fn store_a_snapshot_is_bound_and_released_once() {
+    use rdb_core::contracts::storage::StorageEvent;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    dispatcher
+        .deliver(
+            NODE,
+            BOOT,
+            vec![
+                adopt(1, 1, 1, 1),
+                store(StoreEffect::Commit(support::batch(1, 1, b"k", b"v"))),
+            ],
+            &mut ControlStore::new(),
+            &mut scheduler,
+        )
+        .expect("an adoption and a commit");
+    scheduler.pop();
+
+    let snapshot = store(StoreEffect::Snapshot {
+        handle: SnapshotHandle(4),
+        partition: PartitionId(1),
+    });
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, snapshot).expect("a snapshot");
+    assert_eq!(
+        scheduler.pop().map(|event| event.kind),
+        Some(EventKind::Storage(StorageEvent::SnapshotReady {
+            handle: SnapshotHandle(4),
+            at: Seq(1),
+        })),
+        "bound at the adopted lineage"
+    );
+
+    let release = || {
+        store(StoreEffect::Release {
+            handle: SnapshotHandle(4),
+        })
+    };
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, release()).expect("a release");
+    assert_eq!(scheduler.queued(), 0, "a release completes nothing");
+    assert_eq!(
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, release()),
+        Err(SimError::Config {
+            field: "snapshot_handle"
+        }),
+        "a handle is released once"
+    );
+}
+
+/// Coordinator, 2026-09-26: T1 and P1 read the stepping node's applied view; the other four
+/// keep the caller's (empty) view. P1's reads are safe on it only because P1 serves nothing
+/// from a view that is not at the published position.
+#[retcd_test]
+fn step_t1_and_p1_read_the_nodes_applied_view_and_no_other_module_does() {
+    use rdb_core::contracts::storage::SnapshotRead;
+    use rdb_sim::harness::dispatch::STEP_VIEW;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    assert!(
+        dispatcher
+            .step_view(ModuleName::Transaction, NODE, PartitionId(1))
+            .is_none(),
+        "no engine yet: the caller's view stands"
+    );
+    dispatcher
+        .deliver(
+            NODE,
+            BOOT,
+            vec![
+                adopt(1, 1, 1, 1),
+                store(StoreEffect::Commit(support::batch(1, 1, b"k", b"v"))),
+                store(StoreEffect::Commit(support::batch(1, 2, b"k", b"w"))),
+            ],
+            &mut ControlStore::new(),
+            &mut scheduler,
+        )
+        .expect("an adoption and two commits, never flushed");
+
+    for module in ModuleName::ALL {
+        let view = dispatcher.step_view(module, NODE, PartitionId(1));
+        match module {
+            ModuleName::Transaction | ModuleName::Publication => {
+                let view = view.expect("T1 and P1 read storage");
+                assert_eq!(view.at(), Seq(2), "applied, not durable: {module:?}");
+                assert_eq!(view.generation(), Generation(1));
+                assert_eq!(view.handle(), STEP_VIEW);
+                assert_eq!(
+                    view.get(rdb_core::contracts::storage::Namespace::User, b"k"),
+                    Some(Bytes::from_static(b"w"))
+                );
+            }
+            _ => assert!(view.is_none(), "{module:?} keeps the caller's view"),
+        }
+    }
+    assert_eq!(
+        dispatcher
+            .step_view(ModuleName::Transaction, PEER, PartitionId(1))
+            .map(|view| view.at()),
+        None,
+        "the peer has no engine: a node reads its own storage, never another's"
+    );
+}
+
+#[retcd_test]
+fn store_a_handle_still_bound_is_refused_not_rebound() {
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    let snapshot = || {
+        store(StoreEffect::Snapshot {
+            handle: SnapshotHandle(4),
+            partition: PartitionId(1),
+        })
+    };
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, snapshot()).expect("a first bind");
+    assert_eq!(scheduler.queued(), 1);
+
+    assert_eq!(
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, snapshot()),
+        Err(SimError::Config {
+            field: "snapshot_handle"
+        }),
+        "a second bind of a live handle would replace a view its holder still reads"
+    );
+    assert_eq!(scheduler.queued(), 1, "the refused bind completes nothing");
+    deliver_on(&mut dispatcher, &mut scheduler, PEER, snapshot())
+        .expect("a handle is per node: the peer's is its own");
+}
+
+/// A-R69a: a crash drops every view the node held, the node refuses storage until it restarts,
+/// and a handle reused after the restart opens fresh on the reopened engine. A host crash, so
+/// "fresh" is visible: the unsynced commit the first view saw is gone.
+#[retcd_test]
+fn store_a_crash_drops_the_nodes_views_and_a_reused_handle_opens_fresh_after_restart() {
+    use rdb_core::contracts::storage::StorageEvent;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    dispatcher
+        .deliver(
+            NODE,
+            BOOT,
+            vec![
+                adopt(1, 1, 1, 1),
+                store(StoreEffect::Commit(support::batch(1, 1, b"k", b"v"))),
+            ],
+            &mut ControlStore::new(),
+            &mut scheduler,
+        )
+        .expect("an adoption and a commit");
+    scheduler.pop();
+    let snapshot = || {
+        store(StoreEffect::Snapshot {
+            handle: SnapshotHandle(4),
+            partition: PartitionId(1),
+        })
+    };
+    let release = || {
+        store(StoreEffect::Release {
+            handle: SnapshotHandle(4),
+        })
+    };
+    let ready = |at: u64| {
+        Some(EventKind::Storage(StorageEvent::SnapshotReady {
+            handle: SnapshotHandle(4),
+            at: Seq(at),
+        }))
+    };
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, snapshot()).expect("a bind");
+    assert_eq!(scheduler.pop().map(|event| event.kind), ready(1));
+    // The peer holds the same handle number; its view must outlive the other node's crash.
+    deliver_on(&mut dispatcher, &mut scheduler, PEER, snapshot()).expect("the peer's bind");
+    scheduler.pop();
+
+    dispatcher
+        .inject_storage(StorageOp::Crash {
+            node: NODE,
+            fault: StorageFault::HostCrash,
+        })
+        .expect("a planned crash");
+    assert_eq!(
+        seam_of(deliver_on(&mut dispatcher, &mut scheduler, NODE, release())),
+        "harness::dispatch::deliver::crash",
+        "the crash is taken at the next storage effect"
+    );
+    assert_eq!(
+        seam_of(deliver_on(
+            &mut dispatcher,
+            &mut scheduler,
+            NODE,
+            snapshot()
+        )),
+        "harness::dispatch::deliver::crash",
+        "and the node stays down until it restarts"
+    );
+    assert_eq!(
+        dispatcher.restart(PEER, PEER_BOOT),
+        Err(SimError::Config { field: "restart" }),
+        "only a crashed node restarts"
+    );
+
+    dispatcher
+        .restart(NODE, BootId(2))
+        .expect("the crashed node restarts");
+    assert_eq!(
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, release()),
+        Err(SimError::Config {
+            field: "snapshot_handle"
+        }),
+        "the crash dropped the view: there is nothing to release"
+    );
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, snapshot()).expect("a fresh bind");
+    assert_eq!(
+        scheduler.pop().map(|event| event.kind),
+        ready(0),
+        "the reused handle reads the reopened engine, not the lost buffer"
+    );
+    deliver_on(&mut dispatcher, &mut scheduler, PEER, release())
+        .expect("the peer's view survived the other node's crash");
+    assert_eq!(scheduler.queued(), 0);
+}
+
+/// Every `ModuleDispatch` a run recorded, in order.
+fn dispatches(trace: &Trace) -> Vec<(ModuleName, DispatchOutcome)> {
+    trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::ModuleDispatch {
+                module, outcome, ..
+            } => Some((*module, *outcome)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A-R69a: `SnapshotReady` for a handle P1 minted is offered to P1 and to no other module.
+/// The outcome is P1's business and is not asserted; the addressing is.
+#[retcd_test]
+fn route_a_snapshot_p1_minted_is_offered_to_p1_alone() {
+    support::preamble();
+    let mut runner = Runner::new(&RunPlan::new(support::cluster())).expect("a runner");
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![effect_from(
+                ModuleName::Publication,
+                EffectKind::Store(StoreEffect::Snapshot {
+                    handle: SnapshotHandle(9),
+                    partition: PartitionId(1),
+                }),
+            )],
+        )
+        .expect("a bind");
+    let report = runner.run(RunLimits::SMALL).expect("the run");
+    let trace = runner.finish().expect("a trace");
+    tracing::info!(stop = ?report.stop, "snapshot addressed to P1");
+
+    let offered: Vec<ModuleName> = dispatches(&trace)
+        .into_iter()
+        .map(|(module, _)| module)
+        .collect();
+    assert_eq!(offered, vec![ModuleName::Publication]);
+}
+
+/// A-R69a: the addressed module's decline stops the run by name rather than drop the view it
+/// asked for. A1 mints no snapshots, so it declines one addressed to it today and always will.
+#[retcd_test]
+fn route_an_addressed_snapshot_its_module_declines_stops_the_run_by_name() {
+    use rdb_sim::harness::run::StopReason;
+    support::preamble();
+    let mut runner = Runner::new(&RunPlan::new(support::cluster())).expect("a runner");
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![effect_from(
+                ModuleName::Authority,
+                EffectKind::Store(StoreEffect::Snapshot {
+                    handle: SnapshotHandle(9),
+                    partition: PartitionId(1),
+                }),
+            )],
+        )
+        .expect("a bind");
+    let report = runner.run(RunLimits::SMALL).expect("the run");
+    let trace = runner.finish().expect("a trace");
+
+    assert!(
+        matches!(
+            report.stop,
+            StopReason::Refused {
+                seam: "harness::run::route",
+                module: ModuleName::Authority,
+                ..
+            }
+        ),
+        "{:?}",
+        report.stop
+    );
+    assert_eq!(
+        dispatches(&trace),
+        vec![(ModuleName::Authority, DispatchOutcome::Declined)]
+    );
+}
+
+#[retcd_test]
+fn store_a_revocation_is_persisted_and_routed_to_a1() {
+    use rdb_core::contracts::authority::AuthorityEvent;
+    use rdb_core::contracts::event::KernelEvent;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    let revoke = effect_from(
+        ModuleName::Authority,
+        EffectKind::Store(StoreEffect::PersistEpochRevocation {
+            partition: PartitionId(1),
+            epoch: OwnerEpoch(3),
+        }),
+    );
+
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, revoke).expect("a revocation");
+
+    assert!(dispatcher.epoch_revoked(NODE, PartitionId(1), OwnerEpoch(3)));
+    assert!(!dispatcher.epoch_revoked(PEER, PartitionId(1), OwnerEpoch(3)));
+    let persisted = scheduler.pop().expect("A1 learns");
+    assert_eq!(
+        persisted.kind,
+        EventKind::Kernel(KernelEvent::Authority(
+            AuthorityEvent::EpochRevocationPersisted {
+                partition: PartitionId(1),
+                epoch: OwnerEpoch(3),
+            }
+        ))
+    );
+    assert!(dispatcher.take_routed(persisted.id), "held to an answer");
+    assert!(!dispatcher.take_routed(persisted.id), "asked once");
+}
+
+#[retcd_test]
+fn store_a_host_flush_runs_at_its_tick_and_answers_with_the_engine() {
+    use rdb_core::contracts::ids::{DurableSeq, FlushTicket};
+    use rdb_core::contracts::storage::{DurablePrefix, StorageEvent};
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    let commit = store(StoreEffect::Commit(support::batch(1, 1, b"k", b"v")));
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, commit).expect("a commit");
+    scheduler.pop();
+    dispatcher.schedule_flush(Tick(5), NODE);
+
+    assert_eq!(
+        dispatcher.next_deadline(),
+        Some(Tick(5)),
+        "a flush is work still to do"
+    );
+    assert_eq!(
+        dispatcher
+            .fire_due_timers(Tick(4), &mut scheduler)
+            .expect("nothing due"),
+        0
+    );
+    assert_eq!(
+        dispatcher
+            .fire_due_timers(Tick(5), &mut scheduler)
+            .expect("the flush"),
+        1
+    );
+    let flushed = scheduler.pop().expect("the flush answers");
+    assert_eq!((flushed.at, flushed.node), (Tick(5), NODE));
+    assert_eq!(
+        flushed.kind,
+        EventKind::Storage(StorageEvent::Flushed {
+            ticket: FlushTicket(0),
+            durable: vec![DurablePrefix {
+                partition: PartitionId(1),
+                generation: Generation(1),
+                through: DurableSeq(1),
+            }],
+        })
+    );
+}
+
+/// The same-tick hop (a carried L-R175 item): a routed fact is scheduled at `now`, on the
+/// emitting node, partition and correlation, and marked for the run loop.
+#[retcd_test]
+fn route_a_kernel_fact_is_scheduled_in_the_same_tick_on_the_same_site() {
+    use rdb_core::contracts::event::KernelEvent;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    let applied = effect_from(
+        ModuleName::Transaction,
+        EffectKind::Kernel(KernelEffect::LocalApplied {
+            seq: Seq(1),
+            bytes: 10,
+            record_digest: support::ROOT_DIGEST,
+        }),
+    );
+
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, applied).expect("a routed fact");
+
+    let hop = scheduler.pop().expect("the fact is an event");
+    assert_eq!(
+        (hop.at, hop.node, hop.partition, hop.correlation),
+        (Tick(0), NODE, PartitionId(1), CorrelationId(1))
+    );
+    assert_eq!(
+        hop.kind,
+        EventKind::Kernel(KernelEvent::LocalApplied {
+            seq: Seq(1),
+            bytes: 10,
+            record_digest: support::ROOT_DIGEST,
+        })
+    );
+    assert!(dispatcher.take_routed(hop.id));
+}
+
+/// Ruling B-R46e(2): a configuration change is offered to L1 and P1 before R1, as the trace
+/// shows.
+#[retcd_test]
+fn route_a_config_change_reaches_l1_and_p1_before_r1_in_a_run() {
+    use rdb_core::contracts::event::KernelEvent;
+    support::preamble();
+    let mut plan = RunPlan::new(support::cluster());
+    plan.seed = vec![SeedEvent {
+        at: Tick(1),
+        node: NODE,
+        boot: BOOT,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+        kind: EventKind::Kernel(KernelEvent::ConfigChanged(support::rf3_config())),
+    }];
+    plan.limits.max_events = 1;
+    let (trace, report) = execute(&plan).expect("a run");
+
+    let order: Vec<ModuleName> = trace
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            TraceKind::ModuleDispatch { module, .. } => Some(module),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(order = ?order, stop = ?report.stop, "route config order");
+    assert!(
+        order.len() >= 3,
+        "all three consumers were offered: {order:?}"
+    );
+    assert_eq!(
+        order[..3],
+        [
+            ModuleName::Protection,
+            ModuleName::Publication,
+            ModuleName::Replication
+        ],
+        "consumers first, R1 last of them: {order:?}"
+    );
+}
+
+#[retcd_test]
+fn route_a_routed_fact_its_wired_consumer_declines_stops_the_run_by_name() {
+    use rdb_sim::harness::run::StopReason;
+    support::preamble();
+    let mut runner = Runner::new(&RunPlan::new(support::cluster())).expect("a runner");
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![effect_from(
+                ModuleName::Replication,
+                EffectKind::Kernel(KernelEffect::DivergenceDetected { copy: CopyId(2) }),
+            )],
+        )
+        .expect("routed, not refused, at delivery");
+
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+
+    assert!(
+        matches!(
+            report.stop,
+            StopReason::Refused {
+                seam: "harness::run::route",
+                module: ModuleName::Replication,
+                ..
+            }
+        ),
+        "R1 holds no primary, so it declines, and the decline stops the run: {:?}",
+        report.stop
+    );
+}
+
+/// Lead rulings A-R62 condition 1 and A-R65.2: every owed edge's consumer still reports
+/// `Unavailable`. When one flips to `Wired` this fails, and `OWED_EDGES` is re-read then.
+/// Kernel-b's edges are listed separately, because R1's package-level capability cannot retire
+/// one; its only edge, A1's view, left the table when R1 began answering it (B-R53).
+#[retcd_test]
+fn route_every_owed_consumer_still_reports_unavailable() {
+    use rdb_sim::harness::route::{Arm, Owner, OWED_EDGES};
+    support::preamble();
+    let report = Dispatcher::new().capability_report();
+    let slot = |module: ModuleName| {
+        ModuleName::ALL
+            .iter()
+            .position(|named| *named == module)
+            .expect("one of the six")
+    };
+
+    let mut kernel_b = Vec::new();
+    for (arm, consumer, owner) in OWED_EDGES {
+        match owner {
+            Owner::KernelA => assert_eq!(
+                report[slot(consumer)],
+                CapabilityState::Unavailable,
+                "{arm:?} -> {consumer:?} is owed, so its consumer must still be unwired"
+            ),
+            Owner::KernelB => kernel_b.push((arm, consumer)),
+        }
+    }
+    tracing::info!(edges = OWED_EDGES.len(), kernel_b = ?kernel_b, "owed edges");
+    assert_eq!(
+        kernel_b,
+        Vec::<(Arm, ModuleName)>::new(),
+        "kernel-b owes no edge since R1 answers A1's view (B-R53)"
+    );
+}
+
+/// Lead ruling A-R64(b): none of F1's seven requests to the environment is recorded as a
+/// `RecoveryFact`. Five are refused by name; the two with providers answer.
+#[retcd_test]
+fn provider_no_recovery_request_is_recorded_as_a_fact() {
+    use rdb_core::contracts::authority::{FenceCredential, Lineage};
+    use rdb_core::contracts::ids::Revision;
+    use rdb_core::contracts::recovery::LineageAnchor;
+    support::preamble();
+    let credential = FenceCredential {
+        partition: PartitionId(1),
+        prior_generation: Generation(1),
+        prior_owner_epoch: OwnerEpoch(1),
+        control_revision: Revision(1),
+        sender: CopyId(1),
+    };
+    let refused = Some("harness::dispatch::deliver::recovery");
+    let requests = [
+        (
+            RecoveryEffect::QueryInventory {
+                copies: vec![CopyId(1)],
+            },
+            None,
+        ),
+        (
+            RecoveryEffect::SyncWalThrough {
+                copy: CopyId(1),
+                cutoff: Seq(1),
+            },
+            None,
+        ),
+        (
+            RecoveryEffect::ProbeDigestAt {
+                copy: CopyId(1),
+                seq: Seq(1),
+            },
+            refused,
+        ),
+        (
+            RecoveryEffect::CatchUp {
+                from: CopyId(1),
+                to: CopyId(2),
+                through: Seq(1),
+                credential,
+            },
+            refused,
+        ),
+        (
+            RecoveryEffect::CatchUpBeforeGrant {
+                from: CopyId(1),
+                to: CopyId(2),
+                through: Seq(1),
+                credential,
+            },
+            refused,
+        ),
+        (
+            RecoveryEffect::QuarantineSuffix {
+                copy: CopyId(1),
+                from: Seq(2),
+                until: Tick(10),
+            },
+            refused,
+        ),
+        (
+            RecoveryEffect::RebuildFromAuthoritative {
+                copy: CopyId(1),
+                root: LineageAnchor {
+                    lineage: Lineage {
+                        partition: PartitionId(1),
+                        generation: Generation(1),
+                        owner_epoch: OwnerEpoch(1),
+                    },
+                    base_seq: Seq(0),
+                    base_digest: support::ROOT_DIGEST,
+                },
+            },
+            refused,
+        ),
+    ];
+    for (request, refusal) in requests {
+        let mut dispatcher = two_nodes();
+        let mut scheduler = Scheduler::new();
+        let answer = deliver_on(
+            &mut dispatcher,
+            &mut scheduler,
+            NODE,
+            effect_from(
+                ModuleName::Recovery,
+                EffectKind::Kernel(KernelEffect::Recovery(request.clone())),
+            ),
+        );
+        match refusal {
+            Some(seam) => assert_eq!(answer, Err(SimError::Unavailable { seam }), "{request:?}"),
+            None => assert_eq!(answer, Ok(()), "{request:?} has a provider"),
+        }
+        let facts: Vec<KernelNote> = dispatcher
+            .take_notes()
+            .into_iter()
+            .map(|(_, _, note)| note)
+            .filter(|note| matches!(note, KernelNote::RecoveryFact { .. }))
+            .collect();
+        assert!(
+            facts.is_empty(),
+            "{request:?} was recorded as a fact: {facts:?}"
+        );
+    }
+}
+
+/// Lead rulings A-R65.3 and A-R66: P1's output to the environment is recorded, not refused.
+#[retcd_test]
+fn provider_a_publication_output_is_recorded_as_a_fact() {
+    use rdb_core::contracts::publication::PublicationEffect;
+    support::preamble();
+    let mut dispatcher = two_nodes();
+    let mut scheduler = Scheduler::new();
+    let quarantined = PublicationEffect::Quarantined {
+        generation: Generation(1),
+        seq: Seq(3),
+    };
+
+    deliver_on(
+        &mut dispatcher,
+        &mut scheduler,
+        NODE,
+        effect_from(
+            ModuleName::Publication,
+            EffectKind::Kernel(KernelEffect::Publication(quarantined.clone())),
+        ),
+    )
+    .expect("recorded, not refused");
+
+    assert_eq!(
+        dispatcher.take_notes(),
+        vec![(
+            NODE,
+            ModuleName::Publication,
+            KernelNote::PublicationFact {
+                effect: quarantined
+            }
+        )]
+    );
+    assert_eq!(
+        scheduler.queued(),
+        0,
+        "no consumer, so nothing is scheduled"
+    );
+}
+
+fn digest(seq: u64) -> rdb_core::contracts::digest::Digest {
+    rdb_core::contracts::digest::Digest([u8::try_from(seq).expect("a small sequence"); 32])
+}
+
+/// Copy `copy` of partition 1 at generation 1, head `head`, with a rung at every sequence.
+fn survivor(copy: u8, head: u64) -> rdb_core::contracts::recovery::SurvivorInventory {
+    use rdb_core::contracts::authority::Lineage;
+    use rdb_core::contracts::recovery::{LineageAnchor, SurvivorInventory};
+    SurvivorInventory {
+        copy: CopyId(copy),
+        anchor_seen: LineageAnchor {
+            lineage: Lineage {
+                partition: PartitionId(1),
+                generation: Generation(1),
+                owner_epoch: OwnerEpoch(1),
+            },
+            base_seq: Seq(0),
+            base_digest: support::ROOT_DIGEST,
+        },
+        head: (Seq(head), digest(head)),
+        ladder: (1..=head).map(|seq| (Seq(seq), digest(seq))).collect(),
+        quarantined: None,
+    }
+}
+
+/// `two_nodes()`, with `PEER` holding sequences 1 and 2 of partition 1 and copy 1 placed there.
+fn with_survivor() -> Dispatcher {
+    let mut dispatcher = two_nodes();
+    for seq in 1..=2 {
+        dispatcher
+            .preload(PEER, support::batch(1, seq, b"k", b"v"))
+            .expect("a preload");
+    }
+    dispatcher
+        .place_survivor(PEER, PartitionId(1), survivor(1, 2))
+        .expect("a head the engine holds");
+    dispatcher
+}
+
+/// A-R64(c), A-R67.3: `QueryInventory` answers each copy in order, from what the scenario
+/// placed against the node's own engine, and a copy nobody can report for fails.
+#[retcd_test]
+fn provider_query_inventory_reports_placed_survivors_and_fails_the_rest() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    support::preamble();
+    let mut dispatcher = with_survivor();
+    assert_eq!(
+        dispatcher.take_notes(),
+        vec![(
+            PEER,
+            ModuleName::Recovery,
+            KernelNote::SurvivorPlaced {
+                partition: PartitionId(1),
+                inventory: Box::new(survivor(1, 2)),
+            }
+        )],
+        "a placement is recorded as declared (A-R67.3b)"
+    );
+    assert_eq!(
+        dispatcher.place_survivor(NodeId(3), PartitionId(1), survivor(2, 2)),
+        Err(SimError::Config {
+            field: "survivor_head"
+        }),
+        "a head no engine holds is refused (A-R67.3a)"
+    );
+    assert!(
+        dispatcher.take_notes().is_empty(),
+        "and a refused one is not recorded"
+    );
+
+    let query = |copies: Vec<CopyId>| {
+        effect_from(
+            ModuleName::Recovery,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::QueryInventory {
+                copies,
+            })),
+        )
+    };
+    let mut scheduler = Scheduler::new();
+    let asked = query(vec![CopyId(1), CopyId(2)]);
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, asked).expect("a query");
+
+    let mut answers = Vec::new();
+    while let Some(event) = scheduler.pop() {
+        assert_eq!(
+            (event.node, event.partition),
+            (NODE, PartitionId(1)),
+            "to the asker"
+        );
+        assert!(dispatcher.take_routed(event.id), "held to F1's answer");
+        answers.push(event.kind);
+    }
+    assert_eq!(
+        answers,
+        vec![
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::InventoryReported(
+                Box::new(survivor(1, 2))
+            ))),
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::InventoryFailed {
+                copy: CopyId(2)
+            })),
+        ]
+    );
+
+    // A crashed holder cannot report.
+    dispatcher
+        .inject_storage(StorageOp::Crash {
+            node: PEER,
+            fault: StorageFault::ProcessCrash,
+        })
+        .expect("a planned crash");
+    let touch = store(StoreEffect::Commit(support::batch(1, 3, b"k", b"v")));
+    assert_eq!(
+        seam_of(deliver_on(&mut dispatcher, &mut scheduler, PEER, touch)),
+        "harness::dispatch::deliver::crash"
+    );
+    deliver_on(
+        &mut dispatcher,
+        &mut scheduler,
+        NODE,
+        query(vec![CopyId(1)]),
+    )
+    .expect("a query");
+    assert_eq!(
+        scheduler.pop().map(|event| event.kind),
+        Some(EventKind::Kernel(KernelEvent::Recovery(
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) }
+        )))
+    );
+}
+
+/// A-R64(c), A-R67.4: `SyncWalThrough` proves exactly the cutoff when, and only when, the
+/// holder's engine made it durable; every other outcome is a named `SyncWithheld`, never a
+/// proof and never nothing. B-R55a: a proof is recorded as `SyncProven`, so every request below
+/// is asserted to carry exactly one of the two notes.
+#[retcd_test]
+fn provider_sync_wal_through_proves_only_what_the_engine_made_durable() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
+    use rdb_core::contracts::recovery::{DurableProof, RecoveryEvent};
+    use rdb_core::contracts::trace::SyncWithheldReason;
+    support::preamble();
+    let sync = |copy: u8, cutoff: u64| {
+        effect_from(
+            ModuleName::Recovery,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::SyncWalThrough {
+                copy: CopyId(copy),
+                cutoff: Seq(cutoff),
+            })),
+        )
+    };
+    let proof = |seq: u64| {
+        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::DurableAt(
+            DurableProof {
+                copy: CopyId(1),
+                partition: PartitionId(1),
+                seq: DurableSeq(seq),
+                digest: digest(seq),
+            },
+        )))
+    };
+    let withheld = |copy: u8, cutoff: u64, reason: SyncWithheldReason| {
+        vec![(
+            NODE,
+            ModuleName::Recovery,
+            KernelNote::SyncWithheld {
+                copy: CopyId(copy),
+                cutoff: Seq(cutoff),
+                reason,
+            },
+        )]
+    };
+
+    // A clean sync proves the cutoff; a later, lower cutoff is proved from what is durable.
+    let mut dispatcher = with_survivor();
+    dispatcher.take_notes();
+    let mut scheduler = Scheduler::new();
+    for cutoff in [2, 1] {
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, sync(1, cutoff)).expect("a sync");
+        let answer = scheduler.pop().expect("a proof");
+        assert_eq!(answer.kind, proof(cutoff), "cutoff {cutoff}");
+        assert_eq!((answer.node, answer.partition), (NODE, PartitionId(1)));
+        assert!(dispatcher.take_routed(answer.id));
+        assert_eq!(
+            dispatcher.take_notes(),
+            vec![(
+                NODE,
+                ModuleName::Recovery,
+                KernelNote::SyncProven {
+                    copy: CopyId(1),
+                    cutoff: Seq(cutoff),
+                    durable: DurableSeq(2),
+                },
+            )],
+            "a proof is recorded as proven, once, with what the engine reported (B-R55a)"
+        );
+    }
+    assert_eq!(
+        dispatcher
+            .engine(PEER)
+            .expect("the holder's engine")
+            .durable(PartitionId(1), Generation(1)),
+        DurableSeq(2),
+        "synced on the holder, not on the asker"
+    );
+
+    // Every way the proof can fail to exist, each against a fresh holder.
+    let cases = [
+        (
+            Some(StorageOp::ShortFlush {
+                node: PEER,
+                through: AppliedSeq(1),
+            }),
+            1,
+            2,
+            SyncWithheldReason::Short {
+                durable: DurableSeq(1),
+            },
+        ),
+        (
+            Some(StorageOp::FalseDurable {
+                node: PEER,
+                through: AppliedSeq(2),
+            }),
+            1,
+            2,
+            SyncWithheldReason::Short {
+                durable: DurableSeq(0),
+            },
+        ),
+        (
+            Some(StorageOp::Fail {
+                node: PEER,
+                fault: StorageFault::FlushFailed,
+            }),
+            1,
+            2,
+            SyncWithheldReason::Failed(StorageFault::FlushFailed),
+        ),
+        (None, 9, 2, SyncWithheldReason::NotPlaced),
+        (
+            None,
+            1,
+            3,
+            SyncWithheldReason::Short {
+                durable: DurableSeq(2),
+            },
+        ),
+    ];
+    for (fault, copy, cutoff, reason) in cases {
+        let mut dispatcher = with_survivor();
+        dispatcher.take_notes();
+        let mut scheduler = Scheduler::new();
+        if let Some(op) = fault {
+            dispatcher.inject_storage(op).expect("a planned fault");
+        }
+        deliver_on(&mut dispatcher, &mut scheduler, NODE, sync(copy, cutoff)).expect("a sync");
+        assert_eq!(scheduler.queued(), 0, "{reason:?}: no proof");
+        assert_eq!(dispatcher.take_notes(), withheld(copy, cutoff, reason));
+    }
+
+    // A durable cutoff the placed history has no digest for is not proved either.
+    let mut dispatcher = two_nodes();
+    for seq in 1..=2 {
+        dispatcher
+            .preload(PEER, support::batch(1, seq, b"k", b"v"))
+            .expect("a preload");
+    }
+    let mut sparse = survivor(1, 2);
+    sparse.ladder.clear();
+    dispatcher
+        .place_survivor(PEER, PartitionId(1), sparse)
+        .expect("a head the engine holds");
+    dispatcher.take_notes();
+    let mut scheduler = Scheduler::new();
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, sync(1, 1)).expect("a sync");
+    assert_eq!(scheduler.queued(), 0, "no digest, no proof");
+    assert_eq!(
+        dispatcher.take_notes(),
+        withheld(1, 1, SyncWithheldReason::NoDigest)
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// The spine (dev-sim-route, 2026-09-26): one multi-node run through A1, F1, R1 and L1.
+// ------------------------------------------------------------------------------------------
+
+/// Partition 1's survivors hold sequences 1..=`SPINE_HEAD` of the prior lineage (1, 1).
+const SPINE_HEAD: u64 = 2;
+/// The partition A1 serves on node 1 while partition 1 recovers.
+const SERVED: PartitionId = PartitionId(2);
+
+/// The survivors' shared history: records `1..=SPINE_HEAD` of the prior lineage, as T1 commits
+/// them, so `SendEnvelopes` reads and sends real envelopes (lead ruling B-R57, rule 3).
+fn spine_history() -> rdb_sim::storage::history::CanonicalHistory {
+    rdb_sim::storage::history::canonical_history(spine_prior(), ConfigVersion(1), SPINE_HEAD)
+        .expect("a canonical history")
+}
+
+/// The digest a survivor's history holds at `seq`; the root (seq 0) is the anchor's digest.
+fn spine_digest(seq: u64) -> rdb_core::contracts::digest::Digest {
+    spine_history().digest(seq)
+}
+
+fn spine_prior() -> rdb_core::contracts::authority::Lineage {
+    rdb_core::contracts::authority::Lineage {
+        partition: PartitionId(1),
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    }
+}
+
+fn spine_anchor() -> rdb_core::contracts::recovery::LineageAnchor {
+    rdb_core::contracts::recovery::LineageAnchor {
+        lineage: spine_prior(),
+        base_seq: Seq(0),
+        base_digest: spine_digest(0),
+    }
+}
+
+/// Copy `copy`'s report: the whole shared history, root to `SPINE_HEAD`.
+fn spine_survivor(copy: u8) -> rdb_core::contracts::recovery::SurvivorInventory {
+    rdb_core::contracts::recovery::SurvivorInventory {
+        copy: CopyId(copy),
+        anchor_seen: spine_anchor(),
+        head: (Seq(SPINE_HEAD), spine_digest(SPINE_HEAD)),
+        ladder: (0..=SPINE_HEAD)
+            .map(|seq| (Seq(seq), spine_digest(seq)))
+            .collect(),
+        quarantined: None,
+    }
+}
+
+/// `partitions/{partition}` at generation 1, epoch 1, naming `owner`.
+fn spine_record(partition: PartitionId, owner: NodeId) -> (ControlKey, Bytes) {
+    use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+    let record = PartitionRecord {
+        partition,
+        owner,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+        config_version: ConfigVersion(1),
+        lifecycle: PartitionLifecycle::Serving,
+    };
+    (ControlKey::Partition(partition), record.encode())
+}
+
+/// What F1 on node 1 is handed for partition 1: placement's plan over `rf3_config`.
+fn spine_recovery_plan() -> rdb_core::contracts::recovery::RecoveryPlan {
+    use rdb_core::contracts::authority::{AuthorityView, DenyReason};
+    use rdb_core::contracts::ids::{AuthorityGeneration, GrantId};
+    use rdb_core::contracts::recovery::{Candidate, RecoveryPlan};
+    let config = support::rf3_config();
+    let candidates = config
+        .members
+        .iter()
+        .map(|member| Candidate {
+            copy: member.copy,
+            primary_eligible: true,
+            healthy: true,
+            within_capacity: true,
+            has_valid_grant: true,
+        })
+        .collect();
+    RecoveryPlan {
+        anchor: spine_anchor(),
+        config,
+        candidates,
+        rebuild_required: [CopyId(0), CopyId(1), CopyId(2)].into_iter().collect(),
+        authority_view: AuthorityView {
+            lineage: spine_prior(),
+            grant_id: GrantId(1),
+            boot_id: BOOT,
+            authority_generation: AuthorityGeneration(1),
+            config_version: ConfigVersion(1),
+            authority_seq: 1,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon: DenyReason::NoGrant,
+        },
+        retention_millis: 1_000,
+    }
+}
+
+/// The fence the prior owner (node 4) lost, read at the partition record's revision.
+fn spine_fence(control_revision: u64) -> rdb_core::contracts::authority::FencingProof {
+    use rdb_core::contracts::authority::{FencingProof, Revocation};
+    use rdb_core::contracts::ids::{GrantId, Revision};
+    FencingProof {
+        partition: PartitionId(1),
+        prior_generation: Generation(1),
+        prior_owner_epoch: OwnerEpoch(1),
+        prior_grant_id: GrantId(1),
+        prior_boot_id: BOOT,
+        revocation: Revocation::DurableDrain {
+            ack_revision: Revision(control_revision),
+        },
+        control_revision: Revision(control_revision),
+        decision_tick: Tick(1),
+    }
+}
+
+fn spine_seed(at: u64, node: NodeId, partition: PartitionId, kind: EventKind) -> SeedEvent {
+    SeedEvent {
+        at: Tick(at),
+        node,
+        boot: BOOT,
+        partition,
+        correlation: CorrelationId(at),
+        kind,
+    }
+}
+
+/// The spine scenario (spike §6, F1/R1, as far as the landed kernels allow).
+///
+/// Four nodes. Node 1's A1 acquires its grant and serves partition 2 from the control plane.
+/// Partition 1's prior owner (node 4) is gone: its survivors on nodes 1, 2 and 3 hold the same
+/// two records of lineage (1, 1), preloaded into each node's engine and placed for F1's
+/// providers. F1 on node 1 is given placement's plan and the fence, queries the survivors,
+/// selects, syncs each copy's WAL through the cutoff, and commits the new root by CAS.
+fn spine_plan() -> RunPlan {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    let mut plan = RunPlan::new(support::cluster());
+    plan.provenance = Provenance::Authored {
+        case: String::from("spine-f1-r1"),
+    };
+    // Partition 1 is revision 1, partition 2 revision 2.
+    plan.control_records = vec![
+        spine_record(PartitionId(1), NodeId(4)),
+        spine_record(SERVED, NODE),
+    ];
+    for node in 1..=3 {
+        for batch in spine_history().batches {
+            plan.preloads.push((NodeId(node), batch));
+        }
+        plan.survivors.push((
+            NodeId(node),
+            PartitionId(1),
+            spine_survivor(u8::try_from(node - 1).expect("small")),
+        ));
+    }
+    plan.seed = vec![
+        spine_seed(
+            1,
+            NODE,
+            SERVED,
+            EventKind::Timer(rdb_core::contracts::time::TimerFired {
+                id: rdb_core::authority::AuthorityTimer::Acquire.id(),
+                version: TimerVersion(0),
+                scheduled_at: Tick(1),
+            }),
+        ),
+        spine_seed(
+            2,
+            NODE,
+            PartitionId(1),
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(Box::new(
+                spine_recovery_plan(),
+            )))),
+        ),
+        spine_seed(
+            3,
+            NODE,
+            PartitionId(1),
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(Box::new(
+                spine_fence(1),
+            )))),
+        ),
+    ];
+    plan.limits = RunLimits {
+        max_events: 400,
+        deadline: Tick(3_000),
+    };
+    plan
+}
+
+/// B-R56 with B-R57's provider and B-R58's R1: the spine with the members' fan-out on. Every
+/// other member (two secondaries and the shadow) hears `Recovered` and builds its receiver
+/// (B-R54). The two secondaries are in the barrier, so they start at the cutoff and ACK it at
+/// once. The shadow is not, so it starts at the root and asks node 1 for
+/// `NeedPrefix { have: 0, ROOT }`. Node 1's primary holds the anchor's rung (B-R58), so it vouches
+/// for the root and sends records `1..=2` through the `SendEnvelopes` provider, and the shadow
+/// takes them: the historical records it receives were sealed under the prior generation and
+/// pass R1's historical rule. The run goes on to its deadline.
+///
+/// The fan-out is the **default** (B-R58b): `spine_plan` is `RunPlan::new` and nothing here sets
+/// `member_watches`. With the default off, no member hears `Recovered`, no receiver is built, and
+/// every head below is `None`.
+///
+/// Until 2026-09-27 this row pinned the opposite (the run stopped at the shadow's
+/// `SnapshotCatchupRequired`), and it said it would turn red when R1 could vouch for the root. It
+/// did, in the B-R58 export.
+#[retcd_test]
+fn fanout_the_spine_catches_the_shadow_up_from_the_root_by_default() {
+    use rdb_sim::harness::run::StopReason;
+    support::preamble();
+    let plan = spine_plan();
+    assert!(plan.member_watches, "the fan-out is on by default");
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the spine runs");
+    tracing::info!(stop = ?report.stop, "spine with member watches");
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "{:?}",
+        report.stop
+    );
+    let history = spine_history();
+    let heads: Vec<_> = (2..=4)
+        .map(|node| {
+            runner
+                .dispatcher()
+                .replication()
+                .receiver(NodeId(node), PartitionId(1))
+                .map(|receiver| receiver.applied_head())
+                .map(|head| (head.seq.0, head.digest))
+        })
+        .collect();
+    let at_head = Some((SPINE_HEAD, history.digest(SPINE_HEAD)));
+    assert_eq!(
+        heads,
+        vec![at_head; 3],
+        "the secondaries start at the cutoff; the shadow reaches it from the root"
+    );
+    let shadow = runner
+        .dispatcher()
+        .engine(NodeId(4))
+        .expect("the shadow's engine");
+    for (seq, batch) in (1..).map(Seq).zip(&history.batches) {
+        let stored = shadow
+            .history_at(PartitionId(1), Generation(2), seq)
+            .map(|(record, _)| record);
+        let sent = rdb_sim::storage::history::history_writes(batch, seq).map(|(record, _)| record);
+        assert_eq!(
+            stored, sent,
+            "the shadow holds node 1's record {} unchanged",
+            seq.0
+        );
+    }
+    let trace = runner.finish().expect("a trace");
+    let landed: Vec<NodeId> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredLanded { member, .. },
+                ..
+            } => Some(*member),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        landed,
+        vec![NodeId(2), NodeId(3), NodeId(4)],
+        "both secondaries and the shadow heard it: every other member of the pin"
+    );
+}
+
+/// What one spine run left behind.
+struct SpineRun {
+    trace: Trace,
+    report: rdb_sim::harness::run::RunReport,
+    /// F1's phase on node 1 for partition 1 when the loop stopped.
+    phase: Option<rdb_core::recovery::RecoveryPhase>,
+    /// Each survivor node's engine watermark for partition 1 at the prior generation.
+    durable: Vec<u64>,
+    /// The prefix node 1's engine inherited into generation 2 when F1 recovered.
+    inherited: Seq,
+    /// The primary R1 built on node 1 from `Recovered` (B-R54): its generation and head.
+    primary: Option<(Generation, Seq)>,
+}
+
+/// One spine run: the plan, then the loop to its deadline. Nothing is installed by hand: R1
+/// builds node 1's primary from F1's `Recovered` (lead ruling B-R54).
+fn run_spine() -> SpineRun {
+    let plan = spine_plan();
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the spine runs");
+    let dispatcher = runner.dispatcher();
+    let phase = dispatcher
+        .recovery(NODE, PartitionId(1))
+        .map(rdb_core::recovery::Recovery::phase);
+    let durable = (1..=3)
+        .map(|node| {
+            dispatcher
+                .engine(NodeId(node))
+                .map_or(0, |engine| engine.durable(PartitionId(1), Generation(1)).0)
+        })
+        .collect();
+    let inherited = dispatcher
+        .engine(NODE)
+        .map_or(Seq(0), |engine| engine.base(PartitionId(1), Generation(2)));
+    let primary = dispatcher
+        .replication()
+        .primary(NODE, PartitionId(1))
+        .map(|primary| {
+            (
+                primary.tracker().lineage().generation,
+                primary.tracker().head(),
+            )
+        });
+    let trace = runner.finish().expect("a trace");
+    SpineRun {
+        trace,
+        report,
+        phase,
+        durable,
+        inherited,
+        primary,
+    }
+}
+
+/// The spine: A1, F1, R1 and L1 in one four-node run that stops at its deadline, not at a
+/// refusal, and the same plan run twice writes the same bytes.
+///
+/// Scaffolding, not a row: it asserts that the paths are joined up, and no plan row's claim.
+/// What it does **not** reach, each owed and named in the handoff: A1's takeover emitting the
+/// fence (the fence is seeded), and F1's `CatchUp` and `ProbeDigestAt` (every survivor holds the
+/// cutoff, so neither is asked). The members' fan-out is on by default (B-R58b): every other
+/// member of the pin lands `Recovered` and builds its receiver, and the shadow is caught up from
+/// the root (`fanout_the_spine_catches_the_shadow_up_from_the_root_by_default`).
+#[retcd_test]
+fn spine_a1_f1_r1_l1_run_to_completion_and_replay_byte_identically() {
+    use rdb_core::contracts::trace::ControlOpKind;
+    use rdb_sim::harness::run::StopReason;
+    use rdb_sim::harness::trace::validate;
+    support::preamble();
+    let run = run_spine();
+    let trace = &run.trace;
+    tracing::info!(stop = ?run.report.stop, events = run.report.events_consumed,
+        phase = ?run.phase, durable = ?run.durable, "spine stop");
+
+    assert!(
+        matches!(run.report.stop, StopReason::DeadlineReached { .. }),
+        "the spine runs to its deadline: {:?}",
+        run.report.stop
+    );
+    validate(trace).expect("the spine's trace is well formed");
+
+    // The scenario's placements are in the trace, one per survivor node.
+    let placed: Vec<NodeId> = trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::KernelNoted {
+                    note: KernelNote::SurvivorPlaced { .. },
+                    ..
+                }
+            )
+        })
+        .map(|event| event.node)
+        .collect();
+    assert_eq!(placed, vec![NodeId(1), NodeId(2), NodeId(3)]);
+
+    // F1: every survivor proved durable on its own node, no proof withheld, one CAS, committed.
+    assert_eq!(
+        run.phase,
+        Some(rdb_core::recovery::RecoveryPhase::Committed)
+    );
+    assert_eq!(run.durable, vec![SPINE_HEAD; 3], "synced on each holder");
+    assert_eq!(
+        run.inherited,
+        Seq(SPINE_HEAD),
+        "the new generation starts at the cutoff on the recovering node"
+    );
+    // B-R54: R1 built the primary itself. A `NotRequired` answer to `Recovered` would pass every
+    // dispatch assertion below without one, so its existence and position are asserted here.
+    assert_eq!(
+        run.primary,
+        Some((Generation(2), Seq(SPINE_HEAD))),
+        "R1 leads the new generation from the cutoff on node 1"
+    );
+    assert!(
+        !trace.events.iter().any(|event| matches!(
+            event.kind,
+            TraceKind::KernelNoted {
+                note: KernelNote::SyncWithheld { .. },
+                ..
+            }
+        )),
+        "no proof was withheld"
+    );
+    let proven = trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::KernelNoted {
+                    note: KernelNote::SyncProven { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(proven, 3, "one proof per survivor copy (B-R55a)");
+    let recovery_cas: Vec<&TraceKind> = trace
+        .events
+        .iter()
+        .map(|event| &event.kind)
+        .filter(|kind| {
+            matches!(
+                kind,
+                TraceKind::ControlInteraction {
+                    op: ControlOpKind::Cas,
+                    key: Some(ControlKey::Partition(PartitionId(1))),
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert_eq!(recovery_cas.len(), 1, "{recovery_cas:?}");
+
+    // `Recovered` reached R1 and then L1 on node 1, and both answered it.
+    let dispatches: Vec<(EventId, ModuleName, DispatchOutcome)> = trace
+        .events
+        .iter()
+        .filter(|event| event.partition == PartitionId(1) && event.node == NODE)
+        .filter_map(|event| match &event.kind {
+            TraceKind::ModuleDispatch {
+                event,
+                module,
+                outcome,
+            } => Some((*event, *module, *outcome)),
+            _ => None,
+        })
+        .collect();
+    let recovered = dispatches
+        .iter()
+        .find(|(_, module, outcome)| {
+            *module == ModuleName::Replication
+                && matches!(outcome, DispatchOutcome::Answered { .. })
+        })
+        .map(|(event, _, _)| *event)
+        .expect("R1 answered F1's result");
+    let offered: Vec<(ModuleName, bool)> = dispatches
+        .iter()
+        .filter(|(event, _, _)| *event == recovered)
+        .map(|(_, module, outcome)| (*module, matches!(outcome, DispatchOutcome::Answered { .. })))
+        .collect();
+    assert_eq!(
+        offered[..2],
+        [
+            (ModuleName::Replication, true),
+            (ModuleName::Protection, true)
+        ],
+        "{offered:?}"
+    );
+
+    // B-R55b with B-R56: one `RecoveredFact` per `Recovered` F1 emits, and one `RecoveredLanded`
+    // per member it reaches. A routed `Recovered` is the only event offered to R1 and then L1
+    // first (`route::consumers`), so its offers count the routings without reading the notes.
+    // The members' fan-out is on by default (B-R58b), so node 1's emission is routed once on
+    // node 1 and once more on each member that lands it.
+    let mut offers: std::collections::BTreeMap<EventId, Vec<ModuleName>> =
+        std::collections::BTreeMap::new();
+    for event in &trace.events {
+        if let TraceKind::ModuleDispatch { event, module, .. } = &event.kind {
+            offers.entry(*event).or_default().push(*module);
+        }
+    }
+    let emitted = offers
+        .values()
+        .filter(|modules| modules.starts_with(&[ModuleName::Replication, ModuleName::Protection]))
+        .count();
+    let facts = trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::KernelNoted {
+                    note: KernelNote::RecoveredFact { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    let landed: Vec<NodeId> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredLanded { member, .. },
+                ..
+            } => Some(*member),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(facts, 1, "F1 emits one Recovered");
+    assert_eq!(
+        landed,
+        vec![NodeId(2), NodeId(3), NodeId(4)],
+        "every other member of the pin lands it"
+    );
+    assert_eq!(
+        emitted,
+        facts + landed.len(),
+        "one routing per emission and per landing"
+    );
+
+    // A1 served partition 2 on node 1, and R1 answered its view there with nothing installed
+    // for that partition (B-R53).
+    assert!(trace.events.iter().any(|event| {
+        event.partition == SERVED
+            && matches!(
+                event.kind,
+                TraceKind::ModuleDispatch {
+                    module: ModuleName::Replication,
+                    outcome: DispatchOutcome::Answered { .. },
+                    ..
+                }
+            )
+    }));
+
+    // Byte-identical, run twice. `.trace`, not `.jsonl`: the log relation's glob must not read
+    // it (AGENTS.md, "the glob also catches JSONL that is not a log").
+    let dir = test_log_dir().join("spine");
+    std::fs::create_dir_all(&dir).expect("a fixture directory");
+    let again = run_spine();
+    let (first, second) = (dir.join("first.trace"), dir.join("second.trace"));
+    write_jsonl(trace, &first).expect("write the first");
+    write_jsonl(&again.trace, &second).expect("write the second");
+    let (first, second) = (
+        std::fs::read(first).expect("read the first"),
+        std::fs::read(second).expect("read the second"),
+    );
+    tracing::info!(
+        bytes = first.len(),
+        events = trace.events.len(),
+        "spine trace"
+    );
+    assert!(!first.is_empty());
+    assert!(first == second, "the same plan wrote different bytes");
+}
+
+/// dev-t1's report, 2026-09-26: a recovery's new generation begins at the cutoff. The engine
+/// inherits the predecessor's prefix through it as applied — so T1's step view reaches
+/// `retained_through` — and never as durable. A process crash keeps the base; a host crash keeps
+/// only what the predecessor itself had synced, since those are the bytes the base is made of.
+#[retcd_test]
+fn store_an_inherited_prefix_is_applied_never_durable_and_survives_only_what_was_synced() {
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
+    use rdb_core::contracts::storage::CapturedPrefix;
+    use rdb_sim::storage::crash_image::CrashImage;
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let (old, new, part) = (Generation(1), Generation(2), PartitionId(1));
+    let mut engine = MemoryEngine::new(NODE);
+    for seq in 1..=3 {
+        engine
+            .commit(support::batch(1, seq, b"k", b"v"))
+            .expect("a commit");
+    }
+
+    let mut short = engine.clone();
+    short.inherit(part, old, new, Seq(5)).expect("inherit");
+    assert_eq!(
+        short.base(part, new),
+        Seq(3),
+        "an engine never inherits a prefix it lacks"
+    );
+    assert_eq!(
+        engine.clone().inherit(part, new, old, Seq(1)),
+        Err(SimError::Config { field: "inherit" }),
+        "only from an earlier generation"
+    );
+
+    engine.inherit(part, old, new, Seq(2)).expect("inherit");
+    assert_eq!(engine.base(part, new), Seq(2));
+    assert_eq!(engine.parent(part, new), Some(old));
+    assert_eq!(engine.buffered_applied(part, new), AppliedSeq(2));
+    assert_eq!(
+        engine.durable(part, new),
+        DurableSeq(0),
+        "inherited, not synced"
+    );
+
+    let process = CrashImage::of(&engine, StorageFault::ProcessCrash)
+        .expect("an image")
+        .reopen(NODE);
+    assert_eq!(process.base(part, new), Seq(2));
+    assert_eq!(process.parent(part, new), Some(old));
+    assert_eq!(process.buffered_applied(part, new), AppliedSeq(2));
+    let host = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("an image")
+        .reopen(NODE);
+    assert_eq!(
+        host.base(part, new),
+        Seq(0),
+        "the predecessor never synced the base"
+    );
+
+    engine
+        .sync_wal_through(vec![CapturedPrefix {
+            partition: part,
+            generation: old,
+            through: AppliedSeq(2),
+        }])
+        .expect("a sync");
+    let host = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("an image")
+        .reopen(NODE);
+    assert_eq!(host.base(part, new), Seq(2), "synced, so it survives");
+}
+
+/// Lead ruling, 2026-09-26 (MATERIAL): a new generation's view shows the state as of the cutoff
+/// and nothing the predecessor wrote above it. The predecessor writes `k` at the cutoff and
+/// again at cutoff + 1, and `gone` only above it; after recovery the new generation reads the
+/// cutoff's `k` and no `gone`, while a view of the old generation taken before still reads both.
+#[retcd_test]
+fn store_a_new_generations_view_hides_the_discarded_suffix() {
+    use rdb_core::contracts::ids::{BatchId, SnapshotHandle};
+    use rdb_core::contracts::storage::{Batch, Namespace, SnapshotRead, Write};
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let (old, new, part) = (Generation(1), Generation(2), PartitionId(1));
+    let write = |key: &'static [u8], value: Option<&'static [u8]>| Write {
+        ns: Namespace::User,
+        key: Bytes::from_static(key),
+        value: value.map(Bytes::from_static),
+    };
+    let batch = |generation: Generation, seq: u64, writes: Vec<Write>| Batch {
+        id: BatchId(seq),
+        partition: part,
+        generation,
+        seq: Seq(seq),
+        writes,
+    };
+    let mut engine = MemoryEngine::new(NODE);
+    engine
+        .commit(batch(old, 1, vec![write(b"k", Some(b"at-cutoff"))]))
+        .expect("seq 1");
+    engine
+        .commit(batch(
+            old,
+            2,
+            vec![write(b"k", Some(b"discarded")), write(b"gone", Some(b"x"))],
+        ))
+        .expect("seq 2");
+    let before = engine.snapshot(part, old, SnapshotHandle(1));
+
+    engine.inherit(part, old, new, Seq(1)).expect("cut at 1");
+    let view = engine.snapshot(part, new, SnapshotHandle(2));
+    assert_eq!(view.at(), Seq(1));
+    assert_eq!(
+        view.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"at-cutoff"))
+    );
+    assert_eq!(view.version(Namespace::User, b"k"), Some(1));
+    assert_eq!(
+        view.get(Namespace::User, b"gone"),
+        None,
+        "written only above the cutoff"
+    );
+
+    // The new generation's own writes land on top of the inherited state.
+    engine
+        .commit(batch(
+            new,
+            2,
+            vec![write(b"k", None), write(b"n", Some(b"new"))],
+        ))
+        .expect("the new generation's first batch");
+    let view = engine.snapshot(part, new, SnapshotHandle(3));
+    assert_eq!(view.at(), Seq(2));
+    assert_eq!(view.get(Namespace::User, b"k"), None, "deleted in g2");
+    assert_eq!(view.get(Namespace::User, b"gone"), None);
+    assert_eq!(
+        view.get(Namespace::User, b"n"),
+        Some(Bytes::from_static(b"new"))
+    );
+
+    assert_eq!(
+        before.get(Namespace::User, b"k"),
+        Some(Bytes::from_static(b"discarded")),
+        "the old view is owned and unchanged"
+    );
+    assert_eq!(
+        before.get(Namespace::User, b"gone"),
+        Some(Bytes::from_static(b"x"))
+    );
+}
+
+/// Lead ruling B-R55a (M7B-104): a durable watermark set at preload spends no planned fault.
+/// `PEER` holds 50 applied and 45 durable; the `FalseDurable` planned after that is consumed by
+/// F1's own sync, which therefore proves nothing and says the engine still stands at 45.
+#[retcd_test]
+fn preload_durable_leaves_a_planned_false_durable_for_f1s_sync() {
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
+    use rdb_core::contracts::trace::SyncWithheldReason;
+    support::preamble();
+    let (part, gen) = (PartitionId(1), Generation(1));
+    let false_durable = StorageOp::FalseDurable {
+        node: PEER,
+        through: AppliedSeq(50),
+    };
+
+    // Through a run plan: preloads, then the durable mark, then the planned fault.
+    let mut plan = RunPlan::new(support::cluster());
+    plan.preloads = (1..=50)
+        .map(|seq| (PEER, support::batch(1, seq, b"k", b"v")))
+        .collect();
+    plan.preload_durable = vec![(PEER, part, gen, DurableSeq(45))];
+    plan.storage_ops = vec![false_durable];
+    plan.survivors = vec![(PEER, part, survivor(1, 50))];
+    let mut runner = Runner::new(&plan).expect("the plan applies in order");
+    let engine = runner.dispatcher().engine(PEER).expect("the holder");
+    assert_eq!(engine.buffered_applied(part, gen), AppliedSeq(50));
+    assert_eq!(engine.durable(part, gen), DurableSeq(45));
+    assert!(engine.has_planned(), "the fault is still waiting");
+
+    runner
+        .carry_out(
+            NODE,
+            BOOT,
+            vec![effect_from(
+                ModuleName::Recovery,
+                EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::SyncWalThrough {
+                    copy: CopyId(1),
+                    cutoff: Seq(50),
+                })),
+            )],
+        )
+        .expect("F1's sync");
+    let engine = runner.dispatcher().engine(PEER).expect("the holder");
+    assert_eq!(
+        engine.false_claims(),
+        &[AppliedSeq(50)],
+        "F1's sync is the call that met the fault"
+    );
+    assert!(!engine.has_planned());
+    assert_eq!(engine.durable(part, gen), DurableSeq(45), "nothing moved");
+    let notes: Vec<KernelNote> = runner
+        .dispatcher_mut()
+        .take_notes()
+        .into_iter()
+        .map(|(_, _, note)| note)
+        .filter(|note| {
+            matches!(
+                note,
+                KernelNote::SyncWithheld { .. } | KernelNote::SyncProven { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        vec![KernelNote::SyncWithheld {
+            copy: CopyId(1),
+            cutoff: Seq(50),
+            reason: SyncWithheldReason::Short {
+                durable: DurableSeq(45)
+            },
+        }]
+    );
+
+    // Directly: a durable preload refuses to run while a fault is planned, because it would
+    // spend it.
+    let mut dispatcher = two_nodes();
+    dispatcher
+        .preload(PEER, support::batch(1, 1, b"k", b"v"))
+        .expect("a preload");
+    dispatcher
+        .inject_storage(false_durable)
+        .expect("a planned fault");
+    assert_eq!(
+        dispatcher.preload_durable(PEER, part, gen, DurableSeq(1)),
+        Err(SimError::Config {
+            field: "preload_durable"
+        })
+    );
+    assert!(dispatcher.engine(PEER).expect("the holder").has_planned());
+    // And it cannot declare durable what was never applied.
+    let mut dispatcher = two_nodes();
+    dispatcher
+        .preload(PEER, support::batch(1, 1, b"k", b"v"))
+        .expect("a preload");
+    assert_eq!(
+        dispatcher.preload_durable(PEER, part, gen, DurableSeq(2)),
+        Err(SimError::Config {
+            field: "preload_durable"
+        })
+    );
+}
+
+/// Lead ruling B-R55 (M7B-96): a declared transfer is started by F1's own `QueryInventory`, and
+/// every `TransferProgress` after the first comes from the transfer's own steps — none is seeded.
+/// C advertises 150 from 100, moves 10 a step, and stops at tick 3000; A's copy reports as placed.
+#[retcd_test]
+fn provider_a_transfer_reports_progress_per_step_and_goes_silent_when_it_stops() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    use rdb_sim::harness::transfer::TransferPlan;
+    support::preamble();
+    let plan = TransferPlan {
+        copy: CopyId(2),
+        holder: PEER,
+        advertised: Seq(150),
+        from: Seq(100),
+        per_step: 10,
+        step_millis: 1_000,
+        stop_at: Some(Tick(3_000)),
+        stall_at: None,
+    };
+    let progress = |received: u64| {
+        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::TransferProgress {
+            copy: CopyId(2),
+            advertised_seq: Seq(150),
+            received_seq: Seq(received),
+        }))
+    };
+    let mut dispatcher = with_survivor();
+    dispatcher.plan_transfer(PartitionId(1), plan);
+    let mut scheduler = Scheduler::new();
+    let query = effect_from(
+        ModuleName::Recovery,
+        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::QueryInventory {
+            copies: vec![CopyId(1), CopyId(2)],
+        })),
+    );
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, query).expect("a query");
+
+    let mut seen: Vec<(u64, EventKind)> = Vec::new();
+    let mut drain = |dispatcher: &mut Dispatcher, scheduler: &mut Scheduler| {
+        while let Some(event) = scheduler.pop() {
+            assert_eq!((event.node, event.partition), (NODE, PartitionId(1)));
+            assert!(dispatcher.take_routed(event.id), "held to F1's answer");
+            seen.push((event.at.0, event.kind));
+        }
+    };
+    drain(&mut dispatcher, &mut scheduler);
+    while let Some(at) = dispatcher.next_deadline() {
+        dispatcher
+            .fire_due_timers(at, &mut scheduler)
+            .expect("a step");
+        drain(&mut dispatcher, &mut scheduler);
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            (
+                0,
+                EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::InventoryReported(
+                    Box::new(survivor(1, 2))
+                )))
+            ),
+            (0, progress(100)),
+            (1_000, progress(110)),
+            (2_000, progress(120)),
+        ],
+        "advertised at the query, one step a second, silent from 3000 on"
+    );
+}
+
+/// B-R55: a transfer that reaches its advertised head answers the copy's inventory as a query
+/// would, and a transfer whose holder is down moves nothing.
+#[retcd_test]
+fn provider_a_completed_transfer_answers_the_inventory_and_a_downed_holder_stalls_it() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::RecoveryEvent;
+    use rdb_sim::harness::transfer::TransferPlan;
+    support::preamble();
+    let plan = TransferPlan {
+        copy: CopyId(1),
+        holder: PEER,
+        advertised: Seq(2),
+        from: Seq(1),
+        per_step: 5,
+        step_millis: 500,
+        stop_at: None,
+        stall_at: None,
+    };
+    let query = || {
+        effect_from(
+            ModuleName::Recovery,
+            EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::QueryInventory {
+                copies: vec![CopyId(1)],
+            })),
+        )
+    };
+    let progress = |received: u64| {
+        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::TransferProgress {
+            copy: CopyId(1),
+            advertised_seq: Seq(2),
+            received_seq: Seq(received),
+        }))
+    };
+
+    let mut dispatcher = with_survivor();
+    dispatcher.plan_transfer(PartitionId(1), plan);
+    let mut scheduler = Scheduler::new();
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, query()).expect("a query");
+    assert_eq!(scheduler.pop().map(|event| event.kind), Some(progress(1)));
+    dispatcher
+        .fire_due_timers(Tick(500), &mut scheduler)
+        .expect("a step");
+    let kinds: Vec<EventKind> = std::iter::from_fn(|| scheduler.pop())
+        .map(|event| event.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            progress(2),
+            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::InventoryReported(
+                Box::new(survivor(1, 2))
+            ))),
+        ],
+        "capped at the advertised head, then the placed inventory"
+    );
+    assert_eq!(dispatcher.next_deadline(), None, "nothing left to step");
+
+    // The holder crashes between the advertisement and the first step.
+    let mut dispatcher = with_survivor();
+    dispatcher.plan_transfer(PartitionId(1), plan);
+    let mut scheduler = Scheduler::new();
+    deliver_on(&mut dispatcher, &mut scheduler, NODE, query()).expect("a query");
+    assert_eq!(scheduler.pop().map(|event| event.kind), Some(progress(1)));
+    dispatcher
+        .inject_storage(StorageOp::Crash {
+            node: PEER,
+            fault: StorageFault::ProcessCrash,
+        })
+        .expect("a planned crash");
+    let touch = store(StoreEffect::Commit(support::batch(1, 3, b"k", b"v")));
+    assert_eq!(
+        seam_of(deliver_on(&mut dispatcher, &mut scheduler, PEER, touch)),
+        "harness::dispatch::deliver::crash"
+    );
+    dispatcher
+        .fire_due_timers(Tick(500), &mut scheduler)
+        .expect("a step");
+    assert_eq!(scheduler.queued(), 0, "a downed holder sends nothing");
+    assert_eq!(dispatcher.next_deadline(), None);
+}
+
+// ------------------------------------------------------------------------------------------
+// `SendEnvelopes` (lead ruling B-R57): R1 names a range, the harness reads it from the primary's
+// own engine and sends the stored bytes unchanged.
+// ------------------------------------------------------------------------------------------
+
+/// Partition 1's lineage (1, 1), the one the send rows serve.
+fn send_lineage() -> rdb_core::contracts::authority::Lineage {
+    rdb_core::contracts::authority::Lineage {
+        partition: PartitionId(1),
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    }
+}
+
+/// Records `1..=n` of [`send_lineage`], as T1 commits them.
+fn send_history(n: u64) -> rdb_sim::storage::history::CanonicalHistory {
+    rdb_sim::storage::history::canonical_history(send_lineage(), ConfigVersion(1), n)
+        .expect("a canonical history")
+}
+
+/// Records `cutoff + 1..=n` of [`send_lineage`] at `generation`, chained from `prior`'s digest
+/// at `cutoff`: what a live T1 writes after inheriting `prior` there (B-R57b).
+fn send_history_after(
+    generation: u64,
+    prior: &rdb_sim::storage::history::CanonicalHistory,
+    cutoff: u64,
+    n: u64,
+) -> rdb_sim::storage::history::CanonicalHistory {
+    rdb_sim::storage::history::canonical_history_from(
+        rdb_core::contracts::authority::Lineage {
+            generation: Generation(generation),
+            ..send_lineage()
+        },
+        ConfigVersion(1),
+        (Seq(cutoff), prior.digest(cutoff)),
+        n,
+    )
+    .expect("a canonical history")
+}
+
+/// A runner with node 1 leading partition 1 at `head` of [`send_history`], its engine holding
+/// `stored` (the batches it committed), and node 2 a receiver at the root. Seeded with node 2's
+/// `NeedPrefix { have: 0 }` arriving at node 1, which starts copy 1's cursor.
+fn send_runner(head: u64, stored: Vec<rdb_core::contracts::storage::Batch>) -> Runner {
+    send_runner_on(
+        head,
+        stored.into_iter().map(|batch| (NODE, batch)).collect(),
+        None,
+    )
+}
+
+/// [`send_runner`], with each engine holding its `preloads`, and node 1's durable through
+/// `durable` when given.
+fn send_runner_on(
+    head: u64,
+    preloads: Vec<(NodeId, rdb_core::contracts::storage::Batch)>,
+    durable: Option<u64>,
+) -> Runner {
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::envelope::{AppendOutcome, AppendReject, ReplicaProgress};
+    use rdb_core::contracts::event::EventKind;
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, ReceivedSeq};
+    use rdb_core::contracts::transport::TransportEvent;
+    use rdb_core::contracts::version::ENVELOPE_VERSION;
+    use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+    use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
+    use rdb_core::replication::wire::encode_reply;
+
+    let history = send_history(head);
+    let mut plan = RunPlan::new(support::cluster());
+    plan.preloads = preloads;
+    if let Some(through) = durable {
+        plan.preload_durable = vec![(NODE, PartitionId(1), Generation(1), DurableSeq(through))];
+    }
+    plan.seed = vec![SeedEvent {
+        at: Tick(1),
+        node: NODE,
+        boot: BOOT,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+        kind: EventKind::Transport(TransportEvent::Delivered {
+            from: PeerLabel {
+                node: NodeId(2),
+                boot: BOOT,
+                authenticated: true,
+            },
+            frame: Frame {
+                id: MessageId(0),
+                protocol: ENVELOPE_VERSION,
+                config: ConfigVersion(1),
+                // A reply carries the receiver's lineage: node 2 is at the sender's.
+                sender: send_lineage(),
+                body: encode_reply(&AppendOutcome::Rejected(AppendReject::NeedPrefix {
+                    have: Seq(0),
+                    head_digest: Digest::ROOT,
+                })),
+            },
+        }),
+    }];
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let mut ladder = DigestLadder::new();
+    for seq in 0..=head {
+        ladder.insert(Seq(seq), history.digest(seq));
+    }
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: support::rf3_config(),
+        own: CopyId(0),
+        lineage: send_lineage(),
+        history: ladder,
+        local: ReplicaProgress {
+            received: ReceivedSeq(head),
+            buffered_applied: AppliedSeq(head),
+            durable: DurableSeq(head),
+        },
+    })
+    .expect("a primary at the head");
+    let receiver = AppendReceiver::new(ReceiverInit {
+        config: support::rf3_config(),
+        own: CopyId(1),
+        lineage: send_lineage(),
+        head: Head {
+            seq: Seq(0),
+            digest: Digest::ROOT,
+        },
+        durable: DurableSeq(0),
+    })
+    .expect("a receiver at the root");
+    let replication = runner.dispatcher_mut().replication_mut();
+    replication.install_primary(tracker);
+    replication.install_receiver(receiver);
+    runner
+}
+
+/// The `History` bytes `node`'s engine shows for partition 1 at generation 1, `1..=n`.
+fn stored_records(runner: &Runner, node: NodeId, n: u64) -> Vec<Option<Bytes>> {
+    let engine = runner.dispatcher().engine(node).expect("an engine");
+    (1..=n)
+        .map(|seq| {
+            engine
+                .history_at(PartitionId(1), Generation(1), Seq(seq))
+                .map(|(record, _)| record)
+        })
+        .collect()
+}
+
+/// A copy at the root is caught up to the primary's head by `SendEnvelopes` alone: R1 names one
+/// record at a time, the harness reads it from node 1's engine and sends it, node 2's receiver
+/// stages and applies it, and its ACK moves the cursor to the next. Node 2 ends holding the
+/// same bytes node 1 committed, at node 1's head digest.
+#[retcd_test]
+fn send_envelopes_a_copy_at_the_root_is_caught_up_from_the_primarys_engine() {
+    support::preamble();
+    let history = send_history(3);
+    let mut runner = send_runner(3, history.batches.clone());
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, events = report.events_consumed, "send catch-up");
+
+    let head = runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("node 2's receiver")
+        .applied_head();
+    assert_eq!(
+        (head.seq, head.digest),
+        (Seq(3), history.digest(3)),
+        "node 2 applied through the primary's head, on the primary's history"
+    );
+    let sent = stored_records(&runner, NodeId(2), 3);
+    assert_eq!(
+        sent,
+        stored_records(&runner, NODE, 3),
+        "node 2 holds exactly the bytes node 1 committed"
+    );
+    assert!(sent.iter().all(Option::is_some), "{sent:?}");
+    let acked = runner
+        .dispatcher()
+        .replication()
+        .primary(NODE, PartitionId(1))
+        .expect("node 1's primary")
+        .tracker()
+        .peer(CopyId(1))
+        .expect("copy 1")
+        .progress
+        .buffered_applied;
+    assert_eq!(acked.0, 3, "node 2's ACK reached the primary at the head");
+}
+
+/// Never fabricated (B-R57 rule 1): R1's ladder vouches for seq 3, but node 1's engine holds
+/// only 1..=2. Records 1 and 2 are sent; 3 is not, and nothing stands in for it. The copy
+/// stops at 2.
+#[retcd_test]
+fn send_envelopes_a_record_the_engine_does_not_hold_is_not_sent() {
+    support::preamble();
+    let mut stored = send_history(3).batches;
+    stored.truncate(2);
+    let mut runner = send_runner(3, stored);
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, "send with a missing record");
+
+    let head = runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("node 2's receiver")
+        .applied_head();
+    assert_eq!(head.seq, Seq(2), "the copy took what the engine held");
+    assert_eq!(
+        stored_records(&runner, NodeId(2), 3)[2],
+        None,
+        "nothing was sent for the record the engine lacks"
+    );
+}
+
+/// B-R57 rule 2: a stored record that disagrees with the progress record committed beside it
+/// is not sent. Record 2's progress value is rewritten to another digest; 1 is sent, 2 and
+/// everything after it are not.
+#[retcd_test]
+fn send_envelopes_a_record_that_fails_its_check_is_not_sent() {
+    use rdb_core::contracts::storage::Namespace;
+    support::preamble();
+    let mut stored = send_history(3).batches;
+    for write in &mut stored[1].writes {
+        if write.ns == Namespace::Progress {
+            let mut value = write.value.clone().expect("a progress value").to_vec();
+            let last = value.len() - 1;
+            value[last] ^= 0xff;
+            write.value = Some(Bytes::from(value));
+        }
+    }
+    let mut runner = send_runner(3, stored);
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, "send with a record failing its check");
+
+    let head = runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("node 2's receiver")
+        .applied_head();
+    assert_eq!(head.seq, Seq(1), "only the record that passed was sent");
+}
+
+/// The provider's read (B-R57: "in the primary's lineage, through the inherited base"): at or
+/// below the base, a new generation shows its predecessor's record; above it, only its own.
+/// The predecessor's suffix past the cutoff is invisible from the new generation, though the
+/// predecessor still shows it.
+#[retcd_test]
+fn send_envelopes_the_read_crosses_the_inherited_base_and_not_the_discarded_suffix() {
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let prior = send_history(3);
+    let mut engine = MemoryEngine::new(NODE);
+    for batch in prior.batches.clone() {
+        engine.commit(batch).expect("a commit");
+    }
+    engine
+        .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
+        .expect("generation 2 starts at 2");
+    let next = send_history_after(2, &prior, 2, 3);
+    engine
+        .commit(next.batch(3).clone())
+        .expect("generation 2's own record 3");
+
+    let record = |generation: u64, seq: u64| {
+        engine
+            .history_at(PartitionId(1), Generation(generation), Seq(seq))
+            .map(|(record, _)| record)
+    };
+    let written = |history: &rdb_sim::storage::history::CanonicalHistory, seq: u64| {
+        rdb_sim::storage::history::history_writes(history.batch(seq), Seq(seq))
+            .map(|(record, _)| record)
+    };
+    assert_eq!(
+        record(2, 1),
+        written(&prior, 1),
+        "below the base: the predecessor's"
+    );
+    assert_eq!(
+        record(2, 2),
+        written(&prior, 2),
+        "at the base: the predecessor's"
+    );
+    assert_eq!(
+        record(2, 3),
+        written(&next, 3),
+        "above the base: its own, not the suffix"
+    );
+    assert_eq!(
+        record(1, 3),
+        written(&prior, 3),
+        "the predecessor still shows its suffix"
+    );
+    assert_eq!(record(2, 4), None, "nothing past the head");
+}
+
+// ------------------------------------------------------------------------------------------
+// Placement as data after commit (lead ruling B-R55 item 3, M7B-137): a `SyncWalThrough` F1
+// asks while `Rebuilding` is served by the pinned configuration's node for the copy, in the new
+// generation, with the digest the holder's own engine stores at the cutoff. The harness reports
+// that digest; F1 judges it.
+// ------------------------------------------------------------------------------------------
+
+/// The generation the spine's recovery creates.
+const REBUILT: Generation = Generation(2);
+
+/// The spine with copy 2 unable to report: F1 commits `DegradedRf2` over copies 0 and 1 and
+/// starts rebuilding all three. Nothing of the new generation is installed by hand (B-R58b):
+/// the members' fan-out is on by default, so every other member of the pin hears `Recovered`,
+/// inherits what it holds of the predecessor through the cutoff (B-R56.4), and builds its
+/// receiver. Copy 1 is in the barrier and starts at the cutoff. Copy 2 is not: it asks node 1
+/// from the root, R1 catches it up, and R1's own `CopyCaughtUp` pins the rebuild point and
+/// makes F1 sync every required copy.
+///
+/// Node 3, copy 2's holder, starts with `prior` as its predecessor history and nothing else:
+/// F1 never inventories it (it is not a survivor), so what it holds reaches F1 only through the
+/// holder's own engine at the rebuild's sync.
+fn rebuild_plan(prior: Vec<rdb_core::contracts::storage::Batch>) -> RunPlan {
+    let mut plan = spine_plan();
+    plan.survivors.retain(|(node, _, _)| *node != NodeId(3));
+    plan.preloads.retain(|(node, _)| *node != NodeId(3));
+    for batch in prior {
+        plan.preloads.push((NodeId(3), batch));
+    }
+    plan.limits = RunLimits {
+        max_events: 600,
+        deadline: Tick(4_000),
+    };
+    plan
+}
+
+/// What one rebuild run left behind.
+struct RebuildRun {
+    trace: Trace,
+    phase: Option<rdb_core::recovery::RecoveryPhase>,
+    /// Copy 2's receiver on node 3 at the end: its applied head, if R1 built one.
+    copy_2_head: Option<(u64, rdb_core::contracts::digest::Digest)>,
+    /// What node 3's engine shows for the new generation: its inherited base, and the `History`
+    /// record at each seq `1..=SPINE_HEAD`.
+    copy_2_base: Seq,
+    copy_2_records: Vec<Option<Bytes>>,
+}
+
+fn run_rebuild(prior: Vec<rdb_core::contracts::storage::Batch>) -> RebuildRun {
+    run_rebuild_faulted(prior, None)
+}
+
+/// [`run_rebuild`] with one at-rest fault planned on node 3's engine (lead ruling B-R58d).
+fn run_rebuild_faulted(
+    prior: Vec<rdb_core::contracts::storage::Batch>,
+    fault: Option<StorageOp>,
+) -> RebuildRun {
+    let mut plan = rebuild_plan(prior);
+    plan.storage_ops.extend(fault);
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the rebuild runs");
+    let phase = runner
+        .dispatcher()
+        .recovery(NODE, PartitionId(1))
+        .map(rdb_core::recovery::Recovery::phase);
+    let copy_2_head = runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(3), PartitionId(1))
+        .map(|receiver| receiver.applied_head())
+        .map(|head| (head.seq.0, head.digest));
+    let engine = runner
+        .dispatcher()
+        .engine(NodeId(3))
+        .expect("node 3's engine");
+    let copy_2_base = engine.base(PartitionId(1), REBUILT);
+    tracing::info!(stop = ?report.stop, events = report.events_consumed, ?phase, ?copy_2_head,
+        ?copy_2_base, "rebuild stop");
+    let copy_2_records = (1..=SPINE_HEAD)
+        .map(|seq| {
+            engine
+                .history_at(PartitionId(1), REBUILT, Seq(seq))
+                .map(|(record, _)| record)
+        })
+        .collect();
+    let trace = runner.finish().expect("a trace");
+    RebuildRun {
+        trace,
+        phase,
+        copy_2_head,
+        copy_2_base,
+        copy_2_records,
+    }
+}
+
+impl RebuildRun {
+    /// Every recovery note on node 1 about a sync or a rebuild fact, in trace order.
+    fn sync_notes(&self) -> Vec<KernelNote> {
+        self.trace
+            .events
+            .iter()
+            .filter(|event| event.node == NODE)
+            .filter_map(|event| match &event.kind {
+                TraceKind::KernelNoted { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+            .filter(|note| {
+                matches!(
+                    note,
+                    KernelNote::SyncWithheld { .. }
+                        | KernelNote::SyncProven { .. }
+                        | KernelNote::RecoveryFact { .. }
+                )
+            })
+            .collect()
+    }
+
+    /// How many CASes wrote partition 1's record: the recovery's, then the activation's.
+    fn partition_cas(&self) -> usize {
+        use rdb_core::contracts::trace::ControlOpKind;
+        self.trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TraceKind::ControlInteraction {
+                        op: ControlOpKind::Cas,
+                        key: Some(ControlKey::Partition(PartitionId(1))),
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    fn proven(&self) -> Vec<(CopyId, Seq)> {
+        self.sync_notes()
+            .into_iter()
+            .filter_map(|note| match note {
+                KernelNote::SyncProven { copy, cutoff, .. } => Some((copy, cutoff)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Scaffolding for M7B-137: each required copy is proved from the pinned configuration's node
+/// in the new generation, copy 2 included though no survivor was ever placed for it. Rebuilding
+/// closes: F1 proposes activation by a second CAS and ends `Committed`.
+///
+/// Copy 2's holder starts empty, so its new generation is filled by R1's catch-up alone, with
+/// the members' fan-out on by default (B-R58b) and nothing seeded: the records node 3 stores
+/// are node 1's, sent from the root, and R1's own `CopyCaughtUp` is what starts the rebuild's
+/// syncs. With the fan-out off, node 3 hears nothing, holds nothing, and copy 2 is never proved.
+#[retcd_test]
+fn m7b_137_sync_after_commit_proves_each_pinned_copy_from_its_own_engine() {
+    support::preamble();
+    let run = run_rebuild(Vec::new());
+    let history = spine_history();
+    assert_eq!(
+        run.copy_2_head,
+        Some((SPINE_HEAD, history.digest(SPINE_HEAD))),
+        "R1 caught copy 2 up to the cutoff"
+    );
+    assert_eq!(run.copy_2_base, Seq(0), "node 3 inherited nothing");
+    let sent: Vec<Option<Bytes>> = (1..=SPINE_HEAD)
+        .map(|seq| {
+            rdb_sim::storage::history::history_writes(history.batch(seq), Seq(seq))
+                .map(|(record, _)| record)
+        })
+        .collect();
+    assert_eq!(
+        run.copy_2_records, sent,
+        "node 3 stores node 1's records in the new generation, each written by the catch-up"
+    );
+    let head = Seq(SPINE_HEAD);
+    assert_eq!(
+        run.proven(),
+        vec![
+            (CopyId(0), head),
+            (CopyId(1), head),
+            (CopyId(0), head),
+            (CopyId(1), head),
+            (CopyId(2), head),
+        ],
+        "two survivors before commit, then every required copy: {:?}",
+        run.sync_notes()
+    );
+    assert_eq!(
+        run.partition_cas(),
+        2,
+        "the recovery's CAS, then activation's"
+    );
+    assert_eq!(
+        run.phase,
+        Some(rdb_core::recovery::RecoveryPhase::Committed)
+    );
+}
+
+/// The spine's history as another owner epoch wrote it: a record at every seq that passes its
+/// own check, and a different digest at the cutoff.
+fn another_epochs_history() -> rdb_sim::storage::history::CanonicalHistory {
+    let other = rdb_sim::storage::history::canonical_history(
+        rdb_core::contracts::authority::Lineage {
+            owner_epoch: OwnerEpoch(2),
+            ..spine_prior()
+        },
+        ConfigVersion(1),
+        SPINE_HEAD,
+    )
+    .expect("a canonical history");
+    assert_ne!(
+        other.digest(SPINE_HEAD),
+        spine_digest(SPINE_HEAD),
+        "precondition: another record at the cutoff"
+    );
+    other
+}
+
+/// Lead ruling B-R58c: a member outside the barrier lands **empty** in the new generation. Node
+/// 3 holds copy 2, which the barrier does not name, and it starts with another owner epoch's
+/// predecessor history through the cutoff — content nobody verified. It inherits none of it: R1
+/// catches it up from the root, and its engine reads exactly what R1 sent at every seq. F1 then
+/// proves copy 2 like any other and activates. Inheriting that prefix would put R1's writes
+/// under a base where no read sees them, and the copy would read the other epoch's records.
+#[retcd_test]
+fn fanout_a_member_outside_the_barrier_lands_empty_and_reads_what_r1_sent() {
+    support::preamble();
+    let run = run_rebuild(another_epochs_history().batches);
+    assert_eq!(run.copy_2_base, Seq(0), "node 3 inherited nothing");
+    let history = spine_history();
+    assert_eq!(
+        run.copy_2_head,
+        Some((SPINE_HEAD, history.digest(SPINE_HEAD))),
+        "R1 caught copy 2 up to the cutoff"
+    );
+    let sent: Vec<Option<Bytes>> = (1..=SPINE_HEAD)
+        .map(|seq| {
+            rdb_sim::storage::history::history_writes(history.batch(seq), Seq(seq))
+                .map(|(record, _)| record)
+        })
+        .collect();
+    assert_eq!(
+        run.copy_2_records, sent,
+        "node 3 reads what R1 sent at every seq, not the other epoch's records"
+    );
+    assert!(
+        run.proven().contains(&(CopyId(2), Seq(SPINE_HEAD))),
+        "F1 proved copy 2: {:?}",
+        run.sync_notes()
+    );
+    assert_eq!(
+        run.partition_cas(),
+        2,
+        "the recovery's CAS, then activation's"
+    );
+    assert_eq!(
+        run.phase,
+        Some(rdb_core::recovery::RecoveryPhase::Committed)
+    );
+}
+
+/// One real sync of partition 1 at `generation` on `engine`, through `through`.
+fn sync_send_lineage(
+    engine: &mut rdb_sim::storage::memory::MemoryEngine,
+    generation: Generation,
+    through: u64,
+) {
+    engine
+        .sync_wal_through(vec![rdb_core::contracts::storage::CapturedPrefix {
+            partition: PartitionId(1),
+            generation,
+            through: rdb_core::contracts::ids::AppliedSeq(through),
+        }])
+        .expect("a sync");
+}
+
+/// Lead ruling B-R58d, [`StorageOp::LoseRecord`] on the engine alone. Planned before the record
+/// exists, it waits. The first sync after the record is written loses it, and the sync still
+/// reports the prefix durable: nothing reports a lost write. Its neighbour is untouched, and a
+/// host crash does not bring it back.
+#[retcd_test]
+fn storage_a_lost_record_is_gone_from_the_first_sync_after_it_was_written() {
+    use rdb_core::contracts::ids::DurableSeq;
+    use rdb_core::contracts::storage::StorageFault;
+    use rdb_sim::storage::crash_image::CrashImage;
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let history = send_history(3);
+    let old = Generation(1);
+    let mut engine = MemoryEngine::new(NODE);
+    engine
+        .inject(StorageOp::LoseRecord {
+            node: NODE,
+            partition: PartitionId(1),
+            generation: old,
+            seq: Seq(3),
+        })
+        .expect("a planned loss");
+    for seq in 1..=2 {
+        engine.commit(history.batch(seq).clone()).expect("a commit");
+    }
+    sync_send_lineage(&mut engine, old, 2);
+    assert!(engine.has_planned(), "no record at 3 yet: the loss waits");
+    engine.commit(history.batch(3).clone()).expect("record 3");
+    sync_send_lineage(&mut engine, old, 3);
+    assert!(!engine.has_planned(), "taken by the sync after record 3");
+
+    let record = |engine: &MemoryEngine, seq: u64| {
+        engine
+            .history_at(PartitionId(1), old, Seq(seq))
+            .map(|(record, _)| record)
+    };
+    let written = |seq: u64| {
+        rdb_sim::storage::history::history_writes(history.batch(seq), Seq(seq))
+            .map(|(record, _)| record)
+    };
+    assert_eq!(record(&engine, 3), None, "the record is lost");
+    assert_eq!(record(&engine, 2), written(2), "its neighbour is not");
+    assert_eq!(
+        engine.durable(PartitionId(1), old),
+        DurableSeq(3),
+        "the sync reported the prefix durable all the same"
+    );
+    let host = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("an image")
+        .reopen(NODE);
+    assert_eq!(record(&host, 3), None, "a crash does not bring it back");
+}
+
+/// Lead ruling B-R58d, [`StorageOp::MisfileRecord`] on the engine alone. Generation 2 inherits
+/// generation 1 through 2; the misfile waits until generation 2 has written its own record 3,
+/// and then generation 1's record 3 — which passes its own check — is what generation 2 reads
+/// there. Generation 1 still reads its own, and record 2 is unchanged.
+#[retcd_test]
+fn storage_a_misfiled_record_shadows_the_one_its_target_wrote() {
+    use rdb_sim::storage::history::{history_writes, verified_record};
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let prior = send_history(3);
+    let (old, new) = (Generation(1), Generation(2));
+    let mut engine = MemoryEngine::new(NODE);
+    for batch in prior.batches.clone() {
+        engine.commit(batch).expect("a commit");
+    }
+    engine
+        .inherit(PartitionId(1), old, new, Seq(2))
+        .expect("generation 2 starts at 2");
+    engine
+        .inject(StorageOp::MisfileRecord {
+            node: NODE,
+            partition: PartitionId(1),
+            from: old,
+            to: new,
+            seq: Seq(3),
+        })
+        .expect("a planned misfile");
+    sync_send_lineage(&mut engine, new, 2);
+    assert!(
+        engine.has_planned(),
+        "generation 2 has not written 3: the misfile waits"
+    );
+    let next = send_history_after(2, &prior, 2, 3);
+    engine
+        .commit(next.batch(3).clone())
+        .expect("generation 2's 3");
+    sync_send_lineage(&mut engine, new, 3);
+    assert!(!engine.has_planned(), "taken by the sync after it");
+
+    let read =
+        |generation: Generation, seq: u64| engine.history_at(PartitionId(1), generation, Seq(seq));
+    let written = |history: &rdb_sim::storage::history::CanonicalHistory, seq: u64| {
+        history_writes(history.batch(seq), Seq(seq)).map(|(record, _)| record)
+    };
+    let (record, progress) = read(new, 3).expect("a record at 3");
+    assert_eq!(Some(record.clone()), written(&prior, 3), "generation 1's");
+    assert_ne!(written(&prior, 3), written(&next, 3), "precondition");
+    assert!(
+        verified_record(Seq(3), &record, progress.as_ref()).is_ok(),
+        "it passes its own check"
+    );
+    assert_eq!(read(old, 3).map(|(record, _)| record), written(&prior, 3));
+    assert_eq!(read(new, 2).map(|(record, _)| record), written(&prior, 2));
+    assert_eq!(
+        engine.inject(StorageOp::MisfileRecord {
+            node: NODE,
+            partition: PartitionId(1),
+            from: new,
+            to: new,
+            seq: Seq(3),
+        }),
+        Err(SimError::Config { field: "fault" }),
+        "a misfile into its own lineage is refused: it would change nothing"
+    );
+}
+
+/// Lead ruling L-R177do, on the network alone: a `ForgeAck` plan waits for an acknowledgement.
+/// A frame that is not one passes it by, under its own label. The next acknowledgement arrives
+/// once, at once, under the forged label, with its body unchanged, and the plan is spent. An
+/// authenticated forgery whose claimed role is the body's own is a frame-level lie too, and is
+/// delivered the same way.
+#[retcd_test]
+fn forge_ack_waits_for_an_acknowledgement_and_delivers_it_under_the_forged_label() {
+    use rdb_sim::sim::network::{Arrival, Fate};
+    support::preamble();
+    let label = PeerLabel {
+        node: NodeId(1),
+        boot: BOOT,
+        authenticated: true,
+    };
+    let forge = |claimed_role: ReplicaRole, authenticated: bool| NetworkOp::ForgeAck {
+        from: NodeId(1),
+        to: NodeId(2),
+        claimed_node: NodeId(3),
+        claimed_role,
+        authenticated,
+    };
+    let once = |label: PeerLabel, frame: Frame| {
+        Ok(Fate::Delivered(vec![Arrival {
+            delay_millis: 0,
+            label,
+            frame,
+        }]))
+    };
+    let mut network = Network::new();
+    network
+        .inject(forge(ReplicaRole::RegularSecondary, false))
+        .expect("a plan");
+    assert_eq!(
+        network.send(NodeId(1), NodeId(2), label, frame()),
+        once(label, frame()),
+        "not an acknowledgement: passed by under its own label"
+    );
+    assert_eq!(network.planned().len(), 1, "the plan still waits");
+    let ack = ack_frame(ReplicaRole::Shadow);
+    let forged = |authenticated: bool| PeerLabel {
+        node: NodeId(3),
+        boot: BOOT,
+        authenticated,
+    };
+    assert_eq!(
+        network.send(NodeId(1), NodeId(2), label, ack.clone()),
+        once(forged(false), ack.clone()),
+        "the acknowledgement, under the forged label, body unchanged"
+    );
+    assert!(network.planned().is_empty(), "the plan is spent");
+
+    network
+        .inject(forge(ReplicaRole::Shadow, true))
+        .expect("a plan");
+    assert_eq!(
+        network.send(NodeId(1), NodeId(2), label, ack.clone()),
+        once(forged(true), ack),
+        "a stolen credential under another node's name: the role claimed is the body's"
+    );
+}
+
+/// Lead ruling L-R177do, through the run loop (unblocks M7B-32). In the rebuild run node 3
+/// acknowledges R1's catch-up to node 1. The forgery takes node 3's first acknowledgement and
+/// delivers it to node 1 as node 2's, `authenticated: false`, body unchanged. **R1's own check**
+/// refuses it — its tracker's rule 1, `AckRejected(ForgedIdentity)` — on node 1, once. The same
+/// run without the forgery notes no forged identity anywhere, so the refusal is the forgery's.
+/// And R1 credits the refused frame with nothing: the run ends exactly where it ends when node
+/// 3's acknowledgement is dropped instead.
+#[retcd_test]
+fn forge_ack_an_unauthenticated_acknowledgement_reaches_r1_and_r1_refuses_it() {
+    use rdb_core::contracts::ignore::KernelIgnoredReason;
+    use rdb_core::contracts::trace::AckRejectReason;
+    use rdb_sim::sim::network::Delivery;
+    support::preamble();
+    let run = |op: Option<NetworkOp>| {
+        let mut plan = rebuild_plan(Vec::new());
+        plan.network_ops.extend(op);
+        let mut runner = Runner::new(&plan).expect("a runner");
+        let stop = runner.run(plan.limits).expect("the rebuild runs").stop;
+        let phase = runner
+            .dispatcher()
+            .recovery(NODE, PartitionId(1))
+            .map(rdb_core::recovery::Recovery::phase);
+        let waiting = runner.dispatcher().network().planned().to_vec();
+        let trace = runner.finish().expect("a trace");
+        let refused: Vec<(NodeId, ModuleName)> = trace
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TraceKind::KernelNoted {
+                    module,
+                    note:
+                        KernelNote::Ignored {
+                            reason:
+                                KernelIgnoredReason::AckRejected(AckRejectReason::ForgedIdentity),
+                        },
+                    ..
+                } => Some((event.node, *module)),
+                _ => None,
+            })
+            .collect();
+        (waiting, refused, (stop, phase))
+    };
+    let (_, control, _) = run(None);
+    assert!(
+        control.is_empty(),
+        "control: without the forgery nothing is refused as forged: {control:?}"
+    );
+    let (_, _, lost_end) = run(Some(NetworkOp::PlanNext {
+        from: NodeId(3),
+        to: NODE,
+        delivery: Delivery::Drop,
+    }));
+    let (waiting, refused, forged_end) = run(Some(NetworkOp::ForgeAck {
+        from: NodeId(3),
+        to: NODE,
+        claimed_node: NodeId(2),
+        claimed_role: ReplicaRole::RegularSecondary,
+        authenticated: false,
+    }));
+    assert_eq!(
+        forged_end, lost_end,
+        "R1 credits the refused frame with nothing: the run ends as if node 3's acknowledgement \
+         were lost"
+    );
+    assert!(
+        waiting.is_empty(),
+        "the forgery took an acknowledgement: {waiting:?}"
+    );
+    assert_eq!(
+        refused,
+        vec![(NODE, ModuleName::Replication)],
+        "delivered to node 1, and refused there by R1's own check, once"
+    );
+}
+
+/// Lead ruling L-R177do, through F1's `SyncWalThrough` provider. A stalled sync never answers,
+/// and no [`rdb_core::contracts::recovery::SyncWithheldReason`] says "stalled", so the provider
+/// **refuses by name** rather than withhold under a reason that is not true: the run stops at
+/// `harness::dispatch::deliver::recovery`, on F1's request, with the one capture held. Two
+/// paths: node 2's survivor proof at the barrier, and node 3's rebuilt copy while rebuilding.
+/// The clean run refuses nothing.
+#[retcd_test]
+fn recovery_a_stalled_sync_is_refused_by_name_not_withheld() {
+    use rdb_core::recovery::RecoveryPhase;
+    use rdb_sim::harness::run::StopReason;
+    support::preamble();
+    let run = |stall: Option<NodeId>| {
+        let mut plan = rebuild_plan(Vec::new());
+        plan.storage_ops
+            .extend(stall.map(|node| StorageOp::StallFlush { node }));
+        let mut runner = Runner::new(&plan).expect("a runner");
+        let stop = runner.run(plan.limits).expect("the rebuild runs").stop;
+        let phase = runner
+            .dispatcher()
+            .recovery(NODE, PartitionId(1))
+            .map(rdb_core::recovery::Recovery::phase);
+        let held = stall.map(|node| {
+            runner
+                .dispatcher()
+                .engine(node)
+                .expect("the node's engine")
+                .stalled_syncs()
+                .len()
+        });
+        let refused = match stop {
+            StopReason::Refused { seam, module, .. } => Some((seam, module)),
+            _ => None,
+        };
+        (refused, phase, held)
+    };
+    assert_eq!(run(None).0, None, "control: the clean run refuses nothing");
+    let refused = Some(("harness::dispatch::deliver::recovery", ModuleName::Recovery));
+    assert_eq!(
+        run(Some(NodeId(2))),
+        (refused, Some(RecoveryPhase::Barrier), Some(1)),
+        "a survivor's proof stalls: refused at the barrier, its capture held"
+    );
+    assert_eq!(
+        run(Some(NodeId(3))),
+        (refused, Some(RecoveryPhase::Rebuilding), Some(1)),
+        "the rebuilt copy's proof stalls: refused while rebuilding, its capture held"
+    );
+}
+
+/// Near miss (lead's condition on B-R55 item 3): copy 2's engine holds a record at the cutoff
+/// that passes its own check but is not the committed history's — another owner epoch wrote
+/// it. The harness proves durability and reports the digest it holds, without comparing it.
+/// **F1** refuses it: `Rebuild::durable` judges the proof against the rebuild point and the
+/// committed cutoff, and quarantines. Rebuilding never closes, and no activation CAS is written.
+///
+/// Planted by a misdirected write (lead ruling B-R58d): node 3 holds another epoch's
+/// predecessor history, lands empty (B-R58c), and R1 catches it up with the committed records.
+/// Then [`StorageOp::MisfileRecord`] writes the predecessor's record at the cutoff over R1's, at
+/// the first sync after R1 wrote it.
+#[retcd_test]
+fn m7b_137_sync_after_commit_a_rebuilt_copy_holding_another_record_at_the_cutoff_is_quarantined_by_f1(
+) {
+    use rdb_core::contracts::recovery::{DivergenceEvidence, RecoveryEffect};
+    support::preamble();
+    let other = another_epochs_history();
+    let run = run_rebuild_faulted(
+        other.batches.clone(),
+        Some(StorageOp::MisfileRecord {
+            node: NodeId(3),
+            partition: PartitionId(1),
+            from: spine_prior().generation,
+            to: REBUILT,
+            seq: Seq(SPINE_HEAD),
+        }),
+    );
+    assert_eq!(run.copy_2_base, Seq(0), "node 3 landed empty (B-R58c)");
+    assert_eq!(
+        run.copy_2_head,
+        Some((SPINE_HEAD, spine_digest(SPINE_HEAD))),
+        "R1 caught copy 2 up with the committed records"
+    );
+    let misfiled =
+        rdb_sim::storage::history::history_writes(other.batch(SPINE_HEAD), Seq(SPINE_HEAD))
+            .map(|(record, _)| record);
+    assert_eq!(
+        run.copy_2_records.last(),
+        Some(&misfiled),
+        "the other epoch's record now sits at the cutoff"
+    );
+    let notes = run.sync_notes();
+    let proven_2 = notes
+        .iter()
+        .position(|note| {
+            matches!(
+                note,
+                KernelNote::SyncProven {
+                    copy: CopyId(2),
+                    ..
+                }
+            )
+        })
+        .expect("the harness proved copy 2 durable and reported its digest");
+    // F1's evidence names copy 2 at the cutoff with the digest its engine reported: against the
+    // point its own catch-up pinned (`Pairwise`), or against the committed cutoff
+    // (`RootMismatch`), whichever check F1 runs first.
+    let reported = (CopyId(2), other.digest(SPINE_HEAD));
+    let quarantine = notes
+        .iter()
+        .position(|note| match note {
+            KernelNote::RecoveryFact {
+                effect: RecoveryEffect::Quarantine(evidence),
+            } => match evidence {
+                DivergenceEvidence::Pairwise { seq, a, b } => {
+                    *seq == Seq(SPINE_HEAD) && (*a == reported || *b == reported)
+                }
+                DivergenceEvidence::RootMismatch { copy, .. } => *copy == CopyId(2),
+            },
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("F1 quarantined copy 2: {notes:?}"));
+    assert!(
+        proven_2 < quarantine,
+        "F1 judged the proof the harness routed"
+    );
+    let refused_by: Vec<(NodeId, ModuleName)> = run
+        .trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                module,
+                note:
+                    KernelNote::RecoveryFact {
+                        effect: RecoveryEffect::Quarantine(_),
+                    },
+                ..
+            } => Some((event.node, *module)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(refused_by, vec![(NODE, ModuleName::Recovery)], "F1, not R1");
+    assert_eq!(run.partition_cas(), 1, "no activation");
+    assert_eq!(
+        run.phase,
+        Some(rdb_core::recovery::RecoveryPhase::Quarantined)
+    );
+}
+
+/// Never fabricated: copy 2's engine is applied through the cutoff in the new generation but
+/// stores no `History` record there. Its sync is withheld with `NoDigest`, and Rebuilding stays
+/// open with no activation.
+///
+/// Planted by a lost write (lead ruling B-R58d): node 3 lands empty (B-R58c) and R1 catches it
+/// up, so its receiver holds the cutoff. Then [`StorageOp::LoseRecord`] loses the record R1
+/// wrote there, at the first sync after it was written: applied, reported durable, not there.
+#[retcd_test]
+fn m7b_137_sync_after_commit_a_rebuilt_copy_with_no_record_at_the_cutoff_is_withheld() {
+    use rdb_core::contracts::trace::SyncWithheldReason;
+    support::preamble();
+    let run = run_rebuild_faulted(
+        Vec::new(),
+        Some(StorageOp::LoseRecord {
+            node: NodeId(3),
+            partition: PartitionId(1),
+            generation: REBUILT,
+            seq: Seq(SPINE_HEAD),
+        }),
+    );
+    assert_eq!(run.copy_2_base, Seq(0), "node 3 landed empty (B-R58c)");
+    let history = spine_history();
+    assert_eq!(
+        run.copy_2_head,
+        Some((SPINE_HEAD, history.digest(SPINE_HEAD))),
+        "R1 caught copy 2 up through the cutoff"
+    );
+    let sent: Vec<Option<Bytes>> = (1..SPINE_HEAD)
+        .map(|seq| {
+            rdb_sim::storage::history::history_writes(history.batch(seq), Seq(seq))
+                .map(|(record, _)| record)
+        })
+        .chain([None])
+        .collect();
+    assert_eq!(
+        run.copy_2_records, sent,
+        "every record R1 sent below the cutoff, and none at it"
+    );
+    let notes = run.sync_notes();
+    assert!(
+        notes.contains(&KernelNote::SyncWithheld {
+            copy: CopyId(2),
+            cutoff: Seq(SPINE_HEAD),
+            reason: SyncWithheldReason::NoDigest,
+        }),
+        "{notes:?}"
+    );
+    assert!(
+        !run.proven().contains(&(CopyId(2), Seq(SPINE_HEAD))),
+        "no proof for copy 2"
+    );
+    assert_eq!(run.partition_cas(), 1, "no activation");
+    assert_eq!(
+        run.phase,
+        Some(rdb_core::recovery::RecoveryPhase::Rebuilding)
+    );
+}
+
+/// No borrowed durability (tester attack (c) on M7B-137): a new generation's sync through its
+/// inherited base flushes that base where it lives, in the parent lineage on the **same**
+/// engine. Here generation 1 committed 1..=3 and never synced; generation 2 inherits through 2,
+/// commits its own 3, and syncs through 3. Generation 1 is then durable through 2, not 3: its
+/// suffix above the base is not generation 2's to flush. After a host crash generation 2 still
+/// reads its record at 2. Another
+/// engine holding the same history is not touched.
+#[retcd_test]
+fn m7b_137_sync_after_commit_a_new_generation_sync_flushes_its_inherited_base_on_the_same_engine() {
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
+    use rdb_core::contracts::storage::CapturedPrefix;
+    use rdb_sim::storage::crash_image::CrashImage;
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let prior = send_history(3);
+    let mut engine = MemoryEngine::new(NODE);
+    let mut other = MemoryEngine::new(NodeId(2));
+    for batch in prior.batches.clone() {
+        engine.commit(batch.clone()).expect("a commit");
+        other.commit(batch).expect("a commit");
+    }
+    engine
+        .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
+        .expect("generation 2 starts at 2");
+    assert_eq!(
+        engine.durable(PartitionId(1), Generation(1)),
+        DurableSeq(0),
+        "precondition: the parent never synced"
+    );
+    let next = send_history_after(2, &prior, 2, 3);
+    engine
+        .commit(next.batch(3).clone())
+        .expect("generation 2's own record 3");
+    engine
+        .sync_wal_through(vec![CapturedPrefix {
+            partition: PartitionId(1),
+            generation: Generation(2),
+            through: AppliedSeq(3),
+        }])
+        .expect("a clean flush");
+    assert_eq!(engine.durable(PartitionId(1), Generation(2)), DurableSeq(3));
+    assert_eq!(
+        engine.durable(PartitionId(1), Generation(1)),
+        DurableSeq(2),
+        "the base was flushed where it lives, and nothing above it"
+    );
+    assert_eq!(
+        other.durable(PartitionId(1), Generation(1)),
+        DurableSeq(0),
+        "no other engine moved"
+    );
+    let reopened = CrashImage::of(&engine, StorageFault::HostCrash)
+        .expect("a crash image")
+        .reopen(NODE);
+    assert_eq!(
+        reopened.durable(PartitionId(1), Generation(2)),
+        DurableSeq(3)
+    );
+    assert_eq!(
+        reopened.base(PartitionId(1), Generation(2)),
+        Seq(2),
+        "a host crash keeps the whole base: the parent synced it"
+    );
+    assert!(
+        reopened
+            .history_at(PartitionId(1), Generation(2), Seq(2))
+            .is_some(),
+        "what generation 2 claims durable, it can still read"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// B-R57a (tester-kb-r1's B-R57 gate): the crash seam on the send provider (F5), the helper's
+// shape against a batch T1 really commits (F6), and rows for the guards only the tester's probes
+// caught (D01, D03, D04, D05, H01, H02, M01). The probes s01-s13 are the templates.
+// ------------------------------------------------------------------------------------------
+
+/// This test's own log lines that contain `needle`.
+fn own_log_lines(method: &str, needle: &str) -> Vec<String> {
+    fn walk(dir: &std::path::Path, file: &str, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, file, out);
+            } else if path.file_name().and_then(|name| name.to_str()) == Some(file) {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&test_log_dir(), &format!("{method}.jsonl"), &mut files);
+    assert!(!files.is_empty(), "no log file for {method}");
+    files
+        .iter()
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|line| line.contains(needle))
+        .collect()
+}
+
+/// Node 2's applied head for partition 1.
+fn node2_head(runner: &Runner) -> Seq {
+    runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(2), PartitionId(1))
+        .expect("node 2's receiver")
+        .applied_head()
+        .seq
+}
+
+/// The `History` record `batch` wrote at its own sequence.
+fn record_of(batch: &rdb_core::contracts::storage::Batch) -> Bytes {
+    rdb_sim::storage::history::history_writes(batch, batch.seq)
+        .expect("a history write")
+        .0
+}
+
+/// Replace `batch`'s `History` value and, when given, its `Progress` value.
+fn rewrite_record(
+    batch: &mut rdb_core::contracts::storage::Batch,
+    record: &Bytes,
+    progress: Option<Bytes>,
+) {
+    use rdb_core::contracts::storage::Namespace;
+    for write in &mut batch.writes {
+        if write.ns == Namespace::History {
+            write.value = Some(record.clone());
+        }
+        if write.ns == Namespace::Progress {
+            if let Some(progress) = &progress {
+                write.value = Some(progress.clone());
+            }
+        }
+    }
+}
+
+/// Hand node 1 `SendEnvelopes { copy 1, from..=through }` directly and return the frame bodies
+/// scheduled for node 2, in order. R1 itself names one record at a time; a range pins the
+/// provider's rule for when it does not.
+fn sent_for(runner: &mut Runner, from: u64, through: u64) -> Vec<Bytes> {
+    use rdb_core::contracts::transport::TransportEvent;
+    let mut scheduler = Scheduler::new();
+    runner
+        .dispatcher_mut()
+        .deliver(
+            NODE,
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(9),
+                from: ModuleName::Replication,
+                partition: PartitionId(1),
+                kind: EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                    copy: CopyId(1),
+                    from: Seq(from),
+                    through: Seq(through),
+                }),
+            }],
+            &mut ControlStore::new(),
+            &mut scheduler,
+        )
+        .expect("the provider answers");
+    let mut bodies = Vec::new();
+    while let Some(event) = scheduler.pop() {
+        if let EventKind::Transport(TransportEvent::Delivered { frame, .. }) = event.kind {
+            assert_eq!(event.node, NodeId(2));
+            bodies.push(frame.body);
+        }
+    }
+    bodies
+}
+
+/// F5 (s02b inverted): records 1..=3 committed on node 1, only 1..=2 synced, then a host crash
+/// and no restart. The crash image keeps 1..=2. A crashed primary sends nothing: the provider is
+/// refused at the crash seam like every other storage reader, and never serves the pre-crash
+/// engine's record 3.
+#[retcd_test]
+fn send_envelopes_a_crashed_primary_sends_nothing() {
+    use rdb_core::contracts::storage::StoreEffect;
+    support::preamble();
+    let history = send_history(3);
+    let preloads = history
+        .batches
+        .iter()
+        .cloned()
+        .map(|batch| (NODE, batch))
+        .collect();
+    let mut runner = send_runner_on(3, preloads, Some(2));
+    runner
+        .dispatcher_mut()
+        .inject_storage(StorageOp::Crash {
+            node: NODE,
+            fault: StorageFault::HostCrash,
+        })
+        .expect("a planned crash");
+    let taken = runner.dispatcher_mut().deliver(
+        NODE,
+        BOOT,
+        vec![Effect {
+            correlation: CorrelationId(9),
+            from: ModuleName::Replication,
+            partition: PartitionId(1),
+            kind: EffectKind::Store(StoreEffect::Release {
+                handle: SnapshotHandle(99),
+            }),
+        }],
+        &mut ControlStore::new(),
+        &mut Scheduler::new(),
+    );
+    assert!(taken.is_err(), "the crash is taken: {taken:?}");
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, "send from a crashed primary");
+    let image = runner.dispatcher().crash_image(NODE).expect("still down");
+    assert!(
+        image
+            .reopen(NODE)
+            .history_at(PartitionId(1), Generation(1), Seq(3))
+            .is_none(),
+        "precondition: the crash image lost record 3"
+    );
+    let received = runner.dispatcher().engine(NodeId(2)).map_or(0, |engine| {
+        (1..=3)
+            .filter(|seq| {
+                engine
+                    .history_at(PartitionId(1), Generation(1), Seq(*seq))
+                    .is_some()
+            })
+            .count()
+    });
+    assert_eq!(received, 0, "nothing was sent from the crashed node");
+    assert_eq!(node2_head(&runner), Seq(0));
+    assert!(
+        matches!(
+            report.stop,
+            rdb_sim::harness::run::StopReason::Refused {
+                seam: "harness::dispatch::deliver::crash",
+                ..
+            }
+        ),
+        "refused at the crash seam, by name: {:?}",
+        report.stop
+    );
+}
+
+/// D01 (s01): node 3's engine holds record 3 and the primary's does not. Only the sending node's
+/// engine is read, so the copy stops at 2 and the warn names node 1.
+#[retcd_test]
+fn send_envelopes_only_the_primarys_own_engine_is_read() {
+    support::preamble();
+    let history = send_history(3);
+    let mut preloads: Vec<_> = history.batches[..2]
+        .iter()
+        .cloned()
+        .map(|batch| (NODE, batch))
+        .collect();
+    preloads.extend(
+        history
+            .batches
+            .iter()
+            .cloned()
+            .map(|batch| (NodeId(3), batch)),
+    );
+    let mut runner = send_runner_on(3, preloads, None);
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, "run stop");
+    assert_eq!(node2_head(&runner), Seq(2));
+    let warns = own_log_lines(
+        "send_envelopes_only_the_primarys_own_engine_is_read",
+        "no record at this sequence",
+    );
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("\"seq\":3") && warns[0].contains("\"node\":1"),
+        "{warns:?}"
+    );
+}
+
+/// D03, D04 (s12): a range stops at the first record it cannot send (a hole at 2, or a record
+/// failing its check at 2) though 3 is held and valid. A whole range sends every stored value
+/// unchanged, byte for byte.
+#[retcd_test]
+fn send_envelopes_a_range_stops_at_a_hole_or_a_failed_record() {
+    support::preamble();
+    let history = send_history(3);
+    let holed = vec![history.batches[0].clone(), history.batches[2].clone()];
+    let bodies = sent_for(&mut send_runner(3, holed), 1, 3);
+    assert_eq!(bodies, vec![record_of(&history.batches[0])], "a hole at 2");
+
+    let mut failed = send_history(3).batches;
+    let three = record_of(&failed[2]);
+    rewrite_record(&mut failed[1], &three, None);
+    let bodies = sent_for(&mut send_runner(3, failed.clone()), 1, 3);
+    assert_eq!(bodies, vec![record_of(&failed[0])], "a failed record at 2");
+
+    let bodies = sent_for(&mut send_runner(3, history.batches.clone()), 1, 3);
+    let stored: Vec<Bytes> = history.batches.iter().map(record_of).collect();
+    assert_eq!(bodies, stored, "the frame bodies are the stored values");
+}
+
+/// D05 (s13): the read is in the primary's own generation. Node 1's engine holds generations 1
+/// and 2 at 1..=3 with different bytes; a primary leading generation 2 sends generation 2's.
+/// Generation 2 here is committed without inheriting, so it is a lineage cut at the root, and
+/// [`send_history`]'s root chain is the right start for it (B-R57b).
+#[retcd_test]
+fn send_envelopes_the_read_is_in_the_primarys_own_generation() {
+    use rdb_core::contracts::envelope::ReplicaProgress;
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, ReceivedSeq};
+    use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
+    support::preamble();
+    let second_lineage = rdb_core::contracts::authority::Lineage {
+        generation: Generation(2),
+        ..send_lineage()
+    };
+    let first = send_history(3);
+    let second = rdb_sim::storage::history::canonical_history(second_lineage, ConfigVersion(1), 3)
+        .expect("a canonical history");
+    let mut stored = first.batches.clone();
+    stored.extend(second.batches.clone());
+    let mut runner = send_runner(3, stored);
+    let mut ladder = DigestLadder::new();
+    for seq in 0..=3 {
+        ladder.insert(Seq(seq), second.digest(seq));
+    }
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: support::rf3_config(),
+        own: CopyId(0),
+        lineage: second_lineage,
+        history: ladder,
+        local: ReplicaProgress {
+            received: ReceivedSeq(3),
+            buffered_applied: AppliedSeq(3),
+            durable: DurableSeq(3),
+        },
+    })
+    .expect("a generation-2 primary");
+    runner
+        .dispatcher_mut()
+        .replication_mut()
+        .install_primary(tracker);
+    let want: Vec<Bytes> = second.batches.iter().map(record_of).collect();
+    assert_ne!(
+        want,
+        first.batches.iter().map(record_of).collect::<Vec<_>>(),
+        "precondition: the generations' bytes differ"
+    );
+    assert_eq!(sent_for(&mut runner, 1, 3), want);
+}
+
+/// H01 (s03): record 2's user value is changed and re-encoded under its old carried digest, and
+/// its progress record still names that digest. Only recomputing the digest refuses it.
+#[retcd_test]
+fn send_envelopes_a_tampered_value_under_its_old_digest_is_not_sent() {
+    use rdb_core::contracts::envelope::ReplicationEnvelope;
+    support::preamble();
+    let mut stored = send_history(3).batches;
+    let mut envelope = ReplicationEnvelope::decode(&record_of(&stored[1])).expect("decodes");
+    envelope.mutations[0].value = Some(Bytes::from_static(b"tampered"));
+    let bytes = envelope.encode().expect("encodes");
+    rewrite_record(&mut stored[1], &bytes, None);
+    let mut runner = send_runner(3, stored);
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, "run stop");
+    assert_eq!(node2_head(&runner), Seq(1));
+    let warns = own_log_lines(
+        "send_envelopes_a_tampered_value_under_its_old_digest_is_not_sent",
+        "failed its check",
+    );
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(
+        warns[0].contains("DigestMismatch") && warns[0].contains("\"seq\":2"),
+        "{warns:?}"
+    );
+}
+
+/// H02 (s04): key 2 holds record 3's bytes and its progress record is forged to (2, digest 3).
+/// Only the sequence check refuses it.
+#[retcd_test]
+fn send_envelopes_a_record_under_the_wrong_key_is_not_sent() {
+    support::preamble();
+    let history = send_history(3);
+    let mut stored = history.batches.clone();
+    let three = record_of(&stored[2]);
+    let mut forged = 2u64.to_le_bytes().to_vec();
+    forged.extend_from_slice(&history.digest(3).0);
+    rewrite_record(&mut stored[1], &three, Some(Bytes::from(forged)));
+    let mut runner = send_runner(3, stored);
+    let report = runner
+        .run(RunLimits::SMALL)
+        .expect("the run itself does not fail");
+    tracing::info!(stop = ?report.stop, "run stop");
+    assert_eq!(node2_head(&runner), Seq(1));
+    let warns = own_log_lines(
+        "send_envelopes_a_record_under_the_wrong_key_is_not_sent",
+        "failed its check",
+    );
+    assert_eq!(warns.len(), 1, "{warns:?}");
+    assert!(warns[0].contains("WrongSeq"), "{warns:?}");
+}
+
+/// M01 (s07): across two inheritances (generation 2 from 1 at 2, generation 3 from 2 at 4), a
+/// lineage shows nothing above its base until it writes its own record there, and never a
+/// predecessor's discarded suffix.
+#[retcd_test]
+fn history_at_shows_nothing_above_a_base_through_two_inheritances() {
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    // Each generation chains from its predecessor's digest at its cutoff (B-R57b).
+    let first = send_history(5);
+    let second = send_history_after(2, &first, 2, 5);
+    let third = send_history_after(3, &second, 4, 6);
+    let mut engine = MemoryEngine::new(NODE);
+    for batch in first.batches.iter().cloned() {
+        engine.commit(batch).expect("generation 1");
+    }
+    engine
+        .inherit(PartitionId(1), Generation(1), Generation(2), Seq(2))
+        .expect("generation 2 at 2");
+    let shows = |engine: &MemoryEngine, generation: u64, seq: u64| {
+        engine
+            .history_at(PartitionId(1), Generation(generation), Seq(seq))
+            .map(|(record, _)| record)
+    };
+    for seq in 3..=5 {
+        assert_eq!(shows(&engine, 2, seq), None, "generation 2 at {seq}");
+    }
+    for batch in second.batches.iter().cloned() {
+        engine.commit(batch).expect("generation 2");
+    }
+    engine
+        .inherit(PartitionId(1), Generation(2), Generation(3), Seq(4))
+        .expect("generation 3 at 4");
+    engine
+        .commit(third.batch(6).clone())
+        .expect("generation 3's own 6");
+    let own = |history: &rdb_sim::storage::history::CanonicalHistory, seq: u64| {
+        Some(record_of(history.batch(seq)))
+    };
+    assert_eq!(shows(&engine, 3, 1), own(&first, 1));
+    assert_eq!(shows(&engine, 3, 2), own(&first, 2));
+    assert_eq!(shows(&engine, 3, 3), own(&second, 3));
+    assert_eq!(shows(&engine, 3, 4), own(&second, 4));
+    assert_eq!(shows(&engine, 3, 5), None, "every discarded 5");
+    assert_eq!(shows(&engine, 3, 6), own(&third, 6));
+}
+
+/// F6 (s09): `canonical_history` against a batch T1 really commits. One T1, live at
+/// generation 7 cut at 0, is given the request the helper documents for record 1; its batch is
+/// set beside the helper's record 1 for the same lineage and configuration. The writes (each
+/// namespace, key and value, the History record's bytes included) are equal; the batch id
+/// carries T1's tag. The request is built here, not taken from the helper, so the two cannot
+/// drift together.
+#[retcd_test]
+fn canonical_history_writes_what_t1_commits() {
+    use rdb_core::contracts::authority::{
+        AuthorityDecision, AuthorityEvent, AuthorityView, Checkpoint, DenyReason, FencingProof,
+        Lineage, PartitionMode, Revocation, Verdict,
+    };
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::event::{ClientEvent, Event, KernelEvent, Module, StepCtx};
+    use rdb_core::contracts::ids::{
+        AffinityId, AuthorityGeneration, ClientId, GrantId, RequestId, RequestIdentity, Revision,
+        TenantId,
+    };
+    use rdb_core::contracts::membership::{Member, PartitionConfig};
+    use rdb_core::contracts::protection::{AdmissionState, ReplicationLag};
+    use rdb_core::contracts::recovery::{
+        CommittedRoot, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap,
+        SelectedLineage,
+    };
+    use rdb_core::contracts::storage::{Namespace, SnapshotRead, StoreEffect};
+    use rdb_core::contracts::time::ControlTime;
+    use rdb_core::contracts::trace::Version;
+    use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
+    use rdb_core::contracts::version::API_VERSION;
+    use rdb_core::transaction::{Transaction, BATCH_TAG};
+
+    /// An empty partition: T1 seeds its dedup index from it and finds nothing.
+    struct Empty;
+    impl SnapshotRead for Empty {
+        fn handle(&self) -> SnapshotHandle {
+            SnapshotHandle(0)
+        }
+        fn at(&self) -> Seq {
+            Seq(0)
+        }
+        fn generation(&self) -> Generation {
+            Generation(7)
+        }
+        fn get(&self, _ns: Namespace, _key: &[u8]) -> Option<Bytes> {
+            None
+        }
+        fn version(&self, _ns: Namespace, _key: &[u8]) -> Option<Version> {
+            None
+        }
+        fn scan(&self, _ns: Namespace, _from: &[u8], _limit: usize) -> Vec<(Bytes, Bytes)> {
+            Vec::new()
+        }
+    }
+
+    support::preamble();
+    const GEN: Generation = Generation(7);
+    const C1: ConfigVersion = ConfigVersion(1);
+    let lineage_at = |generation: Generation| Lineage {
+        partition: PartitionId(1),
+        generation,
+        owner_epoch: OwnerEpoch(1),
+    };
+    // Grant 1, so T1's lease id is the helper's `LeaseId(1)`.
+    let view = AuthorityView {
+        lineage: lineage_at(GEN),
+        grant_id: GrantId(1),
+        boot_id: BOOT,
+        authority_generation: AuthorityGeneration(1),
+        config_version: C1,
+        authority_seq: 1,
+        valid_through_tick: Tick(u64::MAX),
+        past_horizon: DenyReason::Expired,
+    };
+    let member = |copy: u8, node: u32, role| Member {
+        copy: CopyId(copy),
+        node: NodeId(node),
+        boot: BOOT,
+        role,
+    };
+    let config = PartitionConfig::new(
+        PartitionId(1),
+        C1,
+        vec![
+            member(1, 1, ReplicaRole::Primary),
+            member(2, 2, ReplicaRole::RegularSecondary),
+            member(3, 3, ReplicaRole::RegularSecondary),
+        ],
+    );
+    let prior = Generation(GEN.0 - 1);
+    let recovered = RecoveryResult {
+        fenced_prior: FencingProof {
+            partition: PartitionId(1),
+            prior_generation: prior,
+            prior_owner_epoch: OwnerEpoch(1),
+            prior_grant_id: GrantId(1),
+            prior_boot_id: BOOT,
+            revocation: Revocation::DurableDrain {
+                ack_revision: Revision(1),
+            },
+            control_revision: Revision(1),
+            decision_tick: Tick::ZERO,
+        },
+        inventories: Vec::new(),
+        selected: SelectedLineage {
+            root: lineage_at(prior),
+            cutoff_seq: Seq(0),
+            cutoff_digest: Digest::ROOT,
+            source: CopyId(1),
+        },
+        new_generation: GEN,
+        mode: PartitionMode::Active,
+        barrier: RecoveryBarrier::try_new(&[], &Default::default(), Seq(0), Digest::ROOT)
+            .expect("an empty required set needs no proof"),
+        loss: LossRecord {
+            queried: Vec::new(),
+            unavailable: Vec::new(),
+            cutoff_seq: Seq(0),
+            highest_advertised_seq: Seq(0),
+            uncertain: false,
+        },
+        committed: CommittedRoot {
+            revision: Revision(2),
+            authority_view: view,
+            pinned_config: config,
+        },
+        retained_status_map: RetainedStatusMap {
+            predecessor_generation: prior,
+            predecessor_cutoff: Seq(0),
+            retained_through: Seq(0),
+            discarded_from: None,
+            uncertain: false,
+        },
+    };
+    let event = |kind: EventKind| Event {
+        id: EventId(0),
+        at: Tick::ZERO,
+        node: NODE,
+        boot: BOOT,
+        partition: PartitionId(1),
+        correlation: CorrelationId(42),
+        kind,
+    };
+    let budgets = Budgets::SPEC_DEFAULTS;
+    let snapshot = Empty;
+    let ctx = StepCtx {
+        now: Tick(10),
+        control_time: ControlTime {
+            estimate: Tick(10),
+            error_millis: 0,
+            bound_established: true,
+            sampled_at: Tick(10),
+        },
+        node: NODE,
+        boot: BOOT,
+        partition: PartitionId(1),
+        generation: GEN,
+        owner_epoch: OwnerEpoch(1),
+        config_version: C1,
+        snapshot: &snapshot,
+        budgets: &budgets,
+    };
+    let mut t1 = Transaction::new();
+    let mut step = |kind: EventKind| -> Vec<EffectKind> {
+        t1.step(&ctx, &event(kind))
+            .expect("a T1 input is never declined")
+            .into_iter()
+            .map(|effect| effect.kind)
+            .collect()
+    };
+    assert_eq!(
+        step(EventKind::Kernel(KernelEvent::Recovered(Box::new(
+            recovered
+        )))),
+        vec![]
+    );
+    assert_eq!(
+        step(EventKind::Kernel(KernelEvent::SetAdmission(
+            AdmissionState {
+                allow: true,
+                reason: None,
+                oldest_unsafe_age: 0,
+                oldest_unsafe_seq: Seq::ZERO,
+                replication_lag: ReplicationLag::ZERO,
+                stalest_copy: None,
+                lost_copies: Vec::new(),
+                paused_prefix: Seq(4),
+                resume_barrier: Seq::ZERO,
+                required_config_versions: vec![C1],
+                outstanding_unsafe_bytes: 0,
+            }
+        ))),
+        vec![]
+    );
+    // Record 1 as the helper documents it: tenant 1, client 1, request 1, affinity 1, one put
+    // of the sequence (big-endian) at the scoped key `k`.
+    let request = TxnRequest {
+        api_version: API_VERSION,
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(1),
+        },
+        affinity: AffinityId(1),
+        expected_generation: None,
+        remaining_millis: 1_000,
+        conditions: Vec::new(),
+        mutations: vec![Mutation::Put {
+            key: scoped_key(TenantId(1), AffinityId(1), b"k"),
+            value: Bytes::copy_from_slice(&1u64.to_be_bytes()),
+            expected_version: None,
+        }],
+    };
+    let effects = step(EventKind::Client(ClientEvent::Submit(request)));
+    let [EffectKind::Kernel(KernelEffect::AuthorityCheck {
+        checkpoint: Checkpoint::StorageDispatch,
+        correlation,
+        ..
+    })] = effects.as_slice()
+    else {
+        panic!("one StorageDispatch check: {effects:?}");
+    };
+    let effects = step(EventKind::Kernel(KernelEvent::Authority(
+        AuthorityEvent::Answer(AuthorityDecision {
+            owner: NODE,
+            boot: BOOT,
+            grant: GrantId(1),
+            authority_generation: AuthorityGeneration(1),
+            lineage: lineage_at(GEN),
+            expiry_utc_ms: 0,
+            decided_at: Tick::ZERO,
+            authority_seq: 1,
+            checkpoint: Checkpoint::StorageDispatch,
+            correlation: *correlation,
+            verdict: Verdict::Admit,
+        }),
+    )));
+    let [EffectKind::Store(StoreEffect::Commit(committed))] = effects.as_slice() else {
+        panic!("one batch: {effects:?}");
+    };
+
+    let canonical = rdb_sim::storage::history::canonical_history(lineage_at(GEN), C1, 1)
+        .expect("a canonical history")
+        .batches
+        .remove(0);
+    let shape = |batch: &rdb_core::contracts::storage::Batch| {
+        batch
+            .writes
+            .iter()
+            .map(|write| (write.ns, write.key.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        shape(&canonical),
+        shape(committed),
+        "the same namespaces and keys, in the same order"
+    );
+    assert_eq!(
+        canonical.writes, committed.writes,
+        "the same values, the History record's bytes included"
+    );
+    assert_eq!(
+        (canonical.partition, canonical.generation, canonical.seq),
+        (committed.partition, committed.generation, committed.seq)
+    );
+    let tag = |id: rdb_core::contracts::ids::BatchId| id.0 >> 56;
+    assert_eq!(tag(committed.id), BATCH_TAG >> 56);
+    assert_eq!(tag(canonical.id), tag(committed.id), "T1's batch tag");
+}
+
+// ------------------------------------------------------------------------------------------
+// B-R57b (tester-kb-r1 F7): a lineage inherited at a cutoff above 0 chains its first own record
+// from the predecessor's digest at the cutoff. `canonical_history_from` takes that start; a
+// history started anywhere else is refused by R1's own receiver, so the helper cannot pass a
+// wrong chain off as a provider or R1 defect.
+
+/// Node 2 (copy 1) receiving generation 2 of [`send_lineage`], its head at the inherited cutoff
+/// `(2, digest)`: a real R1 receiver, as a member at the cutoff builds it.
+fn receiver_at_cutoff(
+    digest: rdb_core::contracts::digest::Digest,
+) -> rdb_core::replication::append::AppendReceiver {
+    use rdb_core::contracts::ids::DurableSeq;
+    use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+    AppendReceiver::new(ReceiverInit {
+        config: support::rf3_config(),
+        own: CopyId(1),
+        lineage: rdb_core::contracts::authority::Lineage {
+            generation: Generation(2),
+            ..send_lineage()
+        },
+        head: Head {
+            seq: Seq(2),
+            digest,
+        },
+        durable: DurableSeq(2),
+    })
+    .expect("a receiver")
+}
+
+/// `record` offered to [`receiver_at_cutoff`] by node 1, leading generation 2: the receiver's
+/// accept head afterwards, and the effects it emitted.
+fn offer_at_cutoff(
+    cutoff: rdb_core::contracts::digest::Digest,
+    record: Bytes,
+) -> (rdb_core::replication::append::Head, Vec<EffectKind>) {
+    let mut receiver = receiver_at_cutoff(cutoff);
+    let frame = Frame {
+        id: MessageId(1),
+        protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
+        config: ConfigVersion(1),
+        sender: rdb_core::contracts::authority::Lineage {
+            generation: Generation(2),
+            ..send_lineage()
+        },
+        body: record,
+    };
+    let from = PeerLabel {
+        node: NODE,
+        boot: BOOT,
+        authenticated: true,
+    };
+    let effects = receiver.on_append(&from, &frame);
+    (receiver.accept_head(), effects)
+}
+
+/// s15 (B-R57b): generation 2 inherits generation 1 at 2 and writes its own record 3 with
+/// [`send_history_after`]. The record chains from generation 1's digest at 2, and a real receiver
+/// whose head is that cutoff takes it.
+#[retcd_test]
+fn canonical_history_from_an_inherited_cutoff_is_taken_by_a_receiver_at_that_cutoff() {
+    use rdb_core::contracts::envelope::ReplicationEnvelope;
+    use rdb_core::replication::append::Head;
+    support::preamble();
+    let first = send_history(3);
+    let next = send_history_after(2, &first, 2, 3);
+    assert_eq!(next.start, Seq(2));
+    assert_eq!(next.batches.len(), 1, "only generation 2's own record");
+    let record = record_of(next.batch(3));
+    let envelope = ReplicationEnvelope::decode(&record).expect("decodes");
+    assert_eq!(
+        envelope.prev_digest,
+        first.digest(2),
+        "chained from the predecessor's record at the cutoff"
+    );
+    assert_eq!(envelope.header.generation, Generation(2));
+    let (head, effects) = offer_at_cutoff(first.digest(2), record);
+    assert_eq!(
+        head,
+        Head {
+            seq: Seq(3),
+            digest: next.digest(3),
+        },
+        "{effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, EffectKind::Kernel(KernelEffect::Alert { .. }))),
+        "{effects:?}"
+    );
+}
+
+/// The near miss for s15: the same generation-2 record 3, chained from generation 2's **own**
+/// record 2 — what `canonical_history` built before B-R57b, a history started from the wrong
+/// digest. Valid on its own terms (the provider's check passes it), and refused by the receiver:
+/// `DivergentHistory { at: 3 }` with a `CorruptHistory` alert, its head left at the cutoff.
+#[retcd_test]
+fn canonical_history_from_the_wrong_digest_is_refused_by_a_receiver_at_that_cutoff() {
+    use rdb_core::contracts::envelope::{AppendOutcome, AppendReject};
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::transport::SendEffect;
+    use rdb_core::replication::append::Head;
+    support::preamble();
+    let first = send_history(3);
+    let wrong = rdb_sim::storage::history::canonical_history(
+        rdb_core::contracts::authority::Lineage {
+            generation: Generation(2),
+            ..send_lineage()
+        },
+        ConfigVersion(1),
+        3,
+    )
+    .expect("a canonical history");
+    assert_ne!(
+        wrong.digest(2),
+        first.digest(2),
+        "precondition: another chain start"
+    );
+    let (record, progress) =
+        rdb_sim::storage::history::history_writes(wrong.batch(3), Seq(3)).expect("stored");
+    assert!(
+        rdb_sim::storage::history::verified_record(Seq(3), &record, progress.as_ref()).is_ok(),
+        "precondition: the provider's check does not read the chain"
+    );
+    let (head, effects) = offer_at_cutoff(first.digest(2), record);
+    assert_eq!(
+        head,
+        Head {
+            seq: Seq(2),
+            digest: first.digest(2),
+        },
+        "{effects:?}"
+    );
+    let replies: Vec<AppendOutcome> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Send(SendEffect::Unicast { frame, .. }) => {
+                Some(rdb_core::replication::wire::decode_reply(&frame.body).expect("a reply"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec![AppendOutcome::Rejected(AppendReject::DivergentHistory {
+            at: Seq(3)
+        })]
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            EffectKind::Kernel(KernelEffect::Alert {
+                reason: ErrorKind::CorruptHistory
+            })
+        )),
+        "{effects:?}"
     );
 }

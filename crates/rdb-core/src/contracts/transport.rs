@@ -40,6 +40,9 @@ pub struct Frame {
     /// The membership configuration the sender believed it was in. A frame from an old config
     /// cannot advance a predicate pinned to a newer one (spec §6.2).
     pub config: ConfigVersion,
+    /// The lineage the sender holds as it sends: its authority now, never the lineage any record
+    /// inside was sealed under. R1 fences a frame on this and on `config` (lead ruling B-R58a).
+    pub sender: crate::contracts::authority::Lineage,
     /// The encoded body.
     pub body: Bytes,
 }

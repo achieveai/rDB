@@ -368,6 +368,10 @@ pub enum AckRejectReason {
     RegressedProgress,
     /// The acknowledgement carries no evidence that can be checked.
     Unverifiable,
+    /// Evidence below the primary's anchor, for the record a catch-up cursor has in flight
+    /// (lead ruling B-R58c). No rung can check it yet, so it drives the cursor and moves no
+    /// watermark; the ACK at the anchor verifies the whole chain below it.
+    InFlightUnverified,
     /// The acknowledging replica's history disagrees with the primary's at a retained position.
     Diverged,
     /// The acknowledging node is not a member of the pinned configuration.
@@ -1330,6 +1334,13 @@ pub enum DispatchOutcome {
         /// Which error, as the stable [`ErrorKind`] — never a message, which could carry a key.
         kind: ErrorKind,
     },
+    /// The module declined an event it is a named consumer of, on an edge the harness lists as
+    /// owed because that module's package is not wired yet (lead ruling A-R62).
+    ///
+    /// Not [`Self::Declined`], which means "this event is not mine". A reducer must never read an
+    /// owed edge as the kernel having taken the event, nor as the event correctly not being its
+    /// business. The run continues past it, and the edge retires when the package is wired.
+    DeclinedOwed,
 }
 
 // Appended 2026-09-22 (lead ruling A-R46).
@@ -1386,4 +1397,125 @@ pub enum KernelNote {
         /// Its age in milliseconds at the evaluation that crossed the threshold.
         age_ms: u64,
     },
+    /// What F1 decided, for the `KernelEffect::Recovery(..)` arms that have no module consumer
+    /// by design: `RecordSourceUnavailable`, `CloseWindow`, `Selected`, `Quarantine`,
+    /// `BlockPromotion` and `RebuildStalled`, as they left the kernel (lead ruling A-R64).
+    ///
+    /// Recorded for the trace and the operator, the reasoning `AuthorityFact` follows (A-R49).
+    /// F1's requests to the environment (`QueryInventory`, `ProbeDigestAt`, `CatchUp`,
+    /// `CatchUpBeforeGrant`, `SyncWalThrough`, `QuarantineSuffix`, `RebuildFromAuthoritative`)
+    /// are never recorded here: each either has a provider or is refused by name.
+    RecoveryFact {
+        /// What F1 decided, as it left the kernel.
+        effect: crate::contracts::recovery::RecoveryEffect,
+    },
+    /// What P1 emitted on `KernelEffect::Publication(..)`, which has no module consumer: status
+    /// writes and quarantine marks for the oracle, and answers to queries (lead ruling A-R65,
+    /// the `RecoveryFact` precedent).
+    ///
+    /// The answers are recorded here until the sim has a client reply path for them. When it
+    /// does, `Mode` and `Snapshot` move there and stop being recorded here.
+    PublicationFact {
+        /// What P1 emitted, as it left the kernel.
+        effect: crate::contracts::publication::PublicationEffect,
+    },
+    /// A survivor copy's history, as the scenario declared it for F1's `QueryInventory` and
+    /// `SyncWalThrough` providers ("inspect survivors", spike §6; lead ruling A-R67.3b).
+    ///
+    /// **Declared, never derived.** Recorded by the environment when the plan places the copy,
+    /// under the node that holds it and `ModuleName::Recovery`, so the oracle and a reader can
+    /// tell a history the scenario asserted from one a kernel produced. The dispatcher refuses a
+    /// placement whose head is past what that node's engine holds (A-R67.3a).
+    SurvivorPlaced {
+        /// The partition.
+        partition: PartitionId,
+        /// What the copy reports when asked.
+        inventory: Box<crate::contracts::recovery::SurvivorInventory>,
+    },
+    /// F1 asked for `SyncWalThrough { copy, cutoff }` and the environment produced no
+    /// `DurableAt` (lead ruling A-R67.4). Never silence. F1 answers the missing proof with its
+    /// own sync timer and `RebuildStalled` (ruling B-R52); this note is what lets a reader see
+    /// why.
+    SyncWithheld {
+        /// The copy asked to sync.
+        copy: crate::contracts::membership::CopyId,
+        /// Through where.
+        cutoff: Seq,
+        /// Why no proof came back.
+        reason: SyncWithheldReason,
+    },
+    /// F1 asked for `SyncWalThrough { copy, cutoff }` and the environment's engine really synced,
+    /// so a `DurableAt` is on its way to F1. The positive twin of [`KernelNote::SyncWithheld`]:
+    /// every sync request is recorded with one of the two, so a reader sees the request and its
+    /// fate without inferring either from engine state (lead ruling B-R55a).
+    SyncProven {
+        /// The copy asked to sync.
+        copy: crate::contracts::membership::CopyId,
+        /// Through where.
+        cutoff: Seq,
+        /// What the engine reported durable after the sync.
+        durable: crate::contracts::ids::DurableSeq,
+    },
+    /// F1 emitted `KernelEffect::Recovered`, recorded whole as it left the kernel (lead ruling
+    /// B-R55b). The routed copy reaches R1 and L1; this one is what the trace and the oracle
+    /// read, so a row can assert the loss record, the barrier and the mode without inferring
+    /// them from what the consumers did. One note per emission, the activation re-emit included.
+    ///
+    /// Boxed: a [`crate::contracts::recovery::RecoveryResult`] is large and unboxed it would set
+    /// the size of every note.
+    RecoveredFact {
+        /// The result, exactly as F1 emitted it.
+        result: Box<crate::contracts::recovery::RecoveryResult>,
+    },
+    /// A committed `Recovered` could not yet reach a member of its pinned config other than the
+    /// emitter (lead ruling B-R56). Paired with a later [`Self::RecoveredLanded`] for the same
+    /// `(member, revision)`.
+    RecoveredDeferred {
+        /// The member that has not heard it.
+        member: NodeId,
+        /// The partition recovered.
+        partition: PartitionId,
+        /// The control revision it was committed at. The activation re-emit has its own.
+        revision: Revision,
+        /// The node whose F1 emitted it.
+        emitter: NodeId,
+        /// Why the member cannot hear it yet.
+        reason: RecoveredDeferReason,
+    },
+    /// A committed `Recovered` reached a member other than the emitter (lead ruling B-R56).
+    RecoveredLanded {
+        /// The member it reached.
+        member: NodeId,
+        /// The partition recovered.
+        partition: PartitionId,
+        /// The control revision it was committed at.
+        revision: Revision,
+        /// The node whose F1 emitted it.
+        emitter: NodeId,
+    },
+}
+
+/// Why a member's `Recovered` was deferred (see [`KernelNote::RecoveredDeferred`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RecoveredDeferReason {
+    /// The member's node is down. It hears the result when the sim restarts it.
+    Crashed,
+    /// The member is cut off. It hears the result when the cut heals.
+    CutOff,
+}
+
+/// Why F1's `SyncWalThrough` produced no `DurableAt` (see [`KernelNote::SyncWithheld`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SyncWithheldReason {
+    /// The scenario placed no survivor for that copy.
+    NotPlaced,
+    /// The sync failed with this fault.
+    Failed(crate::contracts::storage::StorageFault),
+    /// The engine made less than the cutoff durable: a short or false flush, or not applied.
+    Short {
+        /// What the engine holds durable for the copy's lineage.
+        durable: crate::contracts::ids::DurableSeq,
+    },
+    /// The placed history holds no digest at the cutoff.
+    NoDigest,
 }

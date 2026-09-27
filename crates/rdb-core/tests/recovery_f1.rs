@@ -8,8 +8,10 @@
 //! F1 rows that are not here, each for one reason: M7B-96, 104, 136 and 137 are sim rows
 //! (rdb-sim, F:H1/F:M1). M7B-116's spy clause says length is never read from `select_prefix`,
 //! which design §5.4 contradicts, so it waits on a re-word. M7B-112 and 138 assert R1's receiver,
-//! not F1. M7B-108 (re-worded by B-R49), 97 and 113 are the last rows in the file; the last two
-//! read `SelectionSpy`, F1's `LengthSpy`/`SelectSpy` seam.
+//! not F1. M7B-108 (re-worded by B-R49), 97 and 113 come next; the last two read `SelectionSpy`,
+//! F1's `LengthSpy`/`SelectSpy` seam. M7B-153 and 154 (ruling B-R52, the bounded rebuild sync)
+//! are the last rows in the file. M7B-155 was promoted in place from the F-a scaffold, so it sits
+//! with the pre-commit wait rows; M7B-156 is its sim twin (rdb-sim).
 //!
 //! A1's `FenceProven` is not routed to F1 by the sim yet (lead ruling on B-R35), so every test
 //! builds its `FencingProof` directly and delivers it as `RecoveryEvent::FenceProven`.
@@ -1571,11 +1573,16 @@ fn rebuild_activates_through_a_three_copy_barrier() {
     };
     assert_eq!(
         f1.rec(4_000, caught(B, 20)),
-        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+        vec![
+            sync(A, 20),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 4_000 + WINDOW)
+        ]
     );
     assert_eq!(
         f1.rec(4_001, caught(C, 22)),
-        vec![sync(C, 20)],
+        vec![sync(C, 20), arm(4, 4_001 + WINDOW)],
         "the point is pinned"
     );
     let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
@@ -1898,11 +1905,16 @@ fn rebuild_asks_every_required_copy_to_prove_the_point() {
     let mut f1 = lone_committed();
     assert_eq!(
         f1.rec(4_000, caught_up(B, 22, dg(0, 22))),
-        vec![sync(A, 22), sync(B, 22), sync(C, 22)]
+        vec![
+            sync(A, 22),
+            sync(B, 22),
+            sync(C, 22),
+            arm(3, 4_000 + WINDOW)
+        ]
     );
     assert_eq!(
         f1.rec(4_001, caught_up(C, 22, dg(0, 22))),
-        vec![sync(C, 22)]
+        vec![sync(C, 22), arm(4, 4_001 + WINDOW)]
     );
     f1.rec(4_100, durable(A, 22, dg(0, 22)));
     f1.rec(4_101, durable(B, 22, dg(0, 22)));
@@ -1930,7 +1942,12 @@ fn the_rebuild_point_is_never_below_the_cutoff() {
     assert_eq!(f1.cas_count(), 1);
     assert_eq!(
         f1.rec(4_200, caught_up(B, 20, dg(0, 20))),
-        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+        vec![
+            sync(A, 20),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 4_200 + WINDOW)
+        ]
     );
 }
 
@@ -2029,10 +2046,13 @@ fn a_lost_required_copy_blocks_before_commit() {
     assert_eq!(f1.cas_count(), 0);
 }
 
-/// Ruling F-a: the wait after selection is bounded by a re-armed discovery timer. At the deadline
-/// the copies still owing their catch-up, or a proof that reaches and binds, are named.
+/// M7B-155 (ruling F-a; D §5.1): the wait after selection is bounded by a re-armed discovery
+/// timer. At the deadline, in `Synchronizing` or at the `Barrier`, `BarrierIncomplete` names
+/// exactly the copies still owing their catch-up, or a proof that reaches and binds, and nothing
+/// is committed. Near-miss: every copy answers before the deadline, the recovery CAS is proposed,
+/// and the fire is `StaleTimer` with no block. Promoted in place from the F-a scaffold.
 #[retcd_test]
-fn the_wait_after_selection_is_bounded() {
+fn m7b_155_the_wait_after_selection_ends_in_barrier_incomplete() {
     let (mut f1, close) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
     assert_eq!(close.last(), Some(&arm(2, 2 * WINDOW)));
     f1.rec(2_100, caught_up(C, 20, dg(0, 20)));
@@ -2056,6 +2076,25 @@ fn the_wait_after_selection_is_bounded() {
         vec![block(incomplete(vec![B, C]))]
     );
     assert_eq!(f1.cas_count(), 0);
+
+    // Near-miss: the same wait, answered in full before the deadline.
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 12), inv(C, 17)], &[]);
+    f1.rec(2_100, caught_up(C, 20, dg(0, 20)));
+    f1.rec(2_200, caught_up(B, 20, dg(0, 20)));
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    for copy in [A, B, C] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    assert_eq!(f1.step(2 * WINDOW, fired(2)), stale);
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    assert_eq!(f1.cas_count(), 1);
+    assert!(!f1.log.iter().any(|e| matches!(
+        e,
+        EffectKind::Kernel(KernelEffect::Recovery(
+            RecoveryEffect::BlockPromotion { .. }
+        ))
+    )));
 }
 
 /// Rulings F-f and F-g on the activation CAS: its prior is the committed record's epoch, so a
@@ -2179,7 +2218,12 @@ fn tester_a_degraded_rf2_commit_rebuilds_the_third_copy() {
     assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
     assert_eq!(
         f1.rec(4_000, caught_up(C, 20, dg(0, 20))),
-        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+        vec![
+            sync(A, 20),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 4_000 + WINDOW)
+        ]
     );
 }
 
@@ -2269,7 +2313,12 @@ fn a_lost_copy_never_sets_the_rebuild_point() {
     );
     assert_eq!(
         f1.rec(4_200, caught_up(C, 20, dg(0, 20))),
-        vec![sync(A, 20), sync(B, 20), sync(C, 20)]
+        vec![
+            sync(A, 20),
+            sync(B, 20),
+            sync(C, 20),
+            arm(3, 4_200 + WINDOW)
+        ]
     );
 }
 
@@ -3295,29 +3344,97 @@ fn m7b_111_all_three_lone_survivor_choices_are_read_only_until_the_barrier() {
 // Plan rows, §8.4: stale owner, retention, result (M7B-113..119)
 // ---------------------------------------------------------------------------------------------
 
+/// M7B-114's close: A's 500 is the longest verified prefix, so A is the source and leads, and
+/// B and C catch up to it.
+fn a_selected_at_500() -> Vec<EffectKind> {
+    vec![
+        r(RecoveryEffect::CloseWindow),
+        selected(500, A),
+        catch_up(A, B, 500),
+        catch_up(A, C, 500),
+        arm(2, 2 * WINDOW),
+    ]
+}
+
+/// M7B-114's `Collecting` trace: B reports, then A's head-500 report arrives as `a_arrives`, then
+/// C reports, and the run goes on to commit. Every step's effects and phase are asserted; A's
+/// report must be recorded, selected, and listed `Verified` in the result.
+fn a_arrives_in_collecting(a_arrives: RecoveryEvent) -> F1 {
+    let recorded = vec![ign(ReplicaIgnoreReason::Recorded)];
+    let mut f1 = fenced(&[]);
+    assert_eq!(f1.report(10, inv(B, 20)), recorded);
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    assert_eq!(f1.rec(11, a_arrives), recorded, "A arrives in Collecting");
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    assert_eq!(f1.report(12, inv(C, 20)), recorded);
+    assert_eq!(f1.step(WINDOW, fired(1)), a_selected_at_500());
+    assert_eq!(f1.phase(), RecoveryPhase::Synchronizing);
+    let caught = |copy| RecoveryEvent::CopyCaughtUp {
+        copy,
+        head: Seq(500),
+        digest: dg(0, 500),
+    };
+    assert_eq!(f1.rec(2_100, caught(B)), recorded);
+    assert_eq!(
+        f1.rec(2_200, caught(C)),
+        vec![sync(A, 500), sync(B, 500), sync(C, 500)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(3_000, durable(A, 500, dg(0, 500))), not_durable);
+    assert_eq!(f1.rec(3_001, durable(B, 500, dg(0, 500))), not_durable);
+    assert_eq!(
+        f1.rec(3_002, durable(C, 500, dg(0, 500))),
+        vec![cas(CONTROL_REV, A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    let result = recovered(&effects);
+    assert_eq!(
+        result.inventories,
+        [A, B, C].map(|copy| InventoryOutcome::Verified { copy })
+    );
+    assert_eq!(result.selected.source, A);
+    assert_eq!(result.selected.cutoff_seq, Seq(500));
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    f1
+}
+
 /// M7B-114 (D §5.7 "the discriminator is the phase", ADR 0009 §7): before commit, a returning
-/// owner is one more survivor. Its report is verified, and being the longest it is selected and
-/// leads.
+/// owner is one more survivor. The plan's fixture delivers M7B-113's input (A, head 500) in
+/// `Collecting`; this row delivers it there and in `Fenced`, the other pre-selection phase.
+/// Fenced: recorded, then selected at the close. Collecting: the whole run to commit, where A is
+/// recorded, selected, and `Verified` in the result (verified and eligible), and every step is
+/// identical to the same report arriving as `InventoryReported`. Twin of M7B-113 by phase only.
 #[retcd_test]
 fn m7b_114_same_node_before_commit_is_an_ordinary_survivor() {
     let returning = inv(A, 500);
     assert!(verify_ancestry(&anchor(), &returning).is_ok());
+    let recorded = vec![ign(ReplicaIgnoreReason::Recorded)];
+
     let mut f1 = fenced(&[]);
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
     assert_eq!(
-        f1.rec(10, RecoveryEvent::StaleOwnerReturned(Box::new(returning))),
-        vec![ign(ReplicaIgnoreReason::Recorded)]
+        f1.rec(
+            10,
+            RecoveryEvent::StaleOwnerReturned(Box::new(returning.clone()))
+        ),
+        recorded,
+        "A arrives in Fenced"
     );
-    f1.report(10, inv(B, 20));
-    f1.report(10, inv(C, 20));
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    assert_eq!(f1.report(11, inv(B, 20)), recorded);
+    assert_eq!(f1.report(12, inv(C, 20)), recorded);
+    assert_eq!(f1.step(WINDOW, fired(1)), a_selected_at_500());
+
+    let returned = a_arrives_in_collecting(RecoveryEvent::StaleOwnerReturned(Box::new(
+        returning.clone(),
+    )));
+    let reported = a_arrives_in_collecting(RecoveryEvent::InventoryReported(Box::new(returning)));
     assert_eq!(
-        f1.step(WINDOW, fired(1)),
-        vec![
-            r(RecoveryEffect::CloseWindow),
-            selected(500, A),
-            catch_up(A, B, 500),
-            catch_up(A, C, 500),
-            arm(2, 2 * WINDOW),
-        ]
+        returned.log, reported.log,
+        "an ordinary survivor, step for step"
     );
 }
 
@@ -3395,20 +3512,93 @@ fn m7b_115_retain_suffix_uses_the_event_tick_and_no_delete_exists() {
     assert!(deleting.is_empty(), "{deleting:?}");
 }
 
+/// M7B-117's trace (the plan's "after M7B-106"): A and B report head 20, C sends `c_sends`, the
+/// window closes on the cutoff 20 with C unavailable, A and B prove it, and the CAS lands at 9.
+/// `c_answer` is C's step and `close` the window's; every other step's effects and phase are fixed
+/// here. Returns the `Recovered` result, the commit step's only effect.
+fn committed_without_c(
+    c_sends: RecoveryEvent,
+    c_answer: Vec<EffectKind>,
+    close: Vec<EffectKind>,
+) -> RecoveryResult {
+    let recorded = vec![ign(ReplicaIgnoreReason::Recorded)];
+    let mut f1 = fenced(&[]);
+    assert_eq!(f1.report(10, inv(A, 20)), recorded);
+    assert_eq!(f1.report(10, inv(B, 20)), recorded);
+    assert_eq!(f1.rec(20, c_sends), c_answer);
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    assert_eq!(f1.step(WINDOW, fired(1)), close);
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+    assert_eq!(
+        f1.rec(3_000, durable(A, 20, dg(0, 20))),
+        vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(
+        f1.rec(3_001, durable(B, 20, dg(0, 20))),
+        vec![cas(CONTROL_REV, A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    recovered(&effects)
+}
+
 /// M7B-117 (D §5.8 `RecoveryResult`, ADR 0009 §7, K-B-19): the result carries the bounds, the mode
-/// and the status map, with the status map's uncertainty equal to the loss's. Every struct is
-/// destructured without `..`, so a field added to any of them (a client-ACK field included) stops
-/// this row compiling until it is asserted here.
+/// and the status map, with the status map's uncertainty equal to the loss's, on both sides.
+/// Three runs lose C before the cutoff at 20. C streaming a prefix it advertised at 30 leaves the
+/// loss uncertain, and the status map discards from 21. Its twin differs by one fact, C
+/// advertising 20, the cutoff itself: the loss is certain and nothing is discarded. The third is
+/// the tester's `probe_ec_117`: C fails outright, advertising nothing, and the loss is certain.
+/// Every struct is destructured without `..`, so a field added to any of them (a client-ACK field
+/// included) stops this row compiling until it is asserted here.
 #[retcd_test]
 fn m7b_117_recovery_result_carries_bounds_mode_and_status_map() {
-    let mut f1 = fenced(&[]);
-    f1.report(10, inv(A, 20));
-    f1.report(10, inv(B, 20));
-    f1.rec(20, transfer(C, 0));
-    f1.step(WINDOW, fired(1));
-    for copy in [A, B] {
-        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    let streaming = |advertised: u64| RecoveryEvent::TransferProgress {
+        copy: C,
+        advertised_seq: Seq(advertised),
+        received_seq: Seq(0),
+    };
+    // Selection at the cutoff 20 from A; A and B sync; the wait after selection is bounded.
+    let select_20 = vec![
+        r(RecoveryEffect::CloseWindow),
+        selected(20, A),
+        sync(A, 20),
+        sync(B, 20),
+        arm(2, 2 * WINDOW),
+    ];
+    let c_lost = lost(C, UnavailableReason::Stalled);
+    // A streaming C is recorded, and the close finds it stalled before it closes.
+    let c_stalls = |advertised| {
+        committed_without_c(
+            streaming(advertised),
+            vec![ign(ReplicaIgnoreReason::Recorded)],
+            [vec![c_lost.clone()], select_20.clone()].concat(),
+        )
+    };
+    let uncertain_loss = c_stalls(30);
+    let certain_twin = c_stalls(20);
+    let c_failed = committed_without_c(
+        RecoveryEvent::InventoryFailed { copy: C },
+        vec![c_lost],
+        select_20,
+    );
+    for (result, highest, expect_uncertain) in [
+        (uncertain_loss, 30, true),
+        (certain_twin, 20, false),
+        (c_failed, 20, false),
+    ] {
+        result_carries_bounds_mode_and_status_map(result, Seq(highest), expect_uncertain);
     }
+}
+
+/// M7B-117's clause, field by field, for one run of [`committed_without_c`]: C was lost, the
+/// highest advertised head was `highest`, and the loss is `expect_uncertain`.
+fn result_carries_bounds_mode_and_status_map(
+    result: RecoveryResult,
+    highest: Seq,
+    expect_uncertain: bool,
+) {
     let RecoveryResult {
         fenced_prior,
         inventories,
@@ -3419,9 +3609,19 @@ fn m7b_117_recovery_result_carries_bounds_mode_and_status_map() {
         loss,
         committed,
         retained_status_map,
-    } = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    } = result;
     assert_eq!(fenced_prior, proof());
-    assert_eq!(inventories.len(), 3);
+    assert_eq!(
+        inventories,
+        vec![
+            InventoryOutcome::Verified { copy: A },
+            InventoryOutcome::Verified { copy: B },
+            InventoryOutcome::Failed {
+                copy: C,
+                reason: UnavailableReason::Stalled
+            },
+        ]
+    );
     assert_eq!(new_generation, Generation(8));
     assert_eq!(new_generation, selected.root.generation);
     assert_eq!(mode, PartitionMode::DegradedRf2);
@@ -3438,8 +3638,8 @@ fn m7b_117_recovery_result_carries_bounds_mode_and_status_map() {
     } = loss;
     assert_eq!(queried, [A, B, C]);
     assert_eq!(unavailable, [(C, UnavailableReason::Stalled)]);
-    assert_eq!((cutoff_seq, highest_advertised_seq), (Seq(20), Seq(30)));
-    assert!(uncertain);
+    assert_eq!((cutoff_seq, highest_advertised_seq), (Seq(20), highest));
+    assert_eq!(uncertain, expect_uncertain, "loss.uncertain");
     let RetainedStatusMap {
         predecessor_generation,
         predecessor_cutoff,
@@ -3449,8 +3649,12 @@ fn m7b_117_recovery_result_carries_bounds_mode_and_status_map() {
     } = retained_status_map;
     assert_eq!(predecessor_generation, PRIOR_GEN);
     assert_eq!((predecessor_cutoff, retained_through), (Seq(20), Seq(20)));
-    assert_eq!(discarded_from, Some(Seq(21)));
-    assert_eq!(status_uncertain, uncertain);
+    assert_eq!(
+        discarded_from,
+        expect_uncertain.then_some(Seq(21)),
+        "discarded_from"
+    );
+    assert_eq!(status_uncertain, uncertain, "status map uncertain == loss");
     let CommittedRoot {
         revision,
         pinned_config,
@@ -3569,7 +3773,7 @@ fn m7b_126_rebuilding_reaches_activation_only_through_try_new() {
         .contains(&sync(B, 20)));
     assert_eq!(
         f1.rec(4_001, caught_up(C, 20, dg(0, 20))),
-        vec![sync(C, 20)]
+        vec![sync(C, 20), arm(4, 4_001 + WINDOW)]
     );
     let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
     let required = BTreeSet::from([A, B, C]);
@@ -3920,4 +4124,151 @@ fn m7b_113_stale_owner_after_commit_is_quarantined_without_length_comparison() {
     );
     assert_eq!(f1.module.spy(), before, "select_prefix not called");
     assert_eq!(f1.phase(), phase);
+}
+
+// ---------------------------------------------------------------------------------------------
+// B-R52 rows (plan §9): a rebuild sync is bounded by F1's timer (design §5.6a, "A sync is
+// bounded")
+// ---------------------------------------------------------------------------------------------
+
+fn is_stalled(effect: &EffectKind) -> bool {
+    matches!(
+        effect,
+        EffectKind::Kernel(KernelEffect::Recovery(
+            RecoveryEffect::RebuildStalled { .. }
+        ))
+    )
+}
+
+fn stalled(copy: CopyId) -> EffectKind {
+    r(RecoveryEffect::RebuildStalled { copy })
+}
+
+/// The sync deadline: C's catch-up at 4_000 re-arms F1's one timer as version 3 (the fence armed
+/// 1, selection 2) at 4_000 plus the discovery window.
+const SYNC_DEADLINE: u64 = 4_000 + WINDOW;
+
+/// M7B-153/154's fixture: a `DegradedRf2` commit (A and B hold 20, C failed) in `Rebuilding`.
+/// C catches up to 20, which pins the point and syncs every required copy under a fresh timer;
+/// A and B prove the point, C does not. Each step's effects are asserted.
+fn rebuilding_while_c_syncs() -> F1 {
+    let (mut f1, _) = closed(&[], vec![inv(A, 20), inv(B, 20)], &[C]);
+    for copy in [A, B] {
+        f1.rec(3_000, durable(copy, 20, dg(0, 20)));
+    }
+    let degraded = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
+    assert_eq!(degraded.mode, PartitionMode::DegradedRf2);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(
+        f1.rec(4_000, caught_up(C, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20), arm(3, SYNC_DEADLINE)]
+    );
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(4_100, durable(A, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.rec(4_101, durable(B, 20, dg(0, 20))), not_durable);
+    f1
+}
+
+/// M7B-153 (D §5.6a "A sync is bounded", K-B-43 no silent stall; spec §6 "error or partial
+/// completion advances nothing"; ruling B-R52): C's sync is never answered. At the deadline F1
+/// names C, and only C, stays `Rebuilding` with `required` whole and the mode not moved; the
+/// deadline is then spent. A later `CopyCaughtUp{C}` re-syncs and re-arms. Two more traces: in
+/// `ReadOnly` both unproven copies are named, in copy order, and never the proven one; and a copy
+/// already reported lost is not named twice (ruling B-R52a, M7B-128). Last, per §5.6a ("a sync
+/// that misses its deadline is a report, not a loss: … a late `DurableAt` from it is judged like
+/// any other proof and, if it completes the barrier, proposes activation"), C's late proof
+/// proposes activation.
+#[retcd_test]
+fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
+    let everyone = BTreeSet::from([A, B, C]);
+    let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
+    let mut f1 = rebuilding_while_c_syncs();
+    assert_eq!(f1.step(SYNC_DEADLINE - 1, fired(3)), stale, "not yet due");
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(2)), stale, "an older version");
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), vec![stalled(C)]);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(f1.module.rebuild_required(), Some(&everyone));
+    assert_eq!(
+        f1.log.iter().filter(|e| is_recovered(e)).count(),
+        1,
+        "mode not moved"
+    );
+    assert_eq!(
+        f1.step(SYNC_DEADLINE + 1, fired(3)),
+        stale,
+        "the deadline is spent"
+    );
+
+    // A later catch-up re-syncs C under a fresh deadline, which stalls again unanswered.
+    assert_eq!(
+        f1.rec(7_000, caught_up(C, 20, dg(0, 20))),
+        vec![sync(C, 20), arm(4, 7_000 + WINDOW)]
+    );
+    assert_eq!(f1.step(7_000 + WINDOW, fired(4)), vec![stalled(C)]);
+    assert_eq!(f1.module.rebuild_required(), Some(&everyone));
+
+    // §5.6a: the stall is a report, not a loss. C's late proof completes the barrier.
+    assert_eq!(
+        f1.rec(9_500, durable(C, 20, dg(0, 20))),
+        vec![cas(Revision(9), A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 2);
+
+    // ReadOnly: A proved, B and C did not. Each unproven copy is named once, in copy order.
+    let mut f1 = lone_committed();
+    assert_eq!(
+        f1.rec(4_000, caught_up(B, 20, dg(0, 20))),
+        vec![sync(A, 20), sync(B, 20), sync(C, 20), arm(3, SYNC_DEADLINE)]
+    );
+    f1.rec(4_100, durable(A, 20, dg(0, 20)));
+    assert_eq!(
+        f1.step(SYNC_DEADLINE, fired(3)),
+        vec![stalled(B), stalled(C)]
+    );
+    assert_eq!(f1.module.rebuild_required(), Some(&everyone));
+
+    // A copy already reported lost is not named again by the timer.
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    f1.rec(4_100, durable(A, 20, dg(0, 20)));
+    assert_eq!(f1.step(4_200, lose(B)), vec![stalled(B)]);
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), vec![stalled(C)]);
+    assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 2);
+    assert_eq!(f1.module.rebuild_required(), Some(&everyone));
+
+    // Every unproven copy already lost: the deadline has nobody left to name, and still answers
+    // (BA-2) with the ignore a spent deadline gets.
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    f1.rec(4_100, durable(A, 20, dg(0, 20)));
+    f1.rec(4_101, durable(B, 20, dg(0, 20)));
+    assert_eq!(f1.step(4_200, lose(C)), vec![stalled(C)]);
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), stale);
+    assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 1);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+}
+
+/// M7B-154 (D §5.6a; timer versioning; near-miss twin of M7B-153 by one fact): C's proof arrives
+/// before the deadline. The rebuild proceeds as before the timer existed: the barrier holds and
+/// activation is proposed. The deadline's fire is then `StaleTimer`, and nothing stalls.
+#[retcd_test]
+fn m7b_154_a_sync_answered_before_its_deadline_makes_the_timer_stale() {
+    let mut f1 = rebuilding_while_c_syncs();
+    assert_eq!(
+        f1.rec(SYNC_DEADLINE - 1, durable(C, 20, dg(0, 20))),
+        vec![cas(Revision(9), A)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    assert_eq!(
+        f1.step(SYNC_DEADLINE, fired(3)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 0);
+    let active = recovered(&f1.step(
+        SYNC_DEADLINE + 100,
+        cas_result(CasOutcome::Committed(Revision(11))),
+    ));
+    assert_eq!(active.mode, PartitionMode::Active);
 }

@@ -19,7 +19,7 @@
 //! had no representation except by being relabelled durable — which turned every process crash
 //! into a silent promotion and made an early acknowledgement pass.
 
-use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, NodeId, PartitionId};
+use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, NodeId, PartitionId, Seq};
 use rdb_core::contracts::storage::{Batch, StorageFault};
 
 use crate::error::SimError;
@@ -50,6 +50,11 @@ pub struct CrashImage {
     /// The batches that survived, in commit order: every batch at or below its lineage's
     /// surviving `applied`. What [`CrashImage::reopen`] replays.
     batches: Vec<Batch>,
+    /// Each inherited lineage's predecessor and surviving base (see [`MemoryEngine::inherit`]):
+    /// the whole base after a process crash; after a host crash, no more of it than the
+    /// predecessor had synced, because the base is the predecessor's batches and only those
+    /// survive to be replayed.
+    bases: Vec<(PartitionId, Generation, Generation, Seq)>,
 }
 
 impl CrashImage {
@@ -63,6 +68,7 @@ impl CrashImage {
     pub fn of(engine: &MemoryEngine, fault: StorageFault) -> Result<Self, SimError> {
         let mut surviving = Vec::new();
         let mut batches = Vec::new();
+        let mut bases = Vec::new();
         for ((partition, generation), lineage) in engine.lineages() {
             let applied = match fault {
                 StorageFault::ProcessCrash => lineage.applied,
@@ -73,6 +79,15 @@ impl CrashImage {
                     return Err(SimError::Config { field: "fault" });
                 }
             };
+            if let Some(parent) = lineage.parent {
+                let base = match fault {
+                    StorageFault::HostCrash => {
+                        Seq(lineage.base.0.min(engine.durable(*partition, parent).0))
+                    }
+                    _ => lineage.base,
+                };
+                bases.push((*partition, *generation, parent, base));
+            }
             surviving.push(SurvivingPrefix {
                 partition: *partition,
                 generation: *generation,
@@ -87,7 +102,11 @@ impl CrashImage {
                     .cloned(),
             );
         }
-        Ok(Self { surviving, batches })
+        Ok(Self {
+            surviving,
+            batches,
+            bases,
+        })
     }
 
     /// Reopen an engine from this image, for `node`.
@@ -102,6 +121,9 @@ impl CrashImage {
             // Replaying a batch that committed before the crash cannot fail: no fault is
             // planned on a fresh engine, and `commit` only errs on a planned fault.
             let _ = engine.commit(batch.clone());
+        }
+        for (partition, generation, parent, base) in &self.bases {
+            engine.restore_base(*partition, *generation, *parent, *base);
         }
         for prefix in &self.surviving {
             engine.restore_durable(prefix.partition, prefix.generation, prefix.durable);

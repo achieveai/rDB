@@ -5,10 +5,13 @@
 //! # How it is driven
 //!
 //! By [`crate::replication::primary::Primary`], which owns one per copy being caught up and
-//! drops it on `CopyCaughtUp`, on any stop and on `Recovered` (lead ruling B-R48). It reads the
-//! primary's ladder and head as arguments and keeps no copy of either, so it cannot disagree
-//! with the tracker about them. It trusts the `Accepted` ACKs it is given: the tracker's ACK
-//! ladder is the gate, and routing hands the cursor only the ACKs that ladder admits.
+//! drops it on `CopyCaughtUp`, on any stop and on `Recovered` (lead ruling B-R48), when the
+//! copy leaves every active predicate (B-R48a), and when control re-announces the copy at a new
+//! node or boot (M7B-150). `Busy` and `AlreadyHave` never start one (B-R48a); they reach a
+//! cursor only while it runs. It reads the primary's ladder and head as arguments and keeps no
+//! copy of either, so it cannot disagree with the tracker about them. It trusts the `Accepted`
+//! ACKs it is given: the tracker's ACK ladder is the gate, and routing hands the cursor only the
+//! ACKs that ladder admits.
 //!
 //! # Not built
 //!

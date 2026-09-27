@@ -30,9 +30,10 @@ mod views;
 
 use std::collections::BTreeMap;
 
-use crate::contracts::authority::Lineage;
+use crate::contracts::authority::{AuthorityView, Lineage};
 use crate::contracts::digest::Digest;
-use crate::contracts::ids::{DurableSeq, Seq};
+use crate::contracts::ids::{ConfigVersion, DurableSeq, Seq};
+use crate::contracts::ignore::ReplicaIgnoreReason;
 use crate::contracts::storage::DurablePrefix;
 
 pub use tracker::{CopyProgress, ProgressTracker, TrackerInit};
@@ -52,6 +53,42 @@ pub(crate) fn proved_durable(
         })
         .map(|prefix| DurableSeq(prefix.through.0.min(applied.0)))
         .max()
+}
+
+/// What a copy holds of A1's view: the key the install rule compares a new view against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldView {
+    /// The lineage served, its epoch included.
+    pub lineage: Lineage,
+    /// The membership pin in force.
+    pub config_version: ConfigVersion,
+    /// The `authority_seq` of the newest view installed; 0 before any.
+    pub authority_seq: u64,
+}
+
+/// Why a copy holding `held` will not install `view`, or `None` when it will (`design.md`
+/// §2.2, lead ruling B-R53). One gate for both sides of the wire, so the receiver and the
+/// tracker cannot disagree on which view is newer.
+///
+/// The ordering key is the contract's own: the highest `authority_seq` wins. A newer view may
+/// keep the epoch (a configuration-only bump), but it may never lower the epoch or the
+/// configuration version. Such a view contradicts itself and nothing of it is installed.
+///
+/// * another partition or generation: [`ReplicaIgnoreReason::NotRequired`], because installing
+///   a generation is `Recovered`'s job, never a view's;
+/// * `authority_seq` not above the held one, or a higher one that lowers the epoch or the
+///   configuration version: [`ReplicaIgnoreReason::OutOfOrder`], a regress, so nothing is
+///   stored.
+pub(crate) fn view_refusal(held: &HeldView, view: &AuthorityView) -> Option<ReplicaIgnoreReason> {
+    if view.lineage.partition != held.lineage.partition
+        || view.lineage.generation != held.lineage.generation
+    {
+        return Some(ReplicaIgnoreReason::NotRequired);
+    }
+    let regress = view.authority_seq <= held.authority_seq
+        || view.lineage.owner_epoch < held.lineage.owner_epoch
+        || view.config_version < held.config_version;
+    regress.then_some(ReplicaIgnoreReason::OutOfOrder)
 }
 
 /// The answer to "do you hold this digest at this sequence?".

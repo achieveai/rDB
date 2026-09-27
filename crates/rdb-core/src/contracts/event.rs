@@ -25,7 +25,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::authority::{AuthorityEffect, AuthorityEvent, BlockReason, EvidenceRef};
+use crate::contracts::authority::{
+    AuthorityEffect, AuthorityEvent, BlockReason, Checkpoint, EvidenceRef, Lineage,
+};
 use crate::contracts::control::{ControlEffect, ControlEvent};
 use crate::contracts::digest::Digest;
 use crate::contracts::errors::{Capability, ErrorKind, RdbError};
@@ -36,6 +38,7 @@ use crate::contracts::ids::{
 use crate::contracts::ignore::KernelIgnoredReason;
 use crate::contracts::membership::{CopyId, PartitionConfig};
 use crate::contracts::protection::AdmissionState;
+use crate::contracts::publication::{AppliedCandidate, PublicationEffect, PublicationEvent};
 use crate::contracts::qualification::QualificationChanged;
 use crate::contracts::recovery::{RecoveryEffect, RecoveryEvent, RecoveryResult};
 use crate::contracts::storage::{SnapshotRead, StorageEvent, StoreEffect};
@@ -102,6 +105,12 @@ pub enum ClientEvent {
     Status {
         /// The request being asked about.
         identity: RequestIdentity,
+        /// The generation the caller believes the request ran in, if it knows one: the
+        /// `generation` of a reply it received, or the `expected_generation` it sent.
+        ///
+        /// Without it a retired generation cannot be told from one that never held the request,
+        /// so the answer is `Unknown` rather than `Expired` (M7A-135; lead ruling A-R63).
+        generation: Option<Generation>,
     },
 }
 
@@ -342,6 +351,58 @@ pub enum KernelEvent {
         /// The quarantined copy.
         copy: CopyId,
     },
+    /// T1's applied candidate (team kernel-a `design.md` §1.3). Delivered to P1 only. The
+    /// twin is [`KernelEffect::AppliedCandidate`].
+    ///
+    /// Not to R1, although the kernel-a design names it (lead ruling A-R65). R1 learns the
+    /// primary's history from [`Self::LocalApplied`], whose once-per-seq, in-order,
+    /// before-shipping rule is what bounds every ACK (B-R47). A second carrier for the same
+    /// fact would give R1 two sources that can disagree. T1 emits both.
+    ///
+    /// **Boxed**, for the reason [`Self::Recovered`] is: the payload carries an
+    /// [`crate::contracts::authority::AuthorityDecision`] and a [`TxnResult`], and unboxed it
+    /// would set the size of every [`Event`] in the run queue.
+    AppliedCandidate(Box<AppliedCandidate>),
+    /// P1 published `seq` (team kernel-a `design.md` §4.2 step 4, finding K-A-54). Delivered
+    /// to T1. The twin is [`KernelEffect::Published`].
+    Published {
+        /// The lineage it was published in.
+        lineage: Lineage,
+        /// The published position.
+        seq: Seq,
+        /// Its record digest.
+        record_digest: Digest,
+        /// Whose transaction it was.
+        request: RequestIdentity,
+    },
+    /// P1's environment inputs that no other carrier holds. Kernel-a owns the leaf, the same
+    /// shape as [`Self::Authority`].
+    Publication(PublicationEvent),
+    /// Dedup retention below `below` in `generation` may be dropped (team kernel-a `design.md`
+    /// §4.4; ADR-rdb-0004 §4). Computed outside the kernel; delivered to T1.
+    ///
+    /// Event half only: a watermark is the environment's decision, not a kernel's.
+    DedupTrim {
+        /// The generation it applies to.
+        generation: Generation,
+        /// Entries strictly below this may go.
+        below: Seq,
+    },
+    /// Status-index retention below `below` in `generation` may be dropped (team kernel-a
+    /// `design.md` §4.4). Delivered to P1. Event half only, as [`Self::DedupTrim`].
+    StatusTrim {
+        /// The generation it applies to.
+        generation: Generation,
+        /// Entries strictly below this may go.
+        below: Seq,
+    },
+    /// `generation` is retired: its status answers become `StatusExpired` (team kernel-a
+    /// `design.md` §4.4; ADR-rdb-0004 retention boundary). Delivered to T1 and P1. Event half
+    /// only, as [`Self::DedupTrim`].
+    RetireGeneration {
+        /// The retired generation.
+        generation: Generation,
+    },
 }
 
 /// Kernel-internal effects, carried by [`EffectKind::Kernel`].
@@ -506,6 +567,35 @@ pub enum KernelEffect {
         head: Seq,
         /// The primary's digest at `head`.
         digest: Digest,
+    },
+    /// T1's applied candidate, for P1 (team kernel-a `design.md` §1.3). The emitted half
+    /// of [`KernelEvent::AppliedCandidate`] (lead ruling R-S6); boxed for the same reason.
+    AppliedCandidate(Box<AppliedCandidate>),
+    /// P1 published `seq`, for T1. The emitted half of [`KernelEvent::Published`].
+    Published {
+        /// The lineage it was published in.
+        lineage: Lineage,
+        /// The published position.
+        seq: Seq,
+        /// Its record digest.
+        record_digest: Digest,
+        /// Whose transaction it was.
+        request: RequestIdentity,
+    },
+    /// P1's outputs that no other carrier holds. Kernel-a owns the leaf.
+    Publication(PublicationEffect),
+    /// T1 or P1 asks A1 for a recheck (team kernel-a `design.md` §3.3, §4.2; lead ruling
+    /// A-R63). Routed to A1 as [`AuthorityEvent::Check`] with the same three fields.
+    ///
+    /// A separate arm, not a variant of [`AuthorityEffect`]: that enum is what A1 emits, and a
+    /// request *to* A1 in A1's own effect vocabulary would read as A1 asking itself.
+    AuthorityCheck {
+        /// Where the recheck happens.
+        checkpoint: Checkpoint,
+        /// The lineage the caller believes it is operating under.
+        lineage: Lineage,
+        /// The request the recheck is for.
+        correlation: CorrelationId,
     },
 }
 

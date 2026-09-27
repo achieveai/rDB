@@ -341,40 +341,40 @@
         {
           "text": "Foundation contracts, clock and run loop work end to end.",
           "mark": "risk",
-          "evidence": "census: 50 of 56 landed, 6 exempt, 0 owed. Uncommitted. Kernel effects still refused by the run loop."
+          "evidence": "50 of 56 landed, 6 exempt, 0 owed. All uncommitted. Kernel effects accepted by run loop."
         },
         {
           "text": "Kernel-A ordering and consistency properties are validated.",
           "mark": "open",
-          "evidence": "Reach gate passed 2026-09-22; rows not yet written."
+          "evidence": "Reach gate THUMBS UP. Phase 2 dev underway. 61 of 174 rows built (113 owed)."
         },
         {
           "text": "Kernel-B state recovery and durability pass test suite.",
           "mark": "open",
-          "evidence": ""
+          "evidence": "116 of 148 rows built (32 owed). L1 and R1 gates in progress."
         },
         {
           "text": "Verification oracle detects real-world divergence.",
           "mark": "open",
-          "evidence": ""
+          "evidence": "65 of 91 rows built (26 owed)."
         }
       ],
-      "tests": "118 of 469 row ids landed. Foundation 50 of 56, kernel-a 3 of 174, kernel-b 0 of 148, verification 65 of 91.",
+      "tests": "292 of 469 built, 171 owed. Foundation 50/56 (0 owed). Kernel-a 61/174 (113 owed, M7A-28 miscredited). Kernel-b 116/148 (32 owed). Verification 65/91 (26 owed).",
       "status": [
         {
-          "lead": "Kernel-a reach passed.",
-          "text": "The tester drove all 14 fence triggers by hand. They found a real clock fencing defect, now fixed.",
-          "evidence": "ledger L-R144; census 2026-09-22 working tree"
+          "lead": "Paused at milestone stop point.",
+          "text": "Foundation phase complete. Kernel-b gates in progress. Gautam paused for manual progress review.",
+          "evidence": "ledger:5215"
         },
         {
-          "lead": "Timers wired into the run loop.",
-          "text": "Armed timers now fire back into the loop. Kernel effects are the next seam, being built now.",
-          "evidence": "ledger L-R145"
+          "lead": "Kernel-a reach gate THUMBS UP.",
+          "text": "Phase 2 builds takeover paths now. Kernel-b L1 and R1 gates started (38 kernel-a rows live).",
+          "evidence": "ledger:5225, B-R46d, B-R48"
         },
         {
           "lead": "Nothing committed since the 21st.",
-          "text": "About 6,200 lines of M7 work wait in the tree for review and commit.",
-          "evidence": "git diff --stat HEAD -- crates: 24 files, +6231"
+          "text": "All M7 work uncommitted in shared tree. Three open decisions for Gautam on staffing.",
+          "evidence": "git diff --stat HEAD; ledger:5222-5227"
         }
       ],
       "history": [

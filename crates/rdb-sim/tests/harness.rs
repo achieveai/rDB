@@ -37,6 +37,7 @@ use rdb_core::contracts::trace::{
 };
 use rdb_sim::harness::dispatch::Dispatcher;
 use rdb_sim::harness::environment_capabilities;
+use rdb_sim::harness::hosted::{Hosted, Scope};
 use rdb_sim::harness::trace::{log_jsonl_path, log_line, write_log_jsonl, LogTags};
 
 #[retcd_test]
@@ -55,29 +56,93 @@ fn m7f_01_every_kernel_package_reports_unavailable_without_being_stepped() {
     );
 }
 
-#[retcd_test]
-fn m7f_01_stepping_an_unwired_module_returns_unavailable_and_no_effect() {
-    support::preamble();
-    let ctx = support::ctx();
+/// A module that is never wired: the trait's default capability, and `Unavailable` naming its
+/// own package from every step. Slot `SLOT` of [`ModuleName::ALL`], so each of the six is
+/// stubbed under its own name and a refusal that named a neighbour's capability is caught.
+#[derive(Debug, Default)]
+struct Unwired<const SLOT: usize> {
+    stepped: u32,
+}
+
+impl<const SLOT: usize> Module for Unwired<SLOT> {
+    fn name(&self) -> ModuleName {
+        ModuleName::ALL[SLOT]
+    }
+
+    fn step(
+        &mut self,
+        _: &rdb_core::contracts::event::StepCtx<'_>,
+        _: &rdb_core::contracts::event::Event,
+    ) -> Result<Vec<rdb_core::contracts::event::Effect>, RdbError> {
+        self.stepped += 1;
+        Err(RdbError::unavailable(
+            ModuleName::ALL[SLOT].capability(),
+            "m7f_01: a stub that is never wired",
+        ))
+    }
+}
+
+/// One stub through the dispatcher's own container, on two partitions of one node.
+fn m7f_01_offer_to_an_unwired<const SLOT: usize>() {
+    let module = ModuleName::ALL[SLOT];
+    let mut hosted: Hosted<Unwired<SLOT>> = Hosted::new(Scope::Partition);
+
+    // Capability is answered without stepping anything (K-F-10).
+    assert_eq!(
+        hosted.capability(),
+        CapabilityState::Unavailable,
+        "{module:?}: an unwired package reports Unavailable"
+    );
+    assert!(
+        hosted.get(NodeId(1), PartitionId(1)).is_none(),
+        "{module:?}: asking the capability stepped nothing"
+    );
+
+    let mut ctx = support::ctx();
     let probe = support::probe_event();
-    let mut dispatcher = Dispatcher::new();
-
-    for module in ModuleName::ALL {
-        let error = dispatcher
-            .step(module, &ctx, &probe)
-            .expect_err("no kernel package is wired yet: no effect may come back");
-
-        assert_eq!(error.kind(), ErrorKind::Unavailable);
+    for partition in [PartitionId(1), PartitionId(2)] {
+        ctx.partition = partition;
+        let answer = hosted.step(&ctx, &probe);
+        assert!(
+            matches!(&answer, Err(error) if error.kind() == ErrorKind::Unavailable),
+            "{module:?}: an unwired module's refusal comes back unchanged, never as an effect \
+             or a success: {answer:?}"
+        );
         assert_eq!(
-            error.capability(),
+            answer.err().and_then(|error| error.capability()),
             Some(module.capability()),
             "{module:?} must report its own capability, not a neighbour's"
         );
+        assert_eq!(
+            hosted.get(NodeId(1), partition).map(|stub| stub.stepped),
+            Some(1),
+            "{module:?}: the offer reached the module once, and only its own instance"
+        );
     }
-    assert!(
-        dispatcher.take_replies().is_empty(),
-        "an unwired module handed nothing to the environment"
-    );
+}
+
+/// M7F-01: stepping an unwired module through the dispatcher returns `Unavailable` naming that
+/// module's own package, with no effect, and never panics; its capability says `Unavailable`
+/// without a step.
+///
+/// **Re-pointed 2026-09-26 (lead ruling A-R67.2).** It stepped the six real packages through
+/// [`Dispatcher::step`] and expected each to refuse. That claim goes false one package at a time
+/// as the kernels are wired — T1 now answers the probe submit — and the row would have had to
+/// shrink until it asserted nothing. The claim is about the dispatcher, so it is now asserted
+/// against a test-local stub, one per [`ModuleName`], through
+/// [`rdb_sim::harness::hosted::Hosted`], the container A1 and F1 are hosted in. It stays true
+/// after every package is wired. Which real package is still unwired is asserted by
+/// `m7f_01_every_kernel_package_reports_unavailable_without_being_stepped`, not by this one.
+#[retcd_test]
+fn m7f_01_stepping_an_unwired_module_returns_unavailable_and_no_effect() {
+    support::preamble();
+    m7f_01_offer_to_an_unwired::<0>();
+    m7f_01_offer_to_an_unwired::<1>();
+    m7f_01_offer_to_an_unwired::<2>();
+    m7f_01_offer_to_an_unwired::<3>();
+    m7f_01_offer_to_an_unwired::<4>();
+    m7f_01_offer_to_an_unwired::<5>();
+    assert_eq!(ModuleName::ALL.len(), 6, "one stub per module name");
 }
 
 /// An unwired seam proves nothing about mutation (finding K-F-26).
@@ -330,11 +395,10 @@ fn m7f_52_serialised_lines_land_in_a_tagged_file_under_the_test_log_root() {
 use rdb_core::authority::AuthorityTimer;
 use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey};
 use rdb_core::contracts::event::{Effect, EffectKind, EventKind, KernelEffect};
-use rdb_core::contracts::ids::{MessageId, Revision, TimerId, TimerVersion};
+use rdb_core::contracts::ids::{Revision, TimerId, TimerVersion};
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{DispatchOutcome, KernelNote};
-use rdb_core::contracts::transport::{Frame, SendEffect};
 use rdb_sim::harness::replay::{replay, replay_run, ReplayOutcome};
 use rdb_sim::harness::run::{execute, RunLimits, RunPlan, Runner, SeedEvent, StopReason};
 use rdb_sim::sim::cluster::ClusterConfig;
@@ -439,19 +503,20 @@ fn i1_scaffolding_the_run_loop_produces_a_trace() {
         "i1 run report"
     );
 
-    // A1's acquisition ends in a `PublishAuthorityView`, refused until a consumer kernel exists
-    // (lead ruling A-R49). `QueueEmpty` before A-R47. Since finding F2 the view is the
-    // partitions install's, which needs the seeded record (lead ruling B-R39).
-    assert_eq!(
-        report.stop.refusal(),
-        Some("harness::dispatch::deliver::kernel"),
+    // A1's acquisition ended in a `PublishAuthorityView` refused under the `kernel` seam (lead
+    // ruling A-R49) until A-R63 routed that view to its consumers; the run now renews on to the
+    // deadline. `QueueEmpty` before A-R47. Since finding F2 the view is the partitions
+    // install's, which needs the seeded record (lead ruling B-R39).
+    assert_eq!(report.stop.refusal(), None, "{:?}", report.stop);
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
         "{:?}",
         report.stop
     );
-    assert_eq!(
-        report.events_consumed, 3,
-        "the run sustained itself: the AcquireDue, the CAS completion it caused, and the \
-         partitions snapshot the adoption's reload caused"
+    assert!(
+        report.events_consumed > 3,
+        "the run sustained itself past the AcquireDue, the CAS completion it caused, and the \
+         partitions snapshot the adoption's reload caused: {report:?}"
     );
     assert!(trace.events.len() > 9, "more than the capability preamble");
     assert_eq!(report.recorded, trace.events.len());
@@ -641,14 +706,13 @@ fn i1_scaffolding_every_exit_names_itself() {
 
 /// Scaffolding: a refused effect is reported by name and never absorbed.
 ///
-/// Driven through `Runner::carry_out`, the loop's own delivery step, because no wired module
-/// emits a send, store or kernel effect -- A1 emits only `EffectKind::Control`. That is a gap in
-/// the kernel, not in the loop, and it is why this cannot yet be driven by a scenario.
+/// Driven through `Runner::carry_out`, the loop's own delivery step, so the refusal is the
+/// loop's and not a bare dispatcher's.
 ///
-/// Carried by a `Send` effect since 2026-09-22 (lead ruling A-R40 / L-R142). It was a
-/// `TimerEffect::Arm` until the timer wheel was wired. Re-pointed and not deleted: the claim is
-/// that an unwired seam reaches the caller *by name*, `Timer` was only the example that carried
-/// it, and `Send` is still owed.
+/// Carried by R1's `SnapshotCatchupRequired`, an arm with no consumer the harness knows. It was
+/// R1's `SendEnvelopes` from 2026-09-26 until lead ruling B-R57 gave that one a provider. It was a `Send` from 2026-09-22 (lead ruling A-R40 / L-R142) until the network was wired, and
+/// a `TimerEffect::Arm` before that. Re-pointed and not deleted: the claim is that an unwired
+/// seam reaches the caller *by name*; the arm is only the example that carries it.
 #[retcd_test]
 fn i1_scaffolding_a_refusal_reaches_the_caller_by_name() {
     support::preamble();
@@ -660,30 +724,25 @@ fn i1_scaffolding_a_refusal_reaches_the_caller_by_name() {
             BootId(1),
             vec![Effect {
                 correlation: CorrelationId(1),
-                from: ModuleName::Authority,
+                from: ModuleName::Replication,
                 partition: PartitionId(1),
-                kind: EffectKind::Send(SendEffect::Unicast {
-                    to: NodeId(2),
-                    frame: Frame {
-                        id: MessageId(1),
-                        protocol: 1,
-                        config: ConfigVersion(1),
-                        body: bytes::Bytes::new(),
-                    },
+                kind: EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+                    copy: rdb_core::contracts::membership::CopyId(2),
+                    barrier: Seq(1),
                 }),
             }],
         )
-        .expect_err("the network is not wired");
+        .expect_err("no consumer takes a snapshot request yet");
     assert_eq!(
         error,
-        SimError::unavailable("harness::dispatch::deliver::send")
+        SimError::unavailable("harness::dispatch::deliver::kernel")
     );
 
-    let stop = StopReason::from_delivery(error, EventId(7), ModuleName::Authority)
+    let stop = StopReason::from_delivery(error, EventId(7), ModuleName::Replication)
         .expect("a refusal is a stop reason, not a harness failure");
     assert_eq!(
         stop.refusal(),
-        Some("harness::dispatch::deliver::send"),
+        Some("harness::dispatch::deliver::kernel"),
         "the seam name reaches the caller"
     );
     tracing::info!(seam = stop.refusal(), "i1 refusal seam");
@@ -734,6 +793,85 @@ fn i1_scaffolding_an_armed_timer_is_the_runs_remaining_work() {
         events_consumed = report.events_consumed,
         last_tick = report.last_tick.0,
         "i1 timer fired"
+    );
+}
+
+/// Found by dev-kb-f1 on M7B-96: a transfer step that falls due and stalls queues nothing, and
+/// the loop took that empty pop for the end of the run while F1's discovery deadline was still
+/// armed. Here the step at 10 stalls (the source stops at 5) and a timer is armed at 50: the run
+/// must reach 50, and stop `QueueEmpty` only when no deadline is left.
+#[retcd_test]
+fn run_a_stalled_transfer_step_leaves_a_later_deadline_to_fire() {
+    use rdb_core::contracts::membership::CopyId;
+    use rdb_core::contracts::recovery::RecoveryEffect;
+    use rdb_sim::harness::transfer::TransferPlan;
+    support::preamble();
+    // Nodes and no partitions: the holder must be registered to report, and nothing else runs.
+    let mut plan = RunPlan::new(ClusterConfig {
+        partitions: Vec::new(),
+        ..support::cluster()
+    });
+    plan.transfers.push((
+        PartitionId(1),
+        TransferPlan {
+            copy: CopyId(2),
+            holder: NodeId(2),
+            advertised: Seq(150),
+            from: Seq(100),
+            per_step: 10,
+            step_millis: 10,
+            stop_at: Some(Tick(5)),
+            stall_at: None,
+        },
+    ));
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let effect = |from, kind| Effect {
+        correlation: CorrelationId(1),
+        from,
+        partition: PartitionId(1),
+        kind,
+    };
+    runner
+        .carry_out(
+            NodeId(1),
+            BootId(1),
+            vec![
+                effect(
+                    ModuleName::Recovery,
+                    EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::QueryInventory {
+                        copies: vec![CopyId(2)],
+                    })),
+                ),
+                effect(
+                    ModuleName::Authority,
+                    EffectKind::Timer(TimerEffect::Arm {
+                        id: TimerId(1),
+                        version: TimerVersion(1),
+                        at: Tick(50),
+                    }),
+                ),
+            ],
+        )
+        .expect("the query starts the transfer and the timer is armed");
+
+    let report = runner.run(RunLimits::SMALL).expect("a run");
+    tracing::info!(stop = ?report.stop, events = report.events_consumed,
+        last_tick = report.last_tick.0, "stalled transfer");
+
+    assert_eq!(
+        report.events_consumed, 2,
+        "the first report at 0 and the fire at 50; the stall at 10 is not an event"
+    );
+    assert_eq!(
+        report.last_tick,
+        Tick(50),
+        "the run reached the later deadline"
+    );
+    assert_eq!(report.stop, StopReason::QueueEmpty);
+    assert_eq!(
+        runner.dispatcher().next_deadline(),
+        None,
+        "no deadline left"
     );
 }
 
@@ -1906,4 +2044,461 @@ fn m7b_147_a_clean_resume_does_emit_a_resuming_trace_line() {
 
     let untrue = h1_untruthful_lines(&plan, l1_fixture::PRIMARY, l1_fixture::PARTITION);
     assert!(untrue.is_empty(), "{untrue:#?}");
+}
+
+/// B-R55b: every `Recovered` F1 emits is recorded once, as it leaves the kernel, and the note
+/// holds exactly the payload the dispatcher routes. M7B-96 asserts its `LossRecord` on the note.
+#[retcd_test]
+fn route_each_recovered_is_recorded_once_as_the_payload_it_routes() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_sim::sim::control::ControlStore;
+    use rdb_sim::sim::scheduler::Scheduler;
+    support::preamble();
+    let KernelEvent::Recovered(result) = l1_fixture::recovered(40) else {
+        unreachable!("the fixture builds a Recovered")
+    };
+    let mut dispatcher = Dispatcher::new();
+    let (mut control, mut scheduler) = (ControlStore::new(), Scheduler::new());
+    dispatcher
+        .deliver(
+            l1_fixture::PRIMARY,
+            BootId(1),
+            vec![Effect {
+                correlation: CorrelationId(7),
+                from: ModuleName::Recovery,
+                partition: l1_fixture::PARTITION,
+                kind: EffectKind::Kernel(KernelEffect::Recovered(result.clone())),
+            }],
+            &mut control,
+            &mut scheduler,
+        )
+        .expect("a Recovered is routed");
+
+    let facts: Vec<(NodeId, ModuleName, KernelNote)> = dispatcher
+        .take_notes()
+        .into_iter()
+        .filter(|(_, _, note)| matches!(note, KernelNote::RecoveredFact { .. }))
+        .collect();
+    let routed = scheduler.pop().expect("the routed event");
+    assert_eq!(scheduler.queued(), 0, "one emission routes one event");
+    let EventKind::Kernel(KernelEvent::Recovered(routed)) = routed.kind else {
+        panic!("routed as F1's result: {:?}", routed.kind)
+    };
+    assert_eq!(routed, result);
+    assert_eq!(
+        facts,
+        vec![(
+            l1_fixture::PRIMARY,
+            ModuleName::Recovery,
+            KernelNote::RecoveredFact { result: routed },
+        )]
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lead ruling B-R56: a committed recovery reaches every other member of its pinned config
+// through a modelled control watch, CONTROL_WATCH_MILLIS later. Scaffolding, not rows.
+// ---------------------------------------------------------------------------------------------
+
+/// What the B-R55b and B-R56 notes said, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Heard {
+    /// F1 emitted a `Recovered` at this revision.
+    Fact(Revision),
+    Deferred(
+        NodeId,
+        Revision,
+        rdb_core::contracts::trace::RecoveredDeferReason,
+    ),
+    Landed(NodeId, Revision),
+}
+
+/// The L1 fixture's result, pinned to nodes 1-3 with node 1 primary, committed at `revision`.
+/// Its barrier names copy 2 (node 2) and not copy 3 (node 3), so the two members land it
+/// differently under lead ruling B-R58c: node 2 inherits, node 3 lands empty.
+fn fanout_result(revision: u64) -> rdb_core::contracts::recovery::RecoveryResult {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::ids::DurableSeq;
+    use rdb_core::contracts::membership::CopyId;
+    use rdb_core::contracts::recovery::{DurableProof, RecoveryBarrier};
+    let KernelEvent::Recovered(mut result) = l1_fixture::recovered(40) else {
+        unreachable!("the fixture builds a Recovered")
+    };
+    result.committed.revision = Revision(revision);
+    let (cutoff, digest) = (result.selected.cutoff_seq, result.selected.cutoff_digest);
+    let proof = DurableProof {
+        copy: CopyId(2),
+        partition: l1_fixture::PARTITION,
+        seq: DurableSeq(cutoff.0),
+        digest,
+    };
+    result.barrier = RecoveryBarrier::try_new(
+        &[proof],
+        &std::collections::BTreeSet::from([CopyId(2)]),
+        cutoff,
+        digest,
+    )
+    .expect("copy 2 proves the cutoff");
+    *result
+}
+
+/// Nodes 1-3 registered, nothing else. The members' fan-out is on by default (B-R58b), so
+/// nothing here turns it on.
+fn fanout_dispatcher() -> Dispatcher {
+    let mut dispatcher = Dispatcher::new();
+    for node in 1..=3 {
+        dispatcher.register_node(NodeId(node), BootId(1));
+    }
+    dispatcher
+}
+
+/// F1 on node 1 emits `result`.
+fn fanout_emit(
+    dispatcher: &mut Dispatcher,
+    scheduler: &mut rdb_sim::sim::scheduler::Scheduler,
+    result: &rdb_core::contracts::recovery::RecoveryResult,
+) {
+    let mut control = rdb_sim::sim::control::ControlStore::new();
+    dispatcher
+        .deliver(
+            NodeId(1),
+            BootId(1),
+            vec![Effect {
+                correlation: CorrelationId(7),
+                from: ModuleName::Recovery,
+                partition: l1_fixture::PARTITION,
+                kind: EffectKind::Kernel(KernelEffect::Recovered(Box::new(result.clone()))),
+            }],
+            &mut control,
+            scheduler,
+        )
+        .expect("F1's result is routed");
+}
+
+/// Fire the wheel through `until`, draining the queue after each fire: every `Recovered` as
+/// `(tick, node, boot, revision)`, each held to its consumers' answer.
+fn fanout_run(
+    dispatcher: &mut Dispatcher,
+    scheduler: &mut rdb_sim::sim::scheduler::Scheduler,
+    until: u64,
+) -> Vec<(u64, NodeId, BootId, Revision)> {
+    use rdb_core::contracts::event::KernelEvent;
+    let mut out = Vec::new();
+    loop {
+        while let Some(event) = scheduler.pop() {
+            assert!(
+                dispatcher.take_routed(event.id),
+                "held to R1 and L1's answer"
+            );
+            let EventKind::Kernel(KernelEvent::Recovered(result)) = event.kind else {
+                panic!("only Recovered is in flight: {:?}", event.kind)
+            };
+            out.push((
+                event.at.0,
+                event.node,
+                event.boot,
+                result.committed.revision,
+            ));
+        }
+        match dispatcher.next_deadline() {
+            Some(at) if at.0 <= until => {
+                let at = at.max(scheduler.now());
+                dispatcher.fire_due_timers(at, scheduler).expect("a fire");
+            }
+            _ => return out,
+        }
+    }
+}
+
+/// The notes taken since the last call, as [`Heard`]. No other note is expected.
+fn fanout_heard(dispatcher: &mut Dispatcher) -> Vec<Heard> {
+    dispatcher
+        .take_notes()
+        .into_iter()
+        .map(|(_, _, note)| match note {
+            KernelNote::RecoveredFact { result } => Heard::Fact(result.committed.revision),
+            KernelNote::RecoveredDeferred {
+                member,
+                revision,
+                reason,
+                emitter,
+                ..
+            } => {
+                assert_eq!(emitter, NodeId(1));
+                Heard::Deferred(member, revision, reason)
+            }
+            KernelNote::RecoveredLanded {
+                member,
+                revision,
+                emitter,
+                ..
+            } => {
+                assert_eq!(emitter, NodeId(1));
+                Heard::Landed(member, revision)
+            }
+            other => panic!("no other note: {other:?}"),
+        })
+        .collect()
+}
+
+/// B-R56a.4: every deferral of `(member, revision)` is followed by its one landing, a landing
+/// follows a fire of its revision, and the emitter is never a member.
+fn fanout_assert_paired(heard: &[Heard]) {
+    for (at, entry) in heard.iter().enumerate() {
+        match *entry {
+            Heard::Fact(_) => {}
+            Heard::Deferred(member, revision, _) => {
+                assert_ne!(member, NodeId(1), "the emitter is not a member");
+                assert!(
+                    heard[at..].contains(&Heard::Landed(member, revision)),
+                    "{member:?} deferred {revision:?} and never heard it: {heard:?}"
+                );
+            }
+            Heard::Landed(member, revision) => {
+                assert_ne!(member, NodeId(1), "the emitter is not a member");
+                assert!(
+                    heard[..at].contains(&Heard::Fact(revision)),
+                    "{member:?} heard {revision:?} before it was fired: {heard:?}"
+                );
+                assert_eq!(
+                    heard.iter().filter(|seen| **seen == *entry).count(),
+                    1,
+                    "{member:?} heard {revision:?} once: {heard:?}"
+                );
+            }
+        }
+    }
+}
+
+/// B-R56: a three-node recovery reaches each secondary exactly once, after the watch delay, and
+/// the emitter only through its own routing. A member whose copy the recovery's barrier names
+/// inherits when it lands; one outside the barrier lands empty (lead ruling B-R58c).
+#[retcd_test]
+fn fanout_each_other_member_hears_a_recovery_once_after_the_watch_delay() {
+    use rdb_sim::harness::dispatch::CONTROL_WATCH_MILLIS;
+    support::preamble();
+    let (r2, delay) = (Revision(2), CONTROL_WATCH_MILLIS);
+    let mut dispatcher = fanout_dispatcher();
+    let mut scheduler = rdb_sim::sim::scheduler::Scheduler::new();
+    fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(2));
+    assert!(
+        dispatcher.engine(NodeId(2)).is_none(),
+        "nothing reaches a member at emission"
+    );
+
+    let heard = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);
+    assert!(delay > 0, "a watch is never instant");
+    assert_eq!(
+        heard,
+        vec![
+            (0, NodeId(1), BootId(1), r2),
+            (delay, NodeId(2), BootId(1), r2),
+            (delay, NodeId(3), BootId(1), r2),
+        ]
+    );
+    let notes = fanout_heard(&mut dispatcher);
+    assert_eq!(
+        notes,
+        vec![
+            Heard::Fact(r2),
+            Heard::Landed(NodeId(2), r2),
+            Heard::Landed(NodeId(3), r2),
+        ]
+    );
+    fanout_assert_paired(&notes);
+    let prior = Generation(l1_fixture::GEN.0 - 1);
+    let parent = |node: u32| {
+        dispatcher
+            .engine(NodeId(node))
+            .and_then(|engine| engine.parent(l1_fixture::PARTITION, l1_fixture::GEN))
+    };
+    assert_eq!(
+        parent(2),
+        Some(prior),
+        "node 2's copy is in the barrier: it inherited when it landed"
+    );
+    assert_eq!(
+        parent(3),
+        None,
+        "node 3's copy is not: it landed empty (B-R58c)"
+    );
+    assert_eq!(dispatcher.next_deadline(), None);
+}
+
+/// B-R56: a member cut off from the emitter (the proxy for "cannot reach control") is deferred
+/// when its watch fires and hears the result only after the heal.
+#[retcd_test]
+fn fanout_a_cut_member_hears_only_after_the_heal() {
+    use rdb_core::contracts::trace::RecoveredDeferReason;
+    use rdb_sim::sim::network::{LinkState, NetworkOp};
+    support::preamble();
+    let r2 = Revision(2);
+    let link = |state| NetworkOp::SetLink {
+        a: NodeId(1),
+        b: NodeId(2),
+        state,
+    };
+    let mut dispatcher = fanout_dispatcher();
+    let mut scheduler = rdb_sim::sim::scheduler::Scheduler::new();
+    dispatcher
+        .inject_network(link(LinkState::Partitioned))
+        .expect("a cut");
+    fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(2));
+
+    let before = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);
+    assert_eq!(
+        before,
+        vec![
+            (0, NodeId(1), BootId(1), r2),
+            (10, NodeId(3), BootId(1), r2)
+        ]
+    );
+    assert_eq!(dispatcher.next_deadline(), None, "held, not armed");
+    assert!(dispatcher.engine(NodeId(2)).is_none());
+    let mut notes = fanout_heard(&mut dispatcher);
+    assert_eq!(
+        notes,
+        vec![
+            Heard::Fact(r2),
+            Heard::Deferred(NodeId(2), r2, RecoveredDeferReason::CutOff),
+            Heard::Landed(NodeId(3), r2),
+        ]
+    );
+
+    dispatcher
+        .clock_mut()
+        .advance(Tick(100))
+        .expect("time passes");
+    dispatcher
+        .inject_network(link(LinkState::Up))
+        .expect("the heal");
+    let after = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);
+    assert_eq!(
+        after,
+        vec![(110, NodeId(2), BootId(1), r2)],
+        "after the heal"
+    );
+    notes.extend(fanout_heard(&mut dispatcher));
+    assert_eq!(notes.last(), Some(&Heard::Landed(NodeId(2), r2)));
+    fanout_assert_paired(&notes);
+}
+
+/// B-R56.3: a crashed member is deferred, not refused, and hears the result under its new boot
+/// when the sim restarts it.
+#[retcd_test]
+fn fanout_a_crashed_member_hears_on_restart() {
+    use rdb_core::contracts::ids::SnapshotHandle;
+    use rdb_core::contracts::storage::{StorageFault, StoreEffect};
+    use rdb_core::contracts::trace::RecoveredDeferReason;
+    use rdb_sim::storage::StorageOp;
+    support::preamble();
+    let r2 = Revision(2);
+    let mut dispatcher = fanout_dispatcher();
+    let mut scheduler = rdb_sim::sim::scheduler::Scheduler::new();
+    dispatcher
+        .inject_storage(StorageOp::Crash {
+            node: NodeId(2),
+            fault: StorageFault::ProcessCrash,
+        })
+        .expect("a planned crash");
+    let tripped = dispatcher.deliver(
+        NodeId(2),
+        BootId(1),
+        vec![Effect {
+            correlation: CorrelationId(1),
+            from: ModuleName::Publication,
+            partition: l1_fixture::PARTITION,
+            kind: EffectKind::Store(StoreEffect::Snapshot {
+                handle: SnapshotHandle(1),
+                partition: l1_fixture::PARTITION,
+            }),
+        }],
+        &mut rdb_sim::sim::control::ControlStore::new(),
+        &mut scheduler,
+    );
+    assert!(tripped.is_err(), "node 2 is down");
+    fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(2));
+
+    let before = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);
+    assert_eq!(
+        before,
+        vec![
+            (0, NodeId(1), BootId(1), r2),
+            (10, NodeId(3), BootId(1), r2)
+        ]
+    );
+    let mut notes = fanout_heard(&mut dispatcher);
+    assert!(notes.contains(&Heard::Deferred(
+        NodeId(2),
+        r2,
+        RecoveredDeferReason::Crashed
+    )));
+
+    dispatcher
+        .clock_mut()
+        .advance(Tick(50))
+        .expect("time passes");
+    dispatcher
+        .restart(NodeId(2), BootId(2))
+        .expect("node 2 comes back");
+    let after = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);
+    assert_eq!(
+        after,
+        vec![(60, NodeId(2), BootId(2), r2)],
+        "on restart, under the new boot"
+    );
+    notes.extend(fanout_heard(&mut dispatcher));
+    fanout_assert_paired(&notes);
+}
+
+/// B-R56a.3: a member holding an older result lands it before a newer one, even when the newer
+/// one's watch would fire first. Revision 2 is held behind a cut; revision 3 (the activation
+/// re-emit) is emitted at 10, so its watch is due at 20; the heal at 12 releases revision 2 for
+/// 22. Landing each on its own tick would hand node 2 revision 3 and then revision 2.
+#[retcd_test]
+fn fanout_a_member_lands_held_results_in_revision_order() {
+    use rdb_sim::sim::network::{LinkState, NetworkOp};
+    support::preamble();
+    let (r2, r3) = (Revision(2), Revision(3));
+    let link = |state| NetworkOp::SetLink {
+        a: NodeId(1),
+        b: NodeId(2),
+        state,
+    };
+    let mut dispatcher = fanout_dispatcher();
+    let mut scheduler = rdb_sim::sim::scheduler::Scheduler::new();
+    dispatcher
+        .inject_network(link(LinkState::Partitioned))
+        .expect("a cut");
+    fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(2));
+    let mut seen = fanout_run(&mut dispatcher, &mut scheduler, 10);
+    assert_eq!(scheduler.now(), Tick(10));
+
+    fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(3));
+    seen.extend(fanout_run(&mut dispatcher, &mut scheduler, 10));
+    dispatcher
+        .clock_mut()
+        .advance(Tick(12))
+        .expect("time passes");
+    dispatcher
+        .inject_network(link(LinkState::Up))
+        .expect("the heal");
+    seen.extend(fanout_run(&mut dispatcher, &mut scheduler, u64::MAX));
+
+    let on_two: Vec<(u64, Revision)> = seen
+        .iter()
+        .filter(|(_, node, _, _)| *node == NodeId(2))
+        .map(|(at, _, _, revision)| (*at, *revision))
+        .collect();
+    assert_eq!(on_two, vec![(22, r2), (22, r3)], "{seen:?}");
+    let notes = fanout_heard(&mut dispatcher);
+    let landed_on_two: Vec<Revision> = notes
+        .iter()
+        .filter_map(|heard| match heard {
+            Heard::Landed(NodeId(2), revision) => Some(*revision),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(landed_on_two, vec![r2, r3], "ends on the newest: {notes:?}");
+    fanout_assert_paired(&notes);
 }

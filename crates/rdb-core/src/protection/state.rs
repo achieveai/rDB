@@ -75,9 +75,11 @@ pub(super) struct State {
     unsafe_queue: VecDeque<UnsafeEntry>,
     /// R1's durable views for versions above the current predicate, not pinned yet (lead ruling
     /// B-R46d, tester E1). R1 answers its own `ConfigChanged` with a `DurableAdvanced`, and a
-    /// router may hand the change to R1 before L1. The highest view per version is kept. A pin
-    /// seeds its predicate from its entry and drops every entry it reaches or passes, so only
-    /// versions above the current one are ever held: bounded by construction, no cap.
+    /// router may hand the change to R1 before L1. R1's latest view per version is kept, as for
+    /// an active predicate (lead ruling B-R46e, tester F1). A pin seeds its predicate from its
+    /// entry and drops every entry it reaches or passes, so only versions above the current one
+    /// are held. That bounds the map by the distinct future versions R1 reports, not by any
+    /// constant: there is no cap (tester F2).
     pending_durable: BTreeMap<ConfigVersion, DurableSeq>,
     highest_applied: Seq,
     qualifies_now_at_head: bool,
@@ -339,10 +341,12 @@ impl State {
     /// active predicate, so an easier new membership cannot erase old exposure (design §4.3).
     ///
     /// An active predicate's view is stored as reported, not maxed (unchanged by B-R46d). A view
-    /// for a version above the current predicate is kept in `pending_durable` for its pin, the
-    /// highest per version (lead ruling B-R46d, tester E1). Any other entry is dropped. A report
-    /// that records nothing — every version below the lowest active predicate, or between active
-    /// ones — is refused (review A2).
+    /// for a version above the current predicate is kept in `pending_durable` for its pin (lead
+    /// ruling B-R46d, tester E1), stored as reported too, so the latest report wins in both
+    /// stores and the pin order cannot change the floor (lead ruling B-R46e, tester F1). R1's
+    /// view can go down: a copy with a new boot restarts from nothing. Any other entry is
+    /// dropped. A report that records nothing — every version below the lowest active predicate,
+    /// or between active ones — is refused (review A2).
     fn record_durable(
         &mut self,
         now: Tick,
@@ -354,8 +358,7 @@ impl State {
                 self.predicates[index].durable_through = *durable;
                 recorded = true;
             } else if *version > self.config.config_version {
-                let pending = self.pending_durable.entry(*version).or_default();
-                *pending = (*pending).max(*durable);
+                self.pending_durable.insert(*version, *durable);
                 recorded = true;
             }
         }

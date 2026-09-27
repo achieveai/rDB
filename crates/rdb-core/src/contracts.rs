@@ -34,6 +34,7 @@ pub mod ids;
 pub mod ignore;
 pub mod membership;
 pub mod protection;
+pub mod publication;
 pub mod qualification;
 pub mod recovery;
 pub mod storage;

@@ -423,11 +423,35 @@ pub enum RecoveryOp {
         partition: PartitionId,
     },
     /// Bring a node up to a sequence.
+    ///
+    /// Before the first [`TimeOp::Advance`] this is initial state: the node's copy is a survivor
+    /// holding the prior lineage's records `1..=to`, durable (`super::run`'s lowering table).
     Synchronize {
         /// Which node.
         node: NodeId,
         /// To which sequence.
         to: Seq,
+    },
+    /// A copy that is still sending the prefix it advertises (spike §6, F1/R1: "extend while a
+    /// higher compatible prefix transfers").
+    ///
+    /// Discovery's query to it starts the transfer rather than reading an inventory. It then
+    /// moves `per_step` records every `step_ticks` until it reaches `advertised`, or until a
+    /// [`TimeOp::Pause`] of its node silences it. Initial state, like a survivor-placing
+    /// [`Self::Synchronize`]: it must come before the first [`TimeOp::Advance`].
+    Transfer {
+        /// Which partition.
+        partition: PartitionId,
+        /// The node holding the sending copy.
+        node: NodeId,
+        /// What discovery has received from it when the query starts the transfer.
+        received: Seq,
+        /// The head it advertises.
+        advertised: Seq,
+        /// Records moved per step.
+        per_step: u64,
+        /// Ticks between steps.
+        step_ticks: u64,
     },
     /// Rebuild a copy from scratch.
     Rebuild {

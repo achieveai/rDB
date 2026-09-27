@@ -4,7 +4,10 @@
 //! Rows named `m7b_NN_*` are plan rows (`docs/testing/test-plan-m7-kernel-b.md` §4–§5); the
 //! rest are developer scaffolding and tester rows, written against `design.md` §3.4–§3.5. The
 //! tracker is driven directly, except in the routing section, which routes the same inputs
-//! through `Replication::step` (lead ruling B-R48).
+//! through `Replication::step` (lead ruling B-R48). The A1-view rows (M7B-161..163, lead ruling
+//! B-R53) and the primary `Recovered` builds (M7B-164, lead ruling B-R54) come next; the
+//! receiver's own are in `replication_append.rs`. Last are the §9 rows M7B-133..135, 144 and 145,
+//! the edge, retirement and the quarantine route; two of them run R1 beside a real L1 or F1.
 //!
 //! Fixture: A primary (copy 0, node 1), B and C regular (copies 1, 2), D a shadow (copy 3).
 //! `min_regular_acks` 1. Every copy's boot is its node number. The primary has applied 12 and
@@ -14,8 +17,10 @@ use config_log::retcd_test;
 
 use bytes::Bytes;
 use rdb_core::contracts::authority::{
-    AuthorityView, BlockReason, DenyReason, FencingProof, Lineage, PartitionMode, Revocation,
+    AuthorityDecision, AuthorityEvent, AuthorityView, BlockReason, Checkpoint, DenyReason,
+    FencingProof, Lineage, PartitionMode, Revocation, Verdict,
 };
+use rdb_core::contracts::control::{CasOutcome, ControlEffect, ControlEvent, ControlKey};
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
@@ -24,9 +29,10 @@ use rdb_core::contracts::event::{
     StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AppliedSeq, AuthorityGeneration, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId,
-    FlushTicket, Generation, GrantId, MessageId, NodeId, OwnerEpoch, PartitionId, ReceivedSeq,
-    ReplicaRole, Revision, Seq, SnapshotHandle,
+    AppliedSeq, AuthorityGeneration, BootId, ClientId, ConfigVersion, CorrelationId, DurableSeq,
+    EventId, FlushTicket, Generation, GrantId, MessageId, NodeId, OwnerEpoch, PartitionId,
+    ReceivedSeq, ReplicaRole, RequestId, RequestIdentity, Revision, Seq, SnapshotHandle, TenantId,
+    TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -34,13 +40,21 @@ use rdb_core::contracts::qualification::{
     QualificationCause, QualificationChanged, QualificationDirection,
 };
 use rdb_core::contracts::recovery::{
-    CommittedRoot, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap, SelectedLineage,
+    Candidate, CommittedRoot, DurableProof, LineageAnchor, LossRecord, RecoveryBarrier,
+    RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult, RetainedStatusMap,
+    SelectedLineage, SurvivorInventory,
 };
 use rdb_core::contracts::storage::{DurablePrefix, Namespace, SnapshotRead, StorageEvent};
-use rdb_core::contracts::time::{ControlTime, Tick};
+use rdb_core::contracts::time::{ControlTime, Tick, TimerFired};
 use rdb_core::contracts::trace::{AckRejectReason, Version};
-use rdb_core::contracts::transport::{Frame, PeerLabel, TransportEvent};
+use rdb_core::contracts::transport::{Frame, PeerLabel, SendEffect, TransportEvent};
+use rdb_core::contracts::txn::{Durability, Outcome, TxnResult};
 use rdb_core::contracts::version::ENVELOPE_VERSION;
+use rdb_core::protection::{Mode, Protection, HEALTH_EVAL_TIMER};
+use rdb_core::publication::{AppliedCandidate, PubConfig, PubEffect, PubEvent, PubKernel};
+use rdb_core::recovery::{Recovery, RecoveryPhase, DISCOVERY_TIMER};
+use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
+use rdb_core::replication::catchup::{CatchupCursor, MAX_PROBE_ROUNDS};
 use rdb_core::replication::primary::Primary as PrimarySide;
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{decode_reply, encode_reply};
@@ -1080,12 +1094,44 @@ fn m7b_45_recovered_rebuilds_the_tracker_from_the_result() {
     let mut again = c(10, 10, 10);
     (again.generation, again.owner_epoch, again.config_version) = (NEW_GEN, NEW_EPOCH, NEW_CONFIG);
     assert_eq!(deliver(&mut tracker, &again)[0], peer_progress(C, 10));
+
+    // The pin keeps the diverged B, and moves B to boot 22 and C to boot 33. Above, B left the
+    // pin, so its removal alone emptied `diverged`, and C's and D's boots were the same in both
+    // configurations; neither clause was told apart from a rebuild that skipped it (tester
+    // probe p17, mutants A45a and A45b).
+    let mut tracker = both_caught_up();
+    tracker.on_divergence(COPY_B, T);
+    let mut pin = pin_with_b();
+    pin.members[1].boot = BootId(22);
+    pin.members[2].boot = BootId(33);
+    tracker.on_recovered(&recovery(10, d(10), pin), T);
+    assert!(
+        tracker.diverged().is_empty(),
+        "diverged clears for a copy the new configuration keeps"
+    );
+    for (copy, boot) in [(COPY_B, BootId(22)), (COPY_C, BootId(33))] {
+        let peer = tracker.peer(copy).expect("member");
+        assert_eq!(
+            (peer.boot, peer.progress),
+            (boot, ReplicaProgress::EMPTY),
+            "{copy:?}: boot from the new configuration"
+        );
+    }
+    // B is heard again, at its new boot, and only there.
+    let mut again = b(10, 10, 10);
+    (again.generation, again.owner_epoch, again.config_version) = (NEW_GEN, NEW_EPOCH, NEW_CONFIG);
+    dropped(&mut tracker, label(B), &again, AckRejectReason::StaleBoot);
+    again.boot = BootId(22);
+    let from = PeerLabel {
+        boot: BootId(22),
+        ..label(B)
+    };
+    assert_eq!(tracker.on_ack(&from, &again, T)[0], peer_progress(B, 10));
 }
 
 #[retcd_test]
 fn recovered_is_refused_when_this_copy_cannot_lead_the_selected_prefix() {
-    let mut tracker = both_caught_up();
-    let before = tracker.clone();
+    let before = both_caught_up();
     let mut demoted = pin_without_b();
     demoted.members[0].role = RegularSecondary;
     demoted.members[1].role = Primary;
@@ -1093,32 +1139,52 @@ fn recovered_is_refused_when_this_copy_cannot_lead_the_selected_prefix() {
     moved.members[0].node = NodeId(9);
     let mut elsewhere = pin_without_b();
     elsewhere.partition = PartitionId(9);
+    // Another partition's pin that would demote this node: still no retirement here.
+    let mut demoted_elsewhere = demoted.clone();
+    demoted_elsewhere.partition = PartitionId(9);
+    // The third field: whether the pin retires the primary (lead ruling B-R58a). A pin that
+    // names this node something other than the primary does; another partition's pin, or a
+    // cutoff this copy cannot lead from, does not.
     let cases = [
         (
             recovery(10, d(10), demoted),
             replica(ReplicaIgnoreReason::InvalidConfig),
+            true,
         ),
         (
             recovery(10, d(10), moved),
             replica(ReplicaIgnoreReason::InvalidConfig),
+            true,
         ),
         (
             recovery(10, d(10), elsewhere),
             replica(ReplicaIgnoreReason::InvalidConfig),
+            false,
         ),
-        (recovery(10, d(11), pin_without_b()), alert()),
+        (
+            recovery(10, d(10), demoted_elsewhere),
+            replica(ReplicaIgnoreReason::InvalidConfig),
+            false,
+        ),
+        (recovery(10, d(11), pin_without_b()), alert(), false),
         (
             recovery(4, d(4), pin_without_b()),
             replica(ReplicaIgnoreReason::BarrierNotDurable),
+            false,
         ),
         (
             recovery(13, d(13), pin_without_b()),
             replica(ReplicaIgnoreReason::BarrierNotDurable),
+            false,
         ),
     ];
-    for (result, answer) in cases {
+    for (result, answer, retires) in cases {
+        let mut tracker = before.clone();
         assert_eq!(tracker.on_recovered(&result, T), vec![answer]);
-        assert_eq!(tracker, before);
+        assert_eq!(tracker.retired(), retires);
+        // Retiring writes the flag and nothing else.
+        let unflagged = format!("{tracker:?}").replace("retired: true", "retired: false");
+        assert_eq!(unflagged, format!("{before:?}"));
     }
 }
 
@@ -2031,6 +2097,7 @@ fn raw_reply(from: PeerLabel, body: Bytes) -> EventKind {
             id: MessageId(42),
             protocol: ENVELOPE_VERSION,
             config: CONFIG,
+            sender: lineage(),
             body,
         },
     })
@@ -2093,6 +2160,23 @@ fn catching_up_b() -> Replication {
         Some(Seq(11))
     );
     module
+}
+
+/// B and C at the head through routing, with no cursor running.
+fn both_routed() -> Replication {
+    let mut module = routed();
+    for ack in [b(HEAD, HEAD, HEAD), c(HEAD, HEAD, HEAD)] {
+        route(&mut module, accepted(&ack));
+    }
+    module
+}
+
+fn caught_up(copy: CopyId, head: u64) -> EffectKind {
+    kernel(KernelEffect::CopyCaughtUp {
+        copy,
+        head: Seq(head),
+        digest: d(head),
+    })
 }
 
 /// B-R48 ruling 2: routing delivers a partition's events in order, and R1 relies on it. A
@@ -2160,6 +2244,46 @@ fn a_cursor_is_dropped_on_the_ack_that_reports_copy_caught_up() {
     );
     assert!(primary_side(&module).cursor(COPY_B).is_none());
     assert_eq!(*primary_side(&module).tracker(), reference);
+}
+
+/// The cursor chases the primary's moving head, not the anchor. B's ACKs for 13..=15 are lost
+/// while C keeps up; B asks from 12 when 16 lands, and 17 lands while B catches up. Every ACK
+/// sends the next record, `CopyCaughtUp` names 17, the head B actually reached, and B's later
+/// ACKs reach the tracker alone. Handed the anchor, the cursor would send nothing past 12
+/// (tester probe p02, mutant P14).
+#[retcd_test]
+fn m7b_152_a_copy_that_falls_behind_catches_up_to_the_head_that_moved_under_it() {
+    let mut module = both_routed();
+    for seq in HEAD + 1..=HEAD + 3 {
+        route(&mut module, local_applied_event(seq));
+        route(&mut module, accepted(&c(seq, seq, seq)));
+    }
+    route(&mut module, local_applied_event(HEAD + 4));
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix(HEAD))),
+        vec![send(COPY_B, HEAD + 1)]
+    );
+    for seq in HEAD + 1..HEAD + 5 {
+        if seq == HEAD + 3 {
+            route(&mut module, local_applied_event(HEAD + 5));
+        }
+        assert_eq!(
+            route(&mut module, accepted(&b(seq, seq, seq))),
+            vec![peer_progress(B, seq), send(COPY_B, seq + 1)],
+            "B's ACK at {seq}"
+        );
+    }
+    let top = HEAD + 5;
+    assert_eq!(
+        route(&mut module, accepted(&b(top, top, top))),
+        vec![peer_progress(B, top), caught_up(COPY_B, top)]
+    );
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    route(&mut module, local_applied_event(top + 1));
+    assert_eq!(
+        route(&mut module, accepted(&b(top + 1, top + 1, top + 1))),
+        vec![peer_progress(B, top + 1)]
+    );
 }
 
 /// B-R48 ruling 6: the cursor is dropped on any stop. The next non-ACK reply starts a fresh
@@ -2240,10 +2364,115 @@ fn recovered_drops_every_cursor_and_a_head_cut_reports_no_copy_caught_up() {
     assert!(primary_side(&module).cursor(COPY_B).is_none());
 }
 
+/// `Recovered` on a node that holds both halves of the partition answers the receiver's effects
+/// first, then the primary's. A leads P and also holds copy D as a secondary under a
+/// configuration B leads; the pin names A primary, so the receiver refuses it while the primary
+/// rebuilds. The routed vector is the receiver's answer followed by the primary's, each equal to
+/// what that half gives alone (tester probe p12, mutant RT16).
+#[retcd_test]
+fn m7b_151_recovered_answers_the_receiver_first_on_a_node_holding_both_halves() {
+    let result = recovery(10, d(10), pin_with_b());
+    let receiver = AppendReceiver::new(ReceiverInit {
+        config: config_with(
+            CONFIG,
+            vec![
+                member(COPY_B, B, Primary),
+                member(COPY_D, A, RegularSecondary),
+            ],
+        ),
+        own: COPY_D,
+        lineage: lineage(),
+        head: Head {
+            seq: Seq(10),
+            digest: d(10),
+        },
+        durable: DurableSeq(10),
+    })
+    .expect("a receiver on A");
+    let recovered = || EventKind::Kernel(KernelEvent::Recovered(Box::new(result.clone())));
+
+    // The half itself, not a module holding only it: routed alone, `Recovered` would also try to
+    // build A's primary (lead ruling B-R54), and this row compares halves.
+    let from_receiver = receiver.clone().on_recovered(&result);
+    assert_eq!(
+        from_receiver,
+        vec![replica(ReplicaIgnoreReason::InvalidConfig)]
+    );
+    let from_primary = route(&mut catching_up_b(), recovered());
+    assert_eq!(from_primary, tracker().on_recovered(&result, T));
+    assert!(!from_primary.is_empty() && from_primary != from_receiver);
+
+    let mut module = catching_up_b();
+    module.install_receiver(receiver);
+    let mut want = from_receiver;
+    want.extend(from_primary);
+    assert_eq!(route(&mut module, recovered()), want);
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+}
+
 /// Only an ACK the tracker admits reaches a running cursor. The cursor trusts what it is given,
-/// so a forged or diverged ACK must not move it.
+/// so a forged, diverged or otherwise dropped ACK must not move it.
+///
+/// First, seven ACKs from B's own label, which `sender()` passes and the ladder drops, each
+/// claiming the progress that would close B's gap: B is at 12, the head at 16, 13 in flight.
+/// Each is answered with its drop reason alone and leaves the primary as it was. Handed to the
+/// cursor, the first would report `CopyCaughtUp` for B at 16 (tester probe p16, mutant P07).
+/// Then a forged label and a forked digest, which `sender()` refuses as well.
 #[retcd_test]
 fn only_an_admitted_ack_reaches_a_running_cursor() {
+    let top = HEAD + 4;
+    let mut module = both_routed();
+    for seq in HEAD + 1..=top {
+        route(&mut module, local_applied_event(seq));
+    }
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix(HEAD))),
+        vec![send(COPY_B, HEAD + 1)]
+    );
+    let closing = |change: &Change| {
+        let mut ack = b(top, top, top);
+        change(&mut ack);
+        ack
+    };
+    for (ack, reason) in [
+        (
+            closing(&|ack| ack.generation = Generation(GEN.0 - 1)),
+            AckRejectReason::StaleGeneration,
+        ),
+        (
+            closing(&|ack| ack.owner_epoch = OwnerEpoch(EPOCH.0 - 1)),
+            AckRejectReason::StaleEpoch,
+        ),
+        (
+            closing(&|ack| ack.config_version = ConfigVersion(CONFIG.0 - 1)),
+            AckRejectReason::StaleConfig,
+        ),
+        (
+            closing(&|ack| ack.role = Shadow),
+            AckRejectReason::RoleMismatch,
+        ),
+        (
+            closing(&|ack| ack.boot = BootId(99)),
+            AckRejectReason::StaleBoot,
+        ),
+        (
+            closing(&move |ack| ack.progress = progress(top - 1, top, top - 1)),
+            AckRejectReason::InconsistentProgress,
+        ),
+        (
+            b(HEAD - 1, HEAD - 1, HEAD - 1),
+            AckRejectReason::RegressedProgress,
+        ),
+    ] {
+        let before = primary_side(&module).clone();
+        assert_eq!(
+            route(&mut module, accepted(&ack)),
+            vec![rejected(reason)],
+            "{reason:?}"
+        );
+        assert_eq!(*primary_side(&module), before, "{reason:?}");
+    }
+
     let mut module = catching_up_b();
     let running = primary_side(&module).cursor(COPY_B).cloned();
     assert_eq!(
@@ -2390,4 +2619,2063 @@ fn every_primary_input_reaches_the_tracker_as_if_driven_directly() {
             durable: flush(Generation(9), HEAD),
         }),
     ));
+}
+
+// --- cursor life cycle (lead ruling B-R48a) ------------------------------------------------
+
+fn config_event(config: PartitionConfig) -> EventKind {
+    EventKind::Kernel(KernelEvent::ConfigChanged(config))
+}
+
+fn barrier_event(config_version: ConfigVersion) -> EventKind {
+    EventKind::Kernel(KernelEvent::TransitionBarrierConfirmed {
+        config_version,
+        through_seq: Seq(HEAD),
+    })
+}
+
+/// `pin_with_b` one version later: B back after it was retired.
+fn re_adds_b() -> PartitionConfig {
+    let mut config = pin_with_b();
+    config.config_version = ConfigVersion(9);
+    config
+}
+
+/// Route B out of every predicate and back in, checking each control step against `reference`:
+/// pin `pin_without_b`, retire `CONFIG`, pin `re_adds_b`, retire `NEW_CONFIG`.
+fn retire_and_re_add_b(module: &mut Replication, reference: &mut ProgressTracker) {
+    assert_eq!(
+        route(module, config_event(pin_without_b())),
+        reference.on_config_changed(&pin_without_b(), T)
+    );
+    assert_eq!(
+        route(module, barrier_event(CONFIG)),
+        reference.on_transition_confirmed(CONFIG)
+    );
+    assert!(primary_side(module).tracker().peer(COPY_B).is_none());
+    assert_eq!(
+        route(module, config_event(re_adds_b())),
+        reference.on_config_changed(&re_adds_b(), T)
+    );
+    assert_eq!(
+        route(module, barrier_event(NEW_CONFIG)),
+        reference.on_transition_confirmed(NEW_CONFIG)
+    );
+}
+
+/// B-R48a F1 (reverses B-R48 Q2): `Busy` and `AlreadyHave` answer an envelope the copy was sent.
+/// With no catch-up running, that envelope was the stream's, so the reply starts no cursor.
+///
+/// The trace: B and C at the head; B answers `Busy` or `AlreadyHave`; 20 writes, with B's ACK
+/// for each arriving `lag` writes later; then the drain to the head. Every routed step answers
+/// exactly what the tracker answers when driven directly: no record is re-sent beside the
+/// stream, and no `CopyCaughtUp` is reported for a copy that was never behind. Before B-R48a the
+/// reply made a cursor; at lag 1 that re-sent 19 records and reported `CopyCaughtUp` on the
+/// drain (tester probe p04). The label is still checked first.
+#[retcd_test]
+fn a_busy_or_already_have_reply_starts_no_cursor_and_a_steady_copy_is_never_caught_up() {
+    let writes = 20;
+    for kick in [
+        AppendOutcome::Busy {
+            accepted_through: Seq(HEAD),
+        },
+        AppendOutcome::AlreadyHave,
+    ] {
+        // Lag 0 last: there the old cursor sent nothing and only added a `Recorded`.
+        for lag in [1, 2, 0] {
+            let mut module = routed();
+            let mut reference = tracker();
+            for ack in [b(HEAD, HEAD, HEAD), c(HEAD, HEAD, HEAD)] {
+                assert_eq!(
+                    route(&mut module, accepted(&ack)),
+                    deliver(&mut reference, &ack)
+                );
+            }
+            assert_eq!(
+                route(&mut module, reply(B, &kick)),
+                vec![replica(ReplicaIgnoreReason::NothingOutstanding)],
+                "{kick:?}"
+            );
+            assert!(primary_side(&module).cursor(COPY_B).is_none(), "{kick:?}");
+
+            let mut acks = (HEAD + 1..=HEAD + writes).map(|at| b(at, at, at));
+            for seq in HEAD + 1..=HEAD + writes {
+                assert_eq!(
+                    route(&mut module, local_applied_event(seq)),
+                    reference.on_local_applied(Seq(seq), d(seq))
+                );
+                if seq > HEAD + lag {
+                    let ack = acks.next().expect("one ACK per write");
+                    assert_eq!(
+                        route(&mut module, accepted(&ack)),
+                        deliver(&mut reference, &ack),
+                        "{kick:?} lag {lag}: B's ACK at {}",
+                        ack.progress.received.0
+                    );
+                }
+            }
+            for ack in acks {
+                assert_eq!(
+                    route(&mut module, accepted(&ack)),
+                    deliver(&mut reference, &ack),
+                    "{kick:?} lag {lag}: drain at {}",
+                    ack.progress.received.0
+                );
+            }
+            assert!(primary_side(&module).cursor(COPY_B).is_none(), "{kick:?}");
+            assert_eq!(*primary_side(&module).tracker(), reference, "{kick:?}");
+        }
+        let mut module = routed();
+        assert_eq!(
+            route(&mut module, reply_from(label(NodeId(9)), &kick)),
+            vec![rejected(AckRejectReason::NotAMember)],
+            "{kick:?}"
+        );
+    }
+}
+
+/// B-R48a F1, the other half: `Busy` and `AlreadyHave` still update a cursor that is running.
+/// The trace: B asks for 11, answers `Busy` or `AlreadyHave`, then ACKs 11. The reply clears
+/// what is in flight and keeps the cursor; the ACK sends the next record.
+#[retcd_test]
+fn a_busy_or_already_have_reply_still_moves_a_running_cursor() {
+    for kick in [
+        AppendOutcome::Busy {
+            accepted_through: Seq(10),
+        },
+        AppendOutcome::AlreadyHave,
+    ] {
+        let mut module = catching_up_b();
+        assert_eq!(
+            route(&mut module, reply(B, &kick)),
+            vec![replica(ReplicaIgnoreReason::Recorded)],
+            "{kick:?}"
+        );
+        let running = primary_side(&module).cursor(COPY_B).expect("still running");
+        assert_eq!(running.outstanding(), None, "{kick:?}");
+
+        let mut reference = tracker();
+        let ack = b(11, 11, 10);
+        let mut want = deliver(&mut reference, &ack);
+        want.push(send(COPY_B, HEAD));
+        assert_eq!(route(&mut module, accepted(&ack)), want, "{kick:?}");
+    }
+}
+
+/// M7B-149 (B-R48a F2, ruling B-R48b Q1): a copy's cursor goes when the copy leaves every active
+/// predicate, and a re-added copy starts a fresh one.
+///
+/// The trace: B's cursor has answered three probes and C's cursor has 11 in flight. Pinning a
+/// configuration without B keeps B's cursor, because the retiring predicate still names B. The
+/// barrier retires it: B leaves every predicate and its cursor goes; C's stays. B's replies are
+/// then `NotAMember`. B is re-added one version later, and its probes get the full
+/// `MAX_PROBE_ROUNDS` answers before the snapshot request, as on a fresh primary. B's ACK at the
+/// head is then tracker progress, and the fresh cursor, which sent no record, only records it:
+/// no `CopyCaughtUp` from the catch-up the old cursor started. Before B-R48a the old cursor
+/// lived on, and the re-added copy got one answer (tester probe p06).
+#[retcd_test]
+fn m7b_149_a_retired_copy_loses_its_cursor_and_a_re_added_copy_starts_fresh() {
+    let probe = AppendOutcome::ProbeDigestAt { seq: Seq(8) };
+    let mut module = catching_up_b();
+    let mut reference = tracker();
+    for _ in 0..3 {
+        assert_eq!(route(&mut module, reply(B, &probe)), vec![send(COPY_B, 8)]);
+    }
+    assert_eq!(
+        route(&mut module, reply(C, &need_prefix(10))),
+        vec![send(COPY_C, 11)]
+    );
+
+    assert_eq!(
+        route(&mut module, config_event(pin_without_b())),
+        reference.on_config_changed(&pin_without_b(), T)
+    );
+    assert_eq!(
+        primary_side(&module)
+            .cursor(COPY_B)
+            .map(CatchupCursor::probe_rounds),
+        Some(3),
+        "the retiring predicate still names B"
+    );
+
+    assert_eq!(
+        route(&mut module, barrier_event(CONFIG)),
+        reference.on_transition_confirmed(CONFIG)
+    );
+    assert!(primary_side(&module).tracker().peer(COPY_B).is_none());
+    assert!(primary_side(&module).cursor(COPY_B).is_none(), "B left");
+    assert_eq!(
+        primary_side(&module)
+            .cursor(COPY_C)
+            .and_then(CatchupCursor::outstanding),
+        Some(Seq(11)),
+        "C is still a member"
+    );
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix(10))),
+        vec![rejected(AckRejectReason::NotAMember)]
+    );
+
+    assert_eq!(
+        route(&mut module, config_event(re_adds_b())),
+        reference.on_config_changed(&re_adds_b(), T)
+    );
+    assert_eq!(
+        route(&mut module, barrier_event(NEW_CONFIG)),
+        reference.on_transition_confirmed(NEW_CONFIG)
+    );
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    for round in 1..=MAX_PROBE_ROUNDS {
+        assert_eq!(
+            route(&mut module, reply(B, &probe)),
+            vec![send(COPY_B, 8)],
+            "probe {round}"
+        );
+    }
+    assert_eq!(
+        route(&mut module, reply(B, &probe)),
+        vec![kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: COPY_B,
+            barrier: Seq(HEAD),
+        })]
+    );
+
+    let mut at_head = b(HEAD, HEAD, HEAD);
+    at_head.config_version = re_adds_b().config_version;
+    let mut want = deliver(&mut reference, &at_head);
+    assert_eq!(want[0], peer_progress(B, HEAD), "the tracker admits it");
+    want.push(replica(ReplicaIgnoreReason::Recorded));
+    assert_eq!(route(&mut module, accepted(&at_head)), want);
+    assert_eq!(*primary_side(&module).tracker(), reference);
+}
+
+/// B-R48a F2: the catch-up a retired copy's cursor started does not finish on the re-added
+/// copy. The trace: B's cursor has 11 in flight, B is retired and re-added, and B's first ACK
+/// under the new configuration is at the head. That ACK is tracker progress only. Before B-R48a
+/// the old cursor took it and reported `CopyCaughtUp` for a catch-up no live cursor ran
+/// (tester probe p06).
+#[retcd_test]
+fn a_re_added_copy_is_not_reported_caught_up_by_the_cursor_it_left_behind() {
+    let mut module = catching_up_b();
+    let mut reference = tracker();
+    retire_and_re_add_b(&mut module, &mut reference);
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+
+    let mut at_head = b(HEAD, HEAD, HEAD);
+    at_head.config_version = re_adds_b().config_version;
+    let want = deliver(&mut reference, &at_head);
+    assert_eq!(want[0], peer_progress(B, HEAD), "the tracker admits it");
+    assert_eq!(route(&mut module, accepted(&at_head)), want);
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    assert_eq!(*primary_side(&module).tracker(), reference);
+}
+
+/// M7B-150 (ruling B-R48b Q2): a copy control announces at a new boot has restarted. Its
+/// `CopyProgress` is fresh, and the cursor its old incarnation ran goes with it.
+///
+/// The trace: B proved 10, asked from 10 (11 in flight) and has had three probes answered.
+/// `ConfigChanged` re-announces B, still a member, at boot 22. B's next probe starts a new
+/// cursor at one round, and B's ACK at the head is tracker progress that the new cursor, which
+/// sent no record, only records: no `CopyCaughtUp` on the old incarnation's catch-up. The
+/// near-miss twin re-announces B at its own boot: the cursor is kept, the probe is its fourth,
+/// and the same ACK closes the catch-up it started.
+///
+/// Widened by ruling B-R51c (tester probes p18–p20, hand mutants H4–H6):
+/// (a) B moved to node 9 at the same boot is a restart too: fresh, cursor gone, and a probe
+/// from node 9 starts a new cursor at one round;
+/// (b) a refused `ConfigChanged` announcing B at boot 22 (stale version, `min_regular_acks` 0,
+/// a pin demoting A) answers `InvalidConfig` and leaves the primary byte-equal, cursor included;
+/// (c) with C's cursor running (11 in flight), B's restart drops B's cursor only; when B and C
+/// both restart, both go.
+#[retcd_test]
+fn m7b_150_a_copy_restarted_by_control_drops_its_old_cursor() {
+    let probe = AppendOutcome::ProbeDigestAt { seq: Seq(8) };
+    for (boot, restarted) in [(BootId(22), true), (BootId(2), false)] {
+        let from = PeerLabel { boot, ..label(B) };
+        let (mut module, mut reference) = b_mid_probe();
+
+        let announced = reannounced(NEW_CONFIG, boot);
+        assert_eq!(
+            route(&mut module, config_event(announced.clone())),
+            reference.on_config_changed(&announced, T),
+            "{boot:?}"
+        );
+        let peer = *primary_side(&module).tracker().peer(COPY_B).expect("B");
+        let kept = if restarted {
+            ReplicaProgress::EMPTY
+        } else {
+            progress(10, 10, 10)
+        };
+        assert_eq!((peer.boot, peer.progress), (boot, kept), "{boot:?}");
+        assert_eq!(
+            primary_side(&module).cursor(COPY_B).is_none(),
+            restarted,
+            "{boot:?}"
+        );
+
+        assert_eq!(
+            route(&mut module, reply_from(from, &probe)),
+            vec![send(COPY_B, 8)],
+            "{boot:?}"
+        );
+        let rounds = if restarted { 1 } else { 4 };
+        assert_eq!(
+            primary_side(&module)
+                .cursor(COPY_B)
+                .map(CatchupCursor::probe_rounds),
+            Some(rounds),
+            "{boot:?}"
+        );
+
+        let mut at_head = b(HEAD, HEAD, HEAD);
+        (at_head.config_version, at_head.boot) = (NEW_CONFIG, boot);
+        let mut want = reference.on_ack(&from, &at_head, T);
+        assert_eq!(
+            want[0],
+            peer_progress(B, HEAD),
+            "{boot:?}: the tracker admits it"
+        );
+        want.push(if restarted {
+            replica(ReplicaIgnoreReason::Recorded)
+        } else {
+            caught_up(COPY_B, HEAD)
+        });
+        assert_eq!(
+            route(
+                &mut module,
+                reply_from(from, &AppendOutcome::Accepted(at_head))
+            ),
+            want,
+            "{boot:?}"
+        );
+        assert_eq!(*primary_side(&module).tracker(), reference, "{boot:?}");
+    }
+
+    // (a) A new node at the same boot.
+    let moved_to = NodeId(9);
+    let (mut module, mut reference) = b_mid_probe();
+    let mut moved = config();
+    moved.config_version = NEW_CONFIG;
+    moved.members[1].node = moved_to;
+    assert_eq!(
+        route(&mut module, config_event(moved.clone())),
+        reference.on_config_changed(&moved, T)
+    );
+    let peer = *primary_side(&module).tracker().peer(COPY_B).expect("B");
+    assert_eq!(
+        (peer.node, peer.boot, peer.progress),
+        (moved_to, BootId(2), ReplicaProgress::EMPTY)
+    );
+    assert!(
+        primary_side(&module).cursor(COPY_B).is_none(),
+        "B moved node at the same boot: its old cursor goes"
+    );
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix(10))),
+        vec![rejected(AckRejectReason::NotAMember)],
+        "the old node is no longer B"
+    );
+    let from = PeerLabel {
+        node: moved_to,
+        ..label(B)
+    };
+    assert_eq!(
+        route(&mut module, reply_from(from, &probe)),
+        vec![send(COPY_B, 8)]
+    );
+    assert_eq!(
+        primary_side(&module)
+            .cursor(COPY_B)
+            .map(CatchupCursor::probe_rounds),
+        Some(1)
+    );
+
+    // (b) A refused configuration announcing a new boot drops nothing.
+    let mut stale = config();
+    stale.members[1].boot = BootId(22);
+    let mut zero = stale.clone();
+    zero.config_version = NEW_CONFIG;
+    zero.min_regular_acks = 0;
+    let mut demoted = zero.clone();
+    demoted.min_regular_acks = 1;
+    demoted.members[0].role = RegularSecondary;
+    demoted.members[2].role = Primary;
+    for (name, refused) in [("stale", stale), ("zero", zero), ("demoted", demoted)] {
+        let (mut module, _) = b_mid_probe();
+        let before = primary_side(&module).clone();
+        assert_eq!(
+            route(&mut module, config_event(refused)),
+            vec![replica(ReplicaIgnoreReason::InvalidConfig)],
+            "{name}"
+        );
+        assert_eq!(*primary_side(&module), before, "{name}: cursor kept");
+    }
+
+    // (c) One copy's restart drops that copy's cursor only.
+    for c_restarts in [false, true] {
+        let (mut module, _) = b_mid_probe();
+        assert_eq!(
+            route(&mut module, reply(C, &need_prefix(10))),
+            vec![send(COPY_C, 11)]
+        );
+        let mut announced = reannounced(NEW_CONFIG, BootId(22));
+        if c_restarts {
+            announced.members[2].boot = BootId(33);
+        }
+        route(&mut module, config_event(announced));
+        assert!(
+            primary_side(&module).cursor(COPY_B).is_none(),
+            "C restarts: {c_restarts}"
+        );
+        assert_eq!(
+            primary_side(&module)
+                .cursor(COPY_C)
+                .and_then(CatchupCursor::outstanding),
+            if c_restarts { None } else { Some(Seq(11)) },
+            "C restarts: {c_restarts}"
+        );
+    }
+}
+
+/// M7B-150's start: B proved 10, asked from 10 (11 in flight), and has had three probes
+/// answered. Returns the module and the tracker driven directly to the same state.
+fn b_mid_probe() -> (Replication, ProgressTracker) {
+    let mut module = routed();
+    let mut reference = tracker();
+    let proved = b(10, 10, 10);
+    assert_eq!(
+        route(&mut module, accepted(&proved)),
+        deliver(&mut reference, &proved)
+    );
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix(10))),
+        vec![send(COPY_B, 11)]
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            route(
+                &mut module,
+                reply(B, &AppendOutcome::ProbeDigestAt { seq: Seq(8) })
+            ),
+            vec![send(COPY_B, 8)]
+        );
+    }
+    (module, reference)
+}
+
+// --- A1's view on the primary (design §2.2, lead ruling B-R53) -------------------------------
+
+/// A1's view of `P` in `generation`, published at `seq`, pinning `epoch` and `config`.
+fn view_of(
+    seq: u64,
+    generation: Generation,
+    epoch: OwnerEpoch,
+    config: ConfigVersion,
+) -> AuthorityView {
+    AuthorityView {
+        lineage: Lineage {
+            partition: P,
+            generation,
+            owner_epoch: epoch,
+        },
+        grant_id: GrantId(2),
+        boot_id: BootId(1),
+        authority_generation: AuthorityGeneration(1),
+        config_version: config,
+        authority_seq: seq,
+        valid_through_tick: Tick(u64::MAX),
+        past_horizon: DenyReason::NoGrant,
+    }
+}
+
+fn view_event(view: AuthorityView) -> EventKind {
+    EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::View(view)))
+}
+
+/// A view in the golden generation.
+fn view(seq: u64, epoch: OwnerEpoch, config: ConfigVersion) -> EventKind {
+    view_event(view_of(seq, GEN, epoch, config))
+}
+
+/// `(owner_epoch, config_version, authority_seq)` as A's tracker holds them.
+fn tracker_pin(module: &Replication) -> (OwnerEpoch, ConfigVersion, u64) {
+    let tracker = primary_side(module).tracker();
+    (
+        tracker.lineage().owner_epoch,
+        tracker.config().config_version,
+        tracker.authority_seq(),
+    )
+}
+
+/// The primary installs a newer epoch from A1's view, and **only** the epoch and the seq: the
+/// configuration version is a gate on the tracker, never written (lead ruling B-R53), because
+/// its version is the newest predicate's and only `ConfigChanged` pushes one.
+///
+/// The view (seq 1, epoch 6, config 8) is `Recorded`; the tracker is at epoch 6 and still
+/// config 7 with one predicate. B's ACK at epoch 5 is now `StaleEpoch`, and at epoch 6 is
+/// admitted. The `ConfigChanged` to 8 that follows is still taken, not refused as stale, and
+/// its incarnation reset still runs (M7B-150): B, re-announced at a new boot, is fresh. The
+/// same view again is `OutOfOrder`, and so is a newer one that names config 7 now that the
+/// tracker pins 8: the gate reads the version `ConfigChanged` wrote. Neither changes anything.
+/// A view touches no cursor: B's catch-up runs through one unchanged.
+#[retcd_test]
+fn m7b_161_a_newer_view_moves_the_primarys_epoch_and_never_its_config() {
+    let mut module = routed();
+    assert_eq!(
+        route(&mut module, view(1, NEW_EPOCH, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(tracker_pin(&module), (NEW_EPOCH, CONFIG, 1));
+    assert_eq!(primary_side(&module).tracker().predicates(), &[config()]);
+
+    let old = b(HEAD, HEAD, HEAD);
+    let before = module.clone();
+    assert_eq!(
+        route(&mut module, accepted(&old)),
+        vec![rejected(AckRejectReason::StaleEpoch)]
+    );
+    assert_eq!(module, before, "a dropped ACK changes nothing");
+    let new = AppendAck {
+        owner_epoch: NEW_EPOCH,
+        ..old
+    };
+    assert_eq!(
+        route(&mut module, accepted(&new)).first(),
+        Some(&peer_progress(B, HEAD))
+    );
+
+    let restarted = BootId(9);
+    let answer = route(
+        &mut module,
+        config_event(reannounced(NEW_CONFIG, restarted)),
+    );
+    assert_ne!(answer, vec![replica(ReplicaIgnoreReason::InvalidConfig)]);
+    let tracker = primary_side(&module).tracker();
+    assert_eq!(tracker.config().config_version, NEW_CONFIG);
+    let peer = tracker.peer(COPY_B).expect("B is still a member");
+    assert_eq!(
+        (peer.boot, peer.progress),
+        (restarted, ReplicaProgress::EMPTY)
+    );
+
+    let before = module.clone();
+    for (stale, case) in [
+        (view(1, NEW_EPOCH, NEW_CONFIG), "the same seq again"),
+        (view(2, OwnerEpoch(7), CONFIG), "a newer seq below config 8"),
+    ] {
+        assert_eq!(
+            route(&mut module, stale),
+            vec![replica(ReplicaIgnoreReason::OutOfOrder)],
+            "{case}"
+        );
+        assert_eq!(module, before, "{case}: a refused view changes nothing");
+    }
+
+    // A view touches no cursor (tester probe q08): B's catch-up runs through it unchanged.
+    let mut module = catching_up_b();
+    let cursor = primary_side(&module).cursor(COPY_B).cloned();
+    assert_eq!(
+        route(&mut module, view(1, NEW_EPOCH, CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(primary_side(&module).cursor(COPY_B).cloned(), cursor);
+}
+
+/// R1 is a named consumer of A1's view, so it **answers** one for a partition it holds nothing
+/// for, `NotRequired`, where it would decline any other event (lead ruling B-R53). A decline
+/// there would stop the run (B-R28). On a node holding both halves, the receiver answers first.
+///
+/// 1. Nothing installed: `NotRequired`, and the module is unchanged. `LocalApplied` on the same
+///    empty module is still declined, so the answer is the view's alone.
+/// 2. A primary on A, the view on B, where nothing is installed: `NotRequired`, A untouched.
+/// 3. Both halves on A. The receiver (copy D, pinned at config 8) refuses a view at config 7 as
+///    `OutOfOrder`; the tracker (config 7) installs it. The answer is exactly
+///    `[OutOfOrder, Recorded]`, in that order.
+#[retcd_test]
+fn m7b_162_a_view_is_answered_where_nothing_is_installed_and_receiver_first_where_both_are() {
+    let answered = |module: &mut Replication, node: NodeId, kind: EventKind| {
+        let before = module.clone();
+        let effects = step_on(module, node, kind).expect("a view is answered, never declined");
+        assert_eq!(
+            *module, before,
+            "an answered view with no copy changes nothing"
+        );
+        effects
+            .into_iter()
+            .map(|effect| effect.kind)
+            .collect::<Vec<_>>()
+    };
+
+    let mut empty = Replication::new();
+    assert_eq!(
+        answered(&mut empty, A, view(1, NEW_EPOCH, CONFIG)),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert!(matches!(
+        step_on(&mut empty, A, local_applied_event(HEAD + 1)),
+        Err(RdbError::Unavailable { .. })
+    ));
+
+    let mut primary_only = routed();
+    assert_eq!(
+        answered(&mut primary_only, B, view(1, NEW_EPOCH, CONFIG)),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+
+    let receiver = AppendReceiver::new(ReceiverInit {
+        config: config_with(
+            NEW_CONFIG,
+            vec![
+                member(COPY_B, B, Primary),
+                member(COPY_D, A, RegularSecondary),
+            ],
+        ),
+        own: COPY_D,
+        lineage: lineage(),
+        head: Head {
+            seq: Seq(10),
+            digest: d(10),
+        },
+        durable: DurableSeq(10),
+    })
+    .expect("a receiver on A");
+    let mut both = routed();
+    both.install_receiver(receiver.clone());
+    assert_eq!(
+        route(&mut both, view(1, NEW_EPOCH, CONFIG)),
+        vec![
+            replica(ReplicaIgnoreReason::OutOfOrder),
+            replica(ReplicaIgnoreReason::Recorded),
+        ]
+    );
+    assert_eq!(both.receiver(A, P), Some(&receiver));
+    assert_eq!(tracker_pin(&both), (NEW_EPOCH, CONFIG, 1));
+}
+
+/// `Recovered` and `View` make one write (lead ruling B-R53: one `adopt_view`), so the
+/// recovered view's `authority_seq` is the floor the next view must beat, on both halves.
+///
+/// The committed root's view is seq 1. After the rebuild, a view at seq 1 with a higher epoch is
+/// `OutOfOrder` on the tracker and on B's receiver alike, and changes neither; seq 2 installs
+/// on both. The pin wins over the view's version: a committed view naming config 9 over a pin
+/// at 8 leaves the receiver at 8, and the rebuilt primary's only predicate is the pin.
+#[retcd_test]
+fn m7b_163_the_recovered_view_is_the_floor_the_next_view_must_beat() {
+    let result = recovery(10, d(10), pin_with_b());
+    let higher = OwnerEpoch(7);
+
+    let mut tracker = both_caught_up();
+    tracker.on_recovered(&result, T);
+    assert_eq!(
+        (tracker.lineage().owner_epoch, tracker.authority_seq()),
+        (NEW_EPOCH, 1)
+    );
+    let before = tracker.clone();
+    assert_eq!(
+        tracker.on_view(&view_of(1, NEW_GEN, higher, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::OutOfOrder)]
+    );
+    assert_eq!(tracker, before);
+    assert_eq!(
+        tracker.on_view(&view_of(2, NEW_GEN, higher, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        (tracker.lineage().owner_epoch, tracker.authority_seq()),
+        (higher, 2)
+    );
+
+    let mut receiver = AppendReceiver::new(ReceiverInit {
+        config: config(),
+        own: COPY_B,
+        lineage: lineage(),
+        head: Head {
+            seq: Seq(10),
+            digest: d(10),
+        },
+        durable: DurableSeq(10),
+    })
+    .expect("B's receiver");
+    receiver.on_recovered(&result);
+    assert_eq!(
+        (
+            receiver.lineage().generation,
+            receiver.lineage().owner_epoch,
+            receiver.authority_seq()
+        ),
+        (NEW_GEN, NEW_EPOCH, 1)
+    );
+    let before = receiver.clone();
+    assert_eq!(
+        receiver.on_view(&view_of(1, NEW_GEN, higher, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::OutOfOrder)]
+    );
+    assert_eq!(receiver, before);
+    assert_eq!(
+        receiver.on_view(&view_of(2, NEW_GEN, higher, NEW_CONFIG)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        (receiver.lineage().owner_epoch, receiver.authority_seq()),
+        (higher, 2)
+    );
+
+    // The pin wins over the view's version (tester probe q07): a committed view naming config
+    // 9 over a pin at 8 still leaves the receiver at the pin, version included.
+    let mut ahead = result.clone();
+    ahead.committed.authority_view.config_version = ConfigVersion(9);
+    let mut pinned = before;
+    pinned.on_recovered(&ahead);
+    assert_eq!(pinned.config(), &pin_with_b());
+
+    // The tracker half of q07: the rebuilt primary's only predicate is the pin, version included.
+    let mut rebuilt = both_caught_up();
+    rebuilt.on_recovered(&ahead, T);
+    assert_eq!(rebuilt.predicates(), &[pin_with_b()][..]);
+}
+
+// --- Recovered builds R1's side (lead ruling B-R54) --------------------------------------------
+
+/// `result` with a barrier over `copies`, each proved durable at the cutoff.
+fn requiring(mut result: RecoveryResult, copies: &[CopyId]) -> RecoveryResult {
+    let (cutoff, digest) = (result.selected.cutoff_seq, result.selected.cutoff_digest);
+    let proofs: Vec<DurableProof> = copies
+        .iter()
+        .map(|&copy| DurableProof {
+            copy,
+            partition: P,
+            seq: DurableSeq(cutoff.0),
+            digest,
+        })
+        .collect();
+    let required = copies.iter().copied().collect();
+    result.barrier = RecoveryBarrier::try_new(&proofs, &required, cutoff, digest)
+        .expect("every required copy proved");
+    result
+}
+
+fn recovered_event(result: &RecoveryResult) -> EventKind {
+    EventKind::Kernel(KernelEvent::Recovered(Box::new(result.clone())))
+}
+
+/// M7B-164. Nothing is installed on A, and F1's result pins A primary with a barrier that names
+/// A. `Recovered` builds A's primary: exactly the tracker an installed one seeded at the proved
+/// cutoff — ladder `{0: ROOT, 10: d10}`, the genesis rung included (lead ruling B-R58b), and
+/// received, applied and durable 10 — becomes through the same rebuild, so it answers the same
+/// effects and ends equal, and it holds the recovered view's epoch and `authority_seq`. No
+/// receiver is built beside it.
+///
+/// Near-misses: a barrier that does not name A builds nothing and answers `BarrierNotDurable`; a
+/// node the pin does not name builds nothing and answers `NotRequired`; and a node that still
+/// holds a receiver from the old pin keeps it fenced — it answers `InvalidConfig` and is retired
+/// under the new generation (lead ruling B-R58a, F4) — while the primary is built beside it. A
+/// barrier that names A over a pin that does not validate answers `InvalidConfig`, not
+/// `BarrierNotDurable`, and builds nothing (F3).
+#[retcd_test]
+fn m7b_164_recovered_builds_the_primary_on_the_node_the_pin_names_primary() {
+    let result = requiring(recovery(10, d(10), pin_with_b()), &[COPY_A, COPY_B]);
+    let seed = || {
+        let mut history = DigestLadder::new();
+        history.insert(Seq::ZERO, Digest::ROOT);
+        history.insert(Seq(10), d(10));
+        ProgressTracker::new(TrackerInit {
+            config: pin_with_b(),
+            own: COPY_A,
+            lineage: Lineage {
+                partition: P,
+                generation: NEW_GEN,
+                owner_epoch: NEW_EPOCH,
+            },
+            history,
+            local: progress(10, 10, 10),
+        })
+        .expect("the proved seed")
+    };
+    let mut reference = Replication::new();
+    reference.install_primary(seed());
+    let want = route(&mut reference, recovered_event(&result));
+
+    let mut module = Replication::new();
+    assert_eq!(route(&mut module, recovered_event(&result)), want);
+    assert_eq!(module, reference);
+    let built = primary_side(&module).tracker();
+    assert_eq!(
+        (built.lineage(), built.authority_seq(), built.own()),
+        (
+            Lineage {
+                partition: P,
+                generation: NEW_GEN,
+                owner_epoch: NEW_EPOCH
+            },
+            1,
+            COPY_A
+        )
+    );
+    assert_eq!(built.config(), &pin_with_b());
+    assert_eq!(
+        built.peer(COPY_A).expect("A").progress,
+        progress(10, 10, 10)
+    );
+    assert_eq!(built.history().lookup(Seq(10), d(10)), DigestLookup::Match);
+    assert_eq!(built.head(), Seq(10));
+    assert!(module.receiver(A, P).is_none());
+
+    // The barrier names B only: nothing proves A holds the cutoff it would lead from.
+    let unproved = requiring(recovery(10, d(10), pin_with_b()), &[COPY_B]);
+    let mut empty = Replication::new();
+    assert_eq!(
+        route(&mut empty, recovered_event(&unproved)),
+        vec![replica(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(empty, Replication::new());
+
+    // D is not in the pin.
+    let answered = step_on(&mut empty, D, recovered_event(&result)).expect("answered");
+    assert_eq!(
+        answered
+            .into_iter()
+            .map(|effect| effect.kind)
+            .collect::<Vec<_>>(),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+    assert_eq!(empty, Replication::new());
+
+    // F3 (lead ruling B-R58): the barrier names A, but the pin does not validate. That is the
+    // pin's fault, not the barrier's, so it is `InvalidConfig`, the answer `ConfigChanged`
+    // gives the same pin, and nothing is built.
+    let mut invalid = pin_with_b();
+    invalid.min_regular_acks = 0;
+    let unpinnable = requiring(recovery(10, d(10), invalid), &[COPY_A, COPY_B]);
+    assert_eq!(
+        route(&mut empty, recovered_event(&unpinnable)),
+        vec![replica(ReplicaIgnoreReason::InvalidConfig)]
+    );
+    assert_eq!(empty, Replication::new());
+
+    // A still holds copy D's receiver from a pin B led.
+    let stale = AppendReceiver::new(ReceiverInit {
+        config: config_with(
+            CONFIG,
+            vec![
+                member(COPY_B, B, Primary),
+                member(COPY_D, A, RegularSecondary),
+            ],
+        ),
+        own: COPY_D,
+        lineage: lineage(),
+        head: Head {
+            seq: Seq(10),
+            digest: d(10),
+        },
+        durable: DurableSeq(10),
+    })
+    .expect("a receiver on A");
+    let mut swapped = Replication::new();
+    swapped.install_receiver(stale.clone());
+    let mut expected = vec![replica(ReplicaIgnoreReason::InvalidConfig)];
+    expected.extend(want);
+    assert_eq!(route(&mut swapped, recovered_event(&result)), expected);
+    let mut fenced = stale.clone();
+    fenced.on_recovered(&result);
+    assert!(fenced.retired());
+    assert_eq!(swapped.receiver(A, P), Some(&fenced));
+    assert_eq!(swapped.primary(A, P), reference.primary(A, P));
+
+    // The pin's primary in slot 2, on C: nothing ties the primary to copy 0. `TrackerInit`
+    // requires only that `own` is the pin's `Primary` member.
+    let slot_two = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, RegularSecondary),
+            member(COPY_B, B, RegularSecondary),
+            member(COPY_C, C, Primary),
+        ],
+    );
+    let result = requiring(recovery(10, d(10), slot_two.clone()), &[COPY_A, COPY_C]);
+    let mut module = Replication::new();
+    let effects = step_on(&mut module, C, recovered_event(&result)).expect("answered");
+    assert!(!effects.is_empty());
+    let built = module.primary(C, P).expect("C's primary").tracker();
+    assert_eq!(
+        (built.own(), built.node(), built.config(), built.head()),
+        (COPY_C, C, &slot_two, Seq(10))
+    );
+    assert_eq!(
+        built.peer(COPY_C).expect("C").progress,
+        progress(10, 10, 10)
+    );
+}
+
+// --- B-R58b/c and the retired primary --------------------------------------------------------
+
+/// A module where `Recovered` at `cutoff` built A's primary, the barrier naming A and C: B holds
+/// nothing the barrier proved.
+fn built_at(cutoff: u64) -> Replication {
+    let result = requiring(recovery(cutoff, d(cutoff), pin_with_b()), &[COPY_A, COPY_C]);
+    let mut module = Replication::new();
+    route(&mut module, recovered_event(&result));
+    module
+}
+
+/// `NeedPrefix` from a copy at `have` claiming `head_digest` there.
+fn need_prefix_at(have: u64, head_digest: Digest) -> AppendOutcome {
+    AppendOutcome::Rejected(AppendReject::NeedPrefix {
+        have: Seq(have),
+        head_digest,
+    })
+}
+
+/// `ack` restamped in the recovered lineage and pin.
+fn in_new_root(mut ack: AppendAck) -> AppendAck {
+    (ack.generation, ack.owner_epoch, ack.config_version) = (NEW_GEN, NEW_EPOCH, NEW_CONFIG);
+    ack
+}
+
+/// M7B-171 (lead ruling B-R58b). A primary `Recovered` built holds the genesis rung `(0, ROOT)`
+/// beside the cutoff, so a copy that holds nothing is walked from record 1 instead of being
+/// sent to a snapshot the simulation refuses. The rung changes no other lookup: a copy at 5
+/// with a digest the ladder has no rung for still gets the snapshot request, and a copy at 0
+/// that claims anything other than `ROOT` there has diverged — true divergence, since every
+/// lineage starts at `ROOT`.
+#[retcd_test]
+fn m7b_171_a_built_primary_walks_a_copy_that_holds_nothing_from_record_one() {
+    let mut module = built_at(10);
+    assert_eq!(
+        primary_side(&module)
+            .tracker()
+            .history()
+            .lookup(Seq::ZERO, Digest::ROOT),
+        DigestLookup::Match
+    );
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT))),
+        vec![send(COPY_B, 1)]
+    );
+    assert_eq!(
+        primary_side(&module)
+            .cursor(COPY_B)
+            .expect("running")
+            .outstanding(),
+        Some(Seq(1))
+    );
+
+    // Near-miss: no rung at 5, so it is truncation, never divergence (K-B-17).
+    let mut module = built_at(10);
+    assert_eq!(
+        route(
+            &mut module,
+            reply(B, &need_prefix_at(5, forked(b(5, 5, 5)).digest_at_buffered))
+        ),
+        vec![kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: COPY_B,
+            barrier: Seq(10),
+        })]
+    );
+
+    // A copy at 0 that is not at `ROOT` is on another history.
+    let mut module = built_at(10);
+    let effects = route(&mut module, reply(B, &need_prefix_at(0, d(0))));
+    assert_eq!(
+        effects[0],
+        kernel(KernelEffect::DivergenceDetected { copy: COPY_B })
+    );
+    assert!(primary_side(&module)
+        .cursor(COPY_B)
+        .is_none_or(|cursor| cursor.stopped().is_some()));
+}
+
+/// The pin the r03 swap installs: C leads, A and B are regular.
+fn pin_c_leads() -> PartitionConfig {
+    config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, RegularSecondary),
+            member(COPY_B, B, RegularSecondary),
+            member(COPY_C, C, Primary),
+        ],
+    )
+}
+
+/// M7B-172 (lead ruling on the kept primary: fence it). After the r03 swap A holds a receiver for
+/// the new pin and its old primary for generation 3. That primary is retired: an ACK its old
+/// lineage would admit and a `LocalApplied` it would record reach nothing — each is declined as
+/// if no primary were installed, and nothing changes — and a view is answered by the receiver
+/// alone. `Flushed` naming its old prefix finds no one either.
+///
+/// Near-miss: a later `Recovered` that pins A primary over a cutoff A holds clears `retired`; the
+/// rebuilt primary is exactly the one an unretired tracker becomes, and it serves again.
+#[retcd_test]
+fn m7b_172_a_primary_the_pin_retires_is_absent_until_a_pin_names_it_primary_again() {
+    let swap = requiring(recovery(10, d(10), pin_c_leads()), &[COPY_A, COPY_C]);
+    let mut module = routed();
+    let answered = route(&mut module, recovered_event(&swap));
+    assert_eq!(
+        answered.last(),
+        Some(&replica(ReplicaIgnoreReason::InvalidConfig))
+    );
+    assert!(primary_side(&module).tracker().retired());
+    assert!(module.receiver(A, P).is_some(), "the new side is built");
+
+    // Each input the old lineage would act on: the ACK admits (golden lineage), the
+    // `LocalApplied` is the next sequence.
+    assert_eq!(
+        deliver(&mut tracker(), &b(HEAD, HEAD, HEAD))[0],
+        peer_progress(B, HEAD)
+    );
+    let fenced = module.clone();
+    for kind in [
+        accepted(&b(HEAD, HEAD, HEAD)),
+        local_applied_event(HEAD + 1),
+        reply(B, &need_prefix(10)),
+        EventKind::Storage(StorageEvent::Flushed {
+            ticket: FlushTicket(1),
+            durable: flush(GEN, HEAD),
+        }),
+    ] {
+        let result = step_on(&mut module, A, kind);
+        assert!(
+            matches!(result, Err(RdbError::Unavailable { .. })),
+            "{result:?}"
+        );
+        assert_eq!(module, fenced);
+    }
+    let newer = view_of(2, NEW_GEN, NEW_EPOCH, NEW_CONFIG);
+    let mut alone = module.receiver(A, P).expect("built").clone();
+    let want = alone.on_view(&newer);
+    assert_eq!(route(&mut module, view_event(newer)), want);
+    assert_eq!(
+        primary_side(&module).tracker(),
+        fenced.primary(A, P).expect("kept").tracker()
+    );
+
+    // Near-miss: pinned primary again, over the cutoff its ladder holds.
+    let back = requiring(recovery(10, d(10), pin_with_b()), &[COPY_A, COPY_B]);
+    let mut reference = tracker();
+    let want = reference.on_recovered(&back, T);
+    let answered = route(&mut module, recovered_event(&back));
+    assert!(answered.ends_with(&want), "{answered:?}");
+    assert!(!primary_side(&module).tracker().retired());
+    assert_eq!(primary_side(&module).tracker(), &reference);
+    assert_eq!(
+        route(&mut module, local_applied_event(11)),
+        vec![replica(ReplicaIgnoreReason::Recorded)]
+    );
+}
+
+/// B's cursor on a primary built at cutoff 3, started from the root: record 1 is in flight.
+fn walking_b_from_root() -> Replication {
+    let mut module = built_at(3);
+    assert_eq!(
+        route(&mut module, reply(B, &need_prefix_at(0, Digest::ROOT))),
+        vec![send(COPY_B, 1)]
+    );
+    module
+}
+
+/// M7B-173 (lead ruling B-R58c, rows 1 and 5). A primary built at cutoff 3 holds rungs 0 and 3
+/// only. B, root-seeded, is walked from record 1. Its ACKs at 1 and 2 are exactly the records in
+/// flight, below the cutoff, where the ladder holds nothing to verify them against: each drives
+/// the cursor and nothing else — the effects are exactly `[Ignored(AckRejected(
+/// InFlightUnverified)), SendEnvelopes{B, next, next}]`, with no `PeerProgress`, no qualification
+/// edge and no `DurableAdvanced`, and the tracker is unchanged. The ACK at 3 is verified against
+/// the cutoff rung and moves B's watermarks to 3 in one step, and the cursor reports B caught up.
+#[retcd_test]
+fn m7b_173_an_in_flight_ack_below_the_cutoff_drives_the_cursor_and_moves_no_watermark() {
+    let mut module = walking_b_from_root();
+    let before = primary_side(&module).tracker().clone();
+    for seq in 1..3 {
+        assert_eq!(
+            route(&mut module, accepted(&in_new_root(b(seq, seq, seq)))),
+            vec![
+                rejected(AckRejectReason::InFlightUnverified),
+                send(COPY_B, seq + 1)
+            ]
+        );
+        assert_eq!(primary_side(&module).tracker(), &before);
+        assert_eq!(
+            primary_side(&module)
+                .cursor(COPY_B)
+                .expect("running")
+                .outstanding(),
+            Some(Seq(seq + 1))
+        );
+    }
+
+    let at_cut = in_new_root(b(3, 3, 3));
+    let mut reference = before;
+    let mut want = deliver(&mut reference, &at_cut);
+    assert_eq!(want[0], peer_progress(B, 3), "the tracker verifies it");
+    want.push(caught_up(COPY_B, 3));
+    assert_eq!(route(&mut module, accepted(&at_cut)), want);
+    assert_eq!(primary_side(&module).tracker(), &reference);
+    assert_eq!(
+        primary_side(&module)
+            .tracker()
+            .peer(COPY_B)
+            .expect("B")
+            .progress,
+        progress(3, 3, 3)
+    );
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+}
+
+/// M7B-174 (lead ruling B-R58c, rows 2–4). Outside the three bounds an unretained ACK gets
+/// today's answer, `[Ignored(AckRejected(Unverifiable)), SnapshotCatchupRequired]`: an ACK at a
+/// sequence other than the one in flight (ahead of it, or a repeat of the last), and an ACK
+/// with no cursor running. A wrong digest at the cutoff is divergence, and no watermark of B's
+/// ever moved.
+#[retcd_test]
+fn m7b_174_an_unretained_ack_outside_the_in_flight_bounds_gets_todays_answer() {
+    let todays = vec![
+        rejected(AckRejectReason::Unverifiable),
+        kernel(KernelEffect::SnapshotCatchupRequired {
+            copy: COPY_B,
+            barrier: Seq(3),
+        }),
+    ];
+
+    // Not the sequence in flight: 1 is, 2 is not.
+    let mut module = walking_b_from_root();
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(2, 2, 2)))),
+        todays
+    );
+    // A repeat of the ACK that already moved the cursor: 2 is in flight now.
+    let mut module = walking_b_from_root();
+    route(&mut module, accepted(&in_new_root(b(1, 1, 1))));
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        todays
+    );
+
+    // No cursor running.
+    let mut module = built_at(3);
+    assert_eq!(
+        route(&mut module, accepted(&in_new_root(b(1, 1, 1)))),
+        todays
+    );
+
+    // A wrong digest at the cutoff, after the walk.
+    let mut module = walking_b_from_root();
+    for seq in 1..3 {
+        route(&mut module, accepted(&in_new_root(b(seq, seq, seq))));
+    }
+    let mut reference = primary_side(&module).tracker().clone();
+    let wrong = forked(in_new_root(b(3, 3, 3)));
+    let want = deliver(&mut reference, &wrong);
+    assert_eq!(
+        want[0],
+        kernel(KernelEffect::DivergenceDetected { copy: COPY_B })
+    );
+    assert_eq!(route(&mut module, accepted(&wrong)), want);
+    let tracker = primary_side(&module).tracker();
+    assert!(tracker.is_diverged(COPY_B));
+    assert_eq!(tracker.peer(COPY_B).expect("B").progress, progress(0, 0, 0));
+}
+
+// --- §9 rows: the edge is the predicate, retirement, and the quarantine route ----------------
+
+/// A, B and C at `CONFIG` with nobody else: the plan's RF3.
+fn rf3() -> PartitionConfig {
+    config_with(
+        CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            member(COPY_B, B, RegularSecondary),
+            member(COPY_C, C, RegularSecondary),
+        ],
+    )
+}
+
+fn rf3_tracker() -> ProgressTracker {
+    ProgressTracker::new(init(rf3())).expect("RF3 tracker")
+}
+
+/// M7B-134 (design §3.4 "emitted iff `qualifies_now(head)` changed value"; ADR 0005 §5): RF3,
+/// B and C at the head, B diverges by rule 9. C still carries the predicate, so the set
+/// shrinks and nothing about the predicate is said: the vector is exactly three wide, with no
+/// edge, no block and no durable view (every copy stays at the head). The twin differs in one
+/// fact, C never ACKed, and there the same divergence flips the predicate and says so.
+#[retcd_test]
+fn m7b_134_set_change_without_a_predicate_flip_emits_nothing() {
+    let vector = [
+        kernel(KernelEffect::DivergenceDetected { copy: COPY_B }),
+        alert(),
+        copy_lost(COPY_B),
+    ];
+    let mut tracker = rf3_tracker();
+    deliver(&mut tracker, &b(HEAD, HEAD, HEAD));
+    deliver(&mut tracker, &c(HEAD, HEAD, HEAD));
+    assert!(tracker.qualifies_now(Seq(HEAD)));
+    assert_eq!(
+        deliver(&mut tracker, &forked(b(HEAD, HEAD, HEAD))),
+        vector.to_vec()
+    );
+    assert!(tracker.qualifies_now(Seq(HEAD)));
+    assert_eq!(tracker.qualified_copies(Seq(HEAD)), vec![COPY_C]);
+
+    // Twin: C had not ACKed, so B was the predicate.
+    let mut twin = rf3_tracker();
+    deliver(&mut twin, &b(HEAD, HEAD, HEAD));
+    assert!(twin.qualifies_now(Seq(HEAD)));
+    let mut want = vector.to_vec();
+    want.push(lost(QualificationCause::DivergenceDetected(COPY_B)));
+    assert_eq!(deliver(&mut twin, &forked(b(HEAD, HEAD, HEAD))), want);
+    assert!(!twin.qualifies_now(Seq(HEAD)));
+    // C is still a live regular secondary, so the floor is not gone and nothing blocks.
+    assert_eq!(twin.regular_secondaries(), vec![COPY_C]);
+}
+
+/// The `QualificationChanged` M7B-134's twin emits.
+fn twin_lost_edge() -> QualificationChanged {
+    let mut twin = rf3_tracker();
+    deliver(&mut twin, &b(HEAD, HEAD, HEAD));
+    let edges: Vec<QualificationChanged> = deliver(&mut twin, &forked(b(HEAD, HEAD, HEAD)))
+        .into_iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Kernel(KernelEffect::QualificationChanged(q)) => Some(q),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(edges.len(), 1, "{edges:?}");
+    edges[0].clone()
+}
+
+/// P1's candidate at `seq`, bound to this file's lineage and `CONFIG`.
+fn p1_candidate(seq: u64) -> AppliedCandidate {
+    let digest = |s: u64| Digest::of(Domain::Record, &[&s.to_le_bytes()]);
+    AppliedCandidate {
+        lineage: lineage(),
+        config_version: CONFIG,
+        seq: Seq(seq),
+        prev_digest: digest(seq - 1),
+        record_digest: digest(seq),
+        request: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(seq),
+        },
+        request_digest: Digest::of(Domain::Request, &[&seq.to_le_bytes()]),
+        pending_result: TxnResult {
+            partition: P,
+            owner_epoch: EPOCH,
+            generation: GEN,
+            seq: Seq(seq),
+            outcome: Outcome::Published,
+            durability: Durability::BufferedOnTwo,
+        },
+        authority: AuthorityDecision {
+            owner: A,
+            boot: BootId(1),
+            grant: GrantId(1),
+            authority_generation: AuthorityGeneration(1),
+            lineage: lineage(),
+            expiry_utc_ms: 0,
+            decided_at: Tick::ZERO,
+            authority_seq: 1,
+            checkpoint: Checkpoint::StorageDispatch,
+            correlation: CorrelationId(seq),
+            verdict: Verdict::Admit,
+        },
+    }
+}
+
+/// P1 with everything through `HEAD - 1` published and nothing pending.
+fn p1_idle() -> PubKernel {
+    PubKernel::new(PubConfig::default(), BootId(1), lineage(), Seq(HEAD - 1))
+}
+
+/// [`p1_idle`] holding the candidate at `HEAD`.
+fn p1_pending() -> PubKernel {
+    let mut p1 = p1_idle();
+    let armed = p1_kinds(&p1.apply(T, PubEvent::Candidate(p1_candidate(HEAD)), None));
+    assert_eq!(
+        armed.first().map(String::as_str),
+        Some("ArmTimer"),
+        "{armed:?}"
+    );
+    p1
+}
+
+/// [`p1_pending`] after a `Gained` edge for it: a recheck is outstanding.
+fn p1_rechecking() -> PubKernel {
+    let mut p1 = p1_pending();
+    let gained = QualificationChanged {
+        direction: QualificationDirection::Gained,
+        ..twin_lost_edge()
+    };
+    assert_eq!(gained.at_seq, Seq(HEAD));
+    let asked = p1_kinds(&p1.apply(T, PubEvent::QualificationChanged(gained), None));
+    assert_eq!(asked, ["AuthorityCheck"]);
+    p1
+}
+
+/// Which P1 branch each effect came from: the effect's variant and, for a fact, the fact's,
+/// with every payload dropped. `cause` is copied into `QualificationLost` and
+/// `QualificationLostAfterPublish`, so a payload is not a branch.
+fn p1_kinds(effects: &[PubEffect]) -> Vec<String> {
+    let name = |s: &str| -> String { s.chars().take_while(char::is_ascii_alphanumeric).collect() };
+    effects
+        .iter()
+        .map(|effect| {
+            let debug = format!("{effect:?}");
+            match (effect, debug.strip_prefix("Fact(")) {
+                (PubEffect::Fact(_), Some(fact)) => format!("Fact({})", name(fact)),
+                _ => name(&debug),
+            }
+        })
+        .collect()
+}
+
+/// M7B-135, on the event M7B-134's twin emits (B-R27 "no third variant"; design §3.4/§4.1
+/// field list; P1 clause as reworded by ruling B-R63a).
+///
+/// The match on `direction` has no wildcard and the destructure has no `..`, so a third
+/// direction or a changed field list stops this file compiling. L1 is then handed the event
+/// and a copy with every other field changed, in both directions, and ends identical.
+///
+/// P1 is driven through every arm of its qualification step, both directions, with the edge
+/// and two copies that change only `qualified_copies`, `qualified_ack_count`, `cause` and
+/// `tick`. All three land in the same branch, and each branch is named, so P1 is shown to
+/// branch on `direction` and on the candidate binding (`lineage`, `config_version`, `at_seq`)
+/// and on nothing else.
+#[retcd_test]
+fn m7b_135_qualification_changed_has_two_directions_and_trace_fields_only() {
+    let edge = twin_lost_edge();
+    let QualificationChanged {
+        lineage: edge_lineage,
+        config_version,
+        at_seq,
+        direction,
+        qualified_copies,
+        qualified_ack_count,
+        cause,
+        tick,
+    } = edge.clone();
+    let flipped = match direction {
+        QualificationDirection::Gained => QualificationDirection::Lost,
+        QualificationDirection::Lost => QualificationDirection::Gained,
+    };
+    assert_eq!(direction, QualificationDirection::Lost);
+    assert_eq!(flipped, QualificationDirection::Gained);
+    assert_eq!(
+        (edge_lineage, config_version, at_seq, tick),
+        (lineage(), CONFIG, Seq(HEAD), T)
+    );
+    assert_eq!(
+        (qualified_copies, qualified_ack_count, cause),
+        (
+            Vec::new(),
+            0,
+            QualificationCause::DivergenceDetected(COPY_B)
+        )
+    );
+
+    // Every field but `direction` changed, and the same event with only its direction changed.
+    let other = |direction| QualificationChanged {
+        lineage: Lineage {
+            generation: NEW_GEN,
+            owner_epoch: NEW_EPOCH,
+            ..lineage()
+        },
+        config_version: NEW_CONFIG,
+        at_seq: Seq(99),
+        direction,
+        qualified_copies: vec![COPY_C, COPY_B],
+        qualified_ack_count: 2,
+        cause: QualificationCause::StaleBoot(COPY_C),
+        tick: Tick(12_345),
+    };
+    let with = |direction| QualificationChanged {
+        direction,
+        ..edge.clone()
+    };
+    for (start, direction) in [
+        (
+            l1_healthy as fn() -> (Protection, u64),
+            QualificationDirection::Lost,
+        ),
+        (l1_paused, QualificationDirection::Gained),
+    ] {
+        let ((mut one, now), (mut two, _)) = (start(), start());
+        let a = l1_step(&mut one, now, qualification(with(direction)));
+        let b = l1_step(&mut two, now, qualification(other(direction)));
+        assert_eq!(a, b, "{direction:?}");
+        assert_eq!(one, two, "{direction:?}");
+    }
+
+    // P1: published through HEAD - 1; the candidate, when there is one, is HEAD.
+    use QualificationDirection::{Gained, Lost};
+    let variants = |at: u64, direction| {
+        let at_seq = Seq(at);
+        [
+            QualificationChanged {
+                at_seq,
+                direction,
+                ..edge.clone()
+            },
+            QualificationChanged {
+                at_seq,
+                direction,
+                qualified_copies: vec![COPY_B],
+                qualified_ack_count: 1,
+                cause: QualificationCause::AckAdvanced,
+                tick: Tick(12_345),
+                ..edge.clone()
+            },
+            QualificationChanged {
+                at_seq,
+                direction,
+                qualified_copies: vec![COPY_D, COPY_C, COPY_B],
+                qualified_ack_count: 3,
+                cause: QualificationCause::ConfigChanged,
+                tick: Tick(1),
+                ..edge.clone()
+            },
+        ]
+    };
+    let (idle, pending, rechecking) = (p1_idle, p1_pending, p1_rechecking);
+    let stale_lineage = |q: QualificationChanged| QualificationChanged {
+        lineage: Lineage {
+            owner_epoch: NEW_EPOCH,
+            ..lineage()
+        },
+        ..q
+    };
+    let stale_config = |q: QualificationChanged| QualificationChanged {
+        config_version: NEW_CONFIG,
+        ..q
+    };
+    let same = |q: QualificationChanged| q;
+    type Start = fn() -> PubKernel;
+    type Bind = fn(QualificationChanged) -> QualificationChanged;
+    let arms: [(&str, Start, u64, QualificationDirection, Bind, &str); 11] = [
+        (
+            "no candidate, at published",
+            idle,
+            HEAD - 1,
+            Lost,
+            same,
+            "QualificationLostAfterPublish",
+        ),
+        (
+            "no candidate, above published",
+            idle,
+            HEAD,
+            Lost,
+            same,
+            "NotForThisCandidate",
+        ),
+        (
+            "no candidate",
+            idle,
+            HEAD,
+            Gained,
+            same,
+            "NotForThisCandidate",
+        ),
+        (
+            "other seq",
+            pending,
+            HEAD + 1,
+            Gained,
+            same,
+            "NotForThisCandidate",
+        ),
+        (
+            "other seq",
+            pending,
+            HEAD + 1,
+            Lost,
+            same,
+            "NotForThisCandidate",
+        ),
+        (
+            "other lineage",
+            pending,
+            HEAD,
+            Gained,
+            stale_lineage,
+            "NotForThisCandidate",
+        ),
+        (
+            "other config",
+            pending,
+            HEAD,
+            Lost,
+            stale_config,
+            "NotForThisCandidate",
+        ),
+        (
+            "the candidate",
+            pending,
+            HEAD,
+            Gained,
+            same,
+            "AuthorityCheck",
+        ),
+        (
+            "the candidate",
+            pending,
+            HEAD,
+            Lost,
+            same,
+            "QualificationLost",
+        ),
+        (
+            "recheck outstanding",
+            rechecking,
+            HEAD,
+            Gained,
+            same,
+            "RecheckOutstanding",
+        ),
+        (
+            "recheck outstanding",
+            rechecking,
+            HEAD,
+            Lost,
+            same,
+            "QualificationLost",
+        ),
+    ];
+    for (arm, start, at, direction, bind, branch) in arms {
+        let want = if branch == "AuthorityCheck" {
+            branch.to_owned()
+        } else {
+            format!("Fact({branch})")
+        };
+        for q in variants(at, direction) {
+            let mut p1 = start();
+            let got = p1_kinds(&p1.apply(T, PubEvent::QualificationChanged(bind(q.clone())), None));
+            assert_eq!(got, [want.as_str()], "{arm}, {direction:?}: {q:?}");
+        }
+    }
+}
+
+/// Which of A, B, C and D the tracker holds an entry for.
+fn entries(tracker: &ProgressTracker) -> Vec<CopyId> {
+    [COPY_A, COPY_B, COPY_C, COPY_D]
+        .into_iter()
+        .filter(|copy| tracker.peer(*copy).is_some())
+        .collect()
+}
+
+/// M7B-145 (design §3.5 "Retired predicates keep their copies", K-B-49; §4.3 retirement):
+/// predicate `c` is `{A, B, C}`, `c+1` is `{A, B, D}`. `ConfigChanged` adds D and removes
+/// nothing. C keeps acknowledging under `c`: its entry moves, `c`'s durable view reads it, and
+/// `c+1`'s does not, nor does the pinned predicate count it. `TransitionBarrierConfirmed{c}`
+/// removes C and nothing else, and C is then a stranger.
+///
+/// The plan writes the survivors as `{B, D}`. The design keeps an entry for every member of
+/// every active predicate, and A, the primary, is a member of both, so the entries are
+/// `{A, B, D}`: A's is the one M7B-45 and M7B-50 read.
+#[retcd_test]
+fn m7b_145_retired_predicates_keep_their_copies_until_the_barrier_is_confirmed() {
+    let mut tracker = rf3_tracker();
+    deliver(&mut tracker, &b(HEAD, HEAD, HEAD));
+    deliver(&mut tracker, &c(HEAD, HEAD, 10));
+    assert_eq!(entries(&tracker), vec![COPY_A, COPY_B, COPY_C]);
+    assert_eq!(
+        tracker.durable_per_predicate(),
+        vec![(CONFIG, DurableSeq(10))]
+    );
+
+    let next = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            member(COPY_B, B, RegularSecondary),
+            member(COPY_D, D, RegularSecondary),
+        ],
+    );
+    assert_eq!(
+        tracker.on_config_changed(&next, T),
+        vec![durable_advanced(&[(CONFIG, 10), (NEW_CONFIG, 0)])]
+    );
+    assert_eq!(entries(&tracker), vec![COPY_A, COPY_B, COPY_C, COPY_D]);
+    assert_eq!(
+        tracker.peer(COPY_C).expect("C").progress,
+        progress(HEAD, HEAD, 10),
+        "C's entry is kept as it was"
+    );
+
+    // C's ACK under `c` moves C and `c`'s view, and nothing of `c+1`'s.
+    assert_eq!(
+        deliver(&mut tracker, &c(HEAD, HEAD, HEAD)),
+        vec![
+            peer_progress(C, HEAD),
+            durable_advanced(&[(CONFIG, HEAD), (NEW_CONFIG, 0)]),
+        ]
+    );
+    assert_eq!(
+        tracker.peer(COPY_C).expect("C").progress,
+        progress(HEAD, HEAD, HEAD)
+    );
+    assert_eq!(tracker.qualified_copies(Seq(HEAD)), vec![COPY_B]);
+    assert!(
+        !tracker.all_durable_through(Seq(1)),
+        "the pinned `c+1` waits on D"
+    );
+
+    assert_eq!(
+        tracker.on_transition_confirmed(CONFIG),
+        vec![durable_advanced(&[(NEW_CONFIG, 0)])]
+    );
+    assert_eq!(entries(&tracker), vec![COPY_A, COPY_B, COPY_D]);
+    dropped(
+        &mut tracker,
+        label(C),
+        &c(HEAD, HEAD, HEAD),
+        AckRejectReason::NotAMember,
+    );
+}
+
+// L1 beside R1 on node A. The rows below hand R1's effects to a real `Protection` the way
+// routing does (rdb-sim `harness::route`: `PeerProgress`, `CopyLost`, `DurableAdvanced`,
+// `QualificationChanged` and `BlockPartition` are L1's), so what L1 believes is what R1 said.
+
+/// L1's context at `now` on node A.
+fn l1_ctx(now: u64) -> StepCtx<'static> {
+    StepCtx {
+        now: Tick(now),
+        control_time: ControlTime {
+            estimate: Tick(now),
+            error_millis: 10,
+            bound_established: true,
+            sampled_at: Tick(now),
+        },
+        ..step_ctx()
+    }
+}
+
+/// Step `kind` on L1 at `now` and return the effect kinds.
+fn l1_on(p: &mut Protection, now: u64, kind: EventKind) -> Vec<EffectKind> {
+    let event = Event {
+        id: EventId(now),
+        at: Tick(now),
+        node: A,
+        boot: BootId(1),
+        partition: P,
+        correlation: CorrelationId(9),
+        kind,
+    };
+    let effects = p.step(&l1_ctx(now), &event).expect("an L1 input");
+    assert!(!effects.is_empty(), "BA-2: never an empty effect vector");
+    effects.into_iter().map(|effect| effect.kind).collect()
+}
+
+fn l1_step(p: &mut Protection, now: u64, input: KernelEvent) -> Vec<EffectKind> {
+    l1_on(p, now, EventKind::Kernel(input))
+}
+
+/// `HealthEval` at `now`, read from `ctx.now`.
+fn health_eval(p: &mut Protection, now: u64) -> Vec<EffectKind> {
+    l1_on(
+        p,
+        now,
+        EventKind::Timer(TimerFired {
+            id: HEALTH_EVAL_TIMER,
+            version: TimerVersion(0),
+            scheduled_at: Tick::ZERO,
+        }),
+    )
+}
+
+fn qualification(edge: QualificationChanged) -> KernelEvent {
+    KernelEvent::QualificationChanged(edge)
+}
+
+/// The event routing hands L1 for one of R1's effects, or `None` when the effect is not L1's.
+fn for_l1(effect: &EffectKind) -> Option<KernelEvent> {
+    let EffectKind::Kernel(effect) = effect else {
+        return None;
+    };
+    Some(match effect {
+        KernelEffect::PeerProgress {
+            peer,
+            contiguous_seq,
+        } => KernelEvent::PeerProgress {
+            peer: *peer,
+            contiguous_seq: *contiguous_seq,
+        },
+        KernelEffect::CopyLost { copy } => KernelEvent::CopyLost { copy: *copy },
+        KernelEffect::DurableAdvanced { per_predicate } => KernelEvent::DurableAdvanced {
+            per_predicate: per_predicate.clone(),
+        },
+        KernelEffect::QualificationChanged(edge) => qualification(edge.clone()),
+        KernelEffect::BlockPartition(reason) => KernelEvent::BlockPartition(reason.clone()),
+        _ => return None,
+    })
+}
+
+/// Hand every L1 effect in `effects` to `p` at `now`, except those `drop` names.
+fn dispatch(
+    p: &mut Protection,
+    now: u64,
+    effects: &[EffectKind],
+    drop: impl Fn(&KernelEvent) -> bool,
+) {
+    for event in effects.iter().filter_map(for_l1) {
+        if !drop(&event) {
+            l1_step(p, now, event);
+        }
+    }
+}
+
+/// L1 built on A by the RF3 pin, `Paused` at the head until R1 proves it.
+fn l1_paused() -> (Protection, u64) {
+    let mut p = Protection::new();
+    l1_on(&mut p, 0, recovered_event(&recovery(HEAD, d(HEAD), rf3())));
+    assert_eq!(p.mode(), Some(Mode::Paused));
+    (p, 0)
+}
+
+/// R1 and L1 side by side, resumed through the real path: B and C acknowledge the head every
+/// 100 ms, every R1 effect reaches L1, and L1 evaluates every 100 ms until the 5 s hold ends.
+/// Returns both and the tick of the `Allow`.
+fn resumed_side_by_side() -> (ProgressTracker, Protection, u64) {
+    let mut tracker = rf3_tracker();
+    let (mut p, _) = l1_paused();
+    for now in (0..=10_000).step_by(100) {
+        for ack in [b(HEAD, HEAD, HEAD), c(HEAD, HEAD, HEAD)] {
+            let effects = deliver(&mut tracker, &ack);
+            dispatch(&mut p, now, &effects, |_| false);
+        }
+        if health_eval(&mut p, now)
+            .iter()
+            .any(|e| matches!(e, EffectKind::Kernel(KernelEffect::SetAdmission(s)) if s.allow))
+        {
+            assert_eq!(p.mode(), Some(Mode::Healthy));
+            return (tracker, p, now);
+        }
+    }
+    panic!("never resumed: {:?}", p.mode());
+}
+
+fn l1_healthy() -> (Protection, u64) {
+    let (_, p, now) = resumed_side_by_side();
+    (p, now)
+}
+
+/// M7B-133 (design §4.1 "there is no HealthEval backstop"; ADR 0006 §3 "A dropped Lost edge is
+/// caught outside L1"). R1 and L1 resume together. Then control re-announces B and C at new
+/// boots: R1's predicate is false and it says so with `QualificationChanged{Lost}`, which a
+/// lossy dispatcher drops, handing L1 the rest. L1 still believes the head qualifies, and
+/// 100 health evaluations over 10 s, with B and C silent, leave it `Healthy` and admitting.
+///
+/// This documents the risk; it is not a fix. The guard is I1's lossless dispatcher (ADR 0003
+/// §9, B-R23) and verification's mutation row (V-R9), cross-referenced here, not re-asserted.
+/// The lossless twin pauses in the same step.
+#[retcd_test]
+fn m7b_133_dropped_lost_edge_is_not_caught_by_health_eval() {
+    let restarted = || {
+        let mut next = rf3();
+        next.config_version = NEW_CONFIG;
+        next.members[1].boot = BootId(22);
+        next.members[2].boot = BootId(33);
+        next
+    };
+    let lost_edge = |event: &KernelEvent| {
+        matches!(event, KernelEvent::QualificationChanged(q)
+            if q.direction == QualificationDirection::Lost)
+    };
+
+    let (mut tracker, mut p, start) = resumed_side_by_side();
+    let at = start + 100;
+    let effects = tracker.on_config_changed(&restarted(), T);
+    assert!(
+        effects.iter().filter_map(for_l1).any(|e| lost_edge(&e)),
+        "R1 emitted the edge: {effects:?}"
+    );
+    l1_step(&mut p, at, KernelEvent::ConfigChanged(restarted()));
+    dispatch(&mut p, at, &effects, lost_edge);
+    assert!(!tracker.qualifies_now(tracker.head()));
+    assert!(p.qualifies_now_at_head());
+    for eval in 1..=100 {
+        let now = at + eval * 100;
+        let effects = health_eval(&mut p, now);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, EffectKind::Kernel(KernelEffect::SetAdmission(_)))),
+            "no admission edge at {now}: {effects:?}"
+        );
+        assert_eq!(p.mode(), Some(Mode::Healthy), "at {now}");
+    }
+    let admitting = p.admission_state(Tick(at + 10_000)).expect("live");
+    assert!(admitting.allow);
+    assert!(p.qualifies_now_at_head());
+
+    // Lossless: the same step pauses.
+    let (mut tracker, mut p, start) = resumed_side_by_side();
+    let at = start + 100;
+    let effects = tracker.on_config_changed(&restarted(), T);
+    l1_step(&mut p, at, KernelEvent::ConfigChanged(restarted()));
+    dispatch(&mut p, at, &effects, |_| false);
+    assert_eq!(p.mode(), Some(Mode::Paused));
+    assert!(!p.admission_state(Tick(at)).expect("live").allow);
+}
+
+// F1 beside R1 on node A, over the same RF3 copies, so an R1 effect naming a copy is an F1
+// input naming the same one. Only what M7B-144 needs: A alone survives at the head, F1 commits
+// `ReadOnly` and rebuilds B and C.
+
+/// Step `kind` on F1 at `now` and return the effect kinds.
+fn f1_on(f1: &mut Recovery, now: u64, kind: EventKind) -> Vec<EffectKind> {
+    let event = Event {
+        id: EventId(now),
+        at: Tick(now),
+        node: A,
+        boot: BootId(1),
+        partition: P,
+        correlation: CorrelationId(9),
+        kind,
+    };
+    let effects = f1.step(&l1_ctx(now), &event).expect("an F1 input");
+    assert!(!effects.is_empty(), "BA-2: never an empty effect vector");
+    effects.into_iter().map(|effect| effect.kind).collect()
+}
+
+fn f1_rec(f1: &mut Recovery, now: u64, input: RecoveryEvent) -> Vec<EffectKind> {
+    f1_on(f1, now, EventKind::Kernel(KernelEvent::Recovery(input)))
+}
+
+fn f1_durable(copy: CopyId) -> RecoveryEvent {
+    RecoveryEvent::DurableAt(DurableProof {
+        copy,
+        partition: P,
+        seq: DurableSeq(HEAD),
+        digest: d(HEAD),
+    })
+}
+
+/// F1 on A: the RF3 plan anchored on the golden lineage at 5, fenced; A reports its ladder to
+/// the head, B and C fail; the window closes; A proves the head durable; the CAS commits. The
+/// commit's `Recovered` is `ReadOnly` and F1 is `Rebuilding` with `{A, B, C}` required.
+fn f1_rebuilding() -> (Recovery, RecoveryResult) {
+    let anchor = LineageAnchor {
+        lineage: lineage(),
+        base_seq: Seq(5),
+        base_digest: d(5),
+    };
+    let viable = |copy| Candidate {
+        copy,
+        primary_eligible: true,
+        healthy: true,
+        within_capacity: true,
+        has_valid_grant: true,
+    };
+    let plan = RecoveryPlan {
+        anchor,
+        config: rf3(),
+        candidates: vec![viable(COPY_A), viable(COPY_B), viable(COPY_C)],
+        rebuild_required: [COPY_A, COPY_B, COPY_C].into_iter().collect(),
+        authority_view: AuthorityView {
+            lineage: lineage(),
+            grant_id: GrantId(3),
+            boot_id: BootId(1),
+            authority_generation: AuthorityGeneration(1),
+            config_version: CONFIG,
+            authority_seq: 1,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon: DenyReason::NoGrant,
+        },
+        retention_millis: 60_000,
+    };
+    let mut f1 = Recovery::new();
+    f1_rec(&mut f1, 0, RecoveryEvent::Plan(Box::new(plan)));
+    let proof = recovery(HEAD, d(HEAD), rf3()).fenced_prior;
+    f1_rec(&mut f1, 0, RecoveryEvent::FenceProven(Box::new(proof)));
+    let a = SurvivorInventory {
+        copy: COPY_A,
+        anchor_seen: anchor,
+        head: (Seq(HEAD), d(HEAD)),
+        ladder: (5..=HEAD).map(|seq| (Seq(seq), d(seq))).collect(),
+        quarantined: None,
+    };
+    f1_rec(&mut f1, 10, RecoveryEvent::InventoryReported(Box::new(a)));
+    for copy in [COPY_B, COPY_C] {
+        f1_rec(&mut f1, 10, RecoveryEvent::InventoryFailed { copy });
+    }
+    let window = BUDGETS.discovery_window_millis;
+    f1_on(
+        &mut f1,
+        window,
+        EventKind::Timer(TimerFired {
+            id: DISCOVERY_TIMER,
+            version: TimerVersion(1),
+            scheduled_at: Tick::ZERO,
+        }),
+    );
+    f1_rec(&mut f1, window + 100, f1_durable(COPY_A));
+    let committed = f1_on(
+        &mut f1,
+        window + 200,
+        EventKind::Control(ControlEvent::CasResult {
+            key: ControlKey::Partition(P),
+            outcome: CasOutcome::Committed(Revision(9)),
+        }),
+    );
+    let results: Vec<RecoveryResult> = committed
+        .iter()
+        .filter_map(|effect| match effect {
+            EffectKind::Kernel(KernelEffect::Recovered(result)) => Some((**result).clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "{committed:?}");
+    let result = results[0].clone();
+    assert_eq!(result.mode, PartitionMode::ReadOnly);
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    (f1, result)
+}
+
+fn is_stall(effect: &EffectKind) -> bool {
+    matches!(
+        effect,
+        EffectKind::Kernel(KernelEffect::Recovery(
+            RecoveryEffect::RebuildStalled { .. }
+        ))
+    )
+}
+
+fn is_cas(effect: &EffectKind) -> bool {
+    matches!(effect, EffectKind::Control(ControlEffect::Cas { .. }))
+}
+
+/// M7B-144 (design §3.3 `Differs` row: the copy is not a target of this rebuild; §3.4 the
+/// tracker consumes `CopyQuarantined` exactly like `DivergenceDetected`; §5.6a a `CopyLost` is a
+/// stall). One story on nodes A and B, carried by F1's own `Recovered`:
+///
+/// 1. B's receiver holds another digest at the cutoff. `Recovered` quarantines it
+///    (`DivergentHistory`) and it sends nothing, so no `AppendAck`.
+/// 2. A's primary, rebuilt by the same result, sends B an append. B answers `Quarantined`, and
+///    B's cursor turns that into `CopyQuarantined{B}`.
+/// 3. Routed back to R1, the tracker marks B diverged and emits the B-R26 vector once: the
+///    alert and the loss (the predicate was already false, and C keeps the floor). A later
+///    `DivergenceDetected(B)`, and the same `CopyQuarantined` again, are `AlreadyDiverged`. The
+///    routed step is the Q-56 consumer arm, shown by behaviour rather than by grep.
+/// 4. R1's `CopyLost{B}` is handed to F1 as `KernelEvent::CopyLost`, the event routing makes of
+///    it: exactly one `RebuildStalled{B}`, `required` unchanged. C then catches up and A and C
+///    prove the head durable; no activation CAS follows, and F1 stays `Rebuilding`.
+///
+/// The plan's `Alert{RebuildStalled, B}` is landed as `RecoveryEffect::RebuildStalled{copy}`.
+#[retcd_test]
+fn m7b_144_copy_quarantined_reaches_the_tracker_and_stalls_rebuilding_loudly() {
+    let (mut f1, result) = f1_rebuilding();
+    let mut log = Vec::new();
+
+    // 1. B's receiver: another history at the cutoff.
+    let mut receiver = AppendReceiver::new(ReceiverInit {
+        config: rf3(),
+        own: COPY_B,
+        lineage: lineage(),
+        head: Head {
+            seq: Seq(HEAD),
+            digest: Digest([0xEE; 32]),
+        },
+        durable: DurableSeq(HEAD),
+    })
+    .expect("B's receiver");
+    assert_eq!(receiver.on_recovered(&result), vec![alert()]);
+    assert_eq!(receiver.applied_head().seq, Seq(HEAD), "no head moved");
+
+    // 2. A's primary, rebuilt by the same result, and B's answer to its next append. Row 0
+    // answers before the frame is decoded, so the body is immaterial.
+    let mut module = Replication::new();
+    module.install_primary(rf3_tracker());
+    route(&mut module, recovered_event(&result));
+    let append = Frame {
+        id: MessageId(77),
+        protocol: ENVELOPE_VERSION,
+        config: CONFIG,
+        sender: result.selected.root,
+        body: Bytes::from_static(b"RDBA"),
+    };
+    let answer = receiver.on_append(&label(A), &append);
+    let [EffectKind::Send(SendEffect::Unicast { to, frame })] = answer.as_slice() else {
+        panic!("one reply: {answer:?}");
+    };
+    assert_eq!(*to, A);
+    assert_eq!(
+        decode_reply(&frame.body).expect("a reply"),
+        AppendOutcome::Rejected(AppendReject::Quarantined)
+    );
+    assert_eq!(
+        route(
+            &mut module,
+            EventKind::Transport(TransportEvent::Delivered {
+                from: label(B),
+                frame: frame.clone(),
+            })
+        ),
+        vec![kernel(KernelEffect::CopyQuarantined { copy: COPY_B })]
+    );
+
+    // 3. Routed back to R1.
+    let vector = route(
+        &mut module,
+        EventKind::Kernel(KernelEvent::CopyQuarantined { copy: COPY_B }),
+    );
+    assert_eq!(vector, vec![alert(), copy_lost(COPY_B)]);
+    let tracker = primary_side(&module).tracker();
+    assert!(tracker.is_diverged(COPY_B));
+    assert_eq!(tracker.regular_secondaries(), vec![COPY_C]);
+    for again in [
+        KernelEvent::DivergenceDetected { copy: COPY_B },
+        KernelEvent::CopyQuarantined { copy: COPY_B },
+    ] {
+        let answer = route(&mut module, EventKind::Kernel(again));
+        assert_eq!(answer, vec![replica(ReplicaIgnoreReason::AlreadyDiverged)]);
+        log.extend(answer);
+    }
+
+    // 4. The loss reaches F1.
+    let required = f1.rebuild_required().cloned();
+    for effect in &vector {
+        if let EffectKind::Kernel(KernelEffect::CopyLost { copy }) = effect {
+            log.extend(f1_on(
+                &mut f1,
+                20_000,
+                EventKind::Kernel(KernelEvent::CopyLost { copy: *copy }),
+            ));
+        }
+    }
+    assert_eq!(
+        log,
+        vec![
+            replica(ReplicaIgnoreReason::AlreadyDiverged),
+            replica(ReplicaIgnoreReason::AlreadyDiverged),
+            kernel(KernelEffect::Recovery(RecoveryEffect::RebuildStalled {
+                copy: COPY_B
+            })),
+        ]
+    );
+    assert_eq!(f1.rebuild_required().cloned(), required);
+    assert_eq!(
+        required,
+        Some([COPY_A, COPY_B, COPY_C].into_iter().collect())
+    );
+    log.extend(f1_rec(
+        &mut f1,
+        20_100,
+        RecoveryEvent::CopyCaughtUp {
+            copy: COPY_C,
+            head: Seq(HEAD),
+            digest: d(HEAD),
+        },
+    ));
+    for (now, copy) in [(20_200, COPY_A), (20_300, COPY_C)] {
+        let answer = f1_rec(&mut f1, now, f1_durable(copy));
+        assert_eq!(
+            answer,
+            vec![replica(ReplicaIgnoreReason::BarrierNotDurable)],
+            "{copy:?}"
+        );
+        log.extend(answer);
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(log.iter().filter(|e| is_stall(e)).count(), 1);
+    assert!(!log.iter().any(is_cas), "no activation CAS: {log:?}");
 }

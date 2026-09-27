@@ -7,6 +7,11 @@
 //! proof is dropped, later proofs from it are refused, and only a replacement supplied as data or
 //! a fresh fence ends the stall.
 //!
+//! A sync is bounded (ruling B-R52): each `SyncWalThrough` starts a deadline, and a deadline that
+//! passes names each required copy that has not proved the point and was not already reported
+//! lost. It is a report, not a loss: `required` and the proofs do not move, and a late proof is
+//! judged like any other (ruling B-R52a).
+//!
 //! The rebuild point is pinned by the first live catch-up at or above the committed cutoff, and
 //! never below it (rulings F-e, A-3). A pin is never replaced. Every report is judged the same
 //! whenever it lands (ruling A-1): a digest at the cutoff other than the committed one, or a
@@ -20,6 +25,7 @@ use crate::contracts::ids::Seq;
 use crate::contracts::ignore::ReplicaIgnoreReason;
 use crate::contracts::membership::CopyId;
 use crate::contracts::recovery::{DivergenceEvidence, DurableProof, RecoveryBarrier};
+use crate::contracts::time::Tick;
 
 use super::lineage::holds_root;
 
@@ -67,6 +73,8 @@ pub(crate) struct Rebuild {
     cutoff: (Seq, Digest),
     /// The rebuild point: the head the first target caught up to (`design.md` §5.6a).
     point: Option<Point>,
+    /// The last sync's deadline, until it passes and is spent (ruling B-R52).
+    deadline: Option<Tick>,
 }
 
 impl Rebuild {
@@ -77,6 +85,7 @@ impl Rebuild {
             lost: BTreeSet::new(),
             cutoff,
             point: None,
+            deadline: None,
         }
     }
 
@@ -170,5 +179,36 @@ impl Rebuild {
         }
         self.proofs.remove(&copy);
         Ok(())
+    }
+
+    /// A sync was emitted: the rebuild waits on it until `deadline` (ruling B-R52).
+    pub(crate) fn wait_until(&mut self, deadline: Tick) {
+        self.deadline = Some(deadline);
+    }
+
+    /// The pending sync deadline, if one is armed and not yet spent.
+    pub(crate) const fn deadline(&self) -> Option<Tick> {
+        self.deadline
+    }
+
+    /// The deadline passed: spend it and return, in copy order, each required copy that has not
+    /// proved the point and was not already reported lost. `required`, the proofs and the losses
+    /// do not move (ruling B-R52a). Each copy is judged by the one barrier constructor, so this
+    /// can never disagree with it.
+    pub(crate) fn stall(&mut self) -> Vec<CopyId> {
+        self.deadline = None;
+        let Some(point) = self.point else {
+            return Vec::new();
+        };
+        self.required
+            .iter()
+            .copied()
+            .filter(|copy| !self.lost.contains(copy))
+            .filter(|copy| {
+                let held: Vec<DurableProof> = self.proofs.get(copy).copied().into_iter().collect();
+                RecoveryBarrier::try_new(&held, &BTreeSet::from([*copy]), point.seq, point.digest)
+                    .is_err()
+            })
+            .collect()
     }
 }

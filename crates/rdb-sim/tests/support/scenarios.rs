@@ -10,9 +10,12 @@
 //! | [`grammar`] | the six op enums, [`grammar::Scenario`], [`grammar::Budget`] — plain data, serialized as the fixture (decision D4) |
 //! | [`gen`] | the seeded generator and the `BoundaryId -> ScenarioOp` producer table |
 //! | [`reduce`] | ddmin over the op list, deletion only (decision D3) |
+//! | [`regress`] | the reducer end to end: an injected violation, the real-kernel executor, and the regression-fixture pair on disk |
 //! | [`coverage`] | the required lists, the family map and the capability gating table |
 //! | [`mutate`] | the three trace rewrites that test the oracle itself (decision D5) |
 //! | [`builder`] | `TraceBuilder`, the hand-built fixture writer (VA-1) |
+//! | [`cases`] | spike §6's mandatory cross-package cases, as authored constructors (design §3.1, family 2) |
+//! | [`run`] | the runner bridge: a scenario lowered onto the harness's `RunPlan`, run, and judged by the oracle |
 //!
 //! `builder` lives here rather than under `oracle/` on purpose: it *writes* what the oracle
 //! judges, and it needs `contracts::event::Budgets` and `contracts::version` to fill a trace
@@ -26,8 +29,11 @@
 //! [`rdb_sim::sim::cluster::ClusterConfig`] holds a `Vec<PartitionSpec>` and fixes nothing.
 
 pub mod builder;
+pub mod cases;
 pub mod coverage;
 pub mod gen;
 pub mod grammar;
 pub mod mutate;
 pub mod reduce;
+pub mod regress;
+pub mod run;

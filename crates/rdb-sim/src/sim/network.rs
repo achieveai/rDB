@@ -15,12 +15,24 @@
 //! # State
 //!
 //! The fault vocabulary is real and [`Network::inject`] records it; link state is kept.
-//! Delivery ([`Network::send`]) is still owed by package H1 and says so.
+//! Delivery is real since 2026-09-26: [`Network::send`] decides a frame's [`Fate`] from the
+//! link and the next matching plan, and hands back the [`Arrival`]s the harness schedules.
+//! [`NetworkOp::ForgeAck`] is delivered at the frame level (lead ruling L-R177do): the next
+//! acknowledgement on the link arrives under the forged [`PeerLabel`], body unchanged, so R1's
+//! own check is what refuses it. One case is still owed and refuses by name: a forgery with
+//! `authenticated: true` whose `claimed_role` differs from the role the body carries. The role
+//! lives inside the reply body, and rewriting a body is not the network's to do.
+//!
+//! Every frame handed to [`Network::send`] leaves one entry in [`Network::transmissions`],
+//! whatever its fate. A drop is a fate the scenario asked for by name, never a default, and it
+//! is written down like a delivery (ruling B-R28).
 
 use std::collections::BTreeMap;
 
+use rdb_core::contracts::envelope::AppendOutcome;
 use rdb_core::contracts::ids::{MessageId, NodeId, ReplicaRole};
 use rdb_core::contracts::transport::{Frame, PeerLabel};
+use rdb_core::replication::wire::decode_reply;
 
 use crate::error::SimError;
 
@@ -87,6 +99,16 @@ pub enum NetworkOp {
     /// Deliver the next acknowledgement from `from` to `to` under an identity its sender did not
     /// earn.
     ///
+    /// An acknowledgement is a frame whose body R1's codec decodes as
+    /// [`AppendOutcome::Accepted`]. Any other frame on the link passes this plan by: it waits
+    /// for an acknowledgement, and a later plan for the pair decides the other frame. The
+    /// acknowledgement arrives once, at once, under `PeerLabel{node: claimed_node, boot: the
+    /// sender's, authenticated}` with its body unchanged (lead ruling L-R177do). The network
+    /// forges only what a frame carries outside its body. So `claimed_role` is **not** written into
+    /// the body. With `authenticated: false` it is never read, because the receiver refuses the
+    /// label before it looks at a role. With `authenticated: true` and a `claimed_role` other
+    /// than the body's, [`Network::send`] refuses by name.
+    ///
     /// Two independent lies, because they are rejected by two different rules and a scenario must
     /// be able to tell a passing kernel from one that happens to reject everything:
     ///
@@ -125,17 +147,46 @@ pub enum NetworkOp {
     },
 }
 
-/// One frame the network has accepted and not yet delivered.
+/// One copy of a frame the network will hand to its recipient.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InFlight {
+pub struct Arrival {
+    /// How long after the send it arrives. The harness adds it to the current tick and nothing
+    /// else (ruling B-R23).
+    pub delay_millis: u64,
+    /// The identity it arrives under: the sender's own label, or a forged one a plan asked for.
+    pub label: PeerLabel,
+    /// The frame, unchanged. A duplicate carries the same [`Frame::id`], which is what makes it
+    /// recognisable as one.
+    pub frame: Frame,
+}
+
+/// What the network did with one frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fate {
+    /// It arrives, once or (for [`Delivery::Duplicate`]) twice, in arrival order.
+    Delivered(Vec<Arrival>),
+    /// A [`Delivery::Drop`] plan took it in flight. The sender is not told: a real network does
+    /// not tell it either.
+    Dropped,
+    /// The link was [`LinkState::Partitioned`], so it never left. The harness reports this to
+    /// the sender as a failed send.
+    Partitioned,
+}
+
+/// One entry of [`Network::transmissions`]: a frame the network was handed, and its fate in
+/// brief.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Transmission {
     /// Sender.
     pub from: NodeId,
     /// Recipient.
     pub to: NodeId,
-    /// The identity the frame will be delivered under.
-    pub label: PeerLabel,
-    /// The frame.
-    pub frame: Frame,
+    /// The frame's own id.
+    pub id: MessageId,
+    /// How many copies arrive: 0 for a drop or a partition, 2 for a duplicate.
+    pub copies: u8,
+    /// Whether the link was partitioned.
+    pub partitioned: bool,
 }
 
 /// The controlled network.
@@ -146,11 +197,10 @@ pub struct InFlight {
 pub struct Network {
     /// Link state, keyed by the ordered pair. A link never set is up.
     links: BTreeMap<(NodeId, NodeId), LinkState>,
-    /// Frames accepted and not yet delivered.
-    in_flight: Vec<InFlight>,
     /// Per-frame plans not yet consumed, in injection order.
     planned: Vec<NetworkOp>,
-    next_message: MessageId,
+    /// Every frame handed to [`Self::send`], in send order.
+    transmissions: Vec<Transmission>,
 }
 
 impl Network {
@@ -167,7 +217,7 @@ impl Network {
     ///
     /// # Errors
     ///
-    /// [`SimError::Config`] naming `link` for a link from a node to itself.
+    /// [`SimError::Config`] naming `link` for an operation from a node to itself.
     pub fn inject(&mut self, op: NetworkOp) -> Result<(), SimError> {
         match op {
             NetworkOp::SetLink { a, b, state } => {
@@ -177,9 +227,12 @@ impl Network {
                 self.links.insert(Self::pair(a, b), state);
                 Ok(())
             }
-            NetworkOp::PlanNext { .. }
-            | NetworkOp::ForgeAck { .. }
-            | NetworkOp::ForgeNext { .. } => {
+            NetworkOp::PlanNext { from, to, .. }
+            | NetworkOp::ForgeAck { from, to, .. }
+            | NetworkOp::ForgeNext { from, to, .. } => {
+                if from == to {
+                    return Err(SimError::Config { field: "link" });
+                }
                 self.planned.push(op);
                 Ok(())
             }
@@ -201,35 +254,119 @@ impl Network {
         &self.planned
     }
 
-    /// The frames accepted and not yet delivered.
+    /// Every frame handed to [`Self::send`], in send order, with its fate. A frame that was
+    /// dropped or never left is here too: that is what makes a drop a recorded choice rather
+    /// than an absence.
     #[must_use]
-    pub fn in_flight(&self) -> &[InFlight] {
-        &self.in_flight
+    pub fn transmissions(&self) -> &[Transmission] {
+        &self.transmissions
     }
 
-    /// Hand a frame to the network. Returns the identity the frame was sent under.
+    /// Hand `frame` from `from` to `to`, sent under `label`, and say what happens to it.
+    ///
+    /// In this order:
+    ///
+    /// 1. A [`LinkState::Partitioned`] link: [`Fate::Partitioned`]. No plan is consumed; a plan
+    ///    is about the next frame the link *carries*.
+    /// 2. Otherwise the first plan for `(from, to)`, in injection order, is consumed:
+    ///    [`NetworkOp::PlanNext`] decides the [`Delivery`], and [`NetworkOp::ForgeNext`] and
+    ///    [`NetworkOp::ForgeAck`] deliver at once under their forged label. A `ForgeAck` plan
+    ///    counts only for an acknowledgement; every other frame passes it by.
+    /// 3. With no plan, the frame arrives once, at once, under `label`. A delay or a drop is
+    ///    something a scenario asks for, never a default.
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 lands delivery: accepting a frame without a
-    /// delivery event behind it would be a send that silently never arrives, which is a fault
-    /// the scenario must ask for by name ([`Delivery::Drop`]), never a default.
+    /// [`SimError::Config`] naming `link` for a frame from a node to itself.
+    /// [`SimError::Unavailable`] naming `sim::network::Network::forge_ack` when the plan that
+    /// takes this acknowledgement is a [`NetworkOp::ForgeAck`] with `authenticated: true` and a
+    /// `claimed_role` other than the one the body carries. That lie is a field inside the reply
+    /// body, and the network does not rewrite bodies. The plan is left in place and nothing is
+    /// recorded, so the refusal changes nothing.
     pub fn send(
         &mut self,
-        _from: NodeId,
-        _to: NodeId,
-        _frame: Frame,
-    ) -> Result<MessageId, SimError> {
-        Err(SimError::unavailable("sim::network::Network::send"))
-    }
-
-    /// Allocate a message id for a frame this network delivers. Reserved for the delivery
-    /// path; strictly increasing.
-    #[allow(dead_code)]
-    fn next_message_id(&mut self) -> MessageId {
-        let id = self.next_message;
-        self.next_message = MessageId(id.0 + 1);
-        id
+        from: NodeId,
+        to: NodeId,
+        label: PeerLabel,
+        frame: Frame,
+    ) -> Result<Fate, SimError> {
+        if from == to {
+            return Err(SimError::Config { field: "link" });
+        }
+        let id = frame.id;
+        let fate = if self.link(from, to) == LinkState::Partitioned {
+            Fate::Partitioned
+        } else {
+            let acknowledged = acknowledged_role(&frame);
+            let at = self.planned.iter().position(|op| match *op {
+                NetworkOp::PlanNext { from: f, to: t, .. }
+                | NetworkOp::ForgeNext { from: f, to: t, .. } => (f, t) == (from, to),
+                NetworkOp::ForgeAck { from: f, to: t, .. } => {
+                    (f, t) == (from, to) && acknowledged.is_some()
+                }
+                NetworkOp::SetLink { .. } => false,
+            });
+            if let Some(NetworkOp::ForgeAck {
+                claimed_role,
+                authenticated: true,
+                ..
+            }) = at.map(|at| self.planned[at])
+            {
+                if acknowledged != Some(claimed_role) {
+                    return Err(SimError::unavailable("sim::network::Network::forge_ack"));
+                }
+            }
+            let plan = at.map(|at| self.planned.remove(at));
+            let arrive = |delay_millis: u64, label: PeerLabel| Arrival {
+                delay_millis,
+                label,
+                frame: frame.clone(),
+            };
+            match plan {
+                Some(NetworkOp::PlanNext { delivery, .. }) => match delivery {
+                    Delivery::Deliver { delay_millis } => {
+                        Fate::Delivered(vec![arrive(delay_millis, label)])
+                    }
+                    Delivery::Drop => Fate::Dropped,
+                    Delivery::Duplicate {
+                        delay_millis,
+                        second_delay_millis,
+                    } => Fate::Delivered(vec![
+                        arrive(delay_millis, label),
+                        arrive(delay_millis.saturating_add(second_delay_millis), label),
+                    ]),
+                },
+                Some(NetworkOp::ForgeNext { label: forged, .. }) => {
+                    Fate::Delivered(vec![arrive(0, forged)])
+                }
+                Some(NetworkOp::ForgeAck {
+                    claimed_node,
+                    authenticated,
+                    ..
+                }) => Fate::Delivered(vec![arrive(
+                    0,
+                    PeerLabel {
+                        node: claimed_node,
+                        boot: label.boot,
+                        authenticated,
+                    },
+                )]),
+                // `SetLink` is never kept as a plan.
+                Some(NetworkOp::SetLink { .. }) | None => Fate::Delivered(vec![arrive(0, label)]),
+            }
+        };
+        let copies = match &fate {
+            Fate::Delivered(arrivals) => u8::try_from(arrivals.len()).unwrap_or(u8::MAX),
+            Fate::Dropped | Fate::Partitioned => 0,
+        };
+        self.transmissions.push(Transmission {
+            from,
+            to,
+            id,
+            copies,
+            partitioned: matches!(fate, Fate::Partitioned),
+        });
+        Ok(fate)
     }
 
     const fn pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
@@ -238,5 +375,15 @@ impl Network {
         } else {
             (b, a)
         }
+    }
+}
+
+/// The role an acknowledgement's body carries, when `frame` is one: its body decodes under R1's
+/// codec as [`AppendOutcome::Accepted`]. `None` for every other frame. Read only; the body is
+/// never changed.
+fn acknowledged_role(frame: &Frame) -> Option<ReplicaRole> {
+    match decode_reply(&frame.body) {
+        Ok(AppendOutcome::Accepted(ack)) => Some(ack.role),
+        _ => None,
     }
 }

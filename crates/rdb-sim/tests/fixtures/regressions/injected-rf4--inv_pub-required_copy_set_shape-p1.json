@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "generator_version": 1,
+  "provenance": {
+    "Authored": {
+      "case": "injected_rf4_copy_set_shape"
+    }
+  },
+  "topology": {
+    "nodes": 4,
+    "partitions": 1,
+    "config_version_0": 1,
+    "placements": [
+      {
+        "partition": 1,
+        "node": 1,
+        "role": "Primary"
+      },
+      {
+        "partition": 1,
+        "node": 2,
+        "role": "RegularSecondary"
+      },
+      {
+        "partition": 1,
+        "node": 3,
+        "role": "RegularSecondary"
+      },
+      {
+        "partition": 1,
+        "node": 4,
+        "role": "RegularSecondary"
+      }
+    ]
+  },
+  "budget": {
+    "max_events": 2000,
+    "max_ticks": 12000
+  },
+  "ops": [
+    {
+      "Recovery": {
+        "Synchronize": {
+          "node": 1,
+          "to": 100
+        }
+      }
+    },
+    {
+      "Recovery": {
+        "InspectSurvivors": {
+          "partition": 1,
+          "window": 2000
+        }
+      }
+    }
+  ]
+}

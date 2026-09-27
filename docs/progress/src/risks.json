@@ -7,10 +7,10 @@
       "closing": "Start kernel-b once kernel-a phase 2 hands off and its contract asks are answered."
     },
     {
-      "text": "Kernel-a has 3 of 174 rows. Its reach gate passed, and phase 2 is being built now.",
+      "text": "Kernel-a has 61 of 174 rows. Its reach gate THUMBS UP; phase 2 dev underway.",
       "owner": "lead",
       "severity": "high",
-      "closing": "Phase 2 lands, the tester re-gates, then rows follow."
+      "closing": "Phase 2 lands, tester re-gates, then 113 owed rows are staffed and built."
     },
     {
       "text": "About 6,200 lines of M7 code are uncommitted in a shared tree. One bad command could lose them.",
@@ -49,10 +49,28 @@
       "closing": "Kernel-b builds the producers, or the plan marks those cells unreachable."
     },
     {
-      "text": "The C drive fills during parallel builds and corrupts build output.",
+      "text": "R1 digest ladder is unbounded; memory grows without limit during long runs.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "R1 must bound the history ladder or discard old digests during runs."
+    },
+    {
+      "text": "I1 ordering assumptions: ConfigChanged must reach L1 before R1; R1 at most one config behind.",
       "owner": "lead",
       "severity": "medium",
-      "closing": "Check free space before blaming a linker failure. Delete only your own build folder."
+      "closing": "Kernel-b test plan section 15 names the assumptions. Verify they hold on commit."
+    },
+    {
+      "text": "Evidence files of several gates were deleted with their exports outside this session.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Verdicts survive in handoffs; rebuild exports with mkexport.sh and the new basis."
+    },
+    {
+      "text": "Progress cron 948e42e6 was deleted. Refreshes are manual until replaced.",
+      "owner": "lead",
+      "severity": "low",
+      "closing": "Build a new cron schedule once M7 resumes. Current refreshes are explicit."
     }
   ]
 }

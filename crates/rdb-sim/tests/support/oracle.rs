@@ -226,14 +226,21 @@ impl Signature {
     /// A filesystem-safe slug for the reducer's two fixture files (design §4.1).
     #[must_use]
     pub fn slug(&self) -> String {
+        self.core.slug()
+    }
+}
+
+impl CoreTuple {
+    /// The fixture slug, which is the tuple's `(checker, rule, partition)`. A regression fixture
+    /// records what it fails **by its file name** (row M7V-50): the replaying row reads the
+    /// expectation from here, so no field inside the file can be edited to green it.
+    #[must_use]
+    pub fn slug(&self) -> String {
         format!(
             "{}-{}-p{}",
-            self.core
-                .checker
-                .to_ascii_lowercase()
-                .replace("inv-", "inv_"),
-            self.core.rule,
-            self.core.partition.0
+            self.checker.to_ascii_lowercase().replace("inv-", "inv_"),
+            self.rule,
+            self.partition.0
         )
     }
 }

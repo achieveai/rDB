@@ -1,5 +1,5 @@
 {
-  "where": "M7 day 3. 118 of 469 test rows landed. The simulator now records kernel effects, and every simulator test passes.",
-  "blocked": "Kernel-a rows wait for the manual tester to pass phase 2.",
-  "next": "Build the kernel-a takeover side from the new design. Then start kernel-b, the long pole at 148 rows."
+  "where": "M7 paused at milestone stop point. 292 of 469 rows built. Foundation complete.",
+  "blocked": "Nothing. Gautam reviews progress manually.",
+  "next": "Resume: staff kernel-b L1 slice, then kernel-b R1 recovery slice."
 }

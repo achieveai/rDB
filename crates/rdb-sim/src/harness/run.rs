@@ -46,19 +46,32 @@
 //!
 //! ## 2. A refusal stops the run and is carried out in the result
 //!
-//! [`crate::harness::dispatch::Dispatcher::deliver`] refuses [`EffectKind::Send`],
-//! [`EffectKind::Store`] and every [`EffectKind::Kernel`] arm whose consumer is not wired with
-//! [`SimError::Unavailable`] naming the seam (ruling B-R28: nothing is dropped silently). Five
-//! kernel arms are recorded instead, each as a [`TraceKind::KernelNoted`] record straight after
-//! the offer that produced it: `Ignored` and `Alert` (lead ruling A-R46), A1's
-//! `Authority(Fact(..))` (A-R49), and L1's `SetAdmission` and `ProtectionWarn` (B-R42). A1's
-//! other four `Authority(..)` arms are refused. After an answered offer to L1 the loop also
-//! writes the [`TraceKind::ProtectionState`] line L1 owes, if its phase, pinned configuration,
-//! resume hold's start or barrier moved (see [`crate::harness::protection`]). On a refusal the
-//! loop stops there, keeps the seam name, and reports [`StopReason::Refused`]. It does not
-//! absorb the error, does not continue past it, and has no fallback that pretends the effect was
-//! delivered — a loop that swallowed refusals would make an empty run and a working run look
-//! identical.
+//! [`crate::harness::dispatch::Dispatcher::deliver`] carries out [`EffectKind::Send`] through
+//! the controlled network, [`EffectKind::Store`] through the node's memory engine, and every
+//! [`EffectKind::Kernel`] arm with a consumer by scheduling it, in the same tick, as an
+//! [`EventKind::Kernel`] event on the emitting node ([`crate::harness::route`]). What it cannot
+//! carry out it refuses with [`SimError::Unavailable`] naming the seam (ruling B-R28: nothing is
+//! dropped silently). The recorded arms are kept as [`TraceKind::KernelNoted`] records straight
+//! after the offer that produced them: `Ignored` and `Alert` (A-R46), A1's `Authority(Fact(..))`
+//! (A-R49), L1's `SetAdmission` and `ProtectionWarn` (B-R42), F1's six fact arms (A-R64) and
+//! P1's `Publication(..)` outputs (A-R65.3). After an answered offer to L1 the loop also writes
+//! the [`TraceKind::ProtectionState`] line L1 owes, if its phase, pinned configuration, resume
+//! hold's start or barrier moved (see [`crate::harness::protection`]).
+//!
+//! A routed event is offered to its consumers first, in [`route::offer_order`], so a
+//! configuration change reaches L1 and P1 before R1. A consumer that declines on an edge in
+//! [`route::OWED_EDGES`] is recorded as [`DispatchOutcome::DeclinedOwed`] and the run goes on
+//! (A-R62); one that declines on any other named edge stops the run under
+//! `harness::run::route`, because the fact would otherwise be lost.
+//!
+//! A storage completion the dispatcher marks as addressed — `SnapshotReady` for a handle one
+//! module minted — is offered to that module only (A-R69a), and its decline stops the run under
+//! `harness::run::route` the same way.
+//!
+//! On a refusal the loop stops there, keeps the seam name, and reports [`StopReason::Refused`].
+//! It does not absorb the error, does not continue past it, and has no fallback that pretends the
+//! effect was delivered — a loop that swallowed refusals would make an empty run and a working
+//! run look identical.
 //!
 //! The refusal is returned as an `Ok(RunReport)` rather than an `Err` so that the trace and the
 //! counts survive it; [`RunReport::refusal`] hands the seam straight back, and
@@ -66,23 +79,15 @@
 //!
 //! # What this loop cannot do yet
 //!
-//! * ~~**No wired module can produce a refused effect.**~~ **No longer true, 2026-09-22.** It
-//!   read: A1 emits only [`EffectKind::Control`], so [`StopReason::Refused`] is unreachable from
-//!   a scenario today. A1 now emits `KernelEffect::Authority(..)` effects, and routing them is
-//!   ruled (lead ruling A-R49, closing what A-R46 left open): `Fact` is **recorded**, as a
-//!   [`TraceKind::KernelNoted`] beside `Ignored` and `Alert`; `Answer`, `Fence`,
-//!   `PublishAuthorityView` and `FenceProven` are **refused** by name under
-//!   `harness::dispatch::deliver::kernel` until their consumer kernels exist. So a scenario
-//!   **does** reach [`StopReason::Refused`] — an A1 run stops at the first of those four it
-//!   emits — and rows that expected [`StopReason::QueueEmpty`] from an A1 run stop there
-//!   instead. [`Runner::carry_out`] is still the way to reach the `send` and `store` refusals.
-//!   Since finding F2, an acquisition emits its first view only when it installs a partition
-//!   it owns. So a plan that wants that refusal seeds the owning record through
-//!   [`RunPlan::control_records`] (lead ruling B-R39). Over an empty store, A1 acquires, serves
-//!   nothing, and runs on to a limit.
-//! * **The snapshot is empty.** [`StepCtx::snapshot`] is
-//!   [`crate::storage::snapshot::EmptySnapshot`]; joining M1's engine to the step context is not
-//!   this package's decision.
+//! * ~~**No wired module can produce a refused effect.**~~ Closed 2026-09-22, and its successor
+//!   — A1's `Answer`, `Fence`, `PublishAuthorityView` and `FenceProven` refused under
+//!   `harness::dispatch::deliver::kernel` — closed 2026-09-26 when those four started being
+//!   routed to their consumers. An A1 run that installs a view now runs on to a limit, with T1's
+//!   and P1's answers or owed declines recorded, and R1's answer (B-R53).
+//! * **The snapshot is empty for four of the six.** [`StepCtx::snapshot`] is
+//!   [`crate::storage::snapshot::EmptySnapshot`] for A1, R1, L1 and F1. T1 and P1 get the
+//!   stepping node's applied view instead (coordinator, 2026-09-26; see
+//!   [`crate::harness::dispatch::Dispatcher::step`]).
 //! * ~~**The timer wheel is never polled.**~~ **Closed 2026-09-22** (lead ruling A-R40 /
 //!   L-R142). It read: `Clock::due` is never called, because `Clock::arm` is never called either
 //!   — a timer effect is refused before a timer can be armed, so the clock's *tick* advances
@@ -106,8 +111,11 @@ use rdb_core::contracts::event::{
     Budgets, Effect, Event, EventKind, ModuleName, ReplyEffect, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, EventId, Generation, NodeId, OwnerEpoch, PartitionId,
+    BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, Generation, NodeId, OwnerEpoch,
+    PartitionId,
 };
+use rdb_core::contracts::recovery::SurvivorInventory;
+use rdb_core::contracts::storage::Batch;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
     DispatchOutcome, PackageId, Provenance, TopologyEntry, Trace, TraceHeader, TraceKind,
@@ -118,11 +126,15 @@ use crate::error::SimError;
 use crate::harness::dispatch::Dispatcher;
 use crate::harness::environment_capabilities;
 use crate::harness::manifest::{resolve, BudgetOverride};
+use crate::harness::route::{self, Arm, Edge};
 use crate::harness::trace::{Recorder, Site};
+use crate::harness::transfer::TransferPlan;
 use crate::sim::cluster::{Cluster, ClusterConfig};
 use crate::sim::control::{ControlOp, ControlStore};
+use crate::sim::network::NetworkOp;
 use crate::sim::scheduler::Scheduler;
 use crate::storage::snapshot::EmptySnapshot;
+use crate::storage::StorageOp;
 
 /// The digest a header carries before any oracle checkpoint has been folded into it.
 ///
@@ -206,6 +218,32 @@ pub struct RunPlan {
     pub control_records: Vec<(ControlKey, Bytes)>,
     /// Control-plane faults injected before the first pop, in injection order.
     pub control_ops: Vec<ControlOp>,
+    /// Network faults injected before the first pop, in injection order: link states, and the
+    /// fate of the next frame on a link. With none, every frame arrives once, at once.
+    pub network_ops: Vec<NetworkOp>,
+    /// Storage faults planned before the first pop, in injection order, each on its node's
+    /// engine.
+    pub storage_ops: Vec<StorageOp>,
+    /// Host flushes, by tick and node (see [`Dispatcher::schedule_flush`]). No kernel emits a
+    /// flush, so when one runs is the scenario's choice.
+    pub flushes: Vec<(Tick, NodeId)>,
+    /// Batches committed into each node's engine before the first pop: the history the node
+    /// holds at the start (see [`Dispatcher::preload`]). Applied before `survivors`.
+    pub preloads: Vec<(NodeId, Batch)>,
+    /// How far each preloaded history is already synced, as `(node, partition, generation,
+    /// through)` (see [`Dispatcher::preload_durable`], lead ruling B-R55a). Applied after
+    /// `preloads` and before `storage_ops`, so no planned fault is spent on it.
+    pub preload_durable: Vec<(NodeId, PartitionId, Generation, DurableSeq)>,
+    /// Survivor copies placed for F1's providers, as `(node, partition, inventory)` (see
+    /// [`Dispatcher::place_survivor`]).
+    pub survivors: Vec<(NodeId, PartitionId, SurvivorInventory)>,
+    /// Sources still sending their prefix when F1 asks, as `(partition, plan)` (see
+    /// [`Dispatcher::plan_transfer`], lead ruling B-R55).
+    pub transfers: Vec<(PartitionId, TransferPlan)>,
+    /// Whether a committed recovery reaches the other members of its pinned config (lead
+    /// ruling B-R56, [`Dispatcher::set_member_watches`]). On by default (lead
+    /// ruling B-R58b): R1 catches a member up from the root (see the dispatcher field's note).
+    pub member_watches: bool,
     /// The bounds the loop runs under.
     pub limits: RunLimits,
 }
@@ -226,6 +264,14 @@ impl RunPlan {
             seed: Vec::new(),
             control_records: Vec::new(),
             control_ops: Vec::new(),
+            network_ops: Vec::new(),
+            storage_ops: Vec::new(),
+            flushes: Vec::new(),
+            preloads: Vec::new(),
+            preload_durable: Vec::new(),
+            survivors: Vec::new(),
+            transfers: Vec::new(),
+            member_watches: true,
             limits: RunLimits::SMALL,
         }
     }
@@ -433,6 +479,19 @@ impl RunReport {
     }
 }
 
+/// A module's slot in [`ModuleName::ALL`] order, which is the order [`RunReport::answered`]
+/// and [`RunReport::declined`] are indexed in whatever order the loop offered it.
+const fn slot_of(module: ModuleName) -> usize {
+    match module {
+        ModuleName::Authority => 0,
+        ModuleName::Transaction => 1,
+        ModuleName::Replication => 2,
+        ModuleName::Publication => 3,
+        ModuleName::Protection => 4,
+        ModuleName::Recovery => 5,
+    }
+}
+
 /// The package a kernel module belongs to, for its capability line.
 ///
 /// `pub(crate)` and no wider (lead ruling F-2a, 2026-09-22). The capability preamble below and
@@ -525,6 +584,55 @@ impl Runner {
         }
         for op in &plan.control_ops {
             runner.control.inject(*op)?;
+        }
+        for spec in &plan.cluster.nodes {
+            runner.dispatcher.register_node(spec.node, spec.boot);
+        }
+        for op in &plan.network_ops {
+            runner.dispatcher.inject_network(*op)?;
+        }
+        // The history each node starts with, committed and synced before any fault is planned:
+        // a preload is a commit and a durable preload a sync, and either would otherwise spend a
+        // planned fault meant for the run (lead ruling B-R55a).
+        for (node, batch) in &plan.preloads {
+            runner.dispatcher.preload(*node, batch.clone())?;
+        }
+        for (node, partition, generation, through) in &plan.preload_durable {
+            runner
+                .dispatcher
+                .preload_durable(*node, *partition, *generation, *through)?;
+        }
+        for op in &plan.storage_ops {
+            runner.dispatcher.inject_storage(*op)?;
+        }
+        for (at, node) in &plan.flushes {
+            runner.dispatcher.schedule_flush(*at, *node);
+        }
+        for (partition, transfer) in &plan.transfers {
+            runner.dispatcher.plan_transfer(*partition, *transfer);
+        }
+        runner.dispatcher.set_member_watches(plan.member_watches);
+        for (node, partition, inventory) in &plan.survivors {
+            runner
+                .dispatcher
+                .place_survivor(*node, *partition, inventory.clone())?;
+            // Recorded as declared (lead ruling A-R67.3b), under an event id of its own that no
+            // pop carries: the placement is a scenario operation, not the answer to an event.
+            let event = runner.scheduler.next_event_id();
+            let boot = plan
+                .cluster
+                .nodes
+                .iter()
+                .find(|spec| spec.node == *node)
+                .map_or(BootId(0), |spec| spec.boot);
+            let site = Site {
+                at: Tick::ZERO,
+                node: *node,
+                boot,
+                partition: *partition,
+                correlation: CorrelationId(0),
+            };
+            runner.record_notes(site, event)?;
         }
         for seed in &plan.seed {
             runner.queue(seed)?;
@@ -629,11 +737,16 @@ impl Runner {
             }
 
             let Some(event) = self.scheduler.pop() else {
-                // Unreachable: either the queue already held `next`, or the wheel did and the
-                // fire for it was just queued — `Clock::due(fire_at)` cannot return empty when
-                // `next_deadline()` answered a tick at or below `fire_at`. Nothing between there
-                // and here drains the queue. It is a `break` rather than an `expect` because an
-                // unreachable panic in the run loop would take a campaign down.
+                // Reached when the due work queued nothing: a transfer step that stalled
+                // (`transfer::Step::Stalled`) is consumed and schedules no event. The wheel may
+                // still hold later work — F1's discovery deadline, in M7B-96 — so go round again
+                // and let the top of the loop decide. The run ends `QueueEmpty` only there, when
+                // no deadline remains anywhere. The check is on the deadline having moved: a due
+                // entry that was neither queued nor consumed would otherwise loop forever, and
+                // that is a dispatcher defect, so it stops with the same name rather than hang.
+                if armed.is_some() && self.dispatcher.next_deadline() != armed {
+                    continue;
+                }
                 break StopReason::QueueEmpty;
             };
             report.events_consumed += 1;
@@ -683,8 +796,28 @@ impl Runner {
                 correlation: event.correlation,
             };
 
+            // A kernel event is offered to its named consumers first, in the order the contract
+            // gives (see `route::consumers`), then to the rest; every other event in
+            // `ModuleName::ALL` order. Still all six, each once. `routed` is whether the
+            // dispatcher scheduled it from a kernel effect: then a named consumer must answer.
+            let arm = match &event.kind {
+                EventKind::Kernel(kernel) => Arm::of(kernel),
+                _ => None,
+            };
+            let routed = self.dispatcher.take_routed(event.id);
+            // A storage completion one module asked for, for a handle it minted, goes to that
+            // module alone (A-R69a): offered to the others it would hand them a view they never
+            // bound. Its decline stops the run like a named consumer's on a routed fact.
+            let addressed = self.dispatcher.take_addressed(event.id);
+            let order = route::offer_order(arm);
+            let offers: &[ModuleName] = match &addressed {
+                Some(module) => std::slice::from_ref(module),
+                None => &order,
+            };
+
             let mut stop = None;
-            for (slot, module) in ModuleName::ALL.into_iter().enumerate() {
+            for &module in offers {
+                let slot = slot_of(module);
                 report.steps_offered += 1;
                 match self.dispatcher.step(module, &base, &event) {
                     Ok(effects) => {
@@ -721,9 +854,30 @@ impl Runner {
                     // is not a control completion. Recorded rather than only counted, because a
                     // count lives in the `RunReport` and a `RunReport` is not the artifact the
                     // oracle or `compare_traces` reads (ruling B-R28).
+                    //
+                    // Two exceptions, both about kernel events (lead ruling A-R62). A decline on
+                    // an owed edge — a consumer whose package has no body for the arm yet — is
+                    // recorded as `DeclinedOwed`, so a reducer can tell "not built" from "not
+                    // mine". And a decline by a named consumer of a *routed* event stops the
+                    // run: the fact was meant for that module, and continuing would drop it
+                    // silently (B-R28).
                     Err(RdbError::Unavailable { .. }) => {
                         report.declined[slot] += 1;
-                        self.record_dispatch(site, event.id, module, DispatchOutcome::Declined)?;
+                        let edge = route::edge(arm, module);
+                        let outcome = if edge == Edge::Owed {
+                            DispatchOutcome::DeclinedOwed
+                        } else {
+                            DispatchOutcome::Declined
+                        };
+                        self.record_dispatch(site, event.id, module, outcome)?;
+                        if (routed && edge == Edge::Named) || addressed.is_some() {
+                            stop = Some(StopReason::Refused {
+                                seam: "harness::run::route",
+                                event: event.id,
+                                module,
+                            });
+                            break;
+                        }
                     }
                     Err(error) => {
                         self.record_dispatch(
@@ -942,8 +1096,7 @@ mod tests {
     use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey};
     use rdb_core::contracts::event::{EffectKind, ModuleName};
     use rdb_core::contracts::ids::Revision;
-    use rdb_core::contracts::ids::{SnapshotHandle, TimerId, TimerVersion};
-    use rdb_core::contracts::storage::StoreEffect;
+    use rdb_core::contracts::ids::{TimerId, TimerVersion};
     use rdb_core::contracts::time::TimerEffect;
     use rdb_core::contracts::trace::{DispatchOutcome, TraceKind};
 
@@ -1058,18 +1211,53 @@ mod tests {
         plan
     }
 
-    /// The refusal a `served_plan` acquisition stops at: the kernel seam, on A1's offer.
-    fn assert_refused_at_the_install_view(stop: &StopReason) {
+    /// Where a `served_plan` acquisition goes since lead ruling A-R63: A1's install view is
+    /// routed as `AuthorityEvent::View` to R1, T1 and P1, in that order, and the run goes on. R1
+    /// answers it, installed or not (B-R53; until then it declined on an owed edge); T1 answers it
+    /// (A-R68); P1 answers it or declines on its owed edge, whichever its package has reached, so
+    /// this helper does not assert P1. Until 2026-09-26 the dispatcher refused the view under the
+    /// `kernel` seam (A-R49) and these rows stopped there.
+    fn assert_the_install_view_reached_its_consumers(
+        trace: &rdb_core::contracts::trace::Trace,
+        stop: &StopReason,
+    ) {
+        assert_eq!(
+            stop.refusal(),
+            None,
+            "the view is routed, not refused: {stop:?}"
+        );
+        let owed: Vec<ModuleName> = trace
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                TraceKind::ModuleDispatch {
+                    module,
+                    outcome: DispatchOutcome::DeclinedOwed,
+                    ..
+                } => Some(module),
+                _ => None,
+            })
+            .collect();
+        // B-R53: R1 answers the view, so it is no longer an owed decline, and a decline by it
+        // would have stopped the run above. A-R68: T1 consumes the view by design.
         assert!(
-            matches!(
-                stop,
-                StopReason::Refused {
-                    seam: "harness::dispatch::deliver::kernel",
-                    module: ModuleName::Authority,
+            !owed.contains(&ModuleName::Replication),
+            "R1 answers the view (B-R53): {owed:?}"
+        );
+        assert!(
+            trace.events.iter().any(|event| matches!(
+                event.kind,
+                TraceKind::ModuleDispatch {
+                    module: ModuleName::Replication,
+                    outcome: DispatchOutcome::Answered { .. },
                     ..
                 }
-            ),
-            "the install's PublishAuthorityView, refused by name (A-R49): {stop:?}"
+            )),
+            "R1 was offered the view and answered it"
+        );
+        assert!(
+            !owed.contains(&ModuleName::Transaction),
+            "T1 answers the view, never declines it (A-R68): {owed:?}"
         );
     }
 
@@ -1080,18 +1268,19 @@ mod tests {
     /// exists (lead ruling A-R49). It ended `QueueEmpty` before.
     ///
     /// Since finding F2 that view is the reload install's, not the commit's, so the control
-    /// plane is seeded with a record naming the node owner (lead ruling B-R39). Four pops: the
-    /// unmatched commit, `AcquireDue`, the grant CAS completion and the partitions snapshot.
+    /// plane is seeded with a record naming the node owner (lead ruling B-R39).
+    ///
+    /// Since A-R63 the view is routed, not refused, and the run would go on to its renewals, so
+    /// it is bounded at five pops: the unmatched commit, `AcquireDue`, the grant CAS completion,
+    /// the partitions snapshot, and the routed view.
     #[test]
     fn the_loop_runs_and_records() {
-        let (trace, report) = execute(&served_plan(vec![
-            unmatched_commit(Tick(5)),
-            acquire_due(Tick(10)),
-        ]))
-        .expect("a run");
+        let mut bounded = served_plan(vec![unmatched_commit(Tick(5)), acquire_due(Tick(10))]);
+        bounded.limits.max_events = 5;
+        let (trace, report) = execute(&bounded).expect("a run");
 
-        assert_refused_at_the_install_view(&report.stop);
-        assert_eq!(report.events_consumed, 4, "{report:?}");
+        assert_the_install_view_reached_its_consumers(&trace, &report.stop);
+        assert_eq!(report.events_consumed, 5, "{report:?}");
         assert_eq!(
             report.last_tick,
             Tick(10),
@@ -1204,40 +1393,43 @@ mod tests {
     /// A refused effect reaches the caller by name, and the mapping the loop applies turns it
     /// into the stop reason rather than absorbing it.
     ///
-    /// Driven through [`Runner::carry_out`], the loop's own delivery step, because no wired
-    /// module emits a store effect — A1 emits only `EffectKind::Control`.
+    /// Driven through [`Runner::carry_out`], the loop's own delivery step, so the row picks the
+    /// effect rather than waiting for a module to emit it.
     ///
-    /// Carried by a `Store` effect since 2026-09-22 (ruling A-R40). It used to be a `Timer`,
-    /// which is now wired; the subject of the row is that an **unwired** seam is named rather
-    /// than absorbed, and `Timer` was only the example. Re-pointed rather than deleted: the
-    /// guarantee is owed by `Send` and `Store` for as long as they are owed, and a row deleted
-    /// because its example got built is how the guarantee for the rest quietly stops being
-    /// tested.
+    /// Carried by F1's `ProbeDigestAt` since 2026-09-26 (lead ruling A-R61), a request no
+    /// provider answers yet. It was a `Store` from 2026-09-22 (A-R40) until the store was wired,
+    /// and a `Timer` before that. The subject is that an **unwired** seam is named rather than
+    /// absorbed; the example is only what carries it. Re-pointed rather than deleted: a row
+    /// deleted because its example got built is how the guarantee for the rest quietly stops
+    /// being tested.
     #[test]
     fn a_refused_effect_is_reported_not_absorbed() {
         let mut runner = Runner::new(&plan(Vec::new())).expect("a runner");
         let effect = Effect {
             correlation: CorrelationId(1),
-            from: ModuleName::Authority,
+            from: ModuleName::Recovery,
             partition: PART,
-            kind: EffectKind::Store(StoreEffect::Release {
-                handle: SnapshotHandle(1),
-            }),
+            kind: EffectKind::Kernel(rdb_core::contracts::event::KernelEffect::Recovery(
+                rdb_core::contracts::recovery::RecoveryEffect::ProbeDigestAt {
+                    copy: rdb_core::contracts::membership::CopyId(2),
+                    seq: rdb_core::contracts::ids::Seq(1),
+                },
+            )),
         };
 
         let error = runner
             .carry_out(NODE, BOOT, vec![effect])
-            .expect_err("the store is not wired");
+            .expect_err("no provider answers a probe");
         assert_eq!(
             error,
-            crate::error::SimError::unavailable("harness::dispatch::deliver::store")
+            crate::error::SimError::unavailable("harness::dispatch::deliver::recovery")
         );
 
-        let stop = StopReason::from_delivery(error, EventId(7), ModuleName::Authority)
+        let stop = StopReason::from_delivery(error, EventId(7), ModuleName::Recovery)
             .expect("a refusal is a stop, not a harness failure");
         assert_eq!(
             stop.refusal(),
-            Some("harness::dispatch::deliver::store"),
+            Some("harness::dispatch::deliver::recovery"),
             "the seam name reaches the caller"
         );
         assert!(!stop.is_complete());
@@ -1602,12 +1794,32 @@ mod tests {
         // `Watch{Partitions}` (4). Counted when offered, so the refused view and the two
         // effects behind it are in the 8. The run stops at that view (A-R49). Three pops, so a
         // counter that stopped after one pop reads 1.
-        let acted = execute(&served_plan(vec![acquire_due(POP)]))
-            .expect("a run")
-            .1;
-        assert_refused_at_the_install_view(&acted.stop);
-        assert_eq!(acted.events_consumed, 3, "{acted:?}");
-        assert_eq!(acted.effects_offered, 8, "{acted:?}");
+        //
+        // Since A-R63 the view is routed rather than refused, so the run goes on. It is bounded
+        // at four pops: the three above and the routed view itself. A1's share stays 8; what the
+        // view's consumers return (T1 answers it with an `Ignored` once it has a body for it) is
+        // theirs, so the total is checked against the trace rather than pinned here.
+        let mut bounded = served_plan(vec![acquire_due(POP)]);
+        bounded.limits.max_events = 4;
+        let (acted_trace, acted) = execute(&bounded).expect("a run");
+        assert_the_install_view_reached_its_consumers(&acted_trace, &acted.stop);
+        assert_eq!(acted.events_consumed, 4, "{acted:?}");
+        let effects_of = |only: Option<ModuleName>| -> u32 {
+            acted_trace
+                .events
+                .iter()
+                .filter_map(|event| match event.kind {
+                    TraceKind::ModuleDispatch {
+                        module,
+                        outcome: DispatchOutcome::Answered { effects },
+                        ..
+                    } if only.is_none_or(|wanted| wanted == module) => Some(effects),
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(effects_of(Some(ModuleName::Authority)), 8, "{acted:?}");
+        assert_eq!(acted.effects_offered, effects_of(None), "{acted:?}");
     }
 
     /// Probe M13: the six offers appear in `ModuleName::ALL` order, and the trace is where that
@@ -1733,11 +1945,11 @@ mod tests {
             "anything that is not Unavailable comes back unchanged"
         );
         assert!(StopReason::from_delivery(
-            crate::error::SimError::unavailable("harness::dispatch::deliver::send"),
+            crate::error::SimError::unavailable("harness::dispatch::deliver::kernel"),
             EventId(3),
             ModuleName::Authority,
         )
-        .is_ok_and(|stop| stop.refusal() == Some("harness::dispatch::deliver::send")));
+        .is_ok_and(|stop| stop.refusal() == Some("harness::dispatch::deliver::kernel")));
 
         // And through the loop, so the mapping is not tested in isolation from its caller.
         let plan = watch_from_a_compacted_revision();
@@ -1785,14 +1997,14 @@ mod tests {
     #[test]
     fn into_result_turns_a_refusal_into_an_error_and_leaves_the_rest_alone() {
         let refused = RunReport::blank().stopped(StopReason::Refused {
-            seam: "harness::dispatch::deliver::send",
+            seam: "harness::dispatch::deliver::kernel",
             event: EventId(4),
             module: ModuleName::Authority,
         });
         assert_eq!(
             refused.into_result(),
             Err(crate::error::SimError::unavailable(
-                "harness::dispatch::deliver::send"
+                "harness::dispatch::deliver::kernel"
             ))
         );
 

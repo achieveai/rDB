@@ -10,10 +10,10 @@
 //! | M7F-43 | a cancel at the armed version removes the arm, a cancel at any other version removes nothing, and `next_deadline` is the minimum over the table |
 //! | M7F-47 | `pop` is ordered by `(at, event_id)` across ticks, `now` follows each popped tick, a schedule into the past is refused naming `at`, and a duplicate `(tick, event_id)` is refused naming `event_id` |
 //!
-//! **Why the refusal rows are not `m7f_26` again.** `m7f_26` drives the same two seams, but it
-//! asserts only the *seam string*. A `send` that pushed the frame onto `in_flight` and then
-//! refused, or a `suspend` that marked the node stopped and then refused, passes `m7f_26` and
-//! fails here. The state half is the half that has no other row.
+//! **Why the refusal row is not `m7f_26` again.** `m7f_26` drives the same seam, but it asserts
+//! only the *seam string*. A `suspend` that marked the node stopped and then refused passes
+//! `m7f_26` and fails here. The state half is the half that has no other row. (`send` was the
+//! second such seam until it was built; M7F-23 now asserts the partitioned path instead.)
 //!
 //! **Overlap with two landed functions, declared rather than duplicated.**
 //! `m7f_47_two_events_at_one_tick_pop_in_ascending_event_id_order` and
@@ -35,13 +35,14 @@ use rdb_core::contracts::ids::{
 };
 use rdb_core::contracts::time::{Tick, TimerFired};
 use rdb_core::contracts::trace::{BudgetName, Provenance, TraceKind};
+use rdb_core::contracts::transport::PeerLabel;
 use rdb_sim::harness::manifest::BudgetOverride;
 use rdb_sim::harness::run::{execute, RunLimits, RunPlan, SeedEvent};
 use rdb_sim::harness::trace::write_jsonl;
 use rdb_sim::sim::clock::Clock;
 use rdb_sim::sim::cluster::Cluster;
 use rdb_sim::sim::control::ControlOp;
-use rdb_sim::sim::network::{Delivery, LinkState, Network, NetworkOp};
+use rdb_sim::sim::network::{Delivery, Fate, LinkState, Network, NetworkOp, Transmission};
 use rdb_sim::sim::scheduler::Scheduler;
 use rdb_sim::SimError;
 
@@ -55,30 +56,34 @@ fn frame() -> rdb_core::contracts::transport::Frame {
         id: rdb_core::contracts::ids::MessageId(1),
         protocol: 1,
         config: rdb_core::contracts::ids::ConfigVersion(1),
+        sender: rdb_core::contracts::authority::Lineage {
+            partition: rdb_core::contracts::ids::PartitionId(1),
+            generation: rdb_core::contracts::ids::Generation(1),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+        },
         body: bytes::Bytes::new(),
     }
 }
 
-/// M7F-23: `Network::send` is unavailable, names itself, and leaves the network untouched.
+/// M7F-23: a frame on a partitioned link never leaves, and nothing else in the network moves.
 ///
-/// **What turns this red:** a `send` that records the frame before refusing — pushing onto
-/// `in_flight`, consuming the `PlanNext` it was given, or calling `next_message_id` — or a
-/// change to the seam string. Accepting a frame with no delivery event behind it is a send that
-/// silently never arrives, and a drop is a fault a scenario must ask for by name
-/// ([`Delivery::Drop`]), never a default.
+/// **Re-pointed 2026-09-26 (lead ruling A-R61).** The old subject was "`Network::send` refuses
+/// by name and changes nothing". `send` is now real, so that claim is false, and a row asserting
+/// it would go red by design. The name is kept (A-R61: no renames), and records the row's
+/// original subject. The new subject keeps the old one's shape — a call that must change
+/// nothing it was not asked to change — on the one path where the frame goes nowhere.
 ///
-/// The whole-value comparison of the `Debug` rendering is deliberate: `next_message` has no
-/// accessor, so a burned id is observable only through the derived `Debug`. Comparing the whole
-/// value also catches a field this row does not know about.
+/// **What turns this red:** a partitioned send that consumes the plan waiting for the next
+/// frame the link *carries*, that is not recorded as a transmission (a drop nobody can see), that
+/// is recorded as carrying a copy, or that moves the link state.
 ///
-/// The positive control is `inject`: the fault vocabulary is real and takes effect, so this row
-/// is not passing against a `Network` that refuses everything.
+/// The positive control is the same frame after the link heals: it consumes the `Drop` plan and
+/// is recorded as dropped, so the partitioned case is not passing against a network that ignores
+/// plans altogether.
 #[retcd_test]
 fn m7f_23_network_send_is_unavailable_and_names_itself() {
     support::preamble();
     let mut network = Network::new();
-
-    // Positive control: injection works, so "nothing moved" below is a fact about `send`.
     network
         .inject(NetworkOp::SetLink {
             a: NODE,
@@ -86,11 +91,6 @@ fn m7f_23_network_send_is_unavailable_and_names_itself() {
             state: LinkState::Partitioned,
         })
         .expect("a link between two distinct nodes");
-    assert_eq!(
-        network.link(NODE, PEER),
-        LinkState::Partitioned,
-        "the injected link state took effect"
-    );
     network
         .inject(NetworkOp::PlanNext {
             from: NODE,
@@ -98,35 +98,51 @@ fn m7f_23_network_send_is_unavailable_and_names_itself() {
             delivery: Delivery::Drop,
         })
         .expect("a plan is kept until its frame is sent");
+    let label = PeerLabel {
+        node: NODE,
+        boot: BootId(1),
+        authenticated: true,
+    };
 
-    let before = format!("{network:?}");
-    let refused = network
-        .send(NODE, PEER, frame())
-        .expect_err("delivery is owed by package H1 and must refuse rather than fake a success");
-
-    assert_eq!(
-        refused,
-        SimError::Unavailable {
-            seam: "sim::network::Network::send"
-        },
-        "the seam string is the function's own path, so a grep for it finds exactly one function"
-    );
-    assert!(
-        network.in_flight().is_empty(),
-        "a refused send accepted no frame"
-    );
+    let fate = network
+        .send(NODE, PEER, label, frame())
+        .expect("a send between two distinct nodes is carried out");
+    assert_eq!(fate, Fate::Partitioned, "the link is partitioned");
     assert_eq!(
         network.planned().len(),
         1,
-        "a refused send consumed no plan — the Drop is still waiting for the frame that never went"
+        "a partitioned send consumed no plan: the Drop waits for the next frame the link carries"
     );
     assert_eq!(
-        format!("{network:?}"),
-        before,
-        "nothing in the network moved, including the next MessageId it would hand out: an id \
-         burned by a refused call is a gap in the trace's message numbering with no message in it"
+        network.transmissions(),
+        [Transmission {
+            from: NODE,
+            to: PEER,
+            id: frame().id,
+            copies: 0,
+            partitioned: true,
+        }],
+        "the frame is recorded, with no copy delivered: a drop nobody can see is a silent drop"
     );
-    tracing::info!(seam = "sim::network::Network::send", "m7f_23 seam");
+    assert_eq!(network.link(NODE, PEER), LinkState::Partitioned);
+
+    // Positive control: healed, the same frame meets the plan.
+    network
+        .inject(NetworkOp::SetLink {
+            a: NODE,
+            b: PEER,
+            state: LinkState::Up,
+        })
+        .expect("heal");
+    assert_eq!(
+        network.send(NODE, PEER, label, frame()).expect("carried"),
+        Fate::Dropped
+    );
+    assert!(network.planned().is_empty(), "the Drop was consumed");
+    tracing::info!(
+        transmissions = network.transmissions().len(),
+        "m7f_23 partitioned send"
+    );
 }
 
 /// M7F-24: `Cluster::suspend` is unavailable, names itself, and leaves the cluster untouched —
@@ -418,6 +434,14 @@ fn recorded_plan() -> RunPlan {
                 outcome: CasOutcome::Unknown,
             },
         ],
+        network_ops: Vec::new(),
+        storage_ops: Vec::new(),
+        flushes: Vec::new(),
+        preloads: Vec::new(),
+        preload_durable: Vec::new(),
+        survivors: Vec::new(),
+        transfers: Vec::new(),
+        member_watches: true,
         limits: RunLimits {
             max_events: 64,
             deadline: Tick(5_000),

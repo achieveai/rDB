@@ -895,6 +895,56 @@ fn m7b_130_never_heard_peer_has_infinite_lag_and_blocks_resume() {
     );
 }
 
+/// ADR-rdb-0006 row "a peer never heard from blocks resume", as corrected on 2026-09-26 (lead
+/// ruling B-R60). Near-miss: one `PeerProgress` per peer in `Reprotecting` starts the hold, and
+/// 250 ms later `replication_lag` reaches 250 ms and the hold restarts, so the partition never
+/// resumes. Twin: the same peers reporting every 250 ms, as R1's keepalive will, resume 5 s
+/// after the first report.
+#[retcd_test]
+fn a_single_peer_progress_does_not_resume_and_a_stream_every_250_ms_does() {
+    let mut p = reprotecting_at(10_000);
+    step(&mut p, 10_000, progress(B));
+    step(&mut p, 10_000, progress(C));
+    health(&mut p, 10_000);
+    let started = Mode::Reprotecting {
+        below_since: Some(Tick(10_000)),
+    };
+    assert_eq!(p.mode(), Some(started));
+    assert_eq!(
+        health(&mut p, 10_200),
+        ignored(ReplicaIgnoreReason::ResumeHeld)
+    );
+    assert_eq!(p.mode(), Some(started), "lag 200 keeps the hold");
+    health(&mut p, 10_250);
+    assert_eq!(
+        p.mode(),
+        Some(Mode::Reprotecting { below_since: None }),
+        "lag 250 restarts the hold"
+    );
+    for t in (10_300..=70_000).step_by(50) {
+        assert!(no_allow(&health(&mut p, t)), "t={t}");
+    }
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
+    let s = state(&p, 70_000);
+    assert!(!s.allow);
+    assert_eq!(s.replication_lag, ReplicationLag::millis(60_000));
+
+    let mut twin = reprotecting_at(10_000);
+    let mut allowed = None;
+    for t in (10_000..=20_000).step_by(50) {
+        if (t - 10_000) % 250 == 0 {
+            step(&mut twin, t, progress(B));
+            step(&mut twin, t, progress(C));
+        }
+        if !no_allow(&health(&mut twin, t)) {
+            allowed = Some(t);
+            break;
+        }
+    }
+    assert_eq!(allowed, Some(15_000), "5 s after the first report");
+    assert_eq!(twin.mode(), Some(Mode::Healthy));
+}
+
 /// M7B-131: self is not in the lag domain, a shadow never is, and `CopyLost` shrinks it so
 /// resume proceeds on the remaining peer alone.
 #[retcd_test]
@@ -1772,24 +1822,28 @@ fn records_above_the_floor_stay_queued_and_pause_at_the_pause_age() {
 // the pin, so the answer does not depend on whether R1 or L1 hears `ConfigChanged` first.
 // ---------------------------------------------------------------------------------------------
 
+/// A scenario trace (spikes §6): per step, the whole effect vector and the mode after it.
+type Trace = Vec<(Vec<KernelEffect>, Option<Mode>)>;
+
 /// Tester probes e05/e05b, ported: d04's seed ([`paused_with_barrier_40_durable`]), 41..=50
 /// applied at 100..=109, then `inputs` at their ticks, with B and C reporting and a health eval
-/// every 100 ms throughout. Returns each input's answer and the first allow after the last one.
-fn walk_with(inputs: Vec<(u64, KernelEvent)>) -> (Vec<Vec<KernelEffect>>, Option<u64>) {
+/// every 100 ms throughout. Returns the inputs' trace and the first allow after the last one.
+fn walk_with(inputs: Vec<(u64, KernelEvent)>) -> (Trace, Option<u64>) {
     let mut p = paused_with_barrier_40_durable();
     let mut evaluated = 0;
     for (seq, t) in (41..=50).zip(100..) {
         run_to(&mut p, &mut evaluated, t);
         step(&mut p, t, applied(seq, 1));
     }
-    let answers = inputs
+    let trace = inputs
         .into_iter()
         .map(|(t, input)| {
             run_to(&mut p, &mut evaluated, t);
-            step(&mut p, t, input)
+            let effects = step(&mut p, t, input);
+            (effects, p.mode())
         })
         .collect();
-    (answers, run(&mut p, evaluated, 20_000, |_, _| true))
+    (trace, run(&mut p, evaluated, 20_000, |_, _| true))
 }
 
 /// [`run`] from `*evaluated` through the last 100 ms tick at or before `t`, expecting no allow.
@@ -1818,7 +1872,7 @@ fn a_durable_report_before_its_pin_is_not_lost() {
         (400, pin(C2)),
         (500, confirm_c1(50)),
     ]);
-    for answer in &answers {
+    for (answer, _) in &answers {
         assert_eq!(
             *answer,
             ignored(ReplicaIgnoreReason::Recorded),
@@ -1839,7 +1893,7 @@ fn a_durable_report_after_its_pin_resumes() {
         (300, durable(&[(C2, 50)])),
         (500, confirm_c1(50)),
     ]);
-    for answer in &answers {
+    for (answer, _) in &answers {
         assert_eq!(
             *answer,
             ignored(ReplicaIgnoreReason::Recorded),
@@ -1851,8 +1905,9 @@ fn a_durable_report_after_its_pin_resumes() {
 }
 
 /// B-R46d: a report naming an active predicate and one not pinned yet records both. The pending
-/// view keeps the highest seq per version, so a lower later view does not lower it, and the pin
-/// seeds from it: the floor is min(C1 50, C2 45) = 45 and the entry is gone.
+/// view keeps R1's latest report per version, as an active predicate does (lead ruling B-R46e,
+/// tester F1), so the lower later view replaces 45, and the pin seeds from it: the floor is
+/// min(C1 50, C2 30) = 30 and the entry is gone.
 #[retcd_test]
 fn a_mixed_report_is_remembered_for_the_pin() {
     let mut p = golden();
@@ -1873,13 +1928,14 @@ fn a_mixed_report_is_remembered_for_the_pin() {
     );
     assert!(p.pending_durable_versions().is_empty());
     assert_eq!(
-        step(&mut p, T0, applied(45, 1)),
+        step(&mut p, T0, applied(30, 1)),
         ignored(ReplicaIgnoreReason::NothingOutstanding),
-        "C2 seeded at 45, not 30 and not 0"
+        "C2 seeded at 30, the latest view, not 0"
     );
     assert_eq!(
-        step(&mut p, T0, applied(46, 1)),
-        ignored(ReplicaIgnoreReason::Recorded)
+        step(&mut p, T0, applied(31, 1)),
+        ignored(ReplicaIgnoreReason::Recorded),
+        "C2 seeded at 30, not the highest view 45"
     );
 }
 
@@ -1968,4 +2024,214 @@ fn a_report_for_a_retired_version_is_still_refused() {
         step(&mut p, T0, applied(1, 1)),
         ignored(ReplicaIgnoreReason::Recorded)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lead ruling B-R46e: tester F1. The pending store keeps R1's latest report, as the active store
+// does, so the same reports end in the same state whether L1 pins before them or after them.
+// Tester probes f06 and f06b have no plan id; these rows carry plain names.
+// ---------------------------------------------------------------------------------------------
+
+/// One beat of a scenario (spikes §6): an L1 input at a tick, or L1's health timer firing at one.
+#[derive(Clone)]
+enum Beat {
+    Input(u64, KernelEvent),
+    Eval(u64),
+}
+
+/// Plays `beats` on `p` in order and returns their trace.
+fn play(p: &mut Protection, beats: impl IntoIterator<Item = Beat>) -> Trace {
+    beats
+        .into_iter()
+        .map(|beat| {
+            let effects = match beat {
+                Beat::Input(t, input) => step(p, t, input),
+                Beat::Eval(t) => health(p, t),
+            };
+            (effects, p.mode())
+        })
+        .collect()
+}
+
+/// Tester F1, probe f06: C1 is durable through 90, R1 reports C2 twice, and L1 pins C2 before
+/// both reports or after both. Either way C2 holds R1's latest view, `seed`: seq `seed` is
+/// durable when applied, `seed + 1` is queued, warns at 1000 ms and pauses at 2000 ms, and the
+/// two orders end in the same state. Two pairs, because latest must beat both neighbours: falling
+/// (50 then 30, seed 30) separates latest from highest, the old max rule, under which the
+/// pin-last order took 31 as durable and never paused; rising (30 then 50, seed 50; lead ruling
+/// B-R50, tester G1) separates latest from lowest.
+#[retcd_test]
+fn the_pin_order_does_not_decide_the_seeded_view() {
+    for (pair, first, seed) in [("falling", 50, 30), ("rising", 30, 50)] {
+        let report = |view: &[(ConfigVersion, u64)]| Beat::Input(T0, durable(view));
+        let (c1_90, earlier, latest) = (
+            report(&[(C1, 90)]),
+            report(&[(C2, first)]),
+            report(&[(C2, seed)]),
+        );
+        let pin_c2 = Beat::Input(T0, pin(C2));
+        let exposure = [
+            Beat::Input(T0, applied(seed, 1)),
+            Beat::Input(T0, applied(seed + 1, 1)),
+            Beat::Eval(T0 + 1_000),
+            Beat::Eval(T0 + 2_000),
+        ];
+        let orders = [
+            (
+                "pin first",
+                [
+                    c1_90.clone(),
+                    pin_c2.clone(),
+                    earlier.clone(),
+                    latest.clone(),
+                ],
+            ),
+            ("pin last", [c1_90, earlier, latest, pin_c2]),
+        ];
+
+        let healthy = |reason| (ignored(reason), Some(Mode::Healthy));
+        let recorded = healthy(ReplicaIgnoreReason::Recorded);
+        let front = Seq(seed + 1);
+        let paused = AdmissionState {
+            allow: false,
+            reason: Some(ErrorKind::ProtectionPaused),
+            oldest_unsafe_age: 2_000,
+            oldest_unsafe_seq: front,
+            replication_lag: ReplicationLag::millis(2_000),
+            stalest_copy: Some(C),
+            lost_copies: vec![],
+            paused_prefix: front,
+            resume_barrier: front,
+            required_config_versions: vec![C2, C1],
+            outstanding_unsafe_bytes: 1,
+        };
+        let expected: Trace = vec![
+            recorded.clone(),
+            recorded.clone(),
+            recorded.clone(),
+            recorded.clone(),
+            healthy(ReplicaIgnoreReason::NothingOutstanding),
+            recorded,
+            (
+                vec![KernelEffect::ProtectionWarn {
+                    oldest_unsafe_seq: front,
+                    age_ms: 1_000,
+                }],
+                Some(Mode::Warn),
+            ),
+            (vec![KernelEffect::SetAdmission(paused)], Some(Mode::Paused)),
+        ];
+
+        let mut ends = Vec::new();
+        for (order, beats) in orders {
+            let mut p = golden();
+            let trace = play(&mut p, beats.into_iter().chain(exposure.clone()));
+            assert_eq!(trace, expected, "{pair}, {order}");
+            assert!(p.pending_durable_versions().is_empty(), "{pair}, {order}");
+            ends.push(p);
+        }
+        assert_eq!(ends[0], ends[1], "{pair}: the same state whichever order");
+    }
+}
+
+/// Tester F1, probe f06b: the same two C2 reports at the admission edge, on d04's walk. L1 pins
+/// C2 last (at 400) or first (at 150), and C1 retires at 50. R1's latest view says C2 is durable
+/// only through 30, so in both orders L1 is `Paused` at barrier 50 after the retirement and does
+/// not resume until R1 reports C2 through 50 at 3000. Then both resume within one hold of that
+/// report, at the same tick. Under the old max rule the pin-last order stayed `Reprotecting` on
+/// the 50 R1 had since withdrawn and resumed at 5200, before C2 was durable through the barrier.
+///
+/// The rising pair (C2 30, then 50; lead ruling B-R50, tester G1) is the twin: R1's latest view
+/// meets the barrier, so both orders resume with no further report, within one hold of it. A
+/// store that kept the lowest view would seed 30 in the pin-last order and never resume.
+#[retcd_test]
+fn the_pin_order_does_not_decide_the_resume() {
+    let recorded = |mode| (ignored(ReplicaIgnoreReason::Recorded), Some(mode));
+    let catch_up = (3_000, durable(&[(C2, 50)]));
+
+    let (pin_last, pin_last_allow) = walk_with(vec![
+        (200, durable(&[(C1, 50), (C2, 50)])),
+        (300, durable(&[(C1, 50), (C2, 30)])),
+        (400, pin(C2)),
+        (500, confirm_c1(50)),
+        catch_up.clone(),
+    ]);
+    let holding = Mode::Reprotecting {
+        below_since: Some(Tick(200)),
+    };
+    assert_eq!(
+        pin_last,
+        vec![
+            recorded(holding),
+            recorded(holding),
+            recorded(holding),
+            recorded(Mode::Paused),
+            recorded(Mode::Paused),
+        ],
+        "pin last: C2 seeded at 30 fails barrier 40 at the 500 eval"
+    );
+
+    let (pin_first, pin_first_allow) = walk_with(vec![
+        (150, pin(C2)),
+        (200, durable(&[(C1, 50), (C2, 50)])),
+        (300, durable(&[(C1, 50), (C2, 30)])),
+        (500, confirm_c1(50)),
+        catch_up,
+    ]);
+    let barrier_met = Mode::Reprotecting { below_since: None };
+    assert_eq!(
+        pin_first,
+        vec![
+            recorded(barrier_met),
+            recorded(Mode::Paused),
+            recorded(barrier_met),
+            recorded(Mode::Paused),
+            recorded(Mode::Paused),
+        ],
+        "pin first: C2 at 30 fails barrier 50 at the 400 eval"
+    );
+
+    assert_eq!(pin_last_allow, pin_first_allow);
+    assert!(
+        pin_last_allow.is_some_and(|t| t >= 3_000 + BUDGETS.resume_hold_millis),
+        "a full hold after the catch-up report: {pin_last_allow:?}"
+    );
+    assert_allow_within_one_hold(pin_last_allow, 3_000);
+
+    // Rising pair: no catch-up report is sent, because the latest view already meets 50.
+    let (pin_last, pin_last_allow) = walk_with(vec![
+        (200, durable(&[(C1, 50), (C2, 30)])),
+        (300, durable(&[(C1, 50), (C2, 50)])),
+        (400, pin(C2)),
+        (500, confirm_c1(50)),
+    ]);
+    assert_eq!(
+        pin_last,
+        vec![recorded(holding); 4],
+        "rising, pin last: C2 seeded at 50 keeps barrier 40 durable, so the hold never breaks"
+    );
+    assert_eq!(pin_last_allow, Some(5_200), "one hold from 200");
+
+    let (pin_first, pin_first_allow) = walk_with(vec![
+        (150, pin(C2)),
+        (200, durable(&[(C1, 50), (C2, 30)])),
+        (300, durable(&[(C1, 50), (C2, 50)])),
+        (500, confirm_c1(50)),
+    ]);
+    assert_eq!(
+        pin_first,
+        vec![
+            recorded(barrier_met),
+            recorded(Mode::Paused),
+            recorded(Mode::Paused),
+            recorded(Mode::Reprotecting {
+                below_since: Some(Tick(500)),
+            }),
+        ],
+        "rising, pin first: paused at 50 by the 200 eval, barrier met by the 400 eval"
+    );
+    assert_eq!(pin_first_allow, Some(5_500), "one hold from 500");
+    for allow in [pin_last_allow, pin_first_allow] {
+        assert_allow_within_one_hold(allow, 300);
+    }
 }

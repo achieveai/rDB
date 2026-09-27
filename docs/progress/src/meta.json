@@ -1,10 +1,10 @@
 {
-  "updated": "2026-09-22T19:51:58.362Z",
+  "updated": "2026-09-23T05:34:44.040Z",
   "ledger": {
     "path": ".claude/scratchpad/conversation_memories/rdb-partition-database/ledger.md",
-    "line": 4453
+    "line": 5233
   },
-  "git_head": "395d535",
+  "git_head": "5720f79",
   "part_states": {
     "sm-core": "built",
     "sm-log": "built",
@@ -53,7 +53,7 @@
     "rdb-harness-caps": "gap",
     "rdb-authority": "building",
     "rdb-kernel-a": "building",
-    "rdb-kernel-b": "planned",
+    "rdb-kernel-b": "building",
     "rdb-oracle": "building",
     "rdb-campaign": "gap"
   }

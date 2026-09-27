@@ -36,6 +36,9 @@ pub enum Domain {
     Config = 4,
     /// An oracle checkpoint over client-visible state (spike §4, trace seam).
     Checkpoint = 5,
+    /// One value served by a read: the key and the bytes P1 handed out (lead ruling A-R66).
+    /// Its own domain so a single read can never share a preimage with an oracle checkpoint.
+    ReadValue = 6,
 }
 
 /// A 32-byte content digest.
