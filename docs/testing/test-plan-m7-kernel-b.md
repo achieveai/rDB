@@ -1,4 +1,4 @@
-<!-- drift-basis: 87e681a -->
+<!-- drift-basis: c24bc20 -->
 
 # M7 kernel-b test plan: R1 replication, L1 protection, F1 recovery
 
@@ -807,7 +807,7 @@ kernel-b's own leaf, inside the `#[non_exhaustive]` carriers CB-1 built:
   to the node of `from`, where R1 starts a source-side catch-up cursor" (the type's own doc
   comment, citing `design.md` §5.6, §3.2a and rulings B-R59/B-R59a).
 - `KernelEffect::SendRecoveryEnvelopes { copy: CopyId, from: Seq, through: Seq, credential:
-  FenceCredential }` (declared `event.rs:578`) — "the host reads the canonical envelopes
+  FenceCredential }` (declared in `event.rs` as `KernelEffect::SendRecoveryEnvelopes`) — "the host reads the canonical envelopes
   `from..=through` from this node's own log and unicasts each to `copy` as a `RecoveryAppend`
   carrying `credential`, byte for byte… a separate arm from `SendEnvelopes` so that a credentialed
   recovery send and a primary's catch-up send are never confusable" (same doc comment, same
@@ -848,6 +848,8 @@ below that enum shift. No row literal in this plan cites a line below it. The ma
 moved here: this is an uncommitted export, and the marker moves when the lead lands the variant.
 
 Landed in `87e681a`. **Re-read (2026-09-27, lead), basis moves `bc8b45e` → `87e681a`.** `87e681a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat bc8b45e 87e681a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +6 −1: `SyncWithheldReason::Stalled` is appended last (ruling B-R70, M7B-156) and the `NoDigest` doc is reworded (placed history **and** the engine's stored record). No declaration moved; only lines below that enum shift. A grep of this plan for `trace.rs` line citations at or below `:1519` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+**Re-read (2026-09-27, lead), basis moves `87e681a` → `c24bc20`.** `c24bc20` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat 87e681a c24bc20 -- crates/rdb-core/src/contracts` lists `event.rs` only, +9 −5, and every changed line is a `///` doc comment on `KernelEffect::SendEnvelopes` (its producers are now the catch-up cursor, the stream, the keepalive and the retransmit — B-R67i; the `copy` field reads "The copy to send to"). No type, variant or field changed. The hunk sits at `event.rs:553`, so every line below it shifts +4. A grep of this plan for `event.rs` line citations at or below `:553` found one that **rotted**: the `SendRecoveryEnvelopes` bullet above cited "declared `event.rs:578`", which is now `:582`. Per AGENTS.md (cite a declaration by name) it now names `KernelEffect::SendRecoveryEnvelopes` instead of a line. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 ## 16. Row counts
 

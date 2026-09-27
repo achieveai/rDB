@@ -1,4 +1,4 @@
-<!-- drift-basis: 87e681a -->
+<!-- drift-basis: c24bc20 -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -1021,6 +1021,10 @@ re-read, not before it.
 ### 15.6 Rebase from `bc8b45e` to `87e681a` (2026-09-27, lead)
 
 `87e681a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat bc8b45e 87e681a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +6 −1: `SyncWithheldReason::Stalled` is appended last (ruling B-R70, M7B-156) and the `NoDigest` doc is reworded (placed history **and** the engine's stored record). No declaration moved; only lines below that enum shift. A grep of this plan for `trace.rs` line citations at or below `:1519` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+### 15.7 Rebase from `87e681a` to `c24bc20` (2026-09-27, lead)
+
+`c24bc20` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat 87e681a c24bc20 -- crates/rdb-core/src/contracts` lists `event.rs` only, +9 −5, and every changed line is a `///` doc comment on `KernelEffect::SendEnvelopes` (its producers are now the catch-up cursor, the stream, the keepalive and the retransmit — B-R67i; the `copy` field reads "The copy to send to"). No type, variant or field changed. The hunk sits at `event.rs:553`, so every line below it shifts +4. A grep of this plan for `event.rs` line citations at or below `:553` finds one, §15.6's predecessor note at `:607` (`EffectKind::Kernel`), which is explicitly dated "re-read at `9235bfb`" and so is history, not a live coordinate; it is left as written. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 ---
 

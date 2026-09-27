@@ -1,6 +1,6 @@
 # Test Plan — M7, team kernel-a (A1, T1, P1)
 
-<!-- drift-basis: 87e681a -->
+<!-- drift-basis: c24bc20 -->
 
 **Status:** Proposed — test planner deliverable, **correction round 5** (critic-kernel-a round 3
 findings **TD-12..TD-20** applied over round 4's TD-01..TD-11 and round 3's T-A-01..15; §8.7 holds
@@ -1895,6 +1895,8 @@ kernel-b's own leaf, landing in a wave this plan does not consume. Marker moved 
 re-read, not before it.
 
 **Re-read (2026-09-27, lead), basis moves `bc8b45e` → `87e681a`.** `87e681a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat bc8b45e 87e681a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +6 −1: `SyncWithheldReason::Stalled` is appended last (ruling B-R70, M7B-156) and the `NoDigest` doc is reworded (placed history **and** the engine's stored record). No declaration moved; only lines below that enum shift. A grep of this plan for `trace.rs` line citations at or below `:1519` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+**Re-read (2026-09-27, lead), basis moves `87e681a` → `c24bc20`.** `c24bc20` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat 87e681a c24bc20 -- crates/rdb-core/src/contracts` lists `event.rs` only, +9 −5, and every changed line is a `///` doc comment on `KernelEffect::SendEnvelopes` (its producers are now the catch-up cursor, the stream, the keepalive and the retransmit — B-R67i; the `copy` field reads "The copy to send to"). No type, variant or field changed. The hunk sits at `event.rs:553`, so every line below it shifts +4. A grep of this plan for `event.rs` line citations at or below `:553` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 **Re-read discipline, and what round 4 got wrong about it.** This table is only as fresh as its
 last re-read, which is why the basis is now a gate stage rather than a convention. When
