@@ -550,15 +550,19 @@ pub enum KernelEffect {
         /// The primary's head when the need was found.
         barrier: Seq,
     },
-    /// Catch-up (team kernel-b `design.md` §3.6 step 2; lead ruling B-R40): the host reads the
-    /// canonical envelopes `from..=through` from this primary's log and unicasts them to `copy`,
-    /// unchanged. R1 holds no record bytes. `from == through` in M7, because one record is in
-    /// flight at a time.
+    /// Catch-up plus steady-state replication (team kernel-b `design.md` §3.6 step 2; spec §5.2
+    /// step 4; lead rulings B-R40, B-R47b and B-R67i): the host reads the canonical envelopes
+    /// `from..=through` from this primary's log and unicasts them to `copy`, unchanged. R1 holds
+    /// no record bytes. `from == through` in M7, because one record is in flight at a time.
+    ///
+    /// R1 emits it for a catch-up cursor's record, for the stream (each record the primary
+    /// applies, to each regular secondary with no catch-up record in flight), for the
+    /// keepalive's head, and for the retransmit's byte-identical re-send of any of these.
     ///
     /// Also the answer to a `ProbeDigestAt { seq }` (`from == through == seq`): the record carries
     /// its digest, and the receiver's own ladder does the comparison, so no digest frame exists.
     SendEnvelopes {
-        /// The copy being caught up.
+        /// The copy to send to.
         copy: CopyId,
         /// The first sequence to send.
         from: Seq,

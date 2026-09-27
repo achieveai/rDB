@@ -40,12 +40,17 @@
 //! And the cursor sends the next record only for an ACK whose `received` moves past the mark,
 //! so one extra ACK never puts a second copy of every later record on the wire.
 //!
-//! # Not built
+//! # One generation back (step 1a, lead rulings B-R71 and B-R71a)
 //!
-//! Step 1a, the one-generation limit on historical records (K-B-37, M7B-125 twin b), is not
-//! built. It needs each retained record's generation and the lineage's `base_seq`. The ladder
-//! holds only digests, and `Lineage` has no `base_seq`, so the check has no input. This is a
-//! handoff question.
+//! The receiver admits a historical record only from the predecessor generation (K-B-37). So a
+//! record at or below `prior_base`, where the lineage before the primary's own began, is never
+//! sent: the cursor asks for a snapshot instead, as it does for a record it no longer holds.
+//! The tracker keeps `prior_base` from its own rebuilds, and only a rebuild into a new generation
+//! sets it. A primary `Recovered` builds starts with none and keeps none through a
+//! same-generation `Recovered`, so the limit fires only on a node that stays primary across a
+//! generation change. With `None` it does not fire, and a recovery source always passes `None`.
+//! The primary's own `base_seq` is not read here: every record at or below the prior base is
+//! below it too.
 
 use crate::contracts::digest::Digest;
 use crate::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
@@ -300,16 +305,29 @@ impl CatchupCursor {
     /// the record at `head`. The copy answers `NeedPrefix` from its own head, and step 1 walks it
     /// from there; or it holds the record and answers `AlreadyHave` with its ACK.
     pub fn start(&mut self, head: Seq) -> Vec<EffectKind> {
-        self.send_after(Seq(head.0.saturating_sub(1)), head)
+        self.send_after(Seq(head.0.saturating_sub(1)), head, None)
     }
 
-    /// One outcome from the copy. `history` and `head` are the primary's own ladder and
-    /// applied head.
+    /// One outcome from the copy, with no prior base: [`Self::on_outcome_within`] for a cursor
+    /// whose sender knows none, as a recovery source's does not.
     pub fn on_outcome(
         &mut self,
         outcome: AppendOutcome,
         history: &DigestLadder,
         head: Seq,
+    ) -> Vec<EffectKind> {
+        self.on_outcome_within(outcome, history, head, None)
+    }
+
+    /// One outcome from the copy. `history` and `head` are the primary's own ladder and
+    /// applied head, and `prior_base` where the lineage before its own began, when it knows
+    /// (step 1a, lead rulings B-R71 and B-R71a).
+    pub fn on_outcome_within(
+        &mut self,
+        outcome: AppendOutcome,
+        history: &DigestLadder,
+        head: Seq,
+        prior_base: Option<Seq>,
     ) -> Vec<EffectKind> {
         if let Some(stop) = self.stopped {
             let reason = if stop == Stop::Quarantined {
@@ -320,7 +338,7 @@ impl CatchupCursor {
             return vec![replica(reason)];
         }
         match outcome {
-            AppendOutcome::Accepted(ack) => self.on_progress(&ack, history, head),
+            AppendOutcome::Accepted(ack) => self.on_progress(&ack, history, head, prior_base),
             // The receiver follows `AlreadyHave` with its current ACK (§3.2), and that ACK moves
             // the cursor. Sending here as well would send every next record twice.
             AppendOutcome::AlreadyHave => {
@@ -337,7 +355,7 @@ impl CatchupCursor {
                 vec![replica(ReplicaIgnoreReason::Recorded)]
             }
             AppendOutcome::ProbeDigestAt { seq } => self.on_probe(seq, history, head),
-            AppendOutcome::Rejected(reject) => self.on_reject(reject, history, head),
+            AppendOutcome::Rejected(reject) => self.on_reject(reject, history, head, prior_base),
         }
     }
 
@@ -351,6 +369,7 @@ impl CatchupCursor {
         ack: &AppendAck,
         history: &DigestLadder,
         head: Seq,
+        prior_base: Option<Seq>,
     ) -> Vec<EffectKind> {
         let progress = ack.progress;
         let past = self
@@ -368,7 +387,7 @@ impl CatchupCursor {
             return vec![replica(ReplicaIgnoreReason::Recorded)];
         }
         self.answered();
-        self.send_after(Seq(progress.received.0), head)
+        self.send_after(Seq(progress.received.0), head, prior_base)
     }
 
     /// An ACK answered the record in flight: nothing is outstanding or unACKed, and the probe
@@ -413,6 +432,7 @@ impl CatchupCursor {
         head_digest: Digest,
         history: &DigestLadder,
         head: Seq,
+        prior_base: Option<Seq>,
     ) -> Vec<EffectKind> {
         self.outstanding = None;
         self.unacked = None;
@@ -426,7 +446,7 @@ impl CatchupCursor {
                     copy: self.copy,
                 })]
             }
-            DigestLookup::Match => self.send_after(have, head),
+            DigestLookup::Match => self.send_after(have, head, prior_base),
         }
     }
 
@@ -450,12 +470,13 @@ impl CatchupCursor {
         reject: AppendReject,
         history: &DigestLadder,
         head: Seq,
+        prior_base: Option<Seq>,
     ) -> Vec<EffectKind> {
         use AppendReject as R;
         let copy = self.copy;
         let (stop, effect) = match reject {
             R::NeedPrefix { have, head_digest } => {
-                return self.on_need_prefix(have, head_digest, history, head);
+                return self.on_need_prefix(have, head_digest, history, head, prior_base);
             }
             R::Quarantined | R::CorruptHistory { .. } | R::DivergentHistory { .. } => (
                 Stop::Quarantined,
@@ -483,12 +504,16 @@ impl CatchupCursor {
 
     /// Step 2: send the record after `done`, or report that there is nothing past the head to
     /// send. The head is checked before `Seq::next`, so a peer's `u64::MAX` never overflows
-    /// (lead ruling B-R47, S5-F3).
-    fn send_after(&mut self, done: Seq, head: Seq) -> Vec<EffectKind> {
+    /// (lead ruling B-R47, S5-F3). Step 1a first: a record at or below `prior_base` is older than
+    /// the predecessor, so the copy gets a snapshot request and nothing is sent.
+    fn send_after(&mut self, done: Seq, head: Seq, prior_base: Option<Seq>) -> Vec<EffectKind> {
         if done >= head {
             return vec![replica(ReplicaIgnoreReason::Recorded)];
         }
         let next = done.next();
+        if prior_base.is_some_and(|prior| next <= prior) {
+            return vec![self.snapshot(head)];
+        }
         self.outstanding = Some(next);
         self.unacked = Some(next);
         self.waited = false;

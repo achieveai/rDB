@@ -46,9 +46,8 @@
 //! * ~~the acquisition and renewal CAS rows, and the healthy grant-record read-back~~ — built
 //!   under lead ruling A-R47 (item §3.1). The `Fenced | ReadOk` exit row (a record naming a
 //!   *new* grant id) is not: `Fenced` does not remember the old id it would compare against;
-//! * the **post-`Recovered`** install (`Fact(LineageInstalled)`) and the `Recovered` trigger row
-//!   that issues its read. The single-record adopt's changed and unchanged rows are built; this
-//!   one sits above them (finding K-A-55) and needs the trigger's pending read to recognise;
+//! * ~~the **post-`Recovered`** install (`Fact(LineageInstalled)`) and the `Recovered` trigger
+//!   row that issues its read~~ — built under lead ledger L-R177gf and lead ruling A-R78;
 //! * ~~the whole §2.6 activation side~~ — built under lead ruling A-R51 (`design.md` §2.6a,
 //!   T1–T13): `Takeover`, [`EventKind::ExternalFenceVerified`] and
 //!   [`crate::contracts::authority::AuthorityEffect::FenceProven`]. No module consumes the proof
@@ -121,6 +120,7 @@ use crate::contracts::ids::{
     OwnerEpoch, PartitionId, Revision, TimerId, TimerVersion,
 };
 use crate::contracts::ignore::KernelIgnoredReason;
+use crate::contracts::recovery::RecoveryResult;
 use crate::contracts::storage::{StorageEvent, StorageFault, StoreEffect};
 use crate::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::CapabilityState;
@@ -773,6 +773,24 @@ pub struct Authority {
     takeover_reads: BTreeMap<(CorrelationId, NodeId), BTreeMap<PartitionId, PendingTakeover>>,
     /// The takeover side's high-water mark over `partitions/*` (lead ruling A-R52).
     takeover_marks: TakeoverMarks,
+    /// The `partitions/{id}` reads the `Recovered` trigger row issued and no answer has reached
+    /// yet, by partition (`design.md` §2.4, the `Recovered` pair; lead ledger L-R177gf). The
+    /// install row recognises its read-back by the correlation stored here.
+    ///
+    /// On the kernel, not in [`Held`]: the trigger row fires in every state (lead ruling A-R78),
+    /// and an `Unheld` node still issues the read. One entry per partition: a second
+    /// `Recovered` for the same partition supersedes the first, whose read-back is then an
+    /// ordinary read.
+    recovery_reads: BTreeMap<PartitionId, RecoveryRead>,
+}
+
+/// One outstanding post-`Recovered` read of `partitions/{id}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveryRead {
+    /// The `Recovered` event's correlation, which its `Get` and that `Get`'s answer carry.
+    correlation: CorrelationId,
+    /// `r.new_generation`: the install row fires only for a record naming it.
+    generation: Generation,
 }
 
 impl Authority {
@@ -791,6 +809,7 @@ impl Authority {
             takeover: BTreeMap::new(),
             takeover_reads: BTreeMap::new(),
             takeover_marks: TakeoverMarks::default(),
+            recovery_reads: BTreeMap::new(),
         }
     }
 
@@ -1736,6 +1755,7 @@ impl Authority {
         event: &Event,
         id: PartitionId,
         outcome: &ReadOutcome,
+        recovery: Option<Generation>,
     ) -> Result<Vec<Effect>, RdbError> {
         if !self.state.is_held() {
             return Ok(vec![Self::ignored(
@@ -1762,7 +1782,11 @@ impl Authority {
                 };
                 match partition::classify(&record, ctx.node) {
                     Some(reason) => reason,
-                    None => return Ok(self.adopt_partition(ctx, event, id, *revision, &record)),
+                    None => {
+                        return Ok(
+                            self.adopt_partition(ctx, event, id, *revision, &record, recovery)
+                        )
+                    }
                 }
             }
         };
@@ -1804,20 +1828,23 @@ impl Authority {
     ///
     /// # The rows, first match wins (finding K-A-43)
     ///
-    /// 1. **The post-`Recovered` install** — `Fact(LineageInstalled)` — sits here, above the
-    ///    changed row, on purpose (finding K-A-55): after a committed recovery root the revision
-    ///    has always advanced and `served` lacks `id`, so the changed row would match first and
-    ///    `LineageInstalled` would be unreachable. **Not built**: it recognises a read *issued by*
-    ///    the `Recovered(r)` trigger row, and that row still answers `Unavailable`, so no read
-    ///    arriving here can have been issued by it. When the trigger lands, its check goes first.
-    /// 2. **Unchanged** — the lineage already served. No write, no bump, no view.
-    /// 3. **Superseded** — a different lineage at a revision no newer than the one this
+    /// 1. **Unchanged** — the lineage already served. No write, no bump, no view.
+    /// 2. **Superseded** — a different lineage at a revision no newer than the one this
     ///    partition's entry was installed at (lead ruling A-R48). The design table has no row for
     ///    it; see [`AuthorityIgnoreReason::PartitionReadSuperseded`].
+    /// 3. **The post-`Recovered` install** — `recovery` is the generation the `Recovered(r)`
+    ///    trigger row named, because this read is the one it issued (lead ledger L-R177gf), and
+    ///    the record names that generation: the write below, with `Fact(LineageInstalled)`. It
+    ///    is matched ahead of the changed row, as the design puts it (finding K-A-55), so
+    ///    `LineageInstalled` is reachable although the revision has advanced and `served` lacks
+    ///    or differs at `id`. **Deliberately below rows 1 and 2**, not above them as the design
+    ///    table lists it: a read-back of a lineage already served (a coherent load got there
+    ///    first) installs nothing and bumps nothing, and one older than an install already made
+    ///    must not roll it back (A-R48). Both only narrow what the design row would do.
     /// 4. **Changed** — `served[id]` rewritten, `authority_seq += 1`, and the same three emit
     ///    points [`Self::install_partitions`] uses, in the same order. A move off a served lineage
     ///    onto one the adopt withholds fences the old lineage first, as the snapshot path does
-    ///    (lead ruling A-R56.1, finding N4).
+    ///    (lead ruling A-R56.1, finding N4). Rows 3 and 4 differ only in the fact.
     ///
     /// A body naming a different partition than the key it was read from is refused before any
     /// of these, because the branch widens rights. The fence path above is deliberately not given
@@ -1851,6 +1878,7 @@ impl Authority {
         id: PartitionId,
         revision: Revision,
         record: &PartitionRecord,
+        recovery: Option<Generation>,
     ) -> Vec<Effect> {
         if record.partition != id {
             return vec![Self::ignored(event, AuthorityIgnoreReason::FamilyRejected)];
@@ -1906,11 +1934,72 @@ impl Authority {
         self.authority_seq = self.authority_seq.saturating_add(1);
 
         effects.extend(self.adopt(ctx, event, id));
-        effects.push(Self::authority(
-            event,
-            AuthorityEffect::Fact(AuthorityFact::LineageChanged),
-        ));
+        // The install row: the read the `Recovered(r)` trigger issued, naming `r.new_generation`
+        // (`part.owner == us` is `partition::classify`'s, already passed). Anything else that
+        // reaches here is the generic changed row.
+        let fact = if recovery == Some(record.generation) {
+            AuthorityFact::LineageInstalled
+        } else {
+            AuthorityFact::LineageChanged
+        };
+        effects.push(Self::authority(event, AuthorityEffect::Fact(fact)));
         effects
+    }
+
+    /// `Held|Unheld|Fenced | Recovered(r)`: the trigger half of `design.md` §2.4's `Recovered`
+    /// pair (lead ledger L-R177gf). **No rights change here** — F1's result says what it
+    /// selected, and only a linearizable read of `partitions/{r.partition}` may widen rights
+    /// (property 3). So this issues that read, remembers it for the install row, and nothing
+    /// else moves.
+    ///
+    /// * **The read is issued in every state.** An `Unheld` or `Fenced` node's read-back installs
+    ///   nothing (`on_control` answers it before the held arms). The grant it acquires later
+    ///   loads the family coherently, and that load installs the recovered generation
+    ///   (`LineageLoaded`, §2.1) — lead ruling A-R78.
+    /// * **`Fact(RecoveryObserved)` only when `r.fenced_prior` names a lineage this node does not
+    ///   serve** — the design row's guard. Its complement had no row: a node that re-acquired
+    ///   and reloaded the prior `(generation, owner_epoch)` before F1's activation CAS, then ran
+    ///   the recovery itself. Lead ruling A-R78: the `Get` is still issued, the fact is not, and
+    ///   the read-back lands on the install row.
+    ///
+    /// Both effects are routed to `r.fenced_prior.partition`, the partition recovered.
+    fn on_recovered(&mut self, event: &Event, result: &RecoveryResult) -> Vec<Effect> {
+        let prior = &result.fenced_prior;
+        let partition = prior.partition;
+        self.recovery_reads.insert(
+            partition,
+            RecoveryRead {
+                correlation: event.correlation,
+                generation: result.new_generation,
+            },
+        );
+        let serves_prior = self
+            .state
+            .held()
+            .and_then(|held| held.served.get(&partition))
+            .is_some_and(|served| {
+                served.generation == prior.prior_generation
+                    && served.owner_epoch == prior.prior_owner_epoch
+            });
+        let read = ControlEffect::Get {
+            key: ControlKey::Partition(partition),
+        };
+        let mut effects = vec![Self::about(Self::control(event, read), partition)];
+        if !serves_prior {
+            let observed = AuthorityEffect::Fact(AuthorityFact::RecoveryObserved);
+            effects.push(Self::about(Self::authority(event, observed), partition));
+        }
+        effects
+    }
+
+    /// The generation a `Recovered` trigger's read of `partitions/{id}` named, if `event` is that
+    /// read's answer; the entry is removed either way it matches. `None` for any other read.
+    fn take_recovery_read(&mut self, event: &Event, id: PartitionId) -> Option<Generation> {
+        let read = self.recovery_reads.get(&id)?;
+        if read.correlation != event.correlation {
+            return None;
+        }
+        self.recovery_reads.remove(&id).map(|read| read.generation)
     }
 
     /// [`EffectKind::AdoptAuthority`] for an installed `partition`, then its view, or neither
@@ -2507,6 +2596,18 @@ impl Authority {
                 .map(|change| Self::control(event, ControlEffect::Get { key: change.key }))
                 .collect()),
 
+            // The read-back of a `Recovered` trigger reaching a node that holds no grant (lead
+            // ruling A-R78): nothing installs, because there is no grant to serve under. The
+            // acquire's coherent load installs the recovered generation (`design.md` §2.4/§2.1).
+            // The read is answered, so it is forgotten, and a later read cannot pass for it.
+            ControlEvent::Value {
+                key: ControlKey::Partition(id),
+                ..
+            } if !self.state.is_held() => {
+                let _ = self.take_recovery_read(event, *id);
+                Ok(Vec::new())
+            }
+
             _ if !self.state.is_held() => Ok(Vec::new()),
 
             ControlEvent::Watched {
@@ -2540,7 +2641,8 @@ impl Authority {
                 key: ControlKey::Partition(id),
                 outcome,
             } => {
-                let mut effects = self.on_partition_read(ctx, event, *id, outcome)?;
+                let recovery = self.take_recovery_read(event, *id);
+                let mut effects = self.on_partition_read(ctx, event, *id, outcome, recovery)?;
                 effects.extend(self.observe_read(event, ctx.node, *id, outcome));
                 Ok(effects)
             }
@@ -3302,9 +3404,8 @@ impl Authority {
             | EventKind::Node(_)
             | EventKind::Storage(_)
             | EventKind::ExternalFenceVerified { .. }
-            | EventKind::Kernel(KernelEvent::Authority(_)) => return Ok(()),
-            EventKind::Kernel(KernelEvent::Recovered(_)) => {
-                "authority: Recovered | the post-recovery lineage install (partition-record read)"
+            | EventKind::Kernel(KernelEvent::Authority(_) | KernelEvent::Recovered(_)) => {
+                return Ok(())
             }
             EventKind::Client(_) => "authority: client requests reach T1 and P1, never A1",
             EventKind::Transport(_) => "authority: transport frames reach R1, never A1",
@@ -3323,9 +3424,10 @@ impl Module for Authority {
     fn capability(&self) -> CapabilityState {
         // Deliberately still `Unavailable`. The self-fence transitions, the gates, acquisition
         // and renewal are real, but A1's advertised capability is the four gates **over a grant
-        // it acquired and a lineage it installed**, and the lineage path is not whole: the
-        // post-`Recovered` install is not built, and nothing in this build consumes the
-        // `PublishAuthorityView` the grant rows or the `FenceProven` the takeover rows emit. Reporting `Wired`
+        // it acquired and a lineage it installed**, and the path is not whole end to end:
+        // nothing in this build consumes the `PublishAuthorityView` the grant rows or the
+        // `FenceProven` the takeover rows emit. The post-`Recovered` install is built
+        // (L-R177gf), but that alone does not make it whole. Reporting `Wired`
         // here would tell the campaign runner that package A1 answers checks over a served
         // lineage end to end, which it does not. Flipping it is a lead call, not a side effect.
         CapabilityState::Unavailable
@@ -3348,6 +3450,9 @@ impl Module for Authority {
                 self.on_authority_event(ctx, event, authority)
             }
             EventKind::ExternalFenceVerified { .. } => Ok(self.on_external_fence(ctx, event)),
+            EventKind::Kernel(KernelEvent::Recovered(result)) => {
+                Ok(self.on_recovered(event, result))
+            }
             // `supported` has already refused every remaining kind.
             _ => Ok(Vec::new()),
         };

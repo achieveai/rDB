@@ -11,9 +11,14 @@
 //! Every test drives a real `Event` through the module, so "reachable through step" is what
 //! each one proves as well as its ladder row.
 //!
-//! Not here: M7B-23's `StorageFault` effect and M7B-25 (no landed carrier), M7B-26 (sim),
-//! M7B-123 (the cursor's step 1a is not built) and M7B-139 (an R1 `QuarantineSuffix` and a
-//! tracker clause).
+//! M7B-23 and M7B-25 assert the plan rows as re-worded by lead rulings L-R173 Q2 and Q3 (no
+//! `StorageFault` alert carrier; `FlushFailed` declined). M7B-123 drives the primary's catch-up
+//! cursor directly beside the receiver. M7B-139 asserts lead ruling B-R68 (`Differs` emits the
+//! alert alone and retains by deleting nothing) and drives the tracker directly for its tracker
+//! clause. M7B-125 drives a `Primary` whose bases came from its own rebuilds (lead rulings B-R71
+//! and B-R71a).
+//!
+//! Not here: M7B-26 (sim).
 //!
 //! Fixture: three copies — A primary (node 1), B regular secondary (node 2, the receiver under
 //! test), C regular secondary (node 3). B holds `(10, d10)` applied, durable 10, generation 3,
@@ -62,7 +67,7 @@ use rdb_core::replication::append::{
     PROGRESS_KEY, UNSOLICITED,
 };
 use rdb_core::replication::catchup::{retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS};
-use rdb_core::replication::primary::{keepalive_timer, KEEPALIVE_MS};
+use rdb_core::replication::primary::{keepalive_timer, Primary, KEEPALIVE_MS};
 use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{
     decode_recovery_append, decode_reply, encode_recovery_append, encode_reply, REPLY_MAGIC,
@@ -1218,30 +1223,72 @@ fn storage_answers_for_another_batch_are_declined() {
     declined(&mut module, &commit_failed(1));
 }
 
-/// M7B-23's buildable half, at every `StorageFault`. Not the row: design §3.3 also emits a
-/// `StorageFault` effect for A1, and no carrier for it has landed (handoff contract ask).
-#[retcd_test]
-fn commit_failed_drops_the_staged_record_and_asks_again_without_quarantine() {
+/// Every [`StorageFault`] variant. The `match` has no wildcard, so a new variant fails to compile
+/// here until it is listed, and a row that walks this list cannot silently skip it.
+fn every_storage_fault() -> [StorageFault; 5] {
     use StorageFault::{Corrupt, FlushFailed, HostCrash, ProcessCrash, WriteFailed};
-    for fault in [WriteFailed, FlushFailed, ProcessCrash, HostCrash, Corrupt] {
+    let listed = |fault: StorageFault| match fault {
+        WriteFailed | FlushFailed | ProcessCrash | HostCrash | Corrupt => fault,
+    };
+    [WriteFailed, FlushFailed, ProcessCrash, HostCrash, Corrupt].map(listed)
+}
+
+/// M7B-23 (design §3.3 `BatchFailed`; ADR-rdb-0005 §3; gate V1), at every `StorageFault`. The
+/// staged record is dropped and nothing of it survives: both heads stay `(10, d10)`, `received`
+/// falls back to 10, the ladder gains no rung at 11, and a flush naming 11 afterwards has nothing
+/// to make durable. The sender is asked again with `NeedPrefix{have 10, head_digest d10}`, and
+/// nothing is quarantined. **Update (lead rulings L-R173 Q2 and A-R25):** that reply is the only
+/// effect. R1 raises no `Alert{StorageFault}`: A1 reads `CommitFailed` itself and fences the
+/// partition, and no carrier was built. The landed field is `have`, not `from`. Renamed from
+/// `commit_failed_drops_the_staged_record_and_asks_again_without_quarantine`, which asserted the
+/// heads, the reply and the quarantine; the suffix and flush clauses are new here.
+#[retcd_test]
+fn m7b_23_batch_failed_leaves_no_partial_suffix_at_every_fault_kind() {
+    for fault in every_storage_fault() {
         let mut module = module();
         send(&mut module, label(A), &golden());
         let effects = step(&mut module, &commit_failed_with(0, fault));
-        assert_eq!(effects.len(), 1);
+        assert_eq!(effects.len(), 1, "{fault:?}: {effects:?}");
         assert_eq!(
             reply_of(&effects[0]),
             rejected(AppendReject::NeedPrefix {
                 have: Seq(10),
                 head_digest: d(10),
-            })
+            }),
+            "{fault:?}"
         );
         let rx_ = rx(&module);
         assert_eq!(
             (rx_.staged(), rx_.accept_head(), rx_.applied_head()),
-            (None, head(10), head(10))
+            (None, head(10), head(10)),
+            "{fault:?}"
         );
-        assert_eq!(rx_.received_seq(), ReceivedSeq(10));
+        assert_eq!(
+            (
+                rx_.received_seq(),
+                rx_.buffered_applied_seq(),
+                rx_.durable_seq()
+            ),
+            (ReceivedSeq(10), AppliedSeq(10), DurableSeq(10)),
+            "{fault:?}"
+        );
+        assert_eq!(
+            (rx_.history().digest_at(Seq(11)), rx_.history().highest()),
+            (None, Some(Seq(10))),
+            "{fault:?}: no rung for the failed record"
+        );
         assert_eq!(rx_.quarantine(), None, "{fault:?}");
+
+        // No partial suffix to flush: a flush naming 11 moves nothing.
+        let effects = step(&mut module, &flushed(&[(P, GEN, 11)]));
+        assert_eq!(
+            effects,
+            [ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::NothingOutstanding
+            ))],
+            "{fault:?}"
+        );
+        assert_eq!(rx(&module).durable_seq(), DurableSeq(10), "{fault:?}");
 
         // The same record is welcome again.
         let effects = send(&mut module, label(A), &golden());
@@ -1310,6 +1357,59 @@ fn a_flush_cannot_make_a_staged_record_durable() {
         ))]
     );
     assert_eq!(rx(&module).durable_seq(), DurableSeq(10));
+}
+
+/// M7B-25 (design §3.3 `FlushFailed`; ADR-rdb-0005 §3; gate V1 "no `DurableProof` without a
+/// successful flush"). B has applied 12 and proved 10 durable. A failed flush, at every
+/// `StorageFault` (a flush that completed partially is `FlushFailed` too, contract
+/// `StorageFault::FlushFailed`), advances nothing: no ACK leaves, so no durable proof does, and
+/// the receiver is byte-identical. **Update (lead ruling L-R173 Q3):** R1 does not consume
+/// `FlushFailed`, so it is declined (`Unavailable`) rather than answered with the design's
+/// telemetry; there is no `Alert` carrier. Near-miss: a flush that confirms less than was applied
+/// (K-F-25's narrower `Flushed`) raises `durable` to what it confirmed and no further, and the
+/// next full flush still raises it to the applied head.
+#[retcd_test]
+fn m7b_25_flush_failed_and_partial_flush_advance_nothing() {
+    let mut module = applied_to(12);
+    assert_eq!(
+        (
+            rx(&module).buffered_applied_seq(),
+            rx(&module).durable_seq()
+        ),
+        (AppliedSeq(12), DurableSeq(10))
+    );
+    for (ticket, fault) in (1..).zip(every_storage_fault()) {
+        declined(
+            &mut module,
+            &storage(StorageEvent::FlushFailed {
+                ticket: FlushTicket(ticket),
+                fault,
+            }),
+        );
+        assert_eq!(rx(&module).durable_seq(), DurableSeq(10), "{fault:?}");
+    }
+
+    // A narrower confirmation raises durable to what it names, not to the applied head.
+    let effects = step(&mut module, &flushed(&[(P, GEN, 11)]));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], A, UNSOLICITED, CONFIG),
+        AppendOutcome::Accepted(ack(12, 12, 11))
+    );
+    // A failed flush after it still moves nothing.
+    declined(
+        &mut module,
+        &storage(StorageEvent::FlushFailed {
+            ticket: FlushTicket(9),
+            fault: StorageFault::FlushFailed,
+        }),
+    );
+    assert_eq!(rx(&module).durable_seq(), DurableSeq(11));
+    let effects = step(&mut module, &flushed(&[(P, GEN, 12)]));
+    assert_eq!(
+        reply_at(&effects[0], A, UNSOLICITED, CONFIG),
+        AppendOutcome::Accepted(ack(12, 12, 12))
+    );
 }
 
 #[retcd_test]
@@ -1543,6 +1643,211 @@ fn recovered_on_a_differing_cutoff_quarantines_and_moves_no_head() {
     );
 }
 
+/// B at `(60, d60)`, then A's records 61..=120 each staged and committed, durable 110. Records
+/// from `fork` on are a stale ex-owner's (`b"x"`, not the golden `b"v"`), so B ends at
+/// `(120, d120')` and its ladder is dense from 60: golden below `fork`, stale from it.
+fn took_from_stale_owner(fork: u64) -> Replication {
+    let mut module = Replication::new();
+    module.install_receiver(receiver_at(P, 60, 60));
+    let mut records = chain(fork - 1).split_off(60);
+    for seq in fork..=120 {
+        let prev = records
+            .last()
+            .map_or_else(|| d(seq - 1), |env| env.record_digest);
+        records.push(envelope(seq, prev, b"x"));
+    }
+    for (batch, env) in (0..).zip(&records) {
+        send(&mut module, label(A), env);
+        step(&mut module, &committed(batch, env.header.seq.0));
+    }
+    step(&mut module, &flushed(&[(P, GEN, 110)]));
+    let rx_ = rx(&module);
+    assert_eq!(
+        (
+            rx_.applied_head().seq,
+            rx_.durable_seq(),
+            rx_.history().len()
+        ),
+        (Seq(120), DurableSeq(110), 61)
+    );
+    assert_ne!(rx_.applied_head().digest, d(120));
+    module
+}
+
+/// B's ACK in the lineage `recovered` installs, at `(seq, seq, seq)` with the digest `d(seq)`.
+fn ack_after_takeover(seq: u64) -> AppendAck {
+    AppendAck {
+        generation: NEW_GEN,
+        owner_epoch: NEW_EPOCH,
+        config_version: NEW_CONFIG,
+        ..ack(seq, seq, seq)
+    }
+}
+
+/// M7B-139, lead ruling B-R68 (option a). `Recovered{cutoff 100, d100}` reaches a non-primary
+/// copy that took 61..=120 from a stale ex-owner, and the copy looks the anchor up before it
+/// adopts it. One fixture per arm of the lookup:
+///
+/// - `Match` (the ex-owner forked at 101): the M7B-27 table applies at `(100, d100)`.
+/// - `Differs` (forked at 61, so rung 100 is stale): quarantine `DivergentHistory{100}`, and the
+///   effects are exactly `[Alert{CorruptHistory}]`. "Retain" is B-R68's: no delete or truncate,
+///   so heads, watermarks and the whole ladder are what they were, and only the control rows
+///   (lineage, config, authority, floor, revision) move. Retention itself is F1's
+///   `QuarantineSuffix`, not R1's. The copy's next ACK never reaches the tracker, and one that
+///   did would be dropped and never qualify: the tracker clause drives C's cursor and tracker
+///   directly, as M7B-41 does.
+/// - `NotRetained`: the copy holds no rung at 100 and anchors on its highest rung below it,
+///   then asks from there (M7B-124's behind path). The written arm is a copy behind the cutoff.
+///   The plan's shape, rungs above the cutoff and one below it but none at it, needs a sparse
+///   ladder, and this build cannot make one: the ladder is dense from its seeded floor and
+///   nothing drops a rung (`DigestLadder`'s doc).
+///
+/// Not asserted: a copy seeded above the cutoff holds no rung at or below it, and
+/// `on_recovered` answers `Ignored{Error(InvalidArgument)}` and changes nothing. The code calls
+/// that a handoff question, and no design row names an answer, so it is outside this claim.
+#[retcd_test]
+fn m7b_139_recovered_looks_up_the_anchor_before_adopting_it_three_arms() {
+    let new_lineage = Lineage {
+        partition: P,
+        generation: NEW_GEN,
+        owner_epoch: NEW_EPOCH,
+    };
+    let new_root = HistoryRoot {
+        floor: Seq(100),
+        base_digest: d(100),
+        predecessor: Some(GEN),
+    };
+
+    // --- Match: the ex-owner forked above the cutoff.
+    let mut module = took_from_stale_owner(101);
+    let effects = step(&mut module, &recovered(100, d(100), takeover_config()));
+    asks_new_primary(&effects, 100);
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.lineage(), rx_.config()),
+        (new_lineage, &takeover_config())
+    );
+    assert_eq!(
+        (rx_.applied_head(), rx_.accept_head(), rx_.staged()),
+        (head(100), head(100), None)
+    );
+    assert_eq!(
+        (
+            rx_.received_seq(),
+            rx_.buffered_applied_seq(),
+            rx_.durable_seq()
+        ),
+        (ReceivedSeq(100), AppliedSeq(100), DurableSeq(100))
+    );
+    assert_eq!(
+        (rx_.history().highest(), rx_.history().digest_at(Seq(100))),
+        (Some(Seq(100)), Some(d(100)))
+    );
+    assert_eq!(
+        (rx_.root(), rx_.last_partition_revision(), rx_.quarantine()),
+        (new_root, REVISION, None)
+    );
+
+    // --- Differs: rung 100 is the ex-owner's.
+    let mut module = took_from_stale_owner(61);
+    let before = rx(&module).clone();
+    let effects = step(&mut module, &recovered(100, d(100), takeover_config()));
+    assert_eq!(
+        effects,
+        [quarantine_alert()],
+        "B-R68: the alert and nothing else"
+    );
+    let rx_ = rx(&module).clone();
+    assert_eq!(
+        rx_.quarantine(),
+        Some(AppendReject::DivergentHistory { at: Seq(100) })
+    );
+    // The rows that move.
+    assert_eq!(
+        (rx_.lineage(), rx_.config()),
+        (new_lineage, &takeover_config())
+    );
+    assert_eq!(
+        (rx_.root(), rx_.last_partition_revision()),
+        (new_root, REVISION)
+    );
+    // The rows that do not: no head, watermark or rung is deleted or truncated.
+    assert_eq!(
+        (rx_.applied_head(), rx_.accept_head(), rx_.staged()),
+        (before.applied_head(), before.accept_head(), before.staged())
+    );
+    assert_eq!(
+        (
+            rx_.received_seq(),
+            rx_.buffered_applied_seq(),
+            rx_.durable_seq()
+        ),
+        (ReceivedSeq(120), AppliedSeq(120), DurableSeq(110))
+    );
+    assert_eq!(rx_.history(), before.history());
+    assert_eq!(rx_.history().highest(), Some(Seq(120)));
+    assert_eq!((rx_.partition(), rx_.node()), (P, B));
+    // The new primary's first record is refused, and the refusal is all B sends it: no ACK.
+    let next = taken_over(chain(101).pop().expect("101"));
+    let refusal = refused_in(&mut module, C, NEW_CONFIG, next.encode().expect("encode"));
+    assert_eq!(refusal, rejected(AppendReject::Quarantined));
+
+    // The tracker clause, driven directly (M7B-41's fixture shape): C leads from (100, d100).
+    let mut ladder = DigestLadder::new();
+    ladder.insert(Seq::ZERO, Digest::ROOT);
+    ladder.insert(Seq(100), d(100));
+    let mut tracker = ProgressTracker::new(TrackerInit {
+        config: takeover_config(),
+        own: CopyId(2),
+        lineage: new_lineage,
+        history: ladder.clone(),
+        local: ReplicaProgress {
+            received: ReceivedSeq(100),
+            buffered_applied: AppliedSeq(100),
+            durable: DurableSeq(100),
+        },
+    })
+    .expect("C's tracker");
+    // Control: before the quarantine is known, the same ACK would be admitted and qualify.
+    let mut unaware = tracker.clone();
+    unaware.on_ack(&label(B), &ack_after_takeover(100), Tick(1));
+    assert!(unaware.qualified_copies(Seq(100)).contains(&CopyId(1)));
+    // C's cursor turns B's refusal into `CopyQuarantined`; routed back, it marks B diverged.
+    let mut cursor = CatchupCursor::new(CopyId(1));
+    assert_eq!(
+        cursor.on_outcome(refusal, &ladder, Seq(100)),
+        [EffectKind::Kernel(KernelEffect::CopyQuarantined {
+            copy: CopyId(1)
+        })]
+    );
+    tracker.on_divergence(CopyId(1), Tick(1));
+    assert!(tracker.is_diverged(CopyId(1)));
+    let frozen = tracker.clone();
+    assert_eq!(
+        tracker.on_ack(&label(B), &ack_after_takeover(100), Tick(2)),
+        [ignored(KernelIgnoredReason::AckRejected(
+            AckRejectReason::Diverged
+        ))]
+    );
+    assert_eq!(tracker, frozen, "a dropped ACK changes nothing");
+    assert!(!tracker.qualified_copies(Seq(100)).contains(&CopyId(1)));
+
+    // --- NotRetained: B holds nothing at or above the cutoff; it anchors on its own head.
+    let mut module = Replication::new();
+    module.install_receiver(receiver_at(P, 60, 60));
+    let effects = step(&mut module, &recovered(100, d(100), takeover_config()));
+    asks_new_primary(&effects, 60);
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.applied_head(), rx_.accept_head(), rx_.durable_seq()),
+        (head(60), head(60), DurableSeq(60))
+    );
+    assert_eq!(
+        (rx_.root(), rx_.lineage(), rx_.quarantine()),
+        (new_root, new_lineage, None)
+    );
+}
+
 /// Every other event kind a quarantined receiver can be offered, answered or declined, leaves
 /// the quarantine set. The receiver has 11 staged so that storage events for it still route.
 /// The plan's `PinnedConfig` and `ControlBoot` have no event to R1; `ConfigChanged` and a
@@ -1742,6 +2047,339 @@ fn sent_now(module: &mut Replication, from: NodeId, env: &ReplicationEnvelope) -
         module,
         &framed_on(B, from, authority(NEW_GEN, NEW_EPOCH), NEW_CONFIG, env),
     )
+}
+
+/// The committed root's cutoff in M7B-123: `(100, d100)` of generation `GEN`.
+const ROOT_CUT: u64 = 100;
+
+/// B at `(50, d50)`, holding nothing above it, after the takeover committed the root at
+/// `(100, d100)` of `GEN`, with C the new primary. Returns the module and the unsolicited
+/// `NeedPrefix` B sent C.
+fn behind_the_root() -> (Replication, AppendOutcome) {
+    let mut module = Replication::new();
+    module.install_receiver(receiver_at(P, 50, 50));
+    let effects = step(
+        &mut module,
+        &recovered(ROOT_CUT, d(ROOT_CUT), takeover_config()),
+    );
+    asks_new_primary(&effects, 50);
+    let asked = reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG);
+    assert_eq!(rx(&module).history().digest_at(Seq(ROOT_CUT)), None);
+    (module, asked)
+}
+
+/// Stage `env` from C on the new authority and commit it; return B's ACK to C.
+fn applied_from_c(module: &mut Replication, env: &ReplicationEnvelope) -> AppendOutcome {
+    let seq = env.header.seq;
+    let effects = sent_now(module, C, env);
+    let (batch, generation, staged) = staged_batch(&effects);
+    assert_eq!((generation, staged), (NEW_GEN, seq), "B stages {seq:?}");
+    let effects = step(module, &committed(batch.0, seq.0));
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG)
+}
+
+/// M7B-123 (design §3.2 "Historical envelopes", §3.6 step 2; ADR-rdb-0005 §2; ADR-rdb-0009 §7;
+/// K-B-37, B-R25). B is at 50 under `GEN`; `Recovered` commits the root at `(100, d100)` of `GEN`
+/// and `lookup(100)` is `NotRetained` on B, so B takes the behind path and asks C for 51. C's
+/// catch-up cursor, driven by B's real replies, sends 51..100 one at a time as the canonical
+/// envelopes sealed under `GEN`, `EPOCH` and `CONFIG`, in frames on C's new authority. B accepts
+/// every one: rows 4-6 would refuse `GEN` as `StaleGeneration`, so acceptance is the skip, and
+/// the sender check still runs (A, not the pinned primary, is `NotAMember`). The ACK for 100
+/// makes the cursor emit `CopyCaughtUp{B, 100, d100}`, once: the flush ACK that repeats 100 and
+/// the ACK for 101 emit no second one. 101 under `NEW_GEN`, chained on `d100`, passes the normal
+/// ladder. Twins: a record at 100 under `GEN` whose digest is not `d100` quarantines
+/// `DIVERGENT_HISTORY` on the root-anchor clause (it chains on `d99`, so only the anchor can
+/// catch it), and the cursor stops on `CopyQuarantined`; and 51 under `GEN - 1` is not historical,
+/// so rows 4-6 run and answer `StaleGeneration`.
+///
+/// Not claimed here: the primary-side one-generation check (§3.6 step 1a), which is M7B-125's.
+/// Nor is "unrestamped" at the sender: the record checked below is this test's own. The cursor
+/// below is driven directly, as in
+/// `a_probe_answered_by_the_same_record_loops_until_the_cap_asks_for_a_snapshot`.
+#[retcd_test]
+fn m7b_123_historical_envelopes_reach_copy_caught_up_and_root_anchor_quarantines() {
+    let history = chain(ROOT_CUT + 1);
+    let record = |seq: u64| history[usize::try_from(seq).expect("seq") - 1].clone();
+    let mut ladder = DigestLadder::new();
+    for env in &history[..usize::try_from(ROOT_CUT).expect("cut")] {
+        ladder.insert(env.header.seq, env.record_digest);
+    }
+    let copy = CopyId(1);
+    let head_at = Seq(ROOT_CUT);
+
+    let (mut module, asked) = behind_the_root();
+    // The sender check runs for a historical record: only the pinned primary may deliver one.
+    let effects = sent_now(&mut module.clone(), A, &record(51));
+    assert_eq!(
+        reply_at(&effects[0], A, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::NotAMember)
+    );
+
+    let mut cursor = CatchupCursor::new(copy);
+    let mut outcome = asked;
+    let mut sent = Vec::new();
+    let caught_up = loop {
+        let effects = cursor.on_outcome(outcome, &ladder, head_at);
+        match effects.as_slice() {
+            [EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                copy: to,
+                from,
+                through,
+            })] => {
+                assert_eq!((*to, from), (copy, through));
+                assert!(sent.len() < 100, "the walk must end: {sent:?}");
+                sent.push(from.0);
+                let env = record(from.0);
+                assert_eq!(env.header.generation, GEN, "the fixture's record is GEN's");
+                outcome = applied_from_c(&mut module, &env);
+            }
+            _ => break effects,
+        }
+    };
+    assert_eq!(sent, (51..=ROOT_CUT).collect::<Vec<_>>());
+    assert_eq!(
+        caught_up,
+        [EffectKind::Kernel(KernelEffect::CopyCaughtUp {
+            copy,
+            head: head_at,
+            digest: d(ROOT_CUT),
+        })]
+    );
+    assert_eq!(
+        (rx(&module).applied_head(), rx(&module).quarantine()),
+        (head(ROOT_CUT), None)
+    );
+
+    // Exactly once: the flush ACK repeating 100 does not report it again.
+    let effects = step(&mut module, &flushed(&[(P, NEW_GEN, ROOT_CUT)]));
+    let flush_ack = reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG);
+    assert_eq!(
+        cursor.on_outcome(flush_ack, &ladder, head_at),
+        [ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::Recorded
+        ))]
+    );
+
+    // 101 under the new generation passes the normal ladder, and its ACK reports nothing again.
+    let next = taken_over(record(ROOT_CUT + 1));
+    assert_eq!(next.prev_digest, d(ROOT_CUT));
+    let ack_101 = applied_from_c(&mut module, &next);
+    ladder.insert(next.header.seq, next.record_digest);
+    assert_eq!(
+        cursor.on_outcome(ack_101, &ladder, next.header.seq),
+        [ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::Recorded
+        ))]
+    );
+    assert_eq!(rx(&module).applied_head().seq, Seq(ROOT_CUT + 1));
+
+    // Twin: the record at the root's cutoff with another digest. It chains on d99, so only the
+    // root anchor can refuse it.
+    let (mut module, _) = behind_the_root();
+    for seq in 51..ROOT_CUT {
+        applied_from_c(&mut module, &record(seq));
+    }
+    let wrong = envelope(ROOT_CUT, d(ROOT_CUT - 1), b"other");
+    assert_ne!(wrong.record_digest, d(ROOT_CUT));
+    let effects = sent_now(&mut module, C, &wrong);
+    let proof = AppendReject::DivergentHistory { at: Seq(ROOT_CUT) };
+    let answer = reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG);
+    assert_eq!(answer, rejected(proof));
+    assert_eq!(effects[1..], [quarantine_alert()]);
+    assert_eq!(
+        (rx(&module).quarantine(), rx(&module).applied_head()),
+        (Some(proof), head(ROOT_CUT - 1))
+    );
+    let mut cursor = CatchupCursor::new(copy);
+    assert_eq!(
+        cursor.on_outcome(answer, &ladder, head_at),
+        [EffectKind::Kernel(KernelEffect::CopyQuarantined { copy })]
+    );
+
+    // Twin: two generations back is not historical, so rows 4-6 refuse it.
+    let (mut module, _) = behind_the_root();
+    let older = under(record(51), Generation(GEN.0 - 1), EPOCH, CONFIG);
+    let before = rx(&module).clone();
+    let effects = sent_now(&mut module, C, &older);
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, FRAME_ID, NEW_CONFIG),
+        rejected(AppendReject::StaleGeneration { current: NEW_GEN })
+    );
+    assert_eq!(rx(&module), &before, "a refused append changes nothing");
+}
+
+/// `recovered(cutoff, d(cutoff), takeover_config())`'s result, recovering into `generation`
+/// from the one before it.
+fn recovery_at(cutoff: u64, generation: Generation) -> RecoveryResult {
+    let EventKind::Kernel(KernelEvent::Recovered(result)) =
+        recovered(cutoff, d(cutoff), takeover_config()).kind
+    else {
+        unreachable!("recovered builds a Recovered");
+    };
+    let mut result = *result;
+    let prior = Generation(generation.0 - 1);
+    result.fenced_prior.prior_generation = prior;
+    result.retained_status_map.predecessor_generation = prior;
+    result.new_generation = generation;
+    result.selected.root.generation = generation;
+    result.committed.authority_view.lineage.generation = generation;
+    result
+}
+
+/// C leading P and rebuilt by two of its own recoveries: at `(first, d(first))` into `NEW_GEN`,
+/// then — after applying `first + 1..=100` itself — at `(100, d100)` into generation 5. So its
+/// lineage's base is 100 and the one before began at `first` (lead ruling B-R71a).
+fn primary_after_two_recoveries(first: u64) -> Primary {
+    let mut history = DigestLadder::new();
+    history.insert(Seq::ZERO, Digest::ROOT);
+    for seq in 1..=first {
+        history.insert(Seq(seq), d(seq));
+    }
+    let tracker = ProgressTracker::new(TrackerInit {
+        config: takeover_config(),
+        own: CopyId(2),
+        lineage: authority(GEN, EPOCH),
+        history,
+        local: ReplicaProgress {
+            received: ReceivedSeq(first),
+            buffered_applied: AppliedSeq(first),
+            durable: DurableSeq(first),
+        },
+    })
+    .expect("C's tracker");
+    assert_eq!(
+        (tracker.base_seq(), tracker.prior_base()),
+        (Seq::ZERO, None)
+    );
+    let mut primary = Primary::new(tracker);
+    primary.on_recovered(&recovery_at(first, NEW_GEN), Tick(1));
+    for seq in first + 1..=100 {
+        let applied = KernelEvent::LocalApplied {
+            seq: Seq(seq),
+            bytes: 0,
+            record_digest: d(seq),
+        };
+        primary.on_kernel(&applied, Tick(1));
+    }
+    primary.on_recovered(&recovery_at(100, Generation(5)), Tick(2));
+    let tracker = primary.tracker();
+    assert_eq!(
+        (tracker.head(), tracker.base_seq(), tracker.prior_base()),
+        (Seq(100), Seq(100), Some(Seq(first)))
+    );
+    primary
+}
+
+/// B's `NeedPrefix` from `(have, d(have))`, as C's primary receives it.
+fn b_needs(primary: &mut Primary, have: u64) -> Vec<EffectKind> {
+    let need = rejected(AppendReject::NeedPrefix {
+        have: Seq(have),
+        head_digest: d(have),
+    });
+    primary.on_reply(&label(B), encode_reply(&need).as_ref(), Tick(3))
+}
+
+fn sends_b(seq: u64) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::SendEnvelopes {
+        copy: CopyId(1),
+        from: Seq(seq),
+        through: Seq(seq),
+    })
+}
+
+/// B's ACK at `seq`, in C's generation 5, as C's primary receives it.
+fn b_acks(primary: &mut Primary, seq: u64) -> Vec<EffectKind> {
+    let ack = AppendAck {
+        generation: Generation(5),
+        ..ack_after_takeover(seq)
+    };
+    let accepted = AppendOutcome::Accepted(ack);
+    primary.on_reply(&label(B), encode_reply(&accepted).as_ref(), Tick(3))
+}
+
+const fn snapshot_b() -> EffectKind {
+    EffectKind::Kernel(KernelEffect::SnapshotCatchupRequired {
+        copy: CopyId(1),
+        barrier: Seq(100),
+    })
+}
+
+/// M7B-125, lead rulings B-R71 and B-R71a: catch-up's one-generation limit (design §3.6 step
+/// 1a, K-B-37). C's lineage is based at 100, so records 51..=100 are its predecessor's
+/// history: B, at 50, gets them as they are. The record-level `generation` is not in the
+/// effect, which names sequences only. M7B-123 shows B admits such a record; that the sender
+/// does not re-stamp it (the sim's `send_envelopes` sends the stored bytes) no row pins.
+///
+/// - Twin (a), prior base 50: every record above it goes out, the first of them (51), the one at
+///   the base (100), and nothing is refused.
+/// - Twin (b), prior base 51: record 51 is older than the predecessor, which the receiver's
+///   historical rule does not admit, so C asks for a snapshot and sends nothing. From 51 on,
+///   record 52 goes out: the limit is exactly the prior base.
+///
+/// Twin (b) also takes an ACK: B at 40 would be sent 41, and gets the snapshot instead.
+///
+/// Credited for the continuous primary only: a node that stays primary across a generation
+/// change. Not covered (B-R71a): every primary `Recovered` builds starts with no prior base and
+/// keeps none through a same-generation `Recovered`, so step 1a never fires in a node's first
+/// generation as primary, including the B-R58b genesis walk; nor for the recovery source, nor a
+/// probe answer. A prior base taken across generations this node did not serve is not checked
+/// and can be too low.
+#[retcd_test]
+fn m7b_125_catch_up_sends_historical_records_unrestamped_or_snapshot_if_older() {
+    // Twin (a).
+    let mut primary = primary_after_two_recoveries(50);
+    assert_eq!(b_needs(&mut primary, 50), [sends_b(51)]);
+    assert_eq!(b_needs(&mut primary, 99), [sends_b(100)]);
+
+    // Twin (b).
+    let mut primary = primary_after_two_recoveries(51);
+    assert_eq!(b_needs(&mut primary, 50), [snapshot_b()]);
+    assert_eq!(
+        primary.cursor(CopyId(1)).and_then(CatchupCursor::unacked),
+        None,
+        "nothing sent"
+    );
+    assert!(!primary.awaits_ack());
+    // The ACK path reads the same limit: the tracker admits B's ACK at 40, and the cursor would
+    // send 41, which is older than the predecessor too.
+    let progress = EffectKind::Kernel(KernelEffect::PeerProgress {
+        peer: B,
+        contiguous_seq: Seq(40),
+    });
+    assert_eq!(b_acks(&mut primary, 40), [progress, snapshot_b()]);
+    assert_eq!(
+        primary.cursor(CopyId(1)).and_then(CatchupCursor::unacked),
+        None,
+        "nothing sent on the ACK"
+    );
+    assert_eq!(b_needs(&mut primary, 51), [sends_b(52)]);
+}
+
+/// The bases step 1a reads follow the primary's own recoveries (lead ruling B-R71a). A primary
+/// `Recovered` builds on C starts at the cutoff with no prior base; the next `Recovered`
+/// rebuilds it, and its base becomes the prior one.
+#[retcd_test]
+fn a_built_primary_knows_its_base_and_a_rebuilt_one_its_prior_base() {
+    let mut module = Replication::new();
+    let first = requiring(recovered(40, d(40), takeover_config()), &[2], C);
+    step(&mut module, &on(C, first));
+    let tracker = module.primary(C, P).expect("built").tracker();
+    assert_eq!((tracker.base_seq(), tracker.prior_base()), (Seq(40), None));
+    let second = event(EventKind::Kernel(KernelEvent::Recovered(Box::new(
+        recovery_at(40, Generation(5)),
+    ))));
+    step(&mut module, &on(C, requiring(second, &[2], C)));
+    let tracker = module.primary(C, P).expect("rebuilt").tracker();
+    assert_eq!(
+        (
+            tracker.lineage().generation,
+            tracker.base_seq(),
+            tracker.prior_base()
+        ),
+        (Generation(5), Seq(40), Some(Seq(40)))
+    );
 }
 
 // --- RecoveryAppend (§3.2a) ---------------------------------------------------------------

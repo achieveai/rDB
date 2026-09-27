@@ -21,12 +21,13 @@ use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::authority::{Authority, AuthorityTimer, ServedLineage};
 use rdb_core::contracts::authority::{
     AuthorityEffect, AuthorityEvent, AuthorityFact, AuthorityIgnoreReason, AuthorityView,
-    Checkpoint, DenyReason, FenceScope, Lineage, Verdict,
+    Checkpoint, DenyReason, FenceScope, FencingProof, Lineage, PartitionMode, Revocation, Verdict,
 };
 use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
     ControlRecord, ReadOutcome, WatchCursor,
 };
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module,
     NodeLifecycle, StepCtx,
@@ -36,6 +37,10 @@ use rdb_core::contracts::ids::{
     GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
+use rdb_core::contracts::membership::{CopyId, PartitionConfig};
+use rdb_core::contracts::recovery::{
+    CommittedRoot, LossRecord, RecoveryBarrier, RecoveryResult, RetainedStatusMap, SelectedLineage,
+};
 use rdb_core::contracts::storage::{
     Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
@@ -144,6 +149,13 @@ fn acquired() -> (Authority, Vec<Effect>) {
 /// acquires under them, so `E` and `renewed_at` come from the real sequence.
 fn acquired_under(step_ctx: &StepCtx<'_>) -> (Authority, Vec<Effect>) {
     let mut kernel = Authority::new();
+    let effects = acquire(&mut kernel, step_ctx);
+    (kernel, effects)
+}
+
+/// The acquisition [`acquired_under`] runs, on a kernel that already exists: an `Unheld` one
+/// that has seen other events first. Returns the commit's effect vector.
+fn acquire(kernel: &mut Authority, step_ctx: &StepCtx<'_>) -> Vec<Effect> {
     // The same id and correlation as `event(1, ..)` below: the commit is matched to the CAS by
     // correlation, and nothing else.
     let due = Event {
@@ -175,7 +187,7 @@ fn acquired_under(step_ctx: &StepCtx<'_>) -> (Authority, Vec<Effect>) {
         )
         .expect("the acquisition commit row is built");
     assert!(kernel.state().is_held(), "the preamble must reach Held");
-    (kernel, effects)
+    effects
 }
 
 /// `Held`, with `p1` installed at `epoch` by a coherent snapshot at revision 10.
@@ -3022,4 +3034,397 @@ fn m7a_145_authority_view_republished_at_five_points_fans_out_per_served_partiti
             "{view:?}"
         );
     }
+}
+
+// =============================================================================================
+// The post-`Recovered` install (`design.md` §2.4, the `Recovered` pair; lead ledger L-R177gf,
+// lead ruling A-R78).
+// =============================================================================================
+
+/// `partitions/{partition}` naming this node at `generation` and `epoch`.
+fn record_at(partition: PartitionId, generation: u64, epoch: u64) -> PartitionRecord {
+    PartitionRecord {
+        generation: Generation(generation),
+        ..record(partition, NODE, epoch)
+    }
+}
+
+/// F1's `Recovered` for `partition`, under correlation `id`: the prior owner served
+/// `(prior.0, prior.1)` as `(generation, owner_epoch)`, and the activation CAS committed
+/// `new_generation` at revision 20. Only `fenced_prior` and `new_generation` are A1's inputs;
+/// the rest is filled in so the value is whole.
+fn recovered(id: u64, partition: PartitionId, prior: (u64, u64), new_generation: u64) -> Event {
+    let (prior_generation, prior_epoch) = (Generation(prior.0), OwnerEpoch(prior.1));
+    let root = Lineage {
+        partition,
+        generation: prior_generation,
+        owner_epoch: prior_epoch,
+    };
+    let result = RecoveryResult {
+        fenced_prior: FencingProof {
+            partition,
+            prior_generation,
+            prior_owner_epoch: prior_epoch,
+            prior_grant_id: GrantId(1),
+            prior_boot_id: BOOT,
+            revocation: Revocation::DurableDrain {
+                ack_revision: Revision(1),
+            },
+            control_revision: Revision(1),
+            decision_tick: Tick::ZERO,
+        },
+        inventories: Vec::new(),
+        selected: SelectedLineage {
+            root,
+            cutoff_seq: Seq::ZERO,
+            cutoff_digest: Digest::ROOT,
+            source: CopyId(1),
+        },
+        new_generation: Generation(new_generation),
+        mode: PartitionMode::Active,
+        barrier: RecoveryBarrier::try_new(&[], &Default::default(), Seq::ZERO, Digest::ROOT)
+            .expect("an empty required set needs no proof"),
+        loss: LossRecord {
+            queried: Vec::new(),
+            unavailable: Vec::new(),
+            cutoff_seq: Seq::ZERO,
+            highest_advertised_seq: Seq::ZERO,
+            uncertain: false,
+        },
+        committed: CommittedRoot {
+            revision: Revision(20),
+            pinned_config: PartitionConfig::new(partition, ConfigVersion(1), Vec::new()),
+            authority_view: AuthorityView {
+                lineage: Lineage {
+                    generation: Generation(new_generation),
+                    ..root
+                },
+                grant_id: GrantId(1),
+                boot_id: BOOT,
+                authority_generation: AuthorityGeneration::default(),
+                config_version: ConfigVersion(1),
+                authority_seq: 0,
+                valid_through_tick: Tick::ZERO,
+                past_horizon: DenyReason::Expired,
+            },
+        },
+        retained_status_map: RetainedStatusMap {
+            predecessor_generation: prior_generation,
+            predecessor_cutoff: Seq::ZERO,
+            retained_through: Seq::ZERO,
+            discarded_from: None,
+            uncertain: false,
+        },
+    };
+    Event {
+        partition,
+        ..event_of(
+            id,
+            EventKind::Kernel(KernelEvent::Recovered(Box::new(result))),
+        )
+    }
+}
+
+/// `effects` split for the `Recovered` trigger row: each `Get` as the partition it is routed to
+/// and the key it reads, and everything else through [`shapes`].
+fn trigger(effects: &[Effect]) -> (Vec<(PartitionId, ControlKey)>, Vec<Shape>) {
+    let gets = effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Get { key }) => Some((effect.partition, *key)),
+            _ => None,
+        })
+        .collect();
+    let rest = effects
+        .iter()
+        .filter(|effect| !matches!(effect.kind, EffectKind::Control(ControlEffect::Get { .. })))
+        .cloned()
+        .collect::<Vec<_>>();
+    (gets, shapes(&rest))
+}
+
+/// The lineage of every `AdoptAuthority` in `effects`, by partition, in order.
+fn adopted_lineages(effects: &[Effect]) -> Vec<(PartitionId, ServedLineage)> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect.kind {
+            EffectKind::AdoptAuthority {
+                partition,
+                generation,
+                owner_epoch,
+                config_version,
+            } => Some((
+                partition,
+                ServedLineage {
+                    generation,
+                    owner_epoch,
+                    config_version,
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// M7A-176. `design.md` §2.4, the `Recovered` pair: the trigger row
+/// (`Held|Unheld|Fenced | Recovered(r)` ⇒ `Control(Read{partitions/{r.partition}})`,
+/// `Fact(RecoveryObserved)`, no rights change) and the install row above the generic changed row
+/// (K-A-55): the read-back that trigger issued, naming `r.new_generation` and us, is
+/// `AdoptAuthority`, `PublishAuthorityView`, `Fact(LineageInstalled)` with `authority_seq += 1`.
+/// Lead ledger L-R177gf (inv-publish-path break 2: A1 declined `Recovered`, so no adopt followed
+/// F1 and T1's seed never loaded). Lead ruling A-R78 for the `Unheld` case: the read-back installs
+/// nothing, and the acquire's coherent load installs the recovered generation (§2.1).
+///
+/// Near misses: the same record read under another correlation is the generic changed row
+/// (`LineageChanged`), after which the recovery's own read-back is `LineageUnchanged`; a
+/// read-back naming another generation than the recovery's is the generic row too.
+#[retcd_test]
+fn m7a_176_post_recovered_read_back_installs_lineage() {
+    // Held, serving p1 only; F1 recovers p2 (prior g1 e1, which this node does not serve) to g2.
+    let mut kernel = serving_p1(1);
+    let before = kernel.view();
+    let effects = kernel
+        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+        .expect("the Recovered trigger row is built");
+    assert_eq!(
+        trigger(&effects),
+        (
+            vec![(P2, ControlKey::Partition(P2))],
+            vec![Shape::Fact(AuthorityFact::RecoveryObserved)]
+        ),
+        "one linearizable read of the recovered partition, and the fact"
+    );
+    assert_eq!(kernel.view(), before, "no rights change at the trigger");
+
+    let effects = kernel
+        .step(&ctx(4), &read(40, P2, 20, &record_at(P2, 2, 2)))
+        .expect("the install row is built");
+    assert_eq!(
+        shapes(&effects),
+        vec![
+            Shape::Adopt(P2, OwnerEpoch(2)),
+            Shape::Publish(P2),
+            Shape::Fact(AuthorityFact::LineageInstalled),
+        ]
+    );
+    let installed = record_at(P2, 2, 2).lineage();
+    assert_eq!(adopted_lineages(&effects), vec![(P2, installed)]);
+    let view = kernel.view();
+    assert_eq!(view.served.get(&P2), Some(&installed), "served[p2] = g2");
+    assert_eq!(view.served.get(&P1), before.served.get(&P1), "p1 untouched");
+    assert_eq!(view.authority_seq, before.authority_seq + 1, "K-A-34");
+
+    // Near miss: the same record, read under a correlation the trigger did not issue.
+    let mut kernel = serving_p1(1);
+    let _ = kernel
+        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+        .expect("trigger");
+    let effects = kernel
+        .step(&ctx(4), &read(41, P2, 20, &record_at(P2, 2, 2)))
+        .expect("a generic read");
+    assert_eq!(
+        shapes(&effects)[2..],
+        [Shape::Fact(AuthorityFact::LineageChanged)],
+        "not the recovery's read: the generic changed row"
+    );
+    let seq = kernel.authority_seq();
+    let effects = kernel
+        .step(&ctx(5), &read(40, P2, 20, &record_at(P2, 2, 2)))
+        .expect("the recovery's read-back, late");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::LineageUnchanged)],
+        "already served: nothing re-installed, no bump"
+    );
+    assert_eq!(kernel.authority_seq(), seq);
+
+    // Near miss: the recovery's read-back names a generation other than the recovery's.
+    let mut kernel = serving_p1(1);
+    let _ = kernel
+        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+        .expect("trigger");
+    let effects = kernel
+        .step(&ctx(4), &read(40, P2, 20, &record_at(P2, 3, 2)))
+        .expect("a read-back at g3");
+    assert_eq!(
+        shapes(&effects)[2..],
+        [Shape::Fact(AuthorityFact::LineageChanged)],
+        "part.generation != r.new_generation: the generic changed row"
+    );
+
+    // Unheld at Recovered (A-R78): the trigger still reads and observes...
+    let mut kernel = Authority::new();
+    let effects = kernel
+        .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
+        .expect("the trigger row answers in every state");
+    assert_eq!(
+        trigger(&effects),
+        (
+            vec![(P1, ControlKey::Partition(P1))],
+            vec![Shape::Fact(AuthorityFact::RecoveryObserved)]
+        )
+    );
+    // ...its read-back installs nothing, because there is no grant to serve it under...
+    let effects = kernel
+        .step(&ctx(4), &read(40, P1, 20, &record_at(P1, 2, 2)))
+        .expect("an unheld read-back");
+    assert_eq!(adopted_lineages(&effects), vec![], "Unheld: no install");
+    assert!(kernel.view().served.is_empty());
+    // ...and the acquire's coherent load installs the recovered generation.
+    let _ = acquire(&mut kernel, &ctx(5));
+    let effects = kernel
+        .step(&ctx(6), &snapshot(6, 20, &[record_at(P1, 2, 2)]))
+        .expect("the coherent load");
+    assert_eq!(
+        adopted_lineages(&effects),
+        vec![(P1, record_at(P1, 2, 2).lineage())]
+    );
+    assert!(shapes(&effects).contains(&Shape::Fact(AuthorityFact::LineageLoaded)));
+
+    // The answered read is forgotten: after the acquire, a read under its correlation is the
+    // generic changed row, not a second install.
+    let mut kernel = Authority::new();
+    let _ = kernel
+        .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
+        .expect("trigger");
+    let _ = kernel
+        .step(&ctx(4), &read(40, P1, 20, &record_at(P1, 2, 2)))
+        .expect("an unheld read-back");
+    let _ = acquire(&mut kernel, &ctx(5));
+    let effects = kernel
+        .step(&ctx(6), &read(40, P1, 21, &record_at(P1, 2, 2)))
+        .expect("a read after the acquire");
+    assert_eq!(
+        shapes(&effects)[2..],
+        [Shape::Fact(AuthorityFact::LineageChanged)]
+    );
+}
+
+/// M7A-177. Lead ruling A-R78, closing the design gap in §2.4's trigger row: its guard is
+/// "`r.fenced_prior` names a lineage we do not currently serve", and the table had no row for the
+/// complement. The case: a node lost its grant, re-acquired it, and its coherent reload installed
+/// the partition record as it then stood — the prior lineage `(g1, e1)` — before F1's activation
+/// CAS moved it. Then F1, on this same node, recovers `p1` from that very lineage to `g2`.
+///
+/// [`serving_p1`] is that state: `Held` through the real acquisition, with the coherent load at
+/// revision 10 having installed `(g1, e1)`. `Recovered` then issues the `Get` and **no**
+/// `RecoveryObserved` (nothing is observed that A1 did not already serve; nothing widens without
+/// the read), and the read-back lands on the install row: `g2` installed, `LineageInstalled`.
+///
+/// Near miss: serving the same generation at another epoch is not serving the fenced prior, so
+/// the fact is emitted.
+#[retcd_test]
+fn m7a_177_same_node_recovery_after_re_acquire_installs_the_new_generation() {
+    let mut kernel = serving_p1(1);
+    let before = kernel.view();
+    let effects = kernel
+        .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
+        .expect("the Recovered trigger row is built");
+    assert_eq!(
+        trigger(&effects),
+        (vec![(P1, ControlKey::Partition(P1))], vec![]),
+        "the Get, and no RecoveryObserved: this node serves the fenced prior (A-R78)"
+    );
+    assert_eq!(kernel.view(), before, "no rights change at the trigger");
+
+    let effects = kernel
+        .step(&ctx(4), &read(40, P1, 20, &record_at(P1, 2, 2)))
+        .expect("the install row is built");
+    assert_eq!(
+        shapes(&effects),
+        vec![
+            Shape::Adopt(P1, OwnerEpoch(2)),
+            Shape::Publish(P1),
+            Shape::Fact(AuthorityFact::LineageInstalled),
+        ]
+    );
+    let installed = record_at(P1, 2, 2).lineage();
+    assert_eq!(adopted_lineages(&effects), vec![(P1, installed)]);
+    let view = kernel.view();
+    assert_eq!(view.served.get(&P1), Some(&installed), "the new generation");
+    assert_eq!(view.authority_seq, before.authority_seq + 1);
+
+    // Near miss: serving g1 at e2 is not serving the fenced prior (g1, e1).
+    let mut kernel = serving_p1(2);
+    let effects = kernel
+        .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
+        .expect("trigger");
+    assert_eq!(
+        trigger(&effects),
+        (
+            vec![(P1, ControlKey::Partition(P1))],
+            vec![Shape::Fact(AuthorityFact::RecoveryObserved)]
+        )
+    );
+}
+
+/// M7A-162. `design.md` §2.4's three emit points (F-R10, K-A-34); lead ledger L-R177gf. One trace:
+/// a coherent load of two partitions, a partition-record change, a post-`Recovered` install, five
+/// `Watched` deliveries and a committed renewal. `AdoptAuthority` comes out exactly at the three
+/// install points — four effects, two from the load — each step that emits one bumps
+/// `authority_seq` once, and no other step emits one or moves the seq.
+///
+/// **The dispatcher clause is modelled, not run.** The row says the dispatcher's `StepCtx`
+/// lineage equals the last `AdoptAuthority` per partition at every step. This folds every
+/// `AdoptAuthority` into a map the way `rdb-sim`'s `Dispatcher::deliver` fills its `adopted`
+/// table, and after every step compares it with A1's `served`: what a `StepCtx` would carry is
+/// always what A1 installed.
+#[retcd_test]
+fn m7a_162_adopt_authority_only_from_lineage_installs() {
+    let mut kernel = held_kernel();
+    let at = |now: u64| sample_ctx(now, 1_600, 0, 10);
+    let mut adopted = std::collections::BTreeMap::new();
+    let mut total = 0;
+    let mut step = |kernel: &mut Authority, now: u64, event: Event, installs: usize| {
+        let seq = kernel.authority_seq();
+        let effects = kernel.step(&at(now), &event).expect("a built row");
+        let emitted = adopted_lineages(&effects);
+        assert_eq!(emitted.len(), installs, "at {now}: {effects:?}");
+        let bump = u64::from(installs > 0);
+        assert_eq!(
+            kernel.authority_seq(),
+            seq + bump,
+            "at {now}: one bump per install step"
+        );
+        adopted.extend(emitted);
+        assert_eq!(
+            adopted,
+            kernel.view().served,
+            "at {now}: StepCtx lineage == served"
+        );
+        total += installs;
+    };
+
+    let load = snapshot(2, 10, &[record(P1, NODE, 1), record(P2, NODE, 1)]);
+    step(&mut kernel, 1_600, load, 2);
+    step(&mut kernel, 1_601, read(3, P1, 15, &record(P1, NODE, 2)), 1);
+    step(&mut kernel, 1_602, recovered(4, P2, (1, 1), 2), 0);
+    step(&mut kernel, 1_603, read(4, P2, 20, &record_at(P2, 2, 2)), 1);
+    for n in 0..5_u64 {
+        let key = if n % 2 == 0 { P1 } else { P2 };
+        let watched = ControlEvent::Watched {
+            prefix: ControlPrefix::Partitions,
+            cursor: WatchCursor {
+                revision: Revision(21 + n),
+            },
+            changes: vec![ControlChange {
+                key: ControlKey::Partition(key),
+                revision: Revision(21 + n),
+            }],
+        };
+        step(&mut kernel, 1_610 + n, event(10 + n, watched), 0);
+    }
+    let due = renew_due(&kernel, 30, 1_700);
+    step(&mut kernel, 1_700, due, 0);
+    assert!(
+        kernel.view().renewal.is_some(),
+        "fixture: a renewal in flight"
+    );
+    let commit = renew_answered(30, CasOutcome::Committed(Revision(8)));
+    step(&mut kernel, 1_701, commit, 0);
+    assert!(
+        kernel.view().renewal.is_none(),
+        "fixture: the renewal committed"
+    );
+    assert_eq!(total, 4, "the three install points, four effects");
 }

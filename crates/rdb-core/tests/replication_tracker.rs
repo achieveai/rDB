@@ -1762,6 +1762,9 @@ fn local_applied(tracker: &mut ProgressTracker, seq: u64) -> Vec<EffectKind> {
 /// rung together. That closes R-F1: the copy's ACK for record 13, dropped while the primary had
 /// not heard of 13, is admitted once it has. The ordering rule (the primary emits it before it
 /// ships the record) is what makes the rule-7 bound sound, so the bound stays.
+///
+/// Update (B-R47b): the admitted ACK for 13 also reports `Gained` at the head 13, after the
+/// anchor's `Gained` at 12, because one ACK made both qualify.
 #[retcd_test]
 fn local_applied_grows_received_applied_and_the_ladder_together() {
     let mut tracker = tracker();
@@ -1786,7 +1789,11 @@ fn local_applied_grows_received_applied_and_the_ladder_together() {
     );
     assert_eq!(
         deliver(&mut tracker, &b(HEAD + 1, HEAD + 1, HEAD)),
-        vec![peer_progress(B, HEAD + 1), gained(&[COPY_B])]
+        vec![
+            peer_progress(B, HEAD + 1),
+            gained(&[COPY_B]),
+            gained_at(HEAD + 1, &[COPY_B])
+        ]
     );
 }
 
@@ -1819,7 +1826,10 @@ fn local_applied_out_of_order_stores_nothing() {
 
 /// B-R47a: the edge is `qualifies_now(anchor)`, and the anchor is the head the tracker was
 /// seeded at. A local write past it emits no edge and keeps the cached value, so an ACK for the
-/// newest record does not report a second `Gained`.
+/// newest record does not report a second `Gained` at the anchor.
+///
+/// Update (B-R47b): that ACK makes the head 15 qualify, so it reports `Gained` at 15 — the
+/// head's edge, not a repeat of the anchor's.
 #[retcd_test]
 fn local_applied_past_the_anchor_emits_no_edge_and_keeps_the_cached_value() {
     let mut tracker = tracker();
@@ -1837,7 +1847,7 @@ fn local_applied_past_the_anchor_emits_no_edge_and_keeps_the_cached_value() {
     assert!(tracker.qualifies_now(tracker.anchor()));
     assert_eq!(
         deliver(&mut tracker, &b(HEAD + 3, HEAD + 3, HEAD)),
-        vec![peer_progress(B, HEAD + 3)]
+        vec![peer_progress(B, HEAD + 3), gained_at(HEAD + 3, &[COPY_B])]
     );
 }
 
@@ -2192,17 +2202,28 @@ fn caught_up(copy: CopyId, head: u64) -> EffectKind {
 /// `LocalApplied(13)` routed before B's ACK for 13 lets the ACK in. The same ACK routed first
 /// is past the primary's head, is not verified, and stores nothing. The sim's one queue per
 /// partition supplies the first order; a lost `LocalApplied` stays the P1 gap-Alert item.
+///
+/// Update (B-R67i): the routed `LocalApplied` ships 13 to B and C and arms the retransmit,
+/// where it was `Recorded`. Update (B-R47b): the ACK also reports `Gained` at the head 13.
 #[retcd_test]
 fn routing_hands_local_applied_to_the_tracker_before_an_ack_naming_its_seq() {
     let ack = b(HEAD + 1, HEAD + 1, HEAD);
     let mut in_order = routed();
     assert_eq!(
         route(&mut in_order, local_applied_event(HEAD + 1)),
-        vec![replica(ReplicaIgnoreReason::Recorded)]
+        vec![
+            send(COPY_B, HEAD + 1),
+            send(COPY_C, HEAD + 1),
+            retransmit_arm(1)
+        ]
     );
     assert_eq!(
         route(&mut in_order, accepted(&ack)),
-        vec![peer_progress(B, HEAD + 1), gained(&[COPY_B])]
+        vec![
+            peer_progress(B, HEAD + 1),
+            gained(&[COPY_B]),
+            gained_at(HEAD + 1, &[COPY_B])
+        ]
     );
 
     let mut overtaken = routed();
@@ -2260,6 +2281,10 @@ fn a_cursor_is_dropped_on_the_ack_that_reports_copy_caught_up() {
 /// sends the next record, `CopyCaughtUp` names 17, the head B actually reached, and B's later
 /// ACKs reach the tracker alone. Handed the anchor, the cursor would send nothing past 12
 /// (tester probe p02, mutant P14).
+///
+/// Update (B-R67i): the stream's ship of 13 already armed the retransmit, so the cursor's first
+/// send arms nothing. Update (B-R47b): B's ACKs at 17 and 18 make the head qualify, so each also
+/// reports `Gained` there.
 #[retcd_test]
 fn m7b_152_a_copy_that_falls_behind_catches_up_to_the_head_that_moved_under_it() {
     let mut module = both_routed();
@@ -2270,7 +2295,7 @@ fn m7b_152_a_copy_that_falls_behind_catches_up_to_the_head_that_moved_under_it()
     route(&mut module, local_applied_event(HEAD + 4));
     assert_eq!(
         route(&mut module, reply(B, &need_prefix(HEAD))),
-        vec![send(COPY_B, HEAD + 1), retransmit_arm(1)]
+        vec![send(COPY_B, HEAD + 1)]
     );
     for seq in HEAD + 1..HEAD + 5 {
         if seq == HEAD + 3 {
@@ -2285,13 +2310,17 @@ fn m7b_152_a_copy_that_falls_behind_catches_up_to_the_head_that_moved_under_it()
     let top = HEAD + 5;
     assert_eq!(
         route(&mut module, accepted(&b(top, top, top))),
-        vec![peer_progress(B, top), caught_up(COPY_B, top)]
+        vec![
+            peer_progress(B, top),
+            gained_at(top, &[COPY_B]),
+            caught_up(COPY_B, top)
+        ]
     );
     assert!(primary_side(&module).cursor(COPY_B).is_none());
     route(&mut module, local_applied_event(top + 1));
     assert_eq!(
         route(&mut module, accepted(&b(top + 1, top + 1, top + 1))),
-        vec![peer_progress(B, top + 1)]
+        vec![peer_progress(B, top + 1), gained_at(top + 1, &[COPY_B])]
     );
 }
 
@@ -2428,6 +2457,9 @@ fn m7b_151_recovered_answers_the_receiver_first_on_a_node_holding_both_halves() 
 /// Each is answered with its drop reason alone and leaves the primary as it was. Handed to the
 /// cursor, the first would report `CopyCaughtUp` for B at 16 (tester probe p16, mutant P07).
 /// Then a forged label and a forked digest, which `sender()` refuses as well.
+///
+/// Update (B-R67i): the stream's ship of 13 already armed the retransmit, so the cursor's first
+/// send arms nothing.
 #[retcd_test]
 fn only_an_admitted_ack_reaches_a_running_cursor() {
     let top = HEAD + 4;
@@ -2437,7 +2469,7 @@ fn only_an_admitted_ack_reaches_a_running_cursor() {
     }
     assert_eq!(
         route(&mut module, reply(B, &need_prefix(HEAD))),
-        vec![send(COPY_B, HEAD + 1), retransmit_arm(1)]
+        vec![send(COPY_B, HEAD + 1)]
     );
     let closing = |change: &Change| {
         let mut ack = b(top, top, top);
@@ -2548,6 +2580,10 @@ fn a_reply_that_is_not_an_ack_needs_a_live_member_behind_its_label() {
 /// Every primary-side input reaches the tracker exactly as if driven directly. An undecodable
 /// reply is answered with its error's kind. An event for a node with no primary, a flush that
 /// names no prefix of ours, and an event the primary does not consume are declined.
+///
+/// Update (B-R67i): `LocalApplied` still reaches the tracker as the direct call does, and the
+/// tracker's `Recorded` is answered instead by the stream's sends to B and C and the retransmit
+/// arm.
 #[retcd_test]
 fn every_primary_input_reaches_the_tracker_as_if_driven_directly() {
     let next = config_with(
@@ -2565,7 +2601,17 @@ fn every_primary_input_reaches_the_tracker_as_if_driven_directly() {
     let steps: Vec<(EventKind, Box<Direct>)> = vec![
         (
             local_applied_event(HEAD + 1),
-            Box::new(|t| t.on_local_applied(Seq(HEAD + 1), d(HEAD + 1))),
+            Box::new(|t| {
+                assert_eq!(
+                    t.on_local_applied(Seq(HEAD + 1), d(HEAD + 1)),
+                    vec![replica(ReplicaIgnoreReason::Recorded)]
+                );
+                vec![
+                    send(COPY_B, HEAD + 1),
+                    send(COPY_C, HEAD + 1),
+                    retransmit_arm(1),
+                ]
+            }),
         ),
         (
             accepted(&c(HEAD + 1, HEAD + 1, HEAD)),
@@ -2715,10 +2761,15 @@ fn a_busy_or_already_have_reply_starts_no_cursor_and_a_steady_copy_is_never_caug
 
             let mut acks = (HEAD + 1..=HEAD + writes).map(|at| b(at, at, at));
             for seq in HEAD + 1..=HEAD + writes {
+                // Update (B-R67i): each write is the stream's, to B and C, and the first arms
+                // the retransmit; the tracker still takes it as the direct call does.
                 assert_eq!(
-                    route(&mut module, local_applied_event(seq)),
-                    reference.on_local_applied(Seq(seq), d(seq))
+                    reference.on_local_applied(Seq(seq), d(seq)),
+                    vec![replica(ReplicaIgnoreReason::Recorded)]
                 );
+                let mut want = vec![send(COPY_B, seq), send(COPY_C, seq)];
+                want.extend((seq == HEAD + 1).then(|| retransmit_arm(1)));
+                assert_eq!(route(&mut module, local_applied_event(seq)), want);
                 if seq > HEAD + lag {
                     let ack = acks.next().expect("one ACK per write");
                     assert_eq!(
@@ -3671,9 +3722,11 @@ fn m7b_172_a_primary_the_pin_retires_is_absent_until_a_pin_names_it_primary_agai
     assert!(answered.ends_with(&want), "{answered:?}");
     assert!(!primary_side(&module).tracker().retired());
     assert_eq!(primary_side(&module).tracker(), &reference);
+    // Update (B-R67i): serving again means the stream ships 11 to B and C and arms the
+    // retransmit, where the tracker alone answered `Recorded`.
     assert_eq!(
         route(&mut module, local_applied_event(11)),
-        vec![replica(ReplicaIgnoreReason::Recorded)]
+        vec![send(COPY_B, 11), send(COPY_C, 11), retransmit_arm(1)]
     );
 }
 
@@ -6462,4 +6515,487 @@ fn m7b_216_a_walk_whose_delayed_re_sends_land_while_the_next_record_is_staged() 
             .map(|peer| peer.progress),
         Some(progress(4, 4, 4))
     );
+}
+
+// --- the stream and qualification at the head (Gautam 2026-09-27, L-R177gd; lead rulings
+// B-R47b and B-R67i) ------------------------------------------------------------------------
+//
+// Spec §5.2 step 4: each record the primary applies goes to both regular secondaries. The
+// stream re-sends a record no ACK has reached on the B-R67 retransmit timer (B-R67i), and the
+// tracker reports `Gained` at the head as well as at the anchor (B-R47b), so P1 hears that the
+// candidate qualifies. One transaction is in flight at a time (spec §5.2), so the head is the
+// candidate. Every routed row starts from B and C at the head 12, anchor qualified.
+
+/// `QualificationChanged{Gained}` at `at`, the head, carried by an ACK.
+fn gained_at(at: u64, copies: &[CopyId]) -> EffectKind {
+    edge(
+        lineage(),
+        CONFIG,
+        at,
+        QualificationDirection::Gained,
+        copies,
+        QualificationCause::AckAdvanced,
+    )
+}
+
+/// The edge inside `effect`, which must be one.
+fn edge_in(effect: &EffectKind) -> QualificationChanged {
+    match effect {
+        EffectKind::Kernel(KernelEffect::QualificationChanged(q)) => q.clone(),
+        other => panic!("expected a qualification edge, got {other:?}"),
+    }
+}
+
+/// The view P1 holds: the one its candidates' authority was decided under.
+fn p1_view() -> AuthorityView {
+    AuthorityView {
+        lineage: lineage(),
+        grant_id: GrantId(1),
+        boot_id: BootId(1),
+        authority_generation: AuthorityGeneration(1),
+        config_version: CONFIG,
+        authority_seq: 1,
+        valid_through_tick: Tick(u64::MAX),
+        past_horizon: DenyReason::NoGrant,
+    }
+}
+
+/// P1 with everything below `seq` published, A1's view held, and the candidate at `seq`
+/// pending: what T1 leaves after `LocalApplied(seq)` (one transaction in flight).
+fn p1_waiting_on(seq: u64) -> PubKernel {
+    let mut p1 = PubKernel::new(PubConfig::default(), BootId(1), lineage(), Seq(seq - 1));
+    assert!(p1
+        .apply(T, PubEvent::AuthorityView(p1_view()), None)
+        .is_empty());
+    p1.apply(T, PubEvent::Candidate(p1_candidate(seq)), None);
+    p1
+}
+
+/// Hand P1 R1's edge, and return the correlation of the `Publication` check it asks.
+fn p1_asks(p1: &mut PubKernel, effect: &EffectKind) -> CorrelationId {
+    match p1
+        .apply(T, PubEvent::QualificationChanged(edge_in(effect)), None)
+        .as_slice()
+    {
+        [PubEffect::AuthorityCheck {
+            checkpoint: Checkpoint::Publication,
+            correlation,
+            ..
+        }] => *correlation,
+        other => panic!("expected one Publication check, got {other:?}"),
+    }
+}
+
+/// A1 admits P1's `Publication` check for the candidate at `seq`; P1 reads R1's live tracker.
+fn p1_admitted(
+    p1: &mut PubKernel,
+    seq: u64,
+    correlation: CorrelationId,
+    tracker: &ProgressTracker,
+) -> Vec<PubEffect> {
+    let answer = AuthorityDecision {
+        checkpoint: Checkpoint::Publication,
+        correlation,
+        ..p1_candidate(seq).authority
+    };
+    p1.apply(T, PubEvent::AuthorityAnswer(answer), Some(tracker))
+}
+
+/// Whether P1 published `seq`: it told T1.
+fn p1_published(effects: &[PubEffect], seq: u64) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, PubEffect::NotifyTxn { seq: s, .. } if *s == Seq(seq)))
+}
+
+/// R1's `Gained` at the head reaches P1, A1 admits, and P1 publishes `seq`.
+fn publishes(module: &Replication, effect: &EffectKind, seq: u64) {
+    let mut p1 = p1_waiting_on(seq);
+    let correlation = p1_asks(&mut p1, effect);
+    let effects = p1_admitted(&mut p1, seq, correlation, primary_side(module).tracker());
+    assert!(p1_published(&effects, seq), "{effects:?}");
+}
+
+fn busy_at(seq: u64) -> AppendOutcome {
+    AppendOutcome::Busy {
+        accepted_through: Seq(seq),
+    }
+}
+
+/// The retransmit timer's version `version` fires on A.
+fn retransmit_fires(module: &mut Replication, version: u64) -> Vec<EffectKind> {
+    route(module, retransmit_fired(version))
+}
+
+/// [`both_routed`] after `LocalApplied(13)`: 13 is shipped to B and C, and the retransmit
+/// timer is armed at version 1.
+fn shipped_13() -> Replication {
+    let mut module = both_routed();
+    assert_eq!(
+        route(&mut module, local_applied_event(HEAD + 1)),
+        vec![
+            send(COPY_B, HEAD + 1),
+            send(COPY_C, HEAD + 1),
+            retransmit_arm(1)
+        ]
+    );
+    module
+}
+
+/// Two fires of the retransmit timer from version `first`: the first only marks the wait, the
+/// second re-sends. Returns the second fire's effects.
+fn two_fires(module: &mut Replication, first: u64) -> Vec<EffectKind> {
+    assert_eq!(
+        retransmit_fires(module, first),
+        vec![retransmit_arm(first + 1)],
+        "the first fire only marks the wait"
+    );
+    retransmit_fires(module, first + 1)
+}
+
+/// Spec §5.2 step 4, Gautam 2026-09-27 (L-R177gd): the step that records `LocalApplied`
+/// ships the record to every regular secondary, and to no one else — not the primary itself,
+/// not the shadow D (spec: "shadows receive separately"), not a diverged copy — and arms the
+/// retransmit (B-R67i). A gap or a regress stores nothing and ships nothing. Kills mutant
+/// "no ship".
+#[retcd_test]
+fn m7b_217_local_applied_ships_the_record_to_every_regular_secondary() {
+    let mut module = shipped_13();
+    assert_eq!(
+        route(&mut module, local_applied_event(HEAD + 3)),
+        vec![replica(ReplicaIgnoreReason::OutOfOrder)]
+    );
+    assert_eq!(
+        route(&mut module, local_applied_event(HEAD + 1)),
+        vec![replica(ReplicaIgnoreReason::OutOfOrder)]
+    );
+
+    let mut module = both_routed();
+    route(
+        &mut module,
+        EventKind::Kernel(KernelEvent::DivergenceDetected { copy: COPY_C }),
+    );
+    assert_eq!(
+        route(&mut module, local_applied_event(HEAD + 1)),
+        vec![send(COPY_B, HEAD + 1), retransmit_arm(1)]
+    );
+}
+
+/// B-R67c A2 carried to the stream: a copy whose cursor has a record in flight is not shipped
+/// the new head, and the retransmit re-sends the cursor's record to it, never the stream's. C,
+/// with no cursor, gets both. Kills mutant "ship to a copy a cursor is driving".
+#[retcd_test]
+fn m7b_218_the_stream_skips_a_copy_whose_cursor_has_a_record_in_flight() {
+    let mut module = catching_up_b();
+    route(&mut module, accepted(&c(HEAD, HEAD, HEAD)));
+    assert_eq!(
+        route(&mut module, local_applied_event(HEAD + 1)),
+        vec![send(COPY_C, HEAD + 1)],
+        "the timer is already armed for B's record"
+    );
+    let resent = two_fires(&mut module, 1);
+    assert_eq!(sends_to(&resent, COPY_B), vec![11], "the cursor's record");
+    assert_eq!(sends_to(&resent, COPY_C), vec![HEAD + 1], "the stream's");
+}
+
+/// B-R67i, red-first: 13 is shipped and both sends are lost. The retransmit re-sends 13 to both
+/// after one quiet interval, B's ACK gains the predicate at the head (B-R47b), and P1 publishes
+/// 13. Without the re-send nothing else would send 13, because no next record comes while 13 is
+/// unpublished, and the write would end `UnknownOutcome`. Kills mutant "no re-send".
+#[retcd_test]
+fn m7b_219_a_ship_lost_to_both_copies_is_re_sent_and_publishes() {
+    let mut module = shipped_13();
+    let resent = two_fires(&mut module, 1);
+    assert_eq!(
+        resent,
+        vec![
+            send(COPY_B, HEAD + 1),
+            send(COPY_C, HEAD + 1),
+            retransmit_arm(3)
+        ]
+    );
+    let effects = route(&mut module, accepted(&b(HEAD + 1, HEAD + 1, HEAD)));
+    assert_eq!(
+        effects,
+        vec![peer_progress(B, HEAD + 1), gained_at(HEAD + 1, &[COPY_B])]
+    );
+    publishes(&module, &effects[1], HEAD + 1);
+}
+
+/// B-R67i, red-first: B applies 13 and its ACK is lost; C says nothing. The re-send reaches B,
+/// which answers `AlreadyHave` (no cursor: `NothingOutstanding`, B-R48a F1) and its ACK again,
+/// and that ACK publishes 13.
+#[retcd_test]
+fn m7b_220_a_lost_qualifying_ack_is_asked_again_and_publishes() {
+    let mut module = shipped_13();
+    assert_eq!(sends_to(&two_fires(&mut module, 1), COPY_B), vec![HEAD + 1]);
+    assert_eq!(
+        route(&mut module, reply(B, &AppendOutcome::AlreadyHave)),
+        vec![replica(ReplicaIgnoreReason::NothingOutstanding)]
+    );
+    let effects = route(&mut module, accepted(&b(HEAD + 1, HEAD + 1, HEAD)));
+    assert_eq!(
+        effects,
+        vec![peer_progress(B, HEAD + 1), gained_at(HEAD + 1, &[COPY_B])]
+    );
+    publishes(&module, &effects[1], HEAD + 1);
+}
+
+/// B-R67i, red-first (lead's item 4): both copies answer `Busy` to the one shipped record.
+/// `Busy` starts no cursor (B-R48a F1) and nothing is paused, so only the stream's re-send can
+/// reach them. It does, two intervals (200 ms) after the ship, well inside P1's 2000 ms
+/// deadline, and the write publishes.
+#[retcd_test]
+fn m7b_221_both_copies_busy_on_the_shipped_record_still_publish() {
+    let mut module = shipped_13();
+    for node in [B, C] {
+        assert_eq!(
+            route(&mut module, reply(node, &busy_at(HEAD))),
+            vec![replica(ReplicaIgnoreReason::NothingOutstanding)]
+        );
+    }
+    assert!(primary_side(&module).cursor(COPY_B).is_none());
+    assert!(primary_side(&module).cursor(COPY_C).is_none());
+    let resent = two_fires(&mut module, 1);
+    assert_eq!(
+        (sends_to(&resent, COPY_B), sends_to(&resent, COPY_C)),
+        (vec![HEAD + 1], vec![HEAD + 1])
+    );
+    let effects = route(&mut module, accepted(&c(HEAD + 1, HEAD + 1, HEAD)));
+    assert_eq!(
+        effects,
+        vec![peer_progress(C, HEAD + 1), gained_at(HEAD + 1, &[COPY_C])]
+    );
+    publishes(&module, &effects[1], HEAD + 1);
+}
+
+/// `min_regular_acks` 1: C answers `Busy`, and B's ACK publishes 13 at once. C is still re-sent
+/// 13 and B is not, because B's admitted ACK reached it. C's ACK then reports progress and no
+/// second `Gained`: the head stayed qualified (B-R47b, no repeat). With both answered, the next
+/// fire finds nothing and the timer stays down. Kills mutants "not cleared on ACK" and "Gained
+/// repeated for the same seq" (routed).
+#[retcd_test]
+fn m7b_222_one_copy_busy_while_the_other_acks_publishes_and_the_busy_copy_is_re_sent() {
+    let mut module = shipped_13();
+    assert_eq!(
+        route(&mut module, reply(C, &busy_at(HEAD))),
+        vec![replica(ReplicaIgnoreReason::NothingOutstanding)]
+    );
+    let effects = route(&mut module, accepted(&b(HEAD + 1, HEAD + 1, HEAD)));
+    assert_eq!(
+        effects,
+        vec![peer_progress(B, HEAD + 1), gained_at(HEAD + 1, &[COPY_B])]
+    );
+    publishes(&module, &effects[1], HEAD + 1);
+
+    let resent = two_fires(&mut module, 1);
+    assert_eq!(resent, vec![send(COPY_C, HEAD + 1), retransmit_arm(3)]);
+    assert_eq!(
+        route(&mut module, accepted(&c(HEAD + 1, HEAD + 1, HEAD))),
+        vec![peer_progress(C, HEAD + 1)]
+    );
+    assert_eq!(
+        retransmit_fires(&mut module, 3),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+}
+
+/// B-R47b on the tracker alone: `Gained` at the head is edge-triggered. It fires on the step
+/// that makes the head qualify, never again while it stays qualified, never at a head equal to
+/// the anchor (the anchor's own edge says it), and beside the anchor's when one ACK flips both.
+/// A local write that leaves the head unqualified reports nothing: there is no `Lost` at the
+/// head. Kills mutants "no Gained at the head" and "Gained repeated for the same seq".
+#[retcd_test]
+fn m7b_223_qualification_is_gained_at_the_head_once_per_edge() {
+    let mut one = tracker();
+    assert_eq!(
+        deliver(&mut one, &b(HEAD, HEAD, HEAD)),
+        vec![peer_progress(B, HEAD), gained(&[COPY_B])],
+        "at the anchor, one edge"
+    );
+    assert_eq!(
+        local_applied(&mut one, HEAD + 1),
+        vec![replica(ReplicaIgnoreReason::Recorded)],
+        "no Lost at the head"
+    );
+    assert_eq!(
+        deliver(&mut one, &b(HEAD + 1, HEAD + 1, HEAD)),
+        vec![peer_progress(B, HEAD + 1), gained_at(HEAD + 1, &[COPY_B])]
+    );
+    // C's ACKs move the durable view, and no edge: the head stayed qualified.
+    for (ack, why) in [
+        (c(HEAD + 1, HEAD + 1, HEAD), "still qualified: no repeat"),
+        (c(HEAD + 1, HEAD + 1, HEAD + 1), "a flush ACK: no repeat"),
+    ] {
+        let effects = deliver(&mut one, &ack);
+        assert_eq!(effects[0], peer_progress(C, HEAD + 1), "{why}");
+        assert!(
+            !effects.iter().any(|effect| matches!(
+                effect,
+                EffectKind::Kernel(KernelEffect::QualificationChanged(_))
+            )),
+            "{why}: {effects:?}"
+        );
+    }
+
+    let mut fresh = tracker();
+    local_applied(&mut fresh, HEAD + 1);
+    assert_eq!(
+        deliver(&mut fresh, &b(HEAD + 1, HEAD + 1, HEAD)),
+        vec![
+            peer_progress(B, HEAD + 1),
+            gained(&[COPY_B]),
+            gained_at(HEAD + 1, &[COPY_B])
+        ],
+        "one ACK flips the anchor and the head"
+    );
+}
+
+/// B, diverged mid-recheck: the module, and P1 after its outstanding recheck was admitted and
+/// answered `PublishPredicateFalse`.
+fn rechecking_13_after_b_diverged() -> (Replication, PubKernel) {
+    let mut module = shipped_13();
+    let effects = route(&mut module, accepted(&b(HEAD + 1, HEAD + 1, HEAD)));
+    assert_eq!(effects[1], gained_at(HEAD + 1, &[COPY_B]));
+    let mut p1 = p1_waiting_on(HEAD + 1);
+    let correlation = p1_asks(&mut p1, &effects[1]);
+    assert_eq!(
+        route(
+            &mut module,
+            EventKind::Kernel(KernelEvent::DivergenceDetected { copy: COPY_B })
+        ),
+        vec![alert(), copy_lost(COPY_B)],
+        "C holds the anchor: no edge, and no Lost at the head"
+    );
+    let answered = p1_admitted(
+        &mut p1,
+        HEAD + 1,
+        correlation,
+        primary_side(&module).tracker(),
+    );
+    assert_eq!(p1_kinds(&answered), ["Fact(PublishPredicateFalse)"]);
+    assert!(!p1_published(&answered, HEAD + 1));
+    (module, p1)
+}
+
+/// B-R47b: no `Lost` is reported at the head, and none is needed. B's ACK gained 13 and P1 asked
+/// A1; B then diverges. C still holds the anchor, so no edge moves and R1 reports only the
+/// divergence. A1 admits P1's recheck, and P1 re-reads `qualifies_now(13)` live (kernel-b §3.5,
+/// `may_publish`): it is false, so P1 answers `PublishPredicateFalse` and publishes nothing.
+#[retcd_test]
+fn m7b_224_a_head_loss_is_never_reported_and_still_cannot_publish() {
+    let (module, _) = rechecking_13_after_b_diverged();
+    assert!(!primary_side(&module).tracker().qualifies_now(Seq(HEAD + 1)));
+    assert!(primary_side(&module).tracker().qualifies_now(Seq(HEAD)));
+}
+
+/// B-R47b: the edge is stateless, so `Gained` fires again when the head qualifies again. After
+/// [`rechecking_13_after_b_diverged`], C's ACK for 13 makes the head qualify once more; R1
+/// reports a second `Gained` at 13, P1 asks A1 again, and publishes. A remembered "already
+/// gained 13" would leave P1 waiting for its deadline.
+#[retcd_test]
+fn m7b_225_gained_fires_again_after_the_head_lost_and_regained_and_publishes() {
+    let (mut module, mut p1) = rechecking_13_after_b_diverged();
+    let effects = route(&mut module, accepted(&c(HEAD + 1, HEAD + 1, HEAD)));
+    assert_eq!(
+        effects,
+        vec![peer_progress(C, HEAD + 1), gained_at(HEAD + 1, &[COPY_C])]
+    );
+    let correlation = p1_asks(&mut p1, &effects[1]);
+    let answered = p1_admitted(
+        &mut p1,
+        HEAD + 1,
+        correlation,
+        primary_side(&module).tracker(),
+    );
+    assert!(p1_published(&answered, HEAD + 1), "{answered:?}");
+}
+
+/// B-R67i: a shipped record is forgotten, for C, when a cursor takes C (the cursor then owns
+/// what C is sent: one send of 13, not two), on `Recovered`, when control re-announces C at a
+/// new boot, when C diverges, and when C leaves every active predicate. B, untouched, is still
+/// re-sent in each case but `Recovered`, which forgets both. Kills mutants "re-send while a
+/// cursor owns the copy" and "not cleared on `Recovered`", and each other clearing site.
+#[retcd_test]
+fn m7b_226_a_shipped_record_is_forgotten_when_a_cursor_takes_the_copy_or_the_copy_leaves() {
+    // A cursor takes C.
+    let mut module = shipped_13();
+    assert_eq!(
+        route(&mut module, reply(C, &need_prefix(HEAD))),
+        vec![send(COPY_C, HEAD + 1)]
+    );
+    let resent = two_fires(&mut module, 1);
+    assert_eq!(
+        sends_to(&resent, COPY_C),
+        vec![HEAD + 1],
+        "once, by the cursor"
+    );
+    assert_eq!(sends_to(&resent, COPY_B), vec![HEAD + 1]);
+
+    // `Recovered` forgets every copy's.
+    let mut module = shipped_13();
+    route(
+        &mut module,
+        recovered_event(&recovery(10, d(10), pin_with_b())),
+    );
+    assert_eq!(
+        retransmit_fires(&mut module, 1),
+        vec![replica(ReplicaIgnoreReason::NotRequired)]
+    );
+
+    // C at a new boot, C diverged, and C retired: B alone is re-sent.
+    let restarted = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            member(COPY_B, B, RegularSecondary),
+            Member {
+                boot: BootId(99),
+                ..member(COPY_C, C, RegularSecondary)
+            },
+            member(COPY_D, D, Shadow),
+        ],
+    );
+    let without_c = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, Primary),
+            member(COPY_B, B, RegularSecondary),
+            member(COPY_D, D, Shadow),
+        ],
+    );
+    let cases: [(&str, Vec<EventKind>); 3] = [
+        (
+            "new boot",
+            vec![EventKind::Kernel(KernelEvent::ConfigChanged(restarted))],
+        ),
+        (
+            "diverged",
+            vec![EventKind::Kernel(KernelEvent::DivergenceDetected {
+                copy: COPY_C,
+            })],
+        ),
+        (
+            "retired",
+            vec![
+                EventKind::Kernel(KernelEvent::ConfigChanged(without_c)),
+                EventKind::Kernel(KernelEvent::TransitionBarrierConfirmed {
+                    config_version: CONFIG,
+                    through_seq: Seq(HEAD + 1),
+                }),
+            ],
+        ),
+    ];
+    for (case, events) in cases {
+        let mut module = shipped_13();
+        for event in events {
+            route(&mut module, event);
+        }
+        let resent = two_fires(&mut module, 1);
+        assert_eq!(
+            resent,
+            vec![send(COPY_B, HEAD + 1), retransmit_arm(3)],
+            "{case}"
+        );
+    }
 }

@@ -355,6 +355,11 @@ pub struct TxnKernel {
     /// The predecessor's durable dedup records, while not yet loaded (A-R68). Admission check 7
     /// refuses while this is `Some`.
     seed: Option<SeedPending>,
+    /// The `authority_seq` of the view T1 held when it last asked the outstanding
+    /// `StorageDispatch` check again, or `None` if it has not asked again since the check was
+    /// first asked. At most one re-ask per view held (lead ledger L-R177gf, M7A-178): see
+    /// [`Self::reask`].
+    reasked_under: Option<u64>,
 }
 
 impl TxnKernel {
@@ -536,6 +541,7 @@ impl TxnKernel {
                 serving: result.new_generation,
                 retained_through: result.retained_status_map.retained_through,
             }),
+            reasked_under: None,
         }
     }
 
@@ -699,6 +705,7 @@ impl TxnKernel {
             asked_at: ctx.now,
             reservation,
         });
+        self.reasked_under = None;
         vec![TxnEffect::AuthorityCheck {
             checkpoint: Checkpoint::StorageDispatch,
             lineage: self.lineage,
@@ -795,10 +802,20 @@ impl TxnKernel {
     /// it: the view moved on while the check was in flight, the answer lands older than that
     /// view, and the queue waits behind it for good.
     ///
+    /// **At most once per view T1 holds** (lead ledger L-R177gf, M7A-178). A re-ask is asked
+    /// "against the view T1 now holds"; a second stale answer while that view has not moved
+    /// means A1 answered the same question from the same stale place, and asking it a third
+    /// time cannot get a different answer. Before this bound an A1 that could not move (`Unheld`,
+    /// answering at `authority_seq` 0) and T1 asked each other forever at one tick — 29,506
+    /// checks in one simulated run — and the deadline never fired because the tick never
+    /// advanced. A view that moves between the two stale answers allows one more re-ask.
+    ///
     /// When the check cannot be asked again, the request is refused instead and the queue
     /// behind it moves on, so it is never left waiting (lead ruling A-R73). Past its deadline it
-    /// is `DEADLINE_BEFORE_ADMISSION` (spec §5.2 step 3, as at dispatch). With the id counter
-    /// spent it is `OVERLOADED`. Both are truthful: nothing was dispatched.
+    /// is `DEADLINE_BEFORE_ADMISSION` (spec §5.2 step 3, as at dispatch). Asked again already
+    /// under this view it is `LEASE_EXPIRED`, the code a pre-apply authority deny maps to: A1
+    /// could not confirm the grant for it. With the id counter spent it is `OVERLOADED`. All
+    /// three are truthful: nothing was dispatched.
     ///
     /// Empty when the answer is for no outstanding check.
     fn reask(&mut self, ctx: &StepCtx<'_>, answer: &AuthorityDecision) -> Vec<TxnEffect> {
@@ -816,7 +833,9 @@ impl TxnKernel {
             return Vec::new();
         }
         let expired = admitted.expired_at(ctx.now);
-        let fresh = if expired {
+        let held = self.authority.map(|view| view.authority_seq);
+        let exhausted = self.reasked_under.is_some() && self.reasked_under == held;
+        let fresh = if expired || exhausted {
             None
         } else {
             self.mint_correlation()
@@ -825,6 +844,7 @@ impl TxnKernel {
             if let Some(Inflight::AwaitingDispatchCheck { correlation, .. }) = &mut self.inflight {
                 *correlation = fresh;
             }
+            self.reasked_under = held;
             return vec![TxnEffect::AuthorityCheck {
                 checkpoint: Checkpoint::StorageDispatch,
                 lineage: self.lineage,
@@ -837,6 +857,13 @@ impl TxnKernel {
         let partition = self.lineage.partition;
         let error = if expired {
             RdbError::DeadlineBeforeAdmission { partition }
+        } else if exhausted {
+            RdbError::LeaseExpired {
+                partition,
+                grant: self
+                    .deny_context(admitted.req.identity, self.lineage.generation)
+                    .grant,
+            }
         } else {
             RdbError::Overloaded { partition }
         };

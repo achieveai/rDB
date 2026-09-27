@@ -81,6 +81,25 @@
 //!
 //! A shadow never counts toward lag, and a diverged copy's ACKs are dropped at rule 1d, so
 //! neither is sent one.
+//!
+//! # The stream (spec §5.2 step 4; Gautam 2026-09-27, lead rulings B-R47b and B-R67i)
+//!
+//! Each record the primary applies is shipped to the regular secondaries in the step that
+//! records its `LocalApplied`: one `SendEnvelopes{copy, seq, seq}` per copy the keepalive would
+//! send to, after the tracker has grown its ladder, so no honest ACK can pass the head (B-R47).
+//! A copy whose cursor has a record in flight is skipped: the cursor reaches the new head on
+//! its own, and a second send would draw a `NeedPrefix` under it. A gap or a regress, which the
+//! tracker stores nothing for, ships nothing.
+//!
+//! A shipped record is remembered per copy until an admitted ACK reaches it, and the partition's
+//! retransmit timer re-sends it after one quiet interval, exactly as it re-sends a cursor's
+//! record (B-R67i). One transaction is in flight at a time (spec §5.2), so without it a lost
+//! ship, a lost ACK, or a copy that answered `Busy` would wait for a next record that never
+//! comes, and the write would end `UnknownOutcome`. `Busy` and `AlreadyHave` still start no
+//! cursor (B-R48a F1): the re-send is what answers them. The record is forgotten on the ACK, when
+//! a cursor takes the copy (the cursor then owns what the copy is sent), on `Recovered`, when
+//! control re-announces the copy at a new node or boot, when the copy diverges, and when it
+//! leaves every active predicate.
 
 use std::collections::BTreeMap;
 
@@ -129,6 +148,20 @@ pub struct Primary {
     /// The last keepalive version armed. Every arm takes a new one, so a fire from an earlier
     /// arm is told apart from the one armed now.
     armed: u64,
+    /// The record the stream shipped to each copy that no admitted ACK has reached yet (lead
+    /// ruling B-R67i).
+    shipped: BTreeMap<CopyId, Shipped>,
+}
+
+/// A record the stream shipped to one copy and no admitted ACK has reached: what the
+/// retransmit timer re-sends (lead ruling B-R67i), on the cursor's `unacked` rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shipped {
+    /// The record.
+    pub seq: Seq,
+    /// Whether a retransmit fire has passed since it was sent: the first fire only marks the
+    /// wait, and each fire after that re-sends.
+    pub waited: bool,
 }
 
 impl Primary {
@@ -140,7 +173,14 @@ impl Primary {
             cursors: BTreeMap::new(),
             keepalive: None,
             armed: 0,
+            shipped: BTreeMap::new(),
         }
+    }
+
+    /// The record the stream shipped to `copy` that no admitted ACK has reached yet.
+    #[must_use]
+    pub fn shipped(&self, copy: CopyId) -> Option<Shipped> {
+        self.shipped.get(&copy).copied()
     }
 
     /// The progress tracker.
@@ -164,7 +204,15 @@ impl Primary {
     /// A reply frame (`RDBR`) from `from`. An ACK goes through the tracker's ladder first, and
     /// reaches the copy's cursor only when admitted. Any other outcome goes to the cursor of the
     /// copy the label names. A frame that does not decode is answered with its error's kind.
+    /// Afterwards the stream forgets each shipped record an admitted ACK has now reached, or
+    /// whose copy has diverged (lead ruling B-R67i).
     pub fn on_reply(&mut self, from: &PeerLabel, body: &[u8], tick: Tick) -> Vec<EffectKind> {
+        let effects = self.reply(from, body, tick);
+        self.settle_shipped();
+        effects
+    }
+
+    fn reply(&mut self, from: &PeerLabel, body: &[u8], tick: Tick) -> Vec<EffectKind> {
         match wire::decode_reply(body) {
             Ok(AppendOutcome::Accepted(ack)) => {
                 match self.repeat(from, &ack) {
@@ -227,21 +275,36 @@ impl Primary {
         Some(match event {
             KernelEvent::LocalApplied {
                 seq, record_digest, ..
-            } => self.tracker.on_local_applied(*seq, *record_digest),
+            } => {
+                let head = self.tracker.head();
+                let effects = self.tracker.on_local_applied(*seq, *record_digest);
+                if self.tracker.head() == head {
+                    return Some(effects);
+                }
+                let sends = self.ship(*seq);
+                if sends.is_empty() {
+                    effects
+                } else {
+                    sends
+                }
+            }
             KernelEvent::ConfigChanged(config) => {
                 // A copy re-announced at a new node or boot has restarted, and the tracker
                 // starts it fresh. The cursor its old incarnation ran goes too, so its next reply
-                // starts a new one (M7B-150, lead ruling B-R48b Q2). A refused configuration
-                // changes no incarnation and drops nothing.
+                // starts a new one (M7B-150, lead ruling B-R48b Q2), and so does the record the
+                // stream shipped to it (B-R67i): the new incarnation's own replies say what it
+                // lacks. A refused configuration changes no incarnation and drops nothing.
                 let before: Vec<_> = self
                     .cursors
                     .keys()
+                    .chain(self.shipped.keys())
                     .map(|copy| (*copy, self.incarnation(*copy)))
                     .collect();
                 let effects = self.tracker.on_config_changed(config, tick);
                 for (copy, was) in before {
                     if self.incarnation(copy) != was {
                         self.cursors.remove(&copy);
+                        self.shipped.remove(&copy);
                     }
                 }
                 effects
@@ -250,13 +313,17 @@ impl Primary {
                 let effects = self.tracker.on_transition_confirmed(*config_version);
                 // Retirement is where a copy leaves every active predicate: `ConfigChanged`
                 // never removes one (K-B-49). Its cursor goes with it, so a re-added copy
-                // starts a fresh one (lead ruling B-R48a F2).
+                // starts a fresh one (lead ruling B-R48a F2). Its shipped record goes too
+                // (B-R67i).
                 let tracker = &self.tracker;
                 self.cursors.retain(|copy, _| tracker.peer(*copy).is_some());
+                self.settle_shipped();
                 effects
             }
             KernelEvent::DivergenceDetected { copy } | KernelEvent::CopyQuarantined { copy } => {
-                self.tracker.on_divergence(*copy, tick)
+                let effects = self.tracker.on_divergence(*copy, tick);
+                self.settle_shipped();
+                effects
             }
             _ => return None,
         })
@@ -265,12 +332,14 @@ impl Primary {
     /// `Recovered`: the tracker rebuilds (or refuses), and every cursor is dropped, because each
     /// was chasing a head the new root may have cut (lead ruling B-R48). A copy still behind asks
     /// again, and a copy ahead of the cut gets the tracker's snapshot request instead of a
-    /// `CopyCaughtUp` for a head it has passed.
+    /// `CopyCaughtUp` for a head it has passed. Every shipped record is forgotten for the same
+    /// reason (lead ruling B-R67i).
     ///
     /// A primary the pin retires stops its keepalive: it leads nothing, and a later
     /// `SetAdmission` finds no serving primary.
     pub fn on_recovered(&mut self, result: &RecoveryResult, tick: Tick) -> Vec<EffectKind> {
         self.cursors.clear();
+        self.shipped.clear();
         let mut effects = self.tracker.on_recovered(result, tick);
         if self.tracker.retired() {
             effects.extend(self.stop_keepalive());
@@ -331,9 +400,10 @@ impl Primary {
         effects
     }
 
-    /// The copies a keepalive round sends to: every regular secondary of an active predicate
-    /// that has not diverged and has no record in flight on a cursor — sent and not ACKed, as the
-    /// retransmit reads it (lead ruling B-R67c, item A2) — in copy order.
+    /// The copies a keepalive round, and the stream (B-R67i), send to: every regular secondary
+    /// of an active predicate that has not diverged and has no record in flight on a cursor —
+    /// sent and not ACKed, as the retransmit reads it (lead ruling B-R67c, item A2) — in copy
+    /// order.
     fn keepalive_targets(&self) -> impl Iterator<Item = CopyId> + '_ {
         self.tracker
             .peers()
@@ -348,6 +418,24 @@ impl Primary {
             .map(|(copy, _)| copy)
     }
 
+    /// The stream (spec §5.2 step 4): `seq`, just recorded as the head, to every copy
+    /// [`Self::keepalive_targets`] names, remembered per copy for the retransmit (lead ruling
+    /// B-R67i). A copy's earlier shipped record is replaced: the new one implies it.
+    fn ship(&mut self, seq: Seq) -> Vec<EffectKind> {
+        let copies: Vec<_> = self.keepalive_targets().collect();
+        copies
+            .into_iter()
+            .map(|copy| {
+                self.shipped.insert(copy, Shipped { seq, waited: false });
+                EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                    copy,
+                    from: seq,
+                    through: seq,
+                })
+            })
+            .collect()
+    }
+
     /// Cancel the keepalive, if one is armed.
     fn stop_keepalive(&mut self) -> Option<EffectKind> {
         self.keepalive.take().map(|version| {
@@ -358,22 +446,49 @@ impl Primary {
         })
     }
 
-    /// Whether any running cursor has a record it sent and no ACK has answered: what keeps the
-    /// partition's retransmit timer armed (lead ruling B-R67a).
+    /// Whether any running cursor, or the stream, has a record it sent and no ACK has answered:
+    /// what keeps the partition's retransmit timer armed (lead rulings B-R67a and B-R67i).
     #[must_use]
     pub fn awaits_ack(&self) -> bool {
-        self.cursors
-            .values()
-            .any(|cursor| cursor.unacked().is_some())
+        !self.shipped.is_empty()
+            || self
+                .cursors
+                .values()
+                .any(|cursor| cursor.unacked().is_some())
     }
 
     /// One fire of the partition's retransmit timer: each cursor's re-send, if it makes one, in
-    /// copy order ([`CatchupCursor::on_retransmit`]).
+    /// copy order ([`CatchupCursor::on_retransmit`]), then the stream's (lead ruling B-R67i). A
+    /// shipped record is re-sent byte for byte once a whole interval has passed without the
+    /// ACK that would forget it: the first fire after the send only marks the wait.
     pub fn on_retransmit(&mut self) -> Vec<EffectKind> {
-        self.cursors
+        let mut effects: Vec<_> = self
+            .cursors
             .values_mut()
             .filter_map(CatchupCursor::on_retransmit)
-            .collect()
+            .collect();
+        for (copy, shipped) in &mut self.shipped {
+            if shipped.waited {
+                effects.push(EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                    copy: *copy,
+                    from: shipped.seq,
+                    through: shipped.seq,
+                }));
+            }
+            shipped.waited = true;
+        }
+        effects
+    }
+
+    /// Forget each shipped record an admitted ACK has reached, and each whose copy has diverged
+    /// or left every active predicate (lead ruling B-R67i).
+    fn settle_shipped(&mut self) {
+        let tracker = &self.tracker;
+        self.shipped.retain(|copy, shipped| {
+            tracker.peer(*copy).is_some_and(|peer| {
+                peer.progress.buffered_applied.0 < shipped.seq.0 && !tracker.is_diverged(*copy)
+            })
+        });
     }
 
     /// A1's `View`: the tracker installs it or refuses it (lead ruling B-R53). No cursor is
@@ -443,13 +558,20 @@ impl Primary {
     }
 
     /// Hand `outcome` to `copy`'s cursor, making one if none runs, and drop the cursor once it
-    /// has caught the copy up or stopped.
+    /// has caught the copy up or stopped. The cursor owns what the copy is sent from here, so
+    /// the stream forgets the record it shipped there (lead ruling B-R67i).
     fn drive(&mut self, copy: CopyId, outcome: AppendOutcome) -> Vec<EffectKind> {
+        self.shipped.remove(&copy);
         let cursor = self
             .cursors
             .entry(copy)
             .or_insert_with(|| CatchupCursor::new(copy));
-        let effects = cursor.on_outcome(outcome, self.tracker.history(), self.tracker.head());
+        let effects = cursor.on_outcome_within(
+            outcome,
+            self.tracker.history(),
+            self.tracker.head(),
+            self.tracker.prior_base(),
+        );
         let caught_up = effects.iter().any(|effect| {
             matches!(
                 effect,

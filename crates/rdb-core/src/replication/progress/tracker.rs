@@ -7,7 +7,8 @@
 //! A tracker is built by [`ProgressTracker::new`] (fixtures, the manual tester) and rebuilt by a
 //! committed `Recovered`. The primary's own `LocalApplied` grows its ladder, `received` and
 //! applied head one record at a time (lead ruling B-R47, closing B-R36-Q1). The qualification
-//! edge stays at the seed head, the anchor (B-R47a).
+//! edge stays at the seed head, the anchor (B-R47a); a head above it reports `Gained` too, when
+//! it comes to qualify, and never `Lost` (lead ruling B-R47b).
 
 use std::collections::BTreeMap;
 
@@ -113,19 +114,35 @@ pub struct ProgressTracker {
     /// The head the tracker was seeded or rebuilt at: the recovery cutoff. The qualification
     /// edge is `qualifies_now(anchor)` (lead ruling B-R47a), so it means "`min_regular_acks`
     /// regular copies are on our history from the cutoff". A `LocalApplied` never moves it:
-    /// evaluated at the moving head the predicate would go false on every write.
+    /// evaluated at the moving head the predicate would go false on every write. The head has
+    /// its own `Gained`, never `Lost` (lead ruling B-R47b).
     anchor: Seq,
     /// The `authority_seq` of the newest A1 view installed (design §2.2); 0 before any.
     authority_seq: u64,
     /// A `Recovered` pinned this node something other than the primary (lead ruling on the kept
     /// primary, B-R58a): it serves nothing until a `Recovered` pins it primary again.
     retired: bool,
+    /// Where this lineage's history begins: the cutoff of the `Recovered` that last rebuilt the
+    /// tracker, 0 for one [`Self::new`] built and nothing rebuilt (lead rulings B-R71, B-R71a).
+    base_seq: Seq,
+    /// The base the lineage before this one began at, when this tracker saw it: a rebuild into a
+    /// new generation takes its own `base_seq`, and one in the same generation keeps this. A
+    /// tracker built fresh has none. A record at or below it is older than the predecessor, which
+    /// the receiver's historical rule does not admit (catch-up step 1a).
+    /// It is the base this tracker last served, not checked against the recovery's
+    /// `predecessor_generation`: after generations this node did not serve it can sit below the
+    /// predecessor's base. Step 1a then under-fires: a record older than the predecessor can still
+    /// go out, and draws `StaleGeneration`. It never refuses a record the receiver would admit.
+    prior_base: Option<Seq>,
 }
 
 /// The two views a step compares before and after itself. Every edge the tracker reports is a
 /// difference between two of these, so no edge needs remembered state.
 struct Views {
     qualifies: bool,
+    /// The primary's head, and whether it qualified (lead ruling B-R47b).
+    head: Seq,
+    qualifies_head: bool,
     durable: Vec<(ConfigVersion, DurableSeq)>,
 }
 
@@ -192,6 +209,8 @@ impl ProgressTracker {
             anchor: Seq(local.buffered_applied.0),
             authority_seq: 0,
             retired: false,
+            base_seq: Seq::ZERO,
+            prior_base: None,
         }
     }
 
@@ -270,8 +289,9 @@ impl ProgressTracker {
     /// copy (the contract's ordering rule). So no copy can acknowledge a record the tracker has
     /// not heard of, and rule 7's bound on `received` drops nothing honest.
     ///
-    /// It moves no edge: the edge is evaluated at [`Self::anchor`], which a local write never
-    /// moves (B-R47a). Lag behind fresh writes is L1's.
+    /// It moves no edge: the anchor's edge is evaluated at [`Self::anchor`], which a local write
+    /// never moves (B-R47a), and the new head qualifies on no copy yet, while a head that stops
+    /// qualifying reports nothing (B-R47b). Lag behind fresh writes is L1's.
     pub fn on_local_applied(&mut self, seq: Seq, record_digest: Digest) -> Vec<EffectKind> {
         let head = self.head();
         if head.0.checked_add(1) != Some(seq.0) {
@@ -291,8 +311,9 @@ impl ProgressTracker {
         ))]
     }
 
-    /// Where the qualification edge is evaluated (lead ruling B-R47a): the head this tracker
-    /// was seeded or rebuilt at.
+    /// Where the qualification edge that goes both ways is evaluated (lead ruling B-R47a): the
+    /// head this tracker was seeded or rebuilt at. The head above it has a `Gained` of its own
+    /// (B-R47b).
     #[must_use]
     pub const fn anchor(&self) -> Seq {
         self.anchor
@@ -732,6 +753,14 @@ impl ProgressTracker {
             owner_epoch: self.lineage.owner_epoch,
         };
         let mut rebuilt = Self::seeded(config.clone(), self.own, lineage, history, local);
+        // Lead ruling B-R71a. A `Recovered` in the generation already served re-announces it (a
+        // mode change, or F1's rebuild proving a copy durable): the lineage before it is the same.
+        rebuilt.base_seq = cutoff;
+        rebuilt.prior_base = if result.new_generation == self.lineage.generation {
+            self.prior_base
+        } else {
+            Some(self.base_seq)
+        };
         rebuilt.adopt_view(&result.committed.authority_view);
         let barrier = &result.barrier;
         let floor = ReplicaProgress {
@@ -782,6 +811,18 @@ impl ProgressTracker {
         self.retired
     }
 
+    /// Where this lineage's history begins (lead ruling B-R71).
+    #[must_use]
+    pub const fn base_seq(&self) -> Seq {
+        self.base_seq
+    }
+
+    /// Where the lineage before this one began, when this tracker saw it (lead ruling B-R71a).
+    #[must_use]
+    pub const fn prior_base(&self) -> Option<Seq> {
+        self.prior_base
+    }
+
     /// Take a view's epoch and `authority_seq`: the one write `View` and `Recovered` share. The
     /// generation is the caller's, because a recovered view names the root it recovered from.
     fn adopt_view(&mut self, view: &AuthorityView) {
@@ -811,8 +852,11 @@ impl ProgressTracker {
     // ---- edges ---------------------------------------------------------------------------
 
     fn views(&self) -> Views {
+        let head = self.head();
         Views {
             qualifies: self.qualifies_now(self.anchor),
+            head,
+            qualifies_head: self.qualifies_now(head),
             durable: self.durable_per_predicate(),
         }
     }
@@ -827,7 +871,21 @@ impl ProgressTracker {
     }
 
     /// `QualificationChanged` when and only when `qualifies_now(anchor)` changed value in this
-    /// step (rulings B-R27, B-R47a).
+    /// step (rulings B-R27, B-R47a), then `Gained` at the head when this step made a head above
+    /// the anchor qualify (lead ruling B-R47b).
+    ///
+    /// The head's edge exists so P1 hears that its candidate qualifies: P1 matches an edge to
+    /// the candidate by `at_seq`, and one transaction is in flight at a time (spec §5.2; T1
+    /// holds `UnresolvedTransaction` from `LocalApplied` until `Published`), so the candidate is
+    /// the head. If pipelining widens, `Gained` must cover every newly qualified seq in (old
+    /// frontier, new frontier].
+    ///
+    /// It is computed from the views like the anchor's, with nothing remembered: it fires again
+    /// if the head stops qualifying and then qualifies again, and never while it stays
+    /// qualified. The head never reports `Lost`. P1 re-reads `qualifies_now(candidate)` live
+    /// before it publishes, so a head that stopped qualifying cannot publish unreported. L1
+    /// reads the anchor's edge alone, which is unchanged; a head `Gained` implies the anchor
+    /// already qualifies (qualification is monotone), so L1 learns nothing new from it.
     fn push_qualification(
         &self,
         before: &Views,
@@ -837,26 +895,41 @@ impl ProgressTracker {
     ) {
         let anchor = self.anchor;
         let qualifies = self.qualifies_now(anchor);
-        if qualifies == before.qualifies {
-            return;
+        if qualifies != before.qualifies {
+            effects.push(self.edge_at(anchor, qualifies, cause, tick));
         }
-        let qualified_copies = self.qualified_copies(anchor);
-        effects.push(EffectKind::Kernel(KernelEffect::QualificationChanged(
-            QualificationChanged {
-                lineage: self.lineage,
-                config_version: self.config().config_version,
-                at_seq: anchor,
-                direction: if qualifies {
-                    QualificationDirection::Gained
-                } else {
-                    QualificationDirection::Lost
-                },
-                qualified_ack_count: u8::try_from(qualified_copies.len()).unwrap_or(u8::MAX),
-                qualified_copies,
-                cause,
-                tick,
+        let head = self.head();
+        let head_gained = head > anchor
+            && self.qualifies_now(head)
+            && !(before.head == head && before.qualifies_head);
+        if head_gained {
+            effects.push(self.edge_at(head, true, cause, tick));
+        }
+    }
+
+    /// The `QualificationChanged` at `at_seq`, `Gained` when `qualifies`.
+    fn edge_at(
+        &self,
+        at_seq: Seq,
+        qualifies: bool,
+        cause: QualificationCause,
+        tick: Tick,
+    ) -> EffectKind {
+        let qualified_copies = self.qualified_copies(at_seq);
+        EffectKind::Kernel(KernelEffect::QualificationChanged(QualificationChanged {
+            lineage: self.lineage,
+            config_version: self.config().config_version,
+            at_seq,
+            direction: if qualifies {
+                QualificationDirection::Gained
+            } else {
+                QualificationDirection::Lost
             },
-        )));
+            qualified_ack_count: u8::try_from(qualified_copies.len()).unwrap_or(u8::MAX),
+            qualified_copies,
+            cause,
+            tick,
+        }))
     }
 
     /// `DurableAdvanced` when any active predicate's durable view moved in this step.

@@ -4568,3 +4568,77 @@ fn dedup_older_answers_the_newest_older_generation_holding_that_identity() {
     assert_eq!(older(&index, 7, AffinityId(0), zero), Some((3, 30)));
     assert_eq!(older(&index, 7, AFF, identity(2)), None);
 }
+
+/// M7A-178 (plan §8.1, lead ledger L-R177gf; the reask livelock inv-publish-path found). An A1
+/// that cannot move — here `Unheld`, answering every check `Deny(NoGrant)` at `authority_seq` 0
+/// while T1 holds the recovery's view at 1 — answers every check stale. Before the fix each stale
+/// answer re-asked, A1 answered stale again at the same tick, and a sim run spun 29,506 checks
+/// at one tick until its event cap. Now a check is asked again at most once per view T1 holds
+/// (A-R70's "against the view T1 now holds": a second ask under an unmoved view is the same
+/// question), and then refused `LEASE_EXPIRED` (A-R73: refuse when the check cannot be asked
+/// again) — before the deadline, at the same tick — and the queue behind it gets its own turn.
+/// The near miss: when the view moves between two stale answers, the second one re-asks.
+#[retcd_test]
+fn m7a_178_a_stale_authority_at_one_tick_is_asked_once_more_then_refused() {
+    let mut h = H::live();
+    let first = h.admit(put(1, b"a", b"1"));
+    assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![], "queued behind");
+    let start = (h.now, h.k().next_seq());
+
+    // Stand in for the stale A1: answer every check this tick, at seq 0, until none is asked.
+    let mut outstanding = vec![first];
+    let (mut checks, mut refused) = (1, Vec::new());
+    let mut steps = 0;
+    while let Some(correlation) = outstanding.pop() {
+        steps += 1;
+        assert!(
+            steps <= 100,
+            "unbounded re-asks at one tick: {checks} checks"
+        );
+        let effects = h.step(answer(correlation, 0, Verdict::Deny(DenyReason::NoGrant)));
+        let [stale, rest @ ..] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(*stale, ignored(AuthorityIgnoreReason::StaleAuthorityAnswer));
+        for effect in rest {
+            match effect {
+                EffectKind::Kernel(KernelEffect::AuthorityCheck {
+                    checkpoint: Checkpoint::StorageDispatch,
+                    correlation,
+                    ..
+                }) => {
+                    checks += 1;
+                    outstanding.push(*correlation);
+                }
+                other => refused.extend(replies(std::slice::from_ref(other))),
+            }
+        }
+    }
+    assert_eq!(
+        checks, 4,
+        "each request: its check and one re-ask under the unmoved view"
+    );
+    assert_eq!(
+        refused,
+        vec![(1, ErrorKind::LeaseExpired), (2, ErrorKind::LeaseExpired)],
+        "refused before the deadline, not DEADLINE_BEFORE_ADMISSION"
+    );
+    assert_eq!(
+        (h.now, h.k().next_seq()),
+        start,
+        "one tick; nothing dispatched"
+    );
+    assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
+
+    // The near miss: the view moved between the two stale answers, so it is asked again.
+    let mut h = H::live();
+    let c1 = h.admit(put(1, b"a", b"1"));
+    let c2 = reasked(&h.step(answer(c1, 0, Verdict::Deny(DenyReason::NoGrant))));
+    let _ = h.step(push_view(2));
+    let c3 = reasked(&h.step(answer(c2, 0, Verdict::Deny(DenyReason::NoGrant))));
+    assert_ne!(c2, c3);
+    assert!(matches!(
+        h.step(answer(c3, 2, Verdict::Admit)).as_slice(),
+        [EffectKind::Store(StoreEffect::Commit(_))]
+    ));
+}
