@@ -1,6 +1,6 @@
 # Test Plan — M7, team kernel-a (A1, T1, P1)
 
-<!-- drift-basis: b723b6a -->
+<!-- drift-basis: 56f952d -->
 
 **Status:** Proposed — test planner deliverable, **correction round 5** (critic-kernel-a round 3
 findings **TD-12..TD-20** applied over round 4's TD-01..TD-11 and round 3's T-A-01..15; §8.7 holds
@@ -103,10 +103,14 @@ fake requirements one by one; every A1 row that needs a control answer plans it 
 never reaches into the fake's map.
 
 **The other half of the seam vocabulary — what a row may assert A1 *emitted*.**
-`ControlEffect` has exactly four variants (`contracts/control.rs:329-363`):
-`Cas{key: ControlKey, expected, value}`, `Get{key: ControlKey}`, `Watch{prefix: ControlPrefix,
-from: Revision}`, `Reload{prefix: ControlPrefix}`. **A family read is `Reload{prefix}`, never a
-`Get`**: `ControlKey` (`control.rs:25-44`) names one record and has no family member, and
+`ControlEffect` has exactly four variants (`contracts/control.rs`, `ControlEffect`):
+`Cas{request: ControlRequestId, key: ControlKey, expected, value}`, `Get{request: ControlRequestId,
+key: ControlKey}`, `Watch{prefix: ControlPrefix, from: Revision}`, `Reload{prefix: ControlPrefix}`.
+`Cas` and `Get` each carry a `ControlRequestId` the requesting module mints, fresh per request,
+echoed unchanged by the answering `CasResult`/`Value` (lead ledger L-R177hs, 2026-09-27); A1
+matches every `Cas`/`Get` answer by it (A-R47 as amended; see §11 A-R47). **A family read is
+`Reload{prefix}`, never a
+`Get`**: `ControlKey` (`contracts/control.rs`, `ControlKey`) names one record and has no family member, and
 `ControlPrefix` is a separate type for exactly that reason (finding K-F-19 — "typing the family
 position with the record type let a single-record key be passed where a family was meant"). The
 landed doc on `Reload` says it in terms: *"Team kernel-a's `ReadFamily { prefix }` binds to
@@ -1904,6 +1908,8 @@ re-read, not before it.
 **Re-read (2026-09-27, lead), basis moves `87e681a` → `c24bc20`.** `c24bc20` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat 87e681a c24bc20 -- crates/rdb-core/src/contracts` lists `event.rs` only, +9 −5, and every changed line is a `///` doc comment on `KernelEffect::SendEnvelopes` (its producers are now the catch-up cursor, the stream, the keepalive and the retransmit — B-R67i; the `copy` field reads "The copy to send to"). No type, variant or field changed. The hunk sits at `event.rs:553`, so every line below it shifts +4. A grep of this plan for `event.rs` line citations at or below `:553` finds none, so no citation rotted. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 **Re-read (2026-09-27, lead), basis moves `c24bc20` → `b723b6a`.** `b723b6a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat c24bc20 b723b6a -- crates/rdb-core/src/contracts` lists `trace.rs` only, +12 −6, all inside `TraceKind::RecoveryDecision`: `selected_cutoff_seq`, `selected_digest` and `new_generation` become `Option<_>`, `None` exactly when `mode` is `Quarantine` and `Some` otherwise (Gautam, L-R177gd), and the variant's doc comment states the rule. No variant was added or removed and no declaration was renamed. The hunk starts at `trace.rs:1058`, so every line below it shifts +6. A grep of this plan for `trace.rs` line citations at or past `:1058` finds none (the `:1102`, `:1195`, `:1560` and `:1565` citations are `authority.rs`, untouched). No row in this plan reads `RecoveryDecision`. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+**Re-read (2026-09-28, lead), basis moves `b723b6a` → `56f952d`.** `56f952d` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat b723b6a 56f952d -- crates/rdb-core/src/contracts` touches four files: `authority.rs` (+4/−1, doc comment only, on the existing `AuthorityIgnoreReason::UnmatchedCompletion` variant — the matching rule changes from "its correlation is not the in-flight acquisition's" to "matched by request id since lead ledger L-R177hs, by correlation before"; hunk at old `authority.rs:885`, net +2, no variant added, removed or renamed); `control.rs` (+24/−3: `ControlEffect::Cas` and `ControlEffect::Get` each gain a `request: ControlRequestId` field, `ControlEvent::CasResult`/`Value` each gain the matching echoed `request`; four hunks starting at old `:14`, `:325`, `:338`, `:367`); `ids.rs` (+8: new dense id `ControlRequestId(u64)`, inserted between `FlushTicket` and `TimerId` at old `:97`); `ignore.rs` (+10/−1: `ReplicaIgnoreReason` — kernel-b's leaf — gains one variant, `UnmatchedCompletion`, F1's twin of kernel-a's, plus an unrelated net-zero wording fix on `KernelIgnoredReason`'s doc). This plan's §15 table above is frozen at `f616ddf`/`9235bfb` per its own header and is left as written, per AGENTS.md, in every row (8, 12, 13, 15 and the round-6 evidence list) whose citations sit inside those dated entries. **Two live citations, outside the table, had rotted on shape, not on line number.** §1 KA-2's "other half of the seam vocabulary" paragraph wrote `Cas{key: ControlKey, expected, value}` and `Get{key: ControlKey}` without the new `request` field, and cited `contracts/control.rs:329-363` / `control.rs:25-44` for `ControlEffect` / `ControlKey`, both of which moved (`ControlEffect` old `:329` → `:343`, `ControlKey` old `:25` → `:27`, from the `control.rs` hunks above). Both are corrected in place: the shape now carries `request: ControlRequestId`, and the citations now name the declaration instead of a line. `contracts/control.rs:296-307` (`ControlChange`, cited two paragraphs later) sits above the first `control.rs` hunk and is unaffected. Every other `control.rs`/`ids.rs` citation this plan carries — including `sim/control.rs` and `rdb-sim/src/sim/control.rs`, a different file entirely — is either inside a dated §15 entry (history) or below every hunk start (unaffected); none needed a change. `AuthorityIgnoreReason::UnmatchedCompletion`'s new request-id matching rule is already what M7A-179 and A-R47's later citations (§11, dated 2026-09-27, lead ledger L-R177hs) assert; A-R47's own original bullet (§11, dated 2026-09-22) still says "by correlation" and is left as written, being dated and superseded in place by the newer ruling, exactly as the older text says. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 **Re-read discipline, and what round 4 got wrong about it.** This table is only as fresh as its
 last re-read, which is why the basis is now a gate stage rather than a convention. When
