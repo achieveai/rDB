@@ -1067,6 +1067,10 @@ pub enum AuthorityFact {
 /// holds the previous sample as its own state — the retraction rule and the backward-jump
 /// comparison both need it — and arms its own timer for the periodic wake.
 ///
+/// Appended since, each under A-R41: [`Self::Fence`] and [`Self::View`] (A-R63), and
+/// [`Self::EpochRevocationRestored`] (lead ledger L-R178e), the start-of-process read-back of a
+/// durable revocation, which none of the thirteen design names covers.
+///
 /// # Size: nothing is boxed, and that was measured
 ///
 /// [`crate::contracts::event::KernelEvent::Recovered`] is boxed because its payload would set the
@@ -1141,6 +1145,29 @@ pub enum AuthorityEvent {
     /// Twin of [`AuthorityEffect::PublishAuthorityView`], delivered to R1, T1 and P1 (finding
     /// K-A-41; lead ruling A-R63).
     View(AuthorityView),
+    /// A revocation this node made durable in an earlier process, read back from local disk at
+    /// start (spec §7.3 step 2; lead ledger L-R178e, appended under lead ruling A-R41).
+    ///
+    /// **The host replays every persisted revocation as one of these at process start, before
+    /// the first `AcquireDue`** (see
+    /// [`crate::contracts::storage::StoreEffect::PersistEpochRevocation`]). A fresh A1 holds no
+    /// revocation of its own; without the replay a restarted node could install and admit on an
+    /// epoch it had already sworn never to serve, which is exactly what the durable write exists
+    /// to prevent. The first `AcquireDue` is an environment input (team kernel-a `design.md`
+    /// §2.6a decision (a)), so the ordering is the environment's to keep.
+    ///
+    /// A1 records the pair in every state. It emits **no** `DrainProof`: that fact is the
+    /// completion of a request, and a restore completes nothing. Not a second spelling of
+    /// [`Self::EpochRevocationPersisted`] for the same reason (the A-R43 homograph precedent).
+    ///
+    /// The same fields as [`Self::EpochRevocationPersisted`], so the size of this enum, and of
+    /// every event that carries it, is unchanged.
+    EpochRevocationRestored {
+        /// The partition whose epoch was revoked by an earlier process on this node.
+        partition: PartitionId,
+        /// The epoch that stays unserveable.
+        epoch: OwnerEpoch,
+    },
 }
 
 /// A fact the authority module hands its peers (lead ruling A-R25).

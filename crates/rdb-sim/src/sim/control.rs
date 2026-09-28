@@ -328,6 +328,22 @@ impl ControlStore {
         }
     }
 
+    /// A write the scenario makes itself, as the control plane's own actor would: the real
+    /// compare-and-swap, applied now, with no completion to deliver and no kernel asking.
+    /// `expected: None` means create-only; `value: None` deletes.
+    ///
+    /// For a scenario-modelled planner service ([`crate::sim::grant_service`]) and for a row that
+    /// must write a record the planner would have written (a `partitions/{id}` lifecycle move).
+    /// A conflict is returned, never retried: the caller decides what a lost race means.
+    pub fn scenario_cas(
+        &mut self,
+        key: ControlKey,
+        expected: Option<Revision>,
+        value: Option<Bytes>,
+    ) -> CasOutcome {
+        self.apply_cas(key, expected, value)
+    }
+
     /// Hand a control effect to the store on behalf of `node`.
     ///
     /// The outcome is decided now, against the store's current state — the store is

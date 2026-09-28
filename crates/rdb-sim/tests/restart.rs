@@ -9,6 +9,11 @@
 //! | M7V-106 | a restarted node re-reads its partition's newest root; one that drops it teaches it no role |
 //! | M7V-107 | restarting a node no root names re-reads nothing |
 //! | M7V-108 | each restart re-reads the root once, with or without a run between two restarts |
+//! | M7V-109 | a drained epoch stays revoked across a restart: the host replays the revocation, so a new-boot grant installs `(p2, e1)` and neither adopts nor admits it (L-R178e) |
+//! | M7V-110 | the grant service clears a restarted node's old grant one tick past `E_old + epsilon + delta`, and A1's retry re-acquires and serves (option A) |
+//! | M7V-111 | twin, guard 1: a frozen old grant is not cleared |
+//! | M7V-112 | twin, guard 2: at exactly `E_old + epsilon + delta` the old grant is not cleared |
+//! | M7V-113 | twin, guard 3: while a partition naming the node is `Fencing`, the old grant is not cleared |
 //!
 //! All but M7V-105 run the spine (four nodes; F1 on node 1 recovers partition 1 while A1 on
 //! node 1 serves partition 2), then take a process crash and a restart. M7V-105 runs the
@@ -23,11 +28,14 @@ mod support;
 
 use bytes::Bytes;
 use config_log::retcd_test;
-use rdb_core::contracts::control::ControlKey;
-use rdb_core::contracts::event::{Effect, EffectKind, EventKind, ModuleName};
+use rdb_core::authority::grant::GrantRecord;
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::contracts::authority::{AuthorityEvent, DenyReason, Lineage, Verdict};
+use rdb_core::contracts::control::{CasOutcome, ControlKey, ReadOutcome};
+use rdb_core::contracts::event::{Budgets, Effect, EffectKind, EventKind, KernelEvent, ModuleName};
 use rdb_core::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, Seq,
-    SnapshotHandle, TimerVersion,
+    BootId, ConfigVersion, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, Revision,
+    Seq, SnapshotHandle, TimerVersion,
 };
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::storage::{StorageFault, StoreEffect};
@@ -38,6 +46,7 @@ use rdb_core::recovery::RecoveryPhase;
 use rdb_sim::harness::dispatch::{Adopted, Dispatcher};
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent, StopReason};
 
+use rdb_sim::sim::grant_service::{clear_restarted_grant, Clearance, Refusal};
 use rdb_sim::storage::StorageOp;
 
 /// The node that crashes and restarts: the one whose F1 recovers partition 1.
@@ -1110,5 +1119,392 @@ fn m7v_108_each_restart_rereads_the_root_once() {
         landed.iter().map(|(boot, _)| *boot).collect::<Vec<_>>(),
         vec![third],
         "back to back: one landing, under the newest boot: {landed:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Lead ledger L-R178e (Gautam, 2026-09-27): a restarted node's revocations and its old grant.
+// ------------------------------------------------------------------------------------------
+
+/// The epoch node 1 serves partition 2 under, in the spine.
+const SERVED_EPOCH: OwnerEpoch = OwnerEpoch(1);
+/// The clock the grant service reads: a node the spine has no process on, never skewed.
+const SERVICE: NodeId = NodeId(0);
+/// Enough events for a run that retries an acquisition every `renew_millis` for many seconds.
+const LONG_RUN_EVENTS: u32 = 20_000;
+
+fn budgets() -> Budgets {
+    spine_plan().header().expect("a header").config.budgets
+}
+
+fn served_lineage() -> Lineage {
+    Lineage {
+        partition: SERVED,
+        generation: Generation(1),
+        owner_epoch: SERVED_EPOCH,
+    }
+}
+
+/// Run on to `deadline`, which the run must reach.
+fn run_to(runner: &mut Runner, deadline: Tick) {
+    let report = runner
+        .run(RunLimits {
+            max_events: LONG_RUN_EVENTS,
+            deadline,
+        })
+        .expect("the run goes on");
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "precondition: the run reaches {}: {:?}",
+        deadline.0,
+        report.stop
+    );
+}
+
+/// `grants/{NODE}` as the store holds it now.
+fn grant_record(runner: &mut Runner) -> Option<(Revision, GrantRecord)> {
+    match runner.control_mut().get(ControlKey::Grant(NODE)) {
+        ReadOutcome::Found { revision, value } => Some((
+            revision,
+            GrantRecord::decode(&value).expect("a grant record"),
+        )),
+        _ => None,
+    }
+}
+
+/// `partitions/{partition}` as the store holds it now.
+fn partition_record(runner: &mut Runner, partition: PartitionId) -> (Revision, PartitionRecord) {
+    match runner.control_mut().get(ControlKey::Partition(partition)) {
+        ReadOutcome::Found { revision, value } => (
+            revision,
+            PartitionRecord::decode(&value).expect("a partition record"),
+        ),
+        other => panic!(
+            "precondition: partitions/{} is held: {other:?}",
+            partition.0
+        ),
+    }
+}
+
+/// Move `partitions/{partition}` to `lifecycle` at its exact revision, as the planner would.
+fn write_lifecycle(runner: &mut Runner, partition: PartitionId, lifecycle: PartitionLifecycle) {
+    let (revision, record) = partition_record(runner, partition);
+    let next = PartitionRecord {
+        lifecycle,
+        ..record
+    };
+    let outcome = runner.control_mut().scenario_cas(
+        ControlKey::Partition(partition),
+        Some(revision),
+        Some(next.encode()),
+    );
+    assert!(
+        matches!(outcome, CasOutcome::Committed(_)),
+        "precondition: partitions/{} moved: {outcome:?}",
+        partition.0
+    );
+}
+
+/// Whether node 1's A1 holds a grant, and the store's record names `boot`.
+fn held_under(runner: &mut Runner, boot: BootId) -> bool {
+    let held = runner
+        .dispatcher()
+        .authority(NODE)
+        .is_some_and(|a1| a1.state().is_held());
+    held && grant_record(runner).is_some_and(|(_, record)| record.boot == boot)
+}
+
+/// The spine, then a crash and a restart of node 1 under [`REBOOT`], with the new process's first
+/// `AcquireDue` queued. Returns the old boot's grant record, still in the store.
+fn restarted_with_old_grant() -> (Runner, Revision, GrantRecord) {
+    let mut runner = run_spine();
+    let (revision, old) = grant_record(&mut runner).expect("precondition: node 1 wrote a grant");
+    assert_eq!(
+        old.boot, BOOT,
+        "precondition: the grant is the first boot's"
+    );
+    crash(&mut runner, NODE);
+    runner
+        .dispatcher_mut()
+        .restart(NODE, REBOOT)
+        .expect("node 1 restarts");
+    runner
+        .queue(&acquire_due(FIRST_DEADLINE.0 + 1, NODE, REBOOT))
+        .expect("the new process's first acquisition");
+    (runner, revision, old)
+}
+
+/// The first tick at which the service proves the old grant expired: `E_old + epsilon + delta`
+/// is the last tick it may not, so this is one past it. Epsilon is the service clock's own error
+/// bound (a fresh sample carries no drift).
+fn proven_from(runner: &Runner, old: &GrantRecord) -> Tick {
+    let epsilon = runner
+        .dispatcher()
+        .clock()
+        .control_time(SERVICE)
+        .error_millis;
+    let threshold = old
+        .expiry_utc_ms
+        .checked_add_unsigned(epsilon + budgets().dispatch_margin_millis)
+        .expect("a small expiry");
+    Tick(u64::try_from(threshold).expect("a positive expiry") + 1)
+}
+
+/// Run to `at`, put the service's clock exactly there, and call the grant service once.
+fn service_at(runner: &mut Runner, at: Tick) -> Clearance {
+    run_to(runner, at);
+    runner
+        .dispatcher_mut()
+        .clock_mut()
+        .advance(at)
+        .expect("the clock is at or before the deadline");
+    let sample = runner.dispatcher().clock().control_time(SERVICE);
+    let clearance =
+        clear_restarted_grant(runner.control_mut(), NODE, REBOOT, sample, at, &budgets())
+            .expect("the service reads the store");
+    tracing::info!(at = at.0, ?clearance, "grant service");
+    clearance
+}
+
+/// M7V-109 (lead ledger L-R178e, the hole walk): a drained epoch stays revoked across a restart.
+///
+/// Node 1 serves partition 2 at epoch 1. The planner revokes that epoch and node 1 makes the
+/// revocation durable; the planner then writes `partitions/2` as `FencingDrained`. Node 1
+/// crashes and restarts. Its old grant is removed (by the scenario, bypassing the service's
+/// guards: this row is about what a new-boot grant meets, however it came), and the new process
+/// acquires. Its reload reads `partitions/2` naming it at epoch 1.
+///
+/// The restarted A1 holds the revocation, because the host replayed it at start
+/// (`EpochRevocationRestored`), so it installs `(p2, e1)` and neither adopts nor admits it.
+///
+/// Red on HEAD 56f952d: the revocation lived in the old process's `Held` and nothing read it
+/// back, so the new process adopted `(p2, e1)` and admitted it.
+#[retcd_test]
+fn m7v_109_a_drained_epoch_stays_revoked_across_a_restart() {
+    support::preamble();
+    let mut runner = run_spine();
+    runner
+        .queue(&seed(
+            FIRST_DEADLINE.0 + 1,
+            NODE,
+            BOOT,
+            SERVED,
+            EventKind::Kernel(KernelEvent::Authority(
+                AuthorityEvent::RevokeEpochRequested {
+                    partition: SERVED,
+                    epoch: SERVED_EPOCH,
+                },
+            )),
+        ))
+        .expect("the revocation request");
+    run_to(&mut runner, Tick(FIRST_DEADLINE.0 + 200));
+    assert!(
+        runner
+            .dispatcher()
+            .epoch_revoked(NODE, SERVED, SERVED_EPOCH),
+        "precondition: node 1 made the revocation durable"
+    );
+    assert!(
+        runner
+            .dispatcher()
+            .authority(NODE)
+            .is_some_and(|a1| !a1.view().served.contains_key(&SERVED)),
+        "precondition: the old process fenced partition 2"
+    );
+    write_lifecycle(&mut runner, SERVED, PartitionLifecycle::FencingDrained);
+
+    crash(&mut runner, NODE);
+    runner
+        .dispatcher_mut()
+        .restart(NODE, REBOOT)
+        .expect("node 1 restarts");
+    let (revision, _) = grant_record(&mut runner).expect("precondition: the old grant is held");
+    let removed = runner
+        .control_mut()
+        .scenario_cas(ControlKey::Grant(NODE), Some(revision), None);
+    assert!(
+        matches!(removed, CasOutcome::Committed(_)),
+        "precondition: the old grant is removed: {removed:?}"
+    );
+    runner
+        .queue(&acquire_due(FIRST_DEADLINE.0 + 300, NODE, REBOOT))
+        .expect("the new process's first acquisition");
+    run_to(&mut runner, SECOND_DEADLINE);
+
+    assert!(
+        held_under(&mut runner, REBOOT),
+        "precondition: the new process holds a new-boot grant"
+    );
+    let now = runner.dispatcher().clock().now();
+    let a1 = runner.dispatcher().authority(NODE).expect("A1 on node 1");
+    let view = a1.view();
+    tracing::info!(
+        served = view.served.len(),
+        revoked = view.revoked_epochs.len(),
+        "m7v_109 after the new grant"
+    );
+    // The hazard first, then its cause: a red run names what was admitted before why. `adopted`
+    // is the dispatcher's record of every adoption since the restart, so a replay that came
+    // after the install and fenced it late still shows the adoption it let through.
+    let admits = a1.may_admit_at(served_lineage(), now, &budgets());
+    let adopted = runner.dispatcher().adopted(NODE, SERVED);
+    assert_eq!(
+        (admits, adopted),
+        (Verdict::Deny(DenyReason::EpochRevoked), Adopted::default()),
+        "(p2, e1) is neither admitted nor adopted after the restart"
+    );
+    assert!(
+        view.revoked_epochs.contains(&(SERVED, SERVED_EPOCH)),
+        "the restarted A1 holds the revocation: {:?}",
+        view.revoked_epochs
+    );
+    assert_eq!(
+        view.served.get(&SERVED).map(|served| served.owner_epoch),
+        Some(SERVED_EPOCH),
+        "the reload installed (p2, e1) as ours, so the denial is the revocation's"
+    );
+}
+
+/// M7V-110 (Gautam's option A, 2026-09-27): the grant service clears a restarted node's old grant
+/// once the three guards hold, and the node's existing retry then acquires and serves again.
+///
+/// After the restart the new process's acquisition conflicts with the old boot's record and
+/// retries. The service, called at the last tick of `E_old + epsilon + delta`, refuses; called
+/// one tick later, it deletes the record at its exact revision. The next retry acquires under the
+/// new boot, the reload installs `partitions/2`, and `(p2, e1)` is adopted and admits.
+///
+/// Red on HEAD 56f952d: there was no service, so nothing removed the record and node 1 stayed
+/// `Unheld` for ever (the service stubbed to clear nothing reproduces it).
+#[retcd_test]
+fn m7v_110_a_restarted_node_reacquires_once_the_service_clears_its_old_grant() {
+    support::preamble();
+    let (mut runner, revision, old) = restarted_with_old_grant();
+    let proven = proven_from(&runner, &old);
+
+    let early = service_at(&mut runner, Tick(proven.0 - 1));
+    assert_eq!(
+        early,
+        Clearance::Refused(Refusal::NotProvenExpired),
+        "at E_old + epsilon + delta the old grant is not yet proven expired"
+    );
+    assert!(
+        !held_under(&mut runner, REBOOT),
+        "precondition: the conflicting acquisition has not taken a grant"
+    );
+    let cleared = service_at(&mut runner, proven);
+    assert!(
+        matches!(cleared, Clearance::Cleared(at) if at > revision),
+        "one tick later the service clears the old grant: {cleared:?}"
+    );
+    run_to(&mut runner, Tick(proven.0 + 2 * budgets().renew_millis));
+
+    assert!(
+        held_under(&mut runner, REBOOT),
+        "the restarted node re-acquires under its new boot"
+    );
+    let now = runner.dispatcher().clock().now();
+    let a1 = runner.dispatcher().authority(NODE).expect("A1 on node 1");
+    assert_eq!(
+        a1.may_admit_at(served_lineage(), now, &budgets()),
+        Verdict::Admit,
+        "(p2, e1) admits again"
+    );
+    assert_eq!(
+        runner.dispatcher().adopted(NODE, SERVED).owner_epoch,
+        SERVED_EPOCH,
+        "(p2, e1) is adopted again"
+    );
+}
+
+/// What the twins assert: the service refused with `refusal`, the old record is still the old
+/// boot's, and the restarted node, run on past the call, is still not holding a grant.
+fn assert_held_in_place(runner: &mut Runner, clearance: Clearance, refusal: Refusal, row: &str) {
+    assert_eq!(
+        clearance,
+        Clearance::Refused(refusal),
+        "{row}: the service refuses"
+    );
+    let (_, record) = grant_record(runner).expect("the old record is still held");
+    assert_eq!(
+        record.boot, BOOT,
+        "{row}: the record is still the old boot's"
+    );
+    let later = Tick(runner.dispatcher().clock().now().0 + 2 * budgets().renew_millis);
+    run_to(runner, later);
+    assert!(
+        !held_under(runner, REBOOT),
+        "{row}: the restarted node does not acquire"
+    );
+}
+
+/// M7V-111 (option A, guard 1): a frozen record is not cleared. Twin of M7V-110 with one fact
+/// changed: the planner froze the old record (spec §7.3 step 1) after the restart. Past the
+/// proof, the service refuses `Frozen` and writes nothing.
+#[retcd_test]
+fn m7v_111_the_service_never_clears_a_frozen_grant() {
+    support::preamble();
+    let (mut runner, revision, old) = restarted_with_old_grant();
+    let frozen = GrantRecord {
+        frozen: true,
+        ..old
+    };
+    let outcome = runner.control_mut().scenario_cas(
+        ControlKey::Grant(NODE),
+        Some(revision),
+        Some(frozen.encode()),
+    );
+    assert!(
+        matches!(outcome, CasOutcome::Committed(_)),
+        "precondition: the record is frozen: {outcome:?}"
+    );
+    let (frozen_at, _) = grant_record(&mut runner).expect("the frozen record");
+    let proven = proven_from(&runner, &old);
+    let clearance = service_at(&mut runner, Tick(proven.0 + 1_000));
+    assert_held_in_place(&mut runner, clearance, Refusal::Frozen, "M7V-111");
+    assert_eq!(
+        grant_record(&mut runner).map(|(at, record)| (at, record.frozen)),
+        Some((frozen_at, true)),
+        "M7V-111: the frozen record is untouched"
+    );
+}
+
+/// M7V-112 (option A, guard 2): a grant not yet proven expired is not cleared. Twin of M7V-110
+/// with one fact changed: the service is called at exactly `E_old + epsilon + delta`, the last
+/// tick the proof does not hold. It refuses `NotProvenExpired` and writes nothing.
+#[retcd_test]
+fn m7v_112_the_service_never_clears_a_grant_not_yet_proven_expired() {
+    support::preamble();
+    let (mut runner, revision, old) = restarted_with_old_grant();
+    let proven = proven_from(&runner, &old);
+    let clearance = service_at(&mut runner, Tick(proven.0 - 1));
+    assert_eq!(
+        grant_record(&mut runner).map(|(at, _)| at),
+        Some(revision),
+        "M7V-112: the record is at its revision"
+    );
+    assert_held_in_place(&mut runner, clearance, Refusal::NotProvenExpired, "M7V-112");
+}
+
+/// M7V-113 (option A, guard 3): a grant is not cleared while a partition naming the node is
+/// mid-transfer. Twin of M7V-110 with one fact changed: the planner has moved `partitions/2`,
+/// which names node 1, to `Fencing`. Past the proof, the service refuses
+/// `PartitionInTransfer(p2)` and writes nothing.
+#[retcd_test]
+fn m7v_113_the_service_never_clears_a_grant_while_a_partition_is_mid_transfer() {
+    support::preamble();
+    let (mut runner, revision, old) = restarted_with_old_grant();
+    write_lifecycle(&mut runner, SERVED, PartitionLifecycle::Fencing);
+    let proven = proven_from(&runner, &old);
+    let clearance = service_at(&mut runner, Tick(proven.0 + 1_000));
+    assert_eq!(
+        grant_record(&mut runner).map(|(at, _)| at),
+        Some(revision),
+        "M7V-113: the record is at its revision"
+    );
+    assert_held_in_place(
+        &mut runner,
+        clearance,
+        Refusal::PartitionInTransfer(SERVED),
+        "M7V-113",
     );
 }

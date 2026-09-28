@@ -160,6 +160,10 @@ pub struct Dispatcher {
     crashes: BTreeMap<NodeId, CrashImage>,
     /// Epoch revocations made durable, per node (A1's `PersistEpochRevocation`).
     revocations: BTreeSet<(NodeId, PartitionId, OwnerEpoch)>,
+    /// Restarted nodes whose fresh A1 has not yet been offered anything. Its first offer reads
+    /// the node's [`Self::revocations`] back first ([`Self::restore_revocations`], lead ledger
+    /// L-R178e).
+    restoring: BTreeSet<NodeId>,
     /// Host flushes the scenario scheduled, by `(tick, order)`.
     flushes: BTreeMap<(Tick, u64), NodeId>,
     /// The next host flush's ticket, and the order key of the next scheduled flush.
@@ -291,6 +295,7 @@ impl Dispatcher {
             snapshots: BTreeMap::new(),
             crashes: BTreeMap::new(),
             revocations: BTreeSet::new(),
+            restoring: BTreeSet::new(),
             flushes: BTreeMap::new(),
             next_flush: 0,
             routed: BTreeSet::new(),
@@ -599,6 +604,12 @@ impl Dispatcher {
     /// [`rdb_core::contracts::event::NodeLifecycle::Rebooted`] is how a **surviving** A1 hears of
     /// a boot it did not start under. A fresh A1 holds no grant for it to fence.
     ///
+    /// One read-back is the host's, not an event path: the node's durable epoch revocations. A
+    /// real host replays each at process start, before the first `AcquireDue`
+    /// (`AuthorityEvent::EpochRevocationRestored`, lead ledger L-R178e). Here the fresh A1 is
+    /// made lazily, so the replay runs on its first offer, ahead of that offer
+    /// ([`Self::restore_revocations`]). Nothing reaches the fresh A1 before it.
+    ///
     /// The restarted node's control watch reads the committed root again. A member `Recovered`
     /// deferred because this node was down, and the newest committed root of every other
     /// partition whose pinned configuration names this node, land [`CONTROL_WATCH_MILLIS`] after
@@ -641,6 +652,7 @@ impl Dispatcher {
     /// placed survivors, planned transfers, clock skew and the network.
     fn rebuild_kernels(&mut self, node: NodeId) {
         self.authority.forget_node(node);
+        self.restoring.insert(node);
         self.transaction.forget_node(node);
         self.replication.forget_node(node);
         self.publication.forget_node(node);
@@ -926,6 +938,11 @@ impl Dispatcher {
                 return self.publication.step_with(&ctx, event, Some(view));
             }
         }
+        if module == ModuleName::Authority && self.restoring.remove(&ctx.node) {
+            let mut effects = self.restore_revocations(&ctx, event)?;
+            effects.extend(self.authority.step(&ctx, event)?);
+            return Ok(effects);
+        }
         if module != ModuleName::Replication {
             return self.module_mut(module).step(&ctx, event);
         }
@@ -959,6 +976,39 @@ impl Dispatcher {
             if !reported && self.replication.source(node, partition, copy).is_none() {
                 self.catch_ups.remove(&(partition, copy, node));
             }
+        }
+        Ok(effects)
+    }
+
+    /// Replay each durable revocation of `ctx.node` to its fresh A1 as
+    /// `AuthorityEvent::EpochRevocationRestored`, in key order, under `ctx`: the host's
+    /// start-of-process read-back (lead ledger L-R178e). Called once per restart, from the first
+    /// offer to that A1, before the offer itself.
+    ///
+    /// Each restore is `trigger` with its kind and partition replaced, so its effects, if any,
+    /// carry the trigger's id and correlation. A fresh A1 answers a restore with none.
+    fn restore_revocations(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        trigger: &Event,
+    ) -> Result<Vec<Effect>, RdbError> {
+        let node = ctx.node;
+        let restored: Vec<(PartitionId, OwnerEpoch)> = self
+            .revocations
+            .iter()
+            .filter(|(held, _, _)| *held == node)
+            .map(|&(_, partition, epoch)| (partition, epoch))
+            .collect();
+        let mut effects = Vec::new();
+        for (partition, epoch) in restored {
+            let restore = Event {
+                partition,
+                kind: EventKind::Kernel(KernelEvent::Authority(
+                    AuthorityEvent::EpochRevocationRestored { partition, epoch },
+                )),
+                ..trigger.clone()
+            };
+            effects.extend(self.authority.step(ctx, &restore)?);
         }
         Ok(effects)
     }

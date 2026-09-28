@@ -274,11 +274,11 @@ is the row that goes red first.
 
 | Class | Meaning | Per-row budget | Rows |
 |---|---|---|---|
-| **unit** | one kernel (or two hand-wired kernels) driven through `Driver<K>` with hand-built events; the fake control seam scripted by `ControlOp`; no runner | **< 100 ms** | **165**: M7A-01..M7A-57, M7A-59..M7A-84, M7A-86..M7A-92, M7A-94..M7A-96, M7A-99..M7A-101, M7A-103..M7A-116, M7A-118..M7A-129, M7A-138, M7A-140..M7A-162, M7A-164..M7A-167, M7A-169..M7A-183 |
+| **unit** | one kernel (or two hand-wired kernels) driven through `Driver<K>` with hand-built events; the fake control seam scripted by `ControlOp`; no runner | **< 100 ms** | **169**: M7A-01..M7A-57, M7A-59..M7A-84, M7A-86..M7A-92, M7A-94..M7A-96, M7A-99..M7A-101, M7A-103..M7A-116, M7A-118..M7A-129, M7A-138, M7A-140..M7A-162, M7A-164..M7A-167, M7A-169..M7A-187 |
 | **sim** | one scenario through the runner with the real kernels and kernel-b's R1 fake or real R1 | **< 2 s** | **15**: M7A-85, M7A-93, M7A-97, M7A-98, M7A-102, M7A-117, M7A-131..M7A-136, M7A-139, M7A-163, M7A-168 |
 | **campaign** | the Q1 seed loop, reading verification's shared corpus report | one shared corpus, no extra run | **3**: M7A-58 (`zero_overlapping_lineages`), M7A-130 (fake fidelity, conformance suite), M7A-137 (event budget, recorded) |
 
-Counts are for all 183 written rows (M7A-01..M7A-183, no gaps, no duplicates; M7A-175 added 2026-09-26, M7A-176..M7A-178 and M7A-179..M7A-183 added 2026-09-27). §8.1–§8.6 were
+Counts are for all 187 written rows (M7A-01..M7A-187, no gaps, no duplicates; M7A-175 added 2026-09-26, M7A-176..M7A-178 and M7A-179..M7A-183 added 2026-09-27, M7A-184..M7A-187 added 2026-09-28). §8.1–§8.6 were
 cleared by critic-kernel-a round 3. The 10 rows of **§8.7 are provisional until the first green
 run** and are counted by class like any other.
 
@@ -645,6 +645,10 @@ round-2 text in place, then to the round-3 text under A-R26.
 | M7A-181 | `a_late_answer_to_a_re_issued_prior_grant_read_creates_nothing` | lead ledger **L-R177hs** · §2.6a T3/T5: a takeover's prior-grant read is matched by its request id | `held()`; T1 partition read of `TAKEN` (`Fencing`) sends `Get{grants/OTHER}` #1; #1 answers `Unavailable`, so T5 sends #2 under the same correlation | a late answer to #1 (unfrozen, at `UNFROZEN_REV`) ⇒ the takeover table stays empty; #2's own answer (frozen) ⇒ the `TAKEN` entry is created. Red on `HEAD` 547c82c: the late answer created the entry (frozen `None`, observed at 20) | unit | L-R177hs |
 | M7A-182 | `request_ids_stay_fresh_across_a_fence` | lead ledger **L-R177hs** · the tester's F3: an id minted after a fence is none an earlier request carried, so a late answer from before the fence cannot pass for one sent after it | `Authority::new()`; `Recovered` for p2 (read-back `Get`); the real acquisition (grant CAS) and commit; a coherent snapshot installs p1; a read naming `OTHER` fences p1 (`GenerationChanged`); `Recovered` for p2 again (second read-back `Get`) | the four request ids are pairwise distinct. Kills the tester's mutant t4 (A1 counter reset on fence) | unit | L-R177hs |
 | M7A-183 | `an_unheld_watch_answer_does_not_clear_the_recovered_read_back` | lead ledger **L-R177hs** · the tester's F4 · §2.4 and lead ruling A-R78: an `Unheld` node forgets a `Recovered` read-back only on the answer echoing its id | `Authority::new()`; `Recovered` for p1 under correlation 40 (read-back `Get`); an unheld `Watched{partitions}` naming p1 under 41 (a second `Get`); the watch read's answer (`g2`, us) while `Unheld`; then the real acquisition | the watch answer while `Unheld` ⇒ `[]`; after the acquire, the read-back's own answer ⇒ `[Adopt(p1, e2), Publish(p1), Fact(LineageInstalled)]`. Kills the tester's mutant t5 (the unheld arm forgets the read-back on any partition answer, which degrades this to the generic changed row) | unit | L-R177hs |
+| M7A-184 | `a_revocation_persisted_while_unheld_survives_into_held` | lead ledger **L-R178e** (Gautam 2026-09-27): `revoked_epochs` lives on the kernel and is recorded in every state; fence and `DrainProof` only when `Held` | `Authority::new()`; `EpochRevocationPersisted{p1, e3}` while `Unheld`; the real acquisition; a coherent snapshot of `(p1, e3)` and `(p2, e3)`, both ours | while `Unheld`: no `Fence(EpochRevoked)`, no `DrainProof`, set = `[(p1, e3)]`; after the load the set is kept, `served[p1] = e3`, no `Adopt(p1)` and no `Publish(p1)`, `p2` adopted and published; `may_admit(p1@3) = Deny(EpochRevoked)`, `may_admit(p2@3) = Admit`; no view outruns `may_admit`. Red on `HEAD` 56f952d: the `Unheld` completion recorded nothing (set `[]`) | unit | L-R178e |
+| M7A-185 | `a_restored_revocation_blocks_the_install_of_its_epoch` | L-R178e: the host replays each durable revocation at start as `EpochRevocationRestored` (A-R41 append), before the first `AcquireDue` | `Authority::new()`; `EpochRevocationRestored{p1, e3}`; the acquisition and the same load as M7A-184 | the restore answers `[]` and records `(p1, e3)`; the load's assertions as M7A-184. One-fact twin without the restore: `(p1, e3)` adopted and admits. Red on `HEAD` 56f952d: the variant fell to A1's wildcard arm, `Unavailable` | unit | L-R178e |
+| M7A-186 | `a_restored_revocation_for_another_partition_or_epoch_blocks_nothing_else` | L-R178e: a revocation is the exact `(partition, epoch)` pair | `Authority::new()`; restores `(p2, e3)` and `(p1, e2)`; the acquisition and load of `(p1, e3)`, `(p2, e3)` | each restore answers `[]`; set = `[(p1, e2), (p2, e3)]`; `(p1, e3)` adopted and admits; `p2` not adopted, `Deny(EpochRevoked)`. Red on `HEAD` 56f952d: `Unavailable` | unit | L-R178e |
+| M7A-187 | `a_restore_reaching_a_held_kernel_fences_only_its_served_epoch_and_proves_no_drain` | L-R178e: a restore that meets a `Held` kernel (a host that broke the replay order) never leaves the check and the view disagreeing, and never proves a drain | `serving_p1(3)`; restore `(p1, e2)`; restore `(p1, e3)` | `(p1, e2)` ⇒ `[]`, `served` kept; `(p1, e3)` ⇒ shapes exactly `[Fence(EpochRevoked), Publish(p1)]`, no `DrainProof`, `p1` gone from `served`, set = `[(p1, e2), (p1, e3)]`, `may_admit(p1@3) = Deny(GenerationChanged)`. Red on `HEAD` 56f952d: `Unavailable` | unit | L-R178e |
 | M7A-163 | `dropped_control_operation_drains_both_consumers` | ADR 0008 "Dropped control operation" (amended: both consumers) · ADR 0008 §7 item 8 · §3.3 and §4.2 `Freeze` rows | A1+T1+P1 wired; a renewal whose `CasResult` never arrives; T1 queue holds two requests; P1 holds two `Fresh` waiters | `Fence{Node, Expired}` at the local horizon; a superseding view **already past its horizon** (`valid_through_tick == fence_tick − 1`, `past_horizon == Expired`); T1's queue drains with `LEASE_EXPIRED`; P1's `Fresh` waiters drain **at the fence** with `Answer(Err(UNKNOWN_OUTCOME))`; zero `Committed` ever | sim | H1 `ControlOp::DropCompletion` (landed) |
 | M7A-164 | `watch_admission_refused_counter_resets_on_healthy_watch` | §2.4 sweep: `watch_refused_attempts` reset row | five `ResourceExhaustedFatal` terminations (backoff climbing); then a healthy `Watched`/`WatchProgress`; then one more refusal | after the healthy watch the next refusal's backoff equals the first refusal's, not the sixth (one fact vs M7A-31: the healthy event between) | unit | round-2 sweep |
 
@@ -2050,3 +2054,20 @@ four rows land, all unit:
       `M7V-82`, and the `harness::run` unit test
       `the_only_module_with_a_body_reports_itself_unavailable`. The patch does not touch them;
       they belong to their owners.
+- **Restart revocations (lead ledger L-R178e; Gautam, 2026-09-27; dev-a1-restart, export of
+  56f952d).** Four new ids, **M7A-184..M7A-187**, in `authority_partition_adopt.rs` (§8.6).
+  - **Contract change (approved).** `AuthorityEvent::EpochRevocationRestored { partition, epoch }`
+    is appended under A-R41, same fields as `EpochRevocationPersisted`, so the size is unchanged.
+    `StoreEffect::PersistEpochRevocation` gains a doc note naming the replay. No other contract
+    file changes. The drift marker is **not** moved here: the change is uncommitted, and
+    whoever commits it re-reads this table and moves the marker, in that order.
+  - **What changed in A1.** `revoked_epochs` moved from `Held` onto the kernel. It is recorded in
+    every state; the fence and `DrainProof` stay `Held`-only.
+  - **An assertion whose meaning changed.** `AuthorityStateView::revoked_epochs` is no longer a
+    held-only collection. It reads the same in `Unheld`, `Held` and `Fenced`, and a fence or a
+    re-acquire no longer empties it. No existing row asserted the old emptiness.
+  - **`install_partitions` and `FencingDrained` for the node's own partition: not changed.** The
+    only way a new-boot grant meets its own drained partition is covered twice. After a
+    `DurableDrain` the restored revocation denies the epoch (M7A-185, M7V-109). The grant
+    service refuses to clear a grant while any partition naming the node is not `Serving`
+    (M7V-113).

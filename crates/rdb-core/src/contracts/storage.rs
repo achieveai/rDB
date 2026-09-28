@@ -157,6 +157,13 @@ pub enum StoreEffect {
     /// [`crate::contracts::authority::AuthorityEvent::EpochRevocationPersisted`], carrying the
     /// same partition and epoch, and the fence it authorises fires only then (team kernel-a
     /// `design.md` §2.4).
+    ///
+    /// **Read back at every start.** A revocation written here must outlive the process, so the
+    /// environment replays each one it holds for this node as
+    /// [`crate::contracts::authority::AuthorityEvent::EpochRevocationRestored`], at process start
+    /// and before the first `AcquireDue` reaches A1 (lead ledger L-R178e). Without that replay the
+    /// write has no reader, and "a restart cannot restore that epoch" would be true of the disk
+    /// and false of the node.
     PersistEpochRevocation {
         /// The partition whose epoch is being revoked.
         partition: PartitionId,

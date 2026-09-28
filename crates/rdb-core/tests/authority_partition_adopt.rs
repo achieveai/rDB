@@ -3745,3 +3745,244 @@ fn m7a_183_an_unheld_watch_answer_does_not_clear_the_recovered_read_back() {
         "M7A-183: the read-back was still remembered: the install row"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Lead ledger L-R178d/e (inv-a1-restart, gap F-B). A durable revocation outlives the grant it was
+// made under and the process that made it: the set lives on the kernel, is recorded in every
+// state, and a restarted process gets it back through `EpochRevocationRestored`, which the host
+// replays at start, before the first `AcquireDue`.
+// ---------------------------------------------------------------------------------------------
+
+/// A1's own peer-event arm: a revocation an earlier process on this node made durable, read back
+/// from disk at start.
+fn revocation_restored(id: u64, partition: PartitionId, epoch: u64) -> Event {
+    event_of(
+        id,
+        EventKind::Kernel(KernelEvent::Authority(
+            AuthorityEvent::EpochRevocationRestored {
+                partition,
+                epoch: OwnerEpoch(epoch),
+            },
+        )),
+    )
+}
+
+/// The revocation set as a sorted list, for an equality assertion.
+fn revoked(kernel: &Authority) -> Vec<(PartitionId, OwnerEpoch)> {
+    kernel.view().revoked_epochs.into_iter().collect()
+}
+
+/// A kernel that acquires at tick 4 and then loads `p1` and `p2`, both ours at epoch 3, from one
+/// coherent snapshot at revision 10, tick 5. Returns the snapshot's effect vector.
+fn acquire_and_load_p1_p2_at_e3(kernel: &mut Authority) -> Vec<Effect> {
+    let _ = acquire(kernel, &ctx(4));
+    kernel
+        .step(
+            &ctx(5),
+            &snapshot(5, 10, &[record(P1, NODE, 3), record(P2, NODE, 3)]),
+        )
+        .expect("the coherent load")
+}
+
+/// `p2` at `epoch`, as a caller of `may_admit` names it.
+fn p2_at(epoch: u64) -> Lineage {
+    Lineage {
+        partition: P2,
+        ..p1_at(epoch)
+    }
+}
+
+/// M7A-184. Lead ledger L-R178e: a revocation is recorded in every state. An `Unheld` node that
+/// completes a durable revocation keeps it through the acquisition that follows, so the coherent
+/// load that installs `(p1, e3)` as ours withholds its adopt and its view, and `may_admit` denies
+/// `EpochRevoked`. `p2`, loaded by the same snapshot, admits.
+///
+/// Red on `HEAD` 56f952d: the completion answered `Ignored(StaleAuthorityView)` and recorded
+/// nothing, and `enter_held` started every grant with an empty set, so `(p1, e3)` was adopted and
+/// admitted. The fence and the drain proof stay `Held`-only: there is no grant to fence and no
+/// view to supersede.
+#[retcd_test]
+fn m7a_184_a_revocation_persisted_while_unheld_survives_into_held() {
+    let mut kernel = Authority::new();
+    let effects = kernel
+        .step(&ctx(3), &revocation_persisted(3, P1, 3))
+        .expect("the completion, unheld");
+    let unheld = shapes(&effects);
+    assert!(
+        !unheld.contains(&Shape::Fence(DenyReason::EpochRevoked))
+            && !unheld.contains(&Shape::Fact(AuthorityFact::DrainProof)),
+        "M7A-184: no fence and no drain proof without a grant: {unheld:?}"
+    );
+    assert_eq!(
+        revoked(&kernel),
+        vec![(P1, OwnerEpoch(3))],
+        "M7A-184: recorded while Unheld"
+    );
+
+    let effects = acquire_and_load_p1_p2_at_e3(&mut kernel);
+
+    assert_eq!(
+        revoked(&kernel),
+        vec![(P1, OwnerEpoch(3))],
+        "M7A-184: the acquisition kept the set"
+    );
+    assert_eq!(
+        kernel.view().served.get(&P1),
+        Some(&lineage(3)),
+        "M7A-184 fixture: the load installed (p1, e3) as ours"
+    );
+    let loaded = shapes(&effects);
+    assert!(
+        !loaded.contains(&Shape::Adopt(P1, OwnerEpoch(3))) && !loaded.contains(&Shape::Publish(P1)),
+        "M7A-184: no adopt and no view for the revoked epoch: {loaded:?}"
+    );
+    assert!(
+        loaded.contains(&Shape::Adopt(P2, OwnerEpoch(3))) && loaded.contains(&Shape::Publish(P2)),
+        "M7A-184: p2 is adopted, so the load really ran: {loaded:?}"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_at(3), Tick(5), &BUDGETS),
+        Verdict::Deny(DenyReason::EpochRevoked)
+    );
+    assert_eq!(
+        kernel.may_admit_at(p2_at(3), Tick(5), &BUDGETS),
+        Verdict::Admit
+    );
+    assert_no_view_outruns_may_admit(&kernel, &effects, 5);
+}
+
+/// M7A-185. Lead ledger L-R178e: a restored revocation blocks the install of its epoch. The
+/// restore reaches a fresh kernel first, as the host replays it, and answers nothing: no fence,
+/// no drain proof, no view. The acquisition and the coherent load that follow install `(p1, e3)`
+/// as ours, withhold its adopt and its view, and `may_admit` denies it; `p2` admits.
+///
+/// One-fact twin: the same kernel without the restore adopts and admits `(p1, e3)`, so the
+/// denial is the restore's and not the fixture's.
+///
+/// Red on `HEAD` 56f952d with only the contract variant added: A1 had no arm for it and refused
+/// it as `Unavailable`.
+#[retcd_test]
+fn m7a_185_a_restored_revocation_blocks_the_install_of_its_epoch() {
+    let mut kernel = Authority::new();
+    let effects = kernel
+        .step(&ctx(3), &revocation_restored(3, P1, 3))
+        .expect("the restore is answered");
+    assert_eq!(effects, vec![], "M7A-185: a restore records only");
+    assert_eq!(revoked(&kernel), vec![(P1, OwnerEpoch(3))]);
+
+    let effects = acquire_and_load_p1_p2_at_e3(&mut kernel);
+
+    assert_eq!(
+        kernel.view().served.get(&P1),
+        Some(&lineage(3)),
+        "M7A-185 fixture: the load installed (p1, e3) as ours"
+    );
+    let loaded = shapes(&effects);
+    assert!(
+        !loaded.contains(&Shape::Adopt(P1, OwnerEpoch(3))) && !loaded.contains(&Shape::Publish(P1)),
+        "M7A-185: no adopt and no view for the restored revocation: {loaded:?}"
+    );
+    assert!(
+        loaded.contains(&Shape::Adopt(P2, OwnerEpoch(3))) && loaded.contains(&Shape::Publish(P2)),
+        "M7A-185: p2 is adopted: {loaded:?}"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_at(3), Tick(5), &BUDGETS),
+        Verdict::Deny(DenyReason::EpochRevoked)
+    );
+    assert_eq!(
+        kernel.may_admit_at(p2_at(3), Tick(5), &BUDGETS),
+        Verdict::Admit
+    );
+    assert_no_view_outruns_may_admit(&kernel, &effects, 5);
+
+    // The twin: no restore.
+    let mut twin = Authority::new();
+    let effects = acquire_and_load_p1_p2_at_e3(&mut twin);
+    assert!(
+        shapes(&effects).contains(&Shape::Adopt(P1, OwnerEpoch(3))),
+        "M7A-185 twin: without the restore (p1, e3) is adopted"
+    );
+    assert_eq!(
+        twin.may_admit_at(p1_at(3), Tick(5), &BUDGETS),
+        Verdict::Admit
+    );
+}
+
+/// M7A-186. Lead ledger L-R178e: a restored revocation names one `(partition, epoch)` and blocks
+/// nothing else. Restores of `(p2, e3)` and of `(p1, e2)` reach a fresh kernel; the load then
+/// installs `(p1, e3)`, which is neither, and it is adopted and admits.
+///
+/// Kills a restore recorded under the event's partition instead of its own field (every event in
+/// this file is addressed to `p1`), and one keyed by partition alone.
+#[retcd_test]
+fn m7a_186_a_restored_revocation_for_another_partition_or_epoch_blocks_nothing_else() {
+    let mut kernel = Authority::new();
+    for (id, partition, epoch) in [(2, P2, 3), (3, P1, 2)] {
+        let effects = kernel
+            .step(&ctx(id), &revocation_restored(id, partition, epoch))
+            .expect("the restore is answered");
+        assert_eq!(effects, vec![], "M7A-186: a restore records only");
+    }
+    assert_eq!(
+        revoked(&kernel),
+        vec![(P1, OwnerEpoch(2)), (P2, OwnerEpoch(3))],
+        "M7A-186: each restore recorded under its own partition and epoch"
+    );
+
+    let effects = acquire_and_load_p1_p2_at_e3(&mut kernel);
+
+    let loaded = shapes(&effects);
+    assert!(
+        loaded.contains(&Shape::Adopt(P1, OwnerEpoch(3))) && loaded.contains(&Shape::Publish(P1)),
+        "M7A-186: (p1, e3) was never revoked, so it is adopted: {loaded:?}"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_at(3), Tick(5), &BUDGETS),
+        Verdict::Admit
+    );
+    assert!(
+        !loaded.contains(&Shape::Adopt(P2, OwnerEpoch(3))),
+        "M7A-186 fixture: the (p2, e3) restore is live: {loaded:?}"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p2_at(3), Tick(5), &BUDGETS),
+        Verdict::Deny(DenyReason::EpochRevoked)
+    );
+}
+
+/// M7A-187. A restore is replayed before the first `AcquireDue`, so a conforming host never
+/// delivers one to a `Held` kernel. If one arrives anyway, it must not leave the check and the
+/// view disagreeing: a restore naming the **served** epoch fences that partition the way a
+/// completion does (`Fence{Partition, EpochRevoked}` and its past view, the entry removed), but
+/// emits no `DrainProof`, because it completes no request. A restore naming another epoch of a
+/// served partition is recorded and fences nothing.
+#[retcd_test]
+fn m7a_187_a_restore_reaching_a_held_kernel_fences_only_its_served_epoch_and_proves_no_drain() {
+    let mut kernel = serving_p1(3);
+    let effects = kernel
+        .step(&ctx(3), &revocation_restored(3, P1, 2))
+        .expect("a restore of another epoch");
+    assert_eq!(effects, vec![], "M7A-187: another epoch fences nothing");
+    assert_eq!(kernel.view().served.get(&P1), Some(&lineage(3)));
+
+    let effects = kernel
+        .step(&ctx(4), &revocation_restored(4, P1, 3))
+        .expect("a restore of the served epoch");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Fence(DenyReason::EpochRevoked), Shape::Publish(P1)],
+        "M7A-187: the fence and its past view, and no drain proof"
+    );
+    assert!(!kernel.view().served.contains_key(&P1), "M7A-187: removed");
+    assert_eq!(
+        revoked(&kernel),
+        vec![(P1, OwnerEpoch(2)), (P1, OwnerEpoch(3))]
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_at(3), Tick(4), &BUDGETS),
+        Verdict::Deny(DenyReason::GenerationChanged),
+        "M7A-187: p1 is no longer served"
+    );
+    assert_no_view_outruns_may_admit(&kernel, &effects, 4);
+}

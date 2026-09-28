@@ -31,8 +31,9 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 > lives in the section its subject belongs to; no existing id was renumbered or reused.
 > Later additions, in id order: `M7V-92` (V-R25), `M7V-93..M7V-95` (L-R177gf), and
 > `M7V-96..M7V-101` (recorder truth, tester-sim-hooks F1, 2026-09-27; §5 after `M7V-95`), and
-> `M7V-102..M7V-108` (restart rebuild, V-R35, 2026-09-27; §5 after `M7V-101`). The
-> next free id is the one after `M7V-108` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
+> `M7V-102..M7V-108` (restart rebuild, V-R35, 2026-09-27; §5 after `M7V-101`), and `M7V-109..M7V-113`
+> (restart revocations and the grant service, L-R178e, 2026-09-28; §5 after `M7V-108`). The
+> next free id is the one after `M7V-113` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
 > `VA-1..VA-9` — a separate series from rEtcd's `TA-NN`, because the harness surfaces are in
 > different crates.
 
@@ -56,7 +57,7 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 | Grammar, generator, reducer rows M7V-20..M7V-23, M7V-42..M7V-51, M7V-83, M7V-84, M7V-86, M7V-88 | `crates/rdb-sim/tests/scenarios.rs` |
 | Recorded-run rows M7V-80, M7V-92, M7V-96..M7V-101 (the spine and rebuild plans live here) | `crates/rdb-sim/tests/dispatch.rs` |
 | Host cadence and runner rows M7V-93..M7V-95 | `crates/rdb-sim/tests/host_cadence.rs` |
-| Restart rebuild rows M7V-102..M7V-108 (V-R35) | `crates/rdb-sim/tests/restart.rs` |
+| Restart rebuild rows M7V-102..M7V-108 (V-R35), restart revocations and grant service M7V-109..M7V-113 (L-R178e) | `crates/rdb-sim/tests/restart.rs` |
 | Scenario implementation | `crates/rdb-sim/tests/support/scenarios/{mod,grammar,gen,reduce,coverage,mutate}.rs` |
 | Campaign, mutation, evidence rows M7V-52..M7V-77, M7V-78, M7V-82, M7V-87, M7V-89 | `crates/rdb-sim/tests/campaign.rs`, `tests/campaign/{corpus,report,regressions}.rs` |
 | Fixtures | `crates/rdb-sim/tests/fixtures/scenarios/*.json`, `tests/fixtures/regressions/*.json` |
@@ -281,7 +282,7 @@ Rules that follow:
 | Class | Meaning | Per-row budget | Rows (counted from the tables, critic T-17) |
 |---|---|---|---|
 | **unit** | hand-built trace, plain data or a source-level check; no runner, no kernel | **< 100 ms** | **58**: M7V-01..M7V-19, M7V-24..M7V-46, M7V-49, M7V-56, M7V-57, M7V-59, M7V-66..M7V-68, M7V-71, M7V-74, M7V-77, M7V-79, M7V-81..M7V-85; **+ M7V-99** (recorder truth, 2026-09-27; not in the 89-row count) |
-| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) |
+| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) **+ M7V-109..M7V-113** (L-R178e, 2026-09-28; likewise not in it) |
 | **campaign** | the seed loop | one shared default corpus **< 60 s** at `SPIKE_SEEDS=64`; aggregate below | **19**: M7V-51..M7V-55, M7V-58, M7V-60..M7V-65, M7V-72, M7V-73, M7V-75, M7V-76, M7V-78, M7V-87, M7V-89 |
 
 **Aggregate budget for `--test campaign` at default scale (critic T-11).** The class budget is per
@@ -561,6 +562,11 @@ cites them for V8's timing half and asserts neither half alone is V8.
 | M7V-106 | `m7v_106_a_restarted_node_rereads_the_newest_root_even_when_it_is_dropped` | V-R35, tester G3: a restart re-reads each partition's newest root, and a newest root that drops the node teaches it no role | the spine; node 1 crashes; a later root for partition 1 (generation 3, one revision on, configuration without node 1, node 2 primary) is carried out as F1 on node 3 would emit it; node 1 restarts; the run continues to 6 000 | node 2 lands the later root (precondition); node 1 lands nothing for partition 1 after the restart, and holds no R1 primary or receiver and no T1 instance for it. Red before the fix: node 1 re-read the superseded root that named it (`ev/r2/red-g3.log`). Mutant M4 (membership check dropped) turns it red | sim | — |
 | M7V-107 | `m7v_107_restarting_a_node_no_root_names_rereads_nothing` | V-R35, tester M4: a restart re-reads only a root that names the node | the spine with a fifth node in the cluster that no configuration names; it crashes and restarts; the run continues to 6 000 | no root names node 5 (precondition); node 5 lands nothing and builds no receiver. Green on the round-1 code; mutant M4 turns it red (node 5 landed at 2 963) | sim | — |
 | M7V-108 | `m7v_108_each_restart_rereads_the_root_once` | V-R35, tester M5: each restart re-reads the root once | (a) the spine; crash, restart, run to 6 000, crash under boot 2, restart under boot 3, run to 9 000. (b) the spine; crash, restart, crash, restart with no run between, then run to 6 000 | (a) one landing under boot 2 after the first restart, one under boot 3 after the second, and the primary ends at `(Generation(2), Seq(2))`. (b) one landing, under boot 3. Green on the round-1 code; mutant M5 (no in-flight check) turns (b) red with two landings | sim | — |
+| M7V-109 | `m7v_109_a_drained_epoch_stays_revoked_across_a_restart` | lead ledger L-R178e (Gautam 2026-09-27), the hole walk: a durable revocation reaches the restarted A1 before anything else does | the spine; `RevokeEpochRequested{p2, e1}` on node 1, run to 3 200; `partitions/2` written `FencingDrained`; crash, restart under boot 2; the old grant removed by the scenario (bypassing the service: the row is about what a new-boot grant meets); `AcquireDue` under boot 2; run to 6 000 | precondition: the revocation is durable and the old process fenced p2; the new process holds a boot-2 grant and its reload installed `(p2, e1)`. Then `may_admit(p2@e1) = Deny(EpochRevoked)` and `adopted(1, p2)` is the zero triple; the restarted A1's set holds `(p2, e1)`. Red on `HEAD` 56f952d: `(Admit, Adopted{g1, e1, c1})` | sim | — |
+| M7V-110 | `m7v_110_a_restarted_node_reacquires_once_the_service_clears_its_old_grant` | Gautam's option A (2026-09-27): the scenario grant service clears a restarted node's old grant by exact-revision delete once all three guards hold, and A1's existing retry acquires | the spine; crash, restart under boot 2, `AcquireDue` under boot 2; the service (`rdb_sim::sim::grant_service`, clock of node 0) called at `E_old + ε + δ`, then one tick later | at the threshold: `Refused(NotProvenExpired)` and node 1 not held; one tick later: `Cleared(rev)`; after two renewal intervals node 1 holds a boot-2 grant, `(p2, e1)` admits and is adopted. Red with the delete stubbed out: node 1 never re-acquires | sim | — |
+| M7V-111 | `m7v_111_the_service_never_clears_a_frozen_grant` | option A guard 1: a frozen record is the takeover's | as M7V-110, with the old record frozen at its exact revision after the restart; the service called 1 000 ms past the proof | `Refused(Frozen)`; the record is still boot 1, frozen, at its revision; node 1 does not acquire. Kills the guard-1 mutant | sim | — |
+| M7V-112 | `m7v_112_the_service_never_clears_a_grant_not_yet_proven_expired` | option A guard 2: the `ExpiryProven` inequality, strict | as M7V-110, the service called at exactly `E_old + ε + δ` | `Refused(NotProvenExpired)`; the record at its revision; node 1 does not acquire. Kills the guard-2 and δ-dropped mutants | sim | — |
+| M7V-113 | `m7v_113_the_service_never_clears_a_grant_while_a_partition_is_mid_transfer` | option A guard 3: a partition naming the node and not `Serving` is the transfer's | as M7V-110, with `partitions/2` (owner node 1) moved to `Fencing`; the service called 1 000 ms past the proof | `Refused(PartitionInTransfer(p2))`; the record at its revision; node 1 does not acquire. Kills the guard-3 mutant | sim | — |
 
 ---
 
@@ -1002,7 +1008,7 @@ grammar/generator 9 (6 + 80, 86, 88) ·
 reducer 10 (8 + 83, 84) · campaign 18 (14 + 78, 82, 87, 89) · mutations 7 (6 + 81 counted once,
 under oracle) · evidence 6 — the blocks overlap by the reserved ids 20–23 and by M7V-81, and the
 distinct id set is `M7V-01..M7V-89`. By class: unit 58 · sim 12 · campaign 19 (§2).
-Rows added after this count and not in it: `M7V-92`..`M7V-108` (seventeen; `M7V-90` stays retired, and
+Rows added after this count and not in it: `M7V-92`..`M7V-113` (twenty-two; `M7V-90` stays retired, and
 `M7V-91` is held as the candidate row named in §15 drift row 6, still unwritten). Their classes are in §2. Count landed rows with
 `scripts/m7-census.sh verification`, never from this paragraph.
 
@@ -1502,6 +1508,19 @@ by it. What it changes for this plan's rows, and what it does not:
     refused `NotAMember` (78 in tester run t2). A restarted follower's receiver is rebuilt as
     `Member{boot 1}`, and the primary drops every ACK it sends as `AckRejected(StaleBoot)` (30 in
     t1). So a restarted follower never counts toward progress again. Nothing re-pins today.
+- **L-R178e (Gautam, 2026-09-27; dev-a1-restart, 2026-09-28; M7V-109..M7V-113).** Closes V-R35's
+  open items (a) and (b). Items (c) and (d) stay open.
+  - (b) **Revocations read back.** `Dispatcher::restart` marks the node. The first offer to its
+    fresh A1 replays each durable revocation of that node as `EpochRevocationRestored`, in key
+    order, ahead of the offer itself, so nothing reaches the fresh A1 first. A1 records it in
+    every state (`revoked_epochs` moved onto the kernel). M7V-109.
+  - (a) **Grant service.** `rdb_sim::sim::grant_service::clear_restarted_grant` deletes
+    `grants/{node}` at its exact revision only when the record is not frozen, the service's
+    clock proves `E_old + ε + δ` passed (`authority::clock::expiry_proven`, the takeover's own
+    inequality), and no `partitions/{id}` naming the node is other than `Serving`. It is called
+    by the row, not by the run loop. `ControlStore::scenario_cas` is the one new public store
+    method it writes through. M7V-110..M7V-113.
+  - `revocations` still survives a restart, as V-R35 listed; it now also has a reader.
 - **Known gap:** `BatchApply.key_versions` is always empty — the harness holds byte keys and a
   `KeyId` is assigned by the scenario generator. INV-ATOM and the read-version rules see no
   versions from a recorded run.

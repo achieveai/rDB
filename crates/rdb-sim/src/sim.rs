@@ -7,5 +7,6 @@
 pub mod clock;
 pub mod cluster;
 pub mod control;
+pub mod grant_service;
 pub mod network;
 pub mod scheduler;
