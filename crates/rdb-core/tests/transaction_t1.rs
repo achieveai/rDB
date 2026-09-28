@@ -4578,6 +4578,9 @@ fn dedup_older_answers_the_newest_older_generation_holding_that_identity() {
 /// question), and then refused `LEASE_EXPIRED` (A-R73: refuse when the check cannot be asked
 /// again) — before the deadline, at the same tick — and the queue behind it gets its own turn.
 /// The near miss: when the view moves between two stale answers, the second one re-asks.
+/// Two more clauses pin the edges: a request both expired and already re-asked is refused
+/// `DEADLINE_BEFORE_ADMISSION` (expiry is checked first), and a view republished at the same
+/// `authority_seq` has not moved, so it does not reset the bound.
 #[retcd_test]
 fn m7a_178_a_stale_authority_at_one_tick_is_asked_once_more_then_refused() {
     let mut h = H::live();
@@ -4641,4 +4644,39 @@ fn m7a_178_a_stale_authority_at_one_tick_is_asked_once_more_then_refused() {
         h.step(answer(c3, 2, Verdict::Admit)).as_slice(),
         [EffectKind::Store(StoreEffect::Commit(_))]
     ));
+
+    // Expired as well as already re-asked under the unmoved view: expiry is checked first, so
+    // the refusal is DEADLINE_BEFORE_ADMISSION, not LEASE_EXPIRED.
+    let mut h = H::live();
+    let c1 = h.admit(put(1, b"a", b"1"));
+    h.now = 10 + 1_000 - 1;
+    let c2 = reasked(&h.step(answer(c1, 0, Verdict::Deny(DenyReason::NoGrant))));
+    h.now = 10 + 1_000;
+    let effects = h.step(answer(c2, 0, Verdict::Deny(DenyReason::NoGrant)));
+    let [stale, rest @ ..] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(*stale, ignored(AuthorityIgnoreReason::StaleAuthorityAnswer));
+    assert_eq!(
+        replies(rest),
+        vec![(1, ErrorKind::DeadlineBeforeAdmission)],
+        "expired beats the re-ask bound"
+    );
+
+    // "Per view" means per authority_seq: a view republished at the same seq has not moved, so
+    // the second stale answer is still refused.
+    let mut h = H::live();
+    let c1 = h.admit(put(1, b"a", b"1"));
+    let c2 = reasked(&h.step(answer(c1, 0, Verdict::Deny(DenyReason::NoGrant))));
+    let _ = h.step(push_view(1));
+    let effects = h.step(answer(c2, 0, Verdict::Deny(DenyReason::NoGrant)));
+    let [stale, rest @ ..] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(*stale, ignored(AuthorityIgnoreReason::StaleAuthorityAnswer));
+    assert_eq!(
+        replies(rest),
+        vec![(1, ErrorKind::LeaseExpired)],
+        "a same-seq view does not reset the bound"
+    );
 }

@@ -21,3 +21,6 @@ tracing = { workspace = true }
 # This is the allowed direction: `rdb-*` may depend on `config-*` (rdb ADR-0002).
 config-log = { workspace = true }
 config-log-macros = { workspace = true }
+# The campaign's evidence artifacts go through `write_evidence`, which stamps the shared envelope
+# and disclaimer; nothing in this crate may write a second copy (ruling V-R24, after V-R5/F-R1).
+config-testkit = { workspace = true }

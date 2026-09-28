@@ -67,10 +67,16 @@ scope_plan() {
 #                   prefix. Foundation plan section 16 records all three as known exceptions
 #                   ("met with three exceptions"), and section 18 Q-2 gives the reason a landed
 #                   test is not renamed.
+#   M7V-90          retired, not a row. Ruling F-R13 withdrew it in correction round 4: the
+#                   `quorum_rule` field it cross-checked will never exist. The verification plan
+#                   records the retirement in its header note ("its id is **retired, not
+#                   reused**, and the next free id is `M7V-91`") and in its F-R13 paragraph
+#                   ("the id `M7V-90` is retired and the next new row is `M7V-91`"). There is no
+#                   m7v_90_ function and there must never be one.
 #
 # Add to this list only with a citation. An id parked here stops being counted as owed, so an
 # entry without a reason is a way to make owed work disappear.
-EXEMPT="M7F-27 M7F-28 M7F-39 M7F-42 M7F-48 M7F-49"
+EXEMPT="M7F-27 M7F-28 M7F-39 M7F-42 M7F-48 M7F-49 M7V-90"
 
 is_exempt() {
   for e in $EXEMPT; do [ "$e" = "$1" ] && return 0; done

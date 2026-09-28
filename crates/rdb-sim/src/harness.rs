@@ -10,6 +10,8 @@
 //! | [`self::manifest`] | resolving a run's budgets into [`rdb_core::contracts::trace::RunManifest`] |
 //! | [`self::run`] | the run loop: pop, route, step, deliver, record, stop for a named reason |
 //! | [`self::replay`] | re-running a recorded run and proving the result is identical |
+//! | [`self::semantic`] | the semantic lines the oracle arms on: what the kernel decided, applied, synced and acknowledged |
+//! | [`self::hop`] | a planned delay on one kernel-to-kernel hop |
 //!
 //! # State
 //!
@@ -22,12 +24,14 @@
 //! [`environment_capabilities`] is the honest summary the rows log.
 
 pub mod dispatch;
+pub mod hop;
 pub mod hosted;
 pub mod manifest;
 pub mod protection;
 pub mod replay;
 pub mod route;
 pub mod run;
+pub mod semantic;
 pub mod trace;
 pub mod transfer;
 

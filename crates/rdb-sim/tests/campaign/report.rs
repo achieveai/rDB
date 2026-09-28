@@ -38,3 +38,31 @@ pub const fn artifact_name(profile: Profile) -> &'static str {
 
 /// The two duration keys, kept distinct so neither can hide inside the other (critic F11).
 pub const DURATION_KEYS: [&str; 3] = ["wall_ms", "shrink_ms", "compile_ms_excluded"];
+
+impl Profile {
+    /// The profile this binary was compiled under. A pure function of the build
+    /// (`cfg!(debug_assertions)`), never of an environment variable (ruling V-R17).
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(debug_assertions) {
+            Self::Debug
+        } else {
+            Self::Release
+        }
+    }
+
+    /// The artifact's `profile` value.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
+/// The target directory VA-9 reserves for commands 2 and 3.
+pub const CAMPAIGN_TARGET_DIR: &str = ".rtargets/campaign";
+
+/// The coverage artifact's name (ADR-rdb-0019 §2). One name under both profiles.
+pub const COVERAGE_ARTIFACT: &str = "rdb-m7-coverage";

@@ -112,13 +112,14 @@ use rdb_core::contracts::event::{
 };
 use rdb_core::contracts::ids::{
     BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, Generation, NodeId, OwnerEpoch,
-    PartitionId,
+    PartitionId, ReplicaRole,
 };
 use rdb_core::contracts::recovery::SurvivorInventory;
 use rdb_core::contracts::storage::Batch;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
-    DispatchOutcome, PackageId, Provenance, TopologyEntry, Trace, TraceHeader, TraceKind,
+    ApplyOutcome, DispatchOutcome, PackageId, Provenance, TopologyEntry, Trace, TraceHeader,
+    TraceKind,
 };
 use rdb_core::contracts::version::TRACE_SCHEMA_VERSION;
 
@@ -127,6 +128,7 @@ use crate::harness::dispatch::Dispatcher;
 use crate::harness::environment_capabilities;
 use crate::harness::manifest::{resolve, BudgetOverride};
 use crate::harness::route::{self, Arm, Edge};
+use crate::harness::semantic::{self, Semantic};
 use crate::harness::trace::{Recorder, Site};
 use crate::harness::transfer::TransferPlan;
 use crate::sim::cluster::{Cluster, ClusterConfig};
@@ -521,6 +523,8 @@ pub struct Runner {
     cluster: Cluster,
     recorder: Recorder,
     budgets: Budgets,
+    /// The semantic lines' cross-line state (see [`crate::harness::semantic`]).
+    semantic: Semantic,
 }
 
 impl Runner {
@@ -553,6 +557,7 @@ impl Runner {
             cluster,
             recorder: Recorder::new(),
             budgets,
+            semantic: Semantic::default(),
         };
         runner.recorder.begin(header)?;
 
@@ -596,12 +601,14 @@ impl Runner {
         // planned fault meant for the run (lead ruling B-R55a).
         for (node, batch) in &plan.preloads {
             runner.dispatcher.preload(*node, batch.clone())?;
+            runner.record_preload(plan, *node, batch)?;
         }
         for (node, partition, generation, through) in &plan.preload_durable {
             runner
                 .dispatcher
                 .preload_durable(*node, *partition, *generation, *through)?;
         }
+        runner.record_lines()?;
         for op in &plan.storage_ops {
             runner.dispatcher.inject_storage(*op)?;
         }
@@ -725,6 +732,8 @@ impl Runner {
             if armed.is_some_and(|at| at <= fire_at) {
                 self.dispatcher
                     .fire_due_timers(fire_at, &mut self.scheduler)?;
+                // A host flush due now has already synced.
+                self.record_lines()?;
             }
 
             // After the fires are queued, so a run that stops here reports the work that is
@@ -734,6 +743,21 @@ impl Runner {
                     max_events: limits.max_events,
                     queued: self.scheduler.queued(),
                 };
+            }
+
+            // The same case with a later event already queued (ruling V-R30): due work that
+            // queued nothing must not let the pop below take that later event, or the clock jumps
+            // to it and every deadline in between fires late, at its tick. A far-future seed did
+            // exactly that to F1's discovery close. Go round again instead, under the same
+            // moved-deadline guard as the arm below, so a stuck entry still cannot spin.
+            if self
+                .scheduler
+                .next_tick()
+                .is_some_and(|head| head > fire_at)
+                && armed.is_some()
+                && self.dispatcher.next_deadline() != armed
+            {
+                continue;
             }
 
             let Some(event) = self.scheduler.pop() else {
@@ -751,6 +775,16 @@ impl Runner {
             };
             report.events_consumed += 1;
             report.last_tick = self.scheduler.now();
+            // One line per pop, naming its kind: the trace's `ModuleDispatch` records carry the
+            // node and tick but not the event, so a rate row that must be derived by pop kind
+            // (M7V-47, ruling V-R31) is listed from this line. Debug, so off unless asked for:
+            // `RETCD_TEST_LOG=info,rdb_sim::harness::run=debug`.
+            tracing::debug!(
+                tick = self.scheduler.now().0,
+                node = event.node.0,
+                kind = ?event.kind,
+                "runner pop"
+            );
             // `Clock::advance`'s own documentation is "the harness calls this with the
             // scheduler's tick", and this loop is the harness. Without it `Clock::now` stays at
             // `Tick::ZERO` for the whole run, so every `StepCtx::control_time` a module sees
@@ -833,6 +867,17 @@ impl Runner {
                             event.id,
                             module,
                             DispatchOutcome::Answered { effects: count },
+                        )?;
+                        // The semantic lines this answer carries (P-1), recorded before delivery
+                        // like the dispatch line above.
+                        self.semantic.record(
+                            &mut self.recorder,
+                            site,
+                            module,
+                            &event,
+                            &effects,
+                            &self.dispatcher,
+                            &budgets,
                         )?;
                         let delivered = self.carry_out(event.node, event.boot, effects);
                         // Before the refusal is acted on: an `Ignored` delivered ahead of a
@@ -931,14 +976,71 @@ impl Runner {
     ///
     /// Whatever [`Dispatcher::deliver`] returns, unchanged: [`SimError::Unavailable`] naming the
     /// seam for an unbuilt provider, or a [`SimError::Config`] from the store or the scheduler.
+    ///
+    /// What the engines applied and synced on the way is recorded before the result is returned
+    /// ([`Dispatcher::take_lines`]), refused or not: a commit that landed ahead of a refused
+    /// effect in one vector still happened.
     pub fn carry_out(
         &mut self,
         node: NodeId,
         boot: BootId,
         effects: Vec<Effect>,
     ) -> Result<(), SimError> {
-        self.dispatcher
-            .deliver(node, boot, effects, &mut self.control, &mut self.scheduler)
+        let delivered =
+            self.dispatcher
+                .deliver(node, boot, effects, &mut self.control, &mut self.scheduler);
+        self.record_lines()?;
+        delivered
+    }
+
+    /// Record every `BatchApply` and `DurabilityAdvance` line the dispatcher is holding, each at
+    /// its own site (see [`crate::harness::semantic`]).
+    fn record_lines(&mut self) -> Result<(), SimError> {
+        for (site, line) in self.dispatcher.take_lines() {
+            self.recorder.record(site, line)?;
+        }
+        Ok(())
+    }
+
+    /// Record the `BatchApply` a scenario preload of `batch` on `node` stands for, at tick 0,
+    /// under the role `node` holds in the plan's configuration for that partition, or a regular
+    /// secondary where it holds none. A preload is the history a node starts with; without its
+    /// line, an acknowledgement of a preloaded prefix would sit above its node's last apply.
+    fn record_preload(
+        &mut self,
+        plan: &RunPlan,
+        node: NodeId,
+        batch: &Batch,
+    ) -> Result<(), SimError> {
+        let role = plan
+            .cluster
+            .partitions
+            .iter()
+            .find(|spec| spec.partition == batch.partition)
+            .and_then(|spec| {
+                spec.config
+                    .members
+                    .iter()
+                    .find(|member| member.node == node)
+            })
+            .map_or(ReplicaRole::RegularSecondary, |member| member.role);
+        let Some(line) = semantic::apply_line(batch, role, ApplyOutcome::Applied) else {
+            return Ok(());
+        };
+        let boot = plan
+            .cluster
+            .nodes
+            .iter()
+            .find(|spec| spec.node == node)
+            .map_or(BootId(0), |spec| spec.boot);
+        let site = Site {
+            at: Tick::ZERO,
+            node,
+            boot,
+            partition: batch.partition,
+            correlation: CorrelationId(0),
+        };
+        self.recorder.record(site, line).map(drop)
     }
 
     /// Record one [`TraceKind::ModuleDispatch`]: what the loop offered, to whom, and how it was
@@ -1027,7 +1129,8 @@ impl Runner {
     /// # Errors
     ///
     /// Whatever [`Recorder::finish`] returns.
-    pub fn finish(self) -> Result<Trace, SimError> {
+    pub fn finish(mut self) -> Result<Trace, SimError> {
+        self.record_lines()?;
         self.recorder.finish()
     }
 

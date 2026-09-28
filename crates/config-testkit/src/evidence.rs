@@ -61,6 +61,14 @@ pub const DISCLAIMER: &str = "Dev-host evidence. Not a production claim; product
 /// Schema version of the artifact envelope (TA-61).
 pub const SCHEMA: u64 = 1;
 
+/// The `values` key that says why a run achieved **nothing** of its target.
+///
+/// A zero `scale_factor` is a true measurement, not a malformed one: a run whose histories
+/// could not execute reached none of its scale, and saying so beats inflating the number until
+/// it looks like evidence (ruling V-R27). [`validate`] accepts `0` only beside a non-empty
+/// string under this key, so a zero never reaches `docs/evidence/` unexplained.
+pub const BELOW_TARGET_REASON: &str = "below_target_reason";
+
 /// Environment variable that asks for a full-scale run.
 pub const FULL_SCALE_ENV: &str = "RETCD_EVIDENCE";
 
@@ -327,7 +335,8 @@ pub fn read_evidence(path: &Path) -> Result<Artifact, EvidenceError> {
 /// Check every TA-61 rule that a parse alone does not (M6-113).
 ///
 /// The disclaimer must be the exact constant, the schema must be [`SCHEMA`], the build and run
-/// stamps must be populated, and `values` must hold something.
+/// stamps must be populated, and `values` must hold something. A `scale_factor` of `0` needs a
+/// [`BELOW_TARGET_REASON`] in `values`.
 pub fn validate(artifact: &Artifact) -> Result<(), EvidenceError> {
     let fail = |detail: String| {
         Err(EvidenceError::Invalid {
@@ -353,10 +362,20 @@ pub fn validate(artifact: &Artifact) -> Result<(), EvidenceError> {
     if artifact.run.utc.trim().is_empty() {
         return fail("run.utc is empty".to_string());
     }
-    if !artifact.run.scale_factor.is_finite() || artifact.run.scale_factor <= 0.0 {
+    if !artifact.run.scale_factor.is_finite() || artifact.run.scale_factor < 0.0 {
         return fail(format!(
             "run.scale_factor {} is not a measurement",
             artifact.run.scale_factor
+        ));
+    }
+    // Zero is a measurement (V-R27), but only an explained one.
+    if artifact.run.scale_factor <= 0.0
+        && artifact.values[BELOW_TARGET_REASON]
+            .as_str()
+            .is_none_or(|reason| reason.trim().is_empty())
+    {
+        return fail(format!(
+            "run.scale_factor is 0 and values.{BELOW_TARGET_REASON} does not say why"
         ));
     }
     if artifact.run.full_scale != (artifact.run.scale_factor >= 1.0) {

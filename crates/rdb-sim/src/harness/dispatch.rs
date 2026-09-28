@@ -39,7 +39,7 @@ use rdb_core::contracts::event::{
 };
 use rdb_core::contracts::ids::{
     AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket, Generation,
-    NodeId, OwnerEpoch, PartitionId, Seq, SnapshotHandle, TimerId, TimerVersion,
+    NodeId, OwnerEpoch, PartitionId, ReplicaRole, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::publication::PublicationEffect;
@@ -51,7 +51,7 @@ use rdb_core::contracts::storage::{
 };
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{
-    CapabilityState, KernelNote, RecoveredDeferReason, SyncWithheldReason, TraceKind,
+    ApplyOutcome, CapabilityState, KernelNote, RecoveredDeferReason, SyncWithheldReason, TraceKind,
 };
 use rdb_core::contracts::transport::{Frame, LinkFault, PeerLabel, SendEffect, TransportEvent};
 use rdb_core::protection::{Protection, HEALTH_EVAL_TIMER};
@@ -64,9 +64,12 @@ use rdb_core::{
 };
 
 use crate::error::SimError;
+use crate::harness::hop::{self, HopDelay};
 use crate::harness::hosted::{Hosted, Scope};
 use crate::harness::protection::ProtectionTable;
 use crate::harness::route;
+use crate::harness::semantic;
+use crate::harness::trace::Site;
 use crate::harness::transfer::{Step, Transfer, TransferPlan};
 use crate::sim::clock::Clock;
 use crate::sim::control::ControlStore;
@@ -200,6 +203,9 @@ pub struct Dispatcher {
     /// Only its first landing of a generation may inherit (lead ruling B-R58c; see
     /// [`Self::run_due_watches`]).
     landed: BTreeSet<(NodeId, PartitionId, Generation)>,
+    /// Planned delays on `AuthorityCheck` hops (P-3; see [`crate::harness::hop`]). Empty by
+    /// default: every hop is zero ticks (B-R23).
+    hops: Vec<HopDelay>,
     /// Whether a committed recovery fans out to the other members at all. **On** by default
     /// (lead ruling B-R58b). A member that hears `Recovered` builds its receiver (B-R54) and
     /// asks the primary for the prefix, which `SendEnvelopes` sends from the primary's engine
@@ -235,6 +241,9 @@ pub struct Dispatcher {
     /// B-R42). Kept the way [`Self::replies`] is, and for the run loop to write as
     /// [`rdb_core::contracts::trace::TraceKind::KernelNoted`].
     notes: Vec<(NodeId, ModuleName, KernelNote)>,
+    /// What the environment applied and synced, as trace lines not yet collected by the run loop
+    /// ([`Self::take_lines`]). Each carries its own site: the node whose engine did it.
+    lines: Vec<(Site, TraceKind)>,
     /// The authority-clock estimate every [`StepCtx`] this dispatcher builds is filled from
     /// (ask CB-9).
     ///
@@ -285,6 +294,7 @@ impl Dispatcher {
             held: Vec::new(),
             next_watch: 0,
             landed: BTreeSet::new(),
+            hops: Vec::new(),
             member_watches: true,
             next_frame: 1,
             adopted: BTreeMap::new(),
@@ -292,8 +302,15 @@ impl Dispatcher {
             timer_sites: BTreeMap::new(),
             replies: Vec::new(),
             notes: Vec::new(),
+            lines: Vec::new(),
             clock: Clock::default(),
         }
+    }
+
+    /// Hold `hop`'s `AuthorityCheck`s back on their way to A1 (P-3). It applies to every check
+    /// routed after the call, so a row may set it before the first pop or between segments.
+    pub fn delay_hop(&mut self, hop: HopDelay) {
+        self.hops.push(hop);
     }
 
     /// Make `node` reachable, delivering to it under `boot`. The run loop registers every node
@@ -399,16 +416,20 @@ impl Dispatcher {
         if engine.has_planned() {
             return Err(refused);
         }
-        engine
-            .sync_wal_through(vec![CapturedPrefix {
-                partition,
-                generation,
-                through: AppliedSeq(through.0),
-            }])
+        let captured = vec![CapturedPrefix {
+            partition,
+            generation,
+            through: AppliedSeq(through.0),
+        }];
+        let durable = engine
+            .sync_wal_through(captured.clone())
             .map_err(|_| refused.clone())?;
         if engine.durable(partition, generation) < through {
             return Err(refused);
         }
+        let lines = semantic::durability_lines(engine, 0, &captured, Ok(durable.as_slice()));
+        let site = (node, CorrelationId(0));
+        self.push_lines(Tick::ZERO, site, lines);
         Ok(())
     }
 
@@ -984,13 +1005,24 @@ impl Dispatcher {
             match store {
                 StoreEffect::Commit(batch) => {
                     let id = batch.id;
-                    match self.engine_mut(node).commit(batch.clone()) {
-                        Ok(applied) => StorageEvent::Committed { batch: id, applied },
-                        Err(fault) => StorageEvent::CommitFailed { batch: id, fault },
+                    let role = self.apply_role(node, from, batch.partition);
+                    let (kind, outcome) = match self.engine_mut(node).commit(batch.clone()) {
+                        Ok(applied) => (
+                            StorageEvent::Committed { batch: id, applied },
+                            ApplyOutcome::Applied,
+                        ),
+                        Err(fault) => (
+                            StorageEvent::CommitFailed { batch: id, fault },
+                            ApplyOutcome::Failed,
+                        ),
+                    };
+                    if let Some(line) = semantic::apply_line(batch, role, outcome) {
+                        self.push_lines(now, (node, site.2), [(batch.partition, line)]);
                     }
+                    kind
                 }
                 StoreEffect::Flush { ticket, captured } => {
-                    match self.flush(node, *ticket, captured.clone()) {
+                    match self.flush(node, *ticket, captured.clone(), (now, site.2)) {
                         Some(kind) => kind,
                         // A stalled flush never completes (L-R177do): nothing is scheduled, and the
                         // engine holds the capture in `MemoryEngine::stalled_syncs`.
@@ -1047,20 +1079,63 @@ impl Dispatcher {
     /// Sync `captured` on `node` and say what the engine really made durable. `None` for a
     /// stalled flush ([`StorageOp::StallFlush`]): it never completes, so there is nothing to
     /// report, and the caller schedules nothing.
+    ///
+    /// Every flush that completes is recorded, one `DurabilityAdvance` per captured prefix at
+    /// `(at, correlation)` ([`semantic::durability_lines`]).
     fn flush(
         &mut self,
         node: NodeId,
         ticket: FlushTicket,
         captured: Vec<CapturedPrefix>,
+        (at, correlation): (Tick, CorrelationId),
     ) -> Option<StorageEvent> {
         let engine = self.engine_mut(node);
         if engine.stalled_sync(&captured) {
             return None;
         }
-        Some(match engine.sync_wal_through(captured) {
+        let synced = engine.sync_wal_through(captured.clone());
+        let lines = semantic::durability_lines(engine, ticket.0, &captured, synced.as_deref());
+        self.push_lines(at, (node, correlation), lines);
+        Some(match synced {
             Ok(durable) => StorageEvent::Flushed { ticket, durable },
             Err(fault) => StorageEvent::FlushFailed { ticket, fault },
         })
+    }
+
+    /// The role `node` applies a commit from `from` under: T1 commits only as the primary; R1
+    /// commits as the copy its receiver is, which is the role its own acknowledgement claims.
+    /// A commit from anything else, or an R1 commit with no receiver, is recorded as a regular
+    /// secondary: never `Primary`, so it cannot arm INV-AUTH's or INV-DEDUP's primary rules.
+    fn apply_role(&self, node: NodeId, from: ModuleName, partition: PartitionId) -> ReplicaRole {
+        if from == ModuleName::Transaction {
+            return ReplicaRole::Primary;
+        }
+        self.replication
+            .receiver(node, partition)
+            .map_or(ReplicaRole::RegularSecondary, |receiver| {
+                receiver.current_ack().role
+            })
+    }
+
+    /// Queue `lines` for the run loop, each at `node` under its current boot, at `at`, with
+    /// `correlation`. The partition is the line's own.
+    fn push_lines(
+        &mut self,
+        at: Tick,
+        (node, correlation): (NodeId, CorrelationId),
+        lines: impl IntoIterator<Item = (PartitionId, TraceKind)>,
+    ) {
+        let boot = self.boots.get(&node).copied().unwrap_or(BootId(0));
+        for (partition, line) in lines {
+            let site = Site {
+                at,
+                node,
+                boot,
+                partition,
+                correlation,
+            };
+            self.lines.push((site, line));
+        }
     }
 
     /// One [`EffectKind::Kernel`]: recorded, routed, or refused by name.
@@ -1171,8 +1246,11 @@ impl Dispatcher {
             self.notes.push((node, from, note));
         }
         if let Some(event) = route::event_for(kernel) {
-            let now = scheduler.now();
-            let id = self.schedule(scheduler, now, site, EventKind::Kernel(event))?;
+            // Zero ticks unless a planned hop delay names this check (P-3).
+            let at = scheduler
+                .now()
+                .plus_millis(hop::delay(&self.hops, node, kernel));
+            let id = self.schedule(scheduler, at, site, EventKind::Kernel(event))?;
             self.routed.insert(id);
             return Ok(());
         }
@@ -1837,10 +1915,15 @@ impl Dispatcher {
             self.notes.push(withheld(SyncWithheldReason::Stalled));
             return Ok(());
         }
-        if let Err(fault) = engine.sync_wal_through(captured) {
+        // A real sync on the holder's engine, so it is recorded like a host flush: at the holder.
+        let synced = engine.sync_wal_through(captured.clone());
+        let lines = semantic::durability_lines(engine, 0, &captured, synced.as_deref());
+        self.push_lines(scheduler.now(), (holder, site.2), lines);
+        if let Err(fault) = synced {
             self.notes.push(withheld(SyncWithheldReason::Failed(fault)));
             return Ok(());
         }
+        let engine = self.engine_mut(holder);
         let durable = engine.durable(partition, generation);
         let Some(seq) = engine.durable_through(partition, generation, cutoff) else {
             self.notes
@@ -2103,7 +2186,12 @@ impl Dispatcher {
                     through: lineage.applied,
                 })
                 .collect();
-            let Some(kind) = self.flush(node, FlushTicket(order), captured) else {
+            let Some(kind) = self.flush(
+                node,
+                FlushTicket(order),
+                captured,
+                (now, CorrelationId::default()),
+            ) else {
                 // Stalled: it never completes (L-R177do).
                 continue;
             };
@@ -2130,6 +2218,13 @@ impl Dispatcher {
     /// [`rdb_core::contracts::trace::TraceKind::KernelNoted`] (lead ruling A-R46).
     pub fn take_notes(&mut self) -> Vec<(NodeId, ModuleName, KernelNote)> {
         std::mem::take(&mut self.notes)
+    }
+
+    /// The `BatchApply` and `DurabilityAdvance` lines the environment owes since the last call,
+    /// in the order the engines did the work, each with its own site (see
+    /// [`crate::harness::semantic`]). The run loop drains this after every delivery.
+    pub fn take_lines(&mut self) -> Vec<(Site, TraceKind)> {
+        std::mem::take(&mut self.lines)
     }
 
     /// Whether any note is waiting for [`Dispatcher::take_notes`].

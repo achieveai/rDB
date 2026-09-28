@@ -1702,9 +1702,11 @@ fn ack_after_takeover(seq: u64) -> AppendAck {
 ///   ladder, and this build cannot make one: the ladder is dense from its seeded floor and
 ///   nothing drops a rung (`DigestLadder`'s doc).
 ///
-/// Not asserted: a copy seeded above the cutoff holds no rung at or below it, and
-/// `on_recovered` answers `Ignored{Error(InvalidArgument)}` and changes nothing. The code calls
-/// that a handoff question, and no design row names an answer, so it is outside this claim.
+/// Update (lead, after tester-kbr1): the round-2 residual is now pinned. A copy seeded above the
+/// cutoff holds no rung at or below it, and `on_recovered` answers
+/// `Ignored{Error(InvalidArgument)}` and changes nothing. The code calls that a handoff
+/// question, and no design row names an answer; the clause pins today's answer and that
+/// nothing is adopted, and changes if the design names another.
 #[retcd_test]
 fn m7b_139_recovered_looks_up_the_anchor_before_adopting_it_three_arms() {
     let new_lineage = Lineage {
@@ -1846,6 +1848,23 @@ fn m7b_139_recovered_looks_up_the_anchor_before_adopting_it_three_arms() {
         (rx_.root(), rx_.lineage(), rx_.quarantine()),
         (new_root, new_lineage, None)
     );
+
+    // --- NotRetained, nothing to anchor on (tester-kb-append F2 residual, pinned by the lead):
+    // B seeded above the cutoff holds no rung at or below 100. It adopts nothing: the answer is
+    // `InvalidArgument` and the receiver is exactly what it was. The design names no answer
+    // here yet; if it names one, this clause changes with it.
+    let mut module = Replication::new();
+    module.install_receiver(receiver_at(P, 120, 120));
+    let before = rx(&module).clone();
+    assert_eq!(before.history().at_or_below(Seq(100)), None);
+    let effects = step(&mut module, &recovered(100, d(100), takeover_config()));
+    assert_eq!(
+        effects,
+        [ignored(KernelIgnoredReason::Error(
+            ErrorKind::InvalidArgument
+        ))]
+    );
+    assert_eq!(rx(&module), &before, "nothing adopted");
 }
 
 /// Every other event kind a quarantined receiver can be offered, answered or declined, leaves
@@ -2354,6 +2373,25 @@ fn m7b_125_catch_up_sends_historical_records_unrestamped_or_snapshot_if_older() 
         None,
         "nothing sent on the ACK"
     );
+    assert_eq!(b_needs(&mut primary, 51), [sends_b(52)]);
+
+    // Twin (c), tester-kbr1 F3: a `Recovered` in the generation already served (a mode change,
+    // or F1's rebuild) re-announces it. It keeps the prior base (B-R71a: only a rebuild into a
+    // new generation sets one), so step 1a still fires. Kills mutant K7 "same generation drops
+    // the prior base".
+    let mut primary = primary_after_two_recoveries(51);
+    primary.on_recovered(&recovery_at(100, Generation(5)), Tick(4));
+    let tracker = primary.tracker();
+    assert_eq!(
+        (
+            tracker.lineage().generation,
+            tracker.base_seq(),
+            tracker.prior_base()
+        ),
+        (Generation(5), Seq(100), Some(Seq(51))),
+        "the same generation keeps the prior base"
+    );
+    assert_eq!(b_needs(&mut primary, 50), [snapshot_b()]);
     assert_eq!(b_needs(&mut primary, 51), [sends_b(52)]);
 }
 

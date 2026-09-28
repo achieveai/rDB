@@ -6,8 +6,9 @@
 //! tracker is driven directly, except in the routing section, which routes the same inputs
 //! through `Replication::step` (lead ruling B-R48). The A1-view rows (M7B-161..163, lead ruling
 //! B-R53) and the primary `Recovered` builds (M7B-164, lead ruling B-R54) come next; the
-//! receiver's own are in `replication_append.rs`. Last are the §9 rows M7B-133..135, 144 and 145,
-//! the edge, retirement and the quarantine route; two of them run R1 beside a real L1 or F1.
+//! receiver's own are in `replication_append.rs`. Last are the §9 rows M7B-133..135, 140, 144
+//! and 145, the edge, retirement and the two divergence routes; two of them run R1 beside a real
+//! L1 or F1.
 //!
 //! Fixture: A primary (copy 0, node 1), B and C regular (copies 1, 2), D a shadow (copy 3).
 //! `min_regular_acks` 1. Every copy's boot is its node number. The primary has applied 12 and
@@ -64,7 +65,7 @@ use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_core::replication::catchup::{
     retransmit_timer, CatchupCursor, MAX_PROBE_ROUNDS, RETRANSMIT_MS,
 };
-use rdb_core::replication::primary::{keepalive_timer, Primary as PrimarySide};
+use rdb_core::replication::primary::{keepalive_timer, Primary as PrimarySide, Shipped};
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::{decode_reply, encode_reply};
 use rdb_core::replication::Replication;
@@ -4757,6 +4758,108 @@ fn m7b_144_copy_quarantined_reaches_the_tracker_and_stalls_rebuilding_loudly() {
     assert!(!log.iter().any(is_cas), "no activation CAS: {log:?}");
 }
 
+/// M7B-140 (design §3.6 step 1 `Differs`: the cursor emits `DivergenceDetected(copy)` and
+/// nothing else; §3.4 `diverged` has one writer, the tracker; ruling Q-B-5). One story per
+/// fixture, all routed through `Replication::step`:
+///
+/// 1. B answers `NeedPrefix{have 10}` with a digest the ladder holds another value for. The
+///    cursor's step is exactly `[DivergenceDetected(B)]`, and the tracker is untouched by it.
+/// 2. That effect, handed back as the event routing makes of it, reaches the tracker. It marks
+///    B diverged and emits the B-R26 vector without index 0: `Alert`, `CopyLost`, then
+///    `QualificationChanged{Lost}` only if the predicate flipped and `BlockPartition` only if the
+///    floor is gone. Three fixtures take neither, the first, and both conditionals.
+/// 3. The same event again is `AlreadyDiverged` and changes nothing.
+/// 4. B's next ACK is dropped at rule 1d.
+#[retcd_test]
+fn m7b_140_catch_up_side_divergence_has_one_writer_and_one_vector() {
+    let forked_prefix = AppendOutcome::Rejected(AppendReject::NeedPrefix {
+        have: Seq(10),
+        head_digest: Digest([0xEE; 32]),
+    });
+    let alone = || {
+        let mut module = routed();
+        route(&mut module, accepted(&b(HEAD, HEAD, HEAD)));
+        module
+    };
+    let c_forked = || {
+        let mut module = both_routed();
+        route(&mut module, accepted(&forked(c(HEAD, HEAD, HEAD))));
+        module
+    };
+    for (name, mut module, vector) in [
+        // C still qualifies and is a floor: two wide.
+        ("c healthy", both_routed(), vec![alert(), copy_lost(COPY_B)]),
+        // B alone qualified, C is still a regular secondary: the edge, no block.
+        (
+            "c lagging",
+            alone(),
+            vec![
+                alert(),
+                copy_lost(COPY_B),
+                lost(QualificationCause::DivergenceDetected(COPY_B)),
+            ],
+        ),
+        // C already diverged by rule 9: the edge and the block, four wide.
+        (
+            "c diverged",
+            c_forked(),
+            vec![
+                alert(),
+                copy_lost(COPY_B),
+                lost(QualificationCause::DivergenceDetected(COPY_B)),
+                kernel(KernelEffect::BlockPartition(
+                    BlockReason::DivergenceRequiresOperator {
+                        diverged: vec![COPY_C, COPY_B],
+                    },
+                )),
+            ],
+        ),
+    ] {
+        // 1. The cursor proves it and writes nothing else.
+        let before = primary_side(&module).tracker().clone();
+        let proof = route(&mut module, reply(B, &forked_prefix));
+        assert_eq!(
+            proof,
+            vec![kernel(KernelEffect::DivergenceDetected { copy: COPY_B })],
+            "{name}"
+        );
+        assert_eq!(*primary_side(&module).tracker(), before, "{name}");
+        assert!(primary_side(&module).cursor(COPY_B).is_none(), "{name}");
+
+        // 2. Routed back, the tracker is the one writer, and emits the vector once.
+        let [EffectKind::Kernel(KernelEffect::DivergenceDetected { copy })] = proof.as_slice()
+        else {
+            unreachable!("asserted above");
+        };
+        let event = EventKind::Kernel(KernelEvent::DivergenceDetected { copy: *copy });
+        assert_eq!(route(&mut module, event.clone()), vector, "{name}");
+        let tracker = primary_side(&module).tracker();
+        assert!(tracker.is_diverged(COPY_B), "{name}");
+        assert_eq!(
+            tracker.diverged().iter().filter(|c| **c == COPY_B).count(),
+            1,
+            "{name}"
+        );
+
+        // 3. Idempotent.
+        let before = tracker.clone();
+        assert_eq!(
+            route(&mut module, event),
+            vec![replica(ReplicaIgnoreReason::AlreadyDiverged)],
+            "{name}"
+        );
+        assert_eq!(*primary_side(&module).tracker(), before, "{name}");
+
+        // 4. Rule 1d: B's next ACK counts for nothing.
+        assert_eq!(
+            route(&mut module, accepted(&b(HEAD, HEAD, HEAD))),
+            vec![rejected(AckRejectReason::Diverged)],
+            "{name}"
+        );
+        assert_eq!(*primary_side(&module).tracker(), before, "{name}");
+    }
+}
+
 // --- Lead rulings B-R67, B-R67a: a lost catch-up ACK -----------------------------------------
 //
 // Joint-gate B1 (probe S3): one catch-up ACK lost below the cutoff stalled a rebuild for good,
@@ -6725,6 +6828,12 @@ fn m7b_219_a_ship_lost_to_both_copies_is_re_sent_and_publishes() {
 /// B-R67i, red-first: B applies 13 and its ACK is lost; C says nothing. The re-send reaches B,
 /// which answers `AlreadyHave` (no cursor: `NothingOutstanding`, B-R48a F1) and its ACK again,
 /// and that ACK publishes 13.
+///
+/// Update (tester-kbr1 F2): the shipped record clears only on an admitted ACK with
+/// applied ≥ seq. B's staged ACK first (received 13, applied 12) is admitted and reports
+/// progress, yet keeps B's record, so the next fire re-sends 13 to B. Kills mutant K5 "clear on
+/// `received`", under which the staged ACK clears it, and a lost applied ACK after it would
+/// leave nothing to re-send.
 #[retcd_test]
 fn m7b_220_a_lost_qualifying_ack_is_asked_again_and_publishes() {
     let mut module = shipped_13();
@@ -6733,12 +6842,41 @@ fn m7b_220_a_lost_qualifying_ack_is_asked_again_and_publishes() {
         route(&mut module, reply(B, &AppendOutcome::AlreadyHave)),
         vec![replica(ReplicaIgnoreReason::NothingOutstanding)]
     );
+    let staged = shipped_to_b_after_staged_ack(&mut module);
+    assert_eq!(
+        staged,
+        Some(Shipped {
+            seq: Seq(HEAD + 1),
+            waited: true
+        }),
+        "a staged ACK (applied < seq) keeps the shipped record"
+    );
+    assert_eq!(
+        sends_to(&retransmit_fires(&mut module, 3), COPY_B),
+        vec![HEAD + 1],
+        "so the next fire re-sends it"
+    );
     let effects = route(&mut module, accepted(&b(HEAD + 1, HEAD + 1, HEAD)));
     assert_eq!(
         effects,
         vec![peer_progress(B, HEAD + 1), gained_at(HEAD + 1, &[COPY_B])]
     );
+    assert_eq!(
+        primary_side(&module).shipped(COPY_B),
+        None,
+        "applied ≥ seq clears it"
+    );
     publishes(&module, &effects[1], HEAD + 1);
+}
+
+/// B's staged ACK for 13 (received 13, applied 12): admitted, it reports progress at 12 and
+/// nothing else. Returns what the stream still holds for B afterwards.
+fn shipped_to_b_after_staged_ack(module: &mut Replication) -> Option<Shipped> {
+    assert_eq!(
+        route(module, accepted(&b(HEAD + 1, HEAD, HEAD))),
+        vec![peer_progress(B, HEAD)]
+    );
+    primary_side(module).shipped(COPY_B)
 }
 
 /// B-R67i, red-first (lead's item 4): both copies answer `Busy` to the one shipped record.

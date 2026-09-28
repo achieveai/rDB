@@ -64,7 +64,8 @@ impl MutationId {
     }
 
     /// The rows that must catch it. MUT-2 has **two**: the kernel half that proves the forgery
-    /// is rejected, and the oracle half that proves the checker fires when it is not.
+    /// is rejected, and the oracle half that proves the checker fires when it is not. MUT-5 has
+    /// two for the same reason (lead ruling V-R25): M7V-92 the kernel half, M7V-70 the oracle half.
     #[must_use]
     pub const fn catching_rows(self) -> &'static [&'static str] {
         match self {
@@ -72,7 +73,7 @@ impl MutationId {
             Self::Mut2CountForgedAck => &["m7v_69", "m7v_81"],
             Self::Mut3PublishBeforeAck => &["m7v_67"],
             Self::Mut4SkipAncestry => &["m7v_68"],
-            Self::Mut5FalseDurableWatermark => &["m7v_70"],
+            Self::Mut5FalseDurableWatermark => &["m7v_92", "m7v_70"],
         }
     }
 

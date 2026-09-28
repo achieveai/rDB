@@ -6343,3 +6343,616 @@ fn provider_a_stopped_source_leaves_no_asker_behind() {
         "no asker is left for a stopped source: node 2's own F1 hears it"
     );
 }
+
+// ------------------------------------------------------------------------------------------
+// Semantic recording (step 3 of the sim-hooks brief): what each engine applied, synced and
+// acknowledged, as the trace lines the oracle arms on. Scaffolding rows, not plan ids: they
+// assert the harness records what the environment really did, and no invariant's verdict.
+// ------------------------------------------------------------------------------------------
+
+/// One `BatchApply` line on partition 1, flattened for comparison.
+type ApplyLine = (
+    NodeId,
+    Generation,
+    Seq,
+    rdb_core::contracts::digest::Digest,
+    rdb_core::contracts::digest::Digest,
+    ReplicaRole,
+    rdb_core::contracts::trace::ApplyOutcome,
+);
+
+/// `(node, generation, seq, predecessor_digest, entry_digest, role, outcome)` for every
+/// `BatchApply` line on partition 1, in trace order.
+fn applies(trace: &Trace) -> Vec<ApplyLine> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.partition == PartitionId(1))
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                role,
+                generation,
+                seq,
+                predecessor_digest,
+                entry_digest,
+                outcome,
+                ..
+            } => Some((
+                event.node,
+                *generation,
+                *seq,
+                *predecessor_digest,
+                *entry_digest,
+                *role,
+                *outcome,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A commit is a `BatchApply` at the committing node, carrying the digests of the record the
+/// batch wrote — the same bytes the engine then holds — and the role the node holds in its pinned
+/// configuration. A preload is one too, at tick 0, so an acknowledgement of a preloaded prefix is
+/// never above its node's last apply.
+#[retcd_test]
+fn recording_every_commit_is_a_batch_apply_line_with_the_records_own_digests() {
+    use rdb_core::contracts::trace::ApplyOutcome;
+    use rdb_sim::harness::trace::validate;
+    support::preamble();
+    let run = run_rebuild(Vec::new());
+    validate(&run.trace).expect("the rebuild's trace is well formed");
+    let applies = applies(&run.trace);
+    tracing::info!(count = applies.len(), "batch_apply lines");
+
+    // The preloads: nodes 1 and 2 hold the prior history, at tick 0.
+    for node in [NodeId(1), NodeId(2)] {
+        let preloaded: Vec<_> = applies
+            .iter()
+            .filter(|line| line.0 == node && line.1 == Generation(1))
+            .map(|line| (line.2, line.3, line.4, line.6))
+            .collect();
+        assert_eq!(
+            preloaded,
+            (1..=SPINE_HEAD)
+                .map(|seq| (
+                    Seq(seq),
+                    spine_digest(seq - 1),
+                    spine_digest(seq),
+                    ApplyOutcome::Applied
+                ))
+                .collect::<Vec<_>>(),
+            "node {} preloaded the prior history",
+            node.0
+        );
+    }
+    let preload_ticks: Vec<u64> = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::BatchApply {
+                    generation: Generation(1),
+                    ..
+                }
+            )
+        })
+        .map(|event| event.logical_tick)
+        .collect();
+    assert!(
+        !preload_ticks.is_empty() && preload_ticks.iter().all(|tick| *tick == 0),
+        "{preload_ticks:?}"
+    );
+
+    // R1 caught copy 2 up from the root: node 3 applied 1..=SPINE_HEAD of the new generation,
+    // each with the digest its engine now holds, as the regular secondary the pin names.
+    let caught_up: Vec<_> = applies
+        .iter()
+        .filter(|line| line.0 == NodeId(3) && line.1 == REBUILT)
+        .map(|line| (line.2, line.3, line.4, line.5, line.6))
+        .collect();
+    assert_eq!(
+        caught_up,
+        (1..=SPINE_HEAD)
+            .map(|seq| (
+                Seq(seq),
+                spine_digest(seq - 1),
+                spine_digest(seq),
+                ReplicaRole::RegularSecondary,
+                ApplyOutcome::Applied
+            ))
+            .collect::<Vec<_>>()
+    );
+    for (seq, record) in (1..=SPINE_HEAD).zip(&run.copy_2_records) {
+        let record = record.as_ref().expect("node 3 holds the record");
+        let envelope = rdb_core::contracts::envelope::ReplicationEnvelope::decode(record)
+            .expect("an envelope");
+        assert_eq!(
+            envelope.record_digest,
+            spine_digest(seq),
+            "the engine's own bytes"
+        );
+    }
+}
+
+/// An accepted append reply is a `ReplicationAck` recorded at the acknowledging node, at the
+/// moment it answers: from that node, to the primary it answers, with the progress and role its
+/// own acknowledgement carries. Buffered, because that is what `buffered_applied` is.
+#[retcd_test]
+fn recording_every_accepted_append_reply_is_a_replication_ack_line_at_its_acker() {
+    use rdb_core::contracts::trace::DurabilityClass;
+    use rdb_sim::harness::trace::validate;
+    support::preamble();
+    let run = run_rebuild(Vec::new());
+    validate(&run.trace).expect("the rebuild's trace is well formed");
+    let acks: Vec<_> = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::ReplicationAck { .. }))
+        .collect();
+    tracing::info!(count = acks.len(), "replication_ack lines");
+    assert!(!acks.is_empty(), "the catch-up was acknowledged");
+
+    let mut highest_from_3 = None;
+    for event in &acks {
+        let TraceKind::ReplicationAck {
+            from_node,
+            to_node,
+            peer_role,
+            peer_boot,
+            generation,
+            contiguous_seq,
+            contiguous_digest,
+            durability_class,
+            accepted,
+            reject_reason,
+            ..
+        } = &event.kind
+        else {
+            unreachable!("filtered to acks")
+        };
+        assert_eq!(*from_node, event.node, "recorded at the acker");
+        assert_eq!(*peer_boot, event.boot, "under the acker's own boot");
+        assert_eq!(*to_node, NODE, "answering node 1's primary");
+        assert!(*accepted && reject_reason.is_none());
+        assert_eq!(*durability_class, DurabilityClass::Buffered);
+        // The acker's own apply of that position, with that digest, precedes the ack.
+        if contiguous_seq.0 > 0 {
+            let applied = run.trace.events.iter().any(|line| {
+                line.event_id < event.event_id
+                    && line.node == event.node
+                    && matches!(
+                        line.kind,
+                        TraceKind::BatchApply { seq, entry_digest, .. }
+                            if seq == *contiguous_seq && entry_digest == *contiguous_digest
+                    )
+            });
+            assert!(
+                applied,
+                "node {} acked seq {} before any apply of it",
+                from_node.0, contiguous_seq.0
+            );
+        }
+        if *from_node == NodeId(3) && *generation == REBUILT {
+            assert_eq!(*peer_role, ReplicaRole::RegularSecondary);
+            highest_from_3 = Some(highest_from_3.unwrap_or(Seq(0)).max(*contiguous_seq));
+        }
+    }
+    assert_eq!(
+        highest_from_3,
+        Some(Seq(SPINE_HEAD)),
+        "copy 2 acknowledged the whole catch-up"
+    );
+}
+
+/// One `DurabilityAdvance` line on partition 1, flattened for comparison.
+type SyncLine = (
+    NodeId,
+    Generation,
+    Seq,
+    rdb_core::contracts::digest::Digest,
+    rdb_core::contracts::trace::SyncOutcome,
+);
+
+/// `(node, generation, durable_seq, durable_digest, outcome)` for every `DurabilityAdvance` line
+/// on partition 1, in trace order.
+fn syncs(trace: &Trace) -> Vec<SyncLine> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.partition == PartitionId(1))
+        .filter_map(|event| match &event.kind {
+            TraceKind::DurabilityAdvance {
+                generation,
+                durable_seq,
+                durable_digest,
+                outcome,
+                ..
+            } => Some((
+                event.node,
+                *generation,
+                *durable_seq,
+                *durable_digest,
+                *outcome,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A sync is a `DurabilityAdvance` at the node whose engine ran it, and it says `Synced` only
+/// where the engine's watermark really moved. F1's `SyncWalThrough` on each survivor is one; a
+/// planned `FalseDurable` on node 2 makes node 2's a flush that completed and advanced nothing,
+/// which is `Partial` at the watermark the engine still holds — never `Synced` at the cutoff.
+#[retcd_test]
+fn recording_a_sync_is_a_durability_advance_line_synced_only_where_the_engine_moved() {
+    use rdb_core::contracts::ids::AppliedSeq;
+    use rdb_core::contracts::trace::SyncOutcome;
+    use rdb_sim::harness::trace::validate;
+    support::preamble();
+    let run = run_spine();
+    validate(&run.trace).expect("the spine's trace is well formed");
+    let synced: Vec<_> = syncs(&run.trace)
+        .into_iter()
+        .filter(|line| line.1 == Generation(1))
+        .collect();
+    tracing::info!(?synced, "durability_advance lines");
+    for node in 1..=3 {
+        assert!(
+            synced.contains(&(
+                NodeId(node),
+                Generation(1),
+                Seq(SPINE_HEAD),
+                spine_digest(SPINE_HEAD),
+                SyncOutcome::Synced
+            )),
+            "node {node}'s survivor sync is recorded: {synced:?}"
+        );
+    }
+
+    let mut plan = spine_plan();
+    plan.storage_ops.push(StorageOp::FalseDurable {
+        node: PEER,
+        through: AppliedSeq(SPINE_HEAD),
+    });
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the spine runs");
+    tracing::info!(stop = ?report.stop, "spine under FalseDurable on node 2");
+    assert_eq!(
+        runner
+            .dispatcher()
+            .engine(PEER)
+            .expect("node 2")
+            .false_claims(),
+        &[AppliedSeq(SPINE_HEAD)],
+        "the fault was met"
+    );
+    let trace = runner.finish().expect("a trace");
+    validate(&trace).expect("well formed");
+    let on_peer: Vec<_> = syncs(&trace)
+        .into_iter()
+        .filter(|line| line.0 == PEER && line.1 == Generation(1))
+        .collect();
+    tracing::info!(
+        ?on_peer,
+        "node 2's durability_advance lines under FalseDurable"
+    );
+    assert_eq!(
+        on_peer.first(),
+        Some(&(
+            PEER,
+            Generation(1),
+            Seq(0),
+            rdb_core::contracts::digest::Digest::ROOT,
+            SyncOutcome::Partial
+        )),
+        "the false flush advanced nothing, and says so: {on_peer:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// M7V-92 — MUT-5's kernel half (lead ruling V-R25): a false durable watermark never becomes a
+// durable position the kernel reports
+// ------------------------------------------------------------------------------------------
+
+/// The rebuild with node 3's engine lying on its next two syncs: `FalseDurable` completes the
+/// flush, reports nothing durable, and moves nothing. One lie is met by F1's sync of copy 2, the
+/// other by a host flush planned after the catch-up, so both of the kernel's durable inputs on
+/// node 3 (R1's `Flushed` and F1's `DurableAt`) are offered the lie.
+fn run_false_durable_rebuild() -> (
+    RebuildRun,
+    Vec<rdb_core::contracts::ids::AppliedSeq>,
+    u64,
+    u64,
+) {
+    use rdb_core::contracts::ids::AppliedSeq;
+    let mut plan = rebuild_plan(Vec::new());
+    for _ in 0..2 {
+        plan.storage_ops.push(StorageOp::FalseDurable {
+            node: NodeId(3),
+            through: AppliedSeq(SPINE_HEAD),
+        });
+    }
+    plan.flushes.push((Tick(3_000), NodeId(3)));
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the rebuild runs");
+    let engine = runner.dispatcher().engine(NodeId(3)).expect("node 3");
+    let claims = engine.false_claims().to_vec();
+    let performed = engine.durable(PartitionId(1), REBUILT).0;
+    let reported = runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(3), PartitionId(1))
+        .map(|receiver| receiver.current_ack().progress.durable.0)
+        .expect("R1 built copy 2's receiver");
+    let phase = runner
+        .dispatcher()
+        .recovery(NODE, PartitionId(1))
+        .map(rdb_core::recovery::Recovery::phase);
+    tracing::info!(stop = ?report.stop, ?claims, performed, reported, ?phase,
+        "rebuild under FalseDurable on node 3");
+    let copy_2_head = runner
+        .dispatcher()
+        .replication()
+        .receiver(NodeId(3), PartitionId(1))
+        .map(|receiver| receiver.applied_head())
+        .map(|head| (head.seq.0, head.digest));
+    let copy_2_base = runner
+        .dispatcher()
+        .engine(NodeId(3))
+        .expect("node 3")
+        .base(PartitionId(1), REBUILT);
+    let trace = runner.finish().expect("a trace");
+    let run = RebuildRun {
+        trace,
+        phase,
+        copy_2_head,
+        copy_2_base,
+        copy_2_records: Vec::new(),
+    };
+    (run, claims, performed, reported)
+}
+
+/// M7V-92. `StorageOp::FalseDurable` on a rebuilt copy's engine: the kernel never reports a
+/// durable position above what M1 performed. R1's acknowledgement stays at the engine's real
+/// watermark, the recorded `DurabilityAdvance` at the lie is `Partial` and never `Synced` above
+/// it, and F1 withholds copy 2's proof as `Short` rather than proving the cutoff.
+///
+/// Parked on its third clause. "No publish counts an ungrounded ack, and INV-PUB is `Proven`"
+/// needs a sim run that reaches P1's `Publish`, and none does (B-R60: L1 stays `Paused` on a
+/// recovered partition). The row asserts that absence rather than assuming it, so the day a
+/// run publishes this row goes red and demands the INV-PUB clause be written.
+#[retcd_test]
+fn m7v_92_false_durable_the_kernel_never_reports_durable_beyond_what_m1_performed() {
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
+    use rdb_core::contracts::trace::{SyncOutcome, SyncWithheldReason};
+    use rdb_sim::harness::trace::validate;
+    use support::oracle::{Invariant, Oracle, Verdict};
+    support::preamble();
+    let (run, claims, performed, reported) = run_false_durable_rebuild();
+    validate(&run.trace).expect("well formed");
+
+    // The fault was met, twice: a row whose lie never reached a sync would pass vacuously.
+    assert_eq!(
+        claims,
+        vec![AppliedSeq(SPINE_HEAD), AppliedSeq(SPINE_HEAD)],
+        "both planned lies were told"
+    );
+    assert!(
+        performed < SPINE_HEAD,
+        "the lie is a lie: M1 performed {performed}, below the claimed {SPINE_HEAD}"
+    );
+    assert_eq!(
+        run.copy_2_head.map(|(seq, _)| seq),
+        Some(SPINE_HEAD),
+        "copy 2 buffered the whole catch-up, so there was something to lie about"
+    );
+
+    // R1: the acknowledgement's durable position is the engine's, never the claim.
+    assert!(
+        reported <= performed,
+        "R1 reports durable {reported} on node 3, above the {performed} M1 performed"
+    );
+
+    // The record: every `DurabilityAdvance` on node 3 in the new generation, and none `Synced`
+    // above what was performed.
+    let on_3: Vec<_> = syncs(&run.trace)
+        .into_iter()
+        .filter(|line| line.0 == NodeId(3) && line.1 == REBUILT)
+        .collect();
+    tracing::info!(?on_3, "node 3's durability_advance lines");
+    assert_eq!(
+        on_3.iter()
+            .filter(|line| line.4 == SyncOutcome::Partial)
+            .count(),
+        2,
+        "each lie is one Partial line: {on_3:?}"
+    );
+    for line in &on_3 {
+        assert!(
+            line.2 .0 <= performed,
+            "a durability_advance above what M1 performed: {line:?}"
+        );
+    }
+
+    // F1: copy 2 is withheld as short at the real watermark, never proven.
+    let notes = run.sync_notes();
+    tracing::info!(?notes, "node 1's sync notes");
+    assert!(
+        notes.contains(&KernelNote::SyncWithheld {
+            copy: CopyId(2),
+            cutoff: Seq(SPINE_HEAD),
+            reason: SyncWithheldReason::Short {
+                durable: DurableSeq(performed),
+            },
+        }),
+        "{notes:?}"
+    );
+    assert!(
+        !run.proven().iter().any(|(copy, _)| *copy == CopyId(2)),
+        "no proof for copy 2: {:?}",
+        run.proven()
+    );
+
+    // The parked clause, stated as a fact about the run rather than assumed.
+    let publishes = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::Publish { .. }))
+        .count();
+    let inv_pub = Oracle::new()
+        .judge(&run.trace)
+        .verdict(Invariant::Pub)
+        .clone();
+    tracing::info!(publishes, ?inv_pub, "INV-PUB on the FalseDurable rebuild");
+    assert!(!matches!(inv_pub, Verdict::Violated(_)), "{inv_pub:?}");
+    assert_eq!(
+        publishes, 0,
+        "a sim run now publishes (B-R60 closed): un-park M7V-92 and assert INV-PUB Proven"
+    );
+    parked(
+        "M7V-92",
+        PackageId::I1,
+        "INV-PUB Proven over a publish that counted node 3's ack: no sim run reaches P1's \
+         Publish (B-R60); un-park when one does",
+    );
+}
+
+/// Report a parked clause, and fail if its package has landed (as `scenarios.rs` does): read
+/// from the landed capability table, never written down.
+#[track_caller]
+fn parked(row: &str, package: PackageId, what: &str) {
+    let state = rdb_sim::harness::environment_capabilities()
+        .into_iter()
+        .find(|(candidate, _)| *candidate == package)
+        .map(|(_, state)| state);
+    assert_eq!(
+        state,
+        Some(CapabilityState::Unavailable),
+        "{package:?} now reports Wired: {row}'s parked clause must be written"
+    );
+    println!("{row}: parked on {package:?} — {what}");
+}
+
+// ------------------------------------------------------------------------------------------
+// M7V-80's quarantine clause (lead rulings V-R28, V-R29): scaffolding, not M7V-80
+// ------------------------------------------------------------------------------------------
+
+/// The copy whose survivor disagrees: copy 2, on node 3.
+const DISAGREEING: NodeId = NodeId(3);
+
+/// The spine with node 3's survivor reporting the head position (generation 1, seq 2) under a
+/// digest nobody else holds. Every source is reachable, and the other two agree with each other.
+fn disagreeing_spine_plan() -> RunPlan {
+    let mut plan = spine_plan();
+    let forked = rdb_core::contracts::digest::Digest([0xd1; 32]);
+    for (node, _, inventory) in &mut plan.survivors {
+        if *node == DISAGREEING {
+            inventory.head = (Seq(SPINE_HEAD), forked);
+            if let Some(rung) = inventory
+                .ladder
+                .iter_mut()
+                .find(|(seq, _)| seq.0 == SPINE_HEAD)
+            {
+                rung.1 = forked;
+            }
+        }
+    }
+    plan
+}
+
+/// F1's quarantine of a recovery-path digest disagreement is a `quarantine{DigestConflict}` line
+/// at the disagreeing position, naming both sides' nodes. **Not M7V-80**: that row also requires
+/// `recovery_decision{mode=Quarantine}`, which is not recorded (V-R29: its cutoff, digest and new
+/// generation are not optional, and on a quarantine F1 chooses none of them). This row asserts
+/// that absence, so the day the contract ask lands it goes red and M7V-80 can be written.
+#[retcd_test]
+fn recording_a_recovery_digest_disagreement_is_a_quarantine_line_naming_both_sides() {
+    use rdb_core::contracts::recovery::{DivergenceEvidence, RecoveryEffect};
+    use rdb_core::contracts::trace::QuarantineReason;
+    use rdb_sim::harness::trace::validate;
+    use support::oracle::{Invariant, Oracle, Verdict};
+    support::preamble();
+    let plan = disagreeing_spine_plan();
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the spine runs");
+    let phase = runner
+        .dispatcher()
+        .recovery(NODE, PartitionId(1))
+        .map(rdb_core::recovery::Recovery::phase);
+    tracing::info!(stop = ?report.stop, ?phase, "spine with a disagreeing survivor");
+    let trace = runner.finish().expect("a trace");
+    validate(&trace).expect("well formed");
+
+    // F1 decided it, over copy 2 at the head; the other side is copy 0 or copy 1.
+    let evidence: Vec<(Seq, CopyId, CopyId)> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note:
+                    KernelNote::RecoveryFact {
+                        effect:
+                            RecoveryEffect::Quarantine(DivergenceEvidence::Pairwise { seq, a, b }),
+                    },
+                ..
+            } => Some((*seq, a.0, b.0)),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?evidence, "F1's quarantine evidence");
+    assert_eq!(evidence.len(), 1, "one quarantine: {evidence:?}");
+    let (seq, a, b) = evidence[0];
+    assert_eq!(seq, Seq(SPINE_HEAD));
+    assert!(a == CopyId(2) || b == CopyId(2), "copy 2 is a side");
+    assert_eq!(phase, Some(rdb_core::recovery::RecoveryPhase::Quarantined));
+
+    // The line: one per quarantine, at the position, naming each side by the node F1's plan
+    // places it on (copy n is on node n + 1 in the spine).
+    let node_of = |copy: CopyId| NodeId(u32::from(copy.0) + 1);
+    let quarantines: Vec<_> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::Quarantine {
+                reason,
+                generation,
+                seq,
+                sources,
+            } => Some((event.node, *reason, *generation, *seq, sources.clone())),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?quarantines, "quarantine lines");
+    assert_eq!(
+        quarantines,
+        vec![(
+            NODE,
+            QuarantineReason::DigestConflict,
+            Generation(1),
+            Seq(SPINE_HEAD),
+            vec![node_of(a), node_of(b)]
+        )],
+        "at F1's node, in the prior lineage, naming both sides"
+    );
+    assert!(quarantines[0].4.contains(&DISAGREEING));
+
+    // The held clause, as a fact about the trace (V-R29).
+    let decisions = trace
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::RecoveryDecision { .. }))
+        .count();
+    assert_eq!(
+        decisions, 0,
+        "a recovery_decision is now recorded on a quarantine: write M7V-80 in full"
+    );
+
+    let inv_lin = Oracle::new().judge(&trace).verdict(Invariant::Lin).clone();
+    tracing::info!(?inv_lin, "INV-LIN on the quarantined spine");
+    assert!(!matches!(inv_lin, Verdict::Violated(_)), "{inv_lin:?}");
+}

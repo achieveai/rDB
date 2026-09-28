@@ -3,7 +3,8 @@
 **These are dev-host numbers. They are not a production claim.**
 
 Every `*.json` file in this directory was written by one test row on whatever machine last ran
-the M6 evidence suite. A production designation requires re-running the suite on the target
+the M6 evidence suite, or, for the `rdb-*` files, the rDB M7 campaign (see "The rDB M7 files"
+below). A production designation requires re-running the suite on the target
 hardware and reading the numbers it produces there. That decision belongs to whoever operates
 the deployment; this repository does not make it on their behalf (ADR-0031, spec §20, §12.2).
 
@@ -60,6 +61,26 @@ build problem, not evidence.
 | `security-matrix-gossip.json` | M6-110 | the gossip-only subset of the same matrix (stale packets, poisoned endpoint, all seeds unavailable, false suspicion, one-way loss, gossip key rotation): a separate file because M6-109 and M6-110 run concurrently in one binary (TA-61: one writer per file). Gossip key rotation is enumerated but not driven — ADR-0028 rotation had not landed on this branch when this row was written (2026-09-19); the artifact records the case as not driven, with the reason |
 | `security-matrix-version-skew.json` | M6-111 | a mixed-version cluster (a `--compat-schema 1` voter, a voter advertising a future `command_schema`, this build between them): the propose-time refusals, the ordinary writes that still serve, and the minimum the leader settled on; a separate file because M6-109 and M6-111 run concurrently in one binary (TA-61: one writer per file) |
 | `gossip-authority.json` | M6-112 | a hostile gossip soak under a write load, and the before/after equality of membership, cluster id, recovery epoch and data |
+
+## The rDB M7 files
+
+The rDB simulator's campaign (`crates/rdb-sim/tests/campaign.rs`) writes these through the same
+`write_evidence()` helper, so they carry the same disclaimer and schema, and follow ADR-rdb-0019 §2.
+They are listed separately because another suite writes them, with its own commands.
+E2E-47 checks two things (ruling V-R32):
+
+- every `rdb-*.json` in this directory is listed here;
+- every file listed as written by a `debug campaign run` or by `every campaign run` exists after
+  the debug campaign run that E2E-47 starts itself.
+
+A file written by a `release campaign run` is only checked for being listed. The release commands
+are run by hand (ADR-rdb-0019 §2.1).
+
+| File | Row | Written by | What it proves |
+| --- | --- | --- | --- |
+| `rdb-m7-campaign.json` | M7V-72 | debug campaign run | the default 64-seed corpus at reduced scale: seeds, the event cap and the events actually run, one status per invariant (`proven`, `unavailable` with its reason, or `violated`), which row catches each mutation, and wall time with shrink time kept apart. It is the handoff gate's record, never the 1,000-history figure |
+| `rdb-m7-campaign-release.json` | M7V-62, M7V-87 | release campaign run | the same keys from a release build. This is the only artifact that may be cited for the 1,000-history budget (ruling V-R17). The M7 release gate passes only when every invariant is `proven` with `seeds_armed > 0`. It is absent until someone runs that gate by hand |
+| `rdb-m7-coverage.json` | M7V-73 | every campaign run | integer counts of guard outcomes, fault boundaries and pairwise cells, the required cells that got zero hits, and the cells excused because their provider package reports `unavailable`. `coverage_gated` says whether the required-cell gate applied to this corpus size |
 
 ## What this project does not cover
 

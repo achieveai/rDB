@@ -3177,7 +3177,8 @@ fn adopted_lineages(effects: &[Effect]) -> Vec<(PartitionId, ServedLineage)> {
 ///
 /// Near misses: the same record read under another correlation is the generic changed row
 /// (`LineageChanged`), after which the recovery's own read-back is `LineageUnchanged`; a
-/// read-back naming another generation than the recovery's is the generic row too.
+/// read-back naming another generation than the recovery's is the generic row too; and a late
+/// read-back older than an install a newer read made is A-R48 superseded, with no roll-back.
 #[retcd_test]
 fn m7a_176_post_recovered_read_back_installs_lineage() {
     // Held, serving p1 only; F1 recovers p2 (prior g1 e1, which this node does not serve) to g2.
@@ -3297,6 +3298,37 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     assert_eq!(
         shapes(&effects)[2..],
         [Shape::Fact(AuthorityFact::LineageChanged)]
+    );
+
+    // (f) A late read-back older than an install a newer read already made (A-R48): superseded,
+    // not installed, and the newer lineage is not rolled back.
+    let mut kernel = serving_p1(1);
+    let _ = kernel
+        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+        .expect("trigger");
+    let effects = kernel
+        .step(&ctx(4), &read(41, P2, 25, &record_at(P2, 3, 3)))
+        .expect("a newer generic read");
+    assert_eq!(
+        shapes(&effects)[2..],
+        [Shape::Fact(AuthorityFact::LineageChanged)]
+    );
+    let seq = kernel.authority_seq();
+    let effects = kernel
+        .step(&ctx(5), &read(40, P2, 20, &record_at(P2, 2, 2)))
+        .expect("the recovery's read-back, older, late");
+    assert_eq!(adopted_lineages(&effects), vec![], "{effects:?}");
+    assert!(
+        shapes(&effects).contains(&Shape::Ignored(
+            AuthorityIgnoreReason::PartitionReadSuperseded
+        )),
+        "{effects:?}"
+    );
+    assert_eq!(kernel.authority_seq(), seq, "no bump");
+    assert_eq!(
+        kernel.view().served.get(&P2),
+        Some(&record_at(P2, 3, 3).lineage()),
+        "g3 stays served: no roll-back to g2"
     );
 }
 

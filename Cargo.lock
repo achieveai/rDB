@@ -3474,6 +3474,7 @@ dependencies = [
  "bytes",
  "config-log",
  "config-log-macros",
+ "config-testkit",
  "rdb-core",
  "serde",
  "serde_json",

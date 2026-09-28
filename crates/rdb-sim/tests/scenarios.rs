@@ -460,7 +460,8 @@ fn oracle_half(run: &ScenarioRun) -> Vec<(Invariant, Verdict)> {
 /// L1 stays `Paused` after this, so R1's B-R60 keepalive runs to the deadline by design. Ruling
 /// B-R65 bounds its rate, not its time: the budget is a function of the deadline
 /// ([`cases::f1_r1_max_events`]), and every full window after the pause holds at most
-/// [`cases::F1_R1_STEADY_POPS_PER_WINDOW`] pops, asserted before the stop reason.
+/// [`cases::f1_r1_window_bound`] pops: the steady rate, plus the host's first round in the one
+/// window that holds it (ruling V-R31). Asserted before the stop reason.
 ///
 /// **Oracle half**: the trace opens with the 9-line capability preamble, the oracle finds
 /// nothing, and every verdict whose package is unwired is `Unavailable{Capability(p)}`.
@@ -526,13 +527,66 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
         !windows.is_empty(),
         "at least one full window after the pause is checked"
     );
+    // The host's first flush round is a one-off (ruling V-R31). It is counted in the one checked
+    // window that holds it and in no other, so it never loosens a window it is not in.
+    let first_host_round = lowered
+        .as_ref()
+        .ok()
+        .and_then(|plan| plan.flushes.iter().map(|(at, _)| at.0).min());
+    let one_off: u64 = windows
+        .iter()
+        .map(|(start, _)| {
+            cases::f1_r1_window_bound(*start, first_host_round)
+                - cases::F1_R1_STEADY_POPS_PER_WINDOW
+        })
+        .sum();
+    assert_eq!(
+        one_off,
+        cases::F1_R1_FIRST_HOST_ROUND_POPS,
+        "the first host round ({first_host_round:?}) is counted once, in a checked window"
+    );
+    // The one-off's **value**, measured from this run and not from the constant (tester P1):
+    // B's pops over the first host round minus B's over the round after it. The two rounds
+    // differ only in what the first durable prefix sets off, so their difference is the term.
+    let first = first_host_round.expect("the lowered plan has a host flush round");
+    let round = scenario_run::HOST_FLUSH_EVERY_MILLIS;
+    let b_pops_in = |from: u64| {
+        trace
+            .events
+            .iter()
+            .filter(|event| {
+                event.node == cases::B_NODE
+                    && (from..from + round).contains(&event.logical_tick)
+                    && matches!(
+                        event.kind,
+                        TraceKind::ModuleDispatch {
+                            module: ModuleName::Authority,
+                            ..
+                        }
+                    )
+            })
+            .count() as u64
+    };
+    let (first_round, next_round) = (b_pops_in(first), b_pops_in(first + round));
+    tracing::info!(
+        first,
+        first_round,
+        next_round,
+        "m7v_47 f1/r1 B pops by host round"
+    );
+    assert_eq!(
+        first_round.checked_sub(next_round),
+        Some(cases::F1_R1_FIRST_HOST_ROUND_POPS),
+        "B pops {first_round} in the first host round [{first}, +{round}) and {next_round} in \
+         the next: F1_R1_FIRST_HOST_ROUND_POPS is not what the first round adds"
+    );
     for (start, pops) in &windows {
+        let bound = cases::f1_r1_window_bound(*start, first_host_round);
         assert!(
-            *pops <= cases::F1_R1_STEADY_POPS_PER_WINDOW,
+            *pops <= bound,
             "the B-R60 keepalive's rate grew (ruling B-R65): {pops} pops in [{start}, +{}), \
-             measured at most {}",
+             measured at most {bound}",
             cases::F1_R1_RATE_WINDOW,
-            cases::F1_R1_STEADY_POPS_PER_WINDOW
         );
     }
     // A live primary is work until a limit (L1 evaluates every 50 ms), so a run that completes
@@ -730,7 +784,8 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 /// - A1 does not install the post-`Recovered` lineage (its own capability comment);
 /// - the bridge lowers neither a second activation nor the `Reply` hop delay the activation
 ///   must land inside;
-/// - INV-PUB needs `BatchApply` and `ReplicationAck` lines the sim does not record yet.
+/// - INV-PUB counts acknowledgements from `BatchApply` and `ReplicationAck` lines, which the sim
+///   records since the sim-hooks wave (`harness::semantic`); only the three blockers above remain.
 #[retcd_test]
 fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_is_refused_by_name() {
     support::preamble();
@@ -1232,16 +1287,6 @@ fn m7v_50_regressions_replay_every_minimized_and_original_fixture() {
     }
 }
 
-#[retcd_test]
-fn m7v_51_shrink_ms_is_reported_separately_from_wall_ms() {
-    support::preamble();
-    parked(
-        "M7V-51",
-        PackageId::I1,
-        "the two spans are instrumentation on a real campaign run",
-    );
-}
-
 // ------------------------------------------------------------------------------------------
 // M7V-59 — the layered budgets rest on this
 // ------------------------------------------------------------------------------------------
@@ -1534,5 +1579,576 @@ fn m7v_42c_topology_breadth_is_the_grammars_choice() {
         let topology: Topology = grammar::rf3(partitions);
         assert_eq!(topology.partitions, partitions);
         assert_eq!(topology.placements.len(), usize::from(partitions) * 3);
+    }
+}
+
+/// P-1, P-2, P-3 and client routing on real runs, not fixtures.
+///
+/// SCAFFOLDING, not plan rows: the evidence that the semantic hook fires inside the loop, that a
+/// timed op reaches A1, that a hop delay moves an answer, and that a client submit comes back as
+/// a `client_outcome_reported` line. Every run here is over one served partition that was never
+/// recovered, because the recovered path is where the owed blockers sit (see the A1/P1 case).
+///
+/// A timed op is a segmented run with the op injected between segments, and a hop delay is set on
+/// the dispatcher. Neither is in the `RunPlan`, so none of these runs replays under `replay_run`.
+mod semantic_runs {
+    use super::*;
+
+    use crate::support::oracle::checks::authority::Authority;
+    use crate::support::oracle::checks::Checker;
+    use crate::support::oracle::model::Model;
+    use crate::support::oracle::Oracle;
+    use bytes::Bytes;
+    use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+    use rdb_core::authority::AuthorityTimer;
+    use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, Lineage};
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::event::{
+        ClientEvent, Effect, EffectKind, EventKind, KernelEffect, KernelEvent, ModuleName,
+    };
+    use rdb_core::contracts::ids::{
+        AffinityId, BootId, ClientId, ConfigVersion, CorrelationId, Generation, NodeId, OwnerEpoch,
+        RequestId, RequestIdentity, TenantId, TimerVersion,
+    };
+    use rdb_core::contracts::time::{Tick, TimerFired};
+    use rdb_core::contracts::trace::{AuthorityGate, AuthorityOutcome, ClientOutcome};
+    use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
+    use rdb_core::contracts::version::API_VERSION;
+    use rdb_sim::harness::hop::HopDelay;
+    use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent};
+    use rdb_sim::sim::cluster::ClusterConfig;
+    use rdb_sim::sim::control::ControlOp;
+
+    const OWNER: NodeId = NodeId(1);
+    const PART: PartitionId = PartitionId(1);
+    const LINEAGE: Lineage = Lineage {
+        partition: PART,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+    };
+    /// Before the first renewal: A1 acquires at 10 and renews `renew_millis` (500) later.
+    const CURSOR: Tick = Tick(300);
+    const END: Tick = Tick(8_000);
+
+    type Decisions = BTreeMap<u64, (AuthorityGate, AuthorityOutcome, u64)>;
+
+    fn seed(at: u64, correlation: u64, kind: EventKind) -> SeedEvent {
+        SeedEvent {
+            at: Tick(at),
+            node: OWNER,
+            boot: BootId(1),
+            partition: PART,
+            correlation: CorrelationId(correlation),
+            kind,
+        }
+    }
+
+    fn reply_check(at: u64, correlation: u64) -> SeedEvent {
+        seed(
+            at,
+            correlation,
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Check {
+                checkpoint: Checkpoint::Reply,
+                lineage: LINEAGE,
+                correlation: CorrelationId(correlation),
+            })),
+        )
+    }
+
+    /// `partitions/1` names node 1 owner, and node 1's A1 acquires at tick 10.
+    fn served(extra: Vec<SeedEvent>) -> RunPlan {
+        let record = PartitionRecord {
+            partition: PART,
+            owner: OWNER,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+            config_version: ConfigVersion(1),
+            lifecycle: PartitionLifecycle::Serving,
+        };
+        let mut plan = RunPlan::new(ClusterConfig::default());
+        plan.control_records = vec![(ControlKey::Partition(PART), record.encode())];
+        plan.seed = vec![seed(
+            10,
+            1,
+            EventKind::Timer(TimerFired {
+                id: AuthorityTimer::Acquire.id(),
+                version: TimerVersion(0),
+                scheduled_at: Tick(10),
+            }),
+        )];
+        plan.seed.extend(extra);
+        plan
+    }
+
+    /// Run `plan` to [`CURSOR`], let `at_cursor` act on the runner, then run to [`END`].
+    fn segmented(plan: &RunPlan, at_cursor: impl FnOnce(&mut Runner)) -> Trace {
+        let mut runner = Runner::new(plan).expect("a runner");
+        let limits = |deadline| RunLimits {
+            max_events: 1_200,
+            deadline,
+        };
+        let first = runner.run(limits(CURSOR)).expect("segment one");
+        at_cursor(&mut runner);
+        let second = runner.run(limits(END)).expect("segment two");
+        tracing::info!(first = ?first.stop, second = ?second.stop, "segments");
+        runner.finish().expect("a trace")
+    }
+
+    /// The timed op: node 1's next control completion, the first renewal's, never arrives.
+    fn drop_renewal(runner: &mut Runner) {
+        runner
+            .control_mut()
+            .inject(ControlOp::DropCompletion { node: OWNER })
+            .expect("a drop is a plan, so it is accepted");
+    }
+
+    fn decisions(trace: &Trace) -> Decisions {
+        let found: Decisions = trace
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TraceKind::AuthorityDecision {
+                    gate,
+                    outcome,
+                    decision_tick,
+                    ..
+                } => Some((event.correlation.0, (*gate, *outcome, *decision_tick))),
+                _ => None,
+            })
+            .collect();
+        tracing::info!(?found, "authority_decision lines");
+        found
+    }
+
+    #[track_caller]
+    fn decision(found: &Decisions, correlation: u64) -> (AuthorityGate, AuthorityOutcome, u64) {
+        *found
+            .get(&correlation)
+            .unwrap_or_else(|| panic!("no decision for {correlation}: {found:?}"))
+    }
+
+    /// INV-AUTH folded by hand: its verdict stays `Unavailable(Capability(A1))` while A1 reports
+    /// Unavailable, which says nothing about whether it armed.
+    fn inv_auth_arms_clean(trace: &Trace) {
+        let mut model = Model::new(&trace.header);
+        let mut checker = Authority::default();
+        for event in &trace.events {
+            if let Err(violation) = checker.observe(&model, event) {
+                panic!(
+                    "INV-AUTH fired on event {}: {violation:?}",
+                    event.event_id.0
+                );
+            }
+            model.absorb(event);
+        }
+        assert!(checker.armed(), "an authority_decision line arms INV-AUTH");
+        let report = Oracle::new().judge(trace);
+        assert!(
+            !matches!(report.verdict(Invariant::Auth), Verdict::Violated(_)),
+            "{:?}",
+            report.verdict(Invariant::Auth)
+        );
+    }
+
+    /// P-1 and P-2: a `Reply` check inside the grant is `Valid`; one after a dropped renewal
+    /// completion let the grant lapse is not. The control run, no drop, keeps both `Valid`, so
+    /// the lapse is the drop's and nothing else's.
+    #[retcd_test]
+    fn semantic_authority_lines_arm_inv_auth_across_a_lapsed_grant() {
+        support::preamble();
+        let plan = served(vec![reply_check(200, 901), reply_check(5_000, 902)]);
+
+        let kept = decisions(&segmented(&plan, |_| {}));
+        assert_eq!(
+            decision(&kept, 901),
+            (AuthorityGate::Reply, AuthorityOutcome::Valid, 200)
+        );
+        assert_eq!(
+            decision(&kept, 902),
+            (AuthorityGate::Reply, AuthorityOutcome::Valid, 5_000)
+        );
+
+        let trace = segmented(&plan, drop_renewal);
+        let lapsed = decisions(&trace);
+        assert_eq!(
+            decision(&lapsed, 901),
+            (AuthorityGate::Reply, AuthorityOutcome::Valid, 200)
+        );
+        let (gate, outcome, _) = decision(&lapsed, 902);
+        assert_eq!(gate, AuthorityGate::Reply);
+        assert_ne!(
+            outcome,
+            AuthorityOutcome::Valid,
+            "after the lapse: {lapsed:?}"
+        );
+        inv_auth_arms_clean(&trace);
+    }
+
+    /// P-3: a `Reply` check P1 asks at the cursor, with its hop held 4 000 ms, is answered after
+    /// the lapse and not `Valid`. The same run's `StorageDispatch` check, asked at the same
+    /// instant on an unheld hop, is answered at once and `Valid`. That is the gap the A1/P1 case
+    /// needs between publication and the reply decision.
+    #[retcd_test]
+    fn a_hop_delay_puts_the_lapse_between_a_reply_check_and_its_answer() {
+        support::preamble();
+        let ask = |checkpoint, correlation, from| Effect {
+            correlation: CorrelationId(correlation),
+            from,
+            partition: PART,
+            kind: EffectKind::Kernel(KernelEffect::AuthorityCheck {
+                checkpoint,
+                lineage: LINEAGE,
+                correlation: CorrelationId(correlation),
+            }),
+        };
+        let trace = segmented(&served(Vec::new()), |runner| {
+            drop_renewal(runner);
+            runner.dispatcher_mut().delay_hop(HopDelay {
+                node: OWNER,
+                checkpoint: Checkpoint::Reply,
+                by_millis: 4_000,
+            });
+            runner
+                .carry_out(
+                    OWNER,
+                    BootId(1),
+                    vec![
+                        ask(Checkpoint::Reply, 903, ModuleName::Publication),
+                        ask(Checkpoint::StorageDispatch, 904, ModuleName::Transaction),
+                    ],
+                )
+                .expect("both checks are routed");
+        });
+        let found = decisions(&trace);
+        let (gate, outcome, held_at) = decision(&found, 903);
+        assert_eq!(gate, AuthorityGate::Reply);
+        assert_ne!(outcome, AuthorityOutcome::Valid, "{found:?}");
+        let (gate, outcome, prompt_at) = decision(&found, 904);
+        assert_eq!(gate, AuthorityGate::Dispatch);
+        assert_eq!(outcome, AuthorityOutcome::Valid, "{found:?}");
+        assert_eq!(
+            held_at,
+            prompt_at + 4_000,
+            "the hop, and only the hop, moved it"
+        );
+        inv_auth_arms_clean(&trace);
+    }
+
+    /// Client routing: a submit on a partition that was served but never recovered reaches T1,
+    /// which is not primary there, and the client hears so as a `client_outcome_reported` line.
+    #[retcd_test]
+    fn a_client_submit_comes_back_as_a_client_outcome_line() {
+        support::preamble();
+        let request = TxnRequest {
+            api_version: API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(7),
+            },
+            affinity: AffinityId(1),
+            expected_generation: None,
+            remaining_millis: 1_000,
+            conditions: Vec::new(),
+            mutations: vec![Mutation::Put {
+                key: scoped_key(TenantId(1), AffinityId(1), b"k"),
+                value: Bytes::from_static(b"v"),
+                expected_version: None,
+            }],
+        };
+        let plan = served(vec![seed(
+            200,
+            77,
+            EventKind::Client(ClientEvent::Submit(request)),
+        )]);
+        let trace = segmented(&plan, |_| {});
+        let outcomes: Vec<_> = trace
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TraceKind::ClientOutcomeReported {
+                    request,
+                    outcome,
+                    generation,
+                    seq,
+                    delivered,
+                    ..
+                } => Some((
+                    event.correlation.0,
+                    request.0,
+                    *outcome,
+                    *generation,
+                    *seq,
+                    *delivered,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![(
+                77,
+                7,
+                ClientOutcome::Error(ErrorKind::NotPrimary),
+                Generation(1),
+                None,
+                true
+            )]
+        );
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// MUT-5's oracle half (lead rulings V-R25, V-R26): scaffolding, not M7V-70
+// ------------------------------------------------------------------------------------------
+
+/// MUT-5's oracle half, hand-built. **Not M7V-70** (lead ruling V-R26): its row requires INV-PUB
+/// *and* INV-LOSS to fire, and INV-LOSS cannot, because `checks/loss.rs` matches a holder to a
+/// queried source only at the **same** boot, and the crash that loses the suffix is what changes
+/// the boot. This row asserts the INV-PUB half and measures INV-LOSS; M7V-70 stays owed.
+mod false_durable_oracle {
+    use super::*;
+
+    use rdb_core::contracts::digest::Digest;
+    use rdb_core::contracts::ids::{
+        BootId, ClientId, EventId, Generation, GrantId, NodeId, OwnerEpoch, ReplicaRole, RequestId,
+        TenantId,
+    };
+    use rdb_core::contracts::trace::{
+        AdmissionOutcome, ApplyOutcome, AuthorityGate, AuthorityOutcome, DurabilityClass, KeyId,
+        LineageSource, ProtectionPhase, QueriedSource, ReadRequestKind, ReadServiceOutcome,
+        RecoveryMode, SyncOutcome,
+    };
+
+    use crate::support::oracle::{Oracle, Report};
+    use crate::support::scenarios::builder::{digest_at, evidence, TraceBuilder, CONFIG_V1, GEN_1};
+
+    const N1: NodeId = NodeId(1);
+    const N2: NodeId = NodeId(2);
+    const N3: NodeId = NodeId(3);
+    const K1: KeyId = KeyId(1);
+    const PUBLISHED: Seq = Seq(9);
+    /// Where a host crash leaves a copy whose flush through [`PUBLISHED`] was a lie.
+    const SURVIVED: Seq = Seq(6);
+
+    fn root(generation: Generation, predecessor: Option<(Generation, Seq)>) -> TraceKind {
+        TraceKind::LineageRoot {
+            generation,
+            owner_epoch: OwnerEpoch(if predecessor.is_some() { 2 } else { 1 }),
+            base_seq: Seq::ZERO,
+            base_digest: digest_at(generation, Seq::ZERO),
+            predecessor_generation: predecessor.map(|(generation, _)| generation),
+            predecessor_cutoff: predecessor.map(|(_, cutoff)| cutoff),
+            source: if predecessor.is_some() {
+                LineageSource::Recovery
+            } else {
+                LineageSource::Initial
+            },
+        }
+    }
+
+    /// A secondary that came back from a host crash, at boot 2, reporting `reported`.
+    fn returned(node: NodeId, reported: Seq) -> QueriedSource {
+        QueriedSource {
+            node,
+            boot: BootId(2),
+            role: ReplicaRole::RegularSecondary,
+            reachable: true,
+            reported_generation: Some(GEN_1),
+            reported_seq: Some(reported),
+            reported_digest: Some(digest_at(GEN_1, reported)),
+        }
+    }
+
+    /// RF3: K1 published at seq 9 on `Durable` acknowledgements from nodes 2 and 3, each
+    /// grounded by its own flush. Then both secondaries' hosts crash and return at boot 2, and
+    /// recovery keeps what they report. `lost` makes them report [`SURVIVED`], which is what a
+    /// false flush leaves, and the read sees K1 one version back; otherwise they report the whole
+    /// published prefix and the read sees K1 where it was published.
+    fn published_then_crashed(case: &str, lost: bool) -> Trace {
+        let (kept, k1_read) = if lost {
+            (SURVIVED, PUBLISHED.0 - 1)
+        } else {
+            (PUBLISHED, PUBLISHED.0)
+        };
+        let mut b = TraceBuilder::new()
+            .case(case)
+            .capabilities(&[])
+            .push(TraceKind::ProtectionState {
+                phase: ProtectionPhase::Healthy,
+                oldest_unsafe_age_ms: 0,
+                required_copy_set: vec![N1, N2, N3],
+                config_version: CONFIG_V1,
+                paused_prefix_seq: Seq::ZERO,
+                resume_barrier_seq: Seq::ZERO,
+                healthy_since_tick: Some(0),
+            })
+            .push(root(GEN_1, None))
+            .push(TraceKind::ClientSubmit {
+                request: RequestId(1),
+                tenant: TenantId(1),
+                client: ClientId(1),
+                affinity: 1,
+                expected_generation: None,
+                request_digest: Digest::ROOT,
+                deadline_remaining_ms: 10_000,
+                mutation_keys: vec![K1],
+                condition_keys: Vec::new(),
+            })
+            .push(TraceKind::AdmissionDecision {
+                outcome: AdmissionOutcome::Admitted,
+                reason: None,
+                admitted_seq: Some(PUBLISHED),
+                paused: false,
+                oldest_unsafe_age_ms: 0,
+                required_copies: vec![N1, N2, N3],
+                config_version: CONFIG_V1,
+            })
+            .push(TraceKind::AuthorityDecision {
+                gate: AuthorityGate::Publication,
+                owner_node: N1,
+                owner_epoch: OwnerEpoch(1),
+                grant: GrantId(1),
+                grant_boot: BootId(1),
+                generation: GEN_1,
+                valid_from_tick: 0,
+                expiry_tick: 3_000,
+                decision_tick: 0,
+                authority_seq: 0,
+                outcome: AuthorityOutcome::Valid,
+            });
+        let recheck: EventId = b.last_event();
+        b = b
+            .at(1)
+            .apply(PUBLISHED, &[(K1, PUBLISHED.0)], ApplyOutcome::Applied);
+        for node in [N2, N3] {
+            b = b
+                .flush(node, PUBLISHED)
+                .ack_from(node, PUBLISHED, DurabilityClass::Durable);
+        }
+        b.publish(
+            PUBLISHED,
+            &[
+                evidence(N2, ReplicaRole::RegularSecondary, DurabilityClass::Durable),
+                evidence(N3, ReplicaRole::RegularSecondary, DurabilityClass::Durable),
+            ],
+            recheck,
+        )
+        .at(2)
+        .push(TraceKind::RecoveryDecision {
+            fenced_epoch: OwnerEpoch(1),
+            discovery_window_ticks: 2_000,
+            queried_sources: vec![returned(N2, kept), returned(N3, kept)],
+            selected_source: Some(N2),
+            selected_cutoff_seq: kept,
+            selected_digest: digest_at(GEN_1, kept),
+            mode: RecoveryMode::TwoSurvivor,
+            loss_uncertainty: false,
+            new_generation: Generation(2),
+        })
+        .push(root(Generation(2), Some((GEN_1, kept))))
+        .at(3)
+        .push(TraceKind::Read {
+            request_kind: ReadRequestKind::Read,
+            barrier: EventId(1),
+            generation: Generation(2),
+            observed_seq: PUBLISHED,
+            observed_key_versions: vec![(K1, k1_read)],
+            recovery_mode: false,
+            outcome: ReadServiceOutcome::Served,
+        })
+        .build()
+    }
+
+    /// MUT-5 as a trace rewrite: every completed secondary flush becomes what `FalseDurable`
+    /// records (`harness::semantic::durability_lines`), `Partial` at the watermark the engine
+    /// still holds, which is nothing. The acknowledgements it grounded still say `Durable`.
+    fn false_durable(trace: &Trace) -> (Trace, usize) {
+        let mut trace = trace.clone();
+        let mut touched = 0;
+        for event in &mut trace.events {
+            if let TraceKind::DurabilityAdvance {
+                durable_seq,
+                durable_digest,
+                outcome,
+                generation,
+                ..
+            } = &mut event.kind
+            {
+                if event.node != N1 && *outcome == SyncOutcome::Synced {
+                    *durable_seq = Seq::ZERO;
+                    *durable_digest = digest_at(*generation, Seq::ZERO);
+                    *outcome = SyncOutcome::Partial;
+                    touched += 1;
+                }
+            }
+        }
+        (trace, touched)
+    }
+
+    fn judge(trace: &Trace) -> Report {
+        Oracle::new().judge(trace)
+    }
+
+    #[track_caller]
+    fn proven(report: &Report, invariant: Invariant) {
+        assert_eq!(
+            report.verdict(invariant),
+            &Verdict::Proven,
+            "{}",
+            invariant.id()
+        );
+    }
+
+    #[track_caller]
+    fn fired(report: &Report, invariant: Invariant, rule: &str) {
+        match report.verdict(invariant) {
+            Verdict::Violated(signature) => assert_eq!(
+                signature.core.rule,
+                rule,
+                "{} fired {}: {}",
+                invariant.id(),
+                signature.core.rule,
+                signature.detail
+            ),
+            other => panic!(
+                "{} expected Violated{{{rule}}}, got {other:?}",
+                invariant.id()
+            ),
+        }
+    }
+
+    /// The INV-PUB half of M7V-70, and the measurement of its INV-LOSS half.
+    #[retcd_test]
+    fn false_durable_a_publish_counting_an_ungrounded_durable_ack_trips_inv_pub() {
+        support::preamble();
+        // Unrewritten: every Durable ack is grounded, and the crash loses nothing.
+        let clean = published_then_crashed("mut5-clean", false);
+        let report = judge(&clean);
+        proven(&report, Invariant::Pub);
+        proven(&report, Invariant::Loss);
+
+        // Rewritten: both flushes were lies, and the publish still counted both acks.
+        let (lied, touched) = false_durable(&clean);
+        assert_eq!(touched, 2, "one lie per secondary flush");
+        fired(&judge(&lied), Invariant::Pub, "durable_ack_ungrounded");
+
+        // And the lie's consequence: the crash loses the suffix the lie claimed. INV-PUB still
+        // fires on the lie. INV-LOSS is measured, not asserted: its holders are (node, boot 1),
+        // every source returned at boot 2, so the checker skips them and permits the loss. That
+        // is M7V-70's missing half (V-R26).
+        let (lost, touched) = false_durable(&published_then_crashed("mut5-lost", true));
+        assert_eq!(touched, 2);
+        let report = judge(&lost);
+        fired(&report, Invariant::Pub, "durable_ack_ungrounded");
+        assert!(
+            !matches!(report.verdict(Invariant::Loss), Verdict::Unavailable(_)),
+            "INV-LOSS armed on the recovery root: {:?}",
+            report.verdict(Invariant::Loss)
+        );
+        tracing::info!(
+            inv_loss = ?report.verdict(Invariant::Loss),
+            "M7V-70's INV-LOSS half, measured"
+        );
     }
 }

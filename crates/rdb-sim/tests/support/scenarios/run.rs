@@ -21,6 +21,7 @@
 //! | `Time(Pause{node, ticks})` on a transfer's node | the transfer's `stop_at` is the cursor. It must last the rest of the budget: a transfer cannot resume |
 //! | `Recovery(InspectSurvivors{partition, window})` | F1 on the partition's primary node gets placement's `Plan` at the cursor and the prior owner's fence one tick later. The prior owner is the highest placed node that neither survives nor transfers, and its `partitions/{id}` record is control revision 1. A `window` other than the default is a `DiscoveryWindow` budget override |
 //! | `Client(Submit{..})` | a `Submit` seeded on the partition's primary node at the cursor |
+//! | any `InspectSurvivors`, at the end | the host (see [`host`]): a flush on every node every [`HOST_FLUSH_EVERY_MILLIS`] from the latest cutoff F1 can choose through the deadline, and A1's first `AcquireDue` on each primary [`ACQUIRE_AFTER_CUTOFF_MILLIS`] after that. Neither is a grammar op: no kernel emits either, so a recovered scenario without them never resumes L1 or holds a grant |
 //!
 //! **Every other op is [`Unlowerable`], by index, never dropped.** A silently skipped op would
 //! make a scenario that asked for a fault read as a scenario that survived it. The reason names
@@ -40,6 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::AuthorityTimer;
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
 };
@@ -49,16 +51,17 @@ use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent};
 use rdb_core::contracts::ids::ReplicaRole;
 use rdb_core::contracts::ids::{
     AffinityId, AuthorityGeneration, BootId, CorrelationId, DurableSeq, Generation, GrantId,
-    NodeId, OwnerEpoch, PartitionId, RequestIdentity, Revision, Seq,
+    NodeId, OwnerEpoch, PartitionId, RequestIdentity, Revision, Seq, TimerVersion,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{
     Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan, SurvivorInventory,
 };
-use rdb_core::contracts::time::Tick;
+use rdb_core::contracts::time::{Tick, TimerFired};
 use rdb_core::contracts::trace::{BudgetName, Trace, TraceKind};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
 use rdb_core::contracts::version::API_VERSION;
+use rdb_core::recovery::MAX_WINDOW_EXTENSIONS;
 use rdb_sim::harness::manifest::BudgetOverride;
 use rdb_sim::harness::run::{RunLimits, RunPlan, RunReport, Runner, SeedEvent};
 use rdb_sim::harness::trace::validate;
@@ -77,6 +80,16 @@ pub const SUBMIT_REMAINING_MILLIS: u64 = 1_000;
 
 /// Placement's status retention for a lowered recovery plan, in milliseconds.
 pub const RETENTION_MILLIS: u64 = 1_000;
+
+/// How often a recovered scenario's host flusher runs on each node, in milliseconds. The same
+/// period as R1's keepalive (B-R60); the only requirement is that a copy walked up after the
+/// cutoff is flushed within the run.
+pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
+
+/// How long after the latest possible cutoff a recovered scenario's primary first wakes A1, in
+/// milliseconds: room for R1's rebuild walk and F1's activation CAS, which follow the close at
+/// once in every measured run (close + 10 in `case_f1_r1_discovery_window`).
+pub const ACQUIRE_AFTER_CUTOFF_MILLIS: u64 = 500;
 
 /// Why a scenario has no [`RunPlan`]. Never a partial plan: the whole scenario lowers or none of
 /// it does.
@@ -335,6 +348,7 @@ pub fn lower(scenario: &Scenario) -> Result<RunPlan, Unlowerable> {
         }
     }
 
+    host(&mut plan, &mut state, topology, scenario.budget.max_ticks);
     place_survivors(&mut plan, &state, topology);
     Ok(plan)
 }
@@ -400,6 +414,9 @@ struct Lowering {
     holds: BTreeMap<(PartitionId, NodeId), Seq>,
     /// The last correlation handed out.
     correlation: u64,
+    /// Every inspected partition: `(partition, primary node, latest tick its cutoff can be
+    /// chosen)`. What [`host`] schedules the flusher and A1's first wake from.
+    recovered: Vec<(PartitionId, NodeId, u64)>,
 }
 
 impl Lowering {
@@ -580,7 +597,70 @@ fn inspect(
     );
     plan.seed.push(plan_seed);
     plan.seed.push(fence_seed);
+
+    // Discovery opens at the fence and closes on a deadline; only a transfer extends it, at most
+    // `MAX_WINDOW_EXTENSIONS` times. So this is the latest the cutoff can be chosen.
+    let extensions = if plan.transfers.iter().any(|(p, _)| *p == partition) {
+        u64::from(MAX_WINDOW_EXTENSIONS)
+    } else {
+        0
+    };
+    let cutoff_by = fence_at.saturating_add(window.saturating_mul(1 + extensions));
+    state.recovered.push((partition, leader, cutoff_by));
     Ok(())
+}
+
+/// A recovered scenario's host: what no kernel emits, scheduled after the latest cutoff.
+///
+/// * **The flusher.** Every node flushes every [`HOST_FLUSH_EVERY_MILLIS`] from the latest
+///   cutoff through `deadline`. R1 walks the barrier's copies up after the cutoff, and without a
+///   flush after that walk a copy reports durable 0 for ever, so L1 never resumes (L-R177gf).
+///   Never before the cutoff: a flush there cannot make the walked-up copies durable, and it could
+///   move a transfer's durable head under discovery.
+/// * **A1's first wake.** One `AcquireDue` per primary node, [`ACQUIRE_AFTER_CUTOFF_MILLIS`]
+///   after its partition's latest cutoff, so the grant's reload reads the record F1's
+///   activation CAS wrote. Nothing arms the first `AcquireDue` (A1's own docs), and the sim's
+///   control store delivers no watch unless told to, so a grant taken earlier would keep the
+///   prior owner's record. Only the primary: the dead prior owner acquiring would put its
+///   fenced identity (grant 1, boot 1) back.
+///
+/// A scenario that recovers nothing gets neither, so nothing here moves one that does not.
+fn host(plan: &mut RunPlan, state: &mut Lowering, topology: &Topology, deadline: u64) {
+    let Some(start) = state.recovered.iter().map(|(_, _, by)| *by).max() else {
+        return;
+    };
+    let mut at = start;
+    while at <= deadline {
+        for node in 1..=u32::from(topology.nodes) {
+            plan.flushes.push((Tick(at), NodeId(node)));
+        }
+        at = at.saturating_add(HOST_FLUSH_EVERY_MILLIS);
+    }
+
+    let mut wakes: BTreeMap<NodeId, (PartitionId, u64)> = BTreeMap::new();
+    for &(partition, leader, by) in &state.recovered {
+        let at = by.saturating_add(ACQUIRE_AFTER_CUTOFF_MILLIS);
+        let wake = wakes.entry(leader).or_insert((partition, at));
+        if at > wake.1 {
+            *wake = (partition, at);
+        }
+    }
+    for (node, (partition, at)) in wakes {
+        if at > deadline {
+            continue;
+        }
+        let seed = state.seed(
+            at,
+            node,
+            partition,
+            EventKind::Timer(TimerFired {
+                id: AuthorityTimer::Acquire.id(),
+                version: TimerVersion(0),
+                scheduled_at: Tick(at),
+            }),
+        );
+        plan.seed.push(seed);
+    }
 }
 
 /// Every survivor: its batches preloaded, durable at its head, and placed as its inventory.
