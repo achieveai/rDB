@@ -1,4 +1,4 @@
-//! Controlled delivery: drop, duplicate, reorder, partition, heal, and forge.
+//! Controlled delivery: drop, duplicate, reorder, partition, heal, forge, and corrupt.
 //!
 //! The network is hostile by configuration, not by chance. Every delivery decision is a recorded
 //! choice, so a failing history replays exactly.
@@ -21,15 +21,20 @@
 //! acknowledgement on the link arrives under the forged [`PeerLabel`], body unchanged, so R1's
 //! own check is what refuses it. One case is still owed and refuses by name: a forgery with
 //! `authenticated: true` whose `claimed_role` differs from the role the body carries. The role
-//! lives inside the reply body, and rewriting a body is not the network's to do.
+//! lives inside the reply body, and the network rewrites no body to forge an identity.
+//!
+//! One fault does change a body, and only one field of it: [`Delivery::Corrupt`] (lead ruling
+//! B-R75) flips one bit of an append's record digest in flight, so the receiver's own row 7 —
+//! the digest must recompute — is what catches it, never a test-only guard.
 //!
 //! Every frame handed to [`Network::send`] leaves one entry in [`Network::transmissions`],
-//! whatever its fate. A drop is a fate the scenario asked for by name, never a default, and it
-//! is written down like a delivery (ruling B-R28).
+//! whatever its fate, and its bytes in [`Network::frames`]. A drop or a corruption is a fate the
+//! scenario asked for by name, never a default, and it is written down like a delivery (ruling
+//! B-R28).
 
 use std::collections::BTreeMap;
 
-use rdb_core::contracts::envelope::AppendOutcome;
+use rdb_core::contracts::envelope::{AppendOutcome, ReplicationEnvelope};
 use rdb_core::contracts::ids::{MessageId, NodeId, ReplicaRole};
 use rdb_core::contracts::transport::{Frame, PeerLabel};
 use rdb_core::replication::wire::decode_reply;
@@ -56,6 +61,19 @@ pub enum Delivery {
         delay_millis: u64,
         /// Additional delay of the second copy.
         second_delay_millis: u64,
+    },
+    /// Deliver once, after `delay_millis`, with the record digest of the append it carries
+    /// flipped in flight (lead ruling B-R75): one bit, the low bit of the digest's first byte.
+    /// Every other byte arrives as sent, so the receiver's ladder reaches row 7 and finds a
+    /// record whose digest does not recompute.
+    ///
+    /// The one fault that changes a body, and only this field of it. It counts only for a frame
+    /// whose body decodes as a [`ReplicationEnvelope`] — an `Append`. Any other frame on the link
+    /// passes the plan by, as an acknowledgement-less frame passes a [`NetworkOp::ForgeAck`], and
+    /// a later plan for the pair decides that frame.
+    Corrupt {
+        /// How long in flight.
+        delay_millis: u64,
     },
 }
 
@@ -187,6 +205,8 @@ pub struct Transmission {
     pub copies: u8,
     /// Whether the link was partitioned.
     pub partitioned: bool,
+    /// Whether the copy that arrives carries a flipped record digest ([`Delivery::Corrupt`]).
+    pub corrupted: bool,
 }
 
 /// The controlled network.
@@ -201,6 +221,8 @@ pub struct Network {
     planned: Vec<NetworkOp>,
     /// Every frame handed to [`Self::send`], in send order.
     transmissions: Vec<Transmission>,
+    /// The frame of each entry of `transmissions`, at the same index, as it was sent.
+    frames: Vec<Frame>,
 }
 
 impl Network {
@@ -262,6 +284,18 @@ impl Network {
         &self.transmissions
     }
 
+    /// The frame each entry of [`Self::transmissions`] carried, at the same index, exactly as it
+    /// was handed to [`Self::send`]: before any [`Delivery::Corrupt`], whatever its fate.
+    ///
+    /// Every `Send` a kernel emits reaches the network, so this is the recorded send half of
+    /// each step's effect vector (plan BA-4): an append's answer — `AlreadyHave`, `NeedPrefix`,
+    /// a quarantine proof — is a reply frame here, correlated to its request by [`Frame::id`].
+    /// A frame whose link was partitioned is here too.
+    #[must_use]
+    pub fn frames(&self) -> &[Frame] {
+        &self.frames
+    }
+
     /// Hand `frame` from `from` to `to`, sent under `label`, and say what happens to it.
     ///
     /// In this order:
@@ -271,7 +305,8 @@ impl Network {
     /// 2. Otherwise the first plan for `(from, to)`, in injection order, is consumed:
     ///    [`NetworkOp::PlanNext`] decides the [`Delivery`], and [`NetworkOp::ForgeNext`] and
     ///    [`NetworkOp::ForgeAck`] deliver at once under their forged label. A `ForgeAck` plan
-    ///    counts only for an acknowledgement; every other frame passes it by.
+    ///    counts only for an acknowledgement, and a [`Delivery::Corrupt`] plan only for an
+    ///    append; every other frame passes each by.
     /// 3. With no plan, the frame arrives once, at once, under `label`. A delay or a drop is
     ///    something a scenario asks for, never a default.
     ///
@@ -294,11 +329,24 @@ impl Network {
             return Err(SimError::Config { field: "link" });
         }
         let id = frame.id;
+        let mut corrupted = false;
         let fate = if self.link(from, to) == LinkState::Partitioned {
             Fate::Partitioned
         } else {
             let acknowledged = acknowledged_role(&frame);
+            // Decoded only when a corruption is planned on this link, so a run without one pays
+            // nothing for it.
+            let flipped = self
+                .planned
+                .iter()
+                .any(|op| Self::corrupts(op, from, to))
+                .then(|| flip_record_digest(&frame))
+                .flatten();
             let at = self.planned.iter().position(|op| match *op {
+                NetworkOp::PlanNext {
+                    delivery: Delivery::Corrupt { .. },
+                    ..
+                } => Self::corrupts(op, from, to) && flipped.is_some(),
                 NetworkOp::PlanNext { from: f, to: t, .. }
                 | NetworkOp::ForgeNext { from: f, to: t, .. } => (f, t) == (from, to),
                 NetworkOp::ForgeAck { from: f, to: t, .. } => {
@@ -335,6 +383,19 @@ impl Network {
                         arrive(delay_millis, label),
                         arrive(delay_millis.saturating_add(second_delay_millis), label),
                     ]),
+                    Delivery::Corrupt { delay_millis } => {
+                        corrupted = true;
+                        Fate::Delivered(
+                            flipped
+                                .map(|frame| Arrival {
+                                    delay_millis,
+                                    label,
+                                    frame,
+                                })
+                                .into_iter()
+                                .collect(),
+                        )
+                    }
                 },
                 Some(NetworkOp::ForgeNext { label: forged, .. }) => {
                     Fate::Delivered(vec![arrive(0, forged)])
@@ -365,8 +426,22 @@ impl Network {
             id,
             copies,
             partitioned: matches!(fate, Fate::Partitioned),
+            corrupted,
         });
+        self.frames.push(frame);
         Ok(fate)
+    }
+
+    /// Whether `op` is a [`Delivery::Corrupt`] plan for the link `from -> to`.
+    fn corrupts(op: &NetworkOp, from: NodeId, to: NodeId) -> bool {
+        matches!(
+            *op,
+            NetworkOp::PlanNext {
+                from: f,
+                to: t,
+                delivery: Delivery::Corrupt { .. },
+            } if (f, t) == (from, to)
+        )
     }
 
     const fn pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
@@ -386,4 +461,18 @@ fn acknowledged_role(frame: &Frame) -> Option<ReplicaRole> {
         Ok(AppendOutcome::Accepted(ack)) => Some(ack.role),
         _ => None,
     }
+}
+
+/// `frame` with the record digest of the append it carries flipped in one bit, when its body
+/// decodes as a [`ReplicationEnvelope`]; `None` for every other frame. Only the digest moves:
+/// the envelope is decoded and re-encoded with the codec R1 reads it with, so every other field
+/// arrives as sent.
+fn flip_record_digest(frame: &Frame) -> Option<Frame> {
+    let mut envelope = ReplicationEnvelope::decode(&frame.body).ok()?;
+    envelope.record_digest.0[0] ^= 1;
+    let body = envelope.encode().ok()?;
+    Some(Frame {
+        body,
+        ..frame.clone()
+    })
 }

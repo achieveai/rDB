@@ -16,7 +16,9 @@ mod support;
 
 use config_log::retcd_test;
 use rdb_core::contracts::authority::Lineage;
-use rdb_core::contracts::envelope::ReplicaProgress;
+use rdb_core::contracts::envelope::{
+    AppendOutcome, AppendReject, ReplicaProgress, ReplicationEnvelope,
+};
 use rdb_core::contracts::event::{EventKind, ModuleName};
 use rdb_core::contracts::ids::{
     AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, Generation, MessageId, NodeId,
@@ -26,17 +28,19 @@ use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
-    AckRejectReason, DispatchOutcome, KernelNote, SyncOutcome, TraceEvent, TraceKind,
+    AckRejectReason, ApplyOutcome, DispatchOutcome, KernelNote, SyncOutcome, TraceEvent, TraceKind,
 };
 use rdb_core::contracts::transport::{Frame, PeerLabel, TransportEvent};
 use rdb_core::contracts::version::ENVELOPE_VERSION;
 use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
-use rdb_core::replication::progress::{DigestLadder, ProgressTracker, TrackerInit};
+use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
+use rdb_core::replication::wire::decode_reply;
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent, StopReason};
 use rdb_sim::harness::trace::log_line;
-use rdb_sim::sim::network::NetworkOp;
+use rdb_sim::sim::network::{Delivery, NetworkOp, Transmission};
 use rdb_sim::storage::history::{canonical_history, history_writes, CanonicalHistory};
 use rdb_sim::storage::StorageOp;
+use std::collections::{BTreeMap, BTreeSet};
 
 const PARTITION: PartitionId = PartitionId(1);
 const BOOT: BootId = BootId(1);
@@ -863,5 +867,565 @@ fn m7b_78_flush_failed_never_satisfies_the_barrier() {
         run.mode.map(|mode| mode.phase()),
         Some(ProtectionPhase::Paused),
         "L1 is still Paused at the deadline"
+    );
+}
+
+// =============================================================================================
+// M7B-62
+// =============================================================================================
+
+/// How many records A streams.
+const STREAM: u64 = 200;
+/// Virtual ms between two of A's `LocalApplied`. Longer than [`DUP_LAG`], so a duplicate's
+/// second copy lands after its receiver took the first and before the next record arrives.
+const STREAM_GAP: u64 = 5;
+/// How long after its first copy a duplicate's second copy arrives.
+const DUP_LAG: u64 = 3;
+/// `k`: the record whose frame to C the network corrupts.
+const FLIPPED: u64 = 120;
+/// The records whose frame to B is dropped: ten gaps.
+const B_DROPS: [u64; 10] = [10, 25, 40, 55, 70, 85, 100, 130, 160, 185];
+/// The records whose frame to B is duplicated. With [`C_DUPS`], twenty duplicates.
+const B_DUPS: [u64; 15] = [
+    5, 15, 20, 30, 35, 45, 50, 60, 65, 75, 90, 110, 140, 170, 195,
+];
+/// The records whose frame to C is duplicated, all before [`FLIPPED`].
+const C_DUPS: [u64; 5] = [3, 30, 60, 90, 115];
+/// How many of B's frames to A pass before the forgery takes B's next one. Late enough that
+/// the forged acknowledgement names a record past C's `k - 1`, so counting it would show.
+const FORGE_AFTER: usize = 170;
+
+/// A's `LocalApplied` for record `seq`, at `seq * STREAM_GAP`. A applies it, and R1's stream
+/// ships it to each regular secondary in the same step (lead ruling B-R47b).
+fn local_applied(history: &CanonicalHistory, seq: u64) -> SeedEvent {
+    use rdb_core::contracts::event::KernelEvent;
+    SeedEvent {
+        at: Tick(seq * STREAM_GAP),
+        node: A,
+        boot: BOOT,
+        partition: PARTITION,
+        correlation: CorrelationId(2_000 + seq),
+        kind: EventKind::Kernel(KernelEvent::LocalApplied {
+            seq: Seq(seq),
+            bytes: 100,
+            record_digest: history.digest(seq),
+        }),
+    }
+}
+
+/// The index of record `seq`'s stream frame on A -> B. Each earlier drop adds two frames: B's
+/// `NeedPrefix` starts a cursor, which re-sends the dropped record and the one after it. The
+/// row checks the result: every fault landed on the record named here.
+fn b_index(seq: u64) -> usize {
+    let drops = B_DROPS.iter().filter(|drop| **drop < seq).count();
+    usize::try_from(seq - 1).expect("small") + 2 * drops
+}
+
+/// The index of record `seq`'s frame on A -> C, which drops nothing.
+fn c_index(seq: u64) -> usize {
+    usize::try_from(seq - 1).expect("small")
+}
+
+/// `PlanNext` for each of the first frames on `from -> to`: a named index gets its fault, every
+/// other index up to the last named one `Deliver{0}`, the fate an unplanned frame has anyway.
+/// So each fault lands on the frame at its index.
+fn link_plan(from: NodeId, to: NodeId, named: &[(usize, Delivery)]) -> Vec<NetworkOp> {
+    let last = named.iter().map(|(at, _)| at + 1).max().unwrap_or(0);
+    (0..last)
+        .map(|at| NetworkOp::PlanNext {
+            from,
+            to,
+            delivery: named
+                .iter()
+                .find(|(index, _)| *index == at)
+                .map_or(Delivery::Deliver { delay_millis: 0 }, |(_, fault)| *fault),
+        })
+        .collect()
+}
+
+/// The row's faults. A -> B: 10 drops, 15 duplicates. A -> C: 5 duplicates and the digest flip
+/// on `k`. B -> A: after [`FORGE_AFTER`] frames, one of B's frames re-labelled as C's,
+/// unauthenticated.
+fn stream_faults() -> Vec<NetworkOp> {
+    let duplicate = Delivery::Duplicate {
+        delay_millis: 0,
+        second_delay_millis: DUP_LAG,
+    };
+    let to_b: Vec<_> = B_DROPS
+        .iter()
+        .map(|seq| (b_index(*seq), Delivery::Drop))
+        .chain(B_DUPS.iter().map(|seq| (b_index(*seq), duplicate)))
+        .collect();
+    let to_c: Vec<_> = C_DUPS
+        .iter()
+        .map(|seq| (c_index(*seq), duplicate))
+        .chain([(c_index(FLIPPED), Delivery::Corrupt { delay_millis: 0 })])
+        .collect();
+    let mut ops = link_plan(A, B, &to_b);
+    ops.extend(link_plan(A, C, &to_c));
+    ops.extend((0..FORGE_AFTER).map(|_| NetworkOp::PlanNext {
+        from: B,
+        to: A,
+        delivery: Delivery::Deliver { delay_millis: 0 },
+    }));
+    ops.push(NetworkOp::ForgeAck {
+        from: B,
+        to: A,
+        claimed_node: C,
+        claimed_role: ReplicaRole::RegularSecondary,
+        authenticated: false,
+    });
+    ops
+}
+
+/// The stream run under `ops`. A's engine holds `1..=200`; its tracker starts at the root, and
+/// B and C start empty. A applies one record every [`STREAM_GAP`] ms and R1 ships it; every
+/// frame between the three goes through the network. A and B flush after the last record. C is
+/// not flushed: its durable watermark is not the row's, and a quarantined receiver answers a
+/// flush `Ignored{AppendRejected(Quarantined)}`, a reason outside BA-11 that the row has no use
+/// for.
+fn stream_run(ops: Vec<NetworkOp>) -> (Runner, Vec<TraceEvent>) {
+    let history = history(STREAM);
+    let copies = [
+        Copy {
+            node: B,
+            copy: B_COPY,
+            head: 0,
+            durable: 0,
+        },
+        Copy {
+            node: C,
+            copy: C_COPY,
+            head: 0,
+            durable: 0,
+        },
+    ];
+    let mut plan = r1_plan(&history, STREAM, &copies);
+    plan.seed = (1..=STREAM)
+        .map(|seq| local_applied(&history, seq))
+        .collect();
+    let flush = Tick(STREAM * STREAM_GAP + 300);
+    plan.flushes = vec![(flush, A), (flush, B)];
+    plan.network_ops = ops;
+    plan.limits = RunLimits {
+        max_events: 50_000,
+        deadline: Tick(flush.0 + 200),
+    };
+    let mut runner = r1_runner(&plan, &history, 0, &copies);
+    ran_to_deadline(&mut runner, &plan);
+    assert!(
+        runner.dispatcher().network().planned().is_empty(),
+        "every planned fault found its frame"
+    );
+    let trace = runner.recorded().to_vec();
+    (runner, trace)
+}
+
+/// Every frame the network was handed, in send order, with its entry: the send half of every
+/// step's effect vector (`Network::frames`), bytes as sent.
+fn wire(runner: &Runner) -> Vec<(Transmission, Frame)> {
+    let network = runner.dispatcher().network();
+    network
+        .transmissions()
+        .iter()
+        .copied()
+        .zip(network.frames().iter().cloned())
+        .collect()
+}
+
+/// The record an append frame carries. The header sits outside the record digest, so a
+/// corrupted frame still names its record.
+fn append_seq(frame: &Frame) -> u64 {
+    ReplicationEnvelope::decode_header(&frame.body)
+        .expect("an append")
+        .seq
+        .0
+}
+
+/// The records of the frames A sent `to` that the network treated as `pick` says, sorted.
+fn fated(wire: &[(Transmission, Frame)], to: NodeId, pick: fn(&Transmission) -> bool) -> Vec<u64> {
+    let mut seqs: Vec<u64> = wire
+        .iter()
+        .filter(|(sent, _)| (sent.from, sent.to) == (A, to) && pick(sent))
+        .map(|(_, frame)| append_seq(frame))
+        .collect();
+    seqs.sort_unstable();
+    seqs
+}
+
+/// What `node` answered A, in the order it sent the answers. Each is paired with the record of
+/// the request it answers, found by `Frame::id`, or `None` for a flush's `UNSOLICITED` ack.
+fn answers(wire: &[(Transmission, Frame)], node: NodeId) -> Vec<(Option<u64>, AppendOutcome)> {
+    let requests: BTreeMap<MessageId, u64> = wire
+        .iter()
+        .filter(|(sent, _)| (sent.from, sent.to) == (A, node))
+        .map(|(sent, frame)| (sent.id, append_seq(frame)))
+        .collect();
+    wire.iter()
+        .filter(|(sent, _)| (sent.from, sent.to) == (node, A))
+        .map(|(sent, frame)| {
+            (
+                requests.get(&sent.id).copied(),
+                decode_reply(&frame.body).expect("a reply"),
+            )
+        })
+        .collect()
+}
+
+/// One receiver's answers, classified.
+#[derive(Debug, Default)]
+struct Answered {
+    /// Requests answered `AlreadyHave`.
+    duplicates: Vec<u64>,
+    /// `(request, have)` for each `NeedPrefix`.
+    gaps: Vec<(u64, u64)>,
+    /// `(request, at)` for each `CorruptHistory`.
+    corrupt: Vec<(u64, u64)>,
+    /// The highest record its acknowledgements reported applied.
+    head: u64,
+}
+
+/// `node`'s answers, walked in send order against the head its own acknowledgements report.
+/// Every answer is classified, or the row fails:
+///
+/// - `Accepted` moves the head by at most one: no append is taken past a gap.
+/// - `AlreadyHave` answers a record at or below the head: a duplicate.
+/// - `NeedPrefix{have, head_digest}` answers a record past head + 1 (a gap, and only a gap),
+///   naming the head and its digest.
+/// - `CorruptHistory{at}` is returned for the caller.
+///
+/// A gap answered any other way is an `Accepted` past head + 1, an unclassified answer, or no
+/// answer at all; the row checks separately that every delivered request was answered.
+fn walk(
+    node: NodeId,
+    answers: &[(Option<u64>, AppendOutcome)],
+    history: &CanonicalHistory,
+) -> Answered {
+    let mut walked = Answered::default();
+    for (request, outcome) in answers {
+        let head = walked.head;
+        match outcome {
+            AppendOutcome::Accepted(ack) => {
+                let applied = ack.progress.buffered_applied.0;
+                assert!(
+                    applied <= head + 1,
+                    "{node:?} acknowledged {applied} over head {head}: taken past a gap"
+                );
+                walked.head = head.max(applied);
+            }
+            AppendOutcome::AlreadyHave => {
+                let seq = request.expect("AlreadyHave answers a request");
+                assert!(
+                    seq <= head,
+                    "{node:?}: AlreadyHave for {seq} above head {head}"
+                );
+                walked.duplicates.push(seq);
+            }
+            AppendOutcome::Rejected(AppendReject::NeedPrefix { have, head_digest }) => {
+                let seq = request.expect("NeedPrefix answers a request");
+                assert!(
+                    seq > head + 1,
+                    "{node:?}: NeedPrefix for {seq} at head {head}"
+                );
+                assert_eq!(
+                    (have.0, *head_digest),
+                    (head, history.digest(head)),
+                    "{node:?}: NeedPrefix names its head and the head's digest"
+                );
+                walked.gaps.push((seq, have.0));
+            }
+            AppendOutcome::Rejected(AppendReject::CorruptHistory { at }) => {
+                let seq = request.expect("CorruptHistory answers a request");
+                walked.corrupt.push((seq, at.0));
+            }
+            other => panic!("{node:?} answered {other:?} to {request:?}: outside the row's ladder"),
+        }
+    }
+    walked
+}
+
+/// Plan BA-11's reasons as values (§15, CB-7): the ten `ReplicaIgnoreReason` names plus
+/// `InvalidConfig` and `RecoveryOnly`; `NOT_A_MEMBER` and `FORGED_ACK` on the `AckRejected`
+/// arm; `TOO_LARGE` on the `AppendRejected` arm; and `NOT_PRIMARY`.
+fn in_ba_11(reason: &KernelIgnoredReason) -> bool {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::ignore::ReplicaIgnoreReason as R;
+    matches!(
+        reason,
+        KernelIgnoredReason::Replica(
+            R::AlreadyBlocked
+                | R::AlreadyDiverged
+                | R::BarrierNotDurable
+                | R::NoQualifyingSecondary
+                | R::NotACursorEvent
+                | R::NotFenced
+                | R::NothingOutstanding
+                | R::NotRequired
+                | R::Outstanding
+                | R::QuarantinedTerminal
+                | R::InvalidConfig
+                | R::RecoveryOnly
+        ) | KernelIgnoredReason::AckRejected(
+            AckRejectReason::NotAMember | AckRejectReason::ForgedIdentity
+        ) | KernelIgnoredReason::AppendRejected(AppendReject::TooLarge)
+            | KernelIgnoredReason::Error(ErrorKind::NotPrimary)
+    )
+}
+
+/// The one reason outside BA-11 the row accepts, by name: `Replica(Recorded)`, which R1 notes
+/// for a report it keeps for a later step (lead rulings B-R47, B-R67c). BA-11's list predates
+/// those rulings. Flagged to the lead in the plan note; not waved through by a wildcard.
+fn recorded_by_ruling(module: ModuleName, reason: &KernelIgnoredReason) -> bool {
+    use rdb_core::contracts::ignore::ReplicaIgnoreReason as R;
+    module == ModuleName::Replication && *reason == KernelIgnoredReason::Replica(R::Recorded)
+}
+
+/// Every `Ignored` a kernel-b module (R1, L1, F1) noted in the run, as `(node, module, reason)`.
+fn kernel_b_ignored(trace: &[TraceEvent]) -> Vec<(NodeId, ModuleName, KernelIgnoredReason)> {
+    trace
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                module:
+                    module @ (ModuleName::Replication | ModuleName::Protection | ModuleName::Recovery),
+                note: KernelNote::Ignored { reason },
+                ..
+            } => Some((event.node, *module, reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The records `node` applied, as its `BatchApply{Applied}` lines, in trace order.
+fn applied_on(trace: &[TraceEvent], node: NodeId) -> Vec<u64> {
+    trace
+        .iter()
+        .filter(|event| event.node == node)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                seq,
+                outcome: ApplyOutcome::Applied,
+                ..
+            } => Some(seq.0),
+            _ => None,
+        })
+        .collect()
+}
+
+/// M7B-62 (S §5 R1; D §3; 0005 §2–§5), end state by lead ruling B-R75.
+///
+/// Three copies, 200 appends. A applies each record and R1's stream ships it to B and C through
+/// the network. The network duplicates 20 frames (15 to B, 5 to C) and drops 10 (all to B). It
+/// flips the record digest of the frame carrying `k` = 120 to C (`Delivery::Corrupt`). And it
+/// hands one of B's acknowledgements to A as C's, unauthenticated (`ForgeAck`), after C's
+/// quarantine.
+///
+/// End state (B-R75): A and B at `(200, d200)`. C holds `k - 1`, is quarantined
+/// `CorruptHistory{at: k}`, and never applied past `k - 1`. `qualifies_now(200)` is true through
+/// B.
+///
+/// Surfaces (BA-4). The append outcomes have no trace variant, so they are read off the
+/// recorded effect vectors: the frames each `Send` put on the network (`Network::frames`),
+/// matched to their requests by `Frame::id`. Every duplicate draws `AlreadyHave`, every gap
+/// `NeedPrefix`, nothing falls outside the ladder. The forgery is the `kernel_noted`
+/// `Ignored{AckRejected(ForgedIdentity)}` line on A, M7B-32's surface: the recorder writes no
+/// refused `replication_ack`. Kernel-b's `Ignored` reasons are checked against BA-11.
+#[retcd_test]
+fn m7b_62_replication_end_to_end_duplicate_gap_and_forged_ack() {
+    support::preamble();
+    let history = history(STREAM);
+    let (runner, trace) = stream_run(stream_faults());
+    let wire = wire(&runner);
+
+    // The faults landed where the plan put them, and nowhere else.
+    let mut b_dups = B_DUPS.to_vec();
+    b_dups.sort_unstable();
+    assert_eq!(
+        fated(&wire, B, |sent| sent.copies == 0),
+        B_DROPS,
+        "10 drops, all to B"
+    );
+    assert_eq!(fated(&wire, C, |sent| sent.copies == 0), Vec::<u64>::new());
+    assert_eq!(
+        fated(&wire, B, |sent| sent.copies == 2),
+        b_dups,
+        "15 duplicates to B"
+    );
+    assert_eq!(
+        fated(&wire, C, |sent| sent.copies == 2),
+        C_DUPS,
+        "5 duplicates to C"
+    );
+    assert_eq!(
+        wire.iter().filter(|(sent, _)| sent.corrupted).count(),
+        1,
+        "the network corrupted one frame"
+    );
+    assert_eq!(
+        fated(&wire, C, |sent| sent.corrupted),
+        [FLIPPED],
+        "the flip is on k, to C"
+    );
+    // A sent the true record k: the flip happened in flight.
+    let (_, sent_k) = wire
+        .iter()
+        .find(|(sent, _)| sent.corrupted)
+        .expect("the flipped frame");
+    let true_k = ReplicationEnvelope::decode(&sent_k.body).expect("A's record k");
+    assert_eq!(true_k.record_digest, history.digest(FLIPPED));
+    assert_eq!(
+        true_k.compute_record_digest().ok(),
+        Some(history.digest(FLIPPED))
+    );
+
+    // Every request that arrived was answered.
+    for node in [B, C] {
+        let answered: BTreeSet<MessageId> = wire
+            .iter()
+            .filter(|(sent, _)| (sent.from, sent.to) == (node, A))
+            .map(|(sent, _)| sent.id)
+            .collect();
+        let silent: Vec<u64> = wire
+            .iter()
+            .filter(|(sent, _)| (sent.from, sent.to) == (A, node) && sent.copies > 0)
+            .filter(|(sent, _)| !answered.contains(&sent.id))
+            .map(|(_, frame)| append_seq(frame))
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "{node:?} left requests unanswered: {silent:?}"
+        );
+    }
+
+    // B: every duplicate drew AlreadyHave, every gap NeedPrefix, one gap per drop.
+    let b = walk(B, &answers(&wire, B), &history);
+    let mut b_already = b.duplicates.clone();
+    b_already.sort_unstable();
+    assert_eq!(
+        b_already, b_dups,
+        "every duplicate to B drew AlreadyHave, and only those"
+    );
+    assert_eq!(
+        b.gaps,
+        B_DROPS
+            .iter()
+            .map(|drop| (drop + 1, drop - 1))
+            .collect::<Vec<_>>(),
+        "each drop left a gap at the next record, answered NeedPrefix{{have: drop - 1}}"
+    );
+    assert!(b.corrupt.is_empty(), "B saw no corruption");
+    assert_eq!(b.head, STREAM, "B's acknowledgements reach 200");
+
+    // C: the same up to k. The flipped frame is refused, and C takes nothing after it.
+    let c = walk(C, &answers(&wire, C), &history);
+    assert_eq!(
+        c.duplicates, C_DUPS,
+        "every duplicate to C drew AlreadyHave"
+    );
+    assert!(c.gaps.is_empty(), "C lost no frame");
+    assert_eq!(
+        c.corrupt,
+        [(FLIPPED, FLIPPED)],
+        "C answered the flipped frame CorruptHistory{{at: k}}"
+    );
+    assert_eq!(
+        c.head,
+        FLIPPED - 1,
+        "C acknowledged k - 1 and nothing after"
+    );
+
+    // End state (B-R75). A and B at (200, d200).
+    let at = |seq: u64| Head {
+        seq: Seq(seq),
+        digest: history.digest(seq),
+    };
+    assert_eq!(tracker(&runner).head(), Seq(STREAM), "A's head");
+    assert_eq!(
+        tracker(&runner)
+            .history()
+            .lookup(Seq(STREAM), history.digest(STREAM)),
+        DigestLookup::Match,
+        "A's ladder holds d200 at 200"
+    );
+    assert_eq!(
+        receiver(&runner, B).applied_head(),
+        at(STREAM),
+        "B at (200, d200)"
+    );
+    assert_eq!(receiver(&runner, B).durable_seq(), DurableSeq(STREAM));
+    assert_eq!(
+        triple(peer(&runner, B_COPY)),
+        (STREAM, STREAM, STREAM),
+        "peers[B]"
+    );
+    // C holds k - 1, is quarantined at k, and never applied past k - 1.
+    let c_receiver = receiver(&runner, C);
+    assert_eq!(
+        c_receiver.applied_head(),
+        at(FLIPPED - 1),
+        "C holds (k - 1, d(k - 1))"
+    );
+    assert_eq!(
+        c_receiver.accept_head(),
+        at(FLIPPED - 1),
+        "C stages nothing past it"
+    );
+    assert_eq!(
+        c_receiver.quarantine(),
+        Some(AppendReject::CorruptHistory { at: Seq(FLIPPED) })
+    );
+    assert_eq!(
+        applied_on(&trace, C),
+        (1..FLIPPED).collect::<Vec<_>>(),
+        "C applied 1..k - 1, each once, in order, and nothing at or past k"
+    );
+    assert_eq!(
+        triple(peer(&runner, C_COPY)),
+        (FLIPPED - 1, FLIPPED - 1, 0),
+        "peers[C] is where C's own acknowledgements put it"
+    );
+    // qualifies_now(200) through B, and only B.
+    assert!(tracker(&runner).qualifies_now(Seq(STREAM)));
+    assert_eq!(tracker(&runner).qualified_copies(Seq(STREAM)), [B_COPY]);
+
+    // The forgery took B's acknowledgement of a record C never held.
+    let forged = wire
+        .iter()
+        .filter(|(sent, _)| (sent.from, sent.to) == (B, A))
+        .nth(FORGE_AFTER)
+        .map(|(_, frame)| decode_reply(&frame.body).expect("a reply"))
+        .expect("the frame the forgery took");
+    let AppendOutcome::Accepted(forged) = forged else {
+        panic!("the forgery took {forged:?}, not an acknowledgement");
+    };
+    assert!(
+        forged.progress.buffered_applied.0 > FLIPPED - 1,
+        "the forged acknowledgement names {:?}: past C's k - 1, so counting it would show",
+        forged.progress
+    );
+    assert_eq!(
+        ack_refusals(&trace),
+        vec![(A, AckRejectReason::ForgedIdentity)],
+        "A refuses the forgery by rule 1, and refuses no other acknowledgement"
+    );
+    assert_eq!(
+        jsonl(&trace)
+            .iter()
+            .filter(
+                |line| line["@m"] == "kernel_noted" && line.to_string().contains("ForgedIdentity")
+            )
+            .count(),
+        1,
+        "one kernel_noted ForgedIdentity line"
+    );
+
+    // BA-11: no kernel-b Ignored reason outside the set, bar the one named by ruling.
+    let outside: Vec<_> = kernel_b_ignored(&trace)
+        .into_iter()
+        .filter(|(_, module, reason)| !in_ba_11(reason) && !recorded_by_ruling(*module, reason))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "Ignored reasons outside BA-11: {outside:?}"
     );
 }

@@ -35,8 +35,8 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 > (restart revocations and the grant service, L-R178e, 2026-09-28; §5 after `M7V-108`), and
 > `M7V-114..M7V-124` (sim fidelity: a crash kills the process, lead ruling 2026-09-28, and its
 > correction round 1 under V-R36; §5 after
-> `M7V-113`). The
-> next free id is the one after `M7V-124` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
+> `M7V-113`), and `M7V-125..M7V-126` (sim-followup: tester D7 and `NodeDown` precedence; §5 after `M7V-124`). The
+> next free id is the one after `M7V-126` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
 > `VA-1..VA-9` — a separate series from rEtcd's `TA-NN`, because the harness surfaces are in
 > different crates.
 
@@ -60,7 +60,7 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 | Grammar, generator, reducer rows M7V-20..M7V-23, M7V-42..M7V-51, M7V-83, M7V-84, M7V-86, M7V-88 | `crates/rdb-sim/tests/scenarios.rs` |
 | Recorded-run rows M7V-80, M7V-92, M7V-96..M7V-101 (the spine and rebuild plans live here) | `crates/rdb-sim/tests/dispatch.rs` |
 | Host cadence and runner rows M7V-93..M7V-95 | `crates/rdb-sim/tests/host_cadence.rs` |
-| Restart rebuild rows M7V-102..M7V-108 (V-R35), restart revocations and grant service M7V-109..M7V-113 (L-R178e), sim fidelity M7V-114..M7V-124 (lead ruling 2026-09-28, V-R36) | `crates/rdb-sim/tests/restart.rs` |
+| Restart rebuild rows M7V-102..M7V-108 (V-R35), restart revocations and grant service M7V-109..M7V-113 (L-R178e), sim fidelity M7V-114..M7V-126 (lead ruling 2026-09-28, V-R36; M7V-125..M7V-126 sim-followup) | `crates/rdb-sim/tests/restart.rs` |
 | Scenario implementation | `crates/rdb-sim/tests/support/scenarios/{mod,grammar,gen,reduce,coverage,mutate}.rs` |
 | Campaign, mutation, evidence rows M7V-52..M7V-77, M7V-78, M7V-82, M7V-87, M7V-89 | `crates/rdb-sim/tests/campaign.rs`, `tests/campaign/{corpus,report,regressions}.rs` |
 | Fixtures | `crates/rdb-sim/tests/fixtures/scenarios/*.json`, `tests/fixtures/regressions/*.json` |
@@ -285,7 +285,7 @@ Rules that follow:
 | Class | Meaning | Per-row budget | Rows (counted from the tables, critic T-17) |
 |---|---|---|---|
 | **unit** | hand-built trace, plain data or a source-level check; no runner, no kernel | **< 100 ms** | **58**: M7V-01..M7V-19, M7V-24..M7V-46, M7V-49, M7V-56, M7V-57, M7V-59, M7V-66..M7V-68, M7V-71, M7V-74, M7V-77, M7V-79, M7V-81..M7V-85; **+ M7V-99** (recorder truth, 2026-09-27; not in the 89-row count) |
-| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) **+ M7V-109..M7V-113** (L-R178e, 2026-09-28; likewise not in it) **+ M7V-114..M7V-124** (sim fidelity, lead ruling 2026-09-28 and V-R36; likewise not in it) |
+| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) **+ M7V-109..M7V-113** (L-R178e, 2026-09-28; likewise not in it) **+ M7V-114..M7V-126** (sim fidelity, lead ruling 2026-09-28 and V-R36; likewise not in it) |
 | **campaign** | the seed loop | one shared default corpus **< 60 s** at `SPIKE_SEEDS=64`; aggregate below | **19**: M7V-51..M7V-55, M7V-58, M7V-60..M7V-65, M7V-72, M7V-73, M7V-75, M7V-76, M7V-78, M7V-87, M7V-89 |
 
 **Aggregate budget for `--test campaign` at default scale (critic T-11).** The class budget is per
@@ -581,6 +581,8 @@ cites them for V8's timing half and asserts neither half alone is V8.
 | M7V-122 | `m7v_122_a_direct_delivery_to_a_down_node_carries_out_nothing` | rule 1, tester D4: a direct `deliver` to a down node carries out no timer, send or control effect | the spine; node 1 crashes; `deliver(node 1, boot 1, [Timer Arm 0x0122, a frame to node 2, Watch grants])` into a fresh store and scheduler; then `[Timer Arm 0x0123, Store Snapshot]` | first: `Ok`; nothing armed, nothing scheduled, no watch opened, exactly one `Dropped::Effects{node 1, boot 1, NodeDown}` holding the three effects. Second: refused `harness::dispatch::deliver::crash`, and the arm before the snapshot did not run. Red on the round-0 export sources: the timer was armed. Kills the down-node-delivers mutant | sim | — |
 | M7V-123 | `m7v_123_restart_refuses_a_boot_that_is_not_newer` | V-R36, tester D3: `restart` takes only a strictly newer boot | the spine; node 1 crashes under boot 1; `restart` under boot 1, then boot 0; then boot 2; crash under boot 2; `restart` under boot 2 | boots 1 and 0: `Err(Config{restart_boot})`, node still down at boot 1; boot 2: `Ok`, boot 2; after the second crash, boot 2 again: `Err(Config{restart_boot})`. Red on the round-0 export sources: the boot-1 restart was accepted. Kills the no-boot-check mutant | sim | — |
 | M7V-124 | `m7v_124_a_seed_under_a_boot_the_node_is_not_running_is_counted_as_dropped` | V-R36, tester D6: a seed under a boot the node is not running is dropped and counted like any other drop, not refused | a bare runner; `AcquireDue` seeds on node 2 under boot 0 (at 5) and boot 3 (at 6); run to 200 | the run is `Ok`; node 2's drops are exactly `[(seed@5, StaleBoot{current: 1}), (seed@6, UnknownBoot{current: 1})]`; neither is dispatched. Red on the round-0 export sources: the boot-3 seed was stepped. Kills the newer-boot-adopted mutant | sim | — |
+| M7V-125 | `m7v_125_restart_refuses_a_node_the_cluster_never_registered` | V-R36, tester D7 (probe `tsf_r1_q4`): `restart` refuses a node the cluster never registered, which has no boot to be newer than | a bare runner; node 9 unregistered; it reads `grants/9` with the answer delayed 100 ms, then crashes under boot 1; `restart` under boots 0, 1, 2 and 5; run to 400 | every restart: `Err(Config{restart_node})`, node 9 still down with no boot; after the run nothing is dispatched on node 9, and the delayed control answer is dropped as `NodeDown`. Red on the export basis `c676f8a`: `restart(node 9, boot 0)` returned `Ok`. Kills the refuse-boot-0-only mutant (boot 1 then returns `Ok`) | sim | — |
+| M7V-126 | `m7v_126_a_down_nodes_drops_are_node_down_whatever_boot_they_name` | rule 1, tester-sim-fidelity note on `deliver_while_down`: on a down node `NodeDown` ranks above `StaleBoot` and `UnknownBoot`, as it does for events in `Dispatcher::drop_if_dead` | the spine; node 1 crashes under boot 1; `deliver(node 1, boot, [Timer Arm 0x0126, a frame to node 2])` for boots 0, 1 and 2 | each delivery is `Ok` and records exactly `Dropped::Effects{node 1, boot, NodeDown, effects}`, keeping the boot it named; no timer armed, nothing scheduled, boot still 1. Pins a documented choice, so green at first run. Kills the boot-reason-first mutant (boot 0 then records `StaleBoot{current: 1}`) | sim | — |
 
 ---
 
@@ -1022,7 +1024,7 @@ grammar/generator 9 (6 + 80, 86, 88) ·
 reducer 10 (8 + 83, 84) · campaign 18 (14 + 78, 82, 87, 89) · mutations 7 (6 + 81 counted once,
 under oracle) · evidence 6 — the blocks overlap by the reserved ids 20–23 and by M7V-81, and the
 distinct id set is `M7V-01..M7V-89`. By class: unit 58 · sim 12 · campaign 19 (§2).
-Rows added after this count and not in it: `M7V-92`..`M7V-124` (thirty-three; `M7V-90` stays retired, and
+Rows added after this count and not in it: `M7V-92`..`M7V-126` (thirty-five; `M7V-90` stays retired, and
 `M7V-91` is held as the candidate row named in §15 drift row 6, still unwritten). Their classes are in §2. Count landed rows with
 `scripts/m7-census.sh verification`, never from this paragraph.
 
@@ -1558,6 +1560,14 @@ by it. What it changes for this plan's rows, and what it does not:
     and was then dropped as stale. `restart` refuses a boot that is not strictly newer,
     `Config{restart_boot}` (tester D3). A seed under a boot the node is not running is dropped
     and counted, not refused (tester D6). M7V-115, M7V-120, M7V-123, M7V-124.
+  - **D7, a never-registered node (slice sim-followup).** `Dispatcher::restart` refuses a node
+    the cluster never registered, `Config{restart_node}`. It has no current boot, so "strictly
+    newer" compared against nothing and any boot was taken. Boot 0 needs no rule of its own:
+    every registered node has a boot, and boot 0 is newer than none. M7V-125.
+  - **`NodeDown` ranks first on a down node (slice sim-followup).** Effects handed to a down
+    node are `NodeDown` whatever boot they name, as events are in `Dispatcher::drop_if_dead`.
+    Chosen over the boot reasons because no process runs there to compare against, and
+    `Dropped::Effects` keeps the named boot, so nothing is lost. M7V-126.
   - **F-G and request ids.** A1's timer versions and `ControlRequestId`s restart from the same
     counters, so a stale fire or answer can carry exactly what the fresh process expects. Both are
     stopped by the stale-boot drop, with no counter persisted: M7V-116 (timer version), M7V-117
@@ -1587,7 +1597,7 @@ by it. What it changes for this plan's rows, and what it does not:
     `h1_registered_plan`), and the unit rows `a_fire_carries_the_arms_payload_and_the_arms_site`
     (`harness::dispatch`) and `a_fire_carries_the_arms_version_partition_and_correlation`
     (`harness::run`). Twenty more rows seed nodes the cluster never registers and still pass;
-    their events are stamped boot 0 (listed in the dev-sim-fidelity handoff).
+    their events are stamped boot 0 (listed in the dev-sim-fidelity handoff). None restarts a node, so D7's `restart_node` refusal leaves them green (sim-followup gate, 2026-09-28).
   - **Still open:** `Dispatcher::run_due_flushes` and transfers can still touch a crashed node's
     engine. The stale events in M7V-116 and M7V-117 are seeded under the old boot, standing for
     what a dead process's connection or timer would deliver late.

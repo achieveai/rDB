@@ -121,6 +121,7 @@ fn m7f_23_network_send_is_unavailable_and_names_itself() {
             id: frame().id,
             copies: 0,
             partitioned: true,
+            corrupted: false,
         }],
         "the frame is recorded, with no copy delivered: a drop nobody can see is a silent drop"
     );

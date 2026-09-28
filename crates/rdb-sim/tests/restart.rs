@@ -2354,3 +2354,125 @@ fn m7v_124_a_seed_under_a_boot_the_node_is_not_running_is_counted_as_dropped() {
         "neither is stepped"
     );
 }
+
+/// M7V-125 (tester D7, probe `tsf_r1_q4`): `restart` refuses a node the cluster never
+/// registered. Such a node has no current boot, so "strictly newer" had nothing to compare
+/// against and any boot was taken, boot 0 included. The dead process's delayed control answer
+/// was then stepped under that boot: F-G on an unregistered node.
+///
+/// Node 9 is not in the cluster. It reads its grant, the answer delayed 100 ms, then crashes.
+/// Every restart of it is refused, whatever the boot; it stays down with no boot; and the
+/// delayed answer is dropped as `NodeDown`, not stepped.
+///
+/// Red on the export's basis sources (`c676f8a`): `restart(node 9, boot 0)` returned `Ok`.
+#[retcd_test]
+fn m7v_125_restart_refuses_a_node_the_cluster_never_registered() {
+    use rdb_core::contracts::control::ControlEffect;
+    use rdb_core::contracts::ids::ControlRequestId;
+    support::preamble();
+    let nine = NodeId(9);
+    let mut runner = bare_runner();
+    assert_eq!(
+        runner.dispatcher().boot(nine),
+        None,
+        "precondition: node 9 is unregistered"
+    );
+    runner
+        .control_mut()
+        .inject(ControlOp::DelayCompletion {
+            node: nine,
+            by_millis: 100,
+        })
+        .expect("a delayed answer");
+    runner
+        .carry_out(
+            nine,
+            BOOT,
+            vec![Effect {
+                correlation: CorrelationId(84),
+                from: ModuleName::Authority,
+                partition: SERVED,
+                kind: EffectKind::Control(ControlEffect::Get {
+                    request: ControlRequestId(0x0994),
+                    key: ControlKey::Grant(nine),
+                }),
+            }],
+        )
+        .expect("the old process reads its grant");
+    crash_under(&mut runner, nine, BOOT);
+    for boot in [BootId(0), BOOT, REBOOT, BootId(5)] {
+        assert_eq!(
+            runner.dispatcher_mut().restart(nine, boot),
+            Err(rdb_sim::SimError::Config {
+                field: "restart_node"
+            }),
+            "a restart of node 9 under boot {boot:?} is refused"
+        );
+        assert!(runner.dispatcher().is_down(nine), "and node 9 stays down");
+        assert_eq!(runner.dispatcher().boot(nine), None, "with no boot");
+    }
+    let mark = runner.recorded().len();
+    let drops = runner.dispatcher().dropped().len();
+    let report = runner
+        .run(RunLimits {
+            max_events: 400,
+            deadline: Tick(400),
+        })
+        .expect("the run goes on");
+    let stepped: Vec<_> = dispatched(&runner, mark)
+        .into_iter()
+        .filter(|(node, _, _)| *node == nine)
+        .collect();
+    let dropped = dropped_events(&runner, drops, nine);
+    tracing::info!(stop = ?report.stop, ?stepped, ?dropped, "m7v_125 after the refused restarts");
+    assert!(
+        stepped.is_empty(),
+        "nothing is stepped on node 9: {stepped:?}"
+    );
+    assert!(
+        dropped
+            .iter()
+            .any(|(event, reason)| *reason == DropReason::NodeDown
+                && matches!(event.kind, EventKind::Control(_))),
+        "the dead process's delayed answer is dropped as NodeDown: {dropped:?}"
+    );
+}
+
+/// M7V-126 (tester-sim-fidelity note on `deliver_while_down`): on a down node, `NodeDown` ranks
+/// above the boot reasons. Effects handed to it under an older boot, a newer one, or the boot it
+/// died under are all dropped as `NodeDown`, each record keeping the boot the effects named.
+/// This is the event rule of `Dispatcher::drop_if_dead`, applied to effects.
+#[retcd_test]
+fn m7v_126_a_down_nodes_drops_are_node_down_whatever_boot_they_name() {
+    use rdb_sim::sim::scheduler::Scheduler;
+    support::preamble();
+    let mut runner = run_spine();
+    crash(&mut runner, NODE);
+    let mut control = rdb_sim::sim::control::ControlStore::new();
+    let mut scheduler = Scheduler::new();
+    for boot in [BootId(0), BOOT, REBOOT] {
+        let drops = runner.dispatcher().dropped().len();
+        let effects = vec![arm(0x0126, 5_000), frame_to(NodeId(2))];
+        runner
+            .dispatcher_mut()
+            .deliver(NODE, boot, effects.clone(), &mut control, &mut scheduler)
+            .expect("dropped, not an error");
+        assert_eq!(
+            runner.dispatcher().dropped()[drops..],
+            [Dropped::Effects {
+                node: NODE,
+                boot,
+                reason: DropReason::NodeDown,
+                effects,
+            }],
+            "effects under boot {boot:?} to the down node are NodeDown"
+        );
+    }
+    assert!(!is_armed(&runner, NODE, 0x0126), "no timer is armed");
+    assert_eq!(scheduler.queued(), 0, "no frame is scheduled");
+    assert_eq!(
+        runner.dispatcher().boot(NODE),
+        Some(BOOT),
+        "the boot did not move"
+    );
+}

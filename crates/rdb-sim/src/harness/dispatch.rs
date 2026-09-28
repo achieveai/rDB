@@ -136,6 +136,8 @@ pub struct Adopted {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
     /// The node is down: it crashed and has not restarted. No process runs there to hear it.
+    /// It ranks above the two boot reasons: on a down node it is the reason, whatever boot the
+    /// dropped thing names.
     NodeDown,
     /// It names a boot older than the node's current one: it was meant for a process that died.
     StaleBoot {
@@ -727,15 +729,23 @@ impl Dispatcher {
     ///
     /// # Errors
     ///
-    /// [`SimError::Config`] naming `restart` when `node` has not crashed; naming `restart_boot`
-    /// when `boot` is not strictly newer than the node's current one (tester D3). The same or an
-    /// older boot would make the dead process's queued events look current again. Either way
-    /// nothing changes and the node stays down.
+    /// [`SimError::Config`] naming `restart` when `node` has not crashed; naming `restart_node`
+    /// when the cluster never registered `node` (tester D7), so it has no current boot to be
+    /// newer than and any boot would do; naming `restart_boot` when `boot` is not strictly newer
+    /// than the node's current one (tester D3). The same or an older boot would make the dead
+    /// process's queued events look current again. Boot 0 needs no rule of its own: every
+    /// registered node has a boot, and boot 0 is newer than none. Either way nothing changes and
+    /// the node stays down.
     pub fn restart(&mut self, node: NodeId, boot: BootId) -> Result<(), SimError> {
         if !self.is_down(node) {
             return Err(SimError::Config { field: "restart" });
         }
-        if self.boot(node).is_some_and(|current| boot <= current) {
+        let Some(current) = self.boot(node) else {
+            return Err(SimError::Config {
+                field: "restart_node",
+            });
+        };
+        if boot <= current {
             return Err(SimError::Config {
                 field: "restart_boot",
             });
@@ -1241,6 +1251,16 @@ impl Dispatcher {
     /// replies, adoptions) is dropped as [`DropReason::NodeDown`] and recorded. A storage effect
     /// is refused at the crash seam, as every storage effect on a down node is until
     /// [`Self::restart`].
+    ///
+    /// `NodeDown` holds whatever boot the effects name, the node's current one or not
+    /// (tester-sim-fidelity note, slice sim-followup). Three reasons:
+    /// * [`Self::drop_if_dead`] already ranks it first for events, so both [`Dropped`] arms give
+    ///   one answer for one situation.
+    /// * It is the reason that decides. A boot comparison is only meaningful against a running
+    ///   process, and none runs here. `StaleBoot` on a down node would imply a live newer
+    ///   process that does not exist.
+    /// * Nothing is lost. [`Dropped::Effects`] keeps the boot the effects named, so a row that
+    ///   needs the mismatch reads it off `boot` and [`Self::boot`].
     fn deliver_while_down(
         &mut self,
         node: NodeId,
