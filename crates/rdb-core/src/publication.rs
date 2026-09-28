@@ -187,6 +187,14 @@ impl Publication {
         event: &Event,
         repl: Option<&dyn ReplicationView>,
     ) -> Result<Vec<Effect>, RdbError> {
+        if Self::not_ours(event) {
+            return Ok(vec![Effect {
+                correlation: event.correlation,
+                from: ModuleName::Publication,
+                partition: event.partition,
+                kind: ignored(AuthorityIgnoreReason::NotOurs),
+            }]);
+        }
         let input = Self::input(event)?;
         let config = self.config;
         let slot = self
@@ -233,6 +241,21 @@ impl Publication {
             .collect())
     }
 
+    /// A1's fence or view for a partition other than the event's (lead ruling A-R84, batch C):
+    /// P1's input, but not this partition's to act on. Answered `Ignored(NotOurs)`, as T1's
+    /// `on_freeze` answers the same fence, before any slot is touched or made.
+    fn not_ours(event: &Event) -> bool {
+        match &event.kind {
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Fence { scope, .. })) => {
+                !covers(*scope, event.partition)
+            }
+            EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::View(view))) => {
+                view.lineage.partition != event.partition
+            }
+            _ => false,
+        }
+    }
+
     /// The carrier-to-vocabulary half. Refuses what is not P1's by name.
     fn input(event: &Event) -> Result<PubEvent, RdbError> {
         let reason = match &event.kind {
@@ -267,13 +290,11 @@ impl Publication {
                 KernelEvent::Authority(AuthorityEvent::View(view)) => {
                     return Ok(PubEvent::AuthorityView(*view));
                 }
-                KernelEvent::Authority(AuthorityEvent::Fence { scope, reason }) => {
-                    if covers(*scope, event.partition) {
-                        return Ok(PubEvent::Freeze {
-                            cause: freeze_cause(*reason),
-                        });
-                    }
-                    "publication: a partition fence for another partition"
+                // Another partition's fence never reaches here: `not_ours` answered it.
+                KernelEvent::Authority(AuthorityEvent::Fence { reason, .. }) => {
+                    return Ok(PubEvent::Freeze {
+                        cause: freeze_cause(*reason),
+                    });
                 }
                 KernelEvent::BlockPartition(reason) => {
                     return Ok(PubEvent::BlockPartition {
@@ -332,9 +353,10 @@ impl Module for Publication {
     }
 
     fn capability(&self) -> CapabilityState {
-        // Deliberately still `Unavailable`: every §4.2 row is reachable through `step`, but the
-        // dispatcher does not yet hand P1 the primary's tracker through `step_with`, so outside a
-        // scripted view nothing can publish. Flipping it is a lead call.
+        // Deliberately still `Unavailable`: every §4.2 row is reachable through `step`, and the
+        // sim dispatcher routes every P1 edge and hands P1 the primary's tracker through
+        // `step_with` (A-R66); nothing in routing holds it back any more (A-R82..A-R84).
+        // Flipping it is a lead call.
         CapabilityState::Unavailable
     }
 

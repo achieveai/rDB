@@ -1780,10 +1780,10 @@ fn route_a_kernel_fact_is_scheduled_in_the_same_tick_on_the_same_site() {
     assert!(dispatcher.take_routed(hop.id));
 }
 
-/// Ruling B-R46e(2): a configuration change is offered to L1 and P1 before R1, as the trace
-/// shows.
+/// Ruling B-R46e(2): a configuration change is offered to L1 before R1, as the trace shows. P1
+/// is not a consumer (lead ruling A-R82).
 #[retcd_test]
-fn route_a_config_change_reaches_l1_and_p1_before_r1_in_a_run() {
+fn route_a_config_change_reaches_l1_before_r1_in_a_run() {
     use rdb_core::contracts::event::KernelEvent;
     support::preamble();
     let mut plan = RunPlan::new(support::cluster());
@@ -1807,18 +1807,11 @@ fn route_a_config_change_reaches_l1_and_p1_before_r1_in_a_run() {
         })
         .collect();
     tracing::info!(order = ?order, stop = ?report.stop, "route config order");
-    assert!(
-        order.len() >= 3,
-        "all three consumers were offered: {order:?}"
-    );
+    assert!(order.len() >= 2, "both consumers were offered: {order:?}");
     assert_eq!(
-        order[..3],
-        [
-            ModuleName::Protection,
-            ModuleName::Publication,
-            ModuleName::Replication
-        ],
-        "consumers first, R1 last of them: {order:?}"
+        order[..2],
+        [ModuleName::Protection, ModuleName::Replication],
+        "consumers first, L1 before R1: {order:?}"
     );
 }
 
@@ -1856,38 +1849,157 @@ fn route_a_routed_fact_its_wired_consumer_declines_stops_the_run_by_name() {
     );
 }
 
-/// Lead rulings A-R62 condition 1 and A-R65.2: every owed edge's consumer still reports
-/// `Unavailable`. When one flips to `Wired` this fails, and `OWED_EDGES` is re-read then.
-/// Kernel-b's edges are listed separately, because R1's package-level capability cannot retire
-/// one; its only edge, A1's view, left the table when R1 began answering it (B-R53).
+/// Lead rulings A-R62 condition 1, A-R65.2 and A-R82..A-R84: nothing is owed any more. This
+/// used to hold every owed edge's consumer to `Unavailable`, so a capability flip forced the
+/// table to be re-read. Since 2026-09-28 the table is empty: T1's and P1's seventeen edges left
+/// together (fourteen answered, the answer arm split by checkpoint, the foreign fence answered
+/// `Ignored(NotOurs)`, and `ConfigChanged` no longer offered to P1), and R1's one edge left with
+/// B-R53. So the T1/P1 capability flip is unblocked by routing; what still gates it is kernel-a's
+/// own manual-tester gate (A-R67.1), not this table. An edge added back fails here, and comes
+/// back only with a ruling.
 #[retcd_test]
-fn route_every_owed_consumer_still_reports_unavailable() {
-    use rdb_sim::harness::route::{Arm, Owner, OWED_EDGES};
+fn route_nothing_is_owed_any_more() {
+    use rdb_sim::harness::route::OWED_EDGES;
     support::preamble();
     let report = Dispatcher::new().capability_report();
-    let slot = |module: ModuleName| {
-        ModuleName::ALL
-            .iter()
-            .position(|named| *named == module)
-            .expect("one of the six")
-    };
+    tracing::info!(edges = OWED_EDGES.len(), capability = ?report, "owed edges");
+    assert!(
+        OWED_EDGES.is_empty(),
+        "an owed edge came back: {OWED_EDGES:?}"
+    );
+}
 
-    let mut kernel_b = Vec::new();
-    for (arm, consumer, owner) in OWED_EDGES {
-        match owner {
-            Owner::KernelA => assert_eq!(
-                report[slot(consumer)],
-                CapabilityState::Unavailable,
-                "{arm:?} -> {consumer:?} is owed, so its consumer must still be unwired"
-            ),
-            Owner::KernelB => kernel_b.push((arm, consumer)),
+/// M7A-192. Lead ruling A-R84 (dev-edges defect D1, end to end). On a node serving `p1` and
+/// `p2`, A1 steps only `p1`'s events, yet each view and each partition fence it emits is
+/// delivered to the partition it concerns: the install's view of `p2` is offered at `(n1, p2)`,
+/// and a revocation of `p2` requested on `p1` fences `(n1, p2)` and never `(n1, p1)`, and its
+/// paired past view of `p2` (popped after that fence) is offered at `(n1, p2)` too. And the run
+/// goes on, because P1 answers every fence and view it is offered. Before the fix both install
+/// views popped at `p1`, `p2`'s fence popped at `p1`, and P1's decline of that foreign fence
+/// stopped the run as a refusal once its edge left `OWED_EDGES`.
+///
+/// Pops are told apart by their offer order (`route::offer_order`): a view is offered to R1,
+/// T1, P1 first, a fence to T1, P1 first.
+#[retcd_test]
+fn m7a_192_a_view_and_a_fence_for_p2_reach_p2_not_p1() {
+    use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+    use rdb_core::authority::AuthorityTimer;
+    use rdb_core::contracts::authority::AuthorityEvent;
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::time::TimerFired;
+    use rdb_sim::harness::run::StopReason;
+    use ModuleName::{Publication, Replication, Transaction};
+    const P1: PartitionId = PartitionId(1);
+    const P2: PartitionId = PartitionId(2);
+    support::preamble();
+
+    let record = |partition| {
+        let record = PartitionRecord {
+            partition,
+            owner: NODE,
+            generation: Generation(1),
+            owner_epoch: OwnerEpoch(1),
+            config_version: ConfigVersion(1),
+            lifecycle: PartitionLifecycle::Serving,
+        };
+        (ControlKey::Partition(partition), record.encode())
+    };
+    let seed = |at: u64, kind| SeedEvent {
+        at: Tick(at),
+        node: NODE,
+        boot: BOOT,
+        partition: P1,
+        correlation: CorrelationId(at),
+        kind,
+    };
+    let mut plan = RunPlan::new(support::cluster());
+    plan.control_records = vec![record(P1), record(P2)];
+    plan.seed = vec![
+        seed(
+            1,
+            EventKind::Timer(TimerFired {
+                id: AuthorityTimer::Acquire.id(),
+                version: TimerVersion(0),
+                scheduled_at: Tick(1),
+            }),
+        ),
+        seed(
+            20,
+            EventKind::Kernel(KernelEvent::Authority(
+                AuthorityEvent::RevokeEpochRequested {
+                    partition: P2,
+                    epoch: OwnerEpoch(1),
+                },
+            )),
+        ),
+    ];
+    plan.limits = RunLimits {
+        max_events: 200,
+        deadline: Tick(60),
+    };
+    let (trace, report) = execute(&plan).expect("a run");
+
+    // Each pop: its partition and tick, and its offers in order.
+    let mut pops: std::collections::BTreeMap<u64, (PartitionId, u64, Vec<ModuleName>)> =
+        std::collections::BTreeMap::new();
+    for event in &trace.events {
+        if let TraceKind::ModuleDispatch {
+            event: id, module, ..
+        } = &event.kind
+        {
+            pops.entry(id.0)
+                .or_insert_with(|| (event.partition, event.logical_tick, Vec::new()))
+                .2
+                .push(*module);
         }
     }
-    tracing::info!(edges = OWED_EDGES.len(), kernel_b = ?kernel_b, "owed edges");
+    let sited = |prefix: &[ModuleName], tick: u64| -> Vec<PartitionId> {
+        pops.values()
+            .filter(|(_, at, order)| *at == tick && order.starts_with(prefix))
+            .map(|(partition, _, _)| *partition)
+            .collect()
+    };
+    let (install_views, fences) = (
+        sited(&[Replication, Transaction, Publication], 1),
+        sited(&[Transaction, Publication], 20),
+    );
+    // The revocation's paired past view: a view popped at tick 20 after the fence was.
+    let fence_id = pops
+        .iter()
+        .find(|(_, (_, at, order))| *at == 20 && order.starts_with(&[Transaction, Publication]))
+        .map(|(id, _)| *id);
+    let past_views: Vec<PartitionId> = pops
+        .iter()
+        .filter(|(id, (_, at, order))| {
+            *at == 20
+                && Some(**id) > fence_id
+                && order.starts_with(&[Replication, Transaction, Publication])
+        })
+        .map(|(_, (partition, _, _))| *partition)
+        .collect();
+    tracing::info!(
+        stop = ?report.stop, ?install_views, ?fences, ?past_views, "m7a_192 sited pops"
+    );
+
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "M7A-192: no consumer declined a routed fence or view: {:?}",
+        report.stop
+    );
     assert_eq!(
-        kernel_b,
-        Vec::<(Arm, ModuleName)>::new(),
-        "kernel-b owes no edge since R1 answers A1's view (B-R53)"
+        past_views,
+        vec![P2],
+        "M7A-192: the revocation's paired past view of p2 is sited at p2"
+    );
+    assert_eq!(
+        install_views,
+        vec![P1, P2],
+        "M7A-192: one install view at each partition"
+    );
+    assert_eq!(
+        fences,
+        vec![P2],
+        "M7A-192: p2's revocation fences p2, not p1"
     );
 }
 

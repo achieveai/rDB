@@ -1,5 +1,5 @@
 //! Kernel-to-kernel routing: which modules a kernel fact is for, in what order, and which of
-//! those edges are still owed.
+//! those edges are still owed (none, since 2026-09-28).
 //!
 //! A kernel fact leaves a module as [`EffectKind::Kernel`] and arrives at another as
 //! [`EventKind::Kernel`] (ruling R-S6). [`crate::harness::dispatch::Dispatcher::deliver`] turns
@@ -13,18 +13,23 @@
 //!
 //! For a **routed** event, a named consumer that answers `Unavailable` stops the run as
 //! `StopReason::Refused` under the one seam `harness::run::route`, with the consumer as the
-//! module (ruling B-R28: nothing is absorbed). The exception is an edge in [`OWED_EDGES`]: a
-//! consumer whose package is not wired yet (lead ruling A-R62). Its decline is recorded and the
-//! run continues. A seeded event is the scenario's own input, not a routed one, so its named
-//! consumers are offered first but a decline is an ordinary decline.
+//! module (ruling B-R28: nothing is absorbed). The exception was an edge in [`OWED_EDGES`]: a
+//! consumer whose package was not wired yet (lead ruling A-R62), whose decline was recorded
+//! while the run continued. The table is empty since 2026-09-28 (lead rulings A-R82..A-R84), so
+//! every named consumer's decline on a routed event now stops the run. A seeded event is the
+//! scenario's own input, not a routed one, so its named consumers are offered first but a
+//! decline is an ordinary decline.
 //!
 //! # Order
 //!
-//! `ConfigChanged` reaches L1 and P1 **before** R1 (carried item of L-R175, ruling B-R46e(2)):
-//! L1 pins the new predicate before R1 can report a durable view for it, so R1 is never a
-//! configuration change ahead of L1. `LocalApplied` reaches L1 and then R1 in the same tick it
-//! was emitted, and ahead of anything the same step shipped (B-R48): the dispatcher schedules
-//! effects in vector order, and the primary emits it before the record it ships.
+//! `ConfigChanged` reaches L1 **before** R1 (carried item of L-R175, ruling B-R46e(2)): L1 pins
+//! the new predicate before R1 can report a durable view for it, so R1 is never a configuration
+//! change ahead of L1. P1 is not a consumer (lead ruling A-R82): it reads the configuration
+//! version off A1's view, and its design has no `ConfigChanged` input.
+//!
+//! `LocalApplied` reaches L1 and then R1 in the same tick it was emitted, and ahead of anything
+//! the same step shipped (B-R48): the dispatcher schedules effects in vector order, and the
+//! primary emits it before the record it ships.
 //!
 //! L1's `SetAdmission` reaches T1 and R1 (ruling B-R60: R1 runs its keepalive exactly while
 //! admission is rejected). R1 takes a `Recovered` **before** the `SetAdmission(Reject)` L1 emits
@@ -35,15 +40,17 @@
 //! holds the named source copy (rulings B-R59, B-R59a); the dispatcher picks that node, not this
 //! table. R1's `CopyCaughtUp` from that source goes back to the node of the F1 that asked.
 
-use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent};
+use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent, Checkpoint};
 use rdb_core::contracts::event::{KernelEffect, KernelEvent, ModuleName};
 use rdb_core::contracts::recovery::RecoveryEvent;
 
 /// The [`KernelEvent`] arms, without their payloads, so a table can name one.
 ///
-/// [`KernelEvent::Authority`] is split four ways because its consumers differ by leaf: A1's own
+/// [`KernelEvent::Authority`] is split five ways because its consumers differ by leaf: A1's own
 /// inputs go to A1, and the three twins of A1's outputs (lead ruling A-R63) go to the modules
-/// A1 was talking to.
+/// A1 was talking to. The answer twin is split once more by checkpoint (lead ruling A-R83),
+/// because an answer is "delivered to the module that asked" and T1 and P1 ask at different
+/// checkpoints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Arm {
     /// [`KernelEvent::PeerProgress`].
@@ -59,7 +66,13 @@ pub enum Arm {
     /// [`KernelEvent::Authority`] carrying an input to A1: `Check`, `RevokeEpochRequested`,
     /// `EpochRevocationPersisted`, and any leaf added later.
     AuthorityInput,
-    /// [`KernelEvent::Authority`] carrying [`AuthorityEvent::Answer`].
+    /// [`KernelEvent::Authority`] carrying [`AuthorityEvent::Answer`] at
+    /// [`Checkpoint::StorageDispatch`]: T1's check (lead ruling A-R83).
+    DispatchAnswer,
+    /// [`KernelEvent::Authority`] carrying [`AuthorityEvent::Answer`] at any other checkpoint:
+    /// P1's `Publication`, `Reply` and `Read` checks (lead ruling A-R83). `Admission` is
+    /// synchronous by design and `OutboxDispatch` is unused in M7; neither is asked through the
+    /// harness, and both land here, where P1 answers rather than declines.
     AuthorityAnswer,
     /// [`KernelEvent::Authority`] carrying [`AuthorityEvent::Fence`].
     AuthorityFence,
@@ -99,13 +112,14 @@ pub enum Arm {
 
 impl Arm {
     /// Every arm, in declaration order.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::PeerProgress,
         Self::CopyLost,
         Self::SetAdmission,
         Self::Recovered,
         Self::QualificationChanged,
         Self::AuthorityInput,
+        Self::DispatchAnswer,
         Self::AuthorityAnswer,
         Self::AuthorityFence,
         Self::AuthorityView,
@@ -137,7 +151,14 @@ impl Arm {
             KernelEvent::SetAdmission(_) => Self::SetAdmission,
             KernelEvent::Recovered(_) => Self::Recovered,
             KernelEvent::QualificationChanged(_) => Self::QualificationChanged,
-            KernelEvent::Authority(AuthorityEvent::Answer(_)) => Self::AuthorityAnswer,
+            KernelEvent::Authority(AuthorityEvent::Answer(answer)) => match answer.checkpoint {
+                Checkpoint::StorageDispatch => Self::DispatchAnswer,
+                Checkpoint::Publication
+                | Checkpoint::Reply
+                | Checkpoint::Read
+                | Checkpoint::Admission
+                | Checkpoint::OutboxDispatch => Self::AuthorityAnswer,
+            },
             KernelEvent::Authority(AuthorityEvent::Fence { .. }) => Self::AuthorityFence,
             KernelEvent::Authority(AuthorityEvent::View(_)) => Self::AuthorityView,
             KernelEvent::Authority(_) => Self::AuthorityInput,
@@ -163,8 +184,8 @@ impl Arm {
 
 /// The modules an arm is delivered to, in delivery order, each as its contract doc names it.
 ///
-/// Owed consumers are included: the table says who the event is *for*, and [`OWED_EDGES`] says
-/// which of those cannot take it yet.
+/// Owed consumers would be included: the table says who the event is *for*, and [`OWED_EDGES`]
+/// says which of those cannot take it yet (none, since 2026-09-28).
 #[must_use]
 pub const fn consumers(arm: Arm) -> &'static [ModuleName] {
     use ModuleName::{Authority, Protection, Publication, Recovery, Replication, Transaction};
@@ -181,17 +202,18 @@ pub const fn consumers(arm: Arm) -> &'static [ModuleName] {
         // "Delivered to L1 ... and to P1" (design §4.1); `BlockPartition` likewise.
         Arm::QualificationChanged | Arm::BlockPartition => &[Protection, Publication],
         Arm::AuthorityInput => &[Authority],
-        // "Delivered to the module that asked": only T1 and P1 ask (`AuthorityCheck`). A1's
-        // fence is "broadcast to T1 and P1" (A-R28), and `RetireGeneration` names both.
-        Arm::AuthorityAnswer | Arm::AuthorityFence | Arm::RetireGeneration => {
-            &[Transaction, Publication]
-        }
+        // "Delivered to the module that asked": only T1 and P1 ask (`AuthorityCheck`), T1 at
+        // `StorageDispatch` and P1 at `Publication`, `Reply` and `Read` (A-R83).
+        Arm::DispatchAnswer => &[Transaction],
+        Arm::AuthorityAnswer => &[Publication],
+        // A1's fence is "broadcast to T1 and P1" (A-R28), and `RetireGeneration` names both.
+        Arm::AuthorityFence | Arm::RetireGeneration => &[Transaction, Publication],
         // "A1 pushes its authority state to R1, T1 and P1" (kernel-a design §1.7).
         Arm::AuthorityView => &[Replication, Transaction, Publication],
         // "Delivered to L1 and to R1" (design §4.1, §4.3; ruling B-R47).
         Arm::LocalApplied | Arm::TransitionBarrierConfirmed => &[Protection, Replication],
-        // L1 and P1 before R1: ruling B-R46e(2).
-        Arm::ConfigChanged => &[Protection, Publication, Replication],
+        // L1 before R1: ruling B-R46e(2). Not P1, which has no such input (A-R82).
+        Arm::ConfigChanged => &[Protection, Replication],
         Arm::Recovery => &[Recovery],
         Arm::DivergenceDetected | Arm::CopyQuarantined => &[Replication],
         // F1's catch-up request, at the node of its source copy (rulings B-R59, B-R59a).
@@ -217,60 +239,15 @@ pub enum Owner {
 /// on any other edge of a routed event it stops the run. Enumerated, never a wildcard over a
 /// module, so an edge leaves the table only by being deleted.
 ///
-/// Seventeen edges are to T1 and P1, the two packages kernel-a is still building (A-R63). The
-/// scaffolding test `route_every_owed_consumer_still_reports_unavailable` (`tests/dispatch.rs`)
-/// fails once T1 or P1 stops reporting `CapabilityState::Unavailable`, which forces this table to
-/// be re-read then. T1 already answers `AuthorityEvent::View` (lead ruling A-R68); its edge
-/// stays listed until T1 passes its manual-tester gate (A-R67.1), and an answer on an owed edge
-/// is recorded as an answer.
-///
-/// R1 owes nothing. Its one edge, A1's view (A-R65), left the table on 2026-09-26 when R1 began
-/// answering `AuthorityEvent::View` on every node, installed or not (lead ruling B-R53); a
-/// decline by R1 on it now stops the run like any named consumer's. The scaffolding test still
-/// lists kernel-b's edges separately, because R1's package-level capability cannot retire one.
-pub const OWED_EDGES: [(Arm, ModuleName, Owner); 17] = [
-    (Arm::SetAdmission, ModuleName::Transaction, Owner::KernelA),
-    (
-        Arm::AuthorityAnswer,
-        ModuleName::Transaction,
-        Owner::KernelA,
-    ),
-    (Arm::AuthorityFence, ModuleName::Transaction, Owner::KernelA),
-    (Arm::AuthorityView, ModuleName::Transaction, Owner::KernelA),
-    (Arm::Published, ModuleName::Transaction, Owner::KernelA),
-    (Arm::DedupTrim, ModuleName::Transaction, Owner::KernelA),
-    (
-        Arm::RetireGeneration,
-        ModuleName::Transaction,
-        Owner::KernelA,
-    ),
-    (
-        Arm::QualificationChanged,
-        ModuleName::Publication,
-        Owner::KernelA,
-    ),
-    (Arm::ConfigChanged, ModuleName::Publication, Owner::KernelA),
-    (Arm::BlockPartition, ModuleName::Publication, Owner::KernelA),
-    (
-        Arm::AuthorityAnswer,
-        ModuleName::Publication,
-        Owner::KernelA,
-    ),
-    (Arm::AuthorityFence, ModuleName::Publication, Owner::KernelA),
-    (Arm::AuthorityView, ModuleName::Publication, Owner::KernelA),
-    (
-        Arm::AppliedCandidate,
-        ModuleName::Publication,
-        Owner::KernelA,
-    ),
-    (Arm::Publication, ModuleName::Publication, Owner::KernelA),
-    (Arm::StatusTrim, ModuleName::Publication, Owner::KernelA),
-    (
-        Arm::RetireGeneration,
-        ModuleName::Publication,
-        Owner::KernelA,
-    ),
-];
+/// Empty since 2026-09-28. The seventeen edges to T1 and P1 (A-R63) left together: fourteen
+/// because both bodies answer them, and three more: T1's answer edge by splitting the arm by
+/// checkpoint (A-R83), P1's fence edge once P1 answers another partition's fence
+/// `Ignored(NotOurs)` (A-R84), and P1's `ConfigChanged` edge because P1 is no longer a consumer
+/// (A-R82). R1's one edge, A1's view (A-R65), left on 2026-09-26 (B-R53). So every named
+/// consumer's decline on a routed event stops the run, and the T1/P1 capability flip is no longer
+/// blocked by this table. The tripwire `route_nothing_is_owed_any_more` (`tests/dispatch.rs`)
+/// keeps it empty; an edge comes back only with a ruling.
+pub const OWED_EDGES: [(Arm, ModuleName, Owner); 0] = [];
 
 /// How one module stands to one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,13 +421,68 @@ mod tests {
         assert_eq!(offer_order(None), ModuleName::ALL);
     }
 
-    /// `ConfigChanged` reaches L1 and P1 before R1 (B-R46e(2)).
+    /// `ConfigChanged` reaches L1 before R1 (B-R46e(2)); P1 is not a consumer (A-R82).
     #[test]
-    fn a_config_change_reaches_l1_and_p1_before_r1() {
+    fn a_config_change_reaches_l1_before_r1() {
         let order = offer_order(Some(Arm::ConfigChanged));
         let at = |m| order.iter().position(|x| *x == m).expect("offered");
         assert!(at(ModuleName::Protection) < at(ModuleName::Replication));
-        assert!(at(ModuleName::Publication) < at(ModuleName::Replication));
+        assert_eq!(
+            consumers(Arm::ConfigChanged),
+            [ModuleName::Protection, ModuleName::Replication]
+        );
+    }
+
+    /// An answer goes to the module that asked (A-R83): `StorageDispatch` is T1's check, and
+    /// every other checkpoint routes to P1's arm, `Publication`, `Reply` and `Read` being P1's.
+    #[test]
+    fn an_answer_is_for_the_module_that_asked() {
+        use rdb_core::contracts::authority::{
+            AuthorityDecision, AuthorityEvent, Checkpoint, Lineage, Verdict,
+        };
+        use rdb_core::contracts::event::KernelEvent;
+        use rdb_core::contracts::ids::{
+            AuthorityGeneration, BootId, CorrelationId, Generation, GrantId, NodeId, OwnerEpoch,
+            PartitionId,
+        };
+        use rdb_core::contracts::time::Tick;
+        let arm = |checkpoint| {
+            Arm::of(&KernelEvent::Authority(AuthorityEvent::Answer(
+                AuthorityDecision {
+                    owner: NodeId(1),
+                    boot: BootId(1),
+                    grant: GrantId(1),
+                    authority_generation: AuthorityGeneration(1),
+                    lineage: Lineage {
+                        partition: PartitionId(1),
+                        generation: Generation(1),
+                        owner_epoch: OwnerEpoch(1),
+                    },
+                    expiry_utc_ms: 0,
+                    decided_at: Tick::ZERO,
+                    authority_seq: 1,
+                    checkpoint,
+                    correlation: CorrelationId(1),
+                    verdict: Verdict::Admit,
+                },
+            )))
+        };
+        assert_eq!(arm(Checkpoint::StorageDispatch), Some(Arm::DispatchAnswer));
+        assert_eq!(consumers(Arm::DispatchAnswer), [ModuleName::Transaction]);
+        for checkpoint in [
+            Checkpoint::Publication,
+            Checkpoint::Reply,
+            Checkpoint::Read,
+            Checkpoint::Admission,
+            Checkpoint::OutboxDispatch,
+        ] {
+            assert_eq!(
+                arm(checkpoint),
+                Some(Arm::AuthorityAnswer),
+                "{checkpoint:?}"
+            );
+        }
+        assert_eq!(consumers(Arm::AuthorityAnswer), [ModuleName::Publication]);
     }
 
     /// Each owed edge is an edge the consumer table names, and is listed once.
@@ -468,21 +500,21 @@ mod tests {
         }
     }
 
-    /// Every edge to T1 or P1 is owed and owned by kernel-a (A-R63); A1, L1, F1 and, since it
-    /// answers A1's view (B-R53), R1 are owed nothing.
+    /// What is still owed, written out: nothing (2026-09-28, A-R82..A-R84). T1's and P1's
+    /// seventeen edges and R1's one have all left, so every named consumer is `Named` and a
+    /// decline by any of them on a routed event stops the run. An edge added back fails here
+    /// until this list names it.
     #[test]
-    fn every_edge_to_t1_or_p1_is_owed_and_no_other_is() {
+    fn nothing_is_owed() {
+        const STILL_OWED: [(Arm, ModuleName, Owner); 0] = [];
+        assert_eq!(OWED_EDGES, STILL_OWED);
         for arm in Arm::ALL {
             for module in consumers(arm).iter().copied() {
-                let owner = OWED_EDGES
-                    .iter()
-                    .find(|&&(a, m, _)| (a, m) == (arm, module))
-                    .map(|&(_, _, owner)| owner);
-                let expected = match module {
-                    ModuleName::Transaction | ModuleName::Publication => Some(Owner::KernelA),
-                    _ => None,
-                };
-                assert_eq!(owner, expected, "{arm:?} -> {module:?}");
+                assert_eq!(
+                    edge(Some(arm), module),
+                    Edge::Named,
+                    "{arm:?} -> {module:?}"
+                );
             }
         }
     }

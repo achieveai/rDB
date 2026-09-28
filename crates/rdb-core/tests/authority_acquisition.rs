@@ -2276,3 +2276,63 @@ fn m7a_179_a_late_answer_to_an_earlier_renewal_is_not_the_current_ones() {
     );
     assert_eq!(view.record_revision, Some(Revision(10)));
 }
+
+// =============================================================================================
+// Defect KA-ROWS-D1 (2026-09-28): the expiry fence left with a step A1 then declined.
+// =============================================================================================
+
+/// Regression for KA-ROWS-D1, not a plan row. A1 accepts every `Storage` and `Timer` kind at the
+/// door and judges the grant before routing the event, so the expiry fence can fire on a
+/// storage completion or a timer that is not A1's. Its row for that event then declines, and the
+/// decline used to discard the fence and its superseding views while the state stayed `Fenced`:
+/// no consumer ever heard of the fence (found driving M7A-163 through the sim, where the lapse
+/// landed on a `Flushed` and T1's queue and P1's waiters were never drained).
+#[retcd_test]
+fn expiry_fence_leaves_with_an_event_a1_has_no_row_for() {
+    let foreign_timer = EventKind::Timer(TimerFired {
+        id: rdb_core::contracts::ids::TimerId(7),
+        version: TimerVersion(0),
+        scheduled_at: Tick(LAPSE),
+    });
+    let flushed = EventKind::Storage(rdb_core::contracts::storage::StorageEvent::Flushed {
+        ticket: rdb_core::contracts::ids::FlushTicket(1),
+        durable: Vec::new(),
+    });
+    for (why, kind) in [
+        ("a timer outside A1's block", foreign_timer),
+        ("a flush", flushed),
+    ] {
+        let (mut kernel, _) = held();
+        serve_p1(&mut kernel, &ctx(520));
+        let effects = kernel
+            .step(&ctx(LAPSE), &event(LAPSE, LAPSE, kind.clone()))
+            .unwrap_or_else(|declined| panic!("{why}: the fence was declined away: {declined:?}"));
+        assert_eq!(
+            shapes(&effects),
+            vec![
+                Shape::Fence(FenceScope::Node, DenyReason::Expired),
+                Shape::Publish
+            ],
+            "{why}"
+        );
+        assert_eq!(
+            kernel.state(),
+            &AuthorityState::Fenced {
+                reason: DenyReason::Expired,
+                at: Tick(LAPSE),
+            },
+            "{why}"
+        );
+        // The exception belongs to the step that fenced. On the next step the kernel is already
+        // `Fenced`, nothing fences, and the same event is declined as it always was: a run
+        // records it `Declined`, not `Answered` with no effects.
+        let again = kernel.step(&ctx(LAPSE + 1), &event(LAPSE + 1, LAPSE + 1, kind));
+        assert!(
+            matches!(
+                again,
+                Err(rdb_core::contracts::errors::RdbError::Unavailable { .. })
+            ),
+            "{why}: once fenced, the event is declined again: {again:?}"
+        );
+    }
+}

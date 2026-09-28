@@ -274,11 +274,11 @@ is the row that goes red first.
 
 | Class | Meaning | Per-row budget | Rows |
 |---|---|---|---|
-| **unit** | one kernel (or two hand-wired kernels) driven through `Driver<K>` with hand-built events; the fake control seam scripted by `ControlOp`; no runner | **< 100 ms** | **169**: M7A-01..M7A-57, M7A-59..M7A-84, M7A-86..M7A-92, M7A-94..M7A-96, M7A-99..M7A-101, M7A-103..M7A-116, M7A-118..M7A-129, M7A-138, M7A-140..M7A-162, M7A-164..M7A-167, M7A-169..M7A-187 |
-| **sim** | one scenario through the runner with the real kernels and kernel-b's R1 fake or real R1 | **< 2 s** | **15**: M7A-85, M7A-93, M7A-97, M7A-98, M7A-102, M7A-117, M7A-131..M7A-136, M7A-139, M7A-163, M7A-168 |
+| **unit** | one kernel (or two hand-wired kernels) driven through `Driver<K>` with hand-built events; the fake control seam scripted by `ControlOp`; no runner | **< 100 ms** | **173**: M7A-01..M7A-57, M7A-59..M7A-84, M7A-86..M7A-92, M7A-94..M7A-96, M7A-99..M7A-101, M7A-103..M7A-116, M7A-118..M7A-129, M7A-138, M7A-140..M7A-162, M7A-164..M7A-167, M7A-169..M7A-191 |
+| **sim** | one scenario through the runner with the real kernels and kernel-b's R1 fake or real R1 | **< 2 s** | **18**: M7A-85, M7A-93, M7A-97, M7A-98, M7A-102, M7A-117, M7A-131..M7A-136, M7A-139, M7A-163, M7A-168, M7A-192..M7A-194 |
 | **campaign** | the Q1 seed loop, reading verification's shared corpus report | one shared corpus, no extra run | **3**: M7A-58 (`zero_overlapping_lineages`), M7A-130 (fake fidelity, conformance suite), M7A-137 (event budget, recorded) |
 
-Counts are for all 187 written rows (M7A-01..M7A-187, no gaps, no duplicates; M7A-175 added 2026-09-26, M7A-176..M7A-178 and M7A-179..M7A-183 added 2026-09-27, M7A-184..M7A-187 added 2026-09-28). §8.1–§8.6 were
+Counts are for all 194 written rows (M7A-01..M7A-194, no gaps, no duplicates; M7A-175 added 2026-09-26, M7A-176..M7A-178 and M7A-179..M7A-183 added 2026-09-27, M7A-184..M7A-187, M7A-188..M7A-193 (§8.8) and M7A-194 (§8.9) added 2026-09-28). §8.1–§8.6 were
 cleared by critic-kernel-a round 3. The 10 rows of **§8.7 are provisional until the first green
 run** and are counted by class like any other.
 
@@ -551,7 +551,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-132 | `a1_p1_delayed_old_dispatch_after_pause_quarantined_bytes_only` | charter adversarial "delayed old dispatch after pause … leaves quarantined bytes only" · ADR 0007 "late old dispatch quarantine only" · §2.5 "epoch is the safety" | `StorageBatch{seq 5}` dispatched; `NodeLifecycle::Resumed{gap > tolerance}` before `BatchCompleted`; the batch completes after the fence | `Fact(Quarantined{g, 5})`; no `Publish`; no `Reply` with result; **and** the O1/M1 namespace inventory shows every byte written by seq 5 under the fenced epoch's namespace and none under a live one (A-R22) | sim | M1 namespace inventory + O1 (`M7V-15`) |
 | M7A-133 | `a1_p1_delayed_old_dispatch_after_reboot_quarantined_bytes_only` | same clause, "reboot" (one fact vs M7A-132: `Rebooted{other boot}`) | as M7A-132 | as M7A-132 with `BootMismatch` | sim | M1 + O1 |
 | M7A-134 | `a1_p1_delayed_old_dispatch_after_new_generation_quarantined_bytes_only` | same clause, "new generation" (one fact: `Found{authority_generation: ours+1}` on the renewal read) | as M7A-132 | as M7A-132 with `AuthorityGenerationChanged` | sim | M1 + O1 |
-| M7A-135 | `f1_t1_p1_retention_boundary_recovered_applied_then_unknown` | spike §6 F1/T1/P1 · spec §8.1 · ADR 0004 retention boundary · §4.4 `fold_recovered` (K-A-52) | commit seq 5 in gen g; recover into g+1 with `RetainedStatusMap{retained_through: 5, discarded_from: None, uncertain: false}`; retry ⇒ `RECOVERED_APPLIED`; `RetireGeneration{g}`; retry again; a `DedupTrim` below 5 in a live gen instead | first answer `RecoveredApplied{result}`; after `RetireGeneration{g}` the answer is **`StatusExpired`**, not `Unknown` (TD-06): `design.md` line 1889 returns `Outcome::StatusExpired` for a retired generation, ADR 0004's retention-boundary row says `STATUS_EXPIRED`, and M7A-113's third case and M7A-114 both assert it — a retired generation is the one path that *does* produce it. The round-3 text said `Unknown` here and contradicted four other places; this is a correction, not a reopening of Q-13. The never-produced claim is **narrowed to the `fold_recovered` paths**, where it is true and where M7A-116 and M7A-172 carry it: nothing is discarded below `retained_through`, so the fold's third arm is not reached from a recovery map M7 can build. `DedupTrim` path (live generation, entry trimmed) ⇒ `Unknown`; never a second execution of seq 5's mutation. Loss-accepting variant in the same test (one fact: `uncertain: true` on the recovery map) ⇒ the first retry answers `Unknown` instead of `RecoveredApplied` | sim | K-A-52; kernel-b F1 |
+| M7A-135 | `f1_t1_p1_retention_boundary_recovered_applied_then_unknown` | spike §6 F1/T1/P1 · spec §8.1 · ADR 0004 retention boundary · §4.4 `fold_recovered` (K-A-52) | commit seq 5 in gen g; recover into g+1 with `RetainedStatusMap{retained_through: 5, discarded_from: None, uncertain: false}`; retry ⇒ `RECOVERED_APPLIED`; `RetireGeneration{g}`; retry again; a `DedupTrim` + `StatusTrim{g, below: 5}` in a live gen instead (T1 takes the first, P1 the second; P1's `Status` answer comes from `StatusTrim` alone — reviewer-ka-rows F1) | first answer `RecoveredApplied{result}`; after `RetireGeneration{g}` the answer is **`StatusExpired`**, not `Unknown` (TD-06): `design.md` line 1889 returns `Outcome::StatusExpired` for a retired generation, ADR 0004's retention-boundary row says `STATUS_EXPIRED`, and M7A-113's third case and M7A-114 both assert it — a retired generation is the one path that *does* produce it. The round-3 text said `Unknown` here and contradicted four other places; this is a correction, not a reopening of Q-13. The never-produced claim is **narrowed to the `fold_recovered` paths**, where it is true and where M7A-116 and M7A-172 carry it: nothing is discarded below `retained_through`, so the fold's third arm is not reached from a recovery map M7 can build. `DedupTrim` + `StatusTrim{g, below: 5}` in a live (not retired) generation — exclusive, so it drops seq < 5 and keeps seq 5: the trimmed identity's `Status` ⇒ `Unknown`; seq 5's entry is still retained, so its same-digest `Submit` retry ⇒ `GENERATION_CHANGED{g, g+1}`, never a second execution of seq 5's mutation. Past retention (a trim or retire that covers the identity) a retry **without** `expected_generation` is admitted as a new request — M7A-89's rule (A-R68 Q2, spec §5.3), the raw-wire limit of ADR 0004 §8; one **with** `expected_generation = g` is refused `GENERATION_CHANGED` at check 5 whatever was trimmed (lead ruling on tester F2, ka-rows round 1). Loss-accepting variant in the same test (one fact: `uncertain: true` on the recovery map) ⇒ the first retry answers `Unknown` instead of `RecoveredApplied` | sim | K-A-52; kernel-b F1 |
 | M7A-136 | `f1_t1_generation_reconciliation_no_double_apply` | spike §6 F1/T1 · ADR 0004 "generation reconciliation" | as M7A-117 with the client retrying **during** recovery | the retry waits or replays; the mutation is applied exactly once across both generations (oracle INV-DEDUP) | sim | kernel-b F1 + O1 |
 | M7A-137 | `event_budget_per_fault_free_transaction_recorded` | §2.5 "roughly 14–16 events per fault-free transaction" as a Q1 budget suspect · hard rule 1 · A-R24 (count `step` inputs **and** effects, record both) | verification's shared corpus report, fault-free seeds only | per transaction, `step_inputs` and `effects` are both **recorded** in the artifact (`kernel_a.events_per_txn.{inputs,effects}.{min,p50,max}`) — **counted by the fixture over `step` inputs and returned effects, never logged.** Round 5 said "and logged (KA-4 `event_count`)"; there is no `event_count` line and there could not be one, because the count is a property of the driver's history, not of any one kernel decision (L-R54). The per-node `PublishAuthorityView` rate is recorded separately (`kernel_a.view_pushes_per_s`); nothing asserted in the PR default. §14 gives the re-derivation | campaign | Q1 shared report |
 
@@ -649,7 +649,7 @@ round-2 text in place, then to the round-3 text under A-R26.
 | M7A-185 | `a_restored_revocation_blocks_the_install_of_its_epoch` | L-R178e: the host replays each durable revocation at start as `EpochRevocationRestored` (A-R41 append), before the first `AcquireDue` | `Authority::new()`; `EpochRevocationRestored{p1, e3}`; the acquisition and the same load as M7A-184 | the restore answers `[]` and records `(p1, e3)`; the load's assertions as M7A-184. One-fact twin without the restore: `(p1, e3)` adopted and admits. Red on `HEAD` 56f952d: the variant fell to A1's wildcard arm, `Unavailable` | unit | L-R178e |
 | M7A-186 | `a_restored_revocation_for_another_partition_or_epoch_blocks_nothing_else` | L-R178e: a revocation is the exact `(partition, epoch)` pair | `Authority::new()`; restores `(p2, e3)` and `(p1, e2)`; the acquisition and load of `(p1, e3)`, `(p2, e3)` | each restore answers `[]`; set = `[(p1, e2), (p2, e3)]`; `(p1, e3)` adopted and admits; `p2` not adopted, `Deny(EpochRevoked)`. Red on `HEAD` 56f952d: `Unavailable` | unit | L-R178e |
 | M7A-187 | `a_restore_reaching_a_held_kernel_fences_only_its_served_epoch_and_proves_no_drain` | L-R178e: a restore that meets a `Held` kernel (a host that broke the replay order) never leaves the check and the view disagreeing, and never proves a drain | `serving_p1(3)`; restore `(p1, e2)`; restore `(p1, e3)` | `(p1, e2)` ⇒ `[]`, `served` kept; `(p1, e3)` ⇒ shapes exactly `[Fence(EpochRevoked), Publish(p1)]`, no `DrainProof`, `p1` gone from `served`, set = `[(p1, e2), (p1, e3)]`, `may_admit(p1@3) = Deny(GenerationChanged)`. Red on `HEAD` 56f952d: `Unavailable` | unit | L-R178e |
-| M7A-163 | `dropped_control_operation_drains_both_consumers` | ADR 0008 "Dropped control operation" (amended: both consumers) · ADR 0008 §7 item 8 · §3.3 and §4.2 `Freeze` rows | A1+T1+P1 wired; a renewal whose `CasResult` never arrives; T1 queue holds two requests; P1 holds two `Fresh` waiters | `Fence{Node, Expired}` at the local horizon; a superseding view **already past its horizon** (`valid_through_tick == fence_tick − 1`, `past_horizon == Expired`); T1's queue drains with `LEASE_EXPIRED`; P1's `Fresh` waiters drain **at the fence** with `Answer(Err(UNKNOWN_OUTCOME))`; zero `Committed` ever | sim | H1 `ControlOp::DropCompletion` (landed) |
+| M7A-163 | `dropped_control_operation_drains_both_consumers` | ADR 0008 "Dropped control operation" (amended: both consumers) · ADR 0008 §7 item 8 · §3.3 and §4.2 `Freeze` rows | A1+T1+P1 wired; a renewal whose `CasResult` never arrives; T1 queue holds two requests; P1 holds two `Fresh` waiters | `Fence{Node, Expired}` at the local horizon; a superseding view **already past its horizon** (`valid_through_tick == fence_tick − 1`, `past_horizon == Expired`); T1's queue drains with `LEASE_EXPIRED`; P1's `Fresh` waiters drain **at the fence** with `Answer(Err(LEASE_EXPIRED))` — corrected from `UNKNOWN_OUTCOME` (ka-rows delta, 2026-09-28): lead rulings A-R72/A-R72a give a refused read `DenyReason::client_error_kind`'s code, because a read wrote nothing and has no outcome to be unknown about; zero `Committed` ever | sim | H1 `ControlOp::DropCompletion` (landed) |
 | M7A-164 | `watch_admission_refused_counter_resets_on_healthy_watch` | §2.4 sweep: `watch_refused_attempts` reset row | five `ResourceExhaustedFatal` terminations (backoff climbing); then a healthy `Watched`/`WatchProgress`; then one more refusal | after the healthy watch the next refusal's backoff equals the first refusal's, not the sixth (one fact vs M7A-31: the healthy event between) | unit | round-2 sweep |
 
 ### 8.7 Correction round 3 rows (M7A-165..M7A-174) — the ADR verification rows landed at `3eec5e9`, plus the K-A-57 guard
@@ -678,6 +678,39 @@ one goes red.
 | M7A-173 | `publication_binds_the_digest` | ADR 0004 "Publication binds the digest" · K-A-51 · §1.6 `may_publish` third conjunct | one qualifying candidate `{seq 7, record_digest: d}` with the KA-8 fake scripted in three sub-runs: `digest_at(7, d) == Differs{stored: d2}`, `== NotRetained`, `== Match` | `Differs`: no `Publish`, `Fact(PublishPredicateFalse{which: Digest(Differs{stored: d2})})` carrying the stored digest, `pending` kept, `published_seq` unchanged. `NotRetained`: no `Publish`, `Fact(PublishPredicateFalse{which: Digest(NotRetained)})`, same state assertions. `Match`: `Publish{7}` — the one fact that separates it from the other two. All three run with `qualifies_now(7) == true`, so the refusal can only come from the digest conjunct, never from the qualification one (M7A-93 is the `Qualification` arm) | unit | KA-8; K-A-51 (provisional) |
 | M7A-174 | `blocked_publish_refusal_does_not_swallow_a_lineage_move` | architect round 4: the `Blocked \| Admit at Publication` row's `same_lineage_as(cand.authority)` conjunct · K-A-57 reorder · K-A-48 (this is the second trace of ADR 0007 "Blocked is sticky under a publication deny") | `Serving` with a pending candidate `{seq 7}` and two `Fresh` waiters; `BlockPartition{reason}`; then the lineage moves (a new generation is installed, so the pending answer's lineage ≠ ours); then `AuthorityAnswer{Admit, Publication}` for seq 7 | effects contain `Status(Unknown)`, `Fact(Quarantined{g, 7})` and one `Answer(Err(UNKNOWN_OUTCOME))` per drained waiter; state `mode == Blocked{reason}` (K-A-48 stickiness holds); and **`Fact(PublishRefusedBlocked)` is NOT emitted** — the row asserts its absence, not merely the presence of the others. Near-miss twin (one fact: the lineage stays ours) ⇒ exactly the M7A-159 behaviour, `Fact(PublishRefusedBlocked)` and **no** `Fact(Quarantined)`. This row is the guard on the `same_lineage_as` conjunct: the reorder put the `Blocked` row above the `pending \| Admit, lineage moved` quarantine row, so without the conjunct a blocked partition whose lineage moved would emit the refusal fact and silently skip the quarantine. The architect's residual risk is that the conjunct reads as redundant and invites deletion; deleting it turns this row red | unit | K-A-57, K-A-48 (provisional) |
 | M7A-175 | `condition_failure_is_not_reversed_by_a_duplicate` | ADR 0004 §8 (Gautam, lead ruling A-R75, 2026-09-26), kernel half | `CONDITION_FAILED` in g7 with `expected_generation = g7`; `Recovered` into g8 on the same node and, in a second trace, on another; condition made true; same request re-delivered | both traces: exactly `Reply(GENERATION_CHANGED{7, 8})` at check 5; no check, no `StorageBatch`, `next_seq` and `prev_digest` unchanged. Twin (no `expected_generation`): admitted, its dispatch check is the only effect (pins the documented raw-wire limit) | unit | A-R75 |
+
+### 8.8 Owed-edge release (M7A-188..M7A-193) — lead rulings A-R82..A-R84, 2026-09-28
+
+`route::OWED_EDGES` is empty. Its seventeen T1/P1 edges left in four batches: fourteen table-only
+edges (A); A1's answer arm split by checkpoint, `StorageDispatch` to T1 and the rest to P1 (B,
+A-R83); P1 answers another partition's fence `Ignored(NotOurs)` (C); P1 dropped from
+`ConfigChanged` (D, A-R82). Batch C found three defects in the scenario walk (A-R86): A1 sited
+every effect at the stepped event's partition (D1), P1 refused a foreign partition fence (D2),
+and T1 and P1 adopted a view for another partition (D3; A-R84). Each row below was red before its
+fix, and each fails against a one-line mutant of that fix.
+`AuthorityIgnoreReason::NotOurs` now also means "input for another partition" at T1 and P1; a
+later contract pass may split it into its own reason.
+
+| ID | Name | Proves | Input | Assertion | Class | Dep |
+|---|---|---|---|---|---|---|
+| M7A-188 | `a1_sites_a_view_and_a_partition_fence_at_their_partition` | A-R84 (D1): `Effect.partition` is the partition the effect concerns | `serving_p1_p2()` (install stepped on p1); `EpochRevocationPersisted{p2, e1}` on a p1 event; a fresh `serving_p1_p2()` then `Rebooted` | install views at `[(p1, Publish p1), (p2, Publish p2)]`; revocation ⇒ `[(p2, Fence(EpochRevoked)), (p2, Publish p2)]`, facts at p1; node fence ⇒ `[(p1, Fence(BootMismatch)), (p1, Publish p1), (p2, Publish p2)]`. Red at 0923dd8's A1: both install views at p1 | unit | A-R84 |
+| M7A-189 | `p1_answers_another_partitions_fence_not_ours` | batch C (D2): a partition fence for another partition is not P1's | `Rig::new()`, one published, one pending recheck, one admitted read; `Fence{Partition(P2), EpochRevoked}` on P; then `Fence{Partition(P), EpochRevoked}` | the foreign fence ⇒ exactly `[Ignored(NotOurs)]`, `view()` byte-equal; P's own fence ⇒ no `NotOurs`, `mode` `Frozen`. Red at 0923dd8: `Unavailable("a partition fence for another partition")` | unit | A-R84 |
+| M7A-190 | `t1_does_not_adopt_another_partitions_view` | A-R84 (D3, T1): a view whose lineage names another partition is not T1's authority | `H::live()`; own view seq 1; a view for partition 2 at seq 9 | foreign view ⇒ `[Ignored(NotOurs)]`; `authority()` unchanged; queue `Open`. Red at 0923dd8: `[]` (adopted) | unit | A-R84 |
+| M7A-191 | `p1_does_not_adopt_another_partitions_view` | A-R84 (D3, P1) | `Rig::new()`; `view_push(P2, 9)` on P | ⇒ `[Ignored(NotOurs)]`; `view().authority` unchanged; no slot for P2 made. Red at 0923dd8: `[]` (adopted) | unit | A-R84 |
+| M7A-192 | `a_view_and_a_fence_for_p2_reach_p2_not_p1` | A-R84 end to end: the dispatcher delivers each A1 view and partition fence to the partition it concerns | run: records p1, p2 (ours); `AcquireDue` at t1 and `RevokeEpochRequested{p2, e1}` at t20, both seeded on p1 | stop `DeadlineReached`; view-shaped pops at t1 at `[p1, p2]`; fence-shaped pops at t20 at `[p2]`; the revocation's paired past view (view-shaped, t20, after the fence) at `[p2]`. Red with A1's siting reverted: install views at `[p1, p1]`; red with only the view siting reverted: paired past view at `[p1]`; with A1 and P1 both unfixed the same run stopped `Refused{Publication}` on p2's fence at p1 | sim (tests/dispatch.rs) | A-R84 |
+| M7A-193 | `a_publish_runs_through_the_split_answer_arm_with_nothing_owed` | A-R83 (batch B): a publish and a dispatch answer run end to end with the answer arm split by checkpoint. Which module an answer names as its consumer is pinned by the route unit test `an_answer_is_for_the_module_that_asked`, not by this row | the A1/P1 case without its activation op | stop `DeadlineReached` at the case's budget; exactly one `Success` outcome. Zero `DeclinedOwed` is structurally true while `OWED_EDGES` is empty, so it is not this row's claim. Red at 0923dd8: two `DeclinedOwed` pops (T1 on P1's answers); red with the arm unsplit and the table empty: `Refused{Transaction}` | sim (tests/scenarios.rs) | A-R83 |
+
+### 8.9 Status for a previous generation on a failover node (M7A-194) — Gautam's ruling, 2026-09-28
+
+Found by tester-ka-rows (F3) walking M7A-117. Spec §8.1 keeps an old generation's identities
+queryable for the 24 h dedup window. On a failover node they are not: T1's dedup is seeded from
+the durable rows, but P1's status index is not, so `StatusIndex::lookup` answers `StatusExpired`
+for a generation it never opened. Safety holds, because `StatusExpired` and `Unknown` never claim
+nonexecution. M7A-117 stays about T1 dedup. This row is **owed** and has no function yet.
+
+| ID | Name | Proves | Input | Assertion | Class | Dep |
+|---|---|---|---|---|---|---|
+| M7A-194 | `p1_on_a_failover_node_answers_a_previous_generations_status` | spec §8.1: an old generation's status stays queryable within retention on any node that serves g+1 | commit request 5 at gen g on node A; g+1's primary is node B, recovered with the durable rows; `Status` for request 5 on B, with `Some(g)` and with `None` | `RecoveredApplied{result}` on B, as on A. Today B answers `StatusExpired` (`Some(g)`) and `Unknown` (`None`) — observed by tester-ka-rows, scenario S-117s | sim | P1 status seed on failover (owed) |
 
 ---
 
@@ -2073,3 +2106,65 @@ four rows land, all unit:
     `DurableDrain` the restored revocation denies the epoch (M7A-185, M7V-109). The grant
     service refuses to clear a grant while any partition naming the node is not `Serving`
     (M7V-113).
+
+**ka-rows delta, 2026-09-28, kernel-a (dev-ka-rows, export of `0923dd8`). The marker does not
+move: no contract file changed.** Five sim rows land in a new file,
+`crates/rdb-sim/tests/kernel_a_sim.rs`, through the production dispatcher (so A-R76's objection
+to hand-wired kernels does not apply). Fixtures only, no route change: the A1/P1 corpus case
+without its activation op, plus a seed event, a network cut, `ControlOp::DropCompletion`, or an
+F1 root carried out on B.
+
+- **M7A-85** `m7a_85_local_apply_no_ack_no_success_reply` — landed. B is cut from both copies the
+  tick before the write. "No `QualificationChanged` ever" is checked, not assumed: no accepted
+  ACK reaches seq 11 and P1's candidate never turns `qualifying`. Positive control in the same
+  function: uncut, the write publishes and replies `Success`.
+- **M7A-117** `m7a_117_generation_reconciliation_folds_previous_generation` — landed, two
+  sub-cases. Same node: gen 2 → gen 3 on B by a carried-out F1 root. Different node: B's gen-2
+  T1 is fresh and seeded from gen 1's durable entries through `retained_through` 10; L1's edge is
+  forced open with `SetAdmission` during the seed so T1's own gate is what refuses. **Caveat:** in
+  this fixture no A1 view admits while the seed is pending, so the gate is pinned by its code
+  (`PROTECTION_PAUSED`); with it removed the retry is still refused, `LEASE_EXPIRED`. The case
+  where the gate is the only barrier is `transaction_t1.rs`'s
+  `failover_loads_the_predecessors_dedup_before_admitting`. **Read as:** "this must also hold"
+  covers the retry reconciliation and the seed gate; P1's `Status` on the different node answers
+  `Expired` (generation named) and `Unknown` (none), not `RecoveredApplied`, because P1's status
+  index is not seeded — reported to the lead, not asserted.
+- **M7A-135** `m7a_135_f1_t1_p1_retention_boundary_recovered_applied_then_unknown` — landed.
+  "Retry" is read as P1's `Status` (M7A-117 names `RecoveredApplied` as the `Status` answer; a
+  mutating retry gets `GENERATION_CHANGED`). `DedupTrim` is exclusive (`below`), so a trim below 5
+  removes seq 4 (request 4, the fixture's earlier write) and keeps seq 5: request 4 turns
+  `Unknown`, seq 5 is not executed again. Not asserted, and reported: a trim **through** 5
+  (`below: 6`), or a `Submit` after `RetireGeneration{2}`, executes request 5 again in gen 3.
+- **M7A-139** `m7a_139_freeze_keeps_dispatched_inflight_resolves_unknown` — landed. The
+  `Fence{Node, Expired}` is injected between A1's `Dispatch` answer and the `BatchCompleted`,
+  stepping one event at a time: a real lapse cannot land there, because A1 answers inside its
+  `dispatch_margin`. The A-R76 note above ("stays owed") is discharged by this row.
+- **M7A-163** `m7a_163_dropped_control_operation_drains_both_consumers` — landed, with the waiter
+  code corrected in the row to `LEASE_EXPIRED` (A-R72/A-R72a). It found defect **KA-ROWS-D1**:
+  A1 declined the event that carried the expiry fence (a timer outside its block, a storage
+  completion other than `CommitFailed`), so the fence and its superseding view never left and
+  neither consumer drained. Fixed in `Authority::step`: a decline on a step whose revalidation
+  fenced now returns the fence's effects. Regression:
+  `authority_acquisition.rs`'s `expiry_fence_leaves_with_an_event_a1_has_no_row_for`.
+
+**ka-rows round 1, 2026-09-28 (after tester-ka-rows, verdict PASS_WITH_RISKS). The marker does not
+move: no contract file changed.** The lead ruled the re-execution past retention intended (spec
+§5.3, ADR 0004 §8, M7A-89). The bullets above that say "not asserted" or "caveat" are superseded
+where they conflict with this list.
+
+- **M7A-135:** the row's `DedupTrim` wording is replaced by the tester's (F2), and the row now
+  asserts it. After `RetireGeneration{2}`, `Status` without a generation answers `Unknown`. A
+  `Submit` carrying `expected_generation = 2` is refused `GENERATION_CHANGED{2, 3}` with no
+  sequence and no batch, both after the retire and after a trim through seq 5 (F8). After that
+  trim, the retry without `expected_generation` is published at gen 3 as a new request.
+- **M7A-117:** new sub-case `seed_blocked_for_ever_executes_nothing` (tester S-117g, F6). One
+  malformed `Dedup` row keeps B's seed pending for ever while its grant is open. Every `Submit` is
+  refused `PROTECTION_PAUSED{paused_after: 10}`, and gen 2 applies no batch above seq 10. With the
+  seed gate removed, gen 1's request 5 executes again at gen 2 seq 12, and this sub-case fails. The
+  different-node P1 `Status` question (tester F3) is with the lead; the row text is unchanged.
+- **M7A-139:** a second, A1-driven sub-case (F7). A persisted revocation of the served epoch is
+  queued while T1 awaits its dispatch check, so A1 answers `Admit` and then fences the partition
+  itself, `EpochRevoked`, before the `BatchCompleted`. The same list is asserted with that reason.
+- **D1 regression:** the tester's second step in
+  `expiry_fence_leaves_with_an_event_a1_has_no_row_for` (F1) is kept. It fails when the
+  `was_held` guard is dropped.

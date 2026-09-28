@@ -714,9 +714,9 @@ fn reach_every_p1_carrier_steps_and_foreign_kinds_are_refused() {
             refused.push((kind, e));
         }
     }
-    // The fence names another partition, so it is the one refusal in the accepted list.
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert_eq!(refused[0].1.kind(), ErrorKind::Unavailable);
+    // Every carrier is stepped, the fence for another partition included: it is answered
+    // `Ignored(NotOurs)` (M7A-189), no longer refused.
+    assert!(refused.is_empty(), "{refused:?}");
 
     let before = rig.view();
     for kind in [
@@ -1433,7 +1433,8 @@ fn with_no_view_held_no_answer_is_ours() {
 
 /// M7A-156 (K-A-41): A1's fence reaches P1 — at the fence, not at the deadline: waiters drained
 /// (with §3.4's code, A-R72a Q3), owed replies withheld, the partition frozen, the candidate kept
-/// with its recheck cleared. Twin: a fence for another partition is refused and touches nothing.
+/// with its recheck cleared. Twin: a fence for another partition is answered `Ignored(NotOurs)`
+/// and touches nothing (A-R84; it was refused before M7A-189).
 #[retcd_test]
 fn m7a_156_p1_freeze_drains_waiters_withholds_awaiting_replies_sets_frozen() {
     let mut rig = Rig::new();
@@ -1443,10 +1444,11 @@ fn m7a_156_p1_freeze_drains_waiters_withholds_awaiting_replies_sets_frozen() {
     rig.admitted(read(22));
 
     let before = rig.view();
-    let err = rig
-        .try_step_on(P, fence(FenceScope::Partition(P2), DenyReason::Expired))
-        .expect_err("another partition's fence");
-    assert_eq!(err.kind(), ErrorKind::Unavailable);
+    assert_eq!(
+        rig.step(fence(FenceScope::Partition(P2), DenyReason::Expired)),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)],
+        "another partition's fence is not ours (A-R84)"
+    );
     assert_eq!(rig.view(), before);
 
     assert_eq!(
@@ -5656,4 +5658,92 @@ fn a_held_identity_is_refused_as_reuse_even_at_the_cap() {
         );
     }
     assert_eq!(rig.view().waiters.len(), WAITER_CAP);
+}
+
+/// M7A-189. Lead ruling A-R84, batch C (dev-edges defect D2). A partition fence for another
+/// partition is not P1's to act on, and P1 says so as T1's `on_freeze` does: `Ignored(NotOurs)`,
+/// and nothing about this partition changes. Before the fix P1 refused it `Unavailable`, which
+/// the sim recorded as an owed decline and, once the edge left `OWED_EDGES`, stopped the run.
+/// The same answer on a partition P1 holds no kernel for: the guard creates no slot.
+#[retcd_test]
+fn m7a_189_p1_answers_another_partitions_fence_not_ours() {
+    let mut rig = Rig::new();
+    rig.published(5);
+    rig.pending_with_recheck(6);
+    rig.admitted(read(21));
+    let before = rig.view();
+
+    assert_eq!(
+        rig.try_step_on(
+            P,
+            fence(FenceScope::Partition(P2), DenyReason::EpochRevoked)
+        )
+        .expect("M7A-189: answered, not refused"),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert_eq!(rig.view(), before, "M7A-189: P's state untouched");
+
+    // Still P's own fence freezes it: the guard is the partition, not the reason.
+    let own = rig.step(fence(FenceScope::Partition(P), DenyReason::EpochRevoked));
+    assert!(
+        !own.contains(&ignored(AuthorityIgnoreReason::NotOurs)),
+        "M7A-189: P's own fence is P's: {own:?}"
+    );
+    assert!(matches!(rig.view().mode, PubMode::Frozen { .. }));
+
+    // tester-edges TP5: the same answer on a partition P1 holds no kernel for, and no slot is
+    // made for it. Stepped on P2, so a guard that ran after slot creation would leave one.
+    assert!(rig.p1.view(NODE, P2).is_none(), "fixture: no slot for P2");
+    assert_eq!(
+        rig.try_step_on(
+            P2,
+            fence(FenceScope::Partition(P), DenyReason::EpochRevoked)
+        )
+        .expect("M7A-189: answered on P2, not refused"),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert!(
+        rig.p1.view(NODE, P2).is_none(),
+        "M7A-189: no slot for P2 made"
+    );
+}
+
+/// M7A-191. Lead ruling A-R84 (dev-edges defect D3, P1 half). A view whose lineage names
+/// another partition is not adopted: `Ignored(NotOurs)`, and the view P1 holds is unchanged.
+/// Before the fix P1 adopted it silently (`ok0` in the sim trace), so `p2`'s view, delivered at
+/// `p1`, became `p1`'s authority.
+#[retcd_test]
+fn m7a_191_p1_does_not_adopt_another_partitions_view() {
+    let mut rig = Rig::new();
+    let held = rig.view().authority;
+    assert!(held.is_some(), "fixture: P holds its own view");
+
+    assert_eq!(
+        rig.try_step_on(P, view_push(P2, 9))
+            .expect("M7A-191: answered, not refused"),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert_eq!(rig.view().authority, held, "M7A-191: P's view unchanged");
+
+    // tester-edges TP2: a lower partition id is just as foreign. The guard is inequality, not
+    // order, so a view naming partition 1 at P (3) is not adopted either.
+    assert_eq!(
+        rig.try_step_on(P, view_push(PartitionId(1), 10))
+            .expect("M7A-191: answered, not refused"),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert_eq!(rig.view().authority, held, "M7A-191: P's view unchanged");
+
+    // tester-edges TP5: stepped on P2, where P1 holds no kernel, a view for P makes no slot.
+    // The earlier steps were all on P, so they could not have made one either way.
+    assert!(rig.p1.view(NODE, P2).is_none(), "fixture: no slot for P2");
+    assert_eq!(
+        rig.try_step_on(P2, view_push(P, 11))
+            .expect("M7A-191: answered on P2, not refused"),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert!(
+        rig.p1.view(NODE, P2).is_none(),
+        "M7A-191: no slot for P2 made"
+    );
 }

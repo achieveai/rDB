@@ -4731,3 +4731,49 @@ fn m7a_178_a_stale_authority_at_one_tick_is_asked_once_more_then_refused() {
         "a same-seq view does not reset the bound"
     );
 }
+
+/// M7A-190. Lead ruling A-R84 (dev-edges defect D3, T1 half). A view whose lineage names
+/// another partition is not adopted: `Ignored(NotOurs)`, as `on_freeze` answers another
+/// partition's fence, and the view T1 holds is unchanged. Before the fix `on_view` compared only
+/// `authority_seq`, so a newer view for `p2`, delivered at `p1`, became `p1`'s authority.
+#[retcd_test]
+fn m7a_190_t1_does_not_adopt_another_partitions_view() {
+    let mut h = H::live();
+    assert_eq!(
+        h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+            GEN, 1, 1_000
+        ))))),
+        vec![]
+    );
+    let held = h.k().authority().copied();
+    assert!(held.is_some(), "fixture: T1 holds its own view");
+
+    let mut foreign = view(GEN, 9, 1_000);
+    foreign.lineage.partition = PartitionId(2);
+    assert_eq!(
+        h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(
+            foreign
+        )))),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert_eq!(
+        h.k().authority().copied(),
+        held,
+        "M7A-190: T1's view unchanged"
+    );
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+
+    // tester-edges TT1: a lower partition id is just as foreign. The guard is inequality, not
+    // order, so a newer view naming partition 0 at partition 1 is not adopted either.
+    let mut lower = view(GEN, 10, 1_000);
+    lower.lineage.partition = PartitionId(0);
+    assert_eq!(
+        h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(lower)))),
+        vec![ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert_eq!(
+        h.k().authority().copied(),
+        held,
+        "M7A-190: T1's view unchanged"
+    );
+}

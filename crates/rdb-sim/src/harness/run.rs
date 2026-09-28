@@ -59,10 +59,10 @@
 //! hold's start or barrier moved (see [`crate::harness::protection`]).
 //!
 //! A routed event is offered to its consumers first, in [`route::offer_order`], so a
-//! configuration change reaches L1 and P1 before R1. A consumer that declines on an edge in
+//! configuration change reaches L1 before R1. A consumer that declines on an edge in
 //! [`route::OWED_EDGES`] is recorded as [`DispatchOutcome::DeclinedOwed`] and the run goes on
-//! (A-R62); one that declines on any other named edge stops the run under
-//! `harness::run::route`, because the fact would otherwise be lost.
+//! (A-R62); the table is empty since 2026-09-28 (A-R82..A-R84), so a decline on any named edge
+//! stops the run under `harness::run::route`, because the fact would otherwise be lost.
 //!
 //! A storage completion the dispatcher marks as addressed — `SnapshotReady` for a handle one
 //! module minted — is offered to that module only (A-R69a), and its decline stops the run under
@@ -82,8 +82,9 @@
 //! * ~~**No wired module can produce a refused effect.**~~ Closed 2026-09-22, and its successor
 //!   — A1's `Answer`, `Fence`, `PublishAuthorityView` and `FenceProven` refused under
 //!   `harness::dispatch::deliver::kernel` — closed 2026-09-26 when those four started being
-//!   routed to their consumers. An A1 run that installs a view now runs on to a limit, with T1's
-//!   and P1's answers or owed declines recorded, and R1's answer (B-R53).
+//!   routed to their consumers. An A1 run that installs a view now runs on to a limit, with R1's
+//!   (B-R53), T1's and P1's answers recorded. Since 2026-09-28 no edge is owed, so a named
+//!   consumer's decline stops the run as `Refused` instead of being recorded as `DeclinedOwed`.
 //! * **The snapshot is empty for four of the six.** [`StepCtx::snapshot`] is
 //!   [`crate::storage::snapshot::EmptySnapshot`] for A1, R1, L1 and F1. T1 and P1 get the
 //!   stepping node's applied view instead (coordinator, 2026-09-26; see
@@ -1338,9 +1339,9 @@ mod tests {
     /// Where a `served_plan` acquisition goes since lead ruling A-R63: A1's install view is
     /// routed as `AuthorityEvent::View` to R1, T1 and P1, in that order, and the run goes on. R1
     /// answers it, installed or not (B-R53; until then it declined on an owed edge); T1 answers it
-    /// (A-R68); P1 answers it or declines on its owed edge, whichever its package has reached, so
-    /// this helper does not assert P1. Until 2026-09-26 the dispatcher refused the view under the
-    /// `kernel` seam (A-R49) and these rows stopped there.
+    /// (A-R68); P1 answers it too, and since its edge left `OWED_EDGES` (2026-09-28) a decline by
+    /// it would stop the run, which the `refusal` check covers. Until 2026-09-26 the dispatcher
+    /// refused the view under the `kernel` seam (A-R49) and these rows stopped there.
     fn assert_the_install_view_reached_its_consumers(
         trace: &rdb_core::contracts::trace::Trace,
         stop: &StopReason,

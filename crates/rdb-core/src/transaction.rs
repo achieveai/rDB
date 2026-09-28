@@ -1140,6 +1140,11 @@ impl TxnKernel {
     }
 
     fn on_view(&mut self, view: AuthorityView) -> Vec<TxnEffect> {
+        // Another partition's view is not this kernel's authority (lead ruling A-R84), exactly as
+        // another partition's fence is not its freeze.
+        if view.lineage.partition != self.lineage.partition {
+            return vec![ignored(AuthorityIgnoreReason::NotOurs)];
+        }
         if self
             .authority
             .is_some_and(|held| view.authority_seq < held.authority_seq)
@@ -1570,10 +1575,10 @@ impl Module for Transaction {
 
     fn capability(&self) -> CapabilityState {
         // Deliberately still `Unavailable`, as A1 is, pending a lead ruling. Every §3.3 row runs
-        // behind `step`, but a transaction is applied only when the harness carries this
-        // module's `AuthorityCheck` to A1 and its `AppliedCandidate` to R1 and P1, and the sim
-        // dispatcher refuses both today. Advertising `Wired` before that would let a green
-        // campaign that never applied a transaction read as coverage.
+        // behind `step`, and the sim dispatcher now carries this module's `AuthorityCheck` to A1
+        // and its `AppliedCandidate` to P1 (A-R65), with no T1 edge owed (A-R82..A-R84).
+        // Advertising `Wired` is the lead's call: it would let a campaign's green read as
+        // coverage of applied transactions.
         CapabilityState::Unavailable
     }
 

@@ -1091,8 +1091,26 @@ impl Authority {
     }
 
     /// Wrap one of kernel-a's own facts on its arm of [`KernelEffect`] (lead ruling A-R25).
+    ///
+    /// Sited at the partition it concerns (`Effect.partition`; lead ruling A-R84): a view at its
+    /// lineage's partition and a partition fence at the fenced partition, because the host
+    /// delivers each to that partition's T1 and P1. A1 emits both for partitions other than the
+    /// one it stepped (an install serving several, a revocation of another). Everything else
+    /// stays at the event's partition: a node fence has no one partition, and a fact or an
+    /// answer goes back where it was asked.
     fn authority(event: &Event, kind: AuthorityEffect) -> Effect {
-        Self::effect(event, EffectKind::Kernel(KernelEffect::Authority(kind)))
+        let partition = match &kind {
+            AuthorityEffect::Fence {
+                scope: FenceScope::Partition(partition),
+                ..
+            } => *partition,
+            AuthorityEffect::PublishAuthorityView(view) => view.lineage.partition,
+            _ => event.partition,
+        };
+        Self::about(
+            Self::effect(event, EffectKind::Kernel(KernelEffect::Authority(kind))),
+            partition,
+        )
     }
 
     /// "Handled, and deliberately did nothing", in kernel-a's own vocabulary.
@@ -3563,7 +3581,9 @@ impl Module for Authority {
         // over must fence before whatever else arrived on the same step is acted on. This is why
         // any event at all drives the expiry rows, and why a grant is never more than one step
         // past its expiry — see `revalidate`.
+        let was_held = self.state.is_held();
         let mut effects = self.revalidate(ctx, event);
+        let fenced_here = was_held && self.state.is_fenced();
         let routed = match &event.kind {
             EventKind::Control(control) => self.on_control(ctx, event, control),
             EventKind::Timer(fired) => self.on_timer(ctx, event, *fired),
@@ -3579,7 +3599,17 @@ impl Module for Authority {
             // `supported` has already refused every remaining kind.
             _ => Ok(Vec::new()),
         };
-        effects.extend(routed?);
+        match routed {
+            Ok(routed) => effects.extend(routed),
+            // A kind A1 takes at the door but has no row for (a storage completion other than
+            // `CommitFailed`, a timer outside its block), on a step whose judgement above fenced —
+            // any node fence `revalidate` decides, expiry or `ClockUnbounded`.
+            // The state is already `Fenced`, so the fence and its superseding views leave with
+            // this step; declining would drop them and no consumer would ever hear of the fence
+            // (defect KA-ROWS-D1). Nothing else changes: any other decline is still a decline.
+            Err(RdbError::Unavailable { .. }) if fenced_here => return Ok(effects),
+            Err(declined) => return Err(declined),
+        }
         // The takeover sweep is the last thing a step does (`design.md` §2.6a T8). Not reached on
         // an `Err`: a proof recorded in state but never emitted would make at-most-once zero.
         let proofs = self.sweep(ctx, event);

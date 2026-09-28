@@ -1018,6 +1018,61 @@ fn a1p1_case_without_its_activation_publishes_through_a1() {
     assert_eq!(logged, labels, "the log holds the chain the trace does");
 }
 
+/// M7A-193. Lead ruling A-R83 (dev-edges, batch B). The A1/P1 case without its activation runs
+/// its whole publish chain, a dispatch answer and a publish, with the answer arm split by
+/// checkpoint: no decline stops the run and the client gets its one `Success`. Every answer is
+/// still offered to all six modules; which one is its named consumer (`StorageDispatch` T1's,
+/// the rest P1's) is pinned by the route unit test `an_answer_is_for_the_module_that_asked`, not
+/// here. Zero `DeclinedOwed` holds structurally while `OWED_EDGES` is empty. Before
+/// the split, T1 was a named consumer of P1's answers and declined both (two `DeclinedOwed`
+/// pops); with the owed table emptied and the arm not split, that decline stops the run.
+#[retcd_test]
+fn m7a_193_a_publish_runs_through_the_split_answer_arm_with_nothing_owed() {
+    use rdb_core::contracts::trace::{ClientOutcome, DispatchOutcome};
+    support::preamble();
+    let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+    scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    let run = scenario_run::run(&scenario).expect("the case lowers whole without its activation");
+
+    let owed = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::ModuleDispatch {
+                    outcome: DispatchOutcome::DeclinedOwed,
+                    ..
+                }
+            )
+        })
+        .count();
+    let successes = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::ClientOutcomeReported {
+                    outcome: ClientOutcome::Success,
+                    ..
+                }
+            )
+        })
+        .count();
+    tracing::info!(stop = ?run.report.stop, owed, successes, "m7a_193 run");
+    assert!(
+        matches!(run.report.stop, StopReason::DeadlineReached { deadline, .. }
+            if deadline.0 == cases::A1_P1_MAX_TICKS),
+        "M7A-193: no named consumer declined an answer: {:?}",
+        run.report.stop
+    );
+    assert_eq!(owed, 0, "M7A-193: nothing is owed");
+    assert_eq!(successes, 1, "M7A-193: the write published and replied");
+}
+
 /// M7V-47, the F1/T1/P1 and F1/T1 cases: they wait on T1 (lead ruling A-R73).
 #[retcd_test]
 fn m7v_47_cases_f1_t1_wait_on_t1() {

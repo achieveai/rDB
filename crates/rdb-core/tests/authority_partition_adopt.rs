@@ -3986,3 +3986,89 @@ fn m7a_187_a_restore_reaching_a_held_kernel_fences_only_its_served_epoch_and_pro
     );
     assert_no_view_outruns_may_admit(&kernel, &effects, 4);
 }
+
+/// M7A-188. Lead ruling A-R84 (dev-edges defect D1). An effect is sited at the partition it
+/// concerns (`Effect.partition`): A1's view of `p2`, and its fence of `p2`, are delivered to
+/// `(node, p2)` even when the event A1 stepped was `p1`'s. Before the fix every A1 effect took
+/// `event.partition`, so the install stepped on `p1` handed `p2`'s view to `p1`'s T1 and P1, and a
+/// revocation of `p2` fenced `p1`'s consumers with `p2`'s fence. What the fence **is not**: a
+/// node fence stays at the event's partition, and a fact is not a delivery and stays there too.
+#[retcd_test]
+fn m7a_188_a1_sites_a_view_and_a_partition_fence_at_their_partition() {
+    let sited = |effects: &[Effect]| -> Vec<(PartitionId, Shape)> {
+        effects
+            .iter()
+            .map(|effect| {
+                let shape = shapes(std::slice::from_ref(effect)).remove(0);
+                (effect.partition, shape)
+            })
+            .collect()
+    };
+
+    // The install is stepped on p1 and serves p1 and p2: each view lands at its own partition.
+    let (mut kernel, install) = serving_p1_p2();
+    let views: Vec<(PartitionId, Shape)> = sited(&install)
+        .into_iter()
+        .filter(|(_, shape)| matches!(shape, Shape::Publish(_)))
+        .collect();
+    assert_eq!(
+        views,
+        vec![(P1, Shape::Publish(P1)), (P2, Shape::Publish(P2))],
+        "M7A-188: each install view at its own partition: {install:?}"
+    );
+
+    // p2's epoch revocation, persisted on an event of p1: the fence and p2's past view at p2.
+    let revoked = kernel
+        .step(&ctx(3), &revocation_persisted(3, P2, 1))
+        .expect("the epoch-revocation fence");
+    let fence_and_view: Vec<(PartitionId, Shape)> = sited(&revoked)
+        .into_iter()
+        .filter(|(_, shape)| matches!(shape, Shape::Fence(_) | Shape::Publish(_)))
+        .collect();
+    assert_eq!(
+        fence_and_view,
+        vec![
+            (P2, Shape::Fence(DenyReason::EpochRevoked)),
+            (P2, Shape::Publish(P2)),
+        ],
+        "M7A-188: p2's fence and its past view at p2, not at p1: {revoked:?}"
+    );
+    assert_eq!(
+        fences(&revoked),
+        vec![(FenceScope::Partition(P2), DenyReason::EpochRevoked)]
+    );
+    for effect in &revoked {
+        if let EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Fact(_))) = effect.kind {
+            assert_eq!(
+                effect.partition, P1,
+                "M7A-188: a fact stays where it was stepped"
+            );
+        }
+    }
+
+    // A node fence ends admission on every partition: the fence stays at the event's partition,
+    // and each served partition's past view lands at its own.
+    let (mut kernel, _) = serving_p1_p2();
+    let rebooted = kernel
+        .step(
+            &ctx(2),
+            &event_of(
+                9,
+                EventKind::Node(NodeLifecycle::Rebooted { boot: BootId(2) }),
+            ),
+        )
+        .expect("the node-fence row is built");
+    let fence_and_views: Vec<(PartitionId, Shape)> = sited(&rebooted)
+        .into_iter()
+        .filter(|(_, shape)| matches!(shape, Shape::Fence(_) | Shape::Publish(_)))
+        .collect();
+    assert_eq!(
+        fence_and_views,
+        vec![
+            (P1, Shape::Fence(DenyReason::BootMismatch)),
+            (P1, Shape::Publish(P1)),
+            (P2, Shape::Publish(P2)),
+        ],
+        "M7A-188: a node fence at the event's partition, each past view at its own: {rebooted:?}"
+    );
+}
