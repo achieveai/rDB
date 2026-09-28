@@ -670,7 +670,9 @@ impl Runner {
     ///
     /// One iteration is: decide whether to stop, pop, offer the event to all six modules in
     /// [`ModuleName::ALL`] order, carry out each module's effects as they come back, and record
-    /// every control interaction the store declared while doing so.
+    /// every control interaction the store declared while doing so. An event for a node that is
+    /// down, or naming a boot other than its node's current one, is popped and dropped instead
+    /// of offered ([`Dispatcher::drop_if_dead`]); it counts as consumed.
     ///
     /// The three bounds are checked **before** the pop, so a run that stops on one leaves the
     /// event it did not run in the queue and a caller can see what it would have been.
@@ -775,6 +777,23 @@ impl Runner {
             };
             report.events_consumed += 1;
             report.last_tick = self.scheduler.now();
+            // A crash kills the process and everything it owned: an event for a node that is
+            // down, or for a boot it is not running (V-R36), reaches no module. Dropped and kept
+            // on the dispatcher, never an error (G5, F-D; `Dispatcher::drop_if_dead`).
+            if let Some(reason) = self.dispatcher.drop_if_dead(&event) {
+                self.dispatcher.take_routed(event.id);
+                self.dispatcher.take_addressed(event.id);
+                tracing::info!(
+                    tick = self.scheduler.now().0,
+                    node = event.node.0,
+                    boot = event.boot.0,
+                    event = event.id.0,
+                    ?reason,
+                    "runner drop: addressed to a dead process"
+                );
+                self.record_interactions(&event)?;
+                continue;
+            }
             // One line per pop, naming its kind: the trace's `ModuleDispatch` records carry the
             // node and tick but not the event, so a rate row that must be derived by pop kind
             // (M7V-47, ruling V-R31) is listed from this line. Debug, so off unless asked for:
@@ -1639,6 +1658,8 @@ mod tests {
     #[test]
     fn a_fire_carries_the_arms_version_partition_and_correlation() {
         let mut runner = Runner::new(&plan(Vec::new())).expect("a runner");
+        // Registered under the boot it delivers under: only `restart` gives a node a boot.
+        runner.dispatcher_mut().register_node(NODE, BOOT);
         runner
             .carry_out(
                 NODE,

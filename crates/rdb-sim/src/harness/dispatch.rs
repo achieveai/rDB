@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use rdb_core::contracts::authority::{AuthorityEffect, AuthorityEvent, FenceCredential, Lineage};
+use rdb_core::contracts::control::WatchTermination;
 use rdb_core::contracts::errors::RdbError;
 use rdb_core::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, ModuleName,
@@ -72,7 +73,7 @@ use crate::harness::semantic;
 use crate::harness::trace::Site;
 use crate::harness::transfer::{Step, Transfer, TransferPlan};
 use crate::sim::clock::Clock;
-use crate::sim::control::ControlStore;
+use crate::sim::control::{ControlOp, ControlStore};
 use crate::sim::network::{Fate, LinkState, Network, NetworkOp};
 use crate::sim::scheduler::Scheduler;
 use crate::storage::crash_image::CrashImage;
@@ -128,6 +129,65 @@ pub struct Adopted {
     pub owner_epoch: OwnerEpoch,
     /// The membership pin in force.
     pub config_version: ConfigVersion,
+}
+
+/// Why something addressed to a node was dropped rather than handed to its modules (lead ruling
+/// on restart fidelity, 2026-09-28: a crash kills the process and everything it owned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// The node is down: it crashed and has not restarted. No process runs there to hear it.
+    NodeDown,
+    /// It names a boot older than the node's current one: it was meant for a process that died.
+    StaleBoot {
+        /// The boot the node runs under now.
+        current: BootId,
+    },
+    /// It names a boot newer than the node's current one. A boot changes only by
+    /// [`Dispatcher::restart`] (V-R36), so no process ever ran under it on this node.
+    UnknownBoot {
+        /// The boot the node runs under now.
+        current: BootId,
+    },
+}
+
+impl DropReason {
+    /// Why an event or effects naming `boot` do not belong to a node running under `current`,
+    /// or `None` when they do.
+    fn for_boot(boot: BootId, current: BootId) -> Option<Self> {
+        match boot.cmp(&current) {
+            std::cmp::Ordering::Less => Some(Self::StaleBoot { current }),
+            std::cmp::Ordering::Greater => Some(Self::UnknownBoot { current }),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
+/// One thing a dead process would have received or sent, dropped and kept for a row to read.
+///
+/// Not a trace line: [`TraceKind`] has no kind for it, and the trace vocabulary is contract.
+/// Kept here the way [`crate::sim::network::Network`] keeps a dropped frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dropped {
+    /// An event the run loop popped and did not offer to any module
+    /// ([`Dispatcher::drop_if_dead`]).
+    Event {
+        /// The event, as it was queued.
+        event: Event,
+        /// Why.
+        reason: DropReason,
+    },
+    /// Effects handed to [`Dispatcher::deliver`] that no live process of the node emitted:
+    /// under a boot other than its current one, or while it is down. None was carried out.
+    Effects {
+        /// The node they were handed for.
+        node: NodeId,
+        /// The boot they were handed under.
+        boot: BootId,
+        /// Why.
+        reason: DropReason,
+        /// The effects, as handed.
+        effects: Vec<Effect>,
+    },
 }
 
 /// The six kernel modules, in a fixed order, plus what they have declared.
@@ -233,8 +293,13 @@ pub struct Dispatcher {
     next_frame: u32,
     /// The last [`EffectKind::AdoptAuthority`] per `(node, partition)`. Zero before the first.
     adopted: BTreeMap<(NodeId, PartitionId), Adopted>,
-    /// Each node's current boot, as last seen on [`Dispatcher::deliver`].
-    boots: BTreeMap<NodeId, BootId>,
+    /// Nodes whose crash was taken and whose control-store watches are not yet ended.
+    /// [`Self::crash_check`], the one place a crash is taken, adds the node; [`Self::pump`], the
+    /// one place control completions are scheduled, ends its watches and removes it (F-E, D2).
+    watches_owed: BTreeSet<NodeId>,
+    /// Everything dropped because it was addressed to, or came from, a dead process, in the
+    /// order it was dropped ([`DropReason`]).
+    dropped: Vec<Dropped>,
     /// The partition and correlation the live arm of each `(node, timer)` was emitted under.
     ///
     /// [`Clock`] keys a timer by `(node, id)` and nothing else, which is all the supersede and
@@ -314,7 +379,8 @@ impl Dispatcher {
             member_watches: true,
             next_frame: 1,
             adopted: BTreeMap::new(),
-            boots: BTreeMap::new(),
+            watches_owed: BTreeSet::new(),
+            dropped: Vec::new(),
             timer_sites: BTreeMap::new(),
             replies: Vec::new(),
             notes: Vec::new(),
@@ -506,14 +572,57 @@ impl Dispatcher {
         self.engines.get(&node)
     }
 
-    /// The boot `node` runs under: the one last delivered to it, else the one it was registered
-    /// with. `None` for a node the run never registered.
+    /// The boot `node` runs under: the one it was registered with, or the one it last restarted
+    /// under. Only [`Self::restart`] changes it (V-R36). `None` for a node the run never
+    /// registered.
     #[must_use]
     pub fn boot(&self, node: NodeId) -> Option<BootId> {
-        self.boots
-            .get(&node)
-            .or_else(|| self.members.get(&node))
-            .copied()
+        self.members.get(&node).copied()
+    }
+
+    /// Whether `node` is down: a planned crash was taken there and it has not restarted.
+    #[must_use]
+    pub fn is_down(&self, node: NodeId) -> bool {
+        self.crashes.contains_key(&node)
+    }
+
+    /// Whether the run loop must drop `event` instead of offering it to any module, and why.
+    /// A drop is recorded ([`Self::dropped`]); it is not an error and it stops nothing.
+    ///
+    /// A crash kills the process and everything it owned (lead ruling on restart fidelity,
+    /// 2026-09-28), and a node's boot changes only by [`Self::restart`] (V-R36). So three kinds
+    /// of event reach no module:
+    /// * **Any event for a node that is down** ([`DropReason::NodeDown`], tester G5). No process
+    ///   runs there. Its old timers, frames sent to it and control answers for it fall here.
+    /// * **An event naming a boot older than the node's current one**
+    ///   ([`DropReason::StaleBoot`], V-R35 open item (c), F-D). It was queued for the process
+    ///   that died, and the fresh one must not take it for its own: its timer versions and
+    ///   control request ids restart from the same counters, so a stale fire or answer can
+    ///   carry exactly what a fresh arm or request expects (F-G).
+    /// * **An event naming a boot newer than the node's current one**
+    ///   ([`DropReason::UnknownBoot`], tester D1). No process of that boot ever ran there. A
+    ///   scenario that means a node to run under another boot registers it under that boot.
+    ///
+    /// A seed is an event like any other here: one naming a boot the node is not running is
+    /// dropped and counted (tester D6), not refused.
+    pub fn drop_if_dead(&mut self, event: &Event) -> Option<DropReason> {
+        let reason = if self.is_down(event.node) {
+            DropReason::NodeDown
+        } else {
+            DropReason::for_boot(event.boot, self.boot(event.node)?)?
+        };
+        self.dropped.push(Dropped::Event {
+            event: event.clone(),
+            reason,
+        });
+        Some(reason)
+    }
+
+    /// Everything dropped so far because a dead process would have received or sent it, in the
+    /// order it was dropped.
+    #[must_use]
+    pub fn dropped(&self) -> &[Dropped] {
+        &self.dropped
     }
 
     /// What a planned crash left of `node`'s storage, if one fired.
@@ -618,15 +727,25 @@ impl Dispatcher {
     ///
     /// # Errors
     ///
-    /// [`SimError::Config`] naming `restart` when `node` has not crashed.
+    /// [`SimError::Config`] naming `restart` when `node` has not crashed; naming `restart_boot`
+    /// when `boot` is not strictly newer than the node's current one (tester D3). The same or an
+    /// older boot would make the dead process's queued events look current again. Either way
+    /// nothing changes and the node stays down.
     pub fn restart(&mut self, node: NodeId, boot: BootId) -> Result<(), SimError> {
+        if !self.is_down(node) {
+            return Err(SimError::Config { field: "restart" });
+        }
+        if self.boot(node).is_some_and(|current| boot <= current) {
+            return Err(SimError::Config {
+                field: "restart_boot",
+            });
+        }
         let image = self
             .crashes
             .remove(&node)
             .ok_or(SimError::Config { field: "restart" })?;
         self.engines.insert(node, image.reopen(node));
         self.members.insert(node, boot);
-        self.boots.insert(node, boot);
         self.rebuild_kernels(node);
         self.reread_roots(node);
         // The control root is durable: a member that was down when its watch fired hears it now.
@@ -724,12 +843,15 @@ impl Dispatcher {
     /// Take a planned crash on `node`, if one is due, and refuse the effect that met it. A
     /// crashed node stays down until [`Self::restart`]: every later storage effect on it is
     /// refused under the same seam. A crash drops every read view the node held, as a real
-    /// engine loses its snapshots with the process (A-R69a).
+    /// engine loses its snapshots with the process (A-R69a), and its control-store watches end
+    /// with it: this is the one place a crash is taken, so it owes them here, whichever node's
+    /// delivery tripped it, and the next [`Self::pump`] ends them (F-E, tester D2).
     fn crash_check(&mut self, node: NodeId) -> Result<(), SimError> {
         if let Some(fault) = self.engine_mut(node).take_crash() {
             let image = CrashImage::of(self.engine_mut(node), fault)?;
             self.crashes.insert(node, image);
             self.snapshots.retain(|(holder, _), _| *holder != node);
+            self.watches_owed.insert(node);
         }
         if self.crashes.contains_key(&node) {
             return Err(SimError::unavailable("harness::dispatch::deliver::crash"));
@@ -1019,6 +1141,13 @@ impl Dispatcher {
     /// (ruling B-R23). Nothing is ever dropped silently (kernel-b ruling B-R28): an effect is
     /// carried out, kept for the trace, or refused by name.
     ///
+    /// Only the node's current process has output. Effects handed under any other boot, older
+    /// (a dead process's, F-D) or newer (no process's, tester D1), are not carried out: they
+    /// are kept in [`Self::dropped`], and the node's boot does not move; only
+    /// [`Self::restart`] moves it (V-R36). Effects for a node that is down are not carried out
+    /// either ([`Self::deliver_while_down`], tester D4). A planned crash any effect takes, on
+    /// this node or another, ends that node's control-store watches (F-E, tester D2).
+    ///
     /// * [`EffectKind::AdoptAuthority`] is absorbed: the triple is stored for its partition and
     ///   nothing is scheduled, because it asks the environment for nothing.
     /// * [`EffectKind::Control`] is handed to the store, and every completion the store then
@@ -1076,7 +1205,75 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        self.boots.insert(node, boot);
+        if self.is_down(node) {
+            return self.deliver_while_down(node, boot, effects);
+        }
+        // Only the node's current process has output: a boot changes only by `restart` (V-R36),
+        // so effects under an older boot are a dead process's (F-D) and under a newer one are no
+        // process's (tester D1). Neither is carried out, and the node's boot does not move.
+        if let Some(reason) = self
+            .boot(node)
+            .and_then(|current| DropReason::for_boot(boot, current))
+        {
+            self.dropped.push(Dropped::Effects {
+                node,
+                boot,
+                reason,
+                effects,
+            });
+            return Ok(());
+        }
+        match self.deliver_effects(node, boot, effects, control, scheduler) {
+            Ok(()) => self.pump(control, scheduler),
+            Err(refused) => {
+                // A crash this delivery took, on this node or another, owes that node's
+                // watches; `pump` ends them (F-E).
+                if !self.watches_owed.is_empty() {
+                    self.pump(control, scheduler)?;
+                }
+                Err(refused)
+            }
+        }
+    }
+
+    /// [`Self::deliver`] for a node that is down (rule 1, tester D4). No process runs there, so
+    /// nothing is carried out. Every effect but storage (timers, sends, control, kernel,
+    /// replies, adoptions) is dropped as [`DropReason::NodeDown`] and recorded. A storage effect
+    /// is refused at the crash seam, as every storage effect on a down node is until
+    /// [`Self::restart`].
+    fn deliver_while_down(
+        &mut self,
+        node: NodeId,
+        boot: BootId,
+        effects: Vec<Effect>,
+    ) -> Result<(), SimError> {
+        let (storage, dropped): (Vec<Effect>, Vec<Effect>) = effects
+            .into_iter()
+            .partition(|effect| matches!(effect.kind, EffectKind::Store(_)));
+        if !dropped.is_empty() {
+            self.dropped.push(Dropped::Effects {
+                node,
+                boot,
+                reason: DropReason::NodeDown,
+                effects: dropped,
+            });
+        }
+        if storage.is_empty() {
+            Ok(())
+        } else {
+            Err(SimError::unavailable("harness::dispatch::deliver::crash"))
+        }
+    }
+
+    /// [`Self::deliver`]'s loop over `effects`, stopping at the first refusal.
+    fn deliver_effects(
+        &mut self,
+        node: NodeId,
+        boot: BootId,
+        effects: Vec<Effect>,
+        control: &mut ControlStore,
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
         for effect in effects {
             let site = (node, effect.partition, effect.correlation);
             match &effect.kind {
@@ -1119,7 +1316,7 @@ impl Dispatcher {
                 }
             }
         }
-        self.pump(control, scheduler)
+        Ok(())
     }
 
     /// One [`EffectKind::Send`]: through the network, and every arrival onto the queue.
@@ -1316,7 +1513,7 @@ impl Dispatcher {
         (node, correlation): (NodeId, CorrelationId),
         lines: impl IntoIterator<Item = (PartitionId, TraceKind)>,
     ) {
-        let boot = self.boots.get(&node).copied().unwrap_or(BootId(0));
+        let boot = self.boot(node).unwrap_or(BootId(0));
         for (partition, line) in lines {
             let site = Site {
                 at,
@@ -1637,7 +1834,7 @@ impl Dispatcher {
         site: (NodeId, PartitionId, CorrelationId),
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        let boot = self.boots.get(&node).copied().unwrap_or_default();
+        let boot = self.boot(node).unwrap_or_default();
         let frame = Frame {
             id: rdb_core::contracts::ids::MessageId(self.next_frame),
             protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
@@ -1758,8 +1955,7 @@ impl Dispatcher {
                 "harness::dispatch::deliver::recovery",
             ));
         };
-        // Under the holder's registered boot: a source may have delivered nothing yet, so
-        // `boots` may have no entry for it (as for the members' `Recovered` fan-out).
+        // Under the holder's current boot ([`Self::boot`]), which only `restart` changes.
         let boot = *self
             .members
             .get(&holder)
@@ -1963,8 +2159,8 @@ impl Dispatcher {
                     watch.result.selected.cutoff_seq,
                 )?;
             }
-            // Under the member's registered boot: it has delivered nothing yet, so `boots` has
-            // no entry for it. A pinned member the cluster never registered is a scenario fault.
+            // Under the member's current boot ([`Self::boot`]), which only `restart` changes. A
+            // pinned member the cluster never registered is a scenario fault.
             let boot = *self
                 .members
                 .get(&watch.member)
@@ -2223,7 +2419,7 @@ impl Dispatcher {
         }
     }
 
-    /// Schedule `kind` at `at` on the site's node, under that node's last seen boot.
+    /// Schedule `kind` at `at` on the site's node, under its current boot ([`Self::boot`]).
     fn schedule(
         &self,
         scheduler: &mut Scheduler,
@@ -2231,7 +2427,7 @@ impl Dispatcher {
         (node, partition, correlation): (NodeId, PartitionId, CorrelationId),
         kind: EventKind,
     ) -> Result<EventId, SimError> {
-        let boot = self.boots.get(&node).copied().unwrap_or_default();
+        let boot = self.boot(node).unwrap_or_default();
         Self::schedule_on(scheduler, at, node, boot, partition, correlation, kind)
     }
 
@@ -2270,12 +2466,21 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
+        // First end the watches of every node whose crash was taken since the last pump, so
+        // their terminations go out with this batch (F-E, tester D2). Through the store's own
+        // per-node ending with `Unavailable`, "the node stopped": the store declares the end as
+        // it declares any other, a `ControlInteraction`, and the termination, addressed to the
+        // dead process, is dropped by the run loop.
+        for node in std::mem::take(&mut self.watches_owed) {
+            if control.open_watches(node) > 0 {
+                control.inject(ControlOp::TerminateWatch {
+                    node,
+                    termination: WatchTermination::Unavailable,
+                })?;
+            }
+        }
         for completion in control.complete(scheduler.now()) {
-            let boot = self
-                .boots
-                .get(&completion.node)
-                .copied()
-                .unwrap_or_default();
+            let boot = self.boot(completion.node).unwrap_or_default();
             let id = scheduler.next_event_id();
             scheduler.schedule(Event {
                 id,
@@ -2319,7 +2524,7 @@ impl Dispatcher {
         let due = self.clock.due(now);
         let fired = due.len();
         for (node, fire) in due {
-            let boot = self.boots.get(&node).copied().unwrap_or_default();
+            let boot = self.boot(node).unwrap_or_default();
             let (partition, correlation) = self
                 .timer_sites
                 .remove(&(node, fire.id))
@@ -2338,7 +2543,7 @@ impl Dispatcher {
         let health = self.protection.take_due(now);
         let evaluated = health.len();
         for (node, partition, due) in health {
-            let boot = self.boots.get(&node).copied().unwrap_or_default();
+            let boot = self.boot(node).unwrap_or_default();
             let id = scheduler.next_event_id();
             scheduler.schedule(Event {
                 id,
@@ -2569,6 +2774,8 @@ mod tests {
     #[test]
     fn a_fire_carries_the_arms_payload_and_the_arms_site() {
         let mut dispatcher = Dispatcher::new();
+        // Registered under the boot it delivers under: only `restart` gives a node a boot.
+        dispatcher.register_node(NODE, BootId(3));
         let mut control = ControlStore::new();
         let mut scheduler = Scheduler::new();
         dispatcher

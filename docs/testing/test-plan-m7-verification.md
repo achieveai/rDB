@@ -32,8 +32,11 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 > Later additions, in id order: `M7V-92` (V-R25), `M7V-93..M7V-95` (L-R177gf), and
 > `M7V-96..M7V-101` (recorder truth, tester-sim-hooks F1, 2026-09-27; §5 after `M7V-95`), and
 > `M7V-102..M7V-108` (restart rebuild, V-R35, 2026-09-27; §5 after `M7V-101`), and `M7V-109..M7V-113`
-> (restart revocations and the grant service, L-R178e, 2026-09-28; §5 after `M7V-108`). The
-> next free id is the one after `M7V-113` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
+> (restart revocations and the grant service, L-R178e, 2026-09-28; §5 after `M7V-108`), and
+> `M7V-114..M7V-124` (sim fidelity: a crash kills the process, lead ruling 2026-09-28, and its
+> correction round 1 under V-R36; §5 after
+> `M7V-113`). The
+> next free id is the one after `M7V-124` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
 > `VA-1..VA-9` — a separate series from rEtcd's `TA-NN`, because the harness surfaces are in
 > different crates.
 
@@ -57,7 +60,7 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 | Grammar, generator, reducer rows M7V-20..M7V-23, M7V-42..M7V-51, M7V-83, M7V-84, M7V-86, M7V-88 | `crates/rdb-sim/tests/scenarios.rs` |
 | Recorded-run rows M7V-80, M7V-92, M7V-96..M7V-101 (the spine and rebuild plans live here) | `crates/rdb-sim/tests/dispatch.rs` |
 | Host cadence and runner rows M7V-93..M7V-95 | `crates/rdb-sim/tests/host_cadence.rs` |
-| Restart rebuild rows M7V-102..M7V-108 (V-R35), restart revocations and grant service M7V-109..M7V-113 (L-R178e) | `crates/rdb-sim/tests/restart.rs` |
+| Restart rebuild rows M7V-102..M7V-108 (V-R35), restart revocations and grant service M7V-109..M7V-113 (L-R178e), sim fidelity M7V-114..M7V-124 (lead ruling 2026-09-28, V-R36) | `crates/rdb-sim/tests/restart.rs` |
 | Scenario implementation | `crates/rdb-sim/tests/support/scenarios/{mod,grammar,gen,reduce,coverage,mutate}.rs` |
 | Campaign, mutation, evidence rows M7V-52..M7V-77, M7V-78, M7V-82, M7V-87, M7V-89 | `crates/rdb-sim/tests/campaign.rs`, `tests/campaign/{corpus,report,regressions}.rs` |
 | Fixtures | `crates/rdb-sim/tests/fixtures/scenarios/*.json`, `tests/fixtures/regressions/*.json` |
@@ -282,7 +285,7 @@ Rules that follow:
 | Class | Meaning | Per-row budget | Rows (counted from the tables, critic T-17) |
 |---|---|---|---|
 | **unit** | hand-built trace, plain data or a source-level check; no runner, no kernel | **< 100 ms** | **58**: M7V-01..M7V-19, M7V-24..M7V-46, M7V-49, M7V-56, M7V-57, M7V-59, M7V-66..M7V-68, M7V-71, M7V-74, M7V-77, M7V-79, M7V-81..M7V-85; **+ M7V-99** (recorder truth, 2026-09-27; not in the 89-row count) |
-| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) **+ M7V-109..M7V-113** (L-R178e, 2026-09-28; likewise not in it) |
+| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) **+ M7V-109..M7V-113** (L-R178e, 2026-09-28; likewise not in it) **+ M7V-114..M7V-124** (sim fidelity, lead ruling 2026-09-28 and V-R36; likewise not in it) |
 | **campaign** | the seed loop | one shared default corpus **< 60 s** at `SPIKE_SEEDS=64`; aggregate below | **19**: M7V-51..M7V-55, M7V-58, M7V-60..M7V-65, M7V-72, M7V-73, M7V-75, M7V-76, M7V-78, M7V-87, M7V-89 |
 
 **Aggregate budget for `--test campaign` at default scale (critic T-11).** The class budget is per
@@ -567,6 +570,17 @@ cites them for V8's timing half and asserts neither half alone is V8.
 | M7V-111 | `m7v_111_the_service_never_clears_a_frozen_grant` | option A guard 1: a frozen record is the takeover's | as M7V-110, with the old record frozen at its exact revision after the restart; the service called 1 000 ms past the proof | `Refused(Frozen)`; the record is still boot 1, frozen, at its revision; node 1 does not acquire. Kills the guard-1 mutant | sim | — |
 | M7V-112 | `m7v_112_the_service_never_clears_a_grant_not_yet_proven_expired` | option A guard 2: the `ExpiryProven` inequality, strict | as M7V-110, the service called at exactly `E_old + ε + δ` | `Refused(NotProvenExpired)`; the record at its revision; node 1 does not acquire. Kills the guard-2 and δ-dropped mutants | sim | — |
 | M7V-113 | `m7v_113_the_service_never_clears_a_grant_while_a_partition_is_mid_transfer` | option A guard 3: a partition naming the node and not `Serving` is the transfer's | as M7V-110, with `partitions/2` (owner node 1) moved to `Fencing`; the service called 1 000 ms past the proof | `Refused(PartitionInTransfer(p2))`; the record at its revision; node 1 does not acquire. Kills the guard-3 mutant | sim | — |
+| M7V-114 | `m7v_114_a_down_node_is_not_stepped_and_what_reaches_it_is_dropped` | lead ruling 2026-09-28 (a crash kills the process and everything it owned), rule 1, tester G5: a down node is not stepped | the spine; node 1 crashes; no restart; run to 6 000 | the run reaches its deadline (a down node stops nothing); no `ModuleDispatch` on node 1 after the crash; `Dispatcher::dropped()` is non-empty and every entry for node 1 is `Event{.., NodeDown}` under boot 1; node 1 is still down. Red on `HEAD` 4f4a2c3: the run stops `Refused{deliver::crash}` because node 1 was stepped. Kills the no-down-check mutant | sim | — |
+| M7V-115 | `m7v_115_deliver_never_moves_a_nodes_boot_back` | rule 2, F-D: `Dispatcher::deliver` never rolls a node's boot back | the spine; crash, restart under boot 2; `deliver(node 1, boot 1, [Timer Arm TimerId(0x0115)])` | `Ok`; node 1's boot is still 2; the timer is not armed; exactly one `Dropped::Effects{node 1, boot 1, StaleBoot{current: 2}}` was added. Red on `HEAD`: the boot moved back to 1. Kills the stale-effects mutant | sim | — |
+| M7V-116 | `m7v_116_an_old_boots_timer_fire_never_reaches_the_process_that_reused_its_version` | rule 2 and rule 4, F-G: a stale old-boot timer fire whose version equals a fresh arm's never reaches the fresh A1 | `restarted_with_old_grant`; run to 3 002; read the fresh `Acquire` arm `(version, due)`; queue a boot-1 `TimerFired{Acquire, version, due}` ten ticks later; run to `due - 1`, then `due + 1` | before `due`: the stale fire is dropped `StaleBoot{current: 2}`, never dispatched, no grant CAS is sent, the fresh arm is still armed; after `due`: exactly one grant CAS. Red on `HEAD`: the stale fire was acted on (2 grant CASes before `due`). Kills the no-stale-boot mutant | sim | — |
+| M7V-117 | `m7v_117_an_old_boots_control_answer_never_reaches_the_process_that_reused_its_request_id` | rule 2 and rule 4, request ids repeat after a restart: a stale old-boot control answer whose `ControlRequestId` equals the fresh outstanding request never reaches the fresh A1 | the spine; crash, restart under boot 2; `AcquireDue` under boot 2 at 3 001; read the fresh `Acquire` arm; `DelayCompletion{node 1, 5 ms}`; run to `due` and read the outstanding id `BASE + n`; precondition `n <= ` the old process's grant-CAS count (so it issued that id too; observed n = 4 of 6); queue a boot-1 `CasResult{that id, Committed}` at `due + 2`; run to `due + 10` | the stale answer is dropped `StaleBoot{current: 2}` and never dispatched; A1 is not held and has no acquisition outstanding; the store's grant record is still boot 1's. Red on `HEAD`: A1 took the stale answer as its own. Kills the no-stale-boot mutant | sim | — |
+| M7V-118 | `m7v_118_a_crash_ends_the_old_processs_watches_and_a_new_one_watches_only_once_it_asks` | rule 3, F-E: the old process's control-store watches end at crash; a restarted node watches only once it asks | the spine (node 1 watching); crash; run to 3 100; restart under boot 2; run to 3 200; the old grant removed by `scenario_cas`; `AcquireDue` under boot 2 at 3 300; run to 6 000 | open watches drop from `before > 0` to 0 at the crash; `before` `WatchTerminated{Unavailable}` events dropped `NodeDown`; `before` `ControlInteraction` Watch `Terminated{Unavailable, gap: false}`; still 0 open after the restart; after the fresh acquisition node 1 holds a boot-2 grant and watches again. Red on `HEAD`: the watches stayed open through the crash. Kills the no-end-watches mutant | sim | — |
+| M7V-119 | `m7v_119_the_service_never_clears_a_grant_while_a_partition_is_fencing_drained` | option A guard 3, tester advisory ADV-1: `FencingDrained` is not `Serving`, so it is the transfer's too | as M7V-113, with `partitions/2` (owner node 1) moved to `FencingDrained` | `Refused(PartitionInTransfer(p2))`; the record at its revision; node 1 does not acquire. Green on `HEAD` by design; kills the guard-3-blocks-only-`Fencing` mutant, which M7V-113 survives | sim | — |
+| M7V-120 | `m7v_120_a_nodes_boot_changes_only_by_restart` | V-R36 (lead, 2026-09-28), tester D1: a node's boot changes only by `restart`; effects and events under any other boot, newer included, are dropped | a bare runner (every node registered under boot 1); `deliver(node 2, boot 3, [Timer Arm 0x0120])`; node 1 sends node 2 a frame; a boot-3 `AcquireDue` seeded on node 2 at 10; run to 200 | the delivery is `Ok`; node 2's boot is still 1; the timer is not armed; `dropped()` is exactly one `Dropped::Effects{node 2, boot 3, UnknownBoot{current: 1}}`; after the run the only drop on node 2 is the seed, as `UnknownBoot{current: 1}`, and node 2 is stepped under boot 1 only (the frame arrives). Red on the round-0 export sources: node 2's boot became 3. Kills the newer-boot-adopted mutant | sim | — |
+| M7V-121 | `m7v_121_a_crash_taken_on_another_nodes_behalf_ends_the_holders_watches` | rule 3, tester D2: every crash path ends the node's watches, including a crash taken inside another node's delivery | the spine plan, not run; node 2 watches grants; a process crash planned on node 2; node 1 delivers F1's `SyncWalThrough{copy 1, cutoff 1}`, whose holder is node 2 | precondition: the delivery is refused, node 2 is down, node 1 is not; node 2's open watches are 0. Red on the round-0 export sources: 1 (watches were ended only for the delivering node). Kills the crash-owes-no-watches mutant, with M7V-118 | sim | — |
+| M7V-122 | `m7v_122_a_direct_delivery_to_a_down_node_carries_out_nothing` | rule 1, tester D4: a direct `deliver` to a down node carries out no timer, send or control effect | the spine; node 1 crashes; `deliver(node 1, boot 1, [Timer Arm 0x0122, a frame to node 2, Watch grants])` into a fresh store and scheduler; then `[Timer Arm 0x0123, Store Snapshot]` | first: `Ok`; nothing armed, nothing scheduled, no watch opened, exactly one `Dropped::Effects{node 1, boot 1, NodeDown}` holding the three effects. Second: refused `harness::dispatch::deliver::crash`, and the arm before the snapshot did not run. Red on the round-0 export sources: the timer was armed. Kills the down-node-delivers mutant | sim | — |
+| M7V-123 | `m7v_123_restart_refuses_a_boot_that_is_not_newer` | V-R36, tester D3: `restart` takes only a strictly newer boot | the spine; node 1 crashes under boot 1; `restart` under boot 1, then boot 0; then boot 2; crash under boot 2; `restart` under boot 2 | boots 1 and 0: `Err(Config{restart_boot})`, node still down at boot 1; boot 2: `Ok`, boot 2; after the second crash, boot 2 again: `Err(Config{restart_boot})`. Red on the round-0 export sources: the boot-1 restart was accepted. Kills the no-boot-check mutant | sim | — |
+| M7V-124 | `m7v_124_a_seed_under_a_boot_the_node_is_not_running_is_counted_as_dropped` | V-R36, tester D6: a seed under a boot the node is not running is dropped and counted like any other drop, not refused | a bare runner; `AcquireDue` seeds on node 2 under boot 0 (at 5) and boot 3 (at 6); run to 200 | the run is `Ok`; node 2's drops are exactly `[(seed@5, StaleBoot{current: 1}), (seed@6, UnknownBoot{current: 1})]`; neither is dispatched. Red on the round-0 export sources: the boot-3 seed was stepped. Kills the newer-boot-adopted mutant | sim | — |
 
 ---
 
@@ -1008,7 +1022,7 @@ grammar/generator 9 (6 + 80, 86, 88) ·
 reducer 10 (8 + 83, 84) · campaign 18 (14 + 78, 82, 87, 89) · mutations 7 (6 + 81 counted once,
 under oracle) · evidence 6 — the blocks overlap by the reserved ids 20–23 and by M7V-81, and the
 distinct id set is `M7V-01..M7V-89`. By class: unit 58 · sim 12 · campaign 19 (§2).
-Rows added after this count and not in it: `M7V-92`..`M7V-113` (twenty-two; `M7V-90` stays retired, and
+Rows added after this count and not in it: `M7V-92`..`M7V-124` (thirty-three; `M7V-90` stays retired, and
 `M7V-91` is held as the candidate row named in §15 drift row 6, still unwritten). Their classes are in §2. Count landed rows with
 `scripts/m7-census.sh verification`, never from this paragraph.
 
@@ -1504,14 +1518,14 @@ by it. What it changes for this plan's rows, and what it does not:
   - (b) the durable epoch revocations have no read path into a fresh A1. Ruled 2026-09-27
     (Gautam): fixed later by a new contract event `EpochRevocationRestored`, not in this package;
   - (c) scheduler events and control watches queued under the old boot still reach the fresh
-    modules;
+    modules. **Closed** by M7V-114..M7V-118 (sim-fidelity note below);
   - (d) the pinned configuration names each member's old boot, so **every restarted member** is
     refused as a stale copy until something re-pins it. A restarted primary's appends are
     refused `NotAMember` (78 in tester run t2). A restarted follower's receiver is rebuilt as
     `Member{boot 1}`, and the primary drops every ACK it sends as `AckRejected(StaleBoot)` (30 in
     t1). So a restarted follower never counts toward progress again. Nothing re-pins today.
 - **L-R178e (Gautam, 2026-09-27; dev-a1-restart, 2026-09-28; M7V-109..M7V-113).** Closes V-R35's
-  open items (a) and (b). Items (c) and (d) stay open.
+  open items (a) and (b). Item (d) stays open; item (c) is closed by the sim-fidelity note below.
   - (b) **Revocations read back.** `Dispatcher::restart` marks the node. The first offer to its
     fresh A1 replays each durable revocation of that node as `EpochRevocationRestored`, in key
     order, ahead of the offer itself, so nothing reaches the fresh A1 first. A1 records it in
@@ -1523,6 +1537,60 @@ by it. What it changes for this plan's rows, and what it does not:
     by the row, not by the run loop. `ControlStore::scenario_cas` is the one new public store
     method it writes through. M7V-110..M7V-113.
   - `revocations` still survives a restart, as V-R35 listed; it now also has a reader.
+- **Sim fidelity (lead ruling 2026-09-28: a crash kills the process and everything it owned;
+  V-R36: a node's boot changes only by `restart`; dev-sim-fidelity, correction round 1 after
+  tester-sim-fidelity; M7V-114..M7V-124).** Closes V-R35's open item (c), tester G5, F-D, F-E,
+  F-G, the request-id repeat, tester advisory ADV-1, and tester D1..D6. Item (d) stays open. F-C,
+  F-F and CopyAheadOnControl are not in it.
+  - **G5, down node.** `Runner::run` asks `Dispatcher::drop_if_dead` for each popped event. An
+    event for a down node is dropped as `DropReason::NodeDown`: not offered, not an error, and
+    counted as consumed. Each drop is kept in `Dispatcher::dropped()` and logged. `TraceKind` is
+    contract and has no drop kind, so the record is sim-side, as the network's dropped frames
+    are. M7V-114. A direct `deliver` to a down node carries out nothing either: every effect but
+    storage is dropped as `NodeDown` and recorded, and a storage effect is refused at the crash
+    seam as before (`Dispatcher::deliver_while_down`, tester D4). M7V-122.
+  - **F-D and V-R36, one boot per process.** A node's boot is its registered one until
+    `Dispatcher::restart` moves it, and nothing else moves it (the old `boots` map, which
+    `deliver` wrote, is gone; `Dispatcher::boot` reads the registration). An event or a
+    delivery naming any other boot is dropped: older as `StaleBoot`, newer as `UnknownBoot`
+    (tester D1). Round 0 adopted a newer boot through `deliver`; that choice is withdrawn,
+    because every inbound frame, `Recovered` and catch-up is stamped with the registered boot
+    and was then dropped as stale. `restart` refuses a boot that is not strictly newer,
+    `Config{restart_boot}` (tester D3). A seed under a boot the node is not running is dropped
+    and counted, not refused (tester D6). M7V-115, M7V-120, M7V-123, M7V-124.
+  - **F-G and request ids.** A1's timer versions and `ControlRequestId`s restart from the same
+    counters, so a stale fire or answer can carry exactly what the fresh process expects. Both are
+    stopped by the stale-boot drop, with no counter persisted: M7V-116 (timer version), M7V-117
+    (request id). On `HEAD` both reached A1 and were acted on.
+  - **F-E, watches.** `Dispatcher::crash_check`, the one place a crash is taken, marks the node's
+    watches owed; `Dispatcher::pump`, the one place control completions are scheduled, ends them
+    through `ControlOp::TerminateWatch` with `WatchTermination::Unavailable` ("the node
+    stopped"). `deliver` pumps even when refused if a crash was taken, so a crash taken inside
+    another node's delivery (F1's `SyncWalThrough` on the holder) ends the holder's watches too
+    (tester D2). The terminations are addressed to the dead process and dropped. A restarted
+    node watches only once its fresh A1 asks. M7V-118, M7V-121.
+  - **ADV-1.** M7V-119 pins guard 3 on `FencingDrained`; M7V-113 alone survives a guard that
+    blocks only `Fencing`.
+  - **The send path's own crash check (tester D5).** `tests/dispatch.rs`
+    `send_envelopes_a_planned_crash_is_taken_by_the_provider_itself`, F5's twin: a crash planned
+    and not yet taken is taken by `SendEnvelopes` itself. It goes red when that check is removed;
+    F5 no longer can, because the runner never steps a down node.
+  - **Existing rows whose meaning changed.** (`tests/dispatch.rs`) F5
+    `send_envelopes_a_crashed_primary_sends_nothing` asserted the run stops at the crash seam,
+    which needed the down node to be stepped; it now asserts a `NodeDown` drop and a drained run.
+    A-R69a `store_a_crash_drops_the_nodes_views_and_a_reused_handle_opens_fresh_after_restart`
+    delivered the restarted node's effects under boot 1, which rolled the boot back; it now
+    delivers them under boot 2. Under V-R36 five rows delivered or seeded under a boot they never
+    registered, and now register it: `m7f_21_the_effect_to_event_hop_costs_zero_ticks_and_a_delay_costs_exactly_the_delay`
+    (`tests/dispatch.rs`), `h1_scaffolding_a_demoted_l1_keeps_a_stale_promotion_stale` and
+    `h1_scaffolding_a_rebuild_while_paused_traces_the_new_barrier` (`tests/harness.rs`, through
+    `h1_registered_plan`), and the unit rows `a_fire_carries_the_arms_payload_and_the_arms_site`
+    (`harness::dispatch`) and `a_fire_carries_the_arms_version_partition_and_correlation`
+    (`harness::run`). Twenty more rows seed nodes the cluster never registers and still pass;
+    their events are stamped boot 0 (listed in the dev-sim-fidelity handoff).
+  - **Still open:** `Dispatcher::run_due_flushes` and transfers can still touch a crashed node's
+    engine. The stale events in M7V-116 and M7V-117 are seeded under the old boot, standing for
+    what a dead process's connection or timer would deliver late.
 - **Known gap:** `BatchApply.key_versions` is always empty — the harness holds byte keys and a
   `KeyId` is assigned by the scenario generator. INV-ATOM and the read-version rules see no
   versions from a recorded run.

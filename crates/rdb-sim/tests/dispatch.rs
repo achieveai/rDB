@@ -346,6 +346,8 @@ fn m7f_19_the_manifest_lists_exactly_the_overridden_budgets() {
 fn m7f_21_the_effect_to_event_hop_costs_zero_ticks_and_a_delay_costs_exactly_the_delay() {
     support::preamble();
     let mut dispatcher = Dispatcher::new();
+    // Registered under the boot it delivers under: only `restart` gives a node a boot (V-R36).
+    dispatcher.register_node(NODE, BOOT);
     let mut control = ControlStore::new();
     let mut scheduler = Scheduler::new();
     let key = ControlKey::Grant(NODE);
@@ -1552,14 +1554,25 @@ fn store_a_crash_drops_the_nodes_views_and_a_reused_handle_opens_fresh_after_res
     dispatcher
         .restart(NODE, BootId(2))
         .expect("the crashed node restarts");
+    // The new process's effects carry its own boot: an effect under `BOOT` is the dead
+    // process's, and `deliver` drops it (M7V-115).
+    let mut deliver_restarted = |effect: Effect| {
+        dispatcher.deliver(
+            NODE,
+            BootId(2),
+            vec![effect],
+            &mut ControlStore::new(),
+            &mut scheduler,
+        )
+    };
     assert_eq!(
-        deliver_on(&mut dispatcher, &mut scheduler, NODE, release()),
+        deliver_restarted(release()),
         Err(SimError::Config {
             field: "snapshot_handle"
         }),
         "the crash dropped the view: there is nothing to release"
     );
-    deliver_on(&mut dispatcher, &mut scheduler, NODE, snapshot()).expect("a fresh bind");
+    deliver_restarted(snapshot()).expect("a fresh bind");
     assert_eq!(
         scheduler.pop().map(|event| event.kind),
         ready(0),
@@ -4771,9 +4784,10 @@ fn sent_for(runner: &mut Runner, from: u64, through: u64) -> Vec<Bytes> {
 }
 
 /// F5 (s02b inverted): records 1..=3 committed on node 1, only 1..=2 synced, then a host crash
-/// and no restart. The crash image keeps 1..=2. A crashed primary sends nothing: the provider is
-/// refused at the crash seam like every other storage reader, and never serves the pre-crash
-/// engine's record 3.
+/// and no restart. The crash image keeps 1..=2. A crashed primary sends nothing: the runner does
+/// not step a down node, so what is addressed to it is dropped, the provider is never reached,
+/// and the pre-crash engine's record 3 is never served. Until M7V-114 the node was stepped and
+/// the provider was refused at the crash seam instead.
 #[retcd_test]
 fn send_envelopes_a_crashed_primary_sends_nothing() {
     use rdb_core::contracts::storage::StoreEffect;
@@ -4831,17 +4845,75 @@ fn send_envelopes_a_crashed_primary_sends_nothing() {
     });
     assert_eq!(received, 0, "nothing was sent from the crashed node");
     assert_eq!(node2_head(&runner), Seq(0));
+    // A down node is not stepped (M7V-114): what was addressed to it is dropped, so the provider
+    // is never reached, and the run drains rather than stopping at the crash seam.
     assert!(
-        matches!(
-            report.stop,
-            rdb_sim::harness::run::StopReason::Refused {
-                seam: "harness::dispatch::deliver::crash",
-                ..
-            }
-        ),
-        "refused at the crash seam, by name: {:?}",
+        runner.dispatcher().dropped().iter().any(|dropped| matches!(
+            dropped,
+            rdb_sim::harness::dispatch::Dropped::Event {
+                event,
+                reason: rdb_sim::harness::dispatch::DropReason::NodeDown,
+            } if event.node == NODE
+        )),
+        "what reached the crashed node was dropped: {:?}",
+        runner.dispatcher().dropped()
+    );
+    assert!(
+        matches!(report.stop, rdb_sim::harness::run::StopReason::QueueEmpty),
+        "the run drains; nothing steps the crashed node into its seam: {:?}",
         report.stop
     );
+}
+
+/// F5's twin, for the provider's own crash check (tester D5): a crash planned on the primary and
+/// not yet taken is taken by `SendEnvelopes` itself, before any record is read. F5 cannot see
+/// this line, because its crash is taken by a storage effect first and the runner never steps a
+/// down node.
+#[retcd_test]
+fn send_envelopes_a_planned_crash_is_taken_by_the_provider_itself() {
+    support::preamble();
+    let history = send_history(3);
+    let preloads = history
+        .batches
+        .iter()
+        .cloned()
+        .map(|batch| (NODE, batch))
+        .collect();
+    let mut runner = send_runner_on(3, preloads, Some(2));
+    runner
+        .dispatcher_mut()
+        .inject_storage(StorageOp::Crash {
+            node: NODE,
+            fault: StorageFault::HostCrash,
+        })
+        .expect("a planned crash");
+    let mut scheduler = Scheduler::new();
+    let taken = runner.dispatcher_mut().deliver(
+        NODE,
+        BOOT,
+        vec![Effect {
+            correlation: CorrelationId(9),
+            from: ModuleName::Replication,
+            partition: PartitionId(1),
+            kind: EffectKind::Kernel(KernelEffect::SendEnvelopes {
+                copy: CopyId(1),
+                from: Seq(1),
+                through: Seq(3),
+            }),
+        }],
+        &mut ControlStore::new(),
+        &mut scheduler,
+    );
+    assert_eq!(
+        seam_of(taken),
+        "harness::dispatch::deliver::crash",
+        "the provider takes the crash, by name"
+    );
+    assert!(
+        runner.dispatcher().crash_image(NODE).is_some(),
+        "node 1 is down"
+    );
+    assert_eq!(scheduler.queued(), 0, "no frame was sent");
 }
 
 /// D01 (s01): node 3's engine holds record 3 and the primary's does not. Only the sending node's

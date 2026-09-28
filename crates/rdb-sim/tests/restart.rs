@@ -14,6 +14,17 @@
 //! | M7V-111 | twin, guard 1: a frozen old grant is not cleared |
 //! | M7V-112 | twin, guard 2: at exactly `E_old + epsilon + delta` the old grant is not cleared |
 //! | M7V-113 | twin, guard 3: while a partition naming the node is `Fencing`, the old grant is not cleared |
+//! | M7V-114 | a node that is down is not stepped: what reaches it is dropped and recorded, and the run goes on (G5) |
+//! | M7V-115 | `deliver` never moves a node's boot back: an old boot's effects are dropped, not carried out (F-D) |
+//! | M7V-116 | an old boot's timer fire never reaches the fresh process, even at the version it re-armed (F-G) |
+//! | M7V-117 | an old boot's control answer never reaches the fresh process, even under the request id it reused |
+//! | M7V-118 | a crash ends the old process's control-store watches; a restarted node watches only once it asks (F-E) |
+//! | M7V-119 | twin, guard 3: while a partition naming the node is `FencingDrained`, the old grant is not cleared (ADV-1) |
+//! | M7V-120 | a node's boot changes only by `restart`: effects and events under any other boot are dropped (V-R36, D1) |
+//! | M7V-121 | a crash taken on another node's behalf still ends the holder's watches (rule 3, D2) |
+//! | M7V-122 | a direct `deliver` to a down node carries out no timer, send or control effect (rule 1, D4) |
+//! | M7V-123 | `restart` refuses a boot that is not strictly newer (V-R36, D3) |
+//! | M7V-124 | a seed under a boot the node is not running is counted as dropped (V-R36, D6) |
 //!
 //! All but M7V-105 run the spine (four nodes; F1 on node 1 recovers partition 1 while A1 on
 //! node 1 serves partition 2), then take a process crash and a restart. M7V-105 runs the
@@ -30,22 +41,30 @@ use bytes::Bytes;
 use config_log::retcd_test;
 use rdb_core::authority::grant::GrantRecord;
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::AUTHORITY_CONTROL_REQUEST_BASE;
 use rdb_core::contracts::authority::{AuthorityEvent, DenyReason, Lineage, Verdict};
-use rdb_core::contracts::control::{CasOutcome, ControlKey, ReadOutcome};
-use rdb_core::contracts::event::{Budgets, Effect, EffectKind, EventKind, KernelEvent, ModuleName};
+use rdb_core::contracts::control::{
+    CasOutcome, ControlEvent, ControlKey, ReadOutcome, WatchTermination,
+};
+use rdb_core::contracts::event::{
+    Budgets, Effect, EffectKind, Event, EventKind, KernelEvent, ModuleName,
+};
 use rdb_core::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, Revision,
-    Seq, SnapshotHandle, TimerVersion,
+    BootId, ConfigVersion, CorrelationId, EventId, Generation, NodeId, OwnerEpoch, PartitionId,
+    Revision, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::storage::{StorageFault, StoreEffect};
-use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{KernelNote, Provenance, TraceKind};
+use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
+use rdb_core::contracts::trace::{
+    ControlOpKind, ControlOutcomeKind, KernelNote, Provenance, TraceKind,
+};
 use rdb_core::publication::ScriptedReplication;
 use rdb_core::recovery::RecoveryPhase;
-use rdb_sim::harness::dispatch::{Adopted, Dispatcher};
+use rdb_sim::harness::dispatch::{Adopted, Dispatcher, DropReason, Dropped};
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent, StopReason};
 
+use rdb_sim::sim::control::ControlOp;
 use rdb_sim::sim::grant_service::{clear_restarted_grant, Clearance, Refusal};
 use rdb_sim::storage::StorageOp;
 
@@ -1506,5 +1525,832 @@ fn m7v_113_the_service_never_clears_a_grant_while_a_partition_is_mid_transfer() 
         clearance,
         Refusal::PartitionInTransfer(SERVED),
         "M7V-113",
+    );
+}
+
+/// M7V-119 (tester-a1-restart ADV-1, option A guard 3): a grant is not cleared while a partition
+/// naming the node is `FencingDrained` either. Twin of M7V-113 with the other non-`Serving`
+/// lifecycle: the drain finished, but the transfer has not, so the record is still the
+/// transfer's. Kills a guard that blocks on `Fencing` alone.
+#[retcd_test]
+fn m7v_119_the_service_never_clears_a_grant_while_a_partition_is_fencing_drained() {
+    support::preamble();
+    let (mut runner, revision, old) = restarted_with_old_grant();
+    write_lifecycle(&mut runner, SERVED, PartitionLifecycle::FencingDrained);
+    let proven = proven_from(&runner, &old);
+    let clearance = service_at(&mut runner, Tick(proven.0 + 1_000));
+    assert_eq!(
+        grant_record(&mut runner).map(|(at, _)| at),
+        Some(revision),
+        "M7V-119: the record is at its revision"
+    );
+    assert_held_in_place(
+        &mut runner,
+        clearance,
+        Refusal::PartitionInTransfer(SERVED),
+        "M7V-119",
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Restart fidelity (lead ruling, 2026-09-28): a crash kills the process and everything it owned.
+// ------------------------------------------------------------------------------------------
+
+/// Every event the run loop dropped for `node` from the `from`-th drop on, with why.
+fn dropped_events(runner: &Runner, from: usize, node: NodeId) -> Vec<(Event, DropReason)> {
+    runner.dispatcher().dropped()[from..]
+        .iter()
+        .filter_map(|dropped| match dropped {
+            Dropped::Event { event, reason } if event.node == node => {
+                Some((event.clone(), *reason))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `ModuleDispatch` recorded from `from` on, as `(node, boot, event)`.
+fn dispatched(runner: &Runner, from: usize) -> Vec<(NodeId, BootId, EventId)> {
+    runner.recorded()[from..]
+        .iter()
+        .filter_map(|record| match &record.kind {
+            TraceKind::ModuleDispatch { event, .. } => Some((record.node, record.boot, *event)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many CASes on `grants/{NODE}` the store has declared from the `from`-th record on.
+fn grant_cases(runner: &Runner, from: usize) -> usize {
+    runner.recorded()[from..]
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                TraceKind::ControlInteraction {
+                    op: ControlOpKind::Cas,
+                    key: Some(ControlKey::Grant(NODE)),
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+/// Queue `seed`, returning the id the scheduler gave it.
+fn queue(runner: &mut Runner, seed: &SeedEvent) -> EventId {
+    runner.queue(seed).expect("a queued event")
+}
+
+/// M7V-114 (G5): a node that is down is not stepped. Everything addressed to it while it is down
+/// is dropped and recorded, and the run goes on.
+///
+/// The spine runs to 3 000 and node 1 crashes. Its old process still has timers in the wheel and
+/// an L1 instance owed health evaluations. The run continues to 6 000 without a restart.
+///
+/// Red on HEAD `4f4a2c3`: the runner stepped the crashed node under its old boot, so its old
+/// timers fired into its modules, and the run stopped at the first store effect they made,
+/// `Refused { harness::dispatch::deliver::crash }` (tester-sim-restart t4).
+#[retcd_test]
+fn m7v_114_a_down_node_is_not_stepped_and_what_reaches_it_is_dropped() {
+    support::preamble();
+    let mut runner = run_spine();
+    crash(&mut runner, NODE);
+    assert!(
+        !runner.dispatcher().clock().armed(NODE).is_empty(),
+        "precondition: the old process left timers in the wheel"
+    );
+    let mark = runner.recorded().len();
+    let drops = runner.dispatcher().dropped().len();
+
+    let report = runner
+        .run(RunLimits {
+            max_events: LONG_RUN_EVENTS,
+            deadline: SECOND_DEADLINE,
+        })
+        .expect("the run goes on");
+    let dropped = dropped_events(&runner, drops, NODE);
+    let stepped: Vec<_> = dispatched(&runner, mark)
+        .into_iter()
+        .filter(|(node, _, _)| *node == NODE)
+        .collect();
+    tracing::info!(
+        stop = ?report.stop,
+        dropped = dropped.len(),
+        stepped = stepped.len(),
+        "m7v_114 while node 1 is down"
+    );
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "a down node stops nothing: the run reaches its deadline: {:?}",
+        report.stop
+    );
+    assert_eq!(stepped, vec![], "no module on node 1 is offered anything");
+    assert!(
+        !dropped.is_empty(),
+        "what reached node 1 while it was down is recorded as dropped"
+    );
+    assert!(
+        dropped
+            .iter()
+            .all(|(event, reason)| *reason == DropReason::NodeDown && event.boot == BOOT),
+        "each drop is the old boot's, dropped because the node is down: {dropped:?}"
+    );
+    assert!(runner.dispatcher().is_down(NODE), "node 1 is still down");
+}
+
+/// M7V-115 (F-D): `Dispatcher::deliver` never moves a node's boot back. Effects handed under a
+/// boot older than the node's current one are a dead process's output: none is carried out, and
+/// they are recorded as dropped.
+///
+/// Red on HEAD `4f4a2c3`: `deliver` did `boots.insert(node, boot)` first, whatever the boot, so
+/// one old-boot delivery rolled node 1 back to boot 1 and armed the dead process's timer.
+#[retcd_test]
+fn m7v_115_deliver_never_moves_a_nodes_boot_back() {
+    support::preamble();
+    let mut runner = run_spine();
+    crash(&mut runner, NODE);
+    runner
+        .dispatcher_mut()
+        .restart(NODE, REBOOT)
+        .expect("node 1 restarts");
+    assert_eq!(runner.dispatcher().boot(NODE), Some(REBOOT), "precondition");
+    let stale_timer = TimerId(0x0115);
+    let arm = Effect {
+        correlation: CorrelationId(115),
+        from: ModuleName::Replication,
+        partition: RECOVERED,
+        kind: EffectKind::Timer(TimerEffect::Arm {
+            id: stale_timer,
+            version: TimerVersion(1),
+            at: Tick(FIRST_DEADLINE.0 + 500),
+        }),
+    };
+    let drops = runner.dispatcher().dropped().len();
+
+    runner
+        .carry_out(NODE, BOOT, vec![arm.clone()])
+        .expect("a dead process's output is dropped, not refused");
+
+    assert_eq!(
+        runner.dispatcher().boot(NODE),
+        Some(REBOOT),
+        "node 1's boot did not move back"
+    );
+    assert!(
+        runner
+            .dispatcher()
+            .clock()
+            .armed(NODE)
+            .iter()
+            .all(|(id, _, _)| *id != stale_timer),
+        "the old boot's timer was not armed"
+    );
+    assert_eq!(
+        runner.dispatcher().dropped()[drops..],
+        [Dropped::Effects {
+            node: NODE,
+            boot: BOOT,
+            reason: DropReason::StaleBoot { current: REBOOT },
+            effects: vec![arm],
+        }],
+        "the effects are recorded as dropped"
+    );
+}
+
+/// M7V-116 (F-G): an old boot's timer fire never reaches the fresh process, even when its
+/// version is exactly the one the fresh process armed.
+///
+/// A timer's version counter is process memory, so a fresh process counts from the same start
+/// and re-arms versions its old process already used. After the restart, the new process's
+/// acquisition conflicts with the old boot's grant, and A1 re-arms `Acquire` at version `v`.
+/// An old-boot fire of `Acquire` at the same `v` is then queued ahead of that deadline: what
+/// was in flight for the dead process when it died. It is dropped as `StaleBoot`, and A1 does
+/// not acquire early. The fresh arm then fires on its own and does acquire, so `v` is live: the
+/// old fire would have been taken as A1's own.
+///
+/// Red on HEAD `4f4a2c3`: nothing compared an event's boot with the node's, so A1 took the
+/// old fire as its own and sent a CAS at the old fire's tick.
+#[retcd_test]
+fn m7v_116_an_old_boots_timer_fire_never_reaches_the_process_that_reused_its_version() {
+    support::preamble();
+    let (mut runner, _, _) = restarted_with_old_grant();
+    run_to(&mut runner, Tick(FIRST_DEADLINE.0 + 2));
+    let acquire = rdb_core::authority::AuthorityTimer::Acquire.id();
+    let (version, due) = runner
+        .dispatcher()
+        .clock()
+        .armed(NODE)
+        .into_iter()
+        .find_map(|(id, version, at)| (id == acquire).then_some((version, at)))
+        .expect("precondition: the fresh A1 re-armed its acquisition after the conflict");
+    let now = runner.dispatcher().clock().now();
+    assert!(
+        due.0 > now.0 + 20,
+        "precondition: the fresh arm is not due yet"
+    );
+    let mark = runner.recorded().len();
+    let drops = runner.dispatcher().dropped().len();
+    let stale = queue(
+        &mut runner,
+        &seed(
+            now.0 + 10,
+            NODE,
+            BOOT,
+            SERVED,
+            EventKind::Timer(TimerFired {
+                id: acquire,
+                version,
+                scheduled_at: due,
+            }),
+        ),
+    );
+
+    run_to(&mut runner, Tick(due.0 - 1));
+    let dropped = dropped_events(&runner, drops, NODE);
+    tracing::info!(
+        ?version,
+        due = due.0,
+        ?dropped,
+        "m7v_116 before the fresh fire"
+    );
+    assert!(
+        dropped.iter().any(|(event, reason)| event.id == stale
+            && *reason == DropReason::StaleBoot { current: REBOOT }),
+        "the old boot's fire is dropped as stale: {dropped:?}"
+    );
+    assert!(
+        dispatched(&runner, mark)
+            .iter()
+            .all(|(_, _, event)| *event != stale),
+        "no module is offered the old boot's fire"
+    );
+    assert_eq!(
+        grant_cases(&runner, mark),
+        0,
+        "A1 does not acquire at the old fire's tick"
+    );
+    assert!(
+        runner
+            .dispatcher()
+            .clock()
+            .armed(NODE)
+            .contains(&(acquire, version, due)),
+        "the fresh arm is still armed"
+    );
+
+    run_to(&mut runner, Tick(due.0 + 1));
+    assert_eq!(
+        grant_cases(&runner, mark),
+        1,
+        "the fresh arm, at the same version, fires and acquires: the version was live"
+    );
+}
+
+/// M7V-117 (request ids repeat after a restart): an old boot's control answer never reaches the
+/// fresh process, even when its `ControlRequestId` is exactly the one the fresh process has
+/// outstanding.
+///
+/// A1 mints request ids from a per-process counter that starts at zero, so the new process's
+/// ids repeat the old process's, in order. The row reads the id of the new process's
+/// outstanding acquisition CAS, checks the old process issued it too (it sent at least that
+/// many grant CASes), and queues an old-boot `Committed` answer under that id to arrive while
+/// the CAS is outstanding: a completion the dead process's connection delivered late. The
+/// store holds the old boot's grant, so the real answer is a conflict, held back 5 ms. The old
+/// answer is dropped as `StaleBoot`. A1 takes only the real answer and stays `Unheld`, and the
+/// store's record is still the old boot's.
+///
+/// Red on HEAD `4f4a2c3` (with the drop API stubbed in): the old answer was offered to A1, and
+/// A1 did not end unheld with nothing outstanding; it took the answer as its own.
+#[retcd_test]
+fn m7v_117_an_old_boots_control_answer_never_reaches_the_process_that_reused_its_request_id() {
+    support::preamble();
+    let mut runner = run_spine();
+    let (revision, old) = grant_record(&mut runner).expect("precondition: node 1 wrote a grant");
+    // Every grant CAS the old process sent minted the next id from its counter, so it issued at
+    // least this many ids, from `BASE + 1` up.
+    let old_ids = u64::try_from(grant_cases(&runner, 0)).expect("a count fits");
+    crash(&mut runner, NODE);
+    runner
+        .dispatcher_mut()
+        .restart(NODE, REBOOT)
+        .expect("node 1 restarts");
+    let at = FIRST_DEADLINE.0 + 1;
+    queue(&mut runner, &acquire_due(at, NODE, REBOOT));
+    run_to(&mut runner, Tick(at));
+    // Nothing is outstanding once `at` has run: the fresh A1 has re-armed its acquisition, and
+    // the CAS this row races goes out when that arm fires.
+    let acquire = rdb_core::authority::AuthorityTimer::Acquire.id();
+    let due = runner
+        .dispatcher()
+        .clock()
+        .armed(NODE)
+        .into_iter()
+        .find_map(|(id, _, due)| (id == acquire).then_some(due))
+        .expect("precondition: the fresh A1 armed its acquisition");
+    // The store answers that CAS 5 ms late, so the old answer lands while it is outstanding.
+    runner
+        .control_mut()
+        .inject(ControlOp::DelayCompletion {
+            node: NODE,
+            by_millis: 5,
+        })
+        .expect("a delayed answer");
+    run_to(&mut runner, due);
+    let reused = runner
+        .dispatcher()
+        .authority(NODE)
+        .and_then(|a1| a1.state().acquire())
+        .map(|acquire| acquire.request)
+        .expect("precondition: the new process's CAS is outstanding");
+    let n = reused.0 - AUTHORITY_CONTROL_REQUEST_BASE;
+    tracing::info!(n, old_ids, due = due.0, "m7v_117 the fresh CAS's id");
+    assert!(
+        (1..=old_ids).contains(&n),
+        "precondition: the old process issued id BASE+{n} too; it issued {old_ids}"
+    );
+    let mark = runner.recorded().len();
+    let drops = runner.dispatcher().dropped().len();
+    // The dead process's answer to its own request under that id, delivered late.
+    let stale = queue(
+        &mut runner,
+        &seed(
+            due.0 + 2,
+            NODE,
+            BOOT,
+            SERVED,
+            EventKind::Control(ControlEvent::CasResult {
+                request: reused,
+                key: ControlKey::Grant(NODE),
+                outcome: CasOutcome::Committed(Revision(revision.0 + 100)),
+            }),
+        ),
+    );
+
+    run_to(&mut runner, Tick(due.0 + 10));
+    let dropped = dropped_events(&runner, drops, NODE);
+    tracing::info!(?dropped, "m7v_117 after the new CAS's answer");
+    assert!(
+        dropped.iter().any(|(event, reason)| event.id == stale
+            && *reason == DropReason::StaleBoot { current: REBOOT }),
+        "the old boot's answer is dropped as stale: {dropped:?}"
+    );
+    assert!(
+        dispatched(&runner, mark)
+            .iter()
+            .all(|(_, _, event)| *event != stale),
+        "no module is offered the old boot's answer"
+    );
+    assert!(
+        runner
+            .dispatcher()
+            .authority(NODE)
+            .is_some_and(|a1| !a1.state().is_held() && a1.state().acquire().is_none()),
+        "A1 took the real answer, a conflict, and holds nothing"
+    );
+    assert_eq!(
+        grant_record(&mut runner),
+        Some((revision, old)),
+        "the store's record is still the old boot's"
+    );
+}
+
+/// M7V-118 (F-E): a crash ends every control-store watch the old process held, and a restarted
+/// node holds a watch again only once its fresh process asks for one.
+///
+/// The spine leaves node 1's A1 holding its grant and watching. Node 1 crashes: its watches end
+/// at once, with the store's `Unavailable` ("the node stopped"), and each termination, addressed
+/// to the dead process, is dropped. The restart brings none back. Once the old grant is removed
+/// and the new process acquires, its own reload and watch give it watches again.
+///
+/// Red on HEAD `4f4a2c3`: the old process's watches stayed open through the crash and the
+/// restart.
+#[retcd_test]
+fn m7v_118_a_crash_ends_the_old_processs_watches_and_a_new_one_watches_only_once_it_asks() {
+    support::preamble();
+    let mut runner = run_spine();
+    let before = runner.control_mut().open_watches(NODE);
+    assert!(before > 0, "precondition: the old process is watching");
+    let mark = runner.recorded().len();
+    let drops = runner.dispatcher().dropped().len();
+
+    crash(&mut runner, NODE);
+    assert_eq!(
+        runner.control_mut().open_watches(NODE),
+        0,
+        "the crash ends the old process's watches"
+    );
+    run_to(&mut runner, Tick(FIRST_DEADLINE.0 + 100));
+    let terminations: Vec<_> = dropped_events(&runner, drops, NODE)
+        .into_iter()
+        .filter(|(event, _)| {
+            matches!(
+                event.kind,
+                EventKind::Control(ControlEvent::WatchTerminated {
+                    termination: WatchTermination::Unavailable,
+                    ..
+                })
+            )
+        })
+        .collect();
+    tracing::info!(before, ?terminations, "m7v_118 after the crash");
+    assert_eq!(
+        terminations.len(),
+        before,
+        "each ended watch's termination is addressed to the dead process and dropped"
+    );
+    assert!(
+        terminations
+            .iter()
+            .all(|(_, reason)| *reason == DropReason::NodeDown),
+        "dropped because node 1 is down: {terminations:?}"
+    );
+    let declared = runner.recorded()[mark..]
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                TraceKind::ControlInteraction {
+                    op: ControlOpKind::Watch,
+                    outcome: ControlOutcomeKind::Terminated {
+                        termination: WatchTermination::Unavailable,
+                        gap: false,
+                    },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(declared, before, "the store declares each end");
+
+    runner
+        .dispatcher_mut()
+        .restart(NODE, REBOOT)
+        .expect("node 1 restarts");
+    run_to(&mut runner, Tick(FIRST_DEADLINE.0 + 200));
+    assert_eq!(
+        runner.control_mut().open_watches(NODE),
+        0,
+        "the restart brings no watch back"
+    );
+
+    let (revision, _) = grant_record(&mut runner).expect("precondition: the old grant is held");
+    let removed = runner
+        .control_mut()
+        .scenario_cas(ControlKey::Grant(NODE), Some(revision), None);
+    assert!(
+        matches!(removed, CasOutcome::Committed(_)),
+        "precondition: the old grant is removed: {removed:?}"
+    );
+    queue(
+        &mut runner,
+        &acquire_due(FIRST_DEADLINE.0 + 300, NODE, REBOOT),
+    );
+    run_to(&mut runner, SECOND_DEADLINE);
+    assert!(
+        held_under(&mut runner, REBOOT),
+        "precondition: the new process holds a new-boot grant"
+    );
+    assert!(
+        runner.control_mut().open_watches(NODE) > 0,
+        "the new process watches again, because it asked"
+    );
+}
+
+/// A bare runner over the default cluster, every node registered under [`BOOT`]: nothing is
+/// queued but what a row seeds.
+fn bare_runner() -> Runner {
+    let mut plan = RunPlan::new(support::cluster());
+    plan.provenance = Provenance::Authored {
+        case: String::from("restart-bare"),
+    };
+    plan.limits = RunLimits {
+        max_events: 50,
+        deadline: Tick(200),
+    };
+    Runner::new(&plan).expect("a runner")
+}
+
+/// One unicast frame to `to`, as R1 would send it.
+fn frame_to(to: NodeId) -> Effect {
+    use rdb_core::contracts::ids::MessageId;
+    use rdb_core::contracts::transport::{Frame, SendEffect};
+    Effect {
+        correlation: CorrelationId(77),
+        from: ModuleName::Replication,
+        partition: RECOVERED,
+        kind: EffectKind::Send(SendEffect::Unicast {
+            to,
+            frame: Frame {
+                id: MessageId(1),
+                protocol: 1,
+                config: ConfigVersion(1),
+                sender: spine_prior(),
+                body: Bytes::new(),
+            },
+        }),
+    }
+}
+
+/// An arm of timer `id` at `at`.
+fn arm(id: u64, at: u64) -> Effect {
+    Effect {
+        correlation: CorrelationId(id),
+        from: ModuleName::Replication,
+        partition: RECOVERED,
+        kind: EffectKind::Timer(TimerEffect::Arm {
+            id: TimerId(id),
+            version: TimerVersion(1),
+            at: Tick(at),
+        }),
+    }
+}
+
+/// A1 on `node` asking to watch the grants prefix.
+fn watch_grants() -> Effect {
+    use rdb_core::contracts::control::{ControlEffect, ControlPrefix};
+    Effect {
+        correlation: CorrelationId(80),
+        from: ModuleName::Authority,
+        partition: SERVED,
+        kind: EffectKind::Control(ControlEffect::Watch {
+            prefix: ControlPrefix::Grants,
+            from: Revision(0),
+        }),
+    }
+}
+
+/// Whether `node` has timer `id` armed.
+fn is_armed(runner: &Runner, node: NodeId, id: u64) -> bool {
+    runner
+        .dispatcher()
+        .clock()
+        .armed(node)
+        .iter()
+        .any(|(armed, _, _)| *armed == TimerId(id))
+}
+
+/// M7V-120 (V-R36, tester D1): a node's boot changes only by `restart`. Effects handed to
+/// `deliver` under a boot the node is not running are dropped, the newer one included, and the
+/// node's boot does not move. So a frame to that node still arrives under its registered boot and
+/// is stepped, and an event naming the other boot is dropped at the run loop.
+///
+/// Red on the round-0 export sources: `deliver` adopted boot 3 for node 2, so every later
+/// arrival, stamped with the registered boot 1, was dropped as stale.
+#[retcd_test]
+fn m7v_120_a_nodes_boot_changes_only_by_restart() {
+    support::preamble();
+    let mut runner = bare_runner();
+    let two = NodeId(2);
+    let unknown = BootId(3);
+    runner
+        .carry_out(two, unknown, vec![arm(0x0120, 20)])
+        .expect("a delivery under another boot is dropped, not refused");
+    assert_eq!(
+        runner.dispatcher().boot(two),
+        Some(BOOT),
+        "node 2's boot did not move"
+    );
+    assert!(
+        !is_armed(&runner, two, 0x0120),
+        "the other boot's arm was not carried out"
+    );
+    assert_eq!(
+        runner.dispatcher().dropped(),
+        [Dropped::Effects {
+            node: two,
+            boot: unknown,
+            reason: DropReason::UnknownBoot { current: BOOT },
+            effects: vec![arm(0x0120, 20)],
+        }],
+        "the effects are dropped and recorded"
+    );
+
+    runner
+        .carry_out(NODE, BOOT, vec![frame_to(two)])
+        .expect("node 1 sends to node 2");
+    let ghost = queue(&mut runner, &acquire_due(10, two, unknown));
+    let stop = runner.run(RunLimits {
+        max_events: 200,
+        deadline: Tick(200),
+    });
+    let dropped = dropped_events(&runner, 0, two);
+    let on_two: Vec<_> = dispatched(&runner, 0)
+        .into_iter()
+        .filter(|(node, _, _)| *node == two)
+        .collect();
+    tracing::info!(stop = ?stop.map(|report| report.stop), ?dropped, ?on_two, "m7v_120");
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|(event, reason)| (event.id, *reason))
+            .collect::<Vec<_>>(),
+        vec![(ghost, DropReason::UnknownBoot { current: BOOT })],
+        "only the event naming the other boot is dropped"
+    );
+    assert!(
+        !on_two.is_empty() && on_two.iter().all(|(_, boot, _)| *boot == BOOT),
+        "the frame reaches node 2 under its registered boot: {on_two:?}"
+    );
+}
+
+/// M7V-121 (rule 3, tester D2): a crash ends the node's control-store watches on every path,
+/// including a planned crash taken on another node's behalf. Node 1's F1 syncs copy 1, whose
+/// holder is node 2; node 2 has a crash planned, so node 1's delivery takes it. Node 2's watch
+/// ends with it.
+///
+/// Red on the round-0 export sources: watches were ended only for the delivering node, so node
+/// 2 was down and still watching.
+#[retcd_test]
+fn m7v_121_a_crash_taken_on_another_nodes_behalf_ends_the_holders_watches() {
+    use rdb_core::contracts::event::KernelEffect;
+    use rdb_core::contracts::recovery::RecoveryEffect;
+    support::preamble();
+    let two = NodeId(2);
+    let mut runner = Runner::new(&spine_plan()).expect("a runner");
+    runner
+        .carry_out(two, BOOT, vec![watch_grants()])
+        .expect("node 2 watches grants");
+    assert_eq!(
+        runner.control_mut().open_watches(two),
+        1,
+        "precondition: node 2 is watching"
+    );
+    runner
+        .dispatcher_mut()
+        .inject_storage(StorageOp::Crash {
+            node: two,
+            fault: StorageFault::ProcessCrash,
+        })
+        .expect("a planned crash on the holder");
+    let synced = runner.carry_out(
+        NODE,
+        BOOT,
+        vec![Effect {
+            correlation: CorrelationId(81),
+            from: ModuleName::Recovery,
+            partition: RECOVERED,
+            kind: EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::SyncWalThrough {
+                copy: CopyId(1),
+                cutoff: Seq(1),
+            })),
+        }],
+    );
+    tracing::info!(?synced, "m7v_121");
+    assert!(
+        synced.is_err(),
+        "precondition: node 1's sync took the crash at the holder: {synced:?}"
+    );
+    assert!(
+        runner.dispatcher().is_down(two),
+        "precondition: node 2 is down"
+    );
+    assert!(!runner.dispatcher().is_down(NODE), "node 1 is not");
+    assert_eq!(
+        runner.control_mut().open_watches(two),
+        0,
+        "the crash ended node 2's watches"
+    );
+}
+
+/// M7V-122 (rule 1, tester D4): a direct `deliver` to a down node carries out none of its
+/// timer, send or control effects. They are dropped as `NodeDown` and recorded. A storage effect
+/// is still refused at the crash seam, and nothing before it in the batch runs either.
+///
+/// Red on the round-0 export sources: the down node's timer was armed, its frame scheduled and
+/// its watch opened.
+#[retcd_test]
+fn m7v_122_a_direct_delivery_to_a_down_node_carries_out_nothing() {
+    use rdb_sim::sim::scheduler::Scheduler;
+    support::preamble();
+    let mut runner = run_spine();
+    crash(&mut runner, NODE);
+    let drops = runner.dispatcher().dropped().len();
+    let effects = vec![arm(0x0122, 5_000), frame_to(NodeId(2)), watch_grants()];
+    let mut control = rdb_sim::sim::control::ControlStore::new();
+    let mut scheduler = Scheduler::new();
+    runner
+        .dispatcher_mut()
+        .deliver(NODE, BOOT, effects.clone(), &mut control, &mut scheduler)
+        .expect("dropped, not an error");
+    assert!(!is_armed(&runner, NODE, 0x0122), "no timer is armed");
+    assert_eq!(
+        scheduler.queued(),
+        0,
+        "no frame and no completion is scheduled"
+    );
+    assert_eq!(control.open_watches(NODE), 0, "no watch is opened");
+    assert_eq!(
+        runner.dispatcher().dropped()[drops..],
+        [Dropped::Effects {
+            node: NODE,
+            boot: BOOT,
+            reason: DropReason::NodeDown,
+            effects,
+        }],
+        "the effects are dropped and recorded"
+    );
+
+    let snapshot = Effect {
+        correlation: CorrelationId(82),
+        from: ModuleName::Transaction,
+        partition: RECOVERED,
+        kind: EffectKind::Store(StoreEffect::Snapshot {
+            handle: SnapshotHandle(0x0122),
+            partition: RECOVERED,
+        }),
+    };
+    let refused = runner.dispatcher_mut().deliver(
+        NODE,
+        BOOT,
+        vec![arm(0x0123, 5_000), snapshot],
+        &mut control,
+        &mut scheduler,
+    );
+    assert_eq!(
+        refused,
+        Err(rdb_sim::SimError::unavailable(
+            "harness::dispatch::deliver::crash"
+        )),
+        "a storage effect is refused at the crash seam"
+    );
+    assert!(
+        !is_armed(&runner, NODE, 0x0123),
+        "and the arm before it did not run"
+    );
+}
+
+/// M7V-123 (V-R36, tester D3): `restart` takes only a boot strictly newer than the node's
+/// current one. The same boot or an older one would make the dead process's queued events look
+/// current, which is F-D and F-G again.
+///
+/// Red on the round-0 export sources: `restart(node 1, boot 1)` after a crash under boot 1 was
+/// accepted.
+#[retcd_test]
+fn m7v_123_restart_refuses_a_boot_that_is_not_newer() {
+    support::preamble();
+    let mut runner = run_spine();
+    crash(&mut runner, NODE);
+    for stale in [BOOT, BootId(0)] {
+        assert_eq!(
+            runner.dispatcher_mut().restart(NODE, stale),
+            Err(rdb_sim::SimError::Config {
+                field: "restart_boot"
+            }),
+            "a restart under boot {stale:?} is refused"
+        );
+        assert!(runner.dispatcher().is_down(NODE), "and the node stays down");
+        assert_eq!(runner.dispatcher().boot(NODE), Some(BOOT));
+    }
+    runner
+        .dispatcher_mut()
+        .restart(NODE, REBOOT)
+        .expect("a newer boot restarts it");
+    assert_eq!(runner.dispatcher().boot(NODE), Some(REBOOT));
+    crash_under(&mut runner, NODE, REBOOT);
+    assert_eq!(
+        runner.dispatcher_mut().restart(NODE, REBOOT),
+        Err(rdb_sim::SimError::Config {
+            field: "restart_boot"
+        }),
+        "the second crash cannot come back under the boot it died under"
+    );
+}
+
+/// M7V-124 (V-R36, tester D6): a seed naming a boot the node is not running is dropped at the
+/// run loop and counted in `Dispatcher::dropped()` like any other drop: an older boot as
+/// `StaleBoot`, a newer one as `UnknownBoot`. Neither is stepped, and the run does not fail.
+///
+/// Red on the round-0 export sources: the newer-boot seed was stepped.
+#[retcd_test]
+fn m7v_124_a_seed_under_a_boot_the_node_is_not_running_is_counted_as_dropped() {
+    support::preamble();
+    let mut runner = bare_runner();
+    let two = NodeId(2);
+    let older = queue(&mut runner, &acquire_due(5, two, BootId(0)));
+    let newer = queue(&mut runner, &acquire_due(6, two, BootId(3)));
+    let stop = runner.run(RunLimits {
+        max_events: 200,
+        deadline: Tick(200),
+    });
+    let dropped = dropped_events(&runner, 0, two);
+    tracing::info!(stop = ?stop.as_ref().map(|report| &report.stop), ?dropped, "m7v_124");
+    assert!(stop.is_ok(), "the run does not fail: {stop:?}");
+    assert_eq!(
+        dropped
+            .iter()
+            .map(|(event, reason)| (event.id, *reason))
+            .collect::<Vec<_>>(),
+        vec![
+            (older, DropReason::StaleBoot { current: BOOT }),
+            (newer, DropReason::UnknownBoot { current: BOOT }),
+        ],
+        "both seeds are counted as dropped"
+    );
+    assert!(
+        dispatched(&runner, 0)
+            .iter()
+            .all(|(_, _, event)| *event != older && *event != newer),
+        "neither is stepped"
     );
 }

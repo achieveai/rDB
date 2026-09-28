@@ -1174,6 +1174,20 @@ fn h1_plan(seed: Vec<SeedEvent>, deadline: u64) -> RunPlan {
     plan
 }
 
+/// `h1_plan(seed, deadline)` with node 1 registered under the boot its seeds name. A node's boot
+/// changes only by `restart` (V-R36), so a node the cluster does not register has no boot of its
+/// own: every event scheduled for it is stamped boot 0, not the boot its seeds named.
+fn h1_registered_plan(seed: Vec<SeedEvent>, deadline: u64) -> RunPlan {
+    let mut plan = h1_plan(seed, deadline);
+    plan.cluster.nodes.push(rdb_sim::sim::cluster::NodeSpec {
+        node: l1_fixture::PRIMARY,
+        boot: BootId(1),
+        failure_domain: 1,
+        core_sets: 1,
+    });
+    plan
+}
+
 /// Every tick at which L1 answered an offer, in trace order.
 fn h1_protection_answers(trace: &rdb_core::contracts::trace::Trace) -> Vec<u64> {
     trace
@@ -1554,7 +1568,7 @@ fn h1_scaffolding_each_node_and_partition_has_its_own_l1() {
 fn h1_scaffolding_a_demoted_l1_keeps_a_stale_promotion_stale() {
     support::preamble();
     let generation = |ahead| Generation(l1_fixture::GEN.0 + ahead);
-    let plan = h1_plan(
+    let plan = h1_registered_plan(
         vec![
             l1_fixture::on_primary(0, l1_fixture::recovered(0)),
             l1_fixture::on_primary(
@@ -1832,7 +1846,7 @@ fn h1_barrier_lines(trace: &rdb_core::contracts::trace::Trace) -> Vec<(u64, Seq,
 #[retcd_test]
 fn h1_scaffolding_a_rebuild_while_paused_traces_the_new_barrier() {
     support::preamble();
-    let plan = h1_plan(
+    let plan = h1_registered_plan(
         vec![
             l1_fixture::on_primary(0, l1_fixture::recovered(40)),
             l1_fixture::on_primary(
