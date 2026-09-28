@@ -57,7 +57,7 @@ use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::authority::{Authority, AuthorityTimer};
 use rdb_core::contracts::authority::AuthorityEffect;
 use rdb_core::contracts::control::{
-    CasOutcome, ControlEvent, ControlKey, ControlPrefix, ControlRecord,
+    CasOutcome, ControlEffect, ControlEvent, ControlKey, ControlPrefix, ControlRecord,
 };
 use rdb_core::contracts::event::Effect;
 use rdb_core::contracts::publication::PubMode;
@@ -3997,12 +3997,20 @@ impl A1 {
             version: a1.a1.timer_version(AuthorityTimer::Acquire),
             scheduled_at: Tick::ZERO,
         });
-        let _ = a1.step(0, sample, 1, due);
+        let acquire = a1.step(0, sample, 1, due);
+        let request = acquire
+            .iter()
+            .find_map(|effect| match &effect.kind {
+                EffectKind::Control(ControlEffect::Cas { request, .. }) => Some(*request),
+                _ => None,
+            })
+            .expect("M7A-143 fixture: the acquire CAS");
         let _ = a1.step(
             0,
             sample,
             1,
             EventKind::Control(ControlEvent::CasResult {
+                request,
                 key: ControlKey::Grant(NODE_A),
                 outcome: CasOutcome::Committed(Revision(7)),
             }),

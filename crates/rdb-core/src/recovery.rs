@@ -65,7 +65,8 @@ use crate::contracts::recovery::{
 };
 use crate::contracts::time::{Tick, TimerEffect, TimerFired};
 
-use commit::{Cas, CasStep};
+pub use commit::RECOVERY_CONTROL_REQUEST_BASE;
+use commit::{Cas, CasStep, Requests};
 use emit::Emit;
 pub use inventory::MAX_WINDOW_EXTENSIONS;
 use inventory::{Collecting, Deadline, Window};
@@ -211,6 +212,10 @@ enum Input<'a> {
     Read(&'a ReadOutcome),
     Timer(&'a TimerFired),
     CopyLost(CopyId),
+    /// A control answer echoing a request id F1 minted that is not the outstanding one, or that
+    /// arrives while nothing is outstanding: the late answer to an earlier request of F1's own.
+    /// Moves nothing, and is named rather than declined.
+    Unmatched,
 }
 
 /// Package F1: lineage and recovery.
@@ -219,6 +224,9 @@ pub struct Recovery {
     plan: Option<RecoveryPlan>,
     phase: Phase,
     timer_version: TimerVersion,
+    /// Mints the id every control request carries. Never reset: an id a run abandoned stays
+    /// recognisable as F1's own, and never matches a later request.
+    requests: Requests,
     /// Counts selection runs and length reads for tests; nothing here reads it.
     spy: SelectionSpy,
 }
@@ -237,6 +245,7 @@ impl Recovery {
             plan: None,
             phase: Phase::Idle,
             timer_version: TimerVersion(0),
+            requests: Requests::new(),
             spy: SelectionSpy::new(),
         }
     }
@@ -284,23 +293,44 @@ impl Recovery {
         }
     }
 
-    /// A control answer is F1's only when it answers F1's own pending request. The sim offers
-    /// every control event to every module, and F1 must decline what it did not ask for.
+    /// A control answer is F1's only when it answers F1's own pending request, matched by the
+    /// request id it echoes and never by key alone (lead ledger L-R177hs). The sim offers every
+    /// control event to every module, and F1 must decline what it did not ask for.
+    ///
+    /// * The outstanding id, of the kind and key awaited: the answer.
+    /// * An id F1 minted, but not the outstanding one, or with nothing outstanding:
+    ///   [`Input::Unmatched`], the late answer to an earlier request (a run abandoned on
+    ///   `Unknown`, a first run's re-read, or an exchange already decided).
+    /// * Anything else: declined, as before. The outstanding id on another key or kind is
+    ///   declined too.
     fn control_input<'a>(&self, answer: &'a ControlEvent) -> Option<Input<'a>> {
-        let cas = self.pending_cas()?;
+        let (request, key, is_read) = match answer {
+            ControlEvent::CasResult { request, key, .. } => (*request, key, false),
+            ControlEvent::Value { request, key, .. } => (*request, key, true),
+            _ => return None,
+        };
+        let Some(cas) = self.pending_cas() else {
+            return self.requests.minted(request).then_some(Input::Unmatched);
+        };
+        if request != cas.request() {
+            return self.requests.minted(request).then_some(Input::Unmatched);
+        }
+        if !cas.awaits(key, is_read) {
+            return None;
+        }
         match answer {
-            ControlEvent::CasResult { key, outcome } if cas.awaits(key, false) => {
-                Some(Input::Cas(*outcome))
-            }
-            ControlEvent::Value { key, outcome } if cas.awaits(key, true) => {
-                Some(Input::Read(outcome))
-            }
+            ControlEvent::CasResult { outcome, .. } => Some(Input::Cas(*outcome)),
+            ControlEvent::Value { outcome, .. } => Some(Input::Read(outcome)),
             _ => None,
         }
     }
 
     fn route(&mut self, ctx: &StepCtx<'_>, event: &Event, input: Input<'_>) -> Vec<Effect> {
         let mut emit = Emit::new(event);
+        if let Input::Unmatched = input {
+            emit.ignored(ReplicaIgnoreReason::UnmatchedCompletion);
+            return emit.finish();
+        }
         let phase = mem::replace(&mut self.phase, Phase::Idle);
         self.phase = match phase {
             Phase::Idle => self.idle(ctx, input, &mut emit),
@@ -315,7 +345,7 @@ impl Recovery {
             }
             Phase::Barrier(decided, proofs) => self.barrier(ctx, decided, proofs, input, &mut emit),
             Phase::Proposing(decided, barrier, cas) => {
-                Self::proposing(decided, barrier, cas, input, &mut emit)
+                Self::proposing(decided, barrier, cas, &mut self.requests, input, &mut emit)
             }
             Phase::Committed(committed) => self.committed(ctx, committed, input, &mut emit),
         };
@@ -587,7 +617,7 @@ impl Recovery {
 
     /// `durable, never applied` (`design.md` §5.6): only `DurableAt` proofs build the barrier.
     fn barrier(
-        &self,
+        &mut self,
         ctx: &StepCtx<'_>,
         decided: Box<Decided>,
         mut proofs: BTreeMap<CopyId, DurableProof>,
@@ -618,7 +648,11 @@ impl Recovery {
         let (cutoff, digest) = (decided.selected.cutoff_seq, decided.selected.cutoff_digest);
         match RecoveryBarrier::try_new(&held, &decided.required, cutoff, digest) {
             Ok(barrier) => {
-                let cas = Cas::new(decided.record, decided.proof.prior_owner_epoch);
+                let cas = Cas::new(
+                    decided.record,
+                    decided.proof.prior_owner_epoch,
+                    self.requests.mint(),
+                );
                 emit.kind(EffectKind::Control(
                     cas.effect(decided.proof.control_revision),
                 ));
@@ -635,10 +669,17 @@ impl Recovery {
         decided: Box<Decided>,
         barrier: RecoveryBarrier,
         mut cas: Cas,
+        requests: &mut Requests,
         input: Input<'_>,
         emit: &mut Emit<'_>,
     ) -> Phase {
-        match follow_cas(&mut cas, decided.proof.control_revision, input, emit) {
+        match follow_cas(
+            &mut cas,
+            decided.proof.control_revision,
+            requests,
+            input,
+            emit,
+        ) {
             Some(Ok(revision)) => commit(*decided, barrier, revision, emit),
             Some(Err(blocked)) => blocked,
             None => Phase::Proposing(decided, barrier, cas),
@@ -680,7 +721,7 @@ impl Recovery {
         if let Some((mut cas, barrier)) = committed.activation.take() {
             let fence = committed.result.fenced_prior.control_revision;
             let held = committed.held.take();
-            let phase = match follow_cas(&mut cas, fence, input, emit) {
+            let phase = match follow_cas(&mut cas, fence, &mut self.requests, input, emit) {
                 Some(Ok(revision)) => {
                     activate(&mut committed, barrier, revision, emit);
                     Phase::Committed(committed)
@@ -716,7 +757,11 @@ impl Recovery {
                 }),
             Input::Recovery(RecoveryEvent::DurableAt(proof)) => {
                 rebuild.durable(*proof).map(|barrier| {
-                    let cas = Cas::new(committed.record, committed.record.owner_epoch);
+                    let cas = Cas::new(
+                        committed.record,
+                        committed.record.owner_epoch,
+                        self.requests.mint(),
+                    );
                     emit.kind(EffectKind::Control(
                         cas.effect(committed.result.committed.revision),
                     ));
@@ -806,7 +851,8 @@ impl Module for Recovery {
     /// # Errors
     ///
     /// [`RdbError::Unavailable`] -- the decline -- for an event that is not F1's: a kind F1 never
-    /// takes, another module's timer, or a control answer to a request F1 did not make. Every
+    /// takes, another module's timer, or a control answer to a request F1 did not make. A late
+    /// answer to a request F1 did make is taken and named `UnmatchedCompletion`. Every
     /// event it does take yields at least one effect, an `Ignored` when nothing else.
     fn step(&mut self, ctx: &StepCtx<'_>, event: &Event) -> Result<Vec<Effect>, RdbError> {
         let input = match &event.kind {
@@ -1071,6 +1117,7 @@ fn hold_fence(committed: &mut Committed, proof: &FencingProof, emit: &mut Emit<'
 fn follow_cas(
     cas: &mut Cas,
     fence: Revision,
+    requests: &mut Requests,
     input: Input<'_>,
     emit: &mut Emit<'_>,
 ) -> Option<Result<Revision, Phase>> {
@@ -1091,7 +1138,7 @@ fn follow_cas(
             emit,
         ))),
         CasStep::Reread => {
-            emit.kind(EffectKind::Control(cas.read_effect()));
+            emit.kind(EffectKind::Control(cas.read_effect(requests.mint())));
             None
         }
     }

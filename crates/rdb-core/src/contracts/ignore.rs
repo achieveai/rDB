@@ -97,7 +97,7 @@ pub enum KernelIgnoredReason {
 /// Not `Copy`: a variant with an owning payload is a variant kernel-b adds without asking
 /// anyone, and a `Copy` derive here would take that away.
 ///
-/// The eighteen span four subjects — replication, publication, protection and recovery — which is
+/// They span four subjects — replication, publication, protection and recovery — which is
 /// why they are in a file of their own rather than in a landed subject file. This repository
 /// files contracts by subject, and no landed subject file holds them all.
 ///
@@ -173,6 +173,14 @@ pub enum ReplicaIgnoreReason {
     /// nothing is stored. R1: a `LocalApplied` whose `seq` is not the primary's own head + 1
     /// (lead ruling B-R47).
     OutOfOrder,
+    /// `UNMATCHED_COMPLETION`: a control answer carrying a request id F1 minted, but not the id
+    /// of the request F1 has outstanding now, or arriving when nothing is outstanding — the late
+    /// answer to an earlier request, such as an abandoned run's CAS or re-read on the same
+    /// `partitions/{id}` key, or an exchange already decided. Nothing moves. F1 matches every
+    /// answer by [`ControlRequestId`](crate::contracts::ids::ControlRequestId), never by key
+    /// alone (lead ledger L-R177hs). Kernel-a's twin is
+    /// [`AuthorityIgnoreReason::UnmatchedCompletion`].
+    UnmatchedCompletion,
 }
 
 #[cfg(test)]

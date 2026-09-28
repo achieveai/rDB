@@ -19,6 +19,9 @@
 
 use config_log::retcd_test;
 
+use std::collections::BTreeMap;
+use std::ops::{Deref, DerefMut};
+
 use bytes::Bytes;
 use rdb_core::authority::clock::ClockMode;
 use rdb_core::authority::grant::GrantRecord;
@@ -31,12 +34,13 @@ use rdb_core::contracts::authority::{
 use rdb_core::contracts::control::{
     CasOutcome, ControlEffect, ControlEvent, ControlKey, ControlPrefix, ControlRecord, ReadOutcome,
 };
+use rdb_core::contracts::errors::RdbError;
 use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, Event, EventKind, KernelEffect, Module, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, EventId, Generation, GrantId,
-    NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
+    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::storage::{Namespace, SnapshotRead};
@@ -148,9 +152,92 @@ fn control(id: u64, correlation: u64, control: ControlEvent) -> Event {
     event(id, correlation, EventKind::Control(control))
 }
 
+/// A request id A1 never minted: its ids start above `AUTHORITY_CONTROL_REQUEST_BASE`. Carried by
+/// a read A1 judges by content: a partition read, or a grant read it did not ask for (T6).
+const UNASKED: ControlRequestId = ControlRequestId(0);
+
+/// A1, with the request id of the last `Get` it sent for each key under each correlation.
+///
+/// A1 matches a prior-grant read's answer by the request id its `Get` was sent as (lead ledger
+/// L-R177hs). These rows were written when the correlation stood in for that id: "the answer
+/// under correlation `c`" meant "the answer to the read A1 sent under `c`". [`Kernel::step`]
+/// records every `Get`, so [`grant_read`] keeps that reading exact: it echoes the id of the last
+/// `Get` of its key sent under its correlation, and [`UNASKED`] when none was. A row about the
+/// id itself names it, through [`grant_read_as`].
+struct Kernel {
+    a1: Authority,
+    asked: BTreeMap<(CorrelationId, ControlKey), ControlRequestId>,
+}
+
+impl Kernel {
+    fn new() -> Self {
+        Self {
+            a1: Authority::new(),
+            asked: BTreeMap::new(),
+        }
+    }
+
+    /// [`Module::step`], recording each `Get` sent.
+    fn step(&mut self, ctx: &StepCtx<'_>, event: &Event) -> Result<Vec<Effect>, RdbError> {
+        let effects = self.a1.step(ctx, event)?;
+        for effect in &effects {
+            if let EffectKind::Control(ControlEffect::Get { request, key }) = &effect.kind {
+                self.asked.insert((effect.correlation, *key), *request);
+            }
+        }
+        Ok(effects)
+    }
+
+    /// The last `Get` of `grants/{node}` sent under `correlation`, or [`UNASKED`].
+    fn asked(&self, correlation: u64, node: NodeId) -> ControlRequestId {
+        self.asked
+            .get(&(CorrelationId(correlation), ControlKey::Grant(node)))
+            .copied()
+            .unwrap_or(UNASKED)
+    }
+
+    /// The request id of the grant CAS in flight.
+    fn in_flight(&self) -> ControlRequestId {
+        let view = self.a1.view();
+        view.acquire
+            .map(|acquire| acquire.request)
+            .or_else(|| view.renewal.map(|renewal| renewal.request))
+            .expect("fixture: a grant CAS in flight")
+    }
+}
+
+impl Deref for Kernel {
+    type Target = Authority;
+
+    fn deref(&self) -> &Authority {
+        &self.a1
+    }
+}
+
+impl DerefMut for Kernel {
+    fn deref_mut(&mut self) -> &mut Authority {
+        &mut self.a1
+    }
+}
+
+/// The request id of the one control `Get` in `effects`.
+fn asked_once(effects: &[Effect]) -> ControlRequestId {
+    let asked: Vec<ControlRequestId> = effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Get { request, .. }) => Some(*request),
+            _ => None,
+        })
+        .collect();
+    let [request] = asked.as_slice() else {
+        panic!("fixture: one Get: {effects:?}");
+    };
+    *request
+}
+
 /// `Held` from tick 0, through the real acquisition (lead ruling A-R47).
-fn held() -> Authority {
-    let mut kernel = Authority::new();
+fn held() -> Kernel {
+    let mut kernel = Kernel::new();
     let due = event(
         1,
         1,
@@ -168,6 +255,7 @@ fn held() -> Authority {
                 1,
                 1,
                 ControlEvent::CasResult {
+                    request: kernel.in_flight(),
                     key: ControlKey::Grant(NODE),
                     outcome: CasOutcome::Committed(Revision(7)),
                 },
@@ -206,6 +294,7 @@ fn partition_read(id: u64, correlation: u64, revision: u64, body: &PartitionReco
         id,
         correlation,
         ControlEvent::Value {
+            request: UNASKED,
             key: ControlKey::Partition(body.partition),
             outcome: ReadOutcome::Found {
                 revision: Revision(revision),
@@ -251,11 +340,32 @@ fn prior_grant(frozen: bool, revision: u64) -> ReadOutcome {
     }
 }
 
-fn grant_read(id: u64, correlation: u64, node: NodeId, outcome: ReadOutcome) -> Event {
+/// A read of `grants/{node}` under `correlation`, answering the last `Get` of that key `kernel` sent
+/// under that correlation, or [`UNASKED`] when it sent none (see [`Kernel`]).
+fn grant_read(
+    kernel: &Kernel,
+    id: u64,
+    correlation: u64,
+    node: NodeId,
+    outcome: ReadOutcome,
+) -> Event {
+    let request = kernel.asked(correlation, node);
+    grant_read_as(request, id, correlation, node, outcome)
+}
+
+/// [`grant_read`], answering the `Get` sent as `request`.
+fn grant_read_as(
+    request: ControlRequestId,
+    id: u64,
+    correlation: u64,
+    node: NodeId,
+    outcome: ReadOutcome,
+) -> Event {
     control(
         id,
         correlation,
         ControlEvent::Value {
+            request,
             key: ControlKey::Grant(node),
             outcome,
         },
@@ -310,7 +420,7 @@ impl ExternalClaim {
 
 /// `Held`, with `TAKEN` read `Fencing` (T1) and a `Takeover` created by the correlated read of
 /// `OTHER`'s grant (T3), at ticks 10 and 11 — far below [`PROOF_TICK`].
-fn taking_over(frozen: bool) -> Authority {
+fn taking_over(frozen: bool) -> Kernel {
     let mut kernel = held();
     kernel
         .step(
@@ -321,7 +431,7 @@ fn taking_over(frozen: bool) -> Authority {
     kernel
         .step(
             &ctx(11),
-            &grant_read(11, 10, OTHER, prior_grant(frozen, t3_rev(frozen))),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(frozen, t3_rev(frozen))),
         )
         .expect("T3 is built");
     assert!(kernel.view().takeover.contains_key(&TAKEN), "fixture: T3");
@@ -384,7 +494,7 @@ fn shapes(effects: &[Effect]) -> Vec<Shape> {
     effects
         .iter()
         .map(|effect| match &effect.kind {
-            EffectKind::Control(ControlEffect::Get { key }) => Shape::Get(*key),
+            EffectKind::Control(ControlEffect::Get { key, .. }) => Shape::Get(*key),
             EffectKind::Kernel(KernelEffect::Ignored {
                 reason: KernelIgnoredReason::Authority(reason),
             }) => Shape::Ignored(reason.clone(), effect.partition),
@@ -519,7 +629,7 @@ fn a_node_scoped_freeze_proves_only_the_partition_being_fenced() {
     kernel
         .step(
             &ctx(11),
-            &grant_read(11, 10, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
     let effects = kernel.step(&ctx(900), &tick(12)).expect("built");
@@ -702,6 +812,7 @@ fn absent_read(id: u64, as_of: u64) -> Event {
         id,
         id,
         ControlEvent::Value {
+            request: UNASKED,
             key: ControlKey::Partition(TAKEN),
             outcome: ReadOutcome::Absent {
                 as_of: Revision(as_of),
@@ -714,11 +825,17 @@ fn absent_read(id: u64, as_of: u64) -> Event {
 /// sweep far past the bound. Neither may create an entry or prove. This is A-R52's hazard carried
 /// to its end: a node-scoped freeze proving expiry for a partition that is no longer being
 /// fenced.
-fn assert_no_takeover_follows(kernel: &mut Authority, correlation: u64) {
+fn assert_no_takeover_follows(kernel: &mut Kernel, correlation: u64) {
     let answer = kernel
         .step(
             &ctx(50),
-            &grant_read(50, correlation, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(
+                kernel,
+                50,
+                correlation,
+                OTHER,
+                prior_grant(true, FROZEN_REV),
+            ),
         )
         .expect("built");
     let sweep = kernel.step(&ctx(900), &tick(51)).expect("built");
@@ -828,7 +945,7 @@ fn a_newer_fencing_read_after_serving_starts_a_takeover() {
     kernel
         .step(
             &ctx(12),
-            &grant_read(12, 11, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 12, 11, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
     assert_eq!(kernel.view().takeover[&TAKEN], created(true));
@@ -872,7 +989,7 @@ fn an_older_snapshot_not_listing_p_keeps_a_newer_entry() {
     kernel
         .step(
             &ctx(11),
-            &grant_read(11, 10, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
     assert_eq!(kernel.view().takeover[&TAKEN], created(true), "fixture: T3");
@@ -900,7 +1017,7 @@ fn t3_the_correlated_grant_read_creates_the_entry_whole() {
     let effects = kernel
         .step(
             &ctx(11),
-            &grant_read(11, 10, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
 
@@ -933,7 +1050,7 @@ fn t3_a_frozen_read_past_the_bound_proves_in_its_own_step() {
     let effects = kernel
         .step(
             &ctx(PROOF_TICK),
-            &grant_read(11, 10, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
 
@@ -964,6 +1081,7 @@ fn t4_an_absent_prior_grant_defers_and_the_next_read_retries() {
         .step(
             &ctx(11),
             &grant_read(
+                &kernel,
                 11,
                 10,
                 OTHER,
@@ -1019,7 +1137,7 @@ fn t5_an_unavailable_prior_grant_is_read_again() {
     let effects = kernel
         .step(
             &ctx(11),
-            &grant_read(11, 10, OTHER, ReadOutcome::Unavailable),
+            &grant_read(&kernel, 11, 10, OTHER, ReadOutcome::Unavailable),
         )
         .expect("built");
     assert_eq!(shapes(&effects), vec![Shape::Get(ControlKey::Grant(OTHER))]);
@@ -1028,7 +1146,7 @@ fn t5_an_unavailable_prior_grant_is_read_again() {
     kernel
         .step(
             &ctx(12),
-            &grant_read(12, 10, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 12, 10, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
     assert_eq!(kernel.view().takeover[&TAKEN], created(true));
@@ -1043,7 +1161,7 @@ fn t6_an_uncorrelated_read_records_a_later_freeze() {
     let effects = kernel
         .step(
             &ctx(12),
-            &grant_read(12, 12, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 12, 12, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
 
@@ -1062,7 +1180,7 @@ fn t6_an_older_uncorrelated_read_does_not_unfreeze() {
     let effects = kernel
         .step(
             &ctx(12),
-            &grant_read(12, 12, OTHER, prior_grant(false, FROZEN_REV - 1)),
+            &grant_read(&kernel, 12, 12, OTHER, prior_grant(false, FROZEN_REV - 1)),
         )
         .expect("built");
 
@@ -1101,7 +1219,7 @@ fn t7_a_drained_record_reads_the_grant_and_the_freeze_proves_the_drain() {
     let effects = kernel
         .step(
             &ctx(13),
-            &grant_read(13, 13, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 13, 13, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
     assert_eq!(
@@ -1168,7 +1286,7 @@ fn a_drain_seen_before_the_entry_exists_is_not_lost() {
     let effects = kernel
         .step(
             &ctx(11),
-            &grant_read(11, 10, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
 
@@ -1294,6 +1412,7 @@ fn a_fenced_node_keeps_its_entry_and_proves_nothing() {
         .step(
             &ctx(12),
             &grant_read(
+                &kernel,
                 12,
                 12,
                 NODE,
@@ -1313,7 +1432,7 @@ fn a_fenced_node_keeps_its_entry_and_proves_nothing() {
 
 // ---- T11–T13: the external fence --------------------------------------------------------------
 
-fn external(kernel: &mut Authority, now: u64, claim: ExternalClaim) -> Vec<Shape> {
+fn external(kernel: &mut Kernel, now: u64, claim: ExternalClaim) -> Vec<Shape> {
     let effects = kernel
         .step(&ctx(now), &event(now, now, claim.kind()))
         .expect("ExternalFenceVerified is supported");
@@ -1430,7 +1549,7 @@ fn t12_a_claim_after_a_proof_is_already_authorized() {
 /// The scope rule for T11: while not `Held`, a claim is deferred, not judged.
 #[retcd_test]
 fn an_external_claim_while_unheld_is_deferred() {
-    let mut kernel = Authority::new();
+    let mut kernel = Kernel::new();
 
     assert_eq!(
         external(&mut kernel, 12, claim()),
@@ -1475,6 +1594,7 @@ fn t6_a_frozen_read_older_than_the_unfrozen_one_t3_saw_is_stale() {
         .step(
             &ctx(12),
             &grant_read(
+                &kernel,
                 12,
                 12,
                 OTHER,
@@ -1509,7 +1629,7 @@ fn a_prior_grant_body_naming_another_node_is_family_rejected() {
         )
         .expect("T1 is built");
     let t3 = kernel
-        .step(&ctx(11), &grant_read(11, 10, OTHER, foreign()))
+        .step(&ctx(11), &grant_read(&kernel, 11, 10, OTHER, foreign()))
         .expect("built");
     assert_eq!(
         shapes(&t3),
@@ -1520,7 +1640,7 @@ fn a_prior_grant_body_naming_another_node_is_family_rejected() {
 
     let mut kernel = taking_over(false);
     let t6 = kernel
-        .step(&ctx(12), &grant_read(12, 12, OTHER, foreign()))
+        .step(&ctx(12), &grant_read(&kernel, 12, 12, OTHER, foreign()))
         .expect("built");
     assert_eq!(
         shapes(&t6),
@@ -1543,7 +1663,7 @@ fn t6_an_uncorrelated_read_at_the_freeze_revision_is_stale() {
     let effects = kernel
         .step(
             &ctx(12),
-            &grant_read(12, 12, OTHER, prior_grant(true, FROZEN_REV)),
+            &grant_read(&kernel, 12, 12, OTHER, prior_grant(true, FROZEN_REV)),
         )
         .expect("built");
 
@@ -1585,7 +1705,7 @@ fn wide(now: u64) -> StepCtx<'static> {
 }
 
 /// [`taking_over`] with a frozen grant, then the wide sample adopted. Nothing is proven yet.
-fn taking_over_on_a_wide_sample() -> Authority {
+fn taking_over_on_a_wide_sample() -> Kernel {
     let mut kernel = taking_over(true);
     let effects = kernel
         .step(&wide(WIDE_SAMPLED_AT), &tick(WIDE_SAMPLED_AT))
@@ -1681,7 +1801,7 @@ fn m7a_51_takeover_authorized_by_durable_drain() {
 }
 
 /// The shared input of M7A-52 and M7A-53: the wide sample, then a step at `now`.
-fn wide_sweep_at(now: u64) -> (Authority, Vec<Effect>) {
+fn wide_sweep_at(now: u64) -> (Kernel, Vec<Effect>) {
     let mut kernel = taking_over_on_a_wide_sample();
     let effects = kernel.step(&wide(now), &tick(now)).expect("built");
     (kernel, effects)
@@ -1788,12 +1908,11 @@ fn m7a_55_takeover_authorized_at_most_once_per_prior_owner_epoch() {
     effects.extend(second);
 
     let next = PRIOR_EPOCH + 1;
-    for (event, now) in [
-        (partition_read(14, 14, 30, &drained(next)), 14),
-        (grant_read(15, 14, OTHER, prior_grant(true, 31)), 15),
-    ] {
-        effects.extend(kernel.step(&ctx(now), &event).expect("built"));
-    }
+    // One step at a time: the grant read answers the `Get` the partition read sends.
+    let read = partition_read(14, 14, 30, &drained(next));
+    effects.extend(kernel.step(&ctx(14), &read).expect("built"));
+    let read = grant_read(&kernel, 15, 14, OTHER, prior_grant(true, 31));
+    effects.extend(kernel.step(&ctx(15), &read).expect("built"));
 
     let epochs: Vec<OwnerEpoch> = proven(&effects)
         .into_iter()
@@ -1965,7 +2084,7 @@ fn m7a_151_external_fence_takeover_authorized_at_most_once_per_prior_owner_epoch
         ..claim()
     };
     let mut effects = Vec::new();
-    let mut step = |kernel: &mut Authority, now: u64, event: Event| {
+    let mut step = |kernel: &mut Kernel, now: u64, event: Event| {
         let out = kernel.step(&ctx(now), &event).expect("built");
         effects.extend(out.iter().cloned());
         shapes(&out)
@@ -1986,11 +2105,8 @@ fn m7a_151_external_fence_takeover_authorized_at_most_once_per_prior_owner_epoch
 
     let fencing = record(TAKEN, OTHER, PRIOR_EPOCH + 1, PartitionLifecycle::Fencing);
     step(&mut kernel, 15, partition_read(15, 15, 30, &fencing));
-    step(
-        &mut kernel,
-        16,
-        grant_read(16, 15, OTHER, prior_grant(true, 31)),
-    );
+    let read = grant_read(&kernel, 16, 15, OTHER, prior_grant(true, 31));
+    step(&mut kernel, 16, read);
     step(&mut kernel, 17, event(17, 17, next.kind()));
     step(&mut kernel, 18, event(18, 18, next.kind()));
 
@@ -2001,5 +2117,60 @@ fn m7a_151_external_fence_takeover_authorized_at_most_once_per_prior_owner_epoch
     assert_eq!(
         epochs,
         vec![OwnerEpoch(PRIOR_EPOCH), OwnerEpoch(PRIOR_EPOCH + 1)]
+    );
+}
+
+/// M7A-181. Lead ledger L-R177hs; B-R74b's twin on a takeover's prior-grant read (T5, `design.md`
+/// §2.6a). An answer to a read A1 has already re-issued is not the answer to the re-read, even
+/// on the same key under the same correlation.
+///
+/// T1 reads `grants/{OTHER}` (request #1). Its answer is `Unavailable`, so T5 reads again (#2).
+/// A second, late answer to #1 then arrives — unfrozen, at a revision that would create the entry.
+/// Matched by key and correlation it would stand in for #2's answer. It creates nothing. #2's own
+/// answer then creates the entry. Red on `HEAD` (547c82c): the late answer created the entry
+/// (frozen `None`, observed at 20).
+#[retcd_test]
+fn m7a_181_a_late_answer_to_a_re_issued_prior_grant_read_creates_nothing() {
+    let mut kernel = held();
+    let first = asked_once(
+        &kernel
+            .step(
+                &ctx(10),
+                &partition_read(10, 10, RECORD_REV, &taken(PartitionLifecycle::Fencing)),
+            )
+            .expect("T1"),
+    );
+    let second = asked_once(
+        &kernel
+            .step(
+                &ctx(11),
+                &grant_read_as(first, 11, 10, OTHER, ReadOutcome::Unavailable),
+            )
+            .expect("T5"),
+    );
+    assert_ne!(second, first, "M7A-181: the re-read is a fresh request");
+
+    kernel
+        .step(
+            &ctx(12),
+            &grant_read_as(first, 12, 10, OTHER, prior_grant(false, UNFROZEN_REV)),
+        )
+        .expect("a late second answer to the first read");
+    assert!(
+        kernel.view().takeover.is_empty(),
+        "M7A-181: the first read's late answer creates nothing: {:?}",
+        kernel.view().takeover
+    );
+
+    kernel
+        .step(
+            &ctx(13),
+            &grant_read_as(second, 13, 10, OTHER, prior_grant(true, FROZEN_REV)),
+        )
+        .expect("the re-read's own answer");
+    assert!(
+        kernel.view().takeover.contains_key(&TAKEN),
+        "M7A-181: the re-read's own answer creates the entry: {:?}",
+        kernel.view().takeover
     );
 }

@@ -116,8 +116,8 @@ use crate::contracts::event::{
     NodeLifecycle, StepCtx,
 };
 use crate::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, Generation, GrantId, NodeId,
-    OwnerEpoch, PartitionId, Revision, TimerId, TimerVersion,
+    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, Generation,
+    GrantId, NodeId, OwnerEpoch, PartitionId, Revision, TimerId, TimerVersion,
 };
 use crate::contracts::ignore::KernelIgnoredReason;
 use crate::contracts::recovery::RecoveryResult;
@@ -183,6 +183,11 @@ pub const WATCH_BACKOFF_CAP_MILLIS: u64 = 2_000;
 /// R1 `0x00C1`, P1 `0x00D1`, F1 `0x00F1` — with a kind in bits 32..48 and a partition in bits
 /// 0..32, so no partition moves an id into another module's block (`tests/timer_ids.rs`).
 pub const AUTHORITY_TIMER_BASE: u64 = 0x00A1 << 48;
+
+/// The first [`ControlRequestId`] A1 owns: A1's tag in bits 48..64, as for its timers. The sim
+/// offers every control answer to every module and F1 mints its own ids (in its `0x00F1` block),
+/// so a block of its own keeps an A1 id from ever equalling F1's (lead ledger L-R177hs).
+pub const AUTHORITY_CONTROL_REQUEST_BASE: u64 = 0x00A1 << 48;
 
 /// Which of A1's timers a [`TimerId`] is.
 ///
@@ -267,22 +272,17 @@ pub struct ServedLineage {
 
 /// An outstanding renewal CAS (team kernel-a `design.md` §2.1).
 ///
-/// # The correlation, not an `OpId`
+/// # The request id is the `OpId`
 ///
 /// `design.md` §2.1 spells both this and [`Acquire`] with an `op: OpId`, and §2.4 matches
-/// completions with `op == renewal.op`. **There is no such field to match on.**
-/// [`ControlEffect::Cas`] carries `{ key, expected, value }` and
-/// [`ControlEvent::CasResult`] carries `{ key, outcome }`; neither has an operation identity,
-/// and `OpId` is not a type in this workspace
-/// ([`OperationId`](crate::contracts::ids::OperationId) is a control-plane *record* key,
-/// spec §7.1). The identity that actually ties an effect to its completion is
-/// [`Effect::correlation`] / [`Event::correlation`], which the dispatcher carries through, so
-/// that is what is stored here. Recorded rather than silently substituted: it is a design
-/// citation that does not survive contact with the landed seam.
+/// completions with `op == renewal.op`. The contract's [`ControlRequestId`] is that identity:
+/// A1 mints one per request, [`ControlEffect::Cas`] carries it, and [`ControlEvent::CasResult`]
+/// echoes it. Until lead ledger L-R177hs the seam had no such field and the correlation stood in,
+/// which a late answer to an earlier CAS under the same correlation could pass for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Renewal {
-    /// The correlation the CAS effect was emitted under.
-    pub correlation: CorrelationId,
+    /// The request id the CAS was sent as; only an answer echoing it is this CAS's.
+    pub request: ControlRequestId,
     /// The tick the CAS was **dispatched** at. Becomes `Held::renewed_at` on commit, never the
     /// tick the completion arrived (finding K-A-06).
     pub dispatched_at: Tick,
@@ -293,11 +293,11 @@ pub struct Renewal {
 /// An outstanding create-only acquisition CAS (team kernel-a `design.md` §2.1, finding K-A-36).
 ///
 /// Same two fields and the same fate as [`Renewal`]; see that type for why the identity is a
-/// correlation.
+/// request id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Acquire {
-    /// The correlation the CAS effect was emitted under.
-    pub correlation: CorrelationId,
+    /// The request id the CAS was sent as; only an answer echoing it is this CAS's.
+    pub request: ControlRequestId,
     /// The tick the CAS was dispatched at.
     pub dispatched_at: Tick,
     /// The expiry the CAS writes.
@@ -770,7 +770,11 @@ pub struct Authority {
     /// under **and** the owner it reads. `design.md` §2.6a keys by correlation alone, but every
     /// effect of one step carries that step's correlation, so one snapshot naming two owners
     /// would collide. One read per owner answers every partition it names.
-    takeover_reads: BTreeMap<(CorrelationId, NodeId), BTreeMap<PartitionId, PendingTakeover>>,
+    ///
+    /// The key only joins the partitions of one step onto one read. The answer is matched by the
+    /// [`ControlRequestId`] stored in [`TakeoverRead`], never by the key: T5's re-read keeps the
+    /// key, so a late answer to the first read would otherwise pass for the re-read's.
+    takeover_reads: BTreeMap<(CorrelationId, NodeId), TakeoverRead>,
     /// The takeover side's high-water mark over `partitions/*` (lead ruling A-R52).
     takeover_marks: TakeoverMarks,
     /// The `partitions/{id}` reads the `Recovered` trigger row issued and no answer has reached
@@ -782,13 +786,27 @@ pub struct Authority {
     /// `Recovered` for the same partition supersedes the first, whose read-back is then an
     /// ordinary read.
     recovery_reads: BTreeMap<PartitionId, RecoveryRead>,
+    /// How many control requests this kernel has sent. The next is
+    /// `AUTHORITY_CONTROL_REQUEST_BASE + requests_issued + 1`: a counter, so every request id is
+    /// fresh and deterministic (no clock, no randomness). Per instance, like `grants_issued`.
+    requests_issued: u64,
+}
+
+/// One outstanding T1 `grants/{owner}` read: the request it was sent as, and every partition it
+/// answers for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TakeoverRead {
+    request: ControlRequestId,
+    pending: BTreeMap<PartitionId, PendingTakeover>,
 }
 
 /// One outstanding post-`Recovered` read of `partitions/{id}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryRead {
-    /// The `Recovered` event's correlation, which its `Get` and that `Get`'s answer carry.
-    correlation: CorrelationId,
+    /// The request id the trigger row's `Get` was sent as. Only the answer echoing it is the
+    /// read-back; another read of the same key under the same correlation is not (the tester's
+    /// F4, closed by lead ledger L-R177hs).
+    request: ControlRequestId,
     /// `r.new_generation`: the install row fires only for a record naming it.
     generation: Generation,
 }
@@ -810,6 +828,7 @@ impl Authority {
             takeover_reads: BTreeMap::new(),
             takeover_marks: TakeoverMarks::default(),
             recovery_reads: BTreeMap::new(),
+            requests_issued: 0,
         }
     }
 
@@ -1034,6 +1053,18 @@ impl Authority {
     /// Wrap a control request as an effect of this module, for this event.
     fn control(event: &Event, kind: ControlEffect) -> Effect {
         Self::effect(event, EffectKind::Control(kind))
+    }
+
+    /// A request id no earlier request of this kernel carried.
+    fn request(&mut self) -> ControlRequestId {
+        self.requests_issued = self.requests_issued.saturating_add(1);
+        ControlRequestId(AUTHORITY_CONTROL_REQUEST_BASE + self.requests_issued)
+    }
+
+    /// A linearizable read of `key`, as a fresh request.
+    fn get(&mut self, event: &Event, key: ControlKey) -> Effect {
+        let request = self.request();
+        Self::control(event, ControlEffect::Get { request, key })
     }
 
     /// Wrap one of kernel-a's own facts on its arm of [`KernelEffect`] (lead ruling A-R25).
@@ -1452,9 +1483,14 @@ impl Authority {
     ) -> Vec<Effect> {
         self.watch_refused_attempts = 0;
         self.cursors.insert(prefix, cursor_revision);
+        self.reads(event, changes)
+    }
+
+    /// One fresh `Get` per watched change, in order.
+    fn reads(&mut self, event: &Event, changes: &[ControlChange]) -> Vec<Effect> {
         changes
             .iter()
-            .map(|change| Self::control(event, ControlEffect::Get { key: change.key }))
+            .map(|change| self.get(event, change.key))
             .collect()
     }
 
@@ -1523,12 +1559,7 @@ impl Authority {
                 self.watch_backoff.insert(prefix, resume);
                 let at = ctx.now.plus_millis(Self::watch_backoff_millis(1));
                 vec![
-                    Self::control(
-                        event,
-                        ControlEffect::Get {
-                            key: ControlKey::Grant(ctx.node),
-                        },
-                    ),
+                    self.get(event, ControlKey::Grant(ctx.node)),
                     self.arm(event, AuthorityTimer::WatchBackoff, at),
                 ]
             }
@@ -1966,10 +1997,11 @@ impl Authority {
     fn on_recovered(&mut self, event: &Event, result: &RecoveryResult) -> Vec<Effect> {
         let prior = &result.fenced_prior;
         let partition = prior.partition;
+        let request = self.request();
         self.recovery_reads.insert(
             partition,
             RecoveryRead {
-                correlation: event.correlation,
+                request,
                 generation: result.new_generation,
             },
         );
@@ -1982,6 +2014,7 @@ impl Authority {
                     && served.owner_epoch == prior.prior_owner_epoch
             });
         let read = ControlEffect::Get {
+            request,
             key: ControlKey::Partition(partition),
         };
         let mut effects = vec![Self::about(Self::control(event, read), partition)];
@@ -1992,11 +2025,16 @@ impl Authority {
         effects
     }
 
-    /// The generation a `Recovered` trigger's read of `partitions/{id}` named, if `event` is that
-    /// read's answer; the entry is removed either way it matches. `None` for any other read.
-    fn take_recovery_read(&mut self, event: &Event, id: PartitionId) -> Option<Generation> {
+    /// The generation a `Recovered` trigger's read of `partitions/{id}` named, if the answer
+    /// echoing `request` is that read's; the entry is removed either way it matches. `None` for
+    /// any other read, a read of the same key under the same correlation included.
+    fn take_recovery_read(
+        &mut self,
+        request: ControlRequestId,
+        id: PartitionId,
+    ) -> Option<Generation> {
         let read = self.recovery_reads.get(&id)?;
-        if read.correlation != event.correlation {
+        if read.request != request {
             return None;
         }
         self.recovery_reads.remove(&id).map(|read| read.generation)
@@ -2062,8 +2100,8 @@ impl Authority {
     ///    and a retry. **No CAS**, the same rule as the renewal: no sample, no `E_new`, no write
     ///    (ADR-rdb-0007 §2, finding K-A-36).
     /// 3. Otherwise one create-only `Cas` of `grants/{node}` carrying a new grant id, this boot
-    ///    and `E_new` at this tick, and `acquire` remembers all three plus the correlation it was
-    ///    issued under.
+    ///    and `E_new` at this tick, and `acquire` remembers all three plus the request id it was
+    ///    sent as.
     ///
     /// # What arms the first one: nothing yet
     ///
@@ -2095,8 +2133,9 @@ impl Authority {
             expiry_utc_ms: e_new,
             frozen: false,
         };
+        let request = self.request();
         self.set_acquire(Some(Acquire {
-            correlation: event.correlation,
+            request,
             dispatched_at: ctx.now,
             e_new,
             grant,
@@ -2104,6 +2143,7 @@ impl Authority {
         vec![Self::control(
             event,
             ControlEffect::Cas {
+                request,
                 key: ControlKey::Grant(ctx.node),
                 expected: None,
                 value: Some(record.encode()),
@@ -2113,10 +2153,10 @@ impl Authority {
 
     /// A CAS of `grants/{node}` completed.
     ///
-    /// # Matched by correlation, or not at all (lead ruling A-R47)
+    /// # Matched by request id, or not at all (lead ruling A-R47)
     ///
-    /// `design.md` §2.4 matches every completion row on `op == acquire.op`; the correlation is
-    /// that identity here (see [`Renewal`]). A completion that matches no CAS in flight is
+    /// `design.md` §2.4 matches every completion row on `op == acquire.op`; the
+    /// [`ControlRequestId`] the answer echoes is that identity (see [`Renewal`]). A completion that matches no CAS in flight is
     /// [`AuthorityIgnoreReason::UnmatchedCompletion`] and moves nothing. Until A-R47 an
     /// `Unheld` kernel adopted **any** `Committed` on a grant key — the one-event shortcut every
     /// fixture used — and a commit nobody here issued is not a grant.
@@ -2151,6 +2191,7 @@ impl Authority {
         &mut self,
         ctx: &StepCtx<'_>,
         event: &Event,
+        request: ControlRequestId,
         key: ControlKey,
         outcome: CasOutcome,
     ) -> Vec<Effect> {
@@ -2158,7 +2199,7 @@ impl Authority {
             return Vec::new();
         }
         if self.state.is_held() {
-            return self.on_renewal_result(ctx, event, key, outcome);
+            return self.on_renewal_result(ctx, event, request, key, outcome);
         }
         if self.state.is_fenced() {
             return vec![Self::ignored(
@@ -2169,7 +2210,7 @@ impl Authority {
         let Some(acquire) = self
             .state
             .acquire()
-            .filter(|acquire| acquire.correlation == event.correlation)
+            .filter(|acquire| acquire.request == request)
         else {
             return vec![Self::ignored(
                 event,
@@ -2177,7 +2218,6 @@ impl Authority {
             )];
         };
         self.set_acquire(None);
-        let read_back = Self::control(event, ControlEffect::Get { key });
         match outcome {
             CasOutcome::Committed(revision) => {
                 let record = GrantRecord {
@@ -2191,10 +2231,10 @@ impl Authority {
                 self.enter_held(ctx, event, &record, revision, acquire.dispatched_at)
             }
             CasOutcome::Conflict { .. } => vec![
-                read_back,
+                self.get(event, key),
                 Self::authority(event, AuthorityEffect::Fact(AuthorityFact::AcquireLost)),
             ],
-            CasOutcome::Unknown | CasOutcome::Unavailable => vec![read_back],
+            CasOutcome::Unknown | CasOutcome::Unavailable => vec![self.get(event, key)],
         }
     }
 
@@ -2330,7 +2370,7 @@ impl Authority {
     ///    `Expired` fence by itself, which is the design's intent (finding K-A-42).
     /// 3. Otherwise one `Cas` of `grants/{node}` expecting the **exact** revision held (spec
     ///    §7.3 step 1), writing the held record with `E_new` at this tick; `renewal` remembers the
-    ///    correlation, the dispatch tick and `E_new`.
+    ///    request id, the dispatch tick and `E_new`.
     ///
     /// The guard is on the sample, never the mode: with [`clock::ClockMode::Unbounded`] and a valid
     /// sample the renewal is still sent (see [`Self::revalidate`] on the K-A-07 loop).
@@ -2357,9 +2397,10 @@ impl Authority {
             frozen: false,
         };
         let expected = held.record_revision;
+        let request = self.request();
         if let AuthorityState::Held(held) = &mut self.state {
             held.renewal = Some(Renewal {
-                correlation: event.correlation,
+                request,
                 dispatched_at: ctx.now,
                 e_new,
             });
@@ -2367,6 +2408,7 @@ impl Authority {
         vec![Self::control(
             event,
             ControlEffect::Cas {
+                request,
                 key: ControlKey::Grant(ctx.node),
                 expected: Some(expected),
                 value: Some(record.encode()),
@@ -2376,7 +2418,7 @@ impl Authority {
 
     /// A CAS of `grants/{node}` completed while `Held`: the renewal rows.
     ///
-    /// Matched by correlation, as the acquisition is (lead ruling A-R47); an unmatched one is
+    /// Matched by request id, as the acquisition is (lead ruling A-R47); an unmatched one is
     /// [`AuthorityIgnoreReason::UnmatchedCompletion`] and moves nothing. A matched one clears
     /// `renewal`, then:
     ///
@@ -2395,14 +2437,13 @@ impl Authority {
         &mut self,
         ctx: &StepCtx<'_>,
         event: &Event,
+        request: ControlRequestId,
         key: ControlKey,
         outcome: CasOutcome,
     ) -> Vec<Effect> {
         let renewal = match &mut self.state {
             AuthorityState::Held(held) => {
-                let Some(renewal) = held
-                    .renewal
-                    .filter(|renewal| renewal.correlation == event.correlation)
+                let Some(renewal) = held.renewal.filter(|renewal| renewal.request == request)
                 else {
                     return vec![Self::ignored(
                         event,
@@ -2420,7 +2461,6 @@ impl Authority {
             }
             _ => return Vec::new(),
         };
-        let read_back = Self::control(event, ControlEffect::Get { key });
         match outcome {
             CasOutcome::Committed(_) => {
                 let at = renewal.dispatched_at.plus_millis(ctx.budgets.renew_millis);
@@ -2430,16 +2470,17 @@ impl Authority {
                 effects
             }
             CasOutcome::Conflict { .. } => vec![
-                read_back,
+                self.get(event, key),
                 Self::authority(event, AuthorityEffect::Fact(AuthorityFact::RenewLost)),
             ],
             CasOutcome::Unknown => vec![
-                read_back,
+                self.get(event, key),
                 Self::authority(event, AuthorityEffect::Fact(AuthorityFact::RenewUnknown)),
             ],
             CasOutcome::Unavailable => {
                 let at = ctx.now.plus_millis(ctx.budgets.renew_millis);
-                vec![self.arm(event, AuthorityTimer::Renew, at), read_back]
+                let renew = self.arm(event, AuthorityTimer::Renew, at);
+                vec![renew, self.get(event, key)]
             }
         }
     }
@@ -2578,33 +2619,36 @@ impl Authority {
         control: &ControlEvent,
     ) -> Result<Vec<Effect>, RdbError> {
         match control {
-            ControlEvent::CasResult { key, outcome } => {
-                Ok(self.on_cas_result(ctx, event, *key, *outcome))
-            }
+            ControlEvent::CasResult {
+                request,
+                key,
+                outcome,
+            } => Ok(self.on_cas_result(ctx, event, *request, *key, *outcome)),
 
             ControlEvent::Value {
                 key: ControlKey::Grant(node),
                 outcome,
+                ..
             } if *node == ctx.node => self.on_grant_read(ctx, event, outcome),
 
             // An unheld node still reads what a watch names, and only the read's answer can
             // grant (TD-17; M7A-34, M7A-35). A watch event carries a revision, never a body, so
             // it issues the same `Get` a held node would and nothing else: the cursor and the
             // refusal counter belong to a held node's stream (A-R78 F2).
-            ControlEvent::Watched { changes, .. } if self.state.is_unheld() => Ok(changes
-                .iter()
-                .map(|change| Self::control(event, ControlEffect::Get { key: change.key }))
-                .collect()),
+            ControlEvent::Watched { changes, .. } if self.state.is_unheld() => {
+                Ok(self.reads(event, changes))
+            }
 
             // The read-back of a `Recovered` trigger reaching a node that holds no grant (lead
             // ruling A-R78): nothing installs, because there is no grant to serve under. The
             // acquire's coherent load installs the recovered generation (`design.md` §2.4/§2.1).
             // The read is answered, so it is forgotten, and a later read cannot pass for it.
             ControlEvent::Value {
+                request,
                 key: ControlKey::Partition(id),
                 ..
             } if !self.state.is_held() => {
-                let _ = self.take_recovery_read(event, *id);
+                let _ = self.take_recovery_read(*request, *id);
                 Ok(Vec::new())
             }
 
@@ -2638,10 +2682,11 @@ impl Authority {
 
             // This node's serving rights first, then the takeover table (T1, T2, T7).
             ControlEvent::Value {
+                request,
                 key: ControlKey::Partition(id),
                 outcome,
             } => {
-                let recovery = self.take_recovery_read(event, *id);
+                let recovery = self.take_recovery_read(*request, *id);
                 let mut effects = self.on_partition_read(ctx, event, *id, outcome, recovery)?;
                 effects.extend(self.observe_read(event, ctx.node, *id, outcome));
                 Ok(effects)
@@ -2649,9 +2694,10 @@ impl Authority {
 
             // Another node's grant: a takeover's prior owner, T3–T6 (`design.md` §2.6a).
             ControlEvent::Value {
+                request,
                 key: ControlKey::Grant(node),
                 outcome,
-            } => Ok(self.on_prior_grant_read(event, *node, outcome)),
+            } => Ok(self.on_prior_grant_read(event, *request, *node, outcome)),
 
             // A record read answered for a family A1 does not serve from: the cluster schema, a
             // node record, a route, an operation, or the planner's own grant. None of them widens
@@ -2687,9 +2733,9 @@ impl Authority {
 
     /// Forget every outstanding T1 read for `p`.
     fn drop_pending(&mut self, partition: PartitionId) {
-        self.takeover_reads.retain(|_, pending| {
-            pending.remove(&partition);
-            !pending.is_empty()
+        self.takeover_reads.retain(|_, outstanding| {
+            outstanding.pending.remove(&partition);
+            !outstanding.pending.is_empty()
         });
     }
 
@@ -2749,12 +2795,8 @@ impl Authority {
                 if entry.frozen.is_none() {
                     // Frozen before drained (M7A-57): read the grant; the sweep proves once the
                     // read finds it frozen.
-                    return vec![Self::control(
-                        event,
-                        ControlEffect::Get {
-                            key: ControlKey::Grant(entry.prior_node),
-                        },
-                    )];
+                    let prior = entry.prior_node;
+                    return vec![self.get(event, ControlKey::Grant(prior))];
                 }
                 return Vec::new();
             }
@@ -2764,8 +2806,8 @@ impl Authority {
         }
         // A read already outstanding for this lineage answers for it: record a drain, issue
         // nothing.
-        for pending in self.takeover_reads.values_mut() {
-            if let Some(read) = pending.get_mut(&partition) {
+        for outstanding in self.takeover_reads.values_mut() {
+            if let Some(read) = outstanding.pending.get_mut(&partition) {
                 if read.generation == record.generation && read.owner_epoch == record.owner_epoch {
                     if drained {
                         read.drained_at.get_or_insert(revision);
@@ -2775,26 +2817,33 @@ impl Authority {
             }
         }
         self.drop_pending(partition);
+        let read = PendingTakeover {
+            generation: record.generation,
+            owner_epoch: record.owner_epoch,
+            drained_at: drained.then_some(revision),
+        };
+        // One read per owner per step: a partition this step already asked that owner about
+        // joins that read.
         let key = (event.correlation, record.owner);
-        let first = !self.takeover_reads.contains_key(&key);
-        self.takeover_reads.entry(key).or_default().insert(
-            partition,
-            PendingTakeover {
-                generation: record.generation,
-                owner_epoch: record.owner_epoch,
-                drained_at: drained.then_some(revision),
+        if let Some(outstanding) = self.takeover_reads.get_mut(&key) {
+            outstanding.pending.insert(partition, read);
+            return Vec::new();
+        }
+        let request = self.request();
+        self.takeover_reads.insert(
+            key,
+            TakeoverRead {
+                request,
+                pending: BTreeMap::from([(partition, read)]),
             },
         );
-        if first {
-            vec![Self::control(
-                event,
-                ControlEffect::Get {
-                    key: ControlKey::Grant(record.owner),
-                },
-            )]
-        } else {
-            Vec::new()
-        }
+        vec![Self::control(
+            event,
+            ControlEffect::Get {
+                request,
+                key: ControlKey::Grant(record.owner),
+            },
+        )]
     }
 
     /// T1/T2/T7 for a single linearizable read of `partitions/{id}`, only when it is newer than
@@ -2853,7 +2902,11 @@ impl Authority {
         let unlisted: Vec<PartitionId> = self
             .takeover
             .keys()
-            .chain(self.takeover_reads.values().flat_map(BTreeMap::keys))
+            .chain(
+                self.takeover_reads
+                    .values()
+                    .flat_map(|outstanding| outstanding.pending.keys()),
+            )
             .filter(|id| !listed.contains_key(id))
             .filter(|id| self.takeover_marks.is_newer(**id, snapshot_revision))
             .copied()
@@ -2875,6 +2928,7 @@ impl Authority {
     fn on_prior_grant_read(
         &mut self,
         event: &Event,
+        request: ControlRequestId,
         node: NodeId,
         outcome: &ReadOutcome,
     ) -> Vec<Effect> {
@@ -2886,16 +2940,28 @@ impl Authority {
                 .map(|record| (record, *revision)),
             _ => None,
         };
-        if let Some(pending) = self.takeover_reads.remove(&(event.correlation, node)) {
+        // T1's read, matched by the request id its answer echoes and never by key: after T5 the
+        // key is the same and only the id tells the re-read's answer from the first read's.
+        let answered = self
+            .takeover_reads
+            .iter()
+            .find(|((_, owner), outstanding)| *owner == node && outstanding.request == request)
+            .map(|(key, _)| *key);
+        if let Some(key) = answered {
+            let Some(TakeoverRead { pending, .. }) = self.takeover_reads.remove(&key) else {
+                return Vec::new();
+            };
             return match outcome {
-                // T5: unavailable → re-read (ADR-rdb-0007 §3). The re-read carries this event's
-                // correlation, so the pending read moves to it.
+                // T5: unavailable → re-read (ADR-rdb-0007 §3), as a fresh request under the same
+                // key; the first read's id no longer matches.
                 ReadOutcome::Unavailable => {
+                    let request = self.request();
                     self.takeover_reads
-                        .insert((event.correlation, node), pending);
+                        .insert(key, TakeoverRead { request, pending });
                     vec![Self::control(
                         event,
                         ControlEffect::Get {
+                            request,
                             key: ControlKey::Grant(node),
                         },
                     )]

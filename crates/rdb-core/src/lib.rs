@@ -60,10 +60,10 @@ pub use contracts::event::{
 };
 pub use contracts::ids::{
     AffinityId, AppliedSeq, AuthorityGeneration, BatchId, BootId, ChoiceId, ClientId,
-    ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket, Generation, GrantId, LeaseId,
-    MessageId, NodeId, OperationId, OwnerEpoch, PartitionId, RangeId, ReceivedSeq, ReplicaRole,
-    RequestId, RequestIdentity, Revision, ScenarioId, Seq, SnapshotHandle, TenantId, TimerId,
-    TimerVersion,
+    ConfigVersion, ControlRequestId, CorrelationId, DurableSeq, EventId, FlushTicket, Generation,
+    GrantId, LeaseId, MessageId, NodeId, OperationId, OwnerEpoch, PartitionId, RangeId,
+    ReceivedSeq, ReplicaRole, RequestId, RequestIdentity, Revision, ScenarioId, Seq,
+    SnapshotHandle, TenantId, TimerId, TimerVersion,
 };
 pub use contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 pub use contracts::membership::{CopyId, Member, PartitionConfig};

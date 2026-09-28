@@ -24,9 +24,9 @@ use rdb_core::contracts::event::{
     Budgets, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, Generation,
-    GrantId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, SnapshotHandle, TimerId,
-    TimerVersion,
+    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, DurableSeq,
+    EventId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
+    SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -409,6 +409,7 @@ fn foreign_timers_and_events_are_refused() {
         let echo = EventKind::Kernel(KernelEvent::SetAdmission(state(&golden(), 0)));
         // A control event, as the sim's `harness::run` tests seed: not an L1 input.
         let control = EventKind::Control(ControlEvent::CasResult {
+            request: ControlRequestId(1),
             key: ControlKey::ClusterSchema,
             outcome: CasOutcome::Conflict {
                 exists: true,

@@ -14,7 +14,9 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::errors::RdbError;
-use crate::contracts::ids::{NodeId, OperationId, PartitionId, RangeId, Revision};
+use crate::contracts::ids::{
+    ControlRequestId, NodeId, OperationId, PartitionId, RangeId, Revision,
+};
 
 /// The authoritative record families of spec §7.1.
 ///
@@ -325,10 +327,24 @@ pub struct WatchCursor {
 }
 
 /// What a kernel module asks the control environment to do.
+///
+/// # Matching an answer to its request
+///
+/// [`Self::Cas`] and [`Self::Get`] carry a [`ControlRequestId`] the requesting module mints,
+/// fresh per request, and the answering [`ControlEvent::CasResult`] or [`ControlEvent::Value`]
+/// echoes it unchanged. Answers to `Cas` and `Get` are matched to their request by that id: two
+/// requests on one key are otherwise indistinguishable, and a late answer to an abandoned one
+/// would be taken as the answer to the next (lead ledger L-R177hs). F1 matches every answer by
+/// it. A1 matches its grant CASes, its `Recovered` read-back and its takeover prior-grant reads
+/// (T3–T5) by it; its own-grant reads, its watch-driven partition reads and its T6 prior-grant
+/// reads it still judges by key and content, and none of those can commit. [`Self::Watch`] and
+/// [`Self::Reload`] carry none; their answers are judged by revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlEffect {
     /// Compare-and-swap one record. `expected: None` means "must not exist".
     Cas {
+        /// The requesting module's id for this request, echoed by its [`ControlEvent::CasResult`].
+        request: ControlRequestId,
         /// The record.
         key: ControlKey,
         /// The revision the caller believes the record is at.
@@ -338,6 +354,8 @@ pub enum ControlEffect {
     },
     /// Linearizable read of one record.
     Get {
+        /// The requesting module's id for this request, echoed by its [`ControlEvent::Value`].
+        request: ControlRequestId,
         /// The record.
         key: ControlKey,
     },
@@ -367,6 +385,8 @@ pub enum ControlEffect {
 pub enum ControlEvent {
     /// A CAS completed.
     CasResult {
+        /// The [`ControlEffect::Cas`] request this answers, unchanged: what matches the answer.
+        request: ControlRequestId,
         /// The record it was against.
         key: ControlKey,
         /// The outcome.
@@ -374,6 +394,8 @@ pub enum ControlEvent {
     },
     /// A read completed.
     Value {
+        /// The [`ControlEffect::Get`] request this answers, unchanged: what matches the answer.
+        request: ControlRequestId,
         /// The record.
         key: ControlKey,
         /// What the store said.

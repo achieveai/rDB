@@ -549,7 +549,7 @@ mod tests {
     fn tick_event(at: Tick) -> SeedEvent {
         use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey};
         use rdb_core::contracts::event::EventKind;
-        use rdb_core::contracts::ids::Revision;
+        use rdb_core::contracts::ids::{ControlRequestId, Revision};
 
         SeedEvent {
             at,
@@ -558,6 +558,7 @@ mod tests {
             partition: PartitionId(1),
             correlation: CorrelationId(1),
             kind: EventKind::Control(ControlEvent::CasResult {
+                request: ControlRequestId(1),
                 key: ControlKey::ClusterSchema,
                 outcome: CasOutcome::Conflict {
                     exists: true,

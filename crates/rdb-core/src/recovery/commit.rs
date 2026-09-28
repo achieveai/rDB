@@ -12,11 +12,46 @@
 //! than the one we superseded, or identical to our proposal, is a peer's decision; anything else,
 //! `Absent` and unreadable bytes included, is contention. A blind retry never happens:
 //! `Unavailable` and `Unknown` block.
+//!
+//! Every request carries a fresh [`ControlRequestId`] from [`Requests`], and only an answer
+//! echoing the outstanding one is this proposal's (lead ledger L-R177hs): a re-run's CAS and an
+//! abandoned run's CAS are on the same key, so the key alone cannot tell their answers apart.
 
 use crate::authority::partition::PartitionRecord;
 use crate::contracts::authority::BlockReason;
 use crate::contracts::control::{CasOutcome, ControlEffect, ControlKey, ReadOutcome};
-use crate::contracts::ids::{OwnerEpoch, PartitionId, Revision};
+use crate::contracts::ids::{ControlRequestId, OwnerEpoch, PartitionId, Revision};
+
+/// The first [`ControlRequestId`] F1 owns: F1's tag in bits 48..64, as for its timers
+/// ([`super::RECOVERY_TIMER_BASE`]). The sim offers every control answer to every module, and
+/// A1 mints its own ids too, so a block of its own keeps F1's from colliding with another's.
+pub const RECOVERY_CONTROL_REQUEST_BASE: u64 = 0x00F1 << 48;
+
+/// F1's control request ids: a counter, so fresh per request and deterministic (no clock, no
+/// randomness). The first is `RECOVERY_CONTROL_REQUEST_BASE + 1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Requests {
+    issued: u64,
+}
+
+impl Requests {
+    pub(crate) const fn new() -> Self {
+        Self { issued: 0 }
+    }
+
+    /// A request id no earlier request of this instance carried.
+    pub(crate) fn mint(&mut self) -> ControlRequestId {
+        self.issued += 1;
+        ControlRequestId(RECOVERY_CONTROL_REQUEST_BASE + self.issued)
+    }
+
+    /// Whether this instance minted `request`: an answer to one of F1's own requests, current
+    /// or not.
+    pub(crate) const fn minted(self, request: ControlRequestId) -> bool {
+        request.0 > RECOVERY_CONTROL_REQUEST_BASE
+            && request.0 <= RECOVERY_CONTROL_REQUEST_BASE + self.issued
+    }
+}
 
 /// What a control answer means for the proposal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,37 +74,52 @@ pub(crate) struct Cas {
     /// The owner epoch this proposal supersedes. A record above it on the re-read is a peer's.
     prior_epoch: OwnerEpoch,
     rereading: bool,
+    /// The request outstanding now: the CAS, then the re-read once a conflict asks for one.
+    request: ControlRequestId,
 }
 
 impl Cas {
-    /// A proposal of `record` over ownership at `prior_epoch`.
-    pub(crate) const fn new(record: PartitionRecord, prior_epoch: OwnerEpoch) -> Self {
+    /// A proposal of `record` over ownership at `prior_epoch`, sent as `request`.
+    pub(crate) const fn new(
+        record: PartitionRecord,
+        prior_epoch: OwnerEpoch,
+        request: ControlRequestId,
+    ) -> Self {
         Self {
             record,
             prior_epoch,
             rereading: false,
+            request,
         }
     }
 
     /// The control effect proposing this record, conditioned on `expected`.
     pub(crate) fn effect(&self, expected: Revision) -> ControlEffect {
         ControlEffect::Cas {
+            request: self.request,
             key: key(self.record.partition),
             expected: Some(expected),
             value: Some(self.record.encode()),
         }
     }
 
-    /// The re-read that classifies a conflict.
-    pub(crate) fn read_effect(&self) -> ControlEffect {
+    /// The re-read that classifies a conflict, sent as `request`, which is outstanding from now.
+    pub(crate) fn read_effect(&mut self, request: ControlRequestId) -> ControlEffect {
+        self.request = request;
         ControlEffect::Get {
+            request,
             key: key(self.record.partition),
         }
     }
 
+    /// The request outstanding now.
+    pub(crate) const fn request(&self) -> ControlRequestId {
+        self.request
+    }
+
     /// Whether this proposal is waiting for an answer on `answered`: a `CasResult` while
-    /// proposing, a `Value` while re-reading (`is_read`), and only on its own key. The sim offers
-    /// every control answer to every module, so anything else is not F1's to answer.
+    /// proposing, a `Value` while re-reading (`is_read`), and only on its own key. The caller has
+    /// matched the request id first; this is the shape check behind it.
     pub(crate) fn awaits(&self, answered: &ControlKey, is_read: bool) -> bool {
         *answered == key(self.record.partition) && is_read == self.rereading
     }

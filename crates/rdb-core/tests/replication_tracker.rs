@@ -34,10 +34,10 @@ use rdb_core::contracts::event::{
     StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AppliedSeq, AuthorityGeneration, BatchId, BootId, ClientId, ConfigVersion, CorrelationId,
-    DurableSeq, EventId, FlushTicket, Generation, GrantId, LeaseId, MessageId, NodeId, OwnerEpoch,
-    PartitionId, ReceivedSeq, ReplicaRole, RequestId, RequestIdentity, Revision, Seq,
-    SnapshotHandle, TenantId, TimerId, TimerVersion,
+    AppliedSeq, AuthorityGeneration, BatchId, BootId, ClientId, ConfigVersion, ControlRequestId,
+    CorrelationId, DurableSeq, EventId, FlushTicket, Generation, GrantId, LeaseId, MessageId,
+    NodeId, OwnerEpoch, PartitionId, ReceivedSeq, ReplicaRole, RequestId, RequestIdentity,
+    Revision, Seq, SnapshotHandle, TenantId, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -4586,11 +4586,13 @@ fn f1_rebuilding() -> (Recovery, RecoveryResult) {
             scheduled_at: Tick::ZERO,
         }),
     );
-    f1_rec(&mut f1, window + 100, f1_durable(COPY_A));
+    let proposal = f1_rec(&mut f1, window + 100, f1_durable(COPY_A));
+    let request = cas_request(&proposal).expect("fixture: the durable copy proposes");
     let committed = f1_on(
         &mut f1,
         window + 200,
         EventKind::Control(ControlEvent::CasResult {
+            request,
             key: ControlKey::Partition(P),
             outcome: CasOutcome::Committed(Revision(9)),
         }),
@@ -4620,6 +4622,15 @@ fn is_stall(effect: &EffectKind) -> bool {
 
 fn is_cas(effect: &EffectKind) -> bool {
     matches!(effect, EffectKind::Control(ControlEffect::Cas { .. }))
+}
+
+/// The request id of the control CAS in `effects`, if F1 sent one: its answer must echo it (lead
+/// ledger L-R177hs).
+fn cas_request(effects: &[EffectKind]) -> Option<ControlRequestId> {
+    effects.iter().find_map(|effect| match effect {
+        EffectKind::Control(ControlEffect::Cas { request, .. }) => Some(*request),
+        _ => None,
+    })
 }
 
 /// M7B-144 (design §3.3 `Differs` row: the copy is not a target of this rebuild; §3.4 the
@@ -5066,16 +5077,17 @@ fn rebuild_losing_one_ack(admission: Option<bool>, loss: Loss) -> (Recovery, Vec
         );
         now += 1;
     }
-    let mut proposed = false;
+    let mut proposed = None;
     for copy in std::iter::once(COPY_A).chain(caught) {
-        proposed |= f1_rec(&mut f1, now, f1_durable(copy)).iter().any(is_cas);
+        proposed = cas_request(&f1_rec(&mut f1, now, f1_durable(copy))).or(proposed);
         now += 1;
     }
-    if proposed {
+    if let Some(request) = proposed {
         f1_on(
             &mut f1,
             now + 100,
             EventKind::Control(ControlEvent::CasResult {
+                request,
                 key: ControlKey::Partition(P),
                 outcome: CasOutcome::Committed(Revision(10)),
             }),

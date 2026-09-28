@@ -51,8 +51,9 @@ use rdb_core::contracts::event::{
     Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, EventId, Generation, GrantId,
-    NodeId, OperationId, OwnerEpoch, PartitionId, RangeId, Revision, TimerVersion,
+    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    Generation, GrantId, NodeId, OperationId, OwnerEpoch, PartitionId, RangeId, Revision,
+    TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
@@ -129,6 +130,7 @@ impl Driver {
         let effect = support::control_effect(
             1,
             ControlEffect::Cas {
+                request: ANY,
                 key,
                 expected,
                 value,
@@ -262,7 +264,7 @@ impl Driver {
                 EffectKind::Control(ControlEffect::Reload { prefix }) => {
                     self.reloads.push(*prefix);
                 }
-                EffectKind::Control(ControlEffect::Get { key }) => self.gets.push(*key),
+                EffectKind::Control(ControlEffect::Get { key, .. }) => self.gets.push(*key),
                 _ => {}
             }
         }
@@ -291,6 +293,7 @@ impl Driver {
         let effect = support::control_effect(
             1,
             ControlEffect::Cas {
+                request: ANY,
                 key,
                 expected: None,
                 value: Some(Bytes::from_static(value)),
@@ -402,7 +405,7 @@ impl Driver {
                 EffectKind::Control(ControlEffect::Reload { prefix }) => {
                     self.reloads.push(*prefix);
                 }
-                EffectKind::Control(ControlEffect::Get { key }) => self.gets.push(*key),
+                EffectKind::Control(ControlEffect::Get { key, .. }) => self.gets.push(*key),
                 _ => {}
             }
         }
@@ -729,7 +732,24 @@ fn m7a_31_watch_admission_refusal_backs_off_and_never_reloads() {
 
 /// Every effect's kind, in order: what a row compares when it says "effects = [..]".
 fn kinds(effects: &[Effect]) -> Vec<EffectKind> {
-    effects.iter().map(|effect| effect.kind.clone()).collect()
+    effects.iter().map(|effect| anon(&effect.kind)).collect()
+}
+
+/// The request id these rows write, and the one [`anon`] writes over whatever A1 minted. The rows
+/// assert which record is read or written; the id is A1's to choose, and matching an answer by it
+/// is `M7A-179`..`M7A-181`'s subject in rdb-core (lead ledger L-R177hs).
+const ANY: ControlRequestId = ControlRequestId(0);
+
+/// `kind` with the request id of a control `Cas` or `Get` replaced by [`ANY`].
+fn anon(kind: &EffectKind) -> EffectKind {
+    let mut kind = kind.clone();
+    if let EffectKind::Control(
+        ControlEffect::Cas { request, .. } | ControlEffect::Get { request, .. },
+    ) = &mut kind
+    {
+        *request = ANY;
+    }
+    kind
 }
 
 /// A `partitions/{id}` record naming `owner`, lineage (1, 1, 1), serving.
@@ -818,6 +838,7 @@ fn gap_resync(row: &str, termination: WatchTermination) {
             &support::control_effect(
                 1,
                 ControlEffect::Cas {
+                    request: ANY,
                     key: late,
                     expected: None,
                     value: Some(record(9, NodeId(2)).encode()),
@@ -1210,8 +1231,9 @@ fn m7a_30_watch_not_leader_or_unavailable_read_and_backoff_no_read_family() {
                 panic!("M7A-30 {termination:?} on {prefix:?}: [Get, Timer], got {effects:?}");
             };
             assert_eq!(
-                get.kind,
+                anon(&get.kind),
                 EffectKind::Control(ControlEffect::Get {
+                    request: ANY,
                     key: ControlKey::Grant(A)
                 }),
                 "M7A-30 {termination:?}: a Get of one record, our own grant"
@@ -1465,6 +1487,7 @@ fn m7a_34_watch_event_never_grants() {
     assert_eq!(
         kinds(&effects),
         vec![EffectKind::Control(ControlEffect::Get {
+            request: ANY,
             key: ControlKey::Grant(A)
         })],
         "M7A-34: a watch event on our own grant key becomes one linearizable read, and nothing else"
@@ -1508,6 +1531,7 @@ fn m7a_34_watch_event_never_grants() {
         [2_u32, 3, 4]
             .into_iter()
             .map(|n| EffectKind::Control(ControlEffect::Get {
+                request: ANY,
                 key: ControlKey::Grant(NodeId(n))
             }))
             .collect::<Vec<_>>(),
@@ -1609,6 +1633,7 @@ fn m7a_35_no_automatic_promotion() {
         assert_eq!(
             kinds(&watched),
             vec![EffectKind::Control(ControlEffect::Get {
+                request: ANY,
                 key: ControlKey::Grant(PRIMARY)
             })],
             "M7A-35: each change on the primary's grant becomes one read of it"
@@ -1701,8 +1726,9 @@ fn m7a_59_control_unavailable_denies_control_unavailable_no_fence() {
     let gets: Vec<Effect> = echo
         .into_iter()
         .filter(|effect| {
-            effect.kind
+            anon(&effect.kind)
                 == EffectKind::Control(ControlEffect::Get {
+                    request: ANY,
                     key: ControlKey::Grant(A),
                 })
         })
@@ -1814,6 +1840,7 @@ fn m7a_59_control_unavailable_denies_control_unavailable_no_fence() {
         "M7A-59: a renewal whose CAS answers Unavailable keeps the deny"
     );
     let stray = driver.deliver(ControlEvent::CasResult {
+        request: ANY,
         key: ControlKey::Grant(A),
         outcome: CasOutcome::Committed(Revision(99)),
     });
@@ -1890,6 +1917,7 @@ fn m7a_119_fake_cas_conflict_carries_no_value() {
     let ControlEvent::CasResult {
         key,
         outcome: CasOutcome::Conflict { exists, current },
+        ..
     } = completion.event
     else {
         panic!("M7A-119: the planned conflict is delivered as one: {completion:?}");
@@ -1904,6 +1932,7 @@ fn m7a_119_fake_cas_conflict_carries_no_value() {
         kinds(&effects),
         vec![
             EffectKind::Control(ControlEffect::Get {
+                request: ANY,
                 key: ControlKey::Grant(A)
             }),
             EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Fact(
@@ -1955,6 +1984,7 @@ fn m7a_120_fake_unknown_distinct_from_unavailable_and_conflict() {
     );
 
     let read = EffectKind::Control(ControlEffect::Get {
+        request: ANY,
         key: ControlKey::Grant(A),
     });
     let fact = |fact| EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::Fact(fact)));
@@ -1971,7 +2001,7 @@ fn m7a_120_fake_unknown_distinct_from_unavailable_and_conflict() {
             if *id == AuthorityTimer::Renew.id()),
         "M7A-120: Unavailable retries on the renewal timer: {arm:?}"
     );
-    assert_eq!(get.kind, read, "M7A-120: and reads");
+    assert_eq!(anon(&get.kind), read, "M7A-120: and reads");
     assert_eq!(
         kinds(&runs[2].1),
         vec![read, fact(AuthorityFact::RenewLost)],
@@ -2115,6 +2145,7 @@ fn m7a_122_fake_plan_read_unavailable() {
     let get = support::control_effect(
         1,
         ControlEffect::Get {
+            request: ANY,
             key: ControlKey::Grant(A),
         },
     );
@@ -2126,7 +2157,7 @@ fn m7a_122_fake_plan_read_unavailable() {
     for _ in 0..2 {
         driver.store.submit(A, &get).expect("get");
         for completion in driver.store.complete(driver.now) {
-            let ControlEvent::Value { key, outcome } = completion.event else {
+            let ControlEvent::Value { key, outcome, .. } = completion.event else {
                 panic!("M7A-122: a Get completes as Value: {completion:?}");
             };
             assert_eq!(key, ControlKey::Grant(A));
@@ -2441,6 +2472,7 @@ fn cutover_race(first: NodeId, second: NodeId) -> (Vec<(NodeId, CasOutcome)>, By
         let effect = support::control_effect(
             u64::from(node.0),
             ControlEffect::Cas {
+                request: ANY,
                 key: route,
                 expected: Some(r0),
                 value: Some(record(5, node).encode()),

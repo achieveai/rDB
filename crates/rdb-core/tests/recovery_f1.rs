@@ -41,9 +41,9 @@ use rdb_core::contracts::event::{
     StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, Generation,
-    GrantId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq, SnapshotHandle, TimerId,
-    TimerVersion,
+    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, DurableSeq,
+    EventId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, Revision, Seq,
+    SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -368,6 +368,7 @@ fn arm(version: u64, at: u64) -> EffectKind {
 
 fn cas(expected: Revision, owner: CopyId) -> EffectKind {
     EffectKind::Control(ControlEffect::Cas {
+        request: LATEST,
         key: ControlKey::Partition(PARTITION),
         expected: Some(expected),
         value: Some(record(owner).encode()),
@@ -421,6 +422,7 @@ fn lose(copy: CopyId) -> EventKind {
 
 fn cas_result(outcome: CasOutcome) -> EventKind {
     EventKind::Control(ControlEvent::CasResult {
+        request: LATEST,
         key: ControlKey::Partition(PARTITION),
         outcome,
     })
@@ -428,6 +430,7 @@ fn cas_result(outcome: CasOutcome) -> EventKind {
 
 fn read_result(outcome: ReadOutcome) -> EventKind {
     EventKind::Control(ControlEvent::Value {
+        request: LATEST,
         key: ControlKey::Partition(PARTITION),
         outcome,
     })
@@ -460,9 +463,14 @@ fn has_selected(effects: &[EffectKind]) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// One F1 instance plus a log of every effect it emitted.
+/// The request id of every F1 request and answer as these rows spell it (see [`F1::try_at`]).
+const LATEST: ControlRequestId = ControlRequestId(u64::MAX);
+
 struct F1 {
     module: Recovery,
     log: Vec<EffectKind>,
+    /// Every control request id F1 has sent, oldest first, as it minted them.
+    requests: Vec<ControlRequestId>,
 }
 
 impl F1 {
@@ -470,11 +478,29 @@ impl F1 {
         Self {
             module: Recovery::new(),
             log: Vec::new(),
+            requests: Vec::new(),
         }
     }
 
     /// Step `kind` with the context at `now` and the event arriving at `at`.
+    ///
+    /// F1 matches an answer by the request id it echoes (lead ledger L-R177hs). These rows were
+    /// written when the key alone matched it, so every answer in them is to the request F1 sent
+    /// last. This keeps that reading exact: an answer carrying [`LATEST`] is sent echoing the
+    /// newest id in [`Self::requests`], and every `Cas` and `Get` F1 returns is recorded there and
+    /// shown with its id replaced by [`LATEST`], so a row compares what is written and read. A row
+    /// about the id itself sends the raw ids in [`Self::requests`].
     fn try_at(&mut self, now: u64, at: u64, kind: EventKind) -> Result<Vec<EffectKind>, RdbError> {
+        let latest = self.requests.last().copied().unwrap_or(LATEST);
+        let mut kind = kind;
+        if let EventKind::Control(
+            ControlEvent::CasResult { request, .. } | ControlEvent::Value { request, .. },
+        ) = &mut kind
+        {
+            if *request == LATEST {
+                *request = latest;
+            }
+        }
         let event = Event {
             id: EventId(now),
             at: Tick(at),
@@ -491,7 +517,15 @@ impl F1 {
             .map(|effect| {
                 assert_eq!(effect.correlation, CORRELATION);
                 assert_eq!(effect.partition, PARTITION);
-                effect.kind
+                let mut kind = effect.kind;
+                if let EffectKind::Control(
+                    ControlEffect::Cas { request, .. } | ControlEffect::Get { request, .. },
+                ) = &mut kind
+                {
+                    self.requests.push(*request);
+                    *request = LATEST;
+                }
+                kind
             })
             .collect();
         self.log.extend(kinds.iter().cloned());
@@ -507,6 +541,20 @@ impl F1 {
             "expected a decline, got {answer:?}"
         );
         assert_eq!(self.phase(), phase, "a decline moves nothing");
+    }
+
+    /// A late answer to one of F1's own requests, arriving once that exchange is over: taken,
+    /// named `UnmatchedCompletion`, and the whole module is unchanged (lead ledger L-R177hs, the
+    /// tester's F5). It used to be declined as "not an F1 input", but it is one: F1 minted its
+    /// id.
+    fn ignores_late(&mut self, now: u64, kind: EventKind) {
+        let before = self.module.clone();
+        assert_eq!(
+            self.step(now, kind),
+            vec![ign(ReplicaIgnoreReason::UnmatchedCompletion)],
+            "a late answer to F1's own request is named"
+        );
+        assert_eq!(self.module, before, "a late answer moves nothing");
     }
 
     fn at(&mut self, now: u64, at: u64, kind: EventKind) -> Vec<EffectKind> {
@@ -1259,6 +1307,7 @@ fn the_commit_cas_writes_a_serving_record_on_the_partition_key() {
     let f1 = proposing(20);
     assert_eq!(f1.cas_count(), 1);
     let Some(EffectKind::Control(ControlEffect::Cas {
+        request: LATEST,
         key,
         value: Some(body),
         ..
@@ -1355,7 +1404,7 @@ fn unavailable_and_unknown_block_distinctly_and_never_retry() {
             vec![block(reason.clone())]
         );
         assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason));
-        f1.declines(3_200, cas_result(CasOutcome::Committed(Revision(9))));
+        f1.ignores_late(3_200, cas_result(CasOutcome::Committed(Revision(9))));
         assert_eq!(f1.cas_count(), 1, "never re-proposed");
     }
 }
@@ -1372,6 +1421,7 @@ fn rereading() -> F1 {
             })
         ),
         vec![EffectKind::Control(ControlEffect::Get {
+            request: LATEST,
             key: ControlKey::Partition(PARTITION)
         })]
     );
@@ -1464,11 +1514,14 @@ fn identical_bytes_on_the_re_read_are_a_peers_decision() {
 
 /// The sim offers every control answer to every module. F1 answers only its own pending CAS or
 /// re-read on `partitions/{id}`, and declines everything else like any module without that input.
+/// The one exception is a late answer echoing an id F1 minted: that is F1's, and is
+/// `UnmatchedCompletion` (see [`F1::ignores_late`]).
 #[retcd_test]
 fn control_answers_f1_did_not_request_are_declined() {
     let committed = cas_result(CasOutcome::Committed(Revision(9)));
     let other_key = |key| {
         EventKind::Control(ControlEvent::CasResult {
+            request: LATEST,
             key,
             outcome: CasOutcome::Committed(Revision(9)),
         })
@@ -1493,10 +1546,11 @@ fn control_answers_f1_did_not_request_are_declined() {
     );
     f1.declines(3_300, committed.clone());
     assert_eq!(f1.cas_count(), 1);
-    // Committed and fully protected: nothing is pending.
+    // Committed and fully protected: nothing is pending, and a late answer echoing F1's own
+    // CAS id is F1's, so it is named rather than declined.
     let mut done = proposing(20);
     done.step(3_100, committed.clone());
-    done.declines(3_200, committed);
+    done.ignores_late(3_200, committed);
 }
 
 /// Another module's timer is declined in every phase, never answered as stale.
@@ -3188,9 +3242,9 @@ fn m7b_105_commit_is_one_cas_on_the_partition_record() {
         .log
         .iter()
         .filter_map(|effect| match effect {
-            EffectKind::Control(ControlEffect::Cas { key, .. } | ControlEffect::Get { key }) => {
-                Some(key)
-            }
+            EffectKind::Control(
+                ControlEffect::Cas { key, .. } | ControlEffect::Get { key, .. },
+            ) => Some(key),
             _ => None,
         })
         .collect();
@@ -3258,7 +3312,7 @@ fn control_blocks_without_retry(outcome: CasOutcome, reason: &BlockReason) {
     assert_eq!(f1.rec(3_200, durable(A, 20, dg(0, 20))), refused);
     assert_eq!(f1.step(3_300, fired(3)), refused);
     assert_eq!(f1.report(3_400, inv(B, 20)), refused);
-    f1.declines(3_500, cas_result(CasOutcome::Committed(Revision(9))));
+    f1.ignores_late(3_500, cas_result(CasOutcome::Committed(Revision(9))));
     assert_eq!(f1.cas_count(), 1, "never re-proposed");
     assert_eq!(f1.phase(), RecoveryPhase::Blocked(reason.clone()));
     assert!(has_query(&f1.rec(3_600, fence_read_at(7))));
@@ -3837,6 +3891,7 @@ fn m7b_126_rebuilding_reaches_activation_only_through_try_new() {
     assert_eq!(
         f1.step(4_200, cas_result(conflict)),
         vec![EffectKind::Control(ControlEffect::Get {
+            request: LATEST,
             key: ControlKey::Partition(PARTITION)
         })]
     );
@@ -3879,7 +3934,7 @@ fn m7b_127_degraded_rf2_leaves_only_on_the_rebuild_barrier() {
         );
         assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
     }
-    f1.declines(60_000, cas_result(CasOutcome::Committed(Revision(10))));
+    f1.ignores_late(60_000, cas_result(CasOutcome::Committed(Revision(10))));
     f1.rec(60_100, caught_up(C, 20, dg(0, 20)));
     for copy in [A, B, C] {
         f1.rec(60_200, durable(copy, 20, dg(0, 20)));
@@ -4017,8 +4072,8 @@ fn m7b_108_cas_conflict_unchanged_record_never_reproposes() {
             "{current:?}"
         );
         assert_eq!(f1.phase(), contention);
-        f1.declines(3_300, conflict(6));
-        f1.declines(3_301, found(current.encode()));
+        f1.ignores_late(3_300, conflict(6));
+        f1.ignores_late(3_301, found(current.encode()));
         assert_eq!(
             f1.report(3_400, inv(A, 20)),
             vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
@@ -4038,7 +4093,7 @@ fn m7b_108_cas_conflict_unchanged_record_never_reproposes() {
             "{current:?}"
         );
         assert_eq!(f1.phase(), contention);
-        f1.declines(4_400, conflict(12));
+        f1.ignores_late(4_400, conflict(12));
         assert_eq!(
             f1.rec(4_500, durable(C, 20, dg(0, 20))),
             vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
@@ -5227,6 +5282,7 @@ fn m7b_230_a_newer_fence_behind_an_activation_waits_for_its_answer() {
             })
         ),
         vec![EffectKind::Control(ControlEffect::Get {
+            request: LATEST,
             key: ControlKey::Partition(PARTITION)
         })],
         "the re-read is the first run's; the fence stays held"
@@ -5504,6 +5560,7 @@ fn m7b_235_a_released_fence_below_the_peer_floor_stays_blocked() {
             })
         ),
         vec![EffectKind::Control(ControlEffect::Get {
+            request: LATEST,
             key: ControlKey::Partition(PARTITION)
         })]
     );
@@ -5616,5 +5673,300 @@ fn m7b_237_a_newer_fence_without_its_plan_is_invalid_config_and_the_phase_holds(
         f1.phase(),
         RecoveryPhase::Committed,
         "the failed fence was dropped"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M7B-238 and M7B-239: an answer is matched by its request id (lead ledger L-R177hs).
+// ---------------------------------------------------------------------------------------------
+
+/// [`cas_result`], echoing `request` rather than F1's newest request.
+fn cas_result_to(request: ControlRequestId, outcome: CasOutcome) -> EventKind {
+    EventKind::Control(ControlEvent::CasResult {
+        request,
+        key: ControlKey::Partition(PARTITION),
+        outcome,
+    })
+}
+
+/// [`read_result`], echoing `request` rather than F1's newest request.
+fn read_result_to(request: ControlRequestId, outcome: ReadOutcome) -> EventKind {
+    EventKind::Control(ControlEvent::Value {
+        request,
+        key: ControlKey::Partition(PARTITION),
+        outcome,
+    })
+}
+
+/// The newest request F1 has sent.
+fn newest(f1: &F1) -> ControlRequestId {
+    *f1.requests.last().expect("fixture: F1 sent a request")
+}
+
+/// Blocked on `Unknown`, re-fenced on the same plan, and driven back to `Proposing`: the first
+/// run's CAS was never answered for real, and the second run's CAS is now in flight. Returns the
+/// first run's CAS id with it.
+fn re_proposing_after_unknown() -> (F1, ControlRequestId) {
+    let mut f1 = proposing(20);
+    let abandoned = newest(&f1);
+    assert_eq!(
+        f1.step(3_100, cas_result(CasOutcome::Unknown)),
+        vec![block(BlockReason::ControlUnknown)]
+    );
+    let t = 9_000;
+    assert!(has_query(
+        &f1.rec(t, RecoveryEvent::FenceProven(Box::new(proof())))
+    ));
+    for copy in [A, B, C] {
+        f1.report(t + 10, inv(copy, 20));
+    }
+    let version = armed_version(&f1.log);
+    f1.step(t + WINDOW, fired(version));
+    for copy in [A, B, C] {
+        f1.rec(t + WINDOW + 100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing, "fixture");
+    assert_eq!(
+        f1.cas_count(),
+        2,
+        "fixture: the second run's CAS is in flight"
+    );
+    (f1, abandoned)
+}
+
+/// M7B-238 (lead ledger L-R177hs; B-R74b; the tester's F4): a late answer to an abandoned run's
+/// root CAS is not the answer to a newer run's CAS on the same key. The first run blocks on
+/// `Unknown`; a new fence drives the same instance back to `Proposing` with a fresh CAS. The first
+/// CAS's real answer, `Committed`, then arrives: it echoes the first CAS's id, so it is
+/// `UnmatchedCompletion` and moves nothing. The second CAS's own answer is taken. Red on `HEAD`
+/// (547c82c): the late answer produced `Recovered` at revision 9 — a false commit.
+#[retcd_test]
+fn m7b_238_an_abandoned_root_cas_answer_is_not_the_new_runs() {
+    let (mut f1, abandoned) = re_proposing_after_unknown();
+    assert_ne!(newest(&f1), abandoned, "M7B-238: a fresh id per request");
+    let before = f1.module.clone();
+    assert_eq!(
+        f1.step(
+            12_000,
+            cas_result_to(abandoned, CasOutcome::Committed(Revision(9)))
+        ),
+        vec![ign(ReplicaIgnoreReason::UnmatchedCompletion)],
+        "M7B-238: the abandoned CAS's late answer is ignored, named"
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Proposing,
+        "M7B-238: nothing moved"
+    );
+    assert_eq!(f1.cas_count(), 2, "M7B-238: and nothing was re-sent");
+    assert_eq!(
+        f1.module, before,
+        "M7B-238: the whole module is unchanged, the plan included"
+    );
+
+    let result = recovered(&f1.step(12_100, cas_result(CasOutcome::Committed(Revision(12)))));
+    assert_eq!(
+        result.committed.revision,
+        Revision(12),
+        "M7B-238: the new run's own answer commits it"
+    );
+}
+
+/// M7B-238, the activation half: B-R74b's re-entry path. A newer fence is held behind the
+/// activation CAS; the activation answers `Unknown`, so the held fence re-enters and a second run
+/// proposes its own root CAS. The abandoned activation CAS's real answer then arrives: it is
+/// `UnmatchedCompletion`, and the second run's own answer commits it. Red on `HEAD` (547c82c):
+/// the late activation answer produced `Recovered` at revision 11.
+#[retcd_test]
+fn m7b_238_an_abandoned_activation_answer_is_not_the_new_runs() {
+    let t = REFENCE_AT;
+    let mut f1 = held_behind_activation();
+    let abandoned = newest(&f1);
+    let mut expected = vec![block(BlockReason::ControlUnknown)];
+    expected.extend(re_entry(t));
+    assert_eq!(
+        f1.step(t, cas_result(CasOutcome::Unknown)),
+        expected,
+        "fixture"
+    );
+    for copy in [A, B, C] {
+        f1.report(t + 10, on_new_root(copy, 30));
+    }
+    let version = armed_version(&f1.log);
+    f1.step(t + WINDOW, fired(version));
+    for copy in [A, B, C] {
+        f1.rec(t + WINDOW + 100, durable(copy, 30, dg(0, 30)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing, "fixture");
+    assert_ne!(newest(&f1), abandoned, "M7B-238: a fresh id per request");
+
+    let before = f1.module.clone();
+    assert_eq!(
+        f1.step(
+            t + WINDOW + 150,
+            cas_result_to(abandoned, CasOutcome::Committed(Revision(11)))
+        ),
+        vec![ign(ReplicaIgnoreReason::UnmatchedCompletion)],
+        "M7B-238: the abandoned activation's late answer is ignored, named"
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Proposing,
+        "M7B-238: nothing moved"
+    );
+    assert_eq!(
+        f1.module, before,
+        "M7B-238: the whole module is unchanged, the plan included"
+    );
+
+    let result = recovered(&f1.step(
+        t + WINDOW + 200,
+        cas_result(CasOutcome::Committed(Revision(14))),
+    ));
+    assert_eq!(result.committed.revision, Revision(14));
+    assert_eq!(
+        result.new_generation,
+        Generation(9),
+        "M7B-238: the second run's own answer commits the second run"
+    );
+}
+
+/// M7B-239 (lead ledger L-R177hs): the same for the `Conflict` re-read `Get`. The first run's
+/// re-read answers `Unavailable` and blocks; a new fence drives a second run to its own
+/// `Conflict` and its own re-read. A second, late answer to the first re-read — a peer's record,
+/// which would read as `OvertakenByPeer` — is `UnmatchedCompletion` and decides nothing. The
+/// second re-read's own answer decides the second run. Red on `HEAD` (547c82c): the late answer
+/// blocked the second run `OvertakenByPeer`.
+#[retcd_test]
+fn m7b_239_an_abandoned_reread_answer_is_not_the_new_runs() {
+    let mut f1 = rereading();
+    let abandoned = newest(&f1);
+    assert_eq!(
+        f1.step(3_200, read_result(ReadOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)],
+        "fixture"
+    );
+    let t = 9_000;
+    assert!(has_query(
+        &f1.rec(t, RecoveryEvent::FenceProven(Box::new(proof())))
+    ));
+    for copy in [A, B, C] {
+        f1.report(t + 10, inv(copy, 20));
+    }
+    let version = armed_version(&f1.log);
+    f1.step(t + WINDOW, fired(version));
+    for copy in [A, B, C] {
+        f1.rec(t + WINDOW + 100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(
+        f1.step(
+            t + WINDOW + 200,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(6),
+            }),
+        ),
+        vec![EffectKind::Control(ControlEffect::Get {
+            request: LATEST,
+            key: ControlKey::Partition(PARTITION),
+        })],
+        "fixture: the second run re-reads"
+    );
+    assert_ne!(newest(&f1), abandoned, "M7B-239: a fresh id per request");
+
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let before = f1.module.clone();
+    assert_eq!(
+        f1.step(
+            t + WINDOW + 250,
+            read_result_to(
+                abandoned,
+                ReadOutcome::Found {
+                    revision: Revision(6),
+                    value: peer.encode(),
+                }
+            )
+        ),
+        vec![ign(ReplicaIgnoreReason::UnmatchedCompletion)],
+        "M7B-239: the first re-read's late answer is ignored, named"
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Proposing,
+        "M7B-239: nothing decided"
+    );
+    assert_eq!(
+        f1.module, before,
+        "M7B-239: the whole module is unchanged, the plan included"
+    );
+
+    assert_eq!(
+        f1.step(
+            t + WINDOW + 300,
+            read_result(ReadOutcome::Absent { as_of: Revision(6) })
+        ),
+        vec![block(BlockReason::CasContention)],
+        "M7B-239: the second re-read's own answer decides the second run"
+    );
+}
+
+/// M7B-239, the activation half (the tester's F2): the activation CAS's `Conflict` re-read is
+/// matched by its own id too. [`activating`] has the activation CAS in flight; it answers
+/// `Conflict` and F1 re-reads. A peer's record echoing an earlier request of this instance — the
+/// activation CAS's id, then the first id this instance minted — is `UnmatchedCompletion` each
+/// time, and the module does not move. The re-read's own answer, the same peer record, then
+/// decides the run: `OvertakenByPeer`, as in M7B-126.
+#[retcd_test]
+fn m7b_239_an_earlier_requests_answer_is_not_the_activation_reread() {
+    let (mut f1, _) = activating();
+    let activation = newest(&f1);
+    let conflict = CasOutcome::Conflict {
+        exists: true,
+        current: Revision(12),
+    };
+    assert_eq!(
+        f1.step(4_200, cas_result(conflict)),
+        vec![EffectKind::Control(ControlEffect::Get {
+            request: LATEST,
+            key: ControlKey::Partition(PARTITION),
+        })],
+        "fixture: the activation conflict re-reads"
+    );
+    let reread = newest(&f1);
+    let root = f1.requests[0];
+    assert_ne!(reread, activation, "M7B-239: a fresh id per request");
+    assert_ne!(reread, root, "M7B-239: a fresh id per request");
+
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let found = || ReadOutcome::Found {
+        revision: Revision(12),
+        value: peer.encode(),
+    };
+    let before = f1.module.clone();
+    for (tick, earlier) in [(4_250, activation), (4_260, root)] {
+        assert_eq!(
+            f1.step(tick, read_result_to(earlier, found())),
+            vec![ign(ReplicaIgnoreReason::UnmatchedCompletion)],
+            "M7B-239: an answer echoing an earlier request is not the re-read's"
+        );
+        assert_eq!(
+            f1.module, before,
+            "M7B-239: the whole module is unchanged, the plan included"
+        );
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+
+    assert_eq!(
+        f1.step(4_300, read_result(found())),
+        vec![block(BlockReason::OvertakenByPeer)],
+        "M7B-239: the re-read's own answer decides the run"
     );
 }

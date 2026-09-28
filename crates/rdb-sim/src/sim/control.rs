@@ -347,6 +347,7 @@ impl ControlStore {
         let (partition, correlation) = (effect.partition, effect.correlation);
         match control {
             ControlEffect::Cas {
+                request,
                 key,
                 expected,
                 value,
@@ -357,7 +358,12 @@ impl ControlStore {
                     node,
                     partition,
                     correlation,
-                    event: ControlEvent::CasResult { key: *key, outcome },
+                    // The request id is echoed unchanged: the module matches its answer by it.
+                    event: ControlEvent::CasResult {
+                        request: *request,
+                        key: *key,
+                        outcome,
+                    },
                     interaction: interaction(
                         ControlOpKind::Cas,
                         Some(*key),
@@ -366,7 +372,7 @@ impl ControlStore {
                     ),
                 });
             }
-            ControlEffect::Get { key } => {
+            ControlEffect::Get { request, key } => {
                 let outcome = if self.take_planned_read_unavailable() {
                     ReadOutcome::Unavailable
                 } else {
@@ -377,7 +383,11 @@ impl ControlStore {
                     node,
                     partition,
                     correlation,
-                    event: ControlEvent::Value { key: *key, outcome },
+                    event: ControlEvent::Value {
+                        request: *request,
+                        key: *key,
+                        outcome,
+                    },
                     interaction: interaction(ControlOpKind::Get, Some(*key), None, kind),
                 });
             }

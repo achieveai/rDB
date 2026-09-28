@@ -34,8 +34,9 @@ use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, Event, EventKind, KernelEffect, Module, NodeLifecycle, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, CorrelationId, EventId, Generation, GrantId,
-    NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle, TimerVersion,
+    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
+    TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::storage::{Namespace, SnapshotRead};
@@ -129,11 +130,14 @@ fn acquire_due(kernel: &Authority, id: u64, correlation: u64) -> Event {
     )
 }
 
-fn cas_result(id: u64, correlation: u64, outcome: CasOutcome) -> Event {
+/// The answer to the CAS sent as `request`: the id it echoes is what A1 matches it by, never the
+/// key or the correlation (lead ledger L-R177hs).
+fn cas_result(id: u64, correlation: u64, request: ControlRequestId, outcome: CasOutcome) -> Event {
     event(
         id,
         correlation,
         EventKind::Control(ControlEvent::CasResult {
+            request,
             key: ControlKey::Grant(NODE),
             outcome,
         }),
@@ -145,10 +149,42 @@ fn grant_read(id: u64, outcome: ReadOutcome) -> Event {
         id,
         id,
         EventKind::Control(ControlEvent::Value {
+            request: BY_CONTENT,
             key: ControlKey::Grant(NODE),
             outcome,
         }),
     )
+}
+
+/// The request id these rows put on a read of our own grant. A1 judges that read by its content
+/// and matches it by no id, so any id is its answer.
+const BY_CONTENT: ControlRequestId = ControlRequestId(0);
+
+/// A request id A1 never minted: its ids start above `AUTHORITY_CONTROL_REQUEST_BASE`.
+const STRAY: ControlRequestId = ControlRequestId(99);
+
+/// The request id of the grant CAS in flight: the acquisition while `Unheld`, else the renewal.
+fn in_flight(kernel: &Authority) -> ControlRequestId {
+    let view = kernel.view();
+    view.acquire
+        .map(|acquire| acquire.request)
+        .or_else(|| view.renewal.map(|renewal| renewal.request))
+        .expect("fixture: a grant CAS in flight")
+}
+
+/// The request id of the one control CAS in `effects`.
+fn sent_as(effects: &[Effect]) -> ControlRequestId {
+    let sent: Vec<ControlRequestId> = effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Cas { request, .. }) => Some(*request),
+            _ => None,
+        })
+        .collect();
+    let [request] = sent.as_slice() else {
+        panic!("fixture: one CAS: {effects:?}");
+    };
+    *request
 }
 
 /// A kernel with one acquisition CAS in flight, dispatched at tick 5 under correlation 5.
@@ -189,11 +225,12 @@ fn shapes(effects: &[Effect]) -> Vec<Shape> {
                 key: ControlKey::Grant(NODE),
                 expected,
                 value,
+                ..
             }) => Shape::Cas {
                 expected: *expected,
                 record: value.as_deref().and_then(GrantRecord::decode),
             },
-            EffectKind::Control(ControlEffect::Get { key }) => Shape::Get(*key),
+            EffectKind::Control(ControlEffect::Get { key, .. }) => Shape::Get(*key),
             EffectKind::Control(ControlEffect::Reload { prefix }) => Shape::Reload(*prefix),
             EffectKind::Control(ControlEffect::Watch { prefix, from }) => {
                 Shape::Watch(*prefix, *from)
@@ -255,12 +292,12 @@ fn acquire_due_with_a_fresh_sample_issues_one_create_only_grant_cas() {
     assert_eq!(
         acquire,
         Acquire {
-            correlation: CorrelationId(5),
+            request: sent_as(&effects),
             dispatched_at: Tick(5),
             e_new: e_new_at(5),
             grant: acquire.grant,
         },
-        "acquire remembers the correlation, the dispatch tick and the E_new it wrote"
+        "acquire remembers the request id its CAS was sent as, the dispatch tick and the E_new it wrote"
     );
     assert_ne!(
         acquire.grant,
@@ -339,7 +376,7 @@ fn the_matched_commit_enters_held_from_the_dispatch_not_the_completion() {
     let effects = kernel
         .step(
             &ctx(40),
-            &cas_result(40, 5, CasOutcome::Committed(Revision(7))),
+            &cas_result(40, 5, acquire.request, CasOutcome::Committed(Revision(7))),
         )
         .expect("the commit row is built");
 
@@ -390,7 +427,7 @@ fn an_unmatched_commit_grants_nothing() {
     let effects = fresh
         .step(
             &ctx(1),
-            &cas_result(1, 1, CasOutcome::Committed(Revision(7))),
+            &cas_result(1, 1, STRAY, CasOutcome::Committed(Revision(7))),
         )
         .expect("built");
     assert_eq!(
@@ -404,7 +441,7 @@ fn an_unmatched_commit_grants_nothing() {
     let effects = kernel
         .step(
             &ctx(9),
-            &cas_result(9, 99, CasOutcome::Committed(Revision(7))),
+            &cas_result(9, 99, STRAY, CasOutcome::Committed(Revision(7))),
         )
         .expect("built");
     assert_eq!(
@@ -424,7 +461,7 @@ fn an_unmatched_commit_grants_nothing() {
 /// `acquire = None`. The loser learns nothing from the conflict itself (rEtcd ADR-0006).
 #[retcd_test]
 fn a_conflict_loses_and_reads_the_grant_back() {
-    let (mut kernel, _) = acquiring();
+    let (mut kernel, acquire) = acquiring();
 
     let effects = kernel
         .step(
@@ -432,6 +469,7 @@ fn a_conflict_loses_and_reads_the_grant_back() {
             &cas_result(
                 9,
                 5,
+                acquire.request,
                 CasOutcome::Conflict {
                     exists: true,
                     current: Revision(3),
@@ -459,10 +497,13 @@ fn a_conflict_loses_and_reads_the_grant_back() {
 /// rights assumed either way (rEtcd ADR-0015).
 #[retcd_test]
 fn an_unknown_outcome_reads_back_and_assumes_nothing() {
-    let (mut kernel, _) = acquiring();
+    let (mut kernel, acquire) = acquiring();
 
     let effects = kernel
-        .step(&ctx(9), &cas_result(9, 5, CasOutcome::Unknown))
+        .step(
+            &ctx(9),
+            &cas_result(9, 5, acquire.request, CasOutcome::Unknown),
+        )
         .expect("built");
 
     assert_eq!(shapes(&effects), vec![Shape::Get(ControlKey::Grant(NODE))]);
@@ -482,7 +523,10 @@ fn an_unknown_outcome_reads_back_and_assumes_nothing() {
 fn the_read_back_of_our_own_record_adopts_it_without_restarting_the_window() {
     let (mut kernel, acquire) = acquiring();
     kernel
-        .step(&ctx(9), &cas_result(9, 5, CasOutcome::Unknown))
+        .step(
+            &ctx(9),
+            &cas_result(9, 5, acquire.request, CasOutcome::Unknown),
+        )
         .expect("built");
     let seq = kernel.authority_seq();
     let written = GrantRecord {
@@ -624,7 +668,7 @@ fn held() -> (Authority, GrantId) {
     kernel
         .step(
             &ctx(5),
-            &cas_result(5, 5, CasOutcome::Committed(Revision(7))),
+            &cas_result(5, 5, acquire.request, CasOutcome::Committed(Revision(7))),
         )
         .expect("the commit row is built");
     assert!(kernel.state().is_held(), "fixture: Held");
@@ -714,7 +758,7 @@ fn renew_due_with_a_fresh_sample_issues_one_cas_on_the_held_revision() {
     assert_eq!(
         view.renewal,
         Some(Renewal {
-            correlation: CorrelationId(505),
+            request: sent_as(&effects),
             dispatched_at: Tick(505),
             e_new: e_new_at(505),
         })
@@ -786,7 +830,12 @@ fn a_matched_renewal_commit_advances_e_from_the_dispatch() {
     let effects = kernel
         .step(
             &ctx(540),
-            &cas_result(540, 505, CasOutcome::Committed(Revision(9))),
+            &cas_result(
+                540,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(9)),
+            ),
         )
         .expect("the renewal commit row is built");
 
@@ -819,7 +868,7 @@ fn an_unmatched_renewal_commit_extends_nothing() {
     let effects = kernel
         .step(
             &ctx(540),
-            &cas_result(540, 99, CasOutcome::Committed(Revision(9))),
+            &cas_result(540, 99, STRAY, CasOutcome::Committed(Revision(9))),
         )
         .expect("built");
 
@@ -868,9 +917,9 @@ fn a_renewal_that_did_not_commit_reads_back_and_leaves_e_alone() {
         ),
     ];
     for (outcome, expected) in cases {
-        let (mut kernel, _, _) = renewing();
+        let (mut kernel, _, renewal) = renewing();
         let effects = kernel
-            .step(&ctx(540), &cas_result(540, 505, outcome))
+            .step(&ctx(540), &cas_result(540, 505, renewal.request, outcome))
             .expect("built");
         assert_eq!(shapes(&effects), expected, "{outcome:?}");
         let view = kernel.view();
@@ -894,7 +943,10 @@ fn the_read_back_of_a_landed_renewal_adopts_it_without_restarting_the_window() {
     let (mut kernel, grant, renewal) = renewing();
     serve_p1(&mut kernel, &ctx(520));
     kernel
-        .step(&ctx(540), &cas_result(540, 505, CasOutcome::Unknown))
+        .step(
+            &ctx(540),
+            &cas_result(540, 505, renewal.request, CasOutcome::Unknown),
+        )
         .expect("built");
     let seq = kernel.authority_seq();
     let armed = kernel.timer_version(AuthorityTimer::Renew);
@@ -941,9 +993,12 @@ fn the_read_back_of_a_landed_renewal_adopts_it_without_restarting_the_window() {
 /// grant runs out on a healthy store.
 #[retcd_test]
 fn the_read_back_of_the_record_already_held_adopts_nothing_and_rearms() {
-    let (mut kernel, grant, _) = renewing();
+    let (mut kernel, grant, renewal) = renewing();
     kernel
-        .step(&ctx(540), &cas_result(540, 505, CasOutcome::Unknown))
+        .step(
+            &ctx(540),
+            &cas_result(540, 505, renewal.request, CasOutcome::Unknown),
+        )
         .expect("built");
     let armed = kernel.timer_version(AuthorityTimer::Renew);
 
@@ -979,7 +1034,7 @@ fn the_read_back_of_the_record_already_held_adopts_nothing_and_rearms() {
 /// Terminal means terminal (K-A-02).
 #[retcd_test]
 fn a_renewal_that_commits_after_the_fence_is_ignored() {
-    let (mut kernel, _, _) = renewing();
+    let (mut kernel, _, renewal) = renewing();
     kernel
         .step(
             &ctx(510),
@@ -992,7 +1047,12 @@ fn a_renewal_that_commits_after_the_fence_is_ignored() {
     let effects = kernel
         .step(
             &ctx(520),
-            &cas_result(520, 505, CasOutcome::Committed(Revision(9))),
+            &cas_result(
+                520,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(9)),
+            ),
         )
         .expect("built");
 
@@ -1164,7 +1224,7 @@ fn m7a_01_acquire_create_only_cas_one_winner() {
         let cas = shapes(&kernel.step(&ctx(10), &due).expect("the AcquireDue row"));
         let answer = shapes(
             &kernel
-                .step(&ctx(11), &cas_result(11, 10, outcome))
+                .step(&ctx(11), &cas_result(11, 10, in_flight(&kernel), outcome))
                 .expect("the completion row"),
         );
         (kernel, cas, answer)
@@ -1201,7 +1261,7 @@ fn m7a_01_acquire_create_only_cas_one_winner() {
 /// vector, which is the stronger claim. No `Held` field is populated from the conflict.
 #[retcd_test]
 fn m7a_02_acquire_cas_conflict_reads_learns_nothing() {
-    let (mut kernel, _) = acquiring();
+    let (mut kernel, acquire) = acquiring();
 
     let effects = kernel
         .step(
@@ -1209,6 +1269,7 @@ fn m7a_02_acquire_cas_conflict_reads_learns_nothing() {
             &cas_result(
                 9,
                 5,
+                acquire.request,
                 CasOutcome::Conflict {
                     exists: false,
                     current: Revision(0),
@@ -1240,10 +1301,13 @@ fn m7a_02_acquire_cas_conflict_reads_learns_nothing() {
 /// the admission check answers `Deny(NoGrant)`.
 #[retcd_test]
 fn m7a_03_acquire_cas_unknown_reads_no_rights() {
-    let (mut kernel, _) = acquiring();
+    let (mut kernel, acquire) = acquiring();
 
     let effects = kernel
-        .step(&ctx(9), &cas_result(9, 5, CasOutcome::Unknown))
+        .step(
+            &ctx(9),
+            &cas_result(9, 5, acquire.request, CasOutcome::Unknown),
+        )
         .expect("built");
 
     assert_eq!(shapes(&effects), vec![Shape::Get(ControlKey::Grant(NODE))]);
@@ -1357,9 +1421,9 @@ const LAPSE: u64 = 5 + BUDGETS.grant_millis - BUDGETS.dispatch_margin_millis;
 
 /// [`renewing`], answered `outcome` at tick 540.
 fn renewal_answered(outcome: CasOutcome) -> (Authority, GrantId, Vec<Shape>) {
-    let (mut kernel, grant, _) = renewing();
+    let (mut kernel, grant, renewal) = renewing();
     let effects = kernel
-        .step(&ctx(540), &cas_result(540, 505, outcome))
+        .step(&ctx(540), &cas_result(540, 505, renewal.request, outcome))
         .expect("the renewal completion row is built");
     (kernel, grant, shapes(&effects))
 }
@@ -1460,7 +1524,12 @@ fn renewed_at_1000_committed_at(completed: u64) -> AuthorityStateView {
     kernel
         .step(
             &ctx(completed),
-            &cas_result(completed, 1_000, CasOutcome::Committed(Revision(42))),
+            &cas_result(
+                completed,
+                1_000,
+                in_flight(&kernel),
+                CasOutcome::Committed(Revision(42)),
+            ),
         )
         .expect("the renewal commit row");
     kernel.view()
@@ -1529,12 +1598,15 @@ fn m7a_14_renew_unknown_leaves_expiry_denies_only() {
 /// kernel's order exactly.
 #[retcd_test]
 fn m7a_15_renew_unavailable_leaves_expiry_read_backoff() {
-    let (mut kernel, _, _) = renewing();
+    let (mut kernel, _, renewal) = renewing();
     serve_p1(&mut kernel, &ctx(520));
     let armed = kernel.timer_version(AuthorityTimer::Renew);
 
     let effects = kernel
-        .step(&ctx(540), &cas_result(540, 505, CasOutcome::Unavailable))
+        .step(
+            &ctx(540),
+            &cas_result(540, 505, renewal.request, CasOutcome::Unavailable),
+        )
         .expect("built");
 
     assert_eq!(
@@ -1610,11 +1682,16 @@ fn m7a_17_renewal_after_freeze_fences_frozen() {
 /// name is an ignore reason, `AuthorityIgnoreReason::LateRenewalIgnored`, never a fact.
 #[retcd_test]
 fn m7a_18_renewal_before_freeze_race_committed_renewal_does_not_unfence() {
-    let (mut kernel, grant, _) = renewing();
+    let (mut kernel, grant, renewal) = renewing();
     kernel
         .step(
             &ctx(540),
-            &cas_result(540, 505, CasOutcome::Committed(Revision(42))),
+            &cas_result(
+                540,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(42)),
+            ),
         )
         .expect("the renewal commit");
 
@@ -1647,7 +1724,12 @@ fn m7a_18_renewal_before_freeze_race_committed_renewal_does_not_unfence() {
     let late = kernel
         .step(
             &ctx(570),
-            &cas_result(570, 505, CasOutcome::Committed(Revision(44))),
+            &cas_result(
+                570,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(44)),
+            ),
         )
         .expect("built");
     assert_eq!(
@@ -1699,7 +1781,7 @@ fn m7a_21_renewal_read_same_grant_same_boot_no_fence() {
 /// still `Fenced{Expired}`; `E` and the record revision are not written.
 #[retcd_test]
 fn m7a_22_fenced_then_cas_applied_late_renewal_ignored() {
-    let (mut kernel, _, _) = renewing();
+    let (mut kernel, _, renewal) = renewing();
     kernel
         .step(&ctx(LAPSE), &probe(LAPSE))
         .expect("the lapse fence");
@@ -1708,7 +1790,12 @@ fn m7a_22_fenced_then_cas_applied_late_renewal_ignored() {
     let effects = kernel
         .step(
             &ctx(LAPSE + 1),
-            &cas_result(LAPSE + 1, 505, CasOutcome::Committed(Revision(50))),
+            &cas_result(
+                LAPSE + 1,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(50)),
+            ),
         )
         .expect("built");
 
@@ -1780,6 +1867,7 @@ fn m7a_27_renewed_expiry_no_runaway_ten_minutes() {
                 &cas_result(
                     dispatch + 1,
                     dispatch,
+                    in_flight(&kernel),
                     CasOutcome::Committed(Revision(7 + i)),
                 ),
             )
@@ -1929,10 +2017,11 @@ fn acquires_at(kernel: &mut Authority, now: u64) {
         panic!("one create-only CAS: {effects:?}");
     };
     assert_eq!(record.expiry_utc_ms, e_new_at(now), "E == E_new at {now}");
+    let request = in_flight(kernel);
     kernel
         .step(
             &reading(now + 1, now, 10, true),
-            &cas_result(now + 1, now, CasOutcome::Committed(Revision(7))),
+            &cas_result(now + 1, now, request, CasOutcome::Committed(Revision(7))),
         )
         .expect("the commit");
     assert!(kernel.state().is_held(), "the commit adopts");
@@ -2048,4 +2137,142 @@ fn m7a_148_acquire_withheld_reasons_collapse_to_no_sample_and_stale() {
         1,
         "twin: the CAS is issued: {effects:?}"
     );
+}
+
+/// M7A-179. Lead ledger L-R177hs; B-R74b's twin on the grant key. A late answer to an earlier
+/// grant CAS is not the answer to the CAS in flight, even under the same key and correlation.
+///
+/// The acquisition at tick 5 answers `Unknown`, its read-back finds no record, and the next
+/// `AcquireDue` — under the **same correlation** — sends a second create-only CAS. The first
+/// CAS's `Committed` then arrives. Matched by key or correlation it would grant the second CAS's
+/// record from the first's answer. It is `UnmatchedCompletion` and moves nothing; the second
+/// CAS's own answer, echoing its own id, is the one that grants. Red on `HEAD` (547c82c): the
+/// late answer entered `Held`.
+#[retcd_test]
+fn m7a_179_a_late_answer_to_an_earlier_acquisition_is_not_the_current_ones() {
+    let (mut kernel, first) = acquiring();
+    kernel
+        .step(
+            &ctx(9),
+            &cas_result(9, 5, first.request, CasOutcome::Unknown),
+        )
+        .expect("built");
+    kernel
+        .step(
+            &ctx(10),
+            &grant_read(10, ReadOutcome::Absent { as_of: Revision(3) }),
+        )
+        .expect("built");
+    let due = acquire_due(&kernel, 20, 5);
+    kernel.step(&ctx(20), &due).expect("built");
+    let second = kernel
+        .view()
+        .acquire
+        .expect("fixture: a second CAS is in flight");
+    assert_ne!(
+        second.request, first.request,
+        "M7A-179: a fresh id per request"
+    );
+
+    let late = kernel
+        .step(
+            &ctx(30),
+            &cas_result(30, 5, first.request, CasOutcome::Committed(Revision(7))),
+        )
+        .expect("built");
+    assert_eq!(
+        shapes(&late),
+        vec![Shape::Ignored(AuthorityIgnoreReason::UnmatchedCompletion)],
+        "M7A-179: the first CAS's late answer is ignored, named"
+    );
+    assert!(kernel.state().is_unheld(), "M7A-179: and grants nothing");
+    assert_eq!(
+        kernel.view().acquire,
+        Some(second),
+        "M7A-179: the second CAS is still the one awaited"
+    );
+
+    kernel
+        .step(
+            &ctx(40),
+            &cas_result(40, 5, second.request, CasOutcome::Committed(Revision(8))),
+        )
+        .expect("built");
+    let view = kernel.view();
+    assert!(view.state.is_held(), "M7A-179: its own answer grants");
+    assert_eq!(view.record_revision, Some(Revision(8)));
+    assert_eq!(view.expiry_utc_ms, Some(second.e_new));
+}
+
+/// M7A-179, the renewal half. The renewal at 505 answers `Unknown`; the next `RenewDue`, under the
+/// same correlation, sends a second renewal. The first renewal's late `Committed` is
+/// `UnmatchedCompletion`: `E` stays at the acquisition's and the second renewal stays in flight.
+/// Its own answer then extends `E`. Red on `HEAD` (547c82c): the late answer was taken as the second
+/// renewal's commit (`[Arm(Renew)]`).
+#[retcd_test]
+fn m7a_179_a_late_answer_to_an_earlier_renewal_is_not_the_current_ones() {
+    let (mut kernel, _, first) = renewing();
+    kernel
+        .step(
+            &ctx(540),
+            &cas_result(540, 505, first.request, CasOutcome::Unknown),
+        )
+        .expect("built");
+    assert_eq!(
+        kernel.view().renewal,
+        None,
+        "fixture: the first renewal is over"
+    );
+    let due = renew_due(&kernel, 600, 505);
+    kernel.step(&ctx(600), &due).expect("built");
+    let second = kernel
+        .view()
+        .renewal
+        .expect("fixture: a second renewal is in flight");
+    assert_ne!(
+        second.request, first.request,
+        "M7A-179: a fresh id per request"
+    );
+
+    let late = kernel
+        .step(
+            &ctx(640),
+            &cas_result(640, 505, first.request, CasOutcome::Committed(Revision(9))),
+        )
+        .expect("built");
+    assert_eq!(
+        shapes(&late),
+        vec![Shape::Ignored(AuthorityIgnoreReason::UnmatchedCompletion)],
+        "M7A-179: the first renewal's late answer is ignored, named"
+    );
+    let view = kernel.view();
+    assert_eq!(
+        view.expiry_utc_ms,
+        Some(e_new_at(5)),
+        "M7A-179: E is not extended"
+    );
+    assert_eq!(
+        view.renewal,
+        Some(second),
+        "M7A-179: the second renewal is awaited"
+    );
+
+    kernel
+        .step(
+            &ctx(650),
+            &cas_result(
+                650,
+                505,
+                second.request,
+                CasOutcome::Committed(Revision(10)),
+            ),
+        )
+        .expect("built");
+    let view = kernel.view();
+    assert_eq!(
+        view.expiry_utc_ms,
+        Some(second.e_new),
+        "M7A-179: its own answer extends E"
+    );
+    assert_eq!(view.record_revision, Some(Revision(10)));
 }

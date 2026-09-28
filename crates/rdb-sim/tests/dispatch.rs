@@ -20,8 +20,8 @@ use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, EventKind, KernelEffect, ModuleName,
 };
 use rdb_core::contracts::ids::{
-    BootId, ConfigVersion, CorrelationId, EventId, Generation, MessageId, NodeId, OwnerEpoch,
-    PartitionId, ReplicaRole, ScenarioId, Seq, SnapshotHandle, TimerId, TimerVersion,
+    BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId, Generation, MessageId, NodeId,
+    OwnerEpoch, PartitionId, ReplicaRole, ScenarioId, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::RecoveryEffect;
@@ -353,6 +353,7 @@ fn m7f_21_the_effect_to_event_hop_costs_zero_ticks_and_a_delay_costs_exactly_the
         support::control_effect(
             correlation,
             ControlEffect::Cas {
+                request: ControlRequestId(correlation),
                 key,
                 expected: None,
                 value: Some(Bytes::from_static(b"g")),

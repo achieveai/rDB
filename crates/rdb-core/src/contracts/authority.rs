@@ -885,7 +885,9 @@ pub enum AuthorityIgnoreReason {
     /// A takeover was deferred rather than attempted.
     TakeoverDeferred,
     /// A `grants/{node}` CAS completion arrived that matches no CAS this node has outstanding:
-    /// its correlation is not the in-flight acquisition's (lead ruling A-R47).
+    /// its [`ControlRequestId`](crate::contracts::ids::ControlRequestId) is not the one the
+    /// in-flight acquisition or renewal was issued under (lead ruling A-R47; matched by request id
+    /// since lead ledger L-R177hs, by correlation before).
     ///
     /// Appended by kernel-a in the A1 phase-2 build (§3.1), under the authority of lead ruling
     /// A-R41. It is what the retired one-event shortcut now answers: a `Committed` this kernel

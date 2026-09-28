@@ -42,8 +42,8 @@ use rdb_core::contracts::event::{
     NodeLifecycle, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BatchId, BootId, ConfigVersion, CorrelationId, EventId, Generation,
-    GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
+    AuthorityGeneration, BatchId, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageEvent, StorageFault};
@@ -157,6 +157,7 @@ fn held_kernel() -> Authority {
     let committed = at(
         2,
         EventKind::Control(ControlEvent::CasResult {
+            request: in_flight(&kernel),
             key: ControlKey::Grant(NODE),
             outcome: CasOutcome::Committed(Revision(7)),
         }),
@@ -573,6 +574,21 @@ fn arms(effects: &[Effect]) -> Vec<(Option<AuthorityTimer>, Tick)> {
         .collect()
 }
 
+/// The request id of the grant CAS in flight: the acquisition while `Unheld`, else the renewal.
+/// Its completion must echo it to be its answer (lead ledger L-R177hs).
+fn in_flight(kernel: &Authority) -> ControlRequestId {
+    kernel
+        .state()
+        .acquire()
+        .map(|acquire| acquire.request)
+        .or_else(|| kernel.view().renewal.map(|renewal| renewal.request))
+        .expect("fixture: a grant CAS in flight")
+}
+
+/// The request id these rows put on a read A1 judges by its content: a read of its own grant, or
+/// of a partition it did not ask for as a `Recovered` read-back. A1 matches neither by id.
+const BY_CONTENT: ControlRequestId = ControlRequestId(0);
+
 /// How many CASes on our own grant record an effect vector issues.
 fn grant_cases(effects: &[Effect]) -> usize {
     effects
@@ -617,6 +633,7 @@ fn renewal_outstanding() -> Authority {
 #[retcd_test]
 fn m7a_36_tick_local_window_lapsed_fences_expired_with_renewal_outstanding() {
     let mut kernel = renewal_outstanding();
+    let renewal = in_flight(&kernel);
     let wake = fired(&kernel, 2_900, AuthorityTimer::ClockWake);
     let effects = kernel
         .step(&sampled(2_900, 2_500, -5, 0, true), &wake)
@@ -638,6 +655,7 @@ fn m7a_36_tick_local_window_lapsed_fences_expired_with_renewal_outstanding() {
         2_950,
         2_500,
         EventKind::Control(ControlEvent::CasResult {
+            request: renewal,
             key: ControlKey::Grant(NODE),
             outcome: CasOutcome::Committed(Revision(8)),
         }),
@@ -1091,6 +1109,7 @@ fn grant_read(outcome: ReadOutcome) -> Event {
         100,
         100,
         EventKind::Control(ControlEvent::Value {
+            request: BY_CONTENT,
             key: ControlKey::Grant(NODE),
             outcome,
         }),
@@ -1281,6 +1300,7 @@ fn triggers() -> Vec<Trigger> {
             (p1, GenerationChanged),
             |k, t| {
                 let read = ControlEvent::Value {
+                    request: BY_CONTENT,
                     key: ControlKey::Partition(PARTITION),
                     outcome: ReadOutcome::Absent {
                         as_of: Revision(11),
@@ -1402,6 +1422,7 @@ fn created_grants(effects: &[Effect]) -> Vec<GrantId> {
                 key: ControlKey::Grant(NODE),
                 expected: None,
                 value,
+                ..
             }) => value
                 .as_deref()
                 .and_then(GrantRecord::decode)
@@ -1440,11 +1461,12 @@ fn m7a_24_unbounded_mode_does_not_burn_grant_ids() {
             );
         }
     };
-    let committed = |at: u64, correlation: u64, revision: u64| {
+    let committed = |request: ControlRequestId, at: u64, correlation: u64, revision: u64| {
         event_at(
             at,
             correlation,
             EventKind::Control(ControlEvent::CasResult {
+                request,
                 key: ControlKey::Grant(NODE),
                 outcome: CasOutcome::Committed(Revision(revision)),
             }),
@@ -1453,16 +1475,18 @@ fn m7a_24_unbounded_mode_does_not_burn_grant_ids() {
 
     let acquire = fired(&kernel, 10, AuthorityTimer::Acquire);
     step(&mut kernel, 10, &acquire);
-    step(&mut kernel, 11, &committed(11, 10, 7));
+    let request = in_flight(&kernel);
+    step(&mut kernel, 11, &committed(request, 11, 10, 7));
     assert!(kernel.state().is_held(), "fixture: acquired");
     for i in 1..=20 {
         let due_at = 10 + BUDGETS.renew_millis * i;
         let renew = fired(&kernel, due_at, AuthorityTimer::Renew);
         step(&mut kernel, due_at, &renew);
+        let request = in_flight(&kernel);
         step(
             &mut kernel,
             due_at + 1,
-            &committed(due_at + 1, due_at, 7 + i),
+            &committed(request, due_at + 1, due_at, 7 + i),
         );
         step(&mut kernel, due_at + 250, &probe(3, due_at + 250));
     }

@@ -395,7 +395,7 @@ fn m7f_52_serialised_lines_land_in_a_tagged_file_under_the_test_log_root() {
 use rdb_core::authority::AuthorityTimer;
 use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey};
 use rdb_core::contracts::event::{Effect, EffectKind, EventKind, KernelEffect};
-use rdb_core::contracts::ids::{Revision, TimerId, TimerVersion};
+use rdb_core::contracts::ids::{ControlRequestId, Revision, TimerId, TimerVersion};
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{DispatchOutcome, KernelNote};
@@ -439,6 +439,7 @@ fn i1_unmatched_commit(at: Tick) -> SeedEvent {
         partition: PartitionId(1),
         correlation: CorrelationId(1),
         kind: EventKind::Control(ControlEvent::CasResult {
+            request: ControlRequestId(1),
             key: ControlKey::Grant(NodeId(1)),
             outcome: CasOutcome::Committed(Revision(1)),
         }),
@@ -454,6 +455,7 @@ fn i1_inert(at: Tick) -> SeedEvent {
         partition: PartitionId(1),
         correlation: CorrelationId(1),
         kind: EventKind::Control(ControlEvent::CasResult {
+            request: ControlRequestId(1),
             key: ControlKey::ClusterSchema,
             outcome: CasOutcome::Conflict {
                 exists: true,

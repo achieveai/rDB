@@ -33,8 +33,8 @@ use rdb_core::contracts::event::{
     NodeLifecycle, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BatchId, BootId, ConfigVersion, CorrelationId, EventId, Generation,
-    GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
+    AuthorityGeneration, BatchId, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
@@ -156,8 +156,8 @@ fn acquired_under(step_ctx: &StepCtx<'_>) -> (Authority, Vec<Effect>) {
 /// The acquisition [`acquired_under`] runs, on a kernel that already exists: an `Unheld` one
 /// that has seen other events first. Returns the commit's effect vector.
 fn acquire(kernel: &mut Authority, step_ctx: &StepCtx<'_>) -> Vec<Effect> {
-    // The same id and correlation as `event(1, ..)` below: the commit is matched to the CAS by
-    // correlation, and nothing else.
+    // The same id and correlation as `event(1, ..)` below. The commit is matched to the CAS by the
+    // request id it echoes (lead ledger L-R177hs), which [`in_flight`] reads.
     let due = Event {
         id: EventId(1),
         at: Tick(0),
@@ -174,12 +174,14 @@ fn acquire(kernel: &mut Authority, step_ctx: &StepCtx<'_>) -> Vec<Effect> {
     kernel
         .step(step_ctx, &due)
         .expect("the AcquireDue row is built");
+    let request = in_flight(kernel);
     let effects = kernel
         .step(
             step_ctx,
             &event(
                 1,
                 ControlEvent::CasResult {
+                    request,
                     key: ControlKey::Grant(NODE),
                     outcome: CasOutcome::Committed(Revision(7)),
                 },
@@ -188,6 +190,35 @@ fn acquire(kernel: &mut Authority, step_ctx: &StepCtx<'_>) -> Vec<Effect> {
         .expect("the acquisition commit row is built");
     assert!(kernel.state().is_held(), "the preamble must reach Held");
     effects
+}
+
+/// A request id A1 never minted: its ids start above `AUTHORITY_CONTROL_REQUEST_BASE`. Carried by
+/// reads A1 judges by content — its own grant, a partition read that is no `Recovered` read-back —
+/// and by answers to no request of A1's.
+const UNASKED: ControlRequestId = ControlRequestId(0);
+
+/// The request id of the grant CAS in flight: the acquisition while `Unheld`, else the renewal.
+fn in_flight(kernel: &Authority) -> ControlRequestId {
+    let view = kernel.view();
+    view.acquire
+        .map(|acquire| acquire.request)
+        .or_else(|| view.renewal.map(|renewal| renewal.request))
+        .expect("fixture: a grant CAS in flight")
+}
+
+/// The request id of the one control `Get` in `effects`.
+fn asked(effects: &[Effect]) -> ControlRequestId {
+    let asked: Vec<ControlRequestId> = effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Get { request, .. }) => Some(*request),
+            _ => None,
+        })
+        .collect();
+    let [request] = asked.as_slice() else {
+        panic!("fixture: one Get: {effects:?}");
+    };
+    *request
 }
 
 /// `Held`, with `p1` installed at `epoch` by a coherent snapshot at revision 10.
@@ -216,11 +247,24 @@ fn serving_p1(epoch: u64) -> Authority {
     kernel
 }
 
-/// A linearizable read of `partitions/{key}` answering `body` at `revision`.
+/// A linearizable read of `partitions/{key}` answering `body` at `revision`, to no request A1
+/// matches by id: the watch-driven and generic reads, which A1 judges by content.
 fn read(id: u64, key: PartitionId, revision: u64, body: &PartitionRecord) -> Event {
+    read_as(UNASKED, id, key, revision, body)
+}
+
+/// [`read`], answering the `Get` sent as `request`: a `Recovered` read-back is matched by it.
+fn read_as(
+    request: ControlRequestId,
+    id: u64,
+    key: PartitionId,
+    revision: u64,
+    body: &PartitionRecord,
+) -> Event {
     event(
         id,
         ControlEvent::Value {
+            request,
             key: ControlKey::Partition(key),
             outcome: ReadOutcome::Found {
                 revision: Revision(revision),
@@ -618,6 +662,7 @@ fn read_absent(id: u64, key: PartitionId, as_of: u64) -> Event {
     event(
         id,
         ControlEvent::Value {
+            request: UNASKED,
             key: ControlKey::Partition(key),
             outcome: ReadOutcome::Absent {
                 as_of: Revision(as_of),
@@ -1062,6 +1107,7 @@ fn a_renewal_commit_publishes_no_view_for_a_partition_that_moved() {
             &event(
                 5,
                 ControlEvent::CasResult {
+                    request: in_flight(&kernel),
                     key: ControlKey::Grant(NODE),
                     outcome: CasOutcome::Committed(Revision(8)),
                 },
@@ -1246,6 +1292,7 @@ fn a_node_fence_publishes_a_past_view_for_every_served_partition() {
             DenyReason::Revoked,
             ctx(2),
             EventKind::Control(ControlEvent::Value {
+                request: UNASKED,
                 key: ControlKey::Grant(NODE),
                 outcome: ReadOutcome::Absent { as_of: Revision(8) },
             }),
@@ -1254,6 +1301,7 @@ fn a_node_fence_publishes_a_past_view_for_every_served_partition() {
             DenyReason::Frozen,
             ctx(2),
             EventKind::Control(ControlEvent::Value {
+                request: UNASKED,
                 key: ControlKey::Grant(NODE),
                 outcome: own_grant(true),
             }),
@@ -1313,6 +1361,7 @@ fn a_view_still_admits_at_its_own_horizon_when_the_local_window_binds() {
             &event(
                 3,
                 ControlEvent::Value {
+                    request: UNASKED,
                     key: ControlKey::Grant(NODE),
                     outcome: ReadOutcome::Found {
                         revision: Revision(8),
@@ -1656,6 +1705,7 @@ fn a_shrinking_horizon_republishes_every_served_partition() {
             event(
                 3,
                 ControlEvent::Value {
+                    request: UNASKED,
                     key: ControlKey::Grant(NODE),
                     outcome: ReadOutcome::Found {
                         revision: Revision(8),
@@ -1703,6 +1753,7 @@ fn a_renewal_that_lowers_e_republishes_every_served_partition() {
     let commit = event(
         20,
         ControlEvent::CasResult {
+            request: in_flight(&kernel),
             key: ControlKey::Grant(NODE),
             outcome: CasOutcome::Committed(Revision(8)),
         },
@@ -2097,6 +2148,7 @@ fn a_moved_sample_republishes_every_served_partition_in_partition_order() {
             event(
                 3,
                 ControlEvent::CasResult {
+                    request: UNASKED,
                     key: ControlKey::ClusterSchema,
                     outcome: CasOutcome::Conflict {
                         exists: true,
@@ -2475,7 +2527,8 @@ fn m7a_05_lineage_watch_event_reads_never_mutates() {
             effects.as_slice(),
             [Effect {
                 kind: EffectKind::Control(ControlEffect::Get {
-                    key: ControlKey::Partition(P1)
+                    key: ControlKey::Partition(P1),
+                    ..
                 }),
                 ..
             }]
@@ -2874,6 +2927,7 @@ fn our_grant_read(kernel: &Authority, id: u64, revision: u64, e: i64, frozen: bo
     event(
         id,
         ControlEvent::Value {
+            request: UNASKED,
             key: ControlKey::Grant(NODE),
             outcome: ReadOutcome::Found {
                 revision: Revision(revision),
@@ -2895,11 +2949,12 @@ fn renew_due(kernel: &Authority, id: u64, at: u64) -> Event {
     )
 }
 
-/// The grant CAS answered `outcome`, under correlation `id`.
-fn renew_answered(id: u64, outcome: CasOutcome) -> Event {
+/// The grant CAS in flight on `kernel` answered `outcome`, under correlation `id`.
+fn renew_answered(kernel: &Authority, id: u64, outcome: CasOutcome) -> Event {
     event(
         id,
         ControlEvent::CasResult {
+            request: in_flight(kernel),
             key: ControlKey::Grant(NODE),
             outcome,
         },
@@ -2937,7 +2992,7 @@ fn m7a_145_authority_view_republished_at_five_points_fans_out_per_served_partiti
     let committed = kernel
         .step(
             &at(1_601),
-            &renew_answered(30, CasOutcome::Committed(Revision(8))),
+            &renew_answered(&kernel, 30, CasOutcome::Committed(Revision(8))),
         )
         .expect("the renewal commit");
     assert_eq!(published_for(&committed), both, "committed renewal");
@@ -2961,6 +3016,7 @@ fn m7a_145_authority_view_republished_at_five_points_fans_out_per_served_partiti
         .step(
             &at(1_701),
             &renew_answered(
+                &kernel,
                 31,
                 CasOutcome::Conflict {
                     exists: true,
@@ -3131,7 +3187,7 @@ fn trigger(effects: &[Effect]) -> (Vec<(PartitionId, ControlKey)>, Vec<Shape>) {
     let gets = effects
         .iter()
         .filter_map(|effect| match &effect.kind {
-            EffectKind::Control(ControlEffect::Get { key }) => Some((effect.partition, *key)),
+            EffectKind::Control(ControlEffect::Get { key, .. }) => Some((effect.partition, *key)),
             _ => None,
         })
         .collect();
@@ -3187,6 +3243,7 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     let effects = kernel
         .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
         .expect("the Recovered trigger row is built");
+    let read_back = asked(&effects);
     assert_eq!(
         trigger(&effects),
         (
@@ -3198,7 +3255,10 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     assert_eq!(kernel.view(), before, "no rights change at the trigger");
 
     let effects = kernel
-        .step(&ctx(4), &read(40, P2, 20, &record_at(P2, 2, 2)))
+        .step(
+            &ctx(4),
+            &read_as(read_back, 40, P2, 20, &record_at(P2, 2, 2)),
+        )
         .expect("the install row is built");
     assert_eq!(
         shapes(&effects),
@@ -3215,11 +3275,13 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     assert_eq!(view.served.get(&P1), before.served.get(&P1), "p1 untouched");
     assert_eq!(view.authority_seq, before.authority_seq + 1, "K-A-34");
 
-    // Near miss: the same record, read under a correlation the trigger did not issue.
+    // Near miss: the same record, read as the answer to a request the trigger did not issue.
     let mut kernel = serving_p1(1);
-    let _ = kernel
-        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
-        .expect("trigger");
+    let read_back = asked(
+        &kernel
+            .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+            .expect("trigger"),
+    );
     let effects = kernel
         .step(&ctx(4), &read(41, P2, 20, &record_at(P2, 2, 2)))
         .expect("a generic read");
@@ -3230,7 +3292,10 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     );
     let seq = kernel.authority_seq();
     let effects = kernel
-        .step(&ctx(5), &read(40, P2, 20, &record_at(P2, 2, 2)))
+        .step(
+            &ctx(5),
+            &read_as(read_back, 40, P2, 20, &record_at(P2, 2, 2)),
+        )
         .expect("the recovery's read-back, late");
     assert_eq!(
         shapes(&effects),
@@ -3241,11 +3306,16 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
 
     // Near miss: the recovery's read-back names a generation other than the recovery's.
     let mut kernel = serving_p1(1);
-    let _ = kernel
-        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
-        .expect("trigger");
+    let read_back = asked(
+        &kernel
+            .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+            .expect("trigger"),
+    );
     let effects = kernel
-        .step(&ctx(4), &read(40, P2, 20, &record_at(P2, 3, 2)))
+        .step(
+            &ctx(4),
+            &read_as(read_back, 40, P2, 20, &record_at(P2, 3, 2)),
+        )
         .expect("a read-back at g3");
     assert_eq!(
         shapes(&effects)[2..],
@@ -3258,6 +3328,7 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     let effects = kernel
         .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
         .expect("the trigger row answers in every state");
+    let read_back = asked(&effects);
     assert_eq!(
         trigger(&effects),
         (
@@ -3267,7 +3338,10 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     );
     // ...its read-back installs nothing, because there is no grant to serve it under...
     let effects = kernel
-        .step(&ctx(4), &read(40, P1, 20, &record_at(P1, 2, 2)))
+        .step(
+            &ctx(4),
+            &read_as(read_back, 40, P1, 20, &record_at(P1, 2, 2)),
+        )
         .expect("an unheld read-back");
     assert_eq!(adopted_lineages(&effects), vec![], "Unheld: no install");
     assert!(kernel.view().served.is_empty());
@@ -3282,18 +3356,26 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     );
     assert!(shapes(&effects).contains(&Shape::Fact(AuthorityFact::LineageLoaded)));
 
-    // The answered read is forgotten: after the acquire, a read under its correlation is the
-    // generic changed row, not a second install.
+    // The answered read is forgotten: after the acquire, a read echoing its id is the generic
+    // changed row, not a second install.
     let mut kernel = Authority::new();
+    let read_back = asked(
+        &kernel
+            .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
+            .expect("trigger"),
+    );
     let _ = kernel
-        .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
-        .expect("trigger");
-    let _ = kernel
-        .step(&ctx(4), &read(40, P1, 20, &record_at(P1, 2, 2)))
+        .step(
+            &ctx(4),
+            &read_as(read_back, 40, P1, 20, &record_at(P1, 2, 2)),
+        )
         .expect("an unheld read-back");
     let _ = acquire(&mut kernel, &ctx(5));
     let effects = kernel
-        .step(&ctx(6), &read(40, P1, 21, &record_at(P1, 2, 2)))
+        .step(
+            &ctx(6),
+            &read_as(read_back, 40, P1, 21, &record_at(P1, 2, 2)),
+        )
         .expect("a read after the acquire");
     assert_eq!(
         shapes(&effects)[2..],
@@ -3303,9 +3385,11 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     // (f) A late read-back older than an install a newer read already made (A-R48): superseded,
     // not installed, and the newer lineage is not rolled back.
     let mut kernel = serving_p1(1);
-    let _ = kernel
-        .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
-        .expect("trigger");
+    let read_back = asked(
+        &kernel
+            .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+            .expect("trigger"),
+    );
     let effects = kernel
         .step(&ctx(4), &read(41, P2, 25, &record_at(P2, 3, 3)))
         .expect("a newer generic read");
@@ -3315,7 +3399,10 @@ fn m7a_176_post_recovered_read_back_installs_lineage() {
     );
     let seq = kernel.authority_seq();
     let effects = kernel
-        .step(&ctx(5), &read(40, P2, 20, &record_at(P2, 2, 2)))
+        .step(
+            &ctx(5),
+            &read_as(read_back, 40, P2, 20, &record_at(P2, 2, 2)),
+        )
         .expect("the recovery's read-back, older, late");
     assert_eq!(adopted_lineages(&effects), vec![], "{effects:?}");
     assert!(
@@ -3352,6 +3439,7 @@ fn m7a_177_same_node_recovery_after_re_acquire_installs_the_new_generation() {
     let effects = kernel
         .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
         .expect("the Recovered trigger row is built");
+    let read_back = asked(&effects);
     assert_eq!(
         trigger(&effects),
         (vec![(P1, ControlKey::Partition(P1))], vec![]),
@@ -3360,7 +3448,10 @@ fn m7a_177_same_node_recovery_after_re_acquire_installs_the_new_generation() {
     assert_eq!(kernel.view(), before, "no rights change at the trigger");
 
     let effects = kernel
-        .step(&ctx(4), &read(40, P1, 20, &record_at(P1, 2, 2)))
+        .step(
+            &ctx(4),
+            &read_as(read_back, 40, P1, 20, &record_at(P1, 2, 2)),
+        )
         .expect("the install row is built");
     assert_eq!(
         shapes(&effects),
@@ -3425,13 +3516,19 @@ fn m7a_162_adopt_authority_only_from_lineage_installs() {
             "at {now}: StepCtx lineage == served"
         );
         total += installs;
+        effects
     };
 
     let load = snapshot(2, 10, &[record(P1, NODE, 1), record(P2, NODE, 1)]);
     step(&mut kernel, 1_600, load, 2);
     step(&mut kernel, 1_601, read(3, P1, 15, &record(P1, NODE, 2)), 1);
-    step(&mut kernel, 1_602, recovered(4, P2, (1, 1), 2), 0);
-    step(&mut kernel, 1_603, read(4, P2, 20, &record_at(P2, 2, 2)), 1);
+    let read_back = asked(&step(&mut kernel, 1_602, recovered(4, P2, (1, 1), 2), 0));
+    step(
+        &mut kernel,
+        1_603,
+        read_as(read_back, 4, P2, 20, &record_at(P2, 2, 2)),
+        1,
+    );
     for n in 0..5_u64 {
         let key = if n % 2 == 0 { P1 } else { P2 };
         let watched = ControlEvent::Watched {
@@ -3452,11 +3549,199 @@ fn m7a_162_adopt_authority_only_from_lineage_installs() {
         kernel.view().renewal.is_some(),
         "fixture: a renewal in flight"
     );
-    let commit = renew_answered(30, CasOutcome::Committed(Revision(8)));
+    let commit = renew_answered(&kernel, 30, CasOutcome::Committed(Revision(8)));
     step(&mut kernel, 1_701, commit, 0);
     assert!(
         kernel.view().renewal.is_none(),
         "fixture: the renewal committed"
     );
     assert_eq!(total, 4, "the three install points, four effects");
+}
+
+/// M7A-180. Lead ledger L-R177hs; the tester's F4. A `Recovered` read-back is matched by the
+/// request id its `Get` was sent as, not by the partition or the correlation.
+///
+/// Held, serving `p1`; F1 recovers `p2` under correlation 40, and A1 sends the read-back `Get`. A
+/// watch then names `p2` in an event under the **same correlation**, and A1 sends a second `Get`
+/// for the watch. The watch read's answer — the same record, same partition, same correlation —
+/// is the generic changed row (`LineageChanged`), not the install row. The read-back's own answer,
+/// echoing its own id, then finds the lineage already served: `LineageUnchanged`, no bump. Red on
+/// `HEAD` (547c82c): the watch read's answer took the read-back's place and was `LineageInstalled`.
+#[retcd_test]
+fn m7a_180_a_watch_read_is_not_the_recovered_read_back() {
+    let mut kernel = serving_p1(1);
+    let read_back = asked(
+        &kernel
+            .step(&ctx(3), &recovered(40, P2, (1, 1), 2))
+            .expect("trigger"),
+    );
+    let watched = ControlEvent::Watched {
+        prefix: ControlPrefix::Partitions,
+        cursor: WatchCursor {
+            revision: Revision(20),
+        },
+        changes: vec![ControlChange {
+            key: ControlKey::Partition(P2),
+            revision: Revision(20),
+        }],
+    };
+    let watch_read = asked(
+        &kernel
+            .step(&ctx(4), &event(40, watched))
+            .expect("the watch read"),
+    );
+    assert_ne!(watch_read, read_back, "M7A-180: a fresh id per request");
+
+    let effects = kernel
+        .step(
+            &ctx(5),
+            &read_as(watch_read, 40, P2, 20, &record_at(P2, 2, 2)),
+        )
+        .expect("the watch read's answer");
+    assert_eq!(
+        shapes(&effects)[2..],
+        [Shape::Fact(AuthorityFact::LineageChanged)],
+        "M7A-180: the watch's read is not the recovery's: the generic changed row"
+    );
+    let seq = kernel.authority_seq();
+    let effects = kernel
+        .step(
+            &ctx(6),
+            &read_as(read_back, 40, P2, 20, &record_at(P2, 2, 2)),
+        )
+        .expect("the read-back's own answer");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::LineageUnchanged)],
+        "M7A-180: the read-back finds the lineage served: nothing re-installed"
+    );
+    assert_eq!(kernel.authority_seq(), seq, "M7A-180: no bump");
+}
+
+/// M7A-182. Lead ledger L-R177hs; the tester's F3. A1's request ids stay fresh across a fence: an
+/// id minted after a fence is none an earlier request carried, so a late answer to a request from
+/// before the fence can never pass for one sent after it.
+///
+/// `Unheld`, F1 recovers `p2` and A1 sends its read-back `Get`; the real acquisition sends its
+/// CAS; a coherent snapshot installs `p1`; a read naming another owner fences `p1`; F1 recovers
+/// `p2` again and A1 sends a second read-back. Every `Cas` and `Get` of the run carries a distinct
+/// id.
+#[retcd_test]
+fn m7a_182_request_ids_stay_fresh_across_a_fence() {
+    let mut kernel = Authority::new();
+    let mut sent = vec![asked(
+        &kernel
+            .step(&ctx(1), &recovered(40, P2, (1, 1), 2))
+            .expect("trigger"),
+    )];
+    let due = Event {
+        id: EventId(1),
+        at: Tick(0),
+        node: NODE,
+        boot: BOOT,
+        partition: P1,
+        correlation: CorrelationId(1),
+        kind: EventKind::Timer(TimerFired {
+            id: AuthorityTimer::Acquire.id(),
+            version: kernel.timer_version(AuthorityTimer::Acquire),
+            scheduled_at: Tick(0),
+        }),
+    };
+    kernel
+        .step(&ctx(2), &due)
+        .expect("the AcquireDue row is built");
+    let acquire = in_flight(&kernel);
+    sent.push(acquire);
+    kernel
+        .step(
+            &ctx(2),
+            &event(
+                1,
+                ControlEvent::CasResult {
+                    request: acquire,
+                    key: ControlKey::Grant(NODE),
+                    outcome: CasOutcome::Committed(Revision(7)),
+                },
+            ),
+        )
+        .expect("the acquisition commit row is built");
+    assert!(kernel.state().is_held(), "fixture: Held");
+    kernel
+        .step(&ctx(3), &snapshot(3, 10, &[record(P1, NODE, 1)]))
+        .expect("the coherent load");
+    let fenced = kernel
+        .step(&ctx(4), &read(4, P1, 16, &record(P1, OTHER, 5)))
+        .expect("the owner-moved fence");
+    assert!(
+        shapes(&fenced).contains(&Shape::Fence(DenyReason::GenerationChanged)),
+        "fixture: p1 is fenced: {:?}",
+        shapes(&fenced)
+    );
+    sent.push(asked(
+        &kernel
+            .step(&ctx(5), &recovered(50, P2, (2, 2), 3))
+            .expect("trigger after the fence"),
+    ));
+    let distinct: std::collections::BTreeSet<ControlRequestId> = sent.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        sent.len(),
+        "M7A-182: every request id is fresh, across the fence: {sent:?}"
+    );
+}
+
+/// M7A-183. Lead ledger L-R177hs; the tester's F4, the same misattribution on the unheld arm. An
+/// `Unheld` node answers a partition read with nothing, and forgets a `Recovered` read-back only
+/// when the answer echoes that read-back's id (lead ruling A-R78). A watch read's answer on the
+/// same partition is not the read-back's, so the read-back stays remembered: once the node
+/// acquires, the read-back's own answer lands on the install row. Were the watch answer taken for
+/// the read-back, the install would degrade to the generic changed row.
+#[retcd_test]
+fn m7a_183_an_unheld_watch_answer_does_not_clear_the_recovered_read_back() {
+    let mut kernel = Authority::new();
+    let read_back = asked(
+        &kernel
+            .step(&ctx(3), &recovered(40, P1, (1, 1), 2))
+            .expect("trigger"),
+    );
+    let watched = ControlEvent::Watched {
+        prefix: ControlPrefix::Partitions,
+        cursor: WatchCursor {
+            revision: Revision(20),
+        },
+        changes: vec![ControlChange {
+            key: ControlKey::Partition(P1),
+            revision: Revision(20),
+        }],
+    };
+    let watch_read = asked(
+        &kernel
+            .step(&ctx(4), &event(41, watched))
+            .expect("the unheld watch read"),
+    );
+    assert_ne!(watch_read, read_back, "M7A-183: a fresh id per request");
+    let effects = kernel
+        .step(
+            &ctx(5),
+            &read_as(watch_read, 41, P1, 20, &record_at(P1, 2, 2)),
+        )
+        .expect("the watch read's answer, unheld");
+    assert_eq!(effects, vec![], "M7A-183: unheld, a read answers nothing");
+
+    let _ = acquire(&mut kernel, &ctx(6));
+    let effects = kernel
+        .step(
+            &ctx(7),
+            &read_as(read_back, 40, P1, 20, &record_at(P1, 2, 2)),
+        )
+        .expect("the read-back's own answer, held");
+    assert_eq!(
+        shapes(&effects),
+        vec![
+            Shape::Adopt(P1, OwnerEpoch(2)),
+            Shape::Publish(P1),
+            Shape::Fact(AuthorityFact::LineageInstalled),
+        ],
+        "M7A-183: the read-back was still remembered: the install row"
+    );
 }

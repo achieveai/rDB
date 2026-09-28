@@ -546,6 +546,7 @@ contract asks **CB-1** … **CB-4** (`crates/rdb-core/tests/seams.rs`), written 
 | M7F-54 | `m7f_54_append_outcome_is_one_enum_over_the_whole_ladder` **landed** | **CB-4**: `AppendOutcome` is one enum — `Accepted`, `Busy`, `AlreadyHave`, `ProbeDigestAt`, `Rejected` — not `Result<AppendAck, AppendReject>` | one value of each of the five arms | a closure matching all five exhaustively. The shape decision is the assertion: a `Result` would nest a second enum inside `Ok` and make the cursor match twice to learn one fact. kernel-b's §15 calls CB-1 and CB-4 one shape decision; this row and `M7F-53` are that decision spelled the same way twice | unit | none |
 | M7F-55 | `m7f_55_need_prefix_carries_the_head_digest_beside_have` **landed** | **CB-2**: `AppendReject::NeedPrefix { have, head_digest }` (B-R30 Q2 as amended by B-R33 Q-B-4) | two `NeedPrefix` at the **same** `have`, differing only in `head_digest` | the two values differ. With `have` alone the cursor cannot tell "you are behind" from "your history and mine disagree", and `K-B-52` loses one of its two inputs. The equal `have` is what makes the digest the only thing under test | unit | none |
 | M7F-56 | `m7f_56_ack_reject_reason_carries_fourteen_named_reasons` **landed** | **CB-3**: `AckRejectReason` widened from seven to fourteen | all fourteen variants serialised | the sorted, de-duplicated set of names equals a **literal fourteen-name list**, not a count. A count of 14 passes against any fourteen names, including a rename; the list is what makes a rename a failure. Consequence outside this plan: verification's `M7V-56` set-equality row goes red until seven coverage cells are added on their side — see §10.5 | unit | none |
+| M7F-57 | `m7f_57_every_answer_echoes_its_own_request_id` **landed** | lead ledger **L-R177hs** (contract change approved by Gautam 2026-09-27): `ControlEffect::{Cas, Get}` carry a `ControlRequestId` and the sim store echoes it on `ControlEvent::{CasResult, Value}` unchanged | nodes A and B, one correlation; A's completions delayed 500 ticks, B's CAS planned `Unknown`, the next read planned `Unavailable`; A create (id 70), A get (71), B create (9), A get (72), A create (73); then `DropCompletion` and two more gets (80, 81) | every completion's `(node, id, kind)` is exactly its own request's, delayed and planned outcomes included, so no completion ever carries another request's id; the dropped get is never answered and the next echoes 81 | unit | none |
 
 ### 10.5 Conflict 2, and the authority carrier gap — two C0 decisions
 
@@ -1082,12 +1083,12 @@ eight I1 rows in §14.
 | §8 owed seams (M7F-23…26; M7F-05 counted in §5) | 4 | 4 | 3 | 1 | 3 | 1 | 0 |
 | §9 I1 trace validator | 6 | 6 | 0 | 6 | 6 | 0 | 0 |
 | §10 cross-team shapes (incl. M7F-48, M7F-49) | 8 | 8 | 7 | 1 | 8 | 0 | 0 |
-| §10.4 round-2 rows (M7F-50 … M7F-56) | 7 | 7 | 7 | 0 | 7 | 0 | 0 |
+| §10.4 round-2 rows (M7F-50 … M7F-56, and M7F-57) | 8 | 8 | 8 | 0 | 8 | 0 | 0 |
 | §11 deps gate and purity | 3 | 3 | 2 | 1 | 0 | 0 | 3 |
-| **Total** | **56** | **re-census owed** | **re-census owed** | **14** | — | — | **3** |
+| **Total** | **57** | **re-census owed** | **re-census owed** | **14** | — | — | **3** |
 | Q-rows (Q-58 … Q-64) | 7 | — | — | — | — | — | — |
 
-Row id set: `M7F-01` … `M7F-56`, contiguous, no duplicates.
+Row id set: `M7F-01` … `M7F-57`, contiguous, no duplicates.
 
 > **The function totals are withdrawn pending a re-census — lead, 2026-09-22.** The per-row
 > `Landed`/`Owed` marks in §5, §6, §8 and §10 are each verified against a named function at a

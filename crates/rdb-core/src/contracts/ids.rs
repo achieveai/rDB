@@ -97,6 +97,14 @@ dense_id! {
     /// Identifies one `sync_wal_through` call so its completion can be matched to the
     /// prefixes it captured (spec §6.1).
     FlushTicket(u64);
+    /// Identifies one [`ControlEffect::Cas`](crate::contracts::control::ControlEffect::Cas) or
+    /// [`ControlEffect::Get`](crate::contracts::control::ControlEffect::Get), and is echoed
+    /// unchanged by the [`ControlEvent`](crate::contracts::control::ControlEvent) that answers
+    /// it. The requesting module mints it, fresh per request. Answers to `Cas` and `Get` are
+    /// matched by it: a late answer to an abandoned request on the same key carries the old id.
+    /// Which A1 reads are still judged by key and content is listed on `ControlEffect`.
+    /// Not a [`CorrelationId`], which every effect of one step shares.
+    ControlRequestId(u64);
     /// A timer the kernel armed.
     TimerId(u64);
     /// Generation counter for one `TimerId`. A fire carrying a stale version is ignored

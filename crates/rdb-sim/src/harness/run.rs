@@ -1198,7 +1198,7 @@ mod tests {
 
     use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey};
     use rdb_core::contracts::event::{EffectKind, ModuleName};
-    use rdb_core::contracts::ids::Revision;
+    use rdb_core::contracts::ids::{ControlRequestId, Revision};
     use rdb_core::contracts::ids::{TimerId, TimerVersion};
     use rdb_core::contracts::time::TimerEffect;
     use rdb_core::contracts::trace::{DispatchOutcome, TraceKind};
@@ -1246,6 +1246,7 @@ mod tests {
             partition: PART,
             correlation: CorrelationId(1),
             kind: EventKind::Control(ControlEvent::CasResult {
+                request: ControlRequestId(1),
                 key: ControlKey::Grant(NODE),
                 outcome: CasOutcome::Committed(Revision(1)),
             }),
@@ -1269,6 +1270,7 @@ mod tests {
             partition: PART,
             correlation: CorrelationId(1),
             kind: EventKind::Control(ControlEvent::CasResult {
+                request: ControlRequestId(1),
                 key: ControlKey::ClusterSchema,
                 outcome: CasOutcome::Conflict {
                     exists: true,
