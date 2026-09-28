@@ -149,6 +149,14 @@ impl Publication {
         self.slots.get(&(node, partition)).map(|slot| &slot.kernel)
     }
 
+    /// Forget every kernel and scripted view held for `node`. All of it is process memory, so
+    /// this is what a restart of that node loses (lead ruling V-R35); every other node is
+    /// untouched. The simulator calls it from its restart.
+    pub fn forget_node(&mut self, node: NodeId) {
+        self.slots.retain(|(held, _), _| *held != node);
+        self.scripted.retain(|(held, _), _| *held != node);
+    }
+
     /// Everything a row may assert on for `(node, partition)`.
     #[must_use]
     pub fn view(&self, node: NodeId, partition: PartitionId) -> Option<PubStateView> {

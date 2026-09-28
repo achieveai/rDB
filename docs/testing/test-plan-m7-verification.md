@@ -30,8 +30,9 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 > will never exist); its id is **retired, not reused**, and the next free id is `M7V-91`. Each
 > lives in the section its subject belongs to; no existing id was renumbered or reused.
 > Later additions, in id order: `M7V-92` (V-R25), `M7V-93..M7V-95` (L-R177gf), and
-> `M7V-96..M7V-101` (recorder truth, tester-sim-hooks F1, 2026-09-27; §5 after `M7V-95`). The
-> next free id is the one after `M7V-101` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
+> `M7V-96..M7V-101` (recorder truth, tester-sim-hooks F1, 2026-09-27; §5 after `M7V-95`), and
+> `M7V-102..M7V-108` (restart rebuild, V-R35, 2026-09-27; §5 after `M7V-101`). The
+> next free id is the one after `M7V-108` (`M7V-91` stays the unwritten candidate of §15 drift row 6). Architecture requirements in this plan are
 > `VA-1..VA-9` — a separate series from rEtcd's `TA-NN`, because the harness surfaces are in
 > different crates.
 
@@ -55,6 +56,7 @@ rules 1..31 are not restated and are not in force for `rdb-*`.
 | Grammar, generator, reducer rows M7V-20..M7V-23, M7V-42..M7V-51, M7V-83, M7V-84, M7V-86, M7V-88 | `crates/rdb-sim/tests/scenarios.rs` |
 | Recorded-run rows M7V-80, M7V-92, M7V-96..M7V-101 (the spine and rebuild plans live here) | `crates/rdb-sim/tests/dispatch.rs` |
 | Host cadence and runner rows M7V-93..M7V-95 | `crates/rdb-sim/tests/host_cadence.rs` |
+| Restart rebuild rows M7V-102..M7V-108 (V-R35) | `crates/rdb-sim/tests/restart.rs` |
 | Scenario implementation | `crates/rdb-sim/tests/support/scenarios/{mod,grammar,gen,reduce,coverage,mutate}.rs` |
 | Campaign, mutation, evidence rows M7V-52..M7V-77, M7V-78, M7V-82, M7V-87, M7V-89 | `crates/rdb-sim/tests/campaign.rs`, `tests/campaign/{corpus,report,regressions}.rs` |
 | Fixtures | `crates/rdb-sim/tests/fixtures/scenarios/*.json`, `tests/fixtures/regressions/*.json` |
@@ -279,7 +281,7 @@ Rules that follow:
 | Class | Meaning | Per-row budget | Rows (counted from the tables, critic T-17) |
 |---|---|---|---|
 | **unit** | hand-built trace, plain data or a source-level check; no runner, no kernel | **< 100 ms** | **58**: M7V-01..M7V-19, M7V-24..M7V-46, M7V-49, M7V-56, M7V-57, M7V-59, M7V-66..M7V-68, M7V-71, M7V-74, M7V-77, M7V-79, M7V-81..M7V-85; **+ M7V-99** (recorder truth, 2026-09-27; not in the 89-row count) |
-| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) |
+| **sim** | one scenario through the runner and the real kernel | **< 2 s** (M7V-88 replays every fixture and owns **< 10 s**, stated in the row) | **12**: M7V-20..M7V-23, M7V-47, M7V-48, M7V-50, M7V-69, M7V-70, M7V-80, M7V-86, M7V-88; **+ M7V-92** (V-R25; not in the 89-row count below, which predates it) **+ M7V-93..M7V-95** (L-R177gf, V-R30; likewise not in it) **+ M7V-96..M7V-98, M7V-100, M7V-101** (recorder truth, tester-sim-hooks F1, 2026-09-27; likewise not in it) **+ M7V-102..M7V-108** (restart rebuild, V-R35, 2026-09-27; likewise not in it) |
 | **campaign** | the seed loop | one shared default corpus **< 60 s** at `SPIKE_SEEDS=64`; aggregate below | **19**: M7V-51..M7V-55, M7V-58, M7V-60..M7V-65, M7V-72, M7V-73, M7V-75, M7V-76, M7V-78, M7V-87, M7V-89 |
 
 **Aggregate budget for `--test campaign` at default scale (critic T-11).** The class budget is per
@@ -552,6 +554,13 @@ cites them for V8's timing half and asserts neither half alone is V8.
 | M7V-99 | `m7v_99_recording_a_bare_engines_syncs_names_its_watermark_and_the_real_outcome` | `harness::semantic::durability_lines` over a bare `MemoryEngine`, case by case (probe p7) | spine history committed on one engine; syncs through 1, `ShortFlush` 1 of 2, 2, 2 again, 1, 9, then `FalseDurable` and `FlushFailed` | `(before, after, line seq, outcome)` = `(0,1,1,Synced)`, `(1,1,1,Partial)`, `(1,2,2,Synced)`, `(2,2,2,Synced)` (a no-op sync is `Synced` at the watermark: F2), `(2,2,2,Synced)` (below the watermark: the engine's 2, not the captured 1), `(2,2,2,Partial)` (above applied), `(2,2,2,Partial)`, `(2,2,2,Failed)`. Red first on the `ShortFlush` case. Kills t2, t3 and MF | unit | M1 hook |
 | M7V-100 | `m7v_100_recording_only_an_accepted_reply_is_a_replication_ack` | recorder truth (probe p8 + F1's deterministic kill for t4): only an `Accepted` reply is a `replication_ack`, verbatim | `semantic::ack_line` on each reply kind and on an append body; then `Semantic::record` fed R1's non-`Accepted` replies at node 3 of a finished rebuild run, where node 3 holds copy 2's receiver, then one `Accepted` | `ack_line` gives the exact line for `Accepted` and `None` for `AlreadyHave`, `Busy`, `ProbeDigestAt`, `Rejected` and an append body; `record` writes no line for the non-acks and one line, equal to `ack_line`'s, for the `Accepted`. Kills t4 (a refusal logged as the receiver's current ack) | sim | R1 |
 | M7V-101 | `m7v_101_recording_every_line_matches_engine_state_on_the_spine_and_the_rebuild` | recorder truth on unmutated plans (probes p1, p1b) | `rebuild_plan` and `spine_plan`, run to the end, engines kept | every `Applied` apply, `Synced` sync and ack checked against the engines as in M7V-96; both runs end without error; each tick-0 `batch_apply` carries its node's pinned role, and more than one role is seen; no oracle violation. Kills t5 (preloads logged `Primary`) and t4 through the zero-seq check | sim | I1 |
+| M7V-102 | `m7v_102_restart_forgets_what_the_crashed_process_held_in_memory` | ruling V-R35: a restart rebuilds the node's kernel modules from durable state only, so nothing the crashed process held in memory survives it | the spine (`tests/restart.rs`, a copy of `tests/dispatch.rs` `spine_plan`) to 3 000; a `StorageOp::Crash{ProcessCrash}` on node 1, tripped by a store effect; `Dispatcher::restart(node 1, boot 2)` | preconditions: before the crash node 1 holds A1's grant, F1 `Committed` on partition 1, R1's primary and retransmit timer, T1's instance, generation floor and trim memory (a `DedupTrim` seeded at 2 900), P1's instance and a scripted view (installed by the row), L1's instance, armed timers, and a non-zero adopted triple on both partitions. After the restart every one of them is gone, and the node's boot is 2. Red on HEAD `547c82c` (six clauses survived, `ev/red-head.log`); mutants m0 (HEAD's `restart` body), m1 (F1 not rebuilt), m3 (old A1 carried over), m5 (timers kept), and round 2's M2b (retransmits), M2e (floors), M2f (trims) and M2g (scripted) kept, each turn it red. Receiver and source are M7V-105's: node 1 holds neither on the spine | sim | — |
+| M7V-103 | `m7v_103_restart_leaves_every_other_nodes_modules_as_they_were` | V-R35: the rebuild is the restarted node's only | as M7V-102; every other node fingerprinted (A1, armed timers, and per partition F1, T1, R1 receiver and primary, P1, L1, adopted) after the crash and before the restart, then straight after it | each fingerprint holds a receiver (precondition); every fingerprint is unchanged; every other node's boot is still 1. Green on HEAD by construction; mutant m2 (every node rebuilt) turns it red | sim | — |
+| M7V-104 | `m7v_104_a_restarted_node_relearns_the_committed_root_through_its_control_watch` | V-R35: a restarted node re-learns its state through the normal paths only: the control watch on the committed root, and the reopened engine | as M7V-102, then the run continues to 6 000 | the run reaches its deadline; node 1 records `RecoveredLanded` for partition 1 under boot 2 after the restart; its fresh R1 holds the primary at `(Generation(2), Seq(2))`, and the engine kept generation 2 through `Seq(2)`; T1 and L1 rebuilt instances; F1 is `Idle`; A1 holds no grant; both adopted triples are the default. Red on HEAD `547c82c` (no landing after the restart); mutants m0 and m4 (root not re-read) turn it red | sim | — |
+| M7V-105 | `m7v_105_restart_forgets_a_running_catch_up_and_every_r1_table` | V-R35, tester G1: every R1 per-node table is process memory | the catch-up fixture (a copy of `tests/dispatch.rs` `running_catch_up`): node 2 serves copy 1 and runs R1's source catching copy 2 up for F1 on node 1; node 2 crashes and restarts under boot 2 | preconditions: node 2 holds a receiver, a source for copy 2, an armed retransmit timer, and the dispatcher's catch-up asker for it. After the restart all four are gone. Kills M2a (`sources` kept), M2b (`retransmits` kept), M2d (`receivers` kept) and M2h (`catch_ups` kept) | sim | — |
+| M7V-106 | `m7v_106_a_restarted_node_rereads_the_newest_root_even_when_it_is_dropped` | V-R35, tester G3: a restart re-reads each partition's newest root, and a newest root that drops the node teaches it no role | the spine; node 1 crashes; a later root for partition 1 (generation 3, one revision on, configuration without node 1, node 2 primary) is carried out as F1 on node 3 would emit it; node 1 restarts; the run continues to 6 000 | node 2 lands the later root (precondition); node 1 lands nothing for partition 1 after the restart, and holds no R1 primary or receiver and no T1 instance for it. Red before the fix: node 1 re-read the superseded root that named it (`ev/r2/red-g3.log`). Mutant M4 (membership check dropped) turns it red | sim | — |
+| M7V-107 | `m7v_107_restarting_a_node_no_root_names_rereads_nothing` | V-R35, tester M4: a restart re-reads only a root that names the node | the spine with a fifth node in the cluster that no configuration names; it crashes and restarts; the run continues to 6 000 | no root names node 5 (precondition); node 5 lands nothing and builds no receiver. Green on the round-1 code; mutant M4 turns it red (node 5 landed at 2 963) | sim | — |
+| M7V-108 | `m7v_108_each_restart_rereads_the_root_once` | V-R35, tester M5: each restart re-reads the root once | (a) the spine; crash, restart, run to 6 000, crash under boot 2, restart under boot 3, run to 9 000. (b) the spine; crash, restart, crash, restart with no run between, then run to 6 000 | (a) one landing under boot 2 after the first restart, one under boot 3 after the second, and the primary ends at `(Generation(2), Seq(2))`. (b) one landing, under boot 3. Green on the round-1 code; mutant M5 (no in-flight check) turns (b) red with two landings | sim | — |
 
 ---
 
@@ -993,7 +1002,7 @@ grammar/generator 9 (6 + 80, 86, 88) ·
 reducer 10 (8 + 83, 84) · campaign 18 (14 + 78, 82, 87, 89) · mutations 7 (6 + 81 counted once,
 under oracle) · evidence 6 — the blocks overlap by the reserved ids 20–23 and by M7V-81, and the
 distinct id set is `M7V-01..M7V-89`. By class: unit 58 · sim 12 · campaign 19 (§2).
-Rows added after this count and not in it: `M7V-92`..`M7V-101` (ten; `M7V-90` stays retired, and
+Rows added after this count and not in it: `M7V-92`..`M7V-108` (seventeen; `M7V-90` stays retired, and
 `M7V-91` is held as the candidate row named in §15 drift row 6, still unwritten). Their classes are in §2. Count landed rows with
 `scripts/m7-census.sh verification`, never from this paragraph.
 
@@ -1457,6 +1466,40 @@ by it. What it changes for this plan's rows, and what it does not:
   cannot be grounded by it. Whether `Partial` or a new outcome fits is a contract question, not
   settled here.
 - **V-R37 (lead ruling, 2026-09-27, L-R177hp):** `loss_uncertainty = false` on a Quarantine `RecoveryDecision` is accepted. A quarantine selects nothing and discards nothing: the suffix is retained on disk (kernel-b ruling B-R68), so no suffix is lost without proof either way. Pinned by M7V-80 and its unit test (tester-w3 mutant W2).
+- **V-R35 (lead ruling, 2026-09-27; restart rebuild, M7V-102..M7V-108).** Before this,
+  `Dispatcher::restart` reopened the engine and nothing else. Every kernel instance kept its
+  memory across a crash, so a crash row could pass because the node never forgot. Now `restart`
+  drops that node's A1, F1, T1, R1, P1 and L1 instances, its adopted triple, its armed timers and
+  the catch-ups it was sourcing. Each kernel table gains a `forget_node(node)`. First boot has no
+  start-of-life event: A1's first `AcquireDue` is seeded, and a fresh A1 ignores
+  `NodeLifecycle::Rebooted` as stale. So a restart delivers no boot event.
+  What survives, because it is durable:
+  - the engine;
+  - the control store;
+  - the committed roots (`committed`, now carrying the correlation);
+  - `revocations`;
+  - `landed`.
+
+  The node re-learns through its control watch. For each partition, `restart` takes the **newest**
+  committed root, and re-queues it as a `Crashed` held watch only when that root names the node.
+  A root that drops the node supersedes every older one that named it, so the node re-reads
+  nothing there and rebuilds no role (tester G3, M7V-106). A node no root names re-reads nothing
+  (M7V-107). A re-read still in flight is not queued twice (M7V-108). The row set pins every
+  table a restart drops (M7V-102, M7V-105); the one exception is the timer-site map, whose
+  survival is unobservable because the clock forgot the timer it names.
+  **Open, not modelled** (in the handoff):
+  - (a) a re-seeded A1 cannot re-acquire, because its create-only grant CAS meets the old boot's
+    record. Ruled 2026-09-27 (Gautam): fixed later by the scenario grant service (option A), not
+    in this package;
+  - (b) the durable epoch revocations have no read path into a fresh A1. Ruled 2026-09-27
+    (Gautam): fixed later by a new contract event `EpochRevocationRestored`, not in this package;
+  - (c) scheduler events and control watches queued under the old boot still reach the fresh
+    modules;
+  - (d) the pinned configuration names each member's old boot, so **every restarted member** is
+    refused as a stale copy until something re-pins it. A restarted primary's appends are
+    refused `NotAMember` (78 in tester run t2). A restarted follower's receiver is rebuilt as
+    `Member{boot 1}`, and the primary drops every ACK it sends as `AckRejected(StaleBoot)` (30 in
+    t1). So a restarted follower never counts toward progress again. Nothing re-pins today.
 - **Known gap:** `BatchApply.key_versions` is always empty — the harness holds byte keys and a
   `KeyId` is assigned by the scenario generator. INV-ATOM and the read-version rules see no
   versions from a recorded run.

@@ -142,6 +142,25 @@ impl Replication {
     pub fn source(&self, node: NodeId, partition: PartitionId, to: CopyId) -> Option<&Source> {
         self.sources.get(&(node, partition, to))
     }
+
+    /// The last version `(node, partition)`'s retransmit timer armed, if it ever armed one.
+    #[must_use]
+    pub fn retransmit_version(&self, node: NodeId, partition: PartitionId) -> Option<TimerVersion> {
+        self.retransmits
+            .get(&(node, partition))
+            .map(|timer| TimerVersion(timer.last))
+    }
+
+    /// Forget everything installed for `node`: its receivers, primaries, catch-up sources and
+    /// retransmit timers. All of it is process memory, so this is what a restart of that node
+    /// loses (lead ruling V-R35); every other node is untouched. The simulator calls it from its
+    /// restart.
+    pub fn forget_node(&mut self, node: NodeId) {
+        self.receivers.retain(|(held, _), _| *held != node);
+        self.primaries.retain(|(held, _), _| *held != node);
+        self.sources.retain(|(held, _, _), _| *held != node);
+        self.retransmits.retain(|(held, _), _| *held != node);
+    }
 }
 
 /// One R1 answer that changes nothing, as the whole step's answer.

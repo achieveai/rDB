@@ -182,7 +182,11 @@ pub struct Dispatcher {
     /// post-commit `SyncWalThrough` is served from (lead ruling B-R55 item 3, M7B-137). After
     /// commit the copies are the pinned configuration's and the cutoff lives in the new
     /// generation, so neither the placed survivors nor their inventories answer it.
-    committed: BTreeMap<(NodeId, PartitionId), Box<RecoveryResult>>,
+    ///
+    /// With the correlation it was emitted under. It stands for the committed `partitions/{id}`
+    /// root, which is durable, so a restart keeps it: it is what a restarted member's control
+    /// watch reads again ([`Self::restart`], lead ruling V-R35).
+    committed: BTreeMap<(NodeId, PartitionId), (Box<RecoveryResult>, CorrelationId)>,
     /// Transfers the scenario declared, by `(partition, source copy)`, not yet started: F1's
     /// `QueryInventory` for that copy starts one (lead ruling B-R55, [`crate::harness::transfer`]).
     transfer_plans: BTreeMap<(PartitionId, CopyId), TransferPlan>,
@@ -196,12 +200,19 @@ pub struct Dispatcher {
     watches: BTreeMap<(Tick, u64), Watch>,
     /// Members' `Recovered` whose watch fired while the member could not hear it, in the order
     /// that happened. Released by [`Dispatcher::restart`] or by a healed link.
+    ///
+    /// A restart also puts here, with [`RecoveredDeferReason::Crashed`], the newest committed
+    /// root of each partition the node is a member of, when none of its watches already carries
+    /// it: its fresh process reads the root again (lead ruling V-R35).
     held: Vec<(RecoveredDeferReason, Watch)>,
     /// The order key of the next watch.
     next_watch: u64,
     /// Each `(member, partition, generation)` a member has already landed a `Recovered` for.
     /// Only its first landing of a generation may inherit (lead ruling B-R58c; see
-    /// [`Self::run_due_watches`]).
+    /// [`Self::run_due_watches`]). The emitter is entered when it emits, because it inherits then;
+    /// so a restarted emitter that reads its own root again does not inherit twice.
+    ///
+    /// Kept across a restart: an inherit is the engine's, and the crash image keeps the base.
     landed: BTreeSet<(NodeId, PartitionId, Generation)>,
     /// Planned delays on `AuthorityCheck` hops (P-3; see [`crate::harness::hop`]). Empty by
     /// default: every hop is zero ticks (B-R23).
@@ -536,6 +547,32 @@ impl Dispatcher {
         &mut self.replication
     }
 
+    /// T1, for a row that reads an instance after a run.
+    #[must_use]
+    pub const fn transaction(&self) -> &Transaction {
+        &self.transaction
+    }
+
+    /// P1, for a row that reads an instance after a run.
+    #[must_use]
+    pub const fn publication(&self) -> &Publication {
+        &self.publication
+    }
+
+    /// P1, for a row that scripts or reads a replication view (test plan KA-8).
+    pub const fn publication_mut(&mut self) -> &mut Publication {
+        &mut self.publication
+    }
+
+    /// How many catch-ups `node` is the source of, whoever asked for them (B-R59).
+    #[must_use]
+    pub fn catch_ups_sourced_by(&self, node: NodeId) -> usize {
+        self.catch_ups
+            .keys()
+            .filter(|(_, _, source)| *source == node)
+            .count()
+    }
+
     /// Whether `event` was scheduled from a kernel effect, forgetting it. The run loop asks once
     /// per pop: a routed event's named consumers must answer.
     pub fn take_routed(&mut self, event: EventId) -> bool {
@@ -549,16 +586,24 @@ impl Dispatcher {
         self.addressed.remove(&event)
     }
 
-    /// Bring a crashed node back under `boot`: its engine is replaced by what the crash image
-    /// keeps ([`CrashImage::reopen`]), and it takes effects again. Views were dropped at the
-    /// crash, so a handle the old process held opens fresh.
+    /// Bring a crashed node back under `boot`, as a new process (lead ruling V-R35): its engine is
+    /// replaced by what the crash image keeps ([`CrashImage::reopen`]), and every kernel module
+    /// instance it hosted is dropped ([`Self::rebuild_kernels`]). Views were dropped at the crash,
+    /// so a handle the old process held opens fresh.
     ///
-    /// Storage only. The kernels' in-memory state for the node is **not** reset here; a
-    /// process restart for the six modules is owed.
+    /// Nothing the old process held in memory is carried over. The fresh instances are made the
+    /// way first boot makes them, on the node's next event, and learn only through the normal
+    /// event paths: the reopened engine, the control store, and the member watch below. No boot
+    /// event is delivered. First boot has none either — A1's first `AcquireDue` is seeded by the
+    /// scenario (`Authority::on_acquire_due`, "What arms the first one: nothing yet"), and
+    /// [`rdb_core::contracts::event::NodeLifecycle::Rebooted`] is how a **surviving** A1 hears of
+    /// a boot it did not start under. A fresh A1 holds no grant for it to fence.
     ///
-    /// A member `Recovered` deferred because this node was down lands [`CONTROL_WATCH_MILLIS`]
-    /// after the clock's now (lead ruling B-R56). Until the kernel restart is built, that is the
-    /// only way a deferred delivery reaches a crashed member.
+    /// The restarted node's control watch reads the committed root again. A member `Recovered`
+    /// deferred because this node was down, and the newest committed root of every other
+    /// partition whose pinned configuration names this node, land [`CONTROL_WATCH_MILLIS`] after
+    /// the clock's now (lead rulings B-R56, V-R35). The emitter is one of those members: its own
+    /// `Recovered` was routed to its old process at once, and the new one hears it again here.
     ///
     /// # Errors
     ///
@@ -571,11 +616,97 @@ impl Dispatcher {
         self.engines.insert(node, image.reopen(node));
         self.members.insert(node, boot);
         self.boots.insert(node, boot);
+        self.rebuild_kernels(node);
+        self.reread_roots(node);
         // The control root is durable: a member that was down when its watch fired hears it now.
         self.release(self.clock.now(), |reason, watch| {
             reason == RecoveredDeferReason::Crashed && watch.member == node
         });
         Ok(())
+    }
+
+    /// Drop everything `node`'s process held in memory, in each module and in the harness's
+    /// bookkeeping on a module's behalf. Other nodes are untouched.
+    ///
+    /// * The six modules: A1 and F1 are hosted per node ([`Hosted::forget_node`]), L1 per
+    ///   `(node, partition)` ([`ProtectionTable`]), and T1, R1 and P1 key their own state by node
+    ///   (`forget_node` on each).
+    /// * The adopted triple: a module's declaration ([`EffectKind::AdoptAuthority`]), so a fresh
+    ///   process has declared nothing and steps under the zero triple until it adopts again.
+    /// * The node's armed timers and their sites: a timer is the process's.
+    /// * Catch-ups this node was the source of: R1's cursor was process memory.
+    ///
+    /// Kept, because each is durable or is the environment's: the engine (reopened from the
+    /// image), the control store, [`Self::committed`], [`Self::revocations`], [`Self::landed`],
+    /// placed survivors, planned transfers, clock skew and the network.
+    fn rebuild_kernels(&mut self, node: NodeId) {
+        self.authority.forget_node(node);
+        self.transaction.forget_node(node);
+        self.replication.forget_node(node);
+        self.publication.forget_node(node);
+        self.protection.forget_node(node);
+        self.recovery.forget_node(node);
+        self.adopted.retain(|(held, _), _| *held != node);
+        self.clock.forget_timers(node);
+        self.timer_sites.retain(|(held, _), _| *held != node);
+        self.catch_ups.retain(|(_, _, source), _| *source != node);
+    }
+
+    /// Hold, for release with this restart, each partition's newest committed root, when its
+    /// pinned configuration names `node`. Skipped when a watch for that member and partition
+    /// already carries it or a newer one. Off with the member watches (B-R58b): a scenario that
+    /// keeps members deaf keeps a restarted one deaf too.
+    ///
+    /// The newest root is chosen **before** the membership check (tester G3). A root that drops
+    /// the node supersedes every older root that named it. So the node re-reads nothing for that
+    /// partition, and rebuilds no role there: it learns it is no longer a member the way a node
+    /// that never was one does, since a watch fans a root out only to the members it names
+    /// (B-R56). Choosing among the roots that name the node would hand it a superseded one.
+    fn reread_roots(&mut self, node: NodeId) {
+        if !self.member_watches {
+            return;
+        }
+        let mut newest: BTreeMap<PartitionId, Watch> = BTreeMap::new();
+        for (&(emitter, partition), (result, correlation)) in &self.committed {
+            let newer = newest
+                .get(&partition)
+                .is_none_or(|seen| seen.result.committed.revision < result.committed.revision);
+            if newer {
+                let watch = Watch {
+                    member: node,
+                    emitter,
+                    partition,
+                    correlation: *correlation,
+                    result: result.clone(),
+                };
+                newest.insert(partition, watch);
+            }
+        }
+        newest.retain(|_, watch| {
+            watch
+                .result
+                .committed
+                .pinned_config
+                .members
+                .iter()
+                .any(|member| member.node == node)
+        });
+        for (partition, watch) in newest {
+            let revision = watch.result.committed.revision;
+            let carried = self
+                .held
+                .iter()
+                .map(|(_, held)| held)
+                .chain(self.watches.values())
+                .any(|pending| {
+                    pending.member == node
+                        && pending.partition == partition
+                        && pending.result.committed.revision >= revision
+                });
+            if !carried {
+                self.held.push((RecoveredDeferReason::Crashed, watch));
+            }
+        }
     }
 
     /// Take a planned crash on `node`, if one is due, and refuse the effect that met it. A
@@ -1204,7 +1335,11 @@ impl Dispatcher {
                     result.new_generation,
                     result.selected.cutoff_seq,
                 )?;
-                self.committed.insert((node, site.1), result.clone());
+                self.committed
+                    .insert((node, site.1), (result.clone(), site.2));
+                // The emitter inherited just now, so a later landing of this generation on it (a
+                // restart's re-read) must not inherit again (B-R58c).
+                self.landed.insert((node, site.1, result.new_generation));
                 self.fan_out(node, site, result, scheduler.now());
                 None
             }
@@ -1998,7 +2133,7 @@ impl Dispatcher {
         ) {
             return None;
         }
-        let result = self.committed.get(&(node, partition))?;
+        let (result, _) = self.committed.get(&(node, partition))?;
         let holder = result
             .committed
             .pinned_config

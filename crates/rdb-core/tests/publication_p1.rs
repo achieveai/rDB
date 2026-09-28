@@ -4519,7 +4519,8 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 /// and why none is an applied-prefix accessor.
 ///
 /// - `publication.rs`: the timer id; construction and install; scripting the KA-8 fake; the kernel
-///   and its view; how many read keys a slot holds; the step.
+///   and its view; how many read keys a slot holds; the step. `forget_node` drops a node's slots
+///   when the simulator restarts it (V-R35) and returns nothing, so it reads no prefix.
 /// - `kernel.rs`: the handle arithmetic of P1's block (`publication_snapshot`,
 ///   `is_publication_snapshot`: a number, bound by storage only when P1 asks); construction;
 ///   boot, lineage, the **published** position; the view; the step. `open_view` (`pub(crate)`)
@@ -4534,6 +4535,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
         "publication.rs",
         include_str!("../src/publication.rs"),
         &[
+            "forget_node",
             "held_read_keys",
             "install",
             "kernel",

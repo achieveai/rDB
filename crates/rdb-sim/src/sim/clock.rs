@@ -152,6 +152,24 @@ impl Clock {
         }
     }
 
+    /// Drop every timer armed on `node`. A timer lives in the process that armed it, so a restart
+    /// of that node loses them all (lead ruling V-R35), and the fresh process arms its own from
+    /// version zero. Without this a fresh arm at a version the old process had passed is refused
+    /// as a stale re-arm. Skew is the host's, not the process's, and stays.
+    pub fn forget_timers(&mut self, node: NodeId) {
+        self.timers.retain(|(held, _), _| *held != node);
+    }
+
+    /// The timers armed on `node`, as `(id, version, due)`, in id order.
+    #[must_use]
+    pub fn armed(&self, node: NodeId) -> Vec<(TimerId, TimerVersion, Tick)> {
+        self.timers
+            .iter()
+            .filter(|((held, _), _)| *held == node)
+            .map(|((_, id), (version, at))| (*id, *version, *at))
+            .collect()
+    }
+
     /// The next tick at which any timer is due, or `None`.
     ///
     /// What lets the scheduler jump to the next deadline instead of ticking through idle

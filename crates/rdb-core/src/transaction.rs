@@ -1323,6 +1323,27 @@ impl Transaction {
         self.kernels.get(&(node, partition))
     }
 
+    /// The generation floor held for `(node, partition)` (lead ruling A-R73 N2), if one is.
+    #[must_use]
+    pub fn floor(&self, node: NodeId, partition: PartitionId) -> Option<Generation> {
+        self.floors.get(&(node, partition)).copied()
+    }
+
+    /// Whether any trim or retire is remembered for `(node, partition)` (A-R73 N1, A-R73a).
+    #[must_use]
+    pub fn remembers_trims(&self, node: NodeId, partition: PartitionId) -> bool {
+        self.trims.contains_key(&(node, partition))
+    }
+
+    /// Forget everything held for `node`: its instances, and the floors and trims that outlive
+    /// them. All of it is process memory, so this is what a restart of that node loses (lead
+    /// ruling V-R35); every other node is untouched. The simulator calls it from its restart.
+    pub fn forget_node(&mut self, node: NodeId) {
+        self.kernels.retain(|(held, _), _| *held != node);
+        self.floors.retain(|(held, _), _| *held != node);
+        self.trims.retain(|(held, _), _| *held != node);
+    }
+
     /// Step the `(ctx.node, ctx.partition)` instance with a design-shaped event.
     ///
     /// Every §3.3 row is reachable here, including the ones whose contract carrier does not

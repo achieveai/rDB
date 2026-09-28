@@ -83,6 +83,12 @@ impl ProtectionTable {
             .map(|hosted| &hosted.protection)
     }
 
+    /// Drop every L1 instance `node` hosts, and H1's cadence and last line with each: what a
+    /// process restart of that node leaves (lead ruling V-R35). Every other node is untouched.
+    pub(crate) fn forget_node(&mut self, node: NodeId) {
+        self.hosted.retain(|(held, _), _| *held != node);
+    }
+
     /// The earliest tick at which H1 owes some live instance a health evaluation.
     #[must_use]
     pub fn next_eval(&self) -> Option<Tick> {

@@ -54,6 +54,13 @@ impl<M: Module + Default> Hosted<M> {
     pub fn get(&self, node: NodeId, partition: PartitionId) -> Option<&M> {
         self.hosted.get(&self.key(node, partition))
     }
+
+    /// Drop every instance `node` hosts, for every partition. Its next event makes a fresh one,
+    /// as its first event did: what a process restart of that node leaves (lead ruling V-R35).
+    /// Every other node's instances are untouched.
+    pub fn forget_node(&mut self, node: NodeId) {
+        self.hosted.retain(|(held, _), _| *held != node);
+    }
 }
 
 impl<M: Module + Default> Module for Hosted<M> {
