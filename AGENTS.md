@@ -112,9 +112,13 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
 - To get a result about HEAD without disturbing anyone, export it and build the export:
 
   ```sh
-  git archive HEAD | tar -x -C /tmp/headcheck
+  git -c core.autocrlf=false archive HEAD | tar -x -C /tmp/headcheck
   cd /tmp/headcheck && CARGO_TARGET_DIR=$PWD/.t cargo clippy --all-targets -- -D warnings
   ```
+
+  Keep `-c core.autocrlf=false`. On a Windows host with `autocrlf=true`, a plain `git archive`
+  writes CRLF files, and rows that hash or byte-compare fixtures (`m7b_116`, `m7b_59`) fail in the
+  export while passing on the live tree.
 
   14 MB and a few seconds, tracked files only, working tree never read or written. Give it its
   own `CARGO_TARGET_DIR` inside the export, and keep the path short — a deep temp path plus
