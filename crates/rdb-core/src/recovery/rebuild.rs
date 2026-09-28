@@ -17,6 +17,13 @@
 //! whenever it lands (ruling A-1): a digest at the cutoff other than the committed one, or a
 //! second digest at the point, is divergence, and proofs held before the pin are judged when it
 //! lands.
+//!
+//! A proof never displaces a better one (ruling B-R74d, extending B-R74a): per copy, one that
+//! does not bind to the point never replaces one that does, nor one higher than itself. A proof
+//! that binds is always taken. So, once the point is pinned, a reordered answer in one run, or a
+//! late answer from a run F1 left for a newer fence, cannot erase a binding proof and stall the
+//! rebuild. Before the pin nothing binds yet, so a higher proof still replaces a lower one that
+//! would later have bound; the pin's re-sent sync asks that copy again.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -156,14 +163,41 @@ impl Rebuild {
         Ok((head, self.required.iter().copied().collect()))
     }
 
+    /// Whether `proof` binds to the pinned point, judged by the one barrier constructor.
+    fn binds(&self, proof: &DurableProof) -> bool {
+        self.point.is_some_and(|point| {
+            RecoveryBarrier::try_new(
+                &[*proof],
+                &BTreeSet::from([proof.copy]),
+                point.seq,
+                point.digest,
+            )
+            .is_ok()
+        })
+    }
+
+    /// Whether `proof` may replace the copy's held one (ruling B-R74d, extending B-R74a): a proof
+    /// that binds to the point always may; otherwise never in place of one that binds, and never
+    /// below the held one. A late or reordered answer, from this run or an earlier one, cannot
+    /// erase a proof already given.
+    fn displaces(&self, proof: &DurableProof) -> bool {
+        match self.proofs.get(&proof.copy) {
+            None => true,
+            Some(held) => self.binds(proof) || (!self.binds(held) && proof.seq >= held.seq),
+        }
+    }
+
     /// A durability proof. `Ok` with the barrier once every required copy proves the point.
     pub(crate) fn durable(&mut self, proof: DurableProof) -> Result<RecoveryBarrier, Refused> {
         self.check_required(proof.copy)?;
         self.judge(proof.copy, Seq(proof.seq.0), proof.digest)?;
+        let not_durable = || Refused::Ignored(ReplicaIgnoreReason::BarrierNotDurable);
+        if !self.displaces(&proof) {
+            return Err(not_durable());
+        }
         if !self.lost.contains(&proof.copy) {
             self.proofs.insert(proof.copy, proof);
         }
-        let not_durable = || Refused::Ignored(ReplicaIgnoreReason::BarrierNotDurable);
         let point = self.point.ok_or_else(not_durable)?;
         let proofs: Vec<DurableProof> = self.proofs.values().copied().collect();
         RecoveryBarrier::try_new(&proofs, &self.required, point.seq, point.digest)

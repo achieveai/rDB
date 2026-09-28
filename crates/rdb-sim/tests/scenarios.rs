@@ -777,15 +777,21 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
 ///
 /// Built in dev-verif's slice 2, landing with dev-sim-route's shared hooks: the semantic lines
 /// (`Publish`, `AuthorityDecision`, `ClientOutcomeReported`), a timed op as a segmented run, and
-/// a hop delay on P1's `Reply` check. Still owed:
+/// a hop delay on P1's `Reply` check. Re-read at b220a2b (dev-a1p1-w3, 2026-09-27):
 ///
-/// - B-R60: on a recovered RF3 partition L1 stays `Paused` (`BarrierNotDurable`) after both
-///   secondaries ACK, so T1 answers the write `ProtectionPaused` and P1 is never reached;
-/// - A1 does not install the post-`Recovered` lineage (its own capability comment);
-/// - the bridge lowers neither a second activation nor the `Reply` hop delay the activation
-///   must land inside;
-/// - INV-PUB counts acknowledgements from `BatchApply` and `ReplicationAck` lines, which the sim
-///   records since the sim-hooks wave (`harness::semantic`); only the three blockers above remain.
+/// - **Cleared**: B-R60 and A1's post-`Recovered` install. Without its activating op the case
+///   publishes end to end through A1 and replies `Success`
+///   (`a1p1_case_without_its_activation_publishes_through_a1`), once it submits after L1's resume
+///   hold, under a request id the preload did not use, and the lowering declares the topology.
+/// - **Owed, bridge**: `lower` refuses a second `InspectSurvivors` of one partition, and no op
+///   lowers the `Reply` hop delay the activation must land inside.
+/// - **Owed, below the bridge**: nothing in the sim can activate a third generation after the
+///   first recovery. On B, F1 is terminal once `Committed`: a second `Plan` or `FenceProven` is
+///   `Ignored(OutOfPhase)`. On C, discovery reads the survivor inventories the dispatcher was
+///   placed with, which stay generation 1, so it ends `BlockPromotion(NoEligibleRegular)`. And B
+///   would learn of a new generation only through a watch the sim delivers when told. Lowering
+///   the op is therefore not enough; F1 re-entry is a kernel-b question, and live inventories a
+///   dispatcher one.
 #[retcd_test]
 fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_is_refused_by_name() {
     support::preamble();
@@ -807,6 +813,209 @@ fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_is_refused_by_name
         PackageId::I1,
         "case A1/P1: the bridge refuses its second activation (a second InspectSurvivors)",
     );
+}
+
+/// One line of the A1/P1 first half's publish chain: its trace index, and a label.
+fn a1p1_chain(trace: &Trace, correlation: u64) -> Vec<(usize, String)> {
+    trace
+        .events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.correlation.0 == correlation)
+        .filter_map(|(index, event)| {
+            let label = match &event.kind {
+                TraceKind::AuthorityDecision {
+                    gate,
+                    owner_node,
+                    generation,
+                    outcome,
+                    ..
+                } => format!(
+                    "authority {gate:?} {outcome:?} owner {} g{}",
+                    owner_node.0, generation.0
+                ),
+                TraceKind::BatchApply {
+                    role,
+                    generation,
+                    seq,
+                    outcome,
+                    ..
+                } => format!(
+                    "apply {role:?} n{} g{} s{} {outcome:?}",
+                    event.node.0, generation.0, seq.0
+                ),
+                TraceKind::ReplicationAck {
+                    from_node,
+                    contiguous_seq,
+                    accepted,
+                    ..
+                } => format!(
+                    "ack n{} s{} accepted {accepted}",
+                    from_node.0, contiguous_seq.0
+                ),
+                TraceKind::Publish {
+                    generation, seq, ..
+                } => format!("publish g{} s{}", generation.0, seq.0),
+                TraceKind::ClientOutcomeReported {
+                    outcome,
+                    generation,
+                    seq,
+                    delivered,
+                    ..
+                } => format!(
+                    "outcome {outcome:?} g{} {:?} delivered {delivered}",
+                    generation.0,
+                    seq.map(|seq| seq.0)
+                ),
+                _ => return None,
+            };
+            tracing::info!(
+                index,
+                tick = event.logical_tick,
+                node = event.node.0,
+                label = %label,
+                "a1p1 chain"
+            );
+            Some((index, label))
+        })
+        .collect()
+}
+
+/// Scaffolding toward M7V-47's A1/P1 case; **claims no row**. The authored case with its
+/// activating op ([`cases::A1_P1_ACTIVATE_OP`]) removed, through the real lowering and runner:
+/// the half of the case that runs at this basis.
+///
+/// The write is published end to end **through A1**: A1 answers all three gates `Valid` for
+/// B over the generation F1 activated (so A1 installed it after `Recovered` and holds a grant),
+/// T1 applies at the next seq, R1 ships to both secondaries and both ACK, P1 publishes on the
+/// `Publication` decision it names, and the client hears `Success`, in that order and on the
+/// write's correlation. The oracle finds nothing.
+///
+/// Red before the case's re-timing (the write landed inside L1's resume hold, and its request id
+/// was a preloaded identity under another digest), and red before the lowering declared the
+/// topology in the trace header (INV-PUB counted no regular ACK, because the model found no
+/// role for either secondary).
+#[retcd_test]
+fn a1p1_case_without_its_activation_publishes_through_a1() {
+    support::preamble();
+    let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+    let removed = scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    assert!(matches!(
+        removed,
+        ScenarioOp::Recovery(grammar::RecoveryOp::InspectSurvivors { .. })
+    ));
+    let run = scenario_run::run(&scenario).expect("the case lowers whole without its activation");
+    tracing::info!(
+        stop = ?run.report.stop,
+        events = run.report.events_consumed,
+        "a1p1 first half report"
+    );
+    assert!(
+        matches!(run.report.stop, StopReason::DeadlineReached { deadline, .. }
+            if deadline.0 == cases::A1_P1_MAX_TICKS),
+        "runs to its tick budget: {:?}",
+        run.report.stop
+    );
+
+    // The client's answer: one, and a success at the next seq of the activated generation.
+    let head = Seq(cases::A1_P1_HEAD);
+    let written = Seq(head.0 + 1);
+    let activated = rdb_core::contracts::ids::Generation(2);
+    let outcomes: Vec<(u64, u64, u64, String)> = run
+        .trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::ClientOutcomeReported {
+                request,
+                outcome,
+                generation,
+                seq,
+                delivered,
+                ..
+            } => Some((
+                event.correlation.0,
+                event.logical_tick,
+                request.0,
+                format!("{outcome:?} g{} {seq:?} {delivered}", generation.0),
+            )),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?outcomes, "a1p1 outcomes");
+    let [(correlation, replied_at, request, outcome)] = outcomes.as_slice() else {
+        panic!("exactly one client outcome: {outcomes:?}");
+    };
+    assert_eq!(*request, cases::A1_P1_REQUEST.0);
+    assert_eq!(
+        outcome,
+        &format!("Success g{} {:?} true", activated.0, Some(written)),
+        "published and delivered"
+    );
+    assert_eq!(
+        *replied_at,
+        cases::A1_P1_SUBMIT_AT,
+        "zero-tick hops: one tick"
+    );
+
+    // The chain on the write's correlation, in trace order.
+    let chain = a1p1_chain(&run.trace, *correlation);
+    let labels: Vec<&str> = chain.iter().map(|(_, label)| label.as_str()).collect();
+    let owner = cases::B_NODE.0;
+    let g = activated.0;
+    let s = written.0;
+    assert_eq!(
+        labels,
+        vec![
+            format!("authority Dispatch Valid owner {owner} g{g}"),
+            format!("apply Primary n{owner} g{g} s{s} Applied"),
+            format!(
+                "apply RegularSecondary n{} g{g} s{s} Applied",
+                cases::C_NODE.0
+            ),
+            format!(
+                "apply RegularSecondary n{} g{g} s{s} Applied",
+                cases::A_NODE.0
+            ),
+            format!("ack n{} s{s} accepted true", cases::C_NODE.0),
+            format!("ack n{} s{s} accepted true", cases::A_NODE.0),
+            format!("authority Publication Valid owner {owner} g{g}"),
+            format!("publish g{g} s{s}"),
+            format!("authority Reply Valid owner {owner} g{g}"),
+            format!("outcome Success g{g} Some({s}) delivered true"),
+        ],
+        "the publish chain, whole"
+    );
+    // The publication names the `Publication` decision as its recheck.
+    let (decision, publish) = (chain[6].0, chain[7].0);
+    let recheck = match &run.trace.events[publish].kind {
+        TraceKind::Publish {
+            authority_recheck, ..
+        } => Some(authority_recheck.0),
+        _ => None,
+    };
+    assert_eq!(
+        recheck,
+        Some(run.trace.events[decision].event_id.0),
+        "Publish rests on the Publication decision A1 made"
+    );
+
+    // Oracle half.
+    let verdicts = oracle_half(&run);
+    tracing::info!(?verdicts, "a1p1 first half oracle");
+
+    // The same chain, read back out of this test's JSONL log by DuckDB.
+    const METHOD: &str = "a1p1_case_without_its_activation_publishes_through_a1";
+    let relation = config_testkit::logs::relation_for_current_test(module_path!(), METHOD);
+    let rows = config_testkit::logs::query(&format!(
+        "SELECT label FROM {relation} \
+         WHERE testMethod = '{METHOD}' AND \"@m\" = 'a1p1 chain' ORDER BY \"index\""
+    ));
+    let logged: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.get("label").and_then(|label| label.as_str()))
+        .collect();
+    assert_eq!(logged, labels, "the log holds the chain the trace does");
 }
 
 /// M7V-47, the F1/T1/P1 and F1/T1 cases: they wait on T1 (lead ruling A-R73).
@@ -2040,11 +2249,11 @@ mod false_durable_oracle {
             discovery_window_ticks: 2_000,
             queried_sources: vec![returned(N2, kept), returned(N3, kept)],
             selected_source: Some(N2),
-            selected_cutoff_seq: kept,
-            selected_digest: digest_at(GEN_1, kept),
+            selected_cutoff_seq: Some(kept),
+            selected_digest: Some(digest_at(GEN_1, kept)),
             mode: RecoveryMode::TwoSurvivor,
             loss_uncertainty: false,
-            new_generation: Generation(2),
+            new_generation: Some(Generation(2)),
         })
         .push(root(Generation(2), Some((GEN_1, kept))))
         .at(3)

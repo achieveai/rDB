@@ -490,6 +490,16 @@ impl Dispatcher {
         self.engines.get(&node)
     }
 
+    /// The boot `node` runs under: the one last delivered to it, else the one it was registered
+    /// with. `None` for a node the run never registered.
+    #[must_use]
+    pub fn boot(&self, node: NodeId) -> Option<BootId> {
+        self.boots
+            .get(&node)
+            .or_else(|| self.members.get(&node))
+            .copied()
+    }
+
     /// What a planned crash left of `node`'s storage, if one fired.
     #[must_use]
     pub fn crash_image(&self, node: NodeId) -> Option<&CrashImage> {

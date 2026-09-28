@@ -1055,6 +1055,12 @@ pub enum TraceKind {
     },
 
     /// A recovery chose.
+    ///
+    /// `selected_cutoff_seq`, `selected_digest` and `new_generation` are `None` exactly when
+    /// `mode` is [`RecoveryMode::Quarantine`], and `Some` for every other mode. A quarantine
+    /// selects no position and creates no lineage (spec §8.1: divergence blocks promotion), so
+    /// any value there would be one the recovery never chose. A reader treats `None` as "no
+    /// cutoff selected", never as position 0 (Gautam, 2026-09-27, ledger L-R177gd).
     RecoveryDecision {
         /// The epoch that was fenced first.
         fenced_epoch: OwnerEpoch,
@@ -1064,16 +1070,16 @@ pub enum TraceKind {
         queried_sources: Vec<QueriedSource>,
         /// The source whose prefix was selected.
         selected_source: Option<NodeId>,
-        /// The position selected.
-        selected_cutoff_seq: Seq,
-        /// The digest at that position.
-        selected_digest: Digest,
+        /// The position selected. `None` on a quarantine, which selects none; `Some` otherwise.
+        selected_cutoff_seq: Option<Seq>,
+        /// The digest at that position. `None` on a quarantine; `Some` otherwise.
+        selected_digest: Option<Digest>,
         /// What was decided.
         mode: RecoveryMode,
         /// Whether a suffix may have been lost without proof either way.
         loss_uncertainty: bool,
-        /// The lineage created.
-        new_generation: Generation,
+        /// The lineage created. `None` on a quarantine, which creates none; `Some` otherwise.
+        new_generation: Option<Generation>,
     },
 
     /// Something was quarantined.

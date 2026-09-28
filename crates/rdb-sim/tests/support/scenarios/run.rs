@@ -15,6 +15,7 @@
 //! | Op | Becomes |
 //! |---|---|
 //! | `Budget{max_events, max_ticks}` | `RunLimits{max_events, deadline: max_ticks}`. The runner counts **popped** events; the trace records several lines per pop (six `ModuleDispatch` offers alone), so a trace is longer than `max_events` |
+//! | `topology.placements` | the trace header's initial placement, each at `config_version_0`. The oracle reads a node's role from it, and without it INV-PUB counts no regular ACK |
 //! | `Time(Advance{ticks})` | the cursor moves by `ticks` |
 //! | `Recovery(Synchronize{node, to})`, initial | a survivor: the prior lineage's canonical records `1..=to` preloaded on `node`, durable there, and placed as its inventory |
 //! | `Recovery(Transfer{..})`, initial | a [`TransferPlan`]: the harness plays the transfer out when discovery queries that copy |
@@ -58,7 +59,7 @@ use rdb_core::contracts::recovery::{
     Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan, SurvivorInventory,
 };
 use rdb_core::contracts::time::{Tick, TimerFired};
-use rdb_core::contracts::trace::{BudgetName, Trace, TraceKind};
+use rdb_core::contracts::trace::{BudgetName, TopologyEntry, Trace, TraceKind};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
 use rdb_core::contracts::version::API_VERSION;
 use rdb_core::recovery::MAX_WINDOW_EXTENSIONS;
@@ -194,6 +195,18 @@ pub fn lower(scenario: &Scenario) -> Result<RunPlan, Unlowerable> {
     plan.provenance = scenario.provenance.clone();
     plan.generator_version = scenario.generator_version;
     plan.partitions = topology.partitions;
+    // The header's initial placement. Without it the oracle's model finds no role for any node,
+    // so INV-PUB counts no regular ACK and fires on a correct publication.
+    plan.topology = topology
+        .placements
+        .iter()
+        .map(|placement| TopologyEntry {
+            partition: placement.partition,
+            node: placement.node,
+            role: placement.role,
+            config_version: topology.config_version_0,
+        })
+        .collect();
     plan.limits = RunLimits {
         max_events: scenario.budget.max_events,
         deadline: Tick(scenario.budget.max_ticks),

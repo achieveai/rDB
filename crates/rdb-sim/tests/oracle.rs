@@ -247,11 +247,12 @@ fn source(
     }
 }
 
-/// A `recovery_decision` over a set of sources.
+/// A `recovery_decision` over a set of sources. `cutoff` is `None` on a quarantine, which
+/// selects no position and creates no lineage, and then so are the digest and the generation.
 fn recovery(
     sources: &[QueriedSource],
     selected: Option<NodeId>,
-    cutoff: Seq,
+    cutoff: Option<Seq>,
     mode: RecoveryMode,
 ) -> TraceKind {
     TraceKind::RecoveryDecision {
@@ -260,10 +261,10 @@ fn recovery(
         queried_sources: sources.to_vec(),
         selected_source: selected,
         selected_cutoff_seq: cutoff,
-        selected_digest: digest_at(GEN_1, cutoff),
+        selected_digest: cutoff.map(|cutoff| digest_at(GEN_1, cutoff)),
         mode,
         loss_uncertainty: false,
-        new_generation: Generation(2),
+        new_generation: cutoff.map(|_| Generation(2)),
     }
 }
 
@@ -579,7 +580,7 @@ fn golden(unavailable: &[PackageId]) -> Trace {
                 source(N3, BootId(2), true, Some((GEN_1, Seq::ZERO))),
             ],
             Some(N3),
-            Seq::ZERO,
+            Some(Seq::ZERO),
             RecoveryMode::TwoSurvivor,
         ))
         .push(recovery_root(Generation(2), GEN_1, Seq::ZERO))
@@ -1497,7 +1498,7 @@ fn m7v_17_lin_two_entry_digests_at_one_generation_seq_demand_quarantine() {
         .push(recovery(
             &[source(N2, B1, true, None)],
             None,
-            Seq::ZERO,
+            None,
             RecoveryMode::Quarantine,
         ))
         .build();
@@ -1516,7 +1517,7 @@ fn m7v_18_lin_cutoff_above_a_recorded_matching_prefix_violates() {
         .push(recovery(
             &[source(N2, B1, true, Some((Generation(7), Seq(9))))],
             Some(N2),
-            Seq(6),
+            Some(Seq(6)),
             RecoveryMode::TwoSurvivor,
         ))
         .build();
@@ -1542,7 +1543,7 @@ fn m7v_19_lin_cutoff_is_clean_when_the_longer_source_is_unreachable_or_mismatche
         .push(recovery(
             &[source(N2, B1, false, Some((Generation(7), Seq(9))))],
             None,
-            Seq(6),
+            Some(Seq(6)),
             RecoveryMode::TwoSurvivor,
         ))
         .build();
@@ -1563,7 +1564,12 @@ fn m7v_19_lin_cutoff_is_clean_when_the_longer_source_is_unreachable_or_mismatche
         .at(1)
         .apply(Seq(9), &[(K1, 9)], ApplyOutcome::Applied)
         .at(2)
-        .push(recovery(&sources, None, Seq(6), RecoveryMode::TwoSurvivor))
+        .push(recovery(
+            &sources,
+            None,
+            Some(Seq(6)),
+            RecoveryMode::TwoSurvivor,
+        ))
         .build();
     let report = judge(&mismatched);
     proven(&report, Invariant::Lin);
@@ -1651,7 +1657,7 @@ fn lin_a_cutoff_above_the_selected_sources_prefix_violates() {
                     reported.map(|seq| (Generation(7), seq)),
                 )],
                 Some(N2),
-                Seq(6),
+                Some(Seq(6)),
                 RecoveryMode::TwoSurvivor,
             ))
             .build()
@@ -1697,7 +1703,7 @@ fn lin_the_two_cutoff_clauses_do_not_shadow_each_other() {
                     source(N3, B1, true, Some((Generation(7), Seq(9)))),
                 ],
                 Some(N2),
-                Seq(6),
+                Some(Seq(6)),
                 RecoveryMode::TwoSurvivor,
             ))
             .build()
@@ -1873,7 +1879,7 @@ fn loss_fixture(
         b = b.at(2).push(recovery(
             sources,
             None,
-            cutoff.unwrap_or(Seq::ZERO),
+            Some(cutoff.unwrap_or(Seq::ZERO)),
             RecoveryMode::TwoSurvivor,
         ));
     }
@@ -1978,7 +1984,7 @@ fn m7v_28b_loss_a_higher_watermark_still_makes_the_node_a_holder_at_nine() {
         .push(recovery(
             &[source(N2, B1, true, Some((GEN_1, Seq(9))))],
             None,
-            Seq(6),
+            Some(Seq(6)),
             RecoveryMode::TwoSurvivor,
         ))
         .push(recovery_root(Generation(2), GEN_1, Seq(6)))

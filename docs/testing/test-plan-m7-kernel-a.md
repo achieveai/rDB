@@ -424,7 +424,7 @@ predate any run, are marked provisional, and only until the first green run.
 | M7A-62 | `admit_order_checks_2_3_5_simultaneous_yields_deadline_before_admission` | ADR 0004 "admission order normative" · §3.2 steps 2, 3, 5 | one `Submit` whose deadline is past, whose affinity crosses, and whose `expected_generation` is stale; the three facts injected in each of the 6 orderings of fixture setup | every ordering: `Reply(Rejection{DEADLINE_BEFORE_ADMISSION})`; `next_seq` unchanged; zero `Check` effects (twin: M7A-63) | unit | none |
 | M7A-63 | `admit_order_remove_deadline_fact_shifts_to_cross_affinity` | twin of M7A-62 (one fact: deadline in the future) | as M7A-62 | `CROSS_AFFINITY`; removing that too ⇒ `GENERATION_CHANGED` (asserted in the same test, one fact per step) | unit | none |
 | M7A-64 | `admit_incompatible_version_first` | §3.2 step 1 · spec §5.4 `INCOMPATIBLE_VERSION` | `api_version` unknown **and** deadline past | `INCOMPATIBLE_VERSION` | unit | none |
-| M7A-65 | `admit_not_primary_vs_route_changed` | §3.2 step 4 | (a) kernel has no lineage for the partition; (b) lineage present but `route_revision` newer than the request's | (a) `NOT_PRIMARY`; (b) `ROUTE_CHANGED` | unit | none |
+| M7A-65 | `admit_not_primary_vs_route_changed` | §3.2 step 4 | (a) kernel has no lineage for the partition; (b) lineage present but `route_revision` newer than the request's | (a) `NOT_PRIMARY`: exactly `[Reply(Failed{NotPrimary{partition, hint: None}})]` on the node with no lineage, which creates none; twin, one fact apart: the node holding the lineage admits the same request to its dispatch check. (b) `ROUTE_CHANGED`: **deferred to the routing milestone** (Gautam, 2026-09-27; lead ruling A-R74: `TxnRequest` carries no `route_revision`); the row is credited on (a) alone and asserts nothing about (b) | unit | none |
 | M7A-66 | `admit_at_fence_tick_denies_with_the_fence_reason` | A-R16 synchronous admission checkpoint · §2.5 "no message at all" · §3.2 entry check (`view.is_some()`, `now <= valid_through_tick`, lineage) · §1.7/§2.4 fence view `(fence_tick − 1, reason)` (K-A-49) · §3.4 mapping | (a) node fence `Expired` at tick `t`, view `(t − 1, past_horizon Expired)`; `Submit` **at tick `t`** and again at `t + 1`; (b) partition fence `GenerationChanged` at `t`, view `(t − 1, past_horizon GenerationChanged)`; `Submit` at `t`; (c) no view held | (a) both ticks: `Reply(Rejection{LEASE_EXPIRED})` **in the same `step` return**, zero `Control`/`Check` effects, `next_seq` unchanged — the at-fence-tick `Submit` is the case the ADR row exists for and a horizon **at** `t` would have admitted it; (b) `GENERATION_CHANGED`, not `LEASE_EXPIRED` (one fact: the fence reason); (c) `NoGrant ⇒ LEASE_EXPIRED` (twin: M7A-67) | unit | K-A-49 |
 | M7A-67 | `admit_authority_view_allow_proceeds_to_dispatch_check` | twin of M7A-66 (one fact: `now <= valid_through_tick`) | as M7A-66 | effects = `[Check{StorageDispatch, corr}]`; `inflight == AwaitingDispatchCheck` | unit | K-A-35 |
 | M7A-68 | `admit_superseding_view_push_denies_next_submit_without_message` | A-R16 "A1 pushes a superseding view on every fence" · §1.7 · §3.3 `AuthorityView` rows | `Submit` A admitted; `AuthorityView{authority_seq +1, valid_through_tick fence_tick − 1, past_horizon Expired}` pushed at `fence_tick`; `Submit` B at `fence_tick` | B: `LEASE_EXPIRED` synchronously, zero effects to A1; A's in-flight fate is M7A-138/140 (the `Freeze` that accompanies the view) | unit | K-A-49 |
@@ -1321,7 +1321,7 @@ lead ledger L-R146 … L-R152).** Re-derive against `HEAD` once these land in a 
 | M7A-130 | **foundation H1** conformance suite for the control fake | the ops themselves landed — `ControlOp` has eight variants including `DelayCompletion{node, by_millis}` and `DropCompletion{node}`, so M7A-119..M7A-127 left this table. M7A-130 reports `unavailable` until the suite lands |
 | M7A-128 | **placement / V5 seam** (not in M7 kernel-a scope) | listed as missing; §13 Q-10 asks whether it belongs to kernel-a at all |
 | M7A-132..M7A-134 (inventory half) | **M1** `storage_inventory` line + **O1** `M7V-15` | the kernel half (quarantine fact, no publish, no reply) runs now |
-| M7A-65 | **C0** — `TxnRequest` carries no `route_revision`, so check 4's `ROUTE_CHANGED` half has nothing to compare (contract ask to C0; owner: the routing milestone; lead ruling A-R74, 2026-09-26) | Unavailable until `TxnRequest` carries `route_revision`. Half (a), `NOT_PRIMARY`, runs today, but it is not credited on its own: the row is one id, and a name is a claim |
+| M7A-65 | **C0** — `TxnRequest` carries no `route_revision`, so check 4's `ROUTE_CHANGED` half has nothing to compare (contract ask to C0; owner: the routing milestone; lead ruling A-R74, 2026-09-26) | Half (b), `ROUTE_CHANGED`, is **deferred to the routing milestone** (Gautam, 2026-09-27; lead ruling A-R74: `TxnRequest` carries no `route_revision`). The row lands on half (a), `NOT_PRIMARY`, as `m7a_65_admit_not_primary_vs_route_changed` in `transaction_t1.rs`; the function name keeps the plan's Name column, and its doc says it asserts nothing about (b). This supersedes the earlier "not credited on its own" note. When `TxnRequest` gains `route_revision`, (b) is added to the same function |
 | M7A-58, M7A-137 | **Q1** shared corpus report | read verification's `OnceLock` report; never start a second corpus |
 | M7A-165..M7A-174 | **the first green run** (present-provisional; wording follows design round 3/4 text that nothing has executed) | §8.7; a sustained finding re-words the row, never removes it. §8.1–§8.6 were cleared by critic-kernel-a round 3 and are no longer listed here |
 | M7A-91..M7A-96, M7A-103, M7A-106, M7A-152..M7A-155, M7A-170, M7A-173 | **KA-8** — the scripted `ReplicationView` fake (ours, §1) | no external dependency: the fake is part of the P1 fixture, `digest_at` defaults to `Match` and `qualifies_now` to false |
@@ -2016,3 +2016,24 @@ four rows land, all unit:
   (f): the late, older read-back is A-R48 superseded and does not roll back. M7A-178 gains a
   deadline clause (expiry before the bound) and a same-seq clause (a republished view does not
   reset the bound). Each kills a mutant the suite had let survive.
+- **A1's capability flip is ready and held (lead rulings A-R79, A-R80, A-R80a; dev-a1p1-w3,
+  2026-09-27).** No new id. `capability()` stays `Unavailable`.
+  - **Evidence.** A-R80 accepted `rdb-sim`'s `tests/scenarios.rs` row
+    `a1p1_case_without_its_activation_publishes_through_a1` as the end-to-end run A-R79 asked
+    for. On it, A1 answers `Dispatch`, `Publication` and `Reply` `Valid` for owner B at the
+    recovered generation, P1 publishes on the `Publication` decision, and the client hears
+    `Success`.
+  - **Why held (A-R80a).** Flipping A1 makes INV-AUTH, which needs A1 alone, the first fully
+    wired invariant. Nothing in the default campaign corpus arms it, so `M7V-89` (wired implies
+    armed) goes red: "no seed armed it; arming op: the first Submit; seeds scheduled to produce
+    it: []". M7V-89 is not relaxed, and no unplanned corpus member is added to arm it.
+  - **What releases it.** A real default-corpus member that arms INV-AUTH: the re-authored
+    A1/P1 case (V-R34) or seeds that lower (M7V-55), whichever lands first.
+  - **The flip is kept as a patch** by the lead (local notes, not committed; ledger L-R177ht names it). It is small enough to re-derive from this note if lost.
+    - It changes A1's `capability()`, rewrites T1's capability comment, and adds the
+      scaffolding row's `Wired` and INV-AUTH `Proven` clause.
+    - That clause was red at `Some(Unavailable)` before the flip.
+    - When it lands, three rows that hard-code A1 `Unavailable` go red: `rdb-sim` `M7F-01`,
+      `M7V-82`, and the `harness::run` unit test
+      `the_only_module_with_a_body_reports_itself_unavailable`. The patch does not touch them;
+      they belong to their owners.

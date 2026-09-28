@@ -17,6 +17,7 @@
 //! | `Publish` | P1's `KernelEffect::Published`, in the step answering its `Publication` check | evidence from the co-located R1 tracker; `authority_recheck` is the decision line that answer was recorded as |
 //! | `ClientOutcomeReported` | any `ReplyEffect::Transaction` or `ReplyEffect::Failed` | `delivered` is always true: the sim has no lost-reply fault |
 //! | `ReplicationAck` | R1's `SendEffect::Unicast` whose body decodes as `AppendOutcome::Accepted` | at the acknowledging node, `Buffered` at `buffered_applied`, see [`ack_line`] |
+//! | `RecoveryDecision` | F1's `RecoveryEffect::Quarantine`, written just before its `Quarantine` line | `mode = Quarantine`; no source, cutoff, digest or new generation (`None`, L-R177gd); the rest from what the harness delivered to F1, see [`quarantine_decision`] |
 //! | `Quarantine` | F1's `RecoveryEffect::Quarantine` | in the plan anchor's generation, sources by F1's plan placement, see [`quarantine_line`] |
 //!
 //! Two more lines are what the **environment** did rather than what a module answered, so the
@@ -26,7 +27,7 @@
 //! | Line | From | Notes |
 //! |---|---|---|
 //! | `BatchApply` | every `StoreEffect::Commit`, and every scenario preload | the batch's own `History` record's digests, see [`apply_line`] |
-//! | `DurabilityAdvance` | every engine sync: a host flush, F1's `SyncWalThrough`, a durable preload | one per captured prefix, `Synced` only where the engine reported it durable, see [`durability_lines`] |
+//! | `DurabilityAdvance` | every engine sync: a host flush, F1's `SyncWalThrough`, a durable preload | one per captured prefix, `Synced` only where the engine reported the whole capture durable, `Partial` where it reported less (V-R36), see [`durability_lines`] |
 //!
 //! An acknowledgement is recorded when R1 answers the `Committed` its own staging produced, so
 //! the acknowledging node's `BatchApply` always precedes it — which is what the validator's
@@ -46,10 +47,8 @@
 //! * A rejected append (`accepted = false`): R1 answers a refusal with `AppendOutcome::Rejected`
 //!   or an `Ignored` note, and neither carries the `AckRejectReason` the line needs.
 //! * `ReplyEffect::Status` and `ReplyEffect::Read`: neither is a write's outcome.
-//! * `RecoveryDecision` on a quarantine (lead ruling V-R29). Its `selected_cutoff_seq`,
-//!   `selected_digest` and `new_generation` are not optional, and on a quarantine F1 selects no
-//!   position and creates no lineage. Any stand-in is a value F1 never chose, and INV-LIN's
-//!   `cutoff_below_an_available_recorded_prefix` judges it. Held on a contract ask.
+//! * `RecoveryDecision` for a recovery that **selected** (`TwoSurvivor`, `LoneSurvivorReadOnly`).
+//!   Not written yet: only a quarantine's decision is (row M7V-80). A gap, not a ruling.
 
 use std::collections::BTreeMap;
 
@@ -62,15 +61,16 @@ use rdb_core::contracts::event::{
     ReplyEffect,
 };
 use rdb_core::contracts::ids::{
-    CorrelationId, Generation, NodeId, PartitionId, ReplicaRole, RequestIdentity, Seq,
+    BootId, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId, ReplicaRole,
+    RequestIdentity, Seq,
 };
-use rdb_core::contracts::membership::CopyId;
+use rdb_core::contracts::membership::{CopyId, Member};
 use rdb_core::contracts::recovery::{DivergenceEvidence, RecoveryEffect, RecoveryEvent};
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, DurablePrefix, StorageFault};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
     AckEvidence, ApplyOutcome, AuthorityGate, AuthorityOutcome, ClientOutcome, DurabilityClass,
-    EventRef, QuarantineReason, SyncOutcome, TraceKind,
+    EventRef, QuarantineReason, QueriedSource, RecoveryMode, SyncOutcome, TraceKind,
 };
 use rdb_core::contracts::transport::{Frame, SendEffect};
 use rdb_core::contracts::txn::Outcome;
@@ -100,9 +100,27 @@ pub struct Semantic {
     decisions: BTreeMap<(NodeId, CorrelationId), EventRef>,
     /// `(node, request) -> what its Publish line said`.
     published: BTreeMap<(NodeId, RequestIdentity), Published>,
-    /// `(F1's node, partition) -> the anchor generation and each copy's node`, from the
-    /// `RecoveryEvent::Plan` F1 answered: what a `Quarantine` line names its sources with.
-    plans: BTreeMap<(NodeId, PartitionId), (Generation, BTreeMap<CopyId, NodeId>)>,
+    /// `(F1's node, partition) -> the anchor generation and the pinned members`, from the
+    /// `RecoveryEvent::Plan` F1 answered: what a `Quarantine` line names its sources with, and
+    /// what a quarantine's `RecoveryDecision` lists as queried (F1 queries every member).
+    plans: BTreeMap<(NodeId, PartitionId), (Generation, Vec<Member>)>,
+    /// `(F1's node, partition) -> what its discovery was delivered`, from the fence F1 accepted.
+    discoveries: BTreeMap<(NodeId, PartitionId), Discovery>,
+}
+
+/// One F1 discovery, as the harness delivered it: what a quarantine's `RecoveryDecision` says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    /// The epoch the accepted fence proved fenced.
+    pub fenced_epoch: OwnerEpoch,
+    /// The tick that fence arrived at F1: the window opens there, never at the proof's
+    /// `decision_tick` (K-B-14).
+    pub opened_at: Tick,
+    /// The tick F1 emitted `CloseWindow`, if it has.
+    pub closed_at: Option<Tick>,
+    /// Each copy's answer while the window was open: its `(generation, head, digest)` for an
+    /// inventory, `None` for `InventoryFailed`. A copy with no entry never answered.
+    pub answers: BTreeMap<CopyId, Option<(Generation, Seq, Digest)>>,
 }
 
 impl Semantic {
@@ -125,30 +143,43 @@ impl Semantic {
         dispatcher: &Dispatcher,
         budgets: &Budgets,
     ) -> Result<(), SimError> {
-        if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
-            if module == ModuleName::Recovery {
-                let nodes = plan
-                    .config
-                    .members
-                    .iter()
-                    .map(|member| (member.copy, member.node))
-                    .collect();
-                self.plans.insert(
-                    (event.node, event.partition),
-                    (plan.anchor.lineage.generation, nodes),
-                );
-            }
+        if module == ModuleName::Recovery {
+            self.recovery_input(event, effects);
         }
         for effect in effects {
             match &effect.kind {
+                EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::CloseWindow))
+                    if module == ModuleName::Recovery =>
+                {
+                    if let Some(discovery) =
+                        self.discoveries.get_mut(&(event.node, event.partition))
+                    {
+                        discovery.closed_at.get_or_insert(event.at);
+                    }
+                }
                 EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::Quarantine(
                     evidence,
                 ))) if module == ModuleName::Recovery => {
-                    let line = self
-                        .plans
-                        .get(&(event.node, event.partition))
-                        .and_then(|(generation, nodes)| {
-                            quarantine_line(*generation, nodes, evidence)
+                    let key = (event.node, event.partition);
+                    let plan = self.plans.get(&key);
+                    let decision = plan
+                        .zip(self.discoveries.get(&key))
+                        .and_then(|((_, members), discovery)| {
+                            quarantine_decision(discovery, event.at, members, |node| {
+                                dispatcher.boot(node)
+                            })
+                        })
+                        .ok_or(SimError::Config {
+                            field: "semantic::recovery_decision",
+                        })?;
+                    recorder.record(site, decision)?;
+                    let line = plan
+                        .and_then(|(generation, members)| {
+                            let nodes = members
+                                .iter()
+                                .map(|member| (member.copy, member.node))
+                                .collect();
+                            quarantine_line(*generation, &nodes, evidence)
                         })
                         .ok_or(SimError::Config {
                             field: "semantic::quarantine_sources",
@@ -207,6 +238,71 @@ impl Semantic {
             }
         }
         Ok(())
+    }
+
+    /// Fold what the harness delivered to F1: its plan, the fence it **accepted** (the step asks
+    /// for inventory; a refused fence opens nothing), and each copy's answer while the window
+    /// is open. A new accepted fence starts a new discovery.
+    fn recovery_input(&mut self, event: &Event, effects: &[Effect]) {
+        let EventKind::Kernel(KernelEvent::Recovery(input)) = &event.kind else {
+            return;
+        };
+        let key = (event.node, event.partition);
+        match input {
+            RecoveryEvent::Plan(plan) => {
+                self.plans.insert(
+                    key,
+                    (plan.anchor.lineage.generation, plan.config.members.clone()),
+                );
+            }
+            RecoveryEvent::FenceProven(proof) => {
+                let accepted = effects.iter().any(|effect| {
+                    matches!(
+                        effect.kind,
+                        EffectKind::Kernel(KernelEffect::Recovery(
+                            RecoveryEffect::QueryInventory { .. }
+                        ))
+                    )
+                });
+                if accepted {
+                    self.discoveries.insert(
+                        key,
+                        Discovery {
+                            fenced_epoch: proof.prior_owner_epoch,
+                            opened_at: event.at,
+                            closed_at: None,
+                            answers: BTreeMap::new(),
+                        },
+                    );
+                }
+            }
+            RecoveryEvent::InventoryReported(inventory)
+            | RecoveryEvent::StaleOwnerReturned(inventory) => {
+                if let Some(discovery) = self.open_discovery(key) {
+                    discovery.answers.insert(
+                        inventory.copy,
+                        Some((
+                            inventory.anchor_seen.lineage.generation,
+                            inventory.head.0,
+                            inventory.head.1,
+                        )),
+                    );
+                }
+            }
+            RecoveryEvent::InventoryFailed { copy } => {
+                if let Some(discovery) = self.open_discovery(key) {
+                    discovery.answers.insert(*copy, None);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The discovery at `key`, while its window is open.
+    fn open_discovery(&mut self, key: (NodeId, PartitionId)) -> Option<&mut Discovery> {
+        self.discoveries
+            .get_mut(&key)
+            .filter(|discovery| discovery.closed_at.is_none())
     }
 
     fn outcome_line(
@@ -448,6 +544,61 @@ pub fn quarantine_line(
     })
 }
 
+/// The `RecoveryDecision` line for F1's quarantine, decided at `decided_at`, over `discovery`
+/// and the pinned `members` F1 queried, each at the boot `boot_of` says its node runs under.
+///
+/// Every field is either what F1 was delivered or `None` where F1 chose nothing:
+///
+/// * `mode` is `Quarantine`; `selected_source`, `selected_cutoff_seq`, `selected_digest` and
+///   `new_generation` are `None`. A quarantine selects no prefix and creates no lineage, and the
+///   contract says so (L-R177gd). A stand-in here is the value V-R29 refused.
+/// * `fenced_epoch` is the accepted fence's `prior_owner_epoch`.
+/// * `discovery_window_ticks` runs from the fence's arrival to `CloseWindow`, or to the
+///   quarantine when F1 decided before its window closed.
+/// * `queried_sources` is one entry per member, in the plan's order. `reachable` means the copy
+///   answered with an inventory while the window was open; its report is that inventory's
+///   lineage generation and head. A failed or silent copy is unreachable and reports nothing.
+/// * `loss_uncertainty` is `false`: F1 builds its loss record, whose `uncertain` compares the
+///   highest advertised position with the cutoff, only for a selected cutoff. A quarantine cuts
+///   nothing and deletes nothing (spec §8.4), so no suffix may have been lost by this decision.
+///
+/// `None` when a member's node has no boot: a source list with an invented boot would be false.
+#[must_use]
+pub fn quarantine_decision(
+    discovery: &Discovery,
+    decided_at: Tick,
+    members: &[Member],
+    boot_of: impl Fn(NodeId) -> Option<BootId>,
+) -> Option<TraceKind> {
+    let queried_sources = members
+        .iter()
+        .map(|member| {
+            let report = discovery.answers.get(&member.copy).copied().flatten();
+            Some(QueriedSource {
+                node: member.node,
+                boot: boot_of(member.node)?,
+                role: member.role,
+                reachable: report.is_some(),
+                reported_generation: report.map(|(generation, _, _)| generation),
+                reported_seq: report.map(|(_, seq, _)| seq),
+                reported_digest: report.map(|(_, _, digest)| digest),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let closed = discovery.closed_at.unwrap_or(decided_at);
+    Some(TraceKind::RecoveryDecision {
+        fenced_epoch: discovery.fenced_epoch,
+        discovery_window_ticks: closed.0.saturating_sub(discovery.opened_at.0),
+        queried_sources,
+        selected_source: None,
+        selected_cutoff_seq: None,
+        selected_digest: None,
+        mode: RecoveryMode::Quarantine,
+        loss_uncertainty: false,
+        new_generation: None,
+    })
+}
+
 /// The `BatchApply` line for `batch`, committed on a node holding `role`, ending `outcome`.
 ///
 /// The digests are the batch's own `History` record at its seq: `prev_digest` as the
@@ -477,8 +628,13 @@ pub fn apply_line(batch: &Batch, role: ReplicaRole, outcome: ApplyOutcome) -> Op
 /// `engine` is read **after** it.
 ///
 /// * The sync failed: `Failed`, at the watermark the engine still holds.
-/// * It succeeded and reported the prefix durable: `Synced`, at what it reported — a
-///   `ShortFlush` reports less than was captured, and the line says the less.
+/// * It succeeded and reported the prefix durable through at least what was captured: `Synced`,
+///   at what it reported (which may be above the capture, when an earlier sync got further).
+/// * It succeeded and reported the prefix durable through **less** than was captured:
+///   `Partial`, at what it reported. A `ShortFlush` is this case, and so is a capture above
+///   what the engine had applied. The `SyncOutcome` contract says only `Synced` publishes the
+///   captured prefix, and this one was not all made durable (lead ruling V-R36, rows M7V-98 and
+///   M7V-99).
 /// * It succeeded and did not report the prefix: `Partial`, at the watermark the engine still
 ///   holds. A `FalseDurable` flush is this case: it completes with an empty `durable`, so no
 ///   watermark moved, and the line never says `Synced` for it.
@@ -507,7 +663,12 @@ pub fn durability_lines(
                     .iter()
                     .find(|d| d.partition == partition && d.generation == generation)
                     .map_or((held, SyncOutcome::Partial), |d| {
-                        (Seq(d.through.0), SyncOutcome::Synced)
+                        let outcome = if d.through.0 < prefix.through.0 {
+                            SyncOutcome::Partial
+                        } else {
+                            SyncOutcome::Synced
+                        };
+                        (Seq(d.through.0), outcome)
                     }),
             };
             let line = TraceKind::DurabilityAdvance {
@@ -625,5 +786,104 @@ mod tests {
             found: None,
         };
         assert_eq!(quarantine_line(Generation(2), &nodes, &unmapped), None);
+    }
+
+    /// M7V-80's recorder slice, unit level. The window runs from the accepted fence to the
+    /// window's close, not to the decision, when the two differ; a copy that failed its
+    /// inventory and one that never answered are both unreachable with nothing reported; a
+    /// member whose node has no boot gives no line at all, never an invented boot.
+    #[test]
+    fn quarantine_decision_measures_the_window_to_its_close_and_invents_nothing() {
+        let digest = Digest([7; 32]);
+        let member = |copy: u8, node: u32, role: ReplicaRole| Member {
+            copy: CopyId(copy),
+            node: NodeId(node),
+            boot: BootId(1),
+            role,
+        };
+        let members = [
+            member(0, 1, ReplicaRole::Primary),
+            member(1, 2, ReplicaRole::RegularSecondary),
+            member(2, 3, ReplicaRole::RegularSecondary),
+        ];
+        let discovery = Discovery {
+            fenced_epoch: OwnerEpoch(4),
+            opened_at: Tick(3),
+            closed_at: Some(Tick(10)),
+            answers: BTreeMap::from([
+                (CopyId(0), Some((Generation(1), Seq(2), digest))),
+                (CopyId(1), None),
+            ]),
+        };
+        let boot = |node: NodeId| Some(BootId(u64::from(node.0) + 10));
+        let Some(TraceKind::RecoveryDecision {
+            fenced_epoch,
+            discovery_window_ticks,
+            queried_sources,
+            selected_source,
+            selected_cutoff_seq,
+            selected_digest,
+            mode,
+            loss_uncertainty,
+            new_generation,
+        }) = quarantine_decision(&discovery, Tick(12), &members, boot)
+        else {
+            panic!("a decision line")
+        };
+        assert_eq!(fenced_epoch, OwnerEpoch(4));
+        assert_eq!(
+            discovery_window_ticks, 7,
+            "to the close at 10, not the decision at 12"
+        );
+        assert_eq!(mode, RecoveryMode::Quarantine);
+        assert_eq!(
+            (
+                selected_source,
+                selected_cutoff_seq,
+                selected_digest,
+                new_generation
+            ),
+            (None, None, None, None)
+        );
+        assert!(!loss_uncertainty);
+        let reach: Vec<(NodeId, BootId, bool, Option<Seq>)> = queried_sources
+            .iter()
+            .map(|source| {
+                (
+                    source.node,
+                    source.boot,
+                    source.reachable,
+                    source.reported_seq,
+                )
+            })
+            .collect();
+        assert_eq!(
+            reach,
+            vec![
+                (NodeId(1), BootId(11), true, Some(Seq(2))),
+                (NodeId(2), BootId(12), false, None),
+                (NodeId(3), BootId(13), false, None),
+            ]
+        );
+        assert_eq!(queried_sources[0].reported_digest, Some(digest));
+
+        let still_open = Discovery {
+            closed_at: None,
+            ..discovery.clone()
+        };
+        let Some(TraceKind::RecoveryDecision {
+            discovery_window_ticks,
+            ..
+        }) = quarantine_decision(&still_open, Tick(12), &members, boot)
+        else {
+            panic!("a decision line")
+        };
+        assert_eq!(discovery_window_ticks, 9, "unclosed: to the decision");
+
+        let no_boot = |node: NodeId| (node != NodeId(3)).then_some(BootId(1));
+        assert_eq!(
+            quarantine_decision(&discovery, Tick(12), &members, no_boot),
+            None
+        );
     }
 }

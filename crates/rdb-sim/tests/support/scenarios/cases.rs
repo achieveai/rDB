@@ -241,6 +241,20 @@ pub fn case_f1_r1_discovery_window() -> Scenario {
 /// The index of [`case_a1_p1_new_generation_between_publish_and_reply`]'s second
 /// `InspectSurvivors`: the op that activates the new generation.
 pub const A1_P1_ACTIVATE_OP: usize = 6;
+/// The A1/P1 case: where B and C survive. `Synchronize` preloads seqs 1..=10 as client writes
+/// with request ids 1..=10, so those ids are taken.
+pub const A1_P1_HEAD: u64 = 10;
+/// The A1/P1 case: the tick L1 lifts B's resume hold. Recovery fences at `PLAN_AT + 1`, the
+/// survivor window closes 2 s later, and L1 holds writes for `resume_hold_millis` after that.
+pub const A1_P1_RESUMES_AT: u64 = PLAN_AT + 1 + 2_000 + Budgets::SPEC_DEFAULTS.resume_hold_millis;
+/// The A1/P1 case: the tick its write is submitted on B. After the resume hold: submitted
+/// inside it, L1 refuses the write `ProtectionPaused` and nothing is dispatched.
+pub const A1_P1_SUBMIT_AT: u64 = A1_P1_RESUMES_AT + 300;
+/// The A1/P1 case: its write's request id. The first id the preload did not use: reusing one of
+/// the preloaded ids under another digest is refused `RequestIdReuse`.
+pub const A1_P1_REQUEST: RequestId = RequestId(A1_P1_HEAD + 1);
+/// The A1/P1 case: its deadline.
+pub const A1_P1_MAX_TICKS: u64 = A1_P1_SUBMIT_AT + 3_000;
 
 /// Spike §6, A1/P1: "Delayed old dispatch after pause/reboot/new-generation activation may leave
 /// quarantined bytes, never active-lineage publication, ACK, export or replication."
@@ -252,42 +266,45 @@ pub const A1_P1_ACTIVATE_OP: usize = 6;
 /// slot, so A1 answers its `Reply` check `Deny(GenerationChanged)`, and that deny is what P1's
 /// reply arm must honour.
 ///
-/// B and C survive at 10; A is dead. After recovery lands (fence + 2 s), one client write goes
-/// to B, and a second recovery of the partition activates the next generation at the same tick,
-/// before the write's reply is decided. The reply check still has to be held on its hop for the
-/// activation to land in between (P-3's hop delay); the grammar has no op for that yet.
+/// B and C survive at 10; A is dead. Once recovery lands and L1's resume hold lifts, one client
+/// write goes to B, and a second recovery of the partition activates the next generation at the
+/// same tick, before the write's reply is decided. The reply check still has to be held on its
+/// hop for the activation to land in between (P-3's hop delay); the grammar has no op for that yet.
 ///
 /// **Not runnable at this basis, and the row says so by index** (`A1_P1_ACTIVATE_OP`): the
-/// bridge refuses a second `InspectSurvivors` of one partition. Parked until B-R60 lands and A1
-/// installs the post-`Recovered` lineage; the other blockers are recorded in the row.
+/// bridge refuses a second `InspectSurvivors` of one partition, and below the bridge nothing can
+/// yet produce that activation (the row records why). Everything before it runs: without that op
+/// the write publishes through A1 and replies `Success`.
 #[must_use]
 pub fn case_a1_p1_new_generation_between_publish_and_reply() -> Scenario {
     authored(
         "case_a1_p1_new_generation_between_publish_and_reply",
         Budget {
             max_events: 2_000,
-            max_ticks: 8_000,
+            max_ticks: A1_P1_MAX_TICKS,
         },
         vec![
             ScenarioOp::Recovery(RecoveryOp::Synchronize {
                 node: B_NODE,
-                to: Seq(10),
+                to: Seq(A1_P1_HEAD),
             }),
             ScenarioOp::Recovery(RecoveryOp::Synchronize {
                 node: C_NODE,
-                to: Seq(10),
+                to: Seq(A1_P1_HEAD),
             }),
             ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
             ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
                 partition: PARTITION,
                 window: 2_000,
             }),
-            ScenarioOp::Time(TimeOp::Advance { ticks: 2_100 }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: A1_P1_SUBMIT_AT - PLAN_AT,
+            }),
             ScenarioOp::Client(ClientOp::Submit {
                 partition: PARTITION,
                 tenant: TenantId(1),
                 client: ClientId(1),
-                request: RequestId(1),
+                request: A1_P1_REQUEST,
                 digest_id: 1,
                 affinity: 1,
                 expected_generation: None,
@@ -297,7 +314,9 @@ pub fn case_a1_p1_new_generation_between_publish_and_reply() -> Scenario {
                 partition: PARTITION,
                 window: 2_000,
             }),
-            ScenarioOp::Time(TimeOp::Advance { ticks: 3_000 }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: A1_P1_MAX_TICKS - A1_P1_SUBMIT_AT,
+            }),
         ],
     )
 }

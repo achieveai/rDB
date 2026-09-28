@@ -1038,6 +1038,49 @@ fn m7a_64_admit_incompatible_version_first() {
     assert_eq!(h.k().next_seq(), Seq(1));
 }
 
+/// M7A-65, half (a) only: a node that holds no lineage for the partition answers check 4 with
+/// `NOT_PRIMARY` and no hint, in the same step, and nothing else. Half (b), `ROUTE_CHANGED`, is
+/// deferred to the routing milestone (Gautam, 2026-09-27; lead ruling A-R74: `TxnRequest`
+/// carries no `route_revision`), so this function asserts nothing about it.
+///
+/// "No lineage for the partition" is per node: node A is live at generation 7, and the same
+/// request submitted on node B, which never saw a `Recovered`, is refused there. The twin, one
+/// fact apart (the stepping node holds the lineage), is node A admitting the same request to its
+/// dispatch check.
+#[retcd_test]
+fn m7a_65_admit_not_primary_vs_route_changed() {
+    let mut h = H::live();
+    h.node = NODE_B;
+    assert!(
+        h.t1.kernel(NODE_B, PARTITION).is_none(),
+        "B holds no lineage"
+    );
+    assert_eq!(
+        h.step(submit(put(1, b"k", b"v"))),
+        vec![EffectKind::Reply(ReplyEffect::Failed {
+            identity: identity(1),
+            error: RdbError::NotPrimary {
+                partition: PARTITION,
+                hint: None,
+            },
+        })],
+        "exactly one NOT_PRIMARY reply naming the partition, no hint, no check, no batch"
+    );
+    assert!(
+        h.t1.kernel(NODE_B, PARTITION).is_none(),
+        "a refused submit creates no lineage"
+    );
+
+    // The twin: on A, which holds the lineage, the same request passes check 4.
+    h.node = NODE_A;
+    assert_eq!(
+        h.k().next_seq(),
+        Seq(1),
+        "B's refusal reserved nothing on A"
+    );
+    let _ = h.admit(put(1, b"k", b"v"));
+}
+
 #[retcd_test]
 fn a_key_without_a_scope_prefix_is_invalid_not_a_pass() {
     let mut h = H::live();

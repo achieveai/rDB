@@ -15,7 +15,13 @@
 //! Barrier --DurableAt from each--> Proposing --CAS Committed--> Committed
 //!   (mode != Active) Rebuilding --three-copy barrier--> ActivationProposed --CAS--> Committed(Active)
 //! Quarantined: terminal.   Blocked: terminal until a fresh fence.
+//! Committed, Rebuilding --FenceProven, newer root--> Fenced/Collecting
+//! ActivationProposed --FenceProven, newer root--> held; re-enters once the activation CAS ends
 //! ```
+//!
+//! After commit a fence re-enters only when the root it would commit is newer than the committed
+//! one (ruling B-R74); the committed run is dropped whole, and what it left in flight is judged by
+//! the new run's phase alone.
 //!
 //! Nothing before commit waits forever (ruling F-a): Synchronizing and Barrier block with
 //! `BarrierIncomplete` on a lost required copy or when their deadline passes. Nor does a rebuild
@@ -175,6 +181,9 @@ struct Committed {
     retention_millis: u64,
     rebuild: Option<Rebuild>,
     activation: Option<(Cas, RecoveryBarrier)>,
+    /// The newest fence newer than this commit that arrived while the activation CAS was in
+    /// flight. It re-enters once that exchange ends (ruling B-R74b).
+    held: Option<FencingProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -598,6 +607,12 @@ impl Recovery {
         if let Err(evidence) = decided.check_cutoff(proof.copy, Seq(proof.seq.0), proof.digest) {
             return quarantine(evidence, emit);
         }
+        // A proof that does not bind to the cutoff proves nothing, so it never displaces one that
+        // does: a late answer to an earlier run's sync is one (ruling B-R74).
+        if !binds(&decided, proof) {
+            emit.ignored(ReplicaIgnoreReason::BarrierNotDurable);
+            return Phase::Barrier(decided, proofs);
+        }
         proofs.insert(proof.copy, *proof);
         let held: Vec<DurableProof> = proofs.values().copied().collect();
         let (cutoff, digest) = (decided.selected.cutoff_seq, decided.selected.cutoff_digest);
@@ -640,13 +655,32 @@ impl Recovery {
         input: Input<'_>,
         emit: &mut Emit<'_>,
     ) -> Phase {
-        if let Input::Recovery(RecoveryEvent::StaleOwnerReturned(inv)) = input {
-            stale_owner(&committed, inv.copy, emit);
-            return Phase::Committed(committed);
+        match input {
+            Input::Recovery(RecoveryEvent::StaleOwnerReturned(inv)) => {
+                stale_owner(&committed, inv.copy, emit);
+                return Phase::Committed(committed);
+            }
+            // Held for a later fence, as in `Blocked` (ruling B-R74).
+            Input::Recovery(RecoveryEvent::Plan(plan)) => {
+                self.hold_plan(plan, emit);
+                return Phase::Committed(committed);
+            }
+            // With the activation CAS in flight the fence waits for its answer (ruling B-R74b).
+            Input::Recovery(RecoveryEvent::FenceProven(proof))
+                if committed.activation.is_some() =>
+            {
+                hold_fence(&mut committed, proof, emit);
+                return Phase::Committed(committed);
+            }
+            Input::Recovery(RecoveryEvent::FenceProven(proof)) => {
+                return self.refence(ctx, committed, proof, emit);
+            }
+            _ => {}
         }
         if let Some((mut cas, barrier)) = committed.activation.take() {
             let fence = committed.result.fenced_prior.control_revision;
-            return match follow_cas(&mut cas, fence, input, emit) {
+            let held = committed.held.take();
+            let phase = match follow_cas(&mut cas, fence, input, emit) {
                 Some(Ok(revision)) => {
                     activate(&mut committed, barrier, revision, emit);
                     Phase::Committed(committed)
@@ -654,8 +688,15 @@ impl Recovery {
                 Some(Err(blocked)) => blocked,
                 None => {
                     committed.activation = Some((cas, barrier));
-                    Phase::Committed(committed)
+                    committed.held = held;
+                    return Phase::Committed(committed);
                 }
+            };
+            // The exchange has ended and its answer is the first run's. Only now does a held
+            // fence re-enter, through the door of the phase the answer left.
+            return match held {
+                Some(proof) => self.release_fence(ctx, phase, &proof, emit),
+                None => phase,
             };
         }
         let Some(rebuild) = committed.rebuild.as_mut() else {
@@ -713,6 +754,46 @@ impl Recovery {
                 Phase::Committed(committed)
             }
             Ok(()) => Phase::Committed(committed),
+        }
+    }
+
+    /// A fence after commit (ruling B-R74). One whose root would be newer than the committed one
+    /// — it proves this run's own root or a later one — re-enters recovery by the same door as
+    /// `Idle`, and the committed run is dropped whole: its selection, barrier and rebuild. No CAS
+    /// of its own is in flight here (ruling B-R74b holds the fence until one ends, see
+    /// [`hold_fence`]). Anything not newer is the fence this run committed on, or an
+    /// older one, replayed: out of phase, whatever plan is held. Generation orders committed
+    /// roots: it is what `RecoveryResult` names; the epoch advances with it in [`new_root`].
+    fn refence(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        committed: Box<Committed>,
+        proof: &FencingProof,
+        emit: &mut Emit<'_>,
+    ) -> Phase {
+        if new_root(proof).generation <= committed.result.new_generation {
+            emit.ignored(ReplicaIgnoreReason::OutOfPhase);
+            return Phase::Committed(committed);
+        }
+        self.fence(ctx, proof, None, emit)
+            .unwrap_or(Phase::Committed(committed))
+    }
+
+    /// A fence held behind the activation CAS, once that exchange has ended (ruling B-R74b):
+    /// `Committed` takes it as any fence after commit; `Blocked` by its own floor.
+    fn release_fence(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        phase: Phase,
+        proof: &FencingProof,
+        emit: &mut Emit<'_>,
+    ) -> Phase {
+        match phase {
+            Phase::Committed(committed) => self.refence(ctx, committed, proof, emit),
+            Phase::Blocked(reason, seen) => self
+                .fence(ctx, proof, seen, emit)
+                .unwrap_or(Phase::Blocked(reason, seen)),
+            other => other,
         }
     }
 }
@@ -832,16 +913,18 @@ fn synchronize(decided: Box<Decided>, awaiting: BTreeSet<CopyId>, emit: &mut Emi
 /// The required copies without a proof that reaches and binds to the cutoff, each judged by the
 /// one barrier constructor so this can never disagree with it.
 fn unproven(decided: &Decided, proofs: &BTreeMap<CopyId, DurableProof>) -> Vec<CopyId> {
-    let (cutoff, digest) = (decided.selected.cutoff_seq, decided.selected.cutoff_digest);
     decided
         .required
         .iter()
         .copied()
-        .filter(|copy| {
-            let held: Vec<DurableProof> = proofs.get(copy).copied().into_iter().collect();
-            RecoveryBarrier::try_new(&held, &BTreeSet::from([*copy]), cutoff, digest).is_err()
-        })
+        .filter(|copy| !proofs.get(copy).is_some_and(|proof| binds(decided, proof)))
         .collect()
+}
+
+/// Whether `proof` alone reaches and binds to the cutoff, judged by the one barrier constructor.
+fn binds(decided: &Decided, proof: &DurableProof) -> bool {
+    let (cutoff, digest) = (decided.selected.cutoff_seq, decided.selected.cutoff_digest);
+    RecoveryBarrier::try_new(&[*proof], &BTreeSet::from([proof.copy]), cutoff, digest).is_ok()
 }
 
 /// `uncertain = highest_advertised > cutoff` (spec §8.1). No client-ACK field exists.
@@ -928,6 +1011,7 @@ fn commit(
         record,
         rebuild,
         activation: None,
+        held: None,
     }))
 }
 
@@ -960,6 +1044,24 @@ fn stale_owner(committed: &Committed, copy: CopyId, emit: &mut Emit<'_>) {
         copy,
         root: committed.anchor,
     });
+}
+
+/// A fence while the activation CAS is in flight (ruling B-R74b): held when its root is newer
+/// than both the committed root and any fence already held, which it replaces; otherwise out of
+/// phase. A held fence answers `Recorded`; the phase does not move either way.
+fn hold_fence(committed: &mut Committed, proof: &FencingProof, emit: &mut Emit<'_>) {
+    let floor = committed
+        .held
+        .as_ref()
+        .map_or(committed.result.new_generation, |held| {
+            new_root(held).generation
+        });
+    if new_root(proof).generation > floor {
+        committed.held = Some(proof.clone());
+        emit.ignored(ReplicaIgnoreReason::Recorded);
+    } else {
+        emit.ignored(ReplicaIgnoreReason::OutOfPhase);
+    }
 }
 
 /// Drive one proposal through a control answer. `Some(Ok)` landed, `Some(Err)` the blocked phase,

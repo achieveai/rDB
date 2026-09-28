@@ -6583,12 +6583,16 @@ fn syncs(trace: &Trace) -> Vec<SyncLine> {
         .collect()
 }
 
-/// A sync is a `DurabilityAdvance` at the node whose engine ran it, and it says `Synced` only
-/// where the engine's watermark really moved. F1's `SyncWalThrough` on each survivor is one; a
-/// planned `FalseDurable` on node 2 makes node 2's a flush that completed and advanced nothing,
-/// which is `Partial` at the watermark the engine still holds — never `Synced` at the cutoff.
+/// A sync is a `DurabilityAdvance` at the node whose engine ran it: F1's `SyncWalThrough` on each
+/// survivor is `Synced` at the head with the engine's digest there, and a planned `FalseDurable`
+/// on node 2 makes node 2's a flush that completed and advanced nothing, which is `Partial` at
+/// the watermark the engine still holds — never `Synced` at the cutoff.
+///
+/// Renamed from `..._synced_only_where_the_engine_moved` (tester-sim-hooks F2): a no-op sync,
+/// whose watermark does not move, is still `Synced` at that watermark, so the old name claimed
+/// more than the row asserts. A `ShortFlush` is `Partial` (V-R36), pinned by M7V-98 and M7V-99.
 #[retcd_test]
-fn recording_a_sync_is_a_durability_advance_line_synced_only_where_the_engine_moved() {
+fn recording_a_sync_is_synced_at_the_engines_watermark_and_a_false_durable_flush_is_partial() {
     use rdb_core::contracts::ids::AppliedSeq;
     use rdb_core::contracts::trace::SyncOutcome;
     use rdb_sim::harness::trace::validate;
@@ -6839,7 +6843,7 @@ fn parked(row: &str, package: PackageId, what: &str) {
 }
 
 // ------------------------------------------------------------------------------------------
-// M7V-80's quarantine clause (lead rulings V-R28, V-R29): scaffolding, not M7V-80
+// M7V-80 — a recovery-path digest disagreement is F1's quarantine, and the trace says so
 // ------------------------------------------------------------------------------------------
 
 /// The copy whose survivor disagrees: copy 2, on node 3.
@@ -6865,19 +6869,39 @@ fn disagreeing_spine_plan() -> RunPlan {
     plan
 }
 
-/// F1's quarantine of a recovery-path digest disagreement is a `quarantine{DigestConflict}` line
-/// at the disagreeing position, naming both sides' nodes. **Not M7V-80**: that row also requires
-/// `recovery_decision{mode=Quarantine}`, which is not recorded (V-R29: its cutoff, digest and new
-/// generation are not optional, and on a quarantine F1 chooses none of them). This row asserts
-/// that absence, so the day the contract ask lands it goes red and M7V-80 can be written.
+/// M7V-80. A reachable source whose reported digest differs at a recorded position is a
+/// divergence spec §8.2 says never auto-merges, and deciding it is F1's, not the oracle's (the
+/// kernel-facing third sub-case of M7V-19). The trace carries `recovery_decision{Quarantine}`
+/// naming every queried source, the disagreeing one included, with **no** cutoff, digest or new
+/// generation (the contract's `None` on a quarantine, L-R177gd), and `quarantine{DigestConflict}`
+/// at that position naming both sides. INV-LIN does not fire on it: a quarantine selected no
+/// cutoff, so `cutoff_below_an_available_recorded_prefix` has nothing to judge (read as 0, it
+/// would fire on nodes 1 and 2, which report seq 2 under the recorded digest).
+///
+/// The plan's `(gen 7, seq 9)` is the spine's `(gen 1, seq 2)`: the position is illustrative, the
+/// shape is not. Parked on its coverage and `Proven` clauses, which need recorder lines the
+/// harness does not write (I1): see the `parked` call.
 #[retcd_test]
-fn recording_a_recovery_digest_disagreement_is_a_quarantine_line_naming_both_sides() {
-    use rdb_core::contracts::recovery::{DivergenceEvidence, RecoveryEffect};
-    use rdb_core::contracts::trace::QuarantineReason;
+fn m7v_80_recovery_path_digest_disagreement_yields_quarantine_from_the_kernel() {
+    use rdb_core::contracts::event::KernelEvent;
+    use rdb_core::contracts::recovery::{DivergenceEvidence, RecoveryEffect, RecoveryEvent};
+    use rdb_core::contracts::trace::{QuarantineReason, QueriedSource, RecoveryMode};
     use rdb_sim::harness::trace::validate;
     use support::oracle::{Invariant, Oracle, Verdict};
+    use support::scenarios::coverage::{recovery_mode_cell, RECOVERY_MODES};
     support::preamble();
     let plan = disagreeing_spine_plan();
+    let fence_at = plan
+        .seed
+        .iter()
+        .find(|seed| {
+            matches!(
+                seed.kind,
+                EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(_)))
+            )
+        })
+        .map(|seed| seed.at.0)
+        .expect("the spine fences F1");
     let mut runner = Runner::new(&plan).expect("a runner");
     let report = runner.run(plan.limits).expect("the spine runs");
     let phase = runner
@@ -6889,7 +6913,7 @@ fn recording_a_recovery_digest_disagreement_is_a_quarantine_line_naming_both_sid
     validate(&trace).expect("well formed");
 
     // F1 decided it, over copy 2 at the head; the other side is copy 0 or copy 1.
-    let evidence: Vec<(Seq, CopyId, CopyId)> = trace
+    let evidence: Vec<(u64, Seq, CopyId, CopyId)> = trace
         .events
         .iter()
         .filter_map(|event| match &event.kind {
@@ -6900,19 +6924,131 @@ fn recording_a_recovery_digest_disagreement_is_a_quarantine_line_naming_both_sid
                             RecoveryEffect::Quarantine(DivergenceEvidence::Pairwise { seq, a, b }),
                     },
                 ..
-            } => Some((*seq, a.0, b.0)),
+            } => Some((event.logical_tick, *seq, a.0, b.0)),
             _ => None,
         })
         .collect();
     tracing::info!(?evidence, "F1's quarantine evidence");
     assert_eq!(evidence.len(), 1, "one quarantine: {evidence:?}");
-    let (seq, a, b) = evidence[0];
+    let (decided_at, seq, a, b) = evidence[0];
     assert_eq!(seq, Seq(SPINE_HEAD));
     assert!(a == CopyId(2) || b == CopyId(2), "copy 2 is a side");
     assert_eq!(phase, Some(rdb_core::recovery::RecoveryPhase::Quarantined));
+    // The window closed at its deadline, in the step that decided.
+    let closed_at: Vec<u64> = trace
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                TraceKind::KernelNoted {
+                    note: KernelNote::RecoveryFact {
+                        effect: RecoveryEffect::CloseWindow
+                    },
+                    ..
+                }
+            )
+        })
+        .map(|event| event.logical_tick)
+        .collect();
+    assert_eq!(
+        closed_at,
+        vec![decided_at],
+        "one window, closed where F1 decided"
+    );
 
-    // The line: one per quarantine, at the position, naming each side by the node F1's plan
-    // places it on (copy n is on node n + 1 in the spine).
+    // The decision: at F1's node, mode Quarantine, nothing selected and nothing created.
+    let decisions: Vec<_> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            kind @ TraceKind::RecoveryDecision { .. } => Some((event.node, kind.clone())),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?decisions, "recovery_decision lines");
+    assert_eq!(
+        decisions.len(),
+        1,
+        "one recovery_decision line: {decisions:?}"
+    );
+    let (at_node, decision) = decisions[0].clone();
+    assert_eq!(at_node, NODE, "at F1's node");
+    let TraceKind::RecoveryDecision {
+        fenced_epoch,
+        discovery_window_ticks,
+        queried_sources,
+        selected_source,
+        selected_cutoff_seq,
+        selected_digest,
+        mode,
+        loss_uncertainty,
+        new_generation,
+    } = decision
+    else {
+        unreachable!("filtered to decisions")
+    };
+    assert_eq!(mode, RecoveryMode::Quarantine);
+    assert_eq!(
+        (
+            selected_source,
+            selected_cutoff_seq,
+            selected_digest,
+            new_generation
+        ),
+        (None, None, None, None),
+        "a quarantine selects no source, cutoff or digest and creates no lineage"
+    );
+    assert_eq!(fenced_epoch, spine_prior().owner_epoch, "the fence's epoch");
+    assert_eq!(
+        discovery_window_ticks,
+        decided_at - fence_at,
+        "from the fence's arrival to the window's close"
+    );
+    assert!(!loss_uncertainty, "a quarantine discards no suffix");
+    // Every copy F1 queried, by its node: nodes 1 and 2 answered with the shared head, node 3
+    // with the digest nobody else holds, and node 4 (the prior owner, no survivor placed) could
+    // not answer, so it is unreachable and reports nothing.
+    let forked = rdb_core::contracts::digest::Digest([0xd1; 32]);
+    let placed: Vec<NodeId> = plan.survivors.iter().map(|(node, _, _)| *node).collect();
+    assert_eq!(placed, vec![NodeId(1), NodeId(2), DISAGREEING]);
+    let expected: Vec<QueriedSource> = support::rf3_config()
+        .members
+        .iter()
+        .map(|member| {
+            let reported = placed.contains(&member.node).then(|| {
+                let digest = if member.node == DISAGREEING {
+                    forked
+                } else {
+                    spine_digest(SPINE_HEAD)
+                };
+                (Generation(1), Seq(SPINE_HEAD), digest)
+            });
+            QueriedSource {
+                node: member.node,
+                boot: BOOT,
+                role: member.role,
+                reachable: reported.is_some(),
+                reported_generation: reported.map(|(generation, _, _)| generation),
+                reported_seq: reported.map(|(_, seq, _)| seq),
+                reported_digest: reported.map(|(_, _, digest)| digest),
+            }
+        })
+        .collect();
+    assert_eq!(queried_sources, expected);
+    assert_eq!(
+        queried_sources.len(),
+        4,
+        "every member of the pin was queried"
+    );
+    // The guard cell this line hits.
+    assert_eq!(
+        RECOVERY_MODES[recovery_mode_cell(mode)],
+        RecoveryMode::Quarantine
+    );
+
+    // The quarantine: one line, at the position, naming each side by the node F1's plan places
+    // it on (copy n is on node n + 1 in the spine).
     let node_of = |copy: CopyId| NodeId(u32::from(copy.0) + 1);
     let quarantines: Vec<_> = trace
         .events
@@ -6941,18 +7077,680 @@ fn recording_a_recovery_digest_disagreement_is_a_quarantine_line_naming_both_sid
     );
     assert!(quarantines[0].4.contains(&DISAGREEING));
 
-    // The held clause, as a fact about the trace (V-R29).
-    let decisions = trace
-        .events
-        .iter()
-        .filter(|event| matches!(event.kind, TraceKind::RecoveryDecision { .. }))
-        .count();
-    assert_eq!(
-        decisions, 0,
-        "a recovery_decision is now recorded on a quarantine: write M7V-80 in full"
-    );
-
+    // INV-LIN: nothing fires. `Proven` is the parked clause below.
     let inv_lin = Oracle::new().judge(&trace).verdict(Invariant::Lin).clone();
     tracing::info!(?inv_lin, "INV-LIN on the quarantined spine");
     assert!(!matches!(inv_lin, Verdict::Violated(_)), "{inv_lin:?}");
+    parked(
+        "M7V-80",
+        PackageId::I1,
+        "INV-LIN Proven (the recorder writes no lineage_root, so INV-LIN never arms on a \
+         recorded run), the BoundaryId::Divergence cell (no fault_injected line) and the \
+         AckRejectReason::Diverged cell (no rejected-ack line; a quarantine builds no receiver)",
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// Recorder truth: M7V-96..M7V-101 (tester-sim-hooks F1, MATERIAL). Each recorded line is checked
+// against the engine's own state, never against the recorder's inputs, so a recorder that logs
+// something that did not happen is killed by a row rather than by a probe. Adopted from the
+// tester's probes p1, p1b, p3, p4, p5, p7 and p8 (`probe_tail.rs`, md5 b542b3d2).
+// ------------------------------------------------------------------------------------------
+
+/// A finished run, with each node's engine as it stood when the loop stopped.
+struct TruthRun {
+    trace: Trace,
+    engines: std::collections::BTreeMap<NodeId, rdb_sim::storage::memory::MemoryEngine>,
+    err: Option<String>,
+}
+
+/// Run `plan` to its end, keeping each engine before `finish` consumes the runner.
+fn truth_run(plan: &RunPlan) -> TruthRun {
+    let mut runner = Runner::new(plan).expect("a runner");
+    let err = runner.run(plan.limits).err().map(|e| format!("{e:?}"));
+    let engines = (1..=4)
+        .filter_map(|n| {
+            runner
+                .dispatcher()
+                .engine(NodeId(n))
+                .map(|engine| (NodeId(n), engine.clone()))
+        })
+        .collect();
+    let trace = runner.finish().expect("a trace");
+    TruthRun {
+        trace,
+        engines,
+        err,
+    }
+}
+
+/// The digest `engine` holds at `(generation, seq)`, or the root where it holds no record.
+fn truth_digest(
+    engine: &rdb_sim::storage::memory::MemoryEngine,
+    generation: Generation,
+    seq: Seq,
+) -> rdb_core::contracts::digest::Digest {
+    engine
+        .history_at(PartitionId(1), generation, seq)
+        .and_then(|(record, _)| {
+            rdb_core::contracts::envelope::ReplicationEnvelope::decode(&record).ok()
+        })
+        .map_or(rdb_core::contracts::digest::Digest::ROOT, |envelope| {
+            envelope.record_digest
+        })
+}
+
+/// Every `Applied` `BatchApply` names a record its node's engine holds, with those exact
+/// digests. Returns `(applied, failed)` line counts.
+fn truth_applies(run: &TruthRun) -> (usize, usize) {
+    use rdb_core::contracts::trace::ApplyOutcome;
+    let (mut applied, mut failed) = (0, 0);
+    for event in &run.trace.events {
+        let TraceKind::BatchApply {
+            generation,
+            seq,
+            predecessor_digest,
+            entry_digest,
+            outcome,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        if *outcome != ApplyOutcome::Applied {
+            failed += 1;
+            continue;
+        }
+        let (record, _) = run.engines[&event.node]
+            .history_at(event.partition, *generation, *seq)
+            .unwrap_or_else(|| {
+                panic!(
+                    "event {}: node {} logged Applied g{} s{}, which its engine does not hold",
+                    event.event_id.0, event.node.0, generation.0, seq.0
+                )
+            });
+        let envelope = rdb_core::contracts::envelope::ReplicationEnvelope::decode(&record)
+            .expect("an envelope");
+        assert_eq!(
+            (envelope.prev_digest, envelope.record_digest),
+            (*predecessor_digest, *entry_digest),
+            "event {}: BatchApply digests differ from node {}'s stored record",
+            event.event_id.0,
+            event.node.0
+        );
+        applied += 1;
+    }
+    (applied, failed)
+}
+
+/// Every `Synced` line is at or below its node's final watermark (no crash in these runs, so the
+/// watermark only rises), with the engine's own digest there. Returns `(synced, partial,
+/// failed)` line counts.
+fn truth_syncs(run: &TruthRun) -> (usize, usize, usize) {
+    use rdb_core::contracts::trace::SyncOutcome;
+    let (mut synced, mut partial, mut failed) = (0, 0, 0);
+    for event in &run.trace.events {
+        let TraceKind::DurabilityAdvance {
+            generation,
+            durable_seq,
+            durable_digest,
+            outcome,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        let engine = &run.engines[&event.node];
+        let held = Seq(engine.durable(event.partition, *generation).0);
+        match outcome {
+            SyncOutcome::Synced => {
+                synced += 1;
+                assert!(
+                    *durable_seq <= held,
+                    "event {}: Synced at {} above node {}'s watermark {}",
+                    event.event_id.0,
+                    durable_seq.0,
+                    event.node.0,
+                    held.0
+                );
+                assert_eq!(
+                    *durable_digest,
+                    truth_digest(engine, *generation, *durable_seq),
+                    "event {}: the durable digest is the engine's",
+                    event.event_id.0
+                );
+            }
+            SyncOutcome::Partial => partial += 1,
+            SyncOutcome::Failed => failed += 1,
+        }
+    }
+    (synced, partial, failed)
+}
+
+/// Every `ReplicationAck` is accepted, `Buffered`, recorded at its acker under the acker's boot,
+/// and names a position that node already `Applied` (not merely attempted) with that digest.
+/// Unless `allow_zero`, no ack is at seq 0: in these runs nothing replies before its first
+/// commit, so an ack at 0 is not a real `Accepted` reply (the tester's zero-seq check, which is
+/// what catches a refusal logged as an ack on a run-level trace; M7V-100 catches it directly).
+/// Returns the ack count.
+fn truth_acks(run: &TruthRun, allow_zero: bool) -> usize {
+    use rdb_core::contracts::trace::{ApplyOutcome, DurabilityClass};
+    let mut acks = 0;
+    for event in &run.trace.events {
+        let TraceKind::ReplicationAck {
+            from_node,
+            peer_boot,
+            contiguous_seq,
+            contiguous_digest,
+            durability_class,
+            accepted,
+            reject_reason,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        acks += 1;
+        assert!(*accepted && reject_reason.is_none());
+        assert_eq!(*durability_class, DurabilityClass::Buffered);
+        assert_eq!(
+            *from_node, event.node,
+            "event {}: at the acker",
+            event.event_id.0
+        );
+        assert_eq!(*peer_boot, event.boot);
+        assert!(
+            allow_zero || contiguous_seq.0 > 0,
+            "event {}: node {} logged an accepted ack at seq 0",
+            event.event_id.0,
+            event.node.0
+        );
+        if contiguous_seq.0 == 0 {
+            continue;
+        }
+        let applied = run.trace.events.iter().any(|line| {
+            line.event_id < event.event_id
+                && line.node == event.node
+                && matches!(
+                    line.kind,
+                    TraceKind::BatchApply { seq, entry_digest, outcome: ApplyOutcome::Applied, .. }
+                        if seq == *contiguous_seq && entry_digest == *contiguous_digest
+                )
+        });
+        assert!(
+            applied,
+            "event {}: node {} acked seq {} with no earlier Applied BatchApply of it",
+            event.event_id.0, event.node.0, contiguous_seq.0
+        );
+    }
+    acks
+}
+
+/// Every tick-0 `BatchApply` (a preload) carries the role its node holds in `plan`'s pin.
+/// Returns how many were checked.
+fn truth_preload_roles(plan: &RunPlan, run: &TruthRun) -> usize {
+    let mut checked = 0;
+    for event in &run.trace.events {
+        let TraceKind::BatchApply { role, .. } = &event.kind else {
+            continue;
+        };
+        if event.logical_tick != 0 {
+            continue;
+        }
+        let pinned = plan
+            .cluster
+            .partitions
+            .iter()
+            .filter(|partition| partition.partition == event.partition)
+            .flat_map(|partition| partition.config.members.iter())
+            .find(|member| member.node == event.node)
+            .map_or(ReplicaRole::RegularSecondary, |member| member.role);
+        assert_eq!(
+            *role, pinned,
+            "event {}: preload role on node {}",
+            event.event_id.0, event.node.0
+        );
+        checked += 1;
+    }
+    checked
+}
+
+/// Applies, syncs and acks against engine state, and no oracle violation on a correct kernel's
+/// recorded run.
+fn truth_all(name: &str, run: &TruthRun) {
+    let applies = truth_applies(run);
+    let syncs = truth_syncs(run);
+    let acks = truth_acks(run, false);
+    let report = support::oracle::Oracle::new().judge(&run.trace);
+    tracing::info!(name, err = ?run.err, ?applies, ?syncs, acks, "recorder truth");
+    assert!(
+        report.violations().is_empty(),
+        "{name}: the oracle found a violation on a correct kernel's run: {:?}",
+        report.violations()
+    );
+}
+
+/// The `DurabilityAdvance` lines on `node` in generation 1, as `(durable_seq, outcome)`.
+fn truth_sync_lines(
+    run: &TruthRun,
+    node: NodeId,
+) -> Vec<(u64, rdb_core::contracts::trace::SyncOutcome)> {
+    run.trace
+        .events
+        .iter()
+        .filter(|event| event.node == node)
+        .filter_map(|event| match &event.kind {
+            TraceKind::DurabilityAdvance {
+                generation: Generation(1),
+                durable_seq,
+                outcome,
+                ..
+            } => Some((durable_seq.0, *outcome)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// M7V-96. A commit that fails is a `Failed` `BatchApply`, never `Applied`, and every ack on the
+/// run rests on an earlier `Applied` line of its seq, so the failed attempt is never acked. The
+/// spine with a planned `WriteFailed` on node 4 (tester probe p3; kills mutant t1, a failed
+/// commit logged `Applied`).
+#[retcd_test]
+fn m7v_96_recording_a_failed_commit_is_a_failed_batch_apply_and_never_acked() {
+    use rdb_core::contracts::trace::ApplyOutcome;
+    support::preamble();
+    let mut plan = spine_plan();
+    plan.storage_ops.push(StorageOp::Fail {
+        node: NodeId(4),
+        fault: StorageFault::WriteFailed,
+    });
+    let run = truth_run(&plan);
+    truth_all("spine + WriteFailed on node 4", &run);
+    let on_4: Vec<_> = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| event.node == NodeId(4))
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                generation,
+                seq,
+                outcome,
+                ..
+            } => Some((generation.0, seq.0, *outcome)),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?on_4, "node 4's batch_apply lines");
+    assert!(
+        on_4.iter().any(|line| line.2 == ApplyOutcome::Failed),
+        "the planned WriteFailed is a Failed line: {on_4:?}"
+    );
+}
+
+/// M7V-97. A flush that fails is a `Failed` `DurabilityAdvance` at the watermark the engine still
+/// holds, never `Synced`. The spine with a planned `FlushFailed` on node 2 (tester probe p4;
+/// kills mutant t2, a `FlushFailed` sync logged `Synced`).
+#[retcd_test]
+fn m7v_97_recording_a_failed_flush_is_a_failed_durability_advance_never_synced() {
+    use rdb_core::contracts::trace::SyncOutcome;
+    support::preamble();
+    let mut plan = spine_plan();
+    plan.storage_ops.push(StorageOp::Fail {
+        node: PEER,
+        fault: StorageFault::FlushFailed,
+    });
+    let run = truth_run(&plan);
+    truth_all("spine + FlushFailed on node 2", &run);
+    let on_peer = truth_sync_lines(&run, PEER);
+    tracing::info!(?on_peer, "node 2's durability_advance lines");
+    assert_eq!(
+        on_peer.first(),
+        Some(&(0, SyncOutcome::Failed)),
+        "{on_peer:?}"
+    );
+}
+
+/// M7V-98. A `ShortFlush` completes with less durable than was captured, and the line is
+/// `Partial` at the engine's short watermark: the `SyncOutcome` contract says only `Synced`
+/// publishes the captured prefixes and `Partial` is a flush that completed partially (lead
+/// ruling V-R36). The spine with `ShortFlush { through: 1 }` on node 2, whose F1 sync captures
+/// the head at 2 (tester probe p5, finding F3; kills mutant t3, `Synced` at the captured seq).
+#[retcd_test]
+fn m7v_98_recording_a_short_flush_is_partial_at_the_engines_short_watermark() {
+    use rdb_core::contracts::ids::AppliedSeq;
+    use rdb_core::contracts::trace::SyncOutcome;
+    support::preamble();
+    let mut plan = spine_plan();
+    plan.storage_ops.push(StorageOp::ShortFlush {
+        node: PEER,
+        through: AppliedSeq(1),
+    });
+    let run = truth_run(&plan);
+    truth_all("spine + ShortFlush through 1 on node 2", &run);
+    let first = run.trace.events.iter().find_map(|event| match &event.kind {
+        TraceKind::DurabilityAdvance {
+            durable_seq,
+            outcome,
+            captured,
+            ..
+        } if event.node == PEER => Some((durable_seq.0, *outcome, captured.clone())),
+        _ => None,
+    });
+    tracing::info!(?first, "node 2's first durability_advance under ShortFlush");
+    assert_eq!(
+        first,
+        Some((
+            1,
+            SyncOutcome::Partial,
+            vec![(PartitionId(1), Seq(SPINE_HEAD))]
+        )),
+        "captured the head, flushed less, and says so"
+    );
+}
+
+/// One sync of `through` on a bare engine, and the line [`semantic::durability_lines`] writes
+/// for it: `(watermark before, watermark after, line's durable_seq, line's outcome)`.
+fn truth_unit_sync(
+    engine: &mut rdb_sim::storage::memory::MemoryEngine,
+    through: u64,
+) -> (u64, u64, u64, rdb_core::contracts::trace::SyncOutcome) {
+    use rdb_core::contracts::ids::AppliedSeq;
+    use rdb_core::contracts::storage::CapturedPrefix;
+    let (partition, generation) = (PartitionId(1), Generation(1));
+    let captured = vec![CapturedPrefix {
+        partition,
+        generation,
+        through: AppliedSeq(through),
+    }];
+    let before = engine.durable(partition, generation).0;
+    let synced = engine.sync_wal_through(captured.clone());
+    let lines =
+        rdb_sim::harness::semantic::durability_lines(engine, 7, &captured, synced.as_deref());
+    let after = engine.durable(partition, generation).0;
+    let (_, line) = lines
+        .into_iter()
+        .next()
+        .expect("one line per captured prefix");
+    let TraceKind::DurabilityAdvance {
+        durable_seq,
+        outcome,
+        ..
+    } = line
+    else {
+        unreachable!("durability_lines writes DurabilityAdvance")
+    };
+    tracing::info!(
+        through,
+        before,
+        after,
+        durable = durable_seq.0,
+        ?outcome,
+        "unit sync"
+    );
+    (before, after, durable_seq.0, outcome)
+}
+
+/// M7V-99. `durability_lines` over a bare engine names the engine's watermark and the sync's real
+/// outcome, case by case: a first sync through 1 is `Synced` at 1; a `ShortFlush` of a capture
+/// through 2 is `Partial` at its short watermark 1 (V-R36); the whole sync is `Synced` at 2; a
+/// repeat, which moves nothing, is still `Synced` at 2 (tester F2: `Synced` names the watermark,
+/// not a movement); a capture below the watermark is `Synced` at the engine's 2, not the
+/// captured 1; a capture above what was applied gets only 2 and is `Partial` (V-R36);
+/// `FalseDurable` is `Partial` at the unmoved watermark; `FlushFailed` is `Failed` (tester probe
+/// p7; kills mutants t2 and t3).
+#[retcd_test]
+fn m7v_99_recording_a_bare_engines_syncs_names_its_watermark_and_the_real_outcome() {
+    use rdb_core::contracts::ids::AppliedSeq;
+    use rdb_core::contracts::trace::SyncOutcome::{Failed, Partial, Synced};
+    use rdb_sim::storage::memory::MemoryEngine;
+    support::preamble();
+    let mut engine = MemoryEngine::new(PEER);
+    for batch in spine_history().batches {
+        engine.commit(batch).expect("commit");
+    }
+    assert_eq!(truth_unit_sync(&mut engine, 1), (0, 1, 1, Synced), "first");
+    engine
+        .inject(StorageOp::ShortFlush {
+            node: PEER,
+            through: AppliedSeq(1),
+        })
+        .expect("planned");
+    assert_eq!(truth_unit_sync(&mut engine, 2), (1, 1, 1, Partial), "short");
+    assert_eq!(truth_unit_sync(&mut engine, 2), (1, 2, 2, Synced), "whole");
+    assert_eq!(truth_unit_sync(&mut engine, 2), (2, 2, 2, Synced), "repeat");
+    assert_eq!(
+        truth_unit_sync(&mut engine, 1),
+        (2, 2, 2, Synced),
+        "below the watermark"
+    );
+    assert_eq!(
+        truth_unit_sync(&mut engine, 9),
+        (2, 2, 2, Partial),
+        "above applied"
+    );
+    engine
+        .inject(StorageOp::FalseDurable {
+            node: PEER,
+            through: AppliedSeq(5),
+        })
+        .expect("planned");
+    assert_eq!(
+        truth_unit_sync(&mut engine, 2),
+        (2, 2, 2, Partial),
+        "false durable"
+    );
+    engine
+        .inject(StorageOp::Fail {
+            node: PEER,
+            fault: StorageFault::FlushFailed,
+        })
+        .expect("planned");
+    assert_eq!(truth_unit_sync(&mut engine, 2), (2, 2, 2, Failed), "failed");
+}
+
+/// A frame carrying `body`, as R1 on node 3 would send it.
+fn truth_frame(body: Bytes) -> Frame {
+    Frame {
+        id: MessageId(1),
+        protocol: rdb_core::contracts::version::ENVELOPE_VERSION,
+        config: ConfigVersion(1),
+        sender: spine_prior(),
+        body,
+    }
+}
+
+/// M7V-100. Only an `Accepted` reply is a `ReplicationAck`, and it carries that ack verbatim.
+///
+/// Two surfaces. `semantic::ack_line` classifies every reply kind and an append body (tester
+/// probe p8). And `Semantic::record` is driven with R1's replies from node 3 **while node 3 holds a
+/// real receiver** (the rebuild's copy 2): every refusal and the other non-acks write no line,
+/// and the one `Accepted` writes one. That second half is the deterministic kill for mutant t4
+/// (a refusal logged as the receiver's current ack), which the run-level rows catch only by the
+/// zero-seq heuristic (tester F1's closure).
+#[retcd_test]
+fn m7v_100_recording_only_an_accepted_reply_is_a_replication_ack() {
+    use rdb_core::contracts::envelope::{AppendAck, AppendOutcome, AppendReject, ReplicaProgress};
+    use rdb_core::contracts::event::Event;
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, ReceivedSeq};
+    use rdb_core::contracts::trace::DurabilityClass;
+    use rdb_core::contracts::transport::SendEffect;
+    use rdb_core::replication::wire::encode_reply;
+    use rdb_sim::harness::semantic::{ack_line, Semantic};
+    support::preamble();
+    let ack = AppendAck {
+        partition: PartitionId(1),
+        generation: Generation(2),
+        owner_epoch: OwnerEpoch(3),
+        config_version: ConfigVersion(4),
+        from: NodeId(3),
+        boot: BootId(5),
+        role: ReplicaRole::Shadow,
+        progress: ReplicaProgress {
+            received: ReceivedSeq(9),
+            buffered_applied: AppliedSeq(7),
+            durable: DurableSeq(6),
+        },
+        digest_at_buffered: spine_digest(1),
+    };
+    let accepted = truth_frame(encode_reply(&AppendOutcome::Accepted(ack)));
+    assert_eq!(
+        ack_line(NodeId(1), &accepted),
+        Some(TraceKind::ReplicationAck {
+            from_node: NodeId(3),
+            to_node: NodeId(1),
+            peer_role: ReplicaRole::Shadow,
+            peer_boot: BootId(5),
+            config_version: ConfigVersion(4),
+            generation: Generation(2),
+            owner_epoch: OwnerEpoch(3),
+            contiguous_seq: Seq(7),
+            contiguous_digest: spine_digest(1),
+            durability_class: DurabilityClass::Buffered,
+            accepted: true,
+            reject_reason: None,
+        })
+    );
+    let others: Vec<Frame> = [
+        AppendOutcome::AlreadyHave,
+        AppendOutcome::Busy {
+            accepted_through: Seq(3),
+        },
+        AppendOutcome::ProbeDigestAt { seq: Seq(2) },
+        AppendOutcome::Rejected(AppendReject::IncompatibleVersion),
+    ]
+    .iter()
+    .map(|outcome| truth_frame(encode_reply(outcome)))
+    .collect();
+    for frame in &others {
+        assert_eq!(ack_line(NodeId(1), frame), None, "{frame:?}");
+    }
+    // An append body, not a reply, is never an ack either.
+    let batch = spine_history().batches[0].clone();
+    let (record, _) = rdb_sim::storage::history::history_writes(&batch, Seq(1)).expect("a record");
+    assert_eq!(ack_line(NodeId(1), &truth_frame(record)), None);
+
+    // `Semantic::record`, against a dispatcher where node 3 holds copy 2's receiver.
+    let plan = rebuild_plan(Vec::new());
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the rebuild runs");
+    tracing::info!(stop = ?report.stop, "rebuild ran");
+    let dispatcher = runner.dispatcher();
+    assert!(
+        dispatcher
+            .replication()
+            .receiver(NodeId(3), PartitionId(1))
+            .is_some(),
+        "node 3 holds a receiver, so a forged ack would have one to copy"
+    );
+    let site = Site {
+        at: Tick(1),
+        node: NodeId(3),
+        boot: BOOT,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+    };
+    let event = Event {
+        id: EventId(1),
+        at: Tick(1),
+        node: NodeId(3),
+        boot: BOOT,
+        partition: PartitionId(1),
+        correlation: CorrelationId(1),
+        kind: EventKind::Timer(rdb_core::contracts::time::TimerFired {
+            id: TimerId(1),
+            version: TimerVersion(0),
+            scheduled_at: Tick(1),
+        }),
+    };
+    let send = |frame: &Frame| Effect {
+        correlation: CorrelationId(1),
+        from: ModuleName::Replication,
+        partition: PartitionId(1),
+        kind: EffectKind::Send(SendEffect::Unicast {
+            to: NODE,
+            frame: frame.clone(),
+        }),
+    };
+    let mut recorder = Recorder::new();
+    recorder
+        .begin(header(Provenance::Authored {
+            case: String::from("m7v-100"),
+        }))
+        .expect("a header");
+    let mut semantic = Semantic::default();
+    let refusals: Vec<Effect> = others.iter().map(send).collect();
+    semantic
+        .record(
+            &mut recorder,
+            site,
+            ModuleName::Replication,
+            &event,
+            &refusals,
+            dispatcher,
+            &Budgets::SPEC_DEFAULTS,
+        )
+        .expect("recorded");
+    assert_eq!(
+        recorder.events().len(),
+        0,
+        "no reply but Accepted is a line: {:?}",
+        recorder.events()
+    );
+    semantic
+        .record(
+            &mut recorder,
+            site,
+            ModuleName::Replication,
+            &event,
+            &[send(&accepted)],
+            dispatcher,
+            &Budgets::SPEC_DEFAULTS,
+        )
+        .expect("recorded");
+    let kinds: Vec<&TraceKind> = recorder.events().iter().map(|event| &event.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![&ack_line(NODE, &accepted).expect("an ack")],
+        "the Accepted reply is one line, verbatim"
+    );
+}
+
+/// M7V-101. On the spine and on the rebuild, every recorded line matches engine state: each
+/// `Applied` apply is a record the engine holds with those digests, each `Synced` sync is at or
+/// below the engine's watermark with its digest, each ack rests on an earlier `Applied` apply
+/// and none is at seq 0, and each preload carries its node's pinned role (tester probes p1 and
+/// p1b; kills mutant t5, a preload logged `Primary` on a secondary, and t4 by the zero-seq check).
+#[retcd_test]
+fn m7v_101_recording_every_line_matches_engine_state_on_the_spine_and_the_rebuild() {
+    support::preamble();
+    let rebuild = truth_run(&rebuild_plan(Vec::new()));
+    truth_all("rebuild", &rebuild);
+    assert!(rebuild.err.is_none(), "{:?}", rebuild.err);
+    let (applied, _) = truth_applies(&rebuild);
+    assert!(
+        applied > 0 && truth_acks(&rebuild, false) > 0,
+        "lines to check"
+    );
+
+    let plan = spine_plan();
+    let spine = truth_run(&plan);
+    truth_all("spine", &spine);
+    assert!(spine.err.is_none(), "{:?}", spine.err);
+    let roles = truth_preload_roles(&plan, &spine);
+    tracing::info!(roles, "preload lines role-checked");
+    assert!(roles > 0, "the spine preloads");
+    // The pin gives the survivors three roles; a check that saw only one would pass a mutant
+    // that forces every preload to it.
+    let seen: std::collections::BTreeSet<ReplicaRole> = spine
+        .trace
+        .events
+        .iter()
+        .filter(|event| event.logical_tick == 0)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply { role, .. } => Some(*role),
+            _ => None,
+        })
+        .collect();
+    assert!(seen.len() > 1, "more than one preload role: {seen:?}");
 }

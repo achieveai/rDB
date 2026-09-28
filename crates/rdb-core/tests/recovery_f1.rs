@@ -4818,3 +4818,803 @@ fn m7b_138_holder_that_cannot_lead_transfers_under_a_credential_naming_the_holde
         vec![cas(CONTROL_REV, C)]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// B-R74 rows (plan §9; Gautam 2026-09-27): a fresh fence after commit re-enters recovery
+// (M7B-227..229). A fence is newer when the root it would commit is newer than the one this
+// instance committed: `new_root(proof).generation > committed.new_generation`, which is
+// `proof.prior_generation >= committed.new_generation`.
+// ---------------------------------------------------------------------------------------------
+
+/// When the second run is fenced. Past every tick the first run used.
+const REFENCE_AT: u64 = 90_000;
+
+/// A later takeover's fence: it proves the root the first run committed, (8, 2), and read control
+/// after that commit landed at revision 9 (or 11, once activated).
+fn later_fence() -> FencingProof {
+    FencingProof {
+        control_revision: Revision(12),
+        decision_tick: Tick(REFENCE_AT),
+        ..refence()
+    }
+}
+
+/// Rebuilding, with every rebuild sync answered: the activation CAS is in flight (timer at v3).
+fn activation_proposed() -> F1 {
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    for copy in [A, B, C] {
+        f1.rec(4_100, durable(copy, 20, dg(0, 20)));
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    f1
+}
+
+/// Every phase at or after commit, reached the way a run reaches it, and the timer version the
+/// run last armed there.
+fn after_commit() -> Vec<(&'static str, F1, u64)> {
+    let mut active = proposing(20);
+    active.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(active.phase(), RecoveryPhase::Committed);
+    let rebuilding = lone_committed();
+    assert_eq!(rebuilding.phase(), RecoveryPhase::Rebuilding);
+    let mut activated = activation_proposed();
+    activated.step(4_200, cas_result(CasOutcome::Committed(Revision(11))));
+    assert_eq!(activated.phase(), RecoveryPhase::Committed);
+    vec![
+        ("committed active", active, 2),
+        ("rebuilding", rebuilding, 2),
+        ("activation proposed", activation_proposed(), 3),
+        ("active after rebuild", activated, 3),
+    ]
+}
+
+/// The version of the last timer the run armed.
+fn armed_version(log: &[EffectKind]) -> u64 {
+    log.iter()
+        .rev()
+        .find_map(|e| match e {
+            EffectKind::Timer(TimerEffect::Arm { version, .. }) => Some(version.0),
+            _ => None,
+        })
+        .expect("a timer was armed")
+}
+
+/// `effects` without its timer arms: two instances number their timers differently.
+fn untimed(effects: &[EffectKind]) -> Vec<EffectKind> {
+    effects
+        .iter()
+        .filter(|e| !matches!(e, EffectKind::Timer(_)))
+        .cloned()
+        .collect()
+}
+
+/// A fenced second run, driven to its commit: every copy on the new root at 30, the window
+/// closes, all three prove 30, the CAS lands at 14. Returns each step's effects, untimed, and the
+/// result.
+fn second_run(f1: &mut F1) -> (Vec<Vec<EffectKind>>, RecoveryResult) {
+    let t = REFENCE_AT;
+    let version = armed_version(&f1.log);
+    let mut steps = Vec::new();
+    for copy in [A, B, C] {
+        steps.push(f1.report(t + 10, on_new_root(copy, 30)));
+    }
+    steps.push(f1.step(t + WINDOW, fired(version)));
+    for copy in [A, B, C] {
+        steps.push(f1.rec(t + WINDOW + 100, durable(copy, 30, dg(0, 30))));
+    }
+    let commit = f1.step(
+        t + WINDOW + 200,
+        cas_result(CasOutcome::Committed(Revision(14))),
+    );
+    let result = recovered(&commit);
+    steps.push(commit);
+    (steps.iter().map(|s| untimed(s)).collect(), result)
+}
+
+/// The second run on a fresh instance: what the re-entered run must equal.
+fn fresh_second_run() -> (Vec<Vec<EffectKind>>, RecoveryResult) {
+    let mut f1 = F1::new();
+    f1.rec(REFENCE_AT, RecoveryEvent::Plan(Box::new(replan())));
+    f1.rec(
+        REFENCE_AT,
+        RecoveryEvent::FenceProven(Box::new(later_fence())),
+    );
+    second_run(&mut f1)
+}
+
+/// M7B-227 (B-R74, Gautam 2026-09-27; D §5.1 re-entry edge): in `Committed`, `Rebuilding` and
+/// `Committed` after activation (every phase after commit with no CAS of its own in flight), a
+/// replacement plan is held and a fence newer than the committed root starts a new recovery
+/// exactly as `Idle` does. Nothing of the first run reaches the second: its effects and its
+/// result equal a fresh instance's. Update (B-R74b): `ActivationProposed` holds the fence
+/// instead (M7B-230..232).
+#[retcd_test]
+fn m7b_227_a_newer_fence_after_commit_re_enters_recovery() {
+    let (fresh_steps, fresh_result) = fresh_second_run();
+    assert_eq!(fresh_result.fenced_prior, later_fence());
+    assert_eq!(fresh_result.new_generation, Generation(9));
+    assert_eq!(
+        fresh_result.retained_status_map.predecessor_generation,
+        Generation(8)
+    );
+    for (label, mut f1, version) in after_commit() {
+        if label == "activation proposed" {
+            continue; // held, not entered: M7B-230
+        }
+        let phase = f1.phase();
+        assert_eq!(
+            f1.rec(REFENCE_AT, RecoveryEvent::Plan(Box::new(replan()))),
+            vec![ign(ReplicaIgnoreReason::Recorded)],
+            "{label}: the plan is held"
+        );
+        assert_eq!(f1.phase(), phase, "{label}: a plan is held, not acted on");
+        assert_eq!(
+            f1.rec(
+                REFENCE_AT,
+                RecoveryEvent::FenceProven(Box::new(later_fence()))
+            ),
+            vec![
+                r(RecoveryEffect::QueryInventory {
+                    copies: vec![A, B, C]
+                }),
+                arm(version + 1, REFENCE_AT + WINDOW),
+            ],
+            "{label}: the first effect vector is the one Idle gives"
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Fenced, "{label}");
+        assert_eq!(f1.module.rebuild_required(), None, "{label}: no rebuild");
+        let (steps, result) = second_run(&mut f1);
+        assert_eq!(steps, fresh_steps, "{label}: the second run is a fresh one");
+        assert_eq!(
+            result, fresh_result,
+            "{label}: nothing of the first run leaks"
+        );
+        assert_eq!(f1.phase(), RecoveryPhase::Committed, "{label}");
+    }
+}
+
+/// M7B-228 (B-R74, Gautam 2026-09-27): a fence whose root is not newer than the committed one is
+/// ignored `OutOfPhase` in every phase after commit, and nothing moves, even when the held plan
+/// matches it. Generation decides, not the control revision.
+#[retcd_test]
+fn m7b_228_a_stale_or_equal_fence_after_commit_is_ignored() {
+    let fence = |proof: FencingProof| RecoveryEvent::FenceProven(Box::new(proof));
+    let out_of_phase = vec![ign(ReplicaIgnoreReason::OutOfPhase)];
+    let read_later = FencingProof {
+        control_revision: Revision(50),
+        ..proof()
+    };
+    let older = FencingProof {
+        prior_generation: Generation(6),
+        prior_owner_epoch: OwnerEpoch(0),
+        control_revision: Revision(50),
+        ..proof()
+    };
+    let older_plan = RecoveryPlan {
+        anchor: LineageAnchor {
+            lineage: Lineage {
+                partition: PARTITION,
+                generation: Generation(6),
+                owner_epoch: OwnerEpoch(0),
+            },
+            ..anchor()
+        },
+        ..plan(&[])
+    };
+    for (label, mut f1, _) in after_commit() {
+        let phase = f1.phase();
+        let before = f1.module.clone();
+        assert_eq!(
+            f1.rec(REFENCE_AT, fence(proof())),
+            out_of_phase,
+            "{label}: the fence this run committed on, replayed; the held plan matches it"
+        );
+        assert_eq!(f1.module, before, "{label}: nothing moved");
+        assert_eq!(
+            f1.rec(REFENCE_AT, fence(read_later.clone())),
+            out_of_phase,
+            "{label}: an equal root read later is not newer"
+        );
+        assert_eq!(f1.module, before, "{label}: nothing moved");
+        f1.rec(
+            REFENCE_AT,
+            RecoveryEvent::Plan(Box::new(older_plan.clone())),
+        );
+        let held = f1.module.clone();
+        assert_eq!(
+            f1.rec(REFENCE_AT, fence(older.clone())),
+            out_of_phase,
+            "{label}: an older root, its plan held"
+        );
+        assert_eq!(f1.module, held, "{label}: nothing moved");
+        assert_eq!(f1.phase(), phase, "{label}");
+    }
+}
+
+/// M7B-229 (B-R74, Gautam 2026-09-27): what the first run left in flight (its timers, and a
+/// rebuild catch-up and sync answer) reaches the second run as input to the second run's own
+/// phase and is judged there alone: stale timers, out-of-phase events, and a proof below the new
+/// cutoff that proves nothing and displaces nothing. The second run commits exactly what a fresh
+/// instance commits. Update (B-R74b): the fixture is `Rebuilding` with every rebuild sync
+/// outstanding; from `ActivationProposed` a fence is held until the activation answer, so no
+/// answer of the first run's can arrive after re-entry (M7B-230).
+#[retcd_test]
+fn m7b_229_a_late_event_from_the_first_run_does_not_touch_the_second() {
+    let (_, fresh_result) = fresh_second_run();
+    let t = REFENCE_AT;
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    f1.rec(t, RecoveryEvent::Plan(Box::new(replan())));
+    f1.rec(t, RecoveryEvent::FenceProven(Box::new(later_fence())));
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+
+    let out_of_phase = vec![ign(ReplicaIgnoreReason::OutOfPhase)];
+    assert_eq!(
+        f1.rec(t + 5, durable(A, 20, dg(0, 20))),
+        out_of_phase,
+        "a rebuild sync's answer"
+    );
+    assert_eq!(
+        f1.rec(t + 5, caught_up(C, 20, dg(0, 20))),
+        out_of_phase,
+        "a rebuild catch-up"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+
+    for copy in [A, B, C] {
+        f1.report(t + 10, on_new_root(copy, 30));
+    }
+    for version in 1..=3 {
+        assert_eq!(
+            f1.step(t + WINDOW, fired(version)),
+            vec![ign(ReplicaIgnoreReason::StaleTimer)],
+            "the first run's timer v{version}, due by the clock"
+        );
+    }
+    assert_eq!(f1.phase(), RecoveryPhase::Collecting);
+    let close = f1.step(t + WINDOW, fired(4));
+    assert!(has_selected(&close), "{close:?}");
+    assert_eq!(f1.phase(), RecoveryPhase::Barrier);
+
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(
+        f1.rec(t + WINDOW + 100, durable(A, 30, dg(0, 30))),
+        not_durable
+    );
+    assert_eq!(
+        f1.rec(t + WINDOW + 101, durable(A, 20, dg(0, 20))),
+        not_durable,
+        "the first run's sync answer proves nothing at 30"
+    );
+    assert_eq!(
+        f1.rec(t + WINDOW + 102, durable(B, 30, dg(0, 30))),
+        not_durable
+    );
+    let proposed = f1.rec(t + WINDOW + 103, durable(C, 30, dg(0, 30)));
+    assert!(
+        matches!(
+            proposed.as_slice(),
+            [EffectKind::Control(ControlEffect::Cas {
+                expected: Some(Revision(12)),
+                ..
+            })]
+        ),
+        "A's proof at 30 still stands: {proposed:?}"
+    );
+    let result = recovered(&f1.step(
+        t + WINDOW + 200,
+        cas_result(CasOutcome::Committed(Revision(14))),
+    ));
+    assert_eq!(
+        result, fresh_result,
+        "the second run commits what a fresh one does"
+    );
+    assert!(
+        !f1.log.iter().any(|e| matches!(
+            e,
+            EffectKind::Kernel(KernelEffect::Recovery(
+                RecoveryEffect::RebuildStalled { .. }
+            ))
+        )),
+        "the first run's rebuild never stalls into the second"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// B-R74b rows (plan §9): while this run's activation CAS is in flight a newer fence is held, and
+// re-enters only once the activation exchange has ended (M7B-230..232).
+// ---------------------------------------------------------------------------------------------
+
+/// A fence newer than [`later_fence`]: a peer's recovery committed (9, 3), and a later takeover
+/// fenced it, reading control at revision 20.
+fn newest_fence() -> FencingProof {
+    FencingProof {
+        prior_generation: Generation(9),
+        prior_owner_epoch: OwnerEpoch(3),
+        control_revision: Revision(20),
+        ..later_fence()
+    }
+}
+
+/// A plan anchored on (9, 3): the one [`newest_fence`] proves, and [`later_fence`] does not.
+fn newest_plan() -> RecoveryPlan {
+    RecoveryPlan {
+        anchor: LineageAnchor {
+            lineage: Lineage {
+                partition: PARTITION,
+                generation: Generation(9),
+                owner_epoch: OwnerEpoch(3),
+            },
+            base_seq: Seq(25),
+            base_digest: dg(0, 25),
+        },
+        ..plan(&[])
+    }
+}
+
+/// [`activation_proposed`], with [`replan`] held and [`later_fence`] held behind the activation.
+fn held_behind_activation() -> F1 {
+    let mut f1 = activation_proposed();
+    f1.rec(REFENCE_AT, RecoveryEvent::Plan(Box::new(replan())));
+    assert_eq!(
+        f1.rec(
+            REFENCE_AT,
+            RecoveryEvent::FenceProven(Box::new(later_fence()))
+        ),
+        vec![ign(ReplicaIgnoreReason::Recorded)],
+        "held, not entered"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    f1
+}
+
+/// The re-entry `fence()` gives at `at`, armed at v4 (the first run armed v3).
+fn re_entry(at: u64) -> Vec<EffectKind> {
+    vec![
+        r(RecoveryEffect::QueryInventory {
+            copies: vec![A, B, C],
+        }),
+        arm(4, at + WINDOW),
+    ]
+}
+
+/// M7B-230 (B-R74b, Gautam 2026-09-27): a newer fence while the activation CAS is in flight is
+/// held (`Recorded`, phase unchanged). When the activation exchange ends, whatever its arm, the
+/// answer is applied to the first run first, and then the held fence re-enters in the same step,
+/// through the door of the phase the answer left: `Committed` (landed), `Blocked` (`Unknown`), and
+/// `Blocked{OvertakenByPeer}` after a `Conflict` and its re-read (the exchange ends at the re-read,
+/// not at the `Conflict`, so no request of the first run is left outstanding). The second run is a
+/// fresh one. If no answer ever arrives (ADR 0008 item 8, `DropCompletion`), the fence stays held,
+/// which is no worse than before B-R74, when it was ignored; no timer bounds it.
+#[retcd_test]
+fn m7b_230_a_newer_fence_behind_an_activation_waits_for_its_answer() {
+    let (fresh_steps, fresh_result) = fresh_second_run();
+    let t = REFENCE_AT;
+
+    let mut f1 = held_behind_activation();
+    let landed = f1.step(t, cas_result(CasOutcome::Committed(Revision(11))));
+    let active = recovered(&landed);
+    assert_eq!(active.mode, PartitionMode::Active);
+    assert_eq!(active.committed.revision, Revision(11));
+    let mut expected = vec![EffectKind::Kernel(KernelEffect::Recovered(Box::new(
+        active,
+    )))];
+    expected.extend(re_entry(t));
+    assert_eq!(landed, expected, "the first run's Recovered, then re-entry");
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+    let (steps, result) = second_run(&mut f1);
+    assert_eq!(steps, fresh_steps, "landed: the second run is a fresh one");
+    assert_eq!(result, fresh_result, "landed");
+
+    let mut f1 = held_behind_activation();
+    let mut expected = vec![block(BlockReason::ControlUnknown)];
+    expected.extend(re_entry(t));
+    assert_eq!(f1.step(t, cas_result(CasOutcome::Unknown)), expected);
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+    let (steps, result) = second_run(&mut f1);
+    assert_eq!(steps, fresh_steps, "unknown: the second run is a fresh one");
+    assert_eq!(result, fresh_result, "unknown");
+
+    let mut f1 = held_behind_activation();
+    assert_eq!(
+        f1.step(
+            t,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(10),
+            })
+        ),
+        vec![EffectKind::Control(ControlEffect::Get {
+            key: ControlKey::Partition(PARTITION)
+        })],
+        "the re-read is the first run's; the fence stays held"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let mut expected = vec![block(BlockReason::OvertakenByPeer)];
+    expected.extend(re_entry(t + 1));
+    assert_eq!(
+        f1.step(t + 1, found(peer.encode())),
+        expected,
+        "read at 6, the floor is 6; the held fence read 12"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+/// M7B-231 (B-R74b, Gautam 2026-09-27): while held, a newer fence replaces the held one; one
+/// not newer than the held fence, or than the committed root, is ignored `OutOfPhase` and moves
+/// nothing. The fence that re-enters is the newest: only it proves the plan held.
+#[retcd_test]
+fn m7b_231_a_held_fence_is_replaced_only_by_a_newer_one() {
+    let fence = |proof: FencingProof| RecoveryEvent::FenceProven(Box::new(proof));
+    let out_of_phase = vec![ign(ReplicaIgnoreReason::OutOfPhase)];
+    let mut f1 = held_behind_activation();
+    assert_eq!(
+        f1.rec(REFENCE_AT + 1, RecoveryEvent::Plan(Box::new(newest_plan()))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        f1.rec(REFENCE_AT + 2, fence(newest_fence())),
+        vec![ign(ReplicaIgnoreReason::Recorded)],
+        "a newer fence replaces the held one"
+    );
+    let held = f1.module.clone();
+    let read_later = FencingProof {
+        control_revision: Revision(40),
+        ..later_fence()
+    };
+    for (why, stale) in [
+        ("older than the held fence", later_fence()),
+        ("older than the held fence, read later", read_later),
+        (
+            "equal to the held fence, read later",
+            FencingProof {
+                control_revision: Revision(40),
+                ..newest_fence()
+            },
+        ),
+        ("the first run's own fence", proof()),
+    ] {
+        assert_eq!(f1.rec(REFENCE_AT + 3, fence(stale)), out_of_phase, "{why}");
+        assert_eq!(f1.module, held, "{why}: nothing moved");
+    }
+    let t = REFENCE_AT + 50;
+    let landed = f1.step(t, cas_result(CasOutcome::Committed(Revision(11))));
+    assert_eq!(
+        landed[1..],
+        re_entry(t)[..],
+        "the newest fence proves the held plan: {landed:?}"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+/// M7B-232 (B-R74b, Gautam 2026-09-27): nothing but the end of the activation exchange lets a
+/// held fence in. Every other F1 input is answered as `ActivationProposed` answers it today, with
+/// no inventory query and no re-armed discovery; a control answer F1 did not ask for is declined.
+#[retcd_test]
+fn m7b_232_no_re_entry_while_a_fence_is_held() {
+    let mut f1 = held_behind_activation();
+    let t = REFENCE_AT + 10;
+    let out_of_phase = vec![ign(ReplicaIgnoreReason::OutOfPhase)];
+    assert_eq!(f1.report(t, on_new_root(A, 30)), out_of_phase);
+    assert_eq!(f1.rec(t, durable(A, 20, dg(0, 20))), out_of_phase);
+    assert_eq!(f1.rec(t, caught_up(C, 20, dg(0, 20))), out_of_phase);
+    assert_eq!(f1.step(t, lose(B)), out_of_phase);
+    for version in 1..=4 {
+        assert_eq!(
+            f1.step(t + WINDOW, fired(version)),
+            vec![ign(ReplicaIgnoreReason::StaleTimer)],
+            "v{version}"
+        );
+    }
+    assert_eq!(
+        f1.rec(t, RecoveryEvent::Plan(Box::new(replan()))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    assert!(!has_query(&f1.at(
+        t,
+        t,
+        EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::StaleOwnerReturned(
+            Box::new(inv(A, 99)),
+        ))),
+    )));
+    f1.declines(
+        t,
+        read_result(ReadOutcome::Found {
+            revision: Revision(10),
+            value: record(A).encode(),
+        }),
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+    let queries = f1
+        .log
+        .iter()
+        .filter(|e| has_query(std::slice::from_ref(*e)))
+        .count();
+    assert_eq!(queries, 1, "only the first run's own inventory query");
+    let t = REFENCE_AT + 50;
+    let landed = f1.step(t, cas_result(CasOutcome::Committed(Revision(11))));
+    assert_eq!(landed[1..], re_entry(t)[..], "the answer lets it in");
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Round 3 (plan §9, M7B-233..237): B-R74d extends B-R74a to the rebuild barrier, and three
+// clauses of B-R74a/B-R74b that were right but unpinned.
+// ---------------------------------------------------------------------------------------------
+
+/// `effects` is exactly one activation CAS expecting `expected`.
+fn is_activation_cas(effects: &[EffectKind], expected: Revision) -> bool {
+    matches!(
+        effects,
+        [EffectKind::Control(ControlEffect::Cas { expected: Some(at), .. })] if *at == expected
+    )
+}
+
+/// The first run `Rebuilding` with its syncs at 20 outstanding; a newer fence re-enters; the
+/// second run, A alone on the new root at 30, commits `ReadOnly` at 14; B catches up at 30, which
+/// pins the second rebuild's point at 30 and syncs every copy there.
+fn second_rebuild() -> F1 {
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    f1.rec(REFENCE_AT, RecoveryEvent::Plan(Box::new(replan())));
+    f1.rec(
+        REFENCE_AT,
+        RecoveryEvent::FenceProven(Box::new(later_fence())),
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+    let t = REFENCE_AT;
+    f1.report(t + 10, on_new_root(A, 30));
+    for copy in [B, C] {
+        f1.rec(t + 10, RecoveryEvent::InventoryFailed { copy });
+    }
+    let version = armed_version(&f1.log);
+    f1.step(t + WINDOW, fired(version));
+    f1.rec(t + WINDOW + 100, durable(A, 30, dg(0, 30)));
+    let result = recovered(&f1.step(
+        t + WINDOW + 200,
+        cas_result(CasOutcome::Committed(Revision(14))),
+    ));
+    assert_eq!(result.mode, PartitionMode::ReadOnly);
+    assert_eq!(result.new_generation, Generation(9));
+    assert_eq!(
+        f1.rec(t + WINDOW + 300, caught_up(B, 30, dg(0, 30))),
+        vec![
+            sync(A, 30),
+            sync(B, 30),
+            sync(C, 30),
+            arm(version + 2, t + WINDOW + 300 + WINDOW)
+        ],
+        "the second rebuild's point is 30"
+    );
+    f1
+}
+
+/// M7B-233 (B-R74d, Gautam 2026-09-27; ledger L-R177hw): a first-run rebuild answer lands in the
+/// second run's rebuild. `DurableAt{A,20}` from the first run's syncs arrives after A proved the
+/// second point (30): it is answered `BarrierNotDurable` and moves nothing, and B and C at 30 then
+/// send the activation CAS. A first-run answer for a copy with no proof yet held is replaced by
+/// that copy's own proof at the point.
+#[retcd_test]
+fn m7b_233_a_first_run_rebuild_answer_never_displaces_a_second_run_proof() {
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    let mut f1 = second_rebuild();
+    let t = REFENCE_AT + WINDOW + 400;
+    assert_eq!(f1.rec(t, durable(A, 30, dg(0, 30))), not_durable);
+    let proved = f1.module.clone();
+    assert_eq!(
+        f1.rec(t + 1, durable(A, 20, dg(0, 20))),
+        not_durable,
+        "run 1, late"
+    );
+    assert_eq!(f1.module, proved, "A's proof at 30 still stands");
+    assert_eq!(
+        f1.rec(t + 2, durable(C, 20, dg(0, 20))),
+        not_durable,
+        "run 1, late, before C's own"
+    );
+    assert_eq!(f1.rec(t + 3, durable(B, 30, dg(0, 30))), not_durable);
+    let last = f1.rec(t + 4, durable(C, 30, dg(0, 30)));
+    assert!(is_activation_cas(&last, Revision(14)), "{last:?}");
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
+}
+
+/// M7B-234 (B-R74d, Gautam 2026-09-27): the same within one run. Per copy, a proof that does not
+/// bind to the rebuild point never replaces one that does, and before the point is pinned a lower
+/// proof never replaces a higher one. A proof that binds is always taken: the point binds by
+/// digest at its own seq, so the copy's answer at the point may be lower than a proof it gave
+/// before the pin.
+#[retcd_test]
+fn m7b_234_a_reordered_rebuild_proof_never_displaces_a_better_one() {
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+
+    // After the pin: A at the point, then a reordered A 15, then A 25 past the point.
+    let mut f1 = lone_committed();
+    f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
+    assert_eq!(f1.rec(4_100, durable(A, 20, dg(0, 20))), not_durable);
+    let proved = f1.module.clone();
+    for (why, seq) in [("lower", 15), ("higher, not at the point", 25)] {
+        assert_eq!(
+            f1.rec(4_101, durable(A, seq, dg(0, seq))),
+            not_durable,
+            "{why}"
+        );
+        assert_eq!(
+            f1.module, proved,
+            "after the pin, {why}: A's proof at 20 still stands"
+        );
+    }
+    assert_eq!(f1.rec(4_102, durable(B, 20, dg(0, 20))), not_durable);
+    let last = f1.rec(4_103, durable(C, 20, dg(0, 20)));
+    assert!(
+        is_activation_cas(&last, Revision(9)),
+        "after the pin: {last:?}"
+    );
+
+    // Before the pin: A 20, then a reordered A 19, one below; B pins at 20.
+    let mut f1 = lone_committed();
+    assert_eq!(f1.rec(4_000, durable(A, 20, dg(0, 20))), not_durable);
+    let held = f1.module.clone();
+    assert_eq!(f1.rec(4_001, durable(A, 19, dg(0, 19))), not_durable);
+    assert_eq!(
+        f1.module, held,
+        "before the pin: the lower proof moves nothing"
+    );
+    f1.rec(4_002, caught_up(B, 20, dg(0, 20)));
+    assert_eq!(f1.rec(4_100, durable(B, 20, dg(0, 20))), not_durable);
+    let last = f1.rec(4_101, durable(C, 20, dg(0, 20)));
+    assert!(
+        is_activation_cas(&last, Revision(9)),
+        "before the pin: {last:?}"
+    );
+
+    // A proof that binds is taken over a higher one that does not.
+    let mut f1 = lone_committed();
+    assert_eq!(f1.rec(4_000, durable(A, 25, dg(0, 25))), not_durable);
+    f1.rec(4_001, caught_up(B, 20, dg(0, 20)));
+    assert_eq!(f1.rec(4_100, durable(A, 20, dg(0, 20))), not_durable);
+    assert_eq!(f1.rec(4_101, durable(B, 20, dg(0, 20))), not_durable);
+    let last = f1.rec(4_102, durable(C, 20, dg(0, 20)));
+    assert!(
+        is_activation_cas(&last, Revision(9)),
+        "binding wins: {last:?}"
+    );
+}
+
+/// M7B-235 (B-R74b and ruling A-5, Gautam 2026-09-27): a held fence released into `Blocked` must
+/// still beat the peer's floor. The activation `Conflict` re-reads, and the peer's record was
+/// read at 15; the held fence was read at 12, so it is refused `RecoveryBlocked` in the same step,
+/// and only a fence read after 15 re-enters.
+#[retcd_test]
+fn m7b_235_a_released_fence_below_the_peer_floor_stays_blocked() {
+    let mut f1 = held_behind_activation();
+    let t = REFENCE_AT;
+    assert_eq!(
+        f1.step(
+            t,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(15),
+            })
+        ),
+        vec![EffectKind::Control(ControlEffect::Get {
+            key: ControlKey::Partition(PARTITION)
+        })]
+    );
+    let peer = PartitionRecord {
+        owner: NodeId(2),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    assert_eq!(
+        f1.step(
+            t + 1,
+            read_result(ReadOutcome::Found {
+                revision: Revision(15),
+                value: peer.encode(),
+            })
+        ),
+        vec![
+            block(BlockReason::OvertakenByPeer),
+            ign(ReplicaIgnoreReason::RecoveryBlocked)
+        ],
+        "the held fence (read at 12) is below the floor (15)"
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+    let read_at = |revision: u64| {
+        RecoveryEvent::FenceProven(Box::new(FencingProof {
+            control_revision: Revision(revision),
+            ..later_fence()
+        }))
+    };
+    assert_eq!(
+        f1.rec(t + 2, read_at(15)),
+        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)],
+        "at the floor"
+    );
+    assert_eq!(f1.rec(t + 2, read_at(20)), re_entry(t + 2), "above it");
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+}
+
+/// M7B-236 (B-R74a, Gautam 2026-09-27): the single-run half. In one run's `Barrier`, a
+/// reordered lower `DurableAt`, or one past the cutoff that does not carry the cutoff digest,
+/// never erases a copy's binding proof: the answer is `BarrierNotDurable` and nothing moves.
+#[retcd_test]
+fn m7b_236_in_one_run_a_non_binding_proof_never_displaces_a_binding_one() {
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    let mut f1 = at_barrier(20);
+    assert_eq!(f1.rec(3_000, durable(A, 20, dg(0, 20))), not_durable);
+    let proved = f1.module.clone();
+    for (why, seq) in [("reordered, below the cutoff", 15), ("past the cutoff", 25)] {
+        assert_eq!(
+            f1.rec(3_001, durable(A, seq, dg(0, seq))),
+            not_durable,
+            "{why}"
+        );
+        assert_eq!(f1.module, proved, "{why}: nothing moved");
+    }
+    assert_eq!(f1.rec(3_002, durable(B, 20, dg(0, 20))), not_durable);
+    f1.rec(3_003, durable(C, 20, dg(0, 20)));
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Proposing,
+        "A's binding proof still stands"
+    );
+}
+
+/// M7B-237 (B-R74, Gautam 2026-09-27): a newer fence that does not prove the held plan answers
+/// `InvalidConfig` and the phase holds, both where it would enter at once and when a held fence is
+/// released. A released fence that fails is dropped: a plan that arrives later does not bring it
+/// back.
+#[retcd_test]
+fn m7b_237_a_newer_fence_without_its_plan_is_invalid_config_and_the_phase_holds() {
+    let invalid = vec![ign(ReplicaIgnoreReason::InvalidConfig)];
+    for (label, mut f1, _) in after_commit() {
+        if label == "activation proposed" {
+            continue; // released below
+        }
+        let (phase, before) = (f1.phase(), f1.module.clone());
+        assert_eq!(
+            f1.rec(
+                REFENCE_AT,
+                RecoveryEvent::FenceProven(Box::new(later_fence()))
+            ),
+            invalid,
+            "{label}"
+        );
+        assert_eq!(f1.phase(), phase, "{label}: the phase holds");
+        assert_eq!(f1.module, before, "{label}: nothing moved");
+    }
+
+    let mut f1 = activation_proposed();
+    assert_eq!(
+        f1.rec(
+            REFENCE_AT,
+            RecoveryEvent::FenceProven(Box::new(later_fence()))
+        ),
+        vec![ign(ReplicaIgnoreReason::Recorded)],
+        "held"
+    );
+    let landed = f1.step(REFENCE_AT, cas_result(CasOutcome::Committed(Revision(11))));
+    assert_eq!(recovered(&landed).mode, PartitionMode::Active);
+    assert_eq!(landed[1..], invalid[..], "released, and it fails");
+    assert_eq!(f1.phase(), RecoveryPhase::Committed, "the phase holds");
+    assert_eq!(
+        f1.rec(REFENCE_AT + 1, RecoveryEvent::Plan(Box::new(replan()))),
+        vec![ign(ReplicaIgnoreReason::Recorded)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Committed,
+        "the failed fence was dropped"
+    );
+}

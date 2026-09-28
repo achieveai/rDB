@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `predecessor_digest_mismatch` | an apply cites the recorded `entry_digest` at `(generation, predecessor_seq)`, or its root's `base_digest` |
 //! | `digest_conflict_without_quarantine` | one `(generation, seq)` never carries two `entry_digest` values without a `quarantine{DigestConflict}` **and** a `recovery_decision{mode=Quarantine}` — divergence never auto-merges |
-//! | `cutoff_below_an_available_recorded_prefix` | no reachable source reported a `(generation, seq)` above the selected cutoff whose `reported_digest` equals the digest the oracle already recorded there |
+//! | `cutoff_below_an_available_recorded_prefix` | no reachable source reported a `(generation, seq)` above the selected cutoff whose `reported_digest` equals the digest the oracle already recorded there. A decision with no cutoff (`selected_cutoff_seq = None`, a quarantine) selected nothing to be below, so the clause does not apply; `None` is never read as 0 |
 //! | `recovery_root_without_predecessor` | a recovery root cites a real `predecessor_generation` and `predecessor_cutoff` |
 //! | `cutoff_above_selected_source` | the selected cutoff is never above the prefix the selected source itself reported |
 //!
@@ -162,18 +162,23 @@ impl Checker for Lineage {
                 if *mode == RecoveryMode::Quarantine {
                     self.quarantine_decided.insert(event.partition, true);
                 }
+                // `None` is "no cutoff selected" (a quarantine), never position 0: neither
+                // cutoff clause has anything to compare, so both are skipped.
+                let Some(cutoff) = *selected_cutoff_seq else {
+                    return Ok(());
+                };
                 if let Some(selected) = selected_source {
                     if let Some(source) = queried_sources.iter().find(|s| s.node == *selected) {
                         if source
                             .reported_seq
-                            .is_some_and(|reported| reported < *selected_cutoff_seq)
+                            .is_some_and(|reported| reported < cutoff)
                         {
                             return Err(Violation::detailed(
                                 "cutoff_above_selected_source",
                                 source.role,
                                 format!(
                                     "cutoff {} is above the selected source's reported prefix",
-                                    selected_cutoff_seq.0
+                                    cutoff.0
                                 ),
                             ));
                         }
@@ -190,7 +195,7 @@ impl Checker for Lineage {
                     ) else {
                         continue;
                     };
-                    if reported_seq <= *selected_cutoff_seq {
+                    if reported_seq <= cutoff {
                         continue;
                     }
                     if part.digest_at(generation, reported_seq) == Some(reported_digest) {
@@ -200,7 +205,7 @@ impl Checker for Lineage {
                             format!(
                                 "node {} is reachable and reported generation {} seq {} with the \
                                  digest already recorded there, above the selected cutoff {}",
-                                source.node.0, generation.0, reported_seq.0, selected_cutoff_seq.0
+                                source.node.0, generation.0, reported_seq.0, cutoff.0
                             ),
                         ));
                     }
