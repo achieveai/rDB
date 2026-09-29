@@ -4,8 +4,10 @@
 //! reply" is fragile and uncompiled. Each constructor carries `Provenance::Authored` naming
 //! itself, and row **M7V-47** runs it through [`super::run`].
 //!
-//! Two of the four are here. `case_f1_t1_p1_retained_status_24h` and
-//! `case_f1_t1_digest_across_recovery` wait on T1 (lead ruling A-R73).
+//! All four are here. The F1/T1/P1 and F1/T1 cases (lead ruling V-R37) share the A1/P1 case's
+//! arming shape — survivors, one recovery, the resume hold, then client writes — and differ only
+//! in what they submit after it: a retry of an identity the prior generation retained, and
+//! retries of one identity under the same and another digest.
 
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
@@ -318,5 +320,122 @@ pub fn case_a1_p1_new_generation_between_publish_and_reply() -> Scenario {
                 ticks: A1_P1_MAX_TICKS - A1_P1_SUBMIT_AT,
             }),
         ],
+    )
+}
+
+/// The gap between the F1/T1 cases' successive submits. Off the host's flush grid by nothing:
+/// every submit lands on a flush tick, as the A1/P1 case's does.
+pub const F1_T1_STEP: u64 = 100;
+/// The F1/T1/P1 case: the prior generation's identity it retries. `Synchronize` preloads seqs
+/// `1..=A1_P1_HEAD` as requests `1..=A1_P1_HEAD` of client 1, so this one was applied at seq 5
+/// in generation 1.
+pub const F1_T1_P1_RETAINED_REQUEST: RequestId = RequestId(5);
+/// The F1/T1/P1 case: the fresh write after the retry. It takes the sequence after
+/// [`A1_P1_REQUEST`]'s, because the refused retry reserves none.
+pub const F1_T1_P1_NEXT_REQUEST: RequestId = RequestId(A1_P1_HEAD + 2);
+/// The F1/T1 case: the digest the retried identity is resubmitted under. Any value but the
+/// first submit's `digest_id`.
+pub const F1_T1_OTHER_DIGEST: u64 = 2;
+
+fn submit(request: RequestId, digest_id: u64) -> ScenarioOp {
+    ScenarioOp::Client(ClientOp::Submit {
+        partition: PARTITION,
+        tenant: TenantId(1),
+        client: ClientId(1),
+        request,
+        digest_id,
+        affinity: 1,
+        expected_generation: None,
+        keys: vec![KeyId(1)],
+    })
+}
+
+/// The A1/P1 case's arming shape (ruling V-R37): B and C survive at [`A1_P1_HEAD`], A is dead,
+/// one recovery at [`PLAN_AT`], and the cursor at [`A1_P1_SUBMIT_AT`], past L1's resume hold,
+/// where a write is admitted. `tail` follows.
+fn armed_then(tail: Vec<ScenarioOp>) -> Vec<ScenarioOp> {
+    let mut ops = vec![
+        ScenarioOp::Recovery(RecoveryOp::Synchronize {
+            node: B_NODE,
+            to: Seq(A1_P1_HEAD),
+        }),
+        ScenarioOp::Recovery(RecoveryOp::Synchronize {
+            node: C_NODE,
+            to: Seq(A1_P1_HEAD),
+        }),
+        ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+        ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+            partition: PARTITION,
+            window: 2_000,
+        }),
+        ScenarioOp::Time(TimeOp::Advance {
+            ticks: A1_P1_SUBMIT_AT - PLAN_AT,
+        }),
+    ];
+    ops.extend(tail);
+    ops
+}
+
+/// Spike §6, F1/T1/P1: "retain old-generation status mappings for 24 h ... RECOVERED_APPLIED /
+/// UNKNOWN_OUTCOME / STATUS_EXPIRED, never proof of nonexecution."
+///
+/// Generation 1 applied requests `1..=10`; recovery activates generation 2 on B with a retained
+/// status map over them. After the hold, one fresh write ([`A1_P1_REQUEST`]) publishes in
+/// generation 2; then [`F1_T1_P1_RETAINED_REQUEST`] — an identity generation 1 retained, under
+/// a payload the grammar cannot make equal to the preloaded one — is retried, and the kernel
+/// must answer from the retained mapping (`REQUEST_ID_REUSE`, spec §8.1: never re-execute, never
+/// replay transparently) rather than execute it again; then [`F1_T1_P1_NEXT_REQUEST`] shows the
+/// refusal reserved no sequence.
+///
+/// The 24 h expiry half (`STATUS_EXPIRED`) is not in this case: the grammar has no `Status` op
+/// the bridge lowers and no retire op, and the sim's F1 never emits `RetireGeneration`, so the
+/// retention is modelled and never crossed here (ruling V-R37 asks for the arming shape and a
+/// submit after it, which this is).
+#[must_use]
+pub fn case_f1_t1_p1_retained_status_24h() -> Scenario {
+    authored(
+        "case_f1_t1_p1_retained_status_24h",
+        Budget {
+            max_events: 2_000,
+            max_ticks: A1_P1_MAX_TICKS,
+        },
+        armed_then(vec![
+            submit(A1_P1_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance { ticks: F1_T1_STEP }),
+            submit(F1_T1_P1_RETAINED_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance { ticks: F1_T1_STEP }),
+            submit(F1_T1_P1_NEXT_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: A1_P1_MAX_TICKS - A1_P1_SUBMIT_AT - 2 * F1_T1_STEP,
+            }),
+        ]),
+    )
+}
+
+/// Spike §6, F1/T1: "same/different request digests before/after recovery and expiry."
+///
+/// After recovery, [`A1_P1_REQUEST`] is written once, retried under the same digest — the
+/// retained answer replays and nothing is applied twice (INV-ATOM, INV-DEDUP) — and then
+/// resubmitted under [`F1_T1_OTHER_DIGEST`], which is `REQUEST_ID_REUSE` and reserves nothing.
+/// The before-recovery digests are generation 1's preloaded requests; the retained-status case
+/// retries one of those.
+#[must_use]
+pub fn case_f1_t1_digest_across_recovery() -> Scenario {
+    authored(
+        "case_f1_t1_digest_across_recovery",
+        Budget {
+            max_events: 2_000,
+            max_ticks: A1_P1_MAX_TICKS,
+        },
+        armed_then(vec![
+            submit(A1_P1_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance { ticks: F1_T1_STEP }),
+            submit(A1_P1_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance { ticks: F1_T1_STEP }),
+            submit(A1_P1_REQUEST, F1_T1_OTHER_DIGEST),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: A1_P1_MAX_TICKS - A1_P1_SUBMIT_AT - 2 * F1_T1_STEP,
+            }),
+        ]),
     )
 }

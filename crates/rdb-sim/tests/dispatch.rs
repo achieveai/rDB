@@ -6910,10 +6910,11 @@ fn run_false_durable_rebuild() -> (
 /// watermark, the recorded `DurabilityAdvance` at the lie is `Partial` and never `Synced` above
 /// it, and F1 withholds copy 2's proof as `Short` rather than proving the cutoff.
 ///
-/// Parked on its third clause. "No publish counts an ungrounded ack, and INV-PUB is `Proven`"
-/// needs a sim run that reaches P1's `Publish`, and none does (B-R60: L1 stays `Paused` on a
-/// recovered partition). The row asserts that absence rather than assuming it, so the day a
-/// run publishes this row goes red and demands the INV-PUB clause be written.
+/// Its third clause, "no publish counts an ungrounded ack", needs a run that reaches P1's
+/// `Publish`, and this spine never does (B-R60: L1 stays `Paused` on a recovered partition).
+/// That clause is `publish_rows::m7v_92_a_publish_after_the_lie_counts_no_ungrounded_ack` in
+/// `tests/scenarios.rs`, on the A1/P1 arming shape; this function asserts the spine still does
+/// not publish rather than assuming it.
 #[retcd_test]
 fn m7v_92_false_durable_the_kernel_never_reports_durable_beyond_what_m1_performed() {
     use rdb_core::contracts::ids::{AppliedSeq, DurableSeq};
@@ -6986,7 +6987,10 @@ fn m7v_92_false_durable_the_kernel_never_reports_durable_beyond_what_m1_performe
         run.proven()
     );
 
-    // The parked clause, stated as a fact about the run rather than assumed.
+    // This spine never publishes (L1 stays Paused, B-R60). The publish clause runs on a
+    // recovered-and-resumed run in `tests/scenarios.rs`,
+    // `publish_rows::m7v_92_a_publish_after_the_lie_counts_no_ungrounded_ack`. Stated as a fact
+    // about this run, so a spine that starts publishing is noticed here too.
     let publishes = run
         .trace
         .events
@@ -7001,13 +7005,8 @@ fn m7v_92_false_durable_the_kernel_never_reports_durable_beyond_what_m1_performe
     assert!(!matches!(inv_pub, Verdict::Violated(_)), "{inv_pub:?}");
     assert_eq!(
         publishes, 0,
-        "a sim run now publishes (B-R60 closed): un-park M7V-92 and assert INV-PUB Proven"
-    );
-    parked(
-        "M7V-92",
-        PackageId::I1,
-        "INV-PUB Proven over a publish that counted node 3's ack: no sim run reaches P1's \
-         Publish (B-R60); un-park when one does",
+        "the rebuild spine now publishes: the publish clause in scenarios.rs still covers \
+         M7V-92, but re-read this row's third clause against this run"
     );
 }
 

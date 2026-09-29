@@ -2282,17 +2282,127 @@ fn m7a_179_a_late_answer_to_an_earlier_renewal_is_not_the_current_ones() {
 // =============================================================================================
 
 /// Regression for KA-ROWS-D1, not a plan row. A1 accepts every `Storage` and `Timer` kind at the
-/// door and judges the grant before routing the event, so the expiry fence can fire on a
-/// storage completion or a timer that is not A1's. Its row for that event then declines, and the
+/// door and judges the grant before routing the event, so a node fence can fire on a storage
+/// completion or a timer that is not A1's. Its row for that event then declines, and the
 /// decline used to discard the fence and its superseding views while the state stayed `Fenced`:
 /// no consumer ever heard of the fence (found driving M7A-163 through the sim, where the lapse
 /// landed on a `Flushed` and T1's queue and P1's waiters were never drained).
+///
+/// Both node fences `revalidate` decides, so a fix scoped to one reason fails the other
+/// (reviewer-ka-rows F3): the expiry at [`LAPSE`], and `ClockUnbounded` from a sample with no
+/// bound while the local window is still open.
 #[retcd_test]
 fn expiry_fence_leaves_with_an_event_a1_has_no_row_for() {
+    let foreign_timer = |at: u64| {
+        EventKind::Timer(TimerFired {
+            id: rdb_core::contracts::ids::TimerId(7),
+            version: TimerVersion(0),
+            scheduled_at: Tick(at),
+        })
+    };
+    let flushed = EventKind::Storage(rdb_core::contracts::storage::StorageEvent::Flushed {
+        ticket: rdb_core::contracts::ids::FlushTicket(1),
+        durable: Vec::new(),
+    });
+    // A sample with no bound at tick 600: rejected, retracted, and the grant fenced
+    // `ClockUnbounded` with `renewed_at + grant_millis` still ahead.
+    let unbounded = |now: u64| {
+        let mut ctx = ctx(now);
+        ctx.control_time.bound_established = false;
+        ctx
+    };
+    let expired = |now: u64| ctx(now);
+    /// Label, the tick, the fence reason, the event A1 has no row for, and the context builder.
+    type Case = (
+        &'static str,
+        u64,
+        DenyReason,
+        EventKind,
+        fn(u64) -> StepCtx<'static>,
+    );
+    let cases: [Case; 4] = [
+        (
+            "a timer outside A1's block, at the lapse",
+            LAPSE,
+            DenyReason::Expired,
+            foreign_timer(LAPSE),
+            expired,
+        ),
+        (
+            "a flush, at the lapse",
+            LAPSE,
+            DenyReason::Expired,
+            flushed.clone(),
+            expired,
+        ),
+        (
+            "a timer outside A1's block, on a sample with no bound",
+            600,
+            DenyReason::ClockUnbounded,
+            foreign_timer(600),
+            unbounded,
+        ),
+        (
+            "a flush, on a sample with no bound",
+            600,
+            DenyReason::ClockUnbounded,
+            flushed,
+            unbounded,
+        ),
+    ];
+    for (why, at, reason, kind, ctx_at) in cases {
+        let (mut kernel, _) = held();
+        serve_p1(&mut kernel, &ctx(520));
+        let effects = kernel
+            .step(&ctx_at(at), &event(at, at, kind.clone()))
+            .unwrap_or_else(|declined| panic!("{why}: the fence was declined away: {declined:?}"));
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Fence(FenceScope::Node, reason), Shape::Publish],
+            "{why}"
+        );
+        assert_eq!(
+            kernel.state(),
+            &AuthorityState::Fenced {
+                reason,
+                at: Tick(at),
+            },
+            "{why}"
+        );
+        // The exception belongs to the step that fenced. On the next step the kernel is already
+        // `Fenced`, nothing fences, and the same event is declined as it always was: a run
+        // records it `Declined`, not `Answered` with no effects.
+        let again = kernel.step(&ctx_at(at + 1), &event(at + 1, at + 1, kind));
+        assert!(
+            matches!(
+                again,
+                Err(rdb_core::contracts::errors::RdbError::Unavailable { .. })
+            ),
+            "{why}: once fenced, the event is declined again: {again:?}"
+        );
+    }
+}
+
+// =============================================================================================
+// reviewer-ka-rows F2 (ledger L-R179p, 2026-09-28): views republished for a moved sample left
+// with a step A1 then declined.
+// =============================================================================================
+
+/// Regression for reviewer-ka-rows F2, not a plan row. `revalidate` republishes every served
+/// view when the step's clock sample is newly accepted, before the event is routed. When that
+/// event is one A1 takes at the door but has no row for, the decline discards the views — and it
+/// used to keep the sample, so on the next step nothing "moved", they were never republished,
+/// and a secondary honouring the previous view never learned the moved horizon. A declined step
+/// now hands the sample back with the views: the next step A1 accepts absorbs it and publishes.
+/// Not the KA-ROWS-D1 shape (the views leaving with the declined step): a foreign timer that
+/// lands with a fresh sample must not become a publish, or the F1/R1 keepalive budget
+/// (ruling B-R65, `m7v_47`) grows with every timer A1 has no row for.
+#[retcd_test]
+fn republished_views_leave_with_the_next_step_a1_accepts() {
     let foreign_timer = EventKind::Timer(TimerFired {
         id: rdb_core::contracts::ids::TimerId(7),
         version: TimerVersion(0),
-        scheduled_at: Tick(LAPSE),
+        scheduled_at: Tick(600),
     });
     let flushed = EventKind::Storage(rdb_core::contracts::storage::StorageEvent::Flushed {
         ticket: rdb_core::contracts::ids::FlushTicket(1),
@@ -2304,35 +2414,45 @@ fn expiry_fence_leaves_with_an_event_a1_has_no_row_for() {
     ] {
         let (mut kernel, _) = held();
         serve_p1(&mut kernel, &ctx(520));
-        let effects = kernel
-            .step(&ctx(LAPSE), &event(LAPSE, LAPSE, kind.clone()))
-            .unwrap_or_else(|declined| panic!("{why}: the fence was declined away: {declined:?}"));
-        assert_eq!(
-            shapes(&effects),
-            vec![
-                Shape::Fence(FenceScope::Node, DenyReason::Expired),
-                Shape::Publish
-            ],
-            "{why}"
-        );
-        assert_eq!(
-            kernel.state(),
-            &AuthorityState::Fenced {
-                reason: DenyReason::Expired,
-                at: Tick(LAPSE),
-            },
-            "{why}"
-        );
-        // The exception belongs to the step that fenced. On the next step the kernel is already
-        // `Fenced`, nothing fences, and the same event is declined as it always was: a run
-        // records it `Declined`, not `Answered` with no effects.
-        let again = kernel.step(&ctx(LAPSE + 1), &event(LAPSE + 1, LAPSE + 1, kind));
+        let before = kernel.view().clock_sample;
+        // A sample taken at tick 600 arrives with an event A1 declines: no publish leaves, and
+        // the sample is not kept either.
+        let declined = kernel.step(&sampled_at(600, 600), &event(600, 600, kind));
         assert!(
             matches!(
-                again,
+                declined,
                 Err(rdb_core::contracts::errors::RdbError::Unavailable { .. })
             ),
-            "{why}: once fenced, the event is declined again: {again:?}"
+            "{why}: declined, as always: {declined:?}"
+        );
+        assert!(kernel.state().is_held(), "{why}: still held");
+        assert_eq!(
+            kernel.view().clock_sample,
+            before,
+            "{why}: a declined step keeps nothing, the sample included"
+        );
+        // The same sample on the next step A1 accepts is new to it: absorbed, and the horizon
+        // moves with it, so `p1`'s view is republished here — once.
+        let effects = kernel
+            .step(&sampled_at(601, 600), &probe(601))
+            .expect("a control probe is accepted");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Publish],
+            "{why}: the moved sample's views leave with the next accepted step"
+        );
+        assert_eq!(
+            kernel.view().clock_sample.map(|s| s.sampled_at),
+            Some(Tick(600)),
+            "{why}: the sample was accepted"
+        );
+        let again = kernel
+            .step(&sampled_at(602, 600), &probe(602))
+            .expect("a control probe is accepted");
+        assert_eq!(
+            shapes(&again),
+            Vec::<Shape>::new(),
+            "{why}: an unchanged sample republishes nothing"
         );
     }
 }

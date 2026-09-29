@@ -41,19 +41,58 @@ use rdb_sim::harness::hosted::{Hosted, Scope};
 use rdb_sim::harness::trace::{log_jsonl_path, log_line, write_log_jsonl, LogTags};
 
 #[retcd_test]
-fn m7f_01_every_kernel_package_reports_unavailable_without_being_stepped() {
+fn m7f_01_capability_report_is_each_packages_own_answer_without_being_stepped() {
     support::preamble();
     let dispatcher = Dispatcher::new();
 
     let report = dispatcher.capability_report();
 
-    assert_eq!(report, [CapabilityState::Unavailable; 6]);
-    assert_eq!(ModuleName::ALL.len(), report.len());
-    // The default answer, straight from the trait, for a module nobody has stepped.
+    // Capability is a question, not a probe (K-F-10): the report is each module's own answer,
+    // read without stepping anything. A1 and P1 advertise `Wired` since ruling V-R38 (their own
+    // overrides; A1's evidenced by the campaign's INV-AUTH arming, P1's by every §4.2 row
+    // running through `step` with no routing edge owed). T1 overrides too and answers
+    // `Unavailable`, held under ruling V-R40 Q1; R1, L1 and F1 take the trait's default.
+    // `ModuleName::ALL` order: Authority, Transaction, Replication, Publication, Protection,
+    // Recovery.
     assert_eq!(
-        rdb_core::authority::Authority::new().capability(),
+        report,
+        [
+            CapabilityState::Wired,
+            CapabilityState::Unavailable,
+            CapabilityState::Unavailable,
+            CapabilityState::Wired,
+            CapabilityState::Unavailable,
+            CapabilityState::Unavailable,
+        ]
+    );
+    assert_eq!(ModuleName::ALL.len(), report.len());
+    // Each slot is that package's own answer, read from a fresh instance nobody has stepped: the
+    // report neither stepped a module to find out nor answered for it (review VC-T2).
+    for (slot, name) in ModuleName::ALL.into_iter().enumerate() {
+        assert_eq!(
+            report[slot],
+            fresh_capability(name),
+            "slot {slot} ({name:?}) is not the package's own answer"
+        );
+    }
+    // The default answer, straight from the trait, for a module nobody has touched.
+    assert_eq!(
+        Module::capability(&Unwired::<0>::default()),
         CapabilityState::Unavailable
     );
+}
+
+/// What a fresh, never-stepped instance of `name`'s package answers, built by `Default` as the
+/// sim's dispatcher builds it.
+fn fresh_capability(name: ModuleName) -> CapabilityState {
+    match name {
+        ModuleName::Authority => rdb_core::authority::Authority::default().capability(),
+        ModuleName::Transaction => rdb_core::transaction::Transaction::default().capability(),
+        ModuleName::Replication => rdb_core::replication::Replication::default().capability(),
+        ModuleName::Publication => rdb_core::publication::Publication::default().capability(),
+        ModuleName::Protection => rdb_core::protection::Protection::default().capability(),
+        ModuleName::Recovery => rdb_core::recovery::Recovery::default().capability(),
+    }
 }
 
 /// A module that is never wired: the trait's default capability, and `Unavailable` naming its
@@ -132,7 +171,7 @@ fn m7f_01_offer_to_an_unwired<const SLOT: usize>() {
 /// against a test-local stub, one per [`ModuleName`], through
 /// [`rdb_sim::harness::hosted::Hosted`], the container A1 and F1 are hosted in. It stays true
 /// after every package is wired. Which real package is still unwired is asserted by
-/// `m7f_01_every_kernel_package_reports_unavailable_without_being_stepped`, not by this one.
+/// `m7f_01_capability_report_is_each_packages_own_answer_without_being_stepped`, not by this one.
 #[retcd_test]
 fn m7f_01_stepping_an_unwired_module_returns_unavailable_and_no_effect() {
     support::preamble();

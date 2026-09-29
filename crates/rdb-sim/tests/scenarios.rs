@@ -268,15 +268,138 @@ fn m7v_44_generator_respects_the_budget() {
     }
 }
 
+/// M7V-86. The runner half of the bound (critic T-21). The F1/R1 case is the authored history
+/// the bridge lowers, and on its own budget it pops far more than 64 events, so a cap of 64 has
+/// to bite. "Event" here is what the runner counts — a popped queue event — exactly as M7V-63
+/// reads it; one pop records several trace lines, so the trace is longer than the cap.
 #[retcd_test]
 fn m7v_86_runner_stops_at_max_events_and_ends_at_an_event_boundary() {
     support::preamble();
-    parked(
-        "M7V-86",
-        PackageId::I1,
-        "the runner half of the budget bound is behaviour and needs a runner",
+    let mut scenario = cases::case_f1_r1_discovery_window();
+    assert!(
+        scenario.budget.max_events > 64,
+        "the case would fit the cap: {}",
+        scenario.budget.max_events
     );
+    scenario.budget.max_events = 64;
+    let run = scenario_run::run(&scenario).expect("the F1/R1 case lowers");
+    tracing::info!(
+        stop = ?run.report.stop,
+        popped = run.report.events_consumed,
+        recorded = run.trace.events.len(),
+        "m7v_86 run"
+    );
+
+    // The runner stops at the bound, having consumed exactly it: budget_spent = max_events.
+    assert_eq!(run.plan.limits.max_events, 64, "the cap the run was handed");
+    assert!(
+        matches!(
+            run.report.stop,
+            StopReason::EventBudgetExhausted { max_events: 64, .. }
+        ),
+        "the runner stopped for another reason: {:?}",
+        run.report.stop
+    );
+    assert_eq!(
+        run.report.events_consumed, 64,
+        "the runner popped past the cap, or stopped short of it"
+    );
+
+    // It ends at an event boundary: the last event is a whole, validated event with the
+    // highest id, and no id is skipped or repeated on the way there.
+    let last = run
+        .trace
+        .events
+        .last()
+        .expect("a cut trace still holds events");
+    assert!(
+        run.trace
+            .events
+            .windows(2)
+            .all(|pair| pair[0].event_id < pair[1].event_id),
+        "event ids are not strictly increasing"
+    );
+    tracing::info!(last_event = last.event_id.0, "m7v_86 cut");
+    assert_cut_verdicts("F1/R1 at 64 pops", &run);
+
+    // A cut inside a transaction leaves the oracle Unavailable, never Violated (review VC-T1).
+    // The F1/R1 case above never submits, so the cut has to come from a case that does: F1/T1's
+    // first Submit is the pop at tick `A1_P1_SUBMIT_AT`, and measured over caps 850..1000 on
+    // this build, cap 950 is the first to hold it. Caps 950..954 hold T1's dispatch with no A1
+    // answer and no reply; from 955 A1 has answered. The structural asserts below fail loudly if
+    // the case moves, rather than letting the cut drift out of the transaction. The trace shows
+    // the transaction only as T1's dispatch: this case emits no `ClientSubmit` or
+    // `AdmissionDecision` line.
+    let mut scenario = cases::case_f1_t1_digest_across_recovery();
+    scenario.budget.max_events = M7V_86_CUT_INSIDE_FIRST_SUBMIT;
+    let run = scenario_run::run(&scenario).expect("the F1/T1 case lowers");
+    assert!(
+        matches!(
+            run.report.stop,
+            StopReason::EventBudgetExhausted { max_events, .. }
+                if max_events == M7V_86_CUT_INSIDE_FIRST_SUBMIT
+        ),
+        "the F1/T1 run was not cut by the budget: {:?}",
+        run.report.stop
+    );
+    let after_submit = |matches: &dyn Fn(&TraceKind) -> bool| {
+        run.trace
+            .events
+            .iter()
+            .filter(|e| e.logical_tick >= cases::A1_P1_SUBMIT_AT && matches(&e.kind))
+            .count()
+    };
+    let dispatched = after_submit(&|kind| {
+        matches!(
+            kind,
+            TraceKind::ModuleDispatch {
+                module: ModuleName::Transaction,
+                ..
+            }
+        )
+    });
+    let decided = after_submit(&|kind| matches!(kind, TraceKind::AuthorityDecision { .. }));
+    let replied = after_submit(&|kind| matches!(kind, TraceKind::ClientOutcomeReported { .. }));
+    tracing::info!(dispatched, decided, replied, "m7v_86 transaction cut");
+    assert_eq!(
+        (dispatched, decided, replied),
+        (1, 0, 0),
+        "the cut is not inside the first transaction: (T1 dispatches, A1 decisions, replies) \
+         after the submit tick"
+    );
+
+    assert_cut_verdicts("F1/T1 inside its first transaction", &run);
 }
+
+/// Ruling V-R43, for M7V-86: on a cut trace nothing is Violated, an invariant whose packages are
+/// all Wired is NotArmed, and every other one names a capability it lacks.
+fn assert_cut_verdicts(cut: &str, run: &ScenarioRun) {
+    let capabilities = &run.oracle.capabilities;
+    for (invariant, verdict) in run.oracle.verdicts() {
+        let wired = invariant
+            .needs()
+            .iter()
+            .all(|package| capabilities.get(package) == Some(&CapabilityState::Wired));
+        if wired {
+            assert_eq!(
+                verdict,
+                &Verdict::Unavailable(Unavailable::NotArmed),
+                "{} has every package Wired, on the {cut} cut",
+                invariant.id()
+            );
+        } else {
+            assert!(
+                matches!(verdict, Verdict::Unavailable(Unavailable::Capability(_))),
+                "{} lacks a package, on the {cut} cut: {verdict:?}",
+                invariant.id()
+            );
+        }
+    }
+}
+
+/// M7V-86's cut for `case_f1_t1_digest_across_recovery`: the first pop cap that holds its first
+/// Submit, which lands no A1 decision and no reply before the budget stops the run.
+const M7V_86_CUT_INSIDE_FIRST_SUBMIT: u32 = 950;
 
 // ------------------------------------------------------------------------------------------
 // M7V-45, M7V-46 — the fixture is the reproducer
@@ -1073,15 +1196,203 @@ fn m7a_193_a_publish_runs_through_the_split_answer_arm_with_nothing_owed() {
     assert_eq!(successes, 1, "M7A-193: the write published and replied");
 }
 
-/// M7V-47, the F1/T1/P1 and F1/T1 cases: they wait on T1 (lead ruling A-R73).
-#[retcd_test]
-fn m7v_47_cases_f1_t1_wait_on_t1() {
-    support::preamble();
-    parked(
-        "M7V-47",
-        PackageId::I1,
-        "cases F1/T1/P1 retained status 24 h and F1/T1 digest across recovery wait on T1 (A-R73)",
+/// Every `client_outcome_reported` line of `trace`, in trace order: `(tick, request, outcome,
+/// generation, seq)`.
+fn client_outcomes(
+    trace: &Trace,
+) -> Vec<(
+    u64,
+    u64,
+    rdb_core::contracts::trace::ClientOutcome,
+    u64,
+    Option<u64>,
+)> {
+    trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::ClientOutcomeReported {
+                request,
+                outcome,
+                generation,
+                seq,
+                ..
+            } => Some((
+                event.logical_tick,
+                request.0,
+                *outcome,
+                generation.0,
+                seq.map(|seq| seq.0),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `batch_apply` on `node` above the preloaded head, in trace order: `(generation, seq)`.
+fn applies_above_head(trace: &Trace, node: rdb_core::contracts::ids::NodeId) -> Vec<(u64, u64)> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.node == node)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                generation, seq, ..
+            } if seq.0 > cases::A1_P1_HEAD => Some((generation.0, seq.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run an F1/T1 case whole and check its envelope: it lowers and runs to its tick budget.
+fn f1_t1_run(scenario: &Scenario) -> ScenarioRun {
+    let run = scenario_run::run(scenario).expect("the case lowers whole");
+    tracing::info!(
+        case = ?scenario.provenance,
+        stop = ?run.report.stop,
+        events = run.report.events_consumed,
+        "f1/t1 report"
     );
+    assert!(
+        matches!(run.report.stop, StopReason::DeadlineReached { deadline, .. }
+            if deadline.0 == cases::A1_P1_MAX_TICKS),
+        "runs to its tick budget: {:?}",
+        run.report.stop
+    );
+    run
+}
+
+/// M7V-47, case F1/T1/P1 (spike §6): the retained status mapping, run from the grammar through
+/// the real runner and judged by the oracle (ruling V-R37).
+///
+/// **Kernel half.** Generation 1 retained requests `1..=10`; recovery activated generation 2 on
+/// B. The fresh write publishes at seq 11. The retry of request 5 — an identity generation 1
+/// retained, under another payload — is answered from the retained mapping,
+/// `Error(RequestIdReuse)` with no sequence (spec §8.1: never re-executed, never replayed
+/// transparently), and the next fresh write takes seq 12: the refusal reserved nothing and B
+/// applied exactly `[11, 12]` in generation 2, so request 5 executed nowhere a second time.
+///
+/// **Oracle half**: [`oracle_half`].
+#[retcd_test]
+fn m7v_47_case_f1_t1_p1_retained_status_24h_runs_through_the_runner() {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::trace::ClientOutcome;
+    support::preamble();
+    let scenario = cases::case_f1_t1_p1_retained_status_24h();
+    assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
+    assert!(scenario.max_events_implied() <= scenario.budget.max_events);
+    let run = f1_t1_run(&scenario);
+
+    let outcomes = client_outcomes(&run.trace);
+    tracing::info!(?outcomes, "f1/t1/p1 outcomes");
+    let g = 2;
+    let (submit, step) = (cases::A1_P1_SUBMIT_AT, cases::F1_T1_STEP);
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                submit,
+                cases::A1_P1_REQUEST.0,
+                ClientOutcome::Success,
+                g,
+                Some(cases::A1_P1_HEAD + 1)
+            ),
+            (
+                submit + step,
+                cases::F1_T1_P1_RETAINED_REQUEST.0,
+                ClientOutcome::Error(ErrorKind::RequestIdReuse),
+                g,
+                None
+            ),
+            (
+                submit + 2 * step,
+                cases::F1_T1_P1_NEXT_REQUEST.0,
+                ClientOutcome::Success,
+                g,
+                Some(cases::A1_P1_HEAD + 2)
+            ),
+        ],
+        "the fresh write publishes, the retained identity is refused from the mapping with no \
+         sequence, and the next write takes the sequence the refusal did not reserve"
+    );
+    assert_eq!(
+        applies_above_head(&run.trace, cases::B_NODE),
+        vec![(g, cases::A1_P1_HEAD + 1), (g, cases::A1_P1_HEAD + 2)],
+        "B applied the two fresh writes and nothing for the retried identity"
+    );
+
+    let verdicts = oracle_half(&run);
+    tracing::info!(?verdicts, "f1/t1/p1 oracle");
+}
+
+/// M7V-47, case F1/T1 (spike §6): one identity under the same and another digest across the
+/// recovered generation, run from the grammar through the real runner and judged by the oracle
+/// (ruling V-R37).
+///
+/// **Kernel half.** The write publishes at seq 11. Its retry under the same digest is answered
+/// `Success` at the same seq 11 — the retained answer replayed — and its resubmission under
+/// another digest `Error(RequestIdReuse)` with no sequence. B applied seq 11 exactly once in
+/// generation 2 and nothing after it: neither the replay nor the refusal executed anything
+/// (INV-ATOM, INV-DEDUP as kernel facts). Three outcomes on three correlations.
+///
+/// **Oracle half**: [`oracle_half`].
+#[retcd_test]
+fn m7v_47_case_f1_t1_digest_across_recovery_runs_through_the_runner() {
+    use rdb_core::contracts::errors::ErrorKind;
+    use rdb_core::contracts::trace::ClientOutcome;
+    support::preamble();
+    let scenario = cases::case_f1_t1_digest_across_recovery();
+    assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
+    assert!(scenario.max_events_implied() <= scenario.budget.max_events);
+    let run = f1_t1_run(&scenario);
+
+    let outcomes = client_outcomes(&run.trace);
+    tracing::info!(?outcomes, "f1/t1 outcomes");
+    let g = 2;
+    let (submit, step) = (cases::A1_P1_SUBMIT_AT, cases::F1_T1_STEP);
+    let written = Some(cases::A1_P1_HEAD + 1);
+    let request = cases::A1_P1_REQUEST.0;
+    assert_eq!(
+        outcomes,
+        vec![
+            (submit, request, ClientOutcome::Success, g, written),
+            (submit + step, request, ClientOutcome::Success, g, written),
+            (
+                submit + 2 * step,
+                request,
+                ClientOutcome::Error(ErrorKind::RequestIdReuse),
+                g,
+                None
+            ),
+        ],
+        "same digest: the retained answer, at the same seq; another digest: refused, no seq"
+    );
+    let correlations: BTreeSet<u64> = run
+        .trace
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::ClientOutcomeReported { .. }))
+        .map(|event| event.correlation.0)
+        .collect();
+    assert_eq!(correlations.len(), 3, "three submits, three correlations");
+    assert_eq!(
+        applies_above_head(&run.trace, cases::B_NODE),
+        vec![(g, cases::A1_P1_HEAD + 1)],
+        "B applied the write once; the replay and the refusal applied nothing"
+    );
+    let publishes: Vec<u64> = run
+        .trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::Publish { seq, .. } => Some(seq.0),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(publishes, vec![cases::A1_P1_HEAD + 1], "one publication");
+
+    let verdicts = oracle_half(&run);
+    tracing::info!(?verdicts, "f1/t1 oracle");
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1421,11 +1732,9 @@ fn m7v_48_reducer_stops_at_each_of_the_three_shrink_budgets() {
         "the signatures past the cap are recorded unminimized, never dropped"
     );
 
-    parked(
-        "M7V-48",
-        PackageId::I1,
-        "the campaign half — that a real run reports budget_spent in its artifact",
-    );
+    // The campaign half — that a real run's artifact names the spent budget — is
+    // `m7v_48_a_real_run_names_the_spent_budget_in_its_artifact` in `campaign.rs`, where the
+    // engine is.
 }
 
 #[retcd_test]
@@ -2160,6 +2469,524 @@ mod semantic_runs {
             )]
         );
     }
+}
+
+/// Rows that need a run reaching P1's `publish`: M7V-92's publish clause, M7V-69, and M7V-70's
+/// recorded-input measurement, all on the A1/P1 arming shape with two writes.
+mod publish_rows {
+    use super::*;
+    use crate::support::oracle::Oracle;
+    use rdb_core::contracts::ids::ReplicaRole;
+    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, NodeId, RequestId};
+    use rdb_core::contracts::ignore::KernelIgnoredReason;
+    use rdb_core::contracts::time::Tick;
+    use rdb_core::contracts::trace::AckRejectReason;
+    use rdb_core::contracts::trace::{DurabilityClass, SyncOutcome};
+    use rdb_sim::harness::run::{RunLimits, RunPlan, Runner};
+    use rdb_sim::harness::trace::validate;
+    use rdb_sim::sim::network::NetworkOp;
+    use rdb_sim::storage::StorageOp;
+
+    /// The lying copy: A, a regular secondary.
+    pub(super) const LIAR: NodeId = cases::A_NODE;
+    /// The activated generation.
+    const G2: Generation = Generation(2);
+    /// The first write's seq, the prefix the lie claims.
+    pub(super) const FIRST: u64 = cases::A1_P1_HEAD + 1;
+    /// The second write's seq, published after the lie.
+    pub(super) const SECOND: u64 = FIRST + 1;
+    /// The first write's tick: [`cases::A1_P1_SUBMIT_AT`] plus 50, off the host's 100 ms flush
+    /// grid, so the flush that meets the lie is the next grid tick after the write applied.
+    const FIRST_AT: u64 = cases::A1_P1_SUBMIT_AT + 50;
+    /// The second write's tick.
+    const SECOND_AT: u64 = FIRST_AT + 100;
+    const MAX_TICKS: u64 = SECOND_AT + 1_000;
+
+    /// What the run measured between the lie and the second write.
+    struct AfterLie {
+        false_claims: Vec<AppliedSeq>,
+        engine_durable: DurableSeq,
+        reported_durable: DurableSeq,
+        reported_buffered: AppliedSeq,
+    }
+
+    /// The A1/P1 arming shape, a write at [`FIRST_AT`], a second write at [`SECOND_AT`], run to
+    /// [`MAX_TICKS`]: the plan every row of this module drives, with its fault planned between
+    /// segments.
+    fn two_writes_plan() -> RunPlan {
+        let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+        let head = scenario
+            .ops
+            .iter()
+            .position(|op| matches!(op, ScenarioOp::Client(_)))
+            .expect("the A1/P1 case has a submit");
+        let write = scenario.ops[head].clone();
+        let mut second = write.clone();
+        if let ScenarioOp::Client(grammar::ClientOp::Submit { request, .. }) = &mut second {
+            *request = RequestId(SECOND);
+        }
+        scenario.ops.truncate(head);
+        scenario.ops.extend([
+            ScenarioOp::Time(grammar::TimeOp::Advance {
+                ticks: FIRST_AT - cases::A1_P1_SUBMIT_AT,
+            }),
+            write,
+            ScenarioOp::Time(grammar::TimeOp::Advance {
+                ticks: SECOND_AT - FIRST_AT,
+            }),
+            second,
+            ScenarioOp::Time(grammar::TimeOp::Advance {
+                ticks: MAX_TICKS - SECOND_AT,
+            }),
+        ]);
+        scenario.budget.max_ticks = MAX_TICKS;
+        scenario_run::lower(&scenario).expect("lowers")
+    }
+
+    /// The `FalseDurable{LIAR, FIRST}` planned one tick before the first write (told by the host
+    /// flush 50 ticks after the write). Three segments, so the state between the lie and the
+    /// second write can be read.
+    fn false_durable_under_two_writes() -> (ScenarioRun, AfterLie) {
+        let plan = two_writes_plan();
+        let limits = |deadline: u64| RunLimits {
+            max_events: plan.limits.max_events,
+            deadline: Tick(deadline),
+        };
+        let mut runner = Runner::new(&plan).expect("a runner");
+        let first = runner.run(limits(FIRST_AT - 1)).expect("to the write");
+        assert!(
+            matches!(first.stop, StopReason::DeadlineReached { .. }),
+            "{:?}",
+            first.stop
+        );
+        runner
+            .dispatcher_mut()
+            .inject_storage(StorageOp::FalseDurable {
+                node: LIAR,
+                through: AppliedSeq(FIRST),
+            })
+            .expect("planned on A");
+        let middle = runner.run(limits(SECOND_AT - 1)).expect("through the lie");
+        assert!(
+            matches!(middle.stop, StopReason::DeadlineReached { .. }),
+            "{:?}",
+            middle.stop
+        );
+        let engine = runner.dispatcher().engine(LIAR).expect("A's engine");
+        let progress = runner
+            .dispatcher()
+            .replication()
+            .receiver(LIAR, cases::PARTITION)
+            .map(|receiver| receiver.current_ack().progress)
+            .expect("R1 holds A's receiver");
+        let after = AfterLie {
+            false_claims: engine.false_claims().to_vec(),
+            engine_durable: engine.durable(cases::PARTITION, G2),
+            reported_durable: progress.durable,
+            reported_buffered: progress.buffered_applied,
+        };
+        let report = runner.run(limits(MAX_TICKS)).expect("to the deadline");
+        let trace = runner.finish().expect("a trace");
+        validate(&trace).expect("well formed");
+        let oracle = Oracle::new().judge(&trace);
+        (
+            ScenarioRun {
+                plan,
+                report,
+                trace,
+                oracle,
+            },
+            after,
+        )
+    }
+
+    /// The node the forgery claims to be. The environment lists three nodes; this is none of them.
+    pub(super) const CLAIMED: NodeId = NodeId(4);
+
+    /// A `ForgeAck{A -> B, claimed CLAIMED as RegularSecondary, unauthenticated}` planned one tick
+    /// before the first write, so it takes that write's acknowledgement from A. Returns the run
+    /// and what the network still held planned when it ended.
+    pub(super) fn forged_ack_under_two_writes() -> (ScenarioRun, Vec<NetworkOp>) {
+        let plan = two_writes_plan();
+        let limits = |deadline: u64| RunLimits {
+            max_events: plan.limits.max_events,
+            deadline: Tick(deadline),
+        };
+        let mut runner = Runner::new(&plan).expect("a runner");
+        let first = runner.run(limits(FIRST_AT - 1)).expect("to the write");
+        assert!(
+            matches!(first.stop, StopReason::DeadlineReached { .. }),
+            "{:?}",
+            first.stop
+        );
+        runner
+            .dispatcher_mut()
+            .inject_network(NetworkOp::ForgeAck {
+                from: LIAR,
+                to: cases::B_NODE,
+                claimed_node: CLAIMED,
+                claimed_role: ReplicaRole::RegularSecondary,
+                authenticated: false,
+            })
+            .expect("planned on the A -> B hop");
+        let report = runner.run(limits(MAX_TICKS)).expect("to the deadline");
+        let planned = runner.dispatcher().network().planned().to_vec();
+        let trace = runner.finish().expect("a trace");
+        validate(&trace).expect("well formed");
+        let oracle = Oracle::new().judge(&trace);
+        (
+            ScenarioRun {
+                plan,
+                report,
+                trace,
+                oracle,
+            },
+            planned,
+        )
+    }
+
+    /// `(index, tick, node)` of every acknowledgement the kernel refused as `reason`.
+    pub(super) fn ack_rejections(
+        trace: &Trace,
+        reason: AckRejectReason,
+    ) -> Vec<(usize, u64, NodeId)> {
+        trace
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match &event.kind {
+                TraceKind::KernelNoted {
+                    note:
+                        KernelNote::Ignored {
+                            reason: KernelIgnoredReason::AckRejected(rejected),
+                            ..
+                        },
+                    ..
+                } if *rejected == reason => Some((index, event.logical_tick, event.node)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(index, durable_seq, outcome, captured seqs)` of every `durability_advance` on `node` in
+    /// generation 2.
+    fn syncs_on(trace: &Trace, node: NodeId) -> Vec<(usize, u64, SyncOutcome, Vec<u64>)> {
+        trace
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.node == node)
+            .filter_map(|(index, event)| match &event.kind {
+                TraceKind::DurabilityAdvance {
+                    generation,
+                    durable_seq,
+                    outcome,
+                    captured,
+                    ..
+                } if *generation == G2 => Some((
+                    index,
+                    durable_seq.0,
+                    *outcome,
+                    captured.iter().map(|(_, seq)| seq.0).collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One `publish` line: `(index, seq, evidence as (node, class))`.
+    pub(super) type PublishLine = (usize, u64, Vec<(NodeId, DurabilityClass)>);
+
+    /// Every `publish` in `trace`, in trace order.
+    pub(super) fn publishes(trace: &Trace) -> Vec<PublishLine> {
+        trace
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match &event.kind {
+                TraceKind::Publish {
+                    seq, ack_evidence, ..
+                } => Some((
+                    index,
+                    seq.0,
+                    ack_evidence
+                        .iter()
+                        .map(|evidence| (evidence.node, evidence.durability))
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `trace` with the capability lines of `packages` flipped to `Wired`: what the oracle would
+    /// say of this run once those packages land. A probe of the checkers, never a verdict on
+    /// the run (§12 forbids reading it as one).
+    pub(super) fn as_if_wired(trace: &Trace, packages: &[PackageId]) -> Trace {
+        let mut probe = trace.clone();
+        for event in &mut probe.events {
+            if let TraceKind::Capability { package, state } = &mut event.kind {
+                if packages.contains(package) {
+                    *state = CapabilityState::Wired;
+                }
+            }
+        }
+        probe
+    }
+
+    /// M7V-92, the clause parked until a sim run published (V-R25 (2), MUT-5 kernel half): **no
+    /// publish counts an ungrounded ack**, on a run that publishes.
+    ///
+    /// The lie is told by the host flush after the first write published and before the second:
+    /// A's engine records the claim (`false_claims == [11]`), moves nothing (`durable == 10`),
+    /// and R1's acknowledgement for A reports what M1 performed (`durable 10`) under what A
+    /// buffered (`11`), never the claim. The recorder writes the lie as the one `Partial` line on
+    /// A in generation 2, at 10 over a capture of 11, and no `Synced` line on A reaches 11 before
+    /// it. The second write then publishes **after** the lie with A's evidence `Buffered` — the
+    /// class the kernel publishes on — and every accepted acknowledgement from A is `Buffered`:
+    /// nothing the lie could ground was counted.
+    ///
+    /// INV-PUB does not fire. Its verdict is `Unavailable{Capability(P1)}` while P1 reports
+    /// Unavailable ([`oracle_half`], §12); with P1 and R1 flipped to `Wired` on a copy of the
+    /// trace it is `Proven`, which says the checker armed on the publish and found nothing. Red
+    /// under a recorder that names A's evidence `Durable` (`required_copy_set_unsatisfied`) and
+    /// under one that writes the lie as `Synced`.
+    #[retcd_test]
+    fn m7v_92_a_publish_after_the_lie_counts_no_ungrounded_ack() {
+        support::preamble();
+        let (run, after) = false_durable_under_two_writes();
+        assert!(
+            matches!(run.report.stop, StopReason::DeadlineReached { deadline, .. }
+                if deadline.0 == MAX_TICKS),
+            "{:?}",
+            run.report.stop
+        );
+
+        // The lie was told, and the kernel reports what M1 performed.
+        assert_eq!(
+            after.false_claims,
+            vec![AppliedSeq(FIRST)],
+            "one lie, about 11"
+        );
+        assert_eq!(
+            after.engine_durable,
+            DurableSeq(cases::A1_P1_HEAD),
+            "M1 moved nothing"
+        );
+        assert_eq!(
+            after.reported_buffered,
+            AppliedSeq(FIRST),
+            "A buffered the write"
+        );
+        assert_eq!(
+            after.reported_durable, after.engine_durable,
+            "R1 reports M1's watermark, never the claim"
+        );
+
+        // The record: one Partial at the watermark over the captured 11, no Synced at 11 before it.
+        let syncs = syncs_on(&run.trace, LIAR);
+        tracing::info!(?syncs, "A's durability_advance lines in generation 2");
+        let partials: Vec<_> = syncs
+            .iter()
+            .filter(|line| line.2 == SyncOutcome::Partial)
+            .collect();
+        let [(lie, durable, _, captured)] = partials.as_slice() else {
+            panic!("exactly one Partial line on A: {syncs:?}");
+        };
+        assert_eq!(
+            *durable,
+            cases::A1_P1_HEAD,
+            "the Partial names the real watermark"
+        );
+        assert!(
+            captured.contains(&FIRST),
+            "the lie covered 11: {captured:?}"
+        );
+        assert!(
+            syncs
+                .iter()
+                .all(|(index, durable, outcome, _)| *index > *lie
+                    || *outcome != SyncOutcome::Synced
+                    || *durable < FIRST),
+            "no Synced line on A reaches 11 before the lie: {syncs:?}"
+        );
+
+        // The publications: the second is after the lie and counts A as Buffered.
+        let published = publishes(&run.trace);
+        tracing::info!(?published, "publications");
+        assert_eq!(
+            published.iter().map(|p| p.1).collect::<Vec<_>>(),
+            vec![FIRST, SECOND],
+            "both writes published"
+        );
+        let (index, _, evidence) = &published[1];
+        assert!(*index > *lie, "the second publish follows the lie");
+        assert!(
+            evidence.contains(&(LIAR, DurabilityClass::Buffered)),
+            "A is counted as Buffered: {evidence:?}"
+        );
+        assert!(
+            !evidence
+                .iter()
+                .any(|(_, class)| *class == DurabilityClass::Durable),
+            "no evidence claims Durable: {evidence:?}"
+        );
+        let durable_acks_from_a = run
+            .trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(&event.kind, TraceKind::ReplicationAck { from_node, accepted, durability_class, .. }
+                    if *from_node == LIAR && *accepted && *durability_class == DurabilityClass::Durable)
+            })
+            .count();
+        assert_eq!(
+            durable_acks_from_a, 0,
+            "no accepted ack from A claims Durable"
+        );
+
+        // The oracle: nothing fired; verdicts per the preamble; Proven once armed.
+        let verdicts = oracle_half(&run);
+        tracing::info!(?verdicts, "M7V-92 oracle");
+        let probe = Oracle::new().judge(&as_if_wired(&run.trace, &[PackageId::P1, PackageId::R1]));
+        assert_eq!(
+            probe.verdict(Invariant::Pub),
+            &Verdict::Proven,
+            "INV-PUB armed on the publish and found nothing"
+        );
+    }
+
+    /// Scaffolding toward M7V-70 on **recorded** input; **claims no row**. The run above,
+    /// rewritten so A's accepted acknowledgements at or above the lie and A's publish evidence
+    /// say `Durable` — the recorder a kernel that believed the lie would drive — trips INV-PUB's
+    /// grounding clause; unrewritten it does not fire. INV-LOSS is measured: no `lineage_root`
+    /// is recorded, so it reports `Unavailable{Capability(F1)}` on both.
+    #[retcd_test]
+    fn false_durable_recorded_run_rewritten_to_a_durable_ack_trips_inv_pub() {
+        support::preamble();
+        let (run, _) = false_durable_under_two_writes();
+        assert!(run.oracle.is_clean(), "{:?}", run.oracle.violations());
+
+        let mut lied = run.trace.clone();
+        let mut touched = 0;
+        for event in &mut lied.events {
+            match &mut event.kind {
+                TraceKind::ReplicationAck {
+                    from_node,
+                    accepted,
+                    contiguous_seq,
+                    durability_class,
+                    ..
+                } if *from_node == LIAR && *accepted && contiguous_seq.0 >= FIRST => {
+                    *durability_class = DurabilityClass::Durable;
+                    touched += 1;
+                }
+                TraceKind::Publish { ack_evidence, .. } => {
+                    for evidence in ack_evidence.iter_mut().filter(|e| e.node == LIAR) {
+                        evidence.durability = DurabilityClass::Durable;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(touched > 0, "A acknowledged at or above the lie");
+        let report = Oracle::new().judge(&lied);
+        match report.verdict(Invariant::Pub) {
+            Verdict::Violated(signature) => {
+                assert_eq!(
+                    signature.core.rule, "durable_ack_ungrounded",
+                    "{}",
+                    signature.detail
+                );
+            }
+            other => panic!("INV-PUB expected Violated{{durable_ack_ungrounded}}, got {other:?}"),
+        }
+        tracing::info!(
+            clean = ?run.oracle.verdict(Invariant::Loss),
+            lied = ?report.verdict(Invariant::Loss),
+            "M7V-70's INV-LOSS half on recorded input, measured"
+        );
+    }
+}
+
+/// M7V-69 — MUT-2, count a shadow ACK: **the kernel half** (critic T-09), under a run that
+/// publishes.
+///
+/// **Kernel half.** The forgery takes A's acknowledgement of the first write and arrives at
+/// B claiming to be a regular secondary the topology does not list. R1 refuses it —
+/// `KernelNoted{Ignored{AckRejected(ForgedIdentity)}}` at B, once — and nothing in the trace
+/// names the claimed node: no `replication_ack` line (the recorder writes only accepted
+/// acks, so the `ForgedIdentity` coverage cell stays unavailable, ruling Q2 default) and no
+/// `publish.ack_evidence`. The first write still publishes, on C's acknowledgement alone,
+/// and the second on both copies.
+///
+/// **Oracle half.** INV-PUB does not fire: one regular-secondary acknowledgement satisfies
+/// `Rf3` (spec §5.2 step 6, ruling V-R39). On the recorded run its verdict is
+/// `Unavailable{Capability(P1)}` from the preamble ([`oracle_half`]); on the trace with P1
+/// and R1 flipped to `Wired` it is `Proven`. Under the oracle's earlier `Rf3 => 2` this row
+/// is red with `required_copy_set_unsatisfied` on the first publish.
+#[retcd_test]
+fn m7v_69_mut2_forged_shadow_ack_is_rejected_by_the_kernel() {
+    use publish_rows::{ack_rejections, as_if_wired, forged_ack_under_two_writes, publishes};
+    use publish_rows::{CLAIMED, FIRST, LIAR, SECOND};
+    use rdb_core::contracts::ids::NodeId;
+    use rdb_core::contracts::trace::{AckRejectReason, DurabilityClass};
+    use support::oracle::Oracle;
+    support::preamble();
+    let (run, planned) = forged_ack_under_two_writes();
+    assert!(planned.is_empty(), "the forgery was delivered: {planned:?}");
+
+    let rejections = ack_rejections(&run.trace, AckRejectReason::ForgedIdentity);
+    tracing::info!(?rejections, "M7V-69 rejections");
+    assert_eq!(
+        rejections.len(),
+        1,
+        "the kernel refused the forged acknowledgement exactly once: {rejections:?}"
+    );
+    assert_eq!(
+        rejections[0].2,
+        cases::B_NODE,
+        "refused by the primary it was sent to"
+    );
+    assert!(
+        run.trace.events.iter().all(|event| event.node != CLAIMED),
+        "no trace line is attributed to the claimed node"
+    );
+    assert!(
+        run.trace.events.iter().all(|event| !matches!(
+            &event.kind,
+            TraceKind::ReplicationAck { from_node, .. } if *from_node == CLAIMED
+        )),
+        "no accepted acknowledgement is from the claimed node"
+    );
+
+    let published = publishes(&run.trace);
+    tracing::info!(?published, "M7V-69 publishes");
+    let nodes = |evidence: &[(NodeId, DurabilityClass)]| -> BTreeSet<NodeId> {
+        evidence.iter().map(|(node, _)| *node).collect()
+    };
+    assert_eq!(
+        published
+            .iter()
+            .map(|(_, seq, evidence)| (*seq, nodes(evidence)))
+            .collect::<Vec<_>>(),
+        vec![
+            (FIRST, BTreeSet::from([cases::C_NODE])),
+            (SECOND, BTreeSet::from([LIAR, cases::C_NODE])),
+        ],
+        "the first write published on C's acknowledgement alone (A's was taken by the \
+         forgery, which counted for nothing); the second on both copies"
+    );
+
+    let verdicts = oracle_half(&run);
+    tracing::info!(?verdicts, "M7V-69 oracle");
+    let probe = Oracle::new().judge(&as_if_wired(&run.trace, &[PackageId::P1, PackageId::R1]));
+    assert_eq!(
+        probe.verdict(Invariant::Pub),
+        &Verdict::Proven,
+        "INV-PUB holds under one regular acknowledgement (V-R39): {:?}",
+        probe.violations()
+    );
 }
 
 // ------------------------------------------------------------------------------------------

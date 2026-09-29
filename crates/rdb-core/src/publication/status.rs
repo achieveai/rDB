@@ -97,6 +97,12 @@ impl StatusIndex {
         }
     }
 
+    /// Whether `generation` was dropped by [`Self::retire`] in this index's life — one boot.
+    #[must_use]
+    pub fn is_retired(&self, generation: Generation) -> bool {
+        self.retired.contains(&generation)
+    }
+
     /// The answer for `request` when the caller named no generation: the newest generation
     /// holding an entry for it, else `Unknown` — never `StatusExpired`, because without a
     /// generation nothing proves the one the client meant was retired (lead ruling A-R63).
@@ -122,14 +128,43 @@ impl StatusIndex {
             else {
                 continue;
             };
-            entry.outcome = if map.uncertain || map.discarded_from.is_some_and(|d| seq >= d) {
-                StatusOutcome::Unknown
-            } else if seq <= map.retained_through {
-                StatusOutcome::RecoveredApplied { result }
-            } else {
-                StatusOutcome::StatusExpired
-            };
+            entry.outcome = recovered_outcome(map, seq, result);
         }
+    }
+
+    /// Hold `entry` unless the index already speaks for its request in its generation, the
+    /// generation is retired, or a trim watermark covers its sequence. The seed's write
+    /// (M7A-194): a durable row never overrides what this instance recorded itself, and never
+    /// resurrects what a `StatusTrim` or `RetireGeneration` already dropped **in this boot**,
+    /// exactly as `DedupIndex::seed` respects T1's trims. Opens the generation, so absence beside
+    /// a seeded entry answers `Unknown`, as it does on the node that applied it.
+    ///
+    /// Retire and trim memory is per boot, like T1's `TrimMemory` (lead rulings A-R73a, A-R91
+    /// Q1): after a restart the seed may load rows of a generation an earlier boot retired or
+    /// trimmed, so the index answers a superset of what it answered before. That superset is
+    /// truthful — a dedup row exists only for a request that was applied.
+    ///
+    /// Returns whether the entry was added.
+    pub fn restore(&mut self, entry: StatusEntry) -> bool {
+        let generation = entry.lineage.generation;
+        if self.retired.contains(&generation) {
+            return false;
+        }
+        let floor = self
+            .retained_from_seq
+            .get(&generation)
+            .copied()
+            .unwrap_or(Seq::ZERO);
+        if entry.seq.is_some_and(|seq| seq < floor) {
+            return false;
+        }
+        self.open(generation);
+        let key = (generation, entry.request);
+        if self.entries.contains_key(&key) {
+            return false;
+        }
+        self.entries.insert(key, entry);
+        true
     }
 
     /// Drop `generation`'s entries below `below` and remember the watermark. Absence below it
@@ -161,5 +196,24 @@ impl StatusIndex {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Kernel-b §5.8's three-way rule for one `Published` entry of the predecessor generation, by
+/// its own `seq`: `uncertain` is tested first so it wins, then the discarded suffix, then the
+/// retained prefix; above it the entry is past retention. Shared by [`StatusIndex::fold_recovered`]
+/// and the failover seed (M7A-194), and both apply it to the **predecessor generation only**
+/// (`map.predecessor_generation`): `fold_recovered` folds nothing else, and the seed loads an
+/// older generation's row as `RecoveredApplied` (lead ruling A-R91, reviewer C-1). The rule is
+/// kept in one place; the scope is kept by each caller, and
+/// `m7a_194_status_seed_folds_only_the_predecessor_under_an_uncertain_map` compares the two.
+#[must_use]
+pub fn recovered_outcome(map: &RetainedStatusMap, seq: Seq, result: TxnResult) -> StatusOutcome {
+    if map.uncertain || map.discarded_from.is_some_and(|d| seq >= d) {
+        StatusOutcome::Unknown
+    } else if seq <= map.retained_through {
+        StatusOutcome::RecoveredApplied { result }
+    } else {
+        StatusOutcome::StatusExpired
     }
 }

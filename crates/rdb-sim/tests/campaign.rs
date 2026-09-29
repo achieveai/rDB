@@ -3,7 +3,7 @@
 //!
 //! The campaign runs through the scenario bridge (`campaign/engine.rs`): generated seeds, then
 //! the authored cases, folded per design §2.4. Today the bridge lowers no generated seed, so each
-//! reports the capability its checkers need, and the authored F1/R1 case is the history that runs.
+//! reports the capability its checkers need, and the authored cases are the histories that run.
 //! The rows that judge the campaign's *inputs* — the enumerated required lists, the coverage
 //! gate's three branches, the capability report, and the release-boundary grep — sit beside the
 //! rows that judge its outputs, because none of them fails when a package is missing.
@@ -276,15 +276,25 @@ fn m7v_82_capability_state_is_derived_from_the_modules_own_report_never_a_litera
     support::preamble();
 
     // (a) behavioural, both directions, on the real modules. The dispatcher answers from each
-    // module's own `capability()`, and today every kernel module takes the trait's default.
+    // module's own `capability()`: A1 and P1 override it to `Wired` (ruling V-R38; A1 evidenced
+    // by the campaign's INV-AUTH arming). T1 overrides it too and answers `Unavailable`, held
+    // under ruling V-R40 Q1; R1, L1 and F1 take the trait's default. `ModuleName::ALL` order:
+    // Authority, Transaction, Replication, Publication, Protection, Recovery. A report that
+    // answers Unavailable for a landed package is the misreported cause this row exists for; a
+    // Wired row among the other four is a literal or a table.
     let dispatcher = Dispatcher::new();
     let report = dispatcher.capability_report();
-    assert_eq!(report.len(), 6);
-    assert!(
-        report
-            .iter()
-            .all(|state| *state == CapabilityState::Unavailable),
-        "no kernel package is wired in M7, so a Wired row here is a misreported cause: {report:?}"
+    assert_eq!(
+        report,
+        [
+            CapabilityState::Wired,
+            CapabilityState::Unavailable,
+            CapabilityState::Unavailable,
+            CapabilityState::Wired,
+            CapabilityState::Unavailable,
+            CapabilityState::Unavailable,
+        ],
+        "{report:?}"
     );
 
     // The other direction: a module that overrides `capability()` reports Wired. Without this
@@ -315,7 +325,8 @@ fn m7v_82_capability_state_is_derived_from_the_modules_own_report_never_a_litera
     let block = corpus::capabilities();
     assert_eq!(block.len(), corpus::PACKAGES.len());
     assert_eq!(block[&PackageId::M1], CapabilityState::Wired);
-    assert_eq!(block[&PackageId::A1], CapabilityState::Unavailable);
+    assert_eq!(block[&PackageId::A1], CapabilityState::Wired);
+    assert_eq!(block[&PackageId::T1], CapabilityState::Unavailable);
 
     // (a) the `capability` events a real run records at trace start equal those reports, one
     // for one over every `PackageId`: the environment's in its order, then the dispatcher's in
@@ -719,8 +730,8 @@ use support::scenarios::{cases, gen, regress};
 /// the generated seeds plus the authored cases, run once.
 ///
 /// The authored cases ride along because M7V-55 reads "default corpus plus the authored cases",
-/// and because the F1/R1 case is the one history the bridge lowers today — without it the shared
-/// report would describe a corpus in which nothing ran.
+/// and because they are the histories the bridge lowers today (no generated seed does) — without
+/// them the shared report would describe a corpus in which nothing ran.
 fn shared() -> &'static Campaign {
     static SHARED: std::sync::OnceLock<Campaign> = std::sync::OnceLock::new();
     SHARED.get_or_init(|| {
@@ -735,11 +746,15 @@ fn shared() -> &'static Campaign {
     })
 }
 
-/// The authored cases (design §3.1 family 2). Two exist; the other two wait on T1 (A-R73).
+/// The authored cases (design §3.1 family 2), all four (M7V-47). The two F1/T1 cases carry the
+/// corpus's only Submits that reach A1 (ruling V-R37): survivors with a prefix, a recovery, the
+/// resume hold, then the write — the shape the campaign's INV-AUTH arming rests on.
 fn authored_cases() -> Vec<Scenario> {
     vec![
         cases::case_f1_r1_discovery_window(),
         cases::case_a1_p1_new_generation_between_publish_and_reply(),
+        cases::case_f1_t1_p1_retained_status_24h(),
+        cases::case_f1_t1_digest_across_recovery(),
     ]
 }
 
@@ -992,10 +1007,49 @@ fn m7v_52_campaign_reports_a_status_for_every_invariant() {
         violated.is_empty(),
         "the default corpus violated {violated:?}"
     );
+    // No history ended in a runner failure (tester F2, ruling V-R41). An unrun history folds as
+    // `NotArmed` once its packages are wired, so a `Harness` ending on one armed case would
+    // otherwise leave a `proven` status standing on the cases that still ran.
+    let harness: Vec<(usize, &str)> = campaign
+        .histories
+        .iter()
+        .filter_map(|history| match &history.ending {
+            engine::Ending::Harness(message) => Some((history.index, message.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        harness.is_empty(),
+        "shared-corpus histories ended in a harness failure: {harness:?}"
+    );
+    // Every lowered history runs whole at the default cap (review VC-C2). A history the budget
+    // cut is judged on a prefix, so a `proven` beside it would claim more than ran. F1/R1 pops
+    // 1,681 of 2,000 today.
+    let cut: Vec<(usize, u32)> = campaign
+        .histories
+        .iter()
+        .filter_map(|history| match &history.ending {
+            engine::Ending::Judged { popped, stop, .. }
+                if stop.starts_with("EventBudgetExhausted") =>
+            {
+                Some((history.index, *popped))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        cut.is_empty(),
+        "shared-corpus histories stopped at the event budget (index, pops): {cut:?}"
+    );
 
     // The artifact carries the same rows: status, seeds_armed, and a reason exactly when
     // unavailable (V-R20 (5)).
     let values = campaign.values();
+    // A runner failure is visible in the artifact too, not only in this row (review VC-C1).
+    assert_eq!(
+        values["histories_harness"], 0,
+        "the artifact counts harness endings"
+    );
     let entries = values["invariants"].as_object().expect("an invariants map");
     assert_eq!(entries.len(), registry.len());
     for row in &campaign.statuses {
@@ -1067,6 +1121,49 @@ fn m7v_52_campaign_reports_a_status_for_every_invariant() {
         "a disarmed seed is not an armed seed"
     );
     assert_eq!(status_of(Invariant::Lag), (Status::Proven, 3));
+
+    // A history that never ran (an `Unlowerable` seed) enters the same fold. Its verdict is what
+    // the block alone can say: `Capability(p)` for the first needed package that is not wired —
+    // and, when every needed package is wired, `NotArmed`, because design §2.4 points
+    // `Capability` "at a package owner" and `NotArmed` "at the corpus, the generator or the
+    // fixture", and a seed the bridge could not lower is the corpus's fault, not a package's.
+    // Until ruling V-R38 it read `Capability(I1)`, so one unlowerable seed made a fully wired
+    // invariant that a run had proved fold to `unavailable` (INV-AUTH, seeds_armed=2).
+    let all_wired: std::collections::BTreeMap<PackageId, CapabilityState> = corpus::PACKAGES
+        .iter()
+        .map(|package| (*package, CapabilityState::Wired))
+        .collect();
+    assert_eq!(
+        engine::unrun_verdict(Invariant::Auth, &all_wired),
+        Verdict::Unavailable(Unavailable::NotArmed),
+        "an unrun history says nothing against a fully wired invariant"
+    );
+    let mut r1_unwired = all_wired.clone();
+    r1_unwired.insert(PackageId::R1, CapabilityState::Unavailable);
+    assert_eq!(
+        engine::unrun_verdict(Invariant::Pub, &r1_unwired),
+        Verdict::Unavailable(Unavailable::Capability(PackageId::R1)),
+        "an unrun history still reports the package that is not wired"
+    );
+    let per_seed = per_seed_verdicts(&[(
+        Invariant::Auth,
+        [
+            engine::unrun_verdict(Invariant::Auth, &all_wired),
+            Verdict::Proven,
+            engine::unrun_verdict(Invariant::Auth, &all_wired),
+        ],
+    )]);
+    let folded = engine::fold(&per_seed);
+    let auth = folded
+        .iter()
+        .find(|row| row.invariant == Invariant::Auth)
+        .expect("every invariant folds");
+    assert_eq!(
+        (auth.status, auth.seeds_armed),
+        (Status::Proven, 1),
+        "one proving run beats two unrun histories; the unrun count is reported beside it, \
+         not folded over it"
+    );
 }
 
 /// The invariants the checker registry carries, in its order.
@@ -1225,33 +1322,63 @@ fn m7v_54_spike_require_all_fails_the_gate_on_any_not_proven() {
 #[retcd_test]
 fn m7v_53_unwired_capability_reports_unavailable_never_proven() {
     support::preamble();
-    // The input: this build's dispatcher report says P1 is unavailable. After P1 lands this row
-    // needs M7V-82's stubbed-module corpus instead, and says so rather than passing.
-    assert_eq!(
-        engine::capability_block().get(&PackageId::P1),
-        Some(&CapabilityState::Unavailable),
-        "P1 now reports Wired: M7V-53 must move to a P1-stubbed corpus (M7V-82)"
-    );
+    // The input: this build's dispatcher report says some kernel package is unavailable. The row
+    // was written against P1 while P1 was genuinely unwired; P1 reports Wired since ruling
+    // V-R38, and the plan's fallback (a corpus with one module stubbed to answer Unavailable
+    // through the report path) waits on a runner seam M7V-82 still parks. So the package is
+    // derived from the live block — the first kernel package, in `ModuleName::ALL` order, that
+    // reports Unavailable (T1 at V-R38) — and the row says so rather than passing on a literal.
+    // When every kernel package reports Wired this row must move to that stubbed corpus.
+    let block = engine::capability_block();
+    let unwired = [
+        PackageId::A1,
+        PackageId::T1,
+        PackageId::R1,
+        PackageId::P1,
+        PackageId::L1,
+        PackageId::F1,
+    ]
+    .into_iter()
+    .find(|package| block.get(package) == Some(&CapabilityState::Unavailable))
+    .expect("every kernel package reports Wired: M7V-53 must move to a stubbed corpus (M7V-82)");
     let campaign = shared();
+    // Every invariant that needs the package is unavailable, never proven; the ones whose first
+    // unwired need is this package name it in their reason.
     let dependent: Vec<&InvariantStatus> = campaign
         .statuses
         .iter()
-        .filter(|row| row.invariant.needs().contains(&PackageId::P1))
+        .filter(|row| row.invariant.needs().contains(&unwired))
         .collect();
     assert!(!dependent.is_empty());
     let values = campaign.values();
+    let mut named = 0;
     for row in &dependent {
-        assert_eq!(
-            row.status,
-            Status::Unavailable(Unavailable::Capability(PackageId::P1)),
-            "{} reads P1's events",
-            row.invariant.id()
+        assert!(
+            matches!(row.status, Status::Unavailable(Unavailable::Capability(_))),
+            "{} reads {unwired:?}'s events and must not be {:?}",
+            row.invariant.id(),
+            row.status
         );
-        assert_eq!(
-            values["invariants"][row.invariant.id()]["reason"],
-            "capability(P1)"
-        );
+        let first_unwired = row
+            .invariant
+            .needs()
+            .iter()
+            .find(|package| block.get(package) != Some(&CapabilityState::Wired));
+        if first_unwired == Some(&unwired) {
+            assert_eq!(
+                row.status,
+                Status::Unavailable(Unavailable::Capability(unwired)),
+                "{} reads {unwired:?}'s events",
+                row.invariant.id()
+            );
+            assert_eq!(
+                values["invariants"][row.invariant.id()]["reason"],
+                format!("capability({unwired:?})")
+            );
+            named += 1;
+        }
     }
+    assert!(named > 0, "no invariant is blocked on {unwired:?} first");
     // The binary may still exit 0: without SPIKE_REQUIRE_ALL the status gate passes.
     assert_eq!(
         engine::gate(&campaign.statuses, campaign.full_scale(), false, false),
@@ -1421,6 +1548,55 @@ fn m7v_63_campaign_never_exceeds_spike_max_events() {
         Ok(()),
         "the run does not fail on required_missing"
     );
+}
+
+// ------------------------------------------------------------------------------------------
+// M7V-48 — the campaign half: a real run's artifact names the spent budget
+// ------------------------------------------------------------------------------------------
+
+/// The loop half is `m7v_48_reducer_stops_at_each_of_the_three_shrink_budgets` in
+/// `scenarios.rs`. This half runs the campaign on the injected violation under each of the
+/// three knobs and reads the artifact: each names its own bound under `budget_spent`, a spent
+/// step or total budget still emits the best candidate so far, and a signature past the
+/// failure cap is recorded unminimized rather than dropped.
+#[retcd_test]
+fn m7v_48_a_real_run_names_the_spent_budget_in_its_artifact() {
+    support::preamble();
+    let injected = regress::injected_rf4_copy_set_shape();
+    for (var, value, spent, emits_candidate) in [
+        ("SPIKE_SHRINK_STEPS", "5", "steps", true),
+        ("SPIKE_SHRINK_BUDGET_TOTAL", "10", "total", true),
+        ("SPIKE_SHRINK_MAX_FAILURES", "0", "max_failures", false),
+    ] {
+        let knobs = knobs_of(&[("SPIKE_SEEDS", "1"), (var, value)]).with_max_events(2_000);
+        let campaign = small(
+            knobs,
+            1,
+            std::slice::from_ref(&injected),
+            &format!("m7v_48_{spent}"),
+        );
+        let values = campaign.values();
+        let minimized = values["minimized"]
+            .as_array()
+            .expect("the artifact lists every shrink");
+        assert_eq!(
+            minimized.len(),
+            1,
+            "{var}={value}: one failing history, one shrink entry: {minimized:?}"
+        );
+        let entry = &minimized[0];
+        assert_eq!(entry["budget_spent"], spent, "{var}={value}: {entry}");
+        assert_eq!(
+            entry["minimized"], emits_candidate,
+            "{var}={value}: a spent step or total budget still emits the best candidate so \
+             far; a signature past the failure cap is recorded unminimized: {entry}"
+        );
+        assert_eq!(
+            entry["slug"],
+            regress::sole_violation(&injected).core.slug(),
+            "the unshrunk signature is recorded, never dropped"
+        );
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -1671,6 +1847,52 @@ fn m7v_89_every_fully_wired_invariant_arms_on_the_default_corpus() {
     } else {
         println!("wired implies armed: covered {covered:?}");
     }
+    // A covered invariant is one a run armed and held, and that is what its status must say:
+    // `proven`, with the unlowerable seeds counted in the report beside it, never
+    // `unavailable(capability(I1))` because a seed the bridge could not lower said so (V-R38;
+    // design §2.4 puts `NotArmed`, not `Capability`, at the corpus).
+    for invariant in &covered {
+        let row = campaign
+            .statuses
+            .iter()
+            .find(|row| row.invariant == *invariant)
+            .expect("a covered invariant has a status row");
+        assert_eq!(
+            row.status,
+            Status::Proven,
+            "{}: armed on {} seed(s) and still not proven",
+            invariant.id(),
+            row.seeds_armed
+        );
+    }
+    // INV-AUTH's `proven` rests on A1's healthy path only, and the artifact says so beside the
+    // status (tester F1, ruling V-R41).
+    if covered.contains(&Invariant::Auth) {
+        let values = campaign.values();
+        let note = values["invariants"][Invariant::Auth.id()]["note"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            note.contains("healthy path") && note.contains("M7V-47"),
+            "INV-AUTH is proven, so its artifact entry must name the paths the corpus reaches: \
+             {note:?}"
+        );
+    }
+    // The note qualifies a `proven` and nothing else (review VC-C3): the same campaign with
+    // INV-AUTH unavailable carries no note beside it.
+    let mut unproven = campaign.clone();
+    for row in &mut unproven.statuses {
+        if row.invariant == Invariant::Auth {
+            row.status = Status::Unavailable(Unavailable::NotArmed);
+        }
+    }
+    let values = unproven.values();
+    let auth = &values["invariants"][Invariant::Auth.id()];
+    assert_eq!(auth["status"], "unavailable");
+    assert!(
+        auth.get("note").is_none(),
+        "an unavailable INV-AUTH still carries the proven note: {auth}"
+    );
 
     // The synthetic half: every package wired, one invariant never armed.
     let wired: std::collections::BTreeMap<PackageId, CapabilityState> = engine::capability_block()

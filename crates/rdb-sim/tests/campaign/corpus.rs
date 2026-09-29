@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use rdb_core::contracts::event::ModuleName;
 use rdb_core::contracts::trace::{CapabilityState, PackageId};
+use rdb_sim::harness::dispatch::Dispatcher;
 
 use crate::support::scenarios::coverage::{self, Axis, CoverageReport};
 
@@ -28,7 +30,33 @@ pub fn capabilities() -> BTreeMap<PackageId, CapabilityState> {
     for (package, state) in rdb_sim::harness::environment_capabilities() {
         block.insert(package, state);
     }
+    // The six kernel rows come from the dispatcher's own report, in `ModuleName::ALL` order,
+    // exactly as the runner records them. Until ruling V-R38 this loop did not exist and every
+    // kernel row read `Unavailable` whatever the dispatcher said, which no row caught while the
+    // report really was all-`Unavailable`; A1's flip is what exposed it (M7V-82, clause (a)).
+    for (module, state) in ModuleName::ALL
+        .into_iter()
+        .zip(Dispatcher::new().capability_report())
+    {
+        block.insert(package_of(module), state);
+    }
     block
+}
+
+/// The package a kernel module's capability row is stamped under.
+///
+/// Mirrors the runner's own mapping, which is not exported; row **M7V-82** asserts the block
+/// this builds equals the `capability` events a real run records, so the two cannot drift apart
+/// silently.
+const fn package_of(module: ModuleName) -> PackageId {
+    match module {
+        ModuleName::Authority => PackageId::A1,
+        ModuleName::Transaction => PackageId::T1,
+        ModuleName::Replication => PackageId::R1,
+        ModuleName::Publication => PackageId::P1,
+        ModuleName::Protection => PackageId::L1,
+        ModuleName::Recovery => PackageId::F1,
+    }
 }
 
 /// Every package a capability block must carry a row for.

@@ -30,9 +30,9 @@ use rdb_core::contracts::event::{
     ReplyEffect, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AppliedSeq, AuthorityGeneration, BootId, ClientId, ConfigVersion, CorrelationId, DurableSeq,
-    EventId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, ReceivedSeq, ReplicaRole,
-    RequestId, RequestIdentity, Revision, Seq, SnapshotHandle, TenantId, TimerVersion,
+    AffinityId, AppliedSeq, AuthorityGeneration, BootId, ClientId, ConfigVersion, CorrelationId,
+    DurableSeq, EventId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, ReceivedSeq,
+    ReplicaRole, RequestId, RequestIdentity, Revision, Seq, SnapshotHandle, TenantId, TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
@@ -59,6 +59,7 @@ use rdb_core::publication::{
     PUBLICATION_CORRELATION_BASE, PUBLICATION_SNAPSHOT_BASE, WAITER_CAP,
 };
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
+use rdb_core::transaction::dedup::{dedup_key, dedup_value};
 
 const NODE: NodeId = NodeId(1);
 const BOOT: BootId = BootId(1);
@@ -444,11 +445,15 @@ fn assert_no_status_is_unresolved(effects: &[EffectKind]) {
     }
 }
 
-/// A snapshot at one position with one key in it.
+/// A snapshot at one position with one key in it, and the dedup rows a status seed scans
+/// (M7A-194).
 struct FixedSnapshot {
     generation: Generation,
     at: Seq,
     data: BTreeMap<Vec<u8>, (Version, Bytes)>,
+    dedup: Vec<(Bytes, Bytes)>,
+    /// How many times `scan` was called: the status seed's rescans (reviewer R-3).
+    scans: std::cell::Cell<usize>,
 }
 
 impl SnapshotRead for FixedSnapshot {
@@ -467,8 +472,20 @@ impl SnapshotRead for FixedSnapshot {
     fn version(&self, _ns: Namespace, key: &[u8]) -> Option<Version> {
         self.data.get(key).map(|(v, _)| *v)
     }
-    fn scan(&self, _ns: Namespace, _from: &[u8], _limit: usize) -> Vec<(Bytes, Bytes)> {
-        Vec::new()
+    fn scan(&self, ns: Namespace, from: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+        self.scans.set(self.scans.get() + 1);
+        if ns != Namespace::Dedup {
+            return Vec::new();
+        }
+        let mut rows: Vec<_> = self
+            .dedup
+            .iter()
+            .filter(|(key, _)| key.as_ref() >= from)
+            .cloned()
+            .collect();
+        rows.sort();
+        rows.truncate(limit);
+        rows
     }
 }
 
@@ -520,6 +537,8 @@ impl Rig {
                 generation: GEN,
                 at: Seq(START),
                 data: BTreeMap::new(),
+                dedup: Vec::new(),
+                scans: std::cell::Cell::new(0),
             },
         };
         rig.snapshot_at(START);
@@ -749,7 +768,9 @@ fn reach_every_p1_carrier_steps_and_foreign_kinds_are_refused() {
         before,
         "a refused event does not step the kernel"
     );
-    assert_eq!(rig.p1.capability(), CapabilityState::Unavailable);
+    // `Wired` since ruling V-R38: the refusals above are the module's own answer to a foreign
+    // kind, not a sign that it is unwired.
+    assert_eq!(rig.p1.capability(), CapabilityState::Wired);
 }
 
 // ---- the publication rule ---------------------------------------------------------------------
@@ -2171,6 +2192,428 @@ fn recovered_folds_rebases_drops_the_candidate_and_answers_its_waiters() {
             rig.admitted(read_previous(31)),
             vec![previous(31, Ok(snap(3)))],
             "{mode:?}"
+        );
+    }
+}
+
+/// This test's own log lines whose message is `message`. Reads the per-test JSONL file the
+/// `#[retcd_test]` layer writes, the way `config_testkit::logs::lines_for_current_test` does;
+/// rdb-core has no `config-testkit` dev-dependency, and `config-log` is enough.
+fn own_log_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    let run = config_log::testing::test_run_id();
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read test log {}: {e}", path.display()))
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("malformed JSONL line in {}: {e}", path.display()))
+        })
+        .filter(|line| line["testRun"].as_str() == Some(run) && line["@m"] == message)
+        .collect()
+}
+
+/// M7A-194's unit twin: the status seed on a kernel that recorded nothing for the predecessor.
+/// The rig recovers `P` from `GEN` into `GEN + 1` with `retained_through = 6` while the snapshot's
+/// dedup namespace holds gen `GEN`'s rows for requests 4, 5, 6 and 7 (at seq 4, 5, 6 and 7) — the
+/// rows `DedupIndex::seed` loads for T1 — and one row that does not decode, which the seed skips
+/// (A-R90). While the snapshot shows only seq 5 nothing is loaded and
+/// the seed stays owed; once it shows seq 6 the next step loads it: 4, 5 and 6 (the cut itself)
+/// answer `RecoveredApplied` with the published result, asked with and without the generation; 7
+/// is above the cut and stays `Unknown`; under an uncertain map every seeded row answers
+/// `Unknown`, as `fold_recovered` answers for a held one. What the kernel recorded itself is not
+/// overwritten: request 5, published here before the recovery, folds through `fold_recovered` and
+/// keeps its own `record_digest`, while seeded requests 4 and 6 have none.
+#[retcd_test]
+fn m7a_194_status_seed_loads_the_predecessors_durable_rows() {
+    let next = Generation(GEN.0 + 1);
+    let row = |n: u64| {
+        (
+            dedup_key(GEN, AffinityId(1), req(n)),
+            dedup_value(Digest::ROOT, Seq(n), EPOCH),
+        )
+    };
+    let status_reply = |n: u64, status: TxnStatus| {
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status,
+        })]
+    };
+    let applied = |n: u64| {
+        TxnStatus::Resolved(TxnResult {
+            outcome: Outcome::RecoveredApplied,
+            ..result(P, n)
+        })
+    };
+    for uncertain in [false, true] {
+        let mut rig = Rig::new();
+        rig.published(5);
+        rig.snapshot.dedup = vec![
+            row(4),
+            row(5),
+            row(6),
+            row(7),
+            (
+                Bytes::from_static(&[1, 2, 3]),
+                Bytes::from_static(&[4, 5, 6]),
+            ),
+        ];
+        // The recovery lands while storage shows only seq 5: the seed is owed, not loaded.
+        rig.snapshot.generation = next;
+        rig.step(recovered(PartitionMode::Active, 6, uncertain, None));
+        let seed = rig
+            .p1
+            .kernel(NODE, P)
+            .expect("P1 holds P")
+            .seed_pending()
+            .expect("the seed is owed until the snapshot shows seq 5");
+        assert_eq!(
+            (seed.serving, seed.retained_through, seed.map.uncertain),
+            (next, Seq(6), uncertain),
+            "uncertain {uncertain}: the seed names the served generation and the cut"
+        );
+        assert_eq!(
+            rig.step(status(4, Some(GEN))),
+            status_reply(4, TxnStatus::Unknown),
+            "uncertain {uncertain}: before the seed an identity this kernel never recorded is Unknown"
+        );
+
+        rig.snapshot_at(6);
+        let want = |n: u64| {
+            if uncertain {
+                TxnStatus::Unknown
+            } else {
+                applied(n)
+            }
+        };
+        for (n, generation, want) in [
+            (4, Some(GEN), want(4)),
+            (5, Some(GEN), want(5)),
+            (5, None, want(5)),
+            (6, Some(GEN), want(6)),
+            (6, None, want(6)),
+            (7, Some(GEN), TxnStatus::Unknown),
+        ] {
+            assert_eq!(
+                rig.step(status(n, generation)),
+                status_reply(n, want),
+                "uncertain {uncertain}: r{n} asked with {generation:?}, once the snapshot shows the cut"
+            );
+        }
+        let kernel = rig.p1.kernel(NODE, P).expect("P1 holds P");
+        assert!(
+            kernel.seed_pending().is_none(),
+            "uncertain {uncertain}: loaded"
+        );
+        let view = kernel.view();
+        assert_eq!(
+            view.status.entry(GEN, req(5)).and_then(|e| e.record_digest),
+            Some(candidate_of(P, 5, 5).record_digest),
+            "uncertain {uncertain}: the entry this kernel recorded itself is kept, digest and all"
+        );
+        for n in [4, 6] {
+            assert_eq!(
+                view.status
+                    .entry(GEN, req(n))
+                    .map(|e| (e.record_digest, e.seq)),
+                Some((None, Some(Seq(n)))),
+                "uncertain {uncertain}: seeded r{n} has the row's seq and no record digest"
+            );
+        }
+        assert_eq!(
+            view.status.len(),
+            3,
+            "uncertain {uncertain}: 5 (own), 4 and 6 (seeded); 7 is above the cut, the row that \
+             does not decode is skipped"
+        );
+    }
+    // The skip is logged (reviewer T-1): once per seed that met the row, one seed per case.
+    assert_eq!(
+        own_log_lines(
+            "m7a_194_status_seed_loads_the_predecessors_durable_rows",
+            "status seed: a dedup row does not decode; skipped (A-R90)",
+        )
+        .len(),
+        2,
+        "one skip line per case"
+    );
+}
+
+/// M7A-194's seed on the `Recovered` step itself, and its one whole-seed refusal (tester-ka-next
+/// T8 and T9, A-R90). When the snapshot already shows the cut, the seed lands in the step that
+/// set it — the `try_seed` after `apply` in `Publication::step_with`, because the one before it
+/// ran when no seed existed — so nothing reaches the kernel between the recovery and a status
+/// query in the same batch. A dedup row written in the served generation or a newer one is not a
+/// predecessor's row: the seed loads nothing and stays owed while the snapshot shows it, and lands
+/// once it does not. The block logs one warning when it starts and rescans nothing until the
+/// snapshot moves (reviewer R-3): a second input at the same position does zero scans.
+#[retcd_test]
+fn m7a_194_status_seed_lands_on_the_recovered_step_and_fails_closed_on_a_newer_row() {
+    let next = Generation(GEN.0 + 1);
+    let row = |n: u64| {
+        (
+            dedup_key(GEN, AffinityId(1), req(n)),
+            dedup_value(Digest::ROOT, Seq(n), EPOCH),
+        )
+    };
+    let status_of = |n: u64, status: TxnStatus| {
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status,
+        })]
+    };
+    let applied = |n: u64| {
+        TxnStatus::Resolved(TxnResult {
+            outcome: Outcome::RecoveredApplied,
+            ..result(P, n)
+        })
+    };
+
+    // T8: the snapshot shows the cut before the recovery lands.
+    let mut rig = Rig::new();
+    rig.published(5);
+    rig.snapshot.dedup = vec![row(4)];
+    rig.snapshot.generation = next;
+    rig.snapshot_at(6);
+    rig.step(recovered(PartitionMode::Active, 6, false, None));
+    let kernel = rig.p1.kernel(NODE, P).expect("P1 holds P");
+    assert!(
+        kernel.seed_pending().is_none(),
+        "the seed lands on the Recovered step when the snapshot already shows the cut"
+    );
+    assert_eq!(
+        kernel.view().status.entry(GEN, req(4)).map(|e| e.seq),
+        Some(Some(Seq(4))),
+        "and request 4 is held from it"
+    );
+
+    // T9: a row of the served generation ahead of the seed, at or below the cut (above it the
+    // row is the discarded suffix and is skipped before its generation is looked at).
+    let mut rig = Rig::new();
+    rig.published(5);
+    let newer = (
+        dedup_key(next, AffinityId(1), req(8)),
+        dedup_value(Digest::ROOT, Seq(6), EPOCH),
+    );
+    rig.snapshot.dedup = vec![row(4), newer.clone()];
+    rig.snapshot.generation = next;
+    rig.snapshot_at(6);
+    rig.step(recovered(PartitionMode::Active, 6, false, None));
+    let kernel = rig.p1.kernel(NODE, P).expect("P1 holds P");
+    assert!(
+        kernel.seed_pending().is_some(),
+        "a row of the served generation keeps the whole seed owed"
+    );
+    assert!(
+        kernel.view().status.entry(GEN, req(4)).is_none(),
+        "nothing is loaded around it"
+    );
+    let scans = rig.snapshot.scans.get();
+    assert_eq!(
+        rig.step(status(4, Some(GEN))),
+        status_of(4, TxnStatus::Unknown),
+        "the row stays owed across a status query, which answers Unknown for the open predecessor"
+    );
+    assert_eq!(
+        rig.snapshot.scans.get(),
+        scans,
+        "a second input at the same snapshot position rescans nothing"
+    );
+    // The snapshot moves and still shows the row: rescanned, still blocked, not logged again.
+    rig.snapshot_at(7);
+    rig.step(status(4, Some(GEN)));
+    assert!(
+        rig.snapshot.scans.get() > scans,
+        "a moved snapshot is rescanned"
+    );
+    assert!(
+        rig.p1
+            .kernel(NODE, P)
+            .expect("P1 holds P")
+            .seed_pending()
+            .is_some(),
+        "still blocked"
+    );
+    rig.snapshot.dedup.retain(|r| r.0 != newer.0);
+    rig.snapshot_at(8);
+    assert_eq!(
+        rig.step(status(4, Some(GEN))),
+        status_of(4, applied(4)),
+        "once the snapshot no longer shows it the seed lands and request 4 answers"
+    );
+    assert_eq!(
+        own_log_lines(
+            "m7a_194_status_seed_lands_on_the_recovered_step_and_fails_closed_on_a_newer_row",
+            "status seed: blocked by a row of the served generation or newer",
+        )
+        .len(),
+        1,
+        "one warning for the block, however many steps it lasted"
+    );
+    assert!(
+        rig.p1
+            .kernel(NODE, P)
+            .expect("P1 holds P")
+            .seed_pending()
+            .is_none(),
+        "loaded"
+    );
+}
+
+/// M7A-194 under an uncertain map with two retained generations (lead ruling A-R91, reviewer
+/// C-1). The seed loads a row of `GEN - 1` and one of the predecessor `GEN`, recovering into
+/// `GEN + 1` with `uncertain: true`. Only the predecessor folds under the three-way rule: `GEN - 1`
+/// answers `RecoveredApplied`, `GEN` answers `Unknown` — the same split `fold_recovered` makes over
+/// the same two entries held in memory, where the older one is left as it was.
+#[retcd_test]
+fn m7a_194_status_seed_folds_only_the_predecessor_under_an_uncertain_map() {
+    let older = Generation(GEN.0 - 1);
+    let row = |generation: Generation, n: u64| {
+        (
+            dedup_key(generation, AffinityId(1), req(n)),
+            dedup_value(Digest::ROOT, Seq(n), EPOCH),
+        )
+    };
+    let mut rig = Rig::new();
+    rig.snapshot.dedup = vec![row(older, 3), row(GEN, 4)];
+    rig.snapshot.generation = Generation(GEN.0 + 1);
+    rig.snapshot_at(6);
+    rig.step(recovered(PartitionMode::Active, 6, true, None));
+    let kernel = rig.p1.kernel(NODE, P).expect("P1 holds P");
+    assert!(kernel.seed_pending().is_none(), "fixture: the seed landed");
+    let seeded = kernel.view().status;
+    assert_eq!(
+        seeded.lookup(req(3), older),
+        StatusOutcome::RecoveredApplied {
+            result: TxnResult {
+                generation: older,
+                ..result(P, 3)
+            }
+        },
+        "an older generation's row is not folded under the predecessor's uncertain map"
+    );
+    assert_eq!(
+        seeded.lookup(req(4), GEN),
+        StatusOutcome::Unknown,
+        "the predecessor's row is"
+    );
+
+    // The same two entries held in memory, folded by `fold_recovered` under the same map.
+    let mut held = StatusIndex::new(older);
+    for (generation, n) in [(older, 3), (GEN, 4)] {
+        held.record(StatusEntry {
+            request: req(n),
+            lineage: Lineage {
+                generation,
+                ..lineage()
+            },
+            seq: Some(Seq(n)),
+            record_digest: None,
+            outcome: StatusOutcome::Published {
+                result: TxnResult {
+                    generation,
+                    ..result(P, n)
+                },
+            },
+            snapshot: None,
+            at: Tick::ZERO,
+        });
+    }
+    held.fold_recovered(&RetainedStatusMap {
+        predecessor_generation: GEN,
+        predecessor_cutoff: Seq(6),
+        retained_through: Seq(6),
+        discarded_from: None,
+        uncertain: true,
+    });
+    let wire = |index: &StatusIndex, n: u64, generation: Generation| {
+        matches!(
+            to_wire(index.lookup(req(n), generation)),
+            TxnStatus::Resolved(_)
+        )
+    };
+    assert_eq!(
+        (wire(&seeded, 3, older), wire(&seeded, 4, GEN)),
+        (wire(&held, 3, older), wire(&held, 4, GEN)),
+        "the seed and fold_recovered resolve the same generations"
+    );
+    assert_eq!(
+        (wire(&held, 3, older), wire(&held, 4, GEN)),
+        (true, false),
+        "fixture: fold_recovered resolves the older entry and not the predecessor's"
+    );
+}
+
+/// M7A-194, a generation older than the predecessor while the seed is pending (lead ruling A-R91
+/// Q2 as revised, reviewer R-1). The slot opened at `GEN` only and recovers into `GEN + 1` with
+/// the snapshot below `retained_through`, so `GEN - 1` is neither open nor loaded. Before the seed
+/// it answers `Unknown`, not `StatusExpired`; after the seed its durable row answers
+/// `RecoveredApplied`. A generation this boot retired still answers `StatusExpired` throughout.
+#[retcd_test]
+fn m7a_194_status_seed_pending_never_expires_an_older_generation() {
+    let older = Generation(GEN.0 - 1);
+    let status_of = |status: TxnStatus| {
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(3),
+            status,
+        })]
+    };
+    for retired in [false, true] {
+        let mut rig = Rig::new();
+        rig.snapshot.dedup = vec![(
+            dedup_key(older, AffinityId(1), req(3)),
+            dedup_value(Digest::ROOT, Seq(3), EPOCH),
+        )];
+        rig.snapshot.generation = Generation(GEN.0 + 1);
+        if retired {
+            rig.step(EventKind::Kernel(KernelEvent::RetireGeneration {
+                generation: older,
+            }));
+        }
+        rig.step(recovered(PartitionMode::Active, 6, false, None));
+        assert!(
+            rig.p1
+                .kernel(NODE, P)
+                .expect("P1 holds P")
+                .seed_pending()
+                .is_some(),
+            "retired {retired}: fixture: the seed is owed"
+        );
+        let (before, after) = if retired {
+            (TxnStatus::Expired, TxnStatus::Expired)
+        } else {
+            (
+                TxnStatus::Unknown,
+                TxnStatus::Resolved(TxnResult {
+                    generation: older,
+                    outcome: Outcome::RecoveredApplied,
+                    ..result(P, 3)
+                }),
+            )
+        };
+        assert_eq!(
+            rig.step(status(3, Some(older))),
+            status_of(before),
+            "retired {retired}: before the seed"
+        );
+        rig.snapshot_at(6);
+        assert_eq!(
+            rig.step(status(3, Some(older))),
+            status_of(after),
+            "retired {retired}: after the seed"
+        );
+        assert!(
+            rig.p1
+                .kernel(NODE, P)
+                .expect("P1 holds P")
+                .seed_pending()
+                .is_none(),
+            "retired {retired}: loaded"
         );
     }
 }
@@ -4527,10 +4970,16 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 ///   `is_publication_snapshot`: a number, bound by storage only when P1 asks); construction;
 ///   boot, lineage, the **published** position; the view; the step. `open_view` (`pub(crate)`)
 ///   mints a handle asked for at the **published** position, for a publish and for `install`
-///   (A-R71); storage binds it, and P1 keeps it only if bound there.
+///   (A-R71); storage binds it, and P1 keeps it only if bound there. `try_seed` and
+///   `seed_pending` (M7A-194) read the dedup namespace of the step's snapshot — rows at or below
+///   `retained_through`, the recovered cutoff, which is the published position — and expose
+///   whether that read is still owed; neither hands back a view or a sequence above it.
 /// - `status.rs`: the KA-9 wire map and the status index. `entry` hands back a status entry: its
 ///   `seq` is the request's own position and its `snapshot` is `None` while pending, so it names no
-///   view anyone can read.
+///   view anyone can read. `restore` and `recovered_outcome` (M7A-194) are the seed's write and
+///   the fold rule it shares with `fold_recovered`; both take entries in and hand nothing out.
+///   `is_retired` (reviewer R-1, A-R91) answers whether a generation was retired in this boot —
+///   a generation, never a sequence or a view.
 /// - `view.rs`: the KA-8 fake's constructor and scripting.
 const PUB_FNS: [(&str, &str, &[&str]); 4] = [
     (
@@ -4562,6 +5011,8 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "open_view",
             "publication_snapshot",
             "published",
+            "seed_pending",
+            "try_seed",
             "view",
         ],
     ),
@@ -4572,12 +5023,15 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "entry",
             "fold_recovered",
             "is_empty",
+            "is_retired",
             "len",
             "lookup",
             "lookup_any",
             "new",
             "open",
             "record",
+            "recovered_outcome",
+            "restore",
             "retire",
             "to_wire",
             "trim",

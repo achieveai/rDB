@@ -10,9 +10,11 @@
 //! seed is `Unlowerable` at this basis**. Such a seed is recorded as refused, with its op index
 //! and reason, and is never counted as a run. Its per-seed verdict is exactly what the oracle
 //! would have said from the build's capability block — `Capability(p)` for the first needed
-//! package that reports `Unavailable` — and `Capability(I1)` when every needed package is wired,
-//! because then the only thing missing was the runner. It is never `Proven` and never
-//! `NotArmed`: an unrun seed cannot conclude anything from silence.
+//! package that reports `Unavailable` — and `NotArmed` when every needed package is wired: a
+//! seed the bridge could not lower is the corpus's fault, and design §2.4 points `NotArmed` "at
+//! the corpus, the generator or the fixture" and `Capability` "at a package owner". It is never
+//! `Proven`. (Until ruling V-R38 the wired case read `Capability(I1)`, and one unlowerable seed
+//! then folded a fully wired invariant that a run had proved down to `unavailable`.)
 //!
 //! # One fold
 //!
@@ -68,10 +70,12 @@ pub struct Knobs {
 }
 
 impl Knobs {
-    /// The plain `cargo test` column.
+    /// The plain `cargo test` column. `max_events` is 2 000 (ruling V-R38): the authored F1/T1
+    /// cases reach their first Submit at 978 pops, and the earlier 512 stopped them at tick
+    /// 4 603, so no history in the default corpus could arm INV-AUTH.
     pub const DEFAULT: Self = Self {
         seeds: 64,
-        max_events: 512,
+        max_events: 2_000,
         max_ticks: Budget::DEFAULT.max_ticks,
         seed_base: gen::SPIKE_SEED_BASE,
         shrink: ShrinkBudget::DEFAULT,
@@ -219,9 +223,10 @@ pub fn unrun_verdict(
         .needs()
         .iter()
         .find(|package| capabilities.get(package) != Some(&CapabilityState::Wired));
-    Verdict::Unavailable(Unavailable::Capability(
-        missing.copied().unwrap_or(PackageId::I1),
-    ))
+    match missing {
+        Some(package) => Verdict::Unavailable(Unavailable::Capability(*package)),
+        None => Verdict::Unavailable(Unavailable::NotArmed),
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -885,6 +890,15 @@ impl Campaign {
             .count()
     }
 
+    /// Histories the runner failed on: neither judged nor refused by the bridge (review VC-C1).
+    #[must_use]
+    pub fn harness_failures(&self) -> usize {
+        self.histories
+            .iter()
+            .filter(|h| matches!(h.ending, Ending::Harness(_)))
+            .count()
+    }
+
     /// Events popped across every history that ran.
     #[must_use]
     pub fn events_total(&self) -> u64 {
@@ -1114,6 +1128,11 @@ impl Campaign {
                 entry.insert("reason".into(), json!(reason));
             }
             entry.insert("seeds_armed".into(), json!(row.seeds_armed));
+            // The note qualifies a `proven`; beside any other status it would qualify nothing
+            // (review VC-C3).
+            if let Some(note) = reach_note(row.invariant).filter(|_| row.status == Status::Proven) {
+                entry.insert("note".into(), json!(note));
+            }
             invariants.insert(row.invariant.id().into(), Value::Object(entry));
         }
         let mutations: Map<String, Value> = MutationId::ALL
@@ -1148,6 +1167,7 @@ impl Campaign {
             "events_total": self.events_total(),
             "histories_ran": self.ran(),
             "histories_unlowerable": self.unlowerable(),
+            "histories_harness": self.harness_failures(),
             "invariants": invariants,
             "mutations": mutations,
             "wall_ms": self.wall_ms(),
@@ -1221,6 +1241,28 @@ impl Campaign {
                 .map(|u| (format!("{}.{}", u.axis.name(), u.cell), json!(format!("{:?}", u.package))))
                 .collect::<Map<String, Value>>(),
         })
+    }
+}
+
+/// What a `proven` status covers, where the corpus reaches less than the checker could judge
+/// (ruling V-R41). The artifact carries it as the invariant's `note`.
+///
+/// INV-AUTH: the default corpus drives A1 only on its healthy path. Two bounded attempts in
+/// correction round 4 found no op the bridge lowers that lapses a lease, fences, or moves a
+/// lineage, and a submit before the grant is refused by T1's admission before A1 is asked.
+#[must_use]
+pub const fn reach_note(invariant: Invariant) -> Option<&'static str> {
+    match invariant {
+        Invariant::Auth => Some(
+            "proven covers only the paths the default corpus reaches: A1's healthy path \
+             (every recorded decision Valid, inside a held grant, one generation). No history \
+             reaches a NoGrant, Expired, Fenced or lineage denial; rdb-core unit rows cover \
+             those (m7a_03, m7a_36, m7a_50, \
+             a_read_moving_a_partition_to_a_withheld_lineage_fences_the_old_one, \
+             m7a_184..m7a_187, m7a_99, m7a_100). The \
+             denial-reach corpus member is owed under M7V-47/M7V-88 (ruling V-R41).",
+        ),
+        _ => None,
     }
 }
 

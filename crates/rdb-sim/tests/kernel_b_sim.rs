@@ -1,6 +1,10 @@
 //! Kernel-b sim rows of `docs/testing/test-plan-m7-kernel-b.md` that need a fault the simulator
-//! injects: M7B-26 (`StorageOp::FalseDurable`), M7B-32 (`NetworkOp::ForgeAck`) and M7B-78
-//! (a failed flush, `StorageOp::Fail{FlushFailed}`) with its storage-backed positive control.
+//! injects: M7B-26 (`StorageOp::FalseDurable`), M7B-32 (`NetworkOp::ForgeAck`), M7B-78
+//! (a failed flush, `StorageOp::Fail{FlushFailed}`) with its storage-backed positive control,
+//! M7B-62 (the replication stream under `Duplicate`, `Drop`, `Corrupt` and a forged ACK), and
+//! two rows on the full stack of the lowered A1/P1 case: M7B-68 (`StorageOp::StallFlush` on
+//! every copy, L1 warns and pauses admission) and M7B-47 (a copy ACKs and diverges before P1
+//! evaluates, and P1's live `qualifies_now` refuses the publish).
 //!
 //! Every row reads the two surfaces plan BA-4 allows: what the kernel holds or returned (R1's
 //! receiver and tracker, read through `Dispatcher::replication`), and the landed `TraceKind` lines
@@ -15,32 +19,40 @@
 mod support;
 
 use config_log::retcd_test;
-use rdb_core::contracts::authority::Lineage;
+use rdb_core::contracts::authority::{AuthorityIgnoreReason, Checkpoint, Lineage};
 use rdb_core::contracts::envelope::{
     AppendOutcome, AppendReject, ReplicaProgress, ReplicationEnvelope,
 };
-use rdb_core::contracts::event::{EventKind, ModuleName};
+use rdb_core::contracts::errors::RdbError;
+use rdb_core::contracts::event::{ClientEvent, EventKind, KernelEvent, ModuleName, ReplyEffect};
 use rdb_core::contracts::ids::{
-    AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, Generation, MessageId, NodeId,
-    OwnerEpoch, PartitionId, ReceivedSeq, ReplicaRole, Seq,
+    AffinityId, AppliedSeq, BootId, ClientId, ConfigVersion, CorrelationId, DurableSeq, Generation,
+    MessageId, NodeId, OwnerEpoch, PartitionId, ReceivedSeq, ReplicaRole, RequestId,
+    RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
-    AckRejectReason, ApplyOutcome, DispatchOutcome, KernelNote, SyncOutcome, TraceEvent, TraceKind,
+    AckRejectReason, ApplyOutcome, DispatchOutcome, KernelNote, ProtectionPhase, SyncOutcome,
+    TraceEvent, TraceKind,
 };
 use rdb_core::contracts::transport::{Frame, PeerLabel, TransportEvent};
-use rdb_core::contracts::version::ENVELOPE_VERSION;
+use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
+use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
+use rdb_core::protection::{Mode, Protection};
 use rdb_core::replication::append::{AppendReceiver, Head, ReceiverInit};
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use rdb_core::replication::wire::decode_reply;
+use rdb_sim::harness::hop::HopDelay;
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent, StopReason};
 use rdb_sim::harness::trace::log_line;
-use rdb_sim::sim::network::{Delivery, NetworkOp, Transmission};
+use rdb_sim::sim::network::{Delivery, LinkState, NetworkOp, Transmission};
 use rdb_sim::storage::history::{canonical_history, history_writes, CanonicalHistory};
 use rdb_sim::storage::StorageOp;
 use std::collections::{BTreeMap, BTreeSet};
+use support::scenarios::cases;
+use support::scenarios::run as scenario_run;
 
 const PARTITION: PartitionId = PartitionId(1);
 const BOOT: BootId = BootId(1);
@@ -1427,5 +1439,644 @@ fn m7b_62_replication_end_to_end_duplicate_gap_and_forged_ack() {
     assert!(
         outside.is_empty(),
         "Ignored reasons outside BA-11: {outside:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The full-stack fixture for M7B-47 and M7B-68: the lowered A1/P1 case without its activation.
+//
+// `cases::case_a1_p1_new_generation_between_publish_and_reply()` with `A1_P1_ACTIVATE_OP`
+// removed lowers to a three-node generation-2 partition: primary `cases::B_NODE` (node 1),
+// regular secondaries `cases::C_NODE` (node 2, copy 1) and `cases::A_NODE` (node 3, copy 2),
+// recovered at cutoff `A1_P1_HEAD` (10). L1 starts `Paused`, the barrier goes durable at the plan
+// tick and the 5 s hold ends at `A1_P1_RESUMES_AT`; the case's own write, request 11 -> seq 11 at
+// `A1_P1_SUBMIT_AT`, applies, is acknowledged by both secondaries, publishes and is replied in
+// that one tick (`tests/scenarios.rs` `a1p1_case_without_its_activation_publishes_through_a1`).
+// The lowering's host flusher flushes every node every `HOST_FLUSH_EVERY_MILLIS` (100). Both rows
+// start from that healthy, published state, and each row's doc says which plan letter is which
+// node: the case names its primary B, the plan names its primary A.
+
+/// The fixture's primary, node 1, on which every kernel these rows read runs.
+const STACK_PRIMARY: NodeId = cases::B_NODE;
+/// The tick the case's own write, request 11 -> seq 11, is submitted; L1 has been `Healthy`
+/// since `A1_P1_RESUMES_AT`.
+const STACK_SUBMIT_AT: u64 = cases::A1_P1_SUBMIT_AT;
+/// The recovery cutoff and the tracker's anchor (B-R47a); the case's write is `+ 1`.
+const STACK_HEAD: u64 = cases::A1_P1_HEAD;
+
+fn a1p1_plan() -> RunPlan {
+    let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+    scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    scenario_run::lower(&scenario).expect("the A1/P1 case lowers")
+}
+
+/// A one-key put by tenant 1, client 1, `request`: the shape the case's own write has.
+fn stack_txn(request: u64) -> TxnRequest {
+    TxnRequest {
+        api_version: API_VERSION,
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(request),
+        },
+        affinity: AffinityId(1),
+        expected_generation: None,
+        remaining_millis: 1_000,
+        conditions: Vec::new(),
+        mutations: vec![Mutation::Put {
+            key: scoped_key(TenantId(1), AffinityId(1), b"k"),
+            value: bytes::Bytes::copy_from_slice(&request.to_be_bytes()),
+            expected_version: None,
+        }],
+    }
+}
+
+fn on_stack_primary(at: u64, correlation: u64, kind: EventKind) -> SeedEvent {
+    SeedEvent {
+        at: Tick(at),
+        node: STACK_PRIMARY,
+        boot: scenario_run::BOOT,
+        partition: PARTITION,
+        correlation: CorrelationId(correlation),
+        kind,
+    }
+}
+
+/// Runs to `to` and returns the replies that segment produced.
+fn stack_run_to(runner: &mut Runner, to: u64) -> Vec<(NodeId, ReplyEffect)> {
+    let report = runner
+        .run(RunLimits {
+            max_events: 200_000,
+            deadline: Tick(to),
+        })
+        .expect("the run reaches its deadline");
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "the segment to {to} stopped early: {:?}",
+        report.stop
+    );
+    report.replies
+}
+
+fn stack_l1_mode(runner: &Runner) -> Option<Mode> {
+    runner
+        .dispatcher()
+        .protection(STACK_PRIMARY, PARTITION)
+        .and_then(Protection::mode)
+}
+
+/// `(tick, seq)` of every generation-2 `batch_apply` line on the primary: one per admitted write,
+/// which is how "admitted at" is read. `AdmissionDecision` is declared and never recorded.
+fn stack_applies(trace: &[TraceEvent]) -> Vec<(u64, u64)> {
+    trace
+        .iter()
+        .filter(|event| event.node == STACK_PRIMARY)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                generation, seq, ..
+            } if *generation == Generation(2) => Some((event.logical_tick, seq.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(tick, seq)` of every `publish` line in the run.
+fn stack_publishes(trace: &[TraceEvent]) -> Vec<(u64, u64)> {
+    trace
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::Publish { seq, .. } => Some((event.logical_tick, seq.0)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(tick, oldest_unsafe_seq, age_ms)` of every `ProtectionWarn` L1 on the primary noted.
+fn stack_warns(trace: &[TraceEvent]) -> Vec<(u64, u64, u64)> {
+    trace
+        .iter()
+        .filter(|event| event.node == STACK_PRIMARY)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                module: ModuleName::Protection,
+                note:
+                    KernelNote::ProtectionWarn {
+                        oldest_unsafe_seq,
+                        age_ms,
+                    },
+                ..
+            } => Some((event.logical_tick, oldest_unsafe_seq.0, *age_ms)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `(tick, reason)` of every `Ignored` P1 on the primary noted.
+fn stack_p1_ignored(trace: &[TraceEvent]) -> Vec<(u64, KernelIgnoredReason)> {
+    trace
+        .iter()
+        .filter(|event| event.node == STACK_PRIMARY)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                module: ModuleName::Publication,
+                note: KernelNote::Ignored { reason },
+                ..
+            } => Some((event.logical_tick, reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many `durability_advance` lines any node wrote at or after `tick`.
+fn stack_advances_from(trace: &[TraceEvent], tick: u64) -> usize {
+    trace
+        .iter()
+        .filter(|event| event.logical_tick >= tick)
+        .filter(|event| matches!(event.kind, TraceKind::DurabilityAdvance { .. }))
+        .count()
+}
+
+/// The number of requests M7B-68 submits after the stall, one every 10 ms for 3 s.
+const STALL_WRITES: u64 = 300;
+
+/// One M7B-68 run: the fixture to `STACK_SUBMIT_AT - 1` (L1 `Healthy`, nothing written yet),
+/// then with `stall` every node's flushes stalled by `StorageOp::StallFlush`, then
+/// [`STALL_WRITES`] client writes queued at `STACK_SUBMIT_AT + 10k` beside the case's own
+/// write, and the run taken to `STACK_SUBMIT_AT + 3000`. Returns the runner, the trace and the
+/// replies of the last segment.
+fn stall_run(stall: bool) -> (Runner, Vec<TraceEvent>, Vec<(NodeId, ReplyEffect)>) {
+    let plan = a1p1_plan();
+    let mut runner = Runner::new(&plan).expect("a runner");
+    stack_run_to(&mut runner, STACK_SUBMIT_AT - 1);
+    assert_eq!(
+        stack_l1_mode(&runner),
+        Some(Mode::Healthy),
+        "the fixture is Healthy before the stall (A6): the row measures from a Healthy L1"
+    );
+    if stall {
+        for node in [cases::B_NODE, cases::C_NODE, cases::A_NODE] {
+            runner
+                .dispatcher_mut()
+                .inject_storage(StorageOp::StallFlush { node })
+                .expect("the stall is planned");
+        }
+    }
+    for k in 1..=STALL_WRITES {
+        runner
+            .queue(&on_stack_primary(
+                STACK_SUBMIT_AT + 10 * k,
+                20_000 + k,
+                EventKind::Client(ClientEvent::Submit(stack_txn(STACK_HEAD + 1 + k))),
+            ))
+            .expect("a write is queued");
+    }
+    let replies = stack_run_to(&mut runner, STACK_SUBMIT_AT + 3_000);
+    let trace = runner.recorded().to_vec();
+    (runner, trace, replies)
+}
+
+/// `(successes, protection_paused, anything else)` among `replies`.
+fn stack_reply_counts(replies: &[(NodeId, ReplyEffect)]) -> (usize, usize, Vec<String>) {
+    let mut success = 0;
+    let mut paused = 0;
+    let mut other = Vec::new();
+    for (_, reply) in replies {
+        match reply {
+            ReplyEffect::Transaction { .. } => success += 1,
+            ReplyEffect::Failed {
+                error: RdbError::ProtectionPaused { .. },
+                ..
+            } => paused += 1,
+            reply => other.push(format!("{reply:?}")),
+        }
+    }
+    (success, paused, other)
+}
+
+/// M7B-68 (D §4.6 integration row; S §5 L1 verbatim; 0006 §4; gate V8), the way the plan row
+/// reads after tester-kb-sim A6 (2026-09-28): the bound is relative to a stall injected into a
+/// `Healthy` L1, not to virtual 0, because L1 starts `Paused` and admits nothing before the
+/// barrier is durable and the 5 s hold has run. Here `STALL = STACK_SUBMIT_AT`.
+///
+/// With every node's flushes stalled from `STALL` and the client submitting every 10 ms through
+/// T1: L1 notes `ProtectionWarn` once, at `STALL + 1000` (the row says `>= 1000`; the harness
+/// cadence allows up to `+ 50`); writes go on being admitted through `Warn`; L1 emits
+/// `SetAdmission(reject)` by `STALL + 2100` and no write is admitted at a tick past it; every
+/// later submit is refused `ProtectionPaused`. The last admitted tick is logged, not asserted
+/// (BA-7). No node writes a `durability_advance` line after the stall and every engine holds
+/// stalled syncs, which is what makes the stall a stall.
+///
+/// The control is the same run with the flushes honest: the host flusher keeps every write
+/// durable, L1 never warns or rejects, and writes are still admitted past `STALL + 2100`. The
+/// hysteresis half is M7B-129.
+///
+/// Surface (BA-4): `AdmissionDecision` is a declared `TraceKind` no module records, so "admitted
+/// at" is read as the primary's generation-2 `batch_apply` line, one per admitted write; the
+/// warn and the pause are the `kernel_noted` lines L1 writes and the `protection_state` phases.
+/// Not asserted, only observed: the writes admitted after the stall are replied `Transaction`
+/// with `Durability::BufferedOnTwo`, since a reply's precondition is the ACK and not the fsync.
+#[retcd_test]
+fn m7b_68_integration_row_nothing_admitted_after_tick_2100() {
+    support::preamble();
+    const STALL: u64 = STACK_SUBMIT_AT;
+
+    let (runner, trace, replies) = stall_run(true);
+    for node in [cases::B_NODE, cases::C_NODE, cases::A_NODE] {
+        let engine = runner.dispatcher().engine(node).expect("an engine");
+        assert!(
+            !engine.stalled_syncs().is_empty(),
+            "node {node:?} took the stall: its syncs are held, never completed"
+        );
+        assert_eq!(
+            engine.durable(PARTITION, Generation(2)).0,
+            STACK_HEAD,
+            "node {node:?} synced nothing past the cutoff once stalled"
+        );
+    }
+    assert_eq!(
+        stack_advances_from(&trace, STALL),
+        0,
+        "no durability_advance line on any node from the stall on"
+    );
+
+    let warns = stack_warns(&trace);
+    assert_eq!(warns.len(), 1, "L1 warns once: {warns:?}");
+    let (warn_at, _, warn_age) = warns[0];
+    assert!(
+        (STALL + 1_000..=STALL + 1_050).contains(&warn_at),
+        "ProtectionWarn at {warn_at}, not within the 50 ms cadence past STALL + 1000 = {}",
+        STALL + 1_000
+    );
+    assert!(
+        warn_age >= 1_000,
+        "the warn names an age >= 1000: {warn_age}"
+    );
+
+    let applies = stack_applies(&trace);
+    let last_admitted = applies
+        .last()
+        .copied()
+        .expect("the fixture admits its own write");
+    tracing::info!(
+        last_admitted_tick = last_admitted.0,
+        last_admitted_seq = last_admitted.1,
+        admitted = applies.len(),
+        "M7B-68: the last admitted tick, recorded not asserted (BA-7)"
+    );
+    let late: Vec<_> = applies
+        .iter()
+        .filter(|(tick, _)| *tick > STALL + 2_100)
+        .collect();
+    assert!(late.is_empty(), "admitted past STALL + 2100: {late:?}");
+    assert!(
+        applies.iter().any(|(tick, _)| *tick > warn_at),
+        "Warn is not a pause: writes are still admitted after the warn"
+    );
+    let pause: Vec<_> = admissions(&trace)
+        .into_iter()
+        .filter(|(tick, allow)| *tick >= STALL && !allow)
+        .collect();
+    assert_eq!(
+        pause.len(),
+        1,
+        "L1 rejects admission once after the stall: {pause:?}"
+    );
+    assert!(
+        (STALL + 1_000..=STALL + 2_100).contains(&pause[0].0),
+        "the pause at {} is not past the warn and by STALL + 2100",
+        pause[0].0
+    );
+    assert!(
+        matches!(phases(&trace).last(), Some((_, ProtectionPhase::Paused))),
+        "the run ends Paused: {:?}",
+        phases(&trace)
+    );
+    let (success, paused, other) = stack_reply_counts(&replies);
+    assert!(
+        other.is_empty(),
+        "replies neither success nor ProtectionPaused: {other:?}"
+    );
+    assert_eq!(
+        success,
+        applies.len(),
+        "every admitted write is replied, and only those"
+    );
+    assert_eq!(
+        success + paused,
+        usize::try_from(STALL_WRITES + 1).expect("small"),
+        "every submit is answered, the paused ones refused ProtectionPaused"
+    );
+    assert!(paused > 0, "the pause refused at least one write");
+
+    // The control: honest flushes, and the same client.
+    let (runner, trace, replies) = stall_run(false);
+    assert!(
+        stack_warns(&trace).is_empty(),
+        "without the stall L1 never warns: {:?}",
+        stack_warns(&trace)
+    );
+    assert!(
+        stack_applies(&trace)
+            .iter()
+            .any(|(tick, _)| *tick > STALL + 2_100),
+        "without the stall writes are admitted past STALL + 2100"
+    );
+    assert!(
+        !admissions(&trace)
+            .iter()
+            .any(|(tick, allow)| *tick >= STALL && !allow),
+        "without the stall L1 never rejects: {:?}",
+        admissions(&trace)
+    );
+    assert_eq!(stack_l1_mode(&runner), Some(Mode::Healthy));
+    let (success, paused, other) = stack_reply_counts(&replies);
+    assert_eq!(
+        (success, paused, other),
+        (
+            usize::try_from(STALL_WRITES + 1).expect("small"),
+            0,
+            Vec::new()
+        ),
+        "without the stall every write succeeds"
+    );
+}
+
+/// The copy the plan's B is on for M7B-47: it ACKs 98 and then diverges.
+const ACKER: NodeId = cases::C_NODE;
+/// The copy the plan's C is on: it ACKed 97; whether it ACKs 98 is the sub-case.
+const LAGGARD: NodeId = cases::A_NODE;
+/// The plan's 97: the case's own write, published at `STACK_SUBMIT_AT`.
+const SEQ_97: u64 = STACK_HEAD + 1;
+/// The plan's 98: the second write, submitted at [`SECOND_AT`].
+const SEQ_98: u64 = STACK_HEAD + 2;
+const SECOND_AT: u64 = STACK_SUBMIT_AT + 200;
+/// How long the primary's `Publication` checkpoint is delayed, so the divergence at
+/// `SECOND_AT + 5` lands between the ACKs (at `SECOND_AT`) and P1's evaluation.
+const P1_DELAY: u64 = 10;
+
+/// One M7B-47 run: the fixture through its first write (97 published, both copies ACKed it),
+/// then with `laggard_acks == false` the primary-to-[`LAGGARD`] link cut, the primary's P1
+/// checkpoint delayed by [`P1_DELAY`], 98 submitted at [`SECOND_AT`] and
+/// `KernelEvent::DivergenceDetected{copy: ACKER}` seeded at `SECOND_AT + 5`, the event the
+/// route table hands R1 and the tracker consumes. Runs to `SECOND_AT + 3000`, past P1's
+/// post-apply deadline.
+fn ack_then_exclude_run(
+    laggard_acks: bool,
+) -> (Runner, Vec<TraceEvent>, Vec<(NodeId, ReplyEffect)>) {
+    let plan = a1p1_plan();
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let replies = stack_run_to(&mut runner, STACK_SUBMIT_AT + 100);
+    assert!(
+        matches!(replies.as_slice(), [(_, ReplyEffect::Transaction { .. })]),
+        "the case's own write, 97, succeeds: {replies:?}"
+    );
+    let tracker = stack_tracker(&runner);
+    assert_eq!(
+        tracker.anchor(),
+        Seq(STACK_HEAD),
+        "the anchor is the cutoff (B-R47a)"
+    );
+    assert_eq!(tracker.head(), Seq(SEQ_97));
+    assert_eq!(
+        tracker.qualified_copies(Seq(SEQ_97)),
+        vec![stack_copy(&runner, ACKER), stack_copy(&runner, LAGGARD)],
+        "both copies ACKed 97"
+    );
+    let acker = stack_copy(&runner, ACKER);
+    if !laggard_acks {
+        runner
+            .dispatcher_mut()
+            .inject_network(NetworkOp::SetLink {
+                a: STACK_PRIMARY,
+                b: LAGGARD,
+                state: LinkState::Partitioned,
+            })
+            .expect("the link is cut");
+    }
+    runner.dispatcher_mut().delay_hop(HopDelay {
+        node: STACK_PRIMARY,
+        checkpoint: Checkpoint::Publication,
+        by_millis: P1_DELAY,
+    });
+    runner
+        .queue(&on_stack_primary(
+            SECOND_AT,
+            9_712,
+            EventKind::Client(ClientEvent::Submit(stack_txn(SEQ_98))),
+        ))
+        .expect("98 is queued");
+    runner
+        .queue(&on_stack_primary(
+            SECOND_AT + 5,
+            9_713,
+            EventKind::Kernel(KernelEvent::DivergenceDetected { copy: acker }),
+        ))
+        .expect("the divergence is queued");
+    let replies = stack_run_to(&mut runner, SECOND_AT + 3_000);
+    let trace = runner.recorded().to_vec();
+    (runner, trace, replies)
+}
+
+fn stack_tracker(runner: &Runner) -> &ProgressTracker {
+    runner
+        .dispatcher()
+        .replication()
+        .primary(STACK_PRIMARY, PARTITION)
+        .expect("R1's primary on the fixture's primary")
+        .tracker()
+}
+
+fn stack_copy(runner: &Runner, node: NodeId) -> CopyId {
+    stack_tracker(runner)
+        .config()
+        .members
+        .iter()
+        .find(|member| member.node == node)
+        .map(|member| member.copy)
+        .expect("a member")
+}
+
+/// The tick of each node's first accepted `replication_ack` line at seq `seq` in generation 2,
+/// as `(node, tick)` by node. A later line at the same seq is the flush ACK that raises the
+/// durability class, not a second acknowledgement.
+fn stack_first_acks_of(trace: &[TraceEvent], seq: u64) -> Vec<(NodeId, u64)> {
+    let mut first = BTreeMap::new();
+    for event in trace {
+        if let TraceKind::ReplicationAck {
+            from_node,
+            generation,
+            contiguous_seq,
+            accepted: true,
+            ..
+        } = &event.kind
+        {
+            if *generation == Generation(2) && contiguous_seq.0 == seq {
+                first.entry(*from_node).or_insert(event.logical_tick);
+            }
+        }
+    }
+    first.into_iter().collect()
+}
+
+/// M7B-47 (D §3.5 replacement row 1, K-B-09; 0005 §5; 0006 §3): ACK-then-exclude, end to end.
+/// The plan's B is [`ACKER`], its C is [`LAGGARD`], its 97 and 98 are [`SEQ_97`] and [`SEQ_98`].
+///
+/// [`ACKER`] ACKs 98 at [`SECOND_AT`] and diverges at `+ 5`; P1, delayed to `+ 10`, re-reads
+/// `qualifies_now(98)` on its A1 answer and finds it false: it notes exactly one
+/// `Ignored{Authority(PublishPredicateFalse)}`, no `publish` line names 98, P1's published
+/// position stays 97, and 98's client is told `UnknownOutcome` at P1's post-apply deadline.
+/// 97 stays published: `qualifies_now(97)` is still true through [`LAGGARD`].
+///
+/// L1's clause, as landed (B-R47a/B-R47b, pinned by M7B-224): the anchor is the recovery cutoff,
+/// L1 only admits once every required copy is durable through the barrier, so [`LAGGARD`] holds
+/// the anchor and one divergence never flips `qualifies_now(anchor)`; the head never reports
+/// `Lost`. So L1 sees **no** `QualificationChanged{Lost}` in either sub-case, and the row pins
+/// that instead of the plan's "exactly one iff C did not ACK 98": a `Lost` pauses L1 in the
+/// same step (M7B-69), and the first L1 change after the divergence is the unprotected 98's
+/// age `Warn` at `>= SECOND_AT + 1000`, never a pause at `+ 5`.
+///
+/// The twin has [`LAGGARD`] ACK 98 too: the same divergence, and 98 publishes at `+ 10`
+/// through the copy that stayed, so the refusal above is the exclusion and not the divergence
+/// alert itself.
+#[retcd_test]
+fn m7b_47_ack_then_exclude_98_not_published_97_kept() {
+    support::preamble();
+
+    let (runner, trace, replies) = ack_then_exclude_run(false);
+    let acker = stack_copy(&runner, ACKER);
+    let laggard = stack_copy(&runner, LAGGARD);
+    assert_eq!(
+        stack_first_acks_of(&trace, SEQ_98),
+        vec![(ACKER, SECOND_AT)],
+        "B ACKed 98 at SECOND_AT and C did not"
+    );
+    let tracker = stack_tracker(&runner);
+    assert_eq!(tracker.diverged(), &[acker], "B is diverged");
+    assert!(
+        !tracker.qualifies_now(Seq(SEQ_98)),
+        "98 no longer qualifies"
+    );
+    assert!(tracker.qualified_copies(Seq(SEQ_98)).is_empty());
+    assert!(tracker.qualifies_now(Seq(SEQ_97)), "97 still qualifies");
+    assert_eq!(tracker.qualified_copies(Seq(SEQ_97)), vec![laggard]);
+    assert!(
+        tracker.qualifies_now(tracker.anchor()),
+        "the anchor still qualifies through C, so no edge and no Lost (B-R47a)"
+    );
+
+    let refusals: Vec<_> = stack_p1_ignored(&trace)
+        .into_iter()
+        .filter(|(_, reason)| {
+            matches!(
+                reason,
+                KernelIgnoredReason::Authority(AuthorityIgnoreReason::PublishPredicateFalse)
+            )
+        })
+        .collect();
+    assert_eq!(
+        refusals,
+        vec![(
+            SECOND_AT + P1_DELAY,
+            KernelIgnoredReason::Authority(AuthorityIgnoreReason::PublishPredicateFalse)
+        )],
+        "P1's live recheck refuses 98 exactly once, at its delayed evaluation"
+    );
+    assert_eq!(
+        stack_publishes(&trace),
+        vec![(STACK_SUBMIT_AT, SEQ_97)],
+        "97 is the only publish; 98 never publishes"
+    );
+    let p1 = runner
+        .dispatcher()
+        .publication()
+        .view(STACK_PRIMARY, PARTITION)
+        .expect("P1's view");
+    assert_eq!(p1.published.seq, Seq(SEQ_97), "97 stays published");
+    let pending = p1
+        .pending
+        .as_ref()
+        .expect("98 is still P1's pending candidate");
+    assert!(!pending.qualifying, "P1 holds 98 as not qualifying");
+    assert!(
+        matches!(
+            replies.as_slice(),
+            [(
+                _,
+                ReplyEffect::Failed {
+                    error: RdbError::UnknownOutcome { .. },
+                    ..
+                }
+            )]
+        ),
+        "98's client is told UnknownOutcome at the post-apply deadline: {replies:?}"
+    );
+
+    // L1: no Lost reached it. A Lost pauses in the same step (M7B-69); here the first change
+    // after the divergence is the age warn on the unprotected 98, and the pause is the age pause.
+    let l1_changes: Vec<_> = phases(&trace)
+        .into_iter()
+        .filter(|(tick, _)| *tick >= SECOND_AT)
+        .collect();
+    assert!(
+        matches!(
+            l1_changes.first(),
+            Some((tick, ProtectionPhase::Warn)) if *tick >= SECOND_AT + 1_000
+        ),
+        "L1's first change after the divergence is the age warn, not a Lost pause: {l1_changes:?}"
+    );
+    assert!(
+        !admissions(&trace)
+            .iter()
+            .any(|(tick, allow)| (SECOND_AT..SECOND_AT + 1_000).contains(tick) && !allow),
+        "L1 rejected nothing within a second of the divergence: {:?}",
+        admissions(&trace)
+    );
+    assert!(
+        runner
+            .dispatcher()
+            .protection(STACK_PRIMARY, PARTITION)
+            .expect("L1")
+            .qualifies_now_at_head(),
+        "L1's head flag was never cleared by a Lost"
+    );
+
+    // The twin: C ACKs 98 too, and the same divergence does not stop 98.
+    let (runner, trace, replies) = ack_then_exclude_run(true);
+    let acker = stack_copy(&runner, ACKER);
+    let laggard = stack_copy(&runner, LAGGARD);
+    assert_eq!(
+        stack_first_acks_of(&trace, SEQ_98),
+        vec![(ACKER, SECOND_AT), (LAGGARD, SECOND_AT)],
+        "both copies ACKed 98 at SECOND_AT"
+    );
+    let tracker = stack_tracker(&runner);
+    assert_eq!(
+        tracker.diverged(),
+        &[acker],
+        "B is diverged in the twin too"
+    );
+    assert!(tracker.qualifies_now(Seq(SEQ_98)), "98 qualifies through C");
+    assert_eq!(tracker.qualified_copies(Seq(SEQ_98)), vec![laggard]);
+    assert!(
+        stack_p1_ignored(&trace).iter().all(|(_, reason)| !matches!(
+            reason,
+            KernelIgnoredReason::Authority(AuthorityIgnoreReason::PublishPredicateFalse)
+        )),
+        "the twin's P1 refuses nothing: {:?}",
+        stack_p1_ignored(&trace)
+    );
+    assert_eq!(
+        stack_publishes(&trace),
+        vec![(STACK_SUBMIT_AT, SEQ_97), (SECOND_AT + P1_DELAY, SEQ_98)],
+        "98 publishes at P1's delayed evaluation"
+    );
+    assert!(
+        matches!(replies.as_slice(), [(_, ReplyEffect::Transaction { .. })]),
+        "98's client succeeds: {replies:?}"
+    );
+    assert!(
+        phases(&trace).iter().all(|(tick, _)| *tick < SECOND_AT),
+        "L1 changes nothing after the divergence in the twin: {:?}",
+        phases(&trace)
     );
 }

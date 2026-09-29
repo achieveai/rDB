@@ -26,12 +26,14 @@ pub use crate::contracts::publication::{
 use crate::contracts::qualification::{
     QualificationCause, QualificationChanged, QualificationDirection,
 };
-use crate::contracts::recovery::RecoveryResult;
+use crate::contracts::recovery::{RecoveryResult, RetainedStatusMap};
+use crate::contracts::storage::{Namespace, SnapshotRead};
 use crate::contracts::time::Tick;
-use crate::contracts::txn::TxnResult;
+use crate::contracts::txn::{Durability, Outcome as TxnOutcome, TxnResult};
 use crate::replication::progress::DigestLookup;
+use crate::transaction::dedup::{parse_dedup_key, parse_dedup_value, SEED_PAGE};
 
-use super::status::StatusIndex;
+use super::status::{recovered_outcome, StatusIndex};
 use super::view::ReplicationView;
 
 /// The first correlation P1 mints for its own authority checks. The block `0x00D1 << 48` keeps
@@ -496,6 +498,28 @@ pub struct PubStateView {
     pub read_check: Option<CorrelationId>,
 }
 
+/// The durable status a recovered kernel has not loaded yet (M7A-194, spec §8.1).
+///
+/// P1's status index lives in memory, so a kernel that recovered into `serving` on a node that
+/// did not apply the predecessor's requests holds nothing for them, and `StatusIndex::lookup`
+/// would answer `StatusExpired` for a generation still inside retention. The rows are not lost:
+/// every transaction wrote its dedup record in the same atomic batch as its data (spec §4), and
+/// T1 seeds its own index from them (`DedupIndex::seed`, A-R68/A-R70). This is the same seed,
+/// from the same rows, at the same point: set by `Recovered`, loaded by the first step whose
+/// snapshot shows the retained prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusSeed {
+    /// The partition.
+    pub partition: PartitionId,
+    /// The generation the kernel serves. Every row loaded is from an older one.
+    pub serving: Generation,
+    /// Load rows at or below this sequence (`RetainedStatusMap.retained_through`), and load
+    /// nothing until the snapshot shows at least this far.
+    pub retained_through: Seq,
+    /// The map the loaded rows fold under, exactly as `fold_recovered` folds held entries.
+    pub map: RetainedStatusMap,
+}
+
 /// P1's state for one partition on one boot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PubKernel {
@@ -506,6 +530,11 @@ pub struct PubKernel {
     pending: Option<Pending>,
     awaiting_reply: BTreeMap<CorrelationId, AwaitingReply>,
     status: StatusIndex,
+    seed: Option<StatusSeed>,
+    /// The snapshot `(generation, at)` the pending seed last found blocked by a row of the
+    /// served generation or newer. Nothing is rescanned while the snapshot stays there
+    /// (reviewer R-3); `None` while the seed is not blocked.
+    seed_blocked_at: Option<(Generation, Seq)>,
     waiters: VecDeque<Waiter>,
     authority: Option<AuthorityView>,
     mode: PubMode,
@@ -532,6 +561,8 @@ impl PubKernel {
             pending: None,
             awaiting_reply: BTreeMap::new(),
             status: StatusIndex::new(lineage.generation),
+            seed: None,
+            seed_blocked_at: None,
             waiters: VecDeque::new(),
             authority: None,
             mode: PubMode::Serving,
@@ -565,6 +596,120 @@ impl PubKernel {
             generation: self.lineage.generation,
             seq: self.published_seq,
         }
+    }
+
+    /// The durable status not loaded yet, or `None` once it is (or was never owed).
+    #[must_use]
+    pub const fn seed_pending(&self) -> Option<&StatusSeed> {
+        self.seed.as_ref()
+    }
+
+    /// Load the pending seed from `snapshot` if it now shows the retained prefix (M7A-194).
+    /// Does nothing once the seed is loaded. A blocked attempt leaves everything as it was, and
+    /// the next step tries again — T1's `try_seed` discipline, over the same rows.
+    ///
+    /// A row that does not decode is skipped with a log line and the seed completes (lead
+    /// ruling A-R90, tester-ka-next T1): fail-closed on that row, never on the whole seed, so
+    /// one bad row cannot leave a retained generation unanswerable for ever. A row written in
+    /// the generation being served or a newer one is different: it is not a predecessor's row,
+    /// and its presence ahead of the seed means the snapshot is not the one the recovery
+    /// described, so nothing is loaded and the seed stays pending until it no longer shows. The
+    /// block logs one warning when it starts, and the seed rescans only once the snapshot moves
+    /// (reviewer R-3).
+    ///
+    /// Only rows of the predecessor generation fold under the recovery's three-way rule; a row
+    /// of an older generation loads as `RecoveredApplied`, as `fold_recovered` leaves an older
+    /// generation's held entries alone (lead ruling A-R91, reviewer C-1).
+    ///
+    /// Each row lands through [`StatusIndex::restore`], so what this instance recorded itself,
+    /// a retired generation and a trim watermark all win over the durable row. `record_digest`
+    /// is `None`: the dedup row carries the request digest, not the record's.
+    pub fn try_seed(&mut self, now: Tick, snapshot: &dyn SnapshotRead) {
+        let Some(seed) = self.seed else {
+            return;
+        };
+        if snapshot.at() < seed.retained_through {
+            return;
+        }
+        let position = (snapshot.generation(), snapshot.at());
+        if self.seed_blocked_at == Some(position) {
+            return;
+        }
+        let mut found = Vec::new();
+        let mut from = Vec::new();
+        loop {
+            let page = snapshot.scan(Namespace::Dedup, &from, SEED_PAGE);
+            for (key, value) in &page {
+                let (Some(key), Some(value)) = (parse_dedup_key(key), parse_dedup_value(value))
+                else {
+                    tracing::warn!(
+                        partition = ?seed.partition,
+                        serving = ?seed.serving,
+                        key_len = key.len(),
+                        value_len = value.len(),
+                        "status seed: a dedup row does not decode; skipped (A-R90)"
+                    );
+                    continue;
+                };
+                // Above the cut: the discarded suffix, which a copy may still hold.
+                if value.seq > seed.retained_through {
+                    continue;
+                }
+                if key.generation >= seed.serving {
+                    if self.seed_blocked_at.is_none() {
+                        tracing::warn!(
+                            partition = ?seed.partition,
+                            serving = ?seed.serving,
+                            row_generation = ?key.generation,
+                            at = ?position.1,
+                            "status seed: blocked by a row of the served generation or newer"
+                        );
+                    }
+                    self.seed_blocked_at = Some(position);
+                    return;
+                }
+                found.push((key, value));
+            }
+            match page.last() {
+                Some((last, _)) if page.len() == SEED_PAGE => {
+                    from = last.to_vec();
+                    from.push(0);
+                }
+                _ => break,
+            }
+        }
+        for (key, value) in found {
+            let lineage = Lineage {
+                partition: seed.partition,
+                generation: key.generation,
+                owner_epoch: value.owner_epoch,
+            };
+            // The result P1 published for the row, at the durability publication requires —
+            // what T1's seed replays for the same retry.
+            let result = TxnResult {
+                partition: lineage.partition,
+                owner_epoch: lineage.owner_epoch,
+                generation: lineage.generation,
+                seq: value.seq,
+                outcome: TxnOutcome::Published,
+                durability: Durability::BufferedOnTwo,
+            };
+            self.status.restore(StatusEntry {
+                request: key.identity,
+                lineage,
+                seq: Some(value.seq),
+                record_digest: None,
+                outcome: if key.generation == seed.map.predecessor_generation {
+                    recovered_outcome(&seed.map, value.seq, result)
+                } else {
+                    StatusOutcome::RecoveredApplied { result }
+                },
+                snapshot: None,
+                at: now,
+            });
+        }
+        self.seed = None;
+        self.seed_blocked_at = None;
     }
 
     /// Everything a row may assert on.
@@ -612,7 +757,7 @@ impl PubKernel {
                 generation,
             } => {
                 let outcome = match generation {
-                    Some(generation) => self.status.lookup(request, generation),
+                    Some(generation) => self.status_for(request, generation),
                     None => self.status.lookup_any(request),
                 };
                 vec![PubEffect::StatusAnswer {
@@ -1285,11 +1430,45 @@ impl PubKernel {
         effects
     }
 
+    /// [`StatusIndex::lookup`], except that while the seed is pending no generation below the
+    /// served one answers `StatusExpired` unless this boot retired it (lead ruling A-R91 Q2 as
+    /// revised, reviewer R-1). The rows that would answer are not loaded yet, and
+    /// `StatusExpired` tells a client a generation inside retention is past it; `Unknown` never
+    /// proves nonexecution.
+    fn status_for(&self, request: RequestIdentity, generation: Generation) -> StatusOutcome {
+        let outcome = self.status.lookup(request, generation);
+        match self.seed {
+            Some(seed)
+                if matches!(outcome, StatusOutcome::StatusExpired)
+                    && generation < seed.serving
+                    && !self.status.is_retired(generation) =>
+            {
+                StatusOutcome::Unknown
+            }
+            _ => outcome,
+        }
+    }
+
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
         self.lineage = result.selected.root;
         self.published_seq = result.selected.cutoff_seq;
         self.status.fold_recovered(&result.retained_status_map);
         self.status.open(self.lineage.generation);
+        // The predecessor is retained from this step on, loaded or not (lead ruling A-R90,
+        // tester-ka-next T1): until the seed lands an absent identity there answers `Unknown`,
+        // never `StatusExpired`, which would tell a client that a generation inside retention
+        // is past it. A no-op if the generation was already retired.
+        self.status
+            .open(result.retained_status_map.predecessor_generation);
+        // What this node never recorded is loaded from the durable rows once the snapshot shows
+        // them (M7A-194); `fold_recovered` above has already folded what it did record.
+        self.seed_blocked_at = None;
+        self.seed = Some(StatusSeed {
+            partition: self.lineage.partition,
+            serving: self.lineage.generation,
+            retained_through: result.retained_status_map.retained_through,
+            map: result.retained_status_map,
+        });
         let mut effects = self.withhold_awaiting(Withheld::Recovery);
         // The predecessor's view is not a prefix of the new lineage (A-R69a), so it is released
         // and one at the cutoff asked for: design §4.2 rebases `published_snapshot` here, and

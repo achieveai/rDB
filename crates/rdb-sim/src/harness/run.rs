@@ -1448,17 +1448,31 @@ mod tests {
         assert_eq!(report.stop, StopReason::QueueEmpty);
     }
 
-    /// A capability gate would have routed this to nobody: A1 reports `Unavailable` while
-    /// answering. The whole reason routing is gated on the step.
+    /// Routing is gated on the step, never on the capability report. A1 and P1 advertise
+    /// `Wired` (ruling V-R38) and the other four `Unavailable`, yet the loop offers every event
+    /// to all six (`every_module_is_offered_and_five_of_six_decline`): a capability gate would
+    /// have routed this to A1 and P1 alone, and before V-R38 to nobody.
     #[test]
-    fn the_only_module_with_a_body_reports_itself_unavailable() {
+    fn the_capability_report_does_not_gate_routing() {
+        use rdb_core::contracts::trace::CapabilityState;
         let runner = Runner::new(&plan(Vec::new())).expect("a runner");
         let report = runner.dispatcher.capability_report();
-        assert!(
-            report
-                .iter()
-                .all(|state| *state == rdb_core::contracts::trace::CapabilityState::Unavailable),
-            "every module still advertises Unavailable, A1 included"
+        // Spelled as "not Unavailable" because M7V-82(b) forbids the literal `Wired` anywhere
+        // in the harness sources but the module that builds the report. `ModuleName::ALL`
+        // order: A1 and P1 are wired (ruling V-R38), T1, R1, L1 and F1 are not.
+        let wired: Vec<bool> = report
+            .iter()
+            .map(|state| *state != CapabilityState::Unavailable)
+            .collect();
+        assert_eq!(
+            wired,
+            [true, false, false, true, false, false],
+            "{report:?}"
+        );
+        let (_, run) = execute(&plan(vec![nobody_answers(Tick(1))])).expect("a run");
+        assert_eq!(
+            run.steps_offered, 6,
+            "offered to all six regardless of the report"
         );
     }
 

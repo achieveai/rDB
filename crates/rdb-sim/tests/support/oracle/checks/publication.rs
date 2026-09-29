@@ -13,8 +13,10 @@
 //!
 //! The quorum rule is **derived** from `required_copy_set.len()` and is never read from a trace
 //! field (ruling V-R20 (1); ruling F-R13 settles that no such field will land). Two nodes is
-//! `DegradedRf2` with `min_regular_acks` 1-of-1 (ruling B-R3); three is `Rf3` with two; any other
-//! length is itself the violation `required_copy_set_shape`, because the oracle reads only the
+//! `DegradedRf2` with `min_regular_acks` 1-of-1 (ruling B-R3); three is `Rf3` with one — spec
+//! §5.2 step 6, "success only after one regular-secondary ACK", ruling V-R39 (the earlier two
+//! landed in `6175fff` with no ruling) — any other length is itself the violation
+//! `required_copy_set_shape`, because the oracle reads only the
 //! trace and cannot tell a bad fixture from a kernel that really pinned that set — and demoting
 //! it to a fixture check would mean silently skipping INV-PUB for the seed.
 //!

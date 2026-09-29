@@ -1574,11 +1574,15 @@ impl Module for Transaction {
     }
 
     fn capability(&self) -> CapabilityState {
-        // Deliberately still `Unavailable`, as A1 is, pending a lead ruling. Every §3.3 row runs
-        // behind `step`, and the sim dispatcher now carries this module's `AuthorityCheck` to A1
-        // and its `AppliedCandidate` to P1 (A-R65), with no T1 edge owed (A-R82..A-R84).
-        // Advertising `Wired` is the lead's call: it would let a campaign's green read as
-        // coverage of applied transactions.
+        // Deliberately still `Unavailable` (lead ruling V-R40 Q1), although A1 and P1 now report
+        // `Wired` (V-R38). Every §3.3 row runs behind `step`, and the sim dispatcher carries this
+        // module's `AuthorityCheck` to A1 and its `AppliedCandidate` to P1 (A-R65), with no T1
+        // edge owed (A-R82..A-R84). What holds it is the campaign, not this module: reporting
+        // `Wired` makes INV-DEDUP judge T1, which needs a recorded `ClientSubmit`, and the trace
+        // validator's check 3 (ruling F-1) refuses a `ClientSubmit` recorded before a
+        // `SchedulePhaseChanged{Healed}`. Nothing in the sim produces that phase yet; tried in
+        // verif-corpus round 3, both armed F1/T1 cases then failed as harness errors. The
+        // `Healed` producer is a follow-up slice owned by verification/sim.
         CapabilityState::Unavailable
     }
 

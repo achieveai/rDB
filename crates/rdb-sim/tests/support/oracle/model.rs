@@ -200,7 +200,7 @@ impl TraceEventKind {
 /// the `derived_quorum_rule` coverage cell (design §2.3, §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DerivedQuorumRule {
-    /// Three copies: two regular secondary acknowledgements.
+    /// Three copies: one regular-secondary acknowledgement (spec §5.2 step 6, ruling V-R39).
     Rf3,
     /// Two survivors under spec §8.3: `min_regular_acks` 1-of-1 (ruling B-R3).
     DegradedRf2,
@@ -227,7 +227,7 @@ impl DerivedQuorumRule {
     #[must_use]
     pub const fn min_regular_acks(self) -> usize {
         match self {
-            Self::Rf3 => 2,
+            Self::Rf3 => 1,
             Self::DegradedRf2 => 1,
         }
     }

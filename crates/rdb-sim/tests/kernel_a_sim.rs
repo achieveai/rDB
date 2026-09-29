@@ -4,10 +4,13 @@
 //! | Row | Claim |
 //! |---|---|
 //! | M7A-85 | a batch applied on the primary alone gets no success reply in 10 000 ticks; the one reply is P1's `UNKNOWN_OUTCOME` at the post-apply deadline |
+//! | M7A-131 | authority lapses between request 11's publication and its delayed `Reply` check: the fence withholds the reply, the check is answered `Deny(Expired)`, nothing is replied, the status stays `Published`; the log holds the publish and no delivered outcome |
+//! | M7A-136 | a retry during the recovery, on the same node or another, is replayed or refused and never re-executed: seq 5 is applied once per node and no retry's correlation reaches storage |
 //! | M7A-117 | a retry in g+1 of a request g executed is answered from g's retained dedup, never executed again; a different node's fresh T1 admits nothing before its dedup seed lands, even with an open grant and a seed that never lands |
 //! | M7A-135 | the recovery fold answers `RecoveredApplied` below `retained_through`, `Expired` once g is retired, `Unknown` for an entry trimmed in a live generation and for an uncertain map; a retry naming g is refused `GENERATION_CHANGED` whatever was trimmed or retired |
 //! | M7A-139 | a fence between the dispatch answer and the batch completion, injected or A1's own, keeps the dispatched batch, keeps the fence's cause, and resolves the request `UNKNOWN_OUTCOME` |
 //! | M7A-163 | a renewal whose completion is dropped ends in an expiry fence at the local horizon that drains T1's queue and P1's `Fresh` waiters in the same tick |
+//! | M7A-194 | a failover node's P1 answers a previous generation's status `RecoveredApplied` from the durable dedup rows, with and without the generation, as the node that applied it does; inside the seed window the generation answers `Unknown`, never `StatusExpired`; a row that does not decode is skipped and the seed lands; a retired generation is never resurrected and a trim watermark is honoured (A-R90) |
 //!
 //! Fixtures come from the verification corpus, never a new route: the A1/P1 case
 //! (`cases::case_a1_p1_new_generation_between_publish_and_reply`) without its unrunnable
@@ -25,9 +28,10 @@ use std::collections::BTreeSet;
 
 use bytes::Bytes;
 use config_log::retcd_test;
+use config_log::testing::{test_log_dir, test_run_id};
 use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::authority::AuthorityState;
-use rdb_core::contracts::authority::{AuthorityEvent, DenyReason, FenceScope, Lineage};
+use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, DenyReason, FenceScope, Lineage};
 use rdb_core::contracts::control::{CasOutcome, ControlKey, ReadOutcome};
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
 use rdb_core::contracts::event::{
@@ -41,14 +45,18 @@ use rdb_core::contracts::recovery::{DurableProof, RecoveryBarrier, RecoveryResul
 use rdb_core::contracts::storage::{Namespace, Write};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
-    AuthorityGate, ClientOutcome, ControlOutcomeKind, KernelNote, ReadServiceOutcome, TraceEvent,
-    TraceKind,
+    AuthorityGate, AuthorityOutcome, ClientOutcome, ControlOutcomeKind, KernelNote,
+    ReadServiceOutcome, TraceEvent, TraceKind,
 };
 use rdb_core::contracts::txn::{scoped_key, Mutation, Outcome, TxnRequest, TxnResult, TxnStatus};
 use rdb_core::contracts::version::API_VERSION;
-use rdb_core::publication::{FreezeCause, PubMode, PubStateView, POST_APPLY_DEADLINE_MILLIS};
-use rdb_core::transaction::{Inflight, QueueMode, TxnKernel};
+use rdb_core::publication::{
+    FreezeCause, PubMode, PubStateView, StatusOutcome, POST_APPLY_DEADLINE_MILLIS,
+};
+use rdb_core::transaction::{Inflight, QueueMode, Retained, RetainedAnswer, TxnKernel};
+use rdb_sim::harness::hop::HopDelay;
 use rdb_sim::harness::run::{RunLimits, RunPlan, Runner, SeedEvent};
+use rdb_sim::harness::trace::{log_jsonl_path, write_log_jsonl, LogTags};
 use rdb_sim::sim::control::ControlOp;
 use rdb_sim::sim::network::{LinkState, NetworkOp};
 use support::scenarios::cases;
@@ -1499,5 +1507,681 @@ fn m7a_135_f1_t1_p1_retention_boundary_recovered_applied_then_unknown() {
         status_reply(&replies, WRITTEN),
         vec![TxnStatus::Unknown],
         "uncertain: the first retry answers Unknown instead of RecoveredApplied"
+    );
+}
+
+// ---- M7A-194 --------------------------------------------------------------------------------
+
+/// M7A-194 (spec §8.1 "Lineage rules", plan §8.9). Gen 1 applied requests 1..=10 on another
+/// node; B recovers gen 2 with the durable rows and its T1 seeds gen 1's dedup from them
+/// (M7A-117). P1's status index is seeded from the same rows at the same point, so `Status` for
+/// gen 1's request 5 on B answers `RecoveredApplied{result}` — asked with `Some(1)` and with
+/// `None` — the answer the node that applied it gives, and the result T1's seed replays for the
+/// same retry. Request 10 is the retention boundary (`retained_through`) and answers the same. An
+/// identity gen 1 never applied answers `Unknown`, not `StatusExpired`: a seeded generation is a
+/// retained one, and absence in it proves nothing (§4.3 invariant 5).
+///
+/// Red at 3ee83ac: `Expired` for `Some(1)` and `Unknown` for `None` (tester-ka-rows S-117s), the
+/// answers for a generation P1 never opened.
+#[retcd_test]
+fn m7a_194_p1_on_a_failover_node_answers_a_previous_generations_status() {
+    support::preamble();
+    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    let (seed_open, after_seed) = seed_window();
+    // The seed window (A-R90, tester-ka-next T1): the recovery sets the seed at `seed_open` and
+    // the snapshot reaches the cut about 500 ticks later. Inside it gen 1 is retained but not
+    // loaded, so an identity it holds answers `Unknown` — never `StatusExpired`, the answer
+    // M7A-89 lets a client act on by resubmitting.
+    run_to(&mut runner, seed_open);
+    assert!(
+        p1k(&runner).seed_pending().is_some(),
+        "fixture: the seed is set and owed at {seed_open}"
+    );
+    queue(&mut runner, seed_open + 1, 9_700, status(WRITTEN, Some(1)));
+    let inside = run_to(&mut runner, after_seed - 1);
+    assert_eq!(
+        status_reply(&inside, WRITTEN),
+        vec![TxnStatus::Unknown],
+        "inside the seed window a retained generation answers Unknown, not StatusExpired"
+    );
+    let kernel = t1(&runner);
+    assert!(
+        kernel.seed_pending().is_none(),
+        "fixture: T1's dedup seed landed (M7A-117)"
+    );
+    let replayed = match kernel
+        .dedup()
+        .get(Generation(1), AffinityId(1), identity(WRITTEN))
+    {
+        Some(Retained {
+            answer: RetainedAnswer::Applied(result),
+            ..
+        }) => *result,
+        other => panic!("fixture: T1 replays gen 1's request 5 from its seed: {other:?}"),
+    };
+    assert_eq!(
+        (replayed.generation, replayed.seq),
+        (Generation(1), Seq(WRITTEN)),
+        "fixture: the replayed result is gen 1's seq 5"
+    );
+
+    queue(&mut runner, after_seed, 9_701, status(WRITTEN, Some(1)));
+    queue(&mut runner, after_seed + 1, 9_702, status(WRITTEN, None));
+    queue(&mut runner, after_seed + 2, 9_703, status(HEAD, Some(1)));
+    queue(&mut runner, after_seed + 3, 9_704, status(WRITE, Some(1)));
+    let replies = run_to(&mut runner, after_seed + 10);
+    let recovered = |seq| {
+        TxnStatus::Resolved(TxnResult {
+            seq: Seq(seq),
+            outcome: Outcome::RecoveredApplied,
+            ..replayed
+        })
+    };
+    assert_eq!(
+        status_reply(&replies, WRITTEN),
+        vec![recovered(WRITTEN), recovered(WRITTEN)],
+        "gen 1's request 5 on B: RecoveredApplied with T1's replayed result, with and without the generation"
+    );
+    assert_eq!(
+        status_reply(&replies, HEAD),
+        vec![recovered(HEAD)],
+        "request 10, at retained_through, is retained too"
+    );
+    assert_eq!(
+        status_reply(&replies, WRITE),
+        vec![TxnStatus::Unknown],
+        "an identity gen 1 never applied is Unknown in a seeded generation, never StatusExpired"
+    );
+    assert_eq!(
+        p1(&runner).status.len(),
+        HEAD as usize,
+        "gen 1's ten entries are seeded, and nothing else is held"
+    );
+}
+
+/// P1's kernel on B, for what `PubStateView` does not expose: the pending seed.
+fn p1k(runner: &Runner) -> &rdb_core::publication::PubKernel {
+    runner
+        .dispatcher()
+        .publication()
+        .kernel(B, PART)
+        .expect("P1 kernel on B")
+}
+
+/// `(seed_open, after_seed)` on `a1p1_plan()`: the tick B's recovery sets the seed, and the tick
+/// M7A-117 shows T1's seed landed by, ~500 ticks later, when the snapshot reaches the cut.
+fn seed_window() -> (u64, u64) {
+    let seed_open = cases::PLAN_AT + 2_097;
+    (seed_open, seed_open + 503)
+}
+
+fn trim_status(generation: u64, below: u64) -> EventKind {
+    EventKind::Kernel(KernelEvent::StatusTrim {
+        generation: Generation(generation),
+        below: Seq(below),
+    })
+}
+
+fn retire(generation: u64) -> EventKind {
+    EventKind::Kernel(KernelEvent::RetireGeneration {
+        generation: Generation(generation),
+    })
+}
+
+/// M7A-194, the seed past a row that does not decode (A-R90, tester-ka-next T1): one malformed
+/// `Dedup` row in B's durable prefix. The seed skips it and lands; every well-formed row is held
+/// and gen 1's request 5 answers `RecoveredApplied` with and without the generation. (T1's own
+/// dedup seed stays pending on the same row — M7A-117's reading, not asserted here.)
+#[retcd_test]
+fn m7a_194_status_seed_skips_a_malformed_row_and_lands() {
+    support::preamble();
+    let mut plan = a1p1_plan();
+    for (node, batch) in &mut plan.preloads {
+        if *node == B && batch.seq == Seq(HEAD) {
+            batch.writes.push(Write {
+                ns: Namespace::Dedup,
+                key: Bytes::from_static(&[1, 2, 3]),
+                value: Some(Bytes::from_static(&[4, 5, 6])),
+            });
+        }
+    }
+    let mut runner = Runner::new(&plan).expect("runner");
+    let (_, after_seed) = seed_window();
+    run_to(&mut runner, after_seed + 10);
+    assert!(
+        p1k(&runner).seed_pending().is_none(),
+        "the seed completed past the malformed row"
+    );
+    assert_eq!(
+        p1(&runner).status.len(),
+        HEAD as usize,
+        "every well-formed row landed"
+    );
+    queue(
+        &mut runner,
+        after_seed + 11,
+        9_730,
+        status(WRITTEN, Some(1)),
+    );
+    queue(&mut runner, after_seed + 12, 9_731, status(WRITTEN, None));
+    let replies = run_to(&mut runner, after_seed + 22);
+    let answers = status_reply(&replies, WRITTEN);
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert!(
+        answers.iter().all(|status| matches!(
+            status,
+            TxnStatus::Resolved(result)
+                if result.outcome == Outcome::RecoveredApplied
+                    && result.generation == Generation(1)
+                    && result.seq == Seq(WRITTEN)
+        )),
+        "gen 1's request 5 answers RecoveredApplied, with and without the generation: {answers:?}"
+    );
+}
+
+/// M7A-194, the seed's refusals, first half (A-R90, tester-ka-next T7): `RetireGeneration{1}`
+/// lands after the recovery set the seed and before the snapshot reaches the cut. Nothing of gen
+/// 1 is resurrected: the seed is consumed with every row refused, the index holds nothing, and
+/// request 5 answers `StatusExpired` with the generation and `Unknown` without it (A-R63).
+#[retcd_test]
+fn m7a_194_status_seed_never_resurrects_a_retired_generation() {
+    support::preamble();
+    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    let (seed_open, after_seed) = seed_window();
+    run_to(&mut runner, seed_open);
+    assert!(
+        p1k(&runner).seed_pending().is_some(),
+        "fixture: the seed is owed"
+    );
+    queue(&mut runner, seed_open + 1, 9_740, retire(1));
+    run_to(&mut runner, after_seed - 1);
+    queue(&mut runner, after_seed, 9_741, status(WRITTEN, Some(1)));
+    queue(&mut runner, after_seed + 1, 9_742, status(WRITTEN, None));
+    let replies = run_to(&mut runner, after_seed + 10);
+    assert_eq!(
+        status_reply(&replies, WRITTEN),
+        vec![TxnStatus::Expired, TxnStatus::Unknown],
+        "a retired generation stays retired: Expired with it, Unknown without it"
+    );
+    assert_eq!(p1(&runner).status.len(), 0, "nothing of gen 1 is held");
+    assert!(
+        p1k(&runner).seed_pending().is_none(),
+        "the seed is consumed although every row was refused"
+    );
+}
+
+/// M7A-194, the seed's refusals, second half (A-R90, tester-ka-next T7): `StatusTrim{1, below
+/// 6}` before the seed lands (the watermark refuses the rows below it) and after it (the trim
+/// drops them). The same answers either way: request 5 `Unknown` with and without the
+/// generation, request 6 at the floor and request 10 `RecoveredApplied`, five rows held.
+#[retcd_test]
+fn m7a_194_status_seed_respects_a_trim_watermark() {
+    support::preamble();
+    for before in [true, false] {
+        let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+        let (seed_open, after_seed) = seed_window();
+        if before {
+            run_to(&mut runner, seed_open);
+            assert!(
+                p1k(&runner).seed_pending().is_some(),
+                "fixture: the seed is owed"
+            );
+            queue(&mut runner, seed_open + 1, 9_750, trim_status(1, 6));
+            run_to(&mut runner, after_seed - 1);
+        } else {
+            run_to(&mut runner, after_seed - 1);
+            queue(&mut runner, after_seed, 9_750, trim_status(1, 6));
+            run_to(&mut runner, after_seed + 1);
+        }
+        assert!(
+            p1k(&runner).seed_pending().is_none(),
+            "before {before}: the seed landed"
+        );
+        let t = after_seed + 2;
+        queue(&mut runner, t, 9_751, status(WRITTEN, Some(1)));
+        queue(&mut runner, t + 1, 9_752, status(6, Some(1)));
+        queue(&mut runner, t + 2, 9_753, status(HEAD, Some(1)));
+        queue(&mut runner, t + 3, 9_754, status(WRITTEN, None));
+        let replies = run_to(&mut runner, t + 10);
+        assert_eq!(
+            status_reply(&replies, WRITTEN),
+            vec![TxnStatus::Unknown, TxnStatus::Unknown],
+            "before {before}: trimmed request 5 is Unknown, with and without the generation"
+        );
+        let kept = |request: u64| {
+            matches!(
+                status_reply(&replies, request).as_slice(),
+                [TxnStatus::Resolved(result)]
+                    if result.outcome == Outcome::RecoveredApplied
+                        && result.generation == Generation(1)
+                        && result.seq == Seq(request)
+            )
+        };
+        assert!(kept(6), "before {before}: request 6, at the floor, is kept");
+        assert!(kept(HEAD), "before {before}: request 10 is kept");
+        assert_eq!(
+            p1(&runner).status.len(),
+            5,
+            "before {before}: rows 6..=10 are held"
+        );
+    }
+}
+
+// ---- M7A-131 --------------------------------------------------------------------------------
+
+/// M7A-131 (charter A1/P1 adversarial "expire authority between publication and reply", ADR
+/// 0007 "late old dispatch quarantine only", §4.2 step 6). Request 11 passes `Dispatch` and
+/// `Publication` at `SUBMIT` and is published at seq 11 (the fixture's "seq 5"); its
+/// `Check{Reply}` is delayed 2 000 ms by a hop delay on B's `Reply` checkpoint (P-3), and the
+/// control completion A1 waits on was dropped at `SUBMIT - 1600` (as M7A-163), so B's local
+/// window lapses at the last view's horizon — after the publication, before the delayed check is
+/// answered. A1 fences `Node/Expired` with a superseding view; P1's freeze withholds the reply
+/// (`awaiting_reply` empty at the fence, A-R90); the delayed check is then answered
+/// `Deny(Expired)` at the `Reply` gate, finds nothing awaiting, and nothing is replied: zero `ReplyEffect` carrying a result for request 11,
+/// `Status == Published{result}` for it, `published_seq` still 11.
+///
+/// The control run (no drop) is the same run without the lapse: the delayed check is answered
+/// `Valid` at `SUBMIT + 2000` and the one reply is delivered then, so the zero above is the
+/// fence's doing and not the delay's.
+///
+/// Log half (Q-43, quiesced — the trace is written after `finish`): one `publish` line for seq
+/// 11 in both runs; one `client_outcome_reported` for request 11 with `delivered = true` in the
+/// control run and **none** in the expired run. A `delivered = false` line has no producer in
+/// this build: `PubFact::ReplyWithheld` leaves P1 as `Ignored(ReplyWithheld)`, an `Ignored`
+/// effect carries no request identity and is never written to the trace (`run.rs`), and
+/// `AuthorityIgnoreReason` is a frozen contract — ruled A-R88: the zero-beside-control form
+/// stands, no contract change.
+#[retcd_test]
+fn m7a_131_a1_p1_expire_authority_between_publication_and_reply() {
+    support::preamble();
+    let delay = 2_000;
+    // Control first: its lines put every column the expired run's queries name into the
+    // relation, so a missing line reads as a zero and never as a binder error.
+    for drop in [false, true] {
+        let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+        let mut replies = run_to(&mut runner, SUBMIT - 1_600);
+        if drop {
+            runner
+                .control_mut()
+                .inject(ControlOp::DropCompletion { node: B })
+                .expect("drop B's next control completion");
+        }
+        runner.dispatcher_mut().delay_hop(HopDelay {
+            node: B,
+            checkpoint: Checkpoint::Reply,
+            by_millis: delay,
+        });
+        replies.extend(run_to(&mut runner, SUBMIT + 20));
+        let view = p1(&runner);
+        assert_eq!(
+            view.published.seq,
+            Seq(WRITE),
+            "drop {drop}: request 11 passed Publication and is published at seq 11"
+        );
+        assert_eq!(
+            view.awaiting_reply.len(),
+            1,
+            "drop {drop}: its reply waits on the delayed Reply check"
+        );
+        assert!(
+            replies_for(&replies, identity(WRITE)).is_empty(),
+            "drop {drop}: nothing replied before the check"
+        );
+        let last = view.authority.expect("P1 holds A1's view");
+        let fence_tick = last.valid_through_tick.0 + 1;
+        if drop {
+            assert!(
+                (SUBMIT + 20..SUBMIT + delay).contains(&fence_tick),
+                "the lapse ({fence_tick}) lands between the publication and the delayed check"
+            );
+            replies.extend(run_to(&mut runner, fence_tick));
+            let a1 = runner.dispatcher().authority(B).expect("A1 on B").view();
+            assert_eq!(
+                a1.state,
+                AuthorityState::Fenced {
+                    reason: DenyReason::Expired,
+                    at: Tick(fence_tick),
+                },
+                "Fence{{Node, Expired}} at the local horizon"
+            );
+            let superseding = p1(&runner).authority.expect("a view after the fence");
+            assert!(
+                superseding.authority_seq > last.authority_seq
+                    && superseding.past_horizon == DenyReason::Expired,
+                "the fence pushed its superseding view: {superseding:?}"
+            );
+            assert!(
+                p1(&runner).awaiting_reply.is_empty(),
+                "the freeze withheld the awaited reply"
+            );
+            assert_eq!(
+                p1(&runner).mode,
+                PubMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(DenyReason::Expired)
+                },
+                "the fence froze P1: this freeze withheld the reply, not the delayed Deny (A-R90)"
+            );
+        }
+        replies.extend(run_to(&mut runner, SUBMIT + delay + 500));
+        let decided: Vec<_> = runner
+            .recorded()
+            .iter()
+            .filter_map(|e| match &e.kind {
+                TraceKind::AuthorityDecision {
+                    gate: AuthorityGate::Reply,
+                    outcome,
+                    decision_tick,
+                    ..
+                } if e.node == B => Some((*decision_tick, *outcome)),
+                _ => None,
+            })
+            .collect();
+        let want = if drop {
+            AuthorityOutcome::Expired
+        } else {
+            AuthorityOutcome::Valid
+        };
+        assert_eq!(
+            decided,
+            vec![(SUBMIT + delay, want)],
+            "drop {drop}: one Reply decision, at the delayed check"
+        );
+        let view = p1(&runner);
+        assert_eq!(
+            view.published.seq,
+            Seq(WRITE),
+            "drop {drop}: published_seq unchanged"
+        );
+        assert!(
+            view.awaiting_reply.is_empty(),
+            "drop {drop}: awaiting_reply empty"
+        );
+        assert!(
+            matches!(
+                view.status.lookup(identity(WRITE), Generation(2)),
+                StatusOutcome::Published { result } if result.seq == Seq(WRITE)
+            ),
+            "drop {drop}: Status == Published{{result}}: {:?}",
+            view.status.lookup(identity(WRITE), Generation(2))
+        );
+        let for_11 = replies_for(&replies, identity(WRITE));
+        if drop {
+            assert!(
+                for_11.is_empty(),
+                "zero ReplyEffect carrying a result for request 11: {for_11:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    for_11.as_slice(),
+                    [ReplyEffect::Transaction { result, .. }] if result.seq == Seq(WRITE)
+                ),
+                "control: the delayed check admits and the one reply is delivered: {for_11:?}"
+            );
+        }
+
+        // Log half.
+        let trace = runner.finish().expect("trace");
+        let want_outcomes = if drop {
+            vec![]
+        } else {
+            vec![(SUBMIT + delay, ClientOutcome::Success)]
+        };
+        assert_eq!(
+            outcomes(&trace.events, WRITE, None),
+            want_outcomes,
+            "drop {drop}: the trace's outcome lines for request 11"
+        );
+        let method = if drop {
+            "m7a_131_expired"
+        } else {
+            "m7a_131_control"
+        };
+        let tags = LogTags::new(module_path!(), method, test_run_id());
+        let path = log_jsonl_path(&test_log_dir(), module_path!(), method);
+        write_log_jsonl(&trace.events, &tags, &path).expect("the tier-1 lines are written");
+        let relation = config_testkit::logs::test_logs_relation();
+        let count = |sql: String| -> u64 {
+            let rows = config_testkit::logs::query(&sql);
+            rows[0]["n"].as_u64().expect("a count")
+        };
+        let publishes = count(format!(
+            "SELECT count(*) AS n FROM {relation} WHERE testMethod = '{method}' \
+             AND \"@m\" = 'publish' AND seq = {WRITE}"
+        ));
+        let delivered = count(format!(
+            "SELECT count(*) AS n FROM {relation} WHERE testMethod = '{method}' \
+             AND \"@m\" = 'client_outcome_reported' AND request = {WRITE} AND delivered"
+        ));
+        let reported = count(format!(
+            "SELECT count(*) AS n FROM {relation} WHERE testMethod = '{method}' \
+             AND \"@m\" = 'client_outcome_reported' AND request = {WRITE}"
+        ));
+        assert_eq!(
+            (publishes, reported, delivered),
+            (1, u64::from(!drop), u64::from(!drop)),
+            "drop {drop}: one publish for seq 11; a delivered outcome only in the control run"
+        );
+    }
+}
+
+// ---- M7A-136 --------------------------------------------------------------------------------
+
+/// M7A-136 (spike §6 F1/T1, ADR 0004 "generation reconciliation"). As M7A-117, with the client
+/// retrying **during** the recovery rather than after it: the mutation is applied exactly once
+/// across both generations. Asserted from the `BatchApply` lines the run records — INV-DEDUP's
+/// subject, read the way M7A-117 reads it (S-117g) rather than through O1: every apply of
+/// request 5's mutation is the one its own submission made, and no retry's correlation ever
+/// reaches storage.
+///
+/// - **Same node** (`gen2_committed`, then gen 3's root at `now`): a retry queued at `now`, ahead
+///   of the root, is answered from gen 2's own index — the published result replayed, no batch;
+///   the first queued behind the root, during the resume hold, is refused `PROTECTION_PAUSED`;
+///   the other four, through gen 3's first admission, are refused `GENERATION_CHANGED{2, 3}` at
+///   check 5. The sequence is pinned; `NOT_PRIMARY` is never a same-node answer (reviewer T-3).
+///   `Status{Some(2)}` folds `RecoveredApplied`. A fresh request at `GEN3_ADMITS + 2` is
+///   published in gen 3 at the next sequence, so gen 3 admits — it just does not re-execute.
+/// - **Different node** (the A1/P1 case): retries reach B before its T1 exists (`NOT_PRIMARY`),
+///   while its seed is pending (`PROTECTION_PAUSED`, M7A-117), and after it lands
+///   (`GENERATION_CHANGED{1, 2}`); the grammar's request 11 and a fresh request 41 are gen 2's
+///   only batches.
+///
+/// In both halves every node applies seq 5 exactly once — for the copy that lacked the prefix,
+/// as the recovered lineage's catch-up under the recovery's own correlation, never under a
+/// retry's.
+#[retcd_test]
+fn m7a_136_f1_t1_generation_reconciliation_no_double_apply() {
+    support::preamble();
+    // Different node only: `NOT_PRIMARY` is B's answer before its T1 exists, and the same node
+    // never gives it (reviewer T-3).
+    let refused = |reply: &ReplyEffect, current: u64| {
+        matches!(
+            reply,
+            ReplyEffect::Failed {
+                error: RdbError::ProtectionPaused { .. } | RdbError::NotPrimary { .. },
+                ..
+            }
+        ) || matches!(
+            reply,
+            ReplyEffect::Failed {
+                error: RdbError::GenerationChanged { current: got, .. },
+                ..
+            } if got.0 == current
+        )
+    };
+    let kind = |reply: &ReplyEffect| match reply {
+        ReplyEffect::Failed {
+            error: RdbError::ProtectionPaused { .. },
+            ..
+        } => "PROTECTION_PAUSED".to_owned(),
+        ReplyEffect::Failed {
+            error: RdbError::NotPrimary { .. },
+            ..
+        } => "NOT_PRIMARY".to_owned(),
+        ReplyEffect::Failed {
+            error: RdbError::GenerationChanged { expected, current },
+            ..
+        } => format!("GENERATION_CHANGED{{{}, {}}}", expected.0, current.0),
+        other => format!("{other:?}"),
+    };
+
+    // Same node.
+    let (mut runner, published, written) = gen2_committed();
+    let now = runner.dispatcher().clock().now().0;
+    let retries = 9_601..=9_607;
+    queue(&mut runner, now, 9_601, submit(written.clone()));
+    recover_gen3(&mut runner, false);
+    queue(&mut runner, now + 1, 9_602, submit(written.clone()));
+    queue(
+        &mut runner,
+        now + 2,
+        9_603,
+        submit(expecting(written.clone(), 2)),
+    );
+    queue(&mut runner, now + 3, 9_604, status(WRITTEN, Some(2)));
+    queue(&mut runner, GEN3_ADMITS - 1, 9_605, submit(written.clone()));
+    queue(&mut runner, GEN3_ADMITS, 9_606, submit(written.clone()));
+    queue(
+        &mut runner,
+        GEN3_ADMITS + 1,
+        9_607,
+        submit(expecting(written, 2)),
+    );
+    queue(&mut runner, GEN3_ADMITS + 2, 9_608, submit(txn(40, 40)));
+    let replies = run_to(&mut runner, GEN3_ADMITS + 60);
+    // The submits' answers; the status query's is asserted on its own below.
+    let for_5: Vec<_> = replies_for(&replies, identity(WRITTEN))
+        .into_iter()
+        .filter(|reply| !matches!(reply, ReplyEffect::Status { .. }))
+        .collect();
+    assert_eq!(for_5.len(), 6, "one answer per retry: {for_5:?}");
+    assert_eq!(
+        for_5[0],
+        &ReplyEffect::Transaction {
+            identity: identity(WRITTEN),
+            result: published,
+        },
+        "ahead of the root: gen 2's own index replays the published result"
+    );
+    assert_eq!(
+        for_5[1..]
+            .iter()
+            .map(|reply| kind(reply))
+            .collect::<Vec<_>>(),
+        [
+            "PROTECTION_PAUSED",
+            "GENERATION_CHANGED{2, 3}",
+            "GENERATION_CHANGED{2, 3}",
+            "GENERATION_CHANGED{2, 3}",
+            "GENERATION_CHANGED{2, 3}",
+        ],
+        "behind the root, in reply order: PROTECTION_PAUSED in the resume hold, then \
+         GENERATION_CHANGED{{2, 3}} through gen 3's admission; never NOT_PRIMARY here"
+    );
+    assert_eq!(
+        status_reply(&replies, WRITTEN),
+        vec![TxnStatus::Resolved(gen2_result(
+            WRITTEN,
+            Outcome::RecoveredApplied,
+            &published
+        ))],
+        "Status{{Some(2)}} during the recovery folds RecoveredApplied"
+    );
+    assert!(
+        matches!(
+            replies_for(&replies, identity(40)).as_slice(),
+            [ReplyEffect::Transaction { result, .. }]
+                if result.generation == Generation(3) && result.seq == Seq(WRITTEN + 1)
+        ),
+        "gen 3 admits a fresh request at the next sequence"
+    );
+    let trace = runner.finish().expect("trace");
+    let applies = batch_applies(&trace.events);
+    let at_5: Vec<_> = applies
+        .iter()
+        .filter(|(.., seq)| *seq == Seq(WRITTEN))
+        .collect();
+    assert_eq!(
+        at_5,
+        vec![
+            &(9_399, NodeId(1), Generation(2), Seq(WRITTEN)),
+            &(9_399, NodeId(2), Generation(2), Seq(WRITTEN)),
+            &(9_399, NodeId(3), Generation(2), Seq(WRITTEN)),
+        ],
+        "seq 5 is applied once per node, by its own submission, in gen 2"
+    );
+    assert!(
+        applies
+            .iter()
+            .all(|(correlation, ..)| !retries.contains(correlation)),
+        "no retry's correlation reaches storage: {applies:?}"
+    );
+    assert_eq!(
+        applies
+            .iter()
+            .filter(|(_, _, generation, _)| *generation == Generation(3))
+            .map(|(correlation, _, _, seq)| (*correlation, *seq))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([(9_608, Seq(WRITTEN + 1))]),
+        "gen 3's only batch is the fresh request"
+    );
+
+    // Different node.
+    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    let seed_open = cases::PLAN_AT + 2_097;
+    let after_seed = seed_open + 503;
+    let retries = 9_611..=9_616;
+    for (at, correlation) in [
+        (cases::PLAN_AT + 1, 9_611),
+        (cases::PLAN_AT + 1_000, 9_612),
+        (cases::PLAN_AT + 2_002, 9_613),
+        (seed_open, 9_614),
+        (after_seed, 9_615),
+        (SUBMIT + 200, 9_616),
+    ] {
+        queue(&mut runner, at, correlation, submit(txn(WRITTEN, WRITTEN)));
+    }
+    queue(&mut runner, SUBMIT + 201, 9_617, submit(txn(41, 41)));
+    let replies = run_to(&mut runner, SUBMIT + 300);
+    let for_5 = replies_for(&replies, identity(WRITTEN));
+    assert_eq!(for_5.len(), 6, "one answer per retry: {for_5:?}");
+    assert!(
+        for_5.iter().all(|reply| refused(reply, 2)),
+        "every retry on B is refused, NOT_PRIMARY, PROTECTION_PAUSED or GENERATION_CHANGED{{1, 2}}: {for_5:?}"
+    );
+    assert_eq!(
+        for_5[5],
+        &ReplyEffect::Failed {
+            identity: identity(WRITTEN),
+            error: RdbError::GenerationChanged {
+                expected: Generation(1),
+                current: Generation(2),
+            },
+        },
+        "after the seed the retry is reconciled from gen 1's row"
+    );
+    let trace = runner.finish().expect("trace");
+    let applies = batch_applies(&trace.events);
+    for node in [NodeId(1), NodeId(2), NodeId(3)] {
+        let at_5 = applies
+            .iter()
+            .filter(|(_, n, _, seq)| *n == node && *seq == Seq(WRITTEN))
+            .count();
+        assert_eq!(at_5, 1, "{node:?} applies seq 5 exactly once: {applies:?}");
+    }
+    assert!(
+        applies
+            .iter()
+            .all(|(correlation, ..)| !retries.contains(correlation)),
+        "no retry's correlation reaches storage: {applies:?}"
+    );
+    assert_eq!(
+        applies
+            .iter()
+            .filter(|(_, n, generation, _)| *n == B && *generation == Generation(2))
+            .map(|(_, _, _, seq)| *seq)
+            .collect::<Vec<_>>(),
+        vec![Seq(WRITE), Seq(WRITE + 1)],
+        "gen 2's batches on B are request 11 and the fresh request 41"
     );
 }

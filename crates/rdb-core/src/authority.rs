@@ -3563,15 +3563,32 @@ impl Module for Authority {
     }
 
     fn capability(&self) -> CapabilityState {
-        // Deliberately still `Unavailable`. The self-fence transitions, the gates, acquisition
-        // and renewal are real, but A1's advertised capability is the four gates **over a grant
-        // it acquired and a lineage it installed**, and the path is not whole end to end:
-        // nothing in this build consumes the `PublishAuthorityView` the grant rows or the
-        // `FenceProven` the takeover rows emit. The post-`Recovered` install is built
-        // (L-R177gf), but that alone does not make it whole. Reporting `Wired`
-        // here would tell the campaign runner that package A1 answers checks over a served
-        // lineage end to end, which it does not. Flipping it is a lead call, not a side effect.
-        CapabilityState::Unavailable
+        // `Wired` (lead rulings A-R80a, V-R37, V-R38). A1's advertised capability is the four gates
+        // over a grant it acquired and a lineage it installed, and the campaign now exercises
+        // that end to end. The evidence is the authored F1/T1 cases in `rdb-sim`'s
+        // `tests/support/scenarios/cases.rs` (`case_f1_t1_p1_retained_status_24h`,
+        // `case_f1_t1_digest_across_recovery`): survivors with a prefix go through F1's
+        // recovery and the resume hold, then a client submits. A1 installs the recovered
+        // lineage, acquires a grant, and answers each write's `Dispatch`, `Publication` and
+        // `Reply` checks `Valid` for that grant. INV-AUTH, which needs A1 alone, arms on those
+        // runs and holds (`tests/campaign.rs`, M7V-89). Reporting `Unavailable` here would
+        // tell the campaign no such run exists.
+        //
+        // What that `proven` covers (ruling V-R41): only the paths the default corpus reaches,
+        // which is A1's healthy path — every decision it records is `Valid`, inside a held
+        // grant, in one generation. No corpus history reaches a NoGrant, Expired, Fenced or
+        // lineage denial: a submit before the grant is refused by T1's admission before A1 is
+        // asked, and no op the bridge lowers lapses a lease, fences, or moves a lineage.
+        // Denial, fence and lineage are covered by `rdb-core` unit rows instead: NoGrant by
+        // `m7a_03_acquire_cas_unknown_reads_no_rights`; fence by
+        // `m7a_36_tick_local_window_lapsed_fences_expired_with_renewal_outstanding` and
+        // `m7a_50_fence_scope_table_seven_node_two_partition`; lineage by
+        // `a_read_moving_a_partition_to_a_withheld_lineage_fences_the_old_one` and
+        // `m7a_184`..`m7a_187`; P1's side by
+        // `m7a_99_publication_check_deny_quarantines_freezes_authority_lost` and
+        // `m7a_100_publication_check_lineage_moved_quarantines`. The corpus member that
+        // would reach a denial is the A1/P1 case's generation move, owed under M7V-47/M7V-88.
+        CapabilityState::Wired
     }
 
     fn step(&mut self, ctx: &StepCtx<'_>, event: &Event) -> Result<Vec<Effect>, RdbError> {
@@ -3582,8 +3599,21 @@ impl Module for Authority {
         // any event at all drives the expiry rows, and why a grant is never more than one step
         // past its expiry — see `revalidate`.
         let was_held = self.state.is_held();
+        let clock_before = self.clock;
         let mut effects = self.revalidate(ctx, event);
         let fenced_here = was_held && self.state.is_fenced();
+        // Views `revalidate` republished because the step's sample was newly accepted
+        // (reviewer-ka-rows F2). If the event below is declined they leave with nothing, and
+        // the sample they were published for is handed back too (see the `Err` arm), so the
+        // next accepted step absorbs it again and republishes them then.
+        let republished_here = effects.iter().any(|effect| {
+            matches!(
+                effect.kind,
+                EffectKind::Kernel(KernelEffect::Authority(
+                    AuthorityEffect::PublishAuthorityView(_)
+                ))
+            )
+        });
         let routed = match &event.kind {
             EventKind::Control(control) => self.on_control(ctx, event, control),
             EventKind::Timer(fired) => self.on_timer(ctx, event, *fired),
@@ -3608,7 +3638,21 @@ impl Module for Authority {
             // this step; declining would drop them and no consumer would ever hear of the fence
             // (defect KA-ROWS-D1). Nothing else changes: any other decline is still a decline.
             Err(RdbError::Unavailable { .. }) if fenced_here => return Ok(effects),
-            Err(declined) => return Err(declined),
+            // A declined step is a step that did not happen — while held; with no grant, or
+            // fenced, there are no views, so a sample the step keeps loses nothing (T4).
+            // The views a moved sample
+            // republished (reviewer-ka-rows F2) are dropped with it, so the sample goes back
+            // too: kept, it would never "move" again and the views would never be republished —
+            // every secondary would honour the previous horizon past the moved one. Handed back,
+            // the next accepted step absorbs it and republishes. Not `Ok(effects)`: that would
+            // publish on every foreign timer that lands with a fresh sample, and the F1/R1
+            // keepalive budget (ruling B-R65, `m7v_47`) counts those steps.
+            Err(declined) => {
+                if republished_here {
+                    self.clock = clock_before;
+                }
+                return Err(declined);
+            }
         }
         // The takeover sweep is the last thing a step does (`design.md` §2.6a T8). Not reached on
         // an `Err`: a proof recorded in state but never emitted would make at-most-once zero.

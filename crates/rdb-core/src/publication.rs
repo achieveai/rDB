@@ -28,7 +28,7 @@ use bytes::Bytes;
 pub use self::kernel::{
     AppliedCandidate, AwaitingReply, FreezeCause, PendingView, PredicateFalse, PubConfig,
     PubEffect, PubEvent, PubFact, PubKernel, PubMode, PubStateView, PublishedAt, ReadIntent,
-    ReplyOutcome, StatusEntry, StatusOutcome, Withheld, POST_APPLY_DEADLINE_MILLIS,
+    ReplyOutcome, StatusEntry, StatusOutcome, StatusSeed, Withheld, POST_APPLY_DEADLINE_MILLIS,
     PUBLICATION_CORRELATION_BASE, PUBLICATION_SNAPSHOT_BASE, WAITER_CAP,
 };
 pub use self::status::StatusIndex;
@@ -205,6 +205,9 @@ impl Publication {
         if slot.kernel.boot() != ctx.boot {
             *slot = Slot::new(config, ctx.boot, ctx_lineage(ctx), Seq::ZERO);
         }
+        // M7A-194: any P1 input is a chance to load a status seed the snapshot now covers, and
+        // it is loaded before the input is answered, so a `Status` query is answered from it.
+        slot.kernel.try_seed(ctx.now, ctx.snapshot);
         let kinds = match &event.kind {
             // Q1 (lead ruling A-R71): the barrier holds one key per identity, so a second read
             // while the first still waits is refused on arrival, and never queued. Overwriting
@@ -224,10 +227,17 @@ impl Publication {
                     slot.read_keys.insert(*identity, key.clone());
                 }
                 let produced = slot.kernel.apply(ctx.now, input, repl);
-                produced
+                let kinds: Vec<EffectKind> = produced
                     .into_iter()
                     .flat_map(|effect| route(ctx, event, slot, effect))
-                    .collect()
+                    .collect();
+                // A `Recovered` whose snapshot already shows the retained prefix seeds on its
+                // own step, as T1 does right after `at_recovery`: the call above ran before the
+                // seed existed. Pinned by the unit twin
+                // `m7a_194_status_seed_lands_on_the_recovered_step_and_fails_closed_on_a_newer_row`
+                // (tester-ka-next T8).
+                slot.kernel.try_seed(ctx.now, ctx.snapshot);
+                kinds
             }
         };
         Ok(kinds
@@ -353,11 +363,12 @@ impl Module for Publication {
     }
 
     fn capability(&self) -> CapabilityState {
-        // Deliberately still `Unavailable`: every §4.2 row is reachable through `step`, and the
-        // sim dispatcher routes every P1 edge and hands P1 the primary's tracker through
-        // `step_with` (A-R66); nothing in routing holds it back any more (A-R82..A-R84).
-        // Flipping it is a lead call.
-        CapabilityState::Unavailable
+        // `Wired` (lead ruling V-R38, after A-R66 and A-R82..A-R84 left nothing in routing
+        // holding it back): every §4.2 row is reachable through `step`, and the sim dispatcher
+        // routes every P1 edge and hands P1 the primary's tracker through `step_with`. The
+        // campaign reads this answer as "a run can arm an invariant that needs P1"; INV-PUB
+        // still needs R1 as well, so it stays a capability verdict until R1 flips.
+        CapabilityState::Wired
     }
 
     fn step(&mut self, ctx: &StepCtx<'_>, event: &Event) -> Result<Vec<Effect>, RdbError> {
