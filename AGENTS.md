@@ -211,24 +211,31 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   clusters, so it does not look like a flake.** Observed 2026-09-22: `m6_110`, `m6_111`, `m6_112`
   failed with `os error 10013` binding `127.0.0.1:54942`, `:54964` and `:54984`, and
   `e2e_47_daemon_evidence_run_produces_every_artifact` failed with them because it shells out to
-  that suite and asserts it passed. All three ports sit inside an **administered** exclusion:
+  that suite and asserts it passed. All three ports sit inside an excluded UDP block.
+- The exclusions grow, so list them; never copy them from here. 3 UDP blocks on 2026-09-22,
+  6 on 2026-10-01. None is marked `*` (administered): something on the host reserves them.
 
   ```sh
-  netsh int ipv4 show excludedportrange udp   # 50660-50759, 50760-50859, 54934-55033
+  netsh int ipv4 show excludedportrange udp   # 2026-10-01: 50660-50859, 54934-55033, 55430-55729
+  netsh int ipv4 show excludedportrange tcp   # ~600 ports too, e.g. 56751-56950, 58298-58756
   netsh int ipv4 show dynamicport udp         # 49152 + 16384
   ```
 
-  The excluded block is 100 ports out of 16384, so three *independent* draws landing inside it
-  would be a 1-in-4-million coincidence. They are not independent: Windows hands out ephemeral
-  ports from a rotating pointer, so tests running seconds apart get neighbouring ports — here 42
-  apart. **One unlucky pointer position takes out every gossip row in the run at once.**
-
-  That is why it misleads. A flake that hits one row reads as a flake; a flake that hits three
-  related rows together reads as a regression in gossip, and the next reader goes looking for a
-  defect that is not there. It is transient — ~99.4% of pointer positions are clear — but when it
-  fires it fires as a cluster. Check `netsh` before believing it. The durable fix is for the
-  testkit to retry on `10013` rather than to draw once and fail; not yet built, and it belongs to
-  whoever owns M0-M6.
+- Why it clusters: Windows hands out ephemeral ports from a rotating pointer, so binds made
+  seconds apart get neighbouring ports — 42 apart on 2026-09-22. **One unlucky pointer position
+  takes out every gossip row in the run at once.** A flake that hits three related rows reads as
+  a regression in gossip, and the next reader hunts a defect that is not there.
+- **Fixed 2026-10-01 in `config-gossip`, not the testkit.** It hit again on 2026-09-30: `e2e_43`,
+  `m6_20` and `m6_21` failed together on ports 54964 and 55483-55485, the daemon logging `gossip
+  failed to start; continuing without it`. The old start retried a port-`0` bind 8 times and
+  took each port from the OS pointer. Only the last pick was logged; that all 8 sat in one
+  block is inferred from the neighbouring ports. `GossipNode::start` with port `0` now draws
+  up to 32 random candidates across 49152-65535 and retries any refused TCP or UDP bind,
+  `10013` included. Every caller that asks for port `0` gets this — testkit clusters and the
+  e2e daemons alike. A **fixed** configured port is still tried once and never moved.
+- So a `10013` from gossip now means 32 independent refusals — a host problem worth reading,
+  not a flake. The error ends `(last of 32 ephemeral candidate ports)`. Each retry is a debug
+  event `gossip_ephemeral_bind_retry` with `attempt`, `port` and `error`.
 
 ## Counting M7 rows: run the script, never quote a plan
 
