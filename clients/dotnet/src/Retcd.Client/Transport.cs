@@ -92,15 +92,17 @@ internal sealed class Transport : IDisposable
 
     /// <summary>
     /// Open the connection before a call is sent, so "could not connect" (nothing sent) is never confused with
-    /// "sent, then timed out". Returns null when connected, else why it failed.
+    /// "sent, then timed out". Waits at most <paramref name="limit"/> (and never past the deadline): a channel to
+    /// a dead node keeps retrying until cancelled, so without a limit one dead node eats the whole call budget.
+    /// Returns null when connected, else why it failed.
     /// </summary>
-    public async Task<Exception?> ConnectAsync(string endpoint, DateTime deadlineUtc, CancellationToken ct)
+    public async Task<Exception?> ConnectAsync(string endpoint, DateTime deadlineUtc, TimeSpan limit, CancellationToken ct)
     {
         var ch = ChannelFor(endpoint);
         var left = deadlineUtc - DateTime.UtcNow;
         if (left <= TimeSpan.Zero) return new TimeoutException("no time left to connect");
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(left);
+        cts.CancelAfter(left < limit ? left : limit);
         try
         {
             await ch.ConnectAsync(cts.Token).ConfigureAwait(false);

@@ -13,7 +13,8 @@ dotnet add package Retcd.Client --source ./nupkgs      # or: dotnet add referenc
 await using var c = RetcdClient.Create(new RetcdClientOptions {
     Endpoints = new[] { "127.0.0.1:17302", "127.0.0.1:17312", "127.0.0.1:17322" }, Timeout = TimeSpan.FromSeconds(10) });
 ```
-List a live node first. A dead first node costs ~2 s once per process.
+A dead node costs about 0.4 s: each call gives a node 0.4 s to connect, then tries the next
+(3 s each once every node has missed). Nothing is sent to a node that never connected, so this is safe for writes.
 
 ## Use it
 ```csharp
@@ -39,7 +40,8 @@ Watch from the past: `WatchAsync("app/", fromRevision: 42)`. Each event carries 
 - `RevisionCompactedException`, `RetcdNotFoundException`, `ChecksumMismatchException` - as named.
 - All derive from `RetcdException`. Cancel gives `OperationCanceledException`.
 
-Retries happen only when nothing was applied: "not leader" and "connection refused".
+Retries happen only when nothing was applied: "not leader", "no leader yet" and "connection refused".
+They stay inside `Timeout`. A List page refused as "minted by another node" is resent there with the same cursor.
 
 ## Presence (no leases)
 ```csharp
@@ -61,6 +63,12 @@ It stops and restarts one node of that cluster. Point it only at a cluster you o
 
 ## Limits
 Key 1024 bytes. Value 1 MiB. List page 1000. 100 watches per principal per node.
+
+## Changes
+- 0.1.0, unreleased: a dead first endpoint no longer fails the call. Before, the client waited the whole
+  `Timeout` on it and threw `RetcdUnavailableException`.
+- 0.1.0, unreleased: "no leader yet" (UNAVAILABLE stamped by the server, no reason) is waited out within
+  `Timeout`, for reads and writes. Before, it threw `RetcdUnavailableException` at once.
 
 ## What this is not
 - No leases or TTL. Presence is heartbeats plus a watcher.

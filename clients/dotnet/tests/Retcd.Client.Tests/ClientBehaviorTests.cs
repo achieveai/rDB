@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Sockets;
+using Grpc.Core;
 using Retcd.Client;
 
 namespace Retcd.Client.Tests;
@@ -71,6 +72,95 @@ public class ClientBehaviorTests
         Assert.Contains("Nothing was applied", ex.Message);
         await Assert.ThrowsAsync<RetcdUnavailableException>(() => get);
         await Assert.ThrowsAsync<RetcdUnavailableException>(() => del);
+    }
+
+    // ---- the retry loop, with each answer scripted in place of the RPC ----------------------------
+    // The node is a bare TcpListener: the client's connect step passes, and the scripted answer stands in
+    // for what the server would have sent.
+
+    private static RpcException Status(StatusCode code, bool stamped, string? reason = null)
+    {
+        var md = new Metadata();
+        if (stamped) md.Add("retcd-outcome", "rejected");
+        if (reason is not null) md.Add("retcd-reason", reason);
+        return new RpcException(new Grpc.Core.Status(code, "scripted"), md);
+    }
+
+    private static AsyncUnaryCall<string> Answer(Func<string> answer)
+    {
+        Task<string> task;
+        try { task = Task.FromResult(answer()); }
+        catch (Exception ex) { task = Task.FromException<string>(ex); }
+        return new AsyncUnaryCall<string>(task, Task.FromResult(new Metadata()), () => Grpc.Core.Status.DefaultSuccess, () => new Metadata(), () => { });
+    }
+
+    private static async Task WithListeningNode(double timeoutSeconds, Func<RetcdClient, Task> body)
+    {
+        var l = new TcpListener(IPAddress.Loopback, 0);
+        l.Start();
+        try
+        {
+            await using var c = RetcdClient.Create(new RetcdClientOptions
+            {
+                Endpoints = new[] { $"127.0.0.1:{((IPEndPoint)l.LocalEndpoint).Port}" },
+                Timeout = TimeSpan.FromSeconds(timeoutSeconds),
+            });
+            await body(c);
+        }
+        finally
+        {
+            l.Stop();
+        }
+    }
+
+    [Fact]
+    public async Task No_leader_yet_is_waited_out_for_a_read_and_a_write_because_nothing_was_applied()
+    {
+        await WithListeningNode(10, async c =>
+        {
+            foreach (var isWrite in new[] { false, true })
+            {
+                var attempts = 0;
+                var r = await c.UnaryAsync("put", isWrite, 0, (_, _) => Answer(() =>
+                    ++attempts < 3 ? throw Status(StatusCode.Unavailable, stamped: true) : "applied"), CancellationToken.None);
+                Assert.Equal("applied", r);
+                Assert.Equal(3, attempts);
+            }
+        });
+    }
+
+    [Fact]
+    public async Task No_leader_yet_gives_up_at_the_call_timeout_and_says_nothing_was_applied()
+    {
+        await WithListeningNode(1, async c =>
+        {
+            var attempts = 0;
+            var started = DateTime.UtcNow;
+            var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("put", true, 0,
+                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: true); }), CancellationToken.None));
+            var took = DateTime.UtcNow - started;
+            Assert.Contains("no leader known yet", ex.Message);
+            Assert.Contains("Nothing was applied", ex.Message);
+            Assert.True(attempts > 1, $"retried ({attempts} attempts)");
+            Assert.InRange(took.TotalSeconds, 0.9, 5);
+        });
+    }
+
+    [Fact]
+    public async Task Unavailable_with_a_reason_or_without_the_stamp_is_not_resent()
+    {
+        await WithListeningNode(10, async c =>
+        {
+            var attempts = 0;
+            await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("get", false, 0,
+                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: true, reason: "feature_not_activated"); }), CancellationToken.None));
+            Assert.Equal(1, attempts);
+
+            attempts = 0; // a write the transport lost: it may have been applied, so it is never resent
+            await Assert.ThrowsAsync<UnknownOutcomeException>(() => c.UnaryAsync("put", true, 0,
+                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: false); }), CancellationToken.None));
+            Assert.Equal(1, attempts);
+        });
     }
 
     [Fact]

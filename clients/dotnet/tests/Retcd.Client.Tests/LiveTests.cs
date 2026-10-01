@@ -268,6 +268,63 @@ public class LiveTests
     }
 
     [LiveFact]
+    public async Task A_dead_first_endpoint_costs_well_under_a_second_for_a_read_and_a_write()
+    {
+        // Nothing listens on the first endpoint. The client must give up on it quickly and move on;
+        // a write is safe to send elsewhere because the dead node never received it.
+        var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        probe.Start();
+        var dead = $"127.0.0.1:{((System.Net.IPEndPoint)probe.LocalEndpoint).Port}";
+        probe.Stop();
+        var endpoints = new[] { dead }.Concat(Live.Endpoints!).ToArray();
+        var p = Live.Prefix();
+        RetcdClient Fresh() => RetcdClient.Create(new RetcdClientOptions { Endpoints = endpoints, Timeout = TimeSpan.FromSeconds(10) });
+
+        await using (var reader = Fresh())
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Assert.Null(await reader.GetAsync(p + "none"));
+            Assert.True(sw.ElapsedMilliseconds < 1500, $"first read took {sw.ElapsedMilliseconds} ms");
+        }
+        await using var writer = Fresh();
+        try
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await writer.PutAsync(p + "k", "v");
+            Assert.True(sw.ElapsedMilliseconds < 1500, $"first write took {sw.ElapsedMilliseconds} ms");
+            Assert.Equal("v", (await writer.GetAsync(p + "k"))!.ValueAsString());
+        }
+        finally { await Live.CleanAsync(writer, p); }
+    }
+
+    [LiveFact]
+    public async Task A_watch_with_fromRevision_as_the_first_call_skips_an_unreachable_first_endpoint_quickly()
+    {
+        // 10.255.255.1 is not routed here, so a connect neither succeeds nor is refused: it just hangs.
+        // Without the quick connect window the watch waited for the transport's own connect timeout.
+        var p = Live.Prefix();
+        await using var c = Live.NewClient();
+        try
+        {
+            var from = await c.PutAsync(p + "k", "v") - 1;
+            await using var w = RetcdClient.Create(new RetcdClientOptions
+            {
+                Endpoints = new[] { "10.255.255.1:1" }.Concat(Live.Endpoints!).ToArray(),
+                Timeout = TimeSpan.FromSeconds(10),
+            });
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            await foreach (var ev in w.WatchAsync(p, from, cts.Token))
+            {
+                Assert.Equal(p + "k", ev.Key);
+                break;
+            }
+            Assert.True(sw.ElapsedMilliseconds < 1500, $"first event took {sw.ElapsedMilliseconds} ms");
+        }
+        finally { await Live.CleanAsync(c, p); }
+    }
+
+    [LiveFact]
     public async Task Health_lists_every_node_and_one_leader()
     {
         await using var c = Live.NewClient();

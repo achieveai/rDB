@@ -57,6 +57,15 @@ internal static class RetcdErrors
         && !IsConflict(ex, out _, out _)
         && PageTokenReason(ex) is null;
 
+    /// <summary>
+    /// "No leader yet": UNAVAILABLE that the server stamped and gave no reason. It was refused before the
+    /// Raft log, so nothing was applied and a resend cannot duplicate it, even for a write. With a reason
+    /// (feature_not_activated) it is final; without the stamp it came from the transport and a write's
+    /// outcome is unknown.
+    /// </summary>
+    public static bool IsNoLeaderYet(RpcException ex) =>
+        ex.StatusCode == StatusCode.Unavailable && IsServerRejection(ex) && Meta(ex, HeaderReason) is null;
+
     /// <summary>A List cursor minted by another node. The refusal names a better node; follow it with the same token.</summary>
     public static bool IsForeignPageToken(RpcException ex) =>
         PageTokenReason(ex) == "node" && LeaderHint(ex) is not null;

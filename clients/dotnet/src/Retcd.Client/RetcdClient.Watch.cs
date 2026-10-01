@@ -21,11 +21,25 @@ public sealed partial class RetcdClient
         var prefix = RetcdGlob.LiteralPrefix(patternOrPrefix);
         var re = RetcdGlob.HasGlob(patternOrPrefix) ? RetcdGlob.ToRegex(patternOrPrefix) : null;
         var last = fromRevision ?? await ReadRevisionAsync(ct).ConfigureAwait(false);
+        var slowToConnect = new HashSet<string>(); // nodes that missed the quick connect window since the last message
 
         for (;;)
         {
             ct.ThrowIfCancellationRequested();
             var endpoint = _transport.Current;
+            // Connect first, with the same quick window as a call, so a dead node costs QuickConnect and not the
+            // transport's connect timeout. This matters most when fromRevision is given and the watch is the first
+            // thing this client does. A node that is already connected returns at once.
+            var quick = !_transport.Endpoints.All(slowToConnect.Contains);
+            var window = quick ? QuickConnect : SlowConnect;
+            if (await _transport.ConnectAsync(endpoint, DateTime.UtcNow + window, window, ct).ConfigureAwait(false) is not null)
+            {
+                slowToConnect.Add(endpoint);
+                _transport.Drop(endpoint);
+                _transport.Rotate();
+                if (!quick) await Task.Delay(_options.WatchReconnectDelay, ct).ConfigureAwait(false);
+                continue;
+            }
             var req = new Pb.WatchRequest { Prefix = ByteString.CopyFromUtf8(prefix), StartAfterRevision = last };
             RpcException? failure = null;
             using var call = _transport.ClientFor(endpoint).Watch(req, new CallOptions(cancellationToken: ct));
@@ -44,6 +58,7 @@ public sealed partial class RetcdClient
                     break;
                 }
 
+                slowToConnect.Clear();
                 if (msg.BodyCase == Pb.WatchResponse.BodyOneofCase.Progress)
                 {
                     if (msg.Progress.Revision > last) last = msg.Progress.Revision; // quiet heartbeat, no key data

@@ -57,6 +57,15 @@ public class ErrorMappingTests
     }
 
     [Fact]
+    public void No_leader_yet_is_only_a_stamped_unavailable_with_no_reason()
+    {
+        Assert.True(RetcdErrors.IsNoLeaderYet(Rpc(StatusCode.Unavailable, "no leader")));
+        Assert.False(RetcdErrors.IsNoLeaderYet(Rpc(StatusCode.Unavailable, trailers: new[] { ("retcd-reason", "feature_not_activated") })));
+        Assert.False(RetcdErrors.IsNoLeaderYet(Rpc(StatusCode.Unavailable, rejected: false)), "unstamped: from the transport");
+        Assert.False(RetcdErrors.IsNoLeaderYet(Rpc(StatusCode.FailedPrecondition)));
+    }
+
+    [Fact]
     public void Timed_out_write_is_unknown_outcome_but_timed_out_read_is_just_unavailable()
     {
         var ex = Rpc(StatusCode.DeadlineExceeded, rejected: false);

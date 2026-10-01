@@ -16,6 +16,12 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
 {
     private const string NowProbeKey = ".retcd-client/none";
 
+    /// <summary>How long a call waits to connect to one node before trying the next (a live node takes milliseconds).</summary>
+    private static readonly TimeSpan QuickConnect = TimeSpan.FromMilliseconds(400);
+
+    /// <summary>The connect window once every node has missed <see cref="QuickConnect"/> in one call. Same as the socket connect timeout.</summary>
+    private static readonly TimeSpan SlowConnect = TimeSpan.FromSeconds(3);
+
     private readonly RetcdClientOptions _options;
     private readonly Transport _transport;
     private readonly HttpClient _http;
@@ -292,10 +298,12 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     private static Task Pause(int ms, CancellationToken ct) => Task.Delay(ms, ct);
 
     /// <summary>
-    /// One logical call. Follows "not the leader" (nothing was applied) and moves on from a node that
-    /// refuses the connection (nothing was sent). Everything else is mapped and thrown. A write is never re-sent after it may have reached a node.
+    /// One logical call. Follows "not the leader" and waits out "no leader yet" (both refused before the log, so
+    /// nothing was applied), and moves on from a node that refuses the connection (nothing was sent). All of that
+    /// stays inside <see cref="RetcdClientOptions.Timeout"/>. Everything else is mapped and thrown. A write is never
+    /// re-sent after it may have reached a node.
     /// </summary>
-    private async Task<T> UnaryAsync<T>(
+    internal async Task<T> UnaryAsync<T>(
         string op, bool isWrite, long valueSize,
         Func<Pb.ConfigService.ConfigServiceClient, CallOptions, AsyncUnaryCall<T>> send,
         CancellationToken ct, bool followForeignPageToken = false)
@@ -303,6 +311,7 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
         var deadline = DateTime.UtcNow + _options.Timeout;
         string? lastNote = null;
         var hops = 0;
+        var slowToConnect = new HashSet<string>(); // nodes that missed the quick connect window in this call
         for (;;)
         {
             ct.ThrowIfCancellationRequested();
@@ -312,13 +321,18 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
                     $"{op}: no node could take the call within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no attempt made"}). Nothing was applied.");
             }
             var endpoint = _transport.Current;
-            var connectFailure = await _transport.ConnectAsync(endpoint, deadline, ct).ConfigureAwait(false);
+            // Quick window first, so a dead node costs QuickConnect and not the whole budget. Once every known
+            // node has missed it, allow the longer window: they may all just be slow (a remote or loaded host).
+            var quick = !_transport.Endpoints.All(slowToConnect.Contains);
+            var connectFailure = await _transport.ConnectAsync(endpoint, deadline, quick ? QuickConnect : SlowConnect, ct)
+                .ConfigureAwait(false);
             if (connectFailure is not null)
             {
                 lastNote = $"cannot connect to {endpoint} ({connectFailure.GetType().Name})";
+                slowToConnect.Add(endpoint);
                 _transport.Drop(endpoint);
                 _transport.Rotate();
-                await Pause(100, ct).ConfigureAwait(false);
+                await Pause(quick ? 0 : 100, ct).ConfigureAwait(false);
                 continue;
             }
             try
@@ -329,7 +343,8 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
             catch (RpcException ex)
             {
                 if (ct.IsCancellationRequested) throw new OperationCanceledException(ct);
-                if (RetcdErrors.IsNotLeader(ex) || (followForeignPageToken && RetcdErrors.IsForeignPageToken(ex)))
+                if (RetcdErrors.IsNotLeader(ex) || RetcdErrors.IsNoLeaderYet(ex)
+                    || (followForeignPageToken && RetcdErrors.IsForeignPageToken(ex)))
                 {
                     var hint = RetcdErrors.LeaderHint(ex);
                     lastNote = hint is null ? "no leader known yet" : $"not the leader; leader is {hint}";

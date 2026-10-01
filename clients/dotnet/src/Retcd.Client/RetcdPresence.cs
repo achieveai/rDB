@@ -111,7 +111,11 @@ public static class RetcdPresence
 
     private static string NameOf(string key) => key.StartsWith(KeyPrefix, StringComparison.Ordinal) ? key[KeyPrefix.Length..] : key;
 
-    /// <summary>The silence rules. Public logic lives here so a test can drive it with a fake clock.</summary>
+    /// <summary>
+    /// The silence rules: Up, Late after 1.5 intervals, Down after <c>missedBeats</c> intervals or a goodbye.
+    /// No I/O: <see cref="WatchAsync"/> feeds it beats and goodbyes and calls <see cref="Sweep"/> on a timer.
+    /// Internal, with injectable clocks, so a unit test can drive it with a fake clock.
+    /// </summary>
     internal sealed class Monitor
     {
         private sealed class Entry
