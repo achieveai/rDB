@@ -118,6 +118,15 @@ async fn m4_shutdown_with_open_watch_exits_promptly() {
         "graceful shutdown must exit 0; stderr:\n{}",
         process.stderr()
     );
+    // The client plane's drain is bounded (`run.rs`, `CLIENT_DRAIN_SLACK`), and at the gate's
+    // deadline scale that bound is shorter than `bound`, so a prompt exit alone no longer proves
+    // the hub ended the stream before the drain. This reader keeps reading, so its stream must
+    // drain with the plane, not be abandoned at the bound.
+    assert_eq!(
+        support::count_messages(&process.log_file(), "client_plane_drain_abandoned"),
+        0,
+        "a Watch whose client is reading must drain with the plane, not hold it to its bound"
+    );
 
     let ended = tokio::time::timeout(deadline(1), reader)
         .await

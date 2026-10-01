@@ -34,7 +34,11 @@ open questions OQ-15..OQ-19 asked for these rulings.
    Watch streams end first because nothing else ends them: a drain that waited on them would
    wait until each client gave up. Observed 2026-09-30 with no upper bound: the stopping
    leader kept leadership and the cluster took no writes until the watch client left.
-   `m4_shutdown_watch` guards it.
+   `m4_shutdown_watch` guards it. The gRPC drain is bounded: the client plane gets the larger
+   of the read and write timeouts plus 2 s (12 s by default). A stream still open then, such as
+   a watch whose client has stopped reading, is dropped with a `WARN`
+   `msg="client_plane_drain_abandoned"`, and the stop goes on. `m4_shutdown_watch_backpressure`
+   guards the bound.
 5. **Exit codes and the refusal line.** `0` clean shutdown; `2` a refusal (configuration,
    identity, TLS gate, manifest, formation); `3` a fatal storage failure — the store could not
    be opened or replayed.
@@ -180,3 +184,26 @@ What the daemon does defend is everything it can check locally:
 A forged manifest therefore cannot enlist a node into a cluster it has no certificate for, and
 cannot redirect a node's traffic to an endpoint it does not own. M3-74 asserts this set, not a
 voter-list cross-check.
+
+### Note (2026-10-01): `/health` names the client address
+
+The health payload carries one more top-level key, `client`: the node's bound client-plane
+address, the same string the ready line prints under the same name (`"client":"127.0.0.1:C"`).
+Before it, the only place a running node said where it serves gRPC was one stdout line at
+startup, so a poller holding only health ports could not hand a client the address of the node
+it was looking at.
+
+- **Additive.** Every existing field keeps its name, place and meaning. The daemon adds the key
+  beside the engine's `HealthPayload` (flattened, so nothing moves under a wrapper); the engine
+  type is unchanged.
+- **Bound, not advertised.** It is the address this process actually bound, which the endpoint
+  match above already requires to equal the manifest's client endpoint for this node.
+- `health_reports_the_bound_client_address` asserts it equals the ready line's `client`.
+
+### Note (2026-10-01): `/health` is read live
+
+`role` and the leader come from OpenRaft's metrics at the moment of the request; nothing is
+cached. After a leader goes away, a follower keeps naming it until its own election timeout
+fires and an election completes, so a poller sees the new leader about one election after the
+old leader is gone. An earlier playground figure said `/health` lagged the election by 3-5 s;
+that run timed from the stop *request*, so it included the graceful stop itself.

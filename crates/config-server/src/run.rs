@@ -65,6 +65,16 @@ use crate::{health, manifest};
 /// and far above any cost worth measuring.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
+/// Added to the engine's longest per-request bound to give the client plane's drain its own.
+///
+/// Ending the watch hub ends every Watch on the server side, but a stream's last frames and
+/// its trailers still have to cross HTTP/2 flow control, and a client that has stopped reading
+/// never reopens its window. The drain would wait on that stream for as long as the client
+/// stays connected. No unary call can outlive `write_timeout`/`read_timeout` on the server, so
+/// anything still open past that bound plus this slack is a stream to a client that is not
+/// reading, and the stop goes on without it.
+const CLIENT_DRAIN_SLACK: Duration = Duration::from_secs(2);
+
 /// What the process exits with (ADR-0018 §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -621,6 +631,8 @@ struct Running {
     /// plane that must not have its credentials replaced underneath it.
     tls_shutdown: Option<Arc<tokio::sync::Notify>>,
     tls_task: Option<tokio::task::JoinHandle<()>>,
+    /// How long the client plane may take to drain (see [`CLIENT_DRAIN_SLACK`]).
+    client_drain_bound: Duration,
 }
 
 /// Start, serve, and shut down. Returns the process exit code.
@@ -732,6 +744,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     // Read out before `node_cfg` is moved into the node: both planes and the peer transport
     // size their codecs from the same caps this node enforces (ADR-0010 fix-round note).
     let limits = node_cfg.limits;
+    let client_drain_bound = node_cfg.write_timeout.max(node_cfg.read_timeout) + CLIENT_DRAIN_SLACK;
 
     let transport = GrpcPeerTransport::new(tls.clone(), config_engine::NetFault::new(), limits);
     // The same transport, kept concretely. The node only ever wants a `dyn PeerTransport`, but
@@ -778,6 +791,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         policy_task: None,
         tls_shutdown: None,
         tls_task: None,
+        client_drain_bound,
     };
 
     if let Some(verified) = verified {
@@ -887,6 +901,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
                 pagination: Some(Arc::clone(&paginator)),
                 policy: policy.loader.clone(),
                 tls: tls_rotator.clone(),
+                client: client_endpoint.clone(),
             },
             Arc::clone(&notify),
             cfg.metrics_enabled,
@@ -1396,6 +1411,7 @@ async fn shutdown(running: Running) {
         policy_task,
         tls_shutdown,
         tls_task,
+        client_drain_bound,
     } = running;
 
     // The poller first: it takes the journal gate, and a reload landing mid-drain would revoke
@@ -1430,9 +1446,22 @@ async fn shutdown(running: Running) {
     node.watch_hub().shutdown();
     // A plane that was never served has nothing to drain — the refusal happened between
     // binding and serving, and the listener is dropped with its handle.
+    //
+    // The drain is bounded: a Watch client that stopped reading holds its stream's last frames
+    // behind HTTP/2 flow control, and nothing on this side can end that stream (M4-85). On
+    // expiry the plane's task is left to the runtime's own shutdown, which drops it with its
+    // connections.
     if let Some(client_server) = client_server {
-        if let Err(e) = client_server.shutdown().await {
-            tracing::warn!(plane = "client", error = %e, "plane did not drain cleanly");
+        match tokio::time::timeout(client_drain_bound, client_server.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(plane = "client", error = %e, "plane did not drain cleanly");
+            }
+            Err(_) => tracing::warn!(
+                plane = "client",
+                bound_ms = u64::try_from(client_drain_bound.as_millis()).unwrap_or(u64::MAX),
+                "client_plane_drain_abandoned"
+            ),
         }
     }
     if let Some(peer_server) = peer_server {

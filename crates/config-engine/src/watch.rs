@@ -743,8 +743,12 @@ impl WatchHub {
     }
 
     /// Record that the node stopped; every open stream terminates with `Unavailable`.
+    ///
+    /// `send_replace`, never `send`: `send` drops the value when no receiver is subscribed,
+    /// which is every hub with no stream open, and the next `open` would then read `Serving`
+    /// and admit a stream that nothing will ever end.
     pub fn shutdown(&self) {
-        let _ = self.state_tx.send(HubState::Stopped);
+        self.state_tx.send_replace(HubState::Stopped);
     }
 
     /// Declare whether this node currently holds a usable authorization policy.
@@ -1030,6 +1034,19 @@ impl WatchHub {
                 return Err(err);
             }
         };
+        // Subscribe, then look again. The check above ran before admission and the gate hop,
+        // and a stop or a leadership loss can land in between; a receiver subscribed after it
+        // has already seen that value, so the stream's live loop would never wake for it and
+        // the stream would stay open — on a stopping node, holding the client plane's drain.
+        // Anything sent after this subscribe is a change the stream will see.
+        let state = self.state_tx.subscribe();
+        if let Some(err) = self.hub_error() {
+            self.counters.terminate(match err {
+                ConfigError::NotLeader { .. } => TerminationReason::NotLeader,
+                _ => TerminationReason::Unavailable,
+            });
+            return Err(err);
+        }
 
         let id = StreamId(self.next_stream_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel(self.limits.queue_events.max(1) as usize);
@@ -1068,7 +1085,7 @@ impl WatchHub {
             start_after,
             tx,
             receiver: registration.receiver,
-            state: self.state_tx.subscribe(),
+            state,
             policy: registration.policy,
             policy_epoch: registration.policy_epoch,
             progress_interval,
