@@ -1423,6 +1423,11 @@ async fn shutdown(running: Running) {
         task.abort();
         let _ = task.await;
     }
+    // End every open Watch before draining the client plane. A Watch stream ends only when the
+    // hub says so, and `Node::stop` (which also does this) runs after the drain — so the drain
+    // would wait on streams that cannot end until it has finished. `Unavailable`, not
+    // `NotLeader`: the node is going away (M4-85).
+    node.watch_hub().shutdown();
     // A plane that was never served has nothing to drain — the refusal happened between
     // binding and serving, and the listener is dropped with its handle.
     if let Some(client_server) = client_server {

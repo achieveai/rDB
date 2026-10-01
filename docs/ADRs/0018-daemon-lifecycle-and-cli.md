@@ -29,8 +29,12 @@ open questions OQ-15..OQ-19 asked for these rulings.
    `{"ready":true,"node_id":1,"peer":"127.0.0.1:P","client":"127.0.0.1:C","gossip":"127.0.0.1:G","health":"127.0.0.1:H"}`.
    Nothing else is written to stdout. Logs go to JSONL files.
 4. **Shutdown triggers.** `tokio::signal::ctrl_c` and the shutdown file (polled every 100 ms).
-   Graceful order: stop accepting, drain gRPC, stop the node, shut gossip down, close the
-   store, log `msg="shutdown_complete"`, exit 0.
+   Graceful order: stop accepting, end every open Watch stream with `Unavailable`, drain gRPC,
+   stop the node, shut gossip down, close the store, log `msg="shutdown_complete"`, exit 0.
+   Watch streams end first because nothing else ends them: a drain that waited on them would
+   wait until each client gave up. Observed 2026-09-30 with no upper bound: the stopping
+   leader kept leadership and the cluster took no writes until the watch client left.
+   `m4_shutdown_watch` guards it.
 5. **Exit codes and the refusal line.** `0` clean shutdown; `2` a refusal (configuration,
    identity, TLS gate, manifest, formation); `3` a fatal storage failure — the store could not
    be opened or replayed.

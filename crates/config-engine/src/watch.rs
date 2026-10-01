@@ -710,9 +710,14 @@ impl WatchHub {
     }
 
     /// Record that this node is the leader and may serve watches.
+    ///
+    /// A stopped hub stays stopped. The daemon ends the hub before draining its client plane,
+    /// while the node is still running, so the metrics watcher and a watch open's barrier can
+    /// still call this; a stream woken by the stop reads only the latest value, and reviving
+    /// `Serving` would keep it open and stall the drain.
     pub fn note_leader(&self) {
         self.state_tx.send_if_modified(|state| {
-            if *state == HubState::Serving {
+            if matches!(state, HubState::Serving | HubState::Stopped) {
                 false
             } else {
                 *state = HubState::Serving;
@@ -1796,4 +1801,29 @@ pub fn retention_target(
     let (target, reason) = chosen?;
     let target = target.min(view.newest_revision);
     (target > compact_revision).then_some((target, reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stop is final. Between `shutdown()` and the node actually stopping, the metrics
+    /// watcher and a watch open's linearizable barrier both still call `note_leader`; if that
+    /// flipped the hub back to `Serving`, a stream woken by the stop would read the latest value,
+    /// see `Serving`, and stay open — and the daemon's client-plane drain would wait on it.
+    #[test]
+    fn note_leader_does_not_revive_a_stopped_hub() {
+        let hub = WatchHub::with_defaults(WatchLimits::default());
+        // What an open stream's `check_state` reads.
+        let mut stream_state = hub.state_tx.subscribe();
+        hub.note_leader();
+        hub.shutdown();
+        hub.note_leader();
+
+        assert_eq!(*stream_state.borrow_and_update(), HubState::Stopped);
+        match hub.hub_error() {
+            Some(ConfigError::Unavailable { reason }) => assert_eq!(reason, "stopped"),
+            other => panic!("a stopped hub must refuse with Unavailable(stopped), got {other:?}"),
+        }
+    }
 }
