@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Retcd.Client</RootNamespace>
+    <AssemblyName>Retcd.Client</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+
+    <PackageId>Retcd.Client</PackageId>
+    <Version>0.1.0</Version>
+    <Description>C# client for rEtcd, the 3-node config store: get, put, CAS, delete, list with globs, watch that resumes, files, and presence heartbeats.</Description>
+    <PackageTags>retcd;config;grpc;watch</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.Net.Client" Version="2.66.0" />
+    <PackageReference Include="Google.Protobuf" Version="3.28.2" />
+    <PackageReference Include="Grpc.Tools" Version="2.66.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Client stubs only, kept internal so the proto types are not part of the public API. -->
+    <Protobuf Include="../../../../proto/retcd/v1/config.proto"
+              ProtoRoot="../../../../proto"
+              GrpcServices="Client"
+              Access="Internal" />
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+    <InternalsVisibleTo Include="Retcd.Client.Tests" />
+  </ItemGroup>
+
+</Project>
