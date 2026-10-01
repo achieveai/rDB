@@ -71,7 +71,11 @@ if (-not $env:RETCD_TEST_DEADLINE_SCALE) { $env:RETCD_TEST_DEADLINE_SCALE = '3' 
 # each into a test_run_id subdirectory under this root.
 if (-not $env:RETCD_TEST_LOG_DIR) {
     $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
-    $env:RETCD_TEST_LOG_DIR = Join-Path $PWD "$($env:CARGO_TARGET_DIR)/test-logs/$stamp-$PID"
+    # An absolute target dir is used as-is: Join-Path would prefix $PWD onto `C:/...` and put
+    # the logs inside the repo. A rooted `/c/...` is kept as given, so the logs land where cargo
+    # puts the target dir.
+    $targetRoot = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR } else { Join-Path $PWD $env:CARGO_TARGET_DIR }
+    $env:RETCD_TEST_LOG_DIR = "$targetRoot/test-logs/$stamp-$PID"
 }
 
 Write-Host "gate: target=$($env:CARGO_TARGET_DIR) scale=$($env:RETCD_TEST_DEADLINE_SCALE) logs=$($env:RETCD_TEST_LOG_DIR)"

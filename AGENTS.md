@@ -161,6 +161,9 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
 - Read cargo's exit code, not the pipeline's. `gate.sh test ... | grep | tail` reports `tail`'s
   status, and on 2026-09-21 a run that ended `error: 8 targets failed` showed exit 0 that way.
   Send full output to a file and read the file.
+- An absolute `CARGO_TARGET_DIR` (`/c/...` or `C:/...`) is used as-is for the default log root.
+  Before 2026-10-01 both scripts prefixed `$PWD`, so `C:/rdb_test_data/...` logged into
+  `<repo>/C:/rdb_test_data/...`. The `gate:` line prints the resolved `logs=`; read it.
 - The `drift` stage checks the M7 test plans, not the code. Each plan's section 15 says which
   contract commit it was written against, in a marker line `<!-- drift-basis: <sha> -->`, and
   the stage fails when that commit is no longer the newest one to touch

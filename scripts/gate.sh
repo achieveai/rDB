@@ -37,7 +37,13 @@ export RETCD_TEST_DEADLINE_SCALE="${RETCD_TEST_DEADLINE_SCALE:-3}"
 # One log root per invocation, inside the private target dir, so one gate run's logs never mix
 # with another's. Separating the binaries *within* a run is already config-log's job: it writes
 # each into a test_run_id subdirectory under this root.
-export RETCD_TEST_LOG_DIR="${RETCD_TEST_LOG_DIR:-$PWD/$CARGO_TARGET_DIR/test-logs/$(date +%Y%m%d-%H%M%S)-$$}"
+# An absolute target dir (`/c/...` or `C:/...`) is used as-is. Prefixing $PWD onto it made
+# `<repo>/C:/rdb_test_data/...`, so the test stage wrote its logs inside the repo.
+case "$CARGO_TARGET_DIR" in
+  /* | [A-Za-z]:[/\\]*) target_abs="$CARGO_TARGET_DIR" ;;
+  *) target_abs="$PWD/$CARGO_TARGET_DIR" ;;
+esac
+export RETCD_TEST_LOG_DIR="${RETCD_TEST_LOG_DIR:-$target_abs/test-logs/$(date +%Y%m%d-%H%M%S)-$$}"
 
 stage="${1:-all}"
 [ $# -gt 0 ] && shift || true
@@ -97,7 +103,10 @@ case "$stage" in
   purity) run_purity ;;
   lint)  run_lint ;;
   test)  run_test "$@" ;;
-  all)   run_fmt && run_deps && run_drift && run_purity && run_lint && run_test ;;
+  # One stage per line, never an `&&` chain: bash ignores `set -e` inside one, so a failed
+  # stage ended the chain and the script still printed "all OK" and exited 0, with no
+  # clippy and no tests run. Observed 2026-10-01 with a drift failure.
+  all)   run_fmt; run_deps; run_drift; run_purity; run_lint; run_test ;;
   *)     echo "unknown stage: $stage (expected fmt, deps, drift, purity, lint, test or all)" >&2; exit 1 ;;
 esac
 
