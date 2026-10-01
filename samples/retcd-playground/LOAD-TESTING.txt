@@ -1,0 +1,138 @@
+rEtcd LOAD TESTING
+Measured 2026-09-30. Git Bash, repo root unless said. Every number is the median of 3 runs.
+
+SETUP (once)
+  CARGO_TARGET_DIR=/c/rdb_test_data/targets/load-rel cargo build --release -p config-server
+  mkdir -p /c/rdb_test_data/targets/load-bin/debug
+  cp /c/rdb_test_data/targets/load-rel/release/config-server.exe /c/rdb_test_data/targets/load-bin/debug/
+  export CARGO_TARGET_DIR=/c/rdb_test_data/targets/load-bin    # the scripts look for debug/config-server
+  export RUST_LOG=warn          # see Caveats: default logging writes ~2 GB per node per 2 minutes
+  ./scripts/local-cluster.sh up --dir /c/rdb_test_data/load-cluster --base-port 17400
+  cd samples/retcd-playground
+TEARDOWN (always)
+  cd ../..; ./scripts/local-cluster.sh clean --dir /c/rdb_test_data/load-cluster
+Every load run re-reads every acked write at the end. LOST must be 0. Exit code 3 = a loss.
+
+1. WRITE SPEED
+  Why: how fast can clients put, and what do they wait.
+  Run: node load.mjs write --clients 16 --duration 15 --quiet
+  Good: errors 0, LOST 0, p99 under 50 ms.
+  Here: 2331 ops/s, p50 6.3, p99 14.5, max 116 ms (default logging). 2866 ops/s with RUST_LOG=warn.
+
+2. READ SPEED
+  Run: node load.mjs read --clients 32 --duration 15 --quiet
+  Good: errors 0, p99 under 20 ms.
+  Here: 12582 ops/s, p50 2.3, p99 8.0 ms. 12802 with warn. Reads are served by the leader only.
+
+3. MIXED 90% READ / 10% WRITE
+  Run: node load.mjs mixed --clients 32 --duration 15 --read-pct 90 --quiet
+  Here: 9502 ops/s, p50 2.7, p99 12.2 ms, LOST 0. 11273 with warn.
+
+4. BIG VALUES
+  Run: node load.mjs big --clients 4 --duration 15 --size 262144 --quiet
+       node load.mjs big --clients 4 --duration 15 --size 1048576 --quiet
+  Good: errors 0. Max value is 1 MiB; 1048576 exactly is accepted.
+  Here: 256 KiB: 158 puts/s = 41 MB/s, p50 21.5, p99 49 ms.
+        1 MiB:   29 puts/s = 30 MB/s, p50 136, p99 321 ms.
+
+5. RAMP / KNEE (add clients until it stops scaling)
+  Run: node load.mjs ramp --workload write --max-clients 64 --step 8
+       node load.mjs ramp --workload read  --max-clients 128 --procs 12 --step 8
+       node load.mjs ramp --workload mixed --max-clients 128 --procs 12 --step 8
+  It doubles clients 1,2,4,8... Stops on errors over 1% or p99 over 250 ms (--p99-ms).
+  Good: the knee line says where more clients stop helping.
+  Here: write  peaks ~2500-2700/s; knee 32 clients (p99 85 ms there, 112 at 64).
+        read   scales to 32 clients (17.1k/s), flat after: 64 = 18.0k, 128 = 16.6k.
+        mixed  (90% read) knee 64 clients (9.8k/s); 128 clients = 10.3k/s, p99 83 ms.
+  The cluster is not the only limit: the load tool runs on the same box (see Caveats).
+
+6. WATCH FAN-OUT (does every watcher see every write, in order?)
+  Run: node fanout.mjs --watchers 20 --writers 2 --rate 200 --duration 10
+       node fanout.mjs --watchers 100 --writers 2 --rate 200 --duration 10
+  Good: "missing 0 duplicates 0 out-of-order 0". Lag is write-sent to event-received.
+  Here: 20 watchers:  lag p50 4.8, p99 14 ms.  ~2000 writes, 0 missing/dups/out-of-order.
+        100 watchers: lag p50 5.5, p99 36.5 ms. 196400 events delivered, 0 missing.
+
+7. WATCH CAP
+  Run: node fanout.mjs --watchers 120 --writers 1 --rate 20 --duration 8 --readmit
+  Here (3 of 3 runs the same): the first 100 streams open and stay healthy, 0 events lost.
+  Streams 101-120 are refused in ~150-200 ms with RESOURCE_EXHAUSTED
+  "principal already holds 100 watch streams (max_streams_per_principal)", resumable=false.
+  Nothing is dropped from the 100. Closing 5 frees 5: 5 new streams admitted, 0 refused.
+  Dev mode has one principal, so 100 per principal is the real cap here (node cap is 1000).
+
+8. PRESENCE (who is alive; no leases, just heartbeat keys presence/<name>)
+  Why: detect dead or disconnected clients using only rEtcd.
+  How: a client writes presence/<name> every 2 s. The monitor watches presence/ and says
+  UP, LATE (1.5 intervals), DOWN (3 missed beats, ~7 s), BACK. Details: node presence.mjs
+  Run: ./presence-test.sh kill       kill -9 a client (hard crash)
+       ./presence-test.sh freeze     freeze a client process (hung, not dead)
+       ./presence-test.sh swarm      20 clients, stop 3 of them
+       ./presence-test.sh nodedown   20 clients, kill -9 the leader node: no false alarms?
+  Good: RESULT lines. DOWN about 7 s after the last beat. No DOWN for a client that lives.
+  Here: kill:   DOWN 7.1 / 6.8 / 7.4 s after the kill. No false alarm.
+        freeze: DOWN 7.2 / 8.6 / 16.2 s. The 16.2 s run is unexplained (other agents were
+                building on this host then); not reproduced in the other two.
+        swarm:  stopped clients DOWN in 6.5, 6.7, 7.1 s. 0 false alarms.
+        nodedown (3 runs): 0 DOWN, 0 LATE. The monitor reconnects and the clients retry.
+  Not tested: Ctrl-C of a client (it deletes its key, so it says LEFT at once). Windows
+  non-interactive shells cannot send Ctrl-C, so that path is unverified.
+
+9. FAILOVER UNDER LOAD
+  Run: ./failover.sh stop     graceful stop of the leader at t=10 s, back after 12 s
+       ./failover.sh kill     kill -9 the leader
+  Good: load exit code 0, "LOST 0", "longest silence" about 4 s, few errors.
+  Here (3 runs each): longest silence (no op succeeded):
+        stop: 3.71 / 3.70 / 3.35 s, 0 errors.  kill: 3.97 / 3.69 / 3.90 s, 11-15 UNAVAILABLE.
+        Acked writes lost: 0 in all 6 runs (500 keys re-read each time).
+  The "/health shows new leader" line lags the real election by 3-5 s. Use "longest silence".
+
+10. THE WATCH-STALL BUG
+  Why: an open watch stops its node from shutting down.
+  Run: ./stall-bug.sh        (about 1.5 minutes, restarts the node afterwards)
+  Bug: stop the leader while one watch is open on it. The node does not exit, keeps
+  leadership, and writes through it time out. Closing the watch makes it exit at once.
+  Here: node still running and leader 67 s, 79 s (and 171+ s by hand) after the stop (script limit
+  is 60 s; no end seen); write timed out after 10 s; exited <1 s after the watch
+  closed. Reproduced on 2026-09-30 with the same release build as the numbers above.
+  FIXED (2026-09-30, working tree, not yet committed): the daemon now ends open watches
+  before draining. Leader with 2 watches open exits in 0.43-0.58 s; a new leader follows.
+  Rebuild the server, then this script should show the node gone within a second.
+  Regression test: scripts/gate.sh test -p config-server --test m4_shutdown_watch
+
+CAVEATS
+  - One host runs the 3 nodes AND the load clients (Ryzen 9 5950X, 32 threads). Numbers are a
+    floor. Client processes use 1-6 cores. Other agents ran clusters/builds at the same time;
+    a re-run on a quiet host agreed within 6% (write 2197, read 12296, mixed 9567).
+  - Reads and watches go to the leader only. Adding nodes does not add read speed.
+  - There are no leases and no heartbeat key type. Presence is a convention (plain keys),
+    so a dead client's key stays until the monitor decides DOWN; nothing expires it.
+  - Values are at most 1 MiB, keys 1 KiB. Plaintext dev cluster, no auth.
+  - Logging costs speed and disk. Default INFO writes ~3 lines per request (2.1 GB on node 1
+    after 3 x 3 runs of 15 s). RUST_LOG=warn: write +30%, mixed +18%, read +4%, logs ~16 KB.
+    RUST_LOG must be set before local-cluster.sh up.
+  - Ramp numbers wobble 10-30% run to run (see the 3 runs in the evidence).
+  - Evidence (transcripts + JSON): C:/rdb_test_data/targets/load/retcd/final/
+
+rDB (SIMULATOR ONLY)
+  rDB has no server, disk engine or client API yet. These are SIMULATOR numbers, not
+  database load. Not comparable to the rEtcd numbers above. Release build, basis 2357d4a,
+  median of 3 (demo: 5). Wall ms, compile excluded.
+
+11. rDB DEMO (one 3-node failover scenario)
+  Why: raw simulator speed on a real scenario.
+  Run: cargo run --release -p rdb-sim --example demo -- out.json
+       node samples/rdb-demo/view.mjs out.json out.html      (timeline to open in a browser)
+  Here: 7,761 trace events in ~97 ms = ~80,000 events/s (includes start-up and a 1.4 MB
+        JSON write, so a floor). Same 7,761 every run: it is deterministic.
+
+12. rDB RELEASE CAMPAIGN (the M7 release gate's own corpus)
+  Why: 1,000 generated seeds + 4 authored cases, the gate's real command.
+  Run: SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign \
+         scripts/gate.sh test --release -p rdb-sim --test campaign
+       (writes docs/evidence/*.json: run it in an export, not the live tree)
+  Here: 171 ms campaign wall, exit 0. But only 3 histories ran; 1,001 could not be
+        lowered into runs yet (M7V-55 owed). 1 invariant proven, 9 unavailable.
+        So "1,000 histories in 60 s" is NOT measured yet. Debug build is ~5x slower.
+  Scale knob: SPIKE_SEEDS=4096 took 175 ms. Flat, because extra seeds are refused
+        (~15 us each), not run. That is refusal speed, not execution load.
