@@ -23,7 +23,7 @@ export interface ConnectOptions {
   timeoutMs?: number;
   /** How long one call may hunt for a leader or a live node. Default 20000. */
   failoverMs?: number;
-  /** Path to proto/retcd/v1/config.proto. Default: the repo's proto/ (or env RETCD_PROTO). */
+  /** Path to proto/retcd/v1/config.proto. Default: env RETCD_PROTO, else the copy in the package, else the repo's proto/. */
   protoPath?: string;
   /** Health host:port per endpoint. Default: client port + 2. */
   healthEndpoints?: string[];
@@ -54,7 +54,8 @@ export class RetcdClient {
   get(key: string | Buffer): Promise<RetcdRecord | null>;
   /** ifRevision: only if the key is still at that modRevision (0 = only if it does not exist). */
   put(key: string | Buffer, value: string | Uint8Array, opts?: { ifRevision?: number | string | bigint }): Promise<{ revision: number }>;
-  delete(key: string | Buffer, opts?: { ifRevision?: number | string | bigint }): Promise<{ revision: number }>;
+  /** true if it was deleted, false if it did not exist. CasConflictError if ifRevision is stale. */
+  delete(key: string | Buffer, opts?: { ifRevision?: number | string | bigint }): Promise<boolean>;
   list(pattern?: string, opts?: { pageSize?: number }): AsyncGenerator<RetcdRecord, void, undefined> & { readonly readRevision: number | undefined };
   listDirs(pattern?: string, opts?: { pageSize?: number }): Promise<Array<RetcdRecord | DirEntry>>;
   watch(

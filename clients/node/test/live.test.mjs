@@ -10,6 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { CasConflictError, NotFoundError, RetcdClient, TooLargeError, UnknownOutcomeError, startHeartbeat, watchPresence } from '../src/index.mjs';
+import { classify } from '../src/errors.mjs';
 import { killNode, nodeForEndpoint, startNode, waitFor } from '../test-support/node-ctl.mjs';
 
 const ENDPOINTS = (process.env.RETCD_ENDPOINTS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
@@ -24,7 +25,8 @@ const collect = async (it) => {
   return out;
 };
 
-describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is not set' }, () => {
+// The whole suite may run longer than npm test's 30 s per-test limit; each test inside keeps that limit.
+describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is not set', timeout: 600_000 }, () => {
   /** @type {RetcdClient} */
   let c;
   const written = new Set();
@@ -72,9 +74,9 @@ describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is 
     await assert.rejects(put(key, '3', { ifRevision: first.revision }), (e) => e instanceof CasConflictError && e.currentRevision === second.revision);
     assert.equal((await c.get(key)).value.toString(), '2', 'a refused write changed nothing');
     await assert.rejects(c.delete(key, { ifRevision: first.revision }), CasConflictError);
-    await c.delete(key, { ifRevision: second.revision });
+    assert.equal(await c.delete(key, { ifRevision: second.revision }), true);
     assert.equal(await c.get(key), null);
-    await assert.rejects(c.delete(key), NotFoundError);
+    assert.equal(await c.delete(key), false, 'a missing key resolves false, matching C# DeleteAsync');
     await assert.rejects(put(key, 'x', { ifRevision: 5 }), (e) => e instanceof CasConflictError && e.exists === false);
   });
 
@@ -87,17 +89,27 @@ describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is 
     assert.equal((await c.get(`${P('big')}max`)).value.length, 1024 * 1024);
   });
 
-  test('a write that times out is UnknownOutcomeError and is sent exactly once', async () => {
+  test('a write that times out is UnknownOutcomeError and is never sent again', async () => {
     const impatient = new RetcdClient({ endpoints: ENDPOINTS, timeoutMs: 1 });
-    let sent = 0;
-    const real = impatient._once.bind(impatient);
-    impatient._once = (...args) => {
-      sent++;
-      return real(...args);
+    // Record real sends, not attempts: a connect that fails sent nothing. A follower may also
+    // answer first with not-leader, which wrote nothing either. So the rule is not "one send";
+    // it is "the timed-out send is the last one, and only refusals came before it".
+    const sends = [];
+    const real = impatient._send.bind(impatient);
+    impatient._send = async (...args) => {
+      try {
+        const res = await real(...args);
+        sends.push('ok');
+        return res;
+      } catch (err) {
+        sends.push(classify(err));
+        throw err;
+      }
     };
     written.add(`${P('unknown')}k`);
     await assert.rejects(impatient.put(`${P('unknown')}k`, 'v'), UnknownOutcomeError);
-    assert.equal(sent, 1);
+    assert.equal(sends.at(-1), 'transport', `the last send timed out (sends: ${sends})`);
+    assert.ok(sends.slice(0, -1).every((k) => k === 'not-leader'), `only refusals came before it (sends: ${sends})`);
     impatient.close();
   });
 
@@ -118,7 +130,8 @@ describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is 
     assert.deepEqual(await collect(c.list(`${base}nothing`)), []);
   });
 
-  test('list: more keys than the server cap of 1000 per page; and a page cut by the 8 MiB byte cap continues', async () => {
+  // 1030 keys plus ~9 MiB of values: 13 s on an idle host against a debug server, over 30 s when loaded.
+  test('list: more keys than the server cap of 1000 per page; and a page cut by the 8 MiB byte cap continues', { timeout: 120_000 }, async () => {
     const base = P('many');
     const keys = Array.from({ length: 1030 }, (_, i) => `${base}${String(i).padStart(5, '0')}`);
     for (let i = 0; i < keys.length; i += 40) await Promise.all(keys.slice(i, i + 40).map((k) => put(k, 'x')));
@@ -245,6 +258,53 @@ describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is 
     }
   });
 
+  test('a dead first endpoint costs well under a second, for a read and for a write', async () => {
+    // Nothing listens on the first endpoint. A write is safe to send elsewhere: the dead node never got it.
+    const srv = (await import('node:net')).createServer();
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const dead = `127.0.0.1:${srv.address().port}`;
+    await new Promise((r) => srv.close(r));
+    const endpoints = [dead, ...ENDPOINTS];
+    let t0 = performance.now();
+    const reader = await RetcdClient.connect({ endpoints });
+    try {
+      assert.equal(await reader.get(`${P('dead-first')}none`), null);
+      assert.ok(performance.now() - t0 < 1500, `first read took ${Math.round(performance.now() - t0)} ms`);
+    } finally {
+      reader.close();
+    }
+    const writer = new RetcdClient({ endpoints });
+    try {
+      t0 = performance.now();
+      await writer.put(`${P('dead-first')}k`, 'v');
+      written.add(`${P('dead-first')}k`);
+      assert.ok(performance.now() - t0 < 1500, `first write took ${Math.round(performance.now() - t0)} ms`);
+      assert.equal((await c.get(`${P('dead-first')}k`)).value.toString(), 'v');
+    } finally {
+      writer.close();
+    }
+  });
+
+  test('a watch with fromRevision as the first call skips an unreachable first endpoint in well under a second', async () => {
+    // 10.255.255.1 is not routed here, so a connect neither succeeds nor is refused: it just hangs.
+    // Without the quick connect window the watch waited for the transport's own connect timeout.
+    const key = `${P('watch-first')}k`;
+    const from = (await c.put(key, 'v')).revision - 1;
+    written.add(key);
+    const w = new RetcdClient({ endpoints: ['10.255.255.1:1', ...ENDPOINTS] });
+    try {
+      const t0 = performance.now();
+      for await (const ev of w.watch(P('watch-first'), { fromRevision: from })) {
+        assert.equal(ev.key, key);
+        break;
+      }
+      const took = performance.now() - t0;
+      assert.ok(took < 1500, `first event took ${Math.round(took)} ms`);
+    } finally {
+      w.close();
+    }
+  });
+
   test('health(): one entry per node, one leader; a dead address shows ok:false', async () => {
     const h = await c.health();
     assert.equal(h.length, ENDPOINTS.length);
@@ -261,7 +321,9 @@ describe('live cluster', { skip: ENDPOINTS.length ? false : 'RETCD_ENDPOINTS is 
     const name = `live-${RUN}`;
     const key = `presence/${name}`;
     written.add(key);
-    const intervalMs = 200;
+    // LATE fires after 1.5 intervals. At 200 ms, one put delayed by 100 ms on a loaded host broke
+    // "steady beats stay quiet"; 500 ms leaves 250 ms.
+    const intervalMs = 500;
     const mon = watchPresence(c, { intervalMs, missedBeats: 3 });
     const events = [];
     mon.on('change', (e) => e.name === name && events.push(e.state));

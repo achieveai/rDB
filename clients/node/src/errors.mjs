@@ -99,6 +99,13 @@ export function classify(err) {
 export const leaderHint = (err) => metaOf(err, 'retcd-leader-endpoint');
 
 /**
+ * A List cursor minted by another node. The refusal names a better node; resend the same page
+ * request there, with the same token. Any other cursor refusal (expired, evicted, ...) is final.
+ */
+export const isForeignPageToken = (err) =>
+  err?.code === grpc.status.FAILED_PRECONDITION && metaOf(err, 'retcd-reason') === 'node' && leaderHint(err) !== undefined;
+
+/**
  * Turn a gRPC error into a RetcdError.
  * @param {object} err   gRPC ServiceError ({code, details, metadata})
  * @param {{write?: boolean, endpoint?: string}} [ctx]

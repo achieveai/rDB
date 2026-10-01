@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import grpc from '@grpc/grpc-js';
-import { CasConflictError, NotFoundError, RetcdClient, TooLargeError, UnavailableError, UnknownOutcomeError } from '../src/index.mjs';
+import { CasConflictError, RetcdClient, TooLargeError, UnavailableError, UnknownOutcomeError } from '../src/index.mjs';
 
 const S = grpc.status;
 const A = '10.0.0.1:1';
@@ -25,6 +25,7 @@ const timeout = () => grpcErr(S.DEADLINE_EXCEEDED, 'Deadline exceeded');
 function fake(script, opts = {}) {
   const client = new RetcdClient({ endpoints: [A, B, C], failoverMs: 3000, ...opts });
   const attempts = [];
+  client._ready = async () => {}; // every node connects; watch() asks for this before it opens a stream
   client._once = async (addr, method, req) => {
     attempts.push(`${addr} ${method}`);
     return script(addr, method, req, attempts.length);
@@ -138,9 +139,57 @@ test('ifRevision goes out as expected_mod_revision; 0 is sent, not dropped', asy
   await assert.rejects(client.put('k', 'v', { ifRevision: -1 }), RangeError);
 });
 
-test('delete of a missing key throws NotFoundError', async () => {
-  const { client } = fake(() => ({ outcome: 'NOT_FOUND' }));
-  await assert.rejects(client.delete('k'), NotFoundError);
+// The connect step and the send step stubbed separately: `ready(addr, ms)` and `send(addr, method)`.
+function staged({ ready, send }, opts = {}) {
+  const client = new RetcdClient({ endpoints: [A, B, C], failoverMs: 3000, ...opts });
+  const log = [];
+  client._ready = async (addr, ms) => {
+    log.push(`connect ${addr} ${ms}`);
+    return ready(addr, ms);
+  };
+  client._send = async (addr, method) => {
+    log.push(`send ${addr} ${method}`);
+    return send(addr, method);
+  };
+  return { client, log };
+}
+const notConnected = (addr) => Object.assign(grpcErr(S.UNAVAILABLE, `No connection established to ${addr}: not connected within 400 ms`), { connectFailed: true });
+
+test('a dead first node costs one quick connect window, and a write goes to the next node unsent', async () => {
+  const { client, log } = staged({
+    ready: (addr) => {
+      if (addr === A) throw notConnected(addr);
+    },
+    send: () => ({ outcome: 'APPLIED', revision: '4' }),
+  });
+  assert.deepEqual(await client.put('k', 'v'), { revision: 4 });
+  assert.deepEqual(log, [`connect ${A} 400`, `connect ${B} 400`, `send ${B} Put`], 'nothing is sent to a node that never connected');
+  assert.equal(client.endpoint, B);
+});
+
+test('once every node misses the quick window, the call waits longer for each', async () => {
+  const { client, log } = staged({
+    ready: (addr, ms) => {
+      if (ms < 3000) throw notConnected(addr);
+    },
+    send: () => ({ record: null, read_revision: '1' }),
+  });
+  assert.equal(await client.get('k'), null);
+  assert.deepEqual(log, [`connect ${A} 400`, `connect ${B} 400`, `connect ${C} 400`, `connect ${A} 3000`, `send ${A} Get`]);
+});
+
+test('a write that was sent and then timed out is not resent, even after a quick connect', async () => {
+  const { client, log } = staged({ ready: () => {}, send: () => Promise.reject(timeout()) });
+  await assert.rejects(client.put('k', 'v'), UnknownOutcomeError);
+  assert.deepEqual(log, [`connect ${A} 400`, `send ${A} Put`]);
+});
+
+test('delete resolves true when it deleted the key and false when the key was missing', async () => {
+  const gone = fake(() => ({ outcome: 'APPLIED', revision: '7' }));
+  assert.equal(await gone.client.delete('k'), true);
+  const missing = fake(() => ({ outcome: 'NOT_FOUND' }));
+  assert.equal(await missing.client.delete('k'), false);
+  assert.equal(missing.attempts.length, 1, 'a missing key is an answer, not a retry');
 });
 
 test('limits are checked before anything is sent', async () => {
@@ -174,6 +223,46 @@ test('list walks every page with the cursor, filters globs, and exposes readRevi
   assert.equal(reqs[0].max_items, 2);
   assert.equal(reqs[0].page_token.length, 0, 'first call starts a pinned walk with an empty token');
   assert.equal(reqs[1].page_token.toString(), 'T1');
+});
+
+const cursorRefused = (reason, hint) =>
+  grpcErr(S.FAILED_PRECONDITION, `page token refused: ${reason}`, { 'retcd-outcome': 'rejected', 'retcd-reason': reason, ...(hint ? { 'retcd-leader-endpoint': hint } : {}) });
+
+test('list: a cursor refused as minted by another node is resent, same token, to the node the refusal names', async () => {
+  const sent = [];
+  const { client, attempts } = fake((addr, m, req) => {
+    sent.push(`${addr} ${req.page_token.toString() || '(start)'}`);
+    if (req.page_token.length === 0) return { records: [rec('p/a', '1')], read_revision: '9', truncated: false, next_page_token: Buffer.from('T1') };
+    if (addr === A) throw cursorRefused('node', B);
+    return { records: [rec('p/b', '2')], read_revision: '9', truncated: false, next_page_token: Buffer.alloc(0) };
+  });
+  const keys = [];
+  for await (const r of client.list('p/')) keys.push(r.key);
+  assert.deepEqual(keys, ['p/a', 'p/b'], 'the walk finishes, nothing repeated or lost');
+  assert.deepEqual(sent, [`${A} (start)`, `${A} T1`, `${B} T1`], 'page 2 goes to B with the same cursor');
+  assert.equal(attempts.length, 3);
+  assert.equal(client.endpoint, B);
+});
+
+test('list: any other cursor refusal is final, hint or not, and so is "node" with no hint', async () => {
+  for (const [reason, hint] of [['expired', B], ['evicted', B], ['node', undefined]]) {
+    const { client, attempts } = fake((addr, m, req) => {
+      if (req.page_token.length === 0) return { records: [rec('p/a', '1')], read_revision: '9', truncated: false, next_page_token: Buffer.from('T1') };
+      throw cursorRefused(reason, hint);
+    });
+    await assert.rejects(async () => {
+      for await (const r of client.list('p/')) void r;
+    }, { code: 'PAGE_TOKEN', reason }, `${reason} with hint ${hint}`);
+    assert.equal(attempts.length, 2, `${reason}: not resent`);
+  }
+});
+
+test('a "node" cursor refusal outside List is not followed', async () => {
+  const { client, attempts } = fake(() => {
+    throw cursorRefused('node', B);
+  });
+  await assert.rejects(client.get('k'), { code: 'PAGE_TOKEN' });
+  assert.equal(attempts.length, 1);
 });
 
 test('list refuses to end silently when the server truncated without a cursor', async () => {
@@ -301,6 +390,49 @@ test('watch gives up with UnavailableError when it cannot reconnect for giveUpAf
   await assert.rejects(async () => {
     for await (const ev of client.watch('w/', { fromRevision: 1, giveUpAfterMs: 300 })) void ev;
   }, UnavailableError);
+});
+
+test('watch with fromRevision as the first call: a dead first node costs one quick window, and no stream is opened to it', async () => {
+  const client = new RetcdClient({ endpoints: [A, B, C] });
+  const log = [];
+  client._ready = async (addr, ms) => {
+    log.push(`connect ${addr} ${ms}`);
+    if (addr === A) throw notConnected(addr);
+  };
+  client._svc = (addr) => ({
+    Watch: (req) => {
+      log.push(`watch ${addr} after ${req.start_after_revision}`);
+      return stream([putMsg(8, 'w/a')]);
+    },
+  });
+  for await (const ev of client.watch('w/', { fromRevision: 7 })) {
+    assert.equal(ev.revision, 8);
+    break;
+  }
+  assert.deepEqual(log, [`connect ${A} 400`, `connect ${B} 400`, `watch ${B} after 7`]);
+  client.close();
+});
+
+test('watch: once every node misses the quick window it waits longer, and an abort ends a connect wait at once', async () => {
+  const client = new RetcdClient({ endpoints: [A, B] });
+  const windows = [];
+  const ac = new AbortController();
+  client._ready = (addr, ms) => {
+    windows.push(ms);
+    if (ms < 3000) return Promise.reject(notConnected(addr));
+    return new Promise(() => {}); // the slow window never answers
+  };
+  client._svc = () => ({ Watch: () => assert.fail('no stream before a connection') });
+  const started = Date.now();
+  const done = (async () => {
+    for await (const ev of client.watch('w/', { fromRevision: 1, signal: ac.signal })) void ev;
+  })();
+  await new Promise((r) => setTimeout(r, 50));
+  ac.abort();
+  await done; // ends quietly
+  assert.deepEqual(windows, [400, 400, 3000]);
+  assert.ok(Date.now() - started < 1000, 'the abort did not wait out the 3 s window');
+  client.close();
 });
 
 test('close() ends a running watch and later calls fail clearly', async () => {

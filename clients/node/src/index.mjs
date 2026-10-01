@@ -22,6 +22,7 @@ import {
   UnavailableError,
   UnknownOutcomeError,
   classify,
+  isForeignPageToken,
   leaderHint,
   mapError,
   metaOf,
@@ -49,19 +50,36 @@ export {
 /** Server limits (crates/config-core/src/limits.rs). */
 export const LIMITS = Object.freeze({ maxKeyBytes: 1024, maxValueBytes: 1024 * 1024, maxListItems: 1000 });
 
-const DEFAULT_PROTO = fileURLToPath(new URL('../../../proto/retcd/v1/config.proto', import.meta.url));
+// Where config.proto is looked for when neither { protoPath } nor RETCD_PROTO is given, relative to
+// this file: the copy an installed package carries (npm pack bundles it), then the rEtcd repo's own.
+const PROTO_CANDIDATES = [
+  fileURLToPath(new URL('../proto/retcd/v1/config.proto', import.meta.url)),
+  fileURLToPath(new URL('../../../proto/retcd/v1/config.proto', import.meta.url)),
+];
+const defaultProto = () => PROTO_CANDIDATES.find((f) => fs.existsSync(f));
+// How long a call waits to connect to one node before trying the next (a live node takes milliseconds),
+// and the window once every node has missed that in one call. Same values as the C# client.
+const QUICK_CONNECT_MS = 400;
+const SLOW_CONNECT_MS = 3000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
 // One loaded service definition per proto file.
 const serviceCache = new Map();
 function loadService(protoPath) {
-  const file = path.resolve(protoPath ?? process.env.RETCD_PROTO ?? DEFAULT_PROTO);
+  const chosen = protoPath ?? process.env.RETCD_PROTO ?? defaultProto();
+  if (chosen === undefined) {
+    throw new RetcdError(
+      `config.proto not found; looked in ${PROTO_CANDIDATES.join(' and ')}. Pass { protoPath } to RetcdClient.connect, or set RETCD_PROTO, to proto/retcd/v1/config.proto.`,
+      { code: 'PROTO_NOT_FOUND' },
+    );
+  }
+  const file = path.resolve(chosen);
   let svc = serviceCache.get(file);
   if (!svc) {
     if (!fs.existsSync(file)) {
       throw new RetcdError(
-        `proto file not found: ${file}. Pass { protoPath } to RetcdClient.connect, or set RETCD_PROTO, to the repo's proto/retcd/v1/config.proto.`,
+        `proto file not found: ${file}. Pass { protoPath } to RetcdClient.connect, or set RETCD_PROTO, to proto/retcd/v1/config.proto.`,
         { code: 'PROTO_NOT_FOUND' },
       );
     }
@@ -113,7 +131,7 @@ export class RetcdClient {
    * @param {string[]} opts.endpoints  client addresses, e.g. ['127.0.0.1:17302', ...]
    * @param {number} [opts.timeoutMs=10000]   deadline for one attempt
    * @param {number} [opts.failoverMs=20000]  how long one call may hunt for a leader / live node
-   * @param {string} [opts.protoPath]  config.proto; default: the repo's proto/ (or env RETCD_PROTO)
+   * @param {string} [opts.protoPath]  config.proto; default: env RETCD_PROTO, else the copy in the package, else the repo's proto/
    * @param {string[]} [opts.healthEndpoints]  health host:port per endpoint; default client port + 2
    * @param {boolean} [opts.probe=true]  set false to connect lazily
    */
@@ -170,23 +188,88 @@ export class RetcdClient {
     this._addr = this._endpoints[(i + 1) % this._endpoints.length];
   }
 
-  _once(addr, method, req) {
+  _drop(addr) {
+    const c = this._clients.get(addr);
+    if (!c) return;
+    this._clients.delete(addr);
+    c.close();
+  }
+
+  // Connect before anything is sent, waiting at most `ms`. A failure here means the request never left
+  // this process, so it is a 'refused' (safe to send to another node, even a write), never an unknown
+  // outcome. Fails at once when the connect attempt fails (refused), or after `ms` (no answer at all).
+  _ready(addr, ms) {
+    const ch = this._svc(addr).getChannel();
+    const S = grpc.connectivityState;
+    if (ch.getConnectivityState(false) === S.READY) return Promise.resolve();
+    const deadline = Date.now() + Math.min(ms, this._timeoutMs);
+    return new Promise((resolve, reject) => {
+      const fail = (why) => {
+        this._drop(addr); // the next attempt at this node starts fresh
+        const details = `No connection established to ${addr}: ${why}`;
+        reject(Object.assign(new Error(`${grpc.status.UNAVAILABLE} UNAVAILABLE: ${details}`), { code: grpc.status.UNAVAILABLE, details, metadata: new grpc.Metadata(), connectFailed: true }));
+      };
+      const check = () => {
+        let state;
+        try {
+          state = ch.getConnectivityState(true);
+        } catch {
+          return fail('the channel was closed');
+        }
+        if (state === S.READY) return resolve();
+        if (state === S.TRANSIENT_FAILURE || state === S.SHUTDOWN) return fail('connect failed');
+        ch.watchConnectivityState(state, deadline, (err) => (err ? fail(`not connected within ${ms} ms`) : check()));
+      };
+      check();
+    });
+  }
+
+  // _ready, but an abort (or close) ends the wait at once instead of after the connect window.
+  async _readyUnlessStopped(addr, ms, signal) {
+    const ready = this._ready(addr, ms);
+    if (!signal) return ready;
+    ready.catch(() => {}); // still settles after an abort; nobody is waiting for it then
+    let onAbort;
+    const aborted = new Promise((resolve) => {
+      onAbort = resolve;
+      signal.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      await Promise.race([ready, aborted]);
+    } finally {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+
+  _send(addr, method, req) {
     return new Promise((resolve, reject) => {
       this._svc(addr)[method](req, { deadline: Date.now() + this._timeoutMs }, (err, res) => (err ? reject(err) : resolve(res)));
     });
   }
 
+  async _once(addr, method, req, connectMs = SLOW_CONNECT_MS) {
+    await this._ready(addr, connectMs);
+    return this._send(addr, method, req);
+  }
+
   // One logical call with leader following. See the rules at the top of this file.
-  async _call(method, req, { write = false } = {}) {
+  async _call(method, req, { write = false, followForeignPageToken = false } = {}) {
     const giveUpAt = Date.now() + this._failoverMs;
     let hops = 0;
+    const slowToConnect = new Set(); // nodes that missed the quick connect window in this call
     for (;;) {
       this._assertOpen();
       const addr = this._addr;
+      // Quick window first, so a dead node costs QUICK_CONNECT_MS and not the whole budget. Once every
+      // known node has missed it, allow the longer window: they may all just be slow.
+      const quick = !this._endpoints.every((e) => slowToConnect.has(e));
       try {
-        return await this._once(addr, method, req);
+        return await this._once(addr, method, req, quick ? QUICK_CONNECT_MS : SLOW_CONNECT_MS);
       } catch (err) {
-        const kind = classify(err);
+        if (err.connectFailed) slowToConnect.add(addr);
+        // A List cursor from another node is followed like "not the leader": the same request goes to the
+        // node the refusal names, so the walk keeps its token and its pinned revision.
+        const kind = followForeignPageToken && isForeignPageToken(err) ? 'not-leader' : classify(err);
         const readRetry = !write && kind === 'transport' && (err.code === grpc.status.UNAVAILABLE || err.code === grpc.status.DEADLINE_EXCEEDED);
         if (!(kind === 'not-leader' || kind === 'refused' || readRetry) || Date.now() >= giveUpAt) {
           throw mapError(err, { write, endpoint: addr });
@@ -196,7 +279,8 @@ export class RetcdClient {
           this._use(hint);
           if (++hops > 2) await sleep(200); // a hint loop must not spin
         } else {
-          await sleep(kind === 'not-leader' ? 300 : 150); // election in progress, or node down
+          // election in progress, or node down. A node that just failed the quick connect costs no pause.
+          await sleep(kind === 'not-leader' ? 300 : err.connectFailed && quick ? 0 : 150);
           if (!hint || kind !== 'not-leader') this._rotate();
         }
       }
@@ -229,12 +313,18 @@ export class RetcdClient {
     return this._applied(r, 'put');
   }
 
-  /** Delete a key. Throws NotFoundError if it does not exist; CasConflictError if `ifRevision` is stale. */
+  /**
+   * Delete a key. Resolves true if it was deleted, false if it did not exist.
+   * Throws CasConflictError if `ifRevision` is stale.
+   * @returns {Promise<boolean>}
+   */
   async delete(key, { ifRevision } = {}) {
     const req = { key: keyBuf(key) };
     if (ifRevision !== undefined) req.expected_mod_revision = revString(ifRevision, 'ifRevision');
     const r = await this._call('Delete', req, { write: true });
-    return this._applied(r, 'delete');
+    if (r.outcome === 'NOT_FOUND') return false;
+    this._applied(r, 'delete');
+    return true;
   }
 
   // A conflict can come back as an OK response or as a typed error (mapError handles that one).
@@ -270,7 +360,7 @@ export class RetcdClient {
       const re = hasGlob(pattern) ? globToRegExp(pattern) : null;
       let token = Buffer.alloc(0); // present but empty: start a pinned walk
       for (;;) {
-        const r = await self._call('List', { prefix, max_items: pageSize, page_token: token });
+        const r = await self._call('List', { prefix, max_items: pageSize, page_token: token }, { followForeignPageToken: true });
         state.readRevision ??= Number(r.read_revision);
         for (const rec of r.records) {
           const out = toRecord(rec);
@@ -337,8 +427,30 @@ export class RetcdClient {
     let last = fromRevision === undefined ? await this.revision() : Number(revString(fromRevision, 'fromRevision'));
     let failingSince = 0;
     let fails = 0;
+    const slowToConnect = new Set(); // nodes that missed the quick connect window since the last message
+    const giveUp = (cause) => {
+      failingSince ||= Date.now();
+      if (giveUpAfterMs && Date.now() - failingSince > giveUpAfterMs) {
+        throw new UnavailableError(`watch could not reconnect for ${giveUpAfterMs} ms; last seen revision ${last}`, { cause });
+      }
+    };
     while (!signal?.aborted && !this._closed) {
       const addr = this._addr;
+      // Connect first, with the same quick window as a call, so a dead node costs QUICK_CONNECT_MS and not
+      // the transport's connect timeout. This matters most when fromRevision is given and the watch is
+      // the first thing this client does. A node that is already connected returns at once.
+      const quick = !this._endpoints.every((e) => slowToConnect.has(e));
+      try {
+        await this._readyUnlessStopped(addr, quick ? QUICK_CONNECT_MS : SLOW_CONNECT_MS, signal);
+      } catch (err) {
+        if (signal?.aborted || this._closed) return;
+        slowToConnect.add(addr);
+        giveUp(err);
+        this._rotate();
+        if (!quick) await sleep(Math.min(2000, 100 * 2 ** ++fails));
+        continue;
+      }
+      if (signal?.aborted || this._closed) return;
       const call = this._svc(addr).Watch({ prefix, start_after_revision: String(last) });
       this._watches.add(call);
       const onAbort = () => call.cancel();
@@ -347,6 +459,7 @@ export class RetcdClient {
         for await (const m of call) {
           failingSince = 0;
           fails = 0;
+          slowToConnect.clear();
           if (m.body === 'event') {
             const ev = m.event;
             last = Number(ev.revision);
@@ -371,10 +484,7 @@ export class RetcdClient {
         // A typed refusal (compacted, bad argument, denied) will not get better by retrying.
         if (!resumable && kind === 'server') throw mapError(err, { endpoint: addr });
         const hint = kind === 'not-leader' ? leaderHint(err) : undefined;
-        failingSince ||= Date.now();
-        if (giveUpAfterMs && Date.now() - failingSince > giveUpAfterMs) {
-          throw new UnavailableError(`watch could not reconnect for ${giveUpAfterMs} ms; last seen revision ${last}`, { cause: err });
-        }
+        giveUp(err);
         if (hint && hint !== addr) this._use(hint);
         else this._rotate();
         fails++;

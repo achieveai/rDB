@@ -61,13 +61,7 @@ export function startHeartbeat(client, name, { intervalMs = 2000, onError } = {}
       clearTimeout(timer);
       wake?.();
       await loop;
-      if (remove) {
-        try {
-          await client.delete(key);
-        } catch (err) {
-          if (err.code !== 'NOT_FOUND') throw err;
-        }
-      }
+      if (remove) await client.delete(key); // false if already gone: fine
     },
   };
 }

@@ -1,17 +1,42 @@
 // Presence logic with a fake client (no cluster): heartbeat format, and the up/late/down/back states.
+//
+// Time is fake (node:test mock timers for Date, setTimeout and setInterval), so these tests give the
+// same answer on an idle host and on one with every core busy. They used to sleep on the real clock
+// and assert after the sleep; under load a sleep overran, an assertion failed before mon.stop(), and
+// the monitor's interval kept the test process alive for ever.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { startHeartbeat, watchPresence } from '../src/presence.mjs';
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const START = Date.parse('2026-01-01T00:00:00Z');
 
-test('heartbeat writes presence/<name> = {name, pid, seq, sent_at}, exactly', async () => {
+// Let promises and async generators run. setImmediate is not mocked, so this is real "later".
+const flush = async () => {
+  for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+};
+
+// Fake time for this test only. advance(ms) moves the clock in 10 ms steps and lets the code
+// react after each step, the way it would between real timer callbacks.
+function fakeTime(t) {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout', 'setInterval'], now: START });
+  return async (ms) => {
+    for (let left = ms; left > 0; left -= 10) {
+      t.mock.timers.tick(Math.min(10, left));
+      await flush();
+    }
+  };
+}
+
+test('heartbeat writes presence/<name> = {name, pid, seq, sent_at}, exactly', async (t) => {
+  const advance = fakeTime(t);
   const puts = [];
   const client = { put: async (k, v) => puts.push([k, v]), delete: async () => {} };
   const hb = startHeartbeat(client, 'api', { intervalMs: 30 });
-  await sleep(110);
+  t.after(() => hb.stop());
+  await flush();
+  await advance(100); // beats at 0, 30, 60, 90
   await hb.stop();
-  assert.ok(puts.length >= 3, `got ${puts.length} beats`);
+  assert.equal(puts.length, 4);
   const [key, value] = puts[0];
   assert.equal(key, 'presence/api');
   const obj = JSON.parse(value);
@@ -19,14 +44,14 @@ test('heartbeat writes presence/<name> = {name, pid, seq, sent_at}, exactly', as
   assert.equal(obj.name, 'api');
   assert.equal(obj.pid, process.pid);
   assert.equal(obj.seq, 1);
-  assert.equal(new Date(obj.sent_at).toISOString(), obj.sent_at, 'sent_at is an ISO time');
-  assert.deepEqual(puts.map(([, v]) => JSON.parse(v).seq), puts.map((_, i) => i + 1), 'seq counts up by one');
-  const n = puts.length;
-  await sleep(80);
-  assert.equal(puts.length, n, 'stop() really stops');
+  assert.equal(obj.sent_at, new Date(START).toISOString(), 'sent_at is an ISO time');
+  assert.deepEqual(puts.map(([, v]) => JSON.parse(v).seq), [1, 2, 3, 4], 'seq counts up by one');
+  await advance(80);
+  assert.equal(puts.length, 4, 'stop() really stops');
 });
 
-test('heartbeat: a failed beat is reported and the next one still goes out; stop({remove}) deletes the key', async () => {
+test('heartbeat: a failed beat is reported and the next one still goes out; stop({remove}) deletes the key', async (t) => {
+  const advance = fakeTime(t);
   let calls = 0;
   const errors = [];
   const deleted = [];
@@ -37,10 +62,12 @@ test('heartbeat: a failed beat is reported and the next one still goes out; stop
     delete: async (k) => deleted.push(k),
   };
   const hb = startHeartbeat(client, 'x', { intervalMs: 30, onError: (e) => errors.push(e.message) });
-  await sleep(100);
+  t.after(() => hb.stop());
+  await flush();
+  await advance(70); // beats at 0 (fails), 30, 60
   await hb.stop({ remove: true });
   assert.deepEqual(errors, ['boom']);
-  assert.ok(calls >= 3);
+  assert.equal(calls, 3);
   assert.deepEqual(deleted, ['presence/x']);
 });
 
@@ -75,7 +102,7 @@ function fakeStore(initial = {}) {
       });
       while (!signal.aborted) {
         if (queue.length) yield queue.shift();
-        else await new Promise((r) => ((wake = r), signal.addEventListener('abort', r, { once: true }), setTimeout(r, 20)));
+        else await new Promise((r) => ((wake = r), signal.addEventListener('abort', r, { once: true })));
       }
     },
   };
@@ -84,78 +111,81 @@ function fakeStore(initial = {}) {
   return { client, beat, remove };
 }
 
-test('monitor: up, then late, then down when beats stop, then back when they return', async () => {
-  const { client, beat } = fakeStore();
-  const mon = watchPresence(client, { intervalMs: 100, missedBeats: 3 }); // late at 150 ms, down at 350 ms
+// Start a monitor that is always stopped when the test ends, pass or fail.
+async function startMonitor(t, client, opts) {
+  const mon = watchPresence(client, opts);
+  t.after(() => mon.stop());
   const seen = [];
   mon.on('change', (e) => seen.push(`${e.name}:${e.state}`));
   await mon.ready;
-  await sleep(30);
+  await flush(); // the watch is open
+  return { mon, seen };
+}
+
+test('monitor: up, then late, then down when beats stop, then back when they return', async (t) => {
+  const advance = fakeTime(t);
+  const { client, beat } = fakeStore();
+  const { mon, seen } = await startMonitor(t, client, { intervalMs: 100, missedBeats: 3 }); // late at 150 ms, down at 350 ms
   beat('svc');
-  await sleep(60);
+  await flush();
   assert.deepEqual(seen, ['svc:up']);
-  await sleep(150); // ~210 ms since the beat
+  await advance(140);
+  assert.deepEqual(seen, ['svc:up'], 'not late before 1.5 intervals');
+  await advance(10); // 150 ms since the beat
   assert.deepEqual(seen, ['svc:up', 'svc:late']);
-  await sleep(250); // ~460 ms
+  await advance(190); // 340 ms
+  assert.deepEqual(seen, ['svc:up', 'svc:late'], 'not down before 3.5 intervals');
+  await advance(10); // 350 ms
   assert.deepEqual(seen, ['svc:up', 'svc:late', 'svc:down']);
   beat('svc');
-  await sleep(40);
+  await flush();
   assert.deepEqual(seen, ['svc:up', 'svc:late', 'svc:down', 'svc:back']);
   beat('svc'); // a second beat while healthy says nothing
-  await sleep(40);
+  await flush();
   assert.equal(seen.length, 4);
   assert.deepEqual(mon.snapshot().map((m) => `${m.name}:${m.state}`), ['svc:up']);
-  mon.stop();
 });
 
-test('monitor: a beat keeps a name up indefinitely', async () => {
+test('monitor: a beat keeps a name up indefinitely', async (t) => {
+  const advance = fakeTime(t);
   const { client, beat } = fakeStore();
-  const mon = watchPresence(client, { intervalMs: 100, missedBeats: 3 });
-  const seen = [];
-  mon.on('change', (e) => seen.push(`${e.name}:${e.state}`));
-  await mon.ready;
-  await sleep(30);
+  const { seen } = await startMonitor(t, client, { intervalMs: 100, missedBeats: 3 });
   for (let i = 0; i < 8; i++) {
     beat('steady');
-    await sleep(80);
+    await flush();
+    await advance(140); // just short of late, every time
   }
   assert.deepEqual(seen, ['steady:up']);
-  mon.stop();
 });
 
-test('monitor: a deleted key is down at once; names already stored are judged from sent_at', async () => {
-  const now = Date.now();
+test('monitor: a deleted key is down at once; names already stored are judged from sent_at', async (t) => {
+  fakeTime(t);
   const { client, remove } = fakeStore({
-    fresh: new Date(now - 10).toISOString(),
-    stale: new Date(now - 60_000).toISOString(),
-    gone: new Date(now - 10).toISOString(),
+    fresh: new Date(START - 10).toISOString(),
+    stale: new Date(START - 60_000).toISOString(),
+    gone: new Date(START - 10).toISOString(),
   });
-  const mon = watchPresence(client, { intervalMs: 100, missedBeats: 3 });
-  const seen = [];
-  mon.on('change', (e) => seen.push(`${e.name}:${e.state}`));
-  await mon.ready;
+  const { seen } = await startMonitor(t, client, { intervalMs: 100, missedBeats: 3 });
   assert.deepEqual([...seen].sort(), ['fresh:up', 'gone:up', 'stale:down']);
-  await sleep(30);
   remove('gone');
-  await sleep(40);
+  await flush();
   assert.ok(seen.includes('gone:down'));
-  mon.stop();
 });
 
-test('monitor: usable with for-await, replays current state first, ends on stop()', async () => {
-  const { client, beat } = fakeStore({ old: new Date().toISOString() });
-  const mon = watchPresence(client, { intervalMs: 100, missedBeats: 3 });
-  await mon.ready;
+test('monitor: usable with for-await, replays current state first, ends on stop()', async (t) => {
+  fakeTime(t);
+  const { client, beat } = fakeStore({ old: new Date(START).toISOString() });
+  const { mon } = await startMonitor(t, client, { intervalMs: 100, missedBeats: 3 });
   const got = [];
   const done = (async () => {
     for await (const ev of mon) got.push(`${ev.name}:${ev.state}`);
   })();
-  await sleep(30);
+  await flush();
   beat('new');
-  await sleep(60);
+  await flush();
   mon.stop();
   await done;
-  assert.deepEqual(got.slice(0, 2), ['old:up', 'new:up']);
+  assert.deepEqual(got, ['old:up', 'new:up']);
 });
 
 test('monitor: a failing first list surfaces on ready and as error', async () => {

@@ -13,6 +13,7 @@
   },
   "files": [
     "src",
+    "proto",
     "examples",
     "README.md"
   ],
@@ -20,12 +21,19 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test --test-force-exit --test-timeout=30000 \"test/*.test.mjs\"",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepack": "node scripts/bundle-proto.mjs",
+    "postpack": "node scripts/bundle-proto.mjs --clean"
   },
   "license": "UNLICENSED",
   "private": true,
   "dependencies": {
     "@grpc/grpc-js": "^1.12.0",
     "@grpc/proto-loader": "^0.7.13"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "typescript": "5.9.3"
   }
 }
