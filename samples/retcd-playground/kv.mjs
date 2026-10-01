@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import grpc from '@grpc/grpc-js';
 import protoLoader from '@grpc/proto-loader';
+import { basePortFrom, clientPort as clientPortAt, healthPort as healthPortAt } from './retlib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '..', '..');
@@ -17,9 +18,15 @@ const PROTO = path.join(REPO_ROOT, 'proto', 'retcd', 'v1', 'config.proto');
 const MAX_VALUE_BYTES = 1024 * 1024;
 const MAX_KEY_BYTES = 1024;
 
-const UP_HINT = 'cluster not running? run: ./scripts/local-cluster.sh up --dir /c/rdb_test_data/local-cluster';
-const clientPort = (n) => 17300 + (n - 1) * 10 + 2;
-const healthPort = (n) => 17300 + (n - 1) * 10 + 4;
+// local-cluster.sh's default. --base-port P or env RETCD_BASE_PORT changes it (set in main).
+const KV_DEFAULT_BASE_PORT = 17300;
+let basePort = KV_DEFAULT_BASE_PORT;
+const clientPort = (n) => clientPortAt(basePort, n);
+const healthPort = (n) => healthPortAt(basePort, n);
+const upHint = () =>
+  `cluster not running? run: ./scripts/local-cluster.sh up --dir /c/rdb_test_data/local-cluster${
+    basePort === KV_DEFAULT_BASE_PORT ? '' : ` --base-port ${basePort}`
+  }`;
 
 const STATUS_NAME = Object.fromEntries(Object.entries(grpc.status).map(([k, v]) => [v, k]));
 
@@ -39,7 +46,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ---------------------------------------------------------------------------------------
 // Arguments: `--name value` for the flags below, everything else is positional.
 // ---------------------------------------------------------------------------------------
-const VALUE_FLAGS = new Set(['node', 'addr', 'if-rev', 'limit', 'from', 'size', 'nodes']);
+const VALUE_FLAGS = new Set(['node', 'addr', 'base-port', 'if-rev', 'limit', 'from', 'size', 'nodes']);
 const BOOL_FLAGS = new Set(['force', 'help']);
 
 function parseArgs(argv) {
@@ -107,7 +114,7 @@ async function chooseAddr(flags) {
       return { addr, explicit: false };
     }
   }
-  return fail(`cannot reach any node on 127.0.0.1:17302/17312/17322. ${UP_HINT}`);
+  return fail(`cannot reach any node on 127.0.0.1:${[1, 2, 3].map(clientPort).join('/')}. ${upHint()}`);
 }
 
 // First of nodes 1-3 (other than `skip`) that accepts a TCP connection.
@@ -126,7 +133,7 @@ function describe(err, addr) {
   switch (err.code) {
     case grpc.status.UNAVAILABLE:
       if (/ECONNREFUSED|No connection established|Connection refused|connect/i.test(detail)) {
-        return `cannot reach ${addr}. ${UP_HINT}`;
+        return `cannot reach ${addr}. ${upHint()}`;
       }
       return `unavailable (${addr}): ${detail}`;
     case grpc.status.DEADLINE_EXCEEDED:
@@ -456,8 +463,28 @@ async function cmdRm(s, pos, flags) {
   out(`    revision ${r.revision}`);
 }
 
+// After this many failed reconnects in a row, a watch pinned with --node/--addr gives up on
+// that node and looks for the leader on the cluster's nodes (from the base port).
+const WATCH_PIN_TRIES = 3;
+
+// Move the session to the leader: start at a node other than `avoid` that answers, then let a
+// read follow the "not the leader" hint. Returns false if no node answers yet.
+async function findLeader(s, avoid) {
+  const start = (await firstReachable(avoid)) ?? (await firstReachable(null));
+  if (!start) return false;
+  if (start !== s.addr) s.use(start);
+  s.roaming = true;
+  try {
+    await s.call('Get', { key: b('kv/none') });
+    return true;
+  } catch {
+    return false; // election still running; the caller tries again
+  }
+}
+
 // Watch reconnects by itself (leader change, node stopped) and resumes after the last
-// revision it saw, so you can stop a node and keep watching.
+// revision it saw, so you can stop a node and keep watching. Pinned with --node/--addr, it
+// retries that node WATCH_PIN_TRIES times, then follows the leader like an unpinned watch.
 async function cmdWatch(s, pos, flags, choice) {
   if (pos.length > 1) fail("usage: kv watch [prefix or 'pattern'] [--from REV]");
   const arg = pos[0] ?? '';
@@ -476,12 +503,16 @@ async function cmdWatch(s, pos, flags, choice) {
     call?.cancel();
   });
 
+  let pinned = choice.explicit;
+  let failures = 0; // reconnects in a row with no message received
   while (!stopping) {
     const done = await new Promise((resolve) => {
       call = s.client.Watch({ prefix: b(prefix), start_after_revision: last });
       call.on('data', (m) => {
+        failures = 0;
         if (m.body === 'event') {
           const ev = m.event;
+          if (BigInt(ev.revision) <= BigInt(last)) note(`(warning: rev ${ev.revision} is not after ${last}: a duplicate or out of order)`);
           last = ev.revision;
           if (re && !re.test(ev.key.toString('utf8'))) return;
           if (ev.change === 'put') out(`rev ${ev.revision}  PUT  ${ev.key.toString('utf8')}  (${ev.put.value.length} bytes)`);
@@ -501,16 +532,23 @@ async function cmdWatch(s, pos, flags, choice) {
       err.code === grpc.status.UNAVAILABLE ||
       (err.code === grpc.status.FAILED_PRECONDITION && /leader/i.test(err.details ?? ''));
     if (!retryable) fail(describe(err, s.addr));
+    failures++;
     const hint = err && metaOf(err, 'retcd-leader-endpoint');
-    note('(watch connection lost. reconnecting...)');
+    const why = err ? `${STATUS_NAME[err.code] ?? err.code} ${err.details ?? ''}`.trim() : 'stream ended';
+    note(`(watch on ${s.addr} lost: ${why}. reconnecting after revision ${last}...)`);
     await sleep(1000);
-    if (hint) s.use(hint);
-    else if (!choice.explicit) {
-      try {
-        s.use((await chooseAddr({})).addr);
-      } catch {
-        /* nothing answers yet; try again next loop */
-      }
+    if (hint) {
+      s.use(hint);
+      continue;
+    }
+    if (pinned && failures < WATCH_PIN_TRIES) continue;
+    if (pinned) {
+      note(`(${s.addr} failed ${failures} times. looking for the leader on the other nodes...)`);
+      pinned = false;
+    }
+    const failed = s.addr;
+    if (await findLeader(s, failed)) {
+      if (s.addr !== failed) note(`(resuming the watch on ${s.addr})`);
     }
   }
   out();
@@ -612,7 +650,7 @@ async function cmdStatus(flags) {
   out();
   out(`${ready.length} of ${count} ready. leader: ${leaders.size === 1 ? `node ${[...leaders][0]}` : leaders.size === 0 ? 'none yet' : 'nodes disagree'}.`);
   if (ready.length > 1) out(`same data on all ready nodes: ${hashes.size === 1 ? 'yes' : 'not yet (a follower may lag for a moment)'}`);
-  if (up.length === 0) out(UP_HINT);
+  if (up.length === 0) out(upHint());
   if (ready.length === 0) process.exitCode = 1;
 }
 
@@ -661,9 +699,11 @@ const HELP = `kv: play with a local rEtcd cluster
   kv status                           health of each node (--nodes N, default 3)
   kv bench [n] [--size bytes]         n sequential puts, prints ops/sec, p50, p99
 
-  --node N     talk to node N (1 -> 17302, 2 -> 17312, ...)
-  --addr H:P   talk to this client address
-  default      node 1, or the first of nodes 1-3 that answers
+  --node N       talk to node N (1 -> base+2, 2 -> base+12, ...)
+  --addr H:P     talk to this client address
+  default        node 1, or the first of nodes 1-3 that answers
+  --base-port P  where the cluster is (or env RETCD_BASE_PORT). default 17300,
+                 same as local-cluster.sh. Node n's client port is P + (n-1)*10 + 2.
 
   patterns (ls, watch): * one level, ** any depth, ? one char, [a-z] a set
     kv ls 'docs/*'  keys + one DIR row per sub-folder     kv ls 'docs/**/*.md'  every depth
@@ -673,6 +713,11 @@ const HELP = `kv: play with a local rEtcd cluster
 
 async function main() {
   const { pos, flags } = parseArgs(process.argv.slice(2));
+  try {
+    basePort = basePortFrom(flags['base-port'], KV_DEFAULT_BASE_PORT);
+  } catch (err) {
+    fail(err.message, 2);
+  }
   const cmd = pos.shift();
   if (!cmd || cmd === 'help' || cmd === '-h' || flags.help) {
     out(HELP);

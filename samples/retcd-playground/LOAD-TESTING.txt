@@ -2,10 +2,10 @@ rEtcd LOAD TESTING
 Measured 2026-09-30. Git Bash, repo root unless said. Every number is the median of 3 runs.
 
 SETUP (once)
-  CARGO_TARGET_DIR=/c/rdb_test_data/targets/load-rel cargo build --release -p config-server
-  mkdir -p /c/rdb_test_data/targets/load-bin/debug
-  cp /c/rdb_test_data/targets/load-rel/release/config-server.exe /c/rdb_test_data/targets/load-bin/debug/
-  export CARGO_TARGET_DIR=/c/rdb_test_data/targets/load-bin    # the scripts look for debug/config-server
+  export CARGO_TARGET_DIR=/c/rdb_test_data/targets/load-rel RETCD_PROFILE=release
+  cargo build --release -p config-server     # or skip it: `up` builds the release binary if missing
+  # RETCD_PROFILE=release: local-cluster.sh and node.sh run $CARGO_TARGET_DIR/release/config-server.
+  # failover.sh, presence-test.sh and stall-bug.sh default to these two values.
   export RUST_LOG=warn          # see Caveats: default logging writes ~2 GB per node per 2 minutes
   ./scripts/local-cluster.sh up --dir /c/rdb_test_data/load-cluster --base-port 17400
   cd samples/retcd-playground
@@ -85,19 +85,18 @@ Every load run re-reads every acked write at the end. LOST must be 0. Exit code 
   Here (3 runs each): longest silence (no op succeeded):
         stop: 3.71 / 3.70 / 3.35 s, 0 errors.  kill: 3.97 / 3.69 / 3.90 s, 11-15 UNAVAILABLE.
         Acked writes lost: 0 in all 6 runs (500 keys re-read each time).
-  The "/health shows new leader" line lags the real election by 3-5 s. Use "longest silence".
+  "/health shows new leader" counts from when the old leader was down, not from the stop
+  request ("took X s" is the stop itself). /health is read live. Outage = "longest silence".
 
-10. THE WATCH-STALL BUG
-  Why: an open watch stops its node from shutting down.
-  Run: ./stall-bug.sh        (about 1.5 minutes, restarts the node afterwards)
-  Bug: stop the leader while one watch is open on it. The node does not exit, keeps
-  leadership, and writes through it time out. Closing the watch makes it exit at once.
-  Here: node still running and leader 67 s, 79 s (and 171+ s by hand) after the stop (script limit
-  is 60 s; no end seen); write timed out after 10 s; exited <1 s after the watch
-  closed. Reproduced on 2026-09-30 with the same release build as the numbers above.
-  FIXED (2026-09-30, working tree, not yet committed): the daemon now ends open watches
-  before draining. Leader with 2 watches open exits in 0.43-0.58 s; a new leader follows.
-  Rebuild the server, then this script should show the node gone within a second.
+10. A NODE WITH AN OPEN WATCH STOPS PROMPTLY
+  Why: an open watch once kept a stopping leader alive (fixed in a41f25d). This checks it.
+  Run: ./stall-bug.sh        (about 15 s, restarts the node afterwards)
+  How: open one watch on the leader, write its stop file, time the exit.
+  Good: "PASS: node N exited X s after the stop request", exit 0. FAIL (exit 1) if it takes
+  over 5 s (--limit S), or if the watch did not open (then the run proves nothing).
+  Here: 0.27 s (2026-10-01, release build). A new leader follows; writes go on.
+  Before the fix (2026-09-30): the node kept running and stayed leader 67 s, 79 s and 171+ s
+  after the stop; writes timed out; it exited <1 s after the watch closed.
   Regression test: scripts/gate.sh test -p config-server --test m4_shutdown_watch
 
 CAVEATS

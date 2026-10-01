@@ -12,7 +12,8 @@ WHAT="${1:-}"; case "$WHAT" in kill|freeze|swarm|nodedown) ;; *) echo "usage: $0
 shift
 DIR=/c/rdb_test_data/load-cluster; BASE=17400
 while [ $# -gt 0 ]; do case "$1" in --dir) DIR="$2"; shift 2 ;; --base-port) BASE="$2"; shift 2 ;; *) echo "unknown $1" >&2; exit 2 ;; esac; done
-export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/c/rdb_test_data/targets/load-bin}"
+# Where node.sh finds config-server (see LOAD-TESTING.txt SETUP).
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/c/rdb_test_data/targets/load-rel}" RETCD_PROFILE="${RETCD_PROFILE:-release}"
 export RETCD_BASE_PORT="$BASE"
 LOGS="$(mktemp -d)"
 t() { date -u +%T.%3N; }
@@ -67,7 +68,8 @@ nodedown)
   sleep 12
   S="$(winpid 'presence.mjs swarm')"; M="$(winpid 'presence.mjs monitor')"; KILL=("$S" "$M")
   LEADER="$(leader_now)"
-  T0="$(t)"; kill -9 "$(cat "$DIR/node-$LEADER/pid")"; rm -f "$DIR/node-$LEADER/pid"; echo "$T0  KILLED leader node $LEADER (kill -9)"
+  # Line 1 of the pid file is the Windows pid (scripts/local-cluster.sh). taskkill /F = kill -9.
+  T0="$(t)"; taskkill //F //PID "$(sed -n 1p "$DIR/node-$LEADER/pid")" >/dev/null; rm -f "$DIR/node-$LEADER/pid"; echo "$T0  KILLED leader node $LEADER (kill -9)"
   sleep 20
   "$HERE/node.sh" start "$LEADER" --dir "$DIR" | sed 's/^/  /'
   sleep 12

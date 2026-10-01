@@ -1,5 +1,6 @@
-// Shared helpers for load.mjs, fanout.mjs and presence.mjs (not a CLI).
-// Plain gRPC against a plaintext dev cluster. kv.mjs is left alone: it runs main() on import.
+// Shared helpers for load.mjs, fanout.mjs and presence.mjs (not a CLI). kv.mjs uses only the
+// port helpers. Plain gRPC against a plaintext dev cluster. Nothing imports kv.mjs: it runs
+// main() on import.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import grpc from '@grpc/grpc-js';
@@ -56,16 +57,38 @@ export function num(flags, name, dflt) {
 
 // ---- cluster addresses -------------------------------------------------------------------
 // Port formula (scripts/local-cluster.sh): base + (n-1)*10 + 2 is node n's client port.
+// Defaults differ on purpose: load tools use the load cluster (17400), kv.mjs the
+// local-cluster.sh default (17300).
 export const DEFAULT_BASE_PORT = 17400;
 export const clientPort = (base, n) => base + (n - 1) * 10 + 2;
 export const healthPort = (base, n) => base + (n - 1) * 10 + 4;
+
+// --base-port P wins, then env RETCD_BASE_PORT, then dflt. Throws on a value that is not a port.
+export function basePortFrom(flagValue, dflt) {
+  const fromEnv = flagValue === undefined;
+  const raw = fromEnv ? process.env.RETCD_BASE_PORT : flagValue;
+  if (raw === undefined || raw === '') return dflt;
+  const v = Number(raw);
+  if (!/^\d+$/.test(raw) || v < 1 || v > 65000) {
+    throw new Error(`${fromEnv ? 'RETCD_BASE_PORT' : '--base-port'} must be a port number, got "${raw}"`);
+  }
+  return v;
+}
+
+const basePortOrDie = (flags) => {
+  try {
+    return basePortFrom(flags['base-port'], DEFAULT_BASE_PORT);
+  } catch (err) {
+    return die(err.message);
+  }
+};
 
 export const COMMON_FLAGS = ['base-port', 'nodes', 'node', 'addr'];
 
 // Node list from flags: --addr H:P pins one address; else --nodes N (default 3) at --base-port.
 export function nodeList(flags) {
   if (flags.addr) return [flags.addr];
-  const base = num(flags, 'base-port', Number(process.env.RETCD_BASE_PORT ?? DEFAULT_BASE_PORT));
+  const base = basePortOrDie(flags);
   const count = num(flags, 'nodes', 3);
   const list = [];
   for (let n = 1; n <= count; n++) list.push(`127.0.0.1:${clientPort(base, n)}`);
@@ -77,7 +100,7 @@ export function nodeList(flags) {
 }
 
 export async function health(flags, n) {
-  const base = num(flags, 'base-port', Number(process.env.RETCD_BASE_PORT ?? DEFAULT_BASE_PORT));
+  const base = basePortOrDie(flags);
   try {
     const r = await fetch(`http://127.0.0.1:${healthPort(base, n)}/health`, { signal: AbortSignal.timeout(1500) });
     return await r.json();
