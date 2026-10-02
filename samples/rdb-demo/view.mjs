@@ -73,7 +73,7 @@ let body = '';
 let gridRow = 1; // row 1 holds the lane headings; each item gets its own row
 for (const item of items) {
   gridRow += 1;
-  const tick = `<div class="tick" style="grid-column:1;grid-row:${gridRow}">t${esc(item.tick)}</div>`;
+  const tick = `<div class="tick" style="grid-column:1;grid-row:${gridRow}"><span class="sr">tick </span>t${esc(item.tick)}</div>`;
   const cls = `m-${esc(item.module)}`;
   if (item.node === null || !colOf.has(item.node)) {
     body += `${tick}<div class="cell band ${cls}" style="grid-column:2 / ${nodes.length + 2};grid-row:${gridRow}"><b>${esc(MODULE_LABEL[item.module] ?? item.module)}</b> ${esc(item.text)}</div>`;
@@ -83,7 +83,7 @@ for (const item of items) {
   const boot = item.boot !== undefined ? `<span class="boot">boot ${esc(item.boot)}</span>` : '';
   const mark = item.marker === 'crash' ? '<span class="mk crash" title="crash">&#10005;</span>' : item.marker === 'restart' ? '<span class="mk restart" title="restart">&#8635;</span>' : '';
   const kind = item.type === 'trace' ? `<b>${esc(item.module)}</b>` : `<b>${esc(MODULE_LABEL[item.module])}</b>`;
-  body += `${tick}<div class="cell ${cls}${item.marker ? ' ' + item.marker : ''}" style="grid-column:${colOf.get(item.node)};grid-row:${gridRow}">${mark}${kind} ${esc(item.text)}${extra} ${boot}</div>`;
+  body += `${tick}<div class="cell ${cls}${item.marker ? ' ' + item.marker : ''}" style="grid-column:${colOf.get(item.node)};grid-row:${gridRow}"><span class="sr">node ${esc(item.node)}: </span>${mark}${kind} ${esc(item.text)}${extra} ${boot}</div>`;
 }
 
 const legend = presentModules
@@ -113,9 +113,9 @@ const html = `<!doctype html>
 :root {
   color-scheme: light dark;
   --bg: #ffffff; --fg: #1c1f24; --muted: #5b6470; --line: #d6dbe1; --panel: #f5f7fa;
-  --A1: #1f6feb; --P1: #8a4fd6; --F1: #d9480f; --R1: #1a8f5a; --L1: #b7791f; --T1: #c2255c;
+  --A1: #1d69df; --P1: #8a4fd6; --F1: #c5420e; --R1: #177e4f; --L1: #966319; --T1: #c2255c;
   --H1: #6b7280; --M1: #0e7490; --client: #0f766e; --env: #6b7280; --scenario: #475569; --probe: #7c3aed;
-  --crash: #c92a2a; --restart: #2b8a3e; --wired: #2b8a3e; --unavail: #b7791f;
+  --crash: #c92a2a; --restart: #277e38; --wired: #277e38; --unavail: #966319;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -137,6 +137,8 @@ p, li { color: var(--muted); margin: 4px 0; }
 .chip i { font-style: normal; color: var(--muted); }
 .lanes { display: grid; grid-template-columns: 64px repeat(${nodes.length}, minmax(200px, 1fr)); gap: 0 6px; overflow-x: auto; align-items: stretch; }
 .head { grid-row: 1; position: sticky; top: 0; z-index: 1; background: var(--bg); border-bottom: 2px solid var(--line); font-weight: 600; padding: 6px 4px; text-align: center; }
+.cell, .tick { position: relative; }
+.sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .tick { color: var(--muted); font: 12px ui-monospace, Consolas, monospace; padding: 6px 4px 0 0; text-align: right; border-right: 1px solid var(--line); }
 .cell { border-left: 5px solid var(--env); background: var(--panel); margin: 2px 0; padding: 3px 8px; border-radius: 0 4px 4px 0; overflow-wrap: anywhere; font-size: 13px; }
 .cell b { font-size: 11px; letter-spacing: .03em; margin-right: 4px; }

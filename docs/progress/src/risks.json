@@ -1,34 +1,34 @@
 {
   "risks": [
     {
-      "text": "Kernel-b has not started. It holds 148 of the 345 owed M7 rows, so it is the long pole.",
+      "text": "Generated campaign seeds do not lower into the simulator yet. The shared campaign cannot reach full scale.",
       "owner": "lead",
       "severity": "high",
-      "closing": "Start kernel-b once kernel-a phase 2 hands off and its contract asks are answered."
+      "closing": "Lower generated seeds through the bridge. Until then the release gate reports full scale as false."
     },
     {
-      "text": "Kernel-a has 61 of 174 rows. Its reach gate THUMBS UP; phase 2 dev underway.",
+      "text": "Kernel-a and verification still owe rows. The census script lists each owed id.",
       "owner": "lead",
       "severity": "high",
-      "closing": "Phase 2 lands, tester re-gates, then 113 owed rows are staffed and built."
+      "closing": "Run the census script for exact counts. Parked and miscredited rows count as owed until their claim is true."
     },
     {
-      "text": "About 6,200 lines of M7 code are uncommitted in a shared tree. One bad command could lose them.",
+      "text": "M7 code is committed and pushed on the feature branch. Review fixes are still landing on it.",
       "owner": "lead",
-      "severity": "high",
-      "closing": "Commit in reviewed slices once Gautam approves. No agent may stash, reset or clean."
+      "severity": "low",
+      "closing": "Keep fixes in reviewed slices. No agent may stash, reset or clean the shared tree."
     },
     {
-      "text": "The simulator still refuses four kernel-a effect kinds. So a simulated run stops at the first grant.",
+      "text": "Authored recovery-to-write runs work in the simulator. Three delivery seams still refuse by name.",
       "owner": "lead",
       "severity": "medium",
-      "closing": "Ignored, alert and fact effects are now recorded. The rest stay refused by ruling until publication is built."
+      "closing": "The refused seams are node crash restart, recovery requests with no provider, and kernel arms with no consumer. Two environment packages report Unavailable until the seams close."
     },
     {
       "text": "A test name is not its claim. The census counts functions that exist, not what they assert.",
       "owner": "lead",
       "severity": "medium",
-      "closing": "The MISCREDITED list holds such ids as owed until the claim is true on disk. M7A-28 is still on it."
+      "closing": "The MISCREDITED list holds such ids as owed until the claim is true on disk. The census prints that list."
     },
     {
       "text": "The drift check will fail for all four test plans when the contract changes commit.",
@@ -37,28 +37,16 @@
       "closing": "Re-read each plan's section 15 against the contracts, then move its marker. Never move a marker just to pass."
     },
     {
-      "text": "The new purity check script is untracked, but both gate scripts already call it.",
+      "text": "Two of 15 acknowledgement reject reasons have no code that produces them. They are Gap and IncompatibleVersion.",
       "owner": "lead",
-      "severity": "medium",
-      "closing": "The script and both gate script edits land in one commit."
-    },
-    {
-      "text": "Five of seven acknowledgement reject reasons have nothing that produces them.",
-      "owner": "lead",
-      "severity": "medium",
-      "closing": "Kernel-b builds the producers, or the plan marks those cells unreachable."
+      "severity": "low",
+      "closing": "Kernel-b builds the producers, or the plan marks those two cells unreachable."
     },
     {
       "text": "R1 digest ladder is unbounded; memory grows without limit during long runs.",
       "owner": "lead",
       "severity": "high",
       "closing": "R1 must bound the history ladder or discard old digests during runs."
-    },
-    {
-      "text": "I1 ordering assumptions: ConfigChanged must reach L1 before R1; R1 at most one config behind.",
-      "owner": "lead",
-      "severity": "medium",
-      "closing": "Kernel-b test plan section 15 names the assumptions. Verify they hold on commit."
     },
     {
       "text": "Evidence files of several gates were deleted with their exports outside this session.",
@@ -71,6 +59,12 @@
       "owner": "lead",
       "severity": "low",
       "closing": "Build a new cron schedule once M7 resumes. Current refreshes are explicit."
+    },
+    {
+      "text": "At run time, T1, R1, L1, F1, H1 and I1 report Unavailable. Only A1, P1 and M1 report Wired.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Built code is not a Wired capability. T1 is held Unavailable by ruling V-R40; the others flip when their seams close."
     }
   ]
 }

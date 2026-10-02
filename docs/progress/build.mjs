@@ -796,11 +796,12 @@ const PAGE_CSS = `
   .legend-row .chip { font-size: 12px; }
 
   .strip-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; box-shadow: var(--shadow); margin-bottom: 22px; }
-  .strip { display: flex; gap: 4px; }
+  .strip { display: flex; gap: 4px; overflow-x: auto; }
   .strip-seg {
-    flex: 1; text-align: center; padding: 10px 4px; border-radius: 8px; font-weight: 800; font-size: 15px;
+    flex: 1 0 58px; text-align: center; padding: 10px 4px; border-radius: 8px; font-weight: 800; font-size: 15px;
     background: var(--grey-soft); color: var(--muted); border: 1px solid var(--border);
   }
+  .strip-word { display: block; font-size: 12px; font-weight: 600; line-height: 1.3; margin-top: 2px; overflow-wrap: normal; word-break: keep-all; }
   .strip-seg.pass { background: var(--green-soft); color: var(--green); border-color: var(--green); }
   .strip-seg.active { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
   .strip-caption { color: var(--muted); font-size: 14px; margin-top: 10px; }
@@ -930,11 +931,11 @@ function renderStrip(milestones) {
     let glyph = '';
     if (m.chip === 'Done' || m.chip === 'Gate passed') { cls = ' pass'; glyph = ' ✓'; }
     else if (m.chip === 'In progress') { cls = ' active'; glyph = ' ▶'; }
-    return `      <div class="strip-seg${cls}">${esc(m.id)}${glyph}</div>`;
+    return `      <div class="strip-seg${cls}">${esc(m.id)}${glyph}<span class="strip-word">${esc(m.chip)}</span></div>`;
   }).join('\n');
   return `
   <div class="strip-wrap">
-    <div class="strip" aria-label="Milestone strip ${esc(milestones.map((m) => m.id).join(' through '))}">
+    <div class="strip" role="group" tabindex="0" aria-label="Milestone strip ${esc(milestones.map((m) => m.id).join(' through '))}">
 ${segs}
     </div>
     <div class="strip-caption">${passed} of ${total} milestones passed their gate. ${pct}%.</div>

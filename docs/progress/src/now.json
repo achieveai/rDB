@@ -1,5 +1,5 @@
 {
-  "where": "M7 paused at milestone stop point. 292 of 469 rows built. Foundation complete.",
-  "blocked": "Nothing. Gautam reviews progress manually.",
-  "next": "Resume: staff kernel-b L1 slice, then kernel-b R1 recovery slice."
+  "where": "M7 code is committed and pushed. The census lists the rows still owed.",
+  "blocked": "Generated campaign seeds do not lower into the simulator yet.",
+  "next": "Close the owed rows and lower generated seeds, then re-run the release campaign."
 }
