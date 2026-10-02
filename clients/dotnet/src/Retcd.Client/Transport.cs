@@ -87,8 +87,14 @@ internal sealed class Transport : IDisposable
         ch.Dispose();
     }
 
+    /// <summary>Test seam: when set, calls to an endpoint go through this invoker instead of a channel.</summary>
+    internal Func<string, Grpc.Core.CallInvoker>? FakeInvoker { get; set; }
+
+    /// <summary>Test seam: when set, the connect step asks this (endpoint, window) instead of opening a socket. Null = connected.</summary>
+    internal Func<string, TimeSpan, Exception?>? FakeConnect { get; set; }
+
     public Pb.ConfigService.ConfigServiceClient ClientFor(string endpoint) =>
-        new(ChannelFor(endpoint));
+        FakeInvoker is { } fake ? new(fake(endpoint)) : new(ChannelFor(endpoint));
 
     /// <summary>
     /// Open the connection before a call is sent, so "could not connect" (nothing sent) is never confused with
@@ -98,9 +104,10 @@ internal sealed class Transport : IDisposable
     /// </summary>
     public async Task<Exception?> ConnectAsync(string endpoint, DateTime deadlineUtc, TimeSpan limit, CancellationToken ct)
     {
-        var ch = ChannelFor(endpoint);
         var left = deadlineUtc - DateTime.UtcNow;
         if (left <= TimeSpan.Zero) return new TimeoutException("no time left to connect");
+        if (FakeConnect is { } fake) return fake(endpoint, limit);
+        var ch = ChannelFor(endpoint);
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         cts.CancelAfter(left < limit ? left : limit);
         try

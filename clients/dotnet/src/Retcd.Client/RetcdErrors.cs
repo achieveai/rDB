@@ -71,7 +71,9 @@ internal static class RetcdErrors
         PageTokenReason(ex) == "node" && LeaderHint(ex) is not null;
 
     /// <summary>
-    /// The connection could not be made, so nothing was sent. A reset on an open connection is not this.
+    /// The error looks like a failed connect, not a reset on an open connection. Used to move a read or a watch
+    /// on. It is read from the error's contents, so it never licenses resending a write: only the client's own
+    /// connect step does that.
     /// </summary>
     public static bool IsConnectFailure(RpcException ex)
     {
@@ -121,12 +123,9 @@ internal static class RetcdErrors
                 return new RetcdUnavailableException($"{op}: not the leader and no leader hint. Nothing was applied.", ex, ex.StatusCode);
         }
 
-        if (isWrite && !rejected && IsConnectFailure(ex))
-        {
-            return new RetcdUnavailableException($"{op}: cannot connect. Nothing was sent.", ex, ex.StatusCode);
-        }
-
-        // A write whose status the server did not stamp may have been applied (ADR-0015).
+        // A write whose status the server did not stamp may have been applied (ADR-0015). That holds for a connect
+        // error too: Map only sees errors from the call, after the client's own connect step had succeeded, and a
+        // socket error there is no proof the write was not sent.
         if (isWrite && !rejected && ex.StatusCode is StatusCode.Unavailable or StatusCode.Unknown or StatusCode.Internal
                 or StatusCode.Aborted or StatusCode.DataLoss or StatusCode.Cancelled)
         {

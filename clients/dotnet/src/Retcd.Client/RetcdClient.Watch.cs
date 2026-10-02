@@ -72,8 +72,8 @@ public sealed partial class RetcdClient
                 var key = ev.Key.ToStringUtf8();
                 if (re is not null && !re.IsMatch(key)) continue;
                 yield return ev.ChangeCase == Pb.Event.ChangeOneofCase.Put
-                    ? new RetcdEvent(RetcdEventType.Put, key, ev.Put.Value.Memory, ev.Revision)
-                    : new RetcdEvent(RetcdEventType.Delete, key, ReadOnlyMemory<byte>.Empty, ev.Revision);
+                    ? new RetcdEvent(RetcdEventType.Put, key, ev.Put.Value.Memory, ev.Revision) { KeyBytes = ev.Key.Memory }
+                    : new RetcdEvent(RetcdEventType.Delete, key, ReadOnlyMemory<byte>.Empty, ev.Revision) { KeyBytes = ev.Key.Memory };
             }
 
             ct.ThrowIfCancellationRequested();

@@ -37,7 +37,7 @@ public sealed class CasConflictException : RetcdException
     }
 }
 
-/// <summary>A value (or key) is over the server limit. Nothing was sent, or the server refused it.</summary>
+/// <summary>A value (or key) is over the server limit: nothing was sent, or the server refused it.</summary>
 public sealed class ValueTooLargeException : RetcdException
 {
     public long Size { get; }
@@ -45,6 +45,27 @@ public sealed class ValueTooLargeException : RetcdException
 
     public ValueTooLargeException(string what, long size, long limit, Exception? inner = null)
         : base($"{what} is {size} bytes; the limit is {limit} bytes", inner, StatusCode.ResourceExhausted)
+    {
+        Size = size;
+        Limit = limit;
+    }
+}
+
+/// <summary>
+/// A read result is bigger than this client holds in memory: <see cref="RetcdClient.ListDirsAsync"/> past
+/// <see cref="RetcdClient.MaxListDirsBytes"/>. The client stopped partway through the walk; the server refused
+/// nothing and nothing was written. Stream a result this big with <see cref="RetcdClient.ListAsync(string, int, CancellationToken)"/>.
+/// </summary>
+public sealed class ResultTooLargeException : RetcdException
+{
+    /// <summary>Bytes kept when the client stopped.</summary>
+    public long Size { get; }
+
+    /// <summary>The cap.</summary>
+    public long Limit { get; }
+
+    public ResultTooLargeException(string what, long size, long limit)
+        : base($"{what} holds more than {limit} bytes (stopped at {size}); stream it with ListAsync")
     {
         Size = size;
         Limit = limit;

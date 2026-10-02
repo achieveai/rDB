@@ -48,12 +48,28 @@ test('a connection that died after sending is unknown for a write', () => {
   assert.equal(classify(grpcErr(S.UNAVAILABLE, 'Connection dropped')), 'transport');
 });
 
-test('a refused connection is safe: nothing was sent', () => {
-  const err = grpcErr(S.UNAVAILABLE, REFUSED);
+test('a connect failure stamped before sending is safe: nothing was sent', () => {
+  const err = Object.assign(grpcErr(S.UNAVAILABLE, REFUSED), { connectFailed: true });
   assert.equal(classify(err), 'refused');
   const e = mapError(err, { write: true, endpoint: '127.0.0.1:1' });
   assert.ok(e instanceof UnavailableError);
   assert.match(e.message, /Nothing was written/);
+});
+
+test('R1-F001: refusal text without the pre-send stamp is an unknown outcome for a write', () => {
+  const err = grpcErr(S.UNAVAILABLE, REFUSED);
+  const e = mapError(err, { write: true, endpoint: '127.0.0.1:1' });
+  assert.ok(e instanceof UnknownOutcomeError);
+  assert.doesNotMatch(e.message, /Nothing was written/);
+  assert.ok(mapError(err, { write: false }) instanceof UnavailableError, 'a read is just unavailable');
+});
+
+test('R2-F004: a write DEADLINE_EXCEEDED is unknown even when the server stamped it', () => {
+  const stamped = grpcErr(S.DEADLINE_EXCEEDED, 'write timed out after submission', { 'retcd-outcome': 'rejected' });
+  const e = mapError(stamped, { write: true });
+  assert.ok(e instanceof UnknownOutcomeError);
+  assert.doesNotMatch(e.message, /Nothing was written/);
+  assert.ok(mapError(stamped, { write: false }) instanceof UnavailableError, 'a read deadline is still just unavailable');
 });
 
 test('a server rejection (retcd-outcome) is resendable, with or without a leader hint', () => {

@@ -71,6 +71,8 @@ public class ErrorMappingTests
         var ex = Rpc(StatusCode.DeadlineExceeded, rejected: false);
         Assert.IsType<UnknownOutcomeException>(RetcdErrors.Map(ex, "put", isWrite: true));
         Assert.IsType<RetcdUnavailableException>(RetcdErrors.Map(ex, "get", isWrite: false));
+        // The server stamps a write deadline it hit after handing the write to Raft: still unknown (PR #1 R2-F004).
+        Assert.IsType<UnknownOutcomeException>(RetcdErrors.Map(Rpc(StatusCode.DeadlineExceeded, rejected: true), "put", isWrite: true));
     }
 
     [Fact]
@@ -84,12 +86,15 @@ public class ErrorMappingTests
     }
 
     [Fact]
-    public void Refused_connection_means_nothing_was_sent()
+    public void A_refused_connection_seen_from_the_call_is_no_proof_a_write_was_not_sent()
     {
+        // It still reads as a connect failure (a read or watch moves on), but Map only sees errors from the call,
+        // after the client's own connect step succeeded, so a write's outcome is unknown (PR #1 R1-F001).
         var refused = new HttpRequestException("refused", new SocketException((int)SocketError.ConnectionRefused));
         var ex = Rpc(StatusCode.Unavailable, "Error connecting to subchannel.", rejected: false, debug: refused);
         Assert.True(RetcdErrors.IsConnectFailure(ex));
-        Assert.IsType<RetcdUnavailableException>(RetcdErrors.Map(ex, "put", isWrite: true));
+        Assert.IsType<UnknownOutcomeException>(RetcdErrors.Map(ex, "put", isWrite: true));
+        Assert.IsType<RetcdUnavailableException>(RetcdErrors.Map(ex, "get", isWrite: false));
     }
 
     [Fact]

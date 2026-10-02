@@ -35,6 +35,18 @@ export class TooLargeError extends RetcdError {
   }
 }
 
+/**
+ * A read result is bigger than this client holds in memory (listDirs past LIMITS.maxListDirsBytes). Raised by the
+ * client partway through the walk; nothing was written. `size` is the bytes kept when it stopped, `limit` the cap.
+ */
+export class ResultTooLargeError extends RetcdError {
+  constructor(message, { size, limit, ...opts } = {}) {
+    super(message, { code: 'RESULT_TOO_LARGE', ...opts });
+    this.size = size;
+    this.limit = limit;
+  }
+}
+
 /** A write timed out or the connection died after it was sent. It may or may not have been applied. Never auto-retried. */
 export class UnknownOutcomeError extends RetcdError {
   constructor(message, opts) {
@@ -68,7 +80,8 @@ export class IntegrityError extends RetcdError {
 // gRPC -> typed. Rules come from crates/config-grpc/src/error.rs (ADR-0015):
 //   - a status the server minted carries `retcd-outcome: rejected`: it never entered the log.
 //   - a status without it came from the transport. For a write that means "unknown",
-//     EXCEPT a refused connection: nothing was ever sent.
+//     EXCEPT a failed connect step (`connectFailed`): nothing was ever sent.
+//   - a write DEADLINE_EXCEEDED is unknown, stamped or not.
 // ---------------------------------------------------------------------------------------
 const STATUS_NAME = Object.fromEntries(Object.entries(grpc.status).map(([k, v]) => [v, k]));
 const REFUSED = /ECONNREFUSED|No connection established|Connection refused|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN/i;
@@ -150,9 +163,12 @@ export function mapError(err, { write = false, endpoint = '' } = {}) {
     return e;
   }
   // Timeouts, dropped connections, "no leader": what it means depends on read or write.
+  // For a write, only the connect step's own stamp (`connectFailed`, set before anything is sent) proves
+  // nothing was sent; refusal text in an error from the send step does not. A write deadline is unknown
+  // even when the server stamped it: the server can time out after handing the write to Raft.
   const server = metaOf(err, 'retcd-outcome') === 'rejected';
   const name = STATUS_NAME[err.code] ?? err.code;
-  if (write && !server && kind !== 'refused') {
+  if (write && err.connectFailed !== true && (!server || err.code === grpc.status.DEADLINE_EXCEEDED)) {
     return new UnknownOutcomeError(
       `the write may or may not have been applied${where}: ${name}: ${detail}. Read the key to find out; do not blindly retry.`,
       base,

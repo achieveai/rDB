@@ -22,6 +22,12 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     /// <summary>The connect window once every node has missed <see cref="QuickConnect"/> in one call. Same as the socket connect timeout.</summary>
     private static readonly TimeSpan SlowConnect = TimeSpan.FromSeconds(3);
 
+    /// <summary>
+    /// The most key and value bytes <see cref="ListDirsAsync"/> holds before it throws (64 MiB, eight full server
+    /// pages). It counts bytes, not records, because values (up to 1 MiB each) dominate what a caller holds.
+    /// </summary>
+    public const long MaxListDirsBytes = 64L * 1024 * 1024;
+
     private readonly RetcdClientOptions _options;
     private readonly Transport _transport;
     private readonly HttpClient _http;
@@ -44,6 +50,9 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     /// <summary>Test hook: drop the connection to the current node, as a network break would.</summary>
     internal void DropCurrentConnection() => _transport.Drop(_transport.Current);
 
+    /// <summary>Test hook: the transport, to script connects (<see cref="Transport.FakeConnect"/>) and answers (<see cref="Transport.FakeInvoker"/>).</summary>
+    internal Transport TestTransport => _transport;
+
     /// <summary>The node the client is using right now ("http://host:port").</summary>
     public string CurrentEndpoint => _transport.Current;
 
@@ -64,11 +73,23 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     // ------------------------------------------------------------------------------------
 
     /// <summary>Read one key from the leader. Null when it does not exist.</summary>
-    public async Task<RetcdRecord?> GetAsync(string key, CancellationToken ct = default)
+    public Task<RetcdRecord?> GetAsync(string key, CancellationToken ct = default)
     {
         CheckKey(key);
+        return GetAsync(Bytes(key), ct);
+    }
+
+    /// <summary>
+    /// Read one key given as exact bytes, such as a <see cref="RetcdRecord.KeyBytes"/> from a list or watch.
+    /// Use this for keys that are not valid UTF-8. Null when it does not exist.
+    /// </summary>
+    public Task<RetcdRecord?> GetAsync(ReadOnlyMemory<byte> key, CancellationToken ct = default) =>
+        GetAsync(CheckKey(key), ct);
+
+    private async Task<RetcdRecord?> GetAsync(ByteString key, CancellationToken ct)
+    {
         var r = await UnaryAsync("get", isWrite: false, 0,
-            (c, o) => c.GetAsync(new Pb.GetRequest { Key = Bytes(key) }, o), ct).ConfigureAwait(false);
+            (c, o) => c.GetAsync(new Pb.GetRequest { Key = key }, o), ct).ConfigureAwait(false);
         return r.Record is null ? null : ToRecord(r.Record);
     }
 
@@ -80,11 +101,20 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
         => PutAsync(key, new ReadOnlyMemory<byte>(Encoding.UTF8.GetBytes(value)), ifRevision, ct);
 
     /// <inheritdoc cref="PutAsync(string, string, ulong?, CancellationToken)"/>
-    public async Task<ulong> PutAsync(string key, ReadOnlyMemory<byte> value, ulong? ifRevision = null, CancellationToken ct = default)
+    public Task<ulong> PutAsync(string key, ReadOnlyMemory<byte> value, ulong? ifRevision = null, CancellationToken ct = default)
     {
         CheckKey(key);
+        return PutAsync(Bytes(key), value, ifRevision, ct);
+    }
+
+    /// <summary>Write a value under a key given as exact bytes (see <see cref="RetcdRecord.KeyBytes"/>). Otherwise as the string overloads.</summary>
+    public Task<ulong> PutAsync(ReadOnlyMemory<byte> key, ReadOnlyMemory<byte> value, ulong? ifRevision = null, CancellationToken ct = default) =>
+        PutAsync(CheckKey(key), value, ifRevision, ct);
+
+    private async Task<ulong> PutAsync(ByteString key, ReadOnlyMemory<byte> value, ulong? ifRevision, CancellationToken ct)
+    {
         if (value.Length > Limits.MaxValueBytes) throw new ValueTooLargeException("value", value.Length, Limits.MaxValueBytes);
-        var req = new Pb.PutRequest { Key = Bytes(key), Value = UnsafeByteOperations.UnsafeWrap(value) };
+        var req = new Pb.PutRequest { Key = key, Value = UnsafeByteOperations.UnsafeWrap(value) };
         if (ifRevision is { } rev) req.ExpectedModRevision = rev;
         var r = await UnaryAsync("put", isWrite: true, value.Length,
             (c, o) => c.PutAsync(req, o), ct).ConfigureAwait(false);
@@ -100,10 +130,19 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     /// Delete a key. True if it was deleted, false if it did not exist.
     /// With <paramref name="ifRevision"/> it only deletes if the key is at that revision, else throws <see cref="CasConflictException"/>.
     /// </summary>
-    public async Task<bool> DeleteAsync(string key, ulong? ifRevision = null, CancellationToken ct = default)
+    public Task<bool> DeleteAsync(string key, ulong? ifRevision = null, CancellationToken ct = default)
     {
         CheckKey(key);
-        var req = new Pb.DeleteRequest { Key = Bytes(key) };
+        return DeleteAsync(Bytes(key), ifRevision, ct);
+    }
+
+    /// <summary>Delete a key given as exact bytes (see <see cref="RetcdRecord.KeyBytes"/>). Otherwise as the string overload.</summary>
+    public Task<bool> DeleteAsync(ReadOnlyMemory<byte> key, ulong? ifRevision = null, CancellationToken ct = default) =>
+        DeleteAsync(CheckKey(key), ifRevision, ct);
+
+    private async Task<bool> DeleteAsync(ByteString key, ulong? ifRevision, CancellationToken ct)
+    {
+        var req = new Pb.DeleteRequest { Key = key };
         if (ifRevision is { } rev) req.ExpectedModRevision = rev;
         var r = await UnaryAsync("delete", isWrite: true, 0,
             (c, o) => c.DeleteAsync(req, o), ct).ConfigureAwait(false);
@@ -131,7 +170,7 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     {
         var prefix = RetcdGlob.LiteralPrefix(patternOrPrefix);
         var re = RetcdGlob.HasGlob(patternOrPrefix) ? RetcdGlob.ToRegex(patternOrPrefix) : null;
-        await foreach (var page in PagesAsync(prefix, pageSize, ct).ConfigureAwait(false))
+        await foreach (var page in PagesAsync(Bytes(prefix), pageSize, ct).ConfigureAwait(false))
         {
             foreach (var rec in page.Records)
             {
@@ -142,8 +181,23 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Like <see cref="ListAsync"/>, but also returns one <see cref="RetcdDir"/> per matching sub-folder
-    /// (only when the pattern has no "**"). A plain prefix is treated as a folder: "docs" means "docs/*".
+    /// List every key that starts with these exact bytes. Never a pattern. Use it for keys that are not valid
+    /// UTF-8; each record's <see cref="RetcdRecord.KeyBytes"/> addresses it again. Paged and pinned as above.
+    /// </summary>
+    public async IAsyncEnumerable<RetcdRecord> ListAsync(
+        ReadOnlyMemory<byte> prefix, int pageSize = 500, [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        await foreach (var page in PagesAsync(ByteString.CopyFrom(prefix.Span), pageSize, ct).ConfigureAwait(false))
+        {
+            foreach (var rec in page.Records) yield return ToRecord(rec);
+        }
+    }
+
+    /// <summary>
+    /// Like <see cref="ListAsync(string, int, CancellationToken)"/>, but also returns one <see cref="RetcdDir"/> per
+    /// matching sub-folder (only when the pattern has no "**"). A plain prefix is treated as a folder: "docs" means "docs/*".
+    /// The whole listing is held in memory, so it throws <see cref="ResultTooLargeException"/> once the keys and values
+    /// it keeps pass <see cref="MaxListDirsBytes"/>. Walk a folder that big with ListAsync, which streams.
     /// </summary>
     public async Task<RetcdDirListing> ListDirsAsync(string pattern, int pageSize = 500, CancellationToken ct = default)
     {
@@ -153,12 +207,25 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
         var files = new List<RetcdRecord>();
         var dirs = new Dictionary<string, int>();
         var dirOrder = new List<string>();
-        await foreach (var page in PagesAsync(RetcdGlob.LiteralPrefix(pattern), pageSize, ct).ConfigureAwait(false))
+        long kept = 0; // key and value bytes held in files and dirs
+        void Keep(long bytes)
+        {
+            kept += bytes;
+            if (kept > MaxListDirsBytes)
+            {
+                throw new ResultTooLargeException($"ListDirsAsync(\"{pattern}\")", kept, MaxListDirsBytes);
+            }
+        }
+        await foreach (var page in PagesAsync(Bytes(RetcdGlob.LiteralPrefix(pattern)), pageSize, ct).ConfigureAwait(false))
         {
             foreach (var rec in page.Records)
             {
                 var r = ToRecord(rec);
-                if (re.IsMatch(r.Key)) files.Add(r);
+                if (re.IsMatch(r.Key))
+                {
+                    Keep(rec.Key.Length + rec.Value.Length);
+                    files.Add(r);
+                }
                 if (!wantDirs) continue;
                 for (var i = r.Key.IndexOf('/'); i != -1; i = r.Key.IndexOf('/', i + 1))
                 {
@@ -168,6 +235,7 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
                     if (dirs.TryGetValue(path, out var n)) dirs[path] = n + 1;
                     else
                     {
+                        Keep(Encoding.UTF8.GetByteCount(path));
                         dirs[path] = 1;
                         dirOrder.Add(path);
                     }
@@ -182,7 +250,7 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     {
         var all = new List<RetcdRecord>();
         ulong readRev = 0;
-        await foreach (var page in PagesAsync(prefix, 500, ct).ConfigureAwait(false))
+        await foreach (var page in PagesAsync(Bytes(prefix), 500, ct).ConfigureAwait(false))
         {
             readRev = page.ReadRevision; // every page of a pinned walk reports the same revision
             foreach (var rec in page.Records) all.Add(ToRecord(rec));
@@ -191,17 +259,17 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
     }
 
     private async IAsyncEnumerable<Pb.ListResponse> PagesAsync(
-        string prefix, int pageSize, [EnumeratorCancellation] CancellationToken ct)
+        ByteString prefix, int pageSize, [EnumeratorCancellation] CancellationToken ct)
     {
         if (pageSize < 1 || pageSize > Limits.MaxListItems)
         {
             throw new ArgumentOutOfRangeException(nameof(pageSize), $"pageSize must be 1..{Limits.MaxListItems}");
         }
-        if (Encoding.UTF8.GetByteCount(prefix) > Limits.MaxKeyBytes) throw new ArgumentException("prefix is longer than a key can be", nameof(prefix));
+        if (prefix.Length > Limits.MaxKeyBytes) throw new ArgumentException("prefix is longer than a key can be", nameof(prefix));
         var token = ByteString.Empty; // present but empty: start a pinned walk
         for (;;)
         {
-            var req = new Pb.ListRequest { Prefix = Bytes(prefix), MaxItems = (uint)pageSize, PageToken = token };
+            var req = new Pb.ListRequest { Prefix = prefix, MaxItems = (uint)pageSize, PageToken = token };
             var resp = await UnaryAsync("list", isWrite: false, 0, (c, o) => c.ListAsync(req, o), ct,
                 followForeignPageToken: true).ConfigureAwait(false);
             yield return resp;
@@ -284,8 +352,9 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
 
     private static ByteString Bytes(string s) => ByteString.CopyFromUtf8(s);
 
+    // Key is the UTF-8 rendering (lossy for keys that are not valid UTF-8); KeyBytes keeps the exact key.
     private static RetcdRecord ToRecord(Pb.Record r) =>
-        new(r.Key.ToStringUtf8(), r.Value.Memory, r.CreateRevision, r.ModRevision);
+        new(r.Key.ToStringUtf8(), r.Value.Memory, r.CreateRevision, r.ModRevision) { KeyBytes = r.Key.Memory };
 
     private static void CheckKey(string key)
     {
@@ -295,13 +364,21 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
         if (n > Limits.MaxKeyBytes) throw new ArgumentException($"key is {n} bytes; the server limit is {Limits.MaxKeyBytes}", nameof(key));
     }
 
+    private static ByteString CheckKey(ReadOnlyMemory<byte> key)
+    {
+        if (key.Length == 0) throw new ArgumentException("key is empty", nameof(key));
+        if (key.Length > Limits.MaxKeyBytes) throw new ArgumentException($"key is {key.Length} bytes; the server limit is {Limits.MaxKeyBytes}", nameof(key));
+        return ByteString.CopyFrom(key.Span);
+    }
+
     private static Task Pause(int ms, CancellationToken ct) => Task.Delay(ms, ct);
 
     /// <summary>
     /// One logical call. Follows "not the leader" and waits out "no leader yet" (both refused before the log, so
-    /// nothing was applied), and moves on from a node that refuses the connection (nothing was sent). All of that
-    /// stays inside <see cref="RetcdClientOptions.Timeout"/>. Everything else is mapped and thrown. A write is never
-    /// re-sent after it may have reached a node.
+    /// nothing was applied), and moves on from a node the connect step could not reach (nothing was sent) or that
+    /// drops a read.
+    /// All of that stays inside <see cref="RetcdClientOptions.Timeout"/>. Everything else is mapped and thrown. A write
+    /// is never re-sent after it may have reached a node.
     /// </summary>
     internal async Task<T> UnaryAsync<T>(
         string op, bool isWrite, long valueSize,
@@ -312,14 +389,25 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
         string? lastNote = null;
         var hops = 0;
         var slowToConnect = new HashSet<string>(); // nodes that missed the quick connect window in this call
+        RetcdUnavailableException GiveUp() => new(
+            $"{op}: no node could take the call within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no attempt made"}). Nothing was applied.");
+        // A pause never runs past the deadline. One that would reach it waits out what is left and ends the call,
+        // since no attempt could follow it: the call gives up at Timeout, not up to 200 ms after.
+        async Task PauseWithin(int ms)
+        {
+            var left = deadline - DateTime.UtcNow;
+            if (left > TimeSpan.FromMilliseconds(ms))
+            {
+                await Pause(ms, ct).ConfigureAwait(false);
+                return;
+            }
+            if (left > TimeSpan.Zero) await Task.Delay(left, ct).ConfigureAwait(false);
+            throw GiveUp();
+        }
         for (;;)
         {
             ct.ThrowIfCancellationRequested();
-            if (DateTime.UtcNow >= deadline)
-            {
-                throw new RetcdUnavailableException(
-                    $"{op}: no node could take the call within {_options.Timeout.TotalSeconds:0.#} s ({lastNote ?? "no attempt made"}). Nothing was applied.");
-            }
+            if (DateTime.UtcNow >= deadline) throw GiveUp();
             var endpoint = _transport.Current;
             // Quick window first, so a dead node costs QuickConnect and not the whole budget. Once every known
             // node has missed it, allow the longer window: they may all just be slow (a remote or loaded host).
@@ -332,7 +420,7 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
                 slowToConnect.Add(endpoint);
                 _transport.Drop(endpoint);
                 _transport.Rotate();
-                await Pause(quick ? 0 : 100, ct).ConfigureAwait(false);
+                await PauseWithin(quick ? 0 : 100).ConfigureAwait(false);
                 continue;
             }
             try
@@ -351,21 +439,33 @@ public sealed partial class RetcdClient : IAsyncDisposable, IDisposable
                     if (hint is not null && _transport.Normalize(hint) != endpoint)
                     {
                         _transport.Use(hint);
-                        if (++hops > 2) await Pause(200, ct).ConfigureAwait(false);
+                        if (++hops > 2) await PauseWithin(200).ConfigureAwait(false);
                     }
                     else
                     {
-                        await Pause(200, ct).ConfigureAwait(false); // election in progress
+                        await PauseWithin(200).ConfigureAwait(false); // election in progress
                         if (hint is null) _transport.Rotate();
                     }
                     continue;
                 }
-                if (RetcdErrors.IsConnectFailure(ex))
+                // Only the connect step above proves nothing was sent. A connect error that surfaces from the call
+                // itself is no such proof for a write, so a write falls through and is mapped as unknown.
+                if (!isWrite && RetcdErrors.IsConnectFailure(ex))
                 {
                     lastNote = $"cannot connect to {endpoint}";
                     _transport.Drop(endpoint);
                     _transport.Rotate();
-                    await Pause(100, ct).ConfigureAwait(false);
+                    await PauseWithin(100).ConfigureAwait(false);
+                    continue;
+                }
+                // The transport lost the call after sending (the node died or the connection reset). A read changes
+                // nothing, so it goes to the next node. A write's outcome is unknown, so it falls through and is mapped.
+                if (!isWrite && ex.StatusCode == StatusCode.Unavailable && !RetcdErrors.IsServerRejection(ex))
+                {
+                    lastNote = $"{endpoint} dropped the call: {ex.Status.Detail}";
+                    _transport.Drop(endpoint);
+                    _transport.Rotate();
+                    await PauseWithin(100).ConfigureAwait(false);
                     continue;
                 }
                 throw RetcdErrors.Map(ex, op, isWrite, valueSize);

@@ -9,6 +9,7 @@ import {
   NotFoundError,
   RetcdClient,
   RetcdError,
+  ResultTooLargeError,
   UnknownOutcomeError,
   globToRegExp,
   hasGlob,
@@ -31,6 +32,22 @@ export async function typesCheck(): Promise<void> {
   await c.put(Buffer.from('k'), new Uint8Array([1, 2]), { ifRevision: '3' });
   const rec: RetcdRecord | null = await c.get('k');
   const value: Buffer | undefined = rec?.value;
+  // keyBytes is the exact key; it round-trips into get/put/delete, and list takes a byte prefix.
+  const keyBytes: Buffer | undefined = rec?.keyBytes;
+  if (keyBytes) await c.get(keyBytes);
+  for await (const r of c.list(Buffer.from([0x80]))) void r.keyBytes;
+  const dirsLimit: number = LIMITS.maxListDirsBytes;
+  void dirsLimit;
+  try {
+    await c.listDirs('big');
+  } catch (err) {
+    if (err instanceof ResultTooLargeError) {
+      const kept: number = err.size;
+      const cap: number = err.limit;
+      void kept;
+      void cap;
+    }
+  }
 
   // delete resolves a boolean: true deleted, false missing.
   const deleted: boolean = await c.delete('k', { ifRevision: put.revision });
@@ -49,7 +66,9 @@ export async function typesCheck(): Promise<void> {
   for await (const e of c.watch('app/', { fromRevision: readRevision ?? 0, signal: ac.signal, progress: true, giveUpAfterMs: 0 })) {
     const ev: WatchEvent = e;
     const kind: 'put' | 'delete' | 'progress' = ev.type;
+    const evKey: Buffer = ev.keyBytes;
     void kind;
+    void evKey;
   }
 
   const file = await c.putFile('./a.bin', 'files/a.bin');

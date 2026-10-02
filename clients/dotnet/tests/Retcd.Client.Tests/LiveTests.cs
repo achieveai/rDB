@@ -272,10 +272,7 @@ public class LiveTests
     {
         // Nothing listens on the first endpoint. The client must give up on it quickly and move on;
         // a write is safe to send elsewhere because the dead node never received it.
-        var probe = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-        probe.Start();
-        var dead = $"127.0.0.1:{((System.Net.IPEndPoint)probe.LocalEndpoint).Port}";
-        probe.Stop();
+        var dead = $"127.0.0.1:{TestPorts.FreeClosedPort()}";
         var endpoints = new[] { dead }.Concat(Live.Endpoints!).ToArray();
         var p = Live.Prefix();
         RetcdClient Fresh() => RetcdClient.Create(new RetcdClientOptions { Endpoints = endpoints, Timeout = TimeSpan.FromSeconds(10) });

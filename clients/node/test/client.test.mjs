@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import grpc from '@grpc/grpc-js';
-import { CasConflictError, RetcdClient, TooLargeError, UnavailableError, UnknownOutcomeError } from '../src/index.mjs';
+import {
+  CasConflictError, LIMITS, ResultTooLargeError, RetcdClient, RetcdError, TooLargeError, UnavailableError, UnknownOutcomeError,
+} from '../src/index.mjs';
 
 const S = grpc.status;
 const A = '10.0.0.1:1';
@@ -57,7 +59,7 @@ test('a leader we were never given is added to the node list', async () => {
 
 test('a refused connection moves on to the next node, for a write too', async () => {
   const { client, attempts } = fake((addr) => {
-    if (addr === A) throw refused();
+    if (addr === A) throw notConnected(addr); // only the connect step's stamp makes a write safe to resend
     return { outcome: 'APPLIED', revision: '2' };
   });
   assert.deepEqual(await client.put('k', 'v'), { revision: 2 });
@@ -104,8 +106,8 @@ test('a read that timed out is retried on another node', async () => {
 });
 
 test('when no node answers in time: UnavailableError (and a write says nothing was written)', async () => {
-  const { client } = fake(() => {
-    throw refused();
+  const { client } = fake((addr) => {
+    throw notConnected(addr);
   }, { failoverMs: 400 });
   await assert.rejects(client.put('k', 'v'), (e) => e instanceof UnavailableError && /Nothing was written/.test(e.message));
   await assert.rejects(client.get('k'), UnavailableError);
@@ -168,12 +170,13 @@ test('a dead first node costs one quick connect window, and a write goes to the 
 });
 
 test('once every node misses the quick window, the call waits longer for each', async () => {
+  // failoverMs above the windows: a connect window is also clipped to what is left of the call's budget.
   const { client, log } = staged({
     ready: (addr, ms) => {
       if (ms < 3000) throw notConnected(addr);
     },
     send: () => ({ record: null, read_revision: '1' }),
-  });
+  }, { failoverMs: 20_000 });
   assert.equal(await client.get('k'), null);
   assert.deepEqual(log, [`connect ${A} 400`, `connect ${B} 400`, `connect ${C} 400`, `connect ${A} 3000`, `send ${A} Get`]);
 });
@@ -468,4 +471,262 @@ test('connect() fails loudly when nothing is listening', async () => {
 test('connect() needs endpoints, and a missing proto file says how to fix it', () => {
   assert.throws(() => new RetcdClient({ endpoints: [] }), { code: 'INVALID_ARGUMENT' });
   assert.throws(() => new RetcdClient({ endpoints: [A], protoPath: '/no/such/config.proto' }), { code: 'PROTO_NOT_FOUND', message: /RETCD_PROTO/ });
+});
+
+// ---- PR #1 review rows -----------------------------------------------------------------------
+
+test('R1-F001: refusal text from the send step is not proof nothing was sent: one send, UnknownOutcomeError', async () => {
+  const { client, log } = staged({ ready: () => {}, send: () => Promise.reject(refused()) });
+  await assert.rejects(client.put('k', 'v'), (e) => e instanceof UnknownOutcomeError && !/Nothing was written/.test(e.message));
+  assert.deepEqual(log, [`connect ${A} 400`, `send ${A} Put`], 'exactly one send, no failover');
+  // A real connect failure (stamped by _ready) still fails over, for a write too.
+  const real = staged({
+    ready: (addr) => {
+      if (addr === A) throw notConnected(addr);
+    },
+    send: () => ({ outcome: 'APPLIED', revision: '6' }),
+  });
+  assert.deepEqual(await real.client.put('k', 'v'), { revision: 6 });
+  assert.deepEqual(real.log, [`connect ${A} 400`, `connect ${B} 400`, `send ${B} Put`]);
+  // A read with the same refusal text still moves on.
+  const read = staged({ ready: () => {}, send: (addr) => (addr === A ? Promise.reject(refused()) : { record: null, read_revision: '1' }) });
+  assert.equal(await read.client.get('k'), null);
+  assert.deepEqual(read.log, [`connect ${A} 400`, `send ${A} Get`, `connect ${B} 400`, `send ${B} Get`]);
+});
+
+test('R1-F004: an https:// (or any non-http) endpoint is refused at construction, before any channel', async () => {
+  const realInsecure = grpc.credentials.createInsecure;
+  let insecure = 0;
+  grpc.credentials.createInsecure = (...a) => {
+    insecure++;
+    return realInsecure(...a);
+  };
+  try {
+    for (const ep of ['https://127.0.0.1:1', 'HTTPS://127.0.0.1:1', 'grpcs://127.0.0.1:1', 'dns:///127.0.0.1:1']) {
+      assert.throws(() => new RetcdClient({ endpoints: [ep] }), { code: 'INVALID_ARGUMENT', message: /not supported/ }, ep);
+      await assert.rejects(RetcdClient.connect({ endpoints: [A, ep], failoverMs: 300 }), { code: 'INVALID_ARGUMENT' }, ep);
+    }
+    assert.equal(insecure, 0, 'no plaintext channel was opened');
+  } finally {
+    grpc.credentials.createInsecure = realInsecure;
+  }
+  // No scheme and http:// are both plaintext by name, and still accepted.
+  const ok = new RetcdClient({ endpoints: ['http://10.0.0.9:1/', ' 10.0.0.8:1 '] });
+  assert.equal(ok.endpoint, '10.0.0.9:1');
+});
+
+test('R2-F004: a server-stamped write DEADLINE_EXCEEDED is an unknown outcome, never "Nothing was written", never resent', async () => {
+  const { client, attempts } = fake(() => {
+    throw grpcErr(S.DEADLINE_EXCEEDED, 'write timed out after submission', { 'retcd-outcome': 'rejected' });
+  });
+  await assert.rejects(client.put('k', 'v'), (e) => e instanceof UnknownOutcomeError && !/Nothing was written/.test(e.message));
+  await assert.rejects(client.delete('k'), UnknownOutcomeError);
+  assert.equal(attempts.length, 2, 'one attempt per call');
+});
+
+// A node that answers `first` once (if given), then holds every call until the gRPC deadline the client set.
+function stallingNode(client, first) {
+  const deadlines = [];
+  let calls = 0;
+  client._ready = async () => {};
+  client._svc = () =>
+    new Proxy(
+      {},
+      {
+        get: () => (req, opts, cb) => {
+          deadlines.push(Number(opts.deadline) - Date.now());
+          if (calls++ === 0 && first) return setImmediate(() => cb(first()));
+          setTimeout(() => cb(grpcErr(S.DEADLINE_EXCEEDED, 'Deadline exceeded')), Math.max(0, Number(opts.deadline) - Date.now()));
+        },
+      },
+    );
+  return deadlines;
+}
+
+test('R2-F005: a stalled attempt cannot outlive failoverMs, even after an earlier retryable failure', async () => {
+  const noLeader = () => grpcErr(S.UNAVAILABLE, 'no leader', { 'retcd-outcome': 'rejected' });
+  for (const [what, call, Err] of [
+    ['write', (c) => c.put('k', 'v'), UnknownOutcomeError],
+    ['read', (c) => c.get('k'), UnavailableError],
+  ]) {
+    const client = new RetcdClient({ endpoints: [A, B], timeoutMs: 10_000, failoverMs: 600 });
+    const deadlines = stallingNode(client, noLeader);
+    const started = Date.now();
+    await assert.rejects(call(client), Err, what);
+    const took = Date.now() - started;
+    assert.ok(took < 1200, `${what}: took ${took} ms against a 600 ms budget`);
+    assert.ok(deadlines.length >= 2, `${what}: retried after the first refusal`);
+    assert.ok(deadlines.every((d) => d <= 600), `${what}: every attempt deadline fits the budget: ${deadlines}`);
+  }
+});
+
+// An in-memory node keyed by exact bytes: Get, Put, Delete, List (paged).
+function memoryNode() {
+  const kv = new Map(); // hex(key) -> record
+  let rev = 0;
+  const sorted = () => [...kv.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, r]) => r);
+  return {
+    kv,
+    script: (addr, method, req) => {
+      const hex = req.key?.toString('hex');
+      if (method === 'Get') return { record: kv.get(hex) ?? null, read_revision: String(rev) };
+      if (method === 'Put') {
+        rev++;
+        const old = kv.get(hex);
+        kv.set(hex, { key: Buffer.from(req.key), value: Buffer.from(req.value), create_revision: old?.create_revision ?? String(rev), mod_revision: String(rev) });
+        return { outcome: 'APPLIED', revision: String(rev) };
+      }
+      if (method === 'Delete') {
+        if (!kv.delete(hex)) return { outcome: 'NOT_FOUND' };
+        return { outcome: 'APPLIED', revision: String(++rev) };
+      }
+      if (method === 'List') {
+        const after = req.page_token.length ? req.page_token.toString('hex') : '';
+        const all = sorted().filter((r) => r.key.subarray(0, req.prefix.length).equals(req.prefix) && r.key.toString('hex') > after);
+        const page = all.slice(0, req.max_items);
+        const more = all.length > page.length;
+        return { records: page, read_revision: String(rev), truncated: false, next_page_token: more ? page.at(-1).key : Buffer.alloc(0) };
+      }
+      throw new Error(`unexpected ${method}`);
+    },
+  };
+}
+
+test('R2-F006: two non-UTF-8 keys stay distinct: keyBytes round-trips into get, put, delete and list', async () => {
+  const node = memoryNode();
+  const { client } = fake(node.script);
+  await client.put(Buffer.from([0x80]), 'eighty');
+  await client.put(Buffer.from([0x81]), 'eighty-one');
+  const under80 = [];
+  for await (const r of client.list(Buffer.from([0x80]))) under80.push(r);
+  assert.deepEqual(under80.map((r) => [...r.keyBytes]), [[0x80]], 'a byte prefix lists only its own keys');
+  const all = [];
+  for await (const r of client.list('')) all.push(r);
+  assert.equal(all.length, 2);
+  assert.equal(all[0].key, all[1].key, 'the string form is lossy: both are U+FFFD');
+  assert.deepEqual(all.map((r) => [...r.keyBytes]), [[0x80], [0x81]], 'keyBytes are exact and distinct');
+  for (const r of all) assert.ok(Buffer.isBuffer(r.keyBytes));
+  // Each record is addressed again by its returned bytes.
+  assert.equal((await client.get(all[0].keyBytes)).value.toString(), 'eighty');
+  assert.equal((await client.get(all[1].keyBytes)).value.toString(), 'eighty-one');
+  assert.deepEqual([...(await client.get(all[1].keyBytes)).keyBytes], [0x81]);
+  await client.put(all[0].keyBytes, 'changed', { ifRevision: all[0].modRevision });
+  assert.equal(await client.delete(all[1].keyBytes), true);
+  assert.deepEqual([...node.kv.keys()], ['80'], 'the delete hit 0x81 only, and nothing landed at EF BF BD');
+  assert.equal(node.kv.get('80').value.toString(), 'changed');
+});
+
+test('R2-F006: watch events carry keyBytes', async () => {
+  const { client } = fake(() => ({ read_revision: '4' }));
+  client._svc = () => ({ Watch: () => stream([putMsg(5, 'w/a'), { body: 'event', event: { revision: '6', key: Buffer.from([0x81]), change: 'delete', delete: {} } }]) });
+  const got = [];
+  for await (const ev of client.watch('', { fromRevision: 4 })) {
+    got.push(ev);
+    if (got.length === 2) break;
+  }
+  assert.deepEqual(got.map((e) => [...e.keyBytes]), [[...Buffer.from('w/a')], [0x81]]);
+});
+
+test('R2-F014: listDirs stops at its byte limit across pages and points at list(); a small folder is unchanged', async () => {
+  const MiB = Buffer.alloc(1024 * 1024); // one buffer shared by every record: the fake itself stays small
+  let pages = 0;
+  const { client } = fake((a, m, req) => {
+    if (++pages > 20) throw new Error('walked far past the limit');
+    const start = req.page_token.length ? Number(req.page_token.toString()) : 0;
+    const records = Array.from({ length: 10 }, (_, i) => ({ key: Buffer.from(`big/f${String(start + i).padStart(4, '0')}`), value: MiB, create_revision: '1', mod_revision: '1' }));
+    return { records, read_revision: '1', truncated: false, next_page_token: Buffer.from(String(start + 10)) }; // never ends by itself
+  });
+  await assert.rejects(client.listDirs('big', { pageSize: 10 }), (e) => e.code === 'RESULT_TOO_LARGE' && e.limit === LIMITS.maxListDirsBytes && /list\(\)/.test(e.message));
+  assert.equal(pages, 7, 'stopped on the page that crossed 64 MiB, not after the walk');
+  assert.equal(LIMITS.maxListDirsBytes, 64 * 1024 * 1024);
+});
+
+// ---- Round 1: pauses inside the budget, and the rows the tester's surviving mutants showed were missing ----
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const noLeaderYet = () => grpcErr(S.UNAVAILABLE, 'no leader', { 'retcd-outcome': 'rejected' });
+
+test('R2-F005: a pause that would end past failoverMs ends the call at once; it never returns late', async () => {
+  // No leader yet: the 300 ms pause does not fit a 100 ms budget.
+  const one = new RetcdClient({ endpoints: [A], timeoutMs: 10_000, failoverMs: 100 });
+  let sends = 0;
+  one._ready = async () => {};
+  one._send = async () => {
+    sends++;
+    throw noLeaderYet();
+  };
+  let started = Date.now();
+  await assert.rejects(one.put('k', 'v'), UnavailableError);
+  let took = Date.now() - started;
+  assert.equal(sends, 1, 'no attempt after the budget');
+  assert.ok(took < 100, `no-leader pause: took ${took} ms against a 100 ms budget`);
+  // A hint loop: the third hop's 200 ms pause does not fit either.
+  const loop = new RetcdClient({ endpoints: [A, B], timeoutMs: 10_000, failoverMs: 100 });
+  const sentTo = [];
+  loop._ready = async () => {};
+  loop._send = async (addr) => {
+    sentTo.push(addr);
+    throw notLeader(addr === A ? B : A);
+  };
+  started = Date.now();
+  await assert.rejects(loop.put('k', 'v'), UnavailableError);
+  took = Date.now() - started;
+  assert.deepEqual(sentTo, [A, B, A], 'two free hops, then the paused one is never made');
+  assert.ok(took < 100, `hint-loop pause: took ${took} ms against a 100 ms budget`);
+});
+
+test('R2-F005: no attempt starts after failoverMs, even when a pause wakes late', async () => {
+  const client = new RetcdClient({ endpoints: [A], timeoutMs: 10_000, failoverMs: 400 });
+  let sends = 0;
+  client._ready = async () => {};
+  client._send = async () => {
+    sends++;
+    throw noLeaderYet();
+  };
+  const started = Date.now();
+  // The 300 ms pause fits the 400 ms budget, but the event loop is held from 100 ms to 500 ms, so it wakes late.
+  setTimeout(() => {
+    while (Date.now() - started < 500);
+  }, 100);
+  await assert.rejects(client.put('k', 'v'), UnavailableError);
+  assert.equal(sends, 1, 'the late wake finds the budget spent and makes no second attempt');
+});
+
+test('R2-F005: the slow connect window is cut to the time left in the budget', async () => {
+  const client = new RetcdClient({ endpoints: [A], timeoutMs: 10_000, failoverMs: 700 });
+  const windows = [];
+  client._ready = async (addr, ms) => {
+    windows.push(ms);
+    await sleep(Math.max(0, ms));
+    throw notConnected(addr);
+  };
+  client._send = async () => {
+    throw new Error('never sent');
+  };
+  const started = Date.now();
+  await assert.rejects(client.put('k', 'v'), UnavailableError);
+  const took = Date.now() - started;
+  assert.equal(windows[0], 400, 'the quick window first');
+  assert.ok(windows.length === 2 && windows[1] <= 300, `then what is left of 700 ms, not 3000: ${windows}`);
+  assert.ok(took < 1000, `took ${took} ms against a 700 ms budget`);
+});
+
+test('R2-F014: the listDirs limit counts key, value and folder-path bytes, to the byte', async () => {
+  const L = LIMITS.maxListDirsBytes;
+  const page = (...records) => fake(() => ({ records, read_revision: '1', truncated: false, next_page_token: Buffer.alloc(0) })).client;
+  const file = (key, size) => ({ key: Buffer.from(key), value: Buffer.alloc(size), create_revision: '1', mod_revision: '1' });
+  const tooLarge = (e) => e instanceof ResultTooLargeError && e instanceof RetcdError && e.code === 'RESULT_TOO_LARGE';
+  // 'd/k' is 3 bytes, so a value of L - 3 is exactly the limit.
+  assert.equal((await page(file('d/k', L - 3)).listDirs('d')).length, 1, 'exactly the limit is kept');
+  await assert.rejects(page(file('d/k', L - 2)).listDirs('d'), tooLarge, 'one byte over: the key bytes count');
+  // 'd/sub/z' is not a file of 'd/*', but it adds the folder row 'd/sub/' (6 bytes), which tips it over.
+  await assert.rejects(page(file('d/k', L - 3), file('d/sub/z', 0)).listDirs('d'), tooLarge, 'folder paths count');
+});
+
+test('A-R2-1: ResultTooLargeError is a runtime export of the package entry point', async () => {
+  // By package name, so this goes through package.json "exports" as a caller's import does.
+  const entry = await import('@retcd/client');
+  assert.equal(typeof entry.ResultTooLargeError, 'function', 'exported at run time, not only in index.d.ts');
+  assert.equal(entry.ResultTooLargeError, ResultTooLargeError);
+  assert.ok(new entry.ResultTooLargeError('x', { size: 2, limit: 1 }) instanceof entry.RetcdError);
 });

@@ -2,7 +2,10 @@
 import { EventEmitter } from 'node:events';
 
 export interface RetcdRecord {
+  /** The key as UTF-8 text. Lossy for keys that are not valid UTF-8: two such keys can render the same. */
   key: string;
+  /** The exact key. Pass it back to get/put/delete to address this record. */
+  keyBytes: Buffer;
   value: Buffer;
   createRevision: number;
   modRevision: number;
@@ -10,7 +13,10 @@ export interface RetcdRecord {
 
 export interface WatchEvent {
   type: 'put' | 'delete' | 'progress';
+  /** UTF-8 rendering of the key ('' for progress). */
   key: string;
+  /** The exact key (empty for progress). */
+  keyBytes: Buffer;
   /** null for delete and progress */
   value: Buffer | null;
   revision: number;
@@ -56,7 +62,9 @@ export class RetcdClient {
   put(key: string | Buffer, value: string | Uint8Array, opts?: { ifRevision?: number | string | bigint }): Promise<{ revision: number }>;
   /** true if it was deleted, false if it did not exist. CasConflictError if ifRevision is stale. */
   delete(key: string | Buffer, opts?: { ifRevision?: number | string | bigint }): Promise<boolean>;
-  list(pattern?: string, opts?: { pageSize?: number }): AsyncGenerator<RetcdRecord, void, undefined> & { readonly readRevision: number | undefined };
+  /** A string is a prefix or a glob. A Buffer is an exact byte prefix, never a glob. */
+  list(pattern?: string | Buffer, opts?: { pageSize?: number }): AsyncGenerator<RetcdRecord, void, undefined> & { readonly readRevision: number | undefined };
+  /** Held in memory: ResultTooLargeError past LIMITS.maxListDirsBytes of keys and values. Use list() to stream a big folder. */
   listDirs(pattern?: string, opts?: { pageSize?: number }): Promise<Array<RetcdRecord | DirEntry>>;
   watch(
     pattern?: string,
@@ -68,7 +76,7 @@ export class RetcdClient {
   close(): void;
 }
 
-export const LIMITS: Readonly<{ maxKeyBytes: number; maxValueBytes: number; maxListItems: number }>;
+export const LIMITS: Readonly<{ maxKeyBytes: number; maxValueBytes: number; maxListItems: number; maxListDirsBytes: number }>;
 
 // ---- errors ----
 export class RetcdError extends Error {
@@ -84,7 +92,15 @@ export class CasConflictError extends RetcdError {
   /** false if the key does not exist right now. */
   exists: boolean;
 }
+/** Key over 1 KiB or value over 1 MiB: not sent, or the server refused it. */
 export class TooLargeError extends RetcdError {}
+/** A read result is bigger than the client holds in memory (listDirs). Nothing was written. code 'RESULT_TOO_LARGE'. */
+export class ResultTooLargeError extends RetcdError {
+  /** Bytes kept when the client stopped. */
+  size: number;
+  /** The cap, LIMITS.maxListDirsBytes. */
+  limit: number;
+}
 /** A write timed out or died after sending: it may or may not have been applied. Never auto-retried. */
 export class UnknownOutcomeError extends RetcdError {}
 export class UnavailableError extends RetcdError {}

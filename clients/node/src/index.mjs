@@ -3,7 +3,8 @@
 // Leader following, retry rules and glob matching are the ones proven in
 // samples/retcd-playground/kv.mjs:
 //   - a follower answers "not the leader" (nothing applied) -> go to the leader it names.
-//   - a refused connection (nothing sent) -> try the next node.
+//   - a failed connect step (nothing sent) -> try the next node. For a write only _ready's own
+//     `connectFailed` stamp counts; refusal text in an error from the send itself does not.
 //   - a write that timed out, or whose connection died after sending, is NEVER retried:
 //     UnknownOutcomeError. Reads are retried on another node.
 import { createHash } from 'node:crypto';
@@ -18,6 +19,7 @@ import {
   IntegrityError,
   NotFoundError,
   RetcdError,
+  ResultTooLargeError,
   TooLargeError,
   UnavailableError,
   UnknownOutcomeError,
@@ -37,6 +39,7 @@ export {
   NotFoundError,
   NotFoundError as NotFound,
   RetcdError,
+  ResultTooLargeError,
   TooLargeError,
   UnavailableError,
   UnknownOutcomeError,
@@ -47,8 +50,12 @@ export {
   watchPresence,
 };
 
-/** Server limits (crates/config-core/src/limits.rs). */
-export const LIMITS = Object.freeze({ maxKeyBytes: 1024, maxValueBytes: 1024 * 1024, maxListItems: 1000 });
+/**
+ * Server limits (crates/config-core/src/limits.rs), plus `maxListDirsBytes`: the most key and value bytes
+ * listDirs keeps before it throws ResultTooLargeError. 64 MiB is eight full server pages (8 MiB each). It counts
+ * bytes, not records, because values (up to 1 MiB) dominate what a caller holds. Stream a bigger folder with list().
+ */
+export const LIMITS = Object.freeze({ maxKeyBytes: 1024, maxValueBytes: 1024 * 1024, maxListItems: 1000, maxListDirsBytes: 64 * 1024 * 1024 });
 
 // Where config.proto is looked for when neither { protoPath } nor RETCD_PROTO is given, relative to
 // this file: the copy an installed package carries (npm pack bundles it), then the rEtcd repo's own.
@@ -111,18 +118,33 @@ const revString = (n, what) => {
   return String(n);
 };
 
+// `key` is the UTF-8 rendering, for display and globs. Two keys that are not valid UTF-8 can render the
+// same, so `keyBytes` carries the exact key: pass it back to get/put/delete to address that record.
 const toRecord = (r) => ({
   key: r.key.toString('utf8'),
+  keyBytes: Buffer.from(r.key),
   value: r.value,
   createRevision: Number(r.create_revision),
   modRevision: Number(r.mod_revision),
 });
 
-const normalizeEndpoint = (e) => String(e).trim().replace(/^[a-z]+:\/\//i, '').replace(/\/+$/, '');
+// host:port, or http://host:port. This client speaks plaintext gRPC only, so any other scheme (https://
+// above all) is refused here rather than silently stripped and sent in plaintext.
+const normalizeEndpoint = (e) => {
+  const text = String(e).trim();
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(text)?.[1];
+  if (scheme !== undefined && scheme.toLowerCase() !== 'http') {
+    throw new RetcdError(
+      `endpoint "${text}": ${scheme}:// is not supported. This client has no TLS yet and speaks plaintext only; give host:port or http://host:port.`,
+      { code: 'INVALID_ARGUMENT' },
+    );
+  }
+  return text.replace(/^http:\/\//i, '').replace(/\/+$/, '');
+};
 
 /**
- * @typedef {{key: string, value: Buffer, createRevision: number, modRevision: number}} Record
- * @typedef {{type: 'put'|'delete', key: string, value: Buffer|null, revision: number}} WatchEvent
+ * @typedef {{key: string, keyBytes: Buffer, value: Buffer, createRevision: number, modRevision: number}} Record
+ * @typedef {{type: 'put'|'delete', key: string, keyBytes: Buffer, value: Buffer|null, revision: number}} WatchEvent
  */
 export class RetcdClient {
   /**
@@ -241,46 +263,60 @@ export class RetcdClient {
     }
   }
 
-  _send(addr, method, req) {
+  _send(addr, method, req, deadline = Date.now() + this._timeoutMs) {
     return new Promise((resolve, reject) => {
-      this._svc(addr)[method](req, { deadline: Date.now() + this._timeoutMs }, (err, res) => (err ? reject(err) : resolve(res)));
+      this._svc(addr)[method](req, { deadline }, (err, res) => (err ? reject(err) : resolve(res)));
     });
   }
 
-  async _once(addr, method, req, connectMs = SLOW_CONNECT_MS) {
-    await this._ready(addr, connectMs);
-    return this._send(addr, method, req);
+  // One attempt, kept inside the call's budget: neither the connect wait nor the RPC deadline runs past
+  // `giveUpAt`, so a stalled node cannot stretch a call beyond failoverMs.
+  async _once(addr, method, req, connectMs = SLOW_CONNECT_MS, giveUpAt = Infinity) {
+    await this._ready(addr, Math.min(connectMs, giveUpAt - Date.now()));
+    return this._send(addr, method, req, Math.min(Date.now() + this._timeoutMs, giveUpAt));
   }
 
   // One logical call with leader following. See the rules at the top of this file.
   async _call(method, req, { write = false, followForeignPageToken = false } = {}) {
     const giveUpAt = Date.now() + this._failoverMs;
     let hops = 0;
+    let last; // the previous attempt's error and node, thrown if the budget runs out before the next one
     const slowToConnect = new Set(); // nodes that missed the quick connect window in this call
     for (;;) {
       this._assertOpen();
+      // A pause can wake late (a busy event loop); the budget still decides whether another attempt starts.
+      if (last && Date.now() >= giveUpAt) throw mapError(last.err, { write, endpoint: last.addr });
       const addr = this._addr;
       // Quick window first, so a dead node costs QUICK_CONNECT_MS and not the whole budget. Once every
       // known node has missed it, allow the longer window: they may all just be slow.
       const quick = !this._endpoints.every((e) => slowToConnect.has(e));
       try {
-        return await this._once(addr, method, req, quick ? QUICK_CONNECT_MS : SLOW_CONNECT_MS);
+        return await this._once(addr, method, req, quick ? QUICK_CONNECT_MS : SLOW_CONNECT_MS, giveUpAt);
       } catch (err) {
         if (err.connectFailed) slowToConnect.add(addr);
+        last = { err, addr };
         // A List cursor from another node is followed like "not the leader": the same request goes to the
         // node the refusal names, so the walk keeps its token and its pinned revision.
         const kind = followForeignPageToken && isForeignPageToken(err) ? 'not-leader' : classify(err);
         const readRetry = !write && kind === 'transport' && (err.code === grpc.status.UNAVAILABLE || err.code === grpc.status.DEADLINE_EXCEEDED);
-        if (!(kind === 'not-leader' || kind === 'refused' || readRetry) || Date.now() >= giveUpAt) {
+        // A write is resent to another node only when the connect step itself failed (`connectFailed`, set by
+        // _ready before anything is sent). Refusal text in an error from the send step proves nothing.
+        const refusedBeforeSend = write ? err.connectFailed === true : kind === 'refused';
+        if (!(kind === 'not-leader' || refusedBeforeSend || readRetry) || Date.now() >= giveUpAt) {
           throw mapError(err, { write, endpoint: addr });
         }
+        // A pause that would use up the rest of the budget ends the call now: no attempt could follow it.
+        const pause = async (ms) => {
+          if (Date.now() + ms >= giveUpAt) throw mapError(err, { write, endpoint: addr });
+          await sleep(ms);
+        };
         const hint = kind === 'not-leader' ? leaderHint(err) : undefined;
         if (hint && hint !== addr) {
           this._use(hint);
-          if (++hops > 2) await sleep(200); // a hint loop must not spin
+          if (++hops > 2) await pause(200); // a hint loop must not spin
         } else {
           // election in progress, or node down. A node that just failed the quick connect costs no pause.
-          await sleep(kind === 'not-leader' ? 300 : err.connectFailed && quick ? 0 : 150);
+          await pause(kind === 'not-leader' ? 300 : err.connectFailed && quick ? 0 : 150);
           if (!hint || kind !== 'not-leader') this._rotate();
         }
       }
@@ -347,7 +383,8 @@ export class RetcdClient {
    * Every record whose key matches a prefix or a glob, in key order, paged and pinned to one
    * revision. The returned iterator also has `.readRevision` (set after the first page):
    * pass it to watch() as `fromRevision` to list-then-watch with no gap.
-   * @param {string} [pattern]  plain prefix, or a glob ('docs/*.md', 'a/**')
+   * @param {string|Buffer} [pattern]  plain prefix, or a glob ('docs/*.md', 'a/**'). A Buffer is an exact
+   *   byte prefix, never a glob: use it for keys that are not valid UTF-8.
    * @param {{pageSize?: number}} [opts]  server clamps pageSize to 1000
    * @returns {AsyncGenerator<Record> & {readRevision: number|undefined}}
    */
@@ -356,8 +393,9 @@ export class RetcdClient {
     const self = this;
     const state = { readRevision: undefined };
     const gen = (async function* walk() {
-      const prefix = Buffer.from(literalPrefix(pattern), 'utf8');
-      const re = hasGlob(pattern) ? globToRegExp(pattern) : null;
+      const bytes = pattern instanceof Uint8Array;
+      const prefix = bytes ? Buffer.from(pattern) : Buffer.from(literalPrefix(pattern), 'utf8');
+      const re = !bytes && hasGlob(pattern) ? globToRegExp(pattern) : null;
       let token = Buffer.alloc(0); // present but empty: start a pinned walk
       for (;;) {
         const r = await self._call('List', { prefix, max_items: pageSize, page_token: token }, { followForeignPageToken: true });
@@ -381,6 +419,8 @@ export class RetcdClient {
   /**
    * One-level folder view. Keys that match are files; a key deeper than the pattern adds one
    * `{dir, count}` entry for the folder it sits in. 'docs' and 'docs/' mean 'docs/*'.
+   * The whole view is held in memory, so it stops with ResultTooLargeError once the kept keys and values pass
+   * LIMITS.maxListDirsBytes (64 MiB). Walk a folder that big with list(), which streams.
    * @returns {Promise<Array<Record | {dir: string, count: number}>>}
    */
   async listDirs(pattern = '', { pageSize = 500 } = {}) {
@@ -389,9 +429,20 @@ export class RetcdClient {
     const wantDirs = !glob.includes('**');
     const entries = []; // server (sorted) order; a dir entry sits where its first key was
     const dirs = new Map();
+    let kept = 0; // key and value bytes held in `entries`
+    const keep = (entry, bytes) => {
+      kept += bytes;
+      if (kept > LIMITS.maxListDirsBytes) {
+        throw new ResultTooLargeError(
+          `listDirs('${pattern}') holds more than ${LIMITS.maxListDirsBytes} bytes of keys and values. Walk a folder this big with list(), which streams.`,
+          { size: kept, limit: LIMITS.maxListDirsBytes },
+        );
+      }
+      entries.push(entry);
+    };
     // Walk the plain prefix (not the glob) so keys deeper than the pattern can add folders.
     for await (const rec of this.list(literalPrefix(glob), { pageSize })) {
-      if (re.test(rec.key)) entries.push(rec);
+      if (re.test(rec.key)) keep(rec, rec.keyBytes.length + rec.value.length);
       if (!wantDirs) continue;
       for (let i = rec.key.indexOf('/'); i !== -1; i = rec.key.indexOf('/', i + 1)) {
         const dir = rec.key.slice(0, i);
@@ -400,7 +451,7 @@ export class RetcdClient {
         if (!d) {
           d = { dir: `${dir}/`, count: 0 };
           dirs.set(dir, d);
-          entries.push(d);
+          keep(d, Buffer.byteLength(d.dir));
         }
         d.count++;
       }
@@ -465,11 +516,12 @@ export class RetcdClient {
             last = Number(ev.revision);
             const key = ev.key.toString('utf8');
             if (re && !re.test(key)) continue;
-            if (ev.change === 'put') yield { type: 'put', key, value: ev.put.value, revision: last };
-            else yield { type: 'delete', key, value: null, revision: last };
+            const keyBytes = Buffer.from(ev.key); // exact key; `key` is only its UTF-8 rendering
+            if (ev.change === 'put') yield { type: 'put', key, keyBytes, value: ev.put.value, revision: last };
+            else yield { type: 'delete', key, keyBytes, value: null, revision: last };
           } else if (m.body === 'progress') {
             last = Number(m.progress.revision); // quiet heartbeat: no key data
-            if (progress) yield { type: 'progress', key: '', value: null, revision: last };
+            if (progress) yield { type: 'progress', key: '', keyBytes: Buffer.alloc(0), value: null, revision: last };
           }
         }
         // stream ended cleanly (server shutting down): reconnect after a short pause
