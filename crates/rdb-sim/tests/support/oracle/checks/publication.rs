@@ -23,7 +23,10 @@
 //! A peer's role is resolved from the **environment** topology in force at the acknowledgement's
 //! `config_version`, never from `replication_ack.peer_role` (design §2.5). A `Durable` class is
 //! grounded in a preceding `durability_advance{outcome=Synced}` on the same node. Both are
-//! watermark comparisons, not point comparisons (plan §4 convention 2).
+//! watermark comparisons, not point comparisons (plan §4 convention 2). An `ack_evidence` entry
+//! counts only through the accepted acknowledgement at its own `(node, boot)`, in the
+//! publication's lineage and at a configuration the kernel's ACK ladder would accept (plan §4
+//! convention 1, row M7V-91).
 
 use std::collections::BTreeSet;
 
@@ -111,7 +114,10 @@ impl Checker for Publication {
             }
 
             TraceKind::Publish {
-                seq, ack_evidence, ..
+                generation,
+                seq,
+                ack_evidence,
+                ..
             } => {
                 self.armed = true;
 
@@ -157,16 +163,28 @@ impl Checker for Publication {
                     {
                         continue;
                     }
-                    // The acknowledgement must actually have been generated and accepted, at or
-                    // before this publication. A publish moved before its ack (MUT-3) fails here.
-                    let generated = part.acks.iter().any(|((node, boot), ack)| {
-                        *node == evidence.node
-                            && ack.accepted
-                            && ack.contiguous_seq >= *seq
-                            && (evidence.durability != DurabilityClass::Durable
-                                || part.durable_at_boot(*node, *boot, *seq))
-                    });
-                    if !generated {
+                    // The acknowledgement this evidence names must actually have been generated
+                    // and accepted, at or before this publication: the one at the evidence's own
+                    // `(node, boot)` (plan §4 convention 1). Another boot's ack is another
+                    // incarnation's copy (row M7V-91). A publish moved before its ack (MUT-3)
+                    // fails here too.
+                    let Some(ack) = part.ack_covering(evidence.node, evidence.boot, *seq) else {
+                        continue;
+                    };
+                    // No stricter than the kernel's own ACK ladder (`ProgressTracker::
+                    // rules_one_to_seven`). Rule 2: the ack is in the lineage served, so in this
+                    // publication's generation. Rule 4: its configuration is the one the copy is
+                    // held to, `pinned_for` — the newest active predicate naming it. For a member
+                    // of the pin that is the pin or a later configuration that still names the
+                    // node; anything older is `StaleConfig`. "Still names" needs no clause here:
+                    // the environment model restates placements and never removes one, so a node
+                    // the role check above placed at the pin is placed at every later version.
+                    if ack.generation != *generation || ack.config_version < config_version {
+                        continue;
+                    }
+                    if evidence.durability == DurabilityClass::Durable
+                        && !part.durable_at_boot(evidence.node, evidence.boot, *seq)
+                    {
                         continue;
                     }
                     counted.insert(evidence.node);

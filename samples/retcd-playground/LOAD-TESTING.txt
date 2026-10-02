@@ -127,11 +127,18 @@ rDB (SIMULATOR ONLY)
 
 12. rDB RELEASE CAMPAIGN (the M7 release gate's own corpus)
   Why: 1,000 generated seeds + 4 authored cases, the gate's real command.
-  Run: SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign \
+  Run: SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 SPIKE_ASSERT_WALL_MS=60000 \
+         CARGO_TARGET_DIR=.rtargets/campaign \
          scripts/gate.sh test --release -p rdb-sim --test campaign
        (writes docs/evidence/*.json: run it in an export, not the live tree)
-  Here: 171 ms campaign wall, exit 0. But only 3 histories ran; 1,001 could not be
-        lowered into runs yet (M7V-55 owed). 1 invariant proven, 9 unavailable.
+  Exits: NONZERO (101) today, by design. Row M7V-127 fails and lists why:
+        9 invariants unavailable, full_scale false, 33 coverage cells missing.
+        Only 3 histories run; 1,001 cannot be lowered into runs yet (M7V-55
+        owed). It exits 0 only when every invariant is proven at full scale,
+        every coverage cell is hit and the campaign fits in 60 s.
+  Here: ~170 ms campaign wall. 1 invariant proven, 9 unavailable.
         So "1,000 histories in 60 s" is NOT measured yet. Debug build is ~5x slower.
+        RETCD_EVIDENCE=1 alone (ADR-0019 command 2) records the number
+        without gating: that run exits 0.
   Scale knob: SPIKE_SEEDS=4096 took 175 ms. Flat, because extra seeds are refused
         (~15 us each), not run. That is refusal speed, not execution load.

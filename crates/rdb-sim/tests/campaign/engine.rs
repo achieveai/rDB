@@ -1049,8 +1049,10 @@ impl Campaign {
             .collect()
     }
 
-    /// The whole run's verdict: the status gate, the wall check and the coverage gate. A test
-    /// binary exits non-zero on `Err`.
+    /// The whole run's verdict: the status gate, the wall check and the coverage gate. Under
+    /// `SPIKE_REQUIRE_ALL=1` the shared corpus's verdict is the test binary's exit status (row
+    /// M7V-127); without it, `RETCD_EVIDENCE=1` included, only the status gate's always-on
+    /// clauses are.
     ///
     /// # Errors
     ///

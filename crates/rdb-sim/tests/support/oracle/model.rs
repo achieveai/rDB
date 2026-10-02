@@ -266,6 +266,8 @@ pub struct AckRec {
     pub claimed_role: ReplicaRole,
     /// The configuration it was pinned to.
     pub config_version: ConfigVersion,
+    /// The lineage it acknowledged in.
+    pub generation: Generation,
     /// The watermark it holds. Evidence for every sequence at or below it (convention 2).
     pub contiguous_seq: Seq,
     /// How strongly.
@@ -606,6 +608,7 @@ impl Model {
                 peer_role,
                 peer_boot,
                 config_version,
+                generation,
                 contiguous_seq,
                 durability_class,
                 accepted,
@@ -616,6 +619,7 @@ impl Model {
                     AckRec {
                         claimed_role: *peer_role,
                         config_version: *config_version,
+                        generation: *generation,
                         contiguous_seq: *contiguous_seq,
                         durability: *durability_class,
                         accepted: *accepted,

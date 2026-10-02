@@ -1730,8 +1730,9 @@ fn m7v_87_m7_release_gate_is_the_cited_command_and_fails_while_any_invariant_is_
     // (1) Const, ADR and plan agree byte for byte, each read from exactly one row.
     assert_eq!(
         report::RELEASE_GATE_COMMAND,
-        "SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign \
-         scripts/gate.sh test --release -p rdb-sim --test campaign"
+        "SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 SPIKE_ASSERT_WALL_MS=60000 \
+         CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim \
+         --test campaign"
     );
     for (path, prefix) in [
         (
@@ -1757,17 +1758,42 @@ fn m7v_87_m7_release_gate_is_the_cited_command_and_fails_while_any_invariant_is_
         );
     }
 
-    // (2) The command's environment applied to the shared report.
+    // (2) The command's environment applied to the gate function: a synthetic all-proven,
+    // all-armed, full-scale report passes and the same report short of full scale fails.
     let knobs = knobs_of(&[("SPIKE_REQUIRE_ALL", "1"), ("RETCD_EVIDENCE", "1")]);
     assert!(knobs.require_all && knobs.evidence);
+    assert_eq!(
+        engine::gate(&table(&[]), true, knobs.require_all, knobs.evidence),
+        Ok(()),
+        "an all-proven, all-armed, full-scale report passes"
+    );
+    assert!(engine::gate(&table(&[]), false, knobs.require_all, knobs.evidence).is_err());
+
+    // Then to the shared report. The gate passes exactly when nothing is owed, so the row holds
+    // both ways and never turns an owed claim into a pass; M7V-127 is the row that makes the
+    // verdict the binary's exit status under the real command.
     let campaign = shared();
-    let causes = engine::gate(
+    let verdict = engine::gate(
         &campaign.statuses,
         campaign.full_scale(),
         knobs.require_all,
         knobs.evidence,
-    )
-    .expect_err("the release gate fails while any invariant is not proven");
+    );
+    let owed = !campaign.full_scale()
+        || campaign
+            .statuses
+            .iter()
+            .any(|row| row.status != Status::Proven || row.seeds_armed == 0);
+    if !owed {
+        assert_eq!(
+            verdict,
+            Ok(()),
+            "nothing is owed, so the release gate passes"
+        );
+        println!("M7 release claim: every invariant proven at full scale");
+        return;
+    }
+    let causes = verdict.expect_err("the release gate fails while anything is owed");
     for row in &campaign.statuses {
         if row.status != Status::Proven {
             assert!(
@@ -1784,18 +1810,48 @@ fn m7v_87_m7_release_gate_is_the_cited_command_and_fails_while_any_invariant_is_
             causes.contains(&"full_scale: false on an explicit RETCD_EVIDENCE=1 run".to_owned())
         );
     }
-    assert_eq!(
-        engine::gate(&table(&[]), true, knobs.require_all, knobs.evidence),
-        Ok(()),
-        "an all-proven, all-armed, full-scale report passes"
-    );
-    assert!(engine::gate(&table(&[]), false, knobs.require_all, knobs.evidence).is_err());
 
     // (3) During M7 the claim is reported, not passed.
     println!(
         "M7 release claim: unavailable — {} of 10 invariants not proven",
         causes.iter().filter(|c| c.starts_with("INV-")).count()
     );
+}
+
+// ------------------------------------------------------------------------------------------
+// M7V-127 — the shared campaign's verdict is the binary's exit status
+// ------------------------------------------------------------------------------------------
+
+#[retcd_test]
+fn m7v_127_the_shared_campaign_outcome_is_the_test_binarys_exit_status() {
+    support::preamble();
+    // Under SPIKE_REQUIRE_ALL=1 — the release gate, VA-9 command 3 — `Campaign::outcome` is the
+    // whole verdict: the status gate, the wall check and the coverage gate. Every other row reads
+    // one part of it, so without this row the release command printed its causes and exited 0
+    // (PR #1 review R2-F001). Without the switch — command 1, and command 2, which produces the
+    // 1,000-history number and gates nothing (VA-9) — only the status gate's always-on clauses
+    // hold: no `violated`, no `proven` with nothing armed. Both flags are passed `false` so
+    // `RETCD_EVIDENCE=1` alone never adds the `full_scale` cause.
+    let campaign = shared();
+    let (verdict, what) = if campaign.knobs.require_all {
+        (campaign.outcome(), "configured outcome")
+    } else {
+        (
+            engine::gate(&campaign.statuses, campaign.full_scale(), false, false),
+            "status gate's always-on clauses",
+        )
+    };
+    if let Err(causes) = verdict {
+        panic!(
+            "the shared campaign failed its {what} (require_all={}, evidence={}, \
+             assert_wall_ms={:?}), {} cause(s):\n{}",
+            campaign.knobs.require_all,
+            campaign.knobs.evidence,
+            campaign.knobs.assert_wall_ms,
+            causes.len(),
+            causes.join("\n")
+        );
+    }
 }
 
 // ------------------------------------------------------------------------------------------

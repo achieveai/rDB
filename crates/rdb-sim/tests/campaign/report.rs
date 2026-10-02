@@ -11,8 +11,12 @@
 /// Held row **M7V-87** owns the cross-check that this const, the ADR and the plan's VA-9 all
 /// agree. The const is declared now so the row has one place to point at when it is written, and
 /// so the command lives beside the artifact names rather than in three documents only.
+///
+/// `SPIKE_ASSERT_WALL_MS=60000` is ADR-rdb-0019's 1,000-history/60 s target, asserted here and
+/// nowhere else: the PR default records wall time only (V-R11, M7V-60).
 pub const RELEASE_GATE_COMMAND: &str = "SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 \
-     CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign";
+     SPIKE_ASSERT_WALL_MS=60000 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test \
+     --release -p rdb-sim --test campaign";
 
 /// Which campaign produced an artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

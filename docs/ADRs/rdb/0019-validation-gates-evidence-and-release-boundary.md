@@ -70,9 +70,10 @@ in this map.
 this of its own budgets ("proposed acceptance targets, not previously observed speeds") and requires
 measurement on one recorded CI worker. The recorded worker for M7 is a shared Windows Server 2022 VM
 running up to six concurrent agent builds. So the 1,000-history/60 s figure is **recorded** in the PR
-corpus and **asserted** only in a gate run (ruling V-R11), via the release command in §2.1
+corpus and **asserted** only in a gate run (ruling V-R11): the release command in §2.1
 (`RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim
---test campaign`) — the plain gate command compiles workspace members unoptimized and cannot
+--test campaign`) produces the number, and the M7 release gate in §2.1 asserts it with
+`SPIKE_ASSERT_WALL_MS=60000` — the plain gate command compiles workspace members unoptimized and cannot
 produce the number, and only the release artifact `rdb-m7-campaign-release.json` may be cited for
 it (ruling V-R17). If the target is missed, spike §7's rule applies and the revision is written
 here. Never lower an assertion.
@@ -168,7 +169,7 @@ then the M7 release gate is run by hand and its artifact is the evidence.
 |---|---|---|
 | Handoff gate: default 64-seed corpus, debug | `CARGO_TARGET_DIR=.rtargets/verification scripts/gate.sh test -p rdb-sim --test oracle --test scenarios --test campaign` | `rdb-m7-campaign.json`, `full_scale: false` |
 | The 1,000-history number: warm release, full configured scale | `RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` | `rdb-m7-campaign-release.json`, `full_scale: true` |
-| **M7 release gate** — the run whose green is the milestone claim in §1 | `SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` | `rdb-m7-campaign-release.json` with every invariant `proven` and `seeds_armed > 0`, or a failure naming the invariant and its reason |
+| **M7 release gate** — the run whose green is the milestone claim in §1 | `SPIKE_REQUIRE_ALL=1 RETCD_EVIDENCE=1 SPIKE_ASSERT_WALL_MS=60000 CARGO_TARGET_DIR=.rtargets/campaign scripts/gate.sh test --release -p rdb-sim --test campaign` | `rdb-m7-campaign-release.json` with every invariant `proven` and `seeds_armed > 0`, or a failure naming the invariant and its reason |
 
 `.rtargets/campaign` is reserved for the release commands (AGENTS.md: never two cargo invocations
 against one target directory). The full configured scale under `RETCD_EVIDENCE=1` is

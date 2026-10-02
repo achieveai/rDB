@@ -1,4 +1,4 @@
-//! Oracle rows M7V-01..M7V-41, plus M7V-66..68, M7V-71, M7V-79, M7V-81 and M7V-85.
+//! Oracle rows M7V-01..M7V-41, plus M7V-66..68, M7V-71, M7V-79, M7V-81, M7V-85 and M7V-91.
 //!
 //! Every row here is a hand-built trace judged by the oracle, so every one of them runs against
 //! the **landed C0 contract** and needs no runner. Each checker gets a bad trace that trips it and
@@ -776,7 +776,7 @@ fn m7v_04b_atom_failed_batch_key_version_published_violates() {
 }
 
 // ------------------------------------------------------------------------------------------
-// INV-PUB — M7V-06..M7V-12, M7V-79
+// INV-PUB — M7V-06..M7V-12, M7V-79, M7V-91
 // ------------------------------------------------------------------------------------------
 
 /// The shared publication fixture: an admission pinning `required` at `config_version`, an apply
@@ -1115,6 +1115,115 @@ fn m7v_79_pub_degraded_rf2_publish_on_the_primarys_own_durability_alone_violates
         "1-of-1 means one, not zero: {}",
         signature.detail
     );
+}
+
+/// M7V-09's trace with one fact movable at a time: the boot the publication's evidence names, and
+/// the configuration and lineage n2's acknowledgement carries. n2 acknowledges at boot b1, and the
+/// admission pins `[n1,n2]` at configuration 4. An ack at a later configuration follows a
+/// `topology_change` to it that keeps every placement, as a membership change that keeps n2 would.
+///
+/// The evidence is `Buffered`, as the recorder writes it (`semantic::ack_evidence`): a `Durable`
+/// entry is also judged by its grounding at the evidence's boot, which would catch a wrong boot
+/// for the wrong reason and let a checker without the pairing pass.
+fn m7v_91_fixture(
+    case: &str,
+    evidence_boot: BootId,
+    ack_config: ConfigVersion,
+    ack_generation: Generation,
+) -> Trace {
+    let pinned = ConfigVersion(4);
+    let mut b = base(case)
+        .pinned_to(pinned)
+        .push(protection(
+            ProtectionPhase::Healthy,
+            0,
+            &[N1, N2],
+            pinned,
+            Seq::ZERO,
+            Seq::ZERO,
+            Some(0),
+        ))
+        .push(initial_root(GEN_1))
+        .push(submit(REQ1, &[K1]))
+        .push(admit(Seq(9), &[N1, N2], pinned));
+    b = b.push(valid_authority());
+    let recheck = b.last_event();
+    b = b.at(1).apply(Seq(9), &[(K1, 1)], ApplyOutcome::Applied);
+    if ack_config > pinned {
+        b = b
+            .push(TraceKind::TopologyChange {
+                config_version: ack_config,
+                nodes: vec![
+                    (N1, ReplicaRole::Primary),
+                    (N2, ReplicaRole::RegularSecondary),
+                    (N3, ReplicaRole::RegularSecondary),
+                ],
+            })
+            .push(protection(
+                ProtectionPhase::Healthy,
+                0,
+                &[N1, N2],
+                ack_config,
+                Seq::ZERO,
+                Seq::ZERO,
+                Some(0),
+            ));
+    }
+    b.flush(N2, Seq(9))
+        .pinned_to(ack_config)
+        .in_generation(ack_generation)
+        .ack_from(N2, Seq(9), DurabilityClass::Durable)
+        .pinned_to(pinned)
+        .in_generation(GEN_1)
+        .publish(
+            Seq(9),
+            &[rdb_core::contracts::trace::AckEvidence {
+                boot: evidence_boot,
+                ..evidence(N2, ReplicaRole::RegularSecondary, DurabilityClass::Buffered)
+            }],
+            recheck,
+        )
+        .build()
+}
+
+#[retcd_test]
+fn m7v_91_pub_evidence_counts_only_the_ack_at_its_own_boot_config_and_generation() {
+    support::preamble();
+    // Plan §4 convention 1: an evidence entry's boot must equal the `peer_boot` of that node's
+    // paired `replication_ack`. n2 acknowledged at b1; evidence naming b2 rests on an ack nobody
+    // at b2 generated, so it is not a copy (PR #1 review R2-F002).
+    //
+    // The configuration and lineage follow the kernel's ACK ladder, never anything stricter
+    // (`ProgressTracker::rules_one_to_seven`): rule 2 refuses another lineage (`StaleGeneration`),
+    // and rule 4 holds a copy to the newest predicate naming it, so an ack older than the pin is
+    // `StaleConfig` while one at a later configuration that keeps n2 is admitted.
+    for (case, boot, config, generation) in [
+        ("m7v-91-b2", BootId(2), ConfigVersion(4), GEN_1),
+        ("m7v-91-cv3", B1, ConfigVersion(3), GEN_1),
+        ("m7v-91-gen2", B1, ConfigVersion(4), Generation(2)),
+    ] {
+        let signature = violated(
+            &judge(&m7v_91_fixture(case, boot, config, generation)),
+            Invariant::Pub,
+            "required_copy_set_unsatisfied",
+        );
+        assert!(
+            signature.detail.contains("regular_acks_counted=0"),
+            "{case}: {}",
+            signature.detail
+        );
+    }
+
+    // The near-misses: evidence naming b1 against the ack at the pin, and against an ack under
+    // configuration 5, which keeps every member — the kernel admits it, so the oracle counts it.
+    for (case, config) in [
+        ("m7v-91-b1", ConfigVersion(4)),
+        ("m7v-91-cv5", ConfigVersion(5)),
+    ] {
+        let report = judge(&m7v_91_fixture(case, B1, config, GEN_1));
+        proven(&report, Invariant::Pub);
+        assert!(report.is_clean(), "{case}: {:?}", report.violations());
+    }
 }
 
 #[retcd_test]
