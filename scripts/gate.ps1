@@ -69,16 +69,22 @@ if (-not $env:RETCD_TEST_DEADLINE_SCALE) { $env:RETCD_TEST_DEADLINE_SCALE = '3' 
 # One log root per invocation, inside the private target dir, so one gate run's logs never mix
 # with another's. Separating the binaries *within* a run is already config-log's job: it writes
 # each into a test_run_id subdirectory under this root.
+# An absolute target dir is used as-is: Join-Path would prefix $PWD onto `C:/...` and put
+# the logs inside the repo. A rooted `/c/...` is kept as given, so the logs land where cargo
+# puts the target dir.
+$targetRoot = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR } else { Join-Path $PWD $env:CARGO_TARGET_DIR }
 if (-not $env:RETCD_TEST_LOG_DIR) {
     $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss')
-    # An absolute target dir is used as-is: Join-Path would prefix $PWD onto `C:/...` and put
-    # the logs inside the repo. A rooted `/c/...` is kept as given, so the logs land where cargo
-    # puts the target dir.
-    $targetRoot = if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) { $env:CARGO_TARGET_DIR } else { Join-Path $PWD $env:CARGO_TARGET_DIR }
     $env:RETCD_TEST_LOG_DIR = "$targetRoot/test-logs/$stamp-$PID"
 }
+# Cluster data roots and other per-test directories (config_testkit::fs::temp_dir), one root
+# per invocation like the logs, and never %TEMP%, which held 839 of them (5.7 GB) on
+# 2026-09-27. Kept out of the log root, whose `<run>/*/*.jsonl` glob must match only logs.
+# A root the script chose is removed after a passing test stage; one you set is left alone.
+$gateOwnsData = -not $env:RETCD_TEST_DATA_DIR
+if ($gateOwnsData) { $env:RETCD_TEST_DATA_DIR = "$targetRoot/test-data/$(Get-Date -Format 'yyyyMMdd-HHmmss')-$PID" }
 
-Write-Host "gate: target=$($env:CARGO_TARGET_DIR) scale=$($env:RETCD_TEST_DEADLINE_SCALE) logs=$($env:RETCD_TEST_LOG_DIR)"
+Write-Host "gate: target=$($env:CARGO_TARGET_DIR) scale=$($env:RETCD_TEST_DEADLINE_SCALE) logs=$($env:RETCD_TEST_LOG_DIR) data=$($env:RETCD_TEST_DATA_DIR)"
 
 function Invoke-Cargo([string[]]$Arguments) {
     & cargo @Arguments
@@ -135,6 +141,10 @@ if ($Stage -in 'test', 'all') {
     $scoped = $CargoArgs | Where-Object { $_ -eq '-p' -or $_ -like '-p*' -or $_ -eq '--package' -or $_ -like '--package=*' }
     $scope = if ($scoped) { @() } else { @('--workspace') }
     Invoke-Cargo (@('test') + $scope + @('--no-fail-fast') + $CargoArgs)
+    # Reached only when cargo passed. Every test process has exited by now, so no file under
+    # the root is open, and this takes what a dropped `Cluster` could not remove before its
+    # process ended. A failing run keeps its data for inspection.
+    if ($gateOwnsData -and (Test-Path $env:RETCD_TEST_DATA_DIR)) { Remove-Item -Recurse -Force $env:RETCD_TEST_DATA_DIR }
 }
 
 Write-Host "gate: $Stage OK"

@@ -1085,8 +1085,9 @@ pub struct Cluster {
     slots: Mutex<BTreeMap<NodeId, NodeSlot>>,
     netfault: NetFault,
     gossip: GossipControl,
-    /// Owns every node's data directory. Dropped last, after `shutdown` has closed the stores,
-    /// because Windows will not delete a directory RocksDB still has open (TA-16.3).
+    /// Owns every node's data directory. Removed only after the stores have closed, because
+    /// Windows will not delete a directory RocksDB still has open (TA-16.3): by `shutdown`, or
+    /// by `Drop` on a background thread when `shutdown` never ran.
     data_root: Option<tempfile::TempDir>,
     /// Last `compact_revision` observed per node by [`Cluster::assert_journal_invariants`]
     /// (test plan §3.8): the monotonicity half of that helper's contract needs a baseline from
@@ -2889,15 +2890,55 @@ impl Cluster {
     ///
     /// Awaiting the server handles is what makes "the ports are free afterwards" true; drop
     /// alone only *signals* shutdown.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         for id in self.ids() {
             self.stop_node(id).await;
         }
         // Only now may the data directories go. Windows refuses to delete a directory RocksDB
         // still has open, so the order here is the difference between a clean test and a
         // sporadic "directory not empty" on teardown (TA-16.3).
-        drop(self.slots);
-        drop(self.data_root);
+        drop(std::mem::take(&mut *self.lock()));
+        let Some(root) = self.data_root.take() else {
+            return;
+        };
+        // The nodes are stopped, but the last clone of each store belongs to tasks that stopping
+        // only released, so RocksDB's `LOCK` can outlive the `await` above. Removal is polled,
+        // and the poll's sleep is what lets those tasks finish. The wait is short on purpose: a
+        // row still holding a client or a watch stream keeps its store open until it returns,
+        // and waiting longer for that only slows the row down. The reaper takes those.
+        let path = root.path().to_path_buf();
+        let removed = poll_until(self.deadline(1), self.poll_interval(), || {
+            crate::fs::try_remove(&path).then_some(())
+        })
+        .await;
+        if removed.is_err() {
+            tracing::warn!(
+                data_root = %path.display(),
+                "data root still in use after shutdown; removing it once its stores close"
+            );
+            crate::fs::remove_when_closed(root);
+        }
+    }
+}
+
+/// A cluster dropped without [`Cluster::shutdown`] — a row that never calls it, or one that
+/// panicked — still has its data root removed.
+///
+/// Dropping the slots only signals the servers; the stores close when the test's runtime drops
+/// the tasks holding them, after this returns. So the removal waits on another thread. Before
+/// this existed, the `TempDir` dropped here with every store open, and each such drop left a
+/// half-deleted data root in the temp directory for good (839 of them, 5.7 GB, by 2026-09-27).
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        let Some(root) = self.data_root.take() else {
+            return;
+        };
+        drop(std::mem::take(&mut *self.lock()));
+        tracing::info!(
+            data_root = %root.path().display(),
+            "cluster dropped without shutdown; its data root goes once its stores close"
+        );
+        crate::fs::remove_when_closed(root);
     }
 }
 

@@ -183,6 +183,13 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   with `RETCD_TEST_DEADLINE_SCALE=3`, a private `CARGO_TARGET_DIR` and a fresh
   `RETCD_TEST_LOG_DIR`; a bare `cargo test` on a loaded host gives capacity rows a third of the
   patience they were accepted with and fails rows that are not broken.
+- It also sets `RETCD_TEST_DATA_DIR` to `<target>/test-data/<stamp>-<pid>`, where
+  `config_testkit::fs::temp_dir` puts cluster data roots, and removes it after a passing test
+  stage. Unset, they go to `%TEMP%`, which held 839 of them (5.7 GB) on 2026-09-27: `Cluster`'s
+  `TempDir` dropped while RocksDB still held `LOCK`, Windows refused that file, and the drop
+  swallowed the error. `shutdown` now removes the root after the stores close. A `Cluster`
+  dropped without `shutdown` is removed by a background thread, which loses the race when its
+  test is the binary's last; the gate's removal covers that. A failed or killed run keeps them.
 - The scale stretches deadlines only. Raft timers keep their real values, so the rows still
   test the real thing. Any value you set in the environment wins over the script's default.
 - Never run two cargo invocations against one target directory. The second does not merely wait:

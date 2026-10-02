@@ -44,11 +44,22 @@ case "$CARGO_TARGET_DIR" in
   *) target_abs="$PWD/$CARGO_TARGET_DIR" ;;
 esac
 export RETCD_TEST_LOG_DIR="${RETCD_TEST_LOG_DIR:-$target_abs/test-logs/$(date +%Y%m%d-%H%M%S)-$$}"
+# Cluster data roots and other per-test directories (config_testkit::fs::temp_dir), one root
+# per invocation like the logs, and never %TEMP%, which held 839 of them (5.7 GB) on
+# 2026-09-27. Kept out of the log root, whose `<run>/*/*.jsonl` glob must match only logs.
+# A root the script chose is removed after a passing test stage; one you set is left alone.
+if [ -z "${RETCD_TEST_DATA_DIR:-}" ]; then
+  export RETCD_TEST_DATA_DIR="$target_abs/test-data/$(date +%Y%m%d-%H%M%S)-$$"
+  gate_owns_data=1
+else
+  export RETCD_TEST_DATA_DIR
+  gate_owns_data=0
+fi
 
 stage="${1:-all}"
 [ $# -gt 0 ] && shift || true
 
-echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE logs=$RETCD_TEST_LOG_DIR"
+echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE logs=$RETCD_TEST_LOG_DIR data=$RETCD_TEST_DATA_DIR"
 
 run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
 # The second non-cargo check. Every M7 test plan says which contract commit it was written
@@ -74,6 +85,10 @@ run_test() {
     esac
   done
   cargo test "${scope[@]}" --no-fail-fast "$@"
+  # Reached only when cargo passed (`set -e`). Every test process has exited by now, so no
+  # file under the root is open, and this takes what a dropped `Cluster` could not remove
+  # before its process ended. A failing run keeps its data for inspection.
+  if [ "$gate_owns_data" = 1 ]; then rm -rf "$RETCD_TEST_DATA_DIR"; fi
 }
 # perl with JSON::PP ships with every Git for Windows and every Linux perl; no jq needed.
 run_deps() {
