@@ -66,6 +66,9 @@ if (-not $env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR = '.rtargets/gate' }
 # Incremental artifacts are worthless for a full clean gate and cost disk on every run.
 $env:CARGO_INCREMENTAL = '0'
 if (-not $env:RETCD_TEST_DEADLINE_SCALE) { $env:RETCD_TEST_DEADLINE_SCALE = '3' }
+# Port-0 binds draw from this range, below the OS dynamic pool, which other processes on the
+# host can exhaust (os error 10055). See crates/config-gossip/src/ports.rs.
+if (-not $env:RETCD_TEST_PORT_RANGE) { $env:RETCD_TEST_PORT_RANGE = '20000-26999' }
 # One log root per invocation, inside the private target dir, so one gate run's logs never mix
 # with another's. Separating the binaries *within* a run is already config-log's job: it writes
 # each into a test_run_id subdirectory under this root.
@@ -84,7 +87,7 @@ if (-not $env:RETCD_TEST_LOG_DIR) {
 $gateOwnsData = -not $env:RETCD_TEST_DATA_DIR
 if ($gateOwnsData) { $env:RETCD_TEST_DATA_DIR = "$targetRoot/test-data/$(Get-Date -Format 'yyyyMMdd-HHmmss')-$PID" }
 
-Write-Host "gate: target=$($env:CARGO_TARGET_DIR) scale=$($env:RETCD_TEST_DEADLINE_SCALE) logs=$($env:RETCD_TEST_LOG_DIR) data=$($env:RETCD_TEST_DATA_DIR)"
+Write-Host "gate: target=$($env:CARGO_TARGET_DIR) scale=$($env:RETCD_TEST_DEADLINE_SCALE) ports=$($env:RETCD_TEST_PORT_RANGE) logs=$($env:RETCD_TEST_LOG_DIR) data=$($env:RETCD_TEST_DATA_DIR)"
 
 function Invoke-Cargo([string[]]$Arguments) {
     & cargo @Arguments

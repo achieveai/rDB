@@ -1262,7 +1262,7 @@ fn node_start_fatal(error: config_engine::EngineError) -> Fatal {
 }
 
 async fn bind(what: &'static str, addr: std::net::SocketAddr) -> Result<TcpListener, Fatal> {
-    TcpListener::bind(addr)
+    config_gossip::ports::bind_tcp(what, addr)
         .await
         .map_err(|e| Fatal::rejected("bind_failed", format!("{what} listener on {addr}: {e}")))
 }

@@ -34,6 +34,9 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-.rtargets/gate}"
 # Incremental artifacts are worthless for a full clean gate and cost disk on every run.
 export CARGO_INCREMENTAL=0
 export RETCD_TEST_DEADLINE_SCALE="${RETCD_TEST_DEADLINE_SCALE:-3}"
+# Port-0 binds draw from this range, below the OS dynamic pool, which other processes on the
+# host can exhaust (os error 10055). See crates/config-gossip/src/ports.rs.
+export RETCD_TEST_PORT_RANGE="${RETCD_TEST_PORT_RANGE:-20000-26999}"
 # One log root per invocation, inside the private target dir, so one gate run's logs never mix
 # with another's. Separating the binaries *within* a run is already config-log's job: it writes
 # each into a test_run_id subdirectory under this root.
@@ -59,7 +62,7 @@ fi
 stage="${1:-all}"
 [ $# -gt 0 ] && shift || true
 
-echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE logs=$RETCD_TEST_LOG_DIR data=$RETCD_TEST_DATA_DIR"
+echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE ports=$RETCD_TEST_PORT_RANGE logs=$RETCD_TEST_LOG_DIR data=$RETCD_TEST_DATA_DIR"
 
 run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
 # The second non-cargo check. Every M7 test plan says which contract commit it was written

@@ -30,43 +30,12 @@ use crate::meta::{
     decode_hint, decode_hint_extras, encode_hint_with_extras, fingerprint_hex,
     gossip_key_fingerprint, AcceptedGossipKeys, GossipKeyFingerprint,
 };
+use crate::ports::{self, random_port_in, CandidateError, DYNAMIC_PORTS};
 
 /// Depth of the membership-event channel. Events only *wake* the refresher, which then
 /// rebuilds the snapshot from authoritative membership, so a full channel loses nothing but
 /// timeliness.
 const EVENT_CHANNEL_DEPTH: usize = 256;
-
-/// How many candidate ports `start` tries when the caller asked for an ephemeral port
-/// (`bind_addr` port `0`). Each candidate is a whole memberlist bind: TCP, then UDP on the
-/// *same* port with no retry, so a port free for TCP but refused for UDP fails the attempt.
-/// A fixed port is tried once, because a taken fixed port is the caller's problem.
-///
-/// The candidates are drawn at random from [`DYNAMIC_PORTS`], not left to the OS. Windows hands
-/// out ephemeral ports from a rotating pointer, so OS picks made moments apart are neighbours.
-/// On 2026-09-30 three daemons failed on ports 55483-55485 after the old loop's 8 OS picks,
-/// all inside one 100-port block of Windows' UDP exclusions (`os error 10013`). Random draws
-/// are independent: with a few hundred excluded ports in 16384, 32 refusals in a row does not
-/// happen by chance.
-const EPHEMERAL_BIND_ATTEMPTS: u32 = 32;
-
-/// Where ephemeral gossip candidates are drawn from: the IANA dynamic range (RFC 6335), which
-/// is also Windows' default ephemeral range. A port another socket holds, or one the OS
-/// excludes, refuses the bind and the next candidate is tried.
-const DYNAMIC_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
-
-/// One uniformly drawn port from [`DYNAMIC_PORTS`].
-///
-/// `RandomState` is std's per-process random seed, advanced on every call, so this needs no
-/// dependency for what is not a security decision.
-fn random_dynamic_port() -> u16 {
-    use std::hash::{BuildHasher, Hasher};
-    let draw = std::collections::hash_map::RandomState::new()
-        .build_hasher()
-        .finish();
-    let width = u64::from(DYNAMIC_PORTS.end() - DYNAMIC_PORTS.start()) + 1;
-    let offset = u16::try_from(draw % width).expect("an offset below the range width fits u16");
-    DYNAMIC_PORTS.start() + offset
-}
 
 type GossipTransport = TokioNetTransport<SmolStr, TokioSocketAddrResolver, TokioTcp>;
 type TransportOptions = NetTransportOptions<SmolStr, TokioSocketAddrResolver, TokioTcp>;
@@ -249,25 +218,40 @@ impl GossipNode {
     ///
     /// [`GossipError::HintTooLarge`] if `self_hint` does not fit the 512-byte metadata budget
     /// (checked here because `memberlist` would otherwise panic),
-    /// [`GossipError::Config`] for an unusable label, and [`GossipError::Start`] if the
-    /// socket cannot be bound. A fixed port is tried once and never moved. An ephemeral port
-    /// (port `0`) fails only after [`EPHEMERAL_BIND_ATTEMPTS`] random candidates from
-    /// [`DYNAMIC_PORTS`] have each been refused for TCP or UDP.
+    /// [`GossipError::Config`] for an unusable label or a malformed
+    /// [`ports::PORT_RANGE_ENV`], and [`GossipError::Start`] if the socket cannot be bound. A
+    /// fixed port is tried once and never moved. An ephemeral port (port `0`) fails only after
+    /// [`ports::EPHEMERAL_BIND_ATTEMPTS`] random candidates have each been refused for TCP or
+    /// UDP. They come from [`ports::PORT_RANGE_ENV`] when it is set, else from
+    /// [`DYNAMIC_PORTS`].
     pub async fn start(
         cfg: GossipConfig,
         self_hint: ObservedPeerHint,
     ) -> Result<Self, GossipError> {
-        Self::start_with_ports(cfg, self_hint, random_dynamic_port).await
+        // Read only for an ephemeral port: a fixed port never moves, so a malformed range
+        // must not be able to fail it.
+        let env_range = if cfg.bind_addr.port() == 0 {
+            ports::port_range_from_env().map_err(GossipError::Config)?
+        } else {
+            None
+        };
+        let draw_from = env_range.clone().unwrap_or(DYNAMIC_PORTS);
+        Self::start_with_ports(cfg, self_hint, env_range, move || {
+            random_port_in(&draw_from)
+        })
+        .await
     }
 
     /// [`Self::start`] with the source of ephemeral candidate ports injected, so a test can
-    /// hand it ports it knows will be refused.
+    /// hand it ports it knows will be refused. `env_range` is the [`ports::PORT_RANGE_ENV`]
+    /// range those candidates come from, if one is set; it only names the range in the error.
     ///
     /// `next_port` is called once per ephemeral attempt and never for a fixed port.
     async fn start_with_ports(
         cfg: GossipConfig,
         self_hint: ObservedPeerHint,
-        mut next_port: impl FnMut() -> u16,
+        env_range: Option<std::ops::RangeInclusive<u16>>,
+        next_port: impl FnMut() -> u16,
     ) -> Result<Self, GossipError> {
         let span = tracing::info_span!(
             "gossip",
@@ -280,24 +264,29 @@ impl GossipNode {
             if cfg.bind_addr.port() != 0 {
                 return Self::start_instrumented(cfg, self_hint, span).await;
             }
-            let mut attempt = 1;
-            loop {
-                let mut candidate = cfg.clone();
-                candidate.bind_addr.set_port(next_port());
-                let port = candidate.bind_addr.port();
-                match Self::start_instrumented(candidate, self_hint.clone(), span.clone()).await {
-                    Err(GossipError::Start(e)) if attempt < EPHEMERAL_BIND_ATTEMPTS => {
-                        debug!(attempt, port, error = %e, "gossip_ephemeral_bind_retry");
-                        attempt += 1;
-                    }
-                    Err(GossipError::Start(e)) => {
-                        return Err(GossipError::Start(format!(
-                            "{e} (last of {EPHEMERAL_BIND_ATTEMPTS} ephemeral candidate ports)"
-                        )))
-                    }
-                    result => return result,
-                }
-            }
+            ports::bind_candidates(
+                "gossip",
+                env_range.as_ref(),
+                next_port,
+                |port| {
+                    let mut candidate = cfg.clone();
+                    candidate.bind_addr.set_port(port);
+                    Self::start_instrumented(candidate, self_hint.clone(), span.clone())
+                },
+                |e| matches!(e, GossipError::Start(_)),
+            )
+            .await
+            .map_err(|e| match e {
+                CandidateError::Exhausted {
+                    last: GossipError::Start(e),
+                    attempts,
+                    env_range,
+                } => GossipError::Start(format!(
+                    "{e}{}",
+                    ports::exhausted_note(attempts, env_range.as_ref())
+                )),
+                CandidateError::Fatal(e) | CandidateError::Exhausted { last: e, .. } => e,
+            })
         }
         .instrument(outer)
         .await
@@ -1095,13 +1084,17 @@ mod tests {
         // After the refused run, the production draw. Not `0`: letting the OS choose is the
         // neighbour-pointer failure this start exists to avoid. On 2026-10-01 it handed out
         // 55604, inside a new excluded UDP block, and every later `0` drew a neighbour.
+        // The production draw honours the port range exactly as `start` does.
+        let draw_from = ports::port_range_from_env()
+            .expect("a valid port range")
+            .unwrap_or(DYNAMIC_PORTS);
         let picker = || {
             drawn += 1;
-            queue.next().unwrap_or_else(random_dynamic_port)
+            queue.next().unwrap_or_else(|| random_port_in(&draw_from))
         };
 
         let cfg = GossipConfig::new(cluster(), NodeId(1), loopback(0));
-        let node = GossipNode::start_with_ports(cfg, hint(), picker)
+        let node = GossipNode::start_with_ports(cfg, hint(), None, picker)
             .await
             .unwrap_or_else(|e| {
                 panic!("start must survive {BLOCKED_RUN} refused candidates {blocked:?}: {e}")
@@ -1131,7 +1124,7 @@ mod tests {
     /// 1000-port window has probability below 1e-300, so this cannot flake.
     #[test]
     fn gossip_default_candidates_spread_across_the_dynamic_range() {
-        let draws: Vec<u16> = (0..256).map(|_| random_dynamic_port()).collect();
+        let draws: Vec<u16> = (0..256).map(|_| random_port_in(&DYNAMIC_PORTS)).collect();
         assert!(
             draws.iter().all(|p| DYNAMIC_PORTS.contains(p)),
             "every candidate is in {DYNAMIC_PORTS:?}: {draws:?}"
@@ -1151,7 +1144,7 @@ mod tests {
         let mut drawn = 0usize;
 
         let cfg = GossipConfig::new(cluster(), NodeId(1), fixed);
-        let result = GossipNode::start_with_ports(cfg, hint(), || {
+        let result = GossipNode::start_with_ports(cfg, hint(), None, || {
             drawn += 1;
             0
         })
@@ -1173,5 +1166,21 @@ mod tests {
             "a fixed port must never be swapped for a candidate"
         );
         drop(blocker);
+    }
+
+    /// With a range set, an ephemeral gossip bind (TCP and UDP on one port) lands inside it.
+    #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_ephemeral_bind_lands_in_the_port_range() {
+        let range = 20000..=26999;
+        let draw_from = range.clone();
+        let cfg = GossipConfig::new(cluster(), NodeId(1), loopback(0));
+        let node = GossipNode::start_with_ports(cfg, hint(), Some(range.clone()), move || {
+            random_port_in(&draw_from)
+        })
+        .await
+        .expect("gossip binds inside the range");
+        let bound = node.advertise_addr().port();
+        assert!(range.contains(&bound), "{bound} outside {range:?}");
+        node.shutdown().await;
     }
 }

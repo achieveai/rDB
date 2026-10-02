@@ -243,6 +243,19 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
 - So a `10013` from gossip now means 32 independent refusals — a host problem worth reading,
   not a flake. The error ends `(last of 32 ephemeral candidate ports)`. Each retry is a debug
   event `gossip_ephemeral_bind_retry` with `attempt`, `port` and `error`.
+- **The gate now keeps port-`0` listeners out of the dynamic pool altogether.** On 2026-10-01
+  two IIS `w3wp` processes held ~15,700 of its 16,384 ports in state `Bound`
+  (`Get-NetTCPConnection -State Bound`), so a port-`0` bind failed with `10055`, not `10013`.
+  `RETCD_TEST_PORT_RANGE=LO-HI` (gate default `20000-26999`, printed as `ports=` on the
+  `gate:` line) makes every port-`0` bind — gossip, the daemon's peer/client/health listeners,
+  `config_testkit::ports::ephemeral_listener` — draw 32 random candidates from that range.
+  Unset, nothing changes. The one loop lives in `config_gossip::ports`; its events are
+  `{site}_ephemeral_bind` and `{site}_ephemeral_bind_retry` under logger `retcd_ports`.
+- **It cannot move outbound connects.** Every `connect` still takes its local port from the
+  dynamic pool, and so does memberlist's own push/pull. With the pool held, the failure moves
+  to `connect to 127.0.0.1:<port in range>: ... (os error 10055)` and to gossip rows that
+  "did not observe each other within 10s" after `gossip seed join incomplete` with `10055`.
+  That is the host. Count `Bound` ports and their owners before reading it as a regression.
 
 ## Counting M7 rows: run the script, never quote a plan
 
