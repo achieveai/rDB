@@ -1279,9 +1279,10 @@ mod tests {
     /// is kept because every row below reads better with it, but the doc that said "every offer
     /// declines" contradicted the assertion three lines under it
     /// (`answered == [1, 0, 0, 0, 0, 0]`). `Authority::step` answers `Ok` to every
-    /// `EventKind::Control` and `on_control` returns an empty vector for a `Conflict`, so A1
-    /// *answers with nothing* — which is [`DispatchOutcome::Answered { effects: 0 }`] in the
-    /// trace and is deliberately not [`DispatchOutcome::Declined`].
+    /// `EventKind::Control`, and a CAS of a key A1 never writes matches nothing it asked for, so
+    /// A1 answers with exactly `Ignored(UnmatchedCompletion)` — which is
+    /// [`DispatchOutcome::Answered { effects: 1 }`] in the trace and is deliberately not
+    /// [`DispatchOutcome::Declined`]. Until PR #1 R1-F012 (A-R24) it was `[]`, `effects: 0`.
     fn nobody_answers(at: Tick) -> SeedEvent {
         SeedEvent {
             at,
@@ -1913,17 +1914,18 @@ mod tests {
             report.steps_offered,
             "the trace and the report count the same offers"
         );
-        // A1 answers `Ok` to every control event and returns nothing for a losing CAS. That is
-        // `Answered { effects: 0 }` and deliberately not `Declined` — the distinction the
+        // A1 answers `Ok` to every control event, and a losing CAS of a key it never writes with
+        // exactly one `Ignored(UnmatchedCompletion)` (A-R24; PR #1 R1-F012, was `[]`). That is
+        // `Answered { effects: 1 }` and deliberately not `Declined` — the distinction the
         // `RunReport::answered` doc used to get wrong.
-        assert_eq!(recorded[0].1, DispatchOutcome::Answered { effects: 0 });
+        assert_eq!(recorded[0].1, DispatchOutcome::Answered { effects: 1 });
         assert!(
             recorded[1..]
                 .iter()
                 .all(|(_, outcome)| *outcome == DispatchOutcome::Declined),
             "{recorded:?}"
         );
-        assert_eq!(report.effects_offered, 0, "and no effects were produced");
+        assert_eq!(report.effects_offered, 1, "A1's Ignored is the only effect");
         // Probe M11: `== 0` was the only assertion on this counter in the workspace, and it
         // passes just as well against a counter that never increments. A run A1 acts on offers
         // more than its first pop produces, so a counter that stopped after one pop fails too.

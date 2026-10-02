@@ -901,6 +901,13 @@ pub enum AuthorityIgnoreReason {
     /// renewal this node **did** issue, arriving after the fence. This is a completion of nothing
     /// it issued. [`Self::StaleAuthorityView`] is a view held, not a completion received.
     UnmatchedCompletion,
+    /// A held node's `ControlEvent::WatchProgress`: a liveness watermark that moves the watch
+    /// cursor and nothing else, so it answers this reason rather than `[]` (lead ruling A-R24).
+    ///
+    /// Appended by kernel-a for PR #1 review R1-F012, approved by Gautam 2026-10-01. No landed
+    /// name fits: [`Self::StaleAuthorityView`] is a superseded view and the node's view stands;
+    /// the others name a refusal, a sample or a completion, and a watermark is none of those.
+    WatchProgressOnly,
 }
 
 /// Which binding of an [`crate::contracts::event::EventKind::ExternalFenceVerified`] claim did

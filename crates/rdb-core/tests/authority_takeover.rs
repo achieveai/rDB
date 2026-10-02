@@ -506,6 +506,13 @@ fn shapes(effects: &[Effect]) -> Vec<Shape> {
         .collect()
 }
 
+/// What a held probe answers when the sweep proves nothing: the `WatchProgress` probe's own
+/// `Ignored(WatchProgressOnly)` (M7A-195, PR #1 R1-F012) and nothing from the sweep, which is
+/// not an answer (A-R51). Was `[]`.
+fn progress_only() -> Vec<Shape> {
+    vec![Shape::Ignored(AuthorityIgnoreReason::WatchProgressOnly, P1)]
+}
+
 /// The shapes that are not [`Shape::Other`]: what a snapshot step says about takeovers, without
 /// the install's own facts and the re-watch.
 fn takeover_shapes(effects: &[Effect]) -> Vec<Shape> {
@@ -1342,7 +1349,7 @@ fn t9_expiry_is_proven_exactly_past_f_plus_epsilon_plus_delta() {
     let short = kernel.step(&ctx(PROOF_TICK - 1), &tick(12)).expect("built");
     assert_eq!(
         shapes(&short),
-        Vec::new(),
+        progress_only(),
         "T10: the sweep is not an answer"
     );
 
@@ -1368,7 +1375,7 @@ fn a_proven_entry_is_never_proven_again() {
 
     let effects = kernel.step(&ctx(900), &tick(13)).expect("built");
 
-    assert_eq!(shapes(&effects), Vec::new());
+    assert_eq!(shapes(&effects), progress_only());
 }
 
 /// T9's admissibility: an unbounded mode or a stale sample proves nothing, however far past `F`.
@@ -1400,7 +1407,7 @@ fn t10_an_unfrozen_entry_proves_nothing() {
 
     let effects = kernel.step(&ctx(900), &tick(12)).expect("built");
 
-    assert_eq!(shapes(&effects), Vec::new());
+    assert_eq!(shapes(&effects), progress_only());
 }
 
 /// The scope rule: the sweep runs only while `Held`. A fenced node keeps its entry (it lives on
@@ -1838,7 +1845,7 @@ fn m7a_52_takeover_expiry_proven_requires_linearizable_read_and_margin() {
 fn m7a_53_takeover_expiry_not_proven_at_margin() {
     let (kernel, effects) = wide_sweep_at(WIDE_PROOF_TICK - 1);
 
-    assert_eq!(shapes(&effects), Vec::new());
+    assert_eq!(shapes(&effects), progress_only());
     assert_eq!(kernel.view().takeover[&TAKEN], created(true));
     assert!(kernel.state().is_held());
 }

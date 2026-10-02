@@ -435,6 +435,10 @@ fn route(ctx: &StepCtx<'_>, event: &Event, slot: &mut Slot, effect: PubEffect) -
         PubEffect::Status(entry) => {
             EffectKind::Kernel(KernelEffect::Publication(PublicationEffect::Status(entry)))
         }
+        // The status index is full (K-A-12): said, never an empty answer (A-R24).
+        PubEffect::StatusRefused { error, .. } => EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::Error(error),
+        }),
         PubEffect::Reply {
             request,
             outcome: ReplyOutcome::Published { result },

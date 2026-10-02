@@ -7,13 +7,19 @@
 //! [`StatusIndex::lookup`] is a total function with three answers for an absent identity (lead
 //! ruling A-R10), and no answer anywhere proves nonexecution (§4.3 invariant 5): there is no
 //! `NotExecuted` variant to return by accident.
+//!
+//! The index holds at most [`StatusIndex::cap`] entries (plan §13 Q-4, K-A-12). Absent a trim it
+//! stops there: a write that would add an entry is refused `OVERLOADED` and holds nothing, so the
+//! identity answers `Unknown`. Overwrites, held entries and every answer are untouched.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::contracts::errors::ErrorKind;
 use crate::contracts::ids::{Generation, RequestIdentity, Seq};
 use crate::contracts::publication::{StatusEntry, StatusOutcome};
 use crate::contracts::recovery::RetainedStatusMap;
 use crate::contracts::txn::{Outcome as TxnOutcome, TxnResult, TxnStatus};
+use crate::transaction::RETENTION_CAP_ENTRIES;
 
 /// The wire answer for `outcome` (test plan KA-9). Never [`TxnStatus::Unresolved`]: that is
 /// T1's answer for a queue behind a freeze, and no state here maps to it.
@@ -35,7 +41,7 @@ pub const fn to_wire(outcome: StatusOutcome) -> TxnStatus {
 }
 
 /// The per-request status index.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusIndex {
     entries: BTreeMap<(Generation, RequestIdentity), StatusEntry>,
     /// Generations this index still speaks about, and the trim watermark in each. Present means
@@ -43,15 +49,60 @@ pub struct StatusIndex {
     retained_from_seq: BTreeMap<Generation, Seq>,
     /// Generations dropped by [`Self::retire`].
     retired: BTreeSet<Generation>,
+    /// The most entries held at once, over every generation.
+    cap: usize,
+    /// The generations holding an entry for each request: `entries` keyed the other way round,
+    /// so [`Self::lookup_any`] is logarithmic (PR #1 R1-F007). Never holds an empty set.
+    by_request: BTreeMap<RequestIdentity, BTreeSet<Generation>>,
+}
+
+impl Default for StatusIndex {
+    /// An empty index with the default cap, [`RETENTION_CAP_ENTRIES`].
+    fn default() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            retained_from_seq: BTreeMap::new(),
+            retired: BTreeSet::new(),
+            cap: RETENTION_CAP_ENTRIES,
+            by_request: BTreeMap::new(),
+        }
+    }
 }
 
 impl StatusIndex {
-    /// An index that speaks about `generation` and nothing else.
+    /// An index that speaks about `generation` and nothing else, capped at
+    /// [`RETENTION_CAP_ENTRIES`].
     #[must_use]
     pub fn new(generation: Generation) -> Self {
-        let mut index = Self::default();
+        Self::with_cap(generation, RETENTION_CAP_ENTRIES)
+    }
+
+    /// [`Self::new`], holding at most `cap` entries.
+    #[must_use]
+    pub fn with_cap(generation: Generation, cap: usize) -> Self {
+        let mut index = Self {
+            cap,
+            ..Self::default()
+        };
         index.open(generation);
         index
+    }
+
+    /// The most entries this index holds at once (plan §13 Q-4: `retention_cap_entries`).
+    #[must_use]
+    pub const fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// Insert `entry` at `key`, in both maps.
+    fn hold(&mut self, key: (Generation, RequestIdentity), entry: StatusEntry) {
+        self.entries.insert(key, entry);
+        self.by_request.entry(key.1).or_default().insert(key.0);
+    }
+
+    /// Whether `key` is a new entry that the cap leaves no room for.
+    fn full_for(&self, key: &(Generation, RequestIdentity)) -> bool {
+        self.entries.len() >= self.cap && !self.entries.contains_key(key)
     }
 
     /// Start speaking about `generation`. A no-op for a retired or already open one.
@@ -70,10 +121,20 @@ impl StatusIndex {
     }
 
     /// Write `entry` over whatever the index held for its request in its generation.
-    pub fn record(&mut self, entry: StatusEntry) {
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Overloaded`] when the entry would be a new one and the index is at its
+    /// [`Self::cap`]. Nothing is written; the generation is still opened, so the identity answers
+    /// `Unknown`, never `StatusExpired`.
+    pub fn record(&mut self, entry: StatusEntry) -> Result<(), ErrorKind> {
         self.open(entry.lineage.generation);
-        self.entries
-            .insert((entry.lineage.generation, entry.request), entry);
+        let key = (entry.lineage.generation, entry.request);
+        if self.full_for(&key) {
+            return Err(ErrorKind::Overloaded);
+        }
+        self.hold(key, entry);
+        Ok(())
     }
 
     /// The entry for `request` in `generation`, if one is held.
@@ -108,11 +169,11 @@ impl StatusIndex {
     /// generation nothing proves the one the client meant was retired (lead ruling A-R63).
     #[must_use]
     pub fn lookup_any(&self, request: RequestIdentity) -> StatusOutcome {
-        self.entries
-            .iter()
-            .rev()
-            .find(|((_, id), _)| *id == request)
-            .map_or(StatusOutcome::Unknown, |(_, entry)| entry.outcome)
+        self.by_request
+            .get(&request)
+            .and_then(BTreeSet::last)
+            .and_then(|generation| self.entries.get(&(*generation, request)))
+            .map_or(StatusOutcome::Unknown, |entry| entry.outcome)
     }
 
     /// Kernel-b §5.8's three-way rule over the predecessor generation's `Published` entries,
@@ -145,10 +206,15 @@ impl StatusIndex {
     /// truthful — a dedup row exists only for a request that was applied.
     ///
     /// Returns whether the entry was added.
-    pub fn restore(&mut self, entry: StatusEntry) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// [`ErrorKind::Overloaded`] when the entry would be added and the index is at its
+    /// [`Self::cap`], exactly as [`Self::record`] refuses. The generation is still opened.
+    pub fn restore(&mut self, entry: StatusEntry) -> Result<bool, ErrorKind> {
         let generation = entry.lineage.generation;
         if self.retired.contains(&generation) {
-            return false;
+            return Ok(false);
         }
         let floor = self
             .retained_from_seq
@@ -156,15 +222,18 @@ impl StatusIndex {
             .copied()
             .unwrap_or(Seq::ZERO);
         if entry.seq.is_some_and(|seq| seq < floor) {
-            return false;
+            return Ok(false);
         }
         self.open(generation);
         let key = (generation, entry.request);
         if self.entries.contains_key(&key) {
-            return false;
+            return Ok(false);
         }
-        self.entries.insert(key, entry);
-        true
+        if self.full_for(&key) {
+            return Err(ErrorKind::Overloaded);
+        }
+        self.hold(key, entry);
+        Ok(true)
     }
 
     /// Drop `generation`'s entries below `below` and remember the watermark. Absence below it
@@ -173,20 +242,33 @@ impl StatusIndex {
         if self.retired.contains(&generation) {
             return;
         }
-        self.entries
-            .retain(|(gen, _), entry| *gen != generation || entry.seq.is_some_and(|s| s >= below));
+        let by_request = &mut self.by_request;
+        self.entries.retain(|(gen, request), entry| {
+            let keep = *gen != generation || entry.seq.is_some_and(|s| s >= below);
+            if !keep {
+                forget(by_request, *request, generation);
+            }
+            keep
+        });
         let floor = self.retained_from_seq.entry(generation).or_insert(below);
         *floor = (*floor).max(below);
     }
 
     /// Drop `generation` whole. Every later lookup in it answers `StatusExpired`.
     pub fn retire(&mut self, generation: Generation) {
-        self.entries.retain(|(gen, _), _| *gen != generation);
+        let by_request = &mut self.by_request;
+        self.entries.retain(|(gen, request), _| {
+            let keep = *gen != generation;
+            if !keep {
+                forget(by_request, *request, generation);
+            }
+            keep
+        });
         self.retained_from_seq.remove(&generation);
         self.retired.insert(generation);
     }
 
-    /// How many entries are held. The index has no capacity policy yet (K-A-12 is owed).
+    /// How many entries are held. Never more than [`Self::cap`].
     #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -196,6 +278,20 @@ impl StatusIndex {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+}
+
+/// Drop `generation` from `request`'s set in [`StatusIndex::by_request`], and the set once empty.
+fn forget(
+    by_request: &mut BTreeMap<RequestIdentity, BTreeSet<Generation>>,
+    request: RequestIdentity,
+    generation: Generation,
+) {
+    if let Some(generations) = by_request.get_mut(&request) {
+        generations.remove(&generation);
+        if generations.is_empty() {
+            by_request.remove(&request);
+        }
     }
 }
 

@@ -60,6 +60,7 @@ use rdb_core::publication::{
 };
 use rdb_core::replication::progress::{DigestLadder, DigestLookup, ProgressTracker, TrackerInit};
 use rdb_core::transaction::dedup::{dedup_key, dedup_value};
+use rdb_core::transaction::RETENTION_CAP_ENTRIES;
 
 const NODE: NodeId = NodeId(1);
 const BOOT: BootId = BootId(1);
@@ -513,7 +514,12 @@ struct Rig {
 impl Rig {
     /// `P` installed, the view pushed at authority seq 1, nothing qualifying.
     fn new() -> Self {
-        let mut rig = Self::bare();
+        Self::new_with(PubConfig::default())
+    }
+
+    /// [`Self::new`] under `config`.
+    fn new_with(config: PubConfig) -> Self {
+        let mut rig = Self::bare_with(config);
         assert_eq!(
             rig.step(view_push(P, 1)),
             vec![],
@@ -525,7 +531,12 @@ impl Rig {
     /// `P` installed, no view held. The install's snapshot view (handle `0`) is asked for and
     /// never bound here; a row that wants it bound steps `ready(0, START)`.
     fn bare() -> Self {
-        let mut p1 = Publication::new();
+        Self::bare_with(PubConfig::default())
+    }
+
+    /// [`Self::bare`] under `config`.
+    fn bare_with(config: PubConfig) -> Self {
+        let mut p1 = Publication::with_config(config);
         assert_eq!(p1.install(NODE, BOOT, lineage(), Seq(START)), open(0));
         p1.script_replication(NODE, P, ScriptedReplication::new(lineage(), CONFIG));
         let mut rig = Self {
@@ -2522,7 +2533,8 @@ fn m7a_194_status_seed_folds_only_the_predecessor_under_an_uncertain_map() {
             },
             snapshot: None,
             at: Tick::ZERO,
-        });
+        })
+        .expect("under the cap");
     }
     held.fold_recovered(&RetainedStatusMap {
         predecessor_generation: GEN,
@@ -2665,7 +2677,7 @@ fn m7a_172_recovery_folds_status_by_sequence_not_by_presence() {
     ] {
         let mut index = StatusIndex::new(GEN);
         for seq in 9..=12 {
-            index.record(entry(seq));
+            index.record(entry(seq)).expect("under the cap");
         }
         index.fold_recovered(&m);
         let got: Vec<_> = (9..=12).map(|seq| index.lookup(req(seq), GEN)).collect();
@@ -3187,6 +3199,228 @@ fn status_answers_are_a_total_function() {
         wire(TxnStatus::Unknown),
         "A-R63: without a generation nothing proves it retired"
     );
+}
+
+/// The refusal a status write past the cap answers with: `OVERLOADED`, the contract's
+/// client-facing condition (plan §13 Q-4).
+fn status_overloaded() -> EffectKind {
+    EffectKind::Kernel(KernelEffect::Ignored {
+        reason: KernelIgnoredReason::Error(ErrorKind::Overloaded),
+    })
+}
+
+/// How many status-index writes in `effects` are for request `n`.
+fn status_writes_for(effects: &[EffectKind], n: u64) -> usize {
+    effects
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                EffectKind::Kernel(KernelEffect::Publication(PublicationEffect::Status(entry)))
+                    if entry.request == req(n)
+            )
+        })
+        .count()
+}
+
+/// M7A-90's status half, on P1's own index (PR #1 review, R1-F006). Plan §13 Q-4 (lead ruling
+/// A-R24): a named capacity, `retention_cap_entries`, and `OVERLOADED` past it. The row's T1
+/// function bounds status only through T1's admission cap; this one bounds the index itself, so
+/// it holds when `StatusTrim` stops arriving while T1's own trims keep freeing room.
+///
+/// With no trim, the index stops at its cap: a write that would add an entry is refused with an
+/// explicit `Ignored(Error(Overloaded))` in place of its `Status` effect, and nothing is held for
+/// it. The candidate itself still publishes and replies: its bytes are applied, and past apply
+/// the only answers are `Published` and `UNKNOWN_OUTCOME`. Entries already held, and their
+/// answers, are untouched; the refused identity answers `Unknown`, which never proves
+/// nonexecution. A trim frees room and the next candidate is held again.
+///
+/// Red at 7e262dc: `PubConfig` had no `status_cap`, and the index grew without bound.
+#[retcd_test]
+fn m7a_90_status_index_stops_at_its_cap_without_a_trim() {
+    assert_eq!(PubConfig::default().status_cap, RETENTION_CAP_ENTRIES);
+    assert_eq!(StatusIndex::new(GEN).cap(), RETENTION_CAP_ENTRIES);
+
+    // The index alone: an overwrite at the cap is always taken, a new entry is refused.
+    let entry = |n: u64| StatusEntry {
+        request: req(n),
+        lineage: lineage(),
+        seq: Some(Seq(n)),
+        record_digest: Some(d(n)),
+        outcome: StatusOutcome::Unknown,
+        snapshot: None,
+        at: Tick::ZERO,
+    };
+    let mut index = StatusIndex::with_cap(GEN, 2);
+    assert_eq!(index.record(entry(5)), Ok(()));
+    assert_eq!(index.record(entry(6)), Ok(()));
+    assert_eq!(
+        index.record(StatusEntry {
+            outcome: published_status(5),
+            ..entry(5)
+        }),
+        Ok(()),
+        "an overwrite adds nothing"
+    );
+    assert_eq!(index.record(entry(7)), Err(ErrorKind::Overloaded));
+    assert_eq!(index.len(), 2);
+    // The seed's write meets the same cap (PR #1 tester finding F-4).
+    assert_eq!(index.restore(entry(7)), Err(ErrorKind::Overloaded));
+    assert_eq!(index.len(), 2);
+    assert_eq!(index.lookup(req(5), GEN), published_status(5));
+    assert_eq!(index.lookup(req(7), GEN), StatusOutcome::Unknown);
+    index.trim(GEN, Seq(6));
+    assert_eq!(index.record(entry(7)), Ok(()), "the trim freed room");
+    assert_eq!(index.len(), 2);
+
+    // Through P1, with a cap of 3 and no trim.
+    let mut rig = Rig::new_with(PubConfig {
+        status_cap: 3,
+        ..PubConfig::default()
+    });
+    for seq in 5..=7 {
+        rig.published(seq);
+    }
+    assert_eq!(rig.view().status.len(), 3);
+
+    let at_cap = rig.step(candidate(8, 8));
+    assert!(at_cap.contains(&status_overloaded()), "{at_cap:?}");
+    assert_eq!(status_writes_for(&at_cap, 8), 0, "{at_cap:?}");
+    assert_eq!(
+        rig.view().pending.map(|pending| pending.request),
+        Some(req(8)),
+        "the candidate itself is pending publication"
+    );
+    rig.qualify(8);
+    let c = match rig.step(gained(8)).as_slice() {
+        [EffectKind::Kernel(KernelEffect::AuthorityCheck {
+            checkpoint: Checkpoint::Publication,
+            correlation,
+            ..
+        })] => *correlation,
+        other => panic!("expected one Publication check, got {other:?}"),
+    };
+    rig.snapshot_at(8);
+    let publish = rig.step(answer(Checkpoint::Publication, c, Verdict::Admit));
+    assert!(published_any(&publish), "{publish:?}");
+    assert!(publish.contains(&status_overloaded()), "{publish:?}");
+    assert_eq!(status_writes_for(&publish, 8), 0, "{publish:?}");
+    assert_eq!(rig.view().status.len(), 3, "never past the cap");
+
+    let wire = |n: u64, status: TxnStatus| {
+        vec![EffectKind::Reply(ReplyEffect::Status {
+            identity: req(n),
+            status,
+        })]
+    };
+    assert_eq!(
+        rig.step(status(5, Some(GEN))),
+        wire(5, TxnStatus::Resolved(result(P, 5))),
+        "a held entry is untouched"
+    );
+    assert_eq!(
+        rig.step(status(8, Some(GEN))),
+        wire(8, TxnStatus::Unknown),
+        "the refused identity is Unknown, never Expired"
+    );
+    assert_eq!(rig.step(status(8, None)), wire(8, TxnStatus::Unknown));
+
+    rig.step(EventKind::Kernel(KernelEvent::StatusTrim {
+        generation: GEN,
+        below: Seq(6),
+    }));
+    assert_eq!(rig.view().status.len(), 2, "the trim freed room");
+    let (opened, _) = snapshot_ledger(&publish);
+    rig.step(ready_of(opened[0], 8));
+    rig.published(9);
+    assert_eq!(rig.view().status.len(), 3);
+    assert_eq!(
+        rig.step(status(9, Some(GEN))),
+        wire(9, TxnStatus::Resolved(result(P, 9))),
+        "held again once room was freed"
+    );
+}
+
+/// `lookup_any` answers from the newest generation holding the identity, whatever order the
+/// generations were written, trimmed, restored and retired in (PR #1 review, R1-F007). Claims no
+/// row: it pins the answers so that indexing the lookup by identity cannot change them.
+#[retcd_test]
+fn status_lookup_any_answers_the_newest_generation_that_holds_the_identity() {
+    let at = |n: u64, generation: u64, seq: u64| StatusEntry {
+        request: req(n),
+        lineage: Lineage {
+            generation: Generation(generation),
+            ..lineage()
+        },
+        seq: Some(Seq(seq)),
+        record_digest: Some(d(seq)),
+        outcome: StatusOutcome::Published {
+            result: TxnResult {
+                generation: Generation(generation),
+                ..result(P, seq)
+            },
+        },
+        snapshot: None,
+        at: Tick::ZERO,
+    };
+    let outcome = |entry: StatusEntry| entry.outcome;
+    let mut index = StatusIndex::new(Generation(3));
+    // Generations written out of order, and identities interleaved across them.
+    for entry in [
+        at(1, 5, 50),
+        at(2, 3, 30),
+        at(1, 3, 31),
+        at(3, 5, 51),
+        at(2, 4, 40),
+    ] {
+        index.record(entry).expect("under the cap");
+    }
+    assert_eq!(index.lookup_any(req(1)), outcome(at(1, 5, 50)));
+    assert_eq!(index.lookup_any(req(2)), outcome(at(2, 4, 40)));
+    assert_eq!(index.lookup_any(req(3)), outcome(at(3, 5, 51)));
+    assert_eq!(index.lookup_any(req(9)), StatusOutcome::Unknown);
+
+    // An overwrite moves the answer, not the generation.
+    index
+        .record(StatusEntry {
+            outcome: StatusOutcome::Unknown,
+            ..at(1, 5, 50)
+        })
+        .expect("under the cap");
+    assert_eq!(index.lookup_any(req(1)), StatusOutcome::Unknown);
+
+    // A trim of the newest generation falls through to the next one down.
+    index.trim(Generation(5), Seq(51));
+    assert_eq!(index.lookup_any(req(1)), outcome(at(1, 3, 31)));
+    assert_eq!(index.lookup_any(req(3)), outcome(at(3, 5, 51)));
+
+    // A restored entry in a newer generation answers; one under a trim watermark does not land.
+    assert_eq!(index.restore(at(2, 6, 60)), Ok(true));
+    assert_eq!(index.lookup_any(req(2)), outcome(at(2, 6, 60)));
+    assert_eq!(index.restore(at(1, 5, 49)), Ok(false));
+    assert_eq!(index.lookup_any(req(1)), outcome(at(1, 3, 31)));
+
+    // A retired generation is gone; with none left the answer is `Unknown`, never `Expired`.
+    index.retire(Generation(6));
+    assert_eq!(index.lookup_any(req(2)), outcome(at(2, 4, 40)));
+    index.retire(Generation(4));
+    index.retire(Generation(3));
+    assert_eq!(index.lookup_any(req(2)), StatusOutcome::Unknown);
+    assert_eq!(index.lookup_any(req(1)), StatusOutcome::Unknown);
+    assert_eq!(index.lookup_any(req(3)), outcome(at(3, 5, 51)));
+
+    // Nothing is kept for an identity no generation holds any more, through a retire or a trim
+    // (PR #1 tester finding F-6): such an index equals one that never held it, `by_request`
+    // included.
+    let mut dropped = StatusIndex::new(Generation(3));
+    dropped.record(at(1, 4, 40)).expect("under the cap");
+    dropped.record(at(2, 3, 30)).expect("under the cap");
+    dropped.retire(Generation(4));
+    dropped.trim(Generation(3), Seq(31));
+    let mut never = StatusIndex::new(Generation(3));
+    never.retire(Generation(4));
+    never.trim(Generation(3), Seq(31));
+    assert_eq!(dropped, never);
 }
 
 // ---- boots ------------------------------------------------------------------------------------
@@ -4980,6 +5214,8 @@ fn m7a_109_barrier_never_hands_out_applied_prefix() {
 ///   the fold rule it shares with `fold_recovered`; both take entries in and hand nothing out.
 ///   `is_retired` (reviewer R-1, A-R91) answers whether a generation was retired in this boot —
 ///   a generation, never a sequence or a view.
+///   `with_cap` and `cap` (PR #1 R1-F006, K-A-12) build the index with a bound and report it: a
+///   number, never a sequence or a view.
 /// - `view.rs`: the KA-8 fake's constructor and scripting.
 const PUB_FNS: [(&str, &str, &[&str]); 4] = [
     (
@@ -5020,6 +5256,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
         "publication/status.rs",
         include_str!("../src/publication/status.rs"),
         &[
+            "cap",
             "entry",
             "fold_recovered",
             "is_empty",
@@ -5035,6 +5272,7 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
             "retire",
             "to_wire",
             "trim",
+            "with_cap",
         ],
     ),
     (
@@ -5047,9 +5285,11 @@ const PUB_FNS: [(&str, &str, &[&str]); 4] = [
 /// The trait impls in P1's four source files. A trait method needs no `pub`, so an impl for a P1
 /// type is an accessor [`PUB_FNS`] cannot see. `Module for Publication` is the step, the one way
 /// in; `Default for PubConfig` is configuration; the two `ReplicationView` impls are R1's tracker
-/// and the KA-8 fake, which P1 reads, not P1's own state.
-const TRAIT_IMPLS: [&str; 4] = [
+/// and the KA-8 fake, which P1 reads, not P1's own state. `Default for StatusIndex` (PR #1 R1-F006)
+/// is an empty index with the default cap: it holds nothing to read.
+const TRAIT_IMPLS: [&str; 5] = [
     "impl Default for PubConfig",
+    "impl Default for StatusIndex",
     "impl Module for Publication",
     "impl ReplicationView for ProgressTracker",
     "impl ReplicationView for ScriptedReplication",

@@ -32,6 +32,7 @@ use crate::contracts::time::Tick;
 use crate::contracts::txn::{Durability, Outcome as TxnOutcome, TxnResult};
 use crate::replication::progress::DigestLookup;
 use crate::transaction::dedup::{parse_dedup_key, parse_dedup_value, SEED_PAGE};
+use crate::transaction::RETENTION_CAP_ENTRIES;
 
 use super::status::{recovered_outcome, StatusIndex};
 use super::view::ReplicationView;
@@ -87,6 +88,9 @@ pub struct PubConfig {
     pub waiter_cap: usize,
     /// The post-apply deadline. Default [`POST_APPLY_DEADLINE_MILLIS`].
     pub post_apply_deadline_millis: u64,
+    /// The most status entries held at once (plan §13 Q-4, K-A-12). Default
+    /// [`RETENTION_CAP_ENTRIES`], the bound T1's dedup index already holds.
+    pub status_cap: usize,
 }
 
 impl Default for PubConfig {
@@ -94,6 +98,7 @@ impl Default for PubConfig {
         Self {
             waiter_cap: WAITER_CAP,
             post_apply_deadline_millis: POST_APPLY_DEADLINE_MILLIS,
+            status_cap: RETENTION_CAP_ENTRIES,
         }
     }
 }
@@ -319,6 +324,16 @@ pub enum PubEffect {
     },
     /// A status-index write.
     Status(Box<StatusEntry>),
+    /// A status-index write the index refused: it is at [`PubConfig::status_cap`] and no trim
+    /// has freed room (K-A-12). Nothing was written, so the identity answers `Unknown`. The
+    /// candidate still publishes and replies: after apply only `Published` or `UNKNOWN_OUTCOME`
+    /// may answer it.
+    StatusRefused {
+        /// Whose entry.
+        request: RequestIdentity,
+        /// Why: [`ErrorKind::Overloaded`].
+        error: ErrorKind,
+    },
     /// A transaction's one terminal reply.
     Reply {
         /// Whose.
@@ -560,7 +575,7 @@ impl PubKernel {
             published_seq,
             pending: None,
             awaiting_reply: BTreeMap::new(),
-            status: StatusIndex::new(lineage.generation),
+            status: StatusIndex::with_cap(lineage.generation, config.status_cap),
             seed: None,
             seed_blocked_at: None,
             waiters: VecDeque::new(),
@@ -678,6 +693,9 @@ impl PubKernel {
                 _ => break,
             }
         }
+        // Rows past the cap are refused, not held: their identities answer `Unknown`, which never
+        // proves nonexecution (K-A-12).
+        let mut refused = 0_usize;
         for (key, value) in found {
             let lineage = Lineage {
                 partition: seed.partition,
@@ -694,7 +712,7 @@ impl PubKernel {
                 outcome: TxnOutcome::Published,
                 durability: Durability::BufferedOnTwo,
             };
-            self.status.restore(StatusEntry {
+            let restored = self.status.restore(StatusEntry {
                 request: key.identity,
                 lineage,
                 seq: Some(value.seq),
@@ -707,6 +725,17 @@ impl PubKernel {
                 snapshot: None,
                 at: now,
             });
+            if restored.is_err() {
+                refused += 1;
+            }
+        }
+        if refused > 0 {
+            tracing::warn!(
+                partition = ?seed.partition,
+                refused,
+                cap = self.status.cap(),
+                "status seed: the status index is full; rows past its cap are not held (K-A-12)"
+            );
         }
         self.seed = None;
         self.seed_blocked_at = None;
@@ -1518,8 +1547,13 @@ impl PubKernel {
             snapshot: None,
             at: now,
         };
-        self.status.record(entry);
-        PubEffect::Status(Box::new(entry))
+        match self.status.record(entry) {
+            Ok(()) => PubEffect::Status(Box::new(entry)),
+            Err(error) => PubEffect::StatusRefused {
+                request: cand.request,
+                error,
+            },
+        }
     }
 }
 

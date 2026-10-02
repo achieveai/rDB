@@ -3726,7 +3726,11 @@ fn m7a_183_an_unheld_watch_answer_does_not_clear_the_recovered_read_back() {
             &read_as(watch_read, 41, P1, 20, &record_at(P1, 2, 2)),
         )
         .expect("the watch read's answer, unheld");
-    assert_eq!(effects, vec![], "M7A-183: unheld, a read answers nothing");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)],
+        "M7A-183: unheld, a read answers nothing but that (M7A-195)"
+    );
 
     let _ = acquire(&mut kernel, &ctx(6));
     let effects = kernel
@@ -3852,9 +3856,10 @@ fn m7a_184_a_revocation_persisted_while_unheld_survives_into_held() {
 }
 
 /// M7A-185. Lead ledger L-R178e: a restored revocation blocks the install of its epoch. The
-/// restore reaches a fresh kernel first, as the host replays it, and answers nothing: no fence,
-/// no drain proof, no view. The acquisition and the coherent load that follow install `(p1, e3)`
-/// as ours, withhold its adopt and its view, and `may_admit` denies it; `p2` admits.
+/// restore reaches a fresh kernel first, as the host replays it, and answers only
+/// `Ignored(NotOurs)`: no fence, no drain proof, no view. The acquisition and the coherent load
+/// that follow install `(p1, e3)` as ours, withhold its adopt and its view, and `may_admit` denies
+/// it; `p2` admits.
 ///
 /// One-fact twin: the same kernel without the restore adopts and admits `(p1, e3)`, so the
 /// denial is the restore's and not the fixture's.
@@ -3867,7 +3872,11 @@ fn m7a_185_a_restored_revocation_blocks_the_install_of_its_epoch() {
     let effects = kernel
         .step(&ctx(3), &revocation_restored(3, P1, 3))
         .expect("the restore is answered");
-    assert_eq!(effects, vec![], "M7A-185: a restore records only");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+        "M7A-185: a restore records only (M7A-195: and says so)"
+    );
     assert_eq!(revoked(&kernel), vec![(P1, OwnerEpoch(3))]);
 
     let effects = acquire_and_load_p1_p2_at_e3(&mut kernel);
@@ -3922,7 +3931,11 @@ fn m7a_186_a_restored_revocation_for_another_partition_or_epoch_blocks_nothing_e
         let effects = kernel
             .step(&ctx(id), &revocation_restored(id, partition, epoch))
             .expect("the restore is answered");
-        assert_eq!(effects, vec![], "M7A-186: a restore records only");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+            "M7A-186: a restore records only (M7A-195: and says so)"
+        );
     }
     assert_eq!(
         revoked(&kernel),
@@ -3963,7 +3976,11 @@ fn m7a_187_a_restore_reaching_a_held_kernel_fences_only_its_served_epoch_and_pro
     let effects = kernel
         .step(&ctx(3), &revocation_restored(3, P1, 2))
         .expect("a restore of another epoch");
-    assert_eq!(effects, vec![], "M7A-187: another epoch fences nothing");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+        "M7A-187: another epoch fences nothing (M7A-195: and says so)"
+    );
     assert_eq!(kernel.view().served.get(&P1), Some(&lineage(3)));
 
     let effects = kernel
@@ -4070,5 +4087,303 @@ fn m7a_188_a1_sites_a_view_and_a_partition_fence_at_their_partition() {
             (P2, Shape::Publish(P2)),
         ],
         "M7A-188: a node fence at the event's partition, each past view at its own: {rebooted:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M7A-195 (PR #1 review, R1-F012). Lead rulings A-R24 and B-R33: an empty effect vector is never
+// an answer, so each deliberate no-op arm of `Authority::step` says which one it is.
+// ---------------------------------------------------------------------------------------------
+
+/// `kernel` after `Rebooted` under a new boot: the node fence, so the state is `Fenced`.
+fn fenced_kernel() -> Authority {
+    let mut kernel = held_kernel();
+    kernel
+        .step(
+            &ctx(2),
+            &event_of(
+                2,
+                EventKind::Node(NodeLifecycle::Rebooted { boot: BootId(2) }),
+            ),
+        )
+        .expect("the node-fence row is built");
+    assert!(kernel.state().is_fenced(), "fixture: Fenced");
+    kernel
+}
+
+/// M7A-195. A `partitions/{id}` read-back reaching a node that holds no grant installs nothing
+/// (lead ruling A-R78) and says so: exactly `[Ignored(StaleAuthorityView)]`, the answer
+/// `on_partition_read` gives the same read on the same state. Red at 7e262dc: `[]`.
+#[retcd_test]
+fn m7a_195_a_partition_read_back_without_a_grant_is_ignored() {
+    let read_back = ControlEvent::Value {
+        request: UNASKED,
+        key: ControlKey::Partition(P1),
+        outcome: ReadOutcome::Absent { as_of: Revision(4) },
+    };
+    for (state, mut kernel) in [("Unheld", Authority::new()), ("Fenced", fenced_kernel())] {
+        let effects = kernel
+            .step(&ctx(3), &event(3, read_back.clone()))
+            .expect("the read-back is answered");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)],
+            "M7A-195 ({state}): never an empty vector: {effects:?}"
+        );
+    }
+}
+
+/// M7A-195. Any other control event reaching a node that holds no grant — a watch progress mark,
+/// a watch termination — moves no right, and says so: exactly `[Ignored(StaleAuthorityView)]`,
+/// as `Unheld` and `Fenced` answer every other input they take no action on. Red at 7e262dc: `[]`.
+#[retcd_test]
+fn m7a_195_a_control_event_without_a_grant_is_ignored() {
+    let progress = ControlEvent::WatchProgress {
+        prefix: ControlPrefix::Grants,
+        revision: Revision(8),
+    };
+    let terminated = ControlEvent::WatchTerminated {
+        prefix: ControlPrefix::Partitions,
+        from: Revision(8),
+        termination: rdb_core::contracts::control::WatchTermination::NotLeader,
+    };
+    for (state, make) in [
+        ("Unheld", Authority::new as fn() -> Authority),
+        ("Fenced", fenced_kernel),
+    ] {
+        for control in [progress.clone(), terminated.clone()] {
+            let mut kernel = make();
+            let effects = kernel
+                .step(&ctx(3), &event(3, control.clone()))
+                .expect("the control event is answered");
+            assert_eq!(
+                shapes(&effects),
+                vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)],
+                "M7A-195 ({state}, {control:?}): never an empty vector: {effects:?}"
+            );
+        }
+    }
+}
+
+/// M7A-195. A held node's `WatchProgress` moves the cursor and nothing else, and says so:
+/// exactly `[Ignored(WatchProgressOnly)]` (A-R24; variant approved by Gautam 2026-10-01 for
+/// PR #1 R1-F012). Red before the arm changed: `[]`.
+#[retcd_test]
+fn m7a_195_a_held_watch_progress_moves_only_the_cursor() {
+    let mut kernel = held_kernel();
+    let before = kernel.view();
+    let effects = kernel
+        .step(
+            &ctx(3),
+            &event(
+                3,
+                ControlEvent::WatchProgress {
+                    prefix: ControlPrefix::Partitions,
+                    revision: Revision(9),
+                },
+            ),
+        )
+        .expect("the watermark is answered");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::WatchProgressOnly)],
+        "M7A-195 (Held): never an empty vector: {effects:?}"
+    );
+    assert_eq!(
+        kernel.cursor(ControlPrefix::Partitions),
+        Some(Revision(9)),
+        "the cursor moved"
+    );
+    assert!(kernel.state().is_held(), "and the grant stands");
+    assert_eq!(
+        kernel.view().served,
+        before.served,
+        "and nothing is served differently"
+    );
+}
+
+/// M7A-195. A restored revocation that names no epoch this node serves fences nothing (lead
+/// ledger L-R178e) and says so: exactly `[Ignored(NotOurs)]` — no right to end, no view to
+/// supersede. On a fresh `Unheld` kernel, which is where the host delivers every restore, and on
+/// a `Held` one serving `p1` at epoch 3 given `(p1, e2)` and `(p2, e3)`. The pair is still
+/// recorded. Red at 7e262dc: `[]` each time.
+#[retcd_test]
+fn m7a_195_a_restore_naming_no_served_epoch_is_ignored_not_ours() {
+    let not_ours = vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)];
+    let mut kernel = Authority::new();
+    let effects = kernel
+        .step(&ctx(3), &revocation_restored(3, P1, 3))
+        .expect("the restore is answered");
+    assert_eq!(shapes(&effects), not_ours, "M7A-195 (Unheld): {effects:?}");
+    assert_eq!(revoked(&kernel), vec![(P1, OwnerEpoch(3))]);
+
+    let mut kernel = serving_p1(3);
+    for (id, partition, epoch) in [(3, P1, 2), (4, P2, 3)] {
+        let effects = kernel
+            .step(&ctx(id), &revocation_restored(id, partition, epoch))
+            .expect("the restore is answered");
+        assert_eq!(
+            shapes(&effects),
+            not_ours,
+            "M7A-195 (Held, {partition:?} e{epoch}): {effects:?}"
+        );
+    }
+    assert_eq!(kernel.view().served.get(&P1), Some(&lineage(3)));
+    assert_eq!(
+        revoked(&kernel),
+        vec![(P1, OwnerEpoch(2)), (P2, OwnerEpoch(3))]
+    );
+}
+
+/// M7A-195 (e). A CAS completion on a key A1 never writes — the cluster schema, a partition
+/// record, another node's grant — matches nothing this module asked for, so it moves nothing and
+/// says so: exactly `[Ignored(UnmatchedCompletion)]`, in `Unheld`, `Held` and `Fenced` alike
+/// (lead ruling on tester finding F-1a). Red before the fix: `[]` in all three.
+#[retcd_test]
+fn m7a_195_a_cas_of_a_key_a1_never_writes_is_an_unmatched_completion() {
+    let foreign = [
+        (
+            ControlKey::ClusterSchema,
+            CasOutcome::Conflict {
+                exists: true,
+                current: Revision(1),
+            },
+        ),
+        (
+            ControlKey::Partition(P1),
+            CasOutcome::Committed(Revision(5)),
+        ),
+        (ControlKey::Grant(OTHER), CasOutcome::Committed(Revision(5))),
+    ];
+    for (state, make) in [
+        ("Unheld", Authority::new as fn() -> Authority),
+        ("Held", held_kernel),
+        ("Fenced", fenced_kernel),
+    ] {
+        for (key, outcome) in foreign {
+            let mut kernel = make();
+            let before = kernel.view();
+            let effects = kernel
+                .step(
+                    &ctx(3),
+                    &event(
+                        3,
+                        ControlEvent::CasResult {
+                            request: ControlRequestId(1),
+                            key,
+                            outcome,
+                        },
+                    ),
+                )
+                .expect("the completion is answered");
+            assert_eq!(
+                shapes(&effects),
+                vec![Shape::Ignored(AuthorityIgnoreReason::UnmatchedCompletion)],
+                "M7A-195 ({state}, {key:?}): never an empty vector: {effects:?}"
+            );
+            let after = kernel.view();
+            assert_eq!(
+                (after.state, after.served),
+                (before.state, before.served),
+                "M7A-195 ({state}, {key:?}): and nothing moved"
+            );
+        }
+    }
+}
+
+/// M7A-195 (f). A watch delivery with no changes issues no read. Held, it moves the cursor and
+/// nothing else, as a `WatchProgress` does: exactly `[Ignored(WatchProgressOnly)]`. Not held, the
+/// cursor stays and the answer is `[Ignored(StaleAuthorityView)]`, as every other input those
+/// states take no action on (lead ruling on tester finding F-1b). Red before the fix: `[]`.
+#[retcd_test]
+fn m7a_195_an_empty_watch_delivery_is_answered() {
+    let empty = ControlEvent::Watched {
+        prefix: ControlPrefix::Partitions,
+        cursor: WatchCursor {
+            revision: Revision(9),
+        },
+        changes: vec![],
+    };
+
+    let mut kernel = held_kernel();
+    let before = kernel.view();
+    let effects = kernel
+        .step(&ctx(3), &event(3, empty.clone()))
+        .expect("the delivery is answered");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::WatchProgressOnly)],
+        "M7A-195 (Held): never an empty vector: {effects:?}"
+    );
+    assert_eq!(kernel.cursor(ControlPrefix::Partitions), Some(Revision(9)));
+    assert!(kernel.state().is_held(), "and the grant stands");
+    assert_eq!(kernel.view().served, before.served);
+
+    for (state, mut kernel) in [("Unheld", Authority::new()), ("Fenced", fenced_kernel())] {
+        let cursor = kernel.cursor(ControlPrefix::Partitions);
+        let effects = kernel
+            .step(&ctx(3), &event(3, empty.clone()))
+            .expect("the delivery is answered");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)],
+            "M7A-195 ({state}): never an empty vector: {effects:?}"
+        );
+        assert_eq!(
+            kernel.cursor(ControlPrefix::Partitions),
+            cursor,
+            "M7A-195 ({state}): the cursor is a held node's"
+        );
+    }
+}
+
+/// A quiet arm's reason is spent on its own step (PR #1 tester finding F-3). A kernel that
+/// answered a watermark through the quiet path equals one that answered a lifecycle event
+/// directly with the same `Ignored`, so no reason is left in the state for a later step to emit,
+/// and the next step's answer stands alone. Claims no row: it pins `Module::step`'s reset.
+#[retcd_test]
+fn a_quiet_answer_leaves_nothing_behind_in_the_kernel() {
+    let resumed = |id: u64| {
+        event_of(
+            id,
+            EventKind::Node(NodeLifecycle::Resumed {
+                suspended_millis: 0,
+            }),
+        )
+    };
+    let stale = vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)];
+
+    let mut quiet = Authority::new();
+    let answered = quiet
+        .step(
+            &ctx(3),
+            &event(
+                3,
+                ControlEvent::WatchProgress {
+                    prefix: ControlPrefix::Grants,
+                    revision: Revision(8),
+                },
+            ),
+        )
+        .expect("the watermark is answered");
+    assert_eq!(shapes(&answered), stale, "the quiet path: {answered:?}");
+
+    let mut direct = Authority::new();
+    let answered = direct
+        .step(&ctx(3), &resumed(3))
+        .expect("the lifecycle event is answered");
+    assert_eq!(shapes(&answered), stale, "the direct path: {answered:?}");
+
+    assert_eq!(
+        quiet, direct,
+        "nothing of the quiet step is left in the kernel"
+    );
+    let next = quiet
+        .step(&ctx(4), &resumed(4))
+        .expect("the lifecycle event is answered");
+    assert_eq!(
+        shapes(&next),
+        stale,
+        "the next answer stands alone: {next:?}"
     );
 }

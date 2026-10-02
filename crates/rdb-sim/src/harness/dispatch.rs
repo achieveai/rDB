@@ -1117,8 +1117,9 @@ impl Dispatcher {
     /// start-of-process read-back (lead ledger L-R178e). Called once per restart, from the first
     /// offer to that A1, before the offer itself.
     ///
-    /// Each restore is `trigger` with its kind and partition replaced, so its effects, if any,
-    /// carry the trigger's id and correlation. A fresh A1 answers a restore with none.
+    /// Each restore is `trigger` with its kind and partition replaced, so its effects carry the
+    /// trigger's id and correlation. A fresh A1 answers a restore with `Ignored(NotOurs)` alone
+    /// (M7A-195): it serves nothing yet, so nothing is fenced.
     fn restore_revocations(
         &mut self,
         ctx: &StepCtx<'_>,

@@ -814,6 +814,10 @@ pub struct Authority {
     /// `AUTHORITY_CONTROL_REQUEST_BASE + requests_issued + 1`: a counter, so every request id is
     /// fresh and deterministic (no clock, no randomness). Per instance, like `grants_issued`.
     requests_issued: u64,
+    /// The A-R24 answer a no-op arm left on this step, emitted only if the whole step says
+    /// nothing else: one answer per event (PR #1 R1-F012, lead correction round 1). `None`
+    /// between steps.
+    quiet: Option<AuthorityIgnoreReason>,
 }
 
 /// One outstanding T1 `grants/{owner}` read: the request it was sent as, and every partition it
@@ -854,6 +858,7 @@ impl Authority {
             takeover_marks: TakeoverMarks::default(),
             recovery_reads: BTreeMap::new(),
             requests_issued: 0,
+            quiet: None,
         }
     }
 
@@ -1125,6 +1130,15 @@ impl Authority {
                 reason: KernelIgnoredReason::Authority(reason),
             }),
         )
+    }
+
+    /// The answer of an arm that does nothing: [`Self::ignored`] with `reason`, emitted by
+    /// `step` only if nothing else on the step (a `SampleRejected`, a fence, a sweep's proof)
+    /// answers the event. One answer per event (PR #1 R1-F012, lead correction round 1); A-R24
+    /// forbids only `[]`.
+    fn quiet(&mut self, reason: AuthorityIgnoreReason) -> Vec<Effect> {
+        self.quiet = Some(reason);
+        Vec::new()
     }
 
     fn effect(event: &Event, kind: EffectKind) -> Effect {
@@ -1515,6 +1529,9 @@ impl Authority {
     /// linearizable [`ControlEffect::Get`] of the record that changed, and the kernel believes
     /// nothing until that read answers. No reload is emitted here — the stream has not gapped, so
     /// there is nothing to reload against.
+    ///
+    /// A delivery with no changes moves the cursor and nothing else, as a `WatchProgress` does,
+    /// and is answered the same way (A-R24; PR #1 R1-F012).
     fn on_watched(
         &mut self,
         event: &Event,
@@ -1524,6 +1541,9 @@ impl Authority {
     ) -> Vec<Effect> {
         self.watch_refused_attempts = 0;
         self.cursors.insert(prefix, cursor_revision);
+        if changes.is_empty() {
+            return self.quiet(AuthorityIgnoreReason::WatchProgressOnly);
+        }
         self.reads(event, changes)
     }
 
@@ -2202,7 +2222,9 @@ impl Authority {
     /// `Unheld` kernel adopted **any** `Committed` on a grant key — the one-event shortcut every
     /// fixture used — and a commit nobody here issued is not a grant.
     ///
-    /// A CAS of any other key is not one A1 issues, and is answered with no effects, as before.
+    /// A CAS of any other key is not one A1 issues, so it matches nothing in any state and is
+    /// [`AuthorityIgnoreReason::UnmatchedCompletion`] too (A-R24; PR #1 R1-F012). Until then it was
+    /// answered `[]`.
     ///
     /// # The matched rows
     ///
@@ -2237,7 +2259,7 @@ impl Authority {
         outcome: CasOutcome,
     ) -> Vec<Effect> {
         if key != ControlKey::Grant(ctx.node) {
-            return Vec::new();
+            return self.quiet(AuthorityIgnoreReason::UnmatchedCompletion);
         }
         if self.state.is_held() {
             return self.on_renewal_result(ctx, event, request, key, outcome);
@@ -2674,8 +2696,12 @@ impl Authority {
             // An unheld node still reads what a watch names, and only the read's answer can
             // grant (TD-17; M7A-34, M7A-35). A watch event carries a revision, never a body, so
             // it issues the same `Get` a held node would and nothing else: the cursor and the
-            // refusal counter belong to a held node's stream (A-R78 F2).
+            // refusal counter belong to a held node's stream (A-R78 F2). With no changes there is
+            // nothing to read, and it is answered as the catch-all below answers (A-R24).
             ControlEvent::Watched { changes, .. } if self.state.is_unheld() => {
+                if changes.is_empty() {
+                    return Ok(self.quiet(AuthorityIgnoreReason::StaleAuthorityView));
+                }
                 Ok(self.reads(event, changes))
             }
 
@@ -2683,16 +2709,19 @@ impl Authority {
             // ruling A-R78): nothing installs, because there is no grant to serve under. The
             // acquire's coherent load installs the recovered generation (`design.md` §2.4/§2.1).
             // The read is answered, so it is forgotten, and a later read cannot pass for it.
+            // `StaleAuthorityView` is what `on_partition_read` answers the same read on the same
+            // state; an empty vector is never an answer (A-R24).
             ControlEvent::Value {
                 request,
                 key: ControlKey::Partition(id),
                 ..
             } if !self.state.is_held() => {
                 let _ = self.take_recovery_read(*request, *id);
-                Ok(Vec::new())
+                Ok(self.quiet(AuthorityIgnoreReason::StaleAuthorityView))
             }
 
-            _ if !self.state.is_held() => Ok(Vec::new()),
+            // No grant: nothing here moves a right, as `on_lifecycle` and `on_storage` answer.
+            _ if !self.state.is_held() => Ok(self.quiet(AuthorityIgnoreReason::StaleAuthorityView)),
 
             ControlEvent::Watched {
                 prefix,
@@ -2702,10 +2731,12 @@ impl Authority {
 
             // A liveness watermark. It carries no authority and no record content, so it moves
             // the cursor and nothing else — and specifically it does not reload.
+            //
+            // Answered `WatchProgressOnly`, never `[]` (A-R24; PR #1 R1-F012).
             ControlEvent::WatchProgress { prefix, revision } => {
                 self.watch_refused_attempts = 0;
                 self.cursors.insert(*prefix, *revision);
-                Ok(Vec::new())
+                Ok(self.quiet(AuthorityIgnoreReason::WatchProgressOnly))
             }
 
             ControlEvent::WatchTerminated {
@@ -3464,8 +3495,9 @@ impl Authority {
                     .held()
                     .and_then(|held| held.served.get(partition))
                     .is_some_and(|served| served.owner_epoch == *epoch);
+                // No served epoch to end and no view to supersede (A-R24: never `[]`).
                 if !serves_it {
-                    return Ok(Vec::new());
+                    return Ok(self.quiet(AuthorityIgnoreReason::NotOurs));
                 }
                 Ok(self.revoke_served(ctx, event, *partition))
             }
@@ -3598,6 +3630,7 @@ impl Module for Authority {
         // over must fence before whatever else arrived on the same step is acted on. This is why
         // any event at all drives the expiry rows, and why a grant is never more than one step
         // past its expiry — see `revalidate`.
+        self.quiet = None;
         let was_held = self.state.is_held();
         let clock_before = self.clock;
         let mut effects = self.revalidate(ctx, event);
@@ -3626,8 +3659,11 @@ impl Module for Authority {
             EventKind::Kernel(KernelEvent::Recovered(result)) => {
                 Ok(self.on_recovered(event, result))
             }
-            // `supported` has already refused every remaining kind.
-            _ => Ok(Vec::new()),
+            // Unreachable: `supported` refuses these kinds, and this is that same refusal (R1-F012).
+            _ => Err(RdbError::unavailable(
+                Capability::Authority,
+                "authority: an event kind A1 does not take",
+            )),
         };
         match routed {
             Ok(routed) => effects.extend(routed),
@@ -3659,6 +3695,12 @@ impl Module for Authority {
         let proofs = self.sweep(ctx, event);
         Self::supersede_deferrals(&mut effects, &proofs);
         effects.extend(proofs);
+        // A no-op arm's answer, only if nothing else on the step answers the event (A-R24).
+        if let Some(reason) = self.quiet.take() {
+            if effects.is_empty() {
+                effects.push(Self::ignored(event, reason));
+            }
+        }
         Ok(effects)
     }
 }

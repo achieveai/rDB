@@ -1498,7 +1498,13 @@ fn m7a_24_unbounded_mode_does_not_burn_grant_ids() {
 fn unheld_with_a_sample() -> Authority {
     let mut kernel = Authority::new();
     let effects = kernel.step(&pinned(0), &probe(1, 0)).expect("built");
-    assert_eq!(effects, vec![], "fixture: an accepted sample says nothing");
+    // The probe itself is answered `StaleAuthorityView`: no grant (M7A-195, PR #1 R1-F012).
+    assert_eq!(
+        ignored(&effects),
+        vec![AuthorityIgnoreReason::StaleAuthorityView],
+        "fixture: an accepted sample says nothing of its own: {effects:?}"
+    );
+    assert_eq!(effects.len(), 1, "fixture: and nothing else");
     assert!(kernel.clock().sample().is_some(), "fixture: a good sample");
     kernel
 }
@@ -1578,7 +1584,13 @@ fn m7a_165_rejected_sample_retracts_the_good_one() {
         let good = sampled(100, 100, 0, 10, true);
         let effects = twin.step(&good, &probe(3, 100)).expect("built");
         assert_eq!(scoped_fences(&effects), vec![], "{state} twin: {effects:?}");
-        assert_eq!(ignored(&effects), vec![], "{state} twin: {effects:?}");
+        // No rejection. Unheld or fenced, the probe itself is still answered (M7A-195).
+        let probe_answer = if state == "Held" {
+            vec![]
+        } else {
+            vec![AuthorityIgnoreReason::StaleAuthorityView]
+        };
+        assert_eq!(ignored(&effects), probe_answer, "{state} twin: {effects:?}");
         assert!(facts(&effects).is_empty(), "{state} twin: {effects:?}");
         assert_eq!(
             twin.clock().sample(),

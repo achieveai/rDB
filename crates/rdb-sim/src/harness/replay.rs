@@ -181,7 +181,9 @@ pub fn replay_run(
 /// run still had an event queued while the completed one did not. So the guard block's cases 2
 /// and 3 pass because one of their two runs pops one event and the other pops two: the shorter
 /// trace runs out at index 15 while the longer one still has a record there, which is the `15`
-/// each of those rows asserts. They do not pass because the stop reason is visible. The rows
+/// each of those rows asserted. Since PR #1 R1-F012 A1 answers that seed with an `Ignored`, which
+/// adds one note line per pop, so the index is now 16 and so is each row; the table above is the
+/// 2026-09-22 measurement. They do not pass because the stop reason is visible. The rows
 /// say so individually and this paragraph now says so too. Making the stop reason comparable
 /// would need a new `TraceKind` variant, which is a contract change nobody has ruled on. Owed,
 /// beside `M7F-05`.
@@ -544,8 +546,9 @@ mod tests {
     use crate::harness::run::{execute, RunLimits, RunPlan, SeedEvent, StopReason};
     use rdb_core::contracts::time::Tick;
 
-    /// An event A1 takes and does nothing with, so a run of `n` of them is `6n` offers and no
-    /// effects.
+    /// An event A1 takes and does nothing with, so a run of `n` of them is `6n` offers and `n`
+    /// effects: A1's `Ignored(UnmatchedCompletion)`, one note line per pop (A-R24; PR #1
+    /// R1-F012). Until then A1 answered it `[]`.
     fn tick_event(at: Tick) -> SeedEvent {
         use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey};
         use rdb_core::contracts::event::EventKind;
@@ -664,8 +667,8 @@ mod tests {
         );
         assert_eq!(
             diverges_at(&severed_trace, &completed_trace),
-            15,
-            "the severed run stops after one pop's six offers"
+            16,
+            "the severed run stops after one pop's six offers and A1's note"
         );
     }
 
@@ -705,8 +708,8 @@ mod tests {
         assert_eq!(exhausted_trace.header, completed_trace.header);
         assert_eq!(
             diverges_at(&exhausted_trace, &completed_trace),
-            15,
-            "the completed run has one pop's six offers, the exhausted run has two"
+            16,
+            "the completed run has one pop's six offers and note, the exhausted run has two"
         );
     }
 

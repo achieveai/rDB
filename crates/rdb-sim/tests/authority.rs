@@ -1544,7 +1544,8 @@ fn m7a_34_watch_event_never_grants() {
     );
 
     // The reads-on-watch arm is `Unheld` only. A `Fenced` kernel given a watch event with a
-    // real change answers nothing and moves nothing (tester-ka-a1 A4, mutant m10).
+    // real change reads nothing and moves nothing (tester-ka-a1 A4, mutant m10); it says so,
+    // one `Ignored(StaleAuthorityView)` per completion (M7A-195, PR #1 R1-F012).
     let mut fenced = Driver::new();
     fenced.become_held();
     fenced.now = Tick(3_000);
@@ -1559,10 +1560,12 @@ fn m7a_34_watch_event_never_grants() {
         Some(record(4, NodeId(2)).encode()),
     );
     let still = fenced.kernel.view();
+    let emitted = fenced.emit();
+    assert!(!emitted.is_empty(), "M7A-34 fixture: the watch delivered");
     assert_eq!(
-        fenced.emit(),
-        Vec::new(),
-        "M7A-34: a Fenced kernel reads nothing on a watch event"
+        Driver::ignores(&emitted),
+        vec![AuthorityIgnoreReason::StaleAuthorityView; emitted.len()],
+        "M7A-34: a Fenced kernel reads nothing on a watch event, and says so: {emitted:?}"
     );
     assert_eq!(fenced.kernel.view(), still, "M7A-34: and changes nothing");
 }

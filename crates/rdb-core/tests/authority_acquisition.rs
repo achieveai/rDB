@@ -2123,7 +2123,12 @@ fn m7a_148_acquire_withheld_reasons_collapse_to_no_sample_and_stale() {
         .expect("the good sample");
     let at_bound = reading(100, 100, BUDGETS.clock_error_millis, true);
     let effects = kernel.step(&at_bound, &probe(100)).expect("the sample");
-    assert_eq!(shapes(&effects), vec![], "twin: adopted, not rejected");
+    // Unheld, the probe itself answers `StaleAuthorityView` (M7A-195); no `SampleRejected`.
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)],
+        "twin: adopted, not rejected"
+    );
     assert_eq!(kernel.clock().sample(), Some(at_bound.control_time), "twin");
     let due = acquire_due(&kernel, 200, 200);
     let effects = kernel
@@ -2449,9 +2454,10 @@ fn republished_views_leave_with_the_next_step_a1_accepts() {
         let again = kernel
             .step(&sampled_at(602, 600), &probe(602))
             .expect("a control probe is accepted");
+        // No `Publish`: only the held probe's own answer (M7A-195, PR #1 R1-F012; was `[]`).
         assert_eq!(
             shapes(&again),
-            Vec::<Shape>::new(),
+            vec![Shape::Ignored(AuthorityIgnoreReason::WatchProgressOnly)],
             "{why}: an unchanged sample republishes nothing"
         );
     }
