@@ -371,22 +371,35 @@ impl config_grpc::AdminBackend for NodeBackend {
         // call arrived. Comparing ids rather than indexes is what makes an idle cluster work:
         // a build at an unchanged last_log_id still gets a fresh id (ADR-0022), so an operator
         // taking two backups of a quiet cluster gets two fresh exports rather than a hang.
-        let before = store.snapshot_meta().map(|m| m.snapshot_id);
-        self.node.trigger_snapshot().await?;
-        let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
-        let meta = loop {
-            match store.snapshot_meta() {
-                Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break meta,
-                _ if tokio::time::Instant::now() >= deadline => {
-                    return Err(config_engine::AdminError::Unavailable {
-                        reason: format!(
-                            "no snapshot was published within {}s of the trigger",
-                            BACKUP_BUILD_DEADLINE.as_secs()
-                        ),
-                    })
+        let capture = async {
+            let before = store.snapshot_meta().map(|m| m.snapshot_id);
+            self.node.trigger_snapshot().await?;
+            let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
+            loop {
+                match store.snapshot_meta() {
+                    Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break Ok(meta),
+                    _ if tokio::time::Instant::now() >= deadline => {
+                        break Err(config_engine::AdminError::Unavailable {
+                            reason: format!(
+                                "no snapshot was published within {}s of the trigger",
+                                BACKUP_BUILD_DEADLINE.as_secs()
+                            ),
+                        })
+                    }
+                    _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
                 }
-                _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
             }
+        };
+        // M6-33: the policy version the artifact names. Sampled before the trigger and again
+        // after publication, by `PolicyLoader::version_across`: it is `Some` only when no
+        // adoption landed in between, so the version named was in force for the whole
+        // capture. A reload in that window makes it `None` rather than the newer version
+        // (R2-F008). Also `None` under static mode and on a signed-mode node holding no valid
+        // document. It names the version this node was enforcing while the snapshot was taken,
+        // not the document any one entry was written under.
+        let (meta, policy_version) = match &self.policy {
+            Some(loader) => loader.version_across(capture).await?,
+            None => (capture.await?, None),
         };
 
         let snap_path = config_storage::snapshot::snap_path(store.path(), &meta.snapshot_id);
@@ -395,12 +408,6 @@ impl config_grpc::AdminBackend for NodeBackend {
         // is driving for as long as the artifact takes to write.
         let signing_key = keys.signing_key.map(Path::to_path_buf);
         let encryption_key = keys.encryption_key.map(Path::to_path_buf);
-        // M6-33: the version this node is enforcing right now, read before the export is
-        // staged, so the artifact names the document the exported data was authorized under.
-        // `None` under static mode and on a signed-mode node holding no valid document — a
-        // manifest that named a version this node was not enforcing would be a breadcrumb an
-        // operator follows to the wrong document.
-        let policy_version = self.policy.as_ref().and_then(|l| l.state_and_version().1);
         let joined = tokio::task::spawn_blocking(move || {
             // Copied to a scratch file inside `dest_dir` first, exactly as the offline path
             // exports to one. Handing the node's *live* `<id>.snap` to `finish_artifact`

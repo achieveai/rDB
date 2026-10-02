@@ -107,6 +107,18 @@ pub struct PolicyLoader {
     /// failing to read one that should be there is a fault. Only the second is worth alerting
     /// on, and only the second means rollback protection was expected and is absent.
     floor_unreadable: AtomicBool,
+    /// Set while the version in force has not reached the durable floor (R2-F003).
+    ///
+    /// A failed write used to be logged and forgotten, and since only an adoption wrote the
+    /// floor, a file that then stayed the same left it stale for good. Every reload retries
+    /// while this is set, whatever the file holds, and `/metrics` reports it.
+    floor_pending: AtomicBool,
+    /// Adoptions since start, so a caller can tell whether one landed while it waited (R2-F008).
+    ///
+    /// The version alone cannot say so: a break-glass rollback can return to the version a
+    /// caller first read. Written only inside `attempt`, which runs under `reloading`, and read
+    /// under the same lock, so a sample never splits an adoption.
+    adoptions: AtomicU64,
 }
 
 /// What the last attempts left behind, for health and for the no-storm rule.
@@ -178,6 +190,8 @@ impl PolicyLoader {
             expected_cluster,
             floor,
             floor_unreadable: AtomicBool::new(unreadable),
+            floor_pending: AtomicBool::new(false),
+            adoptions: AtomicU64::new(0),
         })
     }
 
@@ -192,7 +206,17 @@ impl PolicyLoader {
     /// outage.
     pub fn reload(&self, source: &'static str) -> Result<PolicyReload, PolicyRejected> {
         let mut attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
+        let adoptions = self.adoptions.load(Ordering::Relaxed);
         let outcome = self.attempt(source);
+        // Whatever the attempt decided: an `Unchanged` or refused reload would otherwise never
+        // write the floor still owed for the version in force (R2-F003). Skipped when the attempt
+        // adopted, because the adoption has just written the floor itself — a second write in
+        // the same reload would only repeat its outcome and its log line.
+        if self.floor_pending.load(Ordering::Relaxed)
+            && self.adoptions.load(Ordering::Relaxed) == adoptions
+        {
+            self.persist_floor(true);
+        }
         match &outcome {
             Ok((_, break_glass)) => {
                 attempts.last_rejection = None;
@@ -294,8 +318,10 @@ impl PolicyLoader {
                 // document `adopt` might then refuse — and a floor above a version this node
                 // never served would refuse a document it should accept at the next restart.
                 // The cost of that order is a crash in between, which leaves the floor one
-                // version stale and re-opens G-09 for exactly one restart.
-                self.persist_floor();
+                // version stale and re-opens G-09 for exactly one restart. A write that fails
+                // without a crash is retried by every later reload; see `persist_floor`.
+                self.adoptions.fetch_add(1, Ordering::Relaxed);
+                self.persist_floor(false);
                 if adopted_cluster_is_unscoped {
                     // Once per adoption, not once per poll: an unchanged file does not reach
                     // this arm. The document is genuine and trusted — it simply predates the
@@ -340,17 +366,40 @@ impl PolicyLoader {
     /// adopt, not forgets what it had" rule ADR-0027 applies to the document itself. The
     /// consequence is stated in the line rather than left to be inferred: until the write
     /// succeeds, this node would accept an older document after a restart.
-    fn persist_floor(&self) {
+    ///
+    /// A failure is not forgotten (R2-F003). It sets `floor_pending`, every later reload calls
+    /// this again until a write lands, and `/metrics` reports the gap meanwhile. `retry` says
+    /// which kind of write this is. An adoption's failed write logs `policy_floor_not_persisted`
+    /// at `error`, even when an earlier write is still owed, because it is a new version that
+    /// failed to persist. A failed retry logs `policy_floor_still_not_persisted` at `warn`. Each
+    /// reload makes at most one of the two writes, so it logs at most one of the two lines. The
+    /// write that clears the debt logs `policy_floor_persisted`.
+    fn persist_floor(&self, retry: bool) {
         let Some(floor) = self.floor.as_ref() else {
             return;
         };
         let version = self.authorizer.version_floor();
-        if let Err(error) = floor.set_policy_version_floor(version) {
+        let Err(error) = floor.set_policy_version_floor(version) else {
+            if self.floor_pending.swap(false, Ordering::Relaxed) {
+                tracing::info!(version, "policy_floor_persisted");
+            }
+            return;
+        };
+        self.floor_pending.store(true, Ordering::Relaxed);
+        if retry {
+            tracing::warn!(
+                %error,
+                version,
+                detail = "the policy version floor is still not persisted, so a restart would \
+                          accept a document older than the one now in force",
+                "policy_floor_still_not_persisted"
+            );
+        } else {
             tracing::error!(
                 %error,
                 version,
-                detail = "the policy version floor was not persisted, so a restart would \
-                          accept a document older than the one now in force",
+                detail = "the policy version floor was not persisted, so a restart would accept \
+                          a document older than the one now in force; every reload retries it",
                 "policy_floor_not_persisted"
             );
         }
@@ -366,6 +415,50 @@ impl PolicyLoader {
         let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
         self.authorizer
             .state_and_version(attempts.last_rejection.as_ref())
+    }
+
+    /// Run `capture`, and name the version that was in force for the whole of it (R2-F008).
+    ///
+    /// The backup RPC waits for a snapshot through this. A reload can adopt a new document at
+    /// any point, and a version read after the wait names whatever was adopted last — possibly
+    /// a document the snapshot's data was never served under. So the version and the adoption
+    /// count are read once before `capture` and once after. If no adoption landed in between,
+    /// that version held throughout and is returned. If one did, the snapshot's version cannot
+    /// be told apart from the newer one, and this returns `None` with a `warn` rather than
+    /// guess: a manifest that names no version is honest, one that names the wrong one sends an
+    /// operator to the wrong document.
+    ///
+    /// No lock is held across `capture`. Blocking reloads for the length of a snapshot build
+    /// would stall the poller and the `ReloadPolicy` RPC for no gain, since an adoption is
+    /// still detected.
+    pub async fn version_across<T, E>(
+        &self,
+        capture: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<(T, Option<u64>), E> {
+        let before = self.adoption_sample();
+        let value = capture.await?;
+        let after = self.adoption_sample();
+        if before == after {
+            return Ok((value, before.1));
+        }
+        tracing::warn!(
+            version_before = ?before.1,
+            version_after = ?after.1,
+            detail = "a policy was adopted while the snapshot was being captured, so the backup \
+                      cannot say which version its data was served under and names none",
+            "backup_policy_ref_withheld"
+        );
+        Ok((value, None))
+    }
+
+    /// The adoption count and the version in force, read together under `reloading`.
+    fn adoption_sample(&self) -> (u64, Option<u64>) {
+        let attempts = self.reloading.lock().unwrap_or_else(|e| e.into_inner());
+        let version = self
+            .authorizer
+            .state_and_version(attempts.last_rejection.as_ref())
+            .1;
+        (self.adoptions.load(Ordering::Relaxed), version)
     }
 
     /// What `/metrics` publishes about this node's policy (ADR-0027, ADR-0026).
@@ -391,6 +484,7 @@ impl PolicyLoader {
             reload_failures: attempts.failures.clone(),
             break_glass_active: self.authorizer.break_glass_active(),
             floor_unreadable: self.floor_unreadable.load(Ordering::Relaxed),
+            floor_unpersisted: self.floor_pending.load(Ordering::Relaxed),
         }
     }
 
@@ -1163,6 +1257,271 @@ mod tests {
             !healthy.loader.metrics().floor_unreadable,
             "and a node whose floor read fine does not raise it — without this half the gauge \
              could be stuck at 1 and still pass"
+        );
+    }
+
+    /// A real store whose next write fails once, as a transient disk error would (R2-F003).
+    struct FailOnce {
+        inner: Arc<dyn PolicyVersionFloor>,
+        fail_next: AtomicBool,
+    }
+
+    impl FailOnce {
+        fn over(inner: Arc<dyn PolicyVersionFloor>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                fail_next: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl PolicyVersionFloor for FailOnce {
+        fn policy_version_floor(&self) -> Result<u64, String> {
+            self.inner.policy_version_floor()
+        }
+        fn set_policy_version_floor(&self, version: u64) -> Result<(), String> {
+            if self.fail_next.swap(false, Ordering::Relaxed) {
+                return Err("injected: the floor write did not reach the disk".to_string());
+            }
+            self.inner.set_policy_version_floor(version)
+        }
+    }
+
+    /// R2-F003, round 1: a refused reload retries an owed floor write too, and each reload logs
+    /// at most one line about the floor, at the level that fits what failed.
+    ///
+    /// Three cases the unchanged-reload row does not reach:
+    /// - A new adoption whose write fails while an older write is still owed. That is a new
+    ///   version failing to persist, so it logs at `error`, not as a retry, and the retry is not
+    ///   also attempted in the same reload.
+    /// - A retry that fails again. It logs one `warn`.
+    /// - A reload whose document is refused. It still makes the owed write, because the retry
+    ///   is owed for the version in force, not for whatever is on disk.
+    #[config_log::retcd_test]
+    fn an_owed_floor_write_is_retried_by_a_refused_reload() {
+        let data = tempfile::tempdir().expect("a data directory");
+        let floor = FailOnce::over(store(data.path()));
+        let fixture = Fixture::with_floor(Some(Arc::clone(&floor) as _));
+        fixture.write(7, &["/"]);
+        fixture.loader.reload("startup").expect("v7 loads");
+
+        let failed = EventCounter::new("policy_floor_not_persisted");
+        let still = EventCounter::new("policy_floor_still_not_persisted");
+        let persisted = EventCounter::new("policy_floor_persisted");
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(failed.clone())
+                .with(still.clone())
+                .with(persisted.clone()),
+        );
+
+        // v8 adopts and its write fails: a first failure.
+        floor.fail_next.store(true, Ordering::Relaxed);
+        fixture.write(8, &["/a/"]);
+        fixture.loader.reload("poll").expect("v8 adopts");
+        assert_eq!((failed.count(), still.count()), (1, 0));
+
+        // v9 adopts while v8's write is owed, and its own write fails too.
+        floor.fail_next.store(true, Ordering::Relaxed);
+        fixture.write(9, &["/a/"]);
+        fixture.loader.reload("poll").expect("v9 adopts");
+        assert_eq!(
+            (failed.count(), still.count()),
+            (2, 0),
+            "a new version that failed to persist is an error, logged once, not a retry"
+        );
+
+        // The file stays on v9 and the retry fails again: one warning.
+        floor.fail_next.store(true, Ordering::Relaxed);
+        let reload = fixture.loader.reload("poll").expect("an unchanged reload");
+        assert_eq!(reload.outcome, "unchanged");
+        assert_eq!((failed.count(), still.count()), (2, 1));
+        assert!(fixture.loader.metrics().floor_unpersisted);
+
+        // The old v7 is put back. It is refused, and the owed write still lands.
+        fixture.write(7, &["/"]);
+        let rejection = fixture
+            .loader
+            .reload("poll")
+            .expect_err("a rollback is refused");
+        assert_eq!(rejection.reason(), "rollback");
+        assert_eq!(
+            persisted.count(),
+            1,
+            "the refused reload made the owed write"
+        );
+        assert!(!fixture.loader.metrics().floor_unpersisted);
+        assert_eq!(
+            floor.inner.policy_version_floor(),
+            Ok(9),
+            "and the disk holds the version in force"
+        );
+    }
+
+    /// R2-F003: one failed floor write is retried by the next reload, even an unchanged one,
+    /// and the restart that follows refuses the document the node had moved past.
+    ///
+    /// The defect: `persist_floor` ran only on the `Adopted` arm and dropped its error, so a
+    /// node that adopted v8 while its floor write failed kept serving v8 with a durable floor
+    /// of 7 for as long as the file stayed the same — and every poll after that is `Unchanged`.
+    /// A restart then accepted the old, validly signed v7.
+    ///
+    /// The failure is injected through the `PolicyVersionFloor` seam over a real `RocksStore`,
+    /// so the restart half reads the floor back off the disk exactly as a daemon does.
+    #[config_log::retcd_test]
+    fn a_failed_floor_write_is_retried_by_an_unchanged_reload() {
+        let data = tempfile::tempdir().expect("a data directory");
+        let dir = {
+            let floor = FailOnce::over(store(data.path()));
+            let fixture = Fixture::with_floor(Some(Arc::clone(&floor) as _));
+            fixture.write(7, &["/"]);
+            fixture.loader.reload("startup").expect("v7 loads");
+
+            assert!(!fixture.loader.metrics().floor_unpersisted);
+
+            let failed = EventCounter::new("policy_floor_not_persisted");
+            let persisted = EventCounter::new("policy_floor_persisted");
+            {
+                use tracing_subscriber::layer::SubscriberExt as _;
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::registry()
+                        .with(failed.clone())
+                        .with(persisted.clone()),
+                );
+
+                // v8 adopts and its floor write fails.
+                floor.fail_next.store(true, Ordering::Relaxed);
+                fixture.write(8, &["/a/"]);
+                let reload = fixture.loader.reload("poll").expect("v8 adopts");
+                assert_eq!(reload.outcome, "reloaded");
+                assert_eq!(fixture.loader.authorizer.policy_version(), Some(8));
+                assert_eq!(failed.count(), 1, "the failed write is logged");
+                assert!(
+                    fixture.loader.metrics().floor_unpersisted,
+                    "and stays visible on the gauge while it is outstanding"
+                );
+
+                // The disk recovers and nothing on it changes, so the next poll is `Unchanged`.
+                let reload = fixture.loader.reload("poll").expect("an unchanged reload");
+                assert_eq!(reload.outcome, "unchanged");
+                assert_eq!(persisted.count(), 1, "the retry landed and says so");
+                assert!(
+                    !fixture.loader.metrics().floor_unpersisted,
+                    "and the gauge clears, or it would alert forever"
+                );
+
+                // Nothing is owed any more, so a further poll writes and logs nothing new.
+                fixture.loader.reload("poll").expect("an unchanged reload");
+                assert_eq!(persisted.count(), 1);
+            }
+            fixture.dir
+        };
+
+        // Restart over the same data directory. Someone puts the old signed v7 back.
+        let restarted = Fixture::in_dir(dir, Some(store(data.path())));
+        restarted.write(7, &["/"]);
+        let rejection = restarted
+            .loader
+            .reload("startup")
+            .expect_err("the node served v8, so v7 must be refused after a restart");
+        assert_eq!(
+            rejection,
+            PolicyRejected::RollbackFloor {
+                floor: 8,
+                incoming: 7
+            }
+        );
+    }
+
+    /// R2-F008: a backup must not name a policy adopted after its snapshot was captured.
+    ///
+    /// `version_across` is the seam `NodeBackend::backup` waits on the snapshot through, so a
+    /// reload inside `capture` lands exactly where the defect's window was: after the snapshot
+    /// is published and before the manifest is built. The defect sampled the version only after
+    /// `capture` returned, and so signed v6 onto data captured under v5.
+    ///
+    /// Three halves. A reload that adopts makes the version unknowable, and the reference is
+    /// withheld. A reload that changes nothing withholds nothing, or every backup taken while
+    /// the poller runs would lose its reference. And a quiet capture keeps the version, which is
+    /// what M6-33 asserts end to end through the daemon.
+    #[config_log::retcd_test]
+    async fn a_backup_does_not_claim_a_policy_adopted_after_its_snapshot() {
+        let fixture = Fixture::new();
+        fixture.write(5, &["/a/"]);
+        fixture.loader.reload("startup").expect("v5 loads");
+
+        let (_, named) = fixture
+            .loader
+            .version_across(async {
+                // The snapshot was taken under v5; the poller adopts v6 before the manifest.
+                fixture.write(6, &["/a/", "/b/"]);
+                fixture.loader.reload("poll").expect("v6 adopts");
+                Ok::<_, ()>(())
+            })
+            .await
+            .expect("the capture succeeds");
+        assert_eq!(fixture.loader.authorizer.policy_version(), Some(6));
+        assert_eq!(
+            named, None,
+            "the snapshot was captured under v5, so the manifest must not name v6"
+        );
+
+        let (_, named) = fixture
+            .loader
+            .version_across(async {
+                fixture.loader.reload("poll").expect("an unchanged reload");
+                Ok::<_, ()>(())
+            })
+            .await
+            .expect("the capture succeeds");
+        assert_eq!(named, Some(6), "an unchanged reload moves nothing");
+
+        let (_, named) = fixture
+            .loader
+            .version_across(async { Ok::<_, ()>(()) })
+            .await
+            .expect("the capture succeeds");
+        assert_eq!(named, Some(6), "a quiet capture names the version in force");
+
+        // Round 1: a break-glass round trip inside the capture ends on the version it started
+        // on, so a version-only comparison would name v5 for data that may have been captured
+        // under v6. The adoption count is what catches it. A break-glass loader over the same
+        // files, because the fixture's own authorizer refuses rollbacks.
+        let loader = PolicyLoader::new(
+            SignedPolicyConfig {
+                policy_file: fixture.loader.cfg.policy_file.clone(),
+                signature_file: fixture.loader.cfg.signature_file.clone(),
+                trust_keys: vec![(KEY_NAME.to_string(), fixture.key.verifying_key())],
+                poll_interval: Duration::from_secs(10),
+            },
+            Arc::new(SignedPolicyAuthorizer::new(true)),
+            Arc::clone(&fixture.hub),
+            THIS_CLUSTER,
+            None,
+        );
+        fixture.write(5, &["/a/"]);
+        loader.reload("startup").expect("v5 loads");
+        let (_, named) = loader
+            .version_across(async {
+                fixture.write(6, &["/a/", "/b/"]);
+                assert_eq!(loader.reload("poll").expect("v6").outcome, "reloaded");
+                fixture.write(5, &["/a/"]);
+                assert_eq!(
+                    loader
+                        .reload("poll")
+                        .expect("break-glass back to v5")
+                        .outcome,
+                    "reloaded"
+                );
+                Ok::<_, ()>(())
+            })
+            .await
+            .expect("the capture succeeds");
+        assert_eq!(loader.authorizer.policy_version(), Some(5));
+        assert_eq!(
+            named, None,
+            "v5 -> v6 -> v5 inside the capture must withhold the version"
         );
     }
 

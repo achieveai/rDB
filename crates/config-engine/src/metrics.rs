@@ -657,6 +657,13 @@ pub struct PolicyMetrics {
     /// cluster-wide client-plane outage (ADR-0027). A log line alone is too thin for a
     /// security control that has silently weakened; this is the surface an alert watches.
     pub floor_unreadable: bool,
+    /// Whether the version now in force has not yet reached the durable rollback floor
+    /// (R2-F003).
+    ///
+    /// Set by a failed floor write and cleared by the reload whose retry lands. While it is
+    /// set, a restart would accept a validly signed document older than the one this node is
+    /// serving. A gauge for the same reason as [`Self::floor_unreadable`].
+    pub floor_unpersisted: bool,
 }
 
 /// What this node's credential rotation has done since it started (M6, ADR-0028).
@@ -1283,6 +1290,17 @@ impl MetricsReport {
                 "retcd_policy_floor_unreadable",
                 &node,
                 u64::from(policy.floor_unreadable) as f64,
+            );
+
+            e.metric(
+                "retcd_policy_floor_unpersisted",
+                "gauge",
+                "1 while the policy version in force has not reached the durable rollback floor",
+            );
+            e.sample(
+                "retcd_policy_floor_unpersisted",
+                &node,
+                u64::from(policy.floor_unpersisted) as f64,
             );
         }
 
