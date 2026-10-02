@@ -1,5 +1,5 @@
 {
-  "where": "Gate passes complete. Production hardening branch awaiting commit decision.",
-  "blocked": "Nothing.",
-  "next": "User decision: commit the fix pass and dashboard tooling."
+  "where": "M7 code is committed and pushed. The census lists the rows still owed.",
+  "blocked": "Generated campaign seeds do not lower into the simulator yet.",
+  "next": "Close the owed rows and lower generated seeds, then re-run the release campaign."
 }

@@ -71,6 +71,7 @@ mod config;
 mod error;
 mod meta;
 mod node;
+pub mod ports;
 mod static_source;
 
 pub use config::GossipConfig;

@@ -11,6 +11,9 @@ members = [
     "crates/config-client",
     "crates/config-testkit",
     "crates/config-server",
+    # --- rDB data plane (M7, rdb ADR-0002) ---
+    "crates/rdb-core",
+    "crates/rdb-sim",
 ]
 
 [workspace.package]
@@ -31,6 +34,11 @@ config-gossip = { path = "crates/config-gossip" }
 config-grpc = { path = "crates/config-grpc" }
 config-client = { path = "crates/config-client" }
 config-testkit = { path = "crates/config-testkit" }
+# rDB data plane (M7). The arrow points one way: `rdb-*` may take `config-log` and
+# `config-log-macros` for JSONL test logging, and no `config-*` crate may ever depend on a
+# `rdb-*` crate (rdb ADR-0002).
+rdb-core = { path = "crates/rdb-core" }
+rdb-sim = { path = "crates/rdb-sim" }
 
 # --- pinned per ADR-0002 / ADR-0003 ---
 # `loosen-follower-log-revert` is deliberately NOT here: it is a dev-dependency feature of

@@ -1,0 +1,33 @@
+%% title: Read and watch path
+%% caption: List returns revision R, Watch resumes from R, replays the journal, then goes live.
+%% open: active
+%% milestones: M0 M3 M4 M6
+flowchart TB
+  subgraph RP1["Read: List returns revision R"]
+    direction LR
+    @{rp-request}
+    @{rp-linearizable}
+    @{rp-read-local}
+    @{pagination}
+    @{rp-request} -->|confirms leadership| @{rp-linearizable}
+    @{rp-linearizable} -->|reads local KvState| @{rp-read-local}
+    @{rp-read-local} -->|paginates the results| @{pagination}
+  end
+  subgraph RP2["Watch: resumes from R"]
+    direction LR
+    @{watch-register}
+    @{compaction-floor}
+    @{event-journal}
+    @{watch-hub}
+    @{watch-register} -->|checks R against floor| @{compaction-floor}
+    @{compaction-floor} -->|replays events after R| @{event-journal}
+    @{event-journal} -->|drains buffer, goes live| @{watch-hub}
+  end
+  subgraph RP0["Leader redirect"]
+    direction LR
+    @{rp-notleader}
+  end
+  RP1 -->|"returns revision R"| RP2
+  RP1 -->|"if not leader"| RP0
+  RP2 -->|"if not leader"| RP0
+  RP2 -->|"R at or below floor"| RP1

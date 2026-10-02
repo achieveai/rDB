@@ -395,3 +395,21 @@ safety gain: M5-R21's hazard is a node rejoining *the same* cluster.
 Rows: `m5_133_retired_set_converges_through_snapshot_install` (both directions of the union,
 after a purge of the entry that would otherwise teach it), `m5_103_install_restores_the_dedup_index_and_retired_set`
 (the receiver-keeps-its-own half, pre-existing).
+
+### 2026-10-01 — one InstallSnapshot call may take 30 s, not 200 ms
+
+OpenRaft's `install_snapshot_timeout` defaults to 200 ms, less than one append-entries call
+(`heartbeat_interval`). One call carries one chunk and, on the last chunk, the follower's whole
+install. Observed on a dev cluster under load: a node restarted behind the purge point never
+rejoined. Every call timed out, the follower heard no heartbeat while the leader retried, and
+its stale campaigns kept raising the leader's term. `NodeConfig::openraft_config` now sets
+`INSTALL_SNAPSHOT_TIMEOUT_MS` (30 s). A longer bound only delays the retry to a follower that
+hung mid-install.
+
+Row: `a_follower_behind_the_purge_point_rejoins_over_a_slow_link` (`m5_snapshot_cluster`). It
+adds 400 ms to every leader-to-follower call; with the old default it failed with the
+follower's term at 7 and 1106 `exceeded 200 ms` errors.
+
+Residual: the leader's stream to that follower also carries its heartbeats (OpenRaft 0.9). An
+install longer than the follower's election timeout can still cost one stale campaign; it no
+longer repeats forever.

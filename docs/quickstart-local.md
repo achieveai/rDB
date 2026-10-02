@@ -29,21 +29,26 @@ Custom size/location: `up -Nodes 5 -Dir .\.my-cluster` / `up --nodes 5 --dir ./.
 
 ```
 NODE  CLIENT             PEER               GOSSIP             HEALTH             STATUS  LEADER  PID
-1     127.0.0.1:17312    127.0.0.1:17311    127.0.0.1:17313    127.0.0.1:17314    ready   1       12345
-2     127.0.0.1:17322    127.0.0.1:17321    127.0.0.1:17323    127.0.0.1:17324    ready   1       12346
-3     127.0.0.1:17332    127.0.0.1:17331    127.0.0.1:17333    127.0.0.1:17334    ready   1       12347
+1     127.0.0.1:17302    127.0.0.1:17301    127.0.0.1:17303    127.0.0.1:17304    ready   1       12345
+2     127.0.0.1:17312    127.0.0.1:17311    127.0.0.1:17313    127.0.0.1:17314    ready   1       12346
+3     127.0.0.1:17322    127.0.0.1:17321    127.0.0.1:17323    127.0.0.1:17324    ready   1       12347
 ```
-Each node gets its own data/log directory under `.local-cluster/node-<n>/`. Default ports:
-`17300 + (n-1)*10 + {1 peer, 2 client, 3 gossip, 4 health}` (`-BasePort`/`--base-port` changes it).
+Each node gets its own data/log directory under `.local-cluster/node-<n>/`. Ports are
+`base + (n-1)*10 + {1 peer, 2 client, 3 gossip, 4 health}`, base 17300 by default
+(`-BasePort`/`--base-port` changes it). So node 1's client port is 17302, node 2's is 17312.
 
 ## Talking to it
 
-No client CLI exists yet. Two ways in:
+Easiest: the playground CLI in [`samples/retcd-playground`](../samples/retcd-playground/README.md)
+(`node kv.mjs put|get|ls|watch|status`; add `--base-port P` if you changed the base port).
+Client libraries: Node.js in [`clients/node`](../clients/node/README.md), C# in
+[`clients/dotnet`](../clients/dotnet/README.md). Lower-level ways in:
 
-1. **`grpcurl`**, plaintext (TLS is insecure here):
+1. **`grpcurl`**, plaintext (TLS is insecure here). Reads and writes go to the leader; a
+   follower answers `FAILED_PRECONDITION` and names the leader in `retcd-leader-endpoint`:
    ```bash
    grpcurl -plaintext -import-path proto -proto proto/retcd/v1/config.proto \
-     -d '{"key": "a2V5MQ=="}' 127.0.0.1:17312 retcd.v1.ConfigService/Get
+     -d '{"key": "a2V5MQ=="}' 127.0.0.1:17302 retcd.v1.ConfigService/Get
    ```
    `key`/`value` are base64 bytes. Proto:
    [`proto/retcd/v1/config.proto`](../proto/retcd/v1/config.proto) (`peer.proto`/`admin.proto` too).

@@ -234,9 +234,8 @@ impl RaftNetwork<TypeConfig> for EngineNetwork {
             RaftError<RaftNodeId, openraft::error::InstallSnapshotError>,
         >,
     > {
-        // Required by the trait; never reached, because the engine runs with
-        // `SnapshotPolicy::Never` and never purges a log (ADR-0008). Returning a typed error
-        // rather than `todo!()` keeps a contract violation debuggable instead of fatal.
+        // Reached when a follower is behind the leader's purge point (ADR-0022). Each call is
+        // bounded by `INSTALL_SNAPSHOT_TIMEOUT_MS`, not by OpenRaft's 200 ms default.
         let resp = self
             .call(PeerRequest::InstallSnapshot(rpc), option.hard_ttl())
             .await

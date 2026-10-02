@@ -30,19 +30,12 @@ use crate::meta::{
     decode_hint, decode_hint_extras, encode_hint_with_extras, fingerprint_hex,
     gossip_key_fingerprint, AcceptedGossipKeys, GossipKeyFingerprint,
 };
+use crate::ports::{self, random_port_in, CandidateError, DYNAMIC_PORTS};
 
 /// Depth of the membership-event channel. Events only *wake* the refresher, which then
 /// rebuilds the snapshot from authoritative membership, so a full channel loses nothing but
 /// timeliness.
 const EVENT_CHANNEL_DEPTH: usize = 256;
-
-/// How many times `start` re-runs the whole bind when the caller asked for an ephemeral port
-/// (`bind_addr` port `0`). memberlist picks the port by binding TCP first, retrying that up to
-/// ten times, and then binds UDP on the *same* port with no retry at all — so on a busy host a
-/// port that was free for TCP can already be held for UDP by another process, and the start
-/// fails for nothing the caller did. Retrying the whole bind is the only way to ask for a new
-/// pair; a fixed port is not retried, because a taken fixed port is the caller's problem.
-const EPHEMERAL_BIND_ATTEMPTS: u32 = 8;
 
 type GossipTransport = TokioNetTransport<SmolStr, TokioSocketAddrResolver, TokioTcp>;
 type TransportOptions = NetTransportOptions<SmolStr, TokioSocketAddrResolver, TokioTcp>;
@@ -225,13 +218,40 @@ impl GossipNode {
     ///
     /// [`GossipError::HintTooLarge`] if `self_hint` does not fit the 512-byte metadata budget
     /// (checked here because `memberlist` would otherwise panic),
-    /// [`GossipError::Config`] for an unusable label, and [`GossipError::Start`] if the
-    /// socket cannot be bound — for an ephemeral port only after [`EPHEMERAL_BIND_ATTEMPTS`]
-    /// whole-bind attempts, because memberlist's own port-0 pick is free for TCP, not for the
-    /// UDP socket it then binds on the same port.
+    /// [`GossipError::Config`] for an unusable label or a malformed
+    /// [`ports::PORT_RANGE_ENV`], and [`GossipError::Start`] if the socket cannot be bound. A
+    /// fixed port is tried once and never moved. An ephemeral port (port `0`) fails only after
+    /// [`ports::EPHEMERAL_BIND_ATTEMPTS`] random candidates have each been refused for TCP or
+    /// UDP. They come from [`ports::PORT_RANGE_ENV`] when it is set, else from
+    /// [`DYNAMIC_PORTS`].
     pub async fn start(
         cfg: GossipConfig,
         self_hint: ObservedPeerHint,
+    ) -> Result<Self, GossipError> {
+        // Read only for an ephemeral port: a fixed port never moves, so a malformed range
+        // must not be able to fail it.
+        let env_range = if cfg.bind_addr.port() == 0 {
+            ports::port_range_from_env().map_err(GossipError::Config)?
+        } else {
+            None
+        };
+        let draw_from = env_range.clone().unwrap_or(DYNAMIC_PORTS);
+        Self::start_with_ports(cfg, self_hint, env_range, move || {
+            random_port_in(&draw_from)
+        })
+        .await
+    }
+
+    /// [`Self::start`] with the source of ephemeral candidate ports injected, so a test can
+    /// hand it ports it knows will be refused. `env_range` is the [`ports::PORT_RANGE_ENV`]
+    /// range those candidates come from, if one is set; it only names the range in the error.
+    ///
+    /// `next_port` is called once per ephemeral attempt and never for a fixed port.
+    async fn start_with_ports(
+        cfg: GossipConfig,
+        self_hint: ObservedPeerHint,
+        env_range: Option<std::ops::RangeInclusive<u16>>,
+        next_port: impl FnMut() -> u16,
     ) -> Result<Self, GossipError> {
         let span = tracing::info_span!(
             "gossip",
@@ -240,20 +260,33 @@ impl GossipNode {
             bind = %cfg.bind_addr,
         );
         let outer = span.clone();
-        let ephemeral = cfg.bind_addr.port() == 0;
         async move {
-            let mut attempt = 1;
-            loop {
-                match Self::start_instrumented(cfg.clone(), self_hint.clone(), span.clone()).await {
-                    Err(GossipError::Start(e))
-                        if ephemeral && attempt < EPHEMERAL_BIND_ATTEMPTS =>
-                    {
-                        tracing::debug!(attempt, error = %e, "gossip_ephemeral_bind_retry");
-                        attempt += 1;
-                    }
-                    result => return result,
-                }
+            if cfg.bind_addr.port() != 0 {
+                return Self::start_instrumented(cfg, self_hint, span).await;
             }
+            ports::bind_candidates(
+                "gossip",
+                env_range.as_ref(),
+                next_port,
+                |port| {
+                    let mut candidate = cfg.clone();
+                    candidate.bind_addr.set_port(port);
+                    Self::start_instrumented(candidate, self_hint.clone(), span.clone())
+                },
+                |e| matches!(e, GossipError::Start(_)),
+            )
+            .await
+            .map_err(|e| match e {
+                CandidateError::Exhausted {
+                    last: GossipError::Start(e),
+                    attempts,
+                    env_range,
+                } => GossipError::Start(format!(
+                    "{e}{}",
+                    ports::exhausted_note(attempts, env_range.as_ref())
+                )),
+                CandidateError::Fatal(e) | CandidateError::Exhausted { last: e, .. } => e,
+            })
         }
         .instrument(outer)
         .await
@@ -990,5 +1023,164 @@ fn warn_decode_failure(shared: &Shared, id: &SmolStr, addr: &SocketAddr, e: &Hin
             error = %e,
             "gossip peer metadata could not be decoded; peer ignored"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+
+    use config_core::identity::RecoveryEpoch;
+
+    use super::*;
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    fn cluster() -> ClusterId {
+        ClusterId::from_bytes([0x6b; 16])
+    }
+
+    fn hint() -> ObservedPeerHint {
+        ObservedPeerHint {
+            cluster_id: cluster(),
+            recovery_epoch: RecoveryEpoch(1),
+            node_id: NodeId(1),
+            peer_endpoint: "node-1.retcd.invalid".into(),
+            client_endpoint: None,
+            software_version: "0.1.0".into(),
+            protocol_version: 1,
+            zone: None,
+            liveness: Liveness::Alive,
+        }
+    }
+
+    /// Hold `count` loopback UDP ports, so a gossip bind on any of them is refused.
+    ///
+    /// This is the observed failure's shape: memberlist's TCP bind on the port succeeds and its
+    /// UDP bind on the same port does not. On 2026-09-30 the refusal was `os error 10013` from a
+    /// Windows excluded range; a held port refuses with `10048`, which takes the same path.
+    fn blocked_udp_ports(count: usize) -> Vec<UdpSocket> {
+        (0..count)
+            .map(|_| UdpSocket::bind(loopback(0)).expect("bind a blocker UDP socket"))
+            .collect()
+    }
+
+    /// More refused candidates in a row than the 8 whole-bind attempts the start used to make.
+    /// One excluded Windows block is 100 ports wide and the OS hands out neighbours, so a run
+    /// this long is what a single unlucky pointer position produces.
+    const BLOCKED_RUN: usize = 12;
+
+    #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_bind_survives_a_run_of_refused_candidate_ports() {
+        let blockers = blocked_udp_ports(BLOCKED_RUN);
+        let blocked: Vec<u16> = blockers
+            .iter()
+            .map(|s| s.local_addr().expect("blocker address").port())
+            .collect();
+        let mut queue = blocked.clone().into_iter();
+        let mut drawn = 0usize;
+        // After the refused run, the production draw. Not `0`: letting the OS choose is the
+        // neighbour-pointer failure this start exists to avoid. On 2026-10-01 it handed out
+        // 55604, inside a new excluded UDP block, and every later `0` drew a neighbour.
+        // The production draw honours the port range exactly as `start` does.
+        let draw_from = ports::port_range_from_env()
+            .expect("a valid port range")
+            .unwrap_or(DYNAMIC_PORTS);
+        let picker = || {
+            drawn += 1;
+            queue.next().unwrap_or_else(|| random_port_in(&draw_from))
+        };
+
+        let cfg = GossipConfig::new(cluster(), NodeId(1), loopback(0));
+        let node = GossipNode::start_with_ports(cfg, hint(), None, picker)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("start must survive {BLOCKED_RUN} refused candidates {blocked:?}: {e}")
+            });
+
+        let bound = node.advertise_addr().port();
+        assert!(
+            !blocked.contains(&bound),
+            "bound {bound}, which is one of the held ports {blocked:?}"
+        );
+        assert_ne!(
+            bound, 0,
+            "advertise address must carry the port actually bound"
+        );
+        // `>`, not `== BLOCKED_RUN + 1`: a random draw after the run can itself land in an
+        // excluded block on this host, and the start is right to draw again.
+        assert!(
+            drawn > BLOCKED_RUN,
+            "every refused port was a candidate, then at least one more: drew {drawn}"
+        );
+        node.shutdown().await;
+        drop(blockers);
+    }
+
+    /// The default candidates are independent draws across the whole dynamic range, not the
+    /// neighbouring ports an OS pointer hands out. 256 uniform draws all landing within one
+    /// 1000-port window has probability below 1e-300, so this cannot flake.
+    #[test]
+    fn gossip_default_candidates_spread_across_the_dynamic_range() {
+        let draws: Vec<u16> = (0..256).map(|_| random_port_in(&DYNAMIC_PORTS)).collect();
+        assert!(
+            draws.iter().all(|p| DYNAMIC_PORTS.contains(p)),
+            "every candidate is in {DYNAMIC_PORTS:?}: {draws:?}"
+        );
+        let (low, high) = (draws.iter().min(), draws.iter().max());
+        let spread = high.zip(low).map_or(0, |(h, l)| h - l);
+        assert!(
+            spread > 1000,
+            "candidates clustered within {spread} ports: {draws:?}"
+        );
+    }
+
+    #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_fixed_port_that_is_refused_fails_and_never_moves() {
+        let blocker = blocked_udp_ports(1).pop().expect("one blocker");
+        let fixed = blocker.local_addr().expect("blocker address");
+        let mut drawn = 0usize;
+
+        let cfg = GossipConfig::new(cluster(), NodeId(1), fixed);
+        let result = GossipNode::start_with_ports(cfg, hint(), None, || {
+            drawn += 1;
+            0
+        })
+        .await;
+
+        match result {
+            Err(GossipError::Start(e)) => assert!(
+                e.contains(&fixed.port().to_string()),
+                "the error must name the configured port {fixed}: {e}"
+            ),
+            Err(other) => panic!("expected a bind failure for {fixed}, got {other}"),
+            Ok(node) => panic!(
+                "a refused fixed port must fail, but the node bound {}",
+                node.advertise_addr()
+            ),
+        }
+        assert_eq!(
+            drawn, 0,
+            "a fixed port must never be swapped for a candidate"
+        );
+        drop(blocker);
+    }
+
+    /// With a range set, an ephemeral gossip bind (TCP and UDP on one port) lands inside it.
+    #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_ephemeral_bind_lands_in_the_port_range() {
+        let range = 20000..=26999;
+        let draw_from = range.clone();
+        let cfg = GossipConfig::new(cluster(), NodeId(1), loopback(0));
+        let node = GossipNode::start_with_ports(cfg, hint(), Some(range.clone()), move || {
+            random_port_in(&draw_from)
+        })
+        .await
+        .expect("gossip binds inside the range");
+        let bound = node.advertise_addr().port();
+        assert!(range.contains(&bound), "{bound} outside {range:?}");
+        node.shutdown().await;
     }
 }

@@ -1,0 +1,106 @@
+{
+  "risks": [
+    {
+      "text": "353 M7 row ids remain of 469. Kernel-a fell from 4 to 2 due to miscrediting. Kernel-b at 0 of 148 is the critical long pole. Counted from the tree by scripts/m7-census.sh.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Serial team completion of four scopes in dependency order."
+    },
+    {
+      "text": "A test function name is not its claim. Of four kernel-a ids census called landed, only one matched plan rows cleanly. Two functions assert different rows than their id suggests.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "scripts/m7-census.sh MISCREDITED list removes ids from landed until their claim holds true on disk."
+    },
+    {
+      "text": "Every row count in this project was a copy of a copy. The old report said 457 remained of 556. The tree says 356 of 469. Numerator and denominator were both wrong, so the fraction looked plausible.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "scripts/m7-census.sh now counts the tree. Quote it, never a plan's prose. It reports existence, not quality."
+    },
+    {
+      "text": "scripts/purity-check.sh is new, untracked, and wired as a gate stage in both gate.sh and gate.ps1. It must land in the same commit as those two edits or gate all breaks.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "purity-check.sh, gate.sh, and gate.ps1 land in one commit."
+    },
+    {
+      "text": "Elapsed time is now the primary schedule risk with one serial team.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Serial team completes all scopes. Foundation is the critical path."
+    },
+    {
+      "text": "G-13 ruled: the version floor is evidence, not a gate. The chartered fix reads the backup manifest. Only the CLI restore path has a manifest, and that path refuses a reused cluster id. So the version it would seed is always from a foreign lineage. Every comparison across that boundary is meaningless. Reproduced on a real restored daemon. It is recoverable, because the policy poller adopts a higher document without a restart. But the refusal reports only the token rollback_floor. It never reports the two numbers it holds.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "ADR-0027 amendment passed its critic on 2026-09-22, with five corrections applied. Remaining work is diagnostics: make the rejection carry its numbers, and give the floor an operator-visible surface."
+    },
+    {
+      "text": "The C drive fills and corrupts build artifacts. It reached 97 percent again with two builds running, at 66 GB free. The lead deleted its own two stale build directories, which brought it back to 104 GB. Eleven build directories remain, holding about 190 GB between them.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Check free space before treating a linker failure as a defect. Delete only your own build directory, and only when idle. A directory that looks stale gets reported, not removed."
+    },
+    {
+      "text": "Four foundation capabilities return Unavailable: M7F-05, Network send, Cluster suspend, harness replay.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Foundation team implements stubs or full versions to unblock kernel test rows."
+    },
+    {
+      "text": "Fifteen contract asks queued for second foundation round from three teams.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Foundation advances through contract backlog in priority order."
+    },
+    {
+      "text": "CB-7 is built, green and uncommitted. A new contracts/ignore.rs holds KernelIgnoredReason with five arms. It is wired and exercised by seven test references. The whole suite passes with it. Nothing has committed it, and no agent currently owns it.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Whoever commits it must also move four drift-basis markers and shift the event.rs line citations by 21. The drift stage catches a stale marker. Nothing checks a shifted line citation."
+    },
+    {
+      "text": "Contract CB-9b: Clock producer exists. No kernel module reads it. Example: authority.rs:331 takes _ctx unused.",
+      "owner": "lead",
+      "severity": "high",
+      "closing": "Kernel module reads and uses Clock from StepCtx."
+    },
+    {
+      "text": "Five of seven AckRejectReason cells have no producer. RoleMismatch and Unverifiable lack coverage.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "Coverage cells defined in kernel test planning."
+    },
+    {
+      "text": "The M6 gap list outlived the gaps. M6-33 and M6-35 closed in commit 096bbfa. The risk list and ADR-0031 did not follow. M7 specified two pieces of work against the stale entries. A critic caught both. Then the correction itself went too far. One withdrawn item turned out to be live.",
+      "owner": "lead",
+      "severity": "medium",
+      "closing": "ADR-0031 and the m6_policy_daemon note now carry dated corrections. Two backup.rs doc comments still cite a gap that closed. Check a gap against source before specifying work on it."
+    },
+    {
+      "text": "A follower continuation page carries no leader hint.",
+      "owner": "lead",
+      "severity": "low",
+      "closing": "Product backlog after the M6 gate."
+    },
+    {
+      "text": "Concurrent agents hit Windows ephemeral-port exhaustion on rotation tests.",
+      "owner": "lead",
+      "severity": "low",
+      "closing": "Known environment constraint, not a code defect."
+    },
+    {
+      "text": "M6 evidence rows are reduced-scale, never a production claim.",
+      "owner": "lead",
+      "severity": "low",
+      "closing": "Restated per ADR-0031 on every refresh."
+    },
+    {
+      "text": "Concurrent gates against the same target directory cause linker collision.",
+      "owner": "lead",
+      "severity": "low",
+      "closing": "Gate script assigns each run a private target directory; concurrent gates need separate ones."
+    }
+  ]
+}

@@ -138,3 +138,14 @@ E2E-43 twice to a node 0 whose ready line carried no gossip address, because
 debug as `gossip_ephemeral_bind_retry`. A fixed port is never retried: a taken fixed port is
 the operator's configuration, not the host's luck. The daemon's degrade-to-no-gossip behaviour
 is unchanged; only the odds of hitting it for a reason the operator cannot see have dropped.
+
+### Note (2026-10-01): ephemeral candidates are drawn at random across the dynamic range
+
+Eight retries were not enough on Windows. Each retry took the OS's next ephemeral port, and
+Windows hands those out from a rotating pointer, so the eight picks were neighbours and could
+all land inside one excluded UDP block (`os error 10013`; AGENTS.md lists how to see the
+blocks). E2E-43, M6-20 and M6-21 failed together that way on 2026-09-30.
+
+For port `0`, `GossipNode::start` now draws each candidate at random from 49152-65535 and tries
+up to `EPHEMERAL_BIND_ATTEMPTS` (32), retrying any `GossipError::Start`. When all fail, the error
+ends `(last of 32 ephemeral candidate ports)`. A fixed port is still tried once and never moved.

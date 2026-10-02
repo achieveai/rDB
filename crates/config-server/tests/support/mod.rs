@@ -264,12 +264,17 @@ impl Harness {
             Some(secs) => format!("watch_files_secs = {secs}\n"),
             None => String::new(),
         };
+        let handshake_timeout_line = match options.tls_handshake_timeout_ms {
+            Some(ms) => format!("handshake_timeout_ms = {ms}\n"),
+            None => String::new(),
+        };
+        let tls_keys = format!("{watch_files_secs_line}{handshake_timeout_line}");
         let tls_block = if options.insecure {
-            format!("[tls]\nmode = \"insecure\"\n{watch_files_secs_line}")
+            format!("[tls]\nmode = \"insecure\"\n{tls_keys}")
         } else {
             format!(
                 "[tls]\nmode = \"mutual\"\nca = \"ca.pem\"\ncert = \"node.cert.pem\"\n\
-                 key = \"node.key.pem\"\n{watch_files_secs_line}"
+                 key = \"node.key.pem\"\n{tls_keys}"
             )
         };
         // `admins` is emitted only when a row asked for it, so every existing row's document is
@@ -570,6 +575,13 @@ pub struct NodeOptions {
     /// Absent writes no key at all, which keeps the daemon's own default (30s) and keeps every
     /// pre-rotation row's document byte-identical.
     pub tls_watch_files_secs: Option<u64>,
+    /// `[tls] handshake_timeout_ms` — how long a TLS handshake may take before the listener
+    /// drops it (gap G-01).
+    ///
+    /// Absent writes no key at all, for the same reason as `tls_watch_files_secs`: the daemon
+    /// keeps its own default and every row that predates the setting keeps a byte-identical
+    /// document, so exposing the constant changed no existing row's meaning.
+    pub tls_handshake_timeout_ms: Option<u64>,
     /// `[gossip] secret_key_hex` / `accepted_key_hex` — the gossip encryption keyring
     /// (ADR-0028).
     ///
@@ -614,6 +626,11 @@ pub struct PolicyFixture {
     pub policy_file: PathBuf,
     /// Where the detached envelope is written.
     pub signature_file: PathBuf,
+    /// Which cluster the written document claims (gap G-06). `None` is the legacy-unscoped
+    /// document every row wrote before the field existed, which still verifies and still
+    /// adopts — so leaving this alone keeps an existing row testing exactly what it tested.
+    /// A row that wants the scoped path calls [`Self::for_cluster`].
+    cluster_id: Option<config_core::ClusterId>,
 }
 
 impl PolicyFixture {
@@ -623,7 +640,17 @@ impl PolicyFixture {
             key: ed25519_dalek::SigningKey::from_bytes(&[0xA7; 32]),
             policy_file: root.join("policy.json"),
             signature_file: root.join("policy.json.sig"),
+            cluster_id: None,
         }
+    }
+
+    /// Write documents scoped to `cluster` instead of legacy-unscoped ones (gap G-06).
+    ///
+    /// Separate from [`Self::new`] so that adding the field changed no existing row's meaning:
+    /// a row that never calls this still writes the document it always wrote.
+    pub fn for_cluster(mut self, cluster: config_core::ClusterId) -> Self {
+        self.cluster_id = Some(cluster);
+        self
     }
 
     /// The `[[authz.trust_keys]]` entry for this fixture's signer.
@@ -664,6 +691,7 @@ impl PolicyFixture {
                 })
                 .collect(),
             admins: admins.iter().map(|a| (*a).to_string()).collect(),
+            cluster_id: self.cluster_id,
         };
         let bytes = serde_json::to_vec(&document).expect("a policy document serializes");
         let hash = document_hash(&bytes);

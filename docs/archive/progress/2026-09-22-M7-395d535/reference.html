@@ -1,0 +1,143 @@
+<details class="ref-block">
+  <summary>Logging and observability — ADR-0013</summary>
+  <div class="ref-body diagram-panel">
+    <svg viewBox="0 0 1040 150" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="JSONL logging pipeline diagram">
+      <style>
+        .lg-box { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+        .lg-box.sink { fill: var(--green-soft); stroke: var(--green); }
+        .lg-lbl { fill: var(--text); font-size: 13px; font-weight: 700; }
+        .lg-sub { fill: var(--muted); font-size: 10.5px; }
+        .lg-arrow { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow4); }
+      </style>
+      <defs>
+        <marker id="arrow4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+        </marker>
+      </defs>
+      <rect class="lg-box" x="10" y="40" width="190" height="56" rx="10"></rect>
+      <text x="105" y="62" class="lg-lbl" text-anchor="middle">#[retcd_test]</text>
+      <text x="105" y="78" class="lg-sub" text-anchor="middle">root span: testModule /</text>
+      <text x="105" y="90" class="lg-sub" text-anchor="middle">testMethod / testRun</text>
+      <path class="lg-arrow" d="M200,68 L272,68"></path>
+      <rect class="lg-box" x="282" y="40" width="150" height="56" rx="10"></rect>
+      <text x="357" y="64" class="lg-lbl" text-anchor="middle">tracing</text>
+      <text x="357" y="80" class="lg-sub" text-anchor="middle">span + event fields</text>
+      <path class="lg-arrow" d="M432,68 L494,68"></path>
+      <rect class="lg-box" x="504" y="40" width="150" height="56" rx="10"></rect>
+      <text x="579" y="64" class="lg-lbl" text-anchor="middle">JsonlLayer</text>
+      <text x="579" y="80" class="lg-sub" text-anchor="middle">config-log</text>
+      <path class="lg-arrow" d="M654,68 L716,68"></path>
+      <rect class="lg-box sink" x="726" y="40" width="150" height="56" rx="10"></rect>
+      <text x="801" y="60" class="lg-lbl" text-anchor="middle">per-test file</text>
+      <text x="801" y="76" class="lg-sub" text-anchor="middle">target/test-logs/</text>
+      <text x="801" y="88" class="lg-sub" text-anchor="middle">&lt;module&gt;/&lt;method&gt;.jsonl</text>
+      <path class="lg-arrow" d="M876,68 L938,68"></path>
+      <rect class="lg-box sink" x="948" y="40" width="82" height="56" rx="10"></rect>
+      <text x="989" y="64" class="lg-lbl" text-anchor="middle">DuckDB</text>
+      <text x="989" y="80" class="lg-sub" text-anchor="middle">query</text>
+    </svg>
+    <div class="diagram-caption">Every test opens its span before any code runs (TA-8). Files flush on panic.</div>
+    <pre class="codeblock"><code>SELECT testMethod, count(*) FROM read_json_auto('target/test-logs/**/*.jsonl', union_by_name=true) GROUP BY 1;</code></pre>
+    <div class="diagram-caption">M6 gate rule: use a fresh <code>RETCD_TEST_LOG_DIR</code> per package or suite. A shared path makes DuckDB sample half-written files.</div>
+  </div>
+</details>
+
+<details class="ref-block">
+  <summary>Test architecture — 12 invariants</summary>
+  <div class="ref-body ta-grid">
+    <div class="ta-item"><span class="ta-id">TA-1</span>Pure, synchronous state machine — apply is sync, total, infallible.</div>
+    <div class="ta-item"><span class="ta-id">TA-2</span><code>state_hash()</code> is a stable digest over revision + records.</div>
+    <div class="ta-item"><span class="ta-id">TA-3</span>One deterministic validator shared by the API edge and apply.</div>
+    <div class="ta-item"><span class="ta-id">TA-4</span>Storage accepts a FaultInjector hook at every durability boundary.</div>
+    <div class="ta-item"><span class="ta-id">TA-5</span>NetFault blocks or delays traffic in-process; a blocked call fails fast.</div>
+    <div class="ta-item"><span class="ta-id">TA-6</span>ConfigNode exposes deadline-pollable waits — no test ever sleeps for consensus.</div>
+    <div class="ta-item"><span class="ta-id">TA-7</span>Gossip is injectable; hint validation is pure and table-driven.</div>
+    <div class="ta-item"><span class="ta-id">TA-8</span>Every test opens <code>#[retcd_test]</code>; spans propagate across <code>tokio::spawn</code>.</div>
+    <div class="ta-item"><span class="ta-id">TA-9</span>Purity is machine-checked: a scan rejects clock/env/fs/rand in apply.</div>
+    <div class="ta-item"><span class="ta-id">TA-10</span>One conformance suite runs against <code>Arc&lt;dyn ConfigStore&gt;</code> for both clients.</div>
+    <div class="ta-item"><span class="ta-id">TA-11</span>Cluster isolation: ephemeral ports, per-test temp dirs, cleaned up on Drop.</div>
+    <div class="ta-item"><span class="ta-id">TA-12</span>Capabilities is one struct equality, never a string grep.</div>
+  </div>
+</details>
+
+<details class="ref-block">
+  <summary>Team workflow</summary>
+  <div class="ref-body diagram-panel">
+    <svg viewBox="0 0 1040 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Team workflow diagram">
+      <style>
+        .wf-box { fill: var(--panel); stroke: var(--border); stroke-width: 1.5; }
+        .wf-box.lead { fill: var(--accent-soft); stroke: var(--accent); }
+        .wf-box.gate { fill: var(--green-soft); stroke: var(--green); }
+        .wf-box.fix { fill: var(--amber-soft); stroke: var(--amber); }
+        .wf-lbl { fill: var(--text); font-size: 12.5px; font-weight: 700; }
+        .wf-e { stroke: var(--muted); stroke-width: 1.6; fill: none; marker-end: url(#arrow5); }
+        .wf-e.dash { stroke-dasharray: 4 3; }
+        .wf-elbl { fill: var(--muted); font-size: 10.5px; }
+      </style>
+      <defs>
+        <marker id="arrow5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"></path>
+        </marker>
+      </defs>
+      <rect class="wf-box lead" x="10" y="16" width="150" height="46" rx="10"></rect>
+      <text x="85" y="44" class="wf-lbl" text-anchor="middle">Architect</text>
+      <path class="wf-e" d="M160,39 L222,39"></path>
+      <rect class="wf-box" x="232" y="16" width="150" height="46" rx="10"></rect>
+      <text x="307" y="44" class="wf-lbl" text-anchor="middle">Tester Planner</text>
+      <path class="wf-e" d="M382,39 L444,39"></path>
+      <rect class="wf-box" x="454" y="16" width="150" height="46" rx="10"></rect>
+      <text x="529" y="44" class="wf-lbl" text-anchor="middle">Developer</text>
+      <path class="wf-e" d="M604,39 L666,39"></path>
+      <rect class="wf-box" x="676" y="16" width="150" height="46" rx="10"></rect>
+      <text x="751" y="44" class="wf-lbl" text-anchor="middle">Tester</text>
+      <path class="wf-e" d="M826,39 L888,39"></path>
+      <rect class="wf-box" x="898" y="16" width="132" height="46" rx="10"></rect>
+      <text x="964" y="44" class="wf-lbl" text-anchor="middle">Arch Critic</text>
+      <rect class="wf-box fix" x="676" y="100" width="150" height="46" rx="10"></rect>
+      <text x="751" y="128" class="wf-lbl" text-anchor="middle">Fixes</text>
+      <path class="wf-e" d="M964,62 C964,110 900,123 826,123"></path>
+      <text x="900" y="95" class="wf-elbl" text-anchor="middle">findings</text>
+      <path class="wf-e" d="M751,100 C751,80 670,60 604,44"></path>
+      <text x="700" y="78" class="wf-elbl">back to Developer</text>
+      <rect class="wf-box gate" x="454" y="100" width="150" height="46" rx="10"></rect>
+      <text x="529" y="128" class="wf-lbl" text-anchor="middle">Gate commit</text>
+      <path class="wf-e" d="M964,62 C964,150 640,150 604,123"></path>
+      <text x="820" y="163" class="wf-elbl" text-anchor="middle">clean review</text>
+      <rect class="wf-box" x="232" y="100" width="150" height="46" rx="10"></rect>
+      <text x="307" y="122" class="wf-lbl" text-anchor="middle">Debugger</text>
+      <text x="307" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(on failures)</text>
+      <path class="wf-e dash" d="M751,146 C751,190 380,190 307,146"></path>
+      <text x="530" y="204" class="wf-elbl" text-anchor="middle">test failure escalation</text>
+      <rect class="wf-box lead" x="10" y="100" width="150" height="46" rx="10"></rect>
+      <text x="85" y="122" class="wf-lbl" text-anchor="middle">Progress</text>
+      <text x="85" y="136" class="wf-lbl" text-anchor="middle" style="font-size:10px;font-weight:600;">(this report)</text>
+      <path class="wf-e dash" d="M232,123 L160,123"></path>
+    </svg>
+    <div class="diagram-caption">Architect designs and gates. Tester Planner writes the backlog before code. Developer implements. Tester and Arch Critic review. Findings loop back as fixes. Debugger joins only on failures.</div>
+  </div>
+</details>
+
+<details class="ref-block">
+  <summary>Decision log — 32 ADRs</summary>
+  <div class="ref-body">
+    <table class="decisions">
+      <thead><tr><th>ADR</th><th>Title</th><th>Note</th></tr></thead>
+      <tbody>
+        <tr><td>0000-0018</td><td>M0-M3 foundational decisions</td><td>Accepted, merged. See <code>docs/ADRs/</code>.</td></tr>
+        <tr><td>0019</td><td>Event journal and replicated compaction</td><td>Delivered by dev-journal. Gate <code>33b5f4b</code>.</td></tr>
+        <tr><td>0020</td><td>Watch delivery and isolation</td><td>Delivered by dev-watch. Two fix rounds closed.</td></tr>
+        <tr><td>0021</td><td>Storage format v2 and migration</td><td>Amended by ruling M5-R19 (undrained-log refusal).</td></tr>
+        <tr><td>0022</td><td>Snapshots and log purge</td><td>Delivered by dev-snapshot. Ruling M5-R11 (purge/defer/refuse).</td></tr>
+        <tr><td>0023</td><td>Admin plane, learner lifecycle, fencing</td><td>Delivered by dev-admin. Two-step RemoveMember.</td></tr>
+        <tr><td>0024</td><td>Backup and fenced restore</td><td>Exit codes per ruling M5-R12.</td></tr>
+        <tr><td>0025</td><td>Bounded request deduplication</td><td>Delivered by dev-dedup. Format v3.</td></tr>
+        <tr><td>0026</td><td>Metrics facade, exporter, runbooks</td><td>Names authoritative over the test plan (ruling M5-R18).</td></tr>
+        <tr><td>0027</td><td>Signed policy documents and RBAC lifecycle</td><td>Delivered by dev-rbac. Gossip convergence M6-20/21.</td></tr>
+        <tr><td>0028</td><td>TLS and gossip key rotation</td><td>Delivered by dev-rotation. <code>m6_rotation.rs</code> 24/24.</td></tr>
+        <tr><td>0029</td><td>Revision-pinned pagination</td><td>Delivered by dev-pagination. 38 tests.</td></tr>
+        <tr><td>0030</td><td>Mixed-version upgrades and migrations</td><td>M6-R20/R22 fixes verified. E2E-42 landed, 8x green.</td></tr>
+        <tr><td>0031</td><td>Evidence artifacts and known gaps</td><td>12/12 evidence rows. Dev-host numbers only.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</details>

@@ -1,0 +1,13 @@
+{
+  "from": { "ledger_line": 711, "git_head": "6f925bb" },
+  "to": { "ledger_line": 720, "git_head": "c5fcfe5" },
+  "items": [
+    {
+      "kind": "note",
+      "milestone": "M6",
+      "summary": "Second gate collision when two gates ran simultaneously. Linker could not overwrite m6_rotation binary.",
+      "evidence": "ledger:715",
+      "parts": ["tls-rotation"]
+    }
+  ]
+}

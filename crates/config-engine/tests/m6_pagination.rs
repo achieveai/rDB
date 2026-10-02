@@ -393,6 +393,125 @@ async fn m6_70_token_from_another_leader_is_rejected() {
     assert_eq!(restarted.items.len(), PAGE as usize);
 }
 
+/// G-04 — a continuation that reached a follower is still refused, and now says where to go.
+///
+/// The refusal is unchanged and deliberately so: the pin is on the leader, so the token really
+/// is unusable here and `reason` stays `node` for every client that only reads `reason`
+/// (M6-70 and M6-83 above are those clients, and neither moves). What is new is that the
+/// refusal names the leader, so the restarted walk does not first have to spend a `NotLeader`
+/// round trip finding it.
+///
+/// The hint's *content* is what is asserted, against the hint the node's own `NotLeader` path
+/// produces — a row that only checked `is_some()` would pass against a hint naming the wrong
+/// node, which is worse than no hint at all.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn g_04_a_followers_page_token_refusal_carries_the_leader_hint() {
+    let cluster = Cluster::formed(3).await;
+    let leader = cluster.leader();
+    let follower = cluster.followers()[0];
+    for i in 0..POPULATION {
+        cluster
+            .put(leader, &format!("/p/{i:04}"), "v")
+            .await
+            .expect("seed put");
+    }
+
+    let clock = Arc::new(ManualClock::new());
+    clock.advance(Duration::from_secs(1_000));
+    let on_leader = paginator_for(
+        cluster.store(leader),
+        leader,
+        Arc::clone(&clock),
+        MAX_PINNED,
+        TTL,
+    );
+    let on_follower = paginator_for(
+        cluster.store(follower),
+        follower,
+        Arc::clone(&clock),
+        MAX_PINNED,
+        TTL,
+    );
+    // Both tables exist before the token is minted, so `issued_ms < started_ms` cannot fire and
+    // the refusal below can only be the wrong-node clause.
+    clock.advance(Duration::from_secs(1));
+
+    let walk = || ListRequest {
+        prefix: key("/p/"),
+        max_items: PAGE,
+        max_bytes: 0,
+    };
+    let token = on_leader
+        .list_page(
+            cluster.get_node(leader),
+            &principal(),
+            PageRequest {
+                list: walk(),
+                page_token: None,
+            },
+        )
+        .await
+        .expect("page 1 from the leader")
+        .next_page_token
+        .expect("a cursor");
+
+    // The misdirected continuation: a real token for a real pin, arriving at the wrong node.
+    let err = on_follower
+        .list_page(
+            cluster.get_node(follower),
+            &principal(),
+            PageRequest::resume(walk(), token.clone()),
+        )
+        .await
+        .expect_err("the follower has no such pin");
+
+    // The oracle: the hint this same follower hands out on the established `NotLeader` path.
+    // Taken from the node rather than from `leader`, so the assertion is about agreement
+    // between the two paths and not about a value the test computed for itself.
+    let oracle = match cluster
+        .put(follower, "/p/unwritable", "v")
+        .await
+        .expect_err("a follower refuses a write")
+    {
+        ConfigError::NotLeader { hint: Some(hint) } => hint,
+        other => panic!("expected NotLeader with a hint, got {other}"),
+    };
+    assert_eq!(oracle.node_id, leader, "the oracle names the real leader");
+
+    assert_expired(&err, PageTokenExpiredReason::Node);
+    match err {
+        ConfigError::PageTokenExpired {
+            hint: Some(hint), ..
+        } => assert_eq!(
+            hint, oracle,
+            "the page-token hint is the same node and the same client endpoint the \
+             `NotLeader` path would have given"
+        ),
+        other => panic!("expected a leader hint on the refusal, got {other}"),
+    }
+
+    // And the rule that keeps a hint honest: a node never points a caller back at itself. The
+    // leader refusing a token minted by some earlier leader knows only one leader — itself —
+    // so it withholds the hint rather than offering a redirect into the same refusal.
+    let mut foreign = open_token(&token, &TOKEN_KEY).expect("our own token");
+    foreign.node_id = NodeId(7);
+    let stale = on_leader
+        .list_page(
+            cluster.get_node(leader),
+            &principal(),
+            PageRequest::resume(walk(), seal_token(&foreign, &TOKEN_KEY)),
+        )
+        .await
+        .expect_err("a token from a node that is not this one");
+    assert_expired(&stale, PageTokenExpiredReason::Node);
+    assert!(
+        matches!(stale, ConfigError::PageTokenExpired { hint: None, .. }),
+        "no self-redirect: {stale}"
+    );
+
+    cluster.shutdown().await;
+}
+
 /// M6-83 — a pin does not survive a restart, and says so with **one** reason.
 ///
 /// Modelled as a paginator built after the token was issued: that is what a restart is from
@@ -791,6 +910,126 @@ async fn m6_81_a_pinned_snapshot_does_not_block_raft_apply() {
     }
 }
 
+/// M6-81, the compaction half — a pin outlives a compaction that reclaimed its revision.
+///
+/// The claim is not "a `Compact` may run next to a pin". On this backend a pin is a clone of
+/// the record map ([`config_storage::PinnedView`]), so a walk that never pinned anything would
+/// also survive a bare compaction, and a row that only ran one would pass against a completely
+/// broken pin. The claim is the one §19.12 actually makes: the replicated `Compact` applies —
+/// a pin never blocks it — *and* the walk still reads the state it pinned afterwards, from a
+/// revision the journal has since reclaimed.
+///
+/// So the row makes the compaction bite before it asserts survival. It deletes half the prefix
+/// the walk has not reached yet, compacts past the walk's own revision, and proves the
+/// reclamation two ways: `compact_revision` is above the pinned revision, and a watcher asking
+/// to replay that revision is refused `RevisionCompacted`. Only then does it resume the walk.
+#[config_log::retcd_test]
+async fn m6_81_a_pin_survives_a_compaction_that_reclaimed_its_revision() {
+    let fixture = Fixture::start().await;
+
+    // Page one pins the walk's revision. Pages 6..10 are still owed, and are exactly the keys
+    // the deletes below remove from live state.
+    let first = fixture.page(None).await.expect("page 1");
+    let pinned_revision = first.revision;
+    let token = first.next_page_token.clone().expect("a cursor");
+    assert_eq!(fixture.paginator.stats().len, 1, "one pin held");
+
+    // Half the prefix leaves live state, so the pinned content and the live content differ by
+    // something the walk has not yet returned.
+    let mut last = 0;
+    for i in (POPULATION / 2)..POPULATION {
+        last = fixture
+            .cluster
+            .delete(NodeId(1), &format!("/p/{i:04}"))
+            .await
+            .expect("delete a key the walk has not reached")
+            .revision;
+    }
+
+    // The replicated `Compact` applies while the pin is held — the test plan's own half of the
+    // row — and it compacts *past* the pinned revision rather than up to some earlier one.
+    let floor = fixture
+        .node()
+        .propose_compact(&principal(), last)
+        .await
+        .expect("a compaction must not be blocked by a held pin");
+    assert!(
+        floor > pinned_revision,
+        "the compaction has to reach past the pin to be testing anything \
+         (floor {floor}, pinned {pinned_revision})"
+    );
+    assert_eq!(
+        fixture.node().compact_revision(),
+        floor,
+        "the floor the node is holding"
+    );
+
+    // What "reclaimed" means, stated as a refusal rather than as a number: a consumer asking to
+    // replay the walk's own revision is told that revision is gone. This is the assertion that
+    // makes the survival below mean something.
+    let replay = fixture
+        .node()
+        .watch(
+            &principal(),
+            config_core::WatchRequest {
+                prefix: key("/p/"),
+                start_after_revision: pinned_revision - 1,
+                progress_interval: Some(Duration::from_secs(3600)),
+            },
+        )
+        .await
+        .err();
+    match replay {
+        Some(ConfigError::RevisionCompacted {
+            minimum_available_revision,
+        }) => assert!(
+            minimum_available_revision > pinned_revision,
+            "history at the pinned revision was reclaimed \
+             (minimum {minimum_available_revision}, pinned {pinned_revision})"
+        ),
+        other => panic!("expected the pinned revision to be reclaimed, got {other:?}"),
+    }
+
+    // The counterfactual, so the survival is not read as "nothing changed": an unpinned walk
+    // would now see half the prefix.
+    assert_eq!(
+        fixture
+            .cluster
+            .list(NodeId(1), "/p/")
+            .await
+            .expect("list live state")
+            .records
+            .len(),
+        POPULATION / 2,
+        "live state lost the second half"
+    );
+
+    // And the pin survived all of it: the walk finishes at its own revision, returning keys
+    // that live state no longer has.
+    let mut items = first.items.clone();
+    let mut token = Some(token);
+    while let Some(cursor) = token.take() {
+        let page = fixture
+            .page(Some(cursor))
+            .await
+            .expect("a continuation across the compaction");
+        assert_eq!(
+            page.revision, pinned_revision,
+            "every page still reports the pinned revision"
+        );
+        items.extend(page.items.clone());
+        token = page.next_page_token;
+    }
+    let keys: Vec<Vec<u8>> = items.iter().map(|r| r.key.to_vec()).collect();
+    let expected: Vec<Vec<u8>> = (0..POPULATION)
+        .map(|i| format!("/p/{i:04}").into_bytes())
+        .collect();
+    assert_eq!(
+        keys, expected,
+        "the whole prefix as it was at the pinned revision, including the deleted half"
+    );
+}
+
 /// M6-82 — an abandoned walk's pin is released by the TTL rather than leaking.
 #[config_log::retcd_test]
 async fn m6_82_pins_are_released_when_a_walk_is_abandoned() {
@@ -920,7 +1159,7 @@ fn assert_expired(err: &ConfigError, expected: PageTokenExpiredReason) {
         "an expiry is a precondition failure: {err}"
     );
     match err {
-        ConfigError::PageTokenExpired { reason } => assert_eq!(
+        ConfigError::PageTokenExpired { reason, .. } => assert_eq!(
             *reason, expected,
             "expected reason `{expected}`, got `{reason}`"
         ),

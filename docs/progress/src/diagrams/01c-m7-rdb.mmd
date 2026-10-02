@@ -1,0 +1,33 @@
+%% title: M7 rDB build order
+%% caption: Work runs top to bottom. Each row shows what exists today and what blocks the next row.
+%% open: always
+%% milestones: M7
+flowchart TB
+  subgraph F["Foundation, contracts first"]
+    direction LR
+    @{rdb-serialiser}
+    @{rdb-contracts}
+    @{rdb-sim-clock}
+    @{rdb-harness-caps}
+    @{rdb-serialiser} ~~~ @{rdb-contracts} ~~~ @{rdb-sim-clock} ~~~ @{rdb-harness-caps}
+  end
+  subgraph KA["Kernel A, authority and replication"]
+    direction LR
+    @{rdb-authority}
+    @{rdb-kernel-a}
+    @{rdb-authority} ~~~ @{rdb-kernel-a}
+  end
+  subgraph KB["Kernel B, transactions and publication"]
+    direction LR
+    @{rdb-kernel-b}
+  end
+  subgraph V["Verification, oracle last"]
+    direction LR
+    @{rdb-oracle}
+    @{rdb-campaign}
+    @{rdb-oracle} ~~~ @{rdb-campaign}
+  end
+  F -->|freezes contract names| KA
+  KA -->|hands on the same carrier| KB
+  KA -->|feeds traces| V
+  KB -->|feeds traces| V

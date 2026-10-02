@@ -1,0 +1,36 @@
+%% title: Operator workflows
+%% caption: Each row is one operator job; steps run left to right; state shows if it works today.
+%% open: active
+%% milestones: M5 M6
+flowchart TB
+  subgraph OW1["Start a local cluster"]
+    direction LR
+    @{local-cluster-up}
+    @{local-cluster-ready}
+    @{local-cluster-up} -->|then wait for| @{local-cluster-ready}
+  end
+  subgraph OW2["Snapshot, then purge the log"]
+    direction LR
+    @{snapshots-purge}
+    @{log-purge}
+    @{snapshots-purge} -->|then purge, guarded| @{log-purge}
+  end
+  subgraph OW3["Back up, then restore"]
+    direction LR
+    @{backup}
+    @{restore}
+    @{backup} -->|verify, then restore| @{restore}
+  end
+  subgraph OW4["Rotate TLS and gossip keys"]
+    direction LR
+    @{tls-rotation}
+    @{gossip-key-rotation}
+    @{tls-rotation} -->|then rotate gossip key| @{gossip-key-rotation}
+  end
+  subgraph OW5["Roll a mixed-version upgrade"]
+    direction LR
+    @{drain-check}
+    @{rolling-upgrade}
+    @{drain-check} -->|then upgrade if clean| @{rolling-upgrade}
+  end
+  OW1 ~~~ OW2 ~~~ OW3 ~~~ OW4 ~~~ OW5

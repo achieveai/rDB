@@ -13,6 +13,14 @@ build.mjs  -> validates everything, writes index.html, advances src/meta.json,
               moves changes.json to changes.last.json, appends one line to the refresh log
 ```
 
+## Focus: the active milestone only
+
+The page shows the active milestone (the one not yet `committed`) and nothing older: its card,
+its diagrams (those whose `milestones` directive names it), its agents and its risks. The strip
+still lists every milestone. Earlier material lives in `docs/archive/progress/`. So `work.json`
+and `risks.json` hold active-milestone entries only; when a milestone commits, archive with
+`node docs/progress/archive.mjs --milestone <M>` and drop its agents and risks.
+
 ## Shared vocabulary (build rejects anything else)
 
 - Milestone `chip`: `Not started` | `In progress` | `Blocked` | `Review` | `Gate passed` | `Done`

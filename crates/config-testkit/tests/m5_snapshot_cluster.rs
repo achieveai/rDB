@@ -45,11 +45,13 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use config_core::NodeId;
 use config_engine::admin::SnapshotTriggered;
 use config_storage::Boundary;
 use config_testkit::cluster::{Cluster, StorageKind};
+use config_testkit::poll::TestTimers;
 
 use support::{put_req, ScriptedInjector};
 
@@ -810,4 +812,86 @@ fn walk_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+// -------------------------------------------------------------------------------------------
+// A follower behind the purge point rejoins when a snapshot call takes longer than 200 ms
+// -------------------------------------------------------------------------------------------
+
+/// Heartbeats slow enough that an append-entries call, which OpenRaft gives
+/// `heartbeat_interval`, survives [`SLOW_LINK`].
+const SLOW_LINK_TIMERS: TestTimers = TestTimers {
+    heartbeat: Duration::from_millis(800),
+    election_timeout_min: Duration::from_millis(2400),
+    election_timeout_max: Duration::from_millis(4800),
+};
+
+/// Added to every leader-to-follower peer call: twice OpenRaft's 200 ms
+/// `install_snapshot_timeout` default, half the append-entries budget above.
+const SLOW_LINK: Duration = Duration::from_millis(400);
+
+/// Observed 2026-10-01 on a dev cluster under load: a node restarted behind the leader's purge
+/// point never rejoined. Every InstallSnapshot call ran past OpenRaft's 200 ms default, so no
+/// snapshot ever landed; the follower heard no heartbeat while the leader retried, campaigned
+/// on its stale log, and pushed the leader's term up again and again.
+///
+/// The delay stands in for a big snapshot on a slow host. It is charged to the call's own
+/// deadline (`GrpcPeerTransport::send_with_schema`), as a slow transfer would be.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_behind_the_purge_point_rejoins_over_a_slow_link() {
+    let cluster = Cluster::builder()
+        .nodes(3)
+        .storage(StorageKind::ROCKS)
+        .snapshot(REPAIR_PROFILE)
+        .timers(SLOW_LINK_TIMERS)
+        .start()
+        .await;
+    cluster
+        .wait_formed(cluster.deadline(10))
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+    let leader = cluster.leader().await;
+    let follower = cluster
+        .ids()
+        .into_iter()
+        .find(|&id| id != leader)
+        .expect("a 3-node cluster has a follower");
+
+    let follower_applied = cluster.node(follower).applied_index();
+    cluster.stop_node(follower).await;
+    for i in 0..40 {
+        cluster
+            .client(leader)
+            .put(put_req(&format!("/m5/rejoin/{i}"), "v"))
+            .await
+            .unwrap_or_else(|e| panic!("put {i}: {e}"));
+    }
+    cluster
+        .wait_for(
+            "the leader to purge past everything the stopped follower holds",
+            cluster.deadline(10),
+            || {
+                let m = cluster.rocks_store(leader).metrics();
+                (m.purges > 0 && m.purged_index > follower_applied).then_some(())
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+
+    cluster.net().delay(leader, follower, SLOW_LINK);
+    cluster.start_node(follower).await;
+    let target = cluster.node(leader).applied_index();
+    cluster
+        .wait_for(
+            "the restarted follower to install a snapshot and catch up",
+            cluster.deadline(6),
+            || (cluster.node(follower).applied_index() >= target).then_some(()),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+    assert!(
+        cluster.rocks_store(follower).metrics().snapshot_installs >= 1,
+        "the follower must have caught up through a snapshot; its log was purged on the leader"
+    );
+    cluster.heal();
 }

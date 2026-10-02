@@ -197,6 +197,19 @@ pub enum Command {
         /// AES-256 key, 32 raw bytes. Required when the backup is encrypted.
         #[arg(long, value_name = "FILE")]
         encryption_key: Option<PathBuf>,
+        /// The signed policy version the restored node will run under (M6-35, ADR-0027).
+        ///
+        /// A number rather than a policy file, because the manifest's reference is a breadcrumb
+        /// for a human and not a validation input: verifying a signed document here would buy
+        /// nothing the daemon does not already do at startup, and would pull policy
+        /// verification into a recovery path that deliberately depends on as little as
+        /// possible — restore reads no configuration file at all.
+        ///
+        /// Optional. Absent means no comparison is made and nothing is reported, which is what
+        /// a restore did before this flag existed. Silence here is the absence of a check, not
+        /// a statement that the versions agree.
+        #[arg(long, value_name = "N")]
+        active_policy_version: Option<u64>,
     },
 }
 

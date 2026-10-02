@@ -1,0 +1,1532 @@
+//! The trace seam: what the harness records, and the only thing the oracle is allowed to read.
+//!
+//! This vocabulary is not a log. It is the *declaration* interface between the kernel and an
+//! independent judge. Team verification specified every field (their
+//! `teams/verification/trace-requirements.md`, 2026-09-20) as "one a checker reads", and this
+//! module is that request folded into the contract, with three properties kept deliberately:
+//!
+//! 1. **No key or value bytes, ever** (team rules). A key is a [`KeyId`]; a value is a version
+//!    plus a [`Digest`]. Identity and ordering are what a checker needs; content is not.
+//! 2. **Closed sets.** Every outcome, reason, mode and state is a Rust enum. rEtcd's M6 rows
+//!    M6-118 and M6-122 exist because open reason strings make assertions impossible.
+//! 3. **One total order.** [`TraceEvent::event_id`] is strictly increasing, assigned by the
+//!    harness. The oracle is a single left-to-right fold; it never sorts and never searches.
+//!
+//! ## Why this is a second vocabulary
+//!
+//! [`crate::contracts::event::Event`] is what the kernel is *fed*. A trace event is what the
+//! system *declares it did*, and most of the interesting declarations — an authority decision at
+//! four gates, the acknowledgement evidence a publication rested on, a recovery's queried
+//! sources — are not scheduler events at all. Collapsing the two would force the oracle to
+//! re-derive decisions from inputs, which is the second implementation of the protocol that
+//! spike §6 forbids.
+//!
+//! ## Replay
+//!
+//! A seed is not enough (spike §4). Replay needs [`TraceHeader::schema_version`] **and**
+//! [`TraceHeader::generator_version`] to match, and then replays the explicit event stream.
+
+use serde::{Deserialize, Serialize};
+
+use crate::contracts::control::{ControlKey, ControlPrefix, WatchTermination};
+use crate::contracts::digest::Digest;
+use crate::contracts::errors::ErrorKind;
+use crate::contracts::event::{Budgets, ModuleName};
+use crate::contracts::ids::{
+    BootId, ClientId, ConfigVersion, CorrelationId, EventId, Generation, GrantId, NodeId,
+    OwnerEpoch, PartitionId, ReplicaRole, RequestId, Revision, ScenarioId, Seq, TenantId,
+};
+
+/// A key, as a stable small integer assigned by the scenario generator.
+///
+/// The reason there is no key type carrying bytes anywhere in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KeyId(
+    /// The generator-assigned index.
+    pub u32,
+);
+
+/// A key's version, as the oracle folds it into its published map. A delete is a tombstone
+/// version, not an absence.
+pub type Version = u64;
+
+/// A back-reference to another event in the same trace.
+///
+/// Used where a checker would otherwise have to search backwards — the authority recheck a
+/// publication rested on, or the barrier a read acquired.
+pub type EventRef = EventId;
+
+// ---------------------------------------------------------------------------------------------
+// Header
+// ---------------------------------------------------------------------------------------------
+
+/// One node's place in the topology, recorded once in the header.
+///
+/// Field order is the sort order of [`TraceHeader::topology`] — `(partition, node)` — so the
+/// derived [`Ord`] and the documented order are one thing (finding K-F-38).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TopologyEntry {
+    /// The partition this entry is about.
+    pub partition: PartitionId,
+    /// The node.
+    pub node: NodeId,
+    /// What it is allowed to do for the protection predicate.
+    pub role: ReplicaRole,
+    /// The membership configuration this placement belongs to.
+    pub config_version: ConfigVersion,
+}
+
+/// Where a scenario came from (finding K-F-09; team verification `trace-requirements.md` §1).
+///
+/// Never a bare seed. A reduced or authored scenario is not in the generator's image, so
+/// replaying its seed reproduces nothing; the checked-in event stream is the reproducer
+/// (ADR-rdb-0003 decision 6), and this says which of the three ways the stream was made.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum Provenance {
+    /// The generator produced it from a seed.
+    Generated {
+        /// The seed. For the report; never sufficient for replay on its own.
+        seed: u64,
+    },
+    /// The reducer shrank it from another scenario.
+    Reduced {
+        /// The scenario it was shrunk from.
+        parent: ScenarioId,
+    },
+    /// A person wrote it.
+    Authored {
+        /// The case name, as the author gave it. A test name, never key or value bytes.
+        case: String,
+    },
+}
+
+/// Which field of [`Budgets`] a name refers to. One member per field, in field order, so the
+/// manifest can say which budgets a run overrode without a string that can be misspelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BudgetName {
+    /// [`Budgets::warn_age_millis`].
+    WarnAge,
+    /// [`Budgets::pause_age_millis`].
+    PauseAge,
+    /// [`Budgets::resume_lag_millis`].
+    ResumeLag,
+    /// [`Budgets::resume_hold_millis`].
+    ResumeHold,
+    /// [`Budgets::grant_millis`].
+    Grant,
+    /// [`Budgets::renew_millis`].
+    Renew,
+    /// [`Budgets::resume_gap_tolerance_millis`].
+    ResumeGapTolerance,
+    /// [`Budgets::clock_sample_period_millis`].
+    ClockSamplePeriod,
+    /// [`Budgets::max_sample_age_millis`].
+    MaxSampleAge,
+    /// [`Budgets::clock_rate_ppm`] — **parts per million, not milliseconds.** The only member
+    /// here that is not a duration. [`Self::set`] takes a bare `u64` and names its parameter
+    /// `value` for that reason; a scenario overriding this one is setting a rate.
+    ClockRatePpm,
+    /// [`Budgets::clock_error_millis`].
+    ClockError,
+    /// [`Budgets::dispatch_margin_millis`].
+    DispatchMargin,
+    /// [`Budgets::dedup_retention_millis`].
+    DedupRetention,
+    /// [`Budgets::discovery_window_millis`].
+    DiscoveryWindow,
+}
+
+impl BudgetName {
+    /// Every budget, in [`Budgets`] field order. A resolver that walks this cannot skip one.
+    ///
+    /// **This array does not defend itself.** `get`/`set` match on `Self`, not on [`Budgets`], so
+    /// adding a field to `Budgets` and forgetting a member here compiles cleanly and silently
+    /// makes that field un-overridable by a scenario and absent from `RunManifest.overridden`.
+    /// It happened on 2026-09-22: lead ruling A-R36 added four clock thresholds to `Budgets`
+    /// precisely so they could not drift apart in private constants, and by leaving this array at
+    /// ten produced the same drift through this door instead. The length is asserted against
+    /// `Budgets`'s field count in `contracts.rs`; if you add a field, that assertion is the thing
+    /// that tells you.
+    pub const ALL: [Self; 14] = [
+        Self::WarnAge,
+        Self::PauseAge,
+        Self::ResumeLag,
+        Self::ResumeHold,
+        Self::Grant,
+        Self::Renew,
+        Self::ResumeGapTolerance,
+        Self::ClockSamplePeriod,
+        Self::MaxSampleAge,
+        Self::ClockRatePpm,
+        Self::ClockError,
+        Self::DispatchMargin,
+        Self::DedupRetention,
+        Self::DiscoveryWindow,
+    ];
+
+    /// The value this name selects in `budgets`.
+    #[must_use]
+    pub const fn get(self, budgets: &Budgets) -> u64 {
+        match self {
+            Self::WarnAge => budgets.warn_age_millis,
+            Self::PauseAge => budgets.pause_age_millis,
+            Self::ResumeLag => budgets.resume_lag_millis,
+            Self::ResumeHold => budgets.resume_hold_millis,
+            Self::Grant => budgets.grant_millis,
+            Self::Renew => budgets.renew_millis,
+            Self::ResumeGapTolerance => budgets.resume_gap_tolerance_millis,
+            Self::ClockSamplePeriod => budgets.clock_sample_period_millis,
+            Self::MaxSampleAge => budgets.max_sample_age_millis,
+            Self::ClockRatePpm => budgets.clock_rate_ppm,
+            Self::ClockError => budgets.clock_error_millis,
+            Self::DispatchMargin => budgets.dispatch_margin_millis,
+            Self::DedupRetention => budgets.dedup_retention_millis,
+            Self::DiscoveryWindow => budgets.discovery_window_millis,
+        }
+    }
+
+    /// Set the value this name selects in `budgets`.
+    pub const fn set(self, budgets: &mut Budgets, value: u64) {
+        match self {
+            Self::WarnAge => budgets.warn_age_millis = value,
+            Self::PauseAge => budgets.pause_age_millis = value,
+            Self::ResumeLag => budgets.resume_lag_millis = value,
+            Self::ResumeHold => budgets.resume_hold_millis = value,
+            Self::Grant => budgets.grant_millis = value,
+            Self::Renew => budgets.renew_millis = value,
+            Self::ResumeGapTolerance => budgets.resume_gap_tolerance_millis = value,
+            Self::ClockSamplePeriod => budgets.clock_sample_period_millis = value,
+            Self::MaxSampleAge => budgets.max_sample_age_millis = value,
+            Self::ClockRatePpm => budgets.clock_rate_ppm = value,
+            Self::ClockError => budgets.clock_error_millis = value,
+            Self::DispatchMargin => budgets.dispatch_margin_millis = value,
+            Self::DedupRetention => budgets.dedup_retention_millis = value,
+            Self::DiscoveryWindow => budgets.discovery_window_millis = value,
+        }
+    }
+}
+
+/// The resolved run: what a scenario actually ran under (finding K-F-27; spike §7 "the
+/// manifest records resolved budgets").
+///
+/// Plain data in the contract crate, because the header carries it and the header is here; no
+/// simulator type crosses the crate boundary. `overridden` is the field that matters: a
+/// campaign row that fails under an override must not be mistaken for one that fails under
+/// defaults — the `RETCD_TEST_DEADLINE_SCALE` lesson from the rEtcd gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunManifest {
+    /// The thresholds the run resolved to.
+    pub budgets: Budgets,
+    /// Which of them differ from [`Budgets::SPEC_DEFAULTS`], in [`BudgetName::ALL`] order.
+    pub overridden: Vec<BudgetName>,
+    /// How many nodes the topology has.
+    pub nodes: u8,
+    /// The event budget the run was bounded by.
+    pub event_cap: u32,
+}
+
+/// Everything a replay or a report needs before the first event.
+///
+/// `deny_unknown_fields` on purpose (team verification `trace-requirements.md` §1): a header
+/// field this build does not know is a header from another build, and reading it as if it were
+/// this one is how a fixture passes for the wrong reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceHeader {
+    /// [`crate::contracts::version::TRACE_SCHEMA_VERSION`] at record time. A bump invalidates
+    /// checked-in fixtures on purpose.
+    pub schema_version: u16,
+    /// The scenario generator's version. Two generators at one seed are two different runs.
+    pub generator_version: u16,
+    /// Where the scenario came from. Never a bare seed (finding K-F-09).
+    pub provenance: Provenance,
+    /// The resolved run: budgets, which were overridden, node count and event cap.
+    pub config: RunManifest,
+    /// How many partitions the topology has.
+    pub partitions: u8,
+    /// Node roles and configuration versions, in ascending `(partition, node)` order.
+    ///
+    /// The **initial snapshot only** (lead ruling V-R12, 2026-09-20). Every later membership
+    /// change — a partition degraded to two copies, a rebuilt third copy, a CAS of normal
+    /// membership — arrives as a [`TraceKind::TopologyChange`] event. The oracle resolves a
+    /// peer's role from the topology in force at the `config_version` an acknowledgement
+    /// carried, never from this field, because this field is only ever true at tick zero.
+    pub topology: Vec<TopologyEntry>,
+    /// Digest over the oracle checkpoints, for replay equality. Not read by any checker.
+    pub oracle_checkpoint_digest: Digest,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Closed sets
+// ---------------------------------------------------------------------------------------------
+
+/// Whether admission let a request through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AdmissionOutcome {
+    /// Admitted to the partition queue.
+    Admitted,
+    /// Rejected before any mutation.
+    Rejected,
+}
+
+/// Which of spec §5.2's four revalidation points an authority decision was made at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AuthorityGate {
+    /// Before the request enters the queue.
+    Admission,
+    /// Immediately before the storage batch is dispatched.
+    Dispatch,
+    /// Before the applied prefix is published.
+    Publication,
+    /// Before the client reply is sent.
+    Reply,
+}
+
+/// How an authority check came out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AuthorityOutcome {
+    /// The grant is valid for this node, boot and epoch.
+    Valid,
+    /// The grant's expiry has provably passed.
+    Expired,
+    /// The grant was frozen or revoked by the planner.
+    Fenced,
+    /// The clock bound spans the decision. Must fail closed (spec §7.2).
+    Uncertain,
+}
+
+/// How a storage batch ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ApplyOutcome {
+    /// The whole batch is applied.
+    Applied,
+    /// The batch failed. Nothing in it is visible.
+    Failed,
+    /// A crash was injected before the atomic commit point. None of the batch survives.
+    CrashedBeforeCommit,
+    /// A crash was injected after the atomic commit point. All of the batch survives.
+    CrashedAfterCommit,
+}
+
+/// How strongly a replica holds a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DurabilityClass {
+    /// The engine batch completed. Not on disk.
+    Buffered,
+    /// An fsync boundary confirmed it.
+    Durable,
+}
+
+/// Why a replica refused an append, or why the primary would not count an acknowledgement, as
+/// the oracle sees it.
+///
+/// Fourteen reasons: the seven this enum landed with, plus the seven of ask CB-3 (lead ruling
+/// B-R33 Q-B-8). Kernel-b's §3.4 ladder has eleven drop reasons and none of the seven it named
+/// was among the landed set, so before the widening a row could not tell "dropped because
+/// diverged" from "dropped because stale" — which is the entire content of its rows 1d and 9.
+///
+/// # On the "closed set" in verification §3.5
+///
+/// Verification's `trace-requirements.md` §3.5 writes this enum as a closed set of the landed
+/// seven and `M7V-56` asserts set equality against its coverage lists, so this widening turns
+/// that row red. That is the row working, not a conflict: `M7V-56` exists to fail on a variant
+/// nobody wrote a coverage cell for. The cost is seven coverage cells in verification's own
+/// file, which is verification's edit and is **not** made here. Until it is, `M7V-56` is red and
+/// should be read as "seven cells owed", not as a contract dispute.
+///
+/// # Two names that also exist on `AppendReject`
+///
+/// `StaleGeneration` and `NotAMember` are also
+/// [`crate::contracts::envelope::AppendReject`] variants. Same words, different enum, different
+/// meaning: there, why a replica refused an append; here, why an acknowledgement does not count.
+/// Kept deliberately rather than by accident — renaming either would make kernel-b's rows and
+/// the oracle's folds disagree about which ladder they are reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum AckRejectReason {
+    /// The predecessor is missing.
+    Gap,
+    /// Same sequence, different digest.
+    DigestMismatch,
+    /// The sender's epoch is not current.
+    StaleEpoch,
+    /// The sender's boot is not the live one.
+    StaleBoot,
+    /// The sender's membership configuration is not the pinned one.
+    StaleConfig,
+    /// The sender was not authenticated.
+    ForgedIdentity,
+    /// An unknown mandatory version, refused before the body was decoded.
+    IncompatibleVersion,
+    /// The acknowledgement names a lineage older than the one being replicated.
+    StaleGeneration,
+    /// The acknowledging replica's role cannot qualify this acknowledgement.
+    RoleMismatch,
+    /// The reported progress contradicts itself — a durable position ahead of a buffered one.
+    InconsistentProgress,
+    /// The reported progress went backwards from what this peer last reported.
+    RegressedProgress,
+    /// The acknowledgement carries no evidence that can be checked.
+    Unverifiable,
+    /// Evidence below the primary's anchor, for the record a catch-up cursor has in flight
+    /// (lead ruling B-R58c). No rung can check it yet, so it drives the cursor and moves no
+    /// watermark; the ACK at the anchor verifies the whole chain below it.
+    InFlightUnverified,
+    /// The acknowledging replica's history disagrees with the primary's at a retained position.
+    Diverged,
+    /// The acknowledging node is not a member of the pinned configuration.
+    NotAMember,
+}
+
+/// How a `sync_wal_through` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SyncOutcome {
+    /// Unambiguous success. Only this publishes the captured prefixes.
+    Synced,
+    /// Errored. No watermark moves.
+    Failed,
+    /// Completed partially. Also no watermark moves (spec §6.1).
+    Partial,
+}
+
+/// What a client was actually told.
+///
+/// Closed, and deliberately three-way rather than two. `RecoveredApplied` is a success the client
+/// is told about differently (spec §5.2): the transaction survived recovery rather than being
+/// published by its own primary. Folding it into [`Self::Success`] would make "a recovered
+/// transaction was reported as an ordinary publication" unobservable, and that is precisely the
+/// confusion the oracle exists to catch. The error arm carries [`ErrorKind`], which is itself the
+/// closed set of spec §5.4 errors — one enum, not a second copy that can drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ClientOutcome {
+    /// Published by the owning primary, with a generation and a sequence.
+    Success,
+    /// Applied through recovery, with a generation and a sequence. Distinct from
+    /// [`Self::Success`] on the wire and in the trace.
+    RecoveredApplied,
+    /// One of the spec §5.4 errors.
+    Error(ErrorKind),
+}
+
+/// What kind of reader acquired the publication barrier.
+///
+/// All four are listed in spec §5.3 and all four must go through the barrier; a maintenance
+/// export that read the raw prefix would be the bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ReadRequestKind {
+    /// An API read.
+    Read,
+    /// A status query.
+    Status,
+    /// A snapshot or export worker.
+    Export,
+    /// An actor-local reader.
+    ActorRead,
+}
+
+/// How a read was *served*.
+///
+/// Named apart from [`crate::contracts::control::ReadOutcome`] on purpose (lead ruling F-R4,
+/// 2026-09-20). That one is what the control store said about a record; this one is how the data
+/// plane served a reader. Module paths kept them apart, but a trace field and a control field in
+/// the same function would not have, and the oracle folds both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ReadServiceOutcome {
+    /// Served from the published prefix.
+    Served,
+    /// Waited at the barrier for the in-flight transaction, then served.
+    WaitedAtBarrier,
+    /// Refused.
+    Rejected(ErrorKind),
+}
+
+/// What happened to a dedup record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DedupAction {
+    /// Stored atomically with the transaction it describes.
+    Store,
+    /// A retry matched a retained identity and digest; no second effect.
+    Hit,
+    /// A retry matched an identity with a different digest: `REQUEST_ID_REUSE`.
+    ReuseReject,
+    /// The retention window passed. Absence is not proof of nonexecution.
+    Expire,
+}
+
+/// Where a lineage root came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum LineageSource {
+    /// The partition's first generation.
+    Initial,
+    /// A recovery decision created it.
+    Recovery,
+}
+
+/// What a recovery decided to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RecoveryMode {
+    /// Two survivors synchronised; both required for every subsequent ACK (spec §8.3).
+    TwoSurvivor,
+    /// One survivor; serve the declared prefix read-only until three copies return (spec §8.4).
+    LoneSurvivorReadOnly,
+    /// Divergence or corruption. Automatic promotion is blocked (spec §8.1).
+    Quarantine,
+}
+
+/// Why something was quarantined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum QuarantineReason {
+    /// Different digests at one lineage position.
+    DigestConflict,
+    /// A record failed its own digest check, or required history is missing.
+    CorruptHistory,
+    /// An unknown mandatory version on a stored record.
+    IncompatibleVersion,
+}
+
+/// The lag-protection state machine of spec §6.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ProtectionPhase {
+    /// Within budget.
+    Healthy,
+    /// Oldest unsafe age at or above the warning threshold.
+    Warn,
+    /// At or above the pause threshold, or no secondary can ACK. Admission stops.
+    Paused,
+    /// Copies are catching up; the exact barrier and the hysteresis are not yet met.
+    Resuming,
+}
+
+/// Which surface carried a version that was checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum VersionSurface {
+    /// A transport frame.
+    Message,
+    /// A stored or control record.
+    Record,
+}
+
+/// How a version check ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum VersionOutcome {
+    /// Understood; the body was decoded.
+    Accept,
+    /// Refused **before** the body was decoded (validation-plan V12).
+    RefuseBeforeApply,
+}
+
+/// The six scenario groups of spike §6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum FaultKind {
+    /// submit, read, status, retry.
+    Client,
+    /// deliver, drop, duplicate, reorder, partition, heal.
+    Network,
+    /// advance, fire, cancel, expire, pause, resume.
+    Time,
+    /// complete batch, fail batch, flush, crash, reopen.
+    Storage,
+    /// CAS, emit watch, gap, compact, reload.
+    Control,
+    /// inspect survivors, select prefix, synchronize, rebuild.
+    Recovery,
+}
+
+/// The "required boundary cases" column of spike §6, as a closed set.
+///
+/// Closed so the coverage matrix is *countable*: "every required cell at least once" is not a
+/// rule that can be written against a free-text boundary name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BoundaryId {
+    /// Client: a retry with the same identity and a different payload digest.
+    ChangedDigest,
+    /// Client: a retry carrying a stale expected generation.
+    OldGeneration,
+    /// Client: the success reply is lost after publication.
+    LostSuccessReply,
+    /// Client: a retry inside the retention window.
+    RetainedDedupHit,
+    /// Client: a retry after retention expired.
+    ExpiredDedup,
+    /// Network: a frame from a boot that is no longer live.
+    StaleBoot,
+    /// Network: a frame from an epoch that is no longer current.
+    StaleEpoch,
+    /// Network: a frame pinned to an old membership configuration.
+    StaleConfig,
+    /// Network: an append whose predecessor the replica does not hold.
+    MissingPredecessor,
+    /// Network: an acknowledgement arriving after the grant was revoked.
+    AckAfterRevocation,
+    /// Network: a frame delivered under an identity its sender did not earn — another node's
+    /// name, or a claimed role above its own. Rejection is the only correct outcome, and it must
+    /// come from the kernel's own authentication and membership check, never from a test-only
+    /// branch.
+    ForgedIdentity,
+    /// Time: two events on one tick, in both orders.
+    SameTickOrder,
+    /// Time: grant skew inside the +/-100 ms assumption.
+    GrantSkewWithinBound,
+    /// Time: grant skew outside it, which must fail closed.
+    GrantSkewOutsideBound,
+    /// Time: a jump across the 24 h dedup window.
+    DedupWindowJump,
+    /// Storage: a crash immediately before the atomic commit point.
+    BeforeAtomicCommit,
+    /// Storage: a crash immediately after it.
+    AfterAtomicCommit,
+    /// Storage: a crash before the flush boundary.
+    BeforeFlush,
+    /// Storage: a crash after it.
+    AfterFlush,
+    /// Storage: an attempt to advance a durable watermark without a successful flush.
+    FalseDurableWatermark,
+    /// Control: a read served from a stale snapshot.
+    StaleSnapshot,
+    /// Control: the control quorum is lost.
+    LostControlQuorum,
+    /// Control: a grant record that does not validate.
+    InvalidGrant,
+    /// Control: staged metadata that was never activated by the pointer CAS.
+    PartialStagedMetadata,
+    /// Control: a watch gap forcing a coherent reload.
+    WatchGap,
+    /// Recovery: survivors ending at different sequences.
+    UnequalSecondaryPrefix,
+    /// Recovery: each of the lone-survivor choices.
+    LoneSurvivorChoice,
+    /// Recovery: different digests at one position.
+    Divergence,
+    /// Recovery: an old owner returning with a longer suffix.
+    ReturningStaleOwner,
+}
+
+/// Whether the schedule is still adversarial or has healed.
+///
+/// The only thing that arms the liveness checker. Spike §6 forbids calling an unhealed partition
+/// a liveness failure, so the oracle must be *told*, never left to infer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SchedulePhase {
+    /// Faults are still being injected. Safety only.
+    Chaotic,
+    /// Delivery is fair and authority is valid. Liveness may be checked from here.
+    Healed,
+}
+
+/// A spike work package, as spike §5 names them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PackageId {
+    /// Contracts and crate boundary.
+    C0,
+    /// Deterministic environment.
+    H1,
+    /// Memory storage and crash images.
+    M1,
+    /// Dispatch, replay and CI.
+    I1,
+    /// Authority and fencing.
+    A1,
+    /// Transactional KV and dedup.
+    T1,
+    /// Replication and progress.
+    R1,
+    /// Publication and outcomes.
+    P1,
+    /// Lag protection.
+    L1,
+    /// Recovery and rebuild.
+    F1,
+}
+
+/// Whether a package is wired in this build.
+///
+/// Emitted once per package at trace start. Without it a campaign cannot tell "no violation"
+/// from "nothing ran", which is the most dangerous false green available in this milestone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum CapabilityState {
+    /// Its handler is registered and executes.
+    Wired,
+    /// Its handler returns [`crate::contracts::errors::RdbError::Unavailable`].
+    Unavailable,
+}
+
+/// One source a recovery queried, and what it said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct QueriedSource {
+    /// The node asked.
+    pub node: NodeId,
+    /// Its process lifetime.
+    pub boot: BootId,
+    /// Its role. A shadow may be a validated recovery source but never a primary.
+    pub role: ReplicaRole,
+    /// Whether it answered within the discovery window. Recording an unreachable source
+    /// *before* choosing a shorter prefix is what separates permitted loss from a bug.
+    pub reachable: bool,
+    /// The generation it reported, when it answered.
+    pub reported_generation: Option<Generation>,
+    /// The highest contiguous sequence it reported.
+    pub reported_seq: Option<Seq>,
+    /// The digest at that sequence.
+    pub reported_digest: Option<Digest>,
+}
+
+/// One acknowledgement a publication rested on.
+///
+/// Team verification's §3.7 four-tuple (finding K-F-22): two acknowledgements from one node
+/// across a restart are two boots, and the checker counts one copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AckEvidence {
+    /// Who acknowledged.
+    pub node: NodeId,
+    /// Its process lifetime when it did.
+    pub boot: BootId,
+    /// In what role. A shadow entry here must never qualify the publication.
+    pub role: ReplicaRole,
+    /// How strongly.
+    pub durability: DurabilityClass,
+}
+
+/// The acknowledgement rule in force when a write was acknowledged (finding K-F-07; team
+/// verification §3.14).
+///
+/// Not carried on [`TraceKind::ProtectionState`]: lead ruling V-R20 (2026-09-20) has the
+/// oracle derive it from `required_copy_set` and the membership in force, so the kernel cannot
+/// declare a rule its acknowledgements did not follow. The enum is the oracle's vocabulary for
+/// that derivation and for the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum QuorumRule {
+    /// Three copies: durable on the primary and acknowledged by two secondaries (spec §5.2).
+    Rf3,
+    /// Two survivors: both required for every acknowledgement (spec §8.3).
+    DegradedRf2,
+}
+
+/// Why a scenario operation was not applied (finding K-F-08; team verification §3.16a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SkipReason {
+    /// The thing the operation referred to no longer exists — a reducer removed the request it
+    /// was a retry of, or the node it targeted.
+    ReferentGone,
+    /// The run's bound was reached before the operation's turn.
+    OutOfBudget,
+}
+
+/// Which control-store operation a [`TraceKind::ControlInteraction`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlOpKind {
+    /// [`crate::contracts::control::ControlEffect::Cas`].
+    Cas,
+    /// [`crate::contracts::control::ControlEffect::Get`].
+    Get,
+    /// [`crate::contracts::control::ControlEffect::Watch`], or an event on the stream it opened.
+    Watch,
+    /// [`crate::contracts::control::ControlEffect::Reload`].
+    Reload,
+}
+
+/// How a control-store operation came out, as the environment declares it.
+///
+/// One closed set over the three control outcome types, so the oracle folds one field. A
+/// termination carries its [`WatchTermination`] and, spelled out, whether it was a gap — the
+/// oracle must not have to know which terminations gap (ADR-rdb-0008 §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ControlOutcomeKind {
+    /// A CAS committed.
+    Committed,
+    /// A CAS lost.
+    Conflict,
+    /// A CAS may or may not have landed.
+    Unknown,
+    /// The store could not be reached.
+    Unavailable,
+    /// A read found the record.
+    Found,
+    /// A read found no record.
+    Absent,
+    /// A watch progress tick, or a contiguous run of changes.
+    Progress,
+    /// A watch ended.
+    Terminated {
+        /// Why.
+        termination: WatchTermination,
+        /// [`WatchTermination::is_gap`] of it, so the oracle reads a field rather than a rule.
+        gap: bool,
+    },
+}
+
+// ---------------------------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------------------------
+
+/// One recorded declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEvent {
+    /// Strictly increasing within the trace. The oracle folds in this order.
+    pub event_id: EventId,
+    /// Simulated time. Never a wall clock.
+    pub logical_tick: u64,
+    /// The partition.
+    pub partition: PartitionId,
+    /// The node it happened on.
+    pub node: NodeId,
+    /// That node's process lifetime.
+    pub boot: BootId,
+    /// Ties a request to its applies, acknowledgements, publication and outcome. Load-bearing
+    /// for the atomicity, dedup and version invariants.
+    pub correlation: CorrelationId,
+    /// What was declared.
+    pub kind: TraceKind,
+}
+
+/// Everything the harness can declare. Ordered roughly along the write path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TraceKind {
+    /// A client sent a transaction.
+    ClientSubmit {
+        /// The request id.
+        request: RequestId,
+        /// The tenant.
+        tenant: TenantId,
+        /// The client.
+        client: ClientId,
+        /// The affinity group. Recorded as the generator's group index.
+        affinity: u64,
+        /// The generation the caller expected, if any.
+        expected_generation: Option<Generation>,
+        /// Digest of the request payload.
+        request_digest: Digest,
+        /// Remaining deadline in milliseconds at send time.
+        deadline_remaining_ms: u64,
+        /// Keys the mutations touch.
+        mutation_keys: Vec<KeyId>,
+        /// Keys the conditions read.
+        condition_keys: Vec<KeyId>,
+    },
+
+    /// Admission control decided.
+    AdmissionDecision {
+        /// Admitted or rejected.
+        outcome: AdmissionOutcome,
+        /// Why, when rejected. `None` when admitted.
+        reason: Option<ErrorKind>,
+        /// The sequence it was admitted at.
+        admitted_seq: Option<Seq>,
+        /// Whether the partition was paused at this moment.
+        paused: bool,
+        /// Age of the oldest transaction not durably on the required copies.
+        oldest_unsafe_age_ms: u64,
+        /// The required-copy set, as pinned by `config_version`.
+        required_copies: Vec<NodeId>,
+        /// The configuration that set pins to.
+        config_version: ConfigVersion,
+    },
+
+    /// An authority check at one of the four gates.
+    AuthorityDecision {
+        /// Which gate.
+        gate: AuthorityGate,
+        /// The node claiming ownership.
+        owner_node: NodeId,
+        /// Its epoch.
+        owner_epoch: OwnerEpoch,
+        /// The grant it holds.
+        grant: GrantId,
+        /// The boot the grant was issued to.
+        grant_boot: BootId,
+        /// The lineage.
+        generation: Generation,
+        /// Earliest tick the grant is valid from.
+        valid_from_tick: u64,
+        /// The grant's expiry tick.
+        expiry_tick: u64,
+        /// When the decision was taken.
+        decision_tick: u64,
+        /// The decision's position in A1's per-node monotonic sequence (lead ruling A-R23;
+        /// team kernel-a `design.md` §1.2). Strictly increasing per node, so the oracle can
+        /// tell a stale decision from a later one without comparing ticks.
+        authority_seq: u64,
+        /// How it came out.
+        outcome: AuthorityOutcome,
+    },
+
+    /// A storage batch reached a boundary.
+    BatchApply {
+        /// The role of the node applying it.
+        role: ReplicaRole,
+        /// The lineage.
+        generation: Generation,
+        /// This transaction's position.
+        seq: Seq,
+        /// The position it descends from.
+        predecessor_seq: Seq,
+        /// The digest it descends from.
+        predecessor_digest: Digest,
+        /// This record's digest.
+        entry_digest: Digest,
+        /// The batch identity.
+        batch: u64,
+        /// The after-image identity for every key the batch touched, deletes included as a
+        /// tombstone version.
+        key_versions: Vec<(KeyId, Version)>,
+        /// How it ended.
+        outcome: ApplyOutcome,
+    },
+
+    /// An append was sent to a peer.
+    ReplicationSend {
+        /// Sender.
+        from_node: NodeId,
+        /// Intended recipient.
+        to_node: NodeId,
+        /// The recipient's role.
+        peer_role: ReplicaRole,
+        /// The lineage.
+        generation: Generation,
+        /// The sender's epoch.
+        owner_epoch: OwnerEpoch,
+        /// The configuration the sender was pinned to.
+        config_version: ConfigVersion,
+        /// The position sent.
+        seq: Seq,
+        /// Its digest.
+        digest: Digest,
+    },
+
+    /// A peer answered an append.
+    ///
+    /// Emitted **at the secondary, where the acknowledgement is generated**, and the envelope's
+    /// `node` is therefore the acknowledging node. What the primary later counts is a separate
+    /// [`Self::ReplicationAckDelivered`]. Two records rather than one because they are two
+    /// different claims: what a copy holds, and what the primary believed when it counted. An ack
+    /// that is generated and then dropped, delayed past a decision, or delivered to a primary that
+    /// has moved on is only visible as the gap between them.
+    ReplicationAck {
+        /// The acknowledging node.
+        from_node: NodeId,
+        /// The node that had sent the append.
+        to_node: NodeId,
+        /// The acknowledging node's role. Without this, "count a shadow ACK" is uncatchable.
+        peer_role: ReplicaRole,
+        /// Its process lifetime.
+        peer_boot: BootId,
+        /// The configuration it was pinned to.
+        config_version: ConfigVersion,
+        /// The lineage.
+        generation: Generation,
+        /// The epoch it believed current.
+        owner_epoch: OwnerEpoch,
+        /// The highest contiguous sequence it holds.
+        contiguous_seq: Seq,
+        /// The digest at that sequence.
+        contiguous_digest: Digest,
+        /// How strongly it holds it.
+        durability_class: DurabilityClass,
+        /// Whether the append was accepted.
+        accepted: bool,
+        /// Why not, when refused.
+        reject_reason: Option<AckRejectReason>,
+    },
+
+    /// The primary received an acknowledgement and was willing to count it.
+    ///
+    /// Emitted **at the primary**, and the envelope's `node` is therefore the primary. Carries a
+    /// back-reference to the [`Self::ReplicationAck`] it corresponds to, so the checker can pair
+    /// them without re-deriving a matching rule. A durability advance that rests on an ack with no
+    /// delivery record, or with one at a stale `config_version`, is the bug this pairing finds.
+    ReplicationAckDelivered {
+        /// Which acknowledgement, by its `event_id`.
+        ack: EventRef,
+        /// The node that produced it.
+        from_node: NodeId,
+        /// Its role **as the receiving primary resolved it**, from its own pinned configuration.
+        /// Not copied from the sender: a shadow that claims to be a regular copy is caught here,
+        /// as a disagreement between this field and the ack's own `peer_role`.
+        peer_role: ReplicaRole,
+        /// The configuration the receiver was pinned to when it counted the ack.
+        config_version: ConfigVersion,
+        /// Whether it was counted towards durability at all. `false` with a reason on the ack is
+        /// a normal rejection; `false` with an accepted ack means the receiver discarded it.
+        counted: bool,
+    },
+
+    /// An fsync boundary completed.
+    DurabilityAdvance {
+        /// The lineage.
+        generation: Generation,
+        /// The new durable position, when it advanced.
+        durable_seq: Seq,
+        /// The digest at that position.
+        durable_digest: Digest,
+        /// The flush identity.
+        flush_ticket: u64,
+        /// The prefixes captured under the write-order mutex.
+        captured: Vec<(PartitionId, Seq)>,
+        /// How it ended. Only [`SyncOutcome::Synced`] may advance anything.
+        outcome: SyncOutcome,
+    },
+
+    /// A prefix became client-visible.
+    Publish {
+        /// The lineage.
+        generation: Generation,
+        /// The position published.
+        seq: Seq,
+        /// Digest of the record at that position.
+        published_digest: Digest,
+        /// The acknowledgements this publication rested on.
+        ack_evidence: Vec<AckEvidence>,
+        /// The `AuthorityDecision` at the publication gate that authorised it. An explicit
+        /// back-reference, so the checker stays a forward fold.
+        authority_recheck: EventRef,
+    },
+
+    /// A client was told something.
+    ClientOutcomeReported {
+        /// Which request.
+        request: RequestId,
+        /// What it was told.
+        outcome: ClientOutcome,
+        /// The lineage reported.
+        generation: Generation,
+        /// The position, on success.
+        seq: Option<Seq>,
+        /// Digest of the returned result.
+        result_digest: Digest,
+        /// Whether the reply actually reached the client. `false` models a lost reply, which
+        /// must never retract a publication (spec §5.3).
+        delivered: bool,
+    },
+
+    /// A reader observed state through the publication barrier.
+    Read {
+        /// What kind of reader.
+        request_kind: ReadRequestKind,
+        /// The barrier it acquired.
+        barrier: EventRef,
+        /// The lineage it read in.
+        generation: Generation,
+        /// The published position it saw.
+        observed_seq: Seq,
+        /// What it saw.
+        observed_key_versions: Vec<(KeyId, Version)>,
+        /// Whether the partition is in read-only recovery.
+        recovery_mode: bool,
+        /// How it was served.
+        outcome: ReadServiceOutcome,
+    },
+
+    /// A dedup record moved.
+    DedupRecord {
+        /// The tenant.
+        tenant: TenantId,
+        /// The client.
+        client: ClientId,
+        /// The request.
+        request: RequestId,
+        /// Digest of the payload that was retained.
+        request_digest: Digest,
+        /// Digest of the result that was retained.
+        result_digest: Digest,
+        /// The lineage it belongs to.
+        generation: Generation,
+        /// When retention ends.
+        retained_until_tick: u64,
+        /// What happened.
+        action: DedupAction,
+    },
+
+    /// A lineage root was established.
+    LineageRoot {
+        /// The lineage it starts.
+        generation: Generation,
+        /// The epoch that established it.
+        owner_epoch: OwnerEpoch,
+        /// Its base position.
+        base_seq: Seq,
+        /// The digest at that position.
+        base_digest: Digest,
+        /// The lineage it descends from, when it is not the first.
+        predecessor_generation: Option<Generation>,
+        /// The predecessor position it cuts off at. The single field that keeps restricted loss
+        /// checkable instead of collapsing into an impossible global no-loss oracle.
+        predecessor_cutoff: Option<Seq>,
+        /// Where it came from.
+        source: LineageSource,
+    },
+
+    /// A recovery chose.
+    ///
+    /// `selected_cutoff_seq`, `selected_digest` and `new_generation` are `None` exactly when
+    /// `mode` is [`RecoveryMode::Quarantine`], and `Some` for every other mode. A quarantine
+    /// selects no position and creates no lineage (spec §8.1: divergence blocks promotion), so
+    /// any value there would be one the recovery never chose. A reader treats `None` as "no
+    /// cutoff selected", never as position 0 (Gautam, 2026-09-27, ledger L-R177gd).
+    RecoveryDecision {
+        /// The epoch that was fenced first.
+        fenced_epoch: OwnerEpoch,
+        /// How long the discovery window ran, in ticks.
+        discovery_window_ticks: u64,
+        /// Every source asked, and whether it answered.
+        queried_sources: Vec<QueriedSource>,
+        /// The source whose prefix was selected.
+        selected_source: Option<NodeId>,
+        /// The position selected. `None` on a quarantine, which selects none; `Some` otherwise.
+        selected_cutoff_seq: Option<Seq>,
+        /// The digest at that position. `None` on a quarantine; `Some` otherwise.
+        selected_digest: Option<Digest>,
+        /// What was decided.
+        mode: RecoveryMode,
+        /// Whether a suffix may have been lost without proof either way.
+        loss_uncertainty: bool,
+        /// The lineage created. `None` on a quarantine, which creates none; `Some` otherwise.
+        new_generation: Option<Generation>,
+    },
+
+    /// Something was quarantined.
+    Quarantine {
+        /// Why.
+        reason: QuarantineReason,
+        /// The lineage.
+        generation: Generation,
+        /// Where.
+        seq: Seq,
+        /// The nodes involved.
+        sources: Vec<NodeId>,
+    },
+
+    /// The lag-protection state machine moved, or restated itself.
+    ///
+    /// Emitted on every [`ProtectionPhase`] transition **and on every `config_version` change,
+    /// whether or not the phase moved**. Spec §6.2's trap is a membership edit that renames the
+    /// required-copy set and thereby resets the unsafe age without anything catching up. If this
+    /// event only fired on phase transitions, that edit would leave no record and the oracle would
+    /// see a legitimately healthy run.
+    ProtectionState {
+        /// The phase.
+        phase: ProtectionPhase,
+        /// Age of the oldest transaction not durably on the required copies.
+        oldest_unsafe_age_ms: u64,
+        /// The required-copy set.
+        required_copy_set: Vec<NodeId>,
+        /// The configuration that set is pinned to. On the same event so that "unsafe age reset
+        /// via membership renaming" is catchable (spec §6.2).
+        config_version: ConfigVersion,
+        /// The prefix admission paused after.
+        paused_prefix_seq: Seq,
+        /// The exact durable barrier required to resume.
+        resume_barrier_seq: Seq,
+        /// When lag first became healthy, for the hysteresis.
+        healthy_since_tick: Option<u64>,
+    },
+
+    /// A mandatory version was checked.
+    VersionCheck {
+        /// Which surface carried it.
+        surface: VersionSurface,
+        /// The protocol version declared.
+        declared_protocol_version: u16,
+        /// The membership configuration declared.
+        declared_config_version: ConfigVersion,
+        /// The schema version declared.
+        declared_schema_version: u16,
+        /// The highest this build understands.
+        known_max: u16,
+        /// Mandatory fields the decoder did not recognise, by field number.
+        mandatory_unknown_fields: Vec<u16>,
+        /// How it ended.
+        outcome: VersionOutcome,
+    },
+
+    /// The scenario injected a fault.
+    FaultInjected {
+        /// Which scenario group.
+        fault_kind: FaultKind,
+        /// The node it was aimed at.
+        target: NodeId,
+        /// The required boundary case it exercises.
+        boundary: BoundaryId,
+        /// Its index in the scenario's operation list, for shrinking.
+        scenario_op_index: u32,
+    },
+
+    /// Membership changed.
+    ///
+    /// **Environment-owned.** Emitted by the H1 control provider when it activates a new
+    /// membership, never by a kernel module (lead ruling V-R12, 2026-09-20). A kernel module
+    /// emitting this would mean the oracle resolves roles from what the kernel believed, which
+    /// is exactly the belief under test — a shadow counted as a regular copy would then be
+    /// self-consistent and invisible.
+    ///
+    /// Together with the header's initial snapshot, these events are the complete topology
+    /// history, and every `config_version` an acknowledgement can carry has one.
+    TopologyChange {
+        /// The membership version being activated. Strictly increasing per partition.
+        config_version: ConfigVersion,
+        /// The new placement, in ascending [`NodeId`] order.
+        nodes: Vec<(NodeId, ReplicaRole)>,
+    },
+
+    /// The schedule changed character.
+    SchedulePhaseChanged {
+        /// The new phase.
+        phase: SchedulePhase,
+        /// Whether delivery is now fair.
+        fair_delivery: bool,
+        /// How many events the liveness check may still consume.
+        remaining_event_budget: u32,
+    },
+
+    /// A package reported whether it is wired. Emitted once per package at trace start.
+    Capability {
+        /// Which package.
+        package: PackageId,
+        /// Wired or unavailable.
+        state: CapabilityState,
+    },
+
+    /// A scenario operation was not applied (finding K-F-08; team verification §3.16a).
+    ///
+    /// Its own kind on purpose: a reducer artifact is not a [`BoundaryId`], or the coverage
+    /// matrix gains a cell nobody can interpret. Not read by a checker; read by the reducer.
+    /// Without it a deduplicated retry that produces nothing is indistinguishable from a
+    /// request never submitted.
+    OpSkipped {
+        /// Its index in the scenario's operation list, the same index
+        /// [`Self::FaultInjected`] carries.
+        scenario_op_index: u32,
+        /// Why.
+        reason: SkipReason,
+    },
+
+    /// A control-store interaction completed, and how (finding K-F-06).
+    ///
+    /// **Environment-owned**, like [`Self::TopologyChange`]: emitted by the H1 control
+    /// provider as it completes the effect, so the kernel cannot lie about what the store said.
+    /// A watch termination arrives here with its `gap`, which is what
+    /// [`Self::FamilyReload`] refers back to.
+    ControlInteraction {
+        /// Which operation.
+        op: ControlOpKind,
+        /// The record, for a CAS or a read.
+        key: Option<ControlKey>,
+        /// The family, for a watch or a reload.
+        prefix: Option<ControlPrefix>,
+        /// How it came out.
+        outcome: ControlOutcomeKind,
+    },
+
+    /// A coherent reload of one family (finding K-F-06).
+    ///
+    /// Emitted by the kernel module that asked for it, because the *decision* to reload is the
+    /// thing under test. `after_termination` is the explicit back-reference to the
+    /// [`Self::ControlInteraction`] whose termination justified it, and `None` is the bug:
+    /// ADR-rdb-0008 §7 item 4 as amended by lead ruling A-R15 — no reload unless a termination
+    /// was delivered first — is two events the oracle relates by a back-reference, not a search.
+    FamilyReload {
+        /// The family reloaded.
+        prefix: ControlPrefix,
+        /// The revision the snapshot was coherent at, and the resumed watch starts after.
+        snapshot_revision: Revision,
+        /// The termination that justified it, by its `event_id`.
+        after_termination: Option<EventRef>,
+    },
+
+    /// One `(event, module)` offer the run loop made, and how the module answered
+    /// (package I1, 2026-09-22).
+    ///
+    /// **Appended at the end of this enum on purpose.** Inserting a variant in the middle moves
+    /// every `trace.rs:NNN` citation below it silently, and nothing in this repository reports
+    /// that; on 2026-09-22 widening `AckRejectReason` pushed three cited spans down 37 lines and
+    /// every check still passed.
+    ///
+    /// **Why it exists.** Until it did, every variant above was a decision or an observation, and
+    /// the run loop's own work — which module was offered which event, and what came back — was
+    /// nowhere in the value. The measured consequence was that
+    /// `rdb_sim::harness::replay::compare_traces` answered `Identical` for a run that consumed
+    /// three events and one that consumed none, for a deadline-severed run and a completed one,
+    /// and for a run under an injected control fault and one without. A typical run recorded nine
+    /// constant [`Self::Capability`] lines and nothing else, so the comparison every determinism
+    /// claim in M7 rests on could not see the run at all. One record per offer makes the trace a
+    /// function of what the loop did.
+    ///
+    /// **This is the dispatch, never the input** (lead ruling L-R103, 2026-09-22). A trace records
+    /// what a run *did*; the reproducer is `rdb_sim::harness::run::RunPlan`, and the seed, the
+    /// control operations and the limits stay in it. `event` names an event of the *input* stream
+    /// only so that six offers can be attributed to the one pop that caused them.
+    ///
+    /// **A decline is an event, not a silence** (ruling B-R28, nothing is dropped silently). A
+    /// module with no body for an event answers [`DispatchOutcome::Declined`] and the run
+    /// continues; before this variant that continuation left no record, so a loop that swallowed
+    /// refusals and a loop that reported them produced the same trace.
+    ModuleDispatch {
+        /// The scheduler event that was offered.
+        ///
+        /// **Not an [`EventRef`]**, despite the type: this is the id the scheduler allocated in
+        /// the run's own event space, and no [`TraceEvent::event_id`] in this trace carries it.
+        /// A checker must not follow it as a back-reference.
+        event: EventId,
+        /// Which module it was offered to. The six offers for one `event` appear in
+        /// `ModuleName::ALL` order, which is the loop's fixed routing order.
+        module: ModuleName,
+        /// What came back.
+        outcome: DispatchOutcome,
+    },
+
+    /// A kernel module said something whose only consumer is the reader of this trace
+    /// (lead ruling A-R46, 2026-09-22).
+    ///
+    /// **Appended at the end of this enum**, for the reason [`Self::ModuleDispatch`] gives.
+    ///
+    /// Two `KernelEffect` arms have no module consumer by design. `Ignored` exists because "an
+    /// empty effect vector is indistinguishable from an unhandled event" (rulings A-R24, B-R33),
+    /// and `Alert` is for an operator. The dispatcher neither routes nor refuses them; it records
+    /// them here. Refusing them made "the module handled this and did nothing" unreachable through
+    /// the run loop, which defeated the reason `Ignored` exists. The other four `KernelEffect`
+    /// arms are the emitted half of a `KernelEvent` (ruling R-S6), they have a module consumer,
+    /// and they never appear here — with one exception inside `Authority(..)`: its `Fact` arm is
+    /// "for the trace and the oracle" (A-R25b), so it is recorded too (lead ruling A-R49).
+    KernelNoted {
+        /// The scheduler event whose offer produced the effect.
+        ///
+        /// **Not an [`EventRef`]**, for the reason [`Self::ModuleDispatch`]'s `event` gives: an
+        /// id in the run's own event space, never a back-reference into this trace.
+        event: EventId,
+        /// The module that emitted it.
+        module: ModuleName,
+        /// What it said.
+        note: KernelNote,
+    },
+}
+
+/// A whole recorded run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trace {
+    /// What the run was.
+    pub header: TraceHeader,
+    /// What it declared, in `event_id` order.
+    pub events: Vec<TraceEvent>,
+}
+
+// ---------------------------------------------------------------------------------------------
+// Appended 2026-09-22 (package I1). New material goes below this line, never above it: an
+// insertion anywhere earlier in this file moves every `trace.rs:NNN` citation under it without
+// any tool in this repository noticing.
+// ---------------------------------------------------------------------------------------------
+
+/// How a kernel module answered one offer from the run loop
+/// ([`TraceKind::ModuleDispatch`]).
+///
+/// Three arms because the loop treats three cases differently and a checker has to be able to
+/// tell them apart: an answer continues the run and its effects are delivered, a decline
+/// continues the run and is not a failure, and any other protocol error stops it. Collapsing the
+/// last two into one "did not answer" would put ruling B-R28 — nothing is dropped silently —
+/// behind a shape that cannot express the difference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DispatchOutcome {
+    /// The module returned `Ok`.
+    ///
+    /// `effects` may be zero, and the distinction matters: a module that answers `Ok(vec![])`
+    /// has *taken* the event and decided to do nothing, which is not what
+    /// [`Self::Declined`] means.
+    Answered {
+        /// How many effects came back, saturating at [`u32::MAX`].
+        effects: u32,
+    },
+    /// The module answered [`crate::contracts::errors::RdbError::Unavailable`]: this build has
+    /// no body for that event at that module. Counted, never fatal.
+    Declined,
+    /// The module answered some other protocol error. The loop stops on it.
+    Errored {
+        /// Which error, as the stable [`ErrorKind`] — never a message, which could carry a key.
+        kind: ErrorKind,
+    },
+    /// The module declined an event it is a named consumer of, on an edge the harness lists as
+    /// owed because that module's package is not wired yet (lead ruling A-R62).
+    ///
+    /// Not [`Self::Declined`], which means "this event is not mine". A reducer must never read an
+    /// owed edge as the kernel having taken the event, nor as the event correctly not being its
+    /// business. The run continues past it, and the edge retires when the package is wired.
+    DeclinedOwed,
+}
+
+// Appended 2026-09-22 (lead ruling A-R46).
+
+/// What a kernel module said, in a [`TraceKind::KernelNoted`] record.
+///
+/// The kernel effects with no module consumer, carried as they left the kernel: `Ignored`,
+/// `Alert`, A1's `Fact` ([`Self::AuthorityFact`], lead ruling A-R49) and L1's `ProtectionWarn`
+/// ([`Self::ProtectionWarn`]); plus L1's `SetAdmission` ([`Self::SetAdmission`]), whose consumer
+/// T1 is not yet wired (lead ruling B-R42). The
+/// reasons keep their own types: `Ignored`'s is the kernels' own vocabulary and `Alert`'s is the
+/// client-facing [`ErrorKind`], and folding one into the other would lose the distinction the
+/// `KernelEffect` docs draw between them.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum KernelNote {
+    /// The module handled the event and deliberately did nothing.
+    Ignored {
+        /// Why, in the vocabulary of the kernel that said it.
+        reason: crate::contracts::ignore::KernelIgnoredReason,
+    },
+    /// An operator-visible condition.
+    Alert {
+        /// What the condition is.
+        reason: ErrorKind,
+    },
+    /// Something A1 did: the payload of `KernelEffect::Authority(AuthorityEffect::Fact(..))`.
+    ///
+    /// Appended 2026-09-22 (lead ruling A-R49). That arm's own doc says it exists "for the trace
+    /// and the oracle" (A-R25b), so like `Ignored` it has no module consumer by design. Every
+    /// other `AuthorityEffect` arm has one (T1, P1, R1, F1) and is refused, never recorded here.
+    AuthorityFact {
+        /// What A1 did, as it left the kernel.
+        fact: crate::contracts::authority::AuthorityFact,
+    },
+    /// L1's `SetAdmission`: the payload of `KernelEffect::SetAdmission(..)`, as it left the
+    /// kernel.
+    ///
+    /// Appended 2026-09-22 (lead ruling B-R42). Unlike the arms above, this one **has** a module
+    /// consumer — T1's admission gate, through `KernelEvent::SetAdmission` — and T1 is not wired.
+    /// Until it is, the trace is where the edge is kept. Recorded, not refused: L1 emits one on
+    /// becoming live, so a refusal would stop every L1 run at its first step. Whether the note
+    /// stays once T1 receives the event is decided by the ruling that wires T1.
+    SetAdmission {
+        /// What L1 published.
+        state: crate::contracts::protection::AdmissionState,
+    },
+    /// L1's `ProtectionWarn`: the oldest unsafe record crossed the warn age (spec §6.2).
+    ///
+    /// Appended 2026-09-22 (lead ruling B-R42). Operator-facing, and no kernel receives it (the
+    /// `KernelEffect` doc says so), so like `Alert` it has no module consumer by design.
+    ProtectionWarn {
+        /// The oldest record not yet durable on every required copy.
+        oldest_unsafe_seq: crate::contracts::ids::Seq,
+        /// Its age in milliseconds at the evaluation that crossed the threshold.
+        age_ms: u64,
+    },
+    /// What F1 decided, for the `KernelEffect::Recovery(..)` arms that have no module consumer
+    /// by design: `RecordSourceUnavailable`, `CloseWindow`, `Selected`, `Quarantine`,
+    /// `BlockPromotion` and `RebuildStalled`, as they left the kernel (lead ruling A-R64).
+    ///
+    /// Recorded for the trace and the operator, the reasoning `AuthorityFact` follows (A-R49).
+    /// F1's requests to the environment (`QueryInventory`, `ProbeDigestAt`, `CatchUp`,
+    /// `CatchUpBeforeGrant`, `SyncWalThrough`, `QuarantineSuffix`, `RebuildFromAuthoritative`)
+    /// are never recorded here: each either has a provider or is refused by name.
+    RecoveryFact {
+        /// What F1 decided, as it left the kernel.
+        effect: crate::contracts::recovery::RecoveryEffect,
+    },
+    /// What P1 emitted on `KernelEffect::Publication(..)`, which has no module consumer: status
+    /// writes and quarantine marks for the oracle, and answers to queries (lead ruling A-R65,
+    /// the `RecoveryFact` precedent).
+    ///
+    /// The answers are recorded here until the sim has a client reply path for them. When it
+    /// does, `Mode` and `Snapshot` move there and stop being recorded here.
+    PublicationFact {
+        /// What P1 emitted, as it left the kernel.
+        effect: crate::contracts::publication::PublicationEffect,
+    },
+    /// A survivor copy's history, as the scenario declared it for F1's `QueryInventory` and
+    /// `SyncWalThrough` providers ("inspect survivors", spike §6; lead ruling A-R67.3b).
+    ///
+    /// **Declared, never derived.** Recorded by the environment when the plan places the copy,
+    /// under the node that holds it and `ModuleName::Recovery`, so the oracle and a reader can
+    /// tell a history the scenario asserted from one a kernel produced. The dispatcher refuses a
+    /// placement whose head is past what that node's engine holds (A-R67.3a).
+    SurvivorPlaced {
+        /// The partition.
+        partition: PartitionId,
+        /// What the copy reports when asked.
+        inventory: Box<crate::contracts::recovery::SurvivorInventory>,
+    },
+    /// F1 asked for `SyncWalThrough { copy, cutoff }` and the environment produced no
+    /// `DurableAt` (lead ruling A-R67.4). Never silence. F1 answers the missing proof with its
+    /// own sync timer and `RebuildStalled` (ruling B-R52); this note is what lets a reader see
+    /// why.
+    SyncWithheld {
+        /// The copy asked to sync.
+        copy: crate::contracts::membership::CopyId,
+        /// Through where.
+        cutoff: Seq,
+        /// Why no proof came back.
+        reason: SyncWithheldReason,
+    },
+    /// F1 asked for `SyncWalThrough { copy, cutoff }` and the environment's engine really synced,
+    /// so a `DurableAt` is on its way to F1. The positive twin of [`KernelNote::SyncWithheld`]:
+    /// every sync request is recorded with one of the two, so a reader sees the request and its
+    /// fate without inferring either from engine state (lead ruling B-R55a).
+    SyncProven {
+        /// The copy asked to sync.
+        copy: crate::contracts::membership::CopyId,
+        /// Through where.
+        cutoff: Seq,
+        /// What the engine reported durable after the sync.
+        durable: crate::contracts::ids::DurableSeq,
+    },
+    /// F1 emitted `KernelEffect::Recovered`, recorded whole as it left the kernel (lead ruling
+    /// B-R55b). The routed copy reaches R1 and L1; this one is what the trace and the oracle
+    /// read, so a row can assert the loss record, the barrier and the mode without inferring
+    /// them from what the consumers did. One note per emission, the activation re-emit included.
+    ///
+    /// Boxed: a [`crate::contracts::recovery::RecoveryResult`] is large and unboxed it would set
+    /// the size of every note.
+    RecoveredFact {
+        /// The result, exactly as F1 emitted it.
+        result: Box<crate::contracts::recovery::RecoveryResult>,
+    },
+    /// A committed `Recovered` could not yet reach a member of its pinned config other than the
+    /// emitter (lead ruling B-R56). Paired with a later [`Self::RecoveredLanded`] for the same
+    /// `(member, revision)`.
+    RecoveredDeferred {
+        /// The member that has not heard it.
+        member: NodeId,
+        /// The partition recovered.
+        partition: PartitionId,
+        /// The control revision it was committed at. The activation re-emit has its own.
+        revision: Revision,
+        /// The node whose F1 emitted it.
+        emitter: NodeId,
+        /// Why the member cannot hear it yet.
+        reason: RecoveredDeferReason,
+    },
+    /// A committed `Recovered` reached a member other than the emitter (lead ruling B-R56).
+    RecoveredLanded {
+        /// The member it reached.
+        member: NodeId,
+        /// The partition recovered.
+        partition: PartitionId,
+        /// The control revision it was committed at.
+        revision: Revision,
+        /// The node whose F1 emitted it.
+        emitter: NodeId,
+    },
+}
+
+/// Why a member's `Recovered` was deferred (see [`KernelNote::RecoveredDeferred`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RecoveredDeferReason {
+    /// The member's node is down. It hears the result when the sim restarts it.
+    Crashed,
+    /// The member is cut off. It hears the result when the cut heals.
+    CutOff,
+}
+
+/// Why F1's `SyncWalThrough` produced no `DurableAt` (see [`KernelNote::SyncWithheld`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SyncWithheldReason {
+    /// The scenario placed no survivor for that copy.
+    NotPlaced,
+    /// The sync failed with this fault.
+    Failed(crate::contracts::storage::StorageFault),
+    /// The engine made less than the cutoff durable: a short or false flush, or not applied.
+    Short {
+        /// What the engine holds durable for the copy's lineage.
+        durable: crate::contracts::ids::DurableSeq,
+    },
+    /// Neither the placed history nor the engine's stored record holds a digest at the cutoff
+    /// (the engine fallback is ruling B-R70, M7B-136).
+    NoDigest,
+    /// The sync never completed: the holder's device stopped completing syncs (a stalled flush),
+    /// so it neither succeeded nor failed and nothing became durable. F1's own sync timer reports
+    /// the copy (ruling B-R52); this reason is what lets a reader see why (M7B-156).
+    Stalled,
+}

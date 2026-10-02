@@ -21,6 +21,16 @@ use config_storage::{EphemeralStore, RocksStore, SnapshotConfig, StateReader};
 /// maximum-size commands per `AppendEntries` is already more than a real write burst produces.
 pub const MAX_PAYLOAD_ENTRIES: u64 = 16;
 
+/// How long one InstallSnapshot call may take, in milliseconds.
+///
+/// OpenRaft's default is 200 ms, shorter than one append-entries call (`heartbeat_interval`).
+/// A call carries one chunk of up to [`config_core::Limits::max_request_bytes`] and, on the last
+/// chunk, the follower's whole install, which grows with the store. Under 200 ms nothing large
+/// ever lands: observed 2026-10-01, a node restarted behind the purge point retried forever,
+/// heard no heartbeat meanwhile, and kept raising the leader's term with stale campaigns.
+/// Too long only delays the retry to a follower that has hung mid-install.
+pub const INSTALL_SNAPSHOT_TIMEOUT_MS: u64 = 30_000;
+
 /// Raft timing, in milliseconds.
 ///
 /// The defaults are the Windows-safe values from the OpenRaft research note: OpenRaft ticks at
@@ -384,6 +394,7 @@ impl NodeConfig {
             // fails the transfer at the codec, after the leader has already read it.
             snapshot_max_chunk_size: (self.limits.max_request_bytes as u64)
                 .min(openraft::Config::default().snapshot_max_chunk_size),
+            install_snapshot_timeout: INSTALL_SNAPSHOT_TIMEOUT_MS,
             max_in_snapshot_log_to_keep: self.snapshot.logs_to_keep,
             purge_batch_size: self.snapshot.purge_batch_size,
             enable_tick: true,

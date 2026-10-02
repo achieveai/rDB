@@ -433,7 +433,7 @@ impl Paginator {
         effective: &ListRequest,
         raw_token: &[u8],
     ) -> Result<ListPage, ConfigError> {
-        let token = self.open(raw_token, principal, effective)?;
+        let token = self.open(node, raw_token, principal, effective)?;
 
         let now_ms = self.pins.clock.now_ms();
         self.pins.expire_now(now_ms);
@@ -470,8 +470,12 @@ impl Paginator {
     }
 
     /// The check order, in order. Nothing here reads a key.
+    ///
+    /// `node` is read for one thing only — the leader hint on the `node` refusal (G-04) — and
+    /// only after that refusal has already been decided, so the check order is unchanged.
     fn open(
         &self,
+        node: &ConfigNode,
         raw_token: &[u8],
         principal: &Principal,
         effective: &ListRequest,
@@ -503,7 +507,7 @@ impl Paginator {
         // Another node's token, or one minted before this process's pin table existed. Both
         // mean the same thing — the pin cannot be here — and both say so with one reason.
         if token.node_id != self.node_id || token.issued_ms < self.started_ms {
-            return Err(self.reject(raw_token, PageTokenExpiredReason::Node));
+            return Err(self.reject_to_leader(node, raw_token));
         }
         Ok(token)
     }
@@ -521,6 +525,29 @@ impl Paginator {
             "page token rejected"
         );
         ConfigError::page_token_expired(reason)
+    }
+
+    /// The `node` refusal, plus where to go instead when this node knows somewhere better.
+    ///
+    /// The refusal itself is unchanged — same reason, same counter, same log line through
+    /// [`Paginator::reject`] — because the token genuinely is not usable here and telling the
+    /// caller otherwise would be a lie. What changes is that the caller no longer has to spend
+    /// a round trip discovering the leader before it restarts (G-04).
+    ///
+    /// The hint is withheld unless it names a *different* node. A leaderless node has nothing
+    /// to offer, and a leader refusing a token minted by some earlier leader would otherwise
+    /// point the caller back at itself — a hint a client would follow into the same refusal.
+    fn reject_to_leader(&self, node: &ConfigNode, raw_token: &[u8]) -> ConfigError {
+        // `reject` owns the counter and the log line, so it runs either way and the two paths
+        // stay one refusal rather than two that have to be kept in step.
+        let refusal = self.reject(raw_token, PageTokenExpiredReason::Node);
+        match node.leader_hint().filter(|h| h.node_id != self.node_id) {
+            None => refusal,
+            Some(hint) => ConfigError::PageTokenExpired {
+                reason: PageTokenExpiredReason::Node,
+                hint: Some(hint),
+            },
+        }
     }
 
     /// Read one page out of a pinned view and mint the next cursor.

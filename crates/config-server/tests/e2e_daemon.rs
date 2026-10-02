@@ -578,9 +578,16 @@ async fn e2e_10_cross_process_trace_correlation() {
 
     // The same join, expressed the way test plan §7 Q10 expresses it: one DuckDB query over
     // the three separate daemon log directories at once.
+    //
+    // Over a snapshot, not the live tree. The three daemons are child processes and they are
+    // still running here, so their log files are open for writing and each is far below
+    // DuckDB's 16 MiB read buffer — the exact regime `logs::LogSnapshot` documents, in which a
+    // read of a growing file fails intermittently with an out-of-range offset. `wait_for_all`
+    // above has already put the lines this asserts on into those files, so freezing them now
+    // loses nothing the query needs.
+    let relation = config_testkit::logs::relation_for_tree(harness.root());
     let rows = config_testkit::logs::query(&format!(
-        "SELECT node_id, count(*) AS lines          FROM read_json_auto('{glob}', union_by_name=true)          WHERE trace_id = '{trace_id}' GROUP BY node_id ORDER BY node_id",
-        glob = harness.logs_glob(),
+        "SELECT node_id, count(*) AS lines          FROM {relation}          WHERE trace_id = '{trace_id}' GROUP BY node_id ORDER BY node_id",
     ));
     config_testkit::logs::assert_nonempty(&rows, "trace lines joined across the daemon logs");
     assert_eq!(
@@ -1646,9 +1653,12 @@ fn e44_key(prefix: &str, index: usize) -> Bytes {
 /// guard rather than on some other path to the same error variant.
 ///
 /// Asserted: continuing the original walk's token after the leader is killed fails with
-/// `ConfigError::PageTokenExpired { reason: PageTokenExpiredReason::Node }` — the pin cannot
-/// exist on any node but the one that minted it, whether or not that node happens to still be
-/// leader (`Paginator::open` runs the node-id check before any leadership check at all). A
+/// `ConfigError::PageTokenExpired { reason: PageTokenExpiredReason::Node, .. }` — the pin
+/// cannot exist on any node but the one that minted it, whether or not that node happens to
+/// still be leader (`Paginator::open` runs the node-id check before any leadership check at
+/// all). The `..` is G-04's `hint`: the refusal may now carry a leader hint, and this row
+/// deliberately does not assert on it — the minting node is dead, so whatever hint the
+/// survivor attaches names a node other than the one the token was bound to. A
 /// freshly restarted walk against the surviving cluster returns a complete, self-consistent
 /// snapshot — every page reports the same (new) revision, no key is missing, and no key is
 /// duplicated.
@@ -1747,7 +1757,10 @@ async fn e2e_44_daemon_pagination_across_a_leader_failover() {
         "continuing a token minted by the killed leader must fail once no live node holds its pin",
     );
     match error {
-        ConfigError::PageTokenExpired { reason } => {
+        // `..` and not the hint: this row is about the `node` reason surviving G-04, which
+        // added a leader hint beside it. Binding the hint here would make an additive change
+        // look like a behaviour change in the row that exists to prove it is not one.
+        ConfigError::PageTokenExpired { reason, .. } => {
             assert_eq!(
                 reason,
                 PageTokenExpiredReason::Node,
@@ -1857,6 +1870,96 @@ fn evidence_files_from_readme(readme: &std::path::Path) -> Vec<String> {
     files
 }
 
+/// The README section that lists the rDB M7 campaign's artifacts (ruling V-R32). Every
+/// `docs/evidence/rdb-*.json` belongs to it and none belongs to the M6 table above.
+const RDB_EVIDENCE_TABLE: &str = "## The rDB M7 files";
+const RDB_EVIDENCE_PREFIX: &str = "rdb-";
+
+/// `(file, written by)` for every row of the README's rDB table.
+///
+/// The "Written by" column is what tells this row whether a listed file must exist after the
+/// debug campaign run it drives. It takes one of three values, and any other value fails the row
+/// rather than being read as "optional": a file this row cannot classify is not silently skipped.
+fn rdb_evidence_rows_from_readme(readme: &std::path::Path) -> Vec<(String, String)> {
+    let text = std::fs::read_to_string(readme)
+        .unwrap_or_else(|e| panic!("read {}: {e}", readme.display()));
+    let mut in_table = false;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("## ") {
+            if in_table {
+                break;
+            }
+            in_table = line.trim_end() == RDB_EVIDENCE_TABLE;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        // Columns: File | Row | Written by | What it proves. Only a data row starts with a
+        // backtick right after the leading pipe, as in the M6 table.
+        let Some(rest) = line.strip_prefix("| `") else {
+            continue;
+        };
+        let end = rest
+            .find('`')
+            .unwrap_or_else(|| panic!("unterminated file name in the rDB table: {line}"));
+        let cells: Vec<&str> = rest[end + 1..]
+            .trim()
+            .trim_start_matches('|')
+            .trim_end_matches('|')
+            .split('|')
+            .map(str::trim)
+            .collect();
+        assert!(
+            cells.len() >= 3,
+            "an rDB table row needs File | Row | Written by | What it proves: {line}"
+        );
+        rows.push((rest[..end].to_string(), cells[1].to_string()));
+    }
+    rows
+}
+
+/// Run the rDB campaign's debug command (ADR-rdb-0019 §2.1, the handoff gate's campaign binary)
+/// to completion and assert it passed, so the rDB artifacts this row checks were written by this
+/// row and not left behind by some earlier run.
+///
+/// Every campaign knob is removed, so the child runs the checked-in default corpus at reduced
+/// scale whatever this process was started with. The profile is the default (`dev`), so the child
+/// writes `rdb-m7-campaign.json`, never the release artifact.
+fn run_rdb_campaign(target_dir: &std::path::Path) {
+    const CAMPAIGN_KNOBS: [&str; 9] = [
+        "RETCD_EVIDENCE",
+        "SPIKE_ASSERT_WALL_MS",
+        "SPIKE_MAX_EVENTS",
+        "SPIKE_REQUIRE_ALL",
+        "SPIKE_SEEDS",
+        "SPIKE_SEED_BASE",
+        "SPIKE_SHRINK_BUDGET_TOTAL",
+        "SPIKE_SHRINK_MAX_FAILURES",
+        "SPIKE_SHRINK_STEPS",
+    ];
+    let log_dir = config_testkit::fs::temp_dir();
+    let mut command = std::process::Command::new("cargo");
+    command
+        .args(["test", "-p", "rdb-sim", "--test", "campaign"])
+        .current_dir(workspace_root())
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("RETCD_TEST_LOG_DIR", log_dir.path());
+    for knob in CAMPAIGN_KNOBS {
+        command.env_remove(knob);
+    }
+    let output = command
+        .output()
+        .expect("spawn `cargo test -p rdb-sim --test campaign`");
+    assert!(
+        output.status.success(),
+        "the rDB campaign did not pass:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Run `cargo test -p config-testkit --test m6_evidence` to completion and assert it passed.
 ///
 /// A fresh temp directory backs `RETCD_TEST_LOG_DIR` for this one invocation (this row's own
@@ -1914,6 +2017,21 @@ fn run_evidence_suite(target_dir: &std::path::Path) {
 /// every file in place (its mtime advances and it still parses as exactly one JSON value, never
 /// two — an append rather than an overwrite would leave a second value in the file) and leaves
 /// the exact same file set behind, so no stale file from a renamed row survives.
+///
+/// **rDB artifacts (ruling V-R32, 2026-09-27).** The rDB M7 campaign writes into the same
+/// directory, so the M6 file-set check above covers only the files not named `rdb-*`, unchanged.
+/// A second check covers the rest against the README's own "## The rDB M7 files" table:
+///
+/// - every `rdb-*.json` on disk is listed there, so an unlisted artifact fails the row;
+/// - this row runs the campaign's debug command itself. Every row listed as written by a
+///   `debug campaign run` or by `every campaign run` must then exist, with an mtime no older than
+///   that run's start, so a file left behind by an earlier run does not count;
+/// - a row written by a `release campaign run` is not required to exist. The campaign picks its
+///   artifact name from the build profile (ADR-rdb-0019 §2), and the release commands are run by
+///   hand (§2.1). So no command this row runs can write that file, and requiring it would fail
+///   every tree in which the M7 release gate has not been run. If the file is present, it still
+///   has to be listed;
+/// - any other "Written by" value fails the row. It is never read as "optional".
 #[retcd_test]
 async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
     let readme = workspace_root()
@@ -1926,9 +2044,31 @@ async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
         "the README's file table parsed too small a set: {expected_files:?}"
     );
 
+    for name in &expected_files {
+        assert!(
+            !name.starts_with(RDB_EVIDENCE_PREFIX),
+            "{name} is in the M6 table; rDB artifacts belong in {RDB_EVIDENCE_TABLE:?}"
+        );
+    }
+    let rdb_listed: std::collections::BTreeMap<String, String> =
+        rdb_evidence_rows_from_readme(&readme).into_iter().collect();
+    assert!(
+        !rdb_listed.is_empty(),
+        "the README has no {RDB_EVIDENCE_TABLE:?} table, or it lists no file"
+    );
+    for name in rdb_listed.keys() {
+        assert!(
+            name.starts_with(RDB_EVIDENCE_PREFIX),
+            "{name} is in the rDB table but is not named {RDB_EVIDENCE_PREFIX}*"
+        );
+    }
+
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"));
+
+    let campaign_started = std::time::SystemTime::now();
+    run_rdb_campaign(&target_dir);
 
     run_evidence_suite(&target_dir);
     let evidence_dir = config_testkit::evidence::evidence_dir();
@@ -1997,12 +2137,56 @@ async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
+    let (present_rdb, present_m6): (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) = present_after
+        .into_iter()
+        .partition(|name| name.starts_with(RDB_EVIDENCE_PREFIX));
     let expected_set: std::collections::BTreeSet<String> = expected_files.iter().cloned().collect();
     assert_eq!(
-        present_after, expected_set,
+        present_m6, expected_set,
         "docs/evidence/*.json does not match the README's own file table after a fresh run (a \
          stale file survived a renamed row, or the README is out of date)"
     );
+
+    // The rDB half (ruling V-R32): no rdb-* file goes unlisted, and none that is listed is
+    // silently skipped.
+    let unlisted: Vec<&String> = present_rdb
+        .iter()
+        .filter(|name| !rdb_listed.contains_key(*name))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "docs/evidence holds rDB artifacts that the README's {RDB_EVIDENCE_TABLE:?} table does \
+         not list: {unlisted:?}"
+    );
+    for (name, written_by) in &rdb_listed {
+        match written_by.as_str() {
+            "debug campaign run" | "every campaign run" => {
+                let path = evidence_dir.join(name);
+                let meta = std::fs::metadata(&path).unwrap_or_else(|e| {
+                    panic!(
+                        "{name} is listed in the rDB table as written by {written_by:?}, but \
+                         it is missing after this row's campaign run: {e}"
+                    )
+                });
+                assert!(
+                    meta.modified().expect("mtime is supported") >= campaign_started,
+                    "{name} was not written by this row's campaign run; the file on disk is \
+                     older than the run"
+                );
+            }
+            // Written only by the release commands, which this row never runs: see the doc
+            // comment. Listing is still enforced above.
+            "release campaign run" => {}
+            other => panic!(
+                "{name}: the rDB table says it is written by {other:?}; this row knows only \
+                 `debug campaign run`, `release campaign run` and `every campaign run`, and will \
+                 not guess whether the file must exist"
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2342,6 +2526,7 @@ fn e40_write_policy(dir: &std::path::Path, version: u64, grants: &[(&str, &str)]
             })
             .collect(),
         admins: Vec::new(),
+        cluster_id: None,
     };
     let bytes = serde_json::to_vec(&document).expect("a policy document serializes");
     let hash = config_core::policy::document_hash(&bytes);

@@ -291,10 +291,21 @@ pub enum ConfigError {
     /// start. It is `FAILED_PRECONDITION` rather than `OUT_OF_RANGE` because nothing was
     /// dropped from history — the *pin* is gone, not the data — and the walk can be restarted
     /// immediately against the same live state.
-    #[error("page token expired: {reason}")]
+    #[error("page token expired: {reason}{}", match .hint { Some(h) => format!(" (try node {} at {})", h.node_id, h.endpoint), None => String::new() })]
     PageTokenExpired {
         /// Which of the transient causes fired; the `retcd-reason` trailer value.
         reason: PageTokenExpiredReason,
+        /// Where the walk can be restarted, when this node knows somewhere better (G-04).
+        ///
+        /// Only ever set for [`PageTokenExpiredReason::Node`], and only when the leader this
+        /// node knows is some *other* node — the one case where "restart the walk" has an
+        /// address attached. Every other reason leaves it `None`, because the pin is gone
+        /// cluster-wide and no node would serve the token either.
+        ///
+        /// Additive by construction: the refusal and its `reason` are unchanged, so a client
+        /// that ignores the hint behaves exactly as it did before. It saves the round trip a
+        /// restarted walk would otherwise spend learning the leader from `NotLeader`.
+        hint: Option<LeaderHint>,
     },
 
     /// Local storage failed fatally. The node becomes unready; this is not retryable here.
@@ -365,7 +376,7 @@ impl ConfigError {
 
     /// Build a [`ConfigError::PageTokenExpired`] (M6, ADR-0029).
     pub fn page_token_expired(reason: PageTokenExpiredReason) -> Self {
-        Self::PageTokenExpired { reason }
+        Self::PageTokenExpired { reason, hint: None }
     }
 
     /// The refusal for a continuation token bound to a different prefix (M6, OQ-62).

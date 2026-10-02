@@ -1,0 +1,336 @@
+{
+  "milestones": [
+    {
+      "id": "M0",
+      "title": "Deterministic core",
+      "chip": "Done",
+      "stage": "committed",
+      "gate_commit": "7014701",
+      "acceptance": [
+        {
+          "text": "Replay is deterministic.",
+          "mark": "proven",
+          "evidence": "m0_replay suite green."
+        },
+        {
+          "text": "Exactly one competing CAS wins.",
+          "mark": "proven",
+          "evidence": "critic-core PASS_WITH_RISKS, fixed direct."
+        },
+        {
+          "text": "Apply uses no clock, randomness, or I/O.",
+          "mark": "proven",
+          "evidence": "Purity scan, config-core."
+        }
+      ],
+      "tests": "74 m0 test functions on disk.",
+      "status": [
+        {
+          "lead": "Merged.",
+          "text": "Merged into main. No further M0 work is planned.",
+          "evidence": ""
+        }
+      ],
+      "history": [
+        "config-core delivered by dev-core: 85 tests at M0 gate.",
+        "critic-core PASS_WITH_RISKS, 6 MATERIAL findings, all fixed direct."
+      ]
+    },
+    {
+      "id": "M1",
+      "title": "Three-node cluster",
+      "chip": "Done",
+      "stage": "committed",
+      "gate_commit": "01a58b8",
+      "acceptance": [
+        {
+          "text": "No empty node self-forms.",
+          "mark": "proven",
+          "evidence": "M1 gate commit 01a58b8."
+        },
+        {
+          "text": "One stopped voter does not block writes.",
+          "mark": "proven",
+          "evidence": "M1 gate commit 01a58b8."
+        },
+        {
+          "text": "Gossip cannot alter membership or data.",
+          "mark": "proven",
+          "evidence": "critic-gossip closed, M1 gate."
+        }
+      ],
+      "tests": "109 m1 test functions on disk.",
+      "status": [
+        {
+          "lead": "Merged.",
+          "text": "Merged into main. 27 of 27 plan rows passed.",
+          "evidence": ""
+        }
+      ],
+      "history": [
+        "config-engine and config-gossip delivered by dev-engine, dev-gossip.",
+        "critic-gossip FAIL, 2 BLOCKER findings; dev-gossip-fix closed both."
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "Durable restart",
+      "chip": "Done",
+      "stage": "committed",
+      "gate_commit": "01a58b8",
+      "acceptance": [
+        {
+          "text": "Every acknowledged mutation survives a restart.",
+          "mark": "proven",
+          "evidence": "M2 gate commit 01a58b8."
+        },
+        {
+          "text": "A crash at any boundary loses nothing.",
+          "mark": "proven",
+          "evidence": "M2 gate commit 01a58b8."
+        },
+        {
+          "text": "A storage identity mismatch blocks startup.",
+          "mark": "proven",
+          "evidence": "M2 gate commit 01a58b8."
+        }
+      ],
+      "tests": "80 m2 test functions on disk.",
+      "status": [
+        {
+          "lead": "Merged.",
+          "text": "Merged into main.",
+          "evidence": "01a58b8"
+        }
+      ],
+      "history": [
+        "RocksStore and the M2 harness delivered by dev-rocks, dev-testkit.",
+        "All store-level gaps closed by tester-m2-storage, verified."
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "First release gate",
+      "chip": "Done",
+      "stage": "committed",
+      "gate_commit": "7d524ac",
+      "acceptance": [
+        {
+          "text": "Wrong cluster, node, or client identity is rejected.",
+          "mark": "proven",
+          "evidence": "M3 gate commit 7d524ac."
+        },
+        {
+          "text": "Direct and gRPC clients share one conformance suite.",
+          "mark": "proven",
+          "evidence": "M3 gate commit 7d524ac."
+        },
+        {
+          "text": "Static authorization denies unlisted principals.",
+          "mark": "proven",
+          "evidence": "M3 gate commit 7d524ac."
+        }
+      ],
+      "tests": "94 m3 test functions on disk.",
+      "status": [
+        {
+          "lead": "Merged.",
+          "text": "Merged into main.",
+          "evidence": "7d524ac"
+        }
+      ],
+      "history": [
+        "config-grpc, config-client, and the daemon delivered. critic-grpc FAIL then closed.",
+        "E2E-01 through E2E-19 green over 4 consecutive runs."
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "Resumable watches",
+      "chip": "Gate passed",
+      "stage": "committed",
+      "gate_commit": "33b5f4b",
+      "acceptance": [
+        {
+          "text": "No silent loss under replay or leader change.",
+          "mark": "proven",
+          "evidence": "critic-m4 FINAL PASS, 178 tests fresh build."
+        },
+        {
+          "text": "A slow watcher never blocks apply.",
+          "mark": "proven",
+          "evidence": "Bounded-queue rows green."
+        },
+        {
+          "text": "Resume below the watermark is typed.",
+          "mark": "proven",
+          "evidence": "RevisionCompacted row, gate 33b5f4b."
+        }
+      ],
+      "tests": "137 m4 test functions on disk.",
+      "status": [
+        {
+          "lead": "Gate committed.",
+          "text": "Committed as 33b5f4b. The coverage sweep is now closed.",
+          "evidence": ""
+        },
+        {
+          "lead": "Post-gate testers finished.",
+          "text": "Both tester-m4c and tester-m4d are done.",
+          "evidence": ""
+        },
+        {
+          "lead": "One regression fixed.",
+          "text": "m4_88 schema-gate interaction, closed by ruling M6-R15.",
+          "evidence": ""
+        }
+      ],
+      "history": [
+        "critic-m4 round 1 FAIL, C4-01 BLOCKER plus C4-02 through 07; dev-watch closed all.",
+        "critic-m4 re-review found C4-08 through 11; round 2 closed with mutation checks.",
+        "critic-m4 FINAL: PASS, 178 tests, residue sweep clean.",
+        "tester-m4 found production bug M4-32; lead fixed, verified 12 of 12 times 4.",
+        "tester-m4b delivered the remaining 45 M4 rows plus E2E-21 and E2E-22.",
+        "Mutation-hygiene incident: two live mutations found and reverted same hour.",
+        "tester-m4c and tester-m4d each completed with risks on the post-gate coverage sweep."
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "Operable lifecycle",
+      "chip": "Gate passed",
+      "stage": "committed",
+      "gate_commit": "e54c6ef",
+      "acceptance": [
+        {
+          "text": "Interrupted membership transitions recover.",
+          "mark": "proven",
+          "evidence": "critic-m5a blockers closed; m5_admin 10/10."
+        },
+        {
+          "text": "Backup restores into one fenced authority.",
+          "mark": "proven",
+          "evidence": "ADR-0024, gate e54c6ef."
+        },
+        {
+          "text": "Stale identities cannot rejoin.",
+          "mark": "proven",
+          "evidence": "m5_133, retired-node fencing (dev-fence)."
+        },
+        {
+          "text": "Snapshot interruption leaves recoverable state.",
+          "mark": "proven",
+          "evidence": "dev-snapshot fix round, 5 findings closed."
+        }
+      ],
+      "tests": "121 m5 test functions on disk.",
+      "status": [
+        {
+          "lead": "Gate committed.",
+          "text": "Committed as e54c6ef, the same checkpoint as M6 wave 1.",
+          "evidence": ""
+        },
+        {
+          "lead": "Re-review passed.",
+          "text": "critic-m5b passed with risks. All blockers are closed.",
+          "evidence": ""
+        },
+        {
+          "lead": "Fencing gap closed.",
+          "text": "dev-fence closed the last snapshot-fencing gap.",
+          "evidence": "ruling M5-R21"
+        }
+      ],
+      "history": [
+        "critic-m5a FAIL, 2 BLOCKERs on Backup RPC and RemoveMember fencing; dev-admin closed both.",
+        "critic-m5b FAIL then PASS_WITH_RISKS on re-review; 3 new MATERIAL findings, all closed.",
+        "INCIDENT resolved: dev-dedup ran an unauthorized checkout, discarding uncommitted M4 edits. Reconstructed same session.",
+        "dev-snapshot fix round closed C5-05, 06, 07, 13, 14 with 2 new mutation checks.",
+        "dev-fence closed C5B-18, retired_nodes not carried in snapshot, with ruling M5-R21.",
+        "tester-m5a, tester-m5b, and dev-harness all completed their M5 rows."
+      ]
+    },
+    {
+      "id": "M6",
+      "title": "Production hardening",
+      "chip": "Gate passed",
+      "stage": "committed",
+      "gate_commit": "4f6f7e5",
+      "acceptance": [
+        {
+          "text": "Signed distributed RBAC lifecycle.",
+          "mark": "proven",
+          "evidence": "m6_rbac 20/20; critic-rbac PASS_WITH_RISKS round 2."
+        },
+        {
+          "text": "Certificate and gossip-key rotation.",
+          "mark": "proven",
+          "evidence": "m6_rotation.rs 24/24. Rows M6-49..56, M6-60 landed (tester-m6e)."
+        },
+        {
+          "text": "Revision-pinned pagination.",
+          "mark": "proven",
+          "evidence": "38 tests; m6_pagination_e2e.rs green; E2E-44 passed."
+        },
+        {
+          "text": "Watch capacity validated.",
+          "mark": "risk",
+          "evidence": "M6-105 at reduced scale, 100 not 1,000."
+        },
+        {
+          "text": "Mixed-version upgrades and migrations.",
+          "mark": "proven",
+          "evidence": "E2E-42 rolling-upgrade row, 8x green. Ruling M6-R22 fix verified red then green."
+        },
+        {
+          "text": "Fault and security matrix.",
+          "mark": "risk",
+          "evidence": "M6-107..112 green. 8 of 17 crash boundaries not driven."
+        },
+        {
+          "text": "Measured RPO/RTO and capacity.",
+          "mark": "risk",
+          "evidence": "M6-106 measures primitives, not the CLI."
+        }
+      ],
+      "tests": "156 m6 test functions on disk. 35 e2e functions across the suite.",
+      "status": [
+        {
+          "lead": "Review closed.",
+          "text": "critic-m6 found zero open blockers and zero material findings.",
+          "evidence": ""
+        },
+        {
+          "lead": "Gate passed.",
+          "text": "Fmt and clippy clean. Cargo test: 1023 passed. 2 pre-existing flakes, not regressions.",
+          "evidence": "ledger:676-677"
+        },
+        {
+          "lead": "Next.",
+          "text": "User decision: commit the fix pass.",
+          "evidence": ""
+        }
+      ],
+      "history": [
+        "dev-evidence and dev-pagination DONE, wave 1: evidence rows, pagination wired.",
+        "dev-rbac completed with deviations: signed policy, gossip convergence M6-20/21.",
+        "dev-compat COMPLETED: mixed-version schema gate, ADR-0030, ruling M6-R15.",
+        "dev-rotation completed with risks: TLS plus gossip-key rotation, ADR-0028.",
+        "tester-m6a, tester-m6b, tester-m6c each completed with risks on M6 rows.",
+        "dev-rotation-harness completed with partial scope: 15 rows in m6_rotation.rs.",
+        "Ruling M6-R20: the storage drain precondition blocks rolling upgrade. Material finding.",
+        "dev-migration COMPLETED: landed the M6-R20 drain fix. Lead-verified, accepted.",
+        "dev-quickstart COMPLETE: one-command local cluster script plus docs.",
+        "Disk-full incident today; corrupted build artifacts purged. See Risks.",
+        "tester-m6e COMPLETE: m6_rotation.rs grew from 15 to 24 rows, M6-49 through 56, M6-60.",
+        "tester-m6d COMPLETE: E2E-41, 42, 43, 45 landed and lead-verified.",
+        "critic-m6 first pass: passed with risks, 1 blocker M6-R22 log-drain gap, 3 material, 5 advisory.",
+        "Blocker M6-R22 closed by lead: pinned-schema dirs no longer lose their compact watermark.",
+        "dev-m6-fixes COMPLETE: closed all 3 material and 5 advisory critic-m6 findings.",
+        "critic-m6 delta review: passed with risks, gate clear. Lead closed the 2 new advisory notes.",
+        "Branch review: 6 reviewers passed with risks. 0 blockers, 19 findings. Fixes landed in tree.",
+        "Gate run 3: fmt clean, clippy clean, cargo test 1023 passed, 2 pre-existing flakes."
+      ]
+    }
+  ]
+}

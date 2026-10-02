@@ -331,6 +331,122 @@
         "Branch review: 6 reviewers passed with risks. 0 blockers, 19 findings. Fixes landed in tree.",
         "Gate run 3: fmt clean, clippy clean, cargo test 1023 passed, 2 pre-existing flakes."
       ]
+    },
+    {
+      "id": "M7",
+      "title": "rDB correctness spike",
+      "chip": "In progress",
+      "stage": "develop",
+      "acceptance": [
+        {
+          "text": "Foundation contracts, clock and run loop work end to end.",
+          "mark": "risk",
+          "evidence": "Census: 57 declared, 51 landed, 6 exempt, 0 owed. Three delivery seams still refuse by name: crash restart, recovery with no provider, kernel arms with no consumer."
+        },
+        {
+          "text": "Kernel-A ordering and consistency properties are validated.",
+          "mark": "open",
+          "evidence": "A1 reports Wired and authored recovery-to-write runs execute in the simulator. T1 reports Unavailable at run time (ruling V-R40). Census: 194 declared, 187 landed, 7 owed."
+        },
+        {
+          "text": "Kernel-B state recovery and durability pass test suite.",
+          "mark": "open",
+          "evidence": "Census: 239 declared, 239 landed, 0 owed. R1, L1 and F1 code and rows are built, but each reports Unavailable at run time."
+        },
+        {
+          "text": "Verification oracle detects real-world divergence.",
+          "mark": "open",
+          "evidence": "Census: 127 declared, 116 landed, 1 exempt, 10 owed. Generated campaign seeds do not lower yet (M7V-55), so full_scale is false."
+        }
+      ],
+      "tests": "Census 2026-10-01, export of 7e262dc: 616 declared, 591 landed, 7 exempt, 18 owed. Foundation 0 owed. Kernel-a 7 owed. Kernel-b 0 owed. Verification 11 owed.",
+      "status": [
+        {
+          "lead": "M7 code is committed and pushed.",
+          "text": "It sits on the feature branch, and review fixes are landing on it.",
+          "evidence": "git log feature/rdb-m7"
+        },
+        {
+          "lead": "Authored A1 runs work in the simulator.",
+          "text": "Recovery-to-write scenarios run through the simulator and assert client outcomes.",
+          "evidence": "scenarios.rs, m7v_47 rows"
+        },
+        {
+          "lead": "Generated seeds still do not lower.",
+          "text": "The release campaign reports full scale as false until they do. Owed rows are in the census.",
+          "evidence": "scripts/m7-census.sh; campaign.rs M7V-55"
+        }
+      ],
+      "history": [
+        "Architect passed all four team designs; no gaps identified.",
+        "Critic passed design records for kernel-a, kernel-b, and verification.",
+        "Test planner issued kernel-a test plan; kernel-b test plan advanced; verification plan completed and passed review.",
+        "Wave 2 committed: foundation code and four kernel contracts landed, 146 tests green.",
+        "PR drafted against foundation scope, halted when dashboard correctly reported M7 incomplete.",
+        "CB-8 fencing branch verified unreachable; doc defect in urgency premise corrected.",
+        "Run loop built first, on Gautam's call. Foundation rows followed, and none are owed now.",
+        "Kernel-a miscredit found: half its credited rows asserted other rows' claims. Two were renamed onto the right id."
+      ]
+    },
+    {
+      "id": "M8",
+      "title": "Storage and value layer",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M9",
+      "title": "Embedded API and live control",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M10",
+      "title": "Replication and recovery, real cluster",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M11",
+      "title": "Placement, transfer, split",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M12",
+      "title": "Qualification",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
+    },
+    {
+      "id": "M13",
+      "title": "Actor adapter",
+      "chip": "Not started",
+      "stage": "design",
+      "acceptance": [],
+      "tests": "Test plan to be defined.",
+      "status": [],
+      "history": []
     }
   ]
 }

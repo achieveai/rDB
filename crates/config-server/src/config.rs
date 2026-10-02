@@ -114,6 +114,16 @@ pub struct TlsSection {
     /// number is seconds or a boolean.
     #[serde(default)]
     pub watch_files_secs: Option<u64>,
+    /// How long an accepted connection may take to finish its TLS handshake before the
+    /// listener drops it and counts it (M6-45, ADR-0028). Default
+    /// [`config_grpc::DEFAULT_HANDSHAKE_TIMEOUT`].
+    ///
+    /// Spelled in milliseconds rather than seconds, unlike `watch_files_secs` above: the
+    /// useful range starts well under a second on a loopback deployment, and a key whose
+    /// smallest expressible value is already four times the round trip it bounds is a key an
+    /// operator cannot actually tune.
+    #[serde(default)]
+    pub handshake_timeout_ms: Option<u64>,
 }
 
 /// `[authz]` — the static allowlist policy file (ADR-0012).
@@ -555,6 +565,11 @@ pub struct TlsMaterial {
     /// profile the PEM does and is meaningless without one: it becomes
     /// [`config_grpc::MtlsConfig::allow_common_name_principals`] on the client plane.
     pub allow_common_name_principals: bool,
+    /// `tls.handshake_timeout_ms`, defaulted. Carried here for the same reason
+    /// `allow_common_name_principals` is: it describes the mutual profile the PEM is served
+    /// under and is meaningless without one. Becomes
+    /// [`config_grpc::MtlsConfig::handshake_timeout`] on both listeners.
+    pub handshake_timeout: Duration,
 }
 
 /// `Debug` prints sizes, never key bytes.
@@ -568,6 +583,7 @@ impl std::fmt::Debug for TlsMaterial {
                 "allow_common_name_principals",
                 &self.allow_common_name_principals,
             )
+            .field("handshake_timeout", &self.handshake_timeout)
             .finish()
     }
 }
@@ -690,11 +706,24 @@ fn validate(
                     "common_name_principals_enabled"
                 );
             }
+            let handshake_timeout = match file.tls.handshake_timeout_ms {
+                Some(0) => {
+                    return Err(ConfigFileError::Invalid(
+                        "tls.handshake_timeout_ms must be greater than zero".to_string(),
+                    ))
+                }
+                Some(v) => Duration::from_millis(v),
+                // The constant itself, not a copy of its value: the default is defined as
+                // "whatever this build already did", and a literal here would be a second
+                // definition of ADR-0028's bound that a change to the first would leave behind.
+                None => config_grpc::DEFAULT_HANDSHAKE_TIMEOUT,
+            };
             let material = TlsMaterial {
                 ca_pem: read_bytes("tls.ca", &ca)?,
                 cert_pem: read_bytes("tls.cert", &cert)?,
                 key_pem: read_bytes("tls.key", &key)?,
                 allow_common_name_principals: file.tls.allow_common_name_principals,
+                handshake_timeout,
             };
             let watch_files = match file.tls.watch_files_secs {
                 Some(0) => {
@@ -1398,6 +1427,53 @@ mode = "insecure"
                 .expect("mutual mode carries material")
                 .allow_common_name_principals,
             "the gate the document opened must reach the profile the planes are served with"
+        );
+    }
+
+    /// G-01: the key is new, so a document that predates it must resolve to exactly the bound
+    /// this build already used — and a zero must be refused like every other interval here.
+    #[test]
+    fn the_handshake_bound_defaults_to_the_constant_it_replaced() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in ["ca.pem", "node.cert.pem", "node.key.pem"] {
+            std::fs::write(dir.path().join(name), b"-----BEGIN-----\n").expect("write pem");
+        }
+        let mutual = |extra: &str| {
+            minimal(extra).replace("mode = \"insecure\"", "mode = \"mutual\"")
+                + "ca = \"ca.pem\"\ncert = \"node.cert.pem\"\nkey = \"node.key.pem\"\n"
+        };
+        let validated = |text: &str| {
+            let file: ServerConfigFile = toml::from_str(text).expect("the document parses");
+            validate(file, dir.path(), None, false)
+        };
+
+        // Silent document: byte-identical to every pre-G-01 configuration file.
+        let cfg = validated(&mutual("")).expect("a complete mutual document");
+        assert_eq!(
+            cfg.tls_material
+                .expect("mutual mode carries material")
+                .handshake_timeout,
+            config_grpc::DEFAULT_HANDSHAKE_TIMEOUT,
+            "a document that never mentions the key must behave exactly as it did before it \
+             existed"
+        );
+
+        // Set: the document's value reaches the profile the listeners are built from.
+        let cfg = validated(&mutual("handshake_timeout_ms = 250")).expect("an explicit bound");
+        assert_eq!(
+            cfg.tls_material
+                .expect("mutual mode carries material")
+                .handshake_timeout,
+            Duration::from_millis(250)
+        );
+
+        // Zero is refused, exactly as `watch_files_secs = 0` is: a bound of zero would end
+        // every handshake before it started, which is a closed listener spelled as a number.
+        let error = validated(&mutual("handshake_timeout_ms = 0"))
+            .expect_err("a zero bound is not a bound");
+        assert!(
+            error.to_string().contains("tls.handshake_timeout_ms"),
+            "the refusal must name the key: {error}"
         );
     }
 

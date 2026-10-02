@@ -1,0 +1,5 @@
+{
+  "where": "Gate passes complete. Production hardening branch awaiting commit decision.",
+  "blocked": "Nothing.",
+  "next": "User decision: commit the fix pass and dashboard tooling."
+}

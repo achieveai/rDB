@@ -710,9 +710,14 @@ impl WatchHub {
     }
 
     /// Record that this node is the leader and may serve watches.
+    ///
+    /// A stopped hub stays stopped. The daemon ends the hub before draining its client plane,
+    /// while the node is still running, so the metrics watcher and a watch open's barrier can
+    /// still call this; a stream woken by the stop reads only the latest value, and reviving
+    /// `Serving` would keep it open and stall the drain.
     pub fn note_leader(&self) {
         self.state_tx.send_if_modified(|state| {
-            if *state == HubState::Serving {
+            if matches!(state, HubState::Serving | HubState::Stopped) {
                 false
             } else {
                 *state = HubState::Serving;
@@ -738,8 +743,12 @@ impl WatchHub {
     }
 
     /// Record that the node stopped; every open stream terminates with `Unavailable`.
+    ///
+    /// `send_replace`, never `send`: `send` drops the value when no receiver is subscribed,
+    /// which is every hub with no stream open, and the next `open` would then read `Serving`
+    /// and admit a stream that nothing will ever end.
     pub fn shutdown(&self) {
-        let _ = self.state_tx.send(HubState::Stopped);
+        self.state_tx.send_replace(HubState::Stopped);
     }
 
     /// Declare whether this node currently holds a usable authorization policy.
@@ -1025,6 +1034,19 @@ impl WatchHub {
                 return Err(err);
             }
         };
+        // Subscribe, then look again. The check above ran before admission and the gate hop,
+        // and a stop or a leadership loss can land in between; a receiver subscribed after it
+        // has already seen that value, so the stream's live loop would never wake for it and
+        // the stream would stay open — on a stopping node, holding the client plane's drain.
+        // Anything sent after this subscribe is a change the stream will see.
+        let state = self.state_tx.subscribe();
+        if let Some(err) = self.hub_error() {
+            self.counters.terminate(match err {
+                ConfigError::NotLeader { .. } => TerminationReason::NotLeader,
+                _ => TerminationReason::Unavailable,
+            });
+            return Err(err);
+        }
 
         let id = StreamId(self.next_stream_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::channel(self.limits.queue_events.max(1) as usize);
@@ -1063,7 +1085,7 @@ impl WatchHub {
             start_after,
             tx,
             receiver: registration.receiver,
-            state: self.state_tx.subscribe(),
+            state,
             policy: registration.policy,
             policy_epoch: registration.policy_epoch,
             progress_interval,
@@ -1796,4 +1818,29 @@ pub fn retention_target(
     let (target, reason) = chosen?;
     let target = target.min(view.newest_revision);
     (target > compact_revision).then_some((target, reason))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stop is final. Between `shutdown()` and the node actually stopping, the metrics
+    /// watcher and a watch open's linearizable barrier both still call `note_leader`; if that
+    /// flipped the hub back to `Serving`, a stream woken by the stop would read the latest value,
+    /// see `Serving`, and stay open — and the daemon's client-plane drain would wait on it.
+    #[test]
+    fn note_leader_does_not_revive_a_stopped_hub() {
+        let hub = WatchHub::with_defaults(WatchLimits::default());
+        // What an open stream's `check_state` reads.
+        let mut stream_state = hub.state_tx.subscribe();
+        hub.note_leader();
+        hub.shutdown();
+        hub.note_leader();
+
+        assert_eq!(*stream_state.borrow_and_update(), HubState::Stopped);
+        match hub.hub_error() {
+            Some(ConfigError::Unavailable { reason }) => assert_eq!(reason, "stopped"),
+            other => panic!("a stopped hub must refuse with Unavailable(stopped), got {other:?}"),
+        }
+    }
 }

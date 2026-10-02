@@ -1,0 +1,42 @@
+%% title: System map
+%% caption: Each row is one layer, oldest at the top. Boxes show which parts exist yet.
+%% open: always
+%% milestones: M0 M1 M2 M3 M4 M5 M6
+flowchart TB
+  subgraph L0["Foundation, M0 to M2"]
+    direction LR
+    @{sm-core}
+    @{sm-log}
+    @{sm-storage}
+    @{sm-testkit}
+    @{sm-core} ~~~ @{sm-log} ~~~ @{sm-storage} ~~~ @{sm-testkit}
+  end
+  subgraph L1["Cluster, M1 to M3"]
+    direction LR
+    @{sm-engine}
+    @{sm-gossip}
+    @{sm-grpc}
+    @{sm-client}
+    @{sm-engine} ~~~ @{sm-gossip} ~~~ @{sm-grpc} ~~~ @{sm-client}
+  end
+  subgraph L1B["Daemon and watches, M3 to M4"]
+    direction LR
+    @{sm-server}
+    @{watch-hub}
+    @{event-journal}
+    @{sm-server} ~~~ @{watch-hub} ~~~ @{event-journal}
+  end
+  subgraph L2["Lifecycle, M5"]
+    direction LR
+    @{snapshots-purge}
+    @{admin-backup-restore}
+    @{snapshots-purge} ~~~ @{admin-backup-restore}
+  end
+  subgraph L3["Hardening, M6"]
+    direction LR
+    @{rbac-policy}
+    @{tls-gossip-rotation}
+    @{pagination-migration}
+    @{rbac-policy} ~~~ @{tls-gossip-rotation} ~~~ @{pagination-migration}
+  end
+  L0 ~~~ L1 ~~~ L1B ~~~ L2 ~~~ L3

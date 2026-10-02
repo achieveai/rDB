@@ -1,0 +1,31 @@
+%% title: Write call path
+%% caption: A Put moves from client through RBAC and Raft commit, then to storage and watchers.
+%% open: active
+%% milestones: M0 M1 M2 M3 M5 M6
+flowchart TB
+  subgraph WP1["Request"]
+    direction LR
+    @{wp-client}
+    @{wp-plane}
+    @{wp-client} -->|sends Put over mTLS| @{wp-plane}
+  end
+  subgraph WP2["Authorize and commit"]
+    direction LR
+    @{rbac-policy}
+    @{wp-leader}
+    @{wp-raft-replicate}
+    @{rbac-policy} -->|checks RBAC policy| @{wp-leader}
+    @{wp-leader} -->|replicates via Raft| @{wp-raft-replicate}
+  end
+  subgraph WP3["Apply to watchers"]
+    direction LR
+    @{wp-apply}
+    @{wp-storage}
+    @{event-journal}
+    @{watch-hub}
+    @{wp-apply} -->|writes a storage batch| @{wp-storage}
+    @{wp-storage} -->|appends a journal entry| @{event-journal}
+    @{event-journal} -->|notifies the watch hub| @{watch-hub}
+  end
+  WP1 -->|"checked against policy"| WP2
+  WP2 -->|"commits, then applies"| WP3

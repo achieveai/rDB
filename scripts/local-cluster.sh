@@ -11,10 +11,18 @@
 #
 # Usage:
 #   scripts/local-cluster.sh up [--nodes N] [--dir DIR] [--base-port PORT] [--timeout-sec N]
-#   scripts/local-cluster.sh down [--dir DIR] [--timeout-sec N]
+#   scripts/local-cluster.sh up --node N [--dir DIR]       start one stopped node of an existing cluster
+#   scripts/local-cluster.sh down [--node N] [--dir DIR] [--timeout-sec N]
 #   scripts/local-cluster.sh status [--dir DIR]
 #   scripts/local-cluster.sh logs --node N [--dir DIR] [--tail N] [--follow]
 #   scripts/local-cluster.sh clean [--dir DIR]
+#
+# Binary: $CARGO_TARGET_DIR (default ./target) / $RETCD_PROFILE (debug, the default, or release)
+# / config-server. Built with `cargo build [--release] -p config-server` if missing.
+#
+# Each node's `pid` file holds the OS pid (on Git Bash: the Windows pid), the same number
+# local-cluster.ps1 writes, so any shell can stop a node another shell started.
+# Bash-only so far: RETCD_PROFILE and `up/down --node N` (samples/retcd-playground/node.sh).
 
 set -euo pipefail
 
@@ -60,20 +68,27 @@ repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd
 }
 
+PROFILE="${RETCD_PROFILE:-debug}"
+case "$PROFILE" in
+    debug | release) ;;
+    *) echo "RETCD_PROFILE must be debug or release, got '$PROFILE'" >&2; exit 2 ;;
+esac
+
 get_binary() {
-    local repo target exe
+    local repo target exe build=(cargo build -p config-server)
     repo="$(repo_root)"
     target="${CARGO_TARGET_DIR:-$repo/target}"
-    exe="$target/debug/config-server"
-    [ -f "$exe" ] || exe="$target/debug/config-server.exe"
+    [ "$PROFILE" = release ] && build+=(--release)
+    exe="$target/$PROFILE/config-server"
+    [ -f "$exe" ] || exe="$target/$PROFILE/config-server.exe"
     if [ ! -f "$exe" ]; then
-        echo "config-server binary not found under $target/debug -- building (cargo build -p config-server)..." >&2
-        (cd "$repo" && cargo build -p config-server)
-        exe="$target/debug/config-server"
-        [ -f "$exe" ] || exe="$target/debug/config-server.exe"
+        echo "config-server binary not found under $target/$PROFILE -- building (${build[*]})..." >&2
+        (cd "$repo" && "${build[@]}")
+        exe="$target/$PROFILE/config-server"
+        [ -f "$exe" ] || exe="$target/$PROFILE/config-server.exe"
     fi
     if [ ! -f "$exe" ]; then
-        echo "config-server binary still not found under $target/debug after building" >&2
+        echo "config-server binary still not found under $target/$PROFILE after building" >&2
         exit 1
     fi
     printf '%s' "$exe"
@@ -261,6 +276,107 @@ new_cluster() {
 }
 
 # ------------------------------------------------------------------------------------------
+# Process identity. A node's `pid` file holds its OS pid on line 1 (on Git Bash the Windows
+# pid, the number local-cluster.ps1 writes) and, from Git Bash, its MSYS pid on line 2. An MSYS
+# pid alone is known only to the MSYS runtime that made it: PowerShell, a new terminal after
+# every Git Bash window closed, or another MSYS install saw a live node as gone, removed its
+# pid file and left it running ("Stopped 0/3").
+# ------------------------------------------------------------------------------------------
+
+is_msys() { case "$(uname -s)" in MINGW* | MSYS* | CYGWIN*) return 0 ;; *) return 1 ;; esac; }
+
+pid_line() {
+    # $1: pid file, $2: line number. Prints that line without CR or spaces.
+    sed -n "$2p" "$1" 2>/dev/null | tr -d '\r '
+}
+
+os_pid_is_server() {
+    # $1: OS pid. True while it is a running config-server. Slow path (~1 s on a busy
+    # Windows host), for a pid this MSYS runtime did not start.
+    [ -n "${1:-}" ] || return 1
+    if is_msys; then
+        ps -W | awk -v p="$1" '$4 == p && /config-server(\.exe)?$/ { found = 1 } END { exit !found }'
+    else
+        [ "$(cat "/proc/$1/comm" 2>/dev/null)" = config-server ]
+    fi
+}
+
+live_pid() {
+    # $1: node_dir. Prints the OS pid if the pid file names a running config-server.
+    local f="$1/pid" os msys
+    os="$(pid_line "$f" 1)"
+    msys="$(pid_line "$f" 2)"
+    [ -n "$os" ] || return 1
+    # Fast path: this MSYS runtime started it and still maps that pid to the same process.
+    if [ -n "$msys" ] && [ "$(cat "/proc/$msys/winpid" 2>/dev/null)" = "$os" ]; then
+        printf '%s' "$os"
+        return 0
+    fi
+    os_pid_is_server "$os" && printf '%s' "$os"
+}
+
+write_pid_file() {
+    # $1: node_dir, $2: `$!` of the config-server just started from this shell. Writes the
+    # pid file. Right after the fork MSYS still reports the forking shell, so wait until the
+    # pid has become config-server.
+    local node_dir="$1" pid="$2" i
+    if [ ! -r "/proc/$pid/winpid" ]; then
+        echo "$pid" > "$node_dir/pid"
+        return 0
+    fi
+    for i in $(seq 1 100); do
+        case "$(cat "/proc/$pid/exename" 2>/dev/null)" in
+            *config-server | *config-server.exe)
+                printf '%s\n%s\n' "$(cat "/proc/$pid/winpid")" "$pid" > "$node_dir/pid"
+                return 0 ;;
+        esac
+        kill -0 "$pid" 2>/dev/null || return 1
+        sleep 0.05
+    done
+    return 1
+}
+
+pid_is_node() {
+    # $1: node_dir, $2: OS pid. True only if that process is config-server running with this
+    # node's stop file. Checked before a hard kill: a dead node's pid can be reused, on this
+    # kind of shared host even by another cluster's config-server.
+    local node_dir="$1" os="$2" msys cmdline want
+    os_pid_is_server "$os" || return 1
+    msys="$(pid_line "$node_dir/pid" 2)"
+    if [ -n "$msys" ] && [ "$(cat "/proc/$msys/winpid" 2>/dev/null)" = "$os" ]; then
+        cmdline="$(tr '\0' ' ' < "/proc/$msys/cmdline")"
+    elif is_msys; then
+        cmdline="$(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=$os').CommandLine" 2>/dev/null)"
+    else
+        cmdline="$(tr '\0' ' ' < "/proc/$os/cmdline" 2>/dev/null)"
+    fi
+    want="$node_dir/stop"
+    command -v cygpath >/dev/null 2>&1 && want="$(cygpath -m "$want")"
+    want="$(printf '%s' "$want" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')"
+    case "$(printf '%s' "$cmdline" | tr '\\' '/' | tr '[:upper:]' '[:lower:]')" in
+        *"$want"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+kill_os_pid() {
+    if is_msys; then taskkill //F //PID "$1" >/dev/null 2>&1 || true; else kill -9 "$1" 2>/dev/null || true; fi
+}
+
+node_answers() {
+    # $1: node_dir. True if this node's health port answers with this node's id and cluster
+    # id: the node is running, whatever its pid file says.
+    local node_dir="$1" health json want_node want_cluster
+    health="$(env_get "$node_dir/node.env" HEALTH)"
+    want_node="$(env_get "$node_dir/node.env" NODE_ID)"
+    want_cluster="$(env_get "$node_dir/../cluster.env" CLUSTER_ID)"
+    json="$(node_health_json "$health")"
+    [ -n "$json" ] || return 1
+    [ "$(json_num_or_null_field "$json" node_id)" = "$want_node" ] \
+        && printf '%s' "$json" | grep -q "\"cluster_id\":\"$want_cluster\""
+}
+
+# ------------------------------------------------------------------------------------------
 # Process lifecycle
 # ------------------------------------------------------------------------------------------
 
@@ -285,7 +401,17 @@ start_node() {
 
     "$bin" "${args[@]}" >"$stdout_file" 2>"$stderr_file" &
     local pid=$!
-    echo "$pid" > "$node_dir/pid"
+    # `$pid` is this shell's own pid for it; the pid file also gets the OS pid ("Process identity").
+    if ! write_pid_file "$node_dir" "$pid"; then
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            echo "node in '$node_dir' started, but its OS pid could not be found; stopped it." >&2
+        else
+            echo "node in '$node_dir' exited at start:" >&2
+            cat "$stderr_file" >&2 2>/dev/null || true
+        fi
+        return 1
+    fi
 
     local deadline=$(( $(date +%s) + TIMEOUT_SEC ))
     local ready_line=""
@@ -295,6 +421,7 @@ start_node() {
             [ -n "$ready_line" ] && break
         fi
         if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$node_dir/pid"
             echo "node in '$node_dir' exited before printing a ready line:" >&2
             cat "$stderr_file" >&2 2>/dev/null || true
             return 1
@@ -307,31 +434,43 @@ start_node() {
     fi
 }
 
+node_running() {
+    # $1: node_dir, $2: OS pid ("" when none is on record). True while the node runs.
+    if [ -n "$2" ]; then live_pid "$1" >/dev/null; else node_answers "$1"; fi
+}
+
 stop_node() {
-    # $1: node_dir, $2: timeout seconds. Returns 0 and prints "stopped" if it stopped a process.
+    # $1: node_dir, $2: timeout seconds. Returns 0 if it stopped a running node, 1 if the node
+    # was not running, 2 if it is still running.
     local node_dir="$1" timeout="${2:-15}"
-    local pid_file="$node_dir/pid"
-    [ -f "$pid_file" ] || return 1
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null || true)"
-    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    local pid_file="$node_dir/pid" pid
+    pid="$(live_pid "$node_dir" || true)"
+    if [ -z "$pid" ]; then
         rm -f "$pid_file"
-        return 1
+        # No live pid on record (lost pid file, or an MSYS pid from an older script). The
+        # node may still run: its own health port says so.
+        node_answers "$node_dir" || return 1
+        echo "  node in '$node_dir' has no live pid on record but answers on its health port; asking it to stop" >&2
     fi
 
     # The documented mechanism (crates/config-server/README.md "Shutdown"): the daemon polls
     # this file every 100ms and drains on its own. Works identically on Windows, which has no
-    # SIGTERM.
+    # SIGTERM. Only this node reads its own stop file, so it is safe with no pid at all.
     : > "$node_dir/stop"
 
     local deadline=$(( $(date +%s) + timeout ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
-        kill -0 "$pid" 2>/dev/null || break
+        node_running "$node_dir" "$pid" || break
         sleep 0.15
     done
-    if kill -0 "$pid" 2>/dev/null; then
-        echo "  node in '$node_dir' (pid $pid) did not exit within ${timeout}s; killing" >&2
-        kill -9 "$pid" 2>/dev/null || true
+    if node_running "$node_dir" "$pid"; then
+        if [ -n "$pid" ] && pid_is_node "$node_dir" "$pid"; then
+            echo "  node in '$node_dir' (pid $pid) did not exit within ${timeout}s; killing" >&2
+            kill_os_pid "$pid"
+        else
+            echo "  node in '$node_dir' did not exit within ${timeout}s and its process is not identified (pid '${pid:-none}'); NOT killed. Stop it by hand." >&2
+            return 2
+        fi
     fi
     rm -f "$pid_file"
     return 0
@@ -363,13 +502,15 @@ node_row() {
     gossip="$(env_get "$node_dir/node.env" GOSSIP)"
     health="$(env_get "$node_dir/node.env" HEALTH)"
     pid="-"
-    if [ -f "$node_dir/pid" ]; then
-        local candidate
-        candidate="$(cat "$node_dir/pid" 2>/dev/null || true)"
-        if [ -n "$candidate" ] && kill -0 "$candidate" 2>/dev/null; then
-            pid="$candidate"
-            running=1
-        fi
+    local candidate
+    if candidate="$(live_pid "$node_dir")"; then
+        pid="$candidate"
+        running=1
+    fi
+    # Running with no live pid on record: `down` still stops it (by its stop file).
+    if [ "$running" = "0" ] && node_answers "$node_dir"; then
+        pid="unknown"
+        running=1
     fi
     if [ "$running" = "1" ]; then
         local json
@@ -435,10 +576,30 @@ wait_cluster_formed() {
 # Subcommands
 # ------------------------------------------------------------------------------------------
 
+cmd_up_one() {
+    # up --node N: start one stopped node of an existing cluster (no --form).
+    local dir_full node_dir
+    dir_full="$(resolve_dir "$DIR" no-create)"
+    node_dir="$dir_full/node-$NODE_ARG"
+    if [ ! -f "$dir_full/cluster.env" ] || [ ! -f "$node_dir/node.env" ]; then
+        echo "no node $NODE_ARG in '$dir_full'. Start the cluster first: $0 up --dir $DIR" >&2
+        exit 1
+    fi
+    if [ "$(node_row "$node_dir" | cut -f6)" = "1" ]; then
+        echo "node $NODE_ARG is already running"
+        return 0
+    fi
+    echo "binary: $(get_binary)"
+    start_node "$node_dir"
+    echo "node $NODE_ARG started (pid $(pid_line "$node_dir/pid" 1))"
+}
+
 cmd_up() {
+    [ -n "$NODE_ARG" ] && { cmd_up_one; return; }
     local dir_full
     dir_full="$(resolve_dir "$DIR" create)"
     local cluster_env="$dir_full/cluster.env"
+    echo "binary: $(get_binary)"
 
     local node_count
     if [ -f "$cluster_env" ]; then
@@ -499,14 +660,27 @@ cmd_down() {
         echo "no cluster at '$dir_full'"
         return 0
     fi
-    local node_count stopped=0 i
+    local node_count stopped=0 left=0 i rc nodes
     node_count="$(env_get "$cluster_env" NODE_COUNT)"
-    for i in $(seq 1 "$node_count"); do
-        if stop_node "$dir_full/node-$i" "$TIMEOUT_SEC"; then
-            stopped=$((stopped + 1))
-        fi
+    nodes="$(seq 1 "$node_count")"
+    if [ -n "$NODE_ARG" ]; then
+        [ -f "$dir_full/node-$NODE_ARG/node.env" ] || { echo "no node $NODE_ARG in '$dir_full'" >&2; exit 1; }
+        nodes="$NODE_ARG"
+    fi
+    for i in $nodes; do
+        rc=0
+        stop_node "$dir_full/node-$i" "$TIMEOUT_SEC" || rc=$?
+        case "$rc" in
+            0) stopped=$((stopped + 1)); echo "  node $i stopped" ;;
+            1) echo "  node $i was not running" ;;
+            *) left=$((left + 1)) ;;
+        esac
     done
-    echo "Stopped $stopped/$node_count node(s) in '$dir_full'."
+    echo "Stopped $stopped/$(echo "$nodes" | wc -w | tr -d ' ') node(s) in '$dir_full'."
+    if [ "$left" -gt 0 ]; then
+        echo "$left node(s) still running; see above." >&2
+        return 1
+    fi
 }
 
 cmd_status() {

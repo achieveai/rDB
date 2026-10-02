@@ -46,6 +46,22 @@ pub struct Sources {
     /// under `tls.mode = "insecure"`, which omits the series rather than exporting a zero that
     /// would read as "expires now".
     pub tls: Option<Arc<config_grpc::TlsRotator>>,
+    /// The bound client-plane address, the same string the ready line prints as `client`.
+    ///
+    /// Daemon-owned like the three above: the engine knows the committed membership's client
+    /// endpoints, but not which socket this process actually bound.
+    pub client: String,
+}
+
+/// What `GET /health` serializes: the engine's payload plus the facts only the daemon holds.
+///
+/// `flatten` keeps every engine field at the top level, so the addition is a new key and not a
+/// wrapper that would move the existing ones (ADR-0018 §3, note of 2026-10-01).
+#[derive(serde::Serialize)]
+struct HealthResponse<'a> {
+    #[serde(flatten)]
+    payload: &'a config_engine::HealthPayload,
+    client: &'a str,
 }
 
 /// Now, in seconds since the Unix epoch.
@@ -143,7 +159,11 @@ async fn handle(
             payload.policy_state = Some(state);
             payload.policy_version = version;
         }
-        match serde_json::to_vec(&payload) {
+        let response = HealthResponse {
+            payload: &payload,
+            client: &sources.client,
+        };
+        match serde_json::to_vec(&response) {
             Ok(body) => http_response(200, "OK", "application/json", &body),
             Err(e) => {
                 tracing::error!(error = %e, "health payload did not serialize");

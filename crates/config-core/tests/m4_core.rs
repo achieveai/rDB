@@ -237,6 +237,14 @@ fn m4_06_compact_is_monotonic() {
         dedup_trim_below: None,
     });
     assert_eq!(state.compact_revision(), 4);
+    // The watermark alone cannot tell a no-op from a re-application, because both leave it at
+    // 4. `compactions()` can: it counts only the compactions that advanced it (state.rs:397).
+    // Without this the equal-watermark case below asserts "still answers" and not "no-op" --
+    // weakening the guard to `clamped < self.compact_revision` left every assertion in this
+    // row green while `Compact(4)` counted as applied and logged `outcome = "applied"`
+    // (M4 manual-test mutation 3, 2026-09-21: 27 passed in config-storage m4_journal,
+    // 16 in config-core m4_core, 12 in config-testkit m4_journal_cluster, all green).
+    let applied_before = state.compactions();
 
     for below in [0u64, 1, 3, 4] {
         let response = state.apply(&Command::Compact {
@@ -251,6 +259,11 @@ fn m4_06_compact_is_monotonic() {
             "Compact({below}) below the watermark must be an answering no-op"
         );
         assert_eq!(state.compact_revision(), 4);
+        assert_eq!(
+            state.compactions(),
+            applied_before,
+            "Compact({below}) must not count as a compaction that advanced the watermark"
+        );
     }
 
     assert_eq!(

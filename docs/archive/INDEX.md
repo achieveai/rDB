@@ -10,6 +10,8 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | Folder (date-milestone-commit) |
 |---|
 | progress/2026-09-19-M6-4f6f7e5 |
+| progress/2026-09-20-M6-c3fe56b |
+| progress/2026-09-22-M7-395d535 |
 
 ## Work notes
 
@@ -19,6 +21,89 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | work/local-cluster-quickstart/research-notes.md | Local cluster quickstart — research notes (dev-quickstart, 2026-09-19) |
 | work/m0-config-core-delivery/research.md | M0 `config-core` — research notes |
 | work/m1-grpc-client-correction-round-1/research.md | Correction round 1 — config-grpc / config-client |
+| work/rdb-partition-database/adr-0027-g13-amendment.md | Amendment to ADR-0027: G-13 is evidence, not a gate |
+| work/rdb-partition-database/ledger.md | Execution ledger — rDB partition database |
+| work/rdb-partition-database/m6-gap-triage.md | M6 gap triage |
+| work/rdb-partition-database/plan-01-rdb-kickoff.md | Plan: rDB partition database — ADRs, work breakdown, tracking |
+| work/rdb-partition-database/plan-m7-completion.md | Plan: M7 complete, gated, and only then a PR |
+| work/rdb-partition-database/progress-refresh-log.md | - 2026-09-21T05:10:05.541Z refresh: ledger.line=0 git_head=d8b3877 (build.mjs) |
+| work/rdb-partition-database/q17-cells.md | Q-17 replacement cells (architect, 2026-09-20) |
+| work/rdb-partition-database/research-notes.md | Partition database (rdb-* docs) — research notes (lead, 2026-09-20) |
+| work/rdb-partition-database/seam-freeze.md | Seam freeze — the five cross-team types, frozen 2026-09-22 |
+| work/rdb-partition-database/team-rules.md | rDB team rules (lead, 2026-09-20) |
+| work/rdb-partition-database/teams/foundation/architect-handoff.md | Team foundation — architect handoff |
+| work/rdb-partition-database/teams/foundation/charter.md | Team foundation — charter (M7) |
+| work/rdb-partition-database/teams/foundation/contract-asks-round2.md | Foundation contract asks — round 2, consolidated |
+| work/rdb-partition-database/teams/foundation/critic-contracts-freeze-r2.md | Critique — M7 Foundation Contracts Freeze, **round 2** |
+| work/rdb-partition-database/teams/foundation/critic-contracts-freeze-r3.md | Critic — foundation contracts freeze, round 3 |
+| work/rdb-partition-database/teams/foundation/critic-contracts-freeze.md | Critic — M7 Foundation Contracts Freeze |
+| work/rdb-partition-database/teams/foundation/critic-design.md | Critic round 1 — team `foundation` |
+| work/rdb-partition-database/teams/foundation/critic-g13-amendment.md | Critic: adversarial read of the ADR-0027 G-13 amendment |
+| work/rdb-partition-database/teams/foundation/critic-round2.md | Team foundation — critic, round 2 (design + code, one pass) |
+| work/rdb-partition-database/teams/foundation/design-contracts-freeze.md | M7 Foundation Contracts Freeze — Design Record |
+| work/rdb-partition-database/teams/foundation/design.md | Team foundation — design (architect, 2026-09-20) |
+| work/rdb-partition-database/teams/foundation/dev-g13-repro-handoff.md | Developer handoff — G-13 floor reproduction (team foundation) |
+| work/rdb-partition-database/teams/foundation/dev-notes.md | Team foundation — developer notes (C0, 2026-09-20) |
+| work/rdb-partition-database/teams/foundation/dev-r2-handoff.md | dev-foundation-r2 handoff |
+| work/rdb-partition-database/teams/foundation/dev-r2-research.md | dev-foundation-r2 — research before the edits |
+| work/rdb-partition-database/teams/foundation/dev-reach/checklist.md | Dev "reach" checklist — M7 foundation |
+| work/rdb-partition-database/teams/foundation/dev-reach-handoff.md | Developer handoff — M7 foundation "reach" |
+| work/rdb-partition-database/teams/foundation/developer-handoff.md | Team foundation — developer handoff (package C0) |
+| work/rdb-partition-database/teams/foundation/drift-reread-handoff.md | M7 contract-drift re-read — handoff |
+| work/rdb-partition-database/teams/foundation/manual-test-plan-contracts-freeze.md | Manual test plan — M7 foundation contracts freeze |
+| work/rdb-partition-database/teams/foundation/manual-tester-handoff.md | Manual tester handoff — round 2 (CB-8 sweep follow-up) |
+| work/rdb-partition-database/teams/foundation/research.md | Team foundation — research notes (architect, 2026-09-20) |
+| work/rdb-partition-database/teams/foundation/rows-foundation-2-handoff.md | rows-foundation-2 — the six owed foundation rows |
+| work/rdb-partition-database/teams/foundation/rows-foundation-checklist.md | rows-foundation — checklist |
+| work/rdb-partition-database/teams/foundation/rows-foundation-handoff.md | Rows handoff — M7 foundation |
+| work/rdb-partition-database/teams/foundation/test-planner-handoff.md | Test-planner handoff — team foundation, round 1 |
+| work/rdb-partition-database/teams/foundation/tester-foundation-hand.md | THUMBS UP |
+| work/rdb-partition-database/teams/kernel-a/architect-handoff.md | kernel-a — architect handoff (2026-09-20) |
+| work/rdb-partition-database/teams/kernel-a/charter.md | Team kernel-a — charter (M7) |
+| work/rdb-partition-database/teams/kernel-a/critic-design.md | kernel-a — critic round 1 (2026-09-20) |
+| work/rdb-partition-database/teams/kernel-a/critic-round3.md | Critic — kernel-a M7 test plan, round 3 (of the critic series; reviewing planner round 4) |
+| work/rdb-partition-database/teams/kernel-a/critic-tests.md | Critic — kernel-a round 3 design diff and the test plan as the developer's basis |
+| work/rdb-partition-database/teams/kernel-a/design.md | kernel-a — design note (architect, 2026-09-20) |
+| work/rdb-partition-database/teams/kernel-a/developer-handoff.md | kernel-a — developer handoff (2026-09-21) |
+| work/rdb-partition-database/teams/kernel-a/manual-tester-handoff.md | Manual mutation-test pass — kernel-a authority.rs (M7A-28/29/32/33) |
+| work/rdb-partition-database/teams/kernel-a/reach-spec.md | Kernel-a A1 — reach specification |
+| work/rdb-partition-database/teams/kernel-a/research.md | kernel-a — research notes (architect, 2026-09-20) |
+| work/rdb-partition-database/teams/kernel-a/test-planner-handoff.md | kernel-a — test planner handoff (2026-09-20, first pass) |
+| work/rdb-partition-database/teams/kernel-a/tester-reach-handoff.md | Kernel-a A1 reach — manual tester handoff |
+| work/rdb-partition-database/teams/kernel-b/architect-handoff.md | kernel-b — architect handoff |
+| work/rdb-partition-database/teams/kernel-b/charter.md | Team kernel-b — charter (M7) |
+| work/rdb-partition-database/teams/kernel-b/critic-design.md | kernel-b — critic round 1 on the architect's design and ADRs 0005 / 0006 / 0009 |
+| work/rdb-partition-database/teams/kernel-b/critic-tests.md | Kernel-b critic: round-4 diff check (K-B-51/52) and test-plan review |
+| work/rdb-partition-database/teams/kernel-b/design.md | kernel-b design — replication, protection, recovery (R1, L1, F1) |
+| work/rdb-partition-database/teams/kernel-b/manual-tester-handoff.md | Manual tester handoff — kernel-b (plan-vs-tree, no code landed) |
+| work/rdb-partition-database/teams/kernel-b/research.md | kernel-b research — prefix agreement, ancestry, and loss-accepting election |
+| work/rdb-partition-database/teams/kernel-b/test-planner-handoff.md | Kernel-b test planner handoff |
+| work/rdb-partition-database/teams/m0-m1/manual-tester-handoff.md | M0/M1 Manual Tester Handoff |
+| work/rdb-partition-database/teams/m2-m3/manual-tester-handoff.md | M2/M3 Manual Test Pass — Handoff |
+| work/rdb-partition-database/teams/m4/manual-tester-handoff.md | M4 Manual Tester Handoff — TAKEN OVER MID-RUN |
+| work/rdb-partition-database/teams/m5/manual-tester-handoff.md | M5 Manual Tester Handoff |
+| work/rdb-partition-database/teams/m6/dev-backup-handoff.md | dev-backup handoff — M6-33 and M6-35 |
+| work/rdb-partition-database/teams/m6/dev-grpc-checklist.md | dev-m6-grpc — task checklist (G-11, G-01) |
+| work/rdb-partition-database/teams/m6/dev-grpc-handoff.md | dev-m6-grpc handoff — G-11 and G-01 |
+| work/rdb-partition-database/teams/m6/dev-pagination-checklist.md | dev-pagination checklist — G-04, M6-81 |
+| work/rdb-partition-database/teams/m6/dev-pagination-handoff.md | dev-pagination handoff — G-04 and M6-81 |
+| work/rdb-partition-database/teams/m6/dev-pagination-notes.md | dev-pagination — research notes (G-04, M6-81) |
+| work/rdb-partition-database/teams/m6/dev-policy-handoff.md | M6 policy-plane gap fixes — handoff (dev-m6-policy) |
+| work/rdb-partition-database/teams/m6/dev-policy-notes.md | dev-policy working notes — M6 G-06 / G-09 / G-07 |
+| work/rdb-partition-database/teams/m6/manual-tester-handoff.md | M6 Manual Tester Handoff — feature/rdb-m7 (096bbfa gap-close) |
+| work/rdb-partition-database/teams/verification/architect-handoff.md | Handoff — team verification, architect (2026-09-20) |
+| work/rdb-partition-database/teams/verification/charter.md | Team verification — charter (M7) |
+| work/rdb-partition-database/teams/verification/code-review.md | Code review — verification O1 oracle, G1 grammar / generator / reducer |
+| work/rdb-partition-database/teams/verification/critic-design.md | Team verification — critic, round 1 (2026-09-20) |
+| work/rdb-partition-database/teams/verification/critic-tests.md | Critic round 2 — the M7 verification test plan |
+| work/rdb-partition-database/teams/verification/design.md | Team verification — design (architect, 2026-09-20) |
+| work/rdb-partition-database/teams/verification/dev-r2-handoff.md | dev-verification-r2 — correction round 1 handoff |
+| work/rdb-partition-database/teams/verification/developer-handoff.md | Verification developer handoff — O1 oracle, G1 grammar / generator / reducer |
+| work/rdb-partition-database/teams/verification/manual-tester-handoff.md | Manual tester handoff — M7 verification pass at fe5b824 |
+| work/rdb-partition-database/teams/verification/research.md | Research — team verification (architect, 2026-09-20) |
+| work/rdb-partition-database/teams/verification/test-planner-handoff.md | Handoff — team verification, test planner (2026-09-20) |
+| work/rdb-partition-database/teams/verification/trace-requirements.md | Trace requirements — team verification to team foundation (via the lead) |
+| work/rdb-partition-database/vacuous-row-sweep.md | Vacuous-row sweep — M7 foundation, kernel-b, verification |
 | work/retcd-m0-m3-implementation/dev-engine-obs-m1-47-48-a10.md | dev-engine-obs: M1-47, M1-48, A10 (2026-09-18) |
 | work/retcd-m0-m3-implementation/dev-fix-library-notes.md | dev-fix-library (L1..L7) — research notes, 2026-09-18 |
 | work/retcd-m0-m3-implementation/dev-grpc-2-r1r3-research.md | dev-grpc-2: research for lead rulings R1/R2/R3 (2026-09-18) |
@@ -73,6 +158,9 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | work/retcd-m4-m6-implementation/progress-refresh-log.md | Progress report refresh log |
 | work/retcd-m4-m6-implementation/progress-rule-map.md | Rule map: SKILL.before.md -> new homes |
 | work/retcd-m4-m6-implementation/progress-skills-split-plan.md | Plan: split the report skill into one skill per component |
+| work/retcd-m4-m6-implementation/review-brief.md | Final review brief: rEtcd feature/m4-m6 vs main (read this first) |
+| work/retcd-m4-m6-implementation/review-final-findings.md | Final review of feature/m4-m6: collected findings |
+| work/retcd-m4-m6-implementation/review-m6-files.txt | crates/config-core/src/lib.rs |
 | work/retcd-m4-m6-implementation/SKILL.before.md | Accessible progress report |
 | work/retcd-m4-m6-implementation/tester-m4b-handoff.md | tester-m4b handoff (draft, in progress) |
 | work/retcd-m4-m6-implementation/tester-m5a-notes.md | tester-m5a — M5 test rows: snapshots, purge, membership, fencing, backup/restore |
@@ -82,6 +170,7 @@ Rebuild one: `node docs/progress/build.mjs --src <folder> --out old.html`.
 | work/retcd-m4-m6-implementation/tester-m6c-notes.md | tester-m6c notes |
 | work/retcd-m4-m6-implementation/tester-m6d-notes.md | tester-m6d notes — E2E-45, E2E-41, E2E-43 |
 | work/retcd-m4-m6-implementation/tester-m6e-notes.md | tester-m6e — M6 test plan §4.2 rotation rows (M6-49..M6-56, M6-60) — working notes |
+| work/retcd-m4-m6-implementation/w1-config-server-findings/checklist.md | w1 — config-server review findings |
 
 ## Older report pages in git history
 
@@ -89,6 +178,8 @@ View one: `git show <commit>:docs/progress/index.html > old.html`.
 
 | Commit | Date | Subject |
 |---|---|---|
+| 31904f8 | 2026-09-19 | docs: record the gate result and the target-dir collision in the ledger |
+| 6f925bb | 2026-09-19 | chore(progress): dashboard pipeline, archive tooling and agent instructions |
 | 4f6f7e5 | 2026-09-19 | feat(m6): signed RBAC, TLS/gossip-key rotation, mixed-version gate, evidence, local cluster |
 | e54c6ef | 2026-09-19 | feat(m5): snapshots, log purge, admin plane, backup/restore, bounded dedup; M6 rbac + pagination |
 | 33b5f4b | 2026-09-19 | feat(m4): watch hub, journal gate, retention compaction, envelope v2; M5/M6 in progress |

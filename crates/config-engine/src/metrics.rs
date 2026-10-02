@@ -647,6 +647,23 @@ pub struct PolicyMetrics {
     /// whole process lifetime (OQ-57), so an operator must be able to alert on a node that is
     /// still running with it set.
     pub break_glass_active: bool,
+    /// Whether this node could not read its durable rollback floor at startup (G-09).
+    ///
+    /// A gauge for the same reason as [`Self::break_glass_active`], and it is the same kind of
+    /// fact: rollback protection is off for the life of this boot, so a validly signed older
+    /// document would be accepted. The node starts anyway and logs `policy_floor_unreadable`
+    /// at `error`, because refusing to start over one unreadable cell would turn a degraded
+    /// disk — or a bug in the read path, which is *not* independent across nodes — into a
+    /// cluster-wide client-plane outage (ADR-0027). A log line alone is too thin for a
+    /// security control that has silently weakened; this is the surface an alert watches.
+    pub floor_unreadable: bool,
+    /// Whether the version now in force has not yet reached the durable rollback floor
+    /// (R2-F003).
+    ///
+    /// Set by a failed floor write and cleared by the reload whose retry lands. While it is
+    /// set, a restart would accept a validly signed document older than the one this node is
+    /// serving. A gauge for the same reason as [`Self::floor_unreadable`].
+    pub floor_unpersisted: bool,
 }
 
 /// What this node's credential rotation has done since it started (M6, ADR-0028).
@@ -1262,6 +1279,28 @@ impl MetricsReport {
                 "retcd_break_glass_active",
                 &node,
                 u64::from(policy.break_glass_active) as f64,
+            );
+
+            e.metric(
+                "retcd_policy_floor_unreadable",
+                "gauge",
+                "1 while this node could not read its durable policy rollback floor (G-09)",
+            );
+            e.sample(
+                "retcd_policy_floor_unreadable",
+                &node,
+                u64::from(policy.floor_unreadable) as f64,
+            );
+
+            e.metric(
+                "retcd_policy_floor_unpersisted",
+                "gauge",
+                "1 while the policy version in force has not reached the durable rollback floor",
+            );
+            e.sample(
+                "retcd_policy_floor_unpersisted",
+                &node,
+                u64::from(policy.floor_unpersisted) as f64,
             );
         }
 

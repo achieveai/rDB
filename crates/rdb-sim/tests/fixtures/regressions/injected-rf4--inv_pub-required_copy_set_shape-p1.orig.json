@@ -1,0 +1,483 @@
+{
+  "schema_version": 1,
+  "generator_version": 1,
+  "provenance": {
+    "Authored": {
+      "case": "injected_rf4_copy_set_shape"
+    }
+  },
+  "topology": {
+    "nodes": 4,
+    "partitions": 1,
+    "config_version_0": 1,
+    "placements": [
+      {
+        "partition": 1,
+        "node": 1,
+        "role": "Primary"
+      },
+      {
+        "partition": 1,
+        "node": 2,
+        "role": "RegularSecondary"
+      },
+      {
+        "partition": 1,
+        "node": 3,
+        "role": "RegularSecondary"
+      },
+      {
+        "partition": 1,
+        "node": 4,
+        "role": "RegularSecondary"
+      }
+    ]
+  },
+  "budget": {
+    "max_events": 2000,
+    "max_ticks": 12000
+  },
+  "ops": [
+    {
+      "Recovery": {
+        "Synchronize": {
+          "node": 1,
+          "to": 100
+        }
+      }
+    },
+    {
+      "Recovery": {
+        "Transfer": {
+          "partition": 1,
+          "node": 2,
+          "received": 100,
+          "advertised": 150,
+          "per_step": 10,
+          "step_ticks": 1500
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 2
+        }
+      }
+    },
+    {
+      "Recovery": {
+        "InspectSurvivors": {
+          "partition": 1,
+          "window": 2000
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 1,
+          "digest_id": 1,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            1
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 2,
+          "digest_id": 2,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            2
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 3,
+          "digest_id": 3,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            3
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 4,
+          "digest_id": 4,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            4
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 5,
+          "digest_id": 5,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            5
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 6,
+          "digest_id": 6,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            6
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 7,
+          "digest_id": 7,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            7
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 8,
+          "digest_id": 8,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            8
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 9,
+          "digest_id": 9,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            9
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 10,
+          "digest_id": 10,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            10
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 11,
+          "digest_id": 11,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            11
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 12,
+          "digest_id": 12,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            12
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 13,
+          "digest_id": 13,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            13
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 14,
+          "digest_id": 14,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            14
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 15,
+          "digest_id": 15,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            15
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 16,
+          "digest_id": 16,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            16
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 170
+        }
+      }
+    },
+    {
+      "Client": {
+        "Submit": {
+          "partition": 1,
+          "tenant": 1,
+          "client": 1,
+          "request": 17,
+          "digest_id": 17,
+          "affinity": 1,
+          "expected_generation": null,
+          "keys": [
+            17
+          ]
+        }
+      }
+    },
+    {
+      "Time": {
+        "Advance": {
+          "ticks": 108
+        }
+      }
+    },
+    {
+      "Time": {
+        "Pause": {
+          "node": 2,
+          "ticks": 9000
+        }
+      }
+    }
+  ]
+}

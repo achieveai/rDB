@@ -1,13 +1,48 @@
 {
-  "from": { "ledger_line": 711, "git_head": "6f925bb" },
-  "to": { "ledger_line": 720, "git_head": "c5fcfe5" },
+  "from": { "ledger_line": 4453, "git_head": "395d535" },
+  "to": { "ledger_line": 5232, "git_head": "5720f79" },
   "items": [
     {
+      "kind": "verdict",
+      "milestone": "M7",
+      "summary": "M7 live-tree census at stop point. Foundation 50/56 built, 0 owed. Kernel-a 61/174 built, 113 owed. Kernel-b 116/148 built, 32 owed. Verification 65/91 built, 26 owed.",
+      "evidence": "ledger:5227",
+      "parts": ["rdb-authority", "rdb-kernel-a", "rdb-kernel-b", "rdb-oracle"]
+    },
+    {
+      "kind": "ruling",
+      "milestone": "M7",
+      "summary": "B-R46e: pending store keeps latest report matching active store. Port f06 and f06b as rows; sim routing carried.",
+      "evidence": "ledger:5216",
+      "parts": ["rdb-kernel-b"]
+    },
+    {
+      "kind": "ruling",
+      "milestone": "M7",
+      "summary": "B-R48a: Busy/AlreadyHave updates existing cursor only, never creates. Drop cursor on copy retirement.",
+      "evidence": "ledger:5227",
+      "parts": ["rdb-kernel-b"]
+    },
+    {
+      "kind": "ruling",
+      "milestone": "M7",
+      "summary": "B-R49a: D-3 accepted as ruled. Port probe_ec_117 as row; add Collecting case to M7B-114.",
+      "evidence": "ledger:5222",
+      "parts": ["rdb-kernel-b"]
+    },
+    {
+      "kind": "decision",
+      "milestone": "M7",
+      "summary": "Gautam pause at milestone stop point. Progress cron 948e42e6 deleted; manual refresh only.",
+      "evidence": "ledger:5215",
+      "parts": []
+    },
+    {
       "kind": "note",
-      "milestone": "M6",
-      "summary": "Second gate collision when two gates ran simultaneously. Linker could not overwrite m6_rotation binary.",
-      "evidence": "ledger:715",
-      "parts": ["tls-rotation"]
+      "milestone": "M7",
+      "summary": "Multiple test exports deleted outside session; mkexport.sh needs new git archive base. Disk freed to 62 GB.",
+      "evidence": "ledger:5220",
+      "parts": []
     }
   ]
 }

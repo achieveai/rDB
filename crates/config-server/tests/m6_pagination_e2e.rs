@@ -332,7 +332,8 @@ async fn m6_32_a_policy_adoption_invalidates_an_outstanding_page_token() {
         matches!(
             error,
             ConfigError::PageTokenExpired {
-                reason: PageTokenExpiredReason::PolicyVersion
+                reason: PageTokenExpiredReason::PolicyVersion,
+                ..
             }
         ),
         "the grants the walk started under are no longer in force, and the refusal has to say \

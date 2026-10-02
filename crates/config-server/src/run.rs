@@ -65,6 +65,16 @@ use crate::{health, manifest};
 /// and far above any cost worth measuring.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(100);
 
+/// Added to the engine's longest per-request bound to give the client plane's drain its own.
+///
+/// Ending the watch hub ends every Watch on the server side, but a stream's last frames and
+/// its trailers still have to cross HTTP/2 flow control, and a client that has stopped reading
+/// never reopens its window. The drain would wait on that stream for as long as the client
+/// stays connected. No unary call can outlive `write_timeout`/`read_timeout` on the server, so
+/// anything still open past that bound plus this slack is a stream to a client that is not
+/// reading, and the stop goes on without it.
+const CLIENT_DRAIN_SLACK: Duration = Duration::from_secs(2);
+
 /// What the process exits with (ADR-0018 §5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -361,22 +371,35 @@ impl config_grpc::AdminBackend for NodeBackend {
         // call arrived. Comparing ids rather than indexes is what makes an idle cluster work:
         // a build at an unchanged last_log_id still gets a fresh id (ADR-0022), so an operator
         // taking two backups of a quiet cluster gets two fresh exports rather than a hang.
-        let before = store.snapshot_meta().map(|m| m.snapshot_id);
-        self.node.trigger_snapshot().await?;
-        let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
-        let meta = loop {
-            match store.snapshot_meta() {
-                Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break meta,
-                _ if tokio::time::Instant::now() >= deadline => {
-                    return Err(config_engine::AdminError::Unavailable {
-                        reason: format!(
-                            "no snapshot was published within {}s of the trigger",
-                            BACKUP_BUILD_DEADLINE.as_secs()
-                        ),
-                    })
+        let capture = async {
+            let before = store.snapshot_meta().map(|m| m.snapshot_id);
+            self.node.trigger_snapshot().await?;
+            let deadline = tokio::time::Instant::now() + BACKUP_BUILD_DEADLINE;
+            loop {
+                match store.snapshot_meta() {
+                    Some(meta) if Some(&meta.snapshot_id) != before.as_ref() => break Ok(meta),
+                    _ if tokio::time::Instant::now() >= deadline => {
+                        break Err(config_engine::AdminError::Unavailable {
+                            reason: format!(
+                                "no snapshot was published within {}s of the trigger",
+                                BACKUP_BUILD_DEADLINE.as_secs()
+                            ),
+                        })
+                    }
+                    _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
                 }
-                _ => tokio::time::sleep(BACKUP_POLL_INTERVAL).await,
             }
+        };
+        // M6-33: the policy version the artifact names. Sampled before the trigger and again
+        // after publication, by `PolicyLoader::version_across`: it is `Some` only when no
+        // adoption landed in between, so the version named was in force for the whole
+        // capture. A reload in that window makes it `None` rather than the newer version
+        // (R2-F008). Also `None` under static mode and on a signed-mode node holding no valid
+        // document. It names the version this node was enforcing while the snapshot was taken,
+        // not the document any one entry was written under.
+        let (meta, policy_version) = match &self.policy {
+            Some(loader) => loader.version_across(capture).await?,
+            None => (capture.await?, None),
         };
 
         let snap_path = config_storage::snapshot::snap_path(store.path(), &meta.snapshot_id);
@@ -413,7 +436,7 @@ impl config_grpc::AdminBackend for NodeBackend {
                     trust_key: None,
                     encryption_key: encryption_key.as_deref(),
                 };
-                backup::finish_artifact(&header, &scratch, &dest_dir, &name, &keys)
+                backup::finish_artifact(&header, &scratch, &dest_dir, &name, &keys, policy_version)
             })();
             // This task created the scratch file, so this task removes it — on both paths.
             let _ = std::fs::remove_file(&scratch);
@@ -615,6 +638,8 @@ struct Running {
     /// plane that must not have its credentials replaced underneath it.
     tls_shutdown: Option<Arc<tokio::sync::Notify>>,
     tls_task: Option<tokio::task::JoinHandle<()>>,
+    /// How long the client plane may take to drain (see [`CLIENT_DRAIN_SLACK`]).
+    client_drain_bound: Duration,
 }
 
 /// Start, serve, and shut down. Returns the process exit code.
@@ -665,7 +690,13 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     };
 
     // ---- 3. policy -------------------------------------------------------------------
-    let policy = load_authorizer(&cfg, &cli, &watch);
+    let policy = load_authorizer(
+        &cfg,
+        &cli,
+        &watch,
+        identity.cluster_id,
+        crate::policy::version_floor(&storage),
+    );
 
     // ---- 4. bind ---------------------------------------------------------------------
     let tls = tls_mode(&cfg)?;
@@ -720,6 +751,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
     // Read out before `node_cfg` is moved into the node: both planes and the peer transport
     // size their codecs from the same caps this node enforces (ADR-0010 fix-round note).
     let limits = node_cfg.limits;
+    let client_drain_bound = node_cfg.write_timeout.max(node_cfg.read_timeout) + CLIENT_DRAIN_SLACK;
 
     let transport = GrpcPeerTransport::new(tls.clone(), config_engine::NetFault::new(), limits);
     // The same transport, kept concretely. The node only ever wants a `dyn PeerTransport`, but
@@ -766,6 +798,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
         policy_task: None,
         tls_shutdown: None,
         tls_task: None,
+        client_drain_bound,
     };
 
     if let Some(verified) = verified {
@@ -875,6 +908,7 @@ pub async fn run(cfg: ServerConfig, cli: Cli) -> Result<ExitCode, Fatal> {
                 pagination: Some(Arc::clone(&paginator)),
                 policy: policy.loader.clone(),
                 tls: tls_rotator.clone(),
+                client: client_endpoint.clone(),
             },
             Arc::clone(&notify),
             cfg.metrics_enabled,
@@ -1014,6 +1048,8 @@ fn load_authorizer(
     cfg: &ServerConfig,
     cli: &Cli,
     watch: &Arc<config_engine::WatchHub>,
+    expected_cluster: config_core::ClusterId,
+    floor: Option<Arc<dyn crate::policy::PolicyVersionFloor>>,
 ) -> LoadedPolicy {
     if cli.dev_allow_all {
         tracing::warn!(
@@ -1022,7 +1058,7 @@ fn load_authorizer(
         return LoadedPolicy::without_document(Arc::new(AllowAll), AuthzKind::Development);
     }
     if cfg.signed_policy.is_some() {
-        return load_signed_policy(cfg, cli, watch);
+        return load_signed_policy(cfg, cli, watch, expected_cluster, floor);
     }
     let Some(path) = cfg.policy_path.as_deref() else {
         tracing::warn!(
@@ -1084,6 +1120,8 @@ fn load_signed_policy(
     cfg: &ServerConfig,
     cli: &Cli,
     watch: &Arc<config_engine::WatchHub>,
+    expected_cluster: config_core::ClusterId,
+    floor: Option<Arc<dyn crate::policy::PolicyVersionFloor>>,
 ) -> LoadedPolicy {
     let signed = cfg
         .signed_policy
@@ -1108,8 +1146,13 @@ fn load_signed_policy(
              version will be accepted for the lifetime of this process"
         );
     }
-    let loader =
-        crate::policy::PolicyLoader::new(signed, Arc::clone(&authorizer), Arc::clone(watch));
+    let loader = crate::policy::PolicyLoader::new(
+        signed,
+        Arc::clone(&authorizer),
+        Arc::clone(watch),
+        expected_cluster,
+        floor,
+    );
     // Synchronous on purpose: nothing else is running yet, so nothing can hold the journal
     // gate, and readiness must be decided before step 4 binds anything.
     let kind = match loader.reload("startup") {
@@ -1181,7 +1224,13 @@ fn tls_mode(cfg: &ServerConfig) -> Result<TlsMode, Fatal> {
             )
             // `tls.allow_common_name_principals`: shut unless the document opened it;
             // `config::validate` has already logged `common_name_principals_enabled` if so.
-            .with_common_name_principals(material.allow_common_name_principals),
+            .with_common_name_principals(material.allow_common_name_principals)
+            // `tls.handshake_timeout_ms`, or the ADR-0028 default when the document is
+            // silent. Set here, on the profile `TlsRotator` captures as its template, so
+            // `read_material`'s clone carries it through every rotation: a rotation replaces
+            // the material a handshake is performed against, never the bound on how long one
+            // may take (G-01).
+            .with_handshake_timeout(material.handshake_timeout),
         )),
         (TlsModeName::Mutual, None) => Err(Fatal::rejected(
             "invalid_config",
@@ -1220,7 +1269,7 @@ fn node_start_fatal(error: config_engine::EngineError) -> Fatal {
 }
 
 async fn bind(what: &'static str, addr: std::net::SocketAddr) -> Result<TcpListener, Fatal> {
-    TcpListener::bind(addr)
+    config_gossip::ports::bind_tcp(what, addr)
         .await
         .map_err(|e| Fatal::rejected("bind_failed", format!("{what} listener on {addr}: {e}")))
 }
@@ -1369,6 +1418,7 @@ async fn shutdown(running: Running) {
         policy_task,
         tls_shutdown,
         tls_task,
+        client_drain_bound,
     } = running;
 
     // The poller first: it takes the journal gate, and a reload landing mid-drain would revoke
@@ -1396,11 +1446,29 @@ async fn shutdown(running: Running) {
         task.abort();
         let _ = task.await;
     }
+    // End every open Watch before draining the client plane. A Watch stream ends only when the
+    // hub says so, and `Node::stop` (which also does this) runs after the drain — so the drain
+    // would wait on streams that cannot end until it has finished. `Unavailable`, not
+    // `NotLeader`: the node is going away (M4-85).
+    node.watch_hub().shutdown();
     // A plane that was never served has nothing to drain — the refusal happened between
     // binding and serving, and the listener is dropped with its handle.
+    //
+    // The drain is bounded: a Watch client that stopped reading holds its stream's last frames
+    // behind HTTP/2 flow control, and nothing on this side can end that stream (M4-85). On
+    // expiry the plane's task is left to the runtime's own shutdown, which drops it with its
+    // connections.
     if let Some(client_server) = client_server {
-        if let Err(e) = client_server.shutdown().await {
-            tracing::warn!(plane = "client", error = %e, "plane did not drain cleanly");
+        match tokio::time::timeout(client_drain_bound, client_server.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(plane = "client", error = %e, "plane did not drain cleanly");
+            }
+            Err(_) => tracing::warn!(
+                plane = "client",
+                bound_ms = u64::try_from(client_drain_bound.as_millis()).unwrap_or(u64::MAX),
+                "client_plane_drain_abandoned"
+            ),
         }
     }
     if let Some(peer_server) = peer_server {

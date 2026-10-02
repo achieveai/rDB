@@ -796,11 +796,12 @@ const PAGE_CSS = `
   .legend-row .chip { font-size: 12px; }
 
   .strip-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; box-shadow: var(--shadow); margin-bottom: 22px; }
-  .strip { display: flex; gap: 4px; }
+  .strip { display: flex; gap: 4px; overflow-x: auto; }
   .strip-seg {
-    flex: 1; text-align: center; padding: 10px 4px; border-radius: 8px; font-weight: 800; font-size: 15px;
+    flex: 1 0 58px; text-align: center; padding: 10px 4px; border-radius: 8px; font-weight: 800; font-size: 15px;
     background: var(--grey-soft); color: var(--muted); border: 1px solid var(--border);
   }
+  .strip-word { display: block; font-size: 12px; font-weight: 600; line-height: 1.3; margin-top: 2px; overflow-wrap: normal; word-break: keep-all; }
   .strip-seg.pass { background: var(--green-soft); color: var(--green); border-color: var(--green); }
   .strip-seg.active { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
   .strip-caption { color: var(--muted); font-size: 14px; margin-top: 10px; }
@@ -930,11 +931,11 @@ function renderStrip(milestones) {
     let glyph = '';
     if (m.chip === 'Done' || m.chip === 'Gate passed') { cls = ' pass'; glyph = ' ✓'; }
     else if (m.chip === 'In progress') { cls = ' active'; glyph = ' ▶'; }
-    return `      <div class="strip-seg${cls}">${esc(m.id)}${glyph}</div>`;
+    return `      <div class="strip-seg${cls}">${esc(m.id)}${glyph}<span class="strip-word">${esc(m.chip)}</span></div>`;
   }).join('\n');
   return `
   <div class="strip-wrap">
-    <div class="strip" aria-label="Milestone strip ${esc(milestones.map((m) => m.id).join(' through '))}">
+    <div class="strip" role="group" tabindex="0" aria-label="Milestone strip ${esc(milestones.map((m) => m.id).join(' through '))}">
 ${segs}
     </div>
     <div class="strip-caption">${passed} of ${total} milestones passed their gate. ${pct}%.</div>
@@ -951,8 +952,16 @@ function renderSystemPicture(diagrams, partsById, oldPartStates, activeMilestone
       <span class="mm-lg-item"><span class="mm-sw gap"></span>⚠ gap — built, with a logged known gap</span>
     </div>`;
 
-  const blocks = diagrams.map((d, i) => {
-    const t = transformMermaid(d.src, partsById, oldPartStates);
+  // The page shows the active milestone only. Earlier diagrams live in the archive snapshots;
+  // with no active milestone (between gates) every diagram shows.
+  const shown = diagrams
+    .map((d, i) => ({ t: transformMermaid(d.src, partsById, oldPartStates), i }))
+    .filter(({ t }) => !activeMilestoneId || t.milestones.includes(activeMilestoneId));
+  const hidden = diagrams.length - shown.length;
+  const archiveNote = hidden ? `
+    <p class="diagram-lead">${hidden} diagrams for earlier milestones are in the archive, under docs/archive/progress.</p>` : '';
+
+  const blocks = shown.map(({ t, i }) => {
     const id = `diagram-${i}`;
     const isAlways = t.open === 'always';
     // Anything not fully built stays open: a collapsed "all good" view must not hide a gap.
@@ -978,7 +987,7 @@ function renderSystemPicture(diagrams, partsById, oldPartStates, activeMilestone
 
   return `
   <section id="section-system-picture">
-    <h2 class="section-title">System picture</h2>${legend}${blocks}
+    <h2 class="section-title">System picture</h2>${legend}${blocks}${archiveNote}
   </section>`;
 }
 
@@ -1042,17 +1051,20 @@ function renderMilestones(milestones, activeMilestone) {
     </div>`;
   }
 
-  const cards = milestones.map(renderMilestoneCard).join('\n');
+  // Only the active milestone gets a card; the strip above already shows every other one.
+  const cards = (activeMilestone ? [activeMilestone] : milestones).map(renderMilestoneCard).join('\n');
+  const title = activeMilestone ? 'This milestone' : 'Milestones';
   return `
   <section id="section-milestones">
-    <h2 class="section-title">Milestones</h2>${legend}${pipeline}
+    <h2 class="section-title">${esc(title)}</h2>${activeMilestone ? '' : legend}${pipeline}
     <div class="board">
 ${cards}
     </div>
   </section>`;
 }
 
-function renderActiveWork(agents, activeMilestoneId) {
+function renderActiveWork(allAgents, activeMilestoneId) {
+  const agents = activeMilestoneId ? allAgents.filter((a) => a.milestone === activeMilestoneId) : allAgents;
   const finished = agents.filter((a) => a.status === 'finished');
 
   const lanesBlock = buildSwimLanes(agents);
@@ -1126,7 +1138,7 @@ ${renderActiveWork(p.work.agents || [], activeMilestoneId)}
 ${renderRisks(p.risks.risks || [])}
 ${renderReference(p.reference)}
 
-  <footer>rEtcd progress report. Source of truth: the M4-M6 ledger. Regenerated after each milestone gate or critic verdict.</footer>
+  <footer>rEtcd progress report for the active milestone. Source of truth: the ledger named in config.json. Earlier milestones: docs/archive/progress.</footer>
 </div>
 
 <script>

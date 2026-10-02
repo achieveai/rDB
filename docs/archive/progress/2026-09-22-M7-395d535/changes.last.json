@@ -1,0 +1,27 @@
+{
+  "from": { "ledger_line": 2349, "git_head": "395d535" },
+  "to": { "ledger_line": 2613, "git_head": "395d535" },
+  "items": [
+    {
+      "kind": "ruling",
+      "milestone": "M7",
+      "summary": "Kernel-a row crediting incorrect. Manual tester found function assertions do not match claimed rows. Two rows moved to miscredited status.",
+      "evidence": "ledger:2424",
+      "parts": ["rdb-kernel-a"]
+    },
+    {
+      "kind": "ruling",
+      "milestone": "M7",
+      "summary": "Census script enhanced with MISCREDITED list. M7F-42 classified as gate stage, not regular row.",
+      "evidence": "ledger:2513",
+      "parts": []
+    },
+    {
+      "kind": "ruling",
+      "milestone": "M7",
+      "summary": "All seven remaining foundation rows awaiting package I1. Nothing in foundation can proceed without I1.",
+      "evidence": "ledger:2564",
+      "parts": ["rdb-foundation"]
+    }
+  ]
+}
