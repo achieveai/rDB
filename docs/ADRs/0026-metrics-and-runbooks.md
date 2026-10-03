@@ -91,6 +91,8 @@ externally, so it is held to at least as strict a rule as a log line, not a loos
 | `retcd_policy_rollbacks_total` | counter | `node_id` | rollbacks permitted by `--break-glass-policy-rollback` (ADR-0027) |
 | `retcd_policy_reload_failures_total` | counter | `node_id`, `reason` | refused reloads, seeded from `PolicyRejected::ALL_REASONS` (ADR-0027) |
 | `retcd_break_glass_active` | gauge | `node_id` | 1 while this process runs with `--break-glass-policy-rollback` (OQ-57) |
+| `retcd_policy_floor_unreadable` | gauge (0/1) | `node_id` | 1 while this boot could not read its durable policy rollback floor, so rollback protection is off for the whole boot; the node starts anyway and logs `policy_floor_unreadable` (ADR-0027, G-09) |
+| `retcd_policy_floor_unpersisted` | gauge (0/1) | `node_id` | 1 while the policy version in force has not reached the durable rollback floor because a floor write failed; a restart would accept an older signed document; cleared by the next floor write that lands (ADR-0027, R2-F003) |
 
 `HealthPayload` (ADR-0018) and this metric list intentionally overlap for a handful of series
 (`authn_rejected`, `authz_denied`) — the health payload remains the single-node JSON snapshot a test

@@ -92,3 +92,47 @@ increment of the counter means a node was restarted with the flag and nobody sai
 - Confirm every node is back above the rolled-back version and converged
   (`retcd_policy_converged_version == retcd_policy_version` everywhere).
 - Confirm `retcd_break_glass_active` is 0 on every node.
+
+## The rollback floor gauges
+
+Each node keeps on disk the policy version it last served: its rollback floor. After a restart,
+the floor is what refuses a validly signed document older than that version. Two per-node gauges
+say when the floor is not doing that job, so rollback protection is off without anyone setting
+the flag. Both are exported only under `authz.mode = "signed"`. The alert rows are in
+[alerts.md](alerts.md).
+
+```
+retcd_policy_floor_unreadable == 1           # this boot could not read its floor
+retcd_policy_floor_unpersisted == 1 for 5m   # the version in force is not on disk yet
+```
+
+Both are warnings, not critical: neither stops the node serving, and the gap is only exploitable
+with a validly signed older document (ADR-0027).
+
+### `retcd_policy_floor_unreadable` reads 1
+
+At startup the node could not read its floor. For this whole boot it will adopt a validly signed
+older document if one is placed on it. It starts anyway, on purpose: refusing to start over one
+unreadable cell would turn a disk fault into an outage (ADR-0027). The gauge never clears while
+the process runs.
+
+1. Read the node's log for `policy_floor_unreadable` at `error`. Its `error` field says why the
+   read failed.
+2. One node: treat its data volume as suspect ([snapshot-and-disk.md](snapshot-and-disk.md)).
+   Several nodes at once: suspect the read path in the release they run, not their disks.
+3. Fix the cause, then restart the node. The gauge reads 0 only after a boot that reads the
+   floor. A 1 again after the restart means the cell itself cannot be read.
+
+### `retcd_policy_floor_unpersisted` reads 1
+
+A floor write failed, so the version in force has not reached the disk. The node keeps serving
+it, and retries the write on every policy reload (each `poll_interval_secs`, 10 s by default).
+The gauge clears when a write lands, and the log says `policy_floor_persisted`. Until then, a
+restart would adopt a validly signed document older than the one in force.
+
+1. Read the node's log for `policy_floor_not_persisted` (a new version failed to persist) and
+   `policy_floor_still_not_persisted` (a retry failed). Both carry the `error`.
+2. A store that refuses this write is a disk or store fault
+   ([snapshot-and-disk.md](snapshot-and-disk.md)).
+3. If the node must restart before the gauge clears, first confirm its policy files are the
+   ones you deployed. The startup reload adopts them and writes the floor again.

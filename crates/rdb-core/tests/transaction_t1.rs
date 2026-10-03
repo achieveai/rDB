@@ -2721,27 +2721,49 @@ fn one_pump_answers_replay_condition_failure_and_check_in_order() {
     assert_eq!(h.k().queue_len(), 0);
 }
 
-/// A-R71, tester-t1 hunt_18, pinned as designed. Check 9 counts the queue behind the one in
-/// flight, exactly. It counts the dedup index as it stands at admission, so that cap is soft:
-/// requests admitted before the index filled still retain, and it overruns by at most what was
-/// already queued. Check 9 precedes step 11 (the order is normative), so a full index refuses
-/// even a retry that would only replay. `OVERLOADED` is a definitive non-admission, and the
-/// retry replays once a trim makes room.
+/// Check 9, both caps exact (issue #3 BACKPRESSURE, Gautam 2026-10-02, option A; supersedes
+/// A-R71's soft dedup cap, tester-t1 hunt_18). The queue cap counts the requests waiting behind
+/// the one in flight. The dedup cap counts what the index holds **plus** every request already
+/// admitted and not yet answered, queued or in flight, because each may still retain an entry.
+/// So the index never holds more than its cap, and P1's status index, capped at the same number,
+/// never has to refuse a status for an identity T1 retains (which the client saw as `UNKNOWN`).
+/// A full index refuses a new request with `OVERLOADED`, a definitive non-admission; a resend of
+/// a request the index holds still replays (ruling F1, Gautam 2026-10-02;
+/// `a_resend_at_a_full_dedup_index_replays_its_saved_answer`).
 #[retcd_test]
-fn the_queue_cap_is_exact_and_the_dedup_cap_is_soft() {
+fn the_queue_cap_and_the_dedup_cap_are_exact() {
+    // The queue: two may wait behind the one in flight, a third is refused.
+    let mut h = H::live_with(Limits {
+        queue_cap: 2,
+        ..Limits::default()
+    });
+    let _ = h.admit(put(1, b"a", b"1"));
+    assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
+    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![]);
+    assert_eq!(
+        failed(&h.step(submit(put(4, b"d", b"4")))),
+        ErrorKind::Overloaded,
+        "the queue cap"
+    );
+
+    // The dedup index: one in flight and one queued already claim a cap of 2.
     let mut h = H::live_with(Limits {
         queue_cap: 2,
         dedup_cap: 2,
         ..Limits::default()
     });
     let mut next = h.admit(put(1, b"a", b"1"));
-    assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
-    assert_eq!(h.step(submit(put(3, b"c", b"3"))), vec![]);
     assert_eq!(
-        failed(&h.step(submit(put(4, b"d", b"4")))),
-        ErrorKind::Overloaded
+        h.step(submit(put(2, b"b", b"2"))),
+        vec![],
+        "one in flight leaves room for one more"
     );
-    for request in 1..=3 {
+    assert_eq!(
+        failed(&h.step(submit(put(3, b"c", b"3")))),
+        ErrorKind::Overloaded,
+        "the index is empty, but the in-flight and the queued request already claim the cap"
+    );
+    for request in 1..=2 {
         let effects = h.step(answer(next, 1, Verdict::Admit));
         let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
             panic!("{effects:?}");
@@ -2750,28 +2772,121 @@ fn the_queue_cap_is_exact_and_the_dedup_cap_is_soft() {
         let digest = h.k().prev_digest();
         assert_eq!(h.step(committed(id, seq)).len(), 2);
         let effects = h.step(published(seq, digest, request));
-        if request < 3 {
+        if request < 2 {
             next = only_check(&effects);
         }
     }
+    assert_eq!(h.k().dedup().len(), 2, "cap 2, holds 2: never past it");
     assert_eq!(
-        h.k().dedup().len(),
-        3,
-        "cap 2, holds 3: all three were admitted below it"
+        failed(&h.step(submit(put(3, b"c", b"3")))),
+        ErrorKind::Overloaded,
+        "a new request at a full index"
     );
+    // A trim makes room, and only a trim does: the same new request is admitted after it
+    // (review F-004; a resend replays with or without it, ruling F1).
+    let _ = h.step(kernel(KernelEvent::DedupTrim {
+        generation: GEN,
+        below: Seq(2),
+    }));
+    assert_eq!(h.k().dedup().len(), 1, "the trim dropped request 1's entry");
+    let _ = only_check(&h.step(submit(put(3, b"c", b"3"))));
+
+    // A resend is exempt from the dedup cap only (ruling F1), never from the queue cap: a
+    // client resending while the queue is full is refused (ruling F7, L-R182hh).
+    let mut h = H::live_with(Limits {
+        queue_cap: 1,
+        ..Limits::default()
+    });
+    let _ = h.resolve(put(1, b"a", b"1"));
+    let _ = h.admit(put(2, b"b", b"2"));
+    assert_eq!(h.step(submit(put(1, b"a", b"1"))), vec![]);
     assert_eq!(
         failed(&h.step(submit(put(1, b"a", b"1")))),
         ErrorKind::Overloaded,
-        "a replay-only retry is refused at check 9"
+        "a resend does not skip the queue cap"
     );
-    let _ = h.step(kernel(KernelEvent::DedupTrim {
-        generation: GEN,
-        below: Seq(3),
-    }));
-    assert!(matches!(
-        h.step(submit(put(3, b"c", b"3"))).as_slice(),
-        [EffectKind::Reply(ReplyEffect::Transaction { .. })]
-    ));
+}
+
+/// Issue #3 regression (tester-fu-rust, 2026-10-02). A dedup hit adds no entry, so check 9 does
+/// not count it against the room the dedup cap leaves. A client that timed out on a request
+/// that did complete, and retries it while another is in flight, gets the retained answer, as
+/// on the basis, never `OVERLOADED`. The hit is still answered at step 11, through the queue.
+/// A full index replays a hit too (ruling F1,
+/// `a_resend_at_a_full_dedup_index_replays_its_saved_answer`).
+#[retcd_test]
+fn a_retry_of_a_retained_request_is_not_counted_against_the_dedup_cap() {
+    let mut h = H::live_with(Limits {
+        dedup_cap: 2,
+        ..Limits::default()
+    });
+    let _ = h.resolve(put(1, b"a", b"1"));
+    let Some(Retained {
+        answer: RetainedAnswer::Applied(retained),
+        ..
+    }) = h.k().dedup().get(GEN, AFF, identity(1)).cloned()
+    else {
+        panic!("expected R(1) retained as Applied");
+    };
+    let (batch, digest, seq) = h.dispatch(put(2, b"b", b"2"));
+    assert_eq!(
+        h.step(submit(put(1, b"a", b"1"))),
+        vec![],
+        "one entry and one in flight leave the cap full for new work, but a hit adds no entry"
+    );
+    assert_eq!(h.step(committed(batch, seq)).len(), 2);
+    assert_eq!(
+        h.step(published(seq, digest, 2)),
+        vec![EffectKind::Reply(ReplyEffect::Transaction {
+            identity: identity(1),
+            result: retained,
+        })],
+        "the queued retry is answered from the index"
+    );
+    assert_eq!(h.k().dedup().len(), 2, "cap 2, holds 2: never past it");
+}
+
+/// Ruling F1 (Gautam 2026-10-02, tester-fu-rust; supersedes A-R71's refusal at a full index).
+/// Scenario: the index is at its cap, request 1 has completed, and the client resends request 1:
+/// it gets its saved answer, not `OVERLOADED` (ADR-0025, "retained -> hit, replay the outcome").
+/// A new request at the same full index is still refused, and the index never passes its cap.
+/// The hit is answered at step 11, never before checks 5–8: with L1 paused, the same resend
+/// gets check 8's `PROTECTION_PAUSED`, not the saved answer.
+#[retcd_test]
+fn a_resend_at_a_full_dedup_index_replays_its_saved_answer() {
+    let mut h = H::live_with(Limits {
+        dedup_cap: 2,
+        ..Limits::default()
+    });
+    let _ = h.resolve(put(1, b"a", b"1"));
+    let _ = h.resolve(put(2, b"b", b"2"));
+    assert_eq!(h.k().dedup().len(), 2, "the index is at its cap");
+    let Some(Retained {
+        answer: RetainedAnswer::Applied(saved),
+        ..
+    }) = h.k().dedup().get(GEN, AFF, identity(1)).cloned()
+    else {
+        panic!("expected R(1) retained as Applied");
+    };
+    assert_eq!(
+        h.step(submit(put(1, b"a", b"1"))),
+        vec![EffectKind::Reply(ReplyEffect::Transaction {
+            identity: identity(1),
+            result: saved,
+        })],
+        "the resend gets its saved answer"
+    );
+    assert_eq!(
+        failed(&h.step(submit(put(3, b"c", b"3")))),
+        ErrorKind::Overloaded,
+        "a new request at a full index"
+    );
+    assert_eq!(h.k().dedup().len(), 2, "cap 2, holds 2: never past it");
+    assert_eq!(h.step(admission(false, None)), vec![]);
+    assert_eq!(
+        failed(&h.step(submit(put(1, b"a", b"1")))),
+        ErrorKind::ProtectionPaused,
+        "check 8 runs before the hit is answered"
+    );
 }
 
 /// A-R71, tester-t1 hunt_19. Expired work is cancelled at storage dispatch (spec §5.2 step 3).

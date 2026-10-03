@@ -1,6 +1,6 @@
 //! INV-AUTH — authority (spec §7.2, §7.3; V2, model only).
 //!
-//! Four clauses:
+//! Five clauses:
 //!
 //! | Rule | Says |
 //! |---|---|
@@ -8,6 +8,7 @@
 //! | `valid_decision_outside_grant_window` | a decision that came out `Valid` at a tick its own grant does not cover is stale authority accepted — a contradiction in one event |
 //! | `apply_after_expiry` | no `batch_apply{role=Primary}` carries a generation whose grant had expired at that tick |
 //! | `publish_under_fenced_authority` / `publish_under_uncertain_authority` | the publication gate's recheck must have come out `Valid`; uncertainty denies (spec §7.2) |
+//! | `publish_authority_recheck_unresolved` | the publication gate's recheck must name an `authority_decision` on the partition (review F-002) |
 //!
 //! Windows are **half-open**: `[valid_from_tick, expiry_tick)`. A handover where one grant's
 //! `expiry_tick` equals the next's `valid_from_tick` is legal (row M7V-15), and an off-by-one
@@ -114,8 +115,20 @@ impl Checker for Authority {
                 ..
             } => {
                 let part = model.part(event.partition);
+                // A recheck that names no event, or an event that is not an
+                // `authority_decision`, resolves to nothing: the publication rests on no
+                // decision, and INV-PUB has no served epoch to hold its acks to (review F-002,
+                // row M7V-130).
                 let Some(recheck) = part.authority.get(&authority_recheck.0) else {
-                    return Ok(());
+                    return Err(Violation::detailed(
+                        "publish_authority_recheck_unresolved",
+                        ReplicaRole::Primary,
+                        format!(
+                            "publication at seq {} names authority_recheck event {}, which is \
+                             no authority_decision on this partition",
+                            seq.0, authority_recheck.0
+                        ),
+                    ));
                 };
                 let rule = match recheck.outcome {
                     AuthorityOutcome::Valid => return Ok(()),

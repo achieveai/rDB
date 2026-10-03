@@ -25,8 +25,8 @@
 //! grounded in a preceding `durability_advance{outcome=Synced}` on the same node. Both are
 //! watermark comparisons, not point comparisons (plan §4 convention 2). An `ack_evidence` entry
 //! counts only through the accepted acknowledgement at its own `(node, boot)`, in the
-//! publication's lineage and at a configuration the kernel's ACK ladder would accept (plan §4
-//! convention 1, row M7V-91).
+//! publication's lineage, at its owner epoch, and at a configuration the kernel's ACK ladder would
+//! accept (plan §4 convention 1, rows M7V-91, M7V-128, M7V-129).
 
 use std::collections::BTreeSet;
 
@@ -117,6 +117,7 @@ impl Checker for Publication {
                 generation,
                 seq,
                 ack_evidence,
+                authority_recheck,
                 ..
             } => {
                 self.armed = true;
@@ -151,6 +152,14 @@ impl Checker for Publication {
                     ));
                 };
 
+                let newest_declared = model
+                    .newest_config(event.partition)
+                    .map_or(config_version, |newest| newest.max(config_version));
+                // A missing recheck is INV-AUTH's violation; this check does not invent an epoch.
+                let served_epoch = part
+                    .authority
+                    .get(&authority_recheck.0)
+                    .map(|recheck| recheck.owner_epoch);
                 let required: BTreeSet<NodeId> = required.into_iter().collect();
                 let mut counted: BTreeSet<NodeId> = BTreeSet::new();
                 for evidence in ack_evidence {
@@ -179,7 +188,15 @@ impl Checker for Publication {
                     // node; anything older is `StaleConfig`. "Still names" needs no clause here:
                     // the environment model restates placements and never removes one, so a node
                     // the role check above placed at the pin is placed at every later version.
-                    if ack.generation != *generation || ack.config_version < config_version {
+                    // `pinned_for` only names a configuration the partition declared, so an ack
+                    // past the newest one — the environment's or the pin — is `StaleConfig` too.
+                    // Rule 3: the ack's epoch is the one the primary serves, which its
+                    // publication-gate decision names; any other is `StaleEpoch`.
+                    if ack.generation != *generation
+                        || ack.config_version < config_version
+                        || ack.config_version > newest_declared
+                        || served_epoch.is_some_and(|epoch| ack.owner_epoch != epoch)
+                    {
                         continue;
                     }
                     if evidence.durability == DurabilityClass::Durable

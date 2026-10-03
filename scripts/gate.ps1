@@ -38,8 +38,7 @@
 .PARAMETER Stage
     fmt, deps, drift, purity, lint, test, or all (the default).
 
-.PARAMETER CargoArgs
-    Extra arguments passed through to cargo, for narrowing a test stage.
+    Every argument after the stage passes through to cargo, for narrowing a test stage.
 
 .EXAMPLE
     pwsh scripts/gate.ps1
@@ -49,13 +48,14 @@
     pwsh scripts/gate.ps1 test -p config-testkit --test m4_watch_faults_cluster
     One suite, same environment.
 #>
-[CmdletBinding()]
+# A plain script on purpose: [CmdletBinding()] or any [Parameter()] adds PowerShell's common
+# parameters, and then cargo's `-p` is refused as ambiguous (-ProgressAction, -PipelineVariable).
+# Unbound arguments land in $args instead, in the order given.
 param(
     [ValidateSet('fmt', 'deps', 'drift', 'purity', 'lint', 'test', 'all')]
-    [string]$Stage = 'all',
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$CargoArgs = @()
+    [string]$Stage = 'all'
 )
+$CargoArgs = [string[]]$args
 
 $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot '..')
@@ -89,14 +89,23 @@ if ($gateOwnsData) { $env:RETCD_TEST_DATA_DIR = "$targetRoot/test-data/$(Get-Dat
 
 Write-Host "gate: target=$($env:CARGO_TARGET_DIR) scale=$($env:RETCD_TEST_DEADLINE_SCALE) ports=$($env:RETCD_TEST_PORT_RANGE) logs=$($env:RETCD_TEST_LOG_DIR) data=$($env:RETCD_TEST_DATA_DIR)"
 
+# `exit`, not `throw`: an uncaught throw ends the script with exit code 1, so a test failure
+# (cargo's 101) and a build or usage error looked the same to the caller. gate.sh passes cargo's
+# code through; so does this.
 function Invoke-Cargo([string[]]$Arguments) {
     & cargo @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "cargo $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine("gate: cargo $($Arguments -join ' ') failed with exit code $LASTEXITCODE")
+        exit $LASTEXITCODE
+    }
 }
 
 function Test-Deps {
     $json = & cargo metadata --format-version 1 --no-deps
-    if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed with exit code $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) {
+        [Console]::Error.WriteLine("gate: cargo metadata failed with exit code $LASTEXITCODE")
+        exit $LASTEXITCODE
+    }
     $meta = $json | ConvertFrom-Json
     $bad = @()
     foreach ($pkg in $meta.packages) {
@@ -131,6 +140,14 @@ function Test-Drift { Invoke-BashCheck 'scripts/drift-check.sh' 'drift' }
 
 function Test-Purity { Invoke-BashCheck 'scripts/purity-check.sh' 'purity' }
 
+# Warns, never fails: outbound connects still draw from the OS dynamic pool (issue #5). The
+# measurement lives in scripts/port-preflight.sh, so gate.sh and this script share one copy.
+function Show-PortPreflight {
+    $bash = (Get-Command bash -ErrorAction SilentlyContinue).Source
+    if (-not $bash) { Write-Host 'gate: ports preflight not run (bash not found)'; return }
+    & $bash 'scripts/port-preflight.sh'
+}
+
 if ($Stage -in 'fmt', 'all')  { Write-Host '== fmt';    Invoke-Cargo @('fmt', '--all', '--check') }
 if ($Stage -in 'deps', 'all') { Write-Host '== deps';   Test-Deps }
 if ($Stage -in 'drift', 'all') { Test-Drift }
@@ -138,6 +155,7 @@ if ($Stage -in 'purity', 'all') { Test-Purity }
 if ($Stage -in 'lint', 'all') { Write-Host '== clippy'; Invoke-Cargo @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings') }
 if ($Stage -in 'test', 'all') {
     Write-Host '== test'
+    Show-PortPreflight
     # `--workspace` is dropped when the caller names a package: cargo ignores `-p` after
     # `--workspace` rather than rejecting it, so a scoped run silently became the whole
     # workspace (observed 2026-09-21). Same rule as gate.sh.

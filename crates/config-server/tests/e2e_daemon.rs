@@ -501,6 +501,114 @@ async fn e2e_09_graceful_shutdown_is_clean() {
     assert_eq!(restarted.node_id(), harness.nodes[victim].node_id);
 }
 
+/// Issue #14: a port a manifest names is never a daemon's port-`0` draw, and two live harnesses
+/// never reserve the same port. Before the fix a daemon's health bind took another row's
+/// released peer or client port, and that row's daemon died with `os error 10048`.
+#[retcd_test]
+async fn harness_ports_and_daemon_port_zero_binds_never_share_a_band() {
+    const METHOD: &str = "harness_ports_and_daemon_port_zero_binds_never_share_a_band";
+    let Some(bands) = support::port_bands() else {
+        eprintln!("RETCD_TEST_PORT_RANGE is unset, so the OS picks every port: nothing to check");
+        return;
+    };
+    let first = Harness::new(METHOD).await;
+    let second = Harness::new(METHOD).await;
+    let mut seen = std::collections::BTreeSet::new();
+    for node in first.nodes.iter().chain(&second.nodes) {
+        for addr in [node.peer, node.client] {
+            assert!(
+                bands.reserved.contains(&addr.port()),
+                "{addr} is outside the reserved band {:?}",
+                bands.reserved
+            );
+            assert!(seen.insert(addr.port()), "{addr} reserved twice");
+        }
+    }
+
+    let nodes = first.start_all();
+    for node in &nodes {
+        let health: std::net::SocketAddr = node
+            .health_endpoint()
+            .parse()
+            .expect("the ready line's health address parses");
+        assert!(
+            bands.children.contains(&health.port()),
+            "node {} health {health} is outside the child band {:?}",
+            node.node_id(),
+            bands.children
+        );
+    }
+}
+
+/// Issue #14: a port taken between the harness releasing it and the daemon binding it does not
+/// fail the row. The bands keep this binary's own binds off a reserved port; another process on
+/// the host can still take one. Here this test is that process: it takes a node's peer port,
+/// lets go only once that daemon has refused to start, and `Harness::start` spawns the node
+/// again on the same port and logs `daemon_start_bind_retry` under `retcd_ports`.
+///
+/// Both kinds of start, in `start_all`'s order: node 2 without `--form`, then node 1 with it.
+/// The forming node's refused attempt has already opened its store, which writes the node's
+/// identity, and a store holding an identity is not fresh. So a plain respawn with `--form`
+/// was refused as `already_formed`; the retry has to clear the directory that attempt made.
+#[retcd_test]
+async fn harness_start_retries_a_node_whose_port_was_taken() {
+    const METHOD: &str = "harness_start_retries_a_node_whose_port_was_taken";
+    let harness = Harness::new(METHOD).await;
+    let _follower = start_with_peer_port_taken(&harness, 1, false);
+    let _former = start_with_peer_port_taken(&harness, 0, true);
+
+    let retries: Vec<serde_json::Value> =
+        config_testkit::logs::lines_for_current_test("e2e_daemon", METHOD)
+            .into_iter()
+            .filter(|line| support::log_field(line, "@m") == Some("daemon_start_bind_retry"))
+            .collect();
+    for (index, cleared) in [(1, false), (0, true)] {
+        let node_id = harness.nodes[index].node_id;
+        let first = retries
+            .iter()
+            .find(|line| line.get("node_id") == Some(&serde_json::json!(node_id)))
+            .unwrap_or_else(|| {
+                panic!("Harness::start logged no daemon_start_bind_retry event for node {node_id}")
+            });
+        assert_eq!(support::log_field(first, "@logger"), Some("retcd_ports"));
+        assert_eq!(first.get("attempt"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            first.get("cleared_data_dir"),
+            Some(&serde_json::json!(cleared)),
+            "node {node_id}: {first:#?}"
+        );
+    }
+}
+
+/// Take node index `index`'s peer port, start the node through `Harness::start`, and let go of
+/// the port only once the daemon has logged its `bind_failed` refusal.
+fn start_with_peer_port_taken(harness: &Harness, index: usize, form: bool) -> DaemonProcess {
+    let node = harness.nodes[index].clone();
+    drop(node.reserved.lock().expect("reservation lock").take());
+    let holder = std::net::TcpListener::bind(node.peer).expect("take the node's peer port");
+
+    let log_file = support::log_file(&node);
+    let node_id = node.node_id;
+    let releaser = std::thread::spawn(move || {
+        let give_up = std::time::Instant::now() + startup_deadline();
+        while !std::fs::read_to_string(&log_file).is_ok_and(|text| text.contains("bind_failed")) {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "node {node_id} never logged a bind_failed refusal into {}",
+                log_file.display()
+            );
+            // A bounded poll on another process's log file, not synchronization.
+            std::thread::sleep(Duration::from_millis(25)); // testkit:allow-sleep
+        }
+        drop(holder);
+    });
+
+    let process = harness.start(index, form);
+    releaser.join().expect("the port holder thread");
+    assert_eq!(process.ready().peer, node.peer.to_string());
+    process
+}
+
 // ---------------------------------------------------------------------------------------
 // E2E-10
 // ---------------------------------------------------------------------------------------
@@ -621,14 +729,31 @@ async fn e2e_11_per_process_log_files_exist_and_are_tagged() {
             "node {} carries the wrong testMethod tags",
             node.node_id()
         );
+        // Third-party targets are exempt (ADR-0013, "what `node_id` is required on"). OpenRaft
+        // logs a failed or slow peer RPC from a task whose own span is `DEBUG`, which the
+        // daemon's `openraft=info` filter disables, so that line has no node span at all. Under
+        // load a formation RPC can be slow enough to log one.
+        let own: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|l| {
+                let logger = l.get("@logger").and_then(serde_json::Value::as_str);
+                !logger.is_some_and(|t| t.starts_with("openraft") || t.starts_with("memberlist"))
+            })
+            .collect();
         assert!(
-            lines
-                .iter()
-                .all(|l| l.get("node_id").and_then(serde_json::Value::as_u64)
-                    == Some(node.node_id())),
-            "node {} has a line without its node_id",
+            !own.is_empty(),
+            "node {} logged only third-party lines",
             node.node_id()
         );
+        if let Some(line) = own
+            .iter()
+            .find(|l| l.get("node_id").and_then(serde_json::Value::as_u64) != Some(node.node_id()))
+        {
+            panic!(
+                "node {} has a line without its node_id: {line}",
+                node.node_id()
+            );
+        }
 
         // The per-test routing file the cross-process DuckDB joins read.
         let routed = node
@@ -1532,7 +1657,16 @@ async fn e2e_38_dedup_resubmit_after_leader_kill_at_process_level() {
         .await
         .expect("the warm-up write applies");
     assert_eq!(warmup.outcome, MutationOutcome::Applied);
-    let before = support::health(nodes[survivor].health_endpoint()).await;
+    // The survivor is a follower: the leader acknowledges the warm-up before the survivor has
+    // necessarily applied it. A baseline read in that gap is one revision low, and "exactly one
+    // more" then never holds (green3 run7, 2026-10-03). Read it once the warm-up is applied.
+    let before = wait_for_all(
+        &[nodes[survivor].health_endpoint().to_string()],
+        "the survivor to apply the warm-up write",
+        |payloads| payloads[0].cluster_revision >= warmup.revision,
+    )
+    .await
+    .remove(0);
 
     let put_task = tokio::spawn({
         let client = client.clone();
@@ -1969,9 +2103,10 @@ fn run_rdb_campaign(target_dir: &std::path::Path) {
 /// `RETCD_TEST_DEADLINE_SCALE`) is inherited from this process, so the child runs under the same
 /// bounds this row itself does. `target_dir` is passed through explicitly (rather than relying
 /// on inheritance alone) so the child never falls back to a different, unbuilt target directory.
+/// Its clusters bind port `0`, so it gets the child port band, never a harness's reserved one.
 fn run_evidence_suite(target_dir: &std::path::Path) {
     let log_dir = config_testkit::fs::temp_dir();
-    let output = std::process::Command::new("cargo")
+    let output = support::narrow_port_range(&mut std::process::Command::new("cargo"))
         .args([
             "test",
             "-p",
@@ -3767,9 +3902,27 @@ async fn e42_write_phase(
     }
 }
 
-/// The current leader's index in `nodes`, from a fresh health snapshot.
+/// The current leader's index in `nodes`, once every node names the same one.
+///
+/// [`wait_formed`] alone is not enough here: it needs every node to name *a* leader, and a
+/// node restarted a moment ago can still name a leader the others have moved on from.
+/// [`leader_index`] reads node 1's view, and node 1 is the last node this row restarts.
 async fn e42_leader_now(nodes: &[DaemonProcess]) -> (usize, Vec<Health>) {
-    let health = wait_formed(nodes).await;
+    wait_formed(nodes).await;
+    let endpoints: Vec<String> = nodes
+        .iter()
+        .map(|n| n.health_endpoint().to_string())
+        .collect();
+    let health = wait_for_all(
+        &endpoints,
+        "every node to name the same leader",
+        |payloads| {
+            payloads
+                .windows(2)
+                .all(|w| w[0].current_leader == w[1].current_leader)
+        },
+    )
+    .await;
     (leader_index(&health, nodes), health)
 }
 
@@ -3786,7 +3939,12 @@ async fn e42_leader_now(nodes: &[DaemonProcess]) -> (usize, Vec<Health>) {
 /// `compact_revision` is still genuinely `0` (deterministically true for the first two restarts,
 /// since the schema gate is still shut then; true in practice for the third too, since the
 /// tick's own period is far longer than the round trip this check waits on).
-async fn e42_assert_history_resumable(client: &GrpcClient, node: &DaemonProcess, health: &Health) {
+async fn e42_assert_history_resumable(
+    client: &GrpcClient,
+    leader: &DaemonProcess,
+    node: &DaemonProcess,
+    health: &Health,
+) {
     assert_ne!(
         health.compact_revision,
         health.cluster_revision,
@@ -3796,16 +3954,20 @@ async fn e42_assert_history_resumable(client: &GrpcClient, node: &DaemonProcess,
         health.compact_revision,
         health.cluster_revision
     );
-    // Routed through the whole-cluster client, not a client pinned to `node` alone: `Watch`
-    // is served by the leader (a client pinned to a follower is answered `not leader`), and
-    // `node` need not be it. `health.compact_revision`, read directly from `node`'s own
-    // `/health` above, is what actually proves *this node's* local state; this call proves the
-    // cluster as a whole still serves a client-visible resume from before the upgrade.
+    // Opened on the current leader, not on `node` and not on the client's first endpoint:
+    // `Watch` is leader-served (spec §11.1), a follower answers `not leader`, and a watch never
+    // follows that hint (`GrpcClient::watch_tracked`). `node` need not be the leader.
+    // `health.compact_revision`, read directly from `node`'s own `/health` above, is what
+    // actually proves *this node's* local state; this call proves the cluster as a whole still
+    // serves a client-visible resume from before the upgrade.
     // Resumed from the node's own watermark, unconditionally (critic-m6 delta N2): branching on
     // `compact_revision == 0` would skip this check on exactly the restart where the schema
     // gate has opened and the retention tick has legitimately moved the watermark, which is
     // the node with the most history to resume.
     let result = client
+        .clone()
+        .pinned(leader.client_endpoint())
+        .expect("the leader is one of the client's endpoints")
         .watch(WatchRequest {
             prefix: Bytes::from_static(E42_PREFIX.as_bytes()),
             start_after_revision: health.compact_revision,
@@ -3884,7 +4046,7 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
         health[2].schema, CURRENT_SCHEMA,
         "the restarted node must advertise the current schema, not the pinned one"
     );
-    e42_assert_history_resumable(&client, &nodes[2], &health[2]).await;
+    e42_assert_history_resumable(&client, &nodes[leader], &nodes[2], &health[2]).await;
     assert_eq!(
         health[leader].cluster_min_schema,
         Some(COMPAT_SCHEMA_1),
@@ -3902,7 +4064,7 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
         health[1].schema, CURRENT_SCHEMA,
         "the restarted node must advertise the current schema, not the pinned one"
     );
-    e42_assert_history_resumable(&client, &nodes[1], &health[1]).await;
+    e42_assert_history_resumable(&client, &nodes[leader], &nodes[1], &health[1]).await;
     assert_eq!(
         health[leader].cluster_min_schema,
         Some(COMPAT_SCHEMA_1),
@@ -3914,13 +4076,34 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
     // ---- Restart node 1 (index 0), the last voter still pinned ----
     e42_quiesce_and_converge(&nodes).await;
     e42_stop_for_restart(&harness, &mut nodes, 0).await;
+    // Node 1 formed the cluster, so it usually leads here. Let nodes 2 and 3 elect a leader
+    // before it comes back, so leadership has always moved off the restarted node. Without
+    // this wait the row raced that election and passed only when node 1 won it back.
+    let stopped_id = nodes[0].node_id();
+    let survivors: Vec<String> = nodes[1..]
+        .iter()
+        .map(|n| n.health_endpoint().to_string())
+        .collect();
+    wait_for_all(
+        &survivors,
+        "nodes 2 and 3 to agree on a leader other than node 1 while it is down",
+        |payloads| {
+            payloads
+                .iter()
+                .all(|p| p.current_leader.is_some_and(|l| l != stopped_id))
+                && payloads
+                    .windows(2)
+                    .all(|w| w[0].current_leader == w[1].current_leader)
+        },
+    )
+    .await;
     nodes[0] = e42_start(&harness, 0, false, None);
     let (leader, health) = e42_leader_now(&nodes).await;
     assert_eq!(
         health[0].schema, CURRENT_SCHEMA,
         "the restarted node must advertise the current schema, not the pinned one"
     );
-    e42_assert_history_resumable(&client, &nodes[0], &health[0]).await;
+    e42_assert_history_resumable(&client, &nodes[leader], &nodes[0], &health[0]).await;
 
     // ---- Activation: every voter is now on the current schema ----
     let leader_id = nodes[leader].node_id();
@@ -3934,8 +4117,8 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
 
     // `feature_activated` is a leader-side line with a per-process monotonic latch — at least
     // once, not exactly-once-per-node (a leadership change mid-upgrade may legitimately produce
-    // a second line across processes; this row never changes leaders on purpose, so one line
-    // from the current leader is the expected shape here).
+    // a second line across processes; this row moves leadership once, before the last voter
+    // upgrades, so one line from the current leader is the expected shape here).
     let activation_line = {
         let path = nodes[leader].log_file();
         poll_until_async(deadline(10), Duration::from_millis(50), || async {

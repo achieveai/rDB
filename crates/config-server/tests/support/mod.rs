@@ -14,20 +14,30 @@
 //! the instant before that node is spawned. The health endpoint is not in the manifest, so it
 //! listens on port `0` and the ready line reports it.
 //!
-//! That leaves a window in which another process on the machine could take the port before the
-//! daemon rebinds it. It is small (milliseconds, and the OS does not immediately reuse a just
-//! released ephemeral port), it is the same trade-off every "pre-allocate then exec" harness
-//! makes, and a collision fails loudly as a bind error rather than silently — but it is real,
-//! and it is why a bind failure in this suite should be read as "port raced", not "daemon
-//! broken".
+//! That leaves the port unguarded from the release until the daemon binds it, and again from a
+//! kill until the restarted daemon binds it. With `RETCD_TEST_PORT_RANGE` set, every port-`0`
+//! bind draws uniformly from that range, so a port released a moment ago is as likely to be
+//! drawn as any other: another row's daemon took one as its health or gossip port, the daemon
+//! that needed it died with `os error 10048`, and issue #14 failed 7 runs of 8. So the range is
+//! split in two (see [`PortBands`]). Harness reservations come from the top quarter, and a port
+//! stays claimed in this process until its harness is dropped. Every child this suite spawns
+//! gets the rest as its `RETCD_TEST_PORT_RANGE`, so no daemon's port-`0` bind can land on a
+//! port a manifest names. With the variable unset, the OS picks as before.
+//!
+//! What this cannot stop is a process outside this test binary — another tree's gate on the
+//! same host — drawing the same range. For that, [`Harness::start`] spawns a node whose port
+//! was in use again on the same port, a bounded number of times, and logs each retry. A port
+//! still held after the last attempt fails loudly as a bind error.
 
 #![allow(dead_code)]
 
 pub mod daemon;
 
-use std::net::{SocketAddr, TcpListener};
+use std::collections::BTreeSet;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use config_core::{ClusterId, NodeId, SchemaTriple};
@@ -483,14 +493,66 @@ ttl_seconds = {}
     }
 
     /// Spawn one node and wait for its ready line.
+    ///
+    /// A daemon that refused to start because one of its ports was in use is spawned again on
+    /// the same ports, up to [`START_BIND_ATTEMPTS`] times with a growing pause, and each retry
+    /// logs `daemon_start_bind_retry` under `retcd_ports` (issue #14). The ports cannot move:
+    /// the manifest names them, and after formation so does every peer's membership. Any other
+    /// refusal fails the row at once.
+    ///
+    /// The daemon binds both planes before it forms, so a bind refusal proves that attempt never
+    /// formed. It did open the store, which writes the node's identity, and a store holding an
+    /// identity is not fresh: respawned with `--form` it refuses `already_formed`. So a forming
+    /// retry clears the data directory, but only one that did not exist when this call began.
+    /// A store from an earlier start is never touched, so a real second `--form` still fails.
     pub fn start(&self, index: usize, form: bool) -> DaemonProcess {
-        let mut spec = self.spec(index);
-        spec.form = form;
-        let mut process = DaemonProcess::spawn(spec);
-        process.wait_ready(startup_deadline()).unwrap_or_else(|e| {
-            panic!("node {} never became ready: {e}", self.nodes[index].node_id)
-        });
-        process
+        let node = &self.nodes[index];
+        let clear_on_retry = form && !node.data_dir.exists();
+        let mut attempt = 1;
+        loop {
+            let mut spec = self.spec(index);
+            spec.form = form;
+            let mut process = DaemonProcess::spawn(spec);
+            let error = match process.wait_ready(startup_deadline()) {
+                Ok(_) => return process,
+                Err(e) => e,
+            };
+            let stderr = process.stderr_after_exit();
+            match port_in_use(&stderr) {
+                Some(refusal) if attempt < START_BIND_ATTEMPTS => {
+                    let pause = Duration::from_millis(250 << (attempt - 1));
+                    if clear_on_retry {
+                        // `stderr_after_exit` waited for the exit, so the store is closed.
+                        match std::fs::remove_dir_all(&node.data_dir) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => panic!(
+                                "could not clear {} before retrying --form: {e}",
+                                node.data_dir.display()
+                            ),
+                        }
+                    }
+                    tracing::warn!(
+                        target: "retcd_ports",
+                        node_id = node.node_id,
+                        attempt,
+                        peer = %node.peer,
+                        client = %node.client,
+                        pause_ms = pause.as_millis() as u64,
+                        cleared_data_dir = clear_on_retry,
+                        error = refusal,
+                        "daemon_start_bind_retry"
+                    );
+                    // A bounded back-off for a port held by someone else, not synchronization.
+                    std::thread::sleep(pause); // testkit:allow-sleep
+                    attempt += 1;
+                }
+                _ => panic!(
+                    "node {} never became ready (attempt {attempt}): {error}\nfull stderr:\n{stderr}",
+                    node.node_id
+                ),
+            }
+        }
     }
 
     /// Start every node, forming the cluster from the signed manifest on node index 0.
@@ -510,6 +572,26 @@ ttl_seconds = {}
     /// Every node's log directory, for a DuckDB glob over the whole cluster.
     pub fn logs_glob(&self) -> String {
         daemon_logs_glob(self.root())
+    }
+}
+
+impl Drop for Harness {
+    /// The manifest stops naming these ports, so another harness may now reserve them. A row
+    /// that failed keeps its directory, daemon logs included, and prints where it is.
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.dir.disable_cleanup(true);
+            eprintln!(
+                "[harness] {} failed; kept {}",
+                self.method,
+                self.dir.path().display()
+            );
+        }
+        let mut claimed = CLAIMED_PORTS.lock().expect("claimed ports");
+        for node in &self.nodes {
+            claimed.remove(&node.peer.port());
+            claimed.remove(&node.client.port());
+        }
     }
 }
 
@@ -793,6 +875,103 @@ pub fn default_policy() -> String {
     )
 }
 
+/// `RETCD_TEST_PORT_RANGE` split in two, so a port a manifest names is never some daemon's
+/// port-`0` draw (issue #14).
+#[derive(Debug, Clone)]
+pub struct PortBands {
+    /// The top quarter: where [`reserve_two`] reserves peer and client ports.
+    pub reserved: RangeInclusive<u16>,
+    /// The rest: the `RETCD_TEST_PORT_RANGE` every child process is given.
+    pub children: RangeInclusive<u16>,
+}
+
+impl PortBands {
+    /// Split `range`, or `None` when it is too narrow to leave a port on each side.
+    pub fn split(range: &RangeInclusive<u16>) -> Option<Self> {
+        let width = range.end() - range.start() + 1;
+        let top = (width / 4).max(1);
+        (width > top).then(|| Self {
+            reserved: range.end() - top + 1..=*range.end(),
+            children: *range.start()..=range.end() - top,
+        })
+    }
+}
+
+/// This process's bands: `None` when `RETCD_TEST_PORT_RANGE` is unset, and the OS picks.
+///
+/// # Panics
+///
+/// The variable is malformed, or names a range too narrow to split.
+pub fn port_bands() -> Option<&'static PortBands> {
+    static BANDS: OnceLock<Option<PortBands>> = OnceLock::new();
+    BANDS
+        .get_or_init(|| {
+            let range =
+                config_gossip::ports::port_range_from_env().unwrap_or_else(|e| panic!("{e}"))?;
+            Some(PortBands::split(&range).unwrap_or_else(|| {
+                panic!(
+                    "{}={range:?} is too narrow to split into reserved and child bands",
+                    config_gossip::ports::PORT_RANGE_ENV
+                )
+            }))
+        })
+        .as_ref()
+}
+
+/// Give a child process the child band as its `RETCD_TEST_PORT_RANGE`, so none of its port-`0`
+/// binds can take a port a harness reserved. A no-op when the variable is unset.
+pub fn narrow_port_range(command: &mut std::process::Command) -> &mut std::process::Command {
+    if let Some(bands) = port_bands() {
+        command.env(
+            config_gossip::ports::PORT_RANGE_ENV,
+            format!("{}-{}", bands.children.start(), bands.children.end()),
+        );
+    }
+    command
+}
+
+/// How many times [`Harness::start`] spawns a node whose listener bind found its port in use.
+/// The pauses between them are 250 ms, 500 ms, 1 s and 2 s.
+pub const START_BIND_ATTEMPTS: u32 = 5;
+
+/// The daemon's `bind_failed` stderr line, when the refusal was a port already in use:
+/// `10048` (in use) or `10013` (held exclusively) on Windows, `98` elsewhere.
+fn port_in_use(stderr: &str) -> Option<&str> {
+    const IN_USE: [&str; 3] = ["(os error 10048)", "(os error 10013)", "(os error 98)"];
+    stderr
+        .lines()
+        .find(|line| line.contains("bind_failed:") && IN_USE.iter().any(|code| line.contains(code)))
+}
+
+/// Ports reserved by a live [`Harness`] in this process. A port stays here from reservation
+/// until its harness is dropped, across every kill and restart, so no other row reserves it
+/// while its daemon is down.
+static CLAIMED_PORTS: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+
+/// Reserve one port from `band` that no live harness in this process has claimed, and claim it.
+fn reserve_in(band: &RangeInclusive<u16>) -> (TcpListener, SocketAddr) {
+    let attempts = config_gossip::ports::EPHEMERAL_BIND_ATTEMPTS;
+    let mut claimed = CLAIMED_PORTS.lock().expect("claimed ports");
+    let mut last = String::from("every candidate was already claimed");
+    for _ in 0..attempts {
+        let port = config_gossip::ports::random_port_in(band);
+        if claimed.contains(&port) {
+            continue;
+        }
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+        match TcpListener::bind(addr) {
+            Ok(listener) => {
+                claimed.insert(port);
+                return (listener, addr);
+            }
+            Err(e) => last = format!("{addr}: {e}"),
+        }
+    }
+    // Unlock first: a poisoned claim set would fail every later row in the binary too.
+    drop(claimed);
+    panic!("no port reserved in {band:?} after {attempts} candidates; last: {last}")
+}
+
 /// Reserve the peer and client ports and keep both listeners open.
 ///
 /// The listeners are returned (as blocking `std` sockets, so dropping them never needs a
@@ -802,10 +981,20 @@ async fn reserve_two() -> (
     SocketAddr,
     SocketAddr,
 ) {
-    let (peer_listener, peer) = config_testkit::ports::ephemeral_listener().await;
-    let (client_listener, client) = config_testkit::ports::ephemeral_listener().await;
-    let peer_listener = peer_listener.into_std().expect("std peer listener");
-    let client_listener = client_listener.into_std().expect("std client listener");
+    let ((peer_listener, peer), (client_listener, client)) = match port_bands() {
+        Some(bands) => (reserve_in(&bands.reserved), reserve_in(&bands.reserved)),
+        None => {
+            let (peer_listener, peer) = config_testkit::ports::ephemeral_listener().await;
+            let (client_listener, client) = config_testkit::ports::ephemeral_listener().await;
+            (
+                (peer_listener.into_std().expect("std peer listener"), peer),
+                (
+                    client_listener.into_std().expect("std client listener"),
+                    client,
+                ),
+            )
+        }
+    };
     (
         Arc::new(Mutex::new(Some((peer_listener, client_listener)))),
         peer,

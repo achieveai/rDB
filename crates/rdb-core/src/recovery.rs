@@ -17,6 +17,7 @@
 //! Quarantined: terminal.   Blocked: terminal until a fresh fence.
 //! Committed, Rebuilding --FenceProven, newer root--> Fenced/Collecting
 //! ActivationProposed --FenceProven, newer root--> held; re-enters once the activation CAS ends
+//! Proposing, ActivationProposed --deadline, no answer--> Blocked(ControlUnknown)
 //! ```
 //!
 //! After commit a fence re-enters only when the root it would commit is newer than the committed
@@ -26,7 +27,10 @@
 //! Nothing before commit waits forever (ruling F-a): Synchronizing and Barrier block with
 //! `BarrierIncomplete` on a lost required copy or when their deadline passes. Nor does a rebuild
 //! after it (ruling B-R52): each `SyncWalThrough` arms the timer, and a sync unanswered at its
-//! deadline names its copy in `RebuildStalled` without leaving `Rebuilding`.
+//! deadline names its copy in `RebuildStalled` without leaving `Rebuilding`. Nor does a CAS exchange
+//! (issue #2, superseding B-R74b's unbounded hold): the recovery CAS and the activation CAS each
+//! arm the timer when sent, and an exchange unanswered at its deadline is read as
+//! `CasOutcome::Unknown`, which blocks with `ControlUnknown` and lets a held fence in.
 //!
 //! `Idle` leaves only on a `FencingProof` (§2.1). After commit, `select_prefix` is unreachable:
 //! a returning stale owner is quarantined without its length ever being read (§5.7).
@@ -78,7 +82,8 @@ pub const RECOVERY_TIMER_BASE: u64 = 0x00F1 << 48;
 
 /// The discovery-window deadline, reused as the probe-wait deadline once the window closes, and
 /// then as the deadline on synchronising and the barrier after selection (ruling F-a), and on each
-/// rebuild sync after commit (ruling B-R52).
+/// rebuild sync after commit (ruling B-R52), and on each CAS exchange: the recovery CAS and the
+/// activation CAS (issue #2).
 pub const DISCOVERY_TIMER: TimerId = TimerId(RECOVERY_TIMER_BASE);
 
 /// The partition mode for a count of eligible regular copies holding the barrier
@@ -183,7 +188,8 @@ struct Committed {
     rebuild: Option<Rebuild>,
     activation: Option<(Cas, RecoveryBarrier)>,
     /// The newest fence newer than this commit that arrived while the activation CAS was in
-    /// flight. It re-enters once that exchange ends (ruling B-R74b).
+    /// flight. It re-enters once that exchange ends (ruling B-R74b): answered, or unanswered at its
+    /// deadline (issue #2).
     held: Option<FencingProof>,
 }
 
@@ -345,6 +351,7 @@ impl Recovery {
             }
             Phase::Barrier(decided, proofs) => self.barrier(ctx, decided, proofs, input, &mut emit),
             Phase::Proposing(decided, barrier, cas) => {
+                let input = self.lost_answer(ctx, &cas, input);
                 Self::proposing(decided, barrier, cas, &mut self.requests, input, &mut emit)
             }
             Phase::Committed(committed) => self.committed(ctx, committed, input, &mut emit),
@@ -537,6 +544,19 @@ impl Recovery {
         }
     }
 
+    /// The current timer at or past `cas`'s deadline means its answer is lost (issue #2; ADR 0008
+    /// item 8, `DropCompletion`): read it as `CasOutcome::Unknown`, so it blocks as an `Unknown`
+    /// answer does and a held fence is released the same way. Any other input passes through. A
+    /// completion arriving afterwards finds nothing outstanding: `UnmatchedCompletion`.
+    fn lost_answer<'a>(&self, ctx: &StepCtx<'_>, cas: &Cas, input: Input<'a>) -> Input<'a> {
+        match input {
+            Input::Timer(fired) if self.due(ctx, fired, cas.deadline()) => {
+                Input::Cas(CasOutcome::Unknown)
+            }
+            other => other,
+        }
+    }
+
     /// Whether `fired` is the current timer and its deadline has passed. Judged at `ctx.now`,
     /// never at the fire's `scheduled_at`; `step` has already checked the id.
     fn due(&self, ctx: &StepCtx<'_>, fired: &TimerFired, deadline: Tick) -> bool {
@@ -648,14 +668,17 @@ impl Recovery {
         let (cutoff, digest) = (decided.selected.cutoff_seq, decided.selected.cutoff_digest);
         match RecoveryBarrier::try_new(&held, &decided.required, cutoff, digest) {
             Ok(barrier) => {
+                let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                 let cas = Cas::new(
                     decided.record,
                     decided.proof.prior_owner_epoch,
                     self.requests.mint(),
+                    deadline,
                 );
                 emit.kind(EffectKind::Control(
                     cas.effect(decided.proof.control_revision),
                 ));
+                self.arm(deadline, emit);
                 Phase::Proposing(decided, barrier, cas)
             }
             Err(_) => {
@@ -706,7 +729,8 @@ impl Recovery {
                 self.hold_plan(plan, emit);
                 return Phase::Committed(committed);
             }
-            // With the activation CAS in flight the fence waits for its answer (ruling B-R74b).
+            // With the activation CAS in flight the fence waits for its answer or its deadline (ruling
+            // B-R74b; issue #2).
             Input::Recovery(RecoveryEvent::FenceProven(proof))
                 if committed.activation.is_some() =>
             {
@@ -719,6 +743,7 @@ impl Recovery {
             _ => {}
         }
         if let Some((mut cas, barrier)) = committed.activation.take() {
+            let input = self.lost_answer(ctx, &cas, input);
             let fence = committed.result.fenced_prior.control_revision;
             let held = committed.held.take();
             let phase = match follow_cas(&mut cas, fence, &mut self.requests, input, emit) {
@@ -757,14 +782,17 @@ impl Recovery {
                 }),
             Input::Recovery(RecoveryEvent::DurableAt(proof)) => {
                 rebuild.durable(*proof).map(|barrier| {
+                    let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
                     let cas = Cas::new(
                         committed.record,
                         committed.record.owner_epoch,
                         self.requests.mint(),
+                        deadline,
                     );
                     emit.kind(EffectKind::Control(
                         cas.effect(committed.result.committed.revision),
                     ));
+                    self.arm(deadline, emit);
                     committed.activation = Some((cas, barrier));
                 })
             }

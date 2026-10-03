@@ -42,6 +42,14 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   which is the run where a log query is actually wanted. Observed 2026-09-21 at 1310 files under
   one root. Because the error names a column, it reads like a typo in the query rather than a limit.
   `crates/config-testkit/tests/logs.rs` holds a positive control that fails if the option is dropped.
+- **Those options still miss a field that only a late file carries.** With `union_by_name`,
+  DuckDB 1.3.2 takes the columns from the first 32 files only; `maximum_sample_files` and
+  `sample_size=-1` do not change that. Measured 2026-10-03 on one 33-file e2e_daemon run:
+  `node_id`, logged by the 33rd file only, fails to bind; list that file first and it binds.
+  `test_logs_relation()` uses the same options, so it has the same gap. For a field that few
+  tests log, read objects instead, which never infers a schema:
+  `SELECT json->>'@m', json->>'node_id' FROM read_ndjson_objects('<root>/<run id>/*/*.jsonl')
+  WHERE json->>'node_id' IS NOT NULL`.
 - Never point DuckDB at a file a test is still writing. `test_logs_relation()` and
   `relation_for_current_test(module, method)` both hand back a `LogSnapshot`: a private copy of
   the files, the `read_json_auto(...)` call over the copy, and a `Drop` that deletes it. Put the
@@ -251,11 +259,38 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   `config_testkit::ports::ephemeral_listener` — draw 32 random candidates from that range.
   Unset, nothing changes. The one loop lives in `config_gossip::ports`; its events are
   `{site}_ephemeral_bind` and `{site}_ephemeral_bind_retry` under logger `retcd_ports`.
+- **The e2e harness splits that range in two (issue #14).** `config-server/tests/support`
+  reserves each manifest's peer and client ports from the top quarter of the range
+  (`25250-26999` at the gate default) and keeps them claimed until the harness drops. Every
+  daemon it spawns, and `e2e_47`'s nested `m6_evidence` run, gets the rest (`20000-25249`) as
+  its `RETCD_TEST_PORT_RANGE`. Before that, a daemon's port-`0` health or gossip bind could take
+  another row's released peer or client port, and that row's daemon died with `os error 10048`
+  (3 of 5 `e2e_daemon` runs on 2026-10-02). A `10048` there now means a process outside the
+  test binary, such as another tree's gate on this host, drew the same port. `Harness::start`
+  then spawns that node again on the same port, up to 5 times over about 4 s, and logs each
+  retry as `daemon_start_bind_retry` under logger `retcd_ports` (fields `node_id`, `attempt`,
+  `peer`, `client`, `error`). The port cannot be re-picked: the manifest names it, and after
+  formation so does every peer's membership. A row that still fails after 5 attempts says so.
 - **It cannot move outbound connects.** Every `connect` still takes its local port from the
   dynamic pool, and so does memberlist's own push/pull. With the pool held, the failure moves
   to `connect to 127.0.0.1:<port in range>: ... (os error 10055)` and to gossip rows that
   "did not observe each other within 10s" after `gossip seed join incomplete` with `10055`.
   That is the host. Count `Bound` ports and their owners before reading it as a regression.
+- **This stays host-only, by decision (issue #5).** The dynamic pool is system-wide: when
+  another process holds it, every process on the host loses its outbound connects, not only
+  rEtcd's. Moving rEtcd's connects into the range was counted on 2026-10-02 and not done:
+  - It is 26 connect sites in 19 files: the product's client (`config-client`) and peer
+    transport (`config-grpc`), 18 tonic channels in tests and 6 raw `TcpStream::connect`. Plus
+    memberlist's push/pull, which needs a custom `StreamLayer` (the trait is public in
+    `memberlist-net`; its `Tcp` layer calls a plain `connect`).
+  - It adds a fault of its own. A connect bound to an explicit local port fails with `10048`
+    while the same four-tuple is in `TIME_WAIT` (measured on this host, 2026-10-02), and every
+    bound connect holds a range port that a listener draw can then hit, which is issue #14's
+    fault on the connect side.
+
+  So the test stage of both gate scripts runs `scripts/port-preflight.sh` first. It prints
+  `gate: dynamic tcp pool start=… size=… bound=…` and warns when half the pool or more is
+  `Bound`. It never fails the gate; it tells you, before the reds, that the host is the suspect.
 
 ## Counting M7 rows: run the script, never quote a plan
 

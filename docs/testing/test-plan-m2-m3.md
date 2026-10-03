@@ -655,7 +655,7 @@ file, certs, allowlist and manifest into each; `DaemonProcess::spawn` × 3 with 
 | E2E-08 | cold_restart_whole_cluster | `shutdown_graceful` all three; respawn all three without `--form` | cluster re-forms from disk; all 15 revisions present; `state_hash` identical on all three; membership log id unchanged | §21 M2 line 1 at process level |
 | E2E-09 | graceful_shutdown_is_clean | `shutdown_graceful` on one node | exit code 0 within the deadline; final log line `msg="shutdown_complete"`; the RocksDB dir reopens immediately afterwards with no `LOCK` error | TA-21, TA-26.4 |
 | E2E-10 | cross_process_trace_correlation | one client put through the leader daemon | Q10 joins the client's `trace_id` to lines in **all three** daemon log files; ≥ 1 `op="apply"` line per node | the three log files are separate; the join is the proof that propagation works across processes |
-| E2E-11 | per_process_log_files_exist_and_are_tagged | any E2E test | each node's `logs/<testModule>/<testMethod>.jsonl` exists, is non-empty, carries exactly one `testMethod`, and every line carries `node_id` | Q12 |
+| E2E-11 | per_process_log_files_exist_and_are_tagged | any E2E test | each node's `logs/<testModule>/<testMethod>.jsonl` exists, is non-empty, carries exactly one `testMethod`, and every line except third-party `openraft*`/`memberlist*` lines carries `node_id` (ADR-0013 note "what `node_id` is required on") | Q12 |
 | E2E-12 | insecure_refused_at_process_level | config with `tls_mode="insecure"` and no flag | process exits code 2 before binding; stderr/log names `--allow-insecure-dev` | |
 | E2E-13 | unlisted_principal_denied_at_process_level | client cert for `svc-z` not in the allowlist | `PERMISSION_DENIED` from the daemon; a deny audit line in that node's log | Q9 over daemon logs |
 | E2E-14 | identity_mismatch_at_process_level | swap node 2's and node 3's data dirs and restart both | both exit code 2 with `msg="identity_mismatch"`; neither serves traffic; the third node keeps running | §4.2 |
@@ -818,9 +818,15 @@ ones we did not anticipate.
 SELECT coalesce(testModule,'<null>') m, coalesce(testMethod,'<null>') t,
        coalesce(testRun,'<null>') r, coalesce(node_id::VARCHAR,'<null>') n, count(*) c
 FROM read_json_auto(?, union_by_name=true)
-WHERE testModule IS NULL OR testMethod IS NULL OR node_id IS NULL
+WHERE testModule IS NULL OR testMethod IS NULL
+   OR (node_id IS NULL AND coalesce("@logger",'') NOT LIKE 'openraft%'
+                       AND coalesce("@logger",'') NOT LIKE 'memberlist%')
 GROUP BY ALL;
 ```
+
+Third-party lines are exempt from the `node_id` half (ADR-0013 note "what `node_id` is required
+on"). OpenRaft logs a slow or failed peer RPC from a task whose span the daemon's `openraft=info`
+filter disables, so under load such a line has no `node_id`.
 
 **Assertion:** zero rows; plus each of the three files exists, is non-empty, and has exactly one
 distinct `node_id`.

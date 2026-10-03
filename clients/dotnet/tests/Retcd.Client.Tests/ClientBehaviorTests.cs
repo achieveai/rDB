@@ -8,14 +8,20 @@ namespace Retcd.Client.Tests;
 /// <summary>Behaviour that needs no cluster: checks before sending, and what a dead address looks like.</summary>
 public class ClientBehaviorTests
 {
-    private static int FreeClosedPort() => TestPorts.FreeClosedPort();
-
-    private static RetcdClient DeadClient(double seconds = 3) =>
-        RetcdClient.Create(new RetcdClientOptions
+    // A dead node with no sockets: the scripted connect step is refused every time, so nothing is ever sent and the
+    // test takes no host port to find a closed one. Health has no connect seam, so it asks port 0, where nothing can
+    // listen (the client refuses port 0 as a node endpoint, so the node itself cannot use it).
+    private static RetcdClient DeadClient(double seconds = 3)
+    {
+        var c = RetcdClient.Create(new RetcdClientOptions
         {
-            Endpoints = new[] { $"127.0.0.1:{FreeClosedPort()}" },
+            Endpoints = new[] { "127.0.0.1:1" },
+            HealthEndpoints = new[] { "127.0.0.1:0" },
             Timeout = TimeSpan.FromSeconds(seconds),
         });
+        c.TestTransport.FakeConnect = (_, _) => new SocketException((int)SocketError.ConnectionRefused);
+        return c;
+    }
 
     [Fact]
     public async Task Value_over_1_MiB_is_refused_before_anything_is_sent()
@@ -68,8 +74,8 @@ public class ClientBehaviorTests
     }
 
     // ---- the retry loop, with each answer scripted in place of the RPC ----------------------------
-    // The node is a bare TcpListener: the client's connect step passes, and the scripted answer stands in
-    // for what the server would have sent.
+    // No sockets: ScriptedClient fakes the connect step, so it passes without the host, and the scripted answer
+    // stands in for what the server would have sent.
 
     private static RpcException Status(StatusCode code, bool stamped, string? reason = null)
     {
@@ -87,100 +93,74 @@ public class ClientBehaviorTests
         return new AsyncUnaryCall<string>(task, Task.FromResult(new Metadata()), () => Grpc.Core.Status.DefaultSuccess, () => new Metadata(), () => { });
     }
 
-    private static async Task WithListeningNode(double timeoutSeconds, Func<RetcdClient, Task> body)
-    {
-        var l = TestPorts.Listen();
-        try
-        {
-            await using var c = RetcdClient.Create(new RetcdClientOptions
-            {
-                Endpoints = new[] { $"127.0.0.1:{TestPorts.Port(l)}" },
-                Timeout = TimeSpan.FromSeconds(timeoutSeconds),
-            });
-            await body(c);
-        }
-        finally
-        {
-            l.Stop();
-        }
-    }
-
     [Fact]
     public async Task No_leader_yet_is_waited_out_for_a_read_and_a_write_because_nothing_was_applied()
     {
-        await WithListeningNode(10, async c =>
+        await using var c = ScriptedClient(1, TimeSpan.FromSeconds(10));
+        foreach (var isWrite in new[] { false, true })
         {
-            foreach (var isWrite in new[] { false, true })
-            {
-                var attempts = 0;
-                var r = await c.UnaryAsync("put", isWrite, 0, (_, _) => Answer(() =>
-                    ++attempts < 3 ? throw Status(StatusCode.Unavailable, stamped: true) : "applied"), CancellationToken.None);
-                Assert.Equal("applied", r);
-                Assert.Equal(3, attempts);
-            }
-        });
+            var attempts = 0;
+            var r = await c.UnaryAsync("put", isWrite, 0, (_, _) => Answer(() =>
+                ++attempts < 3 ? throw Status(StatusCode.Unavailable, stamped: true) : "applied"), CancellationToken.None);
+            Assert.Equal("applied", r);
+            Assert.Equal(3, attempts);
+        }
     }
 
     [Fact]
     public async Task No_leader_yet_gives_up_at_the_call_timeout_and_says_nothing_was_applied()
     {
-        await WithListeningNode(1, async c =>
-        {
-            var attempts = 0;
-            var started = DateTime.UtcNow;
-            var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("put", true, 0,
-                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: true); }), CancellationToken.None));
-            var took = DateTime.UtcNow - started;
-            Assert.Contains("no leader known yet", ex.Message);
-            Assert.Contains("Nothing was applied", ex.Message);
-            Assert.True(attempts > 1, $"retried ({attempts} attempts)");
-            Assert.InRange(took.TotalSeconds, 0.9, 5);
-        });
+        // Scripted connect: the whole 1 s budget goes to "no leader yet" answers and their pauses, never to a socket
+        // connect on a busy host, so the call retries and ends at Timeout (the loop and PauseWithin both wait it out).
+        await using var c = ScriptedClient(1, TimeSpan.FromSeconds(1));
+        var attempts = 0;
+        var started = DateTime.UtcNow;
+        var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("put", true, 0,
+            (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: true); }), CancellationToken.None));
+        var took = DateTime.UtcNow - started;
+        Assert.Contains("no leader known yet", ex.Message);
+        Assert.Contains("Nothing was applied", ex.Message);
+        Assert.True(attempts > 1, $"retried ({attempts} attempts)");
+        Assert.InRange(took.TotalSeconds, 0.9, 5);
     }
 
     [Fact]
     public async Task Unavailable_with_a_reason_or_without_the_stamp_is_not_resent()
     {
-        await WithListeningNode(10, async c =>
-        {
-            var attempts = 0;
-            await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("get", false, 0,
-                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: true, reason: "feature_not_activated"); }), CancellationToken.None));
-            Assert.Equal(1, attempts);
+        await using var c = ScriptedClient(1, TimeSpan.FromSeconds(10));
+        var attempts = 0;
+        await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("get", false, 0,
+            (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: true, reason: "feature_not_activated"); }), CancellationToken.None));
+        Assert.Equal(1, attempts);
 
-            attempts = 0; // a write the transport lost: it may have been applied, so it is never resent
-            await Assert.ThrowsAsync<UnknownOutcomeException>(() => c.UnaryAsync("put", true, 0,
-                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: false); }), CancellationToken.None));
-            Assert.Equal(1, attempts);
-        });
+        attempts = 0; // a write the transport lost: it may have been applied, so it is never resent
+        await Assert.ThrowsAsync<UnknownOutcomeException>(() => c.UnaryAsync("put", true, 0,
+            (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: false); }), CancellationToken.None));
+        Assert.Equal(1, attempts);
     }
 
     [Fact]
     public async Task A_read_the_transport_lost_is_resent_because_a_read_changes_nothing()
     {
-        await WithListeningNode(10, async c =>
-        {
-            var attempts = 0;
-            var r = await c.UnaryAsync("get", false, 0, (_, _) => Answer(() =>
-                ++attempts < 3 ? throw Status(StatusCode.Unavailable, stamped: false) : "read"), CancellationToken.None);
-            Assert.Equal("read", r);
-            Assert.Equal(3, attempts);
-        });
+        await using var c = ScriptedClient(1, TimeSpan.FromSeconds(10));
+        var attempts = 0;
+        var r = await c.UnaryAsync("get", false, 0, (_, _) => Answer(() =>
+            ++attempts < 3 ? throw Status(StatusCode.Unavailable, stamped: false) : "read"), CancellationToken.None);
+        Assert.Equal("read", r);
+        Assert.Equal(3, attempts);
     }
 
     [Fact]
     public async Task A_read_the_transport_keeps_losing_gives_up_at_the_call_timeout()
     {
-        await WithListeningNode(1, async c =>
-        {
-            var attempts = 0;
-            var started = DateTime.UtcNow;
-            var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("get", false, 0,
-                (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: false); }), CancellationToken.None));
-            Assert.Contains("dropped the call", ex.Message);
-            Assert.True(attempts > 1, $"retried ({attempts} attempts)");
-            Assert.InRange((DateTime.UtcNow - started).TotalSeconds, 0.9, 5);
-        });
+        await using var c = ScriptedClient(1, TimeSpan.FromSeconds(1));
+        var attempts = 0;
+        var started = DateTime.UtcNow;
+        var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("get", false, 0,
+            (_, _) => Answer(() => { attempts++; throw Status(StatusCode.Unavailable, stamped: false); }), CancellationToken.None));
+        Assert.Contains("dropped the call", ex.Message);
+        Assert.True(attempts > 1, $"retried ({attempts} attempts)");
+        Assert.InRange((DateTime.UtcNow - started).TotalSeconds, 0.9, 5);
     }
 
     [Fact]
@@ -217,22 +197,23 @@ public class ClientBehaviorTests
     [Fact]
     public async Task R1_F001_a_refusal_seen_after_the_connect_step_is_unknown_for_a_write_and_never_resent()
     {
-        await WithListeningNode(2, async c =>
-        {
-            // The connect step passed, so this came from the send. Its socket error is no proof the write was not sent.
-            var refused = new RpcException(new Grpc.Core.Status(StatusCode.Unavailable, "Error connecting to subchannel.",
-                new HttpRequestException("refused", new SocketException((int)SocketError.ConnectionRefused))));
-            var attempts = 0;
-            var ex = await Assert.ThrowsAsync<UnknownOutcomeException>(() => c.UnaryAsync("put", true, 0,
-                (_, _) => Answer(() => { attempts++; throw refused; }), CancellationToken.None));
-            Assert.Equal(1, attempts);
-            Assert.DoesNotContain("Nothing was", ex.Message);
+        await using var c = ScriptedClient(1, TimeSpan.FromSeconds(2));
+        // The connect step passed, so this came from the send. Its socket error is no proof the write was not sent.
+        var refused = Refused();
+        var attempts = 0;
+        var ex = await Assert.ThrowsAsync<UnknownOutcomeException>(() => c.UnaryAsync("put", true, 0,
+            (_, _) => Answer(() => { attempts++; throw refused; }), CancellationToken.None));
+        Assert.Equal(1, attempts);
+        Assert.DoesNotContain("Nothing was", ex.Message);
 
-            attempts = 0; // a read with the same error still moves on: a read changes nothing
-            var r = await c.UnaryAsync("get", false, 0, (_, _) => Answer(() => ++attempts < 2 ? throw refused : "read"), CancellationToken.None);
-            Assert.Equal("read", r);
-        });
+        attempts = 0; // a read with the same error still moves on: a read changes nothing
+        var r = await c.UnaryAsync("get", false, 0, (_, _) => Answer(() => ++attempts < 2 ? throw refused : "read"), CancellationToken.None);
+        Assert.Equal("read", r);
     }
+
+    /// <summary>A connect failure as the call itself reports it, after the connect step passed.</summary>
+    private static RpcException Refused() => new(new Grpc.Core.Status(StatusCode.Unavailable, "Error connecting to subchannel.",
+        new HttpRequestException("refused", new SocketException((int)SocketError.ConnectionRefused))));
 
     private static int Port(string endpoint) => new Uri(endpoint).Port;
 
@@ -415,7 +396,7 @@ public class ClientBehaviorTests
     }
 
     // ---- A1: a pause after a failure stays inside Timeout ----------------------------------------
-    // No sockets: MemoryNode.Attach fakes the connect step, and the scripted answer stands in for the RPC.
+    // No sockets: ScriptedClient fakes the connect step, and the scripted answer stands in for the RPC.
 
     private static RetcdClient ScriptedClient(int nodes, TimeSpan timeout)
     {
@@ -428,43 +409,132 @@ public class ClientBehaviorTests
         return c;
     }
 
+    // Each row below makes its failure land after the deadline, so no attempt can follow it and any pause after it
+    // is pure lateness. Capped, the call gives up at once; uncapped, it first sleeps the whole pause. A row times only
+    // that tail, from the failure to the give-up, so a stall before the failure on a busy host cannot fail it. There
+    // is no whole-call bound: the time before the failure is the scripted step's own sleep, and the tail bounds the rest.
+
+    private const double TailBoundMs = 50;
+
+    /// <summary>
+    /// Runs <paramref name="call"/> on a client from <paramref name="newClient"/>. The call must fail late and call its
+    /// <c>Action</c> at the moment of the failure. Returns the shortest time from that failure to the give-up over up to
+    /// three tries. One stall on a busy host cannot fail a row, but an uncapped pause is in every try. Each try gets a
+    /// fresh client, so every try is that client's first late give-up and nothing one try leaves behind (the current
+    /// node, any state the client keeps) can let a later try skip the pause.
+    /// </summary>
+    private static async Task<(double Ms, RetcdUnavailableException Ex)> TailAfterALateFailure(
+        Func<RetcdClient> newClient, Func<RetcdClient, Action, Task> call)
+    {
+        var best = (Ms: double.MaxValue, Ex: (RetcdUnavailableException)null!);
+        for (var i = 0; i < 3 && best.Ms >= TailBoundMs; i++)
+        {
+            await using var c = newClient();
+            long failedAt = 0;
+            var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => call(c, () => failedAt = System.Diagnostics.Stopwatch.GetTimestamp()));
+            var ms = System.Diagnostics.Stopwatch.GetElapsedTime(failedAt).TotalMilliseconds;
+            Assert.NotEqual(0, failedAt);
+            if (ms < best.Ms) best = (ms, ex);
+        }
+        return best;
+    }
+
     [Fact]
     public async Task A1_a_no_leader_pause_that_would_run_past_Timeout_does_not_make_the_call_late()
     {
-        // Timeout 250 ms. The one attempt takes 230 ms and answers "no leader yet", so ~20 ms are left for a 200 ms
-        // pause. Uncapped, that pause ends the call at >= 430 ms whatever the timer does; capped, it ends at Timeout.
-        // The attempt's own length, not timer jitter, sets the arithmetic, and the fixed side has 130 ms of slack for
-        // a busy host.
-        await using var c = ScriptedClient(1, TimeSpan.FromMilliseconds(250));
-        var attempts = 0;
-        var started = DateTime.UtcNow;
-        var ex = await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("put", true, 0,
-            (_, _) => Answer(() => { attempts++; Thread.Sleep(230); throw Status(StatusCode.Unavailable, stamped: true); }),
-            CancellationToken.None));
-        var took = DateTime.UtcNow - started;
-        Assert.Equal(1, attempts); // no attempt after the budget
+        // Timeout 100 ms. The one attempt takes 150 ms and answers "no leader yet": the 200 ms election pause must not run.
+        var attemptsPerTry = new List<int>();
+        var (ms, ex) = await TailAfterALateFailure(() => ScriptedClient(1, TimeSpan.FromMilliseconds(100)), async (c, failed) =>
+        {
+            var attempts = 0;
+            try
+            {
+                await c.UnaryAsync("put", true, 0, (_, _) => Answer(() =>
+                {
+                    attempts++;
+                    Thread.Sleep(150);
+                    failed();
+                    throw Status(StatusCode.Unavailable, stamped: true);
+                }), CancellationToken.None);
+            }
+            finally { attemptsPerTry.Add(attempts); }
+        });
+        Assert.All(attemptsPerTry, n => Assert.Equal(1, n)); // no attempt after the budget
         Assert.Contains("no leader known yet", ex.Message);
-        Assert.True(took.TotalMilliseconds < 380, $"took {took.TotalMilliseconds:0} ms against a 250 ms Timeout");
+        Assert.True(ms < TailBoundMs, $"ran {ms:0} ms past a no-leader answer that came after the deadline");
     }
 
     [Fact]
     public async Task A1_a_hint_loop_pause_that_would_run_past_Timeout_does_not_make_the_call_late()
     {
-        // Two nodes naming each other: two free hops, then the third send takes 90 ms, so the third hop's 200 ms pause
-        // cannot fit the ~10 ms left. Uncapped, the call ends at >= 290 ms; capped, at Timeout, with 150 ms of slack.
-        await using var c = ScriptedClient(2, TimeSpan.FromMilliseconds(100));
-        var sends = 0;
+        // Two nodes naming each other: two free hops, then the third send takes 350 ms against a 300 ms Timeout, so
+        // the third hop's 200 ms pause must not run. The wide Timeout leaves the two free hops 300 ms to happen in.
         RpcException NotLeader(string hint) => new(new Grpc.Core.Status(StatusCode.FailedPrecondition, "not leader"),
             new Metadata { { "retcd-outcome", "rejected" }, { "retcd-leader-endpoint", hint } });
-        var started = DateTime.UtcNow;
-        await Assert.ThrowsAsync<RetcdUnavailableException>(() => c.UnaryAsync("put", true, 0,
-            (_, _) => Answer(() =>
+        var sendsPerTry = new List<int>();
+        var (ms, _) = await TailAfterALateFailure(() => ScriptedClient(2, TimeSpan.FromMilliseconds(300)), async (c, failed) =>
+        {
+            var sends = 0;
+            try
             {
-                if (++sends == 3) Thread.Sleep(90);
-                throw NotLeader(sends % 2 == 1 ? "127.0.0.1:2" : "127.0.0.1:1");
-            }), CancellationToken.None));
-        var took = DateTime.UtcNow - started;
-        Assert.Equal(3, sends);
-        Assert.True(took.TotalMilliseconds < 250, $"took {took.TotalMilliseconds:0} ms against a 100 ms Timeout");
+                await c.UnaryAsync("put", true, 0, (_, _) => Answer(() =>
+                {
+                    if (++sends == 3)
+                    {
+                        Thread.Sleep(350);
+                        failed();
+                    }
+                    throw NotLeader(sends % 2 == 1 ? "127.0.0.1:2" : "127.0.0.1:1");
+                }), CancellationToken.None);
+            }
+            finally { sendsPerTry.Add(sends); }
+        });
+        Assert.All(sendsPerTry, n => Assert.Equal(3, n));
+        Assert.True(ms < TailBoundMs, $"ran {ms:0} ms past a third hop that came after the deadline");
+    }
+
+    // The 100 ms pauses after a connect failure, a call-connect failure and a dropped read. In each row the failure
+    // lands after the deadline (Timeout 100 ms, the scripted step takes 150 ms), so no attempt can follow it. Capped,
+    // the call gives up at once; uncapped, it first sleeps the whole 100 ms. The row times only that tail.
+
+    [Fact]
+    public async Task A1_a_pause_after_a_connect_failure_does_not_run_past_Timeout()
+    {
+        // One node: the quick window fails at once, then the slow window fails late and is followed by the 100 ms pause.
+        var (ms, ex) = await TailAfterALateFailure(() => ScriptedClient(1, TimeSpan.FromMilliseconds(100)), async (c, failed) =>
+        {
+            var connects = 0;
+            c.TestTransport.FakeConnect = (_, window) =>
+            {
+                if (++connects == 2)
+                {
+                    Assert.Equal(TimeSpan.FromSeconds(3), window);
+                    Thread.Sleep(150);
+                    failed();
+                }
+                return new TimeoutException("scripted: no answer");
+            };
+            await c.GetAsync("k");
+        });
+        Assert.Contains("cannot connect", ex.Message);
+        Assert.True(ms < TailBoundMs, $"ran {ms:0} ms past a connect failure that came after the deadline");
+    }
+
+    [Fact]
+    public async Task A1_a_pause_after_a_call_connect_failure_does_not_run_past_Timeout()
+    {
+        var (ms, ex) = await TailAfterALateFailure(() => ScriptedClient(1, TimeSpan.FromMilliseconds(100)), (c, failed) => c.UnaryAsync("get", false, 0,
+            (_, _) => Answer(() => { Thread.Sleep(150); failed(); throw Refused(); }), CancellationToken.None));
+        Assert.Contains("cannot connect", ex.Message);
+        Assert.True(ms < TailBoundMs, $"ran {ms:0} ms past a call-connect failure that came after the deadline");
+    }
+
+    [Fact]
+    public async Task A1_a_pause_after_a_dropped_read_does_not_run_past_Timeout()
+    {
+        var (ms, ex) = await TailAfterALateFailure(() => ScriptedClient(1, TimeSpan.FromMilliseconds(100)), (c, failed) => c.UnaryAsync("get", false, 0,
+            (_, _) => Answer(() => { Thread.Sleep(150); failed(); throw Status(StatusCode.Unavailable, stamped: false); }), CancellationToken.None));
+        Assert.Contains("dropped the call", ex.Message);
+        Assert.True(ms < TailBoundMs, $"ran {ms:0} ms past a dropped read that came after the deadline");
     }
 }
