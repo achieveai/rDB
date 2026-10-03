@@ -1,0 +1,39 @@
+[package]
+name = "rdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rDB storage adapter (M8): the M1 storage seam on a real RocksDB engine"
+
+[dependencies]
+rdb-core = { workspace = true }
+# The workspace pin, no new features, so `librocksdb-sys` is shared with `config-storage`
+# (LIBCLANG_PATH, ADR-0017). This crate must not depend on `config-storage`: it would pull in
+# openraft (architecture.md M8 §2).
+rocksdb = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+# Facade only; the example installs the subscriber through `config-log` (ADR-0013).
+tracing = { workspace = true }
+
+[dev-dependencies]
+# The example's canonical batches come from the M7 oracle's own builder, so the bytes written
+# are the bytes T1 commits (rdb-sim `canonical_history`).
+rdb-sim = { workspace = true }
+# The example installs the JSONL subscriber (ADR-0013). Allowed direction: rdb-* -> config-*.
+config-log = { workspace = true }
+# `#[retcd_test]` expands to `::config_log::testing::test_span(..)`, so both are needed.
+config-log-macros = { workspace = true }
+# A thread-local collecting layer lets a test assert on the events an open emits without
+# reading a file the non-blocking writer may not have flushed.
+tracing-subscriber = { workspace = true }
+# The S1 differential writes docs/evidence/rdb-m8-storage-conformance.json through
+# `write_evidence`, which stamps the shared envelope and disclaimer (as rdb-sim's campaign
+# does). Allowed direction: rdb-* -> config-*.
+config-testkit = { workspace = true }
+serde_json = { workspace = true }
+
+[[example]]
+name = "rocks_scenario"
+# Run the example's argument-parsing tests under `cargo test -p rdb-storage` (defect T3).
+test = true

@@ -14,6 +14,7 @@ members = [
     # --- rDB data plane (M7, rdb ADR-0002) ---
     "crates/rdb-core",
     "crates/rdb-sim",
+    "crates/rdb-storage",
 ]
 
 [workspace.package]
@@ -39,6 +40,7 @@ config-testkit = { path = "crates/config-testkit" }
 # `rdb-*` crate (rdb ADR-0002).
 rdb-core = { path = "crates/rdb-core" }
 rdb-sim = { path = "crates/rdb-sim" }
+rdb-storage = { path = "crates/rdb-storage" }
 
 # --- pinned per ADR-0002 / ADR-0003 ---
 # `loosen-follower-log-revert` is deliberately NOT here: it is a dev-dependency feature of

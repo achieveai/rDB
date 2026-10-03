@@ -1,6 +1,8 @@
 # ADR-rdb-0007: Fenced grants and partition epochs
 
 **Status:** Proposed
+**Amended by:** ADR-rdb-0010 (decision 10: a late old-owner write before and after the generation
+switch, and the "Late old dispatch" row).
 **Date:** 2026-09-20
 **Release-blocking.** A failure of gate V2 blocks the ownership-transition and failover features
 outright; there is no partial credit and no flag that softens it.

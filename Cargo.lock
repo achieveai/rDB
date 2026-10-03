@@ -3483,6 +3483,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdb-storage"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "config-log",
+ "config-log-macros",
+ "config-testkit",
+ "rdb-core",
+ "rdb-sim",
+ "rocksdb",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
