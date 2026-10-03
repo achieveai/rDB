@@ -45,10 +45,10 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::publication::PublicationEffect;
 use rdb_core::contracts::recovery::{
-    DurableProof, RecoveryEffect, RecoveryEvent, RecoveryResult, SurvivorInventory,
+    DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryResult, SurvivorInventory,
 };
 use rdb_core::contracts::storage::{
-    Batch, CapturedPrefix, SnapshotRead, StorageEvent, StoreEffect,
+    Batch, CapturedPrefix, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
 use rdb_core::contracts::time::{Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::{
@@ -69,6 +69,7 @@ use crate::harness::hop::{self, HopDelay};
 use crate::harness::hosted::{Hosted, Scope};
 use crate::harness::protection::ProtectionTable;
 use crate::harness::route;
+use crate::harness::run::{FaultTag, StepAction};
 use crate::harness::semantic;
 use crate::harness::trace::Site;
 use crate::harness::transfer::{Step, Transfer, TransferPlan};
@@ -197,8 +198,18 @@ pub enum Dropped {
 /// A struct of six named fields rather than a `Vec<Box<dyn Module>>`: the set is closed, the
 /// order is part of the contract, and a fixed struct cannot be iterated in a surprising order.
 /// It also costs no allocation and no dynamic dispatch on the hot path.
+///
+/// One exception, for M7V-82: [`Self::inject_module`] puts a caller's module in place of the
+/// real one under the same [`ModuleName`]. The order and the set stay closed; only which body
+/// answers changes.
 #[derive(Debug)]
 pub struct Dispatcher {
+    /// Modules a caller put in place of the real one under the same name, consulted before it.
+    /// Empty unless [`Self::inject_module`] was called.
+    injected: Injected,
+    /// Planned faults a scenario step tagged, waiting for their provider to take them, in the
+    /// order they were planned: `(action, partition, tag)` (see [`Self::fault_taken`]).
+    awaiting: Vec<(StepAction, PartitionId, FaultTag)>,
     /// One A1 per node: a grant is a node's (see [`crate::harness::hosted`]).
     authority: Hosted<Authority>,
     transaction: Transaction,
@@ -219,7 +230,7 @@ pub struct Dispatcher {
     /// Read views bound to their handles, until released.
     snapshots: BTreeMap<(NodeId, SnapshotHandle), MemorySnapshot>,
     /// What a planned crash left of each crashed node's storage.
-    crashes: BTreeMap<NodeId, CrashImage>,
+    crashes: BTreeMap<NodeId, (StorageFault, CrashImage)>,
     /// Epoch revocations made durable, per node (A1's `PersistEpochRevocation`).
     revocations: BTreeSet<(NodeId, PartitionId, OwnerEpoch)>,
     /// Restarted nodes whose fresh A1 has not yet been offered anything. Its first offer reads
@@ -337,6 +348,19 @@ pub struct Dispatcher {
     clock: Clock,
 }
 
+/// The modules [`Dispatcher::inject_module`] holds. A newtype so [`Dispatcher`] keeps its
+/// derived `Debug`: [`Module`] has no `Debug` bound, so this prints the names only.
+#[derive(Default)]
+struct Injected(Vec<Box<dyn Module>>);
+
+impl std::fmt::Debug for Injected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|held| held.name()))
+            .finish()
+    }
+}
+
 impl Default for Dispatcher {
     fn default() -> Self {
         Self::new()
@@ -350,6 +374,8 @@ impl Dispatcher {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            injected: Injected::default(),
+            awaiting: Vec::new(),
             authority: Hosted::new(Scope::Node),
             transaction: Transaction::default(),
             replication: Replication::default(),
@@ -630,7 +656,7 @@ impl Dispatcher {
     /// What a planned crash left of `node`'s storage, if one fired.
     #[must_use]
     pub fn crash_image(&self, node: NodeId) -> Option<&CrashImage> {
-        self.crashes.get(&node)
+        self.crashes.get(&node).map(|(_, image)| image)
     }
 
     /// Whether `node` holds a durable revocation of `epoch` for `partition`.
@@ -750,7 +776,7 @@ impl Dispatcher {
                 field: "restart_boot",
             });
         }
-        let image = self
+        let (_, image) = self
             .crashes
             .remove(&node)
             .ok_or(SimError::Config { field: "restart" })?;
@@ -850,23 +876,87 @@ impl Dispatcher {
         }
     }
 
-    /// Take a planned crash on `node`, if one is due, and refuse the effect that met it. A
-    /// crashed node stays down until [`Self::restart`]: every later storage effect on it is
-    /// refused under the same seam. A crash drops every read view the node held, as a real
+    /// Take a planned crash on `node`, if one is due, and say whether `node` is down. A crashed
+    /// node stays down until [`Self::restart`]. The caller decides what the crash means for the
+    /// effect that met it: on the node's own delivery the process is dead, so that effect and
+    /// every later one are dropped ([`Self::deliver_effects`]); on another node's behalf the
+    /// request is answered as failed ([`Self::sync_wal_through`]). Nothing is refused: a crash is
+    /// a fault the run goes on through, and a [`crate::harness::run::StepAction::Restart`] step
+    /// brings the node back. A crash drops every read view the node held, as a real
     /// engine loses its snapshots with the process (A-R69a), and its control-store watches end
     /// with it: this is the one place a crash is taken, so it owes them here, whichever node's
     /// delivery tripped it, and the next [`Self::pump`] ends them (F-E, tester D2).
-    fn crash_check(&mut self, node: NodeId) -> Result<(), SimError> {
+    fn crash_check(&mut self, node: NodeId) -> Result<bool, SimError> {
         if let Some(fault) = self.engine_mut(node).take_crash() {
+            let now = self.clock.now();
+            self.fault_taken(
+                StepAction::Storage(StorageOp::Crash { node, fault }),
+                node,
+                now,
+            );
             let image = CrashImage::of(self.engine_mut(node), fault)?;
-            self.crashes.insert(node, image);
+            self.crashes.insert(node, (fault, image));
             self.snapshots.retain(|(holder, _), _| *holder != node);
             self.watches_owed.insert(node);
+            tracing::info!(tick = now.0, node = node.0, ?fault, "crash taken");
         }
-        if self.crashes.contains_key(&node) {
-            return Err(SimError::unavailable("harness::dispatch::deliver::crash"));
-        }
-        Ok(())
+        Ok(self.is_down(node))
+    }
+
+    /// Hold `tag` until the provider of `action` takes the fault it plans (see
+    /// [`Self::fault_taken`]). Called by the run loop for a [`crate::harness::run::ScenarioStep`]
+    /// whose `taken` is set, just before the action is applied.
+    pub fn await_fault(&mut self, action: StepAction, partition: PartitionId, tag: FaultTag) {
+        self.awaiting.push((action, partition, tag));
+    }
+
+    /// **The one fault hook** (lead ruling L-R182m, critic F1/F2): a provider calls this at the
+    /// moment it takes a planned fault, naming the planned operation as the step gave it. When a
+    /// step tagged that operation, the oldest such tag is consumed and one
+    /// [`TraceKind::FaultInjected`] line is held for the run loop, at `at`, on `target`, with
+    /// the action's fault kind and the tag's boundary and op index. A fault no step tagged
+    /// (planned before the run, by an authored row) records nothing: it has no scenario op index
+    /// to give.
+    ///
+    /// `at` is the tick the provider took the fault at, so the line sorts with the lines the
+    /// provider writes beside it. A host flush runs before the clock is advanced to its tick, so
+    /// the clock's now would put its line in the past of the sync it follows.
+    ///
+    /// Providers that call it: [`Self::crash_check`] for [`StorageOp::Crash`], and
+    /// [`Self::false_durable_check`] for [`StorageOp::FalseDurable`].
+    fn fault_taken(&mut self, action: StepAction, target: NodeId, at: Tick) {
+        let Some(slot) = self
+            .awaiting
+            .iter()
+            .position(|(waiting, _, _)| *waiting == action)
+        else {
+            return;
+        };
+        let (action, partition, tag) = self.awaiting.remove(slot);
+        let site = Site {
+            at,
+            node: target,
+            boot: self.boot(target).unwrap_or_default(),
+            partition,
+            correlation: CorrelationId(0),
+        };
+        tracing::info!(
+            tick = site.at.0,
+            node = target.0,
+            ?action,
+            boundary = ?tag.boundary,
+            op_index = tag.op_index,
+            "fault taken"
+        );
+        self.lines.push((
+            site,
+            TraceKind::FaultInjected {
+                fault_kind: action.fault_kind(),
+                target,
+                boundary: tag.boundary,
+                scenario_op_index: tag.op_index,
+            },
+        ));
     }
 
     fn engine_mut(&mut self, node: NodeId) -> &mut MemoryEngine {
@@ -875,7 +965,22 @@ impl Dispatcher {
             .or_insert_with(|| MemoryEngine::new(node))
     }
 
+    /// Put `module` in place of the real module of the same [`Module::name`], for every later
+    /// step and for [`Self::capability_report`]. A second injection under one name replaces the
+    /// first. The real module is kept and never stepped while replaced.
+    ///
+    /// Reached only through [`crate::harness::run::Runner::with_modules`], the M7V-82 test seam
+    /// (critic F13).
+    pub(crate) fn inject_module(&mut self, module: Box<dyn Module>) {
+        let name = module.name();
+        self.injected.0.retain(|held| held.name() != name);
+        self.injected.0.push(module);
+    }
+
     fn module(&self, name: ModuleName) -> &dyn Module {
+        if let Some(held) = self.injected.0.iter().find(|held| held.name() == name) {
+            return held.as_ref();
+        }
         match name {
             ModuleName::Authority => &self.authority,
             ModuleName::Transaction => &self.transaction,
@@ -887,6 +992,9 @@ impl Dispatcher {
     }
 
     fn module_mut(&mut self, name: ModuleName) -> &mut dyn Module {
+        if let Some(slot) = self.injected.0.iter().position(|held| held.name() == name) {
+            return self.injected.0[slot].as_mut();
+        }
         match name {
             ModuleName::Authority => &mut self.authority,
             ModuleName::Transaction => &mut self.transaction,
@@ -1064,6 +1172,14 @@ impl Dispatcher {
             },
             None => ctx,
         };
+        if let Some(slot) = self
+            .injected
+            .0
+            .iter()
+            .position(|held| held.name() == module)
+        {
+            return self.injected.0[slot].step(&ctx, event);
+        }
         if module == ModuleName::Publication {
             if let Some(primary) = self.replication.primary(event.node, event.partition) {
                 let view: &dyn ReplicationView = primary.tracker();
@@ -1179,9 +1295,9 @@ impl Dispatcher {
     ///   bound is refused; `Release` unbinds it; `PersistEpochRevocation` is recorded and
     ///   completes as A1's `EpochRevocationPersisted`. Buffered data is never reported durable:
     ///   the only durable prefix a completion carries is one [`MemoryEngine::sync_wal_through`]
-    ///   returned. A planned crash is taken before the effect and refused as
-    ///   `harness::dispatch::deliver::crash`, with its [`CrashImage`] kept and the node's views
-    ///   dropped; the node refuses every storage effect the same way until
+    ///   returned. A planned crash is taken before the effect, with its [`CrashImage`] kept and
+    ///   the node's views dropped. The process is dead, so that effect and the rest of the batch
+    ///   are dropped as [`DropReason::NodeDown`], and so is everything handed to the node until
     ///   [`Self::restart`] reopens its engine from the image.
     /// * [`EffectKind::Kernel`]:
     ///   * **Recorded** (no module consumer by design): `Ignored`, `Alert` (A-R46), A1's `Fact`
@@ -1217,7 +1333,8 @@ impl Dispatcher {
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
         if self.is_down(node) {
-            return self.deliver_while_down(node, boot, effects);
+            self.deliver_while_down(node, boot, effects);
+            return Ok(());
         }
         // Only the node's current process has output: a boot changes only by `restart` (V-R36),
         // so effects under an older boot are a dead process's (F-D) and under a newer one are no
@@ -1248,10 +1365,10 @@ impl Dispatcher {
     }
 
     /// [`Self::deliver`] for a node that is down (rule 1, tester D4). No process runs there, so
-    /// nothing is carried out. Every effect but storage (timers, sends, control, kernel,
-    /// replies, adoptions) is dropped as [`DropReason::NodeDown`] and recorded. A storage effect
-    /// is refused at the crash seam, as every storage effect on a down node is until
-    /// [`Self::restart`].
+    /// nothing is carried out. Every effect, storage included, is dropped as
+    /// [`DropReason::NodeDown`] and recorded, as one [`Dropped::Effects`], until
+    /// [`Self::restart`]. A storage effect was refused at a crash seam until 2026-10-02 (team
+    /// i1): a down node's storage is not a seam the harness owes, it is a process that is gone.
     ///
     /// `NodeDown` holds whatever boot the effects name, the node's current one or not
     /// (tester-sim-fidelity note, slice sim-followup). Three reasons:
@@ -1262,31 +1379,24 @@ impl Dispatcher {
     ///   process that does not exist.
     /// * Nothing is lost. [`Dropped::Effects`] keeps the boot the effects named, so a row that
     ///   needs the mismatch reads it off `boot` and [`Self::boot`].
-    fn deliver_while_down(
-        &mut self,
-        node: NodeId,
-        boot: BootId,
-        effects: Vec<Effect>,
-    ) -> Result<(), SimError> {
-        let (storage, dropped): (Vec<Effect>, Vec<Effect>) = effects
-            .into_iter()
-            .partition(|effect| matches!(effect.kind, EffectKind::Store(_)));
-        if !dropped.is_empty() {
+    fn deliver_while_down(&mut self, node: NodeId, boot: BootId, effects: Vec<Effect>) {
+        if !effects.is_empty() {
             self.dropped.push(Dropped::Effects {
                 node,
                 boot,
                 reason: DropReason::NodeDown,
-                effects: dropped,
+                effects,
             });
-        }
-        if storage.is_empty() {
-            Ok(())
-        } else {
-            Err(SimError::unavailable("harness::dispatch::deliver::crash"))
         }
     }
 
     /// [`Self::deliver`]'s loop over `effects`, stopping at the first refusal.
+    ///
+    /// A planned crash on `node` is taken before the first effect that touches its storage
+    /// ([`touches_storage`]). It kills the process, so that effect and every one after it are
+    /// dropped as one [`Dropped::Effects`] with [`DropReason::NodeDown`], and nothing after the
+    /// crash runs; the effects before it did. The same holds when an effect's provider took a
+    /// crash on this node itself, as a `SyncWalThrough` whose holder is the asking node does.
     fn deliver_effects(
         &mut self,
         node: NodeId,
@@ -1295,7 +1405,14 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        for effect in effects {
+        let mut effects = effects.into_iter();
+        while let Some(effect) = effects.next() {
+            if self.is_down(node) || (touches_storage(&effect) && self.crash_check(node)?) {
+                let mut rest = vec![effect];
+                rest.extend(effects);
+                self.deliver_while_down(node, boot, rest);
+                return Ok(());
+            }
             let site = (node, effect.partition, effect.correlation);
             match &effect.kind {
                 EffectKind::AdoptAuthority {
@@ -1409,7 +1526,6 @@ impl Dispatcher {
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
         let now = scheduler.now();
-        self.crash_check(node)?;
         let kind =
             match store {
                 StoreEffect::Commit(batch) => {
@@ -1490,7 +1606,8 @@ impl Dispatcher {
     /// report, and the caller schedules nothing.
     ///
     /// Every flush that completes is recorded, one `DurabilityAdvance` per captured prefix at
-    /// `(at, correlation)` ([`semantic::durability_lines`]).
+    /// `(at, correlation)` ([`semantic::durability_lines`]), and a planned
+    /// [`StorageOp::FalseDurable`] it took goes to the fault hook ([`Self::false_durable_check`]).
     fn flush(
         &mut self,
         node: NodeId,
@@ -1502,13 +1619,31 @@ impl Dispatcher {
         if engine.stalled_sync(&captured) {
             return None;
         }
+        let claims = engine.false_claims().len();
         let synced = engine.sync_wal_through(captured.clone());
         let lines = semantic::durability_lines(engine, ticket.0, &captured, synced.as_deref());
         self.push_lines(at, (node, correlation), lines);
+        self.false_durable_check(node, claims, at);
         Some(match synced {
             Ok(durable) => StorageEvent::Flushed { ticket, durable },
             Err(fault) => StorageEvent::FlushFailed { ticket, fault },
         })
+    }
+
+    /// Hand the planned [`StorageOp::FalseDurable`] the sync just run on `node` took, if it
+    /// took one, to the fault hook ([`Self::fault_taken`]). The engine held `claims` false
+    /// claims before the sync. One it took since is the op as planned, `through` included,
+    /// because the engine records the planned op's own `through`. A sync takes at most one. `at`
+    /// is the sync's tick, the one its durability lines carry.
+    fn false_durable_check(&mut self, node: NodeId, claims: usize, at: Tick) {
+        let taken = self.engine_mut(node).false_claims().get(claims).copied();
+        if let Some(through) = taken {
+            self.fault_taken(
+                StepAction::Storage(StorageOp::FalseDurable { node, through }),
+                node,
+                at,
+            );
+        }
     }
 
     /// The role `node` applies a commit from `from` under: T1 commits only as the primary; R1
@@ -1700,13 +1835,12 @@ impl Dispatcher {
     /// generation and sequence. The copy's cursor stays outstanding, as it would after a lost
     /// frame.
     ///
-    /// A crashed node reads nothing (lead ruling B-R57a): the provider takes the crash seam first,
-    /// like every other storage reader, so a record the crash image lost is never served from
-    /// the pre-crash engine.
+    /// A crashed node reads nothing (lead ruling B-R57a): [`Self::deliver_effects`] takes a planned
+    /// crash before this provider runs ([`touches_storage`]), and drops the effect if the node is
+    /// down, so a record the crash image lost is never served from the pre-crash engine.
     ///
     /// # Errors
     ///
-    /// `harness::dispatch::deliver::crash` when `node` is down.
     /// [`SimError::Config`] naming `send_envelopes` when no primary is hosted for
     /// `(node, partition)` (R1 emits the effect from one, so this is a harness fault, not an
     /// unbuilt seam); [`SimError::Config`] naming `copy` when the
@@ -1719,7 +1853,6 @@ impl Dispatcher {
         site: (NodeId, PartitionId, CorrelationId),
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        self.crash_check(node)?;
         let partition = site.1;
         let Some(primary) = self.replication.primary(node, partition) else {
             return Err(SimError::Config {
@@ -1760,10 +1893,10 @@ impl Dispatcher {
     ///
     /// # Errors
     ///
-    /// `harness::dispatch::deliver::crash` when `node` is down. [`SimError::Config`] naming
-    /// `send_recovery_envelopes` when no receiver is hosted for `(node, partition)` (R1 emits the
-    /// effect from one, so this is a harness fault); [`SimError::Config`] naming `copy` when its
-    /// configuration has no such copy; whatever [`Self::send`] returns.
+    /// [`SimError::Config`] naming `send_recovery_envelopes` when no receiver is hosted for
+    /// `(node, partition)` (R1 emits the effect from one, so this is a harness fault);
+    /// [`SimError::Config`] naming `copy` when its configuration has no such copy; whatever
+    /// [`Self::send`] returns. A down node never reaches here ([`Self::deliver_effects`]).
     fn send_recovery_envelopes(
         &mut self,
         node: NodeId,
@@ -1773,7 +1906,6 @@ impl Dispatcher {
         site: (NodeId, PartitionId, CorrelationId),
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
-        self.crash_check(node)?;
         let partition = site.1;
         let Some(receiver) = self.replication.receiver(node, partition) else {
             return Err(SimError::Config {
@@ -1914,8 +2046,10 @@ impl Dispatcher {
                 through,
                 credential,
             } => self.catch_up(*source, *to, *through, *credential, site, scheduler),
-            RecoveryEffect::ProbeDigestAt { .. }
-            | RecoveryEffect::QuarantineSuffix { .. }
+            RecoveryEffect::ProbeDigestAt { copy, seq } => {
+                self.probe_digest_at(*copy, *seq, site, scheduler)
+            }
+            RecoveryEffect::QuarantineSuffix { .. }
             | RecoveryEffect::RebuildFromAuthoritative { .. } => Err(SimError::unavailable(
                 "harness::dispatch::deliver::recovery",
             )),
@@ -1947,6 +2081,56 @@ impl Dispatcher {
             }
             self.answer_inventory(*copy, site, now, scheduler)?;
         }
+        Ok(())
+    }
+
+    /// F1's `ProbeDigestAt`: the digest `copy` stores at `seq`, routed to the asking F1 at `now`
+    /// as [`RecoveryEvent::ProbeAnswered`] (team i1, 2026-10-02).
+    ///
+    /// Answered from the engine of the node the scenario placed `copy` on, under the generation
+    /// that copy reports today ([`Self::current_inventory`]), with the digest the engine stores
+    /// ([`stored_digest`]). Never a digest the harness made up: a copy that was not placed, whose
+    /// node is down or unregistered, or whose engine stores no record there answers
+    /// [`RecoveryEvent::ProbeUnavailable`], and F1 records that source as lost.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::current_inventory`] returns for the placed copy.
+    fn probe_digest_at(
+        &mut self,
+        copy: CopyId,
+        seq: Seq,
+        site: (NodeId, PartitionId, CorrelationId),
+        scheduler: &mut Scheduler,
+    ) -> Result<(), SimError> {
+        let partition = site.1;
+        let digest = match self.survivors.get(&(partition, copy)) {
+            Some((holder, placed)) if self.can_report(*holder) => {
+                let holder = *holder;
+                let reported = self.current_inventory(holder, partition, placed)?;
+                let lineage = (holder, partition, reported.anchor_seen.lineage.generation);
+                self.engines
+                    .get(&holder)
+                    .and_then(|engine| stored_digest(engine, lineage, seq))
+            }
+            _ => None,
+        };
+        tracing::info!(
+            node = site.0 .0,
+            partition = partition.0,
+            copy = copy.0,
+            seq = seq.0,
+            answered = digest.is_some(),
+            "probe answered from the holder's engine"
+        );
+        let answer = match digest {
+            Some(digest) => RecoveryEvent::ProbeAnswered { copy, seq, digest },
+            None => RecoveryEvent::ProbeUnavailable { copy, seq },
+        };
+        let kind = EventKind::Kernel(KernelEvent::Recovery(answer));
+        let now = scheduler.now();
+        let id = self.schedule(scheduler, now, site, kind)?;
+        self.routed.insert(id);
         Ok(())
     }
 
@@ -1994,8 +2178,13 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Route one copy's inventory answer to the asking F1: what was placed for it, if its holder
-    /// can report, or [`RecoveryEvent::InventoryFailed`].
+    /// Route one copy's inventory answer to the asking F1: what its holder reports for it today
+    /// ([`Self::current_inventory`]), if its holder can report, or
+    /// [`RecoveryEvent::InventoryFailed`].
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`Self::current_inventory`] refuses.
     fn answer_inventory(
         &mut self,
         copy: CopyId,
@@ -2005,7 +2194,8 @@ impl Dispatcher {
     ) -> Result<(), SimError> {
         let answer = match self.survivors.get(&(site.1, copy)) {
             Some((holder, inventory)) if self.can_report(*holder) => {
-                RecoveryEvent::InventoryReported(Box::new(inventory.clone()))
+                let current = self.current_inventory(*holder, site.1, inventory)?;
+                RecoveryEvent::InventoryReported(Box::new(current))
             }
             _ => RecoveryEvent::InventoryFailed { copy },
         };
@@ -2013,6 +2203,100 @@ impl Dispatcher {
         let id = self.schedule(scheduler, now, site, kind)?;
         self.routed.insert(id);
         Ok(())
+    }
+
+    /// What `holder` reports today for the survivor the scenario placed as `placed`.
+    ///
+    /// The placement, unchanged, unless the holder has since adopted a newer generation than the
+    /// placement's anchor (team q1's request, lead-approved 2026-10-02). A survivor that took
+    /// part in a recovery descends from that recovery's committed root, not from the root it was
+    /// placed under, so it answers from the generation it adopted:
+    ///
+    /// A secondary takes no adoption, only a landing; when that landing inherited the committed
+    /// prefix (in the barrier, B-R58c) it descends from the root just the same, so the newest
+    /// landed generation its engine inherited counts as adopted (q1's second recovery,
+    /// L-R182z). A landing that inherited nothing proves nothing about storage and counts for
+    /// nothing.
+    ///
+    /// * `anchor_seen` is that generation's committed root, as F1's own [`RecoveryResult`]
+    ///   recorded it: [`SelectedLineage::root`] with the cutoff as its base.
+    /// * `head` is the highest record the holder's engine applied under that generation, and
+    ///   `ladder` every record the engine stores from the base through it, each with the digest
+    ///   the engine stores ([`stored_digest`]). Never a digest the harness made up.
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Config`] naming `survivor_generation` when no `RecoveryResult` for the adopted
+    /// generation was recorded, so there is no committed root to anchor at; naming
+    /// `survivor_base` when the holder's engine does not store the committed digest at the
+    /// cutoff; naming `survivor_head` when it stores no record at its own applied head.
+    ///
+    /// [`SelectedLineage::root`]: rdb_core::contracts::recovery::SelectedLineage::root
+    fn current_inventory(
+        &self,
+        holder: NodeId,
+        partition: PartitionId,
+        placed: &SurvivorInventory,
+    ) -> Result<SurvivorInventory, SimError> {
+        let engine = self.engines.get(&holder);
+        let inherited = self
+            .landed
+            .iter()
+            .filter(|(node, held, _)| *node == holder && *held == partition)
+            .map(|(_, _, generation)| *generation)
+            .filter(|generation| engine.is_some_and(|e| e.parent(partition, *generation).is_some()))
+            .max()
+            .unwrap_or_default();
+        let generation = self.adopted(holder, partition).generation.max(inherited);
+        if generation <= placed.anchor_seen.lineage.generation {
+            return Ok(placed.clone());
+        }
+        let selected = self
+            .committed
+            .iter()
+            .filter(|((_, held), _)| *held == partition)
+            .map(|(_, (result, _))| result)
+            .find(|result| result.new_generation == generation)
+            .map(|result| result.selected)
+            .ok_or(SimError::Config {
+                field: "survivor_generation",
+            })?;
+        let engine = self.engines.get(&holder).ok_or(SimError::Config {
+            field: "survivor_base",
+        })?;
+        let lineage = (holder, partition, generation);
+        if stored_digest(engine, lineage, selected.cutoff_seq) != Some(selected.cutoff_digest) {
+            return Err(SimError::Config {
+                field: "survivor_base",
+            });
+        }
+        let head = Seq(engine.buffered_applied(partition, generation).0);
+        let head_digest = stored_digest(engine, lineage, head).ok_or(SimError::Config {
+            field: "survivor_head",
+        })?;
+        let ladder = (selected.cutoff_seq.0..=head.0)
+            .filter_map(|seq| stored_digest(engine, lineage, Seq(seq)).map(|d| (Seq(seq), d)))
+            .collect();
+        tracing::info!(
+            node = holder.0,
+            partition = partition.0,
+            placed_generation = placed.anchor_seen.lineage.generation.0,
+            generation = generation.0,
+            base_seq = selected.cutoff_seq.0,
+            head = head.0,
+            "survivor answers from its adopted generation"
+        );
+        Ok(SurvivorInventory {
+            copy: placed.copy,
+            anchor_seen: LineageAnchor {
+                lineage: selected.root,
+                base_seq: selected.cutoff_seq,
+                base_digest: selected.cutoff_digest,
+            },
+            head: (head, head_digest),
+            ladder,
+            quarantined: placed.quarantined,
+        })
     }
 
     /// Whether `node` is registered and not crashed: a node that can answer for its storage.
@@ -2260,9 +2544,9 @@ impl Dispatcher {
     /// — yields no proof and is recorded as [`KernelNote::SyncWithheld`] with its reason (lead
     /// ruling A-R67.4), never nothing. F1 answers a missing proof with its own sync timer (B-R52).
     /// A proof is recorded as [`KernelNote::SyncProven`] (B-R55a), so each request carries
-    /// exactly one of the two. There is one exception, and it stops the run and records neither:
-    ///
-    /// - A crashed holder refuses the effect under `harness::dispatch::deliver::crash`.
+    /// exactly one of the two. A holder that is down, or takes a planned crash here, has no
+    /// storage to sync: the request is withheld as [`SyncWithheldReason::Failed`] with the
+    /// crash's fault (team i1, 2026-10-02; it stopped the run under a crash seam before).
     ///
     /// A holder whose syncs are stalled ([`StorageOp::StallFlush`]) never answers, so its sync
     /// is withheld as [`SyncWithheldReason::Stalled`] and F1's own sync timer reports the stall
@@ -2271,8 +2555,10 @@ impl Dispatcher {
     /// Two sources, chosen by where the asking F1 is (lead ruling B-R55 item 3, M7B-137):
     ///
     /// - **Before commit**, the copy is a placed survivor: its holder is where the scenario put
-    ///   it, the lineage is the anchor's, and the digest is the one its placed history holds at
-    ///   `cutoff`, or, past the placed head, the one its engine stores there (B-R70, M7B-136).
+    ///   it, the lineage and history are what it reports today ([`Self::current_inventory`]: the
+    ///   placement, or the generation its holder adopted since), and the digest is the one that
+    ///   history holds at `cutoff`, or, past its head, the one its engine stores there (B-R70,
+    ///   M7B-136).
     /// - **After commit** (F1 `Committed`, `Rebuilding` or `ActivationProposed`, with its
     ///   `RecoveryResult` recorded), the copy is the pinned configuration's: its holder is that
     ///   configuration's node for it, the lineage is the new generation, and the digest is the
@@ -2298,23 +2584,37 @@ impl Dispatcher {
                 },
             )
         };
-        let (holder, generation, placed) = if let Some((holder, generation)) =
-            self.pinned_holder(site.0, partition, copy)
-        {
-            let Some(holder) = holder else {
-                self.notes.push(withheld(SyncWithheldReason::NotPlaced));
-                return Ok(());
+        let (holder, generation, placed) =
+            if let Some((holder, generation)) = self.pinned_holder(site.0, partition, copy) {
+                let Some(holder) = holder else {
+                    self.notes.push(withheld(SyncWithheldReason::NotPlaced));
+                    return Ok(());
+                };
+                (holder, generation, None)
+            } else {
+                let Some((holder, placed)) = self.survivors.get(&(partition, copy)).cloned() else {
+                    self.notes.push(withheld(SyncWithheldReason::NotPlaced));
+                    return Ok(());
+                };
+                // What the holder reports today, as `QueryInventory` answers it; a down holder is
+                // refused at the crash check below, before anything is read from it.
+                let inventory = if self.is_down(holder) {
+                    placed
+                } else {
+                    self.current_inventory(holder, partition, &placed)?
+                };
+                let generation = inventory.anchor_seen.lineage.generation;
+                (holder, generation, Some(inventory))
             };
-            (holder, generation, None)
-        } else {
-            let Some((holder, inventory)) = self.survivors.get(&(partition, copy)).cloned() else {
-                self.notes.push(withheld(SyncWithheldReason::NotPlaced));
-                return Ok(());
-            };
-            let generation = inventory.anchor_seen.lineage.generation;
-            (holder, generation, Some(inventory))
-        };
-        self.crash_check(holder)?;
+        if self.crash_check(holder)? {
+            let fault = self
+                .crashes
+                .get(&holder)
+                .map(|(fault, _)| *fault)
+                .ok_or(SimError::Config { field: "crash" })?;
+            self.notes.push(withheld(SyncWithheldReason::Failed(fault)));
+            return Ok(());
+        }
         let engine = self.engine_mut(holder);
         let captured = vec![CapturedPrefix {
             partition,
@@ -2328,9 +2628,11 @@ impl Dispatcher {
             return Ok(());
         }
         // A real sync on the holder's engine, so it is recorded like a host flush: at the holder.
+        let claims = engine.false_claims().len();
         let synced = engine.sync_wal_through(captured.clone());
         let lines = semantic::durability_lines(engine, 0, &captured, synced.as_deref());
         self.push_lines(scheduler.now(), (holder, site.2), lines);
+        self.false_durable_check(holder, claims, scheduler.now());
         if let Err(fault) = synced {
             self.notes.push(withheld(SyncWithheldReason::Failed(fault)));
             return Ok(());
@@ -2487,6 +2789,23 @@ impl Dispatcher {
         control: &mut ControlStore,
         scheduler: &mut Scheduler,
     ) -> Result<(), SimError> {
+        let now = scheduler.now();
+        self.pump_at(control, scheduler, now)
+    }
+
+    /// [`Self::pump`], with the store's completions timed from `now` rather than from the
+    /// scheduler's last pop: a scenario step applied at a later tick than that pop (lead ruling
+    /// L-R182k) must not land its completions in the past of its own tick.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::pump`]; [`Scheduler::schedule`] refuses a `now` before the scheduler's.
+    pub fn pump_at(
+        &mut self,
+        control: &mut ControlStore,
+        scheduler: &mut Scheduler,
+        now: Tick,
+    ) -> Result<(), SimError> {
         // First end the watches of every node whose crash was taken since the last pump, so
         // their terminations go out with this batch (F-E, tester D2). Through the store's own
         // per-node ending with `Unavailable`, "the node stopped": the store declares the end as
@@ -2500,7 +2819,7 @@ impl Dispatcher {
                 })?;
             }
         }
-        for completion in control.complete(scheduler.now()) {
+        for completion in control.complete(now) {
             let boot = self.boot(completion.node).unwrap_or_default();
             let id = scheduler.next_event_id();
             scheduler.schedule(Event {
@@ -2661,6 +2980,20 @@ impl Dispatcher {
 /// Whether `node` holds a copy the committed barrier names: the pinned configuration's copy on
 /// that node is one of the barrier's required copies (lead ruling B-R58c). A node the pin does
 /// not place holds no such copy.
+/// Whether carrying out `effect` reads or writes its own node's storage, so a planned crash there
+/// is taken before it: every [`EffectKind::Store`], and R1's two sends served from the node's
+/// own log ([`KernelEffect::SendEnvelopes`], [`KernelEffect::SendRecoveryEnvelopes`]; lead
+/// ruling B-R57a: a record the crash image lost is never served from the pre-crash engine).
+const fn touches_storage(effect: &Effect) -> bool {
+    matches!(
+        effect.kind,
+        EffectKind::Store(_)
+            | EffectKind::Kernel(
+                KernelEffect::SendEnvelopes { .. } | KernelEffect::SendRecoveryEnvelopes { .. }
+            )
+    )
+}
+
 fn in_barrier(result: &RecoveryResult, node: NodeId) -> bool {
     result
         .committed

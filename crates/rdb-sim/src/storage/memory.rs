@@ -342,6 +342,20 @@ impl MemoryEngine {
         &self.false_claims
     }
 
+    /// The namespace inventory of one position: every generation of `partition` whose own
+    /// batches wrote `seq`, in generation order. An inherited prefix is not counted — its bytes
+    /// are the predecessor's. For the oracle; never an input to any decision.
+    #[must_use]
+    pub fn holders(&self, partition: PartitionId, seq: Seq) -> Vec<Generation> {
+        self.lineages
+            .iter()
+            .filter(|((candidate, _), lineage)| {
+                *candidate == partition && lineage.batches.iter().any(|batch| batch.seq == seq)
+            })
+            .map(|((_, generation), _)| *generation)
+            .collect()
+    }
+
     /// Whether a sync of `captured` stalls here: `true` while a [`StorageOp::StallFlush`] is
     /// planned, and the capture is then held in [`Self::stalled_syncs`]. Asked **before**
     /// [`Self::sync_wal_through`]. On `true` the caller does not sync and reports no completion

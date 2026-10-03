@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 
 use rdb_core::contracts::event::Event;
-use rdb_core::contracts::ids::EventId;
+use rdb_core::contracts::ids::{EventId, NodeId};
 use rdb_core::contracts::time::Tick;
 
 use crate::error::SimError;
@@ -84,6 +84,23 @@ impl Scheduler {
         let ((at, _), event) = self.queue.pop_first()?;
         self.now = at;
         Some(event)
+    }
+
+    /// Take every queued event addressed to `node` at or before `through`, in queue order.
+    ///
+    /// For [`crate::sim::cluster::Cluster::suspend`]: what a suspended process would have
+    /// handled in its window, to be queued again after it resumes. Every other event stays
+    /// where it was.
+    pub fn take_for(&mut self, node: NodeId, through: Tick) -> Vec<Event> {
+        let keys: Vec<(Tick, EventId)> = self
+            .queue
+            .iter()
+            .filter(|((at, _), event)| *at <= through && event.node == node)
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| self.queue.remove(&key))
+            .collect()
     }
 
     /// How many events are queued.

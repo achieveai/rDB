@@ -29,20 +29,25 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 use config_log::retcd_test;
 use config_log::testing::{test_log_dir, test_run_id};
+use rdb_core::authority::grant::GrantRecord;
 use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::authority::AuthorityState;
 use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, DenyReason, FenceScope, Lineage};
-use rdb_core::contracts::control::{CasOutcome, ControlKey, ReadOutcome};
+use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey, ReadOutcome};
+use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
 use rdb_core::contracts::event::{
-    ClientEvent, Effect, EffectKind, EventKind, KernelEffect, KernelEvent, ModuleName, ReplyEffect,
+    Budgets, ClientEvent, Effect, EffectKind, EventKind, KernelEffect, KernelEvent, ModuleName,
+    NodeLifecycle, ReplyEffect,
 };
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch, PartitionId,
-    RequestId, RequestIdentity, Revision, Seq, TenantId,
+    AffinityId, AuthorityGeneration, BootId, ClientId, ControlRequestId, CorrelationId, DurableSeq,
+    Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Revision, Seq,
+    SnapshotHandle, TenantId,
 };
+use rdb_core::contracts::publication::PublicationEffect;
 use rdb_core::contracts::recovery::{DurableProof, RecoveryBarrier, RecoveryResult};
-use rdb_core::contracts::storage::{Namespace, Write};
+use rdb_core::contracts::storage::{Namespace, SnapshotRead, Write};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
     AuthorityGate, AuthorityOutcome, ClientOutcome, ControlOutcomeKind, KernelNote,
@@ -146,7 +151,7 @@ fn queue(runner: &mut Runner, at: u64, correlation: u64, kind: EventKind) {
 /// The A1/P1 case without its activation op: recovers gen 2 on B, then B takes request 11.
 fn a1p1_plan() -> RunPlan {
     let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
-    scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    cases::without_activation(&mut scenario);
     scenario_run::lower(&scenario).expect("the A1/P1 case lowers")
 }
 
@@ -819,7 +824,7 @@ const WRITTEN: u64 = 5;
 /// plan and request 5.
 fn same_node_plan() -> (RunPlan, TxnRequest) {
     let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
-    scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    cases::without_activation(&mut scenario);
     for op in &mut scenario.ops {
         match op {
             ScenarioOp::Recovery(RecoveryOp::Synchronize { to, .. }) => *to = Seq(EARLIER - 1),
@@ -861,11 +866,23 @@ fn gen2_root(runner: &Runner) -> Box<RecoveryResult> {
 /// Carry out an F1 root into gen 3 on B at its head (seq 5), after rewriting `partitions/1` to
 /// name gen 3: `RetainedStatusMap{retained_through: 5, discarded_from: None, uncertain}`.
 fn recover_gen3(runner: &mut Runner, uncertain: bool) {
-    let root = gen2_root(runner);
     let kernel = t1(runner);
     let digest = kernel.prev_digest();
     let cutoff = Seq(kernel.next_seq().0 - 1);
     assert_eq!(cutoff, Seq(WRITTEN), "gen 2 holds seq 4 and 5");
+    recover_gen3_at(runner, (cutoff, digest), None, uncertain);
+}
+
+/// Carry out an F1 root into gen 3 on B cut at `cutoff` with that position's digest, after
+/// rewriting `partitions/1` to name gen 3:
+/// `RetainedStatusMap{retained_through: cutoff, discarded_from, uncertain}`.
+fn recover_gen3_at(
+    runner: &mut Runner,
+    (cutoff, digest): (Seq, Digest),
+    discarded_from: Option<Seq>,
+    uncertain: bool,
+) {
+    let root = gen2_root(runner);
     let (revision, record) = match runner.control_mut().get(ControlKey::Partition(PART)) {
         ReadOutcome::Found { revision, value } => {
             (revision, PartitionRecord::decode(&value).expect("record"))
@@ -921,7 +938,7 @@ fn recover_gen3(runner: &mut Runner, uncertain: bool) {
     later.retained_status_map.predecessor_generation = Generation(2);
     later.retained_status_map.predecessor_cutoff = cutoff;
     later.retained_status_map.retained_through = cutoff;
-    later.retained_status_map.discarded_from = None;
+    later.retained_status_map.discarded_from = discarded_from;
     later.retained_status_map.uncertain = uncertain;
     let now = runner.dispatcher().clock().now();
     for member in &later.committed.pinned_config.members {
@@ -2184,4 +2201,295 @@ fn m7a_136_f1_t1_generation_reconciliation_no_double_apply() {
         vec![Seq(WRITE), Seq(WRITE + 1)],
         "gen 2's batches on B are request 11 and the fresh request 41"
     );
+}
+
+// ---- M7A-132..M7A-134 -----------------------------------------------------------------------
+
+/// What reaches B's A1 between its `Dispatch` answer for request 11 and T1's `BatchCompleted`.
+#[derive(Debug, Clone, Copy)]
+enum LateInput {
+    /// `NodeLifecycle::Resumed` with a gap one millisecond past the tolerance (M7A-132).
+    Pause,
+    /// `NodeLifecycle::Rebooted` naming a boot other than the grant's (M7A-133).
+    Reboot,
+    /// The planner re-issues B's grant record under `authority_generation + 1`, and B's read of
+    /// `grants/{B}` answers `Found` with that record (M7A-134).
+    NewGeneration,
+}
+
+impl LateInput {
+    /// The fence reason the plan names for this input.
+    const fn reason(self) -> DenyReason {
+        match self {
+            Self::Pause => DenyReason::ProcessSuspended,
+            Self::Reboot => DenyReason::BootMismatch,
+            Self::NewGeneration => DenyReason::AuthorityGenerationChanged,
+        }
+    }
+}
+
+/// What the late old dispatch leaves behind.
+struct LateRun {
+    runner: Runner,
+    replies: Replies,
+    /// T1's queue left `Open` while seq 11's batch was dispatched and not yet completed.
+    fenced_before_completion: bool,
+    /// The batch completed after that: T1 saw `BatchCompleted` for seq 11.
+    completed_after_fence: bool,
+}
+
+/// The fenced generation: the one B recovered and dispatched request 11 under.
+const G2: Generation = Generation(2);
+
+/// The late old dispatch: request 11 (seq 11 stands in for the plan's "seq 5") is admitted and
+/// dispatched under generation 2, `input` reaches B's A1 behind its `Dispatch` answer and before
+/// the batch completes, and the run goes on past P1's post-apply deadline.
+fn late_old_dispatch(input: LateInput) -> LateRun {
+    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    let mut replies = run_to(&mut runner, SUBMIT - 1);
+    while !matches!(
+        t1(&runner).inflight(),
+        Some(Inflight::AwaitingDispatchCheck { .. })
+    ) {
+        assert!(
+            step(&mut runner, SUBMIT, &mut replies),
+            "the tick ran out before T1 admitted request 11"
+        );
+    }
+    let kind = match input {
+        LateInput::Pause => EventKind::Node(NodeLifecycle::Resumed {
+            suspended_millis: Budgets::SPEC_DEFAULTS.resume_gap_tolerance_millis + 1,
+        }),
+        LateInput::Reboot => EventKind::Node(NodeLifecycle::Rebooted {
+            boot: BootId(BOOT.0 + 1),
+        }),
+        LateInput::NewGeneration => {
+            // The planner's re-issue, written to the store as the planner would write it; the
+            // read answer B's A1 classifies is the store's own body for it.
+            let key = ControlKey::Grant(B);
+            let ReadOutcome::Found { revision, value } = runner.control_mut().get(key) else {
+                panic!("B holds a grant record");
+            };
+            let mut record = GrantRecord::decode(&value).expect("a grant record");
+            record.authority_generation = AuthorityGeneration(record.authority_generation.0 + 1);
+            let CasOutcome::Committed(_) =
+                runner
+                    .control_mut()
+                    .scenario_cas(key, Some(revision), Some(record.encode()))
+            else {
+                panic!("the planner's re-issue commits");
+            };
+            let outcome = runner.control_mut().get(key);
+            EventKind::Control(ControlEvent::Value {
+                request: ControlRequestId(9_602),
+                key,
+                outcome,
+            })
+        }
+    };
+    queue(&mut runner, SUBMIT, 9_601, kind);
+    tracing::info!(
+        ?input,
+        "M7A-132..134 late input queued behind the Dispatch answer"
+    );
+
+    let mut fenced_before_completion = false;
+    let mut completed_after_fence = false;
+    while step(&mut runner, SUBMIT, &mut replies) {
+        let open = *t1(&runner).mode() == QueueMode::Open;
+        match dispatched(&runner) {
+            Some((seq, false)) if seq == Seq(WRITE) && !open => fenced_before_completion = true,
+            Some((seq, true)) if seq == Seq(WRITE) && fenced_before_completion => {
+                completed_after_fence = true;
+            }
+            _ => {}
+        }
+    }
+    let deadline = Tick(SUBMIT).plus_millis(POST_APPLY_DEADLINE_MILLIS).0;
+    replies.extend(run_to(&mut runner, deadline + 100));
+    LateRun {
+        runner,
+        replies,
+        fenced_before_completion,
+        completed_after_fence,
+    }
+}
+
+/// M7A-132..M7A-134's shared claim: the late batch leaves quarantined bytes and nothing else.
+fn assert_quarantined_bytes_only(row: &str, input: LateInput) {
+    let reason = input.reason();
+    let run = late_old_dispatch(input);
+    let (runner, replies) = (&run.runner, &run.replies);
+    assert!(
+        run.fenced_before_completion && run.completed_after_fence,
+        "{row}: the fence lands while seq {WRITE} is dispatched, and the batch completes after it"
+    );
+    assert!(
+        matches!(
+            runner.dispatcher().authority(B).expect("A1 on B").view().state,
+            AuthorityState::Fenced { reason: fenced, .. } if fenced == reason
+        ),
+        "{row}: A1 on B fenced the node for {reason:?}"
+    );
+
+    // The kernel half: P1 quarantines (g, 11), freezes for the reason, publishes nothing at 11.
+    let quarantined: Vec<(Generation, Seq)> = runner
+        .recorded()
+        .iter()
+        .filter(|event| event.node == B)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note:
+                    KernelNote::PublicationFact {
+                        effect: PublicationEffect::Quarantined { generation, seq },
+                    },
+                ..
+            } => Some((*generation, *seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        quarantined,
+        vec![(G2, Seq(WRITE))],
+        "{row}: Fact(Quarantined{{g, {WRITE}}}) once, under the fenced generation"
+    );
+    let view = p1(runner);
+    assert_eq!(
+        view.mode,
+        PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(reason)
+        },
+        "{row}: P1 froze for the fence's reason"
+    );
+    assert_eq!(
+        view.published.seq,
+        Seq(HEAD),
+        "{row}: the published prefix never reaches {WRITE}"
+    );
+    let published: Vec<Seq> = runner
+        .recorded()
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::Publish { seq, .. } if *seq >= Seq(WRITE) => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        published.is_empty(),
+        "{row}: no Publish at or past {WRITE}: {published:?}"
+    );
+    let answers = replies_for(replies, identity(WRITE));
+    assert!(
+        !answers.is_empty()
+            && answers
+                .iter()
+                .all(|reply| !matches!(reply, ReplyEffect::Transaction { .. })),
+        "{row}: request 11 is answered, and never with a result: {answers:?}"
+    );
+
+    // The inventory half: every copy holds seq 11's bytes in the fenced generation's namespace
+    // and in no other generation of the partition.
+    for node in [cases::A_NODE, B, cases::C_NODE] {
+        let engine = runner
+            .dispatcher()
+            .engine(node)
+            .expect("an engine on every node");
+        assert_eq!(
+            engine.holders(PART, Seq(WRITE)),
+            vec![G2],
+            "{row}: {node:?} holds seq {WRITE} under the fenced generation only"
+        );
+    }
+
+    // The next generation (critic F11): recovery cuts gen 3 at the published head, gen 3 exists
+    // on every copy, and what it shows — its inherited prefix included — never holds seq 11.
+    let root = gen2_root(&run.runner);
+    assert_eq!(
+        root.selected.cutoff_seq,
+        Seq(HEAD),
+        "{row}: gen 2 began at {HEAD}, so its root's cutoff digest is seq {HEAD}'s"
+    );
+    let cut = (Seq(HEAD), root.selected.cutoff_digest);
+    let mut runner = run.runner;
+    recover_gen3_at(&mut runner, cut, Some(Seq(WRITE)), false);
+    let landed = runner.dispatcher().clock().now().0 + 1_000;
+    let _ = run_to(&mut runner, landed);
+    assert_next_generation_hides_the_late_write(row, &runner);
+}
+
+/// Gen 3 exists on B, the barrier's only copy, inheriting gen 2 through [`HEAD`]. Its readable
+/// view shows the inherited prefix and not seq 11, whose bytes stay readable under gen 2. A and
+/// C are outside the barrier, so they inherit nothing (`in_barrier` in the dispatcher); on every
+/// copy, seq 11's bytes are still held under gen 2 and no other generation.
+fn assert_next_generation_hides_the_late_write(row: &str, runner: &Runner) {
+    const G3: Generation = Generation(3);
+    let from_late_write = |view: &dyn SnapshotRead| -> Vec<Bytes> {
+        view.scan(Namespace::User, &[], usize::MAX)
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(|key| view.version(Namespace::User, key) == Some(WRITE))
+            .collect()
+    };
+    {
+        let node = B;
+        let engine = runner.dispatcher().engine(B).expect("B's engine");
+        assert_eq!(
+            (engine.parent(PART, G3), engine.base(PART, G3)),
+            (Some(G2), Seq(HEAD)),
+            "{row}: {node:?} holds gen 3, inheriting gen 2 through {HEAD}"
+        );
+        assert!(
+            engine.history_at(PART, G3, Seq(HEAD)).is_some(),
+            "{row}: {node:?}'s gen 3 shows the inherited seq {HEAD}"
+        );
+        assert_eq!(
+            engine.history_at(PART, G3, Seq(WRITE)),
+            None,
+            "{row}: {node:?}'s gen 3 shows no seq {WRITE}"
+        );
+        assert!(
+            engine.history_at(PART, G2, Seq(WRITE)).is_some(),
+            "{row}: {node:?}'s gen 2 still holds seq {WRITE}'s bytes"
+        );
+        let old = engine.snapshot(PART, G2, SnapshotHandle(1));
+        let new = engine.snapshot(PART, G3, SnapshotHandle(2));
+        assert!(
+            !from_late_write(&old).is_empty(),
+            "{row}: {node:?}'s gen 2 view shows a user record seq {WRITE} wrote"
+        );
+        assert_eq!(
+            from_late_write(&new),
+            Vec::<Bytes>::new(),
+            "{row}: {node:?}'s gen 3 view shows no user record seq {WRITE} wrote"
+        );
+    }
+    for node in [cases::A_NODE, B, cases::C_NODE] {
+        let engine = runner
+            .dispatcher()
+            .engine(node)
+            .expect("an engine on every node");
+        assert_eq!(
+            engine.holders(PART, Seq(WRITE)),
+            vec![G2],
+            "{row}: {node:?} holds seq {WRITE} under gen 2 only, after gen 3"
+        );
+    }
+}
+
+#[retcd_test]
+fn m7a_132_a1_p1_delayed_old_dispatch_after_pause_quarantined_bytes_only() {
+    support::preamble();
+    assert_quarantined_bytes_only("M7A-132", LateInput::Pause);
+}
+
+#[retcd_test]
+fn m7a_133_a1_p1_delayed_old_dispatch_after_reboot_quarantined_bytes_only() {
+    support::preamble();
+    assert_quarantined_bytes_only("M7A-133", LateInput::Reboot);
+}
+
+#[retcd_test]
+fn m7a_134_a1_p1_delayed_old_dispatch_after_new_generation_quarantined_bytes_only() {
+    support::preamble();
+    assert_quarantined_bytes_only("M7A-134", LateInput::NewGeneration);
 }

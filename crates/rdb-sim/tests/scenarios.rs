@@ -497,6 +497,74 @@ fn m7v_46_provenance_is_explicit_and_nothing_carries_a_bare_seed() {
 }
 
 // ------------------------------------------------------------------------------------------
+// Generated-seed bridge — the thin slice toward M7V-55 (no row id: M7V-55 is a named residual)
+// ------------------------------------------------------------------------------------------
+
+/// A generated seed whose ops are all network ops lowers onto `RunPlan::steps` and runs.
+///
+/// Seed 9 at `max_events 16` is `[Deliver n2->n1, Heal]`: the `AckAfterRevocation` producer and
+/// the closing heal. The deliver lowers to one `PlanNext` and the heal to `SetLink Up` per node
+/// pair, every step at tick 0 and with no line (L-R182m: a plan is a deferred fault the provider
+/// declares; heal records no phase). The run proves the steps were applied, not merely carried:
+/// no frame meets the plan, so it is still pending on the network afterwards.
+#[retcd_test]
+fn bridge_generated_network_seed_lowers_onto_steps_and_runs() {
+    use rdb_core::contracts::ids::NodeId;
+    use rdb_sim::harness::run::{Runner, StepAction};
+    use rdb_sim::sim::network::{Delivery, LinkState, NetworkOp as SimNetworkOp};
+
+    support::preamble();
+    let budget = Budget {
+        max_events: 16,
+        ..Budget::DEFAULT
+    };
+    let scenario = gen::scenario(9, budget, grammar::rf3(2));
+    assert_eq!(gen::obligation(9), BoundaryId::AckAfterRevocation);
+    assert_eq!(scenario.ops.len(), 2, "{:?}", scenario.ops);
+
+    let plan = scenario_run::lower(&scenario).expect("both network ops lower");
+    let actions: Vec<_> = plan.steps.iter().map(|step| step.action).collect();
+    let planned = SimNetworkOp::PlanNext {
+        from: NodeId(2),
+        to: NodeId(1),
+        delivery: Delivery::Deliver { delay_millis: 0 },
+    };
+    let up = |a, b| {
+        StepAction::Network(SimNetworkOp::SetLink {
+            a: NodeId(a),
+            b: NodeId(b),
+            state: LinkState::Up,
+        })
+    };
+    assert_eq!(
+        actions,
+        vec![StepAction::Network(planned), up(1, 2), up(1, 3), up(2, 3)]
+    );
+    assert!(plan
+        .steps
+        .iter()
+        .all(|step| step.at.0 == 0 && step.line.is_none()));
+
+    let mut runner = Runner::new(&plan).expect("the harness takes the lowered plan");
+    let report = runner.run(plan.limits).expect("the lowered plan runs");
+    assert_eq!(report.stop, StopReason::QueueEmpty, "{report:?}");
+    assert_eq!(runner.dispatcher().network().planned(), &[planned]);
+    let trace = runner.finish().expect("a trace");
+    rdb_sim::harness::trace::validate(&trace).expect("a valid trace");
+    assert!(
+        !trace
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::FaultInjected { .. })),
+        "a lowered plan declares no fault of its own"
+    );
+
+    // And through the campaign's own entry point.
+    let run = scenario_run::attempt(&scenario).expect("attempt runs it");
+    assert_eq!(run.plan.steps.len(), 4);
+}
+
+// ------------------------------------------------------------------------------------------
 // M7V-47 — the four mandatory cross-package cases, through the real runner
 // ------------------------------------------------------------------------------------------
 
@@ -888,35 +956,44 @@ fn m7v_47_case_f1_r1_discovery_window_runs_through_the_runner() {
     tracing::info!(?verdicts, "m7v_47 f1/r1 oracle");
 }
 
-/// M7V-47, case A1/P1 (spike §6): a new generation activates between publication and reply.
+/// M7V-47, case A1/P1 (spike §6): a new generation lands between publication and reply.
 ///
-/// Parked, and specific about why. The case constructs, is authored and fits its budget, and
-/// the bridge refuses it **at its second `InspectSurvivors`, by index**: the op that activates
-/// the next generation. The row turns red the day that op lowers, and must then be written with
-/// both halves (A-R22). Re-authored from "expire authority" by lead ruling L-R177dq: an expiry
-/// cannot reach P1's `Admit if !entry.replied` arm, because A1 revalidates first, its `Fence`
-/// precedes the `Answer`, and P1 clears the awaiting reply on that fence. A generation move
-/// denies the reply check without a fence, which is the deny that arm must honour.
+/// Scenario, walked by hand on 2026-10-02 before this row was written:
+/// - B owns partition 1 in generation 2. A client writes request 11 to B, and B publishes it at
+///   seq 11.
+/// - B's `Reply` check is held on its hop.
+/// - Meanwhile C recovers the partition into generation 3, at cutoff 11.
+/// - The client must not hear `Success` from generation 2, and the oracle must find nothing wrong.
 ///
-/// Built in dev-verif's slice 2, landing with dev-sim-route's shared hooks: the semantic lines
-/// (`Publish`, `AuthorityDecision`, `ClientOutcomeReported`), a timed op as a segmented run, and
-/// a hop delay on P1's `Reply` check. Re-read at b220a2b (dev-a1p1-w3, 2026-09-27):
+/// Re-authored from "expire authority" by lead ruling L-R177dq. An expiry cannot reach the reply
+/// decision, because A1's `Fence` precedes its `Answer`.
 ///
-/// - **Cleared**: B-R60 and A1's post-`Recovered` install. Without its activating op the case
-///   publishes end to end through A1 and replies `Success`
-///   (`a1p1_case_without_its_activation_publishes_through_a1`), once it submits after L1's resume
-///   hold, under a request id the preload did not use, and the lowering declares the topology.
-/// - **Owed, bridge**: `lower` refuses a second `InspectSurvivors` of one partition, and no op
-///   lowers the `Reply` hop delay the activation must land inside.
-/// - **Owed, below the bridge**: nothing in the sim can activate a third generation after the
-///   first recovery. On B, F1 is terminal once `Committed`: a second `Plan` or `FenceProven` is
-///   `Ignored(OutOfPhase)`. On C, discovery reads the survivor inventories the dispatcher was
-///   placed with, which stay generation 1, so it ends `BlockPromotion(NoEligibleRegular)`. And B
-///   would learn of a new generation only through a watch the sim delivers when told. Lowering
-///   the op is therefore not enough; F1 re-entry is a kernel-b question, and live inventories a
-///   dispatcher one.
+/// **Kernel half**, read from the trace:
+/// - On the write's correlation, A1 decides `Dispatch` and `Publication` `Valid` in generation 2,
+///   and B publishes seq 11 there.
+/// - After that publish, the `RecoveredFact` that creates generation 3 is recorded.
+/// - Then P1 on B withholds the awaiting reply (`ReplyWithheld`).
+/// - Then the held `Reply` check decides in generation 2, at
+///   `A1_P1_SUBMIT_AT + A1_P1_HOLD_MILLIS`, and not `Valid`. The outcome is `Fenced`; the case doc
+///   predicted `Deny(GenerationChanged)`.
+/// - No client outcome is reported, and no reply leaves the run.
+///
+/// **Oracle half**: [`oracle_half`], with INV-AUTH `Proven`.
+///
+/// **Pairwise cell**: `Network+Recovery`, the hold crossed with the recovery.
+///
+/// Red at d84891d: the bridge refused the case at op 6, its second `InspectSurvivors`.
+///
+/// Not asserted: generation 3 activating. C leads the recovery but does not own the new
+/// generation, and its rebuild never proves the other copies, so a write in generation 3 is
+/// refused `RecoveryReadOnly`. When B leads instead, the run stops at I1's `deliver::kernel`
+/// (R1's `CopyAheadOnControl`). Owed with M7A-58.
 #[retcd_test]
-fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_is_refused_by_name() {
+fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_runner() {
+    use rdb_core::contracts::authority::{AuthorityIgnoreReason, Checkpoint};
+    use rdb_core::contracts::ids::Generation;
+    use rdb_core::contracts::ignore::KernelIgnoredReason;
+    use rdb_core::contracts::trace::{AuthorityGate, AuthorityOutcome};
     support::preamble();
     let scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
     assert!(matches!(scenario.provenance, Provenance::Authored { .. }));
@@ -925,16 +1002,177 @@ fn m7v_47_case_a1_p1_new_generation_between_publish_and_reply_is_refused_by_name
         scenario.ops[cases::A1_P1_ACTIVATE_OP],
         ScenarioOp::Recovery(grammar::RecoveryOp::InspectSurvivors { .. })
     ));
-    let refused = scenario_run::lower(&scenario).err();
-    assert_eq!(
-        refused.as_ref().map(|refused| refused.op_index),
-        Some(Some(cases::A1_P1_ACTIVATE_OP)),
-        "refused at the activating op, and nowhere earlier: {refused:?}"
+    assert!(matches!(
+        scenario.ops[cases::A1_P1_HOLD_OP],
+        ScenarioOp::Network(grammar::NetworkOp::DelayCheck {
+            node: cases::B_NODE,
+            checkpoint: Checkpoint::Reply,
+            ..
+        })
+    ));
+    // Its pairwise cell: the network hold crossed with the recovery, counted by the campaign's
+    // `pairwise` map for every authored history that ran.
+    let groups: BTreeSet<&str> = scenario.ops.iter().map(gen::group_of).collect();
+    assert!(
+        groups.contains("Network") && groups.contains("Recovery"),
+        "the case registers the Network+Recovery pairwise cell: {groups:?}"
     );
-    parked(
-        "M7V-47",
-        PackageId::I1,
-        "case A1/P1: the bridge refuses its second activation (a second InspectSurvivors)",
+    let run = scenario_run::run(&scenario).expect("the case lowers whole");
+    assert!(
+        matches!(run.report.stop, StopReason::DeadlineReached { deadline, .. }
+            if deadline.0 == cases::A1_P1_MAX_TICKS),
+        "the case runs to its deadline inside its event budget: {:?}",
+        run.report.stop
+    );
+
+    // Kernel half.
+    let events = &run.trace.events;
+    let publishes: Vec<usize> = (0..events.len())
+        .filter(|index| matches!(events[*index].kind, TraceKind::Publish { .. }))
+        .collect();
+    let [publish] = publishes[..] else {
+        panic!("one publication, B's write: {publishes:?}");
+    };
+    assert!(
+        matches!(&events[publish].kind, TraceKind::Publish { generation, seq, .. }
+            if *generation == Generation(2) && seq.0 == cases::A1_P1_HEAD + 1)
+            && events[publish].node == cases::B_NODE,
+        "B publishes the write at seq 11 in generation 2: {:?}",
+        events[publish]
+    );
+    let write = events[publish].correlation;
+    let decisions: Vec<(usize, AuthorityGate, Generation, AuthorityOutcome, u64)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.correlation == write)
+        .filter_map(|(index, event)| match &event.kind {
+            TraceKind::AuthorityDecision {
+                gate,
+                generation,
+                outcome,
+                decision_tick,
+                ..
+            } => Some((index, *gate, *generation, *outcome, *decision_tick)),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?decisions, "a1p1 decisions");
+    let submit = cases::A1_P1_SUBMIT_AT;
+    let [(_, dispatch, ..), (_, publication, ..), reply] = decisions[..] else {
+        panic!("three decisions on the write: {decisions:?}");
+    };
+    assert_eq!(
+        decisions[..2]
+            .iter()
+            .map(|(_, _, generation, outcome, tick)| (*generation, *outcome, *tick))
+            .collect::<Vec<_>>(),
+        vec![(Generation(2), AuthorityOutcome::Valid, submit); 2],
+        "dispatch and publication are Valid in generation 2 at the submit"
+    );
+    assert_eq!(
+        (dispatch, publication),
+        (AuthorityGate::Dispatch, AuthorityGate::Publication)
+    );
+    let (reply_at, gate, generation, outcome, tick) = reply;
+    assert_eq!(
+        (gate, generation, tick),
+        (
+            AuthorityGate::Reply,
+            Generation(2),
+            submit + cases::A1_P1_HOLD_MILLIS
+        ),
+        "the held Reply check decides in generation 2 when its hold ends"
+    );
+    assert_ne!(
+        outcome,
+        AuthorityOutcome::Valid,
+        "generation 2's reply is not authorised once generation 3 exists"
+    );
+    let created = events
+        .iter()
+        .position(|event| {
+            event.partition == cases::PARTITION
+                && matches!(&event.kind, TraceKind::KernelNoted {
+                    note: KernelNote::RecoveredFact { result },
+                    ..
+                } if result.new_generation == Generation(3))
+        })
+        .expect("the second recovery creates generation 3");
+    let withheld = events
+        .iter()
+        .position(|event| {
+            event.node == cases::B_NODE
+                && matches!(
+                    &event.kind,
+                    TraceKind::KernelNoted {
+                        module: ModuleName::Publication,
+                        note: KernelNote::Ignored {
+                            reason: KernelIgnoredReason::Authority(
+                                AuthorityIgnoreReason::ReplyWithheld
+                            ),
+                        },
+                        ..
+                    }
+                )
+        })
+        .expect("P1 on B withholds the reply");
+    assert!(
+        publish < created && created < withheld && withheld < reply_at,
+        "publish {publish} < generation 3 {created} < withheld {withheld} < reply check {reply_at}"
+    );
+    assert_eq!(
+        client_outcomes(&run.trace),
+        vec![],
+        "the client hears nothing from generation 2"
+    );
+    assert!(run.report.replies.is_empty(), "{:?}", run.report.replies);
+
+    // Oracle half.
+    let verdicts = oracle_half(&run);
+    tracing::info!(?verdicts, "m7v_47 a1/p1 oracle");
+    assert_eq!(run.oracle.verdict(Invariant::Auth), &Verdict::Proven);
+}
+
+/// tester-q1 T2: a staged run spends **one** event budget across its segments.
+///
+/// Scenario: A1/P1 runs in segments (the run pauses at each staged tick to apply the hold and the
+/// second recovery). Its cap is set one event below what it pops on its own budget. The run must
+/// stop at that cap, inside its last segment, having popped exactly the cap in total. A runner
+/// that handed each segment the whole budget again would let the last segment finish and run past
+/// the cap.
+#[retcd_test]
+fn a_staged_run_spends_one_event_budget_across_its_segments() {
+    support::preamble();
+    let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+    let staged = scenario_run::lower_staged(&scenario).expect("the A1/P1 case lowers");
+    assert!(
+        staged.stages.iter().any(|stage| stage.at > 0),
+        "A1/P1 must run in more than one segment for this row to mean anything"
+    );
+
+    let natural = scenario_run::run(&scenario).expect("the A1/P1 case runs");
+    assert!(
+        matches!(natural.report.stop, StopReason::DeadlineReached { .. }),
+        "on its own budget A1/P1 ends at its deadline: {:?}",
+        natural.report.stop
+    );
+    let total = natural.report.events_consumed;
+    let cap = total - 1;
+    scenario.budget.max_events = cap;
+
+    let capped = scenario_run::run(&scenario).expect("the capped A1/P1 case runs");
+    tracing::info!(total, cap, stop = ?capped.report.stop, "staged budget run");
+    assert!(
+        matches!(
+            capped.report.stop,
+            StopReason::EventBudgetExhausted { max_events, .. } if max_events == cap
+        ),
+        "a cap one below the natural {total} must bite: {:?}",
+        capped.report.stop
+    );
+    assert_eq!(
+        capped.report.events_consumed, cap,
+        "the segments together popped past the cap, or stopped short of it"
     );
 }
 
@@ -1022,7 +1260,7 @@ fn a1p1_chain(trace: &Trace, correlation: u64) -> Vec<(usize, String)> {
 fn a1p1_case_without_its_activation_publishes_through_a1() {
     support::preamble();
     let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
-    let removed = scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    let removed = cases::without_activation(&mut scenario);
     assert!(matches!(
         removed,
         ScenarioOp::Recovery(grammar::RecoveryOp::InspectSurvivors { .. })
@@ -1154,7 +1392,7 @@ fn m7a_193_a_publish_runs_through_the_split_answer_arm_with_nothing_owed() {
     use rdb_core::contracts::trace::{ClientOutcome, DispatchOutcome};
     support::preamble();
     let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
-    scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    cases::without_activation(&mut scenario);
     let run = scenario_run::run(&scenario).expect("the case lowers whole without its activation");
 
     let owed = run
@@ -1396,6 +1634,98 @@ fn m7v_47_case_f1_t1_digest_across_recovery_runs_through_the_runner() {
 }
 
 // ------------------------------------------------------------------------------------------
+// M7V-88 — every fixture and authored case is realizable by the runner (clause 1)
+// ------------------------------------------------------------------------------------------
+
+/// M7V-88, clause 1 (design §4.5): every scenario fixture and every authored constructor replays
+/// through I1's runner, its recording passes I1's validator, no op was skipped because its
+/// referent was gone, and the oracle report carries the verdict the owning row expects.
+///
+/// Scenario: someone adds or changes an authored case. Before any checker is tuned to it, this row
+/// runs it end to end and says whether the runner can really produce it. Clause 2 (hand-built
+/// oracle traces) is `oracle.rs`'s `m7v_88_every_oracle_fixture_passes_the_runners_validator`.
+///
+/// The expected verdicts are the owning M7V-47 rows': [`oracle_half`] for all four (clean, and
+/// every invariant whose package the preamble reports unwired says so by name), plus INV-AUTH
+/// `Proven` for A1/P1. `tests/fixtures/scenarios/` does not exist, so clause 1's fixture half has
+/// nothing to replay; the row fails if it appears, so a new fixture cannot go unreplayed.
+#[retcd_test]
+fn m7v_88_every_fixture_and_authored_case_is_realizable_by_the_runner() {
+    support::preamble();
+    let started = std::time::Instant::now();
+
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scenarios");
+    assert!(
+        !fixtures.exists(),
+        "{} exists: replay every file in it here",
+        fixtures.display()
+    );
+
+    /// One mandatory authored case (M7V-47): its name, its constructor, and what its owning row
+    /// expects proven.
+    type AuthoredCase = (&'static str, fn() -> Scenario, &'static [Invariant]);
+    const AUTHORED: [AuthoredCase; 4] = [
+        ("F1/R1", cases::case_f1_r1_discovery_window, &[]),
+        (
+            "A1/P1",
+            cases::case_a1_p1_new_generation_between_publish_and_reply,
+            &[Invariant::Auth],
+        ),
+        ("F1/T1/P1", cases::case_f1_t1_p1_retained_status_24h, &[]),
+        ("F1/T1", cases::case_f1_t1_digest_across_recovery, &[]),
+    ];
+    for (name, build, proven) in AUTHORED {
+        let scenario = build();
+        assert!(
+            matches!(scenario.provenance, Provenance::Authored { .. }),
+            "{name}: {:?}",
+            scenario.provenance
+        );
+        let run = scenario_run::run(&scenario)
+            .unwrap_or_else(|refused| panic!("{name} does not lower: {refused:?}"));
+        assert_eq!(
+            rdb_sim::harness::trace::validate(&run.trace),
+            Ok(()),
+            "{name}: the recording is not well formed"
+        );
+        let gone: Vec<u32> = run
+            .trace
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                TraceKind::OpSkipped {
+                    scenario_op_index,
+                    reason: rdb_core::contracts::trace::SkipReason::ReferentGone,
+                } => Some(scenario_op_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gone,
+            Vec::<u32>::new(),
+            "{name}: ops skipped, referent gone"
+        );
+        let verdicts = oracle_half(&run);
+        for invariant in proven {
+            assert_eq!(
+                run.oracle.verdict(*invariant),
+                &Verdict::Proven,
+                "{name}: {}",
+                invariant.id()
+            );
+        }
+        tracing::info!(case = name, ?verdicts, "m7v_88 authored case realizable");
+    }
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "M7V-88 owns < 10 s for the whole set: {:?}",
+        started.elapsed()
+    );
+}
+
+// ------------------------------------------------------------------------------------------
 // M7V-20, M7V-21, M7V-48..M7V-51 — the reducer's behavioural rows
 // ------------------------------------------------------------------------------------------
 
@@ -1623,6 +1953,166 @@ fn m7v_21_minimized_fixture_replays_through_i1_and_fails_the_same_checker() {
         ops = fixture.ops.len(),
         slug = %shrunk.pair.slug,
         "fixture_replayed"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// M7V-22 — a skipped op is a reducer artifact, not a fault
+// ------------------------------------------------------------------------------------------
+
+/// Every `fault_injected` line of `trace`, as `(scenario_op_index, boundary)`.
+fn faults_of(trace: &Trace) -> Vec<(u32, BoundaryId)> {
+    trace
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            TraceKind::FaultInjected {
+                boundary,
+                scenario_op_index,
+                ..
+            } => Some((scenario_op_index, boundary)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `BoundaryId` cell counts of `trace`: one hit per `fault_injected` line, the campaign's
+/// own counting rule (`campaign/engine.rs`, `observe`).
+fn boundary_cells(trace: &Trace) -> BTreeMap<BoundaryId, usize> {
+    let mut cells = BTreeMap::new();
+    for (_, boundary) in faults_of(trace) {
+        *cells.entry(boundary).or_insert(0) += 1;
+    }
+    cells
+}
+
+/// M7V-22. The parent is the RF4 shape with one `Retry` of padding request 5, placed after the
+/// next `Advance`. The reducer's candidate deletes that request's `Submit` (ddmin removes ops
+/// and never edits one, M7V-84), so the `Retry` refers to nothing.
+///
+/// The parent run is the control: the same `Retry` with its `Submit` present records a
+/// `fault_injected{RetainedDedupHit}` at its index. Without it, "no fault for the skipped op"
+/// would pass on a harness that records no fault for anything.
+#[retcd_test]
+fn m7v_22_skipped_op_emits_op_skipped_and_invents_no_event() {
+    use rdb_core::contracts::ids::RequestId;
+    use rdb_core::contracts::trace::SkipReason;
+    use support::scenarios::grammar::ClientOp;
+
+    support::preamble();
+    let submit_of = |request: u64| {
+        move |op: &ScenarioOp| {
+            matches!(op, ScenarioOp::Client(ClientOp::Submit { request: r, .. })
+                if *r == RequestId(request))
+        }
+    };
+    let base = regress::injected_rf4_copy_set_shape();
+    let mut parent = base.clone();
+    let retry = ScenarioOp::Client(ClientOp::Retry {
+        partition: cases::PARTITION,
+        tenant: rdb_core::contracts::ids::TenantId(1),
+        client: rdb_core::contracts::ids::ClientId(1),
+        request: RequestId(5),
+        digest_id: 5,
+    });
+    let before_six = parent
+        .ops
+        .iter()
+        .position(submit_of(6))
+        .expect("padding request 6");
+    parent.ops.insert(before_six, retry.clone());
+
+    // Control: with its Submit present the Retry is a fault, at its own index.
+    let control = scenario_run::run(&parent).expect("the parent lowers");
+    let parent_retry = u32::try_from(before_six).expect("small");
+    assert_eq!(
+        faults_of(&control.trace),
+        vec![(parent_retry, BoundaryId::RetainedDedupHit)],
+        "a Retry of a live Submit records its fault"
+    );
+
+    // The reducer deletes the Submit the Retry refers to.
+    let mut candidate = parent.clone();
+    let submit = candidate
+        .ops
+        .iter()
+        .position(submit_of(5))
+        .expect("padding request 5");
+    candidate.ops.remove(submit);
+    let retry_index = candidate
+        .ops
+        .iter()
+        .position(|op| *op == retry)
+        .expect("the Retry survives the deletion");
+    let skipped = scenario_run::run(&candidate).expect("an orphaned Retry still lowers");
+
+    // Exactly one op_skipped, naming the Retry's index and ReferentGone.
+    let skips: Vec<(u32, SkipReason)> = skipped
+        .trace
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            TraceKind::OpSkipped {
+                scenario_op_index,
+                reason,
+            } => Some((scenario_op_index, reason)),
+            _ => None,
+        })
+        .collect();
+    let retry_index = u32::try_from(retry_index).expect("small");
+    assert_eq!(skips, vec![(retry_index, SkipReason::ReferentGone)]);
+
+    // No fault_injected for it, and no boundary cell moves: the same scenario without the
+    // Retry at all counts the same cells.
+    assert!(
+        faults_of(&skipped.trace)
+            .iter()
+            .all(|(index, _)| *index != retry_index),
+        "{:?}",
+        faults_of(&skipped.trace)
+    );
+    let mut without = candidate.clone();
+    without.ops.retain(|op| *op != retry);
+    let without = scenario_run::run(&without).expect("the scenario without the Retry lowers");
+    assert_eq!(
+        boundary_cells(&skipped.trace),
+        boundary_cells(&without.trace)
+    );
+    // And nothing was invented for it: no Submit ran at its tick that the scenario without it
+    // did not also run.
+    let submits = |run: &ScenarioRun| {
+        run.plan
+            .seed
+            .iter()
+            .filter(|seed| {
+                matches!(
+                    seed.kind,
+                    rdb_core::contracts::event::EventKind::Client(
+                        rdb_core::contracts::event::ClientEvent::Submit(_)
+                    )
+                )
+            })
+            .count()
+    };
+    assert_eq!(submits(&skipped), submits(&without));
+    assert_eq!(submits(&control), submits(&without) + 2);
+
+    // BoundaryId has no op_skipped member (VA-6): enumerated from the enum itself.
+    let names: Vec<String> = coverage::variants::<BoundaryId>()
+        .iter()
+        .map(|boundary| format!("{boundary:?}"))
+        .collect();
+    assert_eq!(names.len(), coverage::REQUIRED.len());
+    assert!(
+        names
+            .iter()
+            .all(|name| !name.to_ascii_lowercase().contains("skip")),
+        "{names:?}"
+    );
+    tracing::info!(
+        retry_index,
+        cells = ?boundary_cells(&skipped.trace),
+        "op_skipped_recorded"
     );
 }
 
@@ -2471,17 +2961,29 @@ mod semantic_runs {
     }
 }
 
+/// M7V-70 — MUT-5 as an injected fault: a node's disk claims a write durable, the lie is recorded
+/// as the `FalseDurableWatermark` cell, and its host crash loses the write. Named for what it
+/// asserts: INV-LOSS is `Unavailable` on every trace, and INV-PUB fires only on a rewrite that
+/// does not need the lie (tester-m1 T-1, T-2). At the top level so the census counts it; the body
+/// is [`publish_rows::mut5_false_durable_watermark`], beside its helpers.
+#[retcd_test]
+fn m7v_70_mut5_false_durable_watermark_hits_its_cell_and_the_crash_loses_the_lied_seq() {
+    support::preamble();
+    publish_rows::mut5_false_durable_watermark();
+}
+
 /// Rows that need a run reaching P1's `publish`: M7V-92's publish clause, M7V-69, and M7V-70's
 /// recorded-input measurement, all on the A1/P1 arming shape with two writes.
 mod publish_rows {
     use super::*;
     use crate::support::oracle::Oracle;
     use rdb_core::contracts::ids::ReplicaRole;
-    use rdb_core::contracts::ids::{AppliedSeq, DurableSeq, Generation, NodeId, RequestId};
+    use rdb_core::contracts::ids::{AppliedSeq, BootId, DurableSeq, Generation, NodeId, RequestId};
     use rdb_core::contracts::ignore::KernelIgnoredReason;
     use rdb_core::contracts::time::Tick;
     use rdb_core::contracts::trace::AckRejectReason;
     use rdb_core::contracts::trace::{DurabilityClass, SyncOutcome};
+    use rdb_sim::harness::dispatch::DropReason;
     use rdb_sim::harness::run::{RunLimits, RunPlan, Runner};
     use rdb_sim::harness::trace::validate;
     use rdb_sim::sim::network::NetworkOp;
@@ -2854,6 +3356,327 @@ mod publish_rows {
             &Verdict::Proven,
             "INV-PUB armed on the publish and found nothing"
         );
+    }
+
+    /// When the host crash on A is planned and a third write submitted to meet it: after the
+    /// second write published, and before A's next host flush could sync what the lie claimed.
+    /// The lie is told at the grid tick [`FIRST_AT`]` + 50`, the grid is 100 ms, so that flush
+    /// is at [`FIRST_AT`]` + 150`.
+    const CRASH_AT: u64 = SECOND_AT + 25;
+    /// The third write's request id.
+    const THIRD: u64 = SECOND + 1;
+
+    /// The scenario op index the lie's step is tagged with: the slot a lowered `FalseDurable` op
+    /// would take, just before the advance to the first write. A stand-in, because the lowering
+    /// does not lower storage ops at this basis; nonzero, so it cannot pass for a planning
+    /// ordinal.
+    fn lie_op_index() -> u32 {
+        let scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
+        let head = scenario
+            .ops
+            .iter()
+            .position(|op| matches!(op, ScenarioOp::Client(_)))
+            .expect("the A1/P1 case has a submit");
+        u32::try_from(head).expect("a small op list")
+    }
+
+    /// What A's engine held just before its host crashed, what happened to the commit that met
+    /// the crash, and what A's engine holds once A restarts.
+    struct Crashed {
+        before_applied: AppliedSeq,
+        before_durable: DurableSeq,
+        /// Every batch of effects dropped on A that held a commit: the boot it was handed under
+        /// and why it was dropped.
+        dropped_commits: Vec<(BootId, DropReason)>,
+        restarted_applied: AppliedSeq,
+        restarted_durable: DurableSeq,
+        restarted_holders: Vec<Vec<Generation>>,
+    }
+
+    /// [`false_durable_under_two_writes`]'s lie, planned for [`lie_op_index`], then a host crash
+    /// on A planned at [`CRASH_AT`] and met by a third write's commit on A: the second write
+    /// has published on A's acknowledgement, and no real sync on A has covered the lie yet.
+    ///
+    /// A crash downs A; it does not stop the run (I1 closed the crash seam, 2026-10-02). B and C
+    /// run on to the deadline while A stays down, and then A is restarted under boot 2. Its engine
+    /// is read at once, before A's new process handles anything, so a catch-up from the primary
+    /// cannot refill what the crash lost.
+    fn false_durable_then_host_crash() -> (ScenarioRun, Crashed) {
+        use rdb_core::contracts::event::{ClientEvent, EffectKind, EventKind};
+        use rdb_core::contracts::storage::{StorageFault, StoreEffect};
+        use rdb_core::contracts::trace::BoundaryId;
+        use rdb_sim::harness::dispatch::Dropped;
+        use rdb_sim::harness::run::SeedEvent;
+        use rdb_sim::harness::run::{FaultTag, ScenarioStep, StepAction};
+        let mut plan = two_writes_plan();
+        // The lie is a deferred step: its line is written by the provider when a sync takes it.
+        plan.steps.push(ScenarioStep {
+            at: Tick(FIRST_AT - 1),
+            node: LIAR,
+            partition: cases::PARTITION,
+            action: StepAction::Storage(StorageOp::FalseDurable {
+                node: LIAR,
+                through: AppliedSeq(FIRST),
+            }),
+            line: None,
+            taken: Some(FaultTag {
+                boundary: BoundaryId::FalseDurableWatermark,
+                op_index: lie_op_index(),
+            }),
+        });
+        let limits = |deadline: u64| RunLimits {
+            max_events: plan.limits.max_events,
+            deadline: Tick(deadline),
+        };
+        let mut runner = Runner::new(&plan).expect("a runner");
+        let through = runner.run(limits(CRASH_AT - 1)).expect("through the lie");
+        assert!(
+            matches!(through.stop, StopReason::DeadlineReached { .. }),
+            "the run reaches the crash tick with work left: {:?}",
+            through.stop
+        );
+        let engine = runner.dispatcher().engine(LIAR).expect("A's engine");
+        let (before_applied, before_durable) = (
+            engine.buffered_applied(cases::PARTITION, G2),
+            engine.durable(cases::PARTITION, G2),
+        );
+        runner
+            .dispatcher_mut()
+            .inject_storage(StorageOp::Crash {
+                node: LIAR,
+                fault: StorageFault::HostCrash,
+            })
+            .expect("planned on A");
+        let third = plan
+            .seed
+            .iter()
+            .find_map(|seed| match &seed.kind {
+                EventKind::Client(ClientEvent::Submit(request))
+                    if request.identity.request == RequestId(SECOND) =>
+                {
+                    let mut request = request.clone();
+                    request.identity.request = RequestId(THIRD);
+                    Some(SeedEvent {
+                        at: Tick(CRASH_AT),
+                        kind: EventKind::Client(ClientEvent::Submit(request)),
+                        ..seed.clone()
+                    })
+                }
+                _ => None,
+            })
+            .expect("the second write's submit");
+        runner.queue(&third).expect("the third write");
+        let report = runner.run(limits(MAX_TICKS)).expect("to the deadline");
+        let dropped_commits = runner
+            .dispatcher()
+            .dropped()
+            .iter()
+            .filter_map(|dropped| match dropped {
+                Dropped::Effects {
+                    node,
+                    boot,
+                    reason,
+                    effects,
+                } if *node == LIAR
+                    && effects
+                        .iter()
+                        .any(|e| matches!(e.kind, EffectKind::Store(StoreEffect::Commit(_)))) =>
+                {
+                    Some((*boot, *reason))
+                }
+                _ => None,
+            })
+            .collect();
+        // `restart` refuses a node that is not down, so this also says A stayed down.
+        runner
+            .dispatcher_mut()
+            .restart(LIAR, BootId(2))
+            .expect("A is still down at the deadline, and restarts under boot 2");
+        let restarted = runner.dispatcher().engine(LIAR).expect("A's engine");
+        let crashed = Crashed {
+            before_applied,
+            before_durable,
+            dropped_commits,
+            restarted_applied: restarted.buffered_applied(cases::PARTITION, G2),
+            restarted_durable: restarted.durable(cases::PARTITION, G2),
+            restarted_holders: [FIRST, SECOND]
+                .map(|seq| restarted.holders(cases::PARTITION, Seq(seq)))
+                .to_vec(),
+        };
+        let trace = runner.finish().expect("a trace");
+        validate(&trace).expect("well formed");
+        let oracle = Oracle::new().judge(&trace);
+        (
+            ScenarioRun {
+                plan,
+                report,
+                trace,
+                oracle,
+            },
+            crashed,
+        )
+    }
+
+    /// The body of M7V-70's row, here beside the helpers it uses: MUT-5, mark buffered as
+    /// durable, as an **injected fault** (VA-4).
+    ///
+    /// `FalseDurable{A, 11}` is taken by A's host flush after the first write; the second write
+    /// then publishes on A's acknowledgement; then A's host crashes, met by a third write's commit
+    /// before any real sync on A. A stays down to the deadline and is restarted under boot 2, and
+    /// the suffix the lie claimed is gone from it.
+    ///
+    /// * **The cell.** The lie is recorded as one `fault_injected{Storage, A,
+    ///   FalseDurableWatermark}` line, beside the `Partial` sync that told it — the line the
+    ///   campaign counts the `Boundary × FalseDurableWatermark` cell from, carrying the op index the
+    ///   lie was planned for ([`lie_op_index`]).
+    /// * **The crash, on the restarted node.** A applied 12 with 10 durable. Restarted, A's
+    ///   engine holds applied 10 and durable 10, and no generation on A holds 11 or 12. Without
+    ///   the lie it would hold 11 (m1 round-3 walk).
+    ///
+    /// Pins of today's output, the same with the lie removed (tester-m1 walk, T-3):
+    ///
+    /// * **The publish.** Seq 12 publishes after the lie, counting A.
+    /// * **INV-PUB, MUT-5's oracle half.** The recorded trace has no violation; its verdict is
+    ///   `Unavailable{Capability(R1)}`. Rewritten so A's accepted acks for seq 11 and above, and
+    ///   A's publish evidence, say `Durable`, it fires `durable_ack_ungrounded` at A's first
+    ///   such ack, which **precedes** the lie. This clause does not depend on the injected fault.
+    /// * **INV-LOSS.** As measured, not the plan's `Proven`: the sim records no
+    ///   `lineage_root`, so the verdict is `Unavailable{Capability(F1)}` with or without the
+    ///   rewrite.
+    /// * **The stop.** `DeadlineReached` at [`MAX_TICKS`], never `Refused`. Since I1 closed the
+    ///   crash seam (2026-10-02) a taken crash is a dead process, not a missing provider: the
+    ///   commit that met it is dropped `NodeDown` under A's boot 1, A stays down, and B and C
+    ///   run on.
+    pub(super) fn mut5_false_durable_watermark() {
+        use rdb_core::contracts::trace::FaultKind;
+        let (run, crashed) = false_durable_then_host_crash();
+        // A taken crash downs A and stops nothing (I1 closed the crash seam): the run reaches its
+        // deadline, and the commit that met the crash was dropped, never carried out.
+        assert!(
+            matches!(
+                run.report.stop,
+                StopReason::DeadlineReached { deadline, .. } if deadline == Tick(MAX_TICKS)
+            ),
+            "the run goes on through A's crash to the deadline: {:?}",
+            run.report.stop
+        );
+        assert_eq!(
+            crashed.dropped_commits,
+            vec![(BootId(1), DropReason::NodeDown)],
+            "the third write's commit met A's crash under boot 1 and was dropped, A being down"
+        );
+
+        // The cell: one fault_injected line for the lie, on A, beside the Partial that told it.
+        let faults: Vec<(usize, &TraceKind)> = run
+            .trace
+            .events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event.kind, TraceKind::FaultInjected { .. }))
+            .map(|(index, event)| (index, &event.kind))
+            .collect();
+        tracing::info!(?faults, "M7V-70 fault_injected lines");
+        let [(at, kind)] = faults.as_slice() else {
+            panic!("exactly one fault_injected line: {faults:?}");
+        };
+        assert_eq!(
+            *kind,
+            &TraceKind::FaultInjected {
+                fault_kind: FaultKind::Storage,
+                target: LIAR,
+                boundary: BoundaryId::FalseDurableWatermark,
+                scenario_op_index: lie_op_index(),
+            },
+            "the lie is recorded as the FalseDurableWatermark boundary, on A"
+        );
+        let syncs = syncs_on(&run.trace, LIAR);
+        let lie = syncs
+            .iter()
+            .find(|line| line.2 == SyncOutcome::Partial)
+            .unwrap_or_else(|| panic!("a Partial line on A: {syncs:?}"));
+        assert!(
+            run.trace.events[*at].logical_tick == run.trace.events[lie.0].logical_tick
+                && *at > lie.0,
+            "the fault line follows the Partial sync that told the lie, in its tick: fault {at} at \
+             {:?}, Partial {} at {:?}",
+            run.trace.events[*at].logical_tick,
+            lie.0,
+            run.trace.events[lie.0].logical_tick
+        );
+
+        // The publish after the lie counts A's acknowledgement (a pin: the same with no lie).
+        let published = publishes(&run.trace);
+        tracing::info!(?published, "M7V-70 publications");
+        let after: Vec<&PublishLine> = published.iter().filter(|p| p.0 > lie.0).collect();
+        assert!(
+            after.iter().any(|(_, seq, evidence)| *seq == SECOND
+                && evidence.iter().any(|(node, _)| *node == LIAR)),
+            "seq {SECOND} published after the lie, counting A: {published:?}"
+        );
+
+        // The host crash loses the suffix, read on A restarted.
+        assert_eq!(
+            (crashed.before_applied, crashed.before_durable),
+            (AppliedSeq(SECOND), DurableSeq(cases::A1_P1_HEAD)),
+            "before the crash A applied {SECOND} with only {} durable",
+            cases::A1_P1_HEAD
+        );
+        assert_eq!(
+            (crashed.restarted_applied, crashed.restarted_durable),
+            (AppliedSeq(cases::A1_P1_HEAD), DurableSeq(cases::A1_P1_HEAD)),
+            "restarted, A holds only what a real sync covered"
+        );
+        assert_eq!(
+            crashed.restarted_holders,
+            vec![Vec::<Generation>::new(); 2],
+            "no generation on A restarted holds {FIRST} or {SECOND}"
+        );
+
+        // INV-PUB, a pin independent of the lie: no violation as recorded; rewritten so A's
+        // accepted acks for seq >= 11 say Durable, the grounding clause fires.
+        assert!(run.oracle.is_clean(), "{:?}", run.oracle.violations());
+        let mut lied = run.trace.clone();
+        let mut touched = 0;
+        for event in &mut lied.events {
+            match &mut event.kind {
+                TraceKind::ReplicationAck {
+                    from_node,
+                    accepted,
+                    contiguous_seq,
+                    durability_class,
+                    ..
+                } if *from_node == LIAR && *accepted && contiguous_seq.0 >= FIRST => {
+                    *durability_class = DurabilityClass::Durable;
+                    touched += 1;
+                }
+                TraceKind::Publish { ack_evidence, .. } => {
+                    for evidence in ack_evidence.iter_mut().filter(|e| e.node == LIAR) {
+                        evidence.durability = DurabilityClass::Durable;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(touched > 0, "A acknowledged at or above the lie");
+        let report = Oracle::new().judge(&lied);
+        match report.verdict(Invariant::Pub) {
+            Verdict::Violated(signature) => assert_eq!(
+                signature.core.rule, "durable_ack_ungrounded",
+                "{}",
+                signature.detail
+            ),
+            other => panic!("INV-PUB expected Violated{{durable_ack_ungrounded}}, got {other:?}"),
+        }
+
+        // INV-LOSS, as measured on recorded input.
+        let unavailable = Verdict::Unavailable(Unavailable::Capability(PackageId::F1));
+        tracing::info!(
+            clean = ?run.oracle.verdict(Invariant::Loss),
+            lied = ?report.verdict(Invariant::Loss),
+            "M7V-70 INV-LOSS"
+        );
+        assert_eq!(run.oracle.verdict(Invariant::Loss), &unavailable);
+        assert_eq!(report.verdict(Invariant::Loss), &unavailable);
     }
 
     /// Scaffolding toward M7V-70 on **recorded** input; **claims no row**. The run above,

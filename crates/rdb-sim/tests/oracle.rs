@@ -2404,6 +2404,47 @@ fn m7v_31_live_unhealed_or_exhausted_budget_disarms_the_checker() {
     not_armed(&judge(&exhausted), Invariant::Live);
 }
 
+/// Scenario (ruling L-R182ee): a client writes while the network is partitioned, the network
+/// heals, and the cluster then finishes the write. Real clusters take writes while the network is
+/// broken, so the recording is valid, and INV-LIVE counts its budget only from the heal on.
+///
+/// The healed budget is one event, exactly the outcome, and the partition is longer than that.
+/// A judge that let even one pre-heal event into its count would report `NotArmed`, not
+/// `Proven`. The twin without the outcome shows the pre-heal write is still owed after the heal:
+/// a write the cluster never finishes under a healed, fair schedule is a liveness failure,
+/// wherever it began.
+#[retcd_test]
+fn live_a_write_during_a_partition_is_judged_from_the_heal_on() {
+    support::preamble();
+    const BUDGET: u32 = 1;
+    const DURING_PARTITION: usize = 6;
+    let partitioned = |case: &str| {
+        let mut b = base(case)
+            .push(valid_authority())
+            .about(CORR1)
+            .push(submit(REQ1, &[K1]))
+            .push(admit(Seq(1), &[N1, N2, N3], CONFIG_V1));
+        for _ in 0..DURING_PARTITION {
+            b = b.push(valid_authority());
+        }
+        b.push(healed(BUDGET))
+    };
+    assert!(DURING_PARTITION > BUDGET as usize);
+
+    let progress = partitioned("live-heal-progress")
+        .about(CORR1)
+        .push(outcome(REQ1, ClientOutcome::Success, Some(Seq(1))))
+        .build();
+    proven(&judge(&progress), Invariant::Live);
+
+    let no_progress = partitioned("live-heal-no-progress").build();
+    violated(
+        &judge(&no_progress),
+        Invariant::Live,
+        "no_terminal_outcome_under_healed_schedule",
+    );
+}
+
 #[retcd_test]
 fn m7v_32_iso_partition_b_stalls_while_only_partition_a_is_blocked_violates() {
     support::preamble();
@@ -2854,6 +2895,19 @@ fn m7v_81_mut2_counted_forged_ack_trips_inv_pub() {
         .flush(N3, Seq(5))
         .ack_from(N3, Seq(5), DurabilityClass::Durable)
         .by(N4, B1)
+        // The shadow applied what it acknowledges (check 4: an ack never claims more than its
+        // emitter applied). The lie MUT-2 elevates is the role, not the prefix.
+        .push(TraceKind::BatchApply {
+            role: ReplicaRole::Shadow,
+            generation: GEN_1,
+            seq: Seq(5),
+            predecessor_seq: Seq(4),
+            predecessor_digest: digest_at(GEN_1, Seq(4)),
+            entry_digest: digest_at(GEN_1, Seq(5)),
+            batch: 5,
+            key_versions: Vec::new(),
+            outcome: ApplyOutcome::Applied,
+        })
         .push(TraceKind::ReplicationAck {
             from_node: N4,
             to_node: N1,
@@ -2969,4 +3023,53 @@ fn m7v_85_without_rule_has_no_call_site_until_m7v_23() {
     );
     // M7V-23 is held (it needs the I1 runner), so today there is no permitted caller at all and
     // the definition on its own is not a call. When M7V-23 lands, this becomes exactly one.
+}
+
+// ------------------------------------------------------------------------------------------
+// M7V-88 — every hand-built oracle trace is realizable by the runner (clause 2)
+// ------------------------------------------------------------------------------------------
+
+/// M7V-88, clause 2 (design §4.5): every trace an oracle row feeds to a checker passes the same
+/// well-formedness checks I1 applies to a recorded trace, through I1's validator.
+///
+/// Scenario: someone writes a new oracle row with a hand-built trace the runner could never
+/// produce, and builds the oracle any way they like — `Oracle::new()`, `Oracle::default()`, or an
+/// import alias. It must still fail in that row, before a checker is tuned to a shape no campaign
+/// reaches.
+///
+/// How the clause holds: `support::oracle::Oracle::judge` runs `harness::trace::validate` before
+/// it folds, so there is no way to reach a checker without the validator. That covers every
+/// binary, including M7V-70's traces in `scenarios.rs`. There is no list or call-site count to
+/// keep honest (critic F9; tester-q1 T1 showed a count is bypassable). The validator's check 3 is
+/// retired (ruling L-R182ee): a client write before the heal is realizable.
+#[retcd_test]
+fn m7v_88_every_oracle_fixture_passes_the_runners_validator() {
+    use support::oracle::Oracle as Judge;
+
+    support::preamble();
+
+    let mut repeated = base("m7v-88").push(healthy()).build();
+    let last = repeated.events.last().expect("an event").clone();
+    repeated.events.push(last);
+
+    let ways: [(&str, Oracle); 3] = [
+        ("Oracle::new()", Oracle::new()),
+        ("Oracle::default()", Oracle::default()),
+        ("an import alias", Judge::new()),
+    ];
+    for (way, oracle) in ways {
+        let refused = std::panic::catch_unwind(|| oracle.judge(&repeated)).expect_err(&format!(
+            "an oracle built by {way} must refuse a trace whose event_id repeats"
+        ));
+        let message = refused
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            message.contains("not a trace the runner could produce")
+                && message.contains("does not follow"),
+            "{way}: {message}"
+        );
+    }
+    tracing::info!("m7v_88 every oracle construction refuses an unrealizable trace");
 }

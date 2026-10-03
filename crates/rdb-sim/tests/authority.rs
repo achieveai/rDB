@@ -13,6 +13,7 @@
 //! | M7A-35 | no automatic promotion: a frozen then deleted primary grant and 100 ticks produce zero `Cas` |
 //! | M7A-59 | an unavailable control read denies `ControlUnavailable` and does not fence |
 //! | M7A-119..129 | §6: the fake's CAS, termination, snapshot, delay, drop and staging semantics, and A1's answer to each; M7A-128 is parked on the absent placement/V5 seam |
+//! | M7A-130 | the fake passes the H1 conformance suite, `support::conformance::control_fake`, on every ADR-rdb-0008 §7 requirement it owns |
 //!
 //! The M7A-31 rows were once named `m7a_33_*`, and the M7A-28 rows once sent M7A-29's input;
 //! both ids sat on `scripts/m7-census.sh`'s `MISCREDITED` list. Each came off by its claim
@@ -2679,5 +2680,52 @@ fn m7a_129_admission_limit_not_reload_loop() {
         driver.take_reloads(),
         vec![ControlPrefix::Partitions],
         "M7A-129 positive control: one resumable termination, exactly one Reload"
+    );
+}
+
+/// M7A-130 — fake fidelity: the control fake passes the H1 conformance suite.
+///
+/// Plan row: foundation's H1 conformance suite run against the fake; every conformance row
+/// green. ADR-rdb-0008's verification table asks for "a conformance test over the requirements
+/// in §7, asserted against the fake itself so a later relaxation is caught", and that suite is
+/// [`support::conformance::control_fake`]. Before 2026-10-02 it did not exist, and this
+/// row was owed.
+///
+/// The requirement set is asserted by value, not only "every result is `Ok`": a suite that
+/// quietly lost a requirement would otherwise pass with one row fewer. Requirement 4 is absent
+/// on purpose — lead ruling A-R15 made it kernel-side, and M7A-32 asserts it on A1.
+#[retcd_test]
+fn m7a_130_fake_fidelity_conformance() {
+    support::preamble();
+    let results = support::conformance::control_fake();
+    for result in &results {
+        tracing::info!(
+            requirement = result.requirement,
+            passed = result.outcome.is_ok(),
+            "m7a_130"
+        );
+    }
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.requirement)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 5, 6, 7, 8],
+        "M7A-130: the suite covers every ADR-rdb-0008 §7 requirement the fake owns"
+    );
+    let failed: Vec<String> = results
+        .iter()
+        .filter_map(|result| {
+            result.outcome.as_ref().err().map(|why| {
+                format!(
+                    "requirement {} ({}): {why}",
+                    result.requirement, result.claim
+                )
+            })
+        })
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "M7A-130: every conformance row green on the fake; failed: {failed:#?}"
     );
 }

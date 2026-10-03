@@ -7,6 +7,7 @@
 //!
 //! | Module | Owner | What lives there |
 //! |---|---|---|
+//! | [`conformance`] | team h1 (package H1) | the control fake's conformance suite, ADR-rdb-0008 §7 (row M7A-130) |
 //! | [`oracle`] | team verification (package O1) | the invariant checkers |
 //! | [`scenarios`] | team verification (packages G1, Q1) | generators and the campaign runner |
 //!
@@ -19,6 +20,7 @@
 
 #![allow(dead_code)]
 
+pub mod conformance;
 pub mod oracle;
 pub mod scenarios;
 

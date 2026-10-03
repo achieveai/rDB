@@ -12,8 +12,9 @@
 //! # What a named consumer's decline means
 //!
 //! For a **routed** event, a named consumer that answers `Unavailable` stops the run as
-//! `StopReason::Refused` under the one seam `harness::run::route`, with the consumer as the
-//! module (ruling B-R28: nothing is absorbed). The exception was an edge in [`OWED_EDGES`]: a
+//! `StopReason::Declined`, with the consumer as the module and its answer as the error (ruling
+//! B-R28: nothing is absorbed). Until 2026-10-02 that stop was `Refused` under a
+//! `harness::run::route` seam; it is a module's answer, not a delivery the harness cannot make. The exception was an edge in [`OWED_EDGES`]: a
 //! consumer whose package was not wired yet (lead ruling A-R62), whose decline was recorded
 //! while the run continued. The table is empty since 2026-09-28 (lead rulings A-R82..A-R84), so
 //! every named consumer's decline on a routed event now stops the run. A seeded event is the

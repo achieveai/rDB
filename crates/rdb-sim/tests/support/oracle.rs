@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rdb_core::contracts::ids::{PartitionId, ReplicaRole};
 use rdb_core::contracts::trace::{BoundaryId, CapabilityState, PackageId, Trace, TraceKind};
+use rdb_sim::harness::trace::validate;
 
 use self::checks::Checker;
 use self::model::{Model, TraceEventKind};
@@ -326,8 +327,19 @@ impl Oracle {
     /// One pass. Checkers observe an event against the facts of the events **before** it; the
     /// model absorbs the event afterwards. A checker that violates aborts only itself: the other
     /// nine keep folding, because a seed with two independent defects must report both.
+    ///
+    /// # Panics
+    ///
+    /// When `trace` fails I1's validator (`harness::trace::validate`). A trace the runner could
+    /// never produce is a broken fixture, not a verdict, so the judge refuses it before any
+    /// checker sees it (M7V-88 clause 2). Every way of building an oracle reaches this, so no
+    /// row in any binary can judge an unrealizable trace.
     #[must_use]
+    #[track_caller]
     pub fn judge(&self, trace: &Trace) -> Report {
+        if let Err(defect) = validate(trace) {
+            panic!("this trace is not a trace the runner could produce: {defect}");
+        }
         let mut model = Model::new(&trace.header);
         let mut checkers = checks::registry();
         let mut fired: BTreeMap<Invariant, Signature> = BTreeMap::new();

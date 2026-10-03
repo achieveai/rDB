@@ -1,5 +1,5 @@
 //! Campaign and evidence rows: M7V-51..M7V-54, M7V-56..M7V-58, M7V-60..M7V-65, M7V-72..M7V-74,
-//! M7V-75 (unset half; set half parked), M7V-76..M7V-78, M7V-82 (half), M7V-87, M7V-89.
+//! M7V-75 (unset half; set half parked), M7V-76..M7V-78, M7V-82, M7V-87, M7V-89.
 //!
 //! The campaign runs through the scenario bridge (`campaign/engine.rs`): generated seeds, then
 //! the authored cases, folded per design §2.4. Today the bridge lowers no generated seed, so each
@@ -25,11 +25,14 @@ use config_log::retcd_test;
 use rdb_core::contracts::errors::{Capability, ErrorKind, RdbError};
 use rdb_core::contracts::event::{Effect, Event, Module, ModuleName, StepCtx};
 use rdb_core::contracts::ids::ReplicaRole;
+use rdb_core::contracts::trace::TraceKind;
 use rdb_core::contracts::trace::{
     AckRejectReason, BoundaryId, CapabilityState, PackageId, ProtectionPhase, RecoveryMode,
 };
 use rdb_sim::harness::dispatch::Dispatcher;
 use rdb_sim::harness::environment_capabilities;
+use rdb_sim::harness::run::{RunPlan, Runner};
+use rdb_sim::sim::cluster::ClusterConfig;
 
 use support::scenarios::coverage::{self, Axis, DerivedQuorumRule};
 
@@ -377,13 +380,90 @@ fn m7v_82_capability_state_is_derived_from_the_modules_own_report_never_a_litera
         "`CapabilityState::Wired` appears outside the module that builds the report: {literals:?}"
     );
 
-    parked(
-        "M7V-82",
-        PackageId::I1,
-        "the stub half of (a): a module stubbed Ok -> Wired and one stubbed Unavailable, asserted \
-         through the real event emission path, needs the runner to accept injected modules \
-         (crates/rdb-sim/src/harness/run.rs has no such seam)",
-    );
+    // (a) the stub half, through the real event emission path: the runner's capability
+    // preamble. Each stub is put in place of a real module whose report is the **opposite**, so
+    // a preamble read from anything but the injected module's own `capability()` fails: T1 is
+    // held Unavailable (V-R40) and its stub answers Ok and reports Wired; P1 is Wired (V-R38)
+    // and its stub answers Unavailable and takes the trait's default.
+    assert_eq!(report[1], CapabilityState::Unavailable, "T1, the real one");
+    assert_eq!(report[3], CapabilityState::Wired, "P1, the real one");
+    let plan = RunPlan::new(ClusterConfig::default());
+    let runner = Runner::with_modules(
+        &plan,
+        vec![
+            Box::new(Answers(ModuleName::Transaction)),
+            Box::new(Declines(ModuleName::Publication)),
+        ],
+    )
+    .expect("a runner over the stubs");
+    let trace = runner.finish().expect("a trace");
+    let preamble: Vec<(PackageId, CapabilityState)> = trace
+        .events
+        .iter()
+        .filter_map(|event| match event.kind {
+            TraceKind::Capability { package, state } => Some((package, state)),
+            _ => None,
+        })
+        .collect();
+    let mut expected: Vec<(PackageId, CapabilityState)> = environment.to_vec();
+    for (module, state) in ModuleName::ALL.into_iter().zip(report) {
+        let state = match module {
+            ModuleName::Transaction => Module::capability(&Answers(module)),
+            ModuleName::Publication => Module::capability(&Declines(module)),
+            _ => state,
+        };
+        expected.push((package_of(module), state));
+    }
+    assert_eq!(preamble, expected);
+    assert!(preamble.contains(&(PackageId::T1, CapabilityState::Wired)));
+    assert!(preamble.contains(&(PackageId::P1, CapabilityState::Unavailable)));
+}
+
+/// The package a kernel module's capability line names, in the order the runner writes them.
+const fn package_of(module: ModuleName) -> PackageId {
+    match module {
+        ModuleName::Authority => PackageId::A1,
+        ModuleName::Transaction => PackageId::T1,
+        ModuleName::Replication => PackageId::R1,
+        ModuleName::Publication => PackageId::P1,
+        ModuleName::Protection => PackageId::L1,
+        ModuleName::Recovery => PackageId::F1,
+    }
+}
+
+/// A stub that answers `Ok` from `step` and says so: it overrides `capability()` to `Wired`,
+/// which is how a module reports a body under K-F-10.
+struct Answers(ModuleName);
+
+/// A stub that answers `RdbError::Unavailable` from `step` and leaves `capability()` to the
+/// trait's default, as every module without a body does.
+struct Declines(ModuleName);
+
+impl Module for Answers {
+    fn name(&self) -> ModuleName {
+        self.0
+    }
+
+    fn capability(&self) -> CapabilityState {
+        CapabilityState::Wired
+    }
+
+    fn step(&mut self, _ctx: &StepCtx<'_>, _event: &Event) -> Result<Vec<Effect>, RdbError> {
+        Ok(Vec::new())
+    }
+}
+
+impl Module for Declines {
+    fn name(&self) -> ModuleName {
+        self.0
+    }
+
+    fn step(&mut self, _ctx: &StepCtx<'_>, _event: &Event) -> Result<Vec<Effect>, RdbError> {
+        Err(RdbError::unavailable(
+            Capability::Publication,
+            "an M7V-82 stub that declines every event",
+        ))
+    }
 }
 
 /// A module that claims to be wired, and one that takes the trait's default.
@@ -2095,6 +2175,131 @@ fn m7v_72_evidence_campaign_artifact_is_written() {
     assert!(values["minimized"].is_array());
 }
 
+// ------------------------------------------------------------------------------------------
+// M7A-137 — events per fault-free transaction, from the shared corpus report
+// ------------------------------------------------------------------------------------------
+
+#[retcd_test]
+fn m7a_137_event_budget_per_fault_free_transaction_recorded() {
+    support::preamble();
+    // The shared corpus, never a second one (kernel-a plan §11). Both counts are recorded, step
+    // inputs and effects (ruling A-R24); neither is held to §2.5's "14-16", which is a suspect,
+    // not a target (hard rule 1).
+    let campaign = shared();
+    let artifact = written_artifact(engine::artifact_name());
+    let recorded = &artifact.values["kernel_a"]["events_per_txn"];
+    println!("kernel_a.events_per_txn = {recorded}");
+
+    // Recounted here from the histories, so the artifact is checked against the report it came
+    // from rather than against itself. Fault-free is judged per transaction (`engine::txn_events`).
+    let samples: Vec<(u32, u32)> = campaign
+        .histories
+        .iter()
+        .filter(|h| h.ran())
+        .flat_map(|h| h.txn_events.iter().copied())
+        .collect();
+    assert!(
+        !samples.is_empty(),
+        "the shared corpus ran no fault-free transaction, so there is nothing to record"
+    );
+    assert_eq!(recorded["transactions"], samples.len());
+    let pick = |f: fn(&(u32, u32)) -> u32| {
+        let mut values: Vec<u32> = samples.iter().map(f).collect();
+        values.sort_unstable();
+        (
+            values[0],
+            values[(values.len() - 1) / 2],
+            values[values.len() - 1],
+        )
+    };
+    for (name, (min, p50, max)) in [("inputs", pick(|s| s.0)), ("effects", pick(|s| s.1))] {
+        let stats = &recorded[name];
+        assert_eq!(stats["min"], min, "{name}.min");
+        assert_eq!(stats["p50"], p50, "{name}.p50");
+        assert_eq!(stats["max"], max, "{name}.max");
+        assert!(min <= p50 && p50 <= max, "{name}: {stats}");
+    }
+    // A transaction's submit is a step input T1 takes, so no recorded transaction has none: a
+    // zero here is a count that lost the correlation, not a cheap transaction.
+    assert!(samples.iter().all(|(inputs, _)| *inputs > 0), "{samples:?}");
+
+    // The counting rule itself, on a trace whose answer is known (hand-counted, so it does not
+    // lean on the fold above). Correlation 7 is the one fault-free transaction: three answered
+    // offers returning 2 + 0 + 1 effects and one decline, so (3 inputs, 3 effects). Around it:
+    // - 8 is answered but no outcome names it, and 9's outcome is an error: neither counts;
+    // - 10 is a second `Success` for request 1, a retry, not the fault-free path;
+    // - 11's span holds a `fault_injected`, and 12's an `op_skipped`, under other correlations;
+    // - 13 was answered by F1;
+    // - a `fault_injected` outside every span leaves 7 counted: fault-free is per transaction.
+    use rdb_core::contracts::event::ModuleName;
+    use rdb_core::contracts::ids::{CorrelationId, RequestId};
+    use rdb_core::contracts::trace::{
+        ClientOutcome, DispatchOutcome, FaultKind, SkipReason, TraceKind,
+    };
+    let mut trace = engine::empty_trace();
+    let template = trace.events.last().expect("the preamble").clone();
+    let push = |trace: &mut rdb_core::contracts::trace::Trace, correlation: u64, kind| {
+        let mut event = template.clone();
+        event.event_id.0 += u64::try_from(trace.events.len()).expect("small");
+        event.correlation = CorrelationId(correlation);
+        event.kind = kind;
+        trace.events.push(event);
+    };
+    let by = |module, outcome| TraceKind::ModuleDispatch {
+        event: rdb_core::contracts::ids::EventId(1),
+        module,
+        outcome,
+    };
+    let offer = |outcome| by(ModuleName::Transaction, outcome);
+    let reply = |request, outcome| TraceKind::ClientOutcomeReported {
+        request: RequestId(request),
+        outcome,
+        generation: rdb_core::contracts::ids::Generation(1),
+        seq: None,
+        result_digest: rdb_core::contracts::digest::Digest::ROOT,
+        delivered: true,
+    };
+    let fault = || TraceKind::FaultInjected {
+        fault_kind: FaultKind::Network,
+        target: template.node,
+        boundary: BoundaryId::MissingPredecessor,
+        scenario_op_index: 0,
+    };
+    let answered = |effects| DispatchOutcome::Answered { effects };
+    push(&mut trace, 7, offer(answered(2)));
+    push(&mut trace, 7, offer(DispatchOutcome::Declined));
+    push(&mut trace, 8, offer(answered(5)));
+    push(&mut trace, 7, offer(answered(0)));
+    push(&mut trace, 9, offer(answered(4)));
+    push(
+        &mut trace,
+        9,
+        reply(2, ClientOutcome::Error(ErrorKind::RequestIdReuse)),
+    );
+    push(&mut trace, 7, offer(answered(1)));
+    push(&mut trace, 7, reply(1, ClientOutcome::Success));
+    push(&mut trace, 0, fault());
+    push(&mut trace, 10, offer(answered(1)));
+    push(&mut trace, 10, reply(1, ClientOutcome::Success));
+    push(&mut trace, 11, offer(answered(6)));
+    push(&mut trace, 0, fault());
+    push(&mut trace, 11, reply(3, ClientOutcome::Success));
+    push(&mut trace, 12, offer(answered(6)));
+    push(
+        &mut trace,
+        0,
+        TraceKind::OpSkipped {
+            scenario_op_index: 1,
+            reason: SkipReason::ReferentGone,
+        },
+    );
+    push(&mut trace, 12, reply(4, ClientOutcome::Success));
+    push(&mut trace, 13, by(ModuleName::Recovery, answered(1)));
+    push(&mut trace, 13, offer(answered(2)));
+    push(&mut trace, 13, reply(5, ClientOutcome::Success));
+    assert_eq!(engine::txn_events(&trace), vec![(3, 3)]);
+}
+
 #[retcd_test]
 fn m7v_73_evidence_coverage_artifact_is_written() {
     support::preamble();
@@ -2102,6 +2307,14 @@ fn m7v_73_evidence_coverage_artifact_is_written() {
     let artifact = written_artifact(report::COVERAGE_ARTIFACT);
     let values = &artifact.values;
     assert_eq!(values, &campaign.coverage_values());
+
+    // Generated seeds arm no liveness (L-R182m): `Heal` lowers as `SetLink Up` with no `Healed`
+    // phase line, so the artifact names it rather than leaving INV-LIVE/ISO silent.
+    let liveness = values["liveness"].as_str().expect("a liveness note");
+    assert!(
+        liveness.contains("generated seeds do not arm liveness"),
+        "{liveness}"
+    );
 
     // Integer counts, never a percentage.
     for key in ["guard_outcomes", "fault_boundaries", "pairwise"] {
@@ -2331,7 +2544,8 @@ fn m7v_76_rdb_scale_factor_tracks_reality() {
         assert!(
             reason.contains(&format!(
                 "{unrun} of {processed} generated seeds did not run"
-            )) && reason.contains("M7V-55"),
+            )) && reason.contains("M7V-55")
+                && reason.contains("M7V-75"),
             "{reason}"
         );
     }

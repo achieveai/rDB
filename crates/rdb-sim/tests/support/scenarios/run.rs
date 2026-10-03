@@ -22,6 +22,10 @@
 //! | `Time(Pause{node, ticks})` on a transfer's node | the transfer's `stop_at` is the cursor. It must last the rest of the budget: a transfer cannot resume |
 //! | `Recovery(InspectSurvivors{partition, window})` | F1 on the partition's primary node gets placement's `Plan` at the cursor and the prior owner's fence one tick later. The prior owner is the highest placed node that neither survives nor transfers, and its `partitions/{id}` record is control revision 1. A `window` other than the default is a `DiscoveryWindow` budget override |
 //! | `Client(Submit{..})` | a `Submit` seeded on the partition's primary node at the cursor |
+//! | `Client(Retry{..})`, its `Submit` lowered earlier | that `Submit` again, same identity, with the retry's `digest_id` as its body, at the cursor, plus a step recording `fault_injected{Client, RetainedDedupHit}` (same `digest_id`) or `{Client, ChangedDigest}` (different). After the dedup retention window it is [`Unlowerable`]: `ExpiredDedup` has no lowering |
+//! | `Client(Retry{..})`, its `Submit` gone | nothing runs; a step records `op_skipped{ReferentGone}` and no fault (design.md §4.3) |
+//! | `Network(Deliver / Drop / Duplicate{from, to})` | a [`ScenarioStep`] at the cursor planning the next `from -> to` frame: `PlanNext` with `Deliver{0}`, `Drop`, or `Duplicate{0, DUPLICATE_GAP_MILLIS}`, its fault tag `taken: None` and no line. `from == to` is refused: the sim network has no self-link |
+//! | `Network(Heal)` | one step per node pair at the cursor setting the link `Up`. **No** `schedule_phase{Healed}` line (lead ruling L-R182m): that arms INV-LIVE and INV-ISO and belongs to the V-R40 Healed slice, so a generated seed arms no liveness check |
 //! | any `InspectSurvivors`, at the end | the host (see [`host`]): a flush on every node every [`HOST_FLUSH_EVERY_MILLIS`] from the latest cutoff F1 can choose through the deadline, and A1's first `AcquireDue` on each primary [`ACQUIRE_AFTER_CUTOFF_MILLIS`] after that. Neither is a grammar op: no kernel emits either, so a recovered scenario without them never resumes L1 or holds a grant |
 //!
 //! **Every other op is [`Unlowerable`], by index, never dropped.** A silently skipped op would
@@ -42,35 +46,43 @@ use std::collections::{BTreeMap, BTreeSet};
 use bytes::Bytes;
 
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
-use rdb_core::authority::AuthorityTimer;
+use rdb_core::authority::{Authority, AuthorityTimer, Held};
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
 };
-use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::control::{ControlKey, ReadOutcome};
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent};
 use rdb_core::contracts::ids::ReplicaRole;
 use rdb_core::contracts::ids::{
-    AffinityId, AuthorityGeneration, BootId, CorrelationId, DurableSeq, Generation, GrantId,
-    NodeId, OwnerEpoch, PartitionId, RequestIdentity, Revision, Seq, TimerVersion,
+    AffinityId, AuthorityGeneration, BootId, ClientId, CorrelationId, DurableSeq, Generation,
+    GrantId, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Revision, Seq, TenantId,
+    TimerVersion,
 };
 use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{
     Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan, SurvivorInventory,
 };
 use rdb_core::contracts::time::{Tick, TimerFired};
-use rdb_core::contracts::trace::{BudgetName, TopologyEntry, Trace, TraceKind};
+use rdb_core::contracts::trace::{
+    BoundaryId, BudgetName, KernelNote, SkipReason, TopologyEntry, Trace, TraceKind,
+};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest};
 use rdb_core::contracts::version::API_VERSION;
 use rdb_core::recovery::MAX_WINDOW_EXTENSIONS;
+use rdb_sim::harness::hop::HopDelay;
 use rdb_sim::harness::manifest::BudgetOverride;
-use rdb_sim::harness::run::{RunLimits, RunPlan, RunReport, Runner, SeedEvent};
+use rdb_sim::harness::run::{
+    RunLimits, RunPlan, RunReport, Runner, ScenarioLine, ScenarioStep, SeedEvent, StepAction,
+    StopReason,
+};
 use rdb_sim::harness::trace::validate;
 use rdb_sim::harness::transfer::TransferPlan;
 use rdb_sim::sim::cluster::{ClusterConfig, NodeSpec, PartitionSpec};
+use rdb_sim::sim::network::{Delivery, LinkState, NetworkOp as SimNetworkOp};
 use rdb_sim::storage::history::{canonical_history, CanonicalHistory};
 
-use super::grammar::{ClientOp, RecoveryOp, Scenario, ScenarioOp, TimeOp, Topology};
+use super::grammar::{ClientOp, NetworkOp, RecoveryOp, Scenario, ScenarioOp, TimeOp, Topology};
 use crate::support::oracle::{Oracle, Report};
 
 /// Every node runs at boot 1: no grammar op reboots one yet (`Storage(Reopen)` is unlowerable).
@@ -91,6 +103,14 @@ pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
 /// milliseconds: room for R1's rebuild walk and F1's activation CAS, which follow the close at
 /// once in every measured run (close + 10 in `case_f1_r1_discovery_window`).
 pub const ACQUIRE_AFTER_CUTOFF_MILLIS: u64 = 500;
+
+/// The partition a network or time step is recorded under. Neither belongs to a partition; this
+/// is the one the generator's producer table aims every boundary at (`gen::producer`).
+pub const FAULT_PARTITION: PartitionId = PartitionId(0);
+
+/// How long after the first copy a lowered `Duplicate`'s second copy lands, in milliseconds. One,
+/// so the two copies are two pops rather than one tick's tie.
+pub const DUPLICATE_GAP_MILLIS: u64 = 1;
 
 /// Why a scenario has no [`RunPlan`]. Never a partial plan: the whole scenario lowers or none of
 /// it does.
@@ -124,6 +144,48 @@ pub struct ScenarioRun {
     pub trace: Trace,
     /// The oracle's verdicts on `trace`.
     pub oracle: Report,
+}
+
+/// A scenario lowered with its staged ops: what [`attempt`] runs.
+#[derive(Debug)]
+pub struct Lowered {
+    /// Everything that lowers before the run starts.
+    pub plan: RunPlan,
+    /// The ops applied to the run at their tick, in op order.
+    pub stages: Vec<Staged>,
+}
+
+/// One staged op: applied after the run has popped everything before `at`, and before anything
+/// at `at`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Staged {
+    /// The tick it acts at: the cursor when it was lowered.
+    pub at: u64,
+    /// Its index in `Scenario::ops`.
+    pub op_index: usize,
+    /// What it does.
+    pub stage: Stage,
+}
+
+/// What a staged op does to the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stage {
+    /// `Network(DelayCheck)`: [`Dispatcher::delay_hop`] from this tick on.
+    ///
+    /// [`Dispatcher::delay_hop`]: rdb_sim::harness::dispatch::Dispatcher::delay_hop
+    Hold(HopDelay),
+    /// A second `InspectSurvivors` of a partition (ruling V-R34). It runs on the next surviving
+    /// copy, and everything it names is read from the run at its tick: the `partitions/{id}`
+    /// record the first recovery committed, the owner's held grant, and the selected prefix of
+    /// the generation it fences. None of it is known when the scenario is lowered.
+    Reinspect {
+        /// The partition.
+        partition: PartitionId,
+        /// The surviving copy F1 runs on this time.
+        leader: NodeId,
+        /// The `Plan` seed's correlation; the fence's is the next one.
+        correlation: u64,
+    },
 }
 
 /// The members of `partition`, copy ids in placement order, every one at [`BOOT`].
@@ -187,10 +249,28 @@ pub const fn prior(partition: PartitionId) -> Lineage {
 /// # Errors
 ///
 /// [`Unlowerable`] for the first op, in list order, the table has no row for, or whose
-/// preconditions do not hold.
+/// preconditions do not hold. A scenario with a staged op is refused at that op: a plan alone
+/// cannot carry it, and [`attempt`] runs it ([`lower_staged`]).
 pub fn lower(scenario: &Scenario) -> Result<RunPlan, Unlowerable> {
+    let lowered = lower_staged(scenario)?;
+    match lowered.stages.first() {
+        Some(staged) => Err(Unlowerable::at(
+            staged.op_index,
+            "a staged op reads the run at its tick, so it runs only through attempt",
+        )),
+        None => Ok(lowered.plan),
+    }
+}
+
+/// [`lower`], keeping the ops that act on the run as it stands at their tick ([`Stage`]).
+///
+/// # Errors
+///
+/// [`Unlowerable`] exactly as [`lower`], staged ops excepted.
+pub fn lower_staged(scenario: &Scenario) -> Result<Lowered, Unlowerable> {
     let topology = &scenario.topology;
     let mut state = Lowering::default();
+    let mut stages = Vec::new();
     let mut plan = RunPlan::new(cluster(topology));
     plan.provenance = scenario.provenance.clone();
     plan.generator_version = scenario.generator_version;
@@ -278,54 +358,130 @@ pub fn lower(scenario: &Scenario) -> Result<RunPlan, Unlowerable> {
                     },
                 ));
             }
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors { partition, window })
+                if state.recovered.iter().any(|(p, _, _)| p == partition) =>
+            {
+                let stage = reinspect(&plan, &mut state, topology, *partition, *window)
+                    .map_err(|reason| Unlowerable::at(index, reason))?;
+                stages.push(Staged {
+                    at: state.cursor,
+                    op_index: index,
+                    stage,
+                });
+            }
             ScenarioOp::Recovery(RecoveryOp::InspectSurvivors { partition, window }) => {
                 inspect(&mut plan, &mut state, topology, *partition, *window)
                     .map_err(|reason| Unlowerable::at(index, reason))?;
             }
-            ScenarioOp::Client(ClientOp::Submit {
+            ScenarioOp::Network(NetworkOp::DelayCheck {
+                node,
+                checkpoint,
+                by_millis,
+            }) => stages.push(Staged {
+                at: state.cursor,
+                op_index: index,
+                stage: Stage::Hold(HopDelay {
+                    node: *node,
+                    checkpoint: *checkpoint,
+                    by_millis: *by_millis,
+                }),
+            }),
+            ScenarioOp::Client(
+                submit @ ClientOp::Submit {
+                    partition,
+                    tenant,
+                    client,
+                    request,
+                    digest_id,
+                    ..
+                },
+            ) => {
+                let node = primary(topology, *partition).ok_or(Unlowerable::at(
+                    index,
+                    "Submit to a partition with no primary placement",
+                ))?;
+                let at = state.cursor;
+                let body = txn_request(submit, *digest_id);
+                let seed = state.seed(
+                    at,
+                    node,
+                    *partition,
+                    EventKind::Client(ClientEvent::Submit(body)),
+                );
+                plan.seed.push(seed);
+                state.submits.insert(
+                    (*partition, *tenant, *client, *request),
+                    (at, submit.clone()),
+                );
+            }
+            ScenarioOp::Client(ClientOp::Retry {
                 partition,
                 tenant,
                 client,
                 request,
                 digest_id,
-                affinity,
-                expected_generation,
-                keys,
             }) => {
                 let node = primary(topology, *partition).ok_or(Unlowerable::at(
                     index,
-                    "Submit to a partition with no primary placement",
+                    "Retry to a partition with no primary placement",
                 ))?;
-                let affinity = AffinityId(*affinity);
-                let value = Bytes::copy_from_slice(&digest_id.to_be_bytes());
-                let request = TxnRequest {
-                    api_version: API_VERSION,
-                    identity: RequestIdentity {
-                        tenant: *tenant,
-                        client: *client,
-                        request: *request,
-                    },
-                    affinity,
-                    expected_generation: *expected_generation,
-                    remaining_millis: SUBMIT_REMAINING_MILLIS,
-                    conditions: Vec::new(),
-                    mutations: keys
-                        .iter()
-                        .map(|key| Mutation::Put {
-                            key: scoped_key(*tenant, affinity, &key.0.to_be_bytes()),
-                            value: value.clone(),
-                            expected_version: None,
-                        })
-                        .collect(),
-                };
+                let op_index = u32::try_from(index).expect("an op index fits u32");
                 let at = state.cursor;
+                let Some((submitted_at, submit)) = state
+                    .submits
+                    .get(&(*partition, *tenant, *client, *request))
+                    .cloned()
+                else {
+                    // The request it retries is gone (a reducer deleted it): skipped, and no
+                    // fault is claimed for it (design.md §4.3, M7V-22).
+                    plan.steps.push(ScenarioStep {
+                        at: Tick(at),
+                        node,
+                        partition: *partition,
+                        action: StepAction::Mark,
+                        line: Some(ScenarioLine::Skipped {
+                            op_index,
+                            reason: SkipReason::ReferentGone,
+                        }),
+                        taken: None,
+                    });
+                    continue;
+                };
+                if at.saturating_sub(submitted_at) >= Budgets::SPEC_DEFAULTS.dedup_retention_millis
+                {
+                    return Err(Unlowerable::at(
+                        index,
+                        "Retry after the dedup retention window: ExpiredDedup has no lowering",
+                    ));
+                }
+                let ClientOp::Submit {
+                    digest_id: original,
+                    ..
+                } = submit
+                else {
+                    unreachable!("only a Submit is kept as a retry's referent");
+                };
+                let boundary = if original == *digest_id {
+                    BoundaryId::RetainedDedupHit
+                } else {
+                    BoundaryId::ChangedDigest
+                };
+                let body = txn_request(&submit, *digest_id);
                 let seed = state.seed(
                     at,
                     node,
                     *partition,
-                    EventKind::Client(ClientEvent::Submit(request)),
+                    EventKind::Client(ClientEvent::Submit(body)),
                 );
                 plan.seed.push(seed);
+                plan.steps.push(ScenarioStep {
+                    at: Tick(at),
+                    node,
+                    partition: *partition,
+                    action: StepAction::Mark,
+                    line: Some(ScenarioLine::Fault { boundary, op_index }),
+                    taken: None,
+                });
             }
             ScenarioOp::Time(TimeOp::Pause { node, ticks }) => {
                 let cursor = state.cursor;
@@ -351,11 +507,67 @@ pub fn lower(scenario: &Scenario) -> Result<RunPlan, Unlowerable> {
                 }
                 transfer.stop_at = Some(Tick(cursor));
             }
+            ScenarioOp::Network(
+                op @ (NetworkOp::Deliver { from, to }
+                | NetworkOp::Drop { from, to }
+                | NetworkOp::Duplicate { from, to }),
+            ) => {
+                if from == to {
+                    return Err(Unlowerable::at(
+                        index,
+                        "a network op from a node to itself: the sim network has no self-link",
+                    ));
+                }
+                let delivery = match op {
+                    NetworkOp::Drop { .. } => Delivery::Drop,
+                    NetworkOp::Duplicate { .. } => Delivery::Duplicate {
+                        delay_millis: 0,
+                        second_delay_millis: DUPLICATE_GAP_MILLIS,
+                    },
+                    _ => Delivery::Deliver { delay_millis: 0 },
+                };
+                plan.steps.push(ScenarioStep {
+                    at: Tick(state.cursor),
+                    node: *to,
+                    partition: FAULT_PARTITION,
+                    action: StepAction::Network(SimNetworkOp::PlanNext {
+                        from: *from,
+                        to: *to,
+                        delivery,
+                    }),
+                    // A plan is deferred: no line at apply (L-R182m). No fault tag either: a
+                    // weighted draw names no boundary, and a boundary is never inferred from
+                    // the op's family (critic F1).
+                    line: None,
+                    taken: None,
+                });
+            }
+            // Delivery restored on every link. No `schedule_phase{Healed}` line: that arms
+            // INV-LIVE and INV-ISO and belongs to the V-R40 Healed slice (L-R182m), so a
+            // generated seed arms no liveness check, and the coverage artifact says so.
+            ScenarioOp::Network(NetworkOp::Heal) => {
+                for a in 1..=u32::from(topology.nodes) {
+                    for b in a + 1..=u32::from(topology.nodes) {
+                        plan.steps.push(ScenarioStep {
+                            at: Tick(state.cursor),
+                            node: NodeId(a),
+                            partition: FAULT_PARTITION,
+                            action: StepAction::Network(SimNetworkOp::SetLink {
+                                a: NodeId(a),
+                                b: NodeId(b),
+                                state: LinkState::Up,
+                            }),
+                            line: None,
+                            taken: None,
+                        });
+                    }
+                }
+            }
             _ => {
                 return Err(Unlowerable::at(
                     index,
-                    "no lowering for this op: the harness takes provider ops only before the \
-                     first pop, so a timed fault has no RunPlan field",
+                    "no lowering for this op: no harness provider or scenario step applies it \
+                     at its tick",
                 ))
             }
         }
@@ -363,7 +575,7 @@ pub fn lower(scenario: &Scenario) -> Result<RunPlan, Unlowerable> {
 
     host(&mut plan, &mut state, topology, scenario.budget.max_ticks);
     place_survivors(&mut plan, &state, topology);
-    Ok(plan)
+    Ok(Lowered { plan, stages })
 }
 
 /// Lower and run `scenario`, validate its trace, and judge it.
@@ -397,12 +609,60 @@ pub enum NoRun {
 ///
 /// [`NoRun`], never a panic.
 pub fn attempt(scenario: &Scenario) -> Result<ScenarioRun, NoRun> {
-    let plan = lower(scenario).map_err(NoRun::Unlowerable)?;
+    let Lowered { plan, stages } = lower_staged(scenario).map_err(NoRun::Unlowerable)?;
     let mut runner = Runner::new(&plan)
         .map_err(|e| NoRun::Harness(format!("the harness refuses the lowered plan: {e:?}")))?;
-    let report = runner
-        .run(plan.limits)
-        .map_err(|e| NoRun::Harness(format!("the harness stops the lowered plan: {e:?}")))?;
+    let stop = |e| NoRun::Harness(format!("the harness stops the lowered plan: {e:?}"));
+    // One segment per staged tick, then the rest. The event budget is the scenario's, spent
+    // across all of them. A segment that stops for any reason but its own deadline ends the run
+    // there: the stages after it never apply.
+    let mut report: Option<RunReport> = None;
+    let mut cut_short = false;
+    for staged in &stages {
+        if staged.at > 0 {
+            let segment = runner
+                .run(remaining(plan.limits, report.as_ref(), Tick(staged.at - 1)))
+                .map_err(stop)?;
+            cut_short = !matches!(
+                segment.stop,
+                StopReason::DeadlineReached { .. } | StopReason::QueueEmpty
+            );
+            report = Some(merged(report, segment));
+            if cut_short {
+                break;
+            }
+        }
+        match &staged.stage {
+            Stage::Hold(hop) => runner.dispatcher_mut().delay_hop(*hop),
+            Stage::Reinspect {
+                partition,
+                leader,
+                correlation,
+            } => reinspect_now(
+                &mut runner,
+                &scenario.topology,
+                staged.at,
+                (*partition, *leader, *correlation),
+            )
+            .map_err(NoRun::Harness)?,
+        }
+    }
+    if !cut_short {
+        let last = runner
+            .run(remaining(
+                plan.limits,
+                report.as_ref(),
+                plan.limits.deadline,
+            ))
+            .map_err(stop)?;
+        report = Some(merged(report, last));
+    }
+    let mut report = report.expect("at least one segment ran");
+    // A later segment is handed only what is left of the budget, so its stop names that rest.
+    // The run's own cap is the one a reader asked for (tester-q1 T2).
+    if let StopReason::EventBudgetExhausted { max_events, .. } = &mut report.stop {
+        *max_events = plan.limits.max_events;
+    }
     let trace = runner
         .finish()
         .map_err(|e| NoRun::Harness(format!("the harness hands back no trace: {e:?}")))?;
@@ -414,6 +674,35 @@ pub fn attempt(scenario: &Scenario) -> Result<ScenarioRun, NoRun> {
         trace,
         oracle,
     })
+}
+
+/// `limits` with the events `spent` has already used taken off, up to `deadline`.
+fn remaining(limits: RunLimits, spent: Option<&RunReport>, deadline: Tick) -> RunLimits {
+    RunLimits {
+        max_events: limits
+            .max_events
+            .saturating_sub(spent.map_or(0, |report| report.events_consumed)),
+        deadline,
+    }
+}
+
+/// Two segments' reports as one run's: counts summed, replies in order, the later stop.
+fn merged(earlier: Option<RunReport>, later: RunReport) -> RunReport {
+    let Some(mut out) = earlier else {
+        return later;
+    };
+    out.stop = later.stop;
+    out.events_consumed += later.events_consumed;
+    out.steps_offered += later.steps_offered;
+    out.effects_offered += later.effects_offered;
+    out.recorded = later.recorded;
+    out.last_tick = out.last_tick.max(later.last_tick);
+    for slot in 0..out.answered.len() {
+        out.answered[slot] += later.answered[slot];
+        out.declined[slot] += later.declined[slot];
+    }
+    out.replies.extend(later.replies);
+    out
 }
 
 /// What the op walk has declared so far.
@@ -430,6 +719,11 @@ struct Lowering {
     /// Every inspected partition: `(partition, primary node, latest tick its cutoff can be
     /// chosen)`. What [`host`] schedules the flusher and A1's first wake from.
     recovered: Vec<(PartitionId, NodeId, u64)>,
+    /// Every lowered `Submit`, by `(partition, tenant, client, request)`, with its tick: what a
+    /// `Retry` resends, or finds gone.
+    submits: BTreeMap<(PartitionId, TenantId, ClientId, RequestId), (u64, ClientOp)>,
+    /// Every copy a staged second recovery runs on: `(partition, node)`.
+    releaders: Vec<(PartitionId, NodeId)>,
 }
 
 impl Lowering {
@@ -451,6 +745,232 @@ impl Lowering {
             kind,
         }
     }
+}
+
+/// The request a lowered `Submit` carries, with `digest_id` as its body: a `Retry` resends its
+/// `Submit` with its own `digest_id`, so a different one is a different request digest.
+fn txn_request(submit: &ClientOp, digest_id: u64) -> TxnRequest {
+    let ClientOp::Submit {
+        tenant,
+        client,
+        request,
+        affinity,
+        expected_generation,
+        keys,
+        ..
+    } = submit
+    else {
+        unreachable!("txn_request is called with a Submit only");
+    };
+    let affinity = AffinityId(*affinity);
+    let value = Bytes::copy_from_slice(&digest_id.to_be_bytes());
+    TxnRequest {
+        api_version: API_VERSION,
+        identity: RequestIdentity {
+            tenant: *tenant,
+            client: *client,
+            request: *request,
+        },
+        affinity,
+        expected_generation: *expected_generation,
+        remaining_millis: SUBMIT_REMAINING_MILLIS,
+        conditions: Vec::new(),
+        mutations: keys
+            .iter()
+            .map(|key| Mutation::Put {
+                key: scoped_key(*tenant, affinity, &key.0.to_be_bytes()),
+                value: value.clone(),
+                expected_version: None,
+            })
+            .collect(),
+    }
+}
+
+/// Placement's recovery plan for `partition`, anchored at `anchor`: every member a candidate,
+/// every non-shadow copy required for the rebuild, and the authority view placement hands the
+/// new owner on the anchor's lineage.
+fn recovery_plan(
+    topology: &Topology,
+    partition: PartitionId,
+    anchor: LineageAnchor,
+) -> RecoveryPlan {
+    let config = config(topology, partition);
+    RecoveryPlan {
+        anchor,
+        candidates: config
+            .members
+            .iter()
+            .map(|member| Candidate {
+                copy: member.copy,
+                primary_eligible: true,
+                healthy: true,
+                within_capacity: true,
+                has_valid_grant: true,
+            })
+            .collect(),
+        rebuild_required: config
+            .members
+            .iter()
+            .filter(|member| member.role != ReplicaRole::Shadow)
+            .map(|member| member.copy)
+            .collect(),
+        authority_view: AuthorityView {
+            lineage: anchor.lineage,
+            grant_id: GrantId(1),
+            boot_id: BOOT,
+            authority_generation: AuthorityGeneration(1),
+            config_version: topology.config_version_0,
+            authority_seq: 1,
+            valid_through_tick: Tick(u64::MAX),
+            past_horizon: DenyReason::NoGrant,
+        },
+        retention_millis: RETENTION_MILLIS,
+        config,
+    }
+}
+
+/// Lower a second `InspectSurvivors` of `partition` to a [`Stage::Reinspect`] on the next
+/// surviving copy in placement order that has not led a recovery of it yet.
+///
+/// Walked by hand on the A1/P1 case (2026-10-02). That leader commits the next generation, and
+/// the owner F1 picks (the selected copy's holder, not the leader) installs its lineage, but the
+/// generation never activates: the leader's rebuild hears no `SyncProven` after its commit, and
+/// a write in it is refused `RecoveryReadOnly`. Led by the owner instead, the run stops at R1's
+/// `CopyAheadOnControl`, which `harness::dispatch::deliver::kernel` still refuses (I1, owed).
+fn reinspect(
+    plan: &RunPlan,
+    state: &mut Lowering,
+    topology: &Topology,
+    partition: PartitionId,
+    window: u64,
+) -> Result<Stage, &'static str> {
+    let led = |node: NodeId| {
+        state
+            .recovered
+            .iter()
+            .any(|(p, leader, _)| *p == partition && *leader == node)
+            || state.releaders.contains(&(partition, node))
+    };
+    let leader = config(topology, partition)
+        .members
+        .iter()
+        .map(|member| member.node)
+        .find(|node| state.holds.contains_key(&(partition, *node)) && !led(*node))
+        .ok_or("a second InspectSurvivors with no surviving copy left to lead it")?;
+    let overridden = plan
+        .overrides
+        .iter()
+        .any(|o| o.name == BudgetName::DiscoveryWindow && o.millis == window);
+    if window != Budgets::SPEC_DEFAULTS.discovery_window_millis && !overridden {
+        return Err("a second InspectSurvivors with a discovery window the first did not set");
+    }
+    state.releaders.push((partition, leader));
+    state.correlation += 2;
+    Ok(Stage::Reinspect {
+        partition,
+        leader,
+        correlation: state.correlation - 1,
+    })
+}
+
+/// Apply a [`Stage::Reinspect`] at `at`: F1 on `leader` gets placement's `Plan` at `at`, and
+/// the current owner's fence one tick later.
+///
+/// Every value is read from the run, never assumed. The `partitions/{id}` record names the
+/// generation being fenced, its owner and epoch, and the revision the fence proves at. The
+/// owner's A1 names the grant and boot it holds. The `RecoveredFact` note that created the
+/// generation names its selected prefix, which is the anchor every survivor of that generation
+/// now reports (`Dispatcher::answer_inventory`).
+fn reinspect_now(
+    runner: &mut Runner,
+    topology: &Topology,
+    at: u64,
+    stage: (PartitionId, NodeId, u64),
+) -> Result<(), String> {
+    let (partition, leader, correlation) = stage;
+    let ReadOutcome::Found { revision, value } =
+        runner.control_mut().get(ControlKey::Partition(partition))
+    else {
+        return Err(format!(
+            "no partitions/{} record to fence at tick {at}",
+            partition.0
+        ));
+    };
+    let record = PartitionRecord::decode(&value)
+        .ok_or_else(|| format!("partitions/{} does not decode", partition.0))?;
+    let held = runner
+        .dispatcher()
+        .authority(record.owner)
+        .and_then(Authority::held)
+        .map(Held::identity)
+        .ok_or_else(|| format!("the owner n{} holds no grant at tick {at}", record.owner.0))?;
+    let selected = runner
+        .recorded()
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredFact { result },
+                ..
+            } if event.partition == partition && result.new_generation == record.generation => {
+                Some(result.selected)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "no recovered fact created generation {} of partition {}",
+                record.generation.0, partition.0
+            )
+        })?;
+    let anchor = LineageAnchor {
+        lineage: selected.root,
+        base_seq: selected.cutoff_seq,
+        base_digest: selected.cutoff_digest,
+    };
+    let fence = FencingProof {
+        partition,
+        prior_generation: record.generation,
+        prior_owner_epoch: record.owner_epoch,
+        prior_grant_id: held.grant,
+        prior_boot_id: held.boot,
+        revocation: Revocation::DurableDrain {
+            ack_revision: revision,
+        },
+        control_revision: revision,
+        decision_tick: Tick(at + 1),
+    };
+    tracing::info!(
+        partition = partition.0,
+        leader = leader.0,
+        owner = record.owner.0,
+        generation = record.generation.0,
+        revision = revision.0,
+        cutoff = selected.cutoff_seq.0,
+        "second recovery staged"
+    );
+    let seed = |at: u64, correlation: u64, event: RecoveryEvent| SeedEvent {
+        at: Tick(at),
+        node: leader,
+        boot: BOOT,
+        partition,
+        correlation: CorrelationId(correlation),
+        kind: EventKind::Kernel(KernelEvent::Recovery(event)),
+    };
+    let plan = recovery_plan(topology, partition, anchor);
+    for event in [
+        seed(at, correlation, RecoveryEvent::Plan(Box::new(plan))),
+        seed(
+            at + 1,
+            correlation + 1,
+            RecoveryEvent::FenceProven(Box::new(fence)),
+        ),
+    ] {
+        runner
+            .queue(&event)
+            .map_err(|e| format!("the second recovery's seed is refused: {e:?}"))?;
+    }
+    Ok(())
 }
 
 /// The one partition `node` is placed in.
@@ -546,38 +1066,7 @@ fn inspect(
         base_seq: Seq(0),
         base_digest: Digest::ROOT,
     };
-    let recovery = RecoveryPlan {
-        anchor,
-        candidates: config
-            .members
-            .iter()
-            .map(|member| Candidate {
-                copy: member.copy,
-                primary_eligible: true,
-                healthy: true,
-                within_capacity: true,
-                has_valid_grant: true,
-            })
-            .collect(),
-        rebuild_required: config
-            .members
-            .iter()
-            .filter(|member| member.role != ReplicaRole::Shadow)
-            .map(|member| member.copy)
-            .collect(),
-        authority_view: AuthorityView {
-            lineage: prior(partition),
-            grant_id: GrantId(1),
-            boot_id: BOOT,
-            authority_generation: AuthorityGeneration(1),
-            config_version: topology.config_version_0,
-            authority_seq: 1,
-            valid_through_tick: Tick(u64::MAX),
-            past_horizon: DenyReason::NoGrant,
-        },
-        retention_millis: RETENTION_MILLIS,
-        config,
-    };
+    let recovery = recovery_plan(topology, partition, anchor);
     let fence_at = state.cursor.saturating_add(1);
     let fence = FencingProof {
         partition,

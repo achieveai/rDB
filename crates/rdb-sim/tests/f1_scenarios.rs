@@ -210,7 +210,11 @@ struct Run {
 fn run_plan(plan: &RunPlan) -> Run {
     let mut runner = Runner::new(plan).expect("a runner");
     let report = runner.run(plan.limits).expect("the scenario runs");
-    assert_eq!(report.refusal(), None, "{:?}", report.stop);
+    assert!(
+        report.clone().into_result().is_ok(),
+        "bounded: neither refused nor declined: {:?}",
+        report.stop
+    );
     let primary = runner
         .dispatcher()
         .replication()
@@ -1015,7 +1019,11 @@ fn m7b_136_two_survivor_synchronization_converges_on_the_selected_prefix() {
     let trace = runner.finish().expect("a trace");
     let sync = syncs(&trace);
     tracing::info!(stop = ?report.stop, ?sync, facts = ?facts_at(&trace), ?c_head, "m7b_136 run");
-    assert_eq!(report.refusal(), None, "{:?}", report.stop);
+    assert!(
+        report.clone().into_result().is_ok(),
+        "bounded: neither refused nor declined: {:?}",
+        report.stop
+    );
     validate(&trace).expect("a well-formed trace");
 
     // F1 selected B's 100.

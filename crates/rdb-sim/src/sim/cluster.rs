@@ -6,16 +6,22 @@
 //!
 //! # State
 //!
-//! The configuration types, [`ClusterConfig::validate`], [`Cluster::new`], [`Cluster::stop`]
-//! and [`Cluster::start`] are real. [`Cluster::suspend`] is owed: it needs the scheduler to
-//! deliver [`rdb_core::contracts::event::NodeLifecycle::Resumed`], and says so.
+//! The configuration types, [`ClusterConfig::validate`], [`Cluster::new`], [`Cluster::stop`],
+//! [`Cluster::start`] and, since 2026-10-02, [`Cluster::suspend`] are real: a suspension queues
+//! [`rdb_core::contracts::event::NodeLifecycle::Resumed`] through the scheduler, ahead of
+//! whatever the node had queued in its window.
 
 use std::collections::BTreeMap;
 
-use rdb_core::contracts::ids::{BootId, ConfigVersion, NodeId, PartitionId, ReplicaRole};
+use rdb_core::contracts::event::{Event, EventKind, NodeLifecycle};
+use rdb_core::contracts::ids::{
+    BootId, ConfigVersion, CorrelationId, EventId, NodeId, PartitionId, ReplicaRole,
+};
 use rdb_core::contracts::membership::PartitionConfig;
+use rdb_core::contracts::time::Tick;
 
 use crate::error::SimError;
+use crate::sim::scheduler::Scheduler;
 
 /// One simulated machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -135,6 +141,9 @@ pub struct Cluster {
     boots: BTreeMap<NodeId, BootId>,
     /// Stopped nodes, and whether the stop was a host crash.
     stopped: BTreeMap<NodeId, bool>,
+    /// Each suspended node's resume tick, kept after it passes, so a second suspension inside
+    /// the window is refused.
+    suspended: BTreeMap<NodeId, Tick>,
     /// The next boot id to hand out: above every boot the configuration named.
     next_boot: BootId,
 }
@@ -157,6 +166,7 @@ impl Cluster {
             config,
             boots,
             stopped: BTreeMap::new(),
+            suspended: BTreeMap::new(),
             next_boot,
         })
     }
@@ -182,6 +192,7 @@ impl Cluster {
     /// Stop a node's process. Buffered-but-unflushed state may survive a process stop; a host
     /// stop discards it (spike §6). Which is which is
     /// [`crate::storage::crash_image::CrashImage::of`]'s job; this records the fact.
+    /// A stop also ends any suspension: the restarted process was never paused.
     ///
     /// # Errors
     ///
@@ -195,6 +206,9 @@ impl Cluster {
             return Err(SimError::Config { field: "stopped" });
         }
         self.stopped.insert(node, host_crash);
+        // A suspension belongs to the process that stopped. The `Resumed` it queued stays under
+        // that process's boot, which a run drops as stale; the restarted process is not suspended.
+        self.suspended.remove(&node);
         Ok(())
     }
 
@@ -219,14 +233,74 @@ impl Cluster {
 
     /// Suspend a node for `millis` of logical time, then resume it.
     ///
-    /// Delivers [`rdb_core::contracts::event::NodeLifecycle::Resumed`] on resumption. That event
-    /// is the only way a kernel module can learn it was stopped — it is not allowed to read a
-    /// clock and notice a jump — and team kernel-a's monotonic admission rule depends on it.
+    /// Delivers [`NodeLifecycle::Resumed`] on resumption. That event is the only way a kernel
+    /// module can learn it was stopped — it is not allowed to read a clock and notice a jump — and
+    /// team kernel-a's monotonic admission rule depends on it.
+    ///
+    /// The resume is `scheduler.now() + millis`. The `Resumed { suspended_millis: millis }` event
+    /// is queued there, under the node's current boot, node-scoped (partition and correlation
+    /// zero), and its id is returned. Every event already queued for the node at or before the
+    /// resume is what the paused process would have handled in its window: each is taken out
+    /// ([`Scheduler::take_for`]) and queued again at the resume, in its old order and after the
+    /// `Resumed`, so the node hears of its suspension before anything that waited through it.
+    /// The node keeps its boot and is not stopped: a suspension is not a restart.
+    ///
+    /// **What this does not do.** The run loop does not consult the cluster — in a run, process
+    /// liveness is [`crate::harness::dispatch::Dispatcher`]'s, as it is for [`Self::stop`] and
+    /// [`Self::start`] — so an event queued for the node *after* this call, inside the window, is
+    /// not held. Nothing schedules one between this call and the next pop unless the caller does.
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] until package H1 wires the resume event into the scheduler.
-    pub fn suspend(&mut self, _node: NodeId, _millis: u64) -> Result<(), SimError> {
-        Err(SimError::unavailable("sim::cluster::Cluster::suspend"))
+    /// [`SimError::Config`] naming `node` for an unknown node, `stopped` for a stopped one,
+    /// `suspended` for one whose last suspension has not resumed yet at `scheduler.now()`, and
+    /// `millis` for a zero-length suspension, which is no suspension. Each changes nothing. And
+    /// whatever [`Scheduler::schedule`] returns.
+    pub fn suspend(
+        &mut self,
+        node: NodeId,
+        millis: u64,
+        scheduler: &mut Scheduler,
+    ) -> Result<EventId, SimError> {
+        let Some(&boot) = self.boots.get(&node) else {
+            return Err(SimError::Config { field: "node" });
+        };
+        if self.stopped.contains_key(&node) {
+            return Err(SimError::Config { field: "stopped" });
+        }
+        if self
+            .suspended
+            .get(&node)
+            .is_some_and(|resume| *resume > scheduler.now())
+        {
+            return Err(SimError::Config { field: "suspended" });
+        }
+        if millis == 0 {
+            return Err(SimError::Config { field: "millis" });
+        }
+        let resume = scheduler.now().plus_millis(millis);
+        let held = scheduler.take_for(node, resume);
+        let id = scheduler.next_event_id();
+        scheduler.schedule(Event {
+            id,
+            at: resume,
+            node,
+            boot,
+            partition: PartitionId(0),
+            correlation: CorrelationId(0),
+            kind: EventKind::Node(NodeLifecycle::Resumed {
+                suspended_millis: millis,
+            }),
+        })?;
+        for event in held {
+            let id = scheduler.next_event_id();
+            scheduler.schedule(Event {
+                id,
+                at: resume,
+                ..event
+            })?;
+        }
+        self.suspended.insert(node, resume);
+        Ok(id)
     }
 }

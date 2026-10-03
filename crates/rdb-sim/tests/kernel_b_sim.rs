@@ -1445,7 +1445,7 @@ fn m7b_62_replication_end_to_end_duplicate_gap_and_forged_ack() {
 // ---------------------------------------------------------------------------------------------
 // The full-stack fixture for M7B-47 and M7B-68: the lowered A1/P1 case without its activation.
 //
-// `cases::case_a1_p1_new_generation_between_publish_and_reply()` with `A1_P1_ACTIVATE_OP`
+// `cases::case_a1_p1_new_generation_between_publish_and_reply()` through `cases::without_activation`
 // removed lowers to a three-node generation-2 partition: primary `cases::B_NODE` (node 1),
 // regular secondaries `cases::C_NODE` (node 2, copy 1) and `cases::A_NODE` (node 3, copy 2),
 // recovered at cutoff `A1_P1_HEAD` (10). L1 starts `Paused`, the barrier goes durable at the plan
@@ -1466,7 +1466,7 @@ const STACK_HEAD: u64 = cases::A1_P1_HEAD;
 
 fn a1p1_plan() -> RunPlan {
     let mut scenario = cases::case_a1_p1_new_generation_between_publish_and_reply();
-    scenario.ops.remove(cases::A1_P1_ACTIVATE_OP);
+    cases::without_activation(&mut scenario);
     scenario_run::lower(&scenario).expect("the A1/P1 case lowers")
 }
 

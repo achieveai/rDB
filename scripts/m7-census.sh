@@ -150,7 +150,18 @@ is_exempt() {
 # rewatch` asserts `[Reload{prefix}]` then the snapshot's `Watch{from: snapshot_revision}`, and
 # `m7a_28_resumed_watch_uses_the_snapshot_revision_not_the_stale_cursor` terminates with
 # `RevisionCompacted` too. M7A-29 keeps its own function, one fact apart.
-MISCREDITED="M7V-47"
+#
+# 2026-10-02, dev-q1 (m7c) — M7V-47 REMOVED, by making its claim true on disk. The A1/P1 function
+# was the one that did not assert its claim; it is now
+# `m7v_47_case_a1_p1_new_generation_between_publish_and_reply_runs_through_the_runner`
+# (`crates/rdb-sim/tests/scenarios.rs`). It runs the case through the staged bridge, with the
+# second recovery and the `Reply` hold. Kernel half: Publish g2 s11, then generation 3's
+# `RecoveredFact`, then P1 `ReplyWithheld`, then a non-`Valid` Reply decision, and no client
+# outcome. Oracle half: `oracle_half` and INV-AUTH `Proven`. Two mutants are red: skip the hold,
+# and skip the second recovery. The other three cases already asserted theirs (plan row status,
+# 2026-09-28). Open for the lead: the plan clause "registers its named pairwise coverage cell"
+# names no cell. The A1/P1 row asserts `Network+Recovery`; the other three assert none.
+MISCREDITED=""
 
 is_miscredited() {
   for m in $MISCREDITED; do [ "$m" = "$1" ] && return 0; done

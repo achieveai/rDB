@@ -19,6 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use rdb_core::contracts::authority::Checkpoint;
 use rdb_core::contracts::ids::{
     ClientId, ConfigVersion, Generation, NodeId, PartitionId, ReplicaRole, RequestId, ScenarioId,
     Seq, TenantId,
@@ -241,6 +242,18 @@ pub enum NetworkOp {
         claimed_node: NodeId,
         /// The role it claims.
         claimed_role: ReplicaRole,
+    },
+    /// Hold every `AuthorityCheck` at `checkpoint` that `node` asks from this tick on, for
+    /// `by_millis` on its hop to A1 (P-3, `harness::hop`). A delayed dispatch, so something can
+    /// land between a decision and its recheck: the A1/P1 case's new generation lands between
+    /// publication and the `Reply` check (ruling V-R34). The generator never draws it.
+    DelayCheck {
+        /// The node whose module asks.
+        node: NodeId,
+        /// Which checkpoint's check.
+        checkpoint: Checkpoint,
+        /// How long each such check spends on its hop.
+        by_millis: u64,
     },
 }
 
