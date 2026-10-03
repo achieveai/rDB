@@ -6,14 +6,16 @@
 //! |---|---|
 //! | M7F-05 | one recorded `RunPlan` executed twice writes two **byte-identical** trace files |
 //! | M7F-23 | `Network::send` refuses by name **and changes nothing**: no frame in flight, no plan consumed, no `MessageId` burned |
-//! | M7F-24 | `Cluster::suspend` refuses by name **and changes nothing**; the near-miss twin is `stop`/`start` on the same cluster, which do work and hand out a strictly higher `BootId` |
+//! | M7F-24 | `Cluster::suspend` queues `Resumed` at `now + millis` under the node's boot, holds the node's queued events in the window behind it, and neither stops nor restarts the node (re-pointed 2026-10-02); the near-miss twin is `stop`/`start` on the same cluster |
 //! | M7F-43 | a cancel at the armed version removes the arm, a cancel at any other version removes nothing, and `next_deadline` is the minimum over the table |
 //! | M7F-47 | `pop` is ordered by `(at, event_id)` across ticks, `now` follows each popped tick, a schedule into the past is refused naming `at`, and a duplicate `(tick, event_id)` is refused naming `event_id` |
 //!
 //! **Why the refusal row is not `m7f_26` again.** `m7f_26` drives the same seam, but it asserts
 //! only the *seam string*. A `suspend` that marked the node stopped and then refused passes
 //! `m7f_26` and fails here. The state half is the half that has no other row. (`send` was the
-//! second such seam until it was built; M7F-23 now asserts the partitioned path instead.)
+//! second such seam until it was built; M7F-23 now asserts the partitioned path instead. Since
+//! 2026-10-02 `suspend` is built too, `m7f_26` no longer drives it, and M7F-24 asserts what it
+//! does.)
 //!
 //! **Overlap with two landed functions, declared rather than duplicated.**
 //! `m7f_47_two_events_at_one_tick_pop_in_ascending_event_id_order` and
@@ -146,51 +148,141 @@ fn m7f_23_network_send_is_unavailable_and_names_itself() {
     );
 }
 
-/// M7F-24: `Cluster::suspend` is unavailable, names itself, and leaves the cluster untouched —
-/// while `stop` and `start` on the same cluster do work.
+/// M7F-24: `Cluster::suspend` queues the resume through the scheduler, holds what the node had
+/// queued in its window behind it, and changes nothing else.
 ///
-/// **What turns this red:** a `suspend` that records the node as stopped (or rolls its boot)
-/// before refusing; a `start` that reuses a `BootId` rather than allocating above every boot
-/// seen so far; a change to the seam string.
+/// **Re-pointed 2026-10-02 (team h1).** The old subject was "`Cluster::suspend` refuses by name
+/// and changes nothing", under the name `m7f_24_cluster_suspend_is_unavailable_and_names_itself`.
+/// `suspend` is now real, so that claim is false. The suffix is renamed to what the row asserts
+/// and the id prefix is kept (critic F7, after the V-R40 Q3 precedent; a name is not a claim).
+/// The new subject keeps the old one's state half — a suspension is not a stop and not a
+/// restart — and adds what the seam now does.
 ///
-/// The `stop`/`start` twin is what stops this row being "a cluster that refuses everything".
-/// `NodeLifecycle::Resumed` is the only way a module can learn it was stopped — it may not read
-/// a clock and notice a jump — so a `suspend` that faked success would silently disable
-/// kernel-a's monotonic admission rule, and a crash would be reachable while a transient was
-/// not.
+/// **What turns this red:** a `suspend` that queues no `Resumed`, queues it at the wrong tick, under
+/// the wrong boot or with the wrong `suspended_millis`; that lets the node's own queued events in
+/// the window run before the `Resumed`, reorders them, or drops one; that moves another node's
+/// event; that records the node as stopped or rolls its boot; or a refusal (unknown, stopped,
+/// still suspended, zero-length) that changes the queue.
+///
+/// The `stop`/`start` twin is kept: the lifecycle either side of `suspend` still works, and a
+/// stopped node cannot be suspended. `NodeLifecycle::Resumed` is the only way a module can learn
+/// it was stopped — it may not read a clock and notice a jump — so a `suspend` that faked success
+/// would silently disable kernel-a's monotonic admission rule.
 #[retcd_test]
-fn m7f_24_cluster_suspend_is_unavailable_and_names_itself() {
+fn m7f_24_cluster_suspend_queues_resumed_and_holds_the_window() {
+    use rdb_core::contracts::event::NodeLifecycle;
     support::preamble();
     let mut cluster = Cluster::new(support::cluster()).expect("a four-node cluster");
     let before = cluster.boot(NODE);
     assert_eq!(before, Some(BootId(1)), "the configured boot");
+    let mut scheduler = Scheduler::new();
+    let event = |scheduler: &mut Scheduler, at: u64, node: NodeId| {
+        let id = scheduler.next_event_id();
+        scheduler
+            .schedule(Event {
+                id,
+                at: Tick(at),
+                node,
+                boot: BootId(1),
+                partition: PartitionId(1),
+                correlation: CorrelationId(id.0),
+                kind: EventKind::Timer(TimerFired {
+                    id: TimerId(1),
+                    version: TimerVersion(1),
+                    scheduled_at: Tick(at),
+                }),
+            })
+            .expect("a future event");
+        id
+    };
+    let inside = event(&mut scheduler, 100, NODE);
+    let elsewhere = event(&mut scheduler, 100, PEER);
+    let after = event(&mut scheduler, 900, NODE);
+    // Queued last, due second: the hold must keep the node's own order, not the queueing order
+    // and not its reverse.
+    let inside_later = event(&mut scheduler, 200, NODE);
 
-    let refused = cluster
-        .suspend(NODE, 500)
-        .expect_err("the resume event is owed by package H1");
-    assert_eq!(
-        refused,
-        SimError::Unavailable {
-            seam: "sim::cluster::Cluster::suspend"
-        },
-    );
-    assert_eq!(
-        cluster.boot(NODE),
-        before,
-        "a refused suspend rolled no boot"
-    );
+    let resumed = cluster
+        .suspend(NODE, 500, &mut scheduler)
+        .expect("a running node suspends");
+    assert_eq!(cluster.boot(NODE), before, "a suspension rolls no boot");
     assert!(
         cluster.stopped(NODE).is_none(),
-        "a refused suspend did not take the node away"
+        "a suspension is not a stop"
     );
 
-    // Near-miss twin: the lifecycle either side of `suspend` is built, so the refusal above is
-    // about suspension and not about the cluster.
+    // Refusals change nothing: still suspended, unknown, zero-length.
+    assert_eq!(
+        cluster.suspend(NODE, 10, &mut scheduler),
+        Err(SimError::Config { field: "suspended" })
+    );
+    assert_eq!(
+        cluster.suspend(NodeId(9), 10, &mut scheduler),
+        Err(SimError::Config { field: "node" })
+    );
+    assert_eq!(
+        cluster.suspend(PEER, 0, &mut scheduler),
+        Err(SimError::Config { field: "millis" })
+    );
+    assert_eq!(
+        scheduler.queued(),
+        5,
+        "four events and one resume, nothing more"
+    );
+
+    let mut popped = Vec::new();
+    while let Some(event) = scheduler.pop() {
+        popped.push(event);
+    }
+    let order: Vec<(u64, NodeId, Option<EventId>)> = popped
+        .iter()
+        .map(|event| {
+            let original = match event.kind {
+                EventKind::Timer(_) => Some(EventId(event.correlation.0)),
+                _ => None,
+            };
+            (event.at.0, event.node, original)
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (100, PEER, Some(elsewhere)),
+            (500, NODE, None),
+            (500, NODE, Some(inside)),
+            (500, NODE, Some(inside_later)),
+            (900, NODE, Some(after)),
+        ],
+        "another node's event is untouched; the node's own events in the window wait for the \
+         resume and run after it, in their own order; the one past the window keeps its tick"
+    );
+    let resume = &popped[1];
+    assert_eq!(resume.id, resumed, "the id suspend returned");
+    assert_eq!(
+        resume.kind,
+        EventKind::Node(NodeLifecycle::Resumed {
+            suspended_millis: 500
+        }),
+        "the module is told how long it was stopped"
+    );
+    assert_eq!(resume.boot, BootId(1), "under the node's current boot");
+
+    // The suspension is over at 900: the node may be suspended again.
+    cluster
+        .suspend(NODE, 10, &mut scheduler)
+        .expect("a node whose suspension has resumed suspends again");
+
+    // Near-miss twin: the lifecycle either side of `suspend` still works, and a stopped node is
+    // not suspended.
     cluster.stop(NODE, false).expect("a running node stops");
     assert_eq!(
         cluster.stopped(NODE),
         Some(false),
         "a process stop, recorded as such"
+    );
+    assert_eq!(
+        cluster.suspend(NODE, 10, &mut scheduler),
+        Err(SimError::Config { field: "stopped" })
     );
     let restarted = cluster.start(NODE).expect("a stopped node starts");
     assert!(
@@ -201,7 +293,46 @@ fn m7f_24_cluster_suspend_is_unavailable_and_names_itself() {
     assert_eq!(cluster.boot(NODE), Some(restarted));
     assert!(cluster.stopped(NODE).is_none(), "and it is running again");
 
-    tracing::info!(seam = "sim::cluster::Cluster::suspend", "m7f_24 seam");
+    tracing::info!(resume_tick = 500, suspended_millis = 500, "m7f_24 suspend");
+}
+
+/// Scenario (tester h1, A2): a node that is stopped and restarted while suspended comes back
+/// unsuspended. The suspension belonged to the process that stopped; the restarted process has a
+/// new boot and was never paused, so it can be suspended at once, and its `Resumed` is queued
+/// under the new boot. The `Resumed` the stopped process left behind is under the dead boot, and
+/// a run drops it as stale (`Dispatcher::drop_if_dead`). Regression: before the fix the restarted
+/// node was refused as `suspended` until the old resume tick.
+#[retcd_test]
+fn suspend_a_node_restarted_while_suspended_comes_back_unsuspended() {
+    use rdb_core::contracts::event::NodeLifecycle;
+    support::preamble();
+    let mut cluster = Cluster::new(support::cluster()).expect("a four-node cluster");
+    let mut scheduler = Scheduler::new();
+    cluster
+        .suspend(NODE, 500, &mut scheduler)
+        .expect("a running node suspends");
+    cluster
+        .stop(NODE, true)
+        .expect("a suspended node can crash");
+    let boot = cluster.start(NODE).expect("and restart");
+    let resumed = cluster
+        .suspend(NODE, 10, &mut scheduler)
+        .expect("the restarted process was never suspended");
+    let mut popped = Vec::new();
+    while let Some(event) = scheduler.pop() {
+        popped.push(event);
+    }
+    let resumes: Vec<(u64, BootId, bool)> = popped
+        .iter()
+        .filter(|event| matches!(event.kind, EventKind::Node(NodeLifecycle::Resumed { .. })))
+        .map(|event| (event.at.0, event.boot, event.id == resumed))
+        .collect();
+    assert_eq!(
+        resumes,
+        vec![(10, boot, true), (500, BootId(1), false)],
+        "the new suspension resumes under the new boot; the old one is left under the dead boot"
+    );
+    tracing::info!(boot = boot.0, "suspend restarted unsuspended");
 }
 
 /// M7F-43: a stale timer version never fires.
@@ -443,6 +574,8 @@ fn recorded_plan() -> RunPlan {
         survivors: Vec::new(),
         transfers: Vec::new(),
         member_watches: true,
+        // Not a field M7F-05 names: timed scenario steps arrived after it (team i1).
+        steps: Vec::new(),
         limits: RunLimits {
             max_events: 64,
             deadline: Tick(5_000),

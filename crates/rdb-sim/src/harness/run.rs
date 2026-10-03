@@ -62,11 +62,11 @@
 //! configuration change reaches L1 before R1. A consumer that declines on an edge in
 //! [`route::OWED_EDGES`] is recorded as [`DispatchOutcome::DeclinedOwed`] and the run goes on
 //! (A-R62); the table is empty since 2026-09-28 (A-R82..A-R84), so a decline on any named edge
-//! stops the run under `harness::run::route`, because the fact would otherwise be lost.
+//! stops the run as [`StopReason::Declined`], because the fact would otherwise be lost.
 //!
 //! A storage completion the dispatcher marks as addressed — `SnapshotReady` for a handle one
-//! module minted — is offered to that module only (A-R69a), and its decline stops the run under
-//! `harness::run::route` the same way.
+//! module minted — is offered to that module only (A-R69a), and its decline stops the run as
+//! [`StopReason::Declined`] the same way.
 //!
 //! On a refusal the loop stops there, keeps the seam name, and reports [`StopReason::Refused`].
 //! It does not absorb the error, does not continue past it, and has no fallback that pretends the
@@ -105,6 +105,8 @@
 //!   [`rdb_core::contracts::time::ControlTime::is_stale`] is false at every step. See the
 //!   comment at the `advance` call in [`Runner::run`].
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::errors::RdbError;
@@ -119,8 +121,8 @@ use rdb_core::contracts::recovery::SurvivorInventory;
 use rdb_core::contracts::storage::Batch;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
-    ApplyOutcome, DispatchOutcome, PackageId, Provenance, TopologyEntry, Trace, TraceHeader,
-    TraceKind,
+    ApplyOutcome, BoundaryId, DispatchOutcome, FaultKind, PackageId, Provenance, SkipReason,
+    TopologyEntry, Trace, TraceHeader, TraceKind,
 };
 use rdb_core::contracts::version::TRACE_SCHEMA_VERSION;
 
@@ -247,8 +249,163 @@ pub struct RunPlan {
     /// ruling B-R56, [`Dispatcher::set_member_watches`]). On by default (lead
     /// ruling B-R58b): R1 catches a member up from the root (see the dispatcher field's note).
     pub member_watches: bool,
+    /// Scenario operations applied **during** the run, at their tick, in this order. Must be
+    /// sorted by `at` (non-decreasing); [`Runner::new`] refuses an unsorted list with
+    /// [`SimError::Config`] naming `steps`. See [`ScenarioStep`] for when one is applied.
+    pub steps: Vec<ScenarioStep>,
     /// The bounds the loop runs under.
     pub limits: RunLimits,
+}
+
+/// One scenario operation the runner applies at a tick, after the run has started.
+///
+/// The plan's other fault fields (`network_ops`, `storage_ops`, ...) are applied before the
+/// first pop. A step is applied by [`Runner::run`] when its tick comes round:
+///
+/// * **Apply-before-pop.** At the top of each loop iteration the next tick is the earliest of
+///   the queue's head, the clock's next deadline and the first pending step's `at`. Every
+///   pending step with `at <=` that tick is applied, in plan order, **before** any event at that
+///   tick is popped and before due timers are fired. The dispatcher's clock is advanced to `at`
+///   first, so whatever the step schedules is timed from `at`. The loop then goes round again.
+/// * **Past the deadline.** A step whose `at` is later than [`RunLimits::deadline`] is neither
+///   applied nor recorded. While it is pending the run is not `QueueEmpty`; it ends
+///   [`StopReason::DeadlineReached`] with `next: at`, the same as a queued event past the
+///   deadline.
+/// * A step consumes no event, so it does not count against [`RunLimits::max_events`].
+///
+/// # Fault lines are written when the fault happens (lead ruling L-R182m, critic F1/F2)
+///
+/// A boundary is credited when it is reached, never because it was scheduled. So:
+///
+/// * An action that **is** the fault ([`StepAction::is_deferred`] false: `Mark` for a fault the
+///   seed itself carries, `Skew`, `Restart`, a `SetLink`) may carry
+///   [`ScenarioLine::Fault`]. It is recorded when the step is applied, at the step's site.
+/// * An action that only **plans** a fault (a network plan, a storage fault, a control plan) may
+///   carry [`ScenarioStep::taken`] instead. Nothing is recorded when the step is applied. The
+///   provider that later takes the fault records the line through the one hook,
+///   `Dispatcher::fault_taken`, with this tag's boundary and op index. A planned fault that is
+///   never taken records nothing.
+/// * The other pairing is refused by [`Runner::new`] with [`SimError::Config`] naming
+///   `step_line` or `step_taken`.
+/// * The line's `fault_kind` is the action's ([`StepAction::fault_kind`]), never the
+///   boundary's family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScenarioStep {
+    /// When it is applied.
+    pub at: Tick,
+    /// The node it is aimed at: `FaultInjected::target` for a line recorded at apply.
+    pub node: NodeId,
+    /// The partition of the recorded line.
+    pub partition: PartitionId,
+    /// What the environment does.
+    pub action: StepAction,
+    /// The line recorded when the step is applied, if any.
+    pub line: Option<ScenarioLine>,
+    /// For a deferred action: what its provider records when it takes the fault.
+    pub taken: Option<FaultTag>,
+}
+
+/// The boundary and scenario op index a provider records when it takes a planned fault (see
+/// [`ScenarioStep::taken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FaultTag {
+    /// The required boundary case the fault exercises.
+    pub boundary: BoundaryId,
+    /// Its index in the scenario's op list.
+    pub op_index: u32,
+}
+
+/// What the environment does when a [`ScenarioStep`] is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepAction {
+    /// Nothing. The step exists for its line: a client fault the seed itself carries (a
+    /// re-submit), or an op the lowering skipped.
+    Mark,
+    /// [`Dispatcher::inject_network`].
+    Network(NetworkOp),
+    /// [`Dispatcher::inject_storage`].
+    Storage(StorageOp),
+    /// [`crate::sim::clock::Clock::set_skew`] for the step's node.
+    Skew {
+        /// The node's clock error.
+        millis: i64,
+        /// Whether its bound is still established.
+        bound_established: bool,
+    },
+    /// [`Dispatcher::restart`] of the step's node under this boot.
+    Restart(BootId),
+    /// [`ControlStore::inject`], then the store's completions are scheduled from the step's tick
+    /// ([`Dispatcher::pump_at`]), so a watch emitted at `at` lands at `at`, never earlier (lead
+    /// ruling L-R182k).
+    Control(ControlOp),
+}
+
+impl StepAction {
+    /// The fault kind of a line about this action: the scenario group of the provider that acts.
+    /// `Mark` is a client fault, because the only fault a seed carries is a client request.
+    /// `Restart` is a storage fault: reopen is in the storage group (`FaultKind::Storage`).
+    #[must_use]
+    pub const fn fault_kind(self) -> FaultKind {
+        match self {
+            Self::Mark => FaultKind::Client,
+            Self::Network(_) => FaultKind::Network,
+            Self::Storage(_) | Self::Restart(_) => FaultKind::Storage,
+            Self::Skew { .. } => FaultKind::Time,
+            Self::Control(_) => FaultKind::Control,
+        }
+    }
+
+    /// Whether applying this action only plans a fault a provider takes later. A `SetLink`
+    /// changes the link at once; every other network op, every storage op and every control op
+    /// is taken by its provider when the operation it names arrives.
+    #[must_use]
+    pub const fn is_deferred(self) -> bool {
+        match self {
+            Self::Mark | Self::Skew { .. } | Self::Restart(_) => false,
+            Self::Network(op) => !matches!(op, NetworkOp::SetLink { .. }),
+            Self::Storage(_) | Self::Control(_) => true,
+        }
+    }
+}
+
+/// The scenario-owned trace line a step records when it is applied. Only the two kinds a
+/// scenario owns, so a plan cannot forge a kernel line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScenarioLine {
+    /// Recorded as [`TraceKind::FaultInjected`] with `target` the step's node and `fault_kind`
+    /// the action's. Only on an action that is itself the fault (see [`ScenarioStep`]).
+    Fault {
+        /// The required boundary case it exercises.
+        boundary: BoundaryId,
+        /// Its index in the scenario's op list.
+        op_index: u32,
+    },
+    /// Recorded as [`TraceKind::OpSkipped`]. No fault line goes with it: a skipped op is a
+    /// reducer artifact, not a fault (M7V-22).
+    Skipped {
+        /// Its index in the scenario's op list.
+        op_index: u32,
+        /// Why.
+        reason: SkipReason,
+    },
+}
+
+impl ScenarioLine {
+    /// The trace line this records for `action` aimed at `target`.
+    const fn kind(self, target: NodeId, action: StepAction) -> TraceKind {
+        match self {
+            Self::Fault { boundary, op_index } => TraceKind::FaultInjected {
+                fault_kind: action.fault_kind(),
+                target,
+                boundary,
+                scenario_op_index: op_index,
+            },
+            Self::Skipped { op_index, reason } => TraceKind::OpSkipped {
+                scenario_op_index: op_index,
+                reason,
+            },
+        }
+    }
 }
 
 impl RunPlan {
@@ -275,6 +432,7 @@ impl RunPlan {
             survivors: Vec::new(),
             transfers: Vec::new(),
             member_watches: true,
+            steps: Vec::new(),
             limits: RunLimits::SMALL,
         }
     }
@@ -342,15 +500,35 @@ pub enum StopReason {
     /// continued is a protocol question for whoever owns the module that raises one; today no
     /// wired module can.
     ///
-    /// **Unreachable from a scenario.** [`Dispatcher`] holds six concrete private fields with no
-    /// injection point, and the only module with a body answers either `Ok` or
-    /// [`RdbError::Unavailable`]. Kept because the loop must not have an unnamed exit.
+    /// **Reachable.** Any module whose `step` answers an error other than
+    /// [`RdbError::Unavailable`] stops the run here, and [`Runner::with_modules`] (team i1,
+    /// M7V-82) puts a stub in place of a real module, so a test reaches it with one. It is not
+    /// a bounded run: [`RunReport::into_result`] gives [`SimError::Kernel`] with the error, as
+    /// for `Declined`. Until 2026-10-02 this doc said "unreachable, no injection point", and
+    /// `into_result` answered `Ok`. Kept because the loop must not have an unnamed exit.
     ModuleError {
         /// Which module.
         module: ModuleName,
         /// The event it was stepping.
         event: EventId,
         /// What it said.
+        error: RdbError,
+    },
+    /// A routed event's named consumer, or the one module an addressed storage completion is
+    /// for, declined it (rulings B-R28, A-R69a). The run stops, because going on would drop a
+    /// fact that was meant for that module.
+    ///
+    /// **Not a refusal.** The harness delivered the fact; the decline is the consumer's own
+    /// answer, carried as it gave it. So [`Self::refusal`] is `None`, and
+    /// [`RunReport::into_result`] gives [`SimError::Kernel`] with this error. Until 2026-10-02
+    /// (team i1) this was `Refused` under a `harness::run::route` seam, which no harness work
+    /// could ever close.
+    Declined {
+        /// The module that declined.
+        module: ModuleName,
+        /// The event it declined.
+        event: EventId,
+        /// Its answer, an [`RdbError::Unavailable`].
         error: RdbError,
     },
 }
@@ -447,15 +625,22 @@ impl RunReport {
     }
 
     /// The run as a `Result`: `Ok` for a run that finished or hit a bound, `Err` for one that
-    /// stopped at an unbuilt seam.
+    /// stopped at an unbuilt seam or on a module's own answer.
     ///
     /// For a caller that would rather have the refusal as an error than have to read
     /// [`Self::stop`] — the shape every other unbuilt seam in this crate answers in.
     ///
     /// # Errors
     ///
-    /// [`SimError::Unavailable`] naming the seam, for [`StopReason::Refused`].
+    /// [`SimError::Unavailable`] naming the seam, for [`StopReason::Refused`];
+    /// [`SimError::Kernel`] with the module's own answer, for [`StopReason::Declined`] and
+    /// [`StopReason::ModuleError`].
     pub fn into_result(self) -> Result<Self, SimError> {
+        if let StopReason::Declined { error, .. } | StopReason::ModuleError { error, .. } =
+            &self.stop
+        {
+            return Err(SimError::Kernel(error.clone()));
+        }
         match self.stop.refusal() {
             Some(seam) => Err(SimError::unavailable(seam)),
             None => Ok(self),
@@ -526,6 +711,8 @@ pub struct Runner {
     budgets: Budgets,
     /// The semantic lines' cross-line state (see [`crate::harness::semantic`]).
     semantic: Semantic,
+    /// The plan's [`ScenarioStep`]s not yet applied, earliest first.
+    steps: VecDeque<ScenarioStep>,
 }
 
 impl Runner {
@@ -545,8 +732,39 @@ impl Runner {
     /// Whatever [`Cluster::new`] returns for an invalid topology, whatever [`RunPlan::header`]
     /// returns, whatever [`ControlStore::seed`] returns for a key seeded twice, whatever
     /// [`ControlStore::inject`] returns for a malformed fault, and whatever
-    /// [`Scheduler::schedule`] returns for a seed event in the past.
+    /// [`Scheduler::schedule`] returns for a seed event in the past. [`SimError::Config`] naming
+    /// `steps` when [`RunPlan::steps`] is not sorted by tick, `step_line` for a fault line on a
+    /// deferred action and `step_taken` for a fault tag on an action that is not deferred (see
+    /// [`ScenarioStep`]).
     pub fn new(plan: &RunPlan) -> Result<Self, SimError> {
+        Self::with_dispatcher(plan, Dispatcher::new())
+    }
+
+    /// **Test seam, for M7V-82 only** (critic F13): [`Self::new`] with each of `modules` put in
+    /// place of the real module of the same [`Module::name`](rdb_core::contracts::event::Module::name).
+    /// The capability preamble is then read from those modules' own reports through the same
+    /// path [`Self::new`] uses, which is what the row asserts.
+    ///
+    /// Only `capability` and `step` are replaced. The dispatcher's other reads of a module's
+    /// typed state (P1's view of R1's tracker, F1's hosted instances) still see the real one,
+    /// so a run built this way is not a product run and no other row may build one.
+    ///
+    /// # Errors
+    ///
+    /// Exactly as [`Self::new`].
+    #[doc(hidden)]
+    pub fn with_modules(
+        plan: &RunPlan,
+        modules: Vec<Box<dyn rdb_core::contracts::event::Module>>,
+    ) -> Result<Self, SimError> {
+        let mut dispatcher = Dispatcher::new();
+        for module in modules {
+            dispatcher.inject_module(module);
+        }
+        Self::with_dispatcher(plan, dispatcher)
+    }
+
+    fn with_dispatcher(plan: &RunPlan, dispatcher: Dispatcher) -> Result<Self, SimError> {
         let cluster = Cluster::new(plan.cluster.clone())?;
         let header = plan.header()?;
         let budgets = header.config.budgets;
@@ -554,12 +772,28 @@ impl Runner {
         let mut runner = Self {
             scheduler: Scheduler::new(),
             control: ControlStore::new(),
-            dispatcher: Dispatcher::new(),
+            dispatcher,
             cluster,
             recorder: Recorder::new(),
             budgets,
             semantic: Semantic::default(),
+            steps: VecDeque::new(),
         };
+        if plan.steps.windows(2).any(|pair| pair[1].at < pair[0].at) {
+            return Err(SimError::Config { field: "steps" });
+        }
+        for step in &plan.steps {
+            let deferred = step.action.is_deferred();
+            if deferred && matches!(step.line, Some(ScenarioLine::Fault { .. })) {
+                return Err(SimError::Config { field: "step_line" });
+            }
+            if !deferred && step.taken.is_some() {
+                return Err(SimError::Config {
+                    field: "step_taken",
+                });
+            }
+        }
+        runner.steps = plan.steps.iter().cloned().collect();
         runner.recorder.begin(header)?;
 
         let preamble = Site {
@@ -709,12 +943,12 @@ impl Runner {
             //
             // "Armed" includes the health evaluations H1 owes a live L1 instance (design §4.6):
             // L1 arms no timer, so a live primary is work until a limit, never `QueueEmpty`.
+            // A pending scenario step is a third source (see [`ScenarioStep`]).
             let queued = self.scheduler.next_tick();
             let armed = self.dispatcher.next_deadline();
-            let next = match (queued, armed) {
-                (None, None) => break StopReason::QueueEmpty,
-                (Some(tick), None) | (None, Some(tick)) => tick,
-                (Some(queued), Some(armed)) => queued.min(armed),
+            let stepped = self.steps.front().map(|step| step.at);
+            let Some(next) = [queued, armed, stepped].into_iter().flatten().min() else {
+                break StopReason::QueueEmpty;
             };
             if next > limits.deadline {
                 // The timer is left in the wheel for the same reason the unrun event is left in
@@ -723,6 +957,13 @@ impl Runner {
                     deadline: limits.deadline,
                     next,
                 };
+            }
+
+            // A step due now is applied before anything else at its tick, and then the loop
+            // looks again: the step may have queued work, or moved a deadline.
+            if stepped == Some(next) {
+                self.apply_steps(next)?;
+                continue;
             }
 
             // Whatever the wheel has due by `next` becomes a queued event **before** the pop, so
@@ -926,7 +1167,7 @@ impl Runner {
                     // mine". And a decline by a named consumer of a *routed* event stops the
                     // run: the fact was meant for that module, and continuing would drop it
                     // silently (B-R28).
-                    Err(RdbError::Unavailable { .. }) => {
+                    Err(error @ RdbError::Unavailable { .. }) => {
                         report.declined[slot] += 1;
                         let edge = route::edge(arm, module);
                         let outcome = if edge == Edge::Owed {
@@ -936,10 +1177,10 @@ impl Runner {
                         };
                         self.record_dispatch(site, event.id, module, outcome)?;
                         if (routed && edge == Edge::Named) || addressed.is_some() {
-                            stop = Some(StopReason::Refused {
-                                seam: "harness::run::route",
-                                event: event.id,
+                            stop = Some(StopReason::Declined {
                                 module,
+                                event: event.id,
+                                error,
                             });
                             break;
                         }
@@ -1011,6 +1252,81 @@ impl Runner {
                 .deliver(node, boot, effects, &mut self.control, &mut self.scheduler);
         self.record_lines()?;
         delivered
+    }
+
+    /// Apply every pending [`ScenarioStep`] due at or before `now`, in plan order, and record
+    /// each one's line (see [`ScenarioStep`] for the rule).
+    ///
+    /// # Errors
+    ///
+    /// [`SimError::Config`] naming `step_node` when a step names a node the cluster never
+    /// registered, and whatever the step's action returns.
+    fn apply_steps(&mut self, now: Tick) -> Result<(), SimError> {
+        self.dispatcher.clock_mut().advance(now)?;
+        while let Some(step) = self.steps.front().filter(|step| step.at <= now).cloned() {
+            self.steps.pop_front();
+            if self.dispatcher.boot(step.node).is_none() {
+                return Err(SimError::Config { field: "step_node" });
+            }
+            if let Some(tag) = step.taken {
+                self.dispatcher
+                    .await_fault(step.action, step.partition, tag);
+            }
+            match step.action {
+                StepAction::Mark => {}
+                StepAction::Network(op) => self.dispatcher.inject_network(op)?,
+                StepAction::Storage(op) => self.dispatcher.inject_storage(op)?,
+                StepAction::Skew {
+                    millis,
+                    bound_established,
+                } => self
+                    .dispatcher
+                    .clock_mut()
+                    .set_skew(step.node, millis, bound_established),
+                StepAction::Restart(boot) => self.dispatcher.restart(step.node, boot)?,
+                StepAction::Control(op) => {
+                    self.control.inject(op)?;
+                    self.dispatcher
+                        .pump_at(&mut self.control, &mut self.scheduler, step.at)?;
+                }
+            }
+            // After the action, so a restart's line carries the new boot.
+            let boot = self
+                .dispatcher
+                .boot(step.node)
+                .ok_or(SimError::Config { field: "step_node" })?;
+            tracing::info!(
+                tick = step.at.0,
+                node = step.node.0,
+                action = ?step.action,
+                line = ?step.line,
+                "scenario step applied"
+            );
+            if let Some(line) = step.line {
+                let site = Site {
+                    at: step.at,
+                    node: step.node,
+                    boot,
+                    partition: step.partition,
+                    correlation: CorrelationId(0),
+                };
+                self.recorder
+                    .record(site, line.kind(step.node, step.action))?;
+            }
+            // A control step's interactions, at the step's own site.
+            let site = Site {
+                at: step.at,
+                node: step.node,
+                boot,
+                partition: step.partition,
+                correlation: CorrelationId(0),
+            };
+            for interaction in self.control.drain_interactions() {
+                self.recorder.record(site, interaction)?;
+            }
+            self.record_lines()?;
+        }
+        Ok(())
     }
 
     /// Record every `BatchApply` and `DurabilityAdvance` line the dispatcher is holding, each at
@@ -1536,9 +1852,9 @@ mod tests {
     /// Driven through [`Runner::carry_out`], the loop's own delivery step, so the row picks the
     /// effect rather than waiting for a module to emit it.
     ///
-    /// Carried by F1's `ProbeDigestAt` since 2026-09-26 (lead ruling A-R61), a request no
-    /// provider answers yet. It was a `Store` from 2026-09-22 (A-R40) until the store was wired,
-    /// and a `Timer` before that. The subject is that an **unwired** seam is named rather than
+    /// Carried by F1's `QuarantineSuffix` since 2026-10-02, when `ProbeDigestAt` got its provider
+    /// (team i1); by `ProbeDigestAt` from 2026-09-26 (lead ruling A-R61). It was a `Store` from
+    /// 2026-09-22 (A-R40) until the store was wired, and a `Timer` before that. The subject is that an **unwired** seam is named rather than
     /// absorbed; the example is only what carries it. Re-pointed rather than deleted: a row
     /// deleted because its example got built is how the guarantee for the rest quietly stops
     /// being tested.
@@ -1550,16 +1866,17 @@ mod tests {
             from: ModuleName::Recovery,
             partition: PART,
             kind: EffectKind::Kernel(rdb_core::contracts::event::KernelEffect::Recovery(
-                rdb_core::contracts::recovery::RecoveryEffect::ProbeDigestAt {
+                rdb_core::contracts::recovery::RecoveryEffect::QuarantineSuffix {
                     copy: rdb_core::contracts::membership::CopyId(2),
-                    seq: rdb_core::contracts::ids::Seq(1),
+                    from: rdb_core::contracts::ids::Seq(1),
+                    until: Tick(1),
                 },
             )),
         };
 
         let error = runner
             .carry_out(NODE, BOOT, vec![effect])
-            .expect_err("no provider answers a probe");
+            .expect_err("no provider keeps a quarantined suffix");
         assert_eq!(
             error,
             crate::error::SimError::unavailable("harness::dispatch::deliver::recovery")
@@ -2151,6 +2468,22 @@ mod tests {
             ))
         );
 
+        // A decline is the consumer's answer, not a seam: an error, but never a refusal.
+        let answer = rdb_core::contracts::errors::RdbError::Unavailable {
+            capability: rdb_core::contracts::errors::Capability::Replication,
+            reason: "no primary installed",
+        };
+        let declined = RunReport::blank().stopped(StopReason::Declined {
+            module: ModuleName::Replication,
+            event: EventId(4),
+            error: answer.clone(),
+        });
+        assert_eq!(declined.refusal(), None, "a decline names no seam");
+        assert_eq!(
+            declined.into_result(),
+            Err(crate::error::SimError::Kernel(answer))
+        );
+
         for stop in [
             StopReason::QueueEmpty,
             StopReason::EventBudgetExhausted {
@@ -2169,5 +2502,248 @@ mod tests {
                 "a bounded run is not an error"
             );
         }
+    }
+
+    /// A module answering a protocol error stops the run as `ModuleError`, and that run is not
+    /// a pass (tester-m7c-i1 N1). Reached through the `Runner::with_modules` seam: a stub A1
+    /// that answers `NotPrimary` to every event. A guard that reads `into_result()` must fail
+    /// on it exactly as on a refusal or a decline.
+    #[test]
+    fn a_module_error_stops_the_run_and_into_result_is_an_error() {
+        use rdb_core::contracts::errors::RdbError;
+        use rdb_core::contracts::event::{Effect, Event, Module, StepCtx};
+        struct Errs;
+        impl Module for Errs {
+            fn name(&self) -> ModuleName {
+                ModuleName::Authority
+            }
+            fn step(
+                &mut self,
+                _ctx: &StepCtx<'_>,
+                _event: &Event,
+            ) -> Result<Vec<Effect>, RdbError> {
+                Err(RdbError::NotPrimary {
+                    partition: PART,
+                    hint: None,
+                })
+            }
+        }
+        let plan = plan(vec![nobody_answers(Tick(1))]);
+        let mut runner = Runner::with_modules(&plan, vec![Box::new(Errs)]).expect("a runner");
+        let report = runner
+            .run(plan.limits)
+            .expect("the run itself does not fail");
+        let error = RdbError::NotPrimary {
+            partition: PART,
+            hint: None,
+        };
+        assert_eq!(
+            report.stop,
+            StopReason::ModuleError {
+                module: ModuleName::Authority,
+                event: EventId(0),
+                error: error.clone(),
+            }
+        );
+        assert_eq!(report.refusal(), None, "a module's own error names no seam");
+        assert_eq!(
+            report.into_result().map(|report| report.stop),
+            Err(crate::error::SimError::Kernel(error)),
+            "a run a module stopped with an error is not a bounded run"
+        );
+    }
+
+    // --------------------------------------------------------------------------------------
+    // Scenario steps (team i1): the Control action, the deadline rule, and the pairing rule.
+    // --------------------------------------------------------------------------------------
+
+    /// `plan` with `NODE` registered at `BOOT`: a step names a node the cluster knows.
+    fn on_node(mut plan: RunPlan) -> RunPlan {
+        plan.cluster.nodes = vec![crate::sim::cluster::NodeSpec {
+            node: NODE,
+            boot: BOOT,
+            failure_domain: 1,
+            core_sets: 1,
+        }];
+        plan
+    }
+
+    fn step(at: Tick, action: super::StepAction) -> super::ScenarioStep {
+        super::ScenarioStep {
+            at,
+            node: NODE,
+            partition: PART,
+            action,
+            line: None,
+            taken: None,
+        }
+    }
+
+    /// The ticks at which A1 was offered an event.
+    fn authority_offers(trace: &rdb_core::contracts::trace::Trace) -> Vec<u64> {
+        trace
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    TraceKind::ModuleDispatch {
+                        module: ModuleName::Authority,
+                        ..
+                    }
+                )
+            })
+            .map(|event| event.logical_tick)
+            .collect()
+    }
+
+    /// A `Control` step is applied at its tick, and what it plans is taken by the store: a
+    /// `DelayCompletion` stepped in at tick 5 delays the grant CAS issued at tick 10 by 50, so
+    /// A1 hears the completion at 60. The same plan without the step hears it at 10.
+    #[test]
+    fn a_control_step_is_applied_at_its_tick() {
+        let base = on_node(served_plan(vec![acquire_due(Tick(10))]));
+        let mut stepped = base.clone();
+        stepped.steps = vec![step(
+            Tick(5),
+            super::StepAction::Control(crate::sim::control::ControlOp::DelayCompletion {
+                node: NODE,
+                by_millis: 50,
+            }),
+        )];
+        let (without, _) = execute(&base).expect("a run");
+        let (with, _) = execute(&stepped).expect("a run");
+
+        assert!(
+            authority_offers(&without).contains(&10) && !authority_offers(&without).contains(&60),
+            "{:?}",
+            authority_offers(&without)
+        );
+        assert!(
+            authority_offers(&with).contains(&60),
+            "the delayed completion lands at 10 + 50: {:?}",
+            authority_offers(&with)
+        );
+    }
+
+    /// A step past the deadline is neither applied nor recorded, and the run says what it would
+    /// have done next.
+    #[test]
+    fn a_step_past_the_deadline_is_not_applied() {
+        let mut plan = on_node(plan(Vec::new()));
+        plan.limits.deadline = Tick(100);
+        plan.steps = vec![super::ScenarioStep {
+            line: Some(super::ScenarioLine::Fault {
+                boundary: rdb_core::contracts::trace::BoundaryId::GrantSkewWithinBound,
+                op_index: 0,
+            }),
+            ..step(
+                Tick(101),
+                super::StepAction::Skew {
+                    millis: 80,
+                    bound_established: true,
+                },
+            )
+        }];
+        let (trace, report) = execute(&plan).expect("a run");
+        assert_eq!(
+            report.stop,
+            StopReason::DeadlineReached {
+                deadline: Tick(100),
+                next: Tick(101)
+            }
+        );
+        assert!(!trace
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::FaultInjected { .. })));
+    }
+
+    /// A step that is itself the fault records its line when applied, with the action's kind; a
+    /// fault line on a deferred action, a tag on an immediate one, and an unsorted list are
+    /// refused by name.
+    #[test]
+    fn a_fault_line_is_written_only_where_the_action_is_the_fault() {
+        use rdb_core::contracts::trace::{BoundaryId, FaultKind};
+
+        let mut skewed = on_node(plan(Vec::new()));
+        let skew = super::StepAction::Skew {
+            millis: 80,
+            bound_established: true,
+        };
+        let fault = Some(super::ScenarioLine::Fault {
+            boundary: BoundaryId::GrantSkewWithinBound,
+            op_index: 3,
+        });
+        skewed.steps = vec![super::ScenarioStep {
+            line: fault,
+            ..step(Tick(7), skew)
+        }];
+        let (trace, _) = execute(&skewed).expect("a run");
+        let lines: Vec<_> = trace
+            .events
+            .iter()
+            .filter_map(|event| match event.kind {
+                TraceKind::FaultInjected {
+                    fault_kind,
+                    target,
+                    boundary,
+                    scenario_op_index,
+                } => Some((
+                    event.logical_tick,
+                    fault_kind,
+                    target,
+                    boundary,
+                    scenario_op_index,
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![(
+                7,
+                FaultKind::Time,
+                NODE,
+                BoundaryId::GrantSkewWithinBound,
+                3
+            )]
+        );
+
+        let crash = super::StepAction::Storage(crate::storage::StorageOp::Crash {
+            node: NODE,
+            fault: rdb_core::contracts::storage::StorageFault::ProcessCrash,
+        });
+        let refused = |steps: Vec<super::ScenarioStep>| {
+            let mut refused = on_node(plan(Vec::new()));
+            refused.steps = steps;
+            Runner::new(&refused).expect_err("refused")
+        };
+        assert_eq!(
+            refused(vec![super::ScenarioStep {
+                line: fault,
+                ..step(Tick(7), crash)
+            }]),
+            crate::error::SimError::Config { field: "step_line" }
+        );
+        assert_eq!(
+            refused(vec![super::ScenarioStep {
+                taken: Some(super::FaultTag {
+                    boundary: BoundaryId::GrantSkewWithinBound,
+                    op_index: 3,
+                }),
+                ..step(Tick(7), skew)
+            }]),
+            crate::error::SimError::Config {
+                field: "step_taken"
+            }
+        );
+        assert_eq!(
+            refused(vec![
+                step(Tick(7), super::StepAction::Mark),
+                step(Tick(6), super::StepAction::Mark)
+            ]),
+            crate::error::SimError::Config { field: "steps" }
+        );
     }
 }

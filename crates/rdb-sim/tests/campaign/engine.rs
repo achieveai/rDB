@@ -29,8 +29,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use config_testkit::evidence::{self as kit, RunInfo};
+use rdb_core::contracts::event::ModuleName;
 use rdb_core::contracts::trace::{
-    BoundaryId, CapabilityState, FaultKind, PackageId, Trace, TraceKind,
+    BoundaryId, CapabilityState, ClientOutcome, DispatchOutcome, FaultKind, PackageId, Trace,
+    TraceEvent, TraceKind,
 };
 use serde_json::{json, Map, Value};
 
@@ -278,6 +280,11 @@ pub struct History {
     pub family_mismatches: Vec<(BoundaryId, FaultKind, FaultKind)>,
     /// How many `fault_injected` events it saw.
     pub faults_observed: usize,
+    /// Per successful client transaction, `(step inputs, effects)`: the offers a module answered
+    /// under its correlation, and the effects those answers returned (M7A-137, ruling A-R24).
+    /// Counted from the trace's `module_dispatch` records, never from a log line. Only the
+    /// transactions [`txn_events`] judges fault-free, one by one.
+    pub txn_events: Vec<(u32, u32)>,
     /// The trace, kept only when the history violated something.
     pub trace: Option<Trace>,
 }
@@ -321,6 +328,7 @@ pub fn history(index: usize, seed: Option<u64>, scenario: Scenario) -> History {
         cells: BTreeMap::new(),
         family_mismatches: Vec::new(),
         faults_observed: 0,
+        txn_events: Vec::new(),
         trace: None,
     };
     match bridge::attempt(&out.scenario) {
@@ -406,8 +414,75 @@ fn observe(trace: &Trace, out: &mut History) {
             _ => {}
         }
     }
+    out.txn_events = txn_events(trace);
 }
 
+/// Per fault-free client transaction, `(step inputs, effects)` (M7A-137, ruling A-R24).
+///
+/// A transaction is the correlation of a `client_outcome_reported` that told its client
+/// `Success`: the harness records no `client_submit`, and a refused request is not the
+/// fault-free path §14 derives. Its step inputs are the offers under that correlation a module
+/// **answered** (a decline is "not mine", not an input the kernel took), and its effects are
+/// what those answers returned. Every event the dispatcher schedules from an answer keeps the
+/// offer's correlation, so the count follows the transaction through T1, A1, P1 and R1.
+///
+/// Fault-free is judged **per transaction** (the M7A-137 plan correction): no generated seed is
+/// fault-free as a whole, since each carries an obligation op, and every authored case recovers
+/// first. A transaction counts when:
+/// - it is the first outcome for its `(partition, request)`: a later one is a retry, which is a
+///   client fault (`RetainedDedupHit` or `ChangedDigest`), not the fault-free path;
+/// - nothing between its first and last record is a `fault_injected`, an `op_skipped` or
+///   a `recovery_decision`, under any correlation;
+/// - F1 answered none of its offers.
+pub fn txn_events(trace: &Trace) -> Vec<(u32, u32)> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for (end, event) in trace.events.iter().enumerate() {
+        let TraceKind::ClientOutcomeReported {
+            request, outcome, ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        let first_outcome = seen.insert((event.partition, *request));
+        if !first_outcome || !matches!(outcome, ClientOutcome::Success) {
+            continue;
+        }
+        let correlation = event.correlation;
+        let mine = |candidate: &&TraceEvent| candidate.correlation == correlation;
+        let start = trace.events.iter().position(|c| mine(&c)).unwrap_or(end);
+        let last = trace.events.iter().rposition(|c| mine(&c)).unwrap_or(end);
+        let span = &trace.events[start..=last];
+        if span.iter().any(|candidate| {
+            matches!(
+                candidate.kind,
+                TraceKind::FaultInjected { .. }
+                    | TraceKind::OpSkipped { .. }
+                    | TraceKind::RecoveryDecision { .. }
+            )
+        }) {
+            continue;
+        }
+        let mut count = (0u32, 0u32);
+        let mut recovered = false;
+        for candidate in span.iter().filter(mine) {
+            if let TraceKind::ModuleDispatch {
+                module,
+                outcome: DispatchOutcome::Answered { effects },
+                ..
+            } = candidate.kind
+            {
+                recovered |= module == ModuleName::Recovery;
+                count.0 += 1;
+                count.1 = count.1.saturating_add(effects);
+            }
+        }
+        if !recovered {
+            out.push(count);
+        }
+    }
+    out
+}
 // ------------------------------------------------------------------------------------------
 // The fold (design §2.4)
 // ------------------------------------------------------------------------------------------
@@ -986,7 +1061,8 @@ impl Campaign {
         let unrun = generated - self.generated_ran();
         if unrun > 0 {
             causes.push(format!(
-                "{unrun} of {generated} generated seeds did not run through the bridge (M7V-55)"
+                "{unrun} of {generated} generated seeds did not run through the bridge \
+                 (M7V-55, M7V-75)"
             ));
         }
         Some(causes.join("; "))
@@ -1183,6 +1259,36 @@ impl Campaign {
             (kit::BELOW_TARGET_REASON): self.below_target_reason(),
             "threads": self.threads,
             "minimized": minimized,
+            "kernel_a": self.kernel_a(),
+        })
+    }
+
+    /// `kernel_a.events_per_txn` (M7A-137): `{inputs, effects}.{min, p50, max}` over every
+    /// fault-free transaction in the corpus, and how many there were. Recorded, never asserted
+    /// against a size (hard rule 1). With no transaction the statistics are `null`, not zero: a
+    /// zero would read as a measured transaction that cost nothing.
+    fn kernel_a(&self) -> Value {
+        let samples: Vec<(u32, u32)> = self
+            .histories
+            .iter()
+            .filter(|history| history.ran())
+            .flat_map(|history| history.txn_events.iter().copied())
+            .collect();
+        let stats = |mut values: Vec<u32>| -> Value {
+            values.sort_unstable();
+            match (values.first(), values.last()) {
+                (Some(min), Some(max)) => {
+                    json!({ "min": min, "p50": values[(values.len() - 1) / 2], "max": max })
+                }
+                _ => json!({ "min": null, "p50": null, "max": null }),
+            }
+        };
+        json!({
+            "events_per_txn": {
+                "transactions": samples.len(),
+                "inputs": stats(samples.iter().map(|(inputs, _)| *inputs).collect()),
+                "effects": stats(samples.iter().map(|(_, effects)| *effects).collect()),
+            },
         })
     }
 
@@ -1227,6 +1333,10 @@ impl Campaign {
             "seeds": self.coverage.seeds,
             "coverage_gated": self.coverage.coverage_gated,
             (kit::BELOW_TARGET_REASON): self.below_target_reason(),
+            // L-R182m: named, not silent. The Healed slice (V-R40) is what would arm them.
+            "liveness": "generated seeds do not arm liveness: the bridge lowers NetworkOp::Heal \
+                         as SetLink Up with no Healed phase line, so INV-LIVE and INV-ISO are \
+                         never armed by a generated seed",
             "guard_outcomes": cells(&[
                 Axis::AckReject,
                 Axis::Recovery,
@@ -1252,17 +1362,22 @@ impl Campaign {
 /// INV-AUTH: the default corpus drives A1 only on its healthy path. Two bounded attempts in
 /// correction round 4 found no op the bridge lowers that lapses a lease, fences, or moves a
 /// lineage, and a submit before the grant is refused by T1's admission before A1 is asked.
+/// Since 2026-10-02 the authored A1/P1 case runs through the staged bridge and moves its
+/// partition to generation 3, so one history records a `Fenced` decision. That generation never
+/// takes a write, so INV-AUTH still judges one generation per partition.
 #[must_use]
 pub const fn reach_note(invariant: Invariant) -> Option<&'static str> {
     match invariant {
         Invariant::Auth => Some(
-            "proven covers only the paths the default corpus reaches: A1's healthy path \
-             (every recorded decision Valid, inside a held grant, one generation). No history \
-             reaches a NoGrant, Expired, Fenced or lineage denial; rdb-core unit rows cover \
-             those (m7a_03, m7a_36, m7a_50, \
-             a_read_moving_a_partition_to_a_withheld_lineage_fences_the_old_one, \
-             m7a_184..m7a_187, m7a_99, m7a_100). The \
-             denial-reach corpus member is owed under M7V-47/M7V-88 (ruling V-R41).",
+            "proven covers only the paths the default corpus reaches. Every Valid decision is on \
+             A1's healthy path: inside a held grant, in one generation per partition. INV-AUTH \
+             judges Valid windows only, and no history records Valid decisions in two \
+             generations of one partition, so no cross-generation overlap is judged (M7A-58, \
+             owed). One authored history, A1/P1 (M7V-47), reaches a Fenced Reply decision after \
+             its partition moves to generation 3; the checker skips it. No history reaches a \
+             NoGrant, Expired or lineage denial; rdb-core unit rows cover those (m7a_03, m7a_36, \
+             m7a_50, a_read_moving_a_partition_to_a_withheld_lineage_fences_the_old_one, \
+             m7a_184..m7a_187, m7a_99, m7a_100).",
         ),
         _ => None,
     }

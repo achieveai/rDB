@@ -16,9 +16,7 @@ use serde_json::{Map, Value};
 
 use rdb_core::contracts::ids::{BootId, CorrelationId, EventId, NodeId, PartitionId, Seq};
 use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{
-    EventRef, PackageId, SchedulePhase, Trace, TraceEvent, TraceHeader, TraceKind,
-};
+use rdb_core::contracts::trace::{EventRef, PackageId, Trace, TraceEvent, TraceHeader, TraceKind};
 use rdb_core::contracts::version::TRACE_SCHEMA_VERSION;
 
 use crate::error::SimError;
@@ -446,18 +444,6 @@ pub enum TraceDefect {
         package: PackageId,
     },
 
-    /// An event the liveness checker folds, before any [`TraceKind::SchedulePhaseChanged`] to
-    /// [`SchedulePhase::Healed`].
-    ///
-    /// Spike §6 forbids calling an unhealed partition a liveness failure, so liveness is only
-    /// claimed inside a stated phase. A trace that feeds the checker before the phase is stated
-    /// arms it outside one, and nothing downstream can tell.
-    #[error("liveness-folded event at {event_id:?} precedes any healed schedule phase")]
-    LivenessFoldedBeforeHealed {
-        /// Where the folded event is.
-        event_id: EventId,
-    },
-
     /// A [`TraceKind::ReplicationAck`] whose `from_node` is not the node the envelope carries.
     ///
     /// The contract fixes both: `ReplicationAck.from_node` is *"the acknowledging node"*, and the
@@ -499,34 +485,13 @@ pub enum TraceDefect {
     },
 }
 
-/// Whether the liveness checker folds this kind of event.
-///
-/// **One variant today, and it is not this module's set to widen.** INV-LIVE belongs to team
-/// verification; `M7V-30` folds "one `inflight` request that never reaches a terminal
-/// `client_outcome`", and [`TraceKind::ClientSubmit`] is that request arriving. When
-/// verification names the rest of the set, it is named here and nowhere else.
-const fn folds_into_liveness(kind: &TraceKind) -> bool {
-    matches!(kind, TraceKind::ClientSubmit { .. })
-}
-
-/// Whether this event states that the schedule has healed.
-const fn arms_liveness(kind: &TraceKind) -> bool {
-    matches!(
-        kind,
-        TraceKind::SchedulePhaseChanged {
-            phase: SchedulePhase::Healed,
-            ..
-        }
-    )
-}
-
 /// Check that a trace is one the runner could have produced.
 ///
 /// **One validator, applied to a `Trace` whichever way it was built** (plan §9). A second code
 /// path for hand-built traces would let a fixture be well-formed for the oracle and unrealizable
 /// by the runner, which is the whole reason `M7V-88` exists.
 ///
-/// The four checks, in the order a defect is reported:
+/// The checks, in the order a defect is reported:
 ///
 /// 1. **`event_id` is a strictly increasing total order.** Everything below folds left to right
 ///    and would otherwise be reading a different history than the one recorded. `logical_tick`
@@ -536,20 +501,19 @@ const fn arms_liveness(kind: &TraceKind) -> bool {
 ///    [`crate::harness::expected_capability_packages`] reports, all of them before the first
 ///    ordinary event. [`PackageId::C0`] is permitted and not required (ruling F-2): it has no
 ///    module and emits no capability line, so requiring it would reject every recorded trace.
-/// 3. **Liveness is only armed inside a stated phase.** An event the liveness checker folds may
-///    not appear before a [`SchedulePhase::Healed`] phase change.
+/// 3. **Retired 2026-10-02 (ruling L-R182ee).** It rejected a `ClientSubmit` before a `Healed`
+///    phase change. Real clusters take client writes while the network is broken, so such a
+///    trace is realizable. INV-LIVE keeps spike §6 only **up to** a heal: it arms on a fair
+///    `Healed` phase change (each one reopens its window with a fresh budget) and spends that
+///    budget only from there, so nothing before the heal counts against liveness. It reads no
+///    other phase. If the network breaks again after the heal (`Chaotic`), the window stays
+///    open, and a write still unanswered when the trace ends inside it is reported `Violated`
+///    (tester-q1 T3). Closing the window on a later break belongs to the V-R40 Healed slice.
+///    The number stays so citations of check 4 stay true.
 /// 4. **An acknowledgement names one emitter, and never claims more than that emitter applied.**
 ///    Keyed on the acknowledgement's own `from_node` — the contract's *"acknowledging node"* —
 ///    and a `from_node` that disagrees with the envelope's `node` is reported before the
 ///    sequences are compared at all.
-///
-/// # The third check is inert on today's recorded traces, and that is not a reason to weaken it
-///
-/// [`crate::harness::run::execute`] emits no `SchedulePhaseChanged` and no `ClientSubmit`, so no
-/// recorded trace can trip check 3 yet. The first time the loop can emit a folded event with no
-/// phase change in front of it, every recorded trace becomes invalid at once and this will look
-/// like the check being too strict. It is not: it is the check finding the thing it was written
-/// for (lead ruling F-1, 2026-09-22).
 ///
 /// # Errors
 ///
@@ -569,7 +533,6 @@ pub fn validate(trace: &Trace) -> Result<(), TraceDefect> {
     }
 
     capability_block(trace)?;
-    liveness_arming(trace)?;
     acks_against_applies(trace)
 }
 
@@ -595,21 +558,6 @@ fn capability_block(trace: &Trace) -> Result<(), TraceDefect> {
     for package in crate::harness::expected_capability_packages() {
         if !reported.contains(&package) {
             return Err(TraceDefect::CapabilityMissing { package });
-        }
-    }
-    Ok(())
-}
-
-/// Check 3: nothing the liveness checker folds appears before the schedule is stated healed.
-fn liveness_arming(trace: &Trace) -> Result<(), TraceDefect> {
-    for event in &trace.events {
-        if arms_liveness(&event.kind) {
-            return Ok(());
-        }
-        if folds_into_liveness(&event.kind) {
-            return Err(TraceDefect::LivenessFoldedBeforeHealed {
-                event_id: event.event_id,
-            });
         }
     }
     Ok(())
@@ -642,7 +590,8 @@ fn liveness_arming(trace: &Trace) -> Result<(), TraceDefect> {
 /// M1 has snapshots and crash images, so a node that catches up from a snapshot and then
 /// acknowledges a prefix it never applied *in this trace* is foreseeable. The first recorded
 /// trace that does it makes this check red, and that will look like the check being too strict.
-/// It will not be — the same shape as ruling F-1's warning about check 3, one check down.
+/// Check 3 carried the same warning and was retired by ruling (L-R182ee, 2026-10-02) once a
+/// realistic trace tripped it. When this one bites, ask for a ruling; never weaken it silently.
 ///
 /// A [`BTreeMap`] and not a hash map: iteration order is part of this crate's output (crate
 /// rule), and which node a defect names for a trace with several offenders must not depend on a

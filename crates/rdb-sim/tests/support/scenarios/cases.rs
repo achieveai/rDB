@@ -9,6 +9,7 @@
 //! in what they submit after it: a retry of an identity the prior generation retained, and
 //! retries of one identity under the same and another digest.
 
+use rdb_core::contracts::authority::Checkpoint;
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
     ClientId, ConfigVersion, NodeId, PartitionId, ReplicaRole, RequestId, Seq, TenantId,
@@ -16,7 +17,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::trace::{KeyId, Provenance};
 
 use super::grammar::{
-    Budget, ClientOp, Placement, RecoveryOp, Scenario, ScenarioOp, TimeOp, Topology,
+    Budget, ClientOp, NetworkOp, Placement, RecoveryOp, Scenario, ScenarioOp, TimeOp, Topology,
     SCENARIO_GENERATOR_VERSION, SCENARIO_SCHEMA_VERSION,
 };
 
@@ -243,6 +244,13 @@ pub fn case_f1_r1_discovery_window() -> Scenario {
 /// The index of [`case_a1_p1_new_generation_between_publish_and_reply`]'s second
 /// `InspectSurvivors`: the op that activates the new generation.
 pub const A1_P1_ACTIVATE_OP: usize = 6;
+/// The index of the same case's hold on B's `Reply` check, right after the activation and at the
+/// same tick. [`without_activation`] removes both.
+pub const A1_P1_HOLD_OP: usize = 7;
+/// How long the case holds B's `Reply` check on its hop: the second recovery's 2 s discovery
+/// window, which is when its commit lands on B, plus half a second. The check decides at
+/// `A1_P1_SUBMIT_AT + A1_P1_HOLD_MILLIS`, inside [`A1_P1_MAX_TICKS`].
+pub const A1_P1_HOLD_MILLIS: u64 = 2_500;
 /// The A1/P1 case: where B and C survive. `Synchronize` preloads seqs 1..=10 as client writes
 /// with request ids 1..=10, so those ids are taken.
 pub const A1_P1_HEAD: u64 = 10;
@@ -269,14 +277,19 @@ pub const A1_P1_MAX_TICKS: u64 = A1_P1_SUBMIT_AT + 3_000;
 /// reply arm must honour.
 ///
 /// B and C survive at 10; A is dead. Once recovery lands and L1's resume hold lifts, one client
-/// write goes to B, and a second recovery of the partition activates the next generation at the
-/// same tick, before the write's reply is decided. The reply check still has to be held on its
-/// hop for the activation to land in between (P-3's hop delay); the grammar has no op for that yet.
+/// write goes to B, and a second recovery of the partition starts at the same tick, led by C
+/// (the bridge's `reinspect`). B's `Reply` check is held on its hop ([`A1_P1_HOLD_MILLIS`],
+/// P-3's hop delay, `NetworkOp::DelayCheck`) so that the second recovery commits in between.
 ///
-/// **Not runnable at this basis, and the row says so by index** (`A1_P1_ACTIVATE_OP`): the
-/// bridge refuses a second `InspectSurvivors` of one partition, and below the bridge nothing can
-/// yet produce that activation (the row records why). Everything before it runs: without that op
-/// the write publishes through A1 and replies `Success`.
+/// What the run does (walked by hand, 2026-10-02): B publishes seq 11 in generation 2. C's
+/// recovery commits generation 3 at cutoff 11 when its window closes, and when that lands on B,
+/// P1 withholds the awaiting reply. The held check then decides `Fenced`, not
+/// `Deny(GenerationChanged)`, and P1 ignores that stale answer. The client hears nothing from
+/// generation 2. Generation 3 is committed but never activated: C, which led the recovery but
+/// does not own the new generation, never proves the rebuild (row M7V-47 records why).
+///
+/// [`without_activation`] gives the case's healthy shape: the write publishes through A1 and
+/// replies `Success`.
 #[must_use]
 pub fn case_a1_p1_new_generation_between_publish_and_reply() -> Scenario {
     authored(
@@ -316,11 +329,36 @@ pub fn case_a1_p1_new_generation_between_publish_and_reply() -> Scenario {
                 partition: PARTITION,
                 window: 2_000,
             }),
+            ScenarioOp::Network(NetworkOp::DelayCheck {
+                node: B_NODE,
+                checkpoint: Checkpoint::Reply,
+                by_millis: A1_P1_HOLD_MILLIS,
+            }),
             ScenarioOp::Time(TimeOp::Advance {
                 ticks: A1_P1_MAX_TICKS - A1_P1_SUBMIT_AT,
             }),
         ],
     )
+}
+
+/// Remove the A1/P1 case's activation and its hold from `scenario`, leaving its healthy shape,
+/// and return the removed activation. Panics naming the op if either is not where the case
+/// puts it, so a caller never runs a shape it did not ask for.
+pub fn without_activation(scenario: &mut Scenario) -> ScenarioOp {
+    let hold = scenario.ops.remove(A1_P1_HOLD_OP);
+    assert!(
+        matches!(hold, ScenarioOp::Network(NetworkOp::DelayCheck { .. })),
+        "A1/P1 op {A1_P1_HOLD_OP} is not the reply hold: {hold:?}"
+    );
+    let activation = scenario.ops.remove(A1_P1_ACTIVATE_OP);
+    assert!(
+        matches!(
+            activation,
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors { .. })
+        ),
+        "A1/P1 op {A1_P1_ACTIVATE_OP} is not the activation: {activation:?}"
+    );
+    activation
 }
 
 /// The gap between the F1/T1 cases' successive submits. Off the host's flush grid by nothing:

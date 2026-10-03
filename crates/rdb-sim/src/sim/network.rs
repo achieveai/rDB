@@ -19,13 +19,16 @@
 //! link and the next matching plan, and hands back the [`Arrival`]s the harness schedules.
 //! [`NetworkOp::ForgeAck`] is delivered at the frame level (lead ruling L-R177do): the next
 //! acknowledgement on the link arrives under the forged [`PeerLabel`], body unchanged, so R1's
-//! own check is what refuses it. One case is still owed and refuses by name: a forgery with
-//! `authenticated: true` whose `claimed_role` differs from the role the body carries. The role
-//! lives inside the reply body, and the network rewrites no body to forge an identity.
+//! own check is what refuses it. Since 2026-10-02 the one forgery that lies inside the body is
+//! delivered too: `authenticated: true` with a `claimed_role` other than the role the body
+//! carries arrives with that role written into the body, and R1's role rule refuses it.
 //!
-//! One fault does change a body, and only one field of it: [`Delivery::Corrupt`] (lead ruling
+//! Three faults change a body, and each only one field of it. [`Delivery::Corrupt`] (lead ruling
 //! B-R75) flips one bit of an append's record digest in flight, so the receiver's own row 7 —
-//! the digest must recompute — is what catches it, never a test-only guard.
+//! the digest must recompute — is what catches it, never a test-only guard. An authenticated
+//! [`NetworkOp::ForgeAck`] rewrites an acknowledgement's role, and nothing else.
+//! [`Delivery::OverstateDurable`] (2026-10-02) raises an acknowledgement's `durable` past its
+//! `buffered_applied`, and nothing else.
 //!
 //! Every frame handed to [`Network::send`] leaves one entry in [`Network::transmissions`],
 //! whatever its fate, and its bytes in [`Network::frames`]. A drop or a corruption is a fate the
@@ -34,10 +37,12 @@
 
 use std::collections::BTreeMap;
 
-use rdb_core::contracts::envelope::{AppendOutcome, ReplicationEnvelope};
-use rdb_core::contracts::ids::{MessageId, NodeId, ReplicaRole};
+use rdb_core::contracts::envelope::{
+    AppendAck, AppendOutcome, ReplicaProgress, ReplicationEnvelope,
+};
+use rdb_core::contracts::ids::{DurableSeq, MessageId, NodeId, ReplicaRole};
 use rdb_core::contracts::transport::{Frame, PeerLabel};
-use rdb_core::replication::wire::decode_reply;
+use rdb_core::replication::wire::{decode_reply, encode_reply};
 
 use crate::error::SimError;
 
@@ -72,6 +77,17 @@ pub enum Delivery {
     /// passes the plan by, as an acknowledgement-less frame passes a [`NetworkOp::ForgeAck`], and
     /// a later plan for the pair decides that frame.
     Corrupt {
+        /// How long in flight.
+        delay_millis: u64,
+    },
+    /// Deliver once, after `delay_millis`, with the acknowledgement's `durable` raised to one
+    /// past its `buffered_applied`: progress that contradicts itself, durable ahead of what was
+    /// applied. Every other field arrives as sent, so R1's identity, lineage, role and boot rules
+    /// pass it and its own ordering rule (rule 7) is what refuses it.
+    ///
+    /// Counts only for an acknowledgement, as [`NetworkOp::ForgeAck`] does. Any other frame on
+    /// the link passes the plan by, and a later plan for the pair decides that frame.
+    OverstateDurable {
         /// How long in flight.
         delay_millis: u64,
     },
@@ -121,11 +137,13 @@ pub enum NetworkOp {
     /// [`AppendOutcome::Accepted`]. Any other frame on the link passes this plan by: it waits
     /// for an acknowledgement, and a later plan for the pair decides the other frame. The
     /// acknowledgement arrives once, at once, under `PeerLabel{node: claimed_node, boot: the
-    /// sender's, authenticated}` with its body unchanged (lead ruling L-R177do). The network
-    /// forges only what a frame carries outside its body. So `claimed_role` is **not** written into
-    /// the body. With `authenticated: false` it is never read, because the receiver refuses the
-    /// label before it looks at a role. With `authenticated: true` and a `claimed_role` other
-    /// than the body's, [`Network::send`] refuses by name.
+    /// sender's, authenticated}` (lead ruling L-R177do). With `authenticated: false` the body is
+    /// unchanged and `claimed_role` is never read, because the receiver refuses the label before
+    /// it looks at a role. With `authenticated: true` the body carries `claimed_role`: an
+    /// acknowledgement whose role is another one has that role, and only that field, rewritten
+    /// with R1's own codec. The body's `from` is not rewritten, so a forgery that also claims
+    /// another node is still refused on identity first; a role lie that is to reach the role
+    /// rule names the real sender as `claimed_node`.
     ///
     /// Two independent lies, because they are rejected by two different rules and a scenario must
     /// be able to tell a passing kernel from one that happens to reject everything:
@@ -304,20 +322,18 @@ impl Network {
     ///    is about the next frame the link *carries*.
     /// 2. Otherwise the first plan for `(from, to)`, in injection order, is consumed:
     ///    [`NetworkOp::PlanNext`] decides the [`Delivery`], and [`NetworkOp::ForgeNext`] and
-    ///    [`NetworkOp::ForgeAck`] deliver at once under their forged label. A `ForgeAck` plan
-    ///    counts only for an acknowledgement, and a [`Delivery::Corrupt`] plan only for an
-    ///    append; every other frame passes each by.
+    ///    [`NetworkOp::ForgeAck`] deliver at once under their forged label. A `ForgeAck` or
+    ///    [`Delivery::OverstateDurable`] plan counts only for an acknowledgement, and a
+    ///    [`Delivery::Corrupt`] plan only for an append; every other frame passes each by.
     /// 3. With no plan, the frame arrives once, at once, under `label`. A delay or a drop is
     ///    something a scenario asks for, never a default.
     ///
     /// # Errors
     ///
     /// [`SimError::Config`] naming `link` for a frame from a node to itself.
-    /// [`SimError::Unavailable`] naming `sim::network::Network::forge_ack` when the plan that
-    /// takes this acknowledgement is a [`NetworkOp::ForgeAck`] with `authenticated: true` and a
-    /// `claimed_role` other than the one the body carries. That lie is a field inside the reply
-    /// body, and the network does not rewrite bodies. The plan is left in place and nothing is
-    /// recorded, so the refusal changes nothing.
+    ///
+    /// [`Network::frames`] keeps the frame as it was handed in, before a forged role, an
+    /// overstated durable position or a corruption, as it does for every fate.
     pub fn send(
         &mut self,
         from: NodeId,
@@ -333,7 +349,7 @@ impl Network {
         let fate = if self.link(from, to) == LinkState::Partitioned {
             Fate::Partitioned
         } else {
-            let acknowledged = acknowledged_role(&frame);
+            let acknowledged = acknowledgement(&frame);
             // Decoded only when a corruption is planned on this link, so a run without one pays
             // nothing for it.
             let flipped = self
@@ -347,6 +363,11 @@ impl Network {
                     delivery: Delivery::Corrupt { .. },
                     ..
                 } => Self::corrupts(op, from, to) && flipped.is_some(),
+                NetworkOp::PlanNext {
+                    from: f,
+                    to: t,
+                    delivery: Delivery::OverstateDurable { .. },
+                } => (f, t) == (from, to) && acknowledged.is_some(),
                 NetworkOp::PlanNext { from: f, to: t, .. }
                 | NetworkOp::ForgeNext { from: f, to: t, .. } => (f, t) == (from, to),
                 NetworkOp::ForgeAck { from: f, to: t, .. } => {
@@ -354,16 +375,6 @@ impl Network {
                 }
                 NetworkOp::SetLink { .. } => false,
             });
-            if let Some(NetworkOp::ForgeAck {
-                claimed_role,
-                authenticated: true,
-                ..
-            }) = at.map(|at| self.planned[at])
-            {
-                if acknowledged != Some(claimed_role) {
-                    return Err(SimError::unavailable("sim::network::Network::forge_ack"));
-                }
-            }
             let plan = at.map(|at| self.planned.remove(at));
             let arrive = |delay_millis: u64, label: PeerLabel| Arrival {
                 delay_millis,
@@ -396,22 +407,63 @@ impl Network {
                                 .collect(),
                         )
                     }
+                    Delivery::OverstateDurable { delay_millis } => {
+                        let Some(ack) = acknowledged else {
+                            unreachable!("an OverstateDurable plan is taken only for an ack");
+                        };
+                        let progress = ReplicaProgress {
+                            durable: DurableSeq(ack.progress.buffered_applied.0 + 1),
+                            ..ack.progress
+                        };
+                        Fate::Delivered(vec![Arrival {
+                            delay_millis,
+                            label,
+                            frame: Frame {
+                                body: encode_reply(&AppendOutcome::Accepted(AppendAck {
+                                    progress,
+                                    ..ack
+                                })),
+                                ..frame.clone()
+                            },
+                        }])
+                    }
                 },
                 Some(NetworkOp::ForgeNext { label: forged, .. }) => {
                     Fate::Delivered(vec![arrive(0, forged)])
                 }
                 Some(NetworkOp::ForgeAck {
                     claimed_node,
+                    claimed_role,
                     authenticated,
                     ..
-                }) => Fate::Delivered(vec![arrive(
-                    0,
-                    PeerLabel {
+                }) => {
+                    let label = PeerLabel {
                         node: claimed_node,
                         boot: label.boot,
                         authenticated,
-                    },
-                )]),
+                    };
+                    // Only an authenticated forgery lies in the body, and only when the role
+                    // differs: otherwise the frame is the sender's own, byte for byte. The plan
+                    // was taken only because `acknowledged` decoded, so `None` here means exactly
+                    // those two cases and nothing else.
+                    let lie = acknowledged
+                        .filter(|ack| authenticated && ack.role != claimed_role)
+                        .map(|ack| Frame {
+                            body: encode_reply(&AppendOutcome::Accepted(AppendAck {
+                                role: claimed_role,
+                                ..ack
+                            })),
+                            ..frame.clone()
+                        });
+                    Fate::Delivered(vec![match lie {
+                        Some(frame) => Arrival {
+                            delay_millis: 0,
+                            label,
+                            frame,
+                        },
+                        None => arrive(0, label),
+                    }])
+                }
                 // `SetLink` is never kept as a plan.
                 Some(NetworkOp::SetLink { .. }) | None => Fate::Delivered(vec![arrive(0, label)]),
             }
@@ -453,12 +505,11 @@ impl Network {
     }
 }
 
-/// The role an acknowledgement's body carries, when `frame` is one: its body decodes under R1's
-/// codec as [`AppendOutcome::Accepted`]. `None` for every other frame. Read only; the body is
-/// never changed.
-fn acknowledged_role(frame: &Frame) -> Option<ReplicaRole> {
+/// The acknowledgement `frame` carries, when it is one: its body decodes under R1's codec as
+/// [`AppendOutcome::Accepted`]. `None` for every other frame. Read only.
+fn acknowledgement(frame: &Frame) -> Option<AppendAck> {
     match decode_reply(&frame.body) {
-        Ok(AppendOutcome::Accepted(ack)) => Some(ack.role),
+        Ok(AppendOutcome::Accepted(ack)) => Some(ack),
         _ => None,
     }
 }

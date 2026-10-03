@@ -53,10 +53,14 @@ use rdb_core::contracts::trace::{CapabilityState, PackageId};
 /// * I1 — `Unavailable`, and **ready to flip only by ruling** (A-R61 says do not flip it here).
 ///   Since 2026-09-26 [`self::dispatch::Dispatcher::deliver`] carries out `Send`, `Store`,
 ///   `Timer` and every kernel-to-kernel effect with a consumer, which it routes in the same run
-///   ([`self::route`]). Three delivery seams are still refused by name, which row `M7F-26`
-///   counts as I1's: `harness::dispatch::deliver::crash` (restarting a crashed node),
-///   `::recovery` (F1's requests with no provider) and `::kernel` (R1's arms with no consumer),
-///   plus `harness::run::route`, the stop on a routed fact a wired consumer declined.
+///   ([`self::route`]). Three seams are still refused by name, the ones row `M7F-26` lists
+///   (`OWED_SEAMS`): `harness::dispatch::deliver::kernel` (R1's arms with no consumer),
+///   `harness::dispatch::deliver::recovery` (F1's requests with no provider) and
+///   `harness::replay::replay` (refused by design; see below). Two closed on 2026-10-02: the
+///   crash seam, `harness::dispatch::deliver::crash` (a taken crash is a fault the run goes on
+///   through, and a `StepAction::Restart` step brings the node back), and the route stop,
+///   `harness::run::route` (a routed fact a wired consumer declined stops the run as
+///   `StopReason::Declined`, not as a refused seam).
 ///   Dispatch, recording, the manifest, the run loop ([`self::run::execute`]) and replay from a
 ///   plan ([`self::replay::replay_run`]) are real.
 ///

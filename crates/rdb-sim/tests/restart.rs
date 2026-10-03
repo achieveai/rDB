@@ -313,7 +313,8 @@ fn landings(runner: &Runner, from: usize, member: NodeId) -> Vec<(BootId, u64)> 
         .collect()
 }
 
-/// Take a planned process crash on `node`: the next storage effect meets it and is refused.
+/// Take a planned process crash on `node`: the next storage effect meets it, and is dropped as
+/// the dead process's.
 fn crash(runner: &mut Runner, node: NodeId) {
     crash_under(runner, node, BOOT);
 }
@@ -327,6 +328,7 @@ fn crash_under(runner: &mut Runner, node: NodeId, boot: BootId) {
             fault: StorageFault::ProcessCrash,
         })
         .expect("a planned crash");
+    let dropped_before = runner.dispatcher().dropped().len();
     let tripped = runner.carry_out(
         node,
         boot,
@@ -340,7 +342,15 @@ fn crash_under(runner: &mut Runner, node: NodeId, boot: BootId) {
             }),
         }],
     );
-    assert!(tripped.is_err(), "precondition: the crash is taken");
+    tripped.expect("precondition: a crash is a fault the run goes on through, not a refusal");
+    assert!(
+        matches!(
+            runner.dispatcher().dropped()[dropped_before..],
+            [Dropped::Effects { node: down, boot: under, reason: DropReason::NodeDown, .. }]
+                if down == node && under == boot
+        ),
+        "precondition: the snapshot that met the crash is dropped as the dead process's"
+    );
     assert!(
         runner.dispatcher().crash_image(node).is_some(),
         "precondition: node {} is down",
@@ -812,7 +822,11 @@ fn running_catch_up() -> Runner {
             deadline: Tick(5),
         })
         .expect("the catch-up starts");
-    assert_eq!(first.stop.refusal(), None, "{:?}", first.stop);
+    assert!(
+        first.clone().into_result().is_ok(),
+        "bounded: neither refused nor declined: {:?}",
+        first.stop
+    );
     runner
 }
 
@@ -1659,6 +1673,223 @@ fn m7v_114_a_down_node_is_not_stepped_and_what_reaches_it_is_dropped() {
     assert!(runner.dispatcher().is_down(NODE), "node 1 is still down");
 }
 
+/// I1's crash seam, closed (team i1, 2026-10-02): a planned crash taken inside a run is a fault
+/// the run goes on through, and a `Restart` step brings the node back, in the same run.
+///
+/// The spine, with two timed steps on node 1: a process crash planned at 3 000, tagged as
+/// scenario op 0, and a restart under boot 2 at 4 500. The crash is taken at node 1's next
+/// storage effect, by the provider, which writes the op's one `FaultInjected` line through the
+/// fault hook. The batch that met it is dropped as the dead process's, and the run reaches its
+/// deadline with node 1 up under its new boot and stepped again.
+///
+/// Red before the seam closed: the run stopped `Refused { harness::dispatch::deliver::crash }`
+/// at the first storage effect after 3 000, so the restart step was never reached.
+#[retcd_test]
+fn crash_a_run_goes_on_through_a_crash_and_a_restart_step_brings_the_node_back() {
+    use rdb_core::contracts::trace::{BoundaryId, FaultKind};
+    use rdb_sim::harness::run::{FaultTag, ScenarioStep, StepAction};
+    support::preamble();
+    const CRASH_AT: Tick = Tick(3_000);
+    const RESTART_AT: Tick = Tick(4_500);
+    let mut plan = spine_plan();
+    let on_node = |at: Tick, action: StepAction, taken: Option<FaultTag>| ScenarioStep {
+        at,
+        node: NODE,
+        partition: SERVED,
+        action,
+        line: None,
+        taken,
+    };
+    plan.steps = vec![
+        on_node(
+            CRASH_AT,
+            StepAction::Storage(StorageOp::Crash {
+                node: NODE,
+                fault: StorageFault::ProcessCrash,
+            }),
+            Some(FaultTag {
+                boundary: BoundaryId::BeforeAtomicCommit,
+                op_index: 0,
+            }),
+        ),
+        on_node(RESTART_AT, StepAction::Restart(REBOOT), None),
+    ];
+    plan.limits = RunLimits {
+        max_events: LONG_RUN_EVENTS,
+        deadline: SECOND_DEADLINE,
+    };
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner
+        .run(plan.limits)
+        .expect("the run itself does not fail");
+
+    let faults: Vec<_> = runner
+        .recorded()
+        .iter()
+        .filter_map(|record| match &record.kind {
+            TraceKind::FaultInjected {
+                fault_kind,
+                target,
+                boundary,
+                scenario_op_index,
+            } => Some((
+                record.logical_tick,
+                *fault_kind,
+                *target,
+                *boundary,
+                *scenario_op_index,
+            )),
+            _ => None,
+        })
+        .collect();
+    let died: Vec<_> = runner
+        .dispatcher()
+        .dropped()
+        .iter()
+        .filter(|dropped| {
+            matches!(
+                dropped,
+                Dropped::Effects {
+                    node: NODE,
+                    boot: BOOT,
+                    reason: DropReason::NodeDown,
+                    ..
+                }
+            )
+        })
+        .collect();
+    let stepped_again = dispatched(&runner, 0)
+        .into_iter()
+        .filter(|(node, boot, _)| *node == NODE && *boot == REBOOT)
+        .count();
+    tracing::info!(
+        stop = ?report.stop,
+        faults = ?faults,
+        died = died.len(),
+        stepped_again,
+        "crash and restart in one run"
+    );
+
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "a crash stops nothing: {:?}",
+        report.stop
+    );
+    assert_eq!(
+        faults.len(),
+        1,
+        "one line for the one taken crash: {faults:?}"
+    );
+    let (at, kind, target, boundary, op) = faults[0];
+    assert!(
+        (CRASH_AT.0..RESTART_AT.0).contains(&at),
+        "written when the crash was taken, after its step and before the restart: {at}"
+    );
+    assert_eq!(
+        (kind, target, boundary, op),
+        (FaultKind::Storage, NODE, BoundaryId::BeforeAtomicCommit, 0),
+        "the kind from the action, the boundary and op index from the step's tag"
+    );
+    assert!(
+        !died.is_empty(),
+        "the batch that met the crash is the dead process's, dropped and recorded"
+    );
+    assert!(!runner.dispatcher().is_down(NODE), "node 1 is up");
+    assert_eq!(
+        runner.dispatcher().boot(NODE),
+        Some(REBOOT),
+        "under its new boot"
+    );
+    assert!(stepped_again > 0, "and is stepped again under it");
+}
+
+/// The one fault hook credits each taken fault to its own step (tester-m7c-i1 R2, walk S7).
+///
+/// Two crashes are pending at once at tick 1, on different nodes: node 2's tagged as scenario
+/// op 5 and planned first, node 1's tagged as op 0. Whichever the providers take, each line must
+/// name the op of the crash that was taken: node 1's line op 0, node 2's (if node 2 crashes) op
+/// 5. With one pending tag the match cannot matter, which is why the crash row above could not
+/// see a hook that took the oldest tag whatever it was for; walked by hand, that hook wrote node
+/// 1's crash as op 5.
+#[retcd_test]
+fn crash_two_pending_faults_on_different_nodes_each_line_names_its_own_op() {
+    use rdb_core::contracts::trace::BoundaryId;
+    use rdb_sim::harness::run::{FaultTag, ScenarioStep, StepAction};
+    support::preamble();
+    const PEER: NodeId = NodeId(2);
+    let crash = |node: NodeId, op_index: u32| ScenarioStep {
+        at: Tick(1),
+        node,
+        partition: SERVED,
+        action: StepAction::Storage(StorageOp::Crash {
+            node,
+            fault: StorageFault::ProcessCrash,
+        }),
+        line: None,
+        taken: Some(FaultTag {
+            boundary: BoundaryId::BeforeAtomicCommit,
+            op_index,
+        }),
+    };
+    let mut plan = spine_plan();
+    plan.steps = vec![crash(PEER, 5), crash(NODE, 0)];
+    plan.limits = RunLimits {
+        max_events: LONG_RUN_EVENTS,
+        deadline: SECOND_DEADLINE,
+    };
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner
+        .run(plan.limits)
+        .expect("the run itself does not fail");
+
+    let lines: Vec<(NodeId, u32)> = runner
+        .recorded()
+        .iter()
+        .filter_map(|record| match &record.kind {
+            TraceKind::FaultInjected {
+                target,
+                scenario_op_index,
+                ..
+            } => Some((*target, *scenario_op_index)),
+            _ => None,
+        })
+        .collect();
+    let peer_down = runner.dispatcher().is_down(PEER);
+    tracing::info!(stop = ?report.stop, ?lines, peer_down, "two pending crashes");
+
+    assert!(
+        report.clone().into_result().is_ok(),
+        "bounded: neither refused nor declined: {:?}",
+        report.stop
+    );
+    assert!(
+        runner.dispatcher().is_down(NODE),
+        "node 1's crash was taken"
+    );
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|(target, _)| *target == NODE)
+            .collect::<Vec<_>>(),
+        vec![&(NODE, 0)],
+        "node 1's crash is credited to node 1's op 0, never to node 2's op 5: {lines:?}"
+    );
+    let expected_peer: Vec<&(NodeId, u32)> = if peer_down { vec![&(PEER, 5)] } else { vec![] };
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|(target, _)| *target == PEER)
+            .collect::<Vec<_>>(),
+        expected_peer,
+        "node 2 has a line, op 5, exactly when its crash was taken: {lines:?}"
+    );
+    assert_eq!(
+        lines.len(),
+        1 + usize::from(peer_down),
+        "no other line: {lines:?}"
+    );
+}
+
 /// M7V-115 (F-D): `Dispatcher::deliver` never moves a node's boot back. Effects handed under a
 /// boot older than the node's current one are a dead process's output: none is carried out, and
 /// they are recorded as dropped.
@@ -2197,9 +2428,25 @@ fn m7v_121_a_crash_taken_on_another_nodes_behalf_ends_the_holders_watches() {
         }],
     );
     tracing::info!(?synced, "m7v_121");
+    synced.expect("precondition: a crash taken at the holder is a fault, not a refusal");
+    // `carry_out` records lines, not notes: the run loop records notes, so read the held one.
     assert!(
-        synced.is_err(),
-        "precondition: node 1's sync took the crash at the holder: {synced:?}"
+        runner
+            .dispatcher_mut()
+            .take_notes()
+            .iter()
+            .any(|(node, _, note)| *node == NODE
+                && matches!(
+                    note,
+                    KernelNote::SyncWithheld {
+                        copy: CopyId(1),
+                        reason: rdb_core::contracts::trace::SyncWithheldReason::Failed(
+                            StorageFault::ProcessCrash
+                        ),
+                        ..
+                    }
+                )),
+        "precondition: node 1's sync took the crash at the holder, and was withheld for it"
     );
     assert!(
         runner.dispatcher().is_down(two),
@@ -2215,7 +2462,9 @@ fn m7v_121_a_crash_taken_on_another_nodes_behalf_ends_the_holders_watches() {
 
 /// M7V-122 (rule 1, tester D4): a direct `deliver` to a down node carries out none of its
 /// timer, send or control effects. They are dropped as `NodeDown` and recorded. A storage effect
-/// is still refused at the crash seam, and nothing before it in the batch runs either.
+/// is no different: the node is already down, so the batch holding it is dropped whole, and
+/// nothing before it runs either (team i1, crash seam closed 2026-10-02; until then it was
+/// refused at `harness::dispatch::deliver::crash`).
 ///
 /// Red on the round-0 export sources: the down node's timer was armed, its frame scheduled and
 /// its watch opened.
@@ -2260,19 +2509,21 @@ fn m7v_122_a_direct_delivery_to_a_down_node_carries_out_nothing() {
             partition: RECOVERED,
         }),
     };
-    let refused = runner.dispatcher_mut().deliver(
-        NODE,
-        BOOT,
-        vec![arm(0x0123, 5_000), snapshot],
-        &mut control,
-        &mut scheduler,
-    );
+    let drops = runner.dispatcher().dropped().len();
+    let batch = vec![arm(0x0123, 5_000), snapshot];
+    runner
+        .dispatcher_mut()
+        .deliver(NODE, BOOT, batch.clone(), &mut control, &mut scheduler)
+        .expect("a storage effect to a down node is dropped too, not refused");
     assert_eq!(
-        refused,
-        Err(rdb_sim::SimError::unavailable(
-            "harness::dispatch::deliver::crash"
-        )),
-        "a storage effect is refused at the crash seam"
+        runner.dispatcher().dropped()[drops..],
+        [Dropped::Effects {
+            node: NODE,
+            boot: BOOT,
+            reason: DropReason::NodeDown,
+            effects: batch,
+        }],
+        "the whole batch, storage effect included, is dropped as one record"
     );
     assert!(
         !is_armed(&runner, NODE, 0x0123),

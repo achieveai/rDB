@@ -2471,7 +2471,8 @@ fn fanout_a_crashed_member_hears_on_restart() {
         &mut rdb_sim::sim::control::ControlStore::new(),
         &mut scheduler,
     );
-    assert!(tripped.is_err(), "node 2 is down");
+    tripped.expect("a crash is a fault the run goes on through, not a refusal");
+    assert!(dispatcher.is_down(NodeId(2)), "node 2 is down");
     fanout_emit(&mut dispatcher, &mut scheduler, &fanout_result(2));
 
     let before = fanout_run(&mut dispatcher, &mut scheduler, u64::MAX);

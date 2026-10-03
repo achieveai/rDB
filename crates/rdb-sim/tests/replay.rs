@@ -1,5 +1,5 @@
 //! Rows M7F-25, M7F-30, M7F-31, M7F-32, M7F-33, M7F-34 and M7F-35: `harness::replay::replay` is
-//! unavailable and names itself, and all four of `harness::trace::validate`'s checks.
+//! unavailable and names itself, and `harness::trace::validate`'s checks.
 //!
 //! | Row | Claim |
 //! |---|---|
@@ -7,7 +7,7 @@
 //! | M7F-30 | the positive control: a well-formed trace is `Ok(())`, and it carries every check's subject |
 //! | M7F-31 | a non-increasing `event_id` is rejected naming it; a repeating `logical_tick` is **legal** |
 //! | M7F-32 | a `Capability` event after the first ordinary event is rejected, and so is a missing package; `C0` inside the opening block is accepted |
-//! | M7F-33 | an event the liveness checker folds, before any `SchedulePhaseChanged{Healed}`, is rejected; one position after, accepted |
+//! | M7F-33 | an event the liveness checker folds is accepted before `SchedulePhaseChanged{Healed}` and after it (ruling L-R182ee retired check 3) |
 //! | M7F-34 | a `ReplicationAck` above the **emitting node's** last `BatchApply.seq` is rejected; at that seq, or from another node, accepted |
 //! | M7F-35 | a recorded trace, the same trace through a JSONL file, and a hand-built one get one verdict from one validator — clean and defective alike |
 //!
@@ -264,8 +264,8 @@ fn healed() -> TraceKind {
 /// team verification (INV-LIVE) and tells this row to use one both plans already agree on and to
 /// say which. `M7V-30` folds *"one `inflight` request that never reaches a terminal
 /// `client_outcome`"*; [`TraceKind::ClientSubmit`] is that request arriving, and it is the only
-/// variant either plan names as folded today. The validator's own `folds_into_liveness` says the
-/// same thing in one place, so widening the set is one edit there and not a sweep of fixtures.
+/// variant either plan names as folded today. Since ruling L-R182ee the validator no longer
+/// orders it against the heal; a client write is the realistic thing to send during a partition.
 fn client_submit() -> TraceKind {
     TraceKind::ClientSubmit {
         request: RequestId(1),
@@ -414,7 +414,8 @@ fn m7f_30_the_validator_accepts_a_well_formed_trace() {
         "no capability event after the block"
     );
 
-    // Check 3's subject: a healed phase change, and a folded event strictly after it.
+    // Check 3 is retired (ruling L-R182ee), so this is the fixture's shape, not a check's subject:
+    // a healed phase change first, and a folded event after it, as a recorded heal would give.
     let healed_at = trace
         .events
         .iter()
@@ -672,28 +673,25 @@ fn m7f_32_the_validator_rejects_a_capability_block_that_is_not_first() {
     );
 }
 
-/// M7F-33: the validator rejects an event the liveness checker folds when it is placed before
-/// any `SchedulePhaseChanged{Healed}`, and accepts the same event one position after.
+/// M7F-33: the validator accepts an event the liveness checker folds whether it comes before or
+/// after `SchedulePhaseChanged{Healed}`.
 ///
-/// **Rewritten by lead ruling F-1 (2026-09-22).** The row named "the liveness-arming event"
-/// until then, and there was no such thing on disk: `SchedulePhaseChanged` **is** the arming
-/// event, so "X before any `SchedulePhaseChanged`" had no X. The rationale was always sound and
-/// is the claim asserted here — *liveness is only claimed inside a stated phase* (spike §6
-/// forbids calling an unhealed partition a liveness failure).
+/// **Rewritten by ruling L-R182ee (2026-10-02).** Until then this row asserted the opposite: a
+/// folded event before the healed phase was rejected (ruling F-1). Real clusters take client
+/// writes while the network is broken, so a write before the heal is a trace the runner can
+/// produce, and rejecting it made 30 hand-built oracle traces unrealizable. Spike §6 still holds
+/// up to the heal, in the checker where it belongs: INV-LIVE arms only on the heal and spends its
+/// budget only from there (`oracle.rs`, `live_a_write_during_a_partition_is_judged_from_the_heal_on`
+/// and M7V-31). It does not cover a network that breaks again after the heal; see
+/// `harness::trace::validate`, check 3.
 ///
 /// The folded event is [`TraceKind::ClientSubmit`]; [`client_submit`] carries the reasoning.
 ///
 /// **The two arms differ in one thing: position.** Same two kinds, same two ticks, same nodes —
-/// the tail list is reversed and the ids follow the positions. So nothing but the ordering rule
-/// can separate the verdicts, which is what stops the row passing on a validator that rejects
-/// every `ClientSubmit` outright.
-///
-/// **Inert on recorded traces today, and F-1 says so in advance.** `run::execute` emits neither
-/// kind, so no recorded trace can trip this yet. The first time the loop can emit a folded event
-/// with no phase change in front of it, every recorded trace goes invalid at once and this will
-/// look like the row being too strict. It will not be.
+/// the tail list is reversed and the ids follow the positions. Both are accepted, so the
+/// validator has no ordering rule between a write and the heal.
 #[retcd_test]
-fn m7f_33_the_validator_rejects_a_liveness_folded_event_before_the_arming_phase_change() {
+fn m7f_33_the_validator_accepts_a_client_write_before_or_after_the_healed_phase_change() {
     support::preamble();
 
     let before = trace_with(vec![
@@ -709,15 +707,20 @@ fn m7f_33_the_validator_rejects_a_liveness_folded_event_before_the_arming_phase_
         },
     ]);
     let folded_at = before.events[before.events.len() - 2].event_id;
+    assert!(
+        matches!(
+            before.events[before.events.len() - 2].kind,
+            TraceKind::ClientSubmit { .. }
+        ),
+        "the write comes first"
+    );
     assert_eq!(
         validate(&before),
-        Err(TraceDefect::LivenessFoldedBeforeHealed {
-            event_id: folded_at
-        }),
-        "a folded event before any healed phase arms the checker outside a stated phase"
+        Ok(()),
+        "a write during a partition, before the heal, is a trace the runner can produce"
     );
 
-    // The near-miss twin: the same folded event, one position later.
+    // The twin: the same write, one position later.
     let after = trace_with(vec![
         Ordinary {
             tick: 90,
@@ -730,18 +733,14 @@ fn m7f_33_the_validator_rejects_a_liveness_folded_event_before_the_arming_phase_
             kind: client_submit(),
         },
     ]);
-    assert_eq!(
-        validate(&after),
-        Ok(()),
-        "inside a stated phase the same event is exactly what the checker is for"
-    );
+    assert_eq!(validate(&after), Ok(()), "and so is one after it");
     assert_eq!(
         before.events.len(),
         after.events.len(),
         "the two fixtures differ in order and in nothing else"
     );
 
-    tracing::info!(?folded_at, "m7f_33 liveness arming order");
+    tracing::info!(?folded_at, "m7f_33 write before the heal accepted");
 }
 
 /// M7F-34: the validator rejects a `ReplicationAck` whose `contiguous_seq` is above the
