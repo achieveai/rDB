@@ -2315,10 +2315,13 @@ async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
             // Written only by the release commands, which this row never runs: see the doc
             // comment. Listing is still enforced above.
             "release campaign run" => {}
+            // Written by the rdb-storage s1_conformance test, never by this row's campaign run;
+            // listing is still enforced above (ruling L-R183p).
+            "rdb-storage test run" => {}
             other => panic!(
                 "{name}: the rDB table says it is written by {other:?}; this row knows only \
-                 `debug campaign run`, `release campaign run` and `every campaign run`, and will \
-                 not guess whether the file must exist"
+                 `debug campaign run`, `release campaign run`, `every campaign run` and \
+                 `rdb-storage test run`, and will not guess whether the file must exist"
             ),
         }
     }

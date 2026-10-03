@@ -346,20 +346,20 @@
         {
           "text": "Kernel-A ordering and consistency properties are validated.",
           "mark": "open",
-          "evidence": "A1 reports Wired and authored recovery-to-write runs execute in the simulator. T1 reports Unavailable at run time (ruling V-R40). Census: 194 declared, 187 landed, 7 owed."
+          "evidence": "A1 reports Wired and authored recovery-to-write runs execute in the simulator. T1 reports Unavailable at run time (ruling V-R40). Census at e1ae4f7: 195 declared, 193 landed, 2 owed (M7A-58, M7A-128)."
         },
         {
           "text": "Kernel-B state recovery and durability pass test suite.",
           "mark": "open",
-          "evidence": "Census: 239 declared, 239 landed, 0 owed. R1, L1 and F1 code and rows are built, but each reports Unavailable at run time."
+          "evidence": "Census at e1ae4f7: 240 declared, 240 landed, 0 owed. R1, L1 and F1 code and rows are built, but each reports Unavailable at run time."
         },
         {
           "text": "Verification oracle detects real-world divergence.",
           "mark": "open",
-          "evidence": "Census: 127 declared, 116 landed, 1 exempt, 10 owed. Generated campaign seeds do not lower yet (M7V-55), so full_scale is false."
+          "evidence": "Census at e1ae4f7: 130 declared, 124 landed, 1 exempt, 5 owed (M7V-20, -23, -55, -75, -80). Generated campaign seeds do not lower yet (M7V-55), so full_scale is false."
         }
       ],
-      "tests": "Census 2026-10-01, export of 7e262dc: 616 declared, 591 landed, 7 exempt, 18 owed. Foundation 0 owed. Kernel-a 7 owed. Kernel-b 0 owed. Verification 11 owed.",
+      "tests": "Census at e1ae4f7: 622 declared, 608 landed, 7 exempt, 7 owed. Foundation 0 owed. Kernel-a 2 owed. Kernel-b 0 owed. Verification 5 owed.",
       "status": [
         {
           "lead": "M7 code is committed and pushed.",
