@@ -81,6 +81,8 @@ run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warn
 # behind a `| tail`; that half is the caller's, this half is the script's.
 run_test() {
   echo "== test"
+  # Warns, never fails: outbound connects still draw from the OS dynamic pool (issue #5).
+  bash scripts/port-preflight.sh || true
   local scope=(--workspace)
   for arg in "$@"; do
     case "$arg" in

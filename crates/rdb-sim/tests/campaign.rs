@@ -1271,23 +1271,30 @@ fn m7v_54_spike_require_all_fails_the_gate_on_any_not_proven() {
     let require_all = knobs_of(&[("SPIKE_REQUIRE_ALL", "1")]);
     assert!(require_all.require_all);
 
-    // The shared report under the variable: every not-proven row is named with its reason.
-    let causes = engine::gate(&campaign.statuses, campaign.full_scale(), true, false)
-        .expect_err("the shared report is not all proven during M7");
-    let expected: Vec<String> = campaign
-        .statuses
-        .iter()
-        .filter_map(|row| {
-            row.status.reason().map(|reason| {
-                format!(
-                    "{}: not proven under SPIKE_REQUIRE_ALL=1: unavailable({reason})",
-                    row.invariant.id()
-                )
+    // Under the variable every not-proven row is named with its reason, and a report with none
+    // passes. Checked both ways, as M7V-87 is, so the row does not go red the day the shared
+    // report is all proven: the synthetic all-proven report holds the passing direction.
+    let named = |statuses: &[InvariantStatus]| {
+        let verdict = engine::gate(statuses, campaign.full_scale(), true, false);
+        let expected: Vec<String> = statuses
+            .iter()
+            .filter_map(|row| {
+                row.status.reason().map(|reason| {
+                    format!(
+                        "{}: not proven under SPIKE_REQUIRE_ALL=1: unavailable({reason})",
+                        row.invariant.id()
+                    )
+                })
             })
-        })
-        .collect();
-    assert!(!expected.is_empty());
-    assert_eq!(causes, expected);
+            .collect();
+        if expected.is_empty() {
+            assert_eq!(verdict, Ok(()), "nothing is not proven, so the gate passes");
+        } else {
+            assert_eq!(verdict, Err(expected));
+        }
+    };
+    named(&campaign.statuses);
+    named(&table(&[]));
 
     // A union of both conditions: not proven (either reason) and proven-with-nothing-armed.
     let report = table(&[

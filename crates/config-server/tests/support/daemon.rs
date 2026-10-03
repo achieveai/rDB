@@ -158,6 +158,7 @@ pub struct DaemonProcess {
     lines: Receiver<String>,
     stdout: Arc<Mutex<Vec<String>>>,
     stderr: Arc<Mutex<String>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     ready: Option<Ready>,
 }
 
@@ -174,7 +175,7 @@ impl std::fmt::Debug for DaemonProcess {
 impl DaemonProcess {
     /// Spawn the daemon. Does not wait for readiness.
     pub fn spawn(spec: DaemonSpec) -> Self {
-        let mut child = Command::new(BINARY)
+        let mut child = super::narrow_port_range(&mut Command::new(BINARY))
             .args(spec.args())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -198,7 +199,7 @@ impl DaemonProcess {
 
         let err = child.stderr.take().expect("stderr is piped");
         let sink = Arc::clone(&stderr_buf);
-        std::thread::spawn(move || {
+        let stderr_reader = std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
                 let mut guard = sink.lock().expect("stderr buffer");
                 guard.push_str(&line);
@@ -212,8 +213,21 @@ impl DaemonProcess {
             lines: rx,
             stdout: stdout_buf,
             stderr: stderr_buf,
+            stderr_reader: Some(stderr_reader),
             ready: None,
         }
+    }
+
+    /// Kill the process if it is still running, and return everything it wrote to stderr.
+    ///
+    /// Unlike [`DaemonProcess::stderr`], this waits for the reader to drain the pipe, so a
+    /// refusal printed just before exit is never missing.
+    pub fn stderr_after_exit(&mut self) -> String {
+        self.kill();
+        if let Some(reader) = self.stderr_reader.take() {
+            reader.join().expect("stderr reader thread");
+        }
+        self.stderr()
     }
 
     /// Block until the ready line arrives, or `deadline` passes.
@@ -369,7 +383,7 @@ pub fn run_to_completion(spec: &DaemonSpec) -> (Option<i32>, String, String) {
     // the daemon instead starts normally (a spec without `--form`, say). On timeout the child
     // is killed and the exit code is `None`, with the reason appended to stderr.
     let deadline = super::startup_deadline();
-    let mut child = Command::new(BINARY)
+    let mut child = super::narrow_port_range(&mut Command::new(BINARY))
         .args(spec.args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

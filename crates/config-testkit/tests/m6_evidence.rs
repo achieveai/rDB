@@ -48,10 +48,11 @@ mod support;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use config_core::{
-    ClusterId, ClusterIdentity, Limits, NodeId, RecoveryEpoch, WatchItem, WatchLimits, WatchRequest,
+    ClusterId, ClusterIdentity, ConfigError, Limits, NodeId, RecoveryEpoch, WatchItem, WatchLimits,
+    WatchRequest,
 };
 use config_storage::{Boundary, NoFaults};
 use config_testkit::cluster::{Cluster, GossipKind, PoisonSpec, RocksSpec, StorageKind};
@@ -715,15 +716,9 @@ async fn m6_107_evidence_partition_matrix() {
     let mut acknowledged: BTreeMap<String, u64> = BTreeMap::new();
     for arrangement in &arrangements {
         for repeat in 0..repeats {
-            let leader = cluster.leader().await;
             let tag = format!("{}_r{repeat}", arrangement.id());
             let before = format!("part/{tag}/before");
-            let revision = cluster
-                .client(leader)
-                .put(put_req(&before, "1"))
-                .await
-                .expect("pre-partition write")
-                .revision;
+            let revision = pre_partition_write(&cluster, &before).await;
             acknowledged.insert(before, revision);
 
             arrangement.apply(&cluster);
@@ -811,6 +806,108 @@ async fn m6_107_evidence_partition_matrix() {
         values,
         run.scaled(MATRIX_REPEATS_FULL_PARTITION as f64, repeats as f64),
     );
+}
+
+/// The write that opens each M6-107 arrangement; returns the revision it was acknowledged at.
+///
+/// It follows a heal, and a heal can set off an election. A leader-minority arrangement keeps
+/// the leader's heartbeats from the followers for the whole 2 s write timeout. When the block
+/// lifts, the leader's replication streams are still backing off (openraft's default
+/// `RaftNetwork::backoff`, 500 ms). If a follower's election timer runs out first, it
+/// campaigns, and a write sent to the leader in that window is caught by the election. All
+/// nodes still name the old leader then, so waiting for them to agree does not help.
+///
+/// So the write is create-only (`expected_mod_revision: Some(0)`, ADR-0006). Every key is new,
+/// so it can apply at most once however often it is sent, which is ADR-0015's recovery recipe
+/// (a CAS) rather than a blind replay. The answers an election can give:
+///
+/// - `NotLeader`, or `Unavailable` with no leader known: openraft answers a pending write so
+///   only when it truncates the entry. Send it again to the leader, as `GrpcClient` does on its
+///   own (DesignSpec-01 §6.1; ADR-0015 "Decision").
+/// - `DeadlineExceededUnknownOutcome`: it may have committed. Send it again.
+/// - `Conflict` with the key present: an earlier send committed. The key's `mod_revision` is
+///   that write's revision, since nothing else writes this key.
+///
+/// Any other error fails the row, and so does having no acknowledgement by the deadline.
+async fn pre_partition_write(cluster: &Cluster, key: &str) -> u64 {
+    let deadline = Instant::now() + cluster.deadline(20);
+    let create_only = config_core::PutRequest {
+        expected_mod_revision: Some(0),
+        ..put_req(key, "1")
+    };
+    loop {
+        let leader = cluster.leader().await;
+        let refused = match cluster.client(leader).put(create_only.clone()).await {
+            Ok(response) => return response.revision,
+            Err(ConfigError::Conflict {
+                exists: true,
+                current_mod_revision,
+            }) => return current_mod_revision,
+            Err(
+                e @ (ConfigError::NotLeader { .. }
+                | ConfigError::Unavailable { .. }
+                | ConfigError::DeadlineExceededUnknownOutcome),
+            ) => e,
+            Err(e) => panic!("pre-partition write: {e:?}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "pre-partition write: no acknowledgement by the deadline; last answer {refused:?}"
+        );
+    }
+}
+
+/// M6-107 regression: the write that opens an arrangement survives an election it runs into,
+/// when the election truncates it and the leader answers `NotLeader`. This is the gate's
+/// failure on 2026-10-03.
+///
+/// The write timeout is longer than any follower's election timeout, so the truncation
+/// answers first.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_107_pre_partition_write_survives_an_election_that_truncates_it() {
+    // 2 s is the harness's default read timeout; only the write timeout changes.
+    write_into_a_forced_election(Duration::from_secs(2), Duration::from_secs(10)).await;
+}
+
+/// M6-107 regression: as above, when the write's deadline passes first and its outcome is
+/// unknown (ADR-0015).
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_107_pre_partition_write_survives_an_election_past_its_deadline() {
+    write_into_a_forced_election(Duration::from_secs(2), Duration::from_secs(2)).await;
+}
+
+/// Forced, so the two rows above do not depend on host load. The leader's heartbeats stop
+/// reaching both followers, while their vote requests still reach it. That is the state a heal
+/// leaves behind after a leader-minority arrangement, made to last until the election happens.
+async fn write_into_a_forced_election(read_timeout: Duration, write_timeout: Duration) {
+    let cluster = Cluster::builder()
+        .nodes(3)
+        .timeouts(read_timeout, write_timeout)
+        .start()
+        .await;
+    let leader = cluster.leader().await;
+    for follower in cluster.followers() {
+        cluster.partition_one_way(leader, follower);
+    }
+
+    let revision = pre_partition_write(&cluster, "part/forced/before").await;
+
+    cluster.heal();
+    let reader = cluster
+        .wait_for_leader(cluster.deadline(20))
+        .await
+        .unwrap_or_else(|t| panic!("no leader after the forced election: {t}"));
+    let got = cluster
+        .client(reader)
+        .get(get_req("part/forced/before"))
+        .await
+        .expect("read back the forced write");
+    assert_eq!(
+        got.record.map(|r| r.mod_revision),
+        Some(revision),
+        "the write was reported acknowledged at {revision} but is not there at that revision"
+    );
+    cluster.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------------------

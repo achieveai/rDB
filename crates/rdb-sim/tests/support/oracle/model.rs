@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::ids::{
-    BootId, ClientId, ConfigVersion, CorrelationId, Generation, NodeId, PartitionId, ReplicaRole,
-    RequestId, Seq, TenantId,
+    BootId, ClientId, ConfigVersion, CorrelationId, Generation, NodeId, OwnerEpoch, PartitionId,
+    ReplicaRole, RequestId, Seq, TenantId,
 };
 use rdb_core::contracts::trace::{
     ApplyOutcome, BoundaryId, CapabilityState, DurabilityClass, KeyId, LineageSource, PackageId,
@@ -268,6 +268,8 @@ pub struct AckRec {
     pub config_version: ConfigVersion,
     /// The lineage it acknowledged in.
     pub generation: Generation,
+    /// The owner epoch it believed current.
+    pub owner_epoch: OwnerEpoch,
     /// The watermark it holds. Evidence for every sequence at or below it (convention 2).
     pub contiguous_seq: Seq,
     /// How strongly.
@@ -332,6 +334,8 @@ pub struct RootRec {
 pub struct AuthorityRec {
     /// The lineage.
     pub generation: Generation,
+    /// The epoch of the owner the decision was for.
+    pub owner_epoch: OwnerEpoch,
     /// Earliest tick the grant is valid from.
     pub valid_from_tick: u64,
     /// The grant's expiry tick.
@@ -498,6 +502,17 @@ impl Model {
             .find_map(|(_, placement)| placement.get(&node).copied())
     }
 
+    /// The newest configuration the **environment** declared for `partition`: the header's
+    /// snapshot or a `topology_change`. `None` when it declared none.
+    #[must_use]
+    pub fn newest_config(&self, partition: PartitionId) -> Option<ConfigVersion> {
+        self.topology
+            .keys()
+            .filter(|(p, _)| *p == partition)
+            .map(|(_, config_version)| *config_version)
+            .max()
+    }
+
     /// Fold `event` into the facts. Called **after** every checker has observed it.
     #[allow(clippy::too_many_lines)]
     pub fn absorb(&mut self, event: &TraceEvent) {
@@ -570,6 +585,7 @@ impl Model {
             }
             TraceKind::AuthorityDecision {
                 generation,
+                owner_epoch,
                 valid_from_tick,
                 expiry_tick,
                 outcome,
@@ -579,6 +595,7 @@ impl Model {
                     event.event_id.0,
                     AuthorityRec {
                         generation: *generation,
+                        owner_epoch: *owner_epoch,
                         valid_from_tick: *valid_from_tick,
                         expiry_tick: *expiry_tick,
                         outcome: *outcome,
@@ -609,6 +626,7 @@ impl Model {
                 peer_boot,
                 config_version,
                 generation,
+                owner_epoch,
                 contiguous_seq,
                 durability_class,
                 accepted,
@@ -620,6 +638,7 @@ impl Model {
                         claimed_role: *peer_role,
                         config_version: *config_version,
                         generation: *generation,
+                        owner_epoch: *owner_epoch,
                         contiguous_seq: *contiguous_seq,
                         durability: *durability_class,
                         accepted: *accepted,

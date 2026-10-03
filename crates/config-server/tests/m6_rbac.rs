@@ -22,7 +22,7 @@ use bytes::Bytes;
 use config_client::{GrpcClient, GrpcClientOptions, TlsMode};
 use config_core::{ConfigError, ConfigStore, PutRequest};
 use config_log::retcd_test;
-use config_testkit::poll::{poll_until_async, Timeout};
+use config_testkit::poll::{deadline_scale, poll_until_async, Timeout};
 
 use support::{
     deadline, startup_deadline, DaemonProcess, Harness, Health, NodeOptions, PolicyFixture,
@@ -39,9 +39,33 @@ use support::{
 /// itself — it only sets how long "eventually" takes.
 const POLL_SECS: u64 = 1;
 
-/// How long a rotation gets to be picked up: several poll intervals, plus process scheduling.
+/// How long a rotation gets to be picked up: several poll intervals, plus process scheduling,
+/// stretched by `RETCD_TEST_DEADLINE_SCALE` like every other derived deadline.
 fn rotation_deadline() -> Duration {
-    Duration::from_secs(POLL_SECS * 10)
+    Duration::from_secs(POLL_SECS * 10) * deadline_scale()
+}
+
+/// memberlist's anti-entropy period: `Options::local`'s `push_pull_interval`, which
+/// `GossipNode::start` does not override.
+const PUSH_PULL_SECS: u64 = 15;
+
+/// How long a node may take to *learn* that every other voter adopted a version.
+///
+/// Longer than [`rotation_deadline`] because this wait is on gossip, not on a local file poll.
+/// A node's version change reaches its peers as a memberlist `Alive` broadcast, and with three
+/// nodes memberlist sends each broadcast only twice (`retransmit_mult` 2 times
+/// `ceil(log10(n + 1))`). Those two sends piggyback on whatever packets leave first, often the
+/// probe ping and ack to the *same* peer, so in about one run in sixteen the third node never
+/// hears it. It learns from the next push/pull instead, whose first tick lands a random
+/// `[0, 15s)` stagger plus one interval after gossip starts, so up to two intervals away.
+/// Measured slow path: 13.9-23.1 s after the last voter adopted, in 6 of 96 loaded runs.
+///
+/// DesignSpec-01 §15.3 sets 30 s as the provisional convergence objective, and ADR-0027
+/// ("Convergence: the fail-closed intersection is a courtesy, not a boundary") keeps it out of
+/// acceptance lines. So this row asserts that convergence *ends*, and allows the product's own
+/// worst case: one poll, two push/pull intervals, and scheduling margin.
+fn convergence_deadline() -> Duration {
+    Duration::from_secs(POLL_SECS + 2 * PUSH_PULL_SECS + 5) * deadline_scale()
 }
 
 /// A client for the granted principal against one daemon.
@@ -84,7 +108,17 @@ async fn signed_node(method: &'static str) -> (Harness, PolicyFixture, DaemonPro
 
 /// Poll `endpoint`'s health until `want` accepts it, or fail with what was last seen.
 async fn health_until(endpoint: &str, what: &str, want: impl Fn(&Health) -> bool) -> Health {
-    let result = poll_until_async(rotation_deadline(), Duration::from_millis(50), || async {
+    health_within(rotation_deadline(), endpoint, what, want).await
+}
+
+/// [`health_until`] with an explicit bound.
+async fn health_within(
+    bound: Duration,
+    endpoint: &str,
+    what: &str,
+    want: impl Fn(&Health) -> bool,
+) -> Health {
+    let result = poll_until_async(bound, Duration::from_millis(50), || async {
         let payload = support::health(endpoint).await;
         want(&payload).then_some(payload)
     })
@@ -233,6 +267,8 @@ async fn m6_16_health_and_metrics_publish_the_signed_policy() {
         "retcd_policy_rollbacks_total",
         "retcd_policy_reload_failures_total",
         "retcd_break_glass_active",
+        "retcd_policy_floor_unreadable",
+        "retcd_policy_floor_unpersisted",
     ] {
         assert!(
             names.contains(&family),
@@ -570,7 +606,8 @@ async fn m6_21_convergence_completes_when_the_last_voter_reports() {
     fixtures[2].write(8, &V8_PREFIXES, &[]);
     for (index, process) in processes.iter().enumerate() {
         let node_id = harness.nodes[index].node_id;
-        health_until(
+        health_within(
+            convergence_deadline(),
             process.health_endpoint(),
             "every voter reports v8, so the narrowing ends",
             |h| h.policy_state.as_ref() == Some(&active_state(8)),

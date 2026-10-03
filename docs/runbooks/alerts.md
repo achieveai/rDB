@@ -48,6 +48,9 @@ numbers: almost every condition here is normal for a few seconds.
 | `retcd_tls_reload_failures_total` | `increase(...[15m]) > 0` | warning | [credential-rotation.md](credential-rotation.md) |
 | `retcd_backup_age_seconds` | `>` 2x the backup interval | warning | [backup-restore.md](backup-restore.md) |
 | `retcd_backup_age_seconds` | `> 48h` | critical | [backup-restore.md](backup-restore.md) |
+| `retcd_break_glass_active` | `== 1` | warning | [policy-break-glass.md](policy-break-glass.md) |
+| `retcd_policy_floor_unreadable` | `== 1` | warning | [policy-break-glass.md](policy-break-glass.md) |
+| `retcd_policy_floor_unpersisted` | `== 1` for 5m | warning | [policy-break-glass.md](policy-break-glass.md) |
 
 ## Notes on specific rows
 
@@ -76,6 +79,19 @@ the row is an absolute-value comparison. `rate()` and quantiles do not apply.
 
 **`retcd_gossip_reachable`** is a per-peer gauge. Alert on a peer you expect to exist; the
 series simply disappears for a peer that has been removed.
+
+**`retcd_break_glass_active`** reads 1 on a node still running with
+`--break-glass-policy-rollback`, which accepts any further rollback without a second decision.
+It is exported only under `authz.mode = "signed"`, and should read 1 only during an incident.
+Open [Alerting](policy-break-glass.md#alerting), and disarm by step 6 of the procedure there.
+
+**`retcd_policy_floor_unreadable`** and **`retcd_policy_floor_unpersisted`** each mean a node
+can accept a validly signed policy document older than the one it serves: the first for this
+whole boot, the second after its next restart. Both are exported only under
+`authz.mode = "signed"`. The first is set once at startup and never clears while the process
+runs, so it needs no `for:`. The second clears itself when a retried floor write lands; 5m is
+30 retries at the default 10 s poll. Open
+[The rollback floor gauges](policy-break-glass.md#the-rollback-floor-gauges).
 
 ## Alerts that cannot fire yet
 

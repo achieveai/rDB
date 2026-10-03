@@ -2065,8 +2065,16 @@ does not move: no contract file changed.** Seven rows landed, each against the l
   `BatchCompleted`" holds; the landed pump point is A's `Published`.
 - **M7A-90**: Q-4's `retention_cap_entries` landed as `transaction::dedup::RETENTION_CAP_ENTRIES`
   (65 536), the `dedup_cap` of `Limits::default()`. The row asserts the second disjunct:
-  `OVERLOADED` for every `Submit` past the cap, so `DedupIndex::len()` never exceeds it, and one
-  candidate per retained identity bounds P1's status entries to the same number. **It is over
+  `OVERLOADED` for every `Submit` of a new identity past the cap, so `DedupIndex::len()` never
+  exceeds it, and one candidate per retained identity bounds P1's status entries to the same
+  number. **Issue #3 delta (Gautam 2026-10-02, option A; supersedes A-R71's soft cap):** check 9
+  counts the index **plus** every admitted request not yet answered, queued or in flight, so the
+  cap is exact. A resend of an identity the index already holds adds no entry: it is exempt from
+  the dedup cap, even at a full index (ruling F1), and replays at step 11 after checks 5–8, but
+  it still counts against the queue cap (ruling F7). Pinned by T1's
+  `the_queue_cap_and_the_dedup_cap_are_exact`,
+  `a_retry_of_a_retained_request_is_not_counted_against_the_dedup_cap` and
+  `a_resend_at_a_full_dedup_index_replays_its_saved_answer`. **It is over
   the unit budget**: 3.5 s in an isolated debug build (about 12 s under a loaded gate), down from 236 s. The 236 s was quadratic, from
   `DedupIndex::older` scanning every entry on each admission. Under lead ruling **A-R76** the
   lookup now walks generations (one range probe and one point lookup each), with no change in

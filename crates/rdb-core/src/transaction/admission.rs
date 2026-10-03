@@ -169,8 +169,22 @@ pub fn admit(
     if let Some(error) = k.admission_refusal(partition) {
         return refuse(error);
     }
-    // 9. Room in the queue, and room in the dedup index (plan Q-4).
-    if k.queue_len() >= k.limits().queue_cap || k.dedup().len() >= k.limits().dedup_cap {
+    // 9. Room in the queue, and room in the dedup index (plan Q-4) for this request and every
+    //    one already admitted and not yet answered, queued or in flight: each may still retain
+    //    an entry. So the index never passes its cap (issue #3, Gautam 2026-10-02; supersedes
+    //    A-R71's soft cap). Neither does P1's status index, but only while its
+    //    `PubConfig::status_cap` is at least this `Limits::dedup_cap`: both default to
+    //    `RETENTION_CAP_ENTRIES`, and nothing here checks a configuration that lowers it. A resend
+    //    the index already holds adds no entry, so the dedup cap never refuses it, full or not
+    //    (ruling F1): step 11 replays its saved answer, after checks 5–8 as for any request.
+    let replays = k
+        .dedup()
+        .get(lineage.generation, req.affinity, req.identity)
+        .is_some();
+    let unanswered = k.queue_len() + usize::from(k.inflight().is_some());
+    if k.queue_len() >= k.limits().queue_cap
+        || (!replays && k.dedup().len() + unanswered >= k.limits().dedup_cap)
+    {
         return refuse(RdbError::Overloaded { partition });
     }
     // 10. Structure.

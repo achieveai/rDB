@@ -116,6 +116,7 @@ const html = `<!doctype html>
   --A1: #1d69df; --P1: #8a4fd6; --F1: #c5420e; --R1: #177e4f; --L1: #966319; --T1: #c2255c;
   --H1: #6b7280; --M1: #0e7490; --client: #0f766e; --env: #6b7280; --scenario: #475569; --probe: #7c3aed;
   --crash: #c92a2a; --restart: #277e38; --wired: #277e38; --unavail: #966319;
+  --mk-fg: #ffffff;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -123,6 +124,7 @@ const html = `<!doctype html>
     --A1: #6ea8ff; --P1: #c4a1ff; --F1: #ff9a66; --R1: #5fd39b; --L1: #f0c36a; --T1: #ff7aa8;
     --H1: #9aa4b2; --M1: #5fd0e6; --client: #4fd1c5; --env: #9aa4b2; --scenario: #94a3b8; --probe: #b79cff;
     --crash: #ff6b6b; --restart: #69db7c; --wired: #69db7c; --unavail: #f0c36a;
+    --mk-fg: #12151a;
   }
 }
 * { box-sizing: border-box; }
@@ -145,7 +147,7 @@ p, li { color: var(--muted); margin: 4px 0; }
 .band { text-align: left; border-left-style: dashed; }
 .m-scenario, .m-probe { border-left-style: dashed; }
 .rep, .boot { color: var(--muted); font-size: 11px; }
-.mk { display: inline-block; width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 50%; color: #fff; font-size: 12px; margin-right: 6px; vertical-align: middle; }
+.mk { display: inline-block; width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 50%; color: var(--mk-fg); font-size: 12px; margin-right: 6px; vertical-align: middle; }
 .mk.crash { background: var(--crash); }
 .mk.restart { background: var(--restart); }
 .cell.crash { outline: 2px solid var(--crash); }

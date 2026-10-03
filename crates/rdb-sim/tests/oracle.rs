@@ -1226,6 +1226,167 @@ fn m7v_91_pub_evidence_counts_only_the_ack_at_its_own_boot_config_and_generation
     }
 }
 
+/// Moves one fact on the paired `replication_ack` of a built M7V-91 trace, and on the
+/// publication's authority recheck when `recheck_epoch` is given.
+fn with_ack(
+    mut trace: Trace,
+    ack_config: Option<ConfigVersion>,
+    ack_epoch: Option<OwnerEpoch>,
+    recheck_epoch: Option<OwnerEpoch>,
+) -> Trace {
+    for event in &mut trace.events {
+        match &mut event.kind {
+            TraceKind::ReplicationAck {
+                config_version,
+                owner_epoch,
+                ..
+            } => {
+                *config_version = ack_config.unwrap_or(*config_version);
+                *owner_epoch = ack_epoch.unwrap_or(*owner_epoch);
+            }
+            TraceKind::AuthorityDecision { owner_epoch, .. } => {
+                *owner_epoch = recheck_epoch.unwrap_or(*owner_epoch);
+            }
+            _ => {}
+        }
+    }
+    trace
+}
+
+#[retcd_test]
+fn m7v_128_pub_evidence_never_counts_an_ack_under_a_config_the_partition_never_declared() {
+    support::preamble();
+    // Rule 4's other bound: `pinned_for` names a configuration the primary knows, so an ack
+    // past the newest one the partition declared is `StaleConfig`, never a copy (PR #1 R2-F002
+    // test round, probe config 99). n2's ack at the pin, moved to 99 with nothing declaring 99.
+    let undeclared = with_ack(
+        m7v_91_fixture("m7v-128-cv99", B1, ConfigVersion(4), GEN_1),
+        Some(ConfigVersion(99)),
+        None,
+        None,
+    );
+    let signature = violated(
+        &judge(&undeclared),
+        Invariant::Pub,
+        "required_copy_set_unsatisfied",
+    );
+    assert!(
+        signature.detail.contains("regular_acks_counted=0"),
+        "{}",
+        signature.detail
+    );
+
+    // The near-miss: the same ack under 99 after a `topology_change` and a `protection_state`
+    // declare 99 and keep every placement. The kernel admits it, so the oracle counts it.
+    let report = judge(&m7v_91_fixture(
+        "m7v-128-cv99-declared",
+        B1,
+        ConfigVersion(99),
+        GEN_1,
+    ));
+    proven(&report, Invariant::Pub);
+    assert!(report.is_clean(), "{:?}", report.violations());
+}
+
+#[retcd_test]
+fn m7v_129_pub_evidence_counts_only_an_ack_at_the_publishing_owner_epoch() {
+    support::preamble();
+    // Rule 3 of `ProgressTracker::rules_one_to_seven`: `ack.owner_epoch != lineage.owner_epoch`
+    // is `StaleEpoch`. The epoch the primary serves is the one its publication-gate decision
+    // names (the publish's `authority_recheck`), here 1. An ack at 2 or at 0 is not a copy.
+    for (case, epoch) in [("m7v-129-e2", OwnerEpoch(2)), ("m7v-129-e0", OwnerEpoch(0))] {
+        let moved = with_ack(
+            m7v_91_fixture(case, B1, ConfigVersion(4), GEN_1),
+            None,
+            Some(epoch),
+            None,
+        );
+        let signature = violated(
+            &judge(&moved),
+            Invariant::Pub,
+            "required_copy_set_unsatisfied",
+        );
+        assert!(
+            signature.detail.contains("regular_acks_counted=0"),
+            "{case}: {}",
+            signature.detail
+        );
+    }
+
+    // The near-miss: ack and recheck both at epoch 2. Equality with the served epoch is the
+    // rule, not a fixed epoch.
+    let both = with_ack(
+        m7v_91_fixture("m7v-129-e2-served", B1, ConfigVersion(4), GEN_1),
+        None,
+        Some(OwnerEpoch(2)),
+        Some(OwnerEpoch(2)),
+    );
+    let report = judge(&both);
+    proven(&report, Invariant::Pub);
+    assert!(report.is_clean(), "{:?}", report.violations());
+}
+
+#[retcd_test]
+fn m7v_130_auth_publish_whose_recheck_does_not_resolve_violates() {
+    support::preamble();
+    // PR #1 follow-ups review F-002 (lead ruling L-R183a). A publication rests on its
+    // publication-gate `authority_decision`, named by `authority_recheck`. A recheck that names
+    // no event, or an event that is not an `authority_decision`, resolves to nothing: INV-PUB
+    // then has no served epoch to hold rule 3 to (M7V-129), so the oracle must not read the
+    // publication as clean. With n2's ack at a stale epoch the old verdicts were both `Proven`.
+    let retarget = |mut trace: Trace, to: EventId| {
+        for event in &mut trace.events {
+            if let TraceKind::Publish {
+                authority_recheck, ..
+            } = &mut event.kind
+            {
+                *authority_recheck = to;
+            }
+        }
+        trace
+    };
+    for (label, ack_epoch) in [
+        ("stale-epoch ack", Some(OwnerEpoch(2))),
+        ("served-epoch ack", None),
+    ] {
+        let fixture = with_ack(
+            m7v_91_fixture("m7v-130", B1, ConfigVersion(4), GEN_1),
+            None,
+            ack_epoch,
+            None,
+        );
+        let ack = fixture
+            .events
+            .iter()
+            .find(|event| matches!(event.kind, TraceKind::ReplicationAck { .. }))
+            .map(|event| event.event_id)
+            .expect("the fixture acknowledges");
+        for (how, to) in [("dangling", EventId(9_999)), ("non-decision", ack)] {
+            let signature = violated(
+                &judge(&retarget(fixture.clone(), to)),
+                Invariant::Auth,
+                "publish_authority_recheck_unresolved",
+            );
+            assert!(
+                signature.detail.contains(&format!("event {}", to.0)),
+                "{label}, {how}: {}",
+                signature.detail
+            );
+        }
+    }
+
+    // The near-miss: the same publication with its recheck resolving to the `Valid` decision
+    // the fixture recorded is clean (M7V-129's near-miss, one fact apart).
+    let report = judge(&m7v_91_fixture(
+        "m7v-130-resolved",
+        B1,
+        ConfigVersion(4),
+        GEN_1,
+    ));
+    proven(&report, Invariant::Auth);
+    assert!(report.is_clean(), "{:?}", report.violations());
+}
+
 #[retcd_test]
 fn m7v_10_pub_ack_role_claim_mismatching_topology_violates() {
     support::preamble();

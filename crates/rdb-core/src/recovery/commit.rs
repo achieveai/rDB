@@ -21,6 +21,7 @@ use crate::authority::partition::PartitionRecord;
 use crate::contracts::authority::BlockReason;
 use crate::contracts::control::{CasOutcome, ControlEffect, ControlKey, ReadOutcome};
 use crate::contracts::ids::{ControlRequestId, OwnerEpoch, PartitionId, Revision};
+use crate::contracts::time::Tick;
 
 /// The first [`ControlRequestId`] F1 owns: F1's tag in bits 48..64, as for its timers
 /// ([`super::RECOVERY_TIMER_BASE`]). The sim offers every control answer to every module, and
@@ -76,21 +77,32 @@ pub(crate) struct Cas {
     rereading: bool,
     /// The request outstanding now: the CAS, then the re-read once a conflict asks for one.
     request: ControlRequestId,
+    /// When the exchange, the re-read included, is given up as `CasOutcome::Unknown` if no
+    /// answer has come (issue #2).
+    deadline: Tick,
 }
 
 impl Cas {
-    /// A proposal of `record` over ownership at `prior_epoch`, sent as `request`.
+    /// A proposal of `record` over ownership at `prior_epoch`, sent as `request`, unanswered at
+    /// `deadline` read as `Unknown`.
     pub(crate) const fn new(
         record: PartitionRecord,
         prior_epoch: OwnerEpoch,
         request: ControlRequestId,
+        deadline: Tick,
     ) -> Self {
         Self {
             record,
             prior_epoch,
             rereading: false,
             request,
+            deadline,
         }
+    }
+
+    /// When this exchange is given up if still unanswered.
+    pub(crate) const fn deadline(&self) -> Tick {
+        self.deadline
     }
 
     /// The control effect proposing this record, conditioned on `expected`.
@@ -124,7 +136,10 @@ impl Cas {
         *answered == key(self.record.partition) && is_read == self.rereading
     }
 
-    /// The four arms of a `CasResult`. Call only when [`Self::awaits`] it.
+    /// The four arms of a `CasResult`. Call only when [`Self::awaits`] it, or with the synthetic
+    /// `CasOutcome::Unknown` that `Recovery::lost_answer` makes of a fire at [`Self::deadline`]
+    /// (issue #2). That one can come while re-reading too, when `awaits` wants a `Value`; it
+    /// blocks with `ControlUnknown` and ends the exchange either way.
     pub(crate) fn on_result(&mut self, outcome: CasOutcome) -> CasStep {
         match outcome {
             CasOutcome::Committed(revision) => CasStep::Landed(revision),

@@ -3630,7 +3630,16 @@ impl Module for Authority {
         // over must fence before whatever else arrived on the same step is acted on. This is why
         // any event at all drives the expiry rows, and why a grant is never more than one step
         // past its expiry — see `revalidate`.
-        self.quiet = None;
+        //
+        // No reset of `quiet` here: one is enough, and it is the `take` after the routed match.
+        // Only routed arms set it, every routed path passes that `take` before it can return,
+        // and `supported` refuses before anything runs — so every step, `Ok` or `Err`, ends with
+        // it `None` (issue #17). A second clear here would hide a path that broke that rather
+        // than report it.
+        debug_assert!(
+            self.quiet.is_none(),
+            "authority: a previous step left quiet set"
+        );
         let was_held = self.state.is_held();
         let clock_before = self.clock;
         let mut effects = self.revalidate(ctx, event);
@@ -3665,6 +3674,9 @@ impl Module for Authority {
                 "authority: an event kind A1 does not take",
             )),
         };
+        // Taken here, before any exit, so no path — `Ok` or either `Err` below — leaves an arm's
+        // reason set past this step (PR #1 kernel round F-2). Only the `Ok` tail uses it.
+        let quiet = self.quiet.take();
         match routed {
             Ok(routed) => effects.extend(routed),
             // A kind A1 takes at the door but has no row for (a storage completion other than
@@ -3696,11 +3708,17 @@ impl Module for Authority {
         Self::supersede_deferrals(&mut effects, &proofs);
         effects.extend(proofs);
         // A no-op arm's answer, only if nothing else on the step answers the event (A-R24).
-        if let Some(reason) = self.quiet.take() {
+        if let Some(reason) = quiet {
             if effects.is_empty() {
                 effects.push(Self::ignored(event, reason));
             }
         }
+        // `quiet` was taken before the routed match, so an arm set after it — by `sweep`, say —
+        // would be dropped, its event never answered (issue #9, ruling F4).
+        debug_assert!(
+            self.quiet.is_none(),
+            "authority: an arm set quiet after the routed match"
+        );
         Ok(effects)
     }
 }

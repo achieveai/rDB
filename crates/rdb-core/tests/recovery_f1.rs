@@ -1296,7 +1296,7 @@ fn the_barrier_needs_every_required_copy_durable_at_the_cutoff() {
     assert_eq!(f1.rec(3_004, durable(B, 20, dg(0, 20))), not_durable);
     assert_eq!(
         f1.rec(3_005, durable(C, 20, dg(0, 20))),
-        vec![cas(CONTROL_REV, A)]
+        vec![cas(CONTROL_REV, A), arm(3, 3_005 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::Proposing);
 }
@@ -1311,9 +1311,13 @@ fn the_commit_cas_writes_a_serving_record_on_the_partition_key() {
         key,
         value: Some(body),
         ..
-    })) = f1.log.last()
+    })) = f1
+        .log
+        .iter()
+        .rev()
+        .find(|e| matches!(e, EffectKind::Control(_)))
     else {
-        panic!("the last effect is the CAS: {:?}", f1.log.last());
+        panic!("the last control effect is the CAS: {:?}", f1.log);
     };
     assert_eq!(*key, ControlKey::Partition(PARTITION));
     let written = PartitionRecord::decode(body).expect("A1's codec reads it");
@@ -1591,7 +1595,7 @@ fn two_survivors_both_must_be_durable() {
     );
     assert_eq!(
         f1.rec(3_001, durable(B, 20, dg(0, 20))),
-        vec![cas(CONTROL_REV, A)]
+        vec![cas(CONTROL_REV, A), arm(3, 3_001 + WINDOW)]
     );
     let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
     assert_eq!(result.mode, PartitionMode::DegradedRf2);
@@ -1652,12 +1656,12 @@ fn rebuild_activates_through_a_three_copy_barrier() {
             sync(A, 20),
             sync(B, 20),
             sync(C, 20),
-            arm(3, 4_000 + WINDOW)
+            arm(4, 4_000 + WINDOW)
         ]
     );
     assert_eq!(
         f1.rec(4_001, caught(C, 22)),
-        vec![sync(C, 20), arm(4, 4_001 + WINDOW)],
+        vec![sync(C, 20), arm(5, 4_001 + WINDOW)],
         "the point is pinned"
     );
     let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
@@ -1670,7 +1674,7 @@ fn rebuild_activates_through_a_three_copy_barrier() {
     );
     assert_eq!(
         f1.rec(4_103, durable(C, 20, dg(0, 20))),
-        vec![cas(Revision(9), A)]
+        vec![cas(Revision(9), A), arm(6, 4_103 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
     let result = recovered(&f1.step(4_200, cas_result(CasOutcome::Committed(Revision(11)))));
@@ -1984,18 +1988,18 @@ fn rebuild_asks_every_required_copy_to_prove_the_point() {
             sync(A, 22),
             sync(B, 22),
             sync(C, 22),
-            arm(3, 4_000 + WINDOW)
+            arm(4, 4_000 + WINDOW)
         ]
     );
     assert_eq!(
         f1.rec(4_001, caught_up(C, 22, dg(0, 22))),
-        vec![sync(C, 22), arm(4, 4_001 + WINDOW)]
+        vec![sync(C, 22), arm(5, 4_001 + WINDOW)]
     );
     f1.rec(4_100, durable(A, 22, dg(0, 22)));
     f1.rec(4_101, durable(B, 22, dg(0, 22)));
     assert_eq!(
         f1.rec(4_102, durable(C, 22, dg(0, 22))),
-        vec![cas(Revision(9), A)]
+        vec![cas(Revision(9), A), arm(6, 4_102 + WINDOW)]
     );
 }
 
@@ -2021,7 +2025,7 @@ fn the_rebuild_point_is_never_below_the_cutoff() {
             sync(A, 20),
             sync(B, 20),
             sync(C, 20),
-            arm(3, 4_200 + WINDOW)
+            arm(4, 4_200 + WINDOW)
         ]
     );
 }
@@ -2297,7 +2301,7 @@ fn tester_a_degraded_rf2_commit_rebuilds_the_third_copy() {
             sync(A, 20),
             sync(B, 20),
             sync(C, 20),
-            arm(3, 4_000 + WINDOW)
+            arm(4, 4_000 + WINDOW)
         ]
     );
 }
@@ -2392,7 +2396,7 @@ fn a_lost_copy_never_sets_the_rebuild_point() {
             sync(A, 20),
             sync(B, 20),
             sync(C, 20),
-            arm(3, 4_200 + WINDOW)
+            arm(4, 4_200 + WINDOW)
         ]
     );
 }
@@ -3134,7 +3138,7 @@ fn m7b_98_holder_that_cannot_lead_gets_catch_up_before_grant() {
     f1.rec(2_200, durable(B, 30, dg(0, 30)));
     assert_eq!(
         f1.rec(2_300, durable(C, 30, dg(0, 30))),
-        vec![cas(CONTROL_REV, C)]
+        vec![cas(CONTROL_REV, C), arm(3, 2_300 + WINDOW)]
     );
 }
 
@@ -3227,7 +3231,8 @@ fn m7b_103_try_new_rejects_a_proof_from_an_unknown_copy() {
 
 /// M7B-105 (D §5.1 "one CAS on `partitions/{id}`", ADR 0009 §5, ADR 0008): the proof that completes
 /// the barrier emits one control effect, the CAS on the partition key conditioned on the fence's
-/// revision, and the run never writes another key.
+/// revision, and the run never writes another key. The same step arms the timer that bounds the
+/// exchange (issue #2, M7B-240).
 #[retcd_test]
 fn m7b_105_commit_is_one_cas_on_the_partition_record() {
     let mut f1 = at_barrier(20);
@@ -3236,7 +3241,7 @@ fn m7b_105_commit_is_one_cas_on_the_partition_record() {
     }
     assert_eq!(
         f1.rec(3_001, durable(C, 20, dg(0, 20))),
-        vec![cas(CONTROL_REV, A)]
+        vec![cas(CONTROL_REV, A), arm(3, 3_001 + WINDOW)]
     );
     let keys: Vec<&ControlKey> = f1
         .log
@@ -3460,7 +3465,7 @@ fn a_arrives_in_collecting(a_arrives: RecoveryEvent) -> F1 {
     assert_eq!(f1.rec(3_001, durable(B, 500, dg(0, 500))), not_durable);
     assert_eq!(
         f1.rec(3_002, durable(C, 500, dg(0, 500))),
-        vec![cas(CONTROL_REV, A)]
+        vec![cas(CONTROL_REV, A), arm(3, 3_002 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::Proposing);
     let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
@@ -3610,7 +3615,7 @@ fn committed_without_c(
     );
     assert_eq!(
         f1.rec(3_001, durable(B, 20, dg(0, 20))),
-        vec![cas(CONTROL_REV, A)]
+        vec![cas(CONTROL_REV, A), arm(3, 3_001 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::Proposing);
     let effects = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
@@ -3848,7 +3853,7 @@ fn m7b_126_rebuilding_reaches_activation_only_through_try_new() {
         .contains(&sync(B, 20)));
     assert_eq!(
         f1.rec(4_001, caught_up(C, 20, dg(0, 20))),
-        vec![sync(C, 20), arm(4, 4_001 + WINDOW)]
+        vec![sync(C, 20), arm(5, 4_001 + WINDOW)]
     );
     let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
     let required = BTreeSet::from([A, B, C]);
@@ -3876,7 +3881,7 @@ fn m7b_126_rebuilding_reaches_activation_only_through_try_new() {
     assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
     assert_eq!(
         f1.rec(4_103, durable(C, 20, dg(0, 20))),
-        vec![cas(Revision(9), A)]
+        vec![cas(Revision(9), A), arm(6, 4_103 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
     let activated = recovered(&f1.step(4_200, cas_result(CasOutcome::Committed(Revision(11)))));
@@ -4220,8 +4225,8 @@ fn stalled(copy: CopyId) -> EffectKind {
     r(RecoveryEffect::RebuildStalled { copy })
 }
 
-/// The sync deadline: C's catch-up at 4_000 re-arms F1's one timer as version 3 (the fence armed
-/// 1, selection 2) at 4_000 plus the discovery window.
+/// The sync deadline: C's catch-up at 4_000 re-arms F1's one timer as version 4 (the fence armed
+/// 1, selection 2, the recovery CAS 3) at 4_000 plus the discovery window.
 const SYNC_DEADLINE: u64 = 4_000 + WINDOW;
 
 /// M7B-153/154's fixture: a `DegradedRf2` commit (A and B hold 20, C failed) in `Rebuilding`.
@@ -4237,7 +4242,7 @@ fn rebuilding_while_c_syncs() -> F1 {
     assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
     assert_eq!(
         f1.rec(4_000, caught_up(C, 20, dg(0, 20))),
-        vec![sync(A, 20), sync(B, 20), sync(C, 20), arm(3, SYNC_DEADLINE)]
+        vec![sync(A, 20), sync(B, 20), sync(C, 20), arm(4, SYNC_DEADLINE)]
     );
     let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
     assert_eq!(f1.rec(4_100, durable(A, 20, dg(0, 20))), not_durable);
@@ -4259,9 +4264,9 @@ fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
     let everyone = BTreeSet::from([A, B, C]);
     let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
     let mut f1 = rebuilding_while_c_syncs();
-    assert_eq!(f1.step(SYNC_DEADLINE - 1, fired(3)), stale, "not yet due");
-    assert_eq!(f1.step(SYNC_DEADLINE, fired(2)), stale, "an older version");
-    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), vec![stalled(C)]);
+    assert_eq!(f1.step(SYNC_DEADLINE - 1, fired(4)), stale, "not yet due");
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), stale, "an older version");
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(4)), vec![stalled(C)]);
     assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
     assert_eq!(f1.module.rebuild_required(), Some(&everyone));
     assert_eq!(
@@ -4270,7 +4275,7 @@ fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
         "mode not moved"
     );
     assert_eq!(
-        f1.step(SYNC_DEADLINE + 1, fired(3)),
+        f1.step(SYNC_DEADLINE + 1, fired(4)),
         stale,
         "the deadline is spent"
     );
@@ -4278,15 +4283,15 @@ fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
     // A later catch-up re-syncs C under a fresh deadline, which stalls again unanswered.
     assert_eq!(
         f1.rec(7_000, caught_up(C, 20, dg(0, 20))),
-        vec![sync(C, 20), arm(4, 7_000 + WINDOW)]
+        vec![sync(C, 20), arm(5, 7_000 + WINDOW)]
     );
-    assert_eq!(f1.step(7_000 + WINDOW, fired(4)), vec![stalled(C)]);
+    assert_eq!(f1.step(7_000 + WINDOW, fired(5)), vec![stalled(C)]);
     assert_eq!(f1.module.rebuild_required(), Some(&everyone));
 
     // §5.6a: the stall is a report, not a loss. C's late proof completes the barrier.
     assert_eq!(
         f1.rec(9_500, durable(C, 20, dg(0, 20))),
-        vec![cas(Revision(9), A)]
+        vec![cas(Revision(9), A), arm(6, 9_500 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
     assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 2);
@@ -4295,11 +4300,11 @@ fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
     let mut f1 = lone_committed();
     assert_eq!(
         f1.rec(4_000, caught_up(B, 20, dg(0, 20))),
-        vec![sync(A, 20), sync(B, 20), sync(C, 20), arm(3, SYNC_DEADLINE)]
+        vec![sync(A, 20), sync(B, 20), sync(C, 20), arm(4, SYNC_DEADLINE)]
     );
     f1.rec(4_100, durable(A, 20, dg(0, 20)));
     assert_eq!(
-        f1.step(SYNC_DEADLINE, fired(3)),
+        f1.step(SYNC_DEADLINE, fired(4)),
         vec![stalled(B), stalled(C)]
     );
     assert_eq!(f1.module.rebuild_required(), Some(&everyone));
@@ -4309,7 +4314,7 @@ fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
     f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
     f1.rec(4_100, durable(A, 20, dg(0, 20)));
     assert_eq!(f1.step(4_200, lose(B)), vec![stalled(B)]);
-    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), vec![stalled(C)]);
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(4)), vec![stalled(C)]);
     assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 2);
     assert_eq!(f1.module.rebuild_required(), Some(&everyone));
 
@@ -4320,7 +4325,7 @@ fn m7b_153_a_rebuild_sync_that_never_answers_stalls_by_name() {
     f1.rec(4_100, durable(A, 20, dg(0, 20)));
     f1.rec(4_101, durable(B, 20, dg(0, 20)));
     assert_eq!(f1.step(4_200, lose(C)), vec![stalled(C)]);
-    assert_eq!(f1.step(SYNC_DEADLINE, fired(3)), stale);
+    assert_eq!(f1.step(SYNC_DEADLINE, fired(4)), stale);
     assert_eq!(f1.log.iter().filter(|e| is_stalled(e)).count(), 1);
     assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
 }
@@ -4333,11 +4338,11 @@ fn m7b_154_a_sync_answered_before_its_deadline_makes_the_timer_stale() {
     let mut f1 = rebuilding_while_c_syncs();
     assert_eq!(
         f1.rec(SYNC_DEADLINE - 1, durable(C, 20, dg(0, 20))),
-        vec![cas(Revision(9), A)]
+        vec![cas(Revision(9), A), arm(5, SYNC_DEADLINE - 1 + WINDOW)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
     assert_eq!(
-        f1.step(SYNC_DEADLINE, fired(3)),
+        f1.step(SYNC_DEADLINE, fired(4)),
         vec![ign(ReplicaIgnoreReason::StaleTimer)]
     );
     assert_eq!(f1.phase(), RecoveryPhase::ActivationProposed);
@@ -4573,7 +4578,7 @@ fn m7b_112_degraded_rf2_requires_both_copies_losing_either_stops_writes() {
         f1.rec(3_000, durable(B, 20, dg(0, 20)));
         assert_eq!(
             f1.rec(3_001, durable(C, 20, dg(0, 20))),
-            vec![cas(CONTROL_REV, primary)]
+            vec![cas(CONTROL_REV, primary), arm(3, 3_001 + WINDOW)]
         );
         let result = recovered(&f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9)))));
         assert_eq!(result.mode, PartitionMode::DegradedRf2);
@@ -4870,7 +4875,7 @@ fn m7b_138_holder_that_cannot_lead_transfers_under_a_credential_naming_the_holde
     f1.rec(6_200, durable(D, 30, dg(0, 30)));
     assert_eq!(
         f1.rec(6_300, durable(C, 30, dg(0, 30))),
-        vec![cas(CONTROL_REV, C)]
+        vec![cas(CONTROL_REV, C), arm(3, 6_300 + WINDOW)]
     );
 }
 
@@ -4894,7 +4899,7 @@ fn later_fence() -> FencingProof {
     }
 }
 
-/// Rebuilding, with every rebuild sync answered: the activation CAS is in flight (timer at v3).
+/// Rebuilding, with every rebuild sync answered: the activation CAS is in flight (timer at v5).
 fn activation_proposed() -> F1 {
     let mut f1 = lone_committed();
     f1.rec(4_000, caught_up(B, 20, dg(0, 20)));
@@ -4917,10 +4922,10 @@ fn after_commit() -> Vec<(&'static str, F1, u64)> {
     activated.step(4_200, cas_result(CasOutcome::Committed(Revision(11))));
     assert_eq!(activated.phase(), RecoveryPhase::Committed);
     vec![
-        ("committed active", active, 2),
-        ("rebuilding", rebuilding, 2),
-        ("activation proposed", activation_proposed(), 3),
-        ("active after rebuild", activated, 3),
+        ("committed active", active, 3),
+        ("rebuilding", rebuilding, 3),
+        ("activation proposed", activation_proposed(), 5),
+        ("active after rebuild", activated, 5),
     ]
 }
 
@@ -5093,7 +5098,8 @@ fn m7b_228_a_stale_or_equal_fence_after_commit_is_ignored() {
 /// cutoff that proves nothing and displaces nothing. The second run commits exactly what a fresh
 /// instance commits. Update (B-R74b): the fixture is `Rebuilding` with every rebuild sync
 /// outstanding; from `ActivationProposed` a fence is held until the activation answer, so no
-/// answer of the first run's can arrive after re-entry (M7B-230).
+/// answer of the first run's can arrive after re-entry (M7B-230) unless the exchange's deadline
+/// released it first, and then that answer is `UnmatchedCompletion` (issue #2, M7B-240).
 #[retcd_test]
 fn m7b_229_a_late_event_from_the_first_run_does_not_touch_the_second() {
     let (_, fresh_result) = fresh_second_run();
@@ -5121,7 +5127,7 @@ fn m7b_229_a_late_event_from_the_first_run_does_not_touch_the_second() {
     for copy in [A, B, C] {
         f1.report(t + 10, on_new_root(copy, 30));
     }
-    for version in 1..=3 {
+    for version in 1..=4 {
         assert_eq!(
             f1.step(t + WINDOW, fired(version)),
             vec![ign(ReplicaIgnoreReason::StaleTimer)],
@@ -5129,7 +5135,7 @@ fn m7b_229_a_late_event_from_the_first_run_does_not_touch_the_second() {
         );
     }
     assert_eq!(f1.phase(), RecoveryPhase::Collecting);
-    let close = f1.step(t + WINDOW, fired(4));
+    let close = f1.step(t + WINDOW, fired(5));
     assert!(has_selected(&close), "{close:?}");
     assert_eq!(f1.phase(), RecoveryPhase::Barrier);
 
@@ -5151,10 +5157,16 @@ fn m7b_229_a_late_event_from_the_first_run_does_not_touch_the_second() {
     assert!(
         matches!(
             proposed.as_slice(),
-            [EffectKind::Control(ControlEffect::Cas {
-                expected: Some(Revision(12)),
-                ..
-            })]
+            [
+                EffectKind::Control(ControlEffect::Cas {
+                    expected: Some(Revision(12)),
+                    ..
+                }),
+                EffectKind::Timer(TimerEffect::Arm {
+                    version: TimerVersion(7),
+                    ..
+                })
+            ]
         ),
         "A's proof at 30 still stands: {proposed:?}"
     );
@@ -5225,13 +5237,13 @@ fn held_behind_activation() -> F1 {
     f1
 }
 
-/// The re-entry `fence()` gives at `at`, armed at v4 (the first run armed v3).
+/// The re-entry `fence()` gives at `at`, armed at v6 (the first run armed v5).
 fn re_entry(at: u64) -> Vec<EffectKind> {
     vec![
         r(RecoveryEffect::QueryInventory {
             copies: vec![A, B, C],
         }),
-        arm(4, at + WINDOW),
+        arm(6, at + WINDOW),
     ]
 }
 
@@ -5241,8 +5253,9 @@ fn re_entry(at: u64) -> Vec<EffectKind> {
 /// through the door of the phase the answer left: `Committed` (landed), `Blocked` (`Unknown`), and
 /// `Blocked{OvertakenByPeer}` after a `Conflict` and its re-read (the exchange ends at the re-read,
 /// not at the `Conflict`, so no request of the first run is left outstanding). The second run is a
-/// fresh one. If no answer ever arrives (ADR 0008 item 8, `DropCompletion`), the fence stays held,
-/// which is no worse than before B-R74, when it was ignored; no timer bounds it.
+/// fresh one. If no answer ever arrives (ADR 0008 item 8, `DropCompletion`), the exchange's deadline
+/// ends it as `Unknown` and the fence re-enters then (issue #2, Gautam 2026-10-02, superseding
+/// B-R74b's "no timer bounds it"; M7B-240).
 #[retcd_test]
 fn m7b_230_a_newer_fence_behind_an_activation_waits_for_its_answer() {
     let (fresh_steps, fresh_result) = fresh_second_run();
@@ -5353,6 +5366,9 @@ fn m7b_231_a_held_fence_is_replaced_only_by_a_newer_one() {
 /// M7B-232 (B-R74b, Gautam 2026-09-27): nothing but the end of the activation exchange lets a
 /// held fence in. Every other F1 input is answered as `ActivationProposed` answers it today, with
 /// no inventory query and no re-armed discovery; a control answer F1 did not ask for is declined.
+/// Update (issue #2, Gautam 2026-10-02): the end of the exchange is its answer **or its deadline**.
+/// The first run's earlier timers (v1..v4) are still `StaleTimer`; the activation's own timer (v5)
+/// at its deadline ends the exchange as `Unknown`, which M7B-240 pins, so it is not fired here.
 #[retcd_test]
 fn m7b_232_no_re_entry_while_a_fence_is_held() {
     let mut f1 = held_behind_activation();
@@ -5366,7 +5382,7 @@ fn m7b_232_no_re_entry_while_a_fence_is_held() {
         assert_eq!(
             f1.step(t + WINDOW, fired(version)),
             vec![ign(ReplicaIgnoreReason::StaleTimer)],
-            "v{version}"
+            "v{version}: a timer older than the activation's own"
         );
     }
     assert_eq!(
@@ -5405,11 +5421,15 @@ fn m7b_232_no_re_entry_while_a_fence_is_held() {
 // clauses of B-R74a/B-R74b that were right but unpinned.
 // ---------------------------------------------------------------------------------------------
 
-/// `effects` is exactly one activation CAS expecting `expected`.
+/// `effects` is exactly one activation CAS expecting `expected`, and the arm of the timer that
+/// bounds it (issue #2, M7B-240).
 fn is_activation_cas(effects: &[EffectKind], expected: Revision) -> bool {
     matches!(
         effects,
-        [EffectKind::Control(ControlEffect::Cas { expected: Some(at), .. })] if *at == expected
+        [
+            EffectKind::Control(ControlEffect::Cas { expected: Some(at), .. }),
+            EffectKind::Timer(TimerEffect::Arm { id, .. }),
+        ] if *at == expected && *id == DISCOVERY_TIMER
     )
 }
 
@@ -5445,7 +5465,7 @@ fn second_rebuild() -> F1 {
             sync(A, 30),
             sync(B, 30),
             sync(C, 30),
-            arm(version + 2, t + WINDOW + 300 + WINDOW)
+            arm(version + 3, t + WINDOW + 300 + WINDOW)
         ],
         "the second rebuild's point is 30"
     );
@@ -5968,5 +5988,111 @@ fn m7b_239_an_earlier_requests_answer_is_not_the_activation_reread() {
         f1.step(4_300, read_result(found())),
         vec![block(BlockReason::OvertakenByPeer)],
         "M7B-239: the re-read's own answer decides the run"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Issue #2 (F003; Gautam 2026-10-02, supersedes B-R74b's "no timer bounds it"): every CAS
+// exchange F1 opens is bounded by the discovery timer (M7B-240).
+// ---------------------------------------------------------------------------------------------
+
+/// M7B-240 (issue #2, Gautam 2026-10-02; supersedes B-R74b's unbounded hold): the recovery CAS
+/// and the activation CAS each arm the discovery timer when they are sent. If no answer has come
+/// by its deadline (ADR 0008 item 8, `DropCompletion`), the expiry is read as `CasOutcome::Unknown`:
+/// `BlockPromotion{ControlUnknown}`, and a fence held behind the activation re-enters in the same
+/// step, as M7B-230's `Unknown` arm does. A completion arriving after that is the late answer to
+/// an exchange already decided: `UnmatchedCompletion`, nothing moves. A fire before the deadline,
+/// or of an earlier version, is still `StaleTimer`. A conflict's re-read is inside the same bound.
+#[retcd_test]
+fn m7b_240_a_lost_cas_completion_is_bounded_by_the_discovery_timer() {
+    let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
+
+    // Activation, with a newer fence held behind it.
+    let (fresh_steps, fresh_result) = fresh_second_run();
+    let sent = activation_proposed();
+    let deadline = 4_100 + WINDOW;
+    assert_eq!(
+        sent.log.last(),
+        Some(&arm(5, deadline)),
+        "M7B-240: the activation CAS arms the timer"
+    );
+    let mut f1 = held_behind_activation();
+    let t = REFENCE_AT;
+    assert_eq!(f1.step(t, fired(4)), stale, "M7B-240: an earlier version");
+    let mut early = activation_proposed();
+    assert_eq!(
+        early.step(deadline - 1, fired(5)),
+        stale,
+        "M7B-240: before the deadline"
+    );
+    assert_eq!(early.phase(), RecoveryPhase::ActivationProposed);
+    let mut expected = vec![block(BlockReason::ControlUnknown)];
+    expected.extend(re_entry(t));
+    assert_eq!(
+        f1.step(t, fired(5)),
+        expected,
+        "M7B-240: expiry is Unknown, and the held fence re-enters"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+    f1.ignores_late(t + 1, cas_result(CasOutcome::Committed(Revision(11))));
+    let (steps, result) = second_run(&mut f1);
+    assert_eq!(steps, fresh_steps, "M7B-240: the second run is a fresh one");
+    assert_eq!(result, fresh_result, "M7B-240");
+
+    // Activation with nothing held: blocked, and only a fresh fence moves it.
+    let mut f1 = activation_proposed();
+    assert_eq!(
+        f1.step(deadline, fired(5)),
+        vec![block(BlockReason::ControlUnknown)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
+    );
+    f1.ignores_late(
+        deadline + 1,
+        cas_result(CasOutcome::Committed(Revision(11))),
+    );
+
+    // The recovery CAS.
+    let mut f1 = proposing(20);
+    let deadline = 3_000 + WINDOW;
+    assert_eq!(
+        f1.log.last(),
+        Some(&arm(3, deadline)),
+        "M7B-240: the recovery CAS arms the timer"
+    );
+    assert_eq!(f1.step(deadline - 1, fired(3)), stale);
+    assert_eq!(f1.step(deadline, fired(2)), stale);
+    assert_eq!(f1.phase(), RecoveryPhase::Proposing);
+    assert_eq!(
+        f1.step(deadline, fired(3)),
+        vec![block(BlockReason::ControlUnknown)],
+        "M7B-240: expiry is Unknown"
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
+    );
+    f1.ignores_late(deadline + 1, cas_result(CasOutcome::Committed(Revision(9))));
+    assert_eq!(f1.cas_count(), 1, "M7B-240: never re-proposed");
+
+    // A conflict's re-read is inside the same exchange and the same bound.
+    let mut f1 = proposing(20);
+    f1.step(
+        3_100,
+        cas_result(CasOutcome::Conflict {
+            exists: true,
+            current: Revision(6),
+        }),
+    );
+    assert_eq!(
+        f1.step(deadline, fired(3)),
+        vec![block(BlockReason::ControlUnknown)],
+        "M7B-240: an unanswered re-read is bounded too"
+    );
+    f1.ignores_late(
+        deadline + 1,
+        read_result(ReadOutcome::Absent { as_of: Revision(6) }),
     );
 }

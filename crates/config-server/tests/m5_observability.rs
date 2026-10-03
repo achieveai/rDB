@@ -32,8 +32,8 @@ use config_log::retcd_test;
 use config_testkit::poll::{poll_until_async, Timeout};
 
 use support::{
-    daemon, deadline, startup_deadline, DaemonProcess, Harness, Health, NodeOptions, PRINCIPAL,
-    UNLISTED_PRINCIPAL,
+    daemon, deadline, startup_deadline, DaemonProcess, Harness, Health, NodeOptions, PolicyFixture,
+    PRINCIPAL, UNLISTED_PRINCIPAL,
 };
 
 // =====================================================================================
@@ -607,10 +607,26 @@ fn m5_116_every_alert_names_an_existing_runbook_and_metric() {
 
 /// The alerts table must not quietly omit the surfaces M5 built. A runbook set that covers only
 /// the easy metrics is the failure mode this row exists for.
+///
+/// A row means a line of the `## Alert table`, not a mention anywhere in the file: the notes
+/// below the table name the policy gauges too, so a whole-file search passed with their rows
+/// deleted (issue #13).
 #[test]
 fn m5_116_alerts_cover_the_m5_surfaces() {
     let alerts = std::fs::read_to_string(repo_root().join("docs/runbooks/alerts.md"))
         .expect("alerts.md must exist");
+    let table = alerts
+        .split("## Alert table")
+        .nth(1)
+        .expect("alerts.md has an `## Alert table` heading")
+        .split("\n## ")
+        .next()
+        .expect("the alert table ends at the next heading");
+    let rows: BTreeSet<&str> = table
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|rest| rest.split('`').next())
+        .collect();
     for required in [
         "retcd_snapshot_installs_total",
         "retcd_raft_peer_lag",
@@ -618,10 +634,14 @@ fn m5_116_alerts_cover_the_m5_surfaces() {
         "retcd_dedup_evictions_total",
         "retcd_cert_expiry_seconds",
         "retcd_backup_age_seconds",
+        // Signed mode only (ADR-0027): break glass left armed, and the two rollback-floor gaps.
+        "retcd_break_glass_active",
+        "retcd_policy_floor_unreadable",
+        "retcd_policy_floor_unpersisted",
     ] {
         assert!(
-            alerts.contains(required),
-            "alerts.md has no row for {required}"
+            rows.contains(required),
+            "alerts.md's alert table has no row for {required}"
         );
     }
 }
@@ -819,12 +839,14 @@ const NOT_EXPORTED: [&str; 9] = [
 /// deployment that never opted into signed policy on the same dashboard panel as one whose
 /// document failed to load. Listing them here rather than in `NOT_EXPORTED` keeps that
 /// distinction readable: these are conditional, those are unimplemented.
-const SIGNED_MODE_ONLY: [&str; 5] = [
+const SIGNED_MODE_ONLY: [&str; 7] = [
     "retcd_policy_version",
     "retcd_policy_converged_version",
     "retcd_policy_rollbacks_total",
     "retcd_policy_reload_failures_total",
     "retcd_break_glass_active",
+    "retcd_policy_floor_unreadable",
+    "retcd_policy_floor_unpersisted",
 ];
 
 /// Series the exporter emits that ADR-0026's table does not list (note item 3). Each is a value
@@ -977,6 +999,87 @@ async fn m5_110_required_metric_names_are_present() {
             bodies[leader]
         );
     }
+}
+
+/// M5-110, signed half (issue #13, review F-005): a signed-mode node exports exactly what
+/// ADR-0026's table lists, and every [`SIGNED_MODE_ONLY`] row matches its family's type and labels.
+///
+/// The static half above subtracts [`SIGNED_MODE_ONLY`] from its comparison, and `m6_16` in
+/// `m6_rbac.rs` checks names it spells itself, so before this row an ADR-0026 policy row could be
+/// deleted or retyped and nothing turned red. One voter is enough: the policy families are
+/// per-node gauges and counters, and every one of them is seeded, so each has a sample to read.
+#[retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m5_110_signed_mode_rows_match_the_exporter() {
+    const METHOD: &str = "m5_110_signed_mode_rows_match_the_exporter";
+
+    let harness = Harness::with_nodes(METHOD, &[1]).await;
+    let fixture = PolicyFixture::new(harness.root());
+    // Written before the node starts, so the startup load adopts it and no poll is involved.
+    fixture.write(4, &[""], &["root"]);
+    let options = NodeOptions {
+        policy: None,
+        signed_policy: Some(fixture.authz(1)),
+        ..harness.node_options()
+    };
+    harness.write_node_files(&harness.nodes[0], &options);
+    let mut spec = harness.spec(0);
+    spec.form = true;
+    let mut process = DaemonProcess::spawn(spec);
+    process
+        .wait_ready(startup_deadline())
+        .unwrap_or_else(|e| panic!("the daemon never announced itself: {e}"));
+    let health = wait_formed(std::slice::from_ref(&process)).await;
+    assert_eq!(health[0].policy_version, Some(4), "{:#?}", health[0]);
+
+    let body = scrape(&process).await;
+    let declared = declared_families(&body);
+    let table = adr_metric_table();
+    let mut expected: BTreeSet<String> = table
+        .iter()
+        .map(|(name, _, _)| name.clone())
+        .filter(|name| !NOT_EXPORTED.contains(&name.as_str()))
+        .collect();
+    expected.extend(EXTRA_EXPORTED.iter().map(|s| (*s).to_string()));
+    let got: BTreeSet<String> = declared.keys().cloned().collect();
+    assert_eq!(
+        got,
+        expected,
+        "a signed-mode node's families and ADR-0026's table have diverged.\n  missing: {:?}\n  \
+         undocumented: {:?}",
+        expected.difference(&got).collect::<Vec<_>>(),
+        got.difference(&expected).collect::<Vec<_>>()
+    );
+
+    for name in SIGNED_MODE_ONLY {
+        let (_, kind, labels) = table
+            .iter()
+            .find(|(row, _, _)| row == name)
+            .unwrap_or_else(|| panic!("ADR-0026 has no row for {name}"));
+        assert_eq!(
+            declared.get(name),
+            Some(kind),
+            "{name}: the exporter's type and ADR-0026's differ"
+        );
+        // Exact, not a subset: every sample carries exactly the labels the row documents, which
+        // is what an alert rule written from the ADR selects on.
+        let want: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+        let mut sampled = false;
+        for (_, label_set, _) in samples(&body).iter().filter(|(n, _, _)| n == name) {
+            sampled = true;
+            let seen: BTreeSet<&str> = label_set
+                .split(',')
+                .map(|pair| pair.split_once('=').expect("a label is name=value").0)
+                .collect();
+            assert_eq!(
+                seen, want,
+                "{name}: a sample's labels and ADR-0026's differ"
+            );
+        }
+        assert!(sampled, "{name} is declared but has no sample:\n{body}");
+    }
+
+    process.stop_gracefully(startup_deadline()).await;
+    drop(harness);
 }
 
 /// M5-111: the values move when the thing they count happens, and no counter goes backwards.
