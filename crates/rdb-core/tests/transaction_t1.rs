@@ -3190,9 +3190,11 @@ fn delete_at(k: &[u8]) -> Mutation {
 /// Scenario: a caller sends one request that writes key K twice. ADR-rdb-0013 open item O5:
 /// check 10 refuses it `INVALID_ARGUMENT` naming `mutations`, with no check asked, nothing
 /// written, nothing retained and `next_seq` unmoved, and a retry gets the same answer. Two `Put`s
-/// are refused, and so is a `Put` with a `Delete` in either order. The next request runs.
+/// are refused, and so is a `Put` with a `Delete` in either order. The repeated key need not be
+/// the first one: `[put a, put k, delete k]` is refused too (tester F1: a check that compared
+/// only the first key with the rest passed every other case). The next request runs.
 ///
-/// Regression. On fe50411 all three were admitted and the batch carried both writes in request
+/// Regression. On fe50411 all of these were admitted and the batch carried both writes in request
 /// order, so the last one won: walked on `rdb-sim`'s A1/P1 fixture, two `Put`s published at
 /// seq 12 on all three copies and a read of K served the second value, and `Put` then `Delete`
 /// published and left K absent.
@@ -3211,6 +3213,10 @@ fn check_ten_refuses_a_request_that_writes_one_key_twice() {
         (
             3,
             vec![delete_at(b"k"), put_at(b"a", b"1"), put_at(b"k", b"2")],
+        ),
+        (
+            4,
+            vec![put_at(b"a", b"1"), put_at(b"k", b"2"), delete_at(b"k")],
         ),
     ];
     for (request, mutations) in cases {
@@ -3269,6 +3275,8 @@ fn check_ten_counts_only_mutations_when_it_looks_for_one_key_twice() {
 /// "First failure wins". O5's refusal is part of check 10's structure, and check 10 runs its
 /// structure before the record's bytes (spec §4.2's two limits, the count first), so:
 /// - over the 1 MiB record cap as well: `mutations`, not `envelope_bytes`;
+/// - more than `MAX_CONDITIONS` conditions as well: `mutations`, not `conditions` (the key
+///   check runs after the mutation count and before the conditions count);
 /// - a condition that fails as well: `mutations`, not `CONDITION_FAILED` (check 12);
 /// - a resend under a request id the index already holds: `mutations`, not `REQUEST_ID_REUSE`
 ///   (check 11), and nothing retained.
@@ -3280,6 +3288,14 @@ fn one_key_written_twice_is_refused_before_the_byte_cap_dedup_and_conditions() {
     let mut oversized = put_sized(1, MAX_ENVELOPE_BYTES);
     oversized.mutations.push(put_at(b"big", b"2"));
     assert_eq!(h.step(submit(oversized)), refused(1), "over the byte cap");
+
+    let mut too_many_conditions = writes(4, vec![put_at(b"k", b"1"), put_at(b"k", b"2")]);
+    too_many_conditions.conditions = vec![Condition::Absent { key: key(b"c") }; MAX_CONDITIONS + 1];
+    assert_eq!(
+        h.step(submit(too_many_conditions)),
+        refused(4),
+        "over the conditions cap"
+    );
 
     let mut condition_fails = writes(2, vec![put_at(b"k", b"1"), put_at(b"k", b"2")]);
     condition_fails.conditions.push(Condition::Present {
