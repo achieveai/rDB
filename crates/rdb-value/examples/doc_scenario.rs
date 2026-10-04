@@ -1142,7 +1142,9 @@ fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
     })
 }
 
-/// Every write in a compiled line reads back (see [`load_compiled`]). A refusal names the key.
+/// Every write in a compiled line reads back (see [`load_compiled`]): every key parses, every
+/// element write has its root written beside it, and every `Put` reads back through the
+/// library. A refusal names the key.
 fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
     // Every `Put` at version 1, so each one is read the way it would be once applied.
     let mut written = MapSnapshot::new(Generation(1));
@@ -1152,15 +1154,19 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
         }
     }
     for mutation in mutations {
-        let Mutation::Put { key, value, .. } = mutation else {
-            continue;
+        let (key, value) = match mutation {
+            Mutation::Put { key, value, .. } => (key, Some(value)),
+            Mutation::Delete { key, .. } => (key, None),
         };
         let keyed = |f: Failure| f.with(vec![("key_hex", json_str(&hex::encode(key)))]);
         let parsed = keys::parse(key)
             .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Key(e)))))?;
         let root = parsed.root();
         match (parsed.sub, &parsed.element) {
+            // A root `Delete` (a drop) has nothing more to read.
+            (Sub::Root, _) if value.is_none() => {}
             (Sub::Root, _) => {
+                let value = value.expect("a Put");
                 let opened = envelope::open(value)
                     .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Envelope(e)))))?;
                 if opened.kind == Kind::Document {
@@ -1169,6 +1175,8 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                     coll::collection(&written, &root).map_err(|e| keyed(e.into()))?;
                 }
             }
+            // An element write of either kind keeps its root in step, so it needs the root
+            // written beside it (tester A1).
             (Sub::Element, Some(element)) => {
                 if written.version(Namespace::User, root.as_bytes()).is_none() {
                     return Err(keyed(Failure::usage(
@@ -1176,7 +1184,9 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                          (ADR-rdb-0013 §10)",
                     )));
                 }
-                coll::member(&written, &root, element).map_err(|e| keyed(e.into()))?;
+                if value.is_some() {
+                    coll::member(&written, &root, element).map_err(|e| keyed(e.into()))?;
+                }
             }
             (Sub::Element, None) => {
                 return Err(Failure::store("an element key parsed without an element"))
@@ -1618,6 +1628,47 @@ mod tests {
             assert_eq!(object_id(&show_id(id)).expect("parses"), id, "{id:?}");
         }
         assert_eq!(show_id(b"user:1"), "user:1");
+    }
+
+    /// A1 (tester-m8-s3, basis a26d9d9): `apply` refused an element `Put` without its root's
+    /// write but applied an element `Delete` without one, so the root's count went stale. Every
+    /// element write, `Delete` included, needs its root written in the same line (ADR-rdb-0013
+    /// §10), and the store is unchanged.
+    #[test]
+    fn a1_apply_refuses_an_element_delete_without_its_root_write() {
+        let dir = scratch("a1");
+        let store = dir.join("s.jsonl");
+        coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["cart", "--absent", "put", "\"banana\"", "5"]),
+        )
+        .expect("put");
+        let banana = keys::element_key(&root_of("cart").unwrap(), &Value::Text("banana".into()))
+            .expect("key");
+        let line = format!(
+            "{{\"cmd\":\"compile\",\"conditions\":[],\"mutations\":[{{\"op\":\"Delete\",\
+             \"key_hex\":\"{}\",\"expected_version\":null}}]}}",
+            hex::encode(banana)
+        );
+        let file = dir.join("c.json");
+        std::fs::write(&file, line).expect("write");
+        let before = std::fs::read(&store).expect("store");
+
+        let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+        assert_eq!(
+            (err.exit, err.error.as_str()),
+            (2, "Usage"),
+            "{}",
+            err.detail
+        );
+        assert!(err.detail.contains("root write"), "{}", err.detail);
+        assert_eq!(
+            std::fs::read(&store).expect("store"),
+            before,
+            "store unchanged"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
     }
 
     // ---- PR #23 review: F-001 bounded reads, F-002 a validated `apply` ---------------------

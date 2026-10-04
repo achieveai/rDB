@@ -298,10 +298,19 @@ pub fn compile_collection(
             }
         }
     }
-    // More removed than the root counts: elements exist that the root does not account for.
-    let count = (count_before + added)
-        .checked_sub(removed)
-        .ok_or(ValueError::Corrupt(Corrupt::OrphanElement))?;
+    // In i128, so only the result is range-checked: one in and one out at `u64::MAX` is fine.
+    // Below 0, more were removed than the root counts: elements exist that it does not account
+    // for. Above `u64::MAX`, the stored count cannot be right (tester D1).
+    let count = i128::from(count_before) + i128::from(added) - i128::from(removed);
+    let count = match u64::try_from(count) {
+        Ok(count) => count,
+        Err(_) if count < 0 => return Err(ValueError::Corrupt(Corrupt::OrphanElement)),
+        Err(_) => {
+            return Err(ValueError::Corrupt(Corrupt::Root(
+                "count plus the elements added overflows u64",
+            )))
+        }
+    };
     let root_value =
         seal(kind.kind(), &root_payload(count)).expect("a root payload is a few bytes");
     let (expected_version, conditions) = match expected {
