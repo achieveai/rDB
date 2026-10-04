@@ -30,9 +30,10 @@ ADR that supersedes.
 | [0009](0009-lineage-and-recovery.md) | Lineage roots, compatible-prefix selection and recovery modes | Proposed |
 | [0010](0010-generation-inheritance.md) | Generation inheritance — a read falls through to older generations | **Accepted** |
 | [0011](0011-rdb-value-pure-crate.md) | `rdb-value` is a pure crate of values and deltas, outside storage | **Accepted** |
+| [0012](0012-document-encoding-cbor-profile.md) | Document encoding — the deterministic CBOR profile, the object envelope and path operations | **Accepted** |
 | [0019](0019-validation-gates-evidence-and-release-boundary.md) | Validation gates, evidence and the release boundary | Proposed |
 
-0012–0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
+0013–0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
 plan it implements, and the range between is reserved for the decisions the kernel teams have not
 reached yet.
 

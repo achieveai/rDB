@@ -1,8 +1,9 @@
-//! The chained delete batch shared by the `rocks_scenario` example and the S1 tests.
+//! The chained request batches shared by the `rocks_scenario` example and the S1 tests.
 //!
 //! Included by path (`#[path = ".../tests/support/delete.rs"] mod delete;`) from both, so there
-//! is one copy. `rdb_sim::storage::history` builds only puts; this builds the delete of the same
-//! canonical key the same way.
+//! is one copy. `rdb_sim::storage::history` builds only puts of one canonical value; this builds
+//! the delete of the same canonical key the same way, and (for the S1 value differential) a
+//! batch for any one user mutation, such as a compiled document `Put`.
 
 use bytes::Bytes;
 use rdb_core::contracts::authority::Lineage;
@@ -14,7 +15,9 @@ use rdb_core::contracts::ids::{
     TenantId,
 };
 use rdb_core::contracts::storage::{Batch, Namespace, Write};
-use rdb_core::contracts::txn::{scoped_key, Mutation, Outcome, TxnRequest};
+use rdb_core::contracts::txn::{
+    scoped_key, Condition, ConditionOutcome, Mutation, Outcome, TxnRequest,
+};
 use rdb_core::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use rdb_core::replication::append::PROGRESS_KEY;
 use rdb_core::transaction::dedup::{dedup_key, dedup_value};
@@ -24,8 +27,43 @@ use rdb_core::transaction::BATCH_TAG;
 /// delete, the request's dedup row, the History record and Progress. Built as
 /// `rdb_sim::storage::history::canonical_history_from` builds its puts.
 pub fn delete_batch(lineage: Lineage, seq: Seq, prev_digest: Digest) -> Result<Batch, RdbError> {
+    let key = scoped_key(TenantId(1), AffinityId(1), b"k");
+    request_batch(
+        lineage,
+        seq,
+        prev_digest,
+        Vec::new(),
+        Mutation::Delete {
+            key,
+            expected_version: None,
+        },
+    )
+}
+
+/// The batch T1 commits for a request of tenant 1, affinity 1 with these `conditions` (all
+/// met) and this one user `mutation`, chained from `prev_digest`: the user write, the request's
+/// dedup row, the History record and Progress.
+#[allow(dead_code)] // the example builds deletes only
+pub fn request_batch(
+    lineage: Lineage,
+    seq: Seq,
+    prev_digest: Digest,
+    conditions: Vec<Condition>,
+    mutation: Mutation,
+) -> Result<Batch, RdbError> {
     let (tenant, affinity) = (TenantId(1), AffinityId(1));
-    let key = scoped_key(tenant, affinity, b"k");
+    let user = match &mutation {
+        Mutation::Put { key, value, .. } => Write {
+            ns: Namespace::User,
+            key: key.clone(),
+            value: Some(value.clone()),
+        },
+        Mutation::Delete { key, .. } => Write {
+            ns: Namespace::User,
+            key: key.clone(),
+            value: None,
+        },
+    };
     let request = TxnRequest {
         api_version: API_VERSION,
         identity: RequestIdentity {
@@ -36,19 +74,12 @@ pub fn delete_batch(lineage: Lineage, seq: Seq, prev_digest: Digest) -> Result<B
         affinity,
         expected_generation: None,
         remaining_millis: 1_000,
-        conditions: Vec::new(),
-        mutations: vec![Mutation::Delete {
-            key: key.clone(),
-            expected_version: None,
-        }],
+        conditions,
+        mutations: vec![mutation],
     };
     let request_digest = request.request_digest();
     let mutations = vec![
-        Write {
-            ns: Namespace::User,
-            key,
-            value: None,
-        },
+        user,
         Write {
             ns: Namespace::Dedup,
             key: dedup_key(lineage.generation, affinity, request.identity),
@@ -69,7 +100,7 @@ pub fn delete_batch(lineage: Lineage, seq: Seq, prev_digest: Digest) -> Result<B
         prev_digest,
         request_identity: request.identity,
         request_digest,
-        conditions_result: Vec::new(),
+        conditions_result: vec![ConditionOutcome::Met; request.conditions.len()],
         mutations,
         result: Outcome::Published,
         record_digest: Digest::ROOT,

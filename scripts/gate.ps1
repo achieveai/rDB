@@ -23,7 +23,9 @@
     The purity stage is the third non-cargo check, and row M7F-42: rdb-core's [dependencies]
     are the five ADR-rdb-0002 names, nothing under crates/rdb-core/src reaches a clock, a
     random source, the filesystem, the network, a thread or async, and no HashMap sits on a
-    path a trace reaches. It lives in scripts/purity-check.sh and this script calls it, for
+    path a trace reaches. rdb-value gets the same three clauses: its [dependencies] are the
+    five ADR-rdb-0012 names, and its src reaches none of those and holds no HashMap.
+    It lives in scripts/purity-check.sh and this script calls it, for
     the same reason the drift stage does.
 
     The drift stage is the second non-cargo check. Every M7 test plan declares the contract

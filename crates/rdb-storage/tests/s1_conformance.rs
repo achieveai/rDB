@@ -12,6 +12,14 @@
 //! root's snapshot once its partition has a child (the oracle's root view is partition-wide),
 //! and per-seq Progress (RocksDB keeps the head only, S0 F1).
 //!
+//! **Value ops (S2 design §6 W3, ADR-rdb-0012 Verification).** A second seeded stream adds
+//! document ops between the storage ops: a create, an update of 1-3 path ops, a stale version,
+//! a create over an existing document, and ops that fail. Each is compiled with `rdb-value`
+//! against the RocksDB snapshot and against a `MapSnapshot` holding the oracle's records; the two
+//! results, `Ok(Compiled)` or the error, must be byte-equal. An accepted write that the kernel
+//! would apply is committed to both engines as one chained batch, and then reads back on both
+//! as the expected document at the writing `seq`.
+//!
 //! Writes `docs/evidence/rdb-m8-storage-conformance.json` through `write_evidence`.
 
 #[path = "support/delete.rs"]
@@ -27,12 +35,19 @@ use rdb_core::contracts::authority::Lineage;
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::envelope::ReplicationEnvelope;
 use rdb_core::contracts::ids::{
-    AppliedSeq, ConfigVersion, Generation, NodeId, OwnerEpoch, PartitionId, Seq, SnapshotHandle,
+    AffinityId, AppliedSeq, ConfigVersion, Generation, NodeId, OwnerEpoch, PartitionId, Seq,
+    SnapshotHandle, TenantId,
 };
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, Namespace, SnapshotRead};
+use rdb_core::contracts::txn::scoped_key;
 use rdb_sim::storage::history::canonical_history_from;
 use rdb_sim::storage::memory::MemoryEngine;
 use rdb_storage::{verify_lineage, Inherited, RocksEngine};
+use rdb_value::delta::{materialize, Delta, Op};
+use rdb_value::path::Path;
+use rdb_value::testing::MapSnapshot;
+use rdb_value::value::{Decimal, Float, Int, Map, MapKey, Timestamp, Value};
+use rdb_value::{compile, read, Document, Expected, ValueError};
 
 /// Seeds at reduced scale, the ordinary gate (ADR-0031: a fixed constant, never host-derived).
 const REDUCED_SEEDS: u64 = 32;
@@ -43,6 +58,12 @@ const OPS_PER_SEED: usize = 40;
 /// Inherits per partition per seed, at most (design §5: 0-3).
 const MAX_INHERITS: u32 = 3;
 const PARTITIONS: [PartitionId; 2] = [PartitionId(1), PartitionId(2)];
+/// Percent of steps followed by one document op. A separate stream, salted from the seed, so
+/// the storage ops keep their own sequence of draws.
+const DOC_PERCENT: u64 = 40;
+const DOC_SALT: u64 = 0xD0C5_0000_0000_0001;
+/// The document keys, besides the canonical `k` the storage ops write.
+const DOC_NAMES: [&[u8]; 2] = [b"doc-a", b"doc-b"];
 
 /// splitmix64: a dependency-free, seedable generator. Same seed, same history.
 struct Rng(u64);
@@ -126,6 +147,122 @@ fn record_digest(batch: &Batch) -> Digest {
     ReplicationEnvelope::decode(record)
         .expect("a generated History record decodes")
         .record_digest
+}
+
+fn pick(rng: &mut Rng, max: u64) -> usize {
+    usize::try_from(rng.upto(max)).expect("a small index")
+}
+
+fn doc_key(name: &[u8]) -> Bytes {
+    scoped_key(TenantId(1), AffinityId(1), name)
+}
+
+/// Small, negative, or up to 2^64 - 1, so an increment can leave the integer range.
+fn random_int(docs: &mut Rng) -> Int {
+    match docs.upto(3) {
+        0 => Int::from(docs.next()),
+        1 => Int::from(-i64::try_from(docs.upto(1000)).expect("small")),
+        _ => Int::from(docs.upto(100)),
+    }
+}
+
+/// One scalar of each kind the profile has.
+fn random_leaf(docs: &mut Rng) -> Value {
+    match docs.upto(7) {
+        0 => Value::Null,
+        1 => Value::Bool(docs.upto(1) == 1),
+        2 => Value::Integer(random_int(docs)),
+        3 => {
+            let eighths = u32::try_from(docs.upto(1_000_000)).expect("small");
+            Value::Float(Float::new(f64::from(eighths) / 8.0).expect("finite"))
+        }
+        4 => {
+            // The last digit is 1-9, so the mantissa is normalised.
+            let mantissa = i128::from(docs.upto(999)) * 10 + 1 + i128::from(docs.upto(8));
+            let exponent = -i64::try_from(docs.upto(20)).expect("small");
+            Value::Decimal(
+                Decimal::new(exponent, Int::new(mantissa).expect("in range")).expect("normalised"),
+            )
+        }
+        5 => {
+            let secs = i64::try_from(docs.upto(4_000_000_000)).expect("small");
+            let nanos = u32::try_from(docs.upto(u64::from(Timestamp::MAX_NANOS))).expect("small");
+            Value::Timestamp(Timestamp::new(secs, nanos).expect("valid nanos"))
+        }
+        6 => Value::Text(format!("s{}", docs.upto(999))),
+        _ => {
+            let len = docs.upto(4);
+            Value::Bytes((0..len).map(|_| docs.next().to_le_bytes()[0]).collect())
+        }
+    }
+}
+
+/// A map holding some of `n`, `s`, `l` and `m`; one time in ten a bare scalar, so a path op on
+/// it fails with `NotAContainer`.
+fn random_doc(docs: &mut Rng) -> Value {
+    if docs.upto(9) == 0 {
+        return random_leaf(docs);
+    }
+    let mut root = Map::new();
+    if docs.upto(3) > 0 {
+        root.insert(MapKey::new("n"), Value::Integer(random_int(docs)));
+    }
+    if docs.upto(3) > 0 {
+        root.insert(MapKey::new("s"), random_leaf(docs));
+    }
+    if docs.upto(3) > 0 {
+        let len = docs.upto(3);
+        let items = (0..len).map(|_| Value::Integer(random_int(docs))).collect();
+        root.insert(MapKey::new("l"), Value::Array(items));
+    }
+    if docs.upto(3) > 0 {
+        let mut nested = Map::new();
+        for name in ["x", "d", "t", "b"] {
+            if docs.upto(3) > 0 {
+                nested.insert(MapKey::new(name), random_leaf(docs));
+            }
+        }
+        root.insert(MapKey::new("m"), Value::Map(nested));
+    }
+    Value::Map(root)
+}
+
+/// One op on a path that may or may not exist, so some ops fail (`PathNotFound`,
+/// `IndexInvalid`, `NotAContainer`, `TypeMismatch`, `Overflow`).
+fn random_op(docs: &mut Rng) -> Op {
+    const PATHS: [&str; 8] = ["/n", "/s", "/l/0", "/l/3", "/m/x", "/m/z", "/z", "/n/0"];
+    let path = Path::parse(PATHS[pick(docs, 7)]).expect("a valid pointer");
+    match docs.upto(9) {
+        0 => Op::Replace(random_doc(docs)),
+        1..=4 => Op::Set(path, random_leaf(docs)),
+        5..=7 => Op::Increment(path, random_int(docs)),
+        _ => Op::Remove(path),
+    }
+}
+
+/// `min..=max` random ops.
+fn random_ops(docs: &mut Rng, min: u64, max: u64) -> Vec<Op> {
+    let count = min + docs.upto(max - min);
+    (0..count).map(|_| random_op(docs)).collect()
+}
+
+/// The oracle's document records as a [`MapSnapshot`], the second store `rdb-value` reads.
+fn oracle_map(view: &dyn SnapshotRead) -> MapSnapshot {
+    let mut map = MapSnapshot::new(view.generation());
+    for name in DOC_NAMES {
+        let key = doc_key(name);
+        match (
+            view.get(Namespace::User, &key),
+            view.version(Namespace::User, &key),
+        ) {
+            (Some(value), Some(version)) => map.insert(key, version, value),
+            (None, None) => {}
+            other => {
+                panic!("the oracle's view of {key:?} has a value or a version alone: {other:?}")
+            }
+        }
+    }
+    map
 }
 
 /// One seeded history over two partitions.
@@ -440,8 +577,119 @@ impl Run {
         self.counts.compared("history_at", applied);
     }
 
-    /// One seeded operation on one partition.
-    fn step(&mut self, rng: &mut Rng, op: usize) {
+    /// One document op on one partition's active lineage: compiled against RocksDB and against
+    /// the oracle's records, which must agree byte for byte; when the kernel would apply it,
+    /// committed to both and read back on both.
+    fn doc_op(&mut self, docs: &mut Rng) {
+        let index = pick(docs, 1);
+        let key = doc_key(DOC_NAMES[pick(docs, 1)]);
+        let (id, active) = (self.partitions[index].id, self.partitions[index].active);
+        let applied = self.applied(index);
+        let at = format!("{} p{} g{} {key:?}", self.context(), id.0, active.0);
+
+        let memory_view = self.memory.snapshot(id, active, SnapshotHandle(1));
+        let current = memory_view.version(Namespace::User, &key);
+        let (expected, delta) = match (current, docs.upto(5)) {
+            // A create: a whole document, sometimes edited in the same delta.
+            (None, 0..=3) => {
+                let mut ops = vec![Op::Replace(random_doc(docs))];
+                ops.extend(random_ops(docs, 0, 2));
+                (Expected::Absent, ops)
+            }
+            // An update of a document that does not exist: `ObjectAbsent`.
+            (None, 4) => (
+                Expected::Version(1 + docs.upto(applied)),
+                random_ops(docs, 1, 1),
+            ),
+            // A create of path ops alone: `ObjectAbsent` unless one of them is a `Replace`.
+            (None, _) => (Expected::Absent, random_ops(docs, 1, 3)),
+            // An update at the current version, 1-3 path ops.
+            (Some(version), 0..=3) => (Expected::Version(version), random_ops(docs, 1, 3)),
+            // A stale version: `VersionConflict`.
+            (Some(version), 4) => {
+                let stale = if docs.upto(1) == 0 {
+                    version - 1
+                } else {
+                    version + 1
+                };
+                (Expected::Version(stale), random_ops(docs, 1, 1))
+            }
+            // A create over an existing document: it compiles on both stores and is compared,
+            // but the batch is never submitted (`!applies` below). The kernel's refusal on
+            // `Condition::Absent` is tested in rdb-core's `transaction_t1`; ops_compile checks
+            // that the condition is attached. Neither is checked here.
+            (Some(_), _) => (Expected::Absent, vec![Op::Replace(random_doc(docs))]),
+        };
+        let delta = Delta(delta);
+
+        let rocks_view = self
+            .rocks()
+            .snapshot(id, active, SnapshotHandle(1))
+            .expect("rocks snapshot");
+        let map = oracle_map(&memory_view);
+        let before = read(&map, &key);
+        assert_eq!(read(&rocks_view, &key), before, "{at}: read before");
+        let compiled = compile(&rocks_view, &key, expected, &delta);
+        assert_eq!(
+            compiled,
+            compile(&map, &key, expected, &delta),
+            "{at}: compiled {expected:?} {delta:?}"
+        );
+        self.counts.compared("compiled", 1);
+
+        let Ok(compiled) = compiled else {
+            self.counts.op("doc_refused");
+            return;
+        };
+        let applies = match expected {
+            Expected::Absent => current.is_none(),
+            Expected::Version(version) => current == Some(version),
+        };
+        // The harness decides this from the version it tracks; no batch reaches either store.
+        if !applies {
+            self.counts.op("doc_racing_create");
+            return;
+        }
+        let base = before
+            .expect("the read before matched on both stores")
+            .map(|document| document.value);
+        let value = materialize(base, &delta).expect("it compiled, so it applies");
+        let seq = applied + 1;
+        let head = self.partitions[index].digests[&applied];
+        let batch = delete::request_batch(
+            lineage(id, active),
+            Seq(seq),
+            head,
+            compiled.condition.into_iter().collect(),
+            compiled.mutation,
+        )
+        .expect("a document batch");
+        self.commit(index, &batch);
+
+        let want: Result<Option<Document>, ValueError> = Ok(Some(Document {
+            version: seq,
+            value,
+        }));
+        let rocks_view = self
+            .rocks()
+            .snapshot(id, active, SnapshotHandle(1))
+            .expect("rocks snapshot");
+        assert_eq!(read(&rocks_view, &key), want, "{at}: rocks read back");
+        let memory_view = self.memory.snapshot(id, active, SnapshotHandle(1));
+        assert_eq!(
+            read(&oracle_map(&memory_view), &key),
+            want,
+            "{at}: oracle read back"
+        );
+        self.counts.compared("doc_read_back", 2);
+        self.counts.op(match expected {
+            Expected::Absent => "doc_create",
+            Expected::Version(_) => "doc_update",
+        });
+    }
+
+    /// One seeded operation on one partition, then, `DOC_PERCENT` of the time, one document op.
+    fn step(&mut self, rng: &mut Rng, docs: &mut Rng, op: usize) {
         let index = usize::try_from(rng.upto(1)).expect("0 or 1");
         let roll = rng.upto(99);
         let applied = self.applied(index);
@@ -462,6 +710,10 @@ impl Run {
             _ => {
                 self.put(index, 1);
             }
+        }
+        if docs.upto(99) < DOC_PERCENT {
+            self.step.push_str(" +doc");
+            self.doc_op(docs);
         }
         self.compare();
     }
@@ -485,8 +737,8 @@ impl Run {
 /// on every host, so a failing `seed=` in a message replays exactly.
 ///
 /// Design §5 (critic F2, F7): over seeded histories, `RocksEngine` and `MemoryEngine` agree on
-/// everything both model. The generator must reach every operation and inherit mode, or the run
-/// fails rather than reporting an agreement it never tested.
+/// everything both model. The generator must reach every operation, inherit mode and document
+/// outcome, or the run fails rather than reporting an agreement it never tested.
 #[retcd_test]
 fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
     let seeds = if full_scale_requested() {
@@ -499,9 +751,10 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
     let mut totals = Counts::default();
     for seed in 0..seeds {
         let mut rng = Rng(seed);
+        let mut docs = Rng(seed ^ DOC_SALT);
         let mut run = Run::new(seed);
         for op in 0..OPS_PER_SEED {
-            run.step(&mut rng, op);
+            run.step(&mut rng, &mut docs, op);
         }
         run.verify_all();
         for (name, n) in run.counts.ops {
@@ -533,6 +786,10 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
         "inherit_copied",
         "inherit_base_zero",
         "inherit_base_below_parent_base",
+        "doc_create",
+        "doc_update",
+        "doc_refused",
+        "doc_racing_create",
     ] {
         assert!(
             totals.ops.get(required).copied().unwrap_or(0) > 0,
@@ -548,6 +805,8 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
             "ops_per_seed": OPS_PER_SEED,
             "partitions": PARTITIONS.len(),
             "max_inherits_per_partition": MAX_INHERITS,
+            "doc_op_percent": DOC_PERCENT,
+            "doc_keys": DOC_NAMES.len(),
             "ops": totals.ops,
             "comparisons": totals.compared,
             "mismatches": 0,
