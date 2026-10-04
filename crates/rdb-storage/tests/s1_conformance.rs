@@ -39,11 +39,11 @@ use rdb_core::contracts::ids::{
     SnapshotHandle, TenantId,
 };
 use rdb_core::contracts::storage::{Batch, CapturedPrefix, Namespace, SnapshotRead};
-use rdb_core::contracts::txn::scoped_key;
 use rdb_sim::storage::history::canonical_history_from;
 use rdb_sim::storage::memory::MemoryEngine;
 use rdb_storage::{verify_lineage, Inherited, RocksEngine};
 use rdb_value::delta::{materialize, Delta, Op};
+use rdb_value::keys::{root_key, RootKey};
 use rdb_value::path::Path;
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Decimal, Float, Int, Map, MapKey, Timestamp, Value};
@@ -153,8 +153,9 @@ fn pick(rng: &mut Rng, max: u64) -> usize {
     usize::try_from(rng.upto(max)).expect("a small index")
 }
 
-fn doc_key(name: &[u8]) -> Bytes {
-    scoped_key(TenantId(1), AffinityId(1), name)
+/// A document's root key (ADR-rdb-0013 §1).
+fn doc_key(name: &[u8]) -> RootKey {
+    root_key(TenantId(1), AffinityId(1), name)
 }
 
 /// Small, negative, or up to 2^64 - 1, so an increment can leave the integer range.
@@ -252,10 +253,10 @@ fn oracle_map(view: &dyn SnapshotRead) -> MapSnapshot {
     for name in DOC_NAMES {
         let key = doc_key(name);
         match (
-            view.get(Namespace::User, &key),
-            view.version(Namespace::User, &key),
+            view.get(Namespace::User, key.as_bytes()),
+            view.version(Namespace::User, key.as_bytes()),
         ) {
-            (Some(value), Some(version)) => map.insert(key, version, value),
+            (Some(value), Some(version)) => map.insert(key.to_bytes(), version, value),
             (None, None) => {}
             other => {
                 panic!("the oracle's view of {key:?} has a value or a version alone: {other:?}")
@@ -588,7 +589,7 @@ impl Run {
         let at = format!("{} p{} g{} {key:?}", self.context(), id.0, active.0);
 
         let memory_view = self.memory.snapshot(id, active, SnapshotHandle(1));
-        let current = memory_view.version(Namespace::User, &key);
+        let current = memory_view.version(Namespace::User, key.as_bytes());
         let (expected, delta) = match (current, docs.upto(5)) {
             // A create: a whole document, sometimes edited in the same delta.
             (None, 0..=3) => {
@@ -660,8 +661,8 @@ impl Run {
             lineage(id, active),
             Seq(seq),
             head,
-            compiled.condition.into_iter().collect(),
-            compiled.mutation,
+            compiled.conditions,
+            compiled.mutations[0].clone(),
         )
         .expect("a document batch");
         self.commit(index, &batch);

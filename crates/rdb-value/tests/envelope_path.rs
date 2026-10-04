@@ -43,7 +43,7 @@ fn open_fails_closed_on_every_damaged_header_field() {
     };
     assert_eq!(open(&[]), Err(Truncated { len: 0 }));
     assert_eq!(open(&good[..39]), Err(Truncated { len: 39 }));
-    for byte in [0x00, 0x02, 0xff] {
+    for byte in [0x00, 0x7f, 0xff] {
         assert_eq!(open(&with(0, byte)), Err(UnknownFormat(byte)));
         assert_eq!(open(&with(1, byte)), Err(UnknownKind(byte)));
         assert_eq!(open(&with(2, byte)), Err(UnknownCodec(byte)));

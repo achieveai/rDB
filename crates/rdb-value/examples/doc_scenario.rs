@@ -1,14 +1,29 @@
-//! Hand entry point for M8 S2 (s2-design §3): documents in a file-backed store.
+//! Hand entry point for M8 S2 and S3 (s2-design §3, s3-design §3): documents, maps and sets in a
+//! file-backed store.
 //!
 //! ```text
-//! doc_scenario --store <FILE> compile <key> (--absent | --expect V) <body>
+//! doc_scenario --store <FILE> compile <id> (--absent | --expect V) <body>
 //! doc_scenario --store <FILE> apply <COMPILED_FILE>
-//! doc_scenario --store <FILE> put <key> (--absent | --expect V) <body>
-//! doc_scenario --store <FILE> op  <key> (--absent | --expect V) <body>
-//! doc_scenario --store <FILE> get <key> [PATH]
+//! doc_scenario --store <FILE> put <id> (--absent | --expect V) <body>
+//! doc_scenario --store <FILE> op  <id> (--absent | --expect V) <body>
+//! doc_scenario --store <FILE> get <id> [PATH]
+//! doc_scenario --store <FILE> map <id> (--absent | --expect V) [--compile-only]
+//!                                  (put K J | del K | need K present|absent)...
+//! doc_scenario --store <FILE> set <id> (--absent | --expect V) [--compile-only]
+//!                                  (add K | del K | need K present|absent)...
+//! doc_scenario --store <FILE> drop <id> --expect V [--compile-only]
+//! doc_scenario --store <FILE> collection <id>
+//! doc_scenario --store <FILE> member <id> K
+//! doc_scenario --store <FILE> members <id> [--after K] [--limit N]
 //! doc_scenario --store <FILE> dump
 //! doc_scenario decode --hex H
 //! doc_scenario --help
+//!
+//! <id> is an object id: plain text, or hex:<hex> for any bytes. Every object lives at
+//! tenant 1, affinity 1, under the root key the library builds (ADR-rdb-0013 §1).
+//! K is a JSON scalar, or cbor:<hex> for any value (bytes, decimals, timestamps), strictly
+//! decoded. `map` takes `put` and `set` takes `add` only by convention: the other is passed to
+//! the library, which refuses it (`KindMismatch`).
 //!
 //! <body> is one or more of, applied in order:
 //!   --json J        replace the whole document with JSON J
@@ -47,29 +62,53 @@
 //! `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.
 //!
 //! The store is one JSON line `{"seq":N}`, then one line per record
-//! `{"key":..,"version":..,"value_hex":..}`, rewritten whole on every commit. `seq` stands in for
-//! the kernel's transaction sequence: each commit takes the next one and stamps it as the
-//! record's version. `apply` checks the condition and `expected_version` the way the kernel's
-//! `first_failed_condition` does, and refuses with the kernel's name, `ConditionFailed`.
+//! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store from S2
+//! (with `key` instead of `key_hex`) is refused, exit 3. `seq` stands in for the kernel's
+//! transaction sequence: each commit takes the next one and stamps it as the version of every
+//! record it writes. `apply` checks the condition, then each write's `expected_version`, the way
+//! the kernel's `first_failed_condition` does, and refuses with the kernel's name,
+//! `ConditionFailed { index }`.
+//!
+//! A compile line (`compile`, or `map`/`set`/`drop` with `--compile-only`) carries `conditions`,
+//! each with `op` and `key_hex`, and `mutations`, each with `op`, `key_hex`, `expected_version`
+//! and, for a `Put`, `value_hex`. `apply` reads only those. Every write is checked before the store is
+//! touched: its key must parse, a root must read back, a map entry must be a document and a set
+//! member empty.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::ExitCode;
 
 use bytes::Bytes;
-use rdb_core::{Condition, Generation, Mutation, Namespace, SnapshotRead};
+use rdb_core::{AffinityId, Condition, Generation, Mutation, Namespace, SnapshotRead, TenantId};
 use rdb_value::cbor;
 use rdb_value::delta::{resolve, ApplyError, Delta, Op};
 use rdb_value::envelope::{self, Kind, MAX_ENVELOPE, MAX_PAYLOAD};
+use rdb_value::keys::{self, RootKey, Sub};
 use rdb_value::path::{Path, PathError};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
 use rdb_value::{compile, read, Compiled, Corrupt, Expected, ValueError};
 
-const USAGE: &str = "usage: doc_scenario --store <FILE> (compile|put|op) <key> (--absent | --expect V) \
+#[path = "doc_scenario/coll.rs"]
+mod coll;
+
+/// The one scope this tool writes in (s3-design §2), so keys match ADR-rdb-0013 §6's example.
+const TENANT: TenantId = TenantId(1);
+/// See [`TENANT`].
+const AFFINITY: AffinityId = AffinityId(1);
+
+const USAGE: &str = "usage: doc_scenario --store <FILE> (compile|put|op) <id> (--absent | --expect V) \
 (--json J | --cbor-hex H | set P J | remove P | incr P N)...\n       doc_scenario --store <FILE> apply <COMPILED_FILE>\n       \
-doc_scenario --store <FILE> get <key> [PATH]\n       doc_scenario --store <FILE> dump\n       \
+doc_scenario --store <FILE> get <id> [PATH]\n       \
+doc_scenario --store <FILE> map <id> (--absent | --expect V) [--compile-only] (put K J | del K | need K present|absent)...\n       \
+doc_scenario --store <FILE> set <id> (--absent | --expect V) [--compile-only] (add K | del K | need K present|absent)...\n       \
+doc_scenario --store <FILE> drop <id> --expect V [--compile-only]\n       \
+doc_scenario --store <FILE> collection <id>\n       doc_scenario --store <FILE> member <id> K\n       \
+doc_scenario --store <FILE> members <id> [--after K] [--limit N]\n       \
+doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
+<id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
 
 // Input limits. Every text input is read through `Read::take` at one of these, so an oversized
@@ -255,6 +294,12 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "get" => "get",
         "dump" => "dump",
         "decode" => "decode",
+        "map" => "map",
+        "set" => "set",
+        "drop" => "drop",
+        "collection" => "collection",
+        "member" => "member",
+        "members" => "members",
         "--help" | "-h" | "help" if rest.is_empty() => return ("help", Ok(Vec::new())),
         other => {
             return (
@@ -274,6 +319,12 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "apply" => apply_cmd(&store, rest),
         "put" | "op" => commit_cmd(&store, rest),
         "get" => get_cmd(&store, rest),
+        "map" => coll::write_cmd(&store, coll::CollectionKind::Map, rest),
+        "set" => coll::write_cmd(&store, coll::CollectionKind::Set, rest),
+        "drop" => coll::drop_cmd(&store, rest),
+        "collection" => coll::collection_cmd(&store, rest),
+        "member" => coll::member_cmd(&store, rest),
+        "members" => coll::members_cmd(&store, rest),
         _ => dump_cmd(&store, rest),
     };
     (name, outcome)
@@ -300,11 +351,11 @@ fn decode_cmd(rest: &[String]) -> Result<Fields, Failure> {
 
 fn compile_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let request = parse_request(rest)?;
-    let mut fields = vec![("key", json_str(&request.key))];
+    let mut fields = id_fields(&request.key, &request.root);
     let store = Store::load(store_path)?;
     let compiled = compile(
         &store.snapshot,
-        request.key.as_bytes(),
+        &request.root,
         request.expected,
         &request.delta,
     )
@@ -319,33 +370,73 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     };
     let compiled = load_compiled(FsPath::new(file))?;
     let mut store = Store::load(store_path)?;
-    let key = vec![(
-        "key",
-        json_str(&String::from_utf8_lossy(compiled.mutation.key())),
-    )];
-    let version = store.apply(&compiled).map_err(|e| e.with(key.clone()))?;
-    let mut fields = key;
-    fields.push(("version", version.to_string()));
+    let version = store.apply(&compiled)?;
+    let mut fields = vec![("version", version.to_string())];
     fields.extend(compiled_fields(&compiled)?);
     Ok(fields)
 }
 
 fn commit_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let request = parse_request(rest)?;
-    let key = vec![("key", json_str(&request.key))];
+    let fields = id_fields(&request.key, &request.root);
     let mut store = Store::load(store_path)?;
     let compiled = compile(
         &store.snapshot,
-        request.key.as_bytes(),
+        &request.root,
         request.expected,
         &request.delta,
     )
-    .map_err(|e| Failure::from(e).with(key.clone()))?;
-    let version = store.apply(&compiled).map_err(|e| e.with(key.clone()))?;
-    let mut fields = key;
-    fields.push(("version", version.to_string()));
-    fields.extend(compiled_fields(&compiled)?);
+    .map_err(|e| Failure::from(e).with(fields.clone()))?;
+    emit(&mut store, &compiled, false, fields)
+}
+
+/// Commit `compiled` and add `version`, or, for `compile_only`, add `compile_only: true`. Then
+/// add the compiled fields, which `apply` reads back.
+fn emit(
+    store: &mut Store,
+    compiled: &Compiled,
+    compile_only: bool,
+    mut fields: Fields,
+) -> Result<Fields, Failure> {
+    if compile_only {
+        fields.push(("compile_only", "true".to_owned()));
+    } else {
+        let version = store.apply(compiled).map_err(|e| e.with(fields.clone()))?;
+        fields.push(("version", version.to_string()));
+    }
+    fields.extend(compiled_fields(compiled)?);
     Ok(fields)
+}
+
+/// An object id argument: `hex:<hex>` for any bytes, otherwise the text's UTF-8 bytes.
+fn object_id(arg: &str) -> Result<Vec<u8>, Failure> {
+    match arg.strip_prefix("hex:") {
+        Some(digits) => hex::decode(digits)
+            .map_err(|e| Failure::usage(format!("object id {arg:?}: bad hex: {e}"))),
+        None => Ok(arg.as_bytes().to_vec()),
+    }
+}
+
+/// The root key of the object `arg` names, in this tool's one scope.
+fn root_of(arg: &str) -> Result<RootKey, Failure> {
+    Ok(keys::root_key(TENANT, AFFINITY, &object_id(arg)?))
+}
+
+/// An object id as this tool takes it back: the text when it is UTF-8 and cannot be read as
+/// `hex:`, otherwise `hex:<hex>`.
+fn show_id(id: &[u8]) -> String {
+    match std::str::from_utf8(id) {
+        Ok(text) if !text.starts_with("hex:") => text.to_owned(),
+        _ => format!("hex:{}", hex::encode(id)),
+    }
+}
+
+/// `key` (the id as given) and `key_hex` (the root key).
+fn id_fields(arg: &str, root: &RootKey) -> Fields {
+    vec![
+        ("key", json_str(arg)),
+        ("key_hex", json_str(&hex::encode(root.as_bytes()))),
+    ]
 }
 
 fn get_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
@@ -354,19 +445,20 @@ fn get_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
         // RFC 6901: "" is the whole document.
         [key, path] if path.is_empty() => (key, None),
         [key, path] => (key, Some(parse_path(path).map_err(|e| e.keyed(key))?)),
-        _ => return Err(Failure::usage("get takes <key> [PATH]")),
+        _ => return Err(Failure::usage("get takes <id> [PATH]")),
     };
+    let root = root_of(key).map_err(|e| e.keyed(key))?;
     let store = Store::load(store_path)?;
-    let mut fields = vec![("key", json_str(key))];
-    if let Some(version) = store.snapshot.version(Namespace::User, key.as_bytes()) {
+    let mut fields = id_fields(key, &root);
+    if let Some(version) = store.snapshot.version(Namespace::User, root.as_bytes()) {
         fields.push(("version", version.to_string()));
     }
-    let document = read(&store.snapshot, key.as_bytes())
+    let document = read(&store.snapshot, &root)
         .map_err(|e| Failure::from(e).with(fields.clone()))?
         .ok_or_else(|| Failure::from(ApplyError::ObjectAbsent).with(fields.clone()))?;
     let raw = store
         .snapshot
-        .get(Namespace::User, key.as_bytes())
+        .get(Namespace::User, root.as_bytes())
         .ok_or_else(|| Failure::store("record vanished between two reads"))?;
     fields.extend(envelope_fields(&raw)?);
     let value = match &path {
@@ -387,23 +479,14 @@ fn dump_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let store = Store::load(store_path)?;
     let mut records = Vec::new();
     for (key, version, raw) in store.snapshot.records() {
-        let key_text = String::from_utf8_lossy(key).into_owned();
         let mut line = Line::default();
-        line.raw("key", json_str(&key_text));
+        line.str("key_hex", &hex::encode(key));
         line.raw("version", version.to_string());
-        match read(&store.snapshot, key) {
-            Ok(Some(document)) => {
-                line.extend(envelope_fields(raw)?);
-                line.raw("value", render(&document.value));
-            }
-            Ok(None) => return Err(Failure::store("record vanished between two reads")),
-            Err(e) => {
-                let failure = Failure::from(e);
-                line.raw("envelope_len", raw.len().to_string());
-                line.str("error", &failure.error);
-                line.str("error_kind", kind_of(&failure.error));
-                line.str("detail", &failure.detail);
-            }
+        if let Err(failure) = dump_record(&store.snapshot, key, raw, &mut line) {
+            line.raw("value_len", raw.len().to_string());
+            line.str("error", &failure.error);
+            line.str("error_kind", kind_of(&failure.error));
+            line.str("detail", &failure.detail);
         }
         records.push(line.render());
     }
@@ -413,23 +496,81 @@ fn dump_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     ])
 }
 
+/// One record of `dump`, read the way its key says: what object it belongs to, which part of
+/// it, and then through the library's own read for that part, so every check a read makes is
+/// made here too.
+fn dump_record(
+    snapshot: &MapSnapshot,
+    key: &[u8],
+    raw: &[u8],
+    line: &mut Line,
+) -> Result<(), Failure> {
+    let parsed =
+        keys::parse(key).map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Key(e))))?;
+    line.str("object", &show_id(&parsed.object_id));
+    let root = parsed.root();
+    match (parsed.sub, &parsed.element) {
+        (Sub::Root, _) => {
+            line.str("sub", "root");
+            let opened = envelope::open(raw)
+                .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Envelope(e))))?;
+            line.str("kind", &format!("{:?}", opened.kind));
+            if opened.kind == Kind::Document {
+                let document = read(snapshot, &root)?
+                    .ok_or_else(|| Failure::store("record vanished between two reads"))?;
+                line.extend(envelope_fields(raw)?);
+                line.raw("value", render(&document.value));
+            } else {
+                let found = coll::collection(snapshot, &root)?
+                    .ok_or_else(|| Failure::store("record vanished between two reads"))?;
+                line.raw("count", found.count.to_string());
+                line.extend(envelope_fields(raw)?);
+            }
+        }
+        (Sub::Element, Some(element)) => {
+            line.str("sub", "element");
+            line.raw("element", render(element));
+            let found = coll::member(snapshot, &root, element)?
+                .ok_or_else(|| Failure::store("record vanished between two reads"))?;
+            if let Some(value) = &found.value {
+                line.extend(envelope_fields(raw)?);
+                line.raw("value", render(value));
+            }
+        }
+        (Sub::Element, None) => {
+            return Err(Failure::store("an element key parsed without an element"))
+        }
+        (Sub::Reserved(byte), _) => {
+            line.str("sub", &format!("reserved {byte:#04x}"));
+            return Err(Failure::refused(
+                format!("ReservedSub({byte:#04x})"),
+                "this sub byte is reserved for a later slice; this build does not read it".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Requests
 // ---------------------------------------------------------------------------------------------
 
 struct Request {
     key: String,
+    root: RootKey,
     expected: Expected,
     delta: Delta,
 }
 
 fn parse_request(args: &[String]) -> Result<Request, Failure> {
     let Some((key, rest)) = args.split_first() else {
-        return Err(Failure::usage("missing <key>"));
+        return Err(Failure::usage("missing <id>"));
     };
+    let root = root_of(key).map_err(|e| e.keyed(key))?;
     let (expected, delta) = parse_body(rest).map_err(|e| e.keyed(key))?;
     Ok(Request {
         key: key.clone(),
+        root,
         expected,
         delta,
     })
@@ -776,9 +917,18 @@ impl Store {
         for (n, line) in lines {
             let record: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| bad(n, &e.to_string()))?;
-            let key = record["key"]
-                .as_str()
-                .ok_or_else(|| bad(n, "missing \"key\""))?;
+            let Some(key_hex) = record["key_hex"].as_str() else {
+                return Err(bad(
+                    n,
+                    if record["key"].is_null() {
+                        "missing \"key_hex\""
+                    } else {
+                        "a store from S2 (\"key\", not \"key_hex\"); S3 keys are object keys, so \
+                         start a new store"
+                    },
+                ));
+            };
+            let key = hex::decode(key_hex).map_err(|e| bad(n, &format!("key_hex: {e}")))?;
             let version = record["version"]
                 .as_u64()
                 .ok_or_else(|| bad(n, "missing \"version\""))?;
@@ -789,29 +939,23 @@ impl Store {
             if version > store.seq {
                 return Err(bad(n, "version is newer than seq"));
             }
-            store.snapshot.insert(
-                Bytes::copy_from_slice(key.as_bytes()),
-                version,
-                Bytes::from(value),
-            );
+            let key = Bytes::from(key);
+            if store.snapshot.version(Namespace::User, &key).is_some() {
+                return Err(bad(n, &format!("key_hex {key_hex} appears twice")));
+            }
+            store.snapshot.insert(key, version, Bytes::from(value));
         }
         Ok(store)
     }
 
-    /// Check `compiled` as the kernel does, then commit it at the next `seq`.
+    /// Check `compiled` as the kernel does, then commit it at the next `seq`: every `Put` at
+    /// that version, every `Delete` removed.
     fn apply(&mut self, compiled: &Compiled) -> Result<u64, Failure> {
-        let Mutation::Put {
-            key,
-            value,
-            expected_version,
-        } = &compiled.mutation
-        else {
-            return Err(Failure::usage("only a Put can be applied"));
-        };
-        // The kernel's order: every condition, then every mutation's `expected_version`.
-        // Each check: what it claims, the key it reads, and whether it held.
+        // The kernel's order (`first_failed_condition`): every condition, then every mutation,
+        // where a mutation without `expected_version` always holds. Each check: what it claims,
+        // the key it reads, and whether it held.
         let mut checks: Vec<(String, &Bytes, bool)> = Vec::new();
-        if let Some(condition) = &compiled.condition {
+        for condition in &compiled.conditions {
             let (claim, key, held) = match condition {
                 Condition::Absent { key } => (
                     "absent".to_owned(),
@@ -831,13 +975,25 @@ impl Store {
             };
             checks.push((claim, key, held));
         }
-        if let Some(want) = expected_version {
-            let found = self.snapshot.version(Namespace::User, key);
-            checks.push((
-                format!("version {want} (expected_version)"),
+        for mutation in &compiled.mutations {
+            let (Mutation::Put {
                 key,
-                found == Some(*want),
-            ));
+                expected_version,
+                ..
+            }
+            | Mutation::Delete {
+                key,
+                expected_version,
+            }) = mutation;
+            let check = match expected_version {
+                Some(want) => (
+                    format!("version {want} (expected_version)"),
+                    key,
+                    self.snapshot.version(Namespace::User, key) == Some(*want),
+                ),
+                None => ("anything (no expected_version)".to_owned(), key, true),
+            };
+            checks.push(check);
         }
         if let Some(index) = checks.iter().position(|(_, _, held)| !held) {
             let (claim, key, _) = &checks[index];
@@ -848,13 +1004,35 @@ impl Store {
             return Err(Failure::refused(
                 format!("ConditionFailed {{ index: {index} }}"),
                 format!(
-                    "check {index} failed for key {}: expected {claim}, found {found}",
-                    json_str(&String::from_utf8_lossy(key))
+                    "check {index} failed for key_hex {}: expected {claim}, found {found}",
+                    hex::encode(key)
                 ),
             ));
         }
         let version = self.seq + 1;
-        self.snapshot.insert(key.clone(), version, value.clone());
+        let deleted: Vec<&Bytes> = compiled
+            .mutations
+            .iter()
+            .filter_map(|m| match m {
+                Mutation::Delete { key, .. } => Some(key),
+                Mutation::Put { .. } => None,
+            })
+            .collect();
+        // `MapSnapshot` has no remove, so a commit with a `Delete` rebuilds it without those keys.
+        if !deleted.is_empty() {
+            let mut kept = MapSnapshot::new(Generation(1));
+            for (key, v, value) in self.snapshot.records() {
+                if !deleted.contains(&key) {
+                    kept.insert(key.clone(), v, value.clone());
+                }
+            }
+            self.snapshot = kept;
+        }
+        for mutation in &compiled.mutations {
+            if let Mutation::Put { key, value, .. } = mutation {
+                self.snapshot.insert(key.clone(), version, value.clone());
+            }
+        }
         self.seq = version;
         self.save()?;
         Ok(version)
@@ -864,11 +1042,9 @@ impl Store {
     fn save(&self) -> Result<(), Failure> {
         let mut text = format!("{{\"seq\":{}}}\n", self.seq);
         for (key, version, value) in self.snapshot.records() {
-            let key = String::from_utf8_lossy(key);
             text.push_str(&format!(
-                "{{\"key\":{},\"version\":{version},\"value_hex\":\"{}\"}}
-",
-                json_str(&key),
+                "{{\"key_hex\":\"{}\",\"version\":{version},\"value_hex\":\"{}\"}}\n",
+                hex::encode(key),
                 hex::encode(value)
             ));
         }
@@ -879,9 +1055,11 @@ impl Store {
     }
 }
 
-/// Read back the line `compile` printed. The envelope must open (digest included), be a
-/// `Document`, and hold a canonical payload, or nothing is applied: the file is input, so it is
-/// checked like a stored record is on read.
+/// Read back the line a compile printed (`compile`, or a collection command with
+/// `--compile-only`). It is input, so every write is checked the way a stored record is on read
+/// before anything is applied: the keys parse, in strictly ascending order (one write per key, as
+/// every compile emits); a root reads back through the library; a map entry is a document and a
+/// set member is empty, read through `member` under the root written beside it.
 fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
     let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
     let source = std::fs::File::open(file).map_err(cannot)?;
@@ -896,81 +1074,187 @@ fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
     let bad =
         |what: &str| Failure::usage(format!("{} is not a compile line: {what}", file.display()));
     let json: serde_json::Value = serde_json::from_str(line).map_err(|e| bad(&e.to_string()))?;
-    if json["cmd"] != "compile" || !json["error"].is_null() {
-        return Err(bad("cmd must be \"compile\", with no error"));
+    let compiled_line = json["cmd"] == "compile" || json["compile_only"] == true;
+    if !compiled_line || !json["error"].is_null() {
+        return Err(bad(
+            "cmd must be \"compile\", or compile_only must be true, with no error",
+        ));
     }
-    let key = Bytes::copy_from_slice(json["key"].as_str().ok_or_else(|| bad("key"))?.as_bytes());
-    let value = hex::decode(
-        json["envelope_hex"]
+    let hex_field = |item: &serde_json::Value, name: &str, at: &str| -> Result<Vec<u8>, Failure> {
+        let text = item[name]
             .as_str()
-            .ok_or_else(|| bad("envelope_hex"))?,
-    )
-    .map_err(|e| bad(&format!("envelope_hex: {e}")))?;
-    let keyed = |f: Failure| f.keyed(&String::from_utf8_lossy(&key));
-    let opened = envelope::open(&value)
-        .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Envelope(e)))))?;
-    if opened.kind != Kind::Document {
-        return Err(keyed(bad(&format!(
-            "envelope kind {:?} is not Document",
-            opened.kind
-        ))));
+            .ok_or_else(|| bad(&format!("{at}{name}")))?;
+        hex::decode(text).map_err(|e| bad(&format!("{at}{name}: {e}")))
+    };
+    let items = json["mutations"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| bad("mutations must be a non-empty array"))?;
+    let mut mutations = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let at = format!("mutations[{i}].");
+        let key = Bytes::from(hex_field(item, "key_hex", &at)?);
+        let expected_version = match &item["expected_version"] {
+            serde_json::Value::Null => None,
+            v => Some(
+                v.as_u64()
+                    .ok_or_else(|| bad(&format!("{at}expected_version")))?,
+            ),
+        };
+        mutations.push(match item["op"].as_str() {
+            Some("Put") => Mutation::Put {
+                key,
+                value: Bytes::from(hex_field(item, "value_hex", &at)?),
+                expected_version,
+            },
+            Some("Delete") => Mutation::Delete {
+                key,
+                expected_version,
+            },
+            _ => return Err(bad(&format!("{at}op must be \"Put\" or \"Delete\""))),
+        });
     }
-    cbor::decode(opened.payload)
-        .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Codec(e)))))?;
-    let expected_version = match &json["expected_version"] {
-        serde_json::Value::Null => None,
-        v => Some(v.as_u64().ok_or_else(|| bad("expected_version"))?),
-    };
-    let condition = match json["condition"].as_str() {
-        None => None,
-        Some("Absent") => Some(Condition::Absent { key: key.clone() }),
-        Some(other) => return Err(bad(&format!("unknown condition {other:?}"))),
-    };
+    if mutations.windows(2).any(|w| w[0].key() >= w[1].key()) {
+        return Err(bad(
+            "keys must be strictly ascending: one write per key, in key order",
+        ));
+    }
+    let mut conditions = Vec::new();
+    let items = json["conditions"]
+        .as_array()
+        .ok_or_else(|| bad("conditions must be an array"))?;
+    for (i, item) in items.iter().enumerate() {
+        let at = format!("conditions[{i}].");
+        if item["op"] != "Absent" {
+            return Err(bad(&format!("{at}op must be \"Absent\"")));
+        }
+        conditions.push(Condition::Absent {
+            key: Bytes::from(hex_field(item, "key_hex", &at)?),
+        });
+    }
+    check_writes(&mutations)?;
     Ok(Compiled {
-        mutation: Mutation::Put {
-            key,
-            value: Bytes::from(value),
-            expected_version,
-        },
-        condition,
+        mutations,
+        conditions,
     })
+}
+
+/// Every write in a compiled line reads back (see [`load_compiled`]). A refusal names the key.
+fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
+    // Every `Put` at version 1, so each one is read the way it would be once applied.
+    let mut written = MapSnapshot::new(Generation(1));
+    for mutation in mutations {
+        if let Mutation::Put { key, value, .. } = mutation {
+            written.insert(key.clone(), 1, value.clone());
+        }
+    }
+    for mutation in mutations {
+        let Mutation::Put { key, value, .. } = mutation else {
+            continue;
+        };
+        let keyed = |f: Failure| f.with(vec![("key_hex", json_str(&hex::encode(key)))]);
+        let parsed = keys::parse(key)
+            .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Key(e)))))?;
+        let root = parsed.root();
+        match (parsed.sub, &parsed.element) {
+            (Sub::Root, _) => {
+                let opened = envelope::open(value)
+                    .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Envelope(e)))))?;
+                if opened.kind == Kind::Document {
+                    read(&written, &root).map_err(|e| keyed(e.into()))?;
+                } else {
+                    coll::collection(&written, &root).map_err(|e| keyed(e.into()))?;
+                }
+            }
+            (Sub::Element, Some(element)) => {
+                if written.version(Namespace::User, root.as_bytes()).is_none() {
+                    return Err(keyed(Failure::usage(
+                        "an element write without its collection's root write \
+                         (ADR-rdb-0013 §10)",
+                    )));
+                }
+                coll::member(&written, &root, element).map_err(|e| keyed(e.into()))?;
+            }
+            (Sub::Element, None) => {
+                return Err(Failure::store("an element key parsed without an element"))
+            }
+            (Sub::Reserved(byte), _) => {
+                return Err(keyed(Failure::usage(format!(
+                    "sub byte {byte:#04x} is reserved; this build writes no such record"
+                ))))
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------
 // Output
 // ---------------------------------------------------------------------------------------------
 
+/// `conditions` and `mutations`: what `apply` reads back. A compile attaches only `Absent`;
+/// another condition is printed by name and `apply` refuses it.
 fn compiled_fields(compiled: &Compiled) -> Result<Fields, Failure> {
-    let Mutation::Put {
-        value,
-        expected_version,
-        ..
-    } = &compiled.mutation
-    else {
-        return Err(Failure::usage(
-            "compile produced something other than a Put",
-        ));
+    let conditions: Vec<String> = compiled
+        .conditions
+        .iter()
+        .map(|condition| match condition {
+            Condition::Absent { key } => format!(
+                "{{\"op\":\"Absent\",\"key_hex\":{}}}",
+                json_str(&hex::encode(key))
+            ),
+            other => format!("{{\"op\":{}}}", json_str(&format!("{other:?}"))),
+        })
+        .collect();
+    let mut items = Vec::new();
+    for mutation in &compiled.mutations {
+        items.push(mutation_line(mutation)?.render());
+    }
+    Ok(vec![
+        ("conditions", format!("[{}]", conditions.join(","))),
+        ("mutations", format!("[{}]", items.join(","))),
+    ])
+}
+
+/// One write: `op`, `key_hex`, the decoded `element` for an element key, `expected_version`,
+/// and for a `Put` its `value_hex` and, unless it is empty (a set member), the envelope's fields
+/// and the decoded `value`.
+fn mutation_line(mutation: &Mutation) -> Result<Line, Failure> {
+    let (op, key, expected_version, value) = match mutation {
+        Mutation::Put {
+            key,
+            value,
+            expected_version,
+        } => ("Put", key, expected_version, Some(value)),
+        Mutation::Delete {
+            key,
+            expected_version,
+        } => ("Delete", key, expected_version, None),
     };
-    let condition = match &compiled.condition {
-        None => "null".to_owned(),
-        Some(Condition::Absent { .. }) => json_str("Absent"),
-        Some(other) => json_str(&format!("{other:?}")),
-    };
-    let mut fields = vec![
-        ("condition", condition),
-        (
-            "expected_version",
-            expected_version.map_or_else(|| "null".to_owned(), |v| v.to_string()),
-        ),
-    ];
-    fields.extend(envelope_fields(value)?);
-    fields.push(("envelope_hex", json_str(&hex::encode(value))));
-    let opened = envelope::open(value)
-        .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Envelope(e))))?;
-    let after = cbor::decode(opened.payload)
-        .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Codec(e))))?;
-    fields.push(("value", render(&after)));
-    Ok(fields)
+    let mut line = Line::default();
+    line.str("op", op);
+    line.str("key_hex", &hex::encode(key));
+    let parsed =
+        keys::parse(key).map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Key(e))))?;
+    if let Some(element) = &parsed.element {
+        line.raw("element", render(element));
+    }
+    line.raw(
+        "expected_version",
+        expected_version.map_or_else(|| "null".to_owned(), |v| v.to_string()),
+    );
+    if let Some(value) = value {
+        line.str("value_hex", &hex::encode(value));
+        if !value.is_empty() {
+            line.extend(envelope_fields(value)?);
+            let opened = envelope::open(value)
+                .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Envelope(e))))?;
+            let decoded = cbor::decode(opened.payload)
+                .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Codec(e))))?;
+            line.raw("value", render(&decoded));
+        }
+    }
+    Ok(line)
 }
 
 fn envelope_fields(raw: &[u8]) -> Result<Fields, Failure> {
@@ -1399,8 +1683,13 @@ mod tests {
             let doc = Value::Array(vec![Value::Bytes(Vec::new()); n]);
             let delta = Delta(vec![Op::Replace(doc.clone())]);
             let snapshot = MapSnapshot::new(Generation(1));
-            let compiled =
-                compile(&snapshot, b"user:1", Expected::Absent, &delta).expect("compiles");
+            let compiled = compile(
+                &snapshot,
+                &root_of("user:1").expect("id"),
+                Expected::Absent,
+                &delta,
+            )
+            .expect("compiles");
             let mut line = Line::new("compile");
             line.str("key", "user:1");
             line.extend(compiled_fields(&compiled).expect("fields"));
@@ -1435,8 +1724,9 @@ mod tests {
         let mut line = Line::new("compile");
         line.extend(fields);
         let good = line.render();
-        // Digest bytes follow the 8-byte head: hex digits 16..80 of `envelope_hex`.
-        let at = good.find("\"envelope_hex\":\"").expect("envelope_hex") + 16 + 16;
+        // Digest bytes follow the 8-byte head: hex digits 16..80 of the first `value_hex`, the
+        // document's one `Put`.
+        let at = good.find("\"value_hex\":\"").expect("value_hex") + 13 + 16;
         let mut flipped = good.into_bytes();
         flipped[at] = if flipped[at] == b'0' { b'1' } else { b'0' };
         let file = dir.join("c.json");
@@ -1478,7 +1768,7 @@ mod tests {
         let mut json: serde_json::Value = serde_json::from_str(&line.render()).expect("json");
         let sealed = envelope::seal(Kind::Document, &[0x18, 0x01]).expect("seals");
         assert!(envelope::open(&sealed).is_ok(), "the digest is right");
-        json["envelope_hex"] = serde_json::Value::String(hex::encode(&sealed));
+        json["mutations"][0]["value_hex"] = serde_json::Value::String(hex::encode(&sealed));
         let file = dir.join("c.json");
         std::fs::write(&file, json.to_string()).expect("write");
         let before = std::fs::read(&store).expect("store");

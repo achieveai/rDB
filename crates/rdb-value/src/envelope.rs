@@ -35,12 +35,16 @@ pub const CODEC_DOCUMENT_V1: u8 = 0x01;
 /// `digest_alg` `0x01`: SHA-256 over the payload.
 pub const DIGEST_SHA256: u8 = 0x01;
 
-/// The envelope's `kind` table. Its own table, not ADR-rdb-0011 O4's object sub-key
-/// discriminator (ADR-rdb-0012 decision 13). `0x00` is invalid; other values are reserved.
+/// The envelope's `kind` table. Its own table, not the object sub-key discriminator
+/// ([`crate::keys::Sub`]; ADR-rdb-0012 decision 13). `0x00` is invalid; other values are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A document, encoded with the `rdb-cbor-document` codec.
     Document,
+    /// The root record of a map (ADR-rdb-0013 decision 7).
+    Map,
+    /// The root record of a set (ADR-rdb-0013 decision 7).
+    Set,
 }
 
 impl Kind {
@@ -49,6 +53,8 @@ impl Kind {
     pub const fn byte(self) -> u8 {
         match self {
             Self::Document => 0x01,
+            Self::Map => 0x02,
+            Self::Set => 0x03,
         }
     }
 
@@ -57,6 +63,8 @@ impl Kind {
     pub const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0x01 => Some(Self::Document),
+            0x02 => Some(Self::Map),
+            0x03 => Some(Self::Set),
             _ => None,
         }
     }

@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::envelope::LIMIT_TEXT;
+use crate::envelope::{Kind, LIMIT_TEXT};
 use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
 
@@ -99,6 +99,32 @@ pub enum ApplyError {
     /// A map key or set member is an array or a map. Only scalars are keys (ADR-rdb-0013 §4).
     #[error("an array or a map cannot be a map key or set member")]
     UnsupportedKeyType,
+    /// The op does not fit the object's kind: a document op on a map or set, a collection op on
+    /// a document, a map op on a set, or the reverse (ADR-rdb-0013 §10).
+    #[error("the object is a {found:?}, which this op does not apply to")]
+    KindMismatch {
+        /// The object's kind.
+        found: Kind,
+    },
+    /// A `need … absent` found the element present.
+    #[error("the element is present")]
+    ElementExists,
+    /// A `need … present` found the element absent.
+    #[error("the element is absent")]
+    ElementAbsent,
+    /// A collection that still has elements cannot be dropped.
+    #[error("the collection still has {count} elements")]
+    NotEmpty {
+        /// The root's element count.
+        count: u64,
+    },
+    /// The compiled request would carry more writes than one transaction admits; nothing is
+    /// written.
+    #[error("{writes} writes are more than one transaction admits")]
+    TooManyWrites {
+        /// The writes the delta would make.
+        writes: usize,
+    },
 }
 
 /// Apply `delta` to `base` (`None` = absent).
