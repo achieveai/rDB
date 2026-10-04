@@ -3160,6 +3160,144 @@ fn an_oversized_request_is_refused_before_dedup_and_conditions() {
     assert_eq!(h.snap.at, written, "nothing written");
 }
 
+// ---------------------------------------------------------------------------------------------
+// One key written twice in one request (ADR-rdb-0013 open item O5; Gautam Q4, ruling L-R186f)
+// ---------------------------------------------------------------------------------------------
+
+/// `request` carrying exactly `mutations`, with no conditions.
+fn writes(request: u64, mutations: Vec<Mutation>) -> TxnRequest {
+    TxnRequest {
+        mutations,
+        ..put(request, b"k", b"")
+    }
+}
+
+fn put_at(k: &[u8], value: &'static [u8]) -> Mutation {
+    Mutation::Put {
+        key: key(k),
+        value: Bytes::from_static(value),
+        expected_version: None,
+    }
+}
+
+fn delete_at(k: &[u8]) -> Mutation {
+    Mutation::Delete {
+        key: key(k),
+        expected_version: None,
+    }
+}
+
+/// Scenario: a caller sends one request that writes key K twice. ADR-rdb-0013 open item O5:
+/// check 10 refuses it `INVALID_ARGUMENT` naming `mutations`, with no check asked, nothing
+/// written, nothing retained and `next_seq` unmoved, and a retry gets the same answer. Two `Put`s
+/// are refused, and so is a `Put` with a `Delete` in either order. The next request runs.
+///
+/// Regression. On fe50411 all three were admitted and the batch carried both writes in request
+/// order, so the last one won: walked on `rdb-sim`'s A1/P1 fixture, two `Put`s published at
+/// seq 12 on all three copies and a read of K served the second value, and `Put` then `Delete`
+/// published and left K absent.
+#[retcd_test]
+fn check_ten_refuses_a_request_that_writes_one_key_twice() {
+    let mut h = H::live();
+    let before = (
+        h.k().next_seq(),
+        h.k().prev_digest(),
+        h.k().dedup().len(),
+        h.snap.at,
+    );
+    let cases = [
+        (1, vec![put_at(b"k", b"1"), put_at(b"k", b"2")]),
+        (2, vec![put_at(b"k", b"1"), delete_at(b"k")]),
+        (
+            3,
+            vec![delete_at(b"k"), put_at(b"a", b"1"), put_at(b"k", b"2")],
+        ),
+    ];
+    for (request, mutations) in cases {
+        let refused = fail(request, RdbError::InvalidArgument { field: "mutations" });
+        let req = writes(request, mutations);
+        assert_eq!(h.step(submit(req.clone())), refused, "request {request}");
+        assert_eq!(h.step(submit(req)), refused, "request {request} retried");
+        assert_eq!(
+            (
+                h.k().next_seq(),
+                h.k().prev_digest(),
+                h.k().dedup().len(),
+                h.snap.at
+            ),
+            before,
+            "request {request}: nothing written or retained"
+        );
+        assert!(h.k().inflight().is_none(), "request {request}");
+    }
+    let _ = h.resolve(put(9, b"k", b"9"));
+}
+
+/// O5 counts mutations, never conditions. Scenario: a caller creates K, so the request pairs
+/// `Condition::Absent{K}` with `Put{K}`, and it names that condition twice; it is admitted.
+/// Scenario: a caller writes and deletes distinct keys in one request, under two identical
+/// `VersionEquals` conditions on a key it also writes; it is admitted. The 255-mutation cap
+/// keeps its own row, `check_ten_admits_each_upper_bound_and_refuses_one_more`.
+#[retcd_test]
+fn check_ten_counts_only_mutations_when_it_looks_for_one_key_twice() {
+    let mut h = H::live();
+    let mut create = put(1, b"doc", b"v");
+    create.conditions = vec![Condition::Absent { key: key(b"doc") }; 2];
+    let correlation = h.admit(create);
+    assert_eq!(
+        h.step(answer(correlation, 1, Verdict::Admit)).len(),
+        1,
+        "the create is dispatched"
+    );
+
+    let mut distinct = writes(
+        2,
+        vec![put_at(b"a", b"1"), delete_at(b"b"), put_at(b"c", b"3")],
+    );
+    distinct.conditions = vec![
+        Condition::VersionEquals {
+            key: key(b"a"),
+            version: 3,
+        };
+        2
+    ];
+    assert_eq!(h.step(submit(distinct)), vec![], "queued behind the create");
+    assert_eq!(h.k().queue_len(), 1);
+}
+
+/// Which answer wins when a request that writes one key twice has another fault too. ADR-0004 §3
+/// "First failure wins". O5's refusal is part of check 10's structure, and check 10 runs its
+/// structure before the record's bytes (spec §4.2's two limits, the count first), so:
+/// - over the 1 MiB record cap as well: `mutations`, not `envelope_bytes`;
+/// - a condition that fails as well: `mutations`, not `CONDITION_FAILED` (check 12);
+/// - a resend under a request id the index already holds: `mutations`, not `REQUEST_ID_REUSE`
+///   (check 11), and nothing retained.
+#[retcd_test]
+fn one_key_written_twice_is_refused_before_the_byte_cap_dedup_and_conditions() {
+    let mut h = H::live();
+    let refused = |request| fail(request, RdbError::InvalidArgument { field: "mutations" });
+
+    let mut oversized = put_sized(1, MAX_ENVELOPE_BYTES);
+    oversized.mutations.push(put_at(b"big", b"2"));
+    assert_eq!(h.step(submit(oversized)), refused(1), "over the byte cap");
+
+    let mut condition_fails = writes(2, vec![put_at(b"k", b"1"), put_at(b"k", b"2")]);
+    condition_fails.conditions.push(Condition::Present {
+        key: key(b"absent"),
+    });
+    assert_eq!(
+        h.step(submit(condition_fails)),
+        refused(2),
+        "condition fails"
+    );
+
+    let _ = h.resolve(put(3, b"k", b"v"));
+    let retained = h.k().dedup().len();
+    let resend = writes(3, vec![put_at(b"k", b"v"), put_at(b"k", b"v")]);
+    assert_eq!(h.step(submit(resend)), refused(3), "id already retained");
+    assert_eq!(h.k().dedup().len(), retained);
+}
+
 /// Ruling L-R185v (ADR-rdb-0012 Consequences, spec §4.3.1): the largest document one request
 /// can write is the 1 MiB record less everything else the record carries. That is 275 bytes of
 /// framing (the 46-byte header, 129 bytes of fixed fields, the 90-byte dedup write and the
