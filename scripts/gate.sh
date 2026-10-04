@@ -70,9 +70,9 @@ run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
 # All four teams held a stale basis at once on 2026-09-20, and a stale basis always over-holds:
 # rows report Unavailable on types that have already landed. See scripts/drift-check.sh.
 run_drift() { scripts/drift-check.sh; }
-# The third non-cargo check, row M7F-42: rdb-core is a pure fold and no trace path is
-# unordered. The rule lives in scripts/purity-check.sh, for the reason the drift stage gives
-# above — two copies of a rule drift apart.
+# The third non-cargo check, row M7F-42: rdb-core is a pure fold, rdb-value is pure too
+# (ADR-rdb-0012), and no trace path is unordered. The rule lives in scripts/purity-check.sh, for
+# the reason the drift stage gives above — two copies of a rule drift apart.
 run_purity() { scripts/purity-check.sh; }
 run_lint() { echo "== clippy"; cargo clippy --workspace --all-targets -- -D warnings; }
 # `--workspace` is dropped when the caller names a package. Cargo treats `--workspace -p x` as

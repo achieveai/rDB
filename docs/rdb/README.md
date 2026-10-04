@@ -43,7 +43,8 @@ existing one as history rather than as a source.
 |---|---|---|
 | `crates/rdb-core` | the pure kernel: seam contracts and six protocol modules | M7 |
 | `crates/rdb-sim` | the deterministic simulator: scheduler, clock, network, fake control store, storage, harness | M7 |
-| `crates/rdb-storage` | RocksDB behind the `SnapshotRead` seam | M8 (reserved) |
+| `crates/rdb-storage` | RocksDB behind the `SnapshotRead` seam: atomic canonical batches with crash and reopen (S0), and generations that read through to their parent (S1, ADR-rdb-0010). Walk-through: `crates/rdb-storage/README.md` | M8 |
+| `crates/rdb-value` | documents: the deterministic CBOR profile, the object envelope and path ops, compiled to one whole-document put. Pure: no clock, no I/O (ADR-rdb-0011, ADR-rdb-0012) | M8 |
 | `crates/rdb-api` | the client-facing surface | later (reserved) |
 
 Build and check the M7 crates with a private target directory, never against the shared one:

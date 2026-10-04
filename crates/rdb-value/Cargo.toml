@@ -1,0 +1,35 @@
+[package]
+name = "rdb-value"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rDB documents (M8 S2): the deterministic CBOR profile, the object envelope and path ops, compiled to one whole-document put. Pure: no clock, no I/O"
+
+# Exactly these five (ADR-rdb-0012 Verification; ADR-rdb-0011: pure, no RocksDB, no `config-*`).
+[dependencies]
+rdb-core = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+# SHA-256 of the canonical payload (ADR-rdb-0012 decision 9). Already pinned for `rdb-core`.
+sha2 = { workspace = true }
+# Exact pin: the library shapes the bytes we read (ADR-rdb-0012 decision 6).
+cbor4ii = { workspace = true }
+
+[dev-dependencies]
+# The example's JSON input and its one-JSON-object-per-command output. `float_roundtrip`: the
+# default parser is best-effort and stores ~1 in 3 decimals 1 ULP off (tester W2 defect D1). It adds
+# no crate; it unifies into test builds of the workspace, where it only makes parsing exact.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+# A serde visitor, so the example refuses a JSON object with a duplicate key instead of
+# silently keeping the last one (which is what `serde_json::Value` does).
+serde = { workspace = true }
+hex = { workspace = true }
+# Random documents and op lists for the read-back, determinism and byte-walk properties.
+proptest = { workspace = true }
+# The second reader: decodes every accepted payload on its own (s2-design §5). Test-only.
+ciborium = { workspace = true }
+
+[[example]]
+name = "doc_scenario"
+# Run the example's regression tests (W2 defects D1, A3, `-0`) under `cargo test -p rdb-value`.
+test = true

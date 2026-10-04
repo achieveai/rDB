@@ -1612,6 +1612,31 @@ fn a_mutations_expected_version_counts_after_the_conditions() {
     );
 }
 
+/// ADR-rdb-0012 §11 (create-if-absent; review L-R185zb). `Condition::Absent` over a key that
+/// already has a record is `CONDITION_FAILED` at its index, and nothing is reserved or written:
+/// this is what makes the second of two racing creates fail. The twin, one fact apart (the key
+/// has no record): the same request goes on to its dispatch check.
+#[retcd_test]
+fn an_absent_condition_over_an_existing_key_fails_and_writes_nothing() {
+    let create = || {
+        let mut req = put(1, b"doc", b"v");
+        req.conditions.push(Condition::Absent { key: key(b"doc") });
+        req
+    };
+    let mut h = H::live();
+    h.snap.versions.insert(key(b"doc").to_vec(), 1);
+    let before = (h.k().next_seq(), h.k().prev_digest(), h.snap.at);
+    assert_eq!(
+        h.step(submit(create())),
+        fail(1, RdbError::ConditionFailed { index: 0 })
+    );
+    assert_eq!((h.k().next_seq(), h.k().prev_digest(), h.snap.at), before);
+    assert_eq!(h.k().inflight(), None);
+
+    let mut h = H::live();
+    let _ = h.admit(create());
+}
+
 /// M7A-80. A `Deny(Expired)` for the outstanding check, at the current `authority_seq`, answers
 /// `LEASE_EXPIRED` and discards the reservation: `next_seq` and `prev_digest` are what they were
 /// before the `Submit`, nothing is retained, and the queue is pumped. The twin, one fact apart
@@ -3133,6 +3158,71 @@ fn an_oversized_request_is_refused_before_dedup_and_conditions() {
     assert_eq!(h.k().dedup().len(), retained);
     assert_eq!(h.k().next_seq(), next);
     assert_eq!(h.snap.at, written, "nothing written");
+}
+
+/// Ruling L-R185v (ADR-rdb-0012 Consequences, spec §4.3.1): the largest document one request
+/// can write is the 1 MiB record less everything else the record carries. That is 275 bytes of
+/// framing (the 46-byte header, 129 bytes of fixed fields, the 90-byte dedup write and the
+/// `Put`'s own 10), then the key, then one byte per condition. The literals are the pin: a change
+/// to the record's layout fails here, and the two documents that state the formula get re-read.
+///
+/// The kernel never decodes a document, so the value is opaque bytes. In `rdb-value` terms it is
+/// a document envelope, whose 40-byte header leaves the payload. A create (`Expected::Absent`)
+/// carries one condition. An update carries none, so it may be one byte larger.
+#[retcd_test]
+fn the_largest_document_is_the_record_less_key_dedup_and_framing() {
+    const FRAMING: usize = 275;
+    const DOCUMENT_HEADER: usize = 40;
+    let doc = key(b"user:1");
+    assert_eq!(doc.len(), KEY_SCOPE_LEN + 6);
+    let write = |request: u64, len: usize, create: bool| TxnRequest {
+        conditions: if create {
+            vec![Condition::Absent { key: doc.clone() }]
+        } else {
+            Vec::new()
+        },
+        mutations: vec![Mutation::Put {
+            key: doc.clone(),
+            value: Bytes::from(vec![0xAB; len]),
+            expected_version: (!create).then_some(1),
+        }],
+        ..put(request, b"user:1", b"")
+    };
+    let refused = |request| {
+        fail(
+            request,
+            RdbError::InvalidArgument {
+                field: "envelope_bytes",
+            },
+        )
+    };
+    let create_max = MAX_ENVELOPE_BYTES - FRAMING - doc.len() - 1;
+    let update_max = MAX_ENVELOPE_BYTES - FRAMING - doc.len();
+    assert_eq!(
+        (create_max - DOCUMENT_HEADER, update_max - DOCUMENT_HEADER),
+        (1_048_242, 1_048_243),
+        "the largest payloads for an 18-byte key"
+    );
+
+    // A create: one byte over is refused before anything is written; the largest commits.
+    let mut h = H::live();
+    let next = h.k().next_seq();
+    assert_eq!(h.step(submit(write(1, create_max + 1, true))), refused(1));
+    assert_eq!(h.snap.at, Seq::ZERO, "nothing written");
+    let correlation = h.admit(write(2, create_max, true));
+    assert_eq!(reserved_len(&h), MAX_ENVELOPE_BYTES);
+    let effects = h.step(answer(correlation, 1, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected exactly one batch, got {effects:?}");
+    };
+    assert_eq!(batch.seq, next);
+
+    // An update of the document at version 1: no condition, so one byte more fits.
+    let mut h = H::live();
+    h.snap.versions.insert(doc.to_vec(), 1);
+    assert_eq!(h.step(submit(write(3, update_max + 1, false))), refused(3));
+    let _ = h.admit(write(4, update_max, false));
+    assert_eq!(reserved_len(&h), MAX_ENVELOPE_BYTES);
 }
 
 // ---------------------------------------------------------------------------------------------

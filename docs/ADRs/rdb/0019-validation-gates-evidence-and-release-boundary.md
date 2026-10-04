@@ -51,7 +51,7 @@ plan, and that re-derivation is stated here rather than implied.
 | V10 | Recovery load | not in scope | M12 | pending — RTO is a provisional objective, not a guarantee | replication + performance |
 | V11 | Resource envelope | not in scope | M12 | pending | storage/runtime |
 | V12 | Compatibility | **claimed, subset** | M9 full | M7: message/record subset only — INV-VER asserts an unknown mandatory version is refused **before apply**. Downgrade-after-format-bump is out of M7. | foundation |
-| V13 | Value semantics | not in scope | M8 | pending | api + storage |
+| V13 | Value semantics | not in scope | M8 | **M8 S2, documents only — partial, narrowed three ways (Gautam, L-R184y).** In `rdb-value`, per ADR-rdb-0012 Verification: profile vectors byte-exact both ways; every named refusal; an independent byte walk over every encoded output; `ciborium` as a second **reader** of accepted bytes — not a second writer; random and mutated input by `proptest` — not coverage-guided fuzzing; path ops, laws L1–L6 and "every accepted write reads back" by property. Errors are checked on the primary only, because replicas never decode a document; replicas apply the primary's bytes. Across stores: the S1 differential in `rdb-storage` has a value-op source; compiled document writes are byte-equal on `RocksSnapshot` and a `MapSnapshot` of the oracle's records, and read back on both engines (L-R185r). **Owed:** map/set, lists and the B+ tree (S3, S4). | api + storage |
 | V14 | Large blobs | not in scope | M8 | pending | storage + replication |
 | V15 | Merge safety | not in scope | M8 | pending | storage |
 

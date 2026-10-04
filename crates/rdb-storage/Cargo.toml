@@ -32,6 +32,10 @@ tracing-subscriber = { workspace = true }
 # does). Allowed direction: rdb-* -> config-*.
 config-testkit = { workspace = true }
 serde_json = { workspace = true }
+# The S1 differential's value-op source (S2 design §6 W3): compiled document writes must be
+# byte-equal on RocksDB and the oracle, and read back on both. A dev-dependency only, so the
+# storage crate never decodes a document (ADR-rdb-0011, ADR-rdb-0012).
+rdb-value = { workspace = true }
 
 [[example]]
 name = "rocks_scenario"
