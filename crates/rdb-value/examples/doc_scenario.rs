@@ -422,11 +422,14 @@ fn root_of(arg: &str) -> Result<RootKey, Failure> {
     Ok(keys::root_key(TENANT, AFFINITY, &object_id(arg)?))
 }
 
-/// An object id as this tool takes it back: the text when it is UTF-8 and cannot be read as
-/// `hex:`, otherwise `hex:<hex>`.
+/// An object id as this tool takes it back: the text when it is UTF-8 with no control
+/// character (no shell argument carries `00`) and cannot be read as `hex:`, otherwise
+/// `hex:<hex>`.
 fn show_id(id: &[u8]) -> String {
     match std::str::from_utf8(id) {
-        Ok(text) if !text.starts_with("hex:") => text.to_owned(),
+        Ok(text) if !text.starts_with("hex:") && !text.chars().any(char::is_control) => {
+            text.to_owned()
+        }
         _ => format!("hex:{}", hex::encode(id)),
     }
 }
@@ -1595,6 +1598,26 @@ mod tests {
              \"t\":{\"$timestamp\":{\"secs\":-1,\"nanos\":123}},\"a$\":1,\
              \"$$$x\":[{\"$$y\":null}]}"
         );
+    }
+
+    /// D-W2-1 (dev walk, C23): `dump` printed an id holding `00` and `01` as text with control
+    /// characters, which no shell argument can carry back. Such an id prints as `hex:`, and
+    /// every printed id parses back to the same bytes.
+    #[test]
+    fn d_w2_1_an_id_with_control_bytes_prints_as_hex_and_reads_back() {
+        let c23 = hex::decode("63617274000101606170706c650001").unwrap();
+        assert_eq!(show_id(&c23), "hex:63617274000101606170706c650001");
+        for id in [
+            &c23[..],
+            b"cart",
+            b"user:1",
+            b"hex:61",
+            b"a\x7fb",
+            &[0xff, 0x00],
+        ] {
+            assert_eq!(object_id(&show_id(id)).expect("parses"), id, "{id:?}");
+        }
+        assert_eq!(show_id(b"user:1"), "user:1");
     }
 
     // ---- PR #23 review: F-001 bounded reads, F-002 a validated `apply` ---------------------
