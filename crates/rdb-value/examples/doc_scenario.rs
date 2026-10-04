@@ -1671,6 +1671,62 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 
+    /// Tester paper cut (s3-tester-w1.md): `ObjectAbsent` said "the document does not exist"
+    /// for a map or a set too.
+    #[test]
+    fn pc1_object_absent_on_a_map_does_not_call_it_a_document() {
+        let dir = scratch("pc1");
+        let store = dir.join("s.jsonl");
+        let err = coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["cart", "--expect", "1", "put", "\"x\"", "1"]),
+        )
+        .expect_err("absent");
+        assert_eq!(err.error, "ObjectAbsent", "{}", err.detail);
+        assert!(!err.detail.contains("document"), "{}", err.detail);
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Tester paper cut (s3-tester-w1.md): a refused create printed the root it never wrote,
+    /// e.g. `map tags --absent` on the set `tags` showed `kind: Map, count: 0` beside
+    /// `ConditionFailed`. A refusal prints no `kind` or `count`; a commit still does.
+    #[test]
+    fn pc2_a_refused_create_prints_no_root_it_never_wrote() {
+        let dir = scratch("pc2");
+        let store = dir.join("s.jsonl");
+        let made = coll::write_cmd(
+            &store,
+            coll::CollectionKind::Set,
+            &args(&["tags", "--absent", "add", "\"a\""]),
+        )
+        .expect("create the set");
+        let names: Vec<_> = made.iter().map(|(name, _)| *name).collect();
+        assert!(
+            names.contains(&"kind") && names.contains(&"count"),
+            "{names:?}"
+        );
+
+        let err = coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["tags", "--absent"]),
+        )
+        .expect_err("the set exists");
+        assert!(
+            err.error.starts_with("ConditionFailed"),
+            "{}: {}",
+            err.error,
+            err.detail
+        );
+        let names: Vec<_> = err.fields.iter().map(|(name, _)| *name).collect();
+        assert!(
+            !names.contains(&"kind") && !names.contains(&"count"),
+            "{names:?}"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
     // ---- PR #23 review: F-001 bounded reads, F-002 a validated `apply` ---------------------
 
     /// A directory of this test's own, under the gate's data root when it sets one.

@@ -50,8 +50,9 @@ impl fmt::Display for Location {
 /// Why an op, or a compile, is refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApplyError {
-    /// An op other than `Replace` on a document that does not exist, or an empty delta on one.
-    #[error("the document does not exist")]
+    /// An op other than `Replace` on a document that does not exist, or an empty delta on one;
+    /// or a map or set update, read or drop of an object that does not exist.
+    #[error("the object does not exist")]
     ObjectAbsent,
     /// A map has no such key.
     #[error("nothing at segment {segment:?}")]

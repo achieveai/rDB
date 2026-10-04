@@ -31,12 +31,17 @@ pub fn write_cmd(
 ) -> Result<Fields, Failure> {
     let (id, root, rest) = object(rest)?;
     let body = parse_ops(rest).map_err(|e| e.keyed(id))?;
-    let mut fields = id_fields(id, &root);
+    let fields = id_fields(id, &root);
     let mut store = Store::load(store_path)?;
     let compiled = compile_collection(&store.snapshot, &root, kind, body.expected, &body.ops)
         .map_err(|e| Failure::from(e).with(fields.clone()))?;
-    fields.extend(root_after(&compiled, &root)?);
-    emit(&mut store, &compiled, body.compile_only, fields)
+    // The root's kind and count are printed only once it is written or compile-only: a
+    // refused commit wrote no root to describe (tester paper cut, s3-tester-w1.md).
+    let after = root_after(&compiled, &root)?;
+    let at = fields.len();
+    let mut out = emit(&mut store, &compiled, body.compile_only, fields)?;
+    out.splice(at..at, after);
+    Ok(out)
 }
 
 /// `drop <id> --expect V [--compile-only]`.
