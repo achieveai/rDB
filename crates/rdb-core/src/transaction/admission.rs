@@ -242,7 +242,7 @@ fn malformed(req: &TxnRequest) -> Option<&'static str> {
     if req.mutations.is_empty() || req.mutations.len() > MAX_REQUEST_MUTATIONS {
         return Some("mutations");
     }
-    // No two mutations name one key (spec §4.2; ADR-rdb-0013 open item O5). The batch carries
+    // No two mutations name one key (spec §4.2, ruling L-R186f). The batch carries
     // both writes in request order, so the last would silently win. Conditions are not
     // counted: a create pairs `Absent{k}` with `Put{k}`. After the count, so this sees ≤ 255.
     let mut keys = BTreeSet::new();

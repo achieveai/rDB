@@ -3161,7 +3161,7 @@ fn an_oversized_request_is_refused_before_dedup_and_conditions() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// One key written twice in one request (ADR-rdb-0013 open item O5; Gautam Q4, ruling L-R186f)
+// One key written twice in one request (spec §4.2; Gautam Q4, ruling L-R186f)
 // ---------------------------------------------------------------------------------------------
 
 /// `request` carrying exactly `mutations`, with no conditions.
@@ -3187,7 +3187,7 @@ fn delete_at(k: &[u8]) -> Mutation {
     }
 }
 
-/// Scenario: a caller sends one request that writes key K twice. ADR-rdb-0013 open item O5:
+/// Scenario: a caller sends one request that writes key K twice. Spec §4.2, ruling L-R186f:
 /// check 10 refuses it `INVALID_ARGUMENT` naming `mutations`, with no check asked, nothing
 /// written, nothing retained and `next_seq` unmoved, and a retry gets the same answer. Two `Put`s
 /// are refused, and so is a `Put` with a `Delete` in either order. The repeated key need not be
@@ -3239,7 +3239,7 @@ fn check_ten_refuses_a_request_that_writes_one_key_twice() {
     let _ = h.resolve(put(9, b"k", b"9"));
 }
 
-/// O5 counts mutations, never conditions. Scenario: a caller creates K, so the request pairs
+/// The rule counts mutations, never conditions. Scenario: a caller creates K, so the request pairs
 /// `Condition::Absent{K}` with `Put{K}`, and it names that condition twice; it is admitted.
 /// Scenario: a caller writes and deletes distinct keys in one request, under two identical
 /// `VersionEquals` conditions on a key it also writes; it is admitted. The 255-mutation cap
@@ -3272,7 +3272,7 @@ fn check_ten_counts_only_mutations_when_it_looks_for_one_key_twice() {
 }
 
 /// Which answer wins when a request that writes one key twice has another fault too. ADR-0004 §3
-/// "First failure wins". O5's refusal is part of check 10's structure, and check 10 runs its
+/// "First failure wins". This refusal is part of check 10's structure, and check 10 runs its
 /// structure before the record's bytes (spec §4.2's two limits, the count first), so:
 /// - over the 1 MiB record cap as well: `mutations`, not `envelope_bytes`;
 /// - more than `MAX_CONDITIONS` conditions as well: `mutations`, not `conditions` (the key
