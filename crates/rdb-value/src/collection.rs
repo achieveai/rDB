@@ -10,6 +10,7 @@
 //! Reads go through `&dyn SnapshotRead` only. Nothing is repaired: a breach of the integrity rule
 //! (decision 11) is reported as a named [`Corrupt`].
 
+use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -202,7 +203,6 @@ pub fn compile_collection(
     expected: Expected,
     ops: &[ElemOp],
 ) -> Result<Compiled, ValueError> {
-    let read_before = matches!(expected, Expected::Version(_));
     let count_before = match expected {
         Expected::Absent => {
             let root_absent = snapshot.version(Namespace::User, root.as_bytes()).is_none();
@@ -240,14 +240,30 @@ pub fn compile_collection(
             ) => k,
         };
         let full = element_key(root, key)?;
-        let entry = touched.entry(full).or_insert_with_key(|full| {
-            let before = read_before && snapshot.version(Namespace::User, full).is_some();
-            Touched {
-                before,
-                present: before,
-                written: None,
+        let entry = match touched.entry(full) {
+            BTreeEntry::Occupied(entry) => entry.into_mut(),
+            BTreeEntry::Vacant(entry) => {
+                let version = match expected {
+                    Expected::Version(_) => snapshot.version(Namespace::User, entry.key()),
+                    Expected::Absent => None,
+                };
+                // Lead ruling on tester W1 A2: a touched element newer than its root is the
+                // same breach a read reports, so the write that would mask it is refused.
+                if let (Some(element), Expected::Version(root)) = (version, expected) {
+                    if element > root {
+                        return Err(ValueError::Corrupt(Corrupt::ElementNewerThanRoot {
+                            element,
+                            root,
+                        }));
+                    }
+                }
+                entry.insert(Touched {
+                    before: version.is_some(),
+                    present: version.is_some(),
+                    written: None,
+                })
             }
-        });
+        };
         match op {
             ElemOp::Put(_, v) => {
                 entry.present = true;

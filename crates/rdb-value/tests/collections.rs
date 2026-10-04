@@ -228,3 +228,41 @@ fn l_r186s_a_flipped_root_kind_is_damage_on_every_read_path() {
         );
     }
 }
+
+/// Lead ruling on tester W1 A2: `ElementNewerThanRoot` was erased by the next write. Step 10(a)
+/// leaves banana at version 6 under a root at 4. Every op that touches banana (put, remove,
+/// need) is refused by name; compile already reads the element's version, so this costs no
+/// read. A write that touches only other elements still compiles (ADR-0013 §10's masking).
+#[test]
+fn a2_a_write_that_touches_an_element_newer_than_its_root_is_refused() {
+    let root = cart();
+    let mut s = MapSnapshot::new(Generation(1));
+    s.insert(root.to_bytes(), 4, map_root(1));
+    let banana = element_key(&root, &text("banana")).unwrap();
+    s.insert(
+        banana,
+        6,
+        seal(Kind::Document, &encode(&int(5)).unwrap()).unwrap(),
+    );
+    let newer = Err(ValueError::Corrupt(Corrupt::ElementNewerThanRoot {
+        element: 6,
+        root: 4,
+    }));
+    for ops in [
+        vec![ElemOp::Put(text("banana"), int(1))],
+        vec![ElemOp::Remove(text("banana"))],
+        vec![ElemOp::NeedPresent(text("banana"))],
+        vec![
+            ElemOp::Put(text("kiwi"), int(1)),
+            ElemOp::Remove(text("banana")),
+        ],
+    ] {
+        let got = compile_collection(&s, &root, CollectionKind::Map, Expected::Version(4), &ops);
+        assert_eq!(got.map(|_| ()), newer, "{ops:?}");
+    }
+    let kiwi = [ElemOp::Put(text("kiwi"), int(1))];
+    assert!(
+        compile_collection(&s, &root, CollectionKind::Map, Expected::Version(4), &kiwi).is_ok(),
+        "an untouched element is not read"
+    );
+}
