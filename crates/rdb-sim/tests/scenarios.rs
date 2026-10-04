@@ -1647,8 +1647,10 @@ fn m7v_47_case_f1_t1_digest_across_recovery_runs_through_the_runner() {
 ///
 /// The expected verdicts are the owning M7V-47 rows': [`oracle_half`] for all four (clean, and
 /// every invariant whose package the preamble reports unwired says so by name), plus INV-AUTH
-/// `Proven` for A1/P1. `tests/fixtures/scenarios/` does not exist, so clause 1's fixture half has
-/// nothing to replay; the row fails if it appears, so a new fixture cannot go unreplayed.
+/// `Proven` for A1/P1. `tests/fixtures/scenarios/` holds no files, so clause 1's fixture half has
+/// nothing to replay; the row fails if a file appears, so a new fixture cannot go unreplayed. It
+/// checks files, not the directory: git does not track an empty directory, so one left behind in
+/// a working tree is not a fixture.
 #[retcd_test]
 fn m7v_88_every_fixture_and_authored_case_is_realizable_by_the_runner() {
     support::preamble();
@@ -1656,9 +1658,12 @@ fn m7v_88_every_fixture_and_authored_case_is_realizable_by_the_runner() {
 
     let fixtures =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/scenarios");
+    let files: Vec<_> = std::fs::read_dir(&fixtures)
+        .map(|dir| dir.filter_map(Result::ok).map(|e| e.path()).collect())
+        .unwrap_or_default();
     assert!(
-        !fixtures.exists(),
-        "{} exists: replay every file in it here",
+        files.is_empty(),
+        "{} holds {files:?}: replay every file in it here",
         fixtures.display()
     );
 

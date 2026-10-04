@@ -51,7 +51,7 @@ use crate::contracts::txn::{
     Condition, ConditionOutcome, Durability, Mutation, Outcome, TxnRequest, TxnResult,
 };
 use crate::contracts::version::ENVELOPE_VERSION;
-use crate::replication::append::PROGRESS_KEY;
+use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS, PROGRESS_KEY};
 
 pub use crate::contracts::publication::{AppliedCandidate, FreezeCause};
 pub use admission::{admit, deny_error, freeze_error, Boundary, DenyContext, QUEUE_CAP};
@@ -725,9 +725,15 @@ impl TxnKernel {
         Some(CorrelationId(CORRELATION_TAG | self.id_base | next))
     }
 
-    /// Step 13: the envelope at `next_seq`, chained to `prev_digest`.
-    fn reserve(&self, admitted: &Admitted) -> Result<Reservation, RdbError> {
-        let req = &admitted.req;
+    /// The envelope for `req` at `next_seq`, chained to `prev_digest`, with its `record_digest`
+    /// still [`Digest::ROOT`]. Every field but the request's own is fixed-width, so its encoded
+    /// length is a function of the request alone: [`encoded_len`].
+    fn envelope(
+        &self,
+        req: &TxnRequest,
+        request_digest: Digest,
+        grant: GrantId,
+    ) -> ReplicationEnvelope {
         let seq = self.next_seq;
         let mut mutations: Vec<Write> = req
             .mutations
@@ -749,12 +755,12 @@ impl TxnKernel {
             ns: Namespace::Dedup,
             key: dedup::dedup_key(self.lineage.generation, req.affinity, req.identity),
             value: Some(dedup::dedup_value(
-                admitted.request_digest,
+                request_digest,
                 seq,
                 self.lineage.owner_epoch,
             )),
         });
-        let mut envelope = ReplicationEnvelope {
+        ReplicationEnvelope {
             header: EnvelopeHeader {
                 protocol_version: ENVELOPE_VERSION,
                 partition: self.lineage.partition,
@@ -764,21 +770,47 @@ impl TxnKernel {
                 seq,
                 body_len: 0,
             },
-            lease_id: LeaseId(admitted.admitted_under.grant_id.0),
+            lease_id: LeaseId(grant.0),
             prev_digest: self.prev_digest,
             request_identity: req.identity,
-            request_digest: admitted.request_digest,
+            request_digest,
             conditions_result: vec![ConditionOutcome::Met; req.conditions.len()],
             mutations,
             result: Outcome::Published,
             record_digest: Digest::ROOT,
-        };
+        }
+    }
+
+    /// Step 13: the envelope at `next_seq`, chained to `prev_digest`.
+    ///
+    /// Check 10 has already refused a record over [`MAX_ENVELOPE_BYTES`] and more writes than
+    /// [`admission::MAX_REQUEST_MUTATIONS`] (spec §4.2, rulings L-R184y and L-R185b), so this
+    /// record passes every secondary's append row 2. Both bounds are checked again here on
+    /// the record itself, each refused with check 10's error (ruling L-R185d).
+    fn reserve(&self, admitted: &Admitted) -> Result<Reservation, RdbError> {
+        let mut envelope = self.envelope(
+            &admitted.req,
+            admitted.request_digest,
+            admitted.admitted_under.grant_id,
+        );
+        // Check 10's two bounds, in its order, refused again on the record itself in every
+        // build: either one, shipped, stalls the partition on a record no secondary takes
+        // (rulings L-R184y, L-R185d). The count first, before any hashing.
+        if envelope.mutations.len() > MAX_MUTATIONS {
+            return Err(RdbError::InvalidArgument { field: "mutations" });
+        }
         envelope.record_digest = envelope.compute_record_digest()?;
         let record = envelope.encode()?;
+        // The bytes, likewise: check 10 measured them with `encoded_len`; this is the record.
+        if record.len() > MAX_ENVELOPE_BYTES {
+            return Err(RdbError::InvalidArgument {
+                field: "envelope_bytes",
+            });
+        }
         envelope.header.body_len = u32::try_from(record.len() - ENVELOPE_HEADER_LEN)
             .map_err(|_| RdbError::InvalidArgument { field: "body_len" })?;
         Ok(Reservation {
-            seq,
+            seq: envelope.header.seq,
             envelope,
             record,
         })
@@ -1197,6 +1229,35 @@ const fn published_result(lineage: Lineage, seq: Seq) -> TxnResult {
     }
 }
 
+/// Check 10's byte bound, computed without building the record: the length
+/// [`ReplicationEnvelope::encode`] gives the envelope [`TxnKernel::envelope`] builds for `req`,
+/// which is the record step 13 ships and every secondary's append row 2 measures. The layout is
+/// the one in [`crate::contracts::envelope`]'s module docs; the test
+/// `encoded_len_is_the_encoded_records_length` pins this against `encode` (ruling L-R185d).
+///
+/// Saturating, so an absurd request still measures over the cap rather than wrapping under it.
+fn encoded_len(req: &TxnRequest) -> usize {
+    // Header; then lease id, prev digest, identity, request digest, the conditions and mutations
+    // count prefixes, the result tag and the record digest.
+    const FIXED: usize = ENVELOPE_HEADER_LEN + 8 + 32 + 16 + 32 + 4 + 4 + 1 + 32;
+    // Per write: namespace tag, key length and has-value tag. A put adds a value length.
+    const WRITE: usize = 1 + 4 + 1;
+    const VALUE: usize = 4;
+    // Step 13's one `Dedup` write, fixed-width.
+    const DEDUP: usize = WRITE + dedup::DEDUP_KEY_LEN + VALUE + dedup::DEDUP_VALUE_LEN;
+    // One outcome byte per condition.
+    let fixed = (FIXED + DEDUP).saturating_add(req.conditions.len());
+    req.mutations.iter().fold(fixed, |len, mutation| {
+        let write = match mutation {
+            Mutation::Put { key, value, .. } => (WRITE + VALUE)
+                .saturating_add(key.len())
+                .saturating_add(value.len()),
+            Mutation::Delete { key, .. } => WRITE.saturating_add(key.len()),
+        };
+        len.saturating_add(write)
+    })
+}
+
 /// `Frozen{cause}` with nothing unresolved.
 const fn frozen(cause: FreezeCause) -> QueueMode {
     QueueMode::Frozen {
@@ -1609,5 +1670,250 @@ pub const fn freeze_cause(reason: DenyReason) -> FreezeCause {
     match reason {
         DenyReason::LocalStorageFenced => FreezeCause::LocalStorageFenced,
         other => FreezeCause::AuthorityLost(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! SCAFFOLDING, not test rows (ruling L-R185d).
+    //!
+    //! They reach two private seams no public input can: step 13 handed a request check 10
+    //! would have refused, and the record length check 10 computes without encoding. They are
+    //! not `M7*` rows and carry no `#[retcd_test]`, as in `contracts::ignore`.
+
+    use std::collections::VecDeque;
+
+    use bytes::Bytes;
+
+    use super::admission::{MAX_CONDITIONS, MAX_REQUEST_MUTATIONS};
+    use super::{encoded_len, Admitted, DedupIndex, Limits, QueueMode, TxnKernel};
+    use crate::contracts::authority::{AuthorityView, DenyReason, Lineage};
+    use crate::contracts::digest::Digest;
+    use crate::contracts::errors::RdbError;
+    use crate::contracts::ids::{
+        AffinityId, AuthorityGeneration, BootId, ClientId, ConfigVersion, Generation, GrantId,
+        OwnerEpoch, PartitionId, RequestId, RequestIdentity, Seq, TenantId,
+    };
+    use crate::contracts::time::Tick;
+    use crate::contracts::txn::{scoped_key, Condition, Mutation, TxnRequest};
+    use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
+
+    const TENANT: TenantId = TenantId(3);
+    const AFFINITY: AffinityId = AffinityId(9);
+
+    fn lineage() -> Lineage {
+        Lineage {
+            partition: PartitionId(1),
+            generation: Generation(7),
+            owner_epoch: OwnerEpoch(1),
+        }
+    }
+
+    fn view() -> AuthorityView {
+        AuthorityView {
+            lineage: lineage(),
+            grant_id: GrantId(2),
+            boot_id: BootId(1),
+            authority_generation: AuthorityGeneration(1),
+            config_version: ConfigVersion(1),
+            authority_seq: 1,
+            valid_through_tick: Tick(1_000),
+            past_horizon: DenyReason::Expired,
+        }
+    }
+
+    /// An open instance at seq 12, as recovery would leave it.
+    fn kernel() -> TxnKernel {
+        TxnKernel {
+            lineage: lineage(),
+            config_version: ConfigVersion(1),
+            next_seq: Seq(12),
+            prev_digest: Digest::ROOT,
+            queue: VecDeque::new(),
+            inflight: None,
+            dedup: DedupIndex::default(),
+            admission: None,
+            authority: Some(view()),
+            mode: QueueMode::Open,
+            id_base: 0,
+            next_batch: 0,
+            next_correlation: 0,
+            limits: Limits::default(),
+            seed: None,
+            reasked_under: None,
+        }
+    }
+
+    fn key(user: &[u8]) -> Bytes {
+        scoped_key(TENANT, AFFINITY, user)
+    }
+
+    fn request(conditions: Vec<Condition>, mutations: Vec<Mutation>) -> TxnRequest {
+        TxnRequest {
+            api_version: 1,
+            identity: RequestIdentity {
+                tenant: TENANT,
+                client: ClientId(5),
+                request: RequestId(1),
+            },
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 1_000,
+            conditions,
+            mutations,
+        }
+    }
+
+    fn put(user: &[u8], len: usize) -> Mutation {
+        Mutation::Put {
+            key: key(user),
+            value: Bytes::from(vec![0xAB; len]),
+            expected_version: None,
+        }
+    }
+
+    /// Step 13 refuses a record over the cap itself, in every build, rather than trust check
+    /// 10: `INVALID_ARGUMENT { envelope_bytes }`, check 10's error, and no reservation, so
+    /// nothing reaches the batch. Unreachable through `admit`; this hands `reserve` a request
+    /// check 10 never saw. Before ruling L-R185d it was a `debug_assert!`, and a release build
+    /// shipped the record.
+    #[test]
+    fn reserve_refuses_an_oversized_record_check_ten_never_saw() {
+        let k = kernel();
+        let req = request(Vec::new(), vec![put(b"big", MAX_ENVELOPE_BYTES)]);
+        let admitted = Admitted {
+            request_digest: req.request_digest(),
+            req,
+            admitted_under: view(),
+            at: Tick::ZERO,
+        };
+        assert_eq!(
+            // The length, not the reservation: a failure prints a number, not a MiB of record.
+            k.reserve(&admitted)
+                .map(|reservation| reservation.record.len()),
+            Err(RdbError::InvalidArgument {
+                field: "envelope_bytes"
+            })
+        );
+    }
+
+    /// Step 13 refuses a record of more writes than every secondary's append row 2 accepts, in
+    /// every build: 256 client writes plus its own `Dedup` write is 257. `INVALID_ARGUMENT {
+    /// mutations }`, check 10's error, and no reservation. Unreachable through `admit`, which
+    /// stops at 255; before ruling L-R185d nothing here checked it, and the record shipped.
+    #[test]
+    fn reserve_refuses_more_writes_than_a_secondary_takes() {
+        let k = kernel();
+        let req = request(
+            Vec::new(),
+            (0..MAX_MUTATIONS)
+                .map(|i| Mutation::Delete {
+                    key: key(&i.to_le_bytes()),
+                    expected_version: None,
+                })
+                .collect(),
+        );
+        let admitted = Admitted {
+            request_digest: req.request_digest(),
+            req,
+            admitted_under: view(),
+            at: Tick::ZERO,
+        };
+        assert_eq!(
+            k.reserve(&admitted)
+                .map(|reservation| reservation.envelope.mutations.len()),
+            Err(RdbError::InvalidArgument { field: "mutations" })
+        );
+    }
+
+    /// Check 10's [`encoded_len`] is the length `encode` gives the envelope step 13 builds, for
+    /// every shape that moves it: no writes, each mutation kind and each condition kind, empty
+    /// keys and values, the most writes and conditions check 10 admits, and one value below, at
+    /// and above the cap.
+    #[test]
+    fn encoded_len_is_the_encoded_records_length() {
+        let k = kernel();
+        let encoded = |req: &TxnRequest| {
+            k.envelope(req, req.request_digest(), GrantId(2))
+                .encode()
+                .expect("every case fits the wire's u32 lengths")
+                .len()
+        };
+        let delete = |user: &[u8]| Mutation::Delete {
+            key: key(user),
+            expected_version: None,
+        };
+        let many = |i: usize| key(&i.to_le_bytes());
+        let mut cases = vec![
+            request(Vec::new(), Vec::new()),
+            request(
+                Vec::new(),
+                vec![Mutation::Put {
+                    key: Bytes::new(),
+                    value: Bytes::new(),
+                    expected_version: None,
+                }],
+            ),
+            request(
+                Vec::new(),
+                vec![
+                    put(b"a", 1),
+                    delete(b"b"),
+                    Mutation::Put {
+                        key: key(b"c"),
+                        value: Bytes::from_static(b"v"),
+                        expected_version: Some(4),
+                    },
+                    Mutation::Delete {
+                        key: key(b"d"),
+                        expected_version: Some(5),
+                    },
+                ],
+            ),
+            request(
+                vec![
+                    Condition::VersionEquals {
+                        key: key(b"a"),
+                        version: 3,
+                    },
+                    Condition::Absent { key: key(b"b") },
+                    Condition::Present { key: key(b"c") },
+                ],
+                vec![put(b"a", 1)],
+            ),
+            request(
+                vec![Condition::Absent { key: key(b"x") }; MAX_CONDITIONS],
+                (0..MAX_REQUEST_MUTATIONS)
+                    .map(|i| Mutation::Put {
+                        key: many(i),
+                        value: Bytes::from(vec![0xCD; 16]),
+                        expected_version: None,
+                    })
+                    .collect(),
+            ),
+            request(
+                Vec::new(),
+                (0..MAX_REQUEST_MUTATIONS)
+                    .map(|i| Mutation::Delete {
+                        key: many(i),
+                        expected_version: None,
+                    })
+                    .collect(),
+            ),
+        ];
+        let at_cap = MAX_ENVELOPE_BYTES - encoded(&request(Vec::new(), vec![put(b"big", 0)]));
+        for len in [at_cap - 1, at_cap, at_cap + 1] {
+            cases.push(request(Vec::new(), vec![put(b"big", len)]));
+        }
+        for req in &cases {
+            assert_eq!(
+                encoded_len(req),
+                encoded(req),
+                "{} conditions, {} mutations",
+                req.conditions.len(),
+                req.mutations.len()
+            );
+        }
+        assert_eq!(encoded_len(&cases[cases.len() - 2]), MAX_ENVELOPE_BYTES);
     }
 }

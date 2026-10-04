@@ -11,6 +11,7 @@
 //! | M7A-139 | a fence between the dispatch answer and the batch completion, injected or A1's own, keeps the dispatched batch, keeps the fence's cause, and resolves the request `UNKNOWN_OUTCOME` |
 //! | M7A-163 | a renewal whose completion is dropped ends in an expiry fence at the local horizon that drains T1's queue and P1's `Fresh` waiters in the same tick |
 //! | M7A-194 | a failover node's P1 answers a previous generation's status `RecoveredApplied` from the durable dedup rows, with and without the generation, as the node that applied it does; inside the seed window the generation answers `Unknown`, never `StatusExpired`; a row that does not decode is skipped and the seed lands; a retired generation is never resurrected and a trim watermark is honoured (A-R90) |
+//! | (no row; ruling L-R184y) | B refuses, before writing, a request every secondary would refuse `TOO_LARGE` (256 client writes, or a record over 1 MiB) with `INVALID_ARGUMENT`; nothing is applied anywhere and the next request publishes; 255 client writes publish on every copy |
 //!
 //! Fixtures come from the verification corpus, never a new route: the A1/P1 case
 //! (`cases::case_a1_p1_new_generation_between_publish_and_reply`) without its unrunnable
@@ -35,6 +36,7 @@ use rdb_core::authority::AuthorityState;
 use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, DenyReason, FenceScope, Lineage};
 use rdb_core::contracts::control::{CasOutcome, ControlEvent, ControlKey, ReadOutcome};
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::envelope::AppendReject;
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
 use rdb_core::contracts::event::{
     Budgets, ClientEvent, Effect, EffectKind, EventKind, KernelEffect, KernelEvent, ModuleName,
@@ -45,6 +47,7 @@ use rdb_core::contracts::ids::{
     Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Revision, Seq,
     SnapshotHandle, TenantId,
 };
+use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::publication::PublicationEffect;
 use rdb_core::contracts::recovery::{DurableProof, RecoveryBarrier, RecoveryResult};
 use rdb_core::contracts::storage::{Namespace, SnapshotRead, Write};
@@ -2492,4 +2495,164 @@ fn m7a_133_a1_p1_delayed_old_dispatch_after_reboot_quarantined_bytes_only() {
 fn m7a_134_a1_p1_delayed_old_dispatch_after_new_generation_quarantined_bytes_only() {
     support::preamble();
     assert_quarantined_bytes_only("M7A-134", LateInput::NewGeneration);
+}
+
+// ---- refuse before writing (ruling L-R184y) ---------------------------------------------------
+
+/// What one oversized-request walk observed.
+struct CapWalk {
+    big: Vec<ReplyEffect>,
+    next: Vec<ReplyEffect>,
+    /// `(node, seq)` of every `BatchApply` past the preload and request 11.
+    applies: BTreeSet<(NodeId, Seq)>,
+    /// `AppendRejected(TooLarge)` notes anywhere in the run.
+    too_large: usize,
+    published: Seq,
+    open: bool,
+}
+
+/// The A1/P1 fixture after request 11 published at seq 11: `big` goes to B as request 12, then a
+/// one-write request 13. Runs to `SUBMIT + 2_000`.
+fn cap_walk(big: Vec<Mutation>) -> CapWalk {
+    let request = |id: u64, mutations: Vec<Mutation>| TxnRequest {
+        mutations,
+        ..txn(id, id)
+    };
+    let mut runner = Runner::new(&a1p1_plan()).expect("runner");
+    queue(&mut runner, SUBMIT + 200, 9_801, submit(request(12, big)));
+    let after = vec![Mutation::Put {
+        key: scoped_key(TenantId(1), AffinityId(1), b"after"),
+        value: Bytes::from_static(b"1"),
+        expected_version: None,
+    }];
+    queue(&mut runner, SUBMIT + 400, 9_802, submit(request(13, after)));
+    let replies = run_to(&mut runner, SUBMIT + 2_000);
+    let trace = runner.recorded();
+    let walk = CapWalk {
+        big: replies_for(&replies, identity(12))
+            .into_iter()
+            .cloned()
+            .collect(),
+        next: replies_for(&replies, identity(13))
+            .into_iter()
+            .cloned()
+            .collect(),
+        applies: batch_applies(trace)
+            .into_iter()
+            .filter(|(_, _, _, seq)| *seq > Seq(WRITE))
+            .map(|(_, node, _, seq)| (node, seq))
+            .collect(),
+        too_large: trace
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    TraceKind::KernelNoted {
+                        note: KernelNote::Ignored {
+                            reason: KernelIgnoredReason::AppendRejected(AppendReject::TooLarge)
+                        },
+                        ..
+                    }
+                )
+            })
+            .count(),
+        published: p1(&runner).published.seq,
+        open: *t1(&runner).mode() == QueueMode::Open,
+    };
+    tracing::info!(
+        big_replies = walk.big.len(),
+        next_replies = walk.next.len(),
+        applies = walk.applies.len(),
+        too_large = walk.too_large,
+        published = walk.published.0,
+        open = walk.open,
+        "cap walk"
+    );
+    walk
+}
+
+/// `n` one-byte puts at distinct keys.
+fn puts(n: usize) -> Vec<Mutation> {
+    (0..n)
+        .map(|i| Mutation::Put {
+            key: scoped_key(TenantId(1), AffinityId(1), format!("m{i}").as_bytes()),
+            value: Bytes::from_static(b"7"),
+            expected_version: None,
+        })
+        .collect()
+}
+
+/// `seq` applied on every copy, and nothing else past seq 11.
+fn applied_everywhere(seqs: &[u64]) -> BTreeSet<(NodeId, Seq)> {
+    seqs.iter()
+        .flat_map(|seq| [B, cases::C_NODE, cases::A_NODE].map(|node| (node, Seq(*seq))))
+        .collect()
+}
+
+fn published_at(request: u64, seq: u64) -> Vec<ReplyEffect> {
+    vec![ReplyEffect::Transaction {
+        identity: identity(request),
+        result: TxnResult {
+            partition: PART,
+            owner_epoch: OwnerEpoch(2),
+            generation: Generation(2),
+            seq: Seq(seq),
+            outcome: Outcome::Published,
+            durability: rdb_core::contracts::txn::Durability::BufferedOnTwo,
+        },
+    }]
+}
+
+/// Ruling L-R184y (spec §4.2 "`INVALID_ARGUMENT` before mutation"), regression for stream K's
+/// stall. On 960db34 the primary applied, at seq 12, a request every secondary's append row 2
+/// refuses `TOO_LARGE`; request 12 ended `UNKNOWN_OUTCOME`, request 13 `PROTECTION_PAUSED`, and
+/// T1 stayed frozen on the unresolved seq 12. Two requests reach that row: 256 client writes (the
+/// envelope carries one more, the dedup write, so 257) and one write whose envelope is over
+/// 1 MiB. Each is now refused on B with `INVALID_ARGUMENT` naming the field, no copy applies
+/// anything for it, no copy ever refuses an append, and request 13 publishes at seq 12 on all
+/// three copies. Positive control: 255 client writes publish at seq 12 everywhere, and request
+/// 13 follows at seq 13.
+#[retcd_test]
+fn primary_refuses_before_writing_what_every_secondary_would_refuse() {
+    support::preamble();
+
+    let refused = |label: &str, big: Vec<Mutation>, field: &'static str| {
+        let walk = cap_walk(big);
+        assert_eq!(
+            walk.big,
+            vec![ReplyEffect::Failed {
+                identity: identity(12),
+                error: RdbError::InvalidArgument { field },
+            }],
+            "{label}: refused on the primary, naming {field}"
+        );
+        assert_eq!(
+            walk.applies,
+            applied_everywhere(&[12]),
+            "{label}: only request 13 is applied"
+        );
+        assert_eq!(
+            walk.next,
+            published_at(13, 12),
+            "{label}: the partition keeps going"
+        );
+        assert_eq!(walk.too_large, 0, "{label}: no copy refuses an append");
+        assert_eq!(walk.published, Seq(12), "{label}");
+        assert!(walk.open, "{label}: T1 is not frozen");
+    };
+    refused("256 client writes", puts(256), "mutations");
+    let one_mib = vec![Mutation::Put {
+        key: scoped_key(TenantId(1), AffinityId(1), b"big"),
+        value: Bytes::from(vec![0xAB; 1 << 20]),
+        expected_version: None,
+    }];
+    refused("a 1 MiB value", one_mib, "envelope_bytes");
+
+    let walk = cap_walk(puts(255));
+    assert_eq!(walk.big, published_at(12, 12), "255 client writes publish");
+    assert_eq!(walk.next, published_at(13, 13));
+    assert_eq!(walk.applies, applied_everywhere(&[12, 13]));
+    assert_eq!(walk.too_large, 0);
+    assert_eq!(walk.published, Seq(13));
+    assert!(walk.open);
 }

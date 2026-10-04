@@ -43,7 +43,8 @@ use rdb_core::contracts::trace::{CapabilityState, Version};
 use rdb_core::contracts::txn::{
     scoped_key, Condition, Durability, Mutation, Outcome, TxnRequest, TxnResult, KEY_SCOPE_LEN,
 };
-use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_MUTATIONS};
+use rdb_core::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
+use rdb_core::transaction::admission::{MAX_CONDITIONS, MAX_REQUEST_MUTATIONS};
 use rdb_core::transaction::dedup::{
     dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, SEED_PAGE,
 };
@@ -2975,9 +2976,13 @@ fn a_lost_authority_freeze_reopens_only_on_a_newer_generation() {
     let _ = h.admit(put(1, b"a", b"1"));
 }
 
-/// A-R71, tester-t1 hunt_23. Check 10's upper bounds: exactly `MAX_MUTATIONS` mutations and
-/// exactly `MAX_CONDITIONS` conditions are admitted, and one more of either is
-/// `INVALID_ARGUMENT` naming the field.
+/// A-R71, tester-t1 hunt_23. Check 10's upper bounds: exactly 255 mutations and exactly
+/// `MAX_CONDITIONS` conditions are admitted, and one more of either is `INVALID_ARGUMENT` naming
+/// the field.
+///
+/// The mutation bound was 256 until ruling L-R184y (2026-10-03). `reserve` adds one dedup write
+/// to every envelope, so 256 client writes shipped as 257 and every secondary's row 2 refused
+/// them `TOO_LARGE` after the primary had applied them. The literals pin spec §4.2's numbers.
 #[retcd_test]
 fn check_ten_admits_each_upper_bound_and_refuses_one_more() {
     let mut h = H::live_with(Limits {
@@ -3001,11 +3006,16 @@ fn check_ten_admits_each_upper_bound_and_refuses_one_more() {
             })
             .collect()
     };
+    assert_eq!(
+        MAX_REQUEST_MUTATIONS + 1,
+        MAX_MUTATIONS,
+        "one envelope write is the dedup row"
+    );
     let mut at = put(1, b"k", b"v");
-    at.mutations = deletes(MAX_MUTATIONS);
+    at.mutations = deletes(255);
     assert_eq!(h.step(submit(at)), vec![], "queued");
     let mut over = put(2, b"k", b"v");
-    over.mutations = deletes(MAX_MUTATIONS + 1);
+    over.mutations = deletes(256);
     assert_eq!(
         h.step(submit(over)),
         fail(2, RdbError::InvalidArgument { field: "mutations" })
@@ -3024,6 +3034,105 @@ fn check_ten_admits_each_upper_bound_and_refuses_one_more() {
             }
         )
     );
+}
+
+/// A one-`Put` request whose value is `len` bytes.
+fn put_sized(request: u64, len: usize) -> TxnRequest {
+    TxnRequest {
+        mutations: vec![Mutation::Put {
+            key: key(b"big"),
+            value: Bytes::from(vec![0xAB; len]),
+            expected_version: None,
+        }],
+        ..put(request, b"big", b"")
+    }
+}
+
+/// The record step 13 reserved for the request awaiting its dispatch check.
+fn reserved_len(h: &H) -> usize {
+    let Some(Inflight::AwaitingDispatchCheck { reservation, .. }) = h.k().inflight() else {
+        panic!("expected AwaitingDispatchCheck");
+    };
+    reservation.record.len()
+}
+
+/// Ruling L-R184y (spec §4.2 "1 MiB encoded bytes ... `INVALID_ARGUMENT` before mutation").
+/// Check 10 refuses a record every secondary's row 2 would refuse for its bytes (ruling L-R185b
+/// moved it there from step 13): one byte over `MAX_ENVELOPE_BYTES` is `INVALID_ARGUMENT` naming
+/// `envelope_bytes`, with no check asked, nothing written and `next_seq` unmoved; a retry is
+/// refused the same way, never replayed. A record of exactly `MAX_ENVELOPE_BYTES` goes on to
+/// dispatch, as row 2 accepts it.
+///
+/// Before the ruling the over-cap record was dispatched and applied on the primary, and the
+/// partition froze on a sequence no secondary would take (stream K).
+#[retcd_test]
+fn check_ten_refuses_a_record_over_the_receivers_byte_cap() {
+    // The record's size beyond its one value, from a probe on a twin instance.
+    let mut probe = H::live();
+    let _ = probe.admit(put_sized(1, 1_000));
+    let overhead = reserved_len(&probe) - 1_000;
+    let at_cap = MAX_ENVELOPE_BYTES - overhead;
+
+    let mut h = H::live();
+    let next = h.k().next_seq();
+    let refused = fail(
+        1,
+        RdbError::InvalidArgument {
+            field: "envelope_bytes",
+        },
+    );
+    assert_eq!(h.step(submit(put_sized(1, at_cap + 1))), refused);
+    assert_eq!(h.step(submit(put_sized(1, at_cap + 1))), refused, "retry");
+    assert_eq!(h.k().next_seq(), next);
+    assert!(h.k().inflight().is_none());
+    assert_eq!(h.snap.at, Seq::ZERO, "nothing written");
+
+    let correlation = h.admit(put_sized(2, at_cap));
+    assert_eq!(reserved_len(&h), MAX_ENVELOPE_BYTES);
+    let effects = h.step(answer(correlation, 1, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected exactly one batch, got {effects:?}");
+    };
+    assert_eq!(
+        batch.seq, next,
+        "the partition keeps going at the same sequence"
+    );
+}
+
+/// D1 (stream K tester; lead ruling L-R185b). Limits are check 10 (spec §5.2 step 1, ADR-0004 §3
+/// "First failure wins"), before dedup (11) and conditions (12). An oversized request whose
+/// condition also fails is `INVALID_ARGUMENT` naming `envelope_bytes`, not `CONDITION_FAILED`, and
+/// its retry gets the same refusal: nothing is retained and nothing is written. An oversized
+/// resend under a request id the index already holds is refused the same way, not
+/// `REQUEST_ID_REUSE`.
+#[retcd_test]
+fn an_oversized_request_is_refused_before_dedup_and_conditions() {
+    let mut h = H::live();
+    let refused = |request| {
+        fail(
+            request,
+            RdbError::InvalidArgument {
+                field: "envelope_bytes",
+            },
+        )
+    };
+    let retained = h.k().dedup().len();
+    let mut condition_fails = put_sized(1, MAX_ENVELOPE_BYTES);
+    condition_fails.conditions.push(Condition::Present {
+        key: key(b"absent"),
+    });
+    assert_eq!(h.step(submit(condition_fails.clone())), refused(1));
+    assert_eq!(h.step(submit(condition_fails)), refused(1), "retry");
+    assert_eq!(h.k().dedup().len(), retained, "nothing retained");
+
+    let _ = h.resolve(put(2, b"k", b"v"));
+    let retained = h.k().dedup().len();
+    let next = h.k().next_seq();
+    let written = h.snap.at;
+    assert_eq!(h.step(submit(put_sized(2, MAX_ENVELOPE_BYTES))), refused(2));
+    assert_eq!(h.k().dedup().len(), retained);
+    assert_eq!(h.k().next_seq(), next);
+    assert_eq!(h.snap.at, written, "nothing written");
 }
 
 // ---------------------------------------------------------------------------------------------
