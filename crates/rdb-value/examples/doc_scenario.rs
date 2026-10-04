@@ -26,6 +26,13 @@
 //! failure also prints the usage text on stderr. `--help` prints the usage text on stdout, not
 //! JSON, and exits 0.
 //!
+//! Input is bounded where it is read: `--json` text, `--cbor-hex`/`--hex` text, and each line
+//! of the store or of a compiled file, at limits derived from `MAX_PAYLOAD` and `MAX_ENVELOPE`
+//! (see `MAX_LINE`). A larger input is refused once one byte past its limit is read (two for
+//! a store line, which may end in `\r\n`): `InputTooLarge`, exit 1, or exit 3 for a store line. `apply` opens the compiled envelope
+//! (digest included), requires a `Document` with a canonical payload, and otherwise refuses
+//! (`Corrupt`, exit 1) before the store is touched.
+//!
 //! JSON input: integers stay integers and `1.0` stays a float, rounded correctly (to nearest,
 //! ties to even). JSON cannot carry an integer past 64 bits, or `-0`, without turning it into a
 //! float, so such a token is refused (`JsonInput`); send it with `--cbor-hex`. JSON input has no
@@ -45,6 +52,7 @@
 //! record's version. `apply` checks the condition and `expected_version` the way the kernel's
 //! `first_failed_condition` does, and refuses with the kernel's name, `ConditionFailed`.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::ExitCode;
 
@@ -52,7 +60,7 @@ use bytes::Bytes;
 use rdb_core::{Condition, Generation, Mutation, Namespace, SnapshotRead};
 use rdb_value::cbor;
 use rdb_value::delta::{resolve, ApplyError, Delta, Op};
-use rdb_value::envelope;
+use rdb_value::envelope::{self, Kind, MAX_ENVELOPE, MAX_PAYLOAD};
 use rdb_value::path::{Path, PathError};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
@@ -63,6 +71,45 @@ const USAGE: &str = "usage: doc_scenario --store <FILE> (compile|put|op) <key> (
 doc_scenario --store <FILE> get <key> [PATH]\n       doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
+
+// Input limits. Every text input is read through `Read::take` at one of these, so an oversized
+// file is refused after `limit + 1` bytes (`limit + 2` for a store line, room for its `\r\n`)
+// instead of being read whole. Each is derived from the
+// document limits, so no input this tool produced is ever refused.
+
+/// The most text this tool prints for one payload byte: an empty byte string (`0x40`, one byte)
+/// in an array renders as `{"$bytes":""},`.
+const RENDER_PER_BYTE: usize = r#"{"$bytes":""},"#.len();
+/// `--json` text: as long as the longest `value` printed for a `MAX_PAYLOAD`-byte document.
+/// Longer JSON (deep indentation, very long float spellings) is refused; send it with
+/// `--cbor-hex`.
+const MAX_JSON_TEXT: usize = RENDER_PER_BYTE * MAX_PAYLOAD;
+/// `--cbor-hex` and `--hex` text: two digits per byte of the largest envelope, which leaves the
+/// header's length in digits for whitespace around a payload's hex.
+const MAX_HEX_TEXT: usize = 2 * MAX_ENVELOPE;
+/// One line of the store or of a `compile` output file: a rendered value, the envelope and the
+/// payload in hex, and one more hex allowance for the key and the field names.
+const MAX_LINE: usize = MAX_JSON_TEXT + 3 * MAX_HEX_TEXT;
+
+/// Up to `limit` bytes from `source`, or `None` when it holds more. Reads at most `limit + 1`.
+fn read_bounded(source: impl Read, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    source
+        .take(u64::try_from(limit).expect("limit fits u64") + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() <= limit).then_some(bytes))
+}
+
+fn too_large(what: &str, limit: usize) -> Failure {
+    Failure::refused(
+        "InputTooLarge".into(),
+        format!("{what} is over the {limit}-byte limit; refused before reading it whole"),
+    )
+}
+
+fn utf8(bytes: Vec<u8>, what: &str) -> Result<String, Failure> {
+    String::from_utf8(bytes).map_err(|e| Failure::usage(format!("{what} is not UTF-8: {e}")))
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -448,23 +495,29 @@ fn set_expected(slot: &mut Option<Expected>, value: Expected) -> Result<(), Fail
     Ok(())
 }
 
-/// `@FILE` reads the argument from FILE.
-fn arg_text(arg: &str) -> Result<String, Failure> {
+/// `@FILE` reads the argument from FILE. Either way, text over `limit` bytes is refused.
+fn arg_text(arg: &str, limit: usize) -> Result<String, Failure> {
     match arg.strip_prefix('@') {
-        Some(file) => std::fs::read_to_string(file)
-            .map(|s| s.trim().to_owned())
-            .map_err(|e| Failure::usage(format!("cannot read {file:?}: {e}"))),
+        Some(file) => {
+            let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {file:?}: {e}"));
+            let source = std::fs::File::open(file).map_err(cannot)?;
+            let bytes = read_bounded(source, limit)
+                .map_err(cannot)?
+                .ok_or_else(|| too_large(&format!("{file:?}"), limit))?;
+            Ok(utf8(bytes, &format!("{file:?}"))?.trim().to_owned())
+        }
+        None if arg.len() > limit => Err(too_large("the argument", limit)),
         None => Ok(arg.to_owned()),
     }
 }
 
 fn hex_input(arg: &str) -> Result<Vec<u8>, Failure> {
-    let text = arg_text(arg)?;
+    let text = arg_text(arg, MAX_HEX_TEXT)?;
     hex::decode(text.trim()).map_err(|e| Failure::usage(format!("bad hex: {e}")))
 }
 
 fn json_input(arg: &str) -> Result<Value, Failure> {
-    let text = arg_text(arg)?;
+    let text = arg_text(arg, MAX_JSON_TEXT)?;
     let value = serde_json::from_str::<Json>(&text)
         .map(|j| j.0)
         .map_err(|e| Failure::refused("JsonInput".into(), json_error(&text, &e)))?;
@@ -652,28 +705,68 @@ struct Store {
 impl Store {
     /// A missing file is an empty store at `seq` 0.
     fn load(path: &FsPath) -> Result<Self, Failure> {
+        match std::fs::File::open(path) {
+            Ok(file) => Self::read(path, BufReader::new(file)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                path: path.to_owned(),
+                seq: 0,
+                snapshot: MapSnapshot::new(Generation(1)),
+            }),
+            Err(e) => Err(Failure::store(format!(
+                "cannot read {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// The store in `source`, read one line at a time, each line bounded at [`MAX_LINE`]: a read
+    /// takes at most `MAX_LINE + 2` bytes, the line and its `\r\n`.
+    fn read(path: &FsPath, mut source: impl BufRead) -> Result<Self, Failure> {
         let mut store = Self {
             path: path.to_owned(),
             seq: 0,
             snapshot: MapSnapshot::new(Generation(1)),
         };
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(store),
-            Err(e) => {
-                return Err(Failure::store(format!(
-                    "cannot read {}: {e}",
-                    path.display()
-                )))
-            }
-        };
-        let mut lines = text
-            .lines()
-            .enumerate()
-            .filter(|(_, l)| !l.trim().is_empty());
         let bad = |n: usize, what: &str| {
             Failure::store(format!("{} line {}: {what}", path.display(), n + 1))
         };
+        let too_long = |n: usize| {
+            bad(
+                n,
+                &format!("over the {MAX_LINE}-byte line limit; refused before reading it whole"),
+            )
+        };
+        // Room for the line and its "\r\n".
+        let limit = MAX_LINE + 2;
+        let mut text = Vec::new();
+        loop {
+            let n = text.len();
+            let mut line = Vec::new();
+            let read = (&mut source)
+                .take(u64::try_from(limit).expect("limit fits u64"))
+                .read_until(b'\n', &mut line)
+                .map_err(|e| bad(n, &e.to_string()))?;
+            if read == 0 {
+                break;
+            }
+            if line.last() == Some(&b'\n') {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+            } else if read == limit {
+                return Err(too_long(n));
+            }
+            if line.len() > MAX_LINE {
+                return Err(too_long(n));
+            }
+            text.push(String::from_utf8(line).map_err(|e| bad(n, &e.to_string()))?);
+        }
+        let mut lines = text
+            .iter()
+            .map(String::as_str)
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty());
         let (n, head) = lines.next().ok_or_else(|| bad(0, "empty file"))?;
         let head: serde_json::Value =
             serde_json::from_str(head).map_err(|e| bad(n, &e.to_string()))?;
@@ -786,10 +879,16 @@ impl Store {
     }
 }
 
-/// Read back the line `compile` printed.
+/// Read back the line `compile` printed. The envelope must open (digest included), be a
+/// `Document`, and hold a canonical payload, or nothing is applied: the file is input, so it is
+/// checked like a stored record is on read.
 fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
-    let text = std::fs::read_to_string(file)
-        .map_err(|e| Failure::usage(format!("cannot read {}: {e}", file.display())))?;
+    let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
+    let source = std::fs::File::open(file).map_err(cannot)?;
+    let bytes = read_bounded(source, MAX_LINE)
+        .map_err(cannot)?
+        .ok_or_else(|| too_large(&file.display().to_string(), MAX_LINE))?;
+    let text = utf8(bytes, &file.display().to_string())?;
     let line = text
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -807,6 +906,17 @@ fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
             .ok_or_else(|| bad("envelope_hex"))?,
     )
     .map_err(|e| bad(&format!("envelope_hex: {e}")))?;
+    let keyed = |f: Failure| f.keyed(&String::from_utf8_lossy(&key));
+    let opened = envelope::open(&value)
+        .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Envelope(e)))))?;
+    if opened.kind != Kind::Document {
+        return Err(keyed(bad(&format!(
+            "envelope kind {:?} is not Document",
+            opened.kind
+        ))));
+    }
+    cbor::decode(opened.payload)
+        .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Codec(e)))))?;
     let expected_version = match &json["expected_version"] {
         serde_json::Value::Null => None,
         v => Some(v.as_u64().ok_or_else(|| bad("expected_version"))?),
@@ -1201,5 +1311,190 @@ mod tests {
              \"t\":{\"$timestamp\":{\"secs\":-1,\"nanos\":123}},\"a$\":1,\
              \"$$$x\":[{\"$$y\":null}]}"
         );
+    }
+
+    // ---- PR #23 review: F-001 bounded reads, F-002 a validated `apply` ---------------------
+
+    /// A directory of this test's own, under the gate's data root when it sets one.
+    fn scratch(name: &str) -> PathBuf {
+        let base =
+            std::env::var_os("RETCD_TEST_DATA_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let dir = base.join(format!("doc_scenario-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    /// F-001: every bound stops just past its limit (one byte; two for a store line). The source
+    /// is endless, so a read that was not bounded would never return.
+    #[test]
+    fn f001_bounded_reads_stop_one_byte_past_the_limit() {
+        assert_eq!(RENDER_PER_BYTE, 14);
+        assert_eq!(
+            (MAX_JSON_TEXT, MAX_HEX_TEXT, MAX_LINE),
+            (14_679_504, 2_097_152, 20_970_960)
+        );
+        for limit in [MAX_JSON_TEXT, MAX_HEX_TEXT, MAX_LINE] {
+            let endless = std::io::repeat(b'1');
+            assert_eq!(read_bounded(endless, limit).expect("reads"), None);
+            let exact = std::io::repeat(b'1').take(u64::try_from(limit).unwrap());
+            assert_eq!(
+                read_bounded(exact, limit).expect("reads").map(|b| b.len()),
+                Some(limit)
+            );
+        }
+        let endless = BufReader::new(std::io::repeat(b'1'));
+        let err = Store::read(FsPath::new("endless"), endless)
+            .err()
+            .expect("refused");
+        assert_eq!((err.exit, err.error.as_str()), (3, "Store"));
+        assert!(err.detail.contains("line limit"), "{}", err.detail);
+        // An argument given inline is held to the same limits before it is parsed.
+        for err in [
+            json_input(&"1".repeat(MAX_JSON_TEXT + 1)).expect_err("json"),
+            hex_input(&"0".repeat(MAX_HEX_TEXT + 1)).expect_err("hex"),
+        ] {
+            assert_eq!((err.exit, err.error.as_str()), (1, "InputTooLarge"));
+        }
+    }
+
+    /// F-001, one over-limit file through each kind of input: `--json @FILE`, `--cbor-hex @FILE`,
+    /// a compiled file and a store. Each is refused by name, never parsed.
+    #[test]
+    fn f001_an_over_limit_file_is_refused_by_every_input() {
+        let dir = scratch("f001");
+        let big = dir.join("big.txt");
+        std::fs::write(&big, vec![b'1'; MAX_LINE + 1]).expect("write");
+        let at = format!("@{}", big.display());
+        for err in [
+            json_input(&at).expect_err("json"),
+            hex_input(&at).expect_err("hex"),
+            load_compiled(&big).expect_err("compiled"),
+        ] {
+            assert_eq!(
+                (err.exit, err.error.as_str()),
+                (1, "InputTooLarge"),
+                "{}",
+                err.detail
+            );
+        }
+        let err = Store::load(&big).err().expect("store");
+        assert_eq!((err.exit, err.error.as_str()), (3, "Store"));
+        assert!(err.detail.contains("line limit"), "{}", err.detail);
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// F-001: the limits never refuse this tool's own output. The worst case per payload byte
+    /// is an array of empty byte strings: its `value` is the longest JSON, and its compile line
+    /// the longest line. Building the full 1 MiB case takes seconds in a debug build, so this
+    /// measures two arrays past the 2^16 head step, checks each element adds exactly
+    /// `RENDER_PER_BYTE` (and 4 hex digits on the line), and extrapolates to the largest array.
+    #[test]
+    fn f001_the_largest_compile_line_fits_the_limits() {
+        let measure = |n: usize| {
+            let doc = Value::Array(vec![Value::Bytes(Vec::new()); n]);
+            let delta = Delta(vec![Op::Replace(doc.clone())]);
+            let snapshot = MapSnapshot::new(Generation(1));
+            let compiled =
+                compile(&snapshot, b"user:1", Expected::Absent, &delta).expect("compiles");
+            let mut line = Line::new("compile");
+            line.str("key", "user:1");
+            line.extend(compiled_fields(&compiled).expect("fields"));
+            (render(&doc).len(), line.render().len())
+        };
+        let (k1, k2) = (1 << 16, (1 << 16) + 100);
+        let ((json1, line1), (json2, line2)) = (measure(k1), measure(k2));
+        assert_eq!(json2 - json1, RENDER_PER_BYTE * (k2 - k1));
+        assert_eq!(line2 - line1, (RENDER_PER_BYTE + 4) * (k2 - k1));
+        // The largest such array: a 5-byte head (`0x9a` and a u32 length), then one byte each.
+        let largest = MAX_PAYLOAD - 5;
+        assert!(json1 + RENDER_PER_BYTE * (largest - k1) <= MAX_JSON_TEXT);
+        assert!(line1 + (RENDER_PER_BYTE + 4) * (largest - k1) <= MAX_LINE);
+    }
+
+    /// F-002: `apply` of a compiled file with one digest byte flipped is refused as
+    /// `Corrupt(DigestMismatch)`, and the store file is unchanged.
+    #[test]
+    fn f002_apply_refuses_a_flipped_digest_and_leaves_the_store() {
+        let dir = scratch("f002");
+        let store = dir.join("s.jsonl");
+        commit_cmd(
+            &store,
+            &args(&["user:1", "--absent", "--json", "{\"visits\":1}"]),
+        )
+        .expect("put");
+        let fields = compile_cmd(
+            &store,
+            &args(&["user:1", "--expect", "1", "incr", "/visits", "1"]),
+        )
+        .expect("compile");
+        let mut line = Line::new("compile");
+        line.extend(fields);
+        let good = line.render();
+        // Digest bytes follow the 8-byte head: hex digits 16..80 of `envelope_hex`.
+        let at = good.find("\"envelope_hex\":\"").expect("envelope_hex") + 16 + 16;
+        let mut flipped = good.into_bytes();
+        flipped[at] = if flipped[at] == b'0' { b'1' } else { b'0' };
+        let file = dir.join("c.json");
+        std::fs::write(&file, &flipped).expect("write");
+        let before = std::fs::read(&store).expect("store");
+
+        let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+        assert_eq!(
+            (err.exit, err.error.as_str()),
+            (1, "Corrupt(DigestMismatch)")
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("store"),
+            before,
+            "store unchanged"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// F-002 (review A-1): a compiled file whose envelope opens (its digest is right) around a
+    /// non-canonical payload, `18 01` for the integer 1, is refused as `Corrupt(NonCanonical ..)`,
+    /// and the store file is unchanged.
+    #[test]
+    fn f002_apply_refuses_a_sound_envelope_around_a_bad_payload() {
+        let dir = scratch("f002-payload");
+        let store = dir.join("s.jsonl");
+        commit_cmd(
+            &store,
+            &args(&["user:1", "--absent", "--json", "{\"visits\":1}"]),
+        )
+        .expect("put");
+        let fields = compile_cmd(
+            &store,
+            &args(&["user:1", "--expect", "1", "incr", "/visits", "1"]),
+        )
+        .expect("compile");
+        let mut line = Line::new("compile");
+        line.extend(fields);
+        let mut json: serde_json::Value = serde_json::from_str(&line.render()).expect("json");
+        let sealed = envelope::seal(Kind::Document, &[0x18, 0x01]).expect("seals");
+        assert!(envelope::open(&sealed).is_ok(), "the digest is right");
+        json["envelope_hex"] = serde_json::Value::String(hex::encode(&sealed));
+        let file = dir.join("c.json");
+        std::fs::write(&file, json.to_string()).expect("write");
+        let before = std::fs::read(&store).expect("store");
+
+        let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+        assert_eq!(err.exit, 1);
+        assert!(
+            err.error.starts_with("Corrupt(NonCanonical"),
+            "{}",
+            err.error
+        );
+        assert_eq!(
+            std::fs::read(&store).expect("store"),
+            before,
+            "store unchanged"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
     }
 }
