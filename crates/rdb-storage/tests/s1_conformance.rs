@@ -657,6 +657,8 @@ impl Run {
         let value = materialize(base, &delta).expect("it compiled, so it applies");
         let seq = applied + 1;
         let head = self.partitions[index].digests[&applied];
+        // A document write is one Put; a second mutation here would be dropped silently.
+        assert_eq!(compiled.mutations.len(), 1, "{:?}", compiled.mutations);
         let batch = delete::request_batch(
             lineage(id, active),
             Seq(seq),
