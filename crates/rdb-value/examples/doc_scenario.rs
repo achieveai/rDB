@@ -63,7 +63,8 @@
 //!
 //! The store is one JSON line `{"seq":N,"envelope":2}`, then one line per record
 //! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store
-//! without `"envelope":2` was sealed before ruling L-R186s and is refused, exit 3, as is a store
+//! with no marker or a lower one was sealed before ruling L-R186s, and one with a higher marker
+//! was written by a newer build. Both are refused, exit 3, as is a store
 //! from S2 (with `key` instead of `key_hex`). `seq` stands in for the kernel's
 //! transaction sequence: each commit takes the next one and stamps it as the version of every
 //! record it writes. `apply` checks the condition, then each write's `expected_version`, the way
@@ -842,7 +843,8 @@ impl<'de> serde::de::Visitor<'de> for JsonVisitor {
 // ---------------------------------------------------------------------------------------------
 
 /// The store's `envelope` marker: records sealed with the digest over header bytes 0..8 and the
-/// payload (ruling L-R186s). A store without it is refused whole, exit 3 (critic K2).
+/// payload (ruling L-R186s). A store with any other marker, or none, is refused whole, exit 3
+/// (critic K2; tester W2 PC6).
 const STORE_ENVELOPE: u64 = 2;
 
 struct Store {
@@ -922,12 +924,25 @@ impl Store {
         store.seq = head["seq"]
             .as_u64()
             .ok_or_else(|| bad(n, "first line must be {\"seq\":N,\"envelope\":2}"))?;
-        if head["envelope"].as_u64() != Some(STORE_ENVELOPE) {
-            return Err(bad(
-                n,
-                "a store from before ruling L-R186s (no \"envelope\":2): its digests do not \
-                 cover the header, so every record would read as damage; start a new store",
-            ));
+        match head["envelope"].as_u64() {
+            Some(STORE_ENVELOPE) => {}
+            // Tester W2 PC6: a higher marker is not an old store.
+            Some(newer) if newer > STORE_ENVELOPE => {
+                return Err(bad(
+                    n,
+                    &format!(
+                        "a store written by a newer build (\"envelope\":{newer}; this build \
+                         reads {STORE_ENVELOPE}); use that build or start a new store"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(bad(
+                    n,
+                    "a store from before ruling L-R186s (no \"envelope\":2): its digests do not \
+                     cover the header, so every record would read as damage; start a new store",
+                ))
+            }
         }
         for (n, line) in lines {
             let record: serde_json::Value =
@@ -1768,6 +1783,47 @@ mod tests {
             err.detail
         );
         assert!(err.detail.contains("L-R186s"), "{}", err.detail);
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Tester W2 PC6: a store marked `"envelope":3` was told it came "from before ruling
+    /// L-R186s". A missing or lower marker keeps that reason; a higher one names a newer build.
+    /// Every case is still refused whole, exit 3.
+    #[test]
+    fn pc6_a_store_from_a_newer_build_is_not_called_old() {
+        let dir = scratch("pc6");
+        let store = dir.join("s.jsonl");
+        coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["cart", "--absent", "put", "\"banana\"", "5"]),
+        )
+        .expect("a new store");
+        let text = std::fs::read_to_string(&store).expect("store");
+        let (_, records) = text.split_once('\n').expect("a head line");
+        for (head, older) in [
+            ("{\"seq\":1}", true),
+            ("{\"seq\":1,\"envelope\":1}", true),
+            ("{\"seq\":1,\"envelope\":3}", false),
+        ] {
+            std::fs::write(&store, format!("{head}\n{records}")).expect("head");
+            let Err(err) = Store::load(&store) else {
+                panic!("{head} loaded");
+            };
+            assert_eq!((err.exit, err.error.as_str()), (3, "Store"), "{head}");
+            assert_eq!(
+                err.detail.contains("before ruling L-R186s"),
+                older,
+                "{head}: {}",
+                err.detail
+            );
+            assert_eq!(
+                err.detail.contains("newer build"),
+                !older,
+                "{head}: {}",
+                err.detail
+            );
+        }
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 
