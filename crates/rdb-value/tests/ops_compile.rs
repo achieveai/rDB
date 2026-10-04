@@ -83,7 +83,8 @@ fn snapshot_with(doc: &Value) -> MapSnapshot {
 }
 
 /// Scenario §2 steps 1, 2 and 5, byte for byte: create, increment, set a new key. The digests
-/// are the design's, computed with Node `crypto` (tester W1 contract 1).
+/// are SHA-256 over header bytes 0..8 then the payload (ruling L-R186s), computed with Node
+/// `crypto` from the pinned header and payload (tester W1 contract 1).
 #[test]
 fn the_counter_scenario_produces_the_designed_bytes() {
     let mut s = MapSnapshot::new(Generation(1));
@@ -101,7 +102,7 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     assert_eq!(hex::encode(&value[..8]), "0101010100000012");
     assert_eq!(
         hex::encode(&value[8..40]),
-        "83b192c67d90cd32fe30cd7bf6bab13a7d7a49fee08d07cbc17b4a9a4fe96b26"
+        "01844f7eef38c8601d6153621026f35437ebf1765e8790c875e676c26f7bbb76"
     );
     assert_eq!(
         hex::encode(payload_of(&step1)),
@@ -135,7 +136,7 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     assert!(step2.conditions.is_empty());
     assert_eq!(
         hex::encode(&value[8..40]),
-        "e597e553867bb497e1f332faf4b7ba859bea842ffaf41aa5d8399a7466c443a3"
+        "8f318d2a0176969d2ea626a083338a6288f90c514cb8d3ea9c651edb22668426"
     );
     assert!(apply(&mut s, &step2, 2));
 
@@ -170,7 +171,7 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     };
     assert_eq!(
         hex::encode(&value[8..40]),
-        "e7b5e955444a2273c5ee993e46182859ae8caa50f700f5f8779f75ae2edfca0f"
+        "e3581d1437f73bda739264803f3a81bf905b919193a3f3025908d716c9a4021e"
     );
 }
 
@@ -288,14 +289,13 @@ fn a_damaged_record_is_corrupt_on_read_and_on_compile() {
 /// can see before then, so the predicate's arrival shows up as a change here.
 #[test]
 fn a_newer_build_record_reads_as_corrupt_until_the_m9_predicate() {
-    use rdb_value::envelope::{seal, EnvelopeError, Kind};
-    let mut header_and_payload = seal(
-        Kind::Document,
-        &encode(&map(&[("visits", int(1))])).unwrap(),
-    )
-    .unwrap()
-    .to_vec();
+    use rdb_value::envelope::{digest, seal, EnvelopeError, Kind, HEADER_LEN};
+    let payload = encode(&map(&[("visits", int(1))])).unwrap();
+    let mut header_and_payload = seal(Kind::Document, &payload).unwrap().to_vec();
     header_and_payload[2] = 0x02;
+    // Re-sealed, so the digest is sound: since ruling L-R186s it covers the codec byte.
+    let head: [u8; 8] = header_and_payload[..8].try_into().unwrap();
+    header_and_payload[8..HEADER_LEN].copy_from_slice(&digest(&head, &payload));
     let mut s = MapSnapshot::new(Generation(1));
     s.insert(key().to_bytes(), 1, Bytes::from(header_and_payload));
     let before = s.clone();

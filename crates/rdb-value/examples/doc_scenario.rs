@@ -61,9 +61,10 @@
 //!
 //! `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.
 //!
-//! The store is one JSON line `{"seq":N}`, then one line per record
-//! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store from S2
-//! (with `key` instead of `key_hex`) is refused, exit 3. `seq` stands in for the kernel's
+//! The store is one JSON line `{"seq":N,"envelope":2}`, then one line per record
+//! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store
+//! without `"envelope":2` was sealed before ruling L-R186s and is refused, exit 3, as is a store
+//! from S2 (with `key` instead of `key_hex`). `seq` stands in for the kernel's
 //! transaction sequence: each commit takes the next one and stamps it as the version of every
 //! record it writes. `apply` checks the condition, then each write's `expected_version`, the way
 //! the kernel's `first_failed_condition` does, and refuses with the kernel's name,
@@ -840,6 +841,10 @@ impl<'de> serde::de::Visitor<'de> for JsonVisitor {
 // The store
 // ---------------------------------------------------------------------------------------------
 
+/// The store's `envelope` marker: records sealed with the digest over header bytes 0..8 and the
+/// payload (ruling L-R186s). A store without it is refused whole, exit 3 (critic K2).
+const STORE_ENVELOPE: u64 = 2;
+
 struct Store {
     path: PathBuf,
     seq: u64,
@@ -916,7 +921,14 @@ impl Store {
             serde_json::from_str(head).map_err(|e| bad(n, &e.to_string()))?;
         store.seq = head["seq"]
             .as_u64()
-            .ok_or_else(|| bad(n, "first line must be {\"seq\":N}"))?;
+            .ok_or_else(|| bad(n, "first line must be {\"seq\":N,\"envelope\":2}"))?;
+        if head["envelope"].as_u64() != Some(STORE_ENVELOPE) {
+            return Err(bad(
+                n,
+                "a store from before ruling L-R186s (no \"envelope\":2): its digests do not \
+                 cover the header, so every record would read as damage; start a new store",
+            ));
+        }
         for (n, line) in lines {
             let record: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| bad(n, &e.to_string()))?;
@@ -1043,7 +1055,7 @@ impl Store {
 
     /// Rewrite the whole file: to a sibling first, then rename over the old one.
     fn save(&self) -> Result<(), Failure> {
-        let mut text = format!("{{\"seq\":{}}}\n", self.seq);
+        let mut text = format!("{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}}}\n", self.seq);
         for (key, version, value) in self.snapshot.records() {
             text.push_str(&format!(
                 "{{\"key_hex\":\"{}\",\"version\":{version},\"value_hex\":\"{}\"}}\n",
@@ -1724,6 +1736,38 @@ mod tests {
             !names.contains(&"kind") && !names.contains(&"count"),
             "{names:?}"
         );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Ruling L-R186s with critic K2: a store written before the digest covered the header
+    /// loaded, and then every record read as `Corrupt(DigestMismatch)`, which hides the reason
+    /// a re-test should fail for. It is refused whole, exit 3, and a new store is marked.
+    #[test]
+    fn l_r186s_a_store_from_before_the_header_digest_is_refused_at_load() {
+        let dir = scratch("l-r186s");
+        let store = dir.join("s.jsonl");
+        coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["cart", "--absent", "put", "\"banana\"", "5"]),
+        )
+        .expect("a new store");
+        let text = std::fs::read_to_string(&store).expect("store");
+        let (head, records) = text.split_once('\n').expect("a head line");
+        assert_eq!(head, "{\"seq\":1,\"envelope\":2}");
+        assert!(Store::load(&store).is_ok());
+
+        std::fs::write(&store, format!("{{\"seq\":1}}\n{records}")).expect("old head");
+        let Err(err) = Store::load(&store) else {
+            panic!("an old store loaded");
+        };
+        assert_eq!(
+            (err.exit, err.error.as_str()),
+            (3, "Store"),
+            "{}",
+            err.detail
+        );
+        assert!(err.detail.contains("L-R186s"), "{}", err.detail);
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 

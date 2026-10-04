@@ -14,13 +14,13 @@ use rdb_core::{
 };
 use rdb_value::cbor::encode;
 use rdb_value::collection::{collection, compile_collection, CollectionKind, ElemOp};
-use rdb_value::envelope::{seal, Kind};
+use rdb_value::envelope::{seal, EnvelopeError, Kind};
 use rdb_value::keys::{element_key, root_key, RootKey};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Int, Map, MapKey, Value};
 
 use rdb_value::delta::{ApplyError, Delta, Op};
-use rdb_value::{compile, Corrupt, Expected, ValueError};
+use rdb_value::{compile, read, Corrupt, Expected, ValueError};
 
 fn cart() -> RootKey {
     root_key(TenantId(1), AffinityId(1), b"cart")
@@ -204,4 +204,27 @@ fn l_r186r_a_document_compile_that_succeeds_fits_the_kernels_record_cap() {
         over.as_ref()
             .map(|c| kernel_record_len(c.conditions.len(), &c.mutations))
     );
+}
+
+/// Ruling L-R186s, the tester's W1 A3 case (`p5-rootdoc.store`): a map root whose `kind` byte
+/// is flipped to `0x01` read as the document `{"keys":1,"count":1}`, and one flipped to `0x03`
+/// read as a set. The digest now covers the header, so every read path names the damage.
+#[test]
+fn l_r186s_a_flipped_root_kind_is_damage_on_every_read_path() {
+    let root = cart();
+    let damage = Err(ValueError::Corrupt(Corrupt::Envelope(
+        EnvelopeError::DigestMismatch,
+    )));
+    for to in [0x01, 0x03] {
+        let mut flipped = map_root(1).to_vec();
+        flipped[1] = to;
+        let mut s = MapSnapshot::new(Generation(1));
+        s.insert(root.to_bytes(), 4, Bytes::from(flipped));
+        assert_eq!(read(&s, &root).map(|_| ()), damage, "read, {to:#04x}");
+        assert_eq!(
+            collection(&s, &root).map(|_| ()),
+            damage,
+            "collection, {to:#04x}"
+        );
+    }
 }
