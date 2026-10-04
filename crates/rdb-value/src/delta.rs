@@ -11,6 +11,31 @@ use crate::envelope::{Kind, LIMIT_TEXT};
 use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
 
+/// Which size limit an [`ApplyError::TooLarge`] hit. Two since ruling L-R186r (tester W2 PC5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeLimit {
+    /// One value's envelope: [`LIMIT_TEXT`].
+    Value,
+    /// The whole write: the record the kernel ships, every key and value plus its framing,
+    /// against `rdb_core::replication::append::MAX_ENVELOPE_BYTES`.
+    Write,
+}
+
+// `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
+const _: () = assert!(rdb_core::replication::append::MAX_ENVELOPE_BYTES == 1 << 20);
+
+impl fmt::Display for SizeLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value => write!(f, "{LIMIT_TEXT} limit for one value"),
+            Self::Write => write!(
+                f,
+                "1 MiB limit for the whole write (every key and value, plus the record's framing)"
+            ),
+        }
+    }
+}
+
 /// One document op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -94,17 +119,21 @@ pub enum ApplyError {
     /// The result nests deeper than the profile allows; nothing is written.
     #[error("the result nests deeper than the profile allows")]
     TooDeep,
-    /// The result is over the size limit; nothing is written.
-    #[error("the result is over the {LIMIT_TEXT} limit")]
-    TooLarge,
+    /// The result is over a size limit; nothing is written.
+    #[error("the result is over the {limit}")]
+    TooLarge {
+        /// Which limit.
+        limit: SizeLimit,
+    },
     /// A map key or set member is an array or a map. Only scalars are keys (ADR-rdb-0013 §4).
     #[error("an array or a map cannot be a map key or set member")]
     UnsupportedKeyType,
-    /// The op does not fit the object's kind: a document op on a map or set, a collection op on
-    /// a document, a map op on a set, or the reverse (ADR-rdb-0013 §10).
-    #[error("the object is a {found:?}, which this op does not apply to")]
+    /// The op does not fit the kind it is aimed at: a document op on a map or set, a collection
+    /// op on a document, a map op on a set, or the reverse (ADR-rdb-0013 §10). The object may
+    /// not exist: `set s put ..` is refused for the command's kind (tester W2 PC4).
+    #[error("a {found:?} does not take this op")]
     KindMismatch {
-        /// The object's kind.
+        /// The object's kind, or the command's when the op does not fit the command.
         found: Kind,
     },
     /// A `need … absent` found the element present.

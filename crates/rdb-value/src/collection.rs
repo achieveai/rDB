@@ -21,7 +21,7 @@ use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode};
 use crate::compile::{check_version, record, Compiled, Corrupt, Expected, ValueError};
-use crate::delta::ApplyError;
+use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{open, seal, Kind};
 use crate::keys::{decode_element_key, element_key, encode_element, RootKey};
 use crate::value::{Int, Map, MapKey, Value};
@@ -357,7 +357,10 @@ pub fn compile_collection(
     // The kernel's own measure of the record it would ship, so compile refuses exactly what
     // admission check 10 refuses (ruling L-R186r).
     if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
-        return Err(ApplyError::TooLarge.into());
+        return Err(ApplyError::TooLarge {
+            limit: SizeLimit::Write,
+        }
+        .into());
     }
     Ok(Compiled {
         mutations,

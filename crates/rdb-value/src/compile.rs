@@ -11,7 +11,7 @@ use rdb_core::transaction::record_len;
 use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode, CodecError, EncodeError};
-use crate::delta::{materialize, ApplyError, Delta};
+use crate::delta::{materialize, ApplyError, Delta, SizeLimit};
 use crate::envelope::{open, seal, EnvelopeError, Kind, OversizedPayload};
 use crate::keys::{KeyError, RootKey};
 use crate::value::Value;
@@ -135,14 +135,18 @@ impl From<EncodeError> for ApplyError {
     fn from(e: EncodeError) -> Self {
         match e {
             EncodeError::TooDeep => Self::TooDeep,
-            EncodeError::TooLarge => Self::TooLarge,
+            EncodeError::TooLarge => Self::TooLarge {
+                limit: SizeLimit::Value,
+            },
         }
     }
 }
 
 impl From<OversizedPayload> for ApplyError {
     fn from(_: OversizedPayload) -> Self {
-        Self::TooLarge
+        Self::TooLarge {
+            limit: SizeLimit::Value,
+        }
     }
 }
 
@@ -219,7 +223,10 @@ pub fn compile(
     // The kernel's own measure of the record it would ship, so compile refuses exactly what
     // admission check 10 refuses (ruling L-R186r).
     if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
-        return Err(ApplyError::TooLarge.into());
+        return Err(ApplyError::TooLarge {
+            limit: SizeLimit::Write,
+        }
+        .into());
     }
     Ok(Compiled {
         mutations,

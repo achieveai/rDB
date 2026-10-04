@@ -11,7 +11,7 @@ use common::{arb_value, int, map, nested, text};
 use proptest::prelude::*;
 use rdb_core::{AffinityId, Condition, Generation, Mutation, TenantId};
 use rdb_value::cbor::encode;
-use rdb_value::delta::{materialize, ApplyError, Delta, Location, Op};
+use rdb_value::delta::{materialize, ApplyError, Delta, Location, Op, SizeLimit};
 use rdb_value::envelope::{open, seal, Kind, MAX_PAYLOAD};
 use rdb_value::keys::{root_key, RootKey};
 use rdb_value::path::Path;
@@ -521,7 +521,9 @@ fn compile_refuses_results_that_are_too_deep_or_too_large() {
             Expected::Absent,
             &delta(vec![Op::Replace(big.clone())])
         ),
-        Err(ValueError::Apply(ApplyError::TooLarge))
+        Err(ValueError::Apply(ApplyError::TooLarge {
+            limit: SizeLimit::Write
+        }))
     );
     let mut s = MapSnapshot::new(Generation(1));
     let sealed = seal(Kind::Document, &encode(&big).unwrap()).unwrap();
@@ -530,7 +532,9 @@ fn compile_refuses_results_that_are_too_deep_or_too_large() {
     let grow = delta(vec![Op::Replace(map(&[("b", big.clone())]))]);
     assert_eq!(
         compile(&s, &key(), Expected::Version(1), &grow),
-        Err(ValueError::Apply(ApplyError::TooLarge))
+        Err(ValueError::Apply(ApplyError::TooLarge {
+            limit: SizeLimit::Value
+        }))
     );
 }
 

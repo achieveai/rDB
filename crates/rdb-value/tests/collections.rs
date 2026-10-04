@@ -19,7 +19,7 @@ use rdb_value::keys::{element_key, root_key, RootKey};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Int, Map, MapKey, Value};
 
-use rdb_value::delta::{ApplyError, Delta, Op};
+use rdb_value::delta::{ApplyError, Delta, Op, SizeLimit};
 use rdb_value::{compile, read, Corrupt, Expected, ValueError};
 
 fn cart() -> RootKey {
@@ -165,7 +165,12 @@ fn l_r186r_a_compile_that_succeeds_fits_the_kernels_record_cap() {
     );
     let over = create(at_cap + 1);
     assert!(
-        matches!(over, Err(ValueError::Apply(ApplyError::TooLarge))),
+        matches!(
+            over,
+            Err(ValueError::Apply(ApplyError::TooLarge {
+                limit: SizeLimit::Write
+            }))
+        ),
         "one byte past the kernel's cap: {:?}",
         over.as_ref()
             .map(|c| kernel_record_len(c.conditions.len(), &c.mutations))
@@ -199,7 +204,12 @@ fn l_r186r_a_document_compile_that_succeeds_fits_the_kernels_record_cap() {
     );
     let over = create(at_cap + 1);
     assert!(
-        matches!(over, Err(ValueError::Apply(ApplyError::TooLarge))),
+        matches!(
+            over,
+            Err(ValueError::Apply(ApplyError::TooLarge {
+                limit: SizeLimit::Write
+            }))
+        ),
         "one byte past the kernel's cap: {:?}",
         over.as_ref()
             .map(|c| kernel_record_len(c.conditions.len(), &c.mutations))
@@ -265,4 +275,45 @@ fn a2_a_write_that_touches_an_element_newer_than_its_root_is_refused() {
         compile_collection(&s, &root, CollectionKind::Map, Expected::Version(4), &kiwi).is_ok(),
         "an untouched element is not read"
     );
+}
+
+/// Tester W2 PC4: `set snew --absent put 1 1` said "the object is a Set" for an object that
+/// does not exist; it is the command that is a set. `KindMismatch` keeps its name and field
+/// (design C13, C24) and says what is true either way.
+#[test]
+fn pc4_kind_mismatch_on_an_absent_object_does_not_claim_it_exists() {
+    let s = MapSnapshot::new(Generation(1));
+    let root = root_key(TenantId(1), AffinityId(1), b"snew");
+    let put = [ElemOp::Put(int(1), int(1))];
+    let err = compile_collection(&s, &root, CollectionKind::Set, Expected::Absent, &put)
+        .expect_err("a set takes no put");
+    assert_eq!(
+        err,
+        ValueError::Apply(ApplyError::KindMismatch { found: Kind::Set })
+    );
+    assert_eq!(err.to_string(), "a Set does not take this op");
+}
+
+/// Tester W2 PC5: a collection write over the record cap said "over the 1 MiB envelope
+/// (1,048,536-byte payload) limit", but no envelope was over it: the whole write was. Since
+/// L-R186r there are two caps, and the detail names the one that was hit.
+#[test]
+fn pc5_too_large_names_the_cap_it_hit() {
+    let s = MapSnapshot::new(Generation(1));
+    let root = cart();
+    let half = || Value::Bytes(vec![0; 600 * 1024]);
+    let write = [
+        ElemOp::Put(text("k1"), half()),
+        ElemOp::Put(text("k2"), half()),
+    ];
+    let err = compile_collection(&s, &root, CollectionKind::Map, Expected::Absent, &write)
+        .expect_err("over the write cap");
+    let detail = err.to_string();
+    assert!(detail.contains("whole write"), "{detail}");
+    assert!(!detail.contains("envelope"), "{detail}");
+
+    let one = [ElemOp::Put(text("k"), Value::Bytes(vec![0; 1 << 20]))];
+    let err = compile_collection(&s, &root, CollectionKind::Map, Expected::Absent, &one)
+        .expect_err("over the value cap");
+    assert!(err.to_string().contains("one value"), "{err}");
 }
