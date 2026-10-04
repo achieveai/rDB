@@ -4,14 +4,23 @@
 //! a damaged store is refused by name, never by a panic.
 
 use bytes::Bytes;
-use rdb_core::{AffinityId, Generation, Mutation, TenantId};
+use rdb_core::contracts::envelope::{EnvelopeHeader, ReplicationEnvelope};
+use rdb_core::contracts::version::ENVELOPE_VERSION;
+use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+use rdb_core::transaction::dedup::{dedup_key, dedup_value};
+use rdb_core::{
+    AffinityId, ClientId, ConditionOutcome, ConfigVersion, Digest, Generation, LeaseId, Mutation,
+    Namespace, Outcome, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Seq, TenantId, Write,
+};
 use rdb_value::cbor::encode;
 use rdb_value::collection::{collection, compile_collection, CollectionKind, ElemOp};
 use rdb_value::envelope::{seal, Kind};
 use rdb_value::keys::{element_key, root_key, RootKey};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Int, Map, MapKey, Value};
-use rdb_value::{Corrupt, Expected, ValueError};
+
+use rdb_value::delta::{ApplyError, Delta, Op};
+use rdb_value::{compile, Corrupt, Expected, ValueError};
 
 fn cart() -> RootKey {
     root_key(TenantId(1), AffinityId(1), b"cart")
@@ -73,4 +82,126 @@ fn d1_a_root_count_at_u64_max_is_refused_by_name_never_wrapped() {
         };
         assert_eq!(value, &map_root(u64::MAX), "{ops:?}");
     }
+}
+
+/// The record the kernel ships for these writes, built as `TxnKernel::envelope` builds it (the
+/// writes, then step 13's one `Dedup` write) and measured by the contract's own `encode`. Every
+/// field outside the request is fixed-width, so the ids chosen here do not move the length.
+fn kernel_record_len(conditions: usize, mutations: &[Mutation]) -> usize {
+    let identity = RequestIdentity {
+        tenant: TenantId(1),
+        client: ClientId(1),
+        request: RequestId(1),
+    };
+    let mut writes: Vec<Write> = mutations
+        .iter()
+        .map(|mutation| match mutation {
+            Mutation::Put { key, value, .. } => Write {
+                ns: Namespace::User,
+                key: key.clone(),
+                value: Some(value.clone()),
+            },
+            Mutation::Delete { key, .. } => Write {
+                ns: Namespace::User,
+                key: key.clone(),
+                value: None,
+            },
+        })
+        .collect();
+    writes.push(Write {
+        ns: Namespace::Dedup,
+        key: dedup_key(Generation(1), AffinityId(1), identity),
+        value: Some(dedup_value(Digest::ROOT, Seq(1), OwnerEpoch(1))),
+    });
+    ReplicationEnvelope {
+        header: EnvelopeHeader {
+            protocol_version: ENVELOPE_VERSION,
+            partition: PartitionId(1),
+            generation: Generation(1),
+            config_version: ConfigVersion(1),
+            owner_epoch: OwnerEpoch(1),
+            seq: Seq(1),
+            body_len: 0,
+        },
+        lease_id: LeaseId(1),
+        prev_digest: Digest::ROOT,
+        request_identity: identity,
+        request_digest: Digest::ROOT,
+        conditions_result: vec![ConditionOutcome::Met; conditions],
+        mutations: writes,
+        result: Outcome::Published,
+        record_digest: Digest::ROOT,
+    }
+    .encode()
+    .expect("fits the wire's u32 lengths")
+    .len()
+}
+
+/// L-R186r (architect-m8-s5): compile measured `TooLarge` as key plus value bytes, while the
+/// kernel's admission check 10 measures the whole record against `MAX_ENVELOPE_BYTES`. A map
+/// create of one large entry is walked across the kernel's cap: every compile that succeeds
+/// must fit the record, and one byte past the cap must be `TooLarge`.
+#[test]
+fn l_r186r_a_compile_that_succeeds_fits_the_kernels_record_cap() {
+    let root = cart();
+    let s = MapSnapshot::new(Generation(1));
+    let create = |n: usize| {
+        let ops = [ElemOp::Put(text("x"), Value::Bytes(vec![0xAB; n]))];
+        compile_collection(&s, &root, CollectionKind::Map, Expected::Absent, &ops)
+    };
+    let record = |n: usize| {
+        let compiled = create(n).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+        kernel_record_len(compiled.conditions.len(), &compiled.mutations)
+    };
+    // One more value byte is one more record byte here (CBOR's 4-byte length covers both).
+    let probe = 100_000;
+    assert_eq!(record(probe + 1), record(probe) + 1);
+    let at_cap = probe + (MAX_ENVELOPE_BYTES - record(probe));
+
+    assert_eq!(
+        record(at_cap),
+        MAX_ENVELOPE_BYTES,
+        "the largest create the kernel admits"
+    );
+    let over = create(at_cap + 1);
+    assert!(
+        matches!(over, Err(ValueError::Apply(ApplyError::TooLarge))),
+        "one byte past the kernel's cap: {:?}",
+        over.as_ref()
+            .map(|c| kernel_record_len(c.conditions.len(), &c.mutations))
+    );
+}
+
+/// L-R186r, the document half. It sits here beside [`kernel_record_len`] rather than in
+/// `ops_compile.rs` so the oracle is written once. A document whose own envelope is within
+/// 1 MiB can still make a record over the kernel's cap, once the key and the record's framing
+/// are added.
+#[test]
+fn l_r186r_a_document_compile_that_succeeds_fits_the_kernels_record_cap() {
+    let root = cart();
+    let s = MapSnapshot::new(Generation(1));
+    let create = |n: usize| {
+        let delta = Delta(vec![Op::Replace(Value::Bytes(vec![0xAB; n]))]);
+        compile(&s, &root, Expected::Absent, &delta)
+    };
+    let record = |n: usize| {
+        let compiled = create(n).unwrap_or_else(|e| panic!("{n}: {e:?}"));
+        kernel_record_len(compiled.conditions.len(), &compiled.mutations)
+    };
+    let probe = 100_000;
+    assert_eq!(record(probe + 1), record(probe) + 1);
+    let at_cap = probe + (MAX_ENVELOPE_BYTES - record(probe));
+
+    assert_eq!(
+        record(at_cap),
+        MAX_ENVELOPE_BYTES,
+        "the largest create the kernel admits"
+    );
+    let over = create(at_cap + 1);
+    assert!(
+        matches!(over, Err(ValueError::Apply(ApplyError::TooLarge))),
+        "one byte past the kernel's cap: {:?}",
+        over.as_ref()
+            .map(|c| kernel_record_len(c.conditions.len(), &c.mutations))
+    );
 }

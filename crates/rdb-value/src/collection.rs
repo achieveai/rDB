@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
 use rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
+use rdb_core::transaction::record_len;
 use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode};
@@ -337,14 +338,9 @@ pub fn compile_collection(
         }
         .into());
     }
-    let bytes: usize = mutations
-        .iter()
-        .map(|m| match m {
-            Mutation::Put { key, value, .. } => key.len() + value.len(),
-            Mutation::Delete { key, .. } => key.len(),
-        })
-        .sum();
-    if bytes > MAX_ENVELOPE_BYTES {
+    // The kernel's own measure of the record it would ship, so compile refuses exactly what
+    // admission check 10 refuses (ruling L-R186r).
+    if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
         return Err(ApplyError::TooLarge.into());
     }
     Ok(Compiled {

@@ -6,6 +6,8 @@
 //! always reads back.
 
 use bytes::Bytes;
+use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+use rdb_core::transaction::record_len;
 use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode, CodecError, EncodeError};
@@ -209,12 +211,18 @@ pub fn compile(
         Expected::Absent => (None, vec![Condition::Absent { key: key.clone() }]),
         Expected::Version(v) => (Some(v), Vec::new()),
     };
+    let mutations = vec![Mutation::Put {
+        key,
+        value,
+        expected_version,
+    }];
+    // The kernel's own measure of the record it would ship, so compile refuses exactly what
+    // admission check 10 refuses (ruling L-R186r).
+    if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
+        return Err(ApplyError::TooLarge.into());
+    }
     Ok(Compiled {
-        mutations: vec![Mutation::Put {
-            key,
-            value,
-            expected_version,
-        }],
+        mutations,
         conditions,
     })
 }

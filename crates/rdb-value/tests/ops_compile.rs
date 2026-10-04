@@ -12,7 +12,7 @@ use proptest::prelude::*;
 use rdb_core::{AffinityId, Condition, Generation, Mutation, TenantId};
 use rdb_value::cbor::encode;
 use rdb_value::delta::{materialize, ApplyError, Delta, Location, Op};
-use rdb_value::envelope::{open, MAX_PAYLOAD};
+use rdb_value::envelope::{open, seal, Kind, MAX_PAYLOAD};
 use rdb_value::keys::{root_key, RootKey};
 use rdb_value::path::Path;
 use rdb_value::testing::MapSnapshot;
@@ -511,7 +511,21 @@ fn compile_refuses_results_that_are_too_deep_or_too_large() {
 
     // A byte string at exactly the payload limit, then one more key.
     let big = Value::Bytes(vec![7; MAX_PAYLOAD - 5]);
-    let s = snapshot_with(&big);
+    // Ruling L-R186r: its create is refused, because the record the kernel would ship (key and
+    // framing added) is over the kernel's cap. A record stored at the limit still reads back,
+    // so the store is seeded with it directly.
+    assert_eq!(
+        compile(
+            &MapSnapshot::new(Generation(1)),
+            &key(),
+            Expected::Absent,
+            &delta(vec![Op::Replace(big.clone())])
+        ),
+        Err(ValueError::Apply(ApplyError::TooLarge))
+    );
+    let mut s = MapSnapshot::new(Generation(1));
+    let sealed = seal(Kind::Document, &encode(&big).unwrap()).unwrap();
+    s.insert(key().to_bytes(), 1, sealed);
     assert_eq!(read(&s, &key()).unwrap().unwrap().value, big);
     let grow = delta(vec![Op::Replace(map(&[("b", big.clone())]))]);
     assert_eq!(
