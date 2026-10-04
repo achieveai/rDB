@@ -146,7 +146,7 @@ A logical history record is retained in RocksDB as data; native engine WAL seque
 |---|---|---|
 | Data-engine memory | Shared cache budget ≤25% node RAM; shared memtable budget ≤15%; tune within a total ≤60% DB-process RAM envelope | Backpressure before host OOM; include native allocations in measurement |
 | Local queues | Max 1,024 waiting requests/partition and 64 MiB/core set, whichever trips first | `OVERLOADED`, before admission |
-| Transaction envelope | Max 256 mutations and 1 MiB encoded bytes; fixed v1 defaults | `INVALID_ARGUMENT` before mutation |
+| Transaction envelope | Max 255 client mutations per request, so the envelope holds at most 256 writes with the primary's one dedup write; max 1 MiB encoded envelope bytes; fixed v1 defaults. The primary checks both before it writes | `INVALID_ARGUMENT` before mutation |
 | Core-set count | One per configured primary execution core, not every logical hardware thread by default | Record actual map in benchmark/configuration |
 | Disk headroom | Stop new placements at 70% allocated capacity; warning at 80%; stop new writes at 90% | Preserve room for compaction/recovery; alert before rejection |
 | Background moves | At most one inbound and one outbound bulk transfer/node; initial cap 10% measured disk/network sustainable bandwidth | Foreground budget wins; pause transfers on p99 breach |

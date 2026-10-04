@@ -11,19 +11,23 @@ use crate::contracts::ids::{Generation, GrantId, PartitionId, RequestIdentity, S
 use crate::contracts::time::Tick;
 use crate::contracts::txn::{key_scope, Condition, TxnRequest};
 use crate::contracts::version::{check_mandatory, VersionedArtifact};
-use crate::transaction::{Admitted, FreezeCause, QueueMode, TxnKernel, TxnRejection};
+use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
+use crate::transaction::{encoded_len, Admitted, FreezeCause, QueueMode, TxnKernel, TxnRejection};
 
 /// Check 9: how many admitted requests may wait behind the one in flight, unless
 /// [`crate::transaction::Limits`] overrides it.
 pub const QUEUE_CAP: usize = 1_024;
 
-/// Check 10: the most conditions one request may carry (spec §4.2's v1 bound, the same number
-/// as [`MAX_MUTATIONS`]).
+/// Check 10: the most conditions one request may carry (spec §4.2's v1 bound). Conditions are not
+/// shipped as writes, so this is not tied to the receiver's mutation bound.
 pub const MAX_CONDITIONS: usize = 256;
 
-/// Check 10: the most mutations one request may carry. R1's receiver refuses an envelope with
-/// more, so admitting one would reserve a sequence no replica can accept.
-pub use crate::replication::append::MAX_MUTATIONS;
+/// Check 10: the most mutations one request may carry, 255 (spec §4.2, ruling L-R184y).
+///
+/// One less than R1's receiver bound [`MAX_MUTATIONS`] because step 13 adds exactly one
+/// `Dedup` write to every envelope. At 256 the envelope carried 257 writes, every secondary
+/// refused it `TOO_LARGE` after the primary had applied it, and the partition froze.
+pub const MAX_REQUEST_MUTATIONS: usize = MAX_MUTATIONS - 1;
 
 /// Which side of the apply boundary a deny lands on. A contract type since lead ruling A-R72a,
 /// re-exported so `transaction::Boundary` still names it.
@@ -187,9 +191,18 @@ pub fn admit(
     {
         return refuse(RdbError::Overloaded { partition });
     }
-    // 10. Structure.
+    // 10. Structure, then the record's bytes against every secondary's append row 2 (spec §4.2).
+    //     Both are limits, so both precede dedup (11) and conditions (12): ruling L-R185b, spec
+    //     §5.2 step 1. Applied and then refused by every copy, an oversized record froze the
+    //     partition (ruling L-R184y).
     if let Some(field) = malformed(req) {
         return refuse(RdbError::InvalidArgument { field });
+    }
+    //     Measured, not encoded: step 13 encodes it once (ruling L-R185d).
+    if encoded_len(req) > MAX_ENVELOPE_BYTES {
+        return refuse(RdbError::InvalidArgument {
+            field: "envelope_bytes",
+        });
     }
     Ok(Admitted {
         request_digest: req.request_digest(),
@@ -224,7 +237,7 @@ fn cross_affinity(req: &TxnRequest) -> Option<RdbError> {
 
 /// Check 10: the field name of the first structural fault.
 fn malformed(req: &TxnRequest) -> Option<&'static str> {
-    if req.mutations.is_empty() || req.mutations.len() > MAX_MUTATIONS {
+    if req.mutations.is_empty() || req.mutations.len() > MAX_REQUEST_MUTATIONS {
         return Some("mutations");
     }
     if req.conditions.len() > MAX_CONDITIONS {
