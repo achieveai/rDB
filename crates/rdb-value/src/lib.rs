@@ -18,6 +18,7 @@ pub mod cbor;
 mod compile;
 pub mod delta;
 pub mod envelope;
+pub mod keys;
 pub mod path;
 pub mod testing;
 pub mod value;

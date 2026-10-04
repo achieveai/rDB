@@ -96,6 +96,9 @@ pub enum ApplyError {
     /// The result is over the size limit; nothing is written.
     #[error("the result is over the {LIMIT_TEXT} limit")]
     TooLarge,
+    /// A map key or set member is an array or a map. Only scalars are keys (ADR-rdb-0013 §4).
+    #[error("an array or a map cannot be a map key or set member")]
+    UnsupportedKeyType,
 }
 
 /// Apply `delta` to `base` (`None` = absent).
