@@ -1379,6 +1379,47 @@ fn gc_batches_match_the_walked_counts() {
     assert_eq!(k.records.len(), 1);
 }
 
+/// R6's fixed case, G1/G2 neighbour after the chunk range. `photp` sorts right after every chunk
+/// key of `photo`, so GC's scan reaches it and must stop at the end of `photo`'s chunk prefix.
+/// G1: the neighbour holds a rootless chunk, which is not `photo`'s garbage. G2: the neighbour is
+/// a published blob, whose root key would read as a chunk tail of length 0. In both, GC of
+/// `photo` deletes exactly `photo`'s chunks and leaves every neighbour record byte-identical.
+#[test]
+fn gc_stops_at_the_end_of_the_chunk_range() {
+    let root = photo();
+    let neighbour = root_key(TenantId(1), AffinityId(1), b"photp");
+    let last_chunk = chunk_of(&root, &[0xff; 16], u32::MAX);
+    assert!(last_chunk < neighbour.to_bytes());
+    assert!(last_chunk < chunk_of(&neighbour, &U2, 0));
+    let cases: [(&str, fn(&mut Kernel, &RootKey)); 2] = [
+        ("G1 rootless neighbour", |k, n| {
+            let c = put_chunk(&k.snapshot(), n, &U2, 0, b"n").unwrap();
+            k.commit(&c);
+        }),
+        ("G2 published neighbour", |k, n| {
+            let answer = upload(k, n, &U2, b"neighbour", 4, Expected::Absent, None);
+            assert_eq!(answer, Ok(Answer::Published));
+        }),
+    ];
+    for (name, add_neighbour) in cases {
+        let mut k = Kernel::new();
+        for i in 0..3 {
+            let c = put_chunk(&k.snapshot(), &root, &U1, i, b"z").unwrap();
+            k.commit(&c);
+        }
+        add_neighbour(&mut k, &neighbour);
+        let before = k.records.clone();
+        let mut expected = before.clone();
+        for i in 0..3 {
+            assert!(expected.remove(&chunk_of(&root, &U1, i)).is_some(), "{name}");
+        }
+        assert!(!expected.is_empty(), "{name}: the neighbour has records");
+        let floor = k.seq;
+        assert_eq!(gc(&mut k, &root, floor, None), Ok(Answer::Collected), "{name}");
+        assert_eq!(k.records, expected, "{name}");
+    }
+}
+
 // ---- R7: crash at every boundary -------------------------------------------------------------
 
 /// R7, crash at every boundary. Protects walk step 6 and C20: after a crash at any commit of an
