@@ -10,7 +10,7 @@ description = "rDB documents (M8 S2): the deterministic CBOR profile, the object
 rdb-core = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
-# SHA-256 of the canonical payload (ADR-rdb-0012 decision 9). Already pinned for `rdb-core`.
+# The envelope digest, SHA-256 (ADR-rdb-0012 decision 9; coverage per ruling L-R186s). Already pinned for `rdb-core`.
 sha2 = { workspace = true }
 # Exact pin: the library shapes the bytes we read (ADR-rdb-0012 decision 6).
 cbor4ii = { workspace = true }

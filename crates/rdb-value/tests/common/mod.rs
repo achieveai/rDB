@@ -342,7 +342,8 @@ fn arb_int() -> impl Strategy<Value = Int> {
     .prop_map(|v| Int::new(v).expect("in range"))
 }
 
-fn arb_leaf() -> impl Strategy<Value = Value> {
+/// Any scalar: every type a map key or set member can be, with the integer edges.
+pub fn arb_leaf() -> impl Strategy<Value = Value> {
     prop_oneof![
         Just(Value::Null),
         any::<bool>().prop_map(Value::Bool),

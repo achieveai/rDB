@@ -5,6 +5,8 @@
 //! faults gets one deterministic answer (M7A-62..M7A-70). Every error produced here is a
 //! **definitive non-admission**: nothing has been serialized at the queue and nothing written.
 
+use std::collections::BTreeSet;
+
 use crate::contracts::authority::DenyReason;
 use crate::contracts::errors::{ErrorKind, RdbError};
 use crate::contracts::ids::{Generation, GrantId, PartitionId, RequestIdentity, Seq};
@@ -238,6 +240,17 @@ fn cross_affinity(req: &TxnRequest) -> Option<RdbError> {
 /// Check 10: the field name of the first structural fault.
 fn malformed(req: &TxnRequest) -> Option<&'static str> {
     if req.mutations.is_empty() || req.mutations.len() > MAX_REQUEST_MUTATIONS {
+        return Some("mutations");
+    }
+    // No two mutations name one key (spec §4.2, ruling L-R186f). The batch carries
+    // both writes in request order, so the last would silently win. Conditions are not
+    // counted: a create pairs `Absent{k}` with `Put{k}`. After the count, so this sees ≤ 255.
+    let mut keys = BTreeSet::new();
+    if !req
+        .mutations
+        .iter()
+        .all(|mutation| keys.insert(mutation.key()))
+    {
         return Some("mutations");
     }
     if req.conditions.len() > MAX_CONDITIONS {

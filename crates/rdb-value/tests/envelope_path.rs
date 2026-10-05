@@ -21,7 +21,7 @@ fn seal_writes_the_documented_header_and_open_reads_it_back() {
     assert_eq!(hex::encode(&sealed[..8]), "0101010100000012");
     assert_eq!(
         hex::encode(&sealed[8..HEADER_LEN]),
-        "83b192c67d90cd32fe30cd7bf6bab13a7d7a49fee08d07cbc17b4a9a4fe96b26"
+        "01844f7eef38c8601d6153621026f35437ebf1765e8790c875e676c26f7bbb76"
     );
     let opened = open(&sealed).expect("opens");
     assert_eq!(opened.kind, Kind::Document);
@@ -43,11 +43,29 @@ fn open_fails_closed_on_every_damaged_header_field() {
     };
     assert_eq!(open(&[]), Err(Truncated { len: 0 }));
     assert_eq!(open(&good[..39]), Err(Truncated { len: 39 }));
-    for byte in [0x00, 0x02, 0xff] {
+    // `envelope_format` and `digest_alg` say how to check the digest, so they are read before
+    // it. A flipped `kind` or `codec_version` is a digest mismatch since ruling L-R186s; see
+    // `l_r186s_*` below.
+    for byte in [0x00, 0x7f, 0xff] {
         assert_eq!(open(&with(0, byte)), Err(UnknownFormat(byte)));
-        assert_eq!(open(&with(1, byte)), Err(UnknownKind(byte)));
-        assert_eq!(open(&with(2, byte)), Err(UnknownCodec(byte)));
         assert_eq!(open(&with(3, byte)), Err(UnknownDigest(byte)));
+    }
+    // Review F-004: a `kind` or `codec_version` this build does not know, under the digest
+    // `seal` wrote for `0x01`, is damage. It fails only if `kind` and `codec_version` are
+    // read after the digest; read before it, these name the newer-build class instead.
+    for byte in [0x00, 0x04, 0xff] {
+        assert_eq!(
+            open(&with(1, byte)),
+            Err(DigestMismatch),
+            "kind {byte:#04x}"
+        );
+    }
+    for byte in [0x00, 0xff] {
+        assert_eq!(
+            open(&with(2, byte)),
+            Err(DigestMismatch),
+            "codec {byte:#04x}"
+        );
     }
     // payload_len says 0 and 2 against 1 byte; then one extra byte after the payload.
     assert_eq!(
@@ -84,6 +102,97 @@ fn open_fails_closed_on_every_damaged_header_field() {
         Err(TooLarge {
             len: MAX_ENVELOPE + 1
         })
+    );
+}
+
+/// `header[..8]` with `kind` and `codec` set, then a digest that really is SHA-256 over
+/// `header[..8] || payload` (ADR-rdb-0012 §9 as amended by ruling L-R186s), then the payload:
+/// what a build that writes those bytes would store. Hashed here, not by `seal`.
+fn hashed(kind: u8, codec: u8, payload: &[u8]) -> Vec<u8> {
+    use sha2::{Digest as _, Sha256};
+    let len = u32::try_from(payload.len()).expect("small").to_be_bytes();
+    let head = [0x01, kind, codec, 0x01, len[0], len[1], len[2], len[3]];
+    let mut hasher = Sha256::new();
+    hasher.update(head);
+    hasher.update(payload);
+    let mut out = head.to_vec();
+    out.extend_from_slice(&hasher.finalize());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Ruling L-R186s (tester W1 A3): the digest covers header bytes 0..8, so one flipped `kind`
+/// or `codec_version` byte is damage. Before it, a map root flipped to `0x01` read as a
+/// document, and map and set swapped silently.
+#[test]
+fn l_r186s_a_flipped_kind_or_codec_is_a_digest_mismatch() {
+    let payload = h("a2646b6579730165636f756e7401");
+    for (from, to) in [
+        (Kind::Map, 0x01),
+        (Kind::Map, 0x03),
+        (Kind::Set, 0x02),
+        (Kind::Set, 0x01),
+        (Kind::Document, 0x02),
+        (Kind::Document, 0x03),
+    ] {
+        let mut flipped = seal(from, &payload).expect("seals").to_vec();
+        flipped[1] = to;
+        assert_eq!(
+            open(&flipped),
+            Err(EnvelopeError::DigestMismatch),
+            "{from:?} -> {to:#04x}"
+        );
+    }
+    for codec in [0x00, 0x02, 0xff] {
+        let mut flipped = seal(Kind::Document, &payload).expect("seals").to_vec();
+        flipped[2] = codec;
+        assert_eq!(
+            open(&flipped),
+            Err(EnvelopeError::DigestMismatch),
+            "{codec:#04x}"
+        );
+    }
+    // `seal` writes exactly that digest.
+    let sealed = seal(Kind::Map, &payload).expect("seals");
+    assert_eq!(sealed.to_vec(), hashed(0x02, 0x01, &payload));
+    // The message names what the digest covers, not the payload alone (review F-008).
+    assert_eq!(
+        EnvelopeError::DigestMismatch.to_string(),
+        "header bytes 0..8 and the payload do not hash to the stored digest"
+    );
+}
+
+/// Ruling L-R186s with critic K1 (ADR-rdb-0012 §12): a record a newer build wrote, of a size
+/// `open` accepts, is not damage. Its `kind` or `codec` is unknown here but its digest is right,
+/// so it reads as `Unknown*`. An unknown `envelope_format` or `digest_alg` is refused before
+/// the digest is computed, whatever the digest bytes are.
+#[test]
+fn l_r186s_a_newer_builds_record_reads_as_unknown_never_as_damage() {
+    use EnvelopeError::*;
+    let payload = h("a0");
+    assert_eq!(open(&hashed(0x04, 0x01, &payload)), Err(UnknownKind(0x04)));
+    assert_eq!(open(&hashed(0x7f, 0x01, &payload)), Err(UnknownKind(0x7f)));
+    assert_eq!(open(&hashed(0x00, 0x01, &payload)), Err(UnknownKind(0x00)));
+    assert_eq!(open(&hashed(0xff, 0x01, &payload)), Err(UnknownKind(0xff)));
+    for codec in [0x00, 0x02, 0xff] {
+        assert_eq!(
+            open(&hashed(0x01, codec, &payload)),
+            Err(UnknownCodec(codec))
+        );
+    }
+    for digest in [[0x00; 32], [0xab; 32]] {
+        let mut newer = hashed(0x01, 0x01, &payload);
+        newer[8..HEADER_LEN].copy_from_slice(&digest);
+        let mut format = newer.clone();
+        format[0] = 0x02;
+        assert_eq!(open(&format), Err(UnknownFormat(0x02)));
+        let mut alg = newer.clone();
+        alg[3] = 0x02;
+        assert_eq!(open(&alg), Err(UnknownDigest(0x02)));
+    }
+    assert_eq!(
+        open(&hashed(0x01, 0x01, &payload)).map(|o| o.kind),
+        Ok(Kind::Document)
     );
 }
 

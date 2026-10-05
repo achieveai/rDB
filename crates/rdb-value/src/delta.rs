@@ -7,9 +7,34 @@
 
 use std::fmt;
 
-use crate::envelope::LIMIT_TEXT;
+use crate::envelope::{Kind, LIMIT_TEXT};
 use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
+
+/// Which size limit an [`ApplyError::TooLarge`] hit. Two since L-R186z (tester W2 PC5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SizeLimit {
+    /// One value's envelope: [`LIMIT_TEXT`].
+    Value,
+    /// The whole write: the record the kernel ships, every key and value plus its framing,
+    /// against `rdb_core::replication::append::MAX_ENVELOPE_BYTES`.
+    Write,
+}
+
+// `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
+const _: () = assert!(rdb_core::replication::append::MAX_ENVELOPE_BYTES == 1 << 20);
+
+impl fmt::Display for SizeLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Value => write!(f, "{LIMIT_TEXT} limit for one value"),
+            Self::Write => write!(
+                f,
+                "1 MiB limit for the whole write (every key and value, plus the record's framing)"
+            ),
+        }
+    }
+}
 
 /// One document op.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,8 +75,9 @@ impl fmt::Display for Location {
 /// Why an op, or a compile, is refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ApplyError {
-    /// An op other than `Replace` on a document that does not exist, or an empty delta on one.
-    #[error("the document does not exist")]
+    /// An op other than `Replace` on a document that does not exist, or an empty delta on one;
+    /// or a map or set update, read or drop of an object that does not exist.
+    #[error("the object does not exist")]
     ObjectAbsent,
     /// A map has no such key.
     #[error("nothing at segment {segment:?}")]
@@ -93,9 +119,42 @@ pub enum ApplyError {
     /// The result nests deeper than the profile allows; nothing is written.
     #[error("the result nests deeper than the profile allows")]
     TooDeep,
-    /// The result is over the size limit; nothing is written.
-    #[error("the result is over the {LIMIT_TEXT} limit")]
-    TooLarge,
+    /// The result is over a size limit; nothing is written.
+    #[error("the result is over the {limit}")]
+    TooLarge {
+        /// Which limit.
+        limit: SizeLimit,
+    },
+    /// A map key or set member is an array or a map. Only scalars are keys (ADR-rdb-0013 §4).
+    #[error("an array or a map cannot be a map key or set member")]
+    UnsupportedKeyType,
+    /// The op does not fit the kind it is aimed at: a document op on a map or set, a collection
+    /// op on a document, a map op on a set, or the reverse (ADR-rdb-0013 §10). The object may
+    /// not exist: `set s put ..` is refused for the command's kind (tester W2 PC4).
+    #[error("a {found:?} does not take this op")]
+    KindMismatch {
+        /// The object's kind, or the command's when the op does not fit the command.
+        found: Kind,
+    },
+    /// A `need … absent` found the element present.
+    #[error("the element is present")]
+    ElementExists,
+    /// A `need … present` found the element absent.
+    #[error("the element is absent")]
+    ElementAbsent,
+    /// A collection that still has elements cannot be dropped.
+    #[error("the collection still has {count} elements")]
+    NotEmpty {
+        /// The root's element count.
+        count: u64,
+    },
+    /// The compiled request would carry more writes than one transaction admits; nothing is
+    /// written.
+    #[error("{writes} writes are more than one transaction admits")]
+    TooManyWrites {
+        /// The writes the delta would make.
+        writes: usize,
+    },
 }
 
 /// Apply `delta` to `base` (`None` = absent).

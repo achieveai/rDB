@@ -1237,6 +1237,14 @@ const fn published_result(lineage: Lineage, seq: Seq) -> TxnResult {
 ///
 /// Saturating, so an absurd request still measures over the cap rather than wrapping under it.
 fn encoded_len(req: &TxnRequest) -> usize {
+    record_len(req.conditions.len(), &req.mutations)
+}
+
+/// [`encoded_len`] for a request's conditions count and mutations, the only parts of a request
+/// its record length depends on. Public so a compiler can refuse what check 10 would refuse
+/// against [`MAX_ENVELOPE_BYTES`] without copying this layout (L-R186v).
+#[must_use]
+pub fn record_len(conditions: usize, mutations: &[Mutation]) -> usize {
     // Header; then lease id, prev digest, identity, request digest, the conditions and mutations
     // count prefixes, the result tag and the record digest.
     const FIXED: usize = ENVELOPE_HEADER_LEN + 8 + 32 + 16 + 32 + 4 + 4 + 1 + 32;
@@ -1246,8 +1254,8 @@ fn encoded_len(req: &TxnRequest) -> usize {
     // Step 13's one `Dedup` write, fixed-width.
     const DEDUP: usize = WRITE + dedup::DEDUP_KEY_LEN + VALUE + dedup::DEDUP_VALUE_LEN;
     // One outcome byte per condition.
-    let fixed = (FIXED + DEDUP).saturating_add(req.conditions.len());
-    req.mutations.iter().fold(fixed, |len, mutation| {
+    let fixed = (FIXED + DEDUP).saturating_add(conditions);
+    mutations.iter().fold(fixed, |len, mutation| {
         let write = match mutation {
             Mutation::Put { key, value, .. } => (WRITE + VALUE)
                 .saturating_add(key.len())

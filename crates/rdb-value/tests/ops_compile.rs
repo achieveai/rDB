@@ -9,16 +9,20 @@ mod common;
 use bytes::Bytes;
 use common::{arb_value, int, map, nested, text};
 use proptest::prelude::*;
-use rdb_core::{Condition, Generation, Mutation};
+use rdb_core::{AffinityId, Condition, Generation, Mutation, TenantId};
 use rdb_value::cbor::encode;
-use rdb_value::delta::{materialize, ApplyError, Delta, Location, Op};
-use rdb_value::envelope::{open, MAX_PAYLOAD};
+use rdb_value::delta::{materialize, ApplyError, Delta, Location, Op, SizeLimit};
+use rdb_value::envelope::{open, seal, Kind, MAX_PAYLOAD};
+use rdb_value::keys::{root_key, RootKey};
 use rdb_value::path::Path;
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Int, Value, INT_MAX, INT_MIN};
 use rdb_value::{compile, read, Compiled, Corrupt, Expected, ValueError};
 
-const KEY: &[u8] = b"user:1";
+/// The document `user:1`'s root key (ADR-rdb-0013 §1).
+fn key() -> RootKey {
+    root_key(TenantId(1), AffinityId(1), b"user:1")
+}
 
 fn p(text: &str) -> Path {
     Path::parse(text).expect("test path")
@@ -40,15 +44,14 @@ fn apply(snapshot: &mut MapSnapshot, compiled: &Compiled, version: u64) -> bool 
         key,
         value,
         expected_version,
-    } = &compiled.mutation
+    } = &compiled.mutations[0]
     else {
         panic!("compile returns a Put");
     };
-    let held = match &compiled.condition {
-        Some(Condition::Absent { key }) => snapshot.version(Namespace::User, key).is_none(),
-        Some(other) => panic!("compile attaches only Absent, got {other:?}"),
-        None => true,
-    } && expected_version
+    let held = compiled.conditions.iter().all(|condition| match condition {
+        Condition::Absent { key } => snapshot.version(Namespace::User, key).is_none(),
+        other => panic!("compile attaches only Absent, got {other:?}"),
+    }) && expected_version
         .is_none_or(|want| snapshot.version(Namespace::User, key) == Some(want));
     if held {
         snapshot.insert(key.clone(), version, value.clone());
@@ -57,7 +60,7 @@ fn apply(snapshot: &mut MapSnapshot, compiled: &Compiled, version: u64) -> bool 
 }
 
 fn payload_of(compiled: &Compiled) -> Vec<u8> {
-    let Mutation::Put { value, .. } = &compiled.mutation else {
+    let Mutation::Put { value, .. } = &compiled.mutations[0] else {
         panic!("a Put");
     };
     open(value)
@@ -70,7 +73,7 @@ fn snapshot_with(doc: &Value) -> MapSnapshot {
     let mut s = MapSnapshot::new(Generation(1));
     let c = compile(
         &s,
-        KEY,
+        &key(),
         Expected::Absent,
         &delta(vec![Op::Replace(doc.clone())]),
     )
@@ -80,17 +83,18 @@ fn snapshot_with(doc: &Value) -> MapSnapshot {
 }
 
 /// Scenario §2 steps 1, 2 and 5, byte for byte: create, increment, set a new key. The digests
-/// are the design's, computed with Node `crypto` (tester W1 contract 1).
+/// are SHA-256 over header bytes 0..8 then the payload (ruling L-R186s), computed with Node
+/// `crypto` from the pinned header and payload (tester W1 contract 1).
 #[test]
 fn the_counter_scenario_produces_the_designed_bytes() {
     let mut s = MapSnapshot::new(Generation(1));
     let doc = map(&[("name", text("ada")), ("visits", int(0))]);
-    let step1 = compile(&s, KEY, Expected::Absent, &delta(vec![Op::Replace(doc)])).unwrap();
+    let step1 = compile(&s, &key(), Expected::Absent, &delta(vec![Op::Replace(doc)])).unwrap();
     let Mutation::Put {
         value,
         expected_version,
         ..
-    } = &step1.mutation
+    } = &step1.mutations[0]
     else {
         panic!()
     };
@@ -98,7 +102,7 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     assert_eq!(hex::encode(&value[..8]), "0101010100000012");
     assert_eq!(
         hex::encode(&value[8..40]),
-        "83b192c67d90cd32fe30cd7bf6bab13a7d7a49fee08d07cbc17b4a9a4fe96b26"
+        "01844f7eef38c8601d6153621026f35437ebf1765e8790c875e676c26f7bbb76"
     );
     assert_eq!(
         hex::encode(payload_of(&step1)),
@@ -106,16 +110,16 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     );
     assert_eq!(*expected_version, None);
     assert_eq!(
-        step1.condition,
-        Some(Condition::Absent {
-            key: Bytes::from_static(KEY)
-        })
+        step1.conditions,
+        vec![Condition::Absent {
+            key: key().to_bytes()
+        }]
     );
     assert!(apply(&mut s, &step1, 1));
 
     let step2 = compile(
         &s,
-        KEY,
+        &key(),
         Expected::Version(1),
         &delta(vec![Op::Increment(p("/visits"), n(1))]),
     )
@@ -124,15 +128,15 @@ fn the_counter_scenario_produces_the_designed_bytes() {
         value,
         expected_version,
         ..
-    } = &step2.mutation
+    } = &step2.mutations[0]
     else {
         panic!()
     };
     assert_eq!(*expected_version, Some(1));
-    assert_eq!(step2.condition, None);
+    assert!(step2.conditions.is_empty());
     assert_eq!(
         hex::encode(&value[8..40]),
-        "e597e553867bb497e1f332faf4b7ba859bea842ffaf41aa5d8399a7466c443a3"
+        "8f318d2a0176969d2ea626a083338a6288f90c514cb8d3ea9c651edb22668426"
     );
     assert!(apply(&mut s, &step2, 2));
 
@@ -140,7 +144,7 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     assert_eq!(
         compile(
             &s,
-            KEY,
+            &key(),
             Expected::Version(1),
             &delta(vec![Op::Increment(p("/visits"), n(1))])
         ),
@@ -153,7 +157,7 @@ fn the_counter_scenario_produces_the_designed_bytes() {
     // Step 5: a new key lands between `name` and `visits` (length first).
     let step5 = compile(
         &s,
-        KEY,
+        &key(),
         Expected::Version(2),
         &delta(vec![Op::Set(p("/email"), text("ada@x.io"))]),
     )
@@ -162,12 +166,12 @@ fn the_counter_scenario_produces_the_designed_bytes() {
         hex::encode(payload_of(&step5)),
         "a3646e616d656361646165656d61696c6861646140782e696f6676697369747301"
     );
-    let Mutation::Put { value, .. } = &step5.mutation else {
+    let Mutation::Put { value, .. } = &step5.mutations[0] else {
         panic!()
     };
     assert_eq!(
         hex::encode(&value[8..40]),
-        "e7b5e955444a2273c5ee993e46182859ae8caa50f700f5f8779f75ae2edfca0f"
+        "e3581d1437f73bda739264803f3a81bf905b919193a3f3025908d716c9a4021e"
     );
 }
 
@@ -176,28 +180,40 @@ fn the_counter_scenario_produces_the_designed_bytes() {
 #[test]
 fn racing_creates_keep_their_absent_condition_and_the_second_fails() {
     let mut s = MapSnapshot::new(Generation(1));
-    let a = compile(&s, KEY, Expected::Absent, &delta(vec![Op::Replace(int(1))])).unwrap();
-    let b = compile(&s, KEY, Expected::Absent, &delta(vec![Op::Replace(int(2))])).unwrap();
+    let a = compile(
+        &s,
+        &key(),
+        Expected::Absent,
+        &delta(vec![Op::Replace(int(1))]),
+    )
+    .unwrap();
+    let b = compile(
+        &s,
+        &key(),
+        Expected::Absent,
+        &delta(vec![Op::Replace(int(2))]),
+    )
+    .unwrap();
     assert!(apply(&mut s, &a, 1));
     assert!(
         !apply(&mut s, &b, 2),
         "second create must fail its condition"
     );
     assert_eq!(
-        read(&s, KEY).unwrap().map(|d| (d.version, d.value)),
+        read(&s, &key()).unwrap().map(|d| (d.version, d.value)),
         Some((1, int(1)))
     );
     // A stale `expected_version` is refused at apply too.
     let first = compile(
         &s,
-        KEY,
+        &key(),
         Expected::Version(1),
         &delta(vec![Op::Replace(int(3))]),
     )
     .unwrap();
     let stale = compile(
         &s,
-        KEY,
+        &key(),
         Expected::Version(1),
         &delta(vec![Op::Replace(int(4))]),
     )
@@ -208,7 +224,7 @@ fn racing_creates_keep_their_absent_condition_and_the_second_fails() {
         "expected_version 1 no longer holds"
     );
     assert_eq!(
-        read(&s, KEY).unwrap().map(|d| (d.version, d.value)),
+        read(&s, &key()).unwrap().map(|d| (d.version, d.value)),
         Some((5, int(3)))
     );
 }
@@ -218,28 +234,28 @@ fn racing_creates_keep_their_absent_condition_and_the_second_fails() {
 #[test]
 fn a_damaged_record_is_corrupt_on_read_and_on_compile() {
     let mut s = snapshot_with(&map(&[("visits", int(1))]));
-    let (key, version, value) = s
+    let (stored, version, value) = s
         .records()
         .next()
         .map(|(k, v, b)| (k.clone(), v, b.clone()))
         .unwrap();
     let mut flipped = value.to_vec();
     *flipped.last_mut().unwrap() ^= 0x01;
-    s.insert(key, version, Bytes::from(flipped));
+    s.insert(stored, version, Bytes::from(flipped));
     let corrupt = ValueError::Corrupt(Corrupt::Envelope(
         rdb_value::envelope::EnvelopeError::DigestMismatch,
     ));
-    assert_eq!(read(&s, KEY), Err(corrupt.clone()));
+    assert_eq!(read(&s, &key()), Err(corrupt.clone()));
     let op = delta(vec![Op::Increment(p("/visits"), n(1))]);
     assert_eq!(
-        compile(&s, KEY, Expected::Version(version), &op),
+        compile(&s, &key(), Expected::Version(version), &op),
         Err(corrupt.clone())
     );
     // Even a whole replace at that version: the base must read back first (A2, by design).
     assert_eq!(
         compile(
             &s,
-            KEY,
+            &key(),
             Expected::Version(version),
             &delta(vec![Op::Replace(int(0))])
         ),
@@ -249,9 +265,9 @@ fn a_damaged_record_is_corrupt_on_read_and_on_compile() {
     let mut s = MapSnapshot::new(Generation(1));
     let sealed =
         rdb_value::envelope::seal(rdb_value::envelope::Kind::Document, &[0x18, 0x01]).unwrap();
-    s.insert(Bytes::from_static(KEY), 1, sealed);
+    s.insert(key().to_bytes(), 1, sealed);
     assert!(matches!(
-        read(&s, KEY),
+        read(&s, &key()),
         Err(ValueError::Corrupt(Corrupt::Codec(
             rdb_value::cbor::CodecError::NonCanonical { .. }
         )))
@@ -259,9 +275,9 @@ fn a_damaged_record_is_corrupt_on_read_and_on_compile() {
     // A header with an empty payload opens, and the empty payload does not decode.
     let mut s = MapSnapshot::new(Generation(1));
     let empty = rdb_value::envelope::seal(rdb_value::envelope::Kind::Document, &[]).unwrap();
-    s.insert(Bytes::from_static(KEY), 1, empty);
+    s.insert(key().to_bytes(), 1, empty);
     assert!(matches!(
-        read(&s, KEY),
+        read(&s, &key()),
         Err(ValueError::Corrupt(Corrupt::Codec(_)))
     ));
 }
@@ -273,41 +289,45 @@ fn a_damaged_record_is_corrupt_on_read_and_on_compile() {
 /// can see before then, so the predicate's arrival shows up as a change here.
 #[test]
 fn a_newer_build_record_reads_as_corrupt_until_the_m9_predicate() {
-    use rdb_value::envelope::{seal, EnvelopeError, Kind};
-    let mut header_and_payload = seal(
-        Kind::Document,
-        &encode(&map(&[("visits", int(1))])).unwrap(),
-    )
-    .unwrap()
-    .to_vec();
+    use rdb_value::envelope::{digest, seal, EnvelopeError, Kind, HEADER_LEN};
+    let payload = encode(&map(&[("visits", int(1))])).unwrap();
+    let mut header_and_payload = seal(Kind::Document, &payload).unwrap().to_vec();
     header_and_payload[2] = 0x02;
+    // Re-sealed, so the digest is sound: since ruling L-R186s it covers the codec byte.
+    let head: [u8; 8] = header_and_payload[..8].try_into().unwrap();
+    header_and_payload[8..HEADER_LEN].copy_from_slice(&digest(&head, &payload));
     let mut s = MapSnapshot::new(Generation(1));
-    s.insert(Bytes::from_static(KEY), 1, Bytes::from(header_and_payload));
+    s.insert(key().to_bytes(), 1, Bytes::from(header_and_payload));
     let before = s.clone();
 
     let newer = ValueError::Corrupt(Corrupt::Envelope(EnvelopeError::UnknownCodec(0x02)));
-    assert_eq!(read(&s, KEY), Err(newer.clone()));
+    assert_eq!(read(&s, &key()), Err(newer.clone()));
     assert_eq!(
         newer.to_string(),
         "corrupt record: unknown codec version 0x02"
     );
     let update = delta(vec![Op::Increment(p("/visits"), n(1))]);
     assert_eq!(
-        compile(&s, KEY, Expected::Version(1), &update),
+        compile(&s, &key(), Expected::Version(1), &update),
         Err(newer.clone())
     );
     assert_eq!(
         compile(
             &s,
-            KEY,
+            &key(),
             Expected::Version(1),
             &delta(vec![Op::Replace(int(0))])
         ),
         Err(newer)
     );
     // A create does not read the record; its `Absent` condition fails at apply instead.
-    let create = compile(&s, KEY, Expected::Absent, &delta(vec![Op::Replace(int(0))]))
-        .expect("a create compiles without reading");
+    let create = compile(
+        &s,
+        &key(),
+        Expected::Absent,
+        &delta(vec![Op::Replace(int(0))]),
+    )
+    .expect("a create compiles without reading");
     assert!(!apply(&mut s, &create, 2));
     assert_eq!(s, before, "nothing is changed");
 }
@@ -455,13 +475,13 @@ fn op_refusals_are_named_and_all_or_nothing() {
         Op::Increment(p("/name"), n(1)),
     ]);
     assert_eq!(
-        compile(&s, KEY, Expected::Version(1), &mixed),
+        compile(&s, &key(), Expected::Version(1), &mixed),
         Err(ValueError::Apply(ApplyError::TypeMismatch))
     );
     assert_eq!(
         compile(
             &MapSnapshot::new(Generation(1)),
-            KEY,
+            &key(),
             Expected::Version(1),
             &mixed
         ),
@@ -479,11 +499,11 @@ fn compile_refuses_results_that_are_too_deep_or_too_large() {
     // Leaf at depth 60 replaced by 5 more arrays: 65 levels.
     let too_deep = delta(vec![Op::Set(path(60), nested(5, Value::Null))]);
     assert_eq!(
-        compile(&s, KEY, Expected::Version(1), &too_deep),
+        compile(&s, &key(), Expected::Version(1), &too_deep),
         Err(ValueError::Apply(ApplyError::TooDeep))
     );
     let deepest = delta(vec![Op::Set(path(60), nested(4, Value::Null))]);
-    let ok = compile(&s, KEY, Expected::Version(1), &deepest).expect("64 levels");
+    let ok = compile(&s, &key(), Expected::Version(1), &deepest).expect("64 levels");
     assert_eq!(
         rdb_value::cbor::decode(&payload_of(&ok)).map(|_| ()),
         Ok(())
@@ -491,12 +511,30 @@ fn compile_refuses_results_that_are_too_deep_or_too_large() {
 
     // A byte string at exactly the payload limit, then one more key.
     let big = Value::Bytes(vec![7; MAX_PAYLOAD - 5]);
-    let s = snapshot_with(&big);
-    assert_eq!(read(&s, KEY).unwrap().unwrap().value, big);
+    // L-R186v: its create is refused, because the record the kernel would ship (key and
+    // framing added) is over the kernel's cap. A record stored at the limit still reads back,
+    // so the store is seeded with it directly.
+    assert_eq!(
+        compile(
+            &MapSnapshot::new(Generation(1)),
+            &key(),
+            Expected::Absent,
+            &delta(vec![Op::Replace(big.clone())])
+        ),
+        Err(ValueError::Apply(ApplyError::TooLarge {
+            limit: SizeLimit::Write
+        }))
+    );
+    let mut s = MapSnapshot::new(Generation(1));
+    let sealed = seal(Kind::Document, &encode(&big).unwrap()).unwrap();
+    s.insert(key().to_bytes(), 1, sealed);
+    assert_eq!(read(&s, &key()).unwrap().unwrap().value, big);
     let grow = delta(vec![Op::Replace(map(&[("b", big.clone())]))]);
     assert_eq!(
-        compile(&s, KEY, Expected::Version(1), &grow),
-        Err(ValueError::Apply(ApplyError::TooLarge))
+        compile(&s, &key(), Expected::Version(1), &grow),
+        Err(ValueError::Apply(ApplyError::TooLarge {
+            limit: SizeLimit::Value
+        }))
     );
 }
 
@@ -587,14 +625,14 @@ proptest! {
     #[test]
     fn every_accepted_write_reads_back(doc in arb_value(), ops in proptest::collection::vec(arb_op(), 1..4)) {
         let s = snapshot_with(&doc);
-        let read_doc = read(&s, KEY).unwrap().unwrap();
+        let read_doc = read(&s, &key()).unwrap().unwrap();
         prop_assert_eq!(read_doc.version, 1);
         prop_assert_eq!(&read_doc.value, &doc);
         let ops = delta(ops);
-        if let Ok(c) = compile(&s, KEY, Expected::Version(1), &ops) {
+        if let Ok(c) = compile(&s, &key(), Expected::Version(1), &ops) {
             let mut s = s.clone();
             prop_assert!(apply(&mut s, &c, 2));
-            let after = read(&s, KEY).unwrap().unwrap();
+            let after = read(&s, &key()).unwrap().unwrap();
             prop_assert_eq!(Ok(after.value.clone()), materialize(Some(doc), &ops));
             prop_assert_eq!(payload_of(&c), encode(&after.value).unwrap());
         }
@@ -611,8 +649,8 @@ proptest! {
         let two = snapshot_with(&doc);
         let ops = delta(vec![op]);
         prop_assert_eq!(
-            compile(&one, KEY, Expected::Version(1), &ops),
-            compile(&two, KEY, Expected::Version(1), &ops)
+            compile(&one, &key(), Expected::Version(1), &ops),
+            compile(&two, &key(), Expected::Version(1), &ops)
         );
     }
 }

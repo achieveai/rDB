@@ -1,16 +1,19 @@
 //! Compile document ops to one whole-document `Put`, with its precondition attached
-//! (ADR-rdb-0012 decision 11).
+//! (ADR-rdb-0012 decision 11). A document lives at its object's root key (ADR-rdb-0013 §1).
 //!
 //! read the record → [`open`] the envelope (digest check) → strict [`decode`] →
 //! [`materialize`] → [`encode`] (refuses too deep or too large) → [`seal`]. So an accepted write
 //! always reads back.
 
 use bytes::Bytes;
+use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
+use rdb_core::transaction::record_len;
 use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode, CodecError, EncodeError};
-use crate::delta::{materialize, ApplyError, Delta};
+use crate::delta::{materialize, ApplyError, Delta, SizeLimit};
 use crate::envelope::{open, seal, EnvelopeError, Kind, OversizedPayload};
+use crate::keys::{KeyError, RootKey};
 use crate::value::Value;
 
 /// What the caller expects to find at the key.
@@ -24,15 +27,20 @@ pub enum Expected {
     Version(u64),
 }
 
-/// One whole-document `Put`, and the condition that must hold when it applies. Returned
+/// The writes of one compiled delta, and the conditions that must hold when they apply. Returned
 /// together so a caller cannot drop the create-if-absent condition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compiled {
-    /// The `Put`: the key, the sealed after-image, and `expected_version`.
-    pub mutation: Mutation,
-    /// `Some(Absent { key })` for [`Expected::Absent`]; `None` for [`Expected::Version`],
-    /// whose check rides on the mutation's `expected_version`.
-    pub condition: Option<Condition>,
+    /// The writes, one per touched key, in key order. A document compile returns exactly one
+    /// `Put`: the key, the sealed after-image, and `expected_version`. A collection compile
+    /// returns its root `Put` first, then one write per element that changed
+    /// (ADR-rdb-0013 §9).
+    pub mutations: Vec<Mutation>,
+    /// `[Absent { key }]` on the root key for [`Expected::Absent`]; empty for
+    /// [`Expected::Version`], whose check rides on the root write's `expected_version`. A list,
+    /// in the kernel request's order, so a write guarded by several keys fits (lead ruling
+    /// L-R186j).
+    pub conditions: Vec<Condition>,
 }
 
 /// A stored document, read back.
@@ -63,6 +71,48 @@ pub enum Corrupt {
     /// `SnapshotRead` promises never happens.
     #[error("the snapshot holds a value without a version, or a version without a value")]
     VersionWithoutValue,
+    /// An object record's key does not decode (ADR-rdb-0013 §4).
+    #[error("key: {0}")]
+    Key(KeyError),
+    /// A collection root's payload is not exactly `{"keys": n, "count": n}`, or its count plus
+    /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right.
+    #[error("collection root: {0}")]
+    Root(&'static str),
+    /// A collection root names an element key profile this build does not know. Written by a
+    /// newer build, not damage (ADR-rdb-0012 §12).
+    #[error("unknown element key profile {0}")]
+    UnknownKeyProfile(i128),
+    /// A map entry's envelope is not a document.
+    #[error("map entry envelope is a {found:?}, not a Document")]
+    EntryNotDocument {
+        /// The entry's envelope kind.
+        found: Kind,
+    },
+    /// A set member's record holds bytes; it must be empty.
+    #[error("set member record holds {len} bytes")]
+    SetMemberHasValue {
+        /// The bytes it holds.
+        len: usize,
+    },
+    /// An element's storage version is above its root's. Every element write also writes the
+    /// root, so this never happens through `rdb-value` (ADR-rdb-0013 §10).
+    #[error("element version {element} is above its root's version {root}")]
+    ElementNewerThanRoot {
+        /// The element's version.
+        element: u64,
+        /// The root's version.
+        root: u64,
+    },
+    /// Element records exist under an object with no root, or a root whose `count` is 0
+    /// (ADR-rdb-0013 §11).
+    #[error("element records exist that the root does not account for")]
+    OrphanElement,
+    /// The root's `count` is above 0 but no element record exists (ADR-rdb-0013 §11).
+    #[error("the root counts {count} elements but none exists")]
+    CountMismatch {
+        /// The root's count.
+        count: u64,
+    },
 }
 
 /// Why a read or a compile is refused.
@@ -86,37 +136,54 @@ impl From<EncodeError> for ApplyError {
     fn from(e: EncodeError) -> Self {
         match e {
             EncodeError::TooDeep => Self::TooDeep,
-            EncodeError::TooLarge => Self::TooLarge,
+            EncodeError::TooLarge => Self::TooLarge {
+                limit: SizeLimit::Value,
+            },
         }
     }
 }
 
 impl From<OversizedPayload> for ApplyError {
     fn from(_: OversizedPayload) -> Self {
-        Self::TooLarge
+        Self::TooLarge {
+            limit: SizeLimit::Value,
+        }
     }
 }
 
-/// The document at `key` in [`Namespace::User`], or `None` when there is no record.
-///
-/// # Errors
-/// [`ValueError::Corrupt`] when the record does not open or decode.
-pub fn read(snapshot: &dyn SnapshotRead, key: &[u8]) -> Result<Option<Document>, ValueError> {
-    let stored = snapshot.get(Namespace::User, key);
-    let version = snapshot.version(Namespace::User, key);
-    match (stored, version) {
+/// The record at `key` with its version, or `None` when there is none.
+pub(crate) fn record(
+    snapshot: &dyn SnapshotRead,
+    key: &[u8],
+) -> Result<Option<(u64, Bytes)>, ValueError> {
+    match (
+        snapshot.get(Namespace::User, key),
+        snapshot.version(Namespace::User, key),
+    ) {
         (None, None) => Ok(None),
-        (Some(bytes), Some(version)) => {
-            let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
-            let value =
-                decode(opened.payload).map_err(|e| ValueError::Corrupt(Corrupt::Codec(e)))?;
-            Ok(Some(Document { version, value }))
-        }
+        (Some(bytes), Some(version)) => Ok(Some((version, bytes))),
         _ => Err(ValueError::Corrupt(Corrupt::VersionWithoutValue)),
     }
 }
 
-/// Compile `delta` against the document at `key` into one `Put` and its precondition.
+/// The document at `root` in [`Namespace::User`], or `None` when there is no record.
+///
+/// # Errors
+/// [`ApplyError::KindMismatch`] when the object is a map or a set; [`ValueError::Corrupt`] when
+/// the record does not open or decode.
+pub fn read(snapshot: &dyn SnapshotRead, root: &RootKey) -> Result<Option<Document>, ValueError> {
+    let Some((version, bytes)) = record(snapshot, root.as_bytes())? else {
+        return Ok(None);
+    };
+    let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+    if opened.kind != Kind::Document {
+        return Err(ApplyError::KindMismatch { found: opened.kind }.into());
+    }
+    let value = decode(opened.payload).map_err(|e| ValueError::Corrupt(Corrupt::Codec(e)))?;
+    Ok(Some(Document { version, value }))
+}
+
+/// Compile `delta` against the document at `root` into one `Put` and its precondition.
 ///
 /// [`Expected::Version`] is checked here first, before any work, and again by the kernel at
 /// apply. [`Expected::Absent`] does not read the record at all: the delta applies to an absent
@@ -124,46 +191,65 @@ pub fn read(snapshot: &dyn SnapshotRead, key: &[u8]) -> Result<Option<Document>,
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`] for [`Expected::Version`] on a missing record;
-/// [`ApplyError::VersionConflict`]; any [`ApplyError`] from the ops or the encoder; or
-/// [`ValueError::Corrupt`] when the stored record does not read back.
+/// [`ApplyError::VersionConflict`]; [`ApplyError::KindMismatch`] when the object is a map or a
+/// set; any [`ApplyError`] from the ops or the encoder; or [`ValueError::Corrupt`] when the
+/// stored record does not read back.
 pub fn compile(
     snapshot: &dyn SnapshotRead,
-    key: &[u8],
+    root: &RootKey,
     expected: Expected,
     delta: &Delta,
 ) -> Result<Compiled, ValueError> {
     let base = match expected {
         Expected::Absent => None,
         Expected::Version(want) => {
-            match snapshot.version(Namespace::User, key) {
-                None => return Err(ApplyError::ObjectAbsent.into()),
-                Some(found) if found != want => {
-                    return Err(ApplyError::VersionConflict {
-                        expected: want,
-                        found,
-                    }
-                    .into())
-                }
-                Some(_) => {}
-            }
-            let document = read(snapshot, key)?.ok_or(ApplyError::ObjectAbsent)?;
+            check_version(snapshot, root, want)?;
+            let document = read(snapshot, root)?.ok_or(ApplyError::ObjectAbsent)?;
             Some(document.value)
         }
     };
     let after = materialize(base, delta)?;
     let payload = encode(&after).map_err(ApplyError::from)?;
     let value = seal(Kind::Document, &payload).map_err(ApplyError::from)?;
-    let key = Bytes::copy_from_slice(key);
-    let (expected_version, condition) = match expected {
-        Expected::Absent => (None, Some(Condition::Absent { key: key.clone() })),
-        Expected::Version(v) => (Some(v), None),
+    let key = root.to_bytes();
+    let (expected_version, conditions) = match expected {
+        Expected::Absent => (None, vec![Condition::Absent { key: key.clone() }]),
+        Expected::Version(v) => (Some(v), Vec::new()),
     };
+    let mutations = vec![Mutation::Put {
+        key,
+        value,
+        expected_version,
+    }];
+    // The kernel's own measure of the record it would ship, so compile refuses exactly what
+    // admission check 10 refuses (L-R186v).
+    if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
+        return Err(ApplyError::TooLarge {
+            limit: SizeLimit::Write,
+        }
+        .into());
+    }
     Ok(Compiled {
-        mutation: Mutation::Put {
-            key,
-            value,
-            expected_version,
-        },
-        condition,
+        mutations,
+        conditions,
     })
+}
+
+/// The root's version must be `want`.
+///
+/// # Errors
+/// [`ApplyError::ObjectAbsent`] or [`ApplyError::VersionConflict`].
+pub(crate) fn check_version(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+    want: u64,
+) -> Result<(), ApplyError> {
+    match snapshot.version(Namespace::User, root.as_bytes()) {
+        None => Err(ApplyError::ObjectAbsent),
+        Some(found) if found != want => Err(ApplyError::VersionConflict {
+            expected: want,
+            found,
+        }),
+        Some(_) => Ok(()),
+    }
 }

@@ -5,10 +5,13 @@
 //! | 0 | 1 | `envelope_format` | `0x01` |
 //! | 1 | 1 | `kind` | [`Kind`] |
 //! | 2 | 1 | `codec_version` | `0x01` = `rdb-cbor-document` v1 |
-//! | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of the payload |
+//! | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of bytes 0..8, then the payload |
 //! | 4 | 4 | `payload_len` | u32 big-endian; equals the remaining bytes |
 //! | 8 | 32 | `digest` | |
 //! | 40 | n | payload | |
+//!
+//! The digest covers the 8 header bytes before it, then the payload (ADR-rdb-0012 §9 as amended
+//! by ruling L-R186s), so a flipped `kind` or `codec_version` is damage, not another type.
 //!
 //! Fail closed: every unknown byte, a length mismatch or a digest mismatch is a named
 //! [`EnvelopeError`]. Nothing is guessed. The record's key and version are not in here: they are
@@ -32,15 +35,19 @@ const _: () = assert!(MAX_ENVELOPE == 1_048_576 && MAX_PAYLOAD == 1_048_536);
 pub const ENVELOPE_FORMAT_V1: u8 = 0x01;
 /// `codec_version` v1: `rdb-cbor-document` v1.
 pub const CODEC_DOCUMENT_V1: u8 = 0x01;
-/// `digest_alg` `0x01`: SHA-256 over the payload.
+/// `digest_alg` `0x01`: SHA-256 over header bytes 0..8, then the payload.
 pub const DIGEST_SHA256: u8 = 0x01;
 
-/// The envelope's `kind` table. Its own table, not ADR-rdb-0011 O4's object sub-key
-/// discriminator (ADR-rdb-0012 decision 13). `0x00` is invalid; other values are reserved.
+/// The envelope's `kind` table. Its own table, not the object sub-key discriminator
+/// ([`crate::keys::Sub`]; ADR-rdb-0013 decision 3). `0x00` is invalid; other values are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A document, encoded with the `rdb-cbor-document` codec.
     Document,
+    /// The root record of a map (ADR-rdb-0013 decision 7).
+    Map,
+    /// The root record of a set (ADR-rdb-0013 decision 7).
+    Set,
 }
 
 impl Kind {
@@ -49,6 +56,8 @@ impl Kind {
     pub const fn byte(self) -> u8 {
         match self {
             Self::Document => 0x01,
+            Self::Map => 0x02,
+            Self::Set => 0x03,
         }
     }
 
@@ -57,6 +66,8 @@ impl Kind {
     pub const fn from_byte(byte: u8) -> Option<Self> {
         match byte {
             0x01 => Some(Self::Document),
+            0x02 => Some(Self::Map),
+            0x03 => Some(Self::Set),
             _ => None,
         }
     }
@@ -69,7 +80,11 @@ impl Kind {
 ///   value, [`Self::UnknownCodec`] and [`Self::UnknownDigest`]. The record may be valid; this build
 ///   cannot read it. Mixed-version windows are supported, so an older node can meet one. It must
 ///   never be offered for deletion as damage;
-/// - **damage**: everything else, and [`Self::UnknownKind`]`(0)`, which no build writes.
+/// - **damage**: everything else.
+///
+/// [`Self::UnknownKind`]`(0)` sits between the two: no build writes `kind` `0x00`, but with a
+/// correct digest it reads as `UnknownKind` and is refused. Telling it apart from a newer
+/// build's record is M9 debt.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeError {
     /// Shorter than the header.
@@ -87,7 +102,9 @@ pub enum EnvelopeError {
     /// `envelope_format` is not one this build reads: written by a newer build.
     #[error("unknown envelope format {0:#04x}")]
     UnknownFormat(u8),
-    /// `kind` is `0x00` (damage: never written) or reserved (written by a newer build).
+    /// `kind` is reserved (written by a newer build) or `0x00`. No build writes `0x00`, but with
+    /// a correct digest it reads as this error and is refused; the newer-build vs damage split
+    /// for it is M9 debt.
     #[error("unknown envelope kind {0:#04x}")]
     UnknownKind(u8),
     /// `codec_version` is not one this build reads: written by a newer build.
@@ -104,8 +121,9 @@ pub enum EnvelopeError {
         /// The bytes after the header.
         actual: usize,
     },
-    /// The payload does not hash to the stored digest.
-    #[error("payload does not hash to the stored digest")]
+    /// Header bytes 0..8 and the payload do not hash to the stored digest: a header byte the
+    /// digest covers, the payload or the digest itself is damaged.
+    #[error("header bytes 0..8 and the payload do not hash to the stored digest")]
     DigestMismatch,
 }
 
@@ -122,16 +140,22 @@ pub struct OversizedPayload {
 pub struct Opened<'a> {
     /// What the payload is.
     pub kind: Kind,
-    /// SHA-256 of the payload, already checked.
+    /// The stored digest (header bytes 0..8, then the payload), already checked.
     pub digest: [u8; 32],
     /// The canonical payload. Not decoded yet.
     pub payload: &'a [u8],
 }
 
-/// SHA-256 of `payload`.
+/// The bytes the digest covers before the payload: header bytes 0..8.
+const DIGESTED_HEAD: usize = 8;
+
+/// SHA-256 over `head` (header bytes 0..8), then `payload`.
 #[must_use]
-pub fn digest(payload: &[u8]) -> [u8; 32] {
-    Sha256::digest(payload).into()
+pub fn digest(head: &[u8; DIGESTED_HEAD], payload: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(head);
+    hasher.update(payload);
+    hasher.finalize().into()
 }
 
 /// The envelope for `payload`: header, then the payload as given.
@@ -143,20 +167,37 @@ pub fn seal(kind: Kind, payload: &[u8]) -> Result<Bytes, OversizedPayload> {
         .ok()
         .filter(|_| payload.len() <= MAX_PAYLOAD)
         .ok_or(OversizedPayload { len: payload.len() })?;
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&[
+    let len = len.to_be_bytes();
+    let head = [
         ENVELOPE_FORMAT_V1,
         kind.byte(),
         CODEC_DOCUMENT_V1,
         DIGEST_SHA256,
-    ]);
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(&digest(payload));
+        len[0],
+        len[1],
+        len[2],
+        len[3],
+    ];
+    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+    out.extend_from_slice(&head);
+    out.extend_from_slice(&digest(&head, payload));
     out.extend_from_slice(payload);
     Ok(Bytes::from(out))
 }
 
-/// Check every header field and the digest, in header order.
+/// Check the size, every header field and the digest. The order is ruling L-R186s with critic
+/// K1, after the size checks:
+///
+/// 1. the size: [`EnvelopeError::Truncated`] below [`HEADER_LEN`], then
+///    [`EnvelopeError::TooLarge`] above [`MAX_ENVELOPE`]. Both are damage and come before any
+///    header byte is read, so a record of either size reads as damage whoever wrote it;
+/// 2. `envelope_format`, then `digest_alg`: they say how the digest is checked, so an unknown
+///    one is a newer build's record and is refused before any hashing;
+/// 3. `payload_len`;
+/// 4. the digest: a mismatch is damage;
+/// 5. `kind`, then `codec_version`. A newer build's record of a valid size hashes correctly, so
+///    an unknown value here is that build's, not damage (ADR-rdb-0012 §12). `kind` `0x00` with a
+///    correct digest also reads as `UnknownKind`. A flipped byte has already failed step 4.
 ///
 /// # Errors
 /// The first [`EnvelopeError`] found.
@@ -171,10 +212,6 @@ pub fn open(bytes: &[u8]) -> Result<Opened<'_>, EnvelopeError> {
     if header[0] != ENVELOPE_FORMAT_V1 {
         return Err(EnvelopeError::UnknownFormat(header[0]));
     }
-    let kind = Kind::from_byte(header[1]).ok_or(EnvelopeError::UnknownKind(header[1]))?;
-    if header[2] != CODEC_DOCUMENT_V1 {
-        return Err(EnvelopeError::UnknownCodec(header[2]));
-    }
     if header[3] != DIGEST_SHA256 {
         return Err(EnvelopeError::UnknownDigest(header[3]));
     }
@@ -185,10 +222,15 @@ pub fn open(bytes: &[u8]) -> Result<Opened<'_>, EnvelopeError> {
             actual: payload.len(),
         });
     }
-    let mut stored = [0_u8; 32];
-    stored.copy_from_slice(&header[8..HEADER_LEN]);
-    if digest(payload) != stored {
+    let (head, rest) = header.split_at(DIGESTED_HEAD);
+    let head: &[u8; DIGESTED_HEAD] = head.try_into().expect("split at DIGESTED_HEAD");
+    let stored: [u8; 32] = rest.try_into().expect("HEADER_LEN is DIGESTED_HEAD + 32");
+    if digest(head, payload) != stored {
         return Err(EnvelopeError::DigestMismatch);
+    }
+    let kind = Kind::from_byte(header[1]).ok_or(EnvelopeError::UnknownKind(header[1]))?;
+    if header[2] != CODEC_DOCUMENT_V1 {
+        return Err(EnvelopeError::UnknownCodec(header[2]));
     }
     Ok(Opened {
         kind,
