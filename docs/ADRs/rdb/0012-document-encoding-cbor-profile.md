@@ -252,7 +252,9 @@ upgrade note.
 ### 12. Errors (named; one enum per layer)
 - **Path:** `PathSyntax{pos}`, `PathTooLong`, `RootNotAllowed` (Set/Remove/Increment on `""`).
 - **Apply:** `ObjectAbsent`, `PathNotFound{segment}`, `NotAContainer{at}`, `IndexInvalid{segment, len}`,
-  `TypeMismatch`, `Overflow`, `VersionConflict{expected, found}`, plus `TooDeep` and `TooLarge` from `encode`.
+  `TypeMismatch`, `Overflow`, `VersionConflict{expected, found}`, plus `TooDeep` and
+  `TooLarge{limit: SizeLimit}`: `Value` from `encode`, `Write` for the whole replicated record (amended
+  2026-10-04; ADR-rdb-0013 decisions 9 and 13).
   - `at` is a `Location`: `Root` (the document itself is a scalar) or `Segment(key)`. A path cannot
     name the root, so a segment alone could not say which value was not a container.
   - `len` is the array's length, so the message gives the valid range `0 .. len`.

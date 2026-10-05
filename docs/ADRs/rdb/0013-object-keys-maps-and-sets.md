@@ -396,6 +396,11 @@ How it is proved:
   ADR-rdb-0012 §8 ("binds every later kind") force this reading. A `+1` counter would have to live in
   the stored bytes.
 - "One logical mutation" is one compiled collection delta (decision 9), however many ops it holds.
+- **A compile whose ops are all no-ops still rewrites the root**, so the collection version moves to
+  that transaction's `seq` even though no element changed. This is deliberate (L-R186al): every
+  compiled request needs at least one mutation (spec §4.2, check 10 refuses an empty one), and the root
+  write is the one a collection compile always has. For M9: a client that wants "no write if nothing
+  changed" must check before it submits.
 - Element records keep their own storage versions. These are not public concurrency tokens
   (spec §4.3.2). Every element write also rewrites the root, so an element's version is never above
   its root's. Decision 10 checks that.
@@ -416,6 +421,7 @@ How it is proved:
 | `Add(m)` | set | insert the member; no-op if it is present |
 | `Remove(k)` | both | remove it; no-op if it is absent |
 | `Need(k, present \| absent)` | both | refuse the whole delta unless `k` is present (`ElementAbsent`) or absent (`ElementExists`) at that point in the delta |
+| only no-ops (`Add` of present members, `Remove` of absent keys, `Need` that holds, or no ops at all) | both | the root `Put` alone, at the same `count`; the version still moves (decision 8) |
 
 - Not in v1: a whole-collection replace, value-digest preconditions, and range removal (Open O4, O6).
 - The compile function is `compile_collection(snapshot, &RootKey, kind, Expected, ops) -> Compiled`.
