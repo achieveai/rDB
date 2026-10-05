@@ -50,7 +50,7 @@ Named staff are not assigned. Gautam assigns these roles at implementation autho
 |---|---|---|---|---|
 | `ExecuteTxn` | App → router → primary; request/result in spec §5 | Await result | API | `api_version=1`; unknown mandatory fields reject |
 | `ValueSession` | Primary-local actor/document code → published-prefix reads and expected-version mutations | Ends at commit, abort, deadline, generation or authority change | API/value | Documents use `rdb-cbor-document/v1`; no remote callback execution |
-| `UploadBlob` / manifest publish | Client/actor → primary; object-scoped immutable chunks then atomic manifest mutation | Upload async; publication transactional | API/value/storage | 1 MiB chunks, 256 MiB logical maximum, BLAKE3 integrity, no cross-object dedup |
+| `UploadBlob` / manifest publish | Client/actor → primary; object-scoped immutable chunks then atomic manifest mutation | Upload async; publication transactional | API/value/storage | chunks of at most 1,044,480 bytes, at most 255 per blob, 254 MiB logical maximum, SHA-256 integrity (L-R186x; [ADR-rdb-0014](../ADRs/rdb/0014-large-blobs-chunks-manifest-gc.md) decisions 3, 4), no cross-object dedup |
 | Collection operations | Value session → namespaced map/set/list object | Transactional | API/value/storage | Direct ordered map/set records; order-statistic B+ tree lists; collection version is public conflict token |
 | `Read` / `RequestStatus` | App → primary; affinity, route/generation, key or request identity | Await result | API | Replies always expose generation and provenance |
 | `Append` / `Progress` | Primary ↔ regular/shadow replica; envelope in spec §6 | Async stream, awaited regular ACK | Replication | Negotiated protocol major; additive minor fields only |
