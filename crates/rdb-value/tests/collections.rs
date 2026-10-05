@@ -157,12 +157,12 @@ fn kernel_record_len(conditions: usize, mutations: &[Mutation]) -> usize {
     .len()
 }
 
-/// L-R186r (architect-m8-s5): compile measured `TooLarge` as key plus value bytes, while the
+/// L-R186v (architect-m8-s5): compile measured `TooLarge` as key plus value bytes, while the
 /// kernel's admission check 10 measures the whole record against `MAX_ENVELOPE_BYTES`. A map
 /// create of one large entry is walked across the kernel's cap: every compile that succeeds
 /// must fit the record, and one byte past the cap must be `TooLarge`.
 #[test]
-fn l_r186r_a_compile_that_succeeds_fits_the_kernels_record_cap() {
+fn l_r186v_a_compile_that_succeeds_fits_the_kernels_record_cap() {
     let root = cart();
     let s = MapSnapshot::new(Generation(1));
     let create = |n: usize| {
@@ -197,12 +197,12 @@ fn l_r186r_a_compile_that_succeeds_fits_the_kernels_record_cap() {
     );
 }
 
-/// L-R186r, the document half. It sits here beside [`kernel_record_len`] rather than in
+/// L-R186v, the document half. It sits here beside [`kernel_record_len`] rather than in
 /// `ops_compile.rs` so the oracle is written once. A document whose own envelope is within
 /// 1 MiB can still make a record over the kernel's cap, once the key and the record's framing
 /// are added.
 #[test]
-fn l_r186r_a_document_compile_that_succeeds_fits_the_kernels_record_cap() {
+fn l_r186v_a_document_compile_that_succeeds_fits_the_kernels_record_cap() {
     let root = cart();
     let s = MapSnapshot::new(Generation(1));
     let create = |n: usize| {
@@ -338,7 +338,7 @@ fn pc4_kind_mismatch_on_an_absent_object_does_not_claim_it_exists() {
 
 /// Tester W2 PC5: a collection write over the record cap said "over the 1 MiB envelope
 /// (1,048,536-byte payload) limit", but no envelope was over it: the whole write was. Since
-/// L-R186r there are two caps, and the detail names the one that was hit.
+/// L-R186v there are two caps, and the detail names the one that was hit.
 #[test]
 fn pc5_too_large_names_the_cap_it_hit() {
     let s = MapSnapshot::new(Generation(1));
@@ -1720,7 +1720,7 @@ fn r11_orphans_on_create_and_drop_and_count_drift_on_drop() {
 
 /// R12 (protects C14, C15): 254 elements and the root are 255 writes, the kernel's limit, and
 /// compile; one more is refused with the number it would have written. The byte cap's exact
-/// boundary is the `l_r186r_*` rows above.
+/// boundary is the `l_r186v_*` rows above.
 #[test]
 fn r12_too_many_writes_at_256_and_accepted_at_255() {
     assert_eq!(MAX_REQUEST_MUTATIONS, 255);

@@ -1242,7 +1242,7 @@ fn encoded_len(req: &TxnRequest) -> usize {
 
 /// [`encoded_len`] for a request's conditions count and mutations, the only parts of a request
 /// its record length depends on. Public so a compiler can refuse what check 10 would refuse
-/// against [`MAX_ENVELOPE_BYTES`] without copying this layout (ruling L-R186r).
+/// against [`MAX_ENVELOPE_BYTES`] without copying this layout (ruling L-R186v).
 #[must_use]
 pub fn record_len(conditions: usize, mutations: &[Mutation]) -> usize {
     // Header; then lease id, prev digest, identity, request digest, the conditions and mutations
