@@ -1836,6 +1836,139 @@ fn damage_is_named_reads_fail_wholly_and_gc_refuses() {
     );
 }
 
+/// The five fields of a well-formed manifest: 12 bytes cut at 4, so 3 chunk digests.
+fn manifest_fields() -> Map {
+    let mut m = Map::new();
+    m.insert(MapKey::new("size"), Value::Integer(Int::from(12_u64)));
+    m.insert(MapKey::new("sha256"), Value::Bytes(vec![0; 32]));
+    m.insert(MapKey::new("upload"), Value::Bytes(U1.to_vec()));
+    m.insert(MapKey::new("chunk_size"), Value::Integer(Int::from(4_u64)));
+    m.insert(
+        MapKey::new("chunk_sha256"),
+        Value::Array(vec![Value::Bytes(vec![0; 32]); 3]),
+    );
+    m
+}
+
+/// `manifest_fields` with `name` set to `value`.
+fn manifest_with(name: &str, value: Value) -> Value {
+    let mut m = manifest_fields();
+    m.insert(MapKey::new(name), value);
+    Value::Map(m)
+}
+
+/// The strict manifest reading (ADR-rdb-0014 §2). Protects a reader of a damaged root: a blob
+/// root whose payload is canonical CBOR but not a v1 manifest, wrong in exactly one field, reads
+/// as `Corrupt::Manifest` naming that fault, and no bytes are served. One row per `Shape` arm of
+/// the decoder; the unedited fields read back as a blob.
+#[test]
+fn every_manifest_shape_fault_is_named() {
+    let root = photo();
+    let read = |payload: &Value| {
+        let record = seal(Kind::Blob, &encode(payload).unwrap()).unwrap();
+        read_blob(&stored(&[(ROOT_PHOTO, record, 1)]), &root)
+    };
+    // The control: the unedited fields are a manifest.
+    let blob = read(&Value::Map(manifest_fields())).unwrap().unwrap();
+    assert_eq!((blob.manifest.size, blob.manifest.chunks()), (12, 3));
+
+    let renamed = {
+        let mut m = manifest_fields();
+        let size = m.remove(&MapKey::new("size")).unwrap();
+        m.insert(MapKey::new("sizes"), size);
+        Value::Map(m)
+    };
+    let four = {
+        let mut m = manifest_fields();
+        m.remove(&MapKey::new("upload"));
+        Value::Map(m)
+    };
+    let digests = |items: Vec<Value>| manifest_with("chunk_sha256", Value::Array(items));
+    let d32 = || Value::Bytes(vec![0; 32]);
+    let rows: [(&str, Value, &str); 15] = [
+        (
+            "not a map (01)",
+            Value::Integer(Int::from(1_u64)),
+            "the payload is not a map",
+        ),
+        ("4 fields", four, "not exactly the five manifest fields"),
+        (
+            "6 fields",
+            manifest_with("extra", Value::Null),
+            "not exactly the five manifest fields",
+        ),
+        ("size renamed", renamed, "a field is missing"),
+        (
+            "size: -1",
+            manifest_with("size", Value::Integer(Int::from(-1_i64))),
+            "a length is negative",
+        ),
+        (
+            "size: \"x\"",
+            manifest_with("size", Value::Text("x".into())),
+            "a length is not an integer",
+        ),
+        (
+            "sha256 31 B",
+            manifest_with("sha256", Value::Bytes(vec![0; 31])),
+            "a digest is not 32 bytes",
+        ),
+        (
+            "sha256 as text",
+            manifest_with("sha256", Value::Text("0".repeat(32))),
+            "a digest is not a byte string",
+        ),
+        (
+            "upload 15 B",
+            manifest_with("upload", Value::Bytes(vec![0x11; 15])),
+            "upload is not 16 bytes",
+        ),
+        (
+            "upload as an integer",
+            manifest_with("upload", Value::Integer(Int::from(7_u64))),
+            "upload is not a byte string",
+        ),
+        (
+            "chunk_sha256 as a map",
+            manifest_with("chunk_sha256", Value::Map(Map::new())),
+            "chunk_sha256 is not an array",
+        ),
+        (
+            "one chunk digest 31 B",
+            digests(vec![d32(), Value::Bytes(vec![0; 31]), d32()]),
+            "a digest is not 32 bytes",
+        ),
+        (
+            "chunk_size: 0",
+            manifest_with("chunk_size", Value::Integer(Int::from(0_u64))),
+            "chunk_size is outside 1 … MAX_CHUNK",
+        ),
+        (
+            "size = 256 × chunk_size",
+            manifest_with("size", Value::Integer(Int::from(256 * 4_u64))),
+            "more chunks than MAX_CHUNKS",
+        ),
+        (
+            "one digest short of n",
+            digests(vec![d32(), d32()]),
+            "chunk_sha256 does not hold one digest per chunk",
+        ),
+    ];
+    for (what, payload, message) in rows {
+        let got = read(&payload);
+        assert_eq!(
+            got,
+            corrupt(Corrupt::Manifest(ManifestError::Shape(message))),
+            "{what}"
+        );
+        assert_eq!(
+            got.unwrap_err().to_string(),
+            format!("corrupt record: blob manifest: {message}"),
+            "{what}"
+        );
+    }
+}
+
 // ---- R10: limits -----------------------------------------------------------------------------
 
 /// R10, limits. Protects C15 and C16: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
