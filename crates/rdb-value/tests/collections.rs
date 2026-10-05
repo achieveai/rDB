@@ -256,6 +256,28 @@ fn l_r186s_a_flipped_root_kind_is_damage_on_every_read_path() {
             damage,
             "collection, {to:#04x}"
         );
+        assert_eq!(
+            member(&s, &root, &text("banana")).map(|_| ()),
+            damage,
+            "member, {to:#04x}"
+        );
+        assert_eq!(
+            members(&s, &root, None, 10).map(|_| ()),
+            damage,
+            "members, {to:#04x}"
+        );
+        assert_eq!(
+            drop_collection(&s, &root, 4).map(|_| ()),
+            damage,
+            "drop, {to:#04x}"
+        );
+        let put = [ElemOp::Put(text("banana"), int(1))];
+        assert_eq!(
+            compile_collection(&s, &root, CollectionKind::Map, Expected::Version(4), &put)
+                .map(|_| ()),
+            damage,
+            "compile, {to:#04x}"
+        );
     }
 }
 
