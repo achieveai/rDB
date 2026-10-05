@@ -15,7 +15,8 @@ left to a missing evidence file, and picks the library (ADR-rdb-0011 O1). Approv
 codec/version, object version, logical/encoded length, digest algorithm, digest and canonical bytes."
 Also §4.3.2's link to `evidence/document-encoding-decision.md`, and §4.3.1's inline value limit. See decisions 1 and 8. Closes ADR-rdb-0011
 O1 and O2. Changes nothing in `rdb-core`.
-**Amended by:** ADR-rdb-0013, 2026-10-04: §7 (`digest_alg` row), §8, §9, §12, §13 and Consequences.
+**Amended by:** ADR-rdb-0013, 2026-10-04: §7 (`digest_alg` and `kind` rows, the freeze), §8, §9, §11, §12,
+§13, Scenarios and Consequences.
 Each edit is marked in place with its ruling.
 **Basis:** `main` 960db34.
 
@@ -148,7 +149,7 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
 | Offset | Size | Field | v1 value |
 |---|---|---|---|
 | 0 | 1 | `envelope_format` | `0x01` |
-| 1 | 1 | `kind` | `0x01` document. `0x00` invalid. Other values reserved for later kinds; the table lives in `envelope.rs` |
+| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt. Other values reserved for later kinds; the table lives in `envelope.rs` |
 | 2 | 1 | `codec_version` | `0x01` = `rdb-cbor-document` v1 |
 | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of header bytes 0..8, then the payload (amended 2026-10-04, L-R186s; ADR-rdb-0013 decision 7) |
 | 4 | 4 | `payload_len` | u32 BE; must equal the remaining bytes. For a document this **is** the logical length |
@@ -159,8 +160,9 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
   discriminator. That one belongs to ADR-rdb-0013 (decision 3).
 - **Fail closed, two different reasons.** Both are refused with a named error and never guessed
   (V12: unknown mandatory versions refused). They are not the same thing (§12):
-  - **Written by a newer build:** an unknown `envelope_format`, a reserved `kind`, or an unknown `codec_version` or
-    `digest_alg` (`UnknownFormat`, `UnknownKind`, `UnknownCodec`, `UnknownDigest`). The record may be
+  - **Written by a newer build:** in a record of a size `open` accepts (§9), an unknown `envelope_format`, a
+    reserved `kind`, or an unknown `codec_version` or `digest_alg` (`UnknownFormat`, `UnknownKind`,
+    `UnknownCodec`, `UnknownDigest`). The record may be
     perfectly valid. Mixed-version windows are supported (rolling upgrade; L-R185w), so during one an
     older node can meet such a record.
   - **Damage:** a truncated header, a length mismatch or a digest mismatch (`Truncated`, `TooLarge`,
@@ -173,6 +175,9 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
   produces for any value, even a fix, would make stored records unreadable. Such a change needs a
   new `codec_version`, with the v1 decoder kept for old records. The vectors in `tests/codec.rs` pin
   the v1 bytes.
+- **S2-format data is not readable and is not migrated** (amended 2026-10-04; ADR-rdb-0013 decisions 1
+  and 7): S3 changed `digest_alg` `0x01` and the document key layout in place, which was allowed only
+  because no v1 data existed. This freeze, and the version-bump rule above, apply from S3 on.
 
 ### 8. Id and version come from the storage record, for every kind
 - This amends the two spec sentences named in the header. Of their fields, the header keeps `kind`,
@@ -196,9 +201,11 @@ Amended 2026-10-04 (Gautam Q5, L-R186s; ADR-rdb-0013 decision 7): the heading, a
   layout is §7's table.
 - It is compared only with other envelope digests, so domain separation buys nothing here.
 - It covers header bytes 0..8 (`envelope_format` through `payload_len`), then the payload.
-- `open` checks, in order: `envelope_format`; `digest_alg`; the length; the digest; then `kind` and
-  `codec_version` (ADR-rdb-0013 decision 7; critic K1, L-R186s).
-- An unknown format, algorithm, kind or codec still means written by a newer build (§12).
+- `open` checks, in order: the size (`Truncated`, `TooLarge`); `envelope_format`; `digest_alg`;
+  `payload_len`; the digest; then `kind` and `codec_version` (ADR-rdb-0013 decision 7; critic K1,
+  L-R186s).
+- In a record of a size `open` accepts, an unknown format, algorithm, kind or codec still means written
+  by a newer build (§12). A record under 40 bytes or over `MAX_ENVELOPE` reads as damage whoever wrote it.
 
 ### 10. Path operations
 - **Syntax: JSON Pointer, RFC 6901.** `""` is the whole document. `/a/b/0` has segments `a`, `b`, `0`.
@@ -220,9 +227,13 @@ Amended 2026-10-04 (Gautam Q5, L-R186s; ADR-rdb-0013 decision 7): the heading, a
   and L5 holds because v1 folds nothing. Deltas are never stored in M8, so a delta has no byte format yet.
 
 ### 11. Compile to one whole-document `Put`, with its precondition attached
-- Sketch, not spelled:
-  `compile(&dyn SnapshotRead, key, Expected, &Delta) -> Result<Compiled, ValueError>`, where
-  `Expected = Absent | Version(u64)` and `Compiled { mutation: Mutation, condition: Option<Condition> }`.
+Amended 2026-10-04 (ADR-rdb-0013 decisions 1 and 9): the sketch, the `Expected::Absent` bullet and the
+upgrade note.
+- Sketch:
+  `compile(&dyn SnapshotRead, &RootKey, Expected, &Delta) -> Result<Compiled, ValueError>`, where
+  `Expected = Absent | Version(u64)` and
+  `Compiled { mutations: Vec<Mutation>, conditions: Vec<Condition> }`. A document compile returns one
+  mutation.
 - Steps: read the record → `open` the envelope (digest check) → strict decode → `materialize` →
   `encode` (refuses `TooDeep` and `TooLarge`) → `seal`.
   - So an accepted write always reads back. A deep `Set` is refused with nothing written; it never
@@ -230,12 +241,13 @@ Amended 2026-10-04 (Gautam Q5, L-R186s; ADR-rdb-0013 decision 7): the heading, a
 - `Expected::Version(v)` must equal the snapshot's version, else `VersionConflict` before any work. It is
   carried as `expected_version: Some(v)`, so the kernel checks it again at apply.
 - `Expected::Absent` needs no record. It returns `expected_version: None` **and**
-  `condition: Some(Condition::Absent { key })`. The kernel evaluates that condition at apply.
+  `conditions: [Condition::Absent { key }]` on the root key. The kernel evaluates that condition at apply.
   - So of two racing creates, the second fails its condition. It never silently overwrites the first.
   - The precondition is part of `compile`'s output, so a caller cannot lose it.
 - Ops on an absent document: `ObjectAbsent`. Deleting a document is a storage `Delete`; it does not
   pass through `rdb-value`.
-- One-line upgrade note: `Compiled` grows to several mutations when S3 writes several records.
+- Upgrade note, done in S3: `Compiled` holds several mutations, because a collection compile writes
+  several records (ADR-rdb-0013 decision 9).
 
 ### 12. Errors (named; one enum per layer)
 - **Path:** `PathSyntax{pos}`, `PathTooLong`, `RootNotAllowed` (Set/Remove/Increment on `""`).
@@ -297,7 +309,7 @@ Amended 2026-10-04 (Gautam Q5, L-R186s; ADR-rdb-0013 decision 7): the heading, a
 
 | Who does what | What they observe |
 |---|---|
-| A caller creates `{"name":"ada","visits":0}` with `Expected::Absent` | payload `a2646e616d65636164616676697369747300` (18 bytes), SHA-256 `83b192c6…6b26`; `condition = Absent` |
+| A caller creates `{"name":"ada","visits":0}` with `Expected::Absent` | payload `a2646e616d65636164616676697369747300` (18 bytes), digest `01844f7e…7bbb76` (§9: header bytes 0..8, then the payload); `conditions = [Absent]` |
 | They increment `/visits` by 1 at the current version | one whole-document `Put` with `expected_version` set; `visits` is 1 |
 | They repeat the same op at the old version | `VersionConflict`; nothing written |
 | Two callers create `user:1` from the same "absent" snapshot | the first applies; the second fails its `Absent` condition |
@@ -307,7 +319,8 @@ Amended 2026-10-04 (Gautam Q5, L-R186s; ADR-rdb-0013 decision 7): the heading, a
 | A client sends a duplicate key, NaN with a payload, a trailing byte, 65 nested arrays, an f32 float, a long head or 1 MiB + 1 bytes | `DuplicateKey`, `NonFiniteFloat`, `TrailingBytes`, `TooDeep`, `NonCanonical`, `NonCanonical`, `TooLarge` |
 | One byte of a stored record is flipped | `Corrupt(DigestMismatch)` on read and on compile; the store is unchanged |
 
-Digests above were computed with Node's `crypto` while drafting; `ops_compile.rs` confirms them byte for byte.
+Amended 2026-10-04 (ADR-rdb-0013 decision 7): the digest above replaces the payload-only `83b192c6…6b26`, superseded.
+`ops_compile.rs`, test `the_counter_scenario_produces_the_designed_bytes`, pins the payload and the digest byte for byte.
 Through the kernel the version is the writing `seq`, so it rises but can skip numbers.
 
 ## Consequences

@@ -62,11 +62,20 @@ item "For S3" (`version = seq` against "increments exactly once").
   - **§9 bullet 3:** "It covers the payload only. Header fields are checked by structure: fixed values
     and an exact length." →
     - "It covers header bytes 0..8 (`envelope_format` through `payload_len`), then the payload.
-    - `open` checks, in order: `envelope_format`; `digest_alg`; the length; the digest; then `kind`
-      and `codec_version` (ADR-rdb-0013 decision 7).
-    - An unknown format, algorithm, kind or codec still means written by a newer build (§12)."
+    - `open` checks, in order: the size (`Truncated`, `TooLarge`); `envelope_format`; `digest_alg`;
+      `payload_len`; the digest; then `kind` and `codec_version` (ADR-rdb-0013 decision 7).
+    - In a record of a size `open` accepts, an unknown format, algorithm, kind or codec still means
+      written by a newer build (§12)."
   - **§7 table, the `digest_alg` row:** "`0x01` = SHA-256 of the payload" → "`0x01` = SHA-256 of header
     bytes 0..8, then the payload".
+- **ADR-rdb-0012 §7, the `kind` row:** "`0x01` document. `0x00` invalid. Other values reserved for later
+  kinds" → `0x01` document, `0x02` map root, `0x03` set root (decision 7), with how `0x00` reads.
+  The same section records that S2-format data is not migrated, and that the freeze starts at S3.
+- **ADR-rdb-0012 §11, the sketch:** "`compile(&dyn SnapshotRead, key, Expected, &Delta)` … `Compiled {
+  mutation: Mutation, condition: Option<Condition> }`" → `compile(&dyn SnapshotRead, &RootKey, Expected,
+  &Delta)` and `Compiled { mutations: Vec<Mutation>, conditions: Vec<Condition> }` (decisions 1 and 9).
+- **ADR-rdb-0012 Scenarios, the create row:** the payload-only digest `83b192c6…6b26`, superseded, →
+  `01844f7e…7bbb76`, over header bytes 0..8 and the payload (decision 7).
 
 **Does not amend:** ADR-rdb-0004 §2 (scope prefix), ADR-rdb-0010 decision 1 (physical prefix). No
 `rdb-core` contract change.
@@ -302,15 +311,17 @@ How it is proved:
 - ADR-rdb-0010's fall-through read (decision 2) and its merged scans (Consequences, "Scans merge level
   prefixes") work on the whole `user_key`, so they need no change. A full copy (decision 6) copies
   keys verbatim.
-- **Example** (partition 7, generation 2, `User` = ns byte `0x00`, tenant 1, affinity 1, map `cart`):
+- **Example** (partition 7, generation 2, `User` = ns byte `0x00`, tenant 1, affinity 1, map `cart`).
+  A **scoped key** is `tenant | affinity | user_key` (`scoped_key`): decision 1's `user_key` behind its
+  12-byte scope.
 
 | Record | Key (hex) |
 |---|---|
-| root of `cart` (`user_key`) | `00000001 0000000000000001` `63617274 0001` `00` (19 bytes) |
+| root of `cart` (scoped key) | `00000001 0000000000000001` `63617274 0001` `00` (19 bytes) |
 | same, on disk | `00000007 0000000000000002 00` `00000001 0000000000000001` `63617274 0001` `00` (32 bytes) |
-| entry `"apple"` (`user_key`) | `00000001 0000000000000001` `63617274 0001` `01` `60 6170706c65 0001` |
-| entry `"banana"` (`user_key`) | `00000001 0000000000000001` `63617274 0001` `01` `60 62616e616e61 0001` |
-| root of document `user:1` (`user_key`) | `00000001 0000000000000001` `757365723a31 0001` `00` (21 bytes) |
+| entry `"apple"` (scoped key) | `00000001 0000000000000001` `63617274 0001` `01` `60 6170706c65 0001` |
+| entry `"banana"` (scoped key) | `00000001 0000000000000001` `63617274 0001` `01` `60 62616e616e61 0001` |
+| root of document `user:1` (scoped key) | `00000001 0000000000000001` `757365723a31 0001` `00` (21 bytes) |
 
 - **S5's slot.**
   - **`0x04` binds only if ADR-rdb-0014 stores chunks as `Namespace::User` records of the object.**
@@ -349,14 +360,17 @@ How it is proved:
   - **The reason:** with three valid kinds, one flipped `kind` byte would otherwise turn a map into a
     document or a set, and nothing would detect it. That is tester W1, finding A3.
   - **`open` checks in this order**, and stops at the first failure:
-    1. `envelope_format`, then `digest_alg`. If either is unknown, the record was written by a newer
+    1. The size: under the 40-byte header (`Truncated`), then over `MAX_ENVELOPE` (`TooLarge`). Both
+       are damage, and no header byte has been read yet.
+    2. `envelope_format`, then `digest_alg`. If either is unknown, the record was written by a newer
        build, because those two bytes say how the digest is computed.
-    2. The length (`Truncated`, `LengthMismatch`), which is damage.
-    3. The digest, which is damage (`DigestMismatch`).
-    4. `kind`, then `codec_version`. An unknown value means a newer build.
-  - **A newer build's record still reads as `Unknown*`, never as damage** (ADR-rdb-0012 §12). Steps 1
-    and 4 classify the record before the digest is trusted, or after it has passed. A real newer-build
-    record hashes correctly, so it reaches step 4.
+    3. `payload_len` against the bytes that follow (`LengthMismatch`), which is damage.
+    4. The digest, which is damage (`DigestMismatch`).
+    5. `kind`, then `codec_version`. An unknown value means a newer build.
+  - **A newer build's record of a size step 1 accepts reads as `Unknown*`, not as damage**
+    (ADR-rdb-0012 §12). Steps 2 and 5 classify the record before the digest is trusted, or after it has
+    passed. A real newer-build record hashes correctly, so it reaches step 5. One under 40 bytes or over
+    `MAX_ENVELOPE` reads as damage whoever wrote it.
   - **What it does not close (tester W2 A6):** a one-byte flip of `envelope_format` or `digest_alg`
     reads as `UnknownFormat` or `UnknownDigest`, the newer-build class. It does not read as
     `DigestMismatch`.
@@ -445,7 +459,7 @@ How it is proved:
     request.
 - `Compiled` grows from one mutation to a list, as ADR-rdb-0012 §11's upgrade note says. A document
   compile returns a list of one.
-- **Drop:** `drop_collection(snapshot, &RootKey, kind, Version(v))` deletes the root with
+- **Drop:** `drop_collection(snapshot, &RootKey, v)` deletes the root with
   `expected_version: Some(v)`. First it scans `prefix | 0x01` with limit 1:
   - If `count = 0` and no element exists, it deletes the root.
   - If `count > 0` and an element exists, it refuses with `NotEmpty{count}`.
@@ -567,13 +581,14 @@ compares `count` with one scanned element (decision 9).
 #### 13. Errors
 - **Apply** (`ApplyError`, in `delta.rs`) gains `KindMismatch{found}`, `UnsupportedKeyType`,
   `ElementExists`, `ElementAbsent`, `NotEmpty{count}` and `TooManyWrites{writes}`. It reuses
-  `ObjectAbsent`, `VersionConflict` and `TooLarge`.
+  `ObjectAbsent` and `VersionConflict`. `TooLarge` becomes `TooLarge{limit: SizeLimit}`: `Value` for
+  one value's envelope, `Write` for the whole replicated record (decision 9; L-R186z).
 - **Corrupt** (in `compile.rs`) gains:
   - `Key(KeyError)`;
   - `Root(..)`, for a payload that is not exactly `{keys, count}`, or a count that a compile would push
     above `u64::MAX`;
   - `EntryNotDocument{found}`;
-  - `SetMemberHasValue`;
+  - `SetMemberHasValue{len}`;
   - `ElementNewerThanRoot{element, root}`;
   - `OrphanElement`;
   - `CountMismatch{count}`;
