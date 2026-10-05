@@ -75,7 +75,9 @@ pub enum Corrupt {
     #[error("key: {0}")]
     Key(KeyError),
     /// A collection root's payload is not exactly `{"keys": n, "count": n}`, or its count plus
-    /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right.
+    /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right. For a
+    /// list root, the payload breaks a rule of ADR-rdb-0016 §3, or a counter it holds would
+    /// overflow.
     #[error("collection root: {0}")]
     Root(&'static str),
     /// A collection root names an element key profile this build does not know. Written by a
@@ -129,6 +131,12 @@ pub enum Corrupt {
     ChunkMissing {
         /// The missing index.
         index: u32,
+    },
+    /// A list leaf names an item that has no record (ADR-rdb-0016 §7).
+    #[error("the list names item {id:032x}, which is not stored")]
+    ItemMissing {
+        /// The item's id.
+        id: u128,
     },
     /// A stored chunk is not the one the manifest names: another kind of record, or another
     /// length or digest (ADR-rdb-0014 §7).

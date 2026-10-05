@@ -22,6 +22,8 @@ pub enum SizeLimit {
     Write,
     /// One blob chunk's bytes, against [`crate::blob::MAX_CHUNK`] (ADR-rdb-0014 §4).
     Chunk,
+    /// One list item's envelope, against [`crate::list::MAX_ITEM`] (ADR-rdb-0016 §4).
+    Item,
 }
 
 // `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
@@ -39,6 +41,11 @@ impl fmt::Display for SizeLimit {
                 f,
                 "{}-byte limit for one blob chunk",
                 crate::blob::MAX_CHUNK
+            ),
+            Self::Item => write!(
+                f,
+                "{}-byte limit for one list item's envelope",
+                crate::list::MAX_ITEM
             ),
         }
     }
@@ -210,6 +217,33 @@ pub enum ApplyError {
     #[error("chunk_size {found} is outside 1 … the blob format's largest chunk")]
     InvalidChunkSize {
         /// The `chunk_size` given.
+        found: u64,
+    },
+    /// A list position past the list's end (ADR-rdb-0016 §5, §6).
+    #[error("position {position} is not inside the list of {len}")]
+    PositionInvalid {
+        /// The position given.
+        position: u64,
+        /// The list's length when the op ran.
+        len: u64,
+    },
+    /// `node_max` is outside `MIN_NODE_MAX … DEFAULT_NODE_MAX` (ADR-rdb-0016 §4).
+    #[error(
+        "node_max {found} is outside {} … {}",
+        crate::list::MIN_NODE_MAX,
+        crate::list::DEFAULT_NODE_MAX
+    )]
+    InvalidNodeSize {
+        /// The `node_max` given.
+        found: usize,
+    },
+    /// A scan token from another generation: the versions it names may have been reused
+    /// (ADR-rdb-0016 §6).
+    #[error("the token is from generation {expected}; the snapshot is at {found}")]
+    GenerationChanged {
+        /// The token's generation.
+        expected: u64,
+        /// The snapshot's generation.
         found: u64,
     },
 }

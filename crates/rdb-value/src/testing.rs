@@ -33,6 +33,13 @@ impl MapSnapshot {
         self.records.insert(key, (version, value));
     }
 
+    /// Move the snapshot's position up to `seq`, never down. A commit whose last write is a
+    /// delete leaves no record at its version, so a snapshot rebuilt from records would sit
+    /// below it; a list create seeds its ids from `at()` (ADR-rdb-0016 §2).
+    pub fn advance_to(&mut self, seq: u64) {
+        self.at = Seq(self.at.0.max(seq));
+    }
+
     /// Every record, in key order: key, version, value.
     pub fn records(&self) -> impl Iterator<Item = (&Bytes, Version, &Bytes)> {
         self.records.iter().map(|(k, (v, b))| (k, *v, b))

@@ -8,7 +8,8 @@
 //!   (decision 2).
 //! - `sub`: the record's role inside the object, from the table in [`Sub`] (decision 3).
 //! - `tail`: empty for the root; for a map entry or set member, the element key in profile v1
-//!   (decision 4), built by [`encode_element`].
+//!   (decision 4), built by [`encode_element`]; for a list item or page, its 16-byte id
+//!   (ADR-rdb-0016 §1).
 //!
 //! A [`RootKey`] can only be made by [`root_key`], so a document or collection op can never be
 //! aimed at an element key (decision 1).
@@ -24,6 +25,12 @@ use crate::value::{Decimal, Float, Int, Timestamp, Value};
 pub const SUB_ROOT: u8 = 0x00;
 /// `sub` of a map entry or a set member. Its tail is an element key, profile v1.
 pub const SUB_ELEMENT: u8 = 0x01;
+/// `sub` of a list item. Its tail is the item id, [`LIST_ID_LEN`] bytes (ADR-rdb-0016 §1).
+pub const SUB_ITEM: u8 = 0x02;
+/// `sub` of a list page. Its tail is the page id, [`LIST_ID_LEN`] bytes (ADR-rdb-0016 §1).
+pub const SUB_PAGE: u8 = 0x03;
+/// A list item or page id's length: a u128, big-endian (ADR-rdb-0016 §2).
+pub const LIST_ID_LEN: usize = 16;
 /// `sub` of a blob chunk. Its tail is `upload_id (16) | index u32 BE` (ADR-rdb-0014 §1).
 pub const SUB_CHUNK: u8 = 0x04;
 /// A chunk key's tail length: [`UPLOAD_LEN`] bytes of upload id, then a u32 index.
@@ -38,7 +45,8 @@ pub const UPLOAD_LEN: usize = 16;
 /// |---|---|
 /// | `0x00` | [`Sub::Root`] |
 /// | `0x01` | [`Sub::Element`] |
-/// | `0x02`, `0x03` | reserved for lists (S4) |
+/// | `0x02` | [`Sub::Item`] (ADR-rdb-0016 §1) |
+/// | `0x03` | [`Sub::Page`] (ADR-rdb-0016 §1) |
 /// | `0x04` | [`Sub::Chunk`] (ADR-rdb-0014 §1) |
 /// | `0x05`–`0xFF` | unassigned |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +55,10 @@ pub enum Sub {
     Root,
     /// `0x01`: a map entry or a set member.
     Element,
+    /// `0x02`: a list item.
+    Item,
+    /// `0x03`: a list page.
+    Page,
     /// `0x04`: a blob chunk.
     Chunk,
     /// Any other byte: reserved or unassigned. Nothing after it is decoded.
@@ -60,6 +72,8 @@ impl Sub {
         match byte {
             SUB_ROOT => Self::Root,
             SUB_ELEMENT => Self::Element,
+            SUB_ITEM => Self::Item,
+            SUB_PAGE => Self::Page,
             SUB_CHUNK => Self::Chunk,
             other => Self::Reserved(other),
         }
@@ -172,6 +186,12 @@ pub enum KeyError {
         /// The tail's length.
         len: usize,
     },
+    /// A list item or page key's tail is not [`LIST_ID_LEN`] bytes (ADR-rdb-0016 §1).
+    #[error("list item or page key tail of {len} bytes; an id is {LIST_ID_LEN}")]
+    ListIdTail {
+        /// The tail's length.
+        len: usize,
+    },
 }
 
 /// An object's root key: the full `Namespace::User` key `scope | esc(object_id) | 0x00`.
@@ -213,6 +233,14 @@ impl RootKey {
         out
     }
 
+    /// `object_prefix | sub`: every record of this object with that `sub` starts with it.
+    #[must_use]
+    pub fn sub_prefix(&self, sub: u8) -> Vec<u8> {
+        let mut out = self.object_prefix().to_vec();
+        out.push(sub);
+        out
+    }
+
     /// `object_prefix | 0x04`: every blob chunk of this object starts with it, in
     /// `(upload, index)` order (ADR-rdb-0014 §1).
     #[must_use]
@@ -229,6 +257,22 @@ pub fn chunk_key(root: &RootKey, upload: &[u8; UPLOAD_LEN], index: u32) -> Bytes
     let mut out = root.chunk_prefix();
     out.extend_from_slice(upload);
     out.extend_from_slice(&index.to_be_bytes());
+    Bytes::from(out)
+}
+
+/// The key of list item `id` under the object at `root` (ADR-rdb-0016 §1).
+#[must_use]
+pub fn item_key(root: &RootKey, id: u128) -> Bytes {
+    let mut out = root.sub_prefix(SUB_ITEM);
+    out.extend_from_slice(&id.to_be_bytes());
+    Bytes::from(out)
+}
+
+/// The key of list page `id` under the object at `root` (ADR-rdb-0016 §1).
+#[must_use]
+pub fn page_key(root: &RootKey, id: u128) -> Bytes {
+    let mut out = root.sub_prefix(SUB_PAGE);
+    out.extend_from_slice(&id.to_be_bytes());
     Bytes::from(out)
 }
 
@@ -533,6 +577,8 @@ pub struct Parsed {
     pub element: Option<Value>,
     /// For [`Sub::Chunk`], the upload id and the index. `None` otherwise.
     pub chunk: Option<([u8; UPLOAD_LEN], u32)>,
+    /// For [`Sub::Item`] and [`Sub::Page`], the id. `None` otherwise.
+    pub list_id: Option<u128>,
 }
 
 impl Parsed {
@@ -553,7 +599,7 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
     let (object_id, rest) = unesc(&key[KEY_SCOPE_LEN..], KEY_SCOPE_LEN)?;
     let (&sub, tail) = rest.split_first().ok_or(KeyError::MissingSub)?;
     let sub = Sub::from_byte(sub);
-    let (mut element, mut chunk) = (None, None);
+    let (mut element, mut chunk, mut list_id) = (None, None, None);
     match sub {
         Sub::Root if !tail.is_empty() => return Err(KeyError::RootHasTail { len: tail.len() }),
         Sub::Element => element = Some(decode_element(tail)?),
@@ -567,6 +613,12 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
                 u32::from_be_bytes(index.try_into().expect("4 bytes")),
             ));
         }
+        Sub::Item | Sub::Page => {
+            let tail: [u8; LIST_ID_LEN] = tail
+                .try_into()
+                .map_err(|_| KeyError::ListIdTail { len: tail.len() })?;
+            list_id = Some(u128::from_be_bytes(tail));
+        }
         Sub::Root | Sub::Reserved(_) => {}
     }
     Ok(Parsed {
@@ -576,5 +628,6 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
         sub,
         element,
         chunk,
+        list_id,
     })
 }

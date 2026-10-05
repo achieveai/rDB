@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | 0 | 1 | `envelope_format` | `0x01` |
 //! | 1 | 1 | `kind` | [`Kind`] |
-//! | 2 | 1 | `codec_version` | `0x01`, read per `kind`: `rdb-cbor-document` v1 for kinds `0x01`–`0x04`; for `0x05` (chunk), the payload as given (ADR-rdb-0014 §2) |
+//! | 2 | 1 | `codec_version` | `0x01`, read per `kind`: `rdb-cbor-document` v1 for kinds `0x01`–`0x04`, `0x06` and `0x07`; for `0x05` (chunk), the payload as given (ADR-rdb-0014 §2) |
 //! | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of bytes 0..8, then the payload |
 //! | 4 | 4 | `payload_len` | u32 big-endian; equals the remaining bytes |
 //! | 8 | 32 | `digest` | |
@@ -52,6 +52,10 @@ pub enum Kind {
     Blob,
     /// A blob chunk: the bytes as given, no CBOR (ADR-rdb-0014 §2).
     Chunk,
+    /// The root record of an ordered list (ADR-rdb-0016 §1, §3).
+    List,
+    /// A page of an ordered list: one node below the root (ADR-rdb-0016 §1, §3).
+    ListPage,
 }
 
 impl Kind {
@@ -64,6 +68,8 @@ impl Kind {
             Self::Set => 0x03,
             Self::Blob => 0x04,
             Self::Chunk => 0x05,
+            Self::List => 0x06,
+            Self::ListPage => 0x07,
         }
     }
 
@@ -76,6 +82,8 @@ impl Kind {
             0x03 => Some(Self::Set),
             0x04 => Some(Self::Blob),
             0x05 => Some(Self::Chunk),
+            0x06 => Some(Self::List),
+            0x07 => Some(Self::ListPage),
             _ => None,
         }
     }

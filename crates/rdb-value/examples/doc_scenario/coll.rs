@@ -245,14 +245,14 @@ fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
     })
 }
 
-fn parse_version(v: &str) -> Result<u64, Failure> {
+pub fn parse_version(v: &str) -> Result<u64, Failure> {
     v.parse::<u64>()
         .map_err(|_| Failure::usage(format!("--expect {v:?} is not a u64")))
 }
 
 /// A key or a value: `cbor:<hex>`, strictly decoded, or JSON (`@FILE` reads it from FILE). An
 /// array or a map is passed on, so the library is what refuses it as a key.
-fn element_arg(arg: &str) -> Result<Value, Failure> {
+pub fn element_arg(arg: &str) -> Result<Value, Failure> {
     match arg.strip_prefix("cbor:") {
         Some(digits) => {
             let bytes = hex::decode(digits)

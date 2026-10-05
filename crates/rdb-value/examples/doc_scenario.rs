@@ -25,9 +25,17 @@
 //! doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]
 //! doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]
 //! doc_scenario --store <FILE> gc <id> --floor F [--compile-only]
+//! doc_scenario --store <FILE> list <id> (--absent | --expect V) [--compile-only]
+//!                                  (push J | insert P J)...
+//! doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]
 //! doc_scenario --store <FILE> dump
 //! doc_scenario decode --hex H
 //! doc_scenario --help
+//!
+//! `--node-max N` (before the command, beside `--store`) is the list node size the store
+//! compiles with (ADR-rdb-0016 §4). Given on a store's first command, it is written to the
+//! store's head line; a later different value is refused (exit 2). Without it a store uses
+//! 24,576. `drop` reads the root's kind and drops a list or a collection.
 //!
 //! <id> is an object id: plain text, or hex:<hex> for any bytes. Every object lives at
 //! tenant 1, affinity 1, under the root key the library builds (ADR-rdb-0013 §1).
@@ -71,13 +79,16 @@
 //!
 //! `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.
 //!
-//! The store is one JSON line `{"seq":N,"envelope":2}`, then one line per record
+//! The store is one JSON line `{"seq":N,"envelope":2}` (plus `"node_max":N` when one was
+//! given), then one line per record
 //! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store
 //! with no marker or a lower one was sealed before ruling L-R186s, and one with a higher marker
 //! was written by a newer build; any other marker is unrecognised. All are refused, exit 3, as
 //! is a store from S2 (with `key` instead of `key_hex`). `seq` stands in for the kernel's
 //! transaction sequence: each commit takes the next one and stamps it as the version of every
-//! record it writes. `apply` checks the condition, then each write's `expected_version`, the way
+//! record it writes. Every commit's keys must strictly ascend, one write per key, as the
+//! kernel's check 10 requires; a list write must name its generation (ADR-rdb-0016 §8). `apply`
+//! checks the condition, then each write's `expected_version`, the way
 //! the kernel's `first_failed_condition` does, and refuses with the kernel's name,
 //! `ConditionFailed { index }`.
 //!
@@ -91,6 +102,7 @@
 //! count is kept by `compile_collection` and `drop_collection`, so a hand-edited line can
 //! leave the count-mismatch or orphan state of ADR-rdb-0013 decision 11.
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::ExitCode;
@@ -101,6 +113,7 @@ use rdb_value::cbor;
 use rdb_value::delta::{resolve, ApplyError, Delta, Op};
 use rdb_value::envelope::{self, Kind, MAX_ENVELOPE, MAX_PAYLOAD};
 use rdb_value::keys::{self, RootKey, Sub};
+use rdb_value::list::DEFAULT_NODE_MAX;
 use rdb_value::path::{Path, PathError};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
@@ -110,6 +123,8 @@ use rdb_value::{compile, read, Compiled, Corrupt, Expected, ValueError};
 mod blob;
 #[path = "doc_scenario/coll.rs"]
 mod coll;
+#[path = "doc_scenario/list.rs"]
+mod list;
 
 /// The one scope this tool writes in, so keys match ADR-rdb-0013 §6's example.
 const TENANT: TenantId = TenantId(1);
@@ -130,9 +145,12 @@ doc_scenario --store <FILE> upload <id> (--absent | --expect V) --upload H --chu
 doc_scenario --store <FILE> blob <id>\n       doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]\n       \
 doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]\n       \
 doc_scenario --store <FILE> gc <id> --floor F [--compile-only]\n       \
+doc_scenario --store <FILE> list <id> (--absent | --expect V) [--compile-only] (push J | insert P J)...\n       \
+doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]\n       \
 doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 <id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
+--node-max N, beside --store, sets a new store's list node size (default 24576).\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
 
 // Input limits. Every text input is read through `Read::take` at one of these, so an oversized
@@ -295,18 +313,41 @@ fn parse_path(text: &str) -> Result<Path, Failure> {
 
 type Fields = Vec<(&'static str, String)>;
 
+thread_local! {
+    /// The `--node-max` of this run, for [`Store::load`]: a new store takes it, an existing one
+    /// must hold the same.
+    static NODE_MAX: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
 fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
     let mut store: Option<PathBuf> = None;
+    let mut node_max: Option<usize> = None;
     let mut rest = args;
     while let [flag, value, tail @ ..] = rest {
-        if flag != "--store" {
-            break;
-        }
-        if store.replace(PathBuf::from(value)).is_some() {
-            return ("usage", Err(Failure::usage("--store given twice")));
+        match flag.as_str() {
+            "--store" => {
+                if store.replace(PathBuf::from(value)).is_some() {
+                    return ("usage", Err(Failure::usage("--store given twice")));
+                }
+            }
+            "--node-max" => {
+                let Ok(n) = value.parse::<usize>() else {
+                    return (
+                        "usage",
+                        Err(Failure::usage(format!(
+                            "--node-max {value:?} is not a size"
+                        ))),
+                    );
+                };
+                if node_max.replace(n).is_some() {
+                    return ("usage", Err(Failure::usage("--node-max given twice")));
+                }
+            }
+            _ => break,
         }
         rest = tail;
     }
+    NODE_MAX.with(|cell| cell.set(node_max));
     let Some((cmd, rest)) = rest.split_first() else {
         return ("usage", Err(Failure::usage("no command")));
     };
@@ -331,6 +372,8 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "read" => "read",
         "blob-delete" => "blob-delete",
         "gc" => "gc",
+        "list" => "list",
+        "items" => "items",
         "--help" | "-h" | "help" if rest.is_empty() => return ("help", Ok(Vec::new())),
         other => {
             return (
@@ -352,7 +395,7 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "get" => get_cmd(&store, rest),
         "map" => coll::write_cmd(&store, coll::CollectionKind::Map, rest),
         "set" => coll::write_cmd(&store, coll::CollectionKind::Set, rest),
-        "drop" => coll::drop_cmd(&store, rest),
+        "drop" => drop_cmd(&store, rest),
         "collection" => coll::collection_cmd(&store, rest),
         "member" => coll::member_cmd(&store, rest),
         "members" => coll::members_cmd(&store, rest),
@@ -363,6 +406,8 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "read" => blob::read_cmd(&store, rest),
         "blob-delete" => blob::delete_cmd(&store, rest),
         "gc" => blob::gc_cmd(&store, rest),
+        "list" => list::write_cmd(&store, rest),
+        "items" => list::items_cmd(&store, rest),
         _ => dump_cmd(&store, rest),
     };
     (name, outcome)
@@ -406,8 +451,16 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let [file] = rest else {
         return Err(Failure::usage("apply takes exactly one file"));
     };
-    let (compiled, generation) = load_compiled(FsPath::new(file))?;
+    let (compiled, generation, writes_list) = load_compiled(FsPath::new(file))?;
     let mut store = Store::load(store_path)?;
+    // A list's pages and ids are guarded only by its root's version, which a failover can
+    // reuse, so a list write is never applied unfenced (ADR-rdb-0016 §8).
+    if generation.is_none() && (writes_list || drops_list(&store, &compiled)) {
+        return Err(Failure::refused(
+            "GenerationRequired".into(),
+            "a list write must name its generation (ADR-rdb-0016 §8); this line names none".into(),
+        ));
+    }
     let version = match generation {
         Some(generation) => store.apply_at(&compiled, generation)?,
         None => store.apply(&compiled)?,
@@ -418,6 +471,38 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     }
     fields.extend(compiled_fields(&compiled)?);
     Ok(fields)
+}
+
+/// Whether `compiled` deletes a root the store holds as a list.
+fn drops_list(store: &Store, compiled: &Compiled) -> bool {
+    compiled.mutations.iter().any(|m| match m {
+        Mutation::Delete { key, .. } => store
+            .snapshot
+            .get(Namespace::User, key)
+            .is_some_and(|raw| envelope::open(&raw).is_ok_and(|o| o.kind == Kind::List)),
+        Mutation::Put { .. } => false,
+    })
+}
+
+/// `drop <id> --expect V [--compile-only]`: a list's drop when the root is a list, otherwise a
+/// collection's, which also names any other kind it finds.
+fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
+    let is_list = match rest.first() {
+        Some(id) => {
+            let root = root_of(id).map_err(|e| e.keyed(id))?;
+            let store = Store::load(store_path)?;
+            store
+                .snapshot
+                .get(Namespace::User, root.as_bytes())
+                .is_some_and(|raw| envelope::open(&raw).is_ok_and(|o| o.kind == Kind::List))
+        }
+        None => false,
+    };
+    if is_list {
+        list::drop_cmd(store_path, rest)
+    } else {
+        coll::drop_cmd(store_path, rest)
+    }
 }
 
 fn commit_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
@@ -570,7 +655,10 @@ fn dump_record(
             } else if opened.kind == Kind::Blob {
                 blob::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
-            } else if opened.kind == Kind::Chunk {
+            } else if opened.kind == Kind::List {
+                list::dump_root(snapshot, &root, line)?;
+                line.extend(envelope_fields(raw)?);
+            } else if matches!(opened.kind, Kind::Chunk | Kind::ListPage) {
                 return Err(Failure::from(ApplyError::KindMismatch {
                     found: opened.kind,
                 }));
@@ -600,6 +688,12 @@ fn dump_record(
                 .chunk
                 .ok_or_else(|| Failure::store("a chunk key parsed without its tail"))?;
             blob::dump_chunk(&upload, index, raw, line)?;
+        }
+        (Sub::Item | Sub::Page, _) => {
+            let id = parsed
+                .list_id
+                .ok_or_else(|| Failure::store("a list key parsed without its id"))?;
+            list::dump_record(parsed.sub, id, raw, line)?;
         }
         (Sub::Reserved(byte), _) => {
             line.str("sub", &format!("reserved {byte:#04x}"));
@@ -906,24 +1000,47 @@ const STORE_ENVELOPE: u64 = 2;
 struct Store {
     path: PathBuf,
     seq: u64,
+    /// The `node_max` its head line names, if one was given when it was made.
+    node_max: Option<usize>,
     snapshot: MapSnapshot,
 }
 
 impl Store {
-    /// A missing file is an empty store at `seq` 0.
+    /// A missing file is an empty store at `seq` 0, with this run's `--node-max` if given. An
+    /// existing store must hold the `--node-max` given, if any (exit 2).
     fn load(path: &FsPath) -> Result<Self, Failure> {
-        match std::fs::File::open(path) {
-            Ok(file) => Self::read(path, BufReader::new(file)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+        let requested = NODE_MAX.with(Cell::get);
+        let store = match std::fs::File::open(path) {
+            Ok(file) => Self::read(path, BufReader::new(file))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self {
                 path: path.to_owned(),
                 seq: 0,
+                node_max: requested,
                 snapshot: MapSnapshot::new(Generation(1)),
-            }),
-            Err(e) => Err(Failure::store(format!(
-                "cannot read {}: {e}",
-                path.display()
-            ))),
+            },
+            Err(e) => {
+                return Err(Failure::store(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        if let Some(requested) = requested {
+            if requested != store.node_max() {
+                return Err(Failure::usage(format!(
+                    "--node-max {requested}: {} is a store at node_max {}; a store keeps the \
+                     node size it was made with",
+                    path.display(),
+                    store.node_max()
+                )));
+            }
         }
+        Ok(store)
+    }
+
+    /// The list node size this store compiles with.
+    fn node_max(&self) -> usize {
+        self.node_max.unwrap_or(DEFAULT_NODE_MAX)
     }
 
     /// The store in `source`, read one line at a time, each line bounded at [`MAX_LINE`]: a read
@@ -932,6 +1049,7 @@ impl Store {
         let mut store = Self {
             path: path.to_owned(),
             seq: 0,
+            node_max: None,
             snapshot: MapSnapshot::new(Generation(1)),
         };
         let bad = |n: usize, what: &str| {
@@ -1020,6 +1138,14 @@ impl Store {
                 ))
             }
         }
+        store.node_max = match head.get("node_max") {
+            None => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| bad(n, "\"node_max\" is not a size"))?,
+            ),
+        };
         for (n, line) in lines {
             let record: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| bad(n, &e.to_string()))?;
@@ -1051,12 +1177,29 @@ impl Store {
             }
             store.snapshot.insert(key, version, Bytes::from(value));
         }
+        // The last commit may have ended in a delete, which leaves no record at its version.
+        store.snapshot.advance_to(store.seq);
         Ok(store)
     }
 
     /// Check `compiled` as the kernel does, then commit it at the next `seq`: every `Put` at
     /// that version, every `Delete` removed.
     fn apply(&mut self, compiled: &Compiled) -> Result<u64, Failure> {
+        // The kernel's check 10 refuses two writes to one key; every compile emits its writes in
+        // strictly ascending key order, so anything else is a compile fault, refused here.
+        if let Some(i) = compiled
+            .mutations
+            .windows(2)
+            .position(|w| w[0].key() >= w[1].key())
+        {
+            return Err(Failure::refused(
+                "Malformed { field: \"mutations\" }".into(),
+                format!(
+                    "mutations {i} and {}: keys must strictly ascend, one write per key",
+                    i + 1
+                ),
+            ));
+        }
         // The kernel's order (`first_failed_condition`): every condition, then every mutation,
         // where a mutation without `expected_version` always holds. Each check: what it claims,
         // the key it reads, and whether it held.
@@ -1140,6 +1283,7 @@ impl Store {
             }
         }
         self.seq = version;
+        self.snapshot.advance_to(version);
         self.save()?;
         Ok(version)
     }
@@ -1166,7 +1310,13 @@ impl Store {
 
     /// Rewrite the whole file: to a sibling first, then rename over the old one.
     fn save(&self) -> Result<(), Failure> {
-        let mut text = format!("{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}}}\n", self.seq);
+        let node_max = self
+            .node_max
+            .map_or_else(String::new, |n| format!(",\"node_max\":{n}"));
+        let mut text = format!(
+            "{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}{node_max}}}\n",
+            self.seq
+        );
         for (key, version, value) in self.snapshot.records() {
             text.push_str(&format!(
                 "{{\"key_hex\":\"{}\",\"version\":{version},\"value_hex\":\"{}\"}}\n",
@@ -1187,7 +1337,7 @@ impl Store {
 /// every compile emits); a root reads back through the library; a map entry is a document and a
 /// set member is empty, read through `member` under the root written beside it. The root's
 /// count is not checked against the elements (see the module doc).
-fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>), Failure> {
+fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>, bool), Failure> {
     let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
     let source = std::fs::File::open(file).map_err(cannot)?;
     let bytes = read_bounded(source, MAX_LINE)
@@ -1269,20 +1419,22 @@ fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>), Failur
         });
     }
     let generation = blob::line_generation(&json).map_err(|e| bad(&e))?;
-    check_writes(&mutations)?;
+    let writes_list = check_writes(&mutations)?;
     Ok((
         Compiled {
             mutations,
             conditions,
         },
         generation,
+        writes_list,
     ))
 }
 
 /// Every write in a compiled line reads back (see [`load_compiled`]): every key parses, every
 /// element write has its root written beside it, and every `Put` reads back through the
-/// library. A refusal names the key.
-fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
+/// library. A refusal names the key. Returns whether any write is a list's root, item or page.
+fn check_writes(mutations: &[Mutation]) -> Result<bool, Failure> {
+    let mut writes_list = false;
     // Every `Put` at version 1, so each one is read the way it would be once applied.
     let mut written = MapSnapshot::new(Generation(1));
     for mutation in mutations {
@@ -1313,7 +1465,11 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                     Kind::Blob => {
                         rdb_value::blob::read_blob(&written, &root).map_err(|e| keyed(e.into()))?;
                     }
-                    Kind::Chunk => {
+                    Kind::List => {
+                        writes_list = true;
+                        rdb_value::list::list(&written, &root).map_err(|e| keyed(e.into()))?;
+                    }
+                    Kind::Chunk | Kind::ListPage => {
                         return Err(keyed(
                             ApplyError::KindMismatch { found: opened.kind }.into(),
                         ))
@@ -1345,6 +1501,20 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                     blob::open_chunk(index, value).map_err(keyed)?;
                 }
             }
+            // An item or page write keeps its root in step, so it needs the root written
+            // beside it, as an element write does.
+            (Sub::Item | Sub::Page, _) => {
+                writes_list = true;
+                if written.version(Namespace::User, root.as_bytes()).is_none() {
+                    return Err(keyed(Failure::usage(
+                        "a list item or page write without its list's root write \
+                         (ADR-rdb-0016 §5)",
+                    )));
+                }
+                if let Some(value) = value {
+                    list::check_record(parsed.sub, value).map_err(keyed)?;
+                }
+            }
             (Sub::Reserved(byte), _) => {
                 return Err(keyed(Failure::usage(format!(
                     "sub byte {byte:#04x} is reserved; this build writes no such record"
@@ -1352,7 +1522,7 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
             }
         }
     }
-    Ok(())
+    Ok(writes_list)
 }
 
 // ---------------------------------------------------------------------------------------------

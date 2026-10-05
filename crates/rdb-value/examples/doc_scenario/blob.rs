@@ -125,7 +125,7 @@ fn object(rest: &[String]) -> Result<(&String, RootKey, &[String]), Failure> {
 
 /// Commit `compiled` at `generation` and add `version`, or, for `compile_only`, add
 /// `compile_only: true`. Then the compiled fields, with `generation` before them.
-fn emit(
+pub fn emit(
     store: &mut Store,
     compiled: &Compiled,
     compile_only: bool,

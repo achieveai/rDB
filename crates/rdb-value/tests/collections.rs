@@ -28,8 +28,8 @@ use rdb_value::collection::{
 };
 use rdb_value::envelope::{seal, EnvelopeError, Kind};
 use rdb_value::keys::{
-    chunk_key, decode_element, decode_element_key, element_key, encode_element, esc, parse,
-    root_key, KeyError, Parsed, RootKey, Sub,
+    chunk_key, decode_element, decode_element_key, element_key, encode_element, esc, item_key,
+    page_key, parse, root_key, KeyError, Parsed, RootKey, Sub,
 };
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Decimal, Int, Map, MapKey, Value};
@@ -871,6 +871,14 @@ fn names_exactly(key: &[u8], parsed: &Parsed) -> bool {
             let (upload, index) = parsed.chunk.expect("a chunk tail is decoded");
             chunk_key(&parsed.root(), &upload, index)[..] == *key
         }
+        Sub::Item => {
+            let id = parsed.list_id.expect("an item tail is decoded");
+            item_key(&parsed.root(), id)[..] == *key
+        }
+        Sub::Page => {
+            let id = parsed.list_id.expect("a page tail is decoded");
+            page_key(&parsed.root(), id)[..] == *key
+        }
         Sub::Reserved(sub) => {
             let mut head = parsed.root().object_prefix().to_vec();
             head.push(sub);
@@ -960,18 +968,23 @@ fn r5_each_damaged_key_is_refused_by_name() {
             KeyError::RootHasTail { len: 1 },
         ),
         (format!("{SCOPE} 61 0001 01 11"), KeyError::UnknownTag(0x11)),
+        (
+            format!("{SCOPE} 61 0001 02 ffff"),
+            KeyError::ListIdTail { len: 2 },
+        ),
     ];
     for (hex, fault) in whole {
         assert_eq!(parse(&spaced(&hex)), Err(fault), "{hex}");
     }
-    let reserved = parse(&spaced(&format!("{SCOPE} 61 0001 02 ffff"))).unwrap();
+    // Lists took subs 0x02 and 0x03 (ADR-rdb-0016), so 0x05 is the first one no build reads.
+    let reserved = parse(&spaced(&format!("{SCOPE} 61 0001 05 ffff"))).unwrap();
     assert_eq!(
         (
             reserved.object_id.as_slice(),
             reserved.sub,
             reserved.element
         ),
-        (&b"a"[..], Sub::Reserved(0x02), None)
+        (&b"a"[..], Sub::Reserved(0x05), None)
     );
 
     let root = cart();
