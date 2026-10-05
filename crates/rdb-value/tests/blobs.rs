@@ -1306,7 +1306,8 @@ fn gc_deletes_exactly_what_the_model_says_within_both_bounds() {
 const GC_SEEDS: u32 = 100;
 
 /// R6's fixed points. C13: the floor. C14: the count bound, 255 then 45 then nothing. C23: the
-/// byte bound under a 5,000-byte id, 207 then 48 then nothing (Node Part 2).
+/// byte bound under a 5,000-byte id, 207 then 48 then nothing (Node Part 2). C21: chunks under a
+/// map root.
 #[test]
 fn gc_batches_match_the_walked_counts() {
     let abandoned = |id: &[u8], uploads: &[(Upload, u32)]| {
@@ -1344,6 +1345,38 @@ fn gc_batches_match_the_walked_counts() {
     let (mut k, root) = abandoned(&[b'a'; 5000], &[(U1, 255)]);
     let floor = k.seq;
     assert_eq!(batch_sizes(&mut k, &root, floor), vec![207, 48, 0]);
+    // C21: a map at the root names no chunk, so its chunks are garbage. The batch is guarded by
+    // the map's version and leaves the map as it was.
+    let root = photo();
+    let map = {
+        let mut m = Map::new();
+        m.insert(MapKey::new("keys"), Value::Integer(Int::from(1_u64)));
+        m.insert(MapKey::new("count"), Value::Integer(Int::from(0_u64)));
+        seal(Kind::Map, &encode(&Value::Map(m)).unwrap()).unwrap()
+    };
+    let mut k = Kernel::new();
+    k.records.insert(root.to_bytes(), (1, map.clone()));
+    k.seq = 1;
+    let c = put_chunk(&k.snapshot(), &root, &U1, 0, b"z").unwrap();
+    assert_eq!(k.commit(&c), 2);
+    let c = collect_garbage(&k.snapshot(), &root, 2).unwrap();
+    assert_eq!(
+        c.conditions,
+        vec![Condition::VersionEquals {
+            key: root.to_bytes(),
+            version: 1,
+        }]
+    );
+    assert_eq!(
+        c.mutations,
+        vec![Mutation::Delete {
+            key: chunk_of(&root, &U1, 0),
+            expected_version: Some(2),
+        }]
+    );
+    k.commit(&c);
+    assert_eq!(k.records.get(&root.to_bytes()), Some(&(1, map)));
+    assert_eq!(k.records.len(), 1);
 }
 
 // ---- R7: crash at every boundary -------------------------------------------------------------
