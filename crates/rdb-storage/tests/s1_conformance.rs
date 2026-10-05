@@ -822,3 +822,127 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
         run_info,
     );
 }
+
+/// M8 S5 (s5-design §5, the RocksDB row; ADR-rdb-0014 §2, §6, §7). Protects walk steps 4 and 5,
+/// and C16: blob B1 and a blob of one full-size chunk, committed through `RocksEngine` as the
+/// batches T1 commits, dropped, reopened, and read back byte-equal. Each request is compiled
+/// against a `MapSnapshot` holding what the earlier commits wrote, so a fault that loses the
+/// chunk batches still commits the publish batch and shows at the read, as
+/// `Corrupt(ChunkMissing)`. One reopen after every commit landed: crash rows rest on S0 and S1.
+#[retcd_test]
+fn m8s_blobs_read_back_byte_equal_after_a_reopen() {
+    use rdb_core::contracts::txn::Mutation;
+    use rdb_value::blob::{publish, put_chunk, read_blob, read_range, MAX_CHUNK};
+    use rdb_value::Compiled;
+
+    /// Commit `compiled`, one `Put`, as the next chained batch, and record its write.
+    fn submit(
+        rocks: &mut RocksEngine,
+        mirror: &mut MapSnapshot,
+        head: &mut Digest,
+        compiled: &Compiled,
+    ) {
+        assert_eq!(compiled.mutations.len(), 1, "{:?}", compiled.mutations);
+        let Mutation::Put { key, value, .. } = &compiled.mutations[0] else {
+            panic!("a blob write is a Put");
+        };
+        let seq = mirror.at().0 + 1;
+        let batch = delete::request_batch(
+            lineage(PartitionId(1), Generation(1)),
+            Seq(seq),
+            *head,
+            compiled.conditions.clone(),
+            compiled.mutations[0].clone(),
+        )
+        .expect("a blob batch");
+        *head = record_digest(&batch);
+        rocks.commit(batch).expect("commit");
+        mirror.insert(key.clone(), seq, value.clone());
+    }
+
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    // Pinned from Node `crypto` and `sha256sum`: B1 (0014-blob-vectors.mjs rev 2.2), and
+    // 1,044,480 bytes of `(i * 7 + 3) mod 256`.
+    let full: Vec<u8> = (0..MAX_CHUNK).map(|i| (i * 7 + 3) as u8).collect();
+    let blobs: [(RootKey, [u8; 16], Vec<u8>, usize, &str); 2] = [
+        (
+            doc_key(b"photo"),
+            [0x11; 16],
+            b"hello, blob!".to_vec(),
+            4,
+            "59953c428c8411494243bb403fd0e93b00ac1aa3c235334d37db42954e2b21c6",
+        ),
+        (
+            doc_key(b"big"),
+            [0x22; 16],
+            full,
+            MAX_CHUNK,
+            "0440c90ea72fd79f5ed2a061bf52aa4299c6b89ac567c999e54a2acc537966c0",
+        ),
+    ];
+    let dir = data_dir("s5-blobs");
+    let db = dir.join("db");
+    let mut rocks = RocksEngine::open(&db).expect("open");
+    let mut mirror = MapSnapshot::new(Generation(1));
+    let mut head = Digest::ROOT;
+    for (root, upload, data, chunk_size, sha) in &blobs {
+        for (index, piece) in (0..).zip(data.chunks(*chunk_size)) {
+            let compiled = put_chunk(&mirror, root, upload, index, piece).expect("a chunk");
+            submit(&mut rocks, &mut mirror, &mut head, &compiled);
+        }
+        let sha256: [u8; 32] =
+            std::array::from_fn(|i| u8::from_str_radix(&sha[2 * i..2 * i + 2], 16).expect("hex"));
+        let compiled = publish(
+            &mirror,
+            root,
+            Expected::Absent,
+            upload,
+            data.len() as u64,
+            *chunk_size as u64,
+            &sha256,
+            Generation(1),
+        )
+        .expect("a publish");
+        submit(&mut rocks, &mut mirror, &mut head, &compiled);
+    }
+
+    drop(rocks);
+    let rocks = RocksEngine::open(&db).expect("reopen");
+    let view = rocks
+        .snapshot(PartitionId(1), Generation(1), SnapshotHandle(1))
+        .expect("rocks snapshot");
+    for (root, upload, data, chunk_size, sha) in &blobs {
+        let range = read_range(&view, root, 0, data.len() as u64);
+        assert!(range.as_deref() == Ok(&data[..]), "read back: {range:?}");
+        let blob = read_blob(&view, root).expect("reads").expect("published");
+        assert_eq!(
+            (
+                blob.manifest.size,
+                hex(&blob.manifest.sha256),
+                blob.manifest.upload,
+                blob.manifest.chunk_size
+            ),
+            (
+                data.len() as u64,
+                (*sha).to_owned(),
+                *upload,
+                *chunk_size as u64
+            )
+        );
+    }
+    for (key, version, value) in mirror.records() {
+        assert_eq!(
+            view.get(Namespace::User, key).as_ref(),
+            Some(value),
+            "{key:?}"
+        );
+        assert_eq!(view.version(Namespace::User, key), Some(version), "{key:?}");
+    }
+    drop(view);
+    drop(rocks);
+    assert!(
+        config_testkit::fs::try_remove(&dir),
+        "remove {}",
+        dir.display()
+    );
+}
