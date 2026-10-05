@@ -2471,4 +2471,71 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).expect("clean");
     }
+
+    /// ADR-rdb-0016 §8: a list write or a list drop is never applied unfenced. A compile line
+    /// with its `generation` removed is refused `GenerationRequired`; one naming another
+    /// generation is refused `GenerationChanged`. The store is unchanged either way, and the
+    /// same line with its own generation applies.
+    #[test]
+    fn w1_apply_refuses_a_list_line_without_its_generation() {
+        let dir = scratch("w1-apply-generation");
+        let store = dir.join("s.jsonl");
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", "\"a\""])).expect("create");
+        let line = |cmd: &str, fields: Fields| {
+            let mut line = Line::new(cmd);
+            line.extend(fields);
+            serde_json::from_str::<serde_json::Value>(&line.render()).expect("json")
+        };
+        let push = line(
+            "list",
+            list::write_cmd(
+                &store,
+                &args(&["todo", "--expect", "1", "--compile-only", "push", "\"b\""]),
+            )
+            .expect("compile the push"),
+        );
+        let file = dir.join("c.json");
+        let before = std::fs::read(&store).expect("store");
+        let mut unfenced = push.clone();
+        unfenced.as_object_mut().unwrap().remove("generation");
+        let mut elsewhere = push.clone();
+        elsewhere["generation"] = 2.into();
+        for (json, want) in [
+            (&unfenced, "GenerationRequired"),
+            (&elsewhere, "GenerationChanged"),
+        ] {
+            std::fs::write(&file, json.to_string()).expect("write");
+            let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+            assert!(err.error.starts_with(want), "{}: {}", err.error, err.detail);
+            assert_eq!(
+                std::fs::read(&store).expect("store"),
+                before,
+                "store unchanged"
+            );
+        }
+        std::fs::write(&file, push.to_string()).expect("write");
+        apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect("fenced line applies");
+
+        list::write_cmd(
+            &store,
+            &args(&["todo", "--expect", "2", "remove", "0", "remove", "0"]),
+        )
+        .expect("empty the list");
+        let mut drop = line(
+            "drop",
+            drop_cmd(&store, &args(&["todo", "--expect", "3", "--compile-only"]))
+                .expect("compile the drop"),
+        );
+        drop.as_object_mut().unwrap().remove("generation");
+        std::fs::write(&file, drop.to_string()).expect("write");
+        let before = std::fs::read(&store).expect("store");
+        let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+        assert_eq!(err.error, "GenerationRequired", "{}", err.detail);
+        assert_eq!(
+            std::fs::read(&store).expect("store"),
+            before,
+            "store unchanged"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
 }
