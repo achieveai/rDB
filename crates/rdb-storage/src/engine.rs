@@ -2,7 +2,8 @@
 //!
 //! Method names mirror `rdb_sim::storage::memory::MemoryEngine` (`commit`, `sync_wal_through`,
 //! `buffered_applied`, `durable`, `history_at`) so the S1 differential test can wrap both. There
-//! is no shared production trait until M9 brings a second real caller (architecture.md M8 §2).
+//! is no shared production trait until M9 brings a second real caller (the M8 architecture §2,
+//! working notes not in the repository).
 //!
 //! Watermarks, and where each one lives:
 //!
@@ -809,8 +810,9 @@ fn dump_inner(path: &Path) -> Result<Vec<RawRecord>, OpenError> {
     Ok(out)
 }
 
-/// Options pinned in code (architecture.md M8 §2). `create` only for a fresh directory, so an
-/// existing one with a missing column family is refused rather than silently completed.
+/// Options pinned in code (the M8 architecture §2, working notes not in the repository).
+/// `create` only for a fresh directory, so an existing one with a missing column family is
+/// refused rather than silently completed.
 fn db_options(create: bool) -> Options {
     let mut opts = Options::default();
     opts.create_if_missing(create);

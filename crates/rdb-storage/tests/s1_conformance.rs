@@ -823,7 +823,7 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
     );
 }
 
-/// M8 S5 (s5-design §5, the RocksDB row; ADR-rdb-0014 §2, §6, §7). Protects walk steps 4 and 5,
+/// M8 S5, the RocksDB row (ADR-rdb-0014 §2, §6, §7, Verification). Protects walk steps 4 and 5,
 /// and C16: blob B1 and a blob of one full-size chunk, committed through `RocksEngine` as the
 /// batches T1 commits, dropped, reopened, and read back byte-equal. Each request is compiled
 /// against a `MapSnapshot` holding what the earlier commits wrote, so a fault that loses the

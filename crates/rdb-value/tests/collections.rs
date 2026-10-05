@@ -1,4 +1,4 @@
-//! Maps and sets at the library API (ADR-rdb-0013 §7–§13; s3-design §5).
+//! Maps and sets at the library API (ADR-rdb-0013 §7–§13, Verification).
 //!
 //! Scenario: the primary's transaction step compiles map and set ops against a snapshot, and
 //! a damaged store is refused by name, never by a panic.
@@ -361,8 +361,8 @@ fn pc5_too_large_names_the_cap_it_hit() {
 }
 
 // ================================================================================================
-// W3: s3-design §5's rows R1–R13 at the library API. Each test names the walked scenario it
-// protects; the tester's mapping is teams/m8/s3-tester-w2.md, "Material acceptance contracts".
+// Rows R1–R13 at the library API (ADR-rdb-0013 Verification). Each test names the walked
+// scenario it protects; the tester's mapping is in working notes, not in the repository.
 // ================================================================================================
 
 /// Bytes from hex written with spaces, as ADR-rdb-0013's tables write them.

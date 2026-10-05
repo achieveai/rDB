@@ -2841,8 +2841,8 @@ fn every_reply_round_trips_and_nothing_else_decodes() {
 
 // --- manual tester (R1 slice 1): rows for mutations the tests above did not notice ---------
 //
-// Each test below failed on one named mutant and passes on clean code. Evidence:
-// `C:/rdbr1t/evidence/mut/<mutant>.*` and `tester-r1-handoff.md`. Not `m7b_` rows: the
+// Each test below failed on one named mutant and passes on clean code. Evidence: the R1
+// tester's mutant runs and handoff, working notes not in the repository. Not `m7b_` rows: the
 // developer adopts or renames them.
 
 /// Mutants M02a (`>` became `>=`) and M02d (byte check moved after the full decode).

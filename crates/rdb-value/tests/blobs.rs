@@ -1,6 +1,6 @@
-//! M8 S5: large blobs against `MapSnapshot` and a kernel stand-in (s5-design §5, R1–R11; R12 is
-//! RocksDB, in `rdb-storage/tests/s1_conformance.rs`). Each test's doc names the design row and
-//! the walked scenario it protects.
+//! M8 S5: large blobs against `MapSnapshot` and a kernel stand-in (ADR-rdb-0014 Verification;
+//! the RocksDB row is in `rdb-storage/tests/s1_conformance.rs`). Each test's doc names the walked
+//! scenario it protects.
 //!
 //! Independent references (S2 lesson 2):
 //! - every digest asserted here is pinned from Node `crypto` (`0014-blob-vectors.mjs`, rev 2.2)
@@ -388,7 +388,7 @@ fn stored(records: &[(&str, Bytes, u64)]) -> MapSnapshot {
     s
 }
 
-/// R1, vectors both ways. Protects walk steps 1, 4 and 6, and C10 and C17: the compiles write
+/// Vectors both ways. Protects walk steps 1, 4 and 6, and C10 and C17: the compiles write
 /// B1, B2 and B3 byte for byte as the Node script prints them, with exactly the conditions
 /// ADR-rdb-0014 §6 names; and a store holding only those bytes reads back the blobs.
 #[test]
@@ -554,7 +554,7 @@ fn the_node_vectors_are_written_and_read_byte_for_byte() {
     assert_eq!(parsed.root(), zero);
 }
 
-/// R2, the digest differential. Protects walk steps 4, 5 and 7, and C6: the whole-blob digest and
+/// The digest differential. Protects walk steps 4, 5 and 7, and C6: the whole-blob digest and
 /// every chunk digest a publish writes equal values pinned from Node `crypto` and `sha256sum`.
 #[test]
 fn published_digests_equal_the_pinned_sha256_values() {
@@ -616,8 +616,8 @@ fn published_digests_equal_the_pinned_sha256_values() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// R2's property. Protects walk step 5: random blobs cut at random chunk sizes read back
-    /// byte-equal, whole and in a random range.
+    /// The digest differential's property. Protects walk step 5: random blobs cut at random
+    /// chunk sizes read back byte-equal, whole and in a random range.
     #[test]
     fn random_blobs_read_back_byte_equal(
         data in proptest::collection::vec(any::<u8>(), 0..2048),
@@ -639,7 +639,7 @@ proptest! {
     }
 }
 
-/// R3, the idempotent chunk. Protects walk step 6, and C1 and C2: resending a stored chunk with
+/// The idempotent chunk. Protects walk step 6, and C1 and C2: resending a stored chunk with
 /// the same bytes compiles to nothing; other bytes are `ChunkConflict`.
 #[test]
 fn a_resent_chunk_is_nothing_and_other_bytes_conflict() {
@@ -671,7 +671,7 @@ fn with_chunks(root: &RootKey, pieces: &[(u32, &[u8])]) -> MapSnapshot {
     k.snapshot()
 }
 
-/// R4, publish verifies. Protects walk step 4, and C3–C6, C8, C15, C16 and C24: each way an
+/// Publish verifies. Protects walk step 4, and C3–C6, C8, C15, C16 and C24: each way an
 /// upload can disagree with its publish is refused by name, and a refusal is all a caller gets,
 /// so nothing is written.
 #[test]
@@ -797,7 +797,7 @@ fn publish_refuses_every_disagreement_by_name() {
     );
 }
 
-// ---- R5: the protocol model ------------------------------------------------------------------
+// ---- the protocol model ----------------------------------------------------------------------
 
 /// mulberry32, as `0014-blob-vectors.mjs` uses it.
 struct Rng(u32);
@@ -1118,7 +1118,7 @@ fn assert_protocol(seeds: u32, m: &Model) {
     );
 }
 
-/// R5, the protocol model at Node Part 3b's rates (ADR-rdb-0014 §6, §8 and §12): failover
+/// The protocol model at Node Part 3b's rates (ADR-rdb-0014 §6, §8 and §12): failover
 /// p = 0.02 losing 0-3 commits, 4 uploads, lost publish replies p = 0.3, half the retries on the
 /// snapshot taken after their commit; 200 seeds x 400 steps (Node ran 2,000). Protects walk
 /// step 8, and C7, C12, C20, C22 and C26: no published root ever names a missing or different
@@ -1137,10 +1137,11 @@ fn the_protocol_model_never_breaks_a_manifest_or_misanswers_a_retry() {
     );
 }
 
-/// R5 with failovers five times as often, p = 0.1. A request compiled before a failover breaks
-/// a manifest only when a version it names is reused for other bytes after the rollback, so the
-/// generation fence (admission check 5, applied first by the stand-in) needs frequent failovers
-/// to be reached at this seed count. Protects walk step 8, and C25 with a real failover.
+/// The protocol model with failovers five times as often, p = 0.1. A request compiled before a
+/// failover breaks a manifest only when a version it names is reused for other bytes after the
+/// rollback, so the generation fence (admission check 5, applied first by the stand-in) needs
+/// frequent failovers to be reached at this seed count. Protects walk step 8, and C25 with a
+/// real failover.
 #[test]
 fn under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole() {
     assert_protocol(
@@ -1154,7 +1155,7 @@ fn under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole() {
     );
 }
 
-// ---- R6: GC against a model ------------------------------------------------------------------
+// ---- GC against a model ----------------------------------------------------------------------
 
 /// What GC must delete, from ADR-rdb-0014 §8 alone: every chunk that the root does not name and
 /// that is at a version ≤ `floor`, in key order, as the longest prefix of at most
@@ -1255,7 +1256,7 @@ fn gc_world(rng: &mut Rng) -> GcWorld {
     }
 }
 
-/// R6, GC against a model. Protects walk steps 7 and 9, and C13, C14, C21 and C23: each batch is
+/// GC against a model. Protects walk steps 7 and 9, and C13, C14, C21 and C23: each batch is
 /// exactly the model's, guarded by the root as read; repeating GC to the end deletes every
 /// unreachable chunk at or below the floor and nothing else; every batch fits the record cap.
 #[test]
@@ -1321,7 +1322,7 @@ fn gc_deletes_exactly_what_the_model_says_within_both_bounds() {
 
 const GC_SEEDS: u32 = 100;
 
-/// R6's fixed points. C13: the floor. C14: the count bound, 255 then 45 then nothing. C23: the
+/// GC's fixed points. C13: the floor. C14: the count bound, 255 then 45 then nothing. C23: the
 /// byte bound under a 5,000-byte id, 207 then 48 then nothing (Node Part 2). C21: chunks under a
 /// map root.
 #[test]
@@ -1395,7 +1396,7 @@ fn gc_batches_match_the_walked_counts() {
     assert_eq!(k.records.len(), 1);
 }
 
-/// R6's fixed case, G1/G2 neighbour after the chunk range. `photp` sorts right after every chunk
+/// GC's fixed case, G1/G2 neighbour after the chunk range. `photp` sorts right after every chunk
 /// key of `photo`, so GC's scan reaches it and must stop at the end of `photo`'s chunk prefix.
 /// G1: the neighbour holds a rootless chunk, which is not `photo`'s garbage. G2: the neighbour is
 /// a published blob, whose root key would read as a chunk tail of length 0. In both, GC of
@@ -1494,9 +1495,9 @@ fn a_stale_delete_never_removes_a_newer_blob() {
     assert_eq!(read_all(&k, &root), Ok(None));
 }
 
-// ---- R7: crash at every boundary -------------------------------------------------------------
+// ---- crash at every boundary -----------------------------------------------------------------
 
-/// R7, crash at every boundary. Protects walk step 6 and C20: after a crash at any commit of an
+/// Crash at every boundary. Protects walk step 6 and C20: after a crash at any commit of an
 /// upload, a replace or a GC, a reader sees the object absent, old or new, wholly; a retry from
 /// there, including after the publish committed and its reply was lost, answers success and ends
 /// byte-identical to a run with no crash. A publish sent from a prefix that lacks a chunk is
@@ -1574,7 +1575,7 @@ fn a_crash_at_any_commit_reads_whole_and_a_retry_ends_identical() {
     }
 }
 
-// ---- R8: range reads -------------------------------------------------------------------------
+// ---- range reads -----------------------------------------------------------------------------
 
 /// A snapshot that records which chunk indices were read.
 struct Counting<'a> {
@@ -1624,7 +1625,7 @@ fn counted(
     (got, c.chunks_read.into_inner().into_iter().collect())
 }
 
-/// R8, range reads. Protects walk step 5, and C11 and C24: every range equals the slice of the
+/// Range reads. Protects walk step 5, and C11 and C24: every range equals the slice of the
 /// input, reads only the chunks it intersects, and an offset near `u64::MAX` is `RangeInvalid`.
 #[test]
 fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
@@ -1686,7 +1687,7 @@ fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
     }
 }
 
-// ---- R9: damage ------------------------------------------------------------------------------
+// ---- damage ----------------------------------------------------------------------------------
 
 /// B1 stored from the Node bytes, with one record replaced (or removed for `None`), plus a
 /// garbage chunk of another upload at version 1 that GC would delete.
@@ -1726,7 +1727,7 @@ fn flipped(record: Bytes, at: usize) -> Bytes {
     Bytes::from(b)
 }
 
-/// R9, damage. Protects walk step 10, and C18 and C19: each `Corrupt` cause is named, a read that
+/// Damage. Protects walk step 10, and C18 and C19: each `Corrupt` cause is named, a read that
 /// touches the damage returns no bytes, and GC refuses under a root it cannot read or a chunk key
 /// it cannot parse, so nothing is deleted.
 #[test]
@@ -1969,9 +1970,9 @@ fn every_manifest_shape_fault_is_named() {
     }
 }
 
-// ---- R10: limits -----------------------------------------------------------------------------
+// ---- limits ----------------------------------------------------------------------------------
 
-/// R10, limits. Protects C15 and C16: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
+/// Limits. Protects C15 and C16: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
 /// is `TooLarge`; index 254 is accepted and 255 is `TooManyChunks`; a full chunk under a 3,745-byte
 /// id compiles and fits the record by `record_len`, and under 3,746 it is `TooLarge` (Node Part 2).
 #[test]
@@ -2015,9 +2016,9 @@ fn chunk_limits_sit_exactly_at_the_format_constants() {
     assert!(put_chunk(&s, &long(3746), &U1, 0, &full[1..]).is_ok());
 }
 
-// ---- R11: kind checks ------------------------------------------------------------------------
+// ---- kind checks -----------------------------------------------------------------------------
 
-/// R11, `KindMismatch` both ways. Protects C9: a blob operation on a document or a map names the
+/// `KindMismatch` both ways. Protects C9: a blob operation on a document or a map names the
 /// kind it found, and a document or map operation on a blob names `Blob`.
 #[test]
 fn blob_and_non_blob_operations_refuse_each_others_objects() {

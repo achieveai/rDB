@@ -2,8 +2,8 @@
 //! chain (ADR-rdb-0010).
 //!
 //! Each test names the hand-walked scenario or defect it protects: `#N` is row N of the S1
-//! design's scenario table (teams/m8/s1-design.md), `S1-T<n>` a defect on the shared list
-//! (teams/m8/s1-defects.md). The rows that need a delete batch (#11, #13, #14) live in the
+//! design's scenario table, `S1-T<n>` a defect on the S1 defect list; both are working notes,
+//! not in the repository. The rows that need a delete batch (#11, #13, #14) live in the
 //! `rocks_scenario` example's tests, beside the delete builder they share.
 //!
 //! Data goes under `RETCD_TEST_DATA_DIR` (set by `scripts/gate.sh`), else Cargo's per-target tmp

@@ -5,7 +5,8 @@
 //! recovered scenario gets them. Without the flusher, the copy R1 walks up after the barrier
 //! reports durable 0 for ever, `barrier_durable()` stays false and L1 never resumes. Without the
 //! grant, A1 never reads back the lineage F1's activation CAS wrote, so every node keeps the
-//! zero triple and T1 has no generation to seed from (`inv-publish-path.md`, breaks 1 and 2).
+//! zero triple and T1 has no generation to seed from (breaks 1 and 2 of the verification team's
+//! publish-path investigation, working notes not in the repository).
 //!
 //! **Owner:** verification (dev-sim-publish, lead ledger L-R177gf). Both rows drive one authored
 //! recovered scenario through the real lowering and runner, and read the trace; the one read of

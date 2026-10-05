@@ -1,4 +1,4 @@
-//! Hand entry point for M8 S2 and S3 (s2-design §3, s3-design §3): documents, maps and sets in a
+//! Hand entry point for M8 S2 and S3 (ADR-rdb-0012, ADR-rdb-0013): documents, maps and sets in a
 //! file-backed store.
 //!
 //! ```text
@@ -111,7 +111,7 @@ mod blob;
 #[path = "doc_scenario/coll.rs"]
 mod coll;
 
-/// The one scope this tool writes in (s3-design §2), so keys match ADR-rdb-0013 §6's example.
+/// The one scope this tool writes in, so keys match ADR-rdb-0013 §6's example.
 const TENANT: TenantId = TenantId(1);
 /// See [`TENANT`].
 const AFFINITY: AffinityId = AffinityId(1);
@@ -1836,7 +1836,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 
-    /// Tester paper cut (s3-tester-w1.md): `ObjectAbsent` said "the document does not exist"
+    /// S3 tester paper cut: `ObjectAbsent` said "the document does not exist"
     /// for a map or a set too.
     #[test]
     fn pc1_object_absent_on_a_map_does_not_call_it_a_document() {
@@ -1853,7 +1853,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 
-    /// Tester paper cut (s3-tester-w1.md): a refused create printed the root it never wrote,
+    /// S3 tester paper cut: a refused create printed the root it never wrote,
     /// e.g. `map tags --absent` on the set `tags` showed `kind: Map, count: 0` beside
     /// `ConditionFailed`. A refusal prints no `kind` or `count`; a commit still does.
     #[test]

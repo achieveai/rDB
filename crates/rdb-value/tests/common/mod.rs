@@ -231,7 +231,7 @@ impl Walk<'_> {
 // ------------------------------------------------------------------------------------------------
 // The second reader: `ciborium` decodes the bytes on its own, and a converter written here turns
 // its value into ours. Run on accepted bytes only: it also accepts duplicate keys, bignums and
-// deep nesting, so it cannot judge a refusal row (s2-design §5, R2-A2).
+// deep nesting, so it cannot judge a refusal row (the S2 critic's R2-A2, ADR-rdb-0012).
 // ------------------------------------------------------------------------------------------------
 
 /// What `ciborium` reads from `bytes`, as our `Value`. Panics when it reads something else, or

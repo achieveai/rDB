@@ -128,7 +128,8 @@ Each edit is marked in place with its ruling.
 - 1.2.3 published 2026-09-07; crate sha256 `a0948fe1a10668d439d5fd476904223ab08a6783945d451fb996728e952ebcc7`
   (crates.io API, and recomputed from the downloaded `.crate`). The 1.2.2→1.2.3 diff touches only
   `src/serde/de.rs`, which is off here, so the decoder we use is 1.2.2's (about 1.65M downloads)
-  (critic probe, `s2-critic.md` A3). The README says the decoder is fuzz-tested.
+  (the S2 critic's probe A3, working notes not in the repository). The README says the decoder
+  is fuzz-tested.
 - Used for: decoding to its `Value` (keeps duplicate keys and the full integer range), and writing
   shortest heads. Its `Value::Float` is f64 only: f32 input widens to f64, and the re-encode compare
   then refuses it. The profile rules, key order and every named check are ours.

@@ -9,7 +9,7 @@ description = "rDB storage adapter (M8): the M1 storage seam on a real RocksDB e
 rdb-core = { workspace = true }
 # The workspace pin, no new features, so `librocksdb-sys` is shared with `config-storage`
 # (LIBCLANG_PATH, ADR-0017). This crate must not depend on `config-storage`: it would pull in
-# openraft (architecture.md M8 §2).
+# openraft (the M8 architecture §2, working notes not in the repository).
 rocksdb = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }

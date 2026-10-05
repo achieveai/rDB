@@ -5,8 +5,8 @@
 //!    digest-chained prefix, and a chain that does not link is caught.
 //! 3. Lineages `(partition, generation)` do not see each other's records.
 //!
-//! Each test names the hand-walked scenario it protects: `#N` is row N of tester-m8's scenario
-//! table (teams/m8/tester-handoff.md).
+//! Each test names the hand-walked scenario it protects: `#N` is row N of the M8 tester's
+//! scenario table, in working notes not in the repository.
 //!
 //! Data goes under `RETCD_TEST_DATA_DIR` (set by `scripts/gate.sh`), else Cargo's per-target tmp
 //! dir; never `%TEMP%`.

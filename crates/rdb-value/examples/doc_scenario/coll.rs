@@ -1,4 +1,4 @@
-//! `doc_scenario`'s map and set commands (s3-design §3). A separate file for size only: it
+//! `doc_scenario`'s map and set commands (ADR-rdb-0013). A separate file for size only: it
 //! shares the store, `apply` and the output of `doc_scenario.rs`.
 
 use std::path::Path as FsPath;
@@ -36,7 +36,7 @@ pub fn write_cmd(
     let compiled = compile_collection(&store.snapshot, &root, kind, body.expected, &body.ops)
         .map_err(|e| Failure::from(e).with(fields.clone()))?;
     // The root's kind and count are printed only once it is written or compile-only: a
-    // refused commit wrote no root to describe (tester paper cut, s3-tester-w1.md).
+    // refused commit wrote no root to describe (an S3 tester paper cut).
     let after = root_after(&compiled, &root)?;
     let at = fields.len();
     let mut out = emit(&mut store, &compiled, body.compile_only, fields)?;
