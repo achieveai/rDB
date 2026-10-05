@@ -130,4 +130,5 @@ Gautam's requirement (L-R182pp), in his words:
 - Spec §4.3–§4.3.4, §5.2, D14; `docs/rdb/value-layer-decision-review.md` "Merge boundary".
 - ADR-rdb-0002 decisions 1–3, 5–7; ADR-rdb-0010; rEtcd ADR-0004 (purity), ADR-0017 (RocksDB build).
 - `crates/rdb-core/src/contracts/txn.rs` `Mutation`; `crates/rdb-core/src/contracts/storage.rs` `SnapshotRead`.
-- `teams/m8/adr-review.md` B1–B4; `teams/m8/architecture.md` §2, §4; ledger L-R182g, -k, -pp.
+- The M8 ADR review (B1–B4) and the M8 architecture notes (§2, §4), working notes not in the
+  repository; ledger L-R182g, -k, -pp.

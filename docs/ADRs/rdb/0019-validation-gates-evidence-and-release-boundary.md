@@ -290,7 +290,7 @@ M8–M13: pending. Each milestone adds its rows and amends its table row in plac
 - `docs/rdb/implementation-spikes.md` §6, §7 — test architecture, budgets, coverage rules
 - rEtcd `docs/ADRs/0031-evidence-and-known-gaps.md` — the evidence schema this ADR reuses
 - rEtcd `docs/testing/test-plan-m6.md` §7 — the evidence-row pattern
-- `teams/verification/design.md` (working notes) — oracle, scenarios, reducer, campaign
+- The verification design (working notes, not in the repository) — oracle, scenarios, reducer, campaign
 
 ## Notes
 

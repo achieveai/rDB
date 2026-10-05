@@ -6,7 +6,7 @@
 - L-R186s Q5 (Gautam): the envelope digest covers the header (decision 7).
 - L-R186v: the record-size bound is the whole replicated record (decision 9, and the W4 note below).
 
-Draft rev 2.4 by architect-m8-s3. It closes:
+Draft rev 2.4. It closes:
 - the S3 critic's F1–F4 and A1–A6;
 - the round-2 advisories N1 and N2 (decision 11);
 - tester W1 items A4 and A5 (decisions 9, 10, 13);
@@ -80,8 +80,8 @@ item "For S3" (`version = seq` against "increments exactly once").
 **Does not amend:** ADR-rdb-0004 §2 (scope prefix), ADR-rdb-0010 decision 1 (physical prefix). No
 `rdb-core` contract change.
 **Basis:** `main` fe50411.
-**Amended by:** ADR-rdb-0014, 2026-10-05: decision 3 (row `0x04`) and decision 11 (the damaged-object
-table). Each edit is marked in place with its ruling.
+**Amended by:** ADR-rdb-0014, 2026-10-05: decision 3 (row `0x04`), decision 11 (the damaged-object
+table) and O3 (closed). Each edit is marked in place with its ruling.
 
 ## Context
 
@@ -691,7 +691,9 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
 - **O1 Length limits** for object ids and element keys. No spec number exists. M9 sets one with its
   request limits. Adding a limit later refuses only new writes.
 - **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`.
-- **O3 Chunk placement and tail** (S5): ADR-rdb-0014 decides, within decision 6.
+- **O3 Chunk placement and tail** (S5). **Closed** 2026-10-05 by ADR-rdb-0014 decision 1 (Gautam,
+  L-R186x Q4), within decision 6: chunks sit under sub byte `0x04` of their object, with the tail
+  `upload_id` (16 bytes), then `index` u32 BE, fixed width, 20 bytes (decision 3, row `0x04`).
 - **O4 Value-digest and element-id preconditions:** spec §4.3.2 says callers "may additionally
   require" them. They belong to the M9 API.
 - **O5 A request that writes one key twice. Closed** by check 10 (spec §4.2, L-R186f).

@@ -1,7 +1,7 @@
 # ADR-rdb-0012: Document encoding — the deterministic CBOR profile, the object envelope and path operations
 
 **Status:** Accepted. Approved by Gautam, 2026-10-03 (ledger L-R184y); built and tested in M8 S2.
-Draft rev 3 by architect-m8-s2 (closes `teams/m8/s2-critic.md` F1–F6, A1–A6, R2-A2..A4). Rulings
+Draft rev 3 (closes the S2 critic's F1–F6, A1–A6, R2-A2..A4, in working notes not in the repository). Rulings
 made while building it are folded in where they apply: the document root (§2, L-R185m Q1), float
 input (§3, L-R185q), the error names and the corrupt-record gap (§12, L-R185m A2, L-R185o), the
 `$` output rule (§14, L-R185o A3), refusal classes (Verification, L-R185m A1) and memory
@@ -16,7 +16,7 @@ codec/version, object version, logical/encoded length, digest algorithm, digest 
 Also §4.3.2's link to `evidence/document-encoding-decision.md`, and §4.3.1's inline value limit. See decisions 1 and 8. Closes ADR-rdb-0011
 O1 and O2. Changes nothing in `rdb-core`.
 **Amended by:** ADR-rdb-0013, 2026-10-04: §7 (`digest_alg` and `kind` rows, the freeze), §8, §9, §11, §12,
-§13, Scenarios and Consequences. ADR-rdb-0014, 2026-10-05: §7 (`codec_version` row).
+§13, Scenarios and Consequences. ADR-rdb-0014, 2026-10-05: §7 (`kind` and `codec_version` rows).
 Each edit is marked in place with its ruling.
 **Basis:** `main` 960db34.
 
@@ -149,7 +149,7 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
 | Offset | Size | Field | v1 value |
 |---|---|---|---|
 | 0 | 1 | `envelope_format` | `0x01` |
-| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt. Other values reserved for later kinds; the table lives in `envelope.rs` |
+| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt. `0x06` onward is unallocated and reserved for later kinds; S4 (lists) takes the next one. The table lives in `envelope.rs` |
 | 2 | 1 | `codec_version` | `0x01`, read per `kind`: for kinds `0x01`–`0x04` it is `rdb-cbor-document` v1; for kind `0x05` (blob chunk) the payload is stored as given. The byte stays `0x01`, so `open` is unchanged (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2) |
 | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of header bytes 0..8, then the payload (amended 2026-10-04, L-R186s; ADR-rdb-0013 decision 7) |
 | 4 | 4 | `payload_len` | u32 BE; must equal the remaining bytes. For a document this **is** the logical length |
@@ -396,7 +396,7 @@ Found while drafting, and completed by the critic (F1, by reading; not executed)
   leaves room for the one `Dedup` write, so a record holds at most 256 writes. The primary also refuses
   an envelope over 1 MiB **before writing**, with `InvalidArgument`. Replicas are unchanged: `validate`
   still counts every write against 256. Spec §4.2 now says 255.
-- Built by stream K (`dev-kernel-cap`, `teams/k-cap/dev-handoff.md`) in `rdb-core` and spec §4.2. It
+- Built by stream K in `rdb-core` and spec §4.2. It
   changes no contract type, because `RdbError::InvalidArgument` already exists. S2 is stacked on it
   (merge order: stream K, PR #22, first; L-R185x), and the effective document limit above depends on
   its refusal.
@@ -491,4 +491,4 @@ does not count them; count them with `cargo test -p rdb-value`.
 - crates.io API and the published `.crate` sources, fetched 2026-10-03: cbor4ii 1.2.2/1.2.3, minicbor 2.3.0,
   ciborium 0.2.2, dcbor 0.25.2, serde_cbor 0.11.2.
 - ADR-rdb-0002 decisions 3, 5, 6, 7; ADR-rdb-0010; ADR-rdb-0011; rEtcd ADR-0002 and ADR-0003 (exact-pin precedent).
-- `teams/m8/s2-critic.md`; `teams/m8/s2-design.md`; `teams/m8/s2-decision-onepager.md`.
+- The S2 critic's review, the S2 design and the S2 decision summary: working notes, not in the repository.
