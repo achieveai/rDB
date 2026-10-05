@@ -64,8 +64,8 @@
 //! The store is one JSON line `{"seq":N,"envelope":2}`, then one line per record
 //! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store
 //! with no marker or a lower one was sealed before ruling L-R186s, and one with a higher marker
-//! was written by a newer build. Both are refused, exit 3, as is a store
-//! from S2 (with `key` instead of `key_hex`). `seq` stands in for the kernel's
+//! was written by a newer build; any other marker is unrecognised. All are refused, exit 3, as
+//! is a store from S2 (with `key` instead of `key_hex`). `seq` stands in for the kernel's
 //! transaction sequence: each commit takes the next one and stamps it as the version of every
 //! record it writes. `apply` checks the condition, then each write's `expected_version`, the way
 //! the kernel's `first_failed_condition` does, and refuses with the kernel's name,
@@ -929,10 +929,10 @@ impl Store {
             None => format!("no \"envelope\" marker; this build reads {STORE_ENVELOPE}"),
             Some(found) => format!("\"envelope\":{found}; this build reads {STORE_ENVELOPE}"),
         };
-        match head["envelope"].as_u64() {
-            Some(STORE_ENVELOPE) => {}
+        match head.get("envelope").map(serde_json::Value::as_u64) {
+            Some(Some(STORE_ENVELOPE)) => {}
             // Tester W2 PC6: a higher marker is not an old store.
-            Some(newer) if newer > STORE_ENVELOPE => {
+            Some(Some(newer)) if newer > STORE_ENVELOPE => {
                 return Err(bad(
                     n,
                     &format!(
@@ -941,7 +941,18 @@ impl Store {
                     ),
                 ));
             }
-            _ => {
+            // Tester PC8: a marker that is no whole number this build can compare says nothing
+            // about the store's age.
+            Some(None) => {
+                return Err(bad(
+                    n,
+                    &format!(
+                        "an unrecognised store marker ({marker}); start a new store with this \
+                         build"
+                    ),
+                ));
+            }
+            None | Some(Some(_)) => {
                 return Err(bad(
                     n,
                     &format!(
@@ -1821,11 +1832,6 @@ mod tests {
                 "(\"envelope\":1; this build reads 2)",
             ),
             (
-                "{\"seq\":1,\"envelope\":\"x\"}",
-                true,
-                "(\"envelope\":\"x\"; this build reads 2)",
-            ),
-            (
                 "{\"seq\":1,\"envelope\":3}",
                 false,
                 "(\"envelope\":3; this build reads 2)",
@@ -1849,6 +1855,58 @@ mod tests {
                 err.detail
             );
             assert!(err.detail.contains(says), "{head}: {}", err.detail);
+        }
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Tester PC8: a marker that is there but is not a whole number this build can compare
+    /// (`1e20`, a string, a negative or a fraction) was told it came "from before ruling
+    /// L-R186s". Nothing says it is older, so it is quoted as unrecognised. Still exit 3. (PC6
+    /// held `"x"` as older; this row replaces it.)
+    #[test]
+    fn pc8_an_unrecognised_marker_is_not_called_old() {
+        let dir = scratch("pc8");
+        let store = dir.join("s.jsonl");
+        coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["cart", "--absent", "put", "\"banana\"", "5"]),
+        )
+        .expect("a new store");
+        let text = std::fs::read_to_string(&store).expect("store");
+        let (_, records) = text.split_once('\n').expect("a head line");
+        for marker in [
+            "1e20",
+            "18446744073709551616",
+            "-1",
+            "2.5",
+            "2.0",
+            "\"x\"",
+            "\"2\"",
+            "null",
+            "true",
+            "{}",
+        ] {
+            let head = format!("{{\"seq\":1,\"envelope\":{marker}}}");
+            std::fs::write(&store, format!("{head}\n{records}")).expect("head");
+            let Err(err) = Store::load(&store) else {
+                panic!("{head} loaded");
+            };
+            assert_eq!((err.exit, err.error.as_str()), (3, "Store"), "{head}");
+            assert!(!err.detail.contains("L-R186s"), "{head}: {}", err.detail);
+            assert!(
+                !err.detail.contains("newer build"),
+                "{head}: {}",
+                err.detail
+            );
+            assert!(
+                err.detail.contains("unrecognised store marker"),
+                "{head}: {}",
+                err.detail
+            );
+            let found: serde_json::Value = serde_json::from_str(marker).expect("json");
+            let quoted = format!("(\"envelope\":{found}; this build reads 2)");
+            assert!(err.detail.contains(&quoted), "{head}: {}", err.detail);
         }
         std::fs::remove_dir_all(&dir).expect("clean");
     }
