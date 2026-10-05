@@ -12,7 +12,7 @@ Normative denominator: configured primary execution cores, each with exactly one
 
 Workload Q1: 4 keys ×1 KiB values/transaction; 70% update transactions and 30% reads; >=10 partitions/core; 10–50 GB live bytes/partition; dataset larger than configured cache. Mix hot/uniform affinity distributions and record amplification, compression and cache hit rates.
 
-Value workloads: Q2 mixes 4–256 KiB whole documents with single-path updates; Q3 uses 100k-entry maps, sets and lists with point/range reads and one-entry/page mutations; Q4 uploads and replaces 1–256 MiB blobs using 1 MiB chunks; Q5 compares materialized Put, explicit mutation-log materialization and each enabled RocksDB Merge family at controlled operand-chain lengths.
+Value workloads: Q2 mixes 4–256 KiB whole documents with single-path updates; Q3 uses 100k-entry maps, sets and lists with point/range reads and one-entry/page mutations; Q4 uploads and replaces 1–254 MiB blobs using chunks of at most 1,044,480 bytes, at most 255 per blob (L-R186x; [ADR-rdb-0014](../ADRs/rdb/0014-large-blobs-chunks-manifest-gc.md) decision 4); Q5 compares materialized Put, explicit mutation-log materialization and each enabled RocksDB Merge family at controlled operand-chain lengths.
 
 Each result must report offered/achieved tx/sec, p50/p95/p99/max latency, errors, admission stalls, replica traffic, flush latency and process CPU/RAM/disk. Prevent coordinated omission in the workload generator; include failed and queued requests in separate histograms rather than reporting only fast successes.
 

@@ -113,6 +113,41 @@ pub enum Corrupt {
         /// The root's count.
         count: u64,
     },
+    /// A blob root's payload is not a v1 manifest (ADR-rdb-0014 §2, "strict reading").
+    #[error("blob manifest: {0}")]
+    Manifest(ManifestError),
+    /// A chunk record does not open (ADR-rdb-0014 §6 check 3, §7).
+    #[error("chunk {index}: {error}")]
+    Chunk {
+        /// The chunk's index.
+        index: u32,
+        /// Why it does not open.
+        error: EnvelopeError,
+    },
+    /// A published manifest names a chunk that is not stored (ADR-rdb-0014 §7).
+    #[error("the manifest names chunk {index}, which is not stored")]
+    ChunkMissing {
+        /// The missing index.
+        index: u32,
+    },
+    /// A stored chunk is not the one the manifest names: another kind of record, or another
+    /// length or digest (ADR-rdb-0014 §7).
+    #[error("chunk {index} is not the chunk the manifest names")]
+    ChunkMismatch {
+        /// The chunk's index.
+        index: u32,
+    },
+}
+
+/// Why a blob root's payload is not a v1 manifest (ADR-rdb-0014 §2).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManifestError {
+    /// The payload is not canonical CBOR.
+    #[error("{0}")]
+    Codec(CodecError),
+    /// The payload decodes but is not exactly the five fields, with their types and limits.
+    #[error("{0}")]
+    Shape(&'static str),
 }
 
 /// Why a read or a compile is refused.

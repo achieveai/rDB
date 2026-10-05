@@ -170,7 +170,9 @@ fn l_r186s_a_flipped_kind_or_codec_is_a_digest_mismatch() {
 fn l_r186s_a_newer_builds_record_reads_as_unknown_never_as_damage() {
     use EnvelopeError::*;
     let payload = h("a0");
-    assert_eq!(open(&hashed(0x04, 0x01, &payload)), Err(UnknownKind(0x04)));
+    // 0x06 is the first kind no S5 build knows. It must move when S4 (lists) takes envelope kind
+    // 0x06 or later (S5 design section 6); otherwise this row asserts a known kind is unknown.
+    assert_eq!(open(&hashed(0x06, 0x01, &payload)), Err(UnknownKind(0x06)));
     assert_eq!(open(&hashed(0x7f, 0x01, &payload)), Err(UnknownKind(0x7f)));
     assert_eq!(open(&hashed(0x00, 0x01, &payload)), Err(UnknownKind(0x00)));
     assert_eq!(open(&hashed(0xff, 0x01, &payload)), Err(UnknownKind(0xff)));

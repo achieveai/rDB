@@ -11,7 +11,8 @@ use crate::envelope::{Kind, LIMIT_TEXT};
 use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
 
-/// Which size limit an [`ApplyError::TooLarge`] hit. Two since L-R186z (tester W2 PC5).
+/// Which size limit an [`ApplyError::TooLarge`] hit. Two since L-R186z (tester W2 PC5), and a
+/// third for blob chunks (ADR-rdb-0014 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeLimit {
     /// One value's envelope: [`LIMIT_TEXT`].
@@ -19,6 +20,8 @@ pub enum SizeLimit {
     /// The whole write: the record the kernel ships, every key and value plus its framing,
     /// against `rdb_core::replication::append::MAX_ENVELOPE_BYTES`.
     Write,
+    /// One blob chunk's bytes, against [`crate::blob::MAX_CHUNK`] (ADR-rdb-0014 §4).
+    Chunk,
 }
 
 // `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
@@ -31,6 +34,11 @@ impl fmt::Display for SizeLimit {
             Self::Write => write!(
                 f,
                 "1 MiB limit for the whole write (every key and value, plus the record's framing)"
+            ),
+            Self::Chunk => write!(
+                f,
+                "{}-byte limit for one blob chunk",
+                crate::blob::MAX_CHUNK
             ),
         }
     }
@@ -154,6 +162,55 @@ pub enum ApplyError {
     TooManyWrites {
         /// The writes the delta would make.
         writes: usize,
+    },
+    /// A chunk is already stored at this index with different bytes (`UPLOAD_CHUNK_CONFLICT`,
+    /// ADR-rdb-0014 §5).
+    #[error("chunk {index} is already stored with different bytes")]
+    ChunkConflict {
+        /// The chunk's index.
+        index: u32,
+    },
+    /// Publish: the upload has no chunk at this index (ADR-rdb-0014 §6 check 3).
+    #[error("the upload has no chunk {index}")]
+    ChunkMissing {
+        /// The missing index.
+        index: u32,
+    },
+    /// Publish: a chunk's length is not what `size` and `chunk_size` make it
+    /// (ADR-rdb-0014 §6 check 3).
+    #[error("chunk {index} holds {found} bytes; size and chunk_size make it {expected}")]
+    ChunkLength {
+        /// The chunk's index.
+        index: u32,
+        /// The length `size` and `chunk_size` give.
+        expected: u64,
+        /// The length stored.
+        found: u64,
+    },
+    /// Publish: the upload has a chunk past the last one `size` names (ADR-rdb-0014 §6 check 4).
+    #[error("the upload has chunk {index}, past the last one size names")]
+    ExtraChunk {
+        /// The first index past the end.
+        index: u32,
+    },
+    /// Publish: the chunks do not hash to the `sha256` given (ADR-rdb-0014 §6 check 5).
+    #[error("the chunks do not hash to the sha256 given")]
+    BlobDigestMismatch,
+    /// A chunk index, or the chunk count `size` and `chunk_size` make, is over the blob format's
+    /// limit (ADR-rdb-0014 §4).
+    #[error("more chunks than a blob holds")]
+    TooManyChunks,
+    /// A range read past the blob's end (ADR-rdb-0014 §7).
+    #[error("the range is not inside the blob's {size} bytes")]
+    RangeInvalid {
+        /// The blob's size.
+        size: u64,
+    },
+    /// `chunk_size` is outside `1 … MAX_CHUNK` (ADR-rdb-0014 §6 check 1).
+    #[error("chunk_size {found} is outside 1 … the blob format's largest chunk")]
+    InvalidChunkSize {
+        /// The `chunk_size` given.
+        found: u64,
     },
 }
 

@@ -28,8 +28,8 @@ use rdb_value::collection::{
 };
 use rdb_value::envelope::{seal, EnvelopeError, Kind};
 use rdb_value::keys::{
-    decode_element, decode_element_key, element_key, encode_element, esc, parse, root_key,
-    KeyError, Parsed, RootKey, Sub,
+    chunk_key, decode_element, decode_element_key, element_key, encode_element, esc, parse,
+    root_key, KeyError, Parsed, RootKey, Sub,
 };
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Decimal, Int, Map, MapKey, Value};
@@ -867,6 +867,10 @@ fn names_exactly(key: &[u8], parsed: &Parsed) -> bool {
             let element = parsed.element.as_ref().expect("an element is decoded");
             element_key(&parsed.root(), element).unwrap()[..] == *key
         }
+        Sub::Chunk => {
+            let (upload, index) = parsed.chunk.expect("a chunk tail is decoded");
+            chunk_key(&parsed.root(), &upload, index)[..] == *key
+        }
         Sub::Reserved(sub) => {
             let mut head = parsed.root().object_prefix().to_vec();
             head.push(sub);
@@ -960,14 +964,14 @@ fn r5_each_damaged_key_is_refused_by_name() {
     for (hex, fault) in whole {
         assert_eq!(parse(&spaced(&hex)), Err(fault), "{hex}");
     }
-    let reserved = parse(&spaced(&format!("{SCOPE} 61 0001 04 ffff"))).unwrap();
+    let reserved = parse(&spaced(&format!("{SCOPE} 61 0001 02 ffff"))).unwrap();
     assert_eq!(
         (
             reserved.object_id.as_slice(),
             reserved.sub,
             reserved.element
         ),
-        (&b"a"[..], Sub::Reserved(0x04), None)
+        (&b"a"[..], Sub::Reserved(0x02), None)
     );
 
     let root = cart();

@@ -9,6 +9,7 @@
 //! - [`compile()`]: snapshot → after-image `Put` + its precondition. [`read`]: snapshot → document.
 //! - [`keys`]: the object-key layout and [`keys::RootKey`] (ADR-rdb-0013 §1–§6).
 //! - [`collection`]: maps and sets, a root record plus one record per element (ADR-rdb-0013 §7–§13).
+//! - [`blob`]: large blobs, chunk records and one manifest root (ADR-rdb-0014).
 //! - [`testing::MapSnapshot`]: an in-memory `SnapshotRead`.
 //!
 //! Pure (ADR-rdb-0011): no clock, no I/O, no logging. Every outcome is a returned value.
@@ -17,6 +18,7 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod blob;
 pub mod cbor;
 pub mod collection;
 mod compile;
@@ -27,4 +29,6 @@ pub mod path;
 pub mod testing;
 pub mod value;
 
-pub use compile::{compile, read, Compiled, Corrupt, Document, Expected, ValueError};
+pub use compile::{
+    compile, read, Compiled, Corrupt, Document, Expected, ManifestError, ValueError,
+};
