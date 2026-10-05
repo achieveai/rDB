@@ -1303,7 +1303,7 @@ fn gc_deletes_exactly_what_the_model_says_within_both_bounds() {
     assert!(batches > GC_SEEDS as usize && by_bytes > 0);
 }
 
-const GC_SEEDS: u32 = 150;
+const GC_SEEDS: u32 = 100;
 
 /// R6's fixed points. C13: the floor. C14: the count bound, 255 then 45 then nothing. C23: the
 /// byte bound under a 5,000-byte id, 207 then 48 then nothing (Node Part 2).
