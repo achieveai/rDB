@@ -156,7 +156,7 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
 | 40 | n | payload | canonical CBOR |
 
 - The `kind` table is the envelope's own table. It is **not** ADR-rdb-0011 O4's object sub-key
-  discriminator. That one belongs to ADR-rdb-0013 (decision 13).
+  discriminator. That one belongs to ADR-rdb-0013 (decision 3).
 - **Fail closed, two different reasons.** Both are refused with a named error and never guessed
   (V12: unknown mandatory versions refused). They are not the same thing (§12):
   - **Written by a newer build:** an unknown `envelope_format`, a reserved `kind`, or an unknown `codec_version` or
