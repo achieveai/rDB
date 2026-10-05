@@ -946,13 +946,15 @@ impl Store {
                 ));
             }
             // Tester PC8: a marker that is no whole number this build can compare says nothing
-            // about the store's age.
+            // about the store's age. Tester PC9: its value is not quoted, because `Value` would
+            // print it rewritten (`1e20` as `1e+20`), not as the file holds it.
             Some(None) => {
                 return Err(bad(
                     n,
                     &format!(
-                        "an unrecognised store marker ({marker}); start a new store with this \
-                         build"
+                        "an unrecognised store marker (\"envelope\" is not a whole number this \
+                         build can compare; this build reads {STORE_ENVELOPE}); start a new store \
+                         with this build"
                     ),
                 ));
             }
@@ -1866,7 +1868,7 @@ mod tests {
 
     /// Tester PC8: a marker that is there but is not a whole number this build can compare
     /// (`1e20`, a string, a negative or a fraction) was told it came "from before ruling
-    /// L-R186s". Nothing says it is older, so it is quoted as unrecognised. Still exit 3. (PC6
+    /// L-R186s". Nothing says it is older, so it is called unrecognised. Still exit 3. (PC6
     /// held `"x"` as older; this row replaces it.)
     #[test]
     fn pc8_an_unrecognised_marker_is_not_called_old() {
@@ -1909,10 +1911,38 @@ mod tests {
                 "{head}: {}",
                 err.detail
             );
-            let found: serde_json::Value = serde_json::from_str(marker).expect("json");
-            let quoted = format!("(\"envelope\":{found}; this build reads 2)");
-            assert!(err.detail.contains(&quoted), "{head}: {}", err.detail);
+            // Tester PC9: the value is not quoted back (`pc9_*`).
+            let says = "(\"envelope\" is not a whole number this build can compare; this build \
+                        reads 2)";
+            assert!(err.detail.contains(says), "{head}: {}", err.detail);
         }
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Tester PC9: an unrecognised marker was quoted after a serde round-trip, so a file holding
+    /// `1e20` was told it held `1e+20`. Nothing the file does not hold is quoted back.
+    #[test]
+    fn pc9_an_unrecognised_marker_is_not_rewritten() {
+        let dir = scratch("pc9");
+        let store = dir.join("s.jsonl");
+        coll::write_cmd(
+            &store,
+            coll::CollectionKind::Map,
+            &args(&["cart", "--absent", "put", "\"banana\"", "5"]),
+        )
+        .expect("a new store");
+        let text = std::fs::read_to_string(&store).expect("store");
+        let (_, records) = text.split_once('\n').expect("a head line");
+        std::fs::write(
+            &store,
+            format!("{{\"seq\":1,\"envelope\":1e20}}\n{records}"),
+        )
+        .expect("head");
+        let Err(err) = Store::load(&store) else {
+            panic!("1e20 loaded");
+        };
+        assert_eq!((err.exit, err.error.as_str()), (3, "Store"));
+        assert!(!err.detail.contains("1e+20"), "{}", err.detail);
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 

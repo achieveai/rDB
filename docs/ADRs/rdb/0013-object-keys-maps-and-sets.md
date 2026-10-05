@@ -508,6 +508,12 @@ How it is proved:
     - That is an accepted repair. It is written through `rdb-value`, with the root rewritten, so it
       keeps decision 11's rule.
     - The alternative is one `get` per touched element.
+    - **An `Add` or `need` that touches a damaged set member is not a repair** (L-R186aq). Touched
+      elements are compared by version, never opened, so it succeeds and writes nothing for the
+      member. Tester example: with member `"b"` holding the byte `78`, `add "b"` exits 0 and writes
+      the root only; `b` stays byte-identical and damaged, and `member` and `members` still report
+      `Corrupt(SetMemberHasValue{len: 1})`. Only `del` then `add` in one compile, or the M9 repair
+      functions (decision 11), clear it.
   - **Not checked: elements the write does not touch.** Checking them would mean a full scan, O(n),
     on every write.
     - **The residual (tester W2, within ruling A2):** a later write that does not touch a
