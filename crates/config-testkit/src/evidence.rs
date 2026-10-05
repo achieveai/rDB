@@ -94,8 +94,12 @@ pub fn full_scale_requested() -> bool {
 /// One evidence file, exactly as [`write_evidence`] writes it to `<evidence_dir>/<name>.json`.
 ///
 /// `deny_unknown_fields` is the point of round-tripping through this type: M6-113 rejects an
-/// artifact carrying a top-level key the schema does not define, which is how a hand-edited or
-/// half-migrated file is caught before someone quotes it.
+/// artifact carrying a top-level key the schema does not define, which is how a malformed or
+/// half-migrated file from this run is caught before someone quotes it.
+///
+/// The committed `docs/evidence/` files change only by a publishing run ([`publishes_to_docs`])
+/// or a hand copy (ruling L-R186bx). The ordinary gate never reads them; they are validated by
+/// `scripts/evidence-gate.ps1`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
@@ -246,6 +250,9 @@ impl RunInfo {
 /// The one trigger (ruling L-R186bt): an ordinary run must leave the tracked artifacts alone,
 /// so only a run that asks with `RETCD_EVIDENCE=1` publishes. Every other run writes into its
 /// own log folder ([`evidence_dir`]).
+///
+/// An ordinary run cannot catch this returning `false` when asked to publish; under a
+/// publishing run, `scripts/evidence-gate.ps1` is what catches it (ruling L-R186cc, F-003).
 pub fn publishes_to_docs() -> bool {
     full_scale_requested()
 }
@@ -796,6 +803,28 @@ mod tests {
             config_log::testing::test_log_dir().display()
         );
         assert!(path.is_file(), "{} was not written", path.display());
+    }
+
+    /// `read_all` reads this run's folder, so the validator rows (M6-113, M6-114) check what this
+    /// run wrote and never pass on the committed files (ruling L-R186cc, F-002).
+    #[test]
+    fn read_all_returns_this_runs_artifact_from_the_run_log_folder() {
+        if full_scale_requested() {
+            return; // a publishing run reads docs/evidence by design
+        }
+        let name = "zz-read-all-probe";
+        let written = write_evidence(name, serde_json::json!({ "probe": 1 }), RunInfo::start(0));
+        let all = read_all();
+        let (path, artifact) = all
+            .get(name)
+            .unwrap_or_else(|| panic!("read_all did not return {name}: {:?}", all.keys()));
+        assert_eq!(path, &written);
+        assert!(
+            path.starts_with(config_log::testing::test_log_dir()),
+            "read_all returned {} from outside this run's log folder",
+            path.display()
+        );
+        assert_eq!(artifact.name, name);
     }
 
     /// The other half of the chooser: a publishing run targets `docs/evidence/`, and nothing

@@ -591,10 +591,17 @@ fn m7v_77_rdb_evidence_carries_no_production_claim() {
     // before they are read; an empty set fails rather than passing.
     let written = &shared().artifacts;
     let artifacts = rdb_evidence_files();
-    assert!(
-        artifacts.len() >= written.len(),
-        "M7V-77: the artifacts this run wrote are missing: {written:?}"
-    );
+    // Each path this run wrote, not just as many files: a count also passes on the committed
+    // docs/evidence copies (ruling L-R186cc, F-001).
+    for path in written {
+        assert!(
+            artifacts
+                .iter()
+                .any(|(read, _)| std::path::Path::new(read) == path),
+            "M7V-77: {} was written by this run but not read: {artifacts:?}",
+            path.display()
+        );
+    }
     for (path, text) in &artifacts {
         assert!(
             text.contains("Not a production claim"),
@@ -613,10 +620,17 @@ fn m7v_74_rdb_evidence_files_validate_against_the_schema() {
     assert_eq!(written.len(), 2, "{written:?}");
 
     let files = rdb_evidence_files();
-    assert!(
-        files.len() >= written.len(),
-        "the artifacts this run wrote are missing: {files:?}"
-    );
+    // Each path this run wrote, not just as many files: a count also passes on the committed
+    // docs/evidence copies (ruling L-R186cc, F-001).
+    for path in written {
+        assert!(
+            files
+                .iter()
+                .any(|(read, _)| std::path::Path::new(read) == path),
+            "{} was written by this run but not read: {files:?}",
+            path.display()
+        );
+    }
     for (path, _) in &files {
         let artifact = evidence::read_evidence(std::path::Path::new(path))
             .unwrap_or_else(|e| panic!("{path}: {e}"));

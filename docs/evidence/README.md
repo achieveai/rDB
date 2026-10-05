@@ -3,8 +3,8 @@
 **These are dev-host numbers. They are not a production claim.**
 
 Every `*.json` file in this directory was written by one test row on whatever machine last ran
-the M6 evidence suite, or, for the `rdb-*` files, the rDB M7 campaign (see "The rDB M7 files"
-below). A production designation requires re-running the suite on the target
+the M6 evidence suite, or, for the `rdb-*` files, the rDB M7 campaign or the rdb-storage S1
+conformance test (see "The rDB M7 files" below). A production designation requires re-running the suite on the target
 hardware and reading the numbers it produces there. That decision belongs to whoever operates
 the deployment; this repository does not make it on their behalf (ADR-0031, spec §20, §12.2).
 
@@ -128,3 +128,7 @@ this.
 - `rdb-m7-campaign.json` and `rdb-m7-coverage.json` record `scale_factor: 0` because no
   generated seed runs through the bridge yet (owed: M7V-55, M7V-75, V-R33), so
   `scripts/evidence-gate.ps1` fails on them under `RETCD_EVIDENCE=1`.
+- `rdb-m8-storage-conformance.json` is committed at reduced scale (32 of 10,000 seeds,
+  `scale_factor: 0.0032`), so `scripts/evidence-gate.ps1` fails on it under
+  `RETCD_EVIDENCE=1` until it is regenerated with
+  `RETCD_EVIDENCE=1 cargo test -p rdb-storage --test s1_conformance`.
