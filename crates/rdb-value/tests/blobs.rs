@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use bytes::Bytes;
-use common::h;
+use common::{h, Kernel, Refused};
 use proptest::prelude::*;
 use rdb_core::contracts::trace::Version;
 use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
@@ -85,103 +85,6 @@ fn corrupt<T>(c: Corrupt) -> Result<T, ValueError> {
     Err(ValueError::Corrupt(c))
 }
 
-// ---- the kernel stand-in --------------------------------------------------------------------
-
-/// Why the stand-in refused a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Refused {
-    /// Admission check 5: the request names another generation than the serving one.
-    GenerationChanged,
-    /// The condition at this index did not hold.
-    Condition(usize),
-    /// The mutation at this index found another version.
-    ExpectedVersion(usize),
-}
-
-/// The kernel as ADR-rdb-0014 relies on it: user records with their versions, a sequence and a
-/// generation. `apply` checks the generation first (admission check 5), then every condition,
-/// then every `expected_version`, and only then writes everything at one new version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Kernel {
-    records: BTreeMap<Bytes, (Version, Bytes)>,
-    seq: u64,
-    generation: u64,
-}
-
-impl Kernel {
-    fn new() -> Self {
-        Self {
-            records: BTreeMap::new(),
-            seq: 0,
-            generation: 1,
-        }
-    }
-
-    fn snapshot(&self) -> MapSnapshot {
-        let mut s = MapSnapshot::new(Generation(self.generation));
-        for (key, (version, value)) in &self.records {
-            s.insert(key.clone(), *version, value.clone());
-        }
-        s
-    }
-
-    fn apply(&mut self, compiled: &Compiled, generation: u64) -> Result<u64, Refused> {
-        assert!(
-            !compiled.mutations.is_empty(),
-            "an empty Compiled is never submitted (the kernel refuses it, check 10)"
-        );
-        if generation != self.generation {
-            return Err(Refused::GenerationChanged);
-        }
-        for (i, condition) in compiled.conditions.iter().enumerate() {
-            let held = match condition {
-                Condition::Absent { key } => !self.records.contains_key(key),
-                Condition::Present { key } => self.records.contains_key(key),
-                Condition::VersionEquals { key, version } => {
-                    self.records.get(key).is_some_and(|(v, _)| v == version)
-                }
-            };
-            if !held {
-                return Err(Refused::Condition(i));
-            }
-        }
-        for (i, mutation) in compiled.mutations.iter().enumerate() {
-            let (Mutation::Put {
-                key,
-                expected_version,
-                ..
-            }
-            | Mutation::Delete {
-                key,
-                expected_version,
-            }) = mutation;
-            if let Some(want) = expected_version {
-                if self.records.get(key).map(|(v, _)| *v) != Some(*want) {
-                    return Err(Refused::ExpectedVersion(i));
-                }
-            }
-        }
-        self.seq += 1;
-        for mutation in &compiled.mutations {
-            match mutation {
-                Mutation::Put { key, value, .. } => {
-                    self.records.insert(key.clone(), (self.seq, value.clone()));
-                }
-                Mutation::Delete { key, .. } => {
-                    self.records.remove(key);
-                }
-            }
-        }
-        Ok(self.seq)
-    }
-
-    /// Apply at the serving generation; the request must hold.
-    fn commit(&mut self, compiled: &Compiled) -> u64 {
-        let generation = self.generation;
-        self.apply(compiled, generation).expect("the request holds")
-    }
-}
-
 /// What a client operation answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
@@ -220,7 +123,7 @@ fn upload(
             return Ok(Answer::Crashed);
         }
         let generation = k.generation;
-        k.apply(&compiled, generation)
+        k.apply(&compiled, Some(generation))
             .map_err(|e| format!("chunk {index}: {e:?}"))?;
         commits += 1;
     }
@@ -242,7 +145,7 @@ fn upload(
         return Ok(Answer::Crashed);
     }
     let generation = k.generation;
-    k.apply(&compiled, generation)
+    k.apply(&compiled, Some(generation))
         .map_err(|e| format!("publish: {e:?}"))?;
     Ok(Answer::Published)
 }
@@ -259,7 +162,7 @@ fn gc(k: &mut Kernel, root: &RootKey, floor: u64, stop: Option<usize>) -> Result
             return Ok(Answer::Crashed);
         }
         let generation = k.generation;
-        k.apply(&compiled, generation)
+        k.apply(&compiled, Some(generation))
             .map_err(|e| format!("gc: {e:?}"))?;
         commits += 1;
     }
@@ -1004,7 +907,7 @@ fn protocol_run(seed: u32, m: &Model) -> Tally {
         }
         if !pending.is_empty() && rng.next() < 0.5 {
             let req = pending.swap_remove(rng.pick(pending.len()));
-            if let Err(refused) = k.apply(&req.compiled, req.generation) {
+            if let Err(refused) = k.apply(&req.compiled, Some(req.generation)) {
                 t.refused += 1;
                 if refused == Refused::GenerationChanged {
                     t.refused_by_generation += 1;
@@ -1473,7 +1376,10 @@ fn a_stale_delete_never_removes_a_newer_blob() {
     assert_eq!(c, delete_at(v1));
     let before = k.clone();
     let generation = k.generation;
-    assert_eq!(k.apply(&c, generation), Err(Refused::ExpectedVersion(0)));
+    assert_eq!(
+        k.apply(&c, Some(generation)),
+        Err(Refused::ExpectedVersion(0))
+    );
     assert_eq!(k, before, "a refused delete writes nothing");
     assert_eq!(read_all(&k, &root), Ok(Some(Bytes::from_static(b2))));
 

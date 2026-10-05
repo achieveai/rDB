@@ -1,11 +1,18 @@
 //! Shared by the `rdb-value` test binaries: hex, value builders, the independent byte walk, the
-//! second reader (`ciborium`) and a random-document strategy. Written apart from `src`, so a
-//! fault in the encoder is not mirrored here (ADR-rdb-0012 Verification).
+//! second reader (`ciborium`), a random-document strategy and the kernel stand-in. Written apart
+//! from `src`, so a fault in the encoder is not mirrored here (ADR-rdb-0012 Verification).
 
 #![allow(dead_code)] // each test binary uses its own subset
 
+use std::collections::BTreeMap;
+
+use bytes::Bytes;
 use proptest::prelude::*;
+use rdb_core::contracts::trace::Version;
+use rdb_core::{Condition, Generation, Mutation};
+use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Decimal, Float, Int, Map, MapKey, Timestamp, Value, INT_MAX, INT_MIN};
+use rdb_value::Compiled;
 
 /// Bytes from hex. Panics on bad hex: a test typo, not a product fault.
 pub fn h(hex: &str) -> Vec<u8> {
@@ -376,4 +383,121 @@ pub fn arb_value() -> impl Strategy<Value = Value> {
             }),
         ]
     })
+}
+
+// ---- the kernel stand-in --------------------------------------------------------------------
+
+/// Why the stand-in refused a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// Admission check 5: the request names another generation than the serving one.
+    GenerationChanged,
+    /// The condition at this index did not hold.
+    Condition(usize),
+    /// The mutation at this index found another version.
+    ExpectedVersion(usize),
+}
+
+/// The kernel as ADR-rdb-0014 and ADR-rdb-0016 rely on it: user records with their versions, a
+/// sequence and a generation. `apply` checks the write set's shape first (check 10), then the
+/// generation when the request names one (admission check 5), then every condition, then every
+/// `expected_version`, and only then writes everything at one new version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kernel {
+    pub records: BTreeMap<Bytes, (Version, Bytes)>,
+    pub seq: u64,
+    pub generation: u64,
+}
+
+impl Kernel {
+    pub fn new() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            seq: 0,
+            generation: 1,
+        }
+    }
+
+    /// A snapshot at `seq`, not at the newest record's version: a commit whose last write is a
+    /// delete leaves no record at its seq, and a list create seeds its ids from `at()`.
+    pub fn snapshot(&self) -> MapSnapshot {
+        let mut s = MapSnapshot::new(Generation(self.generation));
+        for (key, (version, value)) in &self.records {
+            s.insert(key.clone(), *version, value.clone());
+        }
+        s.advance_to(self.seq);
+        s
+    }
+
+    /// `generation: None` is an unfenced request; `Some(g)` is refused unless `g` is serving.
+    pub fn apply(&mut self, compiled: &Compiled, generation: Option<u64>) -> Result<u64, Refused> {
+        assert!(
+            !compiled.mutations.is_empty(),
+            "an empty Compiled is never submitted (the kernel refuses it, check 10)"
+        );
+        assert!(
+            compiled
+                .mutations
+                .windows(2)
+                .all(|pair| key_of(&pair[0]) < key_of(&pair[1])),
+            "a write set whose keys do not strictly ascend is never submitted (the kernel \
+             refuses it, check 10): {:?}",
+            compiled.mutations.iter().map(key_of).collect::<Vec<_>>()
+        );
+        if generation.is_some_and(|g| g != self.generation) {
+            return Err(Refused::GenerationChanged);
+        }
+        for (i, condition) in compiled.conditions.iter().enumerate() {
+            let held = match condition {
+                Condition::Absent { key } => !self.records.contains_key(key),
+                Condition::Present { key } => self.records.contains_key(key),
+                Condition::VersionEquals { key, version } => {
+                    self.records.get(key).is_some_and(|(v, _)| v == version)
+                }
+            };
+            if !held {
+                return Err(Refused::Condition(i));
+            }
+        }
+        for (i, mutation) in compiled.mutations.iter().enumerate() {
+            let (Mutation::Put {
+                key,
+                expected_version,
+                ..
+            }
+            | Mutation::Delete {
+                key,
+                expected_version,
+            }) = mutation;
+            if let Some(want) = expected_version {
+                if self.records.get(key).map(|(v, _)| *v) != Some(*want) {
+                    return Err(Refused::ExpectedVersion(i));
+                }
+            }
+        }
+        self.seq += 1;
+        for mutation in &compiled.mutations {
+            match mutation {
+                Mutation::Put { key, value, .. } => {
+                    self.records.insert(key.clone(), (self.seq, value.clone()));
+                }
+                Mutation::Delete { key, .. } => {
+                    self.records.remove(key);
+                }
+            }
+        }
+        Ok(self.seq)
+    }
+
+    /// Apply at the serving generation; the request must hold.
+    pub fn commit(&mut self, compiled: &Compiled) -> u64 {
+        let generation = self.generation;
+        self.apply(compiled, Some(generation))
+            .expect("the request holds")
+    }
+}
+
+fn key_of(mutation: &Mutation) -> &Bytes {
+    let (Mutation::Put { key, .. } | Mutation::Delete { key, .. }) = mutation;
+    key
 }
