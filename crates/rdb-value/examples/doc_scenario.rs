@@ -33,9 +33,10 @@
 //! doc_scenario --help
 //!
 //! `--node-max N` (before the command, beside `--store`) is the list node size the store
-//! compiles with (ADR-rdb-0016 §4). Given on a store's first command, it is written to the
-//! store's head line; a later different value is refused (exit 2). Without it a store uses
-//! 24,576. `drop` reads the root's kind and drops a list or a collection.
+//! compiles with (ADR-rdb-0016 §4), in 128..=24,576; a size outside that is refused (exit 2)
+//! and never saved. Given on a store's first command, it is written to the store's head line;
+//! a later different value is refused (exit 2). Without it a store uses 24,576. `drop` reads the
+//! root's kind and drops a list or a collection.
 //!
 //! <id> is an object id: plain text, or hex:<hex> for any bytes. Every object lives at
 //! tenant 1, affinity 1, under the root key the library builds (ADR-rdb-0013 §1).
@@ -113,7 +114,7 @@ use rdb_value::cbor;
 use rdb_value::delta::{resolve, ApplyError, Delta, Op};
 use rdb_value::envelope::{self, Kind, MAX_ENVELOPE, MAX_PAYLOAD};
 use rdb_value::keys::{self, RootKey, Sub};
-use rdb_value::list::DEFAULT_NODE_MAX;
+use rdb_value::list::{DEFAULT_NODE_MAX, MIN_NODE_MAX};
 use rdb_value::path::{Path, PathError};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
@@ -150,7 +151,7 @@ doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]\n 
 doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 <id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
---node-max N, beside --store, sets a new store's list node size (default 24576).\n\
+--node-max N, beside --store, sets a new store's list node size, 128..=24576 (default 24576).\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
 
 // Input limits. Every text input is read through `Read::take` at one of these, so an oversized
@@ -339,6 +340,14 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
                         ))),
                     );
                 };
+                if !(MIN_NODE_MAX..=DEFAULT_NODE_MAX).contains(&n) {
+                    return (
+                        "usage",
+                        Err(Failure::usage(format!(
+                            "--node-max {n} is outside {MIN_NODE_MAX}..={DEFAULT_NODE_MAX}"
+                        ))),
+                    );
+                }
                 if node_max.replace(n).is_some() {
                     return ("usage", Err(Failure::usage("--node-max given twice")));
                 }
@@ -2417,6 +2426,49 @@ mod tests {
             before,
             "store unchanged"
         );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+    /// Tester W1 D1 (ruling L-R186cm): an out-of-range `--node-max` was saved in a new store's
+    /// head by the first command that committed, and every later `list` then failed
+    /// `InvalidNodeSize`. It is refused as usage, exit 2, before any store is read or written.
+    #[test]
+    fn d1_an_out_of_range_node_max_is_refused_and_never_saved() {
+        let dir = scratch("d1-node-max");
+        let store = dir.join("s.jsonl");
+        for size in ["64", "127", "24577"] {
+            let (_, got) = run(&args(&[
+                "--store",
+                store.to_str().unwrap(),
+                "--node-max",
+                size,
+                "put",
+                "d",
+                "--absent",
+                "--json",
+                "1",
+            ]));
+            let err = got.expect_err("refused");
+            assert_eq!(
+                (err.exit, err.error.as_str()),
+                (2, "Usage"),
+                "{}",
+                err.detail
+            );
+            assert!(!store.exists(), "--node-max {size}: no store written");
+        }
+        for size in ["128", "24576"] {
+            let (_, got) = run(&args(&[
+                "--store",
+                store.to_str().unwrap(),
+                "--node-max",
+                size,
+                "list",
+                "x",
+                "--absent",
+            ]));
+            got.expect("a size in range makes a list");
+            std::fs::remove_file(&store).expect("reset");
+        }
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 }
