@@ -355,4 +355,4 @@ ADR-rdb-0007.
 - `docs/ADRs/0025-bounded-request-deduplication.md` — server-bound identity, lookup-before-evaluate,
   same-batch write, counter-based age.
 - `crates/config-core/src/state.rs` — `KvState`, `DedupRecord`: the deterministic apply style.
-- `.claude/scratchpad/conversation_memories/rdb-partition-database/teams/kernel-a/design.md` §3.
+- The kernel-a design §3 (working notes, not in the repository).

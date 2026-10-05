@@ -288,14 +288,14 @@ min_regular_acks` — `BlockPartition { reason: DivergenceRequiresOperator, dive
 `PartitionMode::Blocked` plus a named alert. Quarantine is terminal in M7, so a pause caused by
 divergence has no data-path exit; `BlockPartition` says so rather than leaving a permanent pause
 that looks like lag. It has two consumers: the publication module enters its `Blocked` mode (the
-mode table in kernel-a's `design.md` §4.1/§4.2, scratchpad, uncommitted; it drains waiting readers,
-keeps the pending candidate, is sticky against a later freeze, and reports `Blocked` to a mode
-query rather than `Frozen`), and the lag module (ADR-0006 §4) records the block so that its
-admission state reports `DIVERGENCE_REQUIRES_OPERATOR` rather than `PROTECTION_PAUSED` — a client
-told "retry later" for a condition nothing on the data path will change is the silent pause in a
-different coat. The exit is an operator removing the diverged copies from membership and fencing.
-With a floor remaining, the partition continues on the remaining copies with the alert raised;
-committing the degraded membership is the planner's (spec §9), not M7's.
+mode table in the kernel-a design §4.1/§4.2, working notes not in the repository; it drains
+waiting readers, keeps the pending candidate, is sticky against a later freeze, and reports
+`Blocked` to a mode query rather than `Frozen`), and the lag module (ADR-0006 §4) records the
+block so that its admission state reports `DIVERGENCE_REQUIRES_OPERATOR` rather than
+`PROTECTION_PAUSED` — a client told "retry later" for a condition nothing on the data path will
+change is the silent pause in a different coat. The exit is an operator removing the diverged copies
+from membership and fencing. With a floor remaining, the partition continues on the remaining copies
+with the alert raised; committing the degraded membership is the planner's (spec §9), not M7's.
 
 **`diverged` has one writer.** Divergence is proved at two sites — rule 9 on an ACK, and the
 catch-up cursor when a `NeedPrefix` head digest `Differs` — but the mark and the vector above are
@@ -500,5 +500,5 @@ does not describe.
 - rEtcd ADR-0019 (journal in the same atomic batch), ADR-0008 (storage layout, fatal-on-failure),
   `crates/config-storage/src/rocks.rs` (TA-13 durability boundaries)
 - ADR-0006 (lag protection), ADR-0009 (lineage and recovery) consume the watermarks defined here
-- `teams/kernel-b/research.md` §1 (Raft Log Matching, Figure 8), §2 (chain replication invariants),
-  §3 (Kafka ISR as a membership certificate)
+- The kernel-b research notes (working notes, not in the repository): §1 (Raft Log Matching,
+  Figure 8), §2 (chain replication invariants), §3 (Kafka ISR as a membership certificate)

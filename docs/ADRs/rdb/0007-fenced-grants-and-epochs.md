@@ -399,4 +399,4 @@ mapping at publication and reply feeds **V4**.
 - `docs/ADRs/0009-linearizable-reads.md` — every read is a barrier read; no stale reads exist.
 - `docs/ADRs/0015-unknown-outcome-no-auto-retry.md` — unknown mutation outcomes are never replayed.
 - `ADR-rdb-0008` — the control-record side of this decision.
-- `.claude/scratchpad/conversation_memories/rdb-partition-database/teams/kernel-a/research.md` §1, §2.4.
+- The kernel-a research notes §1, §2.4 (working notes, not in the repository).

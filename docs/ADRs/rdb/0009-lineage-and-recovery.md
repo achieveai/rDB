@@ -471,5 +471,6 @@ consumer does not handle.
   by recovery)
 - rEtcd ADR-0024 (fenced restore: a recovered authority never reuses its predecessor's identity),
   ADR-0022 (consistent snapshot view), ADR-0019 (same-batch history)
-- `teams/kernel-b/research.md` §1 (Raft Figure 8 and §5.4.3 steps 6–7), §2 (chain replication: where
-  length *is* ancestry), §3 (Kafka ISR and the unclean-election trade-off)
+- The kernel-b research notes (working notes, not in the repository): §1 (Raft Figure 8 and
+  §5.4.3 steps 6–7), §2 (chain replication: where length *is* ancestry), §3 (Kafka ISR and the
+  unclean-election trade-off)
