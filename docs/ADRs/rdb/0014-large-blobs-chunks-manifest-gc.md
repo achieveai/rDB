@@ -254,6 +254,11 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
      or a new publish if the root is gone and the chunks remain). The kernel's dedup (ADR-rdb-0004's step
      table, step 11; capacity at admission check 9) still answers a retry that reuses its request identity;
      check 0 covers a retry that does not.
+     - **Precondition.** Check 0 answers a retry only when the retry is compiled on a snapshot that
+       already contains the original commit. Compiled on an earlier snapshot, the retry compiles as a
+       normal publish, and the kernel refuses it (`GENERATION_CHANGED`, or its `Absent` condition or
+       `expected_version` while the original stands) or the compile refuses it. After any such refusal
+       the caller re-reads a fresh snapshot and compiles again; check 0 then answers (Open O9).
      - **Why the generation test (critic round 2, N1).** Check 0's answer never reaches admission, so the
        fence (decision 12) cannot guard it. On a snapshot from an older generation, the root may hold a
        manifest that a failover has since rolled back, and "already published" would be false. So check 0
@@ -532,6 +537,10 @@ seen to fail under a named fault (a mutant), then pass.
   later idempotent answer of that kind): it is a read, so it is given only on a snapshot of the serving
   generation, under the read path's freshness rule. `put_chunk`'s "already stored" is exempt: it is never
   final, because publish re-reads every chunk (decision 6 check 3), so a stale one ends in `ChunkMissing`. The executor supplies `serving` from `RecoveryResult.new_generation`.
+  **M9 checklist:** such an answer vouches only for a commit its snapshot contains. So after **any**
+  refusal of a retry (the fence, a condition, an `expected_version` or the compile), the executor
+  re-reads a fresh snapshot and compiles again before it reports failure (decision 6, check 0
+  precondition).
 
 ## References
 - Spec §4.2, §4.3, §4.3.1, §5.4; validation plan V14.
