@@ -155,12 +155,17 @@ fn l_r186s_a_flipped_kind_or_codec_is_a_digest_mismatch() {
     // `seal` writes exactly that digest.
     let sealed = seal(Kind::Map, &payload).expect("seals");
     assert_eq!(sealed.to_vec(), hashed(0x02, 0x01, &payload));
+    // The message names what the digest covers, not the payload alone (review F-008).
+    assert_eq!(
+        EnvelopeError::DigestMismatch.to_string(),
+        "header bytes 0..8 and the payload do not hash to the stored digest"
+    );
 }
 
-/// Ruling L-R186s with critic K1 (ADR-rdb-0012 §12): a record a newer build wrote is never
-/// damage. Its `kind` or `codec` is unknown here but its digest is right, so it reads as
-/// `Unknown*`. An unknown `envelope_format` or `digest_alg` is refused before the digest
-/// is computed, whatever the digest bytes are.
+/// Ruling L-R186s with critic K1 (ADR-rdb-0012 §12): a record a newer build wrote, of a size
+/// `open` accepts, is not damage. Its `kind` or `codec` is unknown here but its digest is right,
+/// so it reads as `Unknown*`. An unknown `envelope_format` or `digest_alg` is refused before
+/// the digest is computed, whatever the digest bytes are.
 #[test]
 fn l_r186s_a_newer_builds_record_reads_as_unknown_never_as_damage() {
     use EnvelopeError::*;

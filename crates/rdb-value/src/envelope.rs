@@ -39,7 +39,7 @@ pub const CODEC_DOCUMENT_V1: u8 = 0x01;
 pub const DIGEST_SHA256: u8 = 0x01;
 
 /// The envelope's `kind` table. Its own table, not the object sub-key discriminator
-/// ([`crate::keys::Sub`]; ADR-rdb-0012 decision 13). `0x00` is invalid; other values are reserved.
+/// ([`crate::keys::Sub`]; ADR-rdb-0013 decision 3). `0x00` is invalid; other values are reserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A document, encoded with the `rdb-cbor-document` codec.
@@ -115,8 +115,9 @@ pub enum EnvelopeError {
         /// The bytes after the header.
         actual: usize,
     },
-    /// The payload does not hash to the stored digest.
-    #[error("payload does not hash to the stored digest")]
+    /// Header bytes 0..8 and the payload do not hash to the stored digest: a header byte the
+    /// digest covers, the payload or the digest itself is damaged.
+    #[error("header bytes 0..8 and the payload do not hash to the stored digest")]
     DigestMismatch,
 }
 
@@ -178,15 +179,19 @@ pub fn seal(kind: Kind, payload: &[u8]) -> Result<Bytes, OversizedPayload> {
     Ok(Bytes::from(out))
 }
 
-/// Check every header field and the digest. The order is ruling L-R186s with critic K1:
+/// Check the size, every header field and the digest. The order is ruling L-R186s with critic
+/// K1, after the size checks:
 ///
-/// 1. `envelope_format`, then `digest_alg`: they say how the digest is checked, so an unknown
+/// 1. the size: [`EnvelopeError::Truncated`] below [`HEADER_LEN`], then
+///    [`EnvelopeError::TooLarge`] above [`MAX_ENVELOPE`]. Both are damage and come before any
+///    header byte is read, so a record of either size reads as damage whoever wrote it;
+/// 2. `envelope_format`, then `digest_alg`: they say how the digest is checked, so an unknown
 ///    one is a newer build's record and is refused before any hashing;
-/// 2. `payload_len`;
-/// 3. the digest: a mismatch is damage;
-/// 4. `kind`, then `codec_version`. A newer build's record hashes correctly, so an unknown
-///    value here is that build's, never damage (ADR-rdb-0012 §12). A flipped byte has already
-///    failed step 3.
+/// 3. `payload_len`;
+/// 4. the digest: a mismatch is damage;
+/// 5. `kind`, then `codec_version`. A newer build's record of a valid size hashes correctly, so
+///    an unknown value here is that build's, not damage (ADR-rdb-0012 §12). `kind` `0x00` with a
+///    correct digest also reads as `UnknownKind`. A flipped byte has already failed step 4.
 ///
 /// # Errors
 /// The first [`EnvelopeError`] found.
