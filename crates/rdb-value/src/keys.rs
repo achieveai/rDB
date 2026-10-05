@@ -399,8 +399,10 @@ fn decode_one(bytes: &[u8]) -> Result<(Value, &[u8]), KeyError> {
     })
 }
 
-/// A decimal body with its six named checks (ADR-rdb-0013 decision 4). Each fault below would
-/// re-encode to the same bytes, so the re-encode compare alone cannot catch it.
+/// A decimal body with its six named checks (ADR-rdb-0013 decision 4). Each check gives its
+/// fault a name. It is not always the only step that refuses the fault: without the
+/// leading-zero check, for one, the re-encode compare still refuses that body, as
+/// `NotCanonical`.
 fn decode_decimal(t: u8, body: &[u8]) -> Result<(Value, &[u8]), KeyError> {
     let negative = t == tag::DEC_NEG;
     let byte = |b: u8| if negative { !b } else { b };

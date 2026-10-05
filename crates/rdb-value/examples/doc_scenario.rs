@@ -74,8 +74,12 @@
 //! A compile line (`compile`, or `map`/`set`/`drop` with `--compile-only`) carries `conditions`,
 //! each with `op` and `key_hex`, and `mutations`, each with `op`, `key_hex`, `expected_version`
 //! and, for a `Put`, `value_hex`. `apply` reads only those. Every write is checked before the store is
-//! touched: its key must parse, a root must read back, a map entry must be a document and a set
-//! member empty.
+//! touched: its key must parse, a root must read back, an element write must have its root
+//! written in the same line, a map entry must be a document and a set member empty. That is
+//! each record's integrity and the root pairing, nothing more: `apply` does not compare a
+//! root's count with the elements, and it takes a root `Delete` while elements remain. The
+//! count is kept by `compile_collection` and `drop_collection`, so a hand-edited line can
+//! leave the count-mismatch or orphan state of ADR-rdb-0013 decision 11.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path as FsPath, PathBuf};
@@ -1107,7 +1111,8 @@ impl Store {
 /// `--compile-only`). It is input, so every write is checked the way a stored record is on read
 /// before anything is applied: the keys parse, in strictly ascending order (one write per key, as
 /// every compile emits); a root reads back through the library; a map entry is a document and a
-/// set member is empty, read through `member` under the root written beside it.
+/// set member is empty, read through `member` under the root written beside it. The root's
+/// count is not checked against the elements (see the module doc).
 fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
     let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
     let source = std::fs::File::open(file).map_err(cannot)?;

@@ -74,7 +74,8 @@ pub enum Corrupt {
     /// An object record's key does not decode (ADR-rdb-0013 §4).
     #[error("key: {0}")]
     Key(KeyError),
-    /// A collection root's payload is not exactly `{"keys": n, "count": n}`.
+    /// A collection root's payload is not exactly `{"keys": n, "count": n}`, or its count plus
+    /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right.
     #[error("collection root: {0}")]
     Root(&'static str),
     /// A collection root names an element key profile this build does not know. Written by a
@@ -221,7 +222,7 @@ pub fn compile(
         expected_version,
     }];
     // The kernel's own measure of the record it would ship, so compile refuses exactly what
-    // admission check 10 refuses (ruling L-R186r).
+    // admission check 10 refuses (ruling L-R186v).
     if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
         return Err(ApplyError::TooLarge {
             limit: SizeLimit::Write,
