@@ -1427,6 +1427,57 @@ fn gc_stops_at_the_end_of_the_chunk_range() {
     }
 }
 
+/// Scenario "stale delete after a replace" (ADR-rdb-0014 §8). A delete compiled from a snapshot
+/// that still holds the old blob deletes the root by that version only, so after a replace the
+/// kernel refuses it and nothing is written; a delete naming the old version on a fresh snapshot
+/// is refused at compile. A delete naming the current version removes the root and only the root.
+#[test]
+fn a_stale_delete_never_removes_a_newer_blob() {
+    let root = photo();
+    let b1: &[u8] = b"hello, blob!";
+    let b2: &[u8] = b"HELLO, BLOB! v2";
+    let mut k = Kernel::new();
+    let published = upload(&mut k, &root, &U1, b1, 4, Expected::Absent, None);
+    assert_eq!(published, Ok(Answer::Published));
+    let v1 = k.records[&root.to_bytes()].0;
+    let stale = k.snapshot();
+    let replaced = upload(&mut k, &root, &U2, b2, 4, Expected::Version(v1), None);
+    assert_eq!(replaced, Ok(Answer::Published));
+    let v2 = k.records[&root.to_bytes()].0;
+    assert!(v2 > v1);
+    let delete_at = |version| Compiled {
+        mutations: vec![Mutation::Delete {
+            key: root.to_bytes(),
+            expected_version: Some(version),
+        }],
+        conditions: Vec::new(),
+    };
+
+    let c = delete_blob(&stale, &root, v1).unwrap();
+    assert_eq!(c, delete_at(v1));
+    let before = k.clone();
+    let generation = k.generation;
+    assert_eq!(k.apply(&c, generation), Err(Refused::ExpectedVersion(0)));
+    assert_eq!(k, before, "a refused delete writes nothing");
+    assert_eq!(read_all(&k, &root), Ok(Some(Bytes::from_static(b2))));
+
+    assert_eq!(
+        delete_blob(&k.snapshot(), &root, v1),
+        apply_err(ApplyError::VersionConflict {
+            expected: v1,
+            found: v2,
+        })
+    );
+
+    let c = delete_blob(&k.snapshot(), &root, v2).unwrap();
+    assert_eq!(c, delete_at(v2));
+    let mut expected = k.records.clone();
+    expected.remove(&root.to_bytes());
+    k.commit(&c);
+    assert_eq!(k.records, expected);
+    assert_eq!(read_all(&k, &root), Ok(None));
+}
+
 // ---- R7: crash at every boundary -------------------------------------------------------------
 
 /// R7, crash at every boundary. Protects walk step 6 and C20: after a crash at any commit of an
