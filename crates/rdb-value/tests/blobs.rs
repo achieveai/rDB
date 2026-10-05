@@ -1860,8 +1860,10 @@ fn manifest_with(name: &str, value: Value) -> Value {
 
 /// The strict manifest reading (ADR-rdb-0014 §2). Protects a reader of a damaged root: a blob
 /// root whose payload is canonical CBOR but not a v1 manifest, wrong in exactly one field, reads
-/// as `Corrupt::Manifest` naming that fault, and no bytes are served. One row per `Shape` arm of
-/// the decoder; the unedited fields read back as a blob.
+/// as `Corrupt::Manifest` naming that fault, and no bytes are served. The unedited fields read
+/// back as a blob. One row per `Shape` arm, except the two arms the damage test above already
+/// asserts with too few fields and too few digests: for those, only the too-many side, which a
+/// `<` in place of `!=` would let through.
 #[test]
 fn every_manifest_shape_fault_is_named() {
     let root = photo();
@@ -1879,20 +1881,14 @@ fn every_manifest_shape_fault_is_named() {
         m.insert(MapKey::new("sizes"), size);
         Value::Map(m)
     };
-    let four = {
-        let mut m = manifest_fields();
-        m.remove(&MapKey::new("upload"));
-        Value::Map(m)
-    };
     let digests = |items: Vec<Value>| manifest_with("chunk_sha256", Value::Array(items));
     let d32 = || Value::Bytes(vec![0; 32]);
-    let rows: [(&str, Value, &str); 15] = [
+    let rows: [(&str, Value, &str); 14] = [
         (
             "not a map (01)",
             Value::Integer(Int::from(1_u64)),
             "the payload is not a map",
         ),
-        ("4 fields", four, "not exactly the five manifest fields"),
         (
             "6 fields",
             manifest_with("extra", Value::Null),
@@ -1950,24 +1946,27 @@ fn every_manifest_shape_fault_is_named() {
             "more chunks than MAX_CHUNKS",
         ),
         (
-            "one digest short of n",
-            digests(vec![d32(), d32()]),
+            "one digest too many",
+            digests(vec![d32(); 4]),
             "chunk_sha256 does not hold one digest per chunk",
         ),
     ];
+    // Every row is read before anything is asserted, so a fault names all the rows it breaks.
+    let mut wrong = Vec::new();
     for (what, payload, message) in rows {
         let got = read(&payload);
-        assert_eq!(
-            got,
-            corrupt(Corrupt::Manifest(ManifestError::Shape(message))),
-            "{what}"
-        );
-        assert_eq!(
-            got.unwrap_err().to_string(),
-            format!("corrupt record: blob manifest: {message}"),
-            "{what}"
-        );
+        let text = got.as_ref().err().map(ToString::to_string);
+        if got != corrupt(Corrupt::Manifest(ManifestError::Shape(message)))
+            || text != Some(format!("corrupt record: blob manifest: {message}"))
+        {
+            wrong.push(format!("{what}: {got:?}"));
+        }
     }
+    assert!(
+        wrong.is_empty(),
+        "rows that read wrong:\n{}",
+        wrong.join("\n")
+    );
 }
 
 // ---- limits ----------------------------------------------------------------------------------
