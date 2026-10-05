@@ -227,6 +227,10 @@ pub enum ApplyError {
         /// The list's length when the op ran.
         len: u64,
     },
+    /// The op would split the list's top node at level 7, making the tree 9 high
+    /// (ADR-rdb-0016 §4). Nothing is written.
+    #[error("the list would be more than 8 high")]
+    ListTooTall,
     /// `node_max` is outside `MIN_NODE_MAX … DEFAULT_NODE_MAX` (ADR-rdb-0016 §4).
     #[error(
         "node_max {found} is outside {} … {}",

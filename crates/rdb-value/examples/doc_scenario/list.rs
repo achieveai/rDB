@@ -38,7 +38,8 @@ fn object(rest: &[String]) -> Result<(&String, RootKey, &[String]), Failure> {
     Ok((id, root, rest))
 }
 
-/// `list <id> (--absent | --expect V) [--compile-only] (push J | insert P J)...`: compile the ops
+/// `list <id> (--absent | --expect V) [--compile-only] (push J | insert P J | remove P |
+/// replace P J | move P Q)...`: compile the ops
 /// at the store's `node_max`, then commit at the compile's generation, or print with
 /// `--compile-only`. Prints the minted `ids` in op order.
 pub fn write_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
@@ -182,7 +183,8 @@ struct Body {
     ops: Vec<ListOp>,
 }
 
-/// `(--absent | --expect V) [--compile-only] (push J | insert P J)...`. No op at all is allowed:
+/// `(--absent | --expect V) [--compile-only] (push J | insert P J | remove P | replace P J |
+/// move P Q)...`. No op at all is allowed:
 /// `list todo --absent` creates an empty list.
 fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
     let (mut expected, mut compile_only, mut ops) = (None, false, Vec::new());
@@ -204,12 +206,23 @@ fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
             "--compile-only" if !compile_only => compile_only = true,
             "push" => ops.push(ListOp::Push(element_arg(&take("a value J")?)?)),
             "insert" => {
-                let p = take("a position P")?;
-                let at = p
-                    .parse::<u64>()
-                    .map_err(|_| Failure::usage(format!("insert {p:?} is not a position")))?;
+                let at = position(word, &take("a position P")?)?;
                 let value = element_arg(&take("a value J")?)?;
                 ops.push(ListOp::Insert { at, value });
+            }
+            "remove" => {
+                let at = position(word, &take("a position P")?)?;
+                ops.push(ListOp::Remove { at });
+            }
+            "replace" => {
+                let at = position(word, &take("a position P")?)?;
+                let value = element_arg(&take("a value J")?)?;
+                ops.push(ListOp::Replace { at, value });
+            }
+            "move" => {
+                let from = position(word, &take("a position P")?)?;
+                let to = position(word, &take("a position Q")?)?;
+                ops.push(ListOp::Move { from, to });
             }
             other => return Err(Failure::usage(format!("unexpected {other:?}"))),
         }
@@ -221,6 +234,12 @@ fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
         compile_only,
         ops,
     })
+}
+
+/// An op's position argument.
+fn position(op: &str, text: &str) -> Result<u64, Failure> {
+    text.parse::<u64>()
+        .map_err(|_| Failure::usage(format!("{op} {text:?} is not a position")))
 }
 
 /// `dump`'s list root: `count`, `bytes` and `height` through the library's read, then the

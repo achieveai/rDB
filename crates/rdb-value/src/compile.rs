@@ -132,6 +132,15 @@ pub enum Corrupt {
         /// The missing index.
         index: u32,
     },
+    /// A list page that a read or a compile opened is damaged: missing, not a page, or not the
+    /// node its parent names (ADR-rdb-0016 §3, §7).
+    #[error("list page {id:032x}: {fault}")]
+    Page {
+        /// The page's id.
+        id: u128,
+        /// What is wrong with it.
+        fault: PageFault,
+    },
     /// A list leaf names an item that has no record (ADR-rdb-0016 §7).
     #[error("the list names item {id:032x}, which is not stored")]
     ItemMissing {
@@ -144,6 +153,38 @@ pub enum Corrupt {
     ChunkMismatch {
         /// The chunk's index.
         index: u32,
+    },
+}
+
+/// Why a list page is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside
+/// [`PageFault::Envelope`] stays written-by-a-newer-build (ADR-rdb-0012 §12).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PageFault {
+    /// Its parent names it, but no record is stored.
+    #[error("not stored")]
+    Missing,
+    /// The envelope does not open.
+    #[error("{0}")]
+    Envelope(EnvelopeError),
+    /// The record is another kind.
+    #[error("a {found:?} record, not a list page")]
+    NotAPage {
+        /// The kind found.
+        found: Kind,
+    },
+    /// The payload is not canonical CBOR.
+    #[error("{0}")]
+    Codec(CodecError),
+    /// The payload decodes but is not the node its parent names.
+    #[error("{0}")]
+    Shape(&'static str),
+    /// The page's version is above its root's.
+    #[error("page version {page} is above its root's version {root}")]
+    NewerThanRoot {
+        /// The page's version.
+        page: u64,
+        /// The root's version.
+        root: u64,
     },
 }
 
