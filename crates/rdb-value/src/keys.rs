@@ -24,6 +24,12 @@ use crate::value::{Decimal, Float, Int, Timestamp, Value};
 pub const SUB_ROOT: u8 = 0x00;
 /// `sub` of a map entry or a set member. Its tail is an element key, profile v1.
 pub const SUB_ELEMENT: u8 = 0x01;
+/// `sub` of a blob chunk. Its tail is `upload_id (16) | index u32 BE` (ADR-rdb-0014 §1).
+pub const SUB_CHUNK: u8 = 0x04;
+/// A chunk key's tail length: [`UPLOAD_LEN`] bytes of upload id, then a u32 index.
+pub const CHUNK_TAIL_LEN: usize = UPLOAD_LEN + 4;
+/// An upload id's length (ADR-rdb-0014 §1).
+pub const UPLOAD_LEN: usize = 16;
 
 /// The sub-key discriminator table (ADR-rdb-0013 decision 3; ADR-rdb-0011 O4). This module owns
 /// it; a later slice adds its row here and in the ADR.
@@ -33,7 +39,7 @@ pub const SUB_ELEMENT: u8 = 0x01;
 /// | `0x00` | [`Sub::Root`] |
 /// | `0x01` | [`Sub::Element`] |
 /// | `0x02`, `0x03` | reserved for lists (S4) |
-/// | `0x04` | reserved for blob chunks (S5, ADR-rdb-0014) |
+/// | `0x04` | [`Sub::Chunk`] (ADR-rdb-0014 §1) |
 /// | `0x05`–`0xFF` | unassigned |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sub {
@@ -41,6 +47,8 @@ pub enum Sub {
     Root,
     /// `0x01`: a map entry or a set member.
     Element,
+    /// `0x04`: a blob chunk.
+    Chunk,
     /// Any other byte: reserved or unassigned. Nothing after it is decoded.
     Reserved(u8),
 }
@@ -52,6 +60,7 @@ impl Sub {
         match byte {
             SUB_ROOT => Self::Root,
             SUB_ELEMENT => Self::Element,
+            SUB_CHUNK => Self::Chunk,
             other => Self::Reserved(other),
         }
     }
@@ -157,6 +166,12 @@ pub enum KeyError {
     /// The key is not under this object's element prefix.
     #[error("key is not an element of this object")]
     OutsideObject,
+    /// A chunk key's tail is not [`CHUNK_TAIL_LEN`] bytes (ADR-rdb-0014 §1).
+    #[error("chunk key tail of {len} bytes; a chunk tail is {CHUNK_TAIL_LEN}")]
+    ChunkTail {
+        /// The tail's length.
+        len: usize,
+    },
 }
 
 /// An object's root key: the full `Namespace::User` key `scope | esc(object_id) | 0x00`.
@@ -197,6 +212,24 @@ impl RootKey {
         out.push(SUB_ELEMENT);
         out
     }
+
+    /// `object_prefix | 0x04`: every blob chunk of this object starts with it, in
+    /// `(upload, index)` order (ADR-rdb-0014 §1).
+    #[must_use]
+    pub fn chunk_prefix(&self) -> Vec<u8> {
+        let mut out = self.object_prefix().to_vec();
+        out.push(SUB_CHUNK);
+        out
+    }
+}
+
+/// The key of chunk `index` of `upload` under the object at `root` (ADR-rdb-0014 §1).
+#[must_use]
+pub fn chunk_key(root: &RootKey, upload: &[u8; UPLOAD_LEN], index: u32) -> Bytes {
+    let mut out = root.chunk_prefix();
+    out.extend_from_slice(upload);
+    out.extend_from_slice(&index.to_be_bytes());
+    Bytes::from(out)
 }
 
 /// The root key of `object_id` in `(tenant, affinity)`. Any byte string is an id, the empty one
@@ -498,6 +531,8 @@ pub struct Parsed {
     pub sub: Sub,
     /// For [`Sub::Element`], the decoded element key. `None` otherwise.
     pub element: Option<Value>,
+    /// For [`Sub::Chunk`], the upload id and the index. `None` otherwise.
+    pub chunk: Option<([u8; UPLOAD_LEN], u32)>,
 }
 
 impl Parsed {
@@ -518,16 +553,28 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
     let (object_id, rest) = unesc(&key[KEY_SCOPE_LEN..], KEY_SCOPE_LEN)?;
     let (&sub, tail) = rest.split_first().ok_or(KeyError::MissingSub)?;
     let sub = Sub::from_byte(sub);
-    let element = match sub {
+    let (mut element, mut chunk) = (None, None);
+    match sub {
         Sub::Root if !tail.is_empty() => return Err(KeyError::RootHasTail { len: tail.len() }),
-        Sub::Element => Some(decode_element(tail)?),
-        Sub::Root | Sub::Reserved(_) => None,
-    };
+        Sub::Element => element = Some(decode_element(tail)?),
+        Sub::Chunk => {
+            let tail: &[u8; CHUNK_TAIL_LEN] = tail
+                .try_into()
+                .map_err(|_| KeyError::ChunkTail { len: tail.len() })?;
+            let (upload, index) = tail.split_at(UPLOAD_LEN);
+            chunk = Some((
+                upload.try_into().expect("split at UPLOAD_LEN"),
+                u32::from_be_bytes(index.try_into().expect("4 bytes")),
+            ));
+        }
+        Sub::Root | Sub::Reserved(_) => {}
+    }
     Ok(Parsed {
         tenant,
         affinity,
         object_id,
         sub,
         element,
+        chunk,
     })
 }

@@ -4,7 +4,7 @@
 //! |---|---|---|---|
 //! | 0 | 1 | `envelope_format` | `0x01` |
 //! | 1 | 1 | `kind` | [`Kind`] |
-//! | 2 | 1 | `codec_version` | `0x01` = `rdb-cbor-document` v1 |
+//! | 2 | 1 | `codec_version` | `0x01`, read per `kind`: `rdb-cbor-document` v1 for kinds `0x01`–`0x04`; for `0x05` (chunk), the payload as given (ADR-rdb-0014 §2) |
 //! | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of bytes 0..8, then the payload |
 //! | 4 | 4 | `payload_len` | u32 big-endian; equals the remaining bytes |
 //! | 8 | 32 | `digest` | |
@@ -48,6 +48,10 @@ pub enum Kind {
     Map,
     /// The root record of a set (ADR-rdb-0013 decision 7).
     Set,
+    /// A blob's root record: its manifest (ADR-rdb-0014 §2).
+    Blob,
+    /// A blob chunk: the bytes as given, no CBOR (ADR-rdb-0014 §2).
+    Chunk,
 }
 
 impl Kind {
@@ -58,6 +62,8 @@ impl Kind {
             Self::Document => 0x01,
             Self::Map => 0x02,
             Self::Set => 0x03,
+            Self::Blob => 0x04,
+            Self::Chunk => 0x05,
         }
     }
 
@@ -68,6 +74,8 @@ impl Kind {
             0x01 => Some(Self::Document),
             0x02 => Some(Self::Map),
             0x03 => Some(Self::Set),
+            0x04 => Some(Self::Blob),
+            0x05 => Some(Self::Chunk),
             _ => None,
         }
     }
