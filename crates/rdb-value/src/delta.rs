@@ -11,7 +11,7 @@ use crate::envelope::{Kind, LIMIT_TEXT};
 use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
 
-/// Which size limit an [`ApplyError::TooLarge`] hit. Two since ruling L-R186v (tester W2 PC5).
+/// Which size limit an [`ApplyError::TooLarge`] hit. Two since L-R186z (tester W2 PC5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeLimit {
     /// One value's envelope: [`LIMIT_TEXT`].

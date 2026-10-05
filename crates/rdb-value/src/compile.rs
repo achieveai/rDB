@@ -222,7 +222,7 @@ pub fn compile(
         expected_version,
     }];
     // The kernel's own measure of the record it would ship, so compile refuses exactly what
-    // admission check 10 refuses (ruling L-R186v).
+    // admission check 10 refuses (L-R186v).
     if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
         return Err(ApplyError::TooLarge {
             limit: SizeLimit::Write,

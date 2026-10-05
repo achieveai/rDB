@@ -511,7 +511,7 @@ fn compile_refuses_results_that_are_too_deep_or_too_large() {
 
     // A byte string at exactly the payload limit, then one more key.
     let big = Value::Bytes(vec![7; MAX_PAYLOAD - 5]);
-    // Ruling L-R186v: its create is refused, because the record the kernel would ship (key and
+    // L-R186v: its create is refused, because the record the kernel would ship (key and
     // framing added) is over the kernel's cap. A record stored at the limit still reads back,
     // so the store is seeded with it directly.
     assert_eq!(

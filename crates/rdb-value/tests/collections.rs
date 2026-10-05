@@ -338,7 +338,7 @@ fn pc4_kind_mismatch_on_an_absent_object_does_not_claim_it_exists() {
 
 /// Tester W2 PC5: a collection write over the record cap said "over the 1 MiB envelope
 /// (1,048,536-byte payload) limit", but no envelope was over it: the whole write was. Since
-/// L-R186v there are two caps, and the detail names the one that was hit.
+/// L-R186z there are two caps, and the detail names the one that was hit.
 #[test]
 fn pc5_too_large_names_the_cap_it_hit() {
     let s = MapSnapshot::new(Generation(1));
