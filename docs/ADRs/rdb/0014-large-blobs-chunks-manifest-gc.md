@@ -225,7 +225,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   - present with the **same bytes**: `Compiled` with **no mutations**. The caller submits nothing (the
     kernel refuses an empty request, check 10). This is spec §4.3.1's "identical bytes succeeds";
   - present with **different bytes**: `ChunkConflict{index}` (`UPLOAD_CHUNK_CONFLICT`, spec §5.4);
-  - present and does not open: `Corrupt(Chunk{index, ..})`;
+  - present and does not open: `Corrupt(Chunk{index, ..})`; present and opens as another `kind`:
+    `Corrupt(ChunkMismatch{index})`;
   - `index ≥ MAX_CHUNKS`: `TooManyChunks`; `bytes` over `MAX_CHUNK`, or `record_len` of the request
     over `MAX_ENVELOPE_BYTES` (decision 4): `TooLarge`.
 - Two racing first writes of one index: the second fails its `Absent` condition. A retry reads the
@@ -276,7 +277,7 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   2. `Expected::Version(v)`: the root exists (`ObjectAbsent`), is kind blob (`KindMismatch{found}`),
      and is at `v` (`VersionConflict`). `Expected::Absent` does not read the root (ADR-rdb-0012 §11).
   3. For `i` in `0 … n−1`: chunk `i` exists (`ChunkMissing{index}`), opens (`Corrupt(Chunk{index, ..})`),
-     and has the length decision 2 requires (`ChunkLength{index, expected, found}`).
+     is a chunk record (`Corrupt(ChunkMismatch{index})` for another `kind`), and has the length decision 2 requires (`ChunkLength{index, expected, found}`).
   4. Chunk `n` does not exist (`ExtraChunk{index: n}`): the caller's `size` disagrees with what was uploaded.
   5. SHA-256 over chunks `0 … n−1`, in order, equals `sha256` (`BlobDigestMismatch`).
 - **Output:** one `Put` of the root (the sealed manifest) and its conditions:
@@ -319,7 +320,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
     never a panic): `RangeInvalid{size}`. `len` 0 is an empty result;
   - it reads only chunks `offset / chunk_size … (offset + len − 1) / chunk_size`;
   - each chunk read must exist (`Corrupt(ChunkMissing{index})`), open (`Corrupt(Chunk{index, ..})`), and
-    match the manifest's digest and length (`Corrupt(ChunkMismatch{index})`).
+    be a chunk record and match the manifest's digest and length (`Corrupt(ChunkMismatch{index})`, for a
+    record of another `kind` too).
 - Any failure returns an error and no bytes ("fail wholly", V14). A range that misses a damaged chunk
   still succeeds; that is spec §4.3.1's "fetch only intersecting chunks".
 - **The manifest and its chunks are read from one snapshot.** Every function here takes one
@@ -386,7 +388,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   `RangeInvalid{size}` and `InvalidChunkSize{found}`. "Already stored" and "already published" are not
   errors: they are a `Compiled` with no mutations. It reuses `ObjectAbsent`, `KindMismatch`, `VersionConflict` and `TooLarge`.
 - **Corrupt** (`compile.rs`) gains `Manifest(..)`, `Chunk{index, error: EnvelopeError}`,
-  `ChunkMissing{index}` and `ChunkMismatch{index}`. `Key(ChunkTail{len})` joins `KeyError`. A missing
+  `ChunkMissing{index}` and `ChunkMismatch{index}` (a record at a chunk key that is of another `kind`, or
+  whose digest or length disagrees with the manifest). `Key(ChunkTail{len})` joins `KeyError`. A missing
   chunk is a client error at publish (the upload is incomplete) and damage after it.
 - **Envelope `kind`** gains `0x04` blob and `0x05` chunk. A reserved `kind` stays written-by-a-newer-build.
 - Mapping to spec §5.4 (`UPLOAD_CHUNK_CONFLICT`, `CORRUPT_BLOB`) is M9's.
