@@ -8,9 +8,10 @@
 //! `1..=applied`, and on `parent`, `base`, `applied` and `durable` of every lineage.
 //!
 //! Not compared, because the oracle does not model them (design §5); each is a rocks-only
-//! contract in `s1_inherit.rs`: refusals and the seal (#3-#9, #12, #18, #34, #35, S1-T2), a
-//! root's snapshot once its partition has a child (the oracle's root view is partition-wide),
-//! and per-seq Progress (RocksDB keeps the head only, S0 F1).
+//! contract in `s1_inherit.rs`: refusals and the seal (writes to a sealed parent, each inherit
+//! conflict, a parent behind the cutoff, a parent left staging), a root's snapshot once its
+//! partition has a child (the oracle's root view is partition-wide), and per-seq Progress
+//! (RocksDB keeps the head only).
 //!
 //! **Value ops (S2 design §6 W3, ADR-rdb-0012 Verification).** A second seeded stream adds
 //! document ops between the storage ops: a create, an update of 1-3 path ops, a stale version,
@@ -823,8 +824,8 @@ fn m8s_conformance_rocks_engine_agrees_with_the_oracle() {
     );
 }
 
-/// M8 S5, the RocksDB row (ADR-rdb-0014 §2, §6, §7, Verification). Protects walk steps 4 and 5,
-/// and C16: blob B1 and a blob of one full-size chunk, committed through `RocksEngine` as the
+/// M8 S5, the RocksDB row (ADR-rdb-0014 §2, §6, §7, Verification): blob B1 and a blob of one
+/// full-size chunk, committed through `RocksEngine` as the
 /// batches T1 commits, dropped, reopened, and read back byte-equal. Each request is compiled
 /// against a `MapSnapshot` holding what the earlier commits wrote, so a fault that loses the
 /// chunk batches still commits the publish batch and shows at the read, as

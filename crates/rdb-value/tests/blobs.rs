@@ -1,8 +1,8 @@
 //! M8 S5: large blobs against `MapSnapshot` and a kernel stand-in (ADR-rdb-0014 Verification;
-//! the RocksDB row is in `rdb-storage/tests/s1_conformance.rs`). Each test's doc names the walked
-//! scenario it protects.
+//! the RocksDB row is in `rdb-storage/tests/s1_conformance.rs`). Each test's doc says what it
+//! checks.
 //!
-//! Independent references (S2 lesson 2):
+//! Independent references:
 //! - every digest asserted here is pinned from Node `crypto` (`0014-blob-vectors.mjs`, rev 2.2)
 //!   and agrees with `sha256sum`; `sha2` appears only as a client computing the digest it sends;
 //! - the protocol model and the GC model are written from ADR-rdb-0014's rules. Their verdicts
@@ -388,7 +388,7 @@ fn stored(records: &[(&str, Bytes, u64)]) -> MapSnapshot {
     s
 }
 
-/// Vectors both ways. Protects walk steps 1, 4 and 6, and C10 and C17: the compiles write
+/// Vectors both ways: the compiles write
 /// B1, B2 and B3 byte for byte as the Node script prints them, with exactly the conditions
 /// ADR-rdb-0014 §6 names; and a store holding only those bytes reads back the blobs.
 #[test]
@@ -554,7 +554,7 @@ fn the_node_vectors_are_written_and_read_byte_for_byte() {
     assert_eq!(parsed.root(), zero);
 }
 
-/// The digest differential. Protects walk steps 4, 5 and 7, and C6: the whole-blob digest and
+/// The digest differential: the whole-blob digest and
 /// every chunk digest a publish writes equal values pinned from Node `crypto` and `sha256sum`.
 #[test]
 fn published_digests_equal_the_pinned_sha256_values() {
@@ -575,7 +575,7 @@ fn published_digests_equal_the_pinned_sha256_values() {
     let blob = read_blob(&k.snapshot(), &photo()).unwrap().unwrap();
     assert_eq!(blob.manifest.sha256, pin(B2_SHA));
     assert_eq!(blob.manifest.chunk_sha256, B2_CHUNK_SHA.map(pin).to_vec());
-    // C6: one wrong digit in the whole-blob digest is refused; nothing is written.
+    // One wrong digit in the whole-blob digest is refused; nothing is written.
     let mut wrong = pin(B1_SHA);
     wrong[31] ^= 0x01;
     let other = root_key(TenantId(1), AffinityId(1), b"other");
@@ -616,7 +616,7 @@ fn published_digests_equal_the_pinned_sha256_values() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// The digest differential's property. Protects walk step 5: random blobs cut at random
+    /// The digest differential's property: random blobs cut at random
     /// chunk sizes read back byte-equal, whole and in a random range.
     #[test]
     fn random_blobs_read_back_byte_equal(
@@ -639,7 +639,7 @@ proptest! {
     }
 }
 
-/// The idempotent chunk. Protects walk step 6, and C1 and C2: resending a stored chunk with
+/// The idempotent chunk: resending a stored chunk with
 /// the same bytes compiles to nothing; other bytes are `ChunkConflict`.
 #[test]
 fn a_resent_chunk_is_nothing_and_other_bytes_conflict() {
@@ -671,7 +671,7 @@ fn with_chunks(root: &RootKey, pieces: &[(u32, &[u8])]) -> MapSnapshot {
     k.snapshot()
 }
 
-/// Publish verifies. Protects walk step 4, and C3–C6, C8, C15, C16 and C24: each way an
+/// Publish verifies: each way an
 /// upload can disagree with its publish is refused by name, and a refusal is all a caller gets,
 /// so nothing is written.
 #[test]
@@ -690,19 +690,19 @@ fn publish_refuses_every_disagreement_by_name() {
             Generation(1),
         )
     };
-    // C3: a missing middle chunk.
+    // A missing middle chunk.
     let s = with_chunks(&o, &[(0, b"hell"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 12, 4, &sha12),
         apply_err(ApplyError::ChunkMissing { index: 1 })
     );
-    // C4: one chunk past n.
+    // One chunk past n.
     let s = with_chunks(&o, &[(0, b"hell"), (1, b"o, b"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 8, 4, &sha(b"hello, b")),
         apply_err(ApplyError::ExtraChunk { index: 2 })
     );
-    // C5: a short chunk.
+    // A short chunk.
     let s = with_chunks(&o, &[(0, b"hell"), (1, b"o,"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 10, 4, &sha(b"hello,lob!")),
@@ -722,20 +722,20 @@ fn publish_refuses_every_disagreement_by_name() {
             found: 2
         })
     );
-    // C6: the whole digest.
+    // A wrong whole-blob digest.
     let s = with_chunks(&o, &[(0, b"hell"), (1, b"o, b"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 12, 4, &[0; 32]),
         apply_err(ApplyError::BlobDigestMismatch)
     );
-    // C16: a chunk size of 0 or over MAX_CHUNK.
+    // A chunk size of 0 or over MAX_CHUNK.
     for bad in [0, MAX_CHUNK as u64 + 1, u64::MAX] {
         assert_eq!(
             p(&s, 12, bad, &sha12),
             apply_err(ApplyError::InvalidChunkSize { found: bad })
         );
     }
-    // C15 and C24: more than MAX_CHUNKS chunks, and a size whose `n` would overflow a naive
+    // More than MAX_CHUNKS chunks, and a size whose `n` would overflow a naive
     // `(size + chunk_size − 1) / chunk_size`.
     assert_eq!(p(&s, 256, 1, &sha12), apply_err(ApplyError::TooManyChunks));
     assert_eq!(
@@ -750,7 +750,7 @@ fn publish_refuses_every_disagreement_by_name() {
         chunk_count(u64::MAX, MAX_CHUNK as u64),
         Err(ApplyError::TooManyChunks)
     );
-    // C8: a stale `--expect`.
+    // A stale `--expect`.
     let mut k = b1();
     assert_eq!(
         upload(
@@ -1120,8 +1120,8 @@ fn assert_protocol(seeds: u32, m: &Model) {
 
 /// The protocol model at Node Part 3b's rates (ADR-rdb-0014 §6, §8 and §12): failover
 /// p = 0.02 losing 0-3 commits, 4 uploads, lost publish replies p = 0.3, half the retries on the
-/// snapshot taken after their commit; 200 seeds x 400 steps (Node ran 2,000). Protects walk
-/// step 8, and C7, C12, C20, C22 and C26: no published root ever names a missing or different
+/// snapshot taken after their commit; 200 seeds x 400 steps (Node ran 2,000). No published
+/// root ever names a missing or different
 /// chunk, no retry is told "failed" while its commit stands, and none is told "already
 /// published" for a commit a failover undid.
 #[test]
@@ -1140,8 +1140,8 @@ fn the_protocol_model_never_breaks_a_manifest_or_misanswers_a_retry() {
 /// The protocol model with failovers five times as often, p = 0.1. A request compiled before a
 /// failover breaks a manifest only when a version it names is reused for other bytes after the
 /// rollback, so the generation fence (admission check 5, applied first by the stand-in) needs
-/// frequent failovers to be reached at this seed count. Protects walk step 8, and C25 with a
-/// real failover.
+/// frequent failovers to be reached at this seed count. This test reaches the fence through real
+/// failovers and checks that every manifest stays whole.
 #[test]
 fn under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole() {
     assert_protocol(
@@ -1256,7 +1256,7 @@ fn gc_world(rng: &mut Rng) -> GcWorld {
     }
 }
 
-/// GC against a model. Protects walk steps 7 and 9, and C13, C14, C21 and C23: each batch is
+/// GC against a model: each batch is
 /// exactly the model's, guarded by the root as read; repeating GC to the end deletes every
 /// unreachable chunk at or below the floor and nothing else; every batch fits the record cap.
 #[test]
@@ -1322,9 +1322,8 @@ fn gc_deletes_exactly_what_the_model_says_within_both_bounds() {
 
 const GC_SEEDS: u32 = 100;
 
-/// GC's fixed points. C13: the floor. C14: the count bound, 255 then 45 then nothing. C23: the
-/// byte bound under a 5,000-byte id, 207 then 48 then nothing (Node Part 2). C21: chunks under a
-/// map root.
+/// GC's fixed points: the floor; the count bound, 255 then 45 then nothing; the byte bound under
+/// a 5,000-byte id, 207 then 48 then nothing (Node Part 2); and chunks under a map root.
 #[test]
 fn gc_batches_match_the_walked_counts() {
     let abandoned = |id: &[u8], uploads: &[(Upload, u32)]| {
@@ -1350,19 +1349,19 @@ fn gc_batches_match_the_walked_counts() {
             k.commit(&c);
         }
     };
-    // C13: versions 1, 2, 3 and floor 2.
+    // The floor: versions 1, 2, 3 and floor 2.
     let (mut k, root) = abandoned(b"photo", &[(U1, 3)]);
     assert_eq!(batch_sizes(&mut k, &root, 2), vec![2, 0]);
     assert!(k.records.contains_key(&chunk_of(&root, &U1, 2)));
-    // C14.
+    // The count bound.
     let (mut k, root) = abandoned(b"big", &[(U1, 150), (U2, 150)]);
     let floor = k.seq;
     assert_eq!(batch_sizes(&mut k, &root, floor), vec![255, 45, 0]);
-    // C23.
+    // The byte bound.
     let (mut k, root) = abandoned(&[b'a'; 5000], &[(U1, 255)]);
     let floor = k.seq;
     assert_eq!(batch_sizes(&mut k, &root, floor), vec![207, 48, 0]);
-    // C21: a map at the root names no chunk, so its chunks are garbage. The batch is guarded by
+    // A map at the root names no chunk, so its chunks are garbage. The batch is guarded by
     // the map's version and leaves the map as it was.
     let root = photo();
     let map = {
@@ -1497,7 +1496,7 @@ fn a_stale_delete_never_removes_a_newer_blob() {
 
 // ---- crash at every boundary -----------------------------------------------------------------
 
-/// Crash at every boundary. Protects walk step 6 and C20: after a crash at any commit of an
+/// Crash at every boundary: after a crash at any commit of an
 /// upload, a replace or a GC, a reader sees the object absent, old or new, wholly; a retry from
 /// there, including after the publish committed and its reply was lost, answers success and ends
 /// byte-identical to a run with no crash. A publish sent from a prefix that lacks a chunk is
@@ -1625,7 +1624,7 @@ fn counted(
     (got, c.chunks_read.into_inner().into_iter().collect())
 }
 
-/// Range reads. Protects walk step 5, and C11 and C24: every range equals the slice of the
+/// Range reads: every range equals the slice of the
 /// input, reads only the chunks it intersects, and an offset near `u64::MAX` is `RangeInvalid`.
 #[test]
 fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
@@ -1650,7 +1649,7 @@ fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
             assert_eq!(read, want, "offset {offset} len {len}");
         }
     }
-    // C11 and C24.
+    // One middle chunk read alone, an empty range at the end, and each range past the end.
     assert_eq!(
         counted(&s, &root, 4, 4),
         (Ok(Bytes::from_static(b"o, b")), vec![1])
@@ -1727,7 +1726,7 @@ fn flipped(record: Bytes, at: usize) -> Bytes {
     Bytes::from(b)
 }
 
-/// Damage. Protects walk step 10, and C18 and C19: each `Corrupt` cause is named, a read that
+/// Damage: each `Corrupt` cause is named, a read that
 /// touches the damage returns no bytes, and GC refuses under a root it cannot read or a chunk key
 /// it cannot parse, so nothing is deleted.
 #[test]
@@ -1826,7 +1825,7 @@ fn damage_is_named_reads_fail_wholly_and_gc_refuses() {
         assert_eq!(read_range(&s, &root, 0, 4).unwrap(), &b"hell"[..]);
         assert_eq!(read_range(&s, &root, 8, 4).unwrap(), &b"lob!"[..]);
     }
-    // C18: a chunk key one byte short refuses the whole batch.
+    // A chunk key one byte short refuses the whole batch.
     let mut s = b1_with(ROOT_PHOTO, Some(root_record()));
     let mut short = chunk_of(&root, &U2, 5).to_vec();
     short.pop();
@@ -1971,7 +1970,7 @@ fn every_manifest_shape_fault_is_named() {
 
 // ---- limits ----------------------------------------------------------------------------------
 
-/// Limits. Protects C15 and C16: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
+/// Limits: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
 /// is `TooLarge`; index 254 is accepted and 255 is `TooManyChunks`; a full chunk under a 3,745-byte
 /// id compiles and fits the record by `record_len`, and under 3,746 it is `TooLarge` (Node Part 2).
 #[test]
@@ -2017,7 +2016,7 @@ fn chunk_limits_sit_exactly_at_the_format_constants() {
 
 // ---- kind checks -----------------------------------------------------------------------------
 
-/// `KindMismatch` both ways. Protects C9: a blob operation on a document or a map names the
+/// `KindMismatch` both ways: a blob operation on a document or a map names the
 /// kind it found, and a document or map operation on a blob names `Blob`.
 #[test]
 fn blob_and_non_blob_operations_refuse_each_others_objects() {

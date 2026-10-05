@@ -1,10 +1,9 @@
 //! M8 S1 behavioural contracts and regressions for [`RocksEngine::inherit`] and the read-through
 //! chain (ADR-rdb-0010).
 //!
-//! Each test names the hand-walked scenario or defect it protects: `#N` is row N of the S1
-//! design's scenario table, `S1-T<n>` a defect on the S1 defect list; both are working notes,
-//! not in the repository. The rows that need a delete batch (#11, #13, #14) live in the
-//! `rocks_scenario` example's tests, beside the delete builder they share.
+//! Each test's doc says which hand-walked scenario or found defect it protects. The scenarios
+//! that need a delete batch live in the `rocks_scenario` example's tests, beside the delete
+//! builder they share.
 //!
 //! Data goes under `RETCD_TEST_DATA_DIR` (set by `scripts/gate.sh`), else Cargo's per-target tmp
 //! dir; never `%TEMP%`.
@@ -149,14 +148,14 @@ fn assert_conflict<T: std::fmt::Debug>(result: &Result<T, InheritError>, reason:
     );
 }
 
-/// g1 holds 10 records and g2 is linked to it at base 10 (row #1's setup).
+/// g1 holds 10 records and g2 is linked to it at base 10 (the linked switch's setup).
 fn linked_g2(engine: &mut RocksEngine) -> CanonicalHistory {
     let g1 = write(engine, G1, 10);
     assert_eq!(engine.inherit(P, G1, G2, Seq(10)), Ok(Inherited::Linked));
     g1
 }
 
-/// #1, #4: a linked switch is O(1): link, seal, `applied = base`, durable not inherited;
+/// A linked switch is O(1): link, seal, `applied = base`, durable not inherited;
 /// the child reads the parent's records through the chain, verify walks them, the same call
 /// again is a no-op, and all of it survives a reopen.
 #[retcd_test]
@@ -196,7 +195,7 @@ fn m8s_01_04_linked_switch_reads_through_and_a_rerun_is_a_noop() {
     verify_lineage(&engine, P, G2).expect("g2 verifies after reopen");
 }
 
-/// #2, #3: the child's own writes chain on from the parent's digest at the cutoff and shadow
+/// The child's own writes chain on from the parent's digest at the cutoff and shadow
 /// the parent; a late write to the sealed parent is refused and changes nothing.
 #[retcd_test]
 fn m8s_02_03_child_chains_on_and_a_sealed_parent_refuses_writes() {
@@ -220,7 +219,7 @@ fn m8s_02_03_child_chains_on_and_a_sealed_parent_refuses_writes() {
     assert_eq!(user_k(&engine, P, G2), Some((G2, 13, 13)));
 }
 
-/// #5-#9: each conflict is refused by its name and writes nothing, in memory or on disk.
+/// Each inherit conflict is refused by its name and writes nothing, in memory or on disk.
 #[retcd_test]
 fn m8s_05_09_conflicts_are_refused_by_name_and_write_nothing() {
     let dir = data_dir("05-conflicts");
@@ -246,7 +245,7 @@ fn m8s_05_09_conflicts_are_refused_by_name_and_write_nothing() {
     assert_eq!(dumped(&db), records, "a refusal wrote a record");
 }
 
-/// #10: a late write before the switch makes a full copy as of `base`. The child holds the
+/// A late write before the switch makes a full copy as of `base`. The child holds the
 /// parent's state at `base`, not the late bytes; History `<= base` falls through, the late
 /// History record does not; the parent keeps its quarantined late bytes.
 #[retcd_test]
@@ -285,7 +284,7 @@ fn m8s_10_late_write_is_copied_as_of_base_and_history_falls_through() {
     }
 }
 
-/// #12: a parent held below `base` is refused `behind_cutoff` and nothing is written; once it
+/// A parent held below `base` is refused `behind_cutoff` and nothing is written; once it
 /// catches up, the same call links.
 #[retcd_test]
 fn m8s_12_behind_cutoff_writes_nothing_until_the_parent_catches_up() {
@@ -308,7 +307,7 @@ fn m8s_12_behind_cutoff_writes_nothing_until_the_parent_catches_up() {
     assert_eq!(engine.inherit(P, G1, G2, Seq(10)), Ok(Inherited::Linked));
 }
 
-/// #15, #16, #18, #34: a full copy that fails after its first key batch leaves g2 staging:
+/// A full copy that fails after its first key batch leaves g2 staging:
 /// verify names it, writes to it are refused, a re-run with other arguments is refused and
 /// leaves it alone, and the same-args re-run clears it and converges.
 #[retcd_test]
@@ -353,7 +352,7 @@ fn m8s_15_16_18_34_a_failed_copy_is_staged_refused_and_a_rerun_converges() {
     assert_eq!(user_k(&engine, P, G2), Some((G2, 1099, 1099)));
 }
 
-/// #19 (linked), #20: a failed switch batch writes nothing and a re-run links; an inject point
+/// A failed linked switch batch writes nothing and a re-run links; an inject point
 /// a linked switch never reaches stays armed and does not fail it.
 #[retcd_test]
 fn m8s_19_20_a_failed_linked_switch_writes_nothing_and_an_unreached_point_stays_armed() {
@@ -376,7 +375,7 @@ fn m8s_19_20_a_failed_linked_switch_writes_nothing_and_an_unreached_point_stays_
     assert_eq!(engine.armed_fault(), Some(InjectedFault::CopyBatch));
 }
 
-/// #25(a): a batch with a `Meta` write is refused whole at commit: format 1 has no History
+/// A batch with a `Meta` write is refused whole at commit: format 1 has no History
 /// after-image for Meta, so a full copy could not rebuild it.
 #[retcd_test]
 fn m8s_25a_a_meta_write_is_refused_at_commit() {
@@ -405,7 +404,7 @@ fn m8s_25a_a_meta_write_is_refused_at_commit() {
     );
 }
 
-/// #26: two linked levels: a row only g1 holds reads `from=1` in g3, and verify walks 1..=12
+/// Two linked levels: a row only g1 holds reads `from=1` in g3, and verify walks 1..=12
 /// over three levels.
 #[retcd_test]
 fn m8s_26_two_linked_levels_read_through_to_the_root() {
@@ -422,7 +421,7 @@ fn m8s_26_two_linked_levels_read_through_to_the_root() {
     verify_lineage(&engine, P, G3).expect("g3 verifies over three levels");
 }
 
-/// #28: syncing a child raises each ancestor's durable to min(through, base, its applied), as
+/// Syncing a child raises each ancestor's durable to min(through, base, its applied), as
 /// `MemoryEngine::sync_ancestors` does.
 #[retcd_test]
 fn m8s_28_syncing_a_child_raises_its_ancestors_durable() {
@@ -461,9 +460,9 @@ fn link_bytes(parent: u64, base: u64, flags: u8) -> Vec<u8> {
     value
 }
 
-/// #30, #25(b): put one malformed record into a valid linked directory (row #1's state), then
+/// Put one malformed record into a valid linked directory (the linked switch's state), then
 /// open must refuse it as a corrupt record, never repaired, with a message that `says` what is
-/// wrong (paper cut S1-P3: it used to call every case "undecodable").
+/// wrong (a tester's paper cut: it used to call every case "undecodable").
 fn assert_refused_at_open(case: &str, key: Vec<u8>, value: Vec<u8>, says: &str) {
     let dir = data_dir(&format!("30-{case}"));
     let db = dir.join("db");
@@ -501,7 +500,7 @@ fn files(db: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
-/// #29, #30, S1-P1: a refused open changes no file. Each directory holds a record the open
+/// A refused open changes no file. Each directory holds a record the open
 /// refuses (format 0, a corrupt parent record, durable above applied) in an unflushed WAL, the
 /// state a writable open would replay, flush and rotate before reading the marker.
 #[retcd_test]
@@ -565,7 +564,7 @@ fn m8s_29_s1_p1_a_refused_open_changes_no_file() {
     }
 }
 
-/// #30, S1-P9: a `parent` record that is not 17 bytes names the length it found.
+/// A `parent` record that is not 17 bytes names the length it found.
 #[retcd_test]
 fn m8s_30_open_refuses_a_parent_record_of_16_bytes() {
     assert_refused_at_open(
@@ -576,7 +575,7 @@ fn m8s_30_open_refuses_a_parent_record_of_16_bytes() {
     );
 }
 
-/// #30, S1-P9: a `parent` record with a flag bit other than `copied` names the flag byte.
+/// A `parent` record with a flag bit other than `copied` names the flag byte.
 #[retcd_test]
 fn m8s_30_open_refuses_a_parent_record_with_an_unknown_flag() {
     assert_refused_at_open(
@@ -587,7 +586,7 @@ fn m8s_30_open_refuses_a_parent_record_with_an_unknown_flag() {
     );
 }
 
-/// #30, S1-P9: a lineage that names itself as parent (a chain could cycle).
+/// A lineage that names itself as parent is refused (a chain could cycle).
 #[retcd_test]
 fn m8s_30_open_refuses_a_parent_not_older_than_its_child() {
     assert_refused_at_open(
@@ -598,7 +597,7 @@ fn m8s_30_open_refuses_a_parent_not_older_than_its_child() {
     );
 }
 
-/// #30, S1-P9: a parent newer than its child.
+/// A parent newer than its child is refused.
 #[retcd_test]
 fn m8s_30_open_refuses_a_parent_newer_than_its_child() {
     assert_refused_at_open(
@@ -609,7 +608,7 @@ fn m8s_30_open_refuses_a_parent_newer_than_its_child() {
     );
 }
 
-/// #30, S1-P3: an inherited lineage whose applied mark is below its base names both numbers.
+/// An inherited lineage whose applied mark is below its base names both numbers.
 #[retcd_test]
 fn m8s_30_open_refuses_applied_below_base() {
     let applied = 9u64.to_be_bytes().to_vec();
@@ -621,7 +620,7 @@ fn m8s_30_open_refuses_applied_below_base() {
     );
 }
 
-/// #30, S1-P9: a `sealed` record that is not 8 bytes names the length it found.
+/// A `sealed` record that is not 8 bytes names the length it found.
 #[retcd_test]
 fn m8s_30_open_refuses_a_sealed_record_of_7_bytes() {
     assert_refused_at_open(
@@ -632,7 +631,7 @@ fn m8s_30_open_refuses_a_sealed_record_of_7_bytes() {
     );
 }
 
-/// #30, S1-P9: a lineage sealed by itself.
+/// A lineage sealed by itself is refused.
 #[retcd_test]
 fn m8s_30_open_refuses_a_self_seal() {
     assert_refused_at_open(
@@ -643,7 +642,7 @@ fn m8s_30_open_refuses_a_self_seal() {
     );
 }
 
-/// #30, S1-P9: a `copying` record that is not 16 bytes names the length it found.
+/// A `copying` record that is not 16 bytes names the length it found.
 #[retcd_test]
 fn m8s_30_open_refuses_a_copying_record_of_15_bytes() {
     assert_refused_at_open(
@@ -654,7 +653,7 @@ fn m8s_30_open_refuses_a_copying_record_of_15_bytes() {
     );
 }
 
-/// #30, S1-P9: a `copying` record whose parent is not older than the staging generation.
+/// A `copying` record whose parent is not older than the staging generation is refused.
 #[retcd_test]
 fn m8s_30_open_refuses_a_copying_record_from_a_newer_parent() {
     let mut value = 3u64.to_be_bytes().to_vec();
@@ -667,7 +666,7 @@ fn m8s_30_open_refuses_a_copying_record_from_a_newer_parent() {
     );
 }
 
-/// #25(b), S1-P3: any stored `Meta` key, however well framed; the message says it is a Meta key,
+/// Any stored `Meta` key, however well framed, is refused; the message says it is a Meta key,
 /// not an undecodable engine record.
 #[retcd_test]
 fn m8s_25b_open_refuses_a_stored_meta_key() {
@@ -682,7 +681,7 @@ fn m8s_25b_open_refuses_a_stored_meta_key() {
     );
 }
 
-/// #31: inheriting in one partition leaves another partition's lineages alone.
+/// Inheriting in one partition leaves another partition's lineages alone.
 #[retcd_test]
 fn m8s_31_inherit_leaves_other_partitions_alone() {
     let dir = data_dir("31-partitions");
@@ -709,7 +708,7 @@ fn m8s_31_inherit_leaves_other_partitions_alone() {
     verify_lineage(&engine, p2, G1).expect("p2 verifies");
 }
 
-/// #32: a late write in a linked child makes the next inherit a full copy over two levels: a
+/// A late write in a linked child makes the next inherit a full copy over two levels: a
 /// row only g1 holds is copied into g3 at its g1 version, nothing from the late seq reaches g3,
 /// and History reads through both levels up to the base.
 #[retcd_test]
@@ -738,7 +737,7 @@ fn m8s_32_a_two_level_copy_takes_the_state_as_of_base() {
     verify_lineage(&engine, P, G3).expect("g3 verifies over three levels");
 }
 
-/// #33: as of base 0 the state is empty: the copy writes no keys and no Progress, and the empty
+/// As of base 0 the state is empty: the copy writes no keys and no Progress, and the empty
 /// child verifies.
 #[retcd_test]
 fn m8s_33_base_zero_copies_nothing() {
@@ -775,9 +774,9 @@ fn stage_g2_from_g1(engine: &mut RocksEngine) {
     assert_eq!(engine.staging(P, G2), Some((G1, Seq(2))));
 }
 
-/// S1-T1, row #35 (L-R183h): while g2 is staging a copy from g1, `inherit 1->3` is refused by
-/// name and writes nothing — before the fix it sealed g1 for g3 and left g2 stuck with
-/// `copying` forever. The way out is the same-args re-run of g2, after which g1 is sealed for
+/// A defect found by hand (L-R183h): while g2 is staging a copy from g1, `inherit 1->3` is
+/// refused by name and writes nothing — before the fix it sealed g1 for g3 and left g2 stuck
+/// with `copying` forever. The way out is the same-args re-run of g2, after which g1 is sealed for
 /// g2 and `1->3` is `parent_sealed_for_other`.
 #[retcd_test]
 fn m8s_35_t1_second_child_is_refused_while_a_sibling_is_staging() {
@@ -810,9 +809,9 @@ fn m8s_35_t1_second_child_is_refused_while_a_sibling_is_staging() {
     );
 }
 
-/// S1-T2: a parent left staging by a failed full copy holds staged keys and no applied mark.
-/// Inheriting from it must be refused by name, not linked at base 0 — linking let the child read
-/// bytes that were never switched in (`read g4` -> `k version=2 from=2`).
+/// A defect found by hand: a parent left staging by a failed full copy holds staged keys and no
+/// applied mark. Inheriting from it must be refused by name, not linked at base 0 — linking let
+/// the child read bytes that were never switched in (`read g4` -> `k version=2 from=2`).
 #[retcd_test]
 fn m8s_t2_inherit_from_a_staging_parent_is_refused() {
     let dir = data_dir("t2-staging-parent");
@@ -836,7 +835,7 @@ fn m8s_t2_inherit_from_a_staging_parent_is_refused() {
 }
 
 /// Put one well-framed `(P, G1)` record straight into RocksDB, around the engine: the on-disk
-/// result of #23's WAL patch, without the WAL tool.
+/// result of a WAL patch that drops a History record, without the WAL tool.
 fn raw_put_g1(db: &Path, ns: Namespace, key: &[u8], version: u64, bytes: &[u8]) {
     let raw =
         rocksdb::DB::open_cf(&rocksdb::Options::default(), db, COLUMN_FAMILIES).expect("raw open");
@@ -849,7 +848,7 @@ fn raw_put_g1(db: &Path, ns: Namespace, key: &[u8], version: u64, bytes: &[u8]) 
         .expect("raw put");
 }
 
-/// #23, #24, step 5: g1 holds 11 records, `patch` corrupts it on disk, and then a full copy at
+/// g1 holds 11 records, `patch` corrupts it on disk, and then a full copy at
 /// base 10 is refused as `inherit_history_missing` (exit 12) naming `at`, and writes nothing.
 fn assert_history_missing(row: &str, patch: impl FnOnce(&Path), at: &str) {
     let dir = data_dir(row);
@@ -887,20 +886,20 @@ fn undecodable_history(seq: u64) -> impl FnOnce(&Path) {
     }
 }
 
-/// #23: seq 11 is above base, so the touched-key scan reads it first.
+/// A History record missing above base: seq 11, so the touched-key scan reads it first.
 #[retcd_test]
 fn m8s_23_history_missing_above_base_is_refused_at_that_seq() {
     assert_history_missing("23-missing-11", undecodable_history(11), "history:11");
 }
 
-/// #24: seq 5 is below base; the backward after-image scan reaches it because seq 11's dedup
-/// key is new above base and so stays open down to seq 1.
+/// A History record missing below base: seq 5; the backward after-image scan reaches it because
+/// seq 11's dedup key is new above base and so stays open down to seq 1.
 #[retcd_test]
 fn m8s_24_history_missing_below_base_is_refused_at_that_seq() {
     assert_history_missing("24-missing-5", undecodable_history(5), "history:5");
 }
 
-/// #24 (coverage): seq 5 holds a record that decodes but claims seq 6, so it is not seq 5's
+/// Seq 5 holds a record that decodes but claims seq 6, so it is not seq 5's
 /// record either; the copy refuses it like a missing one.
 #[retcd_test]
 fn m8s_24_a_history_record_claiming_another_seq_is_missing() {
@@ -915,7 +914,7 @@ fn m8s_24_a_history_record_claiming_another_seq_is_missing() {
     assert_history_missing("24-wrong-seq", patch, "history:5");
 }
 
-/// #26, S0 c07 (coverage): a value whose frame does not decode fails a snapshot taken through
+/// A value whose frame does not decode fails a snapshot taken through
 /// the chain as `Corrupt`, logged as `snapshot_unframe_failed`; it is never skipped.
 #[retcd_test]
 fn m8s_26_c07_an_unframed_parent_value_fails_the_childs_snapshot() {
@@ -950,7 +949,7 @@ fn m8s_26_c07_an_unframed_parent_value_fails_the_childs_snapshot() {
     );
 }
 
-/// #1 D2, S1-P2 (coverage): `dump` and `open_read_only` refuse a directory with no database
+/// `dump` and `open_read_only` refuse a directory with no database
 /// and create nothing, as `open_existing` does.
 #[retcd_test]
 fn m8s_d2_dump_and_read_only_refuse_a_missing_database() {
@@ -973,7 +972,7 @@ fn m8s_step5_a_record_above_base_that_no_history_names_is_refused() {
     assert_history_missing("step5-stray", stray, "dedup:7374726179");
 }
 
-/// #27: partition 0 and generation 0 are ordinary ids: a root g0 inherits to g1 like any other.
+/// Partition 0 and generation 0 are ordinary ids: a root g0 inherits to g1 like any other.
 #[retcd_test]
 fn m8s_27_partition_0_generation_0_inherits_like_any_other() {
     let p0 = PartitionId(0);
@@ -996,14 +995,13 @@ fn m8s_27_partition_0_generation_0_inherits_like_any_other() {
 
 /// Env var that turns [`zz_child_inherits_then_aborts`] from a no-op into the crashing child.
 const CHILD_DIR: &str = "RDB_STORAGE_S1_CHILD_DIR";
-/// Env var naming what the child does before it aborts: `write` (#21), `linked` (#22) or
-/// `staged` (#17).
+/// Env var naming what the child does before it aborts: `write`, `linked` or `staged`.
 const CHILD_MODE: &str = "RDB_STORAGE_S1_CHILD_MODE";
 
-/// The crashing child for #17, #21 and #22. A no-op unless the parent set [`CHILD_DIR`].
-/// `write`: write 10 to g1, abort. `linked`: write 10, link g2 at 10, abort. `staged`: write
-/// 1100, fail the copy's last batch as #15 does, abort with the staging on disk. Never synced,
-/// so the reopen replays the WAL.
+/// The crashing child for the three crash tests below. A no-op unless the parent set
+/// [`CHILD_DIR`]. `write`: write 10 to g1, abort. `linked`: write 10, link g2 at 10, abort.
+/// `staged`: write 1100, fail the copy's last batch as the failed-copy test does, abort with the
+/// staging on disk. Never synced, so the reopen replays the WAL.
 #[test]
 fn zz_child_inherits_then_aborts() {
     let Some(db) = std::env::var_os(CHILD_DIR) else {
@@ -1051,8 +1049,8 @@ fn crash_child(db: &Path, mode: &str) {
     );
 }
 
-/// #21: a process crash after the root's commits (never synced), then a reopen, then the
-/// inherit: links as #1 does, over the records the WAL replayed.
+/// A process crash after the root's commits (never synced), then a reopen, then the
+/// inherit: links as a plain linked switch does, over the records the WAL replayed.
 #[retcd_test]
 fn m8s_21_inherit_after_a_crash_between_commit_and_inherit_links() {
     let dir = data_dir("21-crash-write");
@@ -1066,7 +1064,7 @@ fn m8s_21_inherit_after_a_crash_between_commit_and_inherit_links() {
     assert_eq!(user_k(&engine, P, G2), Some((G1, 10, 10)));
 }
 
-/// #22: a process crash right after a linked switch keeps the whole switch: link, seal and
+/// A process crash right after a linked switch keeps the whole switch: link, seal and
 /// `applied = base`; it verifies, and the same call again is a no-op.
 #[retcd_test]
 fn m8s_22_a_crash_after_a_linked_switch_keeps_it_whole() {
@@ -1091,7 +1089,7 @@ fn m8s_22_a_crash_after_a_linked_switch_keeps_it_whole() {
     );
 }
 
-/// #17: a process crash with a copy staged leaves the staging and whole copy batches, never a
+/// A process crash with a copy staged leaves the staging and whole copy batches, never a
 /// lineage record or a seal; the same call again converges.
 #[retcd_test]
 fn m8s_17_a_crash_with_a_copy_staged_converges_on_a_rerun() {
@@ -1118,7 +1116,7 @@ fn m8s_17_a_crash_with_a_copy_staged_converges_on_a_rerun() {
     assert_eq!(user_k(&engine, P, G2), Some((G2, 1099, 1099)));
 }
 
-/// S1-P5 (carry-over of S0 P9): `fault_injected` names the point by its CLI spelling in a
+/// `fault_injected` names the point by its CLI spelling in a
 /// `point` field, as `fault_not_reached` does, so one log query finds both.
 #[retcd_test]
 fn m8s_19_s1_p5_fault_injected_names_its_point() {
