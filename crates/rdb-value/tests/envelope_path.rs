@@ -50,6 +50,15 @@ fn open_fails_closed_on_every_damaged_header_field() {
         assert_eq!(open(&with(0, byte)), Err(UnknownFormat(byte)));
         assert_eq!(open(&with(3, byte)), Err(UnknownDigest(byte)));
     }
+    // Review F-004: a `kind` or `codec_version` this build does not know, under the digest
+    // `seal` wrote for `0x01`, is damage. It fails only if `kind` and `codec_version` are
+    // read after the digest; read before it, these name the newer-build class instead.
+    for byte in [0x00, 0x04, 0xff] {
+        assert_eq!(open(&with(1, byte)), Err(DigestMismatch), "kind {byte:#04x}");
+    }
+    for byte in [0x00, 0xff] {
+        assert_eq!(open(&with(2, byte)), Err(DigestMismatch), "codec {byte:#04x}");
+    }
     // payload_len says 0 and 2 against 1 byte; then one extra byte after the payload.
     assert_eq!(
         open(&with(7, 0)),
@@ -151,7 +160,10 @@ fn l_r186s_a_newer_builds_record_reads_as_unknown_never_as_damage() {
     assert_eq!(open(&hashed(0x04, 0x01, &payload)), Err(UnknownKind(0x04)));
     assert_eq!(open(&hashed(0x7f, 0x01, &payload)), Err(UnknownKind(0x7f)));
     assert_eq!(open(&hashed(0x00, 0x01, &payload)), Err(UnknownKind(0x00)));
-    assert_eq!(open(&hashed(0x01, 0x02, &payload)), Err(UnknownCodec(0x02)));
+    assert_eq!(open(&hashed(0xff, 0x01, &payload)), Err(UnknownKind(0xff)));
+    for codec in [0x00, 0x02, 0xff] {
+        assert_eq!(open(&hashed(0x01, codec, &payload)), Err(UnknownCodec(codec)));
+    }
     for digest in [[0x00; 32], [0xab; 32]] {
         let mut newer = hashed(0x01, 0x01, &payload);
         newer[8..HEADER_LEN].copy_from_slice(&digest);
