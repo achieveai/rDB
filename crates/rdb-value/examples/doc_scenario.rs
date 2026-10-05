@@ -15,6 +15,16 @@
 //! doc_scenario --store <FILE> collection <id>
 //! doc_scenario --store <FILE> member <id> K
 //! doc_scenario --store <FILE> members <id> [--after K] [--limit N]
+//! doc_scenario --store <FILE> chunk <id> --upload H --index I (--text T | --hex H | --file F)
+//!                                  [--compile-only]
+//! doc_scenario --store <FILE> publish <id> (--absent | --expect V) --upload H --size N
+//!                                  --chunk-size C --sha256 H [--serving G] [--compile-only]
+//! doc_scenario --store <FILE> upload <id> (--absent | --expect V) --upload H --chunk-size C
+//!                                  (--text T | --hex H | --file F) [--stop-after K] [--serving G]
+//! doc_scenario --store <FILE> blob <id>
+//! doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]
+//! doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]
+//! doc_scenario --store <FILE> gc <id> --floor F [--compile-only]
 //! doc_scenario --store <FILE> dump
 //! doc_scenario decode --hex H
 //! doc_scenario --help
@@ -96,6 +106,8 @@ use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
 use rdb_value::{compile, read, Compiled, Corrupt, Expected, ValueError};
 
+#[path = "doc_scenario/blob.rs"]
+mod blob;
 #[path = "doc_scenario/coll.rs"]
 mod coll;
 
@@ -112,6 +124,12 @@ doc_scenario --store <FILE> set <id> (--absent | --expect V) [--compile-only] (a
 doc_scenario --store <FILE> drop <id> --expect V [--compile-only]\n       \
 doc_scenario --store <FILE> collection <id>\n       doc_scenario --store <FILE> member <id> K\n       \
 doc_scenario --store <FILE> members <id> [--after K] [--limit N]\n       \
+doc_scenario --store <FILE> chunk <id> --upload H --index I (--text T | --hex H | --file F) [--compile-only]\n       \
+doc_scenario --store <FILE> publish <id> (--absent | --expect V) --upload H --size N --chunk-size C --sha256 H [--serving G] [--compile-only]\n       \
+doc_scenario --store <FILE> upload <id> (--absent | --expect V) --upload H --chunk-size C (--text T | --hex H | --file F) [--stop-after K] [--serving G]\n       \
+doc_scenario --store <FILE> blob <id>\n       doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]\n       \
+doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]\n       \
+doc_scenario --store <FILE> gc <id> --floor F [--compile-only]\n       \
 doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 <id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
@@ -306,6 +324,13 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "collection" => "collection",
         "member" => "member",
         "members" => "members",
+        "chunk" => "chunk",
+        "publish" => "publish",
+        "upload" => "upload",
+        "blob" => "blob",
+        "read" => "read",
+        "blob-delete" => "blob-delete",
+        "gc" => "gc",
         "--help" | "-h" | "help" if rest.is_empty() => return ("help", Ok(Vec::new())),
         other => {
             return (
@@ -331,6 +356,13 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "collection" => coll::collection_cmd(&store, rest),
         "member" => coll::member_cmd(&store, rest),
         "members" => coll::members_cmd(&store, rest),
+        "chunk" => blob::chunk_cmd(&store, rest),
+        "publish" => blob::publish_cmd(&store, rest),
+        "upload" => blob::upload_cmd(&store, rest),
+        "blob" => blob::blob_cmd(&store, rest),
+        "read" => blob::read_cmd(&store, rest),
+        "blob-delete" => blob::delete_cmd(&store, rest),
+        "gc" => blob::gc_cmd(&store, rest),
         _ => dump_cmd(&store, rest),
     };
     (name, outcome)
@@ -374,10 +406,16 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let [file] = rest else {
         return Err(Failure::usage("apply takes exactly one file"));
     };
-    let compiled = load_compiled(FsPath::new(file))?;
+    let (compiled, generation) = load_compiled(FsPath::new(file))?;
     let mut store = Store::load(store_path)?;
-    let version = store.apply(&compiled)?;
+    let version = match generation {
+        Some(generation) => store.apply_at(&compiled, generation)?,
+        None => store.apply(&compiled)?,
+    };
     let mut fields = vec![("version", version.to_string())];
+    if let Some(generation) = generation {
+        fields.push(("generation", generation.0.to_string()));
+    }
     fields.extend(compiled_fields(&compiled)?);
     Ok(fields)
 }
@@ -529,6 +567,13 @@ fn dump_record(
                     .ok_or_else(|| Failure::store("record vanished between two reads"))?;
                 line.extend(envelope_fields(raw)?);
                 line.raw("value", render(&document.value));
+            } else if opened.kind == Kind::Blob {
+                blob::dump_root(snapshot, &root, line)?;
+                line.extend(envelope_fields(raw)?);
+            } else if opened.kind == Kind::Chunk {
+                return Err(Failure::from(ApplyError::KindMismatch {
+                    found: opened.kind,
+                }));
             } else {
                 let found = coll::collection(snapshot, &root)?
                     .ok_or_else(|| Failure::store("record vanished between two reads"))?;
@@ -548,6 +593,13 @@ fn dump_record(
         }
         (Sub::Element, None) => {
             return Err(Failure::store("an element key parsed without an element"))
+        }
+        (Sub::Chunk, _) => {
+            line.str("sub", "chunk");
+            let (upload, index) = parsed
+                .chunk
+                .ok_or_else(|| Failure::store("a chunk key parsed without its tail"))?;
+            blob::dump_chunk(&upload, index, raw, line)?;
         }
         (Sub::Reserved(byte), _) => {
             line.str("sub", &format!("reserved {byte:#04x}"));
@@ -1092,6 +1144,26 @@ impl Store {
         Ok(version)
     }
 
+    /// [`Store::apply`] for a request that names its generation (ADR-rdb-0014 §12): a generation
+    /// other than the snapshot's is refused first, before any condition, as the kernel's admission
+    /// check 5 refuses it (`GENERATION_CHANGED`).
+    fn apply_at(&mut self, compiled: &Compiled, generation: Generation) -> Result<u64, Failure> {
+        let current = self.snapshot.generation();
+        if generation != current {
+            return Err(Failure::refused(
+                format!(
+                    "GenerationChanged {{ expected: {}, current: {} }}",
+                    generation.0, current.0
+                ),
+                format!(
+                    "GENERATION_CHANGED: the request names generation {}, the store is at {}",
+                    generation.0, current.0
+                ),
+            ));
+        }
+        self.apply(compiled)
+    }
+
     /// Rewrite the whole file: to a sibling first, then rename over the old one.
     fn save(&self) -> Result<(), Failure> {
         let mut text = format!("{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}}}\n", self.seq);
@@ -1115,7 +1187,7 @@ impl Store {
 /// every compile emits); a root reads back through the library; a map entry is a document and a
 /// set member is empty, read through `member` under the root written beside it. The root's
 /// count is not checked against the elements (see the module doc).
-fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
+fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>), Failure> {
     let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
     let source = std::fs::File::open(file).map_err(cannot)?;
     let bytes = read_bounded(source, MAX_LINE)
@@ -1180,18 +1252,31 @@ fn load_compiled(file: &FsPath) -> Result<Compiled, Failure> {
         .ok_or_else(|| bad("conditions must be an array"))?;
     for (i, item) in items.iter().enumerate() {
         let at = format!("conditions[{i}].");
-        if item["op"] != "Absent" {
-            return Err(bad(&format!("{at}op must be \"Absent\"")));
-        }
-        conditions.push(Condition::Absent {
-            key: Bytes::from(hex_field(item, "key_hex", &at)?),
+        let key = Bytes::from(hex_field(item, "key_hex", &at)?);
+        conditions.push(match item["op"].as_str() {
+            Some("Absent") => Condition::Absent { key },
+            Some("VersionEquals") => Condition::VersionEquals {
+                key,
+                version: item["version"]
+                    .as_u64()
+                    .ok_or_else(|| bad(&format!("{at}version")))?,
+            },
+            _ => {
+                return Err(bad(&format!(
+                    "{at}op must be \"Absent\" or \"VersionEquals\""
+                )))
+            }
         });
     }
+    let generation = blob::line_generation(&json).map_err(|e| bad(&e))?;
     check_writes(&mutations)?;
-    Ok(Compiled {
-        mutations,
-        conditions,
-    })
+    Ok((
+        Compiled {
+            mutations,
+            conditions,
+        },
+        generation,
+    ))
 }
 
 /// Every write in a compiled line reads back (see [`load_compiled`]): every key parses, every
@@ -1221,10 +1306,21 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                 let value = value.expect("a Put");
                 let opened = envelope::open(value)
                     .map_err(|e| keyed(Failure::from(ValueError::Corrupt(Corrupt::Envelope(e)))))?;
-                if opened.kind == Kind::Document {
-                    read(&written, &root).map_err(|e| keyed(e.into()))?;
-                } else {
-                    coll::collection(&written, &root).map_err(|e| keyed(e.into()))?;
+                match opened.kind {
+                    Kind::Document => {
+                        read(&written, &root).map_err(|e| keyed(e.into()))?;
+                    }
+                    Kind::Blob => {
+                        rdb_value::blob::read_blob(&written, &root).map_err(|e| keyed(e.into()))?;
+                    }
+                    Kind::Chunk => {
+                        return Err(keyed(
+                            ApplyError::KindMismatch { found: opened.kind }.into(),
+                        ))
+                    }
+                    Kind::Map | Kind::Set => {
+                        coll::collection(&written, &root).map_err(|e| keyed(e.into()))?;
+                    }
                 }
             }
             // An element write of either kind keeps its root in step, so it needs the root
@@ -1243,6 +1339,12 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
             (Sub::Element, None) => {
                 return Err(Failure::store("an element key parsed without an element"))
             }
+            // A chunk `Put` is a sealed `Chunk`; a chunk `Delete` (GC) has nothing to read.
+            (Sub::Chunk, _) => {
+                if let (Some(value), Some((_, index))) = (value, parsed.chunk) {
+                    blob::open_chunk(index, value).map_err(keyed)?;
+                }
+            }
             (Sub::Reserved(byte), _) => {
                 return Err(keyed(Failure::usage(format!(
                     "sub byte {byte:#04x} is reserved; this build writes no such record"
@@ -1257,8 +1359,8 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
 // Output
 // ---------------------------------------------------------------------------------------------
 
-/// `conditions` and `mutations`: what `apply` reads back. A compile attaches only `Absent`;
-/// another condition is printed by name and `apply` refuses it.
+/// `conditions` and `mutations`: what `apply` reads back. A compile attaches `Absent` and, for
+/// a blob, `VersionEquals`; `Present` is printed by name and `apply` refuses it.
 fn compiled_fields(compiled: &Compiled) -> Result<Fields, Failure> {
     let conditions: Vec<String> = compiled
         .conditions
@@ -1266,6 +1368,10 @@ fn compiled_fields(compiled: &Compiled) -> Result<Fields, Failure> {
         .map(|condition| match condition {
             Condition::Absent { key } => format!(
                 "{{\"op\":\"Absent\",\"key_hex\":{}}}",
+                json_str(&hex::encode(key))
+            ),
+            Condition::VersionEquals { key, version } => format!(
+                "{{\"op\":\"VersionEquals\",\"key_hex\":{},\"version\":{version}}}",
                 json_str(&hex::encode(key))
             ),
             other => format!("{{\"op\":{}}}", json_str(&format!("{other:?}"))),
@@ -1304,6 +1410,10 @@ fn mutation_line(mutation: &Mutation) -> Result<Line, Failure> {
     if let Some(element) = &parsed.element {
         line.raw("element", render(element));
     }
+    if let Some((upload, index)) = &parsed.chunk {
+        line.str("upload", &hex::encode(upload));
+        line.raw("index", index.to_string());
+    }
     line.raw(
         "expected_version",
         expected_version.map_or_else(|| "null".to_owned(), |v| v.to_string()),
@@ -1314,9 +1424,12 @@ fn mutation_line(mutation: &Mutation) -> Result<Line, Failure> {
             line.extend(envelope_fields(value)?);
             let opened = envelope::open(value)
                 .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Envelope(e))))?;
-            let decoded = cbor::decode(opened.payload)
-                .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Codec(e))))?;
-            line.raw("value", render(&decoded));
+            // A chunk's payload is the bytes as given, not CBOR (ADR-rdb-0014 §2).
+            if opened.kind != Kind::Chunk {
+                let decoded = cbor::decode(opened.payload)
+                    .map_err(|e| Failure::from(ValueError::Corrupt(Corrupt::Codec(e))))?;
+                line.raw("value", render(&decoded));
+            }
         }
     }
     Ok(line)
