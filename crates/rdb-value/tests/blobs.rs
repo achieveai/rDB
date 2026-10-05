@@ -1359,7 +1359,8 @@ fn a_crash_at_any_commit_reads_whole_and_a_retry_ends_identical() {
     let b1: &[u8] = b"hello, blob!";
     let b2: &[u8] = b"HELLO, BLOB! v2";
     type Step = fn(&mut Kernel, Option<usize>) -> Result<Answer, String>;
-    let steps: [(Step, usize, [Option<&[u8]>; 2]); 3] = [
+    type Readable<'a> = [Option<&'a [u8]>; 2];
+    let steps: [(Step, usize, Readable); 3] = [
         (
             |k, stop| upload(k, &photo(), &U1, b"hello, blob!", 4, Expected::Absent, stop),
             4,
@@ -1394,7 +1395,7 @@ fn a_crash_at_any_commit_reads_whole_and_a_retry_ends_identical() {
             assert_eq!(k.seq, base.seq + crash as u64);
             let seen = read_all(&k, &root).unwrap();
             assert!(
-                readable.iter().any(|r| seen.as_deref() == *r),
+                readable.contains(&seen.as_deref()),
                 "crash {crash}: read {seen:?}"
             );
             let retried = step(&mut k, None).unwrap();

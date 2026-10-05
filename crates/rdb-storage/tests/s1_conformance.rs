@@ -864,7 +864,7 @@ fn m8s_blobs_read_back_byte_equal_after_a_reopen() {
     // Pinned from Node `crypto` and `sha256sum`: B1 (0014-blob-vectors.mjs rev 2.2), and
     // 1,044,480 bytes of `(i * 7 + 3) mod 256`.
     let full: Vec<u8> = (0..MAX_CHUNK).map(|i| (i * 7 + 3) as u8).collect();
-    let blobs: [(RootKey, [u8; 16], Vec<u8>, usize, &str); 2] = [
+    let blobs = [
         (
             doc_key(b"photo"),
             [0x11; 16],
