@@ -36,6 +36,9 @@ exist on secondary" moves to M10, with the upload stream and the prepared-second
   `codec_version` is read per `kind`. For kinds `0x01`–`0x04` it is `rdb-cbor-document` v1; for kind
   `0x05` (chunk) it is "payload stored as given". The byte stays `0x01`, so `envelope::open` is unchanged
   (decision 2; L-R186x).
+- **ADR-rdb-0012 §7, table row `kind`:** "`0x01` document, `0x02` map root, `0x03` set root … Other values
+  reserved for later kinds". New reading: it adds `0x04` blob root (the manifest) and `0x05` blob chunk;
+  `0x06` onward is unallocated, and S4 (lists) takes the next one (decision 2; L-R186x).
 - **ADR-rdb-0013 decision 3, row `0x04`:** "reserved for ADR-rdb-0014". New reading: blob chunk, tail
   `upload_id (16 bytes) | index u32 BE` (decision 1; L-R186x Q4).
 - **ADR-rdb-0013 decision 11, the damaged-object table:** it names collection roots, elements and
