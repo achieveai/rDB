@@ -924,6 +924,11 @@ impl Store {
         store.seq = head["seq"]
             .as_u64()
             .ok_or_else(|| bad(n, "first line must be {\"seq\":N,\"envelope\":2}"))?;
+        // Tester W3 PC7: a marker that is there is quoted; only a missing one is called missing.
+        let marker = match head.get("envelope") {
+            None => format!("no \"envelope\" marker; this build reads {STORE_ENVELOPE}"),
+            Some(found) => format!("\"envelope\":{found}; this build reads {STORE_ENVELOPE}"),
+        };
         match head["envelope"].as_u64() {
             Some(STORE_ENVELOPE) => {}
             // Tester W2 PC6: a higher marker is not an old store.
@@ -931,16 +936,18 @@ impl Store {
                 return Err(bad(
                     n,
                     &format!(
-                        "a store written by a newer build (\"envelope\":{newer}; this build \
-                         reads {STORE_ENVELOPE}); use that build or start a new store"
+                        "a store written by a newer build ({marker}); use that build or start a \
+                         new store"
                     ),
                 ));
             }
             _ => {
                 return Err(bad(
                     n,
-                    "a store from before ruling L-R186s (no \"envelope\":2): its digests do not \
-                     cover the header, so every record would read as damage; start a new store",
+                    &format!(
+                        "a store from before ruling L-R186s ({marker}): its digests do not cover \
+                         the header, so every record would read as damage; start a new store"
+                    ),
                 ))
             }
         }
@@ -1788,7 +1795,8 @@ mod tests {
 
     /// Tester W2 PC6: a store marked `"envelope":3` was told it came "from before ruling
     /// L-R186s". A missing or lower marker keeps that reason; a higher one names a newer build.
-    /// Every case is still refused whole, exit 3.
+    /// Every case is still refused whole, exit 3. Tester W3 PC7: a marker that is there is
+    /// quoted with the version this build reads; only a missing one is called missing.
     #[test]
     fn pc6_a_store_from_a_newer_build_is_not_called_old() {
         let dir = scratch("pc6");
@@ -1801,10 +1809,27 @@ mod tests {
         .expect("a new store");
         let text = std::fs::read_to_string(&store).expect("store");
         let (_, records) = text.split_once('\n').expect("a head line");
-        for (head, older) in [
-            ("{\"seq\":1}", true),
-            ("{\"seq\":1,\"envelope\":1}", true),
-            ("{\"seq\":1,\"envelope\":3}", false),
+        for (head, older, says) in [
+            (
+                "{\"seq\":1}",
+                true,
+                "(no \"envelope\" marker; this build reads 2)",
+            ),
+            (
+                "{\"seq\":1,\"envelope\":1}",
+                true,
+                "(\"envelope\":1; this build reads 2)",
+            ),
+            (
+                "{\"seq\":1,\"envelope\":\"x\"}",
+                true,
+                "(\"envelope\":\"x\"; this build reads 2)",
+            ),
+            (
+                "{\"seq\":1,\"envelope\":3}",
+                false,
+                "(\"envelope\":3; this build reads 2)",
+            ),
         ] {
             std::fs::write(&store, format!("{head}\n{records}")).expect("head");
             let Err(err) = Store::load(&store) else {
@@ -1823,6 +1848,7 @@ mod tests {
                 "{head}: {}",
                 err.detail
             );
+            assert!(err.detail.contains(says), "{head}: {}", err.detail);
         }
         std::fs::remove_dir_all(&dir).expect("clean");
     }
