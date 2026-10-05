@@ -295,7 +295,9 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   guards hold only inside one generation; decision 12 keeps every request inside one.
 - **What the model shows, and no more.** `0014-blob-vectors.mjs` is a Node sketch of these rules: one
   partition, no network, no clock, stale compiles applied in random order, 2,000 seeds × 400 steps. It
-  shows the rules are consistent. It does not test the Rust code; R5 ports it for that.
+  shows the rules are consistent. It does not test the Rust code; the protocol model test ports it for that (`crates/rdb-value/tests/blobs.rs`,
+  fns `the_protocol_model_never_breaks_a_manifest_or_misanswers_a_retry` and
+  `under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole`).
 
   | Part | Case | Broken states (root names a missing / different chunk) |
   |---|---|---|
@@ -412,7 +414,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   refuses the request at admission, or strands it if the generation changes while it waits (Context).
 - **Who sets it.** `rdb-value` builds no `TxnRequest`; its caller does, and already holds the snapshot.
   In M8 the callers are `doc_scenario` and the tests. M9's executor must do the same: that is an M9
-  checklist item, and R5 is the test that shows why. `publish`'s check 0 also takes the serving generation
+  checklist item, and the protocol model test
+  (`under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole`) shows why. `publish`'s check 0 also takes the serving generation
   (decision 6), because its answer never reaches the fence. No contract change: the field and both kernel checks
   exist today.
 - **Upgrade note.** The same reuse affects document and collection compiles as a lost update, not a
@@ -435,7 +438,7 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
 | One byte of a published chunk is flipped | a read that covers it fails wholly with `Corrupt(Chunk{index, DigestMismatch})`; a range that misses it succeeds |
 | The manifest's digest is flipped | every read and GC fails with `Corrupt`; nothing is deleted |
 | The process stops after any committed transaction of an upload, then the upload is retried | the blob is absent or the old one until publish; the retry completes with the same bytes. Stopped after the publish itself (reply lost): every chunk is "already stored" and the publish "already published" (decision 6 check 0) |
-| A GC is compiled in one generation and submitted after a failover | refused `GENERATION_CHANGED` (decision 12); nothing deleted. Not walkable by hand in M8: the dev store has one generation; R5 covers it |
+| A GC is compiled in one generation and submitted after a failover | refused `GENERATION_CHANGED` (decision 12); nothing deleted. Not walkable by hand in M8: the dev store has one generation; the protocol model test covers it |
 | An object whose id is 5,000 bytes has 255 abandoned one-byte chunks; GC runs until empty | 207 `Delete`s, then 48, then none (decision 8's byte bound) |
 
 ## Consequences
