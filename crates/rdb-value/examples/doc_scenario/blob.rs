@@ -12,8 +12,8 @@ use bytes::Bytes;
 use rdb_core::contracts::trace::Version;
 use rdb_core::{Generation, Namespace, Seq, SnapshotHandle, SnapshotRead};
 use rdb_value::blob::{
-    collect_garbage, delete_blob, publish, put_chunk, read_blob, read_range, Blob, Upload,
-    MAX_CHUNK, MAX_CHUNKS,
+    chunk_count, collect_garbage, delete_blob, publish, put_chunk, read_blob, read_range, Blob,
+    Upload, MAX_CHUNK, MAX_CHUNKS,
 };
 use rdb_value::envelope::{self, Kind};
 use rdb_value::keys::{self, RootKey};
@@ -154,11 +154,10 @@ pub fn chunk_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
         match flag.as_str() {
             "--upload" => upload = Some(upload_arg(args.value(&flag)?).map_err(|e| e.keyed(id))?),
             "--index" => {
-                let i = args.number(&flag).map_err(|e| e.keyed(id))?;
-                index =
-                    Some(u32::try_from(i).map_err(|_| {
-                        Failure::usage(format!("--index {i} is not a u32")).keyed(id)
-                    })?);
+                let v = args.value(&flag)?;
+                index = Some(v.parse::<u32>().map_err(|_| {
+                    Failure::usage(format!("--index {v:?} is not a u32")).keyed(id)
+                })?);
             }
             "--text" | "--hex" | "--file" if data.is_none() => {
                 let value = args.value(&flag)?;
@@ -335,11 +334,11 @@ pub fn upload_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failur
     fields.push(("chunk_size", chunk_size.to_string()));
     fields.push(("sha256", json_str(&hex::encode(sha256))));
     fields.push(("serving", serving.0.to_string()));
-    // The pieces, cut as publish will count them; a bad chunk size is publish's refusal.
-    let pieces: Vec<&[u8]> = match usize::try_from(chunk_size) {
-        Ok(c) if c > 0 => data.chunks(c).collect(),
-        _ => Vec::new(),
-    };
+    // Refuse a cut publish would refuse before committing any piece of it (tester PC1): a chunk
+    // size outside 1 ... MAX_CHUNK, or more than MAX_CHUNKS pieces, only leaves garbage behind.
+    chunk_count(size, chunk_size).map_err(|e| Failure::from(e).with(fields.clone()))?;
+    let piece = usize::try_from(chunk_size).expect("chunk_count bounds it by MAX_CHUNK");
+    let pieces: Vec<&[u8]> = data.chunks(piece).collect();
     let mut steps = Vec::new();
     let mut committed = 0_u64;
     let stopped = |steps: &[String], fields: &Fields, committed: u64| -> Fields {
@@ -666,5 +665,102 @@ pub fn line_generation(json: &serde_json::Value) -> Result<Option<Generation>, S
             .as_u64()
             .map(|g| Some(Generation(g)))
             .ok_or_else(|| "generation must be a u64".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn scratch(name: &str) -> PathBuf {
+        let base =
+            std::env::var_os("RETCD_TEST_DATA_DIR").map_or_else(std::env::temp_dir, PathBuf::from);
+        let dir = base.join(format!("doc_scenario_blob-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    /// Tester PC1 (lead ruling L-R186az): `upload` refuses a chunk size over `MAX_CHUNK`, and more
+    /// than `MAX_CHUNKS` pieces, before its first commit. Before the fix it committed 1 and 255
+    /// garbage chunks and then failed at `publish`.
+    #[test]
+    fn pc1_upload_refuses_a_bad_cut_before_any_commit() {
+        let dir = scratch("pc1");
+        let store = dir.join("s.jsonl");
+        let upload = "11111111111111111111111111111111";
+        let big = (MAX_CHUNK + 1).to_string();
+        let err = upload_cmd(
+            &store,
+            &args(&[
+                "o",
+                "--absent",
+                "--upload",
+                upload,
+                "--chunk-size",
+                &big,
+                "--text",
+                "ab",
+            ]),
+        )
+        .expect_err("refused");
+        assert_eq!(err.error, format!("InvalidChunkSize {{ found: {big} }}"));
+        assert!(
+            !store.exists(),
+            "nothing committed for an oversized chunk size"
+        );
+
+        let text = "x".repeat(MAX_CHUNKS + 1);
+        let err = upload_cmd(
+            &store,
+            &args(&[
+                "o",
+                "--absent",
+                "--upload",
+                upload,
+                "--chunk-size",
+                "1",
+                "--text",
+                &text,
+            ]),
+        )
+        .expect_err("refused");
+        assert_eq!(err.error, "TooManyChunks");
+        assert!(!store.exists(), "nothing committed for 256 pieces");
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Tester PC2 (L-R186az): an index that is not a `u32` says `u32`.
+    #[test]
+    fn pc2_index_errors_name_u32() {
+        let dir = scratch("pc2");
+        let store = dir.join("s.jsonl");
+        for index in ["-1", "4294967296"] {
+            let err = chunk_cmd(
+                &store,
+                &args(&[
+                    "o",
+                    "--upload",
+                    "11111111111111111111111111111111",
+                    "--index",
+                    index,
+                    "--text",
+                    "a",
+                ]),
+            )
+            .expect_err("refused");
+            assert_eq!(err.exit, 2, "{index}");
+            assert!(
+                err.detail.contains("is not a u32") && !err.detail.contains("u64"),
+                "{index}: {}",
+                err.detail
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("clean");
     }
 }
