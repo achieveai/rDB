@@ -1391,7 +1391,8 @@ fn gc_stops_at_the_end_of_the_chunk_range() {
     let last_chunk = chunk_of(&root, &[0xff; 16], u32::MAX);
     assert!(last_chunk < neighbour.to_bytes());
     assert!(last_chunk < chunk_of(&neighbour, &U2, 0));
-    let cases: [(&str, fn(&mut Kernel, &RootKey)); 2] = [
+    type AddNeighbour = fn(&mut Kernel, &RootKey);
+    let cases: [(&str, AddNeighbour); 2] = [
         ("G1 rootless neighbour", |k, n| {
             let c = put_chunk(&k.snapshot(), n, &U2, 0, b"n").unwrap();
             k.commit(&c);
@@ -1408,14 +1409,20 @@ fn gc_stops_at_the_end_of_the_chunk_range() {
             k.commit(&c);
         }
         add_neighbour(&mut k, &neighbour);
-        let before = k.records.clone();
-        let mut expected = before.clone();
+        let mut expected = k.records.clone();
         for i in 0..3 {
-            assert!(expected.remove(&chunk_of(&root, &U1, i)).is_some(), "{name}");
+            assert!(
+                expected.remove(&chunk_of(&root, &U1, i)).is_some(),
+                "{name}"
+            );
         }
         assert!(!expected.is_empty(), "{name}: the neighbour has records");
         let floor = k.seq;
-        assert_eq!(gc(&mut k, &root, floor, None), Ok(Answer::Collected), "{name}");
+        assert_eq!(
+            gc(&mut k, &root, floor, None),
+            Ok(Answer::Collected),
+            "{name}"
+        );
         assert_eq!(k.records, expected, "{name}");
     }
 }
