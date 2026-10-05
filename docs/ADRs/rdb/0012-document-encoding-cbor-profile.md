@@ -166,8 +166,9 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
     perfectly valid. Mixed-version windows are supported (rolling upgrade; L-R185w), so during one an
     older node can meet such a record.
   - **Damage:** a truncated header, a length mismatch or a digest mismatch (`Truncated`, `TooLarge`,
-    `LengthMismatch`, `DigestMismatch`), a `kind` of `0x00` (never written), or a v1 payload that
-    does not decode as canonical CBOR.
+    `LengthMismatch`, `DigestMismatch`), or a v1 payload that does not decode as canonical CBOR.
+  - **A `kind` of `0x00`** is never written, but with a correct digest it reads as `UnknownKind` and is
+    refused (amended 2026-10-04, ADR-rdb-0013). Telling it apart from a newer build's record is M9 debt.
 - **Forward compatibility** is by bumping `envelope_format` or `codec_version`. There are no optional
   fields to skip in v1. Readers keep old decoders while old data or snapshots exist (spec §4.3).
 - **v1 encoder output is frozen.** The v1 decoder accepts only the bytes the v1 encoder writes: it

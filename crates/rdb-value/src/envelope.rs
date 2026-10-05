@@ -80,7 +80,11 @@ impl Kind {
 ///   value, [`Self::UnknownCodec`] and [`Self::UnknownDigest`]. The record may be valid; this build
 ///   cannot read it. Mixed-version windows are supported, so an older node can meet one. It must
 ///   never be offered for deletion as damage;
-/// - **damage**: everything else, and [`Self::UnknownKind`]`(0)`, which no build writes.
+/// - **damage**: everything else.
+///
+/// [`Self::UnknownKind`]`(0)` sits between the two: no build writes `kind` `0x00`, but with a
+/// correct digest it reads as `UnknownKind` and is refused. Telling it apart from a newer
+/// build's record is M9 debt.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EnvelopeError {
     /// Shorter than the header.
@@ -98,7 +102,9 @@ pub enum EnvelopeError {
     /// `envelope_format` is not one this build reads: written by a newer build.
     #[error("unknown envelope format {0:#04x}")]
     UnknownFormat(u8),
-    /// `kind` is `0x00` (damage: never written) or reserved (written by a newer build).
+    /// `kind` is reserved (written by a newer build) or `0x00`. No build writes `0x00`, but with
+    /// a correct digest it reads as this error and is refused; the newer-build vs damage split
+    /// for it is M9 debt.
     #[error("unknown envelope kind {0:#04x}")]
     UnknownKind(u8),
     /// `codec_version` is not one this build reads: written by a newer build.
