@@ -28,19 +28,23 @@ Each artifact repeats the same sentence in its `disclaimer` field, emitted by on
   generic label: check it before publishing an artifact outside the team.
 - The artifacts committed here were written by whichever run last produced them, so their
   `git_sha` is the commit that run stood on and not necessarily the tip of the branch you are
-  reading, and `dirty: true` records that that tree had uncommitted changes. Running the suite
-  rewrites every file in this directory in place, which leaves the working tree dirty; that is
-  the intended behaviour, not a failure. Re-run and re-commit when you want the numbers to
-  speak for a specific commit.
+  reading, and `dirty: true` records that that tree had uncommitted changes. Only a run with
+  `RETCD_EVIDENCE=1` rewrites the files in this directory; re-run that way and re-commit when
+  you want the numbers to speak for a specific commit.
 
 ## Running the suite
 
+An ordinary run leaves this directory alone. It writes each artifact to `evidence/` inside the
+test binary's own log folder, `<logs>/<run id>/evidence/<name>.json`, where `<logs>` is
+`RETCD_TEST_LOG_DIR` (the `logs=` folder `scripts/gate.sh` prints) or, unset,
+`<target>/test-logs`. Only a run with `RETCD_EVIDENCE=1` writes here (ruling L-R186bt).
+
 ```powershell
 # Reduced scale. This is what ordinary CI runs: the rows are not `#[ignore]`d, so the code
-# paths stay exercised on every run.
+# paths stay exercised on every run. Artifacts go to the run's log folder, not here.
 $env:CARGO_INCREMENTAL=0; cargo test -p config-testkit --test m6_evidence
 
-# Full scale, on hardware you intend to quote.
+# Full scale, on hardware you intend to quote. Rewrites the files in this directory.
 $env:RETCD_EVIDENCE=1; cargo test -p config-testkit --test m6_evidence
 pwsh scripts/evidence-gate.ps1          # fails if any artifact claims full_scale: false
 ```
