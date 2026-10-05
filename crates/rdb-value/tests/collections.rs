@@ -1535,6 +1535,20 @@ fn r10_each_corrupt_cause_is_named_on_read() {
             root_with(&[("keys", c::int(2)), ("count", c::int(0))]),
             Corrupt::UnknownKeyProfile(2),
         ),
+        // Review F-005: a newer profile is read as that before anything else in the root is
+        // judged, so a root this build would call damaged still names the newer profile.
+        (
+            root_with(&[("keys", c::int(2)), ("count", c::int(0)), ("x", c::int(0))]),
+            Corrupt::UnknownKeyProfile(2),
+        ),
+        (
+            root_with(&[("keys", c::int(2))]),
+            Corrupt::UnknownKeyProfile(2),
+        ),
+        (
+            root_with(&[("keys", c::int(2)), ("count", c::int(-1))]),
+            Corrupt::UnknownKeyProfile(2),
+        ),
         (
             seal(Kind::Map, &[0xFF]).unwrap(),
             Corrupt::Codec(decode(&[0xFF]).unwrap_err()),
