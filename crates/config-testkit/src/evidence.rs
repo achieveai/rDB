@@ -98,8 +98,10 @@ pub fn full_scale_requested() -> bool {
 /// half-migrated file from this run is caught before someone quotes it.
 ///
 /// The committed `docs/evidence/` files change only by a publishing run ([`publishes_to_docs`])
-/// or a hand copy (ruling L-R186bx). The ordinary gate never reads them; they are validated by
-/// `scripts/evidence-gate.ps1`.
+/// or a hand copy (ruling L-R186bx). The ordinary gate never parses or validates their contents;
+/// only E2E-47 reads the names of the committed `rdb-*.json` files, to check the README lists
+/// them. Their contents are validated by `scripts/evidence-gate.ps1`, which does not enforce
+/// `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
@@ -251,8 +253,10 @@ impl RunInfo {
 /// so only a run that asks with `RETCD_EVIDENCE=1` publishes. Every other run writes into its
 /// own log folder ([`evidence_dir`]).
 ///
-/// An ordinary run cannot catch this returning `false` when asked to publish; under a
-/// publishing run, `scripts/evidence-gate.ps1` is what catches it (ruling L-R186cc, F-003).
+/// An ordinary run cannot catch this returning `false` when asked to publish (ruling
+/// L-R186cc, F-003). Under a publishing run, `only_a_publishing_run_targets_docs_evidence`
+/// catches it if that run includes this crate's lib tests; `scripts/evidence-gate.ps1` catches
+/// it only while some committed file is still reduced-scale, because it does not check freshness.
 pub fn publishes_to_docs() -> bool {
     full_scale_requested()
 }
