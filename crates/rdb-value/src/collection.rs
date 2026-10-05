@@ -269,6 +269,8 @@ pub fn compile_collection(
                 entry.present = true;
                 entry.written = Some(Some(v.clone()));
             }
+            // ADR-rdb-0013 decision 9: a no-op if it is present (review Q-1).
+            ElemOp::Add(_) if entry.present => {}
             ElemOp::Add(_) => {
                 entry.present = true;
                 entry.written = Some(None);

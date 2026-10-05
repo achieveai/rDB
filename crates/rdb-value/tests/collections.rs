@@ -1292,6 +1292,41 @@ fn r6_one_mutation_per_touched_key_and_none_for_absent_before_and_after() {
     );
 }
 
+/// Review Q-1: ADR-rdb-0013 decision 9's table makes `Add` of a present member a no-op. So it
+/// writes nothing for that member: the member keeps its version, takes no mutation slot, and a
+/// member holding bytes is not rewritten behind the reader's back (decision 11). The root is
+/// still written, as for every compiled delta (decisions 8 and 9).
+#[test]
+fn q1_add_of_a_present_member_writes_nothing_for_it() {
+    let root = cart();
+    let mut s = created(
+        CollectionKind::Set,
+        &[ElemOp::Add(text("a")), ElemOp::Add(text("b"))],
+    );
+    let (a, b) = (
+        element_key(&root, &text("a")).unwrap(),
+        element_key(&root, &text("b")).unwrap(),
+    );
+    s.insert(b, 1, Bytes::from_static(b"x"));
+    let ops = [ElemOp::Add(text("a")), ElemOp::Add(text("b"))];
+    let compiled =
+        compile_collection(&s, &root, CollectionKind::Set, Expected::Version(1), &ops).unwrap();
+    assert_eq!(
+        compiled.mutations,
+        vec![Mutation::Put {
+            key: root.to_bytes(),
+            value: root_record(Kind::Set, 2),
+            expected_version: Some(1),
+        }]
+    );
+    let after = apply(&s, &compiled, 2).unwrap();
+    assert_eq!(after.version(Namespace::User, &a), Some(1));
+    assert_eq!(
+        members(&after, &root, None, 10).map(|_| ()),
+        corrupt(Corrupt::SetMemberHasValue { len: 1 })
+    );
+}
+
 /// R8 (protects walk step 5, C20): an update carries the root's version and is refused at a
 /// stale one, here and by the kernel; two racing creates compile to the same bytes, and the
 /// second fails its `Absent` condition.
