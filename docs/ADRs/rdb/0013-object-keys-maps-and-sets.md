@@ -80,6 +80,8 @@ item "For S3" (`version = seq` against "increments exactly once").
 **Does not amend:** ADR-rdb-0004 §2 (scope prefix), ADR-rdb-0010 decision 1 (physical prefix). No
 `rdb-core` contract change.
 **Basis:** `main` fe50411.
+**Amended by:** ADR-rdb-0014, 2026-10-05: decision 3 (row `0x04`) and decision 11 (the damaged-object
+table). Each edit is marked in place with its ruling.
 
 ## Context
 
@@ -144,7 +146,7 @@ One `rdb-value` module, `keys.rs`, owns this table. Later slices add rows there,
 | `0x01` | **Map entry or set member** | element key, profile v1 (decision 4) | this ADR (S3) |
 | `0x02` | List element record | reserved: S4, later | S4 |
 | `0x03` | List page record | reserved: S4, later | S4 |
-| `0x04` | **Blob chunk**, if ADR-rdb-0014 stores chunks as object records (decision 6) | reserved for ADR-rdb-0014 | S5 |
+| `0x04` | **Blob chunk** (amended 2026-10-05, L-R186x Q4; ADR-rdb-0014 decision 1) | `upload_id` (16 bytes), then `index` u32 BE: fixed width, 20 bytes, ending the key | ADR-rdb-0014 (S5) |
 | `0x05`–`0xFF` | unassigned | — | — |
 
 - The root sorts first, so a forward scan of an object prefix meets the root before any other record.
@@ -562,6 +564,8 @@ compares `count` with one scanned element (decision 9).
 | a map entry or set member (a value that fails, a member with bytes, or a key that does not decode) | `repair_element(snapshot, &RootKey, raw element key)` | `Delete` of that key, plus a root `Put` at `count − 1` with `expected_version: Some(root version)`. Needs a readable root. **Refuses when `count` is 0**: an element under a count of 0 is the orphan state, and `clear_object` is the repair |
 | a collection root; an element whose root is unreadable; an object in the count-mismatch or orphan state | `clear_object(snapshot, &RootKey)` | Up to 254 `Delete`s of non-root records per call. The root's `Delete` comes last, in the call that finds no other record. Repeat until done |
 | a document root | storage `Delete`, as in ADR-rdb-0012 §12 | unchanged |
+| a blob root (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | Deletes the chunks, then the root, as for a collection root. Each call also stops when one more `Delete` would put `record_len` over `MAX_ENVELOPE_BYTES` (ADR-rdb-0014 decision 8). `repair_element` does not apply. Built with the M9 admin path (O7) |
+| a blob chunk that does not open, or a key under `sub` `0x04` whose tail is not 20 bytes (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | As for a blob root. A chunk no manifest names is garbage, not damage, and GC removes it (ADR-rdb-0014 decision 8) |
 
   - **Both functions refuse with `NotDamaged` when the object is not damaged.** By the definition above,
     a count-mismatch or orphan object is damaged, so `clear_object` accepts it, even though its root

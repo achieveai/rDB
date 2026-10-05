@@ -121,7 +121,8 @@ Gautam's requirement (L-R182pp), in his words:
   Widening later needs an ADR.
 - **O2 Evidence files missing.** Spec §4.3.2 and §4.3.4 link `docs/rdb/evidence/` decision and Merge
   analysis files. That folder does not exist. S2 needs the encoding decision before it starts.
-- **O3 Blob digest.** BLAKE3-256 (§4.3.1) vs SHA-256 (ADR-rdb-0002 decision 6). Deferred to ADR-rdb-0014.
+- **O3 Blob digest. Closed** 2026-10-05 by ADR-rdb-0014 decision 3 (Gautam, L-R186x Q1): SHA-256, as
+  ADR-rdb-0002 decision 6, not BLAKE3-256 (§4.3.1). The spec sentence is amended to match.
 - **O4 One owner for the object sub-key discriminator.** One `rdb-value` module owns the table; S3/S5 add rows.
 
 ## References
