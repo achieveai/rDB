@@ -278,7 +278,7 @@ pub fn check_record(sub: Sub, raw: &[u8]) -> Result<rdb_value::value::Value, Fai
         (Sub::Item, Kind::Document) | (Sub::Page, Kind::ListPage) => {}
         (Sub::Item, found) => {
             return Err(Failure::from(ValueError::Corrupt(
-                Corrupt::EntryNotDocument { found },
+                Corrupt::ItemNotDocument { found },
             )))
         }
         (_, found) => {

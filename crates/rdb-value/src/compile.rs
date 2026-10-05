@@ -75,11 +75,13 @@ pub enum Corrupt {
     #[error("key: {0}")]
     Key(KeyError),
     /// A collection root's payload is not exactly `{"keys": n, "count": n}`, or its count plus
-    /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right. For a
-    /// list root, the payload breaks a rule of ADR-rdb-0016 §3, or a counter it holds would
-    /// overflow.
+    /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right.
     #[error("collection root: {0}")]
     Root(&'static str),
+    /// A list root's payload breaks a rule of ADR-rdb-0016 §3, or a counter it or a node holds
+    /// would overflow. The message names the list.
+    #[error("{0}")]
+    ListRoot(&'static str),
     /// A collection root names an element key profile this build does not know. Written by a
     /// newer build, not damage (ADR-rdb-0012 §12).
     #[error("unknown element key profile {0}")]
@@ -88,6 +90,12 @@ pub enum Corrupt {
     #[error("map entry envelope is a {found:?}, not a Document")]
     EntryNotDocument {
         /// The entry's envelope kind.
+        found: Kind,
+    },
+    /// A list item's envelope is not a document.
+    #[error("list item envelope is a {found:?}, not a Document")]
+    ItemNotDocument {
+        /// The item's envelope kind.
         found: Kind,
     },
     /// A set member's record holds bytes; it must be empty.

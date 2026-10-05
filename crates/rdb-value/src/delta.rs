@@ -163,6 +163,15 @@ pub enum ApplyError {
         /// The root's element count.
         count: u64,
     },
+    /// A list that still has items cannot be dropped (ADR-rdb-0016 §6).
+    #[error(
+        "the list still has {count} {}",
+        if *.count == 1 { "item" } else { "items" }
+    )]
+    ListNotEmpty {
+        /// The root's item count.
+        count: u64,
+    },
     /// The compiled request would carry more writes than one transaction admits; nothing is
     /// written.
     #[error("{writes} writes are more than one transaction admits")]

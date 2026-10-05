@@ -389,7 +389,7 @@ fn root_payload(next: u128, top: &Node, bytes: u64, count: u64) -> Result<Vec<u8
 }
 
 fn corrupt_root(what: &'static str) -> ValueError {
-    ValueError::Corrupt(Corrupt::Root(what))
+    ValueError::Corrupt(Corrupt::ListRoot(what))
 }
 
 /// Open a root record. Another kind is an [`ApplyError::KindMismatch`].
@@ -642,7 +642,7 @@ fn read_item(
     }
     let opened = open(&bytes).map_err(|e| corrupt(Corrupt::Envelope(e)))?;
     if opened.kind != Kind::Document {
-        return Err(corrupt(Corrupt::EntryNotDocument { found: opened.kind }));
+        return Err(corrupt(Corrupt::ItemNotDocument { found: opened.kind }));
     }
     let value = decode(opened.payload).map_err(|e| corrupt(Corrupt::Codec(e)))?;
     Ok((value, version))
@@ -1319,7 +1319,7 @@ pub fn compile_list(
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`], [`ApplyError::VersionConflict`], [`ApplyError::KindMismatch`],
-/// [`ApplyError::NotEmpty`], [`Corrupt::OrphanElement`] (an item or page record under an empty
+/// [`ApplyError::ListNotEmpty`], [`Corrupt::OrphanElement`] (an item or page record under an empty
 /// list), or any other [`ValueError::Corrupt`] of the root.
 pub fn drop_list(
     snapshot: &dyn SnapshotRead,
@@ -1330,7 +1330,7 @@ pub fn drop_list(
     let (_, bytes) = record(snapshot, root.as_bytes())?.ok_or(ApplyError::ObjectAbsent)?;
     let found = open_root(&bytes)?;
     if found.count > 0 {
-        return Err(ApplyError::NotEmpty { count: found.count }.into());
+        return Err(ApplyError::ListNotEmpty { count: found.count }.into());
     }
     if any_item_or_page(snapshot, root) {
         return Err(ValueError::Corrupt(Corrupt::OrphanElement));
