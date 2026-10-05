@@ -841,10 +841,14 @@ struct Pending {
 struct Tally {
     applied: u64,
     refused: u64,
+    /// Refusals by the generation fence (admission check 5) alone.
+    refused_by_generation: u64,
     failovers: u64,
     missing: u64,
     different: u64,
     retries: u64,
+    /// Retries of a publish whose commit a failover had undone.
+    retries_after_rollback: u64,
     stale_retries_recompiled: u64,
     already_on_retry: u64,
     falsely_failed: u64,
@@ -855,10 +859,12 @@ impl std::ops::AddAssign for Tally {
     fn add_assign(&mut self, o: Self) {
         self.applied += o.applied;
         self.refused += o.refused;
+        self.refused_by_generation += o.refused_by_generation;
         self.failovers += o.failovers;
         self.missing += o.missing;
         self.different += o.different;
         self.retries += o.retries;
+        self.retries_after_rollback += o.retries_after_rollback;
         self.stale_retries_recompiled += o.stale_retries_recompiled;
         self.already_on_retry += o.already_on_retry;
         self.falsely_failed += o.falsely_failed;
@@ -958,6 +964,13 @@ fn protocol_run(seed: u32, m: &Model) -> Tally {
                 .records
                 .get(root.as_bytes())
                 .is_some_and(|(_, v)| *v == intent.root_value);
+            let in_lineage = history
+                .get(intent.commit_seq as usize)
+                .and_then(|s| s.get(root.as_bytes()))
+                .is_some_and(|(v, value)| *v == intent.commit_seq && *value == intent.root_value);
+            if !in_lineage {
+                t.retries_after_rollback += 1;
+            }
             let first = if rng.next() < 0.5 {
                 intent.after.clone().expect("set at commit")
             } else {
@@ -981,12 +994,6 @@ fn protocol_run(seed: u32, m: &Model) -> Tally {
             }
             if matches!(r, Published::Already) {
                 t.already_on_retry += 1;
-                let in_lineage = history
-                    .get(intent.commit_seq as usize)
-                    .and_then(|s| s.get(root.as_bytes()))
-                    .is_some_and(|(v, value)| {
-                        *v == intent.commit_seq && *value == intent.root_value
-                    });
                 if !in_lineage && !still_there {
                     t.falsely_already += 1;
                 }
@@ -997,8 +1004,11 @@ fn protocol_run(seed: u32, m: &Model) -> Tally {
         }
         if !pending.is_empty() && rng.next() < 0.5 {
             let req = pending.swap_remove(rng.pick(pending.len()));
-            if k.apply(&req.compiled, req.generation).is_err() {
+            if let Err(refused) = k.apply(&req.compiled, req.generation) {
                 t.refused += 1;
+                if refused == Refused::GenerationChanged {
+                    t.refused_by_generation += 1;
+                }
                 continue;
             }
             history.push(k.records.clone());
@@ -1081,7 +1091,8 @@ struct Model {
 }
 
 /// `seeds` runs of `m`. None may break a manifest or misanswer a retry, and together they
-/// must have exercised failovers, refusals, retries and stale-snapshot retries.
+/// must have exercised failovers, refusals, retries and stale-snapshot retries, and at least one
+/// refusal by the generation fence and one retry of a commit a failover undid.
 fn assert_protocol(seeds: u32, m: &Model) {
     let mut t = Tally::default();
     for seed in 1..=seeds {
@@ -1100,6 +1111,11 @@ fn assert_protocol(seeds: u32, m: &Model) {
     );
     assert!(t.retries > 100 && t.already_on_retry > 50, "{t:?}");
     assert!(t.stale_retries_recompiled > 5, "{t:?}");
+    assert!(t.refused_by_generation > 0, "no fence refusal: {t:?}");
+    assert!(
+        t.retries_after_rollback > 0,
+        "no retry after a rollback: {t:?}"
+    );
 }
 
 /// R5, the protocol model at Node Part 3b's rates (ADR-rdb-0014 §6, §8 and §12): failover
