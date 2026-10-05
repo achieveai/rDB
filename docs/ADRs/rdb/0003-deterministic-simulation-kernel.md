@@ -197,7 +197,6 @@ milestone.
 - `docs/rdb/design-specification.md` §5.2, §5.3, §6.1 — the ordered write path, the publication
   barrier, and the buffered/durable split the trace has to make observable.
 - `docs/ADRs/0014-test-strategy.md` — one test file per milestone acceptance bullet.
-- `.claude/scratchpad/conversation_memories/rdb-partition-database/teams/verification/trace-requirements.md`
-  — the trace vocabulary this ADR freezes.
-- `.claude/scratchpad/conversation_memories/rdb-partition-database/teams/foundation/design.md`
-  §4 — the committed signatures.
+- The verification team's trace requirements (working notes, not in the repository) — the trace
+  vocabulary this ADR freezes.
+- The foundation design §4 (working notes, not in the repository) — the committed signatures.

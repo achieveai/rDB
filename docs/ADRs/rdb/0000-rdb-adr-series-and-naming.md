@@ -68,8 +68,8 @@ process document.
 
 - `docs/ADRs/rdb/README.md` lists every file in `docs/ADRs/rdb/` with its status.
 - A case-insensitive grep for the banned contraction over `Cargo.toml`, `crates`, `docs/ADRs/rdb`
-  and `docs/rdb` prints nothing and exits 1. Observed 2026-09-20. The exact command is in
-  `teams/foundation/architect-handoff.md`, where spelling it does not break the check.
+  and `docs/rdb` prints nothing and exits 1. Observed 2026-09-20. The exact command is kept in
+  working notes outside the repository, where spelling it does not break the check.
 - Every rDB ADR file contains all seven template headings.
 
 ## References

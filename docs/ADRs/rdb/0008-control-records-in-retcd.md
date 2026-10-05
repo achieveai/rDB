@@ -245,4 +245,4 @@ Rows in `docs/testing/test-plan-m7-kernel-a.md` (`M7A-NN`); tests in
 - `crates/config-core/src/store.rs` (`ConfigStore`), `crates/config-engine/src/direct.rs` — the
   surface the fake control store mirrors. Real binding is **M9**.
 - `ADR-rdb-0007` — the grant semantics built on this surface.
-- `.claude/scratchpad/conversation_memories/rdb-partition-database/teams/kernel-a/research.md` §2.
+- The kernel-a research notes §2 (working notes, not in the repository).

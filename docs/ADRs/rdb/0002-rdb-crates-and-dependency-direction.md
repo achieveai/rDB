@@ -123,5 +123,5 @@ feature precisely because that is true.
 - `docs/rdb/design-specification.md` §4.1 — one engine per core set.
 - crates.io and docs.rs for `blake3` 1.8.7, fetched 2026-09-20: latest version, feature list,
   and the `pure` feature.
-- `.claude/scratchpad/conversation_memories/rdb-partition-database/teams/foundation/research.md` §2
-  — the full BLAKE3 evaluation.
+- The foundation team's research notes §2 (working notes, not in the repository) — the full
+  BLAKE3 evaluation.

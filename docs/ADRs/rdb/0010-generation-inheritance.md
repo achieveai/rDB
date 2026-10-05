@@ -140,6 +140,7 @@ and the full-copy fallback (scope ruling 2026-10-02).
   ADR-rdb-0009 decisions 8–10.
 - `crates/rdb-sim/src/storage/memory.rs` `MemoryEngine::inherit`, `parent`, `base`, `replay_into`;
   `crates/rdb-core/src/contracts/storage.rs` `Batch`, `SnapshotRead`, `StorageFault`; M7 rows
-  `m7a_132`..`m7a_134` `..._quarantined_bytes_only` (`kernel_a_sim.rs`, export `m7c-m1`, not yet landed);
-  `rdb-storage` `lineage` module `verify_lineage` (S0, export `m8`).
-- Review and evidence: `teams/m8/adr-review.md` (F1–F5, A1–A3); ledger L-R182g, -k, -w, -kk, -pp.
+  `m7a_132`..`m7a_134` `..._quarantined_bytes_only` in
+  `crates/rdb-sim/tests/kernel_a_sim.rs`; `crates/rdb-storage/src/lineage.rs` `verify_lineage` (S0).
+- Review and evidence: the M8 ADR review (F1–F5, A1–A3), working notes not in the repository;
+  ledger L-R182g, -k, -w, -kk, -pp.
