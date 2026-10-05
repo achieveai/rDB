@@ -49,6 +49,10 @@ $env:RETCD_EVIDENCE=1; cargo test -p config-testkit --test m6_evidence
 pwsh scripts/evidence-gate.ps1          # fails if any artifact claims full_scale: false
 ```
 
+To publish a reduced-scale result, copy the file from `<logs>/<run id>/evidence/` into this
+directory by hand and commit it (ruling L-R186bx). The file keeps its own `full_scale` and
+`scale_factor`, so a reader can see what it is.
+
 `scripts/evidence-gate.ps1` exits non-zero when `RETCD_EVIDENCE=1` is set and any artifact in
 this directory carries `full_scale: false` — a full-scale request that silently degraded is a
 build problem, not evidence.
@@ -121,3 +125,6 @@ this.
   queue accounting instead, which is the oracle the test plan names anyway.
 - Spec §12.2's 60-minute RPO and 60-minute RTO figures remain **provisional planning
   assumptions**. `rpo-rto.json` measures; it does not claim them.
+- `rdb-m7-campaign.json` and `rdb-m7-coverage.json` record `scale_factor: 0` because no
+  generated seed runs through the bridge yet (owed: M7V-55, M7V-75, V-R33), so
+  `scripts/evidence-gate.ps1` fails on them under `RETCD_EVIDENCE=1`.
