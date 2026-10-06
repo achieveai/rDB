@@ -1,10 +1,12 @@
 # ADR-rdb-0016: Ordered lists — blocks, change slots and folding
 
-**Status:** Proposed, draft rev 6.1. **Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
+**Status:** Proposed, draft rev 6.2. **Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
 slots, folded by our code; Merge later, if measured. Superseded: rev 4's tree parts, Q1 (node size), Q4a (top node in root).
 Kept: ids and seed (Q4b), L = 256 B inline and `records` (L-R186cr), overlay flips, `MAX_ITEM` (Q2), tokens, the fence.
 **Rev 6** closes the rev 5 critic review (lead's rulings; working notes not in the repository): B1, M1 §4 · M2 §1, §4, §5 · M3 amendment rev 3 · A1, A3
 Consequences · A2 §4, O1 · A4 §3, §6, §7 · A5 §3, §4. **Rev 6.1** closes round 2: N1, N2, N4 §4 · N3 header, amendment.
+**Rev 6.2** (W1 walk D1, P9): reads fetch the base and only the pending slots, so no read returns a neighbour's records
+(`scan` has no end key); retire and drop delete slot keys by op no. §3, §4, §5, §6, Consequences.
 **Date:** 2026-10-05
 **Spec:** `docs/rdb/design-specification.md` D14, D16, §4.3, §4.3.2, §4.3.4; `docs/rdb/validation-plan.md` V13
 **Decided by:** Gautam, 2026-10-05: L-R186cz (Q1 mechanism N, Q2 cap 512 blocks, Q3 last block splits at its end; stated
@@ -58,9 +60,14 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - **Slot rule:** op no k of a block lives in slot `k mod 240`. Op nos only grow, per block, across folds and generations.
   `SLOTS = 240` is a **format constant**. A slot is read only for a pending op no, and must hold exactly that op no.
   A slot holding any other op no is stale and ignored. A new block starts with `folded = head = 0`.
-- **Replay:** a reader opens the block with one `scan` from its key (limit 241: the base, then every slot), decodes the base,
-  applies the pending ops in op-no order, and checks the result's count against the root. Nothing reaches the caller until
-  all checks pass. A slot needs no version check: its op-no match, the block's version check and the root's version guard it.
+- **Slot keys:** a block's slot keys are a subset of `k mod 240` for op nos 1 … `head` (at most min(head, 240)); a fold
+  skips slot writes, so some may be absent. Every **pending** op no's slot exists. Split, merge-back and retire keep this.
+- **Replay:** a reader `get`s the base, then reads the pending slots with one `scan` from slot `(folded + 1) mod 240`,
+  limit p, or two when the range wraps past slot 239 (the second from slot 0). It never reads a stale slot or a key past the
+  block. A scan entry whose key is not the expected slot is `OpMissing`. It decodes the base, applies the pending ops in
+  op-no order, and checks the result's count against the root. Nothing reaches the caller until all checks pass. A slot
+  needs no version check: its op-no match, the block's version check and the root's version guard it. (A missing pending
+  slot can make a scan return up to p records past the block; the read is refused.)
 - **Fold, decided once per touched block at the end of a compile:** let p = pending ops after this delta and q = their slot
   payload bytes. If p > 240 or 4·q > the stored base's **payload length** (the canonical CBOR of the block, the measure for
   every fill threshold, never the root's `bytes`), the block is **folded**: its new base is written with `folded = head`,
@@ -77,7 +84,8 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
      prefix of at most B bytes; a new last block takes the rest. **Any other block splits into byte-balanced halves**: the
      left half keeps the old id. The new block takes an id from `next` and starts at `folded = head = 0`. Every piece must
      be ≤ B (L-R186cz Q3). **Splits apply in block order** (this decides which takes block 512).
-  2. **Retired, at count 0 when not the only block:** base and existing slots deleted (≤ 241; one op empties ≤ 1 block).
+  2. **Retired, at count 0 when not the only block:** base and the slot key of every op no 1 … `head` deleted (≤ 241,
+     present or not; one op empties ≤ 1 block).
      **If a delta leaves count = 0, the first block stays** (written empty, `folded = head`); the others retire.
   3. **Otherwise refused `TooLarge{List}`**, writing nothing. A multi-op delta that grows one block past 2·B lands here.
      A k-way split would accept it but adds a path v1 does not need.
@@ -129,14 +137,15 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   non-root writes carry `expected_version: None`. A key minted and freed in one delta writes nothing. A compile whose ops
   change nothing still rewrites the root (L-R186cm).
 - **Drop:** version and kind; `ListNotEmpty{count}` when `count > 0`. At `count = 0` there is one block (decision 4) and its
-  replay is empty; one scan from `prefix | 0x02` (limit 243) finds nothing under `0x02`/`0x03` but its base and slots. Writes
-  the root `Delete` (`Some(v)`), the block and each existing slot.
+  replay is empty. Two orphan checks, each a `scan` with limit 1: from `prefix | 0x02` it must find the base; from
+  `block key ‖ 0xF0` it must find nothing under `0x03`. Each reads at most one record outside the list, like create's check.
+  Writes the root `Delete` (`Some(v)`), the base and the slot key of every op no 1 … `head` (≤ 240, present or not).
 
 ### 6. Reads, versions, tokens, and finding an item by id
 - `list(snapshot, &RootKey) -> Option<List{version, count, bytes, blocks}>`. `items(snapshot, &RootKey, Position(p) |
   Token(t), limit) -> Items{list, items, next}`; item = `{position, id, value, version}`.
-- **Calls:** the root's `get` and `version`; per block crossed, one `scan` and one `version` (the base's; slots need none);
-  one `get` and `version` per out-of-line item returned. A point read is 4 calls plus its item's 2.
+- **Calls:** the root's `get` and `version`; per block crossed, the base's `get` and `version` and 0–2 slot
+  `scan`s; one `get` and `version` per out-of-line item. A point read is 4–6 calls plus its item's 2.
 - **Token** = `(generation, version, position)`: `GenerationChanged` or `VersionConflict` on a mismatch.
 - **Version:** every op writes the root, so the collection version moves once per transaction. An inline item's `version` is
   the root's; an out-of-line item's is its record's. Not concurrency tokens; M9's value-digest check hashes the value.
@@ -204,7 +213,8 @@ Tenant 1, affinity 1, id `todo`, `snapshot.at()` = 0, `records` false.
 
 ## Consequences
 - **Per push** (`record_len`, computed): ~0.97 / 1.24 / 3.9 / 16.3 KB at 1 / 10 / 100 / 512 blocks, against 16.8–49.7 KB.
-- A point read opens and digests one block (≤ ~1.25 · B): ~2–7× the tree's bytes past ~24 KiB, the same below.
+- A point read opens one base and its pending slots (q ≤ base/4), so ≤ ~1.25 · B; stale slots are never read (P9: they
+  would add up to 240 × ~300 B ≈ 72 KB). That is ~2–7× the tree's bytes past ~24 KiB, the same below.
 - **Capacity at the default: ≥ ~16 MiB worst (blocks just over B/4 never merge), ~64 MiB push-only** (end splits fill blocks).
 - **F1 residual:** each retired block leaves ≤ 241 tombstones in a linked lineage (ids are never reused), so a churning queue
   grows dead keys at ~1 per 25+ ops, not 1 per op, until the M10 fold.
@@ -217,7 +227,8 @@ Tests in `crates/rdb-value/tests/lists.rs`; each names the scenario it protects.
 - **Vectors both ways** for the root, a block and a slot, from a Node encoder written apart from the Rust code.
 - **Model:** random op lists at `block_max` 1,024, values both sides of the inline limit, vs a `Vec` model (items, ids, `count`,
   `bytes`). After every op an **invariant checker** walks the raw records: root sums; every base ≤ B when written, or unsplit
-  at the cap with no pending slot; **count = 0 ⇔ one block**; pending ≤ 240 and each pending slot holds its op no; bare
+  at the cap with no pending slot; **count = 0 ⇔ one block**; pending ≤ 240 and each pending slot holds its op no; no slot key
+  outside op nos 1 … `head`; bare
   id ⇔ record; every `0x02`/`0x03` key belongs to a live block or item; a `records` list has no inline entry.
 - **Rows:** each Scenarios row above; fold by count and by ¼; merge-back skipped when it would not fit; an id over 3,072 B
   refused; overlay rows (rev 4); stale-slot inheritance.

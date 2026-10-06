@@ -72,7 +72,7 @@ pub fn write_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
     )
 }
 
-/// `drop <id> --expect V [--compile-only]` for a list.
+/// `drop <id> --expect V [--compile-only]` for a list. Prints `written`, as a write does.
 pub fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let (id, root, mut rest) = object(rest)?;
     let (mut version, mut compile_only) = (None, false);
@@ -90,10 +90,15 @@ pub fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure>
         }
     }
     let version = version.ok_or_else(|| Failure::usage("drop needs --expect V").keyed(id))?;
-    let fields = id_fields(id, &root);
+    let mut fields = id_fields(id, &root);
     let mut store = Store::load(store_path)?;
     let compiled = drop_list(&store.snapshot, &root, version)
         .map_err(|e| Failure::from(e).with(fields.clone()))?;
+    let request = compiled.compiled();
+    fields.push((
+        "written",
+        record_len(request.conditions.len(), &request.mutations).to_string(),
+    ));
     emit(
         &mut store,
         compiled.compiled(),
@@ -277,7 +282,8 @@ fn position(op: &str, text: &str) -> Result<u64, Failure> {
 
 /// `dump`'s list root: `count`, `bytes` and `blocks` through the library's read, then the
 /// payload as stored (`next`, `seed`, `bytes`, `count`, `blocks` as `[n, count, bytes, head]`
-/// per block, `records`).
+/// per block, `records`), then `absent_bases`, the ids of the blocks it names whose base is not
+/// in the store, when there are any: such a block has no record of its own to show.
 pub fn dump_root(snapshot: &MapSnapshot, root: &RootKey, line: &mut Line) -> Result<(), Failure> {
     let found =
         list(snapshot, root)?.ok_or_else(|| Failure::store("record vanished between two reads"))?;
@@ -290,7 +296,41 @@ pub fn dump_root(snapshot: &MapSnapshot, root: &RootKey, line: &mut Line) -> Res
     let opened = envelope::open(&raw).map_err(corrupt_envelope)?;
     let payload = cbor::decode(opened.payload)?;
     line.raw("value", render(&payload));
+    let seed = field(&payload, "seed").as_ref().and_then(uint);
+    if let (Some(seed), Some(Value::Array(blocks))) = (seed, field(&payload, "blocks")) {
+        let absent: Vec<String> = blocks
+            .iter()
+            .filter_map(|block| match block {
+                Value::Array(parts) => parts.first().and_then(uint),
+                _ => None,
+            })
+            .map(|n| (u128::from(seed) << 64) | u128::from(n))
+            .filter(|id| {
+                snapshot
+                    .get(Namespace::User, &block_key(root, *id))
+                    .is_none()
+            })
+            .map(|id| json_str(&show(id)))
+            .collect();
+        if !absent.is_empty() {
+            line.raw("absent_bases", format!("[{}]", absent.join(",")));
+        }
+    }
     Ok(())
+}
+
+fn field(value: &Value, name: &str) -> Option<Value> {
+    match value {
+        Value::Map(m) => m.get(&MapKey::new(name)).cloned(),
+        _ => None,
+    }
+}
+
+fn uint(value: &Value) -> Option<u64> {
+    match value {
+        Value::Integer(i) => u64::try_from(i.get()).ok(),
+        _ => None,
+    }
 }
 
 /// `dump`'s list item, block base or change slot: its `sub` and `id` (and `slot`), then the
@@ -335,18 +375,6 @@ pub fn dump_record(
 /// `pending` when op `op_no` is in its block's pending range `folded + 1 ..= head` and belongs in
 /// `slot`; `stale` when it is not. When the root or the base does not decode, says so instead.
 fn slot_state(snapshot: &MapSnapshot, root: &RootKey, id: u128, slot: u8, op_no: &Value) -> String {
-    fn field(value: &Value, name: &str) -> Option<Value> {
-        match value {
-            Value::Map(m) => m.get(&MapKey::new(name)).cloned(),
-            _ => None,
-        }
-    }
-    fn uint(value: &Value) -> Option<u64> {
-        match value {
-            Value::Integer(i) => u64::try_from(i.get()).ok(),
-            _ => None,
-        }
-    }
     let payload = |key: &[u8]| {
         let raw = snapshot.get(Namespace::User, key)?;
         let opened = envelope::open(&raw).ok()?;

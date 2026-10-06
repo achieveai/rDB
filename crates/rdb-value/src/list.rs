@@ -35,7 +35,7 @@ use crate::compile::{
     check_version, record, BlockFault, Compiled, Corrupt, Expected, SlotFault, ValueError,
 };
 use crate::delta::{ApplyError, SizeLimit};
-use crate::envelope::{open, seal, EnvelopeError, Kind, HEADER_LEN};
+use crate::envelope::{open, seal, Kind, HEADER_LEN};
 use crate::keys::{
     block_key, item_key, slot_key, KeyError, RootKey, LIST_ID_LEN, LIST_SLOTS, SUB_BLOCK, SUB_ITEM,
 };
@@ -65,10 +65,6 @@ pub const INLINE_MAX: usize = 256;
 
 /// [`LIST_SLOTS`] as an op-no modulus.
 const SLOTS: u64 = LIST_SLOTS as u64;
-/// One `scan` from a block's key returns its base, then every slot.
-const BLOCK_SCAN: usize = LIST_SLOTS as usize + 1;
-/// A drop's orphan scan: the block's 241 keys and room to see one more.
-const DROP_SCAN: usize = BLOCK_SCAN + 2;
 
 /// The largest encoded value a block entry holds at `block_max`: `min(L, B / 4 − 16)`, so a
 /// block over B holds at least 4 entries (ADR-rdb-0016 §4). At 1,024 it is 240; L binds from
@@ -471,6 +467,13 @@ fn parse_block_ref(value: &Value) -> Result<BlockRef, &'static str> {
 /// Open a root record. Another kind is an [`ApplyError::KindMismatch`].
 fn open_root(bytes: &[u8]) -> Result<Root, ValueError> {
     let opened = open(bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+    // A block or slot record is never written at a root key, so one there is damage, not
+    // another kind of object.
+    if matches!(opened.kind, Kind::ListBlock | Kind::ListSlot) {
+        return Err(corrupt_root(
+            "a list block or slot record is at the root key",
+        ));
+    }
     if opened.kind != Kind::List {
         return Err(ApplyError::KindMismatch { found: opened.kind }.into());
     }
@@ -545,7 +548,7 @@ fn open_root(bytes: &[u8]) -> Result<Root, ValueError> {
 // ---- blocks --------------------------------------------------------------------------------
 
 /// A block read back and replayed: its entries after every pending op, with what a write needs
-/// to decide a fold, and every key it holds.
+/// to decide a fold.
 struct Loaded {
     /// The base's payload length.
     base_len: usize,
@@ -553,12 +556,29 @@ struct Loaded {
     entries: Vec<Entry>,
     /// The pending slots' payload bytes.
     pending_bytes: usize,
-    /// The base's key and every slot key stored, stale ones included.
-    keys: Vec<Bytes>,
 }
 
-/// Read block `id`, which the root (at `root_version`) names as `block`, with one scan; replay
-/// its pending ops; and check it (ADR-rdb-0016 §3, §7) before anything uses it.
+/// The slot op no `op` lives in: `op mod 240`.
+fn slot_of(op: u64) -> u8 {
+    u8::try_from(op % SLOTS).expect("a slot is below 240")
+}
+
+/// Every key block `id` can hold after op no `head`: its base, then the slot of each op no
+/// `1 … head`, ascending (ADR-rdb-0016 §3). A fold writes no slot, so some may be absent; a
+/// retire or a drop deletes them all, present or not.
+fn block_keys(root: &RootKey, id: u128, head: u64) -> Vec<Bytes> {
+    let mut slots: Vec<u8> = (1..=head.min(SLOTS)).map(slot_of).collect();
+    slots.sort_unstable();
+    let mut keys = vec![block_key(root, id)];
+    keys.extend(slots.into_iter().map(|slot| slot_key(root, id, slot)));
+    keys
+}
+
+/// Read block `id`, which the root (at `root_version`) names as `block`: `get` its base, then
+/// read only its pending slots, with one `scan` from the first, or two when they wrap past slot
+/// 239 (ADR-rdb-0016 §3). No stale slot and no key past the block is read, so a neighbour's
+/// records never are (G67). Replay the pending ops and check the block (§7) before anything
+/// uses it.
 fn load_block(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -568,32 +588,9 @@ fn load_block(
 ) -> Result<Loaded, ValueError> {
     let fault = |fault| ValueError::Corrupt(Corrupt::Block { id, fault });
     let key = block_key(root, id);
-    let mut base = None;
-    let mut slots: Vec<Option<Bytes>> = vec![None; BLOCK_SCAN - 1];
-    let mut keys = Vec::new();
-    for (found, value) in snapshot.scan(Namespace::User, &key, BLOCK_SCAN) {
-        let Some(tail) = found.strip_prefix(key.as_ref()) else {
-            break;
-        };
-        match *tail {
-            [] => base = Some(value),
-            [slot] if slot < LIST_SLOTS => slots[usize::from(slot)] = Some(value),
-            [slot] => {
-                return Err(ValueError::Corrupt(Corrupt::Key(
-                    KeyError::SlotOutOfRange { slot },
-                )))
-            }
-            _ => {
-                let len = LIST_ID_LEN + tail.len();
-                return Err(ValueError::Corrupt(Corrupt::Key(KeyError::ListIdTail {
-                    len,
-                })));
-            }
-        }
-        keys.push(found);
-    }
-
-    let bytes = base.ok_or_else(|| fault(BlockFault::Missing))?;
+    let bytes = snapshot
+        .get(Namespace::User, &key)
+        .ok_or_else(|| fault(BlockFault::Missing))?;
     let version = snapshot
         .version(Namespace::User, &key)
         .ok_or(ValueError::Corrupt(Corrupt::VersionWithoutValue))?;
@@ -618,39 +615,50 @@ fn load_block(
             "a list block's folded is past its root entry's head",
         )));
     }
-    if block.head - folded > SLOTS {
+    let pending = block.head - folded;
+    if pending > SLOTS {
         return Err(fault(BlockFault::Shape(
             "a list block has more than 240 pending ops",
         )));
     }
 
+    // The pending slots run from slot (folded + 1) mod 240; past slot 239 they wrap to 0.
+    let start = folded + 1;
+    let first_run = pending.min(SLOTS - start % SLOTS);
+    let runs = [(start, first_run), (start + first_run, pending - first_run)];
     let mut pending_bytes = 0;
-    for op in folded + 1..=block.head {
-        let slot = u8::try_from(op % SLOTS).expect("a slot is below 240");
-        let bad = |fault| {
-            ValueError::Corrupt(Corrupt::Block {
-                id,
-                fault: BlockFault::OpBad { op, fault },
-            })
-        };
-        let raw = slots[usize::from(slot)]
-            .as_ref()
-            .ok_or_else(|| fault(BlockFault::OpMissing { op }))?;
-        let opened = open(raw).map_err(|e| bad(SlotFault::Envelope(e)))?;
-        if opened.kind != Kind::ListSlot {
-            return Err(bad(SlotFault::NotASlot { found: opened.kind }));
+    for (from, len) in runs.into_iter().filter(|&(_, len)| len > 0) {
+        let limit = usize::try_from(len).expect("at most 240 pending ops");
+        let found = snapshot.scan(Namespace::User, &slot_key(root, id, slot_of(from)), limit);
+        for (op, i) in (from..from + len).zip(0..) {
+            // A scan entry that is not this op's slot means the slot is missing (§3).
+            let raw = found
+                .get(i)
+                .filter(|(found_key, _)| *found_key == slot_key(root, id, slot_of(op)))
+                .map(|(_, value)| value)
+                .ok_or_else(|| fault(BlockFault::OpMissing { op }))?;
+            let bad = |fault| {
+                ValueError::Corrupt(Corrupt::Block {
+                    id,
+                    fault: BlockFault::OpBad { op, fault },
+                })
+            };
+            let opened = open(raw).map_err(|e| bad(SlotFault::Envelope(e)))?;
+            if opened.kind != Kind::ListSlot {
+                return Err(bad(SlotFault::NotASlot { found: opened.kind }));
+            }
+            let value = decode(opened.payload).map_err(|e| bad(SlotFault::Codec(e)))?;
+            let (op_no, change) = parse_slot(&value).map_err(|w| bad(SlotFault::Shape(w)))?;
+            // A slot is trusted by its op no: the root names the pending range, and only a write
+            // of that root put op `op` here (ADR-rdb-0016 §7).
+            if op_no != op {
+                return Err(fault(BlockFault::OpMissing { op }));
+            }
+            if !change.apply(&mut entries) {
+                return Err(fault(BlockFault::OpOutOfRange { op }));
+            }
+            pending_bytes += opened.payload.len();
         }
-        let value = decode(opened.payload).map_err(|e| bad(SlotFault::Codec(e)))?;
-        let (op_no, change) = parse_slot(&value).map_err(|w| bad(SlotFault::Shape(w)))?;
-        // A slot is trusted by its op no: the root names the pending range, and only a write of
-        // that root put op `op` here (ADR-rdb-0016 §7).
-        if op_no != op {
-            return Err(fault(BlockFault::OpMissing { op }));
-        }
-        if !change.apply(&mut entries) {
-            return Err(fault(BlockFault::OpOutOfRange { op }));
-        }
-        pending_bytes += opened.payload.len();
     }
     if len_u64(entries.len()) != block.count {
         return Err(fault(BlockFault::Shape(
@@ -662,7 +670,6 @@ fn load_block(
         folded,
         entries,
         pending_bytes,
-        keys,
     })
 }
 
@@ -691,6 +698,7 @@ fn summary(version: u64, root: &Root) -> List {
 
 /// Up to `limit` items of the list at `root`, in list order, from `start`. Every block the
 /// items are in, and every item record returned, is read and checked before any is returned.
+/// `limit` 0 reads the root only: no items and no token, since a token could not advance.
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`]; [`ApplyError::KindMismatch`]; for a token,
@@ -756,7 +764,7 @@ pub fn items(
         let (value, item_version, inline) = match entry.inline {
             Some(value) => (value, version, true),
             None => {
-                let (value, item_version) = read_item(snapshot, root, id, version)?;
+                let (value, item_version, _) = read_item(snapshot, root, id, version)?;
                 (value, item_version, false)
             }
         };
@@ -768,7 +776,7 @@ pub fn items(
             version: item_version,
         });
     }
-    let next = (end < found.count).then_some(Token {
+    let next = (limit > 0 && end < found.count).then_some(Token {
         generation: snapshot.generation(),
         version,
         position: end,
@@ -780,13 +788,14 @@ pub fn items(
     })
 }
 
-/// Read and check the item `id` under a root at `root_version`.
+/// Read and check the item `id` under a root at `root_version`: its value, version and payload
+/// length. A read and a write that sizes the item check it alike, so both name the same fault.
 fn read_item(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
     id: u128,
     root_version: u64,
-) -> Result<(Value, u64), ValueError> {
+) -> Result<(Value, u64, usize), ValueError> {
     let corrupt = ValueError::Corrupt;
     let (version, bytes) =
         record(snapshot, &item_key(root, id))?.ok_or(corrupt(Corrupt::ItemMissing { id }))?;
@@ -801,7 +810,7 @@ fn read_item(
         return Err(corrupt(Corrupt::ItemNotDocument { found: opened.kind }));
     }
     let value = decode(opened.payload).map_err(|e| corrupt(Corrupt::Codec(e)))?;
-    Ok((value, version))
+    Ok((value, version, opened.payload.len()))
 }
 
 /// Whether a record exists under `root`'s item or block range (one limit-1 scan). A key after
@@ -919,7 +928,7 @@ impl Draft<'_> {
     }
 
     /// An item's value length (ADR-rdb-0016 §1): an inline value's encoding, else its record's
-    /// payload, from the overlay first, then read from the snapshot and checked (§5).
+    /// payload, from the overlay first, else read from the snapshot and checked as a read checks it.
     fn item_len(&self, entry: &Entry) -> Result<u64, ValueError> {
         if let Some(value) = &entry.inline {
             return Ok(len_u64(encode(value).map_err(ApplyError::from)?.len()));
@@ -930,18 +939,7 @@ impl Draft<'_> {
             let envelope = slot.value.as_ref().ok_or(missing)?;
             return Ok(len_u64(envelope.len() - HEADER_LEN));
         }
-        let (version, bytes) = record(self.snapshot, &item_key(self.root, id))?.ok_or(missing)?;
-        if version > self.root_version {
-            return Err(ValueError::Corrupt(Corrupt::ElementNewerThanRoot {
-                element: version,
-                root: self.root_version,
-            }));
-        }
-        let truncated = EnvelopeError::Truncated { len: bytes.len() };
-        let payload = bytes
-            .len()
-            .checked_sub(HEADER_LEN)
-            .ok_or(ValueError::Corrupt(Corrupt::Envelope(truncated)))?;
+        let (_, _, payload) = read_item(self.snapshot, self.root, id, self.root_version)?;
         Ok(len_u64(payload))
     }
 
@@ -1167,7 +1165,10 @@ impl Draft<'_> {
                 // (rev 6 B1).
                 if payload.len() > self.block_max {
                     return Err(ApplyError::TooLarge {
-                        limit: SizeLimit::List,
+                        limit: SizeLimit::List {
+                            len: payload.len(),
+                            block_max: self.block_max,
+                        },
                     }
                     .into());
                 }
@@ -1238,7 +1239,7 @@ fn compile(
     }
     if root.as_bytes().len() - SCOPE_AND_SUB > MAX_ID_ESCAPED {
         return Err(ApplyError::TooLarge {
-            limit: SizeLimit::Write,
+            limit: SizeLimit::ObjectId,
         }
         .into());
     }
@@ -1345,13 +1346,16 @@ fn compile(
 }
 
 /// Compile the deletion of the empty list at `root`, at `version` (ADR-rdb-0016 §5): the root,
-/// its one block's base and every slot stored beside it. The block is replayed and checked
-/// first, and one scan must find nothing else under the item or block range.
+/// its one block's base and the slot key of every op no `1 … head`, present or not. The block
+/// is replayed and checked first. Two orphan checks read one record each: the first record
+/// under the item or block range must be the base, and none under the block range may follow
+/// its last slot (G59).
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`], [`ApplyError::VersionConflict`], [`ApplyError::KindMismatch`],
 /// [`ApplyError::ListNotEmpty`], [`Corrupt::OrphanElement`] (an item or block record beside an
-/// empty list), or any other [`ValueError::Corrupt`] of the root or its block.
+/// empty list), [`Corrupt::Key`] (such a key with a malformed tail), or any other
+/// [`ValueError::Corrupt`] of the root or its block.
 pub fn drop_list(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -1366,24 +1370,41 @@ pub fn drop_list(
     let [block] = found.blocks.as_slice() else {
         unreachable!("open_root refuses a count-0 block beside others, so an empty list has one");
     };
-    let loaded = load_block(snapshot, root, version, found.id(block.n), block)?;
+    let id = found.id(block.n);
+    load_block(snapshot, root, version, id, block)?;
+    let base = block_key(root, id);
     let (items, blocks) = (root.sub_prefix(SUB_ITEM), root.sub_prefix(SUB_BLOCK));
-    for (key, _) in snapshot.scan(Namespace::User, &items, DROP_SCAN) {
-        if !(key.starts_with(&items) || key.starts_with(&blocks)) {
-            break;
+    let under = |key: &Bytes| key.starts_with(&items) || key.starts_with(&blocks);
+    match snapshot.scan(Namespace::User, &items, 1).first() {
+        Some((key, _)) if *key == base => {}
+        Some((key, _)) if under(key) => return Err(stray(root, key)),
+        // `load_block` just read the base, so the scan cannot pass it.
+        _ => {
+            return Err(ValueError::Corrupt(Corrupt::Block {
+                id,
+                fault: BlockFault::Missing,
+            }))
         }
-        if !loaded.keys.contains(&key) {
-            return Err(ValueError::Corrupt(Corrupt::OrphanElement));
+    }
+    let mut past = base.to_vec();
+    past.push(LIST_SLOTS);
+    if let Some((key, _)) = snapshot.scan(Namespace::User, &past, 1).first() {
+        if key.starts_with(&blocks) {
+            return Err(stray(root, key));
         }
     }
     let mut mutations = vec![Mutation::Delete {
         key: root.to_bytes(),
         expected_version: Some(version),
     }];
-    mutations.extend(loaded.keys.into_iter().map(|key| Mutation::Delete {
-        key,
-        expected_version: None,
-    }));
+    mutations.extend(
+        block_keys(root, id, block.head)
+            .into_iter()
+            .map(|key| Mutation::Delete {
+                key,
+                expected_version: None,
+            }),
+    );
     Ok(ListCompiled {
         compiled: Compiled {
             mutations,
@@ -1392,4 +1413,24 @@ pub fn drop_list(
         ids: Vec::new(),
         generation: snapshot.generation(),
     })
+}
+
+/// A record a drop's orphan check found under the item or block range that is not its block's
+/// (ADR-rdb-0016 §7): a key whose tail no list writes is `Key(..)`, any other an orphan.
+fn stray(root: &RootKey, key: &[u8]) -> ValueError {
+    let (items, blocks) = (root.sub_prefix(SUB_ITEM), root.sub_prefix(SUB_BLOCK));
+    let fault = if let Some(tail) = key.strip_prefix(items.as_slice()) {
+        (tail.len() != LIST_ID_LEN).then_some(KeyError::ListIdTail { len: tail.len() })
+    } else if let Some(tail) = key.strip_prefix(blocks.as_slice()) {
+        match *tail {
+            [.., slot] if tail.len() == LIST_ID_LEN + 1 && slot >= LIST_SLOTS => {
+                Some(KeyError::SlotOutOfRange { slot })
+            }
+            _ if tail.len() == LIST_ID_LEN || tail.len() == LIST_ID_LEN + 1 => None,
+            _ => Some(KeyError::ListIdTail { len: tail.len() }),
+        }
+    } else {
+        None
+    };
+    ValueError::Corrupt(fault.map_or(Corrupt::OrphanElement, Corrupt::Key))
 }

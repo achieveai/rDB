@@ -503,7 +503,12 @@ fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
             store
                 .snapshot
                 .get(Namespace::User, root.as_bytes())
-                .is_some_and(|raw| envelope::open(&raw).is_ok_and(|o| o.kind == Kind::List))
+                // A block or slot record at a root key is list damage; the list drop names it.
+                .is_some_and(|raw| {
+                    envelope::open(&raw).is_ok_and(|o| {
+                        matches!(o.kind, Kind::List | Kind::ListBlock | Kind::ListSlot)
+                    })
+                })
         }
         None => false,
     };
@@ -664,10 +669,11 @@ fn dump_record(
             } else if opened.kind == Kind::Blob {
                 blob::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
-            } else if opened.kind == Kind::List {
+            } else if matches!(opened.kind, Kind::List | Kind::ListBlock | Kind::ListSlot) {
+                // A block or slot record at a root key is list damage; the list read names it.
                 list::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
-            } else if matches!(opened.kind, Kind::Chunk | Kind::ListBlock | Kind::ListSlot) {
+            } else if opened.kind == Kind::Chunk {
                 return Err(Failure::from(ApplyError::KindMismatch {
                     found: opened.kind,
                 }));
@@ -1306,20 +1312,15 @@ impl Store {
 
     /// [`Store::apply`] for a request that names its generation (ADR-rdb-0014 §12): a generation
     /// other than the snapshot's is refused first, before any condition, as the kernel's admission
-    /// check 5 refuses it (`GENERATION_CHANGED`).
+    /// check 5 refuses it (`GENERATION_CHANGED`), named as a stale token is.
     fn apply_at(&mut self, compiled: &Compiled, generation: Generation) -> Result<u64, Failure> {
         let current = self.snapshot.generation();
         if generation != current {
-            return Err(Failure::refused(
-                format!(
-                    "GenerationChanged {{ expected: {}, current: {} }}",
-                    generation.0, current.0
-                ),
-                format!(
-                    "GENERATION_CHANGED: the request names generation {}, the store is at {}",
-                    generation.0, current.0
-                ),
-            ));
+            return Err(ApplyError::GenerationChanged {
+                expected: generation.0,
+                found: current.0,
+            }
+            .into());
         }
         self.apply(compiled)
     }

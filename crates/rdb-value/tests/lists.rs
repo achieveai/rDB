@@ -16,6 +16,7 @@ use rdb_value::keys::{parse, root_key, RootKey, Sub};
 use rdb_value::list::{
     compile_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_BLOCK_MAX, MIN_BLOCK_MAX,
 };
+use rdb_value::testing::CountingSnapshot;
 use rdb_value::value::{Map, Value};
 use rdb_value::{compile, read, BlockFault, Compiled, Corrupt, Expected, ValueError};
 
@@ -731,6 +732,138 @@ fn w1_a_damaged_block_is_refused_on_read_and_write() {
                     "{name}: {err:?}"
                 );
             }
+        }
+    }
+}
+
+/// The bytes `items`, a push and a drop of the list at `root` read from `k`. The drop is measured
+/// after removing every item.
+fn opened_bytes(k: &Kernel, root: &RootKey) -> [u64; 3] {
+    let snap = k.snapshot();
+    let read = CountingSnapshot::new(&snap);
+    items(&read, root, Start::Position(0), usize::MAX).expect("read");
+    let push = CountingSnapshot::new(&snap);
+    let version = version_of(k, root);
+    let ops = [ListOp::Push(text("x"))];
+    compile_list(&push, root, Expected::Version(version), MIN_BLOCK_MAX, &ops).expect("push");
+    let mut k = k.clone();
+    let all = items(&k.snapshot(), root, Start::Position(0), usize::MAX).expect("read");
+    let removes: Vec<ListOp> = all.items.iter().map(|_| ListOp::Remove { at: 0 }).collect();
+    write(&mut k, root, MIN_BLOCK_MAX, &removes);
+    let snap = k.snapshot();
+    let dropped = CountingSnapshot::new(&snap);
+    drop_list(&dropped, root, version_of(&k, root)).expect("drop");
+    [read.bytes(), push.bytes(), dropped.bytes()]
+}
+
+/// Tester W1 D1 (design S24, G67): a block read stays inside the block's pending slots. A tiny
+/// list's read and write open the same bytes whether or not a list whose items are big records
+/// sorts right after it; they used to scan on into that neighbour's records. A drop's second
+/// orphan check is a limit-1 scan past the block (ADR-rdb-0016 §5), so it opens exactly one
+/// foreign record, the next key: here the neighbour's root, never its items.
+#[test]
+fn d1_a_tiny_list_opens_no_bytes_of_a_big_neighbour() {
+    let tiny = root_key(TenantId(1), AffinityId(1), b"a");
+    let big = root_key(TenantId(1), AffinityId(1), b"b");
+    let mut k = Kernel::new();
+    made(
+        &mut k,
+        &tiny,
+        MIN_BLOCK_MAX,
+        &["a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7"],
+    );
+    // Below a quarter of the base, so it stays pending: the read scans its slot.
+    write(&mut k, &tiny, MIN_BLOCK_MAX, &[ListOp::Push(text("tiny"))]);
+    assert!(
+        k.records
+            .keys()
+            .any(|key| parse(key).is_ok_and(|p| p.root() == tiny && p.slot.is_some())),
+        "the tiny list has a pending slot"
+    );
+    let alone = opened_bytes(&k, &tiny);
+
+    made(&mut k, &big, DEFAULT_BLOCK_MAX, &[]);
+    let record = "w".repeat(400_000);
+    for _ in 0..3 {
+        write(
+            &mut k,
+            &big,
+            DEFAULT_BLOCK_MAX,
+            &[ListOp::Push(text(&record))],
+        );
+    }
+    let neighbour: usize = k
+        .records
+        .iter()
+        .filter(|(key, _)| parse(key).is_ok_and(|p| p.root() == big && p.sub == Sub::Item))
+        .map(|(_, (_, value))| value.len())
+        .sum();
+    assert!(neighbour > 1_200_000, "the neighbour's items are records");
+    let next = k.records[&big.to_bytes()].1.len();
+    let [read, push, dropped] = opened_bytes(&k, &tiny);
+    assert_eq!([read, push], [alone[0], alone[1]], "read, push");
+    assert_eq!(dropped, alone[2] + u64::try_from(next).unwrap(), "drop");
+}
+
+/// Tester W1 D2: a write that sizes an item record checks it as a read does, and refuses a
+/// damaged one with the same `Corrupt(..)` the read names; it used to take the record's length
+/// unopened and write over it.
+#[test]
+fn d2_a_write_refuses_a_damaged_item_record_as_the_read_does() {
+    let root = todo();
+    let mut fresh = Kernel::new();
+    let long = "r".repeat(300);
+    made(&mut fresh, &root, MIN_BLOCK_MAX, &["a", &long]);
+    let item = fresh
+        .records
+        .keys()
+        .find(|key| parse(key).is_ok_and(|p| p.root() == root && p.sub == Sub::Item))
+        .expect("the long item is a record")
+        .clone();
+    let (item_version, sealed) = fresh.records[&item].clone();
+    let mut flipped = sealed.to_vec();
+    flipped[8] ^= 1;
+    let block = seal(Kind::ListBlock, &encode(&text("x")).unwrap()).unwrap();
+    let not_cbor = seal(Kind::Document, &[0xff]).unwrap();
+    let cases: [(&str, Bytes, Named<Corrupt>); 3] = [
+        ("digest flipped", Bytes::from(flipped), |c| {
+            matches!(c, Corrupt::Envelope(EnvelopeError::DigestMismatch))
+        }),
+        ("a block's kind", block, |c| {
+            matches!(
+                c,
+                Corrupt::ItemNotDocument {
+                    found: Kind::ListBlock
+                }
+            )
+        }),
+        ("not CBOR", not_cbor, |c| matches!(c, Corrupt::Codec(_))),
+    ];
+    for (name, damaged, named) in cases {
+        let mut k = fresh.clone();
+        k.records.insert(item.clone(), (item_version, damaged));
+        let snap = k.snapshot();
+        let read = items(&snap, &root, Start::Position(0), usize::MAX).expect_err("read");
+        assert!(
+            matches!(&read, ValueError::Corrupt(c) if named(c)),
+            "{name}: {read:?}"
+        );
+        for op in [
+            ListOp::Remove { at: 1 },
+            ListOp::Replace {
+                at: 1,
+                value: text("short"),
+            },
+        ] {
+            let write = compile_list(
+                &snap,
+                &root,
+                Expected::Version(version_of(&k, &root)),
+                MIN_BLOCK_MAX,
+                &[op],
+            )
+            .expect_err("write");
+            assert_eq!(write, read, "{name}");
         }
     }
 }

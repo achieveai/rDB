@@ -12,7 +12,7 @@ use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
 
 /// Which size limit an [`ApplyError::TooLarge`] hit. Two since L-R186z (tester W2 PC5), and a
-/// third for blob chunks (ADR-rdb-0014 §4).
+/// third for blob chunks (ADR-rdb-0014 §4), then three for lists (ADR-rdb-0016 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeLimit {
     /// One value's envelope: [`LIMIT_TEXT`].
@@ -25,7 +25,14 @@ pub enum SizeLimit {
     /// One list item's envelope, against [`crate::list::MAX_ITEM`] (ADR-rdb-0016 §4).
     Item,
     /// One list block's base payload, against the compile's `block_max` (ADR-rdb-0016 §4).
-    List,
+    List {
+        /// The base payload the write would have made.
+        len: usize,
+        /// The compile's `block_max`.
+        block_max: usize,
+    },
+    /// A list's escaped object id, against [`crate::list::MAX_ID_ESCAPED`] (ADR-rdb-0016 §4).
+    ObjectId,
 }
 
 // `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
@@ -49,7 +56,15 @@ impl fmt::Display for SizeLimit {
                 "{}-byte limit for one list item's envelope",
                 crate::list::MAX_ITEM
             ),
-            Self::List => write!(f, "block_max limit for one list block"),
+            Self::List { len, block_max } => write!(
+                f,
+                "{block_max}-byte block_max limit for one list block (the base would be {len} bytes)"
+            ),
+            Self::ObjectId => write!(
+                f,
+                "{}-byte limit for a list's escaped object id",
+                crate::list::MAX_ID_ESCAPED
+            ),
         }
     }
 }
@@ -249,11 +264,11 @@ pub enum ApplyError {
         /// The `block_max` given.
         found: usize,
     },
-    /// A scan token from another generation: the versions it names may have been reused
-    /// (ADR-rdb-0016 §6).
-    #[error("the token is from generation {expected}; the snapshot is at {found}")]
+    /// A scan token, or a fenced request, from another generation: the versions it names may
+    /// have been reused (ADR-rdb-0016 §6, §8).
+    #[error("the token or request names generation {expected}; the snapshot is at {found}")]
     GenerationChanged {
-        /// The token's generation.
+        /// The token's or the request's generation.
         expected: u64,
         /// The snapshot's generation.
         found: u64,
