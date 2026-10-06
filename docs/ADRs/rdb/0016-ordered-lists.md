@@ -183,7 +183,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
 | bare `n` with no item record; item record does not open, not a document, newer than root | `Corrupt(ItemMissing{id} / Envelope / ItemNotDocument{found} / Codec / ElementNewerThanRoot)` |
 | records under `0x02`/`0x03` with no root, at a fresh id, or beside an empty list at drop | `Corrupt(OrphanElement)` |
-| a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on every path: list reads, writes and drop; document read and compile; blob reads, publish and delete; blob GC; `doc_scenario`'s dump. A map or set path names it `Corrupt(Root(..))` |
+| a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on every path: list, map and set reads, writes and drop; document read and compile; blob reads, publish and delete; blob GC; `doc_scenario`'s dump |
 - `BlockFault` replaces rev 4's `PageFault`. An unknown kind, codec or format stays written-by-a-newer-build.
 - **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one `n` twice; a stale
   slot under a live block; a wrong `bytes` total. The test invariant checker covers each.
@@ -271,8 +271,8 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
 - **Size:** the compile refuses a request over either cap (`w3_each_limit_holds_at_its_edge`). Build-time asserts
   (`worst_op`, `worst_retire`) tie `DEFAULT_BLOCK_MAX`, the 192 KiB top, `MAX_ITEM`, the 512-block root and the id limit
   to `MAX_ENVELOPE_BYTES`. No test measures each op's `record_len` against its decision-4 bound.
-- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s. Each of 81 guard mutants turned a
-  named row red. A Replace out of the block over a stray item record has no row yet. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
+- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s. Each of 81 guard mutants, and the
+  manual tester's 5 spot-check mutants, turned a named row red. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
 
 ## Open
 - **O1** Id-addressed reads and id/value-digest preconditions (ADR-rdb-0013 O4): M9, costs in decision 6. M9's object-id
