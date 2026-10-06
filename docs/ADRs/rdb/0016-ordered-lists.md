@@ -255,11 +255,17 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
 - **Vectors both ways** for the root, a block, a slot and an item record (`w3_vectors_are_written_and_read_byte_for_byte`).
   The bytes are pinned from the Rust run. The manual tester checked the W1 format's bytes and digests with an
   independent Node encoder; no second encoder is committed.
-- **Model:** random op lists at `block_max` 1,024, values both sides of the inline limit, vs a `Vec` model (items, ids, `count`,
-  `bytes`). After every op an **invariant checker** walks the raw records: root sums; every base ≤ B when written, or unsplit
-  at the cap with no pending slot; **count = 0 ⇔ one block**; pending ≤ 240 and each pending slot holds its op no; no slot key
-  outside op nos 1 … `head`; bare
-  id ⇔ record; every `0x02`/`0x03` key belongs to a live block or item; a `records` list has no inline entry.
+- **Model:** random op lists at `block_max` 1,024, values both sides of the inline limit, vs a `Vec` model of values and
+  ids (`model_run`). After every committed step it checks:
+  - the values in order, `count`, and `bytes` against the codec; the blocks' counts sum to `count`;
+  - **ids:** Move and Replace keep an item's id; a new item's id is above every id read before; no id twice;
+  - every base ≤ B; an emptied block retires, except the first block of an empty list;
+  - at most one merge-back, never beside a retire, into a base ≤ ¾ · B;
+  - every `0x03` key belongs to a block the root names, and each slot holds an op no in 1 … `head` at slot `op mod 240`;
+  - the `0x02` keys are exactly the bare entries' ids; a `records` list has no inline entry.
+- **Not in the model, covered by rows:** a fold at the cap written unsplit
+  (`w3_at_the_block_cap_a_fold_is_written_unsplit_unless_the_ops_grew_it`); more than 240 pending ops refused
+  (`w3_every_damage_row_is_refused_by_name_on_every_path`, row B12). A missing pending slot fails the model's own read.
 - **Rows:** each Scenarios row above; fold by count and by ¼; merge-back skipped when it would not fit; an id over 3,072 B
   refused; overlay rows (rev 4); stale-slot inheritance.
 - **Counting snapshot:** calls by role for a point read (`w3_a_point_read_is_four_calls_and_two_more_out_of_line`), a
@@ -271,8 +277,8 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
 - **Size:** the compile refuses a request over either cap (`w3_each_limit_holds_at_its_edge`). Build-time asserts
   (`worst_op`, `worst_retire`) tie `DEFAULT_BLOCK_MAX`, the 192 KiB top, `MAX_ITEM`, the 512-block root and the id limit
   to `MAX_ENVELOPE_BYTES`. No test measures each op's `record_len` against its decision-4 bound.
-- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s. Each of 81 guard mutants, and the
-  manual tester's 5 spot-check mutants, turned a named row red. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
+- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s. At 6f06d0f, each of 81 guard mutants,
+  and the manual tester's 5 spot-check mutants, turned a named row red. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
 
 ## Open
 - **O1** Id-addressed reads and id/value-digest preconditions (ADR-rdb-0013 O4): M9, costs in decision 6. M9's object-id

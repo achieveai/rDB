@@ -1464,16 +1464,18 @@ fn locate(counts: &[u64], pos: u64, end: bool) -> usize {
     unreachable!("position {pos} checked against the count")
 }
 
-/// W2 model check (coordinator, after W10–W12 survived): random deltas of pushes, inserts,
-/// removes, moves and replaces at `block_max` 1,024, a growing phase then a shrinking one, so
-/// blocks fill, split, empty, retire and merge. Every committed step must match a plain `Vec`
-/// (same values, same order, same count), keep every block base at or under B, and change the
-/// block index only as §4 allows: the blocks the ops emptied retire (all but the first when the
-/// list empties), at most one more block goes (one merge-back), none beside a retire, and a
-/// merged-into block's base is at most ¾ · B. A refused delta (`TooLarge`, `TooManyWrites`)
-/// leaves the model as it was. 8 seeds here, 0.63–0.72 s in a debug build (measured
-/// 2026-10-06, 0.71–0.72 s with the item-record check; cut from 20 to stay under 1 s, ruling L-R186dw); 300 in the ignored
-/// `w2_model_300_seeds`, run by hand: `cargo test -p rdb-value --test lists -- --ignored`.
+/// W2 model check (coordinator, after W10–W12 survived): random deltas of pushes, inserts, removes,
+/// moves and replaces at `block_max` 1,024, a growing phase then a shrinking one, so blocks fill,
+/// split, empty, retire and merge. Every committed step must match a plain `Vec` (same values, same
+/// order, same count, and the same ids: Move and Replace keep an item's id, a new item's id is
+/// above every id read before), keep every block base at or under B, and change the block index
+/// only as §4 allows: the blocks the ops emptied retire (all but the first when the list empties),
+/// at most one more block goes (one merge-back), none beside a retire, and a merged-into block's
+/// base is at most ¾ · B. A refused delta (`TooLarge`, `TooManyWrites`) leaves the model as it was.
+/// 8 seeds here, 0.63–0.72 s in a debug build (measured 2026-10-06, 0.71–0.72 s with the
+/// item-record check, 0.65 s alone with the id check; cut from 20 to stay under 1 s, ruling
+/// L-R186dw); 300 in the ignored `w2_model_300_seeds`, run by hand: `cargo test -p rdb-value --test
+/// lists -- --ignored`.
 #[test]
 fn w2_model_random_deltas_match_a_vec_and_keep_the_block_rules() {
     model_run(1..=8, SMALL);
@@ -1599,6 +1601,10 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
         let made = create_list(&k.snapshot(), &root, mode.records, B, &[]).expect("create");
         k.commit(made.compiled());
         let mut model: Vec<Value> = Vec::new();
+        // Each item's id, `None` until a read shows the id this delta minted for it; and the
+        // highest id read so far, which every newly minted id must pass (ids are never reused).
+        let mut ids: Vec<Option<u128>> = Vec::new();
+        let mut high = 0_u128;
         let mut minted = 0_u64;
         for step in 0..mode.steps {
             let growing = step < mode.growing;
@@ -1606,6 +1612,7 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
             // Each block's post-op count, placed as the compile places ops.
             let mut counts: Vec<u64> = before.iter().map(|(_, count)| *count).collect();
             let mut next = model.clone();
+            let mut next_ids = ids.clone();
             // Whether each item of `next` was added by this delta.
             let mut fresh = vec![false; next.len()];
             let mut ops = Vec::new();
@@ -1624,6 +1631,7 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
                     if rng.below(2) == 0 {
                         *counts.last_mut().expect("a list has a block") += 1;
                         next.push(value.clone());
+                        next_ids.push(None);
                         fresh.push(true);
                         ops.push(ListOp::Push(value));
                     } else {
@@ -1631,6 +1639,7 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
                         let i = locate(&counts, at, true);
                         counts[i] += 1;
                         next.insert(index(at), value.clone());
+                        next_ids.insert(index(at), None);
                         fresh.insert(index(at), true);
                         ops.push(ListOp::Insert { at, value });
                     }
@@ -1639,6 +1648,7 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
                     let i = locate(&counts, at, false);
                     counts[i] -= 1;
                     next.remove(index(at));
+                    next_ids.remove(index(at));
                     fresh.remove(index(at));
                     ops.push(ListOp::Remove { at });
                 } else if roll < 92 {
@@ -1651,6 +1661,8 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
                     counts[i] += 1;
                     let value = next.remove(index(from));
                     next.insert(index(to), value);
+                    let id = next_ids.remove(index(from));
+                    next_ids.insert(index(to), id);
                     let added = fresh.remove(index(from));
                     fresh.insert(index(to), added);
                     ops.push(ListOp::Move { from, to });
@@ -1683,6 +1695,7 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
             k.commit(compiled.compiled());
             steps += 1;
             model = next;
+            ids = next_ids;
             let page = items(&k.snapshot(), &root, Start::Position(0), usize::MAX).expect("read");
             let bare: BTreeSet<u128> = page
                 .items
@@ -1692,9 +1705,28 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
                 .collect();
             assert_eq!(item_records(&k, &root), bare, "{at}: item records");
             out_of_line += bare.len();
+            assert!(
+                !mode.records || page.items.iter().all(|item| !item.inline),
+                "{at}: an inline entry in a records list"
+            );
+            let read_ids: Vec<u128> = page.items.iter().map(|item| item.id).collect();
             let read: Vec<Value> = page.items.into_iter().map(|item| item.value).collect();
             assert_eq!(read, model, "{at}: items");
             assert_eq!(page.list.count, len_u64(model.len()), "{at}: count");
+            // A Move or Replace keeps its item's id; a new item gets an id above every one read.
+            for (pos, (want, got)) in ids.iter().zip(&read_ids).enumerate() {
+                match want {
+                    Some(want) => assert_eq!(got, want, "{at}: the id at {pos}"),
+                    None => assert!(
+                        *got > high,
+                        "{at}: new id {got} at {pos} is not above {high}"
+                    ),
+                }
+            }
+            let distinct: BTreeSet<u128> = read_ids.iter().copied().collect();
+            assert_eq!(distinct.len(), read_ids.len(), "{at}: an id twice");
+            high = read_ids.iter().copied().fold(high, u128::max);
+            ids = read_ids.into_iter().map(Some).collect();
             assert_list_bytes(&k, &root, &model, &at);
             assert_block_records(&k, &root, &at);
 
