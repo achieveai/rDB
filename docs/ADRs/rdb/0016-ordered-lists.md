@@ -1,12 +1,14 @@
 # ADR-rdb-0016: Ordered lists — blocks, change slots and folding
 
-**Status:** Proposed, draft rev 6.2. **Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
+**Status:** Proposed, draft rev 6.3. **Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
 slots, folded by our code; Merge later, if measured. Superseded: rev 4's tree parts, Q1 (node size), Q4a (top node in root).
 Kept: ids and seed (Q4b), L = 256 B inline and `records` (L-R186cr), overlay flips, `MAX_ITEM` (Q2), tokens, the fence.
 **Rev 6** closes the rev 5 critic review (lead's rulings; working notes not in the repository): B1, M1 §4 · M2 §1, §4, §5 · M3 amendment rev 3 · A1, A3
 Consequences · A2 §4, O1 · A4 §3, §6, §7 · A5 §3, §4. **Rev 6.1** closes round 2: N1, N2, N4 §4 · N3 header, amendment.
 **Rev 6.2** (W1 walk D1, P9): reads fetch the base and only the pending slots, so no read returns a neighbour's records
 (`scan` has no end key); retire and drop delete slot keys by op no. §3, §4, §5, §6, Consequences.
+**Rev 6.3** (W2 D4, L-R186ds): a block's index entry drops its byte total, so a split, merge-back or Move reads no item
+record. §1, §4, §7, Vectors, Consequences; spec amendment rev 3.2.
 **Date:** 2026-10-05
 **Spec:** `docs/rdb/design-specification.md` D14, D16, §4.3, §4.3.2, §4.3.4; `docs/rdb/validation-plan.md` V13
 **Decided by:** Gautam, 2026-10-05: L-R186cz (Q1 mechanism N, Q2 cap 512 blocks, Q3 last block splits at its end; stated
@@ -14,7 +16,7 @@ defaults B = 128 KiB, 240 slots, fold at ¼); L-R186cr (inline, `records`, L = 2
 **Closes:** ADR-rdb-0013 decision 14 ("Lists — S4, later") and O2 (records, scan tokens, envelope `kind`).
 **Amends, each sentence quoted. Each edit is landed with a back-link to this ADR.**
 - **Spec revision line, D16 row, §4.3.2 list paragraph, its mermaid node and collection-version sentence; ADR-rdb-0012 §7
-  `kind` and `codec_version` rows; ADR-rdb-0013 decision 3 rows `0x02`, `0x03`:** exact text in the S4 spec amendment rev 3 (working notes not in the repository),
+  `kind` and `codec_version` rows; ADR-rdb-0013 decision 3 rows `0x02`, `0x03`:** exact text in the S4 spec amendment rev 3.2 (working notes not in the repository),
   which replaces the rev-4 wording already applied on the S4 branch (f4e1721). In short: kinds `0x06` list root, `0x07` list
   block, `0x08` list change slot, all `rdb-cbor-document` v1; `0x09` onward unallocated; `0x02` item record (tail 16 B),
   `0x03` block (tail 16 B) or change slot (tail 17 B).
@@ -37,7 +39,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 ### 1. A list is a root, blocks, change slots, and a record for each large item
 | Record | `sub` · tail | Kind | Payload (canonical CBOR, exactly these keys) |
 |---|---|---|---|
-| Root | `0x00` · empty | `0x06` | `{next: u, seed: u, bytes: u, count: u, blocks: [[n, count, bytes, head] …], records: bool}` |
+| Root | `0x00` · empty | `0x06` | `{next: u, seed: u, bytes: u, count: u, blocks: [[n, count, head] …], records: bool}` |
 | Block | `0x03` · block id, 16 B | `0x07` | `{items: [entry …], folded: u}` |
 | Change slot | `0x03` · block id ‖ slot u8 (0–239), 17 B | `0x08` | `[op no, op]` |
 | Item | `0x02` · item id, 16 B | `0x01` | the item's value, **only for an item not stored in its block** |
@@ -45,8 +47,11 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - **Op:** `[0, at, entry]` insert · `[1, at]` remove · `[2, at, entry]` replace. `at` is the position in the block **after
   every earlier op of that block**. Push is an insert at the block's end. Move is a remove then an insert (one block or two);
   the entry, its id and any item record are carried untouched.
-- The root's `blocks` lists the blocks in list order: block counter `n`, its item `count` and `bytes`, and `head`, its newest
-  op no. A block's `folded` is the newest op no already in its base. **Pending ops** = op nos `folded + 1 … head`.
+- The root's `blocks` lists the blocks in list order: block counter `n`, its item `count`, and `head`, its newest op no.
+  A block's `folded` is the newest op no already in its base. **Pending ops** = op nos `folded + 1 … head`.
+- The root's `bytes` is the list's total only; a block has none (D4). Each op moves it by the length of the item it
+  touches, from the overlay first: an add by its new value, Remove and Replace by reading the one item they change. **A
+  split, merge-back or Move reads no item record**, so its reads do not grow with item size.
 - **A list always has at least one block, and only an only block may be empty:** count = 0 ⇔ one block (decision 4).
   Readers never scan across sub ranges, except the orphan check (decision 5).
 
@@ -108,13 +113,13 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - **Format caps, checked by readers:** block payload ≤ 262,144 B; slot < 240 and pending ≤ 240; ≤ **512 blocks** (L-R186cz
   Q2); a count-0 block only as the only block. A second index level later needs a new root `codec_version`.
 - **Bounds, one op** (`record_len = 266 + Σ Put(10 + key + value) + Σ Delete(6 + key)`, `e = |esc(object id)|`):
-  - root `Put` ≤ 19,079 + e (512 blocks × 37 B + 72); block `Put` = 79 + e + payload; slot `Put` ≤ 80 + e + 300;
+  - root `Put` ≤ 14,477 + e (512 blocks × 28 B + 78); block `Put` = 79 + e + payload; slot `Put` ≤ 80 + e + 300;
     item `Put` = 39 + e + V; slot `Delete` = 36 + e.
   - Worst insert or replace: a fold with split + a 512 KiB item = 266 + root + 1.25 · B + 2 block keys + item
-    ≈ **707,970 + 4e at the default**; 789,890 + 4e at B = 192 KiB.
-  - Move between two blocks with 240 pending each: both fold, no delete: ≤ 5 writes, ≈ 347 KB at the default.
-  - Retiring a block in a Move whose other block folds and splits: ≈ 192,318 + 244e at the default (e ≤ 3,509), and
-    ≈ 274,538 + 244e at 192 KiB (e ≤ 3,172). **Drop:** 8,960 + 242e (e ≤ 4,295).
+    ≈ **703,368 + 4e at the default**; 785,288 + 4e at B = 192 KiB.
+  - Move between two blocks with 240 pending each: both fold, no delete: ≤ 5 writes, ≈ 342 KB at the default.
+  - Retiring a block in a Move whose other block folds and splits: ≈ 187,716 + 244e at the default (e ≤ 3,528), and
+    ≈ 269,936 + 244e at 192 KiB (e ≤ 3,191). **Drop:** 8,960 + 242e (e ≤ 4,295).
   - **So every list compile refuses an object id with e > 3,072 (`TooLarge{Write}`)**; emptying and dropping then never
     fail on bytes. M9's object-id limit (O1) must be ≤ 3,072 B escaped for lists.
   - Writes: root, ≤ 2 blocks × (base + split block), one item record, one retired block (≤ 241 deletes): ≤ 247 < 255.
@@ -167,7 +172,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 ### 7. Damage: refused, never served (ADR-rdb-0013 decision 11); every row is repaired by `clear_object` (M9)
 | Damage | Error |
 |---|---|
-| root does not open; bad payload; not exactly the 6 keys; `blocks` empty or > 512; a count-0 block beside others; counts or bytes ≠ Σ blocks; `n` ≥ `next`; overflow | `Corrupt(Envelope / Codec / ListRoot(..))` |
+| root does not open; bad payload; not exactly the 6 keys; `blocks` empty or > 512; a count-0 block beside others; count ≠ Σ blocks' counts; `n` ≥ `next`; overflow | `Corrupt(Envelope / Codec / ListRoot(..))` |
 | block missing, does not open, not kind `0x07`, bad CBOR or shape, payload > 262,144, newer than root, `folded` > `head`, `head − folded` > 240, replayed count ≠ root's, entry neither `n` nor `[n, value]` | `Corrupt(Block{id, Missing / Envelope / NotABlock{found} / Codec / Shape(..) / TooLarge / NewerThanRoot})` |
 | pending slot missing or holding another op no; slot not kind `0x08`, bad CBOR or shape; an op's `at` out of range | `Corrupt(Block{id, OpMissing{op} / OpBad{op} / OpOutOfRange{op}})` |
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
@@ -191,13 +196,14 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   `TooManyWrites`, `TooLarge`, `TooDeep`. `ListTooTall` and `InvalidNodeSize` are gone.
 - **Corrupt** gains `ListRoot(&'static str)`, `Block{id, fault: BlockFault}`, `ItemMissing{id}`, `ItemNotDocument{found}`.
 
-## Vectors (prose; byte forms and digests **to be confirmed by the dev's run**)
-Tenant 1, affinity 1, id `todo`, `snapshot.at()` = 0, `records` false.
-- **Create (2 writes):** root `a6`, then `next` 1, `seed` 0, `bytes` 0, `count` 0, `blocks [[0, 0, 0, 0]]` (`81 84 00 00 00
-  00`), `records` false: 49 B, header `01060101 00000031`. Block 0 (key tail 16 zero bytes): `a2 65 6974656d73 80 66
-  666f6c646564 00` (`items []`, `folded` 0): 16 B, header `01070101 00000010`.
-- **Push `"milk"` (a fold, 2 writes):** root `next` 2, `bytes` 5, `count` 1, `blocks [[0, 1, 5, 1]]`, 49 B. Block `items
-  [[1, "milk"]]` (`81 82 01 64 6d696c6b`), `folded` 1, 23 B. Item id `00…01`.
+## Vectors (prose; byte forms and digests from the dev's run at rev 6.3)
+Tenant 1, affinity 1, id `todo`, `snapshot.at()` = 0, `records` false. A digest is SHA-256 over the header's 8 bytes, then
+the payload.
+- **Create (2 writes):** root `a6`, then `next` 1, `seed` 0, `bytes` 0, `count` 0, `blocks [[0, 0, 0]]` (`81 83 00 00
+  00`), `records` false: 48 B, header `01060101 00000030`, digest `1d861766…491debbd37`. Block 0 (key tail 16 zero
+  bytes): `a2 65 6974656d73 80 66 666f6c646564 00` (`items []`, `folded` 0): 16 B, header `01070101 00000010`.
+- **Push `"milk"` (a fold, 2 writes):** root `next` 2, `bytes` 5, `count` 1, `blocks [[0, 1, 1]]` (`81 83 00 01 01`), 48 B,
+  digest `7c9b2589…493c0efd`. Block `items [[1, "milk"]]` (`81 82 01 64 6d696c6b`), `folded` 1, 23 B. Item id `00…01`.
 
 ## Scenarios
 | Who does what | What they observe |
@@ -217,9 +223,14 @@ Tenant 1, affinity 1, id `todo`, `snapshot.at()` = 0, `records` false.
 
 ## Consequences
 - **Per push** (`record_len`, measured: the mean over 10,000 pushes of a 16-byte string to `todo`, folds and splits
-  included): 0.776 / 0.972 / 2.298 / 9.310 KB at 1 / 10 / 100 / 512 blocks with B = 128 KiB, and 0.705 KB at 1 block with
+  included): 0.771 / 0.920 / 1.797 / 6.751 KB at 1 / 10 / 100 / 512 blocks with B = 128 KiB, and 0.699 KB at 1 block with
   B = 64 KiB, against 16.8–49.7 KB. The study's ~0.97 / 1.24 / 3.9 / 16.3 KB assumed a root index entry of 30 B; one
-  measures about 16.6 B. At 512 blocks the pushes fill the last block and are then refused (5,155 of them at 128 KiB).
+  measures about 11.6 B (16.6 B before rev 6.3 dropped its byte total). At 512 blocks the pushes fill the last block and
+  are then refused (5,155 of them at 128 KiB).
+- **Reads before the write caps:** Remove and Replace read the out-of-line item they change, to take its length off
+  `bytes`, before the request caps are checked. A delta of many removes reads every item it names, then may be refused
+  `TooManyWrites`. A damaged item cannot be removed or replaced; `clear_object` repairs it (decision 7). Push, Insert,
+  Move, splits and merge-backs read no item record.
 - A point read opens one base and its pending slots (q ≤ base/4), so ≤ ~1.25 · B; stale slots are never read (P9: they
   would add up to 240 × ~300 B ≈ 72 KB). That is ~2–7× the tree's bytes past ~24 KiB, the same below.
 - **Capacity at the default: ≥ ~16 MiB worst (blocks just over B/4 never merge), ~64 MiB push-only** (end splits fill blocks).

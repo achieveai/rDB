@@ -669,8 +669,13 @@ fn dump_record(
             } else if opened.kind == Kind::Blob {
                 blob::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
-            } else if matches!(opened.kind, Kind::List | Kind::ListBlock | Kind::ListSlot) {
-                // A block or slot record at a root key is list damage; the list read names it.
+            } else if matches!(opened.kind, Kind::ListBlock | Kind::ListSlot) {
+                // A block or slot record at a root key is damage. Name it as read, blob-delete
+                // and gc do (tester W2), whatever object the key was meant to hold.
+                return Err(Failure::from(ValueError::Corrupt(
+                    Corrupt::ListRecordAtRoot { found: opened.kind },
+                )));
+            } else if opened.kind == Kind::List {
                 list::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
             } else if opened.kind == Kind::Chunk {

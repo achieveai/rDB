@@ -10,9 +10,9 @@ use common::{text, Kernel, Refused};
 use rdb_core::{AffinityId, Generation, Mutation, TenantId};
 use rdb_value::cbor::encode;
 use rdb_value::collection::{compile_collection, CollectionKind, ElemOp};
-use rdb_value::delta::{ApplyError, Delta, Op};
+use rdb_value::delta::{ApplyError, Delta, Op, SizeLimit};
 use rdb_value::envelope::{open, seal, EnvelopeError, Kind};
-use rdb_value::keys::{parse, root_key, KeyError, RootKey, Sub};
+use rdb_value::keys::{item_key, parse, root_key, KeyError, RootKey, Sub};
 use rdb_value::list::{
     compile_list, create_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_BLOCK_MAX,
     MIN_BLOCK_MAX,
@@ -936,20 +936,23 @@ fn n4_limit_0_reads_the_root_only_from_any_position() {
     assert_eq!(opened(2), opened(0), "from 2 and from 0");
 }
 
-/// Every block's `bytes` in the root against its items, measured with the codec: the sum of each
-/// item's encoded value, which is its inline encoding or its record's payload alike (ADR-rdb-0016
-/// §1). A read checks only that the blocks sum to the root's `bytes`, so a split that
-/// mis-sizes what it moves passes every read and shows up here only. `values`: the list's
-/// values in order, as read.
-fn assert_block_bytes(k: &Kernel, root: &RootKey, values: &[Value], at: &str) {
-    let mut rest = values;
-    for (i, (count, bytes)) in block_shape(k, root).into_iter().enumerate() {
-        let (held, after) = rest.split_at(index(count));
-        let measured: usize = held.iter().map(|v| encode(v).expect("encodes").len()).sum();
-        assert_eq!(bytes, len_u64(measured), "{at}: block {i}'s bytes");
-        rest = after;
-    }
-    assert!(rest.is_empty(), "{at}: the blocks hold every item");
+/// The root's `bytes` against the items, measured with the codec outside the compile: the sum of
+/// each item's encoded value, which is its inline encoding or its record's payload alike
+/// (ADR-rdb-0016 §1). No read checks it, so a write that mis-sizes an item passes every read and
+/// shows up here only. `values`: the list's values in order, as read.
+fn assert_list_bytes(k: &Kernel, root: &RootKey, values: &[Value], at: &str) {
+    let found = list(&k.snapshot(), root).expect("read").expect("a list");
+    let measured: usize = values
+        .iter()
+        .map(|v| encode(v).expect("encodes").len())
+        .sum();
+    assert_eq!(found.bytes, len_u64(measured), "{at}: the list's bytes");
+    let counts: u64 = block_shape(k, root).iter().sum();
+    assert_eq!(
+        counts,
+        len_u64(values.len()),
+        "{at}: the blocks hold every item"
+    );
 }
 
 /// D3 (tester W2 BLOCKER, basis 96a42b2), repro 1, at B = 1,024 (inline limit 240): four
@@ -978,7 +981,7 @@ fn d3_an_end_split_that_moves_a_new_out_of_line_item_compiles() {
     want.push(text(&l));
     assert_eq!(values(&k, &root), want);
     assert_eq!(block_shape(&k, &root).len(), 2, "the push split the block");
-    assert_block_bytes(&k, &root, &want, "after the split");
+    assert_list_bytes(&k, &root, &want, "after the split");
 }
 
 /// D3 repro 2: a records list at B = 1,024, one push per compile. Push 429 is the first whose
@@ -998,14 +1001,15 @@ fn d3_a_records_list_splits_on_a_single_push() {
     }
     assert_eq!(values(&k, &root), want);
     assert_eq!(block_shape(&k, &root).len(), 2, "push 429 split the block");
-    assert_block_bytes(&k, &root, &want, "after the split");
+    assert_list_bytes(&k, &root, &want, "after the split");
 }
 
 /// The same gap, silent: a stored out-of-line item replaced in the delta that then moves it.
 /// `[a, a, a, a, L]` (L 300 chars, out of line) takes `insert 0 a, replace 5 M` (M 600 chars).
 /// The fold is over B and the end split moves `[a, M]`. Sized from the snapshot, M counted 302
 /// bytes, not 602: the new block's `bytes` was 300 short and the kept one 300 over, and since
-/// they still summed to the root's, every read passed.
+/// they still summed to the root's, every read passed. Blocks hold no bytes since D4; the list's
+/// total still moves by M's new length, as replaced.
 #[test]
 fn d3_a_split_sizes_an_item_replaced_in_the_same_delta_as_replaced() {
     let root = todo();
@@ -1032,7 +1036,198 @@ fn d3_a_split_sizes_an_item_replaced_in_the_same_delta_as_replaced() {
     want.push(text(&m));
     assert_eq!(values(&k, &root), want);
     assert_eq!(block_shape(&k, &root).len(), 2, "the delta split the block");
-    assert_block_bytes(&k, &root, &want, "after the split");
+    assert_list_bytes(&k, &root, &want, "after the split");
+}
+
+/// A records list at `block_max` grown by lines of `per_line` pushes of `width`-char values
+/// until it has two blocks, as the tester's D4 amp-driver grows it. Returns the next value number.
+fn two_block_records_list(
+    k: &mut Kernel,
+    root: &RootKey,
+    block_max: usize,
+    width: usize,
+    per_line: usize,
+) -> u64 {
+    let made = create_list(&k.snapshot(), root, true, block_max, &[]).expect("create");
+    k.commit(made.compiled());
+    let mut next = 0_u64;
+    while list(&k.snapshot(), root)
+        .expect("read")
+        .expect("a list")
+        .blocks
+        < 2
+    {
+        let ops: Vec<ListOp> = (0..per_line)
+            .map(|_| {
+                next += 1;
+                ListOp::Push(text(&format!("{next:0>width$}")))
+            })
+            .collect();
+        write(k, root, block_max, &ops);
+    }
+    next
+}
+
+/// Flip the last byte of the record at `key`, keeping its version: its digest no longer holds.
+fn damage(k: &mut Kernel, key: &Bytes) {
+    let (version, raw) = k.records[key].clone();
+    let mut bytes = raw.to_vec();
+    *bytes.last_mut().expect("a record has bytes") ^= 0xff;
+    k.records.insert(key.clone(), (version, Bytes::from(bytes)));
+}
+
+/// The calls and the bytes read by the compile of the first line of `per_line` inserts at 0 that
+/// splits the first block (not the last) in halves.
+fn split_line_reads(block_max: usize, width: usize, per_line: usize) -> (u64, u64) {
+    let root = todo();
+    let mut k = Kernel::new();
+    two_block_records_list(&mut k, &root, block_max, width, per_line);
+    for line in 0..1_000_u64 {
+        let blocks = list(&k.snapshot(), &root)
+            .expect("read")
+            .expect("a list")
+            .blocks;
+        let ops: Vec<ListOp> = (0..per_line)
+            .map(|_| ListOp::Insert {
+                at: 0,
+                value: text(&format!("{line:0>width$}")),
+            })
+            .collect();
+        let snap = k.snapshot();
+        let counting = CountingSnapshot::new(&snap);
+        let version = version_of(&k, &root);
+        let compiled = compile_list(
+            &counting,
+            &root,
+            Expected::Version(version),
+            block_max,
+            &ops,
+        )
+        .expect("insert line");
+        let reads = (counting.calls(), counting.bytes());
+        k.commit(compiled.compiled());
+        if list(&k.snapshot(), &root)
+            .expect("read")
+            .expect("a list")
+            .blocks
+            > blocks
+        {
+            return reads;
+        }
+    }
+    panic!("no line split the first block");
+}
+
+/// D4 (tester W2, basis 38b3586; lead ruling L-R186ds): a halves split sized the entries it moves
+/// from their item records, so one insert line that split a records list at B = 128 KiB read
+/// 44,021 records and 181 MB with 8 KiB items. A split reads no item record now. The line that
+/// splits reads the root, the block, and two `version` calls per insert (its new id's key, checked
+/// then touched): a bound set by B and the line alone, whatever the item size. At B = 1,024, with
+/// 100 inserts a line; at 38b3586 the 16-char line read 685 calls and 14,854 bytes.
+#[test]
+fn d4_a_split_reads_within_a_bound_set_by_b_whatever_the_item_size() {
+    const B: usize = MIN_BLOCK_MAX;
+    for width in [16, 8_192] {
+        let split = split_line_reads(B, width, 100);
+        let at = format!("{width}-char items: the split line read {split:?}");
+        eprintln!("{at}");
+        assert!(split.0 <= 2 * 100 + 8, "{at}: calls");
+        assert!(split.1 <= 2 * len_u64(B), "{at}: bytes");
+    }
+}
+
+/// [`d4_a_split_reads_within_a_bound_set_by_b_whatever_the_item_size`] at the default B, the
+/// tester's own case: lines of 120 inserts of 16 chars, and of 64 of 8 KiB, which keeps a line
+/// within the write cap. Growing two blocks of 8 KiB items writes several hundred MB of item
+/// records, so it runs by hand: `cargo test -p rdb-value --test lists -- --ignored d4_`.
+#[test]
+#[ignore = "writes several hundred MB of item records; run by hand"]
+fn d4_a_split_at_the_default_b_reads_within_a_bound_set_by_b() {
+    const B: usize = DEFAULT_BLOCK_MAX;
+    for (width, per_line) in [(16, 120), (8_192, 64)] {
+        let split = split_line_reads(B, width, per_line);
+        let at = format!("{width}-char items: the split line read {split:?}");
+        eprintln!("{at}");
+        assert!(split.0 <= 2 * len_u64(per_line) + 8, "{at}: calls");
+        assert!(split.1 <= 2 * len_u64(B), "{at}: bytes");
+    }
+}
+
+/// D4, the damage half: a split read every moved item, so one damaged record among them refused
+/// an insert that never names it. The last item of the first block moves in any halves split of
+/// that block; its record is damaged, and every insert line up to and including the split
+/// compiles. The damage stays: reading the item is still refused.
+#[test]
+fn d4_a_damaged_item_among_the_moved_does_not_refuse_an_insert_that_splits() {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let mut k = Kernel::new();
+    two_block_records_list(&mut k, &root, B, 16, 100);
+    let first = block_index(&k, &root)[0].1;
+    let page = items(&k.snapshot(), &root, Start::Position(first - 1), 1).expect("read");
+    let victim = page.items[0].id;
+    damage(&mut k, &item_key(&root, victim));
+    let mut split = false;
+    for line in 0..100_u64 {
+        let blocks = block_index(&k, &root).len();
+        let ops: Vec<ListOp> = (0..100)
+            .map(|_| ListOp::Insert {
+                at: 0,
+                value: text(&format!("{line:0>16}")),
+            })
+            .collect();
+        write(&mut k, &root, B, &ops);
+        if block_index(&k, &root).len() > blocks {
+            split = true;
+            break;
+        }
+    }
+    assert!(split, "a line split the first block");
+    let position = list(&k.snapshot(), &root)
+        .expect("read")
+        .expect("a list")
+        .count;
+    let read = items(
+        &k.snapshot(),
+        &root,
+        Start::Position(0),
+        usize::try_from(position).expect("fits"),
+    );
+    assert!(matches!(read, Err(ValueError::Corrupt(_))), "{read:?}");
+}
+
+/// D4, critic F2: a Move sized the item it moves, reading its record although a Move changes no
+/// byte total. Unbounded op counts made that D4 again by another op. A Move now reads no item
+/// record: moving an item whose record is damaged succeeds, within its block and across two.
+#[test]
+fn d4_moving_an_item_whose_record_is_damaged_succeeds() {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let mut k = Kernel::new();
+    two_block_records_list(&mut k, &root, B, 16, 100);
+    let count = list(&k.snapshot(), &root)
+        .expect("read")
+        .expect("a list")
+        .count;
+    let page = items(&k.snapshot(), &root, Start::Position(0), 1).expect("read");
+    damage(&mut k, &item_key(&root, page.items[0].id));
+    write(&mut k, &root, B, &[ListOp::Move { from: 0, to: 1 }]);
+    write(
+        &mut k,
+        &root,
+        B,
+        &[ListOp::Move {
+            from: 1,
+            to: count - 1,
+        }],
+    );
+    let after = list(&k.snapshot(), &root).expect("read").expect("a list");
+    assert_eq!(after.count, count);
+    let read = items(&k.snapshot(), &root, Start::Position(count - 1), 1);
+    assert!(
+        matches!(read, Err(ValueError::Corrupt(_))),
+        "the damage stays: {read:?}"
+    );
 }
 
 fn len_u64(n: usize) -> u64 {
@@ -1315,7 +1510,7 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
             let read: Vec<Value> = page.items.into_iter().map(|item| item.value).collect();
             assert_eq!(read, model, "{at}: items");
             assert_eq!(page.list.count, len_u64(model.len()), "{at}: count");
-            assert_block_bytes(&k, &root, &model, &at);
+            assert_list_bytes(&k, &root, &model, &at);
 
             let after = block_index(&k, &root);
             let live: Vec<u64> = after.iter().map(|(n, _)| *n).collect();
@@ -1413,6 +1608,43 @@ fn split_line(seed: u64) -> Vec<ListOp> {
     ops
 }
 
+/// Tester W2: a `TooLarge{List}` refusal tells the caller what to do. A line of pushes that
+/// overfills one block region at B = 1,024 is refused, store unchanged, and the message says
+/// the delta is too large for one transaction and should be split.
+#[test]
+fn w2_a_block_over_b_refusal_says_to_split_the_delta() {
+    let root = todo();
+    let mut k = Kernel::new();
+    made(&mut k, &root, MIN_BLOCK_MAX, &["seed"]);
+    let before = k.records.clone();
+    let ops: Vec<ListOp> = (0..60)
+        .map(|i| ListOp::Push(text(&format!("{i:0>40}"))))
+        .collect();
+    let refused = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Version(version_of(&k, &root)),
+        MIN_BLOCK_MAX,
+        &ops,
+    )
+    .expect_err("a line that overfills one block region is refused");
+    assert!(
+        matches!(
+            refused,
+            ValueError::Apply(ApplyError::TooLarge {
+                limit: SizeLimit::List { .. }
+            })
+        ),
+        "{refused:?}"
+    );
+    let message = refused.to_string();
+    assert!(
+        message.contains("too large for one transaction") && message.contains("split"),
+        "{message}"
+    );
+    assert_eq!(k.records, before, "a refused compile writes nothing");
+}
+
 /// W2 (W17 survived the walks): an end split keeps the longest prefix whose base fits B. Over
 /// 300 random lines of pushes into a fresh list at 1,024, each long enough to split once, the
 /// first block's base fits and would not fit with the next item's entry added.
@@ -1465,7 +1697,7 @@ fn w2_an_end_split_keeps_the_longest_prefix_that_fits() {
 }
 
 /// W17 pinned: seed 3's line, where the end cut sits on the binary search's last step (a search
-/// that stops one step early keeps 12). The exact shape, count and bytes per block, from the root.
+/// that stops one step early keeps 12). The exact shape, the count per block, from the root.
 #[test]
 fn w2_an_end_split_on_the_search_bound_has_this_shape() {
     let root = todo();
@@ -1479,7 +1711,7 @@ fn w2_an_end_split_on_the_search_bound_has_this_shape() {
     )
     .expect("one end split");
     k.commit(compiled.compiled());
-    assert_eq!(block_shape(&k, &root), [(13, 950), (4, 356)]);
+    assert_eq!(block_shape(&k, &root), [13, 4]);
 }
 
 /// W2 (W18 survived the walks): halves takes the first of two equally good cuts (G36). A
@@ -1520,33 +1752,15 @@ fn w2_halves_takes_the_first_of_two_equal_cuts() {
         (total - 1) / 2,
         "the first of the two equal cuts: {index:?}"
     );
-    // Every value is 40 chars, 42 bytes encoded: the two halves are exactly this.
+    // The two halves are exactly this.
     let left = (total - 1) / 2;
-    assert_eq!(
-        block_shape(&k, &root)[..2],
-        [(left, 42 * left), (left + 1, 42 * (left + 1))]
-    );
+    assert_eq!(block_shape(&k, &root)[..2], [left, left + 1]);
 }
 
-/// The root's block index as `(count, bytes)` per block, in block order.
-fn block_shape(k: &Kernel, root: &RootKey) -> Vec<(u64, u64)> {
-    let (_, raw) = &k.records[&root.to_bytes()];
-    let payload = rdb_value::cbor::decode(open(raw).expect("root envelope").payload).expect("cbor");
-    let Value::Map(fields) = payload else {
-        panic!("a list root is a map")
-    };
-    let Some(Value::Array(blocks)) = fields.get(&rdb_value::value::MapKey::new("blocks")) else {
-        panic!("a list root has blocks")
-    };
-    let uint = |v: &Value| match v {
-        Value::Integer(i) => u64::try_from(i.get()).expect("unsigned"),
-        other => panic!("not an integer: {other:?}"),
-    };
-    blocks
-        .iter()
-        .map(|block| match block {
-            Value::Array(parts) => (uint(&parts[1]), uint(&parts[2])),
-            other => panic!("a block entry is an array: {other:?}"),
-        })
+/// The root's block index as the count per block, in block order.
+fn block_shape(k: &Kernel, root: &RootKey) -> Vec<u64> {
+    block_index(k, root)
+        .into_iter()
+        .map(|(_, count)| count)
         .collect()
 }

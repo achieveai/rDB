@@ -281,7 +281,7 @@ fn position(op: &str, text: &str) -> Result<u64, Failure> {
 }
 
 /// `dump`'s list root: `count`, `bytes` and `blocks` through the library's read, then the
-/// payload as stored (`next`, `seed`, `bytes`, `count`, `blocks` as `[n, count, bytes, head]`
+/// payload as stored (`next`, `seed`, `bytes`, `count`, `blocks` as `[n, count, head]`
 /// per block, `records`), then `absent_bases`, the ids of the blocks it names whose base is not
 /// in the store, when there are any: such a block has no record of its own to show.
 pub fn dump_root(snapshot: &MapSnapshot, root: &RootKey, line: &mut Line) -> Result<(), Failure> {
@@ -408,7 +408,7 @@ fn pending_op(
     let head = payload(root.as_bytes()).and_then(|root| match field(&root, "blocks") {
         Some(Value::Array(blocks)) => blocks.iter().find_map(|block| match block {
             Value::Array(parts) if parts.first().and_then(uint) == Some(n) => {
-                parts.get(3).and_then(uint)
+                parts.get(2).and_then(uint)
             }
             _ => None,
         }),

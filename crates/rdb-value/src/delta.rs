@@ -58,7 +58,8 @@ impl fmt::Display for SizeLimit {
             ),
             Self::List { len, block_max } => write!(
                 f,
-                "{block_max}-byte block_max limit for one list block (the base would be {len} bytes)"
+                "{block_max}-byte block_max limit for one list block (the base would be {len} \
+                 bytes): the delta is too large for one transaction, so split it into smaller deltas"
             ),
             Self::ObjectId => write!(
                 f,

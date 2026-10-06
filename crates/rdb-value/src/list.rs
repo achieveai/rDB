@@ -3,7 +3,7 @@
 //!
 //! - The root, at the object's [`RootKey`], is an envelope of kind [`Kind::List`] whose payload is
 //!   canonical CBOR of exactly `{next, seed, bytes, count, blocks, records}`: the id counter, the
-//!   create's seed, the items' value bytes and count, the block index (`[n, count, bytes, head]`
+//!   create's seed, the items' value bytes and count, the block index (`[n, count, head]`
 //!   per block, in list order) and whether every item keeps its own record.
 //! - A block's base, at [`block_key`], is kind [`Kind::ListBlock`]: `{items, folded}`, the entries
 //!   as of op no `folded`. Its later ops, `folded + 1 … head`, each live in change slot
@@ -78,9 +78,9 @@ const fn inline_limit(block_max: usize) -> usize {
     }
 }
 
-/// The largest root payload: [`MAX_BLOCKS`] index entries of at most 37 bytes, and 72 bytes of
+/// The largest root payload: [`MAX_BLOCKS`] index entries of at most 28 bytes, and 78 bytes of
 /// the rest (ADR-rdb-0016 §4).
-const MAX_ROOT_PAYLOAD: usize = MAX_BLOCKS * 37 + 72;
+const MAX_ROOT_PAYLOAD: usize = MAX_BLOCKS * 28 + 78;
 /// `record_len`'s cost of one `Put` past its key and value.
 const PUT_COST: usize = 10;
 /// An object key's bytes besides the escaped object id: the 12-byte scope and `sub`.
@@ -465,13 +465,12 @@ fn parse_block(value: &Value) -> Result<(Vec<Entry>, u64), &'static str> {
 
 // ---- the root ------------------------------------------------------------------------------
 
-/// A root's index entry for one block: its `n`, item count and value bytes, and its newest op
-/// no.
+/// A root's index entry for one block: its `n`, item count and newest op no. It holds no byte
+/// total, so nothing that moves entries between blocks reads an item record (D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlockRef {
     n: u64,
     count: u64,
-    bytes: u64,
     head: u64,
 }
 
@@ -499,7 +498,7 @@ impl Root {
         let blocks = self
             .blocks
             .iter()
-            .map(|b| Value::Array(vec![uint(b.n), uint(b.count), uint(b.bytes), uint(b.head)]))
+            .map(|b| Value::Array(vec![uint(b.n), uint(b.count), uint(b.head)]))
             .collect();
         let mut map = Map::new();
         map.insert(MapKey::new("next"), uint(self.next));
@@ -516,20 +515,19 @@ fn corrupt_root(what: &'static str) -> ValueError {
     ValueError::Corrupt(Corrupt::ListRoot(what))
 }
 
-const BLOCK_REF_SHAPE: &str = "a list root's block entry is not [n, count, bytes, head]";
+const BLOCK_REF_SHAPE: &str = "a list root's block entry is not [n, count, head]";
 
 fn parse_block_ref(value: &Value) -> Result<BlockRef, &'static str> {
     let Value::Array(parts) = value else {
         return Err(BLOCK_REF_SHAPE);
     };
-    let [n, count, bytes, head] = parts.as_slice() else {
+    let [n, count, head] = parts.as_slice() else {
         return Err(BLOCK_REF_SHAPE);
     };
     let field = |v| as_u64(v).ok_or(BLOCK_REF_SHAPE);
     Ok(BlockRef {
         n: field(n)?,
         count: field(count)?,
-        bytes: field(bytes)?,
         head: field(head)?,
     })
 }
@@ -586,23 +584,22 @@ fn open_root(bytes: &[u8]) -> Result<Root, ValueError> {
         .map(parse_block_ref)
         .collect::<Result<Vec<_>, _>>()
         .map_err(corrupt_root)?;
-    let overflow = || corrupt_root("the list root's block counts or bytes leave u64");
-    let (mut counted, mut summed) = (0_u64, 0_u64);
+    let overflow = || corrupt_root("the list root's block counts leave u64");
+    let mut counted = 0_u64;
     for block in &blocks {
         if block.n >= next {
             return Err(corrupt_root("a list root's block n is not below next"));
         }
         counted = counted.checked_add(block.count).ok_or_else(overflow)?;
-        summed = summed.checked_add(block.bytes).ok_or_else(overflow)?;
     }
     if blocks.len() > 1 && blocks.iter().any(|block| block.count == 0) {
         return Err(corrupt_root(
             "the list root names an empty block beside others; only an only block is empty",
         ));
     }
-    if counted != count || summed != bytes {
+    if counted != count {
         return Err(corrupt_root(
-            "the list root's count or bytes is not the sum of its blocks'",
+            "the list root's count is not the sum of its blocks'",
         ));
     }
     Ok(Root {
@@ -1036,7 +1033,7 @@ impl Draft<'_> {
     }
 
     /// Record `change`, already applied to block `i`'s entries, and move the block's and the
-    /// root's totals by `count` items and `bytes`.
+    /// root's counts by `count` and the root's bytes by `bytes`.
     fn record(
         &mut self,
         i: usize,
@@ -1050,10 +1047,10 @@ impl Draft<'_> {
             .expect("an op's block is open")
             .ops
             .push(change);
-        let overflow = || corrupt_root("a list block's count, bytes or head leaves u64");
+        let overflow =
+            || corrupt_root("a list's count or bytes, or a block's count or head, leaves u64");
         let block = &mut self.list.blocks[i];
         block.count = shift(block.count, count).ok_or_else(overflow)?;
-        block.bytes = shift(block.bytes, bytes).ok_or_else(overflow)?;
         block.head = block.head.checked_add(1).ok_or_else(overflow)?;
         self.list.count = shift(self.list.count, count).ok_or_else(overflow)?;
         self.list.bytes = shift(self.list.bytes, bytes).ok_or_else(overflow)?;
@@ -1124,15 +1121,20 @@ impl Draft<'_> {
         self.record(i, Change::Insert { at, entry }, 1, i128::from(len))
     }
 
-    /// Take the item at `pos` out of its block; its record is not touched. Returns its entry and
-    /// value length.
-    fn take(&mut self, pos: u64) -> Result<(Entry, u64), ValueError> {
+    /// The entry of the item at `pos`.
+    fn entry(&mut self, pos: u64) -> Result<Entry, ValueError> {
         let (i, at) = self.locate(pos, false);
-        let entry = self.open_block(i)?.entries[index(at)].clone();
-        let len = self.item_len(&entry)?;
-        self.open_block(i)?.entries.remove(index(at));
+        Ok(self.open_block(i)?.entries[index(at)].clone())
+    }
+
+    /// Take the item at `pos` out of its block, taking `len` off the list's bytes; its record is
+    /// not touched. Returns its entry. It reads no item record (D4): a Remove measures its item
+    /// first, and a Move takes and puts back 0.
+    fn take(&mut self, pos: u64, len: u64) -> Result<Entry, ValueError> {
+        let (i, at) = self.locate(pos, false);
+        let entry = self.open_block(i)?.entries.remove(index(at));
         self.record(i, Change::Remove { at }, -1, -i128::from(len))?;
-        Ok((entry, len))
+        Ok(entry)
     }
 
     /// Give the item at `pos` the value `value`, `len` encoded bytes: in its block entry when
@@ -1217,7 +1219,9 @@ impl Draft<'_> {
             ListOp::Insert { at, value } => self.add(*at, false, value).map(Some),
             ListOp::Remove { at } => {
                 self.check_position(*at, false)?;
-                let (entry, _) = self.take(*at)?;
+                let entry = self.entry(*at)?;
+                let len = self.item_len(&entry)?;
+                let entry = self.take(*at, len)?;
                 // An inline item has no record to delete.
                 if entry.inline.is_none() {
                     let id = self.list.id(entry.n);
@@ -1234,8 +1238,8 @@ impl Draft<'_> {
             ListOp::Move { from, to } => {
                 self.check_position(*from, false)?;
                 self.check_position(*to, false)?;
-                let (entry, len) = self.take(*from)?;
-                self.insert(*to, false, entry, len)?;
+                let entry = self.take(*from, 0)?;
+                self.insert(*to, false, entry, 0)?;
                 Ok(None)
             }
         }
@@ -1265,8 +1269,6 @@ impl Draft<'_> {
     /// block, split the folds over B in block order, then find at most one merge-back. A record
     /// minted and freed in this compile writes nothing.
     fn finish(mut self) -> Result<Finished, ValueError> {
-        // The overlay stays: a split sizes what it moves from it first (D3), since an item
-        // added or replaced in this compile has no record, or a stale one, in the snapshot.
         let mut items = BTreeMap::new();
         for (&id, slot) in &self.items {
             if slot.stored || slot.value.is_some() {
@@ -1386,25 +1388,12 @@ impl Draft<'_> {
             if left.len() > self.block_max || right.len() > self.block_max {
                 return Err(too_large(left.len().max(right.len())));
             }
+            // A split moves entries, not bytes: it reads no item record (D4).
             let moved = entries[k..].to_vec();
-            let mut bytes = 0_u64;
-            for entry in &moved {
-                bytes += self.item_len(entry)?;
-            }
             let n = self.mint()?;
             let count = len_u64(moved.len());
-            let kept = &mut self.list.blocks[i - 1];
-            kept.count -= count;
-            kept.bytes -= bytes;
-            self.list.blocks.insert(
-                i,
-                BlockRef {
-                    n,
-                    count,
-                    bytes,
-                    head: 0,
-                },
-            );
+            self.list.blocks[i - 1].count -= count;
+            self.list.blocks.insert(i, BlockRef { n, count, head: 0 });
             self.blocks
                 .get_mut(&block.n)
                 .expect("the block being split is open")
@@ -1455,7 +1444,6 @@ impl Draft<'_> {
                 let mut list = self.list.clone();
                 list.blocks.remove(r);
                 list.blocks[l].count += right.count;
-                list.blocks[l].bytes += right.bytes;
                 let mut merged = fates.clone();
                 merged.insert(left.n, Fate::Base(pair));
                 let right_keys = block_keys(self.root, self.list.id(right.n), right.head);
@@ -1551,7 +1539,6 @@ fn compile(
                 blocks: vec![BlockRef {
                     n: 0,
                     count: 0,
-                    bytes: 0,
                     head: 0,
                 }],
                 records,
