@@ -32,5 +32,6 @@ pub mod testing;
 pub mod value;
 
 pub use compile::{
-    compile, read, Compiled, Corrupt, Document, Expected, ManifestError, PageFault, ValueError,
+    compile, read, BlockFault, Compiled, Corrupt, Document, Expected, ManifestError, SlotFault,
+    ValueError,
 };

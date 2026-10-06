@@ -6,12 +6,14 @@
 
 use std::path::Path as FsPath;
 
-use rdb_core::{Generation, SnapshotRead};
+use rdb_core::transaction::record_len;
+use rdb_core::{Generation, Namespace, SnapshotRead};
 use rdb_value::cbor;
 use rdb_value::envelope::{self, Kind};
-use rdb_value::keys::{RootKey, Sub};
+use rdb_value::keys::{block_key, RootKey, Sub, LIST_SLOTS};
 use rdb_value::list::{compile_list, create_list, drop_list, items, list, ListOp, Start, Token};
-use rdb_value::testing::MapSnapshot;
+use rdb_value::testing::{CountingSnapshot, MapSnapshot};
+use rdb_value::value::{MapKey, Value};
 use rdb_value::{Corrupt, Expected, ValueError};
 
 use super::blob::emit;
@@ -39,22 +41,28 @@ fn object(rest: &[String]) -> Result<(&String, RootKey, &[String]), Failure> {
 }
 
 /// `list <id> (--absent [--records] | --expect V) [--compile-only] (push J | insert P J |
-/// remove P | replace P J | move P Q)...`: compile the ops at the store's `node_max`, then
+/// remove P | replace P J | move P Q)...`: compile the ops at the store's `block_max`, then
 /// commit at the compile's generation, or print with `--compile-only`. `--records` creates a
-/// list whose every item keeps its own record. Prints the minted `ids` in op order.
+/// list whose every item keeps its own record. Prints the minted `ids` in op order and
+/// `written`, the kernel's `record_len` of the request (ADR-rdb-0016 §Verification).
 pub fn write_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let (id, root, rest) = object(rest)?;
     let body = parse_ops(rest).map_err(|e| e.keyed(id))?;
     let mut fields = id_fields(id, &root);
     let mut store = Store::load(store_path)?;
-    let node_max = store.node_max();
+    let block_max = store.block_max();
     let compiled = match body.expected {
-        Expected::Absent => create_list(&store.snapshot, &root, body.records, node_max, &body.ops),
-        expected => compile_list(&store.snapshot, &root, expected, node_max, &body.ops),
+        Expected::Absent => create_list(&store.snapshot, &root, body.records, block_max, &body.ops),
+        expected => compile_list(&store.snapshot, &root, expected, block_max, &body.ops),
     }
     .map_err(|e| Failure::from(e).with(fields.clone()))?;
     let ids: Vec<String> = compiled.ids().iter().map(|i| json_str(&show(*i))).collect();
     fields.push(("ids", format!("[{}]", ids.join(","))));
+    let request = compiled.compiled();
+    fields.push((
+        "written",
+        record_len(request.conditions.len(), &request.mutations).to_string(),
+    ));
     emit(
         &mut store,
         compiled.compiled(),
@@ -96,9 +104,10 @@ pub fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure>
 }
 
 /// `items <id> [--from P | --token G:V:P] [--limit N]`: the list's `version`, `count`, `bytes`,
-/// `height` and `records`, then the items (`position`, `id`, `value`, `version`, and `in`:
-/// `leaf` when its leaf holds the value, `record` when it has its own) and `next`, the token to
-/// resume from, or `null` at the end.
+/// `blocks` and `records`, then the items (`position`, `id`, `value`, `version`, and `in`:
+/// `block` when its block holds the value, `record` when it has its own), `next`, the token to
+/// resume from, or `null` at the end, and `opened`: the `get`, `scan` and `version` calls the read
+/// made and the value bytes they returned, from a [`CountingSnapshot`].
 pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let (id, root, mut rest) = object(rest)?;
     let (mut start, mut limit) = (None, None);
@@ -131,8 +140,9 @@ pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
     let store = Store::load(store_path)?;
     let mut fields = id_fields(id, &root);
     fields.push(("limit", limit.to_string()));
-    let page = items(&store.snapshot, &root, start, limit)
-        .map_err(|e| Failure::from(e).with(fields.clone()))?;
+    let counting = CountingSnapshot::new(&store.snapshot);
+    let page =
+        items(&counting, &root, start, limit).map_err(|e| Failure::from(e).with(fields.clone()))?;
     let listed: Vec<String> = page
         .items
         .iter()
@@ -143,14 +153,14 @@ pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
                 json_str(&show(item.id)),
                 render(&item.value),
                 item.version,
-                json_str(if item.inline { "leaf" } else { "record" })
+                json_str(if item.inline { "block" } else { "record" })
             )
         })
         .collect();
     fields.push(("version", page.list.version.to_string()));
     fields.push(("count", page.list.count.to_string()));
     fields.push(("bytes", page.list.bytes.to_string()));
-    fields.push(("height", page.list.height.to_string()));
+    fields.push(("blocks", page.list.blocks.to_string()));
     fields.push(("records", page.list.records.to_string()));
     fields.push(("items", format!("[{}]", listed.join(","))));
     fields.push((
@@ -163,6 +173,14 @@ pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
                     t.generation.0, t.version, t.position
                 )
             },
+        ),
+    ));
+    fields.push((
+        "opened",
+        format!(
+            "{{\"bytes\":{},\"calls\":{}}}",
+            counting.bytes(),
+            counting.calls()
         ),
     ));
     Ok(fields)
@@ -257,17 +275,17 @@ fn position(op: &str, text: &str) -> Result<u64, Failure> {
         .map_err(|_| Failure::usage(format!("{op} {text:?} is not a position")))
 }
 
-/// `dump`'s list root: `count`, `bytes` and `height` through the library's read, then the
-/// payload as stored (`next`, `tree`, `bytes`, `count`, `records`). A leaf entry renders as an
-/// id when the item has its own record, or `[id, value]` when the leaf holds it.
+/// `dump`'s list root: `count`, `bytes` and `blocks` through the library's read, then the
+/// payload as stored (`next`, `seed`, `bytes`, `count`, `blocks` as `[n, count, bytes, head]`
+/// per block, `records`).
 pub fn dump_root(snapshot: &MapSnapshot, root: &RootKey, line: &mut Line) -> Result<(), Failure> {
     let found =
         list(snapshot, root)?.ok_or_else(|| Failure::store("record vanished between two reads"))?;
     line.raw("count", found.count.to_string());
     line.raw("bytes", found.bytes.to_string());
-    line.raw("height", found.height.to_string());
+    line.raw("blocks", found.blocks.to_string());
     let raw = snapshot
-        .get(rdb_core::Namespace::User, root.as_bytes())
+        .get(Namespace::User, root.as_bytes())
         .ok_or_else(|| Failure::store("record vanished between two reads"))?;
     let opened = envelope::open(&raw).map_err(corrupt_envelope)?;
     let payload = cbor::decode(opened.payload)?;
@@ -275,29 +293,111 @@ pub fn dump_root(snapshot: &MapSnapshot, root: &RootKey, line: &mut Line) -> Res
     Ok(())
 }
 
-/// `dump`'s list item or page: its `id`, then the record checked as [`check_record`] does, its
-/// envelope fields and its decoded payload.
-pub fn dump_record(sub: Sub, id: u128, raw: &[u8], line: &mut Line) -> Result<(), Failure> {
-    line.str("sub", if sub == Sub::Item { "item" } else { "page" });
+/// `dump`'s list item, block base or change slot: its `sub` and `id` (and `slot`), then the
+/// record checked as [`check_record`] does, its envelope fields and its decoded payload. A base
+/// renders `{items, folded}`; an entry is `n` when the item has its own record, or `[n, value]`.
+/// A slot adds `op_no`, `op` and `state`: `pending` when the root's block entry and the base
+/// make its op no one to replay, `stale` when not, or why neither could be read.
+pub fn dump_record(
+    snapshot: &MapSnapshot,
+    root: &RootKey,
+    sub: Sub,
+    slot: Option<u8>,
+    id: u128,
+    raw: &[u8],
+    line: &mut Line,
+) -> Result<(), Failure> {
+    line.str(
+        "sub",
+        match (sub, slot) {
+            (Sub::Item, _) => "item",
+            (_, None) => "block",
+            (_, Some(_)) => "slot",
+        },
+    );
     line.str("id", &show(id));
-    let value = check_record(sub, raw)?;
+    if let Some(slot) = slot {
+        line.raw("slot", slot.to_string());
+    }
+    let value = check_record(sub, slot, raw)?;
     line.extend(envelope_fields(raw)?);
     line.raw("value", render(&value));
+    if let (Some(slot), Value::Array(parts)) = (slot, &value) {
+        if let [op_no, op] = parts.as_slice() {
+            line.raw("op_no", render(op_no));
+            line.raw("op", render(op));
+            line.str("state", &slot_state(snapshot, root, id, slot, op_no));
+        }
+    }
     Ok(())
 }
 
-/// An item record is a document envelope; a page record is a page envelope. Either payload is
-/// canonical CBOR. Returns the decoded payload.
-pub fn check_record(sub: Sub, raw: &[u8]) -> Result<rdb_value::value::Value, Failure> {
+/// `pending` when op `op_no` is in its block's pending range `folded + 1 ..= head` and belongs in
+/// `slot`; `stale` when it is not. When the root or the base does not decode, says so instead.
+fn slot_state(snapshot: &MapSnapshot, root: &RootKey, id: u128, slot: u8, op_no: &Value) -> String {
+    fn field(value: &Value, name: &str) -> Option<Value> {
+        match value {
+            Value::Map(m) => m.get(&MapKey::new(name)).cloned(),
+            _ => None,
+        }
+    }
+    fn uint(value: &Value) -> Option<u64> {
+        match value {
+            Value::Integer(i) => u64::try_from(i.get()).ok(),
+            _ => None,
+        }
+    }
+    let payload = |key: &[u8]| {
+        let raw = snapshot.get(Namespace::User, key)?;
+        let opened = envelope::open(&raw).ok()?;
+        cbor::decode(opened.payload).ok()
+    };
+    let Some(op_no) = uint(op_no) else {
+        return "unknown: the op no is not an unsigned integer".to_owned();
+    };
+    // A block's n is its id's low 64 bits.
+    let n = u64::try_from(id & u128::from(u64::MAX)).expect("the low 64 bits fit u64");
+    let head = payload(root.as_bytes()).and_then(|root| match field(&root, "blocks") {
+        Some(Value::Array(blocks)) => blocks.iter().find_map(|block| match block {
+            Value::Array(parts) if parts.first().and_then(uint) == Some(n) => {
+                parts.get(3).and_then(uint)
+            }
+            _ => None,
+        }),
+        _ => None,
+    });
+    let Some(head) = head else {
+        return "unknown: the root does not name this block".to_owned();
+    };
+    let folded = payload(&block_key(root, id))
+        .and_then(|base| field(&base, "folded"))
+        .as_ref()
+        .and_then(uint);
+    let Some(folded) = folded else {
+        return "unknown: the block's base does not read".to_owned();
+    };
+    let mine = op_no % u64::from(LIST_SLOTS) == u64::from(slot);
+    if mine && op_no > folded && op_no <= head {
+        "pending".to_owned()
+    } else {
+        "stale".to_owned()
+    }
+}
+
+/// An item record is a document envelope; a block base a block envelope; a change slot a slot
+/// envelope. Every payload is canonical CBOR. Returns the decoded payload.
+pub fn check_record(sub: Sub, slot: Option<u8>, raw: &[u8]) -> Result<Value, Failure> {
     let opened = envelope::open(raw).map_err(corrupt_envelope)?;
-    match (sub, opened.kind) {
-        (Sub::Item, Kind::Document) | (Sub::Page, Kind::ListPage) => {}
-        (Sub::Item, found) => {
+    match (sub, slot, opened.kind) {
+        (Sub::Item, _, Kind::Document)
+        | (Sub::Block, None, Kind::ListBlock)
+        | (Sub::Block, Some(_), Kind::ListSlot) => {}
+        (Sub::Item, _, found) => {
             return Err(Failure::from(ValueError::Corrupt(
                 Corrupt::ItemNotDocument { found },
             )))
         }
-        (_, found) => {
+        (_, _, found) => {
             return Err(Failure::from(rdb_value::delta::ApplyError::KindMismatch {
                 found,
             }))

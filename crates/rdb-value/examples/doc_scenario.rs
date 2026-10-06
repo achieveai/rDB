@@ -32,10 +32,10 @@
 //! doc_scenario decode --hex H
 //! doc_scenario --help
 //!
-//! `--node-max N` (before the command, beside `--store`) is the list node size the store
-//! compiles with (ADR-rdb-0016 §4), in 128..=24,576; a size outside that is refused (exit 2)
+//! `--block-max N` (before the command, beside `--store`) is the list block size the store
+//! compiles with (ADR-rdb-0016 §4), in 1,024..=196,608; a size outside that is refused (exit 2)
 //! and never saved. Given on a store's first command, it is written to the store's head line;
-//! a later different value is refused (exit 2). Without it a store uses 24,576. `drop` reads the
+//! a later different value is refused (exit 2). Without it a store uses 131,072. `drop` reads the
 //! root's kind and drops a list or a collection.
 //!
 //! <id> is an object id: plain text, or hex:<hex> for any bytes. Every object lives at
@@ -80,7 +80,7 @@
 //!
 //! `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.
 //!
-//! The store is one JSON line `{"seq":N,"envelope":2}` (plus `"node_max":N` when one was
+//! The store is one JSON line `{"seq":N,"envelope":2}` (plus `"block_max":N` when one was
 //! given), then one line per record
 //! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store
 //! with no marker or a lower one was sealed before ruling L-R186s, and one with a higher marker
@@ -114,7 +114,7 @@ use rdb_value::cbor;
 use rdb_value::delta::{resolve, ApplyError, Delta, Op};
 use rdb_value::envelope::{self, Kind, MAX_ENVELOPE, MAX_PAYLOAD};
 use rdb_value::keys::{self, RootKey, Sub};
-use rdb_value::list::{DEFAULT_NODE_MAX, MIN_NODE_MAX};
+use rdb_value::list::{DEFAULT_BLOCK_MAX, MAX_BLOCK_MAX, MIN_BLOCK_MAX};
 use rdb_value::path::{Path, PathError};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
@@ -151,7 +151,7 @@ doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]\n 
 doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 <id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
---node-max N, beside --store, sets a new store's list node size, 128..=24576 (default 24576).\n\
+--block-max N, beside --store, sets a new store's list block size, 1024..=196608 (default 131072).\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
 
 // Input limits. Every text input is read through `Read::take` at one of these, so an oversized
@@ -315,14 +315,14 @@ fn parse_path(text: &str) -> Result<Path, Failure> {
 type Fields = Vec<(&'static str, String)>;
 
 thread_local! {
-    /// The `--node-max` of this run, for [`Store::load`]: a new store takes it, an existing one
+    /// The `--block-max` of this run, for [`Store::load`]: a new store takes it, an existing one
     /// must hold the same.
-    static NODE_MAX: Cell<Option<usize>> = const { Cell::new(None) };
+    static BLOCK_MAX: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
     let mut store: Option<PathBuf> = None;
-    let mut node_max: Option<usize> = None;
+    let mut block_max: Option<usize> = None;
     let mut rest = args;
     while let [flag, value, tail @ ..] = rest {
         match flag.as_str() {
@@ -331,32 +331,32 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
                     return ("usage", Err(Failure::usage("--store given twice")));
                 }
             }
-            "--node-max" => {
+            "--block-max" => {
                 let Ok(n) = value.parse::<usize>() else {
                     return (
                         "usage",
                         Err(Failure::usage(format!(
-                            "--node-max {value:?} is not a size"
+                            "--block-max {value:?} is not a size"
                         ))),
                     );
                 };
-                if !(MIN_NODE_MAX..=DEFAULT_NODE_MAX).contains(&n) {
+                if !(MIN_BLOCK_MAX..=MAX_BLOCK_MAX).contains(&n) {
                     return (
                         "usage",
                         Err(Failure::usage(format!(
-                            "--node-max {n} is outside {MIN_NODE_MAX}..={DEFAULT_NODE_MAX}"
+                            "--block-max {n} is outside {MIN_BLOCK_MAX}..={MAX_BLOCK_MAX}"
                         ))),
                     );
                 }
-                if node_max.replace(n).is_some() {
-                    return ("usage", Err(Failure::usage("--node-max given twice")));
+                if block_max.replace(n).is_some() {
+                    return ("usage", Err(Failure::usage("--block-max given twice")));
                 }
             }
             _ => break,
         }
         rest = tail;
     }
-    NODE_MAX.with(|cell| cell.set(node_max));
+    BLOCK_MAX.with(|cell| cell.set(block_max));
     let Some((cmd, rest)) = rest.split_first() else {
         return ("usage", Err(Failure::usage("no command")));
     };
@@ -667,7 +667,7 @@ fn dump_record(
             } else if opened.kind == Kind::List {
                 list::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
-            } else if matches!(opened.kind, Kind::Chunk | Kind::ListPage) {
+            } else if matches!(opened.kind, Kind::Chunk | Kind::ListBlock | Kind::ListSlot) {
                 return Err(Failure::from(ApplyError::KindMismatch {
                     found: opened.kind,
                 }));
@@ -698,11 +698,11 @@ fn dump_record(
                 .ok_or_else(|| Failure::store("a chunk key parsed without its tail"))?;
             blob::dump_chunk(&upload, index, raw, line)?;
         }
-        (Sub::Item | Sub::Page, _) => {
+        (Sub::Item | Sub::Block, _) => {
             let id = parsed
                 .list_id
                 .ok_or_else(|| Failure::store("a list key parsed without its id"))?;
-            list::dump_record(parsed.sub, id, raw, line)?;
+            list::dump_record(snapshot, &root, parsed.sub, parsed.slot, id, raw, line)?;
         }
         (Sub::Reserved(byte), _) => {
             line.str("sub", &format!("reserved {byte:#04x}"));
@@ -1009,22 +1009,22 @@ const STORE_ENVELOPE: u64 = 2;
 struct Store {
     path: PathBuf,
     seq: u64,
-    /// The `node_max` its head line names, if one was given when it was made.
-    node_max: Option<usize>,
+    /// The `block_max` its head line names, if one was given when it was made.
+    block_max: Option<usize>,
     snapshot: MapSnapshot,
 }
 
 impl Store {
-    /// A missing file is an empty store at `seq` 0, with this run's `--node-max` if given. An
-    /// existing store must hold the `--node-max` given, if any (exit 2).
+    /// A missing file is an empty store at `seq` 0, with this run's `--block-max` if given. An
+    /// existing store must hold the `--block-max` given, if any (exit 2).
     fn load(path: &FsPath) -> Result<Self, Failure> {
-        let requested = NODE_MAX.with(Cell::get);
+        let requested = BLOCK_MAX.with(Cell::get);
         let store = match std::fs::File::open(path) {
             Ok(file) => Self::read(path, BufReader::new(file))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self {
                 path: path.to_owned(),
                 seq: 0,
-                node_max: requested,
+                block_max: requested,
                 snapshot: MapSnapshot::new(Generation(1)),
             },
             Err(e) => {
@@ -1035,21 +1035,21 @@ impl Store {
             }
         };
         if let Some(requested) = requested {
-            if requested != store.node_max() {
+            if requested != store.block_max() {
                 return Err(Failure::usage(format!(
-                    "--node-max {requested}: {} is a store at node_max {}; a store keeps the \
-                     node size it was made with",
+                    "--block-max {requested}: {} is a store at block_max {}; a store keeps the \
+                     block size it was made with",
                     path.display(),
-                    store.node_max()
+                    store.block_max()
                 )));
             }
         }
         Ok(store)
     }
 
-    /// The list node size this store compiles with.
-    fn node_max(&self) -> usize {
-        self.node_max.unwrap_or(DEFAULT_NODE_MAX)
+    /// The list block size this store compiles with.
+    fn block_max(&self) -> usize {
+        self.block_max.unwrap_or(DEFAULT_BLOCK_MAX)
     }
 
     /// The store in `source`, read one line at a time, each line bounded at [`MAX_LINE`]: a read
@@ -1058,7 +1058,7 @@ impl Store {
         let mut store = Self {
             path: path.to_owned(),
             seq: 0,
-            node_max: None,
+            block_max: None,
             snapshot: MapSnapshot::new(Generation(1)),
         };
         let bad = |n: usize, what: &str| {
@@ -1147,12 +1147,19 @@ impl Store {
                 ))
             }
         }
-        store.node_max = match head.get("node_max") {
+        if head.get("node_max").is_some() {
+            return Err(bad(
+                n,
+                "a store from the tree-list build (\"node_max\"): its list records are pages, \
+                 not blocks; start a new store",
+            ));
+        }
+        store.block_max = match head.get("block_max") {
             None => None,
             Some(v) => Some(
                 v.as_u64()
                     .and_then(|n| usize::try_from(n).ok())
-                    .ok_or_else(|| bad(n, "\"node_max\" is not a size"))?,
+                    .ok_or_else(|| bad(n, "\"block_max\" is not a size"))?,
             ),
         };
         for (n, line) in lines {
@@ -1319,11 +1326,11 @@ impl Store {
 
     /// Rewrite the whole file: to a sibling first, then rename over the old one.
     fn save(&self) -> Result<(), Failure> {
-        let node_max = self
-            .node_max
-            .map_or_else(String::new, |n| format!(",\"node_max\":{n}"));
+        let block_max = self
+            .block_max
+            .map_or_else(String::new, |n| format!(",\"block_max\":{n}"));
         let mut text = format!(
-            "{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}{node_max}}}\n",
+            "{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}{block_max}}}\n",
             self.seq
         );
         for (key, version, value) in self.snapshot.records() {
@@ -1478,7 +1485,7 @@ fn check_writes(mutations: &[Mutation]) -> Result<bool, Failure> {
                         writes_list = true;
                         rdb_value::list::list(&written, &root).map_err(|e| keyed(e.into()))?;
                     }
-                    Kind::Chunk | Kind::ListPage => {
+                    Kind::Chunk | Kind::ListBlock | Kind::ListSlot => {
                         return Err(keyed(
                             ApplyError::KindMismatch { found: opened.kind }.into(),
                         ))
@@ -1510,18 +1517,24 @@ fn check_writes(mutations: &[Mutation]) -> Result<bool, Failure> {
                     blob::open_chunk(index, value).map_err(keyed)?;
                 }
             }
-            // An item or page write keeps its root in step, so it needs the root written
-            // beside it, as an element write does.
-            (Sub::Item | Sub::Page, _) => {
+            // An item, block or slot write keeps its root in step, so it needs the root written
+            // beside it, as an element write does. A drop deletes the root with its block and
+            // slots, so a root `Delete` counts too.
+            (Sub::Item | Sub::Block, _) => {
                 writes_list = true;
-                if written.version(Namespace::User, root.as_bytes()).is_none() {
+                let root_written = mutations.iter().any(|m| match m {
+                    Mutation::Put { key, .. } | Mutation::Delete { key, .. } => {
+                        key[..] == *root.as_bytes()
+                    }
+                });
+                if !root_written {
                     return Err(keyed(Failure::usage(
-                        "a list item or page write without its list's root write \
+                        "a list item, block or slot write without its list's root write \
                          (ADR-rdb-0016 §5)",
                     )));
                 }
                 if let Some(value) = value {
-                    list::check_record(parsed.sub, value).map_err(keyed)?;
+                    list::check_record(parsed.sub, parsed.slot, value).map_err(keyed)?;
                 }
             }
             (Sub::Reserved(byte), _) => {
@@ -2429,17 +2442,18 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean");
     }
     /// Tester W1 D1 (ruling L-R186cm): an out-of-range `--node-max` was saved in a new store's
-    /// head by the first command that committed, and every later `list` then failed
-    /// `InvalidNodeSize`. It is refused as usage, exit 2, before any store is read or written.
+    /// head by the first command that committed, and every later `list` then failed. Its
+    /// successor `--block-max` (ADR-rdb-0016 §4) is refused as usage, exit 2, before any store
+    /// is read or written.
     #[test]
-    fn d1_an_out_of_range_node_max_is_refused_and_never_saved() {
-        let dir = scratch("d1-node-max");
+    fn d1_an_out_of_range_block_max_is_refused_and_never_saved() {
+        let dir = scratch("d1-block-max");
         let store = dir.join("s.jsonl");
-        for size in ["64", "127", "24577"] {
+        for size in ["512", "1023", "196609"] {
             let (_, got) = run(&args(&[
                 "--store",
                 store.to_str().unwrap(),
-                "--node-max",
+                "--block-max",
                 size,
                 "put",
                 "d",
@@ -2454,13 +2468,13 @@ mod tests {
                 "{}",
                 err.detail
             );
-            assert!(!store.exists(), "--node-max {size}: no store written");
+            assert!(!store.exists(), "--block-max {size}: no store written");
         }
-        for size in ["128", "24576"] {
+        for size in ["1024", "196608"] {
             let (_, got) = run(&args(&[
                 "--store",
                 store.to_str().unwrap(),
-                "--node-max",
+                "--block-max",
                 size,
                 "list",
                 "x",

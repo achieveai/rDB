@@ -170,9 +170,9 @@ fn l_r186s_a_flipped_kind_or_codec_is_a_digest_mismatch() {
 fn l_r186s_a_newer_builds_record_reads_as_unknown_never_as_damage() {
     use EnvelopeError::*;
     let payload = h("a0");
-    // 0x08 is the first kind no build knows since lists took 0x06 and 0x07 (ADR-rdb-0016). It
+    // 0x09 is the first kind no build knows since lists took 0x06 to 0x08 (ADR-rdb-0016). It
     // must move when a later kind takes it; otherwise this row asserts a known kind is unknown.
-    assert_eq!(open(&hashed(0x08, 0x01, &payload)), Err(UnknownKind(0x08)));
+    assert_eq!(open(&hashed(0x09, 0x01, &payload)), Err(UnknownKind(0x09)));
     assert_eq!(open(&hashed(0x7f, 0x01, &payload)), Err(UnknownKind(0x7f)));
     assert_eq!(open(&hashed(0x00, 0x01, &payload)), Err(UnknownKind(0x00)));
     assert_eq!(open(&hashed(0xff, 0x01, &payload)), Err(UnknownKind(0xff)));

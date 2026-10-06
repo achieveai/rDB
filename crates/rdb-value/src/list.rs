@@ -1,23 +1,26 @@
-//! Ordered lists: a root, pages, and a record for each item too large for its leaf
-//! (ADR-rdb-0016).
+//! Ordered lists: a root, blocks with their change slots, and a record for each item too large
+//! for its block (ADR-rdb-0016).
 //!
 //! - The root, at the object's [`RootKey`], is an envelope of kind [`Kind::List`] whose payload is
-//!   canonical CBOR of exactly `{next, tree, bytes, count, records}`: the id counter, the top node
-//!   of the tree, the items' value bytes and count, and whether every item keeps its own record
-//!   (decision 3).
-//! - A leaf entry is an item's id alone, when the item has its own record, or `[id, value]`, when
-//!   the leaf holds its value. A value goes in its leaf when it encodes to at most the effective
-//!   limit `min(`[`INLINE_MAX`]`, (node_max − 15) / 3 − 18)`, unless the list was created with
-//!   `records`. Readers check neither the limit nor the flag.
+//!   canonical CBOR of exactly `{next, seed, bytes, count, blocks, records}`: the id counter, the
+//!   create's seed, the items' value bytes and count, the block index (`[n, count, bytes, head]`
+//!   per block, in list order) and whether every item keeps its own record.
+//! - A block's base, at [`block_key`], is kind [`Kind::ListBlock`]: `{items, folded}`, the entries
+//!   as of op no `folded`. Its later ops, `folded + 1 … head`, each live in change slot
+//!   `op no mod 240`, at [`slot_key`], kind [`Kind::ListSlot`]: `[op no, op]`. A slot holding any
+//!   other op no is stale and never read.
+//! - An entry is an item's `n` alone, when the item has its own record, or `[n, value]`, when the
+//!   block holds its value. The item id is `seed << 64 | n`. A value goes in its block when it
+//!   encodes to at most `min(`[`INLINE_MAX`]`, block_max / 4 − 16)`, unless the list was created
+//!   with `records`. Readers check neither the limit nor the flag.
 //! - An item record, at [`item_key`], is a document envelope holding the item's value.
-//! - A page, at [`page_key`], is a node below the top, kind [`Kind::ListPage`].
-//! - The tree is an order-statistic B+ tree: a leaf holds item entries in list order; an internal
-//!   node names its kids with each kid's item count and value bytes.
-//! - [`compile_list`] turns positional ops into one root `Put` plus one write per item or page
-//!   that changed, in key order, with the snapshot's generation attached (decision 8).
+//! - [`compile_list`] turns positional ops into one root `Put`, the item writes, and per touched
+//!   block either one slot per op or, when the pending ops pass 240 or a quarter of the base's
+//!   bytes, a new base (a fold), in key order, with the snapshot's generation attached
+//!   (decision 8). A fold deletes nothing.
 //!
-//! Reads go through `&dyn SnapshotRead` only. Every page is checked before it is used, and
-//! nothing is repaired: damage is a named [`Corrupt`].
+//! Reads go through `&dyn SnapshotRead` only. Every block is replayed and checked before it is
+//! used, and nothing is repaired: damage is a named [`Corrupt`].
 
 use std::collections::BTreeMap;
 
@@ -28,32 +31,50 @@ use rdb_core::transaction::record_len;
 use rdb_core::{Condition, Generation, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode};
-use crate::compile::{check_version, record, Compiled, Corrupt, Expected, PageFault, ValueError};
+use crate::compile::{
+    check_version, record, BlockFault, Compiled, Corrupt, Expected, SlotFault, ValueError,
+};
 use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{open, seal, EnvelopeError, Kind, HEADER_LEN};
-use crate::keys::{item_key, page_key, RootKey, LIST_ID_LEN, SUB_ITEM, SUB_PAGE};
+use crate::keys::{
+    block_key, item_key, slot_key, KeyError, RootKey, LIST_ID_LEN, LIST_SLOTS, SUB_BLOCK, SUB_ITEM,
+};
 use crate::value::{Int, Map, MapKey, Value};
 
-/// The node size rDB writes with: a node over it splits (ADR-rdb-0016 §4). A compile argument,
-/// never stored.
-pub const DEFAULT_NODE_MAX: usize = 24_576;
-/// The smallest `node_max` a compile takes: a node over it holds at least 4 entries, so both
-/// halves of a split are non-empty (ADR-rdb-0016 §4).
-pub const MIN_NODE_MAX: usize = 128;
+/// The block size rDB writes with: a fold whose base would pass it splits (ADR-rdb-0016 §4). A
+/// compile argument, never stored.
+pub const DEFAULT_BLOCK_MAX: usize = 131_072;
+/// The smallest `block_max` a compile takes (ADR-rdb-0016 §4).
+pub const MIN_BLOCK_MAX: usize = 1_024;
+/// The largest `block_max` a compile takes (ADR-rdb-0016 §4): 192 KiB, so that a base left
+/// unsplit at the block cap stays within [`MAX_BLOCK_PAYLOAD`].
+pub const MAX_BLOCK_MAX: usize = 196_608;
+/// The largest block payload a reader takes (ADR-rdb-0016 §4, §7).
+pub const MAX_BLOCK_PAYLOAD: usize = 262_144;
+/// The longest escaped object id, `|esc(object id)|`, a list compile takes (ADR-rdb-0016 §4).
+/// Within it, emptying or dropping a list never fails on bytes.
+pub const MAX_ID_ESCAPED: usize = 3_072;
+/// The most blocks a list has (ADR-rdb-0016 §4). Readers check it.
+pub const MAX_BLOCKS: usize = 512;
 /// The largest item envelope a write takes (ADR-rdb-0016 §4). A write limit, not a format one:
 /// reads never check it.
 pub const MAX_ITEM: usize = 524_288;
-/// The highest level a node has: a tree is at most 8 high (ADR-rdb-0016 §4).
-pub const MAX_LEVEL: u8 = 7;
-/// L: the largest encoded value a leaf entry holds (ADR-rdb-0016 §4). A code constant, never
+/// L: the largest encoded value a block entry holds (ADR-rdb-0016 §4). A code constant, never
 /// stored; readers never check it.
 pub const INLINE_MAX: usize = 256;
 
-/// The largest encoded value a leaf entry holds at `node_max`: `min(L, (P − 15) / 3 − 18)`. A
-/// leaf's widest overhead is 15 bytes and `[id, value]` adds 18 to the value, so a node over
-/// `node_max` holds at least 4 entries (ADR-rdb-0016 §4). At 128 it is 19; L binds from 837.
-const fn inline_limit(node_max: usize) -> usize {
-    let fit = (node_max.saturating_sub(15) / 3).saturating_sub(18);
+/// [`LIST_SLOTS`] as an op-no modulus.
+const SLOTS: u64 = LIST_SLOTS as u64;
+/// One `scan` from a block's key returns its base, then every slot.
+const BLOCK_SCAN: usize = LIST_SLOTS as usize + 1;
+/// A drop's orphan scan: the block's 241 keys and room to see one more.
+const DROP_SCAN: usize = BLOCK_SCAN + 2;
+
+/// The largest encoded value a block entry holds at `block_max`: `min(L, B / 4 − 16)`, so a
+/// block over B holds at least 4 entries (ADR-rdb-0016 §4). At 1,024 it is 240; L binds from
+/// 1,088.
+const fn inline_limit(block_max: usize) -> usize {
+    let fit = (block_max / 4).saturating_sub(16);
     if fit < INLINE_MAX {
         fit
     } else {
@@ -61,9 +82,36 @@ const fn inline_limit(node_max: usize) -> usize {
     }
 }
 
-// One insert or replace on a list of height 8 at the default node size, with the shortest
-// object id, fits one request (ADR-rdb-0016 §4; 1,541 includes the root's `records`).
-const _: () = assert!(1_541 + 16 * 2 + 15 * DEFAULT_NODE_MAX + MAX_ITEM <= MAX_ENVELOPE_BYTES);
+/// The largest root payload: [`MAX_BLOCKS`] index entries of at most 37 bytes, and 72 bytes of
+/// the rest (ADR-rdb-0016 §4).
+const MAX_ROOT_PAYLOAD: usize = MAX_BLOCKS * 37 + 72;
+/// `record_len`'s cost of one `Put` past its key and value.
+const PUT_COST: usize = 10;
+/// An object key's bytes besides the escaped object id: the 12-byte scope and `sub`.
+const SCOPE_AND_SUB: usize = 13;
+/// The largest slot payload: `[op no, [code, at, [n, value]]]` with every integer at 9 bytes and
+/// an inline value of [`INLINE_MAX`] bytes (287), rounded up.
+const MAX_SLOT_PAYLOAD: usize = 300;
+
+/// The bytes one op can write at `block_max` for an object id that escapes to `e` bytes
+/// (ADR-rdb-0016 §4): the request; the root; a fold of up to 1.25 · B and one entry, written as
+/// two blocks; a slot; the largest item.
+const fn worst_op(block_max: usize, e: usize) -> usize {
+    let key = SCOPE_AND_SUB + e;
+    266 + (PUT_COST + key + HEADER_LEN + MAX_ROOT_PAYLOAD)
+        + 2 * (PUT_COST + key + LIST_ID_LEN + HEADER_LEN)
+        + block_max / 4 * 5
+        + MAX_SLOT_PAYLOAD
+        + (PUT_COST + key + LIST_ID_LEN + 1 + HEADER_LEN + MAX_SLOT_PAYLOAD)
+        + (PUT_COST + key + LIST_ID_LEN + MAX_ITEM)
+}
+
+// Any one op fits one request, at the default and at the largest block size, for the longest id
+// a list takes (ADR-rdb-0016 §4).
+const _: () = assert!(worst_op(DEFAULT_BLOCK_MAX, MAX_ID_ESCAPED) <= MAX_ENVELOPE_BYTES);
+const _: () = assert!(worst_op(MAX_BLOCK_MAX, MAX_ID_ESCAPED) <= MAX_ENVELOPE_BYTES);
+// A base left unsplit at the block cap, 1.25 · B and one entry, is one a reader takes.
+const _: () = assert!(MAX_BLOCK_MAX / 4 * 5 + MAX_SLOT_PAYLOAD <= MAX_BLOCK_PAYLOAD);
 
 /// One positional op (ADR-rdb-0016 §5). Ops apply in order; positions are 0-based and read the
 /// list as the earlier ops left it.
@@ -91,7 +139,7 @@ pub enum ListOp {
         value: Value,
     },
     /// Move the item at `from` so that it ends at `to`; both `< count`. Its id and its record
-    /// stay; only pages are written.
+    /// stay; only blocks are written.
     Move {
         /// The item's position now.
         from: u64,
@@ -137,11 +185,10 @@ pub struct List {
     pub version: u64,
     /// How many items it holds.
     pub count: u64,
-    /// The items' value bytes: each item's canonical encoded length, wherever it is stored. Kept
-    /// by every compile, not checked by reads.
+    /// The items' value bytes: each item's canonical encoded length, wherever it is stored.
     pub bytes: u64,
-    /// The tree's height: 1 when the root's top node is a leaf.
-    pub height: u8,
+    /// How many blocks it has: at least 1.
+    pub blocks: usize,
     /// Whether every item keeps its own record. Set when the list is created.
     pub records: bool,
 }
@@ -155,10 +202,10 @@ pub struct Item {
     pub id: u128,
     /// Its value.
     pub value: Value,
-    /// Whether its leaf holds the value; `false` when the item has its own record.
+    /// Whether its block holds the value; `false` when the item has its own record.
     pub inline: bool,
     /// The storage version of the record that holds the value: the item's own record, or for an
-    /// inline item its leaf's (at height 1, the root's). Not a concurrency token.
+    /// inline item the root's. Not a concurrency token.
     pub version: u64,
 }
 
@@ -194,161 +241,61 @@ pub struct Items {
     pub next: Option<Token>,
 }
 
-// ---- nodes ---------------------------------------------------------------------------------
+// ---- entries and ops ------------------------------------------------------------------------
 
-/// An internal node's entry for one kid: the kid's page id, item count and stored bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Kid {
-    id: u128,
-    count: u64,
-    bytes: u64,
-}
-
-/// A kid entry's `(count, bytes)`.
-type Totals = (u64, u64);
-
-/// A leaf entry (ADR-rdb-0016 §3): an item's id, and its value when the leaf holds it. With no
-/// value here, the item has its own record.
+/// A block entry (ADR-rdb-0016 §1): an item's `n`, and its value when the block holds it. With
+/// no value here, the item has its own record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
-    id: u128,
+    n: u64,
     inline: Option<Value>,
 }
 
 impl Entry {
-    /// `id` or `[id, value]`.
+    /// `n` or `[n, value]`.
     fn value(&self) -> Value {
         match &self.inline {
-            None => id_value(self.id),
-            Some(value) => Value::Array(vec![id_value(self.id), value.clone()]),
+            None => uint(self.n),
+            Some(value) => Value::Array(vec![uint(self.n), value.clone()]),
         }
     }
 }
 
-/// A tree node (ADR-rdb-0016 §3): the root's top node, or a page's payload.
+/// One block op (ADR-rdb-0016 §1): `[0, at, entry]`, `[1, at]` or `[2, at, entry]`. `at` is a
+/// position in the block after every earlier op of that block.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Node {
-    /// Level 0: item entries in list order.
-    Leaf(Vec<Entry>),
-    /// Level 1 to 7: kids in list order.
-    Internal { level: u8, kids: Vec<Kid> },
+enum Change {
+    Insert { at: u64, entry: Entry },
+    Remove { at: u64 },
+    Replace { at: u64, entry: Entry },
 }
 
-impl Node {
-    const fn level(&self) -> u8 {
-        match self {
-            Self::Leaf(_) => 0,
-            Self::Internal { level, .. } => *level,
-        }
-    }
-
-    fn entries(&self) -> usize {
-        match self {
-            Self::Leaf(ids) => ids.len(),
-            Self::Internal { kids, .. } => kids.len(),
-        }
-    }
-
-    /// The items under it, or `None` when that overflows `u64`.
-    fn count(&self) -> Option<u64> {
-        match self {
-            Self::Leaf(ids) => u64::try_from(ids.len()).ok(),
-            Self::Internal { kids, .. } => kids
-                .iter()
-                .try_fold(0_u64, |total, kid| total.checked_add(kid.count)),
-        }
-    }
-
-    fn entry_values(&self) -> Vec<Value> {
-        match self {
-            Self::Leaf(entries) => entries.iter().map(Entry::value).collect(),
-            Self::Internal { kids, .. } => kids
-                .iter()
-                .map(|kid| Value::Array(vec![id_value(kid.id), uint(kid.count), uint(kid.bytes)]))
-                .collect(),
-        }
-    }
-
-    /// `{ids: [id or [id, value]...], level: 0}` or `{kids: [[id, count, bytes]...], level: L}`.
+impl Change {
     fn value(&self) -> Value {
-        let mut node = Map::new();
-        let name = match self {
-            Self::Leaf(_) => "ids",
-            Self::Internal { .. } => "kids",
-        };
-        node.insert(MapKey::new(name), Value::Array(self.entry_values()));
-        node.insert(MapKey::new("level"), uint(u64::from(self.level())));
-        Value::Map(node)
-    }
-
-    fn encoded(&self) -> Result<Vec<u8>, ApplyError> {
-        encode(&self.value()).map_err(ApplyError::from)
-    }
-
-    fn size(&self) -> Result<usize, ApplyError> {
-        self.encoded().map(|bytes| bytes.len())
-    }
-
-    /// Keep the first `at` entries; return the rest as a node of the same level.
-    fn split_off(&mut self, at: usize) -> Self {
         match self {
-            Self::Leaf(ids) => Self::Leaf(ids.split_off(at)),
-            Self::Internal { level, kids } => Self::Internal {
-                level: *level,
-                kids: kids.split_off(at),
-            },
+            Self::Insert { at, entry } => Value::Array(vec![uint(0), uint(*at), entry.value()]),
+            Self::Remove { at } => Value::Array(vec![uint(1), uint(*at)]),
+            Self::Replace { at, entry } => Value::Array(vec![uint(2), uint(*at), entry.value()]),
         }
     }
 
-    /// Append `other`'s entries; both are at one level.
-    fn append(&mut self, other: Self) {
-        match (self, other) {
-            (Self::Leaf(ids), Self::Leaf(more)) => ids.extend(more),
-            (Self::Internal { kids, .. }, Self::Internal { kids: more, .. }) => kids.extend(more),
-            _ => unreachable!("siblings are at one level"),
+    /// Apply to `entries`; `false` when `at` is outside them, which changes nothing.
+    fn apply(self, entries: &mut Vec<Entry>) -> bool {
+        let len = len_u64(entries.len());
+        match self {
+            Self::Insert { at, entry } if at <= len => entries.insert(index(at), entry),
+            Self::Remove { at } if at < len => {
+                entries.remove(index(at));
+            }
+            Self::Replace { at, entry } if at < len => entries[index(at)] = entry,
+            _ => return false,
         }
+        true
     }
-}
-
-/// Split `node` into two byte-balanced halves (ADR-rdb-0016 §4): the cut that makes the two
-/// halves' encoded entries closest in size, the first such cut on a tie. `node` keeps the left
-/// half; the right is returned.
-fn balanced_split(node: &mut Node) -> Result<Node, ApplyError> {
-    let sizes = node
-        .entry_values()
-        .iter()
-        .map(|entry| encode(entry).map(|bytes| bytes.len()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(ApplyError::from)?;
-    assert!(sizes.len() >= 2, "callers never split fewer than 2 entries");
-    let total: usize = sizes.iter().sum();
-    let (mut best, mut cut, mut prefix) = (usize::MAX, 1, 0);
-    for (i, size) in sizes.iter().enumerate().take(sizes.len() - 1) {
-        prefix += size;
-        let gap = prefix.abs_diff(total - prefix);
-        if gap < best {
-            (best, cut) = (gap, i + 1);
-        }
-    }
-    Ok(node.split_off(cut))
 }
 
 fn uint(v: u64) -> Value {
     Value::Integer(Int::from(v))
-}
-
-fn id_value(id: u128) -> Value {
-    Value::Bytes(id.to_be_bytes().to_vec())
-}
-
-/// A 16-byte id, or `None`.
-fn as_id(value: &Value) -> Option<u128> {
-    match value {
-        Value::Bytes(b) => <[u8; LIST_ID_LEN]>::try_from(b.as_slice())
-            .ok()
-            .map(u128::from_be_bytes),
-        _ => None,
-    }
 }
 
 /// A non-negative integer that fits u64, or `None`.
@@ -359,92 +306,141 @@ fn as_u64(value: &Value) -> Option<u64> {
     }
 }
 
-const KID_SHAPE: &str = "a list kid is not [16-byte id, count, bytes]";
-const ENTRY_SHAPE: &str = "a list leaf entry is not an id or [id, value]";
-
-/// Decode a node, checking only what the node says of itself. `Err` names what is wrong.
-fn parse_node(value: &Value) -> Result<Node, &'static str> {
-    let Value::Map(node) = value else {
-        return Err("a list node is not a map");
-    };
-    let level = node
-        .get(&MapKey::new("level"))
-        .and_then(as_u64)
-        .ok_or("a list node's level is not an unsigned integer")?;
-    if level > u64::from(MAX_LEVEL) {
-        return Err("a list node's level is over 7");
-    }
-    let level = u8::try_from(level).expect("a level of at most 7 fits u8");
-    if level == 0 {
-        let (Some(Value::Array(ids)), 2) = (node.get(&MapKey::new("ids")), node.len()) else {
-            return Err("a list leaf is not exactly ids and level");
-        };
-        let entries = ids.iter().map(parse_entry).collect::<Result<_, _>>()?;
-        return Ok(Node::Leaf(entries));
-    }
-    let (Some(Value::Array(kids)), 2) = (node.get(&MapKey::new("kids")), node.len()) else {
-        return Err("a list internal node is not exactly kids and level");
-    };
-    let kids = kids.iter().map(parse_kid).collect::<Result<_, _>>()?;
-    Ok(Node::Internal { level, kids })
+fn len_u64(len: usize) -> u64 {
+    u64::try_from(len).expect("a length fits u64")
 }
 
-/// A 16-byte id, or `[16-byte id, value]` with any value.
+/// A position inside a block already checked against its length.
+fn index(at: u64) -> usize {
+    usize::try_from(at).expect("a block position fits usize")
+}
+
+/// `v + delta`, or `None` outside `u64`.
+fn shift(v: u64, delta: i128) -> Option<u64> {
+    u64::try_from(i128::from(v) + delta).ok()
+}
+
+const ENTRY_SHAPE: &str = "a list block entry is not n or [n, value]";
+const OP_SHAPE: &str =
+    "a list change slot is not [op no, [0, at, entry] or [1, at] or [2, at, entry]]";
+
+/// `n`, or `[n, value]` with any value.
 fn parse_entry(value: &Value) -> Result<Entry, &'static str> {
-    if let Some(id) = as_id(value) {
-        return Ok(Entry { id, inline: None });
+    if let Some(n) = as_u64(value) {
+        return Ok(Entry { n, inline: None });
     }
     let Value::Array(parts) = value else {
         return Err(ENTRY_SHAPE);
     };
-    let [id, inline] = parts.as_slice() else {
+    let [n, inline] = parts.as_slice() else {
         return Err(ENTRY_SHAPE);
     };
     Ok(Entry {
-        id: as_id(id).ok_or(ENTRY_SHAPE)?,
+        n: as_u64(n).ok_or(ENTRY_SHAPE)?,
         inline: Some(inline.clone()),
     })
 }
 
-fn parse_kid(value: &Value) -> Result<Kid, &'static str> {
+/// A slot's `[op no, op]`.
+fn parse_slot(value: &Value) -> Result<(u64, Change), &'static str> {
     let Value::Array(parts) = value else {
-        return Err(KID_SHAPE);
+        return Err(OP_SHAPE);
     };
-    let [id, count, bytes] = parts.as_slice() else {
-        return Err(KID_SHAPE);
+    let [op_no, op] = parts.as_slice() else {
+        return Err(OP_SHAPE);
     };
-    let kid = Kid {
-        id: as_id(id).ok_or(KID_SHAPE)?,
-        count: as_u64(count).ok_or(KID_SHAPE)?,
-        bytes: as_u64(bytes).ok_or(KID_SHAPE)?,
+    let op_no = as_u64(op_no).ok_or(OP_SHAPE)?;
+    let Value::Array(op) = op else {
+        return Err(OP_SHAPE);
     };
-    if kid.count == 0 {
-        return Err("a list kid has count 0");
-    }
-    Ok(kid)
+    let change = match op.as_slice() {
+        [code, at, entry] if as_u64(code) == Some(0) => Change::Insert {
+            at: as_u64(at).ok_or(OP_SHAPE)?,
+            entry: parse_entry(entry)?,
+        },
+        [code, at] if as_u64(code) == Some(1) => Change::Remove {
+            at: as_u64(at).ok_or(OP_SHAPE)?,
+        },
+        [code, at, entry] if as_u64(code) == Some(2) => Change::Replace {
+            at: as_u64(at).ok_or(OP_SHAPE)?,
+            entry: parse_entry(entry)?,
+        },
+        _ => return Err(OP_SHAPE),
+    };
+    Ok((op_no, change))
 }
 
-// ---- the root and pages ----------------------------------------------------------------------
+/// A block payload: `{items: [entry...], folded}`.
+fn block_value(entries: &[Entry], folded: u64) -> Value {
+    let mut map = Map::new();
+    map.insert(
+        MapKey::new("items"),
+        Value::Array(entries.iter().map(Entry::value).collect()),
+    );
+    map.insert(MapKey::new("folded"), uint(folded));
+    Value::Map(map)
+}
+
+/// A block payload, decoded: its entries and `folded`.
+fn parse_block(value: &Value) -> Result<(Vec<Entry>, u64), &'static str> {
+    let Value::Map(fields) = value else {
+        return Err("a list block is not a map");
+    };
+    let (Some(Value::Array(items)), Some(folded), 2) = (
+        fields.get(&MapKey::new("items")),
+        fields.get(&MapKey::new("folded")),
+        fields.len(),
+    ) else {
+        return Err("a list block is not exactly items and folded");
+    };
+    let folded = as_u64(folded).ok_or("a list block's folded is not an unsigned integer")?;
+    let entries = items.iter().map(parse_entry).collect::<Result<_, _>>()?;
+    Ok((entries, folded))
+}
+
+// ---- the root ------------------------------------------------------------------------------
+
+/// A root's index entry for one block: its `n`, item count and value bytes, and its newest op
+/// no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockRef {
+    n: u64,
+    count: u64,
+    bytes: u64,
+    head: u64,
+}
 
 /// A root payload, decoded.
 struct Root {
-    /// The next id to mint.
-    next: u128,
-    top: Node,
+    /// The next `n` to mint, for items and blocks.
+    next: u64,
+    seed: u64,
     bytes: u64,
     count: u64,
+    blocks: Vec<BlockRef>,
     /// Every item keeps its own record.
     records: bool,
 }
 
 impl Root {
-    /// The root payload: `{next, tree, bytes, count, records}`.
+    /// The full id of `n`: `seed << 64 | n`.
+    fn id(&self, n: u64) -> u128 {
+        (u128::from(self.seed) << 64) | u128::from(n)
+    }
+
+    /// The root payload: `{next, seed, bytes, count, blocks, records}`.
     fn payload(&self) -> Result<Vec<u8>, ApplyError> {
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| Value::Array(vec![uint(b.n), uint(b.count), uint(b.bytes), uint(b.head)]))
+            .collect();
         let mut map = Map::new();
-        map.insert(MapKey::new("next"), id_value(self.next));
-        map.insert(MapKey::new("tree"), self.top.value());
+        map.insert(MapKey::new("next"), uint(self.next));
+        map.insert(MapKey::new("seed"), uint(self.seed));
         map.insert(MapKey::new("bytes"), uint(self.bytes));
         map.insert(MapKey::new("count"), uint(self.count));
+        map.insert(MapKey::new("blocks"), Value::Array(blocks));
         map.insert(MapKey::new("records"), Value::Bool(self.records));
         encode(&Value::Map(map)).map_err(ApplyError::from)
     }
@@ -452,6 +448,24 @@ impl Root {
 
 fn corrupt_root(what: &'static str) -> ValueError {
     ValueError::Corrupt(Corrupt::ListRoot(what))
+}
+
+const BLOCK_REF_SHAPE: &str = "a list root's block entry is not [n, count, bytes, head]";
+
+fn parse_block_ref(value: &Value) -> Result<BlockRef, &'static str> {
+    let Value::Array(parts) = value else {
+        return Err(BLOCK_REF_SHAPE);
+    };
+    let [n, count, bytes, head] = parts.as_slice() else {
+        return Err(BLOCK_REF_SHAPE);
+    };
+    let field = |v| as_u64(v).ok_or(BLOCK_REF_SHAPE);
+    Ok(BlockRef {
+        n: field(n)?,
+        count: field(count)?,
+        bytes: field(bytes)?,
+        head: field(head)?,
+    })
 }
 
 /// Open a root record. Another kind is an [`ApplyError::KindMismatch`].
@@ -465,87 +479,191 @@ fn open_root(bytes: &[u8]) -> Result<Root, ValueError> {
         return Err(corrupt_root("the list root's payload is not a map"));
     };
     let field = |name: &str| fields.get(&MapKey::new(name));
-    let (Some(next), Some(tree), Some(bytes), Some(count), Some(records), 5) = (
+    let (Some(next), Some(seed), Some(bytes), Some(count), Some(blocks), Some(records), 6) = (
         field("next"),
-        field("tree"),
+        field("seed"),
         field("bytes"),
         field("count"),
+        field("blocks"),
         field("records"),
         fields.len(),
     ) else {
         return Err(corrupt_root(
-            "the list root is not exactly next, tree, bytes, count and records",
+            "the list root is not exactly next, seed, bytes, count, blocks and records",
         ));
     };
     let &Value::Bool(records) = records else {
         return Err(corrupt_root("the list root's records is not a bool"));
     };
-    let next = as_id(next).ok_or(corrupt_root("the list root's next is not a 16-byte id"))?;
-    let bytes = as_u64(bytes).ok_or(corrupt_root(
-        "the list root's bytes is not an unsigned integer",
-    ))?;
-    let count = as_u64(count).ok_or(corrupt_root(
-        "the list root's count is not an unsigned integer",
-    ))?;
-    let top = parse_node(tree).map_err(corrupt_root)?;
-    if let Node::Internal { kids, .. } = &top {
-        if kids.len() < 2 {
-            return Err(corrupt_root(
-                "the list root's top node has fewer than 2 kids",
-            ));
-        }
+    let unsigned = |v, what| as_u64(v).ok_or(corrupt_root(what));
+    let next = unsigned(next, "the list root's next is not an unsigned integer")?;
+    let seed = unsigned(seed, "the list root's seed is not an unsigned integer")?;
+    let bytes = unsigned(bytes, "the list root's bytes is not an unsigned integer")?;
+    let count = unsigned(count, "the list root's count is not an unsigned integer")?;
+    let Value::Array(blocks) = blocks else {
+        return Err(corrupt_root("the list root's blocks is not an array"));
+    };
+    if blocks.is_empty() || blocks.len() > MAX_BLOCKS {
+        return Err(corrupt_root(
+            "the list root has no blocks, or more than 512",
+        ));
     }
-    if top.count() != Some(count) {
-        return Err(corrupt_root("the list root's count is not its tree's"));
+    let blocks = blocks
+        .iter()
+        .map(parse_block_ref)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(corrupt_root)?;
+    let overflow = || corrupt_root("the list root's block counts or bytes leave u64");
+    let (mut counted, mut summed) = (0_u64, 0_u64);
+    for block in &blocks {
+        if block.n >= next {
+            return Err(corrupt_root("a list root's block n is not below next"));
+        }
+        counted = counted.checked_add(block.count).ok_or_else(overflow)?;
+        summed = summed.checked_add(block.bytes).ok_or_else(overflow)?;
+    }
+    if blocks.len() > 1 && blocks.iter().any(|block| block.count == 0) {
+        return Err(corrupt_root(
+            "the list root names an empty block beside others; only an only block is empty",
+        ));
+    }
+    if counted != count || summed != bytes {
+        return Err(corrupt_root(
+            "the list root's count or bytes is not the sum of its blocks'",
+        ));
     }
     Ok(Root {
         next,
-        top,
+        seed,
         bytes,
         count,
+        blocks,
         records,
     })
 }
 
-/// Read the page `id`, which a node one level up names with `count` items, and check it
-/// (ADR-rdb-0016 §3) before anything uses it. Returns its version and its node.
-fn load_page(
+// ---- blocks --------------------------------------------------------------------------------
+
+/// A block read back and replayed: its entries after every pending op, with what a write needs
+/// to decide a fold, and every key it holds.
+struct Loaded {
+    /// The base's payload length.
+    base_len: usize,
+    folded: u64,
+    entries: Vec<Entry>,
+    /// The pending slots' payload bytes.
+    pending_bytes: usize,
+    /// The base's key and every slot key stored, stale ones included.
+    keys: Vec<Bytes>,
+}
+
+/// Read block `id`, which the root (at `root_version`) names as `block`, with one scan; replay
+/// its pending ops; and check it (ADR-rdb-0016 §3, §7) before anything uses it.
+fn load_block(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
     root_version: u64,
     id: u128,
-    level: u8,
-    count: u64,
-) -> Result<(u64, Node), ValueError> {
-    let fault = |fault| ValueError::Corrupt(Corrupt::Page { id, fault });
-    let (version, bytes) =
-        record(snapshot, &page_key(root, id))?.ok_or_else(|| fault(PageFault::Missing))?;
+    block: &BlockRef,
+) -> Result<Loaded, ValueError> {
+    let fault = |fault| ValueError::Corrupt(Corrupt::Block { id, fault });
+    let key = block_key(root, id);
+    let mut base = None;
+    let mut slots: Vec<Option<Bytes>> = vec![None; BLOCK_SCAN - 1];
+    let mut keys = Vec::new();
+    for (found, value) in snapshot.scan(Namespace::User, &key, BLOCK_SCAN) {
+        let Some(tail) = found.strip_prefix(key.as_ref()) else {
+            break;
+        };
+        match *tail {
+            [] => base = Some(value),
+            [slot] if slot < LIST_SLOTS => slots[usize::from(slot)] = Some(value),
+            [slot] => {
+                return Err(ValueError::Corrupt(Corrupt::Key(
+                    KeyError::SlotOutOfRange { slot },
+                )))
+            }
+            _ => {
+                let len = LIST_ID_LEN + tail.len();
+                return Err(ValueError::Corrupt(Corrupt::Key(KeyError::ListIdTail {
+                    len,
+                })));
+            }
+        }
+        keys.push(found);
+    }
+
+    let bytes = base.ok_or_else(|| fault(BlockFault::Missing))?;
+    let version = snapshot
+        .version(Namespace::User, &key)
+        .ok_or(ValueError::Corrupt(Corrupt::VersionWithoutValue))?;
     if version > root_version {
-        return Err(fault(PageFault::NewerThanRoot {
-            page: version,
+        return Err(fault(BlockFault::NewerThanRoot {
+            block: version,
             root: root_version,
         }));
     }
-    let opened = open(&bytes).map_err(|e| fault(PageFault::Envelope(e)))?;
-    if opened.kind != Kind::ListPage {
-        return Err(fault(PageFault::NotAPage { found: opened.kind }));
+    let opened = open(&bytes).map_err(|e| fault(BlockFault::Envelope(e)))?;
+    if opened.kind != Kind::ListBlock {
+        return Err(fault(BlockFault::NotABlock { found: opened.kind }));
     }
-    let payload = decode(opened.payload).map_err(|e| fault(PageFault::Codec(e)))?;
-    let node = parse_node(&payload).map_err(|what| fault(PageFault::Shape(what)))?;
-    if node.level() != level {
-        return Err(fault(PageFault::Shape(
-            "a list page's level is not one below its parent's",
+    let base_len = opened.payload.len();
+    if base_len > MAX_BLOCK_PAYLOAD {
+        return Err(fault(BlockFault::TooLarge { len: base_len }));
+    }
+    let payload = decode(opened.payload).map_err(|e| fault(BlockFault::Codec(e)))?;
+    let (mut entries, folded) = parse_block(&payload).map_err(|w| fault(BlockFault::Shape(w)))?;
+    if folded > block.head {
+        return Err(fault(BlockFault::Shape(
+            "a list block's folded is past its root entry's head",
         )));
     }
-    if node.entries() == 0 {
-        return Err(fault(PageFault::Shape("a list page is empty")));
-    }
-    if node.count() != Some(count) {
-        return Err(fault(PageFault::Shape(
-            "a list page's count is not its parent's entry",
+    if block.head - folded > SLOTS {
+        return Err(fault(BlockFault::Shape(
+            "a list block has more than 240 pending ops",
         )));
     }
-    Ok((version, node))
+
+    let mut pending_bytes = 0;
+    for op in folded + 1..=block.head {
+        let slot = u8::try_from(op % SLOTS).expect("a slot is below 240");
+        let bad = |fault| {
+            ValueError::Corrupt(Corrupt::Block {
+                id,
+                fault: BlockFault::OpBad { op, fault },
+            })
+        };
+        let raw = slots[usize::from(slot)]
+            .as_ref()
+            .ok_or_else(|| fault(BlockFault::OpMissing { op }))?;
+        let opened = open(raw).map_err(|e| bad(SlotFault::Envelope(e)))?;
+        if opened.kind != Kind::ListSlot {
+            return Err(bad(SlotFault::NotASlot { found: opened.kind }));
+        }
+        let value = decode(opened.payload).map_err(|e| bad(SlotFault::Codec(e)))?;
+        let (op_no, change) = parse_slot(&value).map_err(|w| bad(SlotFault::Shape(w)))?;
+        // A slot is trusted by its op no: the root names the pending range, and only a write of
+        // that root put op `op` here (ADR-rdb-0016 §7).
+        if op_no != op {
+            return Err(fault(BlockFault::OpMissing { op }));
+        }
+        if !change.apply(&mut entries) {
+            return Err(fault(BlockFault::OpOutOfRange { op }));
+        }
+        pending_bytes += opened.payload.len();
+    }
+    if len_u64(entries.len()) != block.count {
+        return Err(fault(BlockFault::Shape(
+            "a list block's replayed count is not its root entry's",
+        )));
+    }
+    Ok(Loaded {
+        base_len,
+        folded,
+        entries,
+        pending_bytes,
+        keys,
+    })
 }
 
 // ---- reads ---------------------------------------------------------------------------------
@@ -566,13 +684,13 @@ fn summary(version: u64, root: &Root) -> List {
         version,
         count: root.count,
         bytes: root.bytes,
-        height: root.top.level() + 1,
+        blocks: root.blocks.len(),
         records: root.records,
     }
 }
 
-/// Up to `limit` items of the list at `root`, in list order, from `start`. Every page on the way
-/// and every item returned is read and checked before any is returned.
+/// Up to `limit` items of the list at `root`, in list order, from `start`. Every block the
+/// items are in, and every item record returned, is read and checked before any is returned.
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`]; [`ApplyError::KindMismatch`]; for a token,
@@ -616,30 +734,35 @@ pub fn items(
     }
     let limit = u64::try_from(limit).unwrap_or(u64::MAX);
     let end = found.count.min(position.saturating_add(limit));
-    let want = usize::try_from(end - position).expect("a page of ids fits memory");
-    let mut entries = Vec::with_capacity(want);
-    if want > 0 {
-        let pages = Reader {
-            snapshot,
-            root,
-            root_version: version,
-            want,
-        };
-        pages.collect(&found.top, version, position, &mut entries)?;
+    let mut entries = Vec::new();
+    let mut first = 0_u64;
+    for block in &found.blocks {
+        let after = first + block.count;
+        if first >= end {
+            break;
+        }
+        if after > position {
+            let loaded = load_block(snapshot, root, version, found.id(block.n), block)?;
+            let from = index(position.saturating_sub(first));
+            let to = index(end.min(after) - first);
+            entries.extend(loaded.entries.into_iter().take(to).skip(from));
+        }
+        first = after;
     }
     let mut out = Vec::with_capacity(entries.len());
-    for (p, (entry, node_version)) in (position..).zip(entries) {
-        // An inline item is its node's: no record is read for it (ADR-rdb-0016 §6).
+    for (p, entry) in (position..).zip(entries) {
+        let id = found.id(entry.n);
+        // An inline item is its block's, and its version the root's (ADR-rdb-0016 §6).
         let (value, item_version, inline) = match entry.inline {
-            Some(value) => (value, node_version, true),
+            Some(value) => (value, version, true),
             None => {
-                let (value, item_version) = read_item(snapshot, root, entry.id, version)?;
+                let (value, item_version) = read_item(snapshot, root, id, version)?;
                 (value, item_version, false)
             }
         };
         out.push(Item {
             position: p,
-            id: entry.id,
+            id,
             value,
             inline,
             version: item_version,
@@ -655,61 +778,6 @@ pub fn items(
         items: out,
         next,
     })
-}
-
-/// A positional read's walk over the tree: opens only the pages its positions are under.
-struct Reader<'a> {
-    snapshot: &'a dyn SnapshotRead,
-    root: &'a RootKey,
-    root_version: u64,
-    want: usize,
-}
-
-impl Reader<'_> {
-    /// Append to `out` the entries under `node`, whose record is at `version`, from its position
-    /// `skip`, until `out` holds `want`. Each entry comes with its leaf's version.
-    fn collect(
-        &self,
-        node: &Node,
-        version: u64,
-        mut skip: u64,
-        out: &mut Vec<(Entry, u64)>,
-    ) -> Result<(), ValueError> {
-        match node {
-            Node::Leaf(entries) => {
-                let from = usize::try_from(skip).map_or(entries.len(), |s| s.min(entries.len()));
-                let room = self.want - out.len();
-                out.extend(
-                    entries[from..]
-                        .iter()
-                        .take(room)
-                        .map(|entry| (entry.clone(), version)),
-                );
-            }
-            Node::Internal { level, kids } => {
-                for kid in kids {
-                    if out.len() >= self.want {
-                        break;
-                    }
-                    if skip >= kid.count {
-                        skip -= kid.count;
-                        continue;
-                    }
-                    let (child_version, child) = load_page(
-                        self.snapshot,
-                        self.root,
-                        self.root_version,
-                        kid.id,
-                        level - 1,
-                        kid.count,
-                    )?;
-                    self.collect(&child, child_version, skip, out)?;
-                    skip = 0;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Read and check the item `id` under a root at `root_version`.
@@ -736,31 +804,17 @@ fn read_item(
     Ok((value, version))
 }
 
-/// Whether a record exists under `root`'s item or page range (one limit-1 scan). A key after
-/// both ranges, such as a chunk or a neighbouring object, does not count (ADR-rdb-0016 §1).
-fn any_item_or_page(snapshot: &dyn SnapshotRead, root: &RootKey) -> bool {
-    let (items, pages) = (root.sub_prefix(SUB_ITEM), root.sub_prefix(SUB_PAGE));
+/// Whether a record exists under `root`'s item or block range (one limit-1 scan). A key after
+/// both ranges, such as a chunk or a neighbouring object, does not count (ADR-rdb-0016 §5).
+fn any_item_or_block(snapshot: &dyn SnapshotRead, root: &RootKey) -> bool {
+    let (items, blocks) = (root.sub_prefix(SUB_ITEM), root.sub_prefix(SUB_BLOCK));
     snapshot
         .scan(Namespace::User, &items, 1)
         .first()
-        .is_some_and(|(key, _)| key.starts_with(&items) || key.starts_with(&pages))
+        .is_some_and(|(key, _)| key.starts_with(&items) || key.starts_with(&blocks))
 }
 
 // ---- compile -------------------------------------------------------------------------------
-
-/// A node in the compile's copy of the tree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum At {
-    Top,
-    Page(u128),
-}
-
-/// A page the compile opened or minted. `node` is `None` once freed.
-struct PageSlot {
-    stored: bool,
-    node: Option<Node>,
-    dirty: bool,
-}
 
 /// An item record the compile touched (the item overlay, ADR-rdb-0016 §5). `stored`: a record
 /// existed in the snapshot. `value`: the record in the compile's view, `None` when there is none.
@@ -769,154 +823,108 @@ struct ItemSlot {
     value: Option<Bytes>,
 }
 
-/// The compile's copy of one list: the root's fields, every page it opened (each checked when
-/// opened) or minted, and every item it wrote.
-struct Tree<'a> {
+/// A block the compile opened or made: its entries as the ops leave them, and the ops.
+struct Work {
+    /// The stored base's payload length; `None` for a block this compile made.
+    base_len: Option<usize>,
+    /// The stored base's `folded`.
+    folded: u64,
+    /// The stored pending slots' payload bytes.
+    pending_bytes: usize,
+    entries: Vec<Entry>,
+    /// This compile's ops on the block, in order: op nos `head − len + 1 … head`.
+    ops: Vec<Change>,
+}
+
+/// The compile's copy of one list: the root's fields, every block it opened (each replayed and
+/// checked when opened) or made, and every item it wrote.
+struct Draft<'a> {
     snapshot: &'a dyn SnapshotRead,
     root: &'a RootKey,
     root_version: u64,
-    node_max: usize,
-    next: u128,
-    count: u64,
-    bytes: u64,
-    records: bool,
-    top: Node,
-    pages: BTreeMap<u128, PageSlot>,
+    block_max: usize,
+    list: Root,
+    blocks: BTreeMap<u64, Work>,
     items: BTreeMap<u128, ItemSlot>,
 }
 
-/// `v + delta`, or `None` outside `u64`.
-fn shift(v: u64, delta: i128) -> Option<u64> {
-    u64::try_from(i128::from(v) + delta).ok()
-}
-
-fn len_u64(len: usize) -> u64 {
-    u64::try_from(len).expect("a record length fits u64")
-}
-
-impl Tree<'_> {
-    fn node(&self, at: At) -> &Node {
-        match at {
-            At::Top => &self.top,
-            At::Page(id) => self.pages[&id]
-                .node
-                .as_ref()
-                .expect("a page the tree names is live"),
-        }
+impl Draft<'_> {
+    /// The next `n` from the counter items and blocks share (ADR-rdb-0016 §2).
+    fn mint(&mut self) -> Result<u64, ValueError> {
+        let n = self.list.next;
+        self.list.next = n
+            .checked_add(1)
+            .filter(|next| *next < u64::MAX)
+            .ok_or(corrupt_root("the list root's next is the largest there is"))?;
+        Ok(n)
     }
 
-    fn node_mut(&mut self, at: At) -> &mut Node {
-        match at {
-            At::Top => &mut self.top,
-            At::Page(id) => {
-                let slot = self
-                    .pages
-                    .get_mut(&id)
-                    .expect("a page the tree names is open");
-                slot.dirty = true;
-                slot.node.as_mut().expect("a page the tree names is live")
+    /// The index of the block holding position `pos`, and `pos` inside it. With `end`, `pos` may
+    /// be a block's length: the end of the first block it ends.
+    fn locate(&self, pos: u64, end: bool) -> (usize, u64) {
+        let mut first = 0_u64;
+        for (i, block) in self.list.blocks.iter().enumerate() {
+            let after = first + block.count;
+            if pos < after || (end && pos == after) {
+                return (i, pos - first);
             }
+            first = after;
         }
+        unreachable!("a position is checked against the list's count first")
     }
 
-    fn entries(&self, at: At) -> &[Entry] {
-        match self.node(at) {
-            Node::Leaf(entries) => entries,
-            Node::Internal { .. } => unreachable!("the path ends at a leaf"),
+    /// The block at index `i`, opened (replayed and checked) unless this compile already has it.
+    fn open_block(&mut self, i: usize) -> Result<&mut Work, ValueError> {
+        let block = self.list.blocks[i];
+        if !self.blocks.contains_key(&block.n) {
+            let id = self.list.id(block.n);
+            let loaded = load_block(self.snapshot, self.root, self.root_version, id, &block)?;
+            self.blocks.insert(
+                block.n,
+                Work {
+                    base_len: Some(loaded.base_len),
+                    folded: loaded.folded,
+                    pending_bytes: loaded.pending_bytes,
+                    entries: loaded.entries,
+                    ops: Vec::new(),
+                },
+            );
         }
+        Ok(self.blocks.get_mut(&block.n).expect("just opened"))
     }
 
-    fn entries_mut(&mut self, at: At) -> &mut Vec<Entry> {
-        match self.node_mut(at) {
-            Node::Leaf(entries) => entries,
-            Node::Internal { .. } => unreachable!("the path ends at a leaf"),
-        }
-    }
-
-    fn kids_mut(&mut self, at: At) -> &mut Vec<Kid> {
-        match self.node_mut(at) {
-            Node::Internal { kids, .. } => kids,
-            Node::Leaf(_) => unreachable!("a node above another is internal"),
-        }
-    }
-
-    fn kids(&self, at: At) -> &[Kid] {
-        match self.node(at) {
-            Node::Internal { kids, .. } => kids,
-            Node::Leaf(_) => unreachable!("a node above another is internal"),
-        }
-    }
-
-    fn set_page(&mut self, id: u128, node: Option<Node>) {
-        let slot = self
-            .pages
-            .get_mut(&id)
-            .expect("a page the tree names is open");
-        slot.node = node;
-        slot.dirty = true;
-    }
-
-    /// The next id from the counter items and pages share (ADR-rdb-0016 §2).
-    fn mint(&mut self) -> Result<u128, ValueError> {
-        let id = self.next;
-        self.next = id.checked_add(1).ok_or(corrupt_root(
-            "the list root's next id is the largest there is",
-        ))?;
-        Ok(id)
-    }
-
-    /// A new page holding `node`. A record already at its key is an orphan.
-    fn mint_page(&mut self, node: Node) -> Result<u128, ValueError> {
-        let id = self.mint()?;
-        if self
-            .snapshot
-            .version(Namespace::User, &page_key(self.root, id))
-            .is_some()
-        {
-            return Err(ValueError::Corrupt(Corrupt::OrphanElement));
-        }
-        self.pages.insert(
-            id,
-            PageSlot {
-                stored: false,
-                node: Some(node),
-                dirty: true,
-            },
-        );
-        Ok(id)
-    }
-
-    /// Open the page `kid` names, below a node at `level + 1`, unless this compile already has it.
-    fn open_kid(&mut self, kid: Kid, level: u8) -> Result<(), ValueError> {
-        if self.pages.contains_key(&kid.id) {
-            return Ok(());
-        }
-        let (_, node) = load_page(
-            self.snapshot,
-            self.root,
-            self.root_version,
-            kid.id,
-            level,
-            kid.count,
-        )?;
-        self.pages.insert(
-            kid.id,
-            PageSlot {
-                stored: true,
-                node: Some(node),
-                dirty: false,
-            },
-        );
+    /// Record `change`, already applied to block `i`'s entries, and move the block's and the
+    /// root's totals by `count` items and `bytes`.
+    fn record(
+        &mut self,
+        i: usize,
+        change: Change,
+        count: i128,
+        bytes: i128,
+    ) -> Result<(), ValueError> {
+        let n = self.list.blocks[i].n;
+        self.blocks
+            .get_mut(&n)
+            .expect("an op's block is open")
+            .ops
+            .push(change);
+        let overflow = || corrupt_root("a list block's count, bytes or head leaves u64");
+        let block = &mut self.list.blocks[i];
+        block.count = shift(block.count, count).ok_or_else(overflow)?;
+        block.bytes = shift(block.bytes, bytes).ok_or_else(overflow)?;
+        block.head = block.head.checked_add(1).ok_or_else(overflow)?;
+        self.list.count = shift(self.list.count, count).ok_or_else(overflow)?;
+        self.list.bytes = shift(self.list.bytes, bytes).ok_or_else(overflow)?;
         Ok(())
     }
 
-    /// An item's value length (ADR-rdb-0016 §3): an inline value's encoding, else its record's
+    /// An item's value length (ADR-rdb-0016 §1): an inline value's encoding, else its record's
     /// payload, from the overlay first, then read from the snapshot and checked (§5).
     fn item_len(&self, entry: &Entry) -> Result<u64, ValueError> {
-        let id = entry.id;
         if let Some(value) = &entry.inline {
             return Ok(len_u64(encode(value).map_err(ApplyError::from)?.len()));
         }
+        let id = self.list.id(entry.n);
         let missing = ValueError::Corrupt(Corrupt::ItemMissing { id });
         if let Some(slot) = self.items.get(&id) {
             let envelope = slot.value.as_ref().ok_or(missing)?;
@@ -967,241 +975,30 @@ impl Tree<'_> {
         self.items.get_mut(&id).expect("just made")
     }
 
-    /// Whether a value of `len` encoded bytes goes in its leaf entry (ADR-rdb-0016 §4, §5).
+    /// Whether a value of `len` encoded bytes goes in its block entry (ADR-rdb-0016 §4, §5).
     const fn fits_inline(&self, len: usize) -> bool {
-        !self.records && len <= inline_limit(self.node_max)
-    }
-
-    /// The path from the top to the leaf holding position `pos` (`pos = count` is the end), the
-    /// kid index taken at each internal node, and the position inside the leaf. Every page on
-    /// it is opened and checked.
-    fn descend(&mut self, pos: u64) -> Result<(Vec<At>, Vec<usize>, usize), ValueError> {
-        let (mut path, mut taken, mut rem) = (vec![At::Top], Vec::new(), pos);
-        loop {
-            let at = *path.last().expect("the path starts at the top");
-            let Node::Internal { level, kids } = self.node(at) else {
-                let leaf_pos = usize::try_from(rem).expect("a leaf position fits usize");
-                return Ok((path, taken, leaf_pos));
-            };
-            let mut j = 0;
-            while j + 1 < kids.len() && rem >= kids[j].count {
-                rem -= kids[j].count;
-                j += 1;
-            }
-            let (kid, level) = (kids[j], *level);
-            self.open_kid(kid, level - 1)?;
-            taken.push(j);
-            path.push(At::Page(kid.id));
-        }
-    }
-
-    /// Move every entry on the path, and the root's totals, by `count` items and `bytes`.
-    fn adjust(
-        &mut self,
-        path: &[At],
-        taken: &[usize],
-        count: i128,
-        bytes: i128,
-    ) -> Result<(), ValueError> {
-        if count == 0 && bytes == 0 {
-            return Ok(());
-        }
-        for (k, &j) in taken.iter().enumerate() {
-            let kid = &mut self.kids_mut(path[k])[j];
-            kid.count =
-                shift(kid.count, count).ok_or(corrupt_root("a list kid's count leaves u64"))?;
-            kid.bytes =
-                shift(kid.bytes, bytes).ok_or(corrupt_root("a list kid's bytes leaves u64"))?;
-        }
-        self.count =
-            shift(self.count, count).ok_or(corrupt_root("the list root's count leaves u64"))?;
-        self.bytes =
-            shift(self.bytes, bytes).ok_or(corrupt_root("the list root's bytes leaves u64"))?;
-        Ok(())
-    }
-
-    /// The `(count, bytes)` entries of `left` and `right`, the two halves of a node whose entry
-    /// was `total`. A leaf's left bytes are summed from its items; the right is the rest.
-    fn halves(
-        &self,
-        left: &Node,
-        right: &Node,
-        total: Totals,
-    ) -> Result<(Totals, Totals), ValueError> {
-        let overflow = || corrupt_root("a list node's count or bytes leaves u64");
-        let (lc, rc) = (
-            left.count().ok_or_else(overflow)?,
-            right.count().ok_or_else(overflow)?,
-        );
-        let (lb, rb) = match (left, right) {
-            (Node::Leaf(entries), Node::Leaf(_)) => {
-                let mut lb = 0_u64;
-                for entry in entries {
-                    lb = lb.checked_add(self.item_len(entry)?).ok_or_else(overflow)?;
-                }
-                let rb = total
-                    .1
-                    .checked_sub(lb)
-                    .ok_or(corrupt_root("a list node's bytes is under its items'"))?;
-                (lb, rb)
-            }
-            (Node::Internal { kids: l, .. }, Node::Internal { kids: r, .. }) => {
-                let sum = |kids: &[Kid]| {
-                    kids.iter()
-                        .try_fold(0_u64, |total, kid| total.checked_add(kid.bytes))
-                };
-                (sum(l).ok_or_else(overflow)?, sum(r).ok_or_else(overflow)?)
-            }
-            _ => unreachable!("halves are at one level"),
-        };
-        Ok(((lc, lb), (rc, rb)))
-    }
-
-    /// Rebalance every node on `path`, leaf first (ADR-rdb-0016 §4): over `node_max`, split in
-    /// two; under a third of it, take one sibling, the left if any, and merge when the pair
-    /// fits two thirds, else split the pair evenly. Then the top: split it into two pages under
-    /// a new top, or replace a top with one kid by that kid. A node or pair of fewer than 2
-    /// entries is never split.
-    fn rebalance(&mut self, path: &[At], taken: &[usize]) -> Result<(), ValueError> {
-        let p = self.node_max;
-        for k in (1..path.len()).rev() {
-            let At::Page(id) = path[k] else {
-                unreachable!("only the path's first node is the top")
-            };
-            let (parent, j) = (path[k - 1], taken[k - 1]);
-            let size = self.node(path[k]).size()?;
-            // A node of one entry is never split: only a list compiled at mixed P has one over P.
-            if size > p && self.node(path[k]).entries() >= 2 {
-                let mut left = self.node(path[k]).clone();
-                let right = balanced_split(&mut left)?;
-                let entry = self.kids(parent)[j];
-                let (l, r) = self.halves(&left, &right, (entry.count, entry.bytes))?;
-                self.set_page(id, Some(left));
-                let new_id = self.mint_page(right)?;
-                let kids = self.kids_mut(parent);
-                kids[j] = Kid {
-                    id,
-                    count: l.0,
-                    bytes: l.1,
-                };
-                kids.insert(
-                    j + 1,
-                    Kid {
-                        id: new_id,
-                        count: r.0,
-                        bytes: r.1,
-                    },
-                );
-            } else if size * 3 < p && self.kids(parent).len() > 1 {
-                let (lj, rj) = if j > 0 { (j - 1, j) } else { (j, j + 1) };
-                let (lk, rk) = (self.kids(parent)[lj], self.kids(parent)[rj]);
-                let level = self.node(path[k]).level();
-                self.open_kid(if lj == j { rk } else { lk }, level)?;
-                let mut pair = self.node(At::Page(lk.id)).clone();
-                pair.append(self.node(At::Page(rk.id)).clone());
-                let overflow = || corrupt_root("a list node's count or bytes leaves u64");
-                let total = (
-                    lk.count.checked_add(rk.count).ok_or_else(overflow)?,
-                    lk.bytes.checked_add(rk.bytes).ok_or_else(overflow)?,
-                );
-                if pair.size()? * 3 <= 2 * p || pair.entries() < 2 {
-                    self.set_page(lk.id, Some(pair));
-                    self.set_page(rk.id, None);
-                    let kids = self.kids_mut(parent);
-                    kids[lj] = Kid {
-                        id: lk.id,
-                        count: total.0,
-                        bytes: total.1,
-                    };
-                    kids.remove(rj);
-                } else {
-                    let right = balanced_split(&mut pair)?;
-                    let (l, r) = self.halves(&pair, &right, total)?;
-                    self.set_page(lk.id, Some(pair));
-                    self.set_page(rk.id, Some(right));
-                    let kids = self.kids_mut(parent);
-                    kids[lj] = Kid {
-                        id: lk.id,
-                        count: l.0,
-                        bytes: l.1,
-                    };
-                    kids[rj] = Kid {
-                        id: rk.id,
-                        count: r.0,
-                        bytes: r.1,
-                    };
-                }
-            }
-        }
-        self.settle_top()
-    }
-
-    fn settle_top(&mut self) -> Result<(), ValueError> {
-        loop {
-            if self.top.size()? > self.node_max && self.top.entries() >= 2 {
-                let level = self.top.level();
-                if level == MAX_LEVEL {
-                    return Err(ApplyError::ListTooTall.into());
-                }
-                let mut left = std::mem::replace(&mut self.top, Node::Leaf(Vec::new()));
-                let right = balanced_split(&mut left)?;
-                let (l, r) = self.halves(&left, &right, (self.count, self.bytes))?;
-                let left_id = self.mint_page(left)?;
-                let right_id = self.mint_page(right)?;
-                self.top = Node::Internal {
-                    level: level + 1,
-                    kids: vec![
-                        Kid {
-                            id: left_id,
-                            count: l.0,
-                            bytes: l.1,
-                        },
-                        Kid {
-                            id: right_id,
-                            count: r.0,
-                            bytes: r.1,
-                        },
-                    ],
-                };
-                return Ok(());
-            }
-            let Node::Internal { level, kids } = &self.top else {
-                return Ok(());
-            };
-            let ([kid], level) = (kids.as_slice(), *level) else {
-                return Ok(());
-            };
-            let kid = *kid;
-            self.open_kid(kid, level - 1)?;
-            let node = self.node(At::Page(kid.id)).clone();
-            self.set_page(kid.id, None);
-            self.top = node;
-        }
+        !self.list.records && len <= inline_limit(self.block_max)
     }
 
     /// Put `entry`, an item of `len` value bytes, at `pos`.
     fn insert(&mut self, pos: u64, entry: Entry, len: u64) -> Result<(), ValueError> {
-        let (path, taken, at) = self.descend(pos)?;
-        let leaf = path.last().copied().expect("the path ends at a leaf");
-        self.entries_mut(leaf).insert(at, entry);
-        self.adjust(&path, &taken, 1, i128::from(len))?;
-        self.rebalance(&path, &taken)
+        let (i, at) = self.locate(pos, true);
+        self.open_block(i)?.entries.insert(index(at), entry.clone());
+        self.record(i, Change::Insert { at, entry }, 1, i128::from(len))
     }
 
-    /// Take the item at `pos` out of the tree; its record is not touched. Returns its entry and
+    /// Take the item at `pos` out of its block; its record is not touched. Returns its entry and
     /// value length.
     fn take(&mut self, pos: u64) -> Result<(Entry, u64), ValueError> {
-        let (path, taken, at) = self.descend(pos)?;
-        let leaf = path.last().copied().expect("the path ends at a leaf");
-        let entry = self.entries(leaf)[at].clone();
+        let (i, at) = self.locate(pos, false);
+        let entry = self.open_block(i)?.entries[index(at)].clone();
         let len = self.item_len(&entry)?;
-        self.entries_mut(leaf).remove(at);
-        self.adjust(&path, &taken, -1, -i128::from(len))?;
-        self.rebalance(&path, &taken)?;
+        self.open_block(i)?.entries.remove(index(at));
+        self.record(i, Change::Remove { at }, -1, -i128::from(len))?;
         Ok((entry, len))
     }
 
-    /// Give the item at `pos` the value `value`, `len` encoded bytes: in its leaf entry when
+    /// Give the item at `pos` the value `value`, `len` encoded bytes: in its block entry when
     /// `envelope` is `None`, else in its record `envelope` (ADR-rdb-0016 §5).
     fn replace(
         &mut self,
@@ -1210,59 +1007,56 @@ impl Tree<'_> {
         len: usize,
         envelope: Option<Bytes>,
     ) -> Result<(), ValueError> {
-        let (path, taken, at) = self.descend(pos)?;
-        let leaf = path.last().copied().expect("the path ends at a leaf");
-        let old = self.entries(leaf)[at].clone();
+        let (i, at) = self.locate(pos, false);
+        let old = self.open_block(i)?.entries[index(at)].clone();
         let old_len = self.item_len(&old)?;
+        let id = self.list.id(old.n);
+        let mut entry = old.clone();
         match envelope {
             None => {
-                // Into the leaf. An out-of-line item's record goes; one never stored writes
+                // Into the block. An out-of-line item's record goes; one never stored writes
                 // nothing. An inline entry has no record to delete: a compile gives an item a
                 // record only by making its entry bare.
                 if old.inline.is_none() {
-                    self.touch(old.id).value = None;
+                    self.touch(id).value = None;
                 }
-                self.entries_mut(leaf)[at].inline = Some(value.clone());
+                entry.inline = Some(value.clone());
             }
             Some(envelope) => {
                 if old.inline.is_some() {
-                    // Out of the leaf: its key must hold no record in the overlay view.
-                    if self.has_record(old.id) {
+                    // Out of the block: its key must hold no record in the overlay view.
+                    if self.has_record(id) {
                         return Err(ValueError::Corrupt(Corrupt::OrphanElement));
                     }
-                    self.entries_mut(leaf)[at].inline = None;
+                    entry.inline = None;
                 }
-                self.touch(old.id).value = Some(envelope);
+                self.touch(id).value = Some(envelope);
             }
         }
-        self.adjust(
-            &path,
-            &taken,
-            0,
-            i128::from(len_u64(len)) - i128::from(old_len),
-        )?;
-        self.rebalance(&path, &taken)
+        self.open_block(i)?.entries[index(at)] = entry.clone();
+        let bytes = i128::from(len_u64(len)) - i128::from(old_len);
+        self.record(i, Change::Replace { at, entry }, 0, bytes)
     }
 
     /// Check `at` against the list as the earlier ops left it.
     fn check_position(&self, at: u64, inclusive: bool) -> Result<(), ValueError> {
         let inside = if inclusive {
-            at <= self.count
+            at <= self.list.count
         } else {
-            at < self.count
+            at < self.list.count
         };
         if inside {
             Ok(())
         } else {
             Err(ApplyError::PositionInvalid {
                 position: at,
-                len: self.count,
+                len: self.list.count,
             }
             .into())
         }
     }
 
-    /// Where `value` goes: its encoding, and its record when it does not go in its leaf
+    /// Where `value` goes: its encoding, and its record when it does not go in its block entry
     /// (ADR-rdb-0016 §5). A record is within [`MAX_ITEM`].
     fn place(&self, value: &Value) -> Result<(usize, Option<Bytes>), ValueError> {
         let payload = encode(value).map_err(ApplyError::from)?;
@@ -1282,14 +1076,15 @@ impl Tree<'_> {
     /// Run one op; returns the id it minted, if any.
     fn apply(&mut self, op: &ListOp) -> Result<Option<u128>, ValueError> {
         match op {
-            ListOp::Push(value) => self.add(self.count, value).map(Some),
+            ListOp::Push(value) => self.add(self.list.count, value).map(Some),
             ListOp::Insert { at, value } => self.add(*at, value).map(Some),
             ListOp::Remove { at } => {
                 self.check_position(*at, false)?;
                 let (entry, _) = self.take(*at)?;
                 // An inline item has no record to delete.
                 if entry.inline.is_none() {
-                    self.touch(entry.id).value = None;
+                    let id = self.list.id(entry.n);
+                    self.touch(id).value = None;
                 }
                 Ok(None)
             }
@@ -1313,7 +1108,8 @@ impl Tree<'_> {
     fn add(&mut self, at: u64, value: &Value) -> Result<u128, ValueError> {
         self.check_position(at, true)?;
         let (len, envelope) = self.place(value)?;
-        let id = self.mint()?;
+        let n = self.mint()?;
+        let id = self.list.id(n);
         if self.has_record(id) {
             return Err(ValueError::Corrupt(Corrupt::OrphanElement));
         }
@@ -1324,12 +1120,13 @@ impl Tree<'_> {
                 None
             }
         };
-        self.insert(at, Entry { id, inline }, len_u64(len))?;
+        self.insert(at, Entry { n, inline }, len_u64(len))?;
         Ok(id)
     }
 
-    /// The item and page writes, by key: `Some` puts, `None` deletes. A record minted and
-    /// freed in this compile writes nothing.
+    /// The item, block and slot writes, by key: `Some` puts, `None` deletes. A record minted
+    /// and freed in this compile writes nothing. Each touched block is folded, or takes one
+    /// slot per op (ADR-rdb-0016 §3).
     fn writes(self) -> Result<BTreeMap<Bytes, Option<Bytes>>, ValueError> {
         let mut writes = BTreeMap::new();
         for (id, slot) in self.items {
@@ -1337,47 +1134,83 @@ impl Tree<'_> {
                 writes.insert(item_key(self.root, id), slot.value);
             }
         }
-        for (id, slot) in self.pages {
-            let value = match (slot.dirty, slot.stored, slot.node) {
-                (false, _, _) | (true, false, None) => continue,
-                (true, true, None) => None,
-                (true, _, Some(node)) => {
-                    Some(seal(Kind::ListPage, &node.encoded()?).map_err(ApplyError::from)?)
+        for (n, work) in self.blocks {
+            let block = self
+                .list
+                .blocks
+                .iter()
+                .find(|b| b.n == n)
+                .expect("a block the compile opened is in the index");
+            let id = self.list.id(n);
+            let first = block.head - len_u64(work.ops.len()) + 1;
+            let slots = (first..)
+                .zip(&work.ops)
+                .map(|(op, change)| {
+                    let payload = encode(&Value::Array(vec![uint(op), change.value()]))
+                        .map_err(ApplyError::from)?;
+                    Ok((op, payload))
+                })
+                .collect::<Result<Vec<_>, ValueError>>()?;
+            let new_bytes: usize = slots.iter().map(|(_, payload)| payload.len()).sum();
+            // Fold when the pending ops would pass the slots, or their bytes a quarter of the
+            // base's; a block this compile made, or a base over B, always folds (ADR-rdb-0016
+            // §3, G66).
+            let fold = work.base_len.is_none_or(|base_len| {
+                base_len > self.block_max
+                    || block.head - work.folded > SLOTS
+                    || 4 * (work.pending_bytes + new_bytes) > base_len
+            });
+            if fold {
+                let payload =
+                    encode(&block_value(&work.entries, block.head)).map_err(ApplyError::from)?;
+                // No delta writes a base over B. W1 has no split, so such a fold is refused
+                // (rev 6 B1).
+                if payload.len() > self.block_max {
+                    return Err(ApplyError::TooLarge {
+                        limit: SizeLimit::List,
+                    }
+                    .into());
                 }
-            };
-            writes.insert(page_key(self.root, id), value);
+                let base = seal(Kind::ListBlock, &payload).map_err(ApplyError::from)?;
+                writes.insert(block_key(self.root, id), Some(base));
+            } else {
+                for (op, payload) in slots {
+                    let slot = u8::try_from(op % SLOTS).expect("a slot is below 240");
+                    let sealed = seal(Kind::ListSlot, &payload).map_err(ApplyError::from)?;
+                    writes.insert(slot_key(self.root, id, slot), Some(sealed));
+                }
+            }
         }
         Ok(writes)
     }
 }
 
-/// Compile `ops` against the list at `root` into one root `Put` and one write per item or page
-/// that changed, in key order (ADR-rdb-0016 §5).
+/// Compile `ops` against the list at `root` into one root `Put` and one write per item, block
+/// or slot that changed, in key order (ADR-rdb-0016 §5).
 ///
 /// - [`Expected::Version`]: the root must exist, be at that version and be a list.
-/// - [`Expected::Absent`]: a create, seeded with `next = snapshot.at() << 64`, of an ordinary
-///   list (`records` false; [`create_list`] takes the flag). The root `Put` carries
-///   [`Condition::Absent`]. When the root is absent here, any record under the item or page
-///   range is [`Corrupt::OrphanElement`].
+/// - [`Expected::Absent`]: a create, seeded with `seed = snapshot.at()`, of an ordinary list
+///   (`records` false; [`create_list`] takes the flag) with one empty block. The root `Put`
+///   carries [`Condition::Absent`]. When the root is absent here, any record under the item or
+///   block range is [`Corrupt::OrphanElement`].
 ///
 /// # Errors
-/// [`ApplyError::InvalidNodeSize`], [`ApplyError::ObjectAbsent`], [`ApplyError::VersionConflict`],
+/// [`ApplyError::InvalidBlockSize`], [`ApplyError::ObjectAbsent`], [`ApplyError::VersionConflict`],
 /// [`ApplyError::KindMismatch`], [`ApplyError::PositionInvalid`], [`ApplyError::TooLarge`],
-/// [`ApplyError::TooDeep`], [`ApplyError::ListTooTall`], [`ApplyError::TooManyWrites`], or
-/// [`ValueError::Corrupt`].
+/// [`ApplyError::TooDeep`], [`ApplyError::TooManyWrites`], or [`ValueError::Corrupt`].
 pub fn compile_list(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
     expected: Expected,
-    node_max: usize,
+    block_max: usize,
     ops: &[ListOp],
 ) -> Result<ListCompiled, ValueError> {
-    compile(snapshot, root, expected, false, node_max, ops)
+    compile(snapshot, root, expected, false, block_max, ops)
 }
 
 /// Compile the create of the list at `root`, then `ops` on it, as [`compile_list`] with
 /// [`Expected::Absent`]. With `records`, every item the list ever holds keeps its own record and
-/// no leaf holds a value (ADR-rdb-0016 §3); no later op changes it.
+/// no block entry holds a value (ADR-rdb-0016 §1); no later op changes it.
 ///
 /// # Errors
 /// As [`compile_list`].
@@ -1385,10 +1218,10 @@ pub fn create_list(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
     records: bool,
-    node_max: usize,
+    block_max: usize,
     ops: &[ListOp],
 ) -> Result<ListCompiled, ValueError> {
-    compile(snapshot, root, Expected::Absent, records, node_max, ops)
+    compile(snapshot, root, Expected::Absent, records, block_max, ops)
 }
 
 /// [`compile_list`], with `records` for a create; an update reads it from the root.
@@ -1397,29 +1230,53 @@ fn compile(
     root: &RootKey,
     expected: Expected,
     records: bool,
-    node_max: usize,
+    block_max: usize,
     ops: &[ListOp],
 ) -> Result<ListCompiled, ValueError> {
-    if !(MIN_NODE_MAX..=DEFAULT_NODE_MAX).contains(&node_max) {
-        return Err(ApplyError::InvalidNodeSize { found: node_max }.into());
+    if !(MIN_BLOCK_MAX..=MAX_BLOCK_MAX).contains(&block_max) {
+        return Err(ApplyError::InvalidBlockSize { found: block_max }.into());
     }
+    if root.as_bytes().len() - SCOPE_AND_SUB > MAX_ID_ESCAPED {
+        return Err(ApplyError::TooLarge {
+            limit: SizeLimit::Write,
+        }
+        .into());
+    }
+    let mut blocks = BTreeMap::new();
     let (found, root_version, expected_version, conditions) = match expected {
         Expected::Absent => {
             let root_absent = snapshot.version(Namespace::User, root.as_bytes()).is_none();
-            if root_absent && any_item_or_page(snapshot, root) {
+            if root_absent && any_item_or_block(snapshot, root) {
                 return Err(ValueError::Corrupt(Corrupt::OrphanElement));
             }
+            // Block 0 takes n = 0; items start at 1.
             let fresh = Root {
-                next: u128::from(snapshot.at().0) << 64,
-                top: Node::Leaf(Vec::new()),
+                next: 1,
+                seed: snapshot.at().0,
                 bytes: 0,
                 count: 0,
+                blocks: vec![BlockRef {
+                    n: 0,
+                    count: 0,
+                    bytes: 0,
+                    head: 0,
+                }],
                 records,
             };
+            blocks.insert(
+                0,
+                Work {
+                    base_len: None,
+                    folded: 0,
+                    pending_bytes: 0,
+                    entries: Vec::new(),
+                    ops: Vec::new(),
+                },
+            );
             let absent = Condition::Absent {
                 key: root.to_bytes(),
             };
-            // A fresh tree names no stored page or item, so the root version is never compared.
+            // A fresh list names no stored block or item, so the root version is never compared.
             (fresh, 0, None, vec![absent])
         }
         Expected::Version(want) => {
@@ -1429,46 +1286,31 @@ fn compile(
         }
     };
 
-    let mut tree = Tree {
+    let mut draft = Draft {
         snapshot,
         root,
         root_version,
-        node_max,
-        next: found.next,
-        count: found.count,
-        bytes: found.bytes,
-        records: found.records,
-        top: found.top,
-        pages: BTreeMap::new(),
+        block_max,
+        list: found,
+        blocks,
         items: BTreeMap::new(),
     };
     let mut minted = Vec::new();
     for op in ops {
-        if let Some(id) = tree.apply(op)? {
+        if let Some(id) = draft.apply(op)? {
             minted.push(id);
         }
     }
 
-    let root_value = seal(
-        Kind::List,
-        &Root {
-            next: tree.next,
-            top: tree.top.clone(),
-            bytes: tree.bytes,
-            count: tree.count,
-            records: tree.records,
-        }
-        .payload()?,
-    )
-    .map_err(ApplyError::from)?;
-    // The root sorts before every item and page (sub 0x00 < 0x02 < 0x03), so this keeps key
-    // order.
+    let root_value = seal(Kind::List, &draft.list.payload()?).map_err(ApplyError::from)?;
+    // The root sorts before every item, block and slot (sub 0x00 < 0x02 < 0x03), so this keeps
+    // key order.
     let mut mutations = vec![Mutation::Put {
         key: root.to_bytes(),
         value: root_value,
         expected_version,
     }];
-    mutations.extend(tree.writes()?.into_iter().map(|(key, value)| match value {
+    mutations.extend(draft.writes()?.into_iter().map(|(key, value)| match value {
         Some(value) => Mutation::Put {
             key,
             value,
@@ -1502,13 +1344,14 @@ fn compile(
     })
 }
 
-/// Compile the deletion of the empty list at `root`, at `version` (ADR-rdb-0016 §5). An empty
-/// list's root is an empty leaf: the root's checks refuse any other top node at `count = 0`.
+/// Compile the deletion of the empty list at `root`, at `version` (ADR-rdb-0016 §5): the root,
+/// its one block's base and every slot stored beside it. The block is replayed and checked
+/// first, and one scan must find nothing else under the item or block range.
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`], [`ApplyError::VersionConflict`], [`ApplyError::KindMismatch`],
-/// [`ApplyError::ListNotEmpty`], [`Corrupt::OrphanElement`] (an item or page record under an empty
-/// list), or any other [`ValueError::Corrupt`] of the root.
+/// [`ApplyError::ListNotEmpty`], [`Corrupt::OrphanElement`] (an item or block record beside an
+/// empty list), or any other [`ValueError::Corrupt`] of the root or its block.
 pub fn drop_list(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -1520,15 +1363,30 @@ pub fn drop_list(
     if found.count > 0 {
         return Err(ApplyError::ListNotEmpty { count: found.count }.into());
     }
-    if any_item_or_page(snapshot, root) {
-        return Err(ValueError::Corrupt(Corrupt::OrphanElement));
+    let [block] = found.blocks.as_slice() else {
+        unreachable!("open_root refuses a count-0 block beside others, so an empty list has one");
+    };
+    let loaded = load_block(snapshot, root, version, found.id(block.n), block)?;
+    let (items, blocks) = (root.sub_prefix(SUB_ITEM), root.sub_prefix(SUB_BLOCK));
+    for (key, _) in snapshot.scan(Namespace::User, &items, DROP_SCAN) {
+        if !(key.starts_with(&items) || key.starts_with(&blocks)) {
+            break;
+        }
+        if !loaded.keys.contains(&key) {
+            return Err(ValueError::Corrupt(Corrupt::OrphanElement));
+        }
     }
+    let mut mutations = vec![Mutation::Delete {
+        key: root.to_bytes(),
+        expected_version: Some(version),
+    }];
+    mutations.extend(loaded.keys.into_iter().map(|key| Mutation::Delete {
+        key,
+        expected_version: None,
+    }));
     Ok(ListCompiled {
         compiled: Compiled {
-            mutations: vec![Mutation::Delete {
-                key: root.to_bytes(),
-                expected_version: Some(version),
-            }],
+            mutations,
             conditions: Vec::new(),
         },
         ids: Vec::new(),

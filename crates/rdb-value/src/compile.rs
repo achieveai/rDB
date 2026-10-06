@@ -140,14 +140,14 @@ pub enum Corrupt {
         /// The missing index.
         index: u32,
     },
-    /// A list page that a read or a compile opened is damaged: missing, not a page, or not the
-    /// node its parent names (ADR-rdb-0016 §3, §7).
-    #[error("list page {id:032x}: {fault}")]
-    Page {
-        /// The page's id.
+    /// A list block that a read or a compile opened is damaged: its base, one of its pending
+    /// change slots, or their replay (ADR-rdb-0016 §3, §7).
+    #[error("list block {id:032x}: {fault}")]
+    Block {
+        /// The block's id.
         id: u128,
         /// What is wrong with it.
-        fault: PageFault,
+        fault: BlockFault,
     },
     /// A list leaf names an item that has no record (ADR-rdb-0016 §7).
     #[error("the list names item {id:032x}, which is not stored")]
@@ -164,36 +164,83 @@ pub enum Corrupt {
     },
 }
 
-/// Why a list page is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside
-/// [`PageFault::Envelope`] stays written-by-a-newer-build (ADR-rdb-0012 §12).
+/// Why a list block is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside
+/// [`BlockFault::Envelope`] or a slot's [`SlotFault::Envelope`] stays written-by-a-newer-build
+/// (ADR-rdb-0012 §12).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PageFault {
-    /// Its parent names it, but no record is stored.
+pub enum BlockFault {
+    /// The root names it, but no base is stored.
     #[error("not stored")]
     Missing,
+    /// The base's envelope does not open.
+    #[error("{0}")]
+    Envelope(EnvelopeError),
+    /// The base is another kind.
+    #[error("a {found:?} record, not a list block")]
+    NotABlock {
+        /// The kind found.
+        found: Kind,
+    },
+    /// The base's payload is not canonical CBOR.
+    #[error("{0}")]
+    Codec(CodecError),
+    /// The base decodes but is not a block, or the replayed block is not the one the root names.
+    #[error("{0}")]
+    Shape(&'static str),
+    /// The base's payload is over the format's largest block.
+    #[error("a block payload of {len} bytes is over the largest a block holds")]
+    TooLarge {
+        /// The payload's length.
+        len: usize,
+    },
+    /// The base's version is above its root's.
+    #[error("block version {block} is above its root's version {root}")]
+    NewerThanRoot {
+        /// The base's version.
+        block: u64,
+        /// The root's version.
+        root: u64,
+    },
+    /// A pending op's slot is not stored, or holds another op no.
+    #[error("pending op {op} is not in its slot")]
+    OpMissing {
+        /// The op no.
+        op: u64,
+    },
+    /// A pending op's slot holds it, but is damaged.
+    #[error("pending op {op}: {fault}")]
+    OpBad {
+        /// The op no.
+        op: u64,
+        /// What is wrong with its slot.
+        fault: SlotFault,
+    },
+    /// A pending op's position is outside the block as the ops before it left it.
+    #[error("pending op {op} names a position outside its block")]
+    OpOutOfRange {
+        /// The op no.
+        op: u64,
+    },
+}
+
+/// Why a pending op's change slot is refused (ADR-rdb-0016 §7).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SlotFault {
     /// The envelope does not open.
     #[error("{0}")]
     Envelope(EnvelopeError),
     /// The record is another kind.
-    #[error("a {found:?} record, not a list page")]
-    NotAPage {
+    #[error("a {found:?} record, not a list change slot")]
+    NotASlot {
         /// The kind found.
         found: Kind,
     },
     /// The payload is not canonical CBOR.
     #[error("{0}")]
     Codec(CodecError),
-    /// The payload decodes but is not the node its parent names.
+    /// The payload decodes but is not `[op no, op]`.
     #[error("{0}")]
     Shape(&'static str),
-    /// The page's version is above its root's.
-    #[error("page version {page} is above its root's version {root}")]
-    NewerThanRoot {
-        /// The page's version.
-        page: u64,
-        /// The root's version.
-        root: u64,
-    },
 }
 
 /// Why a blob root's payload is not a v1 manifest (ADR-rdb-0014 §2).

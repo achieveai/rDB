@@ -24,6 +24,8 @@ pub enum SizeLimit {
     Chunk,
     /// One list item's envelope, against [`crate::list::MAX_ITEM`] (ADR-rdb-0016 §4).
     Item,
+    /// One list block's base payload, against the compile's `block_max` (ADR-rdb-0016 §4).
+    List,
 }
 
 // `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
@@ -47,6 +49,7 @@ impl fmt::Display for SizeLimit {
                 "{}-byte limit for one list item's envelope",
                 crate::list::MAX_ITEM
             ),
+            Self::List => write!(f, "block_max limit for one list block"),
         }
     }
 }
@@ -236,18 +239,14 @@ pub enum ApplyError {
         /// The list's length when the op ran.
         len: u64,
     },
-    /// The op would split the list's top node at level 7, making the tree 9 high
-    /// (ADR-rdb-0016 §4). Nothing is written.
-    #[error("the list would be more than 8 high")]
-    ListTooTall,
-    /// `node_max` is outside `MIN_NODE_MAX … DEFAULT_NODE_MAX` (ADR-rdb-0016 §4).
+    /// `block_max` is outside `MIN_BLOCK_MAX … MAX_BLOCK_MAX` (ADR-rdb-0016 §4).
     #[error(
-        "node_max {found} is outside {} … {}",
-        crate::list::MIN_NODE_MAX,
-        crate::list::DEFAULT_NODE_MAX
+        "block_max {found} is outside {} … {}",
+        crate::list::MIN_BLOCK_MAX,
+        crate::list::MAX_BLOCK_MAX
     )]
-    InvalidNodeSize {
-        /// The `node_max` given.
+    InvalidBlockSize {
+        /// The `block_max` given.
         found: usize,
     },
     /// A scan token from another generation: the versions it names may have been reused

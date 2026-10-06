@@ -1,7 +1,9 @@
 //! A `BTreeMap`-backed [`SnapshotRead`], for the example and for tests.
 //!
 //! It holds [`Namespace::User`] records only; every other namespace reads as empty.
+//! [`CountingSnapshot`] wraps any snapshot and counts what a read takes from it.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
@@ -80,5 +82,76 @@ impl SnapshotRead for MapSnapshot {
             .take(limit)
             .map(|(k, (_, v))| (k.clone(), v.clone()))
             .collect()
+    }
+}
+
+/// A [`SnapshotRead`] that passes every call to `inner` and counts the `get`, `scan` and
+/// `version` calls, and the value bytes `get` and `scan` return (ADR-rdb-0016 §6,
+/// §Verification).
+pub struct CountingSnapshot<'a> {
+    inner: &'a dyn SnapshotRead,
+    calls: Cell<u64>,
+    bytes: Cell<u64>,
+}
+
+impl<'a> CountingSnapshot<'a> {
+    /// A counter over `inner`, at zero.
+    #[must_use]
+    pub fn new(inner: &'a dyn SnapshotRead) -> Self {
+        Self {
+            inner,
+            calls: Cell::new(0),
+            bytes: Cell::new(0),
+        }
+    }
+
+    /// The `get`, `scan` and `version` calls made so far.
+    #[must_use]
+    pub fn calls(&self) -> u64 {
+        self.calls.get()
+    }
+
+    /// The value bytes those calls returned.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    fn count<'v>(&self, values: impl Iterator<Item = &'v Bytes>) {
+        let bytes: usize = values.map(Bytes::len).sum();
+        self.calls.set(self.calls.get() + 1);
+        self.bytes
+            .set(self.bytes.get() + u64::try_from(bytes).expect("a read's length fits u64"));
+    }
+}
+
+impl SnapshotRead for CountingSnapshot<'_> {
+    fn handle(&self) -> SnapshotHandle {
+        self.inner.handle()
+    }
+
+    fn at(&self) -> Seq {
+        self.inner.at()
+    }
+
+    fn generation(&self) -> Generation {
+        self.inner.generation()
+    }
+
+    fn get(&self, ns: Namespace, key: &[u8]) -> Option<Bytes> {
+        let value = self.inner.get(ns, key);
+        self.count(value.iter());
+        value
+    }
+
+    fn version(&self, ns: Namespace, key: &[u8]) -> Option<Version> {
+        self.count(std::iter::empty());
+        self.inner.version(ns, key)
+    }
+
+    fn scan(&self, ns: Namespace, from: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+        let found = self.inner.scan(ns, from, limit);
+        self.count(found.iter().map(|(_, value)| value));
+        found
     }
 }

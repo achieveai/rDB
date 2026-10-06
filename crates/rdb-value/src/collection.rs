@@ -52,7 +52,12 @@ impl CollectionKind {
         match kind {
             Kind::Map => Some(Self::Map),
             Kind::Set => Some(Self::Set),
-            Kind::Document | Kind::Blob | Kind::Chunk | Kind::List | Kind::ListPage => None,
+            Kind::Document
+            | Kind::Blob
+            | Kind::Chunk
+            | Kind::List
+            | Kind::ListBlock
+            | Kind::ListSlot => None,
         }
     }
 }

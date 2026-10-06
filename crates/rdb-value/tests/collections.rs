@@ -28,8 +28,8 @@ use rdb_value::collection::{
 };
 use rdb_value::envelope::{seal, EnvelopeError, Kind};
 use rdb_value::keys::{
-    chunk_key, decode_element, decode_element_key, element_key, encode_element, esc, item_key,
-    page_key, parse, root_key, KeyError, Parsed, RootKey, Sub,
+    block_key, chunk_key, decode_element, decode_element_key, element_key, encode_element, esc,
+    item_key, parse, root_key, slot_key, KeyError, Parsed, RootKey, Sub,
 };
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Decimal, Int, Map, MapKey, Value};
@@ -875,9 +875,12 @@ fn names_exactly(key: &[u8], parsed: &Parsed) -> bool {
             let id = parsed.list_id.expect("an item tail is decoded");
             item_key(&parsed.root(), id)[..] == *key
         }
-        Sub::Page => {
-            let id = parsed.list_id.expect("a page tail is decoded");
-            page_key(&parsed.root(), id)[..] == *key
+        Sub::Block => {
+            let id = parsed.list_id.expect("a block tail is decoded");
+            match parsed.slot {
+                None => block_key(&parsed.root(), id)[..] == *key,
+                Some(slot) => slot_key(&parsed.root(), id, slot)[..] == *key,
+            }
         }
         Sub::Reserved(sub) => {
             let mut head = parsed.root().object_prefix().to_vec();

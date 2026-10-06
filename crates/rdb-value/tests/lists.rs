@@ -14,10 +14,10 @@ use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::envelope::{open, seal, EnvelopeError, Kind};
 use rdb_value::keys::{parse, root_key, RootKey, Sub};
 use rdb_value::list::{
-    compile_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_NODE_MAX, MIN_NODE_MAX,
+    compile_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_BLOCK_MAX, MIN_BLOCK_MAX,
 };
 use rdb_value::value::{Map, Value};
-use rdb_value::{compile, read, Compiled, Corrupt, Expected, PageFault, ValueError};
+use rdb_value::{compile, read, BlockFault, Compiled, Corrupt, Expected, ValueError};
 
 fn todo() -> RootKey {
     root_key(TenantId(1), AffinityId(1), b"todo")
@@ -30,7 +30,7 @@ fn list_of(k: &mut Kernel, n: usize) {
         &k.snapshot(),
         &root,
         Expected::Absent,
-        DEFAULT_NODE_MAX,
+        DEFAULT_BLOCK_MAX,
         &[],
     )
     .expect("create");
@@ -42,7 +42,7 @@ fn list_of(k: &mut Kernel, n: usize) {
             &k.snapshot(),
             &root,
             Expected::Version(version),
-            DEFAULT_NODE_MAX,
+            DEFAULT_BLOCK_MAX,
             &push,
         )
         .expect("push");
@@ -122,10 +122,10 @@ fn version_of(k: &Kernel, root: &RootKey) -> u64 {
     k.records[&root.to_bytes()].0
 }
 
-/// Create `root` and push `values` in one compile at `node_max`.
-fn made(k: &mut Kernel, root: &RootKey, node_max: usize, values: &[&str]) {
+/// Create `root` and push `values` in one compile at `block_max`.
+fn made(k: &mut Kernel, root: &RootKey, block_max: usize, values: &[&str]) {
     let ops: Vec<ListOp> = values.iter().map(|v| ListOp::Push(text(v))).collect();
-    let compiled = compile_list(&k.snapshot(), root, Expected::Absent, node_max, &ops)
+    let compiled = compile_list(&k.snapshot(), root, Expected::Absent, block_max, &ops)
         .expect("create and push");
     k.commit(compiled.compiled());
 }
@@ -145,13 +145,13 @@ fn texts(values: &[&str]) -> Vec<Value> {
 }
 
 /// Compile `ops` against `root` at its current version and commit them.
-fn write(k: &mut Kernel, root: &RootKey, node_max: usize, ops: &[ListOp]) {
+fn write(k: &mut Kernel, root: &RootKey, block_max: usize, ops: &[ListOp]) {
     let version = version_of(k, root);
     let compiled = compile_list(
         &k.snapshot(),
         root,
         Expected::Version(version),
-        node_max,
+        block_max,
         ops,
     )
     .expect("write");
@@ -165,8 +165,8 @@ fn write(k: &mut Kernel, root: &RootKey, node_max: usize, ops: &[ListOp]) {
 fn w1_stale_expect_absent_list_and_create_twice_are_refused() {
     let root = todo();
     let mut k = Kernel::new();
-    made(&mut k, &root, DEFAULT_NODE_MAX, &["a"]);
-    write(&mut k, &root, DEFAULT_NODE_MAX, &[ListOp::Push(text("b"))]);
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a"]);
+    write(&mut k, &root, DEFAULT_BLOCK_MAX, &[ListOp::Push(text("b"))]);
     let now = version_of(&k, &root);
     let push = [ListOp::Push(text("c"))];
 
@@ -174,7 +174,7 @@ fn w1_stale_expect_absent_list_and_create_twice_are_refused() {
         &k.snapshot(),
         &root,
         Expected::Version(now - 1),
-        DEFAULT_NODE_MAX,
+        DEFAULT_BLOCK_MAX,
         &push,
     );
     assert_eq!(
@@ -189,7 +189,7 @@ fn w1_stale_expect_absent_list_and_create_twice_are_refused() {
         &k.snapshot(),
         &other,
         Expected::Version(1),
-        DEFAULT_NODE_MAX,
+        DEFAULT_BLOCK_MAX,
         &push,
     );
     assert_eq!(
@@ -202,7 +202,7 @@ fn w1_stale_expect_absent_list_and_create_twice_are_refused() {
         &k.snapshot(),
         &root,
         Expected::Absent,
-        DEFAULT_NODE_MAX,
+        DEFAULT_BLOCK_MAX,
         &push,
     )
     .expect("a create over a live list compiles");
@@ -220,11 +220,11 @@ fn w1_stale_expect_absent_list_and_create_twice_are_refused() {
 fn w1_insert_at_count_appends_and_one_past_is_refused() {
     let root = todo();
     let mut k = Kernel::new();
-    made(&mut k, &root, DEFAULT_NODE_MAX, &["a", "b"]);
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a", "b"]);
     write(
         &mut k,
         &root,
-        DEFAULT_NODE_MAX,
+        DEFAULT_BLOCK_MAX,
         &[
             ListOp::Insert {
                 at: 2,
@@ -244,7 +244,7 @@ fn w1_insert_at_count_appends_and_one_past_is_refused() {
             &k.snapshot(),
             &root,
             Expected::Version(version),
-            DEFAULT_NODE_MAX,
+            DEFAULT_BLOCK_MAX,
             ops,
         )
         .err()
@@ -284,7 +284,7 @@ fn w1_insert_at_count_appends_and_one_past_is_refused() {
 fn w1_paging_tokens_resume_and_are_refused_when_stale() {
     let root = todo();
     let mut k = Kernel::new();
-    made(&mut k, &root, DEFAULT_NODE_MAX, &["a", "b", "c", "d", "e"]);
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a", "b", "c", "d", "e"]);
     let version = version_of(&k, &root);
     let snap = k.snapshot();
 
@@ -351,7 +351,7 @@ fn w1_paging_tokens_resume_and_are_refused_when_stale() {
         }))
     );
 
-    write(&mut k, &root, DEFAULT_NODE_MAX, &[ListOp::Push(text("f"))]);
+    write(&mut k, &root, DEFAULT_BLOCK_MAX, &[ListOp::Push(text("f"))]);
     assert_eq!(
         items(&k.snapshot(), &root, Start::Token(token), 10).err(),
         Some(ValueError::Apply(ApplyError::VersionConflict {
@@ -368,13 +368,13 @@ fn w1_paging_tokens_resume_and_are_refused_when_stale() {
 fn w1_a_list_write_is_fenced_by_its_generation() {
     let root = todo();
     let mut k = Kernel::new();
-    made(&mut k, &root, DEFAULT_NODE_MAX, &["a"]);
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a"]);
     let version = version_of(&k, &root);
     let push = compile_list(
         &k.snapshot(),
         &root,
         Expected::Version(version),
-        DEFAULT_NODE_MAX,
+        DEFAULT_BLOCK_MAX,
         &[ListOp::Push(text("b"))],
     )
     .expect("push");
@@ -389,7 +389,12 @@ fn w1_a_list_write_is_fenced_by_its_generation() {
     );
     assert_eq!(moved, before, "nothing written");
 
-    write(&mut k, &root, DEFAULT_NODE_MAX, &[ListOp::Remove { at: 0 }]);
+    write(
+        &mut k,
+        &root,
+        DEFAULT_BLOCK_MAX,
+        &[ListOp::Remove { at: 0 }],
+    );
     let drop = drop_list(&k.snapshot(), &root, version_of(&k, &root)).expect("empty drop");
     assert_eq!(drop.generation(), Generation(1));
     let mut moved = k.clone();
@@ -409,7 +414,7 @@ fn key_of(mutation: &Mutation) -> &Bytes {
 
 /// C17: every list write set holds one write per key in strictly ascending key order; the
 /// kernel refuses anything else (check 10). Checked across a create, appends, inserts at the
-/// front, splits at the smallest node size, and a drop.
+/// front, slots and folds at the smallest block size, and a drop.
 #[test]
 fn c17_list_write_sets_strictly_ascend() {
     let root = todo();
@@ -423,7 +428,7 @@ fn c17_list_write_sets_strictly_ascend() {
         &k.snapshot(),
         &root,
         Expected::Absent,
-        MIN_NODE_MAX,
+        MIN_BLOCK_MAX,
         &[ListOp::Push(text("first"))],
     )
     .expect("create");
@@ -444,17 +449,13 @@ fn c17_list_write_sets_strictly_ascend() {
             &k.snapshot(),
             &root,
             Expected::Version(version),
-            MIN_NODE_MAX,
+            MIN_BLOCK_MAX,
             &ops,
         )
         .expect("write");
         ascends(compiled.compiled());
         k.commit(compiled.compiled());
     }
-    assert!(
-        list(&k.snapshot(), &root).unwrap().unwrap().height > 1,
-        "pages were made"
-    );
     assert_eq!(values(&k, &root).len(), 61);
     let removes: Vec<ListOp> = (0..61).map(|_| ListOp::Remove { at: 0 }).collect();
     let version = version_of(&k, &root);
@@ -462,7 +463,7 @@ fn c17_list_write_sets_strictly_ascend() {
         &k.snapshot(),
         &root,
         Expected::Version(version),
-        MIN_NODE_MAX,
+        MIN_BLOCK_MAX,
         &removes,
     )
     .expect("remove all");
@@ -478,13 +479,18 @@ fn c17_list_write_sets_strictly_ascend() {
 fn w1_drop_needs_an_empty_list_at_the_version_read() {
     let root = todo();
     let mut k = Kernel::new();
-    made(&mut k, &root, DEFAULT_NODE_MAX, &["a"]);
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a"]);
     let version = version_of(&k, &root);
     assert_eq!(
         drop_list(&k.snapshot(), &root, version).err(),
         Some(ValueError::Apply(ApplyError::ListNotEmpty { count: 1 }))
     );
-    write(&mut k, &root, DEFAULT_NODE_MAX, &[ListOp::Remove { at: 0 }]);
+    write(
+        &mut k,
+        &root,
+        DEFAULT_BLOCK_MAX,
+        &[ListOp::Remove { at: 0 }],
+    );
     let now = version_of(&k, &root);
     assert_eq!(
         drop_list(&k.snapshot(), &root, version).err(),
@@ -527,7 +533,7 @@ fn w1_kind_mismatch_both_ways() {
     )
     .expect("document");
     k.commit(&document);
-    made(&mut k, &root, DEFAULT_NODE_MAX, &["a"]);
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a"]);
     let snap = k.snapshot();
     let mismatch = |found| Some(ValueError::Apply(ApplyError::KindMismatch { found }));
 
@@ -538,7 +544,7 @@ fn w1_kind_mismatch_both_ways() {
             &snap,
             key,
             Expected::Version(version),
-            DEFAULT_NODE_MAX,
+            DEFAULT_BLOCK_MAX,
             &push,
         );
         assert_eq!(op.err(), mismatch(found));
@@ -566,7 +572,7 @@ fn w1_kind_mismatch_both_ways() {
 fn w1_a_damaged_list_root_is_refused_on_every_path() {
     let root = todo();
     let mut fresh = Kernel::new();
-    made(&mut fresh, &root, DEFAULT_NODE_MAX, &[]);
+    made(&mut fresh, &root, DEFAULT_BLOCK_MAX, &[]);
     let good = fresh.records[&root.to_bytes()].1.clone();
     let mut flipped = good.to_vec();
     flipped[8] ^= 1;
@@ -616,7 +622,7 @@ fn w1_a_damaged_list_root_is_refused_on_every_path() {
                 &snap,
                 &root,
                 Expected::Version(version),
-                DEFAULT_NODE_MAX,
+                DEFAULT_BLOCK_MAX,
                 &push,
             )
             .expect_err("write"),
@@ -632,35 +638,34 @@ type Damage = fn(&mut Kernel, &Bytes, &Bytes, u64);
 /// Whether a refusal is the one a damage case expects.
 type Named<E> = fn(&E) -> bool;
 
-/// Damage to every page under a list root is refused as `Corrupt::Page` on a full read and on
-/// a write at either end, never served. The pages are found by key, not by their layout.
+/// Damage to every block base under a list root is refused as `Corrupt::Block` on a full read
+/// and on a write at either end, never served. The bases are found by key, not by their layout.
 #[test]
-fn w1_a_damaged_page_is_refused_on_read_and_write() {
+fn w1_a_damaged_block_is_refused_on_read_and_write() {
     let root = todo();
     let mut fresh = Kernel::new();
     let names: Vec<String> = (0..40).map(|i| format!("item {i}")).collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    made(&mut fresh, &root, MIN_NODE_MAX, &names);
-    let pages: Vec<Bytes> = fresh
+    made(&mut fresh, &root, MIN_BLOCK_MAX, &names);
+    let bases: Vec<Bytes> = fresh
         .records
         .keys()
-        .filter(|key| parse(key).is_ok_and(|p| p.root() == root && p.sub == Sub::Page))
+        .filter(|key| {
+            parse(key).is_ok_and(|p| p.root() == root && p.sub == Sub::Block && p.slot.is_none())
+        })
         .cloned()
         .collect();
-    assert!(
-        pages.len() > 1,
-        "40 items at the smallest node size make pages"
-    );
+    assert!(!bases.is_empty(), "a list has a block");
     let root_version = version_of(&fresh, &root);
     let document = seal(Kind::Document, &encode(&text("x")).unwrap()).unwrap();
 
-    let cases: [(&str, Damage, Named<PageFault>); 4] = [
+    let cases: [(&str, Damage, Named<BlockFault>); 4] = [
         (
             "missing",
             |k, key, _, _| {
                 k.records.remove(key);
             },
-            |f| matches!(f, PageFault::Missing),
+            |f| matches!(f, BlockFault::Missing),
         ),
         (
             "digest flipped",
@@ -670,7 +675,7 @@ fn w1_a_damaged_page_is_refused_on_read_and_write() {
                 bytes[8] ^= 1;
                 k.records.insert(key.clone(), (v, Bytes::from(bytes)));
             },
-            |f| matches!(f, PageFault::Envelope(EnvelopeError::DigestMismatch)),
+            |f| matches!(f, BlockFault::Envelope(EnvelopeError::DigestMismatch)),
         ),
         (
             "a document",
@@ -681,7 +686,7 @@ fn w1_a_damaged_page_is_refused_on_read_and_write() {
             |f| {
                 matches!(
                     f,
-                    PageFault::NotAPage {
+                    BlockFault::NotABlock {
                         found: Kind::Document
                     }
                 )
@@ -694,12 +699,12 @@ fn w1_a_damaged_page_is_refused_on_read_and_write() {
                 k.records.insert(key.clone(), (root_version + 1, bytes));
                 k.seq = k.seq.max(root_version + 1);
             },
-            |f| matches!(f, PageFault::NewerThanRoot { .. }),
+            |f| matches!(f, BlockFault::NewerThanRoot { .. }),
         ),
     ];
     for (name, damage, named) in cases {
         let mut k = fresh.clone();
-        for key in &pages {
+        for key in &bases {
             damage(&mut k, key, &document, root_version);
         }
         let snap = k.snapshot();
@@ -714,7 +719,7 @@ fn w1_a_damaged_page_is_refused_on_read_and_write() {
                 &snap,
                 &root,
                 Expected::Version(root_version),
-                MIN_NODE_MAX,
+                MIN_BLOCK_MAX,
                 &[op],
             );
             for err in [
@@ -722,7 +727,7 @@ fn w1_a_damaged_page_is_refused_on_read_and_write() {
                 write.expect_err("write"),
             ] {
                 assert!(
-                    matches!(&err, ValueError::Corrupt(Corrupt::Page { fault, .. }) if named(fault)),
+                    matches!(&err, ValueError::Corrupt(Corrupt::Block { fault, .. }) if named(fault)),
                     "{name}: {err:?}"
                 );
             }
