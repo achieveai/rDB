@@ -10,7 +10,7 @@ use rdb_core::{Generation, SnapshotRead};
 use rdb_value::cbor;
 use rdb_value::envelope::{self, Kind};
 use rdb_value::keys::{RootKey, Sub};
-use rdb_value::list::{compile_list, drop_list, items, list, ListOp, Start, Token};
+use rdb_value::list::{compile_list, create_list, drop_list, items, list, ListOp, Start, Token};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::{Corrupt, Expected, ValueError};
 
@@ -38,18 +38,21 @@ fn object(rest: &[String]) -> Result<(&String, RootKey, &[String]), Failure> {
     Ok((id, root, rest))
 }
 
-/// `list <id> (--absent | --expect V) [--compile-only] (push J | insert P J | remove P |
-/// replace P J | move P Q)...`: compile the ops
-/// at the store's `node_max`, then commit at the compile's generation, or print with
-/// `--compile-only`. Prints the minted `ids` in op order.
+/// `list <id> (--absent [--records] | --expect V) [--compile-only] (push J | insert P J |
+/// remove P | replace P J | move P Q)...`: compile the ops at the store's `node_max`, then
+/// commit at the compile's generation, or print with `--compile-only`. `--records` creates a
+/// list whose every item keeps its own record. Prints the minted `ids` in op order.
 pub fn write_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let (id, root, rest) = object(rest)?;
     let body = parse_ops(rest).map_err(|e| e.keyed(id))?;
     let mut fields = id_fields(id, &root);
     let mut store = Store::load(store_path)?;
     let node_max = store.node_max();
-    let compiled = compile_list(&store.snapshot, &root, body.expected, node_max, &body.ops)
-        .map_err(|e| Failure::from(e).with(fields.clone()))?;
+    let compiled = match body.expected {
+        Expected::Absent => create_list(&store.snapshot, &root, body.records, node_max, &body.ops),
+        expected => compile_list(&store.snapshot, &root, expected, node_max, &body.ops),
+    }
+    .map_err(|e| Failure::from(e).with(fields.clone()))?;
     let ids: Vec<String> = compiled.ids().iter().map(|i| json_str(&show(*i))).collect();
     fields.push(("ids", format!("[{}]", ids.join(","))));
     emit(
@@ -92,8 +95,9 @@ pub fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure>
     )
 }
 
-/// `items <id> [--from P | --token G:V:P] [--limit N]`: the list's `version`, `count`, `bytes`
-/// and `height`, then the items (`position`, `id`, `value`, `version`) and `next`, the token to
+/// `items <id> [--from P | --token G:V:P] [--limit N]`: the list's `version`, `count`, `bytes`,
+/// `height` and `records`, then the items (`position`, `id`, `value`, `version`, and `in`:
+/// `leaf` when its leaf holds the value, `record` when it has its own) and `next`, the token to
 /// resume from, or `null` at the end.
 pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let (id, root, mut rest) = object(rest)?;
@@ -134,11 +138,12 @@ pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
         .iter()
         .map(|item| {
             format!(
-                "{{\"position\":{},\"id\":{},\"value\":{},\"version\":{}}}",
+                "{{\"position\":{},\"id\":{},\"value\":{},\"version\":{},\"in\":{}}}",
                 item.position,
                 json_str(&show(item.id)),
                 render(&item.value),
-                item.version
+                item.version,
+                json_str(if item.inline { "leaf" } else { "record" })
             )
         })
         .collect();
@@ -146,6 +151,7 @@ pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
     fields.push(("count", page.list.count.to_string()));
     fields.push(("bytes", page.list.bytes.to_string()));
     fields.push(("height", page.list.height.to_string()));
+    fields.push(("records", page.list.records.to_string()));
     fields.push(("items", format!("[{}]", listed.join(","))));
     fields.push((
         "next",
@@ -179,15 +185,17 @@ fn token_arg(arg: &str) -> Result<Token, Failure> {
 
 struct Body {
     expected: Expected,
+    records: bool,
     compile_only: bool,
     ops: Vec<ListOp>,
 }
 
-/// `(--absent | --expect V) [--compile-only] (push J | insert P J | remove P | replace P J |
-/// move P Q)...`. No op at all is allowed:
-/// `list todo --absent` creates an empty list.
+/// `(--absent [--records] | --expect V) [--compile-only] (push J | insert P J | remove P |
+/// replace P J | move P Q)...`. No op at all is allowed: `list todo --absent` creates an empty
+/// list.
 fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
     let (mut expected, mut compile_only, mut ops) = (None, false, Vec::new());
+    let mut records = false;
     while let Some((word, tail)) = rest.split_first() {
         rest = tail;
         let mut take = |what: &str| -> Result<String, Failure> {
@@ -204,6 +212,7 @@ fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
                 set_expected(&mut expected, Expected::Version(v))?;
             }
             "--compile-only" if !compile_only => compile_only = true,
+            "--records" if !records => records = true,
             "push" => ops.push(ListOp::Push(element_arg(&take("a value J")?)?)),
             "insert" => {
                 let at = position(word, &take("a position P")?)?;
@@ -229,8 +238,14 @@ fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
     }
     let expected =
         expected.ok_or_else(|| Failure::usage("one of --absent or --expect V is required"))?;
+    if records && expected != Expected::Absent {
+        return Err(Failure::usage(
+            "--records goes with --absent: a list is made with it or without it",
+        ));
+    }
     Ok(Body {
         expected,
+        records,
         compile_only,
         ops,
     })
@@ -243,7 +258,8 @@ fn position(op: &str, text: &str) -> Result<u64, Failure> {
 }
 
 /// `dump`'s list root: `count`, `bytes` and `height` through the library's read, then the
-/// payload as stored (`next`, `tree`, `bytes`, `count`).
+/// payload as stored (`next`, `tree`, `bytes`, `count`, `records`). A leaf entry renders as an
+/// id when the item has its own record, or `[id, value]` when the leaf holds it.
 pub fn dump_root(snapshot: &MapSnapshot, root: &RootKey, line: &mut Line) -> Result<(), Failure> {
     let found =
         list(snapshot, root)?.ok_or_else(|| Failure::store("record vanished between two reads"))?;

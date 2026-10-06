@@ -25,7 +25,7 @@
 //! doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]
 //! doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]
 //! doc_scenario --store <FILE> gc <id> --floor F [--compile-only]
-//! doc_scenario --store <FILE> list <id> (--absent | --expect V) [--compile-only]
+//! doc_scenario --store <FILE> list <id> (--absent [--records] | --expect V) [--compile-only]
 //!                                  (push J | insert P J | remove P | replace P J | move P Q)...
 //! doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]
 //! doc_scenario --store <FILE> dump
@@ -146,7 +146,7 @@ doc_scenario --store <FILE> upload <id> (--absent | --expect V) --upload H --chu
 doc_scenario --store <FILE> blob <id>\n       doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]\n       \
 doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]\n       \
 doc_scenario --store <FILE> gc <id> --floor F [--compile-only]\n       \
-doc_scenario --store <FILE> list <id> (--absent | --expect V) [--compile-only] (push J | insert P J | remove P | replace P J | move P Q)...\n       \
+doc_scenario --store <FILE> list <id> (--absent [--records] | --expect V) [--compile-only] (push J | insert P J | remove P | replace P J | move P Q)...\n       \
 doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]\n       \
 doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
