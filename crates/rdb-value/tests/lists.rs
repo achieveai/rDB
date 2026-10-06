@@ -4269,3 +4269,148 @@ fn l_r186ee_a_merge_back_reads_no_item_record() {
         "the damage stays: {read:?}"
     );
 }
+
+// ---- timing probes (L-R186ee D1, D2): ignored, run by hand ---------------------------------
+//
+// `cargo test -p rdb-value --test lists --release -- --ignored --nocapture --test-threads=1
+// l_r186ee_probe` prints the numbers; one thread, so the two do not share the host's cores.
+// Drop `--release` for a debug build. They assert only what makes the
+// numbers mean what they say: the block shape before timing, and the outcome of each compile.
+
+/// The median of `runs` timings of `f`, in milliseconds.
+fn median_ms<T>(runs: usize, mut f: impl FnMut() -> T) -> (f64, T) {
+    let mut times = Vec::with_capacity(runs);
+    let mut last = None;
+    for _ in 0..runs {
+        let started = std::time::Instant::now();
+        let out = f();
+        times.push(started.elapsed().as_secs_f64() * 1e3);
+        last = Some(out);
+    }
+    times.sort_by(f64::total_cmp);
+    (times[runs / 2], last.expect("runs > 0"))
+}
+
+/// D1: at the default B, one block of 10,000 small entries with 240 pending `Insert{at: 0}`.
+/// Times one whole read, one point read, and one compile that opens the block (one more
+/// `Insert{at: 0}`, which folds it), each the median of 5.
+#[test]
+#[ignore = "a timing probe; run by hand"]
+fn l_r186ee_probe_d1_a_full_block_with_240_pending_front_inserts() {
+    const ENTRIES: usize = 10_000;
+    let root = todo();
+    let mut k = Kernel::new();
+    let pushes: Vec<ListOp> = (0..ENTRIES)
+        .map(|i| ListOp::Push(text(&format!("{i:04}"))))
+        .collect();
+    let made = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Absent,
+        DEFAULT_BLOCK_MAX,
+        &pushes,
+    )
+    .expect("create");
+    k.commit(made.compiled());
+    for _ in 0..240 {
+        write(
+            &mut k,
+            &root,
+            DEFAULT_BLOCK_MAX,
+            &[ListOp::Insert {
+                at: 0,
+                value: text("x"),
+            }],
+        );
+    }
+    let refs = block_refs(&k, &root);
+    assert_eq!(refs.len(), 1, "one block");
+    let prefix = root.sub_prefix(SUB_BLOCK);
+    let slots = k
+        .records
+        .range(Bytes::from(prefix.clone())..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
+        .filter(|(key, _)| key.len() == prefix.len() + 17)
+        .count();
+    assert_eq!(slots, 240, "240 pending slots");
+    let base = k
+        .records
+        .range(Bytes::from(prefix.clone())..)
+        .next()
+        .map(|(_, (_, raw))| open(raw).expect("base").payload.len())
+        .expect("a base");
+    let snap = k.snapshot();
+    let (full, page) = median_ms(5, || {
+        items(&snap, &root, Start::Position(0), usize::MAX).expect("read")
+    });
+    assert_eq!(page.items.len(), ENTRIES + 240);
+    let (point, page) = median_ms(5, || {
+        items(&snap, &root, Start::Position(0), 1).expect("read")
+    });
+    assert_eq!(page.items.len(), 1);
+    let version = version_of(&k, &root);
+    let insert = [ListOp::Insert {
+        at: 0,
+        value: text("x"),
+    }];
+    let (compile, _) = median_ms(5, || {
+        compile_list(
+            &snap,
+            &root,
+            Expected::Version(version),
+            DEFAULT_BLOCK_MAX,
+            &insert,
+        )
+        .expect("compile")
+    });
+    eprintln!(
+        "D1: {ENTRIES} entries + 240 pending, base {base} B, B {DEFAULT_BLOCK_MAX}: whole read \
+         {full:.2} ms, point read {point:.2} ms, compile of one insert {compile:.2} ms (median \
+         of 5)"
+    );
+}
+
+/// D2: one delta of k `Insert{at: 0}` into an empty list at the default B, for k = 1,000 to
+/// past the refusal point. Times the compile alone, the median of 3, and prints its outcome.
+#[test]
+#[ignore = "a timing probe; run by hand"]
+fn l_r186ee_probe_d2_one_delta_of_k_front_inserts() {
+    let root = todo();
+    let mut k = Kernel::new();
+    let made = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Absent,
+        DEFAULT_BLOCK_MAX,
+        &[],
+    )
+    .expect("create");
+    k.commit(made.compiled());
+    let snap = k.snapshot();
+    let version = version_of(&k, &root);
+    for count in [
+        1_000, 5_000, 10_000, 20_000, 43_000, 44_000, 50_000, 100_000,
+    ] {
+        let ops = vec![
+            ListOp::Insert {
+                at: 0,
+                value: text("x"),
+            };
+            count
+        ];
+        let (ms, out) = median_ms(3, || {
+            compile_list(
+                &snap,
+                &root,
+                Expected::Version(version),
+                DEFAULT_BLOCK_MAX,
+                &ops,
+            )
+        });
+        let outcome = match out {
+            Ok(compiled) => format!("ok, {} writes", compiled.compiled().mutations.len()),
+            Err(e) => format!("refused {e:?}"),
+        };
+        eprintln!("D2: k {count}: {ms:.1} ms (median of 3), {outcome}");
+    }
+}
