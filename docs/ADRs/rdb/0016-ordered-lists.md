@@ -1,6 +1,7 @@
 # ADR-rdb-0016: Ordered lists — blocks, change slots and folding
 
-**Status:** Proposed, draft rev 6.3. **Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
+**Status:** Accepted, 2026-10-06, at rev 6.3; built and tested in M8 S4.
+**Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
 slots, folded by our code; Merge later, if measured. Superseded: rev 4's tree parts, Q1 (node size), Q4a (top node in root).
 Kept: ids and seed (Q4b), L = 256 B inline and `records` (L-R186cr), overlay flips, `MAX_ITEM` (Q2), tokens, the fence.
 **Rev 6** closes the rev 5 critic review (lead's rulings; working notes not in the repository): B1, M1 §4 · M2 §1, §4, §5 · M3 amendment rev 3 · A1, A3
@@ -9,7 +10,9 @@ Consequences · A2 §4, O1 · A4 §3, §6, §7 · A5 §3, §4. **Rev 6.1** close
 (`scan` has no end key); retire and drop delete slot keys by op no. §3, §4, §5, §6, Consequences.
 **Rev 6.3** (W2 D4, L-R186ds): a block's index entry drops its byte total, so a split, merge-back or Move reads no item
 record. §1, §4, §7, Vectors, Consequences; spec amendment rev 3.2.
-**Date:** 2026-10-05
+**Accepted** (L-R186dx): §6 point-read calls, §7 row `ListRecordAtRoot`, two §4 figures corrected, Consequences and
+Verification checked against the S4 tests.
+**Date:** 2026-10-06
 **Spec:** `docs/rdb/design-specification.md` D14, D16, §4.3, §4.3.2, §4.3.4; `docs/rdb/validation-plan.md` V13
 **Decided by:** Gautam, 2026-10-05: L-R186cz (Q1 mechanism N, Q2 cap 512 blocks, Q3 last block splits at its end; stated
 defaults B = 128 KiB, 240 slots, fold at ¼); L-R186cr (inline, `records`, L = 256 B); Q2 (`MAX_ITEM`); Q4b (id seed).
@@ -98,9 +101,10 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   - **The cap exception (M1):** at 512 blocks, a block whose split only the cap prevents is written **unsplit**, provided
     the delta does not grow its replayed payload. At the cap, an op that grows a block's replayed payload past B is
     refused, even when it would write only a slot. So removes, Move-outs and replaces that do not grow their entry never
-    fail on the cap. An unsplit base is ≤ 1.25 · B + one entry: ~164 KiB at the default, and always ≤ 262,144 B.
+    fail on the cap. An unsplit base is ≤ 1.25 · B + one entry: ~160 KiB at the default, and always ≤ 262,144 B.
     **A base over B takes no slots:** every op on it folds, so it stays ≤ 1.25 · B + two entries and splits on its first
-    fold off the cap (N2: this keeps the 3,072 B id limit; without it, it would be 2,921 at 192 KiB).
+    fold off the cap (N2: this keeps the 3,072 B id limit; without it, the limit would be about 2,921 at 192 KiB, an
+    estimate, not re-derived).
 - **Merge back, minimum conditions:** a folded block under B/4 joins its left neighbour (else right) if the pair, the
   neighbour's pending ops replayed, is ≤ ¾ · B. The left block survives (`folded = head`); the right one's base and slots are
   deleted, and a slot this transaction wrote to either block is dropped. **At most one merge-back per transaction, none if
@@ -119,7 +123,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
     ≈ **703,368 + 4e at the default**; 785,288 + 4e at B = 192 KiB.
   - Move between two blocks with 240 pending each: both fold, no delete: ≤ 5 writes, ≈ 342 KB at the default.
   - Retiring a block in a Move whose other block folds and splits: ≈ 187,716 + 244e at the default (e ≤ 3,528), and
-    ≈ 269,936 + 244e at 192 KiB (e ≤ 3,191). **Drop:** 8,960 + 242e (e ≤ 4,295).
+    ≈ 269,636 + 244e at 192 KiB (e ≤ 3,192). **Drop:** 8,960 + 242e (e ≤ 4,295).
   - **So every list compile refuses an object id with e > 3,072 (`TooLarge{Write}`)**; emptying and dropping then never
     fail on bytes. M9's object-id limit (O1) must be ≤ 3,072 B escaped for lists.
   - Writes: root, ≤ 2 blocks × (base + split block), one item record, one retired block (≤ 241 deletes): ≤ 247 < 255.
@@ -154,14 +158,15 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - `list(snapshot, &RootKey) -> Option<List{version, count, bytes, blocks}>`. `items(snapshot, &RootKey, Position(p) |
   Token(t), limit) -> Items{list, items, next}`; item = `{position, id, value, version}`.
 - **Calls:** the root's `get` and `version`; per block crossed, the base's `get` and `version` and 0–2 slot
-  `scan`s; one `get` and `version` per out-of-line item. A point read is 4–6 calls plus its item's 2.
+  `scan`s; one `get` and `version` per out-of-line item. A point read is 4 calls with no pending op: the root's `get` and
+  `version`, then the base's. Pending ops add one `scan`, two if they wrap past slot 239. An out-of-line item adds 2.
 - **Token** = `(generation, version, position)`: `GenerationChanged` or `VersionConflict` on a mismatch.
 - **Version:** every op writes the root, so the collection version moves once per transaction. An inline item's `version` is
   the root's; an out-of-line item's is its record's. Not concurrency tokens; M9's value-digest check hashes the value.
 - **Finding an item by id (Gautam's note, L-R186cz).** No v1 caller reads by id (ADR-rdb-0013 O4 defers it to M9).
   - An **out-of-line item** is keyed by its id: one `get` of `0x02 · id` returns its value. Its position is not known
     without a block scan.
-  - An **inline item** has no key: finding it means replaying blocks until an entry has its `n`. That is up to ~164 KiB per
+  - An **inline item** has no key: finding it means replaying blocks until an entry has its `n`. That is up to ~160 KiB per
     block at the default, ≤ 512 blocks: fine for a small list, costly as a hot path on a big one.
   - **A later id index:** an exact `n → block` map rewrites one entry per item a split or merge-back moves (~3,000 at
     128 KiB, past the 255-write cap), so it must be paged. A per-block id filter in the root costs ~64 B per block per op.
@@ -178,6 +183,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
 | bare `n` with no item record; item record does not open, not a document, newer than root | `Corrupt(ItemMissing{id} / Envelope / ItemNotDocument{found} / Codec / ElementNewerThanRoot)` |
 | records under `0x02`/`0x03` with no root, at a fresh id, or beside an empty list at drop | `Corrupt(OrphanElement)` |
+| a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on every path: list reads, writes and drop; document read and compile; blob reads, publish and delete; blob GC; `doc_scenario`'s dump. A map or set path names it `Corrupt(Root(..))` |
 - `BlockFault` replaces rev 4's `PageFault`. An unknown kind, codec or format stays written-by-a-newer-build.
 - **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one `n` twice; a stale
   slot under a live block; a wrong `bytes` total. The test invariant checker covers each.
@@ -230,7 +236,10 @@ the payload.
 - **Reads before the write caps:** Remove and Replace read the out-of-line item they change, to take its length off
   `bytes`, before the request caps are checked. A delta of many removes reads every item it names, then may be refused
   `TooManyWrites`. A damaged item cannot be removed or replaced; `clear_object` repairs it (decision 7). Push, Insert,
-  Move, splits and merge-backs read no item record.
+  Move, splits and merge-backs read no item record. A line of k inserts that splits a block makes at most 2 · k + 7
+  calls and reads at most 2 · B bytes, whatever the item size: 2 `version` calls per insert (its new item key), the
+  root's 3, the base's 2 and up to 2 pending scans. At B = 1,024 a line of 100 makes exactly 2 · 100 + 5; at the
+  default B, by hand, 247 = 2 · 120 + 7 (16-char items) and 135 = 2 · 64 + 7 (8 KiB items).
 - A point read opens one base and its pending slots (q ≤ base/4), so ≤ ~1.25 · B; stale slots are never read (P9: they
   would add up to 240 × ~300 B ≈ 72 KB). That is ~2–7× the tree's bytes past ~24 KiB, the same below.
 - **Capacity at the default: ≥ ~16 MiB worst (blocks just over B/4 never merge), ~64 MiB push-only** (end splits fill blocks).
@@ -241,8 +250,11 @@ the payload.
 - B, the fold triggers and L retune without a format change; `SLOTS`, the key layout and the 512 cap do not.
 
 ## Verification
-Tests in `crates/rdb-value/tests/lists.rs`; each names the scenario it protects.
-- **Vectors both ways** for the root, a block and a slot, from a Node encoder written apart from the Rust code.
+Tests in `crates/rdb-value/tests/lists.rs`; each names the scenario it protects. A list record at a root key is also
+checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and `examples/doc_scenario.rs`.
+- **Vectors both ways** for the root, a block, a slot and an item record (`w3_vectors_are_written_and_read_byte_for_byte`).
+  The bytes are pinned from the Rust run. The manual tester checked the W1 format's bytes and digests with an
+  independent Node encoder; no second encoder is committed.
 - **Model:** random op lists at `block_max` 1,024, values both sides of the inline limit, vs a `Vec` model (items, ids, `count`,
   `bytes`). After every op an **invariant checker** walks the raw records: root sums; every base ≤ B when written, or unsplit
   at the cap with no pending slot; **count = 0 ⇔ one block**; pending ≤ 240 and each pending slot holds its op no; no slot key
@@ -250,12 +262,17 @@ Tests in `crates/rdb-value/tests/lists.rs`; each names the scenario it protects.
   id ⇔ record; every `0x02`/`0x03` key belongs to a live block or item; a `records` list has no inline entry.
 - **Rows:** each Scenarios row above; fold by count and by ¼; merge-back skipped when it would not fit; an id over 3,072 B
   refused; overlay rows (rev 4); stale-slot inheritance.
-- **Counting snapshot:** bytes written (`record_len`) per op at 1, 10, 100 blocks within ±10% of the block-list study (working notes); bytes and calls
-  (`get`, `scan`, `version`) per `items` call.
-- **Size:** every compiled op's `record_len` ≤ its decision-4 bound; a build-time assert ties `DEFAULT_BLOCK_MAX`, the
-  192 KiB top, `MAX_ITEM`, the 512-block root and the id limit to `MAX_ENVELOPE_BYTES`.
-- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s; every guard deleted once turns a
-  named row red. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
+- **Counting snapshot:** calls by role for a point read (`w3_a_point_read_is_four_calls_and_two_more_out_of_line`), a
+  tiny list beside a big neighbour (`w3_a_tiny_list_opens_its_own_records_and_one_foreign_one_at_most`) and a split line
+  (`d4_a_split_reads_within_a_bound_set_by_b_whatever_the_item_size`; at the default B by hand,
+  `d4_a_split_at_the_default_b_reads_within_a_bound_set_by_b`). Bytes per push were measured by a driver run by hand,
+  not by a test (Consequences). They are 20–59% under the block-list study, not within ±10% of it: a root index entry
+  is 11.6 B, not the study's 30 B.
+- **Size:** the compile refuses a request over either cap (`w3_each_limit_holds_at_its_edge`). Build-time asserts
+  (`worst_op`, `worst_retire`) tie `DEFAULT_BLOCK_MAX`, the 192 KiB top, `MAX_ITEM`, the 512-block root and the id limit
+  to `MAX_ENVELOPE_BYTES`. No test measures each op's `record_len` against its decision-4 bound.
+- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s. Each of 81 guard mutants turned a
+  named row red. A Replace out of the block over a stray item record has no row yet. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
 
 ## Open
 - **O1** Id-addressed reads and id/value-digest preconditions (ADR-rdb-0013 O4): M9, costs in decision 6. M9's object-id
