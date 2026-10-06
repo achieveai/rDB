@@ -1,0 +1,129 @@
+{
+  "schema": 1,
+  "name": "rdb-m7-campaign",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "f03cded2d8d3aeb0299773572ce5fa8712699c1a",
+    "dirty": false,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-10-05T20:02:54Z",
+    "duration_ms": 883,
+    "seed": 0,
+    "scale_factor": 0.0,
+    "full_scale": false
+  },
+  "values": {
+    "below_target_reason": "64 of 1000 seeds processed; 64 of 64 generated seeds did not run through the bridge (M7V-55, M7V-75)",
+    "compile_ms_excluded": null,
+    "events_total": 5344,
+    "full_scale": false,
+    "histories_harness": 0,
+    "histories_ran": 4,
+    "histories_unlowerable": 64,
+    "invariants": {
+      "INV-ATOM": {
+        "reason": "capability(T1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-AUTH": {
+        "note": "proven covers only the paths the default corpus reaches. Every Valid decision is on A1's healthy path: inside a held grant, in one generation per partition. INV-AUTH judges Valid windows only, and no history records Valid decisions in two generations of one partition, so no cross-generation overlap is judged (M7A-58, owed). One authored history, A1/P1 (M7V-47), reaches a Fenced Reply decision after its partition moves to generation 3; the checker skips it. No history reaches a NoGrant, Expired or lineage denial; rdb-core unit rows cover those (m7a_03, m7a_36, m7a_50, a_read_moving_a_partition_to_a_withheld_lineage_fences_the_old_one, m7a_184..m7a_187, m7a_99, m7a_100).",
+        "seeds_armed": 3,
+        "status": "proven"
+      },
+      "INV-DEDUP": {
+        "reason": "capability(T1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-ISO": {
+        "reason": "capability(H1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-LAG": {
+        "reason": "capability(L1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-LIN": {
+        "reason": "capability(T1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-LIVE": {
+        "reason": "capability(H1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-LOSS": {
+        "reason": "capability(F1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-PUB": {
+        "reason": "capability(R1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      },
+      "INV-VER": {
+        "reason": "capability(R1)",
+        "seeds_armed": 0,
+        "status": "unavailable"
+      }
+    },
+    "kernel_a": {
+      "events_per_txn": {
+        "effects": {
+          "max": 36,
+          "min": 35,
+          "p50": 36
+        },
+        "inputs": {
+          "max": 28,
+          "min": 25,
+          "p50": 28
+        },
+        "transactions": 3
+      }
+    },
+    "max_events": 2000,
+    "minimized": [],
+    "mutations": {
+      "MUT-1": [
+        "M7V-66"
+      ],
+      "MUT-2": [
+        "M7V-69",
+        "M7V-81"
+      ],
+      "MUT-3": [
+        "M7V-67"
+      ],
+      "MUT-4": [
+        "M7V-68"
+      ],
+      "MUT-5": [
+        "M7V-92",
+        "M7V-70"
+      ]
+    },
+    "profile": "debug",
+    "scale_factor": 0.0,
+    "seeds": 64,
+    "shrink_ms": 0,
+    "threads": 32,
+    "wall_ms": 775
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}

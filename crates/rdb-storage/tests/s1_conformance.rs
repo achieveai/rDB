@@ -21,7 +21,8 @@
 //! would apply is committed to both engines as one chained batch, and then reads back on both
 //! as the expected document at the writing `seq`.
 //!
-//! Writes `docs/evidence/rdb-m8-storage-conformance.json` through `write_evidence`.
+//! Writes `rdb-m8-storage-conformance.json` through `write_evidence`: into the run's log folder,
+//! or `docs/evidence/` under `RETCD_EVIDENCE=1`.
 
 #[path = "support/delete.rs"]
 mod delete;

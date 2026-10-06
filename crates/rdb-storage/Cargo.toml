@@ -27,7 +27,7 @@ config-log-macros = { workspace = true }
 # A thread-local collecting layer lets a test assert on the events an open emits without
 # reading a file the non-blocking writer may not have flushed.
 tracing-subscriber = { workspace = true }
-# The S1 differential writes docs/evidence/rdb-m8-storage-conformance.json through
+# The S1 differential writes rdb-m8-storage-conformance.json through
 # `write_evidence`, which stamps the shared envelope and disclaimer (as rdb-sim's campaign
 # does). Allowed direction: rdb-* -> config-*.
 config-testkit = { workspace = true }

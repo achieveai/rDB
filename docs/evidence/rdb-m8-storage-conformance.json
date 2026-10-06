@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "name": "rdb-m8-storage-conformance",
+  "host": {
+    "hostname": "DEVSFOUR-HOST",
+    "os": "windows/x86_64",
+    "cpu_model": "AMD64 Family 25 Model 33 Stepping 2, AuthenticAMD",
+    "cpu_cores": 32,
+    "ram_bytes": null,
+    "disk_class": "unknown"
+  },
+  "build": {
+    "git_sha": "f03cded2d8d3aeb0299773572ce5fa8712699c1a",
+    "dirty": false,
+    "profile": "debug",
+    "rustc": "rustc 1.93.0 (254b59607 2026-01-19)"
+  },
+  "run": {
+    "utc": "2026-10-05T20:02:29Z",
+    "duration_ms": 7890,
+    "seed": 0,
+    "scale_factor": 0.0032,
+    "full_scale": false
+  },
+  "values": {
+    "comparisons": {
+      "compiled": 487,
+      "doc_read_back": 298,
+      "get": 64377,
+      "history_at": 20763,
+      "lineage_marks": 5758,
+      "snapshot": 2560,
+      "snapshot_scan": 19608
+    },
+    "doc_keys": 2,
+    "doc_op_percent": 40,
+    "max_inherits_per_partition": 3,
+    "mismatches": 0,
+    "not_compared": [
+      "refusals and the seal (rocks-only rows #3-#9, #12, #18, #34, #35, S1-T2)",
+      "a root's snapshot once its partition has a child (oracle root view is partition-wide)",
+      "per-seq Progress (RocksDB keeps the head only, S0 F1)"
+    ],
+    "ops": {
+      "delete": 194,
+      "doc_create": 121,
+      "doc_racing_create": 32,
+      "doc_refused": 306,
+      "doc_update": 28,
+      "inherit_base_below_parent_base": 41,
+      "inherit_base_zero": 23,
+      "inherit_copied": 134,
+      "inherit_linked": 21,
+      "put": 672,
+      "reopen": 59,
+      "sync": 200
+    },
+    "ops_per_seed": 40,
+    "partitions": 2,
+    "seeds": 32
+  },
+  "disclaimer": "Dev-host evidence. Not a production claim; production designation requires re-running on target hardware (spec §20, §12.2)."
+}
