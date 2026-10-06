@@ -25,6 +25,10 @@
 //! constants"). Evidence rows are not `#[ignore]`d: they run in the ordinary gate at reduced
 //! scale, which is what keeps the code path exercised between the rare full-scale runs.
 //!
+//! Only a run that [`publishes_to_docs`] writes the committed `docs/evidence/`. Every other run
+//! writes into `evidence/` under its own test log folder, so an ordinary gate run leaves the
+//! tracked artifacts untouched ([`evidence_dir`]).
+//!
 //! # Example
 //!
 //! ```no_run
@@ -87,11 +91,17 @@ pub fn full_scale_requested() -> bool {
 // The artifact
 // ---------------------------------------------------------------------------------------
 
-/// One evidence file, exactly as it is written to `docs/evidence/<name>.json`.
+/// One evidence file, exactly as [`write_evidence`] writes it to `<evidence_dir>/<name>.json`.
 ///
 /// `deny_unknown_fields` is the point of round-tripping through this type: M6-113 rejects an
-/// artifact carrying a top-level key the schema does not define, which is how a hand-edited or
-/// half-migrated file is caught before someone quotes it.
+/// artifact carrying a top-level key the schema does not define, which is how a malformed or
+/// half-migrated file from this run is caught before someone quotes it.
+///
+/// The committed `docs/evidence/` files change only by a publishing run ([`publishes_to_docs`])
+/// or a hand copy (ruling L-R186bx). The ordinary gate never parses or validates their contents;
+/// only E2E-47 reads the names of the committed `rdb-*.json` files, to check the README lists
+/// them. Their contents are validated by `scripts/evidence-gate.ps1`, which does not enforce
+/// `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
@@ -237,17 +247,48 @@ impl RunInfo {
 // Writing
 // ---------------------------------------------------------------------------------------
 
-/// `docs/evidence/`, created if it does not exist.
+/// Whether this run publishes its artifacts to the committed `docs/evidence/`.
 ///
-/// Resolved from this crate's manifest directory rather than from the working directory, so the
-/// artifacts land in the repository whichever directory `cargo test` was invoked from.
+/// The one trigger (ruling L-R186bt): an ordinary run must leave the tracked artifacts alone,
+/// so only a run that asks with `RETCD_EVIDENCE=1` publishes. Every other run writes into its
+/// own log folder ([`evidence_dir`]).
+///
+/// An ordinary run cannot catch this returning `false` when asked to publish (ruling
+/// L-R186cc, F-003). Under a publishing run, `only_a_publishing_run_targets_docs_evidence`
+/// catches it if that run includes this crate's lib tests; `scripts/evidence-gate.ps1` catches
+/// it only while some committed file is still reduced-scale, because it does not check freshness.
+pub fn publishes_to_docs() -> bool {
+    full_scale_requested()
+}
+
+/// The committed `docs/evidence/` directory, which also holds its `README.md`.
+///
+/// Resolved from this crate's manifest directory rather than from the working directory, so it
+/// is the repository's whichever directory `cargo test` was invoked from.
+pub fn docs_evidence_dir() -> PathBuf {
+    workspace_root().join("docs").join("evidence")
+}
+
+/// Where this run writes and reads its artifacts, created if it does not exist.
+///
+/// [`docs_evidence_dir`] when [`publishes_to_docs`]; otherwise `evidence/` in this test
+/// binary's log folder (`config_log::testing::test_log_dir`), so the gate's `logs=` folder
+/// holds it.
 pub fn evidence_dir() -> PathBuf {
-    let dir = workspace_root().join("docs").join("evidence");
+    let dir = evidence_dir_for(publishes_to_docs());
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
     dir
 }
 
-/// Write one row's artifact to `docs/evidence/<name>.json` and return the path.
+fn evidence_dir_for(publish: bool) -> PathBuf {
+    if publish {
+        docs_evidence_dir()
+    } else {
+        config_log::testing::test_log_dir().join("evidence")
+    }
+}
+
+/// Write one row's artifact to `<evidence_dir>/<name>.json` and return the path.
 ///
 /// The envelope — schema, host, build, run, disclaimer — is stamped here and nowhere else.
 /// `values` is the row's own measurements and must be a non-empty JSON object: an artifact with
@@ -390,7 +431,8 @@ pub fn validate(artifact: &Artifact) -> Result<(), EvidenceError> {
     }
 }
 
-/// Every artifact currently in `docs/evidence/`, by row name.
+/// Every artifact currently in [`evidence_dir`] (this run's folder, or `docs/evidence/` when
+/// publishing), by row name.
 ///
 /// `.json.tmp` files are ignored: an interrupted write is not an artifact.
 pub fn read_all() -> BTreeMap<String, (PathBuf, Artifact)> {
@@ -398,13 +440,13 @@ pub fn read_all() -> BTreeMap<String, (PathBuf, Artifact)> {
     let mut out = BTreeMap::new();
     let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("list {}: {e}", dir.display()));
     for entry in entries {
-        let path = entry.expect("read a docs/evidence entry").path();
+        let path = entry.expect("read an evidence directory entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
         let artifact = read_evidence(&path).unwrap_or_else(|e| {
             panic!(
-                "{} is in docs/evidence but is not evidence: {e}",
+                "{} is in the evidence directory but is not evidence: {e}",
                 path.display()
             )
         });
@@ -732,4 +774,70 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression (ruling L-R186bt): an ordinary run wrote `docs/evidence/<name>.json`, so every
+    /// gate run left the tracked artifacts dirty. Without `RETCD_EVIDENCE=1` the artifact must
+    /// land in this run's log folder instead.
+    #[test]
+    fn an_ordinary_run_writes_evidence_under_the_run_log_folder_not_docs() {
+        if full_scale_requested() {
+            return; // a publishing run; the chooser's other half is covered below
+        }
+        let docs = workspace_root().join("docs").join("evidence");
+        let path = write_evidence(
+            "zz-ordinary-run-probe",
+            serde_json::json!({ "probe": 1 }),
+            RunInfo::start(0),
+        );
+        let in_docs = path.starts_with(&docs);
+        if in_docs {
+            // Remove the stray before failing, so the red run leaves the tree as it found it.
+            std::fs::remove_file(&path).expect("remove the probe from docs/evidence");
+        }
+        assert!(!in_docs, "an ordinary run wrote {}", path.display());
+        assert!(
+            path.starts_with(config_log::testing::test_log_dir()),
+            "{} is not under this run's log folder {}",
+            path.display(),
+            config_log::testing::test_log_dir().display()
+        );
+        assert!(path.is_file(), "{} was not written", path.display());
+    }
+
+    /// `read_all` reads this run's folder, so the validator rows (M6-113, M6-114) check what this
+    /// run wrote and never pass on the committed files (ruling L-R186cc, F-002).
+    #[test]
+    fn read_all_returns_this_runs_artifact_from_the_run_log_folder() {
+        if full_scale_requested() {
+            return; // a publishing run reads docs/evidence by design
+        }
+        let name = "zz-read-all-probe";
+        let written = write_evidence(name, serde_json::json!({ "probe": 1 }), RunInfo::start(0));
+        let all = read_all();
+        let (path, artifact) = all
+            .get(name)
+            .unwrap_or_else(|| panic!("read_all did not return {name}: {:?}", all.keys()));
+        assert_eq!(path, &written);
+        assert!(
+            path.starts_with(config_log::testing::test_log_dir()),
+            "read_all returned {} from outside this run's log folder",
+            path.display()
+        );
+        assert_eq!(artifact.name, name);
+    }
+
+    /// The other half of the chooser: a publishing run targets `docs/evidence/`, and nothing
+    /// else does. Checked on the pure chooser, so no artifact is written to the tree.
+    #[test]
+    fn only_a_publishing_run_targets_docs_evidence() {
+        let docs = workspace_root().join("docs").join("evidence");
+        assert_eq!(evidence_dir_for(true), docs);
+        assert!(!evidence_dir_for(false).starts_with(&docs));
+        assert_eq!(publishes_to_docs(), full_scale_requested());
+    }
 }

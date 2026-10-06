@@ -586,14 +586,20 @@ fn m7v_77_rdb_evidence_carries_no_production_claim() {
         offences.join("\n")
     );
 
-    // And every rDB evidence artifact, once any exists, carries the shared disclaimer. There are
-    // none yet, so the row reports that rather than passing on an empty set.
+    // And every rDB evidence artifact this run wrote carries the shared disclaimer. They live in
+    // the run's own folder now (ruling L-R186bt), so the shared corpus must have written them
+    // before they are read; an empty set fails rather than passing.
+    let written = &shared().artifacts;
     let artifacts = rdb_evidence_files();
-    if artifacts.is_empty() {
-        println!(
-            "M7V-77: no docs/evidence/rdb-*.json exists yet — the document half ran over {} \
-             files, the artifact half has nothing to check",
-            rdb_documents().len()
+    // Each path this run wrote, not just as many files: a count also passes on the committed
+    // docs/evidence copies (ruling L-R186cc, F-001).
+    for path in written {
+        assert!(
+            artifacts
+                .iter()
+                .any(|(read, _)| std::path::Path::new(read) == path),
+            "M7V-77: {} was written by this run but not read: {artifacts:?}",
+            path.display()
         );
     }
     for (path, text) in &artifacts {
@@ -614,10 +620,17 @@ fn m7v_74_rdb_evidence_files_validate_against_the_schema() {
     assert_eq!(written.len(), 2, "{written:?}");
 
     let files = rdb_evidence_files();
-    assert!(
-        files.len() >= written.len(),
-        "the artifacts this run wrote are missing: {files:?}"
-    );
+    // Each path this run wrote, not just as many files: a count also passes on the committed
+    // docs/evidence copies (ruling L-R186cc, F-001).
+    for path in written {
+        assert!(
+            files
+                .iter()
+                .any(|(read, _)| std::path::Path::new(read) == path),
+            "{} was written by this run but not read: {files:?}",
+            path.display()
+        );
+    }
     for (path, _) in &files {
         let artifact = evidence::read_evidence(std::path::Path::new(path))
             .unwrap_or_else(|e| panic!("{path}: {e}"));
@@ -732,13 +745,10 @@ fn rdb_documents() -> Vec<(String, String)> {
     files
 }
 
-/// Every `docs/evidence/rdb-*.json`.
+/// Every `rdb-*.json` in this run's evidence folder: the run's log folder, or `docs/evidence/`
+/// when the run publishes (`config_testkit::evidence::evidence_dir`, ruling L-R186bt).
 fn rdb_evidence_files() -> Vec<(String, String)> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("the workspace root is two levels above the crate")
-        .join("docs/evidence");
+    let root = config_testkit::evidence::evidence_dir();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
@@ -1516,7 +1526,7 @@ fn m7v_61_campaign_asserts_wall_ms_only_when_spike_assert_wall_ms_is_set() {
 fn m7v_62_the_release_command_is_the_only_source_of_the_sixty_second_number() {
     support::preamble();
     // (1) The selector is a pure function of the build profile, both directions. It returns the
-    // `write_evidence` name, which writes `docs/evidence/<name>.json`; the file is what VA-9 cites.
+    // `write_evidence` name, which writes `<evidence_dir>/<name>.json`; VA-9 cites that file.
     let debug = cfg!(debug_assertions);
     let file = format!("{}.json", engine::artifact_name());
     assert_eq!(

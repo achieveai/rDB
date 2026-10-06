@@ -2061,7 +2061,10 @@ fn rdb_evidence_rows_from_readme(readme: &std::path::Path) -> Vec<(String, Strin
 /// Every campaign knob is removed, so the child runs the checked-in default corpus at reduced
 /// scale whatever this process was started with. The profile is the default (`dev`), so the child
 /// writes `rdb-m7-campaign.json`, never the release artifact.
-fn run_rdb_campaign(target_dir: &std::path::Path) {
+///
+/// `RETCD_EVIDENCE` is among the removed knobs, so the child never publishes to `docs/evidence/`:
+/// it writes its artifacts under `log_dir` (see [`child_evidence_dir`]), which the caller owns.
+fn run_rdb_campaign(target_dir: &std::path::Path, log_dir: &std::path::Path) {
     const CAMPAIGN_KNOBS: [&str; 9] = [
         "RETCD_EVIDENCE",
         "SPIKE_ASSERT_WALL_MS",
@@ -2073,13 +2076,12 @@ fn run_rdb_campaign(target_dir: &std::path::Path) {
         "SPIKE_SHRINK_MAX_FAILURES",
         "SPIKE_SHRINK_STEPS",
     ];
-    let log_dir = config_testkit::fs::temp_dir();
     let mut command = std::process::Command::new("cargo");
     command
         .args(["test", "-p", "rdb-sim", "--test", "campaign"])
         .current_dir(workspace_root())
         .env("CARGO_TARGET_DIR", target_dir)
-        .env("RETCD_TEST_LOG_DIR", log_dir.path());
+        .env("RETCD_TEST_LOG_DIR", log_dir);
     for knob in CAMPAIGN_KNOBS {
         command.env_remove(knob);
     }
@@ -2096,16 +2098,15 @@ fn run_rdb_campaign(target_dir: &std::path::Path) {
 
 /// Run `cargo test -p config-testkit --test m6_evidence` to completion and assert it passed.
 ///
-/// A fresh temp directory backs `RETCD_TEST_LOG_DIR` for this one invocation (this row's own
-/// scratch tree, dropped when the function returns — after the child has already exited, since
-/// `Command::output` blocks). `RETCD_EVIDENCE` is explicitly removed so the child runs the
-/// suite's reduced-scale default; every other variable (`CARGO_INCREMENTAL`,
+/// `log_dir` backs `RETCD_TEST_LOG_DIR` for this one invocation; the caller owns it and reads the
+/// artifacts out of it with [`child_evidence_dir`]. `RETCD_EVIDENCE` is explicitly removed so the
+/// child runs the suite's reduced-scale default and writes into `log_dir`, never into
+/// `docs/evidence/`; every other variable (`CARGO_INCREMENTAL`,
 /// `RETCD_TEST_DEADLINE_SCALE`) is inherited from this process, so the child runs under the same
 /// bounds this row itself does. `target_dir` is passed through explicitly (rather than relying
 /// on inheritance alone) so the child never falls back to a different, unbuilt target directory.
 /// Its clusters bind port `0`, so it gets the child port band, never a harness's reserved one.
-fn run_evidence_suite(target_dir: &std::path::Path) {
-    let log_dir = config_testkit::fs::temp_dir();
+fn run_evidence_suite(target_dir: &std::path::Path, log_dir: &std::path::Path) {
     let output = support::narrow_port_range(&mut std::process::Command::new("cargo"))
         .args([
             "test",
@@ -2118,7 +2119,7 @@ fn run_evidence_suite(target_dir: &std::path::Path) {
         ])
         .current_dir(workspace_root())
         .env("CARGO_TARGET_DIR", target_dir)
-        .env("RETCD_TEST_LOG_DIR", log_dir.path())
+        .env("RETCD_TEST_LOG_DIR", log_dir)
         .env_remove("RETCD_EVIDENCE")
         .output()
         .expect("spawn `cargo test -p config-testkit --test m6_evidence`");
@@ -2128,6 +2129,28 @@ fn run_evidence_suite(target_dir: &std::path::Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The one `<log_dir>/<run id>/evidence/` folder a child test binary wrote its artifacts to.
+///
+/// A child run that does not publish writes under its own log folder
+/// (`config_testkit::evidence::evidence_dir`), named by a run id this process cannot know in
+/// advance. `log_dir` is fresh per child, so exactly one such folder must exist; none or several
+/// fails the row rather than reading the wrong one.
+fn child_evidence_dir(log_dir: &std::path::Path) -> std::path::PathBuf {
+    let found: Vec<std::path::PathBuf> = std::fs::read_dir(log_dir)
+        .unwrap_or_else(|e| panic!("list {}: {e}", log_dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("evidence"))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one evidence folder under {}, found {found:?}",
+        log_dir.display()
+    );
+    found.into_iter().next().expect("one folder")
 }
 
 /// `daemon_evidence_run_produces_every_artifact` (test plan §9, E2E-47).
@@ -2148,16 +2171,24 @@ fn run_evidence_suite(target_dir: &std::path::Path) {
 ///
 /// Asserted: the subprocess exits `0`; every file the README's table names exists, parses, and
 /// validates against TA-61 (`config_testkit::evidence::validate`); every one carries
-/// `full_scale: false` (a reduced-scale run) and the same `git_sha`; a second run overwrites
-/// every file in place (its mtime advances and it still parses as exactly one JSON value, never
-/// two — an append rather than an overwrite would leave a second value in the file) and leaves
-/// the exact same file set behind, so no stale file from a renamed row survives.
+/// `full_scale: false` (a reduced-scale run) and the same `git_sha`, and parses as exactly one
+/// JSON value, never two (an append rather than an overwrite would leave a second value in the
+/// file); a second run writes the exact same file set, so no stale file from a renamed row
+/// survives.
 ///
-/// **rDB artifacts (ruling V-R32, 2026-09-27).** The rDB M7 campaign writes into the same
-/// directory, so the M6 file-set check above covers only the files not named `rdb-*`, unchanged.
+/// **Where the artifacts are read (ruling L-R186bt, 2026-10-05).** The children run without
+/// `RETCD_EVIDENCE`, so they write into their own log folders, never into `docs/evidence/`; this
+/// row reads each child's folder ([`child_evidence_dir`]). Only the README, and the listing check
+/// over committed `docs/evidence/rdb-*.json`, still read `docs/evidence/`. Before the ruling the
+/// second run's "overwrite in place" was checked by mtime on the shared directory; each run now
+/// has a fresh folder, so that clause reduces to the file-set check.
+///
+/// **rDB artifacts (ruling V-R32, 2026-09-27).** The rDB M7 campaign writes the same kind of
+/// artifact, so the M6 file-set check above covers only the files not named `rdb-*`, unchanged.
 /// A second check covers the rest against the README's own "## The rDB M7 files" table:
 ///
-/// - every `rdb-*.json` on disk is listed there, so an unlisted artifact fails the row;
+/// - every `rdb-*.json` the campaign run wrote, or committed in `docs/evidence/`, is listed
+///   there, so an unlisted artifact fails the row;
 /// - this row runs the campaign's debug command itself. Every row listed as written by a
 ///   `debug campaign run` or by `every campaign run` must then exist, with an mtime no older than
 ///   that run's start, so a file left behind by an earlier run does not count;
@@ -2202,25 +2233,24 @@ async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"));
 
+    // Each child gets its own log root and writes its artifacts there, never into
+    // docs/evidence (ruling L-R186bt); the roots live until this row returns.
+    let campaign_logs = config_testkit::fs::temp_dir();
     let campaign_started = std::time::SystemTime::now();
-    run_rdb_campaign(&target_dir);
+    run_rdb_campaign(&target_dir, campaign_logs.path());
+    let rdb_dir = child_evidence_dir(campaign_logs.path());
 
-    run_evidence_suite(&target_dir);
-    let evidence_dir = config_testkit::evidence::evidence_dir();
-    let mtimes_after_first: std::collections::BTreeMap<String, std::time::SystemTime> =
-        expected_files
-            .iter()
-            .map(|name| {
-                let path = evidence_dir.join(name);
-                let meta = std::fs::metadata(&path).unwrap_or_else(|e| {
-                    panic!(
-                        "evidence file {} missing after the run: {e}",
-                        path.display()
-                    )
-                });
-                (name.clone(), meta.modified().expect("mtime is supported"))
-            })
-            .collect();
+    let first_logs = config_testkit::fs::temp_dir();
+    run_evidence_suite(&target_dir, first_logs.path());
+    let evidence_dir = child_evidence_dir(first_logs.path());
+    for name in &expected_files {
+        let path = evidence_dir.join(name);
+        assert!(
+            path.is_file(),
+            "evidence file {} missing after the run",
+            path.display()
+        );
+    }
 
     let mut git_shas = std::collections::BTreeSet::new();
     for name in &expected_files {
@@ -2249,39 +2279,40 @@ async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
         "the evidence files from one run do not all name the same git_sha: {git_shas:?}"
     );
 
-    // Re-run: every file must be overwritten (mtime does not go backwards) and the file set must
-    // be unchanged — no stale file from a renamed row survives, and no new one appears.
-    run_evidence_suite(&target_dir);
-    for name in &expected_files {
-        let path = evidence_dir.join(name);
-        let meta = std::fs::metadata(&path).unwrap_or_else(|e| {
-            panic!(
-                "evidence file {} missing after the second run: {e}",
-                path.display()
-            )
-        });
-        let modified = meta.modified().expect("mtime is supported");
-        assert!(
-            modified >= mtimes_after_first[name],
-            "{name} was not rewritten by the second run; a re-run must still touch every file"
-        );
-    }
-    let present_after: std::collections::BTreeSet<String> = std::fs::read_dir(&evidence_dir)
-        .expect("read docs/evidence")
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    // Re-run: the second run writes the same file set — no stale file from a renamed row, and no
+    // new one. Each run has its own folder, so the set is exactly what that run wrote.
+    let second_logs = config_testkit::fs::temp_dir();
+    run_evidence_suite(&target_dir, second_logs.path());
+    let evidence_dir = child_evidence_dir(second_logs.path());
+    let json_names = |dir: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect()
+    };
+    let present_after: std::collections::BTreeSet<String> = json_names(&evidence_dir)
+        .into_iter()
+        .chain(json_names(&rdb_dir))
         .collect();
-    let (present_rdb, present_m6): (
+    let (mut present_rdb, present_m6): (
         std::collections::BTreeSet<String>,
         std::collections::BTreeSet<String>,
     ) = present_after
         .into_iter()
         .partition(|name| name.starts_with(RDB_EVIDENCE_PREFIX));
+    // The README promises every committed `docs/evidence/rdb-*.json` is listed too, including
+    // one only a published (release) run writes.
+    present_rdb.extend(
+        json_names(&config_testkit::evidence::docs_evidence_dir())
+            .into_iter()
+            .filter(|name| name.starts_with(RDB_EVIDENCE_PREFIX)),
+    );
     let expected_set: std::collections::BTreeSet<String> = expected_files.iter().cloned().collect();
     assert_eq!(
         present_m6, expected_set,
-        "docs/evidence/*.json does not match the README's own file table after a fresh run (a \
+        "the evidence run's *.json does not match the README's own file table after a fresh run (a \
          stale file survived a renamed row, or the README is out of date)"
     );
 
@@ -2293,13 +2324,13 @@ async fn e2e_47_daemon_evidence_run_produces_every_artifact() {
         .collect();
     assert!(
         unlisted.is_empty(),
-        "docs/evidence holds rDB artifacts that the README's {RDB_EVIDENCE_TABLE:?} table does \
+        "the campaign run wrote rDB artifacts that the README's {RDB_EVIDENCE_TABLE:?} table does \
          not list: {unlisted:?}"
     );
     for (name, written_by) in &rdb_listed {
         match written_by.as_str() {
             "debug campaign run" | "every campaign run" => {
-                let path = evidence_dir.join(name);
+                let path = rdb_dir.join(name);
                 let meta = std::fs::metadata(&path).unwrap_or_else(|e| {
                     panic!(
                         "{name} is listed in the rDB table as written by {written_by:?}, but \

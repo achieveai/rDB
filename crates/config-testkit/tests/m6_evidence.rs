@@ -1,9 +1,10 @@
 //! M6 §7 evidence rows (test plan M6-105..M6-116; ADR-0031, TA-61..TA-63).
 //!
-//! Every row here writes one JSON artifact to `docs/evidence/` through
-//! [`config_testkit::evidence::write_evidence`] and asserts **invariants only**. No row asserts
-//! a numeric threshold: the plan's §7 preamble (anti-flake rules 23 and 37) makes a
-//! cross-host-comparable number something this harness records, never something it gates on.
+//! Every row here writes one JSON artifact through [`config_testkit::evidence::write_evidence`]
+//! (into the run's log folder, or `docs/evidence/` under `RETCD_EVIDENCE=1`) and asserts
+//! **invariants only**. No row asserts a numeric threshold: the plan's §7 preamble (anti-flake
+//! rules 23 and 37) makes a cross-host-comparable number something this harness records, never
+//! something it gates on.
 //! Where ADR-0031 phrases an invariant numerically — "p99 apply latency under 2x the row's own
 //! single-watcher baseline" — the ratio is computed and written into `values` as a recorded
 //! observation plus a boolean, and the row's own pass/fail rests on the structural predicates
@@ -38,8 +39,8 @@
 //! rule forbids. `security_cases()` still enumerates the case in M6-109's matrix, pointing at
 //! the row that drives it.
 //!
-//! The three validator rows deliberately assert over *whatever is in `docs/evidence/` when they
-//! run* plus a synthetic artifact they build themselves: `cargo test` runs this binary's tests
+//! The three validator rows deliberately assert over *whatever is in this run's evidence folder
+//! when they run* plus a synthetic artifact they build themselves: `cargo test` runs this binary's tests
 //! concurrently, so a validator that demanded the full set would be asserting on test ordering.
 //! "All six files exist" is E2E-47's assertion, and `scripts/evidence-gate.ps1` is the gate.
 
@@ -1589,8 +1590,8 @@ async fn m6_112_evidence_gossip_cannot_mutate_membership_or_configuration() {
 // M6-113 / M6-114 / M6-115 / M6-116 — the contract the artifacts themselves must keep
 // ---------------------------------------------------------------------------------------
 
-/// M6-113: every file in `docs/evidence/` parses, carries every TA-61 field, and rejects an
-/// unknown top-level key.
+/// M6-113: every file in this run's evidence folder parses, carries every TA-61 field, and
+/// rejects an unknown top-level key.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m6_113_evidence_files_validate_against_the_schema() {
     for (name, (path, artifact)) in evidence::read_all() {
@@ -1689,7 +1690,7 @@ async fn m6_116_evidence_carries_no_production_claim() {
         );
     }
 
-    let readme = evidence::evidence_dir().join("README.md");
+    let readme = evidence::docs_evidence_dir().join("README.md");
     let text = std::fs::read_to_string(&readme)
         .unwrap_or_else(|e| panic!("read {}: {e}", readme.display()))
         .to_lowercase();

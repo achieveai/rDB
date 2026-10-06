@@ -3,8 +3,8 @@
 **These are dev-host numbers. They are not a production claim.**
 
 Every `*.json` file in this directory was written by one test row on whatever machine last ran
-the M6 evidence suite, or, for the `rdb-*` files, the rDB M7 campaign (see "The rDB M7 files"
-below). A production designation requires re-running the suite on the target
+the M6 evidence suite, or, for the `rdb-*` files, the rDB M7 campaign or the rdb-storage S1
+conformance test (see "The rDB M7 files" below). A production designation requires re-running the suite on the target
 hardware and reading the numbers it produces there. That decision belongs to whoever operates
 the deployment; this repository does not make it on their behalf (ADR-0031, spec §20, §12.2).
 
@@ -28,22 +28,30 @@ Each artifact repeats the same sentence in its `disclaimer` field, emitted by on
   generic label: check it before publishing an artifact outside the team.
 - The artifacts committed here were written by whichever run last produced them, so their
   `git_sha` is the commit that run stood on and not necessarily the tip of the branch you are
-  reading, and `dirty: true` records that that tree had uncommitted changes. Running the suite
-  rewrites every file in this directory in place, which leaves the working tree dirty; that is
-  the intended behaviour, not a failure. Re-run and re-commit when you want the numbers to
-  speak for a specific commit.
+  reading, and `dirty: true` records that that tree had uncommitted changes. Only a run with
+  `RETCD_EVIDENCE=1` rewrites the files in this directory; re-run that way and re-commit when
+  you want the numbers to speak for a specific commit.
 
 ## Running the suite
 
+An ordinary run leaves this directory alone. It writes each artifact to `evidence/` inside the
+test binary's own log folder, `<logs>/<run id>/evidence/<name>.json`, where `<logs>` is
+`RETCD_TEST_LOG_DIR` (the `logs=` folder `scripts/gate.sh` prints) or, unset,
+`<target>/test-logs`. Only a run with `RETCD_EVIDENCE=1` writes here (ruling L-R186bt).
+
 ```powershell
 # Reduced scale. This is what ordinary CI runs: the rows are not `#[ignore]`d, so the code
-# paths stay exercised on every run.
+# paths stay exercised on every run. Artifacts go to the run's log folder, not here.
 $env:CARGO_INCREMENTAL=0; cargo test -p config-testkit --test m6_evidence
 
-# Full scale, on hardware you intend to quote.
+# Full scale, on hardware you intend to quote. Rewrites the files in this directory.
 $env:RETCD_EVIDENCE=1; cargo test -p config-testkit --test m6_evidence
 pwsh scripts/evidence-gate.ps1          # fails if any artifact claims full_scale: false
 ```
+
+To publish a reduced-scale result, copy the file from `<logs>/<run id>/evidence/` into this
+directory by hand and commit it (ruling L-R186bx). The file keeps its own `full_scale` and
+`scale_factor`, so a reader can see what it is.
 
 `scripts/evidence-gate.ps1` exits non-zero when `RETCD_EVIDENCE=1` is set and any artifact in
 this directory carries `full_scale: false` — a full-scale request that silently degraded is a
@@ -117,3 +125,10 @@ this.
   queue accounting instead, which is the oracle the test plan names anyway.
 - Spec §12.2's 60-minute RPO and 60-minute RTO figures remain **provisional planning
   assumptions**. `rpo-rto.json` measures; it does not claim them.
+- `rdb-m7-campaign.json` and `rdb-m7-coverage.json` record `scale_factor: 0` because no
+  generated seed runs through the bridge yet (owed: M7V-55, M7V-75, V-R33), so
+  `scripts/evidence-gate.ps1` fails on them under `RETCD_EVIDENCE=1`.
+- `rdb-m8-storage-conformance.json` is committed at reduced scale (32 of 10,000 seeds,
+  `scale_factor: 0.0032`), so `scripts/evidence-gate.ps1` fails on it under
+  `RETCD_EVIDENCE=1` until it is regenerated with
+  `RETCD_EVIDENCE=1 cargo test -p rdb-storage --test s1_conformance`.
