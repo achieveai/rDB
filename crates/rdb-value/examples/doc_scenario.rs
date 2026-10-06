@@ -36,7 +36,8 @@
 //! compiles with (ADR-rdb-0016 §4), in 1,024..=196,608; a size outside that is refused (exit 2)
 //! and never saved. Given on a store's first command, it is written to the store's head line;
 //! a later different value is refused (exit 2). Without it a store uses 131,072. `drop` reads the
-//! root's kind and drops a list or a collection.
+//! root's kind and drops a list or a collection. `get` reads a document and `items` reads a list;
+//! a `get` on a list's key is refused `KindMismatch`.
 //!
 //! <id> is an object id: plain text, or hex:<hex> for any bytes. Every object lives at
 //! tenant 1, affinity 1, under the root key the library builds (ADR-rdb-0013 §1).
@@ -152,6 +153,7 @@ doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 <id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
 --block-max N, beside --store, sets a new store's list block size, 1024..=196608 (default 131072).\n\
+`get` reads a document and `items` reads a list (a `get` on a list is KindMismatch).\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
 
 // Input limits. Every text input is read through `Read::take` at one of these, so an oversized
