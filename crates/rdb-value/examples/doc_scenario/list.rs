@@ -361,6 +361,30 @@ pub fn dump_record(
     if let Some(slot) = slot {
         line.raw("slot", slot.to_string());
     }
+    // A base or slot of another kind is named as a read names it, damage to its block, not the
+    // `KindMismatch` an apply gives (review A3).
+    if sub == Sub::Block {
+        let found = envelope::open(raw).map_err(corrupt_envelope)?.kind;
+        let fault = match slot {
+            None if found != Kind::ListBlock => Some(BlockFault::NotABlock { found }),
+            Some(slot) if found != Kind::ListSlot => {
+                Some(match pending_op(snapshot, root, id, slot) {
+                    Ok(Some(op)) => BlockFault::OpBad {
+                        op,
+                        fault: SlotFault::NotASlot { found },
+                    },
+                    _ => BlockFault::Shape("a list change slot record is not a slot"),
+                })
+            }
+            _ => None,
+        };
+        if let Some(fault) = fault {
+            return Err(Failure::from(ValueError::Corrupt(Corrupt::Block {
+                id,
+                fault,
+            })));
+        }
+    }
     let value = check_record(sub, slot, raw)?;
     line.extend(envelope_fields(raw)?);
     line.raw("value", render(&value));
@@ -425,8 +449,14 @@ fn pending_op(
         return Err("unknown: the block's base does not read".to_owned());
     };
     let slots = u64::from(LIST_SLOTS);
-    // The first op no after `folded` that this slot holds; pending only up to `head`.
-    let op = folded + 1 + (u64::from(slot) + slots - (folded + 1) % slots) % slots;
+    // The first op no after `folded` that this slot holds; pending only up to `head`. Past
+    // `u64::MAX` there is none, and a read refuses such a base (review A2).
+    let op = folded
+        .checked_add(1)
+        .and_then(|first| first.checked_add((u64::from(slot) + slots - first % slots) % slots));
+    let Some(op) = op else {
+        return Err("unknown: the block's base does not read".to_owned());
+    };
     Ok((op <= head).then_some(op))
 }
 

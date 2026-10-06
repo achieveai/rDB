@@ -587,7 +587,21 @@ fn open_root(bytes: &[u8]) -> Result<Root, ValueError> {
         if block.n >= next {
             return Err(corrupt_root("a list root's block n is not below next"));
         }
+        // No write makes this head, and a block read counts its op nos up to `head + 1`
+        // (review A2).
+        if block.head == u64::MAX {
+            return Err(corrupt_root(
+                "a list root's block head is the largest there is",
+            ));
+        }
         counted = counted.checked_add(block.count).ok_or_else(overflow)?;
+    }
+    // A compile keys its work by n and walks blocks by position, so one n named twice would
+    // index past a block's entries (review A1).
+    let mut named: Vec<u64> = blocks.iter().map(|block| block.n).collect();
+    named.sort_unstable();
+    if named.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(corrupt_root("a list root names one block twice"));
     }
     if blocks.len() > 1 && blocks.iter().any(|block| block.count == 0) {
         return Err(corrupt_root(
@@ -1048,7 +1062,12 @@ impl Draft<'_> {
             || corrupt_root("a list's count or bytes, or a block's count or head, leaves u64");
         let block = &mut self.list.blocks[i];
         block.count = shift(block.count, count).ok_or_else(overflow)?;
-        block.head = block.head.checked_add(1).ok_or_else(overflow)?;
+        // A read refuses a head of `u64::MAX` as damage, so no write makes one.
+        block.head = block
+            .head
+            .checked_add(1)
+            .filter(|head| *head < u64::MAX)
+            .ok_or_else(overflow)?;
         self.list.count = shift(self.list.count, count).ok_or_else(overflow)?;
         self.list.bytes = shift(self.list.bytes, bytes).ok_or_else(overflow)?;
         Ok(())

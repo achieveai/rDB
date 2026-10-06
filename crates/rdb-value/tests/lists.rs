@@ -2573,6 +2573,28 @@ fn damage_rows() -> Vec<DamageRow> {
             })),
         ),
         row(
+            "R15 one block named twice",
+            |k| {
+                edit_q_root(k, |m| {
+                    m.insert(field("blocks"), refs(&[[0, 23, 23], [0, 23, 23]]));
+                    m.insert(field("count"), uint(46));
+                })
+            },
+            QRoot(root("a list root names one block twice")),
+        ),
+        row(
+            "R16 a block head of u64::MAX",
+            |k| {
+                edit_q_root(k, |m| {
+                    m.insert(field("blocks"), refs(&[[0, 23, u64::MAX]]));
+                });
+                edit_q_base(k, |m| {
+                    m.insert(field("folded"), uint(u64::MAX - 1));
+                });
+            },
+            QRoot(root("a list root's block head is the largest there is")),
+        ),
+        row(
             "D11 an empty block beside others",
             |k| {
                 edit_q_root(k, |m| {
@@ -4059,4 +4081,73 @@ fn w3_a_retire_or_merge_back_of_a_block_with_pending_slots_leaves_none_of_it() {
         );
         assert_eq!(values(&k, &root), model, "merge {merge}");
     }
+}
+
+// ---- Review L-R186ee: a root naming one block twice, a head at u64::MAX ---------------------
+
+/// A one-item list `todo` whose root is edited by `edit`.
+fn one_item_with_root(edit: impl FnOnce(&mut Map, [u64; 3])) -> Kernel {
+    let root = todo();
+    let mut k = Kernel::new();
+    made(&mut k, &root, MIN_BLOCK_MAX, &["a"]);
+    let [block] = block_refs(&k, &root)[..] else {
+        panic!("one block")
+    };
+    edit_map(&mut k, &root.to_bytes(), Kind::List, |m| edit(m, block));
+    k
+}
+
+/// Review A1: a root naming one block `n` twice made `compile_list` panic. The compile keyed its
+/// work by `n` but walked blocks by position, so the second Remove indexed past the entries. It
+/// is root damage now: the compile and the read both refuse it by name.
+#[test]
+fn l_r186ee_a_root_naming_one_block_twice_is_refused_not_a_panic() {
+    let root = todo();
+    let k = one_item_with_root(|m, block| {
+        m.insert(field("blocks"), refs(&[block, block]));
+        m.insert(field("count"), uint(2));
+    });
+    let want = Err(ValueError::Corrupt(Corrupt::ListRoot(
+        "a list root names one block twice",
+    )));
+    let ops = [ListOp::Remove { at: 1 }, ListOp::Remove { at: 0 }];
+    let compiled = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Version(version_of(&k, &root)),
+        MIN_BLOCK_MAX,
+        &ops,
+    );
+    assert_eq!(unit(compiled), want, "compile");
+    let read = items(&k.snapshot(), &root, Start::Position(0), usize::MAX);
+    assert_eq!(unit(read), want, "items");
+}
+
+/// Review A2: a read refuses a block head of `u64::MAX` (damage row R16), so a write must never
+/// make one. A push onto a block at head `u64::MAX − 1` is refused as the other root counters
+/// are when they would leave their range, and writes nothing.
+#[test]
+fn l_r186ee_a_write_never_makes_a_block_head_of_u64_max() {
+    let root = todo();
+    let mut k = one_item_with_root(|m, [n, count, _]| {
+        m.insert(field("blocks"), refs(&[[n, count, u64::MAX - 1]]));
+    });
+    let base = block_key(&root, u128::from(block_refs(&k, &root)[0][0]));
+    edit_map(&mut k, &base, Kind::ListBlock, |m| {
+        m.insert(field("folded"), uint(u64::MAX - 1));
+    });
+    assert_eq!(values(&k, &root), texts(&["a"]), "the edited list reads");
+    let pushed = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Version(version_of(&k, &root)),
+        MIN_BLOCK_MAX,
+        &[ListOp::Push(text("b"))],
+    );
+    assert_eq!(
+        unit(pushed),
+        Err(ValueError::Corrupt(Corrupt::ListRoot(
+            "a list's count or bytes, or a block's count or head, leaves u64"
+        )))
+    );
 }

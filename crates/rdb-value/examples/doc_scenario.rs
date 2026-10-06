@@ -1158,13 +1158,6 @@ impl Store {
                 ))
             }
         }
-        if head.get("node_max").is_some() {
-            return Err(bad(
-                n,
-                "a store from the tree-list build (\"node_max\"): its list records are pages, \
-                 not blocks; start a new store",
-            ));
-        }
         store.block_max = match head.get("block_max") {
             None => None,
             Some(v) => Some(
@@ -2775,6 +2768,116 @@ mod tests {
             got[&6]
         );
         assert_eq!(got[&5].0, "pending");
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    // ---- Review L-R186ee: the dump of a list block or slot -------------------------------------
+
+    /// A store with list `todo` at its default block size: 20 items folded in its base, and one
+    /// push after, pending in its slot.
+    fn one_pending_slot(name: &str) -> (PathBuf, PathBuf) {
+        let dir = scratch(name);
+        let store = dir.join("s.jsonl");
+        let names: Vec<String> = (0..20).map(|i| format!("\"{i:0>16}\"")).collect();
+        let mut create = vec!["todo", "--absent"];
+        for name in &names {
+            create.extend(["push", name.as_str()]);
+        }
+        list::write_cmd(&store, &args(&create)).expect("create");
+        list::write_cmd(&store, &args(&["todo", "--expect", "1", "push", "\"p\""])).expect("push");
+        let slots = dumped(&store)
+            .into_iter()
+            .filter(|r| r["sub"] == "slot")
+            .count();
+        assert_eq!(slots, 1, "one pending slot");
+        (dir, store)
+    }
+
+    /// Reseal every record `edit` matches by its sub and slot, as `kind` holding `payload(old)`.
+    fn reseal_list_records(
+        store: &FsPath,
+        matches: impl Fn((Sub, Option<u8>)) -> bool,
+        kind: impl Fn(Kind) -> Kind,
+        payload: impl Fn(Value) -> Value,
+    ) {
+        edit_records(store, |records| {
+            for (key, _, raw) in records.iter_mut() {
+                if matches(sub_slot(key)) {
+                    let opened = envelope::open(raw).expect("envelope");
+                    let value = payload(cbor::decode(opened.payload).expect("cbor"));
+                    *raw =
+                        envelope::seal(kind(opened.kind), &cbor::encode(&value).expect("encode"))
+                            .expect("seal");
+                }
+            }
+        });
+    }
+
+    /// The `error` of each list block and slot line of `dump`, by `block` or `slot`.
+    fn list_errors(store: &FsPath) -> std::collections::BTreeMap<String, String> {
+        dumped(store)
+            .into_iter()
+            .filter(|r| r["sub"] == "block" || r["sub"] == "slot")
+            .map(|r| {
+                let sub = r["sub"].as_str().expect("sub").to_owned();
+                (sub, r["error"].as_str().unwrap_or("").to_owned())
+            })
+            .collect()
+    }
+
+    /// Review A3: a block base or change slot of the wrong envelope kind dumped as
+    /// `KindMismatch`, while every read names it as damage to the block: `NotABlock` for a base,
+    /// and `OpBad` with `NotASlot` for a pending slot. The dump now says what a read says.
+    #[test]
+    fn l_r186ee_dump_names_a_block_or_slot_of_the_wrong_kind_as_a_read_does() {
+        let (dir, store) = one_pending_slot("ree-a3-kind");
+        reseal_list_records(
+            &store,
+            |(sub, _)| sub == Sub::Block,
+            |kind| match kind {
+                Kind::ListBlock => Kind::ListSlot,
+                _ => Kind::ListBlock,
+            },
+            |value| value,
+        );
+        let got = list_errors(&store);
+        assert!(
+            got["block"].contains("fault: NotABlock { found: ListSlot }"),
+            "{got:?}"
+        );
+        assert!(
+            got["slot"].contains("fault: OpBad { op: 21, fault: NotASlot { found: ListBlock } }"),
+            "{got:?}"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Review A2: the dump worked out a slot's pending op no as `folded + 1 + …`, which
+    /// overflowed for a base at `folded` = `u64::MAX`. A read refuses that base, so the slot's
+    /// state is that its base does not read.
+    #[test]
+    fn l_r186ee_dump_of_a_slot_under_a_base_folded_at_u64_max_prints_a_state() {
+        let (dir, store) = one_pending_slot("ree-a2-folded");
+        reseal_list_records(
+            &store,
+            |found| found == (Sub::Block, None),
+            |kind| kind,
+            |value| match value {
+                Value::Map(mut fields) => {
+                    fields.insert(MapKey::new("folded"), Value::Integer(Int::from(u64::MAX)));
+                    Value::Map(fields)
+                }
+                other => panic!("a base is a map: {other:?}"),
+            },
+        );
+        let slot = dumped(&store)
+            .into_iter()
+            .find(|r| r["sub"] == "slot")
+            .expect("the slot line");
+        assert_eq!(
+            slot["state"], "unknown: the block's base does not read",
+            "{slot}"
+        );
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 }

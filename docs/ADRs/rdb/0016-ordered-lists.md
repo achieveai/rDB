@@ -177,7 +177,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 ### 7. Damage: refused, never served (ADR-rdb-0013 decision 11); every row is repaired by `clear_object` (M9)
 | Damage | Error |
 |---|---|
-| root does not open; bad payload; not exactly the 6 keys; `blocks` empty or > 512; a count-0 block beside others; count ≠ Σ blocks' counts; `n` ≥ `next`; overflow | `Corrupt(Envelope / Codec / ListRoot(..))` |
+| root does not open; bad payload; not exactly the 6 keys; `blocks` empty or > 512; a count-0 block beside others; count ≠ Σ blocks' counts; `n` ≥ `next`; one block `n` named twice; a block `head` of `u64::MAX`; overflow | `Corrupt(Envelope / Codec / ListRoot(..))` |
 | block missing, does not open, not kind `0x07`, bad CBOR or shape, payload > 262,144, newer than root, `folded` > `head`, `head − folded` > 240, replayed count ≠ root's, entry neither `n` nor `[n, value]` | `Corrupt(Block{id, Missing / Envelope / NotABlock{found} / Codec / Shape(..) / TooLarge / NewerThanRoot})` |
 | pending slot missing or holding another op no; slot not kind `0x08`, bad CBOR or shape; an op's `at` out of range | `Corrupt(Block{id, OpMissing{op} / OpBad{op} / OpOutOfRange{op}})` |
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
@@ -185,7 +185,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 | records under `0x02`/`0x03` with no root, at a fresh id, or beside an empty list at drop | `Corrupt(OrphanElement)` |
 | a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on every path: list, map and set reads, writes and drop; document read and compile; blob reads, publish and delete; blob GC; `doc_scenario`'s dump |
 - `BlockFault` replaces rev 4's `PageFault`. An unknown kind, codec or format stays written-by-a-newer-build.
-- **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one `n` twice; a stale
+- **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one item `n` in two entries; a stale
   slot under a live block; a wrong `bytes` total. The test invariant checker covers each.
 
 ### 8. Every list request names its generation (kept)
