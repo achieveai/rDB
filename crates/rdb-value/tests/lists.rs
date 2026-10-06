@@ -3034,7 +3034,7 @@ const Q_ITEM_AT: u64 = 22;
 fn w3_every_damage_row_is_refused_by_name_on_every_path() {
     let store = damage_store();
     let rows = damage_rows();
-    assert!(rows.len() >= 60, "{} rows", rows.len());
+    assert_eq!(rows.len(), 65, "every damage row, counted");
     let mut wrong = Vec::new();
     for (name, harm, want) in &rows {
         let mut k = store.clone();
@@ -3832,6 +3832,19 @@ fn w3_at_the_block_cap_a_fold_is_written_unsplit_unless_the_ops_grew_it() {
         ),
         "{push:?}"
     );
+    // Review B3: an op that grows an under-B block at the cap still compiles; the cap refuses
+    // only a fold over B that would need a 513th block.
+    write(
+        &mut k,
+        &root,
+        MIN_BLOCK_MAX,
+        &[ListOp::Insert {
+            at: 0,
+            value: text("y"),
+        }],
+    );
+    assert_eq!(block_index(&k, &root).len(), 512, "the insert into block 0");
+    assert_eq!(values(&k, &root)[0], text("y"));
 }
 
 /// The payload length of block `n`'s base, and its `folded`.
@@ -4149,5 +4162,107 @@ fn l_r186ee_a_write_never_makes_a_block_head_of_u64_max() {
         Err(ValueError::Corrupt(Corrupt::ListRoot(
             "a list's count or bytes, or a block's count or head, leaves u64"
         )))
+    );
+}
+
+// ---- Review L-R186ee: halves by bytes, and a merge-back reads no item record ----------------
+
+/// Review B1: a fold over B in a block that is not the last splits where the two halves' bytes
+/// are closest, not at half the count. 23 throwaway items keep every later n two bytes wide, as
+/// in [`w2_halves_takes_the_first_of_two_equal_cuts`]. Three 230-char values (inline: the limit
+/// is 240 at B = 1,024) inserted at the front of the first of two blocks of 40-char values fold
+/// it over B. The cut is checked against the cut computed here from each entry's encoded length.
+#[test]
+fn l_r186ee_halves_cuts_a_block_by_bytes_not_by_count() {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let mut k = Kernel::new();
+    let zs: Vec<String> = (0..23).map(|i| format!("z{i}")).collect();
+    let zs: Vec<&str> = zs.iter().map(String::as_str).collect();
+    made(&mut k, &root, B, &zs);
+    write(&mut k, &root, B, &vec![ListOp::Remove { at: 0 }; 23]);
+    let pushes: Vec<ListOp> = (0..30)
+        .map(|i| ListOp::Push(text(&format!("{i:0>40}"))))
+        .collect();
+    write(&mut k, &root, B, &pushes);
+    assert_eq!(block_index(&k, &root).len(), 2, "an end split");
+    let big: Vec<ListOp> = (0..3)
+        .map(|i| ListOp::Insert {
+            at: 0,
+            value: text(&format!("{i}{}", "b".repeat(229))),
+        })
+        .collect();
+    write(&mut k, &root, B, &big);
+    let blocks = block_index(&k, &root);
+    assert_eq!(
+        blocks.len(),
+        3,
+        "the first block split in halves: {blocks:?}"
+    );
+    let total = blocks[0].1 + blocks[1].1;
+    // The split block's entries, in order: the first two blocks now. Each is `[n, value]`.
+    let page = items(&k.snapshot(), &root, Start::Position(0), index(total)).expect("read");
+    let sizes: Vec<usize> = page
+        .items
+        .iter()
+        .map(|item| {
+            assert!(item.inline, "every item here is inline");
+            let n = u64::try_from(item.id & u128::from(u64::MAX)).expect("low 64 bits");
+            let entry = Value::Array(vec![uint(n), item.value.clone()]);
+            encode(&entry).expect("encode").len()
+        })
+        .collect();
+    let all: usize = sizes.iter().sum();
+    let (mut best, mut cut, mut left) = (usize::MAX, 0, 0);
+    for (k, size) in sizes.iter().enumerate().take(sizes.len() - 1) {
+        left += size;
+        let gap = (2 * left).abs_diff(all);
+        if gap < best {
+            (best, cut) = (gap, k + 1);
+        }
+    }
+    assert_eq!(
+        blocks[0].1,
+        len_u64(cut),
+        "the byte-balanced cut: {sizes:?}"
+    );
+    assert_ne!(blocks[0].1, total / 2, "not half the count");
+}
+
+/// Review B2: a merge-back moves the right block's entries as they stand and reads no item
+/// record. In a records list of two blocks, the item record of an entry in the right block is
+/// damaged and no op names it. Removes at the front, at most 100 a delta (each deletes its item
+/// record, and a request holds at most 255 writes), shrink the left block until a fold under B/4
+/// merges it back with its right neighbour: every compile succeeds, one block is left, and the
+/// damaged item still reads as damage.
+#[test]
+fn l_r186ee_a_merge_back_reads_no_item_record() {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let mut k = Kernel::new();
+    two_block_records_list(&mut k, &root, B, 16, 100);
+    let first = block_index(&k, &root)[0].1;
+    let page = items(&k.snapshot(), &root, Start::Position(first), 1).expect("read");
+    damage(&mut k, &item_key(&root, page.items[0].id));
+    let mut removed = 0;
+    while block_index(&k, &root).len() == 2 && first - removed > 5 {
+        let batch = (first - removed - 5).min(100);
+        write(
+            &mut k,
+            &root,
+            B,
+            &vec![ListOp::Remove { at: 0 }; index(batch)],
+        );
+        removed += batch;
+    }
+    assert_eq!(
+        block_index(&k, &root).len(),
+        1,
+        "merged back after {removed} removes"
+    );
+    let read = items(&k.snapshot(), &root, Start::Position(first - removed), 1);
+    assert!(
+        matches!(read, Err(ValueError::Corrupt(_))),
+        "the damage stays: {read:?}"
     );
 }
