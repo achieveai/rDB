@@ -14,7 +14,8 @@ use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::envelope::{open, seal, EnvelopeError, Kind};
 use rdb_value::keys::{parse, root_key, KeyError, RootKey, Sub};
 use rdb_value::list::{
-    compile_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_BLOCK_MAX, MIN_BLOCK_MAX,
+    compile_list, create_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_BLOCK_MAX,
+    MIN_BLOCK_MAX,
 };
 use rdb_value::testing::CountingSnapshot;
 use rdb_value::value::{Map, Value};
@@ -935,6 +936,105 @@ fn n4_limit_0_reads_the_root_only_from_any_position() {
     assert_eq!(opened(2), opened(0), "from 2 and from 0");
 }
 
+/// Every block's `bytes` in the root against its items, measured with the codec: the sum of each
+/// item's encoded value, which is its inline encoding or its record's payload alike (ADR-rdb-0016
+/// §1). A read checks only that the blocks sum to the root's `bytes`, so a split that
+/// mis-sizes what it moves passes every read and shows up here only. `values`: the list's
+/// values in order, as read.
+fn assert_block_bytes(k: &Kernel, root: &RootKey, values: &[Value], at: &str) {
+    let mut rest = values;
+    for (i, (count, bytes)) in block_shape(k, root).into_iter().enumerate() {
+        let (held, after) = rest.split_at(index(count));
+        let measured: usize = held.iter().map(|v| encode(v).expect("encodes").len()).sum();
+        assert_eq!(bytes, len_u64(measured), "{at}: block {i}'s bytes");
+        rest = after;
+    }
+    assert!(rest.is_empty(), "{at}: the blocks hold every item");
+}
+
+/// D3 (tester W2 BLOCKER, basis 96a42b2), repro 1, at B = 1,024 (inline limit 240): four
+/// 230-char pushes, then one delta `push <230> push <300>`. The fold is over B and splits at
+/// its end, moving the new 300-char item, whose record exists only in this compile's overlay.
+/// It was refused `ItemMissing { id: 6 }`, and every later push that split the same way.
+#[test]
+fn d3_an_end_split_that_moves_a_new_out_of_line_item_compiles() {
+    let root = todo();
+    let (a, l) = ("a".repeat(230), "L".repeat(300));
+    let mut k = Kernel::new();
+    made(&mut k, &root, MIN_BLOCK_MAX, &[]);
+    write(
+        &mut k,
+        &root,
+        MIN_BLOCK_MAX,
+        &vec![ListOp::Push(text(&a)); 4],
+    );
+    write(
+        &mut k,
+        &root,
+        MIN_BLOCK_MAX,
+        &[ListOp::Push(text(&a)), ListOp::Push(text(&l))],
+    );
+    let mut want = vec![text(&a); 5];
+    want.push(text(&l));
+    assert_eq!(values(&k, &root), want);
+    assert_eq!(block_shape(&k, &root).len(), 2, "the push split the block");
+    assert_block_bytes(&k, &root, &want, "after the split");
+}
+
+/// D3 repro 2: a records list at B = 1,024, one push per compile. Push 429 is the first whose
+/// fold is over B; the end split moves the item it pushes, which has no stored record yet. It
+/// was refused `ItemMissing { id: 429 }`, and the list stayed one block of 428 items for good.
+#[test]
+fn d3_a_records_list_splits_on_a_single_push() {
+    let root = todo();
+    let mut k = Kernel::new();
+    let made = create_list(&k.snapshot(), &root, true, MIN_BLOCK_MAX, &[]).expect("create");
+    k.commit(made.compiled());
+    let mut want = Vec::new();
+    for i in 1..=430 {
+        let value = text(&format!("x{i}"));
+        write(&mut k, &root, MIN_BLOCK_MAX, &[ListOp::Push(value.clone())]);
+        want.push(value);
+    }
+    assert_eq!(values(&k, &root), want);
+    assert_eq!(block_shape(&k, &root).len(), 2, "push 429 split the block");
+    assert_block_bytes(&k, &root, &want, "after the split");
+}
+
+/// The same gap, silent: a stored out-of-line item replaced in the delta that then moves it.
+/// `[a, a, a, a, L]` (L 300 chars, out of line) takes `insert 0 a, replace 5 M` (M 600 chars).
+/// The fold is over B and the end split moves `[a, M]`. Sized from the snapshot, M counted 302
+/// bytes, not 602: the new block's `bytes` was 300 short and the kept one 300 over, and since
+/// they still summed to the root's, every read passed.
+#[test]
+fn d3_a_split_sizes_an_item_replaced_in_the_same_delta_as_replaced() {
+    let root = todo();
+    let (a, l, m) = ("a".repeat(230), "L".repeat(300), "M".repeat(600));
+    let mut k = Kernel::new();
+    made(&mut k, &root, MIN_BLOCK_MAX, &[&a, &a, &a, &a, &l]);
+    assert_eq!(block_shape(&k, &root).len(), 1, "one block before");
+    write(
+        &mut k,
+        &root,
+        MIN_BLOCK_MAX,
+        &[
+            ListOp::Insert {
+                at: 0,
+                value: text(&a),
+            },
+            ListOp::Replace {
+                at: 5,
+                value: text(&m),
+            },
+        ],
+    );
+    let mut want = vec![text(&a); 5];
+    want.push(text(&m));
+    assert_eq!(values(&k, &root), want);
+    assert_eq!(block_shape(&k, &root).len(), 2, "the delta split the block");
+    assert_block_bytes(&k, &root, &want, "after the split");
+}
+
 fn len_u64(n: usize) -> u64 {
     u64::try_from(n).expect("fits u64")
 }
@@ -1008,52 +1108,157 @@ fn locate(counts: &[u64], pos: u64, end: bool) -> usize {
 /// `w2_model_300_seeds`, run by hand: `cargo test -p rdb-value --test lists -- --ignored`.
 #[test]
 fn w2_model_random_deltas_match_a_vec_and_keep_the_block_rules() {
-    model_run(1..=20);
+    model_run(1..=20, SMALL);
 }
 
 /// [`w2_model_random_deltas_match_a_vec_and_keep_the_block_rules`] over 300 seeds (about 17 s).
 #[test]
 #[ignore = "about 17 s in a debug build; run by hand"]
 fn w2_model_300_seeds() {
-    model_run(1..=300);
+    model_run(1..=300, SMALL);
 }
 
-fn model_run(seeds: std::ops::RangeInclusive<u64>) {
+/// D3 (tester W2 BLOCKER): the model above never made an out-of-line item, so it could not see
+/// a split that sizes one from the snapshot. This run draws values small, around the inline
+/// limit (240 at B = 1,024) and well over it, and aims half its moves and replaces at items
+/// added earlier in the same delta, whose records exist only in the compile's overlay.
+#[test]
+fn d3_model_mixed_sizes_and_same_delta_targets() {
+    model_run(1..=12, MIXED);
+}
+
+/// D3 repro 2's shape in the model: a records list, so every item is out of line, with deltas
+/// long enough to fill, split, empty and merge blocks of bare entries.
+#[test]
+fn d3_model_records_list() {
+    model_run(1..=4, RECORDS);
+}
+
+/// Both D3 runs over 300 seeds, by hand: `cargo test -p rdb-value --test lists -- --ignored`.
+#[test]
+#[ignore = "slow in a debug build; run by hand"]
+fn d3_model_300_seeds() {
+    model_run(1..=300, MIXED);
+    model_run(1..=300, RECORDS);
+}
+
+/// What a model run draws. [`SMALL`] is the W2 run unchanged, draw for draw: inline values only.
+#[derive(Clone, Copy)]
+struct Mode {
+    /// A records list: every item out of line.
+    records: bool,
+    /// Values of mixed sizes, and moves and replaces aimed at items added in the same delta.
+    mixed: bool,
+    steps: u64,
+    /// The first `growing` steps add more than they remove.
+    growing: u64,
+    /// Ops per delta: `1 ..= max_ops`.
+    max_ops: u64,
+    /// Percent of ops that add while growing, and after.
+    grow_add: u64,
+    shrink_add: u64,
+}
+
+const SMALL: Mode = Mode {
+    records: false,
+    mixed: false,
+    steps: 60,
+    growing: 30,
+    max_ops: 6,
+    grow_add: 60,
+    shrink_add: 25,
+};
+
+const MIXED: Mode = Mode {
+    mixed: true,
+    ..SMALL
+};
+
+const RECORDS: Mode = Mode {
+    records: true,
+    mixed: true,
+    steps: 30,
+    growing: 12,
+    max_ops: 120,
+    grow_add: 85,
+    shrink_add: 10,
+};
+
+/// A fresh value for the model: in [`SMALL`] as the W2 run drew it; mixed, one of a short
+/// value, one within 16 bytes of the inline limit either side, or one of 300 to 700 bytes.
+fn model_value(rng: &mut Rng, mode: Mode, name: &str) -> Value {
+    let pad = if mode.mixed {
+        match rng.below(3) {
+            0 => rng.below(90),
+            1 => (222 + rng.below(32)).saturating_sub(len_u64(name.len())),
+            _ => 300 + rng.below(400),
+        }
+    } else {
+        rng.below(90)
+    };
+    text(&format!(
+        "{name}{}",
+        "x".repeat(usize::try_from(pad).expect("small"))
+    ))
+}
+
+/// With `mode.mixed`, half the time a position holding an item added in this delta.
+fn model_target(rng: &mut Rng, mode: Mode, fresh: &[bool], hits: &mut usize) -> Option<u64> {
+    if !mode.mixed || rng.below(2) == 0 {
+        return None;
+    }
+    let added: Vec<usize> = (0..fresh.len()).filter(|&i| fresh[i]).collect();
+    if added.is_empty() {
+        return None;
+    }
+    *hits += 1;
+    Some(len_u64(added[index(rng.below(len_u64(added.len())))]))
+}
+
+fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
     const B: usize = MIN_BLOCK_MAX;
     let root = todo();
     let (mut merges, mut retires, mut splits, mut refused, mut steps) = (0, 0, 0, 0, 0);
+    let (mut fresh_hits, mut out_of_line) = (0, 0);
     for seed in seeds {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
         let mut k = Kernel::new();
-        made(&mut k, &root, B, &[]);
+        let made = create_list(&k.snapshot(), &root, mode.records, B, &[]).expect("create");
+        k.commit(made.compiled());
         let mut model: Vec<Value> = Vec::new();
         let mut minted = 0_u64;
-        for step in 0..60_u64 {
-            let growing = step < 30;
+        for step in 0..mode.steps {
+            let growing = step < mode.growing;
             let before = block_index(&k, &root);
             // Each block's post-op count, placed as the compile places ops.
             let mut counts: Vec<u64> = before.iter().map(|(_, count)| *count).collect();
             let mut next = model.clone();
+            // Whether each item of `next` was added by this delta.
+            let mut fresh = vec![false; next.len()];
             let mut ops = Vec::new();
-            for _ in 0..=rng.below(6) {
+            for _ in 0..=rng.below(mode.max_ops) {
                 let len = len_u64(next.len());
                 let roll = rng.below(100);
-                let add = if growing { roll < 60 } else { roll < 25 };
+                let add = roll
+                    < if growing {
+                        mode.grow_add
+                    } else {
+                        mode.shrink_add
+                    };
                 if add || len == 0 {
                     minted += 1;
-                    let value = text(&format!(
-                        "{seed}.{minted}{}",
-                        "x".repeat(usize::try_from(rng.below(90)).expect("small"))
-                    ));
+                    let value = model_value(&mut rng, mode, &format!("{seed}.{minted}"));
                     if rng.below(2) == 0 {
                         *counts.last_mut().expect("a list has a block") += 1;
                         next.push(value.clone());
+                        fresh.push(true);
                         ops.push(ListOp::Push(value));
                     } else {
                         let at = rng.below(len + 1);
                         let i = locate(&counts, at, true);
                         counts[i] += 1;
                         next.insert(index(at), value.clone());
+                        fresh.insert(index(at), true);
                         ops.push(ListOp::Insert { at, value });
                     }
                 } else if roll < 80 {
@@ -1061,20 +1266,30 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>) {
                     let i = locate(&counts, at, false);
                     counts[i] -= 1;
                     next.remove(index(at));
+                    fresh.remove(index(at));
                     ops.push(ListOp::Remove { at });
                 } else if roll < 92 {
                     let (from, to) = (rng.below(len), rng.below(len));
+                    let from =
+                        model_target(&mut rng, mode, &fresh, &mut fresh_hits).unwrap_or(from);
                     let i = locate(&counts, from, false);
                     counts[i] -= 1;
                     let i = locate(&counts, to, true);
                     counts[i] += 1;
                     let value = next.remove(index(from));
                     next.insert(index(to), value);
+                    let added = fresh.remove(index(from));
+                    fresh.insert(index(to), added);
                     ops.push(ListOp::Move { from, to });
                 } else {
                     let at = rng.below(len);
+                    let at = model_target(&mut rng, mode, &fresh, &mut fresh_hits).unwrap_or(at);
                     minted += 1;
-                    let value = text(&format!("{seed}.{minted}r"));
+                    let value = if mode.mixed {
+                        model_value(&mut rng, mode, &format!("{seed}.{minted}r"))
+                    } else {
+                        text(&format!("{seed}.{minted}r"))
+                    };
                     next[index(at)] = value.clone();
                     ops.push(ListOp::Replace { at, value });
                 }
@@ -1096,9 +1311,11 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>) {
             steps += 1;
             model = next;
             let page = items(&k.snapshot(), &root, Start::Position(0), usize::MAX).expect("read");
+            out_of_line += page.items.iter().filter(|item| !item.inline).count();
             let read: Vec<Value> = page.items.into_iter().map(|item| item.value).collect();
             assert_eq!(read, model, "{at}: items");
             assert_eq!(page.list.count, len_u64(model.len()), "{at}: count");
+            assert_block_bytes(&k, &root, &model, &at);
 
             let after = block_index(&k, &root);
             let live: Vec<u64> = after.iter().map(|(n, _)| *n).collect();
@@ -1163,11 +1380,22 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>) {
             }
         }
     }
-    eprintln!("w2 model: {steps} steps, {refused} refused, {splits} splits, {retires} retires, {merges} merges");
+    eprintln!(
+        "model (records {}, mixed {}): {steps} steps, {refused} refused, {splits} splits, \
+         {retires} retires, {merges} merges, {fresh_hits} same-delta targets, {out_of_line} \
+         out-of-line items read",
+        mode.records, mode.mixed
+    );
     assert!(
         splits > 0 && retires > 0 && merges > 0 && steps > 0,
         "every rule was exercised"
     );
+    if mode.mixed {
+        assert!(
+            fresh_hits > 0 && out_of_line > 0,
+            "same-delta targets and out-of-line items were exercised"
+        );
+    }
 }
 
 /// One line of pushes for an end-split check: random lengths summing to a bit over B.

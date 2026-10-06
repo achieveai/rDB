@@ -1265,10 +1265,12 @@ impl Draft<'_> {
     /// block, split the folds over B in block order, then find at most one merge-back. A record
     /// minted and freed in this compile writes nothing.
     fn finish(mut self) -> Result<Finished, ValueError> {
+        // The overlay stays: a split sizes what it moves from it first (D3), since an item
+        // added or replaced in this compile has no record, or a stale one, in the snapshot.
         let mut items = BTreeMap::new();
-        for (id, slot) in std::mem::take(&mut self.items) {
+        for (&id, slot) in &self.items {
             if slot.stored || slot.value.is_some() {
-                items.insert(item_key(self.root, id), slot.value);
+                items.insert(item_key(self.root, id), slot.value.clone());
             }
         }
         let mut fates = BTreeMap::new();
