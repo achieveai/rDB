@@ -33,9 +33,10 @@ ADR that supersedes.
 | [0012](0012-document-encoding-cbor-profile.md) | Document encoding — the deterministic CBOR profile, the object envelope and path operations | **Accepted** |
 | [0013](0013-object-keys-maps-and-sets.md) | Object keys and collections — the object-key layout, the element key profile, maps and sets | **Accepted** |
 | [0014](0014-large-blobs-chunks-manifest-gc.md) | Large blobs — chunk records, the manifest, publish, digest verify and reachability GC | **Accepted** |
+| [0016](0016-ordered-lists.md) | Ordered lists — one block per list, change slots, fold, split and the 512-block cap | Proposed |
 | [0019](0019-validation-gates-evidence-and-release-boundary.md) | Validation gates, evidence and the release boundary | Proposed |
 
-0015–0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
+0015, 0017 and 0018 are unallocated. The gap is deliberate: 0019 was numbered to sit with the validation
 plan it implements, and the range between is reserved for the decisions the kernel teams have not
 reached yet.
 

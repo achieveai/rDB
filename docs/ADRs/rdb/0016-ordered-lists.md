@@ -3,7 +3,7 @@
 **Status:** Proposed, draft rev 6.1. **Rev 5** replaced rev 4's B+ tree with a block list (L-R186cz): changes go in reused
 slots, folded by our code; Merge later, if measured. Superseded: rev 4's tree parts, Q1 (node size), Q4a (top node in root).
 Kept: ids and seed (Q4b), L = 256 B inline and `records` (L-R186cr), overlay flips, `MAX_ITEM` (Q2), tokens, the fence.
-**Rev 6** closes `s4-blocklist-rev5-critic.md` (lead's rulings): B1, M1 §4 · M2 §1, §4, §5 · M3 amendment rev 3 · A1, A3
+**Rev 6** closes the rev 5 critic review (lead's rulings; working notes not in the repository): B1, M1 §4 · M2 §1, §4, §5 · M3 amendment rev 3 · A1, A3
 Consequences · A2 §4, O1 · A4 §3, §6, §7 · A5 §3, §4. **Rev 6.1** closes round 2: N1, N2, N4 §4 · N3 header, amendment.
 **Date:** 2026-10-05
 **Spec:** `docs/rdb/design-specification.md` D14, D16, §4.3, §4.3.2, §4.3.4; `docs/rdb/validation-plan.md` V13
@@ -12,7 +12,7 @@ defaults B = 128 KiB, 240 slots, fold at ¼); L-R186cr (inline, `records`, L = 2
 **Closes:** ADR-rdb-0013 decision 14 ("Lists — S4, later") and O2 (records, scan tokens, envelope `kind`).
 **Amends, each sentence quoted. Each edit is landed with a back-link to this ADR.**
 - **Spec revision line, D16 row, §4.3.2 list paragraph, its mermaid node and collection-version sentence; ADR-rdb-0012 §7
-  `kind` and `codec_version` rows; ADR-rdb-0013 decision 3 rows `0x02`, `0x03`:** exact text in `s4-spec-amendment.md` rev 3,
+  `kind` and `codec_version` rows; ADR-rdb-0013 decision 3 rows `0x02`, `0x03`:** exact text in the S4 spec amendment rev 3 (working notes not in the repository),
   which replaces the rev-4 wording already applied on the S4 branch (f4e1721). In short: kinds `0x06` list root, `0x07` list
   block, `0x08` list change slot, all `rdb-cbor-document` v1; `0x09` onward unallocated; `0x02` item record (tail 16 B),
   `0x03` block (tail 16 B) or change slot (tail 17 B).
@@ -28,7 +28,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 ## Context
 - Rev 4 wrote ~16.8–49.7 KB per push (a root-to-leaf path), and the same again in History. Gautam (L-R186cv): a change must
   not rewrite the list. RocksDB Merge (spec §4.3.4): one bad operand stops writes on the whole node, and nothing bounds
-  chains, so a bounded Merge needs our folds anyway (study §2a). Folding in pure `rdb-value` keeps after-images verbatim.
+  chains, so a bounded Merge needs our folds anyway (the block-list study §2a, working notes). Folding in pure `rdb-value` keeps after-images verbatim.
 
 ## Decision
 
@@ -221,7 +221,7 @@ Tests in `crates/rdb-value/tests/lists.rs`; each names the scenario it protects.
   id ⇔ record; every `0x02`/`0x03` key belongs to a live block or item; a `records` list has no inline entry.
 - **Rows:** each Scenarios row above; fold by count and by ¼; merge-back skipped when it would not fit; an id over 3,072 B
   refused; overlay rows (rev 4); stale-slot inheritance.
-- **Counting snapshot:** bytes written (`record_len`) per op at 1, 10, 100 blocks within ±10% of the study; bytes and calls
+- **Counting snapshot:** bytes written (`record_len`) per op at 1, 10, 100 blocks within ±10% of the block-list study (working notes); bytes and calls
   (`get`, `scan`, `version`) per `items` call.
 - **Size:** every compiled op's `record_len` ≤ its decision-4 bound; a build-time assert ties `DEFAULT_BLOCK_MAX`, the
   192 KiB top, `MAX_ITEM`, the 512-block root and the id limit to `MAX_ENVELOPE_BYTES`.
