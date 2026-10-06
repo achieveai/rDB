@@ -462,8 +462,8 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     };
     let (compiled, generation, writes_list) = load_compiled(FsPath::new(file))?;
     let mut store = Store::load(store_path)?;
-    // A list's pages and ids are guarded only by its root's version, which a failover can
-    // reuse, so a list write is never applied unfenced (ADR-rdb-0016 §8).
+    // A list's blocks, change slots and ids are guarded only by its root's version, which a
+    // failover can reuse, so a list write is never applied unfenced (ADR-rdb-0016 §8).
     if generation.is_none() && (writes_list || drops_list(&store, &compiled)) {
         return Err(Failure::refused(
             "GenerationRequired".into(),
@@ -1447,7 +1447,8 @@ fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>, bool), 
 
 /// Every write in a compiled line reads back (see [`load_compiled`]): every key parses, every
 /// element write has its root written beside it, and every `Put` reads back through the
-/// library. A refusal names the key. Returns whether any write is a list's root, item or page.
+/// library. A refusal names the key. Returns whether any write is a list's root, item, block
+/// base or change slot.
 fn check_writes(mutations: &[Mutation]) -> Result<bool, Failure> {
     let mut writes_list = false;
     // Every `Put` at version 1, so each one is read the way it would be once applied.

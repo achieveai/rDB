@@ -399,7 +399,9 @@ pub enum Refused {
 }
 
 /// The kernel as ADR-rdb-0014 and ADR-rdb-0016 rely on it: user records with their versions, a
-/// sequence and a generation. `apply` checks the write set's shape first (check 10), then the
+/// sequence and a generation. `apply` checks the write set's shape first: not empty and no key
+/// twice, as admission check 10 does. It also asserts that the keys ascend, which the kernel does
+/// not check; that is stricter on purpose, because every compiler here emits key order. Then the
 /// generation when the request names one (admission check 5), then every condition, then every
 /// `expected_version`, and only then writes everything at one new version.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -440,8 +442,8 @@ impl Kernel {
                 .mutations
                 .windows(2)
                 .all(|pair| key_of(&pair[0]) < key_of(&pair[1])),
-            "a write set whose keys do not strictly ascend is never submitted (the kernel \
-             refuses it, check 10): {:?}",
+            "a write set whose keys do not strictly ascend is never submitted (stricter than the \
+             kernel on purpose: check 10 refuses only a repeated key): {:?}",
             compiled.mutations.iter().map(key_of).collect::<Vec<_>>()
         );
         if generation.is_some_and(|g| g != self.generation) {

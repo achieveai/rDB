@@ -182,7 +182,7 @@ pub enum ApplyError {
         /// The root's element count.
         count: u64,
     },
-    /// A list that still has items cannot be dropped (ADR-rdb-0016 §6).
+    /// A list that still has items cannot be dropped (ADR-rdb-0016 §5).
     #[error(
         "the list still has {count} {}",
         if *.count == 1 { "item" } else { "items" }

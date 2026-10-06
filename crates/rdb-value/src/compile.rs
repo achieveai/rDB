@@ -78,8 +78,8 @@ pub enum Corrupt {
     /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right.
     #[error("collection root: {0}")]
     Root(&'static str),
-    /// A list root's payload breaks a rule of ADR-rdb-0016 §3, or a counter it or a node holds
-    /// would overflow. The message names the list.
+    /// A list root's payload breaks a rule of ADR-rdb-0016 §1, §4 or §7, or a counter it or a
+    /// block ref holds would overflow. The message names the list.
     #[error("{0}")]
     ListRoot(&'static str),
     /// A collection root names an element key profile this build does not know. Written by a
@@ -156,7 +156,7 @@ pub enum Corrupt {
         /// What is wrong with it.
         fault: BlockFault,
     },
-    /// A list leaf names an item that has no record (ADR-rdb-0016 §7).
+    /// A list block entry names an item that has no record (ADR-rdb-0016 §7).
     #[error("the list names item {id:032x}, which is not stored")]
     ItemMissing {
         /// The item's id.

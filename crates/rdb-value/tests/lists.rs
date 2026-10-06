@@ -1,7 +1,8 @@
 //! Ordered lists (ADR-rdb-0016), through the public API and the shared kernel stand-in.
 //!
-//! These assert behaviour and error variants only: no digest, no record count and no item or
-//! leaf byte layout, which ruling L-R186cn may change (lead ruling L-R186cq).
+//! One row, `w3_vectors_are_written_and_read_byte_for_byte`, pins the record bytes and digests
+//! of ADR-rdb-0016 rev 6.3. The others assert behaviour, error variants, and the write and call
+//! counts the ADR states.
 
 mod common;
 
@@ -372,8 +373,8 @@ fn w1_paging_tokens_resume_and_are_refused_when_stale() {
 }
 
 /// A list compile carries the generation it read at, and the kernel refuses it at any other:
-/// a list's pages and ids are guarded only by the root's version, which a failover can reuse
-/// (ADR-rdb-0016 §8). The drop is fenced the same way.
+/// a list's blocks, change slots and ids are guarded only by the root's version, which a
+/// failover can reuse (ADR-rdb-0016 §8). The drop is fenced the same way.
 #[test]
 fn w1_a_list_write_is_fenced_by_its_generation() {
     let root = todo();
@@ -765,7 +766,7 @@ fn opened_bytes(k: &Kernel, root: &RootKey) -> [u64; 3] {
     [read.bytes(), push.bytes(), dropped.bytes()]
 }
 
-/// Tester W1 D1 (design S24, G67): a block read stays inside the block's pending slots. A tiny
+/// Tester W1 D1 (ADR-rdb-0016 §3): a block read stays inside the block's pending slots. A tiny
 /// list's read and write open the same bytes whether or not a list whose items are big records
 /// sorts right after it; they used to scan on into that neighbour's records. A drop's second
 /// orphan check is a limit-1 scan past the block (ADR-rdb-0016 §5), so it opens exactly one
@@ -1875,7 +1876,7 @@ fn w2_an_end_split_keeps_the_longest_prefix_that_fits() {
         let ops = split_line(seed);
         let mut k = Kernel::new();
         let Ok(compiled) = compile_list(&k.snapshot(), &root, Expected::Absent, B, &ops) else {
-            continue; // a piece over B: refused, by design (G61)
+            continue; // a piece over B: refused, by design (ADR-rdb-0016 §4)
         };
         k.commit(compiled.compiled());
         let index = block_index(&k, &root);
@@ -1932,7 +1933,7 @@ fn w2_an_end_split_on_the_search_bound_has_this_shape() {
     assert_eq!(block_shape(&k, &root), [13, 4]);
 }
 
-/// W2 (W18 survived the walks): halves takes the first of two equally good cuts (G36). A
+/// W2 (W18 survived the walks): halves takes the first of two equally good cuts (§4). A
 /// non-last block that folds over B with an odd number of equal-size entries has two cuts with
 /// the same gap; the left half keeps the smaller one.
 #[test]
@@ -3655,9 +3656,10 @@ fn w3_a_block_folds_when_its_pending_bytes_pass_a_quarter_of_its_base() {
     assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
 }
 
-/// W3 (N22 was walk-only; G66): a base over B always folds, so a write at a smaller B splits it,
-/// though its op alone would take a slot. Written at the default B, 30 items of 40 chars make a
-/// base over 1,024; one push at 1,024 splits it, and no base is over 1,024 after.
+/// W3 (N22 was walk-only; ADR-rdb-0016 §3, §4): a base over B always folds, so a write at a
+/// smaller B splits it, though its op alone would take a slot. Written at the default B, 30
+/// items of 40 chars make a base over 1,024; one push at 1,024 splits it, and no base is over
+/// 1,024 after.
 #[test]
 fn w3_a_base_over_b_folds_and_splits_on_any_write() {
     let root = todo();
@@ -3781,10 +3783,11 @@ fn at_the_block_cap() -> Kernel {
     k
 }
 
-/// W3 (W07–W09 and W22 were walk-only; G63, G38): at 512 blocks a fold over B is written unsplit
-/// when the ops did not grow the block, and refused when they did. A same-size replace in the
-/// last block folds it (its base is over B) and writes it whole: 512 blocks, every item read. A
-/// push into it is refused `TooLarge{List}`, even though it alone would take a slot.
+/// W3 (W07–W09 and W22 were walk-only; ADR-rdb-0016 §4): at 512 blocks a fold over B is
+/// written unsplit when the ops did not grow the block, and refused when they did. A same-size
+/// replace in the last block folds it (its base is over B) and writes it whole: 512 blocks,
+/// every item read. A push into it is refused `TooLarge{List}`, even though it alone would take
+/// a slot.
 #[test]
 fn w3_at_the_block_cap_a_fold_is_written_unsplit_unless_the_ops_grew_it() {
     let root = todo();

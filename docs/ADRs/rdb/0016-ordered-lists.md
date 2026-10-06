@@ -124,7 +124,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   - Move between two blocks with 240 pending each: both fold, no delete: ≤ 5 writes, ≈ 342 KB at the default.
   - Retiring a block in a Move whose other block folds and splits: ≈ 187,716 + 244e at the default (e ≤ 3,528), and
     ≈ 269,636 + 244e at 192 KiB (e ≤ 3,192). **Drop:** 8,960 + 242e (e ≤ 4,295).
-  - **So every list compile refuses an object id with e > 3,072 (`TooLarge{Write}`)**; emptying and dropping then never
+  - **So every list compile refuses an object id with e > 3,072 (`TooLarge{ObjectId}`)**; emptying and dropping then never
     fail on bytes. M9's object-id limit (O1) must be ≤ 3,072 B escaped for lists.
   - Writes: root, ≤ 2 blocks × (base + split block), one item record, one retired block (≤ 241 deletes): ≤ 247 < 255.
     Drop: root + block + ≤ 240 slots = 242.
@@ -183,10 +183,16 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
 | bare `n` with no item record; item record does not open, not a document, newer than root | `Corrupt(ItemMissing{id} / Envelope / ItemNotDocument{found} / Codec / ElementNewerThanRoot)` |
 | records under `0x02`/`0x03` with no root, at a fresh id, or beside an empty list at drop | `Corrupt(OrphanElement)` |
-| a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on every path: list, map and set reads, writes and drop; document read and compile; blob reads, publish and delete; blob GC; `doc_scenario`'s dump |
+| a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on reads, on writes to an existing object, and on drop and delete: lists, maps, sets, documents and blobs; also blob GC and `doc_scenario`'s dump. A create (`Expected::Absent`) never reads the root: the kernel refuses its `Condition::Absent{root}` (`ConditionFailed`), and nothing is written |
 - `BlockFault` replaces rev 4's `PageFault`. An unknown kind, codec or format stays written-by-a-newer-build.
-- **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one item `n` in two entries; a stale
-  slot under a live block; a wrong `bytes` total. The test invariant checker covers each.
+- **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one item `n` in two
+  entries; a stale slot under a live block; a wrong `bytes` total. Writes never make one: `model_run` checks after every
+  step that
+  - the `0x02` keys are exactly the out-of-line entries' ids (the first two);
+  - no id is read twice (the third);
+  - every `0x03` key belongs to a block the root names, and each slot holds an op no in 1 … `head` at slot `op mod 240`
+    (the fourth, except a slot left by a fold: it holds an old op no in range, and a fold deletes nothing, §3);
+  - `bytes` matches the codec (the fifth).
 
 ### 8. Every list request names its generation (kept)
 - A list request carries `expected_generation: Some(generation)` (ADR-rdb-0014 decision 12): the root's version guards
@@ -198,7 +204,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 
 ### 9. Errors
 - **Apply** gains `PositionInvalid{position, len}`, `InvalidBlockSize{found}`, `GenerationChanged{expected, found}`,
-  `ListNotEmpty{count}`; `SizeLimit` gains `Item` and `List`. Reuses `ObjectAbsent`, `VersionConflict`, `KindMismatch`,
+  `ListNotEmpty{count}`; `SizeLimit` gains `Item`, `List` and `ObjectId`. Reuses `ObjectAbsent`, `VersionConflict`, `KindMismatch`,
   `TooManyWrites`, `TooLarge`, `TooDeep`. `ListTooTall` and `InvalidNodeSize` are gone.
 - **Corrupt** gains `ListRoot(&'static str)`, `Block{id, fault: BlockFault}`, `ItemMissing{id}`, `ItemNotDocument{found}`.
 
@@ -285,3 +291,5 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
   limit must be ≤ 3,072 B escaped for lists (decision 4).
 - **O2** Range removal and one-call delete (ADR-rdb-0013 O6). **O3** A second index level past 512 blocks.
 - **O4** RocksDB Merge, only with a measured need and §4.3.4's gates.
+- **O5** `rdb-value` is caller-bounded: `items()` takes any `limit`, and one delta any number of ops. M9 caps both: the
+  `items()` page size, and the ops per request.

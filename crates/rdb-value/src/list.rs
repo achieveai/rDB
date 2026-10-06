@@ -407,8 +407,8 @@ fn items_len(entries: &[Entry]) -> Result<usize, ValueError> {
     Ok(encode(&items).map_err(ApplyError::from)?.len())
 }
 
-/// Where the last block splits (G35): the longest prefix whose base, at `folded`, is at most
-/// `block_max`. Called only when the whole block is over it.
+/// Where the last block splits (ADR-rdb-0016 §4): the longest prefix whose base, at `folded`,
+/// is at most `block_max`. Called only when the whole block is over it.
 fn end_split(entries: &[Entry], folded: u64, block_max: usize) -> Result<usize, ValueError> {
     let fits = |k: usize| -> Result<bool, ValueError> {
         let base = encode(&block_value(&entries[..k], folded)).map_err(ApplyError::from)?;
@@ -427,7 +427,7 @@ fn end_split(entries: &[Entry], folded: u64, block_max: usize) -> Result<usize, 
     Ok(lo)
 }
 
-/// Where any other block splits (G36): the first cut, `1 … len − 1`, that leaves the two sides'
+/// Where any other block splits (§4): the first cut, `1 … len − 1`, that leaves the two sides'
 /// entry bytes closest.
 fn halves(entries: &[Entry]) -> Result<usize, ValueError> {
     let sizes = entries
@@ -655,7 +655,7 @@ fn block_keys(root: &RootKey, id: u128, head: u64) -> Vec<Bytes> {
 /// Read block `id`, which the root (at `root_version`) names as `block`: `get` its base, then
 /// read only its pending slots, with one `scan` from the first, or two when they wrap past slot
 /// 239 (ADR-rdb-0016 §3). No stale slot and no key past the block is read, so a neighbour's
-/// records never are (G67). Replay the pending ops and check the block (§7) before anything
+/// records never are. Replay the pending ops and check the block (§7) before anything
 /// uses it.
 fn load_block(
     snapshot: &dyn SnapshotRead,
@@ -1315,7 +1315,7 @@ impl Draft<'_> {
     }
 
     /// Retire every block the ops emptied that is not the only one: its base and the slot of
-    /// every op no 1 … `head` go, present or not (G62). When the ops emptied the list, the first
+    /// every op no 1 … `head` go, present or not (§4). When the ops emptied the list, the first
     /// block stays. Returns whether any block was retired.
     fn retire(&mut self, fates: &mut BTreeMap<u64, Fate>) -> bool {
         let all_empty = self.list.count == 0;
@@ -1337,9 +1337,9 @@ impl Draft<'_> {
     }
 
     /// Fold or slot each touched block, in block order, and split a fold over B: the last block
-    /// at its end (G35), any other in halves (G36). A piece over B is refused (G61). At the block
-    /// cap a fold over B is written unsplit (G63), unless the ops grew the block past B, which is
-    /// refused even when it would take only slots (G38).
+    /// at its end, any other in halves. A piece over B is refused. At the block cap a fold over B
+    /// is written unsplit, unless the ops grew the block past B, which is refused even when it
+    /// would take only slots (ADR-rdb-0016 §4).
     fn settle(&mut self, fates: &mut BTreeMap<u64, Fate>) -> Result<(), ValueError> {
         let block_max = self.block_max;
         let too_large = |len| -> ValueError {
@@ -1369,7 +1369,7 @@ impl Draft<'_> {
             let new_bytes: usize = slots.iter().map(|(_, payload)| payload.len()).sum();
             // Fold when the pending ops would pass the slots, or their bytes a quarter of the
             // base's; a block this compile made, or a base over B, always folds (ADR-rdb-0016
-            // §3, G66).
+            // §3, §4).
             let fold = emptied
                 || work.base_len.is_none_or(|base_len| {
                     base_len > self.block_max
@@ -1434,9 +1434,9 @@ impl Draft<'_> {
         Ok(())
     }
 
-    /// The first merge-back in block order (G37): a block this compile folded under B/4, with
-    /// its left neighbour, else its right, when the pair is at most ¾ · B. The left block
-    /// survives, `folded = head`; every key the right one can hold is deleted, and this
+    /// The first merge-back in block order (ADR-rdb-0016 §4): a block this compile folded under
+    /// B/4, with its left neighbour, else its right, when the pair is at most ¾ · B. The left
+    /// block survives, `folded = head`; every key the right one can hold is deleted, and this
     /// compile's slots to either are dropped. Returns the root and fates with it, or `None`.
     fn merge_back(&self, fates: &Fates) -> Result<Option<(Root, Fates)>, ValueError> {
         let blocks = &self.list.blocks;
@@ -1627,7 +1627,7 @@ fn compile(
         mutations.len() <= MAX_REQUEST_MUTATIONS
             && record_len(conditions.len(), mutations) <= MAX_ENVELOPE_BYTES
     };
-    // A merge-back is taken only when it fits; it is never a reason to refuse (G37).
+    // A merge-back is taken only when it fits; it is never a reason to refuse (§4).
     let merged = match finished.merged {
         Some((list, writes)) => Some(request(&list, writes)?).filter(|m| fits(m)),
         None => None,
@@ -1662,7 +1662,7 @@ fn compile(
 /// its one block's base and the slot key of every op no `1 … head`, present or not. The block
 /// is replayed and checked first. Two orphan checks read one record each: the first record
 /// under the item or block range must be the base, and none under the block range may follow
-/// its last slot (G59).
+/// its last slot.
 ///
 /// # Errors
 /// [`ApplyError::ObjectAbsent`], [`ApplyError::VersionConflict`], [`ApplyError::KindMismatch`],

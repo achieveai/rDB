@@ -10,7 +10,8 @@
 //! - [`keys`]: the object-key layout and [`keys::RootKey`] (ADR-rdb-0013 §1–§6).
 //! - [`collection`]: maps and sets, a root record plus one record per element (ADR-rdb-0013 §7–§13).
 //! - [`blob`]: large blobs, chunk records and one manifest root (ADR-rdb-0014).
-//! - [`list`]: ordered lists, a root, one record per item, and pages (ADR-rdb-0016).
+//! - [`list`]: ordered lists: a root, blocks with change slots, and a record for each item too
+//!   large for its block (ADR-rdb-0016).
 //! - [`testing::MapSnapshot`]: an in-memory `SnapshotRead`.
 //!
 //! Pure (ADR-rdb-0011): no clock, no I/O, no logging. Every outcome is a returned value.
