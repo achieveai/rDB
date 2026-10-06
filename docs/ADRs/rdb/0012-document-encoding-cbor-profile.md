@@ -16,7 +16,7 @@ codec/version, object version, logical/encoded length, digest algorithm, digest 
 Also §4.3.2's link to `evidence/document-encoding-decision.md`, and §4.3.1's inline value limit. See decisions 1 and 8. Closes ADR-rdb-0011
 O1 and O2. Changes nothing in `rdb-core`.
 **Amended by:** ADR-rdb-0013, 2026-10-04: §7 (`digest_alg` and `kind` rows, the freeze), §8, §9, §11, §12,
-§13, Scenarios and Consequences. ADR-rdb-0014, 2026-10-05: §7 (`kind` and `codec_version` rows).
+§13, Scenarios and Consequences. ADR-rdb-0014, 2026-10-05: §7 (`kind` and `codec_version` rows). ADR-rdb-0016, 2026-10-05: §7 (`kind` and `codec_version` rows, lists).
 Each edit is marked in place with its ruling.
 **Basis:** `main` 960db34.
 
@@ -150,8 +150,8 @@ or a tombstone: `FRAME_VALUE` / `FRAME_TOMBSTONE`); storage never parses it.
 | Offset | Size | Field | v1 value |
 |---|---|---|---|
 | 0 | 1 | `envelope_format` | `0x01` |
-| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt. `0x06` onward is unallocated and reserved for later kinds; S4 (lists) takes the next one. The table lives in `envelope.rs` |
-| 2 | 1 | `codec_version` | `0x01`, read per `kind`: for kinds `0x01`–`0x04` it is `rdb-cbor-document` v1; for kind `0x05` (blob chunk) the payload is stored as given. The byte stays `0x01`, so `open` is unchanged (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2) |
+| 1 | 1 | `kind` | `0x01` document, `0x02` map root, `0x03` set root (amended 2026-10-04; ADR-rdb-0013 decision 7), `0x04` blob root (the manifest), `0x05` blob chunk (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2), `0x06` list root, `0x07` list block, `0x08` list change slot (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1). `0x00` invalid: no build writes it, but with a correct digest it reads as `UnknownKind`, the newer-build error; telling it apart from damage is M9 debt. `0x09` onward is unallocated and reserved for later kinds. The table lives in `envelope.rs` |
+| 2 | 1 | `codec_version` | `0x01`, read per `kind`: for kinds `0x01`–`0x04` and `0x06`–`0x08` it is `rdb-cbor-document` v1 (lists amended 2026-10-05, L-R186cz; ADR-rdb-0016 decision 1); for kind `0x05` (blob chunk) the payload is stored as given. The byte stays `0x01`, so `open` is unchanged (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 2) |
 | 3 | 1 | `digest_alg` | `0x01` = SHA-256 of header bytes 0..8, then the payload (amended 2026-10-04, L-R186s; ADR-rdb-0013 decision 7) |
 | 4 | 4 | `payload_len` | u32 BE; must equal the remaining bytes. For a document this **is** the logical length |
 | 8 | 32 | `digest` | |

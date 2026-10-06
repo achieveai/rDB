@@ -144,8 +144,8 @@ One `rdb-value` module, `keys.rs`, owns this table. Later slices add rows there,
 |---|---|---|---|
 | `0x00` | **Root record** of the object. Its bytes are an ADR-rdb-0012 §7 envelope, and the envelope's `kind` says what the object is | empty | this ADR |
 | `0x01` | **Map entry or set member** | element key, profile v1 (decision 4) | this ADR (S3) |
-| `0x02` | **List item record**, only for an item not stored in its leaf (amended 2026-10-05, L-R186cr; ADR-rdb-0016 decision 1) | item id, 16 bytes: fixed width, ending the key | ADR-rdb-0016 (S4) |
-| `0x03` | **List page** (amended 2026-10-05; ADR-rdb-0016 decision 1) | page id, 16 bytes: fixed width, ending the key | ADR-rdb-0016 (S4) |
+| `0x02` | **List item record**, only for an item not stored in its block (amended 2026-10-05, L-R186cr, L-R186cz; ADR-rdb-0016 decision 1) | item id, 16 bytes: fixed width, ending the key | ADR-rdb-0016 (S4) |
+| `0x03` | **List block and its change slots** (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decisions 1 and 3) | block id, 16 bytes (the block), or block id then slot `u8` `0x00`–`0xEF`, 17 bytes (a change slot): fixed width, ending the key | ADR-rdb-0016 (S4) |
 | `0x04` | **Blob chunk** (amended 2026-10-05, L-R186x Q4; ADR-rdb-0014 decision 1) | `upload_id` (16 bytes), then `index` u32 BE: fixed width, 20 bytes, ending the key | ADR-rdb-0014 (S5) |
 | `0x05`–`0xFF` | unassigned | — | — |
 
