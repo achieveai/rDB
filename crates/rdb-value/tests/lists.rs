@@ -6,7 +6,7 @@
 mod common;
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use common::{text, Kernel, Refused};
@@ -19,7 +19,7 @@ use rdb_value::collection::{compile_collection, CollectionKind, ElemOp};
 use rdb_value::delta::{ApplyError, Delta, Op, SizeLimit};
 use rdb_value::envelope::{open, seal, EnvelopeError, Kind};
 use rdb_value::keys::{
-    block_key, item_key, parse, root_key, slot_key, KeyError, RootKey, Sub, SUB_BLOCK,
+    block_key, item_key, parse, root_key, slot_key, KeyError, RootKey, Sub, SUB_BLOCK, SUB_ITEM,
 };
 use rdb_value::list::{
     compile_list, create_list, drop_list, items, list, slot_op_no, ListOp, Start, Token,
@@ -1435,6 +1435,21 @@ fn assert_block_records(k: &Kernel, root: &RootKey, at: &str) {
     }
 }
 
+/// The id of every record under the list's item range (tester W3 G2: the model checks that these
+/// are exactly the out-of-line entries, so a Remove or Replace that leaves a record behind fails
+/// on the record, not on a counter).
+fn item_records(k: &Kernel, root: &RootKey) -> BTreeSet<u128> {
+    let prefix = root.sub_prefix(SUB_ITEM);
+    k.records
+        .range(Bytes::from(prefix.clone())..)
+        .take_while(|(key, _)| key.starts_with(&prefix))
+        .map(|(key, _)| {
+            let id: [u8; 16] = key[prefix.len()..].try_into().expect("a 16-byte item id");
+            u128::from_be_bytes(id)
+        })
+        .collect()
+}
+
 /// Where a position lands, as the compile places it: the block holding `pos`, or with `end` the
 /// earlier block at a boundary (ADR-rdb-0016 §4's tie).
 fn locate(counts: &[u64], pos: u64, end: bool) -> usize {
@@ -1456,8 +1471,8 @@ fn locate(counts: &[u64], pos: u64, end: bool) -> usize {
 /// block index only as §4 allows: the blocks the ops emptied retire (all but the first when the
 /// list empties), at most one more block goes (one merge-back), none beside a retire, and a
 /// merged-into block's base is at most ¾ · B. A refused delta (`TooLarge`, `TooManyWrites`)
-/// leaves the model as it was. 8 seeds here, 0.63–0.70 s in a debug build (measured
-/// 2026-10-06; cut from 20 to stay under 1 s, ruling L-R186dw); 300 in the ignored
+/// leaves the model as it was. 8 seeds here, 0.63–0.72 s in a debug build (measured
+/// 2026-10-06, 0.71–0.72 s with the item-record check; cut from 20 to stay under 1 s, ruling L-R186dw); 300 in the ignored
 /// `w2_model_300_seeds`, run by hand: `cargo test -p rdb-value --test lists -- --ignored`.
 #[test]
 fn w2_model_random_deltas_match_a_vec_and_keep_the_block_rules() {
@@ -1669,7 +1684,14 @@ fn model_run(seeds: std::ops::RangeInclusive<u64>, mode: Mode) {
             steps += 1;
             model = next;
             let page = items(&k.snapshot(), &root, Start::Position(0), usize::MAX).expect("read");
-            out_of_line += page.items.iter().filter(|item| !item.inline).count();
+            let bare: BTreeSet<u128> = page
+                .items
+                .iter()
+                .filter(|item| !item.inline)
+                .map(|item| item.id)
+                .collect();
+            assert_eq!(item_records(&k, &root), bare, "{at}: item records");
+            out_of_line += bare.len();
             let read: Vec<Value> = page.items.into_iter().map(|item| item.value).collect();
             assert_eq!(read, model, "{at}: items");
             assert_eq!(page.list.count, len_u64(model.len()), "{at}: count");
@@ -3933,4 +3955,76 @@ fn w3_no_merge_back_beside_a_retire() {
         "the pair fits ¾ · B: {a_len} + {b_len}"
     );
     assert_eq!(values(&k, &root), want);
+}
+
+/// Tester W3 G1 (mutant T3 survived): a Replace that moves an inline item out of its block
+/// writes the item's record, so a record already at that id is damage. The compile is refused
+/// `OrphanElement` and writes nothing; the store is as it was.
+#[test]
+fn w3_a_replace_out_of_the_block_over_a_stray_item_record_is_orphan_element() {
+    let root = todo();
+    let mut k = Kernel::new();
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a"]);
+    let item = items(&k.snapshot(), &root, Start::Position(0), 1)
+        .expect("read")
+        .items
+        .remove(0);
+    assert!(item.inline, "the item starts in its block");
+    let version = version_of(&k, &root);
+    let stray = encode(&text("stray")).expect("encode");
+    plant(
+        &mut k,
+        &item_key(&root, item.id),
+        version,
+        Kind::Document,
+        &stray,
+    );
+    let before = k.records.clone();
+    let replace = [ListOp::Replace {
+        at: 0,
+        value: text(&"o".repeat(300)),
+    }];
+    let got = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Version(version),
+        DEFAULT_BLOCK_MAX,
+        &replace,
+    )
+    .map(|_| ());
+    assert_eq!(got, Err(ValueError::Corrupt(Corrupt::OrphanElement)));
+    assert_eq!(k.records, before, "the store is unchanged");
+}
+
+/// Tester W3 advisory: a retire and a merge-back of a block whose slots are still pending. Five
+/// more pushes leave the second block of [`two_blocks_with_stale_slots`] 5 pending ops. Emptying
+/// it retires it; shrinking the first block to 10 items merges the second into it, its pending
+/// ops replayed. Either way no record of the second block remains, and the values read back.
+#[test]
+fn w3_a_retire_or_merge_back_of_a_block_with_pending_slots_leaves_none_of_it() {
+    let root = todo();
+    for merge in [false, true] {
+        let mut k = Kernel::new();
+        let (mut model, second) = two_blocks_with_stale_slots(&mut k, &root);
+        write(&mut k, &root, DEFAULT_BLOCK_MAX, &pushes(241, 5));
+        model.extend(texts(&["p241", "p242", "p243", "p244", "p245"]));
+        let head = block_refs(&k, &root)[1][2];
+        assert_eq!(head - base_of_block(&k, &root, second).1, 5, "pending ops");
+        let first = block_index(&k, &root)[0].1;
+        let ops = if merge {
+            model.drain(..index(first - 10));
+            vec![ListOp::Remove { at: 0 }; index(first - 10)]
+        } else {
+            let removes = model.len() - index(first);
+            model.truncate(index(first));
+            vec![ListOp::Remove { at: first }; removes]
+        };
+        write(&mut k, &root, DEFAULT_BLOCK_MAX, &ops);
+        assert_eq!(block_index(&k, &root).len(), 1, "merge {merge}");
+        assert!(
+            !block_remains(&k, &root, second),
+            "merge {merge}: a record of the second block remains"
+        );
+        assert_eq!(values(&k, &root), model, "merge {merge}");
+    }
 }
