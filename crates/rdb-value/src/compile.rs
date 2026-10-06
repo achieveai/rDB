@@ -98,8 +98,8 @@ pub enum Corrupt {
         /// The item's envelope kind.
         found: Kind,
     },
-    /// A document or blob root key holds a list block or slot record. Those are never written at
-    /// a root key, so this is damage, not another kind of object.
+    /// A document, blob or list root key holds a list block or slot record. Those are never
+    /// written at a root key, so this is damage, not another kind of object.
     #[error("a list {found:?} record is at the root key")]
     ListRecordAtRoot {
         /// The record's envelope kind.
@@ -312,7 +312,7 @@ pub(crate) fn record(
     }
 }
 
-/// Refuse a list block or slot record found at a document or blob root key. Those are never
+/// Refuse a list block or slot record found at a document, blob or list root key. Those are never
 /// written at a root key, so one there is damage, not another kind of object.
 pub(crate) fn refuse_list_record_at_root(kind: Kind) -> Result<(), ValueError> {
     match kind {

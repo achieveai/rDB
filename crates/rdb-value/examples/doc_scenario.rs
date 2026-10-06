@@ -2558,4 +2558,223 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).expect("clean");
     }
+
+    // ---- W3: the example's walk-only list guards (F16, F17, W25, W26, the wrap) -------------
+
+    /// Rewrite the store's records through `edit`, keeping its seq and block size: damage a
+    /// test plants by hand, as a byte edit of the file would.
+    fn edit_records(path: &FsPath, edit: impl FnOnce(&mut Vec<(Bytes, u64, Bytes)>)) {
+        let mut store = Store::load(path).expect("load");
+        let mut records: Vec<(Bytes, u64, Bytes)> = store
+            .snapshot
+            .records()
+            .map(|(k, v, b)| (k.clone(), v, b.clone()))
+            .collect();
+        edit(&mut records);
+        let mut snapshot = MapSnapshot::new(store.snapshot.generation());
+        for (key, version, value) in records {
+            snapshot.insert(key, version, value);
+        }
+        snapshot.advance_to(store.seq);
+        store.snapshot = snapshot;
+        store.save().expect("save");
+    }
+
+    /// `dump`'s records, one JSON object each.
+    fn dumped(store: &FsPath) -> Vec<serde_json::Value> {
+        let fields = dump_cmd(store, &[]).expect("dump");
+        let (_, records) = fields
+            .iter()
+            .find(|(name, _)| *name == "records")
+            .expect("records");
+        serde_json::from_str(records).expect("json")
+    }
+
+    /// The parsed key of a list record: its sub and slot.
+    fn sub_slot(key: &[u8]) -> (Sub, Option<u8>) {
+        let parsed = keys::parse(key).expect("a key");
+        (parsed.sub, parsed.slot)
+    }
+
+    /// A slot payload `[op no, op]` holding `op_no`, sealed.
+    fn slot_record(op_no: u64, op: Value) -> Bytes {
+        let payload = Value::Array(vec![Value::Integer(Int::from(op_no)), op]);
+        envelope::seal(Kind::ListSlot, &cbor::encode(&payload).expect("encode")).expect("seal")
+    }
+
+    /// The op a slot record holds, decoded.
+    fn slot_op(raw: &[u8]) -> Value {
+        let opened = envelope::open(raw).expect("envelope");
+        match cbor::decode(opened.payload).expect("cbor") {
+            Value::Array(mut parts) if parts.len() == 2 => parts.remove(1),
+            other => panic!("a slot is [op no, op]: {other:?}"),
+        }
+    }
+
+    /// W3 (F17 was walk-only): `drop` sends a root holding a block or slot record to the list
+    /// drop, which names it `ListRecordAtRoot` and writes nothing.
+    #[test]
+    fn w3_drop_of_a_root_holding_a_block_or_slot_record_is_list_record_at_root() {
+        let dir = scratch("w3-drop-at-root");
+        let store = dir.join("s.jsonl");
+        let long = format!("\"{}\"", "a".repeat(200));
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", &long])).expect("create");
+        list::write_cmd(&store, &args(&["todo", "--expect", "1", "push", "\"b\""])).expect("push");
+        let root = root_of("todo").expect("root");
+        let source = std::fs::read(&store).expect("store");
+        // The push is op 2, in slot 2: the create was op 1.
+        for (sub, found) in [(None, "ListBlock"), (Some(2_u8), "ListSlot")] {
+            std::fs::write(&store, &source).expect("reset");
+            edit_records(&store, |records| {
+                let raw = records
+                    .iter()
+                    .find(|(key, _, _)| sub_slot(key) == (Sub::Block, sub))
+                    .map(|(_, _, raw)| raw.clone())
+                    .expect("a block record");
+                let at_root = records
+                    .iter_mut()
+                    .find(|(key, _, _)| key.as_ref() == root.as_bytes())
+                    .expect("the root");
+                at_root.2 = raw;
+            });
+            let before = std::fs::read(&store).expect("store");
+            let err = drop_cmd(&store, &args(&["todo", "--expect", "2"])).expect_err("refused");
+            assert_eq!(
+                err.error,
+                format!("Corrupt(ListRecordAtRoot {{ found: {found} }})"),
+                "{}",
+                err.detail
+            );
+            assert_eq!(
+                std::fs::read(&store).expect("store"),
+                before,
+                "store unchanged"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// W3 (F16 was walk-only): `dump` names a block whose base is not in the store under the
+    /// root's `absent_bases`, and prints no such field while every base is there.
+    #[test]
+    fn w3_dump_names_a_missing_base_under_absent_bases() {
+        let dir = scratch("w3-absent-bases");
+        let store = dir.join("s.jsonl");
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", "\"a\""])).expect("create");
+        let root_line = |store: &FsPath| {
+            dumped(store)
+                .into_iter()
+                .find(|r| r["sub"] == "root")
+                .expect("a root line")
+        };
+        let whole = root_line(&store);
+        assert!(whole.get("absent_bases").is_none(), "{whole}");
+        let mut base_id = None;
+        edit_records(&store, |records| {
+            let at = records
+                .iter()
+                .position(|(key, _, _)| sub_slot(key) == (Sub::Block, None))
+                .expect("a base");
+            base_id = keys::parse(&records[at].0).expect("key").list_id;
+            records.remove(at);
+        });
+        let line = root_line(&store);
+        let absent = line["absent_bases"].as_array().expect("absent_bases");
+        assert_eq!(absent.len(), 1, "{line}");
+        assert_eq!(
+            absent[0],
+            format!("{:032x}", base_id.expect("an id")),
+            "{line}"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// W3 (W25, W26 and the F02 wrap were walk-only): pending ops that wrap past slot 239 dump
+    /// as `pending` on both sides of the wrap; a slot whose op no lies past `head` is `stale`
+    /// though it sits inside the pending range's slots; and a slot whose payload is not
+    /// `[op no, op]` is `OpBad` naming the op it holds pending, or the block's `Shape` when it
+    /// holds none.
+    #[test]
+    fn w3_dump_tells_pending_from_stale_across_the_wrap_and_names_a_bad_slot() {
+        let dir = scratch("w3-dump-wrap");
+        let store = dir.join("s.jsonl");
+        let names: Vec<String> = (0..230).map(|i| format!("\"{i:0>16}\"")).collect();
+        let mut create = vec!["todo", "--absent"];
+        for name in &names {
+            create.extend(["push", name.as_str()]);
+        }
+        list::write_cmd(&store, &args(&create)).expect("create");
+        let pushes: Vec<String> = (0..15).map(|i| format!("\"p{i}\"")).collect();
+        let mut write = vec!["todo", "--expect", "1"];
+        for push in &pushes {
+            write.extend(["push", push.as_str()]);
+        }
+        list::write_cmd(&store, &args(&write)).expect("15 pushes");
+        // Plant stale slots 6 (op 6) and 230 (op 230): each lies inside the pending range's
+        // slots' span on neither side, and its op no is not `folded + 1 ..= head`.
+        edit_records(&store, |records| {
+            let (key, version, raw) = records
+                .iter()
+                .find(|(key, _, _)| sub_slot(key) == (Sub::Block, Some(231)))
+                .cloned()
+                .expect("slot 231");
+            let parsed = keys::parse(&key).expect("key");
+            let root = parsed.root();
+            let id = parsed.list_id.expect("an id");
+            for op_no in [6_u64, 230] {
+                let slot = u8::try_from(op_no).expect("a slot");
+                records.push((
+                    keys::slot_key(&root, id, slot),
+                    version,
+                    slot_record(op_no, slot_op(&raw)),
+                ));
+            }
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+        });
+        let states = |store: &FsPath| -> std::collections::BTreeMap<u64, (String, String)> {
+            dumped(store)
+                .into_iter()
+                .filter(|r| r["sub"] == "slot")
+                .map(|r| {
+                    let slot = r["slot"].as_u64().expect("slot");
+                    let state = r["state"].as_str().unwrap_or("").to_owned();
+                    let error = r["error"].as_str().unwrap_or("").to_owned();
+                    (slot, (state, error))
+                })
+                .collect()
+        };
+        let got = states(&store);
+        let mut want: std::collections::BTreeMap<u64, (String, String)> = (231..240)
+            .chain(0..6)
+            .map(|slot| (slot, ("pending".to_owned(), String::new())))
+            .collect();
+        for slot in [6, 230] {
+            want.insert(slot, ("stale".to_owned(), String::new()));
+        }
+        assert_eq!(got, want);
+
+        // A bad payload in pending slot 0 (op 240) and in stale slot 6.
+        edit_records(&store, |records| {
+            for (key, _, raw) in records.iter_mut() {
+                if matches!(sub_slot(key), (Sub::Block, Some(0 | 6))) {
+                    let bad = Value::Array(vec![Value::Integer(Int::from(1_u64))]);
+                    *raw = envelope::seal(Kind::ListSlot, &cbor::encode(&bad).expect("encode"))
+                        .expect("seal");
+                }
+            }
+        });
+        let got = states(&store);
+        assert!(
+            got[&0].1.contains("fault: OpBad { op: 240, fault: Shape("),
+            "{:?}",
+            got[&0]
+        );
+        assert!(
+            got[&6].1.contains("fault: Shape(") && !got[&6].1.contains("OpBad"),
+            "{:?}",
+            got[&6]
+        );
+        assert_eq!(got[&5].0, "pending");
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
 }

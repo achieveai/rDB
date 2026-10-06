@@ -32,7 +32,8 @@ use rdb_core::{Condition, Generation, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode};
 use crate::compile::{
-    check_version, record, BlockFault, Compiled, Corrupt, Expected, SlotFault, ValueError,
+    check_version, record, refuse_list_record_at_root, BlockFault, Compiled, Corrupt, Expected,
+    SlotFault, ValueError,
 };
 use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{open, seal, Kind, HEADER_LEN};
@@ -536,12 +537,8 @@ fn parse_block_ref(value: &Value) -> Result<BlockRef, &'static str> {
 fn open_root(bytes: &[u8]) -> Result<Root, ValueError> {
     let opened = open(bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
     // A block or slot record is never written at a root key, so one there is damage, not
-    // another kind of object.
-    if matches!(opened.kind, Kind::ListBlock | Kind::ListSlot) {
-        return Err(corrupt_root(
-            "a list block or slot record is at the root key",
-        ));
-    }
+    // another kind of object, named as every other root path names it.
+    refuse_list_record_at_root(opened.kind)?;
     if opened.kind != Kind::List {
         return Err(ApplyError::KindMismatch { found: opened.kind }.into());
     }
