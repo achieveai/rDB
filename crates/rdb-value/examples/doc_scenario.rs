@@ -494,7 +494,8 @@ fn drops_list(store: &Store, compiled: &Compiled) -> bool {
 }
 
 /// `drop <id> --expect V [--compile-only]`: a list's drop when the root is a list, otherwise a
-/// collection's, which also names any other kind it finds.
+/// collection's, which also names any other kind it finds; a list block or slot record at the
+/// root is `ListRecordAtRoot` there, and nothing is written.
 fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let is_list = match rest.first() {
         Some(id) => {
@@ -503,12 +504,7 @@ fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
             store
                 .snapshot
                 .get(Namespace::User, root.as_bytes())
-                // A block or slot record at a root key is list damage; the list drop names it.
-                .is_some_and(|raw| {
-                    envelope::open(&raw).is_ok_and(|o| {
-                        matches!(o.kind, Kind::List | Kind::ListBlock | Kind::ListSlot)
-                    })
-                })
+                .is_some_and(|raw| envelope::open(&raw).is_ok_and(|o| o.kind == Kind::List))
         }
         None => false,
     };
@@ -2605,8 +2601,9 @@ mod tests {
         }
     }
 
-    /// W3 (F17 was walk-only): `drop` sends a root holding a block or slot record to the list
-    /// drop, which names it `ListRecordAtRoot` and writes nothing.
+    /// W3 (F17 was walk-only): `drop` of a root holding a block or slot record goes to the
+    /// collection drop, which names it `ListRecordAtRoot` and writes nothing (ADR-rdb-0016 §7).
+    /// The example's own routing of those kinds to the list drop was dead and is gone (L-R186ef).
     #[test]
     fn w3_drop_of_a_root_holding_a_block_or_slot_record_is_list_record_at_root() {
         let dir = scratch("w3-drop-at-root");

@@ -206,7 +206,8 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - **Apply** gains `PositionInvalid{position, len}`, `InvalidBlockSize{found}`, `GenerationChanged{expected, found}`,
   `ListNotEmpty{count}`; `SizeLimit` gains `Item`, `List` and `ObjectId`. Reuses `ObjectAbsent`, `VersionConflict`, `KindMismatch`,
   `TooManyWrites`, `TooLarge`, `TooDeep`. `ListTooTall` and `InvalidNodeSize` are gone.
-- **Corrupt** gains `ListRoot(&'static str)`, `Block{id, fault: BlockFault}`, `ItemMissing{id}`, `ItemNotDocument{found}`.
+- **Corrupt** gains `ListRoot(&'static str)`, `Block{id, fault: BlockFault}`, `ItemMissing{id}`, `ItemNotDocument{found}`,
+  `ListRecordAtRoot{found}`.
 
 ## Vectors (prose; byte forms and digests from the dev's run at rev 6.3)
 Tenant 1, affinity 1, id `todo`, `snapshot.at()` = 0, `records` false. A digest is SHA-256 over the header's 8 bytes, then
@@ -283,8 +284,11 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
 - **Size:** the compile refuses a request over either cap (`w3_each_limit_holds_at_its_edge`). Build-time asserts
   (`worst_op`, `worst_retire`) tie `DEFAULT_BLOCK_MAX`, the 192 KiB top, `MAX_ITEM`, the 512-block root and the id limit
   to `MAX_ENVELOPE_BYTES`. No test measures each op's `record_len` against its decision-4 bound.
-- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s. At 6f06d0f, each of 81 guard mutants,
-  and the manual tester's 5 spot-check mutants, turned a named row red. **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
+- **Fork, token and seed rows** (rev 4); laws L1, L4, L5, L6; replay on two `MapSnapshot`s.
+- **Mutants:** at 02b5236, 87 of 88 guard mutants turned a named row red; at 6f06d0f, so did the manual tester's 5
+  spot-check mutants. The survivor, F17, removed the example's routing of a block or slot record at a root to the list
+  drop. Since 5d01fe9 the collection drop names it `ListRecordAtRoot` too and writes nothing, so those arms were dead;
+  they are deleted (L-R186ef). **On RocksDB, nothing new:** reads and compiles are pure functions of `get`, `version`, `scan`, `at`.
 
 ## Open
 - **O1** Id-addressed reads and id/value-digest preconditions (ADR-rdb-0013 O4): M9, costs in decision 6. M9's object-id
@@ -293,3 +297,9 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
 - **O4** RocksDB Merge, only with a measured need and §4.3.4's gates.
 - **O5** `rdb-value` is caller-bounded: `items()` takes any `limit`, and one delta any number of ops. M9 caps both: the
   `items()` page size, and the ops per request.
+  - Measured at 02b5236, release build, by the ignored probe `l_r186ee_probe_d2_one_delta_of_k_front_inserts`: one
+    delta's compile cost grows with k² for front inserts. k = 5,000: 24 ms; 20,000: 318 ms; 43,000: 1.5 s.
+  - A delta that will be refused `TooLarge{List}` still pays the full replay first (k = 100,000: 7.6 s, refused).
+  - So M9's per-request op cap must keep k small (L-R186ef).
+  - Reads are not the concern: `l_r186ee_probe_d1_a_full_block_with_240_pending_front_inserts` reads a block of 10,000
+    entries with 240 pending front inserts in 11.6 ms, dominated by decoding the base.
