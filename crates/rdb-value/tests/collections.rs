@@ -283,14 +283,15 @@ fn l_r186s_a_flipped_root_kind_is_damage_on_every_read_path() {
 
 /// S4 P3 next door: a list block (0x07) or slot (0x08) record is never written at a root key,
 /// so one at a collection's root is damage, as on the list paths, not a `KindMismatch` that
-/// reads as "some other kind of object lives here".
+/// reads as "some other kind of object lives here". Named `ListRecordAtRoot`, as every list,
+/// document and blob path names it (lead ruling L-R186dz); a map and a set compile each get a row.
 #[test]
 fn p3_a_list_block_or_slot_at_a_collection_root_is_damage_on_every_path() {
     let root = cart();
-    let damage = Err(ValueError::Corrupt(Corrupt::Root(
-        "a list block or slot record is at the root key",
-    )));
     for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let damage = Err(ValueError::Corrupt(Corrupt::ListRecordAtRoot {
+            found: kind,
+        }));
         let mut s = MapSnapshot::new(Generation(1));
         s.insert(root.to_bytes(), 4, root_record(kind, 1));
         assert_eq!(
@@ -318,7 +319,14 @@ fn p3_a_list_block_or_slot_at_a_collection_root_is_damage_on_every_path() {
             compile_collection(&s, &root, CollectionKind::Map, Expected::Version(4), &put)
                 .map(|_| ()),
             damage,
-            "compile, {kind:?}"
+            "map compile, {kind:?}"
+        );
+        let add = [ElemOp::Add(text("banana"))];
+        assert_eq!(
+            compile_collection(&s, &root, CollectionKind::Set, Expected::Version(4), &add)
+                .map(|_| ()),
+            damage,
+            "set compile, {kind:?}"
         );
     }
 }
