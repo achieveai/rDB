@@ -478,8 +478,9 @@ const SCAN_PAGE: usize = 256;
 /// the record size limit. No mutations means nothing is left to collect.
 ///
 /// # Errors
-/// [`ValueError::Corrupt`] when the root does not open or its manifest does not decode, or a
-/// chunk key's tail is not 20 bytes ([`KeyError::ChunkTail`]). Nothing is deleted then.
+/// [`ValueError::Corrupt`] when the root does not open, is a list block or slot record, or its
+/// manifest does not decode, or a chunk key's tail is not 20 bytes ([`KeyError::ChunkTail`]).
+/// Nothing is deleted then.
 pub fn collect_garbage(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -494,6 +495,9 @@ pub fn collect_garbage(
         ),
         Some((version, bytes)) => {
             let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+            // A list block or slot here is damage, not a root that names no upload (ruling
+            // L-R186dm): reachability is never decided from a root that cannot be read.
+            refuse_list_record_at_root(opened.kind)?;
             let reachable = if opened.kind == Kind::Blob {
                 let m = open_blob(version, &bytes)?.manifest;
                 Some((m.upload, m.chunks()))

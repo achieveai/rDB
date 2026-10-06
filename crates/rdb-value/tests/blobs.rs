@@ -1965,6 +1965,44 @@ fn a_list_block_or_slot_at_a_blob_root_is_damage_on_every_path() {
     }
 }
 
+/// Lead ruling L-R186dm: a list block or slot record at a blob root is damage, not a root, so GC
+/// cannot decide reachability from it (ADR-rdb-0014 §8) and refuses. Before the ruling it read as
+/// "a non-blob root names no upload" and offered every chunk for deletion. Whatever GC returns is
+/// applied, so a batch that deletes anything shows up as a changed kernel.
+#[test]
+fn gc_refuses_a_list_block_or_slot_at_a_blob_root_and_deletes_nothing() {
+    let root = photo();
+    let prefix = root.chunk_prefix();
+    for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let mut k = b1();
+        let chunks = k
+            .records
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count();
+        assert_eq!(chunks, 3, "B1 has its three chunks, {kind:?}");
+        let version = k.records[&root.to_bytes()].0;
+        k.records
+            .insert(root.to_bytes(), (version, seal(kind, &h("a0")).unwrap()));
+        let before = k.clone();
+        let got = collect_garbage(&k.snapshot(), &root, u64::MAX);
+        if let Ok(compiled) = &got {
+            if !compiled.mutations.is_empty() {
+                let _ = k.apply(compiled, None);
+            }
+        }
+        assert_eq!(
+            k, before,
+            "nothing is written; every chunk is still there, {kind:?}"
+        );
+        assert_eq!(
+            got.map(|_| ()),
+            corrupt(Corrupt::ListRecordAtRoot { found: kind }),
+            "{kind:?}"
+        );
+    }
+}
+
 /// `KindMismatch` both ways: a blob operation on a document or a map names the
 /// kind it found, and a document or map operation on a blob names `Blob`.
 #[test]
