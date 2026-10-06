@@ -1456,11 +1456,12 @@ fn locate(counts: &[u64], pos: u64, end: bool) -> usize {
 /// block index only as §4 allows: the blocks the ops emptied retire (all but the first when the
 /// list empties), at most one more block goes (one merge-back), none beside a retire, and a
 /// merged-into block's base is at most ¾ · B. A refused delta (`TooLarge`, `TooManyWrites`)
-/// leaves the model as it was. 20 seeds here (about 1 s in a debug build); 300 in the ignored
+/// leaves the model as it was. 8 seeds here, 0.63–0.70 s in a debug build (measured
+/// 2026-10-06; cut from 20 to stay under 1 s, ruling L-R186dw); 300 in the ignored
 /// `w2_model_300_seeds`, run by hand: `cargo test -p rdb-value --test lists -- --ignored`.
 #[test]
 fn w2_model_random_deltas_match_a_vec_and_keep_the_block_rules() {
-    model_run(1..=20, SMALL);
+    model_run(1..=8, SMALL);
 }
 
 /// [`w2_model_random_deltas_match_a_vec_and_keep_the_block_rules`] over 300 seeds (about 17 s).
@@ -1473,17 +1474,22 @@ fn w2_model_300_seeds() {
 /// D3 (tester W2 BLOCKER): the model above never made an out-of-line item, so it could not see
 /// a split that sizes one from the snapshot. This run draws values small, around the inline
 /// limit (240 at B = 1,024) and well over it, and aims half its moves and replaces at items
-/// added earlier in the same delta, whose records exist only in the compile's overlay.
+/// added earlier in the same delta, whose records exist only in the compile's overlay. 6 seeds
+/// here, 0.52–0.68 s in a debug build (measured 2026-10-06; cut from 12 to stay under 1 s,
+/// ruling L-R186dw); 300 in the ignored `d3_model_300_seeds`.
 #[test]
 fn d3_model_mixed_sizes_and_same_delta_targets() {
-    model_run(1..=12, MIXED);
+    model_run(1..=6, MIXED);
 }
 
 /// D3 repro 2's shape in the model: a records list, so every item is out of line, with deltas
-/// long enough to fill, split, empty and merge blocks of bare entries.
+/// long enough to fill, split, empty and merge blocks of bare entries. Seed 3 alone, the one of
+/// seeds 1–6 that splits, retires and merges by itself: 0.21–0.26 s in a debug build (measured
+/// 2026-10-06; cut from seeds 1–4 to stay under 1 s, ruling L-R186dw); 300 in the ignored
+/// `d3_model_300_seeds`.
 #[test]
 fn d3_model_records_list() {
-    model_run(1..=4, RECORDS);
+    model_run(3..=3, RECORDS);
 }
 
 /// Both D3 runs over 300 seeds, by hand: `cargo test -p rdb-value --test lists -- --ignored`.
@@ -3858,5 +3864,73 @@ fn w3_a_block_folded_at_or_over_a_quarter_of_b_does_not_merge_back() {
         "the pair fits ¾ · B: {left_len} + {right_len}"
     );
     let want = texts(&names[index(left_count - 7)..]);
+    assert_eq!(values(&k, &root), want);
+}
+
+/// W3 (W12 survived once the model seeds were cut, ruling L-R186dw): no merge-back beside a
+/// retire. Three blocks at B = 1024: the first trimmed to 7 items and folded at or over B/4 (no
+/// merge), the last split off by 20 pushes. One delta then empties the last block, which
+/// retires, and trims the middle one to 3 items with enough insert-and-remove pairs to fold it.
+/// The middle base is under B/4 and the pair with the first fits ¾ · B, so without the retire it
+/// would merge; beside the retire the two blocks stay.
+#[test]
+fn w3_no_merge_back_beside_a_retire() {
+    let root = todo();
+    let mut k = Kernel::new();
+    let names: Vec<String> = (0..30).map(|i| format!("{i:0>40}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    made(&mut k, &root, MIN_BLOCK_MAX, &names);
+    let first_count = block_index(&k, &root)[0].1;
+    let mut ops = vec![ListOp::Remove { at: 0 }; index(first_count - 7)];
+    while ops.len() < 242 {
+        ops.push(ListOp::Insert {
+            at: 0,
+            value: text("z"),
+        });
+        ops.push(ListOp::Remove { at: 0 });
+    }
+    write(&mut k, &root, MIN_BLOCK_MAX, &ops);
+    let more: Vec<String> = (30..50).map(|i| format!("{i:0>40}")).collect();
+    let pushes: Vec<ListOp> = more.iter().map(|v| ListOp::Push(text(v))).collect();
+    write(&mut k, &root, MIN_BLOCK_MAX, &pushes);
+    let blocks = block_index(&k, &root);
+    let [(a, 7), (b, b_count), (_, c_count)] = blocks[..] else {
+        panic!("three blocks, the first of 7: {blocks:?}")
+    };
+    // Empty the last block, then trim the middle one to 3 and fold it.
+    let c_at = 7 + b_count;
+    let mut ops = vec![ListOp::Remove { at: c_at }; index(c_count)];
+    ops.extend(vec![ListOp::Remove { at: 7 }; index(b_count - 3)]);
+    while ops.len() < 241 {
+        ops.push(ListOp::Insert {
+            at: 8,
+            value: text("z"),
+        });
+        ops.push(ListOp::Remove { at: 8 });
+    }
+    let mut want = values(&k, &root);
+    want.truncate(index(c_at));
+    want.drain(7..index(7 + b_count - 3));
+    write(&mut k, &root, MIN_BLOCK_MAX, &ops);
+    assert_eq!(
+        block_index(&k, &root),
+        [(a, 7), (b, 3)],
+        "a retire, no merge"
+    );
+    let (a_len, _) = base_of_block(&k, &root, a);
+    let (b_len, b_folded) = base_of_block(&k, &root, b);
+    assert_eq!(
+        b_folded,
+        block_refs(&k, &root)[1][2],
+        "the middle block folded"
+    );
+    assert!(
+        4 * b_len < MIN_BLOCK_MAX,
+        "the middle base is under B/4: {b_len}"
+    );
+    assert!(
+        4 * (a_len + b_len) <= 3 * MIN_BLOCK_MAX,
+        "the pair fits ¾ · B: {a_len} + {b_len}"
+    );
     assert_eq!(values(&k, &root), want);
 }
