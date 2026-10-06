@@ -125,6 +125,13 @@ fn root_payload(count: u64) -> Vec<u8> {
 fn open_root(version: u64, bytes: &[u8]) -> Result<Collection, ValueError> {
     let corrupt = ValueError::Corrupt;
     let opened = open(bytes).map_err(|e| corrupt(Corrupt::Envelope(e)))?;
+    // A block or slot record is never written at a root key, so one there is damage, not
+    // another kind of object (as on the list paths).
+    if matches!(opened.kind, Kind::ListBlock | Kind::ListSlot) {
+        return Err(corrupt(Corrupt::Root(
+            "a list block or slot record is at the root key",
+        )));
+    }
     let kind =
         CollectionKind::of(opened.kind).ok_or(ApplyError::KindMismatch { found: opened.kind })?;
     let payload = decode(opened.payload).map_err(|e| corrupt(Corrupt::Codec(e)))?;

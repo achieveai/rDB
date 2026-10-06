@@ -11,10 +11,12 @@ use rdb_core::{Generation, Namespace, SnapshotRead};
 use rdb_value::cbor;
 use rdb_value::envelope::{self, Kind};
 use rdb_value::keys::{block_key, RootKey, Sub, LIST_SLOTS};
-use rdb_value::list::{compile_list, create_list, drop_list, items, list, ListOp, Start, Token};
+use rdb_value::list::{
+    compile_list, create_list, drop_list, items, list, slot_op_no, ListOp, Start, Token,
+};
 use rdb_value::testing::{CountingSnapshot, MapSnapshot};
 use rdb_value::value::{MapKey, Value};
-use rdb_value::{Corrupt, Expected, ValueError};
+use rdb_value::{BlockFault, Corrupt, Expected, SlotFault, ValueError};
 
 use super::blob::emit;
 use super::coll::{element_arg, parse_version};
@@ -111,7 +113,7 @@ pub fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure>
 /// `items <id> [--from P | --token G:V:P] [--limit N]`: the list's `version`, `count`, `bytes`,
 /// `blocks` and `records`, then the items (`position`, `id`, `value`, `version`, and `in`:
 /// `block` when its block holds the value, `record` when it has its own), `next`, the token to
-/// resume from, or `null` at the end, and `opened`: the `get`, `scan` and `version` calls the read
+/// resume from as `G:V:P`, or `null` at the end, and `opened`: the `get`, `scan` and `version` calls the read
 /// made and the value bytes they returned, from a [`CountingSnapshot`].
 pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let (id, root, mut rest) = object(rest)?;
@@ -173,10 +175,8 @@ pub fn items_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure
         page.next.map_or_else(
             || "null".to_owned(),
             |t| {
-                format!(
-                    "{{\"generation\":{},\"version\":{},\"position\":{}}}",
-                    t.generation.0, t.version, t.position
-                )
+                // As `--token` takes it, so it pastes back.
+                json_str(&format!("{}:{}:{}", t.generation.0, t.version, t.position))
             },
         ),
     ));
@@ -337,7 +337,9 @@ fn uint(value: &Value) -> Option<u64> {
 /// record checked as [`check_record`] does, its envelope fields and its decoded payload. A base
 /// renders `{items, folded}`; an entry is `n` when the item has its own record, or `[n, value]`.
 /// A slot adds `op_no`, `op` and `state`: `pending` when the root's block entry and the base
-/// make its op no one to replay, `stale` when not, or why neither could be read.
+/// make its op no one to replay, `stale` when not, or why neither could be read. A slot payload
+/// that is not `[op no, op]` is an error, as a read refuses it: `OpBad` naming the op this slot
+/// holds pending, or the block's `Shape` when it holds none.
 pub fn dump_record(
     snapshot: &MapSnapshot,
     root: &RootKey,
@@ -362,26 +364,44 @@ pub fn dump_record(
     let value = check_record(sub, slot, raw)?;
     line.extend(envelope_fields(raw)?);
     line.raw("value", render(&value));
-    if let (Some(slot), Value::Array(parts)) = (slot, &value) {
-        if let [op_no, op] = parts.as_slice() {
-            line.raw("op_no", render(op_no));
-            line.raw("op", render(op));
-            line.str("state", &slot_state(snapshot, root, id, slot, op_no));
+    if let Some(slot) = slot {
+        let pending = pending_op(snapshot, root, id, slot);
+        let op_no = slot_op_no(&value).map_err(|why| {
+            let fault = match pending {
+                Ok(Some(op)) => BlockFault::OpBad {
+                    op,
+                    fault: SlotFault::Shape(why),
+                },
+                _ => BlockFault::Shape(why),
+            };
+            Failure::from(ValueError::Corrupt(Corrupt::Block { id, fault }))
+        })?;
+        if let Value::Array(parts) = &value {
+            line.raw("op_no", op_no.to_string());
+            line.raw("op", render(&parts[1]));
         }
+        let state = match pending {
+            Ok(op) if op == Some(op_no) => "pending".to_owned(),
+            Ok(_) => "stale".to_owned(),
+            Err(why) => why,
+        };
+        line.str("state", &state);
     }
     Ok(())
 }
 
-/// `pending` when op `op_no` is in its block's pending range `folded + 1 ..= head` and belongs in
-/// `slot`; `stale` when it is not. When the root or the base does not decode, says so instead.
-fn slot_state(snapshot: &MapSnapshot, root: &RootKey, id: u128, slot: u8, op_no: &Value) -> String {
+/// The op no in its block's pending range `folded + 1 ..= head` that belongs in `slot`, if any.
+/// When the root or the base does not decode, says so instead.
+fn pending_op(
+    snapshot: &MapSnapshot,
+    root: &RootKey,
+    id: u128,
+    slot: u8,
+) -> Result<Option<u64>, String> {
     let payload = |key: &[u8]| {
         let raw = snapshot.get(Namespace::User, key)?;
         let opened = envelope::open(&raw).ok()?;
         cbor::decode(opened.payload).ok()
-    };
-    let Some(op_no) = uint(op_no) else {
-        return "unknown: the op no is not an unsigned integer".to_owned();
     };
     // A block's n is its id's low 64 bits.
     let n = u64::try_from(id & u128::from(u64::MAX)).expect("the low 64 bits fit u64");
@@ -395,21 +415,19 @@ fn slot_state(snapshot: &MapSnapshot, root: &RootKey, id: u128, slot: u8, op_no:
         _ => None,
     });
     let Some(head) = head else {
-        return "unknown: the root does not name this block".to_owned();
+        return Err("unknown: the root does not name this block".to_owned());
     };
     let folded = payload(&block_key(root, id))
         .and_then(|base| field(&base, "folded"))
         .as_ref()
         .and_then(uint);
     let Some(folded) = folded else {
-        return "unknown: the block's base does not read".to_owned();
+        return Err("unknown: the block's base does not read".to_owned());
     };
-    let mine = op_no % u64::from(LIST_SLOTS) == u64::from(slot);
-    if mine && op_no > folded && op_no <= head {
-        "pending".to_owned()
-    } else {
-        "stale".to_owned()
-    }
+    let slots = u64::from(LIST_SLOTS);
+    // The first op no after `folded` that this slot holds; pending only up to `head`.
+    let op = folded + 1 + (u64::from(slot) + slots - (folded + 1) % slots) % slots;
+    Ok((op <= head).then_some(op))
 }
 
 /// An item record is a document envelope; a block base a block envelope; a change slot a slot

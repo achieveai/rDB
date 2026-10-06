@@ -12,7 +12,7 @@ use rdb_value::cbor::encode;
 use rdb_value::collection::{compile_collection, CollectionKind, ElemOp};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::envelope::{open, seal, EnvelopeError, Kind};
-use rdb_value::keys::{parse, root_key, RootKey, Sub};
+use rdb_value::keys::{parse, root_key, KeyError, RootKey, Sub};
 use rdb_value::list::{
     compile_list, drop_list, items, list, ListOp, Start, Token, DEFAULT_BLOCK_MAX, MIN_BLOCK_MAX,
 };
@@ -866,4 +866,459 @@ fn d2_a_write_refuses_a_damaged_item_record_as_the_read_does() {
             assert_eq!(write, read, "{name}");
         }
     }
+}
+
+/// Tester W1 re-walk N3: a stray key between two pending slots was reported as the next slot
+/// missing (`OpMissing`), though that slot is there. The stray is the fault, named as P8 names
+/// one: an 18-byte tail is `Key(ListIdTail{18})`. A read and a write name it alike.
+#[test]
+fn n3_a_stray_between_two_pending_slots_is_named_not_the_next_slot() {
+    let root = todo();
+    let mut k = Kernel::new();
+    let names: Vec<String> = (0..400).map(|i| format!("item {i}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &names);
+    for i in 0..30 {
+        write(
+            &mut k,
+            &root,
+            DEFAULT_BLOCK_MAX,
+            &[ListOp::Push(text(&format!("p{i}")))],
+        );
+    }
+    let slots: Vec<(Bytes, u64)> = k
+        .records
+        .iter()
+        .filter(|(key, _)| parse(key).is_ok_and(|p| p.root() == root && p.slot.is_some()))
+        .map(|(key, (version, _))| (key.clone(), *version))
+        .collect();
+    assert!(slots.len() >= 2, "the pushes stay pending in slots");
+    let (first, version) = slots[0].clone();
+    let mut stray = first.to_vec();
+    stray.push(0);
+    assert!(
+        stray.as_slice() < &slots[1].0[..],
+        "the stray sorts between two slots"
+    );
+    k.records
+        .insert(Bytes::from(stray), (version, Bytes::from_static(b"x")));
+    let named = ValueError::Corrupt(Corrupt::Key(KeyError::ListIdTail { len: 18 }));
+    let snap = k.snapshot();
+    let read = items(&snap, &root, Start::Position(0), usize::MAX).expect_err("read");
+    assert_eq!(read, named, "read");
+    let push = [ListOp::Push(text("y"))];
+    let write = compile_list(
+        &snap,
+        &root,
+        Expected::Version(version_of(&k, &root)),
+        DEFAULT_BLOCK_MAX,
+        &push,
+    )
+    .expect_err("write");
+    assert_eq!(write, named, "write");
+}
+
+/// Tester W1 re-walk N4: `limit` 0 reads the root only, from any position, as the doc says.
+/// From position 2 it read block 0 as well.
+#[test]
+fn n4_limit_0_reads_the_root_only_from_any_position() {
+    let root = todo();
+    let mut k = Kernel::new();
+    made(&mut k, &root, MIN_BLOCK_MAX, &["a", "b", "c", "d"]);
+    let snap = k.snapshot();
+    let opened = |position| {
+        let counting = CountingSnapshot::new(&snap);
+        let page = items(&counting, &root, Start::Position(position), 0).expect("read");
+        assert!(page.items.is_empty() && page.next.is_none(), "{position}");
+        (counting.calls(), counting.bytes())
+    };
+    assert_eq!(opened(2), opened(0), "from 2 and from 0");
+}
+
+fn len_u64(n: usize) -> u64 {
+    u64::try_from(n).expect("fits u64")
+}
+
+fn index(at: u64) -> usize {
+    usize::try_from(at).expect("fits usize")
+}
+
+/// A tiny deterministic generator (xorshift64*), so a failing seed reruns exactly.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// Uniform in `0..n`, `n > 0`.
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// The root's block index: `(n, count)` per block, in block order.
+fn block_index(k: &Kernel, root: &RootKey) -> Vec<(u64, u64)> {
+    let (_, raw) = &k.records[&root.to_bytes()];
+    let payload = rdb_value::cbor::decode(open(raw).expect("root envelope").payload).expect("cbor");
+    let Value::Map(fields) = payload else {
+        panic!("a list root is a map")
+    };
+    let Some(Value::Array(blocks)) = fields.get(&rdb_value::value::MapKey::new("blocks")) else {
+        panic!("a list root has blocks")
+    };
+    let uint = |v: &Value| match v {
+        Value::Integer(i) => u64::try_from(i.get()).expect("unsigned"),
+        other => panic!("not an integer: {other:?}"),
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            Value::Array(parts) => (uint(&parts[0]), uint(&parts[1])),
+            other => panic!("a block entry is an array: {other:?}"),
+        })
+        .collect()
+}
+
+/// Where a position lands, as the compile places it: the block holding `pos`, or with `end` the
+/// earlier block at a boundary (ADR-rdb-0016 §4's tie).
+fn locate(counts: &[u64], pos: u64, end: bool) -> usize {
+    let mut first = 0;
+    for (i, count) in counts.iter().enumerate() {
+        let after = first + count;
+        if pos < after || (end && pos == after) {
+            return i;
+        }
+        first = after;
+    }
+    unreachable!("position {pos} checked against the count")
+}
+
+/// W2 model check (coordinator, after W10–W12 survived): random deltas of pushes, inserts,
+/// removes, moves and replaces at `block_max` 1,024, a growing phase then a shrinking one, so
+/// blocks fill, split, empty, retire and merge. Every committed step must match a plain `Vec`
+/// (same values, same order, same count), keep every block base at or under B, and change the
+/// block index only as §4 allows: the blocks the ops emptied retire (all but the first when the
+/// list empties), at most one more block goes (one merge-back), none beside a retire, and a
+/// merged-into block's base is at most ¾ · B. A refused delta (`TooLarge`, `TooManyWrites`)
+/// leaves the model as it was. 20 seeds here (about 1 s in a debug build); 300 in the ignored
+/// `w2_model_300_seeds`, run by hand: `cargo test -p rdb-value --test lists -- --ignored`.
+#[test]
+fn w2_model_random_deltas_match_a_vec_and_keep_the_block_rules() {
+    model_run(1..=20);
+}
+
+/// [`w2_model_random_deltas_match_a_vec_and_keep_the_block_rules`] over 300 seeds (about 17 s).
+#[test]
+#[ignore = "about 17 s in a debug build; run by hand"]
+fn w2_model_300_seeds() {
+    model_run(1..=300);
+}
+
+fn model_run(seeds: std::ops::RangeInclusive<u64>) {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let (mut merges, mut retires, mut splits, mut refused, mut steps) = (0, 0, 0, 0, 0);
+    for seed in seeds {
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+        let mut k = Kernel::new();
+        made(&mut k, &root, B, &[]);
+        let mut model: Vec<Value> = Vec::new();
+        let mut minted = 0_u64;
+        for step in 0..60_u64 {
+            let growing = step < 30;
+            let before = block_index(&k, &root);
+            // Each block's post-op count, placed as the compile places ops.
+            let mut counts: Vec<u64> = before.iter().map(|(_, count)| *count).collect();
+            let mut next = model.clone();
+            let mut ops = Vec::new();
+            for _ in 0..=rng.below(6) {
+                let len = len_u64(next.len());
+                let roll = rng.below(100);
+                let add = if growing { roll < 60 } else { roll < 25 };
+                if add || len == 0 {
+                    minted += 1;
+                    let value = text(&format!(
+                        "{seed}.{minted}{}",
+                        "x".repeat(usize::try_from(rng.below(90)).expect("small"))
+                    ));
+                    if rng.below(2) == 0 {
+                        *counts.last_mut().expect("a list has a block") += 1;
+                        next.push(value.clone());
+                        ops.push(ListOp::Push(value));
+                    } else {
+                        let at = rng.below(len + 1);
+                        let i = locate(&counts, at, true);
+                        counts[i] += 1;
+                        next.insert(index(at), value.clone());
+                        ops.push(ListOp::Insert { at, value });
+                    }
+                } else if roll < 80 {
+                    let at = rng.below(len);
+                    let i = locate(&counts, at, false);
+                    counts[i] -= 1;
+                    next.remove(index(at));
+                    ops.push(ListOp::Remove { at });
+                } else if roll < 92 {
+                    let (from, to) = (rng.below(len), rng.below(len));
+                    let i = locate(&counts, from, false);
+                    counts[i] -= 1;
+                    let i = locate(&counts, to, true);
+                    counts[i] += 1;
+                    let value = next.remove(index(from));
+                    next.insert(index(to), value);
+                    ops.push(ListOp::Move { from, to });
+                } else {
+                    let at = rng.below(len);
+                    minted += 1;
+                    let value = text(&format!("{seed}.{minted}r"));
+                    next[index(at)] = value.clone();
+                    ops.push(ListOp::Replace { at, value });
+                }
+            }
+            let at = format!("seed {seed} step {step}");
+            let version = version_of(&k, &root);
+            let compiled =
+                match compile_list(&k.snapshot(), &root, Expected::Version(version), B, &ops) {
+                    Ok(compiled) => compiled,
+                    Err(ValueError::Apply(
+                        ApplyError::TooLarge { .. } | ApplyError::TooManyWrites { .. },
+                    )) => {
+                        refused += 1;
+                        continue;
+                    }
+                    Err(e) => panic!("{at}: {e:?} for {ops:?}"),
+                };
+            k.commit(compiled.compiled());
+            steps += 1;
+            model = next;
+            let page = items(&k.snapshot(), &root, Start::Position(0), usize::MAX).expect("read");
+            let read: Vec<Value> = page.items.into_iter().map(|item| item.value).collect();
+            assert_eq!(read, model, "{at}: items");
+            assert_eq!(page.list.count, len_u64(model.len()), "{at}: count");
+
+            let after = block_index(&k, &root);
+            let live: Vec<u64> = after.iter().map(|(n, _)| *n).collect();
+            let all_empty = model.is_empty();
+            let emptied: Vec<u64> = before
+                .iter()
+                .zip(&counts)
+                .enumerate()
+                .filter(|(i, (_, count))| **count == 0 && !(all_empty && *i == 0))
+                .map(|(_, ((n, _), _))| *n)
+                .collect();
+            let gone: Vec<u64> = before
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| !live.contains(n))
+                .collect();
+            assert!(
+                emptied.iter().all(|n| gone.contains(n)),
+                "{at}: an emptied block stayed"
+            );
+            let merged: Vec<u64> = gone
+                .iter()
+                .copied()
+                .filter(|n| !emptied.contains(n))
+                .collect();
+            assert!(merged.len() <= 1, "{at}: {} merge-backs", merged.len());
+            assert!(
+                merged.is_empty() || emptied.is_empty(),
+                "{at}: a merge-back beside a retire"
+            );
+            retires += emptied.len();
+            merges += merged.len();
+            splits += live
+                .iter()
+                .filter(|n| !before.iter().any(|(b, _)| b == *n))
+                .count();
+
+            // Every base, by its block n (an id's low 64 bits).
+            let mut bases = Vec::new();
+            for (key, (_, raw)) in &k.records {
+                let parsed = parse(key).expect("a list key");
+                if let (Sub::Block, None, Some(id)) = (parsed.sub, parsed.slot, parsed.list_id) {
+                    let len = open(raw).expect("base envelope").payload.len();
+                    assert!(len <= B, "{at}: a base of {len} bytes");
+                    bases.push((u64::try_from(id & u128::from(u64::MAX)).expect("low"), len));
+                }
+            }
+            assert_eq!(bases.len(), live.len(), "{at}: one base per live block");
+            if let [n] = merged[..] {
+                // The pair is written to the block left of the one that went: the block before
+                // its old successor now, or the last block when it had none.
+                let i = before
+                    .iter()
+                    .position(|(b, _)| *b == n)
+                    .expect("it was there");
+                let j = before.get(i + 1).map_or(live.len(), |(s, _)| {
+                    live.iter().position(|l| l == s).expect("live")
+                });
+                let left = live[j - 1];
+                let len = bases.iter().find(|(m, _)| *m == left).expect("a base").1;
+                assert!(4 * len <= 3 * B, "{at}: a merged base of {len} bytes");
+            }
+        }
+    }
+    eprintln!("w2 model: {steps} steps, {refused} refused, {splits} splits, {retires} retires, {merges} merges");
+    assert!(
+        splits > 0 && retires > 0 && merges > 0 && steps > 0,
+        "every rule was exercised"
+    );
+}
+
+/// One line of pushes for an end-split check: random lengths summing to a bit over B.
+fn split_line(seed: u64) -> Vec<ListOp> {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut total = 0;
+    let mut ops = Vec::new();
+    let target = MIN_BLOCK_MAX + 100 + usize::try_from(rng.below(700)).expect("small");
+    while total < target {
+        let len = 1 + usize::try_from(rng.below(120)).expect("small");
+        total += len + 4;
+        let value = format!("{seed}.{}{}", ops.len(), "x".repeat(len));
+        ops.push(ListOp::Push(text(&value)));
+    }
+    ops
+}
+
+/// W2 (W17 survived the walks): an end split keeps the longest prefix whose base fits B. Over
+/// 300 random lines of pushes into a fresh list at 1,024, each long enough to split once, the
+/// first block's base fits and would not fit with the next item's entry added.
+#[test]
+fn w2_an_end_split_keeps_the_longest_prefix_that_fits() {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let mut checked = 0;
+    for seed in 1..=300_u64 {
+        let ops = split_line(seed);
+        let mut k = Kernel::new();
+        let Ok(compiled) = compile_list(&k.snapshot(), &root, Expected::Absent, B, &ops) else {
+            continue; // a piece over B: refused, by design (G61)
+        };
+        k.commit(compiled.compiled());
+        let index = block_index(&k, &root);
+        if index.len() != 2 {
+            continue;
+        }
+        let kept = index[0].1;
+        let page = items(&k.snapshot(), &root, Start::Position(kept), 1).expect("read");
+        let next = &page.items[0];
+        let n = u64::try_from(next.id & u128::from(u64::MAX)).expect("low");
+        let entry = Value::Array(vec![
+            Value::Integer(rdb_value::value::Int::new(i128::from(n)).expect("int")),
+            next.value.clone(),
+        ]);
+        let entry_len = encode(&entry).expect("encode").len();
+        let base = k
+            .records
+            .iter()
+            .find(|(key, _)| {
+                let p = parse(key).expect("key");
+                p.sub == Sub::Block
+                    && p.slot.is_none()
+                    && p.list_id.map(|id| id & u128::from(u64::MAX)) == Some(u128::from(index[0].0))
+            })
+            .map(|(_, (_, raw))| open(raw).expect("base").payload.len())
+            .expect("block 0's base");
+        assert!(base <= B, "seed {seed}: kept base {base}");
+        // One more entry adds its bytes, and a byte of array head at 24 items (CBOR).
+        let grow = usize::from(kept + 1 == 24);
+        assert!(
+            base + entry_len + grow > B,
+            "seed {seed}: {kept} kept, base {base}, next entry {entry_len}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 100, "only {checked} lines split once");
+}
+
+/// W17 pinned: seed 3's line, where the end cut sits on the binary search's last step (a search
+/// that stops one step early keeps 12). The exact shape, count and bytes per block, from the root.
+#[test]
+fn w2_an_end_split_on_the_search_bound_has_this_shape() {
+    let root = todo();
+    let mut k = Kernel::new();
+    let compiled = compile_list(
+        &k.snapshot(),
+        &root,
+        Expected::Absent,
+        MIN_BLOCK_MAX,
+        &split_line(3),
+    )
+    .expect("one end split");
+    k.commit(compiled.compiled());
+    assert_eq!(block_shape(&k, &root), [(13, 950), (4, 356)]);
+}
+
+/// W2 (W18 survived the walks): halves takes the first of two equally good cuts (G36). A
+/// non-last block that folds over B with an odd number of equal-size entries has two cuts with
+/// the same gap; the left half keeps the smaller one.
+#[test]
+fn w2_halves_takes_the_first_of_two_equal_cuts() {
+    const B: usize = MIN_BLOCK_MAX;
+    let root = todo();
+    let mut k = Kernel::new();
+    // 23 throwaway items, then none: every later item n is 24 or more, so 40-char values all
+    // encode to entries of one size.
+    let zs: Vec<String> = (0..23).map(|i| format!("z{i}")).collect();
+    let zs: Vec<&str> = zs.iter().map(String::as_str).collect();
+    made(&mut k, &root, B, &zs);
+    write(&mut k, &root, B, &vec![ListOp::Remove { at: 0 }; 23]);
+    let value = |i: usize| text(&format!("{i:0>40}"));
+    let pushes: Vec<ListOp> = (0..30).map(|i| ListOp::Push(value(i))).collect();
+    write(&mut k, &root, B, &pushes);
+    let index = block_index(&k, &root);
+    assert_eq!(index.len(), 2, "an end split");
+    let first = index[0].1;
+    // Enough inserts into the first block to fold it, leaving an odd count over B.
+    let inserts = if (first + 7) % 2 == 1 { 7 } else { 8 };
+    let ops: Vec<ListOp> = (0..inserts)
+        .map(|i| ListOp::Insert {
+            at: 0,
+            value: value(100 + i),
+        })
+        .collect();
+    write(&mut k, &root, B, &ops);
+    let index = block_index(&k, &root);
+    let total = first + u64::try_from(inserts).expect("small");
+    assert_eq!(index.len(), 3, "the first block split in halves: {index:?}");
+    assert_eq!(index[0].1 + index[1].1, total, "{index:?}");
+    assert_eq!(
+        index[0].1,
+        (total - 1) / 2,
+        "the first of the two equal cuts: {index:?}"
+    );
+    // Every value is 40 chars, 42 bytes encoded: the two halves are exactly this.
+    let left = (total - 1) / 2;
+    assert_eq!(
+        block_shape(&k, &root)[..2],
+        [(left, 42 * left), (left + 1, 42 * (left + 1))]
+    );
+}
+
+/// The root's block index as `(count, bytes)` per block, in block order.
+fn block_shape(k: &Kernel, root: &RootKey) -> Vec<(u64, u64)> {
+    let (_, raw) = &k.records[&root.to_bytes()];
+    let payload = rdb_value::cbor::decode(open(raw).expect("root envelope").payload).expect("cbor");
+    let Value::Map(fields) = payload else {
+        panic!("a list root is a map")
+    };
+    let Some(Value::Array(blocks)) = fields.get(&rdb_value::value::MapKey::new("blocks")) else {
+        panic!("a list root has blocks")
+    };
+    let uint = |v: &Value| match v {
+        Value::Integer(i) => u64::try_from(i.get()).expect("unsigned"),
+        other => panic!("not an integer: {other:?}"),
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            Value::Array(parts) => (uint(&parts[1]), uint(&parts[2])),
+            other => panic!("a block entry is an array: {other:?}"),
+        })
+        .collect()
 }

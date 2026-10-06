@@ -140,6 +140,9 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   replay is empty. Two orphan checks, each a `scan` with limit 1: from `prefix | 0x02` it must find the base; from
   `block key ‖ 0xF0` it must find nothing under `0x03`. Each reads at most one record outside the list, like create's check.
   Writes the root `Delete` (`Some(v)`), the base and the slot key of every op no 1 … `head` (≤ 240, present or not).
+  Any other key between the base and `block key ‖ 0xF0` passes both checks. Reads and writes look only at the pending run
+  (a stray inside it is `OpMissing`), so they ignore one elsewhere; the drop leaves it behind, and a later create at that
+  object refuses with `Corrupt(OrphanElement)`.
 
 ### 6. Reads, versions, tokens, and finding an item by id
 - `list(snapshot, &RootKey) -> Option<List{version, count, bytes, blocks}>`. `items(snapshot, &RootKey, Position(p) |

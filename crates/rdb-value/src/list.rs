@@ -106,6 +106,22 @@ const fn worst_op(block_max: usize, e: usize) -> usize {
 // a list takes (ADR-rdb-0016 §4).
 const _: () = assert!(worst_op(DEFAULT_BLOCK_MAX, MAX_ID_ESCAPED) <= MAX_ENVELOPE_BYTES);
 const _: () = assert!(worst_op(MAX_BLOCK_MAX, MAX_ID_ESCAPED) <= MAX_ENVELOPE_BYTES);
+/// The bytes a Move that retires one block can write (ADR-rdb-0016 §4): the request, the root,
+/// the other block folded and split, and the retired block's 241 key deletes.
+const fn worst_retire(block_max: usize, e: usize) -> usize {
+    let key = SCOPE_AND_SUB + e;
+    266 + (PUT_COST + key + HEADER_LEN + MAX_ROOT_PAYLOAD)
+        + 2 * (PUT_COST + key + LIST_ID_LEN + HEADER_LEN)
+        + block_max / 4 * 5
+        + MAX_SLOT_PAYLOAD
+        + (6 + key + LIST_ID_LEN)
+        + LIST_SLOTS as usize * (6 + key + LIST_ID_LEN + 1)
+}
+
+// Retiring a block fits one request at both block sizes for the longest id: emptying a list
+// never fails on bytes.
+const _: () = assert!(worst_retire(DEFAULT_BLOCK_MAX, MAX_ID_ESCAPED) <= MAX_ENVELOPE_BYTES);
+const _: () = assert!(worst_retire(MAX_BLOCK_MAX, MAX_ID_ESCAPED) <= MAX_ENVELOPE_BYTES);
 // A base left unsplit at the block cap, 1.25 · B and one entry, is one a reader takes.
 const _: () = assert!(MAX_BLOCK_MAX / 4 * 5 + MAX_SLOT_PAYLOAD <= MAX_BLOCK_PAYLOAD);
 
@@ -337,6 +353,12 @@ fn parse_entry(value: &Value) -> Result<Entry, &'static str> {
     })
 }
 
+/// A change slot's payload checked as a read checks it: its op no, or why it is not
+/// `[op no, op]`. For tools that show a slot without replaying its block, such as a dump.
+pub fn slot_op_no(value: &Value) -> Result<u64, &'static str> {
+    parse_slot(value).map(|(op_no, _)| op_no)
+}
+
 /// A slot's `[op no, op]`.
 fn parse_slot(value: &Value) -> Result<(u64, Change), &'static str> {
     let Value::Array(parts) = value else {
@@ -377,6 +399,53 @@ fn block_value(entries: &[Entry], folded: u64) -> Value {
     Value::Map(map)
 }
 
+/// The encoded length of a block's entries: what "grows its replayed payload" measures at the
+/// block cap (ADR-rdb-0016 §4). `folded` is left out, so an op no gaining a digit is no growth.
+fn items_len(entries: &[Entry]) -> Result<usize, ValueError> {
+    let items = Value::Array(entries.iter().map(Entry::value).collect());
+    Ok(encode(&items).map_err(ApplyError::from)?.len())
+}
+
+/// Where the last block splits (G35): the longest prefix whose base, at `folded`, is at most
+/// `block_max`. Called only when the whole block is over it.
+fn end_split(entries: &[Entry], folded: u64, block_max: usize) -> Result<usize, ValueError> {
+    let fits = |k: usize| -> Result<bool, ValueError> {
+        let base = encode(&block_value(&entries[..k], folded)).map_err(ApplyError::from)?;
+        Ok(base.len() <= block_max)
+    };
+    // A base grows with its prefix: the empty prefix fits and the whole block does not.
+    let (mut lo, mut hi) = (0, entries.len());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if fits(mid)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok(lo)
+}
+
+/// Where any other block splits (G36): the first cut, `1 … len − 1`, that leaves the two sides'
+/// entry bytes closest.
+fn halves(entries: &[Entry]) -> Result<usize, ValueError> {
+    let sizes = entries
+        .iter()
+        .map(|entry| encode(&entry.value()).map(|bytes| bytes.len()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApplyError::from)?;
+    let total: usize = sizes.iter().sum();
+    let (mut best, mut cut, mut left) = (usize::MAX, 1, 0);
+    for (k, size) in sizes.iter().enumerate().take(sizes.len().saturating_sub(1)) {
+        left += size;
+        let gap = (2 * left).abs_diff(total);
+        if gap < best {
+            (best, cut) = (gap, k + 1);
+        }
+    }
+    Ok(cut)
+}
+
 /// A block payload, decoded: its entries and `folded`.
 fn parse_block(value: &Value) -> Result<(Vec<Entry>, u64), &'static str> {
     let Value::Map(fields) = value else {
@@ -407,6 +476,7 @@ struct BlockRef {
 }
 
 /// A root payload, decoded.
+#[derive(Clone)]
 struct Root {
     /// The next `n` to mint, for items and blocks.
     next: u64,
@@ -631,12 +701,16 @@ fn load_block(
         let limit = usize::try_from(len).expect("at most 240 pending ops");
         let found = snapshot.scan(Namespace::User, &slot_key(root, id, slot_of(from)), limit);
         for (op, i) in (from..from + len).zip(0..) {
-            // A scan entry that is not this op's slot means the slot is missing (§3).
-            let raw = found
-                .get(i)
-                .filter(|(found_key, _)| *found_key == slot_key(root, id, slot_of(op)))
-                .map(|(_, value)| value)
-                .ok_or_else(|| fault(BlockFault::OpMissing { op }))?;
+            // A scan entry past this op's slot means the slot is missing (§3); one before it is a
+            // stray key between two slots, and is named as a drop names one.
+            let expected = slot_key(root, id, slot_of(op));
+            let raw = match found.get(i) {
+                Some((found_key, value)) if *found_key == expected => value,
+                Some((found_key, _)) if *found_key < expected => {
+                    return Err(stray(root, found_key))
+                }
+                _ => return Err(fault(BlockFault::OpMissing { op })),
+            };
             let bad = |fault| {
                 ValueError::Corrupt(Corrupt::Block {
                     id,
@@ -746,7 +820,8 @@ pub fn items(
     let mut first = 0_u64;
     for block in &found.blocks {
         let after = first + block.count;
-        if first >= end {
+        // Nothing from here on is in [position, end): `limit` 0 reads no block from any position.
+        if first.max(position) >= end {
             break;
         }
         if after > position {
@@ -841,8 +916,65 @@ struct Work {
     /// The stored pending slots' payload bytes.
     pending_bytes: usize,
     entries: Vec<Entry>,
+    /// The encoded length of its entries when opened: an op at the block cap must not grow it
+    /// past B (ADR-rdb-0016 §4).
+    start_items: usize,
     /// This compile's ops on the block, in order: op nos `head − len + 1 … head`.
     ops: Vec<Change>,
+}
+
+/// How a block the compile touched or made ends (ADR-rdb-0016 §4).
+#[derive(Clone)]
+enum Fate {
+    /// Written whole: this base payload.
+    Base(Vec<u8>),
+    /// Each op in its slot: the op no and the slot payload.
+    Slots(Vec<(u64, Vec<u8>)>),
+    /// Deleted: every key it has stored.
+    Retired(Vec<Bytes>),
+}
+
+/// Each touched or made block's fate, by `n`.
+type Fates = BTreeMap<u64, Fate>;
+
+/// A compile's end: the root and the writes, and the same with one merge-back, when there is
+/// one. The merge-back is taken only if it fits both request caps.
+struct Finished {
+    list: Root,
+    writes: BTreeMap<Bytes, Option<Bytes>>,
+    merged: Option<(Root, BTreeMap<Bytes, Option<Bytes>>)>,
+}
+
+/// The item, block and slot writes, by key: `Some` puts, `None` deletes.
+fn emit(
+    root: &RootKey,
+    list: &Root,
+    items: &BTreeMap<Bytes, Option<Bytes>>,
+    fates: &BTreeMap<u64, Fate>,
+) -> Result<BTreeMap<Bytes, Option<Bytes>>, ValueError> {
+    let mut writes = items.clone();
+    for (&n, fate) in fates {
+        let id = list.id(n);
+        match fate {
+            Fate::Base(payload) => {
+                let base = seal(Kind::ListBlock, payload).map_err(ApplyError::from)?;
+                writes.insert(block_key(root, id), Some(base));
+            }
+            Fate::Slots(slots) => {
+                for (op, payload) in slots {
+                    let slot = u8::try_from(op % SLOTS).expect("a slot is below 240");
+                    let sealed = seal(Kind::ListSlot, payload).map_err(ApplyError::from)?;
+                    writes.insert(slot_key(root, id, slot), Some(sealed));
+                }
+            }
+            Fate::Retired(keys) => {
+                for key in keys {
+                    writes.insert(key.clone(), None);
+                }
+            }
+        }
+    }
+    Ok(writes)
 }
 
 /// The compile's copy of one list: the root's fields, every block it opened (each replayed and
@@ -894,6 +1026,7 @@ impl Draft<'_> {
                     base_len: Some(loaded.base_len),
                     folded: loaded.folded,
                     pending_bytes: loaded.pending_bytes,
+                    start_items: items_len(&loaded.entries)?,
                     entries: loaded.entries,
                     ops: Vec::new(),
                 },
@@ -978,9 +1111,15 @@ impl Draft<'_> {
         !self.list.records && len <= inline_limit(self.block_max)
     }
 
-    /// Put `entry`, an item of `len` value bytes, at `pos`.
-    fn insert(&mut self, pos: u64, entry: Entry, len: u64) -> Result<(), ValueError> {
-        let (i, at) = self.locate(pos, true);
+    /// Put `entry`, an item of `len` value bytes, at `pos`; with `push`, at the end of the last
+    /// block (ADR-rdb-0016 §4's boundary tie).
+    fn insert(&mut self, pos: u64, push: bool, entry: Entry, len: u64) -> Result<(), ValueError> {
+        let (i, at) = if push {
+            let last = self.list.blocks.len() - 1;
+            (last, self.list.blocks[last].count)
+        } else {
+            self.locate(pos, true)
+        };
         self.open_block(i)?.entries.insert(index(at), entry.clone());
         self.record(i, Change::Insert { at, entry }, 1, i128::from(len))
     }
@@ -1074,8 +1213,8 @@ impl Draft<'_> {
     /// Run one op; returns the id it minted, if any.
     fn apply(&mut self, op: &ListOp) -> Result<Option<u128>, ValueError> {
         match op {
-            ListOp::Push(value) => self.add(self.list.count, value).map(Some),
-            ListOp::Insert { at, value } => self.add(*at, value).map(Some),
+            ListOp::Push(value) => self.add(self.list.count, true, value).map(Some),
+            ListOp::Insert { at, value } => self.add(*at, false, value).map(Some),
             ListOp::Remove { at } => {
                 self.check_position(*at, false)?;
                 let (entry, _) = self.take(*at)?;
@@ -1096,14 +1235,14 @@ impl Draft<'_> {
                 self.check_position(*from, false)?;
                 self.check_position(*to, false)?;
                 let (entry, len) = self.take(*from)?;
-                self.insert(*to, entry, len)?;
+                self.insert(*to, false, entry, len)?;
                 Ok(None)
             }
         }
     }
 
-    /// Push or insert `value` at `at` under a new id.
-    fn add(&mut self, at: u64, value: &Value) -> Result<u128, ValueError> {
+    /// Push (`push`, with `at` the count) or insert `value` at `at` under a new id.
+    fn add(&mut self, at: u64, push: bool, value: &Value) -> Result<u128, ValueError> {
         self.check_position(at, true)?;
         let (len, envelope) = self.place(value)?;
         let n = self.mint()?;
@@ -1118,28 +1257,86 @@ impl Draft<'_> {
                 None
             }
         };
-        self.insert(at, Entry { n, inline }, len_u64(len))?;
+        self.insert(at, push, Entry { n, inline }, len_u64(len))?;
         Ok(id)
     }
 
-    /// The item, block and slot writes, by key: `Some` puts, `None` deletes. A record minted
-    /// and freed in this compile writes nothing. Each touched block is folded, or takes one
-    /// slot per op (ADR-rdb-0016 §3).
-    fn writes(self) -> Result<BTreeMap<Bytes, Option<Bytes>>, ValueError> {
-        let mut writes = BTreeMap::new();
-        for (id, slot) in self.items {
+    /// End the compile (ADR-rdb-0016 §4): retire the emptied blocks, fold or slot each touched
+    /// block, split the folds over B in block order, then find at most one merge-back. A record
+    /// minted and freed in this compile writes nothing.
+    fn finish(mut self) -> Result<Finished, ValueError> {
+        let mut items = BTreeMap::new();
+        for (id, slot) in std::mem::take(&mut self.items) {
             if slot.stored || slot.value.is_some() {
-                writes.insert(item_key(self.root, id), slot.value);
+                items.insert(item_key(self.root, id), slot.value);
             }
         }
-        for (n, work) in self.blocks {
-            let block = self
-                .list
-                .blocks
-                .iter()
-                .find(|b| b.n == n)
-                .expect("a block the compile opened is in the index");
-            let id = self.list.id(n);
+        let mut fates = BTreeMap::new();
+        let retired = self.retire(&mut fates);
+        self.settle(&mut fates)?;
+        // No merge-back beside a retire (ADR-rdb-0016 §4).
+        let merged = if retired {
+            None
+        } else {
+            self.merge_back(&fates)?
+        };
+        let writes = emit(self.root, &self.list, &items, &fates)?;
+        let merged = merged
+            .map(|(list, fates)| {
+                let writes = emit(self.root, &list, &items, &fates)?;
+                Ok::<_, ValueError>((list, writes))
+            })
+            .transpose()?;
+        Ok(Finished {
+            list: self.list,
+            writes,
+            merged,
+        })
+    }
+
+    /// Retire every block the ops emptied that is not the only one: its base and the slot of
+    /// every op no 1 … `head` go, present or not (G62). When the ops emptied the list, the first
+    /// block stays. Returns whether any block was retired.
+    fn retire(&mut self, fates: &mut BTreeMap<u64, Fate>) -> bool {
+        let all_empty = self.list.count == 0;
+        let mut kept = Vec::with_capacity(self.list.blocks.len());
+        for (i, block) in self.list.blocks.iter().enumerate() {
+            if block.count == 0 && !(all_empty && i == 0) {
+                self.blocks
+                    .remove(&block.n)
+                    .expect("a root names an empty block only alone, so the ops emptied this one");
+                let keys = block_keys(self.root, self.list.id(block.n), block.head);
+                fates.insert(block.n, Fate::Retired(keys));
+            } else {
+                kept.push(*block);
+            }
+        }
+        let retired = kept.len() < self.list.blocks.len();
+        self.list.blocks = kept;
+        retired
+    }
+
+    /// Fold or slot each touched block, in block order, and split a fold over B: the last block
+    /// at its end (G35), any other in halves (G36). A piece over B is refused (G61). At the block
+    /// cap a fold over B is written unsplit (G63), unless the ops grew the block past B, which is
+    /// refused even when it would take only slots (G38).
+    fn settle(&mut self, fates: &mut BTreeMap<u64, Fate>) -> Result<(), ValueError> {
+        let block_max = self.block_max;
+        let too_large = |len| -> ValueError {
+            ApplyError::TooLarge {
+                limit: SizeLimit::List { len, block_max },
+            }
+            .into()
+        };
+        // A delta that empties the list writes its first block empty, `folded = head`.
+        let emptied = self.list.count == 0;
+        let mut i = 0;
+        while i < self.list.blocks.len() {
+            let block = self.list.blocks[i];
+            i += 1;
+            let Some(work) = self.blocks.get(&block.n) else {
+                continue;
+            };
             let first = block.head - len_u64(work.ops.len()) + 1;
             let slots = (first..)
                 .zip(&work.ops)
@@ -1153,36 +1350,129 @@ impl Draft<'_> {
             // Fold when the pending ops would pass the slots, or their bytes a quarter of the
             // base's; a block this compile made, or a base over B, always folds (ADR-rdb-0016
             // §3, G66).
-            let fold = work.base_len.is_none_or(|base_len| {
-                base_len > self.block_max
-                    || block.head - work.folded > SLOTS
-                    || 4 * (work.pending_bytes + new_bytes) > base_len
-            });
-            if fold {
-                let payload =
-                    encode(&block_value(&work.entries, block.head)).map_err(ApplyError::from)?;
-                // No delta writes a base over B. W1 has no split, so such a fold is refused
-                // (rev 6 B1).
-                if payload.len() > self.block_max {
-                    return Err(ApplyError::TooLarge {
-                        limit: SizeLimit::List {
-                            len: payload.len(),
-                            block_max: self.block_max,
-                        },
-                    }
-                    .into());
-                }
-                let base = seal(Kind::ListBlock, &payload).map_err(ApplyError::from)?;
-                writes.insert(block_key(self.root, id), Some(base));
+            let fold = emptied
+                || work.base_len.is_none_or(|base_len| {
+                    base_len > self.block_max
+                        || block.head - work.folded > SLOTS
+                        || 4 * (work.pending_bytes + new_bytes) > base_len
+                });
+            let payload =
+                encode(&block_value(&work.entries, block.head)).map_err(ApplyError::from)?;
+            let at_cap = self.list.blocks.len() >= MAX_BLOCKS;
+            if at_cap
+                && payload.len() > self.block_max
+                && items_len(&work.entries)? > work.start_items
+            {
+                return Err(too_large(payload.len()));
+            }
+            if !fold {
+                fates.insert(block.n, Fate::Slots(slots));
+                continue;
+            }
+            if payload.len() <= self.block_max || at_cap {
+                fates.insert(block.n, Fate::Base(payload));
+                continue;
+            }
+            let entries = &work.entries;
+            let k = if i == self.list.blocks.len() {
+                end_split(entries, block.head, self.block_max)?
             } else {
-                for (op, payload) in slots {
-                    let slot = u8::try_from(op % SLOTS).expect("a slot is below 240");
-                    let sealed = seal(Kind::ListSlot, &payload).map_err(ApplyError::from)?;
-                    writes.insert(slot_key(self.root, id, slot), Some(sealed));
+                halves(entries)?
+            };
+            let left = encode(&block_value(&entries[..k], block.head)).map_err(ApplyError::from)?;
+            let right = encode(&block_value(&entries[k..], 0)).map_err(ApplyError::from)?;
+            if left.len() > self.block_max || right.len() > self.block_max {
+                return Err(too_large(left.len().max(right.len())));
+            }
+            let moved = entries[k..].to_vec();
+            let mut bytes = 0_u64;
+            for entry in &moved {
+                bytes += self.item_len(entry)?;
+            }
+            let n = self.mint()?;
+            let count = len_u64(moved.len());
+            let kept = &mut self.list.blocks[i - 1];
+            kept.count -= count;
+            kept.bytes -= bytes;
+            self.list.blocks.insert(
+                i,
+                BlockRef {
+                    n,
+                    count,
+                    bytes,
+                    head: 0,
+                },
+            );
+            self.blocks
+                .get_mut(&block.n)
+                .expect("the block being split is open")
+                .entries
+                .truncate(k);
+            self.blocks.insert(
+                n,
+                Work {
+                    base_len: None,
+                    folded: 0,
+                    pending_bytes: 0,
+                    start_items: 0,
+                    entries: moved,
+                    ops: Vec::new(),
+                },
+            );
+            fates.insert(block.n, Fate::Base(left));
+            fates.insert(n, Fate::Base(right));
+            // The new block is written whole; skip it.
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// The first merge-back in block order (G37): a block this compile folded under B/4, with
+    /// its left neighbour, else its right, when the pair is at most ¾ · B. The left block
+    /// survives, `folded = head`; every key the right one can hold is deleted, and this
+    /// compile's slots to either are dropped. Returns the root and fates with it, or `None`.
+    fn merge_back(&self, fates: &Fates) -> Result<Option<(Root, Fates)>, ValueError> {
+        let blocks = &self.list.blocks;
+        for (i, block) in blocks.iter().enumerate() {
+            let Some(Fate::Base(payload)) = fates.get(&block.n) else {
+                continue;
+            };
+            if 4 * payload.len() >= self.block_max {
+                continue;
+            }
+            let neighbours = [i.checked_sub(1), (i + 1 < blocks.len()).then_some(i + 1)];
+            for j in neighbours.into_iter().flatten() {
+                let (l, r) = (i.min(j), i.max(j));
+                let (left, right) = (blocks[l], blocks[r]);
+                let mut entries = self.replayed(&left)?;
+                entries.extend(self.replayed(&right)?);
+                let pair = encode(&block_value(&entries, left.head)).map_err(ApplyError::from)?;
+                if 4 * pair.len() > 3 * self.block_max {
+                    continue;
                 }
+                let mut list = self.list.clone();
+                list.blocks.remove(r);
+                list.blocks[l].count += right.count;
+                list.blocks[l].bytes += right.bytes;
+                let mut merged = fates.clone();
+                merged.insert(left.n, Fate::Base(pair));
+                let right_keys = block_keys(self.root, self.list.id(right.n), right.head);
+                merged.insert(right.n, Fate::Retired(right_keys));
+                return Ok(Some((list, merged)));
             }
         }
-        Ok(writes)
+        Ok(None)
+    }
+
+    /// A block's entries as the ops leave them: this compile's copy, or the block read,
+    /// replayed and checked.
+    fn replayed(&self, block: &BlockRef) -> Result<Vec<Entry>, ValueError> {
+        if let Some(work) = self.blocks.get(&block.n) {
+            return Ok(work.entries.clone());
+        }
+        let id = self.list.id(block.n);
+        let loaded = load_block(self.snapshot, self.root, self.root_version, id, block)?;
+        Ok(loaded.entries)
     }
 }
 
@@ -1271,6 +1561,7 @@ fn compile(
                     folded: 0,
                     pending_bytes: 0,
                     entries: Vec::new(),
+                    start_items: items_len(&[])?,
                     ops: Vec::new(),
                 },
             );
@@ -1303,32 +1594,49 @@ fn compile(
         }
     }
 
-    let root_value = seal(Kind::List, &draft.list.payload()?).map_err(ApplyError::from)?;
-    // The root sorts before every item, block and slot (sub 0x00 < 0x02 < 0x03), so this keeps
-    // key order.
-    let mut mutations = vec![Mutation::Put {
-        key: root.to_bytes(),
-        value: root_value,
-        expected_version,
-    }];
-    mutations.extend(draft.writes()?.into_iter().map(|(key, value)| match value {
-        Some(value) => Mutation::Put {
-            key,
+    let finished = draft.finish()?;
+    let request = |list: &Root, writes: BTreeMap<Bytes, Option<Bytes>>| {
+        let value = seal(Kind::List, &list.payload()?).map_err(ApplyError::from)?;
+        // The root sorts before every item, block and slot (sub 0x00 < 0x02 < 0x03), so this
+        // keeps key order.
+        let mut mutations = vec![Mutation::Put {
+            key: root.to_bytes(),
             value,
-            expected_version: None,
-        },
-        None => Mutation::Delete {
-            key,
-            expected_version: None,
-        },
-    }));
+            expected_version,
+        }];
+        mutations.extend(writes.into_iter().map(|(key, value)| match value {
+            Some(value) => Mutation::Put {
+                key,
+                value,
+                expected_version: None,
+            },
+            None => Mutation::Delete {
+                key,
+                expected_version: None,
+            },
+        }));
+        Ok::<_, ValueError>(mutations)
+    };
+    // The kernel's own measure of the record it would ship (L-R186v).
+    let fits = |mutations: &[Mutation]| {
+        mutations.len() <= MAX_REQUEST_MUTATIONS
+            && record_len(conditions.len(), mutations) <= MAX_ENVELOPE_BYTES
+    };
+    // A merge-back is taken only when it fits; it is never a reason to refuse (G37).
+    let merged = match finished.merged {
+        Some((list, writes)) => Some(request(&list, writes)?).filter(|m| fits(m)),
+        None => None,
+    };
+    let mutations = match merged {
+        Some(mutations) => mutations,
+        None => request(&finished.list, finished.writes)?,
+    };
     if mutations.len() > MAX_REQUEST_MUTATIONS {
         return Err(ApplyError::TooManyWrites {
             writes: mutations.len(),
         }
         .into());
     }
-    // The kernel's own measure of the record it would ship (L-R186v).
     if record_len(conditions.len(), &mutations) > MAX_ENVELOPE_BYTES {
         return Err(ApplyError::TooLarge {
             limit: SizeLimit::Write,
