@@ -1922,6 +1922,49 @@ fn chunk_limits_sit_exactly_at_the_format_constants() {
 
 // ---- kind checks -----------------------------------------------------------------------------
 
+/// Adjacent leftover to S4 P3: a list block or slot record at a blob root read as
+/// `KindMismatch`, as if another kind of object were there. Those records are never written at
+/// a root key, so every blob path that opens the root names the damage instead.
+#[test]
+fn a_list_block_or_slot_at_a_blob_root_is_damage_on_every_path() {
+    let root = photo();
+    for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let mut s = MapSnapshot::new(Generation(1));
+        s.insert(root.to_bytes(), 4, seal(kind, &h("a0")).unwrap());
+        let damage = ValueError::Corrupt(Corrupt::ListRecordAtRoot { found: kind });
+        assert_eq!(
+            read_blob(&s, &root),
+            Err(damage.clone()),
+            "read_blob, {kind:?}"
+        );
+        assert_eq!(
+            read_range(&s, &root, 0, 0),
+            Err(damage.clone()),
+            "read_range, {kind:?}"
+        );
+        assert_eq!(
+            delete_blob(&s, &root, 4).map(|_| ()),
+            Err(damage.clone()),
+            "delete_blob, {kind:?}"
+        );
+        assert_eq!(
+            publish(
+                &s,
+                &root,
+                Expected::Version(4),
+                &U1,
+                0,
+                4,
+                &pin(B3_SHA),
+                Generation(1)
+            )
+            .map(|_| ()),
+            Err(damage.clone()),
+            "publish, {kind:?}"
+        );
+    }
+}
+
 /// `KindMismatch` both ways: a blob operation on a document or a map names the
 /// kind it found, and a document or map operation on a blob names `Blob`.
 #[test]

@@ -98,6 +98,13 @@ pub enum Corrupt {
         /// The item's envelope kind.
         found: Kind,
     },
+    /// A document or blob root key holds a list block or slot record. Those are never written at
+    /// a root key, so this is damage, not another kind of object.
+    #[error("a list {found:?} record is at the root key")]
+    ListRecordAtRoot {
+        /// The record's envelope kind.
+        found: Kind,
+    },
     /// A set member's record holds bytes; it must be empty.
     #[error("set member record holds {len} bytes")]
     SetMemberHasValue {
@@ -305,16 +312,28 @@ pub(crate) fn record(
     }
 }
 
+/// Refuse a list block or slot record found at a document or blob root key. Those are never
+/// written at a root key, so one there is damage, not another kind of object.
+pub(crate) fn refuse_list_record_at_root(kind: Kind) -> Result<(), ValueError> {
+    match kind {
+        Kind::ListBlock | Kind::ListSlot => Err(ValueError::Corrupt(Corrupt::ListRecordAtRoot {
+            found: kind,
+        })),
+        _ => Ok(()),
+    }
+}
+
 /// The document at `root` in [`Namespace::User`], or `None` when there is no record.
 ///
 /// # Errors
-/// [`ApplyError::KindMismatch`] when the object is a map or a set; [`ValueError::Corrupt`] when
-/// the record does not open or decode.
+/// [`ApplyError::KindMismatch`] when the object is another kind; [`ValueError::Corrupt`] when
+/// the record does not open or decode, or is a list block or slot record.
 pub fn read(snapshot: &dyn SnapshotRead, root: &RootKey) -> Result<Option<Document>, ValueError> {
     let Some((version, bytes)) = record(snapshot, root.as_bytes())? else {
         return Ok(None);
     };
     let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+    refuse_list_record_at_root(opened.kind)?;
     if opened.kind != Kind::Document {
         return Err(ApplyError::KindMismatch { found: opened.kind }.into());
     }

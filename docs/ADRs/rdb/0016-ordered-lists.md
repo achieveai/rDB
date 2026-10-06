@@ -64,10 +64,11 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   skips slot writes, so some may be absent. Every **pending** op no's slot exists. Split, merge-back and retire keep this.
 - **Replay:** a reader `get`s the base, then reads the pending slots with one `scan` from slot `(folded + 1) mod 240`,
   limit p, or two when the range wraps past slot 239 (the second from slot 0). It never reads a stale slot or a key past the
-  block. A scan entry whose key is not the expected slot is `OpMissing`. It decodes the base, applies the pending ops in
-  op-no order, and checks the result's count against the root. Nothing reaches the caller until all checks pass. A slot
-  needs no version check: its op-no match, the block's version check and the root's version guard it. (A missing pending
-  slot can make a scan return up to p records past the block; the read is refused.)
+  block. A scan entry past the expected slot is `OpMissing`; one before it is a stray key, named the way a drop names one
+  (`Key(..)`, §7). It decodes the base, applies the pending ops in op-no order, and checks the result's count against the
+  root. Nothing reaches the caller until all checks pass. A slot needs no version check: its op-no match, the block's
+  version check and the root's version guard it. (A missing pending slot can make a scan return up to p records past the
+  block; the read is refused.)
 - **Fold, decided once per touched block at the end of a compile:** let p = pending ops after this delta and q = their slot
   payload bytes. If p > 240 or 4·q > the stored base's **payload length** (the canonical CBOR of the block, the measure for
   every fill threshold, never the root's `bytes`), the block is **folded**: its new base is written with `folded = head`,
@@ -141,8 +142,8 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   `block key ‖ 0xF0` it must find nothing under `0x03`. Each reads at most one record outside the list, like create's check.
   Writes the root `Delete` (`Some(v)`), the base and the slot key of every op no 1 … `head` (≤ 240, present or not).
   Any other key between the base and `block key ‖ 0xF0` passes both checks. Reads and writes look only at the pending run
-  (a stray inside it is `OpMissing`), so they ignore one elsewhere; the drop leaves it behind, and a later create at that
-  object refuses with `Corrupt(OrphanElement)`.
+  (a stray inside it is named as a drop names one), so they ignore one elsewhere; the drop leaves it behind, and a later
+  create at that object refuses with `Corrupt(OrphanElement)`.
 
 ### 6. Reads, versions, tokens, and finding an item by id
 - `list(snapshot, &RootKey) -> Option<List{version, count, bytes, blocks}>`. `items(snapshot, &RootKey, Position(p) |
@@ -215,7 +216,10 @@ Tenant 1, affinity 1, id `todo`, `snapshot.at()` = 0, `records` false.
 | Drop and recreate `todo`; replay the same batches on two stores | new `seed` = the drop's `seq`; byte-identical stores |
 
 ## Consequences
-- **Per push** (`record_len`, computed): ~0.97 / 1.24 / 3.9 / 16.3 KB at 1 / 10 / 100 / 512 blocks, against 16.8–49.7 KB.
+- **Per push** (`record_len`, measured: the mean over 10,000 pushes of a 16-byte string to `todo`, folds and splits
+  included): 0.776 / 0.972 / 2.298 / 9.310 KB at 1 / 10 / 100 / 512 blocks with B = 128 KiB, and 0.705 KB at 1 block with
+  B = 64 KiB, against 16.8–49.7 KB. The study's ~0.97 / 1.24 / 3.9 / 16.3 KB assumed a root index entry of 30 B; one
+  measures about 16.6 B. At 512 blocks the pushes fill the last block and are then refused (5,155 of them at 128 KiB).
 - A point read opens one base and its pending slots (q ≤ base/4), so ≤ ~1.25 · B; stale slots are never read (P9: they
   would add up to 240 × ~300 B ≈ 72 KB). That is ~2–7× the tree's bytes past ~24 KiB, the same below.
 - **Capacity at the default: ≥ ~16 MiB worst (blocks just over B/4 never merge), ~64 MiB push-only** (end splits fill blocks).

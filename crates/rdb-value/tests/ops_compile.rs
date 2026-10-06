@@ -36,6 +36,35 @@ fn delta(ops: Vec<Op>) -> Delta {
     Delta(ops)
 }
 
+/// Adjacent leftover to S4 P3: a list block or slot record at a document root read as
+/// `KindMismatch`. Those records are never written at a root key, so `read`, and `compile`
+/// through it, name the damage instead.
+#[test]
+fn a_list_block_or_slot_at_a_document_root_is_damage() {
+    let root = key();
+    for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let mut s = MapSnapshot::new(Generation(1));
+        s.insert(
+            root.to_bytes(),
+            4,
+            seal(kind, &encode(&Value::Null).unwrap()).unwrap(),
+        );
+        let damage = ValueError::Corrupt(Corrupt::ListRecordAtRoot { found: kind });
+        assert_eq!(read(&s, &root), Err(damage.clone()), "read, {kind:?}");
+        assert_eq!(
+            compile(
+                &s,
+                &root,
+                Expected::Version(4),
+                &delta(vec![Op::Replace(Value::Null)])
+            )
+            .map(|_| ()),
+            Err(damage),
+            "compile, {kind:?}"
+        );
+    }
+}
+
 /// What the kernel does at apply, for one `Put`: check the condition and `expected_version`,
 /// then store the after-image at `version`. Returns `false` when a check fails.
 fn apply(snapshot: &mut MapSnapshot, compiled: &Compiled, version: u64) -> bool {
