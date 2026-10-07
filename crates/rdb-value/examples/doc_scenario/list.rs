@@ -461,7 +461,8 @@ fn pending_op(
 }
 
 /// An item record is a document envelope; a block base a block envelope; a change slot a slot
-/// envelope. Every payload is canonical CBOR. Returns the decoded payload.
+/// envelope. Every payload is canonical CBOR. Returns the decoded payload. Nothing more: not a
+/// base's `{items, folded}` shape, which a read refuses as `Block::Shape`.
 pub fn check_record(sub: Sub, slot: Option<u8>, raw: &[u8]) -> Result<Value, Failure> {
     let opened = envelope::open(raw).map_err(corrupt_envelope)?;
     match (sub, slot, opened.kind) {

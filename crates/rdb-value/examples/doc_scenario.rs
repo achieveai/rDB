@@ -103,6 +103,14 @@
 //! root's count with the elements, and it takes a root `Delete` while elements remain. The
 //! count is kept by `compile_collection` and `drop_collection`, so a hand-edited line can
 //! leave the count-mismatch or orphan state of ADR-rdb-0013 decision 11.
+//!
+//! A list item, block base or change slot is checked less than a read checks it, by `apply`
+//! and by `dump` alike. Each needs its list's root written beside it (for `apply`), the
+//! envelope kind its key calls for, and canonical CBOR; `dump` also names a slot that is not
+//! `[op no, op]`. Not checked: a base's `{items, folded}` shape, the replay of its pending
+//! slots, the root's `count`, `bytes` and block heads against the blocks, and orphans. So a
+//! hand-edited line or store can hold a list that `items`, a write or a drop refuses, for
+//! example a base of CBOR null as `Block::Shape` (ADR-rdb-0016 §7).
 
 use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read};
@@ -642,7 +650,8 @@ fn dump_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
 
 /// One record of `dump`, read the way its key says: what object it belongs to, which part of
 /// it, and then through the library's own read for that part, so every check a read makes is
-/// made here too.
+/// made here too. A list item, block base or change slot is the exception: it is checked only
+/// as the module doc says, so a base a read refuses can dump without an error.
 fn dump_record(
     snapshot: &MapSnapshot,
     key: &[u8],
@@ -1349,7 +1358,8 @@ impl Store {
 /// before anything is applied: the keys parse, in strictly ascending order (one write per key, as
 /// every compile emits); a root reads back through the library; a map entry is a document and a
 /// set member is empty, read through `member` under the root written beside it. The root's
-/// count is not checked against the elements (see the module doc).
+/// count is not checked against the elements, and a list item, block or slot is checked only by
+/// its kind and its CBOR (see the module doc).
 fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>, bool), Failure> {
     let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
     let source = std::fs::File::open(file).map_err(cannot)?;
@@ -1445,7 +1455,8 @@ fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>, bool), 
 
 /// Every write in a compiled line reads back (see [`load_compiled`]): every key parses, every
 /// element write has its root written beside it, and every `Put` reads back through the
-/// library. A refusal names the key. Returns whether any write is a list's root, item, block
+/// library, except a list item, block or slot `Put`, checked only by [`list::check_record`].
+/// A refusal names the key. Returns whether any write is a list's root, item, block
 /// base or change slot.
 fn check_writes(mutations: &[Mutation]) -> Result<bool, Failure> {
     let mut writes_list = false;
@@ -2878,6 +2889,87 @@ mod tests {
             slot["state"], "unknown: the block's base does not read",
             "{slot}"
         );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// PR #28 F3: `dump` and `apply` check a list block base only as `list::check_record`
+    /// does, its envelope kind and canonical CBOR, not its `{items, folded}` shape. So a base
+    /// whose payload is CBOR null dumps without an error, and a create line whose base is edited
+    /// to null applies, while the library's read refuses that base as `Block::Shape`. This row
+    /// pins that boundary, which the module doc states; it is not a guarantee of the example.
+    #[test]
+    fn pr28_f3_a_null_block_base_dumps_and_imports_but_a_read_refuses_it_as_shape() {
+        let null_base = || {
+            envelope::seal(
+                Kind::ListBlock,
+                &cbor::encode(&Value::Null).expect("encode"),
+            )
+        };
+        let root = root_of("todo").expect("root");
+        let read_fault = |store: &FsPath| {
+            let store = Store::load(store).expect("load");
+            rdb_value::list::items(
+                &store.snapshot,
+                &root,
+                rdb_value::list::Start::Position(0),
+                usize::MAX,
+            )
+            .map(|_| ())
+        };
+        let is_shape = |got: Result<(), ValueError>| {
+            matches!(
+                got,
+                Err(ValueError::Corrupt(Corrupt::Block {
+                    fault: rdb_value::BlockFault::Shape(_),
+                    ..
+                }))
+            )
+        };
+
+        // A stored base edited to null: dump prints it, a read refuses it.
+        let dir = scratch("pr28-f3-null-base");
+        let store = dir.join("s.jsonl");
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", "\"a\""])).expect("create");
+        edit_records(&store, |records| {
+            for (key, _, raw) in records.iter_mut() {
+                if sub_slot(key) == (Sub::Block, None) {
+                    *raw = null_base().expect("seal");
+                }
+            }
+        });
+        let block = dumped(&store)
+            .into_iter()
+            .find(|r| r["sub"] == "block")
+            .expect("the block line");
+        assert!(block.get("error").is_none(), "{block}");
+        assert_eq!(block["value"], serde_json::Value::Null, "{block}");
+        let got = read_fault(&store);
+        assert!(is_shape(got.clone()), "{got:?}");
+
+        // A create line with its base edited to null: apply takes it, a read refuses it.
+        let store = dir.join("t.jsonl");
+        let fields = list::write_cmd(
+            &store,
+            &args(&["todo", "--absent", "--compile-only", "push", "\"a\""]),
+        )
+        .expect("compile the create");
+        let mut line = Line::new("list");
+        line.extend(fields);
+        let mut json: serde_json::Value = serde_json::from_str(&line.render()).expect("json");
+        let mut edited = 0;
+        for mutation in json["mutations"].as_array_mut().expect("mutations") {
+            let key = hex::decode(mutation["key_hex"].as_str().expect("key")).expect("hex");
+            if sub_slot(&key) == (Sub::Block, None) {
+                mutation["value_hex"] = hex::encode(null_base().expect("seal")).into();
+                edited += 1;
+            }
+        }
+        assert_eq!(edited, 1, "the create writes one base");
+        let file = dir.join("c.json");
+        std::fs::write(&file, json.to_string()).expect("write");
+        apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect("the null base is imported");
+        let got = read_fault(&store);
+        assert!(is_shape(got.clone()), "{got:?}");
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 }
