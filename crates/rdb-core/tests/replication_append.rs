@@ -5310,8 +5310,13 @@ fn m9_d3_03_receiver_a_re_emit_of_its_generation_keeps_the_head_it_applied() {
 
 /// M9 S0 D3, rule 2's quarantine guard. B applied 11 and 12 under `GEN`, then the takeover into
 /// `NEW_GEN` named a different record at 11, so B is quarantined with head 12. F1's re-emit in
-/// that generation at `(10, d10)` still truncates to 10 and clears quarantine: 11 and 12 are
-/// the divergence, and keeping them would unflag it (`s0-probe.md` E6 mutant).
+/// that generation at `(10, d10)` still truncates to 10: 11 and 12 are the divergence, and
+/// keeping them would unflag it (`s0-probe.md` E6 mutant).
+///
+/// Amended by M9 S0 ruling 2026-10-07, item 3: quarantine is sticky across that re-emit. B stays
+/// quarantined, asks C for nothing and answers `AlreadyDiverged`; it rejoins only through a
+/// `Recovered` in a new generation. Before the amendment it cleared quarantine and asked from 10,
+/// and the primary, whose rebuild had cleared `diverged` too, caught it up (sim row `m9_f2_01`).
 #[retcd_test]
 fn m9_d3_04_receiver_a_quarantined_copy_still_truncates_on_a_re_emit_of_its_generation() {
     let mut module = applied_to(12);
@@ -5325,8 +5330,14 @@ fn m9_d3_04_receiver_a_quarantined_copy_still_truncates_on_a_re_emit_of_its_gene
         (NEW_GEN, head(12))
     );
     assert!(quarantined.quarantine().is_some());
+    let kept = quarantined.quarantine();
     let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
-    asks_new_primary(&effects, 10);
+    assert_eq!(
+        effects,
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::AlreadyDiverged
+        ))]
+    );
     let rx_ = rx(&module);
     assert_eq!(
         (
@@ -5334,7 +5345,7 @@ fn m9_d3_04_receiver_a_quarantined_copy_still_truncates_on_a_re_emit_of_its_gene
             rx_.quarantine(),
             rx_.history().highest()
         ),
-        (head(10), None, Some(Seq(10)))
+        (head(10), kept, Some(Seq(10)))
     );
 }
 

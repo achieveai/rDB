@@ -687,7 +687,8 @@ impl ProgressTracker {
 
     /// `Recovered` on a copy that already leads (design §3.4, K-B-02): rebuild from its own
     /// ladder and watermarks under the new root. Every other copy starts at zero and re-proves
-    /// its prefix; `diverged` clears here and only here.
+    /// its prefix; `diverged` clears here and only here, and only in a new generation (M9 S0
+    /// ruling 2026-10-07, item 3).
     ///
     /// A pin for this partition that names this node anything but the primary retires the
     /// tracker (lead ruling on the kept primary, B-R58a): routing treats it as absent until a
@@ -737,7 +738,9 @@ impl ProgressTracker {
     }
 
     /// The tracker an accepted `result` installs: this copy's own ladder and watermarks cut at
-    /// the cutoff, every other copy at zero, one predicate, nothing diverged. Each other copy the
+    /// the cutoff, every other copy at zero, one predicate, nothing diverged in a new generation.
+    /// A re-emit of the generation already served keeps each diverged copy it still names: its
+    /// quarantine is sticky there (M9 S0 ruling 2026-10-07, item 3). Each other copy the
     /// barrier requires gets its proved floor at the cutoff, which only the repeat judgment reads
     /// (lead ruling B-R67f).
     ///
@@ -778,6 +781,14 @@ impl ProgressTracker {
             Some(self.base_seq)
         };
         rebuilt.adopt_view(&result.committed.authority_view);
+        if !self.retired && result.new_generation == self.lineage.generation {
+            rebuilt.diverged = self
+                .diverged
+                .iter()
+                .copied()
+                .filter(|copy| rebuilt.peers.contains_key(copy))
+                .collect();
+        }
         let barrier = &result.barrier;
         let floor = ReplicaProgress {
             received: ReceivedSeq(barrier.cutoff().0),

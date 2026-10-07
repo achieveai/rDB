@@ -7210,3 +7210,31 @@ fn m9_d3_08_tracker_a_retired_primary_is_rebuilt_at_the_cutoff_on_a_re_emit() {
     tracker.on_recovered(&result, T);
     assert_eq!((tracker.head(), tracker.retired()), (Seq(HEAD + 1), false));
 }
+
+/// M9 S0 F2 (ruling 2026-10-07, item 3, amending D3 rule 2): quarantine is sticky across a
+/// re-emit of the generation already served, on the primary as on the copy. C was proved
+/// diverged after the rebuild; F1's re-emit of that rebuild keeps C diverged, so C neither
+/// qualifies nor gets a cursor until a new generation. Before the amendment the rebuild cleared
+/// `diverged`, and C was caught up again (sim row
+/// `m9_f2_01`). Near-miss: a `Recovered` in a newer generation still clears it, as M7B-45 says.
+#[retcd_test]
+fn m9_f2_a_tracker_a_re_emit_of_its_generation_keeps_a_diverged_copy_diverged() {
+    let (mut tracker, result) = written_past_the_cutoff();
+    tracker.on_divergence(COPY_C, T);
+    assert_eq!(tracker.diverged(), &[COPY_C]);
+    tracker.on_recovered(&result, T);
+    assert_eq!(
+        (tracker.head(), tracker.diverged()),
+        (Seq(HEAD + 2), &[COPY_C][..]),
+        "the re-emit keeps C diverged"
+    );
+
+    let mut next = result;
+    next.new_generation = Generation(NEW_GEN.0 + 1);
+    tracker.on_recovered(&next, T);
+    assert_eq!(
+        (tracker.lineage().generation, tracker.diverged()),
+        (Generation(NEW_GEN.0 + 1), &[][..]),
+        "a new generation clears it"
+    );
+}

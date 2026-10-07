@@ -44,13 +44,14 @@ use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::authority::PartitionMode;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::errors::ErrorKind;
 use rdb_core::contracts::event::ModuleName;
 use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent, ReplyEffect};
 use rdb_core::contracts::ids::{
     AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch, RequestId,
     RequestIdentity, Seq, TenantId,
 };
-use rdb_core::contracts::ignore::KernelIgnoredReason;
+use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::storage::StorageFault;
@@ -1041,6 +1042,90 @@ fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_f
     );
 }
 
+/// The F2 expectation (ruling 2026-10-07, item 3): A quarantines at `corrupt_at` while the CAS
+/// is held, then stays out; B and C take all `writes` client writes, and every oracle accepts
+/// the run.
+fn f2_stays_out(plan: &RunPlan, corrupt_at: u64, writes: usize) {
+    let (replies, trace, violations) = run_judged(plan);
+    let recovered = recovered_on_primary(&trace);
+    let active = recovered
+        .iter()
+        .find(|(_, mode, _)| *mode == PartitionMode::Active)
+        .map(|(at, ..)| *at)
+        .expect("the result is re-emitted active");
+    let corrupt = noted(&trace, A_NODE, |_, note| {
+        matches!(
+            note,
+            KernelNote::Alert {
+                reason: ErrorKind::CorruptHistory
+            }
+        )
+    });
+    assert_eq!(
+        corrupt,
+        vec![corrupt_at],
+        "A quarantines on the corrupt append"
+    );
+    let out_of_phase = noted(&trace, B_NODE, |module, note| {
+        *module == ModuleName::Recovery
+            && matches!(
+                note,
+                KernelNote::Ignored {
+                    reason: KernelIgnoredReason::Replica(ReplicaIgnoreReason::OutOfPhase)
+                }
+            )
+    });
+    assert!(
+        out_of_phase.contains(&corrupt_at),
+        "B's CopyLost for A reaches F1 while the CAS is in flight: {out_of_phase:?}"
+    );
+    assert!(
+        active > corrupt_at,
+        "the re-emit comes after the quarantine"
+    );
+    let on_a: Vec<(u64, Seq)> = applied_on(&trace, A_NODE)
+        .into_iter()
+        .filter(|(at, generation, _, outcome)| {
+            *at >= active && *generation == Generation(2) && *outcome == ApplyOutcome::Applied
+        })
+        .map(|(at, _, seq, _)| (at, seq))
+        .collect();
+    assert_eq!(on_a, Vec::new(), "A stays quarantined through the re-emit");
+    let with_a: Vec<(u64, Seq)> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE && event.logical_tick >= active)
+        .filter_map(|event| match &event.kind {
+            TraceKind::Publish {
+                generation,
+                seq,
+                ack_evidence,
+                ..
+            } if *generation == Generation(2)
+                && ack_evidence.iter().any(|ack| ack.node == A_NODE) =>
+            {
+                Some((event.logical_tick, *seq))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        with_a,
+        Vec::new(),
+        "no publication after the re-emit counts A"
+    );
+    assert_eq!(
+        written(&replies).len(),
+        writes,
+        "every write publishes on B and C; replies: {replies:#?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
+}
+
 /// F3: no `Recovered` at all. Case B with C cut from B until `S+400`; C's catch-up starts at the
 /// retransmit at `S+500`. C's flush ACKs seq 2 durable with seq 3 already received, then C's
 /// commit of seq 3 fails and C asks again from 2.
@@ -1236,4 +1321,44 @@ fn m9_f3_01_a_need_prefix_duplicated_after_the_cursor_moved_on_still_takes_every
         Vec::<String>::new(),
         "every oracle accepts the run"
     );
+}
+
+/// F1 at cutoff 0 (ruling 2026-10-07, item 4): F2's order on the E6-A timeline of `m9_d3_00`.
+/// B and C survive an empty partition while A is cut, so F1 commits `DegradedRf2` at cutoff 0
+/// and the start record is seq 1; it never passes `admit`. A returns at t4000 and catches seq 1
+/// up, which pins the rebuild at 1: P = 1 > C = 0. The activation CAS is held 1.8 s, and B's
+/// next append to A, a keepalive of seq 1, is corrupted while it is held, so A quarantines.
+fn f1_at_cutoff_zero_unfaulted() -> RunPlan {
+    let mut plan =
+        scenario_run::lower(&cases::case_m9_d3_degraded_empty_gets_a_copy_back_then_writes())
+            .expect("lowers");
+    plan.steps.push(step(
+        cases::M9_D3_A_BACK_AT + 5,
+        StepAction::Control(ControlOp::DelayCompletion {
+            node: B_NODE,
+            by_millis: 1_800,
+        }),
+    ));
+    plan.steps.sort_by_key(|step| step.at);
+    plan
+}
+
+const F1Z_CORRUPT_AT: u64 = cases::M9_D3_A_BACK_AT + 20;
+
+fn f1_at_cutoff_zero() -> RunPlan {
+    let mut plan = f1_at_cutoff_zero_unfaulted();
+    plan.steps.push(plan_next(
+        F1Z_CORRUPT_AT,
+        B_NODE,
+        A_NODE,
+        Delivery::Corrupt { delay_millis: 0 },
+    ));
+    plan.steps.sort_by_key(|step| step.at);
+    plan
+}
+
+#[retcd_test]
+fn m9_f1_01_at_cutoff_zero_a_copy_quarantined_during_the_activation_cas_stays_out_and_the_others_take_every_write(
+) {
+    f2_stays_out(&f1_at_cutoff_zero(), cases::M9_D3_A_BACK_AT + 103, 2);
 }
