@@ -358,26 +358,52 @@ fn any_key_contains(keys: &[Vec<u8>], needle: &str) -> bool {
         .any(|k| k.windows(needle.len()).any(|w| w == needle.as_bytes()))
 }
 
+/// A build triggered by [`trigger_in_background`], with the snapshot that was current when it
+/// was triggered.
+struct BackgroundBuild {
+    cluster: Arc<Cluster>,
+    node: NodeId,
+    before: Option<String>,
+    task: tokio::task::JoinHandle<Result<SnapshotTriggered, config_engine::AdminError>>,
+}
+
 /// Trigger a build on `id` in the background, so the caller can drive the cluster while the
 /// build sits on a paused boundary.
 ///
-/// `trigger_snapshot` only returns once the build has published, so a paused build would
-/// otherwise deadlock the test's own task.
-fn trigger_in_background(
-    cluster: &Arc<Cluster>,
-    id: NodeId,
-) -> tokio::task::JoinHandle<Result<SnapshotTriggered, config_engine::AdminError>> {
+/// `trigger_snapshot` waits for the build to publish, up to the node's `write_timeout`, so a
+/// paused build would otherwise block the test's own task.
+fn trigger_in_background(cluster: &Arc<Cluster>, id: NodeId) -> BackgroundBuild {
+    let before = cluster
+        .rocks_store(id)
+        .snapshot_meta()
+        .map(|m| m.snapshot_id);
     let node = cluster.node(id);
-    tokio::spawn(config_log::testing::in_current_span(async move {
+    let task = tokio::spawn(config_log::testing::in_current_span(async move {
         node.trigger_snapshot().await
-    }))
+    }));
+    BackgroundBuild {
+        cluster: Arc::clone(cluster),
+        node: id,
+        before,
+        task,
+    }
 }
 
-/// The `snapshot_id` a completed background trigger published.
-async fn published_id(
-    handle: tokio::task::JoinHandle<Result<SnapshotTriggered, config_engine::AdminError>>,
-) -> String {
-    match handle
+/// The `snapshot_id` a background build published.
+///
+/// The trigger stops waiting after the node's `write_timeout` (2 s in the testkit, not scaled)
+/// and then answers `Started { snapshot_id: None, .. }` while the build carries on. A row that
+/// holds the build paused for longer than that on a loaded host gets that answer. So `None`
+/// is followed by a wait, under a scaled deadline, for the node's current snapshot to change
+/// from the one current at the trigger.
+async fn published_id(build: BackgroundBuild) -> String {
+    let BackgroundBuild {
+        cluster,
+        node,
+        before,
+        task,
+    } = build;
+    match task
         .await
         .expect("the build task must not panic")
         .expect("the build must not be refused")
@@ -386,6 +412,22 @@ async fn published_id(
             snapshot_id: Some(id),
             ..
         } => id,
+        SnapshotTriggered::Started {
+            snapshot_id: None, ..
+        } => cluster
+            .wait_for(
+                "the build the trigger stopped waiting for to publish",
+                cluster.deadline(10),
+                || {
+                    cluster
+                        .rocks_store(node)
+                        .snapshot_meta()
+                        .map(|m| m.snapshot_id)
+                        .filter(|id| Some(id) != before.as_ref())
+                },
+            )
+            .await
+            .unwrap_or_else(|t| panic!("the build must publish a snapshot id: {t}")),
         other => panic!("the build must publish a snapshot id: {other:?}"),
     }
 }
@@ -528,8 +570,14 @@ async fn m5_02_apply_is_not_blocked_by_a_running_build() {
     }
     let during = cluster.node(leader).metrics();
 
-    assert!(
-        !build.is_finished(),
+    // Asked of the store, not of the trigger task: the trigger stops waiting after the node's
+    // `write_timeout`, so on a loaded host the task can finish while the build is still parked.
+    assert_eq!(
+        cluster
+            .rocks_store(leader)
+            .metrics()
+            .snapshot_builds_in_flight,
+        1,
         "the build must still be parked on its boundary, or the row proved nothing about \
          overlap"
     );
@@ -614,6 +662,48 @@ async fn m5_14_old_snapshot_retained_until_publication() {
             .map(|m| m.snapshot_id),
         Some(b),
         "once B's meta batch commits, B is current"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Fixture regression — a paused build that outlasts the trigger's own wait
+// -------------------------------------------------------------------------------------------
+
+/// `trigger_snapshot` waits for the build to publish only up to the node's `write_timeout`.
+/// After that it answers `Started { snapshot_id: None, .. }` and the build keeps running (see
+/// `trigger_snapshot_inner` in config-engine's `node.rs`). The paused-build rows hold a build
+/// open for as long as their own writes take, so on a loaded host the trigger can give up
+/// first. M5-01 failed in a gate run exactly that way: its 40 puts took more than 2 s.
+///
+/// This row makes that order certain. It keeps the build parked until the trigger has
+/// answered, then releases it, and [`published_id`] must still name the snapshot the build
+/// published.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_build_outlasting_the_trigger_wait_still_yields_its_id() {
+    let (cluster, scripts) = seeded_cluster().await;
+    let leader = cluster.leader().await;
+
+    let pause = scripts[&leader].pause_on_nth(Boundary::BeforeSnapshotTmpSync, 1);
+    let build = trigger_in_background(&cluster, leader);
+    pause.reached().await;
+    cluster
+        .wait_for(
+            "the trigger to stop waiting for the parked build",
+            cluster.deadline(10),
+            || build.task.is_finished().then_some(()),
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{t}"));
+
+    pause.release();
+    let id = published_id(build).await;
+    assert_eq!(
+        cluster
+            .rocks_store(leader)
+            .snapshot_meta()
+            .map(|m| m.snapshot_id),
+        Some(id),
+        "the id must be the snapshot the released build published"
     );
 }
 
