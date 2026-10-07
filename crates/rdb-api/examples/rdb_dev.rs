@@ -33,9 +33,16 @@
 //!
 //! While it runs, a poller prints the partition's progress as it changes: `recovered gen=N`,
 //! `waiting for write protection (...)`, and `ready` once node 1's L1 admits writes. A put
-//! before `ready` is refused, never left hanging. A recovery committed below `Active` whose
-//! rebuild never pins prints `stalled node=N recovery_rebuild_stalled ...` once, after
-//! `REBUILD_PIN_WAIT_MILLIS` times `RETCD_TEST_DEADLINE_SCALE`.
+//! before `ready` is refused, never left hanging. A recovery committed below `Active` that
+//! does not activate prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever
+//! the line changes:
+//!
+//! - when F1 pinned its rebuild, at F1's rebuild deadline (the discovery window, ~2 s) with
+//!   `unproven=[..]`, the copies that have not proved the pinned point;
+//! - when F1 never pinned it, after `REBUILD_PIN_WAIT_MILLIS` times
+//!   `RETCD_TEST_DEADLINE_SCALE`, with `waited_ms=` and "F1 never pinned its rebuild".
+//!
+//! The line clears when the partition activates.
 //!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
 

@@ -470,6 +470,8 @@ struct RebuildWatch {
     /// The copies F1 has named in `RebuildStalled`: each is reported once, though F1 names it
     /// again at every deadline.
     unproven: BTreeSet<CopyId>,
+    /// F1 named a copy the stall line does not carry yet (PC15: reported once per step).
+    unreported: bool,
 }
 
 /// L1 for one partition, with the next evaluation H1 owes it.
@@ -1181,6 +1183,7 @@ impl Host {
                 EffectKind::Kernel(kernel) => self.kernel(effect.from, kernel, site)?,
             }
         }
+        self.report_unproven();
         Ok(())
     }
 
@@ -1451,6 +1454,7 @@ impl Host {
                 since: now,
                 pinned: false,
                 unproven: BTreeSet::new(),
+                unreported: false,
             },
         );
         self.stalled.remove(&partition);
@@ -1480,8 +1484,8 @@ impl Host {
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
              waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
-             rebuild, so the partition stays read-only",
-            partition.0, generation.0, watch.mode, watch.cutoff.0,
+             rebuild, so the partition stays {:?} and does not activate",
+            partition.0, generation.0, watch.mode, watch.cutoff.0, watch.mode,
         );
         tracing::error!(
             node = self.node.0,
@@ -1500,6 +1504,7 @@ impl Host {
 
     /// F1's deadline passed with `copy` still short of the pinned point. The first time F1 names
     /// a copy it joins the stall line; a repeat changes nothing, so the line stays as printed.
+    /// The line is written once the step's effects are all delivered (`report_unproven`).
     fn rebuild_stalled(&mut self, partition: PartitionId, copy: CopyId) {
         let Some(watch) = self.rebuilds.get_mut(&partition) else {
             tracing::warn!(
@@ -1510,33 +1515,51 @@ impl Host {
             );
             return;
         };
-        if !watch.unproven.insert(copy) {
-            return;
+        if watch.unproven.insert(copy) {
+            watch.unreported = true;
         }
-        let phase = self
-            .recoveries
-            .get(&partition)
-            .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
-        let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
-        let unproven: Vec<u8> = watch.unproven.iter().map(|copy| copy.0).collect();
-        let line = format!(
-            "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
-             unproven={unproven:?} phase={phase}: F1 pinned its rebuild, but these copies have \
-             not proved it, so the partition stays read-only",
-            partition.0, watch.generation.0, watch.mode, watch.cutoff.0,
-        );
-        tracing::error!(
-            node = self.node.0,
-            partition = partition.0,
-            generation = watch.generation.0,
-            mode = ?watch.mode,
-            cutoff = watch.cutoff.0,
-            required = ?required,
-            unproven = ?unproven,
-            phase = %phase,
-            "recovery_rebuild_stalled"
-        );
-        self.stalled.insert(partition, line);
+    }
+
+    /// PC15: F1 names every unproven copy at one deadline, in one step, so the stall line is
+    /// written after the step with all of them, once, instead of once per copy.
+    fn report_unproven(&mut self) {
+        let due: Vec<PartitionId> = self
+            .rebuilds
+            .iter()
+            .filter(|(_, watch)| watch.unreported)
+            .map(|(partition, _)| *partition)
+            .collect();
+        for partition in due {
+            let phase = self
+                .recoveries
+                .get(&partition)
+                .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+            let Some(watch) = self.rebuilds.get_mut(&partition) else {
+                continue;
+            };
+            watch.unreported = false;
+            let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
+            let unproven: Vec<u8> = watch.unproven.iter().map(|copy| copy.0).collect();
+            let line = format!(
+                "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} \
+                 required={required:?} unproven={unproven:?} phase={phase}: F1 pinned its \
+                 rebuild, but these copies have not proved it, so the partition stays {:?} and \
+                 does not activate",
+                partition.0, watch.generation.0, watch.mode, watch.cutoff.0, watch.mode,
+            );
+            tracing::error!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = watch.generation.0,
+                mode = ?watch.mode,
+                cutoff = watch.cutoff.0,
+                required = ?required,
+                unproven = ?unproven,
+                phase = %phase,
+                "recovery_rebuild_stalled"
+            );
+            self.stalled.insert(partition, line);
+        }
     }
 
     /// A member hears a committed recovery (the sim's `run_due_watches`).
@@ -2787,13 +2810,12 @@ mod tests {
             host.run_due();
             host.drain();
             assert_eq!(host.fault, None);
-            assert_eq!(
-                host.status(partition)
-                    .stalled
-                    .filter(|line| line.contains("never pinned")),
-                None,
-                "a pinned rebuild was reported never pinned"
-            );
+            if let Some(line) = host.status(partition).stalled {
+                assert!(
+                    line.contains("unproven="),
+                    "a pinned rebuild's only stall line is F1's own: {line}"
+                );
+            }
             if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
                 host.handle(msg);
             }
