@@ -10,9 +10,11 @@
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
-//! put& <object> <value> [--if-version N]  the same put in the background: the prompt returns
-//!                                         at once and `bg <object>: <answer>` prints when it
-//!                                         lands; not remembered for `retry`
+//! put& <object> <value> [--if-version N]  the same put in the background: prints `bg
+//!                                         <object>: queued` and returns at once, and `bg
+//!                                         <object>: <answer>` when it lands; not remembered
+//!                                         for `retry`. Queued is not sent: `sleep` before a
+//!                                         next command that needs the put in flight
 //! retry [<request>]                       send a put's request again, unchanged: the latest
 //!                                         put's, or the one this session sent as <request>
 //! retry [<request>] --payload <value>     the same put and request id with another value,
@@ -379,7 +381,7 @@ fn repl<'scope, 'env>(
             },
             ["put&", object, value, rest @ ..] => parse_if_version(rest).map(|if_version| {
                 let (object, value) = ((*object).to_owned(), (*value).to_owned());
-                say(&format!("bg {object}: sent"));
+                say(&format!("bg {object}: queued"));
                 scope.spawn(move || {
                     let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
                     say(&format!("bg {object}: {}", put_text(&answer)));
