@@ -228,3 +228,59 @@ pub fn clear_verdict<E>(
     }
     Ok(ClearVerdict::Clear)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_verdict, ClearVerdict, GrantRecord};
+    use crate::authority::partition::PartitionRecord;
+    use crate::contracts::event::Budgets;
+    use crate::contracts::ids::{AuthorityGeneration, BootId, GrantId, NodeId};
+    use crate::contracts::time::{ControlTime, Tick};
+
+    const NODE: NodeId = NodeId(1);
+    const BOOT: BootId = BootId(1);
+
+    /// Not frozen and long past `E + epsilon + delta`: every other guard would let it go.
+    fn expired_record() -> GrantRecord {
+        GrantRecord {
+            grant: GrantId(1),
+            node: NODE,
+            boot: BOOT,
+            authority_generation: AuthorityGeneration(1),
+            expiry_utc_ms: 0,
+            frozen: false,
+        }
+    }
+
+    fn verdict(boot: BootId) -> ClearVerdict {
+        let now = Tick(1_000_000_000);
+        let sample = ControlTime {
+            estimate: now,
+            error_millis: Budgets::SPEC_DEFAULTS.clock_error_millis,
+            bound_established: true,
+            sampled_at: now,
+        };
+        let partitions = || Ok::<Vec<PartitionRecord>, ()>(Vec::new());
+        clear_verdict(
+            NODE,
+            &expired_record(),
+            boot,
+            sample,
+            now,
+            &Budgets::SPEC_DEFAULTS,
+            partitions,
+        )
+        .unwrap_or_else(|()| unreachable!("the partition read cannot fail here"))
+    }
+
+    /// The record names the node's current boot, so it is the live process's grant: the service
+    /// must not delete it, however expired it reads. Deleting it would take the grant from under
+    /// a process that still serves. The twin, the same record judged for a later boot, clears,
+    /// so the refusal comes from the boot guard and nothing else. Removing that guard survived
+    /// every other rdb-core and rdb-sim row (M9 S0, 2026-10-07).
+    #[test]
+    fn clearing_the_current_boots_grant_is_refused() {
+        assert_eq!(verdict(BOOT), ClearVerdict::Current);
+        assert_eq!(verdict(BootId(2)), ClearVerdict::Clear);
+    }
+}
