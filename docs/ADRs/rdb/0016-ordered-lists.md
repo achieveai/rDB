@@ -196,8 +196,11 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 
 ### 8. Every list request names its generation (kept)
 - A list request carries `expected_generation: Some(generation)` (ADR-rdb-0014 decision 12): the root's version guards
-  slots, ids and blocks, and versions repeat across a failover. M8's example and kernel refuse a list commit without one;
-  in M9 it is an executor checklist item (O9).
+  slots, ids and blocks, and versions repeat across a failover. Passing `ListCompiled.generation()` into the request is
+  the caller's duty. The kernel does not enforce it: admission check 5 refuses a supplied generation that is not serving
+  (`GenerationChanged`), but a request with `expected_generation: None` is admitted unfenced. M8's example refuses a
+  list line without one (`GenerationRequired`). In M9 it is an executor checklist item (ADR-rdb-0014 O9). The core
+  contract is unchanged.
 - **Inheritance:** a child's op writes slot s under the child prefix, shadowing the parent's; base and older slots read
   through. A parent's slot holds an op no ≤ the inherited `folded` or outside the pending range, so it never matches (linked:
   `applied(parent) = base`; copied: state at `base` only).
