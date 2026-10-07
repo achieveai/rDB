@@ -5416,3 +5416,32 @@ fn m9_s0_07_admission_refuses_the_start_record_identity() {
     assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
     let _ = h.admit(put(1, b"a", b"1"));
 }
+
+/// M9 S0 rule 1, "T1 `Open`". An empty partition recovered read-only owes the start record but
+/// sends nothing while frozen, even under a newer view, and queues nothing. Once the activation
+/// re-emit lifts read-only, the next newer view sends it.
+#[retcd_test]
+fn m9_s0_14_a_read_only_empty_partition_sends_no_start_record_until_it_opens() {
+    let mut h = H::live();
+    let g8 = Generation(8);
+    let g8_view = |seq| {
+        kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+            g8,
+            seq,
+            u64::MAX,
+        ))))
+    };
+    let _ = h.step(recovered(g8, 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+
+    assert_eq!(h.step(g8_view(2)), vec![], "read-only: nothing is sent");
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+    assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
+
+    let active = at_revision(recovered(g8, 0, NODE_A, PartitionMode::Active), 3);
+    let _ = h.step(active);
+    assert_eq!(*h.k().mode(), QueueMode::Open);
+    let _ = only_check(&h.step(g8_view(3)));
+    assert_eq!(h.k().start_record(), StartRecord::Sent { under: 3 });
+}
