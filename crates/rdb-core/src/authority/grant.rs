@@ -151,3 +151,80 @@ pub fn classify(record: &GrantRecord, held: HeldIdentity) -> Option<DenyReason> 
     }
     None
 }
+
+/// What the planner's grant-clearing service may do with a `grants/{node}` record it read: the
+/// three guards of [`clear_verdict`], decided before anything is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearVerdict {
+    /// The record names the node's current boot: it is the live process's grant, not a stale one.
+    Current,
+    /// All three guards hold: the record may go, by an exact-revision delete.
+    Clear,
+    /// A guard holds the record in place.
+    Refused(ClearRefusal),
+}
+
+/// Which guard of [`clear_verdict`] refused, in the order they are checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearRefusal {
+    /// Guard 1: the record is frozen. A frozen record belongs to a takeover (spec §7.3 step 1).
+    Frozen,
+    /// Guard 2: control time is not proven past `E_old + epsilon + delta`.
+    NotProvenExpired,
+    /// Guard 3: this partition names the node as owner and is not `Serving`.
+    PartitionInTransfer(crate::contracts::ids::PartitionId),
+}
+
+/// May a restarted node's stale `grants/{node}` record be deleted? The three guards, as a pure
+/// function, shared by the simulator's model of the service and the real host's admin.
+///
+/// A1's acquisition is create-only, so a restarted node cannot acquire while its old boot's
+/// record stands. Removing it is safe only when **all three** hold:
+///
+/// 1. the record is not frozen;
+/// 2. the service's control time is past `E_old + epsilon + delta`, the same inequality a
+///    takeover proves ([`crate::authority::clock::expiry_proven`]), so the old process can no
+///    longer admit anywhere;
+/// 3. no `partitions/{id}` naming the node as owner has a lifecycle other than `Serving`.
+///
+/// `record` is what `grants/{node}` holds. `boot` is the node's current boot as the service
+/// knows it; `sample` and `now` are the
+/// service's own clock. `partitions` reads the `partitions/` family and is called only once
+/// guards 1 and 2 hold, so a caller whose read can fail fails no earlier than it did before the
+/// extraction. Its error is returned unchanged.
+///
+/// # Errors
+///
+/// Whatever `partitions` returns.
+pub fn clear_verdict<E>(
+    node: NodeId,
+    record: &GrantRecord,
+    boot: BootId,
+    sample: crate::contracts::time::ControlTime,
+    now: crate::contracts::time::Tick,
+    budgets: &crate::contracts::event::Budgets,
+    partitions: impl FnOnce() -> Result<Vec<crate::authority::partition::PartitionRecord>, E>,
+) -> Result<ClearVerdict, E> {
+    use crate::authority::clock::{expiry_proven, ClockView};
+    use crate::authority::partition::PartitionLifecycle;
+
+    if record.boot == boot {
+        return Ok(ClearVerdict::Current);
+    }
+    if record.frozen {
+        return Ok(ClearVerdict::Refused(ClearRefusal::Frozen));
+    }
+    let mut clock = ClockView::new();
+    clock.accept(sample);
+    if expiry_proven(&clock, record.expiry_utc_ms, now, budgets).is_none() {
+        return Ok(ClearVerdict::Refused(ClearRefusal::NotProvenExpired));
+    }
+    for partition in partitions()? {
+        if partition.owner == node && partition.lifecycle != PartitionLifecycle::Serving {
+            return Ok(ClearVerdict::Refused(ClearRefusal::PartitionInTransfer(
+                partition.partition,
+            )));
+        }
+    }
+    Ok(ClearVerdict::Clear)
+}
