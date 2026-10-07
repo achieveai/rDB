@@ -5271,14 +5271,6 @@ fn start_answer(correlation: CorrelationId, authority_seq: u64, verdict: Verdict
     answer(correlation, authority_seq, verdict)
 }
 
-/// `effects` holds no reply of any kind: no client sent the start record (rule 5).
-fn assert_no_reply(effects: &[EffectKind]) {
-    assert!(
-        !effects.iter().any(|e| matches!(e, EffectKind::Reply(_))),
-        "the start record is answered to nobody: {effects:?}"
-    );
-}
-
 /// Answer `correlation` `Admit` at `authority_seq` and expect the start record's batch at seq 1:
 /// only the History and Progress writes, no `User` and no `Dedup` (rule 3). Lands it, publishes
 /// it, and returns nothing to anyone.
