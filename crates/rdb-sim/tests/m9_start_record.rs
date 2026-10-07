@@ -29,6 +29,12 @@
 //! and receivers dropped seq 1, and P1 moved its published position back from 1 to 0. Reads were
 //! then refused `Unavailable` and writes `PROTECTION_PAUSED`. A same-generation re-emit now
 //! changes only the mode, so seq 1 stays and the writes publish at 2 and 3.
+//!
+//! **D4** (host walk at 19faa27) is D2's partition with one copy hearing the `Active` re-emit late:
+//! after it has applied and flushed the start record and B has its ACK. Before D3 the copy
+//! truncated to cutoff 0 and fetched seq 1 again, and B judged every ACK for it a repeat of the
+//! position it already held, so B's catch-up cursor never finished and the copy never got seq 2.
+//! D3's rule keeps the copy's head, so nothing is fetched again.
 
 mod support;
 
@@ -637,5 +643,171 @@ fn m9_d3_09_non_default_hold_writes_published_before_the_re_emit_are_kept() {
             .map(|(request, seq)| (RequestId(request), generation, Seq(seq)))
             .collect::<Vec<_>>(),
         "every write is answered at its seq, across the re-emit; replies: {replies:#?}"
+    );
+}
+
+/// D4's timeline (lead ruling "S0 D3", defect D4 found on the host walk at 19faa27). B alone
+/// survives empty while C and A are cut off, as in D2; the links heal at [`cases::M9_D2_HEAL_AT`]
+/// and F1 re-emits `Active` at the next sync deadline (t4003 in this trace). The cut below holds
+/// only A's watch of that re-emit: B–A is cut after the re-emit and before the watch fires, and
+/// healed one tick before A1's first wake writes the start record (t4503), so A applies seq 1
+/// and a host flush on A at [`D4_FLUSH_AT`] makes it durable and ACKs that to B. Only then does
+/// the released watch land on A, ten ticks after the heal.
+const D4_CUT_AT: u64 = 4_008;
+const D4_BACK_AT: u64 = 4_502;
+const D4_FLUSH_AT: u64 = 4_505;
+const D4_WRITES: [(u64, u64); 2] = [(12_000, 300), (15_000, 301)];
+const D4_MAX_TICKS: u64 = 17_000;
+
+fn d4_late_re_emit() -> RunPlan {
+    use support::scenarios::grammar::NetworkOp as Grammar;
+    let mut scenario = held(&[B_NODE], Seq::ZERO, D4_MAX_TICKS);
+    let Some(ScenarioOp::Time(TimeOp::Advance { ticks: rest })) = scenario.ops.pop() else {
+        unreachable!("held ends on its last advance")
+    };
+    scenario.ops.insert(
+        1,
+        ScenarioOp::Network(Grammar::Partition {
+            set_a: vec![B_NODE],
+            set_b: vec![C_NODE, A_NODE],
+        }),
+    );
+    let heal = cases::M9_D2_HEAL_AT - PLAN_AT;
+    scenario.ops.extend([
+        ScenarioOp::Time(TimeOp::Advance { ticks: heal }),
+        ScenarioOp::Network(Grammar::Heal),
+        ScenarioOp::Time(TimeOp::Advance { ticks: rest - heal }),
+    ]);
+    let mut plan = scenario_run::lower(&scenario).expect("lowers");
+    for (at, state) in [
+        (D4_CUT_AT, LinkState::Partitioned),
+        (D4_BACK_AT, LinkState::Up),
+    ] {
+        plan.steps.push(ScenarioStep {
+            at: Tick(at),
+            node: B_NODE,
+            partition: PARTITION,
+            action: StepAction::Network(NetworkOp::SetLink {
+                a: B_NODE,
+                b: A_NODE,
+                state,
+            }),
+            line: None,
+            taken: None,
+        });
+    }
+    plan.steps.sort_by_key(|step| step.at);
+    plan.flushes.push((Tick(D4_FLUSH_AT), A_NODE));
+    plan.seed.extend(
+        D4_WRITES
+            .iter()
+            .map(|(at, request)| submit_at(*at, 9_000 + request, RequestId(*request))),
+    );
+    plan
+}
+
+/// D4 (host walk at 19faa27, 3 of ~23 held starts): a copy hears the `Active` re-emit only after
+/// it has applied the start record and B has its durable ACK for it. Before D3 the copy truncated
+/// to cutoff 0 and fetched seq 1 again, and every ACK it sent for it repeated, or fell below, the
+/// position B already held for it, so B's catch-up cursor never took one: it re-sent seq 1 every
+/// retransmit for ever, the stream skipped the copy, seq 2 never reached it, and L1 paused the
+/// partition. The second write was refused `PROTECTION_PAUSED`.
+#[retcd_test]
+fn m9_d4_00_a_copy_that_hears_the_re_emit_after_flushing_seq_one_keeps_it_and_takes_the_writes() {
+    let (replies, trace) = run(&d4_late_re_emit());
+    let generation = Generation(2);
+    let active = trace
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredFact { result },
+                ..
+            } if event.node == B_NODE && result.mode == PartitionMode::Active => {
+                Some((event.logical_tick, result.committed.revision))
+            }
+            _ => None,
+        })
+        .expect("F1 re-emits the result active once the links heal");
+    assert!(
+        active.0 > cases::M9_D2_HEAL_AT && active.0 < D4_CUT_AT,
+        "the re-emit precedes the cut that holds A's watch of it: {active:?}"
+    );
+    let landed = trace
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note:
+                    KernelNote::RecoveredLanded {
+                        member, revision, ..
+                    },
+                ..
+            } if *member == A_NODE && *revision == active.1 => Some(event.logical_tick),
+            _ => None,
+        })
+        .expect("A hears the re-emit");
+    let durable = trace
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceKind::DurabilityAdvance {
+                generation: g,
+                durable_seq: Seq(1),
+                ..
+            } if event.node == A_NODE && *g == generation => Some(event.logical_tick),
+            _ => None,
+        })
+        .expect("A makes seq 1 durable");
+    let reported = trace
+        .events
+        .iter()
+        .find_map(|event| match &event.kind {
+            TraceKind::ReplicationAck {
+                from_node,
+                contiguous_seq: Seq(1),
+                accepted: true,
+                ..
+            } if *from_node == A_NODE && event.logical_tick >= durable => Some(event.logical_tick),
+            _ => None,
+        })
+        .expect("B takes A's ACK after the flush");
+    assert!(
+        reported < landed,
+        "the failing order: A flushes seq 1 (t{durable}) and B takes its ACK (t{reported}) \
+         before A hears the re-emit (t{landed})"
+    );
+    let written: Vec<(RequestId, Generation, Seq)> = replies
+        .iter()
+        .filter_map(|reply| match reply {
+            ReplyEffect::Transaction {
+                identity, result, ..
+            } if identity.client == CLIENT.client => {
+                Some((identity.request, result.generation, result.seq))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        written,
+        vec![
+            (RequestId(300), generation, Seq(2)),
+            (RequestId(301), generation, Seq(3)),
+        ],
+        "both writes publish; replies: {replies:#?}"
+    );
+    let on_a: Vec<Seq> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == A_NODE)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        on_a,
+        vec![Seq(1), Seq(2), Seq(3)],
+        "A keeps seq 1 through the re-emit and takes both writes"
     );
 }
