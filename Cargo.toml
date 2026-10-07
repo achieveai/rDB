@@ -16,6 +16,7 @@ members = [
     "crates/rdb-sim",
     "crates/rdb-storage",
     "crates/rdb-value",
+    "crates/rdb-api",
 ]
 
 [workspace.package]

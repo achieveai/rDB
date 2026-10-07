@@ -1,0 +1,27 @@
+[package]
+name = "rdb-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rDB embedded API and host (M9): the six kernel modules on wall-clock time, real RocksDB and real rEtcd control"
+
+# M9 architecture §3. The embedder passes `Arc<dyn ConfigStore>`, so there is no config-client or
+# config-engine dependency here. The arrow is rdb-* -> config-* (ADR-rdb-0002).
+[dependencies]
+rdb-core = { workspace = true }
+rdb-storage = { workspace = true }
+rdb-value = { workspace = true }
+config-core = { workspace = true }
+tokio = { workspace = true }
+# `StreamExt::next` over a `config_core::WatchStream`. Already a workspace dependency.
+futures = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+# Facade only; `rdb_dev` installs the JSONL subscriber through `config-log` (ADR-0013).
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `rdb_dev` starts three in-process rEtcd voters on RocksDB.
+config-testkit = { workspace = true }
+config-log = { workspace = true }
+config-log-macros = { workspace = true }

@@ -3503,6 +3503,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdb-api"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "config-core",
+ "config-log",
+ "config-log-macros",
+ "config-testkit",
+ "futures",
+ "rdb-core",
+ "rdb-storage",
+ "rdb-value",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rdb-core"
 version = "0.1.0"
 dependencies = [
