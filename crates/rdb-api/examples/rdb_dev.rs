@@ -630,9 +630,16 @@ fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// One node's line. `published=` is left off a secondary: P1 publishes nothing there, so its
+/// `0@<gen>` would read as a real position (PC12).
 fn node_line(node: &NodeStatus) -> String {
+    let published = match node.published {
+        _ if node.role == "secondary" => String::new(),
+        Some((g, s)) => format!(" published={}@{}", s.0, g.0),
+        None => " published=-".to_owned(),
+    };
     format!(
-        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={} published={}{}",
+        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}",
         node.node.0,
         holds_part(node),
         node.authority,
@@ -643,8 +650,6 @@ fn node_line(node: &NodeStatus) -> String {
         node.protection.as_deref().unwrap_or("inert"),
         node.admits
             .map_or_else(|| "-".to_owned(), |a| a.to_string()),
-        node.published
-            .map_or_else(|| "-".to_owned(), |(g, s)| format!("{}@{}", s.0, g.0)),
         node.fault
             .as_ref()
             .map_or_else(String::new, |f| format!(" FAULT={f}")),
