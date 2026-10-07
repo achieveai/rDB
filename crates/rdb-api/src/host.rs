@@ -1307,6 +1307,9 @@ impl Host {
             KernelEffect::SendRecoveryEnvelopes { .. } => {
                 return Err(unsupported(self.node, "send_recovery_envelopes"));
             }
+            KernelEffect::CopyCaughtUp { copy, head, .. } => {
+                tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+            }
             _ => {}
         }
         if let Some(event) = route::event_for(kernel) {
@@ -1576,9 +1579,10 @@ impl Host {
             .find(|member| member.copy == copy)
             .map(|member| member.node)
             .ok_or_else(|| format!("send_envelopes to copy {} not in the config", copy.0))?;
+        let mut sent = 0u64;
         for seq in first.0..=through.0 {
             let Some(record) = self.stored_record(sender, Seq(seq)) else {
-                return Ok(());
+                break;
             };
             let frame = Frame {
                 id: MessageId(self.next_frame),
@@ -1589,7 +1593,18 @@ impl Host {
             };
             self.next_frame = self.next_frame.wrapping_add(1).max(1);
             self.send(to, frame, site);
+            sent += 1;
         }
+        tracing::debug!(
+            node = self.node.0,
+            partition = partition.0,
+            copy = copy.0,
+            to = to.0,
+            from = first.0,
+            through = through.0,
+            sent,
+            "envelopes_sent"
+        );
         Ok(())
     }
 
@@ -1702,6 +1717,13 @@ impl Host {
                     return Ok(());
                 };
                 if post_commit {
+                    tracing::info!(
+                        node,
+                        partition = site.partition.0,
+                        copy = copy.0,
+                        seq = cutoff.0,
+                        "rebuild_pinned"
+                    );
                     if let Some(watch) = self.rebuilds.get_mut(&site.partition) {
                         watch.pinned = true;
                     }
