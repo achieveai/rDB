@@ -47,13 +47,16 @@ use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{
-    KernelNote, ProtectionPhase, Provenance, ReadServiceOutcome, SyncWithheldReason, Trace,
-    TraceKind,
+    BudgetName, KernelNote, ProtectionPhase, Provenance, ReadServiceOutcome, SyncWithheldReason,
+    Trace, TraceKind,
 };
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest, TxnResult};
 use rdb_core::contracts::version::API_VERSION;
-use rdb_sim::harness::run::{RunPlan, Runner, SeedEvent, StopReason};
+use rdb_sim::harness::manifest::BudgetOverride;
+use rdb_sim::harness::run::{RunPlan, Runner, ScenarioStep, SeedEvent, StepAction, StopReason};
 use rdb_sim::harness::trace::validate;
+use rdb_sim::sim::control::ControlOp;
+use rdb_sim::sim::network::{LinkState, NetworkOp};
 
 use support::oracle::Oracle;
 use support::scenarios::cases::{self, A_NODE, B_NODE, C_NODE, PARTITION, PLAN_AT};
@@ -77,12 +80,18 @@ const CLIENT: RequestIdentity = RequestIdentity {
 
 /// The survivors in `survivors` hold nothing; placement's plan reaches F1 at [`PLAN_AT`].
 fn empty(survivors: &[NodeId]) -> Scenario {
+    held(survivors, Seq::ZERO, MAX_TICKS)
+}
+
+/// The survivors in `survivors` hold the prior lineage through `head`; the run ends at
+/// `max_ticks`.
+fn held(survivors: &[NodeId], head: Seq, max_ticks: u64) -> Scenario {
     let mut ops: Vec<ScenarioOp> = survivors
         .iter()
         .map(|node| {
             ScenarioOp::Recovery(RecoveryOp::Synchronize {
                 node: *node,
-                to: Seq::ZERO,
+                to: head,
             })
         })
         .collect();
@@ -93,7 +102,7 @@ fn empty(survivors: &[NodeId]) -> Scenario {
             window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
         }),
         ScenarioOp::Time(TimeOp::Advance {
-            ticks: MAX_TICKS - PLAN_AT,
+            ticks: max_ticks - PLAN_AT,
         }),
     ]);
     Scenario {
@@ -105,7 +114,7 @@ fn empty(survivors: &[NodeId]) -> Scenario {
         topology: cases::rf3_partition_1(),
         budget: Budget {
             max_events: 50_000,
-            max_ticks: MAX_TICKS,
+            max_ticks,
         },
         ops,
     }
@@ -113,16 +122,21 @@ fn empty(survivors: &[NodeId]) -> Scenario {
 
 /// The client's one write, to the primary B, at [`SUBMIT_AT`].
 fn submit() -> SeedEvent {
+    submit_at(SUBMIT_AT, 9_010, CLIENT.request)
+}
+
+/// A write of `request` by the client, to the primary B, at `at`.
+fn submit_at(at: u64, correlation: u64, request: RequestId) -> SeedEvent {
     let affinity = AffinityId(1);
     SeedEvent {
-        at: Tick(SUBMIT_AT),
+        at: Tick(at),
         node: B_NODE,
         boot: scenario_run::BOOT,
         partition: PARTITION,
-        correlation: CorrelationId(9_010),
+        correlation: CorrelationId(correlation),
         kind: EventKind::Client(ClientEvent::Submit(TxnRequest {
             api_version: API_VERSION,
-            identity: CLIENT,
+            identity: RequestIdentity { request, ..CLIENT },
             affinity,
             expected_generation: None,
             remaining_millis: 1_000,
@@ -495,4 +509,133 @@ fn m9_d3_00_a_copy_back_after_a_degraded_empty_start_keeps_seq_one_and_publishes
             )
     });
     assert!(healthy, "L1 is healthy again after the re-emit");
+}
+
+/// The optional D3 row, in a **non-default configuration**: the resume hold is lowered to 1 s and
+/// the activation CAS is held 1.8 s (its deadline is the 2 s discovery window). L1 then resumes
+/// in `DegradedRf2` and two client writes publish at seq 2 and 3 before the `Active` re-emit,
+/// so the re-emit meets a published tail and owed replies, not only the start record. B, C and
+/// A hold seq 1, so the cutoff is 1 and there is no start record.
+const D3_HOLD_WRITES: [u64; 5] = [5_300, 5_500, 9_000, 11_000, 14_000];
+const D3_HOLD_MAX_TICKS: u64 = 16_000;
+
+fn d3_hold() -> RunPlan {
+    let mut plan =
+        scenario_run::lower(&held(&[B_NODE, C_NODE], Seq(1), D3_HOLD_MAX_TICKS)).expect("lowers");
+    // A, the prior owner and not a survivor, holds seq 1 durably too.
+    let from_b: Vec<_> = plan
+        .preloads
+        .iter()
+        .filter(|(node, batch)| *node == B_NODE && batch.seq <= Seq(1))
+        .map(|(_, batch)| batch.clone())
+        .collect();
+    let (_, _, generation, _) = *plan
+        .preload_durable
+        .iter()
+        .find(|(node, ..)| *node == B_NODE)
+        .expect("B is durable at its head");
+    plan.preloads
+        .extend(from_b.into_iter().map(|batch| (A_NODE, batch)));
+    plan.preload_durable
+        .push((A_NODE, PARTITION, generation, DurableSeq(1)));
+    for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
+        plan.network_ops.push(NetworkOp::SetLink {
+            a,
+            b,
+            state: LinkState::Partitioned,
+        });
+        plan.steps.push(ScenarioStep {
+            at: Tick(cases::M9_D3_A_BACK_AT),
+            node: B_NODE,
+            partition: PARTITION,
+            action: StepAction::Network(NetworkOp::SetLink {
+                a,
+                b,
+                state: LinkState::Up,
+            }),
+            line: None,
+            taken: None,
+        });
+    }
+    plan.steps.push(ScenarioStep {
+        at: Tick(cases::M9_D3_A_BACK_AT + 5),
+        node: B_NODE,
+        partition: PARTITION,
+        action: StepAction::Control(ControlOp::DelayCompletion {
+            node: B_NODE,
+            by_millis: 1_800,
+        }),
+        line: None,
+        taken: None,
+    });
+    plan.steps.sort_by_key(|step| step.at);
+    plan.overrides.push(BudgetOverride {
+        name: BudgetName::ResumeHold,
+        millis: 1_000,
+    });
+    plan.seed.extend(
+        D3_HOLD_WRITES
+            .iter()
+            .zip(200..)
+            .map(|(at, request)| submit_at(*at, 9_000 + request, RequestId(request))),
+    );
+    plan
+}
+
+#[retcd_test]
+fn m9_d3_09_non_default_hold_writes_published_before_the_re_emit_are_kept() {
+    let (replies, trace) = run(&d3_hold());
+    let recovered = recovered_on_primary(&trace);
+    tracing::info!(?recovered, "d3_hold.recovered");
+    assert!(
+        matches!(recovered.first(), Some((at, PartitionMode::DegradedRf2, Seq(1)))
+            if *at < cases::M9_D3_A_BACK_AT),
+        "committed degraded at cutoff 1 while A is away: {recovered:?}"
+    );
+    let active = recovered
+        .iter()
+        .find(|(_, mode, _)| *mode == PartitionMode::Active)
+        .map(|(at, ..)| *at)
+        .expect("the result is re-emitted active once A is back");
+    let generation = Generation(2);
+    let published_before: Vec<Seq> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE && event.logical_tick < active)
+        .filter_map(|event| match &event.kind {
+            TraceKind::Publish { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        published_before,
+        vec![Seq(2), Seq(3)],
+        "two writes publish in DegradedRf2, before the re-emit at t{active}"
+    );
+    assert_eq!(
+        published(&trace),
+        (2..=6)
+            .map(|seq| (generation, Seq(seq)))
+            .collect::<Vec<_>>(),
+        "every write publishes once, in order, and never below a position published"
+    );
+    let written: Vec<(RequestId, Generation, Seq)> = replies
+        .iter()
+        .filter_map(|reply| match reply {
+            ReplyEffect::Transaction {
+                identity, result, ..
+            } if identity.client == CLIENT.client => {
+                Some((identity.request, result.generation, result.seq))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        written,
+        (200..=204)
+            .zip(2..=6)
+            .map(|(request, seq)| (RequestId(request), generation, Seq(seq)))
+            .collect::<Vec<_>>(),
+        "every write is answered at its seq, across the re-emit; replies: {replies:#?}"
+    );
 }
