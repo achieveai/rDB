@@ -426,6 +426,12 @@ impl CatchupCursor {
     /// Every need re-enters here, even one for the record already in flight (lead ruling
     /// B-R47, S5-F1): that send may have been lost, nothing else an honest copy says would
     /// clear it, and a re-send is idempotent at the receiver.
+    ///
+    /// A matching need also lowers the mark's `received` to `have` (lead ruling 2026-10-07,
+    /// item 1): the copy says it holds nothing past `have`, so a record it staged past that is
+    /// gone, a failed commit or a duplicated or reordered need being two ways. Without this the
+    /// ACK for the record re-sent next does not move past the mark, the cursor never sends again,
+    /// and every later ACK is a repeat. It only lowers, never raises: a need is not an ACK.
     fn on_need_prefix(
         &mut self,
         have: Seq,
@@ -446,7 +452,12 @@ impl CatchupCursor {
                     copy: self.copy,
                 })]
             }
-            DigestLookup::Match => self.send_after(have, head, prior_base),
+            DigestLookup::Match => {
+                if let Some((mark, _)) = self.acked.as_mut() {
+                    mark.received = mark.received.min(ReceivedSeq(have.0));
+                }
+                self.send_after(have, head, prior_base)
+            }
         }
     }
 

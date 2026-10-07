@@ -44,14 +44,18 @@ use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::authority::PartitionMode;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::event::ModuleName;
 use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent, ReplyEffect};
 use rdb_core::contracts::ids::{
     AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch, RequestId,
     RequestIdentity, Seq, TenantId,
 };
+use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
+use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::time::Tick;
+use rdb_core::contracts::trace::{AckRejectReason, ApplyOutcome};
 use rdb_core::contracts::trace::{
     BudgetName, KernelNote, ProtectionPhase, Provenance, ReadServiceOutcome, SyncWithheldReason,
     Trace, TraceKind,
@@ -62,7 +66,8 @@ use rdb_sim::harness::manifest::BudgetOverride;
 use rdb_sim::harness::run::{RunPlan, Runner, ScenarioStep, SeedEvent, StepAction, StopReason};
 use rdb_sim::harness::trace::validate;
 use rdb_sim::sim::control::ControlOp;
-use rdb_sim::sim::network::{LinkState, NetworkOp};
+use rdb_sim::sim::network::{Delivery, LinkState, NetworkOp};
+use rdb_sim::storage::StorageOp;
 
 use support::oracle::Oracle;
 use support::scenarios::cases::{self, A_NODE, B_NODE, C_NODE, PARTITION, PLAN_AT};
@@ -809,5 +814,426 @@ fn m9_d4_00_a_copy_that_hears_the_re_emit_after_flushing_seq_one_keeps_it_and_ta
         on_a,
         vec![Seq(1), Seq(2), Seq(3)],
         "A keeps seq 1 through the re-emit and takes both writes"
+    );
+}
+
+// ---- Stuck-cursor paths F1-F3 (lead ruling 2026-10-07, after critic-d4 rounds 1-2). ----
+
+/// One run, judged, without asserting on the oracle, so a row can check behaviour first.
+fn run_judged(plan: &RunPlan) -> (Vec<ReplyEffect>, Trace, Vec<String>) {
+    support::preamble();
+    let mut runner = Runner::new(plan).expect("the harness takes the plan");
+    let report = runner.run(plan.limits).expect("the run completes");
+    tracing::info!(stop = ?report.stop, events = report.events_consumed, "run report");
+    let trace = runner.finish().expect("the trace closes");
+    validate(&trace).expect("a well-formed trace");
+    let violations = Oracle::new()
+        .judge(&trace)
+        .violations()
+        .iter()
+        .map(|violation| format!("{violation:?}"))
+        .collect();
+    let replies = report.replies.into_iter().map(|(_, reply)| reply).collect();
+    (replies, trace, violations)
+}
+
+fn step(at: u64, action: StepAction) -> ScenarioStep {
+    ScenarioStep {
+        at: Tick(at),
+        node: B_NODE,
+        partition: PARTITION,
+        action,
+        line: None,
+        taken: None,
+    }
+}
+
+fn plan_next(at: u64, from: NodeId, to: NodeId, delivery: Delivery) -> ScenarioStep {
+    step(
+        at,
+        StepAction::Network(NetworkOp::PlanNext { from, to, delivery }),
+    )
+}
+
+/// `(tick, generation, seq, outcome)` of every batch `node` applied, in trace order.
+fn applied_on(trace: &Trace, node: NodeId) -> Vec<(u64, Generation, Seq, ApplyOutcome)> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.node == node)
+        .filter_map(|event| match &event.kind {
+            TraceKind::BatchApply {
+                generation,
+                seq,
+                outcome,
+                ..
+            } => Some((event.logical_tick, *generation, *seq, *outcome)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The ticks of every note on `node` that `want` accepts.
+fn noted(trace: &Trace, node: NodeId, want: impl Fn(&ModuleName, &KernelNote) -> bool) -> Vec<u64> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.node == node)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted { module, note, .. } if want(module, note) => {
+                Some(event.logical_tick)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The client's published writes, as `(request, seq)`.
+fn written(replies: &[ReplyEffect]) -> Vec<(RequestId, Seq)> {
+    replies
+        .iter()
+        .filter_map(|reply| match reply {
+            ReplyEffect::Transaction {
+                identity, result, ..
+            } if identity.client == CLIENT.client => Some((identity.request, result.seq)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// F1, step 2 (P > C): B and C hold 20 records and commit `DegradedRf2` at cutoff 20 while A is
+/// cut. A returns at t4000 and catches the new generation up one record per 100 ms round trip.
+const F1_HEAD: u64 = 20;
+const F1_BACK: u64 = 4_000;
+const F1_WRITES: [u64; 5] = [F1_BACK + 1_300, F1_BACK + 1_500, 9_000, 11_000, 14_000];
+
+fn f1_slow_catch_up() -> RunPlan {
+    let mut plan = scenario_run::lower(&held(&[B_NODE, C_NODE], Seq(F1_HEAD), D3_HOLD_MAX_TICKS))
+        .expect("lowers");
+    let from_b: Vec<_> = plan
+        .preloads
+        .iter()
+        .filter(|(node, _)| *node == B_NODE)
+        .map(|(_, batch)| batch.clone())
+        .collect();
+    let (_, _, generation, durable) = *plan
+        .preload_durable
+        .iter()
+        .find(|(node, ..)| *node == B_NODE)
+        .expect("B is durable at its head");
+    plan.preloads
+        .extend(from_b.into_iter().map(|batch| (A_NODE, batch)));
+    plan.preload_durable
+        .push((A_NODE, PARTITION, generation, durable));
+    for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
+        plan.network_ops.push(NetworkOp::SetLink {
+            a,
+            b,
+            state: LinkState::Partitioned,
+        });
+        plan.steps.push(step(
+            F1_BACK,
+            StepAction::Network(NetworkOp::SetLink {
+                a,
+                b,
+                state: LinkState::Up,
+            }),
+        ));
+    }
+    for _ in 0..60 {
+        plan.steps.push(plan_next(
+            F1_BACK,
+            B_NODE,
+            A_NODE,
+            Delivery::Deliver { delay_millis: 100 },
+        ));
+    }
+    plan.steps.sort_by_key(|step| step.at);
+    plan.overrides.push(BudgetOverride {
+        name: BudgetName::ResumeHold,
+        millis: 1_000,
+    });
+    plan.seed.extend(
+        F1_WRITES
+            .iter()
+            .zip(200..)
+            .map(|(at, request)| submit_at(*at, 9_000 + request, RequestId(request))),
+    );
+    plan
+}
+
+/// The cutoff ≥ 1 guard: here F1 cannot reach its step 2. A rebuild target's ACKs below the
+/// cutoff are `InFlightUnverified` and emit no `PeerProgress`, so L1 cannot resume while it
+/// catches up, and the catch-up's last ACK both pins the rebuild at the cutoff and first makes
+/// the copy heard. At cutoff 0 the start record bypasses `admit` and P = 1 > C = 0; that is
+/// `m9_f1_01`.
+#[retcd_test]
+fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_for_it() {
+    let (replies, trace, violations) = run_judged(&f1_slow_catch_up());
+    let caught_up = applied_on(&trace, A_NODE)
+        .into_iter()
+        .find(|(_, generation, seq, outcome)| {
+            *generation == Generation(2)
+                && *seq == Seq(F1_HEAD)
+                && *outcome == ApplyOutcome::Applied
+        })
+        .map(|(at, ..)| at)
+        .expect("A catches the new generation up to the cutoff");
+    assert!(
+        caught_up > F1_WRITES[1],
+        "the catch-up is still running when the first two writes arrive (t{caught_up})"
+    );
+    let unverified = noted(&trace, B_NODE, |_, note| {
+        matches!(
+            note,
+            KernelNote::Ignored {
+                reason: KernelIgnoredReason::AckRejected(AckRejectReason::InFlightUnverified)
+            }
+        )
+    });
+    assert!(
+        unverified.len() >= 10 && unverified.iter().all(|at| *at <= caught_up),
+        "A's catch-up ACKs below the cutoff are unverified: {unverified:?}"
+    );
+    let points: Vec<Seq> = trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::SyncProven { cutoff, .. },
+                ..
+            } if event.logical_tick >= F1_BACK => Some(*cutoff),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !points.is_empty() && points.iter().all(|point| *point == Seq(F1_HEAD)),
+        "the rebuild point is the committed cutoff, never above it: {points:?}"
+    );
+    let early: Vec<u64> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE && event.logical_tick <= caught_up)
+        .filter(|event| {
+            matches!(event.kind, TraceKind::Publish { generation, .. }
+                if generation == Generation(2))
+        })
+        .map(|event| event.logical_tick)
+        .collect();
+    assert_eq!(
+        early,
+        Vec::<u64>::new(),
+        "no write publishes before A is caught up"
+    );
+    assert_eq!(
+        written(&replies),
+        vec![
+            (RequestId(202), Seq(F1_HEAD + 1)),
+            (RequestId(203), Seq(F1_HEAD + 2)),
+            (RequestId(204), Seq(F1_HEAD + 3)),
+        ],
+        "the two writes during the catch-up are refused as paused; replies: {replies:#?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
+}
+
+/// F3: no `Recovered` at all. Case B with C cut from B until `S+400`; C's catch-up starts at the
+/// retransmit at `S+500`. C's flush ACKs seq 2 durable with seq 3 already received, then C's
+/// commit of seq 3 fails and C asks again from 2.
+fn f3_flush_then_commit_failed() -> RunPlan {
+    let s = SUBMIT_AT;
+    let mut plan = case_b();
+    plan.seed
+        .retain(|seed| !matches!(seed.kind, EventKind::Client(_)));
+    plan.limits.deadline = Tick(s + 3_000);
+    for (at, state) in [(s, LinkState::Partitioned), (s + 400, LinkState::Up)] {
+        plan.steps.push(step(
+            at,
+            StepAction::Network(NetworkOp::SetLink {
+                a: B_NODE,
+                b: C_NODE,
+                state,
+            }),
+        ));
+    }
+    let back = s + 500;
+    for delay_millis in [0, 0, 1] {
+        plan.steps.push(plan_next(
+            back,
+            B_NODE,
+            C_NODE,
+            Delivery::Deliver { delay_millis },
+        ));
+    }
+    plan.steps.push(step(
+        back + 1,
+        StepAction::Storage(StorageOp::Fail {
+            node: C_NODE,
+            fault: StorageFault::WriteFailed,
+        }),
+    ));
+    plan.flushes.push((Tick(back + 1), C_NODE));
+    plan.steps.sort_by_key(|step| step.at);
+    for (i, at) in [s + 100, s + 200, s + 300, s + 530, s + 1_500, s + 2_500]
+        .into_iter()
+        .enumerate()
+    {
+        let i = i as u64;
+        plan.seed.push(submit_at(at, 9_500 + i, RequestId(500 + i)));
+    }
+    plan
+}
+
+#[retcd_test]
+fn m9_f3_00_a_commit_failed_after_a_flush_ack_mid_catch_up_still_takes_every_write() {
+    let (replies, trace, violations) = run_judged(&f3_flush_then_commit_failed());
+    let on_c = applied_on(&trace, C_NODE);
+    let failed = on_c
+        .iter()
+        .position(|(_, _, seq, outcome)| *seq == Seq(3) && *outcome == ApplyOutcome::Failed)
+        .expect("C's commit of seq 3 fails");
+    let failed_at = on_c[failed].0;
+    let flushed_two = trace.events.iter().any(|event| {
+        event.node == C_NODE
+            && event.logical_tick == failed_at
+            && matches!(event.kind, TraceKind::DurabilityAdvance { generation, durable_seq, .. }
+                if generation == Generation(1) && durable_seq == Seq(2))
+    });
+    assert!(
+        flushed_two,
+        "C's flush makes seq 2 durable in the same tick"
+    );
+    assert!(
+        on_c[failed + 1..]
+            .iter()
+            .any(|(_, _, seq, outcome)| *seq == Seq(3) && *outcome == ApplyOutcome::Applied),
+        "C re-fetches seq 3 and applies it: {on_c:?}"
+    );
+    assert_eq!(
+        written(&replies),
+        (500..=505)
+            .zip(2..=7)
+            .map(|(request, seq)| (RequestId(request), Seq(seq)))
+            .collect::<Vec<_>>(),
+        "every write publishes; replies: {replies:#?}"
+    );
+    let c_head = on_c
+        .iter()
+        .filter(|(_, _, _, outcome)| *outcome == ApplyOutcome::Applied)
+        .map(|(_, _, seq, _)| *seq)
+        .max();
+    assert_eq!(
+        c_head,
+        Some(Seq(7)),
+        "C applies through the last write: {on_c:?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
+}
+
+/// The fourth path (ruling 2026-10-07, item 1): F3's stall with no storage fault. Case B with C
+/// cut from B until `S+400`; the retransmit's first frame to C is dropped at `S+500`, so C asks
+/// for the prefix from 1, and that `NeedPrefix{1}` is duplicated with the second copy 200 ms
+/// late. It reaches B after the cursor has served it and C has acknowledged the re-sent records.
+fn f3_duplicated_need_prefix() -> RunPlan {
+    let s = SUBMIT_AT;
+    let mut plan = case_b();
+    plan.seed
+        .retain(|seed| !matches!(seed.kind, EventKind::Client(_)));
+    plan.limits.deadline = Tick(s + 3_000);
+    for (at, state) in [(s, LinkState::Partitioned), (s + 400, LinkState::Up)] {
+        plan.steps.push(step(
+            at,
+            StepAction::Network(NetworkOp::SetLink {
+                a: B_NODE,
+                b: C_NODE,
+                state,
+            }),
+        ));
+    }
+    let back = s + 500;
+    plan.steps
+        .push(plan_next(back, B_NODE, C_NODE, Delivery::Drop));
+    plan.steps.push(plan_next(
+        back,
+        C_NODE,
+        B_NODE,
+        Delivery::Duplicate {
+            delay_millis: 0,
+            second_delay_millis: 200,
+        },
+    ));
+    plan.steps.sort_by_key(|step| step.at);
+    for (i, at) in [s + 100, s + 200, s + 300, s + 530, s + 1_500, s + 2_500]
+        .into_iter()
+        .enumerate()
+    {
+        let i = i as u64;
+        plan.seed.push(submit_at(at, 9_600 + i, RequestId(600 + i)));
+    }
+    plan
+}
+
+#[retcd_test]
+fn m9_f3_01_a_need_prefix_duplicated_after_the_cursor_moved_on_still_takes_every_write() {
+    use rdb_core::contracts::envelope::{AppendOutcome, AppendReject};
+    use rdb_core::replication::wire::decode_reply;
+    support::preamble();
+    let plan = f3_duplicated_need_prefix();
+    let mut runner = Runner::new(&plan).expect("the harness takes the plan");
+    let report = runner.run(plan.limits).expect("the run completes");
+    let network = runner.dispatcher().network();
+    let duplicated: Vec<AppendOutcome> = network
+        .transmissions()
+        .iter()
+        .zip(network.frames())
+        .filter(|(tx, _)| (tx.from, tx.to, tx.copies) == (C_NODE, B_NODE, 2))
+        .filter_map(|(_, frame)| decode_reply(&frame.body).ok())
+        .collect();
+    assert!(
+        matches!(
+            duplicated.as_slice(),
+            [AppendOutcome::Rejected(AppendReject::NeedPrefix { have, .. })] if *have == Seq(1)
+        ),
+        "the one duplicated frame is C's NeedPrefix from 1: {duplicated:?}"
+    );
+    let trace = runner.finish().expect("the trace closes");
+    validate(&trace).expect("a well-formed trace");
+    let violations: Vec<String> = Oracle::new()
+        .judge(&trace)
+        .violations()
+        .iter()
+        .map(|violation| format!("{violation:?}"))
+        .collect();
+    let replies: Vec<ReplyEffect> = report.replies.into_iter().map(|(_, reply)| reply).collect();
+    assert_eq!(
+        written(&replies),
+        (600..=605)
+            .zip(2..=7)
+            .map(|(request, seq)| (RequestId(request), Seq(seq)))
+            .collect::<Vec<_>>(),
+        "every write publishes; replies: {replies:#?}"
+    );
+    let c_head = applied_on(&trace, C_NODE)
+        .into_iter()
+        .filter(|(_, _, _, outcome)| *outcome == ApplyOutcome::Applied)
+        .map(|(_, _, seq, _)| seq)
+        .max();
+    assert_eq!(
+        c_head,
+        Some(Seq(7)),
+        "C keeps catching up after the late copy of its NeedPrefix"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
     );
 }

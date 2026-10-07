@@ -453,21 +453,26 @@ impl ProgressTracker {
     /// ACK at that position would, and one they admit advances its copy and emits
     /// `PeerProgress`. Anything else answers `Recorded` and changes nothing: a repeat never
     /// escalates, and one the ladder cannot verify, below a recovery cutoff, stays unverified
-    /// (lead ruling B-R58c).
+    /// (lead ruling B-R58c). Like [`Self::ack_ladder`], it also names the copy when all nine
+    /// rules admitted the ACK, and `None` otherwise: routing hands a cursor only an ACK named
+    /// here (lead ruling B-R48, M9 S0 ruling 2026-10-07).
     pub fn on_repeat_at_mark(
         &mut self,
         from: &PeerLabel,
         ack: &AppendAck,
         tick: Tick,
-    ) -> Vec<EffectKind> {
+    ) -> (Option<CopyId>, Vec<EffectKind>) {
         let at = Seq(ack.progress.buffered_applied.0);
         match self.admit(from, ack) {
             Ok(copy) if self.history.lookup(at, ack.digest_at_buffered) == DigestLookup::Match => {
-                self.advance(copy, ack.progress, tick)
+                (Some(copy), self.advance(copy, ack.progress, tick))
             }
-            _ => vec![ignored(KernelIgnoredReason::Replica(
-                ReplicaIgnoreReason::Recorded,
-            ))],
+            _ => (
+                None,
+                vec![ignored(KernelIgnoredReason::Replica(
+                    ReplicaIgnoreReason::Recorded,
+                ))],
+            ),
         }
     }
 
