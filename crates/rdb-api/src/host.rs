@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
-use rdb_core::contracts::authority::{AuthorityEffect, Lineage};
+use rdb_core::contracts::authority::{AuthorityEffect, Lineage, PartitionMode};
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::ReplicationEnvelope;
@@ -98,6 +98,13 @@ pub const CONTROL_WATCH_MILLIS: u64 = 10;
 
 /// The handle T1 and P1 read the step view under, as the sim's `STEP_VIEW`. Never bound.
 pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
+
+/// How long a recovery committed below `Active` may go without its rebuild pinning (no
+/// post-commit `SyncWalThrough`) before the host reports it stalled, times
+/// `RETCD_TEST_DEADLINE_SCALE`. F1 arms no timer before the pin, so without this watch the
+/// partition stays read-only in silence (defect D2, lead ruling 2026-10-07). It is a report,
+/// not a fault: the node keeps serving and puts keep their `RECOVERY_READ_ONLY` answer.
+pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
 /// The only affinity S0 writes in.
 const AFFINITY: AffinityId = AffinityId(1);
@@ -325,6 +332,9 @@ pub struct NodeStatus {
     pub durable: u64,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
+    /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
+    /// stalled; cleared when it activates.
+    pub stalled: Option<String>,
 }
 
 /// A node's thread has stopped: nothing sent to it is read.
@@ -424,6 +434,23 @@ enum Delayed {
         site: Site,
         emitter: NodeId,
     },
+    RebuildCheck {
+        partition: PartitionId,
+        generation: Generation,
+    },
+}
+
+/// A recovery this node's F1 committed below `Active`, watched until it activates (D2).
+#[derive(Debug)]
+struct RebuildWatch {
+    generation: Generation,
+    mode: PartitionMode,
+    cutoff: Seq,
+    required: Vec<CopyId>,
+    since: Tick,
+    /// F1 asked for a post-commit sync: the rebuild point is pinned, and F1's own deadline
+    /// (`RebuildStalled`) bounds the rest.
+    pinned: bool,
 }
 
 /// L1 for one partition, with the next evaluation H1 owes it.
@@ -514,6 +541,11 @@ struct Host {
     committed: BTreeMap<PartitionId, Box<RecoveryResult>>,
     landed: BTreeSet<(PartitionId, Generation)>,
     acquire_scheduled: BTreeSet<PartitionId>,
+    rebuilds: BTreeMap<PartitionId, RebuildWatch>,
+    /// The stall line, per partition, once reported; cleared when the partition activates.
+    stalled: BTreeMap<PartitionId, String>,
+    /// [`REBUILD_PIN_WAIT_MILLIS`] times `RETCD_TEST_DEADLINE_SCALE`, read once.
+    rebuild_pin_wait_millis: u64,
     fault: Option<String>,
 }
 
@@ -556,6 +588,9 @@ impl Host {
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
             acquire_scheduled: BTreeSet::new(),
+            rebuilds: BTreeMap::new(),
+            stalled: BTreeMap::new(),
+            rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS.saturating_mul(deadline_scale()),
             fault: None,
         }
     }
@@ -821,6 +856,13 @@ impl Host {
                     site,
                     emitter,
                 } => self.land(result, site, emitter),
+                Delayed::RebuildCheck {
+                    partition,
+                    generation,
+                } => {
+                    self.rebuild_check(partition, generation);
+                    Ok(())
+                }
             };
             if let Err(detail) = outcome {
                 self.set_fault(detail);
@@ -1337,7 +1379,96 @@ impl Host {
             }
         }
         self.schedule_acquire(result, site);
+        self.watch_rebuild(result, partition);
         Ok(())
+    }
+
+    /// D2: a commit below `Active` is watched until F1 pins its rebuild or activates; one that
+    /// does neither within the wait is reported once (`recovery_rebuild_stalled`).
+    fn watch_rebuild(&mut self, result: &RecoveryResult, partition: PartitionId) {
+        if result.mode == PartitionMode::Active {
+            self.rebuilds.remove(&partition);
+            self.stalled.remove(&partition);
+            return;
+        }
+        let generation = result.new_generation;
+        if self
+            .rebuilds
+            .get(&partition)
+            .is_some_and(|watch| watch.generation == generation)
+        {
+            return;
+        }
+        let now = self.clock.now();
+        let at = now.plus_millis(self.rebuild_pin_wait_millis);
+        let required: Vec<CopyId> = self
+            .plans
+            .get(&partition)
+            .map(|plan| plan.rebuild_required.iter().copied().collect())
+            .unwrap_or_default();
+        tracing::info!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            mode = ?result.mode,
+            at = at.0,
+            kind = "rebuild_watch",
+            "host_duty"
+        );
+        self.rebuilds.insert(
+            partition,
+            RebuildWatch {
+                generation,
+                mode: result.mode.clone(),
+                cutoff: result.selected.cutoff_seq,
+                required,
+                since: now,
+                pinned: false,
+            },
+        );
+        self.stalled.remove(&partition);
+        self.delay(
+            at,
+            Delayed::RebuildCheck {
+                partition,
+                generation,
+            },
+        );
+    }
+
+    fn rebuild_check(&mut self, partition: PartitionId, generation: Generation) {
+        let Some(watch) = self
+            .rebuilds
+            .get(&partition)
+            .filter(|watch| watch.generation == generation && !watch.pinned)
+        else {
+            return;
+        };
+        let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
+        let phase = self
+            .recoveries
+            .get(&partition)
+            .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+        let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
+        let line = format!(
+            "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
+             waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
+             rebuild, so the partition stays read-only",
+            partition.0, generation.0, watch.mode, watch.cutoff.0,
+        );
+        tracing::error!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            mode = ?watch.mode,
+            cutoff = watch.cutoff.0,
+            required = ?required,
+            waited_ms,
+            phase = %phase,
+            host_catch_up = "unsupported",
+            "recovery_rebuild_stalled"
+        );
+        self.stalled.insert(partition, line);
     }
 
     /// A member hears a committed recovery (the sim's `run_due_watches`).
@@ -1570,6 +1701,11 @@ impl Host {
                     );
                     return Ok(());
                 };
+                if post_commit {
+                    if let Some(watch) = self.rebuilds.get_mut(&site.partition) {
+                        watch.pinned = true;
+                    }
+                }
                 let ask = PeerAsk::Sync {
                     copy: *copy,
                     cutoff: *cutoff,
@@ -2093,6 +2229,7 @@ impl Host {
                 .publication
                 .view(self.node, partition)
                 .map(|view| (view.published.generation, view.published.seq)),
+            stalled: self.stalled.get(&partition).cloned(),
         }
     }
 }
@@ -2128,6 +2265,15 @@ fn step_l1(
     }
     table.insert(ctx.partition, hosted);
     answer
+}
+
+/// `RETCD_TEST_DEADLINE_SCALE` (an integer, default 1), as `config_testkit::poll` reads it.
+fn deadline_scale() -> u64 {
+    std::env::var("RETCD_TEST_DEADLINE_SCALE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(1)
+        .max(1)
 }
 
 const fn is_progress(kind: &EventKind) -> bool {
@@ -2275,5 +2421,62 @@ mod tests {
         }
         assert!(host.queue.is_empty(), "nothing reached T1");
         assert!(host.pending.is_empty(), "no reply is awaited");
+    }
+
+    /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
+    /// unreachable F1 commits `ReadOnly` at cutoff 0, and its rebuild never pins because no copy
+    /// is behind. F1 arms no timer before the pin, so the partition stayed read-only in silence.
+    /// The host now reports it once, with the mode and the copies it waits on (lead ruling).
+    #[test]
+    fn a_read_only_commit_whose_rebuild_never_pins_is_reported_stalled() {
+        let dir = config_testkit::fs::temp_dir();
+        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let (tx, rx) = mpsc::channel();
+        links.register(NodeId(1), tx.clone());
+        links.hold(NodeId(1), NodeId(2));
+        links.hold(NodeId(1), NodeId(3));
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control =
+            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
+        let clock = HostClock::start();
+        let mut host = Host::new(NodeId(1), engine, links, control, clock);
+        // The same run as the walk, faster: a short discovery window and a short watch.
+        host.budgets.discovery_window_millis = 20;
+        host.rebuild_pin_wait_millis = 50;
+        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
+            tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
+        }))
+        .expect("bootstrap");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stalled = loop {
+            host.run_due();
+            host.drain();
+            assert_eq!(
+                host.fault, None,
+                "the watch reports; it never faults the node"
+            );
+            if let Some(line) = host.status(PartitionId(1)).stalled {
+                break line;
+            }
+            assert!(Instant::now() < deadline, "no stall reported within 5 s");
+            if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
+                host.handle(msg);
+            }
+        };
+        let status = host.status(PartitionId(1));
+        assert_eq!(status.recovery.as_deref(), Some("Rebuilding"));
+        for part in [
+            "recovery_rebuild_stalled partition=1 gen=1 mode=ReadOnly cutoff=0 required=[0, 1, 2]",
+            "phase=Rebuilding host_catch_up=unsupported",
+        ] {
+            assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
+        }
     }
 }

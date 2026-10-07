@@ -22,7 +22,9 @@
 //!
 //! While it runs, a poller prints the partition's progress as it changes: `recovered gen=N`,
 //! `waiting for write protection (...)`, and `ready` once node 1's L1 admits writes. A put
-//! before `ready` is refused, never left hanging.
+//! before `ready` is refused, never left hanging. A recovery committed below `Active` whose
+//! rebuild never pins prints `stalled node=N recovery_rebuild_stalled ...` once, after
+//! `REBUILD_PIN_WAIT_MILLIS` times `RETCD_TEST_DEADLINE_SCALE`.
 //!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
 
@@ -242,6 +244,14 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
         for node in &nodes {
             if let Some(fault) = &node.fault {
                 let line = format!("fault node={} {fault}", node.node.0);
+                if !seen.faults.contains(&line) {
+                    say(&line);
+                    seen.faults.push(line);
+                }
+            }
+            // Not a node fault (the node keeps serving), but printed the same way: once.
+            if let Some(stalled) = &node.stalled {
+                let line = format!("stalled node={} {stalled}", node.node.0);
                 if !seen.faults.contains(&line) {
                     say(&line);
                     seen.faults.push(line);
