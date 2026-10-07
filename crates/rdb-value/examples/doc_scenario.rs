@@ -1,4 +1,4 @@
-//! Hand entry point for M8 S2 and S3 (s2-design §3, s3-design §3): documents, maps and sets in a
+//! Hand entry point for M8 S2 and S3 (ADR-rdb-0012, ADR-rdb-0013): documents, maps and sets in a
 //! file-backed store.
 //!
 //! ```text
@@ -25,9 +25,19 @@
 //! doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]
 //! doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]
 //! doc_scenario --store <FILE> gc <id> --floor F [--compile-only]
+//! doc_scenario --store <FILE> list <id> (--absent [--records] | --expect V) [--compile-only]
+//!                                  (push J | insert P J | remove P | replace P J | move P Q)...
+//! doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]
 //! doc_scenario --store <FILE> dump
 //! doc_scenario decode --hex H
 //! doc_scenario --help
+//!
+//! `--block-max N` (before the command, beside `--store`) is the list block size the store
+//! compiles with (ADR-rdb-0016 §4), in 1,024..=196,608; a size outside that is refused (exit 2)
+//! and never saved. Given on a store's first command, it is written to the store's head line;
+//! a later different value is refused (exit 2). Without it a store uses 131,072. `drop` reads the
+//! root's kind and drops a list or a collection. `get` reads a document and `items` reads a list;
+//! a `get` on a list's key is refused `KindMismatch`.
 //!
 //! <id> is an object id: plain text, or hex:<hex> for any bytes. Every object lives at
 //! tenant 1, affinity 1, under the root key the library builds (ADR-rdb-0013 §1).
@@ -71,13 +81,16 @@
 //!
 //! `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.
 //!
-//! The store is one JSON line `{"seq":N,"envelope":2}`, then one line per record
+//! The store is one JSON line `{"seq":N,"envelope":2}` (plus `"block_max":N` when one was
+//! given), then one line per record
 //! `{"key_hex":..,"version":..,"value_hex":..}`, rewritten whole on every commit. A store
 //! with no marker or a lower one was sealed before ruling L-R186s, and one with a higher marker
 //! was written by a newer build; any other marker is unrecognised. All are refused, exit 3, as
 //! is a store from S2 (with `key` instead of `key_hex`). `seq` stands in for the kernel's
 //! transaction sequence: each commit takes the next one and stamps it as the version of every
-//! record it writes. `apply` checks the condition, then each write's `expected_version`, the way
+//! record it writes. Every commit's keys must strictly ascend, one write per key, as the
+//! kernel's check 10 requires; a list write must name its generation (ADR-rdb-0016 §8). `apply`
+//! checks the condition, then each write's `expected_version`, the way
 //! the kernel's `first_failed_condition` does, and refuses with the kernel's name,
 //! `ConditionFailed { index }`.
 //!
@@ -90,7 +103,16 @@
 //! root's count with the elements, and it takes a root `Delete` while elements remain. The
 //! count is kept by `compile_collection` and `drop_collection`, so a hand-edited line can
 //! leave the count-mismatch or orphan state of ADR-rdb-0013 decision 11.
+//!
+//! A list item, block base or change slot is checked less than a read checks it, by `apply`
+//! and by `dump` alike. Each needs its list's root written beside it (for `apply`), the
+//! envelope kind its key calls for, and canonical CBOR; `dump` also names a slot that is not
+//! `[op no, op]`. Not checked: a base's `{items, folded}` shape, the replay of its pending
+//! slots, the root's `count`, `bytes` and block heads against the blocks, and orphans. So a
+//! hand-edited line or store can hold a list that `items`, a write or a drop refuses, for
+//! example a base of CBOR null as `Block::Shape` (ADR-rdb-0016 §7).
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path as FsPath, PathBuf};
 use std::process::ExitCode;
@@ -101,6 +123,7 @@ use rdb_value::cbor;
 use rdb_value::delta::{resolve, ApplyError, Delta, Op};
 use rdb_value::envelope::{self, Kind, MAX_ENVELOPE, MAX_PAYLOAD};
 use rdb_value::keys::{self, RootKey, Sub};
+use rdb_value::list::{DEFAULT_BLOCK_MAX, MAX_BLOCK_MAX, MIN_BLOCK_MAX};
 use rdb_value::path::{Path, PathError};
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
@@ -110,8 +133,10 @@ use rdb_value::{compile, read, Compiled, Corrupt, Expected, ValueError};
 mod blob;
 #[path = "doc_scenario/coll.rs"]
 mod coll;
+#[path = "doc_scenario/list.rs"]
+mod list;
 
-/// The one scope this tool writes in (s3-design §2), so keys match ADR-rdb-0013 §6's example.
+/// The one scope this tool writes in, so keys match ADR-rdb-0013 §6's example.
 const TENANT: TenantId = TenantId(1);
 /// See [`TENANT`].
 const AFFINITY: AffinityId = AffinityId(1);
@@ -130,9 +155,13 @@ doc_scenario --store <FILE> upload <id> (--absent | --expect V) --upload H --chu
 doc_scenario --store <FILE> blob <id>\n       doc_scenario --store <FILE> read <id> [--offset O --len L] [--out FILE]\n       \
 doc_scenario --store <FILE> blob-delete <id> --expect V [--compile-only]\n       \
 doc_scenario --store <FILE> gc <id> --floor F [--compile-only]\n       \
+doc_scenario --store <FILE> list <id> (--absent [--records] | --expect V) [--compile-only] (push J | insert P J | remove P | replace P J | move P Q)...\n       \
+doc_scenario --store <FILE> items <id> [--from P | --token G:V:P] [--limit N]\n       \
 doc_scenario --store <FILE> dump\n       \
 doc_scenario decode --hex H\n       doc_scenario --help\n(a value written @FILE is read from FILE)\n\
 <id> is text, or hex:<hex>; K is a JSON scalar, or cbor:<hex>.\n\
+--block-max N, beside --store, sets a new store's list block size, 1024..=196608 (default 131072).\n\
+`get` reads a document and `items` reads a list (a `get` on a list is KindMismatch).\n\
 `value` is for reading; to copy a document, pass `payload_hex` to `--cbor-hex`.";
 
 // Input limits. Every text input is read through `Read::take` at one of these, so an oversized
@@ -295,18 +324,49 @@ fn parse_path(text: &str) -> Result<Path, Failure> {
 
 type Fields = Vec<(&'static str, String)>;
 
+thread_local! {
+    /// The `--block-max` of this run, for [`Store::load`]: a new store takes it, an existing one
+    /// must hold the same.
+    static BLOCK_MAX: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
 fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
     let mut store: Option<PathBuf> = None;
+    let mut block_max: Option<usize> = None;
     let mut rest = args;
     while let [flag, value, tail @ ..] = rest {
-        if flag != "--store" {
-            break;
-        }
-        if store.replace(PathBuf::from(value)).is_some() {
-            return ("usage", Err(Failure::usage("--store given twice")));
+        match flag.as_str() {
+            "--store" => {
+                if store.replace(PathBuf::from(value)).is_some() {
+                    return ("usage", Err(Failure::usage("--store given twice")));
+                }
+            }
+            "--block-max" => {
+                let Ok(n) = value.parse::<usize>() else {
+                    return (
+                        "usage",
+                        Err(Failure::usage(format!(
+                            "--block-max {value:?} is not a size"
+                        ))),
+                    );
+                };
+                if !(MIN_BLOCK_MAX..=MAX_BLOCK_MAX).contains(&n) {
+                    return (
+                        "usage",
+                        Err(Failure::usage(format!(
+                            "--block-max {n} is outside {MIN_BLOCK_MAX}..={MAX_BLOCK_MAX}"
+                        ))),
+                    );
+                }
+                if block_max.replace(n).is_some() {
+                    return ("usage", Err(Failure::usage("--block-max given twice")));
+                }
+            }
+            _ => break,
         }
         rest = tail;
     }
+    BLOCK_MAX.with(|cell| cell.set(block_max));
     let Some((cmd, rest)) = rest.split_first() else {
         return ("usage", Err(Failure::usage("no command")));
     };
@@ -331,6 +391,8 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "read" => "read",
         "blob-delete" => "blob-delete",
         "gc" => "gc",
+        "list" => "list",
+        "items" => "items",
         "--help" | "-h" | "help" if rest.is_empty() => return ("help", Ok(Vec::new())),
         other => {
             return (
@@ -352,7 +414,7 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "get" => get_cmd(&store, rest),
         "map" => coll::write_cmd(&store, coll::CollectionKind::Map, rest),
         "set" => coll::write_cmd(&store, coll::CollectionKind::Set, rest),
-        "drop" => coll::drop_cmd(&store, rest),
+        "drop" => drop_cmd(&store, rest),
         "collection" => coll::collection_cmd(&store, rest),
         "member" => coll::member_cmd(&store, rest),
         "members" => coll::members_cmd(&store, rest),
@@ -363,6 +425,8 @@ fn run(args: &[String]) -> (&'static str, Result<Fields, Failure>) {
         "read" => blob::read_cmd(&store, rest),
         "blob-delete" => blob::delete_cmd(&store, rest),
         "gc" => blob::gc_cmd(&store, rest),
+        "list" => list::write_cmd(&store, rest),
+        "items" => list::items_cmd(&store, rest),
         _ => dump_cmd(&store, rest),
     };
     (name, outcome)
@@ -406,8 +470,16 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     let [file] = rest else {
         return Err(Failure::usage("apply takes exactly one file"));
     };
-    let (compiled, generation) = load_compiled(FsPath::new(file))?;
+    let (compiled, generation, writes_list) = load_compiled(FsPath::new(file))?;
     let mut store = Store::load(store_path)?;
+    // A list's blocks, change slots and ids are guarded only by its root's version, which a
+    // failover can reuse, so a list write is never applied unfenced (ADR-rdb-0016 §8).
+    if generation.is_none() && (writes_list || drops_list(&store, &compiled)) {
+        return Err(Failure::refused(
+            "GenerationRequired".into(),
+            "a list write must name its generation (ADR-rdb-0016 §8); this line names none".into(),
+        ));
+    }
     let version = match generation {
         Some(generation) => store.apply_at(&compiled, generation)?,
         None => store.apply(&compiled)?,
@@ -418,6 +490,39 @@ fn apply_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
     }
     fields.extend(compiled_fields(&compiled)?);
     Ok(fields)
+}
+
+/// Whether `compiled` deletes a root the store holds as a list.
+fn drops_list(store: &Store, compiled: &Compiled) -> bool {
+    compiled.mutations.iter().any(|m| match m {
+        Mutation::Delete { key, .. } => store
+            .snapshot
+            .get(Namespace::User, key)
+            .is_some_and(|raw| envelope::open(&raw).is_ok_and(|o| o.kind == Kind::List)),
+        Mutation::Put { .. } => false,
+    })
+}
+
+/// `drop <id> --expect V [--compile-only]`: a list's drop when the root is a list, otherwise a
+/// collection's, which also names any other kind it finds; a list block or slot record at the
+/// root is `ListRecordAtRoot` there, and nothing is written.
+fn drop_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
+    let is_list = match rest.first() {
+        Some(id) => {
+            let root = root_of(id).map_err(|e| e.keyed(id))?;
+            let store = Store::load(store_path)?;
+            store
+                .snapshot
+                .get(Namespace::User, root.as_bytes())
+                .is_some_and(|raw| envelope::open(&raw).is_ok_and(|o| o.kind == Kind::List))
+        }
+        None => false,
+    };
+    if is_list {
+        list::drop_cmd(store_path, rest)
+    } else {
+        coll::drop_cmd(store_path, rest)
+    }
 }
 
 fn commit_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
@@ -545,7 +650,8 @@ fn dump_cmd(store_path: &FsPath, rest: &[String]) -> Result<Fields, Failure> {
 
 /// One record of `dump`, read the way its key says: what object it belongs to, which part of
 /// it, and then through the library's own read for that part, so every check a read makes is
-/// made here too.
+/// made here too. A list item, block base or change slot is the exception: it is checked only
+/// as the module doc says, so a base a read refuses can dump without an error.
 fn dump_record(
     snapshot: &MapSnapshot,
     key: &[u8],
@@ -569,6 +675,15 @@ fn dump_record(
                 line.raw("value", render(&document.value));
             } else if opened.kind == Kind::Blob {
                 blob::dump_root(snapshot, &root, line)?;
+                line.extend(envelope_fields(raw)?);
+            } else if matches!(opened.kind, Kind::ListBlock | Kind::ListSlot) {
+                // A block or slot record at a root key is damage. Name it as read, blob-delete
+                // and gc do (tester W2), whatever object the key was meant to hold.
+                return Err(Failure::from(ValueError::Corrupt(
+                    Corrupt::ListRecordAtRoot { found: opened.kind },
+                )));
+            } else if opened.kind == Kind::List {
+                list::dump_root(snapshot, &root, line)?;
                 line.extend(envelope_fields(raw)?);
             } else if opened.kind == Kind::Chunk {
                 return Err(Failure::from(ApplyError::KindMismatch {
@@ -600,6 +715,12 @@ fn dump_record(
                 .chunk
                 .ok_or_else(|| Failure::store("a chunk key parsed without its tail"))?;
             blob::dump_chunk(&upload, index, raw, line)?;
+        }
+        (Sub::Item | Sub::Block, _) => {
+            let id = parsed
+                .list_id
+                .ok_or_else(|| Failure::store("a list key parsed without its id"))?;
+            list::dump_record(snapshot, &root, parsed.sub, parsed.slot, id, raw, line)?;
         }
         (Sub::Reserved(byte), _) => {
             line.str("sub", &format!("reserved {byte:#04x}"));
@@ -906,24 +1027,47 @@ const STORE_ENVELOPE: u64 = 2;
 struct Store {
     path: PathBuf,
     seq: u64,
+    /// The `block_max` its head line names, if one was given when it was made.
+    block_max: Option<usize>,
     snapshot: MapSnapshot,
 }
 
 impl Store {
-    /// A missing file is an empty store at `seq` 0.
+    /// A missing file is an empty store at `seq` 0, with this run's `--block-max` if given. An
+    /// existing store must hold the `--block-max` given, if any (exit 2).
     fn load(path: &FsPath) -> Result<Self, Failure> {
-        match std::fs::File::open(path) {
-            Ok(file) => Self::read(path, BufReader::new(file)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+        let requested = BLOCK_MAX.with(Cell::get);
+        let store = match std::fs::File::open(path) {
+            Ok(file) => Self::read(path, BufReader::new(file))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self {
                 path: path.to_owned(),
                 seq: 0,
+                block_max: requested,
                 snapshot: MapSnapshot::new(Generation(1)),
-            }),
-            Err(e) => Err(Failure::store(format!(
-                "cannot read {}: {e}",
-                path.display()
-            ))),
+            },
+            Err(e) => {
+                return Err(Failure::store(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        if let Some(requested) = requested {
+            if requested != store.block_max() {
+                return Err(Failure::usage(format!(
+                    "--block-max {requested}: {} is a store at block_max {}; a store keeps the \
+                     block size it was made with",
+                    path.display(),
+                    store.block_max()
+                )));
+            }
         }
+        Ok(store)
+    }
+
+    /// The list block size this store compiles with.
+    fn block_max(&self) -> usize {
+        self.block_max.unwrap_or(DEFAULT_BLOCK_MAX)
     }
 
     /// The store in `source`, read one line at a time, each line bounded at [`MAX_LINE`]: a read
@@ -932,6 +1076,7 @@ impl Store {
         let mut store = Self {
             path: path.to_owned(),
             seq: 0,
+            block_max: None,
             snapshot: MapSnapshot::new(Generation(1)),
         };
         let bad = |n: usize, what: &str| {
@@ -1020,6 +1165,14 @@ impl Store {
                 ))
             }
         }
+        store.block_max = match head.get("block_max") {
+            None => None,
+            Some(v) => Some(
+                v.as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(|| bad(n, "\"block_max\" is not a size"))?,
+            ),
+        };
         for (n, line) in lines {
             let record: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| bad(n, &e.to_string()))?;
@@ -1051,12 +1204,29 @@ impl Store {
             }
             store.snapshot.insert(key, version, Bytes::from(value));
         }
+        // The last commit may have ended in a delete, which leaves no record at its version.
+        store.snapshot.advance_to(store.seq);
         Ok(store)
     }
 
     /// Check `compiled` as the kernel does, then commit it at the next `seq`: every `Put` at
     /// that version, every `Delete` removed.
     fn apply(&mut self, compiled: &Compiled) -> Result<u64, Failure> {
+        // The kernel's check 10 refuses two writes to one key; every compile emits its writes in
+        // strictly ascending key order, so anything else is a compile fault, refused here.
+        if let Some(i) = compiled
+            .mutations
+            .windows(2)
+            .position(|w| w[0].key() >= w[1].key())
+        {
+            return Err(Failure::refused(
+                "Malformed { field: \"mutations\" }".into(),
+                format!(
+                    "mutations {i} and {}: keys must strictly ascend, one write per key",
+                    i + 1
+                ),
+            ));
+        }
         // The kernel's order (`first_failed_condition`): every condition, then every mutation,
         // where a mutation without `expected_version` always holds. Each check: what it claims,
         // the key it reads, and whether it held.
@@ -1140,33 +1310,35 @@ impl Store {
             }
         }
         self.seq = version;
+        self.snapshot.advance_to(version);
         self.save()?;
         Ok(version)
     }
 
     /// [`Store::apply`] for a request that names its generation (ADR-rdb-0014 §12): a generation
     /// other than the snapshot's is refused first, before any condition, as the kernel's admission
-    /// check 5 refuses it (`GENERATION_CHANGED`).
+    /// check 5 refuses it (`GENERATION_CHANGED`), named as a stale token is.
     fn apply_at(&mut self, compiled: &Compiled, generation: Generation) -> Result<u64, Failure> {
         let current = self.snapshot.generation();
         if generation != current {
-            return Err(Failure::refused(
-                format!(
-                    "GenerationChanged {{ expected: {}, current: {} }}",
-                    generation.0, current.0
-                ),
-                format!(
-                    "GENERATION_CHANGED: the request names generation {}, the store is at {}",
-                    generation.0, current.0
-                ),
-            ));
+            return Err(ApplyError::GenerationChanged {
+                expected: generation.0,
+                found: current.0,
+            }
+            .into());
         }
         self.apply(compiled)
     }
 
     /// Rewrite the whole file: to a sibling first, then rename over the old one.
     fn save(&self) -> Result<(), Failure> {
-        let mut text = format!("{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}}}\n", self.seq);
+        let block_max = self
+            .block_max
+            .map_or_else(String::new, |n| format!(",\"block_max\":{n}"));
+        let mut text = format!(
+            "{{\"seq\":{},\"envelope\":{STORE_ENVELOPE}{block_max}}}\n",
+            self.seq
+        );
         for (key, version, value) in self.snapshot.records() {
             text.push_str(&format!(
                 "{{\"key_hex\":\"{}\",\"version\":{version},\"value_hex\":\"{}\"}}\n",
@@ -1186,8 +1358,9 @@ impl Store {
 /// before anything is applied: the keys parse, in strictly ascending order (one write per key, as
 /// every compile emits); a root reads back through the library; a map entry is a document and a
 /// set member is empty, read through `member` under the root written beside it. The root's
-/// count is not checked against the elements (see the module doc).
-fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>), Failure> {
+/// count is not checked against the elements, and a list item, block or slot is checked only by
+/// its kind and its CBOR (see the module doc).
+fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>, bool), Failure> {
     let cannot = |e: std::io::Error| Failure::usage(format!("cannot read {}: {e}", file.display()));
     let source = std::fs::File::open(file).map_err(cannot)?;
     let bytes = read_bounded(source, MAX_LINE)
@@ -1269,20 +1442,24 @@ fn load_compiled(file: &FsPath) -> Result<(Compiled, Option<Generation>), Failur
         });
     }
     let generation = blob::line_generation(&json).map_err(|e| bad(&e))?;
-    check_writes(&mutations)?;
+    let writes_list = check_writes(&mutations)?;
     Ok((
         Compiled {
             mutations,
             conditions,
         },
         generation,
+        writes_list,
     ))
 }
 
 /// Every write in a compiled line reads back (see [`load_compiled`]): every key parses, every
 /// element write has its root written beside it, and every `Put` reads back through the
-/// library. A refusal names the key.
-fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
+/// library, except a list item, block or slot `Put`, checked only by [`list::check_record`].
+/// A refusal names the key. Returns whether any write is a list's root, item, block
+/// base or change slot.
+fn check_writes(mutations: &[Mutation]) -> Result<bool, Failure> {
+    let mut writes_list = false;
     // Every `Put` at version 1, so each one is read the way it would be once applied.
     let mut written = MapSnapshot::new(Generation(1));
     for mutation in mutations {
@@ -1313,7 +1490,11 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                     Kind::Blob => {
                         rdb_value::blob::read_blob(&written, &root).map_err(|e| keyed(e.into()))?;
                     }
-                    Kind::Chunk => {
+                    Kind::List => {
+                        writes_list = true;
+                        rdb_value::list::list(&written, &root).map_err(|e| keyed(e.into()))?;
+                    }
+                    Kind::Chunk | Kind::ListBlock | Kind::ListSlot => {
                         return Err(keyed(
                             ApplyError::KindMismatch { found: opened.kind }.into(),
                         ))
@@ -1345,6 +1526,26 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
                     blob::open_chunk(index, value).map_err(keyed)?;
                 }
             }
+            // An item, block or slot write keeps its root in step, so it needs the root written
+            // beside it, as an element write does. A drop deletes the root with its block and
+            // slots, so a root `Delete` counts too.
+            (Sub::Item | Sub::Block, _) => {
+                writes_list = true;
+                let root_written = mutations.iter().any(|m| match m {
+                    Mutation::Put { key, .. } | Mutation::Delete { key, .. } => {
+                        key[..] == *root.as_bytes()
+                    }
+                });
+                if !root_written {
+                    return Err(keyed(Failure::usage(
+                        "a list item, block or slot write without its list's root write \
+                         (ADR-rdb-0016 §5)",
+                    )));
+                }
+                if let Some(value) = value {
+                    list::check_record(parsed.sub, parsed.slot, value).map_err(keyed)?;
+                }
+            }
             (Sub::Reserved(byte), _) => {
                 return Err(keyed(Failure::usage(format!(
                     "sub byte {byte:#04x} is reserved; this build writes no such record"
@@ -1352,7 +1553,7 @@ fn check_writes(mutations: &[Mutation]) -> Result<(), Failure> {
             }
         }
     }
-    Ok(())
+    Ok(writes_list)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1836,7 +2037,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 
-    /// Tester paper cut (s3-tester-w1.md): `ObjectAbsent` said "the document does not exist"
+    /// S3 tester paper cut: `ObjectAbsent` said "the document does not exist"
     /// for a map or a set too.
     #[test]
     fn pc1_object_absent_on_a_map_does_not_call_it_a_document() {
@@ -1853,7 +2054,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 
-    /// Tester paper cut (s3-tester-w1.md): a refused create printed the root it never wrote,
+    /// S3 tester paper cut: a refused create printed the root it never wrote,
     /// e.g. `map tags --absent` on the set `tags` showed `kind: Map, count: 0` beside
     /// `ConditionFailed`. A refusal prints no `kind` or `count`; a commit still does.
     #[test]
@@ -2247,6 +2448,528 @@ mod tests {
             before,
             "store unchanged"
         );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+    /// Tester W1 D1 (ruling L-R186cm): an out-of-range `--node-max` was saved in a new store's
+    /// head by the first command that committed, and every later `list` then failed. Its
+    /// successor `--block-max` (ADR-rdb-0016 §4) is refused as usage, exit 2, before any store
+    /// is read or written.
+    #[test]
+    fn d1_an_out_of_range_block_max_is_refused_and_never_saved() {
+        let dir = scratch("d1-block-max");
+        let store = dir.join("s.jsonl");
+        for size in ["512", "1023", "196609"] {
+            let (_, got) = run(&args(&[
+                "--store",
+                store.to_str().unwrap(),
+                "--block-max",
+                size,
+                "put",
+                "d",
+                "--absent",
+                "--json",
+                "1",
+            ]));
+            let err = got.expect_err("refused");
+            assert_eq!(
+                (err.exit, err.error.as_str()),
+                (2, "Usage"),
+                "{}",
+                err.detail
+            );
+            assert!(!store.exists(), "--block-max {size}: no store written");
+        }
+        for size in ["1024", "196608"] {
+            let (_, got) = run(&args(&[
+                "--store",
+                store.to_str().unwrap(),
+                "--block-max",
+                size,
+                "list",
+                "x",
+                "--absent",
+            ]));
+            got.expect("a size in range makes a list");
+            std::fs::remove_file(&store).expect("reset");
+        }
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// ADR-rdb-0016 §8: a list write or a list drop is never applied unfenced. A compile line
+    /// with its `generation` removed is refused `GenerationRequired`; one naming another
+    /// generation is refused `GenerationChanged`. The store is unchanged either way, and the
+    /// same line with its own generation applies.
+    #[test]
+    fn w1_apply_refuses_a_list_line_without_its_generation() {
+        let dir = scratch("w1-apply-generation");
+        let store = dir.join("s.jsonl");
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", "\"a\""])).expect("create");
+        let line = |cmd: &str, fields: Fields| {
+            let mut line = Line::new(cmd);
+            line.extend(fields);
+            serde_json::from_str::<serde_json::Value>(&line.render()).expect("json")
+        };
+        let push = line(
+            "list",
+            list::write_cmd(
+                &store,
+                &args(&["todo", "--expect", "1", "--compile-only", "push", "\"b\""]),
+            )
+            .expect("compile the push"),
+        );
+        let file = dir.join("c.json");
+        let before = std::fs::read(&store).expect("store");
+        let mut unfenced = push.clone();
+        unfenced.as_object_mut().unwrap().remove("generation");
+        let mut elsewhere = push.clone();
+        elsewhere["generation"] = 2.into();
+        for (json, want) in [
+            (&unfenced, "GenerationRequired"),
+            (&elsewhere, "GenerationChanged"),
+        ] {
+            std::fs::write(&file, json.to_string()).expect("write");
+            let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+            assert!(err.error.starts_with(want), "{}: {}", err.error, err.detail);
+            assert_eq!(
+                std::fs::read(&store).expect("store"),
+                before,
+                "store unchanged"
+            );
+        }
+        std::fs::write(&file, push.to_string()).expect("write");
+        apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect("fenced line applies");
+
+        list::write_cmd(
+            &store,
+            &args(&["todo", "--expect", "2", "remove", "0", "remove", "0"]),
+        )
+        .expect("empty the list");
+        let mut drop = line(
+            "drop",
+            drop_cmd(&store, &args(&["todo", "--expect", "3", "--compile-only"]))
+                .expect("compile the drop"),
+        );
+        drop.as_object_mut().unwrap().remove("generation");
+        std::fs::write(&file, drop.to_string()).expect("write");
+        let before = std::fs::read(&store).expect("store");
+        let err = apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect_err("refused");
+        assert_eq!(err.error, "GenerationRequired", "{}", err.detail);
+        assert_eq!(
+            std::fs::read(&store).expect("store"),
+            before,
+            "store unchanged"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    // ---- W3: the example's walk-only list guards (F16, F17, W25, W26, the wrap) -------------
+
+    /// Rewrite the store's records through `edit`, keeping its seq and block size: damage a
+    /// test plants by hand, as a byte edit of the file would.
+    fn edit_records(path: &FsPath, edit: impl FnOnce(&mut Vec<(Bytes, u64, Bytes)>)) {
+        let mut store = Store::load(path).expect("load");
+        let mut records: Vec<(Bytes, u64, Bytes)> = store
+            .snapshot
+            .records()
+            .map(|(k, v, b)| (k.clone(), v, b.clone()))
+            .collect();
+        edit(&mut records);
+        let mut snapshot = MapSnapshot::new(store.snapshot.generation());
+        for (key, version, value) in records {
+            snapshot.insert(key, version, value);
+        }
+        snapshot.advance_to(store.seq);
+        store.snapshot = snapshot;
+        store.save().expect("save");
+    }
+
+    /// `dump`'s records, one JSON object each.
+    fn dumped(store: &FsPath) -> Vec<serde_json::Value> {
+        let fields = dump_cmd(store, &[]).expect("dump");
+        let (_, records) = fields
+            .iter()
+            .find(|(name, _)| *name == "records")
+            .expect("records");
+        serde_json::from_str(records).expect("json")
+    }
+
+    /// The parsed key of a list record: its sub and slot.
+    fn sub_slot(key: &[u8]) -> (Sub, Option<u8>) {
+        let parsed = keys::parse(key).expect("a key");
+        (parsed.sub, parsed.slot)
+    }
+
+    /// A slot payload `[op no, op]` holding `op_no`, sealed.
+    fn slot_record(op_no: u64, op: Value) -> Bytes {
+        let payload = Value::Array(vec![Value::Integer(Int::from(op_no)), op]);
+        envelope::seal(Kind::ListSlot, &cbor::encode(&payload).expect("encode")).expect("seal")
+    }
+
+    /// The op a slot record holds, decoded.
+    fn slot_op(raw: &[u8]) -> Value {
+        let opened = envelope::open(raw).expect("envelope");
+        match cbor::decode(opened.payload).expect("cbor") {
+            Value::Array(mut parts) if parts.len() == 2 => parts.remove(1),
+            other => panic!("a slot is [op no, op]: {other:?}"),
+        }
+    }
+
+    /// W3 (F17 was walk-only): `drop` of a root holding a block or slot record goes to the
+    /// collection drop, which names it `ListRecordAtRoot` and writes nothing (ADR-rdb-0016 §7).
+    /// The example's own routing of those kinds to the list drop was dead and is gone (L-R186ef).
+    #[test]
+    fn w3_drop_of_a_root_holding_a_block_or_slot_record_is_list_record_at_root() {
+        let dir = scratch("w3-drop-at-root");
+        let store = dir.join("s.jsonl");
+        let long = format!("\"{}\"", "a".repeat(200));
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", &long])).expect("create");
+        list::write_cmd(&store, &args(&["todo", "--expect", "1", "push", "\"b\""])).expect("push");
+        let root = root_of("todo").expect("root");
+        let source = std::fs::read(&store).expect("store");
+        // The push is op 2, in slot 2: the create was op 1.
+        for (sub, found) in [(None, "ListBlock"), (Some(2_u8), "ListSlot")] {
+            std::fs::write(&store, &source).expect("reset");
+            edit_records(&store, |records| {
+                let raw = records
+                    .iter()
+                    .find(|(key, _, _)| sub_slot(key) == (Sub::Block, sub))
+                    .map(|(_, _, raw)| raw.clone())
+                    .expect("a block record");
+                let at_root = records
+                    .iter_mut()
+                    .find(|(key, _, _)| key.as_ref() == root.as_bytes())
+                    .expect("the root");
+                at_root.2 = raw;
+            });
+            let before = std::fs::read(&store).expect("store");
+            let err = drop_cmd(&store, &args(&["todo", "--expect", "2"])).expect_err("refused");
+            assert_eq!(
+                err.error,
+                format!("Corrupt(ListRecordAtRoot {{ found: {found} }})"),
+                "{}",
+                err.detail
+            );
+            assert_eq!(
+                std::fs::read(&store).expect("store"),
+                before,
+                "store unchanged"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// W3 (F16 was walk-only): `dump` names a block whose base is not in the store under the
+    /// root's `absent_bases`, and prints no such field while every base is there.
+    #[test]
+    fn w3_dump_names_a_missing_base_under_absent_bases() {
+        let dir = scratch("w3-absent-bases");
+        let store = dir.join("s.jsonl");
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", "\"a\""])).expect("create");
+        let root_line = |store: &FsPath| {
+            dumped(store)
+                .into_iter()
+                .find(|r| r["sub"] == "root")
+                .expect("a root line")
+        };
+        let whole = root_line(&store);
+        assert!(whole.get("absent_bases").is_none(), "{whole}");
+        let mut base_id = None;
+        edit_records(&store, |records| {
+            let at = records
+                .iter()
+                .position(|(key, _, _)| sub_slot(key) == (Sub::Block, None))
+                .expect("a base");
+            base_id = keys::parse(&records[at].0).expect("key").list_id;
+            records.remove(at);
+        });
+        let line = root_line(&store);
+        let absent = line["absent_bases"].as_array().expect("absent_bases");
+        assert_eq!(absent.len(), 1, "{line}");
+        assert_eq!(
+            absent[0],
+            format!("{:032x}", base_id.expect("an id")),
+            "{line}"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// W3 (W25, W26 and the F02 wrap were walk-only): pending ops that wrap past slot 239 dump
+    /// as `pending` on both sides of the wrap; a slot whose op no lies past `head` is `stale`
+    /// though it sits inside the pending range's slots; and a slot whose payload is not
+    /// `[op no, op]` is `OpBad` naming the op it holds pending, or the block's `Shape` when it
+    /// holds none.
+    #[test]
+    fn w3_dump_tells_pending_from_stale_across_the_wrap_and_names_a_bad_slot() {
+        let dir = scratch("w3-dump-wrap");
+        let store = dir.join("s.jsonl");
+        let names: Vec<String> = (0..230).map(|i| format!("\"{i:0>16}\"")).collect();
+        let mut create = vec!["todo", "--absent"];
+        for name in &names {
+            create.extend(["push", name.as_str()]);
+        }
+        list::write_cmd(&store, &args(&create)).expect("create");
+        let pushes: Vec<String> = (0..15).map(|i| format!("\"p{i}\"")).collect();
+        let mut write = vec!["todo", "--expect", "1"];
+        for push in &pushes {
+            write.extend(["push", push.as_str()]);
+        }
+        list::write_cmd(&store, &args(&write)).expect("15 pushes");
+        // Plant stale slots 6 (op 6) and 230 (op 230): each lies inside the pending range's
+        // slots' span on neither side, and its op no is not `folded + 1 ..= head`.
+        edit_records(&store, |records| {
+            let (key, version, raw) = records
+                .iter()
+                .find(|(key, _, _)| sub_slot(key) == (Sub::Block, Some(231)))
+                .cloned()
+                .expect("slot 231");
+            let parsed = keys::parse(&key).expect("key");
+            let root = parsed.root();
+            let id = parsed.list_id.expect("an id");
+            for op_no in [6_u64, 230] {
+                let slot = u8::try_from(op_no).expect("a slot");
+                records.push((
+                    keys::slot_key(&root, id, slot),
+                    version,
+                    slot_record(op_no, slot_op(&raw)),
+                ));
+            }
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+        });
+        let states = |store: &FsPath| -> std::collections::BTreeMap<u64, (String, String)> {
+            dumped(store)
+                .into_iter()
+                .filter(|r| r["sub"] == "slot")
+                .map(|r| {
+                    let slot = r["slot"].as_u64().expect("slot");
+                    let state = r["state"].as_str().unwrap_or("").to_owned();
+                    let error = r["error"].as_str().unwrap_or("").to_owned();
+                    (slot, (state, error))
+                })
+                .collect()
+        };
+        let got = states(&store);
+        let mut want: std::collections::BTreeMap<u64, (String, String)> = (231..240)
+            .chain(0..6)
+            .map(|slot| (slot, ("pending".to_owned(), String::new())))
+            .collect();
+        for slot in [6, 230] {
+            want.insert(slot, ("stale".to_owned(), String::new()));
+        }
+        assert_eq!(got, want);
+
+        // A bad payload in pending slot 0 (op 240) and in stale slot 6.
+        edit_records(&store, |records| {
+            for (key, _, raw) in records.iter_mut() {
+                if matches!(sub_slot(key), (Sub::Block, Some(0 | 6))) {
+                    let bad = Value::Array(vec![Value::Integer(Int::from(1_u64))]);
+                    *raw = envelope::seal(Kind::ListSlot, &cbor::encode(&bad).expect("encode"))
+                        .expect("seal");
+                }
+            }
+        });
+        let got = states(&store);
+        assert!(
+            got[&0].1.contains("fault: OpBad { op: 240, fault: Shape("),
+            "{:?}",
+            got[&0]
+        );
+        assert!(
+            got[&6].1.contains("fault: Shape(") && !got[&6].1.contains("OpBad"),
+            "{:?}",
+            got[&6]
+        );
+        assert_eq!(got[&5].0, "pending");
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    // ---- Review L-R186ee: the dump of a list block or slot -------------------------------------
+
+    /// A store with list `todo` at its default block size: 20 items folded in its base, and one
+    /// push after, pending in its slot.
+    fn one_pending_slot(name: &str) -> (PathBuf, PathBuf) {
+        let dir = scratch(name);
+        let store = dir.join("s.jsonl");
+        let names: Vec<String> = (0..20).map(|i| format!("\"{i:0>16}\"")).collect();
+        let mut create = vec!["todo", "--absent"];
+        for name in &names {
+            create.extend(["push", name.as_str()]);
+        }
+        list::write_cmd(&store, &args(&create)).expect("create");
+        list::write_cmd(&store, &args(&["todo", "--expect", "1", "push", "\"p\""])).expect("push");
+        let slots = dumped(&store)
+            .into_iter()
+            .filter(|r| r["sub"] == "slot")
+            .count();
+        assert_eq!(slots, 1, "one pending slot");
+        (dir, store)
+    }
+
+    /// Reseal every record `edit` matches by its sub and slot, as `kind` holding `payload(old)`.
+    fn reseal_list_records(
+        store: &FsPath,
+        matches: impl Fn((Sub, Option<u8>)) -> bool,
+        kind: impl Fn(Kind) -> Kind,
+        payload: impl Fn(Value) -> Value,
+    ) {
+        edit_records(store, |records| {
+            for (key, _, raw) in records.iter_mut() {
+                if matches(sub_slot(key)) {
+                    let opened = envelope::open(raw).expect("envelope");
+                    let value = payload(cbor::decode(opened.payload).expect("cbor"));
+                    *raw =
+                        envelope::seal(kind(opened.kind), &cbor::encode(&value).expect("encode"))
+                            .expect("seal");
+                }
+            }
+        });
+    }
+
+    /// The `error` of each list block and slot line of `dump`, by `block` or `slot`.
+    fn list_errors(store: &FsPath) -> std::collections::BTreeMap<String, String> {
+        dumped(store)
+            .into_iter()
+            .filter(|r| r["sub"] == "block" || r["sub"] == "slot")
+            .map(|r| {
+                let sub = r["sub"].as_str().expect("sub").to_owned();
+                (sub, r["error"].as_str().unwrap_or("").to_owned())
+            })
+            .collect()
+    }
+
+    /// Review A3: a block base or change slot of the wrong envelope kind dumped as
+    /// `KindMismatch`, while every read names it as damage to the block: `NotABlock` for a base,
+    /// and `OpBad` with `NotASlot` for a pending slot. The dump now says what a read says.
+    #[test]
+    fn l_r186ee_dump_names_a_block_or_slot_of_the_wrong_kind_as_a_read_does() {
+        let (dir, store) = one_pending_slot("ree-a3-kind");
+        reseal_list_records(
+            &store,
+            |(sub, _)| sub == Sub::Block,
+            |kind| match kind {
+                Kind::ListBlock => Kind::ListSlot,
+                _ => Kind::ListBlock,
+            },
+            |value| value,
+        );
+        let got = list_errors(&store);
+        assert!(
+            got["block"].contains("fault: NotABlock { found: ListSlot }"),
+            "{got:?}"
+        );
+        assert!(
+            got["slot"].contains("fault: OpBad { op: 21, fault: NotASlot { found: ListBlock } }"),
+            "{got:?}"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// Review A2: the dump worked out a slot's pending op no as `folded + 1 + …`, which
+    /// overflowed for a base at `folded` = `u64::MAX`. A read refuses that base, so the slot's
+    /// state is that its base does not read.
+    #[test]
+    fn l_r186ee_dump_of_a_slot_under_a_base_folded_at_u64_max_prints_a_state() {
+        let (dir, store) = one_pending_slot("ree-a2-folded");
+        reseal_list_records(
+            &store,
+            |found| found == (Sub::Block, None),
+            |kind| kind,
+            |value| match value {
+                Value::Map(mut fields) => {
+                    fields.insert(MapKey::new("folded"), Value::Integer(Int::from(u64::MAX)));
+                    Value::Map(fields)
+                }
+                other => panic!("a base is a map: {other:?}"),
+            },
+        );
+        let slot = dumped(&store)
+            .into_iter()
+            .find(|r| r["sub"] == "slot")
+            .expect("the slot line");
+        assert_eq!(
+            slot["state"], "unknown: the block's base does not read",
+            "{slot}"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
+
+    /// PR #28 F3: `dump` and `apply` check a list block base only as `list::check_record`
+    /// does, its envelope kind and canonical CBOR, not its `{items, folded}` shape. So a base
+    /// whose payload is CBOR null dumps without an error, and a create line whose base is edited
+    /// to null applies, while the library's read refuses that base as `Block::Shape`. This row
+    /// pins that boundary, which the module doc states; it is not a guarantee of the example.
+    #[test]
+    fn pr28_f3_a_null_block_base_dumps_and_imports_but_a_read_refuses_it_as_shape() {
+        let null_base = || {
+            envelope::seal(
+                Kind::ListBlock,
+                &cbor::encode(&Value::Null).expect("encode"),
+            )
+        };
+        let root = root_of("todo").expect("root");
+        let read_fault = |store: &FsPath| {
+            let store = Store::load(store).expect("load");
+            rdb_value::list::items(
+                &store.snapshot,
+                &root,
+                rdb_value::list::Start::Position(0),
+                usize::MAX,
+            )
+            .map(|_| ())
+        };
+        let is_shape = |got: Result<(), ValueError>| {
+            matches!(
+                got,
+                Err(ValueError::Corrupt(Corrupt::Block {
+                    fault: rdb_value::BlockFault::Shape(_),
+                    ..
+                }))
+            )
+        };
+
+        // A stored base edited to null: dump prints it, a read refuses it.
+        let dir = scratch("pr28-f3-null-base");
+        let store = dir.join("s.jsonl");
+        list::write_cmd(&store, &args(&["todo", "--absent", "push", "\"a\""])).expect("create");
+        edit_records(&store, |records| {
+            for (key, _, raw) in records.iter_mut() {
+                if sub_slot(key) == (Sub::Block, None) {
+                    *raw = null_base().expect("seal");
+                }
+            }
+        });
+        let block = dumped(&store)
+            .into_iter()
+            .find(|r| r["sub"] == "block")
+            .expect("the block line");
+        assert!(block.get("error").is_none(), "{block}");
+        assert_eq!(block["value"], serde_json::Value::Null, "{block}");
+        let got = read_fault(&store);
+        assert!(is_shape(got.clone()), "{got:?}");
+
+        // A create line with its base edited to null: apply takes it, a read refuses it.
+        let store = dir.join("t.jsonl");
+        let fields = list::write_cmd(
+            &store,
+            &args(&["todo", "--absent", "--compile-only", "push", "\"a\""]),
+        )
+        .expect("compile the create");
+        let mut line = Line::new("list");
+        line.extend(fields);
+        let mut json: serde_json::Value = serde_json::from_str(&line.render()).expect("json");
+        let mut edited = 0;
+        for mutation in json["mutations"].as_array_mut().expect("mutations") {
+            let key = hex::decode(mutation["key_hex"].as_str().expect("key")).expect("hex");
+            if sub_slot(&key) == (Sub::Block, None) {
+                mutation["value_hex"] = hex::encode(null_base().expect("seal")).into();
+                edited += 1;
+            }
+        }
+        assert_eq!(edited, 1, "the create writes one base");
+        let file = dir.join("c.json");
+        std::fs::write(&file, json.to_string()).expect("write");
+        apply_cmd(&store, &args(&[file.to_str().unwrap()])).expect("the null base is imported");
+        let got = read_fault(&store);
+        assert!(is_shape(got.clone()), "{got:?}");
         std::fs::remove_dir_all(&dir).expect("clean");
     }
 }

@@ -1,4 +1,4 @@
-//! `doc_scenario`'s blob commands (s5-design §3). A separate file, as `coll.rs` is: it shares the
+//! `doc_scenario`'s blob commands (ADR-rdb-0014). A separate file, as `coll.rs` is: it shares the
 //! store, `apply` and the output of `doc_scenario.rs`.
 //!
 //! Every blob request carries the snapshot's generation (ADR-rdb-0014 §12): the compiled line
@@ -125,7 +125,7 @@ fn object(rest: &[String]) -> Result<(&String, RootKey, &[String]), Failure> {
 
 /// Commit `compiled` at `generation` and add `version`, or, for `compile_only`, add
 /// `compile_only: true`. Then the compiled fields, with `generation` before them.
-fn emit(
+pub fn emit(
     store: &mut Store,
     compiled: &Compiled,
     compile_only: bool,

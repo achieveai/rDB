@@ -19,7 +19,9 @@ use rdb_core::{Condition, Generation, Mutation, Namespace, SnapshotRead};
 use sha2::{Digest as _, Sha256};
 
 use crate::cbor::{decode, encode};
-use crate::compile::{record, Compiled, Corrupt, Expected, ManifestError, ValueError};
+use crate::compile::{
+    record, refuse_list_record_at_root, Compiled, Corrupt, Expected, ManifestError, ValueError,
+};
 use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{open, seal, Kind, Opened};
 use crate::keys::{chunk_key, KeyError, RootKey, CHUNK_TAIL_LEN, UPLOAD_LEN};
@@ -183,6 +185,7 @@ impl Manifest {
 /// Open a root record as a blob.
 fn open_blob(version: u64, bytes: &[u8]) -> Result<Blob, ValueError> {
     let opened = open(bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+    refuse_list_record_at_root(opened.kind)?;
     if opened.kind != Kind::Blob {
         return Err(ApplyError::KindMismatch { found: opened.kind }.into());
     }
@@ -205,7 +208,7 @@ fn open_chunk(index: u32, bytes: &[u8]) -> Result<Opened<'_>, ValueError> {
 ///
 /// # Errors
 /// [`ApplyError::KindMismatch`] when the object is not a blob; [`ValueError::Corrupt`] when the
-/// root does not open or its manifest does not decode.
+/// root does not open, is a list block or slot record, or its manifest does not decode.
 pub fn read_blob(snapshot: &dyn SnapshotRead, root: &RootKey) -> Result<Option<Blob>, ValueError> {
     record(snapshot, root.as_bytes())?
         .map(|(version, bytes)| open_blob(version, &bytes))
@@ -323,6 +326,7 @@ fn existing_blob_root(
 ) -> Result<(), ValueError> {
     let (found, bytes) = record(snapshot, root.as_bytes())?.ok_or(ApplyError::ObjectAbsent)?;
     let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+    refuse_list_record_at_root(opened.kind)?;
     if opened.kind != Kind::Blob {
         return Err(ApplyError::KindMismatch { found: opened.kind }.into());
     }
@@ -474,8 +478,9 @@ const SCAN_PAGE: usize = 256;
 /// the record size limit. No mutations means nothing is left to collect.
 ///
 /// # Errors
-/// [`ValueError::Corrupt`] when the root does not open or its manifest does not decode, or a
-/// chunk key's tail is not 20 bytes ([`KeyError::ChunkTail`]). Nothing is deleted then.
+/// [`ValueError::Corrupt`] when the root does not open, is a list block or slot record, or its
+/// manifest does not decode, or a chunk key's tail is not 20 bytes ([`KeyError::ChunkTail`]).
+/// Nothing is deleted then.
 pub fn collect_garbage(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -490,6 +495,9 @@ pub fn collect_garbage(
         ),
         Some((version, bytes)) => {
             let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+            // A list block or slot here is damage, not a root that names no upload (ruling
+            // L-R186dm): reachability is never decided from a root that cannot be read.
+            refuse_list_record_at_root(opened.kind)?;
             let reachable = if opened.kind == Kind::Blob {
                 let m = open_blob(version, &bytes)?.manifest;
                 Some((m.upload, m.chunks()))

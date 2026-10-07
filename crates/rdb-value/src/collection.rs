@@ -20,7 +20,9 @@ use rdb_core::transaction::record_len;
 use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
 
 use crate::cbor::{decode, encode};
-use crate::compile::{check_version, record, Compiled, Corrupt, Expected, ValueError};
+use crate::compile::{
+    check_version, record, refuse_list_record_at_root, Compiled, Corrupt, Expected, ValueError,
+};
 use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{open, seal, Kind};
 use crate::keys::{decode_element_key, element_key, encode_element, RootKey};
@@ -52,7 +54,12 @@ impl CollectionKind {
         match kind {
             Kind::Map => Some(Self::Map),
             Kind::Set => Some(Self::Set),
-            Kind::Document | Kind::Blob | Kind::Chunk => None,
+            Kind::Document
+            | Kind::Blob
+            | Kind::Chunk
+            | Kind::List
+            | Kind::ListBlock
+            | Kind::ListSlot => None,
         }
     }
 }
@@ -120,6 +127,9 @@ fn root_payload(count: u64) -> Vec<u8> {
 fn open_root(version: u64, bytes: &[u8]) -> Result<Collection, ValueError> {
     let corrupt = ValueError::Corrupt;
     let opened = open(bytes).map_err(|e| corrupt(Corrupt::Envelope(e)))?;
+    // A block or slot record is never written at a root key, so one there is damage, not
+    // another kind of object, named as every other root path names it.
+    refuse_list_record_at_root(opened.kind)?;
     let kind =
         CollectionKind::of(opened.kind).ok_or(ApplyError::KindMismatch { found: opened.kind })?;
     let payload = decode(opened.payload).map_err(|e| corrupt(Corrupt::Codec(e)))?;

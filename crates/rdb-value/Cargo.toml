@@ -26,7 +26,8 @@ serde = { workspace = true }
 hex = { workspace = true }
 # Random documents and op lists for the read-back, determinism and byte-walk properties.
 proptest = { workspace = true }
-# The second reader: decodes every accepted payload on its own (s2-design §5). Test-only.
+# The second reader, test-only: decodes every accepted payload on its own (ADR-rdb-0012
+# Verification).
 ciborium = { workspace = true }
 
 [[example]]

@@ -1,8 +1,8 @@
-//! M8 S5: large blobs against `MapSnapshot` and a kernel stand-in (s5-design §5, R1–R11; R12 is
-//! RocksDB, in `rdb-storage/tests/s1_conformance.rs`). Each test's doc names the design row and
-//! the walked scenario it protects.
+//! M8 S5: large blobs against `MapSnapshot` and a kernel stand-in (ADR-rdb-0014 Verification;
+//! the RocksDB row is in `rdb-storage/tests/s1_conformance.rs`). Each test's doc says what it
+//! checks.
 //!
-//! Independent references (S2 lesson 2):
+//! Independent references:
 //! - every digest asserted here is pinned from Node `crypto` (`0014-blob-vectors.mjs`, rev 2.2)
 //!   and agrees with `sha256sum`; `sha2` appears only as a client computing the digest it sends;
 //! - the protocol model and the GC model are written from ADR-rdb-0014's rules. Their verdicts
@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use bytes::Bytes;
-use common::h;
+use common::{h, Kernel, Refused};
 use proptest::prelude::*;
 use rdb_core::contracts::trace::Version;
 use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
@@ -85,103 +85,6 @@ fn corrupt<T>(c: Corrupt) -> Result<T, ValueError> {
     Err(ValueError::Corrupt(c))
 }
 
-// ---- the kernel stand-in --------------------------------------------------------------------
-
-/// Why the stand-in refused a request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Refused {
-    /// Admission check 5: the request names another generation than the serving one.
-    GenerationChanged,
-    /// The condition at this index did not hold.
-    Condition(usize),
-    /// The mutation at this index found another version.
-    ExpectedVersion(usize),
-}
-
-/// The kernel as ADR-rdb-0014 relies on it: user records with their versions, a sequence and a
-/// generation. `apply` checks the generation first (admission check 5), then every condition,
-/// then every `expected_version`, and only then writes everything at one new version.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Kernel {
-    records: BTreeMap<Bytes, (Version, Bytes)>,
-    seq: u64,
-    generation: u64,
-}
-
-impl Kernel {
-    fn new() -> Self {
-        Self {
-            records: BTreeMap::new(),
-            seq: 0,
-            generation: 1,
-        }
-    }
-
-    fn snapshot(&self) -> MapSnapshot {
-        let mut s = MapSnapshot::new(Generation(self.generation));
-        for (key, (version, value)) in &self.records {
-            s.insert(key.clone(), *version, value.clone());
-        }
-        s
-    }
-
-    fn apply(&mut self, compiled: &Compiled, generation: u64) -> Result<u64, Refused> {
-        assert!(
-            !compiled.mutations.is_empty(),
-            "an empty Compiled is never submitted (the kernel refuses it, check 10)"
-        );
-        if generation != self.generation {
-            return Err(Refused::GenerationChanged);
-        }
-        for (i, condition) in compiled.conditions.iter().enumerate() {
-            let held = match condition {
-                Condition::Absent { key } => !self.records.contains_key(key),
-                Condition::Present { key } => self.records.contains_key(key),
-                Condition::VersionEquals { key, version } => {
-                    self.records.get(key).is_some_and(|(v, _)| v == version)
-                }
-            };
-            if !held {
-                return Err(Refused::Condition(i));
-            }
-        }
-        for (i, mutation) in compiled.mutations.iter().enumerate() {
-            let (Mutation::Put {
-                key,
-                expected_version,
-                ..
-            }
-            | Mutation::Delete {
-                key,
-                expected_version,
-            }) = mutation;
-            if let Some(want) = expected_version {
-                if self.records.get(key).map(|(v, _)| *v) != Some(*want) {
-                    return Err(Refused::ExpectedVersion(i));
-                }
-            }
-        }
-        self.seq += 1;
-        for mutation in &compiled.mutations {
-            match mutation {
-                Mutation::Put { key, value, .. } => {
-                    self.records.insert(key.clone(), (self.seq, value.clone()));
-                }
-                Mutation::Delete { key, .. } => {
-                    self.records.remove(key);
-                }
-            }
-        }
-        Ok(self.seq)
-    }
-
-    /// Apply at the serving generation; the request must hold.
-    fn commit(&mut self, compiled: &Compiled) -> u64 {
-        let generation = self.generation;
-        self.apply(compiled, generation).expect("the request holds")
-    }
-}
-
 /// What a client operation answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
@@ -220,7 +123,7 @@ fn upload(
             return Ok(Answer::Crashed);
         }
         let generation = k.generation;
-        k.apply(&compiled, generation)
+        k.apply(&compiled, Some(generation))
             .map_err(|e| format!("chunk {index}: {e:?}"))?;
         commits += 1;
     }
@@ -242,7 +145,7 @@ fn upload(
         return Ok(Answer::Crashed);
     }
     let generation = k.generation;
-    k.apply(&compiled, generation)
+    k.apply(&compiled, Some(generation))
         .map_err(|e| format!("publish: {e:?}"))?;
     Ok(Answer::Published)
 }
@@ -259,7 +162,7 @@ fn gc(k: &mut Kernel, root: &RootKey, floor: u64, stop: Option<usize>) -> Result
             return Ok(Answer::Crashed);
         }
         let generation = k.generation;
-        k.apply(&compiled, generation)
+        k.apply(&compiled, Some(generation))
             .map_err(|e| format!("gc: {e:?}"))?;
         commits += 1;
     }
@@ -388,7 +291,7 @@ fn stored(records: &[(&str, Bytes, u64)]) -> MapSnapshot {
     s
 }
 
-/// R1, vectors both ways. Protects walk steps 1, 4 and 6, and C10 and C17: the compiles write
+/// Vectors both ways: the compiles write
 /// B1, B2 and B3 byte for byte as the Node script prints them, with exactly the conditions
 /// ADR-rdb-0014 §6 names; and a store holding only those bytes reads back the blobs.
 #[test]
@@ -554,7 +457,7 @@ fn the_node_vectors_are_written_and_read_byte_for_byte() {
     assert_eq!(parsed.root(), zero);
 }
 
-/// R2, the digest differential. Protects walk steps 4, 5 and 7, and C6: the whole-blob digest and
+/// The digest differential: the whole-blob digest and
 /// every chunk digest a publish writes equal values pinned from Node `crypto` and `sha256sum`.
 #[test]
 fn published_digests_equal_the_pinned_sha256_values() {
@@ -575,7 +478,7 @@ fn published_digests_equal_the_pinned_sha256_values() {
     let blob = read_blob(&k.snapshot(), &photo()).unwrap().unwrap();
     assert_eq!(blob.manifest.sha256, pin(B2_SHA));
     assert_eq!(blob.manifest.chunk_sha256, B2_CHUNK_SHA.map(pin).to_vec());
-    // C6: one wrong digit in the whole-blob digest is refused; nothing is written.
+    // One wrong digit in the whole-blob digest is refused; nothing is written.
     let mut wrong = pin(B1_SHA);
     wrong[31] ^= 0x01;
     let other = root_key(TenantId(1), AffinityId(1), b"other");
@@ -616,8 +519,8 @@ fn published_digests_equal_the_pinned_sha256_values() {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// R2's property. Protects walk step 5: random blobs cut at random chunk sizes read back
-    /// byte-equal, whole and in a random range.
+    /// The digest differential's property: random blobs cut at random
+    /// chunk sizes read back byte-equal, whole and in a random range.
     #[test]
     fn random_blobs_read_back_byte_equal(
         data in proptest::collection::vec(any::<u8>(), 0..2048),
@@ -639,7 +542,7 @@ proptest! {
     }
 }
 
-/// R3, the idempotent chunk. Protects walk step 6, and C1 and C2: resending a stored chunk with
+/// The idempotent chunk: resending a stored chunk with
 /// the same bytes compiles to nothing; other bytes are `ChunkConflict`.
 #[test]
 fn a_resent_chunk_is_nothing_and_other_bytes_conflict() {
@@ -671,7 +574,7 @@ fn with_chunks(root: &RootKey, pieces: &[(u32, &[u8])]) -> MapSnapshot {
     k.snapshot()
 }
 
-/// R4, publish verifies. Protects walk step 4, and C3–C6, C8, C15, C16 and C24: each way an
+/// Publish verifies: each way an
 /// upload can disagree with its publish is refused by name, and a refusal is all a caller gets,
 /// so nothing is written.
 #[test]
@@ -690,19 +593,19 @@ fn publish_refuses_every_disagreement_by_name() {
             Generation(1),
         )
     };
-    // C3: a missing middle chunk.
+    // A missing middle chunk.
     let s = with_chunks(&o, &[(0, b"hell"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 12, 4, &sha12),
         apply_err(ApplyError::ChunkMissing { index: 1 })
     );
-    // C4: one chunk past n.
+    // One chunk past n.
     let s = with_chunks(&o, &[(0, b"hell"), (1, b"o, b"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 8, 4, &sha(b"hello, b")),
         apply_err(ApplyError::ExtraChunk { index: 2 })
     );
-    // C5: a short chunk.
+    // A short chunk.
     let s = with_chunks(&o, &[(0, b"hell"), (1, b"o,"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 10, 4, &sha(b"hello,lob!")),
@@ -722,20 +625,20 @@ fn publish_refuses_every_disagreement_by_name() {
             found: 2
         })
     );
-    // C6: the whole digest.
+    // A wrong whole-blob digest.
     let s = with_chunks(&o, &[(0, b"hell"), (1, b"o, b"), (2, b"lob!")]);
     assert_eq!(
         p(&s, 12, 4, &[0; 32]),
         apply_err(ApplyError::BlobDigestMismatch)
     );
-    // C16: a chunk size of 0 or over MAX_CHUNK.
+    // A chunk size of 0 or over MAX_CHUNK.
     for bad in [0, MAX_CHUNK as u64 + 1, u64::MAX] {
         assert_eq!(
             p(&s, 12, bad, &sha12),
             apply_err(ApplyError::InvalidChunkSize { found: bad })
         );
     }
-    // C15 and C24: more than MAX_CHUNKS chunks, and a size whose `n` would overflow a naive
+    // More than MAX_CHUNKS chunks, and a size whose `n` would overflow a naive
     // `(size + chunk_size − 1) / chunk_size`.
     assert_eq!(p(&s, 256, 1, &sha12), apply_err(ApplyError::TooManyChunks));
     assert_eq!(
@@ -750,7 +653,7 @@ fn publish_refuses_every_disagreement_by_name() {
         chunk_count(u64::MAX, MAX_CHUNK as u64),
         Err(ApplyError::TooManyChunks)
     );
-    // C8: a stale `--expect`.
+    // A stale `--expect`.
     let mut k = b1();
     assert_eq!(
         upload(
@@ -797,7 +700,7 @@ fn publish_refuses_every_disagreement_by_name() {
     );
 }
 
-// ---- R5: the protocol model ------------------------------------------------------------------
+// ---- the protocol model ----------------------------------------------------------------------
 
 /// mulberry32, as `0014-blob-vectors.mjs` uses it.
 struct Rng(u32);
@@ -1004,7 +907,7 @@ fn protocol_run(seed: u32, m: &Model) -> Tally {
         }
         if !pending.is_empty() && rng.next() < 0.5 {
             let req = pending.swap_remove(rng.pick(pending.len()));
-            if let Err(refused) = k.apply(&req.compiled, req.generation) {
+            if let Err(refused) = k.apply(&req.compiled, Some(req.generation)) {
                 t.refused += 1;
                 if refused == Refused::GenerationChanged {
                     t.refused_by_generation += 1;
@@ -1118,10 +1021,10 @@ fn assert_protocol(seeds: u32, m: &Model) {
     );
 }
 
-/// R5, the protocol model at Node Part 3b's rates (ADR-rdb-0014 §6, §8 and §12): failover
+/// The protocol model at Node Part 3b's rates (ADR-rdb-0014 §6, §8 and §12): failover
 /// p = 0.02 losing 0-3 commits, 4 uploads, lost publish replies p = 0.3, half the retries on the
-/// snapshot taken after their commit; 200 seeds x 400 steps (Node ran 2,000). Protects walk
-/// step 8, and C7, C12, C20, C22 and C26: no published root ever names a missing or different
+/// snapshot taken after their commit; 200 seeds x 400 steps (Node ran 2,000). No published
+/// root ever names a missing or different
 /// chunk, no retry is told "failed" while its commit stands, and none is told "already
 /// published" for a commit a failover undid.
 #[test]
@@ -1137,10 +1040,11 @@ fn the_protocol_model_never_breaks_a_manifest_or_misanswers_a_retry() {
     );
 }
 
-/// R5 with failovers five times as often, p = 0.1. A request compiled before a failover breaks
-/// a manifest only when a version it names is reused for other bytes after the rollback, so the
-/// generation fence (admission check 5, applied first by the stand-in) needs frequent failovers
-/// to be reached at this seed count. Protects walk step 8, and C25 with a real failover.
+/// The protocol model with failovers five times as often, p = 0.1. A request compiled before a
+/// failover breaks a manifest only when a version it names is reused for other bytes after the
+/// rollback, so the generation fence (admission check 5, applied first by the stand-in) needs
+/// frequent failovers to be reached at this seed count. This test reaches the fence through real
+/// failovers and checks that every manifest stays whole.
 #[test]
 fn under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole() {
     assert_protocol(
@@ -1154,7 +1058,7 @@ fn under_frequent_failovers_the_generation_fence_keeps_every_manifest_whole() {
     );
 }
 
-// ---- R6: GC against a model ------------------------------------------------------------------
+// ---- GC against a model ----------------------------------------------------------------------
 
 /// What GC must delete, from ADR-rdb-0014 §8 alone: every chunk that the root does not name and
 /// that is at a version ≤ `floor`, in key order, as the longest prefix of at most
@@ -1255,7 +1159,7 @@ fn gc_world(rng: &mut Rng) -> GcWorld {
     }
 }
 
-/// R6, GC against a model. Protects walk steps 7 and 9, and C13, C14, C21 and C23: each batch is
+/// GC against a model: each batch is
 /// exactly the model's, guarded by the root as read; repeating GC to the end deletes every
 /// unreachable chunk at or below the floor and nothing else; every batch fits the record cap.
 #[test]
@@ -1321,9 +1225,8 @@ fn gc_deletes_exactly_what_the_model_says_within_both_bounds() {
 
 const GC_SEEDS: u32 = 100;
 
-/// R6's fixed points. C13: the floor. C14: the count bound, 255 then 45 then nothing. C23: the
-/// byte bound under a 5,000-byte id, 207 then 48 then nothing (Node Part 2). C21: chunks under a
-/// map root.
+/// GC's fixed points: the floor; the count bound, 255 then 45 then nothing; the byte bound under
+/// a 5,000-byte id, 207 then 48 then nothing (Node Part 2); and chunks under a map root.
 #[test]
 fn gc_batches_match_the_walked_counts() {
     let abandoned = |id: &[u8], uploads: &[(Upload, u32)]| {
@@ -1349,19 +1252,19 @@ fn gc_batches_match_the_walked_counts() {
             k.commit(&c);
         }
     };
-    // C13: versions 1, 2, 3 and floor 2.
+    // The floor: versions 1, 2, 3 and floor 2.
     let (mut k, root) = abandoned(b"photo", &[(U1, 3)]);
     assert_eq!(batch_sizes(&mut k, &root, 2), vec![2, 0]);
     assert!(k.records.contains_key(&chunk_of(&root, &U1, 2)));
-    // C14.
+    // The count bound.
     let (mut k, root) = abandoned(b"big", &[(U1, 150), (U2, 150)]);
     let floor = k.seq;
     assert_eq!(batch_sizes(&mut k, &root, floor), vec![255, 45, 0]);
-    // C23.
+    // The byte bound.
     let (mut k, root) = abandoned(&[b'a'; 5000], &[(U1, 255)]);
     let floor = k.seq;
     assert_eq!(batch_sizes(&mut k, &root, floor), vec![207, 48, 0]);
-    // C21: a map at the root names no chunk, so its chunks are garbage. The batch is guarded by
+    // A map at the root names no chunk, so its chunks are garbage. The batch is guarded by
     // the map's version and leaves the map as it was.
     let root = photo();
     let map = {
@@ -1395,7 +1298,7 @@ fn gc_batches_match_the_walked_counts() {
     assert_eq!(k.records.len(), 1);
 }
 
-/// R6's fixed case, G1/G2 neighbour after the chunk range. `photp` sorts right after every chunk
+/// GC's fixed case, G1/G2 neighbour after the chunk range. `photp` sorts right after every chunk
 /// key of `photo`, so GC's scan reaches it and must stop at the end of `photo`'s chunk prefix.
 /// G1: the neighbour holds a rootless chunk, which is not `photo`'s garbage. G2: the neighbour is
 /// a published blob, whose root key would read as a chunk tail of length 0. In both, GC of
@@ -1473,7 +1376,10 @@ fn a_stale_delete_never_removes_a_newer_blob() {
     assert_eq!(c, delete_at(v1));
     let before = k.clone();
     let generation = k.generation;
-    assert_eq!(k.apply(&c, generation), Err(Refused::ExpectedVersion(0)));
+    assert_eq!(
+        k.apply(&c, Some(generation)),
+        Err(Refused::ExpectedVersion(0))
+    );
     assert_eq!(k, before, "a refused delete writes nothing");
     assert_eq!(read_all(&k, &root), Ok(Some(Bytes::from_static(b2))));
 
@@ -1494,9 +1400,9 @@ fn a_stale_delete_never_removes_a_newer_blob() {
     assert_eq!(read_all(&k, &root), Ok(None));
 }
 
-// ---- R7: crash at every boundary -------------------------------------------------------------
+// ---- crash at every boundary -----------------------------------------------------------------
 
-/// R7, crash at every boundary. Protects walk step 6 and C20: after a crash at any commit of an
+/// Crash at every boundary: after a crash at any commit of an
 /// upload, a replace or a GC, a reader sees the object absent, old or new, wholly; a retry from
 /// there, including after the publish committed and its reply was lost, answers success and ends
 /// byte-identical to a run with no crash. A publish sent from a prefix that lacks a chunk is
@@ -1574,7 +1480,7 @@ fn a_crash_at_any_commit_reads_whole_and_a_retry_ends_identical() {
     }
 }
 
-// ---- R8: range reads -------------------------------------------------------------------------
+// ---- range reads -----------------------------------------------------------------------------
 
 /// A snapshot that records which chunk indices were read.
 struct Counting<'a> {
@@ -1624,7 +1530,7 @@ fn counted(
     (got, c.chunks_read.into_inner().into_iter().collect())
 }
 
-/// R8, range reads. Protects walk step 5, and C11 and C24: every range equals the slice of the
+/// Range reads: every range equals the slice of the
 /// input, reads only the chunks it intersects, and an offset near `u64::MAX` is `RangeInvalid`.
 #[test]
 fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
@@ -1649,7 +1555,7 @@ fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
             assert_eq!(read, want, "offset {offset} len {len}");
         }
     }
-    // C11 and C24.
+    // One middle chunk read alone, an empty range at the end, and each range past the end.
     assert_eq!(
         counted(&s, &root, 4, 4),
         (Ok(Bytes::from_static(b"o, b")), vec![1])
@@ -1686,7 +1592,7 @@ fn every_range_is_the_exact_slice_and_reads_only_its_chunks() {
     }
 }
 
-// ---- R9: damage ------------------------------------------------------------------------------
+// ---- damage ----------------------------------------------------------------------------------
 
 /// B1 stored from the Node bytes, with one record replaced (or removed for `None`), plus a
 /// garbage chunk of another upload at version 1 that GC would delete.
@@ -1726,7 +1632,7 @@ fn flipped(record: Bytes, at: usize) -> Bytes {
     Bytes::from(b)
 }
 
-/// R9, damage. Protects walk step 10, and C18 and C19: each `Corrupt` cause is named, a read that
+/// Damage: each `Corrupt` cause is named, a read that
 /// touches the damage returns no bytes, and GC refuses under a root it cannot read or a chunk key
 /// it cannot parse, so nothing is deleted.
 #[test]
@@ -1825,7 +1731,7 @@ fn damage_is_named_reads_fail_wholly_and_gc_refuses() {
         assert_eq!(read_range(&s, &root, 0, 4).unwrap(), &b"hell"[..]);
         assert_eq!(read_range(&s, &root, 8, 4).unwrap(), &b"lob!"[..]);
     }
-    // C18: a chunk key one byte short refuses the whole batch.
+    // A chunk key one byte short refuses the whole batch.
     let mut s = b1_with(ROOT_PHOTO, Some(root_record()));
     let mut short = chunk_of(&root, &U2, 5).to_vec();
     short.pop();
@@ -1836,9 +1742,141 @@ fn damage_is_named_reads_fail_wholly_and_gc_refuses() {
     );
 }
 
-// ---- R10: limits -----------------------------------------------------------------------------
+/// The five fields of a well-formed manifest: 12 bytes cut at 4, so 3 chunk digests.
+fn manifest_fields() -> Map {
+    let mut m = Map::new();
+    m.insert(MapKey::new("size"), Value::Integer(Int::from(12_u64)));
+    m.insert(MapKey::new("sha256"), Value::Bytes(vec![0; 32]));
+    m.insert(MapKey::new("upload"), Value::Bytes(U1.to_vec()));
+    m.insert(MapKey::new("chunk_size"), Value::Integer(Int::from(4_u64)));
+    m.insert(
+        MapKey::new("chunk_sha256"),
+        Value::Array(vec![Value::Bytes(vec![0; 32]); 3]),
+    );
+    m
+}
 
-/// R10, limits. Protects C15 and C16: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
+/// `manifest_fields` with `name` set to `value`.
+fn manifest_with(name: &str, value: Value) -> Value {
+    let mut m = manifest_fields();
+    m.insert(MapKey::new(name), value);
+    Value::Map(m)
+}
+
+/// The strict manifest reading (ADR-rdb-0014 §2). Protects a reader of a damaged root: a blob
+/// root whose payload is canonical CBOR but not a v1 manifest, wrong in exactly one field, reads
+/// as `Corrupt::Manifest` naming that fault, and no bytes are served. The unedited fields read
+/// back as a blob. One row per `Shape` arm, except the two arms the damage test above already
+/// asserts with too few fields and too few digests: for those, only the too-many side, which a
+/// `<` in place of `!=` would let through.
+#[test]
+fn every_manifest_shape_fault_is_named() {
+    let root = photo();
+    let read = |payload: &Value| {
+        let record = seal(Kind::Blob, &encode(payload).unwrap()).unwrap();
+        read_blob(&stored(&[(ROOT_PHOTO, record, 1)]), &root)
+    };
+    // The control: the unedited fields are a manifest.
+    let blob = read(&Value::Map(manifest_fields())).unwrap().unwrap();
+    assert_eq!((blob.manifest.size, blob.manifest.chunks()), (12, 3));
+
+    let renamed = {
+        let mut m = manifest_fields();
+        let size = m.remove(&MapKey::new("size")).unwrap();
+        m.insert(MapKey::new("sizes"), size);
+        Value::Map(m)
+    };
+    let digests = |items: Vec<Value>| manifest_with("chunk_sha256", Value::Array(items));
+    let d32 = || Value::Bytes(vec![0; 32]);
+    let rows: [(&str, Value, &str); 14] = [
+        (
+            "not a map (01)",
+            Value::Integer(Int::from(1_u64)),
+            "the payload is not a map",
+        ),
+        (
+            "6 fields",
+            manifest_with("extra", Value::Null),
+            "not exactly the five manifest fields",
+        ),
+        ("size renamed", renamed, "a field is missing"),
+        (
+            "size: -1",
+            manifest_with("size", Value::Integer(Int::from(-1_i64))),
+            "a length is negative",
+        ),
+        (
+            "size: \"x\"",
+            manifest_with("size", Value::Text("x".into())),
+            "a length is not an integer",
+        ),
+        (
+            "sha256 31 B",
+            manifest_with("sha256", Value::Bytes(vec![0; 31])),
+            "a digest is not 32 bytes",
+        ),
+        (
+            "sha256 as text",
+            manifest_with("sha256", Value::Text("0".repeat(32))),
+            "a digest is not a byte string",
+        ),
+        (
+            "upload 15 B",
+            manifest_with("upload", Value::Bytes(vec![0x11; 15])),
+            "upload is not 16 bytes",
+        ),
+        (
+            "upload as an integer",
+            manifest_with("upload", Value::Integer(Int::from(7_u64))),
+            "upload is not a byte string",
+        ),
+        (
+            "chunk_sha256 as a map",
+            manifest_with("chunk_sha256", Value::Map(Map::new())),
+            "chunk_sha256 is not an array",
+        ),
+        (
+            "one chunk digest 31 B",
+            digests(vec![d32(), Value::Bytes(vec![0; 31]), d32()]),
+            "a digest is not 32 bytes",
+        ),
+        (
+            "chunk_size: 0",
+            manifest_with("chunk_size", Value::Integer(Int::from(0_u64))),
+            "chunk_size is outside 1 … MAX_CHUNK",
+        ),
+        (
+            "size = 256 × chunk_size",
+            manifest_with("size", Value::Integer(Int::from(256 * 4_u64))),
+            "more chunks than MAX_CHUNKS",
+        ),
+        (
+            "one digest too many",
+            digests(vec![d32(); 4]),
+            "chunk_sha256 does not hold one digest per chunk",
+        ),
+    ];
+    // Every row is read before anything is asserted, so a fault names all the rows it breaks.
+    let mut wrong = Vec::new();
+    for (what, payload, message) in rows {
+        let got = read(&payload);
+        let text = got.as_ref().err().map(ToString::to_string);
+        if got != corrupt(Corrupt::Manifest(ManifestError::Shape(message)))
+            || text != Some(format!("corrupt record: blob manifest: {message}"))
+        {
+            wrong.push(format!("{what}: {got:?}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "rows that read wrong:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// ---- limits ----------------------------------------------------------------------------------
+
+/// Limits: a chunk of `MAX_CHUNK` bytes is accepted and one more byte
 /// is `TooLarge`; index 254 is accepted and 255 is `TooManyChunks`; a full chunk under a 3,745-byte
 /// id compiles and fits the record by `record_len`, and under 3,746 it is `TooLarge` (Node Part 2).
 #[test]
@@ -1882,9 +1920,90 @@ fn chunk_limits_sit_exactly_at_the_format_constants() {
     assert!(put_chunk(&s, &long(3746), &U1, 0, &full[1..]).is_ok());
 }
 
-// ---- R11: kind checks ------------------------------------------------------------------------
+// ---- kind checks -----------------------------------------------------------------------------
 
-/// R11, `KindMismatch` both ways. Protects C9: a blob operation on a document or a map names the
+/// Adjacent leftover to S4 P3: a list block or slot record at a blob root read as
+/// `KindMismatch`, as if another kind of object were there. Those records are never written at
+/// a root key, so every blob path that opens the root names the damage instead.
+#[test]
+fn a_list_block_or_slot_at_a_blob_root_is_damage_on_every_path() {
+    let root = photo();
+    for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let mut s = MapSnapshot::new(Generation(1));
+        s.insert(root.to_bytes(), 4, seal(kind, &h("a0")).unwrap());
+        let damage = ValueError::Corrupt(Corrupt::ListRecordAtRoot { found: kind });
+        assert_eq!(
+            read_blob(&s, &root),
+            Err(damage.clone()),
+            "read_blob, {kind:?}"
+        );
+        assert_eq!(
+            read_range(&s, &root, 0, 0),
+            Err(damage.clone()),
+            "read_range, {kind:?}"
+        );
+        assert_eq!(
+            delete_blob(&s, &root, 4).map(|_| ()),
+            Err(damage.clone()),
+            "delete_blob, {kind:?}"
+        );
+        assert_eq!(
+            publish(
+                &s,
+                &root,
+                Expected::Version(4),
+                &U1,
+                0,
+                4,
+                &pin(B3_SHA),
+                Generation(1)
+            )
+            .map(|_| ()),
+            Err(damage.clone()),
+            "publish, {kind:?}"
+        );
+    }
+}
+
+/// Lead ruling L-R186dm: a list block or slot record at a blob root is damage, not a root, so GC
+/// cannot decide reachability from it (ADR-rdb-0014 §8) and refuses. Before the ruling it read as
+/// "a non-blob root names no upload" and offered every chunk for deletion. Whatever GC returns is
+/// applied, so a batch that deletes anything shows up as a changed kernel.
+#[test]
+fn gc_refuses_a_list_block_or_slot_at_a_blob_root_and_deletes_nothing() {
+    let root = photo();
+    let prefix = root.chunk_prefix();
+    for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let mut k = b1();
+        let chunks = k
+            .records
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count();
+        assert_eq!(chunks, 3, "B1 has its three chunks, {kind:?}");
+        let version = k.records[&root.to_bytes()].0;
+        k.records
+            .insert(root.to_bytes(), (version, seal(kind, &h("a0")).unwrap()));
+        let before = k.clone();
+        let got = collect_garbage(&k.snapshot(), &root, u64::MAX);
+        if let Ok(compiled) = &got {
+            if !compiled.mutations.is_empty() {
+                let _ = k.apply(compiled, None);
+            }
+        }
+        assert_eq!(
+            k, before,
+            "nothing is written; every chunk is still there, {kind:?}"
+        );
+        assert_eq!(
+            got.map(|_| ()),
+            corrupt(Corrupt::ListRecordAtRoot { found: kind }),
+            "{kind:?}"
+        );
+    }
+}
+
+/// `KindMismatch` both ways: a blob operation on a document or a map names the
 /// kind it found, and a document or map operation on a blob names `Blob`.
 #[test]
 fn blob_and_non_blob_operations_refuse_each_others_objects() {

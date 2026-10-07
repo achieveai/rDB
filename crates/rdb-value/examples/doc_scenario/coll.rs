@@ -1,4 +1,4 @@
-//! `doc_scenario`'s map and set commands (s3-design §3). A separate file for size only: it
+//! `doc_scenario`'s map and set commands (ADR-rdb-0013). A separate file for size only: it
 //! shares the store, `apply` and the output of `doc_scenario.rs`.
 
 use std::path::Path as FsPath;
@@ -36,7 +36,7 @@ pub fn write_cmd(
     let compiled = compile_collection(&store.snapshot, &root, kind, body.expected, &body.ops)
         .map_err(|e| Failure::from(e).with(fields.clone()))?;
     // The root's kind and count are printed only once it is written or compile-only: a
-    // refused commit wrote no root to describe (tester paper cut, s3-tester-w1.md).
+    // refused commit wrote no root to describe (an S3 tester paper cut).
     let after = root_after(&compiled, &root)?;
     let at = fields.len();
     let mut out = emit(&mut store, &compiled, body.compile_only, fields)?;
@@ -245,14 +245,14 @@ fn parse_ops(mut rest: &[String]) -> Result<Body, Failure> {
     })
 }
 
-fn parse_version(v: &str) -> Result<u64, Failure> {
+pub fn parse_version(v: &str) -> Result<u64, Failure> {
     v.parse::<u64>()
         .map_err(|_| Failure::usage(format!("--expect {v:?} is not a u64")))
 }
 
 /// A key or a value: `cbor:<hex>`, strictly decoded, or JSON (`@FILE` reads it from FILE). An
 /// array or a map is passed on, so the library is what refuses it as a key.
-fn element_arg(arg: &str) -> Result<Value, Failure> {
+pub fn element_arg(arg: &str) -> Result<Value, Failure> {
     match arg.strip_prefix("cbor:") {
         Some(digits) => {
             let bytes = hex::decode(digits)

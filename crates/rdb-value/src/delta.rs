@@ -12,7 +12,7 @@ use crate::path::Path;
 use crate::value::{Int, MapKey, Value};
 
 /// Which size limit an [`ApplyError::TooLarge`] hit. Two since L-R186z (tester W2 PC5), and a
-/// third for blob chunks (ADR-rdb-0014 §4).
+/// third for blob chunks (ADR-rdb-0014 §4), then three for lists (ADR-rdb-0016 §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeLimit {
     /// One value's envelope: [`LIMIT_TEXT`].
@@ -22,6 +22,17 @@ pub enum SizeLimit {
     Write,
     /// One blob chunk's bytes, against [`crate::blob::MAX_CHUNK`] (ADR-rdb-0014 §4).
     Chunk,
+    /// One list item's envelope, against [`crate::list::MAX_ITEM`] (ADR-rdb-0016 §4).
+    Item,
+    /// One list block's base payload, against the compile's `block_max` (ADR-rdb-0016 §4).
+    List {
+        /// The base payload the write would have made.
+        len: usize,
+        /// The compile's `block_max`.
+        block_max: usize,
+    },
+    /// A list's escaped object id, against [`crate::list::MAX_ID_ESCAPED`] (ADR-rdb-0016 §4).
+    ObjectId,
 }
 
 // `SizeLimit::Write`'s text says 1 MiB; this keeps it honest if the kernel's cap moves.
@@ -39,6 +50,21 @@ impl fmt::Display for SizeLimit {
                 f,
                 "{}-byte limit for one blob chunk",
                 crate::blob::MAX_CHUNK
+            ),
+            Self::Item => write!(
+                f,
+                "{}-byte limit for one list item's envelope",
+                crate::list::MAX_ITEM
+            ),
+            Self::List { len, block_max } => write!(
+                f,
+                "{block_max}-byte block_max limit for one list block (the base would be {len} \
+                 bytes): the delta is too large for one transaction, so split it into smaller deltas"
+            ),
+            Self::ObjectId => write!(
+                f,
+                "{}-byte limit for a list's escaped object id",
+                crate::list::MAX_ID_ESCAPED
             ),
         }
     }
@@ -156,6 +182,15 @@ pub enum ApplyError {
         /// The root's element count.
         count: u64,
     },
+    /// A list that still has items cannot be dropped (ADR-rdb-0016 §5).
+    #[error(
+        "the list still has {count} {}",
+        if *.count == 1 { "item" } else { "items" }
+    )]
+    ListNotEmpty {
+        /// The root's item count.
+        count: u64,
+    },
     /// The compiled request would carry more writes than one transaction admits; nothing is
     /// written.
     #[error("{writes} writes are more than one transaction admits")]
@@ -210,6 +245,33 @@ pub enum ApplyError {
     #[error("chunk_size {found} is outside 1 … the blob format's largest chunk")]
     InvalidChunkSize {
         /// The `chunk_size` given.
+        found: u64,
+    },
+    /// A list position past the list's end (ADR-rdb-0016 §5, §6).
+    #[error("position {position} is not inside the list of {len}")]
+    PositionInvalid {
+        /// The position given.
+        position: u64,
+        /// The list's length when the op ran.
+        len: u64,
+    },
+    /// `block_max` is outside `MIN_BLOCK_MAX … MAX_BLOCK_MAX` (ADR-rdb-0016 §4).
+    #[error(
+        "block_max {found} is outside {} … {}",
+        crate::list::MIN_BLOCK_MAX,
+        crate::list::MAX_BLOCK_MAX
+    )]
+    InvalidBlockSize {
+        /// The `block_max` given.
+        found: usize,
+    },
+    /// A scan token, or a fenced request, from another generation: the versions it names may
+    /// have been reused (ADR-rdb-0016 §6, §8).
+    #[error("the token or request names generation {expected}; the snapshot is at {found}")]
+    GenerationChanged {
+        /// The token's or the request's generation.
+        expected: u64,
+        /// The snapshot's generation.
         found: u64,
     },
 }

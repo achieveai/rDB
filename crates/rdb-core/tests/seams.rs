@@ -299,7 +299,8 @@ fn k_f_39_a_valid_threshold_deserialises() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The round-2 contract asks: CB-1 … CB-4 (kernel-b `architect-handoff.md` §15)
+// The round-2 contract asks: CB-1 … CB-4 (kernel-b `architect-handoff.md` §15, archived under
+// `docs/archive/work/rdb-partition-database`)
 // ---------------------------------------------------------------------------------------------
 
 /// M7F-53 (CB-1): the kernel carrier pair, on both enums, matched exhaustively.

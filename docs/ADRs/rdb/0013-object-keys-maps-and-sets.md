@@ -82,6 +82,8 @@ item "For S3" (`version = seq` against "increments exactly once").
 **Basis:** `main` fe50411.
 **Amended by:** ADR-rdb-0014, 2026-10-05: decision 3 (row `0x04`), decision 11 (the damaged-object
 table) and O3 (closed). Each edit is marked in place with its ruling.
+**Amended by:** ADR-rdb-0016, 2026-10-05: decisions 3, 6, 11, 14 and O2. Each edit is marked in
+place with its ruling.
 
 ## Context
 
@@ -144,8 +146,8 @@ One `rdb-value` module, `keys.rs`, owns this table. Later slices add rows there,
 |---|---|---|---|
 | `0x00` | **Root record** of the object. Its bytes are an ADR-rdb-0012 §7 envelope, and the envelope's `kind` says what the object is | empty | this ADR |
 | `0x01` | **Map entry or set member** | element key, profile v1 (decision 4) | this ADR (S3) |
-| `0x02` | List element record | reserved: S4, later | S4 |
-| `0x03` | List page record | reserved: S4, later | S4 |
+| `0x02` | **List item record**, only for an item not stored in its block (amended 2026-10-05, L-R186cr, L-R186cz; ADR-rdb-0016 decision 1) | item id, 16 bytes: fixed width, ending the key | ADR-rdb-0016 (S4) |
+| `0x03` | **List block and its change slots** (amended 2026-10-05, L-R186cz; ADR-rdb-0016 decisions 1 and 3) | block id, 16 bytes (the block), or block id then slot `u8` `0x00`–`0xEF`, 17 bytes (a change slot): fixed width, ending the key | ADR-rdb-0016 (S4) |
 | `0x04` | **Blob chunk** (amended 2026-10-05, L-R186x Q4; ADR-rdb-0014 decision 1) | `upload_id` (16 bytes), then `index` u32 BE: fixed width, 20 bytes, ending the key | ADR-rdb-0014 (S5) |
 | `0x05`–`0xFF` | unassigned | — | — |
 
@@ -332,8 +334,10 @@ How it is proved:
     envelope, and ADR-rdb-0010 decision 6 rebuilds a copy from `History`, which would hold no such chunk.
   - If `0x04` is used, its `tail` must be fixed width or self-delimiting and must end the key.
   - A blob's manifest is its root record.
-- Decision 10's check, "element version ≤ root version", applies to `sub` `0x01` only. Chunks are
-  written before their manifest.
+- Decision 10's check, "element version ≤ root version", applies to `sub` `0x01`, to `0x02` list
+  item records and to `0x03` list block bases (amended 2026-10-05, L-R186ee; ADR-rdb-0016
+  decisions 3 and 7). A list change slot has none: its op no, its block's check and the root's
+  version guard it. Chunks are written before their manifest.
 
 ### Maps and sets (decisions 7–14)
 
@@ -566,6 +570,7 @@ compares `count` with one scanned element (decision 9).
 | a document root | storage `Delete`, as in ADR-rdb-0012 §12 | unchanged |
 | a blob root (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | Deletes the chunks, then the root, as for a collection root. Each call also stops when one more `Delete` would put `record_len` over `MAX_ENVELOPE_BYTES` (ADR-rdb-0014 decision 8). `repair_element` does not apply. Built with the M9 admin path (O7) |
 | a blob chunk that does not open, or a key under `sub` `0x04` whose tail is not 20 bytes (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | As for a blob root. A chunk no manifest names is garbage, not damage, and GC removes it (ADR-rdb-0014 decision 8) |
+| a list root, block, change slot or item record in any row of ADR-rdb-0016 decision 7 (amended 2026-10-05, L-R186ee; ADR-rdb-0016 decision 7) | `clear_object(snapshot, &RootKey)` | As for a collection root. ADR-rdb-0016 decision 7 lists each row and the error a read names. Built with the M9 admin path (O7) |
 
   - **Both functions refuse with `NotDamaged` when the object is not damaged.** By the definition above,
     a count-mismatch or orphan object is damaged, so `clear_object` accepts it, even though its root
@@ -614,6 +619,9 @@ compares `count` with one scanned element (decision 9).
 ### 14. Lists — S4, later
 - `sub` `0x02` and `0x03` are reserved for S4. A list's root is at `sub` `0x00`, like every object's.
 - S4 adds the envelope `kind`, the records, the scan tokens and the pages, and repoints the spec's list link.
+- **Closed** 2026-10-05 by ADR-rdb-0016 (L-R186ee). Lists are a root, blocks and change slots, not
+  pages (its decisions 1 and 3). The kinds are `0x06` root, `0x07` block and `0x08` slot (decision 1);
+  scan tokens are decision 6.
 
 ## Scenarios
 
@@ -690,7 +698,8 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
 ## Open (none blocks S3)
 - **O1 Length limits** for object ids and element keys. No spec number exists. M9 sets one with its
   request limits. Adding a limit later refuses only new writes.
-- **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`.
+- **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`. **Closed** 2026-10-05 by
+  ADR-rdb-0016 decisions 1 and 6 (L-R186ee); blocks and change slots replace pages.
 - **O3 Chunk placement and tail** (S5). **Closed** 2026-10-05 by ADR-rdb-0014 decision 1 (Gautam,
   L-R186x Q4), within decision 6: chunks sit under sub byte `0x04` of their object, with the tail
   `upload_id` (16 bytes), then `index` u32 BE, fixed width, 20 bytes (decision 3, row `0x04`).

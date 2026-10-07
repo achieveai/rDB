@@ -1,4 +1,4 @@
-//! Maps and sets at the library API (ADR-rdb-0013 §7–§13; s3-design §5).
+//! Maps and sets at the library API (ADR-rdb-0013 §7–§13, Verification).
 //!
 //! Scenario: the primary's transaction step compiles map and set ops against a snapshot, and
 //! a damaged store is refused by name, never by a panic.
@@ -28,8 +28,8 @@ use rdb_value::collection::{
 };
 use rdb_value::envelope::{seal, EnvelopeError, Kind};
 use rdb_value::keys::{
-    chunk_key, decode_element, decode_element_key, element_key, encode_element, esc, parse,
-    root_key, KeyError, Parsed, RootKey, Sub,
+    block_key, chunk_key, decode_element, decode_element_key, element_key, encode_element, esc,
+    item_key, parse, root_key, slot_key, KeyError, Parsed, RootKey, Sub,
 };
 use rdb_value::testing::MapSnapshot;
 use rdb_value::value::{Decimal, Int, Map, MapKey, Value};
@@ -281,6 +281,56 @@ fn l_r186s_a_flipped_root_kind_is_damage_on_every_read_path() {
     }
 }
 
+/// S4 P3 next door: a list block (0x07) or slot (0x08) record is never written at a root key,
+/// so one at a collection's root is damage, as on the list paths, not a `KindMismatch` that
+/// reads as "some other kind of object lives here". Named `ListRecordAtRoot`, as every list,
+/// document and blob path names it (lead ruling L-R186dz); a map and a set compile each get a row.
+#[test]
+fn p3_a_list_block_or_slot_at_a_collection_root_is_damage_on_every_path() {
+    let root = cart();
+    for kind in [Kind::ListBlock, Kind::ListSlot] {
+        let damage = Err(ValueError::Corrupt(Corrupt::ListRecordAtRoot {
+            found: kind,
+        }));
+        let mut s = MapSnapshot::new(Generation(1));
+        s.insert(root.to_bytes(), 4, root_record(kind, 1));
+        assert_eq!(
+            collection(&s, &root).map(|_| ()),
+            damage,
+            "collection, {kind:?}"
+        );
+        assert_eq!(
+            member(&s, &root, &text("banana")).map(|_| ()),
+            damage,
+            "member, {kind:?}"
+        );
+        assert_eq!(
+            members(&s, &root, None, 10).map(|_| ()),
+            damage,
+            "members, {kind:?}"
+        );
+        assert_eq!(
+            drop_collection(&s, &root, 4).map(|_| ()),
+            damage,
+            "drop, {kind:?}"
+        );
+        let put = [ElemOp::Put(text("banana"), int(1))];
+        assert_eq!(
+            compile_collection(&s, &root, CollectionKind::Map, Expected::Version(4), &put)
+                .map(|_| ()),
+            damage,
+            "map compile, {kind:?}"
+        );
+        let add = [ElemOp::Add(text("banana"))];
+        assert_eq!(
+            compile_collection(&s, &root, CollectionKind::Set, Expected::Version(4), &add)
+                .map(|_| ()),
+            damage,
+            "set compile, {kind:?}"
+        );
+    }
+}
+
 /// Lead ruling on tester W1 A2: `ElementNewerThanRoot` was erased by the next write. Step 10(a)
 /// leaves banana at version 6 under a root at 4. Every op that touches banana (put, remove,
 /// need) is refused by name; compile already reads the element's version, so this costs no
@@ -361,8 +411,8 @@ fn pc5_too_large_names_the_cap_it_hit() {
 }
 
 // ================================================================================================
-// W3: s3-design §5's rows R1–R13 at the library API. Each test names the walked scenario it
-// protects; the tester's mapping is teams/m8/s3-tester-w2.md, "Material acceptance contracts".
+// Rows R1–R13 at the library API (ADR-rdb-0013 Verification). Each test names the walked
+// scenario it protects; the tester's mapping is in working notes, not in the repository.
 // ================================================================================================
 
 /// Bytes from hex written with spaces, as ADR-rdb-0013's tables write them.
@@ -871,6 +921,17 @@ fn names_exactly(key: &[u8], parsed: &Parsed) -> bool {
             let (upload, index) = parsed.chunk.expect("a chunk tail is decoded");
             chunk_key(&parsed.root(), &upload, index)[..] == *key
         }
+        Sub::Item => {
+            let id = parsed.list_id.expect("an item tail is decoded");
+            item_key(&parsed.root(), id)[..] == *key
+        }
+        Sub::Block => {
+            let id = parsed.list_id.expect("a block tail is decoded");
+            match parsed.slot {
+                None => block_key(&parsed.root(), id)[..] == *key,
+                Some(slot) => slot_key(&parsed.root(), id, slot)[..] == *key,
+            }
+        }
         Sub::Reserved(sub) => {
             let mut head = parsed.root().object_prefix().to_vec();
             head.push(sub);
@@ -960,18 +1021,23 @@ fn r5_each_damaged_key_is_refused_by_name() {
             KeyError::RootHasTail { len: 1 },
         ),
         (format!("{SCOPE} 61 0001 01 11"), KeyError::UnknownTag(0x11)),
+        (
+            format!("{SCOPE} 61 0001 02 ffff"),
+            KeyError::ListIdTail { len: 2 },
+        ),
     ];
     for (hex, fault) in whole {
         assert_eq!(parse(&spaced(&hex)), Err(fault), "{hex}");
     }
-    let reserved = parse(&spaced(&format!("{SCOPE} 61 0001 02 ffff"))).unwrap();
+    // Lists took subs 0x02 and 0x03 (ADR-rdb-0016), so 0x05 is the first one no build reads.
+    let reserved = parse(&spaced(&format!("{SCOPE} 61 0001 05 ffff"))).unwrap();
     assert_eq!(
         (
             reserved.object_id.as_slice(),
             reserved.sub,
             reserved.element
         ),
-        (&b"a"[..], Sub::Reserved(0x02), None)
+        (&b"a"[..], Sub::Reserved(0x05), None)
     );
 
     let root = cart();

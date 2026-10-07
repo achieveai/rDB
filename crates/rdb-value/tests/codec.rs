@@ -1,8 +1,8 @@
 //! The deterministic CBOR profile, at the library API (ADR-rdb-0012 decisions 2–5).
 //!
 //! Scenario: a client sends document bytes, and the primary keeps exactly the bytes our encoder
-//! would write, refusing anything else (s2-design §2 corner table; tester W1 contracts 1–2,
-//! W2 contracts 1–3).
+//! would write, refusing anything else (the S2 design's corner table and the tester's contracts,
+//! in working notes not in the repository).
 
 mod common;
 

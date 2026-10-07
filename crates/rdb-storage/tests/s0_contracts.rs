@@ -1,12 +1,11 @@
 //! M8 S0 behavioural contracts on a real RocksDB directory.
 //!
-//! 1. A persisted `durable` above `applied` is refused at open (critic F6).
+//! 1. A persisted `durable` above `applied` is refused at open.
 //! 2. After a real process crash (`abort()` in a self-exec child), the stored history is a whole,
 //!    digest-chained prefix, and a chain that does not link is caught.
 //! 3. Lineages `(partition, generation)` do not see each other's records.
 //!
-//! Each test names the hand-walked scenario it protects: `#N` is row N of tester-m8's scenario
-//! table (teams/m8/tester-handoff.md).
+//! Each test's doc says which hand-walked scenario it protects.
 //!
 //! Data goes under `RETCD_TEST_DATA_DIR` (set by `scripts/gate.sh`), else Cargo's per-target tmp
 //! dir; never `%TEMP%`.
@@ -64,7 +63,7 @@ fn private_key(partition: u32, generation: u64, name: &[u8]) -> Vec<u8> {
     key
 }
 
-/// #13 (critic F6): persisted durable above applied is refused at open, every time, unrepaired.
+/// A persisted durable above applied is refused at open, every time, and nothing repairs it.
 #[retcd_test]
 fn s0_open_refuses_durable_above_applied() {
     let dir = data_dir("durable-above-applied");
@@ -102,7 +101,7 @@ fn s0_open_refuses_durable_above_applied() {
         ),
         "{refused:?}"
     );
-    // #13 "every time": a refused open repairs nothing, so the next one refuses the same way.
+    // "Every time": a refused open repairs nothing, so the next one refuses the same way.
     let again = RocksEngine::open(&db).expect_err("still refused");
     assert_eq!(again.to_string(), refused.to_string());
     let marks: Vec<_> = rdb_storage::dump(&db)
@@ -165,7 +164,7 @@ fn crash_child(db: &Path, sync: bool) {
     );
 }
 
-/// #4: abort after 3 unsynced commits; reopen keeps all 3, chained.
+/// A process aborts after 3 unsynced commits; the reopen keeps all 3, chained.
 #[retcd_test]
 fn s0_chain_verified_after_process_crash() {
     let dir = data_dir("crash-chain");
@@ -187,8 +186,7 @@ fn s0_chain_verified_after_process_crash() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #11 (c03) and #17: a record whose `prev_digest` does not link is caught, and only its own
-/// lineage faults.
+/// A record whose `prev_digest` does not link is caught, and only its own lineage faults.
 #[retcd_test]
 fn s0_verify_catches_a_record_that_does_not_chain() {
     let dir = data_dir("broken-chain");
@@ -213,12 +211,12 @@ fn s0_verify_catches_a_record_that_does_not_chain() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #17 and #28: four lineages, (0, 0) among them, each with its own marks and chain.
+/// Four lineages, (0, 0) among them, each keep their own marks and chain.
 #[retcd_test]
 fn s0_lineages_are_isolated_by_partition_and_generation() {
     let dir = data_dir("isolation");
     let db = dir.join("db");
-    // #28 (lead L-R182w, P6): partition 0 and generation 0 are legal lineages.
+    // Lead ruling L-R182w: partition 0 and generation 0 are legal lineages.
     let lineages = [(1u32, 1u64, 2u64), (2, 1, 1), (1, 2, 3), (0, 0, 1)];
     {
         let mut engine = RocksEngine::open(&db).expect("open");
@@ -256,9 +254,9 @@ fn s0_lineages_are_isolated_by_partition_and_generation() {
 
 // --- Regressions for observed defects -------------------------------------------------------
 
-/// #16. D1 (dev-m8 by hand, 2026-10-02): a corrupt SST was reported as `Locked`, exit 5, because
-/// "block checksum mismatch" contains "lock". A tester told "locked" goes looking for a second
-/// process that does not exist.
+/// A corrupt SST is not reported as `Locked`. Found by hand on 2026-10-02: it was `Locked`, exit
+/// 5, because "block checksum mismatch" contains "lock". A tester told "locked" goes looking for
+/// a second process that does not exist.
 #[retcd_test]
 fn s0_d1_corrupt_sst_is_not_reported_as_locked() {
     let dir = data_dir("d1-corrupt-sst");
@@ -292,7 +290,7 @@ fn s0_d1_corrupt_sst_is_not_reported_as_locked() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #20. D1's other side: a real lock is still `Locked`.
+/// The other side of the corrupt-SST fix: a real second open is still `Locked`.
 #[retcd_test]
 fn s0_d1_second_open_is_locked() {
     let dir = data_dir("d1-locked");
@@ -304,8 +302,9 @@ fn s0_d1_second_open_is_locked() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #1. D2 (dev-m8 by hand, 2026-10-02): `verify --dir <typo>` created an empty database and
-/// reported `lineages=0 OK`, exit 0. A check that passes on the wrong directory is a false pass.
+/// Opening an existing database refuses a directory that has none. Found by hand on 2026-10-02:
+/// `verify --dir <typo>` created an empty database and reported `lineages=0 OK`, exit 0. A check
+/// that passes on the wrong directory is a false pass.
 #[retcd_test]
 fn s0_d2_open_existing_refuses_a_missing_database() {
     let dir = data_dir("d2-missing");
@@ -347,8 +346,9 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Events {
     }
 }
 
-/// #14. T2 (tester-m8, 2026-10-02): an open refused with `CorruptRecord` wrote no log event; only
-/// the exit code said anything. Every refusal must leave an Error line naming it.
+/// An open refused with `CorruptRecord` logs it. Found by the tester on 2026-10-02: no log event
+/// was written and only the exit code said anything. Every refusal must leave an Error line
+/// naming it.
 #[test]
 fn s0_t2_corrupt_record_refusal_is_logged() {
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -424,8 +424,8 @@ fn truncate(path: &Path, len: u64) {
         .expect("truncate the WAL");
 }
 
-/// #6 and #7: on the directory a crash left behind, `dump` changes no byte; and a WAL torn at
-/// any point recovers a whole-batch prefix that verifies, never a part of a batch.
+/// On the directory a crash left behind, `dump` changes no byte; and a WAL torn at any point
+/// recovers a whole-batch prefix that verifies, never a part of a batch.
 #[retcd_test]
 fn s0_crashed_dir_dump_is_read_only_and_a_torn_wal_keeps_whole_batches() {
     let dir = data_dir("torn-wal");
@@ -472,8 +472,8 @@ fn s0_crashed_dir_dump_is_read_only_and_a_torn_wal_keeps_whole_batches() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #10 and #8: crash after a flush; then tear off the durable mark, the WAL's last record.
-/// Durable falls back to 0 and applied stays 3: durable may lag, never lead.
+/// A crash after a flush, then the durable mark, the WAL's last record, torn off. Durable falls
+/// back to 0 and applied stays 3: durable may lag, never lead.
 #[retcd_test]
 fn s0_torn_flush_mark_lets_durable_fall_back_never_lead() {
     let dir = data_dir("torn-flush-mark");
@@ -505,25 +505,25 @@ fn s0_torn_flush_mark_lets_durable_fall_back_never_lead() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// One hand-crafted corruption from scenarios #11 and #12, applied with RocksDB directly.
+/// One hand-crafted corruption of a stored record or mark, applied with RocksDB directly.
 #[derive(Debug, Clone, Copy)]
 enum Craft {
-    /// c02: flip the last byte of record 2, inside its carried `record_digest`.
+    /// Flip the last byte of record 2, inside its carried `record_digest`.
     RecordDigest,
-    /// c07: record 2's frame version byte.
+    /// Change record 2's frame version byte.
     FrameByte,
-    /// c11: flip the last byte of the Progress value, inside the head digest.
+    /// Flip the last byte of the Progress value, inside the head digest.
     Progress,
-    /// c05/c06: move the applied mark.
+    /// Move the applied mark.
     Applied(u64),
-    /// #24 u1: record 2's envelope magic `RDBE` becomes `RDBD` (after the 9-byte frame).
+    /// Record 2's envelope magic `RDBE` becomes `RDBD` (after the 9-byte frame).
     Magic,
-    /// #25: records 2 and 3 swap places.
+    /// Records 2 and 3 swap places.
     Swap,
 }
 
-/// #11, #12, #24 and #25: each crafted corruption the tester walked names its own fault. One lineage per
-/// case in one directory (#17 keeps them apart), so the table costs three opens, not fifteen.
+/// Each crafted corruption the tester walked names its own fault. One lineage per case in one
+/// directory (lineages keep apart), so the table costs three opens, not fifteen.
 #[retcd_test]
 fn s0_verify_names_each_crafted_fault() {
     use rdb_core::contracts::storage::{Namespace, StorageFault};
@@ -604,10 +604,9 @@ fn s0_verify_names_each_crafted_fault() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #14 (c08), #21, #26, #27 and S1 #29: a directory with another, a missing or a malformed
-/// format marker, a malformed watermark, or another column-family set is refused at open with the
-/// error that names it. S1 moved the format to 1 (ADR-rdb-0010 decision 11), so S0's 0 is now a
-/// foreign marker too.
+/// A directory with another, a missing or a malformed format marker, a malformed watermark, or
+/// another column-family set is refused at open with the error that names it. S1 moved the
+/// format to 1 (ADR-rdb-0010 decision 11), so S0's 0 is now a foreign marker too.
 #[retcd_test]
 fn s0_open_refuses_a_foreign_layout() {
     use rdb_storage::keys::{CF_METADATA, COLUMN_FAMILIES, FORMAT_VERSION};
@@ -691,9 +690,9 @@ fn s0_open_refuses_a_foreign_layout() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #29, #30 and #31: an injected storage fault fails the call, moves no watermark, and leaves a
-/// directory that still verifies. #31's mark-write fault is the state a crash between the WAL
-/// sync and the durable-mark write leaves; a later sync recovers it.
+/// An injected storage fault fails the call, moves no watermark, and leaves a directory that
+/// still verifies. The mark-write fault is the state a crash between the WAL sync and the
+/// durable-mark write leaves; a later sync recovers it.
 #[cfg(debug_assertions)]
 #[retcd_test]
 fn s0_injected_storage_faults_move_no_watermark() {
@@ -751,9 +750,9 @@ fn s0_injected_storage_faults_move_no_watermark() {
     std::fs::remove_dir_all(&dir).expect("remove the test directory");
 }
 
-/// #31 / T4 (tester-m8 on v5, 2026-10-02): `flush --inject mark-write` with every durable
-/// already at applied logged `fault_injected` and exited 0: there was no mark to write, so the
-/// fault never fired, yet the log said it had. The log must name a fault only when it fires.
+/// The log names an injected fault only when it fires. Found by the tester on 2026-10-02:
+/// `flush --inject mark-write` with every durable already at applied logged `fault_injected` and
+/// exited 0: there was no mark to write, so the fault never fired, yet the log said it had.
 #[cfg(debug_assertions)]
 #[test]
 fn s0_t4_an_unreached_inject_point_logs_no_fault() {

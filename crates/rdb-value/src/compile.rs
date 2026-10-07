@@ -78,6 +78,10 @@ pub enum Corrupt {
     /// the elements a write adds is over `u64::MAX`, so the stored count cannot be right.
     #[error("collection root: {0}")]
     Root(&'static str),
+    /// A list root's payload breaks a rule of ADR-rdb-0016 §1, §4 or §7, or a counter it or a
+    /// block ref holds would overflow. The message names the list.
+    #[error("{0}")]
+    ListRoot(&'static str),
     /// A collection root names an element key profile this build does not know. Written by a
     /// newer build, not damage (ADR-rdb-0012 §12).
     #[error("unknown element key profile {0}")]
@@ -86,6 +90,19 @@ pub enum Corrupt {
     #[error("map entry envelope is a {found:?}, not a Document")]
     EntryNotDocument {
         /// The entry's envelope kind.
+        found: Kind,
+    },
+    /// A list item's envelope is not a document.
+    #[error("list item envelope is a {found:?}, not a Document")]
+    ItemNotDocument {
+        /// The item's envelope kind.
+        found: Kind,
+    },
+    /// A document, blob, map, set or list root key holds a list block or slot record. Those are
+    /// never written at a root key, so this is damage, not another kind of object.
+    #[error("a list {found:?} record is at the root key")]
+    ListRecordAtRoot {
+        /// The record's envelope kind.
         found: Kind,
     },
     /// A set member's record holds bytes; it must be empty.
@@ -130,6 +147,21 @@ pub enum Corrupt {
         /// The missing index.
         index: u32,
     },
+    /// A list block that a read or a compile opened is damaged: its base, one of its pending
+    /// change slots, or their replay (ADR-rdb-0016 §3, §7).
+    #[error("list block {id:032x}: {fault}")]
+    Block {
+        /// The block's id.
+        id: u128,
+        /// What is wrong with it.
+        fault: BlockFault,
+    },
+    /// A list block entry names an item that has no record (ADR-rdb-0016 §7).
+    #[error("the list names item {id:032x}, which is not stored")]
+    ItemMissing {
+        /// The item's id.
+        id: u128,
+    },
     /// A stored chunk is not the one the manifest names: another kind of record, or another
     /// length or digest (ADR-rdb-0014 §7).
     #[error("chunk {index} is not the chunk the manifest names")]
@@ -137,6 +169,85 @@ pub enum Corrupt {
         /// The chunk's index.
         index: u32,
     },
+}
+
+/// Why a list block is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside
+/// [`BlockFault::Envelope`] or a slot's [`SlotFault::Envelope`] stays written-by-a-newer-build
+/// (ADR-rdb-0012 §12).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BlockFault {
+    /// The root names it, but no base is stored.
+    #[error("not stored")]
+    Missing,
+    /// The base's envelope does not open.
+    #[error("{0}")]
+    Envelope(EnvelopeError),
+    /// The base is another kind.
+    #[error("a {found:?} record, not a list block")]
+    NotABlock {
+        /// The kind found.
+        found: Kind,
+    },
+    /// The base's payload is not canonical CBOR.
+    #[error("{0}")]
+    Codec(CodecError),
+    /// The base decodes but is not a block, or the replayed block is not the one the root names.
+    #[error("{0}")]
+    Shape(&'static str),
+    /// The base's payload is over the format's largest block.
+    #[error("a block payload of {len} bytes is over the largest a block holds")]
+    TooLarge {
+        /// The payload's length.
+        len: usize,
+    },
+    /// The base's version is above its root's.
+    #[error("block version {block} is above its root's version {root}")]
+    NewerThanRoot {
+        /// The base's version.
+        block: u64,
+        /// The root's version.
+        root: u64,
+    },
+    /// A pending op's slot is not stored, or holds another op no.
+    #[error("pending op {op} is not in its slot")]
+    OpMissing {
+        /// The op no.
+        op: u64,
+    },
+    /// A pending op's slot holds it, but is damaged.
+    #[error("pending op {op}: {fault}")]
+    OpBad {
+        /// The op no.
+        op: u64,
+        /// What is wrong with its slot.
+        fault: SlotFault,
+    },
+    /// A pending op's position is outside the block as the ops before it left it.
+    #[error("pending op {op} names a position outside its block")]
+    OpOutOfRange {
+        /// The op no.
+        op: u64,
+    },
+}
+
+/// Why a pending op's change slot is refused (ADR-rdb-0016 §7).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SlotFault {
+    /// The envelope does not open.
+    #[error("{0}")]
+    Envelope(EnvelopeError),
+    /// The record is another kind.
+    #[error("a {found:?} record, not a list change slot")]
+    NotASlot {
+        /// The kind found.
+        found: Kind,
+    },
+    /// The payload is not canonical CBOR.
+    #[error("{0}")]
+    Codec(CodecError),
+    /// The payload decodes but is not `[op no, op]`.
+    #[error("{0}")]
+    Shape(&'static str),
 }
 
 /// Why a blob root's payload is not a v1 manifest (ADR-rdb-0014 §2).
@@ -201,16 +312,28 @@ pub(crate) fn record(
     }
 }
 
+/// Refuse a list block or slot record found at a document, blob, map, set or list root key. Those
+/// are never written at a root key, so one there is damage, not another kind of object.
+pub(crate) fn refuse_list_record_at_root(kind: Kind) -> Result<(), ValueError> {
+    match kind {
+        Kind::ListBlock | Kind::ListSlot => Err(ValueError::Corrupt(Corrupt::ListRecordAtRoot {
+            found: kind,
+        })),
+        _ => Ok(()),
+    }
+}
+
 /// The document at `root` in [`Namespace::User`], or `None` when there is no record.
 ///
 /// # Errors
-/// [`ApplyError::KindMismatch`] when the object is a map or a set; [`ValueError::Corrupt`] when
-/// the record does not open or decode.
+/// [`ApplyError::KindMismatch`] when the object is another kind; [`ValueError::Corrupt`] when
+/// the record does not open or decode, or is a list block or slot record.
 pub fn read(snapshot: &dyn SnapshotRead, root: &RootKey) -> Result<Option<Document>, ValueError> {
     let Some((version, bytes)) = record(snapshot, root.as_bytes())? else {
         return Ok(None);
     };
     let opened = open(&bytes).map_err(|e| ValueError::Corrupt(Corrupt::Envelope(e)))?;
+    refuse_list_record_at_root(opened.kind)?;
     if opened.kind != Kind::Document {
         return Err(ApplyError::KindMismatch { found: opened.kind }.into());
     }

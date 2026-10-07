@@ -8,7 +8,8 @@
 //!   (decision 2).
 //! - `sub`: the record's role inside the object, from the table in [`Sub`] (decision 3).
 //! - `tail`: empty for the root; for a map entry or set member, the element key in profile v1
-//!   (decision 4), built by [`encode_element`].
+//!   (decision 4), built by [`encode_element`]; for a list item or block, its 16-byte id, and
+//!   for a block's change slot one more byte, the slot (ADR-rdb-0016 §1).
 //!
 //! A [`RootKey`] can only be made by [`root_key`], so a document or collection op can never be
 //! aimed at an element key (decision 1).
@@ -24,6 +25,16 @@ use crate::value::{Decimal, Float, Int, Timestamp, Value};
 pub const SUB_ROOT: u8 = 0x00;
 /// `sub` of a map entry or a set member. Its tail is an element key, profile v1.
 pub const SUB_ELEMENT: u8 = 0x01;
+/// `sub` of a list item. Its tail is the item id, [`LIST_ID_LEN`] bytes (ADR-rdb-0016 §1).
+pub const SUB_ITEM: u8 = 0x02;
+/// `sub` of a list block and its change slots. A block's tail is its id, [`LIST_ID_LEN`] bytes; a
+/// slot's is the block id and then the slot, one byte below [`LIST_SLOTS`] (ADR-rdb-0016 §1).
+pub const SUB_BLOCK: u8 = 0x03;
+/// A list item or block id's length: a u128, big-endian (ADR-rdb-0016 §2).
+pub const LIST_ID_LEN: usize = 16;
+/// How many change slots a list block has: a slot byte is below it (ADR-rdb-0016 §3). A format
+/// constant: it fixes keys.
+pub const LIST_SLOTS: u8 = 240;
 /// `sub` of a blob chunk. Its tail is `upload_id (16) | index u32 BE` (ADR-rdb-0014 §1).
 pub const SUB_CHUNK: u8 = 0x04;
 /// A chunk key's tail length: [`UPLOAD_LEN`] bytes of upload id, then a u32 index.
@@ -38,7 +49,8 @@ pub const UPLOAD_LEN: usize = 16;
 /// |---|---|
 /// | `0x00` | [`Sub::Root`] |
 /// | `0x01` | [`Sub::Element`] |
-/// | `0x02`, `0x03` | reserved for lists (S4) |
+/// | `0x02` | [`Sub::Item`] (ADR-rdb-0016 §1) |
+/// | `0x03` | [`Sub::Block`] (ADR-rdb-0016 §1) |
 /// | `0x04` | [`Sub::Chunk`] (ADR-rdb-0014 §1) |
 /// | `0x05`–`0xFF` | unassigned |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +59,10 @@ pub enum Sub {
     Root,
     /// `0x01`: a map entry or a set member.
     Element,
+    /// `0x02`: a list item.
+    Item,
+    /// `0x03`: a list block, or one of its change slots.
+    Block,
     /// `0x04`: a blob chunk.
     Chunk,
     /// Any other byte: reserved or unassigned. Nothing after it is decoded.
@@ -60,6 +76,8 @@ impl Sub {
         match byte {
             SUB_ROOT => Self::Root,
             SUB_ELEMENT => Self::Element,
+            SUB_ITEM => Self::Item,
+            SUB_BLOCK => Self::Block,
             SUB_CHUNK => Self::Chunk,
             other => Self::Reserved(other),
         }
@@ -172,6 +190,21 @@ pub enum KeyError {
         /// The tail's length.
         len: usize,
     },
+    /// A list item key's tail is not [`LIST_ID_LEN`] bytes, or a block key's is neither that nor
+    /// one more, a slot (ADR-rdb-0016 §1).
+    #[error(
+        "list item or block key tail of {len} bytes; an id is {LIST_ID_LEN}, and a block's slot one more"
+    )]
+    ListIdTail {
+        /// The tail's length.
+        len: usize,
+    },
+    /// A list block's slot byte is not below [`LIST_SLOTS`] (ADR-rdb-0016 §1, §7).
+    #[error("list block slot {slot}; a slot is below {LIST_SLOTS}")]
+    SlotOutOfRange {
+        /// The slot byte.
+        slot: u8,
+    },
 }
 
 /// An object's root key: the full `Namespace::User` key `scope | esc(object_id) | 0x00`.
@@ -213,6 +246,14 @@ impl RootKey {
         out
     }
 
+    /// `object_prefix | sub`: every record of this object with that `sub` starts with it.
+    #[must_use]
+    pub fn sub_prefix(&self, sub: u8) -> Vec<u8> {
+        let mut out = self.object_prefix().to_vec();
+        out.push(sub);
+        out
+    }
+
     /// `object_prefix | 0x04`: every blob chunk of this object starts with it, in
     /// `(upload, index)` order (ADR-rdb-0014 §1).
     #[must_use]
@@ -229,6 +270,34 @@ pub fn chunk_key(root: &RootKey, upload: &[u8; UPLOAD_LEN], index: u32) -> Bytes
     let mut out = root.chunk_prefix();
     out.extend_from_slice(upload);
     out.extend_from_slice(&index.to_be_bytes());
+    Bytes::from(out)
+}
+
+/// The key of list item `id` under the object at `root` (ADR-rdb-0016 §1).
+#[must_use]
+pub fn item_key(root: &RootKey, id: u128) -> Bytes {
+    let mut out = root.sub_prefix(SUB_ITEM);
+    out.extend_from_slice(&id.to_be_bytes());
+    Bytes::from(out)
+}
+
+/// The key of list block `id`'s base under the object at `root` (ADR-rdb-0016 §1). Its change
+/// slots' keys start with it, so they sort right after it.
+#[must_use]
+pub fn block_key(root: &RootKey, id: u128) -> Bytes {
+    let mut out = root.sub_prefix(SUB_BLOCK);
+    out.extend_from_slice(&id.to_be_bytes());
+    Bytes::from(out)
+}
+
+/// The key of change slot `slot` of list block `id` under the object at `root`
+/// (ADR-rdb-0016 §1). Callers pass a slot below [`LIST_SLOTS`].
+#[must_use]
+pub fn slot_key(root: &RootKey, id: u128, slot: u8) -> Bytes {
+    debug_assert!(slot < LIST_SLOTS, "a slot is below LIST_SLOTS");
+    let mut out = root.sub_prefix(SUB_BLOCK);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.push(slot);
     Bytes::from(out)
 }
 
@@ -533,6 +602,10 @@ pub struct Parsed {
     pub element: Option<Value>,
     /// For [`Sub::Chunk`], the upload id and the index. `None` otherwise.
     pub chunk: Option<([u8; UPLOAD_LEN], u32)>,
+    /// For [`Sub::Item`] and [`Sub::Block`], the id. `None` otherwise.
+    pub list_id: Option<u128>,
+    /// For a [`Sub::Block`] change slot, the slot. `None` otherwise, a block's base included.
+    pub slot: Option<u8>,
 }
 
 impl Parsed {
@@ -553,7 +626,7 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
     let (object_id, rest) = unesc(&key[KEY_SCOPE_LEN..], KEY_SCOPE_LEN)?;
     let (&sub, tail) = rest.split_first().ok_or(KeyError::MissingSub)?;
     let sub = Sub::from_byte(sub);
-    let (mut element, mut chunk) = (None, None);
+    let (mut element, mut chunk, mut list_id, mut slot) = (None, None, None, None);
     match sub {
         Sub::Root if !tail.is_empty() => return Err(KeyError::RootHasTail { len: tail.len() }),
         Sub::Element => element = Some(decode_element(tail)?),
@@ -567,6 +640,24 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
                 u32::from_be_bytes(index.try_into().expect("4 bytes")),
             ));
         }
+        Sub::Item | Sub::Block => {
+            let (id, rest) = match (sub, tail.len()) {
+                (_, LIST_ID_LEN) => (tail, None),
+                (Sub::Block, len) if len == LIST_ID_LEN + 1 => {
+                    (&tail[..LIST_ID_LEN], Some(tail[LIST_ID_LEN]))
+                }
+                (_, len) => return Err(KeyError::ListIdTail { len }),
+            };
+            if let Some(byte) = rest {
+                if byte >= LIST_SLOTS {
+                    return Err(KeyError::SlotOutOfRange { slot: byte });
+                }
+            }
+            list_id = Some(u128::from_be_bytes(
+                id.try_into().expect("LIST_ID_LEN bytes"),
+            ));
+            slot = rest;
+        }
         Sub::Root | Sub::Reserved(_) => {}
     }
     Ok(Parsed {
@@ -576,5 +667,7 @@ pub fn parse(key: &[u8]) -> Result<Parsed, KeyError> {
         sub,
         element,
         chunk,
+        list_id,
+        slot,
     })
 }

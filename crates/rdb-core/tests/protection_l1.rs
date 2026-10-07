@@ -1173,8 +1173,9 @@ fn block_while_reprotecting_pauses_and_reprotecting_traces_as_resuming() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tester rows: one per guard the mutation pass found unguarded (tester-l1-handoff.md). Not plan
-// rows; the row author folds them into the m7b_ rows they belong to.
+// Tester rows: one per guard the mutation pass found unguarded (the L1 tester's handoff, working
+// notes not in the repository). Not plan rows; the row author folds them into the m7b_ rows they
+// belong to.
 // ---------------------------------------------------------------------------------------------
 
 /// Tester row (mutant M03, `>=` -> `>` on the resume lag): a lag of exactly `resume_lag_ms`
@@ -1254,7 +1255,8 @@ fn tester_warn_returns_to_healthy_on_a_partial_drain() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Lead ruling B-R38: the manual gate's findings F1, F4, F5, F6, F7 (tester-l1-handoff.md).
+// Lead ruling B-R38: the manual gate's findings F1, F4, F5, F6, F7 (the L1 tester's handoff,
+// working notes not in the repository).
 // ---------------------------------------------------------------------------------------------
 
 /// F1 (design §4.5): whenever `blocked` is set the reason is `DivergenceRequiresOperator`,
@@ -1356,7 +1358,7 @@ fn with_every_peer_lost_resume_is_blocked() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Lead ruling B-R42: the L1 code review's fixes (review-l1.md).
+// Lead ruling B-R42: the L1 code review's fixes (working notes, not in the repository).
 // ---------------------------------------------------------------------------------------------
 
 /// `required_copy_set` is the current predicate by node: primary plus regular secondaries,
@@ -1573,7 +1575,8 @@ fn a_drain_returns_warn_to_healthy_in_the_draining_step() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Lead ruling B-R46: the sim gate's S1 and S4 (tester-l1-handoff.md, "Sim gate").
+// Lead ruling B-R46: the sim gate's S1 and S4 (the L1 tester's handoff, "Sim gate"; working
+// notes not in the repository).
 // ---------------------------------------------------------------------------------------------
 
 /// `Recovered{cutoff 40}`, `Gained` at 10 and `DurableAdvanced{C1: 40}` at 20: `Paused` with its
