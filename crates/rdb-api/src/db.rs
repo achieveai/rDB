@@ -342,7 +342,38 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
-        let identity = self.identity();
+        self.put_identified(self.identity(), object, value, if_version)
+    }
+
+    /// [`Self::put`] under request id `request`, which this client may have used already. A
+    /// fresh compile, so a changed payload under a used id meets the dedup rules
+    /// (`REQUEST_ID_REUSE`). The tenant and client are this `Db`'s own.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`].
+    pub fn put_as(
+        &self,
+        request: RequestId,
+        object: &[u8],
+        value: &[u8],
+        if_version: Option<u64>,
+    ) -> Result<PutOk, PutError> {
+        let identity = RequestIdentity {
+            tenant: TENANT,
+            client: CLIENT,
+            request,
+        };
+        self.put_identified(identity, object, value, if_version)
+    }
+
+    fn put_identified(
+        &self,
+        identity: RequestIdentity,
+        object: &[u8],
+        value: &[u8],
+        if_version: Option<u64>,
+    ) -> Result<PutOk, PutError> {
         let call = ClientCall::Put {
             identity,
             object: Bytes::copy_from_slice(object),

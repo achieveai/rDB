@@ -11,6 +11,8 @@
 //! put <object> <value> [--if-version N]   write a byte string
 //! retry [<request>]                       send a put's request again, unchanged: the latest
 //!                                         put's, or the one this session sent as <request>
+//! retry [<request>] --payload <value>     the same put and request id with another value,
+//!                                         compiled afresh (REQUEST_ID_REUSE); not remembered
 //! get <object>                            read at the publication barrier
 //! status <request> [<generation>]         what became of a request this session sent
 //! nodes                                   each node's view of partition 1
@@ -350,16 +352,23 @@ fn repl(
             ["quit" | "exit"] => break,
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
+                    let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
                     put_line(
-                        db.put(object.as_bytes(), value.as_bytes(), if_version),
-                        &mut sent,
+                        answer,
+                        Some((&mut sent, object.as_bytes().to_vec(), if_version)),
                     );
                     Ok(())
                 }
                 Err(e) => Err(e),
             },
-            ["retry", rest @ ..] => sent.pick(rest).map(|request| {
-                put_line(db.resend(request), &mut sent);
+            ["retry", rest @ .., "--payload", value] => {
+                sent.pick(rest).map(|(request, object, if_version)| {
+                    let id = request.identity.request;
+                    put_line(db.put_as(id, &object, value.as_bytes(), if_version), None);
+                })
+            }
+            ["retry", rest @ ..] => sent.pick(rest).map(|(request, object, if_version)| {
+                put_line(db.resend(request), Some((&mut sent, object, if_version)));
             }),
             ["get", object] => {
                 get_line(db, object.as_bytes());
@@ -450,21 +459,22 @@ fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
 /// put, whatever it answered, or nothing when the latest put sent nothing (PC11).
 #[derive(Debug, Default)]
 struct Sent {
-    by_id: std::collections::BTreeMap<u64, TxnRequest>,
+    /// The request, and the object and condition it was put with.
+    by_id: std::collections::BTreeMap<u64, (TxnRequest, Vec<u8>, Option<u64>)>,
     latest: Option<Option<u64>>,
 }
 
 impl Sent {
-    fn record(&mut self, request: Option<TxnRequest>) {
+    fn record(&mut self, request: Option<TxnRequest>, object: Vec<u8>, if_version: Option<u64>) {
         let id = request.map(|request| {
             let id = request.identity.request.0;
-            self.by_id.insert(id, request);
+            self.by_id.insert(id, (request, object, if_version));
             id
         });
         self.latest = Some(id);
     }
 
-    fn pick(&self, rest: &[&str]) -> Result<TxnRequest, String> {
+    fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Vec<u8>, Option<u64>), String> {
         let id = match rest {
             [] => match self.latest {
                 None => return Err("no put to retry yet".to_owned()),
@@ -476,7 +486,7 @@ impl Sent {
             [id] => id
                 .parse()
                 .map_err(|_| "retry [<request>]: a request id is a number".to_owned())?,
-            _ => return Err("retry [<request>]".to_owned()),
+            _ => return Err("retry [<request>] [--payload <value>]".to_owned()),
         };
         self.by_id
             .get(&id)
@@ -485,14 +495,23 @@ impl Sent {
     }
 }
 
-fn put_line(answer: Result<rdb_api::PutOk, PutError>, sent: &mut Sent) {
+/// Print a put's answer, and remember what it sent when `record` names where.
+fn put_line(
+    answer: Result<rdb_api::PutOk, PutError>,
+    record: Option<(&mut Sent, Vec<u8>, Option<u64>)>,
+) {
+    let remember = |request: Option<TxnRequest>| {
+        if let Some((sent, object, if_version)) = record {
+            sent.record(request, object, if_version);
+        }
+    };
     match answer {
         Ok(ok) => {
             say(&format!(
                 "ok p=1 gen={} seq={} {:?} request={}",
                 ok.generation.0, ok.seq.0, ok.durability, ok.request.0
             ));
-            sent.record(Some(*ok.sent));
+            remember(Some(*ok.sent));
         }
         Err(PutError { error, request }) => {
             let id = request
@@ -505,7 +524,7 @@ fn put_line(answer: Result<rdb_api::PutOk, PutError>, sent: &mut Sent) {
                 error.no_mutation,
                 error.detail
             ));
-            sent.record(request.map(|request| *request));
+            remember(request.map(|request| *request));
         }
     }
 }
