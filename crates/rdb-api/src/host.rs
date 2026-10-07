@@ -2332,7 +2332,7 @@ impl Host {
         let holds = match receiver.filter(|_| role == "secondary") {
             Some(receiver) => {
                 let lineage = receiver.lineage();
-                (lineage.generation.0 != 0).then(|| Holding {
+                Some(Holding {
                     generation: lineage.generation,
                     owner_epoch: lineage.owner_epoch,
                     applied: receiver.buffered_applied_seq().0,
@@ -2876,6 +2876,8 @@ mod tests {
     /// applied=0 durable=0` while the owner's puts were `BufferedOnTwo`, because the view read
     /// the store at the adopted generation and a secondary adopts none. A secondary now reports
     /// what its receiver took, and a node holding nothing says so instead of printing zeros.
+    /// Node 2's flush is held, so its durable point stays behind the head it applied: `applied`
+    /// must be the receiver's buffered head, not its durable point (tester gap G3, mutant M7).
     #[test]
     fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
         let dir = config_testkit::fs::temp_dir();
@@ -2912,15 +2914,16 @@ mod tests {
                 "nothing held before bootstrap"
             );
         }
+        nodes[1].0.next_flush = Tick(u64::MAX);
         let owner = nodes[0].1.clone();
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             owner.send(msg).map_err(|_| NodeStopped(NodeId(1)))
         }))
         .expect("bootstrap");
 
-        // Until node 2 has taken the start record at seq 1.
+        // Until node 2's receiver has taken the start record at seq 1.
         let deadline = Instant::now() + Duration::from_secs(5);
-        let held = loop {
+        let head = loop {
             for (host, _, rx) in &mut nodes {
                 host.run_due();
                 host.drain();
@@ -2929,18 +2932,31 @@ mod tests {
                 }
                 assert_eq!(host.fault, None, "node {} faulted", host.node.0);
             }
-            let status = nodes[1].0.status(partition);
-            if let Some(held) = status.holds.filter(|held| held.applied >= 1) {
-                assert_eq!(status.role, "secondary");
-                break held;
+            let head = nodes[1]
+                .0
+                .replication
+                .receiver(NodeId(2), partition)
+                .map_or(0, |receiver| receiver.buffered_applied_seq().0);
+            if head >= 1 {
+                break head;
             }
             assert!(
                 Instant::now() < deadline,
-                "node 2 holds no record within 5 s: {status:?}"
+                "node 2's receiver took no record within 5 s"
             );
             std::thread::sleep(Duration::from_millis(1));
         };
         let secondary = &nodes[1].0;
+        let status = secondary.status(partition);
+        assert_eq!(status.role, "secondary");
+        let held = status
+            .holds
+            .expect("a secondary with a receiver holds its lineage");
+        assert_eq!(
+            (held.applied, held.durable),
+            (head, 0),
+            "applied is the buffered head; durable stays at 0 while node 2's flush is held"
+        );
         assert_eq!(
             secondary.adopted(partition).generation,
             Generation(0),
