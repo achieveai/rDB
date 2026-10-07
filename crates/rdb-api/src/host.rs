@@ -216,8 +216,8 @@ pub enum PeerAsk {
         cutoff: Seq,
         /// In this lineage.
         generation: Generation,
-        /// Whether F1 is past its commit: then the digest is the stored one, never the
-        /// inventory's.
+        /// Whether F1 is past its commit. Logged only: seq 0 is `Digest::ROOT` and any other seq
+        /// is the stored record's digest either way (D2 ruling, rule 3).
         post_commit: bool,
     },
 }
@@ -1904,9 +1904,10 @@ impl Host {
             );
             return None;
         }
-        // Before commit an empty copy's inventory heads at the root, so the cutoff it can prove
-        // is 0 at `Digest::ROOT`; anything else is the stored record's digest.
-        let digest = if !post_commit && cutoff == Seq::ZERO {
+        // Seq 0 is the empty prefix: no record is stored there, and every lineage starts at
+        // `Digest::ROOT`. This holder answers it after its own WAL sync, before and after commit
+        // (D2 ruling, rule 3). Any other seq is the stored record's own digest, or nothing.
+        let digest = if cutoff == Seq::ZERO {
             Some(Digest::ROOT)
         } else {
             match self.checked(partition, generation, cutoff) {
@@ -1931,6 +1932,7 @@ impl Host {
             cutoff = cutoff.0,
             durable = durable.0,
             generation = generation.0,
+            post_commit,
             "sync_proven"
         );
         Some(RecoveryEvent::DurableAt(DurableProof {
@@ -2421,6 +2423,48 @@ mod tests {
         }
         assert!(host.queue.is_empty(), "nothing reached T1");
         assert!(host.pending.is_empty(), "no reply is awaited");
+    }
+
+    /// D2 ruling, rule 3: a sync at seq 0 is answered `Digest::ROOT` by the holder itself,
+    /// after commit as before it; at seq 1 with no stored record it is still withheld.
+    #[test]
+    fn a_post_commit_sync_proves_root_at_seq_zero_and_nothing_without_a_record() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let (partition, generation) = (PartitionId(1), Generation(1));
+        // Durable through seq 1, with no history record there.
+        engine
+            .commit(rdb_core::contracts::storage::Batch {
+                id: rdb_core::contracts::ids::BatchId(1),
+                partition,
+                generation,
+                seq: Seq(1),
+                writes: Vec::new(),
+            })
+            .expect("commit seq 1");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
+        let mut host = Host::new(NodeId(2), engine, links, control, HostClock::start());
+
+        let proof = match host.sync(partition, CopyId(1), Seq::ZERO, generation, true) {
+            Some(RecoveryEvent::DurableAt(proof)) => proof,
+            other => panic!("expected a proof at seq 0, got {other:?}"),
+        };
+        assert_eq!(
+            (proof.copy, proof.seq, proof.digest),
+            (CopyId(1), DurableSeq(0), Digest::ROOT)
+        );
+        assert_eq!(
+            host.sync(partition, CopyId(1), Seq(1), generation, true),
+            None,
+            "no record at seq 1: withheld, never ROOT"
+        );
+        // Withheld for the missing record, not for a short sync.
+        assert_eq!(host.engine.durable(partition, generation), DurableSeq(1));
     }
 
     /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
