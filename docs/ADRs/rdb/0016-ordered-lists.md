@@ -189,9 +189,10 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   entries; a stale slot under a live block; a stray slot under a split's new block; a wrong `bytes` total. A split
   checks only its new block's base key, with one `version` call. A scan for the slots would be one call too, but it
   returns the first record at or after the base key, which is normally the next object's, so its bytes are not bounded
-  by B (L-R186el). Such a slot outlives the block's retire or merge-back, which delete slots 1 … `head` only; a later
-  drop of the emptied list then refuses `OrphanElement`, so only `clear_object` removes the list. Writes never make any
-  of these: `model_run` checks after every step that
+  by B (L-R186el). A stray in a slot past `head` (one no op 1 … `head` has used) outlives the block's retire or
+  merge-back, which delete only the slots of ops 1 … `head`; a later drop of the emptied list then refuses
+  `OrphanElement`, so only `clear_object` removes the list. A stray in a used slot is deleted with the block.
+  Writes never make any of these: `model_run` checks after every step that
   - the `0x02` keys are exactly the out-of-line entries' ids (the first two);
   - no id is read twice (the third);
   - every `0x03` key belongs to a block the root names, and each slot holds an op no in 1 … `head` at slot `op mod 240`
