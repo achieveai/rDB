@@ -352,7 +352,9 @@ impl Recovery {
             Phase::Barrier(decided, proofs) => self.barrier(ctx, decided, proofs, input, &mut emit),
             Phase::Proposing(decided, barrier, cas) => {
                 let input = self.lost_answer(ctx, &cas, input);
-                Self::proposing(decided, barrier, cas, &mut self.requests, input, &mut emit)
+                let phase =
+                    Self::proposing(decided, barrier, cas, &mut self.requests, input, &mut emit);
+                self.pin_at_commit(ctx, phase, &mut emit)
             }
             Phase::Committed(committed) => self.committed(ctx, committed, input, &mut emit),
         };
@@ -709,6 +711,56 @@ impl Recovery {
         }
     }
 
+    /// A `ReadOnly` commit at cutoff 0 pins its rebuild at `(0, ROOT)` and asks every required
+    /// copy to sync (M9 S0 D2 ruling, rule 1). No copy is behind an empty prefix, so R1 starts no
+    /// catch-up and no `CopyCaughtUp` would ever pin it. Every other phase, and every other
+    /// commit, passes through: at cutoff 1 or more a copy that missed the inventory starts the
+    /// new generation behind, and its catch-up pins as before.
+    fn pin_at_commit(&mut self, ctx: &StepCtx<'_>, phase: Phase, emit: &mut Emit<'_>) -> Phase {
+        let Phase::Committed(mut committed) = phase else {
+            return phase;
+        };
+        let result = &committed.result;
+        if result.mode != PartitionMode::ReadOnly || result.selected.cutoff_seq != Seq::ZERO {
+            return Phase::Committed(committed);
+        }
+        let source = result.selected.source;
+        let Some(rebuild) = committed.rebuild.as_mut() else {
+            return Phase::Committed(committed);
+        };
+        match rebuild.pin_at_commit(source) {
+            Ok((point, copies)) => {
+                self.sync(ctx, rebuild, point, copies, emit);
+                Phase::Committed(committed)
+            }
+            Err(Refused::Diverged(evidence)) => quarantine(evidence, emit),
+            Err(Refused::Ignored(reason)) => {
+                emit.ignored(reason);
+                Phase::Committed(committed)
+            }
+        }
+    }
+
+    /// Ask `copies` to make `point` durable, bounded by a fresh deadline (ruling B-R52).
+    fn sync(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        rebuild: &mut Rebuild,
+        point: Seq,
+        copies: Vec<CopyId>,
+        emit: &mut Emit<'_>,
+    ) {
+        for copy in copies {
+            emit.recovery(RecoveryEffect::SyncWalThrough {
+                copy,
+                cutoff: point,
+            });
+        }
+        let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
+        self.arm(deadline, emit);
+        rebuild.wait_until(deadline);
+    }
+
     /// After commit: a returning stale owner, the activation CAS in flight, or the rebuild. Each
     /// sync the rebuild emits is bounded by the next timer version (ruling B-R52): at its deadline
     /// the copies that have not proved the point are named, and the rebuild waits on.
@@ -772,14 +824,7 @@ impl Recovery {
         let outcome = match input {
             Input::Recovery(RecoveryEvent::CopyCaughtUp { copy, head, digest }) => rebuild
                 .caught_up(*copy, *head, *digest)
-                .map(|(cutoff, copies)| {
-                    for copy in copies {
-                        emit.recovery(RecoveryEffect::SyncWalThrough { copy, cutoff });
-                    }
-                    let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
-                    self.arm(deadline, emit);
-                    rebuild.wait_until(deadline);
-                }),
+                .map(|(cutoff, copies)| self.sync(ctx, rebuild, cutoff, copies, emit)),
             Input::Recovery(RecoveryEvent::DurableAt(proof)) => {
                 rebuild.durable(*proof).map(|barrier| {
                     let deadline = ctx.now.plus_millis(ctx.budgets.discovery_window_millis);
@@ -810,8 +855,14 @@ impl Recovery {
                     // Every unproven copy was lost, and `CopyLost` already named it.
                     emit.ignored(ReplicaIgnoreReason::StaleTimer);
                 }
-                for copy in stalled {
+                for &copy in &stalled {
                     emit.recovery(RecoveryEffect::RebuildStalled { copy });
+                }
+                // Pinned at the commit, nothing else would ever ask again: the copies were cut
+                // off when it was sent (M9 S0 D2 ruling, rule 2). A rebuild a catch-up pinned
+                // keeps B-R52 as written; the next catch-up asks.
+                if rebuild.pinned_at_commit() && !stalled.is_empty() {
+                    self.sync(ctx, rebuild, Seq::ZERO, stalled, emit);
                 }
                 Ok(())
             }

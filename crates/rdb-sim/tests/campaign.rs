@@ -836,11 +836,12 @@ fn shared() -> &'static Campaign {
     })
 }
 
-/// The authored cases (design §3.1 family 2): all four of M7V-47's, then M9 S0's. The two F1/T1
+/// The authored cases (design §3.1 family 2): all four of M7V-47's, then M9's two. The two F1/T1
 /// cases carry the corpus's only Submits that reach A1 (ruling V-R37): survivors with a prefix,
 /// a recovery, the resume hold, then the write — the shape the campaign's INV-AUTH arming rests
-/// on. M9 S0's is the only history that recovers an empty prefix, so the only one whose first
-/// publish is the kernel's start record, with no client behind it.
+/// on. M9's are the only histories that recover an empty prefix, so the only ones whose first
+/// publish is the kernel's start record, with no client behind it. D2's is also the only one that
+/// commits `ReadOnly` at cutoff 0 and cuts links before a heal.
 fn authored_cases() -> Vec<Scenario> {
     vec![
         cases::case_f1_r1_discovery_window(),
@@ -848,6 +849,7 @@ fn authored_cases() -> Vec<Scenario> {
         cases::case_f1_t1_p1_retained_status_24h(),
         cases::case_f1_t1_digest_across_recovery(),
         cases::case_m9_s0_empty_recovery_then_submit(),
+        cases::case_m9_d2_read_only_empty_heals_then_submit(),
     ]
 }
 
