@@ -391,8 +391,8 @@ fn repl<'scope, 'env>(
                     put_line(db.put_as(id, &object, value.as_bytes(), if_version), None);
                 })
             }
-            ["retry", rest @ ..] => sent.pick(rest).map(|(request, object, if_version)| {
-                put_line(db.resend(request), Some((&mut sent, object, if_version)));
+            ["retry", rest @ ..] => sent.pick(rest).map(|(request, _, _)| {
+                put_line(db.resend(request), None);
             }),
             ["get", object] => {
                 get_line(db.get(object.as_bytes()));
