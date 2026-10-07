@@ -1869,11 +1869,17 @@ impl Host {
                 PendingKind::Status,
             ),
         };
+        // The fence every sent put carries, so a log can show none goes out unfenced.
+        let expected_generation = match &kind {
+            ClientEvent::Submit(request) => request.expected_generation.map(|g| g.0),
+            _ => None,
+        };
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
             request = identity.request.0,
             call = client_name(&kind),
+            expected_generation,
             "client_call"
         );
         // A newer call under one identity replaces the older one's waiter: the older caller has
@@ -1905,6 +1911,11 @@ impl Host {
         remaining_millis: u64,
     ) -> Result<Result<TxnRequest, ApiError>, String> {
         let generation = self.adopted(partition).generation;
+        // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
+        // Refused here and never sent (lead ruling on D1, 2026-10-07).
+        if generation.0 == 0 {
+            return Ok(Err(ApiError::not_adopted(self.node, partition)));
+        }
         self.refresh_view(partition, generation)?;
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("step view missing after refresh".into());
@@ -1925,7 +1936,7 @@ impl Host {
             api_version: API_VERSION,
             identity,
             affinity: AFFINITY,
-            expected_generation: pinned_generation(view.generation()),
+            expected_generation: Some(view.generation()),
             remaining_millis,
             conditions: compiled.conditions,
             mutations: compiled.mutations,
@@ -2119,18 +2130,6 @@ fn step_l1(
     answer
 }
 
-/// The generation a compiled put pins (its `expected_generation`): the generation of the view
-/// it was compiled against, so a put compiled before a recovery is refused after it rather
-/// than applied to a history it never read. Generation 0 is no lineage — nothing adopted yet —
-/// so there is nothing to pin, and T1 answers with its own refusal (defect D1).
-const fn pinned_generation(view: Generation) -> Option<Generation> {
-    if view.0 == 0 {
-        None
-    } else {
-        Some(view)
-    }
-}
-
 const fn is_progress(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Kernel(input) if !matches!(input, KernelEvent::Recovered(_)))
 }
@@ -2229,14 +2228,52 @@ fn head(debug: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdb_core::contracts::ids::{ClientId, RequestId, TenantId};
 
-    /// Defect D1 (2026-10-07, `rdb_dev` walk 2): a put sent after `recovered gen=1` but before
-    /// node 1 adopted generation 1 was compiled against the generation-0 view and refused
-    /// `GENERATION_CHANGED`, though the caller named no generation. Before any adoption the
-    /// node has no lineage to pin.
+    /// Defect D1 (2026-10-07, `rdb_dev` walk 2) and the lead's ruling on it: a put sent before
+    /// the node adopted a generation was compiled against generation 0 and refused
+    /// `GENERATION_CHANGED`. Every sent put carries `expected_generation`, so before adoption
+    /// there is nothing to fence it with: the host refuses it, retryable, and sends nothing.
     #[test]
-    fn a_put_compiled_before_any_adoption_pins_no_generation() {
-        assert_eq!(pinned_generation(Generation(0)), None);
-        assert_eq!(pinned_generation(Generation(1)), Some(Generation(1)));
+    fn a_put_before_any_adoption_is_refused_here_and_never_sent() {
+        let dir = config_testkit::fs::temp_dir();
+        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(store, rt.handle().clone(), Arc::clone(&links));
+        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
+        let (reply, answers) = mpsc::channel();
+        let identity = RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(7),
+        };
+        host.client(Client {
+            partition: PartitionId(1),
+            call: ClientCall::Put {
+                identity,
+                object: Bytes::from_static(b"a"),
+                value: Bytes::from_static(b"v"),
+                if_version: None,
+                remaining_millis: 5_000,
+            },
+            reply,
+        })
+        .expect("no host fault");
+
+        match answers.try_recv() {
+            Ok(Answer::Error { error, request }) => {
+                assert_eq!(error, ApiError::not_adopted(NodeId(1), PartitionId(1)));
+                assert_eq!(error.name(), "UNAVAILABLE");
+                assert!(error.no_mutation, "nothing was sent, so nothing mutated");
+                assert!(request.is_none(), "no request exists for `retry` to replay");
+            }
+            other => panic!("expected a local refusal, got {other:?}"),
+        }
+        assert!(host.queue.is_empty(), "nothing reached T1");
+        assert!(host.pending.is_empty(), "no reply is awaited");
     }
 }

@@ -18,7 +18,8 @@ use bytes::Bytes;
 use config_core::ConfigStore;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::ids::{
-    ClientId, Generation, NodeId, OwnerEpoch, RequestId, RequestIdentity, Seq, TenantId,
+    ClientId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Seq,
+    TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
@@ -95,6 +96,22 @@ impl ApiError {
     #[must_use]
     pub fn invalid(detail: impl Into<String>) -> Self {
         Self::new(ErrorKind::InvalidArgument, detail)
+    }
+
+    /// A put refused before it was sent: this node has adopted no generation yet, so there is
+    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). Nothing left
+    /// the host, so nothing was mutated, and it may be retried once a generation is adopted.
+    #[must_use]
+    pub fn not_adopted(node: NodeId, partition: PartitionId) -> Self {
+        Self {
+            kind: ErrorKind::Unavailable,
+            retry: RetryRule::BoundedJitter,
+            no_mutation: true,
+            detail: format!(
+                "no generation adopted yet for partition {} on node {}; nothing was sent",
+                partition.0, node.0
+            ),
+        }
     }
 
     /// The node faulted (§4.4): the host could not serve an effect. Nothing is retried.
