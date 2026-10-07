@@ -36,8 +36,8 @@ use crate::contracts::event::{
     ModuleName, ReplyEffect, StepCtx,
 };
 use crate::contracts::ids::{
-    BatchId, BootId, ConfigVersion, CorrelationId, Generation, GrantId, LeaseId, NodeId,
-    PartitionId, RequestIdentity, Seq,
+    AffinityId, BatchId, BootId, ConfigVersion, CorrelationId, Generation, GrantId, LeaseId,
+    NodeId, PartitionId, RequestIdentity, Seq,
 };
 use crate::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use crate::contracts::protection::AdmissionState;
@@ -50,7 +50,7 @@ use crate::contracts::trace::CapabilityState;
 use crate::contracts::txn::{
     Condition, ConditionOutcome, Durability, Mutation, Outcome, TxnRequest, TxnResult,
 };
-use crate::contracts::version::ENVELOPE_VERSION;
+use crate::contracts::version::{API_VERSION, ENVELOPE_VERSION};
 use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS, PROGRESS_KEY};
 
 pub use crate::contracts::publication::{AppliedCandidate, FreezeCause};
@@ -114,6 +114,33 @@ pub enum QueueMode {
         cause: FreezeCause,
         /// The dispatched sequence still awaiting `Published`, if any (K-A-46).
         unresolved: Option<Seq>,
+    },
+}
+
+/// How long the start record may wait for its `StorageDispatch` answer before it is refused and
+/// owed again (M9 S0 rules 1 and 2). One hour, as in the probe that proved the trigger
+/// (`s0-probe.md` E4b): no client waits on it, so the deadline only bounds a check A1 never
+/// answers.
+pub const START_RECORD_DEADLINE_MILLIS: u64 = 3_600_000;
+
+/// The kernel's own start record: the empty record at seq 1 of a partition whose first
+/// activation was at cutoff 0 (M9 S0 lead ruling, Gautam chose A on 2026-10-07). Without it an
+/// empty partition never opens: L1 resumes only after a copy ACKs a record, and at head 0 there
+/// is none. Its identity is [`RequestIdentity::START_RECORD`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartRecord {
+    /// Not owed: the recovery's cutoff was not 0, or the record was sent and not refused.
+    NotOwed,
+    /// Owed. Sent once T1 is `Open`, nothing is in flight, `next_seq` is 1 and T1 holds a view
+    /// whose `authority_seq` is above `after` (rule 1).
+    Owed {
+        /// The recovery's view, or the view a refused attempt was sent under (rule 2).
+        after: u64,
+    },
+    /// Sent under the view with this `authority_seq`. A refusal makes it [`Self::Owed`] again.
+    Sent {
+        /// The view it was sent under.
+        under: u64,
     },
 }
 
@@ -360,6 +387,8 @@ pub struct TxnKernel {
     /// first asked. At most one re-ask per view held (lead ledger L-R177gf, M7A-178): see
     /// [`Self::reask`].
     reasked_under: Option<u64>,
+    /// The start record's state (M9 S0).
+    start: StartRecord,
 }
 
 impl TxnKernel {
@@ -420,6 +449,12 @@ impl TxnKernel {
     #[must_use]
     pub const fn seed_pending(&self) -> Option<&SeedPending> {
         self.seed.as_ref()
+    }
+
+    /// The start record's state (M9 S0).
+    #[must_use]
+    pub const fn start_record(&self) -> StartRecord {
+        self.start
     }
 
     /// Load the pending seed from `snapshot` if it now shows the retained prefix. Does nothing
@@ -542,6 +577,16 @@ impl TxnKernel {
                 retained_through: result.retained_status_map.retained_through,
             }),
             reasked_under: None,
+            // Rule 1: owed only when the partition activates at cutoff 0, and never sent at
+            // `Recovered` itself, so it waits for a view newer than this recovery's. Sent at
+            // `Recovered` it was refused `LEASE_EXPIRED` (`s0-probe.md` E4a).
+            start: if result.selected.cutoff_seq == Seq::ZERO {
+                StartRecord::Owed {
+                    after: view.authority_seq,
+                }
+            } else {
+                StartRecord::NotOwed
+            },
         }
     }
 
@@ -577,8 +622,67 @@ impl TxnKernel {
         self.pump(ctx)
     }
 
-    /// One §3.3 row. `Recovered` is handled by [`Transaction`], which owns instance lifetime.
+    /// One §3.3 row, then the start record if it is now due (M9 S0). `Recovered` is handled by
+    /// [`Transaction`], which owns instance lifetime.
     fn step(&mut self, ctx: &StepCtx<'_>, event: TxnEvent) -> Vec<TxnEffect> {
+        let mut out = self.row(ctx, event);
+        // Rule 2: a refusal, at any boundary, owes it again under a view newer than the one it
+        // was sent under. So a refusal never leaves the partition stuck, and it is never sent
+        // again under the view that refused it.
+        if let StartRecord::Sent { under } = self.start {
+            if out.iter().any(is_start_reply) {
+                self.start = StartRecord::Owed { after: under };
+            }
+        }
+        out.extend(self.start_if_due(ctx));
+        out
+    }
+
+    /// Rule 1: send the start record when every condition holds at once.
+    fn start_if_due(&mut self, ctx: &StepCtx<'_>) -> Vec<TxnEffect> {
+        let StartRecord::Owed { after } = self.start else {
+            return Vec::new();
+        };
+        let Some(view) = self.authority else {
+            return Vec::new();
+        };
+        if self.mode != QueueMode::Open
+            || self.inflight.is_some()
+            || self.next_seq != Seq::ZERO.next()
+            || view.authority_seq <= after
+        {
+            return Vec::new();
+        }
+        self.start = StartRecord::Sent {
+            under: view.authority_seq,
+        };
+        let req = TxnRequest {
+            api_version: API_VERSION,
+            identity: RequestIdentity::START_RECORD,
+            affinity: AffinityId(0),
+            expected_generation: None,
+            remaining_millis: START_RECORD_DEADLINE_MILLIS,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        tracing::info!(
+            partition = self.lineage.partition.0,
+            generation = self.lineage.generation.0,
+            authority_seq = view.authority_seq,
+            "t1.start_record_sent"
+        );
+        // Not through `admit`: check 10 refuses this identity to every client, and check 8
+        // refuses while L1 is paused, which is the state this record exists to end.
+        self.queue.push_front(Admitted {
+            request_digest: req.request_digest(),
+            req,
+            admitted_under: view,
+            at: ctx.now,
+        });
+        self.pump(ctx)
+    }
+
+    fn row(&mut self, ctx: &StepCtx<'_>, event: TxnEvent) -> Vec<TxnEffect> {
         match event {
             TxnEvent::Submit(req) => self.on_submit(ctx, &req),
             TxnEvent::AuthorityAnswer(answer) => self.on_answer(ctx, &answer),
@@ -751,15 +855,18 @@ impl TxnKernel {
                 },
             })
             .collect();
-        mutations.push(Write {
-            ns: Namespace::Dedup,
-            key: dedup::dedup_key(self.lineage.generation, req.affinity, req.identity),
-            value: Some(dedup::dedup_value(
-                request_digest,
-                seq,
-                self.lineage.owner_epoch,
-            )),
-        });
+        // The start record has no dedup row: no client can retry it (M9 S0 rule 3).
+        if req.identity != RequestIdentity::START_RECORD {
+            mutations.push(Write {
+                ns: Namespace::Dedup,
+                key: dedup::dedup_key(self.lineage.generation, req.affinity, req.identity),
+                value: Some(dedup::dedup_value(
+                    request_digest,
+                    seq,
+                    self.lineage.owner_epoch,
+                )),
+            });
+        }
         ReplicationEnvelope {
             header: EnvelopeHeader {
                 protocol_version: ENVELOPE_VERSION,
@@ -1115,16 +1222,19 @@ impl TxnKernel {
         // `RetainDedup`: a state write here, because no contract carries it and nothing outside
         // T1 consumes it. Read it back through `TxnKernel::dedup`. The retained result is the
         // candidate's `pending_result`, which is the result P1 published.
-        self.dedup.insert(
-            self.lineage.generation,
-            admitted.req.affinity,
-            admitted.req.identity,
-            Retained {
-                request_digest: admitted.request_digest,
-                answer: RetainedAnswer::Applied(self.pending_result(seq)),
-                applied_at_seq: seq,
-            },
-        );
+        // The start record retains nothing, as it wrote no dedup row (M9 S0 rule 3).
+        if admitted.req.identity != RequestIdentity::START_RECORD {
+            self.dedup.insert(
+                self.lineage.generation,
+                admitted.req.affinity,
+                admitted.req.identity,
+                Retained {
+                    request_digest: admitted.request_digest,
+                    answer: RetainedAnswer::Applied(self.pending_result(seq)),
+                    applied_at_seq: seq,
+                },
+            );
+        }
         self.inflight = None;
         if cause == FreezeCause::UnresolvedTransaction {
             self.mode = QueueMode::Open;
@@ -1279,6 +1389,29 @@ fn reply(identity: RequestIdentity, rejection: TxnRejection) -> TxnEffect {
         identity,
         rejection,
     }
+}
+
+/// Whether `effect` answers the kernel's own start record.
+fn is_start_reply(effect: &TxnEffect) -> bool {
+    matches!(effect, TxnEffect::Reply { identity, .. } if *identity == RequestIdentity::START_RECORD)
+}
+
+/// No client sent the start record, so none is answered for it (M9 S0 rule 5). Its refusal is
+/// recorded as ignored, with the error kind it would have carried, and logged.
+fn quiet_start(partition: PartitionId, effect: TxnEffect) -> TxnEffect {
+    let TxnEffect::Reply {
+        identity,
+        rejection,
+    } = &effect
+    else {
+        return effect;
+    };
+    if *identity != RequestIdentity::START_RECORD {
+        return effect;
+    }
+    let error = rejection.error();
+    tracing::info!(partition = partition.0, error = ?error, "t1.start_record_refused");
+    ignored(error.kind())
 }
 
 fn ignored(reason: impl Into<Ignore>) -> TxnEffect {
@@ -1448,21 +1581,26 @@ impl Transaction {
             }
             _ => {}
         }
-        match event {
-            TxnEvent::Recovered(result) => Ok(self.on_recovered(ctx, &result)),
+        let out = match event {
+            TxnEvent::Recovered(result) => self.on_recovered(ctx, &result),
             TxnEvent::Submit(req) => match self.kernels.get_mut(&key) {
-                Some(kernel) => Ok(kernel.step(ctx, TxnEvent::Submit(req))),
-                None => Ok(match admit(&req, ctx.partition, None, ctx.now) {
+                Some(kernel) => kernel.step(ctx, TxnEvent::Submit(req)),
+                None => match admit(&req, ctx.partition, None, ctx.now) {
                     Err(rejection) => vec![reply(req.identity, rejection)],
                     // `admit` without an instance always fails at check 4.
                     Ok(_) => Vec::new(),
-                }),
+                },
             },
-            other => Ok(match self.kernels.get_mut(&key) {
+            other => match self.kernels.get_mut(&key) {
                 Some(kernel) => kernel.step(ctx, other),
                 None => vec![ignored(ErrorKind::NotPrimary)],
-            }),
-        }
+            },
+        };
+        // Every start-record refusal, including one a recovery or a demotion strands.
+        Ok(out
+            .into_iter()
+            .map(|effect| quiet_start(ctx.partition, effect))
+            .collect())
     }
 
     fn on_recovered(&mut self, ctx: &StepCtx<'_>, result: &RecoveryResult) -> Vec<TxnEffect> {
@@ -1749,6 +1887,7 @@ mod tests {
             limits: Limits::default(),
             seed: None,
             reasked_under: None,
+            start: super::StartRecord::NotOwed,
         }
     }
 

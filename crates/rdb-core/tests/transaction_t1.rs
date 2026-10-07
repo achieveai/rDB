@@ -396,6 +396,20 @@ impl H {
     }
 
     fn live_with(limits: Limits) -> Self {
+        Self::live_at(limits, 0)
+    }
+
+    /// [`Self::live`], but cut at seq 1: a partition with a history, which owes no start record
+    /// (M9 S0 rule 7). For a row that pushes a newer view and is not about an empty partition. At
+    /// cut 0 that view now sends the kernel's start record (M9 S0 rule 1), which is S0's
+    /// subject and not the row's.
+    fn non_empty() -> Self {
+        Self::live_at(Limits::default(), 1)
+    }
+
+    /// Live at generation 7, cut at `cutoff`, L1 allowing. The snapshot shows the cut, so the
+    /// (empty) seed loads at once.
+    fn live_at(limits: Limits, cutoff: u64) -> Self {
         let mut h = Self {
             t1: Transaction::with_limits(limits),
             snap: Snap::default(),
@@ -403,8 +417,9 @@ impl H {
             node: NODE_A,
             boot: BootId(1),
         };
+        h.snap.at = Seq(cutoff);
         assert_eq!(
-            h.step(recovered(GEN, 0, NODE_A, PartitionMode::Active)),
+            h.step(recovered(GEN, cutoff, NODE_A, PartitionMode::Active)),
             vec![]
         );
         assert_eq!(h.step(admission(true, None)), vec![]);
@@ -1107,7 +1122,7 @@ fn a_key_without_a_scope_prefix_is_invalid_not_a_pass() {
 
 #[retcd_test]
 fn check_six_denies_past_the_horizon_with_the_views_reason() {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let mut fenced = view(GEN, 2, 20);
     fenced.past_horizon = DenyReason::GenerationChanged;
     assert_eq!(
@@ -1116,7 +1131,7 @@ fn check_six_denies_past_the_horizon_with_the_views_reason() {
     );
     h.now = 20;
     let _ = h.admit(put(1, b"k", b"v"));
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(fenced))));
     h.now = 21;
     assert_eq!(
@@ -1170,7 +1185,7 @@ fn fence_view(reason: DenyReason) -> Event {
 /// Live, holding the fence view for `reason`, and nothing else from the fence. The `Freeze` that
 /// travels with the view is M7A-138's; holding it back is what leaves check 6 alone to decide.
 fn behind_fence_view(reason: DenyReason) -> H {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(fence_view(reason)), vec![]);
     h
 }
@@ -1672,7 +1687,7 @@ fn m7a_80_seq_reservation_discardable_on_dispatch_deny() {
 
 #[retcd_test]
 fn only_our_answer_at_a_fresh_enough_authority_seq_is_heard() {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
         GEN,
         5,
@@ -1931,7 +1946,7 @@ fn a_retired_generation_is_not_reloaded_by_a_later_seed() {
 /// `Freeze{Expired}`. Returns the harness, A's correlation, the freeze's effects, and
 /// `(next_seq, prev_digest)` from before A.
 fn frozen_while_awaiting() -> (H, CorrelationId, Vec<EffectKind>, (Seq, Digest)) {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push_view(2)), vec![]);
     let before = (h.k().next_seq(), h.k().prev_digest());
     let correlation = h.admit(put(1, b"a", b"1"));
@@ -3443,7 +3458,7 @@ fn at_id_counter_exhaustion_a_new_identity_is_overloaded_and_a_retry_replays() {
 /// waited for good. The near miss: one id left still re-asks.
 #[retcd_test]
 fn at_id_counter_exhaustion_an_outstanding_check_is_refused_not_wedged() {
-    let mut h = H::live_with(ids_spent_after(2));
+    let mut h = H::live_at(ids_spent_after(2), 1);
     let c1 = h.admit(put(1, b"a", b"1"));
     assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
     let _ = h.step(push_view(2));
@@ -3460,7 +3475,7 @@ fn at_id_counter_exhaustion_an_outstanding_check_is_refused_not_wedged() {
         vec![(1, ErrorKind::Overloaded), (2, ErrorKind::Overloaded)]
     );
     assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
-    assert_eq!(h.k().next_seq(), Seq(1), "nothing was dispatched");
+    assert_eq!(h.k().next_seq(), Seq(2), "nothing was dispatched");
 }
 
 /// A-R73 item 3, with tester-t1's attack_c1. A re-ask never outlives the request's deadline:
@@ -3468,7 +3483,7 @@ fn at_id_counter_exhaustion_an_outstanding_check_is_refused_not_wedged() {
 /// (A-R71, hunt_19). The near miss: one millisecond earlier it is asked again.
 #[retcd_test]
 fn a_stale_answer_past_the_deadline_refuses_rather_than_re_asks() {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let c1 = h.admit(put(1, b"a", b"1"));
     let _ = h.step(push_view(2));
     h.now = 10 + 1_000 - 1;
@@ -4548,7 +4563,7 @@ fn push(view: AuthorityView) -> Event {
 /// effect is the dispatch check), and one tick later the next is refused in the same step with
 /// `past_horizon`'s code and nothing sent to A1.
 fn assert_boundary_at(view: AuthorityView, what: &str) {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(view)), vec![], "{what}: adopted");
     assert_boundary_in(&mut h, view, what);
 }
@@ -4591,7 +4606,7 @@ fn m7a_144_admission_boundary_at_valid_through_tick() {
         (Tick(2_000), DenyReason::ClockSampleStale),
         "M7A-143's view"
     );
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(view)), vec![]);
     h.now = 2_000;
     let _ = h.admit(put(1, b"a", b"1"));
@@ -4641,7 +4656,7 @@ fn m7a_146_admission_horizon_follows_the_sample() {
     assert_boundary_at(wide, "ε 90");
     // One T1 through the move: it holds ε 20's view, adopts ε 90's (a sample does not bump
     // `authority_seq`, so an equal seq must replace), and its boundary moves to 2809.
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(narrow)), vec![]);
     assert_eq!(
         h.step(push(wide)),
@@ -4685,7 +4700,7 @@ fn m7a_147_stale_authority_view_never_replaces_newer() {
     let older = view(GEN, 4, u64::MAX);
     let stale = vec![ignored(AuthorityIgnoreReason::StaleAuthorityView)];
 
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(newer)), vec![], "T1");
     assert_eq!(h.step(push(older)), stale, "T1");
     assert_eq!(h.k().authority(), Some(&newer), "T1 keeps seq 5");
