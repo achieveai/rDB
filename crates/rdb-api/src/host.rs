@@ -2557,6 +2557,7 @@ fn head(debug: &str) -> &str {
 mod tests {
     use super::*;
     use rdb_core::contracts::ids::{ClientId, RequestId, TenantId};
+    use rdb_core::contracts::txn::{Durability, Outcome};
 
     /// Defect D1 (2026-10-07, `rdb_dev` walk 2) and the lead's ruling on it: a put sent before
     /// the node adopted a generation was compiled against generation 0 and refused
@@ -2725,65 +2726,29 @@ mod tests {
     #[test]
     fn an_active_commit_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control =
-            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
-        let clock = HostClock::start();
-        let mut nodes = Vec::new();
-        for n in 1..=3u32 {
-            let engine = RocksEngine::open(dir.path().join(n.to_string())).expect("open engine");
-            let (tx, rx) = mpsc::channel();
-            links.register(NodeId(n), tx.clone());
-            let mut host = Host::new(
-                NodeId(n),
-                engine,
-                Arc::clone(&links),
-                Arc::clone(&control),
-                clock,
-            );
+        let mut trio = Trio::new(dir.path(), |host| {
             host.budgets.discovery_window_millis = 20;
             host.rebuild_pin_wait_millis = 50;
-            nodes.push((host, tx, rx));
-        }
-        let owner = nodes[0].1.clone();
-        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
-            owner.send(msg).map_err(|_| NodeStopped(NodeId(1)))
-        }))
-        .expect("bootstrap");
+        });
+        trio.bootstrap();
 
-        // Drive all three until node 1 has landed generation 1, then for 4x the watch's wait.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut quiet_until = None;
-        loop {
-            for (host, _, rx) in &mut nodes {
-                host.run_due();
-                host.drain();
-                while let Ok(msg) = rx.try_recv() {
-                    host.handle(msg);
-                }
-                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
-            }
-            let status = nodes[0].0.status(PartitionId(1));
+        // Until node 1 has landed generation 1, then for 4x the watch's wait.
+        let quiet_until = trio.until("generation 1 landed on node 1", |trio| {
+            let status = trio.status(0);
             assert_eq!(status.stalled, None, "a healthy start reported a stall");
-            if status.recovered == Some(Generation(1)) && quiet_until.is_none() {
+            (status.recovered == Some(Generation(1))).then(|| {
                 assert_eq!(status.recovery.as_deref(), Some("Committed"));
-                quiet_until = Some(Instant::now() + Duration::from_millis(200));
-            }
-            if quiet_until.is_some_and(|until| Instant::now() >= until) {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "generation 1 not landed within 5 s: {status:?}"
+                Instant::now() + Duration::from_millis(200)
+            })
+        });
+        trio.until("the watch's wait passed", |trio| {
+            assert_eq!(
+                trio.status(0).stalled,
+                None,
+                "a healthy start reported a stall"
             );
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            (Instant::now() >= quiet_until).then_some(())
+        });
     }
 
     /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild
@@ -2881,72 +2846,28 @@ mod tests {
     #[test]
     fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
         let dir = config_testkit::fs::temp_dir();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let links = Links::new();
-        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let control =
-            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
-        let clock = HostClock::start();
-        let mut nodes = Vec::new();
-        for n in 1..=3u32 {
-            let engine = RocksEngine::open(dir.path().join(n.to_string())).expect("open engine");
-            let (tx, rx) = mpsc::channel();
-            links.register(NodeId(n), tx.clone());
-            let mut host = Host::new(
-                NodeId(n),
-                engine,
-                Arc::clone(&links),
-                Arc::clone(&control),
-                clock,
-            );
-            host.budgets.discovery_window_millis = 20;
-            nodes.push((host, tx, rx));
-        }
+        let mut trio = Trio::new(dir.path(), |host| host.budgets.discovery_window_millis = 20);
         let partition = PartitionId(1);
-        for (host, _, _) in &nodes {
+        for (host, _, _) in &trio.nodes {
             assert_eq!(
                 host.status(partition).holds,
                 None,
                 "nothing held before bootstrap"
             );
         }
-        nodes[1].0.next_flush = Tick(u64::MAX);
-        let owner = nodes[0].1.clone();
-        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
-            owner.send(msg).map_err(|_| NodeStopped(NodeId(1)))
-        }))
-        .expect("bootstrap");
+        trio.nodes[1].0.next_flush = Tick(u64::MAX);
+        trio.bootstrap();
 
         // Until node 2's receiver has taken the start record at seq 1.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let head = loop {
-            for (host, _, rx) in &mut nodes {
-                host.run_due();
-                host.drain();
-                while let Ok(msg) = rx.try_recv() {
-                    host.handle(msg);
-                }
-                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
-            }
-            let head = nodes[1]
+        let head = trio.until("node 2's receiver took a record", |trio| {
+            let head = trio.nodes[1]
                 .0
                 .replication
                 .receiver(NodeId(2), partition)
                 .map_or(0, |receiver| receiver.buffered_applied_seq().0);
-            if head >= 1 {
-                break head;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "node 2's receiver took no record within 5 s"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let secondary = &nodes[1].0;
+            (head >= 1).then_some(head)
+        });
+        let secondary = &trio.nodes[1].0;
         let status = secondary.status(partition);
         assert_eq!(status.role, "secondary");
         let held = status
@@ -2974,5 +2895,328 @@ mod tests {
                 .0,
             "the head is the record the store holds at the receiver's generation"
         );
+    }
+
+    /// T1 (the tester's write-path row; walks A9, B2, C2, D1, D3 and I1): one request id's
+    /// life, over three real hosts. A put publishes at seq 2, after the start record. The same
+    /// request sent again is answered seq 2 and appends nothing. A put under a stale version is
+    /// refused, provably mutates nothing, and takes no seq. The same id with another value is
+    /// `REQUEST_ID_REUSE` and leaves the object as it was. Status resolves the id to seq 2.
+    #[test]
+    fn one_request_id_publishes_once_and_its_misuses_are_refused() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+
+        let first = match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, request } => {
+                assert_eq!(
+                    (
+                        result.generation,
+                        result.seq,
+                        result.outcome,
+                        result.durability
+                    ),
+                    (
+                        Generation(1),
+                        Seq(2),
+                        Outcome::Published,
+                        Durability::BufferedOnTwo
+                    )
+                );
+                request
+            }
+            other => panic!("put a=1: {other:?}"),
+        };
+        let head = trio.head();
+        assert_eq!(head, Some(2));
+
+        match trio.ask(ClientCall::Resend { request: first }) {
+            Answer::Txn { result, .. } => {
+                assert_eq!(result.seq, Seq(2), "a resend is the same transaction");
+            }
+            other => panic!("resend: {other:?}"),
+        }
+        assert_eq!(trio.head(), head, "a resend appends nothing");
+
+        match trio.ask(put(2, b"a", b"x", Some(1))) {
+            Answer::Error { error, .. } => {
+                assert_eq!(error.name(), "CONDITION_FAILED");
+                assert!(error.no_mutation, "a failed condition mutated nothing");
+            }
+            other => panic!("put a=x at stale version 1: {other:?}"),
+        }
+        match trio.ask(put(3, b"b", b"2", None)) {
+            Answer::Txn { result, .. } => {
+                assert_eq!(result.seq, Seq(3), "the refused put took no seq");
+            }
+            other => panic!("put b=2: {other:?}"),
+        }
+
+        match trio.ask(put(1, b"a", b"other", None)) {
+            Answer::Error { error, .. } => assert_eq!(error.name(), "REQUEST_ID_REUSE"),
+            other => panic!("request 1 with another value: {other:?}"),
+        }
+        match trio.ask(get(4, b"a")) {
+            Answer::Read { value, .. } => {
+                assert_eq!(value, Some((2, Bytes::from_static(b"1"))), "a is unchanged");
+            }
+            other => panic!("get a: {other:?}"),
+        }
+
+        match trio.ask(ClientCall::Status {
+            identity: identity(1),
+            generation: None,
+        }) {
+            Answer::Status(TxnStatus::Resolved(result)) => {
+                assert_eq!((result.generation, result.seq), (Generation(1), Seq(2)));
+            }
+            other => panic!("status of request 1: {other:?}"),
+        }
+    }
+
+    /// T2 (the tester's barrier-read row; walks E1, E2 and E3): with both secondaries cut off,
+    /// node 1 applies a put that no copy can acknowledge. A read at the barrier waits for it,
+    /// and never answers the old value. A read of the previous view answers the old value at
+    /// once. When the links heal, the put publishes and the waiting read answers the new value.
+    #[test]
+    fn a_read_waits_at_the_barrier_while_the_previous_view_answers_at_once() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"old", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=old: {other:?}"),
+        }
+
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let put_new = trio.call(put(2, b"a", b"new", None));
+        trio.until("node 1 applied a=new", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+        let barrier = trio.call(get(3, b"a"));
+        trio.until("node 1 took the read", |trio| {
+            trio.nodes[0]
+                .0
+                .pending
+                .contains_key(&identity(3))
+                .then_some(())
+        });
+        // The next round's drain runs the read through P1, which answers or parks it there.
+        trio.step();
+        assert!(barrier.try_recv().is_err(), "the read waits at the barrier");
+        assert!(put_new.try_recv().is_err(), "no copy acknowledged the put");
+
+        match trio.ask(ClientCall::GetPrevious {
+            identity: identity(4),
+            object: Bytes::from_static(b"a"),
+        }) {
+            Answer::Read {
+                outcome,
+                value,
+                generation,
+                at,
+            } => assert_eq!(
+                (outcome, value, generation, at),
+                (
+                    ReadServiceOutcome::Served,
+                    Some((2, Bytes::from_static(b"old"))),
+                    Generation(1),
+                    Seq(2)
+                )
+            ),
+            other => panic!("get a --previous: {other:?}"),
+        }
+        assert!(barrier.try_recv().is_err(), "the read still waits");
+
+        trio.links.heal_all();
+        match trio.answer(&put_new) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("put a=new after the heal: {other:?}"),
+        }
+        match trio.answer(&barrier) {
+            Answer::Read {
+                outcome, value, at, ..
+            } => assert_eq!(
+                (outcome, value, at),
+                (
+                    ReadServiceOutcome::WaitedAtBarrier,
+                    Some((3, Bytes::from_static(b"new"))),
+                    Seq(3)
+                )
+            ),
+            other => panic!("the waiting read: {other:?}"),
+        }
+    }
+
+    fn identity(request: u64) -> RequestIdentity {
+        RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(1),
+            request: RequestId(request),
+        }
+    }
+
+    fn put(
+        request: u64,
+        object: &'static [u8],
+        value: &'static [u8],
+        if_version: Option<u64>,
+    ) -> ClientCall {
+        ClientCall::Put {
+            identity: identity(request),
+            object: Bytes::from_static(object),
+            value: Bytes::from_static(value),
+            if_version,
+            remaining_millis: 5_000,
+        }
+    }
+
+    fn get(request: u64, object: &'static [u8]) -> ClientCall {
+        ClientCall::Get {
+            identity: identity(request),
+            object: Bytes::from_static(object),
+        }
+    }
+
+    /// Three hosts on this thread, stepped by hand, for the rows that need a whole partition.
+    /// Fields drop in order: the hosts close before the runtime their control calls run on.
+    struct Trio {
+        nodes: Vec<(Host, Sender<Msg>, Receiver<Msg>)>,
+        links: Arc<Links>,
+        store: Arc<dyn config_core::ConfigStore>,
+        clock: HostClock,
+        rt: tokio::runtime::Runtime,
+    }
+
+    impl Trio {
+        /// Every row gives up after this long; a healthy one takes well under a second.
+        const PATIENCE: Duration = Duration::from_secs(5);
+
+        /// Three hosts on `dir`, each tuned by `tune`, not yet bootstrapped.
+        fn new(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> Self {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let links = Links::new();
+            let store: Arc<dyn config_core::ConfigStore> =
+                Arc::new(config_testkit::MemStore::new());
+            let control =
+                ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
+            let clock = HostClock::start();
+            let nodes = (1..=3u32)
+                .map(|n| {
+                    let engine = RocksEngine::open(dir.join(n.to_string())).expect("open engine");
+                    let (tx, rx) = mpsc::channel();
+                    links.register(NodeId(n), tx.clone());
+                    let mut host = Host::new(
+                        NodeId(n),
+                        engine,
+                        Arc::clone(&links),
+                        Arc::clone(&control),
+                        clock,
+                    );
+                    tune(&mut host);
+                    (host, tx, rx)
+                })
+                .collect();
+            Self {
+                nodes,
+                links,
+                store,
+                clock,
+                rt,
+            }
+        }
+
+        /// The spec's budgets, shortened so a start reaches `ready` in well under a second:
+        /// the discovery window and L1's resume hold are most of the 7.6 s a walk waits.
+        fn fast(host: &mut Host) {
+            host.budgets.discovery_window_millis = 20;
+            host.budgets.resume_hold_millis = 50;
+        }
+
+        fn bootstrap(&self) {
+            let owner = self.nodes[0].1.clone();
+            self.rt
+                .block_on(crate::admin::bootstrap(
+                    &self.store,
+                    self.clock.now(),
+                    |msg| owner.send(msg).map_err(|_| NodeStopped(NodeId(1))),
+                ))
+                .expect("bootstrap");
+        }
+
+        /// One round: each host runs its due work and its queue, then takes its mail.
+        fn step(&mut self) {
+            for (host, _, rx) in &mut self.nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+        }
+
+        /// Step until `done` answers, or fail naming `what` after [`Self::PATIENCE`].
+        fn until<T>(&mut self, what: &str, mut done: impl FnMut(&Self) -> Option<T>) -> T {
+            let deadline = Instant::now() + Self::PATIENCE;
+            loop {
+                self.step();
+                if let Some(found) = done(self) {
+                    return found;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "not within {:?}: {what}",
+                    Self::PATIENCE
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        fn status(&self, node: usize) -> NodeStatus {
+            self.nodes[node].0.status(PartitionId(1))
+        }
+
+        fn ready(&mut self) {
+            self.until("node 1 admits writes", |trio| {
+                (trio.status(0).admits == Some(true)).then_some(())
+            });
+        }
+
+        /// The head node 1 has applied.
+        fn head(&self) -> Option<u64> {
+            self.status(0).holds.map(|held| held.applied)
+        }
+
+        /// Send `call` to node 1, the owner, as `Db` does.
+        fn call(&self, call: ClientCall) -> Receiver<Answer> {
+            let (reply, answer) = mpsc::channel();
+            self.nodes[0]
+                .1
+                .send(Msg::Client(Client {
+                    partition: PartitionId(1),
+                    call,
+                    reply,
+                }))
+                .expect("node 1's mailbox");
+            answer
+        }
+
+        fn answer(&mut self, answer: &Receiver<Answer>) -> Answer {
+            self.until("an answer", |_| answer.try_recv().ok())
+        }
+
+        fn ask(&mut self, call: ClientCall) -> Answer {
+            let answer = self.call(call);
+            self.answer(&answer)
+        }
     }
 }
