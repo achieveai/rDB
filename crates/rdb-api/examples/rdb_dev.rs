@@ -9,11 +9,16 @@
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
+//! put& <object> <value> [--if-version N]  the same put in the background: the prompt returns
+//!                                         at once and `bg <object>: <answer>` prints when it
+//!                                         lands; not remembered for `retry`
 //! retry [<request>]                       send a put's request again, unchanged: the latest
 //!                                         put's, or the one this session sent as <request>
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered
 //! get <object>                            read at the publication barrier
+//! get <object> --previous                 read the previously published view at once, never
+//!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
 //! nodes                                   each node's view of partition 1
 //! control                                 the partitions/ and grants/ records in rEtcd
@@ -174,7 +179,7 @@ fn run(args: &Args) -> ExitCode {
     let stop = AtomicBool::new(false);
     let code = std::thread::scope(|scope| {
         scope.spawn(|| poll(&db, &progress, &stop));
-        let code = repl(args, &db, &rt, &*store, &progress);
+        let code = repl(scope, args, &db, &rt, &*store, &progress);
         stop.store(true, Ordering::Relaxed);
         code
     });
@@ -317,10 +322,12 @@ fn holds_part(node: &NodeStatus) -> String {
     )
 }
 
-/// One command per line; the exit code is 1 when any command failed to parse.
-fn repl(
+/// One command per line; the exit code is 1 when any command failed to parse. A background
+/// put runs on `scope`, so the run waits for it before shutting down.
+fn repl<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
     args: &Args,
-    db: &Db,
+    db: &'env Db,
     rt: &tokio::runtime::Runtime,
     store: &dyn ConfigStore,
     progress: &Progress,
@@ -361,6 +368,14 @@ fn repl(
                 }
                 Err(e) => Err(e),
             },
+            ["put&", object, value, rest @ ..] => parse_if_version(rest).map(|if_version| {
+                let (object, value) = ((*object).to_owned(), (*value).to_owned());
+                say(&format!("bg {object}: sent"));
+                scope.spawn(move || {
+                    let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
+                    say(&format!("bg {object}: {}", put_text(&answer)));
+                });
+            }),
             ["retry", rest @ .., "--payload", value] => {
                 sent.pick(rest).map(|(request, object, if_version)| {
                     let id = request.identity.request;
@@ -371,7 +386,11 @@ fn repl(
                 put_line(db.resend(request), Some((&mut sent, object, if_version)));
             }),
             ["get", object] => {
-                get_line(db, object.as_bytes());
+                get_line(db.get(object.as_bytes()));
+                Ok(())
+            }
+            ["get", object, "--previous"] => {
+                get_line(db.get_previous(object.as_bytes()));
                 Ok(())
             }
             ["status", request, rest @ ..] => status_line(db, request, rest),
@@ -505,32 +524,37 @@ fn put_line(
             sent.record(request, object, if_version);
         }
     };
+    say(&put_text(&answer));
     match answer {
-        Ok(ok) => {
-            say(&format!(
-                "ok p=1 gen={} seq={} {:?} request={}",
-                ok.generation.0, ok.seq.0, ok.durability, ok.request.0
-            ));
-            remember(Some(*ok.sent));
-        }
+        Ok(ok) => remember(Some(*ok.sent)),
+        Err(PutError { request, .. }) => remember(request.map(|request| *request)),
+    }
+}
+
+/// A put's answer as one line.
+fn put_text(answer: &Result<rdb_api::PutOk, PutError>) -> String {
+    match answer {
+        Ok(ok) => format!(
+            "ok p=1 gen={} seq={} {:?} request={}",
+            ok.generation.0, ok.seq.0, ok.durability, ok.request.0
+        ),
         Err(PutError { error, request }) => {
             let id = request
                 .as_ref()
                 .map_or_else(|| "-".to_owned(), |r| r.identity.request.0.to_string());
-            say(&format!(
+            format!(
                 "err {} retry={:?} no_mutation={} request={id} ({})",
                 error.name(),
                 error.retry,
                 error.no_mutation,
                 error.detail
-            ));
-            remember(request.map(|request| *request));
+            )
         }
     }
 }
 
-fn get_line(db: &Db, object: &[u8]) {
-    match db.get(object) {
+fn get_line(answer: Result<rdb_api::GetOk, rdb_api::ApiError>) {
+    match answer {
         Ok(ok) => match ok.value {
             Some((version, bytes)) => say(&format!(
                 "value={} version={version} gen={} at={}{}",

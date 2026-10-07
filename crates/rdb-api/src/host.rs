@@ -45,7 +45,7 @@ use rdb_core::contracts::ids::{
     SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::membership::CopyId;
-use rdb_core::contracts::publication::PublicationEffect;
+use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
 use rdb_core::contracts::recovery::{
     DurableProof, LineageAnchor, RecoveryEffect, RecoveryEvent, RecoveryPlan, RecoveryResult,
     SurvivorInventory,
@@ -257,6 +257,14 @@ pub enum ClientCall {
     },
     /// Read object `object` at the publication barrier.
     Get {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The object id.
+        object: Bytes,
+    },
+    /// Read object `object` from the previously published view, at once (P1's
+    /// `ReadPrevious`): it never waits for a write in flight.
+    GetPrevious {
         /// The identity minted for it.
         identity: RequestIdentity,
         /// The object id.
@@ -479,6 +487,7 @@ struct Pending {
 enum PendingKind {
     Txn(TxnRequest),
     Read(RootKey),
+    Previous(RootKey),
     Status,
 }
 
@@ -786,7 +795,7 @@ impl Host {
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
-                PendingKind::Read(_) | PendingKind::Status => None,
+                PendingKind::Read(_) | PendingKind::Previous(_) | PendingKind::Status => None,
             };
             tracing::info!(
                 node = self.node.0,
@@ -1297,9 +1306,11 @@ impl Host {
             KernelEffect::Recovered(result) => self.recovered(result, site)?,
             KernelEffect::Publication(effect) => {
                 return match effect {
+                    PublicationEffect::Snapshot { identity, handle } => {
+                        self.previous_answer(*identity, *handle)
+                    }
                     PublicationEffect::Status(_)
                     | PublicationEffect::Mode { .. }
-                    | PublicationEffect::Snapshot { .. }
                     | PublicationEffect::Quarantined { .. } => {
                         tracing::info!(node, ?effect, "publication_fact");
                         Ok(())
@@ -1998,7 +2009,7 @@ impl Host {
             )? {
                 Ok(request) => (
                     identity,
-                    ClientEvent::Submit(request.clone()),
+                    EventKind::Client(ClientEvent::Submit(request.clone())),
                     PendingKind::Txn(request),
                 ),
                 Err(error) => {
@@ -2011,42 +2022,54 @@ impl Host {
             },
             ClientCall::Resend { request } => (
                 request.identity,
-                ClientEvent::Submit(request.clone()),
+                EventKind::Client(ClientEvent::Submit(request.clone())),
                 PendingKind::Txn(request),
             ),
             ClientCall::Get { identity, object } => {
                 let root = root_key(identity.tenant, AFFINITY, &object);
                 (
                     identity,
-                    ClientEvent::Read {
+                    EventKind::Client(ClientEvent::Read {
                         identity,
                         key: root.to_bytes(),
-                    },
+                    }),
                     PendingKind::Read(root),
                 )
             }
+            ClientCall::GetPrevious { identity, object } => (
+                identity,
+                EventKind::Kernel(KernelEvent::Publication(PublicationEvent::ReadPrevious {
+                    identity,
+                })),
+                PendingKind::Previous(root_key(identity.tenant, AFFINITY, &object)),
+            ),
             ClientCall::Status {
                 identity,
                 generation,
             } => (
                 identity,
-                ClientEvent::Status {
+                EventKind::Client(ClientEvent::Status {
                     identity,
                     generation,
-                },
+                }),
                 PendingKind::Status,
             ),
         };
         // The fence every sent put carries, so a log can show none goes out unfenced.
         let expected_generation = match &kind {
-            ClientEvent::Submit(request) => request.expected_generation.map(|g| g.0),
+            EventKind::Client(ClientEvent::Submit(request)) => {
+                request.expected_generation.map(|g| g.0)
+            }
             _ => None,
         };
         tracing::info!(
             node = self.node.0,
             partition = partition.0,
             request = identity.request.0,
-            call = client_name(&kind),
+            call = match &kind {
+                EventKind::Client(event) => client_name(event),
+                _ => "read_previous",
+            },
             expected_generation,
             "client_call"
         );
@@ -2063,7 +2086,7 @@ impl Host {
             partition,
             correlation: CorrelationId(identity.request.0),
         };
-        self.push(site, EventKind::Client(kind), false, None);
+        self.push(site, kind, false, None);
         Ok(())
     }
 
@@ -2155,6 +2178,52 @@ impl Host {
         Ok(())
     }
 
+    /// P1's answer to a `ReadPrevious`: the kept view it handed out, read for the asked object,
+    /// or why there is none. A handle storage never bound is a host fault.
+    fn previous_answer(
+        &mut self,
+        identity: RequestIdentity,
+        handle: Result<SnapshotHandle, ErrorKind>,
+    ) -> Result<(), String> {
+        tracing::info!(
+            node = self.node.0,
+            request = identity.request.0,
+            ?handle,
+            "read_previous_answer"
+        );
+        let Some(pending) = self.pending.remove(&identity) else {
+            tracing::debug!(
+                node = self.node.0,
+                request = identity.request.0,
+                "reply_unclaimed"
+            );
+            return Ok(());
+        };
+        let PendingKind::Previous(root) = pending.kind else {
+            return Err(format!(
+                "a previous-view answer for request {} that asked {:?}",
+                identity.request.0, pending.kind
+            ));
+        };
+        let answer = match handle {
+            Err(kind) => Answer::Read {
+                outcome: ReadServiceOutcome::Rejected(kind),
+                value: None,
+                generation: Generation(0),
+                at: Seq::ZERO,
+            },
+            Ok(handle) => {
+                let view = self
+                    .bound
+                    .get(&handle)
+                    .ok_or_else(|| format!("previous view {} is not bound", handle.0))?;
+                document_answer(view, &root, ReadServiceOutcome::Served)
+            }
+        };
+        let _ = pending.reply.send(answer);
+        Ok(())
+    }
+
     /// §4.2: the bytes come from the step view P1 just answered from, re-checked against the
     /// reply's version and digest. A mismatch is a host fault, never a retry.
     fn read_answer(
@@ -2187,28 +2256,10 @@ impl Host {
                 "read reply v{version} does not match the step view it came from"
             ));
         }
-        let document = match rdb_value::read(view, root) {
-            Ok(Some(document)) => document,
-            Ok(None) => return Err("read reply names a value the step view does not decode".into()),
-            Err(error) => {
-                return Ok(Answer::Error {
-                    error: compile_error(&error),
-                    request: None,
-                });
-            }
-        };
-        let Value::Bytes(bytes) = document.value else {
-            return Ok(Answer::Error {
-                error: ApiError::invalid("the object is not a byte string (S4a reads documents)"),
-                request: None,
-            });
-        };
-        Ok(Answer::Read {
-            outcome,
-            value: Some((document.version, Bytes::from(bytes))),
-            generation,
-            at,
-        })
+        if matches!(rdb_value::read(view, root), Ok(None)) {
+            return Err("read reply names a value the step view does not decode".into());
+        }
+        Ok(document_answer(view, root, outcome))
     }
 
     // ------------------------------------------------------------------ inspection
@@ -2372,6 +2423,40 @@ fn compile_error(error: &ValueError) -> ApiError {
 
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// A byte-string read of `root` from `view`: absent, its version and bytes, or why not.
+fn document_answer(view: &RocksSnapshot, root: &RootKey, outcome: ReadServiceOutcome) -> Answer {
+    let (generation, at) = (view.generation(), view.at());
+    let document = match rdb_value::read(view, root) {
+        Ok(Some(document)) => document,
+        Ok(None) => {
+            return Answer::Read {
+                outcome,
+                value: None,
+                generation,
+                at,
+            };
+        }
+        Err(error) => {
+            return Answer::Error {
+                error: compile_error(&error),
+                request: None,
+            };
+        }
+    };
+    let Value::Bytes(bytes) = document.value else {
+        return Answer::Error {
+            error: ApiError::invalid("the object is not a byte string (S4a reads documents)"),
+            request: None,
+        };
+    };
+    Answer::Read {
+        outcome,
+        value: Some((document.version, Bytes::from(bytes))),
+        generation,
+        at,
+    }
 }
 
 const fn client_name(event: &ClientEvent) -> &'static str {

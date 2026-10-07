@@ -436,11 +436,27 @@ impl Db {
     ///
     /// [`ApiError`]: a §5.4 refusal, or `UNAVAILABLE` when no answer came in time.
     pub fn get(&self, object: &[u8]) -> Result<GetOk, ApiError> {
-        let identity = self.identity();
-        let call = ClientCall::Get {
-            identity,
+        self.read(ClientCall::Get {
+            identity: self.identity(),
             object: Bytes::copy_from_slice(object),
-        };
+        })
+    }
+
+    /// Read `object` from the previously published view, at once: it never waits for a write
+    /// in flight, so it can answer an older value than [`Db::get`] would.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError`]: P1's refusal (`UNAVAILABLE` before any view is kept), or `UNAVAILABLE`
+    /// when no answer came in time.
+    pub fn get_previous(&self, object: &[u8]) -> Result<GetOk, ApiError> {
+        self.read(ClientCall::GetPrevious {
+            identity: self.identity(),
+            object: Bytes::copy_from_slice(object),
+        })
+    }
+
+    fn read(&self, call: ClientCall) -> Result<GetOk, ApiError> {
         match self.call(call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
