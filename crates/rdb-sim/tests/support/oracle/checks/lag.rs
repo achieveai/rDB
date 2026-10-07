@@ -24,6 +24,14 @@
 //! entry ladder, and it is checkable because the trace declares every `oldest_unsafe_age_ms` it
 //! evaluated.
 //!
+//! Clause (a)'s exactness has one exemption, the kernel's **start record** (M9 S0, lead ruling
+//! "S0 start record", Gautam chose A on 2026-10-07). An empty partition pauses at barrier 0, and
+//! every copy is durable at 0 from the start, so barrier 0 cannot gate anything: L1 resumes only
+//! once a copy acknowledges a record, and the start record at seq 1 is that record. So copies
+//! durable at exactly seq 1 past a barrier of 0 do not overshoot it **when the record at seq 1 is
+//! one no client was admitted for**. Any other overshoot, and seq 1 carrying an admitted write,
+//! still reports.
+//!
 //! The clause "no publish while paused" was **withdrawn** and must not come back: an admitted,
 //! applied transaction has to be resolved rather than abandoned (spec §5.3), and publication is
 //! P1's independent decision. Row M7V-40 is the regression guard, and it asserts a clean verdict
@@ -241,15 +249,34 @@ fn resume_is_legal(
     Ok(())
 }
 
-/// Whether `node`'s recorded durable prefix runs past `barrier`.
+/// Whether `node`'s recorded durable prefix runs past `barrier`, the start record excepted.
 fn overshoots(
     part: &crate::support::oracle::model::PartitionModel,
     node: NodeId,
     barrier: Seq,
 ) -> bool {
-    part.durable
-        .get(&node)
-        .is_some_and(|(_, durable_seq)| *durable_seq > barrier)
+    part.durable.get(&node).is_some_and(|(_, durable_seq)| {
+        *durable_seq > barrier && !start_record_only(part, barrier, *durable_seq)
+    })
+}
+
+/// Whether the only record past `barrier` is an empty partition's start record: the barrier is
+/// 0, the durable prefix ends at seq 1, and the newest apply at seq 1 belongs to a correlation no
+/// client was admitted for (M9 S0 rules 1 and 3; see the module docs).
+fn start_record_only(
+    part: &crate::support::oracle::model::PartitionModel,
+    barrier: Seq,
+    durable_seq: Seq,
+) -> bool {
+    let first = Seq(1);
+    barrier == Seq(0)
+        && durable_seq == first
+        && part
+            .applies
+            .iter()
+            .rev()
+            .find(|((_, seq), _)| *seq == first)
+            .is_some_and(|(_, apply)| !part.admissions.contains_key(&apply.correlation))
 }
 
 /// Node ids, for the signature's detail line.
