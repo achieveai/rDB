@@ -5,7 +5,8 @@
 //!                                           [--hold 1-2,1-3]
 //! ```
 //!
-//! Commands are read from `--script` or stdin, one per line (`#` starts a comment):
+//! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
+//! on spaces; `"..."` makes one word, so `""` is an empty object or value:
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
@@ -354,7 +355,15 @@ fn repl<'scope, 'env>(
             say(&format!("> {line}"));
         }
         tracing::info!(command = %line, "repl_command");
-        let words: Vec<&str> = line.split_whitespace().collect();
+        let words = match split_words(&line) {
+            Ok(words) => words,
+            Err(e) => {
+                say(&format!("usage: {e}"));
+                bad = true;
+                continue;
+            }
+        };
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
         let outcome = match words.as_slice() {
             ["quit" | "exit"] => break,
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
@@ -461,6 +470,39 @@ fn repl<'scope, 'env>(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Split a command line on spaces; `"..."` is one word, and `""` an empty one.
+fn split_words(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut chars = line.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut word = String::new();
+        if c == '"' {
+            chars.next();
+            loop {
+                match chars.next() {
+                    Some('"') => break,
+                    Some(c) => word.push(c),
+                    None => return Err(format!("unclosed quote in {line:?}")),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                word.push(c);
+                chars.next();
+            }
+        }
+        words.push(word);
+    }
+    Ok(words)
 }
 
 fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
