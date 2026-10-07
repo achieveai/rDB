@@ -33,7 +33,7 @@ use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{AuthorityEffect, Lineage, PartitionMode};
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
-use rdb_core::contracts::envelope::ReplicationEnvelope;
+use rdb_core::contracts::envelope::{ReplicaProgress, ReplicationEnvelope};
 use rdb_core::contracts::errors::{ErrorKind, RdbError};
 use rdb_core::contracts::event::{
     Budgets, ClientEvent, Effect, EffectKind, Event, EventKind, KernelEffect, KernelEvent, Module,
@@ -102,9 +102,15 @@ pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 /// How long a recovery committed below `Active` may go without its rebuild pinning (no
 /// post-commit `SyncWalThrough`) before the host reports it stalled, times
 /// `RETCD_TEST_DEADLINE_SCALE`. F1 arms no timer before the pin, so without this watch the
-/// partition stays read-only in silence (defect D2, lead ruling 2026-10-07). It is a report,
-/// not a fault: the node keeps serving and puts keep their `RECOVERY_READ_ONLY` answer.
+/// partition stays below `Active` in silence (defect D2, lead ruling 2026-10-07). It is a
+/// report, not a fault: the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
+
+/// How many times R1 may re-send one record to one copy, with that copy's acknowledged
+/// progress unmoved, before the host warns `replication_copy_not_advancing` (D4 re-sent about
+/// 150 times in silence). R1's retransmit timer fires every 100 ms and its first fire after a
+/// send only marks the wait, so the line comes about 1.6 s after the send.
+pub const STUCK_RESENDS: u32 = 15;
 
 /// The only affinity S0 writes in.
 const AFFINITY: AffinityId = AffinityId(1);
@@ -400,11 +406,25 @@ pub fn spawn(
     control: Arc<ControlAdapter>,
     clock: HostClock,
 ) -> Result<NodeHandle, String> {
+    spawn_with(node, dir, links, control, clock, Budgets::SPEC_DEFAULTS)
+}
+
+/// [`spawn`] with `budgets` in place of the spec's. Crate tests shorten them, so a start is
+/// ready in well under a second; nothing outside the crate can.
+pub(crate) fn spawn_with(
+    node: NodeId,
+    dir: PathBuf,
+    links: Arc<Links>,
+    control: Arc<ControlAdapter>,
+    clock: HostClock,
+    budgets: Budgets,
+) -> Result<NodeHandle, String> {
     let engine = RocksEngine::open(&dir)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone());
-    let host = Host::new(node, engine, links, control, clock);
+    let mut host = Host::new(node, engine, links, control, clock);
+    host.budgets = budgets;
     let join = std::thread::Builder::new()
         .name(format!("rdb-node-{}", node.0))
         .spawn(move || host.run(&rx))
@@ -472,6 +492,18 @@ struct RebuildWatch {
     unproven: BTreeSet<CopyId>,
     /// F1 named a copy the stall line does not carry yet (PC15: reported once per step).
     unreported: bool,
+}
+
+/// One copy's sends of one record, for the stuck-cursor warning.
+#[derive(Debug)]
+struct Resends {
+    generation: Generation,
+    through: Seq,
+    acked: ReplicaProgress,
+    /// Sends after the first with `generation`, `through` and `acked` all unchanged.
+    resends: u32,
+    /// This episode's warning was written; a change to any of the three starts a new one.
+    reported: bool,
 }
 
 /// L1 for one partition, with the next evaluation H1 owes it.
@@ -568,6 +600,9 @@ struct Host {
     stalled: BTreeMap<PartitionId, String>,
     /// [`REBUILD_PIN_WAIT_MILLIS`] times `RETCD_TEST_DEADLINE_SCALE`, read once.
     rebuild_pin_wait_millis: u64,
+    resends: BTreeMap<(PartitionId, CopyId), Resends>,
+    /// [`STUCK_RESENDS`]; crate tests lower it.
+    stuck_resends: u32,
     fault: Option<String>,
 }
 
@@ -613,6 +648,8 @@ impl Host {
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
             rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS.saturating_mul(deadline_scale()),
+            resends: BTreeMap::new(),
+            stuck_resends: STUCK_RESENDS,
             fault: None,
         }
     }
@@ -1481,11 +1518,20 @@ impl Host {
             .get(&partition)
             .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
         let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
+        // PC17: in DegradedRf2 a copy never heard from blocks L1's resume (B-R38), so writes
+        // pause; "paused at prefix Seq(0)" is L1's prefix from before the start record.
+        let effect = match watch.mode {
+            PartitionMode::DegradedRf2 => format!(
+                "stays {:?}, and its writes stay paused until the absent copy returns",
+                watch.mode
+            ),
+            _ => format!("stays {:?} and does not activate", watch.mode),
+        };
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
              waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
-             rebuild, so the partition stays {:?} and does not activate",
-            partition.0, generation.0, watch.mode, watch.cutoff.0, watch.mode,
+             rebuild, so the partition {effect}",
+            partition.0, generation.0, watch.mode, watch.cutoff.0,
         );
         tracing::error!(
             node = self.node.0,
@@ -1660,6 +1706,9 @@ impl Host {
         let tracker = primary.tracker();
         let sender = tracker.lineage();
         let config = tracker.config().config_version;
+        let acked = tracker
+            .peer(copy)
+            .map_or(ReplicaProgress::EMPTY, |peer| peer.progress);
         let to = tracker
             .config()
             .members
@@ -1693,7 +1742,54 @@ impl Host {
             sent,
             "envelopes_sent"
         );
+        self.count_resend(partition, sender.generation, copy, through, acked);
         Ok(())
+    }
+
+    /// A send through the same record, to the same copy, with its acknowledged progress unmoved,
+    /// is a re-send. After `stuck_resends` of them the copy is not advancing: warn once for the
+    /// episode. Nothing else changes; R1 keeps re-sending.
+    fn count_resend(
+        &mut self,
+        partition: PartitionId,
+        generation: Generation,
+        copy: CopyId,
+        through: Seq,
+        acked: ReplicaProgress,
+    ) {
+        let entry = self.resends.entry((partition, copy)).or_insert(Resends {
+            generation,
+            through,
+            acked,
+            resends: 0,
+            reported: false,
+        });
+        if (entry.generation, entry.through, entry.acked) == (generation, through, acked) {
+            entry.resends = entry.resends.saturating_add(1);
+        } else {
+            *entry = Resends {
+                generation,
+                through,
+                acked,
+                resends: 0,
+                reported: false,
+            };
+            return;
+        }
+        if entry.resends >= self.stuck_resends && !entry.reported {
+            entry.reported = true;
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                copy = copy.0,
+                through = through.0,
+                resends = entry.resends,
+                acked_applied = acked.buffered_applied.0,
+                acked_durable = acked.durable.0,
+                "replication_copy_not_advancing"
+            );
+        }
     }
 
     /// The record at `seq` of `lineage`, checked; `None` with a `warn` when absent or bad.
@@ -2947,6 +3043,11 @@ mod tests {
                         Durability::BufferedOnTwo
                     )
                 );
+                assert_eq!(
+                    request.expected_generation,
+                    Some(Generation(1)),
+                    "every sent put carries its generation fence"
+                );
                 request
             }
             other => panic!("put a=1: {other:?}"),
@@ -3074,6 +3175,166 @@ mod tests {
         }
     }
 
+    /// A10, end to end (the tester's row (b), mutant M19). Both secondaries are cut off from the
+    /// start, so F1 commits `ReadOnly` at cutoff 0 and names both copies stalled. After the heal
+    /// the partition activates, and activation clears the stall line. Then two puts publish at
+    /// seq 2 and 3, and L1 stays unpaused past its pause age.
+    ///
+    /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
+    /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
+    /// Integration (~1.6 s): it must watch twice L1's pause age to show L1 never paused.
+    #[test]
+    fn a_start_cut_off_from_both_secondaries_heals_into_a_writable_partition() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast_pause);
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        let stalled = trio.until("F1's stall line", |trio| trio.status(0).stalled);
+        assert!(stalled.contains("unproven=[1, 2]"), "{stalled}");
+
+        trio.links.heal_all();
+        trio.ready();
+        assert_eq!(
+            trio.status(0).stalled,
+            None,
+            "activation clears the stall line"
+        );
+        for (request, object, seq) in [(1, b"a", 2), (2, b"b", 3)] {
+            match trio.ask(put(request, object, b"v", None)) {
+                Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(seq)),
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+        let past_pause = Instant::now() + Duration::from_millis(2 * Trio::PAUSE_AGE_MILLIS);
+        trio.until("twice the pause age, unpaused", |trio| {
+            let status = trio.status(0);
+            assert_ne!(
+                status.protection.as_deref(),
+                Some("paused"),
+                "L1 paused after the heal: {status:?}"
+            );
+            (Instant::now() >= past_pause).then_some(())
+        });
+        assert_eq!(trio.status(0).admits, Some(true));
+    }
+
+    /// The never-pinned report, positive (the tester's row (d): since the D2 rewrite no row
+    /// reached it). Only link 1-3 is held, so F1 commits `DegradedRf2` at cutoff 0. F1 pins
+    /// nothing at that commit, and copy 2 never catches up, so the host's wait runs out and the
+    /// line names the real mode and says writes are paused, not "read-only" (PC17).
+    #[test]
+    fn a_degraded_commit_whose_rebuild_never_pins_is_reported_stalled() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            host.budgets.discovery_window_millis = 20;
+            host.rebuild_pin_wait_millis = 50;
+        });
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
+        assert!(
+            !trio.nodes[0].0.rebuilds[&PartitionId(1)].pinned,
+            "nothing pinned the rebuild"
+        );
+        for part in [
+            "recovery_rebuild_stalled partition=1 gen=1 mode=DegradedRf2 cutoff=0 \
+             required=[0, 1, 2] waited_ms=",
+            "F1 never pinned its rebuild, so the partition stays DegradedRf2, and its writes stay \
+             paused until the absent copy returns",
+        ] {
+            assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
+        }
+        assert!(!stalled.contains("unproven="), "{stalled}");
+    }
+
+    /// The stuck-cursor warning (lead, after D4). Link 1-3 is held once the partition is
+    /// active, so copy 2 (node 3) never acknowledges the put's record and R1 re-sends it every
+    /// 100 ms. After `stuck_resends` re-sends the host warns once, naming copy 2; the re-sends
+    /// after that do not repeat it, and copy 1, which acknowledged, is never named.
+    /// Integration (~1.4 s): R1's retransmit runs on its fixed 100 ms timer.
+    #[config_log::retcd_test]
+    fn a_copy_that_never_acknowledges_a_record_is_reported_once() {
+        const METHOD: &str = "a_copy_that_never_acknowledges_a_record_is_reported_once";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.stuck_resends = 3;
+        });
+        trio.bootstrap();
+        trio.ready();
+        trio.links.hold(NodeId(1), NodeId(3));
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        trio.until("twice the re-sends that report a copy", |trio| {
+            let resends = trio.nodes[0].0.resends.get(&(PartitionId(1), CopyId(2)));
+            resends.filter(|entry| entry.resends >= 6).map(drop)
+        });
+
+        let lines = config_testkit::logs::lines_for_current_test(module_path!(), METHOD);
+        let warned: Vec<_> = lines
+            .iter()
+            .filter(|line| line["@m"] == "replication_copy_not_advancing")
+            .collect();
+        assert_eq!(warned.len(), 1, "one line per episode: {warned:?}");
+        let line = warned[0];
+        assert_eq!(
+            (
+                &line["@l"],
+                &line["partition"],
+                &line["copy"],
+                &line["through"]
+            ),
+            (&"Warning".into(), &1.into(), &2.into(), &2.into()),
+            "{line}"
+        );
+    }
+
+    /// Mutant M13: a read reply must match the step view it was served from, version and digest,
+    /// or the node faults rather than answer. P1 computes the digest from that same view, so no
+    /// client call reaches a mismatch; the row hands node 1 a forged reply instead.
+    #[test]
+    fn a_read_reply_that_does_not_match_the_step_view_faults_instead_of_answering() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        match trio.ask(get(2, b"a")) {
+            Answer::Read { value, .. } => assert_eq!(value, Some((2, Bytes::from_static(b"1")))),
+            other => panic!("get a: {other:?}"),
+        }
+
+        let host = &mut trio.nodes[0].0;
+        let root = root_key(TenantId(1), AFFINITY, b"a");
+        let forged = Digest::of(Domain::ReadValue, &[root.as_bytes(), b"forged"]);
+        let (reply, answer) = mpsc::channel();
+        host.pending.insert(
+            identity(3),
+            Pending {
+                reply,
+                kind: PendingKind::Read(root),
+            },
+        );
+        let fault = host
+            .reply(
+                PartitionId(1),
+                &ReplyEffect::Read {
+                    identity: identity(3),
+                    outcome: ReadServiceOutcome::Served,
+                    value: Some((2, forged)),
+                },
+            )
+            .expect_err("a forged digest faults the node");
+        assert!(fault.contains("does not match the step view"), "{fault}");
+        assert!(answer.try_recv().is_err(), "nothing was answered");
+    }
+
     fn identity(request: u64) -> RequestIdentity {
         RequestIdentity {
             tenant: TenantId(1),
@@ -3117,6 +3378,8 @@ mod tests {
     impl Trio {
         /// Every row gives up after this long; a healthy one takes well under a second.
         const PATIENCE: Duration = Duration::from_secs(5);
+        /// [`Self::fast_pause`]'s L1 pause age: the spec's 2,000 ms, shortened.
+        const PAUSE_AGE_MILLIS: u64 = 400;
 
         /// Three hosts on `dir`, each tuned by `tune`, not yet bootstrapped.
         fn new(dir: &std::path::Path, tune: impl Fn(&mut Host)) -> Self {
@@ -3161,6 +3424,14 @@ mod tests {
         fn fast(host: &mut Host) {
             host.budgets.discovery_window_millis = 20;
             host.budgets.resume_hold_millis = 50;
+        }
+
+        /// [`Self::fast`], and L1 warns and pauses at a fifth of the spec's ages, so a row can
+        /// watch past the pause age in well under a second.
+        fn fast_pause(host: &mut Host) {
+            Self::fast(host);
+            host.budgets.warn_age_millis = Self::PAUSE_AGE_MILLIS / 2;
+            host.budgets.pause_age_millis = Self::PAUSE_AGE_MILLIS;
         }
 
         fn bootstrap(&self) {

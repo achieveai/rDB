@@ -17,6 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use config_core::ConfigStore;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
+use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
     ClientId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Seq,
     TenantId,
@@ -268,6 +269,16 @@ impl Db {
         store: Arc<dyn ConfigStore>,
         rt: Handle,
     ) -> Result<Self, OpenError> {
+        Self::open_with(config, store, rt, Budgets::SPEC_DEFAULTS).await
+    }
+
+    /// [`Self::open`] with `budgets` in every node in place of the spec's. Crate tests only.
+    pub(crate) async fn open_with(
+        config: DbConfig,
+        store: Arc<dyn ConfigStore>,
+        rt: Handle,
+        budgets: Budgets,
+    ) -> Result<Self, OpenError> {
         let nodes_dir = config.dir.join("nodes");
         if nodes_dir.exists() && std::fs::read_dir(&nodes_dir)?.next().is_some() {
             return Err(OpenError::NotEmpty(nodes_dir));
@@ -283,8 +294,15 @@ impl Db {
         for n in 1..=3u32 {
             let node = NodeId(n);
             let dir = nodes_dir.join(n.to_string());
-            let handle = host::spawn(node, dir, Arc::clone(&links), Arc::clone(&control), clock)
-                .map_err(OpenError::Node)?;
+            let handle = host::spawn_with(
+                node,
+                dir,
+                Arc::clone(&links),
+                Arc::clone(&control),
+                clock,
+                budgets,
+            )
+            .map_err(OpenError::Node)?;
             nodes.push(handle);
         }
         let db = Self {
@@ -572,6 +590,72 @@ fn millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tester's row (a): the public `Db` path for a write whose outcome is unknown, and
+    /// mutant M10. With both secondaries cut off nothing can acknowledge the put, and P1 answers
+    /// `UNKNOWN_OUTCOME` when L1 pauses, well inside the put timeout, so the answer carries the
+    /// request. After the heal, resending it is the same transaction at seq 3.
+    /// Integration (~3 s): three node threads on wall-clock time, a real L1 pause and a resume
+    /// after the heal, not stepped by hand.
+    #[test]
+    fn a_put_with_an_unknown_outcome_keeps_its_request_and_resends_after_the_heal() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            discovery_window_millis: 20,
+            resume_hold_millis: 50,
+            warn_age_millis: 200,
+            pause_age_millis: 400,
+            ..Budgets::SPEC_DEFAULTS
+        };
+        let config = DbConfig {
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        let admits = |db: &Db| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "node 1 does not admit writes within 5 s"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        admits(&db);
+        assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
+
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .put(b"a", b"2", None)
+            .expect_err("no copy can acknowledge it");
+        assert_eq!(
+            (unknown.error.name(), unknown.error.retry),
+            ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus)
+        );
+        let request = unknown
+            .request
+            .expect("the answer carries the request to resend");
+
+        db.links().heal_all();
+        admits(&db);
+        let resent = db.resend(*request).expect("resend after the heal");
+        assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(read.value, Some((3, Bytes::from_static(b"2"))));
+        db.shutdown();
+    }
 
     #[test]
     fn wire_names_are_screaming_snake() {
