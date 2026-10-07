@@ -182,12 +182,14 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 | pending slot missing or holding another op no; slot not kind `0x08`, bad CBOR or shape; an op's `at` out of range | `Corrupt(Block{id, OpMissing{op} / OpBad{op} / OpOutOfRange{op}})` |
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
 | bare `n` with no item record; item record does not open, not a document, newer than root | `Corrupt(ItemMissing{id} / Envelope / ItemNotDocument{found} / Codec / ElementNewerThanRoot)` |
-| records under `0x02`/`0x03` with no root, at a fresh id (an item's, or a split's new block), or beside an empty list at drop | `Corrupt(OrphanElement)` |
+| records under `0x02`/`0x03` with no root, at a fresh id (an item's, or a split's new block base), or beside an empty list at drop | `Corrupt(OrphanElement)` |
 | a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on reads, on writes to an existing object, and on drop and delete: lists, maps, sets, documents and blobs; also blob GC and `doc_scenario`'s dump. A create (`Expected::Absent`) never reads the root: the kernel refuses its `Condition::Absent{root}` (`ConditionFailed`), and nothing is written |
 - `BlockFault` replaces rev 4's `PageFault`. An unknown kind, codec or format stays written-by-a-newer-build.
 - **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one item `n` in two
-  entries; a stale slot under a live block; a wrong `bytes` total. Writes never make one: `model_run` checks after every
-  step that
+  entries; a stale slot under a live block; a stray slot under a split's new block; a wrong `bytes` total. A split
+  checks only its new block's base key, with one `version` call. A scan for the slots would be one call too, but it
+  returns the first record at or after the base key, which is normally the next object's, so its bytes are not bounded
+  by B (L-R186el). Writes never make any of these: `model_run` checks after every step that
   - the `0x02` keys are exactly the out-of-line entries' ids (the first two);
   - no id is read twice (the third);
   - every `0x03` key belongs to a block the root names, and each slot holds an op no in 1 … `head` at slot `op mod 240`

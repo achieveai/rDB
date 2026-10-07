@@ -1407,8 +1407,9 @@ impl Draft<'_> {
             // A split moves entries, not bytes: it reads no item record (D4).
             let moved = entries[k..].to_vec();
             let n = self.mint()?;
-            // A fresh block id must name no record yet, as a fresh item id must (§7). No write of
-            // this compile can be there: the id was minted just now.
+            // A fresh block's base key must hold no record yet, as a fresh item id's must (§7). No
+            // write of this compile can be there: the id was minted just now. Its slot keys are
+            // not checked: a scan would return the next object's record, unbounded by B.
             let fresh = block_key(self.root, self.list.id(n));
             if self.snapshot.version(Namespace::User, &fresh).is_some() {
                 return Err(ValueError::Corrupt(Corrupt::OrphanElement));
