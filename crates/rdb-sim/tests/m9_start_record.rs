@@ -25,7 +25,7 @@ use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent, ReplyEffect};
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch, RequestId,
+    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::membership::CopyId;
@@ -37,6 +37,7 @@ use rdb_core::contracts::version::API_VERSION;
 use rdb_sim::harness::run::{RunPlan, Runner, SeedEvent, StopReason};
 use rdb_sim::harness::trace::validate;
 
+use support::oracle::Oracle;
 use support::scenarios::cases::{self, A_NODE, B_NODE, C_NODE, PARTITION, PLAN_AT};
 use support::scenarios::grammar::{
     Budget, RecoveryOp, Scenario, ScenarioOp, TimeOp, SCENARIO_GENERATOR_VERSION,
@@ -44,16 +45,16 @@ use support::scenarios::grammar::{
 };
 use support::scenarios::run as scenario_run;
 
-/// When the client writes: after the fence (one tick past the plan), discovery's window, L1's
-/// resume hold, and 1.3 s of room. The probe saw L1 healthy at t7503 in both cases.
-const SUBMIT_AT: u64 = PLAN_AT + 1 + 2_000 + Budgets::SPEC_DEFAULTS.resume_hold_millis + 1_300;
+/// When the client writes, as in the corpus case. The probe saw L1 healthy at t7503 in both
+/// cases.
+const SUBMIT_AT: u64 = cases::M9_S0_SUBMIT_AT;
 /// The run's deadline: the write's own deadline and its publication, with room.
-const MAX_TICKS: u64 = SUBMIT_AT + 2_000;
-/// The one client and its request.
+const MAX_TICKS: u64 = cases::M9_S0_MAX_TICKS;
+/// The one client and its request; the corpus case's grammar `Submit` lowers to this identity.
 const CLIENT: RequestIdentity = RequestIdentity {
     tenant: TenantId(1),
     client: ClientId(1),
-    request: RequestId(10),
+    request: cases::M9_S0_REQUEST,
 };
 
 /// The survivors in `survivors` hold nothing; placement's plan reaches F1 at [`PLAN_AT`].
@@ -181,7 +182,9 @@ fn case_b() -> RunPlan {
     plan
 }
 
-/// The run, to its tick budget; the client's replies and the validated trace.
+/// The run, to its tick budget; the client's replies and the validated trace, which every
+/// oracle accepts. The start record is a publish no client submitted, which each checker must
+/// take as a system record and not as a lost or unadmitted write (lead ruling, owed alongside).
 fn run(plan: &RunPlan) -> (Vec<ReplyEffect>, Trace) {
     support::preamble();
     let mut runner = Runner::new(plan).expect("the harness takes the plan");
@@ -195,6 +198,12 @@ fn run(plan: &RunPlan) -> (Vec<ReplyEffect>, Trace) {
     );
     let trace = runner.finish().expect("the trace closes");
     validate(&trace).expect("a well-formed trace");
+    let judged = Oracle::new().judge(&trace);
+    assert!(
+        judged.is_clean(),
+        "every oracle accepts the start record: {:#?}",
+        judged.violations()
+    );
     let replies = report.replies.into_iter().map(|(_, reply)| reply).collect();
     (replies, trace)
 }
@@ -266,5 +275,16 @@ fn m9_s0_01_three_empty_copies_publish_the_first_client_write_at_seq_two() {
 #[retcd_test]
 fn m9_s0_02_a_takeover_of_an_empty_prefix_publishes_the_first_client_write_at_seq_two() {
     let (replies, trace) = run(&case_a());
+    assert_first_write_at_seq_two(&replies, &trace, Generation(2));
+}
+
+/// The corpus case (`cases::case_m9_s0_empty_recovery_then_submit`), which the campaign runs
+/// beside the other authored cases: Case A written wholly in the grammar, the write a grammar
+/// `Submit` rather than a hand-built seed.
+#[retcd_test]
+fn m9_s0_12_the_corpus_case_publishes_its_write_at_seq_two() {
+    let plan =
+        scenario_run::lower(&cases::case_m9_s0_empty_recovery_then_submit()).expect("lowers");
+    let (replies, trace) = run(&plan);
     assert_first_write_at_seq_two(&replies, &trace, Generation(2));
 }

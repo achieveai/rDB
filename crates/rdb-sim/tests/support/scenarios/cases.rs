@@ -477,3 +477,57 @@ pub fn case_f1_t1_digest_across_recovery() -> Scenario {
         ]),
     )
 }
+
+/// The M9 S0 case: when the client writes. After the fence (one tick past the plan),
+/// discovery's window, L1's resume hold, and 1.3 s of room for the start record to publish
+/// and L1 to resume; the probe saw L1 healthy at t7503 (`s0-probe.md`).
+pub const M9_S0_SUBMIT_AT: u64 =
+    PLAN_AT + 1 + 2_000 + Budgets::SPEC_DEFAULTS.resume_hold_millis + 1_300;
+
+/// The M9 S0 case's tick budget: the write's deadline and its publication, with room.
+pub const M9_S0_MAX_TICKS: u64 = M9_S0_SUBMIT_AT + 2_000;
+
+/// The M9 S0 case's one client request.
+pub const M9_S0_REQUEST: RequestId = RequestId(10);
+
+/// M9 S0: an empty recovery followed by a submit (lead ruling "S0 start record", Gautam chose A
+/// on 2026-10-07).
+///
+/// B and C survive empty, A (the prior owner) is dead, and F1 recovers at cutoff 0. Before the
+/// kernel's start record, nothing could be written: L1 resumes only after a copy ACKs a record,
+/// and at head 0 there is none, so the write was answered `PROTECTION_PAUSED`. Now the start
+/// record is published at seq 1 and the client's write at seq 2. It is the corpus's only history
+/// that recovers an empty prefix, so it is the only one in which every oracle sees a publish
+/// with no client behind it.
+#[must_use]
+pub fn case_m9_s0_empty_recovery_then_submit() -> Scenario {
+    authored(
+        "case_m9_s0_empty_recovery_then_submit",
+        Budget {
+            max_events: 2_000,
+            max_ticks: M9_S0_MAX_TICKS,
+        },
+        vec![
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: B_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: C_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+                partition: PARTITION,
+                window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+            }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_S0_SUBMIT_AT - PLAN_AT,
+            }),
+            submit(M9_S0_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_S0_MAX_TICKS - M9_S0_SUBMIT_AT,
+            }),
+        ],
+    )
+}
