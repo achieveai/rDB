@@ -2612,4 +2612,87 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+
+    /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild
+    /// is pinned and the watch must stay quiet. The D2 row's start (`ReadOnly` at cutoff 0),
+    /// then the `SyncWalThrough` F1 sends at commit, through the host's own effect path.
+    #[test]
+    fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
+        let dir = config_testkit::fs::temp_dir();
+        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let (tx, rx) = mpsc::channel();
+        links.register(NodeId(1), tx.clone());
+        links.hold(NodeId(1), NodeId(2));
+        links.hold(NodeId(1), NodeId(3));
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control =
+            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
+        let clock = HostClock::start();
+        let mut host = Host::new(NodeId(1), engine, links, control, clock);
+        host.budgets.discovery_window_millis = 20;
+        host.rebuild_pin_wait_millis = 50;
+        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
+            tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
+        }))
+        .expect("bootstrap");
+        let partition = PartitionId(1);
+
+        let step = |host: &mut Host| {
+            host.run_due();
+            host.drain();
+            assert_eq!(host.fault, None);
+            assert_eq!(
+                host.status(partition).stalled,
+                None,
+                "a pinned rebuild was reported"
+            );
+            if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
+                host.handle(msg);
+            }
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !host.rebuilds.contains_key(&partition) {
+            assert!(Instant::now() < deadline, "no rebuild watch within 5 s");
+            step(&mut host);
+        }
+        assert_eq!(
+            host.status(partition).recovery.as_deref(),
+            Some("Rebuilding")
+        );
+
+        // Copy 1's holder is node 2, behind a held link: the ask is buffered, nothing answers.
+        let sync = RecoveryEffect::SyncWalThrough {
+            copy: CopyId(1),
+            cutoff: Seq::ZERO,
+        };
+        let site = Site {
+            partition,
+            correlation: CorrelationId(0),
+        };
+        host.recovery_effect(&sync, site).expect("sync effect");
+        assert!(
+            host.rebuilds[&partition].pinned,
+            "a post-commit sync pins the watch"
+        );
+
+        // Past the check: it ran, and it stayed quiet.
+        let quiet_until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < quiet_until {
+            step(&mut host);
+        }
+        assert!(
+            !host
+                .delayed
+                .values()
+                .any(|item| matches!(item, Delayed::RebuildCheck { .. })),
+            "the rebuild check has not run yet"
+        );
+        assert_eq!(host.status(partition).stalled, None);
+    }
 }
