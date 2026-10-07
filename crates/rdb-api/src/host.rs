@@ -310,10 +310,8 @@ pub struct NodeStatus {
     pub node: NodeId,
     /// The host fault, once one happened.
     pub fault: Option<String>,
-    /// The adopted generation.
-    pub generation: Generation,
-    /// The adopted owner epoch.
-    pub owner_epoch: OwnerEpoch,
+    /// What this node holds for the partition; `None` before it holds any lineage.
+    pub holds: Option<Holding>,
     /// A1's state, as one word and a grant id.
     pub authority: String,
     /// F1's phase for the partition, when an instance exists.
@@ -326,15 +324,25 @@ pub struct NodeStatus {
     pub protection: Option<String>,
     /// Whether L1 admits writes now, when live.
     pub admits: Option<bool>,
-    /// Applied sequence at the adopted generation.
-    pub applied: u64,
-    /// Durable sequence at the adopted generation.
-    pub durable: u64,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
     /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
     /// stalled; cleared when it activates.
     pub stalled: Option<String>,
+}
+
+/// The lineage a node holds and how far it holds it. An owner reports its adopted generation
+/// and its store; a secondary reports what its receiver took, since it adopts none (OB2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Holding {
+    /// The generation held.
+    pub generation: Generation,
+    /// The owner epoch it was held under.
+    pub owner_epoch: OwnerEpoch,
+    /// Highest contiguous sequence applied.
+    pub applied: u64,
+    /// Highest contiguous sequence proved durable.
+    pub durable: u64,
 }
 
 /// A node's thread has stopped: nothing sent to it is read.
@@ -2212,20 +2220,40 @@ impl Host {
             AuthorityState::Held(held) => format!("held(grant {})", held.identity().grant.0),
             AuthorityState::Fenced { reason, .. } => format!("fenced({reason:?})"),
         };
+        let receiver = self.replication.receiver(self.node, partition);
         let role = if self.replication.primary(self.node, partition).is_some() {
             "primary"
-        } else if self.replication.receiver(self.node, partition).is_some() {
+        } else if receiver.is_some() {
             "secondary"
         } else {
             "none"
+        };
+        let holds = match receiver.filter(|_| role == "secondary") {
+            Some(receiver) => {
+                let lineage = receiver.lineage();
+                (lineage.generation.0 != 0).then(|| Holding {
+                    generation: lineage.generation,
+                    owner_epoch: lineage.owner_epoch,
+                    applied: receiver.buffered_applied_seq().0,
+                    durable: receiver.durable_seq().0,
+                })
+            }
+            None => (adopted.generation.0 != 0).then(|| Holding {
+                generation: adopted.generation,
+                owner_epoch: adopted.owner_epoch,
+                applied: self
+                    .engine
+                    .buffered_applied(partition, adopted.generation)
+                    .0,
+                durable: self.engine.durable(partition, adopted.generation).0,
+            }),
         };
         let l1 = self.l1.get(&partition).map(|l1| &l1.protection);
         let now = self.clock.now();
         NodeStatus {
             node: self.node,
             fault: self.fault.clone(),
-            generation: adopted.generation,
-            owner_epoch: adopted.owner_epoch,
+            holds,
             authority,
             recovery: self
                 .recoveries
@@ -2244,11 +2272,6 @@ impl Host {
             admits: l1
                 .and_then(|l1| l1.admission_state(now))
                 .map(|state| state.allow),
-            applied: self
-                .engine
-                .buffered_applied(partition, adopted.generation)
-                .0,
-            durable: self.engine.durable(partition, adopted.generation).0,
             published: self
                 .publication
                 .view(self.node, partition)
@@ -2694,5 +2717,93 @@ mod tests {
             "the rebuild check has not run yet"
         );
         assert_eq!(host.status(partition).stalled, None);
+    }
+
+    /// OB2 (2026-10-07, `rdb_dev` at dd41368): `nodes` printed every secondary as `gen=0
+    /// applied=0 durable=0` while the owner's puts were `BufferedOnTwo`, because the view read
+    /// the store at the adopted generation and a secondary adopts none. A secondary now reports
+    /// what its receiver took, and a node holding nothing says so instead of printing zeros.
+    #[test]
+    fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control =
+            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
+        let clock = HostClock::start();
+        let mut nodes = Vec::new();
+        for n in 1..=3u32 {
+            let engine = RocksEngine::open(dir.path().join(n.to_string())).expect("open engine");
+            let (tx, rx) = mpsc::channel();
+            links.register(NodeId(n), tx.clone());
+            let mut host = Host::new(
+                NodeId(n),
+                engine,
+                Arc::clone(&links),
+                Arc::clone(&control),
+                clock,
+            );
+            host.budgets.discovery_window_millis = 20;
+            nodes.push((host, tx, rx));
+        }
+        let partition = PartitionId(1);
+        for (host, _, _) in &nodes {
+            assert_eq!(
+                host.status(partition).holds,
+                None,
+                "nothing held before bootstrap"
+            );
+        }
+        let owner = nodes[0].1.clone();
+        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
+            owner.send(msg).map_err(|_| NodeStopped(NodeId(1)))
+        }))
+        .expect("bootstrap");
+
+        // Until node 2 has taken the start record at seq 1.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let held = loop {
+            for (host, _, rx) in &mut nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            let status = nodes[1].0.status(partition);
+            if let Some(held) = status.holds.filter(|held| held.applied >= 1) {
+                assert_eq!(status.role, "secondary");
+                break held;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node 2 holds no record within 5 s: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        let secondary = &nodes[1].0;
+        assert_eq!(
+            secondary.adopted(partition).generation,
+            Generation(0),
+            "a secondary adopts no generation, so the store view at it is empty"
+        );
+        assert_eq!(
+            (held.generation, held.owner_epoch),
+            (Generation(1), OwnerEpoch(1))
+        );
+        assert_eq!(
+            held.applied,
+            secondary
+                .engine
+                .buffered_applied(partition, Generation(1))
+                .0,
+            "the head is the record the store holds at the receiver's generation"
+        );
     }
 }

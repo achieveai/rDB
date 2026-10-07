@@ -290,11 +290,27 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
 
 fn waiting_line(owner: &NodeStatus) -> String {
     format!(
-        "waiting for write protection (l1={} authority={} applied={} durable={})",
+        "waiting for write protection (l1={} authority={} {})",
         owner.protection.as_deref().unwrap_or("inert"),
         owner.authority,
-        owner.applied,
-        owner.durable
+        owner.holds.map_or_else(
+            || "holds=nothing".to_owned(),
+            |h| format!("applied={} durable={}", h.applied, h.durable)
+        ),
+    )
+}
+
+/// `gen= epoch= applied= durable=` of what the node holds, or `holds=nothing` before it holds
+/// a lineage: a secondary adopts no generation, so zeros there would read as real (OB2).
+fn holds_part(node: &NodeStatus) -> String {
+    node.holds.map_or_else(
+        || "holds=nothing".to_owned(),
+        |h| {
+            format!(
+                "gen={} epoch={} applied={} durable={}",
+                h.generation.0, h.owner_epoch.0, h.applied, h.durable
+            )
+        },
     )
 }
 
@@ -494,21 +510,22 @@ fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
 
 fn node_line(node: &NodeStatus) -> String {
     format!(
-        "node={} gen={} epoch={} authority={} recovery={} recovered={} role={} l1={} admits={} applied={} durable={} published={}{}",
+        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={} published={}{}",
         node.node.0,
-        node.generation.0,
-        node.owner_epoch.0,
+        holds_part(node),
         node.authority,
         node.recovery.as_deref().unwrap_or("-"),
-        node.recovered.map_or_else(|| "-".to_owned(), |g| g.0.to_string()),
+        node.recovered
+            .map_or_else(|| "-".to_owned(), |g| g.0.to_string()),
         node.role,
         node.protection.as_deref().unwrap_or("inert"),
-        node.admits.map_or_else(|| "-".to_owned(), |a| a.to_string()),
-        node.applied,
-        node.durable,
+        node.admits
+            .map_or_else(|| "-".to_owned(), |a| a.to_string()),
         node.published
             .map_or_else(|| "-".to_owned(), |(g, s)| format!("{}@{}", s.0, g.0)),
-        node.fault.as_ref().map_or_else(String::new, |f| format!(" FAULT={f}")),
+        node.fault
+            .as_ref()
+            .map_or_else(String::new, |f| format!(" FAULT={f}")),
     )
 }
 
