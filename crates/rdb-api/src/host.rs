@@ -502,8 +502,9 @@ struct Resends {
     generation: Generation,
     through: Seq,
     acked: ReplicaProgress,
-    /// Sends with `generation`, `through` and `acked` all unchanged and the copy below the
-    /// head, after the send that started the episode.
+    /// Sends that repeat the previous one (`generation`, `through` and `acked` unchanged) and
+    /// find the copy below the head. Set back to 0 by a send that changes any of the three or
+    /// finds the copy level.
     resends: u32,
     /// This episode's warning was written; a change to any of the three, or the copy reaching
     /// the head, starts a new one.
@@ -1757,12 +1758,15 @@ impl Host {
         Ok(())
     }
 
-    /// A send of the same record to the same copy, with the copy's acknowledged progress unmoved
-    /// and below this primary's applied head, is a re-send to a copy that is behind. After
-    /// `stuck_resends` of them the copy is not advancing: warn once for the episode. A send that
-    /// changes the record or the progress, or finds the copy level with the head, starts the
-    /// count again, so an episode begins when the copy falls behind (D5: R1 re-sends seq 1
-    /// through L1's resume hold to copies that hold it). Nothing else changes; R1 keeps sending.
+    /// A send that repeats the previous one to the same copy (same record, the copy's acked
+    /// progress unmoved) while the copy's acked applied position is below this primary's applied
+    /// head is a re-send to a copy that is behind. After `stuck_resends` of them the copy is not
+    /// advancing: warn once for the episode. A send that changes the record or the progress, or
+    /// finds the copy level with the head, sets the count back to 0, so an episode begins when
+    /// the copy falls behind (D5: R1 re-sends seq 1 through L1's resume hold to copies that hold
+    /// it). The first send after the head moves past an unchanged copy repeats the last level
+    /// one, so it is re-send 1; a send that changes the record or the progress is not counted.
+    /// Nothing else changes; R1 keeps sending.
     fn count_resend(
         &mut self,
         partition: PartitionId,
@@ -2700,14 +2704,21 @@ mod tests {
     use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
     use rdb_core::contracts::txn::{Durability, Outcome};
 
-    /// This test's `replication_copy_not_advancing` lines. A macro, because the JSON value type
+    /// This test's log lines whose message is `$message`. A macro, because the JSON value type
     /// is not nameable here without a `serde_json` dependency.
-    macro_rules! not_advancing {
-        ($method:expr) => {
+    macro_rules! logged {
+        ($method:expr, $message:expr) => {
             config_testkit::logs::lines_for_current_test(module_path!(), $method)
                 .into_iter()
-                .filter(|line| line["@m"] == "replication_copy_not_advancing")
+                .filter(|line| line["@m"] == $message)
                 .collect::<Vec<_>>()
+        };
+    }
+
+    /// This test's `replication_copy_not_advancing` lines.
+    macro_rules! not_advancing {
+        ($method:expr) => {
+            logged!($method, "replication_copy_not_advancing")
         };
     }
 
@@ -2805,9 +2816,12 @@ mod tests {
     /// silence. Since the D2 kernel step, F1 pins that rebuild at the commit and, at each
     /// deadline, names every copy that has not proved the point (`RebuildStalled`). The host
     /// turns that into one stall line naming the mode and those copies, which stays as printed
-    /// while F1 keeps naming them.
-    #[test]
+    /// while F1 keeps naming them. PC15 and mutant M26: F1 names both copies in one step, and a
+    /// repeat names no new copy, so across six deadlines the log holds exactly one error line.
+    #[config_log::retcd_test]
     fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
+        const METHOD: &str =
+            "a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled";
         let dir = config_testkit::fs::temp_dir();
         let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2870,6 +2884,9 @@ mod tests {
             step(&mut host);
         }
         assert_eq!(host.status(partition).stalled, Some(stalled));
+        let logged = logged!(METHOD, "recovery_rebuild_stalled");
+        assert_eq!(logged.len(), 1, "one error line for the stall: {logged:?}");
+        assert_eq!(logged[0]["@l"], "Error", "{}", logged[0]);
     }
 
     /// Tester gap G1 (2026-10-07, mutant M3): the stall watch must stay quiet for an `Active`
@@ -3312,8 +3329,10 @@ mod tests {
     /// D4's shape at the host: the copy acknowledged the record R1 keeps re-sending (through 1,
     /// acked 1), and the head moved past it to 2. The host cannot make R1 do that without the
     /// kernel defect, so the row hands `count_resend` the sends directly, against node 1's real
-    /// head. Level with the head nothing is reported; once behind, the send that starts the
-    /// episode is not counted, the `stuck_resends`-th re-send warns, and later ones do not.
+    /// head. It uses a copy id R1 never sends to, so only the row's sends touch the slot, as only
+    /// R1's through-1 re-sends touched copy 2's in D4 (copy 2's own slot takes the put's seq 2).
+    /// Level with the head nothing is counted. The first send once behind repeats the last
+    /// level one, so it is re-send 1; the `stuck_resends`-th warns, and later ones do not.
     /// The kernel side is the sim row `m9_d4_00`.
     #[config_log::retcd_test]
     fn a_copy_acked_below_the_head_is_reported_once_it_stops_advancing() {
@@ -3325,15 +3344,14 @@ mod tests {
         });
         trio.bootstrap();
         trio.ready();
-        let acked = ReplicaProgress {
-            received: ReceivedSeq(1),
-            buffered_applied: AppliedSeq(1),
-            durable: DurableSeq(1),
-        };
         let send = |trio: &mut Trio| {
-            trio.nodes[0]
-                .0
-                .count_resend(PartitionId(1), Generation(1), CopyId(2), Seq(1), acked);
+            trio.nodes[0].0.count_resend(
+                PartitionId(1),
+                Generation(1),
+                UNSENT,
+                Seq(1),
+                acked_at(1, 1),
+            );
         };
 
         assert_eq!(trio.head(), Some(1));
@@ -3347,17 +3365,20 @@ mod tests {
             other => panic!("put a=1: {other:?}"),
         }
         assert_eq!(trio.head(), Some(2));
-        trio.nodes[0].0.resends.remove(&(PartitionId(1), CopyId(2)));
-        for _ in 0..3 {
-            send(&mut trio);
-        }
+        assert_eq!(
+            trio.nodes[0].0.resends[&(PartitionId(1), UNSENT)].episode(),
+            (Generation(1), Seq(1), acked_at(1, 1)),
+            "R1 did not touch the row's slot"
+        );
+        send(&mut trio);
+        send(&mut trio);
         assert_eq!(
             not_advancing!(METHOD).len(),
             0,
-            "the episode's first send and two re-sends"
+            "re-sends 1 and 2 while behind"
         );
         send(&mut trio);
-        assert_eq!(not_advancing!(METHOD).len(), 1, "the third re-send warns");
+        assert_eq!(not_advancing!(METHOD).len(), 1, "re-send 3 warns");
         send(&mut trio);
         send(&mut trio);
         let warned = not_advancing!(METHOD);
@@ -3371,9 +3392,48 @@ mod tests {
                 &line["acked_applied"],
                 &line["resends"]
             ),
-            (&2.into(), &1.into(), &2.into(), &1.into(), &3.into()),
+            (&UNSENT.0.into(), &1.into(), &2.into(), &1.into(), &3.into()),
             "{line}"
         );
+    }
+
+    /// Lead ruling, mutants M35 and M40: the rule reads the copy's acked **applied** position,
+    /// and a change in it starts a new episode. R1 re-sends seq 3 at head 3 while the copy's
+    /// acked applied climbs 1, 2, 3 and its acked durable stays at 1. Each step is a copy that
+    /// is advancing, so no line: two re-sends at 1 and two at 2 stay under the threshold only
+    /// if the climb restarts the count (M40), and at 3 the copy is level by applied though not
+    /// by durable (M35). Same direct route and unsent copy id as the D4-shape row.
+    #[config_log::retcd_test]
+    fn a_copy_whose_acked_applied_climbs_is_not_reported_while_durable_lags() {
+        const METHOD: &str = "a_copy_whose_acked_applied_climbs_is_not_reported_while_durable_lags";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.stuck_resends = 3;
+        });
+        trio.bootstrap();
+        trio.ready();
+        for (request, object, seq) in [(1, b"a", 2), (2, b"b", 3)] {
+            match trio.ask(put(request, object, b"v", None)) {
+                Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(seq)),
+                other => panic!("put {request}: {other:?}"),
+            }
+        }
+        assert_eq!(trio.head(), Some(3));
+
+        for (applied, sends) in [(1, 3), (2, 3), (3, 4)] {
+            for _ in 0..sends {
+                trio.nodes[0].0.count_resend(
+                    PartitionId(1),
+                    Generation(1),
+                    UNSENT,
+                    Seq(3),
+                    acked_at(applied, 1),
+                );
+            }
+        }
+        let warned = not_advancing!(METHOD);
+        assert!(warned.is_empty(), "an advancing copy warned: {warned:?}");
     }
 
     /// The stuck-cursor warning (lead, after D4). Link 1-3 is held once the partition is
@@ -3457,6 +3517,19 @@ mod tests {
             .expect_err("a forged digest faults the node");
         assert!(fault.contains("does not match the step view"), "{fault}");
         assert!(answer.try_recv().is_err(), "nothing was answered");
+    }
+
+    /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
+    /// `count_resend` calls touch its slot.
+    const UNSENT: CopyId = CopyId(9);
+
+    /// A copy's acknowledged progress, received with applied.
+    fn acked_at(applied: u64, durable: u64) -> ReplicaProgress {
+        ReplicaProgress {
+            received: ReceivedSeq(applied),
+            buffered_applied: AppliedSeq(applied),
+            durable: DurableSeq(durable),
+        }
     }
 
     fn identity(request: u64) -> RequestIdentity {
