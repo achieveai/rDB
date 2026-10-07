@@ -21,6 +21,14 @@
 //! behind an empty prefix, so no catch-up ever pinned the rebuild point. F1 now pins `(0, ROOT)`
 //! at such a commit and asks again at each sync deadline, so the partition opens once the
 //! copies return.
+//!
+//! **D3** (lead ruling "S0 D3", Gautam chose option 1 on 2026-10-07) is the same empty partition
+//! recovered `DegradedRf2` with A cut off. In this trace the start record is at seq 1 before A
+//! returns; the row does not assert when it is written. When A returns, F1 re-emits the same
+//! recovery with `mode: Active`. Before the fix that re-emit rebuilt at the cutoff: the tracker
+//! and receivers dropped seq 1, and P1 moved its published position back from 1 to 0. Reads were
+//! then refused `Unavailable` and writes `PROTECTION_PAUSED`. A same-generation re-emit now
+//! changes only the mode, so seq 1 stays and the writes publish at 2 and 3.
 
 mod support;
 
@@ -32,13 +40,16 @@ use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent, ReplyEffect};
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch,
+    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch, RequestId,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{KernelNote, Provenance, SyncWithheldReason, Trace, TraceKind};
+use rdb_core::contracts::trace::{
+    KernelNote, ProtectionPhase, Provenance, ReadServiceOutcome, SyncWithheldReason, Trace,
+    TraceKind,
+};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest, TxnResult};
 use rdb_core::contracts::version::API_VERSION;
 use rdb_sim::harness::run::{RunPlan, Runner, SeedEvent, StopReason};
@@ -368,4 +379,120 @@ fn m9_d2_00_a_read_only_empty_partition_heals_and_publishes_the_first_write_at_s
         "the commit's sync to each cut-off copy is withheld"
     );
     assert_first_write_at_seq_two(&replies, &trace, Generation(2));
+}
+
+/// A `Fresh` read of the client's key on the primary B at `at`, under request `request`.
+fn read(at: u64, request: u64) -> SeedEvent {
+    SeedEvent {
+        at: Tick(at),
+        node: B_NODE,
+        boot: scenario_run::BOOT,
+        partition: PARTITION,
+        correlation: CorrelationId(9_100 + request),
+        kind: EventKind::Client(ClientEvent::Read {
+            identity: RequestIdentity {
+                request: RequestId(request),
+                ..CLIENT
+            },
+            key: scoped_key(CLIENT.tenant, AffinityId(1), b"a"),
+        }),
+    }
+}
+
+/// D3's reads: before A returns, after the `Active` re-emit, and after both writes.
+const D3_READS: [(u64, u64); 3] = [(3_500, 20), (5_000, 21), (16_500, 22)];
+
+/// E6-A (lead ruling "S0 D3", proof 1): B and C survive an empty partition while A is cut off,
+/// so F1 commits `DegradedRf2` at cutoff 0 and the start record is published at seq 1. A comes
+/// back and F1 re-emits the same result as `Active`. Before the fix that re-emit rewound R1's
+/// head and P1's published position to the cutoff: no write was ever published again, and a
+/// `Fresh` read was refused `Unavailable` because storage's view (seq 1) was above what P1 then
+/// called published (seq 0). The host walk A12 saw both.
+///
+/// A read is served only when storage's view is exactly the published position, so a read
+/// served after the re-emit proves P1 still publishes seq 1: the position did not go down.
+#[retcd_test]
+fn m9_d3_00_a_copy_back_after_a_degraded_empty_start_keeps_seq_one_and_publishes_two_and_three() {
+    let back = cases::M9_D3_A_BACK_AT;
+    let mut plan =
+        scenario_run::lower(&cases::case_m9_d3_degraded_empty_gets_a_copy_back_then_writes())
+            .expect("lowers");
+    plan.seed
+        .extend(D3_READS.iter().map(|(at, request)| read(*at, *request)));
+    let (replies, trace) = run(&plan);
+    let recovered = recovered_on_primary(&trace);
+    tracing::info!(?recovered, "d3.recovered");
+    assert!(
+        matches!(recovered.first(), Some((at, PartitionMode::DegradedRf2, Seq::ZERO)) if *at < back),
+        "committed degraded at cutoff 0 while A is away: {recovered:?}"
+    );
+    let active = recovered
+        .iter()
+        .find(|(_, mode, _)| *mode == PartitionMode::Active)
+        .map(|(at, ..)| *at);
+    assert!(
+        matches!(active, Some(at) if at > back && at < D3_READS[1].0),
+        "the same result re-emitted active once A is back, before the second read: {recovered:?}"
+    );
+    let reads: Vec<(RequestId, ReadServiceOutcome)> = replies
+        .iter()
+        .filter_map(|reply| match reply {
+            ReplyEffect::Read {
+                identity, outcome, ..
+            } if identity.client == CLIENT.client => Some((identity.request, *outcome)),
+            _ => None,
+        })
+        .collect();
+    tracing::info!(?reads, "d3.reads");
+    for (_, request) in D3_READS {
+        assert!(
+            reads.iter().any(|(id, outcome)| *id == RequestId(request)
+                && matches!(
+                    outcome,
+                    ReadServiceOutcome::Served | ReadServiceOutcome::WaitedAtBarrier
+                )),
+            "read {request} is answered from the published position: {reads:?}"
+        );
+    }
+    let generation = Generation(2);
+    assert_eq!(
+        published(&trace),
+        vec![
+            (generation, Seq(1)),
+            (generation, Seq(2)),
+            (generation, Seq(3))
+        ],
+        "the start record, then both writes, in order and never below a position published"
+    );
+    let written: Vec<(RequestId, Generation, Seq)> = replies
+        .iter()
+        .filter_map(|reply| match reply {
+            ReplyEffect::Transaction {
+                identity, result, ..
+            } if identity.client == CLIENT.client => {
+                Some((identity.request, result.generation, result.seq))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        written,
+        vec![
+            (cases::M9_S0_REQUEST, generation, Seq(2)),
+            (cases::M9_D3_SECOND_REQUEST, generation, Seq(3)),
+        ],
+        "both writes are published after the re-emit; replies: {replies:#?}"
+    );
+    let healthy = trace.events.iter().any(|event| {
+        event.node == B_NODE
+            && active.is_some_and(|at| event.logical_tick > at)
+            && matches!(
+                event.kind,
+                TraceKind::ProtectionState {
+                    phase: ProtectionPhase::Healthy,
+                    ..
+                }
+            )
+    });
+    assert!(healthy, "L1 is healthy again after the re-emit");
 }

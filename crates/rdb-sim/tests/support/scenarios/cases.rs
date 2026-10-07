@@ -589,3 +589,72 @@ pub fn case_m9_d2_read_only_empty_heals_then_submit() -> Scenario {
         ],
     )
 }
+
+/// The M9 D3 case: when A's cut links heal. After the commit and the start record's publication
+/// (about t2500), and before the rebuild's second sync deadline.
+pub const M9_D3_A_BACK_AT: u64 = 4_000;
+
+/// The M9 D3 case's two client writes. L1 resumes its 5 s hold when the partition goes `Active`
+/// (about t4010), and was healthy by t10000 in the probe's run (`s0-probe.md` E6).
+pub const M9_D3_SUBMIT_AT: [u64; 2] = [12_000, 15_000];
+
+/// The M9 D3 case's second request. The first is [`M9_S0_REQUEST`].
+pub const M9_D3_SECOND_REQUEST: RequestId = RequestId(11);
+
+/// The M9 D3 case's tick budget: the second write's deadline and its publication, with room.
+pub const M9_D3_MAX_TICKS: u64 = M9_D3_SUBMIT_AT[1] + 2_000;
+
+/// M9 D3: an empty partition that starts with one copy cut off, then gets it back (lead ruling
+/// "S0 D3", Gautam chose option 1 on 2026-10-07).
+///
+/// B and C survive empty; A's links are cut until [`M9_D3_A_BACK_AT`]. F1 commits `DegradedRf2`
+/// at cutoff 0, and the start record is published at seq 1 on B and C. A returns, catches up to
+/// seq 1, and F1 re-emits the same result as `Active`. That re-emit used to rewind R1 and P1 to
+/// the selected cutoff, 0: R1 then had no head to send, so no copy's lag ever dropped and L1
+/// never resumed; P1's published position went from 1 back to 0, so a read was refused. Now a
+/// re-emit in the generation already served keeps what is held above the cutoff, and both
+/// writes are published, at seq 2 and 3.
+#[must_use]
+pub fn case_m9_d3_degraded_empty_gets_a_copy_back_then_writes() -> Scenario {
+    authored(
+        "case_m9_d3_degraded_empty_gets_a_copy_back_then_writes",
+        Budget {
+            max_events: 8_000,
+            max_ticks: M9_D3_MAX_TICKS,
+        },
+        vec![
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: B_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: C_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Network(NetworkOp::Partition {
+                set_a: vec![A_NODE],
+                set_b: vec![B_NODE, C_NODE],
+            }),
+            ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+                partition: PARTITION,
+                window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+            }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_A_BACK_AT - PLAN_AT,
+            }),
+            ScenarioOp::Network(NetworkOp::Heal),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_SUBMIT_AT[0] - M9_D3_A_BACK_AT,
+            }),
+            submit(M9_S0_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_SUBMIT_AT[1] - M9_D3_SUBMIT_AT[0],
+            }),
+            submit(M9_D3_SECOND_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_MAX_TICKS - M9_D3_SUBMIT_AT[1],
+            }),
+        ],
+    )
+}
