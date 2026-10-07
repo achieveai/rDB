@@ -6441,3 +6441,111 @@ fn m7a_191_p1_does_not_adopt_another_partitions_view() {
         "M7A-191: no slot for P2 made"
     );
 }
+
+// ---- M9 S0: the kernel's start record -----------------------------------------------------------
+
+/// The kernel's start record as a candidate at `seq`: request [`RequestIdentity::START_RECORD`].
+fn start_candidate(seq: u64) -> EventKind {
+    let mut candidate = candidate_of(P, seq, seq);
+    candidate.request = RequestIdentity::START_RECORD;
+    EventKind::Kernel(KernelEvent::AppliedCandidate(Box::new(candidate)))
+}
+
+/// T1 is told the start record published, as it is told any record.
+fn notify_start(seq: u64) -> EffectKind {
+    EffectKind::Kernel(KernelEffect::Published {
+        lineage: lineage(),
+        seq: Seq(seq),
+        record_digest: d(seq),
+        request: RequestIdentity::START_RECORD,
+    })
+}
+
+/// M9 S0 rule 5, publish. The start record's candidate arms the deadline and writes no status
+/// entry; its publish moves the position, opens the old-prefix view, tells T1 and cancels the
+/// deadline, and asks no `Reply` check, so nothing awaits a reply. Twin, one fact apart (the
+/// identity): the next client record's candidate writes its `Unknown` entry as ever.
+#[retcd_test]
+fn m9_s0_08_p1_publishes_the_start_record_with_no_status_entry_and_no_reply() {
+    let mut rig = Rig::new();
+    let t = rig.now + 10;
+    assert_eq!(rig.step(start_candidate(5)), vec![arm(1, t + DEADLINE)]);
+    rig.qualify(5);
+    assert_eq!(
+        rig.step(gained(5)),
+        vec![check(Checkpoint::Publication, corr(1))]
+    );
+    rig.snapshot_at(5);
+    assert_eq!(
+        rig.step(answer(Checkpoint::Publication, corr(1), Verdict::Admit)),
+        vec![open(1), notify_start(5), cancel(1)]
+    );
+    let view = rig.view();
+    assert_eq!(view.published.seq, Seq(5));
+    assert_eq!(view.pending, None);
+    assert_eq!(view.mode, PubMode::Serving);
+    assert!(view.awaiting_reply.is_empty(), "nothing awaits a reply");
+
+    let t = rig.now + 10;
+    assert_eq!(
+        rig.step(candidate(6, 6)),
+        vec![
+            arm(2, t + DEADLINE),
+            status_write(6, 6, StatusOutcome::Unknown, t)
+        ]
+    );
+}
+
+/// M9 S0 rule 5, deadline. The start record's post-apply deadline writes no status entry and
+/// sends no reply, and freezes the partition as for any unresolved record. The late publish still
+/// publishes and reopens it (K-A-47), again with no reply.
+#[retcd_test]
+fn m9_s0_09_p1_the_start_records_deadline_writes_no_status_and_no_reply() {
+    let mut rig = Rig::new();
+    rig.step(start_candidate(5));
+    assert_eq!(rig.step(deadline(P, 1)), vec![]);
+    let view = rig.view();
+    assert_eq!(
+        view.mode,
+        PubMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction
+        }
+    );
+    assert!(view.pending.expect("kept").replied);
+
+    rig.qualify(5);
+    let c = publication_check(&rig.step(gained(5)));
+    rig.snapshot_at(5);
+    assert_eq!(
+        rig.step(answer(Checkpoint::Publication, c, Verdict::Admit)),
+        vec![open(1), notify_start(5), cancel(1)]
+    );
+    assert_eq!(rig.view().mode, PubMode::Serving);
+    assert!(rig.view().awaiting_reply.is_empty());
+}
+
+/// M9 S0 rule 4. A status query for the reserved identity is refused
+/// `INVALID_ARGUMENT{identity}`, with or without a generation. Twin: a client's identity P1 never
+/// saw is answered, not refused.
+#[retcd_test]
+fn m9_s0_10_p1_status_refuses_the_start_record_identity() {
+    let mut rig = Rig::new();
+    for generation in [Some(GEN), None] {
+        assert_eq!(
+            rig.step(EventKind::Client(ClientEvent::Status {
+                identity: RequestIdentity::START_RECORD,
+                generation,
+            })),
+            vec![EffectKind::Reply(ReplyEffect::Failed {
+                identity: RequestIdentity::START_RECORD,
+                error: RdbError::InvalidArgument { field: "identity" },
+            })],
+            "{generation:?}"
+        );
+    }
+    let answered = rig.step(status(9, Some(GEN)));
+    assert!(
+        matches!(answered.as_slice(), [EffectKind::Reply(ReplyEffect::Status { identity, .. })] if *identity == req(9)),
+        "{answered:?}"
+    );
+}

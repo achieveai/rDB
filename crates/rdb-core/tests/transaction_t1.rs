@@ -49,8 +49,9 @@ use rdb_core::transaction::dedup::{
     dedup_key, dedup_value, DedupIndex, Retained, RetainedAnswer, SEED_PAGE,
 };
 use rdb_core::transaction::{
-    deny_error, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode, Transaction,
-    TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX, RETENTION_CAP_ENTRIES,
+    deny_error, Boundary, DenyContext, FreezeCause, Inflight, Limits, QueueMode, StartRecord,
+    Transaction, TxnEffect, TxnEvent, TxnRejection, BATCH_TAG, ID_COUNTER_MAX,
+    RETENTION_CAP_ENTRIES,
 };
 
 // The kernels beside T1 in the rows that cross a seam (M7A-144, M7A-146, M7A-147).
@@ -396,6 +397,20 @@ impl H {
     }
 
     fn live_with(limits: Limits) -> Self {
+        Self::live_at(limits, 0)
+    }
+
+    /// [`Self::live`], but cut at seq 1: a partition with a history, which owes no start record
+    /// (M9 S0 rule 7). For a row that pushes a newer view and is not about an empty partition. At
+    /// cut 0 that view now sends the kernel's start record (M9 S0 rule 1), which is S0's
+    /// subject and not the row's.
+    fn non_empty() -> Self {
+        Self::live_at(Limits::default(), 1)
+    }
+
+    /// Live at generation 7, cut at `cutoff`, L1 allowing. The snapshot shows the cut, so the
+    /// (empty) seed loads at once.
+    fn live_at(limits: Limits, cutoff: u64) -> Self {
         let mut h = Self {
             t1: Transaction::with_limits(limits),
             snap: Snap::default(),
@@ -403,8 +418,9 @@ impl H {
             node: NODE_A,
             boot: BootId(1),
         };
+        h.snap.at = Seq(cutoff);
         assert_eq!(
-            h.step(recovered(GEN, 0, NODE_A, PartitionMode::Active)),
+            h.step(recovered(GEN, cutoff, NODE_A, PartitionMode::Active)),
             vec![]
         );
         assert_eq!(h.step(admission(true, None)), vec![]);
@@ -1107,7 +1123,7 @@ fn a_key_without_a_scope_prefix_is_invalid_not_a_pass() {
 
 #[retcd_test]
 fn check_six_denies_past_the_horizon_with_the_views_reason() {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let mut fenced = view(GEN, 2, 20);
     fenced.past_horizon = DenyReason::GenerationChanged;
     assert_eq!(
@@ -1116,7 +1132,7 @@ fn check_six_denies_past_the_horizon_with_the_views_reason() {
     );
     h.now = 20;
     let _ = h.admit(put(1, b"k", b"v"));
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(fenced))));
     h.now = 21;
     assert_eq!(
@@ -1170,7 +1186,7 @@ fn fence_view(reason: DenyReason) -> Event {
 /// Live, holding the fence view for `reason`, and nothing else from the fence. The `Freeze` that
 /// travels with the view is M7A-138's; holding it back is what leaves check 6 alone to decide.
 fn behind_fence_view(reason: DenyReason) -> H {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(fence_view(reason)), vec![]);
     h
 }
@@ -1672,7 +1688,7 @@ fn m7a_80_seq_reservation_discardable_on_dispatch_deny() {
 
 #[retcd_test]
 fn only_our_answer_at_a_fresh_enough_authority_seq_is_heard() {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
         GEN,
         5,
@@ -1931,7 +1947,7 @@ fn a_retired_generation_is_not_reloaded_by_a_later_seed() {
 /// `Freeze{Expired}`. Returns the harness, A's correlation, the freeze's effects, and
 /// `(next_seq, prev_digest)` from before A.
 fn frozen_while_awaiting() -> (H, CorrelationId, Vec<EffectKind>, (Seq, Digest)) {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push_view(2)), vec![]);
     let before = (h.k().next_seq(), h.k().prev_digest());
     let correlation = h.admit(put(1, b"a", b"1"));
@@ -3443,7 +3459,7 @@ fn at_id_counter_exhaustion_a_new_identity_is_overloaded_and_a_retry_replays() {
 /// waited for good. The near miss: one id left still re-asks.
 #[retcd_test]
 fn at_id_counter_exhaustion_an_outstanding_check_is_refused_not_wedged() {
-    let mut h = H::live_with(ids_spent_after(2));
+    let mut h = H::live_at(ids_spent_after(2), 1);
     let c1 = h.admit(put(1, b"a", b"1"));
     assert_eq!(h.step(submit(put(2, b"b", b"2"))), vec![]);
     let _ = h.step(push_view(2));
@@ -3460,7 +3476,7 @@ fn at_id_counter_exhaustion_an_outstanding_check_is_refused_not_wedged() {
         vec![(1, ErrorKind::Overloaded), (2, ErrorKind::Overloaded)]
     );
     assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
-    assert_eq!(h.k().next_seq(), Seq(1), "nothing was dispatched");
+    assert_eq!(h.k().next_seq(), Seq(2), "nothing was dispatched");
 }
 
 /// A-R73 item 3, with tester-t1's attack_c1. A re-ask never outlives the request's deadline:
@@ -3468,7 +3484,7 @@ fn at_id_counter_exhaustion_an_outstanding_check_is_refused_not_wedged() {
 /// (A-R71, hunt_19). The near miss: one millisecond earlier it is asked again.
 #[retcd_test]
 fn a_stale_answer_past_the_deadline_refuses_rather_than_re_asks() {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     let c1 = h.admit(put(1, b"a", b"1"));
     let _ = h.step(push_view(2));
     h.now = 10 + 1_000 - 1;
@@ -4548,7 +4564,7 @@ fn push(view: AuthorityView) -> Event {
 /// effect is the dispatch check), and one tick later the next is refused in the same step with
 /// `past_horizon`'s code and nothing sent to A1.
 fn assert_boundary_at(view: AuthorityView, what: &str) {
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(view)), vec![], "{what}: adopted");
     assert_boundary_in(&mut h, view, what);
 }
@@ -4591,7 +4607,7 @@ fn m7a_144_admission_boundary_at_valid_through_tick() {
         (Tick(2_000), DenyReason::ClockSampleStale),
         "M7A-143's view"
     );
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(view)), vec![]);
     h.now = 2_000;
     let _ = h.admit(put(1, b"a", b"1"));
@@ -4641,7 +4657,7 @@ fn m7a_146_admission_horizon_follows_the_sample() {
     assert_boundary_at(wide, "ε 90");
     // One T1 through the move: it holds ε 20's view, adopts ε 90's (a sample does not bump
     // `authority_seq`, so an equal seq must replace), and its boundary moves to 2809.
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(narrow)), vec![]);
     assert_eq!(
         h.step(push(wide)),
@@ -4685,7 +4701,7 @@ fn m7a_147_stale_authority_view_never_replaces_newer() {
     let older = view(GEN, 4, u64::MAX);
     let stale = vec![ignored(AuthorityIgnoreReason::StaleAuthorityView)];
 
-    let mut h = H::live();
+    let mut h = H::non_empty();
     assert_eq!(h.step(push(newer)), vec![], "T1");
     assert_eq!(h.step(push(older)), stale, "T1");
     assert_eq!(h.k().authority(), Some(&newer), "T1 keeps seq 5");
@@ -5244,4 +5260,180 @@ fn m7a_190_t1_does_not_adopt_another_partitions_view() {
         held,
         "M7A-190: T1's view unchanged"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M9 S0: the kernel's start record (lead ruling "S0 start record", Gautam chose A, 2026-10-07)
+// ---------------------------------------------------------------------------------------------
+
+/// The `StorageDispatch` check the start record goes out under, at the view `authority_seq`.
+fn start_answer(correlation: CorrelationId, authority_seq: u64, verdict: Verdict) -> Event {
+    answer(correlation, authority_seq, verdict)
+}
+
+/// Answer `correlation` `Admit` at `authority_seq` and expect the start record's batch at seq 1:
+/// only the History and Progress writes, no `User` and no `Dedup` (rule 3). Lands it, publishes
+/// it, and returns nothing to anyone.
+fn commit_and_publish_start(h: &mut H, correlation: CorrelationId, authority_seq: u64) {
+    let effects = h.step(start_answer(correlation, authority_seq, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected the start record's batch, got {effects:?}");
+    };
+    assert_eq!(batch.seq, Seq(1), "the start record is seq 1");
+    assert_eq!(
+        batch.writes.iter().map(|w| w.ns).collect::<Vec<_>>(),
+        vec![Namespace::History, Namespace::Progress],
+        "no User and no Dedup write"
+    );
+    let batch = batch.id;
+    let effects = h.step(committed(batch, 1));
+    let [EffectKind::Kernel(KernelEffect::LocalApplied { seq, .. }), EffectKind::Kernel(KernelEffect::AppliedCandidate(candidate))] =
+        effects.as_slice()
+    else {
+        panic!("expected LocalApplied and the candidate, got {effects:?}");
+    };
+    assert_eq!(*seq, Seq(1));
+    assert_eq!(candidate.request, RequestIdentity::START_RECORD);
+    let record_digest = candidate.record_digest;
+    let effects = h.step(kernel(KernelEvent::Published {
+        lineage: lineage(),
+        seq: Seq(1),
+        record_digest,
+        request: RequestIdentity::START_RECORD,
+    }));
+    assert_eq!(
+        effects,
+        vec![],
+        "published, retained nowhere, answered to nobody"
+    );
+    assert!(h.k().dedup().is_empty(), "the start record retains nothing");
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+}
+
+/// M9 S0 rules 1 and 3. A cut-0 activation owes the start record and sends nothing at
+/// `Recovered` (the fixture asserts both of its steps are empty). The first newer view sends
+/// exactly one `StorageDispatch` check; a second view while it waits sends nothing. Admitted, it
+/// commits at seq 1 with no User and no Dedup write, publishes with no reply, and the client's
+/// first write then lands at seq 2. A later view sends nothing again: once per generation.
+#[retcd_test]
+fn m9_s0_03_a_cut_zero_activation_sends_one_start_record_at_seq_one() {
+    let mut h = H::live();
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+    let c = only_check(&h.step(push_view(2)));
+    assert_eq!(h.k().start_record(), StartRecord::Sent { under: 2 });
+    assert_eq!(h.step(push_view(3)), vec![], "one start record at a time");
+    commit_and_publish_start(&mut h, c, 3);
+    assert_eq!(h.k().next_seq(), Seq(2));
+    assert_eq!(h.step(push_view(4)), vec![], "once per generation");
+
+    let c = h.admit(put(1, b"a", b"1"));
+    let effects = h.step(answer(c, 4, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected the client's batch, got {effects:?}");
+    };
+    assert_eq!(batch.seq, Seq(2), "the client's first write is seq 2");
+}
+
+/// M9 S0 rule 7. A cut-1 activation owes nothing: newer views send no check at all.
+#[retcd_test]
+fn m9_s0_04_a_cut_one_activation_sends_no_start_record() {
+    let mut h = H::non_empty();
+    assert_eq!(h.k().start_record(), StartRecord::NotOwed);
+    assert_eq!(h.step(push_view(2)), vec![]);
+    assert_eq!(h.step(push_view(3)), vec![]);
+    assert_eq!(h.k().inflight(), None);
+    assert_eq!(h.k().next_seq(), Seq(2));
+}
+
+/// M9 S0 rule 2. A1 denies the start record. The refusal is recorded, never answered to a
+/// client, and owes it again: not under the view that refused it (a repeat of that view sends
+/// nothing), but at the next newer one, which sends it and lands it at seq 1.
+#[retcd_test]
+fn m9_s0_05_a_refused_start_record_is_sent_again_under_a_newer_view() {
+    let mut h = H::live();
+    let c = only_check(&h.step(push_view(2)));
+    let effects = h.step(start_answer(c, 2, Verdict::Deny(DenyReason::Expired)));
+    assert_eq!(
+        effects,
+        vec![EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::Error(ErrorKind::LeaseExpired)
+        })],
+        "refused, recorded, answered to nobody"
+    );
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 2 });
+    assert_eq!((h.k().inflight(), h.k().next_seq()), (None, Seq(1)));
+    assert_eq!(
+        h.step(push_view(2)),
+        vec![],
+        "not again under the refusing view"
+    );
+    let c = only_check(&h.step(push_view(3)));
+    commit_and_publish_start(&mut h, c, 3);
+}
+
+/// M9 S0 rule 1, the `next_seq` conjunct. When a client write already took seq 1 under the
+/// recovery's view (L1 allowing at once), the partition has its first record and a newer view
+/// sends no start record.
+#[retcd_test]
+fn m9_s0_06_no_start_record_once_seq_one_is_taken() {
+    let mut h = H::live();
+    let (_, seq) = h.resolve(put(1, b"a", b"1"));
+    assert_eq!(seq, 1);
+    assert_eq!(h.step(push_view(2)), vec![]);
+    assert_eq!((h.k().inflight(), h.k().next_seq()), (None, Seq(2)));
+}
+
+/// M9 S0 rule 4. Admission check 10 refuses a client request that carries the reserved
+/// identity `INVALID_ARGUMENT{identity}`, and it is otherwise a valid request: the same body
+/// under a client's identity is admitted.
+#[retcd_test]
+fn m9_s0_07_admission_refuses_the_start_record_identity() {
+    let mut h = H::non_empty();
+    // Its key is in the reserved tenant, so check 3 passes and check 10 is what refuses it.
+    let mut req = put(1, b"a", b"1");
+    req.identity = RequestIdentity::START_RECORD;
+    req.mutations = vec![Mutation::Put {
+        key: scoped_key(RequestIdentity::START_RECORD.tenant, AFF, b"a"),
+        value: Bytes::from_static(b"1"),
+        expected_version: None,
+    }];
+    let effects = h.step(submit(req.clone()));
+    assert_eq!(
+        effects,
+        vec![EffectKind::Reply(ReplyEffect::Failed {
+            identity: RequestIdentity::START_RECORD,
+            error: RdbError::InvalidArgument { field: "identity" },
+        })]
+    );
+    assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
+    let _ = h.admit(put(1, b"a", b"1"));
+}
+
+/// M9 S0 rule 1, "T1 `Open`". An empty partition recovered read-only owes the start record but
+/// sends nothing while frozen, even under a newer view, and queues nothing. Once the activation
+/// re-emit lifts read-only, the next newer view sends it.
+#[retcd_test]
+fn m9_s0_14_a_read_only_empty_partition_sends_no_start_record_until_it_opens() {
+    let mut h = H::live();
+    let g8 = Generation(8);
+    let g8_view = |seq| {
+        kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+            g8,
+            seq,
+            u64::MAX,
+        ))))
+    };
+    let _ = h.step(recovered(g8, 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+
+    assert_eq!(h.step(g8_view(2)), vec![], "read-only: nothing is sent");
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+    assert_eq!((h.k().inflight(), h.k().queue_len()), (None, 0));
+
+    let active = at_revision(recovered(g8, 0, NODE_A, PartitionMode::Active), 3);
+    let _ = h.step(active);
+    assert_eq!(*h.k().mode(), QueueMode::Open);
+    let _ = only_check(&h.step(g8_view(3)));
+    assert_eq!(h.k().start_record(), StartRecord::Sent { under: 3 });
 }

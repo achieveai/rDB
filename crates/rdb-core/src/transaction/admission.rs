@@ -239,6 +239,11 @@ fn cross_affinity(req: &TxnRequest) -> Option<RdbError> {
 
 /// Check 10: the field name of the first structural fault.
 fn malformed(req: &TxnRequest) -> Option<&'static str> {
+    // The kernel's own start record (M9 S0): no client may write under its identity, or the
+    // record that has no dedup row would be indistinguishable from a client write that has one.
+    if req.identity == RequestIdentity::START_RECORD {
+        return Some("identity");
+    }
     if req.mutations.is_empty() || req.mutations.len() > MAX_REQUEST_MUTATIONS {
         return Some("mutations");
     }

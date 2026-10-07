@@ -160,6 +160,23 @@ pub struct RequestIdentity {
     pub request: RequestId,
 }
 
+impl RequestIdentity {
+    /// The identity of the kernel's own start record: the one empty record T1 writes at seq 1
+    /// when a partition first activates at cutoff 0, so an empty partition has a record for its
+    /// copies to ACK (M9 S0 lead ruling, approved 2026-10-07).
+    ///
+    /// Reserved. No client may use it: admission refuses a request that carries it, and a status
+    /// query for it is refused. It has no dedup row, no status entry and no reply.
+    ///
+    /// Every field is its type's maximum, never zero: a zero identity is a real position and is
+    /// also `Default`, so a zero would collide with an unset identity.
+    pub const START_RECORD: Self = Self {
+        tenant: TenantId(u32::MAX),
+        client: ClientId(u32::MAX),
+        request: RequestId(u64::MAX),
+    };
+}
+
 /// What a copy is allowed to do for the protection predicate.
 ///
 /// The distinction is a safety rule, not bookkeeping: a shadow acknowledgement never qualifies

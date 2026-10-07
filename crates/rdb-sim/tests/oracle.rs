@@ -3073,3 +3073,57 @@ fn m7v_88_every_oracle_fixture_passes_the_runners_validator() {
     }
     tracing::info!("m7v_88 every oracle construction refuses an unrealizable trace");
 }
+
+// ------------------------------------------------------------------------------------------
+// INV-LAG — M9 S0: the start record
+// ------------------------------------------------------------------------------------------
+
+/// An empty partition's pause-to-healthy cycle (barrier 0). The record at seq 1 is applied under
+/// [`CORR2`], admitted first when `admitted`; every pinned copy is then durable at `durable`.
+fn start_cycle(case: &str, admitted: bool, durable: Seq) -> Trace {
+    let pinned =
+        |phase, age, since| protection(phase, age, &[N1, N2, N3], CONFIG_V1, Seq(0), Seq(0), since);
+    let mut b = base(case).about(CORR2).at(1_000);
+    if admitted {
+        b = b.push(admit(Seq(1), &[N1, N2, N3], CONFIG_V1));
+    }
+    b = b
+        .at(2_000)
+        .about(CORR1)
+        .push(pinned(ProtectionPhase::Paused, 1_800, None))
+        .about(CORR2)
+        .apply(Seq(1), &[], ApplyOutcome::Applied)
+        .about(CORR1);
+    for node in [N1, N2, N3] {
+        b = b.flush(node, durable);
+    }
+    b.at(3_000)
+        .push(pinned(ProtectionPhase::Resuming, 0, Some(3_000)))
+        .at(8_000)
+        .push(pinned(ProtectionPhase::Healthy, 0, Some(3_000)))
+        .build()
+}
+
+#[retcd_test]
+fn m9_s0_13_lag_the_start_record_alone_past_barrier_zero_is_clean() {
+    support::preamble();
+    // An empty partition pauses at barrier 0, where every copy already is, so the barrier cannot
+    // gate the resume: the start record at seq 1 is what lets L1 resume (M9 S0 rule 1).
+    proven(
+        &judge(&start_cycle("m9-s0-13", false, Seq(1))),
+        Invariant::Lag,
+    );
+
+    // Seq 1 carrying an admitted write is an overshoot, as before.
+    violated(
+        &judge(&start_cycle("m9-s0-13b", true, Seq(1))),
+        Invariant::Lag,
+        "resume_barrier_not_exact",
+    );
+    // So is anything past seq 1, start record or not.
+    violated(
+        &judge(&start_cycle("m9-s0-13c", false, Seq(2))),
+        Invariant::Lag,
+        "resume_barrier_not_exact",
+    );
+}

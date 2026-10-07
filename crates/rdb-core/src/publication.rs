@@ -462,6 +462,10 @@ fn route(ctx: &StepCtx<'_>, event: &Event, slot: &mut Slot, effect: PubEffect) -
             identity: request,
             status: status::to_wire(outcome),
         }),
+        PubEffect::StatusQueryRefused { request } => EffectKind::Reply(ReplyEffect::Failed {
+            identity: request,
+            error: RdbError::InvalidArgument { field: "identity" },
+        }),
         PubEffect::Mode { reader, mode } => {
             EffectKind::Kernel(KernelEffect::Publication(PublicationEffect::Mode {
                 identity: reader,

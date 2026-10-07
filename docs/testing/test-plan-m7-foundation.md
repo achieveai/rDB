@@ -1,4 +1,4 @@
-<!-- drift-basis: 017b772 -->
+<!-- drift-basis: e9c9a7a -->
 
 # Test Plan — M7, team foundation (C0, H1, M1, I1)
 
@@ -1042,6 +1042,10 @@ re-read, not before it.
 ### 15.11 Rebase from `4f4a2c3` to `017b772` (2026-10-02, lead)
 
 `017b772` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat 4f4a2c3 017b772 -- crates/rdb-core/src/contracts` touches one file, `authority.rs` (+7): one variant, `AuthorityIgnoreReason::WatchProgressOnly`, appended last after `UnmatchedCompletion` with its doc comment. The hunk sits after old `:903`, so every line from old `:904` down shifts +7; `AuthorityEvent` is now declared at `:1093`. It is PR #1 R1-F012's answer for a held `WatchProgress` (lead ruling A-R24; contract change approved by Gautam 2026-10-01). No other contract file changed. This plan's live citations into `contracts/authority.rs` all sit above old `:904`. The only ones past it, `:998` and `:1080`, are in §15.3, §15.4 and §15.10, dated entries frozen at their own basis, and are left as written. This plan does not enumerate `AuthorityIgnoreReason`; that is kernel-a's leaf. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
+
+### 15.12 Rebase from `017b772` to `e9c9a7a` (2026-10-07, dev-m9-kernel)
+
+**Re-read (2026-10-07, dev-m9-kernel), basis moves `017b772` → `e9c9a7a`.** `e9c9a7a` is now the newest commit touching `crates/rdb-core/src/contracts`. `git diff --stat 017b772 e9c9a7a -- crates/rdb-core/src/contracts` touches one file, `ids.rs` (+17): one associated constant, `RequestIdentity::START_RECORD` (every field at its type's maximum), in a new `impl RequestIdentity` block directly after the struct, with its doc comment. It is M9 S0's reserved identity for the kernel's start record, the one empty record T1 writes at seq 1 when a partition first activates at cutoff 0 (lead ruling "S0 start record", Gautam chose A on 2026-10-07). No type, field or variant is added, removed or renamed. The hunk sits after old `:161`, so every declaration from old `:162` down shifts +17; `ReplicaRole` moves `:168` → `:185`. This plan's `ids.rs` line citations are `SnapshotHandle` at `:96` and §15.9's dated `ControlRequestId` hunk at old `:97`; both sit above the hunk, so neither moved. M7F-36's `grep -n 'impl From<'` check is unaffected: the new `impl` block holds one constant and no `From`. No foundation row builds or reads a `RequestIdentity` value, so the identity's reservation (admission check 10 and P1's status query now refuse it) reaches no row here. Nothing here lowers an assertion or reopens an ask. Marker moved after this re-read, not before it.
 
 ---
 
