@@ -735,16 +735,27 @@ impl ProgressTracker {
     /// the cutoff, every other copy at zero, one predicate, nothing diverged. Each other copy the
     /// barrier requires gets its proved floor at the cutoff, which only the repeat judgment reads
     /// (lead ruling B-R67f).
+    ///
+    /// M9 S0 D3: a re-emit in the generation already served cuts at this copy's own head when
+    /// that is above the cutoff, so R1's head and T1's next sequence still agree. Everything
+    /// above the cutoff was written in this generation, and [`Self::refuses`] has already
+    /// matched the cutoff in this copy's history. A retired tracker, or any other generation,
+    /// cuts at the cutoff.
     fn rebuilt(&self, result: &RecoveryResult) -> Self {
         let config = &result.committed.pinned_config;
         let cutoff = result.selected.cutoff_seq;
+        let head = if !self.retired && result.new_generation == self.lineage.generation {
+            cutoff.max(self.head())
+        } else {
+            cutoff
+        };
         let mut history = self.history.clone();
-        history.truncate_above(cutoff);
+        history.truncate_above(head);
         let durable = self.own_progress().progress.durable;
         let local = ReplicaProgress {
-            received: ReceivedSeq(cutoff.0),
-            buffered_applied: AppliedSeq(cutoff.0),
-            durable: DurableSeq(durable.0.min(cutoff.0)),
+            received: ReceivedSeq(head.0),
+            buffered_applied: AppliedSeq(head.0),
+            durable: DurableSeq(durable.0.min(head.0)),
         };
         let lineage = Lineage {
             partition: config.partition,

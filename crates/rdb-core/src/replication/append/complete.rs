@@ -72,6 +72,12 @@ impl AppendReceiver {
     /// at or below the cutoff — the cutoff pair itself on `Match`, its own older head when it is
     /// behind — and asks the new primary for everything after it.
     ///
+    /// One exception keeps a head (M9 S0 D3): F1's re-emit of the generation this copy already
+    /// serves, when the copy holds the cutoff (`Match`) and has applied past it, and is neither
+    /// quarantined nor retired. Then the copy keeps its applied head, because everything above
+    /// the cutoff came from this generation's primary, and asks for what follows it. A
+    /// quarantined copy still truncates to the cutoff, since its suffix is the divergence.
+    ///
     /// A pin for another partition, or one naming no primary, is refused and changes nothing.
     /// A pin that names this copy no serving member on this node — the r04 swap makes it the
     /// primary, or drops it — retires it (lead ruling B-R58a, F4): it adopts the new generation,
@@ -98,10 +104,16 @@ impl AppendReceiver {
             return invalid();
         };
         let selected = &result.selected;
-        let anchor = match self
+        let lookup = self
             .history
-            .lookup(selected.cutoff_seq, selected.cutoff_digest)
-        {
+            .lookup(selected.cutoff_seq, selected.cutoff_digest);
+        let keeps_head = lookup == DigestLookup::Match
+            && !self.retired
+            && self.quarantine.is_none()
+            && self.lineage.generation == result.new_generation
+            && self.applied_head.seq > selected.cutoff_seq;
+        let anchor = match lookup {
+            _ if keeps_head => Some(self.applied_head),
             DigestLookup::Differs { .. } => None,
             DigestLookup::Match | DigestLookup::NotRetained => {
                 let Some((seq, digest)) = self.history.at_or_below(selected.cutoff_seq) else {

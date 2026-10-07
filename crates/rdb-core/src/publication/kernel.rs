@@ -472,6 +472,20 @@ const fn deny_kind(reason: DenyReason) -> ErrorKind {
     reason.client_error_kind(Boundary::PreApply)
 }
 
+/// The mode a `Recovered` puts P1 in: an active or degraded recovery serves, a read-only one is
+/// frozen for it, a blocked one stays blocked for its reason.
+fn recovered_mode(mode: &PartitionMode) -> PubMode {
+    match mode {
+        PartitionMode::Active | PartitionMode::DegradedRf2 => PubMode::Serving,
+        PartitionMode::ReadOnly => PubMode::Frozen {
+            cause: FreezeCause::RecoveryReadOnly,
+        },
+        PartitionMode::Blocked { reason } => PubMode::Blocked {
+            reason: reason.clone(),
+        },
+    }
+}
+
 /// The pending candidate, as a row may assert it. No sequence: §4.3 invariant 2 forbids a `pub`
 /// accessor for the applied prefix, and the pending candidate's sequence is exactly that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1499,6 +1513,19 @@ impl PubKernel {
     }
 
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
+        // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
+        // was published, the candidate pending and the replies owed all belong to this lineage,
+        // so only the mode changes. The view still moves, at the same published position, so a
+        // re-emit asks storage for exactly what a rebase to an unmoved position would.
+        if self.lineage == result.selected.root {
+            let mut effects = self.move_view();
+            let mode = recovered_mode(&result.mode);
+            if self.mode != mode {
+                self.mode = mode;
+                effects.extend(self.drain_waiters());
+            }
+            return effects;
+        }
         self.lineage = result.selected.root;
         self.published_seq = result.selected.cutoff_seq;
         self.status.fold_recovered(&result.retained_status_map);
@@ -1527,15 +1554,7 @@ impl PubKernel {
         // asked at a position no longer published.
         effects.extend(self.move_view());
         self.pending = None;
-        self.mode = match &result.mode {
-            PartitionMode::Active | PartitionMode::DegradedRf2 => PubMode::Serving,
-            PartitionMode::ReadOnly => PubMode::Frozen {
-                cause: FreezeCause::RecoveryReadOnly,
-            },
-            PartitionMode::Blocked { reason } => PubMode::Blocked {
-                reason: reason.clone(),
-            },
-        };
+        self.mode = recovered_mode(&result.mode);
         // Not in the design: a waiter queued behind the dropped candidate would otherwise hang.
         // `Serving` and read-only answer it at the rebased position; `Blocked` refuses it.
         effects.extend(self.drain_waiters());

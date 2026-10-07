@@ -6549,3 +6549,100 @@ fn m9_s0_10_p1_status_refuses_the_start_record_identity() {
         "{answered:?}"
     );
 }
+
+// ---- M9 S0 D3: F1's re-emit of the lineage already served ---------------------------------------
+
+/// F1's re-emit of the lineage P1 already serves, at selected cutoff `cutoff` (T-B-03): the
+/// result `recovered` builds, with its root, generation and view on the rig's own lineage.
+fn reemitted(mode: PartitionMode, cutoff: u64) -> EventKind {
+    let EventKind::Kernel(KernelEvent::Recovered(mut result)) =
+        recovered(mode, cutoff, false, None)
+    else {
+        unreachable!("`recovered` builds a Recovered")
+    };
+    result.selected.root = lineage();
+    result.new_generation = GEN;
+    result.committed.authority_view.lineage = lineage();
+    EventKind::Kernel(KernelEvent::Recovered(result))
+}
+
+/// M9 S0 D3 (lead ruling "S0 D3" rule 4). F1 re-emits the lineage P1 already serves as `Active`
+/// once the rebuild finishes, with the cutoff it selected long before. Published 5 (its reply
+/// still owed), candidate 6 pending, and a `Fresh` reader waiting behind it: the re-emit changes
+/// none of them. The view still moves, at the same position. Before the fix the published
+/// position fell to the cutoff, the candidate was dropped, the owed reply was withheld, and a
+/// read was refused because storage's view sat above what P1 called published (host walk A12).
+#[retcd_test]
+fn m9_d3_01_p1_a_re_emit_of_the_served_lineage_keeps_published_pending_and_owed_replies() {
+    let mut rig = Rig::new();
+    let c5 = rig.published(5);
+    let c6 = rig.pending_with_recheck(6);
+    assert_eq!(rig.admitted(read(21)), vec![], "21 waits behind 6");
+    let before = rig.view();
+    assert_eq!(
+        rig.step(reemitted(PartitionMode::Active, START)),
+        vec![release(1), open(2)],
+        "no reply withheld, no reader answered: only the view moves"
+    );
+    let after = rig.view();
+    assert_eq!(
+        after.published, before.published,
+        "published never goes down"
+    );
+    assert_eq!(after.pending, before.pending, "the candidate is kept");
+    assert_eq!(
+        after.awaiting_reply, before.awaiting_reply,
+        "the owed reply is kept"
+    );
+    assert_eq!(after.waiters, vec![req(21)], "the reader still waits");
+    assert_eq!(after.mode, PubMode::Serving);
+    assert_eq!(after.opening.get(&snap(2)), Some(&before.published));
+
+    assert_eq!(
+        rig.step(answer(Checkpoint::Reply, c5, Verdict::Admit)),
+        vec![txn_reply(5, 5)],
+        "the write published before the re-emit is answered"
+    );
+    rig.snapshot_at(6);
+    let effects = rig.step(answer(Checkpoint::Publication, c6, Verdict::Admit));
+    assert!(
+        effects.contains(&read_reply(
+            21,
+            ReadServiceOutcome::WaitedAtBarrier,
+            Some(value_at(6))
+        )),
+        "the kept candidate publishes and the Fresh reader is answered there: {effects:?}"
+    );
+    assert_eq!(rig.view().published.seq, Seq(6));
+}
+
+/// M9 S0 D3, the mode half of rule 4. A re-emit of the served lineage that changes the mode is
+/// still a mode transition, so it drains the waiters (K-A-14), here into `ReadOnly`, which
+/// answers a read at the published position. The candidate and the owed reply are kept.
+#[retcd_test]
+fn m9_d3_02_p1_a_re_emit_that_changes_the_mode_answers_its_waiters_and_keeps_the_rest() {
+    let mut rig = Rig::new();
+    rig.published(5);
+    rig.pending_with_recheck(6);
+    assert_eq!(rig.admitted(read(21)), vec![]);
+    let before = rig.view();
+    assert_eq!(
+        rig.step(reemitted(PartitionMode::ReadOnly, START)),
+        vec![
+            release(1),
+            open(2),
+            read_reply(21, ReadServiceOutcome::WaitedAtBarrier, Some(value_at(5)))
+        ]
+    );
+    let after = rig.view();
+    assert_eq!(
+        after.mode,
+        PubMode::Frozen {
+            cause: FreezeCause::RecoveryReadOnly
+        }
+    );
+    assert_eq!(
+        (after.published, after.pending, after.awaiting_reply),
+        (before.published, before.pending, before.awaiting_reply)
+    );
+}

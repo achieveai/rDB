@@ -7149,3 +7149,64 @@ fn m7b_226_a_shipped_record_is_forgotten_when_a_cursor_takes_the_copy_or_the_cop
         );
     }
 }
+
+// --- M9 S0 D3: F1's re-emit of the generation already served ------------------------------
+
+/// The primary rebuilt into `NEW_GEN` at `HEAD + 1`, then one local write: head `HEAD + 2`.
+/// Returns it and the recovery it was rebuilt from.
+fn written_past_the_cutoff() -> (ProgressTracker, RecoveryResult) {
+    let mut tracker = tracker();
+    local_applied(&mut tracker, HEAD + 1);
+    let result = recovery(HEAD + 1, d(HEAD + 1), pin_without_b());
+    tracker.on_recovered(&result, T);
+    local_applied(&mut tracker, HEAD + 2);
+    assert_eq!(
+        (tracker.lineage().generation, tracker.head()),
+        (NEW_GEN, Seq(HEAD + 2))
+    );
+    (tracker, result)
+}
+
+/// M9 S0 D3 (lead ruling "S0 D3" rule 3). F1 re-emits the result this primary was rebuilt from,
+/// once its rebuild finishes. The primary wrote `HEAD + 2` in this generation since: the rebuild
+/// keeps it, so R1's head still agrees with T1's next sequence and the keepalive has a record to
+/// send. The base stays at the cutoff; the anchor is the seed head, as for every rebuild
+/// (B-R47a), so a copy re-proves through `HEAD + 2` to qualify. Before the fix the head fell back
+/// to the cutoff and the primary sent nothing again (`s0-probe.md` D3).
+#[retcd_test]
+fn m9_d3_07_tracker_a_re_emit_of_its_generation_keeps_its_own_head() {
+    let (mut tracker, result) = written_past_the_cutoff();
+    tracker.on_recovered(&result, T);
+    assert_eq!(tracker.head(), Seq(HEAD + 2));
+    assert_eq!(tracker.history().highest(), Some(Seq(HEAD + 2)));
+    assert_eq!(
+        tracker.peer(COPY_A).expect("A").progress,
+        progress(HEAD + 2, HEAD + 2, HEAD)
+    );
+    assert_eq!(
+        (tracker.base_seq(), tracker.anchor(), tracker.retired()),
+        (Seq(HEAD + 1), Seq(HEAD + 2), false)
+    );
+}
+
+/// M9 S0 D3, rule 3's retired guard. A pin in the same generation that names this node a
+/// secondary retires the primary; a re-emit that pins it primary again rebuilds it at the
+/// cutoff, as before the fix, and unretires it.
+#[retcd_test]
+fn m9_d3_08_tracker_a_retired_primary_is_rebuilt_at_the_cutoff_on_a_re_emit() {
+    let (mut tracker, result) = written_past_the_cutoff();
+    let elsewhere = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, RegularSecondary),
+            member(COPY_C, C, Primary),
+            member(COPY_D, D, RegularSecondary),
+        ],
+    );
+    let mut moved = result.clone();
+    moved.committed.pinned_config = elsewhere;
+    tracker.on_recovered(&moved, T);
+    assert!(tracker.retired());
+    tracker.on_recovered(&result, T);
+    assert_eq!((tracker.head(), tracker.retired()), (Seq(HEAD + 1), false));
+}
