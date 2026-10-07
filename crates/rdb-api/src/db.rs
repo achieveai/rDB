@@ -189,6 +189,8 @@ pub struct PutOk {
     pub outcome: Outcome,
     /// What was true when the reply was sent.
     pub durability: Durability,
+    /// The request as sent, so the caller can [`Db::resend`] it.
+    pub sent: Box<TxnRequest>,
 }
 
 /// A served read.
@@ -367,13 +369,14 @@ impl Db {
             _ => None,
         };
         match self.call(call, self.timeouts.put) {
-            Some(Answer::Txn { result, .. }) => Ok(PutOk {
+            Some(Answer::Txn { result, request }) => Ok(PutOk {
                 request: identity.request,
                 generation: result.generation,
                 owner_epoch: result.owner_epoch,
                 seq: result.seq,
                 outcome: result.outcome,
                 durability: result.durability,
+                sent: Box::new(request),
             }),
             Some(Answer::Error { error, request }) => Err(PutError {
                 error,

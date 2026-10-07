@@ -9,7 +9,8 @@
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
-//! retry                                   send the last put's request again, unchanged
+//! retry [<request>]                       send a put's request again, unchanged: the latest
+//!                                         put's, or the one this session sent as <request>
 //! get <object>                            read at the publication barrier
 //! status <request> [<generation>]         what became of a request this session sent
 //! nodes                                   each node's view of partition 1
@@ -332,7 +333,7 @@ fn repl(
         },
         None => Box::new(std::io::BufReader::new(std::io::stdin())),
     };
-    let mut last: Option<TxnRequest> = None;
+    let mut sent = Sent::default();
     let mut bad = false;
     for line in input.lines() {
         let Ok(line) = line else { break };
@@ -351,19 +352,15 @@ fn repl(
                 Ok(if_version) => {
                     put_line(
                         db.put(object.as_bytes(), value.as_bytes(), if_version),
-                        &mut last,
+                        &mut sent,
                     );
                     Ok(())
                 }
                 Err(e) => Err(e),
             },
-            ["retry"] => match last.clone() {
-                Some(request) => {
-                    put_line(db.resend(request), &mut last);
-                    Ok(())
-                }
-                None => Err("no put to retry yet".to_owned()),
-            },
+            ["retry", rest @ ..] => sent.pick(rest).map(|request| {
+                put_line(db.resend(request), &mut sent);
+            }),
             ["get", object] => {
                 get_line(db, object.as_bytes());
                 Ok(())
@@ -449,12 +446,54 @@ fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
     }
 }
 
-fn put_line(answer: Result<rdb_api::PutOk, PutError>, last: &mut Option<TxnRequest>) {
+/// Every put request this session sent, and which put came last. `retry` replays the latest
+/// put, whatever it answered, or nothing when the latest put sent nothing (PC11).
+#[derive(Debug, Default)]
+struct Sent {
+    by_id: std::collections::BTreeMap<u64, TxnRequest>,
+    latest: Option<Option<u64>>,
+}
+
+impl Sent {
+    fn record(&mut self, request: Option<TxnRequest>) {
+        let id = request.map(|request| {
+            let id = request.identity.request.0;
+            self.by_id.insert(id, request);
+            id
+        });
+        self.latest = Some(id);
+    }
+
+    fn pick(&self, rest: &[&str]) -> Result<TxnRequest, String> {
+        let id = match rest {
+            [] => match self.latest {
+                None => return Err("no put to retry yet".to_owned()),
+                Some(None) => {
+                    return Err("the latest put sent no request; nothing to retry".to_owned())
+                }
+                Some(Some(id)) => id,
+            },
+            [id] => id
+                .parse()
+                .map_err(|_| "retry [<request>]: a request id is a number".to_owned())?,
+            _ => return Err("retry [<request>]".to_owned()),
+        };
+        self.by_id
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| format!("this session sent no put as request {id}"))
+    }
+}
+
+fn put_line(answer: Result<rdb_api::PutOk, PutError>, sent: &mut Sent) {
     match answer {
-        Ok(ok) => say(&format!(
-            "ok p=1 gen={} seq={} {:?} request={}",
-            ok.generation.0, ok.seq.0, ok.durability, ok.request.0
-        )),
+        Ok(ok) => {
+            say(&format!(
+                "ok p=1 gen={} seq={} {:?} request={}",
+                ok.generation.0, ok.seq.0, ok.durability, ok.request.0
+            ));
+            sent.record(Some(*ok.sent));
+        }
         Err(PutError { error, request }) => {
             let id = request
                 .as_ref()
@@ -466,9 +505,7 @@ fn put_line(answer: Result<rdb_api::PutOk, PutError>, last: &mut Option<TxnReque
                 error.no_mutation,
                 error.detail
             ));
-            if let Some(request) = request {
-                *last = Some(*request);
-            }
+            sent.record(request.map(|request| *request));
         }
     }
 }
