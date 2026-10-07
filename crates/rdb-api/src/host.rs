@@ -467,6 +467,9 @@ struct RebuildWatch {
     /// F1 asked for a post-commit sync: the rebuild point is pinned, and F1's own deadline
     /// (`RebuildStalled`) bounds the rest.
     pinned: bool,
+    /// The copies F1 has named in `RebuildStalled`: each is reported once, though F1 names it
+    /// again at every deadline.
+    unproven: BTreeSet<CopyId>,
 }
 
 /// L1 for one partition, with the next evaluation H1 owes it.
@@ -1405,8 +1408,9 @@ impl Host {
         Ok(())
     }
 
-    /// D2: a commit below `Active` is watched until F1 pins its rebuild or activates; one that
-    /// does neither within the wait is reported once (`recovery_rebuild_stalled`).
+    /// D2: a commit below `Active` is watched until it activates. One F1 never pins within the
+    /// wait is reported once (`recovery_rebuild_stalled`); once pinned, F1's own deadline names
+    /// each copy that has not proved the point (`RebuildStalled`), and the host reports that.
     fn watch_rebuild(&mut self, result: &RecoveryResult, partition: PartitionId) {
         if result.mode == PartitionMode::Active {
             self.rebuilds.remove(&partition);
@@ -1446,6 +1450,7 @@ impl Host {
                 required,
                 since: now,
                 pinned: false,
+                unproven: BTreeSet::new(),
             },
         );
         self.stalled.remove(&partition);
@@ -1488,6 +1493,47 @@ impl Host {
             waited_ms,
             phase = %phase,
             host_catch_up = "unsupported",
+            "recovery_rebuild_stalled"
+        );
+        self.stalled.insert(partition, line);
+    }
+
+    /// F1's deadline passed with `copy` still short of the pinned point. The first time F1 names
+    /// a copy it joins the stall line; a repeat changes nothing, so the line stays as printed.
+    fn rebuild_stalled(&mut self, partition: PartitionId, copy: CopyId) {
+        let Some(watch) = self.rebuilds.get_mut(&partition) else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = partition.0,
+                copy = copy.0,
+                "rebuild_stalled_unwatched"
+            );
+            return;
+        };
+        if !watch.unproven.insert(copy) {
+            return;
+        }
+        let phase = self
+            .recoveries
+            .get(&partition)
+            .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+        let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
+        let unproven: Vec<u8> = watch.unproven.iter().map(|copy| copy.0).collect();
+        let line = format!(
+            "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
+             unproven={unproven:?} phase={phase}: F1 pinned its rebuild, but these copies have \
+             not proved it, so the partition stays read-only",
+            partition.0, watch.generation.0, watch.mode, watch.cutoff.0,
+        );
+        tracing::error!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = watch.generation.0,
+            mode = ?watch.mode,
+            cutoff = watch.cutoff.0,
+            required = ?required,
+            unproven = ?unproven,
+            phase = %phase,
             "recovery_rebuild_stalled"
         );
         self.stalled.insert(partition, line);
@@ -1687,9 +1733,13 @@ impl Host {
             | RecoveryEffect::CloseWindow
             | RecoveryEffect::Selected(_)
             | RecoveryEffect::Quarantine(_)
-            | RecoveryEffect::BlockPromotion { .. }
-            | RecoveryEffect::RebuildStalled { .. } => {
+            | RecoveryEffect::BlockPromotion { .. } => {
                 tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
+                Ok(())
+            }
+            RecoveryEffect::RebuildStalled { copy } => {
+                tracing::info!(node, partition = site.partition.0, ?effect, "recovery_fact");
+                self.rebuild_stalled(site.partition, *copy);
                 Ok(())
             }
             RecoveryEffect::QueryInventory { copies } => {
@@ -2598,11 +2648,13 @@ mod tests {
     }
 
     /// Defect D2 (2026-10-07, `rdb_dev --hold 1-2,1-3`, walk A10): with both secondaries
-    /// unreachable F1 commits `ReadOnly` at cutoff 0, and its rebuild never pins because no copy
-    /// is behind. F1 arms no timer before the pin, so the partition stayed read-only in silence.
-    /// The host now reports it once, with the mode and the copies it waits on (lead ruling).
+    /// unreachable F1 commits `ReadOnly` at cutoff 0, and the partition stayed read-only in
+    /// silence. Since the D2 kernel step, F1 pins that rebuild at the commit and, at each
+    /// deadline, names every copy that has not proved the point (`RebuildStalled`). The host
+    /// turns that into one stall line naming the mode and those copies, which stays as printed
+    /// while F1 keeps naming them.
     #[test]
-    fn a_read_only_commit_whose_rebuild_never_pins_is_reported_stalled() {
+    fn a_read_only_commit_at_cutoff_zero_reports_its_unproven_copies_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2620,38 +2672,51 @@ mod tests {
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::start();
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        // The same run as the walk, faster: a short discovery window and a short watch.
+        // The walk, faster: F1's deadline is the discovery window. The never-pinned watch is
+        // pushed out of reach, so only F1's own report can produce the line.
         host.budgets.discovery_window_millis = 20;
-        host.rebuild_pin_wait_millis = 50;
+        host.rebuild_pin_wait_millis = 60_000;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
         }))
         .expect("bootstrap");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let stalled = loop {
+        let partition = PartitionId(1);
+        let step = |host: &mut Host| {
             host.run_due();
             host.drain();
-            assert_eq!(
-                host.fault, None,
-                "the watch reports; it never faults the node"
-            );
-            if let Some(line) = host.status(PartitionId(1)).stalled {
-                break line;
-            }
-            assert!(Instant::now() < deadline, "no stall reported within 5 s");
+            assert_eq!(host.fault, None, "a stall is reported, never a fault");
             if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
                 host.handle(msg);
             }
         };
-        let status = host.status(PartitionId(1));
-        assert_eq!(status.recovery.as_deref(), Some("Rebuilding"));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stalled = loop {
+            step(&mut host);
+            if let Some(line) = host.status(partition).stalled {
+                break line;
+            }
+            assert!(Instant::now() < deadline, "no stall reported within 5 s");
+        };
+        assert!(host.rebuilds[&partition].pinned, "F1 pinned at the commit");
+        assert_eq!(
+            host.status(partition).recovery.as_deref(),
+            Some("Rebuilding")
+        );
         for part in [
-            "recovery_rebuild_stalled partition=1 gen=1 mode=ReadOnly cutoff=0 required=[0, 1, 2]",
-            "phase=Rebuilding host_catch_up=unsupported",
+            "recovery_rebuild_stalled partition=1 gen=1 mode=ReadOnly cutoff=0 required=[0, 1, 2] \
+             unproven=[1, 2]",
+            "phase=Rebuilding",
         ] {
             assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
         }
+
+        // Five more of F1's deadlines: it names both copies again, and the line does not move.
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            step(&mut host);
+        }
+        assert_eq!(host.status(partition).stalled, Some(stalled));
     }
 
     /// Tester gap G1 (2026-10-07, mutant M3): the stall watch must stay quiet for an `Active`
@@ -2722,8 +2787,10 @@ mod tests {
     }
 
     /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild
-    /// is pinned and the watch must stay quiet. The D2 row's start (`ReadOnly` at cutoff 0),
-    /// then the `SyncWalThrough` F1 sends at commit, through the host's own effect path.
+    /// is pinned and the never-pinned watch must stay quiet. The D2 row's start (`ReadOnly` at
+    /// cutoff 0), then the `SyncWalThrough` F1 sends at commit, through the host's own effect
+    /// path. Since the D2 kernel step F1 also names the held copies at its deadline, so a stall
+    /// line does appear; this row pins only that it is never the never-pinned one.
     #[test]
     fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
@@ -2756,9 +2823,11 @@ mod tests {
             host.drain();
             assert_eq!(host.fault, None);
             assert_eq!(
-                host.status(partition).stalled,
+                host.status(partition)
+                    .stalled
+                    .filter(|line| line.contains("never pinned")),
                 None,
-                "a pinned rebuild was reported"
+                "a pinned rebuild was reported never pinned"
             );
             if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
                 host.handle(msg);
@@ -2801,7 +2870,6 @@ mod tests {
                 .any(|item| matches!(item, Delayed::RebuildCheck { .. })),
             "the rebuild check has not run yet"
         );
-        assert_eq!(host.status(partition).stalled, None);
     }
 
     /// OB2 (2026-10-07, `rdb_dev` at dd41368): `nodes` printed every secondary as `gen=0
