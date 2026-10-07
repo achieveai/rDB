@@ -2523,4 +2523,71 @@ mod tests {
             assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
         }
     }
+
+    /// Tester gap G1 (2026-10-07, mutant M3): the stall watch must stay quiet for an `Active`
+    /// commit. Watching one too printed `stalled ... mode=Active phase=Committed` on every
+    /// healthy start, and no row failed. Three nodes, no holds, driven past the watch's wait.
+    #[test]
+    fn an_active_commit_is_never_reported_stalled() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let store: Arc<dyn config_core::ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let control =
+            ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
+        let clock = HostClock::start();
+        let mut nodes = Vec::new();
+        for n in 1..=3u32 {
+            let engine = RocksEngine::open(dir.path().join(n.to_string())).expect("open engine");
+            let (tx, rx) = mpsc::channel();
+            links.register(NodeId(n), tx.clone());
+            let mut host = Host::new(
+                NodeId(n),
+                engine,
+                Arc::clone(&links),
+                Arc::clone(&control),
+                clock,
+            );
+            host.budgets.discovery_window_millis = 20;
+            host.rebuild_pin_wait_millis = 50;
+            nodes.push((host, tx, rx));
+        }
+        let owner = nodes[0].1.clone();
+        rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
+            owner.send(msg).map_err(|_| NodeStopped(NodeId(1)))
+        }))
+        .expect("bootstrap");
+
+        // Drive all three until node 1 has landed generation 1, then for 4x the watch's wait.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut quiet_until = None;
+        loop {
+            for (host, _, rx) in &mut nodes {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    host.handle(msg);
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+            }
+            let status = nodes[0].0.status(PartitionId(1));
+            assert_eq!(status.stalled, None, "a healthy start reported a stall");
+            if status.recovered == Some(Generation(1)) && quiet_until.is_none() {
+                assert_eq!(status.recovery.as_deref(), Some("Committed"));
+                quiet_until = Some(Instant::now() + Duration::from_millis(200));
+            }
+            if quiet_until.is_some_and(|until| Instant::now() >= until) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "generation 1 not landed within 5 s: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
