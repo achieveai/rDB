@@ -7238,3 +7238,40 @@ fn m9_f2_a_tracker_a_re_emit_of_its_generation_keeps_a_diverged_copy_diverged() 
         "a new generation clears it"
     );
 }
+
+/// M9 S0 F1 (ruling 2026-10-07, item 4). F1's rebuild can prove a copy durable above the
+/// selected cutoff: at the start record the selected cutoff is 0 and the barrier's is 1, so
+/// P > C. The rebuild sets each required copy's proved floor at the selected cutoff, never above
+/// it, because everything above it is this generation's and the copy may still truncate there.
+/// Here C is proved at `HEAD + 2` over a re-emit cut at `HEAD + 1`: the repeat judgment knows C
+/// holds `HEAD + 1`, not `HEAD + 2`, and C's watermarks stay at zero. Before the fix the floor
+/// was the barrier's cutoff; the critic's note on commit 1 is that a stale ACK at that floor
+/// could then be judged a repeat at the mark and drive a cursor with no mark. Near-miss: a copy
+/// the barrier does not name keeps no floor at all.
+#[retcd_test]
+fn m9_f1_a_tracker_the_proved_floor_never_rises_above_the_selected_cutoff() {
+    let (mut tracker, mut result) = written_past_the_cutoff();
+    let above = Seq(HEAD + 2);
+    let proof = DurableProof {
+        copy: COPY_C,
+        partition: P,
+        seq: DurableSeq(above.0),
+        digest: d(above.0),
+    };
+    result.barrier =
+        RecoveryBarrier::try_new(&[proof], &[COPY_C].into_iter().collect(), above, d(above.0))
+            .expect("C proved above the selected cutoff");
+    assert_eq!(
+        (result.selected.cutoff_seq, result.barrier.cutoff()),
+        (Seq(HEAD + 1), above)
+    );
+    tracker.on_recovered(&result, T);
+    assert_eq!(tracker.head(), above, "the re-emit keeps the head");
+    assert_eq!(
+        tracker.known(COPY_C),
+        Some(progress(HEAD + 1, HEAD + 1, HEAD + 1)),
+        "the floor is the selected cutoff"
+    );
+    assert_eq!(tracker.peer(COPY_C).expect("C").progress, progress(0, 0, 0));
+    assert_eq!(tracker.known(COPY_D), Some(progress(0, 0, 0)));
+}

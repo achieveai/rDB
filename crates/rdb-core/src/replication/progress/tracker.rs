@@ -51,8 +51,9 @@ pub struct CopyProgress {
     /// Its watermarks as its last admitted ACK stated them. Zero until it proves otherwise.
     pub progress: ReplicaProgress,
     /// The position a `Recovered` barrier's `DurableAt` proof established for this incarnation
-    /// of the copy: the cutoff on all three watermarks when the barrier requires the copy, zero
-    /// otherwise (lead rulings B-R67e and B-R67f). Each `Recovered` restates it, replacing the
+    /// of the copy: the selected cutoff on all three watermarks when the barrier requires the
+    /// copy, never the barrier's own cutoff when that is higher (M9 S0 ruling 2026-10-07, item 4),
+    /// zero otherwise (lead rulings B-R67e and B-R67f). Each `Recovered` restates it, replacing the
     /// last, and a restarted copy starts again at zero.
     ///
     /// Read **only** by the repeat judgment ([`ProgressTracker::known`]). No watermark, view,
@@ -741,7 +742,8 @@ impl ProgressTracker {
     /// the cutoff, every other copy at zero, one predicate, nothing diverged in a new generation.
     /// A re-emit of the generation already served keeps each diverged copy it still names: its
     /// quarantine is sticky there (M9 S0 ruling 2026-10-07, item 3). Each other copy the
-    /// barrier requires gets its proved floor at the cutoff, which only the repeat judgment reads
+    /// barrier requires gets its proved floor at the selected cutoff, even when the barrier
+    /// proves it higher (M9 S0 ruling 2026-10-07, item 4); only the repeat judgment reads it
     /// (lead ruling B-R67f).
     ///
     /// M9 S0 D3: a re-emit in the generation already served cuts at this copy's own head when
@@ -789,13 +791,15 @@ impl ProgressTracker {
                 .filter(|copy| rebuilt.peers.contains_key(copy))
                 .collect();
         }
-        let barrier = &result.barrier;
+        // M9 S0 ruling 2026-10-07, item 4: the floor is the selected cutoff, never the barrier's.
+        // F1 can prove a copy above it (the start record: cutoff 0, barrier 1), and everything
+        // above the cutoff is this generation's, which a copy may still truncate.
         let floor = ReplicaProgress {
-            received: ReceivedSeq(barrier.cutoff().0),
-            buffered_applied: AppliedSeq(barrier.cutoff().0),
-            durable: DurableSeq(barrier.cutoff().0),
+            received: ReceivedSeq(cutoff.0),
+            buffered_applied: AppliedSeq(cutoff.0),
+            durable: DurableSeq(cutoff.0),
         };
-        for copy in barrier.required() {
+        for copy in result.barrier.required() {
             if let Some(peer) = rebuilt.peers.get_mut(copy).filter(|_| *copy != self.own) {
                 peer.proved = floor;
             }
