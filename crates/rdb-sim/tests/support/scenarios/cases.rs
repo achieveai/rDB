@@ -531,3 +531,61 @@ pub fn case_m9_s0_empty_recovery_then_submit() -> Scenario {
         ],
     )
 }
+
+/// The M9 D2 case: when the cut links heal. After the commit (fence plus discovery's window) and
+/// before the rebuild's first sync deadline, which falls one window after the commit.
+pub const M9_D2_HEAL_AT: u64 = 3_000;
+
+/// The M9 D2 case: when the client writes. The partition goes `Active` at the first sync deadline
+/// after the heal (commit plus one window), and L1 is healthy by t10000 in the observed run.
+pub const M9_D2_SUBMIT_AT: u64 = 12_000;
+
+/// The M9 D2 case's tick budget: the write's deadline and its publication, with room.
+pub const M9_D2_MAX_TICKS: u64 = M9_D2_SUBMIT_AT + 2_000;
+
+/// M9 D2: an empty partition recovered read-only while two copies are cut off, then healed and
+/// written to (lead ruling "S0 D2", Gautam chose option 1 on 2026-10-07).
+///
+/// B alone survives, empty, and its links to C and A are cut from the start. F1 commits
+/// `ReadOnly` at cutoff 0. Before the D2 fix nothing ever pinned the rebuild: no copy is behind
+/// an empty prefix, so R1 starts no catch-up and reports no `CopyCaughtUp`, and the partition
+/// stayed read-only for ever. Now F1 pins `(0, ROOT)` at the commit and asks every copy to sync;
+/// the two cut-off copies cannot answer, and the deadline asks them again after the heal. The
+/// partition goes `Active`, the start record is published at seq 1 and the write at seq 2.
+#[must_use]
+pub fn case_m9_d2_read_only_empty_heals_then_submit() -> Scenario {
+    authored(
+        "case_m9_d2_read_only_empty_heals_then_submit",
+        Budget {
+            max_events: 6_000,
+            max_ticks: M9_D2_MAX_TICKS,
+        },
+        vec![
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: B_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Network(NetworkOp::Partition {
+                set_a: vec![B_NODE],
+                set_b: vec![C_NODE, A_NODE],
+            }),
+            ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+                partition: PARTITION,
+                window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+            }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D2_HEAL_AT - PLAN_AT,
+            }),
+            ScenarioOp::Network(NetworkOp::Heal),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D2_SUBMIT_AT - M9_D2_HEAL_AT,
+            }),
+            // The S0 case's request: the M9 sim rows read one client identity.
+            submit(M9_S0_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D2_MAX_TICKS - M9_D2_SUBMIT_AT,
+            }),
+        ],
+    )
+}

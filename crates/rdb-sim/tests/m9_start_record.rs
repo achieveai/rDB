@@ -15,12 +15,19 @@
 //!
 //! Both drive the real grammar lowering and runner (host flusher and first `AcquireDue`
 //! included) and read only the replies and the trace.
+//!
+//! **D2** (lead ruling "S0 D2", Gautam chose option 1 on 2026-10-07) is the same empty partition
+//! recovered `ReadOnly` because two copies were cut off. Its rebuild never finished: nothing is
+//! behind an empty prefix, so no catch-up ever pinned the rebuild point. F1 now pins `(0, ROOT)`
+//! at such a commit and asks again at each sync deadline, so the partition opens once the
+//! copies return.
 
 mod support;
 
 use bytes::Bytes;
 use config_log::retcd_test;
 use rdb_core::authority::partition::PartitionRecord;
+use rdb_core::contracts::authority::PartitionMode;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent, ReplyEffect};
@@ -31,7 +38,7 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::time::Tick;
-use rdb_core::contracts::trace::{Provenance, Trace, TraceKind};
+use rdb_core::contracts::trace::{KernelNote, Provenance, SyncWithheldReason, Trace, TraceKind};
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest, TxnResult};
 use rdb_core::contracts::version::API_VERSION;
 use rdb_sim::harness::run::{RunPlan, Runner, SeedEvent, StopReason};
@@ -192,7 +199,7 @@ fn run(plan: &RunPlan) -> (Vec<ReplyEffect>, Trace) {
     tracing::info!(stop = ?report.stop, events = report.events_consumed, "run report");
     assert!(
         matches!(report.stop, StopReason::DeadlineReached { deadline, .. }
-            if deadline == Tick(MAX_TICKS)),
+            if deadline == plan.limits.deadline),
         "runs to its tick budget, never out of events: {:?}",
         report.stop
     );
@@ -286,5 +293,79 @@ fn m9_s0_12_the_corpus_case_publishes_its_write_at_seq_two() {
     let plan =
         scenario_run::lower(&cases::case_m9_s0_empty_recovery_then_submit()).expect("lowers");
     let (replies, trace) = run(&plan);
+    assert_first_write_at_seq_two(&replies, &trace, Generation(2));
+}
+
+/// Every `Recovered` F1 emitted on the primary, as `(tick, mode, cutoff)`, in trace order.
+fn recovered_on_primary(trace: &Trace) -> Vec<(u64, PartitionMode, Seq)> {
+    trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note: KernelNote::RecoveredFact { result },
+                ..
+            } => Some((
+                event.logical_tick,
+                result.mode.clone(),
+                result.selected.cutoff_seq,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// D2-0 (lead ruling "S0 D2", proof 1): B alone survives an empty partition while C and A are
+/// cut off, so F1 commits `ReadOnly` at cutoff 0. The commit's sync cannot reach C or A; after
+/// the heal the deadline asks them again, the partition goes `Active`, and the first client
+/// write is published at seq 2, after the start record. Before the fix the partition stayed
+/// read-only for ever and the write was refused.
+#[retcd_test]
+fn m9_d2_00_a_read_only_empty_partition_heals_and_publishes_the_first_write_at_seq_two() {
+    let heal = cases::M9_D2_HEAL_AT;
+    let plan = scenario_run::lower(&cases::case_m9_d2_read_only_empty_heals_then_submit())
+        .expect("lowers");
+    let (replies, trace) = run(&plan);
+    let recovered = recovered_on_primary(&trace);
+    tracing::info!(?recovered, "d2.recovered");
+    assert!(
+        matches!(recovered.first(), Some((at, PartitionMode::ReadOnly, Seq::ZERO)) if *at < heal),
+        "committed read-only at cutoff 0 before the heal: {recovered:?}"
+    );
+    assert!(
+        recovered.iter().any(|(at, mode, cutoff)| *at > heal
+            && *mode == PartitionMode::Active
+            && *cutoff == Seq::ZERO),
+        "active after the heal, never before: {recovered:?}"
+    );
+    assert!(
+        recovered
+            .iter()
+            .all(|(at, mode, _)| *mode != PartitionMode::Active || *at > heal),
+        "a cut link withholds the sync, so nothing activates before the heal: {recovered:?}"
+    );
+    let withheld: Vec<CopyId> = trace
+        .events
+        .iter()
+        .filter(|event| event.logical_tick < heal)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note:
+                    KernelNote::SyncWithheld {
+                        copy,
+                        cutoff: Seq::ZERO,
+                        reason: SyncWithheldReason::Stalled,
+                    },
+                ..
+            } => Some(*copy),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        withheld,
+        vec![CopyId(1), CopyId(2)],
+        "the commit's sync to each cut-off copy is withheld"
+    );
     assert_first_write_at_seq_two(&replies, &trace, Generation(2));
 }
