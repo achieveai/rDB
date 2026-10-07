@@ -189,12 +189,15 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
   entries; a stale slot under a live block; a stray slot under a split's new block; a wrong `bytes` total. A split
   checks only its new block's base key, with one `version` call. A scan for the slots would be one call too, but it
   returns the first record at or after the base key, which is normally the next object's, so its bytes are not bounded
-  by B (L-R186el). Writes never make any of these: `model_run` checks after every step that
+  by B (L-R186el). Such a slot outlives the block's retire or merge-back, which delete slots 1 … `head` only; a later
+  drop of the emptied list then refuses `OrphanElement`, so only `clear_object` removes the list. Writes never make any
+  of these: `model_run` checks after every step that
   - the `0x02` keys are exactly the out-of-line entries' ids (the first two);
   - no id is read twice (the third);
   - every `0x03` key belongs to a block the root names, and each slot holds an op no in 1 … `head` at slot `op mod 240`
-    (the fourth, except a slot left by a fold: it holds an old op no in range, and a fold deletes nothing, §3);
-  - `bytes` matches the codec (the fifth).
+    (the fourth and fifth, except a slot left by a fold: it holds an old op no in range, and a fold deletes
+    nothing, §3);
+  - `bytes` matches the codec (the sixth).
 
 ### 8. Every list request names its generation (kept)
 - A list request carries `expected_generation: Some(generation)` (ADR-rdb-0014 decision 12): the root's version guards
