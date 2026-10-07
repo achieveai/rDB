@@ -6096,3 +6096,195 @@ fn m7b_240_a_lost_cas_completion_is_bounded_by_the_discovery_timer() {
         read_result(ReadOutcome::Absent { as_of: Revision(6) }),
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// M9 S0 D2 (lead ruling "S0 D2", Gautam chose option 1 on 2026-10-07): a `ReadOnly` commit at
+// cutoff 0 pins its rebuild at `(0, ROOT)` itself, and asks again at each deadline.
+// ---------------------------------------------------------------------------------------------
+
+/// The anchor of a partition whose history starts at the root: base 0, digest `ROOT`.
+fn root_anchor() -> LineageAnchor {
+    LineageAnchor {
+        lineage: prior(),
+        base_seq: Seq::ZERO,
+        base_digest: Digest::ROOT,
+    }
+}
+
+/// The digest at `seq` of the history from the root: the root itself at 0, branch 0 above it.
+fn from_root(seq: u64) -> Digest {
+    if seq == 0 {
+        Digest::ROOT
+    } else {
+        dg(0, seq)
+    }
+}
+
+/// A survivor of the partition anchored at the root, holding `1..=head` (nothing at head 0).
+fn from_root_inv(copy: CopyId, head: u64) -> SurvivorInventory {
+    SurvivorInventory {
+        copy,
+        anchor_seen: root_anchor(),
+        head: (Seq(head), from_root(head)),
+        ladder: (0..=head).map(|s| (Seq(s), from_root(s))).collect(),
+        quarantined: None,
+    }
+}
+
+/// `survivors` hold `1..=head` of a partition anchored at the root and every other copy failed
+/// its inventory. Each survivor proves `head`, and the recovery CAS commits at revision 9 at
+/// tick 3_100. Returns the F1 and the commit's effects.
+fn committed_from_root(survivors: &[CopyId], head: u64) -> (F1, Vec<EffectKind>) {
+    let mut f1 = fenced_on(RecoveryPlan {
+        anchor: root_anchor(),
+        ..plan(&[])
+    });
+    for &copy in survivors {
+        f1.report(10, from_root_inv(copy, head));
+    }
+    for copy in [A, B, C].into_iter().filter(|c| !survivors.contains(c)) {
+        f1.rec(10, RecoveryEvent::InventoryFailed { copy });
+    }
+    f1.step(WINDOW, fired(1));
+    for &copy in survivors {
+        f1.rec(3_000, durable(copy, head, from_root(head)));
+    }
+    let commit = f1.step(3_100, cas_result(CasOutcome::Committed(Revision(9))));
+    (f1, commit)
+}
+
+/// The pin's deadline: the commit arms F1's one timer as version 4 (the fence armed 1,
+/// selection 2, the recovery CAS 3) at the commit plus the discovery window.
+const PIN_DEADLINE: u64 = 3_100 + WINDOW;
+
+/// D2 rule 1: a `ReadOnly` commit at cutoff 0 pins `(0, ROOT)` and asks every required copy to
+/// sync, in the commit's own step and under a fresh deadline. No catch-up is needed: three root
+/// proofs propose the activation, and it re-emits `Active` at cutoff 0.
+#[retcd_test]
+fn m9_d2_01_a_read_only_commit_at_cutoff_zero_pins_and_syncs_every_copy() {
+    let (mut f1, commit) = committed_from_root(&[A], 0);
+    let result = recovered(&commit);
+    assert_eq!(
+        (result.mode, result.selected.cutoff_seq),
+        (PartitionMode::ReadOnly, Seq::ZERO)
+    );
+    assert_eq!(
+        commit[1..].to_vec(),
+        vec![sync(A, 0), sync(B, 0), sync(C, 0), arm(4, PIN_DEADLINE)],
+        "pinned at the commit, after its Recovered"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(3_200, durable(A, 0, Digest::ROOT)), not_durable);
+    assert_eq!(f1.rec(3_201, durable(B, 0, Digest::ROOT)), not_durable);
+    assert_eq!(
+        f1.rec(3_202, durable(C, 0, Digest::ROOT)),
+        vec![cas(Revision(9), A), arm(5, 3_202 + WINDOW)]
+    );
+    let active = recovered(&f1.step(3_300, cas_result(CasOutcome::Committed(Revision(11)))));
+    assert_eq!(
+        (active.mode, active.selected.cutoff_seq),
+        (PartitionMode::Active, Seq::ZERO)
+    );
+    assert_eq!(f1.module.rebuild_required(), None);
+}
+
+/// D2 rule 2: pinned at the commit, the rebuild asks again at each deadline, only the copies
+/// still unproven, under a fresh deadline each time. The copies were cut off when the commit
+/// asked, and nothing else would ever ask again. A rebuild a catch-up pinned does not re-send
+/// (B-R52 as written; `m7b_153` pins that).
+#[retcd_test]
+fn m9_d2_02_a_commit_pinned_rebuild_asks_each_missing_copy_again_at_its_deadline() {
+    let (mut f1, _) = committed_from_root(&[A], 0);
+    f1.rec(3_200, durable(A, 0, Digest::ROOT));
+    let second = PIN_DEADLINE + WINDOW;
+    assert_eq!(
+        f1.step(PIN_DEADLINE, fired(4)),
+        vec![
+            stalled(B),
+            stalled(C),
+            sync(B, 0),
+            sync(C, 0),
+            arm(5, second)
+        ]
+    );
+    assert_eq!(
+        f1.rec(PIN_DEADLINE + 10, durable(B, 0, Digest::ROOT)),
+        vec![ign(ReplicaIgnoreReason::BarrierNotDurable)]
+    );
+    assert_eq!(
+        f1.step(second, fired(5)),
+        vec![stalled(C), sync(C, 0), arm(6, second + WINDOW)],
+        "only the copy still unproven"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Rebuilding);
+    assert_eq!(
+        f1.module.rebuild_required(),
+        Some(&BTreeSet::from([A, B, C]))
+    );
+    assert_eq!(
+        f1.rec(second + 10, durable(C, 0, Digest::ROOT)),
+        vec![cas(Revision(9), A), arm(7, second + 10 + WINDOW)]
+    );
+}
+
+/// D2 rule 4: the pin changes no safety check. A proof at 0 under any digest but the root's is
+/// divergence, judged against the pin as any second digest at the point is (ruling F-e): the
+/// partition is quarantined and never activates.
+#[retcd_test]
+fn m9_d2_03_a_digest_other_than_the_root_at_cutoff_zero_is_quarantined() {
+    let (mut f1, _) = committed_from_root(&[A], 0);
+    assert_eq!(
+        f1.rec(3_200, durable(B, 0, dg(4, 0))),
+        vec![
+            r(RecoveryEffect::Quarantine(DivergenceEvidence::Pairwise {
+                seq: Seq::ZERO,
+                a: (A, Digest::ROOT),
+                b: (B, dg(4, 0)),
+            })),
+            block(BlockReason::DivergenceRequiresOperator {
+                diverged: vec![A, B]
+            }),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Quarantined);
+}
+
+/// D2 rule 1's bound: at cutoff 1 a `ReadOnly` commit pins nothing. A copy that missed the
+/// inventory starts the new generation behind, so its catch-up pins, as before.
+#[retcd_test]
+fn m9_d2_04_a_read_only_commit_at_cutoff_one_does_not_pin() {
+    let (mut f1, commit) = committed_from_root(&[A], 1);
+    let result = recovered(&commit);
+    assert_eq!(
+        (result.mode, result.selected.cutoff_seq),
+        (PartitionMode::ReadOnly, Seq(1))
+    );
+    assert_eq!(commit.len(), 1, "only the Recovered: {commit:?}");
+    assert_eq!(
+        f1.step(PIN_DEADLINE, fired(3)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)],
+        "no sync, so no deadline"
+    );
+    assert_eq!(
+        f1.rec(4_000, caught_up(B, 1, dg(0, 1))),
+        vec![sync(A, 1), sync(B, 1), sync(C, 1), arm(4, 4_000 + WINDOW)]
+    );
+}
+
+/// D2 rule 1's other bound: only `ReadOnly` pins at the commit. A `DegradedRf2` commit at
+/// cutoff 0 pins nothing (that case is D3's, owed to M10).
+#[retcd_test]
+fn m9_d2_05_a_degraded_commit_at_cutoff_zero_does_not_pin() {
+    let (mut f1, commit) = committed_from_root(&[A, B], 0);
+    let result = recovered(&commit);
+    assert_eq!(
+        (result.mode, result.selected.cutoff_seq),
+        (PartitionMode::DegradedRf2, Seq::ZERO)
+    );
+    assert_eq!(commit.len(), 1, "only the Recovered: {commit:?}");
+    assert_eq!(
+        f1.step(PIN_DEADLINE, fired(3)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+}

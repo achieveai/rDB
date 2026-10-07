@@ -13,7 +13,9 @@
 //! judged like any other (ruling B-R52a).
 //!
 //! The rebuild point is pinned by the first live catch-up at or above the committed cutoff, and
-//! never below it (rulings F-e, A-3). A pin is never replaced. Every report is judged the same
+//! never below it (rulings F-e, A-3). One exception pins at the commit itself: a `ReadOnly` commit
+//! at cutoff 0 (M9 S0 D2 ruling, rule 1). No copy is behind an empty prefix, so no catch-up would
+//! ever come; such a rebuild asks again at each deadline, because nothing else would (rule 2). A pin is never replaced. Every report is judged the same
 //! whenever it lands (ruling A-1): a digest at the cutoff other than the committed one, or a
 //! second digest at the point, is divergence, and proofs held before the pin are judged when it
 //! lands.
@@ -82,6 +84,8 @@ pub(crate) struct Rebuild {
     point: Option<Point>,
     /// The last sync's deadline, until it passes and is spent (ruling B-R52).
     deadline: Option<Tick>,
+    /// Pinned at the commit, not by a catch-up (M9 S0 D2 ruling, rule 1).
+    pinned_at_commit: bool,
 }
 
 impl Rebuild {
@@ -93,6 +97,7 @@ impl Rebuild {
             cutoff,
             point: None,
             deadline: None,
+            pinned_at_commit: false,
         }
     }
 
@@ -161,6 +166,19 @@ impl Rebuild {
                 .map_err(Refused::Diverged)?;
         }
         Ok((head, self.required.iter().copied().collect()))
+    }
+
+    /// Pin the point at `(0, ROOT)` at the commit, judged as a catch-up by `by` would be (M9 S0
+    /// D2 ruling, rule 1), and return it with every required copy, as a pinning catch-up does.
+    pub(crate) fn pin_at_commit(&mut self, by: CopyId) -> Result<(Seq, Vec<CopyId>), Refused> {
+        let pinned = self.caught_up(by, Seq::ZERO, Digest::ROOT)?;
+        self.pinned_at_commit = true;
+        Ok(pinned)
+    }
+
+    /// Whether the point was pinned at the commit, so each deadline asks again (D2 rule 2).
+    pub(crate) const fn pinned_at_commit(&self) -> bool {
+        self.pinned_at_commit
     }
 
     /// Whether `proof` binds to the pinned point, judged by the one barrier constructor.
