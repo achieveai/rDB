@@ -182,7 +182,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 | pending slot missing or holding another op no; slot not kind `0x08`, bad CBOR or shape; an op's `at` out of range | `Corrupt(Block{id, OpMissing{op} / OpBad{op} / OpOutOfRange{op}})` |
 | key under `0x02` with a tail ≠ 16 B; under `0x03` ≠ 16 or 17 B, or slot ≥ 240 | `Corrupt(Key(..))` |
 | bare `n` with no item record; item record does not open, not a document, newer than root | `Corrupt(ItemMissing{id} / Envelope / ItemNotDocument{found} / Codec / ElementNewerThanRoot)` |
-| records under `0x02`/`0x03` with no root, at a fresh id, or beside an empty list at drop | `Corrupt(OrphanElement)` |
+| records under `0x02`/`0x03` with no root, at a fresh id (an item's, or a split's new block), or beside an empty list at drop | `Corrupt(OrphanElement)` |
 | a list block or slot record (kind `0x07`/`0x08`) at a root key | `Corrupt(ListRecordAtRoot{found})` on reads, on writes to an existing object, and on drop and delete: lists, maps, sets, documents and blobs; also blob GC and `doc_scenario`'s dump. A create (`Expected::Absent`) never reads the root: the kernel refuses its `Condition::Absent{root}` (`ConditionFailed`), and nothing is written |
 - `BlockFault` replaces rev 4's `PageFault`. An unknown kind, codec or format stays written-by-a-newer-build.
 - **Not detected by reads (accepted for v1):** an item no entry names; a record under an inline id; one item `n` in two
@@ -243,10 +243,11 @@ the payload.
 - **Reads before the write caps:** Remove and Replace read the out-of-line item they change, to take its length off
   `bytes`, before the request caps are checked. A delta of many removes reads every item it names, then may be refused
   `TooManyWrites`. A damaged item cannot be removed or replaced; `clear_object` repairs it (decision 7). Push, Insert,
-  Move, splits and merge-backs read no item record. A line of k inserts that splits a block makes at most 2 · k + 7
+  Move, splits and merge-backs read no item record. A line of k inserts that splits a block makes at most 2 · k + 8
   calls and reads at most 2 · B bytes, whatever the item size: 2 `version` calls per insert (its new item key), the
-  root's 3, the base's 2 and up to 2 pending scans. At B = 1,024 a line of 100 makes exactly 2 · 100 + 5; at the
-  default B, by hand, 247 = 2 · 120 + 7 (16-char items) and 135 = 2 · 64 + 7 (8 KiB items).
+  root's 3, the base's 2, the new block's key (checked for an orphan) and up to 2 pending scans. At B = 1,024 a line of
+  100 makes exactly 2 · 100 + 6; at the default B, by hand, 248 = 2 · 120 + 8 (16-char items) and 136 = 2 · 64 + 8
+  (8 KiB items).
 - A point read opens one base and its pending slots (q ≤ base/4), so ≤ ~1.25 · B; stale slots are never read (P9: they
   would add up to 240 × ~300 B ≈ 72 KB). That is ~2–7× the tree's bytes past ~24 KiB, the same below.
 - **Capacity at the default: ≥ ~16 MiB worst (blocks just over B/4 never merge), ~64 MiB push-only** (end splits fill blocks).

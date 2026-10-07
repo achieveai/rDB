@@ -1201,10 +1201,11 @@ fn split_line_reads(block_max: usize, width: usize, per_line: usize) -> SplitRea
 /// and the line alone, whatever the item size. At B = 1,024, with 100 inserts a line; at 38b3586
 /// the 16-char line read 685 calls and 14,854 bytes.
 ///
-/// The line reads exactly 2 · 100 + 5 calls (W3 ruling: 205 measured against 202 claimed). The 5:
-/// the root's `version` (the version check), the root's `get` and `version` (the read), and the
-/// base's `get` and `version`. Two `version` calls per insert: its new id's item key, checked
-/// for an orphan, then touched. No pending-slot scan, since every line before it folded.
+/// The line reads exactly 2 · 100 + 6 calls (W3 ruling: 205 measured against 202 claimed; PR #28
+/// F1 added one). The 6: the root's `version` (the version check), the root's `get` and
+/// `version` (the read), the base's `get` and `version`, and the new block's `version`,
+/// checked for an orphan. Two `version` calls per insert: its new id's item key, checked for an
+/// orphan, then touched. No pending-slot scan, since every line before it folded.
 #[test]
 fn d4_a_split_reads_within_a_bound_set_by_b_whatever_the_item_size() {
     const B: usize = MIN_BLOCK_MAX;
@@ -1215,14 +1216,14 @@ fn d4_a_split_reads_within_a_bound_set_by_b_whatever_the_item_size() {
             ("version root", 2),
             ("get root", 1),
             ("get base", 1),
-            ("version base", 1),
+            ("version base", 2),
             ("version item", 2 * 100),
         ]
         .into_iter()
         .map(|(call, n)| (call.to_owned(), n))
         .collect();
         assert_eq!(tally, want, "{at}");
-        assert_eq!(calls, 2 * 100 + 5, "{at}");
+        assert_eq!(calls, 2 * 100 + 6, "{at}");
         assert!(bytes <= 2 * len_u64(B), "{at}: bytes");
     }
 }
@@ -1238,19 +1239,21 @@ fn assert_split_line_bound(reads: &SplitReads, per_line: usize, at: &str) {
         ("version root", 2),
         ("get root", 1),
         ("get base", 1),
-        ("version base", 1),
+        ("version base", 2),
         ("version item", 2 * len_u64(per_line)),
     ] {
         assert_eq!(tally.get(call).copied(), Some(want), "{at}: {call}");
     }
     assert_eq!(tally.len(), 5 + usize::from(scans > 0), "{at}: {tally:?}");
-    assert!(*calls <= 2 * len_u64(per_line) + 7, "{at}: calls");
+    assert!(*calls <= 2 * len_u64(per_line) + 8, "{at}: calls");
 }
 
 /// [`d4_a_split_reads_within_a_bound_set_by_b_whatever_the_item_size`] at the default B, the
-/// tester's own case, within [`assert_split_line_bound`] (the tester measured 2 · per line + 7): lines of 120 inserts of 16 chars, and of 64 of 8 KiB, which keeps a line
-/// within the write cap. Growing two blocks of 8 KiB items writes several hundred MB of item
-/// records, so it runs by hand: `cargo test -p rdb-value --test lists -- --ignored d4_`.
+/// tester's own case, within [`assert_split_line_bound`]: 2 · per line + 8, one more than the
+/// tester measured before PR #28 F1 checked the new block's key. Lines of 120 inserts of 16
+/// chars, and of 64 of 8 KiB, which keeps a line within the write cap. Growing two blocks of 8 KiB
+/// items writes several hundred MB of item records, so it runs by hand:
+/// `cargo test -p rdb-value --test lists -- --ignored d4_`.
 #[test]
 #[ignore = "writes several hundred MB of item records; run by hand"]
 fn d4_a_split_at_the_default_b_reads_within_a_bound_set_by_b() {
@@ -4064,6 +4067,60 @@ fn w3_a_replace_out_of_the_block_over_a_stray_item_record_is_orphan_element() {
     .map(|_| ());
     assert_eq!(got, Err(ValueError::Corrupt(Corrupt::OrphanElement)));
     assert_eq!(k.records, before, "the store is unchanged");
+}
+
+/// PR #28 F1: a split mints a fresh block id, and a record already at that block's key is an
+/// orphan, as it is at a fresh item id. Four 230-byte strings fill one block at B = 1,024 with
+/// `next` at 5; a fifth push mints item 5 and folds over B, so the split mints block 6. With a
+/// stray base planted at block 6 the compile is `OrphanElement` and writes nothing; without it
+/// the same push splits into blocks 0 and 6.
+#[test]
+fn pr28_f1_a_split_onto_a_stray_block_record_is_orphan_element() {
+    let root = todo();
+    let long = "s".repeat(230);
+    let fill = [long.as_str(); 4];
+    for stray in [false, true] {
+        let mut k = Kernel::new();
+        made(&mut k, &root, MIN_BLOCK_MAX, &fill);
+        assert_eq!(block_refs(&k, &root).len(), 1, "four strings fit one block");
+        let first = items(&k.snapshot(), &root, Start::Position(0), 1)
+            .expect("read")
+            .items
+            .remove(0)
+            .id;
+        let seed = first >> 64;
+        let version = version_of(&k, &root);
+        if stray {
+            let base = encode(&text("stray")).expect("encode");
+            plant(
+                &mut k,
+                &block_key(&root, seed << 64 | 6),
+                version,
+                Kind::ListBlock,
+                &base,
+            );
+        }
+        let before = k.records.clone();
+        let got = compile_list(
+            &k.snapshot(),
+            &root,
+            Expected::Version(version),
+            MIN_BLOCK_MAX,
+            &[ListOp::Push(text(&long))],
+        );
+        if stray {
+            assert_eq!(
+                got.map(|_| ()),
+                Err(ValueError::Corrupt(Corrupt::OrphanElement))
+            );
+            assert_eq!(k.records, before, "the store is unchanged");
+        } else {
+            k.commit(got.expect("the push splits").compiled());
+            let ns: Vec<u64> = block_refs(&k, &root).iter().map(|b| b[0]).collect();
+            assert_eq!(ns, [0, 6], "the split mints block 6");
+            assert_eq!(values(&k, &root), texts(&[long.as_str(); 5]));
+        }
+    }
 }
 
 /// Tester W3 advisory: a retire and a merge-back of a block whose slots are still pending. Five
