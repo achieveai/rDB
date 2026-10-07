@@ -625,17 +625,49 @@ impl TxnKernel {
     /// One §3.3 row, then the start record if it is now due (M9 S0). `Recovered` is handled by
     /// [`Transaction`], which owns instance lifetime.
     fn step(&mut self, ctx: &StepCtx<'_>, event: TxnEvent) -> Vec<TxnEffect> {
-        let mut out = self.row(ctx, event);
-        // Rule 2: a refusal, at any boundary, owes it again under a view newer than the one it
-        // was sent under. So a refusal never leaves the partition stuck, and it is never sent
-        // again under the view that refused it.
-        if let StartRecord::Sent { under } = self.start {
-            if out.iter().any(is_start_reply) {
-                self.start = StartRecord::Owed { after: under };
-            }
-        }
-        out.extend(self.start_if_due(ctx));
+        // A client's own `Submit` under the reserved identity is refused at check 10 and
+        // answered like any refusal (rule 4). It never enters the queue, so a `Submit` row
+        // carries no refusal of the kernel's record, and every other row's does.
+        let submit = matches!(event, TxnEvent::Submit(_));
+        let row = self.row(ctx, event);
+        let mut out = if submit { row } else { self.quiet(row) };
+        let started = self.start_if_due(ctx);
+        out.extend(self.quiet(started));
         out
+    }
+
+    /// The kernel's own start record answered to nobody (rule 5), and owed again when refused
+    /// (rule 2). A refusal at any boundary owes it under a view newer than the one it was sent
+    /// under, so a refusal never leaves the partition stuck and it is never sent again under the
+    /// view that refused it. Each refusal is recorded as ignored, with the error kind it would
+    /// have carried, and logged.
+    fn quiet(&mut self, effects: Vec<TxnEffect>) -> Vec<TxnEffect> {
+        effects
+            .into_iter()
+            .map(|effect| {
+                let TxnEffect::Reply {
+                    identity,
+                    rejection,
+                } = &effect
+                else {
+                    return effect;
+                };
+                if *identity != RequestIdentity::START_RECORD {
+                    return effect;
+                }
+                if let StartRecord::Sent { under } = self.start {
+                    self.start = StartRecord::Owed { after: under };
+                }
+                let error = rejection.error();
+                tracing::info!(
+                    partition = self.lineage.partition.0,
+                    generation = self.lineage.generation.0,
+                    error = ?error,
+                    "t1.start_record_refused"
+                );
+                ignored(error.kind())
+            })
+            .collect()
     }
 
     /// Rule 1: send the start record when every condition holds at once.
@@ -1323,7 +1355,8 @@ impl TxnKernel {
         }
         self.inflight = None;
         out.extend(self.drain(error));
-        out
+        // The stranded check may be the kernel's own start record (M9 S0 rule 5).
+        self.quiet(out)
     }
 }
 
@@ -1389,29 +1422,6 @@ fn reply(identity: RequestIdentity, rejection: TxnRejection) -> TxnEffect {
         identity,
         rejection,
     }
-}
-
-/// Whether `effect` answers the kernel's own start record.
-fn is_start_reply(effect: &TxnEffect) -> bool {
-    matches!(effect, TxnEffect::Reply { identity, .. } if *identity == RequestIdentity::START_RECORD)
-}
-
-/// No client sent the start record, so none is answered for it (M9 S0 rule 5). Its refusal is
-/// recorded as ignored, with the error kind it would have carried, and logged.
-fn quiet_start(partition: PartitionId, effect: TxnEffect) -> TxnEffect {
-    let TxnEffect::Reply {
-        identity,
-        rejection,
-    } = &effect
-    else {
-        return effect;
-    };
-    if *identity != RequestIdentity::START_RECORD {
-        return effect;
-    }
-    let error = rejection.error();
-    tracing::info!(partition = partition.0, error = ?error, "t1.start_record_refused");
-    ignored(error.kind())
 }
 
 fn ignored(reason: impl Into<Ignore>) -> TxnEffect {
@@ -1581,26 +1591,21 @@ impl Transaction {
             }
             _ => {}
         }
-        let out = match event {
-            TxnEvent::Recovered(result) => self.on_recovered(ctx, &result),
+        match event {
+            TxnEvent::Recovered(result) => Ok(self.on_recovered(ctx, &result)),
             TxnEvent::Submit(req) => match self.kernels.get_mut(&key) {
-                Some(kernel) => kernel.step(ctx, TxnEvent::Submit(req)),
-                None => match admit(&req, ctx.partition, None, ctx.now) {
+                Some(kernel) => Ok(kernel.step(ctx, TxnEvent::Submit(req))),
+                None => Ok(match admit(&req, ctx.partition, None, ctx.now) {
                     Err(rejection) => vec![reply(req.identity, rejection)],
                     // `admit` without an instance always fails at check 4.
                     Ok(_) => Vec::new(),
-                },
+                }),
             },
-            other => match self.kernels.get_mut(&key) {
+            other => Ok(match self.kernels.get_mut(&key) {
                 Some(kernel) => kernel.step(ctx, other),
                 None => vec![ignored(ErrorKind::NotPrimary)],
-            },
-        };
-        // Every start-record refusal, including one a recovery or a demotion strands.
-        Ok(out
-            .into_iter()
-            .map(|effect| quiet_start(ctx.partition, effect))
-            .collect())
+            }),
+        }
     }
 
     fn on_recovered(&mut self, ctx: &StepCtx<'_>, result: &RecoveryResult) -> Vec<TxnEffect> {
