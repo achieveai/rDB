@@ -25,6 +25,7 @@
 //! | `Client(Retry{..})`, its `Submit` lowered earlier | that `Submit` again, same identity, with the retry's `digest_id` as its body, at the cursor, plus a step recording `fault_injected{Client, RetainedDedupHit}` (same `digest_id`) or `{Client, ChangedDigest}` (different). After the dedup retention window it is [`Unlowerable`]: `ExpiredDedup` has no lowering |
 //! | `Client(Retry{..})`, its `Submit` gone | nothing runs; a step records `op_skipped{ReferentGone}` and no fault (design.md §4.3) |
 //! | `Network(Deliver / Drop / Duplicate{from, to})` | a [`ScenarioStep`] at the cursor planning the next `from -> to` frame: `PlanNext` with `Deliver{0}`, `Drop`, or `Duplicate{0, DUPLICATE_GAP_MILLIS}`, its fault tag `taken: None` and no line. `from == to` is refused: the sim network has no self-link |
+//! | `Network(Partition{set_a, set_b})` | one step per pair across the sides at the cursor setting the link `Partitioned`, with no line. A node on both sides is refused |
 //! | `Network(Heal)` | one step per node pair at the cursor setting the link `Up`. **No** `schedule_phase{Healed}` line (lead ruling L-R182m): that arms INV-LIVE and INV-ISO and belongs to the V-R40 Healed slice, so a generated seed arms no liveness check |
 //! | any `InspectSurvivors`, at the end | the host (see [`host`]): a flush on every node every [`HOST_FLUSH_EVERY_MILLIS`] from the latest cutoff F1 can choose through the deadline, and A1's first `AcquireDue` on each primary [`ACQUIRE_AFTER_CUTOFF_MILLIS`] after that. Neither is a grammar op: no kernel emits either, so a recovered scenario without them never resumes L1 or holds a grant |
 //!
@@ -556,6 +557,33 @@ pub fn lower_staged(scenario: &Scenario) -> Result<Lowered, Unlowerable> {
                                 a: NodeId(a),
                                 b: NodeId(b),
                                 state: LinkState::Up,
+                            }),
+                            line: None,
+                            taken: None,
+                        });
+                    }
+                }
+            }
+            // Every link from one side to the other cut at the cursor, until a `Heal`. No line,
+            // as for `Heal`: a cut is the harness's own fault, and no boundary is inferred.
+            ScenarioOp::Network(NetworkOp::Partition { set_a, set_b }) => {
+                for &a in set_a {
+                    for &b in set_b {
+                        if a == b {
+                            return Err(Unlowerable::at(
+                                index,
+                                "a node on both sides of a partition: the sim network has no \
+                                 self-link",
+                            ));
+                        }
+                        plan.steps.push(ScenarioStep {
+                            at: Tick(state.cursor),
+                            node: a,
+                            partition: FAULT_PARTITION,
+                            action: StepAction::Network(SimNetworkOp::SetLink {
+                                a,
+                                b,
+                                state: LinkState::Partitioned,
                             }),
                             line: None,
                             taken: None,
