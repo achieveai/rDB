@@ -675,13 +675,25 @@ async fn m5_14_old_snapshot_retained_until_publication() {
 /// open for as long as their own writes take, so on a loaded host the trigger can give up
 /// first. M5-01 failed in a gate run exactly that way: its 40 puts took more than 2 s.
 ///
-/// This row makes that order certain. It keeps the build parked until the trigger has
-/// answered, then releases it, and [`published_id`] must still name the snapshot the build
-/// published.
+/// This row makes that order certain. It starts from a published snapshot A, keeps build B
+/// parked until the trigger has answered, then releases it, and [`published_id`] must name B.
+///
+/// A matters: with no prior snapshot, a helper that took whatever is current would still pass.
+/// So the helper is polled once while B is still parked, when the only current snapshot is A.
+/// It must not answer then. Polling before the release makes this an order, not a race.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn paused_build_outlasting_the_trigger_wait_still_yields_its_id() {
     let (cluster, scripts) = seeded_cluster().await;
     let leader = cluster.leader().await;
+
+    let a = published_id(trigger_in_background(&cluster, leader)).await;
+    // The store publishes A before openraft's core hears that A's build finished, and until
+    // it does it drops any new trigger without a word. A restart starts a fresh core, so B's
+    // trigger cannot land in that window.
+    cluster
+        .restart(leader)
+        .await
+        .unwrap_or_else(|e| panic!("restart {leader}: {e}"));
 
     let pause = scripts[&leader].pause_on_nth(Boundary::BeforeSnapshotTmpSync, 1);
     let build = trigger_in_background(&cluster, leader);
@@ -695,8 +707,21 @@ async fn paused_build_outlasting_the_trigger_wait_still_yields_its_id() {
         .await
         .unwrap_or_else(|t| panic!("{t}"));
 
+    let mut waiting = std::pin::pin!(published_id(build));
+    // `unconstrained`: tokio's co-op budget could otherwise turn this one poll into `Pending`
+    // without the helper ever looking at the store.
+    if let std::task::Poll::Ready(early) =
+        futures::poll!(tokio::task::unconstrained(waiting.as_mut()))
+    {
+        panic!(
+            "the helper answered {early:?} while B was still parked; A ({a}) was current, so \
+             it handed back the snapshot from before the trigger"
+        );
+    }
+
     pause.release();
-    let id = published_id(build).await;
+    let id = waiting.await;
+    assert_ne!(id, a, "the id must be B, not the snapshot current before the trigger");
     assert_eq!(
         cluster
             .rocks_store(leader)
