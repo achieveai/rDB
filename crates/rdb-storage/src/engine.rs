@@ -515,7 +515,7 @@ impl RocksEngine {
             );
         }
         for (capture, prefix) in captured.iter().zip(&durable) {
-            tracing::info!(
+            tracing::debug!(
                 target: LOG_TARGET,
                 partition = capture.partition.0,
                 generation = capture.generation.0,

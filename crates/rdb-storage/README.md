@@ -105,7 +105,7 @@ invocation. Every line inside an invocation carries `cmd`, `pid` and `db_dir` (t
 | `rdb_storage` | `meta_write_refused`, `sealed_generation_write_refused`, `staging_generation_write_refused` (ERROR) | `partition, generation, seq` + `sealed_by` / `parent, base` |
 | `rdb_storage` | `wal_sync_ancestor` | `partition, generation, durable` |
 | `rdb_storage` | `batch_commit` | `partition, generation, seq, writes, applied` |
-| `rdb_storage` | `wal_sync` | `partition, generation, captured, durable` |
+| `rdb_storage` | `wal_sync` (DEBUG; one per captured lineage per flush, so `RUST_LOG=rdb_storage=debug` to see it) | `partition, generation, captured, durable` |
 | `rdb_storage` | `lineage_verified` / `lineage_verify_failed` | `partition, generation, applied, durable` / `fault` |
 | `rdb_storage` | `storage_open_refused_*` (level ERROR, one per refusal, field `error`) | suffix `locked`, `column_families`, `format`, `durable_above_applied`, `corrupt_record`, `no_database`, `backend`. Logged by `open`, `open_existing`, `open_read_only` and `dump` alike. |
 | `rdb_storage` | `dump_open` | `path, records` |
