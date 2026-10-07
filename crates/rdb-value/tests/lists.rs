@@ -225,6 +225,39 @@ fn w1_stale_expect_absent_list_and_create_twice_are_refused() {
     assert_eq!(values(&k, &root), texts(&["a", "b"]));
 }
 
+/// PR #28 F2: the fence is the kernel's, not only the compile's. Two pushes compiled from one
+/// snapshot each pass the compile's version check. The first commits; the second, applied at the
+/// same generation, is refused on the root's `expected_version`, mutation 0, and nothing changes:
+/// not the records, not the seq, and the first push's value stays.
+#[test]
+fn pr28_f2_a_second_push_compiled_from_the_same_snapshot_is_refused_at_apply() {
+    let root = todo();
+    let mut k = Kernel::new();
+    made(&mut k, &root, DEFAULT_BLOCK_MAX, &["a"]);
+    let now = version_of(&k, &root);
+    let snap = k.snapshot();
+    let compile = |value: &str| {
+        compile_list(
+            &snap,
+            &root,
+            Expected::Version(now),
+            DEFAULT_BLOCK_MAX,
+            &[ListOp::Push(text(value))],
+        )
+        .expect("the push compiles")
+    };
+    let (first, second) = (compile("b"), compile("c"));
+    assert_eq!(first.generation(), second.generation());
+    k.commit(first.compiled());
+    let before = k.clone();
+    assert_eq!(
+        k.apply(second.compiled(), Some(second.generation().0)),
+        Err(Refused::ExpectedVersion(0))
+    );
+    assert_eq!(k, before, "nothing written, seq unchanged");
+    assert_eq!(values(&k, &root), texts(&["a", "b"]));
+}
+
 /// `Insert{at}` takes `at` up to `count`: at `count` it appends, one past is `PositionInvalid`.
 /// A later op in one compile sees the list the earlier ops left.
 #[test]
