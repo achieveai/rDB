@@ -303,6 +303,10 @@ pub struct Client {
 }
 
 /// What a client asks.
+///
+/// A `Get` or `GetPrevious` sent under the identity of a put that expired (F-014) can be
+/// answered by P1's late `UNKNOWN_OUTCOME` for that put, through `reply`'s `(Failed, _)` arm.
+/// `Db` never does this: each of its gets mints a fresh identity.
 #[derive(Debug, Clone)]
 pub enum ClientCall {
     /// Replace object `object` with the byte string `value` (Decision 2), compiled here against
@@ -4928,6 +4932,82 @@ mod tests {
             other => panic!("request 1 resent after expiry: {other:?}"),
         }
         assert_eq!(trio.head(), Some(2), "request 1 published once");
+    }
+
+    /// F-014's guard (review leftover): an expiry meets only the waiter it was scheduled for.
+    /// Put A is answered before its deadline (a forged P1 refusal, as the rows above forge
+    /// replies), which releases resend B, queued behind it under the same identity. A's expiry
+    /// is still due and fires while B waits: it must leave B alone. Nothing is drained, so no
+    /// module answers B; only the host's own duties run.
+    #[config_log::retcd_test]
+    fn an_expiry_never_expires_the_call_released_after_its_put() {
+        const METHOD: &str = "an_expiry_never_expires_the_call_released_after_its_put";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        let host = &mut trio.nodes[0].0;
+        let request = |remaining_millis| TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(1),
+            affinity: AFFINITY,
+            expected_generation: Some(Generation(1)),
+            remaining_millis,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        let send = |host: &mut Host, remaining_millis| {
+            let (reply, answer) = mpsc::channel();
+            host.client(Client {
+                partition: PartitionId(1),
+                call: ClientCall::Resend {
+                    request: request(remaining_millis),
+                },
+                reply,
+            })
+            .expect("sent");
+            answer
+        };
+        // A's deadline is 0, so its expiry is due after the margin alone; B's is out of reach.
+        let a = send(host, 0);
+        let a_event = host.pending[&identity(1)].event;
+        let b = send(host, 60_000);
+        still_waits("resend B, queued behind A", &b);
+        host.reply(
+            PartitionId(1),
+            &ReplyEffect::Failed {
+                identity: identity(1),
+                error: RdbError::UnknownOutcome {
+                    partition: PartitionId(1),
+                    identity: identity(1),
+                },
+            },
+        )
+        .expect("A is answered");
+        match a.try_recv() {
+            Ok(Answer::Error { error, .. }) => assert_eq!(error.name(), "UNKNOWN_OUTCOME"),
+            other => panic!("put A: {other:?}"),
+        }
+        let b_event = host.pending[&identity(1)].event;
+        assert_ne!(a_event, b_event, "B, released, is the waiter now");
+
+        let a_due = |host: &Host| {
+            host.delayed
+                .values()
+                .any(|item| matches!(item, Delayed::TxnExpiry { event, .. } if *event == a_event))
+        };
+        assert!(a_due(host), "A's expiry is still due");
+        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+        while a_due(host) {
+            host.run_due();
+            assert!(Instant::now() < deadline, "A's expiry never fired");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        still_waits("resend B, after A's expiry fired", &b);
+        assert_eq!(
+            host.pending.get(&identity(1)).map(|waiter| waiter.event),
+            Some(b_event)
+        );
+        assert_eq!(logged!(METHOD, "txn_waiter_expired").len(), 0);
+        assert_eq!(host.fault, None);
     }
 
     /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
