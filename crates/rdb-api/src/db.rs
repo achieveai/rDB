@@ -285,7 +285,9 @@ impl Db {
     /// [`admin::BootstrapError::Control`]; the next open adopts the record if it was written.
     ///
     /// S0 supports one `Db` per control store. Every `Db` runs nodes 1-3 with [`host::BOOT`], so
-    /// a second `Db` on the same store opens but never becomes ready.
+    /// a second `Db` on the same store is refused with [`admin::BootstrapError::AlreadyExists`]
+    /// or, if it opens before the first has committed generation 1, opens but never becomes
+    /// ready.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
