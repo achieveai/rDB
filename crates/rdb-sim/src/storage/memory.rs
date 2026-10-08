@@ -231,6 +231,19 @@ impl MemoryEngine {
         self.take_at_rest();
         let mut durable = Vec::with_capacity(captured.len());
         for capture in captured {
+            // A lineage this engine was never given holds nothing: its durable prefix is the
+            // empty one, and the sync creates no entry for it (`RocksEngine`, defect D7).
+            if !self
+                .lineages
+                .contains_key(&(capture.partition, capture.generation))
+            {
+                durable.push(DurablePrefix {
+                    partition: capture.partition,
+                    generation: capture.generation,
+                    through: DurableSeq(0),
+                });
+                continue;
+            }
             // An inherited base is the predecessor's batches on this engine, so the flush that
             // makes it durable in the child makes it durable there too. Without this the child
             // claimed a prefix its parent never synced, and a host crash, which cuts the base to
