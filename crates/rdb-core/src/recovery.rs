@@ -711,17 +711,24 @@ impl Recovery {
         }
     }
 
-    /// A `ReadOnly` commit at cutoff 0 pins its rebuild at `(0, ROOT)` and asks every required
-    /// copy to sync (M9 S0 D2 ruling, rule 1). No copy is behind an empty prefix, so R1 starts no
-    /// catch-up and no `CopyCaughtUp` would ever pin it. Every other phase, and every other
-    /// commit, passes through: at cutoff 1 or more a copy that missed the inventory starts the
-    /// new generation behind, and its catch-up pins as before.
+    /// A commit at cutoff 0 that rebuilds pins its rebuild at `(0, ROOT)` and asks every
+    /// required copy to sync (M9 S0 D2 ruling, rule 1, widened to every mode by the K1 ruling).
+    /// No catch-up is guaranteed to pin it: a `ReadOnly` partition writes nothing, and a copy that
+    /// returns to a `DegradedRf2` one before the start record ships takes it from the stream, so
+    /// R1 starts no catch-up and reports no `CopyCaughtUp` for it (B-R48a F1). Only a commit that
+    /// is not `Active` has a rebuild, so the cutoff is the whole gate. Every other phase, and every
+    /// commit at cutoff 1 or more, passes through: there a copy that missed the inventory starts
+    /// the new generation behind, and its catch-up pins as before.
+    ///
+    /// At point 0 the activation proves only the empty prefix, never what a copy holds above it.
+    /// `Active` means three copies hold the writes only because L1 pauses them while a copy is
+    /// unheard (B-R38; ADR-rdb-0009 §8, K1 note).
     fn pin_at_commit(&mut self, ctx: &StepCtx<'_>, phase: Phase, emit: &mut Emit<'_>) -> Phase {
         let Phase::Committed(mut committed) = phase else {
             return phase;
         };
         let result = &committed.result;
-        if result.mode != PartitionMode::ReadOnly || result.selected.cutoff_seq != Seq::ZERO {
+        if result.selected.cutoff_seq != Seq::ZERO {
             return Phase::Committed(committed);
         }
         let source = result.selected.source;

@@ -6099,7 +6099,8 @@ fn m7b_240_a_lost_cas_completion_is_bounded_by_the_discovery_timer() {
 
 // ---------------------------------------------------------------------------------------------
 // M9 S0 D2 (lead ruling "S0 D2", Gautam chose option 1 on 2026-10-07): a `ReadOnly` commit at
-// cutoff 0 pins its rebuild at `(0, ROOT)` itself, and asks again at each deadline.
+// cutoff 0 pins its rebuild at `(0, ROOT)` itself, and asks again at each deadline. The K1
+// ruling (2026-10-08) widened the pin to every commit at cutoff 0 (`m9_d2_05`, `m9_k1_01`).
 // ---------------------------------------------------------------------------------------------
 
 /// The anchor of a partition whose history starts at the root: base 0, digest `ROOT`.
@@ -6272,19 +6273,65 @@ fn m9_d2_04_a_read_only_commit_at_cutoff_one_does_not_pin() {
     );
 }
 
-/// D2 rule 1's other bound: only `ReadOnly` pins at the commit. A `DegradedRf2` commit at
-/// cutoff 0 pins nothing (that case is D3's, owed to M10).
+/// D2 rule 1, widened by the K1 ruling (2026-10-08): the gate is the cutoff, not the mode. A
+/// `DegradedRf2` commit at cutoff 0 pins `(0, ROOT)` and asks every required copy to sync, as a
+/// `ReadOnly` one does. A copy that returns before the start record ships takes seq 1 from the
+/// stream and is never behind, so no catch-up would pin it (host walk A12, early heal;
+/// `m9_k1_00`). Before K1 this row asserted the opposite.
 #[retcd_test]
-fn m9_d2_05_a_degraded_commit_at_cutoff_zero_does_not_pin() {
+fn m9_d2_05_a_degraded_commit_at_cutoff_zero_pins_and_syncs_every_copy() {
     let (mut f1, commit) = committed_from_root(&[A, B], 0);
     let result = recovered(&commit);
     assert_eq!(
         (result.mode, result.selected.cutoff_seq),
         (PartitionMode::DegradedRf2, Seq::ZERO)
     );
+    assert_eq!(
+        commit[1..].to_vec(),
+        vec![sync(A, 0), sync(B, 0), sync(C, 0), arm(4, PIN_DEADLINE)],
+        "pinned at the commit, after its Recovered"
+    );
+    let not_durable = vec![ign(ReplicaIgnoreReason::BarrierNotDurable)];
+    assert_eq!(f1.rec(3_200, durable(A, 0, Digest::ROOT)), not_durable);
+    assert_eq!(f1.rec(3_201, durable(B, 0, Digest::ROOT)), not_durable);
+    assert_eq!(
+        f1.step(PIN_DEADLINE, fired(4)),
+        vec![stalled(C), sync(C, 0), arm(5, PIN_DEADLINE + WINDOW)],
+        "the absent copy is named and asked again"
+    );
+    assert_eq!(
+        f1.rec(PIN_DEADLINE + 10, durable(C, 0, Digest::ROOT)),
+        vec![cas(Revision(9), A), arm(6, PIN_DEADLINE + 10 + WINDOW)]
+    );
+    let active = recovered(&f1.step(
+        PIN_DEADLINE + 20,
+        cas_result(CasOutcome::Committed(Revision(11))),
+    ));
+    assert_eq!(
+        (active.mode, active.selected.cutoff_seq),
+        (PartitionMode::Active, Seq::ZERO)
+    );
+    assert_eq!(f1.module.rebuild_required(), None);
+}
+
+/// The K1 gate's bound in `DegradedRf2`: at cutoff 1 nothing pins at the commit. A copy that
+/// missed the inventory starts the new generation behind, so its catch-up pins, as before.
+#[retcd_test]
+fn m9_k1_01_a_degraded_commit_at_cutoff_one_does_not_pin() {
+    let (mut f1, commit) = committed_from_root(&[A, B], 1);
+    let result = recovered(&commit);
+    assert_eq!(
+        (result.mode, result.selected.cutoff_seq),
+        (PartitionMode::DegradedRf2, Seq(1))
+    );
     assert_eq!(commit.len(), 1, "only the Recovered: {commit:?}");
     assert_eq!(
         f1.step(PIN_DEADLINE, fired(3)),
-        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+        vec![ign(ReplicaIgnoreReason::StaleTimer)],
+        "no sync, so no deadline"
+    );
+    assert_eq!(
+        f1.rec(4_000, caught_up(C, 1, dg(0, 1))),
+        vec![sync(A, 1), sync(B, 1), sync(C, 1), arm(4, 4_000 + WINDOW)]
     );
 }

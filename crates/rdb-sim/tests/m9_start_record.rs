@@ -53,7 +53,7 @@ use rdb_core::contracts::ids::{
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::CopyId;
-use rdb_core::contracts::recovery::{RecoveryEvent, SurvivorInventory};
+use rdb_core::contracts::recovery::{RecoveryEffect, RecoveryEvent, SurvivorInventory};
 use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{AckRejectReason, ApplyOutcome};
@@ -1378,20 +1378,29 @@ fn m9_f3_01_a_need_prefix_duplicated_after_the_cursor_moved_on_still_takes_every
 
 /// F1 at cutoff 0 (ruling 2026-10-07, item 4): F2's order on the E6-A timeline of `m9_d3_00`.
 /// B and C survive an empty partition while A is cut, so F1 commits `DegradedRf2` at cutoff 0
-/// and the start record is seq 1; it never passes `admit`. A returns at t4000 and catches seq 1
-/// up, which pins the rebuild at 1: P = 1 > C = 0. The activation CAS is held 1.8 s, and B's
-/// next append to A, a keepalive of seq 1, is corrupted while it is held, so A quarantines.
+/// and the start record is seq 1; it never passes `admit`. A returns at t4000. The activation
+/// CAS is held 1.8 s, and B's next append to A, a keepalive of seq 1, is corrupted while it is
+/// held, so A quarantines.
+///
+/// Since the K1 ruling (2026-10-08) the commit pins the rebuild at `(0, ROOT)`, so P = C = 0:
+/// item 4's P > C is no longer reachable from F1, and `m9_f1_a` alone holds it. A proves the
+/// point at the commit's sync deadline, t4003, and the activation CAS goes out in that tick,
+/// after B's grant renewal. A delay is held for the next completion, so the first one, of 0,
+/// takes the renewal and the second holds the activation CAS. Before K1 the CAS followed A's
+/// catch-up, and one delay at t4005 reached it.
 fn f1_at_cutoff_zero_unfaulted() -> RunPlan {
     let mut plan =
         scenario_run::lower(&cases::case_m9_d3_degraded_empty_gets_a_copy_back_then_writes())
             .expect("lowers");
-    plan.steps.push(step(
-        cases::M9_D3_A_BACK_AT + 5,
-        StepAction::Control(ControlOp::DelayCompletion {
-            node: B_NODE,
-            by_millis: 1_800,
-        }),
-    ));
+    for by_millis in [0, 1_800] {
+        plan.steps.push(step(
+            cases::M9_D3_A_BACK_AT + 3,
+            StepAction::Control(ControlOp::DelayCompletion {
+                node: B_NODE,
+                by_millis,
+            }),
+        ));
+    }
     plan.steps.sort_by_key(|step| step.at);
     plan
 }
@@ -1414,4 +1423,236 @@ fn f1_at_cutoff_zero() -> RunPlan {
 fn m9_f1_01_at_cutoff_zero_a_copy_quarantined_during_the_activation_cas_stays_out_and_the_others_take_every_write(
 ) {
     f2_stays_out(&f1_at_cutoff_zero(), cases::M9_D3_A_BACK_AT + 103, 2);
+}
+
+/// K1's timeline (host walk A12 at 5c798ca, "early heal"): B and C survive an empty partition
+/// while A is cut off, F1 commits `DegradedRf2` at cutoff 0 at t2003, and A's links heal before
+/// the start record is shipped (t2503). A hears the `Recovered` first, so it is never behind: it
+/// takes seq 1 from the stream like C. Measured on this plan before the K1 fix: a heal at
+/// t2010-t2490 left the rebuild unpinned; a heal at t2502 or later reached A after the ship and
+/// pinned through A's catch-up, as in D3.
+const K1_HEAL_AT: u64 = 2_100;
+const K1_WRITES: [u64; 2] = [12_000, 15_000];
+const K1_MAX_TICKS: u64 = 17_000;
+
+fn k1_early_heal() -> RunPlan {
+    k1_heal(K1_HEAL_AT, None, &K1_WRITES)
+}
+
+/// The K1 plan with A's links healed at `heal_at`, B's next messages to A each delayed by
+/// `delay_millis` when given (a 100 ms round trip, as in `f1_slow_catch_up`), and the client's
+/// writes submitted at `writes`.
+fn k1_heal(heal_at: u64, delay_millis: Option<u64>, writes: &[u64]) -> RunPlan {
+    let mut plan =
+        scenario_run::lower(&held(&[B_NODE, C_NODE], Seq::ZERO, K1_MAX_TICKS)).expect("lowers");
+    for (a, b) in [(B_NODE, A_NODE), (C_NODE, A_NODE)] {
+        plan.network_ops.push(NetworkOp::SetLink {
+            a,
+            b,
+            state: LinkState::Partitioned,
+        });
+        plan.steps.push(step(
+            heal_at,
+            StepAction::Network(NetworkOp::SetLink {
+                a,
+                b,
+                state: LinkState::Up,
+            }),
+        ));
+    }
+    for delay_millis in delay_millis.into_iter().flat_map(|delay| [delay; 60]) {
+        plan.steps.push(plan_next(
+            heal_at,
+            B_NODE,
+            A_NODE,
+            Delivery::Deliver { delay_millis },
+        ));
+    }
+    plan.steps.sort_by_key(|step| step.at);
+    plan.seed.extend(
+        writes
+            .iter()
+            .zip(300..)
+            .map(|(at, request)| submit_at(*at, 9_000 + request, RequestId(request))),
+    );
+    plan
+}
+
+/// K1 (host walk A12 at 5c798ca): a copy that returns after a `DegradedRf2` commit at cutoff 0 but
+/// before the start record is shipped takes seq 1 from the stream. R1 runs no catch-up for a copy
+/// that was never behind, so no `CopyCaughtUp` reaches F1, and before the fix nothing pinned the
+/// rebuild: F1 stayed `Rebuilding`, never re-emitted `Active`, and sent no sync, so not even a
+/// deadline reported the stall. Now every commit at cutoff 0 pins `(0, ROOT)` at the commit (K1
+/// ruling), so the deadline after the heal asks A again and the partition activates.
+#[retcd_test]
+fn m9_k1_00_a_copy_back_before_the_start_record_ships_still_lets_the_degraded_start_activate() {
+    let (replies, trace, violations) = run_judged(&k1_early_heal());
+    let recovered = recovered_on_primary(&trace);
+    tracing::info!(?recovered, "k1.recovered");
+    assert!(
+        matches!(recovered.first(), Some((at, PartitionMode::DegradedRf2, Seq::ZERO)) if *at < K1_HEAL_AT),
+        "committed degraded at cutoff 0 while A is away: {recovered:?}"
+    );
+    let first_seq_one = |node| {
+        applied_on(&trace, node)
+            .into_iter()
+            .find(|(_, generation, seq, outcome)| {
+                *generation == Generation(2) && *seq == Seq(1) && *outcome == ApplyOutcome::Applied
+            })
+            .map(|(at, ..)| at)
+    };
+    let (on_a, on_c) = (first_seq_one(A_NODE), first_seq_one(C_NODE));
+    tracing::info!(?on_a, ?on_c, "k1.seq_one");
+    assert!(
+        matches!((on_a, on_c), (Some(a), Some(c)) if a == c && a > K1_HEAL_AT),
+        "the precondition: A takes seq 1 from the stream with C, after the heal, never behind it \
+         (A at {on_a:?}, C at {on_c:?})"
+    );
+    let active = recovered
+        .iter()
+        .find(|(at, mode, cutoff)| {
+            *at > K1_HEAL_AT && *mode == PartitionMode::Active && *cutoff == Seq::ZERO
+        })
+        .map(|(at, ..)| *at);
+    assert!(
+        matches!(active, Some(at) if at < K1_WRITES[0]),
+        "the same result re-emitted active once A holds the prefix, before the first write: \
+         {recovered:?}"
+    );
+    // What `Active` rests on here (K1 ruling, critic F7): a proof at point 0 says nothing about
+    // A, so name what A actually held when it activated, the start record.
+    let a_at_active = applied_on(&trace, A_NODE)
+        .into_iter()
+        .filter(|(at, generation, _, outcome)| {
+            active.is_some_and(|active| *at <= active)
+                && *generation == Generation(2)
+                && *outcome == ApplyOutcome::Applied
+        })
+        .map(|(_, _, seq, _)| seq)
+        .max();
+    assert_eq!(
+        a_at_active,
+        Some(Seq(1)),
+        "A held the start record, and nothing more, when the partition went active (t{active:?})"
+    );
+    assert_eq!(
+        written(&replies),
+        vec![(RequestId(300), Seq(2)), (RequestId(301), Seq(3))],
+        "both writes publish after the start record; replies: {replies:#?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
+}
+
+/// K1's new seam (critic F2): at point 0 A proves at once, so the `Active` re-emit no longer
+/// waits for A's catch-up. A returns after the start record shipped (t2503) and 43 ms before the
+/// first rebuild deadline (t4003), and B's messages to it take 100 ms, so B's catch-up cursor for
+/// A is live mid-seq-1 when the deadline's sync is proved and the re-emit clears the cursors.
+const K1_RACE_HEAL_AT: u64 = 3_960;
+
+#[retcd_test]
+fn m9_k1_02_the_active_re_emit_landing_mid_catch_up_still_brings_the_copy_up_and_writes_publish() {
+    let (replies, trace, violations) = run_judged(&k1_heal(K1_RACE_HEAL_AT, Some(100), &K1_WRITES));
+    let recovered = recovered_on_primary(&trace);
+    let on_a: Vec<(u64, Seq)> = applied_on(&trace, A_NODE)
+        .into_iter()
+        .filter(|(_, generation, _, outcome)| {
+            *generation == Generation(2) && *outcome == ApplyOutcome::Applied
+        })
+        .map(|(at, _, seq, _)| (at, seq))
+        .collect();
+    tracing::info!(?recovered, ?on_a, "k1.race");
+    let active = recovered
+        .iter()
+        .find(|(at, mode, cutoff)| {
+            *at > K1_RACE_HEAL_AT && *mode == PartitionMode::Active && *cutoff == Seq::ZERO
+        })
+        .map(|(at, ..)| *at);
+    let seq_one = on_a
+        .iter()
+        .find(|(_, seq)| *seq == Seq(1))
+        .map(|(at, _)| *at);
+    assert!(
+        matches!((active, seq_one), (Some(active), Some(seq_one)) if active < seq_one),
+        "the race this row is for: the re-emit lands while A is still catching up to seq 1          (active t{active:?}, A applies seq 1 at t{seq_one:?}); recovered {recovered:?}"
+    );
+    assert_eq!(
+        on_a.iter().map(|(_, seq)| *seq).collect::<Vec<_>>(),
+        vec![Seq(1), Seq(2), Seq(3)],
+        "A applies the start record and both writes, in order, once each: {on_a:?}"
+    );
+    assert_eq!(
+        written(&replies),
+        vec![(RequestId(300), Seq(2)), (RequestId(301), Seq(3))],
+        "both writes publish after the start record; replies: {replies:#?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
+}
+
+/// The stall cadence at cutoff 0 (K1 ruling, critic F8, the kernel half of the M26 analogue): A
+/// stays cut through three rebuild deadlines (t4003, t6003, t8003) after a `DegradedRf2` commit.
+/// The rebuild pinned at the commit names A once per deadline, never B or C, never twice in one
+/// deadline, and stops naming it once A is back. L1 paused writes while A was unheard (B-R38) and
+/// holds 5 s after A is heard again, so the writes come after that hold.
+const K1_LATE_HEAL_AT: u64 = 8_500;
+const K1_LATE_WRITES: [u64; 2] = [14_000, 16_000];
+
+#[retcd_test]
+fn m9_k1_03_a_copy_away_for_three_deadlines_is_named_stalled_once_per_deadline() {
+    let (replies, trace, violations) = run_judged(&k1_heal(K1_LATE_HEAL_AT, None, &K1_LATE_WRITES));
+    let stalls: Vec<(u64, CopyId)> = trace
+        .events
+        .iter()
+        .filter(|event| event.node == B_NODE)
+        .filter_map(|event| match &event.kind {
+            TraceKind::KernelNoted {
+                note:
+                    KernelNote::RecoveryFact {
+                        effect: RecoveryEffect::RebuildStalled { copy },
+                    },
+                ..
+            } => Some((event.logical_tick, *copy)),
+            _ => None,
+        })
+        .collect();
+    let recovered = recovered_on_primary(&trace);
+    tracing::info!(?stalls, ?recovered, "k1.cadence");
+    let ticks: Vec<u64> = stalls.iter().map(|(at, _)| *at).collect();
+    assert!(
+        stalls.len() == 3 && stalls.iter().all(|(_, copy)| *copy == stalls[0].1),
+        "one copy, A, named three times: {stalls:?}"
+    );
+    assert!(
+        ticks.windows(2).all(|pair| pair[1] > pair[0])
+            && ticks[2] - ticks[1] == ticks[1] - ticks[0]
+            && ticks[2] < K1_LATE_HEAL_AT,
+        "once per deadline, at an even cadence, all while A is away: {ticks:?}"
+    );
+    let active = recovered
+        .iter()
+        .find(|(at, mode, cutoff)| {
+            *at > K1_LATE_HEAL_AT && *mode == PartitionMode::Active && *cutoff == Seq::ZERO
+        })
+        .map(|(at, ..)| *at);
+    assert!(
+        matches!(active, Some(at) if at < K1_LATE_WRITES[0]),
+        "the partition activates once A is back: {recovered:?}"
+    );
+    assert_eq!(
+        written(&replies),
+        vec![(RequestId(300), Seq(2)), (RequestId(301), Seq(3))],
+        "both writes publish after the start record; replies: {replies:#?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
 }
