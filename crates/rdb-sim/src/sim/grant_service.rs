@@ -83,7 +83,8 @@ pub fn clear_restarted_grant(
     let record = GrantRecord::decode(&value).ok_or(SimError::Config {
         field: "control_records",
     })?;
-    // The three guards are `rdb_core`'s, shared with the real host's admin (M9).
+    // The three guards are `rdb_core`'s. Only this model calls them today; an S2 host admin is
+    // planned to share them.
     let verdict = clear_verdict(node, &record, boot, sample, now, budgets, || {
         let (_, partitions) = control.snapshot_family(ControlPrefix::Partitions)?;
         partitions

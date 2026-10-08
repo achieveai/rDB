@@ -176,7 +176,8 @@ pub enum ClearRefusal {
 }
 
 /// May a restarted node's stale `grants/{node}` record be deleted? The three guards, as a pure
-/// function, shared by the simulator's model of the service and the real host's admin.
+/// function. The simulator's model of the service calls it today; an S2 host admin is planned
+/// to share them.
 ///
 /// A1's acquisition is create-only, so a restarted node cannot acquire while its old boot's
 /// record stands. Removing it is safe only when **all three** hold:
