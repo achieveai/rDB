@@ -1042,6 +1042,59 @@ fn m9_f1_00_a_slow_catch_up_pins_the_rebuild_at_the_cutoff_because_writes_wait_f
     );
 }
 
+/// F2: the `d3_hold` timeline, with the append of write 200 to A corrupted at t5300 while the
+/// activation CAS is held. A quarantines; B's `CopyLost` reaches F1 during the CAS and is out of
+/// phase; the CAS lands and F1 re-emits `Active` with A in the barrier. The re-emit's own
+/// `SetAdmission{allow: false}` starts a keepalive round, which reaches A before A's watch.
+///
+/// Ruling 2026-10-07, item 3: quarantine is sticky across a same-generation re-emit. A truncates
+/// its suffix but stays quarantined, B keeps it diverged, and it rejoins only on a new
+/// generation, which this run never makes. The partition must still take writes on B and C.
+const F2_CORRUPT_AT: u64 = 5_300;
+
+fn f2_quarantined_at_re_emit() -> RunPlan {
+    let mut plan = d3_hold();
+    plan.steps.push(plan_next(
+        F2_CORRUPT_AT,
+        B_NODE,
+        A_NODE,
+        Delivery::Corrupt { delay_millis: 0 },
+    ));
+    plan.steps.sort_by_key(|step| step.at);
+    plan
+}
+
+/// F2 with the re-emit's first frame to A dropped, so no keepalive meets A while it is still
+/// quarantined. Before item 3, B cleared `diverged` in `rebuilt` and A cleared its quarantine
+/// on the watch, so A rejoined the generation it quarantined in; the ruling keeps it out until a
+/// new one.
+fn f2_without_the_re_emit_keepalive() -> RunPlan {
+    let mut plan = f2_quarantined_at_re_emit();
+    plan.steps
+        .push(plan_next(F2_CORRUPT_AT + 1, B_NODE, A_NODE, Delivery::Drop));
+    plan.steps.sort_by_key(|step| step.at);
+    plan
+}
+
+#[retcd_test]
+fn m9_f2_00_a_copy_quarantined_during_the_activation_cas_stays_out_and_the_others_take_every_write()
+{
+    f2_stays_out(
+        &f2_quarantined_at_re_emit(),
+        F2_CORRUPT_AT,
+        D3_HOLD_WRITES.len(),
+    );
+}
+
+#[retcd_test]
+fn m9_f2_01_a_quarantined_copy_that_misses_the_re_emit_keepalive_still_stays_out() {
+    f2_stays_out(
+        &f2_without_the_re_emit_keepalive(),
+        F2_CORRUPT_AT,
+        D3_HOLD_WRITES.len(),
+    );
+}
+
 /// The F2 expectation (ruling 2026-10-07, item 3): A quarantines at `corrupt_at` while the CAS
 /// is held, then stays out; B and C take all `writes` client writes, and every oracle accepts
 /// the run.

@@ -4,7 +4,7 @@
 //!
 //! | Clause | Rule(s) | Says |
 //! |---|---|---|
-//! | (a) | `resume_without_every_pinned_copy`, `resume_barrier_not_exact`, `resume_hold_broken` | a `Paused -> … -> Healthy` move is legal only when every node in the pinned `required_copy_set` is durable at the barrier **exactly**, and lag stayed under 250 ms for the 5 s before it |
+//! | (a) | `resume_without_every_pinned_copy`, `resume_barrier_not_exact`, `resume_hold_broken` | a `Paused -> … -> Healthy` move is legal only when every node in the pinned `required_copy_set`, less the lost ones, is durable at the barrier **exactly**, and lag stayed under 250 ms for the 5 s before it |
 //! | (b) | `unsafe_age_reset_across_config_version` | the unsafe-age timer never falls across a `config_version` change without a retirement barrier |
 //! | (c) | `admitted_while_paused` | pausing is an **admission** gate (critic F20) |
 //!
@@ -23,6 +23,12 @@
 //! L1 rows. The 250 ms / 5 s hold below is a *resume condition* from the same spec row, not the
 //! entry ladder, and it is checkable because the trace declares every `oldest_unsafe_age_ms` it
 //! evaluated.
+//!
+//! Clause (a) quantifies over the pinned set **minus the copies L1 holds lost** (ADR-rdb-0006
+//! §1: `lag_domain = copies − self − lost`; M9 S0 ruling 2026-10-07, item 5). A lost copy does
+//! not gate resume, so it is not short of the barrier either. The set is the `lost_copy_set` of
+//! the `Healthy` line itself, the line in force at resume. A trace written before that field
+//! existed reads it empty, which is the clause it was judged by.
 //!
 //! Clause (a)'s exactness has one exemption, the kernel's **start record** (M9 S0, lead ruling
 //! "S0 start record", Gautam chose A on 2026-10-07). An empty partition pauses at barrier 0, and
@@ -70,6 +76,7 @@ impl Checker for Lag {
                 phase,
                 oldest_unsafe_age_ms,
                 config_version,
+                lost_copy_set,
                 ..
             } => {
                 if *phase == ProtectionPhase::Paused {
@@ -110,7 +117,7 @@ impl Checker for Lag {
                 let Some(pin) = pinned_pause(part) else {
                     return Ok(());
                 };
-                resume_is_legal(part, pin, event.logical_tick)
+                resume_is_legal(part, pin, lost_copy_set, event.logical_tick)
             }
 
             TraceKind::AdmissionDecision { outcome, .. } => {
@@ -165,10 +172,11 @@ fn retired(part: &crate::support::oracle::model::PartitionModel, previous: &Prot
 }
 
 /// Clause (a), in the order an operator wants to read it: who was short, then whether the
-/// barrier was hit exactly, then whether the hold held.
+/// barrier was hit exactly, then whether the hold held. `lost` is the resume line's lost set.
 fn resume_is_legal(
     part: &crate::support::oracle::model::PartitionModel,
     pin: &ProtectionRec,
+    lost: &[NodeId],
     healthy_tick: u64,
 ) -> Result<(), Violation> {
     if !part
@@ -187,8 +195,14 @@ fn resume_is_legal(
         ));
     }
 
-    let short: Vec<NodeId> = pin
+    // ADR-rdb-0006 §1: the copies that gate resume are the pinned set less the lost ones.
+    let gating: Vec<NodeId> = pin
         .required_copy_set
+        .iter()
+        .copied()
+        .filter(|node| !lost.contains(node))
+        .collect();
+    let short: Vec<NodeId> = gating
         .iter()
         .copied()
         .filter(|node| !part.durable_through(*node, pin.resume_barrier_seq))
@@ -209,8 +223,7 @@ fn resume_is_legal(
 
     // "The barrier is hit exactly." An overshoot means the durable prefix ran past the barrier
     // the pause declared, so the barrier was never the thing that gated the resume.
-    let overshot: Vec<NodeId> = pin
-        .required_copy_set
+    let overshot: Vec<NodeId> = gating
         .iter()
         .copied()
         .filter(|node| overshoots(part, *node, pin.resume_barrier_seq))

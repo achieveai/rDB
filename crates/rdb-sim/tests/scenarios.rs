@@ -3897,6 +3897,7 @@ mod false_durable_oracle {
                 phase: ProtectionPhase::Healthy,
                 oldest_unsafe_age_ms: 0,
                 required_copy_set: vec![N1, N2, N3],
+                lost_copy_set: Vec::new(),
                 config_version: CONFIG_V1,
                 paused_prefix_seq: Seq::ZERO,
                 resume_barrier_seq: Seq::ZERO,

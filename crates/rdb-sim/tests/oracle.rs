@@ -118,6 +118,7 @@ fn protection(
         phase,
         oldest_unsafe_age_ms: age_ms,
         required_copy_set: required.to_vec(),
+        lost_copy_set: Vec::new(),
         config_version,
         paused_prefix_seq: paused_prefix,
         resume_barrier_seq: barrier,
@@ -2600,6 +2601,60 @@ fn m7v_37_lag_resume_with_lag_above_250ms_inside_the_hold_violates() {
         &judge(&overshoot),
         Invariant::Lag,
         "resume_barrier_not_exact",
+    );
+}
+
+/// `trace` with its last `Healthy` line naming `lost` as the copies L1 holds lost.
+fn lost_at_resume(mut trace: Trace, lost: &[NodeId]) -> Trace {
+    let healthy = trace
+        .events
+        .iter_mut()
+        .rev()
+        .find_map(|event| match &mut event.kind {
+            TraceKind::ProtectionState {
+                phase: ProtectionPhase::Healthy,
+                lost_copy_set,
+                ..
+            } => Some(lost_copy_set),
+            _ => None,
+        })
+        .expect("lag_cycle ends Healthy");
+    *healthy = lost.to_vec();
+    trace
+}
+
+/// M9 S0 F2 (ruling 2026-10-07, item 5; ADR-rdb-0006 §1: the lag domain is the copies minus
+/// self minus lost). Clause (a) quantifies over the pinned set less the copies the resume line
+/// names lost: n3 lost and short of the barrier, the other two at it, is a legal resume. Near-
+/// misses: the lost set excuses only its own nodes, so n1 short beside a lost n3 still reports n1
+/// alone; and the same run with nothing lost reports n3, as before the field existed.
+#[retcd_test]
+fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
+    support::preamble();
+    let n3_short = || lag_cycle("m9-f2-b", &[(N1, Seq(40)), (N2, Seq(40))], 240, 8_000);
+    proven(&judge(&lost_at_resume(n3_short(), &[N3])), Invariant::Lag);
+
+    let n1_short = lost_at_resume(lag_cycle("m9-f2-b", &[(N2, Seq(40))], 240, 8_000), &[N3]);
+    let signature = violated(
+        &judge(&n1_short),
+        Invariant::Lag,
+        "resume_without_every_pinned_copy",
+    );
+    assert!(
+        signature.detail.contains("node(s) 1 short"),
+        "only n1 is short: {}",
+        signature.detail
+    );
+
+    let signature = violated(
+        &judge(&n3_short()),
+        Invariant::Lag,
+        "resume_without_every_pinned_copy",
+    );
+    assert!(
+        signature.detail.contains("node(s) 3 short"),
+        "{}",
+        signature.detail
     );
 }
 
