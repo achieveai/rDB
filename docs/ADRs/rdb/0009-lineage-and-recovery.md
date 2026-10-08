@@ -360,6 +360,16 @@ that does not know whether it is the owner must not act as if it were.
 | 1 | `READ_ONLY` | `recovery_mode = true`; reads only from the declared prefix; mutations and actor activation rejected; writes wait for **three** copies to fsync the same prefix and validate checksums, then CAS `ACTIVE` (§8.4 steps 4–6) |
 | 0 | `BLOCKED` | operator restore; outside automatic recovery |
 
+**Amended 2026-10-08 (lead ruling "S0 K1", M9).** At cutoff 0 the rebuild pins its point at
+`(0, ROOT)` when the recovery commits, in every mode, not by a catch-up: a copy that returns
+before the start record ships takes it from the stream, is never behind, and so never reports a
+catch-up that could pin. Each deadline then asks every unproven copy again. At that point
+activation proves only the empty prefix, not that the third copy holds what the others hold.
+"Reported degraded until a third copy is caught up" stays true because lag protection pauses
+writes while a copy is unheard, counting it as infinitely behind (B-R38), not because of the
+proof. Work that lets writes resume while a copy is silent (M10 PC17) must not reopen this.
+Rows: `m9_k1_00`, `m9_k1_02` and `m9_k1_03` (sim); `m9_d2_05` and `m9_k1_01` (unit).
+
 The mode is **derived, never configured**. rDB has no equivalent of
 `unclean.leader.election.enable` and must not acquire one: the Kafka toggle is a single boolean that
 converts a durability guarantee into an availability guarantee, and the equivalent pressure here

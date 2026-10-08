@@ -13,12 +13,14 @@
 //! judged like any other (ruling B-R52a).
 //!
 //! The rebuild point is pinned by the first live catch-up at or above the committed cutoff, and
-//! never below it (rulings F-e, A-3). One exception pins at the commit itself: a `ReadOnly` commit
-//! at cutoff 0 (M9 S0 D2 ruling, rule 1). No copy is behind an empty prefix, so no catch-up would
-//! ever come; such a rebuild asks again at each deadline, because nothing else would (rule 2). A pin is never replaced. Every report is judged the same
-//! whenever it lands (ruling A-1): a digest at the cutoff other than the committed one, or a
-//! second digest at the point, is divergence, and proofs held before the pin are judged when it
-//! lands.
+//! never below it (rulings F-e, A-3). One exception pins at the commit itself: any commit at
+//! cutoff 0 (M9 S0 D2 ruling, rule 1, widened from `ReadOnly` to every mode by the K1 ruling). A
+//! catch-up is not guaranteed there: nothing is behind an empty prefix, and a copy that returns
+//! before the start record ships takes it from the stream. Such a rebuild asks again at each
+//! deadline, because nothing else would (rule 2). A pin is never replaced. Every report is judged
+//! the same whenever it lands (ruling A-1): a digest at the cutoff other than the committed one,
+//! or a second digest at the point, is divergence, and proofs held before the pin are judged when
+//! it lands.
 //!
 //! A proof never displaces a better one (ruling B-R74d, extending B-R74a): per copy, one that
 //! does not bind to the point never replaces one that does, nor one higher than itself. A proof
