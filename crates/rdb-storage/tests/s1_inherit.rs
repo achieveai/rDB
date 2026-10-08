@@ -442,6 +442,32 @@ fn m8s_28_syncing_a_child_raises_its_ancestors_durable() {
     assert_eq!(engine.durable(P, G1), DurableSeq(10));
 }
 
+/// Defect D7 (M9 S0, K1 merge): a sync of a lineage the engine was never given made an empty
+/// entry for it, so the inherit that later created that lineage was refused
+/// `child_has_history`, and the rDB host faulted. Such a sync now proves the empty prefix and
+/// creates nothing: an empty copy still proves `(0, ROOT)` (D2 rule 3), and the inherit links.
+#[retcd_test]
+fn d7_a_sync_of_a_lineage_never_given_creates_nothing_and_the_inherit_links() {
+    let dir = data_dir("d7-sync-unknown");
+    let mut engine = RocksEngine::open(dir.join("db")).expect("open");
+
+    let durable = engine
+        .sync_wal_through(vec![CapturedPrefix {
+            partition: P,
+            generation: G1,
+            through: AppliedSeq(0),
+        }])
+        .expect("sync of a lineage never given");
+    assert_eq!(durable.len(), 1);
+    assert_eq!(
+        (durable[0].generation, durable[0].through),
+        (G1, DurableSeq(0))
+    );
+    assert!(!engine.lineages().contains(&(P, G1)), "the sync made g1");
+
+    assert_eq!(engine.inherit(P, G0, G1, Seq(0)), Ok(Inherited::Linked));
+}
+
 /// The raw key of an engine-private record of `(P, generation)`: `P | generation | 0xFF | name`.
 /// Spelled out here on purpose: these tests pin the layout they corrupt.
 fn private_key(generation: u64, name: &[u8]) -> Vec<u8> {
