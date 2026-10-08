@@ -131,7 +131,8 @@ const IDLE_WAIT: Duration = Duration::from_millis(1_000);
 /// past the deadline F1 blocks for good with `BlockPromotion { reason: ControlUnknown }`, and
 /// the row waits out its patience for a commit that cannot come (G2 at 20 ms; at 100 ms on a
 /// host also running a coverage build, 2026-10-07). So it stretches with the scale, as the
-/// waits do.
+/// waits do. Even scaled it is short of a loaded host's stalls (~470 ms, 2026-10-08), so only
+/// rows that count F1's deadlines take it; the rest keep the spec's 2 s (see `Trio::fast`).
 #[cfg(test)]
 pub(crate) fn test_discovery_window_millis() -> u64 {
     100 * u64::from(config_testkit::poll::deadline_scale())
@@ -3175,9 +3176,9 @@ mod tests {
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::start();
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        // The walk, faster: F1's deadline is the discovery window. The never-pinned watch is
-        // pushed out of reach, so only F1's own report can produce the line.
-        host.budgets.discovery_window_millis = test_discovery_window_millis();
+        // The walk, faster: F1's deadline is the discovery window, shortened once F1 has
+        // committed, so the commit's CAS keeps the spec's 2 s against a host stall. The
+        // never-pinned watch is pushed out of reach, so only F1's own report can produce the line.
         host.rebuild_pin_wait_millis = 60_000;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -3185,6 +3186,9 @@ mod tests {
         .expect("bootstrap");
         let partition = PartitionId(1);
         let step = |host: &mut Host| {
+            if host.status(partition).recovered.is_some() {
+                host.budgets.discovery_window_millis = test_discovery_window_millis();
+            }
             host.run_due();
             host.drain();
             assert_eq!(host.fault, None, "a stall is reported, never a fault");
@@ -3259,7 +3263,6 @@ mod tests {
     fn an_active_commit_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.rebuild_pin_wait_millis = 50;
         });
         trio.bootstrap();
@@ -3287,7 +3290,8 @@ mod tests {
     /// is pinned and the never-pinned watch must stay quiet. The D2 row's start (`ReadOnly` at
     /// cutoff 0), then the `SyncWalThrough` F1 sends at commit, through the host's own effect
     /// path. Since the D2 kernel step F1 also names the held copies at its deadline, so a stall
-    /// line does appear; this row pins only that it is never the never-pinned one.
+    /// line may appear; this row pins only that it is never the never-pinned one. The window is
+    /// the spec's 2 s, since it is also the CAS deadline a host stall must not outlast.
     #[config_log::retcd_test]
     fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
@@ -3307,7 +3311,6 @@ mod tests {
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::start();
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        host.budgets.discovery_window_millis = test_discovery_window_millis();
         host.rebuild_pin_wait_millis = 50;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -3385,9 +3388,7 @@ mod tests {
     #[test]
     fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
         let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = test_discovery_window_millis()
-        });
+        let mut trio = Trio::new(dir.path(), |_| {});
         let partition = PartitionId(1);
         for (host, _, _) in &trio.nodes {
             assert_eq!(
@@ -3656,11 +3657,11 @@ mod tests {
             "a_degraded_commit_with_a_copy_away_is_reported_stalled_with_writes_paused";
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.rebuild_pin_wait_millis = 50;
         });
         trio.links.hold(NodeId(1), NodeId(3));
         trio.bootstrap();
+        trio.short_window_after_commit();
         let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
         assert!(
             trio.nodes[0].0.rebuilds[&PartitionId(1)].pinned,
@@ -3730,11 +3731,11 @@ mod tests {
         };
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.rebuild_pin_wait_millis = 50;
         });
         trio.links.hold(NodeId(1), NodeId(3));
         trio.bootstrap();
+        trio.short_window_after_commit();
         let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
 
         // The commit's ask and three deadlines' asks; the log is read every 50 ms, not per step.
@@ -4682,10 +4683,11 @@ mod tests {
             }
         }
 
-        /// The spec's budgets, shortened so a start reaches `ready` in well under a second:
-        /// the discovery window and L1's resume hold are most of the 7.6 s a walk waits.
+        /// The spec's budgets with L1's resume hold shortened, so a start reaches `ready` in
+        /// about the 2 s discovery window. The window stays the spec's: it is also F1's CAS and
+        /// barrier deadline, and a host stall past a short one blocks F1 for good (Trio flake,
+        /// 2026-10-08: ~470 ms against 300 ms). Only rows that count F1's deadlines shorten it.
         fn fast(host: &mut Host) {
-            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.budgets.resume_hold_millis = 50;
         }
 
@@ -4706,6 +4708,18 @@ mod tests {
                     |msg| owner.send(msg).map_err(|_| NodeStopped(NodeId(1))),
                 ))
                 .expect("bootstrap");
+        }
+
+        /// For rows that count F1's post-commit deadlines: the spec's window until node 1 has
+        /// committed, so the commit's CAS outlasts a host stall, then the short test window for
+        /// every deadline armed after it.
+        fn short_window_after_commit(&mut self) {
+            self.until("F1 committed on node 1", |trio| {
+                trio.status(0).recovered.map(|_| ())
+            });
+            for (host, _, _) in &mut self.nodes {
+                host.budgets.discovery_window_millis = test_discovery_window_millis();
+            }
         }
 
         /// One round: each host runs its due work and its queue, then takes its mail.
