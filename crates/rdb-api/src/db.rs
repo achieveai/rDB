@@ -453,6 +453,8 @@ impl Db {
                 durability: result.durability,
                 sent: Box::new(request),
             }),
+            // The host hands no request back on a refusal, nor to a resend that reached an
+            // already-faulted owner: what was sent is the caller's own (mutant W3).
             Some(Answer::Error { error, request }) => Err(PutError {
                 error,
                 request: request.or(sent).map(Box::new),
@@ -618,7 +620,7 @@ mod tests {
     use super::*;
 
     /// The tester's row (a): the public `Db` path for a write whose outcome is unknown, and
-    /// mutant M10. With both secondaries cut off nothing can acknowledge the put, and P1 answers
+    /// mutant W3. With both secondaries cut off nothing can acknowledge the put, and P1 answers
     /// `UNKNOWN_OUTCOME` when L1 pauses, well inside the put timeout, so the answer carries the
     /// request. After the heal, resending it is the same transaction at seq 3.
     /// Integration (~3 s): three node threads on wall-clock time, a real L1 pause and a resume

@@ -379,7 +379,8 @@ pub enum Answer {
     Error {
         /// Why.
         error: ApiError,
-        /// The request, when one was sent.
+        /// The request of a put still waiting when the node faulted. Nothing else carries it: a
+        /// [`ClientCall::Resend`] caller already holds what it sent.
         request: Option<TxnRequest>,
     },
 }
@@ -2461,10 +2462,8 @@ impl Host {
                 result: *result,
                 request,
             },
-            (ReplyEffect::Failed { error, .. }, PendingKind::Txn(request)) => Answer::Error {
-                error: ApiError::from_kernel(error),
-                request: Some(request),
-            },
+            // No request on a refusal: the only product client, the `Db`, sends a put as a
+            // `Resend` and already holds what it sent (mutant W3 guards that side).
             (ReplyEffect::Failed { error, .. }, _) => Answer::Error {
                 error: ApiError::from_kernel(error),
                 request: None,
