@@ -347,7 +347,16 @@ impl Db {
                 request: None,
             });
         }
-        answer.recv_timeout(wait).ok()
+        match answer.recv_timeout(wait) {
+            Ok(answer) => Some(answer),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            // The node dropped the call's waiter unanswered: not a timeout, so not the
+            // timeout's outcome either (F-001).
+            Err(mpsc::RecvTimeoutError::Disconnected) => Some(Answer::Error {
+                error: ApiError::host("the owner dropped the call unanswered"),
+                request: None,
+            }),
+        }
     }
 
     /// Replace `object` with `value`, optionally only if it is at `if_version`.
@@ -837,6 +846,49 @@ mod tests {
             sent.len() == 1 && sent[0].starts_with("Compile"),
             "only the compile reached the owner: {sent:?}"
         );
+        db.shutdown();
+    }
+
+    /// F-001 (S0 review), the `Db` side: a call whose waiter the node drops unanswered is a
+    /// host fault at once, not a timeout. Here the owner's mailbox is read by a thread that
+    /// drops the compile it takes, waiter and all; the put timeout is 5 s, so an answer within
+    /// half of it can only come from the dropped channel.
+    #[test]
+    fn a_call_the_node_drops_unanswered_is_a_host_fault_not_a_timeout() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (owner, mailbox) = NodeHandle::unanswered(OWNER);
+        let dropper = std::thread::spawn(move || drop(mailbox.recv()));
+        let put = Duration::from_secs(5);
+        let mut db = Db {
+            nodes: vec![owner],
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts {
+                put,
+                ..Timeouts::default()
+            },
+            next_request: AtomicU64::new(1),
+        };
+
+        let started = std::time::Instant::now();
+        let refused = db
+            .put(b"a", b"1", None)
+            .expect_err("the compile was dropped");
+        let took = started.elapsed();
+        dropper.join().expect("the dropper thread");
+        assert_eq!(
+            (refused.error.name(), refused.error.retry),
+            ("UNAVAILABLE".to_owned(), RetryRule::NotWired),
+            "{:?} after {took:?}",
+            refused.error
+        );
+        assert!(took < put / 2, "answered in {took:?}, not at the timeout");
+        assert!(refused.request.is_none(), "nothing was sent to resend");
         db.shutdown();
     }
 

@@ -702,6 +702,9 @@ struct Host {
     /// [`STUCK_RESENDS`]; crate tests lower it.
     stuck_resends: u32,
     fault: Option<String>,
+    /// The next step view fails to build, as a storage fault would (F-001 rows).
+    #[cfg(test)]
+    fail_step_view: bool,
 }
 
 impl Host {
@@ -750,6 +753,8 @@ impl Host {
             resends: BTreeMap::new(),
             stuck_resends: STUCK_RESENDS,
             fault: None,
+            #[cfg(test)]
+            fail_step_view: false,
         }
     }
 
@@ -1228,6 +1233,13 @@ impl Host {
         partition: PartitionId,
         generation: Generation,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_step_view) {
+            return Err(format!(
+                "step view of p{} g{}: injected",
+                partition.0, generation.0
+            ));
+        }
         let applied = self.engine.buffered_applied(partition, generation);
         let key = (generation, applied);
         if self
@@ -2376,14 +2388,17 @@ impl Host {
                 value,
                 if_version,
                 remaining_millis,
-            } => match self.compile(
-                partition,
-                identity,
-                &object,
-                value,
-                if_version,
-                remaining_millis,
-            )? {
+            } => match self
+                .compile(
+                    partition,
+                    identity,
+                    &object,
+                    value,
+                    if_version,
+                    remaining_millis,
+                )
+                .map_err(|detail| fail_waiter(&reply, detail))?
+            {
                 Ok(request) => (
                     identity,
                     EventKind::Client(ClientEvent::Submit(request.clone())),
@@ -2404,14 +2419,17 @@ impl Host {
                 if_version,
                 remaining_millis,
             } => {
-                let answer = match self.compile(
-                    partition,
-                    identity,
-                    &object,
-                    value,
-                    if_version,
-                    remaining_millis,
-                )? {
+                let answer = match self
+                    .compile(
+                        partition,
+                        identity,
+                        &object,
+                        value,
+                        if_version,
+                        remaining_millis,
+                    )
+                    .map_err(|detail| fail_waiter(&reply, detail))?
+                {
                     Ok(request) => Answer::Compiled(request),
                     Err(error) => Answer::Error {
                         error,
@@ -2570,25 +2588,16 @@ impl Host {
                 request: None,
             },
             (ReplyEffect::Status { status, .. }, PendingKind::Status) => Answer::Status(*status),
-            (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root)) => {
-                match self.read_answer(partition, *outcome, *value, &root) {
-                    Ok(answer) => answer,
-                    Err(detail) => {
-                        // The node faults on this. Tell the waiting read so, now, as
-                        // `set_fault` tells every other waiting call: dropped, it would time
-                        // out as "no read answer".
-                        let _ = pending.reply.send(Answer::Error {
-                            error: ApiError::host(&detail),
-                            request: None,
-                        });
-                        return Err(detail);
-                    }
-                }
-            }
+            (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root)) => self
+                .read_answer(partition, *outcome, *value, &root)
+                .map_err(|detail| fail_waiter(&pending.reply, detail))?,
             (reply, kind) => {
-                return Err(format!(
-                    "reply {} does not answer a pending {kind:?}",
-                    reply_name(reply)
+                return Err(fail_waiter(
+                    &pending.reply,
+                    format!(
+                        "reply {} does not answer a pending {kind:?}",
+                        reply_name(reply)
+                    ),
                 ));
             }
         };
@@ -2618,9 +2627,12 @@ impl Host {
             return Ok(());
         };
         let PendingKind::Previous(root) = pending.kind else {
-            return Err(format!(
-                "a previous-view answer for request {} that asked {:?}",
-                identity.request.0, pending.kind
+            return Err(fail_waiter(
+                &pending.reply,
+                format!(
+                    "a previous-view answer for request {} that asked {:?}",
+                    identity.request.0, pending.kind
+                ),
             ));
         };
         let answer = match handle {
@@ -2631,10 +2643,12 @@ impl Host {
                 at: Seq::ZERO,
             },
             Ok(handle) => {
-                let view = self
-                    .bound
-                    .get(&handle)
-                    .ok_or_else(|| format!("previous view {} is not bound", handle.0))?;
+                let view = self.bound.get(&handle).ok_or_else(|| {
+                    fail_waiter(
+                        &pending.reply,
+                        format!("previous view {} is not bound", handle.0),
+                    )
+                })?;
                 document_answer(view, &root, ReadServiceOutcome::Served)
             }
         };
@@ -2828,6 +2842,17 @@ fn unsupported(node: NodeId, kind: &str) -> String {
     format!("host_unsupported: {kind}")
 }
 
+/// Tell a call's waiter, now, that the node faults on `detail`, as `set_fault` tells every
+/// pending call; dropped unanswered, the waiter would read it as a timeout (F-001). Returns
+/// `detail`, for the fault.
+fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
+    let _ = reply.send(Answer::Error {
+        error: ApiError::host(&detail),
+        request: None,
+    });
+    detail
+}
+
 /// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
 fn compile_error(error: &ValueError) -> ApiError {
     match error {
@@ -2924,6 +2949,7 @@ fn head(debug: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdb_core::contracts::errors::RetryRule;
     use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
     use rdb_core::contracts::txn::{Durability, Outcome};
 
@@ -4051,6 +4077,107 @@ mod tests {
                 assert_eq!(error.detail, format!("host fault: {fault}"));
             }
             other => panic!("the waiting read is answered with the fault: {other:?}"),
+        }
+    }
+
+    /// The answer a call's waiter holds right after `handle` returns: `None` when the waiter
+    /// was dropped unanswered, as a `Db` would then wait out its timeout.
+    fn answered_now(answer: &Receiver<Answer>) -> Option<Answer> {
+        match answer.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(mpsc::TryRecvError::Disconnected) => None,
+            Err(mpsc::TryRecvError::Empty) => panic!("the waiter is neither answered nor dropped"),
+        }
+    }
+
+    /// F-001 (S0 review): a put or compile whose step view cannot be built faults the node.
+    /// Its own caller hears that at once, as `set_fault` tells every pending call; dropped, it
+    /// would wait out the `Db`'s timeout and read as "no answer". Both arms that compile.
+    #[test]
+    fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
+        for (name, call) in [
+            ("put", put(1, b"a", b"1", None)),
+            (
+                "compile",
+                ClientCall::Compile {
+                    identity: identity(1),
+                    object: Bytes::from_static(b"a"),
+                    value: Bytes::from_static(b"1"),
+                    if_version: None,
+                    remaining_millis: 5_000,
+                },
+            ),
+        ] {
+            let dir = config_testkit::fs::temp_dir();
+            let mut trio = Trio::new(dir.path(), Trio::fast);
+            trio.bootstrap();
+            trio.ready();
+            let host = &mut trio.nodes[0].0;
+            host.fail_step_view = true;
+            let (reply, answer) = mpsc::channel();
+            host.handle(Msg::Client(Client {
+                partition: PartitionId(1),
+                call,
+                reply,
+            }));
+            let fault = host.fault.clone().expect("the node faulted");
+            assert!(fault.contains("injected"), "{name}: {fault}");
+            match answered_now(&answer) {
+                Some(Answer::Error {
+                    error,
+                    request: None,
+                }) => assert_eq!(
+                    (error.retry, error.detail),
+                    (RetryRule::NotWired, format!("host fault: {fault}")),
+                    "{name}"
+                ),
+                other => panic!("{name}: the caller is told the host faulted: {other:?}"),
+            }
+        }
+    }
+
+    /// F-001 (S0 review): a reply whose kind does not answer the waiting call faults the node,
+    /// and that call is told so at once. The same for P1's previous-view answer, to a call that
+    /// did not ask for one or under a handle storage never bound. The replies are forged: no
+    /// client call reaches these arms once one identity has one waiter (F-002).
+    #[test]
+    fn a_reply_the_waiting_call_cannot_take_answers_it_with_the_host_fault() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        let host = &mut trio.nodes[0].0;
+        let root = root_key(TenantId(1), AFFINITY, b"a");
+        let cases: [(&str, PendingKind); 3] = [
+            ("read reply to a status", PendingKind::Status),
+            ("previous view to a read", PendingKind::Read(root.clone())),
+            ("unbound previous view", PendingKind::Previous(root)),
+        ];
+        for (n, (name, kind)) in (1u64..).zip(cases) {
+            let (reply, answer) = mpsc::channel();
+            host.pending.insert(identity(n), Pending { reply, kind });
+            let fault = if n == 1 {
+                host.reply(
+                    PartitionId(1),
+                    &ReplyEffect::Read {
+                        identity: identity(n),
+                        outcome: ReadServiceOutcome::Served,
+                        value: None,
+                    },
+                )
+            } else {
+                host.previous_answer(identity(n), Ok(SnapshotHandle(7)))
+            }
+            .expect_err(name);
+            match answered_now(&answer) {
+                Some(Answer::Error {
+                    error,
+                    request: None,
+                }) => assert_eq!(
+                    (error.retry, error.detail),
+                    (RetryRule::NotWired, format!("host fault: {fault}")),
+                    "{name}"
+                ),
+                other => panic!("{name}: the caller is told the host faulted: {other:?}"),
+            }
         }
     }
 
