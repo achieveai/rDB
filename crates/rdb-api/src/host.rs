@@ -2416,7 +2416,19 @@ impl Host {
             },
             (ReplyEffect::Status { status, .. }, PendingKind::Status) => Answer::Status(*status),
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root)) => {
-                self.read_answer(partition, *outcome, *value, &root)?
+                match self.read_answer(partition, *outcome, *value, &root) {
+                    Ok(answer) => answer,
+                    Err(detail) => {
+                        // The node faults on this. Tell the waiting read so, now, as
+                        // `set_fault` tells every other waiting call: dropped, it would time
+                        // out as "no read answer".
+                        let _ = pending.reply.send(Answer::Error {
+                            error: ApiError::host(&detail),
+                            request: None,
+                        });
+                        return Err(detail);
+                    }
+                }
             }
             (reply, kind) => {
                 return Err(format!(
@@ -3706,7 +3718,18 @@ mod tests {
             )
             .expect_err("a forged digest faults the node");
         assert!(fault.contains("does not match the step view"), "{fault}");
-        assert!(answer.try_recv().is_err(), "nothing was answered");
+        // The waiting read is told the host faulted, at once, not left to time out as "no read
+        // answer in 1s" (lead ruling 3, 2026-10-07).
+        match answer.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: None,
+            }) => {
+                assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+                assert_eq!(error.detail, format!("host fault: {fault}"));
+            }
+            other => panic!("the waiting read is answered with the fault: {other:?}"),
+        }
     }
 
     /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
