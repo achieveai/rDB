@@ -458,3 +458,407 @@ const fn read_name(outcome: &ReadOutcome) -> &'static str {
         _ => "unavailable",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SITE: Site = Site {
+        node: NodeId(1),
+        partition: PartitionId(1),
+        correlation: CorrelationId(0),
+    };
+
+    fn response(outcome: MutationOutcome, exists: bool) -> MutationResponse {
+        MutationResponse {
+            outcome,
+            revision: 7,
+            exists,
+            current_mod_revision: if exists { 5 } else { 0 },
+            dedup_hit: false,
+            dedup_recorded: false,
+        }
+    }
+
+    /// ADR-rdb-0015, the one rule a retry loop leans on: a CAS whose outcome is unknown is
+    /// `Unknown`, a store that could not be reached is `Unavailable`, and a failed
+    /// precondition is `Conflict` with the revision to retry against. F1 blocks on the first,
+    /// and treating either of the others like it duplicates a write or drops a right.
+    #[test]
+    fn cas_answers_keep_unknown_unavailable_and_conflict_apart() {
+        let cases = [
+            (
+                Ok(response(MutationOutcome::Applied, true)),
+                CasOutcome::Committed(Revision(7)),
+            ),
+            (
+                Ok(response(MutationOutcome::Conflict, true)),
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(5),
+                },
+            ),
+            (
+                Ok(response(MutationOutcome::Conflict, false)),
+                CasOutcome::Conflict {
+                    exists: false,
+                    current: Revision(7),
+                },
+            ),
+            (
+                Ok(response(MutationOutcome::NotFound, false)),
+                CasOutcome::Conflict {
+                    exists: false,
+                    current: Revision(7),
+                },
+            ),
+            (
+                Err(ConfigError::Conflict {
+                    exists: true,
+                    current_mod_revision: 4,
+                }),
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(4),
+                },
+            ),
+            (
+                Err(ConfigError::NotFound),
+                CasOutcome::Conflict {
+                    exists: false,
+                    current: Revision(0),
+                },
+            ),
+            (
+                Err(ConfigError::DeadlineExceededUnknownOutcome),
+                CasOutcome::Unknown,
+            ),
+            (
+                Err(ConfigError::Unavailable {
+                    reason: "test".to_owned(),
+                }),
+                CasOutcome::Unavailable,
+            ),
+            (
+                Err(ConfigError::NotLeader { hint: None }),
+                CasOutcome::Unavailable,
+            ),
+        ];
+        for (answer, expected) in cases {
+            let shown = format!("{answer:?}");
+            assert_eq!(
+                cas_outcome(SITE, "partitions/1", answer),
+                expected,
+                "{shown}"
+            );
+        }
+    }
+
+    /// A watch that ends says why, so the kernel can tell a gap it must reload from a stream it
+    /// can resume. Each error reaches the node as one `WatchTerminated` from the cursor reached.
+    #[test]
+    fn a_watch_that_ends_names_why_to_its_node() {
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let cases = [
+            (
+                ConfigError::RevisionCompacted {
+                    minimum_available_revision: 9,
+                },
+                WatchTermination::RevisionCompacted {
+                    minimum_available_revision: Revision(9),
+                },
+            ),
+            (
+                ConfigError::ResourceExhausted {
+                    detail: String::new(),
+                    resumable: true,
+                },
+                WatchTermination::ResourceExhaustedResumable,
+            ),
+            (
+                ConfigError::ResourceExhausted {
+                    detail: String::new(),
+                    resumable: false,
+                },
+                WatchTermination::ResourceExhaustedFatal,
+            ),
+            (
+                ConfigError::NotLeader { hint: None },
+                WatchTermination::NotLeader,
+            ),
+            (
+                ConfigError::Unavailable {
+                    reason: "test".to_owned(),
+                },
+                WatchTermination::Unavailable,
+            ),
+        ];
+        for (error, expected) in cases {
+            terminate(&links, SITE, ControlPrefix::Partitions, Revision(3), &error);
+            match rx.try_recv() {
+                Ok(Msg::Control {
+                    event:
+                        ControlEvent::WatchTerminated {
+                            prefix,
+                            from,
+                            termination,
+                        },
+                    ..
+                }) => assert_eq!(
+                    (prefix, from, termination),
+                    (ControlPrefix::Partitions, Revision(3), expected),
+                    "{error:?}"
+                ),
+                other => panic!("{error:?}: {other:?}"),
+            }
+        }
+    }
+
+    /// A control call the store could not serve is never mistaken for an answer. A failed get
+    /// is `Unavailable`, not `Absent`, which would read as "no record". A failed reload faults
+    /// the node instead of handing it an empty family. A failed delete keeps its request, so
+    /// the module can match the answer. A delete that names no revision never reaches the store.
+    #[test]
+    fn a_control_call_the_store_cannot_serve_is_never_an_answer() {
+        let store = config_testkit::MemStore::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let key = ControlKey::Partition(PartitionId(1));
+        let get = || ControlEffect::Get {
+            request: ControlRequestId(1),
+            key,
+        };
+        let delete = |request, expected| ControlEffect::Cas {
+            request: ControlRequestId(request),
+            key,
+            expected,
+            value: None,
+        };
+
+        let absent = rt.block_on(call(&store, SITE, get()));
+        assert!(
+            matches!(
+                absent,
+                Ok(ControlEvent::Value {
+                    outcome: ReadOutcome::Absent { .. },
+                    ..
+                })
+            ),
+            "{absent:?}"
+        );
+        let unnamed = rt.block_on(call(&store, SITE, delete(2, None)));
+        assert_eq!(
+            unnamed.map_err(|(kind, _)| kind),
+            Err("control_delete_without_revision")
+        );
+
+        store.failing_with(ConfigError::Unavailable {
+            reason: "down".to_owned(),
+        });
+        assert_eq!(
+            rt.block_on(call(&store, SITE, get())),
+            Ok(ControlEvent::Value {
+                request: ControlRequestId(1),
+                key,
+                outcome: ReadOutcome::Unavailable,
+            })
+        );
+        let reload = rt.block_on(call(
+            &store,
+            SITE,
+            ControlEffect::Reload {
+                prefix: ControlPrefix::Partitions,
+            },
+        ));
+        assert_eq!(
+            reload.map_err(|(kind, _)| kind),
+            Err("control_reload_failed")
+        );
+        assert_eq!(
+            rt.block_on(call(&store, SITE, delete(3, Some(Revision(4))))),
+            Ok(ControlEvent::CasResult {
+                request: ControlRequestId(3),
+                key,
+                outcome: CasOutcome::Unavailable,
+            })
+        );
+    }
+
+    type Reply<'a, T> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, ConfigError>> + Send + 'a>>;
+
+    /// A store that serves one scripted watch stream per prefix and nothing else. `MemStore`
+    /// refuses every watch, so without this no lib test reaches the body of [`watch`].
+    /// Written out by hand because `async-trait` is not a dependency of this crate.
+    struct ScriptedWatch(Mutex<BTreeMap<String, Vec<Result<WatchItem, ConfigError>>>>);
+
+    fn unserved<'a, T: Send + 'a>() -> Reply<'a, T> {
+        Box::pin(std::future::ready(Err(ConfigError::Unavailable {
+            reason: "the scripted store serves watches only".to_owned(),
+        })))
+    }
+
+    impl ConfigStore for ScriptedWatch {
+        fn get<'a, 'b>(&'a self, _: GetRequest) -> Reply<'b, config_core::GetResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            unserved()
+        }
+
+        fn list<'a, 'b>(&'a self, _: ListRequest) -> Reply<'b, config_core::ListResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            unserved()
+        }
+
+        fn put<'a, 'b>(&'a self, _: PutRequest) -> Reply<'b, MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            unserved()
+        }
+
+        fn delete<'a, 'b>(&'a self, _: DeleteRequest) -> Reply<'b, MutationResponse>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            unserved()
+        }
+
+        fn capabilities(&self) -> config_core::Capabilities {
+            config_core::Capabilities::EPHEMERAL_DEVELOPMENT
+        }
+
+        fn watch<'a, 'b>(&'a self, request: WatchRequest) -> Reply<'b, config_core::WatchStream>
+        where
+            'a: 'b,
+            Self: 'b,
+        {
+            let prefix = String::from_utf8_lossy(&request.prefix).into_owned();
+            let items = lock(&self.0).remove(&prefix).unwrap_or_default();
+            let stream: config_core::WatchStream = Box::pin(futures::stream::iter(items));
+            Box::pin(std::future::ready(Ok(stream)))
+        }
+    }
+
+    /// A resume point is only right if it is the furthest revision the node was told about:
+    /// earlier replays a change, later skips one. Each change reaches the node with its
+    /// revision, a progress mark moves the cursor without a change, and both a stream error and
+    /// a plain end of stream terminate from the furthest revision seen. A key that no family
+    /// owns faults the node instead of landing in the wrong cache.
+    #[test]
+    fn a_watch_stream_ends_from_the_furthest_revision_it_delivered() {
+        let event = |revision, key: &str| {
+            Ok(WatchItem::Event(config_core::MutationEvent {
+                revision,
+                key: Bytes::from(key.to_owned()),
+                kind: config_core::MutationEventKind::Delete,
+            }))
+        };
+        let script = BTreeMap::from([
+            (
+                ControlPrefix::Partitions.encode().to_owned(),
+                vec![
+                    event(4, "partitions/1"),
+                    Ok(WatchItem::Progress { revision: 6 }),
+                    Err(ConfigError::Unavailable {
+                        reason: "lost".to_owned(),
+                    }),
+                ],
+            ),
+            (
+                ControlPrefix::Nodes.encode().to_owned(),
+                vec![event(5, "nodes/2")],
+            ),
+            (
+                ControlPrefix::Grants.encode().to_owned(),
+                vec![event(7, "grants/x"), event(8, "grants/1")],
+            ),
+        ]);
+        let store: Arc<dyn ConfigStore> = Arc::new(ScriptedWatch(Mutex::new(script)));
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let run = |prefix, from| {
+            rt.block_on(watch(
+                Arc::clone(&store),
+                Arc::clone(&links),
+                SITE,
+                prefix,
+                Revision(from),
+            ));
+            rx.try_iter()
+                .map(|msg| match msg {
+                    Msg::Control { event, .. } => Ok(event),
+                    Msg::Fault { kind, .. } => Err(kind),
+                    _ => Err("not a control message"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let unavailable = WatchTermination::Unavailable;
+
+        assert_eq!(
+            run(ControlPrefix::Partitions, 2),
+            [
+                Ok(ControlEvent::Watched {
+                    prefix: ControlPrefix::Partitions,
+                    cursor: WatchCursor {
+                        revision: Revision(4)
+                    },
+                    changes: vec![ControlChange {
+                        key: ControlKey::Partition(PartitionId(1)),
+                        revision: Revision(4),
+                    }],
+                }),
+                Ok(ControlEvent::WatchProgress {
+                    prefix: ControlPrefix::Partitions,
+                    revision: Revision(6),
+                }),
+                Ok(ControlEvent::WatchTerminated {
+                    prefix: ControlPrefix::Partitions,
+                    from: Revision(6),
+                    termination: unavailable,
+                }),
+            ],
+            "a stream error ends from the progress mark"
+        );
+        assert_eq!(
+            run(ControlPrefix::Nodes, 3),
+            [
+                Ok(ControlEvent::Watched {
+                    prefix: ControlPrefix::Nodes,
+                    cursor: WatchCursor {
+                        revision: Revision(5)
+                    },
+                    changes: vec![ControlChange {
+                        key: ControlKey::Node(NodeId(2)),
+                        revision: Revision(5),
+                    }],
+                }),
+                Ok(ControlEvent::WatchTerminated {
+                    prefix: ControlPrefix::Nodes,
+                    from: Revision(5),
+                    termination: unavailable,
+                }),
+            ],
+            "a stream that just ends ends from its last change"
+        );
+        assert_eq!(
+            run(ControlPrefix::Grants, 0),
+            [Err("control_key_undecodable")],
+            "an unknown key faults the node and nothing after it is delivered"
+        );
+    }
+}

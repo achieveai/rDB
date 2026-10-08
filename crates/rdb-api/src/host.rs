@@ -3298,6 +3298,106 @@ mod tests {
         assert!(!stalled.contains("unproven="), "{stalled}");
     }
 
+    /// A node that faults answers every waiting caller instead of leaving it hanging, and a
+    /// waiting put keeps its request so the caller can resend it elsewhere. Every call after
+    /// that is refused at once. The fault here is the control adapter's own (`Msg::Fault`), the
+    /// one input that faults a healthy node without a kernel or storage defect.
+    #[test]
+    fn a_faulted_node_answers_its_waiting_put_with_the_request_and_refuses_new_calls() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let waiting = trio.call(put(1, b"a", b"1", None));
+        let (host, _, mailbox) = &mut trio.nodes[0];
+        // The mailbox is shared with peer and control traffic, so the put need not be first.
+        while !host.pending.contains_key(&identity(1)) {
+            match mailbox.try_recv() {
+                Ok(msg) => host.handle(msg),
+                Err(_) => break,
+            }
+        }
+        assert!(
+            host.pending.contains_key(&identity(1)),
+            "the put waits: {:?}",
+            waiting.try_recv()
+        );
+
+        host.handle(Msg::Fault {
+            kind: "control_fault_test",
+            detail: "injected".to_owned(),
+        });
+        assert!(host.fault.is_some(), "the node is faulted");
+        match waiting.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: Some(request),
+            }) => {
+                assert_eq!(error.kind, ErrorKind::Unavailable, "{error:?}");
+                assert!(error.detail.contains("injected"), "{error:?}");
+                assert_eq!(request.identity, identity(1));
+            }
+            other => panic!("the waiting put: {other:?}"),
+        }
+
+        let (reply, refused) = mpsc::channel();
+        host.handle(Msg::Client(Client {
+            partition: PartitionId(1),
+            call: get(2, b"a"),
+            reply,
+        }));
+        match refused.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: None,
+            }) => assert!(error.detail.contains("injected"), "{error:?}"),
+            other => panic!("a call after the fault: {other:?}"),
+        }
+        assert!(host.pending.is_empty(), "nothing is left waiting");
+    }
+
+    /// M9 serves only an empty copy, so a copy that holds anything must answer
+    /// `InventoryFailed`, never an invented empty inventory: F1 would select a prefix that
+    /// drops what the copy holds. Two ways to hold something: an anchor past the root, and a
+    /// lineage in the engine. Before bootstrap node 2 is empty and reports the root.
+    #[test]
+    fn a_copy_that_holds_anything_never_reports_an_empty_inventory() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        let root = LineageAnchor {
+            lineage: Lineage {
+                partition: PartitionId(1),
+                generation: Generation(1),
+                owner_epoch: OwnerEpoch(1),
+            },
+            base_seq: Seq::ZERO,
+            base_digest: Digest::ROOT,
+        };
+        let past_root = LineageAnchor {
+            base_seq: Seq(1),
+            ..root
+        };
+        let report =
+            |trio: &Trio, anchor| trio.nodes[1].0.inventory(PartitionId(1), CopyId(1), anchor);
+
+        assert!(
+            matches!(report(&trio, root), RecoveryEvent::InventoryReported(_)),
+            "an empty copy reports the root"
+        );
+        assert_eq!(
+            report(&trio, past_root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "an anchor past the root"
+        );
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(
+            report(&trio, root),
+            RecoveryEvent::InventoryFailed { copy: CopyId(1) },
+            "a copy holding generation 1"
+        );
+    }
+
     /// D5's guard: a healthy start logs no `replication_copy_not_advancing`. L1 holds its resume
     /// for longer than `stuck_resends` retransmits, and R1 re-sends seq 1 through that hold (OB1)
     /// to copies that acknowledged it. A copy level with the primary's head is not stuck, however
@@ -3434,6 +3534,38 @@ mod tests {
         }
         let warned = not_advancing!(METHOD);
         assert!(warned.is_empty(), "an advancing copy warned: {warned:?}");
+    }
+
+    /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
+    /// logged, never dropped in silence, and the primary neither faults nor stops taking
+    /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:
+    /// no M9 kernel module consumes it yet.
+    #[config_log::retcd_test]
+    fn a_send_to_a_stopped_peer_is_logged_and_writes_go_on() {
+        const METHOD: &str = "a_send_to_a_stopped_peer_is_logged_and_writes_go_on";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        // Node 3 stops: its mailbox is gone, so a send to it fails instead of being buffered.
+        drop(std::mem::replace(&mut trio.nodes[2].2, mpsc::channel().1));
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1 with node 3 stopped: {other:?}"),
+        }
+        assert!(
+            trio.nodes[0].0.fault.is_none(),
+            "{:?}",
+            trio.nodes[0].0.fault
+        );
+
+        let failed = logged!(METHOD, "send_failed");
+        assert!(
+            failed
+                .iter()
+                .any(|line| line["node"] == 1 && line["to"] == 3),
+            "node 1's send to node 3 is reported: {failed:?}"
+        );
     }
 
     /// The stuck-cursor warning (lead, after D4). Link 1-3 is held once the partition is

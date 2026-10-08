@@ -187,3 +187,33 @@ pub async fn bootstrap(
     );
     Ok(revision)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Step 1 is create-only: a second bootstrap over the same control store is refused with
+    /// the record's revision and sends node 1 nothing, so it can never start a second
+    /// generation-0 recovery over a partition that already has a history.
+    #[test]
+    fn a_second_bootstrap_over_the_same_store_is_refused_and_sends_nothing() {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let sent = std::sync::Mutex::new(0u32);
+        let send = |_: Msg| -> Result<(), NodeStopped> {
+            *sent.lock().expect("count") += 1;
+            Ok(())
+        };
+        let first = rt
+            .block_on(bootstrap(&store, Tick(0), send))
+            .expect("first bootstrap");
+        assert_eq!(*sent.lock().expect("count"), 2, "Plan and FenceProven");
+        match rt.block_on(bootstrap(&store, Tick(0), send)) {
+            Err(BootstrapError::AlreadyExists { current }) => assert_eq!(current, first.0),
+            other => panic!("a second bootstrap: {other:?}"),
+        }
+        assert_eq!(*sent.lock().expect("count"), 2, "the refusal sent nothing");
+    }
+}

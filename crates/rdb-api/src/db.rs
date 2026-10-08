@@ -654,7 +654,52 @@ mod tests {
         assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
         let read = db.get(b"a").expect("get a");
         assert_eq!(read.value, Some((3, Bytes::from_static(b"2"))));
+        // UNKNOWN_OUTCOME's retry rule is QueryStatus: the status query names the same seq.
+        match db.status(RequestId(2), None).expect("status of request 2") {
+            TxnStatus::Resolved(result) => {
+                assert_eq!((result.seq, result.outcome), (Seq(3), Outcome::Published));
+            }
+            other => panic!("status of request 2: {other:?}"),
+        }
+        // The previous view never waits and never runs ahead of the current one.
+        let previous = db.get_previous(b"a").expect("get_previous a");
+        assert!(
+            !previous.waited
+                && previous.at <= read.at
+                && previous
+                    .value
+                    .as_ref()
+                    .is_some_and(|(version, _)| *version <= 3),
+            "{previous:?} against {read:?}"
+        );
+        // An object never written reads as absent from both views, not as an error.
+        assert_eq!(db.get(b"absent").expect("get absent").value, None);
+        let absent = db.get_previous(b"absent").expect("get_previous absent");
+        assert_eq!(absent.value, None);
         db.shutdown();
+    }
+
+    /// M9 opens only an empty directory: node data already there is refused before any node
+    /// starts, so a second open never bootstraps over a first one's history.
+    #[test]
+    fn open_refuses_a_directory_that_already_holds_node_data() {
+        let dir = config_testkit::fs::temp_dir();
+        std::fs::create_dir_all(dir.path().join("nodes").join("1")).expect("node dir");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+        };
+        match rt.block_on(Db::open(config, store, rt.handle().clone())) {
+            Err(OpenError::NotEmpty(path)) => assert_eq!(path, dir.path().join("nodes")),
+            Err(other) => panic!("open over node data: {other}"),
+            Ok(_) => panic!("open over node data succeeded"),
+        }
     }
 
     #[test]
