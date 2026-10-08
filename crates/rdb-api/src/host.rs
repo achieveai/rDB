@@ -703,8 +703,10 @@ struct Host {
     deferred_syncs: BTreeMap<(PartitionId, Generation), (NodeId, CorrelationId, PeerAsk)>,
     acquire_scheduled: BTreeSet<PartitionId>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
-    /// The stall line, per partition, once reported; cleared when the partition activates.
-    stalled: BTreeMap<PartitionId, String>,
+    /// The stall line, per partition, once reported, up to its effect, with the mode it names;
+    /// cleared when the partition activates. [`Self::status`] adds the effect as it reads the
+    /// line, so the line says what is true then, not when it was written (F-012).
+    stalled: BTreeMap<PartitionId, (String, PartitionMode)>,
     /// [`REBUILD_PIN_WAIT_MILLIS`]; crate tests set it directly.
     rebuild_pin_wait_millis: u64,
     resends: BTreeMap<(PartitionId, CopyId), Resends>,
@@ -1666,11 +1668,11 @@ impl Host {
             .get(&partition)
             .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
         let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
-        let effect = self.stall_effect(partition, &watch.mode);
+        let mode = watch.mode.clone();
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
              waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
-             rebuild, so the partition {effect}",
+             rebuild, so the partition",
             partition.0, generation.0, watch.mode, watch.cutoff.0,
         );
         tracing::error!(
@@ -1685,7 +1687,7 @@ impl Host {
             host_catch_up = "unsupported",
             "recovery_rebuild_stalled"
         );
-        self.stalled.insert(partition, line);
+        self.stalled.insert(partition, (line, mode));
     }
 
     /// F1's deadline passed with `copy` still short of the pinned point. The first time F1 names
@@ -1727,7 +1729,6 @@ impl Host {
             else {
                 continue;
             };
-            let effect = self.stall_effect(partition, &mode);
             let Some(watch) = self.rebuilds.get_mut(&partition) else {
                 continue;
             };
@@ -1737,7 +1738,7 @@ impl Host {
             let line = format!(
                 "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} \
                  required={required:?} unproven={unproven:?} phase={phase}: F1 pinned its \
-                 rebuild, but these copies have not proved it, so the partition {effect}",
+                 rebuild, but these copies have not proved it, so the partition",
                 partition.0, watch.generation.0, watch.mode, watch.cutoff.0,
             );
             tracing::error!(
@@ -1751,7 +1752,7 @@ impl Host {
                 phase = %phase,
                 "recovery_rebuild_stalled"
             );
-            self.stalled.insert(partition, line);
+            self.stalled.insert(partition, (line, mode));
         }
     }
 
@@ -1763,9 +1764,9 @@ impl Host {
             .map(|state| state.allow)
     }
 
-    /// What a stalled rebuild leaves the partition as, said only while it is true. PC17: in
-    /// `DegradedRf2` an unheard copy blocks L1's resume (B-R38), so writes pause, and the line
-    /// says so only while L1 does pause them.
+    /// What a stalled rebuild leaves the partition as, now. PC17: in `DegradedRf2` an unheard
+    /// copy blocks L1's resume (B-R38), so writes pause, and the line says so only while L1 does
+    /// pause them. [`Self::status`] calls it each time it reads the line (F-012).
     fn stall_effect(&self, partition: PartitionId, mode: &PartitionMode) -> String {
         match mode {
             PartitionMode::DegradedRf2 if self.admits(partition) == Some(false) => {
@@ -2851,7 +2852,10 @@ impl Host {
                 .publication
                 .view(self.node, partition)
                 .map(|view| (view.published.generation, view.published.seq)),
-            stalled: self.stalled.get(&partition).cloned(),
+            stalled: self
+                .stalled
+                .get(&partition)
+                .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
         }
     }
 }
@@ -3683,8 +3687,8 @@ mod tests {
         host.stalled.remove(&PartitionId(1));
         host.rebuild_check(PartitionId(1), generation);
         let never = host
+            .status(PartitionId(1))
             .stalled
-            .get(&PartitionId(1))
             .expect("the never-pinned line");
         assert!(
             never.ends_with(
@@ -3792,11 +3796,80 @@ mod tests {
         watch.unproven.insert(CopyId(2));
         watch.unreported = true;
         host.report_unproven();
-        let line = host.stalled.get(&partition).expect("the pinned stall line");
+        let line = host
+            .status(partition)
+            .stalled
+            .expect("the pinned stall line");
         assert!(
             line.ends_with("so the partition stays DegradedRf2 and does not activate"),
             "{line}"
         );
+    }
+
+    /// F-012 (S0 review): the stall line says writes stay paused only while L1 pauses them. L1
+    /// is mode-blind, so nothing orders its resume after F1's activation, which is what clears
+    /// the line. On a real `DegradedRf2` heal F1 activated first in 6 of 6 runs here, even with
+    /// a zero resume hold, so this row orders them by hand instead. L1 pauses for real: both
+    /// links are held, and a put stays unacknowledged past the pause age. Then a stall line is
+    /// written for a `DegradedRf2` watch set by hand, as the K1 row above does, and it says
+    /// writes stay paused. After the heal L1 resumes, and that watch never activates. Once L1
+    /// admits writes, the line must stop saying they are paused.
+    /// Integration (~1 s): three hosts stepped by hand, through a real L1 pause and resume.
+    #[test]
+    fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast_pause);
+        trio.bootstrap();
+        trio.ready();
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let unacknowledged = trio.call(put(1, b"a", b"1", None));
+        trio.until("L1 pauses writes", |trio| {
+            (trio.status(0).admits == Some(false)).then_some(())
+        });
+
+        let partition = PartitionId(1);
+        let host = &mut trio.nodes[0].0;
+        let generation = Generation(9);
+        host.rebuilds.insert(
+            partition,
+            RebuildWatch {
+                generation,
+                mode: PartitionMode::DegradedRf2,
+                cutoff: Seq(1),
+                required: vec![CopyId(0), CopyId(1), CopyId(2)],
+                since: host.clock.now(),
+                pinned: true,
+                unproven: BTreeSet::from([CopyId(2)]),
+                unreported: true,
+            },
+        );
+        host.report_unproven();
+        let paused = trio.status(0).stalled.expect("the stall line");
+        assert!(paused.contains("writes stay paused"), "{paused}");
+
+        trio.links.heal_all();
+        trio.ready();
+        let status = trio.status(0);
+        assert_eq!(
+            trio.nodes[0]
+                .0
+                .rebuilds
+                .get(&partition)
+                .map(|w| w.generation),
+            Some(generation),
+            "the watch is still there: nothing activated it"
+        );
+        let line = status.stalled.expect("the stall line still stands");
+        assert!(
+            !line.contains("writes stay paused"),
+            "L1 admits writes while the stall line says: {line}"
+        );
+        assert!(
+            line.ends_with("so the partition stays DegradedRf2 and does not activate"),
+            "{line}"
+        );
+        drop(unacknowledged);
     }
 
     /// A node that faults answers every waiting caller instead of leaving it hanging, and a
