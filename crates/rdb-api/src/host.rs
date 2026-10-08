@@ -3216,7 +3216,9 @@ mod tests {
             }
         };
 
-        let patience = test_patience(Duration::from_secs(5));
+        // The line lands at F1's first deadline after the commit, two 2 s windows (4.0 s at
+        // scale 1): `Trio::PATIENCE`'s margin.
+        let patience = test_patience(Duration::from_secs(8));
         let deadline = Instant::now() + patience;
         let stalled = loop {
             step(&mut host);
@@ -3621,7 +3623,8 @@ mod tests {
     ///
     /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
     /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
-    /// Integration (~1.6 s): it must watch twice L1's pause age to show L1 never paused.
+    /// Integration (~5 s at scale 1): the stall line waits two 2 s windows, then the row watches
+    /// twice L1's pause age to show L1 never paused.
     #[test]
     fn a_start_cut_off_from_both_secondaries_heals_into_a_writable_partition() {
         let dir = config_testkit::fs::temp_dir();
@@ -4684,9 +4687,10 @@ mod tests {
     }
 
     impl Trio {
-        /// Every row gives up after this long, times the deadline scale; a healthy one takes well
-        /// under a second.
-        const PATIENCE: Duration = Duration::from_secs(5);
+        /// Every `until` gives up after this long, times the deadline scale. The longest wait is a
+        /// stall line at F1's first deadline after a commit, two of the spec's 2 s windows: 4.0 s
+        /// at scale 1 (2026-10-08), so this leaves 4 s.
+        const PATIENCE: Duration = Duration::from_secs(8);
         /// [`Self::fast_pause`]'s L1 pause age: the spec's 2,000 ms, shortened.
         const PAUSE_AGE_MILLIS: u64 = 400;
 
