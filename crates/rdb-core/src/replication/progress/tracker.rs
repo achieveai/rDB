@@ -51,8 +51,9 @@ pub struct CopyProgress {
     /// Its watermarks as its last admitted ACK stated them. Zero until it proves otherwise.
     pub progress: ReplicaProgress,
     /// The position a `Recovered` barrier's `DurableAt` proof established for this incarnation
-    /// of the copy: the cutoff on all three watermarks when the barrier requires the copy, zero
-    /// otherwise (lead rulings B-R67e and B-R67f). Each `Recovered` restates it, replacing the
+    /// of the copy: the selected cutoff on all three watermarks when the barrier requires the
+    /// copy, never the barrier's own cutoff when that is higher (M9 S0 ruling 2026-10-07, item 4),
+    /// zero otherwise (lead rulings B-R67e and B-R67f). Each `Recovered` restates it, replacing the
     /// last, and a restarted copy starts again at zero.
     ///
     /// Read **only** by the repeat judgment ([`ProgressTracker::known`]). No watermark, view,
@@ -453,21 +454,26 @@ impl ProgressTracker {
     /// ACK at that position would, and one they admit advances its copy and emits
     /// `PeerProgress`. Anything else answers `Recorded` and changes nothing: a repeat never
     /// escalates, and one the ladder cannot verify, below a recovery cutoff, stays unverified
-    /// (lead ruling B-R58c).
+    /// (lead ruling B-R58c). Like [`Self::ack_ladder`], it also names the copy when all nine
+    /// rules admitted the ACK, and `None` otherwise: routing hands a cursor only an ACK named
+    /// here (lead ruling B-R48, M9 S0 ruling 2026-10-07).
     pub fn on_repeat_at_mark(
         &mut self,
         from: &PeerLabel,
         ack: &AppendAck,
         tick: Tick,
-    ) -> Vec<EffectKind> {
+    ) -> (Option<CopyId>, Vec<EffectKind>) {
         let at = Seq(ack.progress.buffered_applied.0);
         match self.admit(from, ack) {
             Ok(copy) if self.history.lookup(at, ack.digest_at_buffered) == DigestLookup::Match => {
-                self.advance(copy, ack.progress, tick)
+                (Some(copy), self.advance(copy, ack.progress, tick))
             }
-            _ => vec![ignored(KernelIgnoredReason::Replica(
-                ReplicaIgnoreReason::Recorded,
-            ))],
+            _ => (
+                None,
+                vec![ignored(KernelIgnoredReason::Replica(
+                    ReplicaIgnoreReason::Recorded,
+                ))],
+            ),
         }
     }
 
@@ -682,7 +688,8 @@ impl ProgressTracker {
 
     /// `Recovered` on a copy that already leads (design §3.4, K-B-02): rebuild from its own
     /// ladder and watermarks under the new root. Every other copy starts at zero and re-proves
-    /// its prefix; `diverged` clears here and only here.
+    /// its prefix; `diverged` clears here and only here, and only in a new generation (M9 S0
+    /// ruling 2026-10-07, item 3).
     ///
     /// A pin for this partition that names this node anything but the primary retires the
     /// tracker (lead ruling on the kept primary, B-R58a): routing treats it as absent until a
@@ -732,19 +739,33 @@ impl ProgressTracker {
     }
 
     /// The tracker an accepted `result` installs: this copy's own ladder and watermarks cut at
-    /// the cutoff, every other copy at zero, one predicate, nothing diverged. Each other copy the
-    /// barrier requires gets its proved floor at the cutoff, which only the repeat judgment reads
+    /// the cutoff, every other copy at zero, one predicate, nothing diverged in a new generation.
+    /// A re-emit of the generation already served keeps each diverged copy it still names: its
+    /// quarantine is sticky there (M9 S0 ruling 2026-10-07, item 3). Each other copy the
+    /// barrier requires gets its proved floor at the selected cutoff, even when the barrier
+    /// proves it higher (M9 S0 ruling 2026-10-07, item 4); only the repeat judgment reads it
     /// (lead ruling B-R67f).
+    ///
+    /// M9 S0 D3: a re-emit in the generation already served cuts at this copy's own head when
+    /// that is above the cutoff, so R1's head and T1's next sequence still agree. Everything
+    /// above the cutoff was written in this generation, and [`Self::refuses`] has already
+    /// matched the cutoff in this copy's history. A retired tracker, or any other generation,
+    /// cuts at the cutoff.
     fn rebuilt(&self, result: &RecoveryResult) -> Self {
         let config = &result.committed.pinned_config;
         let cutoff = result.selected.cutoff_seq;
+        let head = if !self.retired && result.new_generation == self.lineage.generation {
+            cutoff.max(self.head())
+        } else {
+            cutoff
+        };
         let mut history = self.history.clone();
-        history.truncate_above(cutoff);
+        history.truncate_above(head);
         let durable = self.own_progress().progress.durable;
         let local = ReplicaProgress {
-            received: ReceivedSeq(cutoff.0),
-            buffered_applied: AppliedSeq(cutoff.0),
-            durable: DurableSeq(durable.0.min(cutoff.0)),
+            received: ReceivedSeq(head.0),
+            buffered_applied: AppliedSeq(head.0),
+            durable: DurableSeq(durable.0.min(head.0)),
         };
         let lineage = Lineage {
             partition: config.partition,
@@ -762,13 +783,23 @@ impl ProgressTracker {
             Some(self.base_seq)
         };
         rebuilt.adopt_view(&result.committed.authority_view);
-        let barrier = &result.barrier;
+        if !self.retired && result.new_generation == self.lineage.generation {
+            rebuilt.diverged = self
+                .diverged
+                .iter()
+                .copied()
+                .filter(|copy| rebuilt.peers.contains_key(copy))
+                .collect();
+        }
+        // M9 S0 ruling 2026-10-07, item 4: the floor is the selected cutoff, never the barrier's.
+        // F1 can prove a copy above it (the start record: cutoff 0, barrier 1), and everything
+        // above the cutoff is this generation's, which a copy may still truncate.
         let floor = ReplicaProgress {
-            received: ReceivedSeq(barrier.cutoff().0),
-            buffered_applied: AppliedSeq(barrier.cutoff().0),
-            durable: DurableSeq(barrier.cutoff().0),
+            received: ReceivedSeq(cutoff.0),
+            buffered_applied: AppliedSeq(cutoff.0),
+            durable: DurableSeq(cutoff.0),
         };
-        for copy in barrier.required() {
+        for copy in result.barrier.required() {
             if let Some(peer) = rebuilt.peers.get_mut(copy).filter(|_| *copy != self.own) {
                 peer.proved = floor;
             }

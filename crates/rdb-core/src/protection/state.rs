@@ -576,6 +576,11 @@ impl State {
         nodes
     }
 
+    /// The node the pinned configuration seats `copy` on, if it seats it.
+    pub(super) fn node_of(&self, copy: CopyId) -> Option<NodeId> {
+        self.config.member(copy).map(|member| member.node)
+    }
+
     /// What L1 publishes (design §4.5).
     pub(super) fn admission_state(&self, now: Tick) -> AdmissionState {
         let (allow, reason) = self.verdict();

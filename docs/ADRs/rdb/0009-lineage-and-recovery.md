@@ -274,6 +274,24 @@ protection is not a consumer of the mode at all — it resumes on qualification,
 and its hold, and may legitimately do so before the activation commits; the mode contract is the
 other modules' guard, not its.
 
+**Amended 2026-10-07 (lead ruling "S0 D3", M9).** "Idempotent on the rows that did not change" was
+not true of three arms. The tracker and every receiver rebuilt at the cutoff, and the publication
+module reset its published position to it. A partition that served `DegradedRf2` past the cutoff
+then lost that tail when the activation re-emit arrived: its published position went backwards,
+reads were refused `Unavailable` and writes stayed `PROTECTION_PAUSED`. A re-emit in the generation
+already held now changes only the mode:
+
+- the tracker truncates only above the head it holds, unless it is retired;
+- a receiver keeps its head under the conditions in ADR-0005 §4's amendment of the same date;
+- the publication module, on the lineage it already serves, keeps its published position, its
+  pending candidate and the replies it owes. Its view still moves, at the unchanged position, and
+  it drains waiting readers only when the mode actually changes.
+- a quarantined receiver truncates but stays quarantined, and the tracker keeps a diverged copy
+  diverged: quarantine clears only on a new-generation `Recovered` (M9 S0 ruling 2026-10-07,
+  item 3; ADR-0005 §4).
+
+The transaction and lag modules are unchanged. Rows: `m9_d3_00` (sim) and `m9_d3_01`..`m9_d3_08`.
+
 `RecoveryBarrier` still cannot be built from a sequence number — only from `DurableProof` values,
 which only the storage seam mints (ADR-0005 §4). Spec §8.1's "buffered complete entries from a live
 survivor may be retained, but must be fsynced before the recovery barrier is committed" is the type;
@@ -447,6 +465,7 @@ consumer does not handle.
 | One CAS, one key | The effect vector from `Proposing` contains exactly one `ControlCas`, targeting `partitions/{id}` |
 | A lost CAS response does not promote | `Unavailable` and `Unknown` each leave the node `Blocked` under their own reason; neither proceeds as owner, and both require a fresh fencing proof to retry |
 | A successful rebuild leaves read-only mode | After the activation CAS commits, the recovery module re-emits its result with `mode: Active`; the transaction and publication modules leave `Frozen { RecoveryReadOnly }` on it. Without that emission a rebuilt partition stays read-only forever — **V3** |
+| The activation re-emit moves no position | A partition recovered `DegradedRf2` at cutoff 0 that wrote seq 1 keeps it when the `Active` re-emit arrives: published goes 1, 2, 3, a `Fresh` read answers after the re-emit, and lag protection reaches `Healthy` (`m9_d3_00`, amended 2026-10-07) |
 | Recovery catch-up is fence-gated | A `RecoveryAppend` with a superseded fence is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append would be |
 | A credential names its sender | A second regular member replaying a captured credential is rejected `NOT_A_MEMBER` |
 | Holder ≠ leader transfers land | The selected holder cannot lead: `CatchUpBeforeGrant` from the holder, credential `sender == holder`, every record accepted at the elected leader; the two-survivor case with the fenced node shorter likewise — **V3** |
@@ -457,7 +476,7 @@ consumer does not handle.
 | All three lone-survivor choices | Old primary, secondary 1, secondary 2 each as sole survivor: read-only mode, correct declared cutoff, `uncertain` set when a higher prefix was advertised — **V3** |
 | Three-copy rebuild barrier | `ACTIVE` only after `RecoveryBarrier::try_new` succeeds over three `DurableProof`s at the **same** cutoff digest; three proofs at three different histories are rejected — **V3** |
 | Degraded RF2 leaves degraded only on a barrier | The third copy catching up is not enough: `Rebuilding` stays until its proof passes `try_new`, then one CAS flips the record to `ACTIVE` — **V3** |
-| Quarantine is not cleared by the data path | A quarantined copy stays quarantined across a matching append, a restart and a catch-up; only `Recovered` clears it |
+| Quarantine is not cleared by the data path | A quarantined copy stays quarantined across a matching append, a restart and a catch-up; only `Recovered` clears it, and only one in a new generation: a same-generation re-emit truncates but keeps it quarantined (`m9_d3_04`, `m9_f2_a`, amended 2026-10-07) |
 | Returning stale owner never overrides | Post-commit, a longer-suffix owner is quarantined; its head seq is never compared |
 | Quarantined suffix retained | `QuarantineSuffix` emitted (named `RetainQuarantinedSuffix` before the §9 amendment, B-R68); no deletion effect exists in the module |
 

@@ -5251,3 +5251,148 @@ fn m7b_201_a_source_sends_nothing_for_a_repeat_ack_and_never_doubles_its_walk() 
     );
     assert!(module.source(B, P, CopyId(2)).is_none());
 }
+
+// --- M9 S0 D3: F1's re-emit of the generation already served -------------------------------
+
+/// B after the takeover at `(10, d10)` into `NEW_GEN`, then records 11 and 12 from C, the new
+/// primary, sealed in `NEW_GEN` and chained on each other, applied and ACKed: a copy that has
+/// applied past the cutoff in this generation.
+fn applied_past_the_cutoff() -> Replication {
+    let mut module = recovered_at_ten();
+    let mut prev = d(10);
+    for mut env in chain(12).into_iter().skip(10) {
+        env.prev_digest = prev;
+        let env = taken_over(env);
+        prev = env.record_digest;
+        applied_from_c(&mut module, &env);
+    }
+    assert_eq!(rx(&module).applied_head().seq, Seq(12));
+    module
+}
+
+/// The one unsolicited `NeedPrefix` a re-anchoring `Recovered` sends C, from `have`.
+fn asks_from(effects: &[EffectKind], have: Head) {
+    assert_eq!(effects.len(), 1, "{effects:?}");
+    assert_eq!(
+        reply_at(&effects[0], C, UNSOLICITED, NEW_CONFIG),
+        rejected(AppendReject::NeedPrefix {
+            have: have.seq,
+            head_digest: have.digest,
+        })
+    );
+}
+
+/// M9 S0 D3 (lead ruling "S0 D3" rule 2). F1 re-emits the takeover it already committed, same
+/// generation and cutoff, once its rebuild finishes. B holds the cutoff and has applied 11 and 12
+/// from this generation's primary since: it keeps them and asks C for what follows 12. Before
+/// the fix it truncated to 10, though 11 and 12 were this generation's records.
+#[retcd_test]
+fn m9_d3_03_receiver_a_re_emit_of_its_generation_keeps_the_head_it_applied() {
+    let mut module = applied_past_the_cutoff();
+    let held = rx(&module).applied_head();
+    let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
+    asks_from(&effects, held);
+    let rx_ = rx(&module);
+    assert_eq!(
+        (
+            rx_.applied_head(),
+            rx_.received_seq(),
+            rx_.history().highest(),
+            rx_.history().digest_at(Seq(10)),
+        ),
+        (held, ReceivedSeq(12), Some(Seq(12)), Some(d(10)))
+    );
+    assert_eq!(
+        (rx_.lineage().generation, rx_.quarantine(), rx_.retired()),
+        (NEW_GEN, None, false)
+    );
+}
+
+/// M9 S0 D3, rule 2's quarantine guard. B applied 11 and 12 under `GEN`, then the takeover into
+/// `NEW_GEN` named a different record at 11, so B is quarantined with head 12. F1's re-emit in
+/// that generation at `(10, d10)` still truncates to 10: 11 and 12 are the divergence, and
+/// keeping them would unflag it (`s0-probe.md` E6 mutant).
+///
+/// Amended by M9 S0 ruling 2026-10-07, item 3: quarantine is sticky across that re-emit. B stays
+/// quarantined, asks C for nothing and answers `AlreadyDiverged`; it rejoins only through a
+/// `Recovered` in a new generation. Before the amendment it cleared quarantine and asked from 10,
+/// and the primary, whose rebuild had cleared `diverged` too, caught it up (sim row `m9_f2_01`).
+#[retcd_test]
+fn m9_d3_04_receiver_a_quarantined_copy_still_truncates_on_a_re_emit_of_its_generation() {
+    let mut module = applied_to(12);
+    assert_eq!(
+        step(&mut module, &recovered(11, d(9), takeover_config())),
+        [quarantine_alert()]
+    );
+    let quarantined = rx(&module);
+    assert_eq!(
+        (quarantined.lineage().generation, quarantined.applied_head()),
+        (NEW_GEN, head(12))
+    );
+    assert!(quarantined.quarantine().is_some());
+    let kept = quarantined.quarantine();
+    let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
+    assert_eq!(
+        effects,
+        vec![ignored(KernelIgnoredReason::Replica(
+            ReplicaIgnoreReason::AlreadyDiverged
+        ))]
+    );
+    let rx_ = rx(&module);
+    assert_eq!(
+        (
+            rx_.applied_head(),
+            rx_.quarantine(),
+            rx_.history().highest()
+        ),
+        (head(10), kept, Some(Seq(10)))
+    );
+}
+
+/// M9 S0 D3, rule 2's lookup guard. A re-emit of B's own generation whose cutoff digest is not
+/// the one B holds still quarantines and moves no head, as any `Differs` does (K-B-44).
+#[retcd_test]
+fn m9_d3_05_receiver_a_re_emit_whose_cutoff_differs_still_quarantines() {
+    let mut module = applied_past_the_cutoff();
+    let before = rx(&module).applied_head();
+    assert_eq!(
+        step(&mut module, &recovered(10, d(9), takeover_config())),
+        [quarantine_alert()]
+    );
+    let rx_ = rx(&module);
+    assert_eq!(rx_.applied_head(), before);
+    assert!(rx_.quarantine().is_some());
+}
+
+/// M9 S0 D3, rule 2's retired guard. The takeover first pins B primary, so B's receiver retires
+/// into `NEW_GEN` while A's record 11, staged under `GEN`, still commits. A re-emit in `NEW_GEN`
+/// that pins B a secondary again truncates to the cutoff: 11 is the old primary's record, not
+/// this generation's, so it is not kept.
+#[retcd_test]
+fn m9_d3_06_receiver_a_retired_copy_still_truncates_on_a_re_emit_of_its_generation() {
+    use ReplicaRole::{Primary, RegularSecondary, Shadow};
+    let b_leads = pinned([RegularSecondary, Primary, RegularSecondary, Shadow]);
+    let mut module = module();
+    send(&mut module, label(A), &golden());
+    step(
+        &mut module,
+        &requiring(recovered(10, d(10), b_leads), &[1], B),
+    );
+    step(&mut module, &committed(0, 11));
+    let retired = rx(&module);
+    assert!(retired.retired());
+    assert_eq!(
+        (retired.lineage().generation, retired.applied_head()),
+        (NEW_GEN, head(11))
+    );
+    // B's primary, which the first pin built, is refused by the second; its receiver re-anchors.
+    let effects = step(&mut module, &recovered(10, d(10), takeover_config()));
+    assert_eq!(effects.len(), 2, "{effects:?}");
+    asks_new_primary(&effects[..1], 10);
+    assert_eq!(effects[1], replica(ReplicaIgnoreReason::InvalidConfig));
+    let rx_ = rx(&module);
+    assert_eq!(
+        (rx_.applied_head(), rx_.retired(), rx_.history().highest()),
+        (head(10), false, Some(Seq(10)))
+    );
+}

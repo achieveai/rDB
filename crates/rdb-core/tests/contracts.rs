@@ -916,3 +916,33 @@ fn kernel_event_stays_within_its_size_budget() {
     assert!(event <= 112, "KernelEvent grew to {event} bytes");
     assert!(effect <= 128, "KernelEffect grew to {effect} bytes");
 }
+
+/// M9 S0 ruling 2026-10-07, item 5, condition 1: `ProtectionState.lost_copy_set` is additive. A
+/// line written before the field existed decodes with an empty set, an empty set is written
+/// exactly as before (no key), and a non-empty set round-trips.
+#[retcd_test]
+fn m9_f2_c_protection_state_lost_copy_set_is_additive() {
+    use rdb_core::contracts::trace::TraceKind;
+    let old = r#"{"ProtectionState":{"phase":"Healthy","oldest_unsafe_age_ms":0,"required_copy_set":[1,2,3],"config_version":1,"paused_prefix_seq":0,"resume_barrier_seq":0,"healthy_since_tick":null}}"#;
+    let decoded: TraceKind = serde_json::from_str(old).expect("a pre-field line decodes");
+    let TraceKind::ProtectionState { lost_copy_set, .. } = &decoded else {
+        panic!("decoded {decoded:?}");
+    };
+    assert!(lost_copy_set.is_empty());
+    assert_eq!(
+        serde_json::to_string(&decoded).expect("encodes"),
+        old,
+        "an empty set writes the old line"
+    );
+
+    let mut lost = decoded;
+    if let TraceKind::ProtectionState { lost_copy_set, .. } = &mut lost {
+        *lost_copy_set = vec![NodeId(3)];
+    }
+    let line = serde_json::to_string(&lost).expect("encodes");
+    assert!(line.contains(r#""lost_copy_set":[3]"#), "{line}");
+    assert_eq!(
+        serde_json::from_str::<TraceKind>(&line).expect("decodes"),
+        lost
+    );
+}

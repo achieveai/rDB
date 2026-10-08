@@ -7149,3 +7149,129 @@ fn m7b_226_a_shipped_record_is_forgotten_when_a_cursor_takes_the_copy_or_the_cop
         );
     }
 }
+
+// --- M9 S0 D3: F1's re-emit of the generation already served ------------------------------
+
+/// The primary rebuilt into `NEW_GEN` at `HEAD + 1`, then one local write: head `HEAD + 2`.
+/// Returns it and the recovery it was rebuilt from.
+fn written_past_the_cutoff() -> (ProgressTracker, RecoveryResult) {
+    let mut tracker = tracker();
+    local_applied(&mut tracker, HEAD + 1);
+    let result = recovery(HEAD + 1, d(HEAD + 1), pin_without_b());
+    tracker.on_recovered(&result, T);
+    local_applied(&mut tracker, HEAD + 2);
+    assert_eq!(
+        (tracker.lineage().generation, tracker.head()),
+        (NEW_GEN, Seq(HEAD + 2))
+    );
+    (tracker, result)
+}
+
+/// M9 S0 D3 (lead ruling "S0 D3" rule 3). F1 re-emits the result this primary was rebuilt from,
+/// once its rebuild finishes. The primary wrote `HEAD + 2` in this generation since: the rebuild
+/// keeps it, so R1's head still agrees with T1's next sequence and the keepalive has a record to
+/// send. The base stays at the cutoff; the anchor is the seed head, as for every rebuild
+/// (B-R47a), so a copy re-proves through `HEAD + 2` to qualify. Before the fix the head fell back
+/// to the cutoff and the primary sent nothing again (`s0-probe.md` D3).
+#[retcd_test]
+fn m9_d3_07_tracker_a_re_emit_of_its_generation_keeps_its_own_head() {
+    let (mut tracker, result) = written_past_the_cutoff();
+    tracker.on_recovered(&result, T);
+    assert_eq!(tracker.head(), Seq(HEAD + 2));
+    assert_eq!(tracker.history().highest(), Some(Seq(HEAD + 2)));
+    assert_eq!(
+        tracker.peer(COPY_A).expect("A").progress,
+        progress(HEAD + 2, HEAD + 2, HEAD)
+    );
+    assert_eq!(
+        (tracker.base_seq(), tracker.anchor(), tracker.retired()),
+        (Seq(HEAD + 1), Seq(HEAD + 2), false)
+    );
+}
+
+/// M9 S0 D3, rule 3's retired guard. A pin in the same generation that names this node a
+/// secondary retires the primary; a re-emit that pins it primary again rebuilds it at the
+/// cutoff, as before the fix, and unretires it.
+#[retcd_test]
+fn m9_d3_08_tracker_a_retired_primary_is_rebuilt_at_the_cutoff_on_a_re_emit() {
+    let (mut tracker, result) = written_past_the_cutoff();
+    let elsewhere = config_with(
+        NEW_CONFIG,
+        vec![
+            member(COPY_A, A, RegularSecondary),
+            member(COPY_C, C, Primary),
+            member(COPY_D, D, RegularSecondary),
+        ],
+    );
+    let mut moved = result.clone();
+    moved.committed.pinned_config = elsewhere;
+    tracker.on_recovered(&moved, T);
+    assert!(tracker.retired());
+    tracker.on_recovered(&result, T);
+    assert_eq!((tracker.head(), tracker.retired()), (Seq(HEAD + 1), false));
+}
+
+/// M9 S0 F2 (ruling 2026-10-07, item 3, amending D3 rule 2): quarantine is sticky across a
+/// re-emit of the generation already served, on the primary as on the copy. C was proved
+/// diverged after the rebuild; F1's re-emit of that rebuild keeps C diverged, so C neither
+/// qualifies nor gets a cursor until a new generation. Before the amendment the rebuild cleared
+/// `diverged`, and C was caught up again (sim row
+/// `m9_f2_01`). Near-miss: a `Recovered` in a newer generation still clears it, as M7B-45 says.
+#[retcd_test]
+fn m9_f2_a_tracker_a_re_emit_of_its_generation_keeps_a_diverged_copy_diverged() {
+    let (mut tracker, result) = written_past_the_cutoff();
+    tracker.on_divergence(COPY_C, T);
+    assert_eq!(tracker.diverged(), &[COPY_C]);
+    tracker.on_recovered(&result, T);
+    assert_eq!(
+        (tracker.head(), tracker.diverged()),
+        (Seq(HEAD + 2), &[COPY_C][..]),
+        "the re-emit keeps C diverged"
+    );
+
+    let mut next = result;
+    next.new_generation = Generation(NEW_GEN.0 + 1);
+    tracker.on_recovered(&next, T);
+    assert_eq!(
+        (tracker.lineage().generation, tracker.diverged()),
+        (Generation(NEW_GEN.0 + 1), &[][..]),
+        "a new generation clears it"
+    );
+}
+
+/// M9 S0 F1 (ruling 2026-10-07, item 4). F1's rebuild can prove a copy durable above the
+/// selected cutoff: at the start record the selected cutoff is 0 and the barrier's is 1, so
+/// P > C. The rebuild sets each required copy's proved floor at the selected cutoff, never above
+/// it, because everything above it is this generation's and the copy may still truncate there.
+/// Here C is proved at `HEAD + 2` over a re-emit cut at `HEAD + 1`: the repeat judgment knows C
+/// holds `HEAD + 1`, not `HEAD + 2`, and C's watermarks stay at zero. Before the fix the floor
+/// was the barrier's cutoff; the critic's note on commit 1 is that a stale ACK at that floor
+/// could then be judged a repeat at the mark and drive a cursor with no mark. Near-miss: a copy
+/// the barrier does not name keeps no floor at all.
+#[retcd_test]
+fn m9_f1_a_tracker_the_proved_floor_never_rises_above_the_selected_cutoff() {
+    let (mut tracker, mut result) = written_past_the_cutoff();
+    let above = Seq(HEAD + 2);
+    let proof = DurableProof {
+        copy: COPY_C,
+        partition: P,
+        seq: DurableSeq(above.0),
+        digest: d(above.0),
+    };
+    result.barrier =
+        RecoveryBarrier::try_new(&[proof], &[COPY_C].into_iter().collect(), above, d(above.0))
+            .expect("C proved above the selected cutoff");
+    assert_eq!(
+        (result.selected.cutoff_seq, result.barrier.cutoff()),
+        (Seq(HEAD + 1), above)
+    );
+    tracker.on_recovered(&result, T);
+    assert_eq!(tracker.head(), above, "the re-emit keeps the head");
+    assert_eq!(
+        tracker.known(COPY_C),
+        Some(progress(HEAD + 1, HEAD + 1, HEAD + 1)),
+        "the floor is the selected cutoff"
+    );
+    assert_eq!(tracker.peer(COPY_C).expect("C").progress, progress(0, 0, 0));
+    assert_eq!(tracker.known(COPY_D), Some(progress(0, 0, 0)));
+}

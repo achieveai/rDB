@@ -64,13 +64,24 @@ impl AppendReceiver {
         Some(vec![self.ack_or_withhold(primary, UNSOLICITED)])
     }
 
-    /// `Recovered` (design §3.3): the only event that rewrites a receiver wholesale and the
-    /// only one that clears quarantine.
+    /// `Recovered` (design §3.3): the only event that rewrites a receiver wholesale, and one in a
+    /// new generation is the only thing that clears quarantine.
     ///
     /// The root anchor is **looked up, not adopted** (K-B-44). `Differs` at the cutoff
     /// quarantines and moves no head. Otherwise the copy re-anchors on the highest rung it holds
     /// at or below the cutoff — the cutoff pair itself on `Match`, its own older head when it is
     /// behind — and asks the new primary for everything after it.
+    ///
+    /// One exception keeps a head (M9 S0 D3): F1's re-emit of the generation this copy already
+    /// serves, when the copy holds the cutoff (`Match`) and has applied past it, and is neither
+    /// quarantined nor retired. Then the copy keeps its applied head, because everything above
+    /// the cutoff came from this generation's primary, and asks for what follows it. A
+    /// quarantined copy still truncates to the cutoff, since its suffix is the divergence.
+    ///
+    /// Quarantine is sticky across that re-emit (M9 S0 ruling 2026-10-07, item 3, amending D3
+    /// rule 2): the quarantined copy truncates but stays quarantined, asks for nothing, and
+    /// answers `AlreadyDiverged`. The primary keeps it diverged too, so it rejoins only through
+    /// a `Recovered` in a new generation.
     ///
     /// A pin for another partition, or one naming no primary, is refused and changes nothing.
     /// A pin that names this copy no serving member on this node — the r04 swap makes it the
@@ -98,10 +109,19 @@ impl AppendReceiver {
             return invalid();
         };
         let selected = &result.selected;
-        let anchor = match self
+        let lookup = self
             .history
-            .lookup(selected.cutoff_seq, selected.cutoff_digest)
-        {
+            .lookup(selected.cutoff_seq, selected.cutoff_digest);
+        let keeps_head = lookup == DigestLookup::Match
+            && !self.retired
+            && self.quarantine.is_none()
+            && self.lineage.generation == result.new_generation
+            && self.applied_head.seq > selected.cutoff_seq;
+        let stays_quarantined = self.quarantine.is_some()
+            && !self.retired
+            && self.lineage.generation == result.new_generation;
+        let anchor = match lookup {
+            _ if keeps_head => Some(self.applied_head),
             DigestLookup::Differs { .. } => None,
             DigestLookup::Match | DigestLookup::NotRetained => {
                 let Some((seq, digest)) = self.history.at_or_below(selected.cutoff_seq) else {
@@ -139,6 +159,11 @@ impl AppendReceiver {
         self.history.truncate_above(anchor.seq);
         self.received = ReceivedSeq(anchor.seq.0);
         self.durable = DurableSeq(self.durable.0.min(anchor.seq.0));
+        if stays_quarantined {
+            return vec![ignored(KernelIgnoredReason::Replica(
+                ReplicaIgnoreReason::AlreadyDiverged,
+            ))];
+        }
         self.quarantine = None;
         let outcome = AppendOutcome::Rejected(self.need_prefix());
         vec![self.send(primary, UNSOLICITED, outcome)]

@@ -63,7 +63,9 @@
 //! report, and the keepalive's ACK is one by design. It runs the tracker's rules 1–9 as a first
 //! ACK there would, and a verified one emits `PeerProgress` (B-R60); one the ladder cannot
 //! verify answers `Recorded`, as a repeat below the cutoff did before
-//! ([`ProgressTracker::on_repeat_at_mark`]). A repeat strictly below the mark answers
+//! ([`ProgressTracker::on_repeat_at_mark`]). A verified one judged against the tracker, for a
+//! cursor that has taken no ACK, also reaches that cursor: the cursor was made by a late
+//! `NeedPrefix` and has a record in flight that this ACK answers. A repeat strictly below the mark answers
 //! `Recorded` and changes nothing: a late duplicate must not tell L1 a position older than the
 //! one it already has.
 //!
@@ -216,8 +218,21 @@ impl Primary {
         match wire::decode_reply(body) {
             Ok(AppendOutcome::Accepted(ack)) => {
                 match self.repeat(from, &ack) {
+                    // A cursor that has taken no ACK was judged against what the tracker knows,
+                    // so a repeat of that still answers the record it sent: one the ladder
+                    // admits reaches it, or the record stays unacked and is re-sent for ever
+                    // (M9 S0 ruling 2026-10-07, a late copy of a need after catch-up).
                     Some((_, Repeat::AtMark)) => {
-                        return self.tracker.on_repeat_at_mark(from, &ack, tick)
+                        let (admitted, mut effects) =
+                            self.tracker.on_repeat_at_mark(from, &ack, tick);
+                        if let Some(copy) = admitted.filter(|copy| {
+                            self.cursors
+                                .get(copy)
+                                .is_some_and(|cursor| cursor.mark().is_none())
+                        }) {
+                            effects.extend(self.drive(copy, AppendOutcome::Accepted(ack)));
+                        }
+                        return effects;
                     }
                     Some((_, Repeat::BelowMark)) => {
                         return vec![ignored(KernelIgnoredReason::Replica(

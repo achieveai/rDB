@@ -177,6 +177,14 @@ impl Protection {
             .unwrap_or_default()
     }
 
+    /// The node L1's pinned configuration seats `copy` on: the map `required_copy_set` reads.
+    /// `None` while inert, or for a copy that configuration does not seat. A copy lost under an
+    /// older configuration stays lost after a pin that drops it, so it can be `None` here.
+    #[must_use]
+    pub fn node_of(&self, copy: CopyId) -> Option<NodeId> {
+        self.state.as_ref().and_then(|s| s.node_of(copy))
+    }
+
     /// How many records are applied but not yet durable on every active predicate.
     #[must_use]
     pub fn unsafe_len(&self) -> usize {

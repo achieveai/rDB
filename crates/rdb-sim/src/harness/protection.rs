@@ -36,6 +36,7 @@ use rdb_core::contracts::event::{
     Effect, Event, EventKind, KernelEvent, Module, ModuleName, StepCtx,
 };
 use rdb_core::contracts::ids::{ConfigVersion, NodeId, PartitionId, Seq};
+use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{CapabilityState, ProtectionPhase, TraceKind};
 use rdb_core::protection::{Mode, Protection};
@@ -125,6 +126,10 @@ impl ProtectionTable {
     ///   barrier from the last `Paused` line, so a stale one would judge a resume against the
     ///   wrong barrier.
     ///
+    /// The lost copies are not a trigger (M9 S0 ruling 2026-10-07, item 5): INV-LAG clause (a)
+    /// reads them from the `Healthy` line it judges, and that line is a phase change, so it always
+    /// carries the set in force at resume.
+    ///
     /// The unsafe age is not a trigger: it moves with the clock, and the line reports it as of
     /// the line's own tick.
     ///
@@ -163,6 +168,7 @@ impl ProtectionTable {
             phase: key.phase,
             oldest_unsafe_age_ms: state.oldest_unsafe_age,
             required_copy_set: hosted.protection.required_copy_set(),
+            lost_copy_set: lost_nodes(&hosted.protection, &state.lost_copies, node, partition),
             config_version,
             paused_prefix_seq: state.paused_prefix,
             resume_barrier_seq: state.resume_barrier,
@@ -207,6 +213,36 @@ impl Module for ProtectionTable {
         self.hosted.insert(key, hosted);
         answer
     }
+}
+
+/// L1's lost copies by node, through L1's own pinned configuration, sorted.
+///
+/// A lost copy that configuration does not seat is left out and warned, never mapped through
+/// another configuration: L1 keeps a copy lost across a pin that drops it, and such a copy is
+/// not in `required_copy_set` either, so INV-LAG clause (a) has nothing to subtract it from.
+fn lost_nodes(
+    protection: &Protection,
+    lost: &[CopyId],
+    node: NodeId,
+    partition: PartitionId,
+) -> Vec<NodeId> {
+    let mut nodes: Vec<NodeId> = lost
+        .iter()
+        .filter_map(|&copy| {
+            let seated = protection.node_of(copy);
+            if seated.is_none() {
+                tracing::warn!(
+                    node = node.0,
+                    partition = partition.0,
+                    copy = copy.0,
+                    "protection line: a lost copy the pinned configuration does not seat; left out"
+                );
+            }
+            seated
+        })
+        .collect();
+    nodes.sort_unstable();
+    nodes
 }
 
 /// Whether `kind` is a progress event for H1's cadence: an L1 kernel input other than
