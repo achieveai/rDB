@@ -25,3 +25,8 @@ tracing = { workspace = true }
 config-testkit = { workspace = true }
 config-log = { workspace = true }
 config-log-macros = { workspace = true }
+
+[[example]]
+name = "rdb_dev"
+# Run the example's poller tests under `cargo test -p rdb-api` (the stall-cleared line).
+test = true

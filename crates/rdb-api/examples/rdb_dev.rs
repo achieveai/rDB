@@ -42,7 +42,9 @@
 //! - when F1 never pinned it, after `REBUILD_PIN_WAIT_MILLIS` times
 //!   `RETCD_TEST_DEADLINE_SCALE`, with `waited_ms=` and "F1 never pinned its rebuild".
 //!
-//! The line clears when the partition activates.
+//! The line clears when the partition activates, or when a newer recovery starts watching its
+//! own rebuild, and the poller then prints `stall cleared node=N recovery=.. recovered=..
+//! admits=..`.
 //!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
 
@@ -254,6 +256,8 @@ struct Seen {
     ready: bool,
     waiting: Option<String>,
     faults: Vec<String>,
+    /// Each node's stall line as last printed, until it clears.
+    stalled: std::collections::BTreeMap<u32, String>,
 }
 
 impl Progress {
@@ -281,13 +285,12 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                     seen.faults.push(line);
                 }
             }
-            // Not a node fault (the node keeps serving), but printed the same way: once.
-            if let Some(stalled) = &node.stalled {
-                let line = format!("stalled node={} {stalled}", node.node.0);
-                if !seen.faults.contains(&line) {
-                    say(&line);
-                    seen.faults.push(line);
-                }
+            if let Some(line) = stall_change(seen.stalled.get(&node.node.0), node) {
+                say(&line);
+                match &node.stalled {
+                    Some(stalled) => seen.stalled.insert(node.node.0, stalled.clone()),
+                    None => seen.stalled.remove(&node.node.0),
+                };
             }
         }
         if let Some(owner) = nodes.iter().find(|n| n.node == NodeId(1)) {
@@ -317,6 +320,26 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
         }
         drop(seen);
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The line to print when a node's stall line changes, given the one printed last. Not a node
+/// fault (the node keeps serving), so it is not kept with them: a stall that clears says so,
+/// or the last stall line would still read as writes paused after the partition healed.
+fn stall_change(printed: Option<&String>, node: &NodeStatus) -> Option<String> {
+    match (printed, &node.stalled) {
+        (Some(was), Some(now)) if was == now => None,
+        (_, Some(now)) => Some(format!("stalled node={} {now}", node.node.0)),
+        (Some(_), None) => Some(format!(
+            "stall cleared node={} recovery={} recovered={} admits={}",
+            node.node.0,
+            node.recovery.as_deref().unwrap_or("-"),
+            node.recovered
+                .map_or_else(|| "-".to_owned(), |g| g.0.to_string()),
+            node.admits
+                .map_or_else(|| "-".to_owned(), |a| a.to_string()),
+        )),
+        (None, None) => None,
     }
 }
 
@@ -730,5 +753,58 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
+        NodeStatus {
+            node: NodeId(1),
+            fault: None,
+            holds: None,
+            authority: "valid".to_owned(),
+            recovery: Some("Committed".to_owned()),
+            recovered: Some(Generation(1)),
+            role: "primary",
+            protection: None,
+            admits: Some(admits),
+            published: None,
+            stalled: stalled.map(str::to_owned),
+        }
+    }
+
+    /// Paper cut after the tester's walk at 1ea889e: a stall that clears said nothing, so the
+    /// last line on screen still read as writes paused after a heal. Each change prints once,
+    /// and a stall that returns after clearing prints again.
+    #[test]
+    fn a_stall_that_clears_prints_a_cleared_line_and_a_new_stall_prints_again() {
+        let stall =
+            "recovery_rebuild_stalled ... its writes stay paused until the absent copy returns";
+        let mut printed: Option<String> = None;
+        let mut lines = Vec::new();
+        for node in [
+            owner(None, false),
+            owner(Some(stall), false),
+            owner(Some(stall), false),
+            owner(None, true),
+            owner(None, true),
+            owner(Some(stall), false),
+        ] {
+            if let Some(line) = stall_change(printed.as_ref(), &node) {
+                lines.push(line);
+            }
+            printed = node.stalled.clone();
+        }
+        assert_eq!(
+            lines,
+            [
+                format!("stalled node=1 {stall}"),
+                "stall cleared node=1 recovery=Committed recovered=1 admits=true".to_owned(),
+                format!("stalled node=1 {stall}"),
+            ]
+        );
     }
 }
