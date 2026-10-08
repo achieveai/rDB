@@ -432,6 +432,42 @@ async fn published_id(build: BackgroundBuild) -> String {
     }
 }
 
+/// Wait until openraft's core has taken in that the build which published `snapshot_id` is
+/// finished.
+///
+/// The store publishes a snapshot before the core hears that its build is done, and until the
+/// core does, it drops any new trigger without a word: `trigger_snapshot` then waits out its
+/// `write_timeout` and no build ever starts. A row that triggers a second build right after a
+/// first one must wait here first.
+///
+/// openraft does not export that state through `NodeMetrics`, so this waits for the core's own
+/// `finish_building_snapshot` event in this test's log. The core logs it inside the call that
+/// clears its in-progress flag, and handles a trigger sent afterwards only after that call
+/// returns. The layer writes each line unbuffered, so a substring scan of the raw file is
+/// enough, and a half-written last line cannot break it.
+async fn wait_for_openraft_to_finish(cluster: &Cluster, snapshot_id: &str, method: &str) {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    let needle = format!("\"snapshot_meta\":\"{{snapshot_id: {snapshot_id},");
+    cluster
+        .wait_for(
+            "openraft's finish_building_snapshot event for the published snapshot",
+            cluster.deadline(10),
+            || {
+                std::fs::read_to_string(&path)
+                    .ok()?
+                    .lines()
+                    .any(|l| l.contains("finish_building_snapshot") && l.contains(&needle))
+                    .then_some(())
+            },
+        )
+        .await
+        .unwrap_or_else(|t| panic!("{} ({}): {t}", needle, path.display()));
+}
+
 // -------------------------------------------------------------------------------------------
 // M5-01 — the exported body is the view captured before the build, not live state
 // -------------------------------------------------------------------------------------------
@@ -632,6 +668,12 @@ async fn m5_14_old_snapshot_retained_until_publication() {
             .await
             .unwrap_or_else(|e| panic!("put {i}: {e}"));
     }
+    wait_for_openraft_to_finish(
+        &cluster,
+        &a,
+        "m5_14_old_snapshot_retained_until_publication",
+    )
+    .await;
 
     let pause = scripts[&leader].pause_on_nth(Boundary::BeforeCurrentSnapshotMeta, 1);
     let build_b = trigger_in_background(&cluster, leader);
@@ -687,13 +729,12 @@ async fn paused_build_outlasting_the_trigger_wait_still_yields_its_id() {
     let leader = cluster.leader().await;
 
     let a = published_id(trigger_in_background(&cluster, leader)).await;
-    // The store publishes A before openraft's core hears that A's build finished, and until
-    // it does it drops any new trigger without a word. A restart starts a fresh core, so B's
-    // trigger cannot land in that window.
-    cluster
-        .restart(leader)
-        .await
-        .unwrap_or_else(|e| panic!("restart {leader}: {e}"));
+    wait_for_openraft_to_finish(
+        &cluster,
+        &a,
+        "paused_build_outlasting_the_trigger_wait_still_yields_its_id",
+    )
+    .await;
 
     let pause = scripts[&leader].pause_on_nth(Boundary::BeforeSnapshotTmpSync, 1);
     let build = trigger_in_background(&cluster, leader);
