@@ -23,4 +23,7 @@ pub mod db;
 pub mod host;
 pub mod transport;
 
+#[cfg(test)]
+mod test_store;
+
 pub use db::{ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, Timeouts};

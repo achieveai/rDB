@@ -170,7 +170,8 @@ impl Default for Timeouts {
 /// Where and how to open a [`Db`].
 #[derive(Debug, Clone)]
 pub struct DbConfig {
-    /// The data directory. Each node's RocksDB goes under `<dir>/nodes/<n>`. Must not hold one.
+    /// The data directory. Each node's RocksDB goes under `<dir>/nodes/<n>`. Must not hold a
+    /// `nodes/` yet, even an empty one: an open claims it by creating it.
     pub dir: PathBuf,
     /// Peer links to hold from the start, as `(a, b)` node pairs.
     pub hold: Vec<(NodeId, NodeId)>,
@@ -228,8 +229,9 @@ impl std::fmt::Display for PutError {
 /// Why [`Db::open`] failed.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
-    /// The data directory already holds node data.
-    #[error("{0} already holds node data; M9 opens only an empty directory")]
+    /// `nodes/` already exists: it holds node data, or another open has claimed it. Nothing was
+    /// started and nothing was removed.
+    #[error("{0} already exists: it holds node data or another open has claimed it; M9 opens only a directory without one")]
     NotEmpty(PathBuf),
     /// A node did not start.
     #[error("node start: {0}")]
@@ -250,6 +252,10 @@ pub struct Db {
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// The `nodes/` this open claimed, while the open is unfinished. Dropping the `Db` then
+    /// removes it after the nodes have stopped, whether the open failed or was cancelled
+    /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
+    unwind: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Db {
@@ -266,8 +272,20 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// [`OpenError`]. When a node fails to start or the bootstrap is refused, every node started
-    /// has stopped and `nodes/` is removed before it returns, so the same open can run again.
+    /// [`OpenError`]. [`OpenError::NotEmpty`] when `config.dir` already has a `nodes/`: this
+    /// open claims the directory by creating it, so of two opens racing on one directory one
+    /// is refused, starts nothing, and removes nothing. Once claimed, when a node fails to
+    /// start, the bootstrap fails, or the returned future is dropped unfinished, every node
+    /// started has stopped and `nodes/` is removed, so the same open can run again.
+    ///
+    /// The bootstrap refuses a `partitions/1` that has a history
+    /// ([`admin::BootstrapError::AlreadyExists`]). An untouched record this bootstrap would
+    /// write is adopted instead, so an open whose create committed but whose reply was lost
+    /// can be run again against the same store. A store error is
+    /// [`admin::BootstrapError::Control`]; the next open adopts the record if it was written.
+    ///
+    /// S0 supports one `Db` per control store. Every `Db` runs nodes 1-3 with [`host::BOOT`], so
+    /// a second `Db` on the same store opens but never becomes ready.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
@@ -302,19 +320,27 @@ impl Db {
             HostClock,
         ) -> Result<NodeHandle, String>,
     ) -> Result<Self, OpenError> {
+        // F-001: creating `nodes/` is the claim, and it is atomic, so of two opens racing on one
+        // directory exactly one gets it. The other is refused before it starts a node, and
+        // removes nothing.
+        std::fs::create_dir_all(&config.dir)?;
         let nodes_dir = config.dir.join("nodes");
-        if nodes_dir.exists() && std::fs::read_dir(&nodes_dir)?.next().is_some() {
-            return Err(OpenError::NotEmpty(nodes_dir));
+        if let Err(error) = std::fs::create_dir(&nodes_dir) {
+            return Err(match error.kind() {
+                std::io::ErrorKind::AlreadyExists => OpenError::NotEmpty(nodes_dir),
+                _ => OpenError::Io(error),
+            });
         }
-        std::fs::create_dir_all(&nodes_dir)?;
         let clock = HostClock::start();
         let links = Links::new();
         let control = ControlAdapter::new(Arc::clone(&store), rt, Arc::clone(&links));
         for (a, b) in &config.hold {
             links.hold(*a, *b);
         }
-        // Built before any node starts, so a failure below drops it: its `Drop` stops and joins
-        // the nodes started so far and shuts the control adapter down (F-004).
+        // Built before any node starts and armed with the claim, so an open that fails below, or
+        // is dropped while it waits, drops it: its `Drop` stops and joins the nodes started so
+        // far, shuts the control adapter down, then removes `nodes/` (F-004, F-005, F-003). So
+        // the same open can run again.
         let mut db = Self {
             nodes: Vec::with_capacity(3),
             links,
@@ -322,23 +348,11 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            unwind: Some(nodes_dir.clone()),
         };
-        match db.start(&nodes_dir, &store, spawn).await {
-            Ok(()) => Ok(db),
-            Err(error) => {
-                drop(db);
-                // F-005: the failed open leaves no node data, so the same open can run again.
-                if let Err(remove) = std::fs::remove_dir_all(&nodes_dir) {
-                    tracing::error!(
-                        dir = %nodes_dir.display(),
-                        error = %remove,
-                        open_error = %error,
-                        "open_unwind_remove_failed"
-                    );
-                }
-                Err(error)
-            }
-        }
+        db.start(&nodes_dir, &store, spawn).await?;
+        db.unwind = None;
+        Ok(db)
     }
 
     /// Start the three nodes under `nodes_dir`, then bootstrap partition 1 through node 1.
@@ -670,6 +684,18 @@ impl Db {
 impl Drop for Db {
     fn drop(&mut self) {
         self.shutdown();
+        // An unfinished open: the nodes have stopped and joined, so on Windows their RocksDB
+        // `LOCK` files are released and the claim can go.
+        if let Some(dir) = self.unwind.take() {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => tracing::info!(dir = %dir.display(), "open_unwound"),
+                Err(error) => tracing::error!(
+                    dir = %dir.display(),
+                    error = %error,
+                    "open_unwind_remove_failed"
+                ),
+            }
+        }
     }
 }
 
@@ -727,6 +753,51 @@ fn millis(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_store::{Script, Scripted};
+
+    /// Wait until node 1 admits writes, failing at once if any node is stuck in discovery.
+    fn admits(db: &Db, phase: &str) {
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+            for node in db.node_status() {
+                let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
+                crate::host::assert_not_blocked(&node, window);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{phase}: node 1 does not admit writes within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The spec's budgets with L1's waits cut short, so a fresh partition admits writes within
+    /// [`admits`]'s patience (the spec holds a resume for 5 s).
+    fn fast() -> Budgets {
+        Budgets {
+            resume_hold_millis: 50,
+            warn_age_millis: 200,
+            pause_age_millis: 400,
+            ..Budgets::SPEC_DEFAULTS
+        }
+    }
+
+    fn config(dir: &std::path::Path) -> DbConfig {
+        DbConfig {
+            dir: dir.to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
 
     /// The tester's row (a): the public `Db` path for a write whose outcome is unknown, and
     /// mutant W3. With both secondaries cut off nothing can acknowledge the put, and P1 answers
@@ -757,23 +828,8 @@ mod tests {
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
             .expect("open");
-        let admits = |db: &Db| {
-            let patience = crate::host::test_patience(Duration::from_secs(5));
-            let deadline = std::time::Instant::now() + patience;
-            while db.node_status().first().and_then(|node| node.admits) != Some(true) {
-                for node in db.node_status() {
-                    let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
-                    crate::host::assert_not_blocked(&node, window);
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "node 1 does not admit writes within {patience:?}"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
 
-        admits(&db);
+        admits(&db, "before the first put");
         assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
 
         db.links().hold(NodeId(1), NodeId(2));
@@ -790,7 +846,7 @@ mod tests {
             .expect("the answer carries the request to resend");
 
         db.links().heal_all();
-        admits(&db);
+        admits(&db, "after the heal");
         let resent = db.resend(*request).expect("resend after the heal");
         assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
         let read = db.get(b"a").expect("get a");
@@ -853,21 +909,6 @@ mod tests {
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
             .expect("open");
-        let admits = |db: &Db, phase: &str| {
-            let patience = crate::host::test_patience(Duration::from_secs(5));
-            let deadline = std::time::Instant::now() + patience;
-            while db.node_status().first().and_then(|node| node.admits) != Some(true) {
-                for node in db.node_status() {
-                    let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
-                    crate::host::assert_not_blocked(&node, window);
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "{phase}: node 1 does not admit writes within {patience:?}"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
 
         admits(&db, "before the first put");
         assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
@@ -923,6 +964,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            unwind: None,
         };
 
         let refused = db
@@ -1070,6 +1112,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            unwind: None,
         };
 
         let started = std::time::Instant::now();
@@ -1111,6 +1154,7 @@ mod tests {
             clock: HostClock::start(),
             timeouts: Timeouts::default(),
             next_request: AtomicU64::new(1),
+            unwind: None,
         };
         let cases = [
             (ErrorKind::ProtectionPaused, RetryRule::RetryAfterRecovery),
@@ -1150,8 +1194,9 @@ mod tests {
         db.shutdown();
     }
 
-    /// M9 opens only an empty directory: node data already there is refused before any node
-    /// starts, so a second open never bootstraps over a first one's history.
+    /// M9 opens only a directory without a `nodes/`: node data already there is refused before
+    /// any node starts, and left as it was, so a second open never bootstraps over a first
+    /// one's history.
     #[test]
     fn open_refuses_a_directory_that_already_holds_node_data() {
         let dir = config_testkit::fs::temp_dir();
@@ -1171,29 +1216,26 @@ mod tests {
             Err(other) => panic!("open over node data: {other}"),
             Ok(_) => panic!("open over node data succeeded"),
         }
+        assert!(
+            dir.path().join("nodes").join("1").exists(),
+            "the refusal removed nothing"
+        );
     }
 
     /// F-004, F-005: an open that fails part-way leaves nothing running and nothing on disk, so
     /// the same open can be tried again. (a) Node 2 fails to start after node 1 has: node 1 is
     /// stopped and joined, and `nodes/` is removed. On Windows the removal is also the proof of
     /// the join, because node 1's RocksDB `LOCK` keeps `nodes/1` from being deleted until its
-    /// thread drops the engine. A second open on the same directory then succeeds. (b) The
-    /// bootstrap is refused, because that second open already wrote `partitions/1`: all three
-    /// nodes are running by then, and the same unwind removes their directory.
-    /// Integration (~0.5 s): real node threads and RocksDB, no partition traffic.
+    /// thread drops the engine. A second open on the same directory then succeeds. (b) Once
+    /// that open has committed generation 1, `partitions/1` has a history, so a further open's
+    /// bootstrap is refused (F-004 adopts only an untouched record): all three nodes are
+    /// running by then, and the same unwind removes their directory.
+    /// Integration (~3 s): real node threads and RocksDB; (b) waits for generation 1.
     #[test]
     fn an_open_that_fails_part_way_unwinds_and_the_same_open_then_succeeds() {
         let dir = config_testkit::fs::temp_dir();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
+        let rt = runtime();
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
-        let config = |dir: &std::path::Path| DbConfig {
-            dir: dir.to_path_buf(),
-            hold: Vec::new(),
-            timeouts: Timeouts::default(),
-        };
         let fail_node_2 = |node: NodeId, dir, links, control, clock| {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
@@ -1218,12 +1260,14 @@ mod tests {
         );
 
         let mut reopened = rt
-            .block_on(Db::open(
+            .block_on(Db::open_with(
                 config(dir.path()),
                 Arc::clone(&store),
                 rt.handle().clone(),
+                fast(),
             ))
             .expect("(a) the same open on the same directory succeeds");
+        admits(&reopened, "(b) before the next bootstrap");
 
         let second = config_testkit::fs::temp_dir();
         match rt.block_on(Db::open(
@@ -1240,6 +1284,204 @@ mod tests {
             "(b) the refused bootstrap removed nodes/ and every node released its lock"
         );
         reopened.shutdown();
+    }
+
+    /// F-001: two opens race on one empty directory, on real OS threads. Each opener's node-1
+    /// start waits until the other has reached its own node-1 start or returned, so neither
+    /// starts a node before both are past the claim. The winner's node-3 start then waits until
+    /// the loser has returned, so the loser runs to its end while the winner's nodes are live.
+    /// Exactly one wins. The loser is refused `NotEmpty` and removes nothing: every node's
+    /// `CURRENT` file is still there, and the winner serves a put and a get.
+    /// Integration (~3 s): real node threads and RocksDB; the winner waits for generation 1.
+    #[test]
+    fn two_opens_racing_on_one_directory_leave_one_owner_and_its_nodes_intact() {
+        /// Per opener: (reached its node-1 start, returned).
+        #[derive(Default)]
+        struct Race {
+            state: std::sync::Mutex<[(bool, bool); 2]>,
+            changed: std::sync::Condvar,
+        }
+        impl Race {
+            fn mark(&self, opener: usize, set: impl FnOnce(&mut (bool, bool))) {
+                set(&mut self.state.lock().expect("race")[opener]);
+                self.changed.notify_all();
+            }
+            fn wait(&self, what: &str, other: usize, until: impl Fn((bool, bool)) -> bool) {
+                let patience = crate::host::test_patience(Duration::from_secs(5));
+                let state = self.state.lock().expect("race");
+                let (_state, waited) = self
+                    .changed
+                    .wait_timeout_while(state, patience, |state| !until(state[other]))
+                    .expect("race");
+                assert!(!waited.timed_out(), "{what} within {patience:?}");
+            }
+        }
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let race = Arc::new(Race::default());
+        let openers: Vec<_> = (0..2usize)
+            .map(|me| {
+                let path = dir.path().to_path_buf();
+                let store = Arc::clone(&store);
+                let handle = rt.handle().clone();
+                let race = Arc::clone(&race);
+                std::thread::spawn(move || {
+                    let other = 1 - me;
+                    let spawn = |node: NodeId, dir, links, control, clock| {
+                        if node == NodeId(1) {
+                            race.mark(me, |state| state.0 = true);
+                            race.wait("the other opener reaches node 1 or returns", other, |s| {
+                                s.0 || s.1
+                            });
+                        }
+                        let started = host::spawn_with(node, dir, links, control, clock, fast())?;
+                        if node == NodeId(3) {
+                            race.wait("the loser returns while these nodes run", other, |s| s.1);
+                        }
+                        Ok(started)
+                    };
+                    let opened = handle.block_on(Db::open_spawning(
+                        config(&path),
+                        store,
+                        handle.clone(),
+                        spawn,
+                    ));
+                    race.mark(me, |state| state.1 = true);
+                    opened
+                })
+            })
+            .collect();
+        let (mut won, mut lost): (Vec<_>, Vec<_>) = openers
+            .into_iter()
+            .map(|opener| opener.join().expect("opener thread"))
+            .partition(Result::is_ok);
+        assert_eq!((won.len(), lost.len()), (1, 1), "{won:?} {lost:?}");
+        match lost.pop() {
+            Some(Err(OpenError::NotEmpty(path))) => assert_eq!(path, dir.path().join("nodes")),
+            other => panic!("the loser is refused at the claim, not: {other:?}"),
+        }
+        let mut db = won.pop().expect("one winner").expect("the winner's Db");
+        admits(&db, "the winner");
+        assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
+        assert_eq!(
+            db.get(b"a").expect("get a").value,
+            Some((2, Bytes::from_static(b"1")))
+        );
+        for n in 1..=3 {
+            let current = dir.path().join("nodes").join(n.to_string()).join("CURRENT");
+            assert!(
+                current.exists(),
+                "the winner's {} survives",
+                current.display()
+            );
+        }
+        db.shutdown();
+    }
+
+    /// F-004 and critic C-1, through `Db`. (a) The bootstrap's create applies but its reply is
+    /// lost, and reading it back fails too. (c) The reply is lost and the create never applied.
+    /// Either way the open fails with `Control` and unwinds, and a retry against the same store,
+    /// in a fresh directory, opens. In (a) the retry adopts the untouched record and reaches a
+    /// usable partition: its first put is seq 2. In (c) it creates the record, as any first
+    /// open does, so the row stops at the open.
+    /// Integration (~3 s): real node threads and RocksDB; (a) waits for generation 1.
+    #[test]
+    fn an_open_whose_bootstrap_reply_was_lost_succeeds_when_opened_again() {
+        let rt = runtime();
+        let cases = [
+            (
+                "(a) applied",
+                Script {
+                    lose_put_replies: 1,
+                    fail_gets: 1,
+                    ..Script::default()
+                },
+                true,
+            ),
+            (
+                "(c) never applied",
+                Script {
+                    drop_puts: 1,
+                    ..Script::default()
+                },
+                false,
+            ),
+        ];
+        for (case, script, put) in cases {
+            let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(script));
+            let first = config_testkit::fs::temp_dir();
+            match rt.block_on(Db::open(
+                config(first.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            )) {
+                Err(OpenError::Bootstrap(admin::BootstrapError::Control(_))) => {}
+                Err(other) => panic!("{case}: the open fails with Control, not: {other}"),
+                Ok(_) => panic!("{case}: the open fails"),
+            }
+            assert!(
+                !first.path().join("nodes").exists(),
+                "{case}: the failed open unwound"
+            );
+            let again = config_testkit::fs::temp_dir();
+            let mut db = rt
+                .block_on(Db::open_with(
+                    config(again.path()),
+                    store,
+                    rt.handle().clone(),
+                    fast(),
+                ))
+                .unwrap_or_else(|error| panic!("{case}: the retry opens: {error}"));
+            if put {
+                admits(&db, case);
+                assert_eq!(
+                    db.put(b"a", b"1", None).expect("put a=1").seq,
+                    Seq(2),
+                    "{case}"
+                );
+            }
+            db.shutdown();
+        }
+    }
+
+    /// F-003: an open dropped while its bootstrap put waits at the control store. The open's
+    /// `Db` goes with the future, so its nodes stop and join and the `nodes/` it claimed is
+    /// removed; on Windows the removal is also the proof of the join, as above. Once the store
+    /// lets puts through, the same open on the same directory and store succeeds. That open's
+    /// claim was disarmed: dropping its `Db` leaves its node data.
+    /// Integration (~0.5 s): real node threads and RocksDB, no partition traffic.
+    #[test]
+    fn an_open_dropped_while_its_bootstrap_put_waits_stops_its_nodes_and_removes_nodes() {
+        let dir = config_testkit::fs::temp_dir();
+        let nodes = dir.path().join("nodes");
+        let rt = runtime();
+        let scripted = Arc::new(Scripted::gated());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&scripted) as Arc<dyn ConfigStore>;
+        let opened = rt.block_on(async {
+            tokio::select! {
+                opened = Db::open(config(dir.path()), Arc::clone(&store), rt.handle().clone()) => {
+                    Some(opened)
+                }
+                () = scripted.put_arrived.notified() => None,
+            }
+        });
+        assert!(opened.is_none(), "the open was dropped: {opened:?}");
+        assert!(
+            !nodes.exists(),
+            "the dropped open removed nodes/ and its nodes released their locks"
+        );
+
+        scripted.release();
+        let db = rt
+            .block_on(Db::open(config(dir.path()), store, rt.handle().clone()))
+            .expect("the same open on the same directory succeeds");
+        drop(db);
+        assert!(
+            nodes.join("1").join("CURRENT").exists(),
+            "an open that succeeded never removes its node data"
+        );
     }
 
     #[test]
