@@ -120,6 +120,13 @@ const AFFINITY: AffinityId = AffinityId(1);
 /// The longest the thread sleeps with nothing due, so a missed wake costs at most this.
 const IDLE_WAIT: Duration = Duration::from_millis(1_000);
 
+/// The discovery window the test rows run with, in place of the spec's 2 s. It is also the
+/// deadline of the control CAS that closes the window, and that CAS takes 20-30 ms on this
+/// host: at 20 ms, about 2 runs in 100 timed out to `BlockPromotion { reason: ControlUnknown }`
+/// and never reached `ready` (G2). This value keeps that margin with every row under 1 s.
+#[cfg(test)]
+pub(crate) const TEST_DISCOVERY_WINDOW_MILLIS: u64 = 100;
+
 /// A message to a node thread.
 #[derive(Debug)]
 pub enum Msg {
@@ -2890,7 +2897,7 @@ mod tests {
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
         // The walk, faster: F1's deadline is the discovery window. The never-pinned watch is
         // pushed out of reach, so only F1's own report can produce the line.
-        host.budgets.discovery_window_millis = 20;
+        host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
         host.rebuild_pin_wait_millis = 60_000;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -2945,7 +2952,7 @@ mod tests {
     fn an_active_commit_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = 20;
+            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
             host.rebuild_pin_wait_millis = 50;
         });
         trio.bootstrap();
@@ -2993,7 +3000,7 @@ mod tests {
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::start();
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        host.budgets.discovery_window_millis = 20;
+        host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
         host.rebuild_pin_wait_millis = 50;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -3063,7 +3070,9 @@ mod tests {
     #[test]
     fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
         let dir = config_testkit::fs::temp_dir();
-        let mut trio = Trio::new(dir.path(), |host| host.budgets.discovery_window_millis = 20);
+        let mut trio = Trio::new(dir.path(), |host| {
+            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS
+        });
         let partition = PartitionId(1);
         for (host, _, _) in &trio.nodes {
             assert_eq!(
@@ -3326,7 +3335,7 @@ mod tests {
     fn a_degraded_commit_whose_rebuild_never_pins_is_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = 20;
+            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
             host.rebuild_pin_wait_millis = 50;
         });
         trio.links.hold(NodeId(1), NodeId(3));
@@ -3800,7 +3809,7 @@ mod tests {
         /// The spec's budgets, shortened so a start reaches `ready` in well under a second:
         /// the discovery window and L1's resume hold are most of the 7.6 s a walk waits.
         fn fast(host: &mut Host) {
-            host.budgets.discovery_window_millis = 20;
+            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
             host.budgets.resume_hold_millis = 50;
         }
 

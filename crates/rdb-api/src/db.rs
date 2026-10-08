@@ -633,7 +633,7 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: 20,
+            discovery_window_millis: crate::host::TEST_DISCOVERY_WINDOW_MILLIS,
             resume_hold_millis: 50,
             warn_age_millis: 200,
             pause_age_millis: 400,
@@ -722,7 +722,7 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: 20,
+            discovery_window_millis: crate::host::TEST_DISCOVERY_WINDOW_MILLIS,
             resume_hold_millis: 50,
             warn_age_millis: 1_000,
             pause_age_millis: 2_000,
