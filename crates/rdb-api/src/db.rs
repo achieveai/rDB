@@ -742,7 +742,6 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: crate::host::test_discovery_window_millis(),
             resume_hold_millis: 50,
             warn_age_millis: 200,
             pause_age_millis: 400,
@@ -761,7 +760,7 @@ mod tests {
             let deadline = std::time::Instant::now() + patience;
             while db.node_status().first().and_then(|node| node.admits) != Some(true) {
                 for node in db.node_status() {
-                    let window = crate::host::test_discovery_window_millis();
+                    let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                     crate::host::assert_not_blocked(&node, window);
                 }
                 assert!(
@@ -836,7 +835,6 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: crate::host::test_discovery_window_millis(),
             resume_hold_millis: 50,
             warn_age_millis: 1_000,
             pause_age_millis: 2_000,
@@ -858,7 +856,7 @@ mod tests {
             let deadline = std::time::Instant::now() + patience;
             while db.node_status().first().and_then(|node| node.admits) != Some(true) {
                 for node in db.node_status() {
-                    let window = crate::host::test_discovery_window_millis();
+                    let window = Budgets::SPEC_DEFAULTS.discovery_window_millis;
                     crate::host::assert_not_blocked(&node, window);
                 }
                 assert!(
@@ -966,7 +964,6 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: crate::host::test_discovery_window_millis(),
             resume_hold_millis: 50,
             ..Budgets::SPEC_DEFAULTS
         };
