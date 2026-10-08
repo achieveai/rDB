@@ -701,9 +701,7 @@ fn refused_read(kind: ErrorKind) -> ApiError {
             current: Generation(0),
         },
         ErrorKind::RequestIdReuse => RdbError::RequestIdReuse { identity },
-        // P1 answers `Unavailable` for a view not yet published or kept, which clears without
-        // the caller doing anything. The kernel's `RdbError::Unavailable` is an unwired seam
-        // (`NotWired`), a different thing, so this kind keeps the API's own rule.
+        // Transient (view not yet published); the kernel's rule, NotWired, would say never retry.
         ErrorKind::Unavailable => return ApiError::new(kind, "the read was refused"),
         other => {
             tracing::error!(kind = ?other, "read_refused_with_unknown_kind");
