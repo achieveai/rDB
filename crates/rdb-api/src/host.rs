@@ -3565,6 +3565,26 @@ mod tests {
         }
         assert!(!stalled.contains("never pinned"), "{stalled}");
 
+        // The never-pinned report (M27), asked for directly: since K1 no M9 run leaves a
+        // rebuild unpinned. While L1 pauses writes it is printed, in PC17's words.
+        let host = &mut trio.nodes[0].0;
+        let watch = host.rebuilds.get_mut(&PartitionId(1)).expect("the watch");
+        watch.pinned = false;
+        let generation = watch.generation;
+        host.stalled.remove(&PartitionId(1));
+        host.rebuild_check(PartitionId(1), generation);
+        let never = host
+            .stalled
+            .get(&PartitionId(1))
+            .expect("the never-pinned line");
+        assert!(
+            never.ends_with(
+                "F1 never pinned its rebuild, so the partition stays DegradedRf2, and its writes \
+                 stay paused until the absent copy returns"
+            ),
+            "{never}"
+        );
+
         // D7: node 2 proved generation 1 only after it landed it.
         let node2 = |message: &str| {
             logged!(METHOD, message)
