@@ -3909,6 +3909,123 @@ mod tests {
         );
     }
 
+    /// PR #33 F-002 (amending ADR-rdb-0009 D3 rule 4). Link 1-3 is held, so F1 commits
+    /// `DegradedRf2` at cutoff 0 and node 1 applies the start record at seq 1. From the commit on,
+    /// node 1's peer frames are set aside, so no copy's acknowledgement reaches R1 and seq 1 stays
+    /// unpublished. After the heal, node 3 proves the rebuild and F1's activation lands while
+    /// seq 1 is still pending: the order in which a CAS answer beats copy 2's ack. P1 keeps the
+    /// view it holds at seq 0, so `GetPrevious` is answered from it, not refused. The frames are
+    /// then delivered and seq 1 publishes. Stepped by hand; no link 1-2 hold, which R1 may report
+    /// as a lost copy.
+    #[test]
+    fn a_re_emit_while_the_start_record_is_pending_keeps_the_previous_view() {
+        /// [`Trio::step`], with every `Frame` to node 1 set aside in `deferred`.
+        fn step(trio: &mut Trio, deferred: &mut Vec<Msg>) {
+            for (index, (host, _, rx)) in trio.nodes.iter_mut().enumerate() {
+                host.run_due();
+                host.drain();
+                while let Ok(msg) = rx.try_recv() {
+                    if index == 0 && matches!(msg, Msg::Frame { .. }) {
+                        deferred.push(msg);
+                    } else {
+                        host.handle(msg);
+                    }
+                }
+                assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+                assert_not_blocked(
+                    &host.status(PartitionId(1)),
+                    host.budgets.discovery_window_millis,
+                );
+            }
+        }
+        fn until<T>(
+            trio: &mut Trio,
+            deferred: &mut Vec<Msg>,
+            what: &str,
+            mut done: impl FnMut(&Trio) -> Option<T>,
+        ) -> T {
+            let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+            loop {
+                step(trio, deferred);
+                if let Some(found) = done(trio) {
+                    return found;
+                }
+                assert!(Instant::now() < deadline, "not in time: {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let view = |trio: &Trio| {
+            trio.nodes[0]
+                .0
+                .publication
+                .view(NodeId(1), PartitionId(1))
+                .expect("P1 serves partition 1 on node 1")
+        };
+
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        trio.until("F1 committed on node 1", |trio| {
+            trio.status(0).recovered.map(|_| ())
+        });
+        let mut deferred = Vec::new();
+        until(&mut trio, &mut deferred, "node 1 applied seq 1", |trio| {
+            (trio.head() == Some(1)).then_some(())
+        });
+        let mode = |trio: &Trio| trio.nodes[0].0.committed[&PartitionId(1)].mode.clone();
+        assert_eq!(mode(&trio), PartitionMode::DegradedRf2);
+        assert_eq!(
+            trio.status(0).published,
+            Some((Generation(1), Seq(0))),
+            "seq 1 is pending"
+        );
+        let before = view(&trio);
+        assert!(before.kept.is_some(), "P1 holds the view at seq 0");
+
+        trio.links.heal(NodeId(1), NodeId(3));
+        until(&mut trio, &mut deferred, "the activation landed", |trio| {
+            (mode(trio) == PartitionMode::Active).then_some(())
+        });
+        step(&mut trio, &mut deferred);
+        assert_eq!(
+            trio.status(0).published,
+            Some((Generation(1), Seq(0))),
+            "the activation landed before any ack of seq 1"
+        );
+        let after = view(&trio);
+
+        let previous = trio.call(ClientCall::GetPrevious {
+            identity: identity(1),
+            object: Bytes::from_static(b"a"),
+        });
+        match until(&mut trio, &mut deferred, "the previous read", |_| {
+            previous.try_recv().ok()
+        }) {
+            Answer::Read {
+                outcome, value, at, ..
+            } => assert_eq!(
+                (outcome, value, at),
+                (ReadServiceOutcome::Served, None, Seq(0)),
+                "answered from the view kept at seq 0"
+            ),
+            other => panic!("get a --previous while seq 1 is pending: {other:?}"),
+        }
+        assert_eq!(
+            (&after.kept, after.opening.len()),
+            (&before.kept, 0),
+            "the re-emit kept the view and opened none"
+        );
+
+        assert!(!deferred.is_empty(), "the copies' acks were set aside");
+        for msg in deferred {
+            trio.nodes[0].0.handle(msg);
+        }
+        trio.until("seq 1 published", |trio| {
+            (trio.status(0).published == Some((Generation(1), Seq(1)))).then_some(())
+        });
+    }
+
     /// F8, the host half (K1 ruling, condition 5): in `DegradedRf2` with copy 2 away, F1 names
     /// it again at every deadline, and the host prints its stall once. Each deadline re-asks
     /// copy 2, which the host logs as `rebuild_pinned`, so the row counts deadlines from the log

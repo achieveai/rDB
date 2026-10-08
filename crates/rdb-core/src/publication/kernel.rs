@@ -1515,10 +1515,18 @@ impl PubKernel {
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
         // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
         // was published, the candidate pending and the replies owed all belong to this lineage,
-        // so only the mode changes. The view still moves, at the same published position, so a
-        // re-emit asks storage for exactly what a rebase to an unmoved position would.
+        // so only the mode changes. The view kept is still the published one: the lineage and
+        // the published position are unchanged, and the host inherits storage only on a first
+        // landing. So it stays (PR #33 F-002, amending D3 rule 4): a real host binds a new view
+        // at its applied position, so moving it while a candidate is applied above the
+        // published position lost it until that candidate published. Only when no view is kept
+        // is one asked for.
         if self.lineage == result.selected.root {
-            let mut effects = self.move_view();
+            let mut effects = if self.kept.is_some() {
+                Vec::new()
+            } else {
+                self.move_view()
+            };
             let mode = recovered_mode(&result.mode);
             if self.mode != mode {
                 self.mode = mode;

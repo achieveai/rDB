@@ -6569,7 +6569,7 @@ fn reemitted(mode: PartitionMode, cutoff: u64) -> EventKind {
 /// M9 S0 D3 (lead ruling "S0 D3" rule 4). F1 re-emits the lineage P1 already serves as `Active`
 /// once the rebuild finishes, with the cutoff it selected long before. Published 5 (its reply
 /// still owed), candidate 6 pending, and a `Fresh` reader waiting behind it: the re-emit changes
-/// none of them. The view still moves, at the same position. Before the fix the published
+/// none of them, and the view kept at 5 stays (PR #33 F-002). Before the fix the published
 /// position fell to the cutoff, the candidate was dropped, the owed reply was withheld, and a
 /// read was refused because storage's view sat above what P1 called published (host walk A12).
 #[retcd_test]
@@ -6581,8 +6581,8 @@ fn m9_d3_01_p1_a_re_emit_of_the_served_lineage_keeps_published_pending_and_owed_
     let before = rig.view();
     assert_eq!(
         rig.step(reemitted(PartitionMode::Active, START)),
-        vec![release(1), open(2)],
-        "no reply withheld, no reader answered: only the view moves"
+        vec![],
+        "no reply withheld, no reader answered, and the kept view neither released nor reopened"
     );
     let after = rig.view();
     assert_eq!(
@@ -6596,7 +6596,12 @@ fn m9_d3_01_p1_a_re_emit_of_the_served_lineage_keeps_published_pending_and_owed_
     );
     assert_eq!(after.waiters, vec![req(21)], "the reader still waits");
     assert_eq!(after.mode, PubMode::Serving);
-    assert_eq!(after.opening.get(&snap(2)), Some(&before.published));
+    assert_eq!(
+        (after.kept, &after.opening),
+        (before.kept, &before.opening),
+        "the view kept at 5 stays, and no other is asked for"
+    );
+    assert!(after.kept.is_some());
 
     assert_eq!(
         rig.step(answer(Checkpoint::Reply, c5, Verdict::Admit)),
@@ -6618,7 +6623,8 @@ fn m9_d3_01_p1_a_re_emit_of_the_served_lineage_keeps_published_pending_and_owed_
 
 /// M9 S0 D3, the mode half of rule 4. A re-emit of the served lineage that changes the mode is
 /// still a mode transition, so it drains the waiters (K-A-14), here into `ReadOnly`, which
-/// answers a read at the published position. The candidate and the owed reply are kept.
+/// answers a read at the published position. The candidate, the owed reply and the kept view
+/// are kept (PR #33 F-002).
 #[retcd_test]
 fn m9_d3_02_p1_a_re_emit_that_changes_the_mode_answers_its_waiters_and_keeps_the_rest() {
     let mut rig = Rig::new();
@@ -6628,11 +6634,11 @@ fn m9_d3_02_p1_a_re_emit_that_changes_the_mode_answers_its_waiters_and_keeps_the
     let before = rig.view();
     assert_eq!(
         rig.step(reemitted(PartitionMode::ReadOnly, START)),
-        vec![
-            release(1),
-            open(2),
-            read_reply(21, ReadServiceOutcome::WaitedAtBarrier, Some(value_at(5)))
-        ]
+        vec![read_reply(
+            21,
+            ReadServiceOutcome::WaitedAtBarrier,
+            Some(value_at(5))
+        )]
     );
     let after = rig.view();
     assert_eq!(
@@ -6642,7 +6648,17 @@ fn m9_d3_02_p1_a_re_emit_that_changes_the_mode_answers_its_waiters_and_keeps_the
         }
     );
     assert_eq!(
-        (after.published, after.pending, after.awaiting_reply),
-        (before.published, before.pending, before.awaiting_reply)
+        (
+            after.published,
+            after.pending,
+            after.awaiting_reply,
+            after.kept
+        ),
+        (
+            before.published,
+            before.pending,
+            before.awaiting_reply,
+            before.kept
+        )
     );
 }

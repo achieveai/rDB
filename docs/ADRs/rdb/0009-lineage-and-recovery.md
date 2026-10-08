@@ -284,13 +284,20 @@ already held now changes only the mode:
 - the tracker truncates only above the head it holds, unless it is retired;
 - a receiver keeps its head under the conditions in ADR-0005 §4's amendment of the same date;
 - the publication module, on the lineage it already serves, keeps its published position, its
-  pending candidate and the replies it owes. Its view still moves, at the unchanged position, and
-  it drains waiting readers only when the mode actually changes.
+  pending candidate and the replies it owes, and it drains waiting readers only when the mode
+  actually changes. **Amended 2026-10-08 (PR #33 F-002):** it also keeps the view it holds, which
+  is still the published one. This rule first said the view moves, at the unchanged position.
+  That held only for a test rig that binds a view where it is asked. A real host binds a new view
+  at its applied position, so with a candidate applied above the published position the moved
+  view was released and `PreviousPublished` answered `Unavailable` until that candidate
+  published. Only when it keeps no view does it ask for one.
 - a quarantined receiver truncates but stays quarantined, and the tracker keeps a diverged copy
   diverged: quarantine clears only on a new-generation `Recovered` (M9 S0 ruling 2026-10-07,
   item 3; ADR-0005 §4).
 
-The transaction and lag modules are unchanged. Rows: `m9_d3_00` (sim) and `m9_d3_01`..`m9_d3_08`.
+The transaction and lag modules are unchanged. Rows: `m9_d3_00` (sim) and `m9_d3_01`..`m9_d3_08`;
+for the kept view, `a_re_emit_while_the_start_record_is_pending_keeps_the_previous_view` in
+`rdb-api`'s host tests.
 
 `RecoveryBarrier` still cannot be built from a sequence number — only from `DurableProof` values,
 which only the storage seam mints (ADR-0005 §4). Spec §8.1's "buffered complete entries from a live
