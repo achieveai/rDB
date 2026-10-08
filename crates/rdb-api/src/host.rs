@@ -450,6 +450,21 @@ impl NodeHandle {
         self.tx.send(msg).map_err(|_| NodeStopped(self.node))
     }
 
+    /// A node with no thread: what is sent to it queues in the returned mailbox and is never
+    /// answered. Crate tests only.
+    #[cfg(test)]
+    pub(crate) fn unanswered(node: NodeId) -> (Self, Receiver<Msg>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Self {
+                node,
+                tx,
+                join: None,
+            },
+            rx,
+        )
+    }
+
     /// Ask the thread to stop and wait for it.
     pub fn stop(&mut self) {
         let _ = self.tx.send(Msg::Stop);

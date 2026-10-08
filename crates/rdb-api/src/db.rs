@@ -791,6 +791,53 @@ mod tests {
         db.shutdown();
     }
 
+    /// Mutant W4. A compile sends nothing, so a put whose compile is never answered is a
+    /// definitive `UNAVAILABLE` with no request, never `UNKNOWN_OUTCOME`. No other row reaches
+    /// this arm: a real compile is local and answers in well under a millisecond. Here the owner
+    /// has no thread, so its mailbox is read only by this row, after the put returns: the
+    /// compile is all that was sent, and no resend followed it.
+    #[test]
+    fn a_put_whose_compile_is_never_answered_is_unavailable_and_sends_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (owner, mailbox) = NodeHandle::unanswered(OWNER);
+        let mut db = Db {
+            nodes: vec![owner],
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts {
+                put: Duration::from_millis(20),
+                ..Timeouts::default()
+            },
+            next_request: AtomicU64::new(1),
+        };
+
+        let refused = db
+            .put(b"a", b"1", None)
+            .expect_err("nothing answers the compile");
+        assert_eq!(refused.error.name(), "UNAVAILABLE", "{:?}", refused.error);
+        assert!(
+            refused.request.is_none(),
+            "nothing was sent, so no request to resend"
+        );
+        let sent: Vec<_> = mailbox
+            .try_iter()
+            .map(|msg| match msg {
+                Msg::Client(Client { call, .. }) => format!("{call:?}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert!(
+            sent.len() == 1 && sent[0].starts_with("Compile"),
+            "only the compile reached the owner: {sent:?}"
+        );
+        db.shutdown();
+    }
+
     /// M9 opens only an empty directory: node data already there is refused before any node
     /// starts, so a second open never bootstraps over a first one's history.
     #[test]
