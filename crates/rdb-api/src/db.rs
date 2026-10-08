@@ -651,6 +651,10 @@ mod tests {
             let patience = crate::host::test_patience(Duration::from_secs(5));
             let deadline = std::time::Instant::now() + patience;
             while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+                for node in db.node_status() {
+                    let window = crate::host::test_discovery_window_millis();
+                    crate::host::assert_not_blocked(&node, window);
+                }
                 assert!(
                     std::time::Instant::now() < deadline,
                     "node 1 does not admit writes within {patience:?}"
@@ -744,6 +748,10 @@ mod tests {
             let patience = crate::host::test_patience(Duration::from_secs(5));
             let deadline = std::time::Instant::now() + patience;
             while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+                for node in db.node_status() {
+                    let window = crate::host::test_discovery_window_millis();
+                    crate::host::assert_not_blocked(&node, window);
+                }
                 assert!(
                     std::time::Instant::now() < deadline,
                     "{phase}: node 1 does not admit writes within {patience:?}"

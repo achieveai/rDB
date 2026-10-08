@@ -139,6 +139,34 @@ pub(crate) fn test_patience(base: Duration) -> Duration {
     base * config_testkit::poll::deadline_scale()
 }
 
+/// Fail a test row at once when `status` shows F1 in a terminal phase. `Blocked` lasts until a
+/// fresh fence, which no row sends, and `Quarantined` for good, so nothing a row waits on can
+/// follow; waiting out its patience only hides why (lead ruling (c), 2026-10-07: a 300 ms CAS
+/// deadline once read as "no rebuild watch within 15s"). `window_millis` is the discovery
+/// window, which is also the deadline a `ControlUnknown` block ran out of.
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_not_blocked(status: &NodeStatus, window_millis: u64) {
+    let Some(phase) = status.recovery.as_deref() else {
+        return;
+    };
+    if let Some(reason) = phase
+        .strip_prefix("Blocked(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        panic!(
+            "node {} F1 blocked: {reason} at {window_millis} ms (the discovery window and CAS \
+             deadline); nothing this row waits on can follow",
+            status.node.0
+        );
+    }
+    assert!(
+        phase != "Quarantined",
+        "node {} F1 quarantined; nothing this row waits on can follow",
+        status.node.0
+    );
+}
+
 /// A message to a node thread.
 #[derive(Debug)]
 pub enum Msg {
@@ -2932,6 +2960,10 @@ mod tests {
             host.run_due();
             host.drain();
             assert_eq!(host.fault, None, "a stall is reported, never a fault");
+            assert_not_blocked(
+                &host.status(partition),
+                host.budgets.discovery_window_millis,
+            );
             if let Ok(msg) = rx.recv_timeout(host.wait().min(Duration::from_millis(10))) {
                 host.handle(msg);
             }
@@ -3040,6 +3072,10 @@ mod tests {
             host.run_due();
             host.drain();
             assert_eq!(host.fault, None);
+            assert_not_blocked(
+                &host.status(partition),
+                host.budgets.discovery_window_millis,
+            );
             if let Some(line) = host.status(partition).stalled {
                 assert!(
                     line.contains("unproven="),
@@ -3885,6 +3921,10 @@ mod tests {
                     host.handle(msg);
                 }
                 assert_eq!(host.fault, None, "node {} faulted", host.node.0);
+                assert_not_blocked(
+                    &host.status(PartitionId(1)),
+                    host.budgets.discovery_window_millis,
+                );
             }
         }
 
