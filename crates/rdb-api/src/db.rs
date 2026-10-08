@@ -20,8 +20,8 @@ use config_core::ConfigStore;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    ClientId, Generation, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity, Seq,
-    TenantId,
+    ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity,
+    Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
@@ -569,7 +569,7 @@ impl Db {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
                 ..
-            }) => Err(ApiError::new(kind, "the read was refused")),
+            }) => Err(refused_read(kind)),
             Some(Answer::Read {
                 outcome,
                 value,
@@ -670,6 +670,53 @@ impl Db {
 impl Drop for Db {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// A read P1 refused with `kind`, with the retry rule and mutation proof the kernel's own table
+/// gives that kind, as a put's refusal has (F-011). The `RdbError` here only carries the kind
+/// to that table: its fields are placeholders, so its message never reaches the detail.
+fn refused_read(kind: ErrorKind) -> ApiError {
+    let partition = PARTITION;
+    let identity = RequestIdentity {
+        tenant: TENANT,
+        client: CLIENT,
+        request: RequestId(0),
+    };
+    let kernel = match kind {
+        ErrorKind::ProtectionPaused => RdbError::ProtectionPaused {
+            partition,
+            paused_after: Seq(0),
+        },
+        ErrorKind::LeaseExpired => RdbError::LeaseExpired {
+            partition,
+            grant: GrantId(0),
+        },
+        ErrorKind::UnknownOutcome => RdbError::UnknownOutcome {
+            partition,
+            identity,
+        },
+        ErrorKind::GenerationChanged => RdbError::GenerationChanged {
+            expected: Generation(0),
+            current: Generation(0),
+        },
+        ErrorKind::RequestIdReuse => RdbError::RequestIdReuse { identity },
+        // P1 answers `Unavailable` for a view not yet published or kept, which clears without
+        // the caller doing anything. The kernel's `RdbError::Unavailable` is an unwired seam
+        // (`NotWired`), a different thing, so this kind keeps the API's own rule.
+        ErrorKind::Unavailable => return ApiError::new(kind, "the read was refused"),
+        other => {
+            tracing::error!(kind = ?other, "read_refused_with_unknown_kind");
+            return ApiError::host(&format!(
+                "P1 refused a read with {other:?}, which no read refusal carries"
+            ));
+        }
+    };
+    ApiError {
+        kind,
+        retry: kernel.retry_rule(),
+        no_mutation: kernel.proves_no_mutation(),
+        detail: "the read was refused".to_owned(),
     }
 }
 
@@ -1038,6 +1085,65 @@ mod tests {
         );
         assert!(took < put / 2, "answered in {took:?}, not at the timeout");
         assert!(refused.request.is_none(), "nothing was sent to resend");
+        db.shutdown();
+    }
+
+    /// F-011 (S0 review): a get P1 refuses takes its retry rule from the kernel's table, as a
+    /// put does. PROTECTION_PAUSED and LEASE_EXPIRED are `RetryAfterRecovery` (spec §5.4,
+    /// ADR-rdb-0004 §5), not the `BoundedJitter` of a kind `ApiError::new` does not list. P1's
+    /// `Unavailable` (a view not yet published) keeps `BoundedJitter`, and a kind no read
+    /// refusal carries is a host fault, never a guess. The owner's mailbox is answered by hand.
+    /// Unit (~10 ms): no node thread.
+    #[test]
+    fn a_refused_get_takes_its_retry_rule_from_the_kernel() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (owner, mailbox) = NodeHandle::unanswered(OWNER);
+        let mut db = Db {
+            nodes: vec![owner],
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts::default(),
+            next_request: AtomicU64::new(1),
+        };
+        let cases = [
+            (ErrorKind::ProtectionPaused, RetryRule::RetryAfterRecovery),
+            (ErrorKind::LeaseExpired, RetryRule::RetryAfterRecovery),
+            (ErrorKind::GenerationChanged, RetryRule::Reconcile),
+            (ErrorKind::Unavailable, RetryRule::BoundedJitter),
+            (ErrorKind::ConditionFailed, RetryRule::NotWired),
+        ];
+        let answerer = std::thread::spawn(move || {
+            for (kind, _) in cases {
+                let Ok(Msg::Client(Client { reply, .. })) = mailbox.recv() else {
+                    panic!("a get reaches the owner");
+                };
+                reply
+                    .send(Answer::Read {
+                        outcome: ReadServiceOutcome::Rejected(kind),
+                        value: None,
+                        generation: Generation(1),
+                        at: Seq(1),
+                    })
+                    .expect("the get waits");
+            }
+        });
+
+        for (kind, retry) in cases {
+            let refused = db.get(b"a").expect_err("P1 refused the get");
+            assert_eq!(refused.retry, retry, "{kind:?}: {refused:?}");
+            if retry == RetryRule::NotWired {
+                assert_eq!(refused.kind, ErrorKind::Unavailable, "{refused:?}");
+                assert!(refused.detail.starts_with("host fault: "), "{refused:?}");
+            } else {
+                assert_eq!(refused.kind, kind, "{refused:?}");
+            }
+        }
+        answerer.join().expect("the answerer thread");
         db.shutdown();
     }
 
