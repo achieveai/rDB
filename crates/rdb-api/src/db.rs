@@ -4,9 +4,10 @@
 //! answer to an [`ApiError`] with the §5.4 name and retry rule. It holds no kernel state: the
 //! node threads own everything (§4).
 //!
-//! A call that gets no answer in time is `UNKNOWN_OUTCOME` for a write (the request may still
-//! publish; ask `status` with the same identity) and `UNAVAILABLE` for a read (a read mutates
-//! nothing). Neither waits for ever.
+//! A call that gets no answer in time is `UNKNOWN_OUTCOME` for a write that was sent (the request
+//! may still publish; ask `status` with the same identity), `UNAVAILABLE` with no request for a
+//! put that could not be compiled in time (nothing was sent), and `UNAVAILABLE` for a read (a
+//! read mutates nothing). None waits for ever.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,8 +150,9 @@ fn wire_name(kind: ErrorKind) -> String {
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
-    /// A write: past this it is `UNKNOWN_OUTCOME`. Also the kernel deadline it is sent with, and
-    /// how long a fresh put waits for its compile, before anything is sent.
+    /// A write: once sent, past this it is `UNKNOWN_OUTCOME`. Also the kernel deadline it is sent
+    /// with, and how long a fresh put waits for its compile; a compile past it is `UNAVAILABLE`
+    /// with no request, since nothing was sent.
     pub put: Duration,
     /// A read or a status query.
     pub read: Duration,
