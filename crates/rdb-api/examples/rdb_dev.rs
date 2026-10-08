@@ -39,8 +39,8 @@
 //!
 //! - when F1 pinned its rebuild, at F1's rebuild deadline (the discovery window, ~2 s) with
 //!   `unproven=[..]`, the copies that have not proved the pinned point;
-//! - when F1 never pinned it, after `REBUILD_PIN_WAIT_MILLIS` times
-//!   `RETCD_TEST_DEADLINE_SCALE`, with `waited_ms=` and "F1 never pinned its rebuild".
+//! - when F1 never pinned it, after `REBUILD_PIN_WAIT_MILLIS` (5 s), with `waited_ms=` and
+//!   "F1 never pinned its rebuild".
 //!
 //! The line clears when the partition activates, or when a newer recovery starts watching its
 //! own rebuild, and the poller then prints `stall cleared node=N recovery=.. recovered=..

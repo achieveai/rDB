@@ -101,10 +101,10 @@ pub const CONTROL_WATCH_MILLIS: u64 = 10;
 pub const STEP_VIEW: SnapshotHandle = SnapshotHandle(u64::MAX);
 
 /// How long a recovery committed below `Active` may go without its rebuild pinning (no
-/// post-commit `SyncWalThrough`) before the host reports it stalled, times
-/// `RETCD_TEST_DEADLINE_SCALE`. F1 arms no timer before the pin, so without this watch the
-/// partition stays below `Active` in silence (defect D2, lead ruling 2026-10-07). It is a
-/// report, not a fault: the node keeps serving and puts keep the answer they had.
+/// post-commit `SyncWalThrough`) before the host reports it stalled. Crate tests set the host
+/// field directly. F1 arms no timer before the pin, so without this watch the partition stays
+/// below `Active` in silence (defect D2, lead ruling 2026-10-07). It is a report, not a fault:
+/// the node keeps serving and puts keep the answer they had.
 pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 
 /// How many times R1 may re-send one record to one copy, with that copy's acknowledged
@@ -705,7 +705,7 @@ struct Host {
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported; cleared when the partition activates.
     stalled: BTreeMap<PartitionId, String>,
-    /// [`REBUILD_PIN_WAIT_MILLIS`] times `RETCD_TEST_DEADLINE_SCALE`, read once.
+    /// [`REBUILD_PIN_WAIT_MILLIS`]; crate tests set it directly.
     rebuild_pin_wait_millis: u64,
     resends: BTreeMap<(PartitionId, CopyId), Resends>,
     /// [`STUCK_RESENDS`]; crate tests lower it.
@@ -759,7 +759,7 @@ impl Host {
             acquire_scheduled: BTreeSet::new(),
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
-            rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS.saturating_mul(deadline_scale()),
+            rebuild_pin_wait_millis: REBUILD_PIN_WAIT_MILLIS,
             resends: BTreeMap::new(),
             stuck_resends: STUCK_RESENDS,
             fault: None,
@@ -2887,15 +2887,6 @@ fn step_l1(
     }
     table.insert(ctx.partition, hosted);
     answer
-}
-
-/// `RETCD_TEST_DEADLINE_SCALE` (an integer, default 1), as `config_testkit::poll` reads it.
-fn deadline_scale() -> u64 {
-    std::env::var("RETCD_TEST_DEADLINE_SCALE")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(1)
-        .max(1)
 }
 
 const fn is_progress(kind: &EventKind) -> bool {
