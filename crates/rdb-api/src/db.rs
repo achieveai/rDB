@@ -701,6 +701,8 @@ fn refused_read(kind: ErrorKind) -> ApiError {
             current: Generation(0),
         },
         ErrorKind::RequestIdReuse => RdbError::RequestIdReuse { identity },
+        // P1 refuses a read past its waiter cap (`on_acquire`).
+        ErrorKind::Overloaded => RdbError::Overloaded { partition },
         // Transient (view not yet published); the kernel's rule, NotWired, would say never retry.
         ErrorKind::Unavailable => return ApiError::new(kind, "the read was refused"),
         other => {
@@ -1086,8 +1088,9 @@ mod tests {
     /// F-011 (S0 review): a get P1 refuses takes its retry rule from the kernel's table, as a
     /// put does. PROTECTION_PAUSED and LEASE_EXPIRED are `RetryAfterRecovery` (spec §5.4,
     /// ADR-rdb-0004 §5), not the `BoundedJitter` of a kind `ApiError::new` does not list. P1's
-    /// `Unavailable` (a view not yet published) keeps `BoundedJitter`, and a kind no read
-    /// refusal carries is a host fault, never a guess. The owner's mailbox is answered by hand.
+    /// `Unavailable` (a view not yet published) keeps `BoundedJitter`, as does `Overloaded` (P1's
+    /// waiter cap; round 2 R3), and a kind no read refusal carries is a host fault, never a
+    /// guess. The owner's mailbox is answered by hand.
     /// Unit (~10 ms): no node thread.
     #[test]
     fn a_refused_get_takes_its_retry_rule_from_the_kernel() {
@@ -1110,6 +1113,7 @@ mod tests {
             (ErrorKind::LeaseExpired, RetryRule::RetryAfterRecovery),
             (ErrorKind::GenerationChanged, RetryRule::Reconcile),
             (ErrorKind::Unavailable, RetryRule::BoundedJitter),
+            (ErrorKind::Overloaded, RetryRule::BoundedJitter),
             (ErrorKind::ConditionFailed, RetryRule::NotWired),
         ];
         let answerer = std::thread::spawn(move || {
