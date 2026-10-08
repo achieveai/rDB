@@ -849,6 +849,102 @@ mod tests {
         db.shutdown();
     }
 
+    /// F-002 (S0 review), on threads: one `Db`, shared, as `rdb_dev`'s `put&` shares it. While
+    /// a put waits for copies it cannot reach, a status query and a changed payload come under
+    /// its request id from two more threads. Each caller gets its own answer once the links
+    /// heal, and node 1 never faults. Case (b) of the host row, a put over a read waiting at
+    /// the barrier, is not repeated here: nothing a `Db` caller sees orders a read's arrival
+    /// before a put's, so the host row steps it by hand. Nor does anything order the two calls
+    /// before the heal: the put publishes only at R1's next retransmit, up to 100 ms after it,
+    /// and they arrive within a millisecond. With the queue removed this row failed 3 of 3.
+    /// Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn callers_on_three_threads_under_one_request_id_each_get_their_own_answer() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            discovery_window_millis: crate::host::test_discovery_window_millis(),
+            resume_hold_millis: 50,
+            ..Budgets::SPEC_DEFAULTS
+        };
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let config = DbConfig {
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts {
+                put: patience,
+                read: patience,
+            },
+        };
+        let db = Arc::new(
+            rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+                .expect("open"),
+        );
+        let until = |what: &str, done: &dyn Fn(&Db) -> bool| {
+            let deadline = std::time::Instant::now() + patience;
+            while !done(&db) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "not within {patience:?}: {what}"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let applied = |db: &Db| {
+            db.node_status()
+                .first()
+                .and_then(|n| n.holds)
+                .map(|h| h.applied)
+        };
+        until("node 1 admits writes", &|db| {
+            db.node_status().first().and_then(|n| n.admits) == Some(true)
+        });
+        assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
+
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let id = RequestId(100);
+        let putter = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || db.put_as(id, b"a", b"2", None))
+        };
+        until("node 1 applied the put", &|db| applied(db) == Some(3));
+        let asker = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || db.status(id, None))
+        };
+        let changer = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || db.put_as(id, b"a", b"other", None))
+        };
+        db.links().heal_all();
+
+        let put = putter.join().expect("putter").expect("the put publishes");
+        assert_eq!((put.request, put.seq), (id, Seq(3)));
+        match asker.join().expect("asker").expect("the status query") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(3)),
+            other => panic!("status of request 100: {other:?}"),
+        }
+        let changed = changer
+            .join()
+            .expect("changer")
+            .expect_err("a changed payload under a used id");
+        assert_eq!(
+            changed.error.name(),
+            "REQUEST_ID_REUSE",
+            "{:?}",
+            changed.error
+        );
+        let node = db.node_status().into_iter().next().expect("node 1");
+        assert_eq!(node.fault, None, "node 1 never faulted");
+        assert_eq!(applied(&db), Some(3), "request 100 published once");
+    }
+
     /// F-001 (S0 review), the `Db` side: a call whose waiter the node drops unanswered is a
     /// host fault at once, not a timeout. Here the owner's mailbox is read by a thread that
     /// drops the compile it takes, waiter and all; the put timeout is 5 s, so an answer within

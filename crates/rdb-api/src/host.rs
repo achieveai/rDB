@@ -114,6 +114,11 @@ pub const REBUILD_PIN_WAIT_MILLIS: u64 = 5_000;
 /// level with the head is never reported, however often R1 re-sends to it (D5).
 pub const STUCK_RESENDS: u32 = 15;
 
+/// How many calls may queue under one identity behind the call that waits (F-002). A `Db`
+/// caller sends at most a status query and a resend while its put waits, and `put&` one more;
+/// 4 leaves one spare and still bounds a caller that loops.
+pub const MAX_QUEUED_PER_IDENTITY: usize = 4;
+
 /// The only affinity S0 writes in.
 const AFFINITY: AffinityId = AffinityId(1);
 
@@ -685,6 +690,10 @@ struct Host {
     views: BTreeMap<PartitionId, ((Generation, AppliedSeq), RocksSnapshot)>,
     bound: BTreeMap<SnapshotHandle, RocksSnapshot>,
     pending: BTreeMap<RequestIdentity, Pending>,
+    /// Calls under an identity that already has a waiter in `pending`, in arrival order: each
+    /// is sent once the one before it is answered (F-002). At most
+    /// [`MAX_QUEUED_PER_IDENTITY`] per identity.
+    queued: BTreeMap<RequestIdentity, VecDeque<Client>>,
     plans: BTreeMap<PartitionId, RecoveryPlan>,
     committed: BTreeMap<PartitionId, Box<RecoveryResult>>,
     landed: BTreeSet<(PartitionId, Generation)>,
@@ -742,6 +751,7 @@ impl Host {
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
             pending: BTreeMap::new(),
+            queued: BTreeMap::new(),
             plans: BTreeMap::new(),
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
@@ -952,6 +962,19 @@ impl Host {
                 error: ApiError::host(&detail),
                 request,
             });
+        }
+        for (identity, queue) in std::mem::take(&mut self.queued) {
+            for client in queue {
+                tracing::info!(
+                    node = self.node.0,
+                    request = identity.request.0,
+                    "queued_failed_by_fault"
+                );
+                let _ = client.reply.send(Answer::Error {
+                    error: ApiError::host(&detail),
+                    request: None,
+                });
+            }
         }
         for (key, (asker, _, _)) in std::mem::take(&mut self.deferred_syncs) {
             self.drop_deferred_sync(key, asker, "fault");
@@ -2376,6 +2399,45 @@ impl Host {
     // ------------------------------------------------------------------ clients
 
     fn client(&mut self, client: Client) -> Result<(), String> {
+        // One waiter per identity (F-002): a call under an identity whose earlier call still
+        // waits is sent once that one is answered, never in its place. A compile waits on
+        // nothing, so it never queues.
+        let identity = match &client.call {
+            ClientCall::Compile { .. } => None,
+            ClientCall::Put { identity, .. }
+            | ClientCall::Get { identity, .. }
+            | ClientCall::GetPrevious { identity, .. }
+            | ClientCall::Status { identity, .. } => Some(*identity),
+            ClientCall::Resend { request } => Some(request.identity),
+        };
+        if let Some(identity) = identity.filter(|id| self.pending.contains_key(id)) {
+            let queue = self.queued.entry(identity).or_default();
+            if queue.len() >= MAX_QUEUED_PER_IDENTITY {
+                tracing::warn!(
+                    node = self.node.0,
+                    request = identity.request.0,
+                    queued = queue.len(),
+                    "client_call_refused_queue_full"
+                );
+                let _ = client.reply.send(Answer::Error {
+                    error: ApiError::invalid(format!(
+                        "request {} already has {} calls waiting behind it; nothing was sent",
+                        identity.request.0,
+                        queue.len()
+                    )),
+                    request: None,
+                });
+                return Ok(());
+            }
+            queue.push_back(client);
+            tracing::info!(
+                node = self.node.0,
+                request = identity.request.0,
+                queued = queue.len(),
+                "client_call_queued"
+            );
+            return Ok(());
+        }
         let Client {
             partition,
             call,
@@ -2499,8 +2561,7 @@ impl Host {
             expected_generation,
             "client_call"
         );
-        // A newer call under one identity replaces the older one's waiter: the older caller has
-        // timed out by then (it is the only way the same identity is sent twice).
+        // No waiter is replaced: a call under an identity that has one was queued above.
         self.pending.insert(
             identity,
             Pending {
@@ -2602,7 +2663,38 @@ impl Host {
             }
         };
         let _ = pending.reply.send(answer);
-        Ok(())
+        self.release_queued(identity)
+    }
+
+    /// Send the next call queued under `identity`, now that its waiter is answered (F-002). A
+    /// call answered without waiting (a refused compile) leaves the identity free again, so
+    /// the one after it follows at once. A queued call whose caller has given up is still
+    /// sent: its caller holds `UNKNOWN_OUTCOME` or `UNAVAILABLE`, which allow that, and the
+    /// kernel de-duplicates a request sent twice.
+    fn release_queued(&mut self, identity: RequestIdentity) -> Result<(), String> {
+        loop {
+            if self.pending.contains_key(&identity) {
+                return Ok(());
+            }
+            let Some(queue) = self.queued.get_mut(&identity) else {
+                return Ok(());
+            };
+            let next = queue.pop_front();
+            let left = queue.len();
+            if left == 0 {
+                self.queued.remove(&identity);
+            }
+            let Some(next) = next else {
+                return Ok(());
+            };
+            tracing::info!(
+                node = self.node.0,
+                request = identity.request.0,
+                left,
+                "client_call_dequeued"
+            );
+            self.client(next)?;
+        }
     }
 
     /// P1's answer to a `ReadPrevious`: the kept view it handed out, read for the asked object,
@@ -2653,7 +2745,7 @@ impl Host {
             }
         };
         let _ = pending.reply.send(answer);
-        Ok(())
+        self.release_queued(identity)
     }
 
     /// §4.2: the bytes come from the step view P1 just answered from, re-checked against the
@@ -4177,6 +4269,253 @@ mod tests {
                     "{name}"
                 ),
                 other => panic!("{name}: the caller is told the host faulted: {other:?}"),
+            }
+        }
+    }
+
+    /// A waiter that has neither an answer nor been dropped.
+    fn still_waits(name: &str, waiter: &Receiver<Answer>) {
+        match waiter.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            other => panic!("{name} still waits: {other:?}"),
+        }
+    }
+
+    /// F-002 (S0 review): one identity, one waiter. A `Db` is shared across threads (`rdb_dev`'s
+    /// `put&`), so a second call can come under an identity whose first call still waits. It
+    /// queues behind that call and is submitted once that call is answered: every caller gets
+    /// its own answer, and no reply meets a call it cannot answer. Before, the newer call
+    /// replaced the waiter, so the older caller was answered by nobody, and a put over a read
+    /// waiting at the barrier faulted the node.
+    ///
+    /// - (a) Behind a put in flight: a status query, the same request resent, the same request
+    ///   resent by a caller that has already given up, and a changed payload. The changed
+    ///   payload still ends in `REQUEST_ID_REUSE`, but only once the put is answered (here, at
+    ///   the heal): queued, it waits for the first call's answer, where before it was refused
+    ///   at once. The given-up caller's resend is still submitted, as its `UNKNOWN_OUTCOME`
+    ///   allows, and publishes nothing more: the kernel de-duplicates it.
+    /// - (b) A put under the identity of a read waiting at the barrier.
+    /// - (c) A host fault answers the waiting call and every call queued behind it (F-001).
+    #[config_log::retcd_test]
+    fn a_second_call_under_a_waiting_identity_queues_and_each_caller_gets_its_own_answer() {
+        const METHOD: &str =
+            "a_second_call_under_a_waiting_identity_queues_and_each_caller_gets_its_own_answer";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        let hold = |trio: &Trio| {
+            trio.links.hold(NodeId(1), NodeId(2));
+            trio.links.hold(NodeId(1), NodeId(3));
+        };
+
+        // (a)
+        let compiled = match trio.ask(ClientCall::Compile {
+            identity: identity(10),
+            object: Bytes::from_static(b"a"),
+            value: Bytes::from_static(b"2"),
+            if_version: None,
+            remaining_millis: 5_000,
+        }) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 10: {other:?}"),
+        };
+        hold(&trio);
+        let first = trio.call(ClientCall::Resend {
+            request: compiled.clone(),
+        });
+        trio.until("node 1 applied request 10", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+        let status = trio.call(ClientCall::Status {
+            identity: identity(10),
+            generation: None,
+        });
+        let same = trio.call(ClientCall::Resend {
+            request: compiled.clone(),
+        });
+        drop(trio.call(ClientCall::Resend { request: compiled }));
+        let changed = trio.call(put(10, b"a", b"other", None));
+        for _ in 0..3 {
+            trio.step();
+        }
+        for (name, waiter) in [
+            ("the put", &first),
+            ("the status query", &status),
+            ("the same request", &same),
+            ("the changed payload", &changed),
+        ] {
+            still_waits(name, waiter);
+        }
+        trio.links.heal_all();
+        match trio.answer(&first) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("request 10: {other:?}"),
+        }
+        match trio.answer(&status) {
+            Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(3)),
+            other => panic!("status of request 10: {other:?}"),
+        }
+        match trio.answer(&same) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3), "the same transaction"),
+            other => panic!("request 10 resent: {other:?}"),
+        }
+        match trio.answer(&changed) {
+            Answer::Error { error, .. } => assert_eq!(error.name(), "REQUEST_ID_REUSE"),
+            other => panic!("request 10 with another value: {other:?}"),
+        }
+        let calls = |request: u64| {
+            logged!(METHOD, "client_call")
+                .iter()
+                .filter(|line| line["request"] == request)
+                .count()
+        };
+        trio.until("the given-up resend was submitted", |_| {
+            (calls(10) == 5).then_some(())
+        });
+        for _ in 0..3 {
+            trio.step();
+        }
+        assert_eq!(trio.head(), Some(3), "request 10 published once");
+
+        // (b)
+        hold(&trio);
+        let put_b = trio.call(put(20, b"b", b"1", None));
+        trio.until("node 1 applied request 20", |trio| {
+            (trio.head() == Some(4)).then_some(())
+        });
+        let read = trio.call(get(21, b"b"));
+        trio.until("node 1 took the read", |trio| {
+            trio.nodes[0]
+                .0
+                .pending
+                .contains_key(&identity(21))
+                .then_some(())
+        });
+        trio.step();
+        let over = trio.call(put(21, b"c", b"1", None));
+        for _ in 0..3 {
+            trio.step();
+        }
+        for (name, waiter) in [("put b", &put_b), ("the read", &read), ("put c", &over)] {
+            still_waits(name, waiter);
+        }
+        trio.links.heal_all();
+        match trio.answer(&put_b) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(4)),
+            other => panic!("put b: {other:?}"),
+        }
+        match trio.answer(&read) {
+            Answer::Read { outcome, value, .. } => assert_eq!(
+                (outcome, value),
+                (
+                    ReadServiceOutcome::WaitedAtBarrier,
+                    Some((4, Bytes::from_static(b"1")))
+                )
+            ),
+            other => panic!("the read at the barrier: {other:?}"),
+        }
+        // Sent the moment the read is answered, which can still be inside L1's resume hold
+        // after the heal: then the kernel refuses it, and that refusal is its own answer.
+        match trio.answer(&over) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
+            Answer::Error { error, .. } => assert_eq!(error.name(), "PROTECTION_PAUSED"),
+            other => panic!("put c under the read's identity: {other:?}"),
+        }
+
+        // (c)
+        trio.ready();
+        let head = trio.head().expect("node 1 holds the partition");
+        hold(&trio);
+        let put_d = trio.call(put(30, b"d", b"1", None));
+        trio.until("node 1 applied request 30", |trio| {
+            (trio.head() == Some(head + 1)).then_some(())
+        });
+        let queued = trio.call(ClientCall::Status {
+            identity: identity(30),
+            generation: None,
+        });
+        for _ in 0..3 {
+            trio.step();
+        }
+        still_waits("the status behind put d", &queued);
+        let host = &mut trio.nodes[0].0;
+        host.fail_step_view = true;
+        let (reply, faulting) = mpsc::channel();
+        host.handle(Msg::Client(Client {
+            partition: PartitionId(1),
+            call: put(31, b"e", b"1", None),
+            reply,
+        }));
+        assert!(host.fault.is_some(), "the node faulted");
+        for (name, waiter) in [
+            ("put d", &put_d),
+            ("the status behind it", &queued),
+            ("the faulting put", &faulting),
+        ] {
+            match waiter.try_recv() {
+                Ok(Answer::Error { error, .. }) => {
+                    assert_eq!(error.retry, RetryRule::NotWired, "{name}: {error:?}");
+                }
+                other => panic!("{name} is told the host faulted: {other:?}"),
+            }
+        }
+        assert_eq!(logged!(METHOD, "client_call_queued").len(), 6);
+    }
+
+    /// F-002's bound: past [`MAX_QUEUED_PER_IDENTITY`] calls queued under one identity, the next
+    /// is refused at once, definitively, and nothing of it is sent.
+    #[test]
+    fn a_call_past_the_queue_bound_for_its_identity_is_refused_and_sends_nothing() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let first = trio.call(put(1, b"a", b"1", None));
+        trio.until("node 1 applied request 1", |trio| {
+            (trio.head() == Some(2)).then_some(())
+        });
+        let status = || ClientCall::Status {
+            identity: identity(1),
+            generation: None,
+        };
+        let queued: Vec<_> = (0..MAX_QUEUED_PER_IDENTITY)
+            .map(|_| trio.call(status()))
+            .collect();
+        let refused = trio.call(status());
+        for _ in 0..3 {
+            trio.step();
+        }
+        match refused.try_recv() {
+            Ok(Answer::Error {
+                error,
+                request: None,
+            }) => assert_eq!(
+                (error.name(), error.retry, error.no_mutation),
+                ("INVALID_ARGUMENT".to_owned(), RetryRule::Definitive, true),
+                "{error:?}"
+            ),
+            other => panic!("the call past the bound is refused at once: {other:?}"),
+        }
+        still_waits("the put", &first);
+        for waiter in &queued {
+            still_waits("a queued status", waiter);
+        }
+        trio.links.heal_all();
+        match trio.answer(&first) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("request 1: {other:?}"),
+        }
+        for waiter in &queued {
+            match trio.answer(waiter) {
+                Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(2)),
+                other => panic!("a queued status: {other:?}"),
             }
         }
     }
