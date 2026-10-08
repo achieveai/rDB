@@ -4736,9 +4736,12 @@ mod tests {
     /// (round 2 R2): the call it queued behind may yet publish, so the caller asks `status`. A
     /// resend carries its request back; a put was never compiled, so it has none (the `Db`
     /// sends every put as a resend). A read past the bound stays `INVALID_ARGUMENT`. The queued
-    /// resends are each answered with the one transaction once the heal lets it publish.
-    #[test]
+    /// resends are each answered with the one transaction once the heal lets it publish, and
+    /// only they and the first were ever sent.
+    #[config_log::retcd_test]
     fn a_call_past_the_queue_bound_for_its_identity_is_refused_and_sends_nothing() {
+        const METHOD: &str =
+            "a_call_past_the_queue_bound_for_its_identity_is_refused_and_sends_nothing";
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), Trio::fast);
         trio.bootstrap();
@@ -4812,6 +4815,15 @@ mod tests {
                 other => panic!("request 1: {other:?}"),
             }
         }
+        let sent = logged!(METHOD, "client_call")
+            .into_iter()
+            .filter(|line| line["request"] == 1)
+            .count();
+        assert_eq!(
+            sent,
+            1 + MAX_QUEUED_PER_IDENTITY,
+            "the first call and the queued ones; nothing past the bound"
+        );
     }
 
     /// F-014 (round 2 R1): P1 may withhold a published put's reply for good (a Reply check A1
@@ -4821,8 +4833,9 @@ mod tests {
     /// Now a status query never queues behind a write, and a put's waiter expires at its
     /// request's deadline plus [`TXN_WAITER_MARGIN_MILLIS`] as `UNKNOWN_OUTCOME`. Here A1
     /// denies the Reply check: the status query answers `Resolved` at the put's seq while the
-    /// put still waits, the put expires, and a resend gets the published result again. The node
-    /// never faults (`Trio::step` checks).
+    /// put still waits, the put expires, the resend queued behind it is released and gets the
+    /// published result again, and so does a resend after. The node never faults (`Trio::step`
+    /// checks).
     #[config_log::retcd_test]
     fn a_put_whose_reply_p1_withholds_expires_and_its_status_is_answered_meanwhile() {
         const METHOD: &str =
@@ -4867,6 +4880,17 @@ mod tests {
             assert!(Instant::now() < deadline, "request 1 never resolved");
         };
         assert_eq!(status.seq, Seq(2), "the status is the put's");
+        // P1 has already withheld the put's reply, so clearing the deny cannot revive it; it lets
+        // the resend queued behind the put be answered once the expiry releases it.
+        trio.nodes[0].0.deny_reply_checks = false;
+        let behind = trio.call(ClientCall::Resend {
+            request: compiled.clone(),
+        });
+        for _ in 0..3 {
+            trio.step();
+        }
+        still_waits("the put whose reply P1 withheld", &put);
+        still_waits("the resend queued behind it", &behind);
 
         let expired = trio.answer(&put);
         assert!(
@@ -4888,8 +4912,17 @@ mod tests {
         let logged = logged!(METHOD, "txn_waiter_expired");
         assert_eq!(logged.len(), 1, "{logged:?}");
         assert_eq!(logged[0]["request"], 1, "{}", logged[0]);
+        // The expiry frees the identity: the queued resend goes out and gets the replay.
+        match trio.answer(&behind) {
+            Answer::Txn { result, .. } => assert_eq!(result, status, "the queued resend"),
+            other => panic!("the resend queued behind the withheld put: {other:?}"),
+        }
+        let dequeued = logged!(METHOD, "client_call_dequeued")
+            .into_iter()
+            .filter(|line| line["request"] == 1)
+            .count();
+        assert_eq!(dequeued, 1, "the queued resend was released by the expiry");
 
-        trio.nodes[0].0.deny_reply_checks = false;
         match trio.ask(ClientCall::Resend { request: compiled }) {
             Answer::Txn { result, .. } => assert_eq!(result, status, "the replayed result"),
             other => panic!("request 1 resent after expiry: {other:?}"),
