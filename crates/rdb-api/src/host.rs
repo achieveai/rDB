@@ -271,8 +271,9 @@ pub enum PeerAsk {
         cutoff: Seq,
         /// In this lineage.
         generation: Generation,
-        /// Whether F1 is past its commit. Logged only: seq 0 is `Digest::ROOT` and any other seq
-        /// is the stored record's digest either way (D2 ruling, rule 3).
+        /// Whether F1 is past its commit. The digest does not depend on it: seq 0 is `Digest::ROOT`
+        /// and any other seq the stored record's digest (D2 ruling, rule 3). A holder that has not
+        /// landed the generation waits for the landing before it answers (D7).
         post_commit: bool,
     },
 }
@@ -687,6 +688,10 @@ struct Host {
     plans: BTreeMap<PartitionId, RecoveryPlan>,
     committed: BTreeMap<PartitionId, Box<RecoveryResult>>,
     landed: BTreeSet<(PartitionId, Generation)>,
+    /// D7: per lineage, the one post-commit sync a peer asked of a generation this node has
+    /// not landed. Answered right after the landing's inherit, so the proof is of a generation
+    /// this copy holds; the latest ask wins.
+    deferred_syncs: BTreeMap<(PartitionId, Generation), (NodeId, CorrelationId, PeerAsk)>,
     acquire_scheduled: BTreeSet<PartitionId>,
     rebuilds: BTreeMap<PartitionId, RebuildWatch>,
     /// The stall line, per partition, once reported; cleared when the partition activates.
@@ -737,6 +742,7 @@ impl Host {
             plans: BTreeMap::new(),
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
+            deferred_syncs: BTreeMap::new(),
             acquire_scheduled: BTreeSet::new(),
             rebuilds: BTreeMap::new(),
             stalled: BTreeMap::new(),
@@ -941,6 +947,9 @@ impl Host {
                 error: ApiError::host(&detail),
                 request,
             });
+        }
+        for (key, (asker, _, _)) in std::mem::take(&mut self.deferred_syncs) {
+            self.drop_deferred_sync(key, asker, "fault");
         }
         self.queue.clear();
         self.fault = Some(detail);
@@ -1605,21 +1614,24 @@ impl Host {
         else {
             return;
         };
+        // K1 ruling, condition 6: a rebuild that never pinned while L1 admits writes is not a
+        // stall anyone waits on, so the line is never printed then.
+        if self.admits(partition) == Some(true) {
+            tracing::info!(
+                node = self.node.0,
+                partition = partition.0,
+                generation = generation.0,
+                "rebuild_check_admitting"
+            );
+            return;
+        }
         let waited_ms = self.clock.now().0.saturating_sub(watch.since.0);
         let phase = self
             .recoveries
             .get(&partition)
             .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
         let required: Vec<u8> = watch.required.iter().map(|copy| copy.0).collect();
-        // PC17: in DegradedRf2 a copy never heard from blocks L1's resume (B-R38), so writes
-        // pause; "paused at prefix Seq(0)" is L1's prefix from before the start record.
-        let effect = match watch.mode {
-            PartitionMode::DegradedRf2 => format!(
-                "stays {:?}, and its writes stay paused until the absent copy returns",
-                watch.mode
-            ),
-            _ => format!("stays {:?} and does not activate", watch.mode),
-        };
+        let effect = self.stall_effect(partition, &watch.mode);
         let line = format!(
             "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} required={required:?} \
              waited_ms={waited_ms} phase={phase} host_catch_up=unsupported: F1 never pinned its \
@@ -1673,6 +1685,14 @@ impl Host {
                 .recoveries
                 .get(&partition)
                 .map_or_else(|| "none".to_owned(), |f1| format!("{:?}", f1.phase()));
+            let Some(mode) = self
+                .rebuilds
+                .get(&partition)
+                .map(|watch| watch.mode.clone())
+            else {
+                continue;
+            };
+            let effect = self.stall_effect(partition, &mode);
             let Some(watch) = self.rebuilds.get_mut(&partition) else {
                 continue;
             };
@@ -1682,9 +1702,8 @@ impl Host {
             let line = format!(
                 "recovery_rebuild_stalled partition={} gen={} mode={:?} cutoff={} \
                  required={required:?} unproven={unproven:?} phase={phase}: F1 pinned its \
-                 rebuild, but these copies have not proved it, so the partition stays {:?} and \
-                 does not activate",
-                partition.0, watch.generation.0, watch.mode, watch.cutoff.0, watch.mode,
+                 rebuild, but these copies have not proved it, so the partition {effect}",
+                partition.0, watch.generation.0, watch.mode, watch.cutoff.0,
             );
             tracing::error!(
                 node = self.node.0,
@@ -1698,6 +1717,26 @@ impl Host {
                 "recovery_rebuild_stalled"
             );
             self.stalled.insert(partition, line);
+        }
+    }
+
+    /// Whether L1 admits writes to `partition` now, when L1 is live here.
+    fn admits(&self, partition: PartitionId) -> Option<bool> {
+        self.l1
+            .get(&partition)
+            .and_then(|l1| l1.protection.admission_state(self.clock.now()))
+            .map(|state| state.allow)
+    }
+
+    /// What a stalled rebuild leaves the partition as, said only while it is true. PC17: in
+    /// `DegradedRf2` an unheard copy blocks L1's resume (B-R38), so writes pause, and the line
+    /// says so only while L1 does pause them.
+    fn stall_effect(&self, partition: PartitionId, mode: &PartitionMode) -> String {
+        match mode {
+            PartitionMode::DegradedRf2 if self.admits(partition) == Some(false) => {
+                format!("stays {mode:?}, and its writes stay paused until the absent copy returns")
+            }
+            _ => format!("stays {mode:?} and does not activate"),
         }
     }
 
@@ -1723,6 +1762,7 @@ impl Host {
         if first && barrier {
             self.inherit(partition, &result)?;
         }
+        self.answer_deferred_syncs(partition, result.new_generation);
         self.schedule_acquire(&result, site);
         self.committed.insert(partition, result.clone());
         self.push(
@@ -1732,6 +1772,43 @@ impl Host {
             None,
         );
         Ok(())
+    }
+
+    /// D7: `generation` just landed, so the sync deferred for it is answered now, and one
+    /// deferred for an older generation of the partition never will be: it is dropped.
+    fn answer_deferred_syncs(&mut self, partition: PartitionId, generation: Generation) {
+        let due: Vec<(PartitionId, Generation)> = self
+            .deferred_syncs
+            .keys()
+            .filter(|(p, g)| *p == partition && *g <= generation)
+            .copied()
+            .collect();
+        for key in due {
+            let Some((asker, correlation, ask)) = self.deferred_syncs.remove(&key) else {
+                continue;
+            };
+            if key.1 == generation {
+                self.answer_peer(asker, partition, correlation, &ask);
+            } else {
+                self.drop_deferred_sync(key, asker, "newer_generation_landed");
+            }
+        }
+    }
+
+    fn drop_deferred_sync(
+        &self,
+        (partition, generation): (PartitionId, Generation),
+        asker: NodeId,
+        reason: &'static str,
+    ) {
+        tracing::warn!(
+            node = self.node.0,
+            partition = partition.0,
+            generation = generation.0,
+            asker = asker.0,
+            reason,
+            "sync_deferred_dropped"
+        );
     }
 
     fn inherit(&mut self, partition: PartitionId, result: &RecoveryResult) -> Result<(), String> {
@@ -2113,6 +2190,30 @@ impl Host {
         correlation: CorrelationId,
         ask: &PeerAsk,
     ) {
+        if let PeerAsk::Sync {
+            copy,
+            generation,
+            post_commit: true,
+            ..
+        } = *ask
+        {
+            if !self.landed.contains(&(partition, generation)) {
+                let replaced = self
+                    .deferred_syncs
+                    .insert((partition, generation), (asker, correlation, ask.clone()))
+                    .is_some();
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    generation = generation.0,
+                    copy = copy.0,
+                    asker = asker.0,
+                    replaced,
+                    "sync_deferred"
+                );
+                return;
+            }
+        }
         let Some(answer) = self.answer(partition, ask) else {
             return;
         };
@@ -3009,9 +3110,28 @@ mod tests {
         }
 
         // Five more of F1's deadlines: it names both copies again, and the line does not move.
-        let until = Instant::now() + Duration::from_millis(100);
-        while Instant::now() < until {
+        // Each deadline re-asks copy 2 (`rebuild_pinned`), so they are counted from the log,
+        // not assumed from elapsed time: the scaled window made a fixed 100 ms less than one.
+        let asks_of_copy_2 = || {
+            logged!(METHOD, "rebuild_pinned")
+                .into_iter()
+                .filter(|line| line["copy"] == 2)
+                .count()
+        };
+        let more = asks_of_copy_2() + 5;
+        let mut read = Instant::now();
+        loop {
             step(&mut host);
+            if read.elapsed() >= Duration::from_millis(50) {
+                read = Instant::now();
+                if asks_of_copy_2() >= more {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline + patience,
+                "five more deadlines not within {patience:?}"
+            );
         }
         assert_eq!(host.status(partition).stalled, Some(stalled));
         let logged = logged!(METHOD, "recovery_rebuild_stalled");
@@ -3409,12 +3529,18 @@ mod tests {
         assert_eq!(trio.status(0).admits, Some(true));
     }
 
-    /// The never-pinned report, positive (the tester's row (d): since the D2 rewrite no row
-    /// reached it). Only link 1-3 is held, so F1 commits `DegradedRf2` at cutoff 0. F1 pins
-    /// nothing at that commit, and copy 2 never catches up, so the host's wait runs out and the
-    /// line names the real mode and says writes are paused, not "read-only" (PC17).
-    #[test]
-    fn a_degraded_commit_whose_rebuild_never_pins_is_reported_stalled() {
+    /// The tester's row (d), moved onto the pinned stall by the K1 ruling (condition 6), and
+    /// defect D7. Only link 1-3 is held, so F1 commits `DegradedRf2` at cutoff 0 and, since K1,
+    /// pins that rebuild at the commit and asks every copy to sync. Copy 2 never answers, so F1
+    /// names it at its deadline and the host's line says what is true while L1 pauses writes for
+    /// the unheard copy (B-R38): writes stay paused until it returns (PC17, mutant M28).
+    /// D7: node 2 heard the sync for generation 1 before it landed that generation, proved it,
+    /// and then faulted inheriting it. A sync for a generation not yet landed now waits for the
+    /// landing, so the proof is of a generation the copy holds.
+    #[config_log::retcd_test]
+    fn a_degraded_commit_with_a_copy_away_is_reported_stalled_with_writes_paused() {
+        const METHOD: &str =
+            "a_degraded_commit_with_a_copy_away_is_reported_stalled_with_writes_paused";
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
             host.budgets.discovery_window_millis = test_discovery_window_millis();
@@ -3424,18 +3550,124 @@ mod tests {
         trio.bootstrap();
         let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
         assert!(
-            !trio.nodes[0].0.rebuilds[&PartitionId(1)].pinned,
-            "nothing pinned the rebuild"
+            trio.nodes[0].0.rebuilds[&PartitionId(1)].pinned,
+            "F1 pinned the rebuild at the commit"
         );
+        assert_eq!(trio.status(0).admits, Some(false), "L1 pauses writes");
         for part in [
             "recovery_rebuild_stalled partition=1 gen=1 mode=DegradedRf2 cutoff=0 \
-             required=[0, 1, 2] waited_ms=",
-            "F1 never pinned its rebuild, so the partition stays DegradedRf2, and its writes stay \
-             paused until the absent copy returns",
+             required=[0, 1, 2] unproven=[",
+            "2] phase=Rebuilding: F1 pinned its rebuild, but these copies have not proved it, so \
+             the partition stays DegradedRf2, and its writes stay paused until the absent copy \
+             returns",
         ] {
             assert!(stalled.contains(part), "{part:?} missing from {stalled:?}");
         }
-        assert!(!stalled.contains("unproven="), "{stalled}");
+        assert!(!stalled.contains("never pinned"), "{stalled}");
+
+        // D7: node 2 proved generation 1 only after it landed it.
+        let node2 = |message: &str| {
+            logged!(METHOD, message)
+                .into_iter()
+                .filter(|line| line["node"] == 2 && line["generation"] == 1)
+                .map(|line| line["@t"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let landed = node2("recovered_landed");
+        let proved = node2("sync_proven");
+        assert_eq!(landed.len(), 1, "node 2 landed generation 1 once");
+        assert!(
+            !proved.is_empty() && proved.iter().all(|at| *at > landed[0]),
+            "node 2 proved generation 1 at {proved:?}, landed it at {landed:?}"
+        );
+    }
+
+    /// F8, the host half (K1 ruling, condition 5): in `DegradedRf2` with copy 2 away, F1 names
+    /// it again at every deadline, and the host prints its stall once. Each deadline re-asks
+    /// copy 2, which the host logs as `rebuild_pinned`, so the row counts deadlines from the log
+    /// rather than assuming them from elapsed time. Mutant M26 (report at every naming) fails it.
+    #[config_log::retcd_test]
+    fn a_degraded_stall_is_printed_once_across_three_deadlines() {
+        const METHOD: &str = "a_degraded_stall_is_printed_once_across_three_deadlines";
+        let asks_of_copy_2 = || {
+            logged!(METHOD, "rebuild_pinned")
+                .into_iter()
+                .filter(|line| line["node"] == 1 && line["copy"] == 2)
+                .count()
+        };
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            host.budgets.discovery_window_millis = test_discovery_window_millis();
+            host.rebuild_pin_wait_millis = 50;
+        });
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        let stalled = trio.until("a stall line", |trio| trio.status(0).stalled);
+
+        // The commit's ask and three deadlines' asks; the log is read every 50 ms, not per step.
+        let mut read = Instant::now();
+        trio.until("three more of F1's deadlines", |_| {
+            if read.elapsed() < Duration::from_millis(50) {
+                return None;
+            }
+            read = Instant::now();
+            (asks_of_copy_2() >= 4).then_some(())
+        });
+        assert_eq!(
+            trio.status(0).stalled,
+            Some(stalled),
+            "the line stays as printed"
+        );
+        let logged = logged!(METHOD, "recovery_rebuild_stalled");
+        assert_eq!(logged.len(), 1, "one line across the deadlines: {logged:?}");
+        assert_eq!(logged[0]["@l"], "Error", "{}", logged[0]);
+    }
+
+    /// K1 ruling, condition 6: no stall line says writes are paused while L1 admits them, and
+    /// a rebuild that never pinned is not reported at all then. M9 reaches neither: K1 pins
+    /// every cutoff-0 commit, and an unheard copy pauses writes (B-R38). So the watch is set by
+    /// hand on an `Active`, admitting node, and each report is asked for directly.
+    #[test]
+    fn a_stall_line_never_says_writes_are_paused_while_they_are_admitted() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.status(0).admits, Some(true), "L1 admits writes");
+        let partition = PartitionId(1);
+        let host = &mut trio.nodes[0].0;
+        let generation = Generation(9);
+        host.rebuilds.insert(
+            partition,
+            RebuildWatch {
+                generation,
+                mode: PartitionMode::DegradedRf2,
+                cutoff: Seq(1),
+                required: vec![CopyId(0), CopyId(1), CopyId(2)],
+                since: host.clock.now(),
+                pinned: false,
+                unproven: BTreeSet::new(),
+                unreported: false,
+            },
+        );
+
+        host.rebuild_check(partition, generation);
+        assert_eq!(
+            host.stalled.get(&partition),
+            None,
+            "never-pinned while admitting"
+        );
+
+        let watch = host.rebuilds.get_mut(&partition).expect("watch");
+        watch.pinned = true;
+        watch.unproven.insert(CopyId(2));
+        watch.unreported = true;
+        host.report_unproven();
+        let line = host.stalled.get(&partition).expect("the pinned stall line");
+        assert!(
+            line.ends_with("so the partition stays DegradedRf2 and does not activate"),
+            "{line}"
+        );
     }
 
     /// A node that faults answers every waiting caller instead of leaving it hanging, and a
