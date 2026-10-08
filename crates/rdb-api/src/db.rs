@@ -633,7 +633,7 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: crate::host::TEST_DISCOVERY_WINDOW_MILLIS,
+            discovery_window_millis: crate::host::test_discovery_window_millis(),
             resume_hold_millis: 50,
             warn_age_millis: 200,
             pause_age_millis: 400,
@@ -648,11 +648,12 @@ mod tests {
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
             .expect("open");
         let admits = |db: &Db| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let patience = crate::host::test_patience(Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + patience;
             while db.node_status().first().and_then(|node| node.admits) != Some(true) {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "node 1 does not admit writes within 5 s"
+                    "node 1 does not admit writes within {patience:?}"
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -722,7 +723,7 @@ mod tests {
             .expect("runtime");
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let budgets = Budgets {
-            discovery_window_millis: crate::host::TEST_DISCOVERY_WINDOW_MILLIS,
+            discovery_window_millis: crate::host::test_discovery_window_millis(),
             resume_hold_millis: 50,
             warn_age_millis: 1_000,
             pause_age_millis: 2_000,
@@ -740,11 +741,12 @@ mod tests {
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
             .expect("open");
         let admits = |db: &Db, phase: &str| {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let patience = crate::host::test_patience(Duration::from_secs(5));
+            let deadline = std::time::Instant::now() + patience;
             while db.node_status().first().and_then(|node| node.admits) != Some(true) {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "{phase}: node 1 does not admit writes within 5 s"
+                    "{phase}: node 1 does not admit writes within {patience:?}"
                 );
                 std::thread::sleep(Duration::from_millis(5));
             }

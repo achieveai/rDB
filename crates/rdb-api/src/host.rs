@@ -120,12 +120,24 @@ const AFFINITY: AffinityId = AffinityId(1);
 /// The longest the thread sleeps with nothing due, so a missed wake costs at most this.
 const IDLE_WAIT: Duration = Duration::from_millis(1_000);
 
-/// The discovery window the test rows run with, in place of the spec's 2 s. It is also the
-/// deadline of the control CAS that closes the window, and that CAS takes 20-30 ms on this
-/// host: at 20 ms, about 2 runs in 100 timed out to `BlockPromotion { reason: ControlUnknown }`
-/// and never reached `ready` (G2). This value keeps that margin with every row under 1 s.
+/// The discovery window the test rows run with, in place of the spec's 2 s: 100 ms, times
+/// `RETCD_TEST_DEADLINE_SCALE`. It is also the deadline of the control CAS that closes the
+/// window. That CAS takes 5-20 ms here, and up to ~80 ms with the suite running in parallel;
+/// past the deadline F1 blocks for good with `BlockPromotion { reason: ControlUnknown }`, and
+/// the row waits out its patience for a commit that cannot come (G2 at 20 ms; at 100 ms on a
+/// host also running a coverage build, 2026-10-07). So it stretches with the scale, as the
+/// waits do.
 #[cfg(test)]
-pub(crate) const TEST_DISCOVERY_WINDOW_MILLIS: u64 = 100;
+pub(crate) fn test_discovery_window_millis() -> u64 {
+    100 * u64::from(config_testkit::poll::deadline_scale())
+}
+
+/// How long a test row waits for a state it expects: `base`, times `RETCD_TEST_DEADLINE_SCALE`,
+/// as the cluster rows' deadlines are. A wait, never a sleep.
+#[cfg(test)]
+pub(crate) fn test_patience(base: Duration) -> Duration {
+    base * config_testkit::poll::deadline_scale()
+}
 
 /// A message to a node thread.
 #[derive(Debug)]
@@ -2909,7 +2921,7 @@ mod tests {
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
         // The walk, faster: F1's deadline is the discovery window. The never-pinned watch is
         // pushed out of reach, so only F1's own report can produce the line.
-        host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
+        host.budgets.discovery_window_millis = test_discovery_window_millis();
         host.rebuild_pin_wait_millis = 60_000;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -2925,13 +2937,17 @@ mod tests {
             }
         };
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let patience = test_patience(Duration::from_secs(5));
+        let deadline = Instant::now() + patience;
         let stalled = loop {
             step(&mut host);
             if let Some(line) = host.status(partition).stalled {
                 break line;
             }
-            assert!(Instant::now() < deadline, "no stall reported within 5 s");
+            assert!(
+                Instant::now() < deadline,
+                "no stall reported within {patience:?}"
+            );
         };
         assert!(host.rebuilds[&partition].pinned, "F1 pinned at the commit");
         assert_eq!(
@@ -2964,7 +2980,7 @@ mod tests {
     fn an_active_commit_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
+            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.rebuild_pin_wait_millis = 50;
         });
         trio.bootstrap();
@@ -2993,7 +3009,7 @@ mod tests {
     /// cutoff 0), then the `SyncWalThrough` F1 sends at commit, through the host's own effect
     /// path. Since the D2 kernel step F1 also names the held copies at its deadline, so a stall
     /// line does appear; this row pins only that it is never the never-pinned one.
-    #[test]
+    #[config_log::retcd_test]
     fn a_rebuild_pinned_by_its_post_commit_sync_is_never_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
@@ -3012,7 +3028,7 @@ mod tests {
             ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
         let clock = HostClock::start();
         let mut host = Host::new(NodeId(1), engine, links, control, clock);
-        host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
+        host.budgets.discovery_window_millis = test_discovery_window_millis();
         host.rebuild_pin_wait_millis = 50;
         rt.block_on(crate::admin::bootstrap(&store, clock.now(), |msg| {
             tx.send(msg).map_err(|_| NodeStopped(NodeId(1)))
@@ -3034,9 +3050,13 @@ mod tests {
                 host.handle(msg);
             }
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let patience = test_patience(Duration::from_secs(5));
+        let deadline = Instant::now() + patience;
         while !host.rebuilds.contains_key(&partition) {
-            assert!(Instant::now() < deadline, "no rebuild watch within 5 s");
+            assert!(
+                Instant::now() < deadline,
+                "no rebuild watch within {patience:?}"
+            );
             step(&mut host);
         }
         assert_eq!(
@@ -3083,7 +3103,7 @@ mod tests {
     fn a_secondary_reports_the_lineage_and_head_its_receiver_holds() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS
+            host.budgets.discovery_window_millis = test_discovery_window_millis()
         });
         let partition = PartitionId(1);
         for (host, _, _) in &trio.nodes {
@@ -3347,7 +3367,7 @@ mod tests {
     fn a_degraded_commit_whose_rebuild_never_pins_is_reported_stalled() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
-            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
+            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.rebuild_pin_wait_millis = 50;
         });
         trio.links.hold(NodeId(1), NodeId(3));
@@ -3786,7 +3806,8 @@ mod tests {
     }
 
     impl Trio {
-        /// Every row gives up after this long; a healthy one takes well under a second.
+        /// Every row gives up after this long, times the deadline scale; a healthy one takes well
+        /// under a second.
         const PATIENCE: Duration = Duration::from_secs(5);
         /// [`Self::fast_pause`]'s L1 pause age: the spec's 2,000 ms, shortened.
         const PAUSE_AGE_MILLIS: u64 = 400;
@@ -3832,7 +3853,7 @@ mod tests {
         /// The spec's budgets, shortened so a start reaches `ready` in well under a second:
         /// the discovery window and L1's resume hold are most of the 7.6 s a walk waits.
         fn fast(host: &mut Host) {
-            host.budgets.discovery_window_millis = TEST_DISCOVERY_WINDOW_MILLIS;
+            host.budgets.discovery_window_millis = test_discovery_window_millis();
             host.budgets.resume_hold_millis = 50;
         }
 
@@ -3869,7 +3890,8 @@ mod tests {
 
         /// Step until `done` answers, or fail naming `what` after [`Self::PATIENCE`].
         fn until<T>(&mut self, what: &str, mut done: impl FnMut(&Self) -> Option<T>) -> T {
-            let deadline = Instant::now() + Self::PATIENCE;
+            let patience = test_patience(Self::PATIENCE);
+            let deadline = Instant::now() + patience;
             loop {
                 self.step();
                 if let Some(found) = done(self) {
@@ -3878,7 +3900,7 @@ mod tests {
                 assert!(
                     Instant::now() < deadline,
                     "not within {:?}: {what}",
-                    Self::PATIENCE
+                    patience
                 );
                 std::thread::sleep(Duration::from_millis(1));
             }
