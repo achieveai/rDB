@@ -120,6 +120,12 @@ pub const STUCK_RESENDS: u32 = 15;
 /// `UNKNOWN_OUTCOME` and a read as `INVALID_ARGUMENT`; neither is sent.
 pub const MAX_QUEUED_PER_IDENTITY: usize = 4;
 
+/// How long past its request's deadline (`remaining_millis`) a put's waiter is kept before it
+/// expires as `UNKNOWN_OUTCOME` (F-014). P1 may withhold a published put's reply for good, at
+/// a denied Reply check, a fence or a new lineage, and nothing else answers that waiter. The
+/// margin keeps a reply that is merely late from losing the race.
+pub const TXN_WAITER_MARGIN_MILLIS: u64 = 500;
+
 /// The only affinity S0 writes in.
 const AFFINITY: AffinityId = AffinityId(1);
 
@@ -565,6 +571,12 @@ enum Delayed {
         partition: PartitionId,
         generation: Generation,
     },
+    /// A put's waiter reaches its deadline plus [`TXN_WAITER_MARGIN_MILLIS`]: it expires if
+    /// it is still the one sent as `event`.
+    TxnExpiry {
+        identity: RequestIdentity,
+        event: EventId,
+    },
 }
 
 /// A recovery this node's F1 committed below `Active`, watched until it activates (D2).
@@ -619,6 +631,9 @@ struct HostedL1 {
 struct Pending {
     reply: Sender<Answer>,
     kind: PendingKind,
+    /// The event that sent it, so a [`Delayed::TxnExpiry`] meets only its own waiter.
+    event: EventId,
+    since: Tick,
 }
 
 #[derive(Debug)]
@@ -626,7 +641,6 @@ enum PendingKind {
     Txn(TxnRequest),
     Read(RootKey),
     Previous(RootKey),
-    Status,
 }
 
 /// Why a step produced no effects.
@@ -696,6 +710,11 @@ struct Host {
     /// is sent once the one before it is answered (F-002). At most
     /// [`MAX_QUEUED_PER_IDENTITY`] per identity.
     queued: BTreeMap<RequestIdentity, VecDeque<Client>>,
+    /// Status queries sent and not yet stepped, by their event. Never in `pending`, so never
+    /// behind a write (F-014): P1 answers one in the step that takes it.
+    statuses: BTreeMap<EventId, (RequestIdentity, Sender<Answer>)>,
+    /// The status query whose event is being stepped, until P1's answer takes it.
+    answering: Option<(RequestIdentity, Sender<Answer>)>,
     plans: BTreeMap<PartitionId, RecoveryPlan>,
     committed: BTreeMap<PartitionId, Box<RecoveryResult>>,
     landed: BTreeSet<(PartitionId, Generation)>,
@@ -718,6 +737,10 @@ struct Host {
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
+    /// A1's answers to P1's Reply check are denied, as a lease expired since publication would
+    /// be, so P1 withholds the reply (F-014 rows).
+    #[cfg(test)]
+    deny_reply_checks: bool,
 }
 
 impl Host {
@@ -756,6 +779,8 @@ impl Host {
             bound: BTreeMap::new(),
             pending: BTreeMap::new(),
             queued: BTreeMap::new(),
+            statuses: BTreeMap::new(),
+            answering: None,
             plans: BTreeMap::new(),
             committed: BTreeMap::new(),
             landed: BTreeSet::new(),
@@ -769,6 +794,8 @@ impl Host {
             fault: None,
             #[cfg(test)]
             fail_step_view: false,
+            #[cfg(test)]
+            deny_reply_checks: false,
         }
     }
 
@@ -955,7 +982,7 @@ impl Host {
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
-                PendingKind::Read(_) | PendingKind::Previous(_) | PendingKind::Status => None,
+                PendingKind::Read(_) | PendingKind::Previous(_) => None,
             };
             tracing::info!(
                 node = self.node.0,
@@ -979,6 +1006,18 @@ impl Host {
                     request: None,
                 });
             }
+        }
+        let statuses = std::mem::take(&mut self.statuses).into_values();
+        for (identity, reply) in statuses.chain(self.answering.take()) {
+            tracing::info!(
+                node = self.node.0,
+                request = identity.request.0,
+                "status_failed_by_fault"
+            );
+            let _ = reply.send(Answer::Error {
+                error: ApiError::host(&detail),
+                request: None,
+            });
         }
         for (key, (asker, _, _)) in std::mem::take(&mut self.deferred_syncs) {
             self.drop_deferred_sync(key, asker, "fault");
@@ -1056,6 +1095,7 @@ impl Host {
                     self.rebuild_check(partition, generation);
                     Ok(())
                 }
+                Delayed::TxnExpiry { identity, event } => self.expire_txn(identity, event, now),
             };
             if let Err(detail) = outcome {
                 self.set_fault(detail);
@@ -1112,6 +1152,54 @@ impl Host {
         Ok(())
     }
 
+    /// F-014: the put sent as `event` still waits at its deadline plus the margin, so P1 has
+    /// withheld its reply or never will send one. Its caller is told `UNKNOWN_OUTCOME` with the
+    /// request, to ask `status`, and the calls queued behind it go on.
+    fn expire_txn(
+        &mut self,
+        identity: RequestIdentity,
+        event: EventId,
+        now: Tick,
+    ) -> Result<(), String> {
+        let Entry::Occupied(waiter) = self.pending.entry(identity) else {
+            return Ok(());
+        };
+        if waiter.get().event != event {
+            return Ok(());
+        }
+        let pending = waiter.remove();
+        let PendingKind::Txn(request) = pending.kind else {
+            return Err(fail_waiter(
+                &pending.reply,
+                format!(
+                    "a put's expiry met request {}'s {:?}",
+                    identity.request.0, pending.kind
+                ),
+            ));
+        };
+        let age_ms = now.0.saturating_sub(pending.since.0);
+        tracing::warn!(
+            node = self.node.0,
+            tenant = identity.tenant.0,
+            client = identity.client.0,
+            request = identity.request.0,
+            age_ms,
+            remaining_ms = request.remaining_millis,
+            "txn_waiter_expired"
+        );
+        let _ = pending.reply.send(Answer::Error {
+            error: ApiError::new(
+                ErrorKind::UnknownOutcome,
+                format!(
+                    "request {} had no reply {age_ms} ms after it was sent; ask its status",
+                    identity.request.0
+                ),
+            ),
+            request: Some(request),
+        });
+        self.release_queued(identity)
+    }
+
     fn delay(&mut self, at: Tick, item: Delayed) {
         self.delayed.insert((at, self.next_delayed), item);
         self.next_delayed += 1;
@@ -1164,6 +1252,8 @@ impl Host {
             routed,
             addressed,
         } = queued;
+        #[cfg(test)]
+        let event = self.deny_reply_check(event);
         if let EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(plan))) = &event.kind {
             self.plans.insert(event.partition, (**plan).clone());
         }
@@ -1176,6 +1266,7 @@ impl Host {
             Some(module) => vec![module],
             None => order.to_vec(),
         };
+        self.answering = self.statuses.remove(&event.id);
         for module in offers {
             match self.offer(module, &event) {
                 Ok(effects) => {
@@ -1199,7 +1290,31 @@ impl Host {
                 Err(StepError::Host(detail)) => return Err(detail),
             }
         }
+        // P1 answers a status query in the step that takes it, START_RECORD included.
+        if let Some((identity, reply)) = self.answering.take() {
+            return Err(fail_waiter(
+                &reply,
+                format!(
+                    "no module answered request {}'s status query",
+                    identity.request.0
+                ),
+            ));
+        }
         Ok(())
+    }
+
+    /// [`Self::deny_reply_checks`]: A1's answer to P1's Reply check, turned into a deny.
+    #[cfg(test)]
+    fn deny_reply_check(&self, mut event: Event) -> Event {
+        use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, DenyReason, Verdict};
+        if let EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Answer(answer))) =
+            &mut event.kind
+        {
+            if self.deny_reply_checks && answer.checkpoint == Checkpoint::Reply {
+                answer.verdict = Verdict::Deny(DenyReason::Expired);
+            }
+        }
+        event
     }
 
     /// Step `module` with the adopted triple, and T1 and P1 with the step view.
@@ -2404,13 +2519,13 @@ impl Host {
     fn client(&mut self, client: Client) -> Result<(), String> {
         // One waiter per identity (F-002): a call under an identity whose earlier call still
         // waits is sent once that one is answered, never in its place. A compile waits on
-        // nothing, so it never queues.
+        // nothing, so it never queues. Nor does a status query (F-014): P1 answers it in the
+        // step that takes it, and it is how a caller resolves a put that may never be answered.
         let identity = match &client.call {
-            ClientCall::Compile { .. } => None,
+            ClientCall::Compile { .. } | ClientCall::Status { .. } => None,
             ClientCall::Put { identity, .. }
             | ClientCall::Get { identity, .. }
-            | ClientCall::GetPrevious { identity, .. }
-            | ClientCall::Status { identity, .. } => Some(*identity),
+            | ClientCall::GetPrevious { identity, .. } => Some(*identity),
             ClientCall::Resend { request } => Some(request.identity),
         };
         if let Some(identity) = identity.filter(|id| self.pending.contains_key(id)) {
@@ -2481,7 +2596,7 @@ impl Host {
                 Ok(request) => (
                     identity,
                     EventKind::Client(ClientEvent::Submit(request.clone())),
-                    PendingKind::Txn(request),
+                    Some(PendingKind::Txn(request)),
                 ),
                 Err(error) => {
                     let _ = reply.send(Answer::Error {
@@ -2528,7 +2643,7 @@ impl Host {
             ClientCall::Resend { request } => (
                 request.identity,
                 EventKind::Client(ClientEvent::Submit(request.clone())),
-                PendingKind::Txn(request),
+                Some(PendingKind::Txn(request)),
             ),
             ClientCall::Get { identity, object } => {
                 let root = root_key(identity.tenant, AFFINITY, &object);
@@ -2538,7 +2653,7 @@ impl Host {
                         identity,
                         key: root.to_bytes(),
                     }),
-                    PendingKind::Read(root),
+                    Some(PendingKind::Read(root)),
                 )
             }
             ClientCall::GetPrevious { identity, object } => (
@@ -2546,8 +2661,13 @@ impl Host {
                 EventKind::Kernel(KernelEvent::Publication(PublicationEvent::ReadPrevious {
                     identity,
                 })),
-                PendingKind::Previous(root_key(identity.tenant, AFFINITY, &object)),
+                Some(PendingKind::Previous(root_key(
+                    identity.tenant,
+                    AFFINITY,
+                    &object,
+                ))),
             ),
+            // No pending waiter: bound to its own event, in `statuses`.
             ClientCall::Status {
                 identity,
                 generation,
@@ -2557,7 +2677,7 @@ impl Host {
                     identity,
                     generation,
                 }),
-                PendingKind::Status,
+                None,
             ),
         };
         // The fence every sent put carries, so a log can show none goes out unfenced.
@@ -2578,19 +2698,39 @@ impl Host {
             expected_generation,
             "client_call"
         );
-        // No waiter is replaced: a call under an identity that has one was queued above.
-        self.pending.insert(
-            identity,
-            Pending {
-                reply,
-                kind: pending,
-            },
-        );
         let site = Site {
             partition,
             correlation: CorrelationId(identity.request.0),
         };
-        self.push(site, kind, false, None);
+        let queued = self.queued(site, kind, false, None);
+        let event = queued.event.id;
+        let since = queued.event.at;
+        match pending {
+            Some(kind) => {
+                if let PendingKind::Txn(request) = &kind {
+                    let at = since.plus_millis(
+                        request
+                            .remaining_millis
+                            .saturating_add(TXN_WAITER_MARGIN_MILLIS),
+                    );
+                    self.delay(at, Delayed::TxnExpiry { identity, event });
+                }
+                // No waiter is replaced: a call under an identity that has one was queued above.
+                self.pending.insert(
+                    identity,
+                    Pending {
+                        reply,
+                        kind,
+                        event,
+                        since,
+                    },
+                );
+            }
+            None => {
+                self.statuses.insert(event, (identity, reply));
+            }
+        }
+        self.queue.push_back(queued);
         Ok(())
     }
 
@@ -2646,6 +2786,38 @@ impl Host {
             | ReplyEffect::Read { identity, .. } => *identity,
         };
         tracing::info!(node = self.node.0, request = identity.request.0, reply = reply_name(reply), detail = ?reply, "reply");
+        // A status query's answer, or its refusal, goes to the query being stepped, never to a
+        // write waiting under the same identity (F-014).
+        let for_status = matches!(
+            reply,
+            ReplyEffect::Status { .. } | ReplyEffect::Failed { .. }
+        ) && self
+            .answering
+            .as_ref()
+            .is_some_and(|(asked, _)| *asked == identity);
+        if let Some((_, waiter)) = self.answering.take_if(|_| for_status) {
+            let answer = match reply {
+                ReplyEffect::Status { status, .. } => Answer::Status(*status),
+                ReplyEffect::Failed { error, .. } => Answer::Error {
+                    error: ApiError::from_kernel(error),
+                    request: None,
+                },
+                ReplyEffect::Transaction { .. } | ReplyEffect::Read { .. } => {
+                    return Err(fail_waiter(
+                        &waiter,
+                        format!("reply {} to a status query", reply_name(reply)),
+                    ));
+                }
+            };
+            let _ = waiter.send(answer);
+            return Ok(());
+        }
+        if let ReplyEffect::Status { .. } = reply {
+            return Err(format!(
+                "a status answer for request {} with no status query being stepped",
+                identity.request.0
+            ));
+        }
         let Some(pending) = self.pending.remove(&identity) else {
             tracing::debug!(
                 node = self.node.0,
@@ -2665,7 +2837,6 @@ impl Host {
                 error: ApiError::from_kernel(error),
                 request: None,
             },
-            (ReplyEffect::Status { status, .. }, PendingKind::Status) => Answer::Status(*status),
             (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root)) => self
                 .read_answer(partition, *outcome, *value, &root)
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?,
@@ -4228,6 +4399,8 @@ mod tests {
             Pending {
                 reply,
                 kind: PendingKind::Read(root),
+                event: EventId(0),
+                since: Tick(0),
             },
         );
         let fault = host
@@ -4322,13 +4495,24 @@ mod tests {
         let host = &mut trio.nodes[0].0;
         let root = root_key(TenantId(1), AFFINITY, b"a");
         let cases: [(&str, PendingKind); 3] = [
-            ("read reply to a status", PendingKind::Status),
+            // A status query is never a pending waiter since F-014, so the read reply meets a
+            // previous-view call instead.
+            (
+                "read reply to a previous-view call",
+                PendingKind::Previous(root.clone()),
+            ),
             ("previous view to a read", PendingKind::Read(root.clone())),
             ("unbound previous view", PendingKind::Previous(root)),
         ];
         for (n, (name, kind)) in (1u64..).zip(cases) {
             let (reply, answer) = mpsc::channel();
-            host.pending.insert(identity(n), Pending { reply, kind });
+            let waiter = Pending {
+                reply,
+                kind,
+                event: EventId(0),
+                since: Tick(0),
+            };
+            host.pending.insert(identity(n), waiter);
             let fault = if n == 1 {
                 host.reply(
                     PartitionId(1),
@@ -4371,8 +4555,10 @@ mod tests {
     /// replaced the waiter, so the older caller was answered by nobody, and a put over a read
     /// waiting at the barrier faulted the node.
     ///
-    /// - (a) Behind a put in flight: a status query, the same request resent, the same request
-    ///   resent by a caller that has already given up, and a changed payload. The changed
+    /// - (a) Behind a put in flight: the same request resent, the same request resent by a
+    ///   caller that has already given up, and a changed payload. A status query under the
+    ///   same identity does not queue (F-014, round 2 R1): it is answered at once, `Unknown`
+    ///   while the put is unpublished, and the put still waits. The changed
     ///   payload still ends in `REQUEST_ID_REUSE`, but only once the put is answered (here, at
     ///   the heal): queued, it waits for the first call's answer, where before it was refused
     ///   at once. The given-up caller's resend is still submitted, as its `UNKNOWN_OUTCOME`
@@ -4414,10 +4600,13 @@ mod tests {
         trio.until("node 1 applied request 10", |trio| {
             (trio.head() == Some(3)).then_some(())
         });
-        let status = trio.call(ClientCall::Status {
+        match trio.ask(ClientCall::Status {
             identity: identity(10),
             generation: None,
-        });
+        }) {
+            Answer::Status(TxnStatus::Unknown) => {}
+            other => panic!("status of request 10 while it waits: {other:?}"),
+        }
         let same = trio.call(ClientCall::Resend {
             request: compiled.clone(),
         });
@@ -4428,7 +4617,6 @@ mod tests {
         }
         for (name, waiter) in [
             ("the put", &first),
-            ("the status query", &status),
             ("the same request", &same),
             ("the changed payload", &changed),
         ] {
@@ -4438,10 +4626,6 @@ mod tests {
         match trio.answer(&first) {
             Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
             other => panic!("request 10: {other:?}"),
-        }
-        match trio.answer(&status) {
-            Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(3)),
-            other => panic!("status of request 10: {other:?}"),
         }
         match trio.answer(&same) {
             Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3), "the same transaction"),
@@ -4518,14 +4702,11 @@ mod tests {
         trio.until("node 1 applied request 30", |trio| {
             (trio.head() == Some(head + 1)).then_some(())
         });
-        let queued = trio.call(ClientCall::Status {
-            identity: identity(30),
-            generation: None,
-        });
+        let queued = trio.call(get(30, b"d"));
         for _ in 0..3 {
             trio.step();
         }
-        still_waits("the status behind put d", &queued);
+        still_waits("the get behind put d", &queued);
         let host = &mut trio.nodes[0].0;
         host.fail_step_view = true;
         let (reply, faulting) = mpsc::channel();
@@ -4537,7 +4718,7 @@ mod tests {
         assert!(host.fault.is_some(), "the node faulted");
         for (name, waiter) in [
             ("put d", &put_d),
-            ("the status behind it", &queued),
+            ("the get behind it", &queued),
             ("the faulting put", &faulting),
         ] {
             match waiter.try_recv() {
@@ -4547,7 +4728,7 @@ mod tests {
                 other => panic!("{name} is told the host faulted: {other:?}"),
             }
         }
-        assert_eq!(logged!(METHOD, "client_call_queued").len(), 6);
+        assert_eq!(logged!(METHOD, "client_call_queued").len(), 5);
     }
 
     /// F-002's bound: past [`MAX_QUEUED_PER_IDENTITY`] calls queued under one identity, the next
@@ -4631,6 +4812,89 @@ mod tests {
                 other => panic!("request 1: {other:?}"),
             }
         }
+    }
+
+    /// F-014 (round 2 R1): P1 may withhold a published put's reply for good (a Reply check A1
+    /// denies, a fence, a new lineage), and nothing else answers that waiter. Before, the waiter
+    /// held its identity forever and every later call under it queued behind, the status query
+    /// included: the one call that resolves an `UNKNOWN_OUTCOME` could never be answered.
+    /// Now a status query never queues behind a write, and a put's waiter expires at its
+    /// request's deadline plus [`TXN_WAITER_MARGIN_MILLIS`] as `UNKNOWN_OUTCOME`. Here A1
+    /// denies the Reply check: the status query answers `Resolved` at the put's seq while the
+    /// put still waits, the put expires, and a resend gets the published result again. The node
+    /// never faults (`Trio::step` checks).
+    #[config_log::retcd_test]
+    fn a_put_whose_reply_p1_withholds_expires_and_its_status_is_answered_meanwhile() {
+        const METHOD: &str =
+            "a_put_whose_reply_p1_withholds_expires_and_its_status_is_answered_meanwhile";
+        const REMAINING_MILLIS: u64 = 1_000;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let compiled = match trio.ask(ClientCall::Compile {
+            identity: identity(1),
+            object: Bytes::from_static(b"a"),
+            value: Bytes::from_static(b"1"),
+            if_version: None,
+            remaining_millis: REMAINING_MILLIS,
+        }) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 1: {other:?}"),
+        };
+        trio.nodes[0].0.deny_reply_checks = true;
+        let sent = Instant::now();
+        let put = trio.call(ClientCall::Resend {
+            request: compiled.clone(),
+        });
+        trio.until("node 1 applied request 1", |trio| {
+            (trio.head() == Some(2)).then_some(())
+        });
+        // Asked until P1 has published: before, its index answers `Unknown`. Each is answered
+        // while the put still waits, which a status queued behind the put never is.
+        let deadline = Instant::now() + test_patience(Trio::PATIENCE);
+        let status = loop {
+            let answer = trio.ask(ClientCall::Status {
+                identity: identity(1),
+                generation: None,
+            });
+            still_waits("the put whose reply P1 withheld", &put);
+            match answer {
+                Answer::Status(TxnStatus::Resolved(result)) => break result,
+                Answer::Status(TxnStatus::Unknown | TxnStatus::Unresolved { .. }) => {}
+                other => panic!("status of request 1: {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "request 1 never resolved");
+        };
+        assert_eq!(status.seq, Seq(2), "the status is the put's");
+
+        let expired = trio.answer(&put);
+        assert!(
+            sent.elapsed() >= Duration::from_millis(REMAINING_MILLIS),
+            "expired after {:?}, inside the request's deadline",
+            sent.elapsed()
+        );
+        match expired {
+            Answer::Error { error, request } => {
+                assert_eq!(
+                    (error.name(), error.retry, error.no_mutation),
+                    ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
+                    "{error:?}"
+                );
+                assert_eq!(request, Some(compiled.clone()), "the request comes back");
+            }
+            other => panic!("the withheld put expires: {other:?}"),
+        }
+        let logged = logged!(METHOD, "txn_waiter_expired");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert_eq!(logged[0]["request"], 1, "{}", logged[0]);
+
+        trio.nodes[0].0.deny_reply_checks = false;
+        match trio.ask(ClientCall::Resend { request: compiled }) {
+            Answer::Txn { result, .. } => assert_eq!(result, status, "the replayed result"),
+            other => panic!("request 1 resent after expiry: {other:?}"),
+        }
+        assert_eq!(trio.head(), Some(2), "request 1 published once");
     }
 
     /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct

@@ -949,8 +949,9 @@ mod tests {
 
     /// F-002 (S0 review), on threads: one `Db`, shared, as `rdb_dev`'s `put&` shares it. While
     /// a put waits for copies it cannot reach, a status query and a changed payload come under
-    /// its request id from two more threads. Each caller gets its own answer once the links
-    /// heal, and node 1 never faults. Case (b) of the host row, a put over a read waiting at
+    /// its request id from two more threads. Each caller gets its own answer, and node 1 never
+    /// faults. The changed payload waits for the heal; the status query never waits behind the
+    /// put (F-014), so it reads `Unknown` or, once the put has published, `Resolved`. Case (b) of the host row, a put over a read waiting at
     /// the barrier, is not repeated here: nothing a `Db` caller sees orders a read's arrival
     /// before a put's, so the host row steps it by hand. Nor does anything order the two calls
     /// before the heal: the put publishes only at R1's next retransmit, up to 100 ms after it,
@@ -1023,8 +1024,11 @@ mod tests {
 
         let put = putter.join().expect("putter").expect("the put publishes");
         assert_eq!((put.request, put.seq), (id, Seq(3)));
+        // Never queued behind the put (F-014): answered at once, before or after the heal lets
+        // the put publish, whichever comes first.
         match asker.join().expect("asker").expect("the status query") {
             TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(3)),
+            TxnStatus::Unknown => {}
             other => panic!("status of request 100: {other:?}"),
         }
         let changed = changer
