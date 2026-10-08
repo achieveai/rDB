@@ -254,10 +254,18 @@ already holds is not a new root. It is ADR-0009's activation re-emit, which chan
 So a receiver keeps its applied and accept heads, and asks the primary from its own head, when all
 of these hold: the generation is the one it holds, its head is above the cutoff, the cutoff lookup
 is `Match`, and it is neither quarantined nor retired. Any other receiver takes the path above. A
-quarantined receiver therefore still leaves quarantine only on `Recovered`, in the same generation
-or a new one. Before this, a partition that served `DegradedRf2` past the cutoff lost that tail on
+quarantined receiver leaves quarantine only on a new-generation `Recovered` (amended again below).
+Before this, a partition that served `DegradedRf2` past the cutoff lost that tail on
 every copy when the activation re-emit arrived. Rows: `m9_d3_03` keeps the head; `m9_d3_04`
 (quarantined), `m9_d3_05` (`Differs`) and `m9_d3_06` (retired) take the path above.
+
+**Amended again 2026-10-07 (M9 S0 ruling, item 3).** Quarantine is sticky across a
+same-generation re-emit. A quarantined receiver given a `Recovered` in the generation it holds
+truncates to the cutoff as above, but stays quarantined and answers `AlreadyDiverged`; the primary
+keeps it `diverged`. Quarantine clears only on a `Recovered` in a new generation, so `Recovered`
+is still the only event that clears it. Liveness: the kept-out copy is in L1's lost set, so lag
+protection resumes on the others (ADR-0006 §1). Rows: `m9_d3_04` (amended: truncates, stays
+quarantined), `m9_f2_a` (tracker), `m9_f2_00` and `m9_f2_01` (simulation).
 
 ### 5. The ACK predicate is computed from the pinned configuration
 
@@ -493,7 +501,7 @@ does not describe.
 | The designated sender is admitted wherever it sends | Holder ≠ leader: records from the holder under a credential with `sender == holder` are accepted at the elected leader and at every lagging holder; the two-survivor case with the recovering node holding the shorter prefix likewise — **gate V3** |
 | The root anchor is checked on a non-participant | A copy divergent at or below the cutoff that missed discovery receives `Recovered`: quarantined `DIVERGENT_HISTORY`, never `Match` on rule 9, never qualifies; a copy with `NotRetained` at the cutoff truncates and catches up by chain — **gate V3** |
 | Divergence proved on the catch-up side has one vector | `NeedPrefix` head digest `Differs`: the cursor emits `DivergenceDetected` only; the tracker's step emits exactly one `Alert` and one `CopyLost` and sets `diverged`; the copy's next ACK is dropped `DIVERGED_COPY` |
-| A same-generation re-emit keeps the receiver's head | A receiver in the generation it holds, above the cutoff, `Match`, not quarantined, not retired, keeps its head on `Recovered`; a quarantined, `Differs` or retired one is rewritten as before (`m9_d3_03`..`m9_d3_06`, amended 2026-10-07) |
+| A same-generation re-emit keeps the receiver's head | A receiver in the generation it holds, above the cutoff, `Match`, not quarantined, not retired, keeps its head on `Recovered`; a `Differs` or retired one is rewritten as before, and a quarantined one truncates but stays quarantined until a new generation (`m9_d3_03`..`m9_d3_06`, `m9_f2_a`, amended 2026-10-07) |
 | A quarantined copy is marked without an ACK | A copy quarantined at `Recovered` never ACKs; the cursor's `QUARANTINED` outcome reaches the tracker as `CopyQuarantined`, which sets `diverged` and emits exactly one `Alert` and one `CopyLost` |
 | Historical records catch a copy up across a generation change | Copy at seq 50; root committed with `base_seq = 100` under predecessor *g*; envelopes 51..100 carrying *g* are accepted and the copy reaches `CopyCaughtUp` at `(100, base_digest)`; 101 under *g+1* passes the normal ladder; a record at 100 whose digest is not `base_digest` quarantines — **gate V3** |
 | One generation of history only | A copy needing records older than `predecessor_generation` receives `SnapshotCatchupRequired`, never `STALE_GENERATION` |

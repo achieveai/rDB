@@ -286,6 +286,9 @@ already held now changes only the mode:
 - the publication module, on the lineage it already serves, keeps its published position, its
   pending candidate and the replies it owes. Its view still moves, at the unchanged position, and
   it drains waiting readers only when the mode actually changes.
+- a quarantined receiver truncates but stays quarantined, and the tracker keeps a diverged copy
+  diverged: quarantine clears only on a new-generation `Recovered` (M9 S0 ruling 2026-10-07,
+  item 3; ADR-0005 §4).
 
 The transaction and lag modules are unchanged. Rows: `m9_d3_00` (sim) and `m9_d3_01`..`m9_d3_08`.
 
@@ -473,7 +476,7 @@ consumer does not handle.
 | All three lone-survivor choices | Old primary, secondary 1, secondary 2 each as sole survivor: read-only mode, correct declared cutoff, `uncertain` set when a higher prefix was advertised — **V3** |
 | Three-copy rebuild barrier | `ACTIVE` only after `RecoveryBarrier::try_new` succeeds over three `DurableProof`s at the **same** cutoff digest; three proofs at three different histories are rejected — **V3** |
 | Degraded RF2 leaves degraded only on a barrier | The third copy catching up is not enough: `Rebuilding` stays until its proof passes `try_new`, then one CAS flips the record to `ACTIVE` — **V3** |
-| Quarantine is not cleared by the data path | A quarantined copy stays quarantined across a matching append, a restart and a catch-up; only `Recovered` clears it |
+| Quarantine is not cleared by the data path | A quarantined copy stays quarantined across a matching append, a restart and a catch-up; only `Recovered` clears it, and only one in a new generation: a same-generation re-emit truncates but keeps it quarantined (`m9_d3_04`, `m9_f2_a`, amended 2026-10-07) |
 | Returning stale owner never overrides | Post-commit, a longer-suffix owner is quarantined; its head seq is never compared |
 | Quarantined suffix retained | `QuarantineSuffix` emitted (named `RetainQuarantinedSuffix` before the §9 amendment, B-R68); no deletion effect exists in the module |
 

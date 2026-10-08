@@ -418,6 +418,10 @@ stateDiagram-v2
 | Health evaluation | Every 50 ms plus progress events | Idle partitions with no outstanding transactions do not become falsely unsafe |
 | Resume | All configured regular copies durable through paused prefix; lag below 250 ms for 5 s | No timer reset merely because a replica was renamed/replaced |
 
+"All configured regular copies" means those lag protection does not hold lost: ADR-rdb-0006 §1
+defines the lag domain as the copies minus self minus lost. The trace exports that set as
+`ProtectionState.lost_copy_set`, and INV-LAG reads it (M9 S0, 2026-10-07).
+
 Required copies are pinned by configuration version. Membership changes cannot erase old exposure: use a durable transition barrier and lineage checkpoint, then explicitly retire the old predicate. Export age and outstanding bytes separately.
 
 If no regular secondary can ACK, success stops immediately. The 2 s threshold is not permission to ACK locally for 2 s. Pausing does not retroactively protect old ACKs; after a long outage their age-at-loss can greatly exceed 2 s.
