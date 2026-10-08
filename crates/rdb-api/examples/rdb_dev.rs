@@ -379,8 +379,9 @@ fn holds_part(node: &NodeStatus) -> String {
     )
 }
 
-/// One command per line; the exit code is 1 when any command failed to parse. A background
-/// put runs on `scope`, so the run waits for it before shutting down.
+/// One command per line; the exit code is 1 when any command failed to parse, and 2 at once
+/// when a line cannot be read. A background put runs on `scope`, so the run waits for it before
+/// shutting down.
 fn repl<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     args: &Args,
@@ -402,11 +403,15 @@ fn repl<'scope, 'env>(
     let mut sent = Sent::default();
     let mut bad = false;
     for line in input.lines() {
-        let Ok(line) = line else { break };
-        let line = line.split('#').next().unwrap_or("").trim().to_owned();
-        if line.is_empty() {
-            continue;
-        }
+        let line = match command(line) {
+            Ok(Some(line)) => line,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::error!(error = %e, "repl_input_failed");
+                eprintln!("rdb_dev: {e}");
+                return ExitCode::from(2);
+            }
+        };
         if args.script.is_some() {
             say(&format!("> {line}"));
         }
@@ -526,6 +531,15 @@ fn repl<'scope, 'env>(
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// One input line as a command: `None` for a blank or comment-only line. An unreadable line
+/// is an error, never the end of input (F-007): a script that is not UTF-8, such as one
+/// PowerShell 5.1 wrote as UTF-16LE, otherwise ran nothing and exited 0.
+fn command(line: std::io::Result<String>) -> Result<Option<String>, String> {
+    let line = line.map_err(|e| format!("input: {e}; scripts must be UTF-8"))?;
+    let line = line.split('#').next().unwrap_or("").trim().to_owned();
+    Ok((!line.is_empty()).then_some(line))
 }
 
 /// Split a command line on spaces; `"..."` is one word, and `""` an empty one.
@@ -845,6 +859,30 @@ mod tests {
             !dir.exists(),
             "the failed open left {} behind",
             dir.display()
+        );
+    }
+
+    /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
+    /// input, so the run says so and exits 2 instead of running nothing and exiting 0. Unit.
+    #[test]
+    fn an_unreadable_line_is_an_input_error_not_the_end_of_input() {
+        let utf16le: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "put a 1\r\nquit\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes),
+            )
+            .collect();
+        let first = std::io::BufRead::lines(std::io::Cursor::new(utf16le))
+            .next()
+            .expect("one line");
+        let error = command(first).expect_err("a UTF-16LE line is not a command");
+        assert!(error.starts_with("input: "), "{error}");
+        assert_eq!(command(Ok("  # a comment".to_owned())), Ok(None));
+        assert_eq!(
+            command(Ok("put a 1 # set a".to_owned())),
+            Ok(Some("put a 1".to_owned()))
         );
     }
 }
