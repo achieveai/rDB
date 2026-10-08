@@ -133,7 +133,8 @@ pub enum StartRecord {
     NotOwed,
     /// Owed. Sent once T1 is `Open`, nothing is in flight, `next_seq` is 1 and T1 holds a view
     /// whose `authority_seq` is above `after` (rule 1), or, after a refusal, any view other
-    /// than the one that refused it (rule 2, review F-003).
+    /// than the one that refused it and at least one renew interval after the refusal (rule 2,
+    /// review F-003).
     Owed {
         /// The recovery's view, or the view a refused attempt was sent under (rule 2).
         after: u64,
