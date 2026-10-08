@@ -5371,6 +5371,100 @@ fn m9_s0_05_a_refused_start_record_is_sent_again_under_a_newer_view() {
     commit_and_publish_start(&mut h, c, 3);
 }
 
+/// M9 S0 rule 2, review F-003. A1 denies the start record for a reason that clears with no
+/// `authority_seq` bump: `ControlUnavailable` clears when a read finds the grant record or a
+/// renewal commits, `ClockSampleStale` when a fresh sample arrives. A1 republishes the view at
+/// the same `authority_seq` with a moved horizon on a committed renewal and on a moved sample
+/// (A-R54.1), and nothing else tells T1. The record is not sent again under the view that
+/// refused it, but the moved view sends it, it lands at seq 1, and the client's first write is
+/// seq 2.
+fn a_start_record_refused_for_a_deny_that_clears_without_a_bump_is_sent_again(deny: DenyReason) {
+    let mut h = H::live();
+    let at_two = |valid_through| {
+        kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+            GEN,
+            2,
+            valid_through,
+        ))))
+    };
+    let c = only_check(&h.step(at_two(4_000)));
+    let effects = h.step(start_answer(c, 2, Verdict::Deny(deny)));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [EffectKind::Kernel(KernelEffect::Ignored {
+                reason: KernelIgnoredReason::Error(_)
+            })]
+        ),
+        "refused {deny:?}, recorded, answered to nobody: {effects:?}"
+    );
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 2 });
+    assert_eq!(
+        h.step(at_two(4_000)),
+        vec![],
+        "not again under the refusing view"
+    );
+    let c = only_check(&h.step(at_two(4_500)));
+    commit_and_publish_start(&mut h, c, 2);
+    assert_eq!(h.k().next_seq(), Seq(2));
+
+    let c = h.admit(put(1, b"a", b"1"));
+    let effects = h.step(answer(c, 2, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected the client's batch, got {effects:?}");
+    };
+    assert_eq!(batch.seq, Seq(2), "the client's first write is seq 2");
+}
+
+#[retcd_test]
+fn m9_f003_00_a_start_record_refused_control_unavailable_is_sent_again_with_no_bump() {
+    a_start_record_refused_for_a_deny_that_clears_without_a_bump_is_sent_again(
+        DenyReason::ControlUnavailable,
+    );
+}
+
+#[retcd_test]
+fn m9_f003_01_a_start_record_refused_clock_sample_stale_is_sent_again_with_no_bump() {
+    a_start_record_refused_for_a_deny_that_clears_without_a_bump_is_sent_again(
+        DenyReason::ClockSampleStale,
+    );
+}
+
+/// M9 S0 rule 5 on the two arms of `on_recovered` that strand (review F-013). The start record's
+/// check is in flight when a recovery lands. A demotion answers it `NOT_PRIMARY` and a new
+/// generation answers it `GENERATION_CHANGED`, but nobody sent it: each refusal is recorded as
+/// ignored, never as a `Reply`. The new generation owes its own start record.
+#[retcd_test]
+fn m9_f013_00_a_start_record_stranded_by_a_recovery_is_answered_to_nobody() {
+    let mut h = H::live();
+    let _ = only_check(&h.step(push_view(2)));
+    assert_eq!(
+        h.step(recovered(
+            Generation(8),
+            0,
+            NodeId(99),
+            PartitionMode::Active
+        )),
+        vec![EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::Error(ErrorKind::NotPrimary)
+        })],
+        "demoted: the stranded start record is answered to nobody"
+    );
+    assert!(h.t1.kernel(NODE_A, PARTITION).is_none());
+
+    let mut h = H::live();
+    let _ = only_check(&h.step(push_view(2)));
+    assert_eq!(
+        h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active)),
+        vec![EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::Error(ErrorKind::GenerationChanged)
+        })],
+        "a new generation: the stranded start record is answered to nobody"
+    );
+    assert_eq!(h.k().lineage().generation, Generation(8));
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+}
+
 /// M9 S0 rule 1, the `next_seq` conjunct. When a client write already took seq 1 under the
 /// recovery's view (L1 allowing at once), the partition has its first record and a newer view
 /// sends no start record.

@@ -132,7 +132,8 @@ pub enum StartRecord {
     /// Not owed: the recovery's cutoff was not 0, or the record was sent and not refused.
     NotOwed,
     /// Owed. Sent once T1 is `Open`, nothing is in flight, `next_seq` is 1 and T1 holds a view
-    /// whose `authority_seq` is above `after` (rule 1).
+    /// whose `authority_seq` is above `after` (rule 1), or, after a refusal, any view other
+    /// than the one that refused it (rule 2, review F-003).
     Owed {
         /// The recovery's view, or the view a refused attempt was sent under (rule 2).
         after: u64,
@@ -389,6 +390,11 @@ pub struct TxnKernel {
     reasked_under: Option<u64>,
     /// The start record's state (M9 S0).
     start: StartRecord,
+    /// The whole view the start record was last sent under, `None` until it is first sent. A
+    /// refusal for a reason that clears with no `authority_seq` bump, `ControlUnavailable` or
+    /// `ClockSampleStale`, is followed by a view at the same `authority_seq` with a moved
+    /// horizon, and only that tells T1 (review F-003).
+    start_sent_under: Option<AuthorityView>,
 }
 
 impl TxnKernel {
@@ -587,6 +593,7 @@ impl TxnKernel {
             } else {
                 StartRecord::NotOwed
             },
+            start_sent_under: None,
         }
     }
 
@@ -637,10 +644,11 @@ impl TxnKernel {
     }
 
     /// The kernel's own start record answered to nobody (rule 5), and owed again when refused
-    /// (rule 2). A refusal at any boundary owes it under a view newer than the one it was sent
-    /// under, so a refusal never leaves the partition stuck and it is never sent again under the
-    /// view that refused it. Each refusal is recorded as ignored, with the error kind it would
-    /// have carried, and logged.
+    /// (rule 2). A refusal at any boundary owes it under any view other than the one it was sent
+    /// under: a newer one, or one A1 republished at the same `authority_seq` because the horizon
+    /// moved (review F-003). So a refusal never leaves the partition stuck, and it is never sent
+    /// again under the view that refused it. Each refusal is recorded as ignored, with the error
+    /// kind it would have carried, and logged.
     fn quiet(&mut self, effects: Vec<TxnEffect>) -> Vec<TxnEffect> {
         effects
             .into_iter()
@@ -671,6 +679,14 @@ impl TxnKernel {
     }
 
     /// Rule 1: send the start record when every condition holds at once.
+    ///
+    /// The view conjunct has two arms. Rule 1's: a view newer than `after`, so the first send
+    /// waits for a view newer than the recovery's. Rule 2's, once a send was refused: any view
+    /// other than the one it was sent under (review F-003). A1 republishes at the same
+    /// `authority_seq` exactly when the admission horizon moves (a committed renewal, an adopted
+    /// record, a moved sample; A-R54.1), which is what clears `ControlUnavailable` and
+    /// `ClockSampleStale`. Each such view allows one more attempt, so a deny that persists is
+    /// asked again at A1's publication cadence, never in a loop at one view.
     fn start_if_due(&mut self, ctx: &StepCtx<'_>) -> Vec<TxnEffect> {
         let StartRecord::Owed { after } = self.start else {
             return Vec::new();
@@ -678,16 +694,19 @@ impl TxnKernel {
         let Some(view) = self.authority else {
             return Vec::new();
         };
+        let moved = view.authority_seq > after
+            || self.start_sent_under.is_some_and(|refused| refused != view);
         if self.mode != QueueMode::Open
             || self.inflight.is_some()
             || self.next_seq != Seq::ZERO.next()
-            || view.authority_seq <= after
+            || !moved
         {
             return Vec::new();
         }
         self.start = StartRecord::Sent {
             under: view.authority_seq,
         };
+        self.start_sent_under = Some(view);
         let req = TxnRequest {
             api_version: API_VERSION,
             identity: RequestIdentity::START_RECORD,
@@ -1893,6 +1912,7 @@ mod tests {
             seed: None,
             reasked_under: None,
             start: super::StartRecord::NotOwed,
+            start_sent_under: None,
         }
     }
 
