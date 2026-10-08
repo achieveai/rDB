@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
-//!                                           [--hold 1-2,1-3]
+//!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
 //! ```
 //!
 //! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
@@ -70,6 +70,9 @@ struct Args {
     script: Option<PathBuf>,
     keep: bool,
     hold: Vec<(NodeId, NodeId)>,
+    /// How long a put waits for its answer. Short values reach the Db's own timeout,
+    /// before the kernel answers (walk w24).
+    put_timeout: Option<std::time::Duration>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -80,6 +83,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         script: None,
         keep: false,
         hold: Vec::new(),
+        put_timeout: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -88,6 +92,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--log-dir" => parsed.log_dir = PathBuf::from(value("--log-dir")?),
             "--script" => parsed.script = Some(PathBuf::from(value("--script")?)),
             "--keep" => parsed.keep = true,
+            "--put-timeout-ms" => {
+                let text = value("--put-timeout-ms")?;
+                let millis = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--put-timeout-ms takes a number, not {text:?}"))?;
+                parsed.put_timeout = Some(std::time::Duration::from_millis(millis));
+            }
             "--hold" => {
                 for pair in value("--hold")?.split(',') {
                     parsed.hold.push(parse_pair(pair)?);
@@ -174,7 +185,10 @@ fn run(args: &Args) -> ExitCode {
     let config = DbConfig {
         dir: args.dir.clone(),
         hold: args.hold.clone(),
-        timeouts: Timeouts::default(),
+        timeouts: Timeouts {
+            put: args.put_timeout.unwrap_or(Timeouts::default().put),
+            ..Timeouts::default()
+        },
     };
     let mut db = match rt.block_on(Db::open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,

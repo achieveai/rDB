@@ -258,6 +258,22 @@ pub enum ClientCall {
         /// The kernel deadline.
         remaining_millis: u64,
     },
+    /// Compile a put exactly as [`ClientCall::Put`] does, and answer [`Answer::Compiled`]
+    /// without sending it. The caller holds the request before anything is sent, so every
+    /// later outcome, its own timeout included, can hand it back for an unchanged
+    /// [`ClientCall::Resend`] (defect w24).
+    Compile {
+        /// The identity minted for it.
+        identity: RequestIdentity,
+        /// The object id.
+        object: Bytes,
+        /// The bytes.
+        value: Bytes,
+        /// Write only if the object is at this version.
+        if_version: Option<u64>,
+        /// The kernel deadline.
+        remaining_millis: u64,
+    },
     /// Send an earlier request again, unchanged.
     Resend {
         /// The request.
@@ -308,6 +324,8 @@ pub enum Answer {
         /// The position of that view.
         at: Seq,
     },
+    /// A put compiled and not sent. Send it with [`ClientCall::Resend`].
+    Compiled(TxnRequest),
     /// A status query was answered.
     Status(TxnStatus),
     /// The call failed.
@@ -2215,6 +2233,37 @@ impl Host {
                     return Ok(());
                 }
             },
+            ClientCall::Compile {
+                identity,
+                object,
+                value,
+                if_version,
+                remaining_millis,
+            } => {
+                let answer = match self.compile(
+                    partition,
+                    identity,
+                    &object,
+                    value,
+                    if_version,
+                    remaining_millis,
+                )? {
+                    Ok(request) => Answer::Compiled(request),
+                    Err(error) => Answer::Error {
+                        error,
+                        request: None,
+                    },
+                };
+                tracing::info!(
+                    node = self.node.0,
+                    partition = partition.0,
+                    request = identity.request.0,
+                    compiled = matches!(answer, Answer::Compiled(_)),
+                    "client_compile"
+                );
+                let _ = reply.send(answer);
+                return Ok(());
+            }
             ClientCall::Resend { request } => (
                 request.identity,
                 EventKind::Client(ClientEvent::Submit(request.clone())),

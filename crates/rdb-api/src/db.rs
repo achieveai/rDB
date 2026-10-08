@@ -149,7 +149,8 @@ fn wire_name(kind: ErrorKind) -> String {
 /// How long `Db` waits for each kind of call.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
-    /// A write: past this it is `UNKNOWN_OUTCOME`. Also the kernel deadline it is sent with.
+    /// A write: past this it is `UNKNOWN_OUTCOME`. Also the kernel deadline it is sent with, and
+    /// how long a fresh put waits for its compile, before anything is sent.
     pub put: Duration,
     /// A read or a status query.
     pub read: Duration,
@@ -353,7 +354,9 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// [`PutError`]: a §5.4 refusal, or `UNKNOWN_OUTCOME` when no answer came in time.
+    /// [`PutError`]: a §5.4 refusal, or `UNKNOWN_OUTCOME` when no answer came in time; that
+    /// error carries the request, ready to [`Db::resend`] unchanged. `UNAVAILABLE` with no
+    /// request when the put could not even be compiled in time: nothing was sent.
     pub fn put(
         &self,
         object: &[u8],
@@ -392,14 +395,37 @@ impl Db {
         value: &[u8],
         if_version: Option<u64>,
     ) -> Result<PutOk, PutError> {
-        let call = ClientCall::Put {
+        // Compile first, send second (defect w24): the request is in hand before anything is
+        // sent, so every outcome of the send, a timeout included, hands it back for an
+        // unchanged resend. A compile sends nothing, so a compile that does not answer is a
+        // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
+        let call = ClientCall::Compile {
             identity,
             object: Bytes::copy_from_slice(object),
             value: Bytes::copy_from_slice(value),
             if_version,
             remaining_millis: millis(self.timeouts.put),
         };
-        self.txn(identity, call)
+        let refused = |error| {
+            Err(PutError {
+                error,
+                request: None,
+            })
+        };
+        match self.call(call, self.timeouts.put) {
+            Some(Answer::Compiled(request)) => self.resend(request),
+            Some(Answer::Error { error, .. }) => refused(error),
+            Some(other) => refused(ApiError::host(&format!(
+                "a put compile was answered with {other:?}"
+            ))),
+            None => refused(ApiError::new(
+                ErrorKind::Unavailable,
+                format!(
+                    "no compile answer in {:?} for request {}: nothing was sent",
+                    self.timeouts.put, identity.request.0
+                ),
+            )),
+        }
     }
 
     /// Send `request` again, unchanged: same identity, same payload.
@@ -676,6 +702,82 @@ mod tests {
         assert_eq!(db.get(b"absent").expect("get absent").value, None);
         let absent = db.get_previous(b"absent").expect("get_previous absent");
         assert_eq!(absent.value, None);
+        db.shutdown();
+    }
+
+    /// Defect w24 (lead ruling, MATERIAL): every `UNKNOWN_OUTCOME` hands back a request the app
+    /// can resend unchanged, so the retry de-duplicates instead of applying twice. Here the
+    /// `Db` itself gives up: links 1-2 and 1-3 are held, so the put commits on node 1 and waits
+    /// for an acknowledgement past the 300 ms put timeout. Nothing answers it before then: the
+    /// kernel checks a deadline only at dispatch, and L1 pauses only at 2 s. After the heal,
+    /// resending the request applies once: `a` moves from version 2 to 3, never to 4.
+    /// Integration (~1 s): three node threads on wall-clock time.
+    #[config_log::retcd_test]
+    fn a_fresh_put_that_times_out_keeps_its_request_and_applies_once_when_resent() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            discovery_window_millis: 20,
+            resume_hold_millis: 50,
+            warn_age_millis: 1_000,
+            pause_age_millis: 2_000,
+            ..Budgets::SPEC_DEFAULTS
+        };
+        let config = DbConfig {
+            dir: dir.path().to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts {
+                put: Duration::from_millis(300),
+                read: Duration::from_secs(1),
+            },
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        let admits = |db: &Db, phase: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while db.node_status().first().and_then(|node| node.admits) != Some(true) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{phase}: node 1 does not admit writes within 5 s"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        admits(&db, "before the first put");
+        assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
+
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .put(b"a", b"2", None)
+            .expect_err("nothing answers in 300 ms");
+        assert_eq!(
+            (unknown.error.name(), unknown.error.retry),
+            ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus),
+            "{unknown:?}"
+        );
+        let request = unknown
+            .request
+            .expect("a put the Db gave up on still carries its request");
+        assert_eq!(request.identity.request, RequestId(2));
+
+        db.links().heal_all();
+        admits(&db, "after the heal");
+        let resent = db.resend(*request).expect("resend after the heal");
+        assert_eq!((resent.request, resent.seq), (RequestId(2), Seq(3)));
+        let read = db.get(b"a").expect("get a");
+        assert_eq!(
+            read.value,
+            Some((3, Bytes::from_static(b"2"))),
+            "applied once: version 2 to 3"
+        );
         db.shutdown();
     }
 
