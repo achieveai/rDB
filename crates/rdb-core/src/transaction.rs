@@ -132,7 +132,9 @@ pub enum StartRecord {
     /// Not owed: the recovery's cutoff was not 0, or the record was sent and not refused.
     NotOwed,
     /// Owed. Sent once T1 is `Open`, nothing is in flight, `next_seq` is 1 and T1 holds a view
-    /// whose `authority_seq` is above `after` (rule 1).
+    /// whose `authority_seq` is above `after` (rule 1), or, after a refusal, any view other
+    /// than the one that refused it and at least one renew interval after the refusal (rule 2,
+    /// review F-003).
     Owed {
         /// The recovery's view, or the view a refused attempt was sent under (rule 2).
         after: u64,
@@ -389,6 +391,14 @@ pub struct TxnKernel {
     reasked_under: Option<u64>,
     /// The start record's state (M9 S0).
     start: StartRecord,
+    /// The whole view the start record was last sent under, `None` until it is first sent. A
+    /// refusal for a reason that clears with no `authority_seq` bump, `ControlUnavailable` or
+    /// `ClockSampleStale`, is followed by a view at the same `authority_seq` with a moved
+    /// horizon, and only that tells T1 (review F-003).
+    start_sent_under: Option<AuthorityView>,
+    /// When the start record was last refused, `None` until it is. A send under such a
+    /// same-seq view waits one renew interval from it (review F-003, critic C1).
+    start_refused_at: Option<Tick>,
 }
 
 impl TxnKernel {
@@ -587,6 +597,8 @@ impl TxnKernel {
             } else {
                 StartRecord::NotOwed
             },
+            start_sent_under: None,
+            start_refused_at: None,
         }
     }
 
@@ -630,18 +642,24 @@ impl TxnKernel {
         // carries no refusal of the kernel's record, and every other row's does.
         let submit = matches!(event, TxnEvent::Submit(_));
         let row = self.row(ctx, event);
-        let mut out = if submit { row } else { self.quiet(row) };
+        let mut out = if submit {
+            row
+        } else {
+            self.quiet(ctx.now, row)
+        };
         let started = self.start_if_due(ctx);
-        out.extend(self.quiet(started));
+        out.extend(self.quiet(ctx.now, started));
         out
     }
 
     /// The kernel's own start record answered to nobody (rule 5), and owed again when refused
-    /// (rule 2). A refusal at any boundary owes it under a view newer than the one it was sent
-    /// under, so a refusal never leaves the partition stuck and it is never sent again under the
-    /// view that refused it. Each refusal is recorded as ignored, with the error kind it would
-    /// have carried, and logged.
-    fn quiet(&mut self, effects: Vec<TxnEffect>) -> Vec<TxnEffect> {
+    /// (rule 2). A refusal at any boundary owes it under any view other than the one it was sent
+    /// under: a newer one, or one A1 republished at the same `authority_seq` because the horizon
+    /// moved (review F-003). So a refusal never leaves the partition stuck, and it is never sent
+    /// again under the view that refused it. A refusal at `now` is remembered, which spaces a
+    /// same-seq re-send (see [`Self::start_if_due`]). Each refusal is recorded as ignored, with
+    /// the error kind it would have carried, and logged.
+    fn quiet(&mut self, now: Tick, effects: Vec<TxnEffect>) -> Vec<TxnEffect> {
         effects
             .into_iter()
             .map(|effect| {
@@ -657,6 +675,7 @@ impl TxnKernel {
                 }
                 if let StartRecord::Sent { under } = self.start {
                     self.start = StartRecord::Owed { after: under };
+                    self.start_refused_at = Some(now);
                 }
                 let error = rejection.error();
                 tracing::info!(
@@ -671,6 +690,16 @@ impl TxnKernel {
     }
 
     /// Rule 1: send the start record when every condition holds at once.
+    ///
+    /// The view conjunct has two arms. Rule 1's: a view newer than `after`, so the first send
+    /// waits for a view newer than the recovery's. Rule 2's, once a send was refused: a view
+    /// other than the one it was sent under, at least one renew interval after the refusal
+    /// (review F-003). A1 republishes at the same `authority_seq` whenever the admission horizon
+    /// moves (a committed renewal, an adopted record, a moved sample; A-R54.1), which is what
+    /// clears `ControlUnavailable` and `ClockSampleStale`. A moved sample is every A1 step at a
+    /// new millisecond, so the view alone would re-ask a deny that persists about once per
+    /// millisecond (critic C1). The spacing bounds that to one send per renew interval, and the
+    /// first changed view after it still sends at once.
     fn start_if_due(&mut self, ctx: &StepCtx<'_>) -> Vec<TxnEffect> {
         let StartRecord::Owed { after } = self.start else {
             return Vec::new();
@@ -678,16 +707,22 @@ impl TxnKernel {
         let Some(view) = self.authority else {
             return Vec::new();
         };
+        let spaced = self
+            .start_refused_at
+            .is_some_and(|at| ctx.now >= at.plus_millis(ctx.budgets.renew_millis));
+        let moved = view.authority_seq > after
+            || (spaced && self.start_sent_under.is_some_and(|refused| refused != view));
         if self.mode != QueueMode::Open
             || self.inflight.is_some()
             || self.next_seq != Seq::ZERO.next()
-            || view.authority_seq <= after
+            || !moved
         {
             return Vec::new();
         }
         self.start = StartRecord::Sent {
             under: view.authority_seq,
         };
+        self.start_sent_under = Some(view);
         let req = TxnRequest {
             api_version: API_VERSION,
             identity: RequestIdentity::START_RECORD,
@@ -1344,7 +1379,11 @@ impl TxnKernel {
     /// Everything waiting, answered with `error`, and the pre-apply inflight with it: what a
     /// recovery or a demotion owes the requests it strands. A `Dispatched` inflight gets no
     /// reply from T1 — P1 holds its outcome.
-    fn strand(&mut self, error: impl Fn(&Self, RequestIdentity) -> RdbError) -> Vec<TxnEffect> {
+    fn strand(
+        &mut self,
+        now: Tick,
+        error: impl Fn(&Self, RequestIdentity) -> RdbError,
+    ) -> Vec<TxnEffect> {
         let mut out = Vec::new();
         if let Some(Inflight::AwaitingDispatchCheck { admitted, .. }) = &self.inflight {
             let identity = admitted.req.identity;
@@ -1356,7 +1395,7 @@ impl TxnKernel {
         self.inflight = None;
         out.extend(self.drain(error));
         // The stranded check may be the kernel's own start record (M9 S0 rule 5).
-        self.quiet(out)
+        self.quiet(now, out)
     }
 }
 
@@ -1633,7 +1672,7 @@ impl Transaction {
         if primary != Some(ctx.node) {
             // Demotion: whatever was waiting is answered `NOT_PRIMARY` with the new primary.
             return match self.kernels.remove(&key) {
-                Some(mut demoted) => demoted.strand(|k, _| RdbError::NotPrimary {
+                Some(mut demoted) => demoted.strand(ctx.now, |k, _| RdbError::NotPrimary {
                     partition: k.lineage.partition,
                     hint: primary,
                 }),
@@ -1646,7 +1685,7 @@ impl Transaction {
                 self.kernels.insert(key, held);
                 return out;
             }
-            Some(mut held) => held.strand(|k, _| RdbError::GenerationChanged {
+            Some(mut held) => held.strand(ctx.now, |k, _| RdbError::GenerationChanged {
                 expected: k.lineage.generation,
                 current: generation,
             }),
@@ -1893,6 +1932,8 @@ mod tests {
             seed: None,
             reasked_under: None,
             start: super::StartRecord::NotOwed,
+            start_sent_under: None,
+            start_refused_at: None,
         }
     }
 

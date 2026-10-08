@@ -5371,6 +5371,193 @@ fn m9_s0_05_a_refused_start_record_is_sent_again_under_a_newer_view() {
     commit_and_publish_start(&mut h, c, 3);
 }
 
+/// M9 S0 rule 2, review F-003. A1 denies the start record for a reason that clears with no
+/// `authority_seq` bump: `ControlUnavailable` clears when a read finds the grant record or a
+/// renewal commits, `ClockSampleStale` when a fresh sample arrives. A1 republishes the view at
+/// the same `authority_seq` with a moved horizon on a committed renewal and on a moved sample
+/// (A-R54.1), and nothing else tells T1. The record is not sent again under the view that
+/// refused it, even one renew interval later, but the moved view after that interval sends it,
+/// it lands at seq 1, and the client's first write is seq 2.
+fn a_start_record_refused_for_a_deny_that_clears_without_a_bump_is_sent_again(deny: DenyReason) {
+    let mut h = H::live();
+    let at_two = |valid_through| {
+        kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+            GEN,
+            2,
+            valid_through,
+        ))))
+    };
+    let c = only_check(&h.step(at_two(4_000)));
+    let effects = h.step(start_answer(c, 2, Verdict::Deny(deny)));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [EffectKind::Kernel(KernelEffect::Ignored {
+                reason: KernelIgnoredReason::Error(_)
+            })]
+        ),
+        "refused {deny:?}, recorded, answered to nobody: {effects:?}"
+    );
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 2 });
+    assert_eq!(
+        h.step(at_two(4_000)),
+        vec![],
+        "not again under the refusing view"
+    );
+    h.now += BUDGETS.renew_millis;
+    assert_eq!(
+        h.step(at_two(4_000)),
+        vec![],
+        "not again under the refusing view, however late"
+    );
+    let c = only_check(&h.step(at_two(4_500)));
+    commit_and_publish_start(&mut h, c, 2);
+    assert_eq!(h.k().next_seq(), Seq(2));
+
+    let c = h.admit(put(1, b"a", b"1"));
+    let effects = h.step(answer(c, 2, Verdict::Admit));
+    let [EffectKind::Store(StoreEffect::Commit(batch))] = effects.as_slice() else {
+        panic!("expected the client's batch, got {effects:?}");
+    };
+    assert_eq!(batch.seq, Seq(2), "the client's first write is seq 2");
+}
+
+#[retcd_test]
+fn m9_f003_00_a_start_record_refused_control_unavailable_is_sent_again_with_no_bump() {
+    a_start_record_refused_for_a_deny_that_clears_without_a_bump_is_sent_again(
+        DenyReason::ControlUnavailable,
+    );
+}
+
+#[retcd_test]
+fn m9_f003_01_a_start_record_refused_clock_sample_stale_is_sent_again_with_no_bump() {
+    a_start_record_refused_for_a_deny_that_clears_without_a_bump_is_sent_again(
+        DenyReason::ClockSampleStale,
+    );
+}
+
+/// A view at seq 2 with horizon `valid_through`: a same-seq republish when only the horizon moves.
+fn view_at_two(valid_through: u64) -> Event {
+    kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        GEN,
+        2,
+        valid_through,
+    ))))
+}
+
+/// Review F-003, critic C1. After a refusal, a changed same-seq view sends the start record again
+/// only once a renew interval has passed since the refusal. A1 publishes such a view on every
+/// step at a new millisecond, so without the spacing a deny that persists is re-asked about once
+/// per millisecond. Views inside the interval send nothing; the first changed view at its end
+/// sends.
+#[retcd_test]
+fn m9_f003_02_a_refused_start_record_waits_one_renew_interval_for_a_changed_view() {
+    let mut h = H::live();
+    let refused_at = h.now;
+    let c = only_check(&h.step(view_at_two(4_000)));
+    let _ = h.step(start_answer(
+        c,
+        2,
+        Verdict::Deny(DenyReason::ControlUnavailable),
+    ));
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 2 });
+    for (late, valid_through) in [(1, 4_001), (250, 4_250), (BUDGETS.renew_millis - 1, 4_499)] {
+        h.now = refused_at + late;
+        assert_eq!(
+            h.step(view_at_two(valid_through)),
+            vec![],
+            "a changed view {late} ms after the refusal is inside the spacing"
+        );
+    }
+    h.now = refused_at + BUDGETS.renew_millis;
+    let c = only_check(&h.step(view_at_two(4_500)));
+    commit_and_publish_start(&mut h, c, 2);
+}
+
+/// Review F-003, critic C1: the rate bound. A deny that never clears is held for `N` renew
+/// intervals while a changed same-seq view arrives every millisecond, as A1 publishes one per
+/// step. Every check is refused at once. The start record is sent at most `N + 1` times: once at
+/// the start and once per interval.
+#[retcd_test]
+fn m9_f003_03_a_deny_that_persists_is_asked_at_most_once_per_renew_interval() {
+    const N: u64 = 4;
+    let mut h = H::live();
+    let start = h.now;
+    let mut sends = 0;
+    for t in start..=start + N * BUDGETS.renew_millis {
+        h.now = t;
+        let effects = h.step(view_at_two(100_000 + t));
+        if effects.is_empty() {
+            continue;
+        }
+        let c = only_check(&effects);
+        sends += 1;
+        let refused = h.step(start_answer(
+            c,
+            2,
+            Verdict::Deny(DenyReason::ControlUnavailable),
+        ));
+        assert!(
+            matches!(
+                refused.as_slice(),
+                [EffectKind::Kernel(KernelEffect::Ignored { .. })]
+            ),
+            "refused, answered to nobody: {refused:?}"
+        );
+    }
+    assert_eq!(h.k().next_seq(), Seq(1), "never admitted");
+    assert!(
+        sends <= N + 1,
+        "{sends} sends over {N} renew intervals: at most one per interval"
+    );
+    assert_eq!(
+        sends,
+        N + 1,
+        "and the deny is still asked once per interval"
+    );
+}
+
+/// M9 S0 rule 5 on the demotion arm of `on_recovered` (review F-013). The start record's check
+/// is in flight when a recovery pins another primary. The check is stranded with `NOT_PRIMARY`,
+/// but nobody sent it: the refusal is recorded as ignored, never as a `Reply`.
+#[retcd_test]
+fn m9_f013_00_a_start_record_stranded_by_a_demotion_is_answered_to_nobody() {
+    let mut h = H::live();
+    let _ = only_check(&h.step(push_view(2)));
+    assert_eq!(
+        h.step(recovered(
+            Generation(8),
+            0,
+            NodeId(99),
+            PartitionMode::Active
+        )),
+        vec![EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::Error(ErrorKind::NotPrimary)
+        })],
+        "demoted: the stranded start record is answered to nobody"
+    );
+    assert!(h.t1.kernel(NODE_A, PARTITION).is_none());
+}
+
+/// M9 S0 rule 5 on the new-generation arm of `on_recovered` (review F-013). The start record's
+/// check is in flight when a recovery of a newer generation lands on this node. The check is
+/// stranded with `GENERATION_CHANGED`, recorded as ignored, never as a `Reply`. The new
+/// generation owes its own start record.
+#[retcd_test]
+fn m9_f013_01_a_start_record_stranded_by_a_new_generation_is_answered_to_nobody() {
+    let mut h = H::live();
+    let _ = only_check(&h.step(push_view(2)));
+    assert_eq!(
+        h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active)),
+        vec![EffectKind::Kernel(KernelEffect::Ignored {
+            reason: KernelIgnoredReason::Error(ErrorKind::GenerationChanged)
+        })],
+        "a new generation: the stranded start record is answered to nobody"
+    );
+    assert_eq!(h.k().lineage().generation, Generation(8));
+    assert_eq!(h.k().start_record(), StartRecord::Owed { after: 1 });
+}
+
 /// M9 S0 rule 1, the `next_seq` conjunct. When a client write already took seq 1 under the
 /// recovery's view (L1 allowing at once), the partition has its first record and a newer view
 /// sends no start record.
