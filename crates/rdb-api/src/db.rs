@@ -264,7 +264,8 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// [`OpenError`].
+    /// [`OpenError`]. When a node fails to start or the bootstrap is refused, every node started
+    /// has stopped and `nodes/` is removed before it returns, so the same open can run again.
     pub async fn open(
         config: DbConfig,
         store: Arc<dyn ConfigStore>,
@@ -280,6 +281,25 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
+        Self::open_spawning(config, store, rt, |node, dir, links, control, clock| {
+            host::spawn_with(node, dir, links, control, clock, budgets)
+        })
+        .await
+    }
+
+    /// [`Self::open_with`] with `spawn` starting each node, so a crate test can fail one.
+    async fn open_spawning(
+        config: DbConfig,
+        store: Arc<dyn ConfigStore>,
+        rt: Handle,
+        spawn: impl Fn(
+            NodeId,
+            PathBuf,
+            Arc<Links>,
+            Arc<ControlAdapter>,
+            HostClock,
+        ) -> Result<NodeHandle, String>,
+    ) -> Result<Self, OpenError> {
         let nodes_dir = config.dir.join("nodes");
         if nodes_dir.exists() && std::fs::read_dir(&nodes_dir)?.next().is_some() {
             return Err(OpenError::NotEmpty(nodes_dir));
@@ -291,34 +311,65 @@ impl Db {
         for (a, b) in &config.hold {
             links.hold(*a, *b);
         }
-        let mut nodes = Vec::with_capacity(3);
-        for n in 1..=3u32 {
-            let node = NodeId(n);
-            let dir = nodes_dir.join(n.to_string());
-            let handle = host::spawn_with(
-                node,
-                dir,
-                Arc::clone(&links),
-                Arc::clone(&control),
-                clock,
-                budgets,
-            )
-            .map_err(OpenError::Node)?;
-            nodes.push(handle);
-        }
-        let db = Self {
-            nodes,
+        // Built before any node starts, so a failure below drops it: its `Drop` stops and joins
+        // the nodes started so far and shuts the control adapter down (F-004).
+        let mut db = Self {
+            nodes: Vec::with_capacity(3),
             links,
             control,
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
         };
-        let owner = db
+        match db.start(&nodes_dir, &store, spawn).await {
+            Ok(()) => Ok(db),
+            Err(error) => {
+                drop(db);
+                // F-005: the failed open leaves no node data, so the same open can run again.
+                if let Err(remove) = std::fs::remove_dir_all(&nodes_dir) {
+                    tracing::error!(
+                        dir = %nodes_dir.display(),
+                        error = %remove,
+                        open_error = %error,
+                        "open_unwind_remove_failed"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Start the three nodes under `nodes_dir`, then bootstrap partition 1 through node 1.
+    async fn start(
+        &mut self,
+        nodes_dir: &std::path::Path,
+        store: &Arc<dyn ConfigStore>,
+        spawn: impl Fn(
+            NodeId,
+            PathBuf,
+            Arc<Links>,
+            Arc<ControlAdapter>,
+            HostClock,
+        ) -> Result<NodeHandle, String>,
+    ) -> Result<(), OpenError> {
+        for n in 1..=3u32 {
+            let node = NodeId(n);
+            let dir = nodes_dir.join(n.to_string());
+            let handle = spawn(
+                node,
+                dir,
+                Arc::clone(&self.links),
+                Arc::clone(&self.control),
+                self.clock,
+            )
+            .map_err(OpenError::Node)?;
+            self.nodes.push(handle);
+        }
+        let owner = self
             .node(OWNER)
             .ok_or_else(|| OpenError::Node("no owner node".into()))?;
-        admin::bootstrap(&store, clock.now(), |msg| owner.send(msg)).await?;
-        Ok(db)
+        admin::bootstrap(store, self.clock.now(), |msg| owner.send(msg)).await?;
+        Ok(())
     }
 
     fn node(&self, node: NodeId) -> Option<&NodeHandle> {
@@ -1009,6 +1060,75 @@ mod tests {
             Err(other) => panic!("open over node data: {other}"),
             Ok(_) => panic!("open over node data succeeded"),
         }
+    }
+
+    /// F-004, F-005: an open that fails part-way leaves nothing running and nothing on disk, so
+    /// the same open can be tried again. (a) Node 2 fails to start after node 1 has: node 1 is
+    /// stopped and joined, and `nodes/` is removed. On Windows the removal is also the proof of
+    /// the join, because node 1's RocksDB `LOCK` keeps `nodes/1` from being deleted until its
+    /// thread drops the engine. A second open on the same directory then succeeds. (b) The
+    /// bootstrap is refused, because that second open already wrote `partitions/1`: all three
+    /// nodes are running by then, and the same unwind removes their directory.
+    /// Integration (~0.5 s): real node threads and RocksDB, no partition traffic.
+    #[test]
+    fn an_open_that_fails_part_way_unwinds_and_the_same_open_then_succeeds() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = |dir: &std::path::Path| DbConfig {
+            dir: dir.to_path_buf(),
+            hold: Vec::new(),
+            timeouts: Timeouts::default(),
+        };
+        let fail_node_2 = |node: NodeId, dir, links, control, clock| {
+            if node == NodeId(2) {
+                return Err("node 2: injected".to_owned());
+            }
+            host::spawn_with(node, dir, links, control, clock, Budgets::SPEC_DEFAULTS)
+        };
+
+        let failed = rt.block_on(Db::open_spawning(
+            config(dir.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+            fail_node_2,
+        ));
+        match failed {
+            Err(OpenError::Node(detail)) => assert_eq!(detail, "node 2: injected"),
+            Err(other) => panic!("(a) the open fails at node 2, not with: {other}"),
+            Ok(_) => panic!("(a) the open fails at node 2"),
+        }
+        assert!(
+            !dir.path().join("nodes").exists(),
+            "(a) the failed open removed nodes/ and node 1 released its lock"
+        );
+
+        let mut reopened = rt
+            .block_on(Db::open(
+                config(dir.path()),
+                Arc::clone(&store),
+                rt.handle().clone(),
+            ))
+            .expect("(a) the same open on the same directory succeeds");
+
+        let second = config_testkit::fs::temp_dir();
+        match rt.block_on(Db::open(
+            config(second.path()),
+            Arc::clone(&store),
+            rt.handle().clone(),
+        )) {
+            Err(OpenError::Bootstrap(admin::BootstrapError::AlreadyExists { .. })) => {}
+            Err(other) => panic!("(b) the bootstrap is refused, not: {other}"),
+            Ok(_) => panic!("(b) the bootstrap is refused: partitions/1 exists"),
+        }
+        assert!(
+            !second.path().join("nodes").exists(),
+            "(b) the refused bootstrap removed nodes/ and every node released its lock"
+        );
+        reopened.shutdown();
     }
 
     #[test]

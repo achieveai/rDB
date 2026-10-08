@@ -59,7 +59,7 @@ use bytes::Bytes;
 use config_core::{ConfigStore, ListRequest};
 use config_testkit::cluster::{Cluster, StorageKind};
 use rdb_api::host::NodeStatus;
-use rdb_api::{Db, DbConfig, PutError, Timeouts};
+use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts};
 use rdb_core::authority::grant::GrantRecord;
 use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::ids::{Generation, NodeId, RequestId};
@@ -163,12 +163,17 @@ fn main() -> ExitCode {
     if std::env::var_os("RETCD_TEST_DATA_DIR").is_none() {
         std::env::set_var("RETCD_TEST_DATA_DIR", args.dir.join("control"));
     }
-    let code = run(&args);
+    let code = run(&args, Db::open);
     drop(guard);
     code
 }
 
-fn run(args: &Args) -> ExitCode {
+/// The run, with `open` in place of [`Db::open`] so a row can fail it.
+fn run<Open, Opening>(args: &Args, open: Open) -> ExitCode
+where
+    Open: FnOnce(DbConfig, Arc<dyn ConfigStore>, tokio::runtime::Handle) -> Opening,
+    Opening: std::future::Future<Output = Result<Db, OpenError>>,
+{
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -192,11 +197,11 @@ fn run(args: &Args) -> ExitCode {
             ..Timeouts::default()
         },
     };
-    let mut db = match rt.block_on(Db::open(config, Arc::clone(&store), rt.handle().clone())) {
+    let mut db = match rt.block_on(open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("rdb_dev: open: {e}");
-            rt.block_on(cluster.shutdown());
+            close(store, cluster, rt, args);
             return ExitCode::from(1);
         }
     };
@@ -210,16 +215,21 @@ fn run(args: &Args) -> ExitCode {
         code
     });
     db.shutdown();
-    // The direct client holds the voter's store open: drop every handle on it before the
-    // cluster closes its stores, or their RocksDB files outlive the run.
     drop(db);
+    close(store, cluster, rt, args);
+    code
+}
+
+/// End the run once the Db is gone, whether it opened or not (F-006). The direct client holds
+/// the voter's store open: drop every handle on it before the cluster closes its stores, or
+/// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`.
+fn close(store: Arc<dyn ConfigStore>, cluster: Cluster, rt: tokio::runtime::Runtime, args: &Args) {
     drop(store);
     rt.block_on(cluster.shutdown());
     drop(rt);
     if !args.keep {
         remove(&args.dir);
     }
-    code
 }
 
 /// Remove `dir`, retrying for up to 2 s while Windows still holds a file the voters closed.
@@ -805,6 +815,36 @@ mod tests {
                 "stall cleared node=1 recovery=Committed recovered=1 admits=true".to_owned(),
                 format!("stalled node=1 {stall}"),
             ]
+        );
+    }
+
+    /// F-005, F-006: an open that fails tears the run down as a clean quit does, and without
+    /// `--keep` leaves no directory. The voters' data goes under `--dir`, as `main` puts it, so
+    /// the row also proves the order: a store handle still open when the voters close keeps
+    /// their RocksDB files, and on Windows `--dir` then cannot be removed.
+    /// Integration (~2 s): three real rEtcd voters; the Db open is the injected failure.
+    #[test]
+    fn an_open_that_fails_exits_1_and_leaves_no_directory() {
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        // As `main` does. This binary's other row reads no environment.
+        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
+        let args = Args {
+            dir: dir.clone(),
+            log_dir: root.path().join("logs"),
+            script: None,
+            keep: false,
+            hold: Vec::new(),
+            put_timeout: None,
+        };
+        let code = run(&args, |_, _, _| async {
+            Err(OpenError::Node("node 2: injected".to_owned()))
+        });
+        assert_eq!(code, ExitCode::from(1), "a failed open exits 1");
+        assert!(
+            !dir.exists(),
+            "the failed open left {} behind",
+            dir.display()
         );
     }
 }
