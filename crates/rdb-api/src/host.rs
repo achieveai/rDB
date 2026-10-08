@@ -116,7 +116,8 @@ pub const STUCK_RESENDS: u32 = 15;
 
 /// How many calls may queue under one identity behind the call that waits (F-002). A `Db`
 /// caller sends at most a status query and a resend while its put waits, and `put&` one more;
-/// 4 leaves one spare and still bounds a caller that loops.
+/// 4 leaves one spare and still bounds a caller that loops. Past it a write is refused as
+/// `UNKNOWN_OUTCOME` and a read as `INVALID_ARGUMENT`; neither is sent.
 pub const MAX_QUEUED_PER_IDENTITY: usize = 4;
 
 /// The only affinity S0 writes in.
@@ -2421,14 +2422,28 @@ impl Host {
                     queued = queue.len(),
                     "client_call_refused_queue_full"
                 );
-                let _ = client.reply.send(Answer::Error {
-                    error: ApiError::invalid(format!(
-                        "request {} already has {} calls waiting behind it; nothing was sent",
-                        identity.request.0,
-                        queue.len()
-                    )),
-                    request: None,
-                });
+                let detail = format!(
+                    "request {} already has {} calls waiting behind it; nothing was sent",
+                    identity.request.0,
+                    queue.len()
+                );
+                // A write past the bound is UNKNOWN_OUTCOME (round 2 R2): the call it queued
+                // behind may yet publish, so the caller must ask `status`, never conclude.
+                let answer = match client.call {
+                    ClientCall::Resend { request } => Answer::Error {
+                        error: ApiError::new(ErrorKind::UnknownOutcome, detail),
+                        request: Some(request),
+                    },
+                    ClientCall::Put { .. } => Answer::Error {
+                        error: ApiError::new(ErrorKind::UnknownOutcome, detail),
+                        request: None,
+                    },
+                    _ => Answer::Error {
+                        error: ApiError::invalid(detail),
+                        request: None,
+                    },
+                };
+                let _ = client.reply.send(answer);
                 return Ok(());
             }
             queue.push_back(client);
@@ -4533,31 +4548,65 @@ mod tests {
     }
 
     /// F-002's bound: past [`MAX_QUEUED_PER_IDENTITY`] calls queued under one identity, the next
-    /// is refused at once, definitively, and nothing of it is sent.
+    /// is refused at once and nothing of it is sent. A write past the bound is `UNKNOWN_OUTCOME`
+    /// (round 2 R2): the call it queued behind may yet publish, so the caller asks `status`. A
+    /// resend carries its request back; a put was never compiled, so it has none (the `Db`
+    /// sends every put as a resend). A read past the bound stays `INVALID_ARGUMENT`. The queued
+    /// resends are each answered with the one transaction once the heal lets it publish.
     #[test]
     fn a_call_past_the_queue_bound_for_its_identity_is_refused_and_sends_nothing() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), Trio::fast);
         trio.bootstrap();
         trio.ready();
+        let compiled = match trio.ask(ClientCall::Compile {
+            identity: identity(1),
+            object: Bytes::from_static(b"a"),
+            value: Bytes::from_static(b"1"),
+            if_version: None,
+            remaining_millis: 5_000,
+        }) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 1: {other:?}"),
+        };
         trio.links.hold(NodeId(1), NodeId(2));
         trio.links.hold(NodeId(1), NodeId(3));
-        let first = trio.call(put(1, b"a", b"1", None));
+        let resend = || ClientCall::Resend {
+            request: compiled.clone(),
+        };
+        let first = trio.call(resend());
         trio.until("node 1 applied request 1", |trio| {
             (trio.head() == Some(2)).then_some(())
         });
-        let status = || ClientCall::Status {
-            identity: identity(1),
-            generation: None,
-        };
         let queued: Vec<_> = (0..MAX_QUEUED_PER_IDENTITY)
-            .map(|_| trio.call(status()))
+            .map(|_| trio.call(resend()))
             .collect();
-        let refused = trio.call(status());
+        let past_resend = trio.call(resend());
+        let past_put = trio.call(put(1, b"a", b"1", None));
+        let past_get = trio.call(get(1, b"a"));
         for _ in 0..3 {
             trio.step();
         }
-        match refused.try_recv() {
+        for (name, waiter, request) in [
+            ("a resend", &past_resend, Some(compiled.clone())),
+            ("a put", &past_put, None),
+        ] {
+            match waiter.try_recv() {
+                Ok(Answer::Error {
+                    error,
+                    request: got,
+                }) => {
+                    assert_eq!(
+                        (error.name(), error.retry, error.no_mutation),
+                        ("UNKNOWN_OUTCOME".to_owned(), RetryRule::QueryStatus, false),
+                        "{name}: {error:?}"
+                    );
+                    assert_eq!(got, request, "{name}");
+                }
+                other => panic!("{name} past the bound is refused at once: {other:?}"),
+            }
+        }
+        match past_get.try_recv() {
             Ok(Answer::Error {
                 error,
                 request: None,
@@ -4566,21 +4615,17 @@ mod tests {
                 ("INVALID_ARGUMENT".to_owned(), RetryRule::Definitive, true),
                 "{error:?}"
             ),
-            other => panic!("the call past the bound is refused at once: {other:?}"),
+            other => panic!("a get past the bound is refused at once: {other:?}"),
         }
-        still_waits("the put", &first);
+        still_waits("the first resend", &first);
         for waiter in &queued {
-            still_waits("a queued status", waiter);
+            still_waits("a queued resend", waiter);
         }
         trio.links.heal_all();
-        match trio.answer(&first) {
-            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
-            other => panic!("request 1: {other:?}"),
-        }
-        for waiter in &queued {
+        for waiter in std::iter::once(&first).chain(&queued) {
             match trio.answer(waiter) {
-                Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(2)),
-                other => panic!("a queued status: {other:?}"),
+                Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+                other => panic!("request 1: {other:?}"),
             }
         }
     }
