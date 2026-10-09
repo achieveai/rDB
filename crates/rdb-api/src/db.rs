@@ -1719,7 +1719,8 @@ mod tests {
     /// re-entry, and an empty txn). Every put lands at one seq or none does; a refusal the
     /// compile makes carries no request, and one the kernel makes carries the request to
     /// resend. 4b, a deadline past 30 s, is the unit row above.
-    /// Integration (~1.5 s): three node threads; most of it is the open and readiness.
+    /// Integration (~3 s): three node threads; most of it is the open and readiness, which
+    /// no `Db` row can skip.
     #[test]
     fn a_txn_writes_every_put_at_one_seq_or_none_and_each_refusal_keeps_the_right_request() {
         let dir = config_testkit::fs::temp_dir();
@@ -1827,7 +1828,8 @@ mod tests {
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn
     /// fill it, and any new request is `OVERLOADED` and provably unapplied; a resend of either
     /// filled entry still replays its answer. Refused at open is the unit row above.
-    /// Integration (~1 s): three node threads; most of it is the open and readiness.
+    /// Integration (~3 s): three node threads; most of it is the open and readiness, which
+    /// no `Db` row can skip.
     #[test]
     fn a_full_dedup_cap_refuses_new_requests_and_still_replays_old_ones() {
         let dir = config_testkit::fs::temp_dir();
@@ -1873,7 +1875,7 @@ mod tests {
     /// two margins (G14: the detail is the host's). While it is unpublished, a second txn is
     /// refused `PROTECTION_PAUSED`; after the heal, both resends are admitted: the first
     /// replays its seq, the second takes the next one.
-    /// Integration (~2 s): three node threads, a real 600 ms expiry, and a heal. L1's pause is
+    /// Integration (~3.5 s): three node threads, a real 600 ms expiry, and a heal. L1's pause is
     /// set past the expiry so the host's answer is the one under test.
     #[test]
     fn a_txn_is_refused_while_another_is_unpublished_and_admitted_after_it_publishes() {
@@ -1928,7 +1930,8 @@ mod tests {
     /// committed can be refused `no_mutation=true` although its mutation is applied. A resend
     /// can never prove that, so every answer to `resend` and `resend_within` says
     /// `no_mutation=false`. The kind and retry rule stay the kernel's.
-    /// Integration (~1 s): three node threads; most of it is the open and readiness.
+    /// Integration (~3 s): three node threads; most of it is the open and readiness, which
+    /// no `Db` row can skip.
     #[test]
     fn a_resend_of_a_committed_txn_never_claims_no_mutation() {
         let dir = config_testkit::fs::temp_dir();
