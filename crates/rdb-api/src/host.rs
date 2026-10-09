@@ -4702,7 +4702,9 @@ mod tests {
     ///   payload still ends in `REQUEST_ID_REUSE`, but only once the put is answered (here, at
     ///   the heal): queued, it waits for the first call's answer, where before it was refused
     ///   at once. The given-up caller's resend is still submitted, as its `UNKNOWN_OUTCOME`
-    ///   allows, and publishes nothing more: the kernel de-duplicates it.
+    ///   allows, and publishes nothing more: the kernel de-duplicates it. A compile under the
+    ///   waiting identity does not queue either (S1 guard G11): it sends nothing, and it is
+    ///   how `retry N --payload` starts while request N still waits.
     /// - (b) A put under the identity of a read waiting at the barrier.
     /// - (c) A host fault answers the waiting call and every call queued behind it (F-001).
     #[config_log::retcd_test]
@@ -4740,6 +4742,14 @@ mod tests {
         }) {
             Answer::Status(TxnStatus::Unknown) => {}
             other => panic!("status of request 10 while it waits: {other:?}"),
+        }
+        let recompiled = trio.call(compile(10, b"a", b"3"));
+        for _ in 0..3 {
+            trio.step();
+        }
+        match recompiled.try_recv() {
+            Ok(Answer::Compiled(request)) => assert_eq!(request.identity, identity(10)),
+            other => panic!("a compile under the waiting request 10 is not queued: {other:?}"),
         }
         let same = trio.call(ClientCall::Resend {
             request: compiled.clone(),
