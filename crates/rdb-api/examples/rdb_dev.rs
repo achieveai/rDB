@@ -491,16 +491,11 @@ fn repl<'scope, 'env>(
                 });
             }),
             ["retry", rest @ .., "--payload", value] => {
-                sent.pick(rest).and_then(|(request, kind)| match kind {
-                    Kind::Put { object, if_version } => {
-                        let id = request.identity.request;
-                        put_line(db.put_as(id, &object, value.as_bytes(), if_version), None);
-                        Ok(())
-                    }
-                    Kind::Txn => Err(format!(
-                        "retry --payload changes a put's value; request {} was a txn",
-                        request.identity.request.0
-                    )),
+                sent.pick(rest).and_then(|(request, kind)| {
+                    let id = request.identity.request;
+                    let (object, if_version) = payload_put(kind, id)?;
+                    put_line(db.put_as(id, &object, value.as_bytes(), if_version), None);
+                    Ok(())
                 })
             }
             ["retry", rest @ .., "--deadline-ms", millis] => match millis.parse::<u64>() {
@@ -731,6 +726,18 @@ fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
             .map(Some)
             .map_err(|_| "--if-version takes a number".to_owned()),
         _ => Err("put <object> <value> [--if-version N]".to_owned()),
+    }
+}
+
+/// What `retry <id> --payload` re-puts: the object and condition of the put `request` was
+/// sent as. A txn has no single object, so it is refused (S1 guard G10).
+fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>), String> {
+    match kind {
+        Kind::Put { object, if_version } => Ok((object, if_version)),
+        Kind::Txn => Err(format!(
+            "retry --payload changes a put's value; request {} was a txn",
+            request.0
+        )),
     }
 }
 
@@ -1048,7 +1055,7 @@ mod tests {
     /// --deadline-ms 2000` published it at seq 3, and a plain `retry 4` then resent the
     /// deadline-0 request it was first sent with. Check 2 refused that before the dedup replay,
     /// so the retry answered DEADLINE_BEFORE_ADMISSION, not seq 3. The next retry sends what
-    /// was sent last; a retry that sent nothing (the deadline cap) changes nothing. Unit.
+    /// was sent last, whether that send was answered (D1's own path) or refused. Unit.
     #[test]
     fn the_next_retry_resends_the_deadline_the_last_retry_was_sent_with() {
         use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
@@ -1067,22 +1074,33 @@ mod tests {
         };
         let mut sent = Sent::default();
         sent.record(Some(request(0)), Kind::Txn);
-        sent.resent(&Err(PutError {
-            error: rdb_api::ApiError::invalid("refused after it was sent"),
-            request: Some(Box::new(request(2_000))),
-        }));
         let deadline = |sent: &Sent| sent.pick(&["4"]).expect("request 4").0.remaining_millis;
-        assert_eq!(deadline(&sent), 2_000, "the retry's deadline is kept");
-        sent.resent(&Err(PutError {
-            error: rdb_api::ApiError::invalid("deadline: past the maximum; nothing was sent"),
-            request: None,
+        // D1: `retry 4 --deadline-ms 2000` published at seq 3.
+        sent.resent(&Ok(rdb_api::PutOk {
+            request: RequestId(4),
+            generation: Generation(1),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+            seq: rdb_core::contracts::ids::Seq(3),
+            outcome: rdb_core::contracts::txn::Outcome::Published,
+            durability: rdb_core::contracts::txn::Durability::BufferedOnTwo,
+            sent: Box::new(request(2_000)),
         }));
         assert_eq!(
             deadline(&sent),
             2_000,
-            "a retry that sent nothing changes nothing"
+            "the answered retry's deadline is kept"
         );
         assert_eq!(sent.pick(&[]).expect("latest").0.remaining_millis, 2_000);
+        // A refusal hands the request it sent back; that is the next retry's too.
+        sent.resent(&Err(PutError {
+            error: rdb_api::ApiError::invalid("refused after it was sent"),
+            request: Some(Box::new(request(1_500))),
+        }));
+        assert_eq!(
+            deadline(&sent),
+            1_500,
+            "the refused retry's deadline is kept"
+        );
     }
 
     /// The tester's PC-2: `--dedup-cap 65537` started three rEtcd voters, then the open refused
@@ -1120,8 +1138,6 @@ mod tests {
         );
     }
 
-    /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
-    /// input, so the run says so and exits 2 instead of running nothing and exiting 0. Unit.
     /// S1 ruling A5 (guard G16): an op is `[<group>:]<object>=<value>[@<version>]`. The object
     /// ends at the first `=`, a group is only a leading `digits:`, and a version only a
     /// trailing `@digits`; anything else stays in the object or the value. Unit (~1 ms).
@@ -1164,6 +1180,21 @@ mod tests {
         );
     }
 
+    /// S1 ruling A7, guard G10: `retry <id> --payload` re-puts the object and condition of a
+    /// put. A txn has no single object, so it is refused with a usage line. Unit (~1 ms).
+    #[test]
+    fn retry_payload_re_puts_a_put_and_refuses_a_txn() {
+        let put = Kind::Put {
+            object: b"a".to_vec(),
+            if_version: Some(3),
+        };
+        assert_eq!(payload_put(put, RequestId(4)), Ok((b"a".to_vec(), Some(3))));
+        let refused = payload_put(Kind::Txn, RequestId(5)).expect_err("a txn has no one object");
+        assert!(refused.ends_with("request 5 was a txn"), "{refused}");
+    }
+
+    /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
+    /// input, so the run says so and exits 2 instead of running nothing and exiting 0. Unit.
     #[test]
     fn an_unreadable_line_is_an_input_error_not_the_end_of_input() {
         let utf16le: Vec<u8> = [0xFF, 0xFE]

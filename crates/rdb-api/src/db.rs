@@ -47,9 +47,14 @@ const CLIENT: ClientId = ClientId(1);
 /// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
 const GROUP: AffinityId = AffinityId(1);
 
-/// The longest deadline a transaction may carry: the caller's maximum in
-/// `docs/rdb/developer-handoff.md`, ExecuteTxn row. A longer one is refused before the compile
-/// runs, so no waiter, and nothing queued behind it under the same identity, is held past it.
+/// The longest deadline [`Db::txn`] and [`Db::resend_within`] accept: the caller's maximum in
+/// `docs/rdb/developer-handoff.md`, ExecuteTxn row. Those two refuse a longer one before
+/// anything is compiled or sent. [`Db::put`] and [`Db::put_as`] carry [`Timeouts::put`], which
+/// is not capped, and [`Db::resend`] sends whatever deadline its request already carries.
+///
+/// The bound is on the waiter at the head of its identity's queue: the host expires it at its
+/// deadline plus [`TXN_WAITER_MARGIN_MILLIS`]. A call queued behind it under the same identity
+/// starts its own clock only when it is released, so it can be held up to one deadline longer.
 pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A failed call, with the §5.4 name and what the caller may do next.
@@ -505,11 +510,15 @@ impl Db {
 
     /// [`Self::put`] under request id `request`, which this client may have used already. A
     /// fresh compile, so a changed payload under a used id meets the dedup rules
-    /// (`REQUEST_ID_REUSE`). The tenant and client are this `Db`'s own.
+    /// (`REQUEST_ID_REUSE`) when the compile succeeds. The tenant and client are this `Db`'s
+    /// own.
     ///
     /// # Errors
     ///
-    /// As [`Self::put`].
+    /// As [`Self::put`], except that no answer claims `no_mutation` (D-S0-1). `request` may
+    /// already be applied, and the compile refuses (a stale condition, an oversized value)
+    /// before the dedup index is asked, as kernel checks 2 and 9 do. Such a refusal says only
+    /// that this call sent nothing; ask [`Self::status`] what became of `request`.
     pub fn put_as(
         &self,
         request: RequestId,
@@ -522,7 +531,7 @@ impl Db {
             client: CLIENT,
             request,
         };
-        self.put_identified(identity, object, value, if_version)
+        maybe_mutated(self.put_identified(identity, object, value, if_version))
     }
 
     fn put_identified(
@@ -623,9 +632,11 @@ impl Db {
     ///
     /// As [`Self::put`], except that no answer to a resend claims `no_mutation`: the request
     /// may have applied on an earlier send, and the kernel refuses an overloaded or late
-    /// request before it looks for that (Q-A).
+    /// request before it looks for that (Q-A). Waits as [`Self::txn`] does, for the deadline
+    /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
-        maybe_mutated(self.send(ClientCall::Resend { request }, self.timeouts.put))
+        let wait = send_wait(Duration::from_millis(request.remaining_millis));
+        maybe_mutated(self.send(ClientCall::Resend { request }, wait))
     }
 
     /// Send `request` again with a fresh kernel deadline, `deadline`: same identity, same
@@ -927,8 +938,10 @@ fn maybe_mutated(answer: Result<PutOk, PutError>) -> Result<PutOk, PutError> {
     })
 }
 
-/// The time [`Db::send`] waits: its deadline plus twice the host's waiter margin, so
-/// the host's expiry at one margin answers first (S1 ruling A2).
+/// The time a transaction's send waits: its deadline plus twice the host's waiter margin, so
+/// the host's expiry at one margin answers first (S1 ruling A2). That holds for the call at
+/// the head of its identity's queue; one queued behind it starts its expiry only when it is
+/// released, so the `Db` may give up on it first (see [`MAX_TXN_DEADLINE`]).
 fn send_wait(deadline: Duration) -> Duration {
     deadline + Duration::from_millis(2 * TXN_WAITER_MARGIN_MILLIS)
 }
@@ -1718,7 +1731,8 @@ mod tests {
     /// S1 contract, the txn write path (scenarios 1, 1x, 2, the foreign group, 4 and its
     /// re-entry, and an empty txn). Every put lands at one seq or none does; a refusal the
     /// compile makes carries no request, and one the kernel makes carries the request to
-    /// resend. 4b, a deadline past 30 s, is the unit row above.
+    /// resend. 4b, a deadline past 30 s, is
+    /// `a_deadline_past_thirty_seconds_is_refused_before_anything_is_sent`.
     /// Integration (~3 s): three node threads; most of it is the open and readiness, which
     /// no `Db` row can skip.
     #[test]
@@ -1827,7 +1841,8 @@ mod tests {
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn
     /// fill it, and any new request is `OVERLOADED` and provably unapplied; a resend of either
-    /// filled entry still replays its answer. Refused at open is the unit row above.
+    /// filled entry still replays its answer. Refused at open is
+    /// `open_refuses_a_dedup_cap_above_the_status_cap_and_logs_why`.
     /// Integration (~3 s): three node threads; most of it is the open and readiness, which
     /// no `Db` row can skip.
     #[test]
@@ -1875,8 +1890,13 @@ mod tests {
     /// two margins (G14: the detail is the host's). While it is unpublished, a second txn is
     /// refused `PROTECTION_PAUSED`; after the heal, both resends are admitted: the first
     /// replays its seq, the second takes the next one.
-    /// Integration (~3.5 s): three node threads, a real 600 ms expiry, and a heal. L1's pause is
-    /// set past the expiry so the host's answer is the one under test.
+    ///
+    /// S1-R-003: `Db::resend` waits the request's own deadline plus two margins, never the put
+    /// timeout. The put timeout here is 500 ms; a request refused at deadline 0 is resent with
+    /// 1 000 ms while nothing can acknowledge it, so the host's expiry at 1.5 s answers. With
+    /// the put timeout as the wait, the `Db` gave up first, at 500 ms, with its own detail.
+    /// Integration (~5 s): three node threads, real 600 ms and 1.5 s expiries, and two heals.
+    /// L1's pause is set past both expiries so the host's answer is the one under test.
     #[test]
     fn a_txn_is_refused_while_another_is_unpublished_and_admitted_after_it_publishes() {
         let dir = config_testkit::fs::temp_dir();
@@ -1887,13 +1907,15 @@ mod tests {
             pause_age_millis: 4_000,
             ..fast()
         };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
         let mut db = rt
-            .block_on(Db::open_with(
-                config(dir.path()),
-                store,
-                rt.handle().clone(),
-                budgets,
-            ))
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
             .expect("open");
         admits(&db, "after the open");
         assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
@@ -1922,6 +1944,31 @@ mod tests {
         assert_eq!((first.request, first.seq), (RequestId(2), Seq(3)));
         let second = db.resend(*second).expect("3b: admitted after the publish");
         assert_eq!((second.request, second.seq), (RequestId(3), Seq(4)));
+
+        // S1-R-003: a resend whose deadline outlives the put timeout.
+        let late = db
+            .txn(&[txn_put(b"c", b"1", None)], Duration::ZERO)
+            .expect_err("deadline 0 is refused before admission");
+        let late = TxnRequest {
+            remaining_millis: 1_000,
+            ..*late.request.expect("a deadline refusal keeps its request")
+        };
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .resend(late.clone())
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        assert!(
+            unknown.error.detail.contains("had no reply"),
+            "the host's expiry answers a resend, not the put timeout: {unknown:?}"
+        );
+        db.links().heal_all();
+        admits(&db, "after the second heal");
+        assert_eq!(
+            db.resend(late).expect("published after the heal").seq,
+            Seq(5)
+        );
         db.shutdown();
     }
 
@@ -1929,7 +1976,13 @@ mod tests {
     /// and 9 (overload) run before the dedup replay, so a resend of a request that already
     /// committed can be refused `no_mutation=true` although its mutation is applied. A resend
     /// can never prove that, so every answer to `resend` and `resend_within` says
-    /// `no_mutation=false`. The kind and retry rule stay the kernel's.
+    /// `no_mutation=false`. The kind and retry rule stay the kernel's. `resend` is checked on
+    /// its own (S1-R-008), and PC-4 pins the split: the same refusal proves no mutation on a
+    /// first send and cannot on its resend.
+    ///
+    /// D-S0-1, the same flaw on `put_as`: it recompiles under a caller-chosen id, and the
+    /// compile refuses before the dedup index is asked. Under applied request 1, a stale
+    /// condition answered `CONDITION_FAILED no_mutation=true`, and so did an oversized value.
     /// Integration (~3 s): three node threads; most of it is the open and readiness, which
     /// no `Db` row can skip.
     #[test]
@@ -1978,6 +2031,53 @@ mod tests {
             "{refused:?}"
         );
         assert!(!refused.error.no_mutation, "{refused:?}");
+        // S1-R-008: through `Db::resend` itself.
+        let late = TxnRequest {
+            remaining_millis: 0,
+            ..(*txn.sent).clone()
+        };
+        let refused = db.resend(late).expect_err("deadline 0 through resend");
+        assert_eq!(
+            (refused.error.kind, refused.error.no_mutation),
+            (ErrorKind::DeadlineBeforeAdmission, false),
+            "request 2 is applied at seq 3: {refused:?}"
+        );
+        // PC-4: the same refusal, first send against resend.
+        let first = db
+            .txn(&[txn_put(b"b", b"1", None)], Duration::ZERO)
+            .expect_err("deadline 0");
+        assert_eq!(
+            (first.error.kind, first.error.no_mutation),
+            (ErrorKind::DeadlineBeforeAdmission, true),
+            "a first send refused before admission mutated nothing: {first:?}"
+        );
+        let again = db
+            .resend(*first.request.expect("a deadline refusal keeps its request"))
+            .expect_err("still deadline 0");
+        assert_eq!(
+            (again.error.kind, again.error.no_mutation),
+            (ErrorKind::DeadlineBeforeAdmission, false),
+            "a resend cannot know: {again:?}"
+        );
+
+        // D-S0-1: `put_as` under applied request 1 (a=1 at seq 2; a is now at version 3).
+        let stale = db
+            .put_as(put.request, b"a", b"1", Some(2))
+            .expect_err("a is at version 3");
+        assert_eq!(stale.error.kind, ErrorKind::ConditionFailed, "{stale:?}");
+        assert!(
+            !stale.error.no_mutation,
+            "request 1 is applied at seq 2; the answer must not claim no mutation: {stale:?}"
+        );
+        let oversized = db
+            .put_as(put.request, b"a", &vec![b'z'; 1_048_536], None)
+            .expect_err("past the envelope");
+        assert_eq!(
+            oversized.error.kind,
+            ErrorKind::InvalidArgument,
+            "{oversized:?}"
+        );
+        assert!(!oversized.error.no_mutation, "{oversized:?}");
 
         // `status 2`, then `retry 2`: still seq 3, never a second apply.
         match db.status(RequestId(2), None).expect("status 2") {
