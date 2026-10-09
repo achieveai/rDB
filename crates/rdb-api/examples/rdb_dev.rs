@@ -500,7 +500,9 @@ fn repl<'scope, 'env>(
             }
             ["retry", rest @ .., "--deadline-ms", millis] => match millis.parse::<u64>() {
                 Ok(ms) => sent.pick(rest).map(|(request, _)| {
-                    put_line(db.resend_within(request, Duration::from_millis(ms)), None);
+                    let answer = db.resend_within(request, Duration::from_millis(ms));
+                    sent.resent(&answer);
+                    put_line(answer, None);
                 }),
                 Err(_) => Err("retry [<request>] --deadline-ms N: N is milliseconds".to_owned()),
             },
@@ -758,6 +760,23 @@ impl Sent {
         self.latest = Some(id);
     }
 
+    /// A retry's answer: the request it carries is what was sent last under its id, so the
+    /// next `retry` of that id sends it (D1). An answer with no request sent nothing, and
+    /// changes nothing.
+    fn resent(&mut self, answer: &Result<rdb_api::PutOk, PutError>) {
+        let request = match answer {
+            Ok(ok) => Some(&*ok.sent),
+            Err(PutError { request, .. }) => request.as_deref(),
+        };
+        if let Some(request) = request {
+            let id = request.identity.request.0;
+            if let Some(entry) = self.by_id.get_mut(&id) {
+                entry.0 = request.clone();
+                self.latest = Some(Some(id));
+            }
+        }
+    }
+
     fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Kind), String> {
         let id = match rest {
             [] => match self.latest {
@@ -1011,6 +1030,47 @@ mod tests {
             "the failed open left {} behind",
             dir.display()
         );
+    }
+
+    /// D1 (S1 dev walk, fbf2b95): `txn --deadline-ms 0 a=5` was refused, `retry 4
+    /// --deadline-ms 2000` published it at seq 3, and a plain `retry 4` then resent the
+    /// deadline-0 request it was first sent with. Check 2 refused that before the dedup replay,
+    /// so the retry answered DEADLINE_BEFORE_ADMISSION, not seq 3. The next retry sends what
+    /// was sent last; a retry that sent nothing (the deadline cap) changes nothing. Unit.
+    #[test]
+    fn the_next_retry_resends_the_deadline_the_last_retry_was_sent_with() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let request = |remaining_millis| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(4),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        let mut sent = Sent::default();
+        sent.record(Some(request(0)), Kind::Txn);
+        sent.resent(&Err(PutError {
+            error: rdb_api::ApiError::invalid("refused after it was sent"),
+            request: Some(Box::new(request(2_000))),
+        }));
+        let deadline = |sent: &Sent| sent.pick(&["4"]).expect("request 4").0.remaining_millis;
+        assert_eq!(deadline(&sent), 2_000, "the retry's deadline is kept");
+        sent.resent(&Err(PutError {
+            error: rdb_api::ApiError::invalid("deadline: past the maximum; nothing was sent"),
+            request: None,
+        }));
+        assert_eq!(
+            deadline(&sent),
+            2_000,
+            "a retry that sent nothing changes nothing"
+        );
+        assert_eq!(sent.pick(&[]).expect("latest").0.remaining_millis, 2_000);
     }
 
     /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
