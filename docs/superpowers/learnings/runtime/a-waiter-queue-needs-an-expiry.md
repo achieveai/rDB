@@ -22,9 +22,9 @@ F-002 was a displacement bug: a second call under the same request identity took
 - Testing the expiry without anything queued behind it. The release step it runs was unprotected, so deleting it left every row green (F-017).
 
 ## Solution
-- Every waiter that depends on another party's reply gets an expiry: its deadline plus a margin. It answers UNKNOWN_OUTCOME, then releases the queue.
+- A write waiter (`PendingKind::Txn`), which depends on the other nodes' replies, gets an expiry: its deadline plus a margin. It answers UNKNOWN_OUTCOME, then releases the queue. Read waiters (`Get`, `GetPrevious`) have no expiry; give them one if they ever wait on another party.
 - The expiry carries the waiter's event id and fires only for that waiter, so it can never touch a successor.
-- Read-only calls about the same key, such as status, are never queued behind it.
+- `Status` and `Compile` skip the queue, so asking about a write never waits behind it. `Get` and `GetPrevious` still queue.
 - Each step has a row and a mutant: no expiry, no release, no event-id guard, status queued again.
 
 ## Why it works
