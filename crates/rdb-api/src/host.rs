@@ -2777,8 +2777,19 @@ impl Host {
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("step view missing after refresh".into());
         };
+        // The first put's group is the request's affinity. A put in another group is refused
+        // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
+        let affinity = puts.first().map_or(AFFINITY, |put| put.group);
         let (mut conditions, mut mutations) = (Vec::new(), Vec::new());
         for (index, put) in puts.iter().enumerate() {
+            if put.group != affinity {
+                let mut refused = ApiError::from_kernel(&RdbError::CrossAffinity {
+                    expected: affinity,
+                    found: put.group,
+                });
+                refused.detail = format!("op {index}: {}", refused.detail);
+                return Ok(Err(refused));
+            }
             let root = root_key(identity.tenant, put.group, &put.object);
             let expected = match put.if_version {
                 Some(version) => Expected::Version(version),
@@ -2802,7 +2813,7 @@ impl Host {
         Ok(Ok(TxnRequest {
             api_version: API_VERSION,
             identity,
-            affinity: puts.first().map_or(AFFINITY, |put| put.group),
+            affinity,
             expected_generation: Some(view.generation()),
             remaining_millis,
             conditions,

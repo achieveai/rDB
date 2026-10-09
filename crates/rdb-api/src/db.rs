@@ -264,7 +264,8 @@ pub struct GetOk {
 pub struct PutError {
     /// Why.
     pub error: ApiError,
-    /// The request sent, when one was.
+    /// The request sent, when one was. A resend refused before sending, such as one past
+    /// [`MAX_TXN_DEADLINE`], hands back the request it was given, unchanged: nothing was sent.
     pub request: Option<Box<TxnRequest>>,
 }
 
@@ -557,16 +558,17 @@ impl Db {
 
     /// Write every put in `puts` as one transaction, or none of them, with a kernel deadline of
     /// `deadline`. Every put must name the same group: the first put's is the request's
-    /// affinity, and a put in another group is refused (`CROSS_AFFINITY`).
+    /// affinity, and a put in another group is refused (`CROSS_AFFINITY`) by the compile,
+    /// before anything is sent.
     ///
     /// # Errors
     ///
     /// As [`Self::put`]. Before anything is compiled or sent, `INVALID_ARGUMENT (deadline)`
-    /// when `deadline` is past [`MAX_TXN_DEADLINE`]. A put that does not compile refuses the
-    /// whole transaction, its detail naming the put as `op <index>`. The compile waits
-    /// [`Timeouts::put`], never `deadline`; the send waits `deadline` plus twice
-    /// [`TXN_WAITER_MARGIN_MILLIS`], so the host's own expiry, `UNKNOWN_OUTCOME` at `deadline`
-    /// plus one margin, answers first.
+    /// when `deadline` is past [`MAX_TXN_DEADLINE`]. A put that does not compile, or names
+    /// another group, refuses the whole transaction with no request, its detail naming the put
+    /// as `op <index>`. The compile waits [`Timeouts::put`], never `deadline`; the send waits
+    /// `deadline` plus twice [`TXN_WAITER_MARGIN_MILLIS`], so the host's own expiry,
+    /// `UNKNOWN_OUTCOME` at `deadline` plus one margin, answers first.
     pub fn txn(&self, puts: &[TxnPut<'_>], deadline: Duration) -> Result<PutOk, PutError> {
         if let Some(error) = deadline_refusal(deadline) {
             return Err(PutError {
@@ -1774,30 +1776,33 @@ mod tests {
         assert!(stale.request.is_none(), "the compile refused it: {stale:?}");
         assert_eq!(db.get(b"a").expect("a").value.map(|v| v.0), Some(3));
 
-        // 2: a second group in one txn. The kernel refuses it; nothing lands.
+        // 2: a second group in one txn. The compile refuses it, naming the first put in
+        // another group, so nothing is sent and nothing lands (PR #36 F-001). At deadline 0
+        // too: the kernel's deadline check never sees it.
         let other = AffinityId(2);
-        let cross = db
-            .txn(
-                &[
-                    txn_put(b"a", b"4", None),
-                    TxnPut {
-                        group: other,
-                        ..txn_put(b"c", b"1", None)
-                    },
-                ],
-                deadline,
-            )
-            .expect_err("scenario 2");
-        assert_eq!(cross.error.kind, ErrorKind::CrossAffinity, "{cross:?}");
-        // Every call mints an id, gets included, so ids are read from answers, not counted.
-        let cross_id = cross
-            .request
-            .expect("a kernel refusal keeps its request")
-            .identity;
-        assert_eq!(
-            db.status(cross_id.request, None).expect("status"),
-            TxnStatus::Unknown
-        );
+        let mixed = [
+            txn_put(b"a", b"4", None),
+            TxnPut {
+                group: other,
+                ..txn_put(b"c", b"1", None)
+            },
+        ];
+        for (what, wait) in [("scenario 2", deadline), ("at deadline 0", Duration::ZERO)] {
+            let cross = db.txn(&mixed, wait).expect_err(what);
+            assert_eq!(
+                (cross.error.kind, cross.error.no_mutation),
+                (ErrorKind::CrossAffinity, true),
+                "{what}: {cross:?}"
+            );
+            assert!(
+                cross.error.detail.starts_with("op 1: "),
+                "{what}: {cross:?}"
+            );
+            assert!(
+                cross.request.is_none(),
+                "{what}: the compile refused it: {cross:?}"
+            );
+        }
         assert_eq!(db.get(b"a").expect("a").value.map(|v| v.0), Some(3));
 
         // The foreign group alone is a txn of its own, at the next seq.
@@ -1842,15 +1847,22 @@ mod tests {
 
     /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn
     /// fill it, and any new request is `OVERLOADED` and provably unapplied; a resend of either
-    /// filled entry still replays its answer. Refused at open is
-    /// `open_refuses_a_dedup_cap_above_the_status_cap_and_logs_why`.
+    /// filled entry still replays its answer. The open logs the cap it took as `db_open`.
+    /// Refused at open is `open_refuses_a_dedup_cap_above_the_status_cap_and_logs_why`.
     /// Integration (~3 s): three node threads; most of it is the open and readiness, which
     /// no `Db` row can skip.
-    #[test]
+    #[config_log::retcd_test]
     fn a_full_dedup_cap_refuses_new_requests_and_still_replays_old_ones() {
+        const METHOD: &str = "a_full_dedup_cap_refuses_new_requests_and_still_replays_old_ones";
         let dir = config_testkit::fs::temp_dir();
         let rt = runtime();
         let mut db = opened(dir.path(), &rt, Some(2));
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "db_open")
+            .collect();
+        assert_eq!(lines.len(), 1, "one open line: {lines:?}");
+        assert_eq!(lines[0]["dedup_cap"], 2);
         let deadline = Duration::from_secs(2);
         let put = db.put(b"a", b"1", None).expect("put fills entry 1");
         let txn = db

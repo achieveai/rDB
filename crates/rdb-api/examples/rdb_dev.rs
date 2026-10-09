@@ -500,8 +500,9 @@ fn repl<'scope, 'env>(
             }
             ["retry", rest @ .., "--deadline-ms", millis] => match millis.parse::<u64>() {
                 Ok(ms) => sent.pick(rest).map(|(request, _)| {
-                    let answer = db.resend_within(request, Duration::from_millis(ms));
-                    sent.resent(&answer);
+                    let deadline = Duration::from_millis(ms);
+                    let answer = db.resend_within(request, deadline);
+                    sent.resent_within(deadline, &answer);
                     put_line(answer, None);
                 }),
                 Err(_) => Err("retry [<request>] --deadline-ms N: N is milliseconds".to_owned()),
@@ -786,6 +787,15 @@ impl Sent {
                 entry.0 = request.clone();
                 self.latest = Some(Some(id));
             }
+        }
+    }
+
+    /// A `retry --deadline-ms` answer. A deadline past `MAX_TXN_DEADLINE` is refused before
+    /// anything is sent, and the request handed back is the one picked, unchanged, so nothing
+    /// changes: the next bare `retry` still sends the latest (PR #36 F-002).
+    fn resent_within(&mut self, deadline: Duration, answer: &Result<rdb_api::PutOk, PutError>) {
+        if deadline <= rdb_api::MAX_TXN_DEADLINE {
+            self.resent(answer);
         }
     }
 
@@ -1100,6 +1110,58 @@ mod tests {
             deadline(&sent),
             1_500,
             "the refused retry's deadline is kept"
+        );
+    }
+
+    /// PR #36 F-002: `txn --deadline-ms 0 a=1` (request 1), `txn b=1` (request 2), then `retry 1
+    /// --deadline-ms 30001`. The deadline is past `MAX_TXN_DEADLINE`, so nothing was sent, but
+    /// the request it handed back made request 1 the latest, and a bare `retry` resent it, not
+    /// request 2. A retry that sends still makes its request the latest. Unit.
+    #[test]
+    fn a_retry_refused_before_sending_leaves_the_latest_request_alone() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let request = |id, remaining_millis| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        let mut sent = Sent::default();
+        sent.record(Some(request(1, 0)), Kind::Txn);
+        sent.record(Some(request(2, 2_000)), Kind::Txn);
+        let latest = |sent: &Sent| sent.pick(&[]).expect("latest").0.identity.request;
+        let over = rdb_api::MAX_TXN_DEADLINE + Duration::from_millis(1);
+        sent.resent_within(
+            over,
+            &Err(PutError {
+                error: rdb_api::ApiError::invalid("past the maximum; nothing was sent"),
+                request: Some(Box::new(request(1, 0))),
+            }),
+        );
+        assert_eq!(latest(&sent), RequestId(2), "nothing was sent");
+        // At the maximum it is sent: the refusal's request is the next retry's.
+        sent.resent_within(
+            rdb_api::MAX_TXN_DEADLINE,
+            &Err(PutError {
+                error: rdb_api::ApiError::invalid("refused after it was sent"),
+                request: Some(Box::new(request(1, 30_000))),
+            }),
+        );
+        assert_eq!(
+            latest(&sent),
+            RequestId(1),
+            "a retry that sends is the latest"
+        );
+        assert_eq!(
+            sent.pick(&["1"]).expect("request 1").0.remaining_millis,
+            30_000
         );
     }
 
