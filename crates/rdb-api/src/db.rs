@@ -52,9 +52,10 @@ const GROUP: AffinityId = AffinityId(1);
 /// anything is compiled or sent. [`Db::put`] and [`Db::put_as`] carry [`Timeouts::put`], which
 /// is not capped, and [`Db::resend`] sends whatever deadline its request already carries.
 ///
-/// The bound is on the waiter at the head of its identity's queue: the host expires it at its
-/// deadline plus [`TXN_WAITER_MARGIN_MILLIS`]. A call queued behind it under the same identity
-/// starts its own clock only when it is released, so it can be held up to one deadline longer.
+/// The bound is on the waiter at the head of its identity's queue only: the host expires it at
+/// its deadline plus [`TXN_WAITER_MARGIN_MILLIS`]. Calls queued behind it under the same
+/// identity are released one at a time, and each one's clock starts only when it is released.
+/// So a queued call waits behind every call ahead of it first, and no bound covers that wait.
 pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A failed call, with the §5.4 name and what the caller may do next.
