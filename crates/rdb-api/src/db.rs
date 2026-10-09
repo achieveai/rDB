@@ -20,17 +20,20 @@ use config_core::ConfigStore;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId, RequestIdentity,
-    Seq, TenantId,
+    AffinityId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
+    RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
+use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
 use tokio::runtime::Handle;
 
 use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
-use crate::host::{self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus};
+use crate::host::{
+    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, PutOp, TXN_WAITER_MARGIN_MILLIS,
+};
 use crate::transport::Links;
 
 /// The node every S0 call goes to: partition 1's owner.
@@ -40,6 +43,14 @@ const OWNER: NodeId = admin::OWNER;
 /// no raw identity on the REPL).
 const TENANT: TenantId = TenantId(1);
 const CLIENT: ClientId = ClientId(1);
+
+/// The affinity group a [`Db::put`] writes in, and that [`Db::get`] reads.
+const GROUP: AffinityId = AffinityId(1);
+
+/// The longest deadline a transaction may carry: the caller's maximum in
+/// `docs/rdb/developer-handoff.md`, ExecuteTxn row. A longer one is refused before the compile
+/// runs, so no waiter, and nothing queued behind it under the same identity, is held past it.
+pub const MAX_TXN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A failed call, with the §5.4 name and what the caller may do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +188,24 @@ pub struct DbConfig {
     pub hold: Vec<(NodeId, NodeId)>,
     /// Call timeouts.
     pub timeouts: Timeouts,
+    /// T1's dedup cap: retained answers allowed before a new write is `OVERLOADED`. `None` is
+    /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
+    /// status index holds no more than that. A dev budget, to reach a full index by hand.
+    pub dedup_cap: Option<usize>,
+}
+
+/// One put of a [`Db::txn`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxnPut<'a> {
+    /// The affinity group the object lives in. Every put of one transaction must share one.
+    pub group: AffinityId,
+    /// The object id.
+    pub object: &'a [u8],
+    /// The bytes.
+    pub value: &'a [u8],
+    /// Write only if the object is at this version. `None` writes over the version the compile
+    /// sees, and creates the object when that is absent.
+    pub if_version: Option<u64>,
 }
 
 /// A published write.
@@ -239,6 +268,16 @@ pub enum OpenError {
     /// The bootstrap was refused.
     #[error(transparent)]
     Bootstrap(#[from] admin::BootstrapError),
+    /// [`DbConfig::dedup_cap`] is above the cap P1's status index holds. Nothing was started.
+    #[error(
+        "dedup_cap {asked} is above the most P1's status index holds ({max}); nothing was started"
+    )]
+    DedupCap {
+        /// The cap asked for.
+        asked: usize,
+        /// The largest allowed, [`RETENTION_CAP_ENTRIES`].
+        max: usize,
+    },
     /// The filesystem refused.
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -303,9 +342,16 @@ impl Db {
         rt: Handle,
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
-        Self::open_spawning(config, store, rt, |node, dir, links, control, clock| {
-            host::spawn_with(node, dir, links, control, clock, budgets)
-        })
+        let limits = limits(config.dedup_cap)?;
+        tracing::info!(dedup_cap = limits.dedup_cap, "db_open");
+        Self::open_spawning(
+            config,
+            store,
+            rt,
+            move |node, dir, links, control, clock| {
+                host::spawn_with(node, dir, links, control, clock, budgets, limits)
+            },
+        )
         .await
     }
 
@@ -477,12 +523,62 @@ impl Db {
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
+        let put = TxnPut {
+            group: GROUP,
+            object,
+            value,
+            if_version,
+        };
+        self.compile_and_send(identity, &[put], self.timeouts.put, self.timeouts.put)
+    }
+
+    /// Write every put in `puts` as one transaction, or none of them, with a kernel deadline of
+    /// `deadline`. Every put must name the same group: the first put's is the request's
+    /// affinity, and a put in another group is refused (`CROSS_AFFINITY`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`]. Before anything is compiled or sent, `INVALID_ARGUMENT (deadline)`
+    /// when `deadline` is past [`MAX_TXN_DEADLINE`]. A put that does not compile refuses the
+    /// whole transaction, its detail naming the put as `op <index>`. The compile waits
+    /// [`Timeouts::put`], never `deadline`; the send waits `deadline` plus twice
+    /// [`TXN_WAITER_MARGIN_MILLIS`], so the host's own expiry, `UNKNOWN_OUTCOME` at `deadline`
+    /// plus one margin, answers first.
+    pub fn txn(&self, puts: &[TxnPut<'_>], deadline: Duration) -> Result<PutOk, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        self.compile_and_send(self.identity(), puts, deadline, send_wait(deadline))
+    }
+
+    /// Compile `puts` under `identity` with kernel deadline `deadline`, waiting
+    /// [`Timeouts::put`] for it, then send it, waiting `wait` for the answer.
+    fn compile_and_send(
+        &self,
+        identity: RequestIdentity,
+        puts: &[TxnPut<'_>],
+        deadline: Duration,
+        wait: Duration,
+    ) -> Result<PutOk, PutError> {
+        // Compile first, send second (defect w24): the request is in hand before anything is
+        // sent, so every outcome of the send, a timeout included, hands it back for an
+        // unchanged resend. A compile sends nothing, so a compile that does not answer is a
+        // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
         let call = ClientCall::Compile {
             identity,
-            object: Bytes::copy_from_slice(object),
-            value: Bytes::copy_from_slice(value),
-            if_version,
-            remaining_millis: millis(self.timeouts.put),
+            puts: puts
+                .iter()
+                .map(|put| PutOp {
+                    group: put.group,
+                    object: Bytes::copy_from_slice(put.object),
+                    value: Bytes::copy_from_slice(put.value),
+                    if_version: put.if_version,
+                })
+                .collect(),
+            remaining_millis: millis(deadline),
         };
         let refused = |error| {
             Err(PutError {
@@ -490,8 +586,10 @@ impl Db {
                 request: None,
             })
         };
+        // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
+        // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(call, self.timeouts.put) {
-            Some(Answer::Compiled(request)) => self.resend(request),
+            Some(Answer::Compiled(request)) => self.send(ClientCall::Resend { request }, wait),
             Some(Answer::Error { error, .. }) => refused(error),
             Some(other) => refused(ApiError::host(&format!(
                 "a put compile was answered with {other:?}"
@@ -512,18 +610,45 @@ impl Db {
     ///
     /// As [`Self::put`].
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
-        let identity = request.identity;
-        self.txn(identity, ClientCall::Resend { request })
+        self.send(ClientCall::Resend { request }, self.timeouts.put)
     }
 
-    fn txn(&self, identity: RequestIdentity, call: ClientCall) -> Result<PutOk, PutError> {
+    /// Send `request` again with a fresh kernel deadline, `deadline`: same identity, same
+    /// payload. The deadline is not part of the request's digest, so a request already answered
+    /// still replays its answer. Waits as [`Self::txn`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::txn`]: `INVALID_ARGUMENT (deadline)`, with nothing sent, when `deadline` is
+    /// past [`MAX_TXN_DEADLINE`].
+    pub fn resend_within(
+        &self,
+        mut request: TxnRequest,
+        deadline: Duration,
+    ) -> Result<PutOk, PutError> {
+        if let Some(error) = deadline_refusal(deadline) {
+            return Err(PutError {
+                error,
+                request: None,
+            });
+        }
+        request.remaining_millis = millis(deadline);
+        self.send(ClientCall::Resend { request }, send_wait(deadline))
+    }
+
+    /// Send a write and wait `wait` for its answer.
+    fn send(&self, call: ClientCall, wait: Duration) -> Result<PutOk, PutError> {
         let sent = match &call {
             ClientCall::Resend { request } => Some(request.clone()),
             _ => None,
         };
-        match self.call(call, self.timeouts.put) {
+        let identity = match &call {
+            ClientCall::Resend { request } => request.identity.request,
+            _ => RequestId(0),
+        };
+        match self.call(call, wait) {
             Some(Answer::Txn { result, request }) => Ok(PutOk {
-                request: identity.request,
+                request: identity,
                 generation: result.generation,
                 owner_epoch: result.owner_epoch,
                 seq: result.seq,
@@ -544,10 +669,7 @@ impl Db {
             None => Err(PutError {
                 error: ApiError::new(
                     ErrorKind::UnknownOutcome,
-                    format!(
-                        "no answer in {:?} for request {}",
-                        self.timeouts.put, identity.request.0
-                    ),
+                    format!("no answer in {wait:?} for request {}", identity.0),
                 ),
                 request: sent.map(Box::new),
             }),
@@ -748,6 +870,38 @@ fn refused_read(kind: ErrorKind) -> ApiError {
     }
 }
 
+/// T1's limits for a `dedup_cap` option: the spec's, with only the dedup cap lowered.
+fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
+    let mut limits = Limits::default();
+    if let Some(asked) = dedup_cap {
+        if asked > RETENTION_CAP_ENTRIES {
+            return Err(OpenError::DedupCap {
+                asked,
+                max: RETENTION_CAP_ENTRIES,
+            });
+        }
+        limits.dedup_cap = asked;
+    }
+    Ok(limits)
+}
+
+/// `INVALID_ARGUMENT (deadline)` for a deadline past [`MAX_TXN_DEADLINE`].
+fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
+    (deadline > MAX_TXN_DEADLINE).then(|| {
+        ApiError::invalid(format!(
+            "deadline: {} ms is past the maximum of {} ms; nothing was sent",
+            deadline.as_millis(),
+            MAX_TXN_DEADLINE.as_millis()
+        ))
+    })
+}
+
+/// How long a transaction's send waits: its deadline plus twice the host's waiter margin, so
+/// the host's expiry at one margin answers first (S1 ruling A2).
+fn send_wait(deadline: Duration) -> Duration {
+    deadline + Duration::from_millis(2 * TXN_WAITER_MARGIN_MILLIS)
+}
+
 fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -790,6 +944,7 @@ mod tests {
             dir: dir.to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
+            dedup_cap: None,
         }
     }
 
@@ -826,6 +981,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
+            dedup_cap: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -907,6 +1063,7 @@ mod tests {
                 put: Duration::from_millis(300),
                 read: Duration::from_secs(1),
             },
+            dedup_cap: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1022,6 +1179,7 @@ mod tests {
                 put: patience,
                 read: patience,
             },
+            dedup_cap: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1212,6 +1370,7 @@ mod tests {
             dir: dir.path().to_path_buf(),
             hold: Vec::new(),
             timeouts: Timeouts::default(),
+            dedup_cap: None,
         };
         match rt.block_on(Db::open(config, store, rt.handle().clone())) {
             Err(OpenError::NotEmpty(path)) => assert_eq!(path, dir.path().join("nodes")),
@@ -1242,7 +1401,15 @@ mod tests {
             if node == NodeId(2) {
                 return Err("node 2: injected".to_owned());
             }
-            host::spawn_with(node, dir, links, control, clock, Budgets::SPEC_DEFAULTS)
+            host::spawn_with(
+                node,
+                dir,
+                links,
+                control,
+                clock,
+                Budgets::SPEC_DEFAULTS,
+                Limits::default(),
+            )
         };
 
         let failed = rt.block_on(Db::open_spawning(
@@ -1338,7 +1505,15 @@ mod tests {
                                 s.0 || s.1
                             });
                         }
-                        let started = host::spawn_with(node, dir, links, control, clock, fast())?;
+                        let started = host::spawn_with(
+                            node,
+                            dir,
+                            links,
+                            control,
+                            clock,
+                            fast(),
+                            Limits::default(),
+                        )?;
                         if node == NodeId(3) {
                             race.wait("the loser returns while these nodes run", other, |s| s.1);
                         }
