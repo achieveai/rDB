@@ -1693,11 +1693,7 @@ mod tests {
     }
 
     /// Open a `Db` on three real node threads with [`fast`] budgets and wait until it admits.
-    fn opened(
-        dir: &std::path::Path,
-        rt: &tokio::runtime::Runtime,
-        dedup_cap: Option<usize>,
-    ) -> Db {
+    fn opened(dir: &std::path::Path, rt: &tokio::runtime::Runtime, dedup_cap: Option<usize>) -> Db {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let config = DbConfig {
             dedup_cap,
@@ -1717,6 +1713,214 @@ mod tests {
             value,
             if_version,
         }
+    }
+
+    /// S1 contract, the txn write path (scenarios 1, 1x, 2, the foreign group, 4 and its
+    /// re-entry, and an empty txn). Every put lands at one seq or none does; a refusal the
+    /// compile makes carries no request, and one the kernel makes carries the request to
+    /// resend. 4b, a deadline past 30 s, is the unit row above.
+    /// Integration (~1.5 s): three node threads; most of it is the open and readiness.
+    #[test]
+    fn a_txn_writes_every_put_at_one_seq_or_none_and_each_refusal_keeps_the_right_request() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        let deadline = Duration::from_secs(2);
+        assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
+
+        // 1: both puts at seq 3, each conditioned on what the compile read.
+        let both = db
+            .txn(
+                &[txn_put(b"a", b"2", Some(2)), txn_put(b"b", b"1", None)],
+                deadline,
+            )
+            .expect("scenario 1");
+        assert_eq!((both.request, both.seq), (RequestId(2), Seq(3)));
+        assert_eq!(both.sent.mutations.len(), 2);
+        assert_eq!(
+            db.get(b"a").expect("a").value,
+            Some((3, Bytes::from_static(b"2")))
+        );
+        assert_eq!(
+            db.get(b"b").expect("b").value,
+            Some((3, Bytes::from_static(b"1")))
+        );
+
+        // 1x: op 1 names a stale version. Nothing is sent; neither put lands.
+        let stale = db
+            .txn(
+                &[txn_put(b"a", b"3", None), txn_put(b"b", b"2", Some(2))],
+                deadline,
+            )
+            .expect_err("scenario 1x");
+        assert_eq!(stale.error.kind, ErrorKind::ConditionFailed, "{stale:?}");
+        assert!(stale.error.detail.starts_with("op 1: "), "{stale:?}");
+        assert!(stale.request.is_none(), "the compile refused it: {stale:?}");
+        assert_eq!(db.get(b"a").expect("a").value.map(|v| v.0), Some(3));
+
+        // 2: a second group in one txn. The kernel refuses it; nothing lands.
+        let other = AffinityId(2);
+        let cross = db
+            .txn(
+                &[
+                    txn_put(b"a", b"4", None),
+                    TxnPut {
+                        group: other,
+                        ..txn_put(b"c", b"1", None)
+                    },
+                ],
+                deadline,
+            )
+            .expect_err("scenario 2");
+        assert_eq!(cross.error.kind, ErrorKind::CrossAffinity, "{cross:?}");
+        // Every call mints an id, gets included, so ids are read from answers, not counted.
+        let cross_id = cross
+            .request
+            .expect("a kernel refusal keeps its request")
+            .identity;
+        assert_eq!(
+            db.status(cross_id.request, None).expect("status"),
+            TxnStatus::Unknown
+        );
+        assert_eq!(db.get(b"a").expect("a").value.map(|v| v.0), Some(3));
+
+        // The foreign group alone is a txn of its own, at the next seq.
+        let foreign = db
+            .txn(
+                &[TxnPut {
+                    group: other,
+                    ..txn_put(b"c", b"1", None)
+                }],
+                deadline,
+            )
+            .expect("one foreign group");
+        assert_eq!((foreign.seq, foreign.sent.affinity), (Seq(4), other));
+
+        // 4: deadline 0 is refused before admission, provably unapplied, request kept.
+        let late = db
+            .txn(&[txn_put(b"a", b"5", None)], Duration::ZERO)
+            .expect_err("scenario 4");
+        assert_eq!(
+            (late.error.kind, late.error.no_mutation),
+            (ErrorKind::DeadlineBeforeAdmission, true),
+            "{late:?}"
+        );
+        let late = late.request.expect("a deadline refusal keeps its request");
+        // Re-entry: the same request with a deadline it can meet commits, once.
+        let entered = db.resend_within(*late.clone(), deadline).expect("re-entry");
+        assert_eq!(
+            (entered.request, entered.seq),
+            (late.identity.request, Seq(5))
+        );
+        assert_eq!(db.resend(*entered.sent).expect("replay").seq, Seq(5));
+        assert_eq!(
+            db.get(b"a").expect("a").value,
+            Some((5, Bytes::from_static(b"5")))
+        );
+
+        // No puts at all is malformed.
+        let empty = db.txn(&[], deadline).expect_err("an empty txn");
+        assert_eq!(empty.error.kind, ErrorKind::InvalidArgument, "{empty:?}");
+        db.shutdown();
+    }
+
+    /// S1 contract, the dedup cap (ruling M2/M3). With room for two entries, a put and a txn
+    /// fill it, and any new request is `OVERLOADED` and provably unapplied; a resend of either
+    /// filled entry still replays its answer. Refused at open is the unit row above.
+    /// Integration (~1 s): three node threads; most of it is the open and readiness.
+    #[test]
+    fn a_full_dedup_cap_refuses_new_requests_and_still_replays_old_ones() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, Some(2));
+        let deadline = Duration::from_secs(2);
+        let put = db.put(b"a", b"1", None).expect("put fills entry 1");
+        let txn = db
+            .txn(&[txn_put(b"b", b"1", None)], deadline)
+            .expect("txn fills entry 2");
+        for (what, refused) in [
+            (
+                "a third txn",
+                db.txn(&[txn_put(b"c", b"1", None)], deadline),
+            ),
+            ("a third put", db.put(b"c", b"1", None)),
+        ] {
+            let refused = refused.expect_err(what);
+            assert_eq!(
+                (refused.error.kind, refused.error.no_mutation),
+                (ErrorKind::Overloaded, true),
+                "{what}: {refused:?}"
+            );
+        }
+        assert_eq!(db.resend(*put.sent).expect("put replays").seq, put.seq);
+        assert_eq!(
+            db.resend_within(*txn.sent, deadline)
+                .expect("txn replays")
+                .seq,
+            txn.seq
+        );
+        assert_eq!(
+            db.get(b"c").expect("c").value,
+            None,
+            "no third write landed"
+        );
+        db.shutdown();
+    }
+
+    /// S1 contract, scenario 3b, and guard G14. With links 1-2 and 1-3 held, a txn with a
+    /// 100 ms deadline applies on node 1 and waits for an acknowledgement. The host's expiry
+    /// answers it `UNKNOWN_OUTCOME` at deadline plus one margin, before the `Db`'s own wait of
+    /// two margins (G14: the detail is the host's). While it is unpublished, a second txn is
+    /// refused `PROTECTION_PAUSED`; after the heal, both resends are admitted: the first
+    /// replays its seq, the second takes the next one.
+    /// Integration (~2 s): three node threads, a real 600 ms expiry, and a heal. L1's pause is
+    /// set past the expiry so the host's answer is the one under test.
+    #[test]
+    fn a_txn_is_refused_while_another_is_unpublished_and_admitted_after_it_publishes() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                budgets,
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        assert_eq!(db.put(b"a", b"1", None).expect("put a=1").seq, Seq(2));
+
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"2", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+        assert!(
+            unknown.error.detail.contains("had no reply"),
+            "the host's expiry answers, not the Db's wait: {unknown:?}"
+        );
+        let first = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+
+        let paused = db
+            .txn(&[txn_put(b"b", b"1", None)], Duration::from_secs(2))
+            .expect_err("3b: refused while request 2 is unpublished");
+        assert_eq!(paused.error.kind, ErrorKind::ProtectionPaused, "{paused:?}");
+        let second = paused.request.expect("a kernel refusal keeps its request");
+
+        db.links().heal_all();
+        admits(&db, "after the heal");
+        let first = db.resend(*first).expect("the first publishes");
+        assert_eq!((first.request, first.seq), (RequestId(2), Seq(3)));
+        let second = db.resend(*second).expect("3b: admitted after the publish");
+        assert_eq!((second.request, second.seq), (RequestId(3), Seq(4)));
+        db.shutdown();
     }
 
     /// The tester's Q-A probe (lead ruling: fix it in rdb-api). Kernel checks 2 (deadline)
@@ -1741,12 +1945,18 @@ mod tests {
         let refused = db
             .resend_within((*txn.sent).clone(), Duration::ZERO)
             .expect_err("a deadline of 0 is refused before admission");
-        assert_eq!(refused.error.kind, ErrorKind::DeadlineBeforeAdmission, "{refused:?}");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::DeadlineBeforeAdmission,
+            "{refused:?}"
+        );
         assert!(
             !refused.error.no_mutation,
             "request 2 is applied at seq 3; the answer must not claim no mutation: {refused:?}"
         );
-        let handed_back = refused.request.expect("a resend refusal hands the request back");
+        let handed_back = refused
+            .request
+            .expect("a resend refusal hands the request back");
         assert_eq!(handed_back.identity, txn.sent.identity);
         // The same for the put's request, and for a deadline refused before anything is sent.
         let refused = db
@@ -1754,9 +1964,16 @@ mod tests {
             .expect_err("deadline 0");
         assert!(!refused.error.no_mutation, "{refused:?}");
         let refused = db
-            .resend_within((*put.sent).clone(), MAX_TXN_DEADLINE + Duration::from_millis(1))
+            .resend_within(
+                (*put.sent).clone(),
+                MAX_TXN_DEADLINE + Duration::from_millis(1),
+            )
             .expect_err("past the cap");
-        assert_eq!(refused.error.kind, ErrorKind::InvalidArgument, "{refused:?}");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::InvalidArgument,
+            "{refused:?}"
+        );
         assert!(!refused.error.no_mutation, "{refused:?}");
 
         // `status 2`, then `retry 2`: still seq 3, never a second apply.
@@ -1818,8 +2035,14 @@ mod tests {
             (ErrorKind::InvalidArgument, true),
             "{refused:?}"
         );
-        assert!(refused.error.detail.starts_with("deadline: "), "{refused:?}");
-        assert!(refused.request.is_none(), "a txn refused here was never compiled");
+        assert!(
+            refused.error.detail.starts_with("deadline: "),
+            "{refused:?}"
+        );
+        assert!(
+            refused.request.is_none(),
+            "a txn refused here was never compiled"
+        );
 
         let request = TxnRequest {
             api_version: rdb_core::contracts::version::API_VERSION,
@@ -1833,7 +2056,11 @@ mod tests {
         let refused = db
             .resend_within(request.clone(), past)
             .expect_err("past the cap");
-        assert_eq!(refused.error.kind, ErrorKind::InvalidArgument, "{refused:?}");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::InvalidArgument,
+            "{refused:?}"
+        );
         assert_eq!(
             refused.request.as_deref(),
             Some(&request),
@@ -1842,13 +2069,16 @@ mod tests {
         assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
 
         // At the cap itself the txn is compiled (and, unanswered here, UNAVAILABLE).
-        let at_cap = db.txn(&[put], MAX_TXN_DEADLINE).expect_err("nothing answers");
+        let at_cap = db
+            .txn(&[put], MAX_TXN_DEADLINE)
+            .expect_err("nothing answers");
         assert_eq!(at_cap.error.kind, ErrorKind::Unavailable, "{at_cap:?}");
         match mailbox.try_recv() {
             Ok(Msg::Client(Client {
-                call: ClientCall::Compile {
-                    remaining_millis, ..
-                },
+                call:
+                    ClientCall::Compile {
+                        remaining_millis, ..
+                    },
                 ..
             })) => assert_eq!(remaining_millis, 30_000),
             other => panic!("the compile reached the owner: {other:?}"),
@@ -1874,12 +2104,18 @@ mod tests {
         };
         match rt.block_on(Db::open(above, store, rt.handle().clone())) {
             Err(OpenError::DedupCap { asked, max }) => {
-                assert_eq!((asked, max), (RETENTION_CAP_ENTRIES + 1, RETENTION_CAP_ENTRIES));
+                assert_eq!(
+                    (asked, max),
+                    (RETENTION_CAP_ENTRIES + 1, RETENTION_CAP_ENTRIES)
+                );
             }
             Err(other) => panic!("refused for the dedup cap, not: {other}"),
             Ok(_) => panic!("a dedup cap above the status cap opened"),
         }
-        assert!(!dir.path().join("nodes").exists(), "refused before the claim");
+        assert!(
+            !dir.path().join("nodes").exists(),
+            "refused before the claim"
+        );
         let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
             .into_iter()
             .filter(|line| line["@m"] == "dedup_cap_refused")
@@ -1890,7 +2126,10 @@ mod tests {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
             ..config(dir.path())
         };
-        assert!(limits(at_cap.dedup_cap).is_ok(), "the status cap itself is allowed");
+        assert!(
+            limits(at_cap.dedup_cap).is_ok(),
+            "the status cap itself is allowed"
+        );
     }
 
     #[test]

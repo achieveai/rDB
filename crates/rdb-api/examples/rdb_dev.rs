@@ -1017,7 +1017,9 @@ mod tests {
     /// Integration (~2 s): three real rEtcd voters; the Db open is the injected failure.
     #[test]
     fn an_open_that_fails_exits_1_and_leaves_no_directory() {
-        let _env = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
         // As `main` does.
@@ -1089,7 +1091,9 @@ mod tests {
     /// (~10 ms); its red run started the voters (~2 s).
     #[test]
     fn a_refused_dedup_cap_exits_1_before_any_voter_starts() {
-        let _env = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
         std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
@@ -1118,6 +1122,48 @@ mod tests {
 
     /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
     /// input, so the run says so and exits 2 instead of running nothing and exiting 0. Unit.
+    /// S1 ruling A5 (guard G16): an op is `[<group>:]<object>=<value>[@<version>]`. The object
+    /// ends at the first `=`, a group is only a leading `digits:`, and a version only a
+    /// trailing `@digits`; anything else stays in the object or the value. Unit (~1 ms).
+    #[test]
+    fn a_txn_op_reads_a_group_and_a_version_only_where_the_grammar_puts_them() {
+        let op = |group, object: &str, value: &str, if_version| TxnOp {
+            group,
+            object: object.to_owned(),
+            value: value.to_owned(),
+            if_version,
+        };
+        let default = Duration::from_millis(7);
+        let (deadline, ops) = parse_txn(
+            &["2:a=1@3", "a=x=y", "k:v=1", "a=b@c", "1x:a=1", "a=@1"],
+            default,
+        )
+        .expect("all parse");
+        assert_eq!(deadline, default);
+        assert_eq!(
+            ops,
+            [
+                op(2, "a", "1", Some(3)),
+                op(1, "a", "x=y", None),
+                op(1, "k:v", "1", None),
+                op(1, "a", "b@c", None),
+                op(1, "1x:a", "1", None),
+                op(1, "a", "", Some(1)),
+            ]
+        );
+        let (deadline, _) = parse_txn(&["--deadline-ms", "0", "a=1"], default).expect("deadline");
+        assert_eq!(deadline, Duration::ZERO);
+        assert!(parse_txn(&["a"], default).is_err(), "no `=`");
+        assert!(
+            parse_txn(&["99999999999999999999:a=1"], default).is_err(),
+            "group too large"
+        );
+        assert!(
+            parse_txn(&["--deadline-ms", "x", "a=1"], default).is_err(),
+            "bad deadline"
+        );
+    }
+
     #[test]
     fn an_unreadable_line_is_an_input_error_not_the_end_of_input() {
         let utf16le: Vec<u8> = [0xFF, 0xFE]
