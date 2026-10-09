@@ -2606,6 +2606,13 @@ impl Dispatcher {
                 let generation = inventory.anchor_seen.lineage.generation;
                 (holder, generation, Some(inventory))
             };
+        // The answer is the holder's own round trip, so a cut link never carries it (M9 S0 D2
+        // ruling, rule 2's rows). Withheld as stalled: like a stalled device it never answers,
+        // and F1's sync deadline reports the copy (ruling B-R52).
+        if holder != site.0 && self.network.link(site.0, holder) == LinkState::Partitioned {
+            self.notes.push(withheld(SyncWithheldReason::Stalled));
+            return Ok(());
+        }
         if self.crash_check(holder)? {
             let fault = self
                 .crashes
@@ -3010,6 +3017,11 @@ fn stored_digest(
     seq: Seq,
 ) -> Option<rdb_core::contracts::digest::Digest> {
     let Some((record, progress)) = engine.history_at(partition, generation, seq) else {
+        // Seq 0 holds no record: every lineage starts at the root (M9 S0 D2 ruling, rule 3).
+        // Only seq 0; a missing record at any other cutoff is still withheld (M7B-137).
+        if seq == Seq::ZERO {
+            return Some(rdb_core::contracts::digest::Digest::ROOT);
+        }
         tracing::warn!(
             node = holder.0,
             partition = partition.0,

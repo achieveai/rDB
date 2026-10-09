@@ -477,3 +477,184 @@ pub fn case_f1_t1_digest_across_recovery() -> Scenario {
         ]),
     )
 }
+
+/// The M9 S0 case: when the client writes. After the fence (one tick past the plan),
+/// discovery's window, L1's resume hold, and 1.3 s of room for the start record to publish
+/// and L1 to resume; the probe saw L1 healthy at t7503 (`s0-probe.md`).
+pub const M9_S0_SUBMIT_AT: u64 =
+    PLAN_AT + 1 + 2_000 + Budgets::SPEC_DEFAULTS.resume_hold_millis + 1_300;
+
+/// The M9 S0 case's tick budget: the write's deadline and its publication, with room.
+pub const M9_S0_MAX_TICKS: u64 = M9_S0_SUBMIT_AT + 2_000;
+
+/// The M9 S0 case's one client request.
+pub const M9_S0_REQUEST: RequestId = RequestId(10);
+
+/// M9 S0: an empty recovery followed by a submit (lead ruling "S0 start record", Gautam chose A
+/// on 2026-10-07).
+///
+/// B and C survive empty, A (the prior owner) is dead, and F1 recovers at cutoff 0. Before the
+/// kernel's start record, nothing could be written: L1 resumes only after a copy ACKs a record,
+/// and at head 0 there is none, so the write was answered `PROTECTION_PAUSED`. Now the start
+/// record is published at seq 1 and the client's write at seq 2. It is the corpus's only history
+/// that recovers an empty prefix, so it is the only one in which every oracle sees a publish
+/// with no client behind it.
+#[must_use]
+pub fn case_m9_s0_empty_recovery_then_submit() -> Scenario {
+    authored(
+        "case_m9_s0_empty_recovery_then_submit",
+        Budget {
+            max_events: 2_000,
+            max_ticks: M9_S0_MAX_TICKS,
+        },
+        vec![
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: B_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: C_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+                partition: PARTITION,
+                window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+            }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_S0_SUBMIT_AT - PLAN_AT,
+            }),
+            submit(M9_S0_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_S0_MAX_TICKS - M9_S0_SUBMIT_AT,
+            }),
+        ],
+    )
+}
+
+/// The M9 D2 case: when the cut links heal. After the commit (fence plus discovery's window) and
+/// before the rebuild's first sync deadline, which falls one window after the commit.
+pub const M9_D2_HEAL_AT: u64 = 3_000;
+
+/// The M9 D2 case: when the client writes. The partition goes `Active` at the first sync deadline
+/// after the heal (commit plus one window), and L1 is healthy by t10000 in the observed run.
+pub const M9_D2_SUBMIT_AT: u64 = 12_000;
+
+/// The M9 D2 case's tick budget: the write's deadline and its publication, with room.
+pub const M9_D2_MAX_TICKS: u64 = M9_D2_SUBMIT_AT + 2_000;
+
+/// M9 D2: an empty partition recovered read-only while two copies are cut off, then healed and
+/// written to (lead ruling "S0 D2", Gautam chose option 1 on 2026-10-07).
+///
+/// B alone survives, empty, and its links to C and A are cut from the start. F1 commits
+/// `ReadOnly` at cutoff 0. Before the D2 fix nothing ever pinned the rebuild: no copy is behind
+/// an empty prefix, so R1 starts no catch-up and reports no `CopyCaughtUp`, and the partition
+/// stayed read-only for ever. Now F1 pins `(0, ROOT)` at the commit and asks every copy to sync;
+/// the two cut-off copies cannot answer, and the deadline asks them again after the heal. The
+/// partition goes `Active`, the start record is published at seq 1 and the write at seq 2.
+#[must_use]
+pub fn case_m9_d2_read_only_empty_heals_then_submit() -> Scenario {
+    authored(
+        "case_m9_d2_read_only_empty_heals_then_submit",
+        Budget {
+            max_events: 6_000,
+            max_ticks: M9_D2_MAX_TICKS,
+        },
+        vec![
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: B_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Network(NetworkOp::Partition {
+                set_a: vec![B_NODE],
+                set_b: vec![C_NODE, A_NODE],
+            }),
+            ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+                partition: PARTITION,
+                window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+            }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D2_HEAL_AT - PLAN_AT,
+            }),
+            ScenarioOp::Network(NetworkOp::Heal),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D2_SUBMIT_AT - M9_D2_HEAL_AT,
+            }),
+            // The S0 case's request: the M9 sim rows read one client identity.
+            submit(M9_S0_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D2_MAX_TICKS - M9_D2_SUBMIT_AT,
+            }),
+        ],
+    )
+}
+
+/// The M9 D3 case: when A's cut links heal. After the commit and the start record's publication
+/// (about t2500), and before the rebuild's second sync deadline.
+pub const M9_D3_A_BACK_AT: u64 = 4_000;
+
+/// The M9 D3 case's two client writes. L1 resumes its 5 s hold when the partition goes `Active`
+/// (about t4010), and was healthy by t10000 in the probe's run (`s0-probe.md` E6).
+pub const M9_D3_SUBMIT_AT: [u64; 2] = [12_000, 15_000];
+
+/// The M9 D3 case's second request. The first is [`M9_S0_REQUEST`].
+pub const M9_D3_SECOND_REQUEST: RequestId = RequestId(11);
+
+/// The M9 D3 case's tick budget: the second write's deadline and its publication, with room.
+pub const M9_D3_MAX_TICKS: u64 = M9_D3_SUBMIT_AT[1] + 2_000;
+
+/// M9 D3: an empty partition that starts with one copy cut off, then gets it back (lead ruling
+/// "S0 D3", Gautam chose option 1 on 2026-10-07).
+///
+/// B and C survive empty; A's links are cut until [`M9_D3_A_BACK_AT`]. F1 commits `DegradedRf2`
+/// at cutoff 0, and the start record is published at seq 1 on B and C. A returns, catches up to
+/// seq 1, and F1 re-emits the same result as `Active`. That re-emit used to rewind R1 and P1 to
+/// the selected cutoff, 0: R1 then had no head to send, so no copy's lag ever dropped and L1
+/// never resumed; P1's published position went from 1 back to 0, so a read was refused. Now a
+/// re-emit in the generation already served keeps what is held above the cutoff, and both
+/// writes are published, at seq 2 and 3.
+#[must_use]
+pub fn case_m9_d3_degraded_empty_gets_a_copy_back_then_writes() -> Scenario {
+    authored(
+        "case_m9_d3_degraded_empty_gets_a_copy_back_then_writes",
+        Budget {
+            max_events: 8_000,
+            max_ticks: M9_D3_MAX_TICKS,
+        },
+        vec![
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: B_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Recovery(RecoveryOp::Synchronize {
+                node: C_NODE,
+                to: Seq::ZERO,
+            }),
+            ScenarioOp::Network(NetworkOp::Partition {
+                set_a: vec![A_NODE],
+                set_b: vec![B_NODE, C_NODE],
+            }),
+            ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
+            ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
+                partition: PARTITION,
+                window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
+            }),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_A_BACK_AT - PLAN_AT,
+            }),
+            ScenarioOp::Network(NetworkOp::Heal),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_SUBMIT_AT[0] - M9_D3_A_BACK_AT,
+            }),
+            submit(M9_S0_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_SUBMIT_AT[1] - M9_D3_SUBMIT_AT[0],
+            }),
+            submit(M9_D3_SECOND_REQUEST, 1),
+            ScenarioOp::Time(TimeOp::Advance {
+                ticks: M9_D3_MAX_TICKS - M9_D3_SUBMIT_AT[1],
+            }),
+        ],
+    )
+}

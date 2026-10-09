@@ -21,7 +21,9 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::time::{Tick, TimerFired};
-use rdb_core::replication::catchup::{retransmit_timer, CatchupCursor, Stop, MAX_PROBE_ROUNDS};
+use rdb_core::replication::catchup::{
+    retransmit_timer, CatchupCursor, Repeat, Stop, MAX_PROBE_ROUNDS,
+};
 use rdb_core::replication::progress::{DigestLadder, DigestLookup};
 
 const COPY_B: CopyId = CopyId(1);
@@ -1499,4 +1501,182 @@ mod routed {
             })
             .collect()
     }
+}
+
+// ---- M9 S0, stuck-cursor paths (lead ruling 2026-10-07, item 1) ----
+
+/// The copy's own ACK, unwrapped, for a judgment that takes an [`AppendAck`].
+fn ack(received: u64, applied: u64) -> AppendAck {
+    match accepted(received, applied) {
+        AppendOutcome::Accepted(ack) => ack,
+        other => unreachable!("accepted builds an ACK, not {other:?}"),
+    }
+}
+
+/// F3 in one cursor. B sent 10 with 9 applied; the copy's flush ACKed 9 durable with 10 staged,
+/// so the cursor moved on to 11. Then the copy's commit of 10 failed and it asked again from 9.
+/// The ACK for the re-sent 10 must move the cursor on: before the ruling it did not pass the
+/// mark's `received` of 10, so it was `Recorded`, nothing more was sent, and the copy stalled.
+#[retcd_test]
+fn m9_f3_a_need_below_the_mark_lets_the_ack_for_the_re_sent_record_move_the_cursor_on() {
+    let mut cursor = CatchupCursor::new(COPY_B);
+    assert_eq!(feed(&mut cursor, need_prefix(8, d(8))), vec![send(9)]);
+    assert_eq!(feed(&mut cursor, accepted(9, 9)), vec![send(10)]);
+    assert_eq!(feed(&mut cursor, accepted(10, 9)), vec![send(11)]);
+    assert_eq!(feed(&mut cursor, need_prefix(9, d(9))), vec![send(10)]);
+    assert_eq!(
+        cursor.mark().map(|(mark, _)| mark.received),
+        Some(ReceivedSeq(9)),
+        "the need lowers the mark's received to what the copy holds"
+    );
+    assert_eq!(
+        feed(&mut cursor, accepted(10, 10)),
+        vec![send(11)],
+        "the ACK for the re-sent 10 sends the next record"
+    );
+}
+
+/// The other half of the same rule: a need never raises the mark. A need above it is not an
+/// ACK, and the mark is what the repeat judgment reads, so raising it would turn the copy's next
+/// ACK at the mark into a `BelowMark` repeat that answers `Recorded` and reports nothing.
+#[retcd_test]
+fn m9_f3_a_need_above_the_mark_leaves_it_where_the_acks_put_it() {
+    let mut cursor = CatchupCursor::new(COPY_B);
+    assert_eq!(feed(&mut cursor, need_prefix(8, d(8))), vec![send(9)]);
+    assert_eq!(feed(&mut cursor, accepted(9, 9)), vec![send(10)]);
+    assert_eq!(feed(&mut cursor, need_prefix(11, d(11))), vec![send(12)]);
+    assert_eq!(
+        cursor.mark().map(|(mark, _)| mark.received),
+        Some(ReceivedSeq(9)),
+        "the need does not raise the mark"
+    );
+    assert_eq!(
+        cursor.repeat(&ack(9, 9), &ladder()),
+        Some(Repeat::AtMark),
+        "an ACK at the mark is still judged at the mark"
+    );
+}
+
+/// How many of `effects` are `CopyCaughtUp`, `PeerProgress` and `DurableAdvanced`.
+fn caught_progress_durable(effects: &[EffectKind]) -> (usize, usize, usize) {
+    let count = |want: fn(&KernelEffect) -> bool| {
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, EffectKind::Kernel(kernel) if want(kernel)))
+            .count()
+    };
+    (
+        count(|kernel| matches!(kernel, KernelEffect::CopyCaughtUp { .. })),
+        count(|kernel| matches!(kernel, KernelEffect::PeerProgress { .. })),
+        count(|kernel| matches!(kernel, KernelEffect::DurableAdvanced { .. })),
+    )
+}
+
+/// `catching_up_b()` carried to the head and dropped there, the head then grown to `head`, and
+/// then a late copy of B's first need, `NeedPrefix{have 10}`, followed by B's `AlreadyHave`. The
+/// late need starts a fresh cursor with no mark — Fix A has nothing to lower — and 11 in flight.
+fn late_need_after_catch_up(head: u64) -> rdb_core::replication::Replication {
+    use rdb_core::contracts::event::KernelEvent;
+    use routed::{b_ack, catching_up_b, cursor, from_b, sends, step};
+    let mut module = catching_up_b();
+    let effects = step(&mut module, 1, from_b(&b_ack(11, 11))).expect("routed");
+    assert_eq!(sends(&effects), vec![12], "{effects:?}");
+    let effects = step(&mut module, 2, from_b(&b_ack(12, 12))).expect("routed");
+    assert_eq!(caught_progress_durable(&effects).0, 1, "{effects:?}");
+    assert!(cursor(&module).is_none(), "a caught-up cursor is dropped");
+    for seq in HEAD + 1..=head {
+        let applied = EventKind::Kernel(KernelEvent::LocalApplied {
+            seq: Seq(seq),
+            bytes: 1,
+            record_digest: d(seq),
+        });
+        step(&mut module, 3, applied).expect("routed");
+    }
+    let late = step(&mut module, 4, from_b(&need_prefix(10, d(10)))).expect("routed");
+    assert_eq!(
+        sends(&late),
+        vec![11],
+        "the late need starts a fresh cursor: {late:?}"
+    );
+    assert_eq!(cursor(&module).and_then(CatchupCursor::mark), None);
+    let have = step(&mut module, 5, from_b(&AppendOutcome::AlreadyHave)).expect("routed");
+    assert_eq!(sends(&have), Vec::<u64>::new(), "{have:?}");
+    module
+}
+
+/// M9 S0, F3 duplicated need (lead rulings 2026-10-07: item 1, and the AtMark drive after the
+/// stop-and-ask). B's ACK at 12 after the late need repeats what the tracker knows, so it is
+/// judged `AtMark` against it. With the head at 12 it must still reach the fresh cursor and
+/// close it: otherwise 11 stays unacked, the retransmit timer re-sends it for ever, and B is
+/// never sent another record (the sim row `m9_f3_01`). The ACK yields the tracker's own
+/// `PeerProgress` for a repeat it admits (B-R67d) and then `CopyCaughtUp`, the copy's second for
+/// this head, which the ruling accepts: during a rebuild `displaces` absorbs it, after activation
+/// it is ignored. No second `PeerProgress`, no `DurableAdvanced`, and the same ACK again sends
+/// nothing.
+#[retcd_test]
+fn m9_f3_b_a_late_need_after_catch_up_at_the_head_is_closed_by_the_copys_next_ack() {
+    use routed::{b_ack, cursor, from_b, sends, step};
+    let mut module = late_need_after_catch_up(HEAD);
+    let repeat = step(&mut module, 6, from_b(&b_ack(12, 12))).expect("routed");
+    assert!(
+        cursor(&module).is_none(),
+        "the copy's ACK at the head closes the fresh cursor: {:?}",
+        cursor(&module).map(CatchupCursor::unacked)
+    );
+    assert_eq!(
+        repeat,
+        vec![
+            kernel(KernelEffect::PeerProgress {
+                peer: NodeId(2),
+                contiguous_seq: Seq(HEAD),
+            }),
+            kernel(KernelEffect::CopyCaughtUp {
+                copy: COPY_B,
+                head: Seq(HEAD),
+                digest: d(HEAD),
+            }),
+        ]
+    );
+    let again = step(&mut module, 7, from_b(&b_ack(12, 12))).expect("routed");
+    assert_eq!(sends(&again), Vec::<u64>::new(), "{again:?}");
+    assert_eq!(caught_progress_durable(&again).0, 0, "{again:?}");
+    assert_eq!(caught_progress_durable(&again).2, 0, "{again:?}");
+    assert!(cursor(&module).is_none());
+}
+
+/// The same path with the head past B (13): the ACK at 12 reaches the fresh cursor, which is sent
+/// 13 next, as the sim row's copy is sent seq 6. One `PeerProgress` (the tracker's), no
+/// `DurableAdvanced`, no `CopyCaughtUp`. The same ACK again is now a repeat of the cursor's own
+/// mark and sends nothing.
+#[retcd_test]
+fn m9_f3_b_a_late_need_after_catch_up_below_the_head_sends_the_next_record() {
+    use routed::{b_ack, cursor, from_b, sends, step};
+    let mut module = late_need_after_catch_up(HEAD + 1);
+    let repeat = step(&mut module, 6, from_b(&b_ack(12, 12))).expect("routed");
+    assert_eq!(sends(&repeat), vec![HEAD + 1], "{repeat:?}");
+    assert_eq!(caught_progress_durable(&repeat), (0, 1, 0), "{repeat:?}");
+    let running = cursor(&module).expect("still catching B up");
+    assert_eq!(running.unacked(), Some(Seq(HEAD + 1)));
+    let again = step(&mut module, 7, from_b(&b_ack(12, 12))).expect("routed");
+    assert_eq!(sends(&again), Vec::<u64>::new(), "{again:?}");
+    assert_eq!(caught_progress_durable(&again).0, 0, "{again:?}");
+    assert_eq!(caught_progress_durable(&again).2, 0, "{again:?}");
+}
+
+/// Only an ACK the ladder admits reaches a cursor that has taken no ACK (B-R48, made explicit by
+/// the M9 S0 ruling 2026-10-07: `on_repeat_at_mark` names the copy it admitted). B's cursor has
+/// 11 in flight and no mark, and the tracker knows B at 0. A stale ACK from B at 0 repeats that
+/// exactly, so it is judged `AtMark`, but the ladder holds no rung below 5 to verify it. It
+/// answers `Recorded` and changes nothing; handed to the cursor, it would become the cursor's
+/// mark and move what B is sent next. (A digest the ladder refutes never gets this far: the
+/// judgment rejects it, and it escalates as before.)
+#[retcd_test]
+fn m9_f3_b_an_unverifiable_repeat_does_not_reach_a_cursor_with_no_mark() {
+    use routed::{b_ack, catching_up_b, cursor, from_b, step};
+    let mut module = catching_up_b();
+    assert_eq!(cursor(&module).and_then(CatchupCursor::mark), None);
+    let before = module.clone();
+    let effects = step(&mut module, 1, from_b(&b_ack(0, 0))).expect("routed");
+    assert_eq!(effects, vec![replica(ReplicaIgnoreReason::Recorded)]);
+    assert_eq!(module, before, "the stale ACK changes nothing");
 }

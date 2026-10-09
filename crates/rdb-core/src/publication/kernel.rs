@@ -376,6 +376,12 @@ pub enum PubEffect {
         /// The answer.
         outcome: StatusOutcome,
     },
+    /// A status query refused: it named [`RequestIdentity::START_RECORD`], the kernel's own
+    /// start record, which no client wrote and which has no status entry (M9 S0).
+    StatusQueryRefused {
+        /// The identity asked about.
+        request: RequestIdentity,
+    },
     /// A mode answer.
     Mode {
         /// Who asked.
@@ -464,6 +470,20 @@ fn refuse(reader: RequestIdentity, intent: ReadIntent, kind: ErrorKind) -> PubEf
 /// [`DenyReason::client_error_kind`], the one T1 answers with too (lead ruling A-R72a).
 const fn deny_kind(reason: DenyReason) -> ErrorKind {
     reason.client_error_kind(Boundary::PreApply)
+}
+
+/// The mode a `Recovered` puts P1 in: an active or degraded recovery serves, a read-only one is
+/// frozen for it, a blocked one stays blocked for its reason.
+fn recovered_mode(mode: &PartitionMode) -> PubMode {
+    match mode {
+        PartitionMode::Active | PartitionMode::DegradedRf2 => PubMode::Serving,
+        PartitionMode::ReadOnly => PubMode::Frozen {
+            cause: FreezeCause::RecoveryReadOnly,
+        },
+        PartitionMode::Blocked { reason } => PubMode::Blocked {
+            reason: reason.clone(),
+        },
+    }
 }
 
 /// The pending candidate, as a row may assert it. No sequence: §4.3 invariant 2 forbids a `pub`
@@ -785,6 +805,10 @@ impl PubKernel {
                 request,
                 generation,
             } => {
+                // The kernel's start record has no status entry and no client (M9 S0).
+                if request == RequestIdentity::START_RECORD {
+                    return vec![PubEffect::StatusQueryRefused { request }];
+                }
                 let outcome = match generation {
                     Some(generation) => self.status_for(request, generation),
                     None => self.status.lookup_any(request),
@@ -841,13 +865,11 @@ impl PubKernel {
         self.next_timer_version += 1;
         let deadline = TimerVersion(self.next_timer_version);
         let at = Tick(now.0.saturating_add(self.config.post_apply_deadline_millis));
-        let mut effects = vec![
-            PubEffect::ArmTimer {
-                version: deadline,
-                at,
-            },
-            self.write_status(now, &cand, StatusOutcome::Unknown),
-        ];
+        let mut effects = vec![PubEffect::ArmTimer {
+            version: deadline,
+            at,
+        }];
+        effects.extend(self.write_status(now, &cand, StatusOutcome::Unknown));
         if not_serving {
             effects.push(PubEffect::Fact(PubFact::CandidateWhileNotServing {
                 mode: self.mode.clone(),
@@ -1065,13 +1087,14 @@ impl PubKernel {
         // Quarantine: the bytes stay where they are, in a namespace nobody reads (K-A-22).
         pending.qualifying = None;
         pending.recheck = None;
-        let mut effects = vec![
-            self.write_status(now, &cand, StatusOutcome::Unknown),
-            PubEffect::Fact(PubFact::Quarantined {
-                generation: cand.lineage.generation,
-                seq: cand.seq,
-            }),
-        ];
+        let mut effects: Vec<PubEffect> = self
+            .write_status(now, &cand, StatusOutcome::Unknown)
+            .into_iter()
+            .collect();
+        effects.push(PubEffect::Fact(PubFact::Quarantined {
+            generation: cand.lineage.generation,
+            seq: cand.seq,
+        }));
         if !matches!(self.mode, PubMode::Blocked { .. }) {
             self.mode = PubMode::Frozen {
                 cause: FreezeCause::AuthorityLost(reason),
@@ -1090,13 +1113,16 @@ impl PubKernel {
         // 1. The published position. Nothing is ever handed out above it.
         self.published_seq = cand.seq;
         // 2. Status.
-        let mut effects = vec![self.write_status(
-            now,
-            &cand,
-            StatusOutcome::Published {
-                result: cand.pending_result,
-            },
-        )];
+        let mut effects: Vec<PubEffect> = self
+            .write_status(
+                now,
+                &cand,
+                StatusOutcome::Published {
+                    result: cand.pending_result,
+                },
+            )
+            .into_iter()
+            .collect();
         // 3. Release the waiters onto the new position.
         let published = self.published();
         effects.extend(self.waiters.drain(..).map(|w| PubEffect::Answer {
@@ -1117,22 +1143,25 @@ impl PubKernel {
         effects.push(PubEffect::CancelTimer {
             version: pending.deadline,
         });
-        // 5. The fourth revalidation; the reply state moves, it is not dropped (K-A-40).
-        let correlation = self.mint_correlation();
-        effects.push(PubEffect::AuthorityCheck {
-            checkpoint: Checkpoint::Reply,
-            lineage: cand.lineage,
-            correlation,
-        });
-        self.awaiting_reply.insert(
-            correlation,
-            AwaitingReply {
-                request: cand.request,
-                seq: cand.seq,
-                result: cand.pending_result,
-                replied: pending.replied,
-            },
-        );
+        // 5. The fourth revalidation; the reply state moves, it is not dropped (K-A-40). The
+        //    kernel's own start record has no client to answer, so it has no reply (M9 S0 rule 5).
+        if cand.request != RequestIdentity::START_RECORD {
+            let correlation = self.mint_correlation();
+            effects.push(PubEffect::AuthorityCheck {
+                checkpoint: Checkpoint::Reply,
+                lineage: cand.lineage,
+                correlation,
+            });
+            self.awaiting_reply.insert(
+                correlation,
+                AwaitingReply {
+                    request: cand.request,
+                    seq: cand.seq,
+                    result: cand.pending_result,
+                    replied: pending.replied,
+                },
+            );
+        }
         // 7. Resolving the transaction is what unfreezes it; no other cause reopens (K-A-47).
         if self.mode
             == (PubMode::Frozen {
@@ -1170,13 +1199,18 @@ impl PubKernel {
                 cause: FreezeCause::UnresolvedTransaction,
             };
         }
-        let mut effects = vec![
-            self.write_status(now, &cand, StatusOutcome::Unknown),
-            PubEffect::Reply {
+        let mut effects: Vec<PubEffect> = self
+            .write_status(now, &cand, StatusOutcome::Unknown)
+            .into_iter()
+            .collect();
+        // The start record freezes the partition like any unresolved record, but no client waits
+        // on it, so it is answered to nobody (M9 S0 rule 5).
+        if cand.request != RequestIdentity::START_RECORD {
+            effects.push(PubEffect::Reply {
                 request: cand.request,
                 outcome: ReplyOutcome::Unknown,
-            },
-        ];
+            });
+        }
         effects.extend(self.drain_waiters());
         effects
     }
@@ -1479,6 +1513,27 @@ impl PubKernel {
     }
 
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
+        // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
+        // was published, the candidate pending and the replies owed all belong to this lineage,
+        // so only the mode changes. The view kept is still the published one: the lineage and
+        // the published position are unchanged, and the host inherits storage only on a first
+        // landing. So it stays (PR #33 F-002, amending D3 rule 4): a real host binds a new view
+        // at its applied position, so moving it while a candidate is applied above the
+        // published position lost it until that candidate published. Only when no view is kept
+        // is one asked for.
+        if self.lineage == result.selected.root {
+            let mut effects = if self.kept.is_some() {
+                Vec::new()
+            } else {
+                self.move_view()
+            };
+            let mode = recovered_mode(&result.mode);
+            if self.mode != mode {
+                self.mode = mode;
+                effects.extend(self.drain_waiters());
+            }
+            return effects;
+        }
         self.lineage = result.selected.root;
         self.published_seq = result.selected.cutoff_seq;
         self.status.fold_recovered(&result.retained_status_map);
@@ -1507,15 +1562,7 @@ impl PubKernel {
         // asked at a position no longer published.
         effects.extend(self.move_view());
         self.pending = None;
-        self.mode = match &result.mode {
-            PartitionMode::Active | PartitionMode::DegradedRf2 => PubMode::Serving,
-            PartitionMode::ReadOnly => PubMode::Frozen {
-                cause: FreezeCause::RecoveryReadOnly,
-            },
-            PartitionMode::Blocked { reason } => PubMode::Blocked {
-                reason: reason.clone(),
-            },
-        };
+        self.mode = recovered_mode(&result.mode);
         // Not in the design: a waiter queued behind the dropped candidate would otherwise hang.
         // `Serving` and read-only answer it at the rebased position; `Blocked` refuses it.
         effects.extend(self.drain_waiters());
@@ -1535,7 +1582,12 @@ impl PubKernel {
         now: Tick,
         cand: &AppliedCandidate,
         outcome: StatusOutcome,
-    ) -> PubEffect {
+    ) -> Option<PubEffect> {
+        // The kernel's own start record has no status entry (M9 S0 rule 5): no client asked for
+        // it, and a status query for its identity is refused.
+        if cand.request == RequestIdentity::START_RECORD {
+            return None;
+        }
         // `snapshot` stays `None`: P1 never mints a handle (K-A-27), and the kernel does not see
         // the storage view that owns one. The published position is `(lineage.generation, seq)`.
         let entry = StatusEntry {
@@ -1547,13 +1599,13 @@ impl PubKernel {
             snapshot: None,
             at: now,
         };
-        match self.status.record(entry) {
+        Some(match self.status.record(entry) {
             Ok(()) => PubEffect::Status(Box::new(entry)),
             Err(error) => PubEffect::StatusRefused {
                 request: cand.request,
                 error,
             },
-        }
+        })
     }
 }
 

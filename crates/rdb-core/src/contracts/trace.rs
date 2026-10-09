@@ -1108,6 +1108,15 @@ pub enum TraceKind {
         oldest_unsafe_age_ms: u64,
         /// The required-copy set.
         required_copy_set: Vec<NodeId>,
+        /// The copies L1 holds lost (`AdmissionState::lost_copies`), by node through L1's pinned
+        /// configuration, sorted. ADR-rdb-0006 §1: the lag domain is the copies minus self minus
+        /// lost, so a lost copy does not gate resume, and the INV-LAG oracle subtracts this set
+        /// from `required_copy_set` (M9 S0 ruling 2026-10-07, item 5).
+        ///
+        /// Additive: omitted when empty, and a trace written before it decodes empty, which is
+        /// exactly the clause those traces were judged by.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        lost_copy_set: Vec<NodeId>,
         /// The configuration that set is pinned to. On the same event so that "unsafe age reset
         /// via membership renaming" is catchable (spec §6.2).
         config_version: ConfigVersion,

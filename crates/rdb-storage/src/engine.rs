@@ -432,7 +432,8 @@ impl RocksEngine {
     /// `flush_wal(true)` syncs the whole engine WAL, so each prefix is confirmed through
     /// `min(captured, applied)`. The `durable` marks are written **after** the sync returns, in
     /// a separate unsynced write: on a host crash they can lag, never lead. Writing them first
-    /// would make a failed sync a false durable mark.
+    /// would make a failed sync a false durable mark. A lineage the engine was never given is
+    /// durable through 0 and stays unknown: the sync creates nothing (defect D7).
     ///
     /// # Errors
     ///
@@ -454,6 +455,23 @@ impl RocksEngine {
         let mut durable = Vec::with_capacity(captured.len());
         let mut raised = Vec::new();
         for capture in &captured {
+            // A lineage this engine was never given holds nothing: its durable prefix is the
+            // empty one, and the sync creates no entry for it. One it made was a child with
+            // "history" that the inherit creating the lineage later refused (defect D7).
+            if !next.contains_key(&(capture.partition, capture.generation)) {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    partition = capture.partition.0,
+                    generation = capture.generation.0,
+                    "wal_sync_unknown_lineage"
+                );
+                durable.push(DurablePrefix {
+                    partition: capture.partition,
+                    generation: capture.generation,
+                    through: DurableSeq(0),
+                });
+                continue;
+            }
             // An inherited base is the parent's batches in this same WAL, so the sync that makes
             // it durable in the child makes it durable in every ancestor, through each level's
             // base (`MemoryEngine::sync_ancestors`).
@@ -515,7 +533,7 @@ impl RocksEngine {
             );
         }
         for (capture, prefix) in captured.iter().zip(&durable) {
-            tracing::info!(
+            tracing::debug!(
                 target: LOG_TARGET,
                 partition = capture.partition.0,
                 generation = capture.generation.0,

@@ -22,6 +22,7 @@
 //! * [`contracts`] — the seams. One module per seam; see its table.
 //! * [`authority`], [`transaction`], [`replication`], [`publication`], [`protection`],
 //!   [`recovery`] — the six kernel modules, one per spike §5 package.
+//! * [`route`] — which modules a kernel fact reaches, and in what order. Every host shares it.
 //!
 //! # State (2026-09-20)
 //!
@@ -42,6 +43,7 @@ pub mod protection;
 pub mod publication;
 pub mod recovery;
 pub mod replication;
+pub mod route;
 pub mod transaction;
 
 pub use contracts::authority::{

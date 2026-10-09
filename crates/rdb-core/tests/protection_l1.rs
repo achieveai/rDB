@@ -2239,3 +2239,23 @@ fn the_pin_order_does_not_decide_the_resume() {
         assert_allow_within_one_hold(allow, 300);
     }
 }
+
+/// M9 S0 (critic M2 on the S0 options). At cut 0 a `Gained` alone takes L1 from `Paused` to
+/// `Reprotecting` and no further: with no `PeerProgress` from any peer the lag stays infinite
+/// and admission is never allowed. So an edge with no ACK behind it cannot open an empty
+/// partition; the start record's ACKs must. Twin, one fact apart: B and C reporting every 100 ms
+/// resume after the 5 s hold.
+#[retcd_test]
+fn m9_s0_11_l1_gained_alone_without_peer_progress_stays_reprotecting() {
+    let mut p = reprotecting_at(0);
+    for t in (50..=60_000).step_by(50) {
+        assert!(no_allow(&health(&mut p, t)), "t={t}");
+    }
+    assert_eq!(p.mode(), Some(Mode::Reprotecting { below_since: None }));
+    let s = state(&p, 60_000);
+    assert!(!s.allow);
+    assert_eq!(s.replication_lag, ReplicationLag::INFINITE);
+
+    let mut twin = reprotecting_at(0);
+    assert_eq!(run(&mut twin, 0, 20_000, |_, _| true), Some(5_100));
+}

@@ -6,7 +6,7 @@
 //! while removing it could hand two processes the same partition.
 //!
 //! [`clear_restarted_grant`] removes it, by an exact-revision delete, only when **all three**
-//! guards hold:
+//! guards of [`rdb_core::authority::grant::clear_verdict`] hold:
 //!
 //! 1. the record is not frozen: a frozen record belongs to a takeover (spec §7.3 step 1), and
 //!    the takeover, not this service, decides what happens to it;
@@ -22,9 +22,8 @@
 //! This is a model of a service, not the service: it lives in the simulator because rEtcd's
 //! planner does not exist yet, and a row that wants a restarted node to serve again calls it.
 
-use rdb_core::authority::clock::{expiry_proven, ClockView};
-use rdb_core::authority::grant::GrantRecord;
-use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
+use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::control::{CasOutcome, ControlKey, ControlPrefix, ReadOutcome};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{BootId, NodeId, PartitionId, Revision};
@@ -84,27 +83,31 @@ pub fn clear_restarted_grant(
     let record = GrantRecord::decode(&value).ok_or(SimError::Config {
         field: "control_records",
     })?;
-    if record.boot == boot {
-        return Ok(Clearance::Current);
-    }
-    if record.frozen {
-        return Ok(Clearance::Refused(Refusal::Frozen));
-    }
-    let mut clock = ClockView::new();
-    clock.accept(sample);
-    if expiry_proven(&clock, record.expiry_utc_ms, now, budgets).is_none() {
-        return Ok(Clearance::Refused(Refusal::NotProvenExpired));
-    }
-    let (_, partitions) = control.snapshot_family(ControlPrefix::Partitions)?;
-    for entry in partitions {
-        let partition = PartitionRecord::decode(&entry.value).ok_or(SimError::Config {
-            field: "control_records",
-        })?;
-        if partition.owner == node && partition.lifecycle != PartitionLifecycle::Serving {
-            return Ok(Clearance::Refused(Refusal::PartitionInTransfer(
-                partition.partition,
-            )));
+    // The three guards are `rdb_core`'s. Only this model calls them today; an S2 host admin is
+    // planned to share them.
+    let verdict = clear_verdict(node, &record, boot, sample, now, budgets, || {
+        let (_, partitions) = control.snapshot_family(ControlPrefix::Partitions)?;
+        partitions
+            .iter()
+            .map(|entry| {
+                PartitionRecord::decode(&entry.value).ok_or(SimError::Config {
+                    field: "control_records",
+                })
+            })
+            .collect()
+    })?;
+    match verdict {
+        ClearVerdict::Current => return Ok(Clearance::Current),
+        ClearVerdict::Refused(ClearRefusal::Frozen) => {
+            return Ok(Clearance::Refused(Refusal::Frozen))
         }
+        ClearVerdict::Refused(ClearRefusal::NotProvenExpired) => {
+            return Ok(Clearance::Refused(Refusal::NotProvenExpired))
+        }
+        ClearVerdict::Refused(ClearRefusal::PartitionInTransfer(partition)) => {
+            return Ok(Clearance::Refused(Refusal::PartitionInTransfer(partition)))
+        }
+        ClearVerdict::Clear => {}
     }
     Ok(match control.scenario_cas(key, Some(revision), None) {
         CasOutcome::Committed(at) => Clearance::Cleared(at),

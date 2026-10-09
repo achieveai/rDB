@@ -118,6 +118,7 @@ fn protection(
         phase,
         oldest_unsafe_age_ms: age_ms,
         required_copy_set: required.to_vec(),
+        lost_copy_set: Vec::new(),
         config_version,
         paused_prefix_seq: paused_prefix,
         resume_barrier_seq: barrier,
@@ -2603,6 +2604,60 @@ fn m7v_37_lag_resume_with_lag_above_250ms_inside_the_hold_violates() {
     );
 }
 
+/// `trace` with its last `Healthy` line naming `lost` as the copies L1 holds lost.
+fn lost_at_resume(mut trace: Trace, lost: &[NodeId]) -> Trace {
+    let healthy = trace
+        .events
+        .iter_mut()
+        .rev()
+        .find_map(|event| match &mut event.kind {
+            TraceKind::ProtectionState {
+                phase: ProtectionPhase::Healthy,
+                lost_copy_set,
+                ..
+            } => Some(lost_copy_set),
+            _ => None,
+        })
+        .expect("lag_cycle ends Healthy");
+    *healthy = lost.to_vec();
+    trace
+}
+
+/// M9 S0 F2 (ruling 2026-10-07, item 5; ADR-rdb-0006 §1: the lag domain is the copies minus
+/// self minus lost). Clause (a) quantifies over the pinned set less the copies the resume line
+/// names lost: n3 lost and short of the barrier, the other two at it, is a legal resume. Near-
+/// misses: the lost set excuses only its own nodes, so n1 short beside a lost n3 still reports n1
+/// alone; and the same run with nothing lost reports n3, as before the field existed.
+#[retcd_test]
+fn m9_f2_b_lag_a_lost_copy_does_not_gate_resume_and_excuses_no_other() {
+    support::preamble();
+    let n3_short = || lag_cycle("m9-f2-b", &[(N1, Seq(40)), (N2, Seq(40))], 240, 8_000);
+    proven(&judge(&lost_at_resume(n3_short(), &[N3])), Invariant::Lag);
+
+    let n1_short = lost_at_resume(lag_cycle("m9-f2-b", &[(N2, Seq(40))], 240, 8_000), &[N3]);
+    let signature = violated(
+        &judge(&n1_short),
+        Invariant::Lag,
+        "resume_without_every_pinned_copy",
+    );
+    assert!(
+        signature.detail.contains("node(s) 1 short"),
+        "only n1 is short: {}",
+        signature.detail
+    );
+
+    let signature = violated(
+        &judge(&n3_short()),
+        Invariant::Lag,
+        "resume_without_every_pinned_copy",
+    );
+    assert!(
+        signature.detail.contains("node(s) 3 short"),
+        "{}",
+        signature.detail
+    );
+}
+
 #[retcd_test]
 fn m7v_38_lag_unsafe_age_reset_by_a_config_version_change_violates() {
     support::preamble();
@@ -3072,4 +3127,58 @@ fn m7v_88_every_oracle_fixture_passes_the_runners_validator() {
         );
     }
     tracing::info!("m7v_88 every oracle construction refuses an unrealizable trace");
+}
+
+// ------------------------------------------------------------------------------------------
+// INV-LAG — M9 S0: the start record
+// ------------------------------------------------------------------------------------------
+
+/// An empty partition's pause-to-healthy cycle (barrier 0). The record at seq 1 is applied under
+/// [`CORR2`], admitted first when `admitted`; every pinned copy is then durable at `durable`.
+fn start_cycle(case: &str, admitted: bool, durable: Seq) -> Trace {
+    let pinned =
+        |phase, age, since| protection(phase, age, &[N1, N2, N3], CONFIG_V1, Seq(0), Seq(0), since);
+    let mut b = base(case).about(CORR2).at(1_000);
+    if admitted {
+        b = b.push(admit(Seq(1), &[N1, N2, N3], CONFIG_V1));
+    }
+    b = b
+        .at(2_000)
+        .about(CORR1)
+        .push(pinned(ProtectionPhase::Paused, 1_800, None))
+        .about(CORR2)
+        .apply(Seq(1), &[], ApplyOutcome::Applied)
+        .about(CORR1);
+    for node in [N1, N2, N3] {
+        b = b.flush(node, durable);
+    }
+    b.at(3_000)
+        .push(pinned(ProtectionPhase::Resuming, 0, Some(3_000)))
+        .at(8_000)
+        .push(pinned(ProtectionPhase::Healthy, 0, Some(3_000)))
+        .build()
+}
+
+#[retcd_test]
+fn m9_s0_13_lag_the_start_record_alone_past_barrier_zero_is_clean() {
+    support::preamble();
+    // An empty partition pauses at barrier 0, where every copy already is, so the barrier cannot
+    // gate the resume: the start record at seq 1 is what lets L1 resume (M9 S0 rule 1).
+    proven(
+        &judge(&start_cycle("m9-s0-13", false, Seq(1))),
+        Invariant::Lag,
+    );
+
+    // Seq 1 carrying an admitted write is an overshoot, as before.
+    violated(
+        &judge(&start_cycle("m9-s0-13b", true, Seq(1))),
+        Invariant::Lag,
+        "resume_barrier_not_exact",
+    );
+    // So is anything past seq 1, start record or not.
+    violated(
+        &judge(&start_cycle("m9-s0-13c", false, Seq(2))),
+        Invariant::Lag,
+        "resume_barrier_not_exact",
+    );
 }
