@@ -762,7 +762,10 @@ async fn paused_build_outlasting_the_trigger_wait_still_yields_its_id() {
 
     pause.release();
     let id = waiting.await;
-    assert_ne!(id, a, "the id must be B, not the snapshot current before the trigger");
+    assert_ne!(
+        id, a,
+        "the id must be B, not the snapshot current before the trigger"
+    );
     assert_eq!(
         cluster
             .rocks_store(leader)

@@ -64,7 +64,7 @@ use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
-use rdb_core::transaction::Transaction;
+use rdb_core::transaction::{Limits, Transaction};
 use rdb_storage::{RocksEngine, RocksSnapshot};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::keys::{root_key, RootKey};
@@ -323,19 +323,17 @@ pub enum ClientCall {
         /// The kernel deadline.
         remaining_millis: u64,
     },
-    /// Compile a put exactly as [`ClientCall::Put`] does, and answer [`Answer::Compiled`]
-    /// without sending it. The caller holds the request before anything is sent, so every
-    /// later outcome, its own timeout included, can hand it back for an unchanged
-    /// [`ClientCall::Resend`] (defect w24).
+    /// Compile one transaction of `puts`, each as [`ClientCall::Put`] compiles its one, and
+    /// answer [`Answer::Compiled`] without sending it. The caller holds the request before
+    /// anything is sent, so every later outcome, its own timeout included, can hand it back for
+    /// an unchanged [`ClientCall::Resend`] (defect w24). The request's affinity is the first
+    /// put's group, or group 1 with no puts, which the kernel then refuses. One put that does
+    /// not compile refuses the whole transaction, naming it as `op <index>`.
     Compile {
         /// The identity minted for it.
         identity: RequestIdentity,
-        /// The object id.
-        object: Bytes,
-        /// The bytes.
-        value: Bytes,
-        /// Write only if the object is at this version.
-        if_version: Option<u64>,
+        /// The puts, in request order.
+        puts: Vec<PutOp>,
         /// The kernel deadline.
         remaining_millis: u64,
     },
@@ -366,6 +364,21 @@ pub enum ClientCall {
         /// The generation the caller believes it ran in.
         generation: Option<Generation>,
     },
+}
+
+/// One put of a [`ClientCall::Compile`]: replace `object` in affinity group `group` with the
+/// byte string `value`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PutOp {
+    /// The affinity group the object lives in.
+    pub group: AffinityId,
+    /// The object id.
+    pub object: Bytes,
+    /// The bytes.
+    pub value: Bytes,
+    /// Write only if the object is at this version; `None` means the version the compile sees
+    /// (absent included).
+    pub if_version: Option<u64>,
 }
 
 /// A node's answer to a client call.
@@ -507,11 +520,20 @@ pub fn spawn(
     control: Arc<ControlAdapter>,
     clock: HostClock,
 ) -> Result<NodeHandle, String> {
-    spawn_with(node, dir, links, control, clock, Budgets::SPEC_DEFAULTS)
+    spawn_with(
+        node,
+        dir,
+        links,
+        control,
+        clock,
+        Budgets::SPEC_DEFAULTS,
+        Limits::default(),
+    )
 }
 
-/// [`spawn`] with `budgets` in place of the spec's. Crate tests shorten them, so a start is
-/// ready in well under a second; nothing outside the crate can.
+/// [`spawn`] with `budgets` in place of the spec's, and T1's `limits`. Crate tests shorten the
+/// budgets, so a start is ready in well under a second; nothing outside the crate can. `Db`
+/// lowers only `limits.dedup_cap`, as its `dedup_cap` option asks.
 pub(crate) fn spawn_with(
     node: NodeId,
     dir: PathBuf,
@@ -519,6 +541,7 @@ pub(crate) fn spawn_with(
     control: Arc<ControlAdapter>,
     clock: HostClock,
     budgets: Budgets,
+    limits: Limits,
 ) -> Result<NodeHandle, String> {
     let engine = RocksEngine::open(&dir)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
@@ -526,6 +549,7 @@ pub(crate) fn spawn_with(
     links.register(node, tx.clone());
     let mut host = Host::new(node, engine, links, control, clock);
     host.budgets = budgets;
+    host.transaction = Transaction::with_limits(limits);
     let join = std::thread::Builder::new()
         .name(format!("rdb-node-{}", node.0))
         .spawn(move || host.run(&rx))
@@ -2590,9 +2614,12 @@ impl Host {
                 .compile(
                     partition,
                     identity,
-                    &object,
-                    value,
-                    if_version,
+                    &[PutOp {
+                        group: AFFINITY,
+                        object,
+                        value,
+                        if_version,
+                    }],
                     remaining_millis,
                 )
                 .map_err(|detail| fail_waiter(&reply, detail))?
@@ -2612,20 +2639,11 @@ impl Host {
             },
             ClientCall::Compile {
                 identity,
-                object,
-                value,
-                if_version,
+                puts,
                 remaining_millis,
             } => {
                 let answer = match self
-                    .compile(
-                        partition,
-                        identity,
-                        &object,
-                        value,
-                        if_version,
-                        remaining_millis,
-                    )
+                    .compile(partition, identity, &puts, remaining_millis)
                     .map_err(|detail| fail_waiter(&reply, detail))?
                 {
                     Ok(request) => Answer::Compiled(request),
@@ -2638,6 +2656,7 @@ impl Host {
                     node = self.node.0,
                     partition = partition.0,
                     request = identity.request.0,
+                    puts = puts.len(),
                     compiled = matches!(answer, Answer::Compiled(_)),
                     "client_compile"
                 );
@@ -2738,15 +2757,14 @@ impl Host {
         Ok(())
     }
 
-    /// Compile a byte-string put against the step view. The outer error faults the node (the
-    /// step view could not be built); the inner one is the caller's.
+    /// Compile byte-string puts as one transaction against the step view. The outer error
+    /// faults the node (the step view could not be built); the inner one is the caller's: the
+    /// first put that does not compile refuses them all, named by its index, never its key.
     fn compile(
         &mut self,
         partition: PartitionId,
         identity: RequestIdentity,
-        object: &[u8],
-        value: Bytes,
-        if_version: Option<u64>,
+        puts: &[PutOp],
         remaining_millis: u64,
     ) -> Result<Result<TxnRequest, ApiError>, String> {
         let generation = self.adopted(partition).generation;
@@ -2759,26 +2777,47 @@ impl Host {
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("step view missing after refresh".into());
         };
-        let root = root_key(identity.tenant, AFFINITY, object);
-        let expected = match if_version {
-            Some(version) => Expected::Version(version),
-            None => view
-                .version(Namespace::User, root.as_bytes())
-                .map_or(Expected::Absent, Expected::Version),
-        };
-        let delta = Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]);
-        let compiled = match rdb_value::compile(view, &root, expected, &delta) {
-            Ok(compiled) => compiled,
-            Err(error) => return Ok(Err(compile_error(&error))),
-        };
+        // The first put's group is the request's affinity. A put in another group is refused
+        // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
+        let affinity = puts.first().map_or(AFFINITY, |put| put.group);
+        let (mut conditions, mut mutations) = (Vec::new(), Vec::new());
+        for (index, put) in puts.iter().enumerate() {
+            if put.group != affinity {
+                let mut refused = ApiError::from_kernel(&RdbError::CrossAffinity {
+                    expected: affinity,
+                    found: put.group,
+                });
+                refused.detail = format!("op {index}: {}", refused.detail);
+                return Ok(Err(refused));
+            }
+            let root = root_key(identity.tenant, put.group, &put.object);
+            let expected = match put.if_version {
+                Some(version) => Expected::Version(version),
+                None => view
+                    .version(Namespace::User, root.as_bytes())
+                    .map_or(Expected::Absent, Expected::Version),
+            };
+            let delta = Delta(vec![Op::Replace(Value::Bytes(put.value.to_vec()))]);
+            match rdb_value::compile(view, &root, expected, &delta) {
+                Ok(compiled) => {
+                    conditions.extend(compiled.conditions);
+                    mutations.extend(compiled.mutations);
+                }
+                Err(error) => {
+                    let mut refused = compile_error(&error);
+                    refused.detail = format!("op {index}: {}", refused.detail);
+                    return Ok(Err(refused));
+                }
+            }
+        }
         Ok(Ok(TxnRequest {
             api_version: API_VERSION,
             identity,
-            affinity: AFFINITY,
+            affinity,
             expected_generation: Some(view.generation()),
             remaining_millis,
-            conditions: compiled.conditions,
-            mutations: compiled.mutations,
+            conditions,
+            mutations,
         }))
     }
 
@@ -4566,16 +4605,7 @@ mod tests {
     fn a_call_whose_compile_faults_the_node_is_answered_with_the_host_fault() {
         for (name, call) in [
             ("put", put(1, b"a", b"1", None)),
-            (
-                "compile",
-                ClientCall::Compile {
-                    identity: identity(1),
-                    object: Bytes::from_static(b"a"),
-                    value: Bytes::from_static(b"1"),
-                    if_version: None,
-                    remaining_millis: 5_000,
-                },
-            ),
+            ("compile", compile(1, b"a", b"1")),
         ] {
             let dir = config_testkit::fs::temp_dir();
             let mut trio = Trio::new(dir.path(), Trio::fast);
@@ -4683,7 +4713,9 @@ mod tests {
     ///   payload still ends in `REQUEST_ID_REUSE`, but only once the put is answered (here, at
     ///   the heal): queued, it waits for the first call's answer, where before it was refused
     ///   at once. The given-up caller's resend is still submitted, as its `UNKNOWN_OUTCOME`
-    ///   allows, and publishes nothing more: the kernel de-duplicates it.
+    ///   allows, and publishes nothing more: the kernel de-duplicates it. A compile under the
+    ///   waiting identity does not queue either (S1 guard G11): it sends nothing, and it is
+    ///   how `retry N --payload` starts while request N still waits.
     /// - (b) A put under the identity of a read waiting at the barrier.
     /// - (c) A host fault answers the waiting call and every call queued behind it (F-001).
     #[config_log::retcd_test]
@@ -4704,13 +4736,7 @@ mod tests {
         };
 
         // (a)
-        let compiled = match trio.ask(ClientCall::Compile {
-            identity: identity(10),
-            object: Bytes::from_static(b"a"),
-            value: Bytes::from_static(b"2"),
-            if_version: None,
-            remaining_millis: 5_000,
-        }) {
+        let compiled = match trio.ask(compile(10, b"a", b"2")) {
             Answer::Compiled(request) => request,
             other => panic!("compile request 10: {other:?}"),
         };
@@ -4727,6 +4753,14 @@ mod tests {
         }) {
             Answer::Status(TxnStatus::Unknown) => {}
             other => panic!("status of request 10 while it waits: {other:?}"),
+        }
+        let recompiled = trio.call(compile(10, b"a", b"3"));
+        for _ in 0..3 {
+            trio.step();
+        }
+        match recompiled.try_recv() {
+            Ok(Answer::Compiled(request)) => assert_eq!(request.identity, identity(10)),
+            other => panic!("a compile under the waiting request 10 is not queued: {other:?}"),
         }
         let same = trio.call(ClientCall::Resend {
             request: compiled.clone(),
@@ -4867,13 +4901,7 @@ mod tests {
         let mut trio = Trio::new(dir.path(), Trio::fast);
         trio.bootstrap();
         trio.ready();
-        let compiled = match trio.ask(ClientCall::Compile {
-            identity: identity(1),
-            object: Bytes::from_static(b"a"),
-            value: Bytes::from_static(b"1"),
-            if_version: None,
-            remaining_millis: 5_000,
-        }) {
+        let compiled = match trio.ask(compile(1, b"a", b"1")) {
             Answer::Compiled(request) => request,
             other => panic!("compile request 1: {other:?}"),
         };
@@ -4968,9 +4996,12 @@ mod tests {
         trio.ready();
         let compiled = match trio.ask(ClientCall::Compile {
             identity: identity(1),
-            object: Bytes::from_static(b"a"),
-            value: Bytes::from_static(b"1"),
-            if_version: None,
+            puts: vec![PutOp {
+                group: AFFINITY,
+                object: Bytes::from_static(b"a"),
+                value: Bytes::from_static(b"1"),
+                if_version: None,
+            }],
             remaining_millis: REMAINING_MILLIS,
         }) {
             Answer::Compiled(request) => request,
@@ -5159,6 +5190,19 @@ mod tests {
             object: Bytes::from_static(object),
             value: Bytes::from_static(value),
             if_version,
+            remaining_millis: 5_000,
+        }
+    }
+
+    fn compile(request: u64, object: &'static [u8], value: &'static [u8]) -> ClientCall {
+        ClientCall::Compile {
+            identity: identity(request),
+            puts: vec![PutOp {
+                group: AFFINITY,
+                object: Bytes::from_static(object),
+                value: Bytes::from_static(value),
+                if_version: None,
+            }],
             remaining_millis: 5_000,
         }
     }

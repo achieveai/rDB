@@ -26,4 +26,6 @@ pub mod transport;
 #[cfg(test)]
 mod test_store;
 
-pub use db::{ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, Timeouts};
+pub use db::{
+    ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, Timeouts, TxnPut, MAX_TXN_DEADLINE,
+};

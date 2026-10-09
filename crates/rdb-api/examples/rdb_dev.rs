@@ -3,7 +3,11 @@
 //! ```text
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
+//!                                           [--dedup-cap N]
 //! ```
+//!
+//! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
+//! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
 //!
 //! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
 //! on spaces; `"..."` makes one word, so `""` is an empty object or value:
@@ -15,10 +19,21 @@
 //!                                         <object>: <answer>` when it lands; not remembered
 //!                                         for `retry`. Queued is not sent: `sleep` before a
 //!                                         next command that needs the put in flight
-//! retry [<request>]                       send a put's request again, unchanged: the latest
-//!                                         put's, or the one this session sent as <request>
+//! txn [--deadline-ms N] <op>...           write every op as one transaction, or none. An op
+//!                                         is [<group>:]<object>=<value>[@<version>]: the
+//!                                         object ends at the first `=`, a group is only a
+//!                                         leading `digits:` (default 1), and a version only a
+//!                                         trailing `@digits`. The deadline defaults to the put
+//!                                         timeout; past 30000 it is refused
+//! txn& [--deadline-ms N] <op>...          the same txn in the background, as `put&`: `bg txn:
+//!                                         queued`, then `bg txn: <answer>`; not remembered
+//! retry [<request>]                       send a put's or txn's request again, unchanged: the
+//!                                         latest one's, or the one this session sent as
+//!                                         <request>
+//! retry [<request>] --deadline-ms N       the same request with a fresh deadline of N ms
 //! retry [<request>] --payload <value>     the same put and request id with another value,
-//!                                         compiled afresh (REQUEST_ID_REUSE); not remembered
+//!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
+//!                                         A put's only, never a txn's
 //! get <object>                            read at the publication barrier
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
@@ -59,10 +74,10 @@ use bytes::Bytes;
 use config_core::{ConfigStore, ListRequest};
 use config_testkit::cluster::{Cluster, StorageKind};
 use rdb_api::host::NodeStatus;
-use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts};
+use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
 use rdb_core::authority::grant::GrantRecord;
 use rdb_core::authority::partition::PartitionRecord;
-use rdb_core::contracts::ids::{Generation, NodeId, RequestId};
+use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, RequestId};
 use rdb_core::contracts::txn::TxnRequest;
 
 #[derive(Debug)]
@@ -75,6 +90,8 @@ struct Args {
     /// How long a put waits for its answer. Short values reach the Db's own timeout,
     /// before the kernel answers (walk w24).
     put_timeout: Option<std::time::Duration>,
+    /// T1's dedup cap, lowered as a dev budget.
+    dedup_cap: Option<usize>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -86,6 +103,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         keep: false,
         hold: Vec::new(),
         put_timeout: None,
+        dedup_cap: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -100,6 +118,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .parse::<u64>()
                     .map_err(|_| format!("--put-timeout-ms takes a number, not {text:?}"))?;
                 parsed.put_timeout = Some(std::time::Duration::from_millis(millis));
+            }
+            "--dedup-cap" => {
+                let text = value("--dedup-cap")?;
+                parsed.dedup_cap = Some(
+                    text.parse::<usize>()
+                        .map_err(|_| format!("--dedup-cap takes a number, not {text:?}"))?,
+                );
             }
             "--hold" => {
                 for pair in value("--hold")?.split(',') {
@@ -184,11 +209,6 @@ where
             return ExitCode::from(1);
         }
     };
-    let cluster = rt.block_on(Cluster::start(3, StorageKind::ROCKS));
-    let leader = rt.block_on(cluster.leader());
-    let store = cluster.client(leader);
-    say(&format!("control up: 3 voters, leader {leader:?}"));
-    tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let config = DbConfig {
         dir: args.dir.clone(),
         hold: args.hold.clone(),
@@ -196,7 +216,18 @@ where
             put: args.put_timeout.unwrap_or(Timeouts::default().put),
             ..Timeouts::default()
         },
+        dedup_cap: args.dedup_cap,
     };
+    // Before the voters start (PC-2): a refused option starts nothing.
+    if let Err(e) = config.check() {
+        eprintln!("rdb_dev: open: {e}");
+        return ExitCode::from(1);
+    }
+    let cluster = rt.block_on(Cluster::start(3, StorageKind::ROCKS));
+    let leader = rt.block_on(cluster.leader());
+    let store = cluster.client(leader);
+    say(&format!("control up: 3 voters, leader {leader:?}"));
+    tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let mut db = match rt.block_on(open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,
         Err(e) => {
@@ -402,6 +433,7 @@ fn repl<'scope, 'env>(
     };
     let mut sent = Sent::default();
     let mut bad = false;
+    let deadline = args.put_timeout.unwrap_or(Timeouts::default().put);
     for line in input.lines() {
         let line = match command(line) {
             Ok(Some(line)) => line,
@@ -430,10 +462,11 @@ fn repl<'scope, 'env>(
             ["put", object, value, rest @ ..] => match parse_if_version(rest) {
                 Ok(if_version) => {
                     let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
-                    put_line(
-                        answer,
-                        Some((&mut sent, object.as_bytes().to_vec(), if_version)),
-                    );
+                    let kind = Kind::Put {
+                        object: object.as_bytes().to_vec(),
+                        if_version,
+                    };
+                    put_line(answer, Some((&mut sent, kind)));
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -446,14 +479,44 @@ fn repl<'scope, 'env>(
                     say(&format!("bg {object}: {}", put_text(&answer)));
                 });
             }),
+            ["txn", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
+                let answer = db.txn(&txn_puts(&ops), deadline);
+                put_line(answer, Some((&mut sent, Kind::Txn)));
+            }),
+            ["txn&", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
+                say("bg txn: queued");
+                scope.spawn(move || {
+                    let answer = db.txn(&txn_puts(&ops), deadline);
+                    say(&format!("bg txn: {}", put_text(&answer)));
+                });
+            }),
             ["retry", rest @ .., "--payload", value] => {
-                sent.pick(rest).map(|(request, object, if_version)| {
+                sent.pick(rest).and_then(|(request, kind)| {
                     let id = request.identity.request;
+                    let (object, if_version) = payload_put(kind, id)?;
                     put_line(db.put_as(id, &object, value.as_bytes(), if_version), None);
+                    Ok(())
                 })
             }
-            ["retry", rest @ ..] => sent.pick(rest).map(|(request, _, _)| {
-                put_line(db.resend(request), None);
+            ["retry", rest @ .., "--deadline-ms", millis] => match millis.parse::<u64>() {
+                Ok(ms) => sent.pick(rest).map(|(request, _)| {
+                    let deadline = Duration::from_millis(ms);
+                    let answer = db.resend_within(request, deadline);
+                    sent.resent_within(deadline, &answer);
+                    put_line(answer, None);
+                }),
+                Err(_) => Err("retry [<request>] --deadline-ms N: N is milliseconds".to_owned()),
+            },
+            ["retry", rest @ ..] => sent.pick(rest).map(|(request, kind)| {
+                let answer = match kind {
+                    Kind::Put { .. } => db.resend(request),
+                    // A txn waits as it was sent: its own deadline, not the put timeout.
+                    Kind::Txn => {
+                        let deadline = Duration::from_millis(request.remaining_millis);
+                        db.resend_within(request, deadline)
+                    }
+                };
+                put_line(answer, None);
             }),
             ["get", object] => {
                 get_line(db.get(object.as_bytes()));
@@ -575,6 +638,87 @@ fn split_words(line: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+/// One txn op as typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TxnOp {
+    group: u64,
+    object: String,
+    value: String,
+    if_version: Option<u64>,
+}
+
+fn txn_puts(ops: &[TxnOp]) -> Vec<TxnPut<'_>> {
+    ops.iter()
+        .map(|op| TxnPut {
+            group: AffinityId(op.group),
+            object: op.object.as_bytes(),
+            value: op.value.as_bytes(),
+            if_version: op.if_version,
+        })
+        .collect()
+}
+
+/// `[--deadline-ms N] <op>...`, with `default` as the deadline when none is given. No ops is
+/// not a usage error: the kernel refuses an empty transaction, and that is worth seeing.
+fn parse_txn(rest: &[&str], default: Duration) -> Result<(Duration, Vec<TxnOp>), String> {
+    const USAGE: &str = "txn [--deadline-ms N] [<group>:]<object>=<value>[@<version>]...";
+    let (deadline, ops) = match rest {
+        ["--deadline-ms", millis, ops @ ..] => (
+            Duration::from_millis(
+                millis
+                    .parse()
+                    .map_err(|_| format!("{USAGE}: --deadline-ms takes milliseconds"))?,
+            ),
+            ops,
+        ),
+        ops => (default, ops),
+    };
+    let ops = ops
+        .iter()
+        .map(|op| parse_op(op).map_err(|e| format!("{USAGE}: {e}")))
+        .collect::<Result<_, _>>()?;
+    Ok((deadline, ops))
+}
+
+/// `[<group>:]<object>=<value>[@<version>]` (S1 ruling A5): the object ends at the first `=`,
+/// a group is only a leading `digits:`, and a version only a trailing `@digits`. Anything else
+/// stays in the object or the value.
+fn parse_op(op: &str) -> Result<TxnOp, String> {
+    let (left, right) = op
+        .split_once('=')
+        .ok_or_else(|| format!("{op:?} has no `=`"))?;
+    let (group, object) = match left.split_once(':') {
+        Some((digits, object)) if is_digits(digits) => (
+            digits
+                .parse()
+                .map_err(|_| format!("{op:?}: group {digits} is too large"))?,
+            object,
+        ),
+        _ => (1, left),
+    };
+    let (value, if_version) = match right.rsplit_once('@') {
+        Some((value, digits)) if is_digits(digits) => (
+            value,
+            Some(
+                digits
+                    .parse()
+                    .map_err(|_| format!("{op:?}: version {digits} is too large"))?,
+            ),
+        ),
+        _ => (right, None),
+    };
+    Ok(TxnOp {
+        group,
+        object: object.to_owned(),
+        value: value.to_owned(),
+        if_version,
+    })
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
 fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
     match rest {
         [] => Ok(None),
@@ -586,54 +730,101 @@ fn parse_if_version(rest: &[&str]) -> Result<Option<u64>, String> {
     }
 }
 
-/// Every put request this session sent, and which put came last. `retry` replays the latest
-/// put, whatever it answered, or nothing when the latest put sent nothing (PC11).
+/// What `retry <id> --payload` re-puts: the object and condition of the put `request` was
+/// sent as. A txn has no single object, so it is refused (S1 guard G10).
+fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>), String> {
+    match kind {
+        Kind::Put { object, if_version } => Ok((object, if_version)),
+        Kind::Txn => Err(format!(
+            "retry --payload changes a put's value; request {} was a txn",
+            request.0
+        )),
+    }
+}
+
+/// What a recorded request was sent as.
+#[derive(Debug, Clone)]
+enum Kind {
+    /// A put, with the object and condition it was put with, for `retry --payload`.
+    Put {
+        object: Vec<u8>,
+        if_version: Option<u64>,
+    },
+    /// A txn.
+    Txn,
+}
+
+/// Every put and txn request this session sent, and which came last. `retry` replays the
+/// latest, whatever it answered, or nothing when the latest sent nothing (PC11).
 #[derive(Debug, Default)]
 struct Sent {
-    /// The request, and the object and condition it was put with.
-    by_id: std::collections::BTreeMap<u64, (TxnRequest, Vec<u8>, Option<u64>)>,
+    /// The request, and what it was sent as.
+    by_id: std::collections::BTreeMap<u64, (TxnRequest, Kind)>,
     latest: Option<Option<u64>>,
 }
 
 impl Sent {
-    fn record(&mut self, request: Option<TxnRequest>, object: Vec<u8>, if_version: Option<u64>) {
+    fn record(&mut self, request: Option<TxnRequest>, kind: Kind) {
         let id = request.map(|request| {
             let id = request.identity.request.0;
-            self.by_id.insert(id, (request, object, if_version));
+            self.by_id.insert(id, (request, kind));
             id
         });
         self.latest = Some(id);
     }
 
-    fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Vec<u8>, Option<u64>), String> {
+    /// A retry's answer: the request it carries is what was sent last under its id, so the
+    /// next `retry` of that id sends it (D1). An answer with no request sent nothing, and
+    /// changes nothing.
+    fn resent(&mut self, answer: &Result<rdb_api::PutOk, PutError>) {
+        let request = match answer {
+            Ok(ok) => Some(&*ok.sent),
+            Err(PutError { request, .. }) => request.as_deref(),
+        };
+        if let Some(request) = request {
+            let id = request.identity.request.0;
+            if let Some(entry) = self.by_id.get_mut(&id) {
+                entry.0 = request.clone();
+                self.latest = Some(Some(id));
+            }
+        }
+    }
+
+    /// A `retry --deadline-ms` answer. A deadline past `MAX_TXN_DEADLINE` is refused before
+    /// anything is sent, and the request handed back is the one picked, unchanged, so nothing
+    /// changes: the next bare `retry` still sends the latest (PR #36 F-002).
+    fn resent_within(&mut self, deadline: Duration, answer: &Result<rdb_api::PutOk, PutError>) {
+        if deadline <= rdb_api::MAX_TXN_DEADLINE {
+            self.resent(answer);
+        }
+    }
+
+    fn pick(&self, rest: &[&str]) -> Result<(TxnRequest, Kind), String> {
         let id = match rest {
             [] => match self.latest {
-                None => return Err("no put to retry yet".to_owned()),
+                None => return Err("no put or txn to retry yet".to_owned()),
                 Some(None) => {
-                    return Err("the latest put sent no request; nothing to retry".to_owned())
+                    return Err("the latest put or txn sent no request; nothing to retry".to_owned())
                 }
                 Some(Some(id)) => id,
             },
             [id] => id
                 .parse()
                 .map_err(|_| "retry [<request>]: a request id is a number".to_owned())?,
-            _ => return Err("retry [<request>] [--payload <value>]".to_owned()),
+            _ => return Err("retry [<request>] [--payload <value> | --deadline-ms N]".to_owned()),
         };
         self.by_id
             .get(&id)
             .cloned()
-            .ok_or_else(|| format!("this session sent no put as request {id}"))
+            .ok_or_else(|| format!("this session sent no put or txn as request {id}"))
     }
 }
 
-/// Print a put's answer, and remember what it sent when `record` names where.
-fn put_line(
-    answer: Result<rdb_api::PutOk, PutError>,
-    record: Option<(&mut Sent, Vec<u8>, Option<u64>)>,
-) {
+/// Print a put's or txn's answer, and remember what it sent when `record` names where.
+fn put_line(answer: Result<rdb_api::PutOk, PutError>, record: Option<(&mut Sent, Kind)>) {
     let remember = |request: Option<TxnRequest>| {
-        if let Some((sent, object, if_version)) = record {
-            sent.record(request, object, if_version);
+        if let Some((sent, kind)) = record {
+            sent.record(request, kind);
         }
     };
     say(&put_text(&answer));
@@ -784,6 +975,10 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
 mod tests {
     use super::*;
 
+    /// The rows that set `RETCD_TEST_DATA_DIR`, as `main` does, hold this: the variable is the
+    /// process's, and these rows run in parallel.
+    static ENV: Mutex<()> = Mutex::new(());
+
     fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
         NodeStatus {
             node: NodeId(1),
@@ -839,9 +1034,12 @@ mod tests {
     /// Integration (~2 s): three real rEtcd voters; the Db open is the injected failure.
     #[test]
     fn an_open_that_fails_exits_1_and_leaves_no_directory() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        // As `main` does. This binary's other row reads no environment.
+        // As `main` does.
         std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
         let args = Args {
             dir: dir.clone(),
@@ -850,6 +1048,7 @@ mod tests {
             keep: false,
             hold: Vec::new(),
             put_timeout: None,
+            dedup_cap: None,
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -860,6 +1059,200 @@ mod tests {
             "the failed open left {} behind",
             dir.display()
         );
+    }
+
+    /// D1 (S1 dev walk, fbf2b95): `txn --deadline-ms 0 a=5` was refused, `retry 4
+    /// --deadline-ms 2000` published it at seq 3, and a plain `retry 4` then resent the
+    /// deadline-0 request it was first sent with. Check 2 refused that before the dedup replay,
+    /// so the retry answered DEADLINE_BEFORE_ADMISSION, not seq 3. The next retry sends what
+    /// was sent last, whether that send was answered (D1's own path) or refused. Unit.
+    #[test]
+    fn the_next_retry_resends_the_deadline_the_last_retry_was_sent_with() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let request = |remaining_millis| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(4),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        let mut sent = Sent::default();
+        sent.record(Some(request(0)), Kind::Txn);
+        let deadline = |sent: &Sent| sent.pick(&["4"]).expect("request 4").0.remaining_millis;
+        // D1: `retry 4 --deadline-ms 2000` published at seq 3.
+        sent.resent(&Ok(rdb_api::PutOk {
+            request: RequestId(4),
+            generation: Generation(1),
+            owner_epoch: rdb_core::contracts::ids::OwnerEpoch(1),
+            seq: rdb_core::contracts::ids::Seq(3),
+            outcome: rdb_core::contracts::txn::Outcome::Published,
+            durability: rdb_core::contracts::txn::Durability::BufferedOnTwo,
+            sent: Box::new(request(2_000)),
+        }));
+        assert_eq!(
+            deadline(&sent),
+            2_000,
+            "the answered retry's deadline is kept"
+        );
+        assert_eq!(sent.pick(&[]).expect("latest").0.remaining_millis, 2_000);
+        // A refusal hands the request it sent back; that is the next retry's too.
+        sent.resent(&Err(PutError {
+            error: rdb_api::ApiError::invalid("refused after it was sent"),
+            request: Some(Box::new(request(1_500))),
+        }));
+        assert_eq!(
+            deadline(&sent),
+            1_500,
+            "the refused retry's deadline is kept"
+        );
+    }
+
+    /// PR #36 F-002: `txn --deadline-ms 0 a=1` (request 1), `txn b=1` (request 2), then `retry 1
+    /// --deadline-ms 30001`. The deadline is past `MAX_TXN_DEADLINE`, so nothing was sent, but
+    /// the request it handed back made request 1 the latest, and a bare `retry` resent it, not
+    /// request 2. A retry that sends still makes its request the latest. Unit.
+    #[test]
+    fn a_retry_refused_before_sending_leaves_the_latest_request_alone() {
+        use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+        let request = |id, remaining_millis| TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: RequestIdentity {
+                tenant: TenantId(1),
+                client: ClientId(1),
+                request: RequestId(id),
+            },
+            affinity: AffinityId(1),
+            expected_generation: Some(Generation(1)),
+            remaining_millis,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        let mut sent = Sent::default();
+        sent.record(Some(request(1, 0)), Kind::Txn);
+        sent.record(Some(request(2, 2_000)), Kind::Txn);
+        let latest = |sent: &Sent| sent.pick(&[]).expect("latest").0.identity.request;
+        let over = rdb_api::MAX_TXN_DEADLINE + Duration::from_millis(1);
+        sent.resent_within(
+            over,
+            &Err(PutError {
+                error: rdb_api::ApiError::invalid("past the maximum; nothing was sent"),
+                request: Some(Box::new(request(1, 0))),
+            }),
+        );
+        assert_eq!(latest(&sent), RequestId(2), "nothing was sent");
+        // At the maximum it is sent: the refusal's request is the next retry's.
+        sent.resent_within(
+            rdb_api::MAX_TXN_DEADLINE,
+            &Err(PutError {
+                error: rdb_api::ApiError::invalid("refused after it was sent"),
+                request: Some(Box::new(request(1, 30_000))),
+            }),
+        );
+        assert_eq!(
+            latest(&sent),
+            RequestId(1),
+            "a retry that sends is the latest"
+        );
+        assert_eq!(
+            sent.pick(&["1"]).expect("request 1").0.remaining_millis,
+            30_000
+        );
+    }
+
+    /// The tester's PC-2: `--dedup-cap 65537` started three rEtcd voters, then the open refused
+    /// the cap. The cap is checked first now, so a refused cap starts nothing and exits 1. With
+    /// `--keep`, voters that had started would leave their data under `--dir`. Unit when green
+    /// (~10 ms); its red run started the voters (~2 s).
+    #[test]
+    fn a_refused_dedup_cap_exits_1_before_any_voter_starts() {
+        let _env = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
+        let args = Args {
+            dir: dir.clone(),
+            log_dir: root.path().join("logs"),
+            script: None,
+            keep: true,
+            hold: Vec::new(),
+            put_timeout: None,
+            dedup_cap: Some(65_537),
+        };
+        let opened = AtomicBool::new(false);
+        let code = run(&args, |_, _, _| {
+            opened.store(true, Ordering::Relaxed);
+            async { Err(OpenError::Node("never reached".to_owned())) }
+        });
+        assert_eq!(code, ExitCode::from(1), "a refused cap exits 1");
+        assert!(!opened.load(Ordering::Relaxed), "the open was never tried");
+        assert!(
+            !dir.join("control").exists(),
+            "no voter started: {} exists",
+            dir.join("control").display()
+        );
+    }
+
+    /// S1 ruling A5 (guard G16): an op is `[<group>:]<object>=<value>[@<version>]`. The object
+    /// ends at the first `=`, a group is only a leading `digits:`, and a version only a
+    /// trailing `@digits`; anything else stays in the object or the value. Unit (~1 ms).
+    #[test]
+    fn a_txn_op_reads_a_group_and_a_version_only_where_the_grammar_puts_them() {
+        let op = |group, object: &str, value: &str, if_version| TxnOp {
+            group,
+            object: object.to_owned(),
+            value: value.to_owned(),
+            if_version,
+        };
+        let default = Duration::from_millis(7);
+        let (deadline, ops) = parse_txn(
+            &["2:a=1@3", "a=x=y", "k:v=1", "a=b@c", "1x:a=1", "a=@1"],
+            default,
+        )
+        .expect("all parse");
+        assert_eq!(deadline, default);
+        assert_eq!(
+            ops,
+            [
+                op(2, "a", "1", Some(3)),
+                op(1, "a", "x=y", None),
+                op(1, "k:v", "1", None),
+                op(1, "a", "b@c", None),
+                op(1, "1x:a", "1", None),
+                op(1, "a", "", Some(1)),
+            ]
+        );
+        let (deadline, _) = parse_txn(&["--deadline-ms", "0", "a=1"], default).expect("deadline");
+        assert_eq!(deadline, Duration::ZERO);
+        assert!(parse_txn(&["a"], default).is_err(), "no `=`");
+        assert!(
+            parse_txn(&["99999999999999999999:a=1"], default).is_err(),
+            "group too large"
+        );
+        assert!(
+            parse_txn(&["--deadline-ms", "x", "a=1"], default).is_err(),
+            "bad deadline"
+        );
+    }
+
+    /// S1 ruling A7, guard G10: `retry <id> --payload` re-puts the object and condition of a
+    /// put. A txn has no single object, so it is refused with a usage line. Unit (~1 ms).
+    #[test]
+    fn retry_payload_re_puts_a_put_and_refuses_a_txn() {
+        let put = Kind::Put {
+            object: b"a".to_vec(),
+            if_version: Some(3),
+        };
+        assert_eq!(payload_put(put, RequestId(4)), Ok((b"a".to_vec(), Some(3))));
+        let refused = payload_put(Kind::Txn, RequestId(5)).expect_err("a txn has no one object");
+        assert!(refused.ends_with("request 5 was a txn"), "{refused}");
     }
 
     /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the
