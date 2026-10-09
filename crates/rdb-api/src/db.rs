@@ -621,9 +621,11 @@ impl Db {
     ///
     /// # Errors
     ///
-    /// As [`Self::put`].
+    /// As [`Self::put`], except that no answer to a resend claims `no_mutation`: the request
+    /// may have applied on an earlier send, and the kernel refuses an overloaded or late
+    /// request before it looks for that (Q-A).
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
-        self.send(ClientCall::Resend { request }, self.timeouts.put)
+        maybe_mutated(self.send(ClientCall::Resend { request }, self.timeouts.put))
     }
 
     /// Send `request` again with a fresh kernel deadline, `deadline`: same identity, same
@@ -634,20 +636,20 @@ impl Db {
     ///
     /// As [`Self::txn`]: `INVALID_ARGUMENT (deadline)`, with nothing sent, when `deadline` is
     /// past [`MAX_TXN_DEADLINE`]. That refusal hands `request` back unchanged, as every resend
-    /// refusal does.
+    /// refusal does. As [`Self::resend`], no answer claims `no_mutation`.
     pub fn resend_within(
         &self,
         mut request: TxnRequest,
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
         if let Some(error) = deadline_refusal(deadline) {
-            return Err(PutError {
+            return maybe_mutated(Err(PutError {
                 error,
                 request: Some(Box::new(request)),
-            });
+            }));
         }
         request.remaining_millis = millis(deadline);
-        self.send(ClientCall::Resend { request }, send_wait(deadline))
+        maybe_mutated(self.send(ClientCall::Resend { request }, send_wait(deadline)))
     }
 
     /// Send a write and wait `wait` for its answer.
@@ -915,7 +917,17 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
     })
 }
 
-/// How long a transaction's send waits: its deadline plus twice the host's waiter margin, so
+/// A resend's answer: whatever refused it, the request may have applied on an earlier send.
+/// Kernel checks 2 (deadline) and 9 (overload) run before the dedup replay and prove only that
+/// this send mutated nothing (Q-A).
+fn maybe_mutated(answer: Result<PutOk, PutError>) -> Result<PutOk, PutError> {
+    answer.map_err(|mut refused| {
+        refused.error.no_mutation = false;
+        refused
+    })
+}
+
+/// The time [`Db::send`] waits: its deadline plus twice the host's waiter margin, so
 /// the host's expiry at one margin answers first (S1 ruling A2).
 fn send_wait(deadline: Duration) -> Duration {
     deadline + Duration::from_millis(2 * TXN_WAITER_MARGIN_MILLIS)
@@ -1678,6 +1690,87 @@ mod tests {
             nodes.join("1").join("CURRENT").exists(),
             "an open that succeeded never removes its node data"
         );
+    }
+
+    /// Open a `Db` on three real node threads with [`fast`] budgets and wait until it admits.
+    fn opened(
+        dir: &std::path::Path,
+        rt: &tokio::runtime::Runtime,
+        dedup_cap: Option<usize>,
+    ) -> Db {
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            dedup_cap,
+            ..config(dir)
+        };
+        let db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "after the open");
+        db
+    }
+
+    fn txn_put<'a>(object: &'a [u8], value: &'a [u8], if_version: Option<u64>) -> TxnPut<'a> {
+        TxnPut {
+            group: GROUP,
+            object,
+            value,
+            if_version,
+        }
+    }
+
+    /// The tester's Q-A probe (lead ruling: fix it in rdb-api). Kernel checks 2 (deadline)
+    /// and 9 (overload) run before the dedup replay, so a resend of a request that already
+    /// committed can be refused `no_mutation=true` although its mutation is applied. A resend
+    /// can never prove that, so every answer to `resend` and `resend_within` says
+    /// `no_mutation=false`. The kind and retry rule stay the kernel's.
+    /// Integration (~1 s): three node threads; most of it is the open and readiness.
+    #[test]
+    fn a_resend_of_a_committed_txn_never_claims_no_mutation() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let mut db = opened(dir.path(), &rt, None);
+        let put = db.put(b"a", b"1", None).expect("put a=1");
+        assert_eq!(put.seq, Seq(2));
+        let txn = db
+            .txn(&[txn_put(b"a", b"2", None)], Duration::from_secs(2))
+            .expect("txn a=2");
+        assert_eq!((txn.request, txn.seq), (RequestId(2), Seq(3)));
+
+        // `retry 2 --deadline-ms 0`: refused before the replay, yet applied at seq 3.
+        let refused = db
+            .resend_within((*txn.sent).clone(), Duration::ZERO)
+            .expect_err("a deadline of 0 is refused before admission");
+        assert_eq!(refused.error.kind, ErrorKind::DeadlineBeforeAdmission, "{refused:?}");
+        assert!(
+            !refused.error.no_mutation,
+            "request 2 is applied at seq 3; the answer must not claim no mutation: {refused:?}"
+        );
+        let handed_back = refused.request.expect("a resend refusal hands the request back");
+        assert_eq!(handed_back.identity, txn.sent.identity);
+        // The same for the put's request, and for a deadline refused before anything is sent.
+        let refused = db
+            .resend_within((*put.sent).clone(), Duration::ZERO)
+            .expect_err("deadline 0");
+        assert!(!refused.error.no_mutation, "{refused:?}");
+        let refused = db
+            .resend_within((*put.sent).clone(), MAX_TXN_DEADLINE + Duration::from_millis(1))
+            .expect_err("past the cap");
+        assert_eq!(refused.error.kind, ErrorKind::InvalidArgument, "{refused:?}");
+        assert!(!refused.error.no_mutation, "{refused:?}");
+
+        // `status 2`, then `retry 2`: still seq 3, never a second apply.
+        match db.status(RequestId(2), None).expect("status 2") {
+            TxnStatus::Resolved(result) => assert_eq!(result.seq, Seq(3)),
+            other => panic!("status of request 2: {other:?}"),
+        }
+        let replay = db.resend((*txn.sent).clone()).expect("replay");
+        assert_eq!(replay.seq, Seq(3));
+        assert_eq!(
+            db.get(b"a").expect("get a").value,
+            Some((3, Bytes::from_static(b"2")))
+        );
+        db.shutdown();
     }
 
     /// A `Db` whose owner has no thread: what is sent queues in the returned mailbox, never
