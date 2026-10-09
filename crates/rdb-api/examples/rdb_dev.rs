@@ -209,11 +209,6 @@ where
             return ExitCode::from(1);
         }
     };
-    let cluster = rt.block_on(Cluster::start(3, StorageKind::ROCKS));
-    let leader = rt.block_on(cluster.leader());
-    let store = cluster.client(leader);
-    say(&format!("control up: 3 voters, leader {leader:?}"));
-    tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let config = DbConfig {
         dir: args.dir.clone(),
         hold: args.hold.clone(),
@@ -223,6 +218,16 @@ where
         },
         dedup_cap: args.dedup_cap,
     };
+    // Before the voters start (PC-2): a refused option starts nothing.
+    if let Err(e) = config.check() {
+        eprintln!("rdb_dev: open: {e}");
+        return ExitCode::from(1);
+    }
+    let cluster = rt.block_on(Cluster::start(3, StorageKind::ROCKS));
+    let leader = rt.block_on(cluster.leader());
+    let store = cluster.client(leader);
+    say(&format!("control up: 3 voters, leader {leader:?}"));
+    tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let mut db = match rt.block_on(open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,
         Err(e) => {
@@ -953,6 +958,10 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
 mod tests {
     use super::*;
 
+    /// The rows that set `RETCD_TEST_DATA_DIR`, as `main` does, hold this: the variable is the
+    /// process's, and these rows run in parallel.
+    static ENV: Mutex<()> = Mutex::new(());
+
     fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
         NodeStatus {
             node: NodeId(1),
@@ -1008,9 +1017,10 @@ mod tests {
     /// Integration (~2 s): three real rEtcd voters; the Db open is the injected failure.
     #[test]
     fn an_open_that_fails_exits_1_and_leaves_no_directory() {
+        let _env = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = config_testkit::fs::temp_dir();
         let dir = root.path().join("run");
-        // As `main` does. This binary's other row reads no environment.
+        // As `main` does.
         std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
         let args = Args {
             dir: dir.clone(),
@@ -1071,6 +1081,39 @@ mod tests {
             "a retry that sent nothing changes nothing"
         );
         assert_eq!(sent.pick(&[]).expect("latest").0.remaining_millis, 2_000);
+    }
+
+    /// The tester's PC-2: `--dedup-cap 65537` started three rEtcd voters, then the open refused
+    /// the cap. The cap is checked first now, so a refused cap starts nothing and exits 1. With
+    /// `--keep`, voters that had started would leave their data under `--dir`. Unit when green
+    /// (~10 ms); its red run started the voters (~2 s).
+    #[test]
+    fn a_refused_dedup_cap_exits_1_before_any_voter_starts() {
+        let _env = ENV.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = config_testkit::fs::temp_dir();
+        let dir = root.path().join("run");
+        std::env::set_var("RETCD_TEST_DATA_DIR", dir.join("control"));
+        let args = Args {
+            dir: dir.clone(),
+            log_dir: root.path().join("logs"),
+            script: None,
+            keep: true,
+            hold: Vec::new(),
+            put_timeout: None,
+            dedup_cap: Some(65_537),
+        };
+        let opened = AtomicBool::new(false);
+        let code = run(&args, |_, _, _| {
+            opened.store(true, Ordering::Relaxed);
+            async { Err(OpenError::Node("never reached".to_owned())) }
+        });
+        assert_eq!(code, ExitCode::from(1), "a refused cap exits 1");
+        assert!(!opened.load(Ordering::Relaxed), "the open was never tried");
+        assert!(
+            !dir.join("control").exists(),
+            "no voter started: {} exists",
+            dir.join("control").display()
+        );
     }
 
     /// F-007: a script PowerShell 5.1 wrote as UTF-16LE is an input error, not the end of the

@@ -194,6 +194,19 @@ pub struct DbConfig {
     pub dedup_cap: Option<usize>,
 }
 
+impl DbConfig {
+    /// The checks [`Db::open`] makes before it starts anything, so a caller can make them
+    /// before starting what the open needs, such as the control store.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::DedupCap`] when [`Self::dedup_cap`] is above [`RETENTION_CAP_ENTRIES`];
+    /// it is also logged as `dedup_cap_refused`.
+    pub fn check(&self) -> Result<(), OpenError> {
+        limits(self.dedup_cap).map(|_| ())
+    }
+}
+
 /// One put of a [`Db::txn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxnPut<'a> {
@@ -620,7 +633,8 @@ impl Db {
     /// # Errors
     ///
     /// As [`Self::txn`]: `INVALID_ARGUMENT (deadline)`, with nothing sent, when `deadline` is
-    /// past [`MAX_TXN_DEADLINE`].
+    /// past [`MAX_TXN_DEADLINE`]. That refusal hands `request` back unchanged, as every resend
+    /// refusal does.
     pub fn resend_within(
         &self,
         mut request: TxnRequest,
@@ -629,7 +643,7 @@ impl Db {
         if let Some(error) = deadline_refusal(deadline) {
             return Err(PutError {
                 error,
-                request: None,
+                request: Some(Box::new(request)),
             });
         }
         request.remaining_millis = millis(deadline);
@@ -875,6 +889,11 @@ fn limits(dedup_cap: Option<usize>) -> Result<Limits, OpenError> {
     let mut limits = Limits::default();
     if let Some(asked) = dedup_cap {
         if asked > RETENTION_CAP_ENTRIES {
+            tracing::error!(
+                dedup_cap = asked,
+                max = RETENTION_CAP_ENTRIES,
+                "dedup_cap_refused"
+            );
             return Err(OpenError::DedupCap {
                 asked,
                 max: RETENTION_CAP_ENTRIES,
@@ -1659,6 +1678,126 @@ mod tests {
             nodes.join("1").join("CURRENT").exists(),
             "an open that succeeded never removes its node data"
         );
+    }
+
+    /// A `Db` whose owner has no thread: what is sent queues in the returned mailbox, never
+    /// answered. Unit rows only.
+    fn unanswered(put: Duration) -> (Db, std::sync::mpsc::Receiver<Msg>, tokio::runtime::Runtime) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let links = Links::new();
+        let (owner, mailbox) = NodeHandle::unanswered(OWNER);
+        let db = Db {
+            nodes: vec![owner],
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.handle().clone(), links),
+            clock: HostClock::start(),
+            timeouts: Timeouts {
+                put,
+                ..Timeouts::default()
+            },
+            next_request: AtomicU64::new(1),
+            unwind: None,
+        };
+        (db, mailbox, rt)
+    }
+
+    /// S1 ruling M1 (scenario 4b) and the tester's PC-1. A deadline past 30 s is refused
+    /// `INVALID_ARGUMENT (deadline)` before anything is compiled or sent, on `txn` and on
+    /// `resend_within`; 30 s itself is compiled. The refused resend hands its request back
+    /// unchanged, as every resend refusal does, so `rdb_dev` prints `request=N`, not `-`.
+    /// Unit (~30 ms): no node thread; the owner's mailbox shows what was sent.
+    #[test]
+    fn a_deadline_past_thirty_seconds_is_refused_before_anything_is_sent() {
+        let (mut db, mailbox, _rt) = unanswered(Duration::from_millis(20));
+        let past = MAX_TXN_DEADLINE + Duration::from_millis(1);
+        let put = TxnPut {
+            group: GROUP,
+            object: b"a",
+            value: b"1",
+            if_version: None,
+        };
+        let refused = db.txn(&[put], past).expect_err("past the cap");
+        assert_eq!(
+            (refused.error.kind, refused.error.no_mutation),
+            (ErrorKind::InvalidArgument, true),
+            "{refused:?}"
+        );
+        assert!(refused.error.detail.starts_with("deadline: "), "{refused:?}");
+        assert!(refused.request.is_none(), "a txn refused here was never compiled");
+
+        let request = TxnRequest {
+            api_version: rdb_core::contracts::version::API_VERSION,
+            identity: db.identity(),
+            affinity: GROUP,
+            expected_generation: Some(Generation(1)),
+            remaining_millis: 0,
+            conditions: Vec::new(),
+            mutations: Vec::new(),
+        };
+        let refused = db
+            .resend_within(request.clone(), past)
+            .expect_err("past the cap");
+        assert_eq!(refused.error.kind, ErrorKind::InvalidArgument, "{refused:?}");
+        assert_eq!(
+            refused.request.as_deref(),
+            Some(&request),
+            "the caller's request comes back unchanged"
+        );
+        assert!(mailbox.try_recv().is_err(), "nothing reached the owner");
+
+        // At the cap itself the txn is compiled (and, unanswered here, UNAVAILABLE).
+        let at_cap = db.txn(&[put], MAX_TXN_DEADLINE).expect_err("nothing answers");
+        assert_eq!(at_cap.error.kind, ErrorKind::Unavailable, "{at_cap:?}");
+        match mailbox.try_recv() {
+            Ok(Msg::Client(Client {
+                call: ClientCall::Compile {
+                    remaining_millis, ..
+                },
+                ..
+            })) => assert_eq!(remaining_millis, 30_000),
+            other => panic!("the compile reached the owner: {other:?}"),
+        }
+        db.shutdown();
+    }
+
+    /// S1 ruling M2 and the tester's PC-2. A dedup cap above P1's status cap is refused at open
+    /// before `nodes/` is claimed, and the refusal is a log line, not only the caller's error.
+    /// The status cap itself is allowed. Unit (~10 ms): nothing starts.
+    #[config_log::retcd_test]
+    fn open_refuses_a_dedup_cap_above_the_status_cap_and_logs_why() {
+        const METHOD: &str = "open_refuses_a_dedup_cap_above_the_status_cap_and_logs_why";
+        let dir = config_testkit::fs::temp_dir();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let above = DbConfig {
+            dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
+            ..config(dir.path())
+        };
+        match rt.block_on(Db::open(above, store, rt.handle().clone())) {
+            Err(OpenError::DedupCap { asked, max }) => {
+                assert_eq!((asked, max), (RETENTION_CAP_ENTRIES + 1, RETENTION_CAP_ENTRIES));
+            }
+            Err(other) => panic!("refused for the dedup cap, not: {other}"),
+            Ok(_) => panic!("a dedup cap above the status cap opened"),
+        }
+        assert!(!dir.path().join("nodes").exists(), "refused before the claim");
+        let lines: Vec<_> = config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+            .into_iter()
+            .filter(|line| line["@m"] == "dedup_cap_refused")
+            .collect();
+        assert_eq!(lines.len(), 1, "one refusal line: {lines:?}");
+        assert_eq!(lines[0]["dedup_cap"], RETENTION_CAP_ENTRIES + 1);
+        let at_cap = DbConfig {
+            dedup_cap: Some(RETENTION_CAP_ENTRIES),
+            ..config(dir.path())
+        };
+        assert!(limits(at_cap.dedup_cap).is_ok(), "the status cap itself is allowed");
     }
 
     #[test]
