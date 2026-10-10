@@ -633,6 +633,9 @@ fn repl<'scope, 'env>(
                 say(&format!("dropped {} watches", control.store.drop_watches()));
                 Ok(())
             }
+            ["control", verb @ ("gap" | "drop-watches"), ..] => {
+                Err(format!("control {verb}: takes no arguments"))
+            }
             ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
                 control.store.fail_lists(fault);
                 say(&format!("fail list {word}"));

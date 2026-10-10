@@ -4598,6 +4598,46 @@ mod tests {
         assert!(warned.is_empty(), "an advancing copy warned: {warned:?}");
     }
 
+    /// M9 S2a ruling guard "the `past_horizon` computation": `authority_view` logs
+    /// `margin_ms` = `valid_through` - `at`, and `past_horizon` only when that is below 0.
+    /// While renewals commit every view has time left; once the store stops answering, the
+    /// grant runs out and the view A1 publishes at the fence has none.
+    /// Integration (~4 s): the grant must expire at the spec's horizon.
+    #[config_log::retcd_test]
+    fn the_view_line_says_past_horizon_only_once_no_time_is_left() {
+        const METHOD: &str = "the_view_line_says_past_horizon_only_once_no_time_is_left";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 fenced", |trio| {
+            trio.status(0).authority.starts_with("fenced").then_some(())
+        });
+
+        let views: Vec<_> = logged!(METHOD, "authority_view")
+            .into_iter()
+            .filter(|line| line["node"] == 1)
+            .collect();
+        for line in &views {
+            let left = line["valid_through"].as_i64().expect("valid_through")
+                - line["at"].as_i64().expect("at");
+            assert_eq!(line["margin_ms"], left, "{line}");
+            assert_eq!(line["past_horizon"], left < 0, "{line}");
+        }
+        assert!(
+            views.iter().any(|line| line["past_horizon"] == false),
+            "a view with time left: {views:?}"
+        );
+        assert!(
+            views.iter().any(|line| line["past_horizon"] == true),
+            "the fence's view has none: {views:?}"
+        );
+    }
+
     /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
     /// logged, never dropped in silence, and the primary neither faults nor stops taking
     /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:
@@ -5358,6 +5398,8 @@ mod tests {
         nodes: Vec<(Host, Sender<Msg>, Receiver<Msg>)>,
         links: Arc<Links>,
         store: Arc<dyn config_core::ConfigStore>,
+        /// The same store, to make it fail.
+        mem: Arc<config_testkit::MemStore>,
         clock: HostClock,
         rt: tokio::runtime::Runtime,
     }
@@ -5378,8 +5420,8 @@ mod tests {
                 .build()
                 .expect("runtime");
             let links = Links::new();
-            let store: Arc<dyn config_core::ConfigStore> =
-                Arc::new(config_testkit::MemStore::new());
+            let mem = Arc::new(config_testkit::MemStore::new());
+            let store: Arc<dyn config_core::ConfigStore> = Arc::clone(&mem) as _;
             let control =
                 ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
             let clock = HostClock::start();
@@ -5403,6 +5445,7 @@ mod tests {
                 nodes,
                 links,
                 store,
+                mem,
                 clock,
                 rt,
             }

@@ -50,7 +50,8 @@ struct Site {
     correlation: CorrelationId,
 }
 
-/// A reload still running, and how many of its lists have failed so far.
+/// The newest reload of a family, running or done, and how many of its lists have failed so
+/// far (0 once it answers).
 type Reloading = (JoinHandle<()>, Arc<AtomicU32>);
 
 /// The control binding for every node of one process.
@@ -136,12 +137,15 @@ impl ControlAdapter {
     }
 
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
-    /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`).
+    /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
+    /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
+    /// dropped from the map as they are (a newer one replaces it, or `shutdown` takes them
+    /// all), so a count above 0 is always a reload still retrying.
     #[must_use]
     pub fn reload_pending(&self, node: NodeId) -> Option<u32> {
         lock(&self.reloads)
             .iter()
-            .filter(|((at, _), (task, _))| *at == node && !task.is_finished())
+            .filter(|((at, _), _)| *at == node)
             .map(|(_, (_, failed))| failed.load(Ordering::Relaxed))
             .filter(|failed| *failed > 0)
             .max()
@@ -937,6 +941,49 @@ mod tests {
         );
     }
 
+    /// M9 S2a ruling: a reload that cannot finish faults its node through the mailbox, instead
+    /// of leaving it waiting for a snapshot — both a store error worth no retry and a key under
+    /// the family that does not decode.
+    #[test]
+    fn a_reload_that_cannot_finish_faults_its_node() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mem = Arc::new(config_testkit::MemStore::new());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as _;
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
+        let reload = || {
+            adapter.submit(
+                NodeId(1),
+                PartitionId(1),
+                CorrelationId(0),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Partitions,
+                },
+            );
+            received(&rx, std::time::Duration::from_millis(250))
+        };
+
+        mem.failing_with(ConfigError::invalid_argument("wrong"));
+        assert_eq!(reload(), ["fault control_reload_failed"]);
+
+        mem.stop_failing();
+        let put = mem.put(PutRequest {
+            key: Bytes::from_static(b"partitions/x"),
+            value: Bytes::from_static(b"x"),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        });
+        rt.block_on(put).expect("put");
+        assert_eq!(reload(), ["fault control_key_undecodable"]);
+        adapter.shutdown();
+    }
+
     /// M9 S2a ruling: the wait between lists doubles from 50 ms and never passes 2 s, however
     /// long the store stays down.
     #[test]
@@ -1006,6 +1053,12 @@ mod tests {
         );
         assert_eq!(adapter.reload_pending(NodeId(2)), None, "only for its node");
         reload();
+        // The newer reload replaced the older one in the map, so this count is its own: it
+        // has failed too, and must be put back to 0 when it answers.
+        assert!(
+            eventually(|| adapter.reload_pending(NodeId(1)).is_some()),
+            "the newer reload retries too"
+        );
         store.stop_failing();
         let snapshot = format!(
             "{:?}",

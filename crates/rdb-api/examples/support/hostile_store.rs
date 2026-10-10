@@ -332,3 +332,147 @@ impl ConfigStore for HostileStore {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use config_testkit::cluster::StorageKind;
+
+    /// M9 S2a ruling guards "re-resolve on `NotLeader`" and "the bound-node swap on `control
+    /// stop`": the mutant pass found no row that failed without either. A `NotLeader` answer
+    /// moves the store to the leader. Stopping a voter the store is not bound to only marks
+    /// it; stopping the bound one moves the store first, never to a voter being stopped.
+    /// One in-memory cluster, about a second.
+    #[test]
+    fn the_store_follows_the_leader_and_leaves_a_voter_before_its_stop() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = Arc::new(
+            rt.block_on(
+                Cluster::builder()
+                    .nodes(3)
+                    .storage(StorageKind::Ephemeral)
+                    .start(),
+            ),
+        );
+        let leader = rt.block_on(cluster.leader());
+        let followers: Vec<VoterId> = cluster
+            .ids()
+            .into_iter()
+            .filter(|id| *id != leader)
+            .collect();
+        let store = HostileStore::new(&cluster, followers[0]);
+
+        let answer = rt.block_on(store.get(GetRequest {
+            key: Bytes::from_static(b"partitions/1"),
+        }));
+        assert!(
+            matches!(answer, Err(ConfigError::NotLeader { .. })),
+            "a follower answers NotLeader: {answer:?}"
+        );
+        assert_eq!(store.bound(), leader, "the next call goes to the leader");
+
+        assert_eq!(
+            store.stopping(followers[0]),
+            Ok(None),
+            "not bound: only marked"
+        );
+        assert_eq!(
+            store.stopping(leader),
+            Ok(Some(followers[1])),
+            "bound: moved first, past the voter already being stopped"
+        );
+        assert_eq!(store.bound(), followers[1]);
+
+        drop(store);
+        let cluster = Arc::try_unwrap(cluster).expect("the only handle");
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// `control fail list`'s words (M9 S2a mutant pass): three transient errors, which a reload
+    /// retries, and `invalid`, which it must not (scenario 2f-other).
+    #[test]
+    fn fail_list_words_name_three_transient_faults_and_one_that_is_not() {
+        let class = |word| match ListFault::parse(word)
+            .expect("a word")
+            .map(ListFault::error)
+        {
+            Some(ConfigError::Unavailable { .. }) => "unavailable",
+            Some(ConfigError::DeadlineExceededUnknownOutcome) => "deadline",
+            Some(ConfigError::NotLeader { .. }) => "notleader",
+            Some(ConfigError::InvalidArgument { .. }) => "invalid",
+            Some(_) => "another error",
+            None => "off",
+        };
+        let words = ["unavailable", "deadline", "notleader", "invalid", "off"];
+        assert_eq!(words.map(class), words);
+        assert!(ListFault::parse("bogus").is_err());
+    }
+
+    /// M9 S2a mutant pass: an injected list fault answers without reaching a voter, so even
+    /// `notleader` moves no binding, and `off` reaches the voter again. `drop_watches` ends a
+    /// stream the store handed out. One in-memory cluster, well under a second.
+    #[test]
+    fn a_list_fault_never_reaches_a_voter_and_dropped_watches_end() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = Arc::new(
+            rt.block_on(
+                Cluster::builder()
+                    .nodes(3)
+                    .storage(StorageKind::Ephemeral)
+                    .start(),
+            ),
+        );
+        let leader = rt.block_on(cluster.leader());
+        let store = HostileStore::new(&cluster, leader);
+        let list = || {
+            rt.block_on(store.list(ListRequest {
+                prefix: Bytes::from_static(b"partitions/"),
+                max_items: 0,
+                max_bytes: 0,
+            }))
+        };
+
+        store.fail_lists(Some(ListFault::NotLeader));
+        let failed = list();
+        assert!(
+            matches!(failed, Err(ConfigError::NotLeader { .. })),
+            "the injected fault, not the leader's answer: {failed:?}"
+        );
+        assert_eq!(store.bound(), leader, "an injected fault moves nothing");
+        store.fail_lists(None);
+        let listed = list();
+        assert!(listed.is_ok(), "off: the leader answers: {listed:?}");
+
+        let mut stream = rt
+            .block_on(store.watch(WatchRequest {
+                prefix: Bytes::from_static(b"partitions/"),
+                start_after_revision: 0,
+                progress_interval: None,
+            }))
+            .expect("a watch on the leader");
+        assert_eq!(store.drop_watches(), 1, "one stream open");
+        let ended = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while let Some(item) = stream.next().await {
+                    assert!(item.is_ok(), "a dropped stream just ends: {item:?}");
+                }
+            })
+            .await
+        });
+        assert!(ended.is_ok(), "the stream did not end within 1 s");
+
+        drop(stream);
+        drop(store);
+        let cluster = Arc::try_unwrap(cluster).expect("the only handle");
+        rt.block_on(cluster.shutdown());
+    }
+}
