@@ -1492,8 +1492,8 @@ async fn w07_compacted_error(
         Err(ConfigError::RevisionCompacted {
             minimum_available_revision,
         }) => {
-            // The floor is actionable, not decorative: it is the cursor the client re-opens
-            // with after re-`List`ing, so it must be the first revision still available.
+            // The floor is actionable, not decorative: it names the oldest event still
+            // retained, `compact_revision + 1`, the same number on every node and wire.
             assert_eq!(
                 minimum_available_revision,
                 floor + 1,
@@ -1518,54 +1518,56 @@ async fn w08_compacted_boundary(
     cfg: &ConformanceConfig,
     fixture: &Arc<dyn WatchFixture>,
 ) -> ScenarioResult {
+    let prefix = key(cfg, "w08/");
     let written = put_series(store, cfg, "w08", 6).await;
     let floor = fixture.compact(written[4]).await.expect("compact");
 
-    // Test plan §4 W-08 is explicit about which side of the floor is which: "compact to 5,
-    // `watch("", 5)` and `watch("", 6)` | the first is `RevisionCompacted{6}`; the second
-    // succeeds". `compact_revision == floor` means revisions `1..=floor` are gone, so a cursor
-    // *at* the floor (`start_after_revision == floor`, requesting `> floor`) still names the
-    // floor itself as "not yet delivered" and is refused (`register_locked`'s
-    // `start_after <= compact_revision` check, OQ-27); only a cursor strictly above it
-    // (`floor + 1`, the reported `minimum_available_revision`) is satisfiable.
-    let at_floor = store
+    // Test plan §4 W-08: "compact to 5, `watch("", 4)` and `watch("", 5)` | the first is
+    // `RevisionCompacted{6}`; the second succeeds". `compact_revision == floor` means events
+    // `1..=floor` are gone. `start_after_revision` is exclusive, so a cursor at the floor asks
+    // only for `> floor` — every one of which is retained — and is the cursor spec §11.2's
+    // `List` reports right after a compaction. Only a cursor below the floor needs a deleted
+    // event (ADR-0020, 2026-10-10 amendment).
+    let below = store
         .watch(WatchRequest {
-            prefix: key(cfg, "w08/"),
-            start_after_revision: floor,
+            prefix: prefix.clone(),
+            start_after_revision: floor - 1,
             progress_interval: None,
         })
         .await
         .err();
     assert!(
         matches!(
-            at_floor,
+            below,
             Some(ConfigError::RevisionCompacted {
                 minimum_available_revision
             }) if minimum_available_revision == floor + 1
         ),
-        "a cursor exactly at the floor must be refused with minimum_available_revision == floor + 1, got {at_floor:?}"
+        "a cursor one below the floor must be refused with minimum_available_revision == floor + 1, got {below:?}"
     );
 
-    let above = store
+    let mut at_floor = store
         .watch(WatchRequest {
-            prefix: key(cfg, "w08/"),
-            start_after_revision: floor + 1,
+            prefix: prefix.clone(),
+            start_after_revision: floor,
             progress_interval: None,
         })
-        .await;
-    assert!(
-        above.is_ok(),
-        "a cursor one past the floor must be accepted, got {:?}",
-        above.err()
+        .await
+        .unwrap_or_else(|e| panic!("a cursor exactly at the floor must be accepted, got {e}"));
+    let (events, _) = take_events(&mut at_floor, &prefix, 1).await;
+    assert_eq!(
+        revisions_of(&events),
+        written[5..],
+        "a cursor at the floor must replay the retained event just above it"
     );
-    drop(above);
 
     ScenarioResult {
         id: "W-08",
         name: "watch-compacted-boundary",
         passed: true,
-        detail: "cursor == floor is refused; cursor == floor + 1 is accepted".into(),
-        observed: json!({ "at_floor_refused": true, "past_floor_accepted": true }),
+        detail: "cursor == floor - 1 is refused; cursor == floor is accepted and replays floor + 1"
+            .into(),
+        observed: json!({ "below_floor_refused": true, "at_floor_accepted": true }),
     }
 }
 

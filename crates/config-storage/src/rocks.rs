@@ -1094,7 +1094,7 @@ impl RocksStore {
         {
             // Ruling R1: the watermark is stamped from *this node's* `cluster_revision`, as a
             // local open-time write, not a replicated command. The pre-v2 history has no
-            // journal, so every revision at or below it is unresumable here — and mid-rolling
+            // journal, so every cursor below it is unresumable here — and mid-rolling
             // upgrade three correct voters legitimately hold three different watermarks, which
             // is why neither this value nor the journal is folded into `state_hash`.
             let cluster_revision: u64 = read_meta(&db, CF_STATE_META, KEY_CLUSTER_REVISION)

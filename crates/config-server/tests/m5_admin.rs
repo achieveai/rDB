@@ -916,8 +916,8 @@ async fn m5_90_restore_preserves_revision_and_fences_the_identity() {
     assert_eq!(
         reader.compact_revision().expect("read compact_revision"),
         fixture.revision,
-        "everything at or below the restored revision is compacted, so a watch resuming there \
-         is told RevisionCompacted instead of being handed a partial replay"
+        "everything at or below the restored revision is compacted, so a watch resuming below \
+         it is told RevisionCompacted instead of being handed a partial replay"
     );
     let stats = reader.journal_stats().expect("read the journal stats");
     assert_eq!(

@@ -92,7 +92,7 @@ pub enum TerminationReason {
     NotLeader,
     /// The node stopped, or the hub shut down.
     Unavailable,
-    /// The starting revision was at or below `compact_revision` (§11.2).
+    /// The starting revision was below `compact_revision` (§11.2).
     RevisionCompacted,
     /// The stream's bounded event queue was full.
     QueueFull,
@@ -823,9 +823,11 @@ impl WatchHub {
         self.gate.acquire();
         let result = (|| {
             let compact_revision = self.compact_revision.load(Ordering::Acquire);
-            // OQ-27: a watermark of 0 means nothing was ever deleted, so `R == 0` on a fresh
-            // cluster is a legitimate "from the beginning" cursor, not a compacted one.
-            if compact_revision > 0 && start_after <= compact_revision {
+            // The cursor asks for `(R, H]`, and compaction to `C` deleted `1..=C`, so only
+            // `R < C` asks for a deleted event. `R == C` is the cursor spec §11.2's `List`
+            // hands back right after a compaction; refusing it loops (ADR-0020, 2026-10-10).
+            // A watermark of 0 needs no special case: no `u64` is below it (OQ-27).
+            if start_after < compact_revision {
                 return Err(ConfigError::RevisionCompacted {
                     minimum_available_revision: compact_revision + 1,
                 });
@@ -1264,7 +1266,7 @@ impl Delivery {
                 // while this page is being read, and `read_events` serves whatever is still
                 // on disk. The store moves its in-memory watermark *before* it writes the
                 // `delete_range`, which makes a watermark read *after* the page a sound
-                // witness: if it is still below `from`, nothing in `(from, to]` had been
+                // witness: if it is still at or below `from`, nothing in `(from, to]` had been
                 // deleted when the page was read. The hub's own atomic is only updated after
                 // the write and cannot give that guarantee.
                 let floor = reader.compact_revision()?;
@@ -1290,7 +1292,9 @@ impl Delivery {
                     ))
                 }
             };
-            if floor > 0 && from <= floor {
+            // Same boundary as registration: the page asked for `(from, to]`, and a floor at
+            // `from` deleted nothing in it.
+            if from < floor {
                 return Err(Terminal::new(
                     TerminationReason::RevisionCompacted,
                     ConfigError::RevisionCompacted {
