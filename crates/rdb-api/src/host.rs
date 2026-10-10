@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
-use rdb_core::contracts::authority::{AuthorityEffect, Lineage, PartitionMode};
+use rdb_core::contracts::authority::{AuthorityEffect, AuthorityView, Lineage, PartitionMode};
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::{ReplicaProgress, ReplicationEnvelope};
@@ -64,7 +64,7 @@ use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
-use rdb_core::transaction::{Limits, Transaction};
+use rdb_core::transaction::{Inflight, Limits, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::keys::{root_key, RootKey};
@@ -762,6 +762,12 @@ struct Host {
     /// [`STUCK_RESENDS`]; crate tests lower it.
     stuck_resends: u32,
     fault: Option<String>,
+    /// The tick the step being carried out was offered at, its `StepCtx::now`: the tick a
+    /// module judged at, which a line about one of its effects names.
+    stepped_at: Tick,
+    /// Per partition, the last view A1 published. `txn_dispatch` and `host_stall` measure the
+    /// grant left against its horizon (M9 S2a, critic A2).
+    authority_views: BTreeMap<PartitionId, AuthorityView>,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -820,6 +826,8 @@ impl Host {
             resends: BTreeMap::new(),
             stuck_resends: STUCK_RESENDS,
             fault: None,
+            stepped_at: now,
+            authority_views: BTreeMap::new(),
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
@@ -1067,6 +1075,7 @@ impl Host {
             .collect();
         for id in due {
             if let Some((version, scheduled_at, site)) = self.timers.remove(&id) {
+                self.report_stall(id, scheduled_at, now);
                 let fired = TimerFired {
                     id,
                     version,
@@ -1233,6 +1242,101 @@ impl Host {
         self.next_delayed += 1;
     }
 
+    // ------------------------------------------------------------------ horizon lines (S2a)
+
+    /// `host_stall`: a kernel timer due at `due` fires at `now`, later than the dispatch margin
+    /// A1's horizon keeps. `grant_margin_ms` is the least time left to any published view's
+    /// horizon, negative once past it. It sees a late timer only, never a stall between a step
+    /// and its storage effect (critic A2).
+    fn report_stall(&self, timer: TimerId, due: Tick, now: Tick) {
+        let late_ms = now.0.saturating_sub(due.0);
+        if late_ms <= self.budgets.dispatch_margin_millis {
+            return;
+        }
+        let grant_margin_ms = self
+            .authority_views
+            .values()
+            .map(|view| margin_ms(view.valid_through_tick, now))
+            .min();
+        tracing::warn!(
+            node = self.node.0,
+            timer = timer.0,
+            due = due.0,
+            at = now.0,
+            late_ms,
+            grant_margin_ms,
+            "host_stall"
+        );
+    }
+
+    /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`]. `renewed_at`
+    /// is the dispatch tick of the last committed renewal, which the horizon is counted from,
+    /// absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
+    /// publication.
+    fn report_view(&mut self, view: &AuthorityView) {
+        let at = self.stepped_at;
+        tracing::info!(
+            node = self.node.0,
+            partition = view.lineage.partition.0,
+            seq = view.authority_seq,
+            renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
+            valid_through = view.valid_through_tick.0,
+            past_horizon = ?view.past_horizon,
+            margin_ms = margin_ms(view.valid_through_tick, at),
+            at = at.0,
+            "authority_view"
+        );
+        self.authority_views.insert(view.lineage.partition, *view);
+    }
+
+    /// `txn_dispatch`: T1 hands `batch` to storage. The binding tick is `decided_at`, when A1
+    /// allowed T1's step-14 `StorageDispatch` recheck; `valid_through` is the horizon of the
+    /// last view A1 published before it, and `margin_ms` the time that was left (critic A2).
+    fn report_dispatch(&self, batch: &rdb_core::contracts::storage::Batch) {
+        let inflight = self
+            .transaction
+            .kernel(self.node, batch.partition)
+            .and_then(TxnKernel::inflight);
+        let Some(Inflight::Dispatched {
+            admitted,
+            batch: id,
+            seq,
+            authority,
+            ..
+        }) = inflight
+        else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = batch.partition.0,
+                batch = batch.id.0,
+                "txn_dispatch_unmatched"
+            );
+            return;
+        };
+        if *id != batch.id {
+            tracing::warn!(
+                node = self.node.0,
+                partition = batch.partition.0,
+                batch = batch.id.0,
+                inflight = id.0,
+                "txn_dispatch_unmatched"
+            );
+            return;
+        }
+        let view = self.authority_views.get(&batch.partition);
+        tracing::info!(
+            node = self.node.0,
+            partition = batch.partition.0,
+            request = admitted.req.identity.request.0,
+            seq = seq.0,
+            decided_at = authority.decided_at.0,
+            authority_seq = authority.authority_seq,
+            valid_through = view.map(|view| view.valid_through_tick.0),
+            margin_ms = view.map(|view| margin_ms(view.valid_through_tick, authority.decided_at)),
+            "txn_dispatch"
+        );
+    }
+
     // ------------------------------------------------------------------ the loop
 
     fn push(&mut self, site: Site, kind: EventKind, routed: bool, addressed: Option<ModuleName>) {
@@ -1355,6 +1459,7 @@ impl Host {
                 .map_err(StepError::Host)?;
         }
         let now = self.clock.now();
+        self.stepped_at = now;
         let empty = EmptyView;
         let snapshot: &dyn SnapshotRead = match (self.views.get(&partition), reads_storage) {
             (Some((_, view)), true) => view,
@@ -1529,25 +1634,30 @@ impl Host {
 
     fn store(&mut self, from: ModuleName, store: &StoreEffect, site: Site) -> Result<(), String> {
         let kind = match store {
-            StoreEffect::Commit(batch) => match self.engine.commit(batch.clone()) {
-                Ok(applied) => StorageEvent::Committed {
-                    batch: batch.id,
-                    applied,
-                },
-                Err(fault) => {
-                    tracing::error!(
-                        node = self.node.0,
-                        partition = batch.partition.0,
-                        seq = batch.seq.0,
-                        ?fault,
-                        "commit_failed"
-                    );
-                    StorageEvent::CommitFailed {
+            StoreEffect::Commit(batch) => {
+                if from == ModuleName::Transaction {
+                    self.report_dispatch(batch);
+                }
+                match self.engine.commit(batch.clone()) {
+                    Ok(applied) => StorageEvent::Committed {
                         batch: batch.id,
-                        fault,
+                        applied,
+                    },
+                    Err(fault) => {
+                        tracing::error!(
+                            node = self.node.0,
+                            partition = batch.partition.0,
+                            seq = batch.seq.0,
+                            ?fault,
+                            "commit_failed"
+                        );
+                        StorageEvent::CommitFailed {
+                            batch: batch.id,
+                            fault,
+                        }
                     }
                 }
-            },
+            }
             StoreEffect::Flush { ticket, captured } => {
                 match self.engine.sync_wal_through(captured.clone()) {
                     Ok(durable) => StorageEvent::Flushed {
@@ -1614,6 +1724,19 @@ impl Host {
             }
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
+            }
+            KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
+                self.report_view(view);
+            }
+            KernelEffect::Authority(AuthorityEffect::Fence { scope, reason }) => {
+                tracing::warn!(
+                    node,
+                    partition = site.partition.0,
+                    scope = ?scope,
+                    reason = ?reason,
+                    at = self.stepped_at.0,
+                    "authority_fence"
+                );
             }
             KernelEffect::SetAdmission(state) => {
                 tracing::info!(node, partition = site.partition.0, allow = state.allow, reason = ?state.reason, "set_admission");
@@ -3183,6 +3306,13 @@ fn compile_error(error: &ValueError) -> ApiError {
 
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds from `at` to `horizon`: positive while it is ahead, 0 at the last tick a view
+/// still admits, negative past it.
+fn margin_ms(horizon: Tick, at: Tick) -> i64 {
+    let ahead = i128::from(horizon.0) - i128::from(at.0);
+    i64::try_from(ahead).unwrap_or(if ahead < 0 { i64::MIN } else { i64::MAX })
 }
 
 /// A byte-string read of `root` from `view`: absent, its version and bytes, or why not.

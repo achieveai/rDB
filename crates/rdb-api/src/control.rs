@@ -148,6 +148,21 @@ fn log_call(site: Site, op: &str, key: &str, outcome: &str, started: Instant) {
     tracing::info!(node = site.node.0, op, key, outcome, millis, "control_call");
 }
 
+/// `control_call` for `op=watch`, with `from`, the revision the watch starts after, so a re-watch
+/// shows where it resumed (M9 S2a).
+fn log_watch(site: Site, key: &str, outcome: &str, from: Revision, started: Instant) {
+    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        node = site.node.0,
+        op = "watch",
+        key,
+        outcome,
+        from = from.0,
+        millis,
+        "control_call"
+    );
+}
+
 type Fault = (&'static str, String);
 
 async fn call(
@@ -343,11 +358,11 @@ async fn watch(
         .await;
     let mut stream = match opened {
         Ok(stream) => {
-            log_call(site, "watch", name, "open", started);
+            log_watch(site, name, "open", from, started);
             stream
         }
         Err(error) => {
-            log_call(site, "watch", name, "refused", started);
+            log_watch(site, name, "refused", from, started);
             terminate(&links, site, prefix, from, &error);
             return;
         }
