@@ -1,6 +1,6 @@
-//! M5-88 / M5-89 / M5-92 — the fence a `restore` mints, seen from both sides: an old cluster
-//! and a restored one can never talk to each other, and a restored store still forms the new
-//! cluster it was restored into (spec §19.11; ADR-0011, ADR-0024; OQ-45).
+//! M5-88 / M5-89 / M5-91 / M5-92 — the fence a `restore` mints, seen from both sides: an old
+//! cluster and a restored one can never talk to each other, and a restored store still forms the
+//! new cluster it was restored into (spec §19.11; ADR-0011, ADR-0024; OQ-45).
 //!
 //! # M5-88 / M5-89 — what they prove, and what they approximate
 //!
@@ -26,7 +26,8 @@
 //! stand in for. It exports a real artifact from a stopped node, restores it into a fenced
 //! identity through `config_storage::restore_into_fresh_store`, and stands that directory up as
 //! node 1 of a new `Cluster` via `ClusterBuilder::data_dir` — the harness seam whose absence
-//! this module doc previously recorded as the gap that blocked the row.
+//! this module doc previously recorded as the gap that blocked the row. M5-91 reuses that round
+//! trip to watch the restored cluster: refused below the restored revision, served at it.
 
 mod support;
 
@@ -37,7 +38,9 @@ use config_testkit::cluster::{Cluster, StorageKind};
 use openraft::raft::VoteRequest;
 use openraft::Vote;
 
-use support::{get_req, put_req};
+use config_core::{WatchItem, WatchRequest};
+use futures::StreamExt;
+use support::{get_req, list_req, put_req};
 
 /// M5-88 and M5-89 together: the refusal is proven in both directions from a single pair of
 /// clusters, which is what makes it a symmetry claim rather than two coincidentally similar
@@ -309,4 +312,143 @@ async fn m5_92_a_restored_store_forms_the_new_cluster_as_its_genesis_member() {
     }
 
     restored.shutdown().await;
+}
+
+/// M5-91: a watch on a restored cluster. A cursor from before the backup is refused typed; the
+/// client then relists, as spec §14 step 9 tells it to, and the watch at the revision that
+/// `List` reports is served and delivers the first post-restore write with no gap.
+///
+/// Restore sets `compact_revision = cluster_revision = R`, so right after formation `List`
+/// reports `R` itself. Before ADR-0020's 2026-10-10 amendment the watch at `R` was refused,
+/// and the relist the runbook prescribes looped until the first write.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m5_91_after_restore_a_relist_then_watch_at_the_restored_revision_is_served() {
+    // --- source cluster, backup taken from a stopped node (as M5-92) -----------------------
+    let source = Cluster::builder()
+        .nodes(3)
+        .storage(StorageKind::ROCKS)
+        .start()
+        .await;
+    source
+        .wait_formed(source.deadline(10))
+        .await
+        .unwrap_or_else(|t| panic!("source cluster: {t}"));
+    let writer = source.leader().await;
+    for i in 0..6 {
+        source
+            .client(writer)
+            .put(put_req(&format!("/m5/91/{i}"), "before-the-disaster"))
+            .await
+            .unwrap_or_else(|e| panic!("seed put {i}: {e}"));
+    }
+    let backup_revision = source.metrics(writer).cluster_revision;
+    source
+        .wait_revision_all(backup_revision, source.deadline(20))
+        .await
+        .expect("every voter reaches the backup revision before the backup is taken");
+    let donor = source.followers().first().copied().unwrap_or(writer);
+    let source_identity = source.identity(donor);
+    source.stop(donor).await;
+    let artifacts = config_testkit::fs::temp_dir();
+    let snap = artifacts.path().join("m5-91.snap");
+    let header = config_storage::export_snapshot(&source.data_dir(donor), &snap)
+        .expect("export a backup artifact from the stopped node");
+    assert_eq!(header.cluster_revision, backup_revision);
+    source.shutdown().await;
+
+    // --- restore and form the new cluster ---------------------------------------------------
+    let fresh = config_testkit::fs::temp_dir();
+    let data_dir = fresh.path().join("restored");
+    let new_cluster_id = ClusterId::from_bytes([0x91; 16]);
+    let new_epoch = RecoveryEpoch(source_identity.recovery_epoch.0 + 1);
+    config_storage::restore_into_fresh_store(
+        &data_dir,
+        &ClusterIdentity {
+            cluster_id: new_cluster_id,
+            recovery_epoch: new_epoch,
+            node_id: NodeId(1),
+        },
+        &snap,
+        &config_core::RestoredFrom {
+            cluster_id: source_identity.cluster_id,
+            recovery_epoch: source_identity.recovery_epoch.0,
+            revision: header.cluster_revision,
+        },
+    )
+    .expect("restore into a fresh, fenced store");
+    let mut cfg = Cluster::builder()
+        .nodes(3)
+        .storage(StorageKind::ROCKS)
+        .cluster_id(new_cluster_id)
+        .data_dir(NodeId(1), &data_dir)
+        .form(false)
+        .config();
+    cfg.recovery_epoch = new_epoch;
+    let restored = Cluster::start_with(cfg).await;
+    restored
+        .form()
+        .await
+        .expect("the restored store forms the new cluster");
+    restored
+        .wait_formed(restored.deadline(10))
+        .await
+        .unwrap_or_else(|t| panic!("restored cluster: {t}"));
+    let leader = restored.leader().await;
+
+    // A cursor from before the backup is refused typed, naming the oldest retained revision.
+    match restored
+        .watch(leader, watch_req("/m5/91/", backup_revision - 5))
+        .await
+    {
+        Err(config_core::ConfigError::RevisionCompacted {
+            minimum_available_revision,
+        }) => assert_eq!(minimum_available_revision, backup_revision + 1),
+        other => panic!("a cursor below the restored revision must be refused: {other:?}"),
+    }
+
+    // The documented recovery: relist, then watch from the revision the List reports.
+    let listed = restored
+        .client(leader)
+        .list(list_req("/m5/91/"))
+        .await
+        .expect("relist on the restored cluster");
+    assert_eq!(
+        listed.records.len(),
+        6,
+        "the restored state came with the cluster"
+    );
+    assert_eq!(
+        listed.read_revision, backup_revision,
+        "with no write since the restore, List reports the restored revision itself"
+    );
+    let mut stream = restored
+        .watch(leader, watch_req("/m5/91/", listed.read_revision))
+        .await
+        .unwrap_or_else(|e| panic!("the watch at the relisted revision must be served: {e}"));
+
+    let after = restored
+        .client(leader)
+        .put(put_req("/m5/91/after", "after-the-restore"))
+        .await
+        .expect("the first post-restore write");
+    assert_eq!(after.revision, backup_revision + 1);
+    let first = tokio::time::timeout(restored.deadline(10), stream.next())
+        .await
+        .expect("the post-restore write must be delivered within the deadline");
+    match first {
+        Some(Ok(WatchItem::Event(event))) => assert_eq!(event.revision, backup_revision + 1),
+        other => panic!("expected the post-restore event first, got {other:?}"),
+    }
+
+    restored.shutdown().await;
+}
+
+fn watch_req(prefix: &str, start_after_revision: u64) -> WatchRequest {
+    WatchRequest {
+        prefix: support::key(prefix),
+        start_after_revision,
+        // Long on purpose: `None` selects the node default, and a progress frame arriving
+        // before the event would fail the first-item assertion for no reason.
+        progress_interval: Some(std::time::Duration::from_secs(3600)),
+    }
 }

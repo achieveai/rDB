@@ -605,10 +605,13 @@ async fn m4_55_resume_just_above_watermark_succeeds() {
     cluster.shutdown().await;
 }
 
-/// M4-56: the client obeys `RevisionCompacted`'s own advice — re-watching at exactly
-/// `minimum_available_revision` succeeds and delivers the retained tail.
+/// M4-56: the client acts on `RevisionCompacted` without losing a retained event. The refusal
+/// names `minimum_available_revision`, the oldest retained revision. Watching *after* it is
+/// accepted but skips that event, so it is not the resume cursor. The advice is to relist (spec
+/// §11.2), or to watch at `minimum - 1`, which is `compact_revision` and replays the whole tail
+/// (ADR-0020, 2026-10-10 amendment).
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
-async fn m4_56_resume_at_exactly_minimum_available_revision() {
+async fn m4_56_resume_from_the_refusal_delivers_the_whole_retained_tail() {
     let (cluster, compacted, written) = compacted_cluster().await;
     let leader = cluster.leader().await;
 
@@ -622,23 +625,21 @@ async fn m4_56_resume_at_exactly_minimum_available_revision() {
         }) => minimum_available_revision,
         other => panic!("expected RevisionCompacted to learn the minimum, got {other:?}"),
     };
+    assert_eq!(minimum, compacted + 1, "the oldest retained revision");
 
     let mut stream = cluster
-        .watch_as(leader, Principal::development(), watch_req(minimum))
+        .watch_as(leader, Principal::development(), watch_req(minimum - 1))
         .await
         .unwrap_or_else(|e| {
-            panic!("re-watching at the advised minimum {minimum} must succeed: {e}")
+            panic!("re-watching one below the reported minimum {minimum} must succeed: {e}")
         });
     let last = *written.last().expect("100 puts");
     let events = collect_events_until(&mut stream, last, cluster.deadline(20)).await;
-    // `start_after_revision` is exclusive: watching at exactly `minimum` (the oldest retained
-    // revision) delivers from `minimum + 1` onward, not `minimum` itself. The row's claim is
-    // that the advised value is *usable* (no error), not that it is itself replayed.
     let revisions: Vec<u64> = events.iter().map(|e| e.revision).collect();
     assert_eq!(
         revisions,
-        written[(minimum as usize)..],
-        "watching at the advised minimum must deliver the complete retained tail"
+        written[(compacted as usize)..],
+        "the retained tail must arrive whole, starting at the reported minimum itself"
     );
 
     cluster.shutdown().await;

@@ -329,7 +329,7 @@ async fn m4_52_concurrent_registrations_are_serialized() {
 // §3.5 — compacted cursors and revision boundaries
 // ---------------------------------------------------------------------------------------
 
-/// M4-53, M4-54, M4-55, M4-56: the compaction boundary, from both sides, plus the error's own
+/// M4-53, M4-54, M4-55: the compaction boundary, from both sides, plus the error's own
 /// advice.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m4_53_compacted_cursor_boundary_and_recovery() {
@@ -380,16 +380,20 @@ async fn m4_53_compacted_cursor_boundary_and_recovery() {
     assert_eq!(assert_ascending(&take(&mut at, 10).await), written[10..]);
     drop(at);
 
-    // M4-55/M4-56: the number the error handed back is usable. It is the oldest retained
-    // revision; a client re-`List`s to get state *through* it and then watches after it, which
-    // is the §11.2 flow — so what arrives is everything above that revision.
+    // M4-55: one above the floor. The error reported `floor + 1` as the oldest retained
+    // revision; watching *after* it is accepted but skips that event, so it is not a resume
+    // cursor. The recovery is to relist (§11.2) or watch at `floor`, as the clause above does.
     let mut stream = cluster
         .node(leader.0)
         .watch(&principal(), watch_request("app/", floor + 1))
         .await
-        .expect("the minimum_available_revision the error reported must be accepted");
+        .expect("a cursor above the floor must be accepted");
     let delivered = assert_ascending(&take(&mut stream, 9).await);
-    assert_eq!(delivered, written[11..]);
+    assert_eq!(
+        delivered,
+        written[11..],
+        "everything after the cursor, and so not event floor + 1"
+    );
 
     cluster.shutdown().await;
 }

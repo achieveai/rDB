@@ -125,9 +125,10 @@ revocation is M6 (ADR-0028). Missing this step is structurally harmless — the 
 binding already rejects the old nodes — but do it anyway.
 
 **9. Tell clients to discard page tokens and relist before restarting watches.**
-Enforced at the storage layer: restore sets `compact_revision = revision`, so a watch resuming
-at or below it gets `RevisionCompacted` rather than a partial replay. Restore does not promise
-watch continuity.
+Restore sets `compact_revision = revision`, so a watch resuming below it gets
+`RevisionCompacted` rather than a partial replay. Relisting is still required: storage does not
+fence a cursor at the restored revision (served since 2026-10-10, ADR-0020), nor one above it.
+Restore does not promise watch continuity.
 
 **10. Record RPO, RTO, revision, operator, reviewer.**
 
