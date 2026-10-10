@@ -119,7 +119,7 @@ empty), with:
   This is the same "no retained history" honesty ADR-0021's format migration already establishes
   for a different reason: a restored store's `events` CF is only ever populated with whatever the
   backup's own retention window still held at export time, and setting `compact_revision` to the
-  current revision means any watch resuming at or below it correctly receives `RevisionCompacted`
+  current revision means any watch resuming below it correctly receives `RevisionCompacted`
   rather than a partial or misleading replay. Spec §14 step 9 reinforces this from the client side:
   "require every client to discard page tokens and relist before restarting watches" — restore does
   not promise watch continuity, and `compact_revision = revision` is what makes that true at the
@@ -196,7 +196,7 @@ runs against; it does not itself publish a number.
   categories (signature, checksum, decrypt) with the correct `reason`; `restore` refuses each row
   of the CLI refusal matrix; a successful restore's record counts, revision, and membership match
   the manifest; a restored cluster and its source cluster (kept running in the test harness) reject
-  cross-cluster peer RPCs in both directions (§19.11); a client resuming a watch at or below the
+  cross-cluster peer RPCs in both directions (§19.11); a client resuming a watch below the
   restored `compact_revision` receives `RevisionCompacted` (ADR-0020); encrypted-backup round trip
   (encrypt at backup time, decrypt at verify/restore time) produces byte-identical plaintext to an
   unencrypted control backup of the same state.
@@ -213,7 +213,7 @@ Specifically it:
 
 - **drops** the `events` column family rather than writing it and declaring it compacted. That is
   the only shape consistent with `compact_revision = revision`: the journal cannot be replayed
-  across a recovery boundary, and a watch resuming at or below the restored revision is told
+  across a recovery boundary, and a watch resuming below the restored revision is told
   `RevisionCompacted` (ADR-0020);
 - sets `cluster_revision = compact_revision = revision` from the manifest, so the restored store
   continues the source's revision rather than restarting at zero;
@@ -277,3 +277,10 @@ exactly one line (TA-47). `restore_completed` is the only record in which both i
 afterwards the store knows only the new one and the artifact knows only the old one.
 
 Verified by `config-server/tests/m5_admin.rs` (12 rows).
+
+### 2026-10-10 — a cursor at the restored revision is served
+
+ADR-0020's 2026-10-10 amendment accepts a watch at `compact_revision`. After a restore that is
+the restored revision `R`. Such a client already holds the backup's state at `R`, so the
+restored cluster owes it only events above `R`, and it gets them. A cursor below `R` is still
+refused. Spec §14 step 9's relist instruction is unchanged.

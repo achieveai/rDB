@@ -305,8 +305,8 @@ impl KvState {
     /// The retained-history watermark (M4, ADR-0019).
     ///
     /// `0` means nothing has ever been compacted and *every* revision from 1 upwards is still
-    /// resumable. A resume cursor `R` is refused only when `compact_revision > 0 && R <=
-    /// compact_revision` (OQ-27), which is why the zero case must not be special-cased away.
+    /// resumable. A resume cursor `R` is refused only when `R < compact_revision`: it then asks
+    /// for an event compaction deleted. `R == compact_revision` asks for none (ADR-0020).
     pub fn compact_revision(&self) -> u64 {
         self.compact_revision
     }

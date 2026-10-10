@@ -390,11 +390,9 @@ async fn e2e_24_25_compaction_via_tiny_retention_then_watch_below_watermark() {
         other => panic!("expected RevisionCompacted, got {other:?}"),
     };
 
-    // Re-watching at the reported floor succeeds. `start_after_revision` must be at least the
-    // reported `minimum_available_revision`, not `compact_revision` itself: a request one below
-    // that floor (`compact_revision`) is refused the same way `start_after_revision: 5` was,
-    // which is what this row is proving — the client must resume from the *reported* value, not
-    // from an off-by-one guess derived from `compact_revision`.
+    // Re-watching at the reported floor succeeds: the number the refusal carried is usable as
+    // a cursor. (`compact_revision` itself would be accepted too, ADR-0020's 2026-10-10
+    // amendment; this row proves the reported value, not the boundary.)
     let mut stream = ConfigStore::watch(
         &client,
         WatchRequest {
@@ -507,9 +505,7 @@ async fn e2e_26_journal_survives_process_restart() {
                 WatchRequest {
                     prefix: Bytes::from_static(b"e2e26/"),
                     // The reported floor is `compact_revision + 1` (confirmed in
-                    // `e2e_24_25`): `compact_before` itself is one revision below what the
-                    // journal actually retains after compaction, so it is rejected the same
-                    // way a stale `start_after_revision` is anywhere else in this file.
+                    // `e2e_24_25`), and this row resumes from it.
                     start_after_revision: compact_before + 1,
                     progress_interval: None,
                 },

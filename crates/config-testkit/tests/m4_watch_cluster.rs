@@ -556,23 +556,26 @@ async fn compacted_cluster() -> (Cluster, u64, Vec<u64>) {
     (cluster, compacted, written)
 }
 
-/// M4-54: `R == compact_revision` is not resumable — event `compact_revision` itself is gone.
+/// M4-54: `R == compact_revision` is resumable. The cursor asks for `(R, H]`, and compaction to
+/// `R` deleted only `1..=R`, so the whole retained tail arrives — including `compact_revision +
+/// 1`, which no fresh watch could reach while this cursor was refused (ADR-0020, 2026-10-10).
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
-async fn m4_54_resume_at_watermark_returns_compacted() {
-    let (cluster, compacted, _written) = compacted_cluster().await;
+async fn m4_54_resume_at_watermark_delivers_the_whole_retained_tail() {
+    let (cluster, compacted, written) = compacted_cluster().await;
     let leader = cluster.leader().await;
 
-    let result = cluster
+    let mut stream = cluster
         .watch_as(leader, Principal::development(), watch_req(compacted))
-        .await;
-    match result {
-        Err(ConfigError::RevisionCompacted {
-            minimum_available_revision,
-        }) => assert_eq!(minimum_available_revision, compacted + 1),
-        other => {
-            panic!("watching at exactly compact_revision must be RevisionCompacted: {other:?}")
-        }
-    }
+        .await
+        .unwrap_or_else(|e| panic!("watching at exactly compact_revision must succeed: {e}"));
+    let last = *written.last().expect("100 puts");
+    let events = collect_events_until(&mut stream, last, cluster.deadline(20)).await;
+    let revisions: Vec<u64> = events.iter().map(|e| e.revision).collect();
+    assert_eq!(
+        revisions,
+        written[(compacted as usize)..],
+        "delivery must start at compacted + 1, the oldest retained revision"
+    );
 
     cluster.shutdown().await;
 }
@@ -592,9 +595,7 @@ async fn m4_55_resume_just_above_watermark_succeeds() {
     let revisions: Vec<u64> = events.iter().map(|e| e.revision).collect();
     // `start_after_revision` is exclusive, so watching at `compacted + 1` delivers from
     // `compacted + 2` onward — `written[compacted..]` is `compacted+1` itself, which this
-    // watch never sees (a fresh watch cannot land exactly on `compacted + 1`'s own event; that
-    // revision is only reachable by having already been watching before the compaction, per
-    // M4-31/M4-32).
+    // watch never sees. A fresh watch reaches that event by starting at `compacted` (M4-54).
     assert_eq!(
         revisions,
         written[(compacted as usize + 1)..],
@@ -611,8 +612,9 @@ async fn m4_56_resume_at_exactly_minimum_available_revision() {
     let (cluster, compacted, written) = compacted_cluster().await;
     let leader = cluster.leader().await;
 
+    // One below the watermark: the first cursor that still needs a deleted event.
     let refused = cluster
-        .watch_as(leader, Principal::development(), watch_req(compacted))
+        .watch_as(leader, Principal::development(), watch_req(compacted - 1))
         .await;
     let minimum = match refused {
         Err(ConfigError::RevisionCompacted {
