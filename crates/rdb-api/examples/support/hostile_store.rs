@@ -11,6 +11,13 @@
 //!   never bound to again while it is being stopped ([`HostileStore::stopping`]). Dropping the
 //!   old client is also what lets `control start` reopen that voter's RocksDB.
 //!
+//! Two faults rEtcd cannot be made to show by hand, for scenario 2:
+//!
+//! * [`HostileStore::drop_watches`] ends every watch stream it handed out, as a lost connection
+//!   would (`control drop-watches`, and the second half of `control gap`);
+//! * [`HostileStore::fail_lists`] answers every `list` with one error until turned off
+//!   (`control fail list`), without reaching a voter, so the answer moves no binding.
+//!
 //! It holds the cluster weakly, so `rdb_dev` can still take the cluster back to shut it down.
 //! Example-only: the product's Db takes any `ConfigStore` and knows nothing of voters.
 //!
@@ -27,11 +34,59 @@ use config_core::{
     ListResponse, MutationResponse, NodeId as VoterId, PutRequest, WatchRequest, WatchStream,
 };
 use config_testkit::cluster::Cluster;
+use futures::StreamExt;
+use tokio::sync::watch;
 
 type Reply<'a, T> = Pin<Box<dyn Future<Output = Result<T, ConfigError>> + Send + 'a>>;
 
 /// The reason a stopped voter's client gives (`config_engine::ConfigNode::stop`).
 const STOPPED: &str = "stopped";
+
+/// What `control fail list` makes every `list` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFault {
+    /// `Unavailable`: transient.
+    Unavailable,
+    /// `DeadlineExceededUnknownOutcome`: transient.
+    Deadline,
+    /// `NotLeader` with no hint: transient.
+    NotLeader,
+    /// `InvalidArgument`: not transient, so a reload must still fault on it.
+    Invalid,
+}
+
+impl ListFault {
+    /// The words `control fail list` takes; `off` is `None`.
+    pub const WORDS: &'static str = "unavailable|deadline|notleader|invalid|off";
+
+    /// `control fail list <word>`: `Some` fault, or `None` for `off`.
+    pub fn parse(word: &str) -> Result<Option<Self>, String> {
+        match word {
+            "unavailable" => Ok(Some(Self::Unavailable)),
+            "deadline" => Ok(Some(Self::Deadline)),
+            "notleader" => Ok(Some(Self::NotLeader)),
+            "invalid" => Ok(Some(Self::Invalid)),
+            "off" => Ok(None),
+            other => Err(format!(
+                "control fail list <{}>, not {other:?}",
+                Self::WORDS
+            )),
+        }
+    }
+
+    fn error(self) -> ConfigError {
+        match self {
+            Self::Unavailable => ConfigError::Unavailable {
+                reason: "hostile store: list failed on purpose".to_owned(),
+            },
+            Self::Deadline => ConfigError::DeadlineExceededUnknownOutcome,
+            Self::NotLeader => ConfigError::NotLeader { hint: None },
+            Self::Invalid => ConfigError::InvalidArgument {
+                detail: "hostile store: list failed on purpose".to_owned(),
+            },
+        }
+    }
+}
 
 /// Which voter the store talks to, and the voters it must not move to.
 struct Binding {
@@ -46,6 +101,10 @@ struct Binding {
 pub struct HostileStore {
     cluster: Weak<Cluster>,
     binding: Mutex<Binding>,
+    /// The fault every `list` answers, while set.
+    list_fault: Mutex<Option<ListFault>>,
+    /// Bumped by [`HostileStore::drop_watches`]; every stream handed out ends on the next bump.
+    ends: watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for HostileStore {
@@ -75,6 +134,8 @@ impl HostileStore {
                 client: cluster.client(voter),
                 stopping: BTreeSet::new(),
             }),
+            list_fault: Mutex::new(None),
+            ends: watch::channel(0).0,
         }
     }
 
@@ -169,6 +230,26 @@ impl HostileStore {
         self.lock().stopping.remove(&voter);
     }
 
+    /// `control fail list <word>`: every `list` answers `fault` from now on, or, with `None`,
+    /// reaches the voter again.
+    pub fn fail_lists(&self, fault: Option<ListFault>) {
+        *self
+            .list_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fault;
+        tracing::info!(fault = ?fault, "control_store_fail_lists");
+    }
+
+    /// `control drop-watches`: end every watch stream this store handed out. Each ends as a
+    /// plain end of stream, which the Db reads as `Unavailable` and re-watches from its cursor.
+    /// Returns how many were open.
+    pub fn drop_watches(&self) -> usize {
+        let open = self.ends.receiver_count();
+        self.ends.send_modify(|n| *n += 1);
+        tracing::info!(open, "control_store_watches_dropped");
+        open
+    }
+
     /// Run `call` on the bound voter's client, and follow the leader on its answer.
     fn through<'a, 'b, T, F>(&'a self, call: F) -> Reply<'b, T>
     where
@@ -201,6 +282,15 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
+        let fault = *self
+            .list_fault
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(fault) = fault {
+            let error = fault.error();
+            tracing::info!(fault = ?fault, %error, "control_store_list_failed");
+            return Box::pin(std::future::ready(Err(error)));
+        }
         self.through(move |store| store.list(request))
     }
 
@@ -229,6 +319,16 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
-        self.through(move |store| store.watch(request))
+        let mut ended = self.ends.subscribe();
+        let opened = self.through(move |store| store.watch(request));
+        Box::pin(async move {
+            let stream = opened.await?;
+            let until = async move {
+                // An error means the store is gone; the stream ends then too.
+                let _ = ended.changed().await;
+            };
+            let stream: WatchStream = Box::pin(stream.take_until(until));
+            Ok(stream)
+        })
     }
 }

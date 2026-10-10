@@ -80,8 +80,19 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl ApiError {
-    /// An error of `kind`, with the retry rule and mutation proof that kind carries when the
-    /// kernel raises it.
+    /// An error of `kind` raised by the API itself, with a fixed retry rule and mutation proof
+    /// per kind:
+    ///
+    /// | kind | `retry` | `no_mutation` |
+    /// |---|---|---|
+    /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
+    /// | `UnknownOutcome` | `QueryStatus` | `false` |
+    /// | `CorruptHistory` | `Quarantine` | `false` |
+    /// | any other | `BoundedJitter` | `false` |
+    ///
+    /// This is not what the kernel attaches to the same kind: for example a kernel
+    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves no mutation.
+    /// Wrap a kernel error with [`Self::from_kernel`], never with this.
     #[must_use]
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
         let (retry, no_mutation) = match kind {
@@ -251,7 +262,10 @@ pub struct PutOk {
 pub struct GetOk {
     /// The object's version and bytes, `None` when absent.
     pub value: Option<(u64, Bytes)>,
-    /// The generation of the view it was read from.
+    /// The storage generation of the view it was read from. Right after a cutoff, at seq 0,
+    /// it can still be the predecessor generation: the new generation has written nothing
+    /// yet, so both views hold identical contents. Never fence on it; a write fences with the
+    /// generation the node adopted, not with this one.
     pub generation: Generation,
     /// The position of that view.
     pub at: Seq,
@@ -808,7 +822,9 @@ impl Db {
                         reply,
                     })
                     .ok()?;
-                answer.recv_timeout(self.timeouts.read).ok()
+                let mut status = answer.recv_timeout(self.timeouts.read).ok()?;
+                status.reload_pending = self.control.reload_pending(status.node);
+                Some(status)
             })
             .collect()
     }

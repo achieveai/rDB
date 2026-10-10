@@ -48,6 +48,14 @@
 //! control stop <voter>                    stop one rEtcd voter (1, 2 or 3). The Db's store
 //!                                         moves off it first; refused if no other runs
 //! control start <voter>                   start a stopped voter again on its own data
+//! control gap                             compact rEtcd through its current revision, then
+//!                                         drop the Db's watches: a re-watch from an older
+//!                                         cursor is refused `RevisionCompacted` and reloads
+//! control drop-watches                    end the Db's watch streams; they re-watch from
+//!                                         their cursors with no reload
+//! control fail list <unavailable|deadline|notleader|invalid|off>
+//!                                         every list the Db's store sends answers that error,
+//!                                         until `off`. `control` reads are not affected
 //! link hold|heal <a>-<b> | link heal all | links
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //! sleep <millis>
@@ -86,7 +94,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use config_core::{ConfigStore, ListRequest, NodeId as VoterId};
+use config_core::{ConfigStore, GetRequest, ListRequest, NodeId as VoterId};
 use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
 use rdb_api::host::NodeStatus;
@@ -96,7 +104,7 @@ use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, RequestId};
 use rdb_core::contracts::txn::TxnRequest;
 
-use hostile_store::HostileStore;
+use hostile_store::{HostileStore, ListFault};
 
 /// The control voters' Raft timers. Faster than the harness default, whose failover can outlast
 /// A1's write horizon (walk 1L): `tests::control_failover_millis` is 1000 ms here, 3000 ms there.
@@ -617,6 +625,19 @@ fn repl<'scope, 'env>(
                 say(&voters_line(control));
                 Ok(())
             }
+            ["control", "gap"] => {
+                say(&gap(rt, control));
+                Ok(())
+            }
+            ["control", "drop-watches"] => {
+                say(&format!("dropped {} watches", control.store.drop_watches()));
+                Ok(())
+            }
+            ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
+                control.store.fail_lists(fault);
+                say(&format!("fail list {word}"));
+            }),
+            ["control", "fail", ..] => Err(format!("control fail list <{}>", ListFault::WORDS)),
             ["control", verb @ ("stop" | "start"), voter] => parse_voter(control.cluster, voter)
                 .map(|voter| {
                     say(&if *verb == "stop" {
@@ -625,6 +646,15 @@ fn repl<'scope, 'env>(
                         start_voter(rt, control.cluster, voter)
                     });
                 }),
+            ["control", "stop" | "start", ..] => Err(format!(
+                "control stop|start <voter>: exactly one voter, one of {:?}",
+                control
+                    .cluster
+                    .ids()
+                    .iter()
+                    .map(|id| id.0)
+                    .collect::<Vec<_>>()
+            )),
             ["links"] => {
                 say(&format!(
                     "held={:?}",
@@ -988,7 +1018,7 @@ fn node_line(node: &NodeStatus) -> String {
         None => " published=-".to_owned(),
     };
     format!(
-        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}",
+        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
         node.node.0,
         holds_part(node),
         node.authority,
@@ -999,6 +1029,8 @@ fn node_line(node: &NodeStatus) -> String {
         node.protection.as_deref().unwrap_or("inert"),
         node.admits
             .map_or_else(|| "-".to_owned(), |a| a.to_string()),
+        node.reload_pending
+            .map_or_else(String::new, |n| format!(" reload pending attempt={n}")),
         node.fault
             .as_ref()
             .map_or_else(String::new, |f| format!(" FAULT={f}")),
@@ -1039,6 +1071,36 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
             Err(e) => say(&format!("err control list {prefix}: {e}")),
         }
     }
+}
+
+/// `control gap`: compact through the revision the leader reads now, then drop the Db's
+/// watches. Returns the line to print; a failure, a panic in the harness included, is printed.
+fn gap(rt: &tokio::runtime::Runtime, control: &Control<'_>) -> String {
+    let cluster = Arc::clone(control.cluster);
+    let compacted = rt.block_on(rt.spawn(async move {
+        let leader = cluster
+            .leader_now()
+            .ok_or_else(|| "no rEtcd leader now; try again".to_owned())?;
+        let read = cluster
+            .client(leader)
+            .get(GetRequest {
+                key: Bytes::from_static(b"partitions/1"),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        cluster
+            .compact_now(read.read_revision)
+            .await
+            .map_err(|e| e.to_string())
+    }));
+    let compacted = match compacted {
+        Ok(Ok(revision)) => revision,
+        Ok(Err(e)) => return format!("err control gap: {e}"),
+        Err(e) => return format!("err control gap: {e}"),
+    };
+    tracing::info!(revision = compacted, "control_compacted");
+    let dropped = control.store.drop_watches();
+    format!("compacted through revision {compacted}; dropped {dropped} watches")
 }
 
 /// `voters leader=N running=[..] bound=N`; `leader=-` while none is elected.
@@ -1198,6 +1260,7 @@ mod tests {
             admits: Some(admits),
             published: None,
             stalled: stalled.map(str::to_owned),
+            reload_pending: None,
         }
     }
 

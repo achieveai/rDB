@@ -1,5 +1,5 @@
-//! A control store for crate tests: a `MemStore` that can lose a put's reply, fail a read, and
-//! hold every put at a gate (F-003, F-004).
+//! A control store for crate tests: a `MemStore` that can lose a put's reply, fail a read or a
+//! list, and hold every put at a gate (F-003, F-004).
 //!
 //! Written out by hand because `async-trait` is not a dependency of this crate.
 
@@ -25,6 +25,8 @@ pub(crate) struct Script {
     pub(crate) drop_puts: u32,
     /// Gets still to fail with `Unavailable`, without reading.
     pub(crate) fail_gets: u32,
+    /// Lists still to fail with `Unavailable`, without reading (M9 S2a, scenario 2f).
+    pub(crate) fail_lists: u32,
 }
 
 pub(crate) struct Scripted {
@@ -88,6 +90,11 @@ impl ConfigStore for Scripted {
         'a: 'b,
         Self: 'b,
     {
+        if self.take(|script| &mut script.fail_lists) {
+            return Box::pin(std::future::ready(Err(ConfigError::Unavailable {
+                reason: "scripted: the list failed".to_owned(),
+            })));
+        }
         self.inner.list(request)
     }
 

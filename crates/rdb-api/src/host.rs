@@ -442,6 +442,9 @@ pub struct NodeStatus {
     /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
     /// stalled; cleared when it activates.
     pub stalled: Option<String>,
+    /// While a control reload of this node's is retrying, how many of its lists have failed.
+    /// Filled by `Db::node_status` from the control adapter; the host itself leaves it `None`.
+    pub reload_pending: Option<u32>,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -1272,17 +1275,21 @@ impl Host {
     /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`]. `renewed_at`
     /// is the dispatch tick of the last committed renewal, which the horizon is counted from,
     /// absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
-    /// publication.
+    /// publication, and `past_horizon` whether none was left. `would_fence_as` is the reason a
+    /// check past the horizon would deny with (`AuthorityView::past_horizon`); it is not a state,
+    /// and is set while the view is still valid.
     fn report_view(&mut self, view: &AuthorityView) {
         let at = self.stepped_at;
+        let margin_ms = margin_ms(view.valid_through_tick, at);
         tracing::info!(
             node = self.node.0,
             partition = view.lineage.partition.0,
             seq = view.authority_seq,
             renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
             valid_through = view.valid_through_tick.0,
-            past_horizon = ?view.past_horizon,
-            margin_ms = margin_ms(view.valid_through_tick, at),
+            past_horizon = margin_ms < 0,
+            would_fence_as = ?view.past_horizon,
+            margin_ms,
             at = at.0,
             "authority_view"
         );
@@ -3209,6 +3216,7 @@ impl Host {
                 .stalled
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
+            reload_pending: None,
         }
     }
 }
