@@ -286,7 +286,7 @@ ADR-0020's 2026-10-10 amendment accepts a watch at `compact_revision`. After a r
 the restored revision `R`. If the cursor came from the backed-up history, the client already
 holds the backup's state at `R`, so the restored cluster owes it only events above `R`, and it
 gets them. A cursor below `R` is still refused. Cursors from another history are not fenced at
-any revision; that predates this change and is tracked separately. Spec §14 step 9's relist
+any revision; that predates this change and is tracked in issue #37. Spec §14 step 9's relist
 instruction is unchanged, and it now works: a relist right after restore reports `R`, and the
 watch at `R` is served instead of refused until the first write. This supersedes the step-9 row
 and the `compact_revision = revision` bullet above where they say storage enforces the relist.
