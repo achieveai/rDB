@@ -1300,7 +1300,8 @@ impl Host {
     /// allowed T1's step-14 `StorageDispatch` recheck (critic A2). `valid_through` is the
     /// horizon of the newest view at dispatch, and `margin_ms` the time from `decided_at` to it.
     /// That view can be newer than the one A1 decided on, so a judge of the binding tick joins
-    /// on `authority_seq` (`authority_view`'s `seq`). Views that moved only `valid_through`
+    /// on `node`, `partition` and `authority_seq` (`authority_view`'s `seq`; seqs repeat across
+    /// nodes and partitions). Views that moved only `valid_through`
     /// share a seq, so take the last with that seq and `at` at or before `decided_at` (review
     /// F-005: this host keeps only the newest view, and finding the deciding one here would
     /// need a lookup it does not have).
