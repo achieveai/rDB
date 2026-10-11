@@ -393,6 +393,90 @@ mod tests {
         rt.block_on(cluster.shutdown());
     }
 
+    /// Review F-003: a voter that stops under the store, with no `control stop` to move it
+    /// first, answers `Unavailable` with the engine's own stopped reason; the store hands that
+    /// answer back and binds the next call to the leader. It pins [`STOPPED`] against
+    /// `config_engine::ConfigNode::stop`: if that reason changes, the store stops following off
+    /// a stopped voter, and this row goes red. One in-memory cluster on `rdb_dev`'s timers.
+    #[test]
+    fn a_stopped_bound_voter_moves_the_store_to_the_leader() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = Arc::new(
+            rt.block_on(
+                Cluster::builder()
+                    .nodes(3)
+                    .storage(StorageKind::Ephemeral)
+                    .timers(crate::CONTROL_TIMERS)
+                    .start(),
+            ),
+        );
+        let leader = rt.block_on(cluster.leader());
+        let follower = cluster
+            .ids()
+            .into_iter()
+            .find(|id| *id != leader)
+            .expect("a follower");
+        let store = HostileStore::new(&cluster, follower);
+        rt.block_on(cluster.stop_node(follower));
+        let get = || {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from_static(b"partitions/1"),
+            }))
+        };
+
+        let answer = get();
+        assert!(
+            matches!(&answer, Err(ConfigError::Unavailable { reason }) if reason == STOPPED),
+            "a stopped voter answers {STOPPED:?}: {answer:?}"
+        );
+        assert_eq!(store.bound(), leader, "the next call goes to the leader");
+        let next = get();
+        assert!(next.is_ok(), "the leader answers: {next:?}");
+
+        drop(store);
+        let cluster = Arc::try_unwrap(cluster).expect("the only handle");
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// Review F-003: `control stop` of the voter the store is bound to is refused when no
+    /// other voter runs to move the store to. The binding stays, and the voter is left
+    /// unmarked, so the store may still use it. One in-memory voter.
+    #[test]
+    fn stopping_the_only_running_voter_is_refused() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = Arc::new(
+            rt.block_on(
+                Cluster::builder()
+                    .nodes(1)
+                    .storage(StorageKind::Ephemeral)
+                    .timers(crate::CONTROL_TIMERS)
+                    .start(),
+            ),
+        );
+        let only = VoterId(1);
+        let store = HostileStore::new(&cluster, only);
+
+        let refused = store.stopping(only);
+        assert!(
+            matches!(&refused, Err(why) if why.contains("no other voter is running")),
+            "{refused:?}"
+        );
+        assert_eq!(store.bound(), only, "the binding stays");
+        assert!(store.lock().stopping.is_empty(), "the voter is not marked");
+
+        drop(store);
+        let cluster = Arc::try_unwrap(cluster).expect("the only handle");
+        rt.block_on(cluster.shutdown());
+    }
+
     /// `control fail list`'s words (M9 S2a mutant pass): three transient errors, which a reload
     /// retries, and `invalid`, which it must not (scenario 2f-other).
     #[test]

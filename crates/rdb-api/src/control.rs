@@ -202,6 +202,21 @@ fn log_watch(site: Site, key: &str, outcome: &str, from: Revision, started: Inst
     );
 }
 
+/// `control_call` for a reload that found its family, with `read_revision`, the revision the
+/// list read at, which is the snapshot's revision (M9 S2a, tester paper cut).
+fn log_reload_found(site: Site, key: &str, read_revision: u64, started: Instant) {
+    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        node = site.node.0,
+        op = "reload",
+        key,
+        outcome = "found",
+        read_revision,
+        millis,
+        "control_call"
+    );
+}
+
 type Fault = (&'static str, String);
 
 async fn call(
@@ -326,7 +341,7 @@ async fn reload_once(store: &dyn ConfigStore, site: Site, prefix: ControlPrefix)
             value: record.value,
         });
     }
-    log_call(site, "reload", name, "found", started);
+    log_reload_found(site, name, response.read_revision, started);
     Attempt::Done(Ok(ControlEvent::FamilySnapshot {
         prefix,
         snapshot_revision: Revision(response.read_revision),
@@ -819,15 +834,33 @@ mod tests {
         );
     }
 
-    /// What a node's mailbox received within `limit`, as event or fault kind.
-    fn received(rx: &std::sync::mpsc::Receiver<Msg>, limit: std::time::Duration) -> Vec<String> {
+    /// How long a row waits for a message or state it expects, before
+    /// [`crate::host::test_patience`] stretches it. Only a failing row waits it out.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long a mailbox must stay empty to show that nothing more was posted. Fixed, not
+    /// scaled: it proves an absence, so a loaded host only makes the proof weaker, never a red.
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// What a node's mailbox received, as event or fault kind: the first `expected` messages,
+    /// each waited for with patience (M9 S2a review F-001), then any more that arrive before
+    /// the mailbox stays empty for [`QUIET`]. `expected` 0 is a quiet window alone.
+    fn received(rx: &std::sync::mpsc::Receiver<Msg>, expected: usize) -> Vec<String> {
+        let name = |msg| match msg {
+            Msg::Control { event, .. } => format!("{event:?}"),
+            Msg::Fault { kind, .. } => format!("fault {kind}"),
+            _ => "another message".to_owned(),
+        };
+        let patience = crate::host::test_patience(PATIENCE);
         let mut seen = Vec::new();
-        while let Ok(msg) = rx.recv_timeout(limit) {
-            seen.push(match msg {
-                Msg::Control { event, .. } => format!("{event:?}"),
-                Msg::Fault { kind, .. } => format!("fault {kind}"),
-                _ => "another message".to_owned(),
-            });
+        while seen.len() < expected {
+            match rx.recv_timeout(patience) {
+                Ok(msg) => seen.push(name(msg)),
+                Err(_) => return seen,
+            }
+        }
+        while let Ok(msg) = rx.recv_timeout(QUIET) {
+            seen.push(name(msg));
         }
         seen
     }
@@ -858,7 +891,7 @@ mod tests {
                 prefix: ControlPrefix::Partitions,
             },
         );
-        let seen = received(&rx, std::time::Duration::from_millis(500));
+        let seen = received(&rx, 1);
         adapter.shutdown();
         assert_eq!(
             seen,
@@ -966,7 +999,7 @@ mod tests {
                     prefix: ControlPrefix::Partitions,
                 },
             );
-            received(&rx, std::time::Duration::from_millis(250))
+            received(&rx, 1)
         };
 
         mem.failing_with(ConfigError::invalid_argument("wrong"));
@@ -998,9 +1031,9 @@ mod tests {
         );
     }
 
-    /// Polls `ready` every 5 ms for up to a second.
+    /// Polls `ready` every 5 ms, for up to [`PATIENCE`] stretched by the deadline scale.
     fn eventually(ready: impl Fn() -> bool) -> bool {
-        let until = Instant::now() + std::time::Duration::from_secs(1);
+        let until = Instant::now() + crate::host::test_patience(PATIENCE);
         while Instant::now() < until {
             if ready() {
                 return true;
@@ -1010,9 +1043,13 @@ mod tests {
         false
     }
 
-    /// M9 S2a ruling: while a reload retries, `reload_pending` names its node's failed lists. A
-    /// newer reload of the same prefix replaces a retrying one, so the node gets one snapshot,
-    /// not one per reload. Shutdown abandons a retrying reload, so nothing reaches the node after.
+    /// M9 S2a ruling: only the newest reload of a family answers. A reload whose list read the
+    /// family and is still in flight when a newer one starts never posts: its snapshot is older
+    /// than the newer one's, and posted after it would roll the node's cache back. The two
+    /// snapshots differ, so a reload that kept the oldest instead goes red too (review F-002).
+    /// While a reload retries, `reload_pending` names its node's failed lists; a newer reload
+    /// replaces a retrying one, so the node gets one snapshot, not one per reload. Shutdown
+    /// abandons a retrying reload, so nothing reaches the node after.
     #[test]
     fn the_newest_reload_wins_and_shutdown_abandons_a_retrying_one() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1020,7 +1057,10 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let store = Arc::new(config_testkit::MemStore::new());
+        let store = Arc::new(Scripted::new(Script {
+            hold_lists: 1,
+            ..Script::default()
+        }));
         let links = Links::new();
         let (tx, rx) = std::sync::mpsc::channel();
         links.register(NodeId(1), tx);
@@ -1040,10 +1080,50 @@ mod tests {
             );
         };
         let down = || {
-            store.failing_with(ConfigError::Unavailable {
+            store.mem().failing_with(ConfigError::Unavailable {
                 reason: "down".to_owned(),
             });
         };
+
+        // The older reload reads the empty family, and its answer is held in flight.
+        reload();
+        let held = rt.block_on(async {
+            tokio::time::timeout(
+                crate::host::test_patience(PATIENCE),
+                store.list_held.notified(),
+            )
+            .await
+        });
+        assert!(held.is_ok(), "the older reload's list did not read");
+        let key = ControlKey::Partition(PartitionId(1));
+        let written = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(key.encode()),
+                value: Bytes::from_static(b"newer"),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put");
+        // The newer reload reads the record; then the older one's list may answer.
+        reload();
+        store.release_lists();
+        let newer = format!(
+            "{:?}",
+            ControlEvent::FamilySnapshot {
+                prefix: ControlPrefix::Partitions,
+                snapshot_revision: Revision(written.revision),
+                records: vec![ControlRecord {
+                    key,
+                    revision: Revision(written.revision),
+                    value: Bytes::from_static(b"newer"),
+                }],
+            }
+        );
+        assert_eq!(
+            received(&rx, 1),
+            std::slice::from_ref(&newer),
+            "only the newer reload answers, with the newer family"
+        );
 
         down();
         reload();
@@ -1059,20 +1139,8 @@ mod tests {
             eventually(|| adapter.reload_pending(NodeId(1)).is_some()),
             "the newer reload retries too"
         );
-        store.stop_failing();
-        let snapshot = format!(
-            "{:?}",
-            ControlEvent::FamilySnapshot {
-                prefix: ControlPrefix::Partitions,
-                snapshot_revision: Revision(0),
-                records: Vec::new(),
-            }
-        );
-        assert_eq!(
-            received(&rx, std::time::Duration::from_millis(250)),
-            [snapshot],
-            "the older reload never posts"
-        );
+        store.mem().stop_failing();
+        assert_eq!(received(&rx, 1), [newer], "the older reload never posts");
         assert_eq!(
             adapter.reload_pending(NodeId(1)),
             None,
@@ -1083,9 +1151,9 @@ mod tests {
         reload();
         assert!(eventually(|| adapter.reload_pending(NodeId(1)).is_some()));
         adapter.shutdown();
-        store.stop_failing();
+        store.mem().stop_failing();
         assert_eq!(
-            received(&rx, std::time::Duration::from_millis(250)),
+            received(&rx, 0),
             Vec::<String>::new(),
             "a reload abandoned at shutdown posts nothing"
         );

@@ -1272,6 +1272,12 @@ mod tests {
     /// horizon, because the default timers make a failover take up to 3000 ms against a
     /// horizon that can be as short as 2299 ms. A new leader has to be in place with a whole
     /// renewal interval to spare, so the renewal sent to it commits before the horizon.
+    ///
+    /// The slack this relies on (review F-004): with `CONTROL_TIMERS` and the spec budgets it is
+    /// 1500 ms (1000 ms failover + 500 ms renewal) against the 2299 ms horizon, so 799 ms. The
+    /// floor already takes off one renewal for the age of the last one, and the added renewal
+    /// covers the 500 ms renewal tick. Nothing here counts the renewal's RPC and commit time
+    /// on the new leader: those must fit in the 799 ms, and no term is added for them.
     #[test]
     fn control_failover_leaves_a_renewal_inside_the_write_horizon() {
         let budgets = Budgets::SPEC_DEFAULTS;

@@ -1,5 +1,6 @@
 //! A control store for crate tests: a `MemStore` that can lose a put's reply, fail a read or a
-//! list, and hold every put at a gate (F-003, F-004).
+//! list, hold every put at a gate (F-003, F-004), and hold a list's answer after it has read
+//! (M9 S2a review F-002).
 //!
 //! Written out by hand because `async-trait` is not a dependency of this crate.
 
@@ -27,6 +28,9 @@ pub(crate) struct Script {
     pub(crate) fail_gets: u32,
     /// Lists still to fail with `Unavailable`, without reading (M9 S2a, scenario 2f).
     pub(crate) fail_lists: u32,
+    /// Lists still to read and then hold their answer until [`Scripted::release_lists`]: a
+    /// list in flight, whose snapshot is older than anything written after it read.
+    pub(crate) hold_lists: u32,
 }
 
 pub(crate) struct Scripted {
@@ -36,6 +40,10 @@ pub(crate) struct Scripted {
     gate: Semaphore,
     /// Notified when a put arrives, before it waits at the gate.
     pub(crate) put_arrived: Notify,
+    /// A held list takes a permit before it answers. Starts closed.
+    list_gate: Semaphore,
+    /// Notified when a held list has read, before it waits at its gate.
+    pub(crate) list_held: Notify,
 }
 
 impl Scripted {
@@ -45,7 +53,19 @@ impl Scripted {
             script: Mutex::new(script),
             gate: Semaphore::new(Semaphore::MAX_PERMITS),
             put_arrived: Notify::new(),
+            list_gate: Semaphore::new(0),
+            list_held: Notify::new(),
         }
+    }
+
+    /// The store underneath, to fail every call or write around the script.
+    pub(crate) const fn mem(&self) -> &MemStore {
+        &self.inner
+    }
+
+    /// Let held lists answer, one at a time.
+    pub(crate) fn release_lists(&self) {
+        self.list_gate.add_permits(1);
     }
 
     /// Every put waits until [`Scripted::release`].
@@ -95,7 +115,19 @@ impl ConfigStore for Scripted {
                 reason: "scripted: the list failed".to_owned(),
             })));
         }
-        self.inner.list(request)
+        if !self.take(|script| &mut script.hold_lists) {
+            return self.inner.list(request);
+        }
+        Box::pin(async move {
+            let answer = self.inner.list(request).await;
+            self.list_held.notify_one();
+            let _permit = self
+                .list_gate
+                .acquire()
+                .await
+                .expect("the list gate is never closed");
+            answer
+        })
     }
 
     fn put<'a, 'b>(&'a self, request: PutRequest) -> Reply<'b, MutationResponse>

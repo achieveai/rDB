@@ -1297,8 +1297,13 @@ impl Host {
     }
 
     /// `txn_dispatch`: T1 hands `batch` to storage. The binding tick is `decided_at`, when A1
-    /// allowed T1's step-14 `StorageDispatch` recheck; `valid_through` is the horizon of the
-    /// last view A1 published before it, and `margin_ms` the time that was left (critic A2).
+    /// allowed T1's step-14 `StorageDispatch` recheck (critic A2). `valid_through` is the
+    /// horizon of the newest view at dispatch, and `margin_ms` the time from `decided_at` to it.
+    /// That view can be newer than the one A1 decided on, so a judge of the binding tick joins
+    /// on `authority_seq` (`authority_view`'s `seq`). Views that moved only `valid_through`
+    /// share a seq, so take the last with that seq and `at` at or before `decided_at` (review
+    /// F-005: this host keeps only the newest view, and finding the deciding one here would
+    /// need a lookup it does not have).
     fn report_dispatch(&self, batch: &rdb_core::contracts::storage::Batch) {
         let inflight = self
             .transaction
@@ -4602,7 +4607,8 @@ mod tests {
     /// `margin_ms` = `valid_through` - `at`, and `past_horizon` only when that is below 0.
     /// While renewals commit every view has time left; once the store stops answering, the
     /// grant runs out and the view A1 publishes at the fence has none.
-    /// Integration (~4 s): the grant must expire at the spec's horizon.
+    /// Integration (~5.5 s at scale 1, measured alone, review F-006): the grant must expire at
+    /// the spec's horizon.
     #[config_log::retcd_test]
     fn the_view_line_says_past_horizon_only_once_no_time_is_left() {
         const METHOD: &str = "the_view_line_says_past_horizon_only_once_no_time_is_left";
