@@ -22,7 +22,7 @@ counter key — one spelling, everywhere.
 |---|---|---|
 | `not_leader` | Leadership moved off this node | Nobody's. Clients re-establish |
 | `unavailable` | Node stopping, or hub shut down | Nobody's |
-| `revision_compacted` | Start revision was at or below `compact_revision` | Client resumed too late, or retention is too tight |
+| `revision_compacted` | Start revision was below `compact_revision` | Client resumed too late, or retention is too tight |
 | `queue_full` | The stream's bounded event queue filled | **Overload** |
 | `queue_bytes` | The stream's byte budget was exhausted | **Overload** |
 | `broadcast_lagged` | The stream fell behind the shared live buffer | **Overload** |

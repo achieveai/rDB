@@ -21,6 +21,7 @@
 //! Every call logs `control_call{node, op, key, outcome, millis}`.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -49,6 +50,10 @@ struct Site {
     correlation: CorrelationId,
 }
 
+/// The newest reload of a family, running or done, and how many of its lists have failed so
+/// far (0 once it answers).
+type Reloading = (JoinHandle<()>, Arc<AtomicU32>);
+
 /// The control binding for every node of one process.
 pub struct ControlAdapter {
     store: Arc<dyn ConfigStore>,
@@ -56,6 +61,8 @@ pub struct ControlAdapter {
     links: Arc<Links>,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     watches: Mutex<BTreeMap<(NodeId, ControlPrefix), JoinHandle<()>>>,
+    /// The reload of each (node, prefix). A newer one aborts the one it replaces.
+    reloads: Mutex<BTreeMap<(NodeId, ControlPrefix), Reloading>>,
 }
 
 impl std::fmt::Debug for ControlAdapter {
@@ -80,6 +87,7 @@ impl ControlAdapter {
             links,
             tasks: Mutex::new(Vec::new()),
             watches: Mutex::new(BTreeMap::new()),
+            reloads: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -98,6 +106,18 @@ impl ControlAdapter {
         };
         let store = Arc::clone(&self.store);
         let links = Arc::clone(&self.links);
+        if let ControlEffect::Reload { prefix } = effect {
+            // Only the newest reload of a family may answer: an older snapshot posted after a
+            // newer one would roll the node's cache back.
+            let failed = Arc::new(AtomicU32::new(0));
+            let task = self
+                .rt
+                .spawn(reload(store, links, site, prefix, Arc::clone(&failed)));
+            if let Some((old, _)) = lock(&self.reloads).insert((node, prefix), (task, failed)) {
+                old.abort();
+            }
+            return;
+        }
         if let ControlEffect::Watch { prefix, from } = effect {
             let task = self.rt.spawn(watch(store, links, site, prefix, from));
             if let Some(old) = lock(&self.watches).insert((node, prefix), task) {
@@ -116,9 +136,28 @@ impl ControlAdapter {
         tasks.push(task);
     }
 
-    /// Stop every watch and abandon every call still running. Called before the store goes.
+    /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
+    /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
+    /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
+    /// dropped from the map as they are (a newer one replaces it, or `shutdown` takes them
+    /// all), so a count above 0 is always a reload still retrying.
+    #[must_use]
+    pub fn reload_pending(&self, node: NodeId) -> Option<u32> {
+        lock(&self.reloads)
+            .iter()
+            .filter(|((at, _), _)| *at == node)
+            .map(|(_, (_, failed))| failed.load(Ordering::Relaxed))
+            .filter(|failed| *failed > 0)
+            .max()
+    }
+
+    /// Stop every watch and abandon every call still running, reloads included. Called before
+    /// the store goes.
     pub fn shutdown(&self) {
         for (_, task) in std::mem::take(&mut *lock(&self.watches)) {
+            task.abort();
+        }
+        for (_, (task, _)) in std::mem::take(&mut *lock(&self.reloads)) {
             task.abort();
         }
         for task in std::mem::take(&mut *lock(&self.tasks)) {
@@ -146,6 +185,36 @@ fn fault(links: &Links, node: NodeId, kind: &'static str, detail: String) {
 fn log_call(site: Site, op: &str, key: &str, outcome: &str, started: Instant) {
     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(node = site.node.0, op, key, outcome, millis, "control_call");
+}
+
+/// `control_call` for `op=watch`, with `from`, the revision the watch starts after, so a re-watch
+/// shows where it resumed (M9 S2a).
+fn log_watch(site: Site, key: &str, outcome: &str, from: Revision, started: Instant) {
+    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        node = site.node.0,
+        op = "watch",
+        key,
+        outcome,
+        from = from.0,
+        millis,
+        "control_call"
+    );
+}
+
+/// `control_call` for a reload that found its family, with `read_revision`, the revision the
+/// list read at, which is the snapshot's revision (M9 S2a, tester paper cut).
+fn log_reload_found(site: Site, key: &str, read_revision: u64, started: Instant) {
+    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        node = site.node.0,
+        op = "reload",
+        key,
+        outcome = "found",
+        read_revision,
+        millis,
+        "control_call"
+    );
 }
 
 type Fault = (&'static str, String);
@@ -192,44 +261,126 @@ async fn call(
                 outcome,
             })
         }
-        ControlEffect::Reload { prefix } => {
-            let name = prefix.encode();
-            let listed = store
-                .list(ListRequest {
-                    prefix: Bytes::from_static(name.as_bytes()),
-                    max_items: 0,
-                    max_bytes: 0,
-                })
-                .await;
-            let response = match listed {
-                Ok(response) => response,
-                Err(error) => {
-                    log_call(site, "reload", name, "unavailable", started);
-                    return Err(("control_reload_failed", format!("{name}: {error}")));
-                }
-            };
-            if response.truncated {
-                log_call(site, "reload", name, "truncated", started);
-                return Err(("control_reload_truncated", name.to_owned()));
-            }
-            let mut records = Vec::with_capacity(response.records.len());
-            for record in response.records {
-                let key = decode_key(&record.key)?;
-                records.push(ControlRecord {
-                    key,
-                    revision: Revision(record.mod_revision),
-                    value: record.value,
-                });
-            }
-            log_call(site, "reload", name, "found", started);
-            Ok(ControlEvent::FamilySnapshot {
-                prefix,
-                snapshot_revision: Revision(response.read_revision),
-                records,
-            })
-        }
-        // Spawned on its own by `submit`; never reaches here.
+        // Each spawned on its own by `submit`; never reaches here.
+        ControlEffect::Reload { .. } => Err(("control_reload_misrouted", String::new())),
         ControlEffect::Watch { .. } => Err(("control_watch_misrouted", String::new())),
+    }
+}
+
+/// The first wait before a reload's list is sent again, doubled per attempt.
+const RELOAD_BACKOFF_BASE_MILLIS: u64 = 50;
+/// The longest wait between two attempts (M9 S2a ruling, critic A3).
+const RELOAD_BACKOFF_CAP_MILLIS: u64 = 2_000;
+
+/// How long to wait after failed attempt `attempt` (1-based): 50, 100, 200 ms ... capped at 2 s.
+fn reload_backoff(attempt: u32) -> std::time::Duration {
+    // Shift at most 16: `checked_shl` only refuses a shift of 64 or more, and bits shifted out
+    // below that are lost, so `50 << 63` is 0 — a zero wait at attempt 64 (M9 S2a row
+    // `a_reload_waits_twice_as_long_each_time_up_to_two_seconds`). 50 << 16 is far past the cap.
+    let doubled = RELOAD_BACKOFF_BASE_MILLIS << attempt.saturating_sub(1).min(16);
+    std::time::Duration::from_millis(doubled.min(RELOAD_BACKOFF_CAP_MILLIS))
+}
+
+/// Whether a failed list may be sent again: the store could not be reached, did not answer in
+/// time, or was not the leader. Any other error says the request itself is wrong, and retrying
+/// it would hide that forever.
+const fn transient(error: &ConfigError) -> bool {
+    matches!(
+        error,
+        ConfigError::Unavailable { .. }
+            | ConfigError::DeadlineExceededUnknownOutcome
+            | ConfigError::NotLeader { .. }
+    )
+}
+
+/// One reload attempt: a list that failed in a way worth repeating, or the attempt's end.
+#[derive(Debug)]
+enum Attempt {
+    /// The list failed with a [`transient`] error.
+    Again(ConfigError),
+    /// The snapshot, or the fault that ends the node's wait for one.
+    Done(Result<ControlEvent, Fault>),
+}
+
+/// List `prefix` once. A truncated list faults the node: a partial family would read as a
+/// complete one.
+async fn reload_once(store: &dyn ConfigStore, site: Site, prefix: ControlPrefix) -> Attempt {
+    let started = Instant::now();
+    let name = prefix.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(name.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await;
+    let response = match listed {
+        Ok(response) => response,
+        Err(error) if transient(&error) => {
+            log_call(site, "reload", name, "unavailable", started);
+            return Attempt::Again(error);
+        }
+        Err(error) => {
+            log_call(site, "reload", name, "failed", started);
+            return Attempt::Done(Err(("control_reload_failed", format!("{name}: {error}"))));
+        }
+    };
+    if response.truncated {
+        log_call(site, "reload", name, "truncated", started);
+        return Attempt::Done(Err(("control_reload_truncated", name.to_owned())));
+    }
+    let mut records = Vec::with_capacity(response.records.len());
+    for record in response.records {
+        let key = match decode_key(&record.key) {
+            Ok(key) => key,
+            Err(fault) => return Attempt::Done(Err(fault)),
+        };
+        records.push(ControlRecord {
+            key,
+            revision: Revision(record.mod_revision),
+            value: record.value,
+        });
+    }
+    log_reload_found(site, name, response.read_revision, started);
+    Attempt::Done(Ok(ControlEvent::FamilySnapshot {
+        prefix,
+        snapshot_revision: Revision(response.read_revision),
+        records,
+    }))
+}
+
+/// `Reload`: list until the store answers, then post the snapshot. A transient failure waits
+/// [`reload_backoff`] and tries again, logged as `control_reload_retry` and counted
+/// in `failed` for `Db::node_status`; anything else faults the node, as before (M9 S2a, 2f).
+async fn reload(
+    store: Arc<dyn ConfigStore>,
+    links: Arc<Links>,
+    site: Site,
+    prefix: ControlPrefix,
+    failed: Arc<AtomicU32>,
+) {
+    let mut attempt = 0_u32;
+    let answer = loop {
+        match reload_once(&*store, site, prefix).await {
+            Attempt::Done(answer) => break answer,
+            Attempt::Again(error) => {
+                attempt = attempt.saturating_add(1);
+                failed.store(attempt, Ordering::Relaxed);
+                tracing::warn!(
+                    node = site.node.0,
+                    prefix = prefix.encode(),
+                    attempt,
+                    %error,
+                    "control_reload_retry"
+                );
+                tokio::time::sleep(reload_backoff(attempt)).await;
+            }
+        }
+    };
+    failed.store(0, Ordering::Relaxed);
+    match answer {
+        Ok(event) => post(&links, site, event),
+        Err((kind, detail)) => fault(&links, site.node, kind, detail),
     }
 }
 
@@ -343,11 +494,11 @@ async fn watch(
         .await;
     let mut stream = match opened {
         Ok(stream) => {
-            log_call(site, "watch", name, "open", started);
+            log_watch(site, name, "open", from, started);
             stream
         }
         Err(error) => {
-            log_call(site, "watch", name, "refused", started);
+            log_watch(site, name, "refused", from, started);
             terminate(&links, site, prefix, from, &error);
             return;
         }
@@ -462,6 +613,7 @@ const fn read_name(outcome: &ReadOutcome) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_store::{Script, Scripted};
 
     const SITE: Site = Site {
         node: NodeId(1),
@@ -617,8 +769,9 @@ mod tests {
     }
 
     /// A control call the store could not serve is never mistaken for an answer. A failed get
-    /// is `Unavailable`, not `Absent`, which would read as "no record". A failed reload faults
-    /// the node instead of handing it an empty family. A failed delete keeps its request, so
+    /// is `Unavailable`, not `Absent`, which would read as "no record". A reload the store
+    /// cannot serve is tried again, never handed over as an empty family (M9 S2a 2f; it used to
+    /// fault the node). A failed delete keeps its request, so
     /// the module can match the answer. A delete that names no revision never reaches the store.
     #[test]
     fn a_control_call_the_store_cannot_serve_is_never_an_answer() {
@@ -666,16 +819,10 @@ mod tests {
                 outcome: ReadOutcome::Unavailable,
             })
         );
-        let reload = rt.block_on(call(
-            &store,
-            SITE,
-            ControlEffect::Reload {
-                prefix: ControlPrefix::Partitions,
-            },
-        ));
-        assert_eq!(
-            reload.map_err(|(kind, _)| kind),
-            Err("control_reload_failed")
+        let reload = rt.block_on(reload_once(&store, SITE, ControlPrefix::Partitions));
+        assert!(
+            matches!(reload, Attempt::Again(ConfigError::Unavailable { .. })),
+            "an unreachable store is tried again, never handed over as an empty family: {reload:?}"
         );
         assert_eq!(
             rt.block_on(call(&store, SITE, delete(3, Some(Revision(4))))),
@@ -684,6 +831,331 @@ mod tests {
                 key,
                 outcome: CasOutcome::Unavailable,
             })
+        );
+    }
+
+    /// How long a row waits for a message or state it expects, before
+    /// [`crate::host::test_patience`] stretches it. Only a failing row waits it out.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// How long a mailbox must stay empty to show that nothing more was posted. Fixed, not
+    /// scaled: it proves an absence, so a loaded host only makes the proof weaker, never a red.
+    const QUIET: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// What a node's mailbox received, as event or fault kind: the first `expected` messages,
+    /// each waited for with patience (M9 S2a review F-001), then any more that arrive before
+    /// the mailbox stays empty for [`QUIET`]. `expected` 0 is a quiet window alone.
+    fn received(rx: &std::sync::mpsc::Receiver<Msg>, expected: usize) -> Vec<String> {
+        let name = |msg| match msg {
+            Msg::Control { event, .. } => format!("{event:?}"),
+            Msg::Fault { kind, .. } => format!("fault {kind}"),
+            _ => "another message".to_owned(),
+        };
+        let patience = crate::host::test_patience(PATIENCE);
+        let mut seen = Vec::new();
+        while seen.len() < expected {
+            match rx.recv_timeout(patience) {
+                Ok(msg) => seen.push(name(msg)),
+                Err(_) => return seen,
+            }
+        }
+        while let Ok(msg) = rx.recv_timeout(QUIET) {
+            seen.push(name(msg));
+        }
+        seen
+    }
+
+    /// Walk 2f (M9 S2a): `control fail list unavailable`, then a gap, faulted node 1 with
+    /// `control_reload_failed`. A list the store cannot serve for a while is retried, and the
+    /// node gets its snapshot once the store answers.
+    #[test]
+    fn a_reload_the_store_cannot_serve_yet_is_retried_not_faulted() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_lists: 2,
+            ..Script::default()
+        }));
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
+        adapter.submit(
+            NodeId(1),
+            PartitionId(1),
+            CorrelationId(0),
+            ControlEffect::Reload {
+                prefix: ControlPrefix::Partitions,
+            },
+        );
+        let seen = received(&rx, 1);
+        adapter.shutdown();
+        assert_eq!(
+            seen,
+            [format!(
+                "{:?}",
+                ControlEvent::FamilySnapshot {
+                    prefix: ControlPrefix::Partitions,
+                    snapshot_revision: Revision(0),
+                    records: Vec::new(),
+                }
+            )]
+        );
+    }
+
+    /// M9 S2a ruling: a reload lists again only when the store may still answer — it was
+    /// unreachable, out of time, or not the leader. Any other error, and a list cut short, faults
+    /// the node at once: retrying would hide a wrong request, and a partial family would read as
+    /// records that do not exist.
+    #[test]
+    fn a_reload_retries_only_a_store_that_may_still_answer() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = config_testkit::MemStore::new();
+        let transient = [
+            ConfigError::Unavailable {
+                reason: "down".to_owned(),
+            },
+            ConfigError::DeadlineExceededUnknownOutcome,
+            ConfigError::NotLeader { hint: None },
+        ];
+        for error in transient {
+            store.failing_with(error.clone());
+            let attempt = rt.block_on(reload_once(&store, SITE, ControlPrefix::Partitions));
+            assert!(
+                matches!(attempt, Attempt::Again(_)),
+                "{error:?}: {attempt:?}"
+            );
+        }
+        let definite = [
+            ConfigError::invalid_argument("wrong"),
+            ConfigError::NotFound,
+            ConfigError::RevisionCompacted {
+                minimum_available_revision: 3,
+            },
+        ];
+        for error in definite {
+            store.failing_with(error.clone());
+            let attempt = rt.block_on(reload_once(&store, SITE, ControlPrefix::Partitions));
+            assert!(
+                matches!(
+                    attempt,
+                    Attempt::Done(Err(("control_reload_failed", ref detail)))
+                        if detail.starts_with("partitions/: ")
+                ),
+                "{error:?}: {attempt:?}"
+            );
+        }
+
+        let short = config_testkit::MemStore::with_limits(config_core::Limits {
+            max_list_items: 1,
+            ..config_core::Limits::DEFAULT
+        });
+        for id in [1, 2] {
+            let put = short.put(PutRequest {
+                key: Bytes::from(ControlKey::Partition(PartitionId(id)).encode()),
+                value: Bytes::from_static(b"x"),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            });
+            rt.block_on(put).expect("put");
+        }
+        let attempt = rt.block_on(reload_once(&short, SITE, ControlPrefix::Partitions));
+        assert!(
+            matches!(
+                attempt,
+                Attempt::Done(Err(("control_reload_truncated", ref name))) if name == "partitions/"
+            ),
+            "{attempt:?}"
+        );
+    }
+
+    /// M9 S2a ruling: a reload that cannot finish faults its node through the mailbox, instead
+    /// of leaving it waiting for a snapshot — both a store error worth no retry and a key under
+    /// the family that does not decode.
+    #[test]
+    fn a_reload_that_cannot_finish_faults_its_node() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mem = Arc::new(config_testkit::MemStore::new());
+        let store: Arc<dyn ConfigStore> = Arc::clone(&mem) as _;
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
+        let reload = || {
+            adapter.submit(
+                NodeId(1),
+                PartitionId(1),
+                CorrelationId(0),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Partitions,
+                },
+            );
+            received(&rx, 1)
+        };
+
+        mem.failing_with(ConfigError::invalid_argument("wrong"));
+        assert_eq!(reload(), ["fault control_reload_failed"]);
+
+        mem.stop_failing();
+        let put = mem.put(PutRequest {
+            key: Bytes::from_static(b"partitions/x"),
+            value: Bytes::from_static(b"x"),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        });
+        rt.block_on(put).expect("put");
+        assert_eq!(reload(), ["fault control_key_undecodable"]);
+        adapter.shutdown();
+    }
+
+    /// M9 S2a ruling: the wait between lists doubles from 50 ms and never passes 2 s, however
+    /// long the store stays down.
+    #[test]
+    fn a_reload_waits_twice_as_long_each_time_up_to_two_seconds() {
+        let waits: Vec<u128> = [1, 2, 3, 6, 7, 8, 40, 64, 65, u32::MAX]
+            .into_iter()
+            .map(|attempt| reload_backoff(attempt).as_millis())
+            .collect();
+        assert_eq!(
+            waits,
+            [50, 100, 200, 1600, 2000, 2000, 2000, 2000, 2000, 2000]
+        );
+    }
+
+    /// Polls `ready` every 5 ms, for up to [`PATIENCE`] stretched by the deadline scale.
+    fn eventually(ready: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + crate::host::test_patience(PATIENCE);
+        while Instant::now() < until {
+            if ready() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// M9 S2a ruling: only the newest reload of a family answers. A reload whose list read the
+    /// family and is still in flight when a newer one starts never posts: its snapshot is older
+    /// than the newer one's, and posted after it would roll the node's cache back. The two
+    /// snapshots differ, so a reload that kept the oldest instead goes red too (review F-002).
+    /// While a reload retries, `reload_pending` names its node's failed lists; a newer reload
+    /// replaces a retrying one, so the node gets one snapshot, not one per reload. Shutdown
+    /// abandons a retrying reload, so nothing reaches the node after.
+    #[test]
+    fn the_newest_reload_wins_and_shutdown_abandons_a_retrying_one() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(Scripted::new(Script {
+            hold_lists: 1,
+            ..Script::default()
+        }));
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        let reload = || {
+            adapter.submit(
+                NodeId(1),
+                PartitionId(1),
+                CorrelationId(0),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Partitions,
+                },
+            );
+        };
+        let down = || {
+            store.mem().failing_with(ConfigError::Unavailable {
+                reason: "down".to_owned(),
+            });
+        };
+
+        // The older reload reads the empty family, and its answer is held in flight.
+        reload();
+        let held = rt.block_on(async {
+            tokio::time::timeout(
+                crate::host::test_patience(PATIENCE),
+                store.list_held.notified(),
+            )
+            .await
+        });
+        assert!(held.is_ok(), "the older reload's list did not read");
+        let key = ControlKey::Partition(PartitionId(1));
+        let written = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(key.encode()),
+                value: Bytes::from_static(b"newer"),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put");
+        // The newer reload reads the record; then the older one's list may answer.
+        reload();
+        store.release_lists();
+        let newer = format!(
+            "{:?}",
+            ControlEvent::FamilySnapshot {
+                prefix: ControlPrefix::Partitions,
+                snapshot_revision: Revision(written.revision),
+                records: vec![ControlRecord {
+                    key,
+                    revision: Revision(written.revision),
+                    value: Bytes::from_static(b"newer"),
+                }],
+            }
+        );
+        assert_eq!(
+            received(&rx, 1),
+            std::slice::from_ref(&newer),
+            "only the newer reload answers, with the newer family"
+        );
+
+        down();
+        reload();
+        assert!(
+            eventually(|| adapter.reload_pending(NodeId(1)).is_some()),
+            "a retrying reload is reported"
+        );
+        assert_eq!(adapter.reload_pending(NodeId(2)), None, "only for its node");
+        reload();
+        // The newer reload replaced the older one in the map, so this count is its own: it
+        // has failed too, and must be put back to 0 when it answers.
+        assert!(
+            eventually(|| adapter.reload_pending(NodeId(1)).is_some()),
+            "the newer reload retries too"
+        );
+        store.mem().stop_failing();
+        assert_eq!(received(&rx, 1), [newer], "the older reload never posts");
+        assert_eq!(
+            adapter.reload_pending(NodeId(1)),
+            None,
+            "done is not pending"
+        );
+
+        down();
+        reload();
+        assert!(eventually(|| adapter.reload_pending(NodeId(1)).is_some()));
+        adapter.shutdown();
+        store.mem().stop_failing();
+        assert_eq!(
+            received(&rx, 0),
+            Vec::<String>::new(),
+            "a reload abandoned at shutdown posts nothing"
         );
     }
 

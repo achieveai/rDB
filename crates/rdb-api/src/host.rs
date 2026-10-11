@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
-use rdb_core::contracts::authority::{AuthorityEffect, Lineage, PartitionMode};
+use rdb_core::contracts::authority::{AuthorityEffect, AuthorityView, Lineage, PartitionMode};
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::{ReplicaProgress, ReplicationEnvelope};
@@ -64,7 +64,7 @@ use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
-use rdb_core::transaction::{Limits, Transaction};
+use rdb_core::transaction::{Inflight, Limits, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::keys::{root_key, RootKey};
@@ -442,6 +442,9 @@ pub struct NodeStatus {
     /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
     /// stalled; cleared when it activates.
     pub stalled: Option<String>,
+    /// While a control reload of this node's is retrying, how many of its lists have failed.
+    /// Filled by `Db::node_status` from the control adapter; the host itself leaves it `None`.
+    pub reload_pending: Option<u32>,
 }
 
 /// The lineage a node holds and how far it holds it. An owner reports its adopted generation
@@ -762,6 +765,12 @@ struct Host {
     /// [`STUCK_RESENDS`]; crate tests lower it.
     stuck_resends: u32,
     fault: Option<String>,
+    /// The tick the step being carried out was offered at, its `StepCtx::now`: the tick a
+    /// module judged at, which a line about one of its effects names.
+    stepped_at: Tick,
+    /// Per partition, the last view A1 published. `txn_dispatch` and `host_stall` measure the
+    /// grant left against its horizon (M9 S2a, critic A2).
+    authority_views: BTreeMap<PartitionId, AuthorityView>,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -820,6 +829,8 @@ impl Host {
             resends: BTreeMap::new(),
             stuck_resends: STUCK_RESENDS,
             fault: None,
+            stepped_at: now,
+            authority_views: BTreeMap::new(),
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
@@ -1067,6 +1078,7 @@ impl Host {
             .collect();
         for id in due {
             if let Some((version, scheduled_at, site)) = self.timers.remove(&id) {
+                self.report_stall(id, scheduled_at, now);
                 let fired = TimerFired {
                     id,
                     version,
@@ -1233,6 +1245,111 @@ impl Host {
         self.next_delayed += 1;
     }
 
+    // ------------------------------------------------------------------ horizon lines (S2a)
+
+    /// `host_stall`: a kernel timer due at `due` fires at `now`, later than the dispatch margin
+    /// A1's horizon keeps. `grant_margin_ms` is the least time left to any published view's
+    /// horizon, negative once past it. It sees a late timer only, never a stall between a step
+    /// and its storage effect (critic A2).
+    fn report_stall(&self, timer: TimerId, due: Tick, now: Tick) {
+        let late_ms = now.0.saturating_sub(due.0);
+        if late_ms <= self.budgets.dispatch_margin_millis {
+            return;
+        }
+        let grant_margin_ms = self
+            .authority_views
+            .values()
+            .map(|view| margin_ms(view.valid_through_tick, now))
+            .min();
+        tracing::warn!(
+            node = self.node.0,
+            timer = timer.0,
+            due = due.0,
+            at = now.0,
+            late_ms,
+            grant_margin_ms,
+            "host_stall"
+        );
+    }
+
+    /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`]. `renewed_at`
+    /// is the dispatch tick of the last committed renewal, which the horizon is counted from,
+    /// absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
+    /// publication, and `past_horizon` whether none was left. `would_fence_as` is the reason a
+    /// check past the horizon would deny with (`AuthorityView::past_horizon`); it is not a state,
+    /// and is set while the view is still valid.
+    fn report_view(&mut self, view: &AuthorityView) {
+        let at = self.stepped_at;
+        let margin_ms = margin_ms(view.valid_through_tick, at);
+        tracing::info!(
+            node = self.node.0,
+            partition = view.lineage.partition.0,
+            seq = view.authority_seq,
+            renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
+            valid_through = view.valid_through_tick.0,
+            past_horizon = margin_ms < 0,
+            would_fence_as = ?view.past_horizon,
+            margin_ms,
+            at = at.0,
+            "authority_view"
+        );
+        self.authority_views.insert(view.lineage.partition, *view);
+    }
+
+    /// `txn_dispatch`: T1 hands `batch` to storage. The binding tick is `decided_at`, when A1
+    /// allowed T1's step-14 `StorageDispatch` recheck (critic A2). `valid_through` is the
+    /// horizon of the newest view at dispatch, and `margin_ms` the time from `decided_at` to it.
+    /// That view can be newer than the one A1 decided on, so a judge of the binding tick joins
+    /// on `node`, `partition` and `authority_seq` (`authority_view`'s `seq`; seqs repeat across
+    /// nodes and partitions). Views that moved only `valid_through`
+    /// share a seq, so take the last with that seq and `at` at or before `decided_at` (review
+    /// F-005: this host keeps only the newest view, and finding the deciding one here would
+    /// need a lookup it does not have).
+    fn report_dispatch(&self, batch: &rdb_core::contracts::storage::Batch) {
+        let inflight = self
+            .transaction
+            .kernel(self.node, batch.partition)
+            .and_then(TxnKernel::inflight);
+        let Some(Inflight::Dispatched {
+            admitted,
+            batch: id,
+            seq,
+            authority,
+            ..
+        }) = inflight
+        else {
+            tracing::warn!(
+                node = self.node.0,
+                partition = batch.partition.0,
+                batch = batch.id.0,
+                "txn_dispatch_unmatched"
+            );
+            return;
+        };
+        if *id != batch.id {
+            tracing::warn!(
+                node = self.node.0,
+                partition = batch.partition.0,
+                batch = batch.id.0,
+                inflight = id.0,
+                "txn_dispatch_unmatched"
+            );
+            return;
+        }
+        let view = self.authority_views.get(&batch.partition);
+        tracing::info!(
+            node = self.node.0,
+            partition = batch.partition.0,
+            request = admitted.req.identity.request.0,
+            seq = seq.0,
+            decided_at = authority.decided_at.0,
+            authority_seq = authority.authority_seq,
+            valid_through = view.map(|view| view.valid_through_tick.0),
+            margin_ms = view.map(|view| margin_ms(view.valid_through_tick, authority.decided_at)),
+            "txn_dispatch"
+        );
+    }
+
     // ------------------------------------------------------------------ the loop
 
     fn push(&mut self, site: Site, kind: EventKind, routed: bool, addressed: Option<ModuleName>) {
@@ -1355,6 +1472,7 @@ impl Host {
                 .map_err(StepError::Host)?;
         }
         let now = self.clock.now();
+        self.stepped_at = now;
         let empty = EmptyView;
         let snapshot: &dyn SnapshotRead = match (self.views.get(&partition), reads_storage) {
             (Some((_, view)), true) => view,
@@ -1529,25 +1647,30 @@ impl Host {
 
     fn store(&mut self, from: ModuleName, store: &StoreEffect, site: Site) -> Result<(), String> {
         let kind = match store {
-            StoreEffect::Commit(batch) => match self.engine.commit(batch.clone()) {
-                Ok(applied) => StorageEvent::Committed {
-                    batch: batch.id,
-                    applied,
-                },
-                Err(fault) => {
-                    tracing::error!(
-                        node = self.node.0,
-                        partition = batch.partition.0,
-                        seq = batch.seq.0,
-                        ?fault,
-                        "commit_failed"
-                    );
-                    StorageEvent::CommitFailed {
+            StoreEffect::Commit(batch) => {
+                if from == ModuleName::Transaction {
+                    self.report_dispatch(batch);
+                }
+                match self.engine.commit(batch.clone()) {
+                    Ok(applied) => StorageEvent::Committed {
                         batch: batch.id,
-                        fault,
+                        applied,
+                    },
+                    Err(fault) => {
+                        tracing::error!(
+                            node = self.node.0,
+                            partition = batch.partition.0,
+                            seq = batch.seq.0,
+                            ?fault,
+                            "commit_failed"
+                        );
+                        StorageEvent::CommitFailed {
+                            batch: batch.id,
+                            fault,
+                        }
                     }
                 }
-            },
+            }
             StoreEffect::Flush { ticket, captured } => {
                 match self.engine.sync_wal_through(captured.clone()) {
                     Ok(durable) => StorageEvent::Flushed {
@@ -1614,6 +1737,19 @@ impl Host {
             }
             KernelEffect::Authority(AuthorityEffect::Fact(fact)) => {
                 tracing::info!(node, ?fact, "authority_fact");
+            }
+            KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(view)) => {
+                self.report_view(view);
+            }
+            KernelEffect::Authority(AuthorityEffect::Fence { scope, reason }) => {
+                tracing::warn!(
+                    node,
+                    partition = site.partition.0,
+                    scope = ?scope,
+                    reason = ?reason,
+                    at = self.stepped_at.0,
+                    "authority_fence"
+                );
             }
             KernelEffect::SetAdmission(state) => {
                 tracing::info!(node, partition = site.partition.0, allow = state.allow, reason = ?state.reason, "set_admission");
@@ -3086,6 +3222,7 @@ impl Host {
                 .stalled
                 .get(&partition)
                 .map(|(line, mode)| format!("{line} {}", self.stall_effect(partition, mode))),
+            reload_pending: None,
         }
     }
 }
@@ -3183,6 +3320,13 @@ fn compile_error(error: &ValueError) -> ApiError {
 
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Milliseconds from `at` to `horizon`: positive while it is ahead, 0 at the last tick a view
+/// still admits, negative past it.
+fn margin_ms(horizon: Tick, at: Tick) -> i64 {
+    let ahead = i128::from(horizon.0) - i128::from(at.0);
+    i64::try_from(ahead).unwrap_or(if ahead < 0 { i64::MIN } else { i64::MAX })
 }
 
 /// A byte-string read of `root` from `view`: absent, its version and bytes, or why not.
@@ -4460,6 +4604,47 @@ mod tests {
         assert!(warned.is_empty(), "an advancing copy warned: {warned:?}");
     }
 
+    /// M9 S2a ruling guard "the `past_horizon` computation": `authority_view` logs
+    /// `margin_ms` = `valid_through` - `at`, and `past_horizon` only when that is below 0.
+    /// While renewals commit every view has time left; once the store stops answering, the
+    /// grant runs out and the view A1 publishes at the fence has none.
+    /// Integration (~5.5 s at scale 1, measured alone, review F-006): the grant must expire at
+    /// the spec's horizon.
+    #[config_log::retcd_test]
+    fn the_view_line_says_past_horizon_only_once_no_time_is_left() {
+        const METHOD: &str = "the_view_line_says_past_horizon_only_once_no_time_is_left";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 fenced", |trio| {
+            trio.status(0).authority.starts_with("fenced").then_some(())
+        });
+
+        let views: Vec<_> = logged!(METHOD, "authority_view")
+            .into_iter()
+            .filter(|line| line["node"] == 1)
+            .collect();
+        for line in &views {
+            let left = line["valid_through"].as_i64().expect("valid_through")
+                - line["at"].as_i64().expect("at");
+            assert_eq!(line["margin_ms"], left, "{line}");
+            assert_eq!(line["past_horizon"], left < 0, "{line}");
+        }
+        assert!(
+            views.iter().any(|line| line["past_horizon"] == false),
+            "a view with time left: {views:?}"
+        );
+        assert!(
+            views.iter().any(|line| line["past_horizon"] == true),
+            "the fence's view has none: {views:?}"
+        );
+    }
+
     /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
     /// logged, never dropped in silence, and the primary neither faults nor stops taking
     /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:
@@ -5220,6 +5405,8 @@ mod tests {
         nodes: Vec<(Host, Sender<Msg>, Receiver<Msg>)>,
         links: Arc<Links>,
         store: Arc<dyn config_core::ConfigStore>,
+        /// The same store, to make it fail.
+        mem: Arc<config_testkit::MemStore>,
         clock: HostClock,
         rt: tokio::runtime::Runtime,
     }
@@ -5240,8 +5427,8 @@ mod tests {
                 .build()
                 .expect("runtime");
             let links = Links::new();
-            let store: Arc<dyn config_core::ConfigStore> =
-                Arc::new(config_testkit::MemStore::new());
+            let mem = Arc::new(config_testkit::MemStore::new());
+            let store: Arc<dyn config_core::ConfigStore> = Arc::clone(&mem) as _;
             let control =
                 ControlAdapter::new(Arc::clone(&store), rt.handle().clone(), Arc::clone(&links));
             let clock = HostClock::start();
@@ -5265,6 +5452,7 @@ mod tests {
                 nodes,
                 links,
                 store,
+                mem,
                 clock,
                 rt,
             }

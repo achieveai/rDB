@@ -256,10 +256,12 @@ pub enum ConfigError {
     /// Not retryable and not resumable at the same cursor. The client's recovery is spec
     /// §11.2's list-to-watch flow: `List` the prefix, then watch from the revision that
     /// response reported.
-    #[error("revision compacted; the oldest resumable revision is {minimum_available_revision}")]
+    #[error("revision compacted; the oldest retained revision is {minimum_available_revision}")]
     RevisionCompacted {
-        /// The lowest revision a watch may still start after — `compact_revision + 1`. A
-        /// cursor at or below `compact_revision` is permanently gone (OQ-27).
+        /// The oldest revision whose event is still retained — `compact_revision + 1`. A watch
+        /// may start after `compact_revision` itself, one below this number, because that
+        /// cursor asks for nothing compaction deleted; a cursor below `compact_revision` is
+        /// permanently gone (ADR-0020, 2026-10-10 amendment).
         minimum_available_revision: u64,
     },
 
@@ -446,7 +448,8 @@ impl ConfigError {
     /// Build a [`ConfigError::RevisionCompacted`] from the watermark that refused the cursor.
     ///
     /// Takes `compact_revision` rather than the minimum so no caller can get the `+ 1` wrong:
-    /// a cursor is refused when `R <= compact_revision`, so the lowest usable one is the next.
+    /// compaction deleted every event up to `compact_revision`, so the oldest retained one is
+    /// the next.
     pub fn revision_compacted(compact_revision: u64) -> Self {
         Self::RevisionCompacted {
             minimum_available_revision: compact_revision.saturating_add(1),

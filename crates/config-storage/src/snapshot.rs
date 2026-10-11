@@ -1151,7 +1151,7 @@ pub(crate) const INSTALL_BATCH_RECORDS: usize = 4_096;
 /// * `kv` and `dedup` from the snapshot body; `events` is dropped.
 /// * `cluster_revision` **preserved**, so a client that read a revision before the disaster
 ///   sees the number continue rather than restart.
-/// * `compact_revision = cluster_revision`, so a watch resuming at or below it is told
+/// * `compact_revision = cluster_revision`, so a watch resuming below it is told
 ///   `RevisionCompacted` instead of being handed a partial replay (ADR-0020, M5-91).
 /// * `identity` = the new one. No `last_applied`, no `membership`, no `current_snapshot`: the
 ///   restored store has data but no Raft position, which is exactly what lets `--form` treat

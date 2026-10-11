@@ -39,7 +39,23 @@
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
 //! nodes                                   each node's view of partition 1
-//! control                                 the partitions/ and grants/ records in rEtcd
+//! control                                 the partitions/ and grants/ records in rEtcd, read
+//!                                         from the rEtcd leader now, never through the Db's
+//!                                         store
+//! control voters                          `voters leader=N running=[..] bound=N`: the rEtcd
+//!                                         leader, the running voters, and the voter the Db's
+//!                                         control store calls now
+//! control stop <voter>                    stop one rEtcd voter (1, 2 or 3). The Db's store
+//!                                         moves off it first; refused if no other runs
+//! control start <voter>                   start a stopped voter again on its own data
+//! control gap                             compact rEtcd through its current revision, then
+//!                                         drop the Db's watches: a re-watch from an older
+//!                                         cursor is refused `RevisionCompacted` and reloads
+//! control drop-watches                    end the Db's watch streams; they re-watch from
+//!                                         their cursors with no reload
+//! control fail list <unavailable|deadline|notleader|invalid|off>
+//!                                         every list the Db's store sends answers that error,
+//!                                         until `off`. `control` reads are not affected
 //! link hold|heal <a>-<b> | link heal all | links
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //! sleep <millis>
@@ -61,7 +77,14 @@
 //! own rebuild, and the poller then prints `stall cleared node=N recovery=.. recovered=..
 //! admits=..`.
 //!
+//! The Db's control store follows the rEtcd leader (`support/hostile_store.rs`): a call a
+//! voter answers `NotLeader`, or refuses because it stopped, sends the next call to the leader
+//! then, logged as `control_store_rebind`.
+//!
 //! The JSONL log goes to `<log-dir>/rdb_dev.jsonl`; its path is printed to stderr as `log=`.
+
+#[path = "support/hostile_store.rs"]
+mod hostile_store;
 
 use std::io::{BufRead, Write as _};
 use std::path::PathBuf;
@@ -71,14 +94,25 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use config_core::{ConfigStore, ListRequest};
+use config_core::{ConfigStore, GetRequest, ListRequest, NodeId as VoterId};
 use config_testkit::cluster::{Cluster, StorageKind};
+use config_testkit::TestTimers;
 use rdb_api::host::NodeStatus;
 use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
 use rdb_core::authority::grant::GrantRecord;
 use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, RequestId};
 use rdb_core::contracts::txn::TxnRequest;
+
+use hostile_store::{HostileStore, ListFault};
+
+/// The control voters' Raft timers. Faster than the harness default, whose failover can outlast
+/// A1's write horizon (walk 1L): `tests::control_failover_millis` is 1000 ms here, 3000 ms there.
+const CONTROL_TIMERS: TestTimers = TestTimers {
+    heartbeat: Duration::from_millis(100),
+    election_timeout_min: Duration::from_millis(300),
+    election_timeout_max: Duration::from_millis(500),
+};
 
 #[derive(Debug)]
 struct Args {
@@ -223,15 +257,25 @@ where
         eprintln!("rdb_dev: open: {e}");
         return ExitCode::from(1);
     }
-    let cluster = rt.block_on(Cluster::start(3, StorageKind::ROCKS));
+    let cluster = Arc::new(
+        rt.block_on(
+            Cluster::builder()
+                .nodes(3)
+                .storage(StorageKind::ROCKS)
+                .timers(CONTROL_TIMERS)
+                .start(),
+        ),
+    );
     let leader = rt.block_on(cluster.leader());
-    let store = cluster.client(leader);
+    let hostile = Arc::new(HostileStore::new(&cluster, leader));
+    let store: Arc<dyn ConfigStore> = Arc::clone(&hostile) as Arc<dyn ConfigStore>;
     say(&format!("control up: 3 voters, leader {leader:?}"));
     tracing::info!(dir = %args.dir.display(), holds = ?args.hold, "rdb_dev_start");
     let mut db = match rt.block_on(open(config, Arc::clone(&store), rt.handle().clone())) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("rdb_dev: open: {e}");
+            drop(hostile);
             close(store, cluster, rt, args);
             return ExitCode::from(1);
         }
@@ -239,14 +283,19 @@ where
     say("bootstrap: partition 1 recovery started");
     let progress = Progress::default();
     let stop = AtomicBool::new(false);
+    let control = Control {
+        cluster: &cluster,
+        store: &hostile,
+    };
     let code = std::thread::scope(|scope| {
         scope.spawn(|| poll(&db, &progress, &stop));
-        let code = repl(scope, args, &db, &rt, &*store, &progress);
+        let code = repl(scope, args, &db, &rt, &control, &progress);
         stop.store(true, Ordering::Relaxed);
         code
     });
     db.shutdown();
     drop(db);
+    drop(hostile);
     close(store, cluster, rt, args);
     code
 }
@@ -254,13 +303,48 @@ where
 /// End the run once the Db is gone, whether it opened or not (F-006). The direct client holds
 /// the voter's store open: drop every handle on it before the cluster closes its stores, or
 /// their RocksDB files outlive the run. Then `--dir` goes, unless `--keep`.
-fn close(store: Arc<dyn ConfigStore>, cluster: Cluster, rt: tokio::runtime::Runtime, args: &Args) {
+///
+/// The store holds the cluster weakly, so the cluster comes back here unless a call is
+/// resolving the leader at this instant; that is waited out for up to 2 s, and past it the
+/// voters are not shut down and the run says so.
+fn close(
+    store: Arc<dyn ConfigStore>,
+    cluster: Arc<Cluster>,
+    rt: tokio::runtime::Runtime,
+    args: &Args,
+) {
     drop(store);
-    rt.block_on(cluster.shutdown());
+    let started = Instant::now();
+    let mut shared = cluster;
+    let cluster = loop {
+        match Arc::try_unwrap(shared) {
+            Ok(cluster) => break Some(cluster),
+            Err(still) if started.elapsed() >= Duration::from_secs(2) => {
+                eprintln!(
+                    "rdb_dev: the cluster is still shared ({} handles); voters not shut down",
+                    Arc::strong_count(&still)
+                );
+                break None;
+            }
+            Err(still) => {
+                shared = still;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    if let Some(cluster) = cluster {
+        rt.block_on(cluster.shutdown());
+    }
     drop(rt);
     if !args.keep {
         remove(&args.dir);
     }
+}
+
+/// What the REPL's `control` verbs reach: the voters, and the Db's store over them.
+struct Control<'a> {
+    cluster: &'a Arc<Cluster>,
+    store: &'a HostileStore,
 }
 
 /// Remove `dir`, retrying for up to 2 s while Windows still holds a file the voters closed.
@@ -418,7 +502,7 @@ fn repl<'scope, 'env>(
     args: &Args,
     db: &'env Db,
     rt: &tokio::runtime::Runtime,
-    store: &dyn ConfigStore,
+    control: &Control<'_>,
     progress: &Progress,
 ) -> ExitCode {
     let input: Box<dyn BufRead> = match &args.script {
@@ -534,9 +618,46 @@ fn repl<'scope, 'env>(
                 Ok(())
             }
             ["control"] => {
-                control_lines(rt, store);
+                control_lines(rt, control.cluster);
                 Ok(())
             }
+            ["control", "voters"] => {
+                say(&voters_line(control));
+                Ok(())
+            }
+            ["control", "gap"] => {
+                say(&gap(rt, control));
+                Ok(())
+            }
+            ["control", "drop-watches"] => {
+                say(&format!("dropped {} watches", control.store.drop_watches()));
+                Ok(())
+            }
+            ["control", verb @ ("gap" | "drop-watches"), ..] => {
+                Err(format!("control {verb}: takes no arguments"))
+            }
+            ["control", "fail", "list", word] => ListFault::parse(word).map(|fault| {
+                control.store.fail_lists(fault);
+                say(&format!("fail list {word}"));
+            }),
+            ["control", "fail", ..] => Err(format!("control fail list <{}>", ListFault::WORDS)),
+            ["control", verb @ ("stop" | "start"), voter] => parse_voter(control.cluster, voter)
+                .map(|voter| {
+                    say(&if *verb == "stop" {
+                        stop_voter(rt, control, voter)
+                    } else {
+                        start_voter(rt, control.cluster, voter)
+                    });
+                }),
+            ["control", "stop" | "start", ..] => Err(format!(
+                "control stop|start <voter>: exactly one voter, one of {:?}",
+                control
+                    .cluster
+                    .ids()
+                    .iter()
+                    .map(|id| id.0)
+                    .collect::<Vec<_>>()
+            )),
             ["links"] => {
                 say(&format!(
                     "held={:?}",
@@ -900,7 +1021,7 @@ fn node_line(node: &NodeStatus) -> String {
         None => " published=-".to_owned(),
     };
     format!(
-        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}",
+        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
         node.node.0,
         holds_part(node),
         node.authority,
@@ -911,13 +1032,23 @@ fn node_line(node: &NodeStatus) -> String {
         node.protection.as_deref().unwrap_or("inert"),
         node.admits
             .map_or_else(|| "-".to_owned(), |a| a.to_string()),
+        node.reload_pending
+            .map_or_else(String::new, |n| format!(" reload pending attempt={n}")),
         node.fault
             .as_ref()
             .map_or_else(String::new, |f| format!(" FAULT={f}")),
     )
 }
 
-fn control_lines(rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) {
+/// `control`: the records, read from the voter that is leader now through a client of its own,
+/// never through the Db's store, so what that store is doing never hides them (critic A3).
+fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
+    let Some(leader) = cluster.leader_now() else {
+        say("err control: no rEtcd leader now; try again");
+        return;
+    };
+    // Only this thread stops a voter, so the leader is still running here.
+    let store = cluster.client(leader);
     for prefix in ["partitions/", "grants/"] {
         let listed = rt.block_on(store.list(ListRequest {
             prefix: Bytes::from_static(prefix.as_bytes()),
@@ -941,6 +1072,126 @@ fn control_lines(rt: &tokio::runtime::Runtime, store: &dyn ConfigStore) {
                 }
             }
             Err(e) => say(&format!("err control list {prefix}: {e}")),
+        }
+    }
+}
+
+/// `control gap`: compact through the revision the leader reads now, then drop the Db's
+/// watches. Returns the line to print; a failure, a panic in the harness included, is printed.
+fn gap(rt: &tokio::runtime::Runtime, control: &Control<'_>) -> String {
+    let cluster = Arc::clone(control.cluster);
+    let compacted = rt.block_on(rt.spawn(async move {
+        let leader = cluster
+            .leader_now()
+            .ok_or_else(|| "no rEtcd leader now; try again".to_owned())?;
+        let read = cluster
+            .client(leader)
+            .get(GetRequest {
+                key: Bytes::from_static(b"partitions/1"),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        cluster
+            .compact_now(read.read_revision)
+            .await
+            .map_err(|e| e.to_string())
+    }));
+    let compacted = match compacted {
+        Ok(Ok(revision)) => revision,
+        Ok(Err(e)) => return format!("err control gap: {e}"),
+        Err(e) => return format!("err control gap: {e}"),
+    };
+    tracing::info!(revision = compacted, "control_compacted");
+    let dropped = control.store.drop_watches();
+    format!("compacted through revision {compacted}; dropped {dropped} watches")
+}
+
+/// `voters leader=N running=[..] bound=N`; `leader=-` while none is elected.
+fn voters_line(control: &Control<'_>) -> String {
+    format!(
+        "voters leader={} running={:?} bound={}",
+        control
+            .cluster
+            .leader_now()
+            .map_or_else(|| "-".to_owned(), |l| l.0.to_string()),
+        control
+            .cluster
+            .running_ids()
+            .iter()
+            .map(|id| id.0)
+            .collect::<Vec<_>>(),
+        control.store.bound().0
+    )
+}
+
+/// A voter the cluster was started with.
+fn parse_voter(cluster: &Cluster, text: &str) -> Result<VoterId, String> {
+    let ids = cluster.ids();
+    text.parse::<u64>()
+        .ok()
+        .map(VoterId)
+        .filter(|id| ids.contains(id))
+        .ok_or_else(|| {
+            format!(
+                "control stop|start <voter>: a voter is one of {:?}, not {text:?}",
+                ids.iter().map(|id| id.0).collect::<Vec<_>>()
+            )
+        })
+}
+
+/// `control stop <voter>`: move the Db's store off it, then stop it. Returns the line to print.
+/// A failure is printed, never a panic: the stop runs as a task, so even a panic inside the
+/// harness comes back as an error.
+fn stop_voter(rt: &tokio::runtime::Runtime, control: &Control<'_>, voter: VoterId) -> String {
+    if !control.cluster.running_ids().contains(&voter) {
+        return format!("err control stop {}: not running", voter.0);
+    }
+    let moved = match control.store.stopping(voter) {
+        Ok(moved) => moved,
+        Err(e) => {
+            tracing::warn!(voter = voter.0, error = %e, "control_stop_refused");
+            return format!("err control stop {}: refused: {e}", voter.0);
+        }
+    };
+    let cluster = Arc::clone(control.cluster);
+    let stopped = rt.block_on(rt.spawn(async move { cluster.stop_node(voter).await }));
+    control.store.stopped(voter);
+    let moved = moved.map_or_else(String::new, |to| {
+        format!(" (control store moved to voter {} first)", to.0)
+    });
+    match stopped {
+        Ok(()) => {
+            tracing::info!(voter = voter.0, "control_voter_stopped");
+            format!("stopped voter {}{moved}", voter.0)
+        }
+        Err(e) => {
+            tracing::error!(voter = voter.0, error = %e, "control_voter_stop_failed");
+            format!("err control stop {}: {e}{moved}", voter.0)
+        }
+    }
+}
+
+/// `control start <voter>`, on its own data directory. Returns the line to print; a failure,
+/// a panic inside the harness included, is printed, never raised.
+fn start_voter(rt: &tokio::runtime::Runtime, cluster: &Arc<Cluster>, voter: VoterId) -> String {
+    if cluster.running_ids().contains(&voter) {
+        return format!("voter {} is already running", voter.0);
+    }
+    let shared = Arc::clone(cluster);
+    let started = rt.block_on(rt.spawn(async move { shared.try_start_node(voter).await }));
+    let failed = match started {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    match failed {
+        None => {
+            tracing::info!(voter = voter.0, "control_voter_started");
+            format!("started voter {}", voter.0)
+        }
+        Some(e) => {
+            tracing::error!(voter = voter.0, error = %e, "control_voter_start_failed");
+            format!("err control start {}: {e}", voter.0)
         }
     }
 }
@@ -974,6 +1225,26 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rdb_core::contracts::event::Budgets;
+
+    /// The longest a stopped control leader can leave the voters without one, in ms. A follower
+    /// that saw a committed leader waits out the leader lease (`election_timeout_max` in
+    /// openraft 0.9) and then its own election timeout before it stands
+    /// (`RaftCore::handle_tick_election`).
+    const fn control_failover_millis(timers: TestTimers) -> u128 {
+        timers.election_timeout_max.as_millis() * 2
+    }
+
+    /// The shortest time A1 still admits writes after the control leader stops, in ms: the grant,
+    /// less the dispatch margin, the clock error and the one tick A1 keeps back, counted from a
+    /// renewal that can be a whole renewal interval old when the leader stops.
+    const fn write_horizon_floor_millis(budgets: &Budgets) -> u128 {
+        (budgets.grant_millis
+            - budgets.dispatch_margin_millis
+            - budgets.clock_error_millis
+            - 1
+            - budgets.renew_millis) as u128
+    }
 
     /// The rows that set `RETCD_TEST_DATA_DIR`, as `main` does, hold this: the variable is the
     /// process's, and these rows run in parallel.
@@ -992,7 +1263,32 @@ mod tests {
             admits: Some(admits),
             published: None,
             stalled: stalled.map(str::to_owned),
+            reload_pending: None,
         }
+    }
+
+    /// Walk 1L (M9 S2a): `control stop` of the control leader fenced the owner `Expired` and
+    /// writes never came back. The voters elected 2338 ms after the stop, 3 ms past A1's
+    /// horizon, because the default timers make a failover take up to 3000 ms against a
+    /// horizon that can be as short as 2299 ms. A new leader has to be in place with a whole
+    /// renewal interval to spare, so the renewal sent to it commits before the horizon.
+    ///
+    /// The slack this relies on (review F-004): with `CONTROL_TIMERS` and the spec budgets it is
+    /// 1500 ms (1000 ms failover + 500 ms renewal) against the 2299 ms horizon, so 799 ms. The
+    /// floor already takes off one renewal for the age of the last one, and the added renewal
+    /// covers the 500 ms renewal tick. Nothing here counts the renewal's RPC and commit time
+    /// on the new leader: those must fit in the 799 ms, and no term is added for them.
+    #[test]
+    fn control_failover_leaves_a_renewal_inside_the_write_horizon() {
+        let budgets = Budgets::SPEC_DEFAULTS;
+        let failover = control_failover_millis(CONTROL_TIMERS);
+        let renewed_by = failover + u128::from(budgets.renew_millis);
+        let horizon = write_horizon_floor_millis(&budgets);
+        assert!(
+            renewed_by < horizon,
+            "a control failover of up to {failover} ms plus one renewal ({renewed_by} ms) \
+             outlasts the {horizon} ms A1 still admits after the leader stops"
+        );
     }
 
     /// Paper cut after the tester's walk at 1ea889e: a stall that clears said nothing, so the

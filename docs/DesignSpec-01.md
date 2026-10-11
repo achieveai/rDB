@@ -494,12 +494,12 @@ Clients deduplicate by `(key, revision, operation)`. They persist the highest fu
 1. `List(prefix)` returns a consistent snapshot and revision `R`.
 2. Client calls `Watch(prefix, start_after_revision=R)`.
 3. Leader completes a linearization barrier.
-4. Under one serialized event-journal gate shared with compaction, it verifies `R > compact_revision`, captures high-water revision `H`, and registers a bounded live cursor. Compaction cannot advance past the cursor validation/handoff while this gate is held.
+4. Under one serialized event-journal gate shared with compaction, it verifies `R >= compact_revision`, captures high-water revision `H`, and registers a bounded live cursor. Compaction cannot advance past the cursor validation/handoff while this gate is held.
 5. It replays durable events in `(R, H]`.
 6. It buffers newly applied events above `H` during replay.
 7. It drains the buffer in revision order, then switches to live delivery.
 
-`compact_revision` is the greatest revision whose events have been deleted. Therefore a resume cursor is valid only when `R > compact_revision`. When `R <= compact_revision`, return `REVISION_COMPACTED { minimum_available_revision = compact_revision + 1 }`; the client relists.
+`compact_revision` is the greatest revision whose events have been deleted. A cursor `R` asks for events above `R`, so it is valid when `R >= compact_revision`; `R == compact_revision` is exactly the revision step 1 reports right after a compaction. When `R < compact_revision`, return `REVISION_COMPACTED { minimum_available_revision = compact_revision + 1 }` (the oldest retained revision); the client relists.
 
 ### 11.3 Resource isolation
 

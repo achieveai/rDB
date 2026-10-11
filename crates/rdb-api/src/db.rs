@@ -80,8 +80,19 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl ApiError {
-    /// An error of `kind`, with the retry rule and mutation proof that kind carries when the
-    /// kernel raises it.
+    /// An error of `kind` raised by the API itself, with a fixed retry rule and mutation proof
+    /// per kind:
+    ///
+    /// | kind | `retry` | `no_mutation` |
+    /// |---|---|---|
+    /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
+    /// | `UnknownOutcome` | `QueryStatus` | `false` |
+    /// | `CorruptHistory` | `Quarantine` | `false` |
+    /// | any other | `BoundedJitter` | `false` |
+    ///
+    /// This is not what the kernel attaches to the same kind: for example a kernel
+    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves no mutation.
+    /// Wrap a kernel error with [`Self::from_kernel`], never with this.
     #[must_use]
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
         let (retry, no_mutation) = match kind {
@@ -251,7 +262,10 @@ pub struct PutOk {
 pub struct GetOk {
     /// The object's version and bytes, `None` when absent.
     pub value: Option<(u64, Bytes)>,
-    /// The generation of the view it was read from.
+    /// The storage generation of the view it was read from. Right after a cutoff, at seq 0,
+    /// it can still be the predecessor generation: the new generation has written nothing
+    /// yet, so both views hold identical contents. Never fence on it; a write fences with the
+    /// generation the node adopted, not with this one.
     pub generation: Generation,
     /// The position of that view.
     pub at: Seq,
@@ -808,7 +822,9 @@ impl Db {
                         reply,
                     })
                     .ok()?;
-                answer.recv_timeout(self.timeouts.read).ok()
+                let mut status = answer.recv_timeout(self.timeouts.read).ok()?;
+                status.reload_pending = self.control.reload_pending(status.node);
+                Some(status)
             })
             .collect()
     }
@@ -1293,6 +1309,51 @@ mod tests {
         let node = db.node_status().into_iter().next().expect("node 1");
         assert_eq!(node.fault, None, "node 1 never faulted");
         assert_eq!(applied(&db), Some(3), "request 100 published once");
+    }
+
+    /// M9 S2a mutant pass: `node_status` reports a control reload that is retrying, on the
+    /// node whose reload it is (`rdb_dev nodes`: `reload pending attempt=N`). Every list fails
+    /// here, so node 1's first reload retries for as long as the row runs.
+    /// Integration (~3 s): node 1 reloads only once it holds the partition's grant.
+    #[test]
+    fn node_status_reports_a_control_reload_that_is_retrying() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(Scripted::new(Script {
+            fail_lists: u32::MAX,
+            ..Script::default()
+        }));
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        let patience = crate::host::test_patience(Duration::from_secs(8));
+        let deadline = std::time::Instant::now() + patience;
+        let pending = loop {
+            let status = db.node_status();
+            if let Some(node) = status.iter().find(|node| node.reload_pending.is_some()) {
+                break (node.node, status.clone());
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no reload reported pending within {patience:?}: {status:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        db.shutdown();
+        let (node, status) = pending;
+        assert_eq!(node, NodeId(1), "the owner's reload: {status:?}");
+        assert!(
+            status
+                .iter()
+                .filter(|other| other.node != NodeId(1))
+                .all(|other| other.reload_pending.is_none()),
+            "only node 1's: {status:?}"
+        );
     }
 
     /// F-001 (S0 review), the `Db` side: a call whose waiter the node drops unanswered is a
