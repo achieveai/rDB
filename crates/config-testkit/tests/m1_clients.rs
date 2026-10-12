@@ -172,11 +172,29 @@ async fn m1_23_direct_write_advances_applied_index_on_all_nodes() {
         .expect("put");
     assert_eq!(written.outcome, MutationOutcome::Applied);
 
+    // OpenRaft answers the write before it publishes the leader's new `last_applied`, so the
+    // metric read straight after the put can still name the previous index. That made the wait
+    // below vacuous and the final check fail inside the gap. Wait for the leader to pass the
+    // index it had before the write, and take that as the target.
+    let leader_before = before[ids
+        .iter()
+        .position(|id| *id == leader)
+        .expect("the leader is one of the ids")]
+    .0;
     let target = cluster
-        .metrics(leader)
-        .last_applied
-        .expect("the leader applied its own write")
-        .index;
+        .wait_for(
+            "the leader's last_applied to pass its value before the write",
+            cluster.deadline(10),
+            || {
+                cluster
+                    .metrics(leader)
+                    .last_applied
+                    .map(|l| l.index)
+                    .filter(|index| *index > leader_before)
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the leader never published its own write as applied: {e}"));
     cluster
         .wait_applied_all(target, cluster.deadline(10))
         .await
