@@ -38,7 +38,13 @@
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
-//! nodes                                   each node's view of partition 1
+//! nodes                                   each node's view of partition 1, with the boot its
+//!                                         running process has
+//! node restart <n>                        stop node n and start it again on its data at its
+//!                                         boot plus one; prints `node n boot b`. The new
+//!                                         process holds no role and stays out until M10: a
+//!                                         restarted secondary leaves writes going on the other
+//!                                         copy, and a restarted owner stops writes for good
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
@@ -171,17 +177,18 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(parsed)
 }
 
+fn parse_node(text: &str) -> Result<NodeId, String> {
+    match text.trim().parse::<u32>() {
+        Ok(n @ 1..=3) => Ok(NodeId(n)),
+        _ => Err(format!("{text:?}: a node is 1, 2 or 3")),
+    }
+}
+
 fn parse_pair(text: &str) -> Result<(NodeId, NodeId), String> {
     let (a, b) = text
         .split_once('-')
         .ok_or_else(|| format!("{text:?}: a link is <a>-<b>"))?;
-    let node = |s: &str| -> Result<NodeId, String> {
-        match s.trim().parse::<u32>() {
-            Ok(n @ 1..=3) => Ok(NodeId(n)),
-            _ => Err(format!("{s:?}: a node is 1, 2 or 3")),
-        }
-    };
-    let (a, b) = (node(a)?, node(b)?);
+    let (a, b) = (parse_node(a)?, parse_node(b)?);
     if a == b {
         return Err(format!("{text:?}: a link joins two different nodes"));
     }
@@ -617,6 +624,13 @@ fn repl<'scope, 'env>(
                 }
                 Ok(())
             }
+            ["node", "restart", node] => parse_node(node).map(|node| {
+                say(&match db.restart_node(node) {
+                    Ok(boot) => format!("node {} boot {}", node.0, boot.0),
+                    Err(e) => format!("node restart {}: {e}", node.0),
+                });
+            }),
+            ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
             ["control"] => {
                 control_lines(rt, control.cluster);
                 Ok(())
@@ -1021,8 +1035,9 @@ fn node_line(node: &NodeStatus) -> String {
         None => " published=-".to_owned(),
     };
     format!(
-        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
+        "node={} boot={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
         node.node.0,
+        node.boot.0,
         holds_part(node),
         node.authority,
         node.recovery.as_deref().unwrap_or("-"),
@@ -1253,6 +1268,7 @@ mod tests {
     fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
         NodeStatus {
             node: NodeId(1),
+            boot: rdb_api::host::BOOT,
             fault: None,
             holds: None,
             authority: "valid".to_owned(),

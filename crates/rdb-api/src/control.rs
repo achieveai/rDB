@@ -35,17 +35,21 @@ use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
     ControlRecord, ReadOutcome, WatchCursor, WatchTermination,
 };
-use rdb_core::contracts::ids::{ControlRequestId, CorrelationId, NodeId, PartitionId, Revision};
+use rdb_core::contracts::ids::{
+    BootId, ControlRequestId, CorrelationId, NodeId, PartitionId, Revision,
+};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::host::Msg;
 use crate::transport::Links;
 
-/// Where a completion goes: the asking node, and the effect's partition and correlation.
+/// Where a completion goes: the asking node and the boot it asked under, and the effect's
+/// partition and correlation.
 #[derive(Debug, Clone, Copy)]
 struct Site {
     node: NodeId,
+    boot: BootId,
     partition: PartitionId,
     correlation: CorrelationId,
 }
@@ -63,7 +67,9 @@ pub struct ControlAdapter {
     store: Arc<dyn ConfigStore>,
     rt: Handle,
     links: Arc<Links>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The gets and CASes still running, per asking node, so a restart abandons only that
+    /// node's (M9 S2b, critic M2).
+    tasks: Mutex<BTreeMap<NodeId, Vec<JoinHandle<()>>>>,
     watches: Mutex<BTreeMap<(NodeId, ControlPrefix), JoinHandle<()>>>,
     /// The reload of each (node, prefix). A newer one aborts the one it replaces.
     reloads: Reloads,
@@ -89,22 +95,25 @@ impl ControlAdapter {
             store,
             rt,
             links,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new(BTreeMap::new()),
             watches: Mutex::new(BTreeMap::new()),
             reloads: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
-    /// Carry out `effect` for `node`; its completion arrives in the node's mailbox.
+    /// Carry out `effect` for `node`, running at `boot`; its completion arrives in the node's
+    /// mailbox stamped with `boot`, so a later process of the node can tell it is not its own.
     pub fn submit(
         &self,
         node: NodeId,
+        boot: BootId,
         partition: PartitionId,
         correlation: CorrelationId,
         effect: ControlEffect,
     ) {
         let site = Site {
             node,
+            boot,
             partition,
             correlation,
         };
@@ -140,19 +149,20 @@ impl ControlAdapter {
         let task = self.rt.spawn(async move {
             match call(&*store, site, effect).await {
                 Ok(event) => post(&links, site, event),
-                Err((kind, detail)) => fault(&links, site.node, kind, detail),
+                Err((kind, detail)) => fault(&links, site, kind, detail),
             }
         });
         let mut tasks = lock(&self.tasks);
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
     }
 
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
     /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
     /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
-    /// dropped from the map as they are (a newer one replaces it, or `shutdown` takes them
-    /// all), so a count above 0 is always a reload still retrying.
+    /// dropped from the map as they are (a newer one replaces it, `forget_node` or `shutdown`
+    /// takes them), so a count above 0 is always a reload still retrying.
     #[must_use]
     pub fn reload_pending(&self, node: NodeId) -> Option<u32> {
         lock(&self.reloads)
@@ -161,6 +171,40 @@ impl ControlAdapter {
             .map(|(_, (_, failed))| failed.load(Ordering::Relaxed))
             .filter(|failed| *failed > 0)
             .max()
+    }
+
+    /// Stop `node`'s watches and reloads and abandon its calls still running, and nobody
+    /// else's: the node's process has stopped (`Db::restart_node`). A reload removed here never
+    /// answers. `abort` lands only at an await, so a call already past its last one can still
+    /// post; that completion carries the old boot, and the node's next process drops it.
+    /// Logged as `control_forgot{node, watches, reloads, calls}`.
+    pub fn forget_node(&self, node: NodeId) {
+        let mut watches = 0_usize;
+        lock(&self.watches).retain(|(at, _), task| {
+            let mine = *at == node;
+            if mine {
+                task.abort();
+                watches += 1;
+            }
+            !mine
+        });
+        let mut reloads = 0_usize;
+        lock(&self.reloads).retain(|(at, _), (task, _)| {
+            let mine = *at == node;
+            if mine {
+                task.abort();
+                reloads += 1;
+            }
+            !mine
+        });
+        let mut calls = 0_usize;
+        for task in lock(&self.tasks).remove(&node).unwrap_or_default() {
+            if !task.is_finished() {
+                calls += 1;
+            }
+            task.abort();
+        }
+        tracing::info!(node = node.0, watches, reloads, calls, "control_forgot");
     }
 
     /// Stop every watch and abandon every call still running, reloads included. Called before
@@ -172,7 +216,10 @@ impl ControlAdapter {
         for (_, (task, _)) in std::mem::take(&mut *lock(&self.reloads)) {
             task.abort();
         }
-        for task in std::mem::take(&mut *lock(&self.tasks)) {
+        for task in std::mem::take(&mut *lock(&self.tasks))
+            .into_values()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -182,6 +229,7 @@ fn post(links: &Links, site: Site, event: ControlEvent) {
     let msg = Msg::Control {
         partition: site.partition,
         correlation: site.correlation,
+        boot: site.boot,
         event,
     };
     if links.post(site.node, msg).is_err() {
@@ -189,9 +237,16 @@ fn post(links: &Links, site: Site, event: ControlEvent) {
     }
 }
 
-fn fault(links: &Links, node: NodeId, kind: &'static str, detail: String) {
-    tracing::error!(node = node.0, kind, %detail, "control_fault");
-    let _ = links.post(node, Msg::Fault { kind, detail });
+fn fault(links: &Links, site: Site, kind: &'static str, detail: String) {
+    tracing::error!(node = site.node.0, boot = site.boot.0, kind, %detail, "control_fault");
+    let _ = links.post(
+        site.node,
+        Msg::Fault {
+            boot: site.boot,
+            kind,
+            detail,
+        },
+    );
 }
 
 fn log_call(site: Site, op: &str, key: &str, outcome: &str, started: Instant) {
@@ -411,7 +466,7 @@ async fn reload(
     }
     match answer {
         Ok(event) => post(&links, site, event),
-        Err((kind, detail)) => fault(&links, site.node, kind, detail),
+        Err((kind, detail)) => fault(&links, site, kind, detail),
     }
     // Held through the send on purpose: released before it, a replacement could slip in
     // between the check and the post, and no row would go red (PR #38 re-review).
@@ -543,7 +598,7 @@ async fn watch(
             Ok(WatchItem::Event(event)) => {
                 let key = match decode_key(&event.key) {
                     Ok(key) => key,
-                    Err((kind, detail)) => return fault(&links, site.node, kind, detail),
+                    Err((kind, detail)) => return fault(&links, site, kind, detail),
                 };
                 cursor = Revision(event.revision);
                 tracing::debug!(
@@ -651,6 +706,7 @@ mod tests {
 
     const SITE: Site = Site {
         node: NodeId(1),
+        boot: crate::host::BOOT,
         partition: PartitionId(1),
         correlation: CorrelationId(0),
     };
@@ -919,6 +975,7 @@ mod tests {
         let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
         adapter.submit(
             NodeId(1),
+            crate::host::BOOT,
             PartitionId(1),
             CorrelationId(0),
             ControlEffect::Reload {
@@ -1027,6 +1084,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {
@@ -1090,6 +1148,7 @@ mod tests {
         );
         adapter.submit(
             NodeId(1),
+            crate::host::BOOT,
             PartitionId(1),
             CorrelationId(0),
             ControlEffect::Reload {
@@ -1156,6 +1215,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {
@@ -1232,6 +1292,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {
@@ -1346,6 +1407,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {

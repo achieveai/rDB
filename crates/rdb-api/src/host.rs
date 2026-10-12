@@ -76,8 +76,9 @@ use crate::control::ControlAdapter;
 use crate::db::ApiError;
 use crate::transport::Links;
 
-/// Every node runs at boot 1 in M9: no restart is in scope until S2, and the scenarios lowering
-/// uses the same value (`rdb_sim` tests, `support::scenarios::run::BOOT`).
+/// The boot every node starts at when a `Db` opens; the scenarios lowering uses the same value
+/// (`rdb_sim` tests, `support::scenarios::run::BOOT`). `Db::restart_node` starts a node again
+/// at its previous boot plus one (M9 S2b).
 pub const BOOT: BootId = BootId(1);
 
 /// The host flusher's period, in milliseconds. The same value as the scenarios lowering's
@@ -183,17 +184,23 @@ pub(crate) fn assert_not_blocked(status: &NodeStatus, window_millis: u64) {
 /// A message to a node thread.
 #[derive(Debug)]
 pub enum Msg {
-    /// A control call or watch completed.
+    /// A control call or watch completed. A node drops one whose `boot` is not its own: the
+    /// effect was asked for by an earlier process of the node (M9 S2b, critic M2).
     Control {
         /// The partition of the effect that asked.
         partition: PartitionId,
         /// Its correlation.
         correlation: CorrelationId,
+        /// The boot of the node process that asked.
+        boot: BootId,
         /// The completion.
         event: ControlEvent,
     },
-    /// The control adapter could not carry an effect out. Faults the node.
+    /// The control adapter could not carry an effect out. Faults the node, unless `boot` is not
+    /// the node's own, as for [`Msg::Control`].
     Fault {
+        /// The boot of the node process that asked.
+        boot: BootId,
         /// Which fault.
         kind: &'static str,
         /// Its detail.
@@ -421,6 +428,8 @@ pub enum Answer {
 pub struct NodeStatus {
     /// The node.
     pub node: NodeId,
+    /// The boot of the node's running process.
+    pub boot: BootId,
     /// The host fault, once one happened.
     pub fault: Option<String>,
     /// What this node holds for the partition; `None` before it holds any lineage.
@@ -471,6 +480,8 @@ pub struct NodeStopped(pub NodeId);
 pub struct NodeHandle {
     /// The node.
     pub node: NodeId,
+    /// The boot this process of the node runs at.
+    pub boot: BootId,
     tx: Sender<Msg>,
     join: Option<JoinHandle<()>>,
 }
@@ -493,6 +504,7 @@ impl NodeHandle {
         (
             Self {
                 node,
+                boot: BOOT,
                 tx,
                 join: None,
             },
@@ -531,12 +543,15 @@ pub fn spawn(
         clock,
         Budgets::SPEC_DEFAULTS,
         Limits::default(),
+        BOOT,
     )
 }
 
-/// [`spawn`] with `budgets` in place of the spec's, and T1's `limits`. Crate tests shorten the
-/// budgets, so a start is ready in well under a second; nothing outside the crate can. `Db`
-/// lowers only `limits.dedup_cap`, as its `dedup_cap` option asks.
+/// [`spawn`] with `budgets` in place of the spec's, T1's `limits`, and `boot`. Crate tests
+/// shorten the budgets, so a start is ready in well under a second; nothing outside the crate
+/// can. `Db` lowers only `limits.dedup_cap`, as its `dedup_cap` option asks, and passes a boot
+/// above [`BOOT`] only when it restarts the node.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_with(
     node: NodeId,
     dir: PathBuf,
@@ -545,12 +560,14 @@ pub(crate) fn spawn_with(
     clock: HostClock,
     budgets: Budgets,
     limits: Limits,
+    boot: BootId,
 ) -> Result<NodeHandle, String> {
     let engine = RocksEngine::open(&dir)
         .map_err(|e| format!("node {}: open {}: {e}", node.0, dir.display()))?;
     let (tx, rx) = mpsc::channel();
     links.register(node, tx.clone());
     let mut host = Host::new(node, engine, links, control, clock);
+    host.boot = boot;
     host.budgets = budgets;
     host.transaction = Transaction::with_limits(limits);
     let join = std::thread::Builder::new()
@@ -559,6 +576,7 @@ pub(crate) fn spawn_with(
         .map_err(|e| format!("node {}: spawn: {e}", node.0))?;
     Ok(NodeHandle {
         node,
+        boot,
         tx,
         join: Some(join),
     })
@@ -707,6 +725,10 @@ impl SnapshotRead for EmptyView {
 /// The node: everything its thread owns.
 struct Host {
     node: NodeId,
+    /// This process's boot: [`BOOT`], or higher after `Db::restart_node`. Every event and step
+    /// carries it, so does every frame this node sends, and a control completion asked for
+    /// under another boot is dropped (M9 S2b).
+    boot: BootId,
     engine: RocksEngine,
     links: Arc<Links>,
     control: Arc<ControlAdapter>,
@@ -771,6 +793,9 @@ struct Host {
     /// Per partition, the last view A1 published. `txn_dispatch` and `host_stall` measure the
     /// grant left against its horizon (M9 S2a, critic A2).
     authority_views: BTreeMap<PartitionId, AuthorityView>,
+    /// Peer frames this process took from its mailbox, for `node_stopped`: what a restarted
+    /// node is still sent, though it holds no role (M9 S2b, critic A5).
+    frames_received: u64,
     /// The next step view fails to build, as a storage fault would (F-001 rows).
     #[cfg(test)]
     fail_step_view: bool,
@@ -791,6 +816,7 @@ impl Host {
         let now = clock.now();
         Self {
             node,
+            boot: BOOT,
             engine,
             links,
             control,
@@ -831,6 +857,7 @@ impl Host {
             fault: None,
             stepped_at: now,
             authority_views: BTreeMap::new(),
+            frames_received: 0,
             #[cfg(test)]
             fail_step_view: false,
             #[cfg(test)]
@@ -861,7 +888,9 @@ impl Host {
         }
         tracing::info!(
             node = self.node.0,
+            boot = self.boot.0,
             faulted = self.fault.is_some(),
+            frames = self.frames_received,
             "node_stopped"
         );
     }
@@ -888,16 +917,40 @@ impl Host {
 
     // ------------------------------------------------------------------ mailbox
 
+    /// A control completion or fault asked for by an earlier process of this node, `from_boot`:
+    /// never offered and never a fault (M9 S2b, critic M2). An unheld A1 acts on a read of its
+    /// own grant whoever asked for it, and an acquire that read starts would commit a grant this
+    /// process cannot serve.
+    fn drop_stale(&self, msg: &Msg, from_boot: BootId) {
+        let what = match msg {
+            Msg::Control { event, .. } => format!("control/{}", head(&format!("{event:?}"))),
+            Msg::Fault { kind, .. } => format!("fault/{kind}"),
+            _ => "other".to_owned(),
+        };
+        tracing::info!(
+            node = self.node.0,
+            boot = self.boot.0,
+            from_boot = from_boot.0,
+            what,
+            "control_stale_boot_dropped"
+        );
+    }
+
     fn handle(&mut self, msg: Msg) {
         if let Some(fault) = self.fault.clone() {
             self.answer_faulted(msg, &fault);
             return;
         }
         let outcome = match msg {
+            Msg::Control { boot, .. } | Msg::Fault { boot, .. } if boot != self.boot => {
+                self.drop_stale(&msg, boot);
+                Ok(())
+            }
             Msg::Control {
                 partition,
                 correlation,
                 event,
+                ..
             } => {
                 let site = Site {
                     partition,
@@ -906,7 +959,7 @@ impl Host {
                 self.push(site, EventKind::Control(event), false, None);
                 Ok(())
             }
-            Msg::Fault { kind, detail } => Err(format!("control adapter: {kind}: {detail}")),
+            Msg::Fault { kind, detail, .. } => Err(format!("control adapter: {kind}: {detail}")),
             Msg::Inject {
                 partition,
                 correlation,
@@ -935,6 +988,7 @@ impl Host {
                 from,
                 frame,
             } => {
+                self.frames_received += 1;
                 let kind = EventKind::Transport(TransportEvent::Delivered { from, frame });
                 self.push(
                     Site {
@@ -1371,7 +1425,7 @@ impl Host {
                 id,
                 at: self.clock.now(),
                 node: self.node,
-                boot: BOOT,
+                boot: self.boot,
                 partition: site.partition,
                 correlation: site.correlation,
                 kind,
@@ -1482,7 +1536,7 @@ impl Host {
             now,
             control_time: HostClock::control_time(now, &self.budgets),
             node: self.node,
-            boot: BOOT,
+            boot: self.boot,
             partition,
             generation: adopted.generation,
             owner_epoch: adopted.owner_epoch,
@@ -1593,6 +1647,7 @@ impl Host {
                 EffectKind::Control(control) => {
                     self.control.submit(
                         self.node,
+                        self.boot,
                         effect.partition,
                         effect.correlation,
                         control.clone(),
@@ -1633,7 +1688,7 @@ impl Host {
             correlation: site.correlation,
             from: PeerLabel {
                 node: self.node,
-                boot: BOOT,
+                boot: self.boot,
                 authenticated: true,
             },
             frame,
@@ -3194,6 +3249,7 @@ impl Host {
         let now = self.clock.now();
         NodeStatus {
             node: self.node,
+            boot: self.boot,
             fault: self.fault.clone(),
             holds,
             authority,
@@ -3430,6 +3486,88 @@ mod tests {
         ($method:expr) => {
             logged!($method, "replication_copy_not_advancing")
         };
+    }
+
+    /// M9 S2b, critic M2 (guard 4): after `Db::restart_node`, a `grants/1` read the previous
+    /// process asked for can still land in the new process's mailbox, since `abort` reaches a
+    /// control call only at an await. An unheld A1 acts on any read of its own grant: on
+    /// `Absent` it re-arms `AcquireDue`, and the acquire that follows commits a grant for the
+    /// new boot, which has no R1 instance to serve it. So the host drops a completion stamped
+    /// with another boot. The second half is the control: the same read stamped with this
+    /// process's boot does arm the acquire, so the first half's quiet is the boot check's.
+    /// Unit (~300 ms): one host, no thread; a `MemStore` shows whether a grant was written.
+    #[test]
+    fn a_grant_read_from_the_previous_boot_never_starts_an_acquire() {
+        use config_core::{ConfigStore, GetRequest};
+        use rdb_core::contracts::control::{ControlKey, ReadOutcome};
+        use rdb_core::contracts::ids::{ControlRequestId, Revision};
+
+        let dir = config_testkit::fs::temp_dir();
+        let engine = RocksEngine::open(dir.path().join("node")).expect("open engine");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let links = Links::new();
+        let (tx, _completions) = mpsc::channel();
+        links.register(NodeId(1), tx);
+        let store = Arc::new(config_testkit::MemStore::new());
+        let control = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            Arc::clone(&links),
+        );
+        let mut host = Host::new(NodeId(1), engine, links, control, HostClock::start());
+        host.boot = BootId(2);
+        // The retry an acted-on read arms is due one renewal later: 20 ms here, not 500.
+        host.budgets.renew_millis = 20;
+        let read_from = |boot| Msg::Control {
+            partition: PartitionId(1),
+            correlation: CorrelationId(9),
+            boot,
+            event: ControlEvent::Value {
+                request: ControlRequestId(1),
+                key: ControlKey::Grant(NodeId(1)),
+                outcome: ReadOutcome::Absent { as_of: Revision(5) },
+            },
+        };
+        let grant = || {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from(ControlKey::Grant(NodeId(1)).encode()),
+            }))
+            .expect("read grants/1")
+            .record
+        };
+
+        host.handle(read_from(BOOT));
+        // Fifteen retry intervals: an acted-on read has committed its grant long before.
+        let until = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < until {
+            host.run_due();
+            host.drain();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(host.fault.is_none(), "{:?}", host.fault);
+        assert_eq!(
+            grant(),
+            None,
+            "a read the boot-1 process asked for made the boot-2 process acquire grants/1"
+        );
+        assert!(
+            host.timers.is_empty(),
+            "the stale read armed {:?}",
+            host.timers
+        );
+        assert!(host.authority.view().state.is_unheld());
+
+        host.handle(read_from(BootId(2)));
+        host.drain();
+        assert_eq!(
+            host.timers.len(),
+            1,
+            "the same read from this boot arms the acquire's retry"
+        );
     }
 
     /// Defect D1 (2026-10-07, `rdb_dev` walk 2) and the lead's ruling on it: a put sent before
@@ -4392,6 +4530,7 @@ mod tests {
         );
 
         host.handle(Msg::Fault {
+            boot: BOOT,
             kind: "control_fault_test",
             detail: "injected".to_owned(),
         });

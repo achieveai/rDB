@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,7 +20,7 @@ use config_core::ConfigStore;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
+    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -32,7 +32,8 @@ use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
 use crate::host::{
-    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, PutOp, TXN_WAITER_MARGIN_MILLIS,
+    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, NodeStopped, PutOp,
+    TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::transport::Links;
 
@@ -319,7 +320,12 @@ pub enum OpenError {
 
 /// Three rDB nodes in this process, serving partition 1.
 pub struct Db {
-    nodes: Vec<NodeHandle>,
+    /// The running node threads. Under a lock, because [`Db::restart_node`] replaces one while
+    /// other threads keep calling.
+    nodes: Mutex<Vec<NodeHandle>>,
+    /// What [`Db::restart_node`] starts a node again with. `None` in a `Db` a crate test builds
+    /// by hand around threadless nodes.
+    respawn: Option<Respawn>,
     links: Arc<Links>,
     control: Arc<ControlAdapter>,
     clock: HostClock,
@@ -335,6 +341,20 @@ impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db").finish_non_exhaustive()
     }
+}
+
+/// How the open started its nodes, kept so a restarted node starts the same way.
+#[derive(Debug, Clone)]
+struct Respawn {
+    nodes_dir: PathBuf,
+    budgets: Budgets,
+    limits: Limits,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Db {
@@ -357,7 +377,7 @@ impl Db {
     /// can be run again against the same store. A store error is
     /// [`admin::BootstrapError::Control`]; the next open adopts the record if it was written.
     ///
-    /// S0 supports one `Db` per control store. Every `Db` runs nodes 1-3 with [`host::BOOT`], so
+    /// S0 supports one `Db` per control store. Every `Db` starts nodes 1-3 at [`host::BOOT`], so
     /// a second `Db` on the same store is refused with [`admin::BootstrapError::AlreadyExists`]
     /// or, if it opens before the first has committed generation 1, opens but never becomes
     /// ready.
@@ -378,15 +398,31 @@ impl Db {
     ) -> Result<Self, OpenError> {
         let limits = limits(config.dedup_cap)?;
         tracing::info!(dedup_cap = limits.dedup_cap, "db_open");
-        Self::open_spawning(
+        let respawn = Respawn {
+            nodes_dir: config.dir.join("nodes"),
+            budgets,
+            limits,
+        };
+        let mut db = Self::open_spawning(
             config,
             store,
             rt,
             move |node, dir, links, control, clock| {
-                host::spawn_with(node, dir, links, control, clock, budgets, limits)
+                host::spawn_with(
+                    node,
+                    dir,
+                    links,
+                    control,
+                    clock,
+                    budgets,
+                    limits,
+                    host::BOOT,
+                )
             },
         )
-        .await
+        .await?;
+        db.respawn = Some(respawn);
+        Ok(db)
     }
 
     /// [`Self::open_with`] with `spawn` starting each node, so a crate test can fail one.
@@ -424,7 +460,8 @@ impl Db {
         // far, shuts the control adapter down, then removes `nodes/` (F-004, F-005, F-003). So
         // the same open can run again.
         let mut db = Self {
-            nodes: Vec::with_capacity(3),
+            nodes: Mutex::new(Vec::with_capacity(3)),
+            respawn: None,
             links,
             control,
             clock,
@@ -461,17 +498,24 @@ impl Db {
                 self.clock,
             )
             .map_err(OpenError::Node)?;
-            self.nodes.push(handle);
+            lock(&self.nodes).push(handle);
         }
-        let owner = self
-            .node(OWNER)
-            .ok_or_else(|| OpenError::Node("no owner node".into()))?;
-        admin::bootstrap(store, self.clock.now(), |msg| owner.send(msg)).await?;
+        if !lock(&self.nodes).iter().any(|handle| handle.node == OWNER) {
+            return Err(OpenError::Node("no owner node".into()));
+        }
+        admin::bootstrap(store, self.clock.now(), |msg| self.send_to(OWNER, msg)).await?;
         Ok(())
     }
 
-    fn node(&self, node: NodeId) -> Option<&NodeHandle> {
-        self.nodes.iter().find(|handle| handle.node == node)
+    /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
+    /// an answer is awaited.
+    fn send_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
+        let nodes = lock(&self.nodes);
+        let handle = nodes
+            .iter()
+            .find(|handle| handle.node == node)
+            .ok_or(NodeStopped(node))?;
+        handle.send(msg)
     }
 
     fn identity(&self) -> RequestIdentity {
@@ -489,8 +533,7 @@ impl Db {
             call,
             reply,
         });
-        let owner = self.node(OWNER)?;
-        if owner.send(msg).is_err() {
+        if self.send_to(OWNER, msg).is_err() {
             return Some(Answer::Error {
                 error: ApiError::host("the owner's node thread has stopped"),
                 request: None,
@@ -812,16 +855,19 @@ impl Db {
     /// the read timeout is left out.
     #[must_use]
     pub fn node_status(&self) -> Vec<NodeStatus> {
-        self.nodes
-            .iter()
-            .filter_map(|handle| {
+        let nodes: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        nodes
+            .into_iter()
+            .filter_map(|node| {
                 let (reply, answer) = mpsc::channel();
-                handle
-                    .send(Msg::Inspect {
+                self.send_to(
+                    node,
+                    Msg::Inspect {
                         partition: PARTITION,
                         reply,
-                    })
-                    .ok()?;
+                    },
+                )
+                .ok()?;
                 let mut status = answer.recv_timeout(self.timeouts.read).ok()?;
                 status.reload_pending = self.control.reload_pending(status.node);
                 Some(status)
@@ -841,9 +887,86 @@ impl Db {
         self.clock.now()
     }
 
+    /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
+    /// process supervisor would (M9 S2b; a real supervisor takes over in M10). Returns the new
+    /// boot.
+    ///
+    /// In order: the old thread is stopped and joined, which drops its engine and releases
+    /// RocksDB's `LOCK` on `nodes/<n>`; the control adapter forgets the node's watches, reloads
+    /// and calls ([`ControlAdapter::forget_node`]); the node starts again at the new boot and
+    /// takes over its mailbox. A completion the old process asked for that still arrives carries
+    /// the old boot and is dropped (`control_stale_boot_dropped`).
+    ///
+    /// The new process holds no role and stays out. Its peers' membership pins the old boot, so
+    /// they refuse its acknowledgements, and nothing in M9 arms it to acquire a grant: rejoining
+    /// takes a re-pin with catch-up, which is M10. Restarting a secondary leaves writes going on
+    /// the other copy. Restarting the owner stops writes for the life of the `Db`: its old grant
+    /// can be cleared, but the new process never takes one. Logged as `node_restarted{node,
+    /// old_boot, boot}`.
+    ///
+    /// # Errors
+    ///
+    /// `INVALID_ARGUMENT` for a node this `Db` does not run, or a `Db` with no data directory
+    /// (a crate test's). A host error when the node does not start again: it then stays stopped.
+    pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
+        let Some(respawn) = &self.respawn else {
+            return Err(ApiError::invalid(
+                "this Db was built without a data directory, so it cannot restart a node",
+            ));
+        };
+        // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
+        let mut nodes = lock(&self.nodes);
+        let Some(handle) = nodes.iter_mut().find(|handle| handle.node == node) else {
+            return Err(ApiError::invalid(format!(
+                "node {}: no such node; this Db runs nodes 1, 2 and 3",
+                node.0
+            )));
+        };
+        let old_boot = handle.boot;
+        let boot = BootId(old_boot.0 + 1);
+        handle.stop();
+        self.control.forget_node(node);
+        let started = host::spawn_with(
+            node,
+            respawn.nodes_dir.join(node.0.to_string()),
+            Arc::clone(&self.links),
+            Arc::clone(&self.control),
+            self.clock,
+            respawn.budgets,
+            respawn.limits,
+            boot,
+        );
+        match started {
+            Ok(started) => {
+                *handle = started;
+                tracing::info!(
+                    node = node.0,
+                    old_boot = old_boot.0,
+                    boot = boot.0,
+                    "node_restarted"
+                );
+                Ok(boot)
+            }
+            Err(detail) => {
+                tracing::error!(
+                    node = node.0,
+                    old_boot = old_boot.0,
+                    boot = boot.0,
+                    %detail,
+                    "node_restart_failed"
+                );
+                Err(ApiError::host(&detail))
+            }
+        }
+    }
+
     /// Stop every node and every control call. The control store stays the caller's.
     pub fn shutdown(&mut self) {
-        for handle in &mut self.nodes {
+        for handle in self
+            .nodes
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             handle.stop();
         }
         self.control.shutdown();
@@ -1177,7 +1300,8 @@ mod tests {
         let links = Links::new();
         let (owner, mailbox) = NodeHandle::unanswered(OWNER);
         let mut db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
@@ -1371,7 +1495,8 @@ mod tests {
         let dropper = std::thread::spawn(move || drop(mailbox.recv()));
         let put = Duration::from_secs(5);
         let mut db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
@@ -1416,7 +1541,8 @@ mod tests {
         let links = Links::new();
         let (owner, mailbox) = NodeHandle::unanswered(OWNER);
         let mut db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
@@ -1517,6 +1643,7 @@ mod tests {
                 clock,
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
+                host::BOOT,
             )
         };
 
@@ -1621,6 +1748,7 @@ mod tests {
                             clock,
                             fast(),
                             Limits::default(),
+                            host::BOOT,
                         )?;
                         if node == NodeId(3) {
                             race.wait("the loser returns while these nodes run", other, |s| s.1);
@@ -2177,7 +2305,8 @@ mod tests {
         let links = Links::new();
         let (owner, mailbox) = NodeHandle::unanswered(OWNER);
         let db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
