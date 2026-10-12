@@ -1647,6 +1647,23 @@ impl Authority {
     /// An older snapshot than the one already installed is ignored:
     /// [`AuthorityStateView::partitions_revision`] is exactly what makes that decidable, and it
     /// is not the cursor (lead ruling A-R30).
+    ///
+    /// # The grants family feeds each other node's record to the takeovers (T6)
+    ///
+    /// A gap reload adopts the family (ADR-rdb-0008 §4): the snapshot stands in for every watch
+    /// event the gap lost. For `grants/*` the only one of those A1 cannot get back another way is
+    /// a change to a prior owner's grant. A takeover learns that grant by an explicit read once
+    /// (T1 → T3) and every later change, the freeze above all, from the watch (T6). The planner
+    /// writes `Fencing` before it freezes, so T3 can read the grant unfrozen; if the freeze then
+    /// falls in the compacted range and the prior owner is down and never drains, nothing re-reads
+    /// it, the entry never learns the freeze, and expiry is never proven. Discarding the records
+    /// left that partition stuck. So each `grants/{n}` record with `n` not this node goes through
+    /// [`Self::refresh_prior`] at the record's own revision, exactly as T6's read would.
+    ///
+    /// An older snapshot is safe here without a family-wide age check: `refresh_prior` refreshes
+    /// an entry only from a revision strictly newer than the one it last observed (A-R53.2), so a
+    /// rewound snapshot cannot unfreeze an entry. This node's own record is left to its renewal
+    /// path, which catches a freeze or revoke of our grant at the next renewal CAS.
     fn on_family_snapshot(
         &mut self,
         ctx: &StepCtx<'_>,
@@ -1669,6 +1686,23 @@ impl Authority {
             // The takeover side orders itself by its own per-partition mark (A-R52), so an older
             // snapshot does not re-start a takeover that a newer read dropped (T1, T2).
             effects.extend(self.observe_snapshot(event, ctx.node, snapshot_revision, records));
+        }
+
+        // Another node's grant, as T6 would have read it had the watch not gapped. Our own
+        // record keeps its renewal path. A body naming another node than its key is not that
+        // node's grant (A-R53.3).
+        if prefix == ControlPrefix::Grants {
+            for record in records {
+                let ControlKey::Grant(node) = record.key else {
+                    continue;
+                };
+                if node == ctx.node {
+                    continue;
+                }
+                if let Some(grant) = GrantRecord::decode(&record.value).filter(|g| g.node == node) {
+                    effects.extend(self.refresh_prior(event, &grant, record.revision));
+                }
+            }
         }
 
         effects.push(Self::control(
@@ -3077,19 +3111,7 @@ impl Authority {
         }
         let mut effects = Vec::new();
         if let Some((record, revision)) = decoded {
-            for (partition, entry) in &mut self.takeover {
-                let newer = entry.observed_revision < revision;
-                if entry.prior_node == node && entry.proven.is_none() && newer {
-                    entry.prior_grant_id = record.grant;
-                    entry.prior_boot_id = record.boot;
-                    entry.frozen = record.frozen.then_some(FrozenGrant {
-                        expiry_utc_ms: record.expiry_utc_ms,
-                        control_revision: revision,
-                    });
-                    entry.observed_revision = revision;
-                    effects.push(Self::deferred(event, *partition));
-                }
-            }
+            effects = self.refresh_prior(event, &record, revision);
         }
         if effects.is_empty() {
             // Another node's grant that no takeover is waiting on. It neither widens nor narrows
@@ -3098,6 +3120,36 @@ impl Authority {
                 event,
                 AuthorityIgnoreReason::StaleAuthorityView,
             ));
+        }
+        effects
+    }
+
+    /// T6 for `record`, the prior owner's grant as the store held it at `revision`: refresh every
+    /// unproven entry for `record.node` that `revision` is strictly newer than (A-R53.2), and
+    /// defer each one it refreshed. Empty when it refreshed none.
+    ///
+    /// Shared by an uncorrelated read ([`Self::on_prior_grant_read`]) and a coherent grants
+    /// snapshot ([`Self::on_family_snapshot`]). The strictly-newer test is what keeps an older
+    /// snapshot, or a late read, from unfreezing an entry.
+    fn refresh_prior(
+        &mut self,
+        event: &Event,
+        record: &GrantRecord,
+        revision: Revision,
+    ) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for (partition, entry) in &mut self.takeover {
+            let newer = entry.observed_revision < revision;
+            if entry.prior_node == record.node && entry.proven.is_none() && newer {
+                entry.prior_grant_id = record.grant;
+                entry.prior_boot_id = record.boot;
+                entry.frozen = record.frozen.then_some(FrozenGrant {
+                    expiry_utc_ms: record.expiry_utc_ms,
+                    control_revision: revision,
+                });
+                entry.observed_revision = revision;
+                effects.push(Self::deferred(event, *partition));
+            }
         }
         effects
     }

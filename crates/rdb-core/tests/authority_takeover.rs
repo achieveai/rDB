@@ -33,6 +33,7 @@ use rdb_core::contracts::authority::{
 };
 use rdb_core::contracts::control::{
     CasOutcome, ControlEffect, ControlEvent, ControlKey, ControlPrefix, ControlRecord, ReadOutcome,
+    WatchTermination,
 };
 use rdb_core::contracts::errors::RdbError;
 use rdb_core::contracts::event::{
@@ -2180,4 +2181,278 @@ fn m7a_181_a_late_answer_to_a_re_issued_prior_grant_read_creates_nothing() {
         "M7A-181: the re-read's own answer creates the entry: {:?}",
         kernel.view().takeover
     );
+}
+
+// ---- A grants watch gap over a prior owner's freeze ------------------------------------------
+//
+// The planner writes `partitions/{p}` to `Fencing` and then freezes the old grant: two CASes,
+// in that order (spec §7.3 step 1, ADR-rdb-0007 §6). T1 reads the grant between them, so T3 can
+// see it unfrozen, and the freeze then reaches the entry only through the grants watch (T6). A
+// prior owner that is down never drains, so no `FencingDrained` read re-reads the grant (M7A-57).
+
+/// `Held` as [`held`] builds it, plus the body the acquisition wrote to `grants/{NODE}`, so a
+/// coherent grants snapshot can list this node's own record as the store holds it.
+fn held_with_own_body() -> (Kernel, Bytes) {
+    let mut kernel = Kernel::new();
+    let due = event(
+        1,
+        1,
+        EventKind::Timer(TimerFired {
+            id: AuthorityTimer::Acquire.id(),
+            version: kernel.timer_version(AuthorityTimer::Acquire),
+            scheduled_at: Tick(0),
+        }),
+    );
+    let effects = kernel.step(&ctx(0), &due).expect("AcquireDue is built");
+    let own = effects
+        .iter()
+        .find_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Cas {
+                key: ControlKey::Grant(NODE),
+                value: Some(value),
+                ..
+            }) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("fixture: the acquisition CAS carries the grant body");
+    kernel
+        .step(
+            &ctx(0),
+            &control(
+                1,
+                1,
+                ControlEvent::CasResult {
+                    request: kernel.in_flight(),
+                    key: ControlKey::Grant(NODE),
+                    outcome: CasOutcome::Committed(Revision(7)),
+                },
+            ),
+        )
+        .expect("the acquisition commit is built");
+    assert!(kernel.state().is_held(), "fixture: Held");
+    (kernel, own)
+}
+
+/// T3 saw `OTHER`'s grant unfrozen at 20. The freeze commits at 21, and the grants watch then
+/// ends `RevisionCompacted` before delivering it. The reload's coherent
+/// snapshot at 30 lists the frozen record. Nothing after it re-reads the grant: a newer
+/// `partitions/*` snapshot still says `Fencing` (the owner is down, so it never drains).
+///
+/// The twin gets the same freeze through the watch (T6) and proves `ExpiryProven` at
+/// [`PROOF_TICK`]. The gapped kernel must reach the same proof, because the snapshot told it
+/// everything the watch would have.
+#[retcd_test]
+fn a_freeze_in_a_compacted_grants_range_still_proves_expiry() {
+    // The twin: no gap. Fixture check, so a red below cannot be the fixture's.
+    let mut watched = taking_over(false);
+    watched
+        .step(
+            &ctx(12),
+            &grant_read(&watched, 12, 12, OTHER, prior_grant(true, FROZEN_REV)),
+        )
+        .expect("T6");
+    let effects = watched.step(&ctx(PROOF_TICK), &tick(13)).expect("built");
+    assert_eq!(
+        shapes(&effects)
+            .into_iter()
+            .filter(|shape| matches!(shape, Shape::Proven(..)))
+            .collect::<Vec<_>>(),
+        vec![Shape::Proven(
+            TAKEN,
+            proof(expiry_proven_at(PROOF_TICK), PROOF_TICK)
+        )],
+        "control: the freeze delivered by the watch proves expiry"
+    );
+
+    // The gapped kernel: the same T1 and T3 as `taking_over(false)`.
+    let (mut kernel, own) = held_with_own_body();
+    kernel
+        .step(
+            &ctx(10),
+            &partition_read(10, 10, RECORD_REV, &taken(PartitionLifecycle::Fencing)),
+        )
+        .expect("T1 is built");
+    kernel
+        .step(
+            &ctx(11),
+            &grant_read(&kernel, 11, 10, OTHER, prior_grant(false, UNFROZEN_REV)),
+        )
+        .expect("T3 is built");
+    assert_eq!(
+        kernel.view().takeover[&TAKEN],
+        created(false),
+        "fixture: T3"
+    );
+
+    // The freeze at 21 is compacted away before the grants watch delivers it.
+    let effects = kernel
+        .step(
+            &ctx(12),
+            &control(
+                12,
+                12,
+                ControlEvent::WatchTerminated {
+                    prefix: ControlPrefix::Grants,
+                    from: Revision(7),
+                    termination: WatchTermination::RevisionCompacted {
+                        minimum_available_revision: Revision(25),
+                    },
+                },
+            ),
+        )
+        .expect("built");
+    assert!(
+        effects.iter().any(|effect| effect.kind
+            == EffectKind::Control(ControlEffect::Reload {
+                prefix: ControlPrefix::Grants
+            })),
+        "fixture: a gap reloads grants: {effects:?}"
+    );
+
+    // The coherent reload at 30: this node's own record, and `OTHER`'s, frozen at 21.
+    let frozen = match prior_grant(true, FROZEN_REV) {
+        ReadOutcome::Found { value, .. } => value,
+        other => panic!("fixture: {other:?}"),
+    };
+    let effects = kernel
+        .step(
+            &ctx(13),
+            &control(
+                13,
+                13,
+                ControlEvent::FamilySnapshot {
+                    prefix: ControlPrefix::Grants,
+                    snapshot_revision: Revision(30),
+                    records: vec![
+                        ControlRecord {
+                            key: ControlKey::Grant(NODE),
+                            revision: Revision(7),
+                            value: own,
+                        },
+                        ControlRecord {
+                            key: ControlKey::Grant(OTHER),
+                            revision: Revision(FROZEN_REV),
+                            value: frozen,
+                        },
+                    ],
+                },
+            ),
+        )
+        .expect("built");
+    assert!(
+        effects.iter().any(|effect| effect.kind
+            == EffectKind::Control(ControlEffect::Watch {
+                prefix: ControlPrefix::Grants,
+                from: Revision(30),
+            })),
+        "fixture: the watch resumes from the snapshot: {effects:?}"
+    );
+
+    // The only later news a down owner produces: `partitions/*` still `Fencing`.
+    kernel
+        .step(
+            &ctx(14),
+            &snapshot(14, 31, &[taken(PartitionLifecycle::Fencing)]),
+        )
+        .expect("built");
+
+    let effects = kernel.step(&ctx(PROOF_TICK), &tick(15)).expect("built");
+    assert_eq!(
+        kernel.view().takeover[&TAKEN].frozen,
+        Some(FrozenGrant {
+            expiry_utc_ms: F,
+            control_revision: Revision(FROZEN_REV),
+        }),
+        "the gap reload's snapshot listed the freeze; the entry never learned it"
+    );
+    assert_eq!(
+        shapes(&effects)
+            .into_iter()
+            .filter(|shape| matches!(shape, Shape::Proven(..)))
+            .collect::<Vec<_>>(),
+        vec![Shape::Proven(
+            TAKEN,
+            proof(expiry_proven_at(PROOF_TICK), PROOF_TICK)
+        )],
+        "the gapped kernel proves what the twin proves"
+    );
+}
+
+/// The grants snapshot arm keeps T6's order (A-R53.2): an older grants snapshot that lists
+/// `OTHER`'s grant unfrozen, delivered after the entry recorded the freeze at [`FROZEN_REV`],
+/// changes nothing. The entry stays frozen, the step defers nothing, and expiry is still proven.
+#[retcd_test]
+fn an_older_grants_snapshot_after_a_newer_freeze_changes_nothing() {
+    let mut kernel = taking_over(true);
+    let unfrozen = match prior_grant(false, UNFROZEN_REV) {
+        ReadOutcome::Found { value, .. } => value,
+        other => panic!("fixture: {other:?}"),
+    };
+
+    let effects = kernel
+        .step(
+            &ctx(12),
+            &control(
+                12,
+                12,
+                ControlEvent::FamilySnapshot {
+                    prefix: ControlPrefix::Grants,
+                    snapshot_revision: Revision(UNFROZEN_REV),
+                    records: vec![ControlRecord {
+                        key: ControlKey::Grant(OTHER),
+                        revision: Revision(UNFROZEN_REV),
+                        value: unfrozen,
+                    }],
+                },
+            ),
+        )
+        .expect("built");
+
+    assert_eq!(takeover_shapes(&effects), Vec::new());
+    assert_eq!(kernel.view().takeover[&TAKEN], created(true));
+    let effects = kernel.step(&ctx(PROOF_TICK), &tick(13)).expect("built");
+    assert_eq!(
+        shapes(&effects)
+            .into_iter()
+            .filter(|shape| matches!(shape, Shape::Proven(..)))
+            .collect::<Vec<_>>(),
+        vec![Shape::Proven(
+            TAKEN,
+            proof(expiry_proven_at(PROOF_TICK), PROOF_TICK)
+        )]
+    );
+}
+
+/// A grants snapshot record whose body names another node than its key is not that node's grant
+/// (A-R53.3), as for T6's read. `grants/{THIRD}` carrying `OTHER`'s frozen body must not freeze
+/// the entry taken over from `OTHER`.
+#[retcd_test]
+fn a_grants_snapshot_record_naming_another_node_than_its_key_refreshes_nothing() {
+    let mut kernel = taking_over(false);
+    let frozen = match prior_grant(true, FROZEN_REV) {
+        ReadOutcome::Found { value, .. } => value,
+        other => panic!("fixture: {other:?}"),
+    };
+
+    let effects = kernel
+        .step(
+            &ctx(12),
+            &control(
+                12,
+                12,
+                ControlEvent::FamilySnapshot {
+                    prefix: ControlPrefix::Grants,
+                    snapshot_revision: Revision(30),
+                    records: vec![ControlRecord {
+                        key: ControlKey::Grant(THIRD),
+                        revision: Revision(FROZEN_REV),
+                        value: frozen,
+                    }],
+                },
+            ),
+        )
+        .expect("built");
+
+    assert_eq!(takeover_shapes(&effects), Vec::new());
+    assert_eq!(kernel.view().takeover[&TAKEN], created(false));
 }
