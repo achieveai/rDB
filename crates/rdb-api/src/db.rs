@@ -887,6 +887,20 @@ impl Db {
         self.clock.now()
     }
 
+    /// The boot `node`'s running process has, or `None` for a node this `Db` does not run.
+    #[must_use]
+    pub fn boot_of(&self, node: NodeId) -> Option<BootId> {
+        lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.boot)
+    }
+
+    /// The budgets every node runs with, or `None` in a `Db` a crate test builds by hand.
+    pub(crate) fn budgets(&self) -> Option<Budgets> {
+        self.respawn.as_ref().map(|respawn| respawn.budgets)
+    }
+
     /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
     /// process supervisor would (M9 S2b; a real supervisor takes over in M10). Returns the new
     /// boot.
@@ -899,10 +913,14 @@ impl Db {
     ///
     /// The new process holds no role and stays out. Its peers' membership pins the old boot, so
     /// they refuse its acknowledgements, and nothing in M9 arms it to acquire a grant: rejoining
-    /// takes a re-pin with catch-up, which is M10. Restarting a secondary leaves writes going on
-    /// the other copy. Restarting the owner stops writes for the life of the `Db`: its old grant
-    /// can be cleared, but the new process never takes one. Logged as `node_restarted{node,
-    /// old_boot, boot}`.
+    /// takes a re-pin with catch-up, which is M10.
+    ///
+    /// So in M9 restarting **any** node stops writes for the life of the `Db`. A restarted
+    /// secondary's copy is never durable again, so L1 warns about 1 s later and pauses writes
+    /// about 2 s later (spec §6.2), and nothing un-pauses them before M10. Puts already admitted
+    /// may still land in that window. A restarted owner never takes a grant again: its old grant
+    /// can be cleared ([`crate::admin::clear_grant`]), but nothing acquires a new one. Logged as
+    /// `node_restarted{node, old_boot, boot}`.
     ///
     /// # Errors
     ///

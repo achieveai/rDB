@@ -42,9 +42,19 @@
 //!                                         running process has
 //! node restart <n>                        stop node n and start it again on its data at its
 //!                                         boot plus one; prints `node n boot b`. The new
-//!                                         process holds no role and stays out until M10: a
-//!                                         restarted secondary leaves writes going on the other
-//!                                         copy, and a restarted owner stops writes for good
+//!                                         process holds no role and stays out until M10. So
+//!                                         any restart stops writes for the life of this run:
+//!                                         after a secondary's, L1 pauses about 2 s later
+//!                                         (`PROTECTION_PAUSED`) because that copy is never
+//!                                         durable again; after the owner's, no node holds a
+//!                                         grant. Restarting is not a recovery: catch-up and
+//!                                         re-pin are M10
+//! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
+//!                                         and it may go: `absent`, `current` (the running
+//!                                         process's own), `cleared rev=R`, `conflict`, or
+//!                                         `refused frozen|not-proven-expired|partition-in-
+//!                                         transfer pP until=T in=Nms` (T is E + epsilon +
+//!                                         delta). Run it again until `cleared` or `absent`
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
@@ -62,6 +72,11 @@
 //! control fail list <unavailable|deadline|notleader|invalid|off>
 //!                                         every list the Db's store sends answers that error,
 //!                                         until `off`. `control` reads are not affected
+//! control lifecycle <p> <serving|fencing|drained>
+//!                                         rewrite partitions/<p>'s lifecycle on the rEtcd
+//!                                         leader, at its revision. Put `serving` back after
+//! control freeze-grant <n>                set grants/<n>'s frozen bit on the rEtcd leader, at
+//!                                         its revision. Nothing in M9 undoes it: run it last
 //! link hold|heal <a>-<b> | link heal all | links
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //! sleep <millis>
@@ -100,14 +115,18 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use config_core::{ConfigStore, GetRequest, ListRequest, NodeId as VoterId};
+use config_core::{
+    ConfigStore, GetRequest, ListRequest, MutationOutcome, NodeId as VoterId, PutRequest,
+};
 use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
+use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
 use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
-use rdb_core::authority::grant::GrantRecord;
-use rdb_core::authority::partition::PartitionRecord;
-use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, RequestId};
+use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, PartitionId, RequestId};
 use rdb_core::contracts::txn::TxnRequest;
 
 use hostile_store::{HostileStore, ListFault};
@@ -631,6 +650,28 @@ fn repl<'scope, 'env>(
                 });
             }),
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
+            ["admin", "clear-grant", node] => parse_node(node).map(|node| {
+                say(
+                    &match rt.block_on(admin::clear_grant(db, control.store, node)) {
+                        Ok(clearance) => clearance_line(clearance, db.now()),
+                        Err(e) => format!("err admin clear-grant {}: {e}", node.0),
+                    },
+                );
+            }),
+            ["admin", ..] => Err("admin clear-grant <n>: n is 1, 2 or 3".to_owned()),
+            ["control", "lifecycle", partition, word] => {
+                parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
+                    say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
+                })
+            }
+            ["control", "lifecycle", ..] => Err(format!(
+                "control lifecycle <p> <{}>",
+                LIFECYCLE_WORDS.join("|")
+            )),
+            ["control", "freeze-grant", node] => parse_node(node).map(|node| {
+                say(&freeze_grant(rt, control.cluster, node));
+            }),
+            ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
             ["control"] => {
                 control_lines(rt, control.cluster);
                 Ok(())
@@ -1088,6 +1129,125 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
             }
             Err(e) => say(&format!("err control list {prefix}: {e}")),
         }
+    }
+}
+
+/// `admin clear-grant`'s answer as one line.
+fn clearance_line(clearance: Clearance, now: rdb_core::contracts::time::Tick) -> String {
+    match clearance {
+        Clearance::Absent => "absent".to_owned(),
+        Clearance::Current => "current".to_owned(),
+        Clearance::Cleared(revision) => format!("cleared rev={}", revision.0),
+        Clearance::Conflict => "conflict: the record moved; run it again".to_owned(),
+        Clearance::Refused {
+            refusal,
+            until_utc_ms,
+        } => {
+            let refusal = match refusal {
+                ClearRefusal::Frozen => "frozen".to_owned(),
+                ClearRefusal::NotProvenExpired => "not-proven-expired".to_owned(),
+                ClearRefusal::PartitionInTransfer(partition) => {
+                    format!("partition-in-transfer p{}", partition.0)
+                }
+            };
+            let wait = u64::try_from(until_utc_ms).map_or(0, |until| until.saturating_sub(now.0));
+            format!("refused {refusal} until={until_utc_ms} in={wait}ms")
+        }
+    }
+}
+
+/// The words `control lifecycle` takes, in `PartitionLifecycle` order.
+const LIFECYCLE_WORDS: [&str; 3] = ["serving", "fencing", "drained"];
+
+fn parse_lifecycle(
+    partition: &str,
+    word: &str,
+) -> Result<(PartitionId, PartitionLifecycle), String> {
+    let usage = || format!("control lifecycle <p> <{}>", LIFECYCLE_WORDS.join("|"));
+    let partition = partition
+        .parse::<u32>()
+        .map(PartitionId)
+        .map_err(|_| format!("{}: {partition:?} is not a partition id", usage()))?;
+    let lifecycle = match word {
+        "serving" => PartitionLifecycle::Serving,
+        "fencing" => PartitionLifecycle::Fencing,
+        "drained" => PartitionLifecycle::FencingDrained,
+        other => return Err(format!("{}: not {other:?}", usage())),
+    };
+    Ok((partition, lifecycle))
+}
+
+/// `control lifecycle`: read `partitions/<p>` on the rEtcd leader and write it back with
+/// `lifecycle`, at the revision read. Example-only, like every raw `control` verb: no product
+/// path writes a lifecycle other than `Serving` in M9. Returns the line to print.
+fn set_lifecycle(
+    rt: &tokio::runtime::Runtime,
+    cluster: &Cluster,
+    partition: PartitionId,
+    lifecycle: PartitionLifecycle,
+) -> String {
+    let key = ControlKey::Partition(partition).encode();
+    rewrite(rt, cluster, &key, |body| {
+        let mut record = PartitionRecord::decode(body)?;
+        record.lifecycle = lifecycle;
+        Some((record.encode(), format!("{:?}", record.lifecycle)))
+    })
+}
+
+/// `control freeze-grant`: read `grants/<n>` on the rEtcd leader and write it back frozen, at
+/// the revision read. Returns the line to print.
+fn freeze_grant(rt: &tokio::runtime::Runtime, cluster: &Cluster, node: NodeId) -> String {
+    let key = ControlKey::Grant(node).encode();
+    rewrite(rt, cluster, &key, |body| {
+        let mut record = GrantRecord::decode(body)?;
+        record.frozen = true;
+        Some((record.encode(), format!("frozen boot={}", record.boot.0)))
+    })
+}
+
+/// Read `key` on the rEtcd leader, let `change` rewrite its body, and put the result at the
+/// revision read. `change` answers `None` for a body it cannot decode.
+fn rewrite(
+    rt: &tokio::runtime::Runtime,
+    cluster: &Cluster,
+    key: &str,
+    change: impl FnOnce(&[u8]) -> Option<(Bytes, String)>,
+) -> String {
+    let Some(leader) = cluster.leader_now() else {
+        return format!("err control {key}: no rEtcd leader now; try again");
+    };
+    let store = cluster.client(leader);
+    let read = match rt.block_on(store.get(GetRequest {
+        key: Bytes::from(key.to_owned()),
+    })) {
+        Ok(read) => read,
+        Err(e) => return format!("err control get {key}: {e}"),
+    };
+    let Some(found) = read.record else {
+        return format!("err control {key}: absent");
+    };
+    let Some((value, what)) = change(&found.value) else {
+        return format!(
+            "err control {key}: rev={} does not decode",
+            found.mod_revision
+        );
+    };
+    let put = rt.block_on(store.put(PutRequest {
+        key: Bytes::from(key.to_owned()),
+        value,
+        expected_mod_revision: Some(found.mod_revision),
+        dedup: None,
+    }));
+    match put {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(key, from = found.mod_revision, revision = response.revision, what = %what, "control_rewrite");
+            format!("{key} rev={} {what}", response.revision)
+        }
+        Ok(response) => format!(
+            "err control {key}: {:?} at rev={}",
+            response.outcome, found.mod_revision
+        ),
+        Err(e) => format!("err control put {key}: {e}"),
     }
 }
 

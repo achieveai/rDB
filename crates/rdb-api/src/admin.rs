@@ -18,17 +18,24 @@
 //! From there F1 queries the three empty copies, selects, commits generation 1 and the host
 //! carries it to every member. The admin never injects `Recovered`, never writes a record into
 //! the partition and never answers for a module (lead ruling: no workaround in `rdb_api`).
+//!
+//! [`clear_grant`] (M9 S2b) is the planner's other duty here: it removes the `grants/{node}`
+//! record a restarted node's old process left behind, through rdb-core's three guards.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use config_core::{ConfigError, ConfigStore, GetRequest, MutationOutcome, PutRequest};
+use config_core::{
+    ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
+};
+use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
 };
-use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::errors::ErrorKind;
 use rdb_core::contracts::event::{EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
     AuthorityGeneration, ConfigVersion, CorrelationId, Generation, GrantId, NodeId, OwnerEpoch,
@@ -38,6 +45,8 @@ use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
 use rdb_core::contracts::time::Tick;
 
+use crate::clock::HostClock;
+use crate::db::{ApiError, Db};
 use crate::host::{Msg, NodeStopped, BOOT};
 
 /// The partition S0 serves.
@@ -226,6 +235,209 @@ async fn adopt(
     }
     tracing::info!(key = %key, revision = found.mod_revision, "bootstrap_partition_record_adopted");
     Ok(Revision(found.mod_revision))
+}
+
+/// What [`clear_grant`] did with `grants/{node}`. The simulator's service answers the same way
+/// (`rdb_sim`'s `grant_service::Clearance`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clearance {
+    /// `grants/{node}` holds nothing: there is nothing to clear.
+    Absent,
+    /// The record names the node's current boot: it is the running process's grant, however
+    /// expired it reads. Nothing was written.
+    Current,
+    /// The record was deleted at this revision.
+    Cleared(Revision),
+    /// A guard held the record in place. Nothing was written.
+    Refused {
+        /// Which guard.
+        refusal: ClearRefusal,
+        /// `E + epsilon + delta` in UTC milliseconds: once control time is past it, guard 2
+        /// holds. It moves if the old process still renews.
+        until_utc_ms: i64,
+    },
+    /// All three guards held, but the record moved between the read and the delete. Nothing was
+    /// deleted; run it again.
+    Conflict,
+}
+
+/// Remove `grants/{node}` if a restarted node's old process left it and it may safely go (M9
+/// S2b). The operator runs it, again until it answers [`Clearance::Cleared`] or
+/// [`Clearance::Absent`]; a polling service is M10.
+///
+/// Reads the record, then the whole `partitions/` family, then asks
+/// [`rdb_core::authority::grant::clear_verdict`] with the boot `db` runs `node` at now, never
+/// the boot the record names, and the `Db`'s own clock. Only a [`ClearVerdict::Clear`] writes:
+/// a delete at the record's own `mod_revision`, so a record renewed or replaced since the read
+/// is left alone ([`Clearance::Conflict`]).
+///
+/// The `partitions/` list is read before the verdict because the verdict's read is synchronous
+/// and `store` is not (critic A2). So with lists failing this is an error even where it would
+/// answer [`Clearance::Current`].
+///
+/// Guard 3 and the delete are two calls: rEtcd has no compare across keys. That is safe in M9
+/// because nothing can make guard 3 false between them. The only writers of `partitions/` are
+/// [`bootstrap`] and F1's commit, and both write `Serving` (`rdb_dev`'s `control lifecycle`
+/// runs on the same thread as its `admin clear-grant`). **M10 tripwire:** the first writer of a
+/// non-`Serving` lifecycle, the planner, must also be the only clearer, or rEtcd must gain a
+/// multi-key compare.
+///
+/// Logged as `grant_clear{node, boot, record_boot, revision, expiry, now, until, verdict}`, and a
+/// failure as `grant_clear_failed{node, error}`.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for a node `db` does not run, or a `Db` built without budgets (a crate
+/// test's). `UNAVAILABLE` when a read fails, the `partitions/` list comes back truncated, or a
+/// record does not decode: nothing is deleted then. `UNKNOWN_OUTCOME` when the delete's reply is
+/// lost; running it again reads where it stands.
+pub async fn clear_grant(
+    db: &Db,
+    store: &dyn ConfigStore,
+    node: NodeId,
+) -> Result<Clearance, ApiError> {
+    let answer = judge_and_clear(db, store, node).await;
+    if let Err(error) = &answer {
+        tracing::warn!(node = node.0, %error, "grant_clear_failed");
+    }
+    answer
+}
+
+async fn judge_and_clear(
+    db: &Db,
+    store: &dyn ConfigStore,
+    node: NodeId,
+) -> Result<Clearance, ApiError> {
+    let boot = db.boot_of(node).ok_or_else(|| {
+        ApiError::invalid(format!(
+            "node {}: no such node; this Db runs nodes 1, 2 and 3",
+            node.0
+        ))
+    })?;
+    let budgets = db.budgets().ok_or_else(|| {
+        ApiError::invalid("this Db was built without budgets, so it cannot judge a grant")
+    })?;
+    let key = ControlKey::Grant(node).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| unavailable(format!("get {key}: {error}")))?;
+    let Some(found) = read.record else {
+        tracing::info!(
+            node = node.0,
+            boot = boot.0,
+            verdict = ?Clearance::Absent,
+            "grant_clear"
+        );
+        return Ok(Clearance::Absent);
+    };
+    let record = GrantRecord::decode(&found.value).ok_or_else(|| {
+        unavailable(format!(
+            "{key} at revision {} is not a grant record",
+            found.mod_revision
+        ))
+    })?;
+    let partitions = list_partitions(store).await?;
+    let now = db.now();
+    let sample = HostClock::control_time(now, &budgets);
+    let verdict = clear_verdict(node, &record, boot, sample, now, &budgets, || {
+        Ok::<_, std::convert::Infallible>(partitions)
+    })
+    .unwrap_or_else(|never| match never {});
+    let margin = budgets
+        .clock_error_millis
+        .saturating_add(budgets.dispatch_margin_millis);
+    let until_utc_ms = record
+        .expiry_utc_ms
+        .saturating_add(i64::try_from(margin).unwrap_or(i64::MAX));
+    let clearance = match verdict {
+        ClearVerdict::Current => Clearance::Current,
+        ClearVerdict::Refused(refusal) => Clearance::Refused {
+            refusal,
+            until_utc_ms,
+        },
+        ClearVerdict::Clear => delete(store, &key, found.mod_revision).await?,
+    };
+    tracing::info!(
+        node = node.0,
+        boot = boot.0,
+        record_boot = record.boot.0,
+        revision = found.mod_revision,
+        expiry = record.expiry_utc_ms,
+        now = now.0,
+        until = until_utc_ms,
+        verdict = ?clearance,
+        "grant_clear"
+    );
+    Ok(clearance)
+}
+
+/// The whole `partitions/` family, or an error: a failed or truncated list is never read as a
+/// complete one, since a missing record could hide a partition in transfer.
+async fn list_partitions(store: &dyn ConfigStore) -> Result<Vec<PartitionRecord>, ApiError> {
+    let prefix = ControlPrefix::Partitions.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| unavailable(format!("list {prefix}: {error}")))?;
+    if listed.truncated {
+        return Err(unavailable(format!(
+            "list {prefix} came back truncated at revision {}",
+            listed.read_revision
+        )));
+    }
+    listed
+        .records
+        .iter()
+        .map(|found| {
+            PartitionRecord::decode(&found.value).ok_or_else(|| {
+                unavailable(format!(
+                    "{} at revision {} is not a partition record",
+                    String::from_utf8_lossy(&found.key),
+                    found.mod_revision
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Delete `key` only while it is still at `revision`.
+async fn delete(store: &dyn ConfigStore, key: &str, revision: u64) -> Result<Clearance, ApiError> {
+    let answer = store
+        .delete(DeleteRequest {
+            key: Bytes::from(key.to_owned()),
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        })
+        .await;
+    match answer {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            Ok(Clearance::Cleared(Revision(response.revision)))
+        }
+        Ok(_) | Err(ConfigError::Conflict { .. } | ConfigError::NotFound) => {
+            Ok(Clearance::Conflict)
+        }
+        Err(ConfigError::DeadlineExceededUnknownOutcome) => Err(ApiError::new(
+            ErrorKind::UnknownOutcome,
+            format!("delete {key} at revision {revision}: the reply was lost"),
+        )),
+        Err(error) => Err(unavailable(format!(
+            "delete {key} at revision {revision}: {error}"
+        ))),
+    }
+}
+
+fn unavailable(detail: String) -> ApiError {
+    ApiError::new(
+        ErrorKind::Unavailable,
+        format!("control store: {detail}; nothing deleted"),
+    )
 }
 
 #[cfg(test)]
