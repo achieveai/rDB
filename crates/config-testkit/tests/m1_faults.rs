@@ -105,18 +105,89 @@ async fn m1_25_direct_read_uses_linearizable_barrier() {
     // Proves the barrier — not connectivity in general — was the reason: some node (not
     // necessarily the original `leader`; the two connected peers may well have elected a new
     // one while it was isolated) serves the same data again once healed.
+    //
+    // The read above waits out its whole read deadline (issue #40), which outlasts an
+    // election, so right after heal the old leader still calls itself leader beside the new
+    // one. `leader_now` returns the lowest id, which can be that stale leader (see
+    // `Cluster::leaders_now`). So poll every self-declared leader until one serves the read.
     cluster.heal();
-    let new_leader = cluster
-        .wait_for_leader(cluster.deadline(10))
+    let recovered =
+        config_testkit::poll_until_async(cluster.deadline(10), cluster.poll_interval(), || async {
+            for id in cluster.leaders_now() {
+                if let Ok(resp) = cluster.client(id).get(get_req("/m1-25")).await {
+                    return Some(resp);
+                }
+            }
+            None
+        })
         .await
-        .unwrap_or_else(|e| panic!("no leader after heal: {e:?}"));
-    let recovered = cluster
-        .client(new_leader)
-        .get(get_req("/m1-25"))
-        .await
-        .expect("a read after heal must succeed again");
+        .unwrap_or_else(|e| panic!("no node served the read after heal: {e}"));
     assert_eq!(
         recovered.record.as_ref().map(|r| r.value.as_ref()),
+        Some(b"v1".as_slice())
+    );
+
+    cluster.shutdown().await;
+}
+
+/// Issue #40: one read-index round that misses quorum must not fail a read that still has
+/// time left. openraft confirms leadership with one heartbeat round whose answers must land
+/// within a heartbeat; on a loaded host a follower can miss that once while the cluster is
+/// healthy. The read barrier retries `QuorumNotEnough` until the read's own deadline.
+///
+/// Deterministic, no timing: the leader's answers from both followers are dropped, so every
+/// round misses quorum. Once the engine logs a `read_index_retry` the faults are lifted, and
+/// the same read must come back with the committed value. Before the retry existed the read
+/// ended `Unavailable` on the first miss and never logged the line.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn issue_40_read_retries_a_missed_read_index_round() {
+    const METHOD: &str = "issue_40_read_retries_a_missed_read_index_round";
+    let cluster = Cluster::start(3, StorageKind::Ephemeral).await;
+    let leader = cluster.leader().await;
+    let peers: Vec<_> = cluster.followers();
+    assert_eq!(peers.len(), 2, "a 3-node cluster has two followers");
+
+    cluster
+        .client(leader)
+        .put(put_req("/issue-40", "v1"))
+        .await
+        .expect("seed write on the leader");
+
+    let net = cluster.netfault();
+    for p in &peers {
+        net.drop_response(leader, *p);
+    }
+
+    let read_client = cluster.client(leader);
+    let read_task = tokio::spawn(async move { read_client.get(get_req("/issue-40")).await });
+
+    let retried = cluster
+        .wait_for(
+            "the read to retry a missed read-index round (or to finish)",
+            cluster.deadline(10),
+            || {
+                let retry_logged =
+                    config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                        .iter()
+                        .any(|row| {
+                            row.get("@m").and_then(serde_json::Value::as_str)
+                                == Some("read_index_retry")
+                        });
+                (retry_logged || read_task.is_finished()).then_some(retry_logged)
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
+
+    cluster.heal();
+    let read = read_task.await.expect("read task panicked");
+    assert!(
+        retried,
+        "the read finished without retrying a missed read-index round: {read:?}"
+    );
+    let resp = read.expect("a read that retried inside its deadline must succeed after heal");
+    assert_eq!(
+        resp.record.as_ref().map(|r| r.value.as_ref()),
         Some(b"v1".as_slice())
     );
 
