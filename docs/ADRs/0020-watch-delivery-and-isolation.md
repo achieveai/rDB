@@ -42,7 +42,7 @@ shared with compaction") and closes the race ADR-0019 names as its open concurre
   serialize anything expensive.
 - Applying `Compact` (ADR-0019) takes the same gate around the storage call, via a hook the
   storage layer invokes immediately before and after the `Compact` batch. This is what prevents a
-  registering watch from validating `R > compact_revision` against a watermark that moves before
+  registering watch from validating `R >= compact_revision` against a watermark that moves before
   it finishes subscribing — without the shared gate, a watch could pass the check and then have
   its starting revision compacted out from under it before the broadcast subscription exists,
   producing exactly the silent-gap failure §19.6 forbids.
@@ -62,7 +62,7 @@ shared with compaction") and closes the race ADR-0019 names as its open concurre
    nothing wrong that a resume would fix; it must back off or the operator must raise the limit.
 3. Leader check via `ensure_linearizable()` (ADR-0009); a non-leader returns
    `NotLeader { validated_hint }` before any gate or journal work.
-4. Under `journal_gate`: if `R <= compact_revision`, return
+4. Under `journal_gate`: if `R < compact_revision`, return
    `RevisionCompacted { minimum_available_revision: compact_revision + 1 }` (§11.2's exact
    formula) and register nothing. Otherwise capture `H` = the current applied revision and
    subscribe to the broadcast sender. Release the gate.
@@ -106,7 +106,7 @@ revision, never key material, matching §11.3's "reveal no unauthorized key info
 
 | condition | `ConfigError` | gRPC status | trailers |
 |---|---|---|---|
-| starting revision at/below watermark | `RevisionCompacted { minimum_available_revision }` | `OUT_OF_RANGE` | `retcd-reason: revision_compacted`, `retcd-min-revision: <u64>` |
+| starting revision below watermark | `RevisionCompacted { minimum_available_revision }` | `OUT_OF_RANGE` | `retcd-reason: revision_compacted`, `retcd-min-revision: <u64>` |
 | admission limit exceeded | `ResourceExhausted { resumable: false }` | per ADR-0010 §6.2 existing `ResourceExhausted` mapping | `retcd-resumable: false` |
 | queue/byte budget exceeded, broadcast lag | `ResourceExhausted { resumable: true }` | per ADR-0010 §6.2 existing `ResourceExhausted` mapping | `retcd-resumable: true` |
 | leader changes away from this node | `NotLeader { validated_hint }` | per ADR-0010 §6.2 | leader hint metadata (ADR-0010) |
@@ -230,7 +230,7 @@ ADR-0013, ADR-0015).
 ## Verification
 
 - M4 rows for: gap-free replay/live handoff under concurrent apply (via the `gate_hooks` seam);
-  leader change mid-replay terminates with `NotLeader`; resume at/below `compact_revision` returns
+  leader change mid-replay terminates with `NotLeader`; resume below `compact_revision` returns
   `RevisionCompacted` with the exact `minimum_available_revision`; slow consumer hits the
   queue/byte limit and terminates `ResourceExhausted { resumable: true }` without measurably
   affecting apply latency of concurrent mutations (§19.12); admission limits enforced per-node and
@@ -261,10 +261,12 @@ place a later reader would otherwise have to re-derive:
   cannot be built from a node that does not exist yet. `WatchHub::new` takes only the limits and
   the clock; the reader, the authorizer and the node span arrive later through `attach`, which
   `ConfigNode::start` calls once.
-- **`compact_revision == 0` means "nothing has been deleted".** The cursor check is
+- **`compact_revision == 0` means "nothing has been deleted".** The cursor check was
   `compact_revision > 0 && start_after_revision <= compact_revision` (OQ-27). The literal form
   rejects `start_after_revision = 0` on a fresh cluster, which would break every first-time
-  watcher; `m4_57_fresh_cluster_start_after_zero` is the guard.
+  watcher; `m4_57_fresh_cluster_start_after_zero` is the guard. *Superseded on 2026-10-10: the
+  check is now `start_after_revision < compact_revision`, which needs no zero case. See the
+  amendment at the end.*
 - **A zero retention ceiling is *disabled*, not "keep nothing".** `max_age`, `max_revisions` and
   `max_bytes` are each independent, and a `0` (or an omitted key) switches that one off. Reading
   a zero literally would make a node with no `[retention]` section delete its whole journal on
@@ -327,3 +329,19 @@ what a server supports (ADR-0016).
   hop, so a registration refused at the gate still returns its slot through `Drop`. The park
   is bounded by one storage write and cannot deadlock, but it is not allowed to be a worker:
   under many concurrent registrations against a slow compaction that is worker starvation.
+
+## Amendment (2026-10-10): a cursor at the watermark is accepted
+
+- **Change.** A watch is refused only when `start_after_revision < compact_revision`, at
+  registration and at the replay page's floor check. The OQ-27 zero guard goes: no `u64` is
+  below `0`.
+- **Why.** The cursor asks for `(R, H]`; compaction to `C` deletes `1..=C`. So `R == C` needs
+  nothing deleted. Refusing it looped spec §11.2: after a compaction with no new write, `List`
+  reports `C`, the watch at `C` is refused, and the re-list reports `C` again (M9 S2a: about
+  1000 refusals a second). It also left event `C + 1` unreachable to any new watch.
+- **etcd** refuses only when `minRev < compactRev`, `minRev` being the first revision needed.
+  Here that is `R + 1 <= C`: the same rule.
+- **Unchanged.** `minimum_available_revision` stays `C + 1`, the oldest retained revision, as
+  `rdb-core`'s `WatchTermination` documents it; no wire change. No read takes a past revision,
+  so reads have no compaction boundary to move. After a restore (ADR-0024), a cursor at the
+  restored revision is now served: its state is the backup's, so nothing is missing.

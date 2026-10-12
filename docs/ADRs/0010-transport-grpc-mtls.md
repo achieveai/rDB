@@ -252,7 +252,7 @@ recorded above changes.
 M4 adds the first server-streaming RPC to the client plane, `Watch`, and it fits this ADR's
 existing surface with two additions and no changes:
 
-- **Two new trailers.** `retcd-min-revision` accompanies `OUT_OF_RANGE` (a cursor at or below
+- **Two new trailers.** `retcd-min-revision` accompanies `OUT_OF_RANGE` (a cursor below
   `compact_revision`) and carries the first revision still retained; `retcd-resumable`
   accompanies `RESOURCE_EXHAUSTED` and is `true` when the client fell behind and `false` when it
   hit an admission cap. Both are machine-readable because the two `RESOURCE_EXHAUSTED` cases call

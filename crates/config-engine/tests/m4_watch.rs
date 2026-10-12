@@ -329,7 +329,7 @@ async fn m4_52_concurrent_registrations_are_serialized() {
 // §3.5 — compacted cursors and revision boundaries
 // ---------------------------------------------------------------------------------------
 
-/// M4-53, M4-54, M4-55, M4-56: the compaction boundary, from both sides, plus the error's own
+/// M4-53, M4-54, M4-55: the compaction boundary, from both sides, plus the error's own
 /// advice.
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m4_53_compacted_cursor_boundary_and_recovery() {
@@ -360,24 +360,78 @@ async fn m4_53_compacted_cursor_boundary_and_recovery() {
     // *derived* from the floor the node is actually holding.
     assert_eq!(minimum(below), floor + 1);
 
-    // M4-54: exactly at the floor is **not** resumable — event `floor` itself is gone.
-    let at = cluster
+    // M4-54, the other side: one below the floor is refused. Event `floor` is gone, and a
+    // cursor at `floor - 1` still needs it.
+    let just_below = cluster
+        .node(leader.0)
+        .watch(&principal(), watch_request("app/", floor - 1))
+        .await
+        .err();
+    assert_eq!(minimum(just_below), floor + 1);
+
+    // M4-54: exactly at the floor **is** resumable. The cursor asks for `(floor, H]`, and
+    // compaction deleted only `1..=floor`, so the replay is complete. This exercises the
+    // replay's own floor check too, since `H > floor` here.
+    let mut at = cluster
         .node(leader.0)
         .watch(&principal(), watch_request("app/", floor))
         .await
-        .err();
-    assert_eq!(minimum(at), floor + 1);
+        .expect("a cursor exactly at the floor needs no deleted event and must be accepted");
+    assert_eq!(assert_ascending(&take(&mut at, 10).await), written[10..]);
+    drop(at);
 
-    // M4-55/M4-56: the number the error handed back is usable. The client re-`List`s to get
-    // state *through* `minimum_available_revision` and then watches after it, which is the
-    // §11.2 flow — so what arrives is everything above the first still-retained revision.
+    // M4-55: one above the floor. The error reported `floor + 1` as the oldest retained
+    // revision; watching *after* it is accepted but skips that event, so it is not a resume
+    // cursor. The recovery is to relist (§11.2) or watch at `floor`, as the clause above does.
     let mut stream = cluster
         .node(leader.0)
         .watch(&principal(), watch_request("app/", floor + 1))
         .await
-        .expect("the minimum_available_revision the error reported must be accepted");
+        .expect("a cursor above the floor must be accepted");
     let delivered = assert_ascending(&take(&mut stream, 9).await);
-    assert_eq!(delivered, written[11..]);
+    assert_eq!(
+        delivered,
+        written[11..],
+        "everything after the cursor, and so not event floor + 1"
+    );
+
+    cluster.shutdown().await;
+}
+
+/// M4-54, the case that looped: spec §11.2's list-to-watch flow right after a compaction, with
+/// no write since.
+///
+/// `List` reports the compacted revision `C` itself, because `Compact` allocates no revision.
+/// The client then watches after `C`. That asks only for events above `C`, and compaction to
+/// `C` keeps every one of them, so it must be accepted. Refusing it sent the client back to
+/// `List`, which reported `C` again: an unbounded refusal loop (observed in M9 S2a, ~1000/s).
+/// Nothing is replayed here (`H == C`), so this row isolates the registration check.
+#[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_54_list_then_watch_at_the_floor_with_no_later_write() {
+    let cluster = Cluster::formed(3).await;
+    let leader = cluster.leader();
+    let written = writes(&cluster, "app/", 5).await;
+    let floor = cluster
+        .get_node(leader)
+        .propose_compact(&principal(), written[4])
+        .await
+        .expect("compacting to the head must succeed");
+    assert_eq!(floor, written[4], "the row needs the floor at the head");
+
+    let listed = cluster.list(leader, "app/").await.expect("list");
+    assert_eq!(
+        listed.read_revision, floor,
+        "with no write since the compaction, List reports the floor itself"
+    );
+
+    let mut stream = cluster
+        .node(leader.0)
+        .watch(&principal(), watch_request("app/", listed.read_revision))
+        .await
+        .expect("a watch after the List's own revision must be accepted at the floor");
+    let next = writes(&cluster, "app/", 1).await;
+    assert_eq!(next, vec![floor + 1]);
+    assert_eq!(assert_ascending(&take(&mut stream, 1).await), next);
 
     cluster.shutdown().await;
 }

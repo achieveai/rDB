@@ -319,8 +319,8 @@ fn m4_07_compact_above_applied_revision_is_clamped() {
 
 /// An empty machine can be compacted. `Compact` on `cluster_revision == 0` clamps to 0, which
 /// is the "nothing compacted" value — so it is a no-op, and a cursor at revision 1 stays
-/// valid. OQ-27 says the check is `compact_revision > 0 && R <= compact_revision`; this is the
-/// row that keeps `0` from ever meaning "everything is gone".
+/// valid. The cursor check is `R < compact_revision` (ADR-0020), so `0` refuses nothing; this
+/// is the row that keeps `0` from ever meaning "everything is gone".
 #[config_log::retcd_test]
 fn m4_08_compact_on_an_empty_machine_is_a_noop() {
     let mut state = KvState::new();
@@ -463,10 +463,10 @@ fn m4_12_compact_is_not_rejected_by_key_or_value_caps() {
     );
 }
 
-/// M4-17 / spec §16: the compacted-cursor error names the *next usable* revision, not the
+/// M4-17 / spec §16: the compacted-cursor error names the *oldest retained* revision, not the
 /// watermark, so a client can act on it without re-deriving the `+ 1`.
 #[config_log::retcd_test]
-fn m4_13_revision_compacted_reports_the_next_usable_revision() {
+fn m4_13_revision_compacted_reports_the_oldest_retained_revision() {
     let err = ConfigError::revision_compacted(137);
 
     assert_eq!(

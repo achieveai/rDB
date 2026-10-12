@@ -216,8 +216,8 @@ pub trait StateReader: Send + Sync {
     /// The retained-history watermark (M4, ADR-0019).
     ///
     /// `0` means nothing has ever been compacted, and every revision from 1 upwards is still
-    /// resumable. A cursor `R` is refused only when `compact_revision > 0 && R <=
-    /// compact_revision` (OQ-27).
+    /// resumable. A cursor `R` is refused only when `R < compact_revision`, because only then
+    /// does it ask for a deleted event (ADR-0020, 2026-10-10 amendment).
     fn compact_revision(&self) -> Result<u64, StorageReadError>;
 
     /// Retained events with `from_exclusive < revision <= to_inclusive`, ascending, at most
