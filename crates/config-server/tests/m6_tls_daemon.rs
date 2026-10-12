@@ -179,7 +179,11 @@ async fn g01_a_document_without_the_key_starts_unchanged() {
     // at all — the byte-identical pre-G-01 document.
     let mut node = harness.start(0, true);
 
-    let health = support::health(node.health_endpoint()).await;
+    // The ready line comes before the one-voter membership commits, so a single health read
+    // can still say `ready: false`. Wait until the node is formed and serves a read.
+    let health = support::wait_formed(&harness, std::slice::from_ref(&node))
+        .await
+        .remove(0);
     assert_eq!(health.node_id, harness.nodes[0].node_id);
     assert!(
         health.ready,
