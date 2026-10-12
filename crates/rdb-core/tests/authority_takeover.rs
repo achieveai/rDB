@@ -2461,3 +2461,198 @@ fn a_grants_snapshot_record_naming_another_node_than_its_key_refreshes_nothing()
     assert_eq!(takeover_shapes(&effects), Vec::new());
     assert_eq!(kernel.view().takeover[&TAKEN], created(false));
 }
+
+// ---- A prior grant read that lands before T3's answer ------------------------------------------
+//
+// Control answers can arrive out of order: the host spawns each call on its own task. So a newer
+// read of the prior owner's grant (T6, or a grants snapshot) can land while T1's read is still
+// outstanding, and T3's answer, taken earlier, then carries an older record. The entry must start
+// from the newer of the two, or a freeze seen before T3 is lost and nothing re-reads it.
+
+/// `held()` with T1 sent for `TAKEN` at tick 10 and its `grants/{OTHER}` read not yet answered.
+fn t1_outstanding() -> Kernel {
+    let mut kernel = held();
+    kernel
+        .step(
+            &ctx(10),
+            &partition_read(10, 10, RECORD_REV, &taken(PartitionLifecycle::Fencing)),
+        )
+        .expect("T1 is built");
+    assert_ne!(
+        kernel.asked(10, OTHER),
+        UNASKED,
+        "fixture: T1 read OTHER's grant"
+    );
+    assert!(kernel.view().takeover.is_empty(), "fixture: no entry yet");
+    kernel
+}
+
+/// T3: T1's read answered with `outcome` at tick 13. Then the only later news a down owner gives,
+/// `partitions/*` still `Fencing`, and a step at [`PROOF_TICK`]; its proofs are returned.
+fn answer_t3_then_wait(kernel: &mut Kernel, outcome: ReadOutcome) -> Vec<Shape> {
+    kernel
+        .step(&ctx(13), &grant_read(kernel, 13, 10, OTHER, outcome))
+        .expect("T3 is built");
+    kernel
+        .step(
+            &ctx(14),
+            &snapshot(14, 31, &[taken(PartitionLifecycle::Fencing)]),
+        )
+        .expect("built");
+    let effects = kernel.step(&ctx(PROOF_TICK), &tick(15)).expect("built");
+    shapes(&effects)
+        .into_iter()
+        .filter(|shape| matches!(shape, Shape::Proven(..)))
+        .collect()
+}
+
+/// The freeze arrives in a grants snapshot after T1 asked and before T3's older, unfrozen answer.
+#[retcd_test]
+fn a_grants_snapshot_before_t3_answers_keeps_the_newer_freeze() {
+    let mut kernel = t1_outstanding();
+    let frozen = match prior_grant(true, FROZEN_REV) {
+        ReadOutcome::Found { value, .. } => value,
+        other => panic!("fixture: {other:?}"),
+    };
+    kernel
+        .step(
+            &ctx(12),
+            &control(
+                12,
+                12,
+                ControlEvent::FamilySnapshot {
+                    prefix: ControlPrefix::Grants,
+                    snapshot_revision: Revision(30),
+                    records: vec![ControlRecord {
+                        key: ControlKey::Grant(OTHER),
+                        revision: Revision(FROZEN_REV),
+                        value: frozen,
+                    }],
+                },
+            ),
+        )
+        .expect("built");
+
+    let proven = answer_t3_then_wait(&mut kernel, prior_grant(false, UNFROZEN_REV));
+
+    let entry = &kernel.view().takeover[&TAKEN];
+    assert_eq!(
+        entry.frozen,
+        created(true).frozen,
+        "T3 kept the newer freeze"
+    );
+    assert_eq!(entry.observed_revision, Revision(FROZEN_REV));
+    assert_eq!(
+        proven,
+        vec![Shape::Proven(
+            TAKEN,
+            proof(expiry_proven_at(PROOF_TICK), PROOF_TICK)
+        )]
+    );
+}
+
+/// The twin: the freeze arrives by T6, an uncorrelated read, before T3's older answer.
+#[retcd_test]
+fn a_t6_read_before_t3_answers_keeps_the_newer_freeze() {
+    let mut kernel = t1_outstanding();
+    kernel
+        .step(
+            &ctx(12),
+            &grant_read(&kernel, 12, 12, OTHER, prior_grant(true, FROZEN_REV)),
+        )
+        .expect("T6 is built");
+
+    let proven = answer_t3_then_wait(&mut kernel, prior_grant(false, UNFROZEN_REV));
+
+    let entry = &kernel.view().takeover[&TAKEN];
+    assert_eq!(
+        entry.frozen,
+        created(true).frozen,
+        "T3 kept the newer freeze"
+    );
+    assert_eq!(entry.observed_revision, Revision(FROZEN_REV));
+    assert_eq!(
+        proven,
+        vec![Shape::Proven(
+            TAKEN,
+            proof(expiry_proven_at(PROOF_TICK), PROOF_TICK)
+        )]
+    );
+}
+
+/// The kept record only moves forward: an older read that lands after a newer one, both before
+/// T3's answer, does not replace the freeze kept from the newer.
+#[retcd_test]
+fn an_older_read_before_t3_answers_does_not_replace_a_kept_freeze() {
+    let mut kernel = t1_outstanding();
+    kernel
+        .step(
+            &ctx(11),
+            &grant_read(&kernel, 11, 11, OTHER, prior_grant(true, FROZEN_REV)),
+        )
+        .expect("T6 is built");
+    kernel
+        .step(
+            &ctx(12),
+            &grant_read(&kernel, 12, 12, OTHER, prior_grant(false, UNFROZEN_REV)),
+        )
+        .expect("T6 is built");
+
+    let proven = answer_t3_then_wait(&mut kernel, prior_grant(false, UNFROZEN_REV));
+
+    assert_eq!(
+        kernel.view().takeover[&TAKEN].frozen,
+        created(true).frozen,
+        "the older read replaced the kept freeze"
+    );
+    assert_eq!(proven.len(), 1);
+}
+
+/// T3's own answer wins when it is the newer: a read kept before it at an older revision does not
+/// override it.
+#[retcd_test]
+fn t3_s_newer_answer_beats_an_older_read_kept_before_it() {
+    let mut kernel = t1_outstanding();
+    kernel
+        .step(
+            &ctx(12),
+            &grant_read(&kernel, 12, 12, OTHER, prior_grant(false, UNFROZEN_REV)),
+        )
+        .expect("T6 is built");
+
+    let proven = answer_t3_then_wait(&mut kernel, prior_grant(true, FROZEN_REV));
+
+    assert_eq!(
+        kernel.view().takeover[&TAKEN].frozen,
+        created(true).frozen,
+        "the older kept read overrode T3's newer answer"
+    );
+    assert_eq!(proven.len(), 1);
+}
+
+/// Only the owner T1 asked about is kept: `THIRD`'s frozen grant, read before T3 answers about
+/// `OTHER`, must not freeze the entry taken over from `OTHER`.
+#[retcd_test]
+fn a_read_of_another_owners_grant_before_t3_answers_is_not_kept() {
+    let mut kernel = t1_outstanding();
+    let third = ReadOutcome::Found {
+        revision: Revision(FROZEN_REV),
+        value: GrantRecord {
+            grant: GrantId(5),
+            node: THIRD,
+            boot: BootId(6),
+            authority_generation: AuthorityGeneration::default(),
+            expiry_utc_ms: F,
+            frozen: true,
+        }
+        .encode(),
+    };
+    kernel
+        .step(&ctx(12), &grant_read(&kernel, 12, 12, THIRD, third))
+        .expect("built");
+
+    let proven = answer_t3_then_wait(&mut kernel, prior_grant(false, UNFROZEN_REV));
+
+    assert_eq!(kernel.view().takeover[&TAKEN], created(false));
+    assert_eq!(proven, Vec::new());
+}

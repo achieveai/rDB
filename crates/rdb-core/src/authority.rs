@@ -820,12 +820,16 @@ pub struct Authority {
     quiet: Option<AuthorityIgnoreReason>,
 }
 
-/// One outstanding T1 `grants/{owner}` read: the request it was sent as, and every partition it
-/// answers for.
+/// One outstanding T1 `grants/{owner}` read: the request it was sent as, every partition it
+/// answers for, and the newest record of the owner's grant seen while it is outstanding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TakeoverRead {
     request: ControlRequestId,
     pending: BTreeMap<PartitionId, PendingTakeover>,
+    /// The newest `grants/{owner}` record a T6 read or a grants snapshot delivered before this
+    /// read was answered, at its revision. Answers can arrive out of order, so T3's answer may be
+    /// older; T3 then starts the entry from this one instead. Gone with the read.
+    newest: Option<(GrantRecord, Revision)>,
 }
 
 /// One outstanding post-`Recovered` read of `partitions/{id}`.
@@ -1658,8 +1662,8 @@ impl Authority {
     /// is down and never drains, nothing re-reads it, the entry never learns the freeze, and expiry
     /// is never proven. Discarding the records left that partition stuck. So each `grants/{n}`
     /// record goes through [`Self::refresh_prior`] at the record's own revision, exactly as T6's
-    /// read would. That stands in for the lost events only for a takeover entry that already
-    /// exists: a snapshot that lands before T3 has created the entry refreshes nothing here.
+    /// read would. Before T3 has created the entry, the record is kept on T1's outstanding read
+    /// and T3 starts from the newer of it and its own answer.
     ///
     /// An older snapshot is safe here without a family-wide age check: `refresh_prior` refreshes
     /// an entry only from a revision strictly newer than the one it last observed (A-R53.2), so a
@@ -2939,6 +2943,7 @@ impl Authority {
             TakeoverRead {
                 request,
                 pending: BTreeMap::from([(partition, read)]),
+                newest: None,
             },
         );
         vec![Self::control(
@@ -3052,16 +3057,26 @@ impl Authority {
             .find(|((_, owner), outstanding)| *owner == node && outstanding.request == request)
             .map(|(key, _)| *key);
         if let Some(key) = answered {
-            let Some(TakeoverRead { pending, .. }) = self.takeover_reads.remove(&key) else {
+            let Some(TakeoverRead {
+                pending, newest, ..
+            }) = self.takeover_reads.remove(&key)
+            else {
                 return Vec::new();
             };
             return match outcome {
                 // T5: unavailable → re-read (ADR-rdb-0007 §3), as a fresh request under the same
-                // key; the first read's id no longer matches.
+                // key; the first read's id no longer matches. `newest` starts empty: the re-read
+                // is issued after every record seen so far, so its linearizable answer is no older.
                 ReadOutcome::Unavailable => {
                     let request = self.request();
-                    self.takeover_reads
-                        .insert(key, TakeoverRead { request, pending });
+                    self.takeover_reads.insert(
+                        key,
+                        TakeoverRead {
+                            request,
+                            pending,
+                            newest: None,
+                        },
+                    );
                     vec![Self::control(
                         event,
                         ControlEffect::Get {
@@ -3076,8 +3091,14 @@ impl Authority {
                     .map(|partition| Self::deferred(event, *partition))
                     .collect(),
                 ReadOutcome::Found { .. } => {
-                    let Some((record, revision)) = decoded else {
+                    let Some((answer, answered_at)) = decoded else {
                         return vec![Self::ignored(event, AuthorityIgnoreReason::FamilyRejected)];
+                    };
+                    // A strictly newer record seen while this read was outstanding wins: the
+                    // answer was taken earlier and merely delivered later (A-R53.2's order).
+                    let (record, revision) = match newest {
+                        Some((seen, at)) if answered_at < at => (seen, at),
+                        _ => (answer, answered_at),
                     };
                     // T3: create each entry whole (A-R31).
                     let frozen = record.frozen.then_some(FrozenGrant {
@@ -3127,6 +3148,9 @@ impl Authority {
     /// unproven entry for `record.node` that `revision` is strictly newer than (A-R53.2), and
     /// defer each one it refreshed. Empty when it refreshed none.
     ///
+    /// A T1 read of `record.node` still outstanding keeps the record too, when it is strictly
+    /// newer than the one it kept, so T3 can start from it (see [`TakeoverRead::newest`]).
+    ///
     /// Shared by an uncorrelated read ([`Self::on_prior_grant_read`]) and a coherent grants
     /// snapshot ([`Self::on_family_snapshot`]). The strictly-newer test is what keeps an older
     /// snapshot, or a late read, from unfreezing an entry.
@@ -3148,6 +3172,12 @@ impl Authority {
                 });
                 entry.observed_revision = revision;
                 effects.push(Self::deferred(event, *partition));
+            }
+        }
+        for ((_, owner), outstanding) in &mut self.takeover_reads {
+            let newer = outstanding.newest.is_none_or(|(_, kept)| kept < revision);
+            if *owner == record.node && newer {
+                outstanding.newest = Some((*record, revision));
             }
         }
         effects
