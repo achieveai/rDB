@@ -2656,3 +2656,225 @@ fn a_read_of_another_owners_grant_before_t3_answers_is_not_kept() {
     assert_eq!(kernel.view().takeover[&TAKEN], created(false));
     assert_eq!(proven, Vec::new());
 }
+
+// ---- T4: an absent prior grant parks the takeover (lead ruling A-R94) ---------------------------
+//
+// T3's read of the prior owner's grant can answer `Absent`: the grant was cleared, never issued,
+// or not issued yet. The lineage is parked at the answer's `as_of`, and the next record of that
+// owner's grant strictly newer than `as_of` (T6, or a grants snapshot) creates the entry as T3
+// would. A down owner never drains, so no partitions read may ever come to retry T1.
+
+/// The revision T3's `Absent` answer is taken at.
+const ABSENT_AS_OF: u64 = 21;
+
+/// `t1_outstanding()` with T3 answered `Absent` at [`ABSENT_AS_OF`]: no entry, the lineage parked.
+fn parked_absent() -> Kernel {
+    let mut kernel = t1_outstanding();
+    let effects = kernel
+        .step(
+            &ctx(11),
+            &grant_read(
+                &kernel,
+                11,
+                10,
+                OTHER,
+                ReadOutcome::Absent {
+                    as_of: Revision(ABSENT_AS_OF),
+                },
+            ),
+        )
+        .expect("T4 is built");
+    assert_eq!(
+        shapes(&effects),
+        vec![ignored(AuthorityIgnoreReason::TakeoverDeferred, TAKEN)],
+        "fixture: T4"
+    );
+    assert!(kernel.view().takeover.is_empty(), "fixture: no entry");
+    kernel
+}
+
+/// A grants snapshot at 40 holding `OTHER`'s grant, written at `revision`.
+fn other_grant_snapshot(id: u64, frozen: bool, revision: u64) -> Event {
+    let value = match prior_grant(frozen, revision) {
+        ReadOutcome::Found { value, .. } => value,
+        other => panic!("fixture: {other:?}"),
+    };
+    control(
+        id,
+        id,
+        ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Grants,
+            snapshot_revision: Revision(40),
+            records: vec![ControlRecord {
+                key: ControlKey::Grant(OTHER),
+                revision: Revision(revision),
+                value,
+            }],
+        },
+    )
+}
+
+/// The frozen grant written after the `Absent` answer: the planner's freeze, or its frozen create.
+const FROZEN_AFTER_ABSENT: u64 = ABSENT_AS_OF + 2;
+
+/// The entry built from `OTHER`'s frozen grant at [`FROZEN_AFTER_ABSENT`].
+fn created_after_absent() -> Takeover {
+    Takeover {
+        frozen: Some(FrozenGrant {
+            expiry_utc_ms: F,
+            control_revision: Revision(FROZEN_AFTER_ABSENT),
+        }),
+        observed_revision: Revision(FROZEN_AFTER_ABSENT),
+        ..created(false)
+    }
+}
+
+/// Then the frozen record arrives, by T6 or by a grants snapshot, and expiry is proven with no
+/// further partitions read.
+#[retcd_test]
+fn t4_a_frozen_grant_after_an_absent_one_creates_the_entry_and_proves_expiry() {
+    for by_snapshot in [false, true] {
+        let mut kernel = parked_absent();
+        let news = if by_snapshot {
+            other_grant_snapshot(12, true, FROZEN_AFTER_ABSENT)
+        } else {
+            grant_read(
+                &kernel,
+                12,
+                12,
+                OTHER,
+                prior_grant(true, FROZEN_AFTER_ABSENT),
+            )
+        };
+        let effects = kernel.step(&ctx(12), &news).expect("built");
+
+        assert_eq!(
+            takeover_shapes(&effects),
+            vec![ignored(AuthorityIgnoreReason::TakeoverDeferred, TAKEN)],
+            "by_snapshot={by_snapshot}"
+        );
+        assert_eq!(
+            kernel.view().takeover[&TAKEN],
+            created_after_absent(),
+            "by_snapshot={by_snapshot}"
+        );
+        let effects = kernel.step(&ctx(PROOF_TICK), &tick(13)).expect("built");
+        assert_eq!(
+            proofs(&effects),
+            1,
+            "by_snapshot={by_snapshot}: expiry is proven"
+        );
+    }
+}
+
+/// C1 of A-R94: only a record strictly newer than the `Absent` answer, and only of the parked
+/// owner's grant, creates the entry. A rewound grants snapshot (A-R92) can carry the grant as it
+/// was before it was deleted; that must build nothing. The control at the end shows the lineage
+/// was still parked, so the refusals above are not vacuous.
+#[retcd_test]
+fn t4_a_grant_record_no_newer_than_the_absent_answer_creates_no_entry() {
+    let mut kernel = parked_absent();
+
+    kernel
+        .step(&ctx(12), &other_grant_snapshot(12, true, ABSENT_AS_OF))
+        .expect("built");
+    assert!(kernel.view().takeover.is_empty(), "a record at as_of");
+
+    let effects = kernel
+        .step(
+            &ctx(13),
+            &grant_read(&kernel, 13, 13, OTHER, prior_grant(true, ABSENT_AS_OF - 1)),
+        )
+        .expect("built");
+    assert_eq!(
+        shapes(&effects),
+        vec![ignored(AuthorityIgnoreReason::StaleAuthorityView, P1)]
+    );
+    assert!(kernel.view().takeover.is_empty(), "a record below as_of");
+
+    let third = ReadOutcome::Found {
+        revision: Revision(FROZEN_AFTER_ABSENT),
+        value: GrantRecord {
+            grant: GrantId(5),
+            node: THIRD,
+            boot: BootId(6),
+            authority_generation: AuthorityGeneration::default(),
+            expiry_utc_ms: F,
+            frozen: true,
+        }
+        .encode(),
+    };
+    kernel
+        .step(&ctx(14), &grant_read(&kernel, 14, 14, THIRD, third))
+        .expect("built");
+    assert!(kernel.view().takeover.is_empty(), "another owner's grant");
+
+    kernel
+        .step(
+            &ctx(15),
+            &grant_read(
+                &kernel,
+                15,
+                15,
+                OTHER,
+                prior_grant(true, FROZEN_AFTER_ABSENT),
+            ),
+        )
+        .expect("built");
+    assert_eq!(
+        kernel.view().takeover[&TAKEN],
+        created_after_absent(),
+        "control: the lineage was still parked"
+    );
+}
+
+/// C2 of A-R94: whatever drops a pending read drops the parked lineage too. After each of these
+/// `partitions/*` observations, the owner's later frozen grant is someone else's news.
+#[retcd_test]
+fn t4_a_dropped_lineage_is_not_resumed_by_a_later_grant_record() {
+    let cases = [
+        (
+            "serving again",
+            partition_read(12, 12, 25, &taken(PartitionLifecycle::Serving)),
+        ),
+        (
+            "ours",
+            partition_read(
+                12,
+                12,
+                25,
+                &record(TAKEN, NODE, PRIOR_EPOCH + 1, PartitionLifecycle::Serving),
+            ),
+        ),
+        ("absent", absent_read(12, 25)),
+        ("unlisted by a snapshot", snapshot(12, 30, &[])),
+    ];
+    // Every case is judged before the assert, so a red names all the cases that failed.
+    let mut seen = Vec::new();
+    let mut expected = Vec::new();
+    for (case, observation) in cases {
+        let mut kernel = parked_absent();
+        kernel.step(&ctx(12), &observation).expect("built");
+
+        let effects = kernel
+            .step(
+                &ctx(13),
+                &grant_read(
+                    &kernel,
+                    13,
+                    13,
+                    OTHER,
+                    prior_grant(true, FROZEN_AFTER_ABSENT),
+                ),
+            )
+            .expect("built");
+
+        seen.push((case, shapes(&effects), kernel.view().takeover.is_empty()));
+        expected.push((
+            case,
+            vec![ignored(AuthorityIgnoreReason::StaleAuthorityView, P1)],
+            true,
+        ));
+    }
+    assert_eq!(seen, expected);
+}

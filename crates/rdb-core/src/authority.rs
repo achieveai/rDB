@@ -799,6 +799,9 @@ pub struct Authority {
     /// [`ControlRequestId`] stored in [`TakeoverRead`], never by the key: T5's re-read keeps the
     /// key, so a late answer to the first read would otherwise pass for the re-read's.
     takeover_reads: BTreeMap<(CorrelationId, NodeId), TakeoverRead>,
+    /// T4's parked lineages, by partition: T1 read the owner's grant and it answered `Absent`
+    /// (lead ruling A-R94). Dropped with the pending reads ([`Self::drop_pending`]).
+    parked: BTreeMap<PartitionId, ParkedTakeover>,
     /// The takeover side's high-water mark over `partitions/*` (lead ruling A-R52).
     takeover_marks: TakeoverMarks,
     /// The `partitions/{id}` reads the `Recovered` trigger row issued and no answer has reached
@@ -832,6 +835,20 @@ struct TakeoverRead {
     newest: Option<(GrantRecord, Revision)>,
 }
 
+/// A T1 lineage whose `grants/{owner}` read answered `Absent` at `as_of` (T4, lead ruling A-R94).
+///
+/// Absent cannot tell a cleared grant from one not issued yet, and a prior owner that is down
+/// never drains, so no partitions read may come to retry T1. The next record of the owner's grant
+/// strictly newer than `as_of` (T6, or a grants snapshot) creates the entry as T3 would. The
+/// strictly-newer test keeps a rewound grants snapshot (A-R92) from building an entry out of a
+/// grant that was already deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParkedTakeover {
+    owner: NodeId,
+    read: PendingTakeover,
+    as_of: Revision,
+}
+
 /// One outstanding post-`Recovered` read of `partitions/{id}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecoveryRead {
@@ -859,6 +876,7 @@ impl Authority {
             takeover: BTreeMap::new(),
             revoked_epochs: BTreeSet::new(),
             takeover_reads: BTreeMap::new(),
+            parked: BTreeMap::new(),
             takeover_marks: TakeoverMarks::default(),
             recovery_reads: BTreeMap::new(),
             requests_issued: 0,
@@ -1663,7 +1681,8 @@ impl Authority {
     /// is never proven. Discarding the records left that partition stuck. So each `grants/{n}`
     /// record goes through [`Self::refresh_prior`] at the record's own revision, exactly as T6's
     /// read would. Before T3 has created the entry, the record is kept on T1's outstanding read
-    /// and T3 starts from the newer of it and its own answer.
+    /// and T3 starts from the newer of it and its own answer. After T3's read answered `Absent`,
+    /// a record strictly newer than that answer creates the entry from the parked lineage (T4).
     ///
     /// An older snapshot is safe here without a family-wide age check: `refresh_prior` refreshes
     /// an entry only from a revision strictly newer than the one it last observed (A-R53.2), so a
@@ -2858,12 +2877,13 @@ impl Authority {
         )
     }
 
-    /// Forget every outstanding T1 read for `p`.
+    /// Forget every outstanding T1 read for `p`, and `p`'s parked lineage (T4).
     fn drop_pending(&mut self, partition: PartitionId) {
         self.takeover_reads.retain(|_, outstanding| {
             outstanding.pending.remove(&partition);
             !outstanding.pending.is_empty()
         });
+        self.parked.remove(&partition);
     }
 
     /// T2 for a record that is absent: drop the entry unless it is proven, and any pending read.
@@ -3035,6 +3055,7 @@ impl Authority {
                     .values()
                     .flat_map(|outstanding| outstanding.pending.keys()),
             )
+            .chain(self.parked.keys())
             .filter(|id| !listed.contains_key(id))
             .filter(|id| self.takeover_marks.is_newer(**id, snapshot_revision))
             .copied()
@@ -3104,11 +3125,22 @@ impl Authority {
                         },
                     )]
                 }
-                // T4: no grant to take over from. The next partitions read retries.
-                ReadOutcome::Absent { .. } => pending
-                    .keys()
-                    .map(|partition| Self::deferred(event, *partition))
-                    .collect(),
+                // T4: no grant to take over from yet. Park the lineage at `as_of`; the owner's
+                // next grant record creates the entry (A-R94), and a newer partitions read still
+                // retries T1.
+                ReadOutcome::Absent { as_of } => {
+                    let mut effects = Vec::new();
+                    for (partition, read) in pending {
+                        let parked = ParkedTakeover {
+                            owner: node,
+                            read,
+                            as_of: *as_of,
+                        };
+                        self.parked.insert(partition, parked);
+                        effects.push(Self::deferred(event, partition));
+                    }
+                    effects
+                }
                 ReadOutcome::Found { .. } => {
                     let Some((answer, answered_at)) = decoded else {
                         return vec![Self::ignored(event, AuthorityIgnoreReason::FamilyRejected)];
@@ -3120,23 +3152,11 @@ impl Authority {
                         _ => (answer, answered_at),
                     };
                     // T3: create each entry whole (A-R31).
-                    let frozen = record.frozen.then_some(FrozenGrant {
-                        expiry_utc_ms: record.expiry_utc_ms,
-                        control_revision: revision,
-                    });
                     let mut effects = Vec::new();
                     for (partition, read) in pending {
-                        self.takeover.entry(partition).or_insert(Takeover {
-                            prior_node: node,
-                            prior_generation: read.generation,
-                            prior_owner_epoch: read.owner_epoch,
-                            prior_grant_id: record.grant,
-                            prior_boot_id: record.boot,
-                            frozen,
-                            observed_revision: revision,
-                            revoked_at: read.drained_at,
-                            proven: None,
-                        });
+                        self.takeover
+                            .entry(partition)
+                            .or_insert(Self::created(&record, read, revision));
                         effects.push(Self::deferred(event, partition));
                     }
                     effects
@@ -3168,7 +3188,9 @@ impl Authority {
     /// defer each one it refreshed. Empty when it refreshed none.
     ///
     /// A T1 read of `record.node` still outstanding keeps the record too, when it is strictly
-    /// newer than the one it kept, so T3 can start from it (see [`TakeoverRead::newest`]).
+    /// newer than the one it kept, so T3 can start from it (see [`TakeoverRead::newest`]). A
+    /// lineage parked by T4 becomes an entry, as T3 would create it, when `revision` is strictly
+    /// newer than the `Absent` answer (see [`ParkedTakeover`]).
     ///
     /// Shared by an uncorrelated read ([`Self::on_prior_grant_read`]) and a coherent grants
     /// snapshot ([`Self::on_family_snapshot`]). The strictly-newer test is what keeps an older
@@ -3199,7 +3221,44 @@ impl Authority {
                 outstanding.newest = Some((*record, revision));
             }
         }
+        let mut unparked = Vec::new();
+        self.parked.retain(|partition, parked| {
+            let take = parked.owner == record.node && parked.as_of < revision;
+            if take {
+                unparked.push((*partition, parked.read));
+            }
+            !take
+        });
+        for (partition, read) in unparked {
+            self.takeover
+                .entry(partition)
+                .or_insert(Self::created(record, read, revision));
+            effects.push(Self::deferred(event, partition));
+        }
         effects
+    }
+
+    /// The entry T3 creates for `read`'s lineage from the prior owner's grant `record`, read at
+    /// `revision`: whole (A-R31), frozen when the record is.
+    const fn created(record: &GrantRecord, read: PendingTakeover, revision: Revision) -> Takeover {
+        Takeover {
+            prior_node: record.node,
+            prior_generation: read.generation,
+            prior_owner_epoch: read.owner_epoch,
+            prior_grant_id: record.grant,
+            prior_boot_id: record.boot,
+            frozen: if record.frozen {
+                Some(FrozenGrant {
+                    expiry_utc_ms: record.expiry_utc_ms,
+                    control_revision: revision,
+                })
+            } else {
+                None
+            },
+            observed_revision: revision,
+            revoked_at: read.drained_at,
+            proven: None,
+        }
     }
 
     /// T11–T13: an external fence claim, bound against the takeover table rather than trusted
