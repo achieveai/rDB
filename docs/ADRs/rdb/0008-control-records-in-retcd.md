@@ -100,8 +100,8 @@ There is no multi-key transaction in rEtcd and rDB must not pretend otherwise.
   checkpoint (ADR-rdb-0007 §5).
 - rEtcd's watch is **better than §7.1 assumed**, and rDB should exploit it rather than poll.
   ADR-0020's registration sequence takes a `journal_gate` shared with compaction, checks
-  `start_after_revision > compact_revision`, captures the applied revision `H`, subscribes, replays
-  `(R, H]`, then switches to live. A stream that has not terminated has therefore **not silently
+  `start_after_revision >= compact_revision` (`>` before ADR-0020's 2026-10-10 amendment),
+  captures the applied revision `H`, subscribes, replays `(R, H]`, then switches to live. A stream that has not terminated has therefore **not silently
   skipped an event**. Gaps are typed terminations, not missing items:
 
 | Termination | Meaning | rDB response |

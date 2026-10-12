@@ -390,11 +390,10 @@ async fn e2e_24_25_compaction_via_tiny_retention_then_watch_below_watermark() {
         other => panic!("expected RevisionCompacted, got {other:?}"),
     };
 
-    // Re-watching at the reported floor succeeds. `start_after_revision` must be at least the
-    // reported `minimum_available_revision`, not `compact_revision` itself: a request one below
-    // that floor (`compact_revision`) is refused the same way `start_after_revision: 5` was,
-    // which is what this row is proving — the client must resume from the *reported* value, not
-    // from an off-by-one guess derived from `compact_revision`.
+    // A watch after the reported floor is accepted and delivers. It is not the resume cursor:
+    // the floor is the oldest *retained* revision, so watching after it skips that event. The
+    // recovery is to relist, or to watch at `minimum - 1` (`compact_revision`, ADR-0020's
+    // 2026-10-10 amendment). This row proves only that the daemon serves above the floor.
     let mut stream = ConfigStore::watch(
         &client,
         WatchRequest {
@@ -404,7 +403,7 @@ async fn e2e_24_25_compaction_via_tiny_retention_then_watch_below_watermark() {
         },
     )
     .await
-    .expect("a watch at the reported floor must be accepted");
+    .expect("a watch after the reported floor must be accepted");
     let item = stream
         .next()
         .await
@@ -507,9 +506,7 @@ async fn e2e_26_journal_survives_process_restart() {
                 WatchRequest {
                     prefix: Bytes::from_static(b"e2e26/"),
                     // The reported floor is `compact_revision + 1` (confirmed in
-                    // `e2e_24_25`): `compact_before` itself is one revision below what the
-                    // journal actually retains after compaction, so it is rejected the same
-                    // way a stale `start_after_revision` is anywhere else in this file.
+                    // `e2e_24_25`), and this row resumes from it.
                     start_after_revision: compact_before + 1,
                     progress_interval: None,
                 },

@@ -65,8 +65,8 @@ entry, symmetrically with writing no `kv` change.
   serde shape changes.
 - Invariant: `compact_revision` is monotonically non-decreasing and is the greatest revision whose
   events have been **deleted** (spec §11.2) — not merely eligible for deletion. A watch resuming
-  at `R <= compact_revision` cannot be satisfied from the journal (§11.2, §19.6) and is refused
-  (ADR-0020).
+  at `R < compact_revision` cannot be satisfied from the journal (§11.2, §19.6) and is refused
+  (ADR-0020). `R == compact_revision` asks only for retained events and is served.
 
 ### Compaction is a replicated command, not a leader side-effect
 

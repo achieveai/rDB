@@ -371,7 +371,7 @@ pub trait ConfigStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// * [`ConfigError::RevisionCompacted`] — the cursor is at or below `compact_revision`, so
+    /// * [`ConfigError::RevisionCompacted`] — the cursor is below `compact_revision`, so
     ///   the history it names is permanently gone. Recover with spec §11.2's list-to-watch
     ///   flow; do **not** retry the same cursor.
     /// * [`ConfigError::ResourceExhausted`] with `resumable: false` — an admission cap. With
