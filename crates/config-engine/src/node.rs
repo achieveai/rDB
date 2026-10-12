@@ -2013,13 +2013,19 @@ impl NodeInner {
     /// OpenRaft gives each read-index heartbeat only `heartbeat_interval` to answer, so on a
     /// loaded host a follower that is merely slow fails the round with `QuorumNotEnough` while
     /// the read's own deadline has most of its time left (issue #40). That one error is retried,
-    /// with a pause of a quarter heartbeat, until the deadline; each retry logs
-    /// `read_index_retry`. The deadline then reports the last round's reason, so a leader cut off
-    /// from its majority still says "quorum not reached", only after `read_timeout`.
+    /// after a pause of one heartbeat interval, until the deadline; each retry logs
+    /// `read_index_retry`. A pause of a full heartbeat keeps the extra rounds, and OpenRaft's
+    /// error line for each failed peer, few during a real quorum loss. A node stopped during the
+    /// pause answers `stopped`, as a call that arrives after `stop` does (M1-40).
+    ///
+    /// A leader cut off from its majority therefore fails the read after `read_timeout`, not
+    /// after one round. In process the error names the last round ("quorum not reached"). Over
+    /// gRPC with default settings the client's own deadline equals `read_timeout` and may expire
+    /// first, so a remote caller can see deadline text instead; both are `Unavailable`.
     /// `ForwardToLeader` and `Fatal` are returned at once: retrying cannot change them.
     async fn linearizable_barrier(&self) -> Result<(), ConfigError> {
         let deadline = tokio::time::Instant::now() + self.cfg.read_timeout;
-        let pause = Duration::from_millis((self.cfg.raft.heartbeat_ms / 4).max(1));
+        let pause = Duration::from_millis(self.cfg.raft.heartbeat_ms.max(1));
         let mut last_quorum_miss: Option<String> = None;
         let mut attempt: u32 = 0;
         loop {
@@ -2045,6 +2051,11 @@ impl NodeInner {
                     last_quorum_miss = Some(reason);
                     // A bounded back-off inside the read's own deadline, not synchronization.
                     tokio::time::sleep(pause).await;
+                    if self.is_stopped() {
+                        return Err(ConfigError::Unavailable {
+                            reason: "stopped".to_string(),
+                        });
+                    }
                 }
                 Ok(Err(RaftError::Fatal(fatal))) => return Err(read_fatal_to_config_error(fatal)),
                 Ok(Ok(_read_log_id)) => return Ok(()),
