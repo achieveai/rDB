@@ -2829,7 +2829,9 @@ fn t4_a_grant_record_no_newer_than_the_absent_answer_creates_no_entry() {
 }
 
 /// C2 of A-R94: whatever drops a pending read drops the parked lineage too. After each of these
-/// `partitions/*` observations, the owner's later frozen grant is someone else's news.
+/// `partitions/*` observations, the owner's later frozen grant is someone else's news. A new owner
+/// epoch is the case where a kept lineage would do harm: the entry would carry the old epoch, T3's
+/// answer for the new one could not replace it, and the sweep would prove the old epoch.
 #[retcd_test]
 fn t4_a_dropped_lineage_is_not_resumed_by_a_later_grant_record() {
     let cases = [
@@ -2848,6 +2850,15 @@ fn t4_a_dropped_lineage_is_not_resumed_by_a_later_grant_record() {
         ),
         ("absent", absent_read(12, 25)),
         ("unlisted by a snapshot", snapshot(12, 30, &[])),
+        (
+            "a new owner epoch, still fencing",
+            partition_read(
+                12,
+                12,
+                25,
+                &record(TAKEN, OTHER, PRIOR_EPOCH + 1, PartitionLifecycle::Fencing),
+            ),
+        ),
     ];
     // Every case is judged before the assert, so a red names all the cases that failed.
     let mut seen = Vec::new();
