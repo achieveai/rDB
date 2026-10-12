@@ -413,6 +413,8 @@ async fn reload(
         Ok(event) => post(&links, site, event),
         Err((kind, detail)) => fault(&links, site.node, kind, detail),
     }
+    // Held through the send on purpose: released before it, a replacement could slip in
+    // between the check and the post, and no row would go red (PR #38 re-review).
     drop(reloads);
 }
 
