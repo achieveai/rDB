@@ -2347,6 +2347,11 @@ fn a_freeze_in_a_compacted_grants_range_still_proves_expiry() {
             })),
         "fixture: the watch resumes from the snapshot: {effects:?}"
     );
+    assert_eq!(
+        takeover_shapes(&effects),
+        vec![ignored(AuthorityIgnoreReason::TakeoverDeferred, TAKEN)],
+        "the snapshot refreshes the entry as T6 would, and says so about `TAKEN`"
+    );
 
     // The only later news a down owner produces: `partitions/*` still `Fencing`.
     kernel

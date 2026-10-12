@@ -1650,15 +1650,16 @@ impl Authority {
     ///
     /// # The grants family feeds each other node's record to the takeovers (T6)
     ///
-    /// A gap reload adopts the family (ADR-rdb-0008 §4): the snapshot stands in for every watch
-    /// event the gap lost. For `grants/*` the only one of those A1 cannot get back another way is
-    /// a change to a prior owner's grant. A takeover learns that grant by an explicit read once
-    /// (T1 → T3) and every later change, the freeze above all, from the watch (T6). The planner
-    /// writes `Fencing` before it freezes, so T3 can read the grant unfrozen; if the freeze then
-    /// falls in the compacted range and the prior owner is down and never drains, nothing re-reads
-    /// it, the entry never learns the freeze, and expiry is never proven. Discarding the records
-    /// left that partition stuck. So each `grants/{n}` record with `n` not this node goes through
-    /// [`Self::refresh_prior`] at the record's own revision, exactly as T6's read would.
+    /// A gap reload adopts the family (ADR-rdb-0008 §4). For `grants/*` the only watch event a gap
+    /// loses that A1 cannot get back another way is a change to a prior owner's grant. A takeover
+    /// learns that grant by an explicit read once (T1 → T3) and every later change, the freeze
+    /// above all, from the watch (T6). The planner writes `Fencing` before it freezes, so T3 can
+    /// read the grant unfrozen; if the freeze then falls in the compacted range and the prior owner
+    /// is down and never drains, nothing re-reads it, the entry never learns the freeze, and expiry
+    /// is never proven. Discarding the records left that partition stuck. So each `grants/{n}`
+    /// record goes through [`Self::refresh_prior`] at the record's own revision, exactly as T6's
+    /// read would. That stands in for the lost events only for a takeover entry that already
+    /// exists: a snapshot that lands before T3 has created the entry refreshes nothing here.
     ///
     /// An older snapshot is safe here without a family-wide age check: `refresh_prior` refreshes
     /// an entry only from a revision strictly newer than the one it last observed (A-R53.2), so a
@@ -1688,17 +1689,15 @@ impl Authority {
             effects.extend(self.observe_snapshot(event, ctx.node, snapshot_revision, records));
         }
 
-        // Another node's grant, as T6 would have read it had the watch not gapped. Our own
-        // record keeps its renewal path. A body naming another node than its key is not that
-        // node's grant (A-R53.3).
+        // Another node's grant, as T6 would have read it had the watch not gapped. A body naming
+        // another node than its key is not that node's grant (A-R53.3).
         if prefix == ControlPrefix::Grants {
             for record in records {
                 let ControlKey::Grant(node) = record.key else {
                     continue;
                 };
-                if node == ctx.node {
-                    continue;
-                }
+                // No filter for our own record: no entry names this node as prior owner, because
+                // `observe_partition` returns early for our partitions.
                 if let Some(grant) = GrantRecord::decode(&record.value).filter(|g| g.node == node) {
                     effects.extend(self.refresh_prior(event, &grant, record.revision));
                 }
