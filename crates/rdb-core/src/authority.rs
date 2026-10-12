@@ -1652,7 +1652,7 @@ impl Authority {
     /// [`AuthorityStateView::partitions_revision`] is exactly what makes that decidable, and it
     /// is not the cursor (lead ruling A-R30).
     ///
-    /// # The grants family feeds each other node's record to the takeovers (T6)
+    /// # The grants family feeds each other node's record to the takeovers (T6; lead ruling A-R93)
     ///
     /// A gap reload adopts the family (ADR-rdb-0008 §4). For `grants/*` the only watch event a gap
     /// loses that A1 cannot get back another way is a change to a prior owner's grant. A takeover
@@ -1669,6 +1669,25 @@ impl Authority {
     /// an entry only from a revision strictly newer than the one it last observed (A-R53.2), so a
     /// rewound snapshot cannot unfreeze an entry. This node's own record is left to its renewal
     /// path, which catches a freeze or revoke of our grant at the next renewal CAS.
+    ///
+    /// # An older snapshot rewinds the cursor, and that is accepted (lead ruling A-R92, #39)
+    ///
+    /// The cursor is set and the watch re-opened from `snapshot_revision` before any age check,
+    /// for every prefix, `Partitions` included. So a snapshot older than the cursor rewinds it
+    /// and the store replays changes this kernel has already read. That is waste, not harm: a
+    /// [`ControlChange`] carries a key and a revision but no value, [`Self::reads`] turns each
+    /// into a fresh `Get` of the current value, and every read handler orders per key. Rows
+    /// `issue_39_*` in `tests/authority_partition_adopt.rs` pin it, including a key deleted and
+    /// a key moved after the newer snapshot.
+    ///
+    /// It costs more than duplicate reads, in two small ways. A replayed read of our own grant
+    /// re-arms `Renew` at `max(now, renewed_at + renew)`, which pulls a pending withheld or
+    /// unavailable retry forward. And the snapshot resets `watch_refused_attempts`, so the watch
+    /// back-off starts again. Neither changes a right or a fence. A guard that ignored the older
+    /// snapshot would remove only the waste, at the price of a new [`AuthorityIgnoreReason`]
+    /// variant, so it was not added. The simulator refuses a watch below its compaction floor
+    /// (`SimError::Config`), so a rewind under the floor is modelled by the host's
+    /// `RevisionCompacted` → `Reload` path only.
     fn on_family_snapshot(
         &mut self,
         ctx: &StepCtx<'_>,
