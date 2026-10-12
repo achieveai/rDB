@@ -44,7 +44,9 @@ already checked (ADR-0008):
      nothing in `events` to retain, and a freshly-upgraded node must not claim retention it does
      not have. A watch resuming at any `R <= cluster_revision_at_migration` correctly receives
      `RevisionCompacted` (ADR-0020) rather than silently skipping history that was genuinely never
-     recorded.
+     recorded. *Superseded 2026-10-10 (ADR-0020 amendment; note 7 at the end): only
+     `R < cluster_revision_at_migration` is refused. A watch at that revision asks for nothing
+     unrecorded and is served.*
    - `state_meta/format_version = 2`.
 3. Log `format_migrated { from: 1, to: 2 }` at `info`.
 4. Proceed to the existing identity-check / Raft-start sequence unchanged.
@@ -117,7 +119,9 @@ in, not a new rule.
   against a freshly-migrated node, for any `start_after_revision` at or below the migration-time
   `cluster_revision`, gets `RevisionCompacted` rather than a (false) successful replay of zero
   events. This is intentional and matches the semantics of `compact_revision`: it is honest about
-  what was never recorded.
+  what was never recorded. *Superseded 2026-10-10 (ADR-0020 amendment; note 7 at the end): the
+  refusal covers only `start_after_revision` below the migration-time `cluster_revision`. At it,
+  the watch is served.*
 - A future format bump (M5's `dedup` CF, spec §9.2, or any snapshot-format change) follows the
   identical shape: one new marker value, one bounded migration writing only what changed, one new
   row in a refusal matrix like this one. This ADR is the template, not a one-off.
@@ -132,7 +136,9 @@ in, not a new rule.
   produces a consistent v1 or v2 store respectively (never a directory with one of the two new
   keys but not the other); `compact_revision` after migration equals the store's
   `cluster_revision` at migration time; a watch resuming at or below that value on the
-  freshly-migrated node returns `RevisionCompacted`.
+  freshly-migrated node returns `RevisionCompacted`. *Superseded 2026-10-10 (ADR-0020
+  amendment; note 7 at the end): below that value it returns `RevisionCompacted`; at it, the
+  watch is served.*
 - Test plan: `docs/testing/test-plan-m4.md`, M4 rows for storage format v2 and migration (row IDs
   assigned when that plan is written).
 
@@ -368,3 +374,14 @@ the retry after a crash between `open_db` creating the families and the migratio
 (M4-14, M4-18), so it must still be stamped. A directory with a populated journal keeps
 whatever watermark it has. M6-R20(a) now asserts `compact_revision == 0` after the pinned-then-upgraded
 open. R1's contract is unchanged for real v1 directories.
+
+### Note 7 (2026-10-10, ADR-0020 amendment): a watch at the migration-time revision is served
+
+ADR-0020's 2026-10-10 amendment refuses a watch only when `start_after_revision <
+compact_revision`. After this migration the watermark is the migration-time `cluster_revision`,
+so a watch at exactly that revision is now served. That is still honest about what was never
+recorded: the cursor asks only for events above it, and the journal records every event from
+the first write after the migration. A cursor below it is still refused with
+`RevisionCompacted`. This supersedes step 2, the second consequence and the verification bullet
+above where they say a watch at the migration-time revision is refused, "and this is
+intentional". A future format bump written from this template keeps the strict `<`.

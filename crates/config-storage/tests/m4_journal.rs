@@ -771,7 +771,8 @@ async fn m4_17_migrated_dir_has_no_retained_history() {
     assert_eq!(
         reader.compact_revision().unwrap(),
         3,
-        "everything at or below the pre-migration revision is unresumable"
+        "no event at or below the pre-migration revision was recorded, so a cursor below it is \
+         refused (at it, served since ADR-0020's 2026-10-10 amendment)"
     );
     assert!(all_events(&reader).is_empty());
 }

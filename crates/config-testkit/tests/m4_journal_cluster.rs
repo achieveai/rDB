@@ -617,9 +617,10 @@ async fn m4_31_cursor_validates_after_compact_sees_new_watermark() {
 /// `(10, 200]`).
 ///
 /// The fix re-reads the store's `compact_revision` *after* every page: the store moves its
-/// in-memory watermark before it writes the `delete_range`, so a watermark still below `from`
-/// after the read proves the page was intact, and a watermark at or above `from` refuses with
-/// `RevisionCompacted { minimum_available_revision: compact_revision + 1 }`.
+/// in-memory watermark before it writes the `delete_range`, so a watermark still at or below
+/// `from` after the read proves the page was intact, and a watermark above `from` refuses with
+/// `RevisionCompacted { minimum_available_revision: compact_revision + 1 }` (boundary amended
+/// 2026-10-10, ADR-0020: a floor at `from` deleted nothing in `(from, to]`).
 #[config_log::retcd_test(flavor = "multi_thread", worker_threads = 4)]
 async fn m4_32_compact_while_replay_in_flight_does_not_truncate_replay() {
     let cluster = Arc::new(rocks_cluster(3).await);
@@ -669,7 +670,7 @@ async fn m4_32_compact_while_replay_in_flight_does_not_truncate_replay() {
         }
         Err(ConfigError::RevisionCompacted { .. }) => {
             // Refused outright is also legal — the registration's own validated cursor (10)
-            // was already at or below the compaction's new floor by the time it resumed.
+            // was already below the compaction's new floor by the time it resumed.
         }
         Err(other) => panic!("registration parked at BeforeReplay got neither outcome: {other}"),
     }

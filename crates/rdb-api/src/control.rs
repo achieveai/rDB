@@ -51,8 +51,12 @@ struct Site {
 }
 
 /// The newest reload of a family, running or done, and how many of its lists have failed so
-/// far (0 once it answers).
+/// far (0 once it answers). The count's allocation is also the reload's identity: a reload
+/// answers only while the map still holds its own count (M9 S2a review F-002).
 type Reloading = (JoinHandle<()>, Arc<AtomicU32>);
+
+/// The reload of each (node, prefix), shared with the reloads themselves.
+type Reloads = Arc<Mutex<BTreeMap<(NodeId, ControlPrefix), Reloading>>>;
 
 /// The control binding for every node of one process.
 pub struct ControlAdapter {
@@ -62,7 +66,7 @@ pub struct ControlAdapter {
     tasks: Mutex<Vec<JoinHandle<()>>>,
     watches: Mutex<BTreeMap<(NodeId, ControlPrefix), JoinHandle<()>>>,
     /// The reload of each (node, prefix). A newer one aborts the one it replaces.
-    reloads: Mutex<BTreeMap<(NodeId, ControlPrefix), Reloading>>,
+    reloads: Reloads,
 }
 
 impl std::fmt::Debug for ControlAdapter {
@@ -87,7 +91,7 @@ impl ControlAdapter {
             links,
             tasks: Mutex::new(Vec::new()),
             watches: Mutex::new(BTreeMap::new()),
-            reloads: Mutex::new(BTreeMap::new()),
+            reloads: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -108,12 +112,20 @@ impl ControlAdapter {
         let links = Arc::clone(&self.links);
         if let ControlEffect::Reload { prefix } = effect {
             // Only the newest reload of a family may answer: an older snapshot posted after a
-            // newer one would roll the node's cache back.
+            // newer one would roll the node's cache back. Spawned under the lock, so the new
+            // reload is in the map before it can look for itself there. `abort` only saves the
+            // older one's work; `reload` is what keeps it from answering.
             let failed = Arc::new(AtomicU32::new(0));
-            let task = self
-                .rt
-                .spawn(reload(store, links, site, prefix, Arc::clone(&failed)));
-            if let Some((old, _)) = lock(&self.reloads).insert((node, prefix), (task, failed)) {
+            let mut reloads = lock(&self.reloads);
+            let task = self.rt.spawn(reload(
+                store,
+                links,
+                Arc::clone(&self.reloads),
+                site,
+                prefix,
+                Arc::clone(&failed),
+            ));
+            if let Some((old, _)) = reloads.insert((node, prefix), (task, failed)) {
                 old.abort();
             }
             return;
@@ -352,9 +364,15 @@ async fn reload_once(store: &dyn ConfigStore, site: Site, prefix: ControlPrefix)
 /// `Reload`: list until the store answers, then post the snapshot. A transient failure waits
 /// [`reload_backoff`] and tries again, logged as `control_reload_retry` and counted
 /// in `failed` for `Db::node_status`; anything else faults the node, as before (M9 S2a, 2f).
+///
+/// It answers, snapshot or fault, only while `reloads` still holds its own `failed` for the
+/// family, and sends under that lock, which a replacement and `shutdown` both take. `abort` is
+/// not enough on its own: it lands at the next await, and the step that answers has none, so a
+/// reload replaced inside that step would still post its older answer (M9 S2a review F-002).
 async fn reload(
     store: Arc<dyn ConfigStore>,
     links: Arc<Links>,
+    reloads: Reloads,
     site: Site,
     prefix: ControlPrefix,
     failed: Arc<AtomicU32>,
@@ -378,10 +396,24 @@ async fn reload(
         }
     };
     failed.store(0, Ordering::Relaxed);
+    // `post` and `fault` take only the links' lock, never `reloads`.
+    let reloads = lock(&reloads);
+    let current = reloads
+        .get(&(site.node, prefix))
+        .is_some_and(|(_, own)| Arc::ptr_eq(own, &failed));
+    if !current {
+        tracing::debug!(
+            node = site.node.0,
+            prefix = prefix.encode(),
+            "control_reload_superseded"
+        );
+        return;
+    }
     match answer {
         Ok(event) => post(&links, site, event),
         Err((kind, detail)) => fault(&links, site.node, kind, detail),
     }
+    drop(reloads);
 }
 
 async fn cas(
@@ -1031,6 +1063,132 @@ mod tests {
         );
     }
 
+    /// PR #38 review F-001: the retry loop really waits what [`reload_backoff`] computes. On
+    /// paused time the gap between one list and the next is exact: 50 ms after the first
+    /// failure, doubling, then held at the 2 s cap, and the snapshot follows the first list
+    /// that answers.
+    #[test]
+    fn a_reload_spaces_its_lists_by_the_backoff() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let store = Arc::new(Scripted::new(Script {
+            fail_lists: 7,
+            ..Script::default()
+        }));
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        adapter.submit(
+            NodeId(1),
+            PartitionId(1),
+            CorrelationId(0),
+            ControlEffect::Reload {
+                prefix: ControlPrefix::Partitions,
+            },
+        );
+        // Paused time jumps to the next timer whenever every task waits, so this costs no wall
+        // time. 60 s of it is far past the 5.15 s the eight lists need.
+        let answer = rt.block_on(async {
+            let mailbox = async {
+                loop {
+                    if let Ok(msg) = rx.try_recv() {
+                        return msg;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(60), mailbox).await
+        });
+        adapter.shutdown();
+        assert!(
+            matches!(
+                answer,
+                Ok(Msg::Control {
+                    event: ControlEvent::FamilySnapshot { .. },
+                    ..
+                })
+            ),
+            "{answer:?}"
+        );
+        let gaps: Vec<u128> = store
+            .list_arrivals()
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).as_millis())
+            .collect();
+        assert_eq!(gaps, [50, 100, 200, 400, 800, 1600, 2000]);
+    }
+
+    /// PR #38 review F-002, follow-up: a replaced reload that is still retrying stops listing.
+    /// The newer one's check keeps the older one from answering; `abort` is what stops it from
+    /// listing a down store every 2 s until the store answers. On paused time, with every list
+    /// failing, the older reload reaches its second retry, then a newer one replaces it. Over
+    /// the next 10 s the store sees exactly one reload's lists: the newer one's, on its own
+    /// backoff from its first list.
+    #[test]
+    fn a_replaced_reload_stops_listing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let store = Arc::new(Scripted::new(Script::default()));
+        store.mem().failing_with(ConfigError::Unavailable {
+            reason: "down".to_owned(),
+        });
+        let links = Links::new();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        let reload = || {
+            adapter.submit(
+                NodeId(1),
+                PartitionId(1),
+                CorrelationId(0),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Partitions,
+                },
+            );
+        };
+        let tick = std::time::Duration::from_millis(1);
+
+        // The first list, then retries 1 and 2: three lists, the last at 150 ms.
+        reload();
+        rt.block_on(async {
+            while store.list_arrivals().len() < 3 {
+                tokio::time::sleep(tick).await;
+            }
+        });
+        reload();
+        // Paused time jumps from timer to timer, so 10 s costs no wall time. No list of the
+        // newer reload falls on the window's end (its 10th is at 9150 ms, its 11th at 11150).
+        rt.block_on(async { tokio::time::sleep(std::time::Duration::from_secs(10)).await });
+        adapter.shutdown();
+
+        let arrivals = store.list_arrivals();
+        let first = arrivals[3];
+        let offsets: Vec<u128> = arrivals[3..]
+            .iter()
+            .map(|at| (*at - first).as_millis())
+            .collect();
+        assert_eq!(
+            offsets,
+            [0, 50, 150, 350, 750, 1550, 3150, 5150, 7150, 9150],
+            "only the newer reload lists once it has replaced the older one"
+        );
+    }
+
     /// Polls `ready` every 5 ms, for up to [`PATIENCE`] stretched by the deadline scale.
     fn eventually(ready: impl Fn() -> bool) -> bool {
         let until = Instant::now() + crate::host::test_patience(PATIENCE);
@@ -1156,6 +1314,94 @@ mod tests {
             received(&rx, 0),
             Vec::<String>::new(),
             "a reload abandoned at shutdown posts nothing"
+        );
+    }
+
+    /// PR #38 review F-002: `abort` lands only at an await, so a reload replaced while it is
+    /// already inside the step that answers would still post its older snapshot. Here the older
+    /// reload's list has read the empty family and blocks its worker thread inside that step;
+    /// a record is written; the newer reload answers with it; then the older one finishes. Only
+    /// the newer snapshot ever reaches the node.
+    #[test]
+    fn a_reload_replaced_inside_its_last_step_never_posts() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(Scripted::new(Script {
+            block_lists: 1,
+            ..Script::default()
+        }));
+        let links = Links::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        let reload = || {
+            adapter.submit(
+                NodeId(1),
+                PartitionId(1),
+                CorrelationId(0),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Partitions,
+                },
+            );
+        };
+        let patience = crate::host::test_patience(PATIENCE);
+
+        reload();
+        assert!(
+            store.list_blocked(patience),
+            "the older reload's list did not read"
+        );
+        let key = ControlKey::Partition(PartitionId(1));
+        let written = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(key.encode()),
+                value: Bytes::from_static(b"newer"),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put");
+        reload();
+        let newer = format!(
+            "{:?}",
+            ControlEvent::FamilySnapshot {
+                prefix: ControlPrefix::Partitions,
+                snapshot_revision: Revision(written.revision),
+                records: vec![ControlRecord {
+                    key,
+                    revision: Revision(written.revision),
+                    value: Bytes::from_static(b"newer"),
+                }],
+            }
+        );
+        assert_eq!(
+            received(&rx, 1),
+            [newer],
+            "the newer reload answers while the older one is blocked"
+        );
+
+        store.unblock_lists();
+        // Shutting the runtime down waits for the poll the older reload is in to end, and that
+        // poll is the one that would post.
+        rt.shutdown_timeout(patience);
+        let late: Vec<String> = rx
+            .try_iter()
+            .map(|msg| match msg {
+                Msg::Control { event, .. } => format!("{event:?}"),
+                Msg::Fault { kind, .. } => format!("fault {kind}"),
+                _ => "another message".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            late,
+            Vec::<String>::new(),
+            "the replaced reload never posts"
         );
     }
 
