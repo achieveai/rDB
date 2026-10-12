@@ -34,7 +34,8 @@ use rdb_core::contracts::event::{
 };
 use rdb_core::contracts::ids::{
     AuthorityGeneration, BatchId, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
-    Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
+    Generation, GrantId, NodeId, OperationId, OwnerEpoch, PartitionId, RangeId, Revision, Seq,
+    SnapshotHandle, TimerId,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
 use rdb_core::contracts::membership::{CopyId, PartitionConfig};
@@ -44,7 +45,7 @@ use rdb_core::contracts::recovery::{
 use rdb_core::contracts::storage::{
     Namespace, SnapshotRead, StorageEvent, StorageFault, StoreEffect,
 };
-use rdb_core::contracts::time::{ControlTime, Tick, TimerFired};
+use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::Version;
 
 const NODE: NodeId = NodeId(1);
@@ -4386,4 +4387,509 @@ fn a_quiet_answer_leaves_nothing_behind_in_the_kernel() {
         stale,
         "the next answer stands alone: {next:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Issue #39: an older family snapshot rewinds the cursor and re-opens the watch from its own
+// revision, for every prefix (`on_family_snapshot` writes the cursor before the Partitions-only
+// age check). These rows ask whether the replay that follows is harmful or only wasteful.
+//
+// Two kernels from one fixture. `straight` takes the snapshot at 20 and nothing else. `rewound`
+// takes the same snapshot, then one at 10, then the watch the older snapshot re-opened replays
+// every change in (10, 20], and every `Get` that replay issues is answered with the record as it
+// stands now: a linearizable read answers the present, never the revision the change named.
+// The claim: `rewound` ends in `straight`'s state, and every extra effect is a read, a re-watch,
+// an `Ignored` or a re-arm of a timer at the deadline already armed. Nothing moves a right.
+// ---------------------------------------------------------------------------------------------
+
+/// One record of a family as a read answers it now: changed at `revision`, which is in (10, 20].
+struct Current {
+    key: ControlKey,
+    revision: u64,
+    value: Bytes,
+}
+
+/// `Held`, serving `p1` at epoch 1 from a partitions snapshot at 10, with a renewal committed at
+/// revision 15. Returns every effect the fixture produced, so a row can read the armed deadlines.
+fn rewind_fixture() -> (Authority, Vec<Effect>) {
+    let mut kernel = serving_p1(1);
+    let mut effects = kernel
+        .step(&ctx(500), &renew_due(&kernel, 30, 500))
+        .expect("RenewDue");
+    effects.extend(
+        kernel
+            .step(
+                &ctx(501),
+                &renew_answered(&kernel, 30, CasOutcome::Committed(Revision(15))),
+            )
+            .expect("the renewal commit"),
+    );
+    assert_eq!(kernel.view().record_revision, Some(Revision(15)), "fixture");
+    (kernel, effects)
+}
+
+/// Our own grant record as the fixture's renewal committed it.
+fn our_grant(kernel: &Authority) -> Bytes {
+    let held = kernel.held().expect("fixture: Held").identity();
+    GrantRecord {
+        grant: held.grant,
+        node: NODE,
+        boot: held.boot,
+        authority_generation: held.authority_generation,
+        expiry_utc_ms: kernel.view().expiry_utc_ms.expect("fixture: E"),
+        frozen: false,
+    }
+    .encode()
+}
+
+/// The deadline of the last `Arm` of each timer in `effects`, by timer id.
+fn armed_deadlines(effects: &[Effect]) -> std::collections::BTreeMap<TimerId, Tick> {
+    effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Timer(TimerEffect::Arm { id, at, .. }) => Some((*id, *at)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs the two kernels for `prefix` and asserts the replay is only waste. `at_10` is the family
+/// as the older snapshot lists it. Returns the extra effects' shapes for the row's own claims.
+fn replay_after_rewind(
+    prefix: ControlPrefix,
+    current: &[Current],
+    at_10: Vec<ControlRecord>,
+) -> Vec<Shape> {
+    let newer = event(
+        40,
+        ControlEvent::FamilySnapshot {
+            prefix,
+            snapshot_revision: Revision(20),
+            records: current
+                .iter()
+                .map(|record| ControlRecord {
+                    key: record.key,
+                    revision: Revision(record.revision),
+                    value: record.value.clone(),
+                })
+                .collect(),
+        },
+    );
+
+    let (mut straight, mut straight_effects) = rewind_fixture();
+    straight_effects.extend(
+        straight
+            .step(&ctx(600), &newer)
+            .expect("the newer snapshot"),
+    );
+
+    let (mut rewound, _) = rewind_fixture();
+    rewound.step(&ctx(600), &newer).expect("the newer snapshot");
+    assert_eq!(rewound.view(), straight.view(), "{prefix:?}: one fixture");
+
+    // The rewind itself, as the issue describes it.
+    let mut extra = rewound
+        .step(
+            &ctx(601),
+            &event(
+                41,
+                ControlEvent::FamilySnapshot {
+                    prefix,
+                    snapshot_revision: Revision(10),
+                    records: at_10,
+                },
+            ),
+        )
+        .expect("the older snapshot");
+    assert_eq!(
+        rewound.cursor(prefix),
+        Some(Revision(10)),
+        "{prefix:?}: the older snapshot rewinds the cursor (issue #39)"
+    );
+    assert!(
+        extra.iter().any(|effect| effect.kind
+            == EffectKind::Control(ControlEffect::Watch {
+                prefix,
+                from: Revision(10),
+            })),
+        "{prefix:?}: and re-opens the watch from 10: {extra:?}"
+    );
+
+    // The replay: one delivery of every change in (10, 20], then each read answered as of now.
+    let replay = rewound
+        .step(
+            &ctx(602),
+            &event(
+                42,
+                ControlEvent::Watched {
+                    prefix,
+                    cursor: WatchCursor {
+                        revision: Revision(20),
+                    },
+                    changes: current
+                        .iter()
+                        .map(|record| ControlChange {
+                            key: record.key,
+                            revision: Revision(record.revision),
+                        })
+                        .collect(),
+                },
+            ),
+        )
+        .expect("the replayed delivery");
+    let reads: Vec<(ControlRequestId, ControlKey)> = replay
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Get { request, key }) => Some((*request, *key)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        current.len(),
+        "{prefix:?}: one read per change"
+    );
+    extra.extend(replay);
+    for (n, (request, key)) in (0_u64..).zip(reads) {
+        let now = current
+            .iter()
+            .find(|record| record.key == key)
+            .expect("a read of a changed key");
+        extra.extend(
+            rewound
+                .step(
+                    &ctx(603 + n),
+                    &event(
+                        43 + n,
+                        ControlEvent::Value {
+                            request,
+                            key,
+                            outcome: ReadOutcome::Found {
+                                revision: Revision(now.revision),
+                                value: now.value.clone(),
+                            },
+                        },
+                    ),
+                )
+                .expect("the replayed read's answer"),
+        );
+    }
+
+    // State: equal, timer versions aside (a re-arm bumps the version; the deadline is below).
+    let mut after = rewound.view();
+    let before = straight.view();
+    assert!(after.timer_versions >= before.timer_versions, "{prefix:?}");
+    after.timer_versions = before.timer_versions;
+    assert_eq!(
+        after, before,
+        "{prefix:?}: the replay leaves the straight state"
+    );
+
+    // Timers: whatever the replay re-armed is armed at the deadline already standing.
+    let standing = armed_deadlines(&straight_effects);
+    for (id, at) in armed_deadlines(&extra) {
+        assert_eq!(
+            standing.get(&id),
+            Some(&at),
+            "{prefix:?}: timer {id:?} re-armed at a new deadline: {extra:?}"
+        );
+    }
+
+    // Effects: a read, a re-watch, an `Ignored` or a re-arm. Nothing that moves a right.
+    for effect in &extra {
+        let waste = matches!(
+            &effect.kind,
+            EffectKind::Control(ControlEffect::Get { .. } | ControlEffect::Watch { .. })
+                | EffectKind::Kernel(KernelEffect::Ignored { .. })
+                | EffectKind::Timer(TimerEffect::Arm { .. })
+        );
+        assert!(
+            waste,
+            "{prefix:?}: the replay did more than waste: {effect:?}"
+        );
+    }
+    shapes(&extra)
+}
+
+/// A record body no handler decodes: A1 does not read these families for their content.
+fn opaque(revision: u64) -> Bytes {
+    Bytes::from(revision.to_le_bytes().to_vec())
+}
+
+/// The families A1 never reads for content: one changed key each, whose read-back reaches
+/// `on_control`'s catch-all `Value` arm and is answered `StaleAuthorityView`.
+fn replay_of_an_unread_family(prefix: ControlPrefix, key: ControlKey) {
+    let shapes = replay_after_rewind(
+        prefix,
+        &[Current {
+            key,
+            revision: 15,
+            value: opaque(15),
+        }],
+        vec![ControlRecord {
+            key,
+            revision: Revision(9),
+            value: opaque(9),
+        }],
+    );
+    assert_eq!(
+        shapes.last(),
+        Some(&Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)),
+        "{prefix:?}: {shapes:?}"
+    );
+}
+
+/// Issue #39, `ClusterSchema`: a replayed change is one read, answered `StaleAuthorityView`.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_cluster_schema() {
+    replay_of_an_unread_family(ControlPrefix::ClusterSchema, ControlKey::ClusterSchema);
+}
+
+/// Issue #39, `Nodes`.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_nodes() {
+    replay_of_an_unread_family(ControlPrefix::Nodes, ControlKey::Node(OTHER));
+}
+
+/// Issue #39, `Routes`.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_routes() {
+    replay_of_an_unread_family(ControlPrefix::Routes, ControlKey::Route(RangeId(1)));
+}
+
+/// Issue #39, `Operations`.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_operations() {
+    replay_of_an_unread_family(
+        ControlPrefix::Operations,
+        ControlKey::Operation(OperationId(1)),
+    );
+}
+
+/// Issue #39, `PlannerGrant`.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_planner_grant() {
+    replay_of_an_unread_family(ControlPrefix::PlannerGrant, ControlKey::PlannerGrant);
+}
+
+/// Issue #39, `Grants`. Our own record (renewed at 15) reads back as `GrantRecordNotNewer` and
+/// re-arms `Renew` at the deadline the commit set; another node's record, with no takeover
+/// waiting on it, is T6's `StaleAuthorityView`.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_grants() {
+    let ours = our_grant(&rewind_fixture().0);
+    let theirs = GrantRecord {
+        grant: GrantId(77),
+        node: OTHER,
+        boot: BootId(9),
+        authority_generation: AuthorityGeneration(1),
+        expiry_utc_ms: 1,
+        frozen: false,
+    }
+    .encode();
+    let shapes = replay_after_rewind(
+        ControlPrefix::Grants,
+        &[
+            Current {
+                key: ControlKey::Grant(OTHER),
+                revision: 12,
+                value: theirs.clone(),
+            },
+            Current {
+                key: ControlKey::Grant(NODE),
+                revision: 15,
+                value: ours.clone(),
+            },
+        ],
+        vec![
+            ControlRecord {
+                key: ControlKey::Grant(OTHER),
+                revision: Revision(5),
+                value: theirs,
+            },
+            ControlRecord {
+                key: ControlKey::Grant(NODE),
+                revision: Revision(7),
+                value: ours,
+            },
+        ],
+    );
+    assert!(
+        shapes.contains(&Shape::Ignored(AuthorityIgnoreReason::GrantRecordNotNewer))
+            && shapes.contains(&Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)),
+        "both grant handlers were reached: {shapes:?}"
+    );
+}
+
+/// Issue #39, `Partitions`. The age check skips the install, but the cursor still rewinds. `p1`
+/// moved to epoch 2 at 15; the replayed read answers the lineage the snapshot at 20 installed, so
+/// it is `LineageUnchanged` (`adopt_partition`), and the takeover marks (A-R52) are already at 20.
+#[retcd_test]
+fn issue_39_replay_after_rewind_is_waste_for_partitions() {
+    let shapes = replay_after_rewind(
+        ControlPrefix::Partitions,
+        &[Current {
+            key: ControlKey::Partition(P1),
+            revision: 15,
+            value: record(P1, NODE, 2).encode(),
+        }],
+        vec![ControlRecord {
+            key: ControlKey::Partition(P1),
+            revision: Revision(9),
+            value: record(P1, NODE, 1).encode(),
+        }],
+    );
+    assert_eq!(
+        shapes.last(),
+        Some(&Shape::Ignored(AuthorityIgnoreReason::LineageUnchanged)),
+        "{shapes:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Issue #39, a key that changes later. The rows above answer every replayed read as of
+// 20, so `straight` and `rewound` saw the same world. Here the key changes *after* the newer
+// snapshot (at 25), so the replayed read answers a present the straight kernel learns only from
+// the forward watch. Oracle: `straight` = snapshot 20 then the forward change at 25;
+// `rewound` = snapshot 20, snapshot 10, the replay of (10, 20], then the same forward change.
+// ---------------------------------------------------------------------------------------------
+
+/// one `Watched` delivery of `changes` at `cursor`, every read answered
+/// with `outcome`. Returns all effects.
+fn deliver_watched(
+    kernel: &mut Authority,
+    base: u64,
+    cursor: u64,
+    changes: &[u64],
+    outcome: &ReadOutcome,
+) -> Vec<Effect> {
+    let mut effects = kernel
+        .step(
+            &ctx(700 + base),
+            &event(
+                100 + base,
+                ControlEvent::Watched {
+                    prefix: ControlPrefix::Partitions,
+                    cursor: WatchCursor {
+                        revision: Revision(cursor),
+                    },
+                    changes: changes
+                        .iter()
+                        .map(|revision| ControlChange {
+                            key: ControlKey::Partition(P1),
+                            revision: Revision(*revision),
+                        })
+                        .collect(),
+                },
+            ),
+        )
+        .expect("delivery");
+    let reads: Vec<ControlRequestId> = effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Get { request, .. }) => Some(*request),
+            _ => None,
+        })
+        .collect();
+    for (n, request) in (1_u64..).zip(reads) {
+        effects.extend(
+            kernel
+                .step(
+                    &ctx(700 + base + n),
+                    &event(
+                        100 + base + n,
+                        ControlEvent::Value {
+                            request,
+                            key: ControlKey::Partition(P1),
+                            outcome: outcome.clone(),
+                        },
+                    ),
+                )
+                .expect("answer"),
+        );
+    }
+    effects
+}
+
+fn replay_of_a_key_changed_after_the_newer_snapshot(now: ReadOutcome) {
+    let at_20 = event(
+        40,
+        ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Partitions,
+            snapshot_revision: Revision(20),
+            records: vec![ControlRecord {
+                key: ControlKey::Partition(P1),
+                revision: Revision(15),
+                value: record(P1, NODE, 2).encode(),
+            }],
+        },
+    );
+    let (mut straight, _) = rewind_fixture();
+    straight.step(&ctx(600), &at_20).expect("20");
+    let straight_effects = deliver_watched(&mut straight, 50, 25, &[25], &now);
+
+    let (mut rewound, _) = rewind_fixture();
+    rewound.step(&ctx(600), &at_20).expect("20");
+    rewound
+        .step(
+            &ctx(601),
+            &event(
+                41,
+                ControlEvent::FamilySnapshot {
+                    prefix: ControlPrefix::Partitions,
+                    snapshot_revision: Revision(10),
+                    records: vec![ControlRecord {
+                        key: ControlKey::Partition(P1),
+                        revision: Revision(9),
+                        value: record(P1, NODE, 1).encode(),
+                    }],
+                },
+            ),
+        )
+        .expect("10");
+    let mut rewound_effects = deliver_watched(&mut rewound, 10, 20, &[15], &now);
+    rewound_effects.extend(deliver_watched(&mut rewound, 50, 25, &[25], &now));
+
+    let mut after = rewound.view();
+    let before = straight.view();
+    after.timer_versions = before.timer_versions;
+    assert_eq!(
+        fences(&straight_effects).len(),
+        1,
+        "{now:?}: control: the change fences p1"
+    );
+    assert_eq!(after, before, "{now:?}: same end state");
+    assert_eq!(
+        fences(&rewound_effects),
+        fences(&straight_effects),
+        "{now:?}: exactly the fences the forward read gives"
+    );
+    let rights = |effects: &[Effect]| {
+        shapes(effects)
+            .into_iter()
+            .filter(|shape| !matches!(shape, Shape::Ignored(_) | Shape::Other))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rights(&rewound_effects),
+        rights(&straight_effects),
+        "{now:?}: same right-moving effects, in order"
+    );
+}
+
+/// `p1` deleted at 25, after the newer snapshot.
+#[retcd_test]
+fn issue_39_replay_of_a_key_deleted_after_the_newer_snapshot() {
+    replay_of_a_key_changed_after_the_newer_snapshot(ReadOutcome::Absent {
+        as_of: Revision(25),
+    });
+}
+
+/// `p1` moved to another owner at 25, after the newer snapshot.
+#[retcd_test]
+fn issue_39_replay_of_a_key_moved_after_the_newer_snapshot() {
+    replay_of_a_key_changed_after_the_newer_snapshot(ReadOutcome::Found {
+        revision: Revision(25),
+        value: record(P1, OTHER, 3).encode(),
+    });
 }

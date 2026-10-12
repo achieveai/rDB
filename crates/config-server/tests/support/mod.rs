@@ -1097,6 +1097,103 @@ pub async fn health(endpoint: &str) -> Health {
         .unwrap_or_else(|e| panic!("health payload from {endpoint} did not parse ({e}): {body}"))
 }
 
+/// The key [`wait_formed`] reads. Nothing writes it; a read of an absent key is still a full
+/// linearizable read, so the probe changes no state, revision or journal.
+pub const FORMED_PROBE_KEY: &str = "/__formed_probe";
+
+/// Wait until the cluster is formed **and serves a linearizable read** (issue #40).
+///
+/// Health reporting one leader, the full voter set and `ready` on every node is not enough: the
+/// leader's first read-index round still needs a majority to answer its heartbeat within one
+/// heartbeat interval, and on a loaded host that round can fail (`Unavailable ... quorum not
+/// reached for a linearizable read`) for a moment after health says formed. So each poll also
+/// reads [`FORMED_PROBE_KEY`] through the leader that health names, as [`PRINCIPAL`] over mutual
+/// TLS. `Unavailable` and `NotLeader` are retried until the bound; any other error panics at once.
+///
+/// Returns the health payloads of the poll whose read succeeded, so a caller's leader is the one
+/// that just served it.
+pub async fn wait_formed(harness: &Harness, nodes: &[DaemonProcess]) -> Vec<Health> {
+    wait_formed_reading(harness, nodes, FORMED_PROBE_KEY).await
+}
+
+/// [`wait_formed`], reading `probe_key` instead: for a cluster whose policy does not grant
+/// [`PRINCIPAL`] a read of [`FORMED_PROBE_KEY`].
+pub async fn wait_formed_reading(
+    harness: &Harness,
+    nodes: &[DaemonProcess],
+    probe_key: &str,
+) -> Vec<Health> {
+    use config_core::{ConfigError, ConfigStore, GetRequest};
+
+    let endpoints: Vec<String> = nodes
+        .iter()
+        .map(|n| n.health_endpoint().to_string())
+        .collect();
+    let voters: Vec<u64> = nodes.iter().map(DaemonProcess::node_id).collect();
+    let last = Mutex::new(String::from("no poll completed"));
+    let result =
+        config_testkit::poll::poll_until_async(deadline(10), Duration::from_millis(50), || async {
+            let mut payloads = Vec::with_capacity(endpoints.len());
+            for endpoint in &endpoints {
+                payloads.push(health(endpoint).await);
+            }
+            let formed = payloads
+                .iter()
+                .all(|p| p.membership_voter_ids == voters && p.current_leader.is_some() && p.ready);
+            if !formed {
+                *last.lock().expect("last") = format!("health not formed: {payloads:#?}");
+                return None;
+            }
+            let leader = payloads[0].current_leader.expect("checked above");
+            let pin = nodes
+                .iter()
+                .find(|n| n.node_id() == leader)
+                .unwrap_or_else(|| panic!("health names leader {leader}, not a spawned node"))
+                .client_endpoint();
+            let client = config_client::GrpcClient::connect(
+                nodes
+                    .iter()
+                    .map(|n| n.client_endpoint().to_string())
+                    .collect(),
+                config_client::GrpcClientOptions {
+                    request_deadline: deadline(2),
+                    tls: config_client::TlsMode::MutualTls(harness.tls.client_mtls(PRINCIPAL)),
+                    ..config_client::GrpcClientOptions::default()
+                },
+            )
+            .expect("the client plane endpoints are well formed")
+            .with_cluster_id(harness.cluster_id)
+            .pinned(pin)
+            .expect("the leader is a configured endpoint");
+            let read = client
+                .get(GetRequest {
+                    key: bytes::Bytes::copy_from_slice(probe_key.as_bytes()),
+                })
+                .await;
+            match read {
+                Ok(_) => Some(payloads),
+                Err(e @ (ConfigError::Unavailable { .. } | ConfigError::NotLeader { .. })) => {
+                    *last.lock().expect("last") =
+                        format!("linearizable read of {probe_key} through leader {leader}: {e}");
+                    None
+                }
+                Err(e) => panic!(
+                    "linearizable read of {probe_key} through leader {leader} failed with a \
+                     non-transient error: {e}"
+                ),
+            }
+        })
+        .await;
+    match result {
+        Ok(payloads) => payloads,
+        Err(timeout) => panic!(
+            "the cluster did not form and serve a linearizable read within {:?}; last: {}",
+            timeout.elapsed,
+            last.lock().expect("last")
+        ),
+    }
+}
+
 /// A minimal HTTP/1.1 `GET`, returning the response body.
 ///
 /// The health endpoint answers one request per connection and closes, so "read to EOF" is the

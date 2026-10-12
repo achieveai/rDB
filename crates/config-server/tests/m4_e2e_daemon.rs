@@ -3,9 +3,10 @@
 //!
 //! This file does not edit `e2e_daemon.rs` (another tester owns it live) or `support/`; it uses
 //! both. Every convenience function `e2e_daemon.rs` keeps private to itself
-//! (`wait_formed`/`client_for`/`cluster_client`/`put_keys`/`leader_index`/`wait_for_all`) is
-//! reimplemented locally, verbatim in spirit, because a private `fn` in one integration-test
-//! binary is not visible to another (each `tests/*.rs` file is its own crate).
+//! (`client_for`/`cluster_client`/`put_keys`/`leader_index`/`wait_for_all`) is reimplemented
+//! locally, verbatim in spirit, because a private `fn` in one integration-test binary is not
+//! visible to another (each `tests/*.rs` file is its own crate). `wait_formed` is shared from
+//! `support` (issue #40).
 //!
 //! Two rows are **not** attempted here, with the precise gap recorded rather than silently
 //! skipped:
@@ -42,7 +43,8 @@ use config_testkit::poll::{poll_until_async, Timeout};
 use futures::StreamExt;
 
 use support::{
-    daemon, deadline, startup_deadline, DaemonProcess, Harness, Health, NodeOptions, PRINCIPAL,
+    daemon, deadline, startup_deadline, wait_formed, DaemonProcess, Harness, Health, NodeOptions,
+    PRINCIPAL,
 };
 
 // --------------------------------------------------------------------------------------------
@@ -92,20 +94,6 @@ async fn wait_for_all(
             panic!("{what} did not hold within {elapsed:?}; last health payloads: {last:#?}")
         }
     }
-}
-
-async fn wait_formed(nodes: &[DaemonProcess]) -> Vec<Health> {
-    let endpoints: Vec<String> = nodes
-        .iter()
-        .map(|n| n.health_endpoint().to_string())
-        .collect();
-    let voters: Vec<u64> = nodes.iter().map(DaemonProcess::node_id).collect();
-    wait_for_all(&endpoints, "the cluster to form", |payloads| {
-        payloads
-            .iter()
-            .all(|p| p.membership_voter_ids == voters && p.current_leader.is_some() && p.ready)
-    })
-    .await
 }
 
 fn leader_index(health: &[Health], nodes: &[DaemonProcess]) -> usize {
@@ -269,7 +257,7 @@ async fn e2e_20_capabilities_report_retained_watch() {
     );
 
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let client = cluster_client(&harness, &nodes)
         .pinned(nodes[leader].client_endpoint())
@@ -316,7 +304,7 @@ async fn e2e_24_25_compaction_via_tiny_retention_then_watch_below_watermark() {
     }
 
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let client = cluster_client(&harness, &nodes)
         .pinned(nodes[leader].client_endpoint())
@@ -439,7 +427,7 @@ async fn e2e_26_journal_survives_process_restart() {
     }
 
     let nodes = harness.start_all();
-    let health_before = wait_formed(&nodes).await;
+    let health_before = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health_before, &nodes);
     let client = cluster_client(&harness, &nodes)
         .pinned(nodes[leader].client_endpoint())
@@ -472,7 +460,7 @@ async fn e2e_26_journal_survives_process_restart() {
         .map(|index| harness.start(index, false))
         .collect();
 
-    let health_after = wait_formed(&restarted).await;
+    let health_after = wait_formed(&harness, &restarted).await;
     let compact_after: Vec<u64> = health_after.iter().map(|p| p.compact_revision).collect();
     let hash_after: Vec<String> = health_after
         .iter()
@@ -491,10 +479,10 @@ async fn e2e_26_journal_survives_process_restart() {
     let client_after = cluster_client(&harness, &restarted)
         .pinned(restarted[leader_after].client_endpoint())
         .expect("the leader is a configured endpoint");
-    // `wait_formed` only checks the health payload's `current_leader`/voter agreement, not
-    // whether the just-elected leader has completed the read-index round a linearizable watch
-    // needs (`ensure_linearizable()`); immediately after a fresh election that round can still
-    // be in flight, which surfaces as a transient `Unavailable`. Retry on that one error class
+    // `wait_formed` has seen one linearizable read succeed through this leader (issue #40), but
+    // the watch runs its own read-index round (`ensure_linearizable()`), and on a loaded host a
+    // follower that misses that round's heartbeat deadline still surfaces as a transient
+    // `Unavailable`. Retry on that one error class
     // within a bounded poll rather than adding a sleep before the first attempt — the client
     // itself must still make exactly one call per successful open (M4-106/M4-107's rule), so
     // this loop is the test polling readiness, not the client silently resuming a stream.

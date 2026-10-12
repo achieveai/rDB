@@ -47,6 +47,13 @@ suite.
   be able to stop working on a read whatever a caller claims to be willing to wait — but a test
   that sets a generous client deadline and expects it to be the binding one is testing a
   configuration it does not have.
+- **2026-10-12: a missed read-index round is retried inside that cap (#40).** OpenRaft gives
+  each round one heartbeat interval, so a slow follower can fail it (`QuorumNotEnough`) while
+  the read has time left. The barrier retries `QuorumNotEnough`, one heartbeat apart, until
+  `read_timeout`. So a leader cut off from its majority answers `Unavailable` after the read
+  deadline, not after one heartbeat. In process the reason names the missed quorum. Over gRPC
+  with default settings the client deadline equals `read_timeout` and may fire first, so a
+  remote caller can see deadline text instead.
 
 Consequence for tests: wait on OpenRaft's `last_applied` (`ConfigNode::wait_applied`, or a
 `wait_until` predicate over `NodeMetrics::last_applied`) before asserting a linearizable read,

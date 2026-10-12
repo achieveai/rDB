@@ -1991,35 +1991,74 @@ impl NodeInner {
             });
         }
 
-        match tokio::time::timeout(self.cfg.read_timeout, self.raft.ensure_linearizable()).await {
-            // A read has no side effects, so an expired deadline is plainly retryable.
-            Err(_) => Err(ConfigError::Unavailable {
-                reason: "read deadline exceeded before the linearizable barrier".to_string(),
-            }),
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f)))) => {
-                Err(self.not_leader(f.leader_id.map(NodeId)))
+        self.linearizable_barrier().await?;
+        let mut project = Some(project);
+        let mut out = None;
+        self.reader.with_state(&mut |s| {
+            if let Some(f) = project.take() {
+                out = Some(f(s, &validated));
             }
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(e)))) => {
-                Err(ConfigError::Unavailable {
-                    reason: format!("quorum not reached for a linearizable read: {e}"),
-                })
-            }
-            Ok(Err(RaftError::Fatal(fatal))) => Err(read_fatal_to_config_error(fatal)),
-            Ok(Ok(_read_log_id)) => {
-                let mut project = Some(project);
-                let mut out = None;
-                self.reader.with_state(&mut |s| {
-                    if let Some(f) = project.take() {
-                        out = Some(f(s, &validated));
+        });
+        // `StateReader::with_state` is contracted to call its closure exactly once.
+        // A store that broke that contract would be returning no state at all, so the
+        // honest answer is a retryable `Unavailable` naming the broken contract —
+        // panicking inside a client call would take the whole node's runtime with it.
+        out.ok_or_else(|| ConfigError::Unavailable {
+            reason: "state reader did not yield applied state".to_string(),
+        })
+    }
+
+    /// `ensure_linearizable` under one `read_timeout` deadline for the whole call.
+    ///
+    /// OpenRaft gives each read-index heartbeat only `heartbeat_interval` to answer, so on a
+    /// loaded host a follower that is merely slow fails the round with `QuorumNotEnough` while
+    /// the read's own deadline has most of its time left (issue #40). That one error is retried,
+    /// after a pause of one heartbeat interval, until the deadline; each retry logs
+    /// `read_index_retry`. A pause of a full heartbeat keeps the extra rounds, and OpenRaft's
+    /// error line for each failed peer, few during a real quorum loss. A node stopped during the
+    /// pause answers `stopped`, as a call that arrives after `stop` does (M1-40).
+    ///
+    /// A leader cut off from its majority therefore fails the read after `read_timeout`, not
+    /// after one round. In process the error names the last round ("quorum not reached"). Over
+    /// gRPC with default settings the client's own deadline equals `read_timeout` and may expire
+    /// first, so a remote caller can see deadline text instead; both are `Unavailable`.
+    /// `ForwardToLeader` and `Fatal` are returned at once: retrying cannot change them.
+    async fn linearizable_barrier(&self) -> Result<(), ConfigError> {
+        let deadline = tokio::time::Instant::now() + self.cfg.read_timeout;
+        let pause = Duration::from_millis(self.cfg.raft.heartbeat_ms.max(1));
+        let mut last_quorum_miss: Option<String> = None;
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match tokio::time::timeout_at(deadline, self.raft.ensure_linearizable()).await {
+                // A read has no side effects, so an expired deadline is plainly retryable.
+                Err(_) => {
+                    return Err(ConfigError::Unavailable {
+                        reason: last_quorum_miss.unwrap_or_else(|| {
+                            "read deadline exceeded before the linearizable barrier".to_string()
+                        }),
+                    })
+                }
+                Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f)))) => {
+                    return Err(self.not_leader(f.leader_id.map(NodeId)))
+                }
+                Ok(Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(e)))) => {
+                    let reason = format!("quorum not reached for a linearizable read: {e}");
+                    if tokio::time::Instant::now() + pause >= deadline {
+                        return Err(ConfigError::Unavailable { reason });
                     }
-                });
-                // `StateReader::with_state` is contracted to call its closure exactly once.
-                // A store that broke that contract would be returning no state at all, so the
-                // honest answer is a retryable `Unavailable` naming the broken contract —
-                // panicking inside a client call would take the whole node's runtime with it.
-                out.ok_or_else(|| ConfigError::Unavailable {
-                    reason: "state reader did not yield applied state".to_string(),
-                })
+                    tracing::debug!(attempt, error = %e, "read_index_retry");
+                    last_quorum_miss = Some(reason);
+                    // A bounded back-off inside the read's own deadline, not synchronization.
+                    tokio::time::sleep(pause).await;
+                    if self.is_stopped() {
+                        return Err(ConfigError::Unavailable {
+                            reason: "stopped".to_string(),
+                        });
+                    }
+                }
+                Ok(Err(RaftError::Fatal(fatal))) => return Err(read_fatal_to_config_error(fatal)),
+                Ok(Ok(_read_log_id)) => return Ok(()),
             }
         }
     }
@@ -2095,26 +2134,11 @@ impl NodeInner {
                 reason: "stopped".to_string(),
             });
         }
-        match tokio::time::timeout(self.cfg.read_timeout, self.raft.ensure_linearizable()).await {
-            Err(_) => {
-                return Err(ConfigError::Unavailable {
-                    reason: "read deadline exceeded before the linearizable barrier".to_string(),
-                })
-            }
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f)))) => {
-                return Err(self.not_leader(f.leader_id.map(NodeId)))
-            }
-            Ok(Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(e)))) => {
-                return Err(ConfigError::Unavailable {
-                    reason: format!("quorum not reached for a linearizable read: {e}"),
-                })
-            }
-            Ok(Err(RaftError::Fatal(fatal))) => return Err(read_fatal_to_config_error(fatal)),
-            // A quorum just confirmed this node is the leader, which is a stronger statement
-            // than the metrics watcher's eventual view - publish it so the stream this call
-            // is about to open does not terminate on a stale `NotLeader`.
-            Ok(Ok(_read_log_id)) => self.watch.note_leader(),
-        }
+        self.linearizable_barrier().await?;
+        // A quorum just confirmed this node is the leader, which is a stronger statement
+        // than the metrics watcher's eventual view - publish it so the stream this call
+        // is about to open does not terminate on a stale `NotLeader`.
+        self.watch.note_leader();
         self.watch
             .open(
                 principal,

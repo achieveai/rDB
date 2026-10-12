@@ -32,8 +32,8 @@ use config_log::retcd_test;
 use config_testkit::poll::{poll_until_async, Timeout};
 
 use support::{
-    daemon, deadline, startup_deadline, DaemonProcess, Harness, Health, NodeOptions, PolicyFixture,
-    PRINCIPAL, UNLISTED_PRINCIPAL,
+    daemon, deadline, startup_deadline, wait_formed, DaemonProcess, Harness, Health, NodeOptions,
+    PolicyFixture, PRINCIPAL, UNLISTED_PRINCIPAL,
 };
 
 // =====================================================================================
@@ -692,32 +692,6 @@ fn client_as(harness: &Harness, nodes: &[DaemonProcess], principal: &str) -> Grp
     .with_cluster_id(harness.cluster_id)
 }
 
-/// Poll every node's health until one leader and the full voter set are agreed.
-async fn wait_formed(nodes: &[DaemonProcess]) -> Vec<Health> {
-    let endpoints: Vec<String> = nodes
-        .iter()
-        .map(|n| n.health_endpoint().to_string())
-        .collect();
-    let voters: Vec<u64> = nodes.iter().map(DaemonProcess::node_id).collect();
-    let result = poll_until_async(deadline(10), Duration::from_millis(50), || async {
-        let mut payloads = Vec::with_capacity(endpoints.len());
-        for endpoint in &endpoints {
-            payloads.push(support::health(endpoint).await);
-        }
-        payloads
-            .iter()
-            .all(|p: &Health| {
-                p.membership_voter_ids == voters && p.current_leader.is_some() && p.ready
-            })
-            .then_some(payloads)
-    })
-    .await;
-    match result {
-        Ok(payloads) => payloads,
-        Err(Timeout { elapsed, .. }) => panic!("the cluster did not form within {elapsed:?}"),
-    }
-}
-
 /// Which spawned node the cluster currently calls leader.
 fn leader_index(health: &[Health], nodes: &[DaemonProcess]) -> usize {
     let leader = health[0]
@@ -877,7 +851,7 @@ async fn m5_110_required_metric_names_are_present() {
         "[dedup]\nenabled = true\nwindow_requests = 8\nmax_records = 64\n",
     )
     .await;
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let client = client_as(&harness, &nodes, PRINCIPAL);
 
@@ -1028,7 +1002,7 @@ async fn m5_110_signed_mode_rows_match_the_exporter() {
     process
         .wait_ready(startup_deadline())
         .unwrap_or_else(|e| panic!("the daemon never announced itself: {e}"));
-    let health = wait_formed(std::slice::from_ref(&process)).await;
+    let health = wait_formed(&harness, std::slice::from_ref(&process)).await;
     assert_eq!(health[0].policy_version, Some(4), "{:#?}", health[0]);
 
     let body = scrape(&process).await;
@@ -1229,7 +1203,7 @@ async fn m5_113_metric_cardinality_is_bounded() {
     const CEILING: usize = 300;
 
     let (harness, nodes) = three_nodes(METHOD, "").await;
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = &nodes[leader_index(&health, &nodes)];
     let client = client_as(&harness, &nodes, PRINCIPAL);
 
@@ -1325,7 +1299,7 @@ async fn m5_113_metric_cardinality_is_bounded() {
 async fn m5_114_derived_raft_metrics_match_their_sources() {
     const METHOD: &str = "m5_114_derived_raft_metrics_match_their_sources";
     let (harness, nodes) = three_nodes(METHOD, "").await;
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let client = client_as(&harness, &nodes, PRINCIPAL);
 

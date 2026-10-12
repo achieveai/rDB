@@ -36,9 +36,9 @@ use tonic::transport::{Channel, Endpoint};
 use tracing::Instrument;
 
 use support::{
-    daemon, deadline, startup_deadline, DaemonProcess, DaemonSpec, GossipKeyOptions, Harness,
-    Health, ListTuning, NodeOptions, PolicyFixture, RetentionTuning, NODE_IDS, PRINCIPAL,
-    UNLISTED_PRINCIPAL,
+    daemon, deadline, startup_deadline, wait_formed, wait_formed_reading, DaemonProcess,
+    DaemonSpec, GossipKeyOptions, Harness, Health, ListTuning, NodeOptions, PolicyFixture,
+    RetentionTuning, NODE_IDS, PRINCIPAL, UNLISTED_PRINCIPAL,
 };
 
 /// A client over every daemon's client plane, presenting `principal`'s certificate.
@@ -88,21 +88,6 @@ async fn wait_for_all(
     }
 }
 
-/// Wait until every node agrees on one leader and the full voter set.
-async fn wait_formed(nodes: &[DaemonProcess]) -> Vec<Health> {
-    let endpoints: Vec<String> = nodes
-        .iter()
-        .map(|n| n.health_endpoint().to_string())
-        .collect();
-    let voters: Vec<u64> = nodes.iter().map(DaemonProcess::node_id).collect();
-    wait_for_all(&endpoints, "the cluster to form", |payloads| {
-        payloads
-            .iter()
-            .all(|p| p.membership_voter_ids == voters && p.current_leader.is_some() && p.ready)
-    })
-    .await
-}
-
 /// Which node the cluster currently calls leader.
 fn leader_index(health: &[Health], nodes: &[DaemonProcess]) -> usize {
     let leader = health[0]
@@ -146,7 +131,7 @@ async fn put_keys(client: &GrpcClient, prefix: &str, count: usize) -> Vec<u64> {
 async fn e2e_01_three_processes_form_cluster() {
     let harness = Harness::new("e2e_01_three_processes_form_cluster").await;
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
 
     assert_eq!(
         health[0].membership_voter_ids,
@@ -215,7 +200,7 @@ async fn e2e_02_capabilities_from_cli() {
 
     // The running node must agree with what the flag promised.
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     // The health payload renders `authz_kind` in snake_case because it is the engine's own
     // enum (it can also say `missing`/`invalid`, which the capability report cannot express).
     assert_eq!(health[0].durability, reported["durability"]);
@@ -232,7 +217,7 @@ async fn e2e_02_capabilities_from_cli() {
 async fn e2e_03_conformance_over_grpc_mtls_to_daemons() {
     let harness = Harness::new("e2e_03_conformance_over_grpc_mtls_to_daemons").await;
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let client = cluster_client(&harness, &nodes)
@@ -255,7 +240,7 @@ async fn e2e_03_conformance_over_grpc_mtls_to_daemons() {
 async fn e2e_04_kill_leader_process_elects_new_leader() {
     let harness = Harness::new("e2e_04_kill_leader_process_elects_new_leader").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let client = cluster_client(&harness, &nodes);
@@ -291,7 +276,7 @@ async fn e2e_04_kill_leader_process_elects_new_leader() {
 async fn e2e_05_no_data_loss_after_process_kill() {
     let harness = Harness::new("e2e_05_no_data_loss_after_process_kill").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let client = cluster_client(&harness, &nodes);
@@ -356,7 +341,7 @@ async fn e2e_05_no_data_loss_after_process_kill() {
 async fn e2e_06_killed_node_restarts_and_catches_up() {
     let harness = Harness::new("e2e_06_killed_node_restarts_and_catches_up").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let victim = (leader + 1) % nodes.len();
 
@@ -402,7 +387,7 @@ async fn e2e_06_killed_node_restarts_and_catches_up() {
 async fn e2e_07_writes_continue_while_one_process_dead() {
     let harness = Harness::new("e2e_07_writes_continue_while_one_process_dead").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let victim = (leader + 1) % nodes.len();
 
@@ -427,7 +412,7 @@ async fn e2e_07_writes_continue_while_one_process_dead() {
 async fn e2e_08_cold_restart_whole_cluster() {
     let harness = Harness::new("e2e_08_cold_restart_whole_cluster").await;
     let mut nodes = harness.start_all();
-    let before = wait_formed(&nodes).await;
+    let before = wait_formed(&harness, &nodes).await;
 
     let client = cluster_client(&harness, &nodes);
     put_keys(&client, "/k/", 15).await;
@@ -444,7 +429,7 @@ async fn e2e_08_cold_restart_whole_cluster() {
     let nodes: Vec<DaemonProcess> = (0..harness.nodes.len())
         .map(|index| harness.start(index, false))
         .collect();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
     // A node whose log was ahead of its state machine at shutdown applies the tail only after
     // the new leader commits it, so the revision is a bounded wait, not an immediate assert.
     let endpoints: Vec<String> = nodes
@@ -479,7 +464,7 @@ async fn e2e_08_cold_restart_whole_cluster() {
 async fn e2e_09_graceful_shutdown_is_clean() {
     let harness = Harness::new("e2e_09_graceful_shutdown_is_clean").await;
     let mut nodes = harness.start_all();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
 
     let victim = nodes.len() - 1;
     let log_file = nodes[victim].log_file();
@@ -580,6 +565,42 @@ async fn harness_start_retries_a_node_whose_port_was_taken() {
     }
 }
 
+/// Issue #40: `wait_formed` returns only after a linearizable read through the leader has
+/// succeeded, not merely once health says formed. A single voter whose policy grants
+/// [`PRINCIPAL`] reads under `/granted/` only: the wait reading there returns, and the default
+/// wait, whose probe key is outside the grant, fails loudly instead of calling the cluster formed.
+#[retcd_test]
+async fn harness_wait_formed_requires_a_linearizable_read() {
+    use futures::FutureExt;
+
+    const METHOD: &str = "harness_wait_formed_requires_a_linearizable_read";
+    let harness = Harness::with_nodes(METHOD, &[1]).await;
+    std::fs::write(
+        &harness.policy,
+        format!(
+            "[[grant]]\nprincipal = \"{PRINCIPAL}\"\nprefix = \"/granted/\"\naccess = [\"read\", \"write\"]\n"
+        ),
+    )
+    .expect("narrow the allowlist");
+    let nodes = harness.start_all();
+
+    let health = wait_formed_reading(&harness, &nodes, "/granted/probe").await;
+    assert_eq!(health[0].current_leader, Some(1));
+
+    let refused = std::panic::AssertUnwindSafe(wait_formed(&harness, &nodes))
+        .catch_unwind()
+        .await
+        .expect_err("a probe read the policy refuses must not count as formed");
+    let message = refused
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or("panic with a non-string payload");
+    assert!(
+        message.contains(support::FORMED_PROBE_KEY) && message.contains("non-transient"),
+        "the refusal must name the probe key and the error: {message}"
+    );
+}
+
 /// Take node index `index`'s peer port, start the node through `Harness::start`, and let go of
 /// the port only once the daemon has logged its `bind_failed` refusal.
 fn start_with_peer_port_taken(harness: &Harness, index: usize, form: bool) -> DaemonProcess {
@@ -623,7 +644,7 @@ fn start_with_peer_port_taken(harness: &Harness, index: usize, form: bool) -> Da
 async fn e2e_10_cross_process_trace_correlation() {
     let harness = Harness::new("e2e_10_cross_process_trace_correlation").await;
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let client = cluster_client(&harness, &nodes)
@@ -714,7 +735,7 @@ async fn e2e_10_cross_process_trace_correlation() {
 async fn e2e_11_per_process_log_files_exist_and_are_tagged() {
     let harness = Harness::new("e2e_11_per_process_log_files_exist_and_are_tagged").await;
     let nodes = harness.start_all();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
 
     for node in &nodes {
         let lines = support::log_lines(&node.log_file());
@@ -815,7 +836,7 @@ async fn e2e_12_insecure_refused_at_process_level() {
 async fn e2e_13_unlisted_principal_denied_at_process_level() {
     let harness = Harness::new("e2e_13_unlisted_principal_denied_at_process_level").await;
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let client = client_for(
@@ -860,7 +881,7 @@ async fn e2e_13_unlisted_principal_denied_at_process_level() {
 async fn e2e_14_identity_mismatch_at_process_level() {
     let harness = Harness::new("e2e_14_identity_mismatch_at_process_level").await;
     let mut nodes = harness.start_all();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
 
     // Stop nodes 2 and 3, then swap the data directories their configurations name.
     for index in [1, 2] {
@@ -932,7 +953,7 @@ async fn e2e_14_identity_mismatch_at_process_level() {
 async fn e2e_15_unknown_outcome_at_process_level() {
     let harness = Harness::new("e2e_15_unknown_outcome_at_process_level").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let client = client_for(
@@ -1022,7 +1043,7 @@ async fn e2e_16_crash_kill_loses_no_acknowledged_mutation() {
 
     let harness = Harness::new("e2e_16_crash_kill_loses_no_acknowledged_mutation").await;
     let mut nodes = harness.start_all();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
 
     let client = cluster_client(&harness, &nodes);
     let mut written = 0u64;
@@ -1397,7 +1418,7 @@ async fn collect_until(
 async fn e2e_21_watch_across_a_leader_kill() {
     let harness = Harness::new("e2e_21_watch_across_a_leader_kill").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
 
     let write_client = cluster_client(&harness, &nodes);
@@ -1506,7 +1527,7 @@ async fn e2e_21_watch_across_a_leader_kill() {
 async fn e2e_22_watch_survives_follower_kill() {
     let harness = Harness::new("e2e_22_watch_survives_follower_kill").await;
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let victim = (leader + 1) % nodes.len();
     assert_ne!(
@@ -1623,7 +1644,7 @@ async fn e2e_38_dedup_resubmit_after_leader_kill_at_process_level() {
     }
 
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let survivor = (leader + 1) % nodes.len();
     assert_ne!(
@@ -1817,7 +1838,7 @@ async fn e2e_44_daemon_pagination_across_a_leader_failover() {
     }
 
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let killed_id = nodes[leader].node_id();
 
@@ -3013,7 +3034,7 @@ async fn e2e_45_daemon_restore_refuses_the_client_plane_without_a_policy() {
         src.write_node_files(node, &src_options);
     }
     let mut src_nodes = src.start_all();
-    wait_formed(&src_nodes).await;
+    wait_formed_reading(&src, &src_nodes, "/e45/__formed_probe").await;
 
     let src_client = cluster_client(&src, &src_nodes);
     let revisions = put_keys(&src_client, E45_PREFIX, E45_KEYS).await;
@@ -3333,7 +3354,7 @@ async fn e2e_41_daemon_tls_rotation_with_restart_free_continuity() {
     }
 
     let mut nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let pids_before: Vec<u32> = nodes.iter().map(DaemonProcess::pid).collect();
 
     let leader = leader_index(&health, &nodes);
@@ -3677,7 +3698,7 @@ async fn e2e_43_daemon_gossip_key_rotation_with_one_node_down() {
     let node2 = harness.start(2, false);
     let mut nodes = vec![node0, node1, node2];
 
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     let leader = leader_index(&health, &nodes);
     let leader_id = nodes[leader].node_id();
     // Never the leader — the row's "the cluster never loses its leader" claim would otherwise
@@ -3771,7 +3792,7 @@ async fn e2e_43_daemon_gossip_key_rotation_with_one_node_down() {
     harness.write_node_files(&harness.nodes[target], &restart_options);
     nodes[target] = harness.start(target, false);
 
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
     // Recomputed here, not reused from before the restart: `--health-listen` binds an ephemeral
     // port, so the restarted node almost certainly answers on a different one than it did before
     // `stop_gracefully` — an endpoint list captured earlier would poll a now-dead port.
@@ -3941,8 +3962,8 @@ async fn e42_write_phase(
 /// [`wait_formed`] alone is not enough here: it needs every node to name *a* leader, and a
 /// node restarted a moment ago can still name a leader the others have moved on from.
 /// [`leader_index`] reads node 1's view, and node 1 is the last node this row restarts.
-async fn e42_leader_now(nodes: &[DaemonProcess]) -> (usize, Vec<Health>) {
-    wait_formed(nodes).await;
+async fn e42_leader_now(harness: &Harness, nodes: &[DaemonProcess]) -> (usize, Vec<Health>) {
+    wait_formed(harness, nodes).await;
     let endpoints: Vec<String> = nodes
         .iter()
         .map(|n| n.health_endpoint().to_string())
@@ -4047,7 +4068,7 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
     let node2 = e42_start(&harness, 2, false, Some(1));
     let node0 = e42_start(&harness, 0, true, Some(1));
     let mut nodes = vec![node0, node1, node2];
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     assert!(
         health.iter().all(|p| p.schema == COMPAT_SCHEMA_1),
         "every node must advertise exactly the v1 ceiling before any restart: {health:#?}"
@@ -4075,7 +4096,7 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
     e42_quiesce_and_converge(&nodes).await;
     e42_stop_for_restart(&harness, &mut nodes, 2).await;
     nodes[2] = e42_start(&harness, 2, false, None);
-    let (leader, health) = e42_leader_now(&nodes).await;
+    let (leader, health) = e42_leader_now(&harness, &nodes).await;
     assert_eq!(
         health[2].schema, CURRENT_SCHEMA,
         "the restarted node must advertise the current schema, not the pinned one"
@@ -4093,7 +4114,7 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
     e42_quiesce_and_converge(&nodes).await;
     e42_stop_for_restart(&harness, &mut nodes, 1).await;
     nodes[1] = e42_start(&harness, 1, false, None);
-    let (leader, health) = e42_leader_now(&nodes).await;
+    let (leader, health) = e42_leader_now(&harness, &nodes).await;
     assert_eq!(
         health[1].schema, CURRENT_SCHEMA,
         "the restarted node must advertise the current schema, not the pinned one"
@@ -4132,7 +4153,7 @@ async fn e2e_42_daemon_rolling_upgrade_v1_to_v2() {
     )
     .await;
     nodes[0] = e42_start(&harness, 0, false, None);
-    let (leader, health) = e42_leader_now(&nodes).await;
+    let (leader, health) = e42_leader_now(&harness, &nodes).await;
     assert_eq!(
         health[0].schema, CURRENT_SCHEMA,
         "the restarted node must advertise the current schema, not the pinned one"
