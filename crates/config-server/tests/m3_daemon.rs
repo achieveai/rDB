@@ -54,7 +54,8 @@ use config_testkit::manifest::{Manifest, ManifestFixture, Tamper};
 use config_testkit::poll::{poll_until_async, Timeout};
 
 use support::{
-    daemon, deadline, startup_deadline, DaemonProcess, Harness, Health, NodeOptions, PRINCIPAL,
+    daemon, deadline, startup_deadline, wait_formed, DaemonProcess, Harness, Health, NodeOptions,
+    PRINCIPAL,
 };
 
 /// A client over `endpoints`, presenting `principal`'s certificate.
@@ -102,21 +103,6 @@ async fn wait_for_all(
             panic!("{what} did not hold within {elapsed:?}; last health payloads: {last:#?}")
         }
     }
-}
-
-/// Wait until every node agrees on one leader and the full voter set.
-async fn wait_formed(nodes: &[DaemonProcess]) -> Vec<Health> {
-    let endpoints: Vec<String> = nodes
-        .iter()
-        .map(|n| n.health_endpoint().to_string())
-        .collect();
-    let voters: Vec<u64> = nodes.iter().map(DaemonProcess::node_id).collect();
-    wait_for_all(&endpoints, "the cluster to form", |payloads| {
-        payloads
-            .iter()
-            .all(|p| p.membership_voter_ids == voters && p.current_leader.is_some() && p.ready)
-    })
-    .await
 }
 
 /// The daemon's own JSONL lines whose `@m` equals `startup_failed`, for `method`.
@@ -433,7 +419,7 @@ async fn m3_46_capabilities_cli_matches_runtime() {
     assert_eq!(reported["dedup"], "Unsupported");
 
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     assert_eq!(health[0].durability, reported["durability"]);
     assert_eq!(health[0].authz_kind, "static_allowlist");
     assert_eq!(reported["authz"], "StaticAllowlist");
@@ -455,7 +441,7 @@ async fn m3_46_capabilities_cli_matches_runtime() {
 async fn m3_66_valid_manifest_forms_cluster() {
     let harness = Harness::new("m3_66_valid_manifest_forms_cluster").await;
     let nodes = harness.start_all();
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     for h in &health {
         assert_eq!(h.membership_voter_ids, vec![1, 2, 3]);
     }
@@ -668,7 +654,7 @@ async fn m3_72_manifest_cluster_id_must_match_node_identity() {
 async fn m3_73_manifest_is_not_authority_after_formation() {
     let harness = Harness::new("m3_73_manifest_is_not_authority_after_formation").await;
     let mut nodes = harness.start_all();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
 
     let client = cluster_client(&harness, &nodes);
     let before = client
@@ -698,7 +684,7 @@ async fn m3_73_manifest_is_not_authority_after_formation() {
 
     nodes[0] = harness.start(0, false);
 
-    let health = wait_formed(&nodes).await;
+    let health = wait_formed(&harness, &nodes).await;
     assert_eq!(health[0].node_id, 1);
 
     // Replication with the real node 2 still works: a write after the restart converges on

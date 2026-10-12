@@ -38,7 +38,8 @@ use config_log::retcd_test;
 use config_testkit::poll::{poll_until_async, Timeout};
 
 use support::{
-    deadline, DaemonProcess, Harness, Health, ListTuning, NodeOptions, PolicyFixture, PRINCIPAL,
+    deadline, wait_formed, DaemonProcess, Harness, ListTuning, NodeOptions, PolicyFixture,
+    PRINCIPAL,
 };
 
 /// Keys written under [`PREFIX`]. Comfortably more than three pages, so a walk that silently
@@ -67,31 +68,6 @@ fn cluster_client(harness: &Harness, nodes: &[DaemonProcess]) -> GrpcClient {
     )
     .expect("the client plane endpoints are well formed")
     .with_cluster_id(harness.cluster_id)
-}
-
-/// Wait until every node agrees on one leader and the full voter set.
-async fn wait_formed(nodes: &[DaemonProcess]) {
-    let endpoints: Vec<String> = nodes
-        .iter()
-        .map(|n| n.health_endpoint().to_string())
-        .collect();
-    let voters: Vec<u64> = nodes.iter().map(DaemonProcess::node_id).collect();
-    let result = poll_until_async(deadline(10), Duration::from_millis(50), || async {
-        let mut payloads = Vec::with_capacity(endpoints.len());
-        for endpoint in &endpoints {
-            payloads.push(support::health(endpoint).await);
-        }
-        payloads
-            .iter()
-            .all(|p: &Health| {
-                p.membership_voter_ids == voters && p.current_leader.is_some() && p.ready
-            })
-            .then_some(())
-    })
-    .await;
-    if let Err(Timeout { elapsed, .. }) = result {
-        panic!("the cluster did not form within {elapsed:?}");
-    }
 }
 
 /// Write [`POPULATION`] keys under [`PREFIX`], so that a walk of [`PAGE`] records paginates.
@@ -165,7 +141,7 @@ async fn e2e_m6_wiring_a_pinned_walk_returns_every_key_once_and_ignores_a_mid_wa
     );
 
     let mut nodes = harness.start_all();
-    wait_formed(&nodes).await;
+    wait_formed(&harness, &nodes).await;
     let client = cluster_client(&harness, &nodes);
 
     seed_prefix(&client).await;
@@ -290,7 +266,7 @@ async fn m6_32_a_policy_adoption_invalidates_an_outstanding_page_token() {
 
     let mut node = harness.start(0, true);
     let nodes = std::slice::from_ref(&node);
-    wait_formed(nodes).await;
+    wait_formed(&harness, nodes).await;
     let endpoint = node.health_endpoint().to_string();
     let client = cluster_client(&harness, nodes);
     seed_prefix(&client).await;
