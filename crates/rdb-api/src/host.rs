@@ -2578,6 +2578,7 @@ impl Host {
             RecoveryPhase::Committed
                 | RecoveryPhase::Rebuilding
                 | RecoveryPhase::ActivationProposed
+                | RecoveryPhase::ActivationUnresolved
         ) {
             return None;
         }
@@ -3916,6 +3917,69 @@ mod tests {
             );
             (Instant::now() >= quiet_until).then_some(())
         });
+    }
+
+    /// A-R102 addendum, item 3, at the host (W10-D1): a resolving activation still names the
+    /// pinned configuration. Node 1 starts with its links to 2 and 3 held, so F1 commits
+    /// `ReadOnly` and rebuilds; the control store goes down before the links heal, so the
+    /// activation CAS answers `Unavailable` and F1 waits in `ActivationUnresolved`. A
+    /// `SyncWalThrough` asked then is served from the pinned configuration (`rebuild_pinned`),
+    /// as in `Committed`, `Rebuilding` and `ActivationProposed`. When the store answers again,
+    /// writes resume with no restart (Walk 10's r24n, which used to stay `Blocked`).
+    /// Integration (~3 s): bootstrap's discovery window, then the activation's own deadline.
+    #[config_log::retcd_test]
+    fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
+        const METHOD: &str = "a_resolving_activation_still_serves_syncs_from_the_pinned_configuration";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        trio.bootstrap();
+        trio.until("F1 rebuilding on node 1", |trio| {
+            (trio.status(0).recovery.as_deref() == Some("Rebuilding")).then_some(())
+        });
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.links.heal_all();
+        trio.until("F1 resolving on node 1", |trio| {
+            (trio.status(0).recovery.as_deref() == Some("ActivationUnresolved")).then_some(())
+        });
+
+        let pinned_asks_of_copy_2 = || {
+            logged!(METHOD, "rebuild_pinned")
+                .into_iter()
+                .filter(|line| line["node"] == 1 && line["copy"] == 2)
+                .count()
+        };
+        let before = pinned_asks_of_copy_2();
+        let sync = RecoveryEffect::SyncWalThrough {
+            copy: CopyId(2),
+            cutoff: Seq::ZERO,
+        };
+        let site = Site {
+            partition: PartitionId(1),
+            correlation: CorrelationId(0),
+        };
+        trio.nodes[0]
+            .0
+            .recovery_effect(&sync, site)
+            .expect("sync effect");
+        assert_eq!(
+            trio.status(0).recovery.as_deref(),
+            Some("ActivationUnresolved"),
+            "precondition: still resolving when the sync was asked"
+        );
+        assert_eq!(
+            pinned_asks_of_copy_2(),
+            before + 1,
+            "a sync asked while resolving is served from the pinned configuration"
+        );
+
+        trio.mem.stop_failing();
+        trio.ready();
+        assert_eq!(trio.status(0).recovery.as_deref(), Some("Committed"));
     }
 
     /// Tester gap G2 (2026-10-07, mutant M4): once F1 sends its post-commit sync, the rebuild

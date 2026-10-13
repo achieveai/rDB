@@ -545,6 +545,9 @@ const STUCK: &str =
 /// Not fenced, with A1's self-replace stopped (W8-D1): stuck, as [`gave_up_line`] says.
 ///
 /// F1 blocked comes first (W10-D1): stuck, as [`blocked_line`] says, over any other reason.
+/// F1 resolving its activation resumes by itself ([`resolving_line`]), over the fence's resume
+/// line and the held-link line, but never over a stuck state: a fence nothing lifts, a stopped
+/// self-replace, or a restart with L1 refusing. After a restart, the pause follows the resume.
 fn ready_reason(
     owner: &NodeStatus,
     admits: bool,
@@ -560,8 +563,10 @@ fn ready_reason(
     }
     let gave_up =
         (!admits && fence.is_none() && owner.replace_stopped).then(|| gave_up_line(owner));
+    let resolving = resolving_line(owner)
+        .filter(|_| !admits && fence.is_none_or(|reason| fence_lifts(owner, reason)));
     let Some(note) = restart_note else {
-        if let Some(line) = gave_up {
+        if let Some(line) = gave_up.or(resolving) {
             return Some(line);
         }
         return match (fence, links_wait(owner, held)) {
@@ -585,6 +590,9 @@ fn ready_reason(
     }
     if let Some(line) = gave_up {
         return Some(format!("{line}; {note}"));
+    }
+    if let Some(line) = resolving {
+        return Some(format!("{line}; once they resume, they {pause}"));
     }
     Some(match fence {
         Some(reason) if fence_lifts(owner, reason) => {
@@ -620,14 +628,27 @@ fn links_wait<'a>(owner: &'a NodeStatus, held: &[(NodeId, NodeId)]) -> Option<(&
 }
 
 /// The line for F1 `Blocked(<reason>)` on node 1: recovery cannot finish, so writes stay out
-/// whatever the grant, the links or L1 do (W10-D1, tester r24n: an activation CAS unanswered
-/// with the store down, `Blocked(ControlUnknown)`, writes never back). It names the reason and
-/// promises no way out: whether a later fence unblocks it is the kernel's open ruling.
+/// whatever the grant, the links or L1 do (W10-D1). Since A-R102 an unanswered activation
+/// resolves instead ([`resolving_line`]), so this is only the recovery CAS or a real dead end.
+/// It names the reason and promises no way out.
 fn blocked_line(owner: &NodeStatus) -> Option<String> {
     let recovery = owner.recovery.as_deref()?;
     recovery
         .starts_with("Blocked(")
         .then(|| format!("node {}'s recovery is {recovery}, so {STUCK}", owner.node.0))
+}
+
+/// The line for F1 `ActivationUnresolved` on node 1: the activation CAS went unanswered (tester
+/// r24n: the store down), and F1 reads and proposes again by itself once the store answers
+/// (A-R102), so writes come back with no restart.
+fn resolving_line(owner: &NodeStatus) -> Option<String> {
+    (owner.recovery.as_deref() == Some("ActivationUnresolved")).then(|| {
+        format!(
+            "node {}'s recovery is waiting for the control store to confirm activation; writes \
+             resume by themselves once it answers",
+            owner.node.0
+        )
+    })
 }
 
 /// The line for A1 `unheld` with its self-replace stopped (`replace_stopped`): a freeze, or a
@@ -2076,6 +2097,77 @@ mod tests {
                 "{node:?}"
             );
         }
+    }
+
+    /// Walk 10, W10-D1 after the kernel fix (A-R102 and its addendum): r24n's activation CAS,
+    /// unanswered with the store down, now leaves F1 in `ActivationUnresolved`, and F1 resolves
+    /// by itself once the store answers. So the line says writes wait for the store and resume
+    /// by themselves, over the fence's resume line, and `ready` follows once they do. A stuck
+    /// state still wins: a fence nothing lifts, a self-replace that stopped, or a restart with
+    /// L1 refusing keeps the stay-stopped line. After a restart with L1 healthy, the pause
+    /// promise follows the resume. Driven directly from r24n's states. Unit.
+    #[test]
+    fn a_resolving_activation_says_writes_resume_once_the_store_answers() {
+        let resolving = "node 1's recovery is waiting for the control store to confirm \
+                         activation; writes resume by themselves once it answers";
+        let with = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let fenced = |recovery: &str| with("fenced(Expired)", recovery, Some(DenyReason::Expired));
+        let held_links = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+        let mut serving = owner(None, true);
+        serving.authority = "held(grant 2)".to_owned();
+        serving.protection = Some("healthy".to_owned());
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (fenced("Rebuilding"), &held_links[..]),
+            (fenced("ActivationProposed"), &[][..]),
+            (fenced("ActivationUnresolved"), &[][..]),
+            (with("held(grant 2)", "ActivationUnresolved", None), &[][..]),
+            (serving, &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .skip(2)
+        .collect();
+        assert_eq!(
+            lines,
+            [format!("not ready: writes not admitted: {resolving}"), "ready".to_owned()]
+        );
+
+        let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[]);
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
+        healthy.protection = Some("healthy".to_owned());
+        assert_eq!(
+            reason(&healthy, Some(note)),
+            Some(format!(
+                "{resolving}; once they resume, they pause soon, at the latest about \
+                 {PAUSE_AGE_SECS} s after the next write, because {note}"
+            ))
+        );
+        let paused = with("held(grant 2)", "ActivationUnresolved", None);
+        assert_eq!(reason(&paused, Some(note)), Some(format!("{note}; {STUCK}")));
+        let frozen = with(
+            "fenced(Frozen)",
+            "ActivationUnresolved",
+            Some(DenyReason::Frozen),
+        );
+        assert_eq!(
+            reason(&frozen, None),
+            Some(format!(
+                "node 1's grant is fenced(Frozen); nothing in M9 replaces it, so {STUCK}"
+            ))
+        );
+        let mut stopped = with("unheld", "ActivationUnresolved", None);
+        stopped.replace_stopped = true;
+        assert_eq!(reason(&stopped, None), Some(gave_up_line(&stopped)));
     }
 
     /// Walk 8, W8-D1 (tester r6_3200): a freeze landed while A1 was between grants. A1 lost
