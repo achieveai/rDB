@@ -727,6 +727,66 @@ mod tests {
         assert_eq!(grant_revision(&store, &rt), Some(garbled));
     }
 
+    /// Review F-024 (mutant U4): a delete the store refused before proposing it, `Unavailable`
+    /// or `NotLeader`, deleted nothing, and says so; any other delete error may have reached
+    /// the store, so it says `no_mutation=false` and to run it again to see. Only the transient
+    /// ones say a jittered retry helps. Unit (~20 ms): the scripted store fails the delete only.
+    #[test]
+    fn a_delete_the_store_refused_before_proposing_says_nothing_deleted_and_no_other_does() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for (case, error, retry, no_mutation) in [
+            (
+                "unavailable",
+                ConfigError::Unavailable {
+                    reason: "down".to_owned(),
+                },
+                RetryRule::BoundedJitter,
+                true,
+            ),
+            (
+                "not leader",
+                ConfigError::NotLeader { hint: None },
+                RetryRule::BoundedJitter,
+                true,
+            ),
+            (
+                "permission",
+                ConfigError::PermissionDenied {
+                    detail: "no delete on grants/".to_owned(),
+                },
+                RetryRule::NotWired,
+                false,
+            ),
+        ] {
+            let store = Scripted::new(Script {
+                fail_delete_with: Some(error),
+                ..Script::default()
+            });
+            let (db, _mailbox, written) = restarted_owner(&store, &rt);
+            let refused = rt
+                .block_on(clear_grant(&db, &store, OWNER))
+                .expect_err(case);
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::Unavailable, retry, no_mutation),
+                "{case}: {refused:?}"
+            );
+            assert!(
+                refused.detail.contains("delete grants/1"),
+                "{case}: {refused:?}"
+            );
+            let tail = if no_mutation {
+                "nothing deleted"
+            } else {
+                "the delete may have applied; run it again to read where it stands"
+            };
+            assert!(refused.detail.ends_with(tail), "{case}: {refused:?}");
+            assert_eq!(grant_revision(&store, &rt), Some(written), "{case}");
+        }
+    }
+
     fn put_at(
         store: &dyn ConfigStore,
         rt: &tokio::runtime::Runtime,

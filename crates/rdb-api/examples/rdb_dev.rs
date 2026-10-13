@@ -151,12 +151,14 @@ use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
 use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
-use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
+use rdb_api::{ApiError, Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::authority::DenyReason;
 use rdb_core::contracts::control::ControlKey;
-use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, PartitionId, RequestId};
+use rdb_core::contracts::errors::RetryRule;
+use rdb_core::contracts::event::Budgets;
+use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 
 use hostile_store::{HostileStore, ListFault};
@@ -495,38 +497,78 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                     seen.waiting = Some(why);
                 }
             }
+        } else if db.restart_failed(NodeId(1)) {
+            if let Some(line) = stopped_owner_step(&mut seen, db.restart_note().as_deref()) {
+                say(&line);
+            }
         }
         drop(seen);
         std::thread::sleep(Duration::from_millis(100));
     }
 }
 
-/// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. A
-/// restart wins. While node 1 still admits writes, it says they are about to pause: L1 keeps
-/// admitting for about 2 s after a secondary restarts (walk 6c), or after a fence until about
-/// 2 s after the next write (tester q8), so a bare `ready` there is true and misleading
-/// (Message 7). Both pauses fall within about 2 s of the next write (F-015). Once they pause, it
-/// says nothing brings them back in this run (D2).
+/// L1's pause age, in whole seconds rounded up, under the budgets [`Db::open`] runs every node
+/// with: a write made while a copy is out stays unsafe and pauses writes this long after it.
+const PAUSE_AGE_SECS: u64 = Budgets::SPEC_DEFAULTS.pause_age_millis.div_ceil(1000);
+
+/// What a line says when nothing in M9 brings writes back.
+const STUCK: &str =
+    "writes stay stopped for this run: to write again, quit and start rdb_dev again";
+
+/// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. Each
+/// part is derived from the state that decides it (tester walk 7, W7-D1, W7-D2).
 ///
-/// Then a fenced grant. While A1's self-replace poll is live it looks stuck but is not: A1
-/// replaces the grant itself once the old one's expiry is proven, and a restart there would end
-/// recovery for the run (Message 6). The line promises that only while the poll is live and the
-/// reason is not one [`never_replaced`] names (F-004): once the poll stopped (a frozen, foreign
-/// or deleted record, F-016), nothing in M9 lifts the fence.
+/// After a restart (`restart_note`), while node 1 still admits writes, L1 pauses them soon: on
+/// its own within about 2 s of the restart (walk 6c, tester r1, with no write), and at the
+/// latest about [`PAUSE_AGE_SECS`] after the next write, which stays unsafe with a copy out
+/// (tester r3). So the line promises "soon" and that bound, never a pause tied only to the
+/// next write (W7-D1). Once node 1 does not admit, the line says writes stay stopped only when
+/// that holds: L1 paused or reprotecting, which with a copy out nothing in M9 resumes, or the
+/// owner itself restarted. Not admitting because of a fence the poll can lift (FR, tester r3)
+/// promises the resume and then the pause (W7-D2).
+///
+/// A fenced grant. While A1's self-replace poll is live it looks stuck but is not: A1 replaces
+/// the grant itself once the old one's expiry is proven, and a restart there would end recovery
+/// for the run (Message 6). The line promises that only while the poll is live and the reason
+/// is not one [`never_replaced`] names (F-004): once the poll stopped (a frozen, foreign or
+/// deleted record, F-016), nothing in M9 lifts the fence.
 fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) -> Option<String> {
-    if let Some(note) = restart_note {
-        return Some(if admits {
-            format!("writes pause within about 2 s of the next write because {note}")
-        } else {
-            format!(
-                "{note}; writes stay stopped for this run: to write again, quit and start rdb_dev \
-                 again"
-            )
-        });
+    let fence = owner.fence.filter(|_| !admits);
+    let Some(note) = restart_note else {
+        return fence.map(|reason| fence_line(owner, reason));
+    };
+    let pause = format!(
+        "pause soon, at the latest about {PAUSE_AGE_SECS} s after the next write, because {note}"
+    );
+    if admits {
+        return Some(format!("writes {pause}"));
     }
+    let l1_rejects = matches!(owner.protection.as_deref(), Some("paused" | "reprotecting"));
+    if owner.boot != rdb_api::host::BOOT || l1_rejects {
+        return Some(format!("{note}; {STUCK}"));
+    }
+    Some(match fence {
+        Some(reason) if fence_lifts(owner, reason) => {
+            format!(
+                "{}; once they resume, they {pause}",
+                fence_line(owner, reason)
+            )
+        }
+        Some(reason) => format!("{}; {note}", fence_line(owner, reason)),
+        None => format!("writes are not admitted now; if they come back, they {pause}"),
+    })
+}
+
+/// Whether A1's self-replace can still lift a fence for `reason`: its poll is live, and the
+/// record is not one it answers `Never` ([`never_replaced`]).
+const fn fence_lifts(owner: &NodeStatus, reason: DenyReason) -> bool {
+    owner.fence_polling && !never_replaced(reason)
+}
+
+/// The fenced grant's line: it resumes by itself while [`fence_lifts`], else it is stuck.
+fn fence_line(owner: &NodeStatus, reason: DenyReason) -> String {
     let node = owner.node.0;
-    let reason = owner.fence.filter(|_| !admits)?;
-    Some(if owner.fence_polling && !never_replaced(reason) {
+    if fence_lifts(owner, reason) {
         format!(
             "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
              is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
@@ -535,11 +577,10 @@ fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) ->
         )
     } else {
         format!(
-            "node {node}'s grant is {}; nothing in M9 replaces it, so writes stay stopped for \
-             this run: to write again, quit and start rdb_dev again",
+            "node {node}'s grant is {}; nothing in M9 replaces it, so {STUCK}",
             owner.authority
         )
-    })
+    }
 }
 
 /// A fence reason whose grant record A1's self-replace answers `Never` (`grant::self_replace`):
@@ -558,7 +599,20 @@ const fn never_replaced(reason: DenyReason) -> bool {
 /// away prints nothing; the waiting line says what is left.
 fn ready_step(seen: &mut Seen, owner: &NodeStatus, restart_note: Option<&str>) -> Option<String> {
     let admits = owner.admits == Some(true);
-    let reason = ready_reason(owner, admits, restart_note);
+    step_line(seen, admits, ready_reason(owner, admits, restart_note))
+}
+
+/// The poller's line once node 1's restart failed: no process runs it, so `node_status` leaves
+/// it out, and writes stay stopped for the run (W7-D3). `restart_note` names the failed
+/// restart; it is never `None` after one.
+fn stopped_owner_step(seen: &mut Seen, restart_note: Option<&str>) -> Option<String> {
+    let note = restart_note?;
+    step_line(seen, false, Some(format!("{note}; {STUCK}")))
+}
+
+/// The `ready` or `not ready` line for `admits` and `reason`, given what `seen` holds as
+/// printed, as [`ready_step`] describes.
+fn step_line(seen: &mut Seen, admits: bool, reason: Option<String>) -> Option<String> {
     let changed = admits != seen.ready;
     let new_reason = reason.is_some() && reason != seen.reason;
     if !(changed || new_reason) {
@@ -739,8 +793,15 @@ fn repl<'scope, 'env>(
             }
             ["status", request, rest @ ..] => status_line(db, &sent, request, rest),
             ["nodes"] => {
-                for node in db.node_status() {
-                    say(&node_line(&node));
+                let answered = db.node_status();
+                for node in [1, 2, 3].map(NodeId) {
+                    say(&answered
+                        .iter()
+                        .find(|status| status.node == node)
+                        .map_or_else(
+                            || missing_node_line(node, db.boot_of(node), db.restart_failed(node)),
+                            node_line,
+                        ));
                 }
                 Ok(())
             }
@@ -755,7 +816,7 @@ fn repl<'scope, 'env>(
                 say(
                     &match rt.block_on(admin::clear_grant(db, control.store, node)) {
                         Ok(clearance) => clearance_line(clearance, node, db),
-                        Err(e) => format!("err admin clear-grant {}: {e}", node.0),
+                        Err(e) => admin_error_line(node, &e),
                     },
                 );
             }),
@@ -1167,9 +1228,11 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
     match db.status(RequestId(request), generation) {
         // After a restart, `Unknown` can be a write this session saw `ok` (tester W3-D2).
         Ok(TxnStatus::Unknown) => {
+            // `None` when node 1 did not answer in time (F-025).
             let in_flight = nodes
                 .iter()
-                .any(|node| node.node == NodeId(1) && node.in_flight == Some(RequestId(request)));
+                .find(|node| node.node == NodeId(1))
+                .map(|owner| owner.in_flight == Some(RequestId(request)));
             let restarted: Vec<NodeId> = nodes
                 .iter()
                 .filter(|node| node.boot != rdb_api::host::BOOT)
@@ -1191,10 +1254,11 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
 /// request not `in_flight` there was refused before it was queued, or never arrived, and
 /// nothing will resolve it. One in flight waits for M10 after both secondaries' restarts, and
 /// after one secondary's resolves once the other can take it, as when a held link heals
-/// (W5-D1).
+/// (W5-D1). `in_flight` is `None` when node 1 did not answer in time: whether it holds the
+/// request is then not known, so the line promises nothing and says to ask again (F-025).
 fn unknown_line(
     ours: bool,
-    in_flight: bool,
+    in_flight: Option<bool>,
     restarted: &[NodeId],
     restart_note: Option<&str>,
 ) -> String {
@@ -1207,7 +1271,11 @@ fn unknown_line(
         .collect();
     let owner_restarted = restarted.contains(&NodeId(1));
     match others.as_slice() {
-        _ if !owner_restarted && !in_flight => format!(
+        _ if !owner_restarted && in_flight.is_none() => format!(
+            "status Unknown (node 1 did not answer in time, so whether it holds it in flight is \
+             not known; try again; {note})"
+        ),
+        _ if !owner_restarted && in_flight == Some(false) => format!(
             "status Unknown (node 1 does not hold it in flight, so waiting will not change \
              this: it was refused before it was queued, or never arrived; {note})"
         ),
@@ -1219,6 +1287,25 @@ fn unknown_line(
             "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
              restarted node rejoins, which is M10; {note})"
         ),
+    }
+}
+
+/// The `nodes` line for a node `node_status` left out, which it does both for a node whose
+/// restart failed, so no process runs it (`failed`, F-013), and for one that did not answer in
+/// time. A node left out is never dropped from the list silently (W7-D3).
+fn missing_node_line(node: NodeId, boot: Option<BootId>, failed: bool) -> String {
+    let boot = boot.map_or_else(|| "?".to_owned(), |boot| boot.0.to_string());
+    if failed {
+        format!(
+            "node={} boot={boot} stopped: its restart as boot {boot} failed, so no process runs \
+             it",
+            node.0
+        )
+    } else {
+        format!(
+            "node={} boot={boot} did not answer in time; try again",
+            node.0
+        )
     }
 }
 
@@ -1285,6 +1372,32 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
             Err(e) => say(&format!("err control list {prefix}: {e}")),
         }
     }
+}
+
+/// `admin clear-grant`'s error as one line, with its retry rule and mutation proof as a `put`
+/// error prints them, and in plain words whether running it again can help (F-012): a
+/// permanent store error and a transient one otherwise read alike.
+fn admin_error_line(node: NodeId, error: &ApiError) -> String {
+    let words = match error.retry {
+        RetryRule::RefreshRoute | RetryRule::RetryAfterRecovery | RetryRule::BoundedJitter => {
+            "running it again can help"
+        }
+        RetryRule::QueryStatus => {
+            "run it again: it reads where the record stands before it deletes anything"
+        }
+        RetryRule::Definitive
+        | RetryRule::Reconcile
+        | RetryRule::Quarantine
+        | RetryRule::NotWired => "running it again will not help: it fails the same way each time",
+    };
+    format!(
+        "err admin clear-grant {}: {} retry={:?} no_mutation={} ({}); {words}",
+        node.0,
+        error.name(),
+        error.retry,
+        error.no_mutation,
+        error.detail
+    )
 }
 
 /// `admin clear-grant`'s answer as one line. Only `not-proven-expired` clears with time, so
@@ -1572,7 +1685,6 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdb_core::contracts::event::Budgets;
 
     /// The longest a stopped control leader can leave the voters without one, in ms. A follower
     /// that saw a committed leader waits out the leader lease (`election_timeout_max` in
@@ -1677,6 +1789,8 @@ mod tests {
     /// Message 6 paper cut: a fenced owner printed a bare `not ready`, and a user may then restart
     /// the node, which ends recovery in M9. The fence prints its reason when it comes after the
     /// line, nothing more while it lasts or as it clears, and a restart after it prints again.
+    /// W7-D2 (tester r3): that restart left the poll live, and writes came back, so the line
+    /// promises the resume and the pause after it, not that writes stay stopped.
     #[test]
     fn a_fenced_owner_says_writes_resume_by_themselves_and_not_to_restart() {
         let mut fenced = owner(None, false);
@@ -1708,8 +1822,11 @@ mod tests {
                  node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
                     .to_owned(),
                 format!(
-                    "not ready: writes not admitted: {note}; writes stay stopped for this run: \
-                     to write again, quit and start rdb_dev again"
+                    "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
+                     resume by themselves once the old grant's expiry is proven, so do not \
+                     restart node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42); \
+                     once they resume, they pause soon, at the latest about 2 s after the next \
+                     write, because {note}"
                 ),
                 "ready".to_owned(),
             ]
@@ -1778,19 +1895,24 @@ mod tests {
         assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
     }
 
-    /// Message 7: after a secondary restarts, L1 keeps admitting writes for about 2 s (walk 6c),
+    /// Message 7: after a secondary restarts, L1 keeps admitting writes for a while (walk 6c),
     /// and a bare `ready` then read as if writes would last. While admitted the line says they
-    /// are about to pause and why; once they pause, the not-ready line says so for the run.
+    /// are about to pause and why; once L1 pauses, the not-ready line says so for the run.
+    /// W7-D1 (tester r1): the pause came 1.89 s after the restart with no write at all, so the
+    /// line promises only "soon", and an upper bound counted from the next write: a write with
+    /// a copy out stays unsafe and pauses at L1's pause age (r3: 2.02 s).
     #[test]
-    fn ready_after_a_restart_says_writes_pause_within_about_2_s() {
+    fn ready_after_a_restart_says_writes_pause_soon_not_only_after_the_next_write() {
         let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut paused = owner(None, false);
+        paused.protection = Some("paused".to_owned());
         let mut seen = Seen::default();
         let mut lines = Vec::new();
         for (node, restart) in [
             (owner(None, true), None),
             (owner(None, true), Some(note)),
             (owner(None, true), Some(note)),
-            (owner(None, false), Some(note)),
+            (paused, Some(note)),
         ] {
             lines.extend(ready_step(&mut seen, &node, restart));
         }
@@ -1799,7 +1921,8 @@ mod tests {
             [
                 "ready".to_owned(),
                 format!(
-                    "ready for now; writes pause within about 2 s of the next write because {note}"
+                    "ready for now; writes pause soon, at the latest about 2 s after the next \
+                     write, because {note}"
                 ),
                 format!(
                     "not ready: writes not admitted: {note}; writes stay stopped for this run: \
@@ -1807,6 +1930,175 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// W7-D1, W7-D2: every `ready`/`not ready` reason is derived from the state that decides it,
+    /// checked against each state of the tester's walk-7 text matrix (s2b-tester.md, "Text
+    /// matrix"). The stuck line ("writes stay stopped for this run") prints only where nothing
+    /// in M9 brings writes back: L1 paused or reprotecting with a copy out, the owner itself
+    /// restarted, or a fence no self-replace lifts. A fence whose poll is live, with a
+    /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
+    #[test]
+    fn every_ready_line_matches_the_state_that_decides_it() {
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let failed = "node 2 stopped: its restart as boot 2 failed; a restarted node stays out \
+                      until M10 (#42)";
+        let owner_note = "the owner, node 1, restarted (now boot 2); a restarted node stays out \
+                          until M10 (#42)";
+        let stuck = "writes stay stopped for this run: to write again, quit and start rdb_dev \
+                     again";
+        let pause = |note: &str| {
+            format!("pause soon, at the latest about 2 s after the next write, because {note}")
+        };
+        let resume = |reason: &str| {
+            format!(
+                "node 1's grant is fenced({reason}); writes resume by themselves once the old \
+                 grant's expiry is proven, so do not restart node 1: a restarted node does not \
+                 rejoin in M9 (achieveai/rDB#42)"
+            )
+        };
+        let fenced_stuck = |reason: &str| {
+            format!("node 1's grant is fenced({reason}); nothing in M9 replaces it, so {stuck}")
+        };
+        let with = |admits: bool, protection: Option<&str>, fence: Option<(DenyReason, bool)>| {
+            let mut node = owner(None, admits);
+            node.protection = protection.map(str::to_owned);
+            if let Some((reason, polling)) = fence {
+                node.authority = format!("fenced({reason:?})");
+                node.fence = Some(reason);
+                node.fence_polling = polling;
+            }
+            node
+        };
+        let mut restarted_owner = owner(None, false);
+        restarted_owner.boot = BootId(2);
+        restarted_owner.admits = None;
+        restarted_owner.protection = None;
+        let mut unheld = owner(None, false);
+        unheld.authority = "unheld".to_owned();
+        let expiring = Some((DenyReason::Expired, true));
+        let rows: Vec<(&str, NodeStatus, Option<&str>, Option<String>)> = vec![
+            (
+                "H",
+                with(true, Some("healthy"), None),
+                None,
+                Some("ready".to_owned()),
+            ),
+            (
+                "HR",
+                with(true, Some("healthy"), None),
+                Some(note),
+                Some(format!("ready for now; writes {}", pause(note))),
+            ),
+            (
+                "SF admitting",
+                with(true, Some("healthy"), None),
+                Some(failed),
+                Some(format!("ready for now; writes {}", pause(failed))),
+            ),
+            (
+                "HP",
+                with(false, Some("paused"), None),
+                Some(note),
+                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+            ),
+            (
+                "HP reprotecting",
+                with(false, Some("reprotecting"), None),
+                Some(note),
+                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+            ),
+            (
+                "SF paused",
+                with(false, Some("paused"), None),
+                Some(failed),
+                Some(format!("not ready: writes not admitted: {failed}; {stuck}")),
+            ),
+            (
+                "FP",
+                with(false, Some("healthy"), expiring),
+                None,
+                Some(format!(
+                    "not ready: writes not admitted: {}",
+                    resume("Expired")
+                )),
+            ),
+            (
+                "FS",
+                with(false, Some("healthy"), Some((DenyReason::Expired, false))),
+                None,
+                Some(format!(
+                    "not ready: writes not admitted: {}",
+                    fenced_stuck("Expired")
+                )),
+            ),
+            (
+                "FZ",
+                with(false, Some("healthy"), Some((DenyReason::Frozen, true))),
+                None,
+                Some(format!(
+                    "not ready: writes not admitted: {}",
+                    fenced_stuck("Frozen")
+                )),
+            ),
+            (
+                "U",
+                unheld.clone(),
+                None,
+                Some("not ready: writes not admitted".to_owned()),
+            ),
+            (
+                "U with a restart",
+                unheld,
+                Some(note),
+                Some(format!(
+                    "not ready: writes not admitted: writes are not admitted now; if they come \
+                     back, they {}",
+                    pause(note)
+                )),
+            ),
+            (
+                "FR",
+                with(false, Some("healthy"), expiring),
+                Some(note),
+                Some(format!(
+                    "not ready: writes not admitted: {}; once they resume, they {}",
+                    resume("Expired"),
+                    pause(note)
+                )),
+            ),
+            (
+                "FR, L1 paused",
+                with(false, Some("paused"), expiring),
+                Some(note),
+                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+            ),
+            (
+                "FR, poll stopped",
+                with(false, Some("healthy"), Some((DenyReason::Expired, false))),
+                Some(note),
+                Some(format!(
+                    "not ready: writes not admitted: {}; {note}",
+                    fenced_stuck("Expired")
+                )),
+            ),
+            (
+                "RO",
+                restarted_owner,
+                Some(owner_note),
+                Some(format!(
+                    "not ready: writes not admitted: {owner_note}; {stuck}"
+                )),
+            ),
+        ];
+        for (state, node, restart, line) in rows {
+            let admits = node.admits == Some(true);
+            let mut seen = Seen {
+                ready: !admits,
+                ..Seen::default()
+            };
+            assert_eq!(ready_step(&mut seen, &node, restart), line, "state {state}");
+        }
     }
 
     /// Tester W3-D2 and walk 5: after a restart, `Unknown` for a request this session sent
@@ -1819,33 +2111,137 @@ mod tests {
     #[test]
     fn status_unknown_carries_the_restart_note_and_waits_for_m10_only_when_no_copy_can_resolve() {
         let note = Some("NOTE");
-        assert_eq!(unknown_line(true, true, &[], None), "status Unknown");
+        assert_eq!(unknown_line(true, Some(true), &[], None), "status Unknown");
         assert_eq!(
-            unknown_line(false, false, &[NodeId(2)], note),
+            unknown_line(false, Some(false), &[NodeId(2)], note),
             "status Unknown"
         );
         assert_eq!(
-            unknown_line(true, true, &[NodeId(2)], note),
+            unknown_line(true, Some(true), &[NodeId(2)], note),
             "status Unknown (not evidence of a lost write: it resolves once node 3, which did \
              not restart, can take it; NOTE)"
         );
         assert_eq!(
-            unknown_line(true, true, &[NodeId(3)], note),
+            unknown_line(true, Some(true), &[NodeId(3)], note),
             "status Unknown (not evidence of a lost write: it resolves once node 2, which did \
              not restart, can take it; NOTE)"
         );
         let m10 = "status Unknown (not evidence of a lost write: its outcome cannot be known \
                    until a restarted node rejoins, which is M10; NOTE)";
-        assert_eq!(unknown_line(true, true, &[NodeId(2), NodeId(3)], note), m10);
-        assert_eq!(unknown_line(true, true, &[NodeId(1)], note), m10);
-        assert_eq!(unknown_line(true, true, &[NodeId(1), NodeId(2)], note), m10);
-        assert_eq!(unknown_line(true, false, &[NodeId(1)], note), m10);
+        assert_eq!(
+            unknown_line(true, Some(true), &[NodeId(2), NodeId(3)], note),
+            m10
+        );
+        assert_eq!(unknown_line(true, Some(true), &[NodeId(1)], note), m10);
+        assert_eq!(
+            unknown_line(true, Some(true), &[NodeId(1), NodeId(2)], note),
+            m10
+        );
+        assert_eq!(unknown_line(true, Some(false), &[NodeId(1)], note), m10);
         let refused = "status Unknown (node 1 does not hold it in flight, so waiting will not \
                        change this: it was refused before it was queued, or never arrived; NOTE)";
-        assert_eq!(unknown_line(true, false, &[NodeId(3)], note), refused);
+        assert_eq!(unknown_line(true, Some(false), &[NodeId(3)], note), refused);
         assert_eq!(
-            unknown_line(true, false, &[NodeId(2), NodeId(3)], note),
+            unknown_line(true, Some(false), &[NodeId(2), NodeId(3)], note),
             refused
+        );
+    }
+
+    /// F-025: `node_status` leaves out a node 1 that does not answer in time, and the line then
+    /// read as "not in flight; waiting will not change this", which nothing showed. Without an
+    /// answer it says so and to ask again; after the owner's own restart the M10 line stands.
+    /// Unit.
+    #[test]
+    fn status_unknown_says_try_again_when_node_1_did_not_answer() {
+        let note = Some("NOTE");
+        let silent = "status Unknown (node 1 did not answer in time, so whether it holds it in \
+                      flight is not known; try again; NOTE)";
+        assert_eq!(unknown_line(true, None, &[NodeId(3)], note), silent);
+        assert_eq!(
+            unknown_line(true, None, &[NodeId(2), NodeId(3)], note),
+            silent
+        );
+        assert_eq!(
+            unknown_line(false, None, &[NodeId(3)], note),
+            "status Unknown"
+        );
+        assert_eq!(
+            unknown_line(true, None, &[NodeId(1)], note),
+            "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
+             restarted node rejoins, which is M10; NOTE)"
+        );
+    }
+
+    /// W7-D3 (tester r12): after node 1's restart failed, the poller kept its last `ready`,
+    /// because `node_status` leaves node 1 out and the poll printed nothing then. It now prints
+    /// the stuck line once, naming the failed restart. `nodes` names a node left out, as
+    /// stopped or as not answering, instead of dropping it (r11, r12). Unit; the live walk
+    /// w12 (r9/walks) shows both on a real run.
+    #[test]
+    fn a_failed_owner_restart_says_not_ready_and_nodes_names_the_stopped_node() {
+        let note = "the owner, node 1, stopped: its restart as boot 2 failed; a restarted node \
+                    stays out until M10 (#42)";
+        let mut seen = Seen::default();
+        lines_ready(&mut seen);
+        assert_eq!(
+            stopped_owner_step(&mut seen, Some(note)),
+            Some(format!(
+                "not ready: writes not admitted: {note}; writes stay stopped for this run: to \
+                 write again, quit and start rdb_dev again"
+            ))
+        );
+        assert_eq!(
+            stopped_owner_step(&mut seen, Some(note)),
+            None,
+            "printed once"
+        );
+        assert_eq!(
+            missing_node_line(NodeId(1), Some(BootId(2)), true),
+            "node=1 boot=2 stopped: its restart as boot 2 failed, so no process runs it"
+        );
+        assert_eq!(
+            missing_node_line(NodeId(2), Some(BootId(1)), false),
+            "node=2 boot=1 did not answer in time; try again"
+        );
+    }
+
+    /// `seen` after a `ready` line, as the poller holds it before a failure.
+    fn lines_ready(seen: &mut Seen) {
+        assert_eq!(
+            ready_step(seen, &owner(None, true), None),
+            Some("ready".to_owned())
+        );
+    }
+
+    /// F-012 (tester walk 7): rdb_dev printed an admin error as `KIND (detail)` only, so a
+    /// permanent store error and a transient one read alike. The line carries `retry=` and
+    /// `no_mutation=` as a `put` error does, and says in words whether running it again helps.
+    /// Unit.
+    #[test]
+    fn an_admin_error_says_whether_running_it_again_can_help() {
+        let error = |retry, no_mutation| ApiError {
+            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
+            retry,
+            no_mutation,
+            detail: "control store: list partitions/: x; nothing deleted".to_owned(),
+        };
+        assert_eq!(
+            admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
+            "err admin clear-grant 1: UNAVAILABLE retry=BoundedJitter no_mutation=true (control \
+             store: list partitions/: x; nothing deleted); running it again can help"
+        );
+        assert_eq!(
+            admin_error_line(NodeId(1), &error(RetryRule::NotWired, true)),
+            "err admin clear-grant 1: UNAVAILABLE retry=NotWired no_mutation=true (control \
+             store: list partitions/: x; nothing deleted); running it again will not help: it \
+             fails the same way each time"
+        );
+        assert!(
+            admin_error_line(NodeId(1), &error(RetryRule::QueryStatus, false)).ends_with(
+                "no_mutation=false (control store: list partitions/: x; nothing deleted); \
+                        run it again: it reads where the record stands before it deletes \
+                        anything"
+            )
         );
     }
 

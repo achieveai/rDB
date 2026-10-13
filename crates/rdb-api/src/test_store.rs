@@ -1,8 +1,8 @@
 //! A control store for crate tests: a `MemStore` that can lose a put's reply, fail a read or a
 //! list, hold every put at a gate (F-003, F-004), hold a list's answer after it has read
 //! (M9 S2a review F-002), or block the list's worker thread there (PR #38 review F-002), or
-//! hold a watch at a gate (M9 S2b review F-005). It records when each list arrived (PR #38
-//! review F-001).
+//! hold a watch at a gate (M9 S2b review F-005), or fail a delete (F-024). It records when each
+//! list arrived (PR #38 review F-001).
 //!
 //! Written out by hand because `async-trait` is not a dependency of this crate.
 
@@ -41,6 +41,8 @@ pub(crate) struct Script {
     /// Watches still to wait at a gate until [`Scripted::release_watches`], then open: a watch
     /// that answers only once the row lets it (M9 S2b review F-005).
     pub(crate) hold_watches: u32,
+    /// The next delete fails with this, without deleting (M9 S2b review F-024).
+    pub(crate) fail_delete_with: Option<ConfigError>,
 }
 
 /// Whether a blocked list has read, and whether blocked lists may answer.
@@ -238,6 +240,10 @@ impl ConfigStore for Scripted {
         'a: 'b,
         Self: 'b,
     {
+        let fail = self.script.lock().expect("script").fail_delete_with.take();
+        if let Some(error) = fail {
+            return Box::pin(std::future::ready(Err(error)));
+        }
         self.inner.delete(request)
     }
 

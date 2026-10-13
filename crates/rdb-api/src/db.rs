@@ -926,6 +926,16 @@ impl Db {
             .map(|handle| handle.boot)
     }
 
+    /// Whether `node`'s last restart failed, so no process runs it (F-013). [`Self::node_status`]
+    /// leaves such a node out, as it does one that did not answer in time; this tells the two
+    /// apart (W7-D3).
+    #[must_use]
+    pub fn restart_failed(&self, node: NodeId) -> bool {
+        lock(&self.nodes)
+            .iter()
+            .any(|handle| handle.node == node && handle.start_failed)
+    }
+
     /// Why writes stopped for good, once a node of this `Db` has restarted or failed to restart;
     /// `None` while every node runs its first boot. Names each restarted node and its boot, and
     /// says when the restart failed and the node stays stopped (F-013), in one short clause,
@@ -2499,7 +2509,8 @@ mod tests {
 
     /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
     /// writes; a put refused then was refused at admission and never queued, so a retry of it
-    /// must not promise that `status` will show its outcome: status stays `Unknown` for good.
+    /// must not promise that `status` will show its outcome: status stays `Unknown` for good. A
+    /// retry of the published put keeps the promise, since status shows it (review F-023).
     /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
     #[test]
     fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
@@ -2515,7 +2526,7 @@ mod tests {
             ))
             .expect("open");
         admits(&db, "after the open");
-        db.put(b"a", b"1", None).expect("before the restart");
+        let first = db.put(b"a", b"1", None).expect("before the restart");
         assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
         let patience = crate::host::test_patience(Duration::from_secs(5));
         let deadline = std::time::Instant::now() + patience;
@@ -2554,6 +2565,26 @@ mod tests {
             "nothing is applied unpublished at node 1"
         );
         assert_eq!(db.status(id, None).expect("status"), TxnStatus::Unknown);
+
+        // Review F-023, mutant U3: a published request is not in flight either (just checked),
+        // so only the status half of `status_will_show` keeps its retry's promise.
+        let published = db.resend(*first.sent).expect_err("still paused");
+        assert_eq!(
+            published.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{published:?}"
+        );
+        assert!(
+            published
+                .error
+                .detail
+                .contains(&format!("status {} shows its outcome", first.request.0)),
+            "published, so status shows it: {published:?}"
+        );
+        assert!(
+            !matches!(db.status(first.request, None), Ok(TxnStatus::Unknown)),
+            "and status does"
+        );
         db.shutdown();
     }
 
@@ -2846,6 +2877,11 @@ mod tests {
             Some(BootId(2)),
             "the boot it was given"
         );
+        assert!(
+            db.restart_failed(NodeId(2)),
+            "W7-D3: a caller can tell it failed"
+        );
+        assert!(!db.restart_failed(OWNER), "node 1 was never restarted");
         let note = db
             .restart_note()
             .expect("a failed restart stops writes too");
