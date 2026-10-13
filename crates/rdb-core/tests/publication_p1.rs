@@ -7548,3 +7548,60 @@ fn a_blocked_recovery_over_a_storage_fence_stays_blocked() {
     ));
     assert_eq!(rig.view().mode, PubMode::Blocked { reason: block() });
 }
+
+/// Round 11 (lead ruling: a deny at `Publication` for local storage is a storage fence, as T1's
+/// `freeze_cause` maps it): the quarantine freezes `LocalStorageFenced`, boot-long, with no
+/// storage fence from A1 before it. A new grant's view and a re-emit then lift nothing.
+#[retcd_test]
+fn a_publication_deny_for_local_storage_freezes_as_a_storage_fence() {
+    let mut rig = Rig::new();
+    let c = rig.pending_with_recheck(5);
+    let effects = rig.step(answer(
+        Checkpoint::Publication,
+        c,
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+    ));
+    assert!(effects.contains(&quarantined(5)), "fixture: {effects:?}");
+    let fenced = PubMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+    };
+    assert_eq!(rig.view().mode, fenced, "the quarantine");
+    rig.step(view_under(2, 2, u64::MAX));
+    assert_eq!(rig.view().mode, fenced, "a new grant's view");
+    rig.step(reemitted(PartitionMode::Active, START));
+    assert_eq!(rig.view().mode, fenced, "a re-emit");
+}
+
+/// Round 11 (lead ruling: only F1's `Active` re-emit lifts read-only): an unresolved transaction
+/// kept through a read-only re-emit (round 10) resolves to `RecoveryReadOnly`, never `Serving`.
+/// The twin re-emits `Active` after it, which lifts the read-only state, so it resolves to
+/// `Serving`.
+#[retcd_test]
+fn an_unresolved_transaction_kept_through_a_read_only_re_emit_resolves_to_read_only() {
+    let read_only = PubMode::Frozen {
+        cause: FreezeCause::RecoveryReadOnly,
+    };
+    for (re_emits, resolved) in [
+        (vec![PartitionMode::ReadOnly], read_only),
+        (
+            vec![PartitionMode::ReadOnly, PartitionMode::Active],
+            PubMode::Serving,
+        ),
+    ] {
+        let mut rig = Rig::new();
+        let c = rig.pending_with_recheck(5);
+        rig.step(deadline(P, 1));
+        let unresolved = PubMode::Frozen {
+            cause: FreezeCause::UnresolvedTransaction,
+        };
+        assert_eq!(rig.view().mode, unresolved, "fixture");
+        for mode in &re_emits {
+            rig.step(reemitted(mode.clone(), START));
+        }
+        assert_eq!(rig.view().mode, unresolved, "fixture: kept (round 10)");
+        rig.snapshot_at(5);
+        let effects = rig.step(answer(Checkpoint::Publication, c, Verdict::Admit));
+        assert!(published_any(&effects), "fixture: {effects:?}");
+        assert_eq!(rig.view().mode, resolved, "{re_emits:?}");
+    }
+}
