@@ -20,7 +20,7 @@ pub mod admission;
 pub mod dedup;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 
@@ -1702,6 +1702,12 @@ pub struct Transaction {
     /// Per `(node, partition)`, every trim and retire it was told of, with or without an
     /// instance, applied to each instance it creates (lead rulings A-R73 N1, A-R73a).
     trims: BTreeMap<(NodeId, PartitionId), TrimMemory>,
+    /// Every `(node, partition)` a storage fence reached in this boot, with or without an
+    /// instance: a fence event, or an instance frozen `LocalStorageFenced` by a failed batch. It
+    /// is boot-long, as A1's `storage_fenced` is (lead ruling, M9 S2b-E round 10), so an instance
+    /// created later in the boot starts `Frozen{LocalStorageFenced}`. Only a restart
+    /// ([`Self::forget_node`]) clears it.
+    storage_fenced: BTreeSet<(NodeId, PartitionId)>,
 }
 
 impl Transaction {
@@ -1745,6 +1751,7 @@ impl Transaction {
         self.kernels.retain(|(held, _), _| *held != node);
         self.floors.retain(|(held, _), _| *held != node);
         self.trims.retain(|(held, _), _| *held != node);
+        self.storage_fenced.retain(|(held, _)| *held != node);
     }
 
     /// Step the `(ctx.node, ctx.partition)` instance with a design-shaped event.
@@ -1775,23 +1782,47 @@ impl Transaction {
                 let floor = self.floors.get(&key).copied();
                 self.trims.entry(key).or_default().retire(generation, floor);
             }
+            // Round 10: a storage fence is remembered for the boot, with or without an instance.
+            TxnEvent::Freeze {
+                scope,
+                cause: FreezeCause::LocalStorageFenced,
+            } if match scope {
+                FenceScope::Node => true,
+                FenceScope::Partition(partition) => partition == ctx.partition,
+            } =>
+            {
+                self.storage_fenced.insert(key);
+            }
             _ => {}
         }
-        match event {
-            TxnEvent::Recovered(result) => Ok(self.on_recovered(ctx, &result)),
+        let out = match event {
+            TxnEvent::Recovered(result) => self.on_recovered(ctx, &result),
             TxnEvent::Submit(req) => match self.kernels.get_mut(&key) {
-                Some(kernel) => Ok(kernel.step(ctx, TxnEvent::Submit(req))),
-                None => Ok(match admit(&req, ctx.partition, None, ctx.now) {
+                Some(kernel) => kernel.step(ctx, TxnEvent::Submit(req)),
+                None => match admit(&req, ctx.partition, None, ctx.now) {
                     Err(rejection) => vec![reply(req.identity, rejection)],
                     // `admit` without an instance always fails at check 4.
                     Ok(_) => Vec::new(),
-                }),
+                },
             },
-            other => Ok(match self.kernels.get_mut(&key) {
+            other => match self.kernels.get_mut(&key) {
                 Some(kernel) => kernel.step(ctx, other),
                 None => vec![ignored(ErrorKind::NotPrimary)],
-            }),
+            },
+        };
+        // A failed batch fences storage too (spec §5.2 step 3), so it is remembered the same way.
+        if self.kernels.get(&key).is_some_and(|kernel| {
+            matches!(
+                kernel.mode,
+                QueueMode::Frozen {
+                    cause: FreezeCause::LocalStorageFenced,
+                    ..
+                }
+            )
+        }) {
+            self.storage_fenced.insert(key);
         }
+        Ok(out)
     }
 
     fn on_recovered(&mut self, ctx: &StepCtx<'_>, result: &RecoveryResult) -> Vec<TxnEffect> {
@@ -1846,6 +1877,10 @@ impl Transaction {
             trims.apply(&mut dedup);
         }
         let mut kernel = TxnKernel::at_recovery(result, dedup, self.limits, ctx.boot);
+        // A storage fence is boot-long (lead ruling, round 10): a new generation does not lift it.
+        if self.storage_fenced.contains(&key) {
+            kernel.mode = frozen(FreezeCause::LocalStorageFenced);
+        }
         kernel.try_seed(ctx.snapshot);
         self.kernels.insert(key, kernel);
         out

@@ -2620,7 +2620,9 @@ impl Authority {
     /// * **Absent, or unavailable: a retry, and no row in `design.md` says so.** The table has
     ///   `ReadOk{Some(rec)}` rows only. Absent means the key is free and unavailable means the
     ///   store cannot say; neither widens anything, and without the retry the node would never
-    ///   try again.
+    ///   try again. After a fence, Absent is the exception: [`AuthorityIgnoreReason::NotOurs`],
+    ///   no retry, and the self-replace stops ([`Self::self_replace_stopped`]), as the fenced
+    ///   poll's Absent stops it (round 10).
     /// * A body this build cannot decode: treated as the store unavailable, and logged as
     ///   `a1.grant_read_back_undecodable`. A retry, as for the fenced poll. Never a step error:
     ///   the CAS answer that sent this read armed nothing, and the host drops an `Unavailable`
@@ -2635,7 +2637,10 @@ impl Authority {
         let after_fence = self.after_fence;
         let ReadOutcome::Found { revision, value } = outcome else {
             if after_fence.is_some() && matches!(outcome, ReadOutcome::Absent { .. }) {
-                // After a fence an absent record is not a free key to take (A-R96).
+                // After a fence an absent record is not a free key to take (A-R96): the only exit
+                // is a CAS at the exact revision read. So the self-replace stops, as the fenced
+                // poll's absent answer stops it, and `self_replace_stopped` says so (round 10).
+                self.stop_polling();
                 return vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)];
             }
             return vec![self.acquire_retry(ctx, event)];

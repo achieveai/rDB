@@ -591,6 +591,12 @@ pub struct PubKernel {
     /// `RecoveryReadOnly`, never `Serving`, and an `Admit` publishes nothing. Only
     /// [`Self::on_recovered`] clears it.
     read_only_under: bool,
+    /// A storage fence reached this kernel in this boot (lead ruling, M9 S2b-E round 10). It is
+    /// boot-long, as A1's `storage_fenced` is: nothing in this boot lifts it, not a re-emit, a
+    /// thaw, a new grant's view, a quarantine or a new lineage. A new boot starts a new kernel.
+    /// It is set even while `Blocked` absorbs the freeze, so a recovery that ends the block
+    /// lands in `Frozen{LocalStorageFenced}`.
+    storage_fenced: bool,
     next_correlation: u64,
     next_timer_version: u64,
     /// Invariant: when `Some`, storage bound it at [`Self::published`].
@@ -621,6 +627,7 @@ impl PubKernel {
             mode: PubMode::Serving,
             lost: None,
             read_only_under: false,
+            storage_fenced: false,
             next_correlation: 0,
             next_timer_version: 0,
             kept: None,
@@ -1534,6 +1541,10 @@ impl PubKernel {
         if let Some(pending) = self.pending.as_mut() {
             pending.recheck = None;
         }
+        // Boot-long (round 10), and recorded before a block absorbs the freeze.
+        if cause == FreezeCause::LocalStorageFenced {
+            self.storage_fenced = true;
+        }
         if matches!(self.mode, PubMode::Blocked { .. }) {
             let mut effects = self.withhold_awaiting(Withheld::Fence);
             effects.push(PubEffect::Fact(PubFact::FenceWhileBlocked { cause }));
@@ -1633,6 +1644,8 @@ impl PubKernel {
     /// lifted here. Neither a node fence ([`Self::on_freeze`]) nor a deny at `Publication`
     /// ([`Self::on_publication_answer`]'s quarantine) replaces `LocalStorageFenced` or `Blocked`
     /// with `AuthorityLost`, and the quarantine does not replace `RecoveryReadOnly` either.
+    /// `LocalStorageFenced` is boot-long (`storage_fenced`, round 10): no recovery lifts it
+    /// either, of the same lineage or a new one.
     ///
     /// A fence over `RecoveryReadOnly` does replace it with `Frozen{AuthorityLost}`, so every
     /// read is refused while authority is lost (A-R72). The read-only state is remembered
@@ -1716,6 +1729,19 @@ impl PubKernel {
         }
     }
 
+    /// The mode a recovery sets, under this boot's storage fence if one reached the kernel
+    /// (`storage_fenced`, round 10). A `Blocked` recovery stays `Blocked`, as a block overrides
+    /// every freeze (`on_block`).
+    fn fenced(&self, mode: PubMode) -> PubMode {
+        if self.storage_fenced && !matches!(mode, PubMode::Blocked { .. }) {
+            PubMode::Frozen {
+                cause: FreezeCause::LocalStorageFenced,
+            }
+        } else {
+            mode
+        }
+    }
+
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
         // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
         // was published, the candidate pending and the replies owed all belong to this lineage,
@@ -1731,6 +1757,29 @@ impl PubKernel {
             } else {
                 self.move_view()
             };
+            // A storage fence is boot-long (lead ruling, round 10): the re-emit keeps it, and
+            // lands in it when a block absorbed the fence. Nothing lost is waiting to thaw under
+            // it, so no record from before applies.
+            if self.storage_fenced {
+                self.lost = None;
+                self.read_only_under = false;
+                let mode = self.fenced(recovered_mode(&result.mode));
+                if self.mode != mode {
+                    self.mode = mode;
+                    effects.extend(self.drain_waiters());
+                }
+                return effects;
+            }
+            // Nor does it lift an unresolved transaction, as T1 lifts none
+            // (`TxnKernel::on_reemitted`, K-A-47): the candidate it waits on is still pending
+            // in this lineage, and only its publish (step 7) lifts the freeze (round 10).
+            if self.mode
+                == (PubMode::Frozen {
+                    cause: FreezeCause::UnresolvedTransaction,
+                })
+            {
+                return effects;
+            }
             // A re-emit of the lineage lifts no `AuthorityLost` freeze (lead rulings A-R99,
             // F-028, and round 9), as T1 lifts none (`TxnKernel::on_reemitted`): a re-delivery
             // would otherwise serve reads with the grant lost. Only a new grant's view (`Thaws`,
@@ -1799,7 +1848,8 @@ impl PubKernel {
         // asked at a position no longer published.
         effects.extend(self.move_view());
         self.pending = None;
-        self.mode = recovered_mode(&result.mode);
+        // Boot-long: a new lineage does not lift a storage fence either (round 10).
+        self.mode = self.fenced(recovered_mode(&result.mode));
         // Not in the design: a waiter queued behind the dropped candidate would otherwise hang.
         // `Serving` and read-only answer it at the rebased position; `Blocked` refuses it.
         effects.extend(self.drain_waiters());
