@@ -43,18 +43,23 @@
 //! node restart <n>                        stop node n and start it again on its data at its
 //!                                         boot plus one; prints `node n boot b`. The new
 //!                                         process holds no role and stays out until M10. So
-//!                                         any restart stops writes for the life of this run:
-//!                                         after a secondary's, L1 pauses about 2 s later
-//!                                         (`PROTECTION_PAUSED`) because that copy is never
-//!                                         durable again; after the owner's, no node holds a
-//!                                         grant. Restarting is not a recovery: catch-up and
-//!                                         re-pin are M10
+//!                                         any restart stops writes, safely, for the life of
+//!                                         this run: after a secondary's, L1 pauses about 2 s
+//!                                         later (`PROTECTION_PAUSED`) because that copy is
+//!                                         never durable again; after the owner's, no node
+//!                                         holds a grant. Every refusal after it names the
+//!                                         restart. Restarting is not a recovery: catch-up and
+//!                                         re-pin are M10 (achieveai/rDB#42). To write again,
+//!                                         quit and start rdb_dev again. Refused until the
+//!                                         first `ready`
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
-//!                                         `refused frozen|not-proven-expired|partition-in-
-//!                                         transfer pP until=T in=Nms` (T is E + epsilon +
-//!                                         delta). Run it again until `cleared` or `absent`
+//!                                         `refused ...`. Only `not-proven-expired` clears by
+//!                                         waiting, and says how long; `frozen` waits for the
+//!                                         takeover to finish, `partition-in-transfer pP` for
+//!                                         pP to be `serving` again. Clearing never lets a
+//!                                         restarted owner write again in M9
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
