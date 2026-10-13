@@ -907,6 +907,9 @@ struct AfterFence {
     /// The revision a read proved replaceable at. The next acquisition CAS expects exactly it;
     /// taken when that CAS is dispatched.
     replace_at: Option<Revision>,
+    /// A poll's answer stopped the polling: the record is not this boot's to replace
+    /// ([`SelfReplace::Never`]) or is absent. Nothing re-arms after it.
+    stopped: bool,
 }
 
 impl Authority {
@@ -1044,6 +1047,18 @@ impl Authority {
     #[must_use]
     pub const fn watch_refused_attempts(&self) -> u32 {
         self.watch_refused_attempts
+    }
+
+    /// Whether this node is `Fenced` and the self-replace (lead ruling A-R96) will still read its
+    /// own grant record again: from the node fence through every `NotYet` or `Unavailable`
+    /// re-arm. `false` once a poll's answer stopped it — a [`SelfReplace::Never`] verdict or an
+    /// absent record — and `false` whenever the node is not `Fenced`. A later node fence leaves a
+    /// fresh after-fence record, so it reads `true` again. For the host's status line (reviewer
+    /// F-004, F-016), which cannot tell from the effects alone: the poll id is `None` between
+    /// re-arms, and `NotOurs` has other sources.
+    #[must_use]
+    pub fn self_replace_polling(&self) -> bool {
+        self.state.is_fenced() && self.after_fence.is_some_and(|after| !after.stopped)
     }
 
     /// How long the `attempt`-th consecutive capacity refusal waits before re-watching.
@@ -1284,6 +1299,7 @@ impl Authority {
                 fenced: held.grant,
                 poll: None,
                 replace_at: None,
+                stopped: false,
             });
             self.state = AuthorityState::Fenced {
                 reason,
@@ -2433,6 +2449,7 @@ impl Authority {
             }
             ReadOutcome::Unavailable => return Ok(vec![self.acquire_retry(ctx, event)]),
             ReadOutcome::Absent { .. } => {
+                self.stop_polling();
                 return Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]);
             }
         };
@@ -2470,7 +2487,17 @@ impl Authority {
                 Self::ignored(event, AuthorityIgnoreReason::AcquireWithheld),
                 self.acquire_retry(ctx, event),
             ],
-            SelfReplace::Never => vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)],
+            SelfReplace::Never => {
+                self.stop_polling();
+                vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]
+            }
+        }
+    }
+
+    /// Record that the self-replace's polling stopped, for [`Self::self_replace_polling`].
+    fn stop_polling(&mut self) {
+        if let Some(after) = self.after_fence.as_mut() {
+            after.stopped = true;
         }
     }
 

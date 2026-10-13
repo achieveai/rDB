@@ -2881,6 +2881,106 @@ fn after_a_fence_an_unavailable_poll_keeps_polling_until_control_returns() {
     );
 }
 
+/// Reviewer F-004/F-016 (round 4 add-on 3): `self_replace_polling` says whether the fenced node
+/// will read its own record again. It holds from the fence through a `NotYet` wait and an
+/// unavailable store, each of which re-arms, and stops once a poll's answer is a record not ours
+/// to replace (here frozen) or no record. Never while held.
+#[retcd_test]
+fn self_replace_polling_holds_through_each_rearm_and_stops_on_a_record_not_ours() {
+    let (mut kernel, fenced) = held();
+    assert!(!kernel.self_replace_polling(), "held: not fenced");
+    kernel
+        .step(&ctx(LAPSE), &probe(LAPSE))
+        .expect("the lapse fence");
+    assert_eq!(kernel.state().fence_reason(), Some(DenyReason::Expired));
+    assert!(kernel.self_replace_polling(), "fenced (Expired)");
+
+    // `NotYet`: the poll lands short of `E + epsilon + delta` (3_115) and re-arms.
+    let first = 3_100;
+    let poll = poll_sent(
+        &kernel
+            .step(
+                &sampled_at(first, first),
+                &acquire_due(&kernel, first, first),
+            )
+            .expect("the fenced Acquire row"),
+    );
+    let not_yet = 3_110;
+    kernel
+        .step(
+            &sampled_at(not_yet, not_yet),
+            &polled(not_yet, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the NotYet answer");
+    assert!(kernel.self_replace_polling(), "NotYet re-arms");
+
+    // The store unavailable: re-armed again.
+    let second = not_yet + BUDGETS.renew_millis;
+    let poll = poll_sent(
+        &kernel
+            .step(
+                &sampled_at(second, second),
+                &acquire_due(&kernel, second, second),
+            )
+            .expect("the re-armed firing"),
+    );
+    kernel
+        .step(
+            &sampled_at(second, second),
+            &polled(second, poll, ReadOutcome::Unavailable),
+        )
+        .expect("the unavailable answer");
+    assert!(kernel.self_replace_polling(), "Unavailable re-arms");
+
+    // A frozen record: not ours to replace, and polling stops.
+    let third = second + BUDGETS.renew_millis;
+    let poll = poll_sent(
+        &kernel
+            .step(
+                &sampled_at(third, third),
+                &acquire_due(&kernel, third, third),
+            )
+            .expect("the re-armed firing"),
+    );
+    let mut frozen = our_record(fenced, e_new_at(5));
+    frozen.frozen = true;
+    let effects = kernel
+        .step(
+            &sampled_at(third, third),
+            &polled(third, poll, found(7, &frozen)),
+        )
+        .expect("the frozen answer");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert!(kernel.state().is_fenced());
+    assert!(!kernel.self_replace_polling(), "a frozen record stops it");
+
+    // No record: polling stops too.
+    let (mut kernel, _, poll) = fenced_and_polled();
+    assert!(kernel.self_replace_polling(), "fixture: polling");
+    kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, ReadOutcome::Absent { as_of: Revision(7) }),
+        )
+        .expect("the absent answer");
+    assert!(kernel.state().is_fenced());
+    assert!(!kernel.self_replace_polling(), "an absent record stops it");
+
+    // A proven record is replaced: `Unheld` with the CAS in flight, so no longer fenced.
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the Replace answer");
+    assert!(kernel.state().is_unheld(), "fixture: replacing");
+    assert!(!kernel.self_replace_polling(), "not fenced");
+}
+
 /// The freeze race (A-R96 kernel ruling 1, critic M2): the replace conflicts because the record
 /// changed under it, and the read-back finds it is no longer ours to replace — a planner froze
 /// it, or another boot or authority generation wrote it. No CAS, no re-arm, not `Held`.
