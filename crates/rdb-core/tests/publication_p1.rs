@@ -7322,3 +7322,37 @@ fn a_quarantine_under_a_fence_keeps_the_partition_read_only_underneath() {
         "only F1's re-emit reaches Serving"
     );
 }
+
+/// Round 8, F-028 (lead ruling A-R99): F1's re-emit of the same lineage never lifts a
+/// partition-scope freeze. After a read-only recovery and a partition fence, T1 stays
+/// `Frozen{AuthorityLost}` (`Stays`) through the `Active` re-emit, so P1 must too, or the two
+/// kernels disagree and P1 serves reads whose authority A-R97 treats as unproven. A new grant's
+/// view of the lineage lifts nothing either; only M10's takeover or rejoin does.
+#[retcd_test]
+fn a_re_emit_never_lifts_a_partition_fence() {
+    let mut rig = Rig::new();
+    gate_read_only(&mut rig);
+    let lineage = rig.view().lineage;
+    rig.step(fence(
+        FenceScope::Partition(P),
+        DenyReason::GenerationChanged,
+    ));
+    let frozen = PubMode::Frozen {
+        cause: FreezeCause::AuthorityLost(DenyReason::GenerationChanged),
+    };
+    assert_eq!(rig.view().mode, frozen, "fixture: the partition fence");
+    rig.step(recovered(PartitionMode::Active, 5, false, None));
+    assert_eq!(rig.view().mode, frozen, "the re-emit lifts nothing");
+    rig.step(EventKind::Kernel(KernelEvent::Authority(
+        AuthorityEvent::View(AuthorityView {
+            lineage,
+            grant_id: GrantId(2),
+            ..authority_view(4)
+        }),
+    )));
+    assert_eq!(
+        rig.view().mode,
+        frozen,
+        "nor does a new grant's view after it"
+    );
+}
