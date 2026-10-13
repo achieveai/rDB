@@ -110,6 +110,27 @@ pub fn init_test_logging() {
     });
 }
 
+/// Flushes the per-test log writer when dropped. `#[retcd_test]` creates one before anything
+/// else in the test, so it drops last: after the body, after an async test's runtime has shut
+/// down (whose tasks still log), and during unwinding after a panic. It drops inside the test
+/// function, before libtest has the result, so the binary cannot exit while it is flushing.
+/// Without it, the lines still queued when the binary's last test returns are lost at exit.
+///
+/// It is a plain local, never a thread-local: a thread-local destructor runs under the Windows
+/// loader lock, and one that waits on the writer stops every thread in the process from
+/// starting or exiting. Observed 2026-10-12 as a hang in `m3_authz`.
+#[derive(Debug)]
+pub struct FlushTestLogsOnDrop;
+
+impl Drop for FlushTestLogsOnDrop {
+    fn drop(&mut self) {
+        // Panicking while already unwinding would abort the process; report and carry on.
+        if let Err(e) = crate::layer::try_flush_test_logs() {
+            eprintln!("{e}");
+        }
+    }
+}
+
 /// Create the root span for a test. Prefer `#[retcd_test]`; use this directly only when the
 /// attribute cannot be applied.
 pub fn test_span(module: &'static str, method: &'static str) -> Span {

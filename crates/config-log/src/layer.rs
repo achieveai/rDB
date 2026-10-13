@@ -11,12 +11,22 @@
 //! Redaction is the caller's responsibility (log `key_hex`, never values), but as a safety
 //! net any field literally named `value`, `password`, `secret`, `token`, or `private_key`
 //! is replaced with `"<redacted>"`.
+//!
+//! Per-test lines are written by one background thread, never by the logging thread. On
+//! 2026-10-12 a single append to one per-test file blocked for 2.2–2.8 s on the Windows test
+//! host. The layer then held a process-wide lock across that write, so every thread of every
+//! test in the binary waited behind it, and whole cluster suites failed with deadline and
+//! leader errors. Now a slow write delays only the writer thread. The cost is that a line is
+//! on disk only once the writer reaches it: [`test_file_path`] and [`flush_test_logs`] wait
+//! for that, and `#[retcd_test]` flushes again when the test ends
+//! ([`crate::testing::FlushTestLogsOnDrop`]).
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
@@ -115,8 +125,81 @@ pub struct JsonlLayer {
     application: String,
     default_sink: Mutex<Sink>,
     test_log_dir: Option<PathBuf>,
-    test_files: Mutex<HashMap<PathBuf, File>>,
     include_location: bool,
+}
+
+/// Work for the per-test writer thread, handled in the order it was sent.
+enum WriterMsg {
+    /// Append `line` to the file at the path.
+    Line(PathBuf, Vec<u8>),
+    /// Every line sent before this one is written; answer on the channel.
+    Flush(mpsc::SyncSender<()>),
+}
+
+/// The per-test writer, started by the first per-test line. One per process, shared by every
+/// [`JsonlLayer`], so [`flush_test_logs`] covers them all.
+static TEST_WRITER: OnceLock<mpsc::Sender<WriterMsg>> = OnceLock::new();
+
+fn test_writer() -> &'static mpsc::Sender<WriterMsg> {
+    TEST_WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("retcd-test-log-writer".into())
+            .spawn(move || run_test_writer(rx))
+            .expect("spawn the per-test log writer thread");
+        tx
+    })
+}
+
+fn run_test_writer(rx: mpsc::Receiver<WriterMsg>) {
+    let mut files: HashMap<PathBuf, File> = HashMap::new();
+    for msg in rx {
+        match msg {
+            WriterMsg::Line(path, line) => {
+                let file = files.entry(path).or_insert_with_key(|path| {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .unwrap_or_else(|e| panic!("cannot open test log {}: {e}", path.display()))
+                });
+                let _ = file.write_all(&line);
+            }
+            WriterMsg::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+/// The per-test writer thread has stopped, so lines sent to it were lost. It stops only by
+/// panicking, after failing to open a test log; that panic is on stderr.
+#[derive(Debug, thiserror::Error)]
+#[error("the per-test log writer thread has stopped; per-test log lines were lost (see its panic on stderr)")]
+pub struct TestWriterStopped;
+
+/// Wait until every per-test line logged before this call is in its file.
+///
+/// Returns at once in a process that never routed a line to a per-test file.
+pub fn try_flush_test_logs() -> Result<(), TestWriterStopped> {
+    let Some(tx) = TEST_WRITER.get() else {
+        return Ok(());
+    };
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    tx.send(WriterMsg::Flush(done_tx))
+        .map_err(|_| TestWriterStopped)?;
+    done_rx.recv().map_err(|_| TestWriterStopped)
+}
+
+/// [`try_flush_test_logs`], panicking if the writer has stopped: a reader must not see a
+/// file with lines silently missing.
+pub fn flush_test_logs() {
+    if let Err(e) = try_flush_test_logs() {
+        panic!("{e}");
+    }
 }
 
 impl JsonlLayer {
@@ -132,7 +215,6 @@ impl JsonlLayer {
             application: application.into(),
             default_sink: Mutex::new(Sink::Writer(default_writer)),
             test_log_dir,
-            test_files: Mutex::new(HashMap::new()),
             include_location,
         }
     }
@@ -144,19 +226,10 @@ impl JsonlLayer {
                     .get(TEST_MODULE_FIELD)
                     .and_then(Value::as_str)
                     .unwrap_or("unknown_module");
-                let path = test_file_path(dir, module, method);
-                let mut files = self.test_files.lock().unwrap_or_else(|e| e.into_inner());
-                let file = files.entry(path.clone()).or_insert_with(|| {
-                    if let Some(parent) = path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .unwrap_or_else(|e| panic!("cannot open test log {}: {e}", path.display()))
-                });
-                let _ = file.write_all(line);
+                let path = test_file_path_of(dir, module, method);
+                // A send fails only once the writer has stopped; `flush_test_logs` reports
+                // that to whoever reads the file next.
+                let _ = test_writer().send(WriterMsg::Line(path, line.to_vec()));
                 return;
             }
         }
@@ -170,7 +243,18 @@ impl JsonlLayer {
 }
 
 /// Path of the per-test JSONL file for `(module, method)` under `dir`.
+///
+/// Flushes first ([`flush_test_logs`]), so the file holds every line logged before the call.
+/// Every reader of its own test log gets the path here, which is why the flush lives here and
+/// not at each call site. A reader that finds a log file some other way calls
+/// [`flush_test_logs`] itself. In a process with no per-test routing, such as a daemon, the
+/// flush returns at once.
 pub fn test_file_path(dir: &Path, module: &str, method: &str) -> PathBuf {
+    flush_test_logs();
+    test_file_path_of(dir, module, method)
+}
+
+fn test_file_path_of(dir: &Path, module: &str, method: &str) -> PathBuf {
     dir.join(sanitize(&module.replace("::", ".")))
         .join(format!("{}.jsonl", sanitize(method)))
 }
