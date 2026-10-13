@@ -915,7 +915,9 @@ impl Db {
         self.clock.now()
     }
 
-    /// The boot `node`'s running process has, or `None` for a node this `Db` does not run.
+    /// The boot `node`'s running process has, or `None` for a node this `Db` does not run. After
+    /// a restart that failed, the boot that restart gave it: no process runs it, and the old
+    /// boot is retired either way (F-013).
     #[must_use]
     pub fn boot_of(&self, node: NodeId) -> Option<BootId> {
         lock(&self.nodes)
@@ -924,8 +926,9 @@ impl Db {
             .map(|handle| handle.boot)
     }
 
-    /// Why writes stopped for good, once a node of this `Db` has restarted; `None` while every
-    /// node runs its first boot. Names each restarted node and its boot, in one short clause,
+    /// Why writes stopped for good, once a node of this `Db` has restarted or failed to restart;
+    /// `None` while every node runs its first boot. Names each restarted node and its boot, and
+    /// says when the restart failed and the node stays stopped (F-013), in one short clause,
     /// because it rides on every refused answer (tester walk 5): a restarted copy does not
     /// rejoin before M10 (achieveai/rDB#42), so writes do not resume, and this `Db`'s data and
     /// control store cannot be opened again (`NotEmpty`, `AlreadyExists`), so writing again
@@ -937,10 +940,15 @@ impl Db {
             .filter(|handle| handle.boot != host::BOOT)
             .map(|handle| {
                 let (node, boot) = (handle.node.0, handle.boot.0);
-                if handle.node == OWNER {
-                    format!("the owner, node {node}, restarted (now boot {boot})")
+                let who = if handle.node == OWNER {
+                    format!("the owner, node {node},")
                 } else {
-                    format!("node {node} restarted (now boot {boot})")
+                    format!("node {node}")
+                };
+                if handle.start_failed {
+                    format!("{who} stopped: its restart as boot {boot} failed")
+                } else {
+                    format!("{who} restarted (now boot {boot})")
                 }
             })
             .collect();
@@ -1110,7 +1118,8 @@ impl Db {
     /// `UNAVAILABLE`, with nothing stopped, before this `Db` is ready: node 1 has never been seen
     /// admitting writes (logged `node_restart_refused_not_ready`). `INVALID_ARGUMENT` for a node
     /// this `Db` does not run, or a `Db` with no data directory (a crate test's). A host error
-    /// when the node does not start again: it then stays stopped.
+    /// when the node does not start again: it then stays stopped, [`Self::boot_of`] names the
+    /// boot it was given, and [`Self::restart_note`] says the restart failed (F-013).
     pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
@@ -1172,6 +1181,10 @@ impl Db {
                     %detail,
                     "node_restart_failed"
                 );
+                // The old process is gone and its boot is retired: name the boot it was given,
+                // so nothing calls the old boot's grant "running" (F-013).
+                handle.boot = boot;
+                handle.start_failed = true;
                 Err(ApiError::host(&detail))
             }
         }
@@ -2795,6 +2808,76 @@ mod tests {
         db.ready_seen.store(true, Ordering::Relaxed);
         assert_eq!(db.restart_node(OWNER).expect("ready was seen"), BootId(2));
         assert_eq!(db.boot_of(OWNER), Some(BootId(2)));
+        db.shutdown();
+    }
+
+    /// Msg 8, F-013: a restart whose new process does not start leaves the node stopped, and
+    /// says so. Before, the handle kept the old boot: `restart_note` was `None`, so refusals lost
+    /// the note, and `clear_grant` called the stopped node's record `Current`, "running".
+    /// Unit (~100 ms): node 2's data directory sits under a file, so its engine cannot open.
+    #[test]
+    fn a_failed_restart_leaves_the_node_stopped_and_says_so() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let blocker = dir.path().join("nodes");
+        std::fs::write(&blocker, b"a file where the nodes directory goes").expect("write");
+        let store = config_testkit::MemStore::new();
+        let (owner, _owner_mailbox) = NodeHandle::unanswered(OWNER);
+        let (second, _second_mailbox) = NodeHandle::unanswered(NodeId(2));
+        let short = Timeouts {
+            read: Duration::from_millis(20),
+            ..Timeouts::default()
+        };
+        let mut db = Db::by_hand(
+            vec![owner, second],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            short,
+            Some((blocker, fast())),
+        );
+        db.ready_seen.store(true, Ordering::Relaxed);
+
+        let failed = db
+            .restart_node(NodeId(2))
+            .expect_err("cannot open its engine");
+        assert_eq!(failed.kind, ErrorKind::Unavailable, "{failed:?}");
+        assert_eq!(
+            db.boot_of(NodeId(2)),
+            Some(BootId(2)),
+            "the boot it was given"
+        );
+        let note = db
+            .restart_note()
+            .expect("a failed restart stops writes too");
+        assert!(
+            note.contains("node 2 stopped: its restart as boot 2 failed"),
+            "{note}"
+        );
+        let refused = db.get(b"a").expect_err("node 1 never answers");
+        assert!(refused.detail.ends_with(&note), "{refused:?}");
+
+        let old = rdb_core::authority::grant::GrantRecord {
+            grant: GrantId(2),
+            node: NodeId(2),
+            boot: host::BOOT,
+            authority_generation: rdb_core::contracts::ids::AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(rdb_core::contracts::control::ControlKey::Grant(NodeId(2)).encode()),
+            value: old.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/2");
+        let clearance = rt
+            .block_on(crate::admin::clear_grant(&db, &store, NodeId(2)))
+            .expect("clear_grant");
+        assert!(
+            matches!(clearance, crate::admin::Clearance::Cleared(_)),
+            "the boot-1 record is no running process's: {clearance:?}"
+        );
         db.shutdown();
     }
 

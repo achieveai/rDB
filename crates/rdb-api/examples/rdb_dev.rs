@@ -73,10 +73,10 @@
 //!                                         and it may go: `absent`, `current` (the running
 //!                                         process's own), `cleared rev=R`, `conflict`, or
 //!                                         `refused ...`. Only `not-proven-expired` clears by
-//!                                         waiting, and says how long; `frozen` waits for the
-//!                                         takeover to finish, `partition-in-transfer pP` for
-//!                                         pP to be `serving` again. Clearing never lets a
-//!                                         restarted owner write again in M9
+//!                                         waiting, and says how long; `frozen` never clears
+//!                                         in M9 (no takeover runs), `partition-in-transfer
+//!                                         pP` waits for pP to be `serving` again. Clearing
+//!                                         never lets a restarted owner write again in M9
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
@@ -108,8 +108,10 @@
 //! While it runs, a poller prints the partition's progress as it changes: `recovered gen=N`,
 //! `waiting to admit writes (l1=.. authority=..)`, and `ready` once node 1 admits writes: its L1
 //! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
-//! waiting line then saying which. When node 1's grant is fenced, that line says why and that
-//! writes resume by themselves, so the node is not restarted (#42). After a secondary restarts,
+//! waiting line then saying which. When node 1's grant is fenced, that line says why. While A1
+//! still polls its own record it adds that writes resume by themselves, so the node is not
+//! restarted (#42); once the poll has stopped, or for a frozen, foreign-boot or other-authority
+//! record, it says nothing in M9 replaces the grant and writes stay stopped for the run. After a secondary restarts,
 //! L1 still admits writes for a while, so the line reads `ready for now; writes pause within
 //! about 2 s of the next write because ..` until they do: about 2 s after the restart, or,
 //! after a fence, about 2 s after the next write (tester q8). A put before `ready` is refused,
@@ -152,6 +154,7 @@ use rdb_api::host::NodeStatus;
 use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::contracts::authority::DenyReason;
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, PartitionId, RequestId};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
@@ -502,9 +505,14 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
 /// restart wins. While node 1 still admits writes, it says they are about to pause: L1 keeps
 /// admitting for about 2 s after a secondary restarts (walk 6c), or after a fence until about
 /// 2 s after the next write (tester q8), so a bare `ready` there is true and misleading
-/// (Message 7). Both pauses fall within about 2 s of the next write (F-015). Once they pause, it says nothing brings them back in this run
-/// (D2). Then a fenced grant, which looks stuck but is not: A1 replaces the grant itself once the
-/// old one's expiry is proven, and a restart there would end recovery for the run (Message 6).
+/// (Message 7). Both pauses fall within about 2 s of the next write (F-015). Once they pause, it
+/// says nothing brings them back in this run (D2).
+///
+/// Then a fenced grant. While A1's self-replace poll is live it looks stuck but is not: A1
+/// replaces the grant itself once the old one's expiry is proven, and a restart there would end
+/// recovery for the run (Message 6). The line promises that only while the poll is live and the
+/// reason is not one [`never_replaced`] names (F-004): once the poll stopped (a frozen, foreign
+/// or deleted record, F-016), nothing in M9 lifts the fence.
 fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) -> Option<String> {
     if let Some(note) = restart_note {
         return Some(if admits {
@@ -517,14 +525,31 @@ fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) ->
         });
     }
     let node = owner.node.0;
-    (!admits && owner.authority.starts_with("fenced")).then(|| {
+    let reason = owner.fence.filter(|_| !admits)?;
+    Some(if owner.fence_polling && !never_replaced(reason) {
         format!(
             "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
              is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
              (achieveai/rDB#42)",
             owner.authority
         )
+    } else {
+        format!(
+            "node {node}'s grant is {}; nothing in M9 replaces it, so writes stay stopped for \
+             this run: to write again, quit and start rdb_dev again",
+            owner.authority
+        )
     })
+}
+
+/// A fence reason whose grant record A1's self-replace answers `Never` (`grant::self_replace`):
+/// frozen, another boot's, or under another authority generation. The first poll stops on it,
+/// so the line says so from the fence on rather than for one renewal interval later.
+const fn never_replaced(reason: DenyReason) -> bool {
+    matches!(
+        reason,
+        DenyReason::Frozen | DenyReason::BootMismatch | DenyReason::AuthorityGenerationChanged
+    )
 }
 
 /// The `ready` or `not ready` line to print for `owner`, given what was printed last, and what
@@ -1289,8 +1314,8 @@ fn clearance_line(clearance: Clearance, node: NodeId, db: &Db) -> String {
         Clearance::Refused {
             refusal: ClearRefusal::Frozen,
             ..
-        } => "refused frozen: a takeover froze this grant; it clears only once the takeover \
-              finishes, never by waiting"
+        } => "refused frozen: this grant is frozen; M9 runs no takeover and nothing in M9 \
+              unfreezes it, so it never clears in this run"
             .to_owned(),
         Clearance::Refused {
             refusal: ClearRefusal::PartitionInTransfer(partition),
@@ -1579,6 +1604,8 @@ mod tests {
             fault: None,
             holds: None,
             authority: "valid".to_owned(),
+            fence: None,
+            fence_polling: false,
             recovery: Some("Committed".to_owned()),
             recovered: Some(Generation(1)),
             role: "primary",
@@ -1654,6 +1681,8 @@ mod tests {
     fn a_fenced_owner_says_writes_resume_by_themselves_and_not_to_restart() {
         let mut fenced = owner(None, false);
         fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        fenced.fence_polling = true;
         let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
         let mut seen = Seen {
             ready: true,
@@ -1685,6 +1714,68 @@ mod tests {
                 "ready".to_owned(),
             ]
         );
+    }
+
+    /// Msg 8, F-004 and F-016: "resume by themselves" only while A1's after-fence poll is live
+    /// and the reason is one the self-replace can lift. `fenced(Frozen)` never resumes, even
+    /// before its first poll stops; `fenced(Expired)` whose poll stopped (a later freeze or
+    /// delete) prints a new line saying so. The host row
+    /// `status_says_the_after_fence_poll_stopped_when_the_record_is_frozen_later` proves the
+    /// poll field on a real host.
+    #[test]
+    fn a_fence_promises_resume_only_while_the_poll_is_live_and_can_lift_it() {
+        let fenced = |reason: DenyReason, polling: bool| {
+            let mut node = owner(None, false);
+            node.authority = format!("fenced({reason:?})");
+            node.fence = Some(reason);
+            node.fence_polling = polling;
+            node
+        };
+        let resume = |reason: &str| {
+            format!(
+                "not ready: writes not admitted: node 1's grant is fenced({reason}); writes \
+                 resume by themselves once the old grant's expiry is proven, so do not restart \
+                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
+            )
+        };
+        let stuck = |reason: &str| {
+            format!(
+                "not ready: writes not admitted: node 1's grant is fenced({reason}); nothing in \
+                 M9 replaces it, so writes stay stopped for this run: to write again, quit and \
+                 start rdb_dev again"
+            )
+        };
+        for (reason, name) in [
+            (DenyReason::Frozen, "Frozen"),
+            (DenyReason::BootMismatch, "BootMismatch"),
+            (
+                DenyReason::AuthorityGenerationChanged,
+                "AuthorityGenerationChanged",
+            ),
+        ] {
+            for polling in [true, false] {
+                let mut seen = Seen::default();
+                assert_eq!(
+                    ready_step(&mut seen, &fenced(reason, polling), None),
+                    Some(stuck(name)),
+                    "{name}, polling={polling}"
+                );
+            }
+        }
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let lines: Vec<String> = [
+            fenced(DenyReason::Expired, true),
+            fenced(DenyReason::Expired, true),
+            fenced(DenyReason::Expired, false),
+            fenced(DenyReason::Expired, false),
+        ]
+        .iter()
+        .filter_map(|node| ready_step(&mut seen, node, None))
+        .collect();
+        assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
     }
 
     /// Message 7: after a secondary restarts, L1 keeps admitting writes for about 2 s (walk 6c),

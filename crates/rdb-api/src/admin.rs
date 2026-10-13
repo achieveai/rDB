@@ -35,7 +35,7 @@ use rdb_core::contracts::authority::{
 };
 use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::digest::Digest;
-use rdb_core::contracts::errors::ErrorKind;
+use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::{EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
     AuthorityGeneration, ConfigVersion, CorrelationId, Generation, GrantId, NodeId, OwnerEpoch,
@@ -289,8 +289,10 @@ pub enum Clearance {
 ///
 /// `INVALID_ARGUMENT` for a node `db` does not run, or a `Db` built without budgets (a crate
 /// test's). `UNAVAILABLE` when a read fails, the `partitions/` list comes back truncated, or a
-/// record does not decode: nothing is deleted then. `UNKNOWN_OUTCOME` when the delete's reply is
-/// lost; running it again reads where it stands.
+/// record does not decode: nothing is deleted then, and `no_mutation` says so. Its retry rule is
+/// `BoundedJitter` only for a store that was unavailable, timed out or not the leader, and
+/// `NotWired` otherwise: repeating a refused or unreadable call changes nothing (F-012).
+/// `UNKNOWN_OUTCOME` when the delete's reply is lost; running it again reads where it stands.
 pub async fn clear_grant(
     db: &Db,
     store: &dyn ConfigStore,
@@ -323,7 +325,7 @@ async fn judge_and_clear(
             key: Bytes::from(key.clone()),
         })
         .await
-        .map_err(|error| store_failed(&format!("get {key}"), &error))?;
+        .map_err(|error| store_failed(&format!("get {key}"), &error, true))?;
     let Some(found) = read.record else {
         tracing::info!(
             node = node.0,
@@ -334,7 +336,7 @@ async fn judge_and_clear(
         return Ok(Clearance::Absent);
     };
     let record = GrantRecord::decode(&found.value).ok_or_else(|| {
-        unavailable(format!(
+        unreadable(format!(
             "{key} at revision {} is not a grant record",
             found.mod_revision
         ))
@@ -385,9 +387,9 @@ async fn list_partitions(store: &dyn ConfigStore) -> Result<Vec<PartitionRecord>
             max_bytes: 0,
         })
         .await
-        .map_err(|error| store_failed(&format!("list {prefix}"), &error))?;
+        .map_err(|error| store_failed(&format!("list {prefix}"), &error, true))?;
     if listed.truncated {
-        return Err(unavailable(format!(
+        return Err(unreadable(format!(
             "list {prefix} came back truncated at revision {}",
             listed.read_revision
         )));
@@ -397,7 +399,7 @@ async fn list_partitions(store: &dyn ConfigStore) -> Result<Vec<PartitionRecord>
         .iter()
         .map(|found| {
             PartitionRecord::decode(&found.value).ok_or_else(|| {
-                unavailable(format!(
+                unreadable(format!(
                     "{} at revision {} is not a partition record",
                     String::from_utf8_lossy(&found.key),
                     found.mod_revision
@@ -427,9 +429,15 @@ async fn delete(store: &dyn ConfigStore, key: &str, revision: u64) -> Result<Cle
             ErrorKind::UnknownOutcome,
             format!("delete {key} at revision {revision}: the reply was lost"),
         )),
+        // Refused before it was proposed: the record is as it was. Any other failure may have
+        // reached the store.
         Err(error) => Err(store_failed(
             &format!("delete {key} at revision {revision}"),
             &error,
+            matches!(
+                error,
+                ConfigError::Unavailable { .. } | ConfigError::NotLeader { .. }
+            ),
         )),
     }
 }
@@ -438,8 +446,11 @@ async fn delete(store: &dyn ConfigStore, key: &str, revision: u64) -> Result<Cle
 /// only (`grant_clear_store_error{call, error}`), since an `Unavailable` names the whole
 /// membership with its ports. A read that timed out says so: the store's wording, "mutation
 /// outcome is unknown", is about a write. Never a lost delete reply, which
-/// [`delete`] answers itself.
-fn store_failed(call: &str, error: &ConfigError) -> ApiError {
+/// [`delete`] answers itself. Only a transient error ([`crate::control::transient`]) is worth
+/// a jittered retry; any other says the call itself is refused, and repeating it changes
+/// nothing (review F-012). `no_mutation` is the caller's: true for a read, false for a delete
+/// that may have reached the store.
+fn store_failed(call: &str, error: &ConfigError, no_mutation: bool) -> ApiError {
     tracing::warn!(call, %error, "grant_clear_store_error");
     let short = match error {
         ConfigError::DeadlineExceededUnknownOutcome => "timed out".to_owned(),
@@ -448,14 +459,32 @@ fn store_failed(call: &str, error: &ConfigError) -> ApiError {
         }
         other => other.to_string(),
     };
-    unavailable(format!("{call}: {short}"))
+    let retry = if crate::control::transient(error) {
+        RetryRule::BoundedJitter
+    } else {
+        RetryRule::NotWired
+    };
+    unavailable(format!("{call}: {short}"), retry, no_mutation)
 }
 
-fn unavailable(detail: String) -> ApiError {
-    ApiError::new(
-        ErrorKind::Unavailable,
-        format!("control store: {detail}; nothing deleted"),
-    )
+/// A record this build cannot read, or a list cut short: before anything is written, and the
+/// same on every retry, so `NotWired` (review F-012).
+fn unreadable(detail: String) -> ApiError {
+    unavailable(detail, RetryRule::NotWired, true)
+}
+
+fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError {
+    let tail = if no_mutation {
+        "nothing deleted"
+    } else {
+        "the delete may have applied; run it again to read where it stands"
+    };
+    ApiError {
+        kind: ErrorKind::Unavailable,
+        retry,
+        no_mutation,
+        detail: format!("control store: {detail}; {tail}"),
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +652,79 @@ mod tests {
             );
             assert_eq!(grant_revision(store, &rt), Some(written), "{case}");
         }
+    }
+
+    /// Msg 8, F-012: a refusal before the delete says nothing was mutated, and only a transient
+    /// store error says a jittered retry helps. A permission error and a `grants/1` that does
+    /// not decode stay the same however often they are retried, so they answer `NotWired`; an
+    /// unavailable store answers `BoundedJitter`. Each leaves `grants/1` as it was.
+    /// Unit (~20 ms).
+    #[test]
+    fn a_clear_refused_before_the_delete_says_no_mutation_and_retries_only_transient_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for (case, error, retry) in [
+            (
+                "permission",
+                ConfigError::PermissionDenied {
+                    detail: "no grant on grants/".to_owned(),
+                },
+                RetryRule::NotWired,
+            ),
+            (
+                "unavailable",
+                ConfigError::Unavailable {
+                    reason: "down".to_owned(),
+                },
+                RetryRule::BoundedJitter,
+            ),
+        ] {
+            let store = config_testkit::MemStore::new();
+            let (db, _mailbox, written) = restarted_owner(&store, &rt);
+            store.failing_with(error);
+            let refused = rt
+                .block_on(clear_grant(&db, &store, OWNER))
+                .expect_err(case);
+            store.stop_failing();
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::Unavailable, retry, true),
+                "{case}: {refused:?}"
+            );
+            assert!(
+                refused.detail.ends_with("nothing deleted"),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(grant_revision(&store, &rt), Some(written), "{case}");
+        }
+
+        let store = config_testkit::MemStore::new();
+        let (db, _mailbox, _) = restarted_owner(&store, &rt);
+        let key = Bytes::from(ControlKey::Grant(OWNER).encode());
+        let found = rt
+            .block_on(store.get(GetRequest { key: key.clone() }))
+            .expect("get")
+            .record
+            .expect("grants/1");
+        let garbled = rt
+            .block_on(store.put(PutRequest {
+                key,
+                value: Bytes::from_static(b"not a grant record"),
+                expected_mod_revision: Some(found.mod_revision),
+                dedup: None,
+            }))
+            .expect("put")
+            .revision;
+        let refused = rt
+            .block_on(clear_grant(&db, &store, OWNER))
+            .expect_err("does not decode");
+        assert_eq!(
+            (refused.kind, refused.retry, refused.no_mutation),
+            (ErrorKind::Unavailable, RetryRule::NotWired, true),
+            "{refused:?}"
+        );
+        assert_eq!(grant_revision(&store, &rt), Some(garbled));
     }
 
     fn put_at(

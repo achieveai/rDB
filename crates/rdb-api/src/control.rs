@@ -395,7 +395,7 @@ fn reload_backoff(attempt: u32) -> std::time::Duration {
 /// Whether a failed list may be sent again: the store could not be reached, did not answer in
 /// time, or was not the leader. Any other error says the request itself is wrong, and retrying
 /// it would hide that forever.
-const fn transient(error: &ConfigError) -> bool {
+pub(crate) const fn transient(error: &ConfigError) -> bool {
     matches!(
         error,
         ConfigError::Unavailable { .. }
@@ -1321,6 +1321,113 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         false
+    }
+
+    /// M9 S2b review F-005: `forget_node(n)` stops node `n`'s control work and nobody else's.
+    /// Nodes 1 and 2 each hold a watch waiting to open, a reload held after its list read, and a
+    /// CAS waiting at the store's gate (`MemStore` serves no watches, so a watch that opens
+    /// answers `WatchTerminated`: that answer is the watch's sign of life). Node 2 is forgotten,
+    /// then everything is let through: node 1 gets all three answers, node 2 gets none, and its
+    /// put never reaches the store. A slip that drains every node, or inverts a filter, takes
+    /// node 1's work and goes red here. Unit (~300 ms, mostly the quiet window).
+    #[test]
+    fn forgetting_one_node_stops_its_control_work_and_leaves_the_others() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(Scripted::gated_with(Script {
+            hold_lists: 2,
+            hold_watches: 2,
+            ..Script::default()
+        }));
+        let links = Links::new();
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx1);
+        links.register(NodeId(2), tx2);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        let submit = |node, effect| {
+            adapter.submit(
+                node,
+                crate::host::BOOT,
+                PartitionId(1),
+                CorrelationId(0),
+                effect,
+            );
+        };
+        let waited = |signal: &tokio::sync::Notify, what: &str| {
+            let arrived = rt.block_on(async {
+                tokio::time::timeout(crate::host::test_patience(PATIENCE), signal.notified()).await
+            });
+            assert!(arrived.is_ok(), "{what} did not arrive");
+        };
+        let grant = |node| ControlKey::Grant(NodeId(node));
+        for node in [1, 2] {
+            submit(
+                NodeId(node),
+                ControlEffect::Watch {
+                    prefix: ControlPrefix::Partitions,
+                    from: Revision(0),
+                },
+            );
+            waited(&store.watch_held, "the watch");
+            submit(
+                NodeId(node),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Grants,
+                },
+            );
+            waited(&store.list_held, "the reload's list");
+            submit(
+                NodeId(node),
+                ControlEffect::Cas {
+                    request: ControlRequestId(u64::from(node)),
+                    key: grant(node),
+                    expected: None,
+                    value: Some(Bytes::from_static(b"grant")),
+                },
+            );
+            waited(&store.put_arrived, "the CAS's put");
+        }
+
+        adapter.forget_node(NodeId(2), crate::host::BOOT);
+        for _ in [1, 2] {
+            store.release();
+            store.release_lists();
+            store.release_watches();
+        }
+
+        let kind = |seen: Vec<String>| {
+            let mut kinds: Vec<String> = seen
+                .iter()
+                .map(|name| name.split([' ', '{']).next().unwrap_or_default().to_owned())
+                .collect();
+            kinds.sort();
+            kinds
+        };
+        assert_eq!(
+            kind(received(&rx1, 3)),
+            ["CasResult", "FamilySnapshot", "WatchTerminated"],
+            "node 1's watch, reload and CAS all answer"
+        );
+        assert_eq!(
+            received(&rx2, 0),
+            Vec::<String>::new(),
+            "nothing of the forgotten node's answers"
+        );
+        let unapplied = rt
+            .block_on(store.mem().get(config_core::GetRequest {
+                key: Bytes::from(grant(2).encode()),
+            }))
+            .expect("get grants/2");
+        assert!(unapplied.record.is_none(), "{unapplied:?}");
+        adapter.shutdown();
     }
 
     /// M9 S2a ruling: only the newest reload of a family answers. A reload whose list read the

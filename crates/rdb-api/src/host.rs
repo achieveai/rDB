@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, FenceScope, Lineage, PartitionMode,
+    AuthorityEffect, AuthorityView, DenyReason, FenceScope, Lineage, PartitionMode, Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -438,6 +438,12 @@ pub struct NodeStatus {
     pub holds: Option<Holding>,
     /// A1's state, as one word and a grant id.
     pub authority: String,
+    /// Why A1 is fenced; `None` while it is not.
+    pub fence: Option<DenyReason>,
+    /// Whether A1 is fenced and its self-replace poll (A-R96) will still read its own grant
+    /// record again ([`Authority::self_replace_polling`]). `false` once a poll found the record
+    /// not this boot's to replace, or absent: nothing in M9 then lifts the fence (F-004, F-016).
+    pub fence_polling: bool,
     /// F1's phase for the partition, when an instance exists.
     pub recovery: Option<String>,
     /// The newest generation this node recovered or landed.
@@ -451,7 +457,7 @@ pub struct NodeStatus {
     pub admits: Option<bool>,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
-    /// The request node 1's T1 holds applied and not yet published, which publishing it
+    /// The request this node's T1 holds applied and not yet published, which publishing it
     /// resolves (`Inflight::Dispatched`). `None` when nothing is applied unpublished: a request
     /// refused at admission, or never sent, is not here (Msg 8, W6-D1).
     pub in_flight: Option<RequestId>,
@@ -489,6 +495,9 @@ pub struct NodeHandle {
     pub node: NodeId,
     /// The boot this process of the node runs at.
     pub boot: BootId,
+    /// Set when a restart did not start this node again: `boot` is then the boot it was
+    /// given, and no process runs it (F-013).
+    pub(crate) start_failed: bool,
     tx: Sender<Msg>,
     join: Option<JoinHandle<()>>,
 }
@@ -512,6 +521,7 @@ impl NodeHandle {
             Self {
                 node,
                 boot: BOOT,
+                start_failed: false,
                 tx,
                 join: None,
             },
@@ -584,6 +594,7 @@ pub(crate) fn spawn_with(
     Ok(NodeHandle {
         node,
         boot,
+        start_failed: false,
         tx,
         join: Some(join),
     })
@@ -1514,7 +1525,7 @@ impl Host {
     /// [`Self::deny_reply_checks`]: A1's answer to P1's Reply check, turned into a deny.
     #[cfg(test)]
     fn deny_reply_check(&self, mut event: Event) -> Event {
-        use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint, DenyReason, Verdict};
+        use rdb_core::contracts::authority::{AuthorityEvent, Checkpoint};
         if let EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::Answer(answer))) =
             &mut event.kind
         {
@@ -3265,9 +3276,18 @@ impl Host {
 
     fn status(&self, partition: PartitionId) -> NodeStatus {
         let adopted = self.adopted(partition);
-        // Admitting takes both halves: L1 admitting and A1 holding a grant. L1 alone said
-        // `admits=true` on a fenced owner whose puts answered `LEASE_EXPIRED` (M9 S2b, e).
-        let granted = matches!(self.authority.view().state, AuthorityState::Held(_));
+        let now = self.clock.now();
+        // Admitting takes both halves: L1 admitting and A1 admitting. L1 alone said
+        // `admits=true` on a fenced owner whose puts answered `LEASE_EXPIRED` (M9 S2b, e). A1's
+        // half is its own verdict on the adopted lineage, not "holds a grant": a held grant
+        // still denies while the control store is unavailable, or before it serves the
+        // partition (review F-001).
+        let lineage = Lineage {
+            partition,
+            generation: adopted.generation,
+            owner_epoch: adopted.owner_epoch,
+        };
+        let granted = self.authority.may_admit_at(lineage, now, &self.budgets) == Verdict::Admit;
         let authority = match &self.authority.view().state {
             AuthorityState::Unheld { .. } => "unheld".to_owned(),
             AuthorityState::Held(held) => format!("held(grant {})", held.identity().grant.0),
@@ -3302,13 +3322,14 @@ impl Host {
             }),
         };
         let l1 = self.l1.get(&partition).map(|l1| &l1.protection);
-        let now = self.clock.now();
         NodeStatus {
             node: self.node,
             boot: self.boot,
             fault: self.fault.clone(),
             holds,
             authority,
+            fence: fence_of(self.authority.state()),
+            fence_polling: self.authority.self_replace_polling(),
             recovery: self
                 .recoveries
                 .get(&partition)
@@ -3382,6 +3403,16 @@ fn step_l1(
 
 const fn is_progress(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Kernel(input) if !matches!(input, KernelEvent::Recovered(_)))
+}
+
+/// [`NodeStatus::fence`] for `state`: the reason only while `Fenced`. Not
+/// [`AuthorityState::fence_reason`], which also answers `last_fence` while `Unheld`, as during a
+/// self-replace's re-acquisition (walk 8d).
+const fn fence_of(state: &AuthorityState) -> Option<DenyReason> {
+    match state {
+        AuthorityState::Fenced { reason, .. } => Some(*reason),
+        AuthorityState::Unheld { .. } | AuthorityState::Held(_) => None,
+    }
 }
 
 const fn mode_name(mode: Mode) -> &'static str {
@@ -3559,6 +3590,8 @@ mod tests {
     /// new boot, which has no R1 instance to serve it. So the host drops a completion stamped
     /// with another boot. The second half is the control: the same read stamped with this
     /// process's boot does arm the acquire, so the first half's quiet is the boot check's.
+    /// A control fault is dropped the same way (review F-006): the previous process's failed
+    /// call must not fault the new one, and the same fault from this boot does.
     /// Unit (~300 ms): one host, no thread; a `MemStore` shows whether a grant was written.
     #[test]
     fn a_grant_read_from_the_previous_boot_never_starts_an_acquire() {
@@ -3596,6 +3629,11 @@ mod tests {
                 outcome: ReadOutcome::Absent { as_of: Revision(5) },
             },
         };
+        let fault_from = |boot| Msg::Fault {
+            boot,
+            kind: "control_reload_failed",
+            detail: "grants/: the store could not list it".to_owned(),
+        };
         let grant = || {
             rt.block_on(store.get(GetRequest {
                 key: Bytes::from(ControlKey::Grant(NodeId(1)).encode()),
@@ -3624,6 +3662,12 @@ mod tests {
             host.timers
         );
         assert!(host.authority.view().state.is_unheld());
+        host.handle(fault_from(BOOT));
+        assert!(
+            host.fault.is_none(),
+            "a control fault from the boot-1 process faulted the boot-2 process: {:?}",
+            host.fault
+        );
 
         host.handle(read_from(BootId(2)));
         host.drain();
@@ -3631,6 +3675,12 @@ mod tests {
             host.timers.len(),
             1,
             "the same read from this boot arms the acquire's retry"
+        );
+
+        host.handle(fault_from(BootId(2)));
+        assert!(
+            host.fault.is_some(),
+            "the same fault from this boot faults the node"
         );
     }
 
@@ -4942,6 +4992,133 @@ mod tests {
             });
         }
         assert!(versions[1] > 0, "the second fence's version: {versions:?}");
+    }
+
+    /// Msg 8, F-001: `admits` is A1's own admission verdict, not "L1 allows and A1 is `Held`".
+    /// While the control store is down A1 still holds, but denies `ControlUnavailable` before
+    /// it fences, and status said `admits=true` there. After the store returns, `admits=true`
+    /// means a put lands.
+    /// Integration (~2 s): bootstrap's discovery window, then one store outage on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn admits_follows_a1s_verdict_while_the_grant_is_still_held() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        let denied = trio.until("node 1 stops admitting", |trio| {
+            let status = trio.status(0);
+            (status.admits != Some(true)).then_some(status)
+        });
+        trio.mem.stop_failing();
+        assert!(
+            denied.authority.starts_with("held("),
+            "admits went false before the fence, while the grant is still held: {denied:?}"
+        );
+        assert_eq!(denied.admits, Some(false), "{denied:?}");
+        trio.until("node 1 admits again", |trio| {
+            (trio.status(0).admits == Some(true)).then_some(())
+        });
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("a put once status admits: {other:?}"),
+        }
+    }
+
+    /// Msg 8, walk 8d: while a self-replace re-acquires, A1 is `Unheld` with the old fence as
+    /// `last_fence`, and status reported it as a live fence. rdb_dev then said "nothing in M9
+    /// replaces it" one step before the new grant committed. Only `Fenced` is a fence.
+    /// Unit (~0 ms).
+    #[test]
+    fn status_reports_a_fence_only_while_fenced() {
+        let unheld = AuthorityState::Unheld {
+            last_fence: Some(DenyReason::Expired),
+            acquire: None,
+        };
+        assert_eq!(fence_of(&unheld), None, "unheld after a fence");
+        assert_eq!(fence_of(&AuthorityState::default()), None, "unheld at boot");
+        let fenced = AuthorityState::Fenced {
+            reason: DenyReason::Expired,
+            at: Tick(0),
+        };
+        assert_eq!(fence_of(&fenced), Some(DenyReason::Expired));
+    }
+
+    /// Msg 8, F-004 and F-016: status says whether A1's after-fence poll is live, from A1
+    /// itself. An `Expired` fence polls; a freeze of the record afterwards stops the poll while
+    /// the fence still reads `Expired`, so the reason alone cannot tell (F-016). The freeze is
+    /// written with no step in between, after the failing calls have drained, so no poll can
+    /// read the record unfrozen and replace it.
+    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn status_says_the_after_fence_poll_stopped_when_the_record_is_frozen_later() {
+        use config_core::{ConfigStore as _, GetRequest, MutationOutcome, PutRequest};
+        use rdb_core::authority::grant::GrantRecord;
+        use rdb_core::contracts::control::ControlKey;
+
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let held = trio.status(0);
+        assert_eq!((held.fence, held.fence_polling), (None, false), "{held:?}");
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        let fenced = trio.until("node 1 fenced", |trio| {
+            let status = trio.status(0);
+            status.fence.is_some().then_some(status)
+        });
+        assert_eq!(
+            (fenced.fence, fenced.fence_polling, fenced.admits),
+            (Some(DenyReason::Expired), true, Some(false)),
+            "{fenced:?}"
+        );
+
+        // No step from here to the freeze: nothing new is sent, and what was sent fails.
+        std::thread::sleep(Duration::from_millis(50));
+        trio.mem.stop_failing();
+        let key = Bytes::from(ControlKey::Grant(NodeId(1)).encode());
+        let found = trio
+            .rt
+            .block_on(trio.mem.get(GetRequest { key: key.clone() }))
+            .expect("get grants/1")
+            .record
+            .expect("grants/1 exists");
+        let mut record = GrantRecord::decode(&found.value).expect("a grant record");
+        record.frozen = true;
+        let put = trio
+            .rt
+            .block_on(trio.mem.put(PutRequest {
+                key,
+                value: record.encode(),
+                expected_mod_revision: Some(found.mod_revision),
+                dedup: None,
+            }))
+            .expect("put grants/1 frozen");
+        assert_eq!(put.outcome, MutationOutcome::Applied);
+
+        let stopped = trio.until("the poll reads the frozen record", |trio| {
+            let status = trio.status(0);
+            (!status.fence_polling).then_some(status)
+        });
+        assert_eq!(
+            (stopped.fence, stopped.authority.as_str(), stopped.admits),
+            (Some(DenyReason::Expired), "fenced(Expired)", Some(false)),
+            "the reason is unchanged; only the poll says it stopped: {stopped:?}"
+        );
     }
 
     /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
