@@ -1382,20 +1382,35 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
 }
 
 /// `admin clear-grant`'s error as one line, with its retry rule and mutation proof as a `put`
-/// error prints them, and in plain words whether running it again can help (F-012): a
-/// permanent store error and a transient one otherwise read alike.
+/// error prints them, and in plain words whether running it again can help (F-012): a permanent
+/// store error and a transient one otherwise read alike. The words follow the retry rule and
+/// the mutation proof together (F-027).
 fn admin_error_line(node: NodeId, error: &ApiError) -> String {
-    let words = match error.retry {
+    // From `retry` and `no_mutation` together (F-027): a delete that may have applied is worth
+    // running again even when the call itself fails the same way, because the rerun reads the
+    // record before it deletes anything.
+    let transient = match error.retry {
         RetryRule::RefreshRoute | RetryRule::RetryAfterRecovery | RetryRule::BoundedJitter => {
-            "running it again can help"
+            Some(true)
         }
-        RetryRule::QueryStatus => {
-            "run it again: it reads where the record stands before it deletes anything"
-        }
+        RetryRule::QueryStatus => None,
         RetryRule::Definitive
         | RetryRule::Reconcile
         | RetryRule::Quarantine
-        | RetryRule::NotWired => "running it again will not help: it fails the same way each time",
+        | RetryRule::NotWired => Some(false),
+    };
+    let words = match (transient, error.no_mutation) {
+        (None, _) => "run it again: it reads where the record stands before it deletes anything",
+        (Some(true), true) => "running it again can help",
+        (Some(true), false) => {
+            "running it again can help, and shows whether the delete applied: it reads the \
+             record first"
+        }
+        (Some(false), true) => "running it again will not help: it fails the same way each time",
+        (Some(false), false) => {
+            "run it again to see whether the delete applied: it reads the record first, and \
+             only a record still there fails the same way again"
+        }
     };
     format!(
         "err admin clear-grant {}: {} retry={:?} no_mutation={} ({}); {words}",
@@ -2276,6 +2291,40 @@ mod tests {
                         run it again: it reads where the record stands before it deletes \
                         anything"
             )
+        );
+    }
+
+    /// Re-review F-027: the words follow `retry` and `no_mutation` together, never `retry`
+    /// alone. A permanent delete error is `NotWired` with `no_mutation=false`, and its detail
+    /// says the delete may have applied and to run it again to read where it stands; "running
+    /// it again will not help" then contradicted it. A rerun reads the record first, so it
+    /// shows whether the delete applied; only a record still there fails the same way. Unit.
+    #[test]
+    fn an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did() {
+        let error = |retry| ApiError {
+            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
+            retry,
+            no_mutation: false,
+            detail: "control store: delete grants/1 at revision 5: permission denied; the \
+                     delete may have applied; run it again to read where it stands"
+                .to_owned(),
+        };
+        let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
+        assert_eq!(
+            permanent,
+            "err admin clear-grant 1: UNAVAILABLE retry=NotWired no_mutation=false (control \
+             store: delete grants/1 at revision 5: permission denied; the delete may have \
+             applied; run it again to read where it stands); run it again to see whether the \
+             delete applied: it reads the record first, and only a record still there fails \
+             the same way again"
+        );
+        let transient = admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter));
+        assert!(
+            transient.ends_with(
+                "; running it again can help, and shows whether the delete applied: it reads \
+                 the record first"
+            ),
+            "{transient}"
         );
     }
 
