@@ -1,7 +1,8 @@
 //! A control store for crate tests: a `MemStore` that can lose a put's reply, fail a read or a
 //! list, hold every put at a gate (F-003, F-004), hold a list's answer after it has read
-//! (M9 S2a review F-002), or block the list's worker thread there (PR #38 review F-002). It
-//! records when each list arrived (PR #38 review F-001).
+//! (M9 S2a review F-002), or block the list's worker thread there (PR #38 review F-002), or
+//! hold a watch at a gate (M9 S2b review F-005), or fail a delete (F-024). It records when each
+//! list arrived (PR #38 review F-001).
 //!
 //! Written out by hand because `async-trait` is not a dependency of this crate.
 
@@ -37,6 +38,11 @@ pub(crate) struct Script {
     /// [`Scripted::unblock_lists`]: an answer already in hand, in the poll that posts it, where
     /// `abort` cannot reach it (M9 S2a review F-002). Needs a second worker thread.
     pub(crate) block_lists: u32,
+    /// Watches still to wait at a gate until [`Scripted::release_watches`], then open: a watch
+    /// that answers only once the row lets it (M9 S2b review F-005).
+    pub(crate) hold_watches: u32,
+    /// The next delete fails with this, without deleting (M9 S2b review F-024).
+    pub(crate) fail_delete_with: Option<ConfigError>,
 }
 
 /// Whether a blocked list has read, and whether blocked lists may answer.
@@ -55,6 +61,10 @@ pub(crate) struct Scripted {
     pub(crate) put_arrived: Notify,
     /// A held list takes a permit before it answers. Starts closed.
     list_gate: Semaphore,
+    /// A held watch takes a permit before it opens. Starts closed.
+    watch_gate: Semaphore,
+    /// Notified when a held watch has arrived, before it waits at its gate.
+    pub(crate) watch_held: Notify,
     /// Notified when a held list has read, before it waits at its gate.
     pub(crate) list_held: Notify,
     /// The gate a blocked list waits at, on its worker thread.
@@ -72,6 +82,8 @@ impl Scripted {
             gate: Semaphore::new(Semaphore::MAX_PERMITS),
             put_arrived: Notify::new(),
             list_gate: Semaphore::new(0),
+            watch_gate: Semaphore::new(0),
+            watch_held: Notify::new(),
             list_held: Notify::new(),
             blocked: (Mutex::new(Blocked::default()), Condvar::new()),
             lists: Mutex::new(Vec::new()),
@@ -121,11 +133,21 @@ impl Scripted {
         self.list_gate.add_permits(1);
     }
 
+    /// Let held watches open, one at a time.
+    pub(crate) fn release_watches(&self) {
+        self.watch_gate.add_permits(1);
+    }
+
     /// Every put waits until [`Scripted::release`].
     pub(crate) fn gated() -> Self {
+        Self::gated_with(Script::default())
+    }
+
+    /// [`Scripted::gated`], also following `script`.
+    pub(crate) fn gated_with(script: Script) -> Self {
         Self {
             gate: Semaphore::new(0),
-            ..Self::new(Script::default())
+            ..Self::new(script)
         }
     }
 
@@ -218,6 +240,10 @@ impl ConfigStore for Scripted {
         'a: 'b,
         Self: 'b,
     {
+        let fail = self.script.lock().expect("script").fail_delete_with.take();
+        if let Some(error) = fail {
+            return Box::pin(std::future::ready(Err(error)));
+        }
         self.inner.delete(request)
     }
 
@@ -230,6 +256,17 @@ impl ConfigStore for Scripted {
         'a: 'b,
         Self: 'b,
     {
-        self.inner.watch(request)
+        if !self.take(|script| &mut script.hold_watches) {
+            return self.inner.watch(request);
+        }
+        Box::pin(async move {
+            self.watch_held.notify_one();
+            let _permit = self
+                .watch_gate
+                .acquire()
+                .await
+                .expect("the watch gate is never closed");
+            self.inner.watch(request).await
+        })
     }
 }

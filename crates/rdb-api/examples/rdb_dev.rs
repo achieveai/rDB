@@ -38,7 +38,45 @@
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
-//! nodes                                   each node's view of partition 1
+//! nodes                                   each node's view of partition 1, with the boot its
+//!                                         running process has
+//! node restart <n>                        stop node n and start it again on its data at its
+//!                                         boot plus one; prints `node n boot b`. The new
+//!                                         process holds no role and stays out until M10. So
+//!                                         any restart stops writes, safely, for the life of
+//!                                         this run: after a secondary's, L1 pauses within
+//!                                         about 2 s of the next write (`PROTECTION_PAUSED`)
+//!                                         because that copy is never durable again; after
+//!                                         the owner's, no node
+//!                                         holds a grant. Reads: after a secondary's they keep
+//!                                         answering, unless a write was in flight that no
+//!                                         other copy can take yet: then fresh reads answer
+//!                                         `UNKNOWN_OUTCOME` and `get --previous` still
+//!                                         answers. That lasts while no copy that did not
+//!                                         restart can take the write: if the other secondary
+//!                                         was only unreachable, healing its link resolves
+//!                                         it; only with both secondaries restarted does it
+//!                                         wait for M10. After the owner's every read is
+//!                                         `UNAVAILABLE`. Every `PROTECTION_PAUSED`,
+//!                                         `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY`
+//!                                         after it names the restart, and so does a `status`
+//!                                         of `Unknown` for a request this session sent: that
+//!                                         is not evidence of a lost write. After one
+//!                                         secondary's restart it resolves once the other can
+//!                                         take the write; after the owner's, or both
+//!                                         secondaries', it waits for the node to rejoin.
+//!                                         Restarting is not a recovery: catch-up and re-pin
+//!                                         are M10 (achieveai/rDB#42). To write again,
+//!                                         quit and start rdb_dev again. Refused until the
+//!                                         first `ready`
+//! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
+//!                                         and it may go: `absent`, `current` (the running
+//!                                         process's own), `cleared rev=R`, `conflict`, or
+//!                                         `refused ...`. Only `not-proven-expired` clears by
+//!                                         waiting, and says how long; `frozen` never clears
+//!                                         in M9 (no takeover runs), `partition-in-transfer
+//!                                         pP` waits for pP to be `serving` again. Clearing
+//!                                         never lets a restarted owner write again in M9
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
@@ -56,6 +94,11 @@
 //! control fail list <unavailable|deadline|notleader|invalid|off>
 //!                                         every list the Db's store sends answers that error,
 //!                                         until `off`. `control` reads are not affected
+//! control lifecycle <p> <serving|fencing|drained>
+//!                                         rewrite partitions/<p>'s lifecycle on the rEtcd
+//!                                         leader, at its revision. Put `serving` back after
+//! control freeze-grant <n>                set grants/<n>'s frozen bit on the rEtcd leader, at
+//!                                         its revision. Nothing in M9 undoes it: run it last
 //! link hold|heal <a>-<b> | link heal all | links
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //! sleep <millis>
@@ -63,10 +106,17 @@
 //! ```
 //!
 //! While it runs, a poller prints the partition's progress as it changes: `recovered gen=N`,
-//! `waiting for write protection (...)`, and `ready` once node 1's L1 admits writes. A put
-//! before `ready` is refused, never left hanging. A recovery committed below `Active` that
-//! does not activate prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever
-//! the line changes:
+//! `waiting to admit writes (l1=.. authority=..)`, and `ready` once node 1 admits writes: its L1
+//! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
+//! waiting line then saying which. When node 1's grant is fenced, that line says why. While A1
+//! still polls its own record it adds that writes resume by themselves, so the node is not
+//! restarted (#42); once the poll has stopped, or for a frozen, foreign-boot or other-authority
+//! record, it says nothing in M9 replaces the grant and writes stay stopped for the run. After a secondary restarts,
+//! L1 still admits writes for a while, so the line reads `ready for now; writes pause within
+//! about 2 s of the next write because ..` until they do: about 2 s after the restart, or,
+//! after a fence, about 2 s after the next write (tester q8). A put before `ready` is refused,
+//! never left hanging. A recovery committed below `Active` that does not activate prints
+//! `stalled node=N recovery_rebuild_stalled ...`, and again whenever the line changes:
 //!
 //! - when F1 pinned its rebuild, at F1's rebuild deadline (the discovery window, ~2 s) with
 //!   `unproven=[..]`, the copies that have not proved the pinned point;
@@ -94,15 +144,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use config_core::{ConfigStore, GetRequest, ListRequest, NodeId as VoterId};
+use config_core::{
+    ConfigStore, GetRequest, ListRequest, MutationOutcome, NodeId as VoterId, PutRequest,
+};
 use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
+use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
-use rdb_api::{Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
-use rdb_core::authority::grant::GrantRecord;
-use rdb_core::authority::partition::PartitionRecord;
-use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, RequestId};
-use rdb_core::contracts::txn::TxnRequest;
+use rdb_api::{ApiError, Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
+use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
+use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
+use rdb_core::contracts::authority::DenyReason;
+use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::errors::RetryRule;
+use rdb_core::contracts::event::Budgets;
+use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
+use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 
 use hostile_store::{HostileStore, ListFault};
 
@@ -171,17 +228,18 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(parsed)
 }
 
+fn parse_node(text: &str) -> Result<NodeId, String> {
+    match text.trim().parse::<u32>() {
+        Ok(n @ 1..=3) => Ok(NodeId(n)),
+        _ => Err(format!("{text:?}: a node is 1, 2 or 3")),
+    }
+}
+
 fn parse_pair(text: &str) -> Result<(NodeId, NodeId), String> {
     let (a, b) = text
         .split_once('-')
         .ok_or_else(|| format!("{text:?}: a link is <a>-<b>"))?;
-    let node = |s: &str| -> Result<NodeId, String> {
-        match s.trim().parse::<u32>() {
-            Ok(n @ 1..=3) => Ok(NodeId(n)),
-            _ => Err(format!("{s:?}: a node is 1, 2 or 3")),
-        }
-    };
-    let (a, b) = (node(a)?, node(b)?);
+    let (a, b) = (parse_node(a)?, parse_node(b)?);
     if a == b {
         return Err(format!("{text:?}: a link joins two different nodes"));
     }
@@ -380,6 +438,8 @@ struct Seen {
     recovered: Option<Generation>,
     ready: bool,
     waiting: Option<String>,
+    /// The reason last printed on a `ready` or `not ready` line.
+    reason: Option<String>,
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
     stalled: std::collections::BTreeMap<u32, String>,
@@ -427,13 +487,13 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 ));
             }
             let admits = owner.admits == Some(true);
-            if admits != seen.ready {
-                seen.ready = admits;
-                say(if admits {
-                    "ready"
-                } else {
-                    "not ready: write protection lost"
-                });
+            if let Some(line) = ready_step(
+                &mut seen,
+                owner,
+                db.restart_note().as_deref(),
+                &db.links().held(),
+            ) {
+                say(&line);
             }
             if seen.recovered.is_some() && !admits {
                 let why = waiting_line(owner);
@@ -442,10 +502,265 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                     seen.waiting = Some(why);
                 }
             }
+        } else if db.restart_failed(NodeId(1)) {
+            if let Some(line) = stopped_owner_step(&mut seen, db.restart_note().as_deref()) {
+                say(&line);
+            }
         }
         drop(seen);
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// L1's pause age, in whole seconds rounded up, under the budgets [`Db::open`] runs every node
+/// with: a write made while a copy is out stays unsafe and pauses writes this long after it.
+const PAUSE_AGE_SECS: u64 = Budgets::SPEC_DEFAULTS.pause_age_millis.div_ceil(1000);
+
+/// What a line says when nothing in M9 brings writes back.
+const STUCK: &str =
+    "writes stay stopped for this run: to write again, quit and start rdb_dev again";
+
+/// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. Each
+/// part is derived from the state that decides it (tester walk 7, W7-D1, W7-D2).
+///
+/// After a restart (`restart_note`), while node 1 still admits writes, L1 pauses them soon: on
+/// its own within about 2 s of the restart (walk 6c, tester r1, with no write), and at the
+/// latest about [`PAUSE_AGE_SECS`] after the next write, which stays unsafe with a copy out
+/// (tester r3). So the line promises "soon" and that bound, never a pause tied only to the
+/// next write (W7-D1). Once node 1 does not admit, the line says writes stay stopped only when
+/// that holds: L1 paused or reprotecting, which with a copy out nothing in M9 resumes, or the
+/// owner itself restarted. Not admitting because of a fence the poll can lift (FR, tester r3)
+/// promises the resume and then the pause (W7-D2).
+///
+/// A fenced grant. While A1's self-replace poll is live it looks stuck but is not: A1 replaces
+/// the grant itself once the old one's expiry is proven, and a restart there would end recovery
+/// for the run (Message 6). The line promises that only while the poll is live and the reason
+/// is not one [`never_replaced`] names (F-004): once the poll stopped (a frozen, foreign or
+/// deleted record, F-016), nothing in M9 lifts the fence.
+///
+/// With no restart, L1 paused or reprotecting while `held` holds a link of node 1's keeps writes
+/// out until those links heal and the copies catch up (W8-D2): the line names the links, fenced
+/// or not, as a condition. Without a held link (startup) the copies catch up by themselves.
+///
+/// Not fenced, with A1's self-replace stopped (W8-D1): stuck, as [`gave_up_line`] says.
+///
+/// F1 blocked comes first (W10-D1): stuck, as [`blocked_line`] says, over any other reason.
+/// F1 resolving its activation resumes by itself ([`resolving_line`]), over the fence's resume
+/// line and the held-link line, but never over a stuck state: a fence nothing lifts, a stopped
+/// self-replace, or a restart with L1 refusing. After a restart, the pause follows the resume.
+fn ready_reason(
+    owner: &NodeStatus,
+    admits: bool,
+    restart_note: Option<&str>,
+    held: &[(NodeId, NodeId)],
+) -> Option<String> {
+    let fence = owner.fence.filter(|_| !admits);
+    if let Some(line) = blocked_line(owner).filter(|_| !admits) {
+        return Some(match restart_note {
+            Some(note) => format!("{line}; {note}"),
+            None => line,
+        });
+    }
+    let gave_up =
+        (!admits && fence.is_none() && owner.replace_stopped).then(|| gave_up_line(owner));
+    let resolving = resolving_line(owner, held)
+        .filter(|_| !admits && fence.is_none_or(|reason| fence_lifts(owner, reason)));
+    let Some(note) = restart_note else {
+        if let Some(line) = gave_up.or(resolving) {
+            return Some(line);
+        }
+        return match (fence, links_wait(owner, held)) {
+            (Some(reason), _) => Some(fence_line(owner, reason, held)),
+            (None, Some((mode, links))) if !admits => Some(format!(
+                "l1={mode} and links {links} are held: writes wait for node {}'s copies to catch \
+                 up, which needs those links: heal them (link heal all)",
+                owner.node.0
+            )),
+            (None, _) => None,
+        };
+    };
+    let pause = format!(
+        "pause soon, at the latest about {PAUSE_AGE_SECS} s after the next write, because {note}"
+    );
+    if admits {
+        return Some(format!("writes {pause}"));
+    }
+    if owner.boot != rdb_api::host::BOOT || l1_rejecting(owner).is_some() {
+        return Some(format!("{note}; {STUCK}"));
+    }
+    if let Some(line) = gave_up {
+        return Some(format!("{line}; {note}"));
+    }
+    if let Some(line) = resolving {
+        return Some(format!("{line}; once they resume, they {pause}"));
+    }
+    Some(match fence {
+        Some(reason) if fence_lifts(owner, reason) => {
+            format!(
+                "{}; once they resume, they {pause}",
+                fence_line(owner, reason, held)
+            )
+        }
+        Some(reason) => format!("{}; {note}", fence_line(owner, reason, held)),
+        None => format!("writes are not admitted now; if they come back, they {pause}"),
+    })
+}
+
+/// L1's mode while it refuses writes, `paused` or `reprotecting`: with a copy out it waits on
+/// that copy and its links, and after a restart nothing in M9 brings the copy back.
+fn l1_rejecting(owner: &NodeStatus) -> Option<&str> {
+    owner
+        .protection
+        .as_deref()
+        .filter(|mode| matches!(*mode, "paused" | "reprotecting"))
+}
+
+/// L1's mode while it refuses writes, and the links of `owner`'s that `held` holds, when there
+/// are both: writes then wait on those links (W8-D2).
+fn links_wait<'a>(owner: &'a NodeStatus, held: &[(NodeId, NodeId)]) -> Option<(&'a str, String)> {
+    let mode = l1_rejecting(owner)?;
+    let links: Vec<String> = held
+        .iter()
+        .filter(|(a, b)| *a == owner.node || *b == owner.node)
+        .map(|(a, b)| format!("{}-{}", a.0, b.0))
+        .collect();
+    (!links.is_empty()).then(|| (mode, links.join(", ")))
+}
+
+/// The line for F1 `Blocked(<reason>)` on node 1: recovery cannot finish, so writes stay out
+/// whatever the grant, the links or L1 do (W10-D1). Since A-R102 an unanswered activation
+/// resolves instead ([`resolving_line`]), so this is only the recovery CAS or a real dead end.
+/// It names the reason and promises no way out.
+fn blocked_line(owner: &NodeStatus) -> Option<String> {
+    let recovery = owner.recovery.as_deref()?;
+    recovery
+        .starts_with("Blocked(")
+        .then(|| format!("node {}'s recovery is {recovery}, so {STUCK}", owner.node.0))
+}
+
+/// The line for F1 `ActivationUnresolved` on node 1: the activation CAS went unanswered (tester
+/// r24n: the store down), and F1 reads and proposes again by itself once the store answers
+/// (A-R102), so writes come back with no restart. With L1 paused or reprotecting and a link of
+/// node 1's held, writes also wait on those links, so the line names both (W11-D1, tester w6:
+/// links held again mid-outage, `PROTECTION_PAUSED` after the store answered).
+fn resolving_line(owner: &NodeStatus, held: &[(NodeId, NodeId)]) -> Option<String> {
+    if owner.recovery.as_deref() != Some("ActivationUnresolved") {
+        return None;
+    }
+    let node = owner.node.0;
+    Some(match links_wait(owner, held) {
+        Some((mode, links)) => format!(
+            "node {node}'s recovery is waiting for the control store to confirm activation, \
+             l1={mode} and links {links} are held; writes resume only once the store answers \
+             and node {node}'s copies catch up, which needs those links: heal them (link heal \
+             all)"
+        ),
+        None => format!(
+            "node {node}'s recovery is waiting for the control store to confirm activation; \
+             writes resume by themselves once it answers"
+        ),
+    })
+}
+
+/// The line for A1 `unheld` with its self-replace stopped (`replace_stopped`): a freeze, or a
+/// record not this boot's, landed between grants, and A1 will not try again (W8-D1, tester
+/// r6_3200). Nothing in M9 replaces the grant.
+fn gave_up_line(owner: &NodeStatus) -> String {
+    let node = owner.node.0;
+    format!(
+        "node {node}'s grant is {} and node {node} stopped trying for one: its grant record is \
+         frozen or not its own; nothing in M9 replaces it, so {STUCK}",
+        owner.authority
+    )
+}
+
+/// Whether A1's self-replace can still lift a fence for `reason`: its poll is live, and the
+/// record is not one it answers `Never` ([`never_replaced`]).
+const fn fence_lifts(owner: &NodeStatus, reason: DenyReason) -> bool {
+    owner.fence_polling && !never_replaced(reason)
+}
+
+/// The fenced grant's line: it resumes by itself while [`fence_lifts`], else it is stuck. With
+/// L1 paused or reprotecting and a link of node 1's held, the grant comes back by itself and
+/// writes still wait on those links (W8-D2, tester r9: `held(grant 3)`, `l1=paused`, writes back
+/// only after `link heal all`).
+fn fence_line(owner: &NodeStatus, reason: DenyReason, held: &[(NodeId, NodeId)]) -> String {
+    let node = owner.node.0;
+    if let (true, Some((mode, links))) = (fence_lifts(owner, reason), links_wait(owner, held)) {
+        format!(
+            "node {node}'s grant is {}, l1={mode} and links {links} are held; writes resume only \
+             once the old grant's expiry is proven and node {node}'s copies catch up, which needs \
+             those links: heal them (link heal all); do not restart node {node}: a restarted \
+             node does not rejoin in M9 (achieveai/rDB#42)",
+            owner.authority
+        )
+    } else if fence_lifts(owner, reason) {
+        format!(
+            "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
+             is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
+             (achieveai/rDB#42)",
+            owner.authority
+        )
+    } else {
+        format!(
+            "node {node}'s grant is {}; nothing in M9 replaces it, so {STUCK}",
+            owner.authority
+        )
+    }
+}
+
+/// A fence reason whose grant record A1's self-replace answers `Never` (`grant::self_replace`):
+/// frozen, another boot's, or under another authority generation. The first poll stops on it,
+/// so the line says so from the fence on rather than for one renewal interval later.
+const fn never_replaced(reason: DenyReason) -> bool {
+    matches!(
+        reason,
+        DenyReason::Frozen | DenyReason::BootMismatch | DenyReason::AuthorityGenerationChanged
+    )
+}
+
+/// The `ready` or `not ready` line to print for `owner`, given what was printed last, and what
+/// `seen` now holds as printed: on each change of `admits`, and again when a new reason appears
+/// (a restart while ready, a fence after the line, a restart after a fence). A reason that goes
+/// away prints the bare line, so a promise it made never outlives its state (W8-D1, tester
+/// r6_3200: the fence's resume line stayed the last word after A1 stopped, `unheld`).
+fn ready_step(
+    seen: &mut Seen,
+    owner: &NodeStatus,
+    restart_note: Option<&str>,
+    held: &[(NodeId, NodeId)],
+) -> Option<String> {
+    let admits = owner.admits == Some(true);
+    step_line(
+        seen,
+        admits,
+        ready_reason(owner, admits, restart_note, held),
+    )
+}
+
+/// The poller's line once node 1's restart failed: no process runs it, so `node_status` leaves
+/// it out, and writes stay stopped for the run (W7-D3). `restart_note` names the failed
+/// restart; it is never `None` after one.
+fn stopped_owner_step(seen: &mut Seen, restart_note: Option<&str>) -> Option<String> {
+    let note = restart_note?;
+    step_line(seen, false, Some(format!("{note}; {STUCK}")))
+}
+
+/// The `ready` or `not ready` line for `admits` and `reason`, given what `seen` holds as
+/// printed, as [`ready_step`] describes.
+fn step_line(seen: &mut Seen, admits: bool, reason: Option<String>) -> Option<String> {
+    if admits == seen.ready && reason == seen.reason {
+        return None;
+    }
+    let line = match (admits, &reason) {
+        (true, None) => "ready".to_owned(),
+        (true, Some(why)) => format!("ready for now; {why}"),
+        (false, None) => "not ready: writes not admitted".to_owned(),
+        (false, Some(why)) => format!("not ready: writes not admitted: {why}"),
+    };
+    seen.ready = admits;
+    seen.reason = reason;
+    Some(line)
 }
 
 /// The line to print when a node's stall line changes, given the one printed last. Not a node
@@ -470,7 +785,7 @@ fn stall_change(printed: Option<&String>, node: &NodeStatus) -> Option<String> {
 
 fn waiting_line(owner: &NodeStatus) -> String {
     format!(
-        "waiting for write protection (l1={} authority={} {})",
+        "waiting to admit writes (l1={} authority={} {})",
         owner.protection.as_deref().unwrap_or("inert"),
         owner.authority,
         owner.holds.map_or_else(
@@ -610,13 +925,49 @@ fn repl<'scope, 'env>(
                 get_line(db.get_previous(object.as_bytes()));
                 Ok(())
             }
-            ["status", request, rest @ ..] => status_line(db, request, rest),
+            ["status", request, rest @ ..] => status_line(db, &sent, request, rest),
             ["nodes"] => {
-                for node in db.node_status() {
-                    say(&node_line(&node));
+                let answered = db.node_status();
+                for node in [1, 2, 3].map(NodeId) {
+                    say(&answered
+                        .iter()
+                        .find(|status| status.node == node)
+                        .map_or_else(
+                            || missing_node_line(node, db.boot_of(node), db.restart_failed(node)),
+                            node_line,
+                        ));
                 }
                 Ok(())
             }
+            ["node", "restart", node] => parse_node(node).map(|node| {
+                say(&match db.restart_node(node) {
+                    Ok(boot) => format!("node {} boot {}", node.0, boot.0),
+                    Err(e) => format!("err node restart {}: {e}", node.0),
+                });
+            }),
+            ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
+            ["admin", "clear-grant", node] => parse_node(node).map(|node| {
+                say(
+                    &match rt.block_on(admin::clear_grant(db, control.store, node)) {
+                        Ok(clearance) => clearance_line(clearance, node, db),
+                        Err(e) => admin_error_line(node, &e),
+                    },
+                );
+            }),
+            ["admin", ..] => Err("admin clear-grant <n>: n is 1, 2 or 3".to_owned()),
+            ["control", "lifecycle", partition, word] => {
+                parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
+                    say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
+                })
+            }
+            ["control", "lifecycle", ..] => Err(format!(
+                "control lifecycle <p> <{}>",
+                LIFECYCLE_WORDS.join("|")
+            )),
+            ["control", "freeze-grant", node] => parse_node(node).map(|node| {
+                say(&freeze_grant(rt, control.cluster, node));
+            }),
+            ["control", "freeze-grant", ..] => Err("control freeze-grant <n>".to_owned()),
             ["control"] => {
                 control_lines(rt, control.cluster);
                 Ok(())
@@ -993,7 +1344,7 @@ fn get_line(answer: Result<rdb_api::GetOk, rdb_api::ApiError>) {
     }
 }
 
-fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
+fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(), String> {
     let request = request
         .parse::<u64>()
         .map_err(|_| "status <request> [<generation>]".to_owned())?;
@@ -1005,11 +1356,98 @@ fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
         )),
         _ => return Err("status <request> [<generation>]".to_owned()),
     };
+    // The nodes first: a request node 1 holds in flight that publishes between the two looks is
+    // then answered by the status, never called not in flight (Msg 8, W6-D1).
+    let nodes = db.node_status();
     match db.status(RequestId(request), generation) {
+        // After a restart, `Unknown` can be a write this session saw `ok` (tester W3-D2).
+        Ok(TxnStatus::Unknown) => {
+            // `None` when node 1 did not answer in time (F-025).
+            let in_flight = nodes
+                .iter()
+                .find(|node| node.node == NodeId(1))
+                .map(|owner| owner.in_flight == Some(RequestId(request)));
+            let restarted = restarted_nodes(|node| db.boot_of(node));
+            let note = db.restart_note();
+            let ours = sent.by_id.contains_key(&request);
+            say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
+        }
         Ok(status) => say(&format!("status {status:?}")),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
     }
     Ok(())
+}
+
+/// The nodes that restarted, from each node's boot (`boot_of`), never from the nodes that
+/// answered `node_status`: that leaves out a node whose restart failed, and `status` of a write
+/// in flight then said it waits for M10 while the other secondary could still take it.
+fn restarted_nodes(boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
+    [1, 2, 3]
+        .map(NodeId)
+        .into_iter()
+        .filter(|&node| boot_of(node).is_some_and(|boot| boot != rdb_api::host::BOOT))
+        .collect()
+}
+
+/// `status Unknown`, with the restart note when there is one, unless this session never sent
+/// the request (`ours` false): that outcome is known (tester walk 5). After the owner's
+/// restart its outcome waits for M10. Otherwise it follows what node 1 holds (Msg 8, W6-D1): a
+/// request not `in_flight` there was refused before it was queued, or never arrived, and
+/// nothing will resolve it. One in flight waits for M10 after both secondaries' restarts, and
+/// after one secondary's resolves once the other can take it, as when a held link heals
+/// (W5-D1). `in_flight` is `None` when node 1 did not answer in time: whether it holds the
+/// request is then not known, so the line promises nothing and says to ask again (F-025).
+fn unknown_line(
+    ours: bool,
+    in_flight: Option<bool>,
+    restarted: &[NodeId],
+    restart_note: Option<&str>,
+) -> String {
+    let Some(note) = restart_note.filter(|_| ours) else {
+        return "status Unknown".to_owned();
+    };
+    let others: Vec<u32> = [2, 3]
+        .into_iter()
+        .filter(|node| !restarted.contains(&NodeId(*node)))
+        .collect();
+    let owner_restarted = restarted.contains(&NodeId(1));
+    match others.as_slice() {
+        _ if !owner_restarted && in_flight.is_none() => format!(
+            "status Unknown (node 1 did not answer in time, so whether it holds it in flight is \
+             not known; try again; {note})"
+        ),
+        _ if !owner_restarted && in_flight == Some(false) => format!(
+            "status Unknown (node 1 does not hold it in flight, so waiting will not change \
+             this: it was refused before it was queued, or never arrived; {note})"
+        ),
+        [other] if !owner_restarted => format!(
+            "status Unknown (not evidence of a lost write: it resolves once node {other}, which \
+             did not restart, can take it; {note})"
+        ),
+        _ => format!(
+            "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
+             restarted node rejoins, which is M10; {note})"
+        ),
+    }
+}
+
+/// The `nodes` line for a node `node_status` left out, which it does both for a node whose
+/// restart failed, so no process runs it (`failed`, F-013), and for one that did not answer in
+/// time. A node left out is never dropped from the list silently (W7-D3).
+fn missing_node_line(node: NodeId, boot: Option<BootId>, failed: bool) -> String {
+    let boot = boot.map_or_else(|| "?".to_owned(), |boot| boot.0.to_string());
+    if failed {
+        format!(
+            "node={} boot={boot} stopped: its restart as boot {boot} failed, so no process runs \
+             it",
+            node.0
+        )
+    } else {
+        format!(
+            "node={} boot={boot} did not answer in time; try again",
+            node.0
+        )
+    }
 }
 
 /// One node's line. `published=` is left off a secondary: P1 publishes nothing there, so its
@@ -1021,8 +1459,9 @@ fn node_line(node: &NodeStatus) -> String {
         None => " published=-".to_owned(),
     };
     format!(
-        "node={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
+        "node={} boot={} {} authority={} recovery={} recovered={} role={} l1={} admits={}{published}{}{}",
         node.node.0,
+        node.boot.0,
         holds_part(node),
         node.authority,
         node.recovery.as_deref().unwrap_or("-"),
@@ -1073,6 +1512,183 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
             }
             Err(e) => say(&format!("err control list {prefix}: {e}")),
         }
+    }
+}
+
+/// `admin clear-grant`'s error as one line, with its retry rule and mutation proof as a `put`
+/// error prints them, and in plain words whether running it again can help (F-012): a permanent
+/// store error and a transient one otherwise read alike. The words follow the retry rule and
+/// the mutation proof together (F-027).
+fn admin_error_line(node: NodeId, error: &ApiError) -> String {
+    // From `retry` and `no_mutation` together (F-027): a delete that may have applied is worth
+    // running again even when the call itself fails the same way, because the rerun reads the
+    // record before it deletes anything.
+    let transient = match error.retry {
+        RetryRule::RefreshRoute | RetryRule::RetryAfterRecovery | RetryRule::BoundedJitter => {
+            Some(true)
+        }
+        RetryRule::QueryStatus => None,
+        RetryRule::Definitive
+        | RetryRule::Reconcile
+        | RetryRule::Quarantine
+        | RetryRule::NotWired => Some(false),
+    };
+    let words = match (transient, error.no_mutation) {
+        (None, _) => "run it again: it reads where the record stands before it deletes anything",
+        (Some(true), true) => "running it again can help",
+        (Some(true), false) => {
+            "running it again can help, and shows whether the delete applied: it reads the \
+             record first"
+        }
+        (Some(false), true) => "running it again will not help: it fails the same way each time",
+        (Some(false), false) => {
+            "run it again to see whether the delete applied: it reads the record first, and \
+             only a record still there fails the same way again"
+        }
+    };
+    format!(
+        "err admin clear-grant {}: {} retry={:?} no_mutation={} ({}); {words}",
+        node.0,
+        error.name(),
+        error.retry,
+        error.no_mutation,
+        error.detail
+    )
+}
+
+/// `admin clear-grant`'s answer as one line. Only `not-proven-expired` clears with time, so
+/// only it says when to try again (W2-D1); the raw `until` stays in the `grant_clear` log line.
+fn clearance_line(clearance: Clearance, node: NodeId, db: &Db) -> String {
+    match clearance {
+        Clearance::Absent => "absent".to_owned(),
+        Clearance::Current => format!(
+            "current: the record is node {}'s running boot {}; in M9 it clears only after that \
+             node restarts, and a restart stops writes for the run (achieveai/rDB#42)",
+            node.0,
+            db.boot_of(node)
+                .map_or_else(|| "?".to_owned(), |boot| boot.0.to_string())
+        ),
+        Clearance::Cleared(revision) => format!("cleared rev={}", revision.0),
+        Clearance::Conflict => "conflict: the record moved; run it again".to_owned(),
+        Clearance::Refused {
+            refusal: ClearRefusal::NotProvenExpired,
+            until_utc_ms,
+        } => {
+            let wait =
+                u64::try_from(until_utc_ms).map_or(0, |until| until.saturating_sub(db.now().0));
+            format!(
+                "refused not-proven-expired: the grant may still be live; try again in {wait} ms"
+            )
+        }
+        Clearance::Refused {
+            refusal: ClearRefusal::Frozen,
+            ..
+        } => "refused frozen: this grant is frozen; M9 runs no takeover and nothing in M9 \
+              unfreezes it, so it never clears in this run"
+            .to_owned(),
+        Clearance::Refused {
+            refusal: ClearRefusal::PartitionInTransfer(partition),
+            ..
+        } => format!(
+            "refused partition-in-transfer p{0}: p{0} is not serving; it clears only once p{0} \
+             is back to serving (control lifecycle {0} serving), never by waiting",
+            partition.0
+        ),
+    }
+}
+
+/// The words `control lifecycle` takes, in `PartitionLifecycle` order.
+const LIFECYCLE_WORDS: [&str; 3] = ["serving", "fencing", "drained"];
+
+fn parse_lifecycle(
+    partition: &str,
+    word: &str,
+) -> Result<(PartitionId, PartitionLifecycle), String> {
+    let usage = || format!("control lifecycle <p> <{}>", LIFECYCLE_WORDS.join("|"));
+    let partition = partition
+        .parse::<u32>()
+        .map(PartitionId)
+        .map_err(|_| format!("{}: {partition:?} is not a partition id", usage()))?;
+    let lifecycle = match word {
+        "serving" => PartitionLifecycle::Serving,
+        "fencing" => PartitionLifecycle::Fencing,
+        "drained" => PartitionLifecycle::FencingDrained,
+        other => return Err(format!("{}: not {other:?}", usage())),
+    };
+    Ok((partition, lifecycle))
+}
+
+/// `control lifecycle`: read `partitions/<p>` on the rEtcd leader and write it back with
+/// `lifecycle`, at the revision read. Example-only, like every raw `control` verb: no product
+/// path writes a lifecycle other than `Serving` in M9. Returns the line to print.
+fn set_lifecycle(
+    rt: &tokio::runtime::Runtime,
+    cluster: &Cluster,
+    partition: PartitionId,
+    lifecycle: PartitionLifecycle,
+) -> String {
+    let key = ControlKey::Partition(partition).encode();
+    rewrite(rt, cluster, &key, |body| {
+        let mut record = PartitionRecord::decode(body)?;
+        record.lifecycle = lifecycle;
+        Some((record.encode(), format!("{:?}", record.lifecycle)))
+    })
+}
+
+/// `control freeze-grant`: read `grants/<n>` on the rEtcd leader and write it back frozen, at
+/// the revision read. Returns the line to print.
+fn freeze_grant(rt: &tokio::runtime::Runtime, cluster: &Cluster, node: NodeId) -> String {
+    let key = ControlKey::Grant(node).encode();
+    rewrite(rt, cluster, &key, |body| {
+        let mut record = GrantRecord::decode(body)?;
+        record.frozen = true;
+        Some((record.encode(), format!("frozen boot={}", record.boot.0)))
+    })
+}
+
+/// Read `key` on the rEtcd leader, let `change` rewrite its body, and put the result at the
+/// revision read. `change` answers `None` for a body it cannot decode.
+fn rewrite(
+    rt: &tokio::runtime::Runtime,
+    cluster: &Cluster,
+    key: &str,
+    change: impl FnOnce(&[u8]) -> Option<(Bytes, String)>,
+) -> String {
+    let Some(leader) = cluster.leader_now() else {
+        return format!("err control {key}: no rEtcd leader now; try again");
+    };
+    let store = cluster.client(leader);
+    let read = match rt.block_on(store.get(GetRequest {
+        key: Bytes::from(key.to_owned()),
+    })) {
+        Ok(read) => read,
+        Err(e) => return format!("err control get {key}: {e}"),
+    };
+    let Some(found) = read.record else {
+        return format!("err control {key}: absent");
+    };
+    let Some((value, what)) = change(&found.value) else {
+        return format!(
+            "err control {key}: rev={} does not decode",
+            found.mod_revision
+        );
+    };
+    let put = rt.block_on(store.put(PutRequest {
+        key: Bytes::from(key.to_owned()),
+        value,
+        expected_mod_revision: Some(found.mod_revision),
+        dedup: None,
+    }));
+    match put {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            tracing::info!(key, from = found.mod_revision, revision = response.revision, what = %what, "control_rewrite");
+            format!("{key} rev={} {what}", response.revision)
+        }
+        Ok(response) => format!(
+            "err control {key}: {:?} at rev={}",
+            response.outcome, found.mod_revision
+        ),
+        Err(e) => format!("err control put {key}: {e}"),
     }
 }
 
@@ -1225,7 +1841,6 @@ fn wait_for(progress: &Progress, what: &str, limit: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rdb_core::contracts::event::Budgets;
 
     /// The longest a stopped control leader can leave the voters without one, in ms. A follower
     /// that saw a committed leader waits out the leader lease (`election_timeout_max` in
@@ -1253,15 +1868,20 @@ mod tests {
     fn owner(stalled: Option<&str>, admits: bool) -> NodeStatus {
         NodeStatus {
             node: NodeId(1),
+            boot: rdb_api::host::BOOT,
             fault: None,
             holds: None,
             authority: "valid".to_owned(),
+            fence: None,
+            fence_polling: false,
+            replace_stopped: false,
             recovery: Some("Committed".to_owned()),
             recovered: Some(Generation(1)),
             role: "primary",
             protection: None,
             admits: Some(admits),
             published: None,
+            in_flight: None,
             stalled: stalled.map(str::to_owned),
             reload_pending: None,
         }
@@ -1320,6 +1940,909 @@ mod tests {
                 "stall cleared node=1 recovery=Committed recovered=1 admits=true".to_owned(),
                 format!("stalled node=1 {stall}"),
             ]
+        );
+    }
+
+    /// Message 6 paper cut: a fenced owner printed a bare `not ready`, and a user may then restart
+    /// the node, which ends recovery in M9. The fence prints its reason when it comes after the
+    /// line, nothing more while it lasts, the bare line as it clears with writes still out
+    /// (W8-D1), and a restart after it prints again.
+    /// W7-D2 (tester r3): that restart left the poll live, and writes came back, so the line
+    /// promises the resume and the pause after it, not that writes stay stopped.
+    #[test]
+    fn a_fenced_owner_says_writes_resume_by_themselves_and_not_to_restart() {
+        let mut fenced = owner(None, false);
+        fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        fenced.fence_polling = true;
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let mut lines = Vec::new();
+        for (node, restart) in [
+            (owner(None, false), None),
+            (fenced.clone(), None),
+            (fenced.clone(), None),
+            (owner(None, false), None),
+            (fenced.clone(), Some(note)),
+            (owner(None, true), None),
+        ] {
+            lines.extend(ready_step(&mut seen, &node, restart, &[]));
+        }
+        assert_eq!(
+            lines,
+            [
+                "not ready: writes not admitted".to_owned(),
+                "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
+                 resume by themselves once the old grant's expiry is proven, so do not restart \
+                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
+                    .to_owned(),
+                "not ready: writes not admitted".to_owned(),
+                format!(
+                    "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
+                     resume by themselves once the old grant's expiry is proven, so do not \
+                     restart node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42); \
+                     once they resume, they pause soon, at the latest about 2 s after the next \
+                     write, because {note}"
+                ),
+                "ready".to_owned(),
+            ]
+        );
+    }
+
+    /// Msg 8, F-004 and F-016: "resume by themselves" only while A1's after-fence poll is live
+    /// and the reason is one the self-replace can lift. `fenced(Frozen)` never resumes, even
+    /// before its first poll stops; `fenced(Expired)` whose poll stopped (a later freeze or
+    /// delete) prints a new line saying so. The host row
+    /// `status_says_the_after_fence_poll_stopped_when_the_record_is_frozen_later` proves the
+    /// poll field on a real host.
+    #[test]
+    fn a_fence_promises_resume_only_while_the_poll_is_live_and_can_lift_it() {
+        let fenced = |reason: DenyReason, polling: bool| {
+            let mut node = owner(None, false);
+            node.authority = format!("fenced({reason:?})");
+            node.fence = Some(reason);
+            node.fence_polling = polling;
+            node
+        };
+        let resume = |reason: &str| {
+            format!(
+                "not ready: writes not admitted: node 1's grant is fenced({reason}); writes \
+                 resume by themselves once the old grant's expiry is proven, so do not restart \
+                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
+            )
+        };
+        let stuck = |reason: &str| {
+            format!(
+                "not ready: writes not admitted: node 1's grant is fenced({reason}); nothing in \
+                 M9 replaces it, so writes stay stopped for this run: to write again, quit and \
+                 start rdb_dev again"
+            )
+        };
+        for (reason, name) in [
+            (DenyReason::Frozen, "Frozen"),
+            (DenyReason::BootMismatch, "BootMismatch"),
+            (
+                DenyReason::AuthorityGenerationChanged,
+                "AuthorityGenerationChanged",
+            ),
+        ] {
+            for polling in [true, false] {
+                let mut seen = Seen::default();
+                assert_eq!(
+                    ready_step(&mut seen, &fenced(reason, polling), None, &[]),
+                    Some(stuck(name)),
+                    "{name}, polling={polling}"
+                );
+            }
+        }
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let lines: Vec<String> = [
+            fenced(DenyReason::Expired, true),
+            fenced(DenyReason::Expired, true),
+            fenced(DenyReason::Expired, false),
+            fenced(DenyReason::Expired, false),
+        ]
+        .iter()
+        .filter_map(|node| ready_step(&mut seen, node, None, &[]))
+        .collect();
+        assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
+    }
+
+    /// Walk 10, W10-D1 (tester r24n, r24n2, r26): a read-only start with links held, the store
+    /// down, then `link heal all`. F1's activation CAS went unanswered and F1 blocked
+    /// (`recovery=Blocked(ControlUnknown)`), while the poller kept promising writes resume by
+    /// themselves; once a grant was back it printed the bare line, and writes never came back.
+    /// A blocked recovery says so, names its reason and says writes stay stopped, over the
+    /// fence's resume line and the held-link line. It promises no way out. Driven directly from
+    /// r24n's states. Unit.
+    #[test]
+    fn a_blocked_recovery_says_writes_stay_stopped_over_any_resume_promise() {
+        let blocked = "not ready: writes not admitted: node 1's recovery is \
+                       Blocked(ControlUnknown), so writes stay stopped for this run: to write \
+                       again, quit and start rdb_dev again";
+        let with = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let fenced = |recovery: &str| with("fenced(Expired)", recovery, Some(DenyReason::Expired));
+        let held_links = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (fenced("Rebuilding"), &held_links[..]),
+            (fenced("ActivationProposed"), &[][..]),
+            (fenced("Blocked(ControlUnknown)"), &[][..]),
+            (with("unheld", "Blocked(ControlUnknown)", None), &[][..]),
+            (
+                with("held(grant 2)", "Blocked(ControlUnknown)", None),
+                &[][..],
+            ),
+            (
+                with("held(grant 2)", "Blocked(ControlUnknown)", None),
+                &held_links[..],
+            ),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .skip(2)
+        .collect();
+        assert_eq!(lines, [blocked]);
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let stuck = with("held(grant 2)", "Blocked(ControlUnknown)", None);
+        let mut healthy = stuck.clone();
+        healthy.protection = Some("healthy".to_owned());
+        for node in [stuck, healthy] {
+            assert_eq!(
+                ready_step(&mut Seen::default(), &node, Some(note), &[]),
+                Some(format!("{blocked}; {note}")),
+                "{node:?}"
+            );
+        }
+    }
+
+    /// Walk 10, W10-D1 after the kernel fix (A-R102 and its addendum): r24n's activation CAS,
+    /// unanswered with the store down, now leaves F1 in `ActivationUnresolved`, and F1 resolves
+    /// by itself once the store answers. So the line says writes wait for the store and resume
+    /// by themselves, over the fence's resume line, and `ready` follows once they do. A stuck
+    /// state still wins: a fence nothing lifts, a self-replace that stopped, or a restart with
+    /// L1 refusing keeps the stay-stopped line. After a restart with L1 healthy, the pause
+    /// promise follows the resume. Driven directly from r24n's states. Unit.
+    #[test]
+    fn a_resolving_activation_says_writes_resume_once_the_store_answers() {
+        let resolving = "node 1's recovery is waiting for the control store to confirm \
+                         activation; writes resume by themselves once it answers";
+        let with = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let fenced = |recovery: &str| with("fenced(Expired)", recovery, Some(DenyReason::Expired));
+        let held_links = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+        let mut serving = owner(None, true);
+        serving.authority = "held(grant 2)".to_owned();
+        serving.protection = Some("healthy".to_owned());
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (fenced("Rebuilding"), &held_links[..]),
+            (fenced("ActivationProposed"), &[][..]),
+            (fenced("ActivationUnresolved"), &[][..]),
+            (with("held(grant 2)", "ActivationUnresolved", None), &[][..]),
+            (serving, &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .skip(2)
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                format!("not ready: writes not admitted: {resolving}"),
+                "ready".to_owned()
+            ]
+        );
+
+        let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[]);
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
+        healthy.protection = Some("healthy".to_owned());
+        assert_eq!(
+            reason(&healthy, Some(note)),
+            Some(format!(
+                "{resolving}; once they resume, they pause soon, at the latest about \
+                 {PAUSE_AGE_SECS} s after the next write, because {note}"
+            ))
+        );
+        let paused = with("held(grant 2)", "ActivationUnresolved", None);
+        assert_eq!(
+            reason(&paused, Some(note)),
+            Some(format!("{note}; {STUCK}"))
+        );
+        let frozen = with(
+            "fenced(Frozen)",
+            "ActivationUnresolved",
+            Some(DenyReason::Frozen),
+        );
+        assert_eq!(
+            reason(&frozen, None),
+            Some(format!(
+                "node 1's grant is fenced(Frozen); nothing in M9 replaces it, so {STUCK}"
+            ))
+        );
+        let mut stopped = with("unheld", "ActivationUnresolved", None);
+        stopped.replace_stopped = true;
+        assert_eq!(reason(&stopped, None), Some(gave_up_line(&stopped)));
+    }
+
+    /// Walk 11, W11-D1 (tester w6, w6r): while F1 resolved its activation with the store down,
+    /// the tester held links 1-2 and 1-3 again. The resolving line, "writes resume by themselves
+    /// once it answers", stayed the last word; when the store answered, F1 committed and writes
+    /// stayed paused (`PROTECTION_PAUSED`) until `link heal all`. With L1 paused and a link of
+    /// node 1's held, the resolving line names both conditions, as the fence line does (W8-D2).
+    /// Driven directly from w6's states. Unit.
+    #[test]
+    fn a_resolving_activation_with_links_held_says_writes_also_wait_on_the_links() {
+        let resolving = "node 1's recovery is waiting for the control store to confirm \
+                         activation; writes resume by themselves once it answers";
+        let both = "node 1's recovery is waiting for the control store to confirm activation, \
+                    l1=paused and links 1-2, 1-3 are held; writes resume only once the store \
+                    answers and node 1's copies catch up, which needs those links: heal them \
+                    (link heal all)";
+        let links = "l1=paused and links 1-2, 1-3 are held: writes wait for node 1's copies to \
+                     catch up, which needs those links: heal them (link heal all)";
+        let with = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let resolving_fenced = with(
+            "fenced(Expired)",
+            "ActivationUnresolved",
+            Some(DenyReason::Expired),
+        );
+        let committed = with("held(grant 3)", "Committed", None);
+        let mut serving = owner(None, true);
+        serving.authority = "held(grant 3)".to_owned();
+        serving.protection = Some("healthy".to_owned());
+        let held_links = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (&resolving_fenced, &[][..]),
+            (&resolving_fenced, &held_links[..]),
+            (&committed, &held_links[..]),
+            (&serving, &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .collect();
+        let not_ready = |why: &str| format!("not ready: writes not admitted: {why}");
+        assert_eq!(
+            lines,
+            [
+                not_ready(resolving),
+                not_ready(both),
+                not_ready(links),
+                "ready".to_owned()
+            ]
+        );
+    }
+
+    /// Walk 8, W8-D1 (tester r6_3200): a freeze landed while A1 was between grants. A1 lost
+    /// its self-replace CAS, answered the frozen record `NotOurs` and stopped, `unheld` for the
+    /// rest of the run, and the fence's "resume by themselves" line stayed the last word because
+    /// a reason that went away printed nothing. A reason that goes away while writes stay out
+    /// is withdrawn with the bare line, so no promise outlives the state that made it.
+    #[test]
+    fn a_resume_promise_is_withdrawn_when_its_fence_goes_and_writes_stay_out() {
+        // The tester's r6_3200 state, driven directly (the race took 0 of 16 live runs): A1
+        // fenced with its poll live, then `unheld` with its self-replace stopped
+        // (`replace_stopped`, kernel `self_replace_stopped`), then a later poll that changes
+        // nothing. With and without a restart, the stuck line, once.
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let gave_up = "node 1's grant is unheld and node 1 stopped trying for one: its grant \
+                       record is frozen or not its own; nothing in M9 replaces it, so writes \
+                       stay stopped for this run: to write again, quit and start rdb_dev again";
+        let mut fenced = owner(None, false);
+        fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        fenced.fence_polling = true;
+        let mut stopped = owner(None, false);
+        stopped.authority = "unheld".to_owned();
+        stopped.replace_stopped = true;
+        for restart in [None, Some(note)] {
+            let mut seen = Seen {
+                ready: true,
+                ..Seen::default()
+            };
+            let lines: Vec<String> = [&fenced, &stopped, &stopped]
+                .iter()
+                .filter_map(|node| ready_step(&mut seen, node, restart, &[]))
+                .skip(1)
+                .collect();
+            let want = restart.map_or_else(
+                || format!("not ready: writes not admitted: {gave_up}"),
+                |note| format!("not ready: writes not admitted: {gave_up}; {note}"),
+            );
+            assert_eq!(lines, [want], "restart={restart:?}");
+        }
+        // Fenced with the poll stopped keeps the fence's own stuck line.
+        let mut fenced_stopped = fenced.clone();
+        fenced_stopped.fence_polling = false;
+        fenced_stopped.replace_stopped = true;
+        assert_eq!(
+            ready_step(&mut Seen::default(), &fenced_stopped, None, &[]),
+            Some(
+                "not ready: writes not admitted: node 1's grant is fenced(Expired); nothing in M9 \
+                 replaces it, so writes stay stopped for this run: to write again, quit and \
+                 start rdb_dev again"
+                    .to_owned()
+            )
+        );
+
+        let mut fenced = owner(None, false);
+        fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        fenced.fence_polling = true;
+        let mut unheld = owner(None, false);
+        unheld.authority = "unheld".to_owned();
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let lines: Vec<String> = [fenced, unheld.clone(), unheld]
+            .iter()
+            .filter_map(|node| ready_step(&mut seen, node, None, &[]))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
+                 resume by themselves once the old grant's expiry is proven, so do not restart \
+                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)",
+                "not ready: writes not admitted",
+            ]
+        );
+    }
+
+    /// Node 1's links held, as `link hold 1-2; link hold 1-3` leaves them.
+    const HELD: [(NodeId, NodeId); 2] = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+
+    /// Walk 8, W8-D2 (tester r9, walk 7's 4b): links held, a write in flight, then the fence.
+    /// L1 was paused, and the fence line promised writes resume by themselves. The grant came
+    /// back (`held(grant 3)`) and writes did not, until `link heal all`. With L1 paused or
+    /// reprotecting and a link of node 1's held, under a live poll, the line names the links
+    /// writes also wait on, and still says not to restart node 1. With no link of node 1's held,
+    /// the copies catch up by themselves and the resume line stands.
+    #[test]
+    fn a_fence_with_l1_paused_and_links_held_says_writes_also_wait_on_the_links() {
+        for mode in ["paused", "reprotecting"] {
+            let mut node = owner(None, false);
+            node.authority = "fenced(Expired)".to_owned();
+            node.fence = Some(DenyReason::Expired);
+            node.fence_polling = true;
+            node.protection = Some(mode.to_owned());
+            assert_eq!(
+                ready_step(&mut Seen::default(), &node, None, &HELD),
+                Some(format!(
+                    "not ready: writes not admitted: node 1's grant is fenced(Expired), \
+                     l1={mode} and links 1-2, 1-3 are held; writes resume only once the old \
+                     grant's expiry is proven and node 1's copies catch up, which needs those \
+                     links: heal them (link heal all); do not restart node 1: a restarted node \
+                     does not rejoin in M9 (achieveai/rDB#42)"
+                )),
+                "l1={mode}"
+            );
+            for held in [&[][..], &[(NodeId(2), NodeId(3))][..]] {
+                assert_eq!(
+                    ready_step(&mut Seen::default(), &node, None, held),
+                    Some(
+                        "not ready: writes not admitted: node 1's grant is fenced(Expired); \
+                         writes resume by themselves once the old grant's expiry is proven, so \
+                         do not restart node 1: a restarted node does not rejoin in M9 \
+                         (achieveai/rDB#42)"
+                            .to_owned()
+                    ),
+                    "l1={mode} held={held:?}"
+                );
+            }
+        }
+    }
+
+    /// W8-D2 live re-walk (`r9/walks/w8/w8d2.out`): once A1 held grant 2 again, the fence's
+    /// reason went, and the withdrawal (W8-D1) printed the bare line while L1 stayed paused for
+    /// 20 s, until `link heal all`. Not admitting with L1 paused or reprotecting, a link of node
+    /// 1's held and no restart, names the links writes wait on, as a condition and not a
+    /// promise: a stopped A1 may also hold them out. At startup (`w8d2b.out`) L1 is paused, then
+    /// reprotecting, with no link held, and catches up by itself: no reason.
+    #[test]
+    fn l1_paused_with_links_held_says_writes_wait_on_those_links() {
+        let fenced = |mode: &str| {
+            let mut node = owner(None, false);
+            node.authority = "fenced(Expired)".to_owned();
+            node.fence = Some(DenyReason::Expired);
+            node.fence_polling = true;
+            node.protection = Some(mode.to_owned());
+            node
+        };
+        let held = |mode: &str, admits: bool| {
+            let mut node = owner(None, admits);
+            node.authority = "held(grant 2)".to_owned();
+            node.protection = Some(mode.to_owned());
+            node
+        };
+        let mut startup = Seen::default();
+        assert_eq!(
+            ready_step(&mut startup, &held("paused", false), None, &[]),
+            None
+        );
+        assert_eq!(
+            ready_step(&mut startup, &held("reprotecting", false), None, &[]),
+            None
+        );
+        let wait = "not ready: writes not admitted: l1=paused and links 1-2, 1-3 are held: \
+                    writes wait for node 1's copies to catch up, which needs those links: heal \
+                    them (link heal all)";
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let lines: Vec<String> = [
+            (held("paused", false), &HELD[..]),
+            (fenced("paused"), &HELD[..]),
+            (held("paused", false), &HELD[..]),
+            (held("paused", false), &HELD[..]),
+            (held("reprotecting", false), &[][..]),
+            (held("healthy", true), &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                wait.to_owned(),
+                "not ready: writes not admitted: node 1's grant is fenced(Expired), l1=paused \
+                 and links 1-2, 1-3 are held; writes resume only once the old grant's expiry is \
+                 proven and node 1's copies catch up, which needs those links: heal them (link \
+                 heal all); do not restart node 1: a restarted node does not rejoin in M9 \
+                 (achieveai/rDB#42)"
+                    .to_owned(),
+                wait.to_owned(),
+                "not ready: writes not admitted".to_owned(),
+                "ready".to_owned(),
+            ]
+        );
+    }
+
+    /// Message 7: after a secondary restarts, L1 keeps admitting writes for a while (walk 6c),
+    /// and a bare `ready` then read as if writes would last. While admitted the line says they
+    /// are about to pause and why; once L1 pauses, the not-ready line says so for the run.
+    /// W7-D1 (tester r1): the pause came 1.89 s after the restart with no write at all, so the
+    /// line promises only "soon", and an upper bound counted from the next write: a write with
+    /// a copy out stays unsafe and pauses at L1's pause age (r3: 2.02 s).
+    #[test]
+    fn ready_after_a_restart_says_writes_pause_soon_not_only_after_the_next_write() {
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut paused = owner(None, false);
+        paused.protection = Some("paused".to_owned());
+        let mut seen = Seen::default();
+        let mut lines = Vec::new();
+        for (node, restart) in [
+            (owner(None, true), None),
+            (owner(None, true), Some(note)),
+            (owner(None, true), Some(note)),
+            (paused, Some(note)),
+        ] {
+            lines.extend(ready_step(&mut seen, &node, restart, &[]));
+        }
+        assert_eq!(
+            lines,
+            [
+                "ready".to_owned(),
+                format!(
+                    "ready for now; writes pause soon, at the latest about 2 s after the next \
+                     write, because {note}"
+                ),
+                format!(
+                    "not ready: writes not admitted: {note}; writes stay stopped for this run: \
+                     to write again, quit and start rdb_dev again"
+                ),
+            ]
+        );
+    }
+
+    /// W7-D1, W7-D2: every `ready`/`not ready` reason is derived from the state that decides it,
+    /// checked against each state of the tester's walk-7 text matrix (s2b-tester.md, "Text
+    /// matrix"). The stuck line ("writes stay stopped for this run") prints only where nothing
+    /// in M9 brings writes back: L1 paused or reprotecting with a copy out, the owner itself
+    /// restarted, or a fence no self-replace lifts. A fence whose poll is live, with a
+    /// secondary restarted (FR, r3), promises the resume and the pause after it. Unit.
+    #[test]
+    fn every_ready_line_matches_the_state_that_decides_it() {
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let failed = "node 2 stopped: its restart as boot 2 failed; a restarted node stays out \
+                      until M10 (#42)";
+        let owner_note = "the owner, node 1, restarted (now boot 2); a restarted node stays out \
+                          until M10 (#42)";
+        let stuck = "writes stay stopped for this run: to write again, quit and start rdb_dev \
+                     again";
+        let pause = |note: &str| {
+            format!("pause soon, at the latest about 2 s after the next write, because {note}")
+        };
+        let resume = |reason: &str| {
+            format!(
+                "node 1's grant is fenced({reason}); writes resume by themselves once the old \
+                 grant's expiry is proven, so do not restart node 1: a restarted node does not \
+                 rejoin in M9 (achieveai/rDB#42)"
+            )
+        };
+        let fenced_stuck = |reason: &str| {
+            format!("node 1's grant is fenced({reason}); nothing in M9 replaces it, so {stuck}")
+        };
+        let with = |admits: bool, protection: Option<&str>, fence: Option<(DenyReason, bool)>| {
+            let mut node = owner(None, admits);
+            node.protection = protection.map(str::to_owned);
+            if let Some((reason, polling)) = fence {
+                node.authority = format!("fenced({reason:?})");
+                node.fence = Some(reason);
+                node.fence_polling = polling;
+            }
+            node
+        };
+        let mut restarted_owner = owner(None, false);
+        restarted_owner.boot = BootId(2);
+        restarted_owner.admits = None;
+        restarted_owner.protection = None;
+        let mut unheld = owner(None, false);
+        unheld.authority = "unheld".to_owned();
+        let expiring = Some((DenyReason::Expired, true));
+        let rows: Vec<(&str, NodeStatus, Option<&str>, Option<String>)> = vec![
+            (
+                "H",
+                with(true, Some("healthy"), None),
+                None,
+                Some("ready".to_owned()),
+            ),
+            (
+                "HR",
+                with(true, Some("healthy"), None),
+                Some(note),
+                Some(format!("ready for now; writes {}", pause(note))),
+            ),
+            (
+                "SF admitting",
+                with(true, Some("healthy"), None),
+                Some(failed),
+                Some(format!("ready for now; writes {}", pause(failed))),
+            ),
+            (
+                "HP",
+                with(false, Some("paused"), None),
+                Some(note),
+                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+            ),
+            (
+                "HP reprotecting",
+                with(false, Some("reprotecting"), None),
+                Some(note),
+                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+            ),
+            (
+                "SF paused",
+                with(false, Some("paused"), None),
+                Some(failed),
+                Some(format!("not ready: writes not admitted: {failed}; {stuck}")),
+            ),
+            (
+                "FP",
+                with(false, Some("healthy"), expiring),
+                None,
+                Some(format!(
+                    "not ready: writes not admitted: {}",
+                    resume("Expired")
+                )),
+            ),
+            (
+                "FS",
+                with(false, Some("healthy"), Some((DenyReason::Expired, false))),
+                None,
+                Some(format!(
+                    "not ready: writes not admitted: {}",
+                    fenced_stuck("Expired")
+                )),
+            ),
+            (
+                "FZ",
+                with(false, Some("healthy"), Some((DenyReason::Frozen, true))),
+                None,
+                Some(format!(
+                    "not ready: writes not admitted: {}",
+                    fenced_stuck("Frozen")
+                )),
+            ),
+            (
+                "U",
+                unheld.clone(),
+                None,
+                Some("not ready: writes not admitted".to_owned()),
+            ),
+            (
+                "U with a restart",
+                unheld,
+                Some(note),
+                Some(format!(
+                    "not ready: writes not admitted: writes are not admitted now; if they come \
+                     back, they {}",
+                    pause(note)
+                )),
+            ),
+            (
+                "FR",
+                with(false, Some("healthy"), expiring),
+                Some(note),
+                Some(format!(
+                    "not ready: writes not admitted: {}; once they resume, they {}",
+                    resume("Expired"),
+                    pause(note)
+                )),
+            ),
+            (
+                "FR, L1 paused",
+                with(false, Some("paused"), expiring),
+                Some(note),
+                Some(format!("not ready: writes not admitted: {note}; {stuck}")),
+            ),
+            (
+                "FR, poll stopped",
+                with(false, Some("healthy"), Some((DenyReason::Expired, false))),
+                Some(note),
+                Some(format!(
+                    "not ready: writes not admitted: {}; {note}",
+                    fenced_stuck("Expired")
+                )),
+            ),
+            (
+                "RO",
+                restarted_owner,
+                Some(owner_note),
+                Some(format!(
+                    "not ready: writes not admitted: {owner_note}; {stuck}"
+                )),
+            ),
+        ];
+        for (state, node, restart, line) in rows {
+            let admits = node.admits == Some(true);
+            let mut seen = Seen {
+                ready: !admits,
+                ..Seen::default()
+            };
+            assert_eq!(
+                ready_step(&mut seen, &node, restart, &[]),
+                line,
+                "state {state}"
+            );
+        }
+    }
+
+    /// Tester W3-D2 and walk 5: after a restart, `Unknown` for a request this session sent
+    /// carries the note, and promises M10 only after the owner's restart or both secondaries'.
+    /// After one secondary's it names the copy that can still resolve it (W5-D1). A request
+    /// never sent, or no restart, stays bare. Msg 8, W6-D1: one node 1 does not hold in flight
+    /// promises nothing, unless the owner restarted; the Db row
+    /// `a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status` proves
+    /// `in_flight` on a real Db.
+    #[test]
+    fn status_unknown_carries_the_restart_note_and_waits_for_m10_only_when_no_copy_can_resolve() {
+        let note = Some("NOTE");
+        assert_eq!(unknown_line(true, Some(true), &[], None), "status Unknown");
+        assert_eq!(
+            unknown_line(false, Some(false), &[NodeId(2)], note),
+            "status Unknown"
+        );
+        assert_eq!(
+            unknown_line(true, Some(true), &[NodeId(2)], note),
+            "status Unknown (not evidence of a lost write: it resolves once node 3, which did \
+             not restart, can take it; NOTE)"
+        );
+        assert_eq!(
+            unknown_line(true, Some(true), &[NodeId(3)], note),
+            "status Unknown (not evidence of a lost write: it resolves once node 2, which did \
+             not restart, can take it; NOTE)"
+        );
+        let m10 = "status Unknown (not evidence of a lost write: its outcome cannot be known \
+                   until a restarted node rejoins, which is M10; NOTE)";
+        assert_eq!(
+            unknown_line(true, Some(true), &[NodeId(2), NodeId(3)], note),
+            m10
+        );
+        assert_eq!(unknown_line(true, Some(true), &[NodeId(1)], note), m10);
+        assert_eq!(
+            unknown_line(true, Some(true), &[NodeId(1), NodeId(2)], note),
+            m10
+        );
+        assert_eq!(unknown_line(true, Some(false), &[NodeId(1)], note), m10);
+        let refused = "status Unknown (node 1 does not hold it in flight, so waiting will not \
+                       change this: it was refused before it was queued, or never arrived; NOTE)";
+        assert_eq!(unknown_line(true, Some(false), &[NodeId(3)], note), refused);
+        assert_eq!(
+            unknown_line(true, Some(false), &[NodeId(2), NodeId(3)], note),
+            refused
+        );
+    }
+
+    /// F-025: `node_status` leaves out a node 1 that does not answer in time, and the line then
+    /// read as "not in flight; waiting will not change this", which nothing showed. Without an
+    /// answer it says so and to ask again; after the owner's own restart the M10 line stands.
+    /// Unit.
+    #[test]
+    fn status_unknown_says_try_again_when_node_1_did_not_answer() {
+        let note = Some("NOTE");
+        let silent = "status Unknown (node 1 did not answer in time, so whether it holds it in \
+                      flight is not known; try again; NOTE)";
+        assert_eq!(unknown_line(true, None, &[NodeId(3)], note), silent);
+        assert_eq!(
+            unknown_line(true, None, &[NodeId(2), NodeId(3)], note),
+            silent
+        );
+        assert_eq!(
+            unknown_line(false, None, &[NodeId(3)], note),
+            "status Unknown"
+        );
+        assert_eq!(
+            unknown_line(true, None, &[NodeId(1)], note),
+            "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
+             restarted node rejoins, which is M10; NOTE)"
+        );
+    }
+
+    /// Msg 9 adjacent defect: `node_status` leaves out a node whose restart failed (SF), so a
+    /// restart set built from it missed node 2, and `status` of a write in flight said it waits
+    /// for M10 although node 3, which did not restart, can still take it. The set comes from
+    /// each node's boot, answered or not. Unit; walk w13 (r9/walks) shows it live.
+    #[test]
+    fn a_failed_secondary_restart_counts_as_restarted_for_status() {
+        // Node 2's restart failed: it answers no `node_status`, but its boot moved on.
+        let boots = |node: NodeId| {
+            Some(if node == NodeId(2) {
+                BootId(2)
+            } else {
+                BootId(1)
+            })
+        };
+        let restarted = restarted_nodes(boots);
+        assert_eq!(
+            restarted,
+            [NodeId(2)],
+            "node 2 did not answer: its restart failed"
+        );
+        assert_eq!(
+            unknown_line(true, Some(true), &restarted, Some("NOTE")),
+            "status Unknown (not evidence of a lost write: it resolves once node 3, which did \
+             not restart, can take it; NOTE)"
+        );
+    }
+
+    /// W7-D3 (tester r12): after node 1's restart failed, the poller kept its last `ready`,
+    /// because `node_status` leaves node 1 out and the poll printed nothing then. It now prints
+    /// the stuck line once, naming the failed restart. `nodes` names a node left out, as
+    /// stopped or as not answering, instead of dropping it (r11, r12). Unit; the live walk
+    /// w12 (r9/walks) shows both on a real run.
+    #[test]
+    fn a_failed_owner_restart_says_not_ready_and_nodes_names_the_stopped_node() {
+        let note = "the owner, node 1, stopped: its restart as boot 2 failed; a restarted node \
+                    stays out until M10 (#42)";
+        let mut seen = Seen::default();
+        lines_ready(&mut seen);
+        assert_eq!(
+            stopped_owner_step(&mut seen, Some(note)),
+            Some(format!(
+                "not ready: writes not admitted: {note}; writes stay stopped for this run: to \
+                 write again, quit and start rdb_dev again"
+            ))
+        );
+        assert_eq!(
+            stopped_owner_step(&mut seen, Some(note)),
+            None,
+            "printed once"
+        );
+        assert_eq!(
+            missing_node_line(NodeId(1), Some(BootId(2)), true),
+            "node=1 boot=2 stopped: its restart as boot 2 failed, so no process runs it"
+        );
+        assert_eq!(
+            missing_node_line(NodeId(2), Some(BootId(1)), false),
+            "node=2 boot=1 did not answer in time; try again"
+        );
+    }
+
+    /// `seen` after a `ready` line, as the poller holds it before a failure.
+    fn lines_ready(seen: &mut Seen) {
+        assert_eq!(
+            ready_step(seen, &owner(None, true), None, &[]),
+            Some("ready".to_owned())
+        );
+    }
+
+    /// F-012 (tester walk 7): rdb_dev printed an admin error as `KIND (detail)` only, so a
+    /// permanent store error and a transient one read alike. The line carries `retry=` and
+    /// `no_mutation=` as a `put` error does, and says in words whether running it again helps.
+    /// Unit.
+    #[test]
+    fn an_admin_error_says_whether_running_it_again_can_help() {
+        let error = |retry, no_mutation| ApiError {
+            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
+            retry,
+            no_mutation,
+            detail: "control store: list partitions/: x; nothing deleted".to_owned(),
+        };
+        assert_eq!(
+            admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter, true)),
+            "err admin clear-grant 1: UNAVAILABLE retry=BoundedJitter no_mutation=true (control \
+             store: list partitions/: x; nothing deleted); running it again can help"
+        );
+        assert_eq!(
+            admin_error_line(NodeId(1), &error(RetryRule::NotWired, true)),
+            "err admin clear-grant 1: UNAVAILABLE retry=NotWired no_mutation=true (control \
+             store: list partitions/: x; nothing deleted); running it again will not help: it \
+             fails the same way each time"
+        );
+        assert!(
+            admin_error_line(NodeId(1), &error(RetryRule::QueryStatus, false)).ends_with(
+                "no_mutation=false (control store: list partitions/: x; nothing deleted); \
+                        run it again: it reads where the record stands before it deletes \
+                        anything"
+            )
+        );
+    }
+
+    /// Re-review F-027: the words follow `retry` and `no_mutation` together, never `retry`
+    /// alone. A permanent delete error is `NotWired` with `no_mutation=false`, and its detail
+    /// says the delete may have applied and to run it again to read where it stands; "running
+    /// it again will not help" then contradicted it. A rerun reads the record first, so it
+    /// shows whether the delete applied; only a record still there fails the same way. Unit.
+    #[test]
+    fn an_admin_error_that_may_have_deleted_says_a_rerun_shows_whether_it_did() {
+        let error = |retry| ApiError {
+            kind: rdb_core::contracts::errors::ErrorKind::Unavailable,
+            retry,
+            no_mutation: false,
+            detail: "control store: delete grants/1 at revision 5: permission denied; the \
+                     delete may have applied; run it again to read where it stands"
+                .to_owned(),
+        };
+        let permanent = admin_error_line(NodeId(1), &error(RetryRule::NotWired));
+        assert_eq!(
+            permanent,
+            "err admin clear-grant 1: UNAVAILABLE retry=NotWired no_mutation=false (control \
+             store: delete grants/1 at revision 5: permission denied; the delete may have \
+             applied; run it again to read where it stands); run it again to see whether the \
+             delete applied: it reads the record first, and only a record still there fails \
+             the same way again"
+        );
+        let transient = admin_error_line(NodeId(1), &error(RetryRule::BoundedJitter));
+        assert!(
+            transient.ends_with(
+                "; running it again can help, and shows whether the delete applied: it reads \
+                 the record first"
+            ),
+            "{transient}"
         );
     }
 

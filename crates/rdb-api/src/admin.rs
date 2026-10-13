@@ -18,17 +18,24 @@
 //! From there F1 queries the three empty copies, selects, commits generation 1 and the host
 //! carries it to every member. The admin never injects `Recovered`, never writes a record into
 //! the partition and never answers for a module (lead ruling: no workaround in `rdb_api`).
+//!
+//! [`clear_grant`] (M9 S2b) is the planner's other duty here: it removes the `grants/{node}`
+//! record a restarted node's old process left behind, through rdb-core's three guards.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
-use config_core::{ConfigError, ConfigStore, GetRequest, MutationOutcome, PutRequest};
+use config_core::{
+    ConfigError, ConfigStore, DeleteRequest, GetRequest, ListRequest, MutationOutcome, PutRequest,
+};
+use rdb_core::authority::grant::{clear_verdict, ClearRefusal, ClearVerdict, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::authority::{
     AuthorityView, DenyReason, FencingProof, Lineage, Revocation,
 };
-use rdb_core::contracts::control::ControlKey;
+use rdb_core::contracts::control::{ControlKey, ControlPrefix};
 use rdb_core::contracts::digest::Digest;
+use rdb_core::contracts::errors::{ErrorKind, RetryRule};
 use rdb_core::contracts::event::{EventKind, KernelEvent};
 use rdb_core::contracts::ids::{
     AuthorityGeneration, ConfigVersion, CorrelationId, Generation, GrantId, NodeId, OwnerEpoch,
@@ -38,6 +45,8 @@ use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
 use rdb_core::contracts::recovery::{Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan};
 use rdb_core::contracts::time::Tick;
 
+use crate::clock::HostClock;
+use crate::db::{ApiError, Db};
 use crate::host::{Msg, NodeStopped, BOOT};
 
 /// The partition S0 serves.
@@ -228,6 +237,256 @@ async fn adopt(
     Ok(Revision(found.mod_revision))
 }
 
+/// What [`clear_grant`] did with `grants/{node}`. The simulator's service answers the same way
+/// (`rdb_sim`'s `grant_service::Clearance`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clearance {
+    /// `grants/{node}` holds nothing: there is nothing to clear.
+    Absent,
+    /// The record names the node's current boot: it is the running process's grant, however
+    /// expired it reads. Nothing was written.
+    Current,
+    /// The record was deleted at this revision.
+    Cleared(Revision),
+    /// A guard held the record in place. Nothing was written.
+    Refused {
+        /// Which guard.
+        refusal: ClearRefusal,
+        /// `E + epsilon + delta` in UTC milliseconds: once control time is past it, guard 2
+        /// holds. It moves if the old process still renews.
+        until_utc_ms: i64,
+    },
+    /// All three guards held, but the record moved between the read and the delete. Nothing was
+    /// deleted; run it again.
+    Conflict,
+}
+
+/// Remove `grants/{node}` if a restarted node's old process left it and it may safely go (M9
+/// S2b). The operator runs it, again until it answers [`Clearance::Cleared`] or
+/// [`Clearance::Absent`]; a polling service is M10.
+///
+/// Reads the record, then the whole `partitions/` family, then asks
+/// [`rdb_core::authority::grant::clear_verdict`] with the boot `db` runs `node` at now, never
+/// the boot the record names, and the `Db`'s own clock. Only a [`ClearVerdict::Clear`] writes:
+/// a delete at the record's own `mod_revision`, so a record renewed or replaced since the read
+/// is left alone ([`Clearance::Conflict`]).
+///
+/// The `partitions/` list is read before the verdict because the verdict's read is synchronous
+/// and `store` is not (critic A2). So with lists failing this is an error even where it would
+/// answer [`Clearance::Current`].
+///
+/// Guard 3 and the delete are two calls: rEtcd has no compare across keys. That is safe in M9
+/// because nothing can make guard 3 false between them. The only writers of `partitions/` are
+/// [`bootstrap`] and F1's commit, and both write `Serving` (`rdb_dev`'s `control lifecycle`
+/// runs on the same thread as its `admin clear-grant`). **M10 tripwire:** the first writer of a
+/// non-`Serving` lifecycle, the planner, must also be the only clearer, or rEtcd must gain a
+/// multi-key compare.
+///
+/// Logged as `grant_clear{node, boot, record_boot, revision, expiry, now, until, verdict}`, and a
+/// failure as `grant_clear_failed{node, error}`.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` for a node `db` does not run, or a `Db` built without budgets (a crate
+/// test's). `UNAVAILABLE` when a read fails, the `partitions/` list comes back truncated, or a
+/// record does not decode: nothing is deleted then, and `no_mutation` says so. Its retry rule is
+/// `BoundedJitter` only for a store that was unavailable, timed out or not the leader, and
+/// `NotWired` otherwise: repeating a refused or unreadable call changes nothing (F-012).
+/// `UNKNOWN_OUTCOME` when the delete's reply is lost; running it again reads where it stands.
+pub async fn clear_grant(
+    db: &Db,
+    store: &dyn ConfigStore,
+    node: NodeId,
+) -> Result<Clearance, ApiError> {
+    let answer = judge_and_clear(db, store, node).await;
+    if let Err(error) = &answer {
+        tracing::warn!(node = node.0, %error, "grant_clear_failed");
+    }
+    answer
+}
+
+async fn judge_and_clear(
+    db: &Db,
+    store: &dyn ConfigStore,
+    node: NodeId,
+) -> Result<Clearance, ApiError> {
+    let boot = db.boot_of(node).ok_or_else(|| {
+        ApiError::invalid(format!(
+            "node {}: no such node; this Db runs nodes 1, 2 and 3",
+            node.0
+        ))
+    })?;
+    let budgets = db.budgets().ok_or_else(|| {
+        ApiError::invalid("this Db was built without budgets, so it cannot judge a grant")
+    })?;
+    let key = ControlKey::Grant(node).encode();
+    let read = store
+        .get(GetRequest {
+            key: Bytes::from(key.clone()),
+        })
+        .await
+        .map_err(|error| store_failed(&format!("get {key}"), &error, true))?;
+    let Some(found) = read.record else {
+        tracing::info!(
+            node = node.0,
+            boot = boot.0,
+            verdict = ?Clearance::Absent,
+            "grant_clear"
+        );
+        return Ok(Clearance::Absent);
+    };
+    let record = GrantRecord::decode(&found.value).ok_or_else(|| {
+        unreadable(format!(
+            "{key} at revision {} is not a grant record",
+            found.mod_revision
+        ))
+    })?;
+    let partitions = list_partitions(store).await?;
+    let now = db.now();
+    let sample = HostClock::control_time(now, &budgets);
+    let verdict = clear_verdict(node, &record, boot, sample, now, &budgets, || {
+        Ok::<_, std::convert::Infallible>(partitions)
+    })
+    .unwrap_or_else(|never| match never {});
+    let margin = budgets
+        .clock_error_millis
+        .saturating_add(budgets.dispatch_margin_millis);
+    let until_utc_ms = record
+        .expiry_utc_ms
+        .saturating_add(i64::try_from(margin).unwrap_or(i64::MAX));
+    let clearance = match verdict {
+        ClearVerdict::Current => Clearance::Current,
+        ClearVerdict::Refused(refusal) => Clearance::Refused {
+            refusal,
+            until_utc_ms,
+        },
+        ClearVerdict::Clear => delete(store, &key, found.mod_revision).await?,
+    };
+    tracing::info!(
+        node = node.0,
+        boot = boot.0,
+        record_boot = record.boot.0,
+        revision = found.mod_revision,
+        expiry = record.expiry_utc_ms,
+        now = now.0,
+        until = until_utc_ms,
+        verdict = ?clearance,
+        "grant_clear"
+    );
+    Ok(clearance)
+}
+
+/// The whole `partitions/` family, or an error: a failed or truncated list is never read as a
+/// complete one, since a missing record could hide a partition in transfer.
+async fn list_partitions(store: &dyn ConfigStore) -> Result<Vec<PartitionRecord>, ApiError> {
+    let prefix = ControlPrefix::Partitions.encode();
+    let listed = store
+        .list(ListRequest {
+            prefix: Bytes::from_static(prefix.as_bytes()),
+            max_items: 0,
+            max_bytes: 0,
+        })
+        .await
+        .map_err(|error| store_failed(&format!("list {prefix}"), &error, true))?;
+    if listed.truncated {
+        return Err(unreadable(format!(
+            "list {prefix} came back truncated at revision {}",
+            listed.read_revision
+        )));
+    }
+    listed
+        .records
+        .iter()
+        .map(|found| {
+            PartitionRecord::decode(&found.value).ok_or_else(|| {
+                unreadable(format!(
+                    "{} at revision {} is not a partition record",
+                    String::from_utf8_lossy(&found.key),
+                    found.mod_revision
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Delete `key` only while it is still at `revision`.
+async fn delete(store: &dyn ConfigStore, key: &str, revision: u64) -> Result<Clearance, ApiError> {
+    let answer = store
+        .delete(DeleteRequest {
+            key: Bytes::from(key.to_owned()),
+            expected_mod_revision: Some(revision),
+            dedup: None,
+        })
+        .await;
+    match answer {
+        Ok(response) if response.outcome == MutationOutcome::Applied => {
+            Ok(Clearance::Cleared(Revision(response.revision)))
+        }
+        Ok(_) | Err(ConfigError::Conflict { .. } | ConfigError::NotFound) => {
+            Ok(Clearance::Conflict)
+        }
+        Err(ConfigError::DeadlineExceededUnknownOutcome) => Err(ApiError::new(
+            ErrorKind::UnknownOutcome,
+            format!("delete {key} at revision {revision}: the reply was lost"),
+        )),
+        // Refused before it was proposed: the record is as it was. Any other failure may have
+        // reached the store.
+        Err(error) => Err(store_failed(
+            &format!("delete {key} at revision {revision}"),
+            &error,
+            matches!(
+                error,
+                ConfigError::Unavailable { .. } | ConfigError::NotLeader { .. }
+            ),
+        )),
+    }
+}
+
+/// `call` failed in the control store, told briefly: the store's own words go to the log
+/// only (`grant_clear_store_error{call, error}`), since an `Unavailable` names the whole
+/// membership with its ports. A read that timed out says so: the store's wording, "mutation
+/// outcome is unknown", is about a write. Never a lost delete reply, which
+/// [`delete`] answers itself. Only a transient error ([`crate::control::transient`]) is worth
+/// a jittered retry; any other says the call itself is refused, and repeating it changes
+/// nothing (review F-012). `no_mutation` is the caller's: true for a read, false for a delete
+/// that may have reached the store.
+fn store_failed(call: &str, error: &ConfigError, no_mutation: bool) -> ApiError {
+    tracing::warn!(call, %error, "grant_clear_store_error");
+    let short = match error {
+        ConfigError::DeadlineExceededUnknownOutcome => "timed out".to_owned(),
+        ConfigError::Unavailable { .. } => {
+            "unavailable now (the store's reason is in the log)".to_owned()
+        }
+        other => other.to_string(),
+    };
+    let retry = if crate::control::transient(error) {
+        RetryRule::BoundedJitter
+    } else {
+        RetryRule::NotWired
+    };
+    unavailable(format!("{call}: {short}"), retry, no_mutation)
+}
+
+/// A record this build cannot read, or a list cut short: before anything is written, and the
+/// same on every retry, so `NotWired` (review F-012).
+fn unreadable(detail: String) -> ApiError {
+    unavailable(detail, RetryRule::NotWired, true)
+}
+
+fn unavailable(detail: String, retry: RetryRule, no_mutation: bool) -> ApiError {
+    let tail = if no_mutation {
+        "nothing deleted"
+    } else {
+        "the delete may have applied; run it again to read where it stands"
+    };
+    ApiError {
+        kind: ErrorKind::Unavailable,
+        retry,
+        no_mutation,
+        detail: format!("control store: {detail}; {tail}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +514,292 @@ mod tests {
             }))
             .expect("put");
         assert_eq!(response.outcome, MutationOutcome::Applied);
+    }
+
+    /// A `Db` whose owner restarted (boot 2, no thread) with `grants/1` left by its boot-1
+    /// process, long expired and not frozen: every guard but the store's would clear it.
+    /// Returns the revision the record was written at.
+    fn restarted_owner(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+    ) -> (Db, std::sync::mpsc::Receiver<Msg>, u64) {
+        let (mut owner, mailbox) = crate::host::NodeHandle::unanswered(OWNER);
+        owner.boot = rdb_core::contracts::ids::BootId(BOOT.0 + 1);
+        let held: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
+        let db = Db::by_hand(
+            vec![owner],
+            held,
+            rt.handle(),
+            crate::db::Timeouts::default(),
+            Some((std::path::PathBuf::new(), budgets)),
+        );
+        let old = GrantRecord {
+            grant: GrantId(1),
+            node: OWNER,
+            boot: BOOT,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        let written = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+                value: old.encode(),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put grants/1");
+        (db, mailbox, written.revision)
+    }
+
+    fn grant_revision(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) -> Option<u64> {
+        rt.block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+        }))
+        .expect("get grants/1")
+        .record
+        .map(|found| found.mod_revision)
+    }
+
+    /// Message 6, round-3 mutant M2: the delete names the revision `clear_grant` judged. A write
+    /// to `grants/1` between that read and the delete (here, while the `partitions/` list is
+    /// held) makes the delete lose: `Conflict`, and the moved record stays. The control row:
+    /// the same record with nothing in between clears.
+    /// Unit (~20 ms): `MemStore` behind the scripted list.
+    #[test]
+    fn a_grant_that_moves_after_it_was_judged_is_not_deleted() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = Scripted::new(Script {
+            hold_lists: 1,
+            ..Script::default()
+        });
+        let (db, _mailbox, written) = restarted_owner(&store, &rt);
+        let moved = rt.block_on(async {
+            let move_it = async {
+                store.list_held.notified().await;
+                let key = Bytes::from(ControlKey::Grant(OWNER).encode());
+                let current = store.mem().get(GetRequest { key: key.clone() }).await;
+                let value = current.expect("get").record.expect("grants/1").value;
+                let moved = store
+                    .mem()
+                    .put(PutRequest {
+                        key,
+                        value,
+                        expected_mod_revision: Some(written),
+                        dedup: None,
+                    })
+                    .await
+                    .expect("move grants/1");
+                store.release_lists();
+                moved.revision
+            };
+            let (clearance, moved) = tokio::join!(clear_grant(&db, &store, OWNER), move_it);
+            assert_eq!(clearance, Ok(Clearance::Conflict));
+            moved
+        });
+        assert_eq!(
+            grant_revision(&store, &rt),
+            Some(moved),
+            "the moved record stays"
+        );
+
+        let store = config_testkit::MemStore::new();
+        let (db, _mailbox, written) = restarted_owner(&store, &rt);
+        assert!(
+            matches!(rt.block_on(clear_grant(&db, &store, OWNER)), Ok(Clearance::Cleared(at)) if at.0 > written)
+        );
+        assert_eq!(grant_revision(&store, &rt), None);
+    }
+
+    /// Message 6, round-3 mutant M3: a `partitions/` list that fails or comes back truncated is
+    /// never read as complete, since a missing record could hide a partition in transfer. Each
+    /// is `UNAVAILABLE` ending "nothing deleted", and `grants/1` stays.
+    /// Unit (~20 ms).
+    #[test]
+    fn a_failed_or_truncated_partition_list_deletes_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let failing = Scripted::new(Script {
+            fail_lists: 1,
+            ..Script::default()
+        });
+        let short = config_testkit::MemStore::with_limits(config_core::Limits {
+            max_list_items: 1,
+            ..config_core::Limits::DEFAULT
+        });
+        for id in [1, 2] {
+            let mut serving = record(1);
+            serving.partition = PartitionId(id);
+            put_at(
+                &short,
+                &rt,
+                ControlKey::Partition(PartitionId(id)),
+                serving.encode(),
+            );
+        }
+        let stores: [(&str, &dyn ConfigStore); 2] = [("failed", &failing), ("truncated", &short)];
+        for (case, store) in stores {
+            let (db, _mailbox, written) = restarted_owner(store, &rt);
+            let error = rt.block_on(clear_grant(&db, store, OWNER)).expect_err(case);
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{case}: {error:?}");
+            assert!(
+                error.detail.ends_with("; nothing deleted"),
+                "{case}: {error:?}"
+            );
+            assert_eq!(grant_revision(store, &rt), Some(written), "{case}");
+        }
+    }
+
+    /// Msg 8, F-012: a refusal before the delete says nothing was mutated, and only a transient
+    /// store error says a jittered retry helps. A permission error and a `grants/1` that does
+    /// not decode stay the same however often they are retried, so they answer `NotWired`; an
+    /// unavailable store answers `BoundedJitter`. Each leaves `grants/1` as it was.
+    /// Unit (~20 ms).
+    #[test]
+    fn a_clear_refused_before_the_delete_says_no_mutation_and_retries_only_transient_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for (case, error, retry) in [
+            (
+                "permission",
+                ConfigError::PermissionDenied {
+                    detail: "no grant on grants/".to_owned(),
+                },
+                RetryRule::NotWired,
+            ),
+            (
+                "unavailable",
+                ConfigError::Unavailable {
+                    reason: "down".to_owned(),
+                },
+                RetryRule::BoundedJitter,
+            ),
+        ] {
+            let store = config_testkit::MemStore::new();
+            let (db, _mailbox, written) = restarted_owner(&store, &rt);
+            store.failing_with(error);
+            let refused = rt
+                .block_on(clear_grant(&db, &store, OWNER))
+                .expect_err(case);
+            store.stop_failing();
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::Unavailable, retry, true),
+                "{case}: {refused:?}"
+            );
+            assert!(
+                refused.detail.ends_with("nothing deleted"),
+                "{case}: {refused:?}"
+            );
+            assert_eq!(grant_revision(&store, &rt), Some(written), "{case}");
+        }
+
+        let store = config_testkit::MemStore::new();
+        let (db, _mailbox, _) = restarted_owner(&store, &rt);
+        let key = Bytes::from(ControlKey::Grant(OWNER).encode());
+        let found = rt
+            .block_on(store.get(GetRequest { key: key.clone() }))
+            .expect("get")
+            .record
+            .expect("grants/1");
+        let garbled = rt
+            .block_on(store.put(PutRequest {
+                key,
+                value: Bytes::from_static(b"not a grant record"),
+                expected_mod_revision: Some(found.mod_revision),
+                dedup: None,
+            }))
+            .expect("put")
+            .revision;
+        let refused = rt
+            .block_on(clear_grant(&db, &store, OWNER))
+            .expect_err("does not decode");
+        assert_eq!(
+            (refused.kind, refused.retry, refused.no_mutation),
+            (ErrorKind::Unavailable, RetryRule::NotWired, true),
+            "{refused:?}"
+        );
+        assert_eq!(grant_revision(&store, &rt), Some(garbled));
+    }
+
+    /// Review F-024 (mutant U4): a delete the store refused before proposing it, `Unavailable`
+    /// or `NotLeader`, deleted nothing, and says so; any other delete error may have reached
+    /// the store, so it says `no_mutation=false` and to run it again to see. Only the transient
+    /// ones say a jittered retry helps. Unit (~20 ms): the scripted store fails the delete only.
+    #[test]
+    fn a_delete_the_store_refused_before_proposing_says_nothing_deleted_and_no_other_does() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for (case, error, retry, no_mutation) in [
+            (
+                "unavailable",
+                ConfigError::Unavailable {
+                    reason: "down".to_owned(),
+                },
+                RetryRule::BoundedJitter,
+                true,
+            ),
+            (
+                "not leader",
+                ConfigError::NotLeader { hint: None },
+                RetryRule::BoundedJitter,
+                true,
+            ),
+            (
+                "permission",
+                ConfigError::PermissionDenied {
+                    detail: "no delete on grants/".to_owned(),
+                },
+                RetryRule::NotWired,
+                false,
+            ),
+        ] {
+            let store = Scripted::new(Script {
+                fail_delete_with: Some(error),
+                ..Script::default()
+            });
+            let (db, _mailbox, written) = restarted_owner(&store, &rt);
+            let refused = rt
+                .block_on(clear_grant(&db, &store, OWNER))
+                .expect_err(case);
+            assert_eq!(
+                (refused.kind, refused.retry, refused.no_mutation),
+                (ErrorKind::Unavailable, retry, no_mutation),
+                "{case}: {refused:?}"
+            );
+            assert!(
+                refused.detail.contains("delete grants/1"),
+                "{case}: {refused:?}"
+            );
+            let tail = if no_mutation {
+                "nothing deleted"
+            } else {
+                "the delete may have applied; run it again to read where it stands"
+            };
+            assert!(refused.detail.ends_with(tail), "{case}: {refused:?}");
+            assert_eq!(grant_revision(&store, &rt), Some(written), "{case}");
+        }
+    }
+
+    fn put_at(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+        key: ControlKey,
+        value: Bytes,
+    ) {
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(key.encode()),
+            value,
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put");
     }
 
     /// F-004 (b): only an untouched record of this bootstrap's own is adopted. A record that

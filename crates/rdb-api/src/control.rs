@@ -18,7 +18,9 @@
 //! * `Reload` → one `FamilySnapshot` at the list's read revision. A truncated list faults the node:
 //!   a partial family would read as a complete one.
 //!
-//! Every call logs `control_call{node, op, key, outcome, millis}`.
+//! Every call logs `control_call{node, op, key, outcome, millis}`. A get adds `revision`, the one it
+//! found; a CAS adds `expected`, the revision it requires (0: must not exist), and `revision`, the
+//! one it committed at.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -35,17 +37,21 @@ use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
     ControlRecord, ReadOutcome, WatchCursor, WatchTermination,
 };
-use rdb_core::contracts::ids::{ControlRequestId, CorrelationId, NodeId, PartitionId, Revision};
+use rdb_core::contracts::ids::{
+    BootId, ControlRequestId, CorrelationId, NodeId, PartitionId, Revision,
+};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use crate::host::Msg;
 use crate::transport::Links;
 
-/// Where a completion goes: the asking node, and the effect's partition and correlation.
+/// Where a completion goes: the asking node and the boot it asked under, and the effect's
+/// partition and correlation.
 #[derive(Debug, Clone, Copy)]
 struct Site {
     node: NodeId,
+    boot: BootId,
     partition: PartitionId,
     correlation: CorrelationId,
 }
@@ -63,7 +69,9 @@ pub struct ControlAdapter {
     store: Arc<dyn ConfigStore>,
     rt: Handle,
     links: Arc<Links>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// The gets and CASes still running, per asking node, so a restart abandons only that
+    /// node's (M9 S2b, critic M2).
+    tasks: Mutex<BTreeMap<NodeId, Vec<JoinHandle<()>>>>,
     watches: Mutex<BTreeMap<(NodeId, ControlPrefix), JoinHandle<()>>>,
     /// The reload of each (node, prefix). A newer one aborts the one it replaces.
     reloads: Reloads,
@@ -89,22 +97,25 @@ impl ControlAdapter {
             store,
             rt,
             links,
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new(BTreeMap::new()),
             watches: Mutex::new(BTreeMap::new()),
             reloads: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
-    /// Carry out `effect` for `node`; its completion arrives in the node's mailbox.
+    /// Carry out `effect` for `node`, running at `boot`; its completion arrives in the node's
+    /// mailbox stamped with `boot`, so a later process of the node can tell it is not its own.
     pub fn submit(
         &self,
         node: NodeId,
+        boot: BootId,
         partition: PartitionId,
         correlation: CorrelationId,
         effect: ControlEffect,
     ) {
         let site = Site {
             node,
+            boot,
             partition,
             correlation,
         };
@@ -140,19 +151,20 @@ impl ControlAdapter {
         let task = self.rt.spawn(async move {
             match call(&*store, site, effect).await {
                 Ok(event) => post(&links, site, event),
-                Err((kind, detail)) => fault(&links, site.node, kind, detail),
+                Err((kind, detail)) => fault(&links, site, kind, detail),
             }
         });
         let mut tasks = lock(&self.tasks);
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
+        let calls = tasks.entry(node).or_default();
+        calls.retain(|task| !task.is_finished());
+        calls.push(task);
     }
 
     /// While a reload of `node`'s is still retrying, how many of its lists have failed: the
     /// highest count over its families (`rdb_dev nodes`: `reload pending attempt=N`). A reload
     /// puts its count back to 0 before it answers, and the only reloads ever stopped early are
-    /// dropped from the map as they are (a newer one replaces it, or `shutdown` takes them
-    /// all), so a count above 0 is always a reload still retrying.
+    /// dropped from the map as they are (a newer one replaces it, `forget_node` or `shutdown`
+    /// takes them), so a count above 0 is always a reload still retrying.
     #[must_use]
     pub fn reload_pending(&self, node: NodeId) -> Option<u32> {
         lock(&self.reloads)
@@ -161,6 +173,48 @@ impl ControlAdapter {
             .map(|(_, (_, failed))| failed.load(Ordering::Relaxed))
             .filter(|failed| *failed > 0)
             .max()
+    }
+
+    /// Stop `node`'s watches and reloads and abandon its calls still running, and nobody
+    /// else's: the node's process has stopped (`Db::restart_node`). A reload removed here never
+    /// answers. `abort` lands only at an await, so a call already past its last one can still
+    /// post; that completion carries the old boot, and the node's next process drops it.
+    /// `boot` is the stopped process's, for the log: `control_forgot{node, boot, watches,
+    /// reloads, calls}`.
+    pub fn forget_node(&self, node: NodeId, boot: BootId) {
+        let mut watches = 0_usize;
+        lock(&self.watches).retain(|(at, _), task| {
+            let mine = *at == node;
+            if mine {
+                task.abort();
+                watches += 1;
+            }
+            !mine
+        });
+        let mut reloads = 0_usize;
+        lock(&self.reloads).retain(|(at, _), (task, _)| {
+            let mine = *at == node;
+            if mine {
+                task.abort();
+                reloads += 1;
+            }
+            !mine
+        });
+        let mut calls = 0_usize;
+        for task in lock(&self.tasks).remove(&node).unwrap_or_default() {
+            if !task.is_finished() {
+                calls += 1;
+            }
+            task.abort();
+        }
+        tracing::info!(
+            node = node.0,
+            boot = boot.0,
+            watches,
+            reloads,
+            calls,
+            "control_forgot"
+        );
     }
 
     /// Stop every watch and abandon every call still running, reloads included. Called before
@@ -172,7 +226,10 @@ impl ControlAdapter {
         for (_, (task, _)) in std::mem::take(&mut *lock(&self.reloads)) {
             task.abort();
         }
-        for task in std::mem::take(&mut *lock(&self.tasks)) {
+        for task in std::mem::take(&mut *lock(&self.tasks))
+            .into_values()
+            .flatten()
+        {
             task.abort();
         }
     }
@@ -182,6 +239,7 @@ fn post(links: &Links, site: Site, event: ControlEvent) {
     let msg = Msg::Control {
         partition: site.partition,
         correlation: site.correlation,
+        boot: site.boot,
         event,
     };
     if links.post(site.node, msg).is_err() {
@@ -189,14 +247,45 @@ fn post(links: &Links, site: Site, event: ControlEvent) {
     }
 }
 
-fn fault(links: &Links, node: NodeId, kind: &'static str, detail: String) {
-    tracing::error!(node = node.0, kind, %detail, "control_fault");
-    let _ = links.post(node, Msg::Fault { kind, detail });
+fn fault(links: &Links, site: Site, kind: &'static str, detail: String) {
+    tracing::error!(node = site.node.0, boot = site.boot.0, kind, %detail, "control_fault");
+    let _ = links.post(
+        site.node,
+        Msg::Fault {
+            boot: site.boot,
+            kind,
+            detail,
+        },
+    );
 }
 
 fn log_call(site: Site, op: &str, key: &str, outcome: &str, started: Instant) {
     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(node = site.node.0, op, key, outcome, millis, "control_call");
+}
+
+/// `control_call` for a get or a CAS, with the revisions it names: `expected`, the revision a CAS
+/// requires, and `revision`, the one a get found or a CAS committed at, each absent when there is
+/// none. A same-boot fresh grant is checked by these: its replace's `expected` is the `revision`
+/// of the get before it (M9 S2b, A-R96).
+fn log_revisions(
+    site: Site,
+    (op, key, outcome): (&str, &str, &str),
+    expected: Option<u64>,
+    revision: Option<u64>,
+    started: Instant,
+) {
+    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        node = site.node.0,
+        op,
+        key,
+        outcome,
+        expected,
+        revision,
+        millis,
+        "control_call"
+    );
 }
 
 /// `control_call` for `op=watch`, with `from`, the revision the watch starts after, so a re-watch
@@ -266,7 +355,17 @@ async fn call(
                     ReadOutcome::Unavailable
                 }
             };
-            log_call(site, "get", &name, read_name(&outcome), started);
+            let found = match &outcome {
+                ReadOutcome::Found { revision, .. } => Some(revision.0),
+                _ => None,
+            };
+            log_revisions(
+                site,
+                ("get", &name, read_name(&outcome)),
+                None,
+                found,
+                started,
+            );
             Ok(ControlEvent::Value {
                 request,
                 key,
@@ -296,7 +395,7 @@ fn reload_backoff(attempt: u32) -> std::time::Duration {
 /// Whether a failed list may be sent again: the store could not be reached, did not answer in
 /// time, or was not the leader. Any other error says the request itself is wrong, and retrying
 /// it would hide that forever.
-const fn transient(error: &ConfigError) -> bool {
+pub(crate) const fn transient(error: &ConfigError) -> bool {
     matches!(
         error,
         ConfigError::Unavailable { .. }
@@ -411,7 +510,7 @@ async fn reload(
     }
     match answer {
         Ok(event) => post(&links, site, event),
-        Err((kind, detail)) => fault(&links, site.node, kind, detail),
+        Err((kind, detail)) => fault(&links, site, kind, detail),
     }
     // Held through the send on purpose: released before it, a replacement could slip in
     // between the check and the post, and no row would go red (PR #38 re-review).
@@ -430,6 +529,12 @@ async fn cas(
     ),
 ) -> Result<ControlEvent, Fault> {
     let name = key.encode();
+    // A put spells "must not exist" as revision 0; a delete always names one.
+    let required = if value.is_some() {
+        Some(expected.map_or(0, |revision| revision.0))
+    } else {
+        expected.map(|revision| revision.0)
+    };
     let (op, answer) = match value {
         Some(value) => (
             "cas_put",
@@ -462,7 +567,17 @@ async fn cas(
         }
     };
     let outcome = cas_outcome(site, &name, answer);
-    log_call(site, op, &name, cas_name(&outcome), started);
+    let committed = match &outcome {
+        CasOutcome::Committed(revision) => Some(revision.0),
+        _ => None,
+    };
+    log_revisions(
+        site,
+        (op, &name, cas_name(&outcome)),
+        required,
+        committed,
+        started,
+    );
     Ok(ControlEvent::CasResult {
         request,
         key,
@@ -543,7 +658,7 @@ async fn watch(
             Ok(WatchItem::Event(event)) => {
                 let key = match decode_key(&event.key) {
                     Ok(key) => key,
-                    Err((kind, detail)) => return fault(&links, site.node, kind, detail),
+                    Err((kind, detail)) => return fault(&links, site, kind, detail),
                 };
                 cursor = Revision(event.revision);
                 tracing::debug!(
@@ -651,6 +766,7 @@ mod tests {
 
     const SITE: Site = Site {
         node: NodeId(1),
+        boot: crate::host::BOOT,
         partition: PartitionId(1),
         correlation: CorrelationId(0),
     };
@@ -919,6 +1035,7 @@ mod tests {
         let adapter = ControlAdapter::new(store, rt.handle().clone(), links);
         adapter.submit(
             NodeId(1),
+            crate::host::BOOT,
             PartitionId(1),
             CorrelationId(0),
             ControlEffect::Reload {
@@ -1027,6 +1144,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {
@@ -1090,6 +1208,7 @@ mod tests {
         );
         adapter.submit(
             NodeId(1),
+            crate::host::BOOT,
             PartitionId(1),
             CorrelationId(0),
             ControlEffect::Reload {
@@ -1156,6 +1275,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {
@@ -1203,6 +1323,113 @@ mod tests {
         false
     }
 
+    /// M9 S2b review F-005: `forget_node(n)` stops node `n`'s control work and nobody else's.
+    /// Nodes 1 and 2 each hold a watch waiting to open, a reload held after its list read, and a
+    /// CAS waiting at the store's gate (`MemStore` serves no watches, so a watch that opens
+    /// answers `WatchTerminated`: that answer is the watch's sign of life). Node 2 is forgotten,
+    /// then everything is let through: node 1 gets all three answers, node 2 gets none, and its
+    /// put never reaches the store. A slip that drains every node, or inverts a filter, takes
+    /// node 1's work and goes red here. Unit (~300 ms, mostly the quiet window).
+    #[test]
+    fn forgetting_one_node_stops_its_control_work_and_leaves_the_others() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let store = Arc::new(Scripted::gated_with(Script {
+            hold_lists: 2,
+            hold_watches: 2,
+            ..Script::default()
+        }));
+        let links = Links::new();
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        links.register(NodeId(1), tx1);
+        links.register(NodeId(2), tx2);
+        let adapter = ControlAdapter::new(
+            Arc::clone(&store) as Arc<dyn ConfigStore>,
+            rt.handle().clone(),
+            links,
+        );
+        let submit = |node, effect| {
+            adapter.submit(
+                node,
+                crate::host::BOOT,
+                PartitionId(1),
+                CorrelationId(0),
+                effect,
+            );
+        };
+        let waited = |signal: &tokio::sync::Notify, what: &str| {
+            let arrived = rt.block_on(async {
+                tokio::time::timeout(crate::host::test_patience(PATIENCE), signal.notified()).await
+            });
+            assert!(arrived.is_ok(), "{what} did not arrive");
+        };
+        let grant = |node| ControlKey::Grant(NodeId(node));
+        for node in [1, 2] {
+            submit(
+                NodeId(node),
+                ControlEffect::Watch {
+                    prefix: ControlPrefix::Partitions,
+                    from: Revision(0),
+                },
+            );
+            waited(&store.watch_held, "the watch");
+            submit(
+                NodeId(node),
+                ControlEffect::Reload {
+                    prefix: ControlPrefix::Grants,
+                },
+            );
+            waited(&store.list_held, "the reload's list");
+            submit(
+                NodeId(node),
+                ControlEffect::Cas {
+                    request: ControlRequestId(u64::from(node)),
+                    key: grant(node),
+                    expected: None,
+                    value: Some(Bytes::from_static(b"grant")),
+                },
+            );
+            waited(&store.put_arrived, "the CAS's put");
+        }
+
+        adapter.forget_node(NodeId(2), crate::host::BOOT);
+        for _ in [1, 2] {
+            store.release();
+            store.release_lists();
+            store.release_watches();
+        }
+
+        let kind = |seen: Vec<String>| {
+            let mut kinds: Vec<String> = seen
+                .iter()
+                .map(|name| name.split([' ', '{']).next().unwrap_or_default().to_owned())
+                .collect();
+            kinds.sort();
+            kinds
+        };
+        assert_eq!(
+            kind(received(&rx1, 3)),
+            ["CasResult", "FamilySnapshot", "WatchTerminated"],
+            "node 1's watch, reload and CAS all answer"
+        );
+        assert_eq!(
+            received(&rx2, 0),
+            Vec::<String>::new(),
+            "nothing of the forgotten node's answers"
+        );
+        let unapplied = rt
+            .block_on(store.mem().get(config_core::GetRequest {
+                key: Bytes::from(grant(2).encode()),
+            }))
+            .expect("get grants/2");
+        assert!(unapplied.record.is_none(), "{unapplied:?}");
+        adapter.shutdown();
+    }
+
     /// M9 S2a ruling: only the newest reload of a family answers. A reload whose list read the
     /// family and is still in flight when a newer one starts never posts: its snapshot is older
     /// than the newer one's, and posted after it would roll the node's cache back. The two
@@ -1232,6 +1459,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {
@@ -1346,6 +1574,7 @@ mod tests {
         let reload = || {
             adapter.submit(
                 NodeId(1),
+                crate::host::BOOT,
                 PartitionId(1),
                 CorrelationId(0),
                 ControlEffect::Reload {

@@ -1376,6 +1376,106 @@ fn check_eight_fails_closed_then_passes_the_reason_through() {
     );
 }
 
+/// P2. R(1) is published and retained; then L1 pauses with `PROTECTION_PAUSED`. A retry of R(1)
+/// is refused by check 8 before step 11 can replay it: one `Failed` reply, `paused_after` L1's
+/// paused prefix, and nothing else. No batch, no check, nothing reserved, the queue unchanged,
+/// and the saved answer is still held for a retry once L1 allows.
+/// `a_resend_at_a_full_dedup_index_replays_its_saved_answer` pins the error kind at a full index
+/// with L1 failing closed (`reason: None`); this row pins the whole answer and the state.
+// Ruling F1 (saved answer only after checks 5–8), reaffirmed by Gautam 2026-10-12 (P2).
+#[retcd_test]
+fn a_retry_of_a_published_request_answers_paused_while_l1_pauses_f1() {
+    let (mut h, retained) = retained_after_publish();
+    assert_eq!(retained.outcome, Outcome::Published);
+    let before = (h.k().next_seq(), h.k().prev_digest(), h.k().queue_len());
+    assert_eq!(
+        h.step(admission(false, Some(ErrorKind::ProtectionPaused))),
+        vec![]
+    );
+    assert_eq!(
+        h.step(submit(put(1, b"k", b"v"))),
+        vec![EffectKind::Reply(ReplyEffect::Failed {
+            identity: identity(1),
+            error: RdbError::ProtectionPaused {
+                partition: PARTITION,
+                paused_after: Seq(4)
+            }
+        })]
+    );
+    assert_eq!(
+        (h.k().next_seq(), h.k().prev_digest(), h.k().queue_len()),
+        before
+    );
+    assert_eq!(h.k().inflight(), None);
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+    assert!(
+        matches!(
+            h.k().dedup().get(GEN, AFF, identity(1)),
+            Some(Retained { answer: RetainedAnswer::Applied(saved), .. }) if *saved == retained
+        ),
+        "the saved answer is kept"
+    );
+}
+
+/// P2, under ruling F1. A retry of R(1) while R(1) is not yet final and L1 pauses. Three stages
+/// of R(1):
+/// - awaiting its `StorageDispatch` check (nothing written);
+/// - dispatched, storage not yet answered;
+/// - applied, not yet published (the queue is frozen on it, so check 7 answers before check 8).
+///
+/// Every stage answers one `Failed` reply, `PROTECTION_PAUSED`, and leaves R(1)'s in-flight state
+/// and the queue mode as they were. The first two come from check 8, so `paused_after` is L1's
+/// paused prefix (4); the third from check 7, so it is the unresolved seq (1).
+#[retcd_test]
+fn a_retry_of_a_request_not_yet_final_answers_paused_while_l1_pauses() {
+    for (stage, paused_after) in [
+        ("awaiting check", Seq(4)),
+        ("dispatched", Seq(4)),
+        ("applied", Seq(1)),
+    ] {
+        let mut h = H::live();
+        match stage {
+            "awaiting check" => {
+                h.admit(put(1, b"k", b"v"));
+            }
+            "dispatched" => {
+                h.dispatch(put(1, b"k", b"v"));
+            }
+            _ => {
+                let (batch, _, seq) = h.dispatch(put(1, b"k", b"v"));
+                assert_eq!(h.step(committed(batch, seq)).len(), 2);
+            }
+        }
+        let inflight = h.k().inflight().cloned();
+        let mode = *h.k().mode();
+        assert!(inflight.is_some(), "{stage}: R(1) is in flight");
+        assert_eq!(
+            h.step(admission(false, Some(ErrorKind::ProtectionPaused))),
+            vec![],
+            "{stage}"
+        );
+        let effects = h.step(submit(put(1, b"k", b"v")));
+        let [EffectKind::Reply(ReplyEffect::Failed {
+            identity: id,
+            error,
+        })] = effects.as_slice()
+        else {
+            panic!("{stage}: expected one Failed reply, got {effects:?}");
+        };
+        assert_eq!(*id, identity(1), "{stage}");
+        assert_eq!(
+            *error,
+            RdbError::ProtectionPaused {
+                partition: PARTITION,
+                paused_after
+            },
+            "{stage}"
+        );
+        assert_eq!(h.k().inflight().cloned(), inflight, "{stage}");
+        assert_eq!(h.k().mode(), &mode, "{stage}");
+    }
+}
+
 /// A queue of one behind the one in flight.
 fn queue_of_one() -> Limits {
     Limits {
@@ -2995,9 +3095,10 @@ fn a_failed_batch_answers_the_queue_behind_it() {
     assert_eq!(h.k().queue_len(), 0);
 }
 
-/// A-R71, tester-t1 hunt_21, pinned as designed (design §3.3: only `Recovered` reopens). A
-/// freeze for lost authority holds for the rest of the generation. A fresh view does not reopen
-/// it, and a `Recovered` no newer than the held lineage is ignored. A newer generation does.
+/// A-R71, tester-t1 hunt_21, pinned as designed (design §3.3: `Recovered` reopens, or, since lead
+/// ruling A-R96, a view under a new grant id). A freeze for lost authority holds for the rest of
+/// the generation under the fenced grant. A fresh view under that same grant does not reopen it,
+/// and a `Recovered` no newer than the held lineage is ignored. A newer generation does.
 #[retcd_test]
 fn a_lost_authority_freeze_reopens_only_on_a_newer_generation() {
     let mut h = H::live();
@@ -3015,6 +3116,99 @@ fn a_lost_authority_freeze_reopens_only_on_a_newer_generation() {
     let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active));
     let _ = h.step(admission(true, None));
     let _ = h.admit(put(1, b"a", b"1"));
+}
+
+/// `view(GEN, seq, valid_through)` under grant id `grant`.
+fn view_under(grant: u64, authority_seq: u64, valid_through: u64) -> Event {
+    kernel(KernelEvent::Authority(AuthorityEvent::View(
+        AuthorityView {
+            grant_id: GrantId(grant),
+            ..view(GEN, authority_seq, valid_through)
+        },
+    )))
+}
+
+/// Scenario (S2b-E, lead ruling A-R96): the node fenced while idle, then replaced its own grant
+/// record under a new grant id (A1's self-replace), and A1 published the partition's view under
+/// it. The freeze lifts on that view and writes are admitted again — same boot, no restart, the
+/// sequence continuing where it stopped.
+#[retcd_test]
+fn a_lost_authority_freeze_thaws_on_an_admitting_view_under_a_new_grant_id() {
+    let mut h = H::non_empty();
+    let next = h.k().next_seq();
+    assert_eq!(h.step(fence(FenceScope::Node, DenyReason::Expired)), vec![]);
+    assert_eq!(
+        failed(&h.step(submit(put(1, b"a", b"1")))),
+        ErrorKind::LeaseExpired
+    );
+    assert_eq!(h.step(view_under(3, 9, u64::MAX)), vec![]);
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+    let _ = h.admit(put(2, b"a", b"1"));
+    assert_eq!(h.k().next_seq(), next, "the chain continues");
+}
+
+/// The thaw's twins (A-R96): each differs from the thawing view in one conjunct, and the freeze
+/// holds — the same grant id the fence ended, another lineage, a view already past, and a
+/// freeze that is not for lost authority.
+#[retcd_test]
+fn a_lost_authority_freeze_holds_on_a_view_that_fails_one_thaw_conjunct() {
+    type Case = (&'static str, DenyReason, Event);
+    let other_lineage = kernel(KernelEvent::Authority(AuthorityEvent::View(
+        AuthorityView {
+            grant_id: GrantId(3),
+            ..view(Generation(GEN.0 + 1), 9, u64::MAX)
+        },
+    )));
+    let cases: [Case; 4] = [
+        (
+            "the fenced grant id",
+            DenyReason::Expired,
+            view_under(2, 9, u64::MAX),
+        ),
+        ("another lineage", DenyReason::Expired, other_lineage),
+        (
+            "not admitting now",
+            DenyReason::Expired,
+            view_under(3, 9, 5),
+        ),
+        (
+            "local storage, not authority",
+            DenyReason::LocalStorageFenced,
+            view_under(3, 9, u64::MAX),
+        ),
+    ];
+    for (why, reason, thaw) in cases {
+        let mut h = H::non_empty();
+        let _ = h.step(fence(FenceScope::Node, reason));
+        let frozen = *h.k().mode();
+        let _ = h.step(thaw);
+        assert_eq!(h.k().mode(), &frozen, "{why}");
+    }
+}
+
+/// Scenario (S2b-E, A-R96 M2): a write was in flight at the fence. The new grant's view arrives
+/// first and the freeze holds, because that write is unresolved. P1 then publishes it under the
+/// new grant (same boot, authority generation and lineage), and `Published` both resolves it and
+/// thaws the queue. Before A-R96 it answered `PublishedWhileFrozen` and stayed frozen.
+#[retcd_test]
+fn a_write_in_flight_at_the_fence_publishes_and_the_queue_thaws() {
+    let mut h = H::non_empty();
+    let (batch, digest, seq) = h.dispatch(put(1, b"a", b"1"));
+    assert_eq!(h.step(fence(FenceScope::Node, DenyReason::Expired)), vec![]);
+    assert_eq!(h.step(committed(batch, seq)).len(), 2);
+    assert_eq!(h.step(view_under(3, 9, u64::MAX)), vec![]);
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+            unresolved: Some(Seq(seq)),
+        },
+        "unresolved: no thaw yet"
+    );
+    assert_eq!(h.step(published(seq, digest, 1)), vec![]);
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+    assert_eq!(h.k().dedup().len(), 1, "retained, as any published write");
+    let _ = h.admit(put(2, b"b", b"2"));
 }
 
 /// A-R71, tester-t1 hunt_23. Check 10's upper bounds: exactly 255 mutations and exactly
@@ -5623,4 +5817,246 @@ fn m9_s0_14_a_read_only_empty_partition_sends_no_start_record_until_it_opens() {
     assert_eq!(*h.k().mode(), QueueMode::Open);
     let _ = only_check(&h.step(g8_view(3)));
     assert_eq!(h.k().start_record(), StartRecord::Sent { under: 3 });
+}
+
+/// The thaw's mode conjunct (A-R96): authority was lost, and then the local store fenced too. The
+/// freeze is now for local storage, and a view under a new grant does not lift it.
+#[retcd_test]
+fn a_freeze_that_moved_to_local_storage_holds_on_a_new_grants_view() {
+    let mut h = H::non_empty();
+    let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+    let _ = h.step(fence(FenceScope::Node, DenyReason::LocalStorageFenced));
+    let frozen = *h.k().mode();
+    assert!(
+        matches!(
+            frozen,
+            QueueMode::Frozen {
+                cause: FreezeCause::LocalStorageFenced,
+                ..
+            }
+        ),
+        "fixture: {frozen:?}"
+    );
+    let _ = h.step(view_under(3, 9, u64::MAX));
+    assert_eq!(h.k().mode(), &frozen);
+}
+
+/// Round 4 (review lane; spec §5.2 step 3, ADR-rdb-0007 §3): a storage fence holds for the rest
+/// of the generation. The partition is storage-fenced, then the node fences on expiry and comes
+/// back under a new grant id in the same boot (S2b-E). The node fence must not replace the
+/// storage cause with `AuthorityLost`, which the new grant's view would thaw. Two cases: the
+/// partition fence alone (nothing unresolved), and a failed batch, which also leaves its seq
+/// unresolved.
+#[retcd_test]
+fn a_node_fence_never_replaces_a_storage_fence() {
+    for case in ["partition fence", "failed batch"] {
+        let mut h = H::non_empty();
+        let unresolved = if case == "partition fence" {
+            let _ = h.step(fence(
+                FenceScope::Partition(PARTITION),
+                DenyReason::LocalStorageFenced,
+            ));
+            None
+        } else {
+            let (batch, _, seq) = h.dispatch(put(1, b"a", b"1"));
+            let _ = h.step(storage(StorageEvent::CommitFailed {
+                batch,
+                fault: StorageFault::WriteFailed,
+            }));
+            let _ = h.step(fence(
+                FenceScope::Partition(PARTITION),
+                DenyReason::LocalStorageFenced,
+            ));
+            Some(Seq(seq))
+        };
+        let frozen = QueueMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced,
+            unresolved,
+        };
+        assert_eq!(h.k().mode(), &frozen, "{case}: fixture");
+        let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+        assert_eq!(
+            h.k().mode(),
+            &frozen,
+            "{case}: the node fence keeps the cause"
+        );
+        let _ = h.step(view_under(3, 9, u64::MAX));
+        assert_eq!(h.k().mode(), &frozen, "{case}: the new grant's view");
+    }
+}
+
+/// Round 4, lead ruling A-R97: the A-R96 thaw lifts only a freeze a **node** fence caused. A
+/// partition-scope `AuthorityLost` fence (here `GenerationChanged`, as `classify`, an adopt's
+/// `must_fence` or a snapshot's supersession sends it) never thaws in M9: it waits for M10's
+/// takeover or rejoin. The walk the verifier traced: the partition fence under grant 2, a node
+/// fence and a self-replace to grant 3, and A1 re-adopting the identical lineage, whose view under
+/// grant 3 arrives here. The twin leaves out the node fence.
+#[retcd_test]
+fn a_partition_scope_lost_authority_freeze_never_thaws_in_m9() {
+    for node_fence in [true, false] {
+        let mut h = H::non_empty();
+        let _ = h.step(fence(
+            FenceScope::Partition(PARTITION),
+            DenyReason::GenerationChanged,
+        ));
+        if node_fence {
+            let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+        }
+        let frozen = *h.k().mode();
+        assert!(
+            matches!(
+                frozen,
+                QueueMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_),
+                    unresolved: None
+                }
+            ),
+            "node fence {node_fence}: fixture {frozen:?}"
+        );
+        let _ = h.step(view_under(3, 9, u64::MAX));
+        assert_eq!(h.k().mode(), &frozen, "node fence {node_fence}: no thaw");
+    }
+}
+
+/// Round 7, F-018 (A-R98 N2): a read-only recovery is lifted only by F1's activation re-emit
+/// (`on_reemitted`), never by a view. A node fence while read-only must not replace the cause with
+/// `AuthorityLost`, which the new grant's view would thaw to `Open`, letting writes into a
+/// partition recovery left read-only. The re-emit still lifts it afterwards.
+#[retcd_test]
+fn a_node_fence_never_replaces_recovery_read_only() {
+    let mut h = H::live();
+    let g8 = Generation(8);
+    let _ = h.step(recovered(g8, 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        g8,
+        2,
+        u64::MAX,
+    )))));
+    let frozen = QueueMode::Frozen {
+        cause: FreezeCause::RecoveryReadOnly,
+        unresolved: None,
+    };
+    assert_eq!(h.k().mode(), &frozen, "fixture");
+    let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+    assert_eq!(h.k().mode(), &frozen, "the node fence keeps the cause");
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(
+        AuthorityView {
+            grant_id: GrantId(3),
+            ..view(g8, 3, u64::MAX)
+        },
+    ))));
+    assert_eq!(h.k().mode(), &frozen, "the new grant's view lifts nothing");
+    assert_eq!(
+        failed(&h.step(submit(put(1, b"k", b"v")))),
+        ErrorKind::RecoveryReadOnly
+    );
+
+    let active = at_revision(recovered(g8, 0, NODE_A, PartitionMode::Active), 3);
+    assert_eq!(h.step(active), vec![]);
+    assert_eq!(
+        *h.k().mode(),
+        QueueMode::Open,
+        "the activation re-emit lifts it"
+    );
+}
+
+/// Round 8, F-026 (coverage, A-R98 and A-R99): the read-only sticky arm in `TxnKernel::on_freeze`
+/// holds for a node fence only. A partition-scope fence over a read-only recovery replaces the
+/// cause with `AuthorityLost` (`Stays`), and F1's `Active` re-emit of the generation, which lifts
+/// only `RecoveryReadOnly`, leaves T1 frozen. Built against mutant M3b, which dropped the arm's
+/// `FenceScope::Node` condition so the partition fence kept `RecoveryReadOnly` and the re-emit
+/// opened T1.
+#[retcd_test]
+fn a_partition_fence_over_recovery_read_only_survives_the_re_emit() {
+    let mut h = H::live();
+    let g8 = Generation(8);
+    let _ = h.step(recovered(g8, 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        g8,
+        2,
+        u64::MAX,
+    )))));
+    let _ = h.step(fence(
+        FenceScope::Partition(PARTITION),
+        DenyReason::GenerationChanged,
+    ));
+    let frozen = QueueMode::Frozen {
+        cause: FreezeCause::AuthorityLost(DenyReason::GenerationChanged),
+        unresolved: None,
+    };
+    assert_eq!(
+        h.k().mode(),
+        &frozen,
+        "the partition fence replaces the cause"
+    );
+    let active = at_revision(recovered(g8, 0, NODE_A, PartitionMode::Active), 3);
+    let _ = h.step(active);
+    assert_eq!(h.k().mode(), &frozen, "the re-emit lifts nothing");
+}
+
+/// Round 10 (lead ruling: `LocalStorageFenced` is boot-long, as A1's `storage_fenced` is): a
+/// recovery to a newer generation builds a new instance, and that instance starts storage
+/// fenced, not `Open`. Only a new boot clears it (`Transaction::forget_node`).
+#[retcd_test]
+fn a_new_generation_never_lifts_a_storage_fence() {
+    let mut h = H::live();
+    let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active));
+    let _ = h.step(fence(
+        FenceScope::Partition(PARTITION),
+        DenyReason::LocalStorageFenced,
+    ));
+    let fenced = QueueMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+        unresolved: None,
+    };
+    assert_eq!(h.k().mode(), &fenced, "fixture");
+    let _ = h.step(recovered(Generation(9), 0, NODE_A, PartitionMode::Active));
+    assert_eq!(
+        h.k().lineage().generation,
+        Generation(9),
+        "fixture: a new instance"
+    );
+    assert_eq!(h.k().mode(), &fenced, "the new instance");
+}
+
+/// Round 10 (the same ruling): a storage fence that reaches T1 while this node holds no
+/// instance is still remembered for the boot, so the instance a later recovery builds starts
+/// storage fenced.
+#[retcd_test]
+fn a_storage_fence_without_an_instance_holds_for_the_next_one() {
+    let mut h = H::live();
+    let _ = h.step(recovered(Generation(8), 0, NODE_B, PartitionMode::Active));
+    assert!(h.t1.kernel(NODE_A, PARTITION).is_none(), "fixture: demoted");
+    let _ = h.step(fence(
+        FenceScope::Partition(PARTITION),
+        DenyReason::LocalStorageFenced,
+    ));
+    let _ = h.step(recovered(Generation(9), 0, NODE_A, PartitionMode::Active));
+    assert_eq!(h.k().lineage().generation, Generation(9), "fixture");
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced,
+            unresolved: None,
+        }
+    );
+}
+
+/// Round 10 (the same ruling): a failed batch fences storage as a fence does, so the instance
+/// a newer generation builds starts storage fenced too.
+#[retcd_test]
+fn a_failed_batch_holds_storage_fenced_into_the_next_generation() {
+    let (mut h, effects, _, seq) = a_batch_that_fails(commit_failed(StorageFault::WriteFailed));
+    assert_fenced_after(&mut h, &effects, seq, "fixture");
+    let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active));
+    assert_eq!(h.k().lineage().generation, Generation(8), "fixture");
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced,
+            unresolved: None,
+        }
+    );
 }

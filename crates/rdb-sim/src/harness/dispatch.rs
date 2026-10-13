@@ -2706,6 +2706,7 @@ impl Dispatcher {
             RecoveryPhase::Committed
                 | RecoveryPhase::Rebuilding
                 | RecoveryPhase::ActivationProposed
+                | RecoveryPhase::ActivationUnresolved
         ) {
             return None;
         }
