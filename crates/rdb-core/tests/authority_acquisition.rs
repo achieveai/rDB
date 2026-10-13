@@ -3424,6 +3424,84 @@ fn a_storage_fence_outlives_a_same_boot_self_replace() {
     );
 }
 
+/// Round 7, F-017 (A-R98 N1): the storage fault arrives on the step whose `revalidate` fences the
+/// node on expiry, so A1 is already `Fenced` when the fault reaches it. The failure is a fact
+/// about this disk for the rest of the boot, whatever A1's state, so `p1` is still recorded
+/// storage-fenced. After a same-boot self-replace and `p1`'s install under the new grant, `p1` is
+/// refused `LocalStorageFenced` and no view of it admits.
+#[retcd_test]
+fn a_storage_fault_on_the_step_that_fences_the_node_still_fences_the_partition() {
+    let (mut kernel, fenced) = held();
+    serve_p1(&mut kernel, &ctx(6));
+    kernel
+        .step(
+            &ctx(LAPSE),
+            &event(
+                LAPSE,
+                LAPSE,
+                EventKind::Storage(StorageEvent::CommitFailed {
+                    batch: BatchId(1),
+                    fault: StorageFault::WriteFailed,
+                }),
+            ),
+        )
+        .expect("the lapse step carrying the storage fault");
+    assert!(
+        kernel.state().is_fenced(),
+        "fixture: the same step fenced the node"
+    );
+
+    let due = acquire_due(&kernel, 3_100, 3_100);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(3_100, 3_100), &due)
+            .expect("the fenced Acquire row"),
+    );
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let at = PROVEN + 5;
+    kernel
+        .step(
+            &sampled_at(at, PROVEN),
+            &cas_result(
+                at,
+                at,
+                sent_as(&replace),
+                CasOutcome::Committed(Revision(9)),
+            ),
+        )
+        .expect("the replace commits");
+    let held_now = kernel
+        .state()
+        .held()
+        .expect("fixture: Held again, same boot");
+    assert_ne!(held_now.identity().grant, fenced, "fixture: a new grant id");
+
+    let now = at + 1;
+    let effects = kernel
+        .step(&sampled_at(now, PROVEN), &p1_snapshot(now, 10))
+        .expect("p1 installed under the new grant");
+    assert!(kernel.view().served.contains_key(&P1), "fixture: p1 served");
+    assert!(
+        kernel.view().storage_fenced.contains(&P1),
+        "the fault is recorded though A1 was fenced when it arrived"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_lineage(), Tick(now), &BUDGETS),
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+        "a write fault seen while fenced still fences p1 under the new grant"
+    );
+    assert_eq!(
+        admitting_p1_views(&effects, now),
+        vec![],
+        "no admitting view of p1"
+    );
+}
+
 /// Round 4, lead ruling A-R97: the A1 half of the path the verifier traced, steps 1-3. Under
 /// grant 1 a snapshot drops `p1`, which fences it `GenerationChanged` at partition scope and
 /// leaves a tombstone. The node fences, self-replaces to grant 2, and a newer snapshot installs

@@ -5917,3 +5917,46 @@ fn a_partition_scope_lost_authority_freeze_never_thaws_in_m9() {
         assert_eq!(h.k().mode(), &frozen, "node fence {node_fence}: no thaw");
     }
 }
+
+/// Round 7, F-018 (A-R98 N2): a read-only recovery is lifted only by F1's activation re-emit
+/// (`on_reemitted`), never by a view. A node fence while read-only must not replace the cause with
+/// `AuthorityLost`, which the new grant's view would thaw to `Open`, letting writes into a
+/// partition recovery left read-only. The re-emit still lifts it afterwards.
+#[retcd_test]
+fn a_node_fence_never_replaces_recovery_read_only() {
+    let mut h = H::live();
+    let g8 = Generation(8);
+    let _ = h.step(recovered(g8, 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        g8,
+        2,
+        u64::MAX,
+    )))));
+    let frozen = QueueMode::Frozen {
+        cause: FreezeCause::RecoveryReadOnly,
+        unresolved: None,
+    };
+    assert_eq!(h.k().mode(), &frozen, "fixture");
+    let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+    assert_eq!(h.k().mode(), &frozen, "the node fence keeps the cause");
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(
+        AuthorityView {
+            grant_id: GrantId(3),
+            ..view(g8, 3, u64::MAX)
+        },
+    ))));
+    assert_eq!(h.k().mode(), &frozen, "the new grant's view lifts nothing");
+    assert_eq!(
+        failed(&h.step(submit(put(1, b"k", b"v")))),
+        ErrorKind::RecoveryReadOnly
+    );
+
+    let active = at_revision(recovered(g8, 0, NODE_A, PartitionMode::Active), 3);
+    assert_eq!(h.step(active), vec![]);
+    assert_eq!(
+        *h.k().mode(),
+        QueueMode::Open,
+        "the activation re-emit lifts it"
+    );
+}
