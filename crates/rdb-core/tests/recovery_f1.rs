@@ -6335,3 +6335,104 @@ fn m9_k1_01_a_degraded_commit_at_cutoff_one_does_not_pin() {
         vec![sync(A, 1), sync(B, 1), sync(C, 1), arm(4, 4_000 + WINDOW)]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// W10-D1 (Walk 10, 2026-10-13; lead round 12): the activation CAS went unanswered while the
+// store had lost quorum, its deadline blocked F1 with `ControlUnknown`, and the write still
+// landed once quorum came back. Nothing in M9 fences the owner's own partition, so the block
+// never lifted and the partition stayed `ReadOnly` with its record already rewritten.
+// ---------------------------------------------------------------------------------------------
+
+/// An activation blocked by its own deadline, then a store that answers again: every `Get` F1
+/// sends from here is told `partitions/{p}` holds `value` at `revision`, and every timer F1 arms
+/// is fired at its deadline. When F1 has nothing outstanding the next window's fire is offered
+/// anyway. Returns the `Recovered` F1 emitted, if any.
+fn blocked_activation_then_store_answers(
+    revision: Revision,
+    value: Bytes,
+) -> (F1, Option<RecoveryResult>) {
+    let mut f1 = activation_proposed();
+    let deadline = 4_100 + WINDOW;
+    assert_eq!(
+        f1.step(deadline, fired(5)),
+        vec![block(BlockReason::ControlUnknown)],
+        "W10-D1: the unanswered activation blocks at its deadline"
+    );
+    let mut recovered = None;
+    let mut effects = Vec::new();
+    let mut now = deadline;
+    for _ in 0..8 {
+        let mut next = Vec::new();
+        for effect in effects.drain(..) {
+            match effect {
+                EffectKind::Control(ControlEffect::Get { .. }) => {
+                    next.extend(f1.step(
+                        now + 1,
+                        read_result(ReadOutcome::Found {
+                            revision,
+                            value: value.clone(),
+                        }),
+                    ));
+                }
+                EffectKind::Timer(TimerEffect::Arm { version, at, .. }) => {
+                    now = at.0;
+                    next.extend(f1.step(now, fired(version.0)));
+                }
+                EffectKind::Kernel(KernelEffect::Recovered(result)) => recovered = Some(*result),
+                _ => {}
+            }
+        }
+        if next.is_empty() {
+            now += WINDOW;
+            next.extend(f1.step(now, fired(6)));
+        }
+        effects = next;
+        if recovered.is_some() {
+            break;
+        }
+    }
+    (f1, recovered)
+}
+
+/// W10-D1 (red until the lead's fix): the activation landed while F1 waited. The store, once it
+/// answers, holds F1's own commit bytes at a revision above the commit, and only this
+/// activation writes those bytes there. F1 must end `Committed` with `mode: Active` at that
+/// revision, not `Blocked(ControlUnknown)` for good.
+#[retcd_test]
+fn w10_d1_a_landed_activation_is_found_once_the_store_answers() {
+    let landed = Revision(16);
+    let (f1, recovered) = blocked_activation_then_store_answers(landed, record(A).encode());
+    let result =
+        recovered.expect("W10-D1: F1 stays Blocked(ControlUnknown) after the store answers");
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, landed);
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+}
+
+/// W10-D1 guard: the activation may have landed, but another lineage has decided since. The store
+/// answers with that decision's bytes. F1 must never go `Active` on it: it stays
+/// `Blocked(ControlUnknown)` or names the peer as `OvertakenByPeer`.
+#[retcd_test]
+fn w10_d1_a_peers_decision_after_a_blocked_activation_never_activates() {
+    let peer = PartitionRecord {
+        owner: NodeId(9),
+        generation: Generation(9),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let (f1, recovered) = blocked_activation_then_store_answers(Revision(17), peer.encode());
+    assert_eq!(recovered, None, "W10-D1: no Recovered on a peer's decision");
+    assert!(
+        matches!(
+            f1.phase(),
+            RecoveryPhase::Blocked(BlockReason::ControlUnknown | BlockReason::OvertakenByPeer)
+        ),
+        "W10-D1: blocked, not {:?}",
+        f1.phase()
+    );
+    assert_eq!(
+        f1.cas_count(),
+        2,
+        "W10-D1: the recovery CAS and the activation, never re-proposed over a peer"
+    );
+}
