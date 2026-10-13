@@ -6020,3 +6020,43 @@ fn a_new_generation_never_lifts_a_storage_fence() {
     );
     assert_eq!(h.k().mode(), &fenced, "the new instance");
 }
+
+/// Round 10 (the same ruling): a storage fence that reaches T1 while this node holds no
+/// instance is still remembered for the boot, so the instance a later recovery builds starts
+/// storage fenced.
+#[retcd_test]
+fn a_storage_fence_without_an_instance_holds_for_the_next_one() {
+    let mut h = H::live();
+    let _ = h.step(recovered(Generation(8), 0, NODE_B, PartitionMode::Active));
+    assert!(h.t1.kernel(NODE_A, PARTITION).is_none(), "fixture: demoted");
+    let _ = h.step(fence(
+        FenceScope::Partition(PARTITION),
+        DenyReason::LocalStorageFenced,
+    ));
+    let _ = h.step(recovered(Generation(9), 0, NODE_A, PartitionMode::Active));
+    assert_eq!(h.k().lineage().generation, Generation(9), "fixture");
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced,
+            unresolved: None,
+        }
+    );
+}
+
+/// Round 10 (the same ruling): a failed batch fences storage as a fence does, so the instance
+/// a newer generation builds starts storage fenced too.
+#[retcd_test]
+fn a_failed_batch_holds_storage_fenced_into_the_next_generation() {
+    let (mut h, effects, _, seq) = a_batch_that_fails(commit_failed(StorageFault::WriteFailed));
+    assert_fenced_after(&mut h, &effects, seq, "fixture");
+    let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active));
+    assert_eq!(h.k().lineage().generation, Generation(8), "fixture");
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced,
+            unresolved: None,
+        }
+    );
+}

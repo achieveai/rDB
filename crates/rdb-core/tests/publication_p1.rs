@@ -7528,3 +7528,23 @@ fn a_storage_fence_while_blocked_holds_after_the_recovery() {
         }
     );
 }
+
+/// Round 10 (the same ruling): a blocked recovery over a storage fence stays `Blocked`, as a
+/// block overrides every freeze (`a_block_overrides_every_freeze`). The fence is still held
+/// underneath for the boot; this row pins only which refusal the mode names.
+#[retcd_test]
+fn a_blocked_recovery_over_a_storage_fence_stays_blocked() {
+    let mut rig = Rig::new();
+    rig.published(5);
+    rig.step(fence(
+        FenceScope::Partition(P),
+        DenyReason::LocalStorageFenced,
+    ));
+    rig.step(recovered(
+        PartitionMode::Blocked { reason: block() },
+        5,
+        false,
+        None,
+    ));
+    assert_eq!(rig.view().mode, PubMode::Blocked { reason: block() });
+}
