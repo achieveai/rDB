@@ -24,7 +24,8 @@ use rdb_core::authority::{
     Acquire, Authority, AuthorityState, AuthorityStateView, AuthorityTimer, Renewal,
 };
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityFact, AuthorityIgnoreReason, DenyReason, FenceScope, Lineage, Verdict,
+    AuthorityEffect, AuthorityFact, AuthorityIgnoreReason, AuthorityView, DenyReason, FenceScope,
+    Lineage, Verdict,
 };
 use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
@@ -34,12 +35,12 @@ use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, Event, EventKind, KernelEffect, Module, NodeLifecycle, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    AuthorityGeneration, BatchId, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
     Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
     TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
-use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageEvent, StorageFault};
 use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::Version;
 
@@ -2991,4 +2992,187 @@ fn after_a_fence_a_read_under_an_in_flight_replace_leaves_no_replace_target() {
         vec![Shape::Get(ControlKey::Grant(NODE))],
         "a poll, never a CAS at revision 7"
     );
+}
+
+/// `kernel`, holding `fenced` from [`held`], fences on expiry at [`LAPSE`], polls, proves the
+/// record expired and replaces it under a new grant id in the same boot (S2b-E). Returns the tick
+/// the replace committed at.
+fn self_replaced(kernel: &mut Authority, fenced: GrantId) -> u64 {
+    kernel
+        .step(&ctx(LAPSE), &probe(LAPSE))
+        .expect("the lapse fence");
+    assert!(kernel.state().is_fenced(), "fixture: fenced");
+    let due = acquire_due(kernel, 3_100, 3_100);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(3_100, 3_100), &due)
+            .expect("the fenced Acquire row"),
+    );
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let at = PROVEN + 5;
+    kernel
+        .step(
+            &sampled_at(at, PROVEN),
+            &cas_result(
+                at,
+                at,
+                sent_as(&replace),
+                CasOutcome::Committed(Revision(9)),
+            ),
+        )
+        .expect("the replace commits");
+    let held = kernel
+        .state()
+        .held()
+        .expect("fixture: Held again, same boot");
+    assert_ne!(held.identity().grant, fenced, "fixture: a new grant id");
+    at
+}
+
+/// A coherent partitions snapshot at `revision` holding `p1` at [`p1_lineage`], at tick `at`.
+fn p1_snapshot(at: u64, revision: u64) -> Event {
+    let record = PartitionRecord {
+        partition: P1,
+        owner: NODE,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+        config_version: ConfigVersion(1),
+        lifecycle: PartitionLifecycle::Serving,
+    };
+    event(
+        at,
+        at,
+        EventKind::Control(ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Partitions,
+            snapshot_revision: Revision(revision),
+            records: vec![ControlRecord {
+                key: ControlKey::Partition(P1),
+                revision: Revision(revision),
+                value: record.encode(),
+            }],
+        }),
+    )
+}
+
+/// The views of `p1` in `effects` that still admit at `now`.
+fn admitting_p1_views(effects: &[Effect], now: u64) -> Vec<AuthorityView> {
+    effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(
+                view,
+            ))) if view.lineage.partition == P1 && now <= view.valid_through_tick.0 => Some(*view),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Round 4 (review lane, spec §5.2 step 3, ADR-rdb-0007 §3): a storage fence holds for the rest
+/// of the generation. `p1` is served under grant 1 and its local write fails, so `p1` is fenced
+/// `LocalStorageFenced`. Then the node fences on expiry, replaces its own record under a new grant
+/// id in the same boot (S2b-E), and installs `p1` again under the new grant. The disk is the same
+/// disk: `p1` must still be refused `LocalStorageFenced`, and no view of it may admit.
+#[retcd_test]
+fn a_storage_fence_outlives_a_same_boot_self_replace() {
+    let (mut kernel, fenced) = held();
+    serve_p1(&mut kernel, &ctx(6));
+    let effects = kernel
+        .step(
+            &ctx(7),
+            &event(
+                7,
+                7,
+                EventKind::Storage(StorageEvent::CommitFailed {
+                    batch: BatchId(1),
+                    fault: StorageFault::WriteFailed,
+                }),
+            ),
+        )
+        .expect("the storage fence row");
+    assert_eq!(
+        fence_shapes(&effects),
+        vec![Shape::Fence(
+            FenceScope::Partition(P1),
+            DenyReason::LocalStorageFenced
+        )],
+        "fixture: p1 storage-fenced under grant 1"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_lineage(), Tick(7), &BUDGETS),
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+        "fixture"
+    );
+
+    let now = self_replaced(&mut kernel, fenced) + 1;
+    let effects = kernel
+        .step(&sampled_at(now, PROVEN), &p1_snapshot(now, 10))
+        .expect("p1 installed under the new grant");
+    assert!(
+        kernel.view().served.contains_key(&P1),
+        "fixture: p1 served under the new grant"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_lineage(), Tick(now), &BUDGETS),
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+        "the storage fence holds across the self-replace"
+    );
+    assert!(
+        kernel.view().storage_fenced.contains(&P1),
+        "the fence is still recorded"
+    );
+    assert_eq!(
+        admitting_p1_views(&effects, now),
+        vec![],
+        "no admitting view of p1"
+    );
+}
+
+/// Round 4, lead ruling A-R97: the A1 half of the path the verifier traced, steps 1-3. Under
+/// grant 1 a snapshot drops `p1`, which fences it `GenerationChanged` at partition scope and
+/// leaves a tombstone. The node fences, self-replaces to grant 2, and a newer snapshot installs
+/// the **identical** lineage again: nothing asks for a new owner epoch, so A1 publishes an
+/// admitting view of that lineage under grant 2. This row pins that A1 does (it is not A1's
+/// fault: re-adopting past a tombstone is A-R48b). The kernel half, step 4, is
+/// `a_partition_scope_lost_authority_freeze_never_thaws_in_m9` in T1 and P1, which must not thaw
+/// on this view.
+#[retcd_test]
+fn a_partition_fence_then_self_replace_republishes_the_identical_lineage() {
+    let (mut kernel, fenced) = held();
+    serve_p1(&mut kernel, &ctx(6));
+    let dropped = event(
+        7,
+        7,
+        EventKind::Control(ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Partitions,
+            snapshot_revision: Revision(11),
+            records: vec![],
+        }),
+    );
+    let effects = kernel
+        .step(&ctx(7), &dropped)
+        .expect("the dropping snapshot");
+    assert_eq!(
+        fence_shapes(&effects),
+        vec![Shape::Fence(
+            FenceScope::Partition(P1),
+            DenyReason::GenerationChanged
+        )],
+        "step 1: a partition-scope fence under grant 1"
+    );
+
+    let now = self_replaced(&mut kernel, fenced) + 1;
+    let effects = kernel
+        .step(&sampled_at(now, PROVEN), &p1_snapshot(now, 12))
+        .expect("step 3: the identical lineage, newer revision");
+    let views = admitting_p1_views(&effects, now);
+    let [view] = views.as_slice() else {
+        panic!("one admitting view of p1: {effects:?}");
+    };
+    assert_eq!(view.lineage, p1_lineage(), "the identical lineage");
+    assert_ne!(view.grant_id, fenced, "under the new grant");
 }

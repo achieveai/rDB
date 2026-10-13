@@ -6934,3 +6934,77 @@ fn a_freeze_that_moved_to_local_storage_holds_on_a_new_grants_view() {
     assert_eq!(rig.step(view_under(2, 2, u64::MAX)), vec![]);
     assert_eq!(rig.view().mode, frozen);
 }
+
+/// Round 4 (review lane; spec §5.2 step 3, ADR-rdb-0007 §3): a storage fence holds for the rest
+/// of the generation. `P` is storage-fenced, then the node fences on expiry and comes back under a
+/// new grant id in the same boot (S2b-E). The node fence must not replace the storage cause with
+/// `AuthorityLost`, which the new grant's view would thaw to `Serving`.
+#[retcd_test]
+fn a_node_fence_never_replaces_a_storage_fence() {
+    let mut rig = Rig::new();
+    enter_storage_fenced(&mut rig);
+    let frozen = PubMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+    };
+    assert_eq!(rig.view().mode, frozen, "fixture");
+    rig.step(fence(FenceScope::Node, DenyReason::Expired));
+    assert_eq!(rig.view().mode, frozen, "the node fence keeps the cause");
+    rig.step(view_under(2, 2, u64::MAX));
+    assert_eq!(rig.view().mode, frozen, "the new grant's view");
+}
+
+/// Round 4, lead ruling A-R97: the A-R96 thaw lifts only a freeze a **node** fence caused. A
+/// partition-scope `AuthorityLost` fence (`GenerationChanged`, as `classify`, an adopt's
+/// `must_fence` or a snapshot's supersession sends it) never thaws in M9: it waits for M10's
+/// takeover or rejoin. The walk the verifier traced: the partition fence under grant 1, a node
+/// fence and a self-replace to grant 2, and A1 re-adopting the identical lineage, whose view under
+/// grant 2 arrives here. The twin leaves out the node fence.
+#[retcd_test]
+fn a_partition_scope_lost_authority_freeze_never_thaws_in_m9() {
+    for node_fence in [true, false] {
+        let mut rig = Rig::new();
+        rig.step(fence(
+            FenceScope::Partition(P),
+            DenyReason::GenerationChanged,
+        ));
+        if node_fence {
+            rig.step(fence(FenceScope::Node, DenyReason::Expired));
+        }
+        let frozen = rig.view().mode;
+        assert!(
+            matches!(
+                frozen,
+                PubMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_)
+                }
+            ),
+            "node fence {node_fence}: fixture {frozen:?}"
+        );
+        rig.step(view_under(2, 2, u64::MAX));
+        assert_eq!(rig.view().mode, frozen, "node fence {node_fence}: no thaw");
+    }
+}
+
+/// Round 4, C02 (`s2b-verify.md`): a node fence can reach a P1 that has held no view yet — in
+/// the gap between the first acquisition and the partitions reload, A1's `fence()` emits the
+/// `Fence` before its past view. No grant id is known to have ended, so the first admitting view
+/// of this lineage, from the grant the self-replace wrote, thaws P1: writes come back by
+/// themselves (A-R96). A node fence ends its grant id, and A1 never again publishes an admitting
+/// view under it.
+#[retcd_test]
+fn a_node_fence_before_any_view_thaws_on_the_first_admitting_view() {
+    let mut rig = Rig::bare();
+    assert_eq!(
+        rig.step(fence(FenceScope::Node, DenyReason::Expired)),
+        vec![]
+    );
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired)
+        },
+        "fixture"
+    );
+    assert_eq!(rig.step(view_under(2, 2, u64::MAX)), vec![]);
+    assert_eq!(rig.view().mode, PubMode::Serving);
+}

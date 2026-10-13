@@ -5840,3 +5840,80 @@ fn a_freeze_that_moved_to_local_storage_holds_on_a_new_grants_view() {
     let _ = h.step(view_under(3, 9, u64::MAX));
     assert_eq!(h.k().mode(), &frozen);
 }
+
+/// Round 4 (review lane; spec §5.2 step 3, ADR-rdb-0007 §3): a storage fence holds for the rest
+/// of the generation. The partition is storage-fenced, then the node fences on expiry and comes
+/// back under a new grant id in the same boot (S2b-E). The node fence must not replace the
+/// storage cause with `AuthorityLost`, which the new grant's view would thaw. Two cases: the
+/// partition fence alone (nothing unresolved), and a failed batch, which also leaves its seq
+/// unresolved.
+#[retcd_test]
+fn a_node_fence_never_replaces_a_storage_fence() {
+    for case in ["partition fence", "failed batch"] {
+        let mut h = H::non_empty();
+        let unresolved = if case == "partition fence" {
+            let _ = h.step(fence(
+                FenceScope::Partition(PARTITION),
+                DenyReason::LocalStorageFenced,
+            ));
+            None
+        } else {
+            let (batch, _, seq) = h.dispatch(put(1, b"a", b"1"));
+            let _ = h.step(storage(StorageEvent::CommitFailed {
+                batch,
+                fault: StorageFault::WriteFailed,
+            }));
+            let _ = h.step(fence(
+                FenceScope::Partition(PARTITION),
+                DenyReason::LocalStorageFenced,
+            ));
+            Some(Seq(seq))
+        };
+        let frozen = QueueMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced,
+            unresolved,
+        };
+        assert_eq!(h.k().mode(), &frozen, "{case}: fixture");
+        let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+        assert_eq!(
+            h.k().mode(),
+            &frozen,
+            "{case}: the node fence keeps the cause"
+        );
+        let _ = h.step(view_under(3, 9, u64::MAX));
+        assert_eq!(h.k().mode(), &frozen, "{case}: the new grant's view");
+    }
+}
+
+/// Round 4, lead ruling A-R97: the A-R96 thaw lifts only a freeze a **node** fence caused. A
+/// partition-scope `AuthorityLost` fence (here `GenerationChanged`, as `classify`, an adopt's
+/// `must_fence` or a snapshot's supersession sends it) never thaws in M9: it waits for M10's
+/// takeover or rejoin. The walk the verifier traced: the partition fence under grant 2, a node
+/// fence and a self-replace to grant 3, and A1 re-adopting the identical lineage, whose view under
+/// grant 3 arrives here. The twin leaves out the node fence.
+#[retcd_test]
+fn a_partition_scope_lost_authority_freeze_never_thaws_in_m9() {
+    for node_fence in [true, false] {
+        let mut h = H::non_empty();
+        let _ = h.step(fence(
+            FenceScope::Partition(PARTITION),
+            DenyReason::GenerationChanged,
+        ));
+        if node_fence {
+            let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+        }
+        let frozen = *h.k().mode();
+        assert!(
+            matches!(
+                frozen,
+                QueueMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_),
+                    unresolved: None
+                }
+            ),
+            "node fence {node_fence}: fixture {frozen:?}"
+        );
+        let _ = h.step(view_under(3, 9, u64::MAX));
+        assert_eq!(h.k().mode(), &frozen, "node fence {node_fence}: no thaw");
+    }
+}
