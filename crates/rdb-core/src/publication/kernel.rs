@@ -590,6 +590,9 @@ pub struct PubKernel {
     /// amended, F-018): the partition is still read-only underneath. A thaw returns to
     /// `RecoveryReadOnly`, never `Serving`, and an `Admit` publishes nothing. Only
     /// [`Self::on_recovered`] clears it.
+    ///
+    /// It is also set when a read-only re-emit keeps `Frozen{UnresolvedTransaction}`, and then
+    /// the publish that resolves it (step 7) lands in `RecoveryReadOnly` (round 11).
     read_only_under: bool,
     /// A storage fence reached this kernel in this boot (lead ruling, M9 S2b-E round 10). It is
     /// boot-long, as A1's `storage_fenced` is: nothing in this boot lifts it, not a re-emit, a
@@ -1166,7 +1169,17 @@ impl PubKernel {
                     cause: FreezeCause::LocalStorageFenced | FreezeCause::RecoveryReadOnly
                 }
         );
-        if !sticky {
+        // A deny for local storage is a storage fence, as T1's `freeze_cause` maps it (lead
+        // ruling, round 11): boot-long, whether or not A1's fence arrived first, and it replaces
+        // every mode but `Blocked`, as `on_freeze` does.
+        if reason == DenyReason::LocalStorageFenced {
+            self.storage_fenced = true;
+            if !matches!(self.mode, PubMode::Blocked { .. }) {
+                self.mode = PubMode::Frozen {
+                    cause: FreezeCause::LocalStorageFenced,
+                };
+            }
+        } else if !sticky {
             self.mode = PubMode::Frozen {
                 cause: FreezeCause::AuthorityLost(reason),
             };
@@ -1247,7 +1260,16 @@ impl PubKernel {
                 cause: FreezeCause::UnresolvedTransaction,
             })
         {
-            self.mode = PubMode::Serving;
+            // A read-only re-emit while it was unresolved left the partition read-only
+            // underneath, and only F1's `Active` re-emit lifts that (lead ruling, round 11).
+            self.mode = if self.read_only_under {
+                PubMode::Frozen {
+                    cause: FreezeCause::RecoveryReadOnly,
+                }
+            } else {
+                PubMode::Serving
+            };
+            self.read_only_under = false;
         }
         // 8. A write held across a lost-authority freeze has now published under the new grant;
         //    with nothing pending, the view that asked for it also lifts the freeze (A-R96).
@@ -1772,12 +1794,18 @@ impl PubKernel {
             }
             // Nor does it lift an unresolved transaction, as T1 lifts none
             // (`TxnKernel::on_reemitted`, K-A-47): the candidate it waits on is still pending
-            // in this lineage, and only its publish (step 7) lifts the freeze (round 10).
+            // in this lineage, and only its publish (step 7) lifts the freeze (round 10). The
+            // re-emit's read-only state is kept underneath for step 7: only an `Active` one lifts
+            // read-only (lead ruling, round 11).
             if self.mode
                 == (PubMode::Frozen {
                     cause: FreezeCause::UnresolvedTransaction,
                 })
             {
+                self.read_only_under = !matches!(
+                    result.mode,
+                    PartitionMode::Active | PartitionMode::DegradedRf2
+                );
                 return effects;
             }
             // A re-emit of the lineage lifts no `AuthorityLost` freeze (lead rulings A-R99,
