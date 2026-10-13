@@ -323,7 +323,7 @@ async fn judge_and_clear(
             key: Bytes::from(key.clone()),
         })
         .await
-        .map_err(|error| unavailable(format!("get {key}: {error}")))?;
+        .map_err(|error| store_failed(&format!("get {key}"), &error))?;
     let Some(found) = read.record else {
         tracing::info!(
             node = node.0,
@@ -385,7 +385,7 @@ async fn list_partitions(store: &dyn ConfigStore) -> Result<Vec<PartitionRecord>
             max_bytes: 0,
         })
         .await
-        .map_err(|error| unavailable(format!("list {prefix}: {error}")))?;
+        .map_err(|error| store_failed(&format!("list {prefix}"), &error))?;
     if listed.truncated {
         return Err(unavailable(format!(
             "list {prefix} came back truncated at revision {}",
@@ -427,10 +427,28 @@ async fn delete(store: &dyn ConfigStore, key: &str, revision: u64) -> Result<Cle
             ErrorKind::UnknownOutcome,
             format!("delete {key} at revision {revision}: the reply was lost"),
         )),
-        Err(error) => Err(unavailable(format!(
-            "delete {key} at revision {revision}: {error}"
-        ))),
+        Err(error) => Err(store_failed(
+            &format!("delete {key} at revision {revision}"),
+            &error,
+        )),
     }
+}
+
+/// `call` failed in the control store, told briefly: the store's own words go to the log
+/// only (`grant_clear_store_error{call, error}`), since an `Unavailable` names the whole
+/// membership with its ports. A read that timed out says so: the store's wording, "mutation
+/// outcome is unknown", is about a write. Never a lost delete reply, which
+/// [`delete`] answers itself.
+fn store_failed(call: &str, error: &ConfigError) -> ApiError {
+    tracing::warn!(call, %error, "grant_clear_store_error");
+    let short = match error {
+        ConfigError::DeadlineExceededUnknownOutcome => "timed out".to_owned(),
+        ConfigError::Unavailable { .. } => {
+            "unavailable now (the store's reason is in the log)".to_owned()
+        }
+        other => other.to_string(),
+    };
+    unavailable(format!("{call}: {short}"))
 }
 
 fn unavailable(detail: String) -> ApiError {

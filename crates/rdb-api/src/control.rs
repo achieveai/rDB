@@ -177,8 +177,9 @@ impl ControlAdapter {
     /// else's: the node's process has stopped (`Db::restart_node`). A reload removed here never
     /// answers. `abort` lands only at an await, so a call already past its last one can still
     /// post; that completion carries the old boot, and the node's next process drops it.
-    /// Logged as `control_forgot{node, watches, reloads, calls}`.
-    pub fn forget_node(&self, node: NodeId) {
+    /// `boot` is the stopped process's, for the log: `control_forgot{node, boot, watches,
+    /// reloads, calls}`.
+    pub fn forget_node(&self, node: NodeId, boot: BootId) {
         let mut watches = 0_usize;
         lock(&self.watches).retain(|(at, _), task| {
             let mine = *at == node;
@@ -204,7 +205,14 @@ impl ControlAdapter {
             }
             task.abort();
         }
-        tracing::info!(node = node.0, watches, reloads, calls, "control_forgot");
+        tracing::info!(
+            node = node.0,
+            boot = boot.0,
+            watches,
+            reloads,
+            calls,
+            "control_forgot"
+        );
     }
 
     /// Stop every watch and abandon every call still running, reloads included. Called before

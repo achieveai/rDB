@@ -10,7 +10,7 @@
 //! read mutates nothing). None waits for ever.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -331,6 +331,10 @@ pub struct Db {
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// Whether node 1 has been seen admitting writes: by [`Db::node_status`], by a put that
+    /// was answered, or by [`Db::restart_node`]'s own look. Never cleared, so a node can still
+    /// be restarted once writes have stopped (M9 S2b, D3).
+    ready_seen: AtomicBool,
     /// The `nodes/` this open claimed, while the open is unfinished. Dropping the `Db` then
     /// removes it after the nodes have stopped, whether the open failed or was cancelled
     /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
@@ -467,6 +471,7 @@ impl Db {
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: Some(nodes_dir.clone()),
         };
         db.start(&nodes_dir, &store, spawn).await?;
@@ -664,7 +669,7 @@ impl Db {
         };
         let refused = |error| {
             Err(PutError {
-                error,
+                error: self.explained(error),
                 request: None,
             })
         };
@@ -733,7 +738,7 @@ impl Db {
             ClientCall::Resend { request } => request.identity.request,
             _ => RequestId(0),
         };
-        match self.call(call, wait) {
+        let answered = match self.call(call, wait) {
             Some(Answer::Txn { result, request }) => Ok(PutOk {
                 request: identity,
                 generation: result.generation,
@@ -760,7 +765,14 @@ impl Db {
                 ),
                 request: sent.map(Box::new),
             }),
+        };
+        if answered.is_ok() {
+            self.ready_seen.store(true, Ordering::Relaxed);
         }
+        answered.map_err(|PutError { error, request }| PutError {
+            error: self.explained(error),
+            request,
+        })
     }
 
     /// Read `object` at the publication barrier.
@@ -790,7 +802,7 @@ impl Db {
     }
 
     fn read(&self, call: ClientCall) -> Result<GetOk, ApiError> {
-        match self.call(call, self.timeouts.read) {
+        let answered = match self.call(call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
                 ..
@@ -814,7 +826,8 @@ impl Db {
                 ErrorKind::Unavailable,
                 format!("no read answer in {:?}", self.timeouts.read),
             )),
-        }
+        };
+        answered.map_err(|error| self.explained(error))
     }
 
     /// What became of this client's request `request`.
@@ -832,7 +845,7 @@ impl Db {
             client: CLIENT,
             request,
         };
-        match self.call(
+        let answered = match self.call(
             ClientCall::Status {
                 identity,
                 generation,
@@ -848,7 +861,8 @@ impl Db {
                 ErrorKind::Unavailable,
                 format!("no status answer in {:?}", self.timeouts.read),
             )),
-        }
+        };
+        answered.map_err(|error| self.explained(error))
     }
 
     /// Each node's state for partition 1, in node order. A node that does not answer within
@@ -870,6 +884,9 @@ impl Db {
                 .ok()?;
                 let mut status = answer.recv_timeout(self.timeouts.read).ok()?;
                 status.reload_pending = self.control.reload_pending(status.node);
+                if status.node == OWNER && status.admits == Some(true) {
+                    self.ready_seen.store(true, Ordering::Relaxed);
+                }
                 Some(status)
             })
             .collect()
@@ -896,6 +913,72 @@ impl Db {
             .map(|handle| handle.boot)
     }
 
+    /// Why writes stopped for good, once a node of this `Db` has restarted; `None` while every
+    /// node runs its first boot. Names each restarted node and its boot, and says that writes
+    /// will not resume (M9 S2b, D2): a restarted copy does not rejoin before M10
+    /// (achieveai/rDB#42), and this `Db`'s data and control store cannot be opened again
+    /// (`NotEmpty`, `AlreadyExists`), so writing again takes a new `Db` on new ones.
+    #[must_use]
+    pub fn restart_note(&self) -> Option<String> {
+        let restarted: Vec<String> = lock(&self.nodes)
+            .iter()
+            .filter(|handle| handle.boot != host::BOOT)
+            .map(|handle| {
+                let (node, boot) = (handle.node.0, handle.boot.0);
+                if handle.node == OWNER {
+                    format!("the owner, node {node}, restarted (now boot {boot})")
+                } else {
+                    format!("node {node} restarted (now boot {boot})")
+                }
+            })
+            .collect();
+        (!restarted.is_empty()).then(|| {
+            format!(
+                "{}; a restarted node does not rejoin in M9 (achieveai/rDB#42), so writes stay \
+                 stopped for the life of this Db; to write again, open a new Db on a new \
+                 directory and control store",
+                restarted.join(", ")
+            )
+        })
+    }
+
+    /// `error` with [`Self::restart_note`] appended to its detail, for the kinds a restart
+    /// leaves every later call with: `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME`. The
+    /// kind, retry rule and mutation proof are unchanged.
+    fn explained(&self, mut error: ApiError) -> ApiError {
+        let stopped = matches!(
+            error.kind,
+            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome
+        );
+        if let Some(note) = self.restart_note().filter(|_| stopped) {
+            error.detail = format!("{}; {note}", error.detail);
+        }
+        error
+    }
+
+    /// Whether node 1 admits writes or has been seen to; looks once when it has not.
+    fn ready(&self) -> bool {
+        if self.ready_seen.load(Ordering::Relaxed) {
+            return true;
+        }
+        let (reply, answer) = mpsc::channel();
+        let asked = self.send_to(
+            OWNER,
+            Msg::Inspect {
+                partition: PARTITION,
+                reply,
+            },
+        );
+        let admits = asked.is_ok()
+            && answer
+                .recv_timeout(self.timeouts.read)
+                .is_ok_and(|status| status.admits == Some(true));
+        if admits {
+            self.ready_seen.store(true, Ordering::Relaxed);
+        }
+        admits
+    }
+
     /// The budgets every node runs with, or `None` in a `Db` a crate test builds by hand.
     pub(crate) fn budgets(&self) -> Option<Budgets> {
         self.respawn.as_ref().map(|respawn| respawn.budgets)
@@ -920,18 +1003,35 @@ impl Db {
     /// about 2 s later (spec §6.2), and nothing un-pauses them before M10. Puts already admitted
     /// may still land in that window. A restarted owner never takes a grant again: its old grant
     /// can be cleared ([`crate::admin::clear_grant`]), but nothing acquires a new one. Logged as
-    /// `node_restarted{node, old_boot, boot}`.
+    /// `node_restarted{node, old_boot, boot}`. From then on a `PROTECTION_PAUSED`,
+    /// `UNAVAILABLE` or `UNKNOWN_OUTCOME` answer says so ([`Self::restart_note`]).
     ///
     /// # Errors
     ///
-    /// `INVALID_ARGUMENT` for a node this `Db` does not run, or a `Db` with no data directory
-    /// (a crate test's). A host error when the node does not start again: it then stays stopped.
+    /// `UNAVAILABLE`, with nothing stopped, before this `Db` is ready: node 1 has never been seen
+    /// admitting writes (logged `node_restart_refused_not_ready`). `INVALID_ARGUMENT` for a node
+    /// this `Db` does not run, or a `Db` with no data directory (a crate test's). A host error
+    /// when the node does not start again: it then stays stopped.
     pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
         let Some(respawn) = &self.respawn else {
             return Err(ApiError::invalid(
                 "this Db was built without a data directory, so it cannot restart a node",
             ));
         };
+        // Before the lock: the look asks node 1 through it.
+        if !self.ready() {
+            tracing::warn!(node = node.0, "node_restart_refused_not_ready");
+            return Err(ApiError {
+                kind: ErrorKind::Unavailable,
+                retry: RetryRule::BoundedJitter,
+                no_mutation: true,
+                detail: format!(
+                    "node {} not restarted: this Db is not ready yet (node 1 has not admitted \
+                     a write); restart a node only once it is ready",
+                    node.0
+                ),
+            });
+        }
         // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
         let mut nodes = lock(&self.nodes);
         let Some(handle) = nodes.iter_mut().find(|handle| handle.node == node) else {
@@ -943,7 +1043,7 @@ impl Db {
         let old_boot = handle.boot;
         let boot = BootId(old_boot.0 + 1);
         handle.stop();
-        self.control.forget_node(node);
+        self.control.forget_node(node, old_boot);
         let started = host::spawn_with(
             node,
             respawn.nodes_dir.join(node.0.to_string()),
@@ -1328,6 +1428,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
 
@@ -1523,6 +1624,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
 
@@ -1566,6 +1668,7 @@ mod tests {
             clock: HostClock::start(),
             timeouts: Timeouts::default(),
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
         let cases = [
@@ -2333,6 +2436,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
         (db, mailbox, rt)

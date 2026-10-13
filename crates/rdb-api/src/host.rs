@@ -2334,11 +2334,28 @@ impl Host {
             return;
         }
         entry.reported = true;
+        // The member the configuration pins to `copy`: a node restarted since then runs a
+        // later boot than `copy_boot`, so its acknowledgements are refused (M9 S2b). Both are
+        // left out when the copy is not in the configuration.
+        let member = self
+            .replication
+            .primary(self.node, partition)
+            .and_then(|primary| {
+                primary
+                    .tracker()
+                    .config()
+                    .members
+                    .iter()
+                    .find(|member| member.copy == copy)
+                    .map(|member| (member.node.0, member.boot.0))
+            });
         tracing::warn!(
             node = self.node.0,
             partition = partition.0,
             generation = generation.0,
             copy = copy.0,
+            copy_node = member.map(|(node, _)| node),
+            copy_boot = member.map(|(_, boot)| boot),
             through = through.0,
             head = head.0,
             resends = entry.resends,

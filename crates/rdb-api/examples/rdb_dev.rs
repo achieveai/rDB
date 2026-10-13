@@ -406,6 +406,8 @@ struct Seen {
     recovered: Option<Generation>,
     ready: bool,
     waiting: Option<String>,
+    /// `Db::restart_note` as last printed on a `not ready` line.
+    restarted: Option<String>,
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
     stalled: std::collections::BTreeMap<u32, String>,
@@ -453,13 +455,20 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 ));
             }
             let admits = owner.admits == Some(true);
-            if admits != seen.ready {
+            // A restart names itself on the `not ready` line, and again if it comes after it:
+            // nothing else says that writes will not come back in this run (D2).
+            let restarted = db.restart_note();
+            if admits != seen.ready || (!admits && restarted != seen.restarted) {
                 seen.ready = admits;
-                say(if admits {
-                    "ready"
-                } else {
-                    "not ready: write protection lost"
+                say(&match (admits, &restarted) {
+                    (true, _) => "ready".to_owned(),
+                    (false, None) => "not ready: write protection lost".to_owned(),
+                    (false, Some(note)) => format!(
+                        "not ready: write protection lost: {note} (here: quit, then start \
+                         rdb_dev again)"
+                    ),
                 });
+                seen.restarted = restarted;
             }
             if seen.recovered.is_some() && !admits {
                 let why = waiting_line(owner);
@@ -646,14 +655,14 @@ fn repl<'scope, 'env>(
             ["node", "restart", node] => parse_node(node).map(|node| {
                 say(&match db.restart_node(node) {
                     Ok(boot) => format!("node {} boot {}", node.0, boot.0),
-                    Err(e) => format!("node restart {}: {e}", node.0),
+                    Err(e) => format!("err node restart {}: {e}", node.0),
                 });
             }),
             ["node", ..] => Err("node restart <n>: n is 1, 2 or 3".to_owned()),
             ["admin", "clear-grant", node] => parse_node(node).map(|node| {
                 say(
                     &match rt.block_on(admin::clear_grant(db, control.store, node)) {
-                        Ok(clearance) => clearance_line(clearance, db.now()),
+                        Ok(clearance) => clearance_line(clearance, node, db),
                         Err(e) => format!("err admin clear-grant {}: {e}", node.0),
                     },
                 );
@@ -1132,27 +1141,44 @@ fn control_lines(rt: &tokio::runtime::Runtime, cluster: &Cluster) {
     }
 }
 
-/// `admin clear-grant`'s answer as one line.
-fn clearance_line(clearance: Clearance, now: rdb_core::contracts::time::Tick) -> String {
+/// `admin clear-grant`'s answer as one line. Only `not-proven-expired` clears with time, so
+/// only it says when to try again (W2-D1); the raw `until` stays in the `grant_clear` log line.
+fn clearance_line(clearance: Clearance, node: NodeId, db: &Db) -> String {
     match clearance {
         Clearance::Absent => "absent".to_owned(),
-        Clearance::Current => "current".to_owned(),
+        Clearance::Current => format!(
+            "current: the record is node {}'s running boot {}; in M9 it clears only after that \
+             node restarts, and a restart stops writes for the run (achieveai/rDB#42)",
+            node.0,
+            db.boot_of(node)
+                .map_or_else(|| "?".to_owned(), |boot| boot.0.to_string())
+        ),
         Clearance::Cleared(revision) => format!("cleared rev={}", revision.0),
         Clearance::Conflict => "conflict: the record moved; run it again".to_owned(),
         Clearance::Refused {
-            refusal,
+            refusal: ClearRefusal::NotProvenExpired,
             until_utc_ms,
         } => {
-            let refusal = match refusal {
-                ClearRefusal::Frozen => "frozen".to_owned(),
-                ClearRefusal::NotProvenExpired => "not-proven-expired".to_owned(),
-                ClearRefusal::PartitionInTransfer(partition) => {
-                    format!("partition-in-transfer p{}", partition.0)
-                }
-            };
-            let wait = u64::try_from(until_utc_ms).map_or(0, |until| until.saturating_sub(now.0));
-            format!("refused {refusal} until={until_utc_ms} in={wait}ms")
+            let wait =
+                u64::try_from(until_utc_ms).map_or(0, |until| until.saturating_sub(db.now().0));
+            format!(
+                "refused not-proven-expired: the grant may still be live; try again in {wait} ms"
+            )
         }
+        Clearance::Refused {
+            refusal: ClearRefusal::Frozen,
+            ..
+        } => "refused frozen: a takeover froze this grant; it clears only once the takeover \
+              finishes, never by waiting"
+            .to_owned(),
+        Clearance::Refused {
+            refusal: ClearRefusal::PartitionInTransfer(partition),
+            ..
+        } => format!(
+            "refused partition-in-transfer p{0}: p{0} is not serving; it clears only once p{0} \
+             is back to serving (control lifecycle {0} serving), never by waiting",
+            partition.0
+        ),
     }
 }
 
