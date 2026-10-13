@@ -7605,3 +7605,30 @@ fn an_unresolved_transaction_kept_through_a_read_only_re_emit_resolves_to_read_o
         assert_eq!(rig.view().mode, resolved, "{re_emits:?}");
     }
 }
+
+/// Round 11 (the same ruling): a local-storage deny while `Blocked` leaves the mode `Blocked`
+/// (K-A-48), as a storage fence does, but is not forgotten: the re-emit that ends the block lands
+/// in `LocalStorageFenced`, not `Serving`.
+#[retcd_test]
+fn a_publication_deny_for_local_storage_while_blocked_holds_after_the_re_emit() {
+    let mut rig = Rig::new();
+    let (c, _) = checking_with_waiters(&mut rig, true);
+    let effects = rig.step(answer(
+        Checkpoint::Publication,
+        c,
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+    ));
+    assert!(effects.contains(&quarantined(7)), "fixture: {effects:?}");
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Blocked { reason: block() },
+        "Blocked is sticky under the deny"
+    );
+    rig.step(reemitted(PartitionMode::Active, START));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced
+        }
+    );
+}
