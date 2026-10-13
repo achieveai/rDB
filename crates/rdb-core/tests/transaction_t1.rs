@@ -3017,6 +3017,99 @@ fn a_lost_authority_freeze_reopens_only_on_a_newer_generation() {
     let _ = h.admit(put(1, b"a", b"1"));
 }
 
+/// `view(GEN, seq, valid_through)` under grant id `grant`.
+fn view_under(grant: u64, authority_seq: u64, valid_through: u64) -> Event {
+    kernel(KernelEvent::Authority(AuthorityEvent::View(
+        AuthorityView {
+            grant_id: GrantId(grant),
+            ..view(GEN, authority_seq, valid_through)
+        },
+    )))
+}
+
+/// Scenario (S2b-E, lead ruling A-R96): the node fenced while idle, then replaced its own grant
+/// record under a new grant id (A1's self-replace), and A1 published the partition's view under
+/// it. The freeze lifts on that view and writes are admitted again — same boot, no restart, the
+/// sequence continuing where it stopped.
+#[retcd_test]
+fn a_lost_authority_freeze_thaws_on_an_admitting_view_under_a_new_grant_id() {
+    let mut h = H::non_empty();
+    let next = h.k().next_seq();
+    assert_eq!(h.step(fence(FenceScope::Node, DenyReason::Expired)), vec![]);
+    assert_eq!(
+        failed(&h.step(submit(put(1, b"a", b"1")))),
+        ErrorKind::LeaseExpired
+    );
+    assert_eq!(h.step(view_under(3, 9, u64::MAX)), vec![]);
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+    let _ = h.admit(put(2, b"a", b"1"));
+    assert_eq!(h.k().next_seq(), next, "the chain continues");
+}
+
+/// The thaw's twins (A-R96): each differs from the thawing view in one conjunct, and the freeze
+/// holds — the same grant id the fence ended, another lineage, a view already past, and a
+/// freeze that is not for lost authority.
+#[retcd_test]
+fn a_lost_authority_freeze_holds_on_a_view_that_fails_one_thaw_conjunct() {
+    type Case = (&'static str, DenyReason, Event);
+    let other_lineage = kernel(KernelEvent::Authority(AuthorityEvent::View(
+        AuthorityView {
+            grant_id: GrantId(3),
+            ..view(Generation(GEN.0 + 1), 9, u64::MAX)
+        },
+    )));
+    let cases: [Case; 4] = [
+        (
+            "the fenced grant id",
+            DenyReason::Expired,
+            view_under(2, 9, u64::MAX),
+        ),
+        ("another lineage", DenyReason::Expired, other_lineage),
+        (
+            "not admitting now",
+            DenyReason::Expired,
+            view_under(3, 9, 5),
+        ),
+        (
+            "local storage, not authority",
+            DenyReason::LocalStorageFenced,
+            view_under(3, 9, u64::MAX),
+        ),
+    ];
+    for (why, reason, thaw) in cases {
+        let mut h = H::non_empty();
+        let _ = h.step(fence(FenceScope::Node, reason));
+        let frozen = *h.k().mode();
+        let _ = h.step(thaw);
+        assert_eq!(h.k().mode(), &frozen, "{why}");
+    }
+}
+
+/// Scenario (S2b-E, A-R96 M2): a write was in flight at the fence. The new grant's view arrives
+/// first and the freeze holds, because that write is unresolved. P1 then publishes it under the
+/// new grant (same boot, authority generation and lineage), and `Published` both resolves it and
+/// thaws the queue. Before A-R96 it answered `PublishedWhileFrozen` and stayed frozen.
+#[retcd_test]
+fn a_write_in_flight_at_the_fence_publishes_and_the_queue_thaws() {
+    let mut h = H::non_empty();
+    let (batch, digest, seq) = h.dispatch(put(1, b"a", b"1"));
+    assert_eq!(h.step(fence(FenceScope::Node, DenyReason::Expired)), vec![]);
+    assert_eq!(h.step(committed(batch, seq)).len(), 2);
+    assert_eq!(h.step(view_under(3, 9, u64::MAX)), vec![]);
+    assert_eq!(
+        h.k().mode(),
+        &QueueMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+            unresolved: Some(Seq(seq)),
+        },
+        "unresolved: no thaw yet"
+    );
+    assert_eq!(h.step(published(seq, digest, 1)), vec![]);
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+    assert_eq!(h.k().dedup().len(), 1, "retained, as any published write");
+    let _ = h.admit(put(2, b"b", b"2"));
+}
+
 /// A-R71, tester-t1 hunt_23. Check 10's upper bounds: exactly 255 mutations and exactly
 /// `MAX_CONDITIONS` conditions are admitted, and one more of either is `INVALID_ARGUMENT` naming
 /// the field.
@@ -5623,4 +5716,26 @@ fn m9_s0_14_a_read_only_empty_partition_sends_no_start_record_until_it_opens() {
     assert_eq!(*h.k().mode(), QueueMode::Open);
     let _ = only_check(&h.step(g8_view(3)));
     assert_eq!(h.k().start_record(), StartRecord::Sent { under: 3 });
+}
+
+/// The thaw's mode conjunct (A-R96): authority was lost, and then the local store fenced too. The
+/// freeze is now for local storage, and a view under a new grant does not lift it.
+#[retcd_test]
+fn a_freeze_that_moved_to_local_storage_holds_on_a_new_grants_view() {
+    let mut h = H::non_empty();
+    let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+    let _ = h.step(fence(FenceScope::Node, DenyReason::LocalStorageFenced));
+    let frozen = *h.k().mode();
+    assert!(
+        matches!(
+            frozen,
+            QueueMode::Frozen {
+                cause: FreezeCause::LocalStorageFenced,
+                ..
+            }
+        ),
+        "fixture: {frozen:?}"
+    );
+    let _ = h.step(view_under(3, 9, u64::MAX));
+    assert_eq!(h.k().mode(), &frozen);
 }

@@ -126,7 +126,7 @@ use crate::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use crate::contracts::trace::CapabilityState;
 
 use self::clock::{e_new, expiry_proven, local_ok, utc_ok, ClockMode, ClockView};
-use self::grant::{GrantRecord, HeldIdentity};
+use self::grant::{self_replace, GrantRecord, HeldIdentity, SelfReplace};
 use self::partition::{PartitionLifecycle, PartitionRecord};
 
 /// How many consecutive [`WatchTermination::ResourceExhaustedFatal`] terminations A1 will
@@ -196,7 +196,10 @@ pub const AUTHORITY_CONTROL_REQUEST_BASE: u64 = 0x00A1 << 48;
 /// row asserting that a *stale* wake is ignored cannot say which wake it staled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AuthorityTimer {
-    /// `Unheld | AcquireDue`: the create-only CAS wake, and its back-off re-arm.
+    /// Two meanings (lead ruling A-R96). `Unheld | AcquireDue`: the acquire CAS wake, and its
+    /// back-off re-arm — create-only before a first grant, at the exact revision read after a
+    /// fence. `Fenced | AcquireDue` after a node fence: a `Get` of the node's own grant record,
+    /// the self-replace poll. The host fires it after delivering the fence; `fence()` arms nothing.
     Acquire,
     /// `Held | RenewDue`: the renewal CAS wake.
     Renew,
@@ -821,6 +824,10 @@ pub struct Authority {
     /// nothing else: one answer per event (PR #1 R1-F012, lead correction round 1). `None`
     /// between steps.
     quiet: Option<AuthorityIgnoreReason>,
+    /// What the last node fence left for the self-replace (lead ruling A-R96, M9 S2b-E). `Some`
+    /// from a node fence until a grant is held again; `None` at boot, so a first acquisition is
+    /// create-only as it always was.
+    after_fence: Option<AfterFence>,
 }
 
 /// One outstanding T1 `grants/{owner}` read: the request it was sent as, every partition it
@@ -860,6 +867,24 @@ struct RecoveryRead {
     generation: Generation,
 }
 
+/// What a node fence leaves behind for the self-replace (lead ruling A-R96, M9 S2b-E).
+///
+/// After a fence the same boot may hold again only under a **new** grant id, written over its own
+/// record by a CAS at the exact revision it read, once that record's expiry is proven past
+/// ([`grant::self_replace`]). Until then it only polls with a `Get` (M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AfterFence {
+    /// The grant id the fence ended. Never adopted again, however valid a record naming it
+    /// reads (A-R96 M1; ADR-rdb-0007 R5).
+    fenced: GrantId,
+    /// The `Get` the last `Acquire` firing sent while `Fenced`. Only its answer can move
+    /// `Fenced`; every other read there stays inert, as it was before A-R96.
+    poll: Option<ControlRequestId>,
+    /// The revision a read proved replaceable at. The next acquisition CAS expects exactly it;
+    /// taken when that CAS is dispatched.
+    replace_at: Option<Revision>,
+}
+
 impl Authority {
     /// A module holding no grant, no sample and no cursor.
     #[must_use]
@@ -881,6 +906,7 @@ impl Authority {
             recovery_reads: BTreeMap::new(),
             requests_issued: 0,
             quiet: None,
+            after_fence: None,
         }
     }
 
@@ -1229,6 +1255,13 @@ impl Authority {
         }));
         self.authority_seq = authority_seq;
         if matches!(scope, FenceScope::Node) {
+            // Remembered for the self-replace (A-R96). No timer is armed here (M3): the host
+            // fires `Acquire` after it delivers this fence, as it fires the first one.
+            self.after_fence = Some(AfterFence {
+                fenced: held.grant,
+                poll: None,
+                replace_at: None,
+            });
             self.state = AuthorityState::Fenced {
                 reason,
                 at: ctx.now,
@@ -2249,9 +2282,21 @@ impl Authority {
     /// The `authority_generation` written is the default. A node has no source for the cluster's
     /// current one — `design.md` puts the grant service at M8/M9 — and a read-back adopts
     /// whatever the record says.
+    ///
+    /// # After a fence (lead ruling A-R96)
+    ///
+    /// With [`AfterFence`] set, the CAS is never create-only. Until a read has proven the own
+    /// record replaceable, the firing only polls it with a `Get` (M1); once one has, the CAS
+    /// expects exactly the revision that read saw.
     fn on_acquire_due(&mut self, ctx: &StepCtx<'_>, event: &Event) -> Vec<Effect> {
         if self.state.acquire().is_some() {
             return vec![Self::ignored(event, AuthorityIgnoreReason::StaleTimer)];
+        }
+        if self
+            .after_fence
+            .is_some_and(|after| after.replace_at.is_none())
+        {
+            return vec![self.poll(event, ctx.node)];
         }
         let Some(e_new) = e_new(&self.clock, ctx.now, ctx.budgets) else {
             return vec![
@@ -2259,6 +2304,10 @@ impl Authority {
                 self.acquire_retry(ctx, event),
             ];
         };
+        let expected = self
+            .after_fence
+            .as_mut()
+            .and_then(|after| after.replace_at.take());
         self.grants_issued = self.grants_issued.saturating_add(1);
         let grant = GrantId(self.grants_issued);
         let record = GrantRecord {
@@ -2281,10 +2330,86 @@ impl Authority {
             ControlEffect::Cas {
                 request,
                 key: ControlKey::Grant(ctx.node),
-                expected: None,
+                expected,
                 value: Some(record.encode()),
             },
         )]
+    }
+
+    /// The self-replace's poll (A-R96): a `Get` of our own grant, remembered so that, while
+    /// `Fenced`, only its answer is acted on.
+    fn poll(&mut self, event: &Event, node: NodeId) -> Effect {
+        let request = self.request();
+        if let Some(after) = self.after_fence.as_mut() {
+            after.poll = Some(request);
+        }
+        Self::control(
+            event,
+            ControlEffect::Get {
+                request,
+                key: ControlKey::Grant(node),
+            },
+        )
+    }
+
+    /// The answer to the poll sent while `Fenced` (A-R96), by [`grant::self_replace`]:
+    ///
+    /// * `Replace`: `Unheld`, with the fence's reason kept as `last_fence`, and the acquisition
+    ///   row at once — a CAS at the revision read, under a new grant id.
+    /// * `NotYet`, or the store unavailable: [`AuthorityIgnoreReason::AcquireWithheld`] and the
+    ///   poll re-armed one renewal interval on. Still `Fenced`.
+    /// * `Never`, or the record absent: [`AuthorityIgnoreReason::NotOurs`] and no re-arm. Polling
+    ///   stops; a takeover or a restart is the way on.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` naming [`Capability::Codec`] when the body is not a [`GrantRecord`].
+    fn on_fenced_poll_read(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        event: &Event,
+        reason: DenyReason,
+        outcome: &ReadOutcome,
+    ) -> Result<Vec<Effect>, RdbError> {
+        let (record, revision) = match outcome {
+            ReadOutcome::Found { revision, value } => {
+                let Some(record) = GrantRecord::decode(value) else {
+                    return Err(RdbError::unavailable(
+                        Capability::Codec,
+                        "authority: grants/{node} body is not a GrantRecord this build can read",
+                    ));
+                };
+                (record, *revision)
+            }
+            ReadOutcome::Unavailable => return Ok(vec![self.acquire_retry(ctx, event)]),
+            ReadOutcome::Absent { .. } => {
+                return Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]);
+            }
+        };
+        match self_replace(
+            &record,
+            ctx.node,
+            ctx.boot,
+            &self.clock,
+            ctx.now,
+            ctx.budgets,
+        ) {
+            SelfReplace::Replace => {
+                if let Some(after) = self.after_fence.as_mut() {
+                    after.replace_at = Some(revision);
+                }
+                self.state = AuthorityState::Unheld {
+                    last_fence: Some(reason),
+                    acquire: None,
+                };
+                Ok(self.on_acquire_due(ctx, event))
+            }
+            SelfReplace::NotYet => Ok(vec![
+                Self::ignored(event, AuthorityIgnoreReason::AcquireWithheld),
+                self.acquire_retry(ctx, event),
+            ]),
+            SelfReplace::Never => Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]),
+        }
     }
 
     /// A CAS of `grants/{node}` completed.
@@ -2399,7 +2524,12 @@ impl Authority {
         event: &Event,
         outcome: &ReadOutcome,
     ) -> Result<Vec<Effect>, RdbError> {
+        let after_fence = self.after_fence;
         let ReadOutcome::Found { revision, value } = outcome else {
+            if after_fence.is_some() && matches!(outcome, ReadOutcome::Absent { .. }) {
+                // After a fence an absent record is not a free key to take (A-R96).
+                return Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]);
+            }
             return Ok(vec![self.acquire_retry(ctx, event)]);
         };
         let Some(record) = GrantRecord::decode(value) else {
@@ -2408,15 +2538,43 @@ impl Authority {
                 "authority: grants/{node} body is not a GrantRecord this build can read",
             ));
         };
+        // M1 (A-R96): after a fence, never back to the grant id the fence ended, however valid
+        // the record naming it reads — a renewal dispatched before the fence can land after it.
         let adoptable = record.node == ctx.node
             && record.boot == ctx.boot
             && !record.frozen
+            && after_fence.is_none_or(|after| record.grant != after.fenced)
             && utc_ok(&self.clock, record.expiry_utc_ms, ctx.now, ctx.budgets).is_ok();
         let renewed_at =
             clock::renewed_at_for(&self.clock, record.expiry_utc_ms, ctx.now, ctx.budgets);
         match renewed_at {
             Some(renewed_at) if adoptable => {
                 Ok(self.enter_held(ctx, event, &record, *revision, renewed_at))
+            }
+            // After a fence: replace when proven, wait while not, stop when it is not ours.
+            _ if after_fence.is_some() => {
+                match self_replace(
+                    &record,
+                    ctx.node,
+                    ctx.boot,
+                    &self.clock,
+                    ctx.now,
+                    ctx.budgets,
+                ) {
+                    SelfReplace::Replace => {
+                        if let Some(after) = self.after_fence.as_mut() {
+                            after.replace_at = Some(*revision);
+                        }
+                        Ok(self.on_acquire_due(ctx, event))
+                    }
+                    SelfReplace::NotYet => Ok(vec![
+                        Self::ignored(event, AuthorityIgnoreReason::AcquireWithheld),
+                        self.acquire_retry(ctx, event),
+                    ]),
+                    SelfReplace::Never => {
+                        Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)])
+                    }
+                }
             }
             _ => Ok(vec![
                 Self::ignored(event, AuthorityIgnoreReason::NotOurs),
@@ -2457,6 +2615,7 @@ impl Authority {
         renewed_at: Tick,
     ) -> Vec<Effect> {
         self.authority_seq = self.authority_seq.saturating_add(1);
+        self.after_fence = None;
         self.state = AuthorityState::Held(Held {
             grant: record.grant,
             node: ctx.node,
@@ -2699,15 +2858,26 @@ impl Authority {
         &mut self,
         ctx: &StepCtx<'_>,
         event: &Event,
+        request: ControlRequestId,
         outcome: &ReadOutcome,
     ) -> Result<Vec<Effect>, RdbError> {
         if self.state.is_unheld() {
             return self.on_unheld_grant_read(ctx, event, outcome);
         }
         let Some(identity) = self.state.held().map(Held::identity) else {
-            // `Fenced`. Its one way out is `design.md` §2.4's `Fenced | ReadOk` row — a record
-            // naming a *new* grant id — and that row is not built: `Fenced` does not remember
-            // the old id it would compare against. Until it is, a read widens nothing.
+            // `Fenced`. Its way out is the self-replace (lead ruling A-R96): the answer to the
+            // poll an `Acquire` firing sent, and nothing else. Every other read widens nothing,
+            // as before A-R96, so a read in flight at the fence cannot start a replace the host
+            // did not ask for.
+            let polled = self
+                .after_fence
+                .is_some_and(|after| after.poll == Some(request));
+            if let (true, Some(reason)) = (polled, self.state.fence_reason()) {
+                if let Some(after) = self.after_fence.as_mut() {
+                    after.poll = None;
+                }
+                return self.on_fenced_poll_read(ctx, event, reason, outcome);
+            }
             return Ok(vec![Self::ignored(
                 event,
                 AuthorityIgnoreReason::StaleAuthorityView,
@@ -2763,10 +2933,10 @@ impl Authority {
             } => Ok(self.on_cas_result(ctx, event, *request, *key, *outcome)),
 
             ControlEvent::Value {
+                request,
                 key: ControlKey::Grant(node),
                 outcome,
-                ..
-            } if *node == ctx.node => self.on_grant_read(ctx, event, outcome),
+            } if *node == ctx.node => self.on_grant_read(ctx, event, *request, outcome),
 
             // An unheld node still reads what a watch names, and only the read's answer can
             // grant (TD-17; M7A-34, M7A-35). A watch event carries a revision, never a body, so
@@ -3433,6 +3603,15 @@ impl Authority {
         }
         // `Fenced` is terminal. No timeout, no retry, no "probably fine now" — and specifically
         // no re-arm, so a fenced node's timers go quiet rather than waking it for ever.
+        //
+        // One exception, lead ruling A-R96: `Acquire` after a node fence polls the node's own
+        // record for the self-replace. That is the `Acquire` timer's second meaning — before a
+        // first grant it acquires, after a fence it polls — and nothing in this module arms it on
+        // the fence: the host fires it once it delivers the fence (M3), and only the poll's
+        // answer re-arms it.
+        if self.state.is_fenced() && kind == AuthorityTimer::Acquire && self.after_fence.is_some() {
+            return Ok(vec![self.poll(event, ctx.node)]);
+        }
         if self.state.is_fenced() {
             return Ok(vec![Self::ignored(
                 event,

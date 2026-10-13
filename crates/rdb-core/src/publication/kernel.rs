@@ -17,7 +17,7 @@ use crate::contracts::authority::{
 use crate::contracts::digest::Digest;
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::ids::{
-    BootId, CorrelationId, Generation, PartitionId, RequestIdentity, Seq, SnapshotHandle,
+    BootId, CorrelationId, Generation, GrantId, PartitionId, RequestIdentity, Seq, SnapshotHandle,
     TimerVersion,
 };
 pub use crate::contracts::publication::{
@@ -179,7 +179,8 @@ pub enum PubFact {
     StaleAuthorityAnswer,
     /// `Admit` at `Publication` in `Blocked`.
     PublishRefusedBlocked,
-    /// `Admit` at `Publication` in `Frozen{RecoveryReadOnly}` (test plan Q-6).
+    /// `Admit` at `Publication` in `Frozen{RecoveryReadOnly}` (test plan Q-6), or
+    /// `Deny(ControlUnavailable)` there: asked again on A1's next view (A-R96 M2).
     PublishDeferred,
     /// `Admit` at `Publication`, but R1's predicate is false now.
     PublishPredicateFalse {
@@ -409,6 +410,9 @@ struct Pending {
     cand: AppliedCandidate,
     qualifying: Option<QualificationChanged>,
     recheck: Option<(CorrelationId, Tick)>,
+    /// A1 answered the `Publication` check `Deny(ControlUnavailable)`: a temporary deny, so the
+    /// check is asked again on A1's next view (lead ruling A-R96 M2). Cleared whenever it is asked.
+    deferred: bool,
     deadline: TimerVersion,
     replied: bool,
 }
@@ -573,6 +577,10 @@ pub struct PubKernel {
     waiters: VecDeque<Waiter>,
     authority: Option<AuthorityView>,
     mode: PubMode,
+    /// The grant id of the view held when the mode became `Frozen{AuthorityLost}`, which only an
+    /// admitting view of this lineage under a **different** grant id thaws (lead ruling A-R96).
+    /// `None` when no view was held then, and such a freeze never thaws here.
+    lost_grant: Option<GrantId>,
     next_correlation: u64,
     next_timer_version: u64,
     /// Invariant: when `Some`, storage bound it at [`Self::published`].
@@ -601,6 +609,7 @@ impl PubKernel {
             waiters: VecDeque::new(),
             authority: None,
             mode: PubMode::Serving,
+            lost_grant: None,
             next_correlation: 0,
             next_timer_version: 0,
             kept: None,
@@ -820,7 +829,7 @@ impl PubKernel {
                 }]
             }
             PubEvent::Freeze { cause } => self.on_freeze(cause),
-            PubEvent::AuthorityView(view) => self.on_view(view),
+            PubEvent::AuthorityView(view) => self.on_view(now, view),
             PubEvent::BlockPartition { reason } => self.on_block(reason),
             PubEvent::ModeQuery { reader } => vec![PubEffect::Mode {
                 reader,
@@ -879,6 +888,7 @@ impl PubKernel {
             cand,
             qualifying: None,
             recheck: None,
+            deferred: false,
             deadline,
             replied: false,
         });
@@ -924,6 +934,7 @@ impl PubKernel {
                 // `pending` borrows `self`, so the minting is spelled out here.
                 pending.qualifying = Some(q);
                 pending.recheck = Some((correlation, now));
+                pending.deferred = false;
                 vec![PubEffect::AuthorityCheck {
                     checkpoint: Checkpoint::Publication,
                     lineage: cand.lineage,
@@ -1054,11 +1065,25 @@ impl PubKernel {
             return Vec::new();
         };
         let cand = pending.cand;
+        // Lead ruling A-R96 M2. The grant id is **not** compared: a decision that matches the
+        // candidate's boot, authority generation and lineage and differs only in grant id was
+        // decided under a grant this boot wrote over its own record by an exact-revision CAS
+        // (`authority::grant::self_replace`). That CAS proves the record was never frozen in
+        // between, and a takeover would have moved the lineage's owner epoch.
+        let same_authority = answer.boot == cand.authority.boot
+            && answer.authority_generation == cand.authority.authority_generation
+            && answer.lineage == cand.authority.lineage;
         let deny = match answer.verdict {
-            Verdict::Deny(reason) => Some(reason),
-            Verdict::Admit if !answer.same_lineage_as(&cand.authority) => {
-                Some(DenyReason::GenerationChanged)
+            // A temporary deny: the grant is held, control just cannot be seen. Denying is not
+            // fencing (ADR-rdb-0007), so the write is deferred and asked again on A1's next view,
+            // never quarantined (A-R96 M2).
+            Verdict::Deny(DenyReason::ControlUnavailable) => {
+                pending.recheck = None;
+                pending.deferred = true;
+                return vec![PubEffect::Fact(PubFact::PublishDeferred)];
             }
+            Verdict::Deny(reason) => Some(reason),
+            Verdict::Admit if !same_authority => Some(DenyReason::GenerationChanged),
             Verdict::Admit => None,
         };
         let Some(reason) = deny else {
@@ -1099,6 +1124,7 @@ impl PubKernel {
             self.mode = PubMode::Frozen {
                 cause: FreezeCause::AuthorityLost(reason),
             };
+            self.lost_grant = self.authority.map(|view| view.grant_id);
         }
         effects.extend(self.drain_waiters());
         effects
@@ -1170,6 +1196,9 @@ impl PubKernel {
         {
             self.mode = PubMode::Serving;
         }
+        // 8. A write held across a lost-authority freeze has now published under the new grant;
+        //    with nothing pending, the view that asked for it also lifts the freeze (A-R96).
+        effects.extend(self.thaw(now));
         tracing::debug!(
             partition = cand.lineage.partition.0,
             generation = cand.lineage.generation.0,
@@ -1464,13 +1493,16 @@ impl PubKernel {
             effects.push(PubEffect::Fact(PubFact::FenceWhileBlocked { cause }));
             return effects;
         }
+        if matches!(cause, FreezeCause::AuthorityLost(_)) {
+            self.lost_grant = self.authority.map(|view| view.grant_id);
+        }
         self.mode = PubMode::Frozen { cause };
         let mut effects = self.drain_waiters();
         effects.extend(self.withhold_awaiting(Withheld::Fence));
         effects
     }
 
-    fn on_view(&mut self, view: AuthorityView) -> Vec<PubEffect> {
+    fn on_view(&mut self, now: Tick, view: AuthorityView) -> Vec<PubEffect> {
         if self
             .authority
             .is_some_and(|held| view.authority_seq < held.authority_seq)
@@ -1478,7 +1510,60 @@ impl PubKernel {
             return vec![PubEffect::Fact(PubFact::StaleAuthorityView)];
         }
         self.authority = Some(view);
-        Vec::new()
+        // The pending write is asked again (A-R96 M2) when it was deferred — a view is what A1
+        // emits when its renewal commits, so control answers again; asked under the deny it is
+        // deferred again, and nothing loops, because no view arrives while control is down — or
+        // when this view would thaw a lost-authority freeze, so the write it holds can publish
+        // under the new grant first. Otherwise nothing is pending and the freeze lifts here.
+        let ask = self.pending.as_ref().is_some_and(|p| p.recheck.is_none())
+            && (self.pending.as_ref().is_some_and(|p| p.deferred) || self.thaw_view(now));
+        if !ask {
+            return self.thaw(now);
+        }
+        let correlation = self.mint_correlation();
+        let Some(pending) = self.pending.as_mut() else {
+            return Vec::new();
+        };
+        pending.recheck = Some((correlation, now));
+        pending.deferred = false;
+        vec![PubEffect::AuthorityCheck {
+            checkpoint: Checkpoint::Publication,
+            lineage: pending.cand.lineage,
+            correlation,
+        }]
+    }
+
+    /// Whether the view held would lift a lost-authority freeze (lead ruling A-R96, M9 S2b-E):
+    /// the mode is `Frozen{AuthorityLost}`, the view names exactly this lineage under a grant id
+    /// other than the one held at the freeze, and it admits now. Safe for the reason
+    /// `TxnKernel::thaw` gives: an `AuthorityLost` freeze comes only from a node fence, terminal
+    /// for its grant id, from a revoked epoch, whose lineage A1 publishes no view for again, or
+    /// from a deny at `Publication`. `LocalStorageFenced`, `Blocked`, `UnresolvedTransaction` and
+    /// `RecoveryReadOnly` are never lifted here.
+    fn thaw_view(&self, now: Tick) -> bool {
+        let lost = matches!(
+            self.mode,
+            PubMode::Frozen {
+                cause: FreezeCause::AuthorityLost(_)
+            }
+        );
+        lost && self.authority.is_some_and(|view| {
+            view.lineage == self.lineage
+                && self.lost_grant.is_some_and(|grant| grant != view.grant_id)
+                && now <= view.valid_through_tick
+        })
+    }
+
+    /// Lift a lost-authority freeze when [`Self::thaw_view`] holds and nothing is pending: every
+    /// applied seq is then published, so the chain continues. Drains the waiters, as every mode
+    /// transition does (K-A-14).
+    fn thaw(&mut self, now: Tick) -> Vec<PubEffect> {
+        if self.pending.is_some() || !self.thaw_view(now) {
+            return Vec::new();
+        }
+        self.mode = PubMode::Serving;
+        self.lost_grant = None;
+        self.drain_waiters()
     }
 
     fn on_block(&mut self, reason: BlockReason) -> Vec<PubEffect> {

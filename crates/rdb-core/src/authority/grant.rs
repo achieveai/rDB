@@ -152,6 +152,69 @@ pub fn classify(record: &GrantRecord, held: HeldIdentity) -> Option<DenyReason> 
     None
 }
 
+/// What a fenced boot may do with its own `grants/{node}` record (lead ruling A-R96, M9 S2b-E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfReplace {
+    /// Write over it, by a CAS at the exact revision read, under a new grant id.
+    Replace,
+    /// This boot's record, but its expiry is not proven past yet: ask again later.
+    NotYet,
+    /// Not this boot's to replace: frozen (a takeover's), another boot's, or issued under another
+    /// authority generation. Only a takeover or a restart moves it.
+    Never,
+}
+
+/// May the boot `boot` of `node`, fenced, replace `record` — its own `grants/{node}` — with a new
+/// grant id? [`SelfReplace::Replace`] only when all of these hold:
+///
+/// 1. it names `node` and `boot`: the same process, so nothing but this kernel writes it;
+/// 2. it is not frozen: a frozen record belongs to a takeover (spec §7.3 step 1);
+/// 3. its authority generation is the default, the one this build writes ([`classify`]'s row 3
+///    fences on any other);
+/// 4. [`expiry_proven`](crate::authority::clock::expiry_proven) holds on `clock` at `now`: a
+///    bounded mode and a fresh, valid sample show control time past `E + epsilon + delta`.
+///
+/// # Why `expiry_proven` is sound here although the record is not frozen
+///
+/// Its doc speaks of a **frozen** prior grant, because a takeover proves the expiry of a record
+/// the planner froze, and the freeze is what stops the old owner extending `E` under it. Here no
+/// freeze is needed for the same guarantee, for two reasons. The only writer of an unfrozen
+/// `grants/{node}` of this boot is this boot (A1, one CAS in flight at a time), and it is fenced:
+/// it issues no renewal, so `E` does not move unless a renewal dispatched **before** the fence
+/// lands late. And the replace is a CAS at the exact revision that was read: if such a late
+/// renewal (or a planner freeze) commits first, the revision moves, the replace conflicts, and the
+/// re-read judges the new record afresh — a late renewal is then `NotYet` until its own `E` is
+/// proven past. So the `E` that was proven is the `E` the record still holds when it is replaced,
+/// and past it this boot admits nowhere ([`utc_ok`](crate::authority::clock::utc_ok) is the same
+/// inequality from the other side).
+///
+/// **Not checked here, an M10 gate:** the planner's grant-clearing service has a third guard,
+/// "no partition naming the node as owner is in transfer" ([`ClearRefusal::PartitionInTransfer`]).
+/// A self-replace keeps the same `owner_epoch` for every partition the node serves, so it cannot
+/// race a takeover that has not frozen the grant; a transfer that does not freeze first is an M10
+/// question and is recorded there.
+#[must_use]
+pub fn self_replace(
+    record: &GrantRecord,
+    node: NodeId,
+    boot: BootId,
+    clock: &crate::authority::clock::ClockView,
+    now: crate::contracts::time::Tick,
+    budgets: &crate::contracts::event::Budgets,
+) -> SelfReplace {
+    if record.node != node
+        || record.boot != boot
+        || record.frozen
+        || record.authority_generation != AuthorityGeneration::default()
+    {
+        return SelfReplace::Never;
+    }
+    if crate::authority::clock::expiry_proven(clock, record.expiry_utc_ms, now, budgets).is_none() {
+        return SelfReplace::NotYet;
+    }
+    SelfReplace::Replace
+}
+
 /// What the planner's grant-clearing service may do with a `grants/{node}` record it read: the
 /// three guards of [`clear_verdict`], decided before anything is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

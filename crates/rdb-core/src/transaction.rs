@@ -399,6 +399,10 @@ pub struct TxnKernel {
     /// When the start record was last refused, `None` until it is. A send under such a
     /// same-seq view waits one renew interval from it (review F-003, critic C1).
     start_refused_at: Option<Tick>,
+    /// The grant id of the view held when the queue froze for lost authority. Only an admitting
+    /// view of this lineage under a **different** grant id thaws it (lead ruling A-R96); `None`
+    /// when no view was held then, and such a freeze never thaws here.
+    lost_grant: Option<GrantId>,
 }
 
 impl TxnKernel {
@@ -599,6 +603,7 @@ impl TxnKernel {
             },
             start_sent_under: None,
             start_refused_at: None,
+            lost_grant: None,
         }
     }
 
@@ -761,7 +766,7 @@ impl TxnKernel {
                 request,
             } => self.on_published(ctx, lineage, seq, record_digest, request),
             TxnEvent::Freeze { scope, cause } => self.on_freeze(scope, cause),
-            TxnEvent::AuthorityView(view) => self.on_view(view),
+            TxnEvent::AuthorityView(view) => self.on_view(ctx, view),
             TxnEvent::AdmissionState(state) => {
                 self.admission = Some(state);
                 Vec::new()
@@ -1307,11 +1312,43 @@ impl TxnKernel {
             self.mode = QueueMode::Open;
             self.pump(ctx)
         } else {
-            // The transaction resolved; the authority did not come back. Only `Recovered`
-            // reopens.
+            // The transaction resolved. The queue reopens only if the authority came back under
+            // a new grant (A-R96); otherwise only `Recovered` reopens.
             self.mode = frozen(cause);
-            vec![ignored(AuthorityIgnoreReason::PublishedWhileFrozen)]
+            self.thaw(ctx)
+                .unwrap_or_else(|| vec![ignored(AuthorityIgnoreReason::PublishedWhileFrozen)])
         }
+    }
+
+    /// Lift a lost-authority freeze (lead ruling A-R96, M9 S2b-E), or `None` when it holds.
+    ///
+    /// It lifts only when **all** of these hold: the queue is `Frozen{AuthorityLost}` with
+    /// nothing unresolved; the view held names exactly this lineage; its grant id differs from
+    /// the one held at the freeze; and it admits now. Safe because an `AuthorityLost` freeze
+    /// comes only from a node fence, terminal for its grant id, or from a revoked epoch, whose
+    /// lineage A1 publishes no view for again. So an admitting view of this lineage under another
+    /// grant id is a new grant of the same boot, and with nothing unresolved every applied seq
+    /// is published: `next_seq` and `prev_digest` continue the chain. `LocalStorageFenced`,
+    /// `UnresolvedTransaction` and `RecoveryReadOnly` are never lifted here.
+    fn thaw(&mut self, ctx: &StepCtx<'_>) -> Option<Vec<TxnEffect>> {
+        let QueueMode::Frozen {
+            cause: FreezeCause::AuthorityLost(_),
+            unresolved: None,
+        } = self.mode
+        else {
+            return None;
+        };
+        let view = self.authority?;
+        let lost = self.lost_grant?;
+        if view.lineage != self.lineage
+            || view.grant_id == lost
+            || ctx.now > view.valid_through_tick
+        {
+            return None;
+        }
+        self.mode = QueueMode::Open;
+        self.lost_grant = None;
+        Some(self.pump(ctx))
     }
 
     fn on_freeze(&mut self, scope: FenceScope, cause: FreezeCause) -> Vec<TxnEffect> {
@@ -1344,11 +1381,14 @@ impl TxnKernel {
         out.extend(self.drain(|k, identity| {
             freeze_error(cause, &k.deny_context(identity, k.lineage.generation))
         }));
+        if matches!(cause, FreezeCause::AuthorityLost(_)) {
+            self.lost_grant = self.authority.map(|view| view.grant_id);
+        }
         self.mode = QueueMode::Frozen { cause, unresolved };
         out
     }
 
-    fn on_view(&mut self, view: AuthorityView) -> Vec<TxnEffect> {
+    fn on_view(&mut self, ctx: &StepCtx<'_>, view: AuthorityView) -> Vec<TxnEffect> {
         // Another partition's view is not this kernel's authority (lead ruling A-R84), exactly as
         // another partition's fence is not its freeze.
         if view.lineage.partition != self.lineage.partition {
@@ -1361,7 +1401,7 @@ impl TxnKernel {
             return vec![ignored(AuthorityIgnoreReason::StaleAuthorityView)];
         }
         self.authority = Some(view);
-        Vec::new()
+        self.thaw(ctx).unwrap_or_default()
     }
 
     /// Answer every queued request with `error`, in queue order. Nothing queued was written.
@@ -1934,6 +1974,7 @@ mod tests {
             start: super::StartRecord::NotOwed,
             start_sent_under: None,
             start_refused_at: None,
+            lost_grant: None,
         }
     }
 

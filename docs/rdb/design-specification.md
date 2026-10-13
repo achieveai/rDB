@@ -513,6 +513,10 @@ Revalidate at publication and reply. New-epoch activation first drains/cancels o
 
 Clock uncertainty beyond the configured bound, backward jumps, process resume, reboot or authority-generation change invalidates cached grants. Such nodes stop accepting requests and acquire a fresh grant; automatic promotion is disabled when error bounds cannot be established. Verified external machine fencing is the fallback, not an assumption that an unreachable machine is dead.
 
+**Same-boot fresh grant (M9, lead ruling A-R96).** A self-fenced node needs no restart to leave `SelfFenced`. Once a read of its own grant record proves that record's expiry, it replaces the record by a CAS at exactly the revision read, under a new grant id. It never returns to the grant id the fence ended. A planner's freeze makes the record unreplaceable.
+
+**M10 gate:** the self-replace has no partition-in-transfer guard. That is safe in M9 only because M9 never starts a takeover, so the freeze is the only gate needed. Before M10 enables transfers, the self-replace must refuse while a transfer of any partition the node owns is in progress; otherwise an owner can contend with a planner mid-transfer.
+
 **Sizing note: grant length against control failover (added 2026-10-12, M9 S2b).** A control-leader failover must leave a renewal inside the write horizon, or one failover fences every owner. A1 admits until `grant_millis − dispatch_margin_millis − clock_error_millis − 1` after its last committed renewal (`Authority::admission_horizon`), and that renewal can be one `renew_millis` old when the leader stops. The new leader must then be in place with one more renewal to spare. So:
 
 `control failover + renew_millis < grant_millis − dispatch_margin_millis − clock_error_millis − 1 − renew_millis`
@@ -520,11 +524,11 @@ Clock uncertainty beyond the configured bound, backward jumps, process resume, r
 - With the defaults (3000, 100, 100, 500) the right side is 2299 ms.
 - rEtcd's default timers allow a failover of up to about 3000 ms (two `election_timeout_max`), so they break it. Measured in M9 S2a: the voters elected 2338 ms after the stop, 3 ms past the horizon, and the owner fenced `Expired`.
 - `rdb_dev`'s control timers give 1000 + 500 = 1500 ms, which leaves 799 ms for the renewal's RPC and commit. Row `control_failover_leaves_a_renewal_inside_the_write_horizon` holds that.
-- Owed to M10: a startup check against the voters' real timers (needs `--control ENDPOINTS`; `dyn ConfigStore` hides them) and A1's quicker renewal retry. Until then, with default rEtcd timers one leader failover fences every owner, and in M9 that is permanent.
+- Owed to M10: a startup check against the voters' real timers (needs `--control ENDPOINTS`; `dyn ConfigStore` hides them) and A1's quicker renewal retry. Until then, with default rEtcd timers one leader failover fences every owner. Writes then stop until the same-boot fresh grant (above) proves the old grant expired and replaces it, which takes at least the rest of that grant plus `clock_error_millis + dispatch_margin_millis` once the new leader answers.
 
 **M9 note: a node restart stops writes, safely, for the life of the `Db` (added 2026-10-12, M9 S2b; achieveai/rDB#42).** `Db::restart_node` starts the node again at boot + 1. Peers' membership pins the old boot (`Member::boot`), so they refuse the new process's acknowledgements, and the new process holds no role, no grant and no pending acquire.
 - Restarting a **secondary**: its copy is never durable again, so L1 warns about 1 s later and pauses writes about 2 s later (§6.2).
-- Restarting the **owner**: it never takes a grant again. Its old grant can be cleared once expiry is proven (§7.3), but nothing acquires a new one.
+- Restarting the **owner**: it never takes a grant again. Its old grant can be cleared once expiry is proven (§7.3), but nothing acquires a new one. The same-boot fresh grant does not apply: it belongs to the process whose grant was fenced, and a restarted process holds no grant to replace.
 - Either way nothing un-pauses writes before M10, which brings catch-up and re-pin (#42). Reads of already published data keep answering. Every `PROTECTION_PAUSED`, `UNAVAILABLE` or `UNKNOWN_OUTCOME` answer names the restarted node and boot.
 - A restart is therefore never a recovery step in M9. Writing again takes a new `Db` on a new directory and control store: the same ones cannot be reopened (`OpenError::NotEmpty`, `BootstrapError::AlreadyExists`).
 
