@@ -216,8 +216,8 @@ fn m7f_22_environment_capabilities_name_what_is_owed() {
 }
 
 /// Every row here writes one JSONL file under the test log root, and its first three lines are
-/// the `Capability` lines. Read back synchronously: `config-log` appends per-test files with a
-/// blocking `write_all`, so the row's own lines are on disk before this assertion runs.
+/// the `Capability` lines. Read back synchronously: `test_file_path` flushes `config-log`'s
+/// writer first, so the row's own lines are on disk before this assertion runs.
 #[retcd_test]
 fn m7f_22_each_row_writes_one_jsonl_file_under_the_test_log_root() {
     support::preamble();

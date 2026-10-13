@@ -105,6 +105,14 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   `relation_for_current_test`, which copies one named file. Moving fixtures out of the log root is
   the durable fix and is owed; it touches several pre-existing call sites across teams.
 - To read your own output without DuckDB at all, use `logs::lines_for_current_test`.
+- **Per-test lines are written by a background thread, so a line is in the file only after a
+  flush.** `config_log::layer::test_file_path` and every `config_testkit::logs` helper flush
+  first. A reader that finds a log file some other way (walking the run directory, say) calls
+  `config_log::layer::flush_test_logs()` before reading. `#[retcd_test]` flushes again when
+  the test ends, after an async test's runtime has shut down, so nothing is lost at exit.
+  Before 2026-10-12 the layer wrote inline under one process-wide lock. One append that
+  stalled for 2.2–2.8 s on this host then froze every cluster in the binary, and
+  `m4_watch_cluster` lost 10–12 rows at once to `deadline exceeded`.
 
 ## Several agents, one working tree
 

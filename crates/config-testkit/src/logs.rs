@@ -199,8 +199,8 @@ fn snapshot_dir() -> PathBuf {
 ///
 /// The length is read once and never re-read, so anything appended while the copy runs is
 /// simply not in the snapshot — the point is a file of fixed length, not a current one. The
-/// trailing-newline trim is insurance: `config_log`'s layer writes one whole line per
-/// `write_all` under a mutex, so a torn line should not be reachable, but a snapshot that
+/// trailing-newline trim is insurance: `config_log`'s writer thread writes one whole line per
+/// `write_all`, so a torn line should not be reachable, but a snapshot that
 /// cannot end mid-object costs one `set_len` to guarantee.
 fn freeze(src: &Path, dest: &Path) {
     let mut reader = File::open(src)
@@ -255,6 +255,7 @@ fn freeze(src: &Path, dest: &Path) {
 /// assertion over it vacuously true (test plan §6 rule 11).
 #[must_use]
 pub fn test_logs_relation() -> LogSnapshot {
+    config_log::layer::flush_test_logs();
     let root = config_log::testing::test_log_dir();
     let dir = snapshot_dir();
     let snapshot = LogSnapshot::new(dir.clone(), &dir.join("*").join("*.jsonl"));
@@ -326,6 +327,7 @@ pub fn relation_for_current_test(module: &str, method: &str) -> LogSnapshot {
 /// would make every assertion over it vacuously true (test plan §6 rule 11).
 #[must_use]
 pub fn relation_for_tree(root: &Path) -> LogSnapshot {
+    config_log::layer::flush_test_logs();
     let dir = snapshot_dir();
     let snapshot = LogSnapshot::new(dir.clone(), &dir.join("**").join("*.jsonl"));
     let mut found = 0usize;
