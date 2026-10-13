@@ -69,8 +69,8 @@
 //!
 //! The recovery CAS stays out (ruling F-g): `PartitionRecord` binds neither the run nor the
 //! cutoff, so our bytes on a read cannot be told from a peer's identical decision on another
-//! cutoff. Resolving it needs a run id in `partitions/{p}` (M10). In M9 it runs only on the first
-//! open's bootstrap, before any write is admitted.
+//! cutoff. Resolving it needs a run id in `partitions/{p}` (M10, achieveai/rDB#45). In M9 it runs
+//! only on the first open's bootstrap, before any write is admitted.
 //!
 //! `Idle` leaves only on a `FencingProof` (§2.1). After commit, `select_prefix` is unreachable:
 //! a returning stale owner is quarantined without its length ever being read (§5.7).

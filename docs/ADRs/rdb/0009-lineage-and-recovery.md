@@ -379,7 +379,7 @@ Safety rests on the exact-revision CAS and the linearizable read: after our comm
 can write our bytes, and a takeover first needs a non-`Serving` record (A-R51), which changes them.
 The recovery CAS cannot be resolved this way: `PartitionRecord` binds no run id or cutoff, so our
 bytes cannot be told from a peer's identical decision (ruling F-g). That needs a run id in
-`partitions/{id}`, owed to M10.
+`partitions/{id}`, owed to M10 and tracked as achieveai/rDB#45.
 
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
