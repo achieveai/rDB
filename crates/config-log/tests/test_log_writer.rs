@@ -112,21 +112,24 @@ fn lines_queued_at_process_exit_are_not_lost() {
 
 fn child_writes_every_line(child: &str) {
     let root = tempfile::tempdir().expect("temp log root");
+    // `--nocapture`, so a flush error the test guard prints reaches `out.stderr`.
     let out = Command::new(std::env::current_exe().expect("this test binary"))
-        .args([child, "--exact", "--ignored", "--test-threads=1"])
+        .args([
+            child,
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
         .env("RETCD_TEST_LOG_DIR", root.path())
         .output()
         .expect("run the child");
-    assert!(
-        out.status.success(),
-        "{child} failed: {}\n{}",
-        out.status,
-        String::from_utf8_lossy(&out.stdout)
-    );
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stdout.contains("1 passed"),
-        "{child} ran no test:\n{stdout}"
+        out.status.success() && stdout.contains("1 passed"),
+        "{child} failed or ran no test: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status
     );
 
     // `<root>/<child run id>/<module>/<method>.jsonl`; the child is the only run under `root`.
@@ -139,5 +142,51 @@ fn child_writes_every_line(child: &str) {
     let path = runs[0]
         .join("test_log_writer")
         .join(format!("{child}.jsonl"));
-    assert_complete(child, &lines_in(&path, None), THREADS, PER_THREAD);
+    let lines = lines_in(&path, None);
+    assert!(
+        lines.len() == THREADS * PER_THREAD,
+        "{child}: {} of {} lines in its file\nchild stderr:\n{stderr}",
+        lines.len(),
+        THREADS * PER_THREAD
+    );
+    assert_complete(child, &lines, THREADS, PER_THREAD);
+}
+
+/// A per-test file that cannot be opened loses its own lines and nothing else: the shared
+/// writer keeps going, and the reader of that file is told the path and the cause.
+#[retcd_test]
+fn an_unopenable_log_file_loses_only_its_own_lines() {
+    const BLOCKED: &str = "an_unopenable_log_file_blocked_twin";
+    // A directory where the twin's `<method>.jsonl` should go, so opening it fails.
+    let blocker = config_log::layer::test_file_path(&test_log_dir(), module_path!(), BLOCKED);
+    std::fs::create_dir_all(&blocker).expect("create the blocking directory");
+
+    let twin = tracing::info_span!("twin", testMethod = BLOCKED);
+    twin.in_scope(|| tracing::info!("to the blocked file"));
+    tracing::info!("to my own file");
+
+    let read_blocked = std::panic::catch_unwind(|| {
+        config_log::layer::test_file_path(&test_log_dir(), module_path!(), BLOCKED)
+    });
+    std::fs::remove_dir(&blocker).expect("remove the blocking directory");
+    let message = read_blocked
+        .expect_err("reading the blocked file must fail")
+        .downcast::<String>()
+        .map(|m| *m)
+        .unwrap_or_default();
+    assert!(
+        message.contains(&blocker.display().to_string()),
+        "the panic names the path: {message}"
+    );
+
+    let own = config_log::layer::test_file_path(
+        &test_log_dir(),
+        module_path!(),
+        "an_unopenable_log_file_loses_only_its_own_lines",
+    );
+    let text = std::fs::read_to_string(&own).expect("own log file");
+    assert!(
+        text.contains("to my own file"),
+        "the writer kept going after the failed open"
+    );
 }
