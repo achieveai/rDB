@@ -833,8 +833,10 @@ impl Db {
     /// What became of this client's request `request`.
     ///
     /// After a restart ([`Self::restart_note`] is `Some`), `Unknown` is not evidence that a write
-    /// was lost, even one answered `ok`: the node that knew its outcome may be the one restarted,
-    /// and the outcome cannot be known until it rejoins (M10, achieveai/rDB#42).
+    /// was lost, even one answered `ok`. After the owner's restart, or both secondaries', its
+    /// outcome cannot be known until a restarted node rejoins (M10, achieveai/rDB#42). After one
+    /// secondary's, it resolves once the other secondary can take the write: healing a link to
+    /// it is enough (tester walk 5, W5-D1).
     ///
     /// # Errors
     ///
@@ -918,10 +920,11 @@ impl Db {
     }
 
     /// Why writes stopped for good, once a node of this `Db` has restarted; `None` while every
-    /// node runs its first boot. Names each restarted node and its boot, and says that writes
-    /// will not resume (M9 S2b, D2): a restarted copy does not rejoin before M10
-    /// (achieveai/rDB#42), and this `Db`'s data and control store cannot be opened again
-    /// (`NotEmpty`, `AlreadyExists`), so writing again takes a new `Db` on new ones.
+    /// node runs its first boot. Names each restarted node and its boot, in one short clause,
+    /// because it rides on every refused answer (tester walk 5): a restarted copy does not
+    /// rejoin before M10 (achieveai/rDB#42), so writes do not resume, and this `Db`'s data and
+    /// control store cannot be opened again (`NotEmpty`, `AlreadyExists`), so writing again
+    /// takes a new `Db` on new ones (M9 S2b, D2).
     #[must_use]
     pub fn restart_note(&self) -> Option<String> {
         let restarted: Vec<String> = lock(&self.nodes)
@@ -938,9 +941,7 @@ impl Db {
             .collect();
         (!restarted.is_empty()).then(|| {
             format!(
-                "{}; a restarted node does not rejoin in M9 (achieveai/rDB#42), so writes stay \
-                 stopped for the life of this Db; to write again, open a new Db on a new \
-                 directory and control store",
+                "{}; a restarted node stays out until M10 (#42)",
                 restarted.join(", ")
             )
         })
@@ -998,6 +999,35 @@ impl Db {
         self.respawn.as_ref().map(|respawn| respawn.budgets)
     }
 
+    /// A `Db` around `nodes` built by hand, for crate tests (`NodeHandle::unanswered`).
+    /// `respawn` names where [`Self::restart_node`] starts a node and the budgets it uses, and
+    /// is what lets [`crate::admin::clear_grant`] judge; `None` refuses both.
+    #[cfg(test)]
+    pub(crate) fn by_hand(
+        nodes: Vec<NodeHandle>,
+        store: Arc<dyn ConfigStore>,
+        rt: &Handle,
+        timeouts: Timeouts,
+        respawn: Option<(PathBuf, Budgets)>,
+    ) -> Self {
+        let links = Links::new();
+        Self {
+            nodes: Mutex::new(nodes),
+            respawn: respawn.map(|(nodes_dir, budgets)| Respawn {
+                nodes_dir,
+                budgets,
+                limits: Limits::default(),
+            }),
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.clone(), links),
+            clock: HostClock::start(),
+            timeouts,
+            next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+        }
+    }
+
     /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
     /// process supervisor would (M9 S2b; a real supervisor takes over in M10). Returns the new
     /// boot.
@@ -1018,7 +1048,8 @@ impl Db {
     /// may still land in that window. A restarted owner never takes a grant again: its old grant
     /// can be cleared ([`crate::admin::clear_grant`]), but nothing acquires a new one. Logged as
     /// `node_restarted{node, old_boot, boot}`. From then on a `PROTECTION_PAUSED`,
-    /// `UNAVAILABLE` or `UNKNOWN_OUTCOME` answer says so ([`Self::restart_note`]).
+    /// `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY` answer says so
+    /// ([`Self::restart_note`]).
     ///
     /// # Errors
     ///
@@ -2454,6 +2485,113 @@ mod tests {
             unwind: None,
         };
         (db, mailbox, rt)
+    }
+
+    /// M9 S2b D2 and tester W3-D1: once a node has restarted, every `PROTECTION_PAUSED`,
+    /// `UNAVAILABLE`, `UNKNOWN_OUTCOME` and `NOT_PRIMARY` answer names it, and `NOT_PRIMARY` says
+    /// no node becomes primary again; the kind and retry rule stay. Other kinds, and every kind
+    /// before a restart, are left alone. The calls route through it: a get, a status and a put
+    /// that nothing answers come back `UNAVAILABLE` with the note.
+    /// Unit (~100 ms): the owner has no thread.
+    #[test]
+    fn after_a_restart_each_noted_kind_names_it_and_not_primary_says_no_primary_returns() {
+        use ErrorKind::{LeaseExpired, NotPrimary, ProtectionPaused, Unavailable, UnknownOutcome};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let (owner, _mailbox) = NodeHandle::unanswered(OWNER);
+        let short = Timeouts {
+            put: Duration::from_millis(20),
+            read: Duration::from_millis(20),
+        };
+        let mut db = Db::by_hand(vec![owner], store, rt.handle(), short, None);
+        let kinds = [
+            ProtectionPaused,
+            Unavailable,
+            UnknownOutcome,
+            NotPrimary,
+            LeaseExpired,
+        ];
+        assert_eq!(db.restart_note(), None);
+        for kind in kinds {
+            assert_eq!(
+                db.explained(ApiError::new(kind, "d")).detail,
+                "d",
+                "{kind:?}"
+            );
+        }
+
+        lock(&db.nodes)[0].boot = BootId(2);
+        let note = db.restart_note().expect("the owner restarted");
+        assert_eq!(
+            note,
+            "the owner, node 1, restarted (now boot 2); a restarted node stays out until M10 (#42)"
+        );
+        for kind in kinds {
+            let plain = ApiError::new(kind, "d");
+            let explained = db.explained(plain.clone());
+            let detail = match kind {
+                ProtectionPaused | Unavailable | UnknownOutcome => format!("d; {note}"),
+                NotPrimary => format!("d; no node becomes primary again in M9: {note}"),
+                _ => "d".to_owned(),
+            };
+            assert_eq!(
+                (explained.kind, explained.retry, explained.detail),
+                (kind, plain.retry, detail)
+            );
+        }
+
+        let get = db.get(b"a").expect_err("nothing answers the read");
+        let status = db.status(RequestId(1), None).expect_err("nor the status");
+        let put = db.put(b"a", b"1", None).expect_err("nor the compile").error;
+        for (call, error) in [("get", get), ("status", status), ("put", put)] {
+            assert!(
+                error.kind == Unavailable && error.detail.ends_with(&note),
+                "{call}: {error:?}"
+            );
+        }
+        db.shutdown();
+    }
+
+    /// M9 S2b D3: `restart_node` is refused, with nothing stopped, until node 1 has been seen
+    /// admitting writes, and goes ahead once it has, even if writes have stopped since: the
+    /// flag never clears. Unit (~200 ms): the owner has no thread, so its look goes unanswered;
+    /// the allowed restart starts a real node on a temp directory.
+    #[test]
+    fn a_restart_is_refused_before_ready_and_goes_ahead_after() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let (owner, mailbox) = NodeHandle::unanswered(OWNER);
+        let short = Timeouts {
+            read: Duration::from_millis(20),
+            ..Timeouts::default()
+        };
+        let respawn = Some((dir.path().to_path_buf(), fast()));
+        let mut db = Db::by_hand(vec![owner], store, rt.handle(), short, respawn);
+
+        let refused = db.restart_node(OWNER).expect_err("not ready yet");
+        assert_eq!(
+            (refused.kind, refused.no_mutation),
+            (ErrorKind::Unavailable, true),
+            "{refused:?}"
+        );
+        assert!(refused.detail.contains("not ready yet"), "{refused:?}");
+        assert_eq!(db.boot_of(OWNER), Some(host::BOOT), "nothing was stopped");
+        assert!(
+            matches!(mailbox.try_recv(), Ok(Msg::Inspect { .. })),
+            "the refusal comes from the look at node 1"
+        );
+
+        db.ready_seen.store(true, Ordering::Relaxed);
+        assert_eq!(db.restart_node(OWNER).expect("ready was seen"), BootId(2));
+        assert_eq!(db.boot_of(OWNER), Some(BootId(2)));
+        db.shutdown();
     }
 
     /// S1 ruling M1 (scenario 4b) and the tester's PC-1. A deadline past 30 s is refused

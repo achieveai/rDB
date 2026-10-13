@@ -49,15 +49,21 @@
 //!                                         never durable again; after the owner's, no node
 //!                                         holds a grant. Reads: after a secondary's they keep
 //!                                         answering, unless a write was in flight that no
-//!                                         other copy can take (both secondaries restarted, or
-//!                                         the other unreachable): then fresh reads answer
+//!                                         other copy can take yet: then fresh reads answer
 //!                                         `UNKNOWN_OUTCOME` and `get --previous` still
-//!                                         answers. After the owner's every read is
+//!                                         answers. That lasts while no copy that did not
+//!                                         restart can take the write: if the other secondary
+//!                                         was only unreachable, healing its link resolves
+//!                                         it; only with both secondaries restarted does it
+//!                                         wait for M10. After the owner's every read is
 //!                                         `UNAVAILABLE`. Every `PROTECTION_PAUSED`,
 //!                                         `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY`
 //!                                         after it names the restart, and so does a `status`
-//!                                         of `Unknown`: that is not evidence of a lost write,
-//!                                         its outcome cannot be known until the node rejoins.
+//!                                         of `Unknown` for a request this session sent: that
+//!                                         is not evidence of a lost write. After one
+//!                                         secondary's restart it resolves once the other can
+//!                                         take the write; after the owner's, or both
+//!                                         secondaries', it waits for the node to rejoin.
 //!                                         Restarting is not a recovery: catch-up and re-pin
 //!                                         are M10 (achieveai/rDB#42). To write again,
 //!                                         quit and start rdb_dev again. Refused until the
@@ -101,7 +107,8 @@
 //! While it runs, a poller prints the partition's progress as it changes: `recovered gen=N`,
 //! `waiting to admit writes (l1=.. authority=..)`, and `ready` once node 1 admits writes: its L1
 //! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
-//! waiting line then saying which. A put before `ready` is refused, never left hanging. A recovery committed below `Active` that
+//! waiting line then saying which. When node 1's grant is fenced, that line says why and that
+//! writes resume by themselves, so the node is not restarted (#42). A put before `ready` is refused, never left hanging. A recovery committed below `Active` that
 //! does not activate prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever
 //! the line changes:
 //!
@@ -422,8 +429,8 @@ struct Seen {
     recovered: Option<Generation>,
     ready: bool,
     waiting: Option<String>,
-    /// `Db::restart_note` as last printed on a `not ready` line.
-    restarted: Option<String>,
+    /// The reason last printed on a `not ready` line.
+    reason: Option<String>,
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
     stalled: std::collections::BTreeMap<u32, String>,
@@ -471,20 +478,13 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 ));
             }
             let admits = owner.admits == Some(true);
-            // A restart names itself on the `not ready` line, and again if it comes after it:
-            // nothing else says that writes will not come back in this run (D2).
-            let restarted = db.restart_note();
-            if admits != seen.ready || (!admits && restarted != seen.restarted) {
+            let reason = not_ready_reason(owner, db.restart_note().as_deref());
+            if let Some(line) = ready_change(&seen, admits, reason.as_ref()) {
+                say(&line);
                 seen.ready = admits;
-                say(&match (admits, &restarted) {
-                    (true, _) => "ready".to_owned(),
-                    (false, None) => "not ready: writes not admitted".to_owned(),
-                    (false, Some(note)) => format!(
-                        "not ready: writes not admitted: {note} (here: quit, then start \
-                         rdb_dev again)"
-                    ),
-                });
-                seen.restarted = restarted;
+                if !admits {
+                    seen.reason = reason;
+                }
             }
             if seen.recovered.is_some() && !admits {
                 let why = waiting_line(owner);
@@ -497,6 +497,41 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
         drop(seen);
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Why node 1 does not admit writes, when a user could act on it wrongly. A restart wins: nothing
+/// else says writes will not come back in this run (D2). Then a fenced grant, which looks stuck
+/// but is not: A1 replaces the grant itself once the old one's expiry is proven, and a restart
+/// there would end recovery for the run (Message 6).
+fn not_ready_reason(owner: &NodeStatus, restart_note: Option<&str>) -> Option<String> {
+    if let Some(note) = restart_note {
+        return Some(format!(
+            "{note}; writes stay stopped for this run: to write again, quit and start rdb_dev again"
+        ));
+    }
+    let node = owner.node.0;
+    owner.authority.starts_with("fenced").then(|| {
+        format!(
+            "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
+             is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
+             (achieveai/rDB#42)",
+            owner.authority
+        )
+    })
+}
+
+/// The `ready` or `not ready` line to print, given what was printed last: on each change of
+/// `admits`, and while not ready again when a new reason appears (a fence after the line, a
+/// restart after a fence). A reason that goes away prints nothing; the waiting line says what is
+/// left.
+fn ready_change(seen: &Seen, admits: bool, reason: Option<&String>) -> Option<String> {
+    let changed = admits != seen.ready;
+    let new_reason = !admits && reason.is_some() && reason != seen.reason.as_ref();
+    (changed || new_reason).then(|| match (admits, reason) {
+        (true, _) => "ready".to_owned(),
+        (false, None) => "not ready: writes not admitted".to_owned(),
+        (false, Some(why)) => format!("not ready: writes not admitted: {why}"),
+    })
 }
 
 /// The line to print when a node's stall line changes, given the one printed last. Not a node
@@ -661,7 +696,7 @@ fn repl<'scope, 'env>(
                 get_line(db.get_previous(object.as_bytes()));
                 Ok(())
             }
-            ["status", request, rest @ ..] => status_line(db, request, rest),
+            ["status", request, rest @ ..] => status_line(db, &sent, request, rest),
             ["nodes"] => {
                 for node in db.node_status() {
                     say(&node_line(&node));
@@ -1073,7 +1108,7 @@ fn get_line(answer: Result<rdb_api::GetOk, rdb_api::ApiError>) {
     }
 }
 
-fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
+fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(), String> {
     let request = request
         .parse::<u64>()
         .map_err(|_| "status <request> [<generation>]".to_owned())?;
@@ -1086,19 +1121,46 @@ fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
         _ => return Err("status <request> [<generation>]".to_owned()),
     };
     match db.status(RequestId(request), generation) {
-        // After a restart, `Unknown` can be a write this session saw `ok`: the node that knew
-        // it is gone, and the restarted one holds no history (tester W3-D2).
-        Ok(TxnStatus::Unknown) => say(&match db.restart_note() {
-            Some(note) => format!(
-                "status Unknown (its outcome cannot be known until the restarted node rejoins, \
-                 which is M10: {note})"
-            ),
-            None => "status Unknown".to_owned(),
-        }),
+        // After a restart, `Unknown` can be a write this session saw `ok` (tester W3-D2).
+        Ok(TxnStatus::Unknown) => {
+            let restarted: Vec<NodeId> = db
+                .node_status()
+                .iter()
+                .filter(|node| node.boot != rdb_api::host::BOOT)
+                .map(|node| node.node)
+                .collect();
+            let note = db.restart_note();
+            let ours = sent.by_id.contains_key(&request);
+            say(&unknown_line(ours, &restarted, note.as_deref()));
+        }
         Ok(status) => say(&format!("status {status:?}")),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
     }
     Ok(())
+}
+
+/// `status Unknown`, with the restart note when there is one, unless this session never sent
+/// the request (`ours` false): that outcome is known (tester walk 5). It waits for M10 only
+/// after the owner's restart or both secondaries': after one secondary's, it resolves once the
+/// other can take the write, as when a held link heals (W5-D1).
+fn unknown_line(ours: bool, restarted: &[NodeId], restart_note: Option<&str>) -> String {
+    let Some(note) = restart_note.filter(|_| ours) else {
+        return "status Unknown".to_owned();
+    };
+    let others: Vec<u32> = [2, 3]
+        .into_iter()
+        .filter(|node| !restarted.contains(&NodeId(*node)))
+        .collect();
+    match others.as_slice() {
+        [other] if !restarted.contains(&NodeId(1)) => format!(
+            "status Unknown (not evidence of a lost write: it resolves once node {other}, which \
+             did not restart, can take it; {note})"
+        ),
+        _ => format!(
+            "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
+             restarted node rejoins, which is M10; {note})"
+        ),
+    }
 }
 
 /// One node's line. `published=` is left off a secondary: P1 publishes nothing there, so its
@@ -1548,6 +1610,80 @@ mod tests {
                 format!("stalled node=1 {stall}"),
             ]
         );
+    }
+
+    /// Message 6 paper cut: a fenced owner printed a bare `not ready`, and a user may then restart
+    /// the node, which ends recovery in M9. The fence prints its reason when it comes after the
+    /// line, nothing more while it lasts or as it clears, and a restart after it prints again.
+    #[test]
+    fn a_fenced_owner_says_writes_resume_by_themselves_and_not_to_restart() {
+        let mut fenced = owner(None, false);
+        fenced.authority = "fenced(Expired)".to_owned();
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let mut lines = Vec::new();
+        for (node, restart) in [
+            (owner(None, false), None),
+            (fenced.clone(), None),
+            (fenced.clone(), None),
+            (owner(None, false), None),
+            (fenced.clone(), Some(note)),
+            (owner(None, true), None),
+        ] {
+            let admits = node.admits == Some(true);
+            let reason = not_ready_reason(&node, restart);
+            if let Some(line) = ready_change(&seen, admits, reason.as_ref()) {
+                lines.push(line);
+                seen.ready = admits;
+                if !admits {
+                    seen.reason = reason;
+                }
+            }
+        }
+        assert_eq!(
+            lines,
+            [
+                "not ready: writes not admitted".to_owned(),
+                "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
+                 resume by themselves once the old grant's expiry is proven, so do not restart \
+                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
+                    .to_owned(),
+                format!(
+                    "not ready: writes not admitted: {note}; writes stay stopped for this run: \
+                     to write again, quit and start rdb_dev again"
+                ),
+                "ready".to_owned(),
+            ]
+        );
+    }
+
+    /// Tester W3-D2 and walk 5: after a restart, `Unknown` for a request this session sent
+    /// carries the note, and promises M10 only after the owner's restart or both secondaries'.
+    /// After one secondary's it names the copy that can still resolve it (W5-D1). A request
+    /// never sent, or no restart, stays bare.
+    #[test]
+    fn status_unknown_carries_the_restart_note_and_waits_for_m10_only_when_no_copy_can_resolve() {
+        let note = Some("NOTE");
+        assert_eq!(unknown_line(true, &[], None), "status Unknown");
+        assert_eq!(unknown_line(false, &[NodeId(2)], note), "status Unknown");
+        assert_eq!(
+            unknown_line(true, &[NodeId(2)], note),
+            "status Unknown (not evidence of a lost write: it resolves once node 3, which did \
+             not restart, can take it; NOTE)"
+        );
+        assert_eq!(
+            unknown_line(true, &[NodeId(3)], note),
+            "status Unknown (not evidence of a lost write: it resolves once node 2, which did \
+             not restart, can take it; NOTE)"
+        );
+        let m10 = "status Unknown (not evidence of a lost write: its outcome cannot be known \
+                   until a restarted node rejoins, which is M10; NOTE)";
+        assert_eq!(unknown_line(true, &[NodeId(2), NodeId(3)], note), m10);
+        assert_eq!(unknown_line(true, &[NodeId(1)], note), m10);
+        assert_eq!(unknown_line(true, &[NodeId(1), NodeId(2)], note), m10);
     }
 
     /// F-005, F-006: an open that fails tears the run down as a clean quit does, and without

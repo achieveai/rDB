@@ -487,6 +487,159 @@ mod tests {
         assert_eq!(response.outcome, MutationOutcome::Applied);
     }
 
+    /// A `Db` whose owner restarted (boot 2, no thread) with `grants/1` left by its boot-1
+    /// process, long expired and not frozen: every guard but the store's would clear it.
+    /// Returns the revision the record was written at.
+    fn restarted_owner(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+    ) -> (Db, std::sync::mpsc::Receiver<Msg>, u64) {
+        let (mut owner, mailbox) = crate::host::NodeHandle::unanswered(OWNER);
+        owner.boot = rdb_core::contracts::ids::BootId(BOOT.0 + 1);
+        let held: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = rdb_core::contracts::event::Budgets::SPEC_DEFAULTS;
+        let db = Db::by_hand(
+            vec![owner],
+            held,
+            rt.handle(),
+            crate::db::Timeouts::default(),
+            Some((std::path::PathBuf::new(), budgets)),
+        );
+        let old = GrantRecord {
+            grant: GrantId(1),
+            node: OWNER,
+            boot: BOOT,
+            authority_generation: AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        let written = rt
+            .block_on(store.put(PutRequest {
+                key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+                value: old.encode(),
+                expected_mod_revision: Some(0),
+                dedup: None,
+            }))
+            .expect("put grants/1");
+        (db, mailbox, written.revision)
+    }
+
+    fn grant_revision(store: &dyn ConfigStore, rt: &tokio::runtime::Runtime) -> Option<u64> {
+        rt.block_on(store.get(GetRequest {
+            key: Bytes::from(ControlKey::Grant(OWNER).encode()),
+        }))
+        .expect("get grants/1")
+        .record
+        .map(|found| found.mod_revision)
+    }
+
+    /// Message 6, round-3 mutant M2: the delete names the revision `clear_grant` judged. A write
+    /// to `grants/1` between that read and the delete (here, while the `partitions/` list is
+    /// held) makes the delete lose: `Conflict`, and the moved record stays. The control row:
+    /// the same record with nothing in between clears.
+    /// Unit (~20 ms): `MemStore` behind the scripted list.
+    #[test]
+    fn a_grant_that_moves_after_it_was_judged_is_not_deleted() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store = Scripted::new(Script {
+            hold_lists: 1,
+            ..Script::default()
+        });
+        let (db, _mailbox, written) = restarted_owner(&store, &rt);
+        let moved = rt.block_on(async {
+            let move_it = async {
+                store.list_held.notified().await;
+                let key = Bytes::from(ControlKey::Grant(OWNER).encode());
+                let current = store.mem().get(GetRequest { key: key.clone() }).await;
+                let value = current.expect("get").record.expect("grants/1").value;
+                let moved = store
+                    .mem()
+                    .put(PutRequest {
+                        key,
+                        value,
+                        expected_mod_revision: Some(written),
+                        dedup: None,
+                    })
+                    .await
+                    .expect("move grants/1");
+                store.release_lists();
+                moved.revision
+            };
+            let (clearance, moved) = tokio::join!(clear_grant(&db, &store, OWNER), move_it);
+            assert_eq!(clearance, Ok(Clearance::Conflict));
+            moved
+        });
+        assert_eq!(
+            grant_revision(&store, &rt),
+            Some(moved),
+            "the moved record stays"
+        );
+
+        let store = config_testkit::MemStore::new();
+        let (db, _mailbox, written) = restarted_owner(&store, &rt);
+        assert!(
+            matches!(rt.block_on(clear_grant(&db, &store, OWNER)), Ok(Clearance::Cleared(at)) if at.0 > written)
+        );
+        assert_eq!(grant_revision(&store, &rt), None);
+    }
+
+    /// Message 6, round-3 mutant M3: a `partitions/` list that fails or comes back truncated is
+    /// never read as complete, since a missing record could hide a partition in transfer. Each
+    /// is `UNAVAILABLE` ending "nothing deleted", and `grants/1` stays.
+    /// Unit (~20 ms).
+    #[test]
+    fn a_failed_or_truncated_partition_list_deletes_nothing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let failing = Scripted::new(Script {
+            fail_lists: 1,
+            ..Script::default()
+        });
+        let short = config_testkit::MemStore::with_limits(config_core::Limits {
+            max_list_items: 1,
+            ..config_core::Limits::DEFAULT
+        });
+        for id in [1, 2] {
+            let mut serving = record(1);
+            serving.partition = PartitionId(id);
+            put_at(
+                &short,
+                &rt,
+                ControlKey::Partition(PartitionId(id)),
+                serving.encode(),
+            );
+        }
+        let stores: [(&str, &dyn ConfigStore); 2] = [("failed", &failing), ("truncated", &short)];
+        for (case, store) in stores {
+            let (db, _mailbox, written) = restarted_owner(store, &rt);
+            let error = rt.block_on(clear_grant(&db, store, OWNER)).expect_err(case);
+            assert_eq!(error.kind, ErrorKind::Unavailable, "{case}: {error:?}");
+            assert!(
+                error.detail.ends_with("; nothing deleted"),
+                "{case}: {error:?}"
+            );
+            assert_eq!(grant_revision(store, &rt), Some(written), "{case}");
+        }
+    }
+
+    fn put_at(
+        store: &dyn ConfigStore,
+        rt: &tokio::runtime::Runtime,
+        key: ControlKey,
+        value: Bytes,
+    ) {
+        rt.block_on(store.put(PutRequest {
+            key: Bytes::from(key.encode()),
+            value,
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put");
+    }
+
     /// F-004 (b): only an untouched record of this bootstrap's own is adopted. A record that
     /// has been written since it was created, or one at a later generation (what F1's commit
     /// leaves), is a partition with a history: the bootstrap is refused with the record's

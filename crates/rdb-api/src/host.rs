@@ -1334,7 +1334,8 @@ impl Host {
     /// counted from, absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
     /// publication, and `past_horizon` whether none was left. `would_fence_as` is the reason a
     /// check past the horizon would deny with (`AuthorityView::past_horizon`); it is not a state,
-    /// and is set while the view is still valid.
+    /// and is set while the view is still valid. A healthy view mostly reads
+    /// `ClockSampleStale` here, a reason that never fences (spec §7.2, M12 gate): read `past_horizon` for whether time ran out.
     fn report_view(&mut self, view: &AuthorityView) {
         let at = self.stepped_at;
         let margin_ms = margin_ms(view.valid_through_tick, at);
@@ -4691,7 +4692,8 @@ mod tests {
     /// R1's through-1 re-sends touched copy 2's in D4 (copy 2's own slot takes the put's seq 2).
     /// Level with the head nothing is counted. The first send once behind repeats the last
     /// level one, so it is re-send 1; the `stuck_resends`-th warns, and later ones do not.
-    /// The kernel side is the sim row `m9_d4_00`.
+    /// The kernel side is the sim row `m9_d4_00`. Then a member copy's line names the node and
+    /// boot its configuration pins (Message 6), where the unsent copy's names neither.
     #[config_log::retcd_test]
     fn a_copy_acked_below_the_head_is_reported_once_it_stops_advancing() {
         const METHOD: &str = "a_copy_acked_below_the_head_is_reported_once_it_stops_advancing";
@@ -4751,6 +4753,31 @@ mod tests {
                 &line["resends"]
             ),
             (&UNSENT.0.into(), &1.into(), &2.into(), &1.into(), &3.into()),
+            "{line}"
+        );
+        assert!(
+            line["copy_node"].is_null() && line["copy_boot"].is_null(),
+            "a copy outside the configuration names no member: {line}"
+        );
+
+        // Message 6: a member's line names the node and the boot the configuration pins to it,
+        // so a restarted node (a later boot) reads as the copy that stopped. Copy 1 is node 2.
+        // Its slot holds R1's last level send, so the first send here starts the episode.
+        for _ in 0..4 {
+            trio.nodes[0].0.count_resend(
+                PartitionId(1),
+                Generation(1),
+                CopyId(1),
+                Seq(1),
+                acked_at(1, 1),
+            );
+        }
+        let warned = not_advancing!(METHOD);
+        assert_eq!(warned.len(), 2, "{warned:?}");
+        let line = &warned[1];
+        assert_eq!(
+            (&line["copy"], &line["copy_node"], &line["copy_boot"]),
+            (&1.into(), &2.into(), &BOOT.0.into()),
             "{line}"
         );
     }
@@ -4833,6 +4860,76 @@ mod tests {
             views.iter().any(|line| line["past_horizon"] == true),
             "the fence's view has none: {views:?}"
         );
+    }
+
+    /// The `Acquire` firings queued on `host`, with the tick each is queued for.
+    fn queued_acquires(host: &Host) -> Vec<(Tick, TimerFired)> {
+        host.delayed
+            .iter()
+            .filter_map(|((at, _), item)| match item {
+                Delayed::Event(Queued {
+                    event:
+                        Event {
+                            kind: EventKind::Timer(fired),
+                            ..
+                        },
+                    ..
+                }) if fired.id == AuthorityTimer::Acquire.id() => Some((*at, *fired)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Message 6, round 4 (A-R96 host trigger and status). A node fence queues one `Acquire`
+    /// firing at A1's current `Acquire` timer version, one renewal later: the kernel drops a
+    /// firing older than that version as stale, and without the firing A1 never polls its grant
+    /// and writes never resume. Status says `admits=false` while fenced, though L1 still allows.
+    /// The second fence shows the version is read, not assumed: A1 has re-armed `Acquire`
+    /// since the first, so it is above 0 there. Between them the grant is replaced, so writes
+    /// resume each time.
+    /// Integration (~3 s): bootstrap's discovery window, then two fences on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn each_node_fence_queues_an_acquire_at_the_current_timer_version() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let mut versions = Vec::new();
+        for fence in 1..=2 {
+            trio.mem
+                .failing_with(config_core::ConfigError::Unavailable {
+                    reason: "the control store is down".to_owned(),
+                });
+            let (status, queued, current) = trio.until("node 1 fenced", |trio| {
+                let status = trio.status(0);
+                let host = &trio.nodes[0].0;
+                status.authority.starts_with("fenced").then(|| {
+                    let current = host.authority.timer_version(AuthorityTimer::Acquire);
+                    (status, queued_acquires(host), current)
+                })
+            });
+            assert_eq!(
+                (status.admits, status.protection.as_deref()),
+                (Some(false), Some("healthy")),
+                "fence {fence}: L1 allows, A1 does not: {status:?}"
+            );
+            let [(at, fired)] = queued.as_slice() else {
+                panic!("fence {fence}: one Acquire queued, not {queued:?}");
+            };
+            assert_eq!(fired.version, current, "fence {fence}");
+            assert_eq!(fired.scheduled_at, *at, "fence {fence}");
+            versions.push(current.0);
+
+            trio.mem.stop_failing();
+            trio.until("node 1 holds a grant again", |trio| {
+                (trio.status(0).admits == Some(true)).then_some(())
+            });
+        }
+        assert!(versions[1] > 0, "the second fence's version: {versions:?}");
     }
 
     /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
