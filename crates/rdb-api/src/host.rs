@@ -3929,7 +3929,8 @@ mod tests {
     /// Integration (~3 s): bootstrap's discovery window, then the activation's own deadline.
     #[config_log::retcd_test]
     fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
-        const METHOD: &str = "a_resolving_activation_still_serves_syncs_from_the_pinned_configuration";
+        const METHOD: &str =
+            "a_resolving_activation_still_serves_syncs_from_the_pinned_configuration";
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), Trio::fast);
         trio.links.hold(NodeId(1), NodeId(2));

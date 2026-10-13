@@ -2138,7 +2138,10 @@ mod tests {
         .collect();
         assert_eq!(
             lines,
-            [format!("not ready: writes not admitted: {resolving}"), "ready".to_owned()]
+            [
+                format!("not ready: writes not admitted: {resolving}"),
+                "ready".to_owned()
+            ]
         );
 
         let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[]);
@@ -2153,7 +2156,10 @@ mod tests {
             ))
         );
         let paused = with("held(grant 2)", "ActivationUnresolved", None);
-        assert_eq!(reason(&paused, Some(note)), Some(format!("{note}; {STUCK}")));
+        assert_eq!(
+            reason(&paused, Some(note)),
+            Some(format!("{note}; {STUCK}"))
+        );
         let frozen = with(
             "fenced(Frozen)",
             "ActivationUnresolved",
