@@ -2960,6 +2960,118 @@ fn after_a_fence_an_undecodable_poll_answer_keeps_polling() {
     );
 }
 
+/// Round 6 (the round 5 adjacent item): the read-back after a lost or unknown acquisition is the
+/// only way on from `Unheld` — the CAS answer arms nothing — and its body is one this build cannot
+/// decode. It used to be a `Codec` error, which the host drops for a control answer, so the node
+/// sat `Unheld` with no `Acquire` armed for ever. It is now an unavailable store: logged, and
+/// `Acquire` re-armed one renewal interval on. Two cases: a first acquisition that conflicted, and
+/// a self-replace after a fence whose outcome is unknown. Each re-armed firing acts again.
+#[retcd_test]
+fn an_undecodable_read_back_while_unheld_rearms_the_acquisition() {
+    let garbage = |revision: u64| ReadOutcome::Found {
+        revision: Revision(revision),
+        value: Bytes::from_static(b"not a grant record"),
+    };
+
+    // A first acquisition, lost.
+    let (mut kernel, acquire) = acquiring();
+    kernel
+        .step(
+            &ctx(9),
+            &cas_result(
+                9,
+                5,
+                acquire.request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(3),
+                },
+            ),
+        )
+        .expect("the conflict");
+    let effects = kernel
+        .step(&ctx(10), &grant_read(10, garbage(8)))
+        .expect("an undecodable read-back re-arms; it is not a step error");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(10 + BUDGETS.renew_millis)
+        )],
+        "first acquisition"
+    );
+    assert!(kernel.state().is_unheld());
+    let back = 10 + BUDGETS.renew_millis;
+    let effects = kernel
+        .step(&ctx(back), &acquire_due(&kernel, back, back))
+        .expect("the re-armed firing");
+    assert!(
+        matches!(
+            shapes(&effects).as_slice(),
+            [Shape::Cas { expected: None, .. }]
+        ),
+        "first acquisition: tries again: {effects:?}"
+    );
+
+    // A self-replace after a fence, outcome unknown.
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(PROVEN + 1, PROVEN + 1, request, CasOutcome::Unknown),
+        )
+        .expect("the replace's outcome is unknown");
+    let at = PROVEN + 2;
+    let effects = kernel
+        .step(&sampled_at(at, PROVEN), &grant_read(at, garbage(9)))
+        .expect("an undecodable read-back re-arms; it is not a step error");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(at + BUDGETS.renew_millis)
+        )],
+        "after a replace"
+    );
+    assert!(kernel.state().is_unheld());
+    let back = at + BUDGETS.renew_millis;
+    let effects = kernel
+        .step(&sampled_at(back, back), &acquire_due(&kernel, back, back))
+        .expect("the re-armed firing");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Get(ControlKey::Grant(NODE))],
+        "after a replace: polls again before any write"
+    );
+
+    let logged = own_log_lines(
+        "an_undecodable_read_back_while_unheld_rearms_the_acquisition",
+        "a1.grant_read_back_undecodable",
+    );
+    let seen: Vec<_> = logged
+        .iter()
+        .map(|line| (line["node"].as_u64(), line["revision"].as_u64()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Some(u64::from(NODE.0)), Some(8)),
+            (Some(u64::from(NODE.0)), Some(9))
+        ]
+    );
+}
+
 /// Reviewer F-004/F-016 (round 4 add-on 3): `self_replace_polling` says whether the fenced node
 /// will read its own record again. It holds from the fence through a `NotYet` wait and an
 /// unavailable store, each of which re-arms, and stops once a poll's answer is a record not ours
