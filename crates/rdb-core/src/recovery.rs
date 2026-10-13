@@ -132,6 +132,8 @@ pub enum RecoveryPhase {
     Rebuilding,
     /// The activation CAS is in flight.
     ActivationProposed,
+    /// The activation CAS ended `Unknown` or at its deadline (ruling A-R102, W10-D1).
+    ActivationUnresolved,
     /// Divergence found. Terminal in M7.
     Quarantined,
     /// Automatic recovery stopped. Terminal until a fresh fence.
