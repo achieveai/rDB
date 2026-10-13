@@ -5960,3 +5960,38 @@ fn a_node_fence_never_replaces_recovery_read_only() {
         "the activation re-emit lifts it"
     );
 }
+
+/// Round 8, F-026 (coverage, A-R98 and A-R99): the read-only sticky arm in `TxnKernel::on_freeze`
+/// holds for a node fence only. A partition-scope fence over a read-only recovery replaces the
+/// cause with `AuthorityLost` (`Stays`), and F1's `Active` re-emit of the generation, which lifts
+/// only `RecoveryReadOnly`, leaves T1 frozen. Built against mutant M3b, which dropped the arm's
+/// `FenceScope::Node` condition so the partition fence kept `RecoveryReadOnly` and the re-emit
+/// opened T1.
+#[retcd_test]
+fn a_partition_fence_over_recovery_read_only_survives_the_re_emit() {
+    let mut h = H::live();
+    let g8 = Generation(8);
+    let _ = h.step(recovered(g8, 0, NODE_A, PartitionMode::ReadOnly));
+    let _ = h.step(admission(true, None));
+    let _ = h.step(kernel(KernelEvent::Authority(AuthorityEvent::View(view(
+        g8,
+        2,
+        u64::MAX,
+    )))));
+    let _ = h.step(fence(
+        FenceScope::Partition(PARTITION),
+        DenyReason::GenerationChanged,
+    ));
+    let frozen = QueueMode::Frozen {
+        cause: FreezeCause::AuthorityLost(DenyReason::GenerationChanged),
+        unresolved: None,
+    };
+    assert_eq!(
+        h.k().mode(),
+        &frozen,
+        "the partition fence replaces the cause"
+    );
+    let active = at_revision(recovered(g8, 0, NODE_A, PartitionMode::Active), 3);
+    let _ = h.step(active);
+    assert_eq!(h.k().mode(), &frozen, "the re-emit lifts nothing");
+}

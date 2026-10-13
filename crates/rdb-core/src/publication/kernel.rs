@@ -582,7 +582,9 @@ pub struct PubKernel {
     authority: Option<AuthorityView>,
     mode: PubMode,
     /// What the `Frozen{AuthorityLost}` mode waits for (lead rulings A-R96, A-R97): the same
-    /// record T1 keeps, so the two kernels cannot disagree about a thaw. `None` outside it.
+    /// record T1 keeps, so the two kernels cannot disagree about a thaw. `None` outside it. A re-emit
+    /// of the same lineage clears a `Thaws` record and never a `Stays` one (A-R99, F-028); a new
+    /// lineage clears either (`Self::on_recovered`).
     lost: Option<LostAuthority>,
     /// A lost-authority freeze replaced `Frozen{RecoveryReadOnly}` (lead ruling A-R98 as
     /// amended, F-018): the partition is still read-only underneath. A thaw returns to
@@ -1624,7 +1626,8 @@ impl PubKernel {
     /// - a partition-scope fence, `GenerationChanged` (`classify`, `classify_absent`, an adopt's
     ///   `must_fence`, a superseding snapshot) or `EpochRevoked`: never lifted here in M9, **even
     ///   at the identical lineage** under a new grant. It waits for M10's takeover or rejoin
-    ///   (#42), which arrives as `Recovered`. A later node fence does not make it liftable.
+    ///   (#42), which arrives as `Recovered` for a new lineage. A re-emit of the same lineage does
+    ///   not lift it (lead ruling A-R99, F-028), and neither does a later node fence.
     ///
     /// `LocalStorageFenced`, `Blocked`, `UnresolvedTransaction` and `RecoveryReadOnly` are never
     /// lifted here. Neither a node fence ([`Self::on_freeze`]) nor a deny at `Publication`
@@ -1714,10 +1717,7 @@ impl PubKernel {
     }
 
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
-        // Both branches below set the mode from the recovery, never to `AuthorityLost`, so a
-        // record from before is stale; a sticky `Stays` kept here would refuse a later thaw. The
-        // read-only memory is the recovery's to set, through the mode, so it goes too (A-R98).
-        self.lost = None;
+        // The read-only memory is the recovery's to set, through the mode, so it goes (A-R98).
         self.read_only_under = false;
         // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
         // was published, the candidate pending and the replies owed all belong to this lineage,
@@ -1733,6 +1733,15 @@ impl PubKernel {
             } else {
                 self.move_view()
             };
+            // A re-emit of the lineage frozen by a partition-scope fence lifts nothing (lead
+            // ruling A-R99, F-028): `Stays` waits for M10's takeover or rejoin, which arrives as
+            // a new lineage below. T1 ignores the same re-emit (`TxnKernel::on_reemitted`), so
+            // the two kernels stay frozen together. A `Thaws` record is stale once the mode
+            // comes from the recovery, so it goes.
+            if matches!(self.lost, Some(LostAuthority::Stays)) {
+                return effects;
+            }
+            self.lost = None;
             let mode = recovered_mode(&result.mode);
             if self.mode != mode {
                 self.mode = mode;
@@ -1740,6 +1749,9 @@ impl PubKernel {
             }
             return effects;
         }
+        // A new lineage is the takeover or rejoin a `Stays` waits for, so every record goes, as
+        // T1's new instance starts with none.
+        self.lost = None;
         self.lineage = result.selected.root;
         self.published_seq = result.selected.cutoff_seq;
         self.status.fold_recovered(&result.retained_status_map);

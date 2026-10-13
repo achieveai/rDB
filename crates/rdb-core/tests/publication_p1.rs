@@ -7217,16 +7217,39 @@ fn a_publication_deny_after_a_partition_fence_keeps_it_from_thawing() {
     assert_eq!(rig.view().mode, frozen);
 }
 
-/// Round 7, F-022 (coverage): a recovery sets the mode from its result, so the partition fence's
-/// `Stays` from before it is stale and is dropped. A later node fence is then an ordinary node
-/// fence, and the new grant's view thaws `P`. Built against mutant U2, which kept the record
-/// across `on_recovered`.
+/// Round 7, F-022 (coverage), rebased in round 8 on lead ruling A-R99: F1's re-emit of the same
+/// lineage no longer lifts a partition fence (`a_re_emit_never_lifts_a_partition_fence`), so the
+/// recovery that drops the fence's `Stays` is a new lineage, M10's takeover or rejoin. Its mode
+/// comes from the recovery and the record from before is stale: a later node fence is an
+/// ordinary node fence, and the new grant's view thaws `P`. Built against mutant U2, which kept
+/// the record across `on_recovered`.
 #[retcd_test]
 fn after_a_recovery_a_node_fence_thaws_under_a_new_grant() {
     let mut rig = Rig::new();
+    rig.published(5);
     enter_partition_lost(&mut rig);
-    rig.step(reemitted(PartitionMode::Active, START));
-    assert_eq!(rig.view().mode, PubMode::Serving, "fixture: the re-emit");
+    let effects = rig.step(recovered(PartitionMode::Active, 5, false, None));
+    let (opened, _) = snapshot_ledger(&effects);
+    assert_eq!(opened.len(), 1, "{effects:?}");
+    rig.snapshot.generation = Generation(GEN.0 + 1);
+    rig.snapshot_at(5);
+    rig.step(ready_of(opened[0], 5));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Serving,
+        "fixture: the new lineage"
+    );
+    let lineage = rig.view().lineage;
+    let view_at = |grant, seq| {
+        EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::View(
+            AuthorityView {
+                lineage,
+                grant_id: GrantId(grant),
+                ..authority_view(seq)
+            },
+        )))
+    };
+    rig.step(view_at(1, 3));
     rig.step(fence(FenceScope::Node, DenyReason::Expired));
     assert_eq!(
         rig.view().mode,
@@ -7235,7 +7258,7 @@ fn after_a_recovery_a_node_fence_thaws_under_a_new_grant() {
         },
         "fixture: the node fence"
     );
-    rig.step(view_under(2, 2, u64::MAX));
+    rig.step(view_at(2, 4));
     assert_eq!(rig.view().mode, PubMode::Serving);
 }
 

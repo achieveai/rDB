@@ -142,7 +142,9 @@ pub(crate) enum LostAuthority {
         ended: Option<GrantId>,
     },
     /// A partition-scope fence (`GenerationChanged`, `EpochRevoked`, ...). Never lifted by a
-    /// view in M9 (A-R97): it waits for M10's takeover or rejoin, which comes as `Recovered`.
+    /// view in M9 (A-R97): it waits for M10's takeover or rejoin, which comes as `Recovered` for a
+    /// new generation. F1's re-emit of the same one does not lift it in either kernel (lead ruling
+    /// A-R99, F-028): T1 ignores it (`TxnKernel::on_reemitted`), and P1 keeps the freeze.
     /// Sticky: a later node fence does not make it liftable, and neither does a deny at
     /// `Publication` (P1's quarantine passes the record it holds). It governs publication as well
     /// as the mode (lead ruling A-R98, F-019): while P1 holds it, an `Admit` at `Publication`
