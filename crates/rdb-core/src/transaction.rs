@@ -137,6 +137,9 @@ pub(crate) enum LostAuthority {
     /// `route::event_for` to `Host::push`, in `rdb-api`) and processed in order by `Host::drain`.
     /// Only timers are delayed (`Host::delay`). So such a view reaches this kernel before the
     /// fence, and the freeze then records its grant as `ended`.
+    ///
+    /// F1's re-emit of the same generation does not lift it in either kernel (round 9): only the
+    /// view does, or a new generation.
     Thaws {
         /// The grant id the freeze ended, if a view was held.
         ended: Option<GrantId>,

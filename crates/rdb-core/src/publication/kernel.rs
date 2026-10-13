@@ -583,8 +583,8 @@ pub struct PubKernel {
     mode: PubMode,
     /// What the `Frozen{AuthorityLost}` mode waits for (lead rulings A-R96, A-R97): the same
     /// record T1 keeps, so the two kernels cannot disagree about a thaw. `None` outside it. A re-emit
-    /// of the same lineage clears a `Thaws` record and never a `Stays` one (A-R99, F-028); a new
-    /// lineage clears either (`Self::on_recovered`).
+    /// of the same lineage clears neither record and lifts neither freeze, as in T1 (A-R99, F-028,
+    /// round 9); a new lineage clears either (`Self::on_recovered`).
     lost: Option<LostAuthority>,
     /// A lost-authority freeze replaced `Frozen{RecoveryReadOnly}` (lead ruling A-R98 as
     /// amended, F-018): the partition is still read-only underneath. A thaw returns to
@@ -1717,8 +1717,6 @@ impl PubKernel {
     }
 
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
-        // The read-only memory is the recovery's to set, through the mode, so it goes (A-R98).
-        self.read_only_under = false;
         // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
         // was published, the candidate pending and the replies owed all belong to this lineage,
         // so only the mode changes. The view kept is still the published one: the lineage and
@@ -1733,15 +1731,35 @@ impl PubKernel {
             } else {
                 self.move_view()
             };
-            // A re-emit of the lineage frozen by a partition-scope fence lifts nothing (lead
-            // ruling A-R99, F-028): `Stays` waits for M10's takeover or rejoin, which arrives as
-            // a new lineage below. T1 ignores the same re-emit (`TxnKernel::on_reemitted`), so
-            // the two kernels stay frozen together. A `Thaws` record is stale once the mode
-            // comes from the recovery, so it goes.
-            if matches!(self.lost, Some(LostAuthority::Stays)) {
+            // A re-emit of the lineage lifts no `AuthorityLost` freeze (lead rulings A-R99,
+            // F-028, and round 9), as T1 lifts none (`TxnKernel::on_reemitted`): a re-delivery
+            // would otherwise serve reads with the grant lost. Only a new grant's view (`Thaws`,
+            // `Self::thaw`) or a new lineage below lifts it, and `Stays` waits for the latter,
+            // M10's takeover or rejoin — even when a `Blocked` replaced the freeze's mode. What an
+            // activation re-emit does change is the read-only state underneath (A-R98 as
+            // amended): it ends, as T1's `RecoveryReadOnly` opens, so the thaw reaches `Serving`.
+            let frozen_lost = matches!(
+                self.mode,
+                PubMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_)
+                }
+            );
+            if frozen_lost || matches!(self.lost, Some(LostAuthority::Stays)) {
+                if frozen_lost
+                    && matches!(
+                        result.mode,
+                        PartitionMode::Active | PartitionMode::DegradedRf2
+                    )
+                {
+                    self.read_only_under = false;
+                }
                 return effects;
             }
+            // The mode comes from the recovery, so no record from before applies (`lost` is
+            // `None` outside `Frozen{AuthorityLost}`), and the read-only memory is the
+            // recovery's to set, through the mode (A-R98).
             self.lost = None;
+            self.read_only_under = false;
             let mode = recovered_mode(&result.mode);
             if self.mode != mode {
                 self.mode = mode;
@@ -1752,6 +1770,7 @@ impl PubKernel {
         // A new lineage is the takeover or rejoin a `Stays` waits for, so every record goes, as
         // T1's new instance starts with none.
         self.lost = None;
+        self.read_only_under = false;
         self.lineage = result.selected.root;
         self.published_seq = result.selected.cutoff_seq;
         self.status.fold_recovered(&result.retained_status_map);
