@@ -2606,30 +2606,33 @@ impl Authority {
     ///   `ReadOk{Some(rec)}` rows only. Absent means the key is free and unavailable means the
     ///   store cannot say; neither widens anything, and without the retry the node would never
     ///   try again.
-    ///
-    /// # Errors
-    ///
-    /// `Unavailable` naming [`Capability::Codec`] when the body is not a [`GrantRecord`], as for
-    /// the held read-back.
+    /// * A body this build cannot decode: treated as the store unavailable, and logged as
+    ///   `a1.grant_read_back_undecodable`. A retry, as for the fenced poll. Never a step error:
+    ///   the CAS answer that sent this read armed nothing, and the host drops an `Unavailable`
+    ///   from a module that is not a control answer's named consumer, so an error here left the
+    ///   node `Unheld` with nothing armed (M9 S2b-E round 6).
     fn on_unheld_grant_read(
         &mut self,
         ctx: &StepCtx<'_>,
         event: &Event,
         outcome: &ReadOutcome,
-    ) -> Result<Vec<Effect>, RdbError> {
+    ) -> Vec<Effect> {
         let after_fence = self.after_fence;
         let ReadOutcome::Found { revision, value } = outcome else {
             if after_fence.is_some() && matches!(outcome, ReadOutcome::Absent { .. }) {
                 // After a fence an absent record is not a free key to take (A-R96).
-                return Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]);
+                return vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)];
             }
-            return Ok(vec![self.acquire_retry(ctx, event)]);
+            return vec![self.acquire_retry(ctx, event)];
         };
         let Some(record) = GrantRecord::decode(value) else {
-            return Err(RdbError::unavailable(
-                Capability::Codec,
-                "authority: grants/{node} body is not a GrantRecord this build can read",
-            ));
+            tracing::warn!(
+                node = ctx.node.0,
+                revision = revision.0,
+                bytes = value.len(),
+                "a1.grant_read_back_undecodable"
+            );
+            return vec![self.acquire_retry(ctx, event)];
         };
         // M1 (A-R96): after a fence, never back to the grant id the fence ended, however valid
         // the record naming it reads — a renewal dispatched before the fence can land after it.
@@ -2642,7 +2645,7 @@ impl Authority {
             clock::renewed_at_for(&self.clock, record.expiry_utc_ms, ctx.now, ctx.budgets);
         match renewed_at {
             Some(renewed_at) if adoptable => {
-                Ok(self.enter_held(ctx, event, &record, *revision, renewed_at))
+                self.enter_held(ctx, event, &record, *revision, renewed_at)
             }
             // After a fence: replace when proven, wait while not, stop when it is not ours.
             _ if after_fence.is_some() => {
@@ -2654,12 +2657,12 @@ impl Authority {
                     ctx.now,
                     ctx.budgets,
                 );
-                Ok(self.after_fence_effects(ctx, event, verdict, *revision))
+                self.after_fence_effects(ctx, event, verdict, *revision)
             }
-            _ => Ok(vec![
+            _ => vec![
                 Self::ignored(event, AuthorityIgnoreReason::NotOurs),
                 self.acquire_retry(ctx, event),
-            ]),
+            ],
         }
     }
 
@@ -2941,7 +2944,7 @@ impl Authority {
         outcome: &ReadOutcome,
     ) -> Result<Vec<Effect>, RdbError> {
         if self.state.is_unheld() {
-            return self.on_unheld_grant_read(ctx, event, outcome);
+            return Ok(self.on_unheld_grant_read(ctx, event, outcome));
         }
         let Some(identity) = self.state.held().map(Held::identity) else {
             // `Fenced`. Its way out is the self-replace (lead ruling A-R96): the answer to the
