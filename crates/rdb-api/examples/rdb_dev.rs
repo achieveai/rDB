@@ -1233,11 +1233,7 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
                 .iter()
                 .find(|node| node.node == NodeId(1))
                 .map(|owner| owner.in_flight == Some(RequestId(request)));
-            let restarted: Vec<NodeId> = nodes
-                .iter()
-                .filter(|node| node.boot != rdb_api::host::BOOT)
-                .map(|node| node.node)
-                .collect();
+            let restarted = restarted_nodes(|node| db.boot_of(node));
             let note = db.restart_note();
             let ours = sent.by_id.contains_key(&request);
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
@@ -1246,6 +1242,17 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
     }
     Ok(())
+}
+
+/// The nodes that restarted, from each node's boot (`boot_of`), never from the nodes that
+/// answered `node_status`: that leaves out a node whose restart failed, and `status` of a write
+/// in flight then said it waits for M10 while the other secondary could still take it.
+fn restarted_nodes(boot_of: impl Fn(NodeId) -> Option<BootId>) -> Vec<NodeId> {
+    [1, 2, 3]
+        .map(NodeId)
+        .into_iter()
+        .filter(|&node| boot_of(node).is_some_and(|boot| boot != rdb_api::host::BOOT))
+        .collect()
 }
 
 /// `status Unknown`, with the restart note when there is one, unless this session never sent
@@ -2169,6 +2176,33 @@ mod tests {
             unknown_line(true, None, &[NodeId(1)], note),
             "status Unknown (not evidence of a lost write: its outcome cannot be known until a \
              restarted node rejoins, which is M10; NOTE)"
+        );
+    }
+
+    /// Msg 9 adjacent defect: `node_status` leaves out a node whose restart failed (SF), so a
+    /// restart set built from it missed node 2, and `status` of a write in flight said it waits
+    /// for M10 although node 3, which did not restart, can still take it. The set comes from
+    /// each node's boot, answered or not. Unit; walk w13 (r9/walks) shows it live.
+    #[test]
+    fn a_failed_secondary_restart_counts_as_restarted_for_status() {
+        // Node 2's restart failed: it answers no `node_status`, but its boot moved on.
+        let boots = |node: NodeId| {
+            Some(if node == NodeId(2) {
+                BootId(2)
+            } else {
+                BootId(1)
+            })
+        };
+        let restarted = restarted_nodes(boots);
+        assert_eq!(
+            restarted,
+            [NodeId(2)],
+            "node 2 did not answer: its restart failed"
+        );
+        assert_eq!(
+            unknown_line(true, Some(true), &restarted, Some("NOTE")),
+            "status Unknown (not evidence of a lost write: it resolves once node 3, which did \
+             not restart, can take it; NOTE)"
         );
     }
 
