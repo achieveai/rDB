@@ -3806,6 +3806,10 @@ impl Authority {
     /// [`StorageFault::WriteFailed`]'s own doc says the same — so the grant stays held and every
     /// other partition keeps serving (ADR-rdb-0007 §3, Scope column).
     ///
+    /// The partition goes into `storage_fenced` in every state (lead ruling A-R98, F-017). Only
+    /// a `Held` node also emits the partition fence; otherwise there is no view to supersede and
+    /// the answer is [`AuthorityIgnoreReason::StaleAuthorityView`].
+    ///
     /// # Errors
     ///
     /// The other four [`StorageEvent`] variants are T1's and L1's completions, not A1's, and they
@@ -3828,21 +3832,24 @@ impl Authority {
                 AuthorityIgnoreReason::StaleAuthorityView,
             )]);
         }
+        // Recorded whatever the state (lead ruling A-R98, F-017): the failure is a fact about
+        // this disk for the rest of the boot, and the record only ever narrows writes. A fault
+        // that lands on the step whose `revalidate` fenced the node reaches here `Fenced`, and
+        // without the record a same-boot self-replace would admit the partition again.
+        let partition = event.partition;
+        self.storage_fenced.insert(partition);
         if !self.state.is_held() {
             return Ok(vec![Self::ignored(
                 event,
                 AuthorityIgnoreReason::StaleAuthorityView,
             )]);
         }
-        let partition = event.partition;
-        let effects = self.fence(
+        Ok(self.fence(
             ctx,
             event,
             FenceScope::Partition(partition),
             DenyReason::LocalStorageFenced,
-        );
-        self.storage_fenced.insert(partition);
-        Ok(effects)
+        ))
     }
 
     /// One of A1's own events, delivered on kernel-a's arm (lead ruling A-R25).

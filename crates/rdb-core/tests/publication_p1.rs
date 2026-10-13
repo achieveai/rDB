@@ -7046,17 +7046,16 @@ fn a_node_fence_before_any_view_thaws_on_the_first_admitting_view() {
     }
 }
 
-/// Round 7, F-018 (A-R98 N2): a read-only recovery is lifted only by F1's re-emit of the lineage
-/// as `Active`, never by a view. A node fence while read-only must not replace the cause with
-/// `AuthorityLost`, which the new grant's view would thaw to `Serving`. The re-emit still lifts it.
+/// Round 7, F-018 (A-R98 N2, amended to option R): a read-only recovery is lifted only by F1's
+/// re-emit of the lineage as `Active`, never by a view. A node fence while read-only still moves
+/// P1 to `Frozen{AuthorityLost}`, so reads are refused while authority is lost (A-R72 row 4), but
+/// P1 remembers the read-only state underneath it: the new grant's view thaws back to
+/// `RecoveryReadOnly`, never `Serving`. The re-emit still lifts it.
 #[retcd_test]
 fn a_node_fence_never_replaces_recovery_read_only() {
     let mut rig = Rig::new();
     gate_read_only(&mut rig);
     let lineage = rig.view().lineage;
-    let frozen = PubMode::Frozen {
-        cause: FreezeCause::RecoveryReadOnly,
-    };
     rig.step(EventKind::Kernel(KernelEvent::Authority(
         AuthorityEvent::View(AuthorityView {
             lineage,
@@ -7065,7 +7064,13 @@ fn a_node_fence_never_replaces_recovery_read_only() {
         }),
     )));
     rig.step(fence(FenceScope::Node, DenyReason::Expired));
-    assert_eq!(rig.view().mode, frozen, "the node fence keeps the cause");
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired)
+        },
+        "the node fence freezes reads, as A-R72 row 4 requires"
+    );
     rig.step(EventKind::Kernel(KernelEvent::Authority(
         AuthorityEvent::View(AuthorityView {
             lineage,
@@ -7075,8 +7080,10 @@ fn a_node_fence_never_replaces_recovery_read_only() {
     )));
     assert_eq!(
         rig.view().mode,
-        frozen,
-        "the new grant's view lifts nothing"
+        PubMode::Frozen {
+            cause: FreezeCause::RecoveryReadOnly
+        },
+        "the new grant's view thaws back to read-only, never to Serving"
     );
     rig.step(recovered(PartitionMode::Active, 5, false, None));
     assert_eq!(rig.view().mode, PubMode::Serving, "the re-emit lifts it");
@@ -7169,4 +7176,136 @@ fn a_deferred_write_is_not_asked_again_while_lost_authority_stays() {
     assert_eq!(view.published.seq, Seq(START));
     assert!(view.pending.is_some(), "the write stays pending");
     assert_eq!(view.mode, frozen);
+}
+
+/// Round 7, F-021 (coverage, A-R97): a deny at `Publication` after a partition fence quarantines
+/// the write and keeps the partition fence's `Stays`, so the new grant's view of the identical
+/// lineage neither thaws `P` nor asks the quarantined write again. Built against mutant U1, which
+/// passed no prior record into the quarantine's `at_freeze`.
+#[retcd_test]
+fn a_publication_deny_after_a_partition_fence_keeps_it_from_thawing() {
+    let mut rig = Rig::new();
+    rig.step(candidate(5, 5));
+    enter_partition_lost(&mut rig);
+    rig.qualify(5);
+    let c = publication_check(&rig.step(gained(5)));
+    let effects = rig.step(answer(
+        Checkpoint::Publication,
+        c,
+        Verdict::Deny(DenyReason::Expired),
+    ));
+    assert!(effects.contains(&quarantined(5)), "fixture: {effects:?}");
+    let frozen = rig.view().mode;
+    assert_eq!(
+        rig.step(view_under(2, 2, u64::MAX)),
+        vec![],
+        "no thaw, no Publication check"
+    );
+    assert_eq!(rig.view().mode, frozen);
+}
+
+/// Round 7, F-022 (coverage): a recovery sets the mode from its result, so the partition fence's
+/// `Stays` from before it is stale and is dropped. A later node fence is then an ordinary node
+/// fence, and the new grant's view thaws `P`. Built against mutant U2, which kept the record
+/// across `on_recovered`.
+#[retcd_test]
+fn after_a_recovery_a_node_fence_thaws_under_a_new_grant() {
+    let mut rig = Rig::new();
+    enter_partition_lost(&mut rig);
+    rig.step(reemitted(PartitionMode::Active, START));
+    assert_eq!(rig.view().mode, PubMode::Serving, "fixture: the re-emit");
+    rig.step(fence(FenceScope::Node, DenyReason::Expired));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired)
+        },
+        "fixture: the node fence"
+    );
+    rig.step(view_under(2, 2, u64::MAX));
+    assert_eq!(rig.view().mode, PubMode::Serving);
+}
+
+/// Round 7, F-018 as amended (option R), must-show 1: a read check in flight across a node fence
+/// over a read-only partition serves nothing when its `Admit` arrives after the new grant's view
+/// thawed P1 back to `RecoveryReadOnly`. The answer was decided under the view held before the
+/// fence, older than the one P1 holds now, so it decides no read (A-R72 row 5): it re-asks.
+#[retcd_test]
+fn an_admit_decided_before_the_fence_serves_nothing_after_the_thaw_to_read_only() {
+    let mut rig = Rig::new();
+    gate_read_only(&mut rig);
+    let lineage = rig.view().lineage;
+    let view_at = |grant, seq| {
+        EventKind::Kernel(KernelEvent::Authority(AuthorityEvent::View(
+            AuthorityView {
+                lineage,
+                grant_id: GrantId(grant),
+                ..authority_view(seq)
+            },
+        )))
+    };
+    rig.step(view_at(1, 3));
+    let c = rig.ask(read(41));
+    rig.step(fence(FenceScope::Node, DenyReason::Expired));
+    rig.step(view_at(2, 4));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::RecoveryReadOnly
+        },
+        "fixture: thawed back to read-only"
+    );
+    let effects = rig.step(answer_in(lineage, Checkpoint::Read, c, Verdict::Admit, 3));
+    assert_eq!(
+        effects.first(),
+        Some(&ignored(AuthorityIgnoreReason::StaleAuthorityAnswer)),
+        "{effects:?}"
+    );
+    let again = read_check(&effects[1..]);
+    assert_ne!(again, c, "asked again under a new correlation");
+}
+
+/// Round 7, F-018 as amended (option R), must-show 2: P1's quarantine keeps the read-only memory.
+/// A write pending when F1 re-emits the lineage read-only, then a node fence, then a deny at
+/// `Publication` under the new grant: the quarantine replaces the cause with `AuthorityLost`
+/// but must not forget that the partition is read-only underneath. So a later `Admit` under a
+/// newer grant publishes nothing, and P1 never reaches `Serving` without F1's re-emit.
+#[retcd_test]
+fn a_quarantine_under_a_fence_keeps_the_partition_read_only_underneath() {
+    let mut rig = Rig::new();
+    rig.pending_with_recheck(5);
+    rig.step(reemitted(PartitionMode::ReadOnly, START));
+    rig.step(fence(FenceScope::Node, DenyReason::Expired));
+    let c2 = publication_check(&rig.step(view_under(2, 2, u64::MAX)));
+    let mut deny = decision(
+        P,
+        Checkpoint::Publication,
+        c2,
+        Verdict::Deny(DenyReason::Expired),
+        2,
+    );
+    deny.grant = GrantId(2);
+    let effects = rig.step(EventKind::Kernel(KernelEvent::Authority(
+        AuthorityEvent::Answer(deny),
+    )));
+    assert!(effects.contains(&quarantined(5)), "fixture: {effects:?}");
+    let c3 = publication_check(&rig.step(view_under(3, 3, u64::MAX)));
+    let mut admit = decision(P, Checkpoint::Publication, c3, Verdict::Admit, 3);
+    admit.grant = GrantId(3);
+    rig.snapshot_at(5);
+    let effects = rig.step(EventKind::Kernel(KernelEvent::Authority(
+        AuthorityEvent::Answer(admit),
+    )));
+    assert!(
+        !published_any(&effects),
+        "read-only: not published: {effects:?}"
+    );
+    rig.step(view_under(3, 4, u64::MAX));
+    let view = rig.view();
+    assert_eq!(view.published.seq, Seq(START));
+    assert_ne!(
+        view.mode,
+        PubMode::Serving,
+        "only F1's re-emit reaches Serving"
+    );
 }

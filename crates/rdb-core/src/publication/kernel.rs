@@ -584,6 +584,11 @@ pub struct PubKernel {
     /// What the `Frozen{AuthorityLost}` mode waits for (lead rulings A-R96, A-R97): the same
     /// record T1 keeps, so the two kernels cannot disagree about a thaw. `None` outside it.
     lost: Option<LostAuthority>,
+    /// A lost-authority freeze replaced `Frozen{RecoveryReadOnly}` (lead ruling A-R98 as
+    /// amended, F-018): the partition is still read-only underneath. A thaw returns to
+    /// `RecoveryReadOnly`, never `Serving`, and an `Admit` publishes nothing. Only
+    /// [`Self::on_recovered`] clears it.
+    read_only_under: bool,
     next_correlation: u64,
     next_timer_version: u64,
     /// Invariant: when `Some`, storage bound it at [`Self::published`].
@@ -613,6 +618,7 @@ impl PubKernel {
             authority: None,
             mode: PubMode::Serving,
             lost: None,
+            read_only_under: false,
             next_correlation: 0,
             next_timer_version: 0,
             kept: None,
@@ -1090,6 +1096,14 @@ impl PubKernel {
             Verdict::Admit => None,
         };
         let Some(reason) = deny else {
+            // A-R97 covers publication, not only the mode (lead ruling A-R98, F-019). While a
+            // partition fence's lost authority `Stays`, an `Admit` under the identical lineage
+            // does not prove no takeover happened, so the write is neither published nor
+            // quarantined: it stays pending until M10's takeover or rejoin.
+            if matches!(self.lost, Some(LostAuthority::Stays)) {
+                pending.recheck = None;
+                return vec![PubEffect::Fact(PubFact::PublishDeferred)];
+            }
             match &self.mode {
                 PubMode::Blocked { .. } => {
                     pending.recheck = None;
@@ -1098,6 +1112,13 @@ impl PubKernel {
                 PubMode::Frozen {
                     cause: FreezeCause::RecoveryReadOnly,
                 } => {
+                    pending.recheck = None;
+                    return vec![PubEffect::Fact(PubFact::PublishDeferred)];
+                }
+                // Read-only underneath a lost-authority freeze (A-R98 as amended, F-018).
+                PubMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_),
+                } if self.read_only_under => {
                     pending.recheck = None;
                     return vec![PubEffect::Fact(PubFact::PublishDeferred)];
                 }
@@ -1126,12 +1147,14 @@ impl PubKernel {
         // `Blocked` is sticky under a publication deny (K-A-48), and so is a storage fence: it
         // holds for the rest of the generation (spec §5.2 step 3, ADR-rdb-0007 §3), and the
         // `AuthorityLost` that replaced it would thaw on a new grant's view (M9 S2b-E round 5,
-        // the same rule as `on_freeze`).
+        // the same rule as `on_freeze`). So is a read-only recovery, which only F1's re-emit
+        // lifts (lead ruling A-R98, F-018). A quarantine under a fence that already replaced it
+        // leaves `read_only_under` set, so the thaw still returns to read-only (A-R98 as amended).
         let sticky = matches!(
             self.mode,
             PubMode::Blocked { .. }
                 | PubMode::Frozen {
-                    cause: FreezeCause::LocalStorageFenced
+                    cause: FreezeCause::LocalStorageFenced | FreezeCause::RecoveryReadOnly
                 }
         );
         if !sticky {
@@ -1526,6 +1549,19 @@ impl PubKernel {
             ) => FreezeCause::LocalStorageFenced,
             _ => cause,
         };
+        // A read-only recovery is lifted only by F1's re-emit of the lineage (`on_recovered`).
+        // Unlike T1, P1 serves reads while read-only, so a fence still moves it to
+        // `Frozen{AuthorityLost}` and every read is refused by the mode (A-R72 row 4); the
+        // read-only state is remembered underneath it instead, so no view lifts it to `Serving`
+        // (lead ruling A-R98 as amended, F-018).
+        if matches!(cause, FreezeCause::AuthorityLost(_))
+            && self.mode
+                == (PubMode::Frozen {
+                    cause: FreezeCause::RecoveryReadOnly,
+                })
+        {
+            self.read_only_under = true;
+        }
         if matches!(cause, FreezeCause::AuthorityLost(_)) {
             self.lost = Some(LostAuthority::at_freeze(
                 matches!(scope, FenceScope::Partition(_)),
@@ -1554,7 +1590,11 @@ impl PubKernel {
         // per A1 step through an outage — one check per step, bounded, and never a ping-pong,
         // because a step's view is queued before its answer. Otherwise the freeze lifts here
         // when nothing is pending.
+        //
+        // Nothing is asked while the lost authority `Stays` (lead ruling A-R98, F-019): no answer
+        // could publish the write then, and `on_publication_answer` would refuse it.
         let ask = self.pending.as_ref().is_some_and(|p| p.recheck.is_none())
+            && !matches!(self.lost, Some(LostAuthority::Stays))
             && (self.pending.as_ref().is_some_and(|p| p.deferred) || self.thaw_view(now));
         if !ask {
             return self.thaw(now);
@@ -1587,7 +1627,19 @@ impl PubKernel {
     ///   (#42), which arrives as `Recovered`. A later node fence does not make it liftable.
     ///
     /// `LocalStorageFenced`, `Blocked`, `UnresolvedTransaction` and `RecoveryReadOnly` are never
-    /// lifted here.
+    /// lifted here. Neither a node fence ([`Self::on_freeze`]) nor a deny at `Publication`
+    /// ([`Self::on_publication_answer`]'s quarantine) replaces `LocalStorageFenced` or `Blocked`
+    /// with `AuthorityLost`, and the quarantine does not replace `RecoveryReadOnly` either.
+    ///
+    /// A fence over `RecoveryReadOnly` does replace it with `Frozen{AuthorityLost}`, so every
+    /// read is refused while authority is lost (A-R72). The read-only state is remembered
+    /// underneath (`read_only_under`): [`Self::thaw`] then returns to `Frozen{RecoveryReadOnly}`,
+    /// never `Serving`, and an `Admit` publishes nothing meanwhile. Only F1's re-emit of the
+    /// lineage ([`Self::on_recovered`]) clears that memory and reaches `Serving` (lead ruling
+    /// A-R98 as amended, option R; F-018).
+    ///
+    /// While the lost authority `Stays`, a pending write is not published either, and a deferred
+    /// one is not asked again (lead ruling A-R98, F-019).
     ///
     /// Why an admitting view under the ended grant cannot arrive after the fence, reordered, so
     /// that `ended: None` (C02) never lifts on it, is on [`LostAuthority::Thaws`] (M9 S2b-E round
@@ -1611,11 +1663,21 @@ impl PubKernel {
     /// Lift a lost-authority freeze when [`Self::thaw_view`] holds and nothing is pending: every
     /// applied seq is then published, so the chain continues. Drains the waiters, as every mode
     /// transition does (K-A-14).
+    ///
+    /// A partition read-only underneath the freeze thaws back to `Frozen{RecoveryReadOnly}`,
+    /// never `Serving`; only [`Self::on_recovered`] reaches `Serving` from there (lead ruling
+    /// A-R98 as amended, F-018).
     fn thaw(&mut self, now: Tick) -> Vec<PubEffect> {
         if self.pending.is_some() || !self.thaw_view(now) {
             return Vec::new();
         }
-        self.mode = PubMode::Serving;
+        self.mode = if self.read_only_under {
+            PubMode::Frozen {
+                cause: FreezeCause::RecoveryReadOnly,
+            }
+        } else {
+            PubMode::Serving
+        };
         self.lost = None;
         self.drain_waiters()
     }
@@ -1653,8 +1715,10 @@ impl PubKernel {
 
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
         // Both branches below set the mode from the recovery, never to `AuthorityLost`, so a
-        // record from before is stale; a sticky `Stays` kept here would refuse a later thaw.
+        // record from before is stale; a sticky `Stays` kept here would refuse a later thaw. The
+        // read-only memory is the recovery's to set, through the mode, so it goes too (A-R98).
         self.lost = None;
+        self.read_only_under = false;
         // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
         // was published, the candidate pending and the replies owed all belong to this lineage,
         // so only the mode changes. The view kept is still the published one: the lineage and

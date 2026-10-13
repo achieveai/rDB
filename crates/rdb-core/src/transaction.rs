@@ -143,7 +143,11 @@ pub(crate) enum LostAuthority {
     },
     /// A partition-scope fence (`GenerationChanged`, `EpochRevoked`, ...). Never lifted by a
     /// view in M9 (A-R97): it waits for M10's takeover or rejoin, which comes as `Recovered`.
-    /// Sticky: a later node fence does not make it liftable.
+    /// Sticky: a later node fence does not make it liftable, and neither does a deny at
+    /// `Publication` (P1's quarantine passes the record it holds). It governs publication as well
+    /// as the mode (lead ruling A-R98, F-019): while P1 holds it, an `Admit` at `Publication`
+    /// publishes nothing and quarantines nothing (`on_publication_answer`), and a view asks no
+    /// deferred write again (`on_view`), so the write stays pending.
     Stays,
 }
 
@@ -1393,7 +1397,9 @@ impl TxnKernel {
     ///
     /// With nothing unresolved every applied seq is published, so `next_seq` and `prev_digest`
     /// continue the chain. `LocalStorageFenced`, `UnresolvedTransaction` and `RecoveryReadOnly`
-    /// are never lifted here.
+    /// are never lifted here, and a node fence replaces neither `LocalStorageFenced` nor
+    /// `RecoveryReadOnly` with `AuthorityLost` ([`Self::on_freeze`]), so no view lifts them by
+    /// that route either. Only `on_reemitted` lifts `RecoveryReadOnly` (lead ruling A-R98, F-018).
     ///
     /// T1 never records `ended: None`: an instance is built from `Recovered` holding its view.
     /// Why an admitting view under the ended grant cannot arrive after the fence, reordered, is on
@@ -1430,6 +1436,10 @@ impl TxnKernel {
         // A storage fence holds for the rest of the generation (spec §5.2 step 3, ADR-rdb-0007
         // §3), so a later loss of authority never replaces it: a new grant's view would then
         // lift a freeze that must hold (M9 S2b-E round 4).
+        //
+        // A read-only recovery is lifted only by F1's activation re-emit (`on_reemitted`), so a
+        // node fence never replaces it either (lead ruling A-R98, F-018). A partition-scope fence
+        // still does: its `AuthorityLost` `Stays`, which nothing lifts in M9, re-emit included.
         let cause = match (self.mode, cause) {
             (
                 QueueMode::Frozen {
@@ -1438,6 +1448,13 @@ impl TxnKernel {
                 },
                 FreezeCause::AuthorityLost(_),
             ) => FreezeCause::LocalStorageFenced,
+            (
+                QueueMode::Frozen {
+                    cause: FreezeCause::RecoveryReadOnly,
+                    ..
+                },
+                FreezeCause::AuthorityLost(_),
+            ) if matches!(scope, FenceScope::Node) => FreezeCause::RecoveryReadOnly,
             _ => cause,
         };
         let mut out = Vec::new();
