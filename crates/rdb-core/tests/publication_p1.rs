@@ -7087,6 +7087,19 @@ fn a_node_fence_never_replaces_recovery_read_only() {
     );
     rig.step(recovered(PartitionMode::Active, 5, false, None));
     assert_eq!(rig.view().mode, PubMode::Serving, "the re-emit lifts it");
+    rig.step(fence(FenceScope::Node, DenyReason::Expired));
+    rig.step(EventKind::Kernel(KernelEvent::Authority(
+        AuthorityEvent::View(AuthorityView {
+            lineage,
+            grant_id: GrantId(3),
+            ..authority_view(5)
+        }),
+    )));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Serving,
+        "the re-emit cleared the memory: a later node fence thaws to Serving"
+    );
 }
 
 /// Round 7, F-018 (A-R98 N2), the quarantine half: a deny at `Publication` while read-only
