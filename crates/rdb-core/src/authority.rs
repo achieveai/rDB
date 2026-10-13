@@ -1061,6 +1061,21 @@ impl Authority {
         self.state.is_fenced() && self.after_fence.is_some_and(|after| !after.stopped)
     }
 
+    /// Whether the self-replace (lead ruling A-R96) has stopped for good: a read of this node's
+    /// own grant record answered [`SelfReplace::Never`] (another boot, another authority
+    /// generation, or frozen) or, while `Fenced`, found it absent. Nothing re-arms after it, so
+    /// A1 will not try for authority again on its own. In **any** state: unlike
+    /// [`Self::self_replace_polling`], it also reads `true` when the stop landed while `Unheld`
+    /// mid self-replace — the replace CAS conflicted and its read-back found the record frozen —
+    /// where nothing else public says A1 stopped trying (W8-D1).
+    ///
+    /// Cleared only by what clears the after-fence record: a later node fence re-seeds it with
+    /// polling live ([`Self::fence`]), and adopting a grant (`Held`) drops it.
+    #[must_use]
+    pub fn self_replace_stopped(&self) -> bool {
+        self.after_fence.is_some_and(|after| after.stopped)
+    }
+
     /// How long the `attempt`-th consecutive capacity refusal waits before re-watching.
     ///
     /// [`WATCH_BACKOFF_BASE_MILLIS`] doubled per refusal, saturating at

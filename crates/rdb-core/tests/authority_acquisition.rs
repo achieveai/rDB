@@ -3225,6 +3225,61 @@ fn after_a_fence_a_conflicting_replace_never_writes_over_a_record_not_ours() {
     }
 }
 
+/// Round 8, W8-D1: a freeze lands while `Unheld` mid self-replace. The replace conflicts, the
+/// read-back finds the record frozen, and the `Never` verdict stops the self-replace. The node is
+/// not `Fenced`, so `self_replace_polling` cannot say so; `self_replace_stopped` does, so the
+/// host can tell the user writes will not come back on their own.
+#[retcd_test]
+fn a_freeze_while_unheld_mid_self_replace_reports_the_self_replace_stopped() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    assert!(!kernel.self_replace_stopped(), "fenced: still polling");
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(
+                PROVEN + 1,
+                PROVEN + 1,
+                request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(8),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    assert!(
+        kernel.state().is_unheld(),
+        "fixture: unheld mid self-replace"
+    );
+    assert!(!kernel.self_replace_stopped(), "fixture: not stopped yet");
+    let mut frozen = our_record(fenced, e_new_at(5));
+    frozen.frozen = true;
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &grant_read(PROVEN + 2, found(8, &frozen)),
+        )
+        .expect("the read-back");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+        "fixture: Never"
+    );
+    assert!(kernel.state().is_unheld());
+    assert!(
+        !kernel.self_replace_polling(),
+        "not fenced, so polling says nothing"
+    );
+    assert!(kernel.self_replace_stopped(), "A1 stopped trying");
+}
+
 /// Critic A5 (A-R96): a read of our record lands while the replace CAS is in flight. It records
 /// nothing: when the replace then conflicts and the read-back is not yet proven, the next firing
 /// polls again rather than CASing at the revision the in-flight read saw.
