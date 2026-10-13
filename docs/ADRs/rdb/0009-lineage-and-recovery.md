@@ -371,6 +371,10 @@ only that CAS's `Committed` activates — a read alone never does. Any other rec
 as a conflict's re-read is: a newer epoch is `OvertakenByPeer`, anything else `CasContention`.
 One request is outstanding at a time; a timer fire abandons an unanswered one and reads again;
 `Unavailable` and `Unknown` wait for the next fire. A fence with a newer root enters at once.
+**Addendum (Round 13):** a definitive `Unavailable` on the activation exchange resolves the same
+way — it proves the CAS did not apply, and it waits for the exchange's own fire before reading —
+and a fence held behind the activation whose re-entry is refused leaves F1 resolving, not
+`Blocked`. Only the recovery CAS still blocks on `Unavailable` or `Unknown`.
 Safety rests on the exact-revision CAS and the linearizable read: after our commit no recoverer
 can write our bytes, and a takeover first needs a non-`Serving` record (A-R51), which changes them.
 The recovery CAS cannot be resolved this way: `PartitionRecord` binds no run id or cutoff, so our
@@ -498,7 +502,7 @@ consumer does not handle.
 | Failure recorded before a shorter prefix is chosen | Effect-vector index assertion: `RecordSourceUnavailable` precedes `SelectPrefix` |
 | Buffered entries are fsynced before the barrier | `RecoveryBarrier::try_new` rejects a missing proof, a proof below the cutoff and a proof bound to another digest, each by a named test; a `FlushFailed` blocks commit — **V1, V3** |
 | One CAS, one key | The effect vector from `Proposing` contains exactly one `ControlCas`, targeting `partitions/{id}` |
-| A lost CAS response does not promote | `Unavailable` and `Unknown` each leave the node `Blocked` under their own reason; neither proceeds as owner, and both require a fresh fencing proof to retry. **Amended 2026-10-13 (A-R102):** an `Unknown` activation CAS with no fence held instead enters `ActivationUnresolved` and activates only on a `Committed` answer to a CAS at the revision a read found its own bytes at; a peer's record blocks `OvertakenByPeer` (`w10_d1_*` rows in `recovery_f1.rs`, M7B-146, M7B-240) |
+| A lost CAS response does not promote | `Unavailable` and `Unknown` each leave the node `Blocked` under their own reason; neither proceeds as owner, and both require a fresh fencing proof to retry. **Amended 2026-10-13 (A-R102 and its addendum):** an `Unknown` or `Unavailable` activation CAS, with no held fence re-entering, instead enters `ActivationUnresolved` and activates only on a `Committed` answer to a CAS at the revision a read found its own bytes at; a peer's record blocks `OvertakenByPeer` (`w10_d1_*` rows in `recovery_f1.rs`, M7B-146, M7B-240) |
 | A successful rebuild leaves read-only mode | After the activation CAS commits, the recovery module re-emits its result with `mode: Active`; the transaction and publication modules leave `Frozen { RecoveryReadOnly }` on it. Without that emission a rebuilt partition stays read-only forever — **V3** |
 | The activation re-emit moves no position | A partition recovered `DegradedRf2` at cutoff 0 that wrote seq 1 keeps it when the `Active` re-emit arrives: published goes 1, 2, 3, a `Fresh` read answers after the re-emit, and lag protection reaches `Healthy` (`m9_d3_00`, amended 2026-10-07) |
 | Recovery catch-up is fence-gated | A `RecoveryAppend` with a superseded fence is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append would be |

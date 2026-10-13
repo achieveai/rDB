@@ -18,7 +18,8 @@
 //! Committed, Rebuilding --FenceProven, newer root--> Fenced/Collecting
 //! ActivationProposed --FenceProven, newer root--> held; re-enters once the activation CAS ends
 //! Proposing --Unknown, or deadline with no answer--> Blocked(ControlUnknown)
-//! ActivationProposed --Unknown, or deadline with no answer, no fence held--> ActivationUnresolved
+//! ActivationProposed --Unknown, Unavailable, or deadline with no answer--> ActivationUnresolved
+//!   (a held fence re-enters instead when it can; refused, F1 resolves)
 //! ActivationUnresolved --read our bytes at r, same CAS at r, Committed--> Committed(Active)
 //! ActivationUnresolved --another record on the read--> Blocked(OvertakenByPeer | CasContention)
 //! ActivationUnresolved --FenceProven, newer root--> Fenced/Collecting, at once
@@ -36,14 +37,18 @@
 //! arm the timer when sent, and an exchange unanswered at its deadline is read as
 //! `CasOutcome::Unknown`, which reports `BlockPromotion{ControlUnknown}` and lets a held fence in.
 //!
-//! # An `Unknown` activation resolves (ruling A-R102, W10-D1)
+//! # An unresolved activation resolves (ruling A-R102 and its addendum, W10-D1)
 //!
 //! An `Unknown` answer may have landed. For the recovery CAS that stays a terminal
-//! `Blocked(ControlUnknown)`. For the activation CAS with no fence held it does not: nothing in
-//! M9 fences the owner's own partition, so a terminal block there kept a partition read-only for
-//! good after a control-store outage, with its record already rewritten. Instead F1 enters
+//! `Blocked(ControlUnknown)`. For the activation CAS it does not: nothing in M9 fences the owner's
+//! own partition, so a terminal block there kept a partition read-only for good after a
+//! control-store outage, with its record already rewritten. Instead F1 enters
 //! `ActivationUnresolved` and reads `partitions/{p}` (DesignSpec-01: read authoritative state and
-//! use CAS to recover):
+//! use CAS to recover). Every exit of the activation exchange that is a store outage resolves
+//! this way: `Unknown`, the deadline, and a definitive `Unavailable` (from the CAS or from a
+//! conflict's re-read), which proves the CAS did not apply. `Unknown` reads at once;
+//! `Unavailable` waits for the exchange's own fire. A fence held behind the activation re-enters
+//! first when it can; when its re-entry is refused, F1 resolves all the same (addendum, Round 13).
 //!
 //! * Our own commit bytes at `r`, at or above the commit revision: the same CAS at `r`. Only a
 //!   `Committed` answer lands; nothing activates on a read alone. So an operator's no-op rewrite
@@ -167,16 +172,17 @@ pub enum RecoveryPhase {
     Rebuilding,
     /// The activation CAS is in flight.
     ActivationProposed,
-    /// The activation CAS ended `Unknown`, or unanswered at its deadline, with no fence held
-    /// (ruling A-R102, W10-D1). Not a block: F1 is resolving it, by a read of `partitions/{p}`
-    /// and then the same CAS at the revision it read our own bytes at. Only that CAS's
+    /// The activation exchange ended `Unknown`, `Unavailable`, or unanswered at its deadline, and
+    /// no held fence re-entered (ruling A-R102 and its addendum, W10-D1). Not a block: F1 is
+    /// resolving it, by a read of `partitions/{p}` and then the same CAS at the revision it read
+    /// our own bytes at. Only that CAS's
     /// `Committed` activates; any other record blocks through the conflict re-read's rule. One
     /// request at a time, re-read on each timer fire; a fence with a newer root enters at once.
     ActivationUnresolved,
     /// Divergence found. Terminal in M7.
     Quarantined,
-    /// Automatic recovery stopped. Terminal until a fresh fence. An `Unknown` recovery CAS lands
-    /// here; an `Unknown` activation with no fence held does not (`ActivationUnresolved`).
+    /// Automatic recovery stopped. Terminal until a fresh fence. An `Unknown` or `Unavailable`
+    /// recovery CAS lands here; the activation CAS's do not (`ActivationUnresolved`).
     Blocked(BlockReason),
 }
 
@@ -233,8 +239,8 @@ struct Committed {
     /// flight. It re-enters once that exchange ends (ruling B-R74b): answered, or unanswered at its
     /// deadline (issue #2).
     held: Option<FencingProof>,
-    /// The activation CAS ended `Unknown` or at its deadline and is being resolved (ruling
-    /// A-R102). `activation` is kept; its `Cas` carries the request outstanding now, if any.
+    /// The activation exchange ended `Unknown`, `Unavailable` or at its deadline and is being
+    /// resolved (ruling A-R102 and its addendum). `activation` is kept; its `Cas` carries the request outstanding now, if any.
     resolving: Option<Resolving>,
 }
 
@@ -879,12 +885,25 @@ impl Recovery {
                     activate(&mut committed, barrier, revision, emit);
                     Phase::Committed(committed)
                 }
-                // Unknown, or unanswered at its deadline: it may have landed. With no fence held
-                // to re-enter, resolve it by reading (ruling A-R102) rather than block for good.
-                Some(Err(Phase::Blocked(BlockReason::ControlUnknown, _))) if held.is_none() => {
+                // Unknown, unanswered at its deadline, or Unavailable: one store outage under
+                // different timings (ruling A-R102 and its addendum). Unless a held fence
+                // re-enters, resolve rather than block for good. Unknown may have landed, so it
+                // reads at once; Unavailable waits for the exchange's own fire (M4).
+                Some(Err(Phase::Blocked(
+                    reason @ (BlockReason::ControlUnknown | BlockReason::ControlUnavailable),
+                    _,
+                ))) => {
                     committed.activation = Some((cas, barrier));
                     committed.resolving = Some(Resolving { awaiting: false });
-                    self.read_again(ctx, &mut committed, emit);
+                    if let Some(proof) = held {
+                        match self.refence(ctx, committed, &proof, emit) {
+                            Phase::Committed(refused) => committed = refused,
+                            entered => return entered,
+                        }
+                    }
+                    if reason == BlockReason::ControlUnknown {
+                        self.read_again(ctx, &mut committed, emit);
+                    }
                     return Phase::Committed(committed);
                 }
                 Some(Err(blocked)) => blocked,
@@ -1002,8 +1021,9 @@ impl Recovery {
         }
     }
 
-    /// A resolving activation (ruling A-R102): the activation CAS ended `Unknown` or at its
-    /// deadline, so it may have landed. One request is outstanding at a time.
+    /// A resolving activation (ruling A-R102 and its addendum): the activation exchange ended
+    /// `Unknown`, `Unavailable` or at its deadline. It may have landed, or not; only a read tells.
+    /// One request is outstanding at a time.
     ///
     /// * A due fire abandons whatever is unanswered and reads again, re-armed.
     /// * A read of our own bytes at `r`, at or above the commit revision, proposes the same CAS

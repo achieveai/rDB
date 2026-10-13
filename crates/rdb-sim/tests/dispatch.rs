@@ -8852,7 +8852,7 @@ fn m7v_101_recording_every_line_matches_engine_state_on_the_spine_and_the_rebuil
 fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
     use rdb_core::contracts::trace::{ControlOpKind, SyncWithheldReason};
     use rdb_core::recovery::{Recovery, RecoveryPhase};
-    use rdb_sim::harness::run::{ScenarioStep, StepAction};
+    use rdb_sim::harness::run::{ScenarioStep, StepAction, StopReason};
     support::preamble();
     let base = run_rebuild(Vec::new());
     let activation = base
@@ -8896,7 +8896,12 @@ fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
     ));
     plan.limits.deadline = Tick(fire + 1);
     let mut runner = Runner::new(&plan).expect("a runner");
-    runner.run(plan.limits).expect("the run");
+    let report = runner.run(plan.limits).expect("the run");
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "stopped at the deadline, past the failed read: {:?}",
+        report.stop
+    );
     let control: Vec<String> = runner
         .recorded()
         .iter()
@@ -8932,5 +8937,18 @@ fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
             }
         )),
         "served from the pinned configuration: {notes:?}"
+    );
+    assert_eq!(
+        notes,
+        vec![(
+            NODE,
+            ModuleName::Recovery,
+            KernelNote::SyncProven {
+                copy: CopyId(2),
+                cutoff: Seq(SPINE_HEAD),
+                durable: rdb_core::contracts::ids::DurableSeq(SPINE_HEAD),
+            }
+        )],
+        "node 3's engine proves copy 2 through the cutoff"
     );
 }

@@ -13,8 +13,8 @@
 //! anything else, `Absent` and unreadable bytes included, is contention. A blind retry never
 //! happens: `Unavailable` and `Unknown` block the recovery CAS.
 //!
-//! One exception, for the activation CAS only (ruling A-R102, W10-D1): after `Unknown` it is
-//! resolved by a read, then the same CAS at the revision the read found our own bytes at
+//! One exception, for the activation CAS only (ruling A-R102 and its addendum, W10-D1): after
+//! `Unknown` or `Unavailable` it is resolved by a read, then the same CAS at the revision the read found our own bytes at
 //! ([`Cas::ours_at`], [`Cas::repropose`]). Nothing lands on a read; only that CAS's `Committed`
 //! does. Any other record on that read still goes through [`Cas::on_read`]. The recovery CAS
 //! stays terminal: its record binds no run id, so our bytes cannot be told from a peer's (F-g).
