@@ -5995,3 +5995,28 @@ fn a_partition_fence_over_recovery_read_only_survives_the_re_emit() {
     let _ = h.step(active);
     assert_eq!(h.k().mode(), &frozen, "the re-emit lifts nothing");
 }
+
+/// Round 10 (lead ruling: `LocalStorageFenced` is boot-long, as A1's `storage_fenced` is): a
+/// recovery to a newer generation builds a new instance, and that instance starts storage
+/// fenced, not `Open`. Only a new boot clears it (`Transaction::forget_node`).
+#[retcd_test]
+fn a_new_generation_never_lifts_a_storage_fence() {
+    let mut h = H::live();
+    let _ = h.step(recovered(Generation(8), 0, NODE_A, PartitionMode::Active));
+    let _ = h.step(fence(
+        FenceScope::Partition(PARTITION),
+        DenyReason::LocalStorageFenced,
+    ));
+    let fenced = QueueMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+        unresolved: None,
+    };
+    assert_eq!(h.k().mode(), &fenced, "fixture");
+    let _ = h.step(recovered(Generation(9), 0, NODE_A, PartitionMode::Active));
+    assert_eq!(
+        h.k().lineage().generation,
+        Generation(9),
+        "fixture: a new instance"
+    );
+    assert_eq!(h.k().mode(), &fenced, "the new instance");
+}

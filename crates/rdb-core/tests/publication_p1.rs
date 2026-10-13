@@ -7437,3 +7437,94 @@ fn a_re_emit_over_a_node_fence_keeps_it_and_sets_only_the_read_only_memory() {
         assert_eq!(rig.view().mode, thawed, "{mode:?}: the new grant's view");
     }
 }
+
+/// Round 10 (state table): F1's re-emit of the lineage never lifts an unresolved transaction, as
+/// T1 lifts none (`TxnKernel::on_reemitted`). Only resolving it does (K-A-47); a re-emit put P1
+/// at `Serving` or `RecoveryReadOnly` while T1 stayed frozen.
+#[retcd_test]
+fn a_re_emit_never_lifts_an_unresolved_transaction() {
+    let mut rig = Rig::new();
+    rig.step(candidate(5, 5));
+    rig.step(deadline(P, 1));
+    let frozen = PubMode::Frozen {
+        cause: FreezeCause::UnresolvedTransaction,
+    };
+    assert_eq!(rig.view().mode, frozen, "fixture");
+    for mode in [PartitionMode::Active, PartitionMode::ReadOnly] {
+        rig.step(reemitted(mode.clone(), START));
+        assert_eq!(rig.view().mode, frozen, "{mode:?}");
+    }
+}
+
+/// Round 10 (lead ruling: `LocalStorageFenced` is boot-long, as A1's `storage_fenced` is): F1's
+/// re-emit of the lineage never lifts a storage fence in P1, `Active` or read-only. T1 never
+/// lifts it either.
+#[retcd_test]
+fn a_re_emit_never_lifts_a_storage_fence() {
+    let mut rig = Rig::new();
+    rig.step(fence(
+        FenceScope::Partition(P),
+        DenyReason::LocalStorageFenced,
+    ));
+    let fenced = PubMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+    };
+    assert_eq!(rig.view().mode, fenced, "fixture");
+    for mode in [PartitionMode::Active, PartitionMode::ReadOnly] {
+        rig.step(reemitted(mode.clone(), START));
+        assert_eq!(rig.view().mode, fenced, "{mode:?}");
+    }
+}
+
+/// Round 10 (the same ruling): a recovery to a new lineage does not lift a storage fence either.
+/// Only a new boot does, with a fresh kernel.
+#[retcd_test]
+fn a_new_lineage_never_lifts_a_storage_fence() {
+    let mut rig = Rig::new();
+    rig.published(5);
+    rig.step(fence(
+        FenceScope::Partition(P),
+        DenyReason::LocalStorageFenced,
+    ));
+    let fenced = PubMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+    };
+    let effects = rig.step(recovered(PartitionMode::Active, 5, false, None));
+    assert_eq!(rig.view().mode, fenced, "the recovery");
+    let (opened, _) = snapshot_ledger(&effects);
+    assert_eq!(opened.len(), 1, "{effects:?}");
+    rig.snapshot.generation = Generation(GEN.0 + 1);
+    rig.snapshot_at(5);
+    rig.step(ready_of(opened[0], 5));
+    assert_eq!(
+        rig.view().lineage.generation,
+        Generation(GEN.0 + 1),
+        "fixture"
+    );
+    assert_eq!(rig.view().mode, fenced, "its view bound");
+}
+
+/// Round 10 (the same ruling): a storage fence that lands while `Blocked` leaves the mode
+/// `Blocked` (B-R29), but is not forgotten: the recovery that leaves `Blocked` lands in
+/// `LocalStorageFenced`, not `Serving`.
+#[retcd_test]
+fn a_storage_fence_while_blocked_holds_after_the_recovery() {
+    let mut rig = Rig::new();
+    rig.step(EventKind::Kernel(KernelEvent::BlockPartition(block())));
+    rig.step(fence(
+        FenceScope::Partition(P),
+        DenyReason::LocalStorageFenced,
+    ));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Blocked { reason: block() },
+        "fixture: Blocked is sticky under a fence"
+    );
+    rig.step(reemitted(PartitionMode::Active, START));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Frozen {
+            cause: FreezeCause::LocalStorageFenced
+        }
+    );
+}

@@ -3280,6 +3280,56 @@ fn a_freeze_while_unheld_mid_self_replace_reports_the_self_replace_stopped() {
     assert!(kernel.self_replace_stopped(), "A1 stopped trying");
 }
 
+/// Round 10 (dev-s2b): the grant record is deleted while `Unheld` mid self-replace. The replace
+/// conflicts and the read-back finds no record. After a fence an absent key is not a free one to
+/// create (A-R96: the only exit is a CAS at the exact revision read), so the self-replace stops,
+/// as the fenced poll's absent answer stops it, and `self_replace_stopped` says so. No CAS, no
+/// re-arm.
+#[retcd_test]
+fn an_absent_record_while_unheld_mid_self_replace_stops_the_self_replace() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(
+                PROVEN + 1,
+                PROVEN + 1,
+                request,
+                CasOutcome::Conflict {
+                    exists: false,
+                    current: Revision(8),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    assert!(
+        kernel.state().is_unheld(),
+        "fixture: unheld mid self-replace"
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &grant_read(PROVEN + 2, ReadOutcome::Absent { as_of: Revision(8) }),
+        )
+        .expect("the read-back");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+        "no CAS, no re-arm"
+    );
+    assert!(
+        kernel.self_replace_stopped(),
+        "A1 stopped trying, and says so"
+    );
+}
+
 /// Critic A5 (A-R96): a read of our record lands while the replace CAS is in flight. It records
 /// nothing: when the replace then conflicts and the read-back is not yet proven, the next firing
 /// polls again rather than CASing at the revision the in-flight read saw.
