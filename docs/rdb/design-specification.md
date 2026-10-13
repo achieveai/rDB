@@ -515,7 +515,11 @@ Clock uncertainty beyond the configured bound, backward jumps, process resume, r
 
 **Same-boot fresh grant (M9, lead ruling A-R96).** A self-fenced node needs no restart to leave `SelfFenced`. Once a read of its own grant record proves that record's expiry, it replaces the record by a CAS at exactly the revision read, under a new grant id. It never returns to the grant id the fence ended. A planner's freeze makes the record unreplaceable.
 
+A renewal sent before a fence can still commit after quorum returns (seen in M9 S2b walks 4b and 4c: a renewal answered `unknown` landed as the next revision, still under the fenced grant id). So a planner may read a later expiry than the owner believed it held. That is safe: every decision proves expiry on the record it actually read, and a self-replace CAS that conflicts re-reads and proves again.
+
 **M10 gate:** the self-replace has no partition-in-transfer guard. That is safe in M9 only because M9 never starts a takeover, so the freeze is the only gate needed. Before M10 enables transfers, the self-replace must refuse while a transfer of any partition the node owns is in progress; otherwise an owner can contend with a planner mid-transfer.
+
+**M12 gate (critic advisory A1):** at Publication, a deny for `ClockSampleStale` or `ClockModeUnbounded` quarantines the write, as every deny but `ControlUnavailable` does. Neither fences, so no new grant follows and nothing thaws the write: it stays quarantined for as long as the grant lives. M9's host cannot produce either, because it stamps every clock sample at "now". A real clock source (M12) must first make P1 defer these denies, or thaw them once a fresh sample or a bounded mode returns.
 
 **Sizing note: grant length against control failover (added 2026-10-12, M9 S2b).** A control-leader failover must leave a renewal inside the write horizon, or one failover fences every owner. A1 admits until `grant_millis − dispatch_margin_millis − clock_error_millis − 1` after its last committed renewal (`Authority::admission_horizon`), and that renewal can be one `renew_millis` old when the leader stops. The new leader must then be in place with one more renewal to spare. So:
 
@@ -529,7 +533,10 @@ Clock uncertainty beyond the configured bound, backward jumps, process resume, r
 **M9 note: a node restart stops writes, safely, for the life of the `Db` (added 2026-10-12, M9 S2b; achieveai/rDB#42).** `Db::restart_node` starts the node again at boot + 1. Peers' membership pins the old boot (`Member::boot`), so they refuse the new process's acknowledgements, and the new process holds no role, no grant and no pending acquire.
 - Restarting a **secondary**: its copy is never durable again, so L1 warns about 1 s later and pauses writes about 2 s later (§6.2).
 - Restarting the **owner**: it never takes a grant again. Its old grant can be cleared once expiry is proven (§7.3), but nothing acquires a new one. The same-boot fresh grant does not apply: it belongs to the process whose grant was fenced, and a restarted process holds no grant to replace.
-- Either way nothing un-pauses writes before M10, which brings catch-up and re-pin (#42). Reads of already published data keep answering. Every `PROTECTION_PAUSED`, `UNAVAILABLE` or `UNKNOWN_OUTCOME` answer names the restarted node and boot.
+- Either way nothing un-pauses writes before M10, which brings catch-up and re-pin (#42).
+- Reads after a **secondary** restart keep answering, with one exception. If a write was in flight at the restart and no other copy can still take it, fresh reads answer `UNKNOWN_OUTCOME`: the write can never resolve, so the unresolved-transaction freeze holds (§5.3, K-A-47). That happens when both secondaries restart, or when the other one is unreachable. `--previous` reads still answer. M10 clears this through #42. If the other secondary takes the write, it publishes and reads keep answering (M9 S2b walks 5b, 5d, 5e).
+- Reads after an **owner** restart answer `UNAVAILABLE`, `--previous` included: in M9 the owner is the only node that serves reads.
+- Every `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY` answer names the restarted node and boot. A status of `Unknown` after a restart is not evidence that a write was lost, even one answered `ok`: its outcome cannot be known until the node rejoins (#42). `rdb_dev` adds the same note to it.
 - A restart is therefore never a recovery step in M9. Writing again takes a new `Db` on a new directory and control store: the same ones cannot be reopened (`OpenError::NotEmpty`, `BootstrapError::AlreadyExists`).
 
 ### 7.3 Ownership transition protocol

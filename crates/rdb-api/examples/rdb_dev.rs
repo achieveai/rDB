@@ -47,9 +47,19 @@
 //!                                         this run: after a secondary's, L1 pauses about 2 s
 //!                                         later (`PROTECTION_PAUSED`) because that copy is
 //!                                         never durable again; after the owner's, no node
-//!                                         holds a grant. Every refusal after it names the
-//!                                         restart. Restarting is not a recovery: catch-up and
-//!                                         re-pin are M10 (achieveai/rDB#42). To write again,
+//!                                         holds a grant. Reads: after a secondary's they keep
+//!                                         answering, unless a write was in flight that no
+//!                                         other copy can take (both secondaries restarted, or
+//!                                         the other unreachable): then fresh reads answer
+//!                                         `UNKNOWN_OUTCOME` and `get --previous` still
+//!                                         answers. After the owner's every read is
+//!                                         `UNAVAILABLE`. Every `PROTECTION_PAUSED`,
+//!                                         `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY`
+//!                                         after it names the restart, and so does a `status`
+//!                                         of `Unknown`: that is not evidence of a lost write,
+//!                                         its outcome cannot be known until the node rejoins.
+//!                                         Restarting is not a recovery: catch-up and re-pin
+//!                                         are M10 (achieveai/rDB#42). To write again,
 //!                                         quit and start rdb_dev again. Refused until the
 //!                                         first `ready`
 //! admin clear-grant <n>                   remove grants/<n> if node n's old process left it
@@ -133,7 +143,7 @@ use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::control::ControlKey;
 use rdb_core::contracts::ids::{AffinityId, Generation, NodeId, PartitionId, RequestId};
-use rdb_core::contracts::txn::TxnRequest;
+use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 
 use hostile_store::{HostileStore, ListFault};
 
@@ -1076,6 +1086,15 @@ fn status_line(db: &Db, request: &str, rest: &[&str]) -> Result<(), String> {
         _ => return Err("status <request> [<generation>]".to_owned()),
     };
     match db.status(RequestId(request), generation) {
+        // After a restart, `Unknown` can be a write this session saw `ok`: the node that knew
+        // it is gone, and the restarted one holds no history (tester W3-D2).
+        Ok(TxnStatus::Unknown) => say(&match db.restart_note() {
+            Some(note) => format!(
+                "status Unknown (its outcome cannot be known until the restarted node rejoins, \
+                 which is M10: {note})"
+            ),
+            None => "status Unknown".to_owned(),
+        }),
         Ok(status) => say(&format!("status {status:?}")),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
     }

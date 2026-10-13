@@ -832,6 +832,10 @@ impl Db {
 
     /// What became of this client's request `request`.
     ///
+    /// After a restart ([`Self::restart_note`] is `Some`), `Unknown` is not evidence that a write
+    /// was lost, even one answered `ok`: the node that knew its outcome may be the one restarted,
+    /// and the outcome cannot be known until it rejoins (M10, achieveai/rDB#42).
+    ///
     /// # Errors
     ///
     /// [`ApiError`]: a refusal, or `UNAVAILABLE` when no answer came in time.
@@ -943,15 +947,25 @@ impl Db {
     }
 
     /// `error` with [`Self::restart_note`] appended to its detail, for the kinds a restart
-    /// leaves every later call with: `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME`. The
-    /// kind, retry rule and mutation proof are unchanged.
+    /// leaves every later call with: `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME`, and
+    /// `NOT_PRIMARY`, whose `RefreshRoute` would otherwise send the caller looking for a primary
+    /// that no node becomes again in M9 (tester W3-D1). The kind, retry rule and mutation proof
+    /// are unchanged.
     fn explained(&self, mut error: ApiError) -> ApiError {
-        let stopped = matches!(
-            error.kind,
-            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome
-        );
-        if let Some(note) = self.restart_note().filter(|_| stopped) {
-            error.detail = format!("{}; {note}", error.detail);
+        let Some(note) = self.restart_note() else {
+            return error;
+        };
+        match error.kind {
+            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
+                error.detail = format!("{}; {note}", error.detail);
+            }
+            ErrorKind::NotPrimary => {
+                error.detail = format!(
+                    "{}; no node becomes primary again in M9: {note}",
+                    error.detail
+                );
+            }
+            _ => {}
         }
         error
     }
