@@ -7379,3 +7379,61 @@ fn a_re_emit_never_lifts_a_partition_fence() {
         "nor does a new grant's view after it"
     );
 }
+
+/// Round 9 (lead ruling on the round 8 open decision): F1's re-emit of the lineage never lifts an
+/// `AuthorityLost` freeze in P1, as `TxnKernel::on_reemitted` never lifts one in T1. Only a new
+/// grant's view of the lineage (`Thaws`) or a new lineage does. A duplicate `Active` re-emit
+/// after a node fence used to put P1 at `Serving` with its grant lost, so it could serve reads
+/// with no authority.
+#[retcd_test]
+fn a_duplicate_re_emit_never_lifts_a_node_fence() {
+    let mut rig = Rig::new();
+    assert_eq!(rig.view().mode, PubMode::Serving, "fixture");
+    rig.step(fence(FenceScope::Node, DenyReason::Expired));
+    let frozen = PubMode::Frozen {
+        cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+    };
+    assert_eq!(rig.view().mode, frozen, "fixture: the node fence");
+    rig.step(reemitted(PartitionMode::Active, START));
+    assert_eq!(rig.view().mode, frozen, "the re-emit lifts nothing");
+    rig.step(view_under(2, 2, u64::MAX));
+    assert_eq!(
+        rig.view().mode,
+        PubMode::Serving,
+        "the new grant's view does"
+    );
+}
+
+/// Round 9: after a read-only recovery and a node fence, F1's activation re-emit ends the
+/// read-only state but lifts no `AuthorityLost`: P1 stays frozen until the new grant's view,
+/// which then thaws to `Serving`, as T1 is open by then. A read-only re-emit instead keeps the
+/// read-only state underneath, so the same view thaws only to `RecoveryReadOnly` (A-R98 as
+/// amended).
+#[retcd_test]
+fn a_re_emit_over_a_node_fence_keeps_it_and_sets_only_the_read_only_memory() {
+    for (mode, thawed) in [
+        (PartitionMode::Active, PubMode::Serving),
+        (
+            PartitionMode::ReadOnly,
+            PubMode::Frozen {
+                cause: FreezeCause::RecoveryReadOnly,
+            },
+        ),
+    ] {
+        let mut rig = Rig::new();
+        rig.step(reemitted(PartitionMode::ReadOnly, START));
+        rig.step(fence(FenceScope::Node, DenyReason::Expired));
+        let frozen = PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+        };
+        assert_eq!(rig.view().mode, frozen, "{mode:?}: fixture");
+        rig.step(reemitted(mode.clone(), START));
+        assert_eq!(
+            rig.view().mode,
+            frozen,
+            "{mode:?}: the re-emit lifts nothing"
+        );
+        rig.step(view_under(2, 2, u64::MAX));
+        assert_eq!(rig.view().mode, thawed, "{mode:?}: the new grant's view");
+    }
+}
