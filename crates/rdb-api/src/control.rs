@@ -18,7 +18,9 @@
 //! * `Reload` → one `FamilySnapshot` at the list's read revision. A truncated list faults the node:
 //!   a partial family would read as a complete one.
 //!
-//! Every call logs `control_call{node, op, key, outcome, millis}`.
+//! Every call logs `control_call{node, op, key, outcome, millis}`. A get adds `revision`, the one it
+//! found; a CAS adds `expected`, the revision it requires (0: must not exist), and `revision`, the
+//! one it committed at.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -262,6 +264,30 @@ fn log_call(site: Site, op: &str, key: &str, outcome: &str, started: Instant) {
     tracing::info!(node = site.node.0, op, key, outcome, millis, "control_call");
 }
 
+/// `control_call` for a get or a CAS, with the revisions it names: `expected`, the revision a CAS
+/// requires, and `revision`, the one a get found or a CAS committed at, each absent when there is
+/// none. A same-boot fresh grant is checked by these: its replace's `expected` is the `revision`
+/// of the get before it (M9 S2b, A-R96).
+fn log_revisions(
+    site: Site,
+    (op, key, outcome): (&str, &str, &str),
+    expected: Option<u64>,
+    revision: Option<u64>,
+    started: Instant,
+) {
+    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        node = site.node.0,
+        op,
+        key,
+        outcome,
+        expected,
+        revision,
+        millis,
+        "control_call"
+    );
+}
+
 /// `control_call` for `op=watch`, with `from`, the revision the watch starts after, so a re-watch
 /// shows where it resumed (M9 S2a).
 fn log_watch(site: Site, key: &str, outcome: &str, from: Revision, started: Instant) {
@@ -329,7 +355,17 @@ async fn call(
                     ReadOutcome::Unavailable
                 }
             };
-            log_call(site, "get", &name, read_name(&outcome), started);
+            let found = match &outcome {
+                ReadOutcome::Found { revision, .. } => Some(revision.0),
+                _ => None,
+            };
+            log_revisions(
+                site,
+                ("get", &name, read_name(&outcome)),
+                None,
+                found,
+                started,
+            );
             Ok(ControlEvent::Value {
                 request,
                 key,
@@ -493,6 +529,12 @@ async fn cas(
     ),
 ) -> Result<ControlEvent, Fault> {
     let name = key.encode();
+    // A put spells "must not exist" as revision 0; a delete always names one.
+    let required = if value.is_some() {
+        Some(expected.map_or(0, |revision| revision.0))
+    } else {
+        expected.map(|revision| revision.0)
+    };
     let (op, answer) = match value {
         Some(value) => (
             "cas_put",
@@ -525,7 +567,17 @@ async fn cas(
         }
     };
     let outcome = cas_outcome(site, &name, answer);
-    log_call(site, op, &name, cas_name(&outcome), started);
+    let committed = match &outcome {
+        CasOutcome::Committed(revision) => Some(revision.0),
+        _ => None,
+    };
+    log_revisions(
+        site,
+        (op, &name, cas_name(&outcome)),
+        required,
+        committed,
+        started,
+    );
     Ok(ControlEvent::CasResult {
         request,
         key,

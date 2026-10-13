@@ -89,8 +89,9 @@
 //! ```
 //!
 //! While it runs, a poller prints the partition's progress as it changes: `recovered gen=N`,
-//! `waiting for write protection (...)`, and `ready` once node 1's L1 admits writes. A put
-//! before `ready` is refused, never left hanging. A recovery committed below `Active` that
+//! `waiting to admit writes (l1=.. authority=..)`, and `ready` once node 1 admits writes: its L1
+//! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
+//! waiting line then saying which. A put before `ready` is refused, never left hanging. A recovery committed below `Active` that
 //! does not activate prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever
 //! the line changes:
 //!
@@ -467,9 +468,9 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 seen.ready = admits;
                 say(&match (admits, &restarted) {
                     (true, _) => "ready".to_owned(),
-                    (false, None) => "not ready: write protection lost".to_owned(),
+                    (false, None) => "not ready: writes not admitted".to_owned(),
                     (false, Some(note)) => format!(
-                        "not ready: write protection lost: {note} (here: quit, then start \
+                        "not ready: writes not admitted: {note} (here: quit, then start \
                          rdb_dev again)"
                     ),
                 });
@@ -510,7 +511,7 @@ fn stall_change(printed: Option<&String>, node: &NodeStatus) -> Option<String> {
 
 fn waiting_line(owner: &NodeStatus) -> String {
     format!(
-        "waiting for write protection (l1={} authority={} {})",
+        "waiting to admit writes (l1={} authority={} {})",
         owner.protection.as_deref().unwrap_or("inert"),
         owner.authority,
         owner.holds.map_or_else(

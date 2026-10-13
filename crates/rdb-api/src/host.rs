@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
-use rdb_core::contracts::authority::{AuthorityEffect, AuthorityView, Lineage, PartitionMode};
+use rdb_core::contracts::authority::{
+    AuthorityEffect, AuthorityView, FenceScope, Lineage, PartitionMode,
+};
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
 use rdb_core::contracts::envelope::{ReplicaProgress, ReplicationEnvelope};
@@ -444,7 +446,8 @@ pub struct NodeStatus {
     pub role: &'static str,
     /// L1's mode, when live.
     pub protection: Option<String>,
-    /// Whether L1 admits writes now, when live.
+    /// Whether this node admits writes now: L1 admits and A1 holds a grant. `None` while L1 is
+    /// not live. `protection` is L1 alone and `authority` A1 alone.
     pub admits: Option<bool>,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
@@ -1326,9 +1329,9 @@ impl Host {
         );
     }
 
-    /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`]. `renewed_at`
-    /// is the dispatch tick of the last committed renewal, which the horizon is counted from,
-    /// absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
+    /// `authority_view`: A1 published `view` in the step at [`Self::stepped_at`], under `grant`.
+    /// `renewed_at` is the dispatch tick of the last committed renewal, which the horizon is
+    /// counted from, absent once the grant is no longer held. `margin_ms` is the time left to the horizon at
     /// publication, and `past_horizon` whether none was left. `would_fence_as` is the reason a
     /// check past the horizon would deny with (`AuthorityView::past_horizon`); it is not a state,
     /// and is set while the view is still valid.
@@ -1339,6 +1342,7 @@ impl Host {
             node = self.node.0,
             partition = view.lineage.partition.0,
             seq = view.authority_seq,
+            grant = view.grant_id.0,
             renewed_at = self.authority.view().renewed_at.map(|tick| tick.0),
             valid_through = view.valid_through_tick.0,
             past_horizon = margin_ms < 0,
@@ -1805,6 +1809,9 @@ impl Host {
                     at = self.stepped_at.0,
                     "authority_fence"
                 );
+                if *scope == FenceScope::Node {
+                    self.schedule_acquire_after_fence(site);
+                }
             }
             KernelEffect::SetAdmission(state) => {
                 tracing::info!(node, partition = site.partition.0, allow = state.allow, reason = ?state.reason, "set_admission");
@@ -2224,6 +2231,30 @@ impl Host {
         let fired = TimerFired {
             id: AuthorityTimer::Acquire.id(),
             version: TimerVersion(0),
+            scheduled_at: at,
+        };
+        let queued = self.queued(site, EventKind::Timer(fired), false, None);
+        self.delay(at, Delayed::Event(queued));
+    }
+
+    /// A-R96 M3: after a node fence, fire A1's `Acquire` one `renew_millis` later, at the version
+    /// A1 has it armed under. A1 arms no timer when it fences; this firing makes it read its own
+    /// grant record, and from then on only that read's answer re-arms it. Without it a fenced
+    /// node stays fenced. Logged as `host_duty{kind="acquire_after_fence"}`.
+    fn schedule_acquire_after_fence(&mut self, site: Site) {
+        let at = self.clock.now().plus_millis(self.budgets.renew_millis);
+        let version = self.authority.timer_version(AuthorityTimer::Acquire);
+        tracing::info!(
+            node = self.node.0,
+            partition = site.partition.0,
+            kind = "acquire_after_fence",
+            at = at.0,
+            version = version.0,
+            "host_duty"
+        );
+        let fired = TimerFired {
+            id: AuthorityTimer::Acquire.id(),
+            version,
             scheduled_at: at,
         };
         let queued = self.queued(site, EventKind::Timer(fired), false, None);
@@ -3229,6 +3260,9 @@ impl Host {
 
     fn status(&self, partition: PartitionId) -> NodeStatus {
         let adopted = self.adopted(partition);
+        // Admitting takes both halves: L1 admitting and A1 holding a grant. L1 alone said
+        // `admits=true` on a fenced owner whose puts answered `LEASE_EXPIRED` (M9 S2b, e).
+        let granted = matches!(self.authority.view().state, AuthorityState::Held(_));
         let authority = match &self.authority.view().state {
             AuthorityState::Unheld { .. } => "unheld".to_owned(),
             AuthorityState::Held(held) => format!("held(grant {})", held.identity().grant.0),
@@ -3286,7 +3320,7 @@ impl Host {
                 .map(|mode| mode_name(mode).to_owned()),
             admits: l1
                 .and_then(|l1| l1.admission_state(now))
-                .map(|state| state.allow),
+                .map(|state| state.allow && granted),
             published: self
                 .publication
                 .view(self.node, partition)
