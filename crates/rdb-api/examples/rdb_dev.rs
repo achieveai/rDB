@@ -541,6 +541,8 @@ const STUCK: &str =
 /// With no restart, L1 paused or reprotecting while `held` holds a link of node 1's keeps writes
 /// out until those links heal and the copies catch up (W8-D2): the line names the links, fenced
 /// or not, as a condition. Without a held link (startup) the copies catch up by themselves.
+///
+/// Not fenced, with A1's self-replace stopped (W8-D1): stuck, as [`gave_up_line`] says.
 fn ready_reason(
     owner: &NodeStatus,
     admits: bool,
@@ -548,7 +550,12 @@ fn ready_reason(
     held: &[(NodeId, NodeId)],
 ) -> Option<String> {
     let fence = owner.fence.filter(|_| !admits);
+    let gave_up =
+        (!admits && fence.is_none() && owner.replace_stopped).then(|| gave_up_line(owner));
     let Some(note) = restart_note else {
+        if let Some(line) = gave_up {
+            return Some(line);
+        }
         return match (fence, links_wait(owner, held)) {
             (Some(reason), _) => Some(fence_line(owner, reason, held)),
             (None, Some((mode, links))) if !admits => Some(format!(
@@ -567,6 +574,9 @@ fn ready_reason(
     }
     if owner.boot != rdb_api::host::BOOT || l1_rejecting(owner).is_some() {
         return Some(format!("{note}; {STUCK}"));
+    }
+    if let Some(line) = gave_up {
+        return Some(format!("{line}; {note}"));
     }
     Some(match fence {
         Some(reason) if fence_lifts(owner, reason) => {
@@ -599,6 +609,18 @@ fn links_wait<'a>(owner: &'a NodeStatus, held: &[(NodeId, NodeId)]) -> Option<(&
         .map(|(a, b)| format!("{}-{}", a.0, b.0))
         .collect();
     (!links.is_empty()).then(|| (mode, links.join(", ")))
+}
+
+/// The line for A1 `unheld` with its self-replace stopped (`replace_stopped`): a freeze, or a
+/// record not this boot's, landed between grants, and A1 will not try again (W8-D1, tester
+/// r6_3200). Nothing in M9 replaces the grant.
+fn gave_up_line(owner: &NodeStatus) -> String {
+    let node = owner.node.0;
+    format!(
+        "node {node}'s grant is {} and node {node} stopped trying for one: its grant record is \
+         frozen or not its own; nothing in M9 replaces it, so {STUCK}",
+        owner.authority
+    )
 }
 
 /// Whether A1's self-replace can still lift a fence for `reason`: its poll is live, and the
@@ -1801,6 +1823,7 @@ mod tests {
             authority: "valid".to_owned(),
             fence: None,
             fence_polling: false,
+            replace_stopped: false,
             recovery: Some("Committed".to_owned()),
             recovered: Some(Generation(1)),
             role: "primary",
@@ -1987,6 +2010,51 @@ mod tests {
     /// is withdrawn with the bare line, so no promise outlives the state that made it.
     #[test]
     fn a_resume_promise_is_withdrawn_when_its_fence_goes_and_writes_stay_out() {
+        // The tester's r6_3200 state, driven directly (the race took 0 of 16 live runs): A1
+        // fenced with its poll live, then `unheld` with its self-replace stopped
+        // (`replace_stopped`, kernel `self_replace_stopped`), then a later poll that changes
+        // nothing. With and without a restart, the stuck line, once.
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let gave_up = "node 1's grant is unheld and node 1 stopped trying for one: its grant \
+                       record is frozen or not its own; nothing in M9 replaces it, so writes \
+                       stay stopped for this run: to write again, quit and start rdb_dev again";
+        let mut fenced = owner(None, false);
+        fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        fenced.fence_polling = true;
+        let mut stopped = owner(None, false);
+        stopped.authority = "unheld".to_owned();
+        stopped.replace_stopped = true;
+        for restart in [None, Some(note)] {
+            let mut seen = Seen {
+                ready: true,
+                ..Seen::default()
+            };
+            let lines: Vec<String> = [&fenced, &stopped, &stopped]
+                .iter()
+                .filter_map(|node| ready_step(&mut seen, node, restart, &[]))
+                .skip(1)
+                .collect();
+            let want = restart.map_or_else(
+                || format!("not ready: writes not admitted: {gave_up}"),
+                |note| format!("not ready: writes not admitted: {gave_up}; {note}"),
+            );
+            assert_eq!(lines, [want], "restart={restart:?}");
+        }
+        // Fenced with the poll stopped keeps the fence's own stuck line.
+        let mut fenced_stopped = fenced.clone();
+        fenced_stopped.fence_polling = false;
+        fenced_stopped.replace_stopped = true;
+        assert_eq!(
+            ready_step(&mut Seen::default(), &fenced_stopped, None, &[]),
+            Some(
+                "not ready: writes not admitted: node 1's grant is fenced(Expired); nothing in M9 \
+                 replaces it, so writes stay stopped for this run: to write again, quit and \
+                 start rdb_dev again"
+                    .to_owned()
+            )
+        );
+
         let mut fenced = owner(None, false);
         fenced.authority = "fenced(Expired)".to_owned();
         fenced.fence = Some(DenyReason::Expired);

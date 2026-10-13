@@ -444,6 +444,10 @@ pub struct NodeStatus {
     /// record again ([`Authority::self_replace_polling`]). `false` once a poll found the record
     /// not this boot's to replace, or absent: nothing in M9 then lifts the fence (F-004, F-016).
     pub fence_polling: bool,
+    /// Whether A1's self-replace stopped for good ([`Authority::self_replace_stopped`]), in any
+    /// state: also `Unheld`, when the stop landed mid self-replace, where `fence` is `None` and
+    /// `fence_polling` is `false` and nothing else says A1 stopped trying (W8-D1).
+    pub replace_stopped: bool,
     /// F1's phase for the partition, when an instance exists.
     pub recovery: Option<String>,
     /// The newest generation this node recovered or landed.
@@ -3330,6 +3334,7 @@ impl Host {
             authority,
             fence: fence_of(self.authority.state()),
             fence_polling: self.authority.self_replace_polling(),
+            replace_stopped: self.authority.self_replace_stopped(),
             recovery: self
                 .recoveries
                 .get(&partition)
@@ -5072,7 +5077,11 @@ mod tests {
         trio.bootstrap();
         trio.ready();
         let held = trio.status(0);
-        assert_eq!((held.fence, held.fence_polling), (None, false), "{held:?}");
+        assert_eq!(
+            (held.fence, held.fence_polling, held.replace_stopped),
+            (None, false, false),
+            "{held:?}"
+        );
         trio.mem
             .failing_with(config_core::ConfigError::Unavailable {
                 reason: "the control store is down".to_owned(),
@@ -5082,8 +5091,13 @@ mod tests {
             status.fence.is_some().then_some(status)
         });
         assert_eq!(
-            (fenced.fence, fenced.fence_polling, fenced.admits),
-            (Some(DenyReason::Expired), true, Some(false)),
+            (
+                fenced.fence,
+                fenced.fence_polling,
+                fenced.replace_stopped,
+                fenced.admits
+            ),
+            (Some(DenyReason::Expired), true, false, Some(false)),
             "{fenced:?}"
         );
 
@@ -5115,8 +5129,18 @@ mod tests {
             (!status.fence_polling).then_some(status)
         });
         assert_eq!(
-            (stopped.fence, stopped.authority.as_str(), stopped.admits),
-            (Some(DenyReason::Expired), "fenced(Expired)", Some(false)),
+            (
+                stopped.fence,
+                stopped.authority.as_str(),
+                stopped.replace_stopped,
+                stopped.admits
+            ),
+            (
+                Some(DenyReason::Expired),
+                "fenced(Expired)",
+                true,
+                Some(false)
+            ),
             "the reason is unchanged; only the poll says it stopped: {stopped:?}"
         );
     }
