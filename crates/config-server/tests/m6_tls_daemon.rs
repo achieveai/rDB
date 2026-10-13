@@ -19,8 +19,8 @@
 //! The row waits by reading the stalled socket to EOF and by polling `/metrics`, both under
 //! deadlines derived from [`support::deadline`]. The one timing assertion that is not a
 //! deadline is the *lower* bound — the listener must not have given up sooner than it was told
-//! to — and a lower bound cannot be made flaky by a slow host, only by a fast one, which is not
-//! a thing that happens.
+//! to. A slow host can still break a lower bound if the client's clock starts after the
+//! server's, so the row starts it before the connect; see the row for the measurement.
 
 mod support;
 
@@ -128,12 +128,17 @@ async fn g01_a_stalled_handshake_is_cut_off_at_the_configured_bound() {
         "nothing has failed a handshake yet, so the row's increment below is its own"
     );
 
+    // The clock starts before the connect, not when it returns. The listener arms its bound on
+    // accept, which cannot precede the SYN this call sends, so a clock read here is never later
+    // than the server's. A clock read after `connect` returns is no such bound: under parallel
+    // load the call returned ~10 ms after the server had already armed, and the row read 241 ms
+    // against a listener that had waited its full 250.
+    let opened = std::time::Instant::now();
     // Connect and then say nothing at all. The listener accepts the TCP before it can know who
     // is calling, which is precisely the unauthenticated window the bound exists to close.
     let mut stalled = tokio::net::TcpStream::connect(&client_endpoint)
         .await
         .unwrap_or_else(|e| panic!("connect to the client plane at {client_endpoint}: {e}"));
-    let opened = std::time::Instant::now();
     let mut byte = [0u8; 1];
     let read = tokio::time::timeout(deadline(20), stalled.read(&mut byte))
         .await
