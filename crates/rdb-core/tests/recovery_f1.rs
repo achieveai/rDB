@@ -6781,3 +6781,100 @@ fn w10_d1_our_bytes_below_the_commit_are_not_proposed_over() {
     );
     assert_eq!(f1.cas_count(), 2, "no CAS at a revision below the commit");
 }
+
+/// W10-D1 row 10 (A-R102 addendum, Round 13, item 1): a definitive `Unavailable` on the
+/// activation exchange proves our CAS did not apply. It is the same store outage as `Unknown`
+/// under a different timing, so it resolves too, never blocks: one
+/// `BlockPromotion{ControlUnavailable}` fact, then it waits for the exchange's own fire (M4:
+/// `Unavailable` waits), reads, and proposes again at the revision it read. The `Conflict`
+/// re-read's `Unavailable` is the same exit.
+#[retcd_test]
+fn w10_d1_a_definitive_unavailable_activation_resolves_too() {
+    let mut f1 = activation_proposed();
+    let activation = *f1.requests.last().expect("the activation CAS");
+    let t = 4_200;
+    assert_eq!(
+        f1.step(t, cas_result(CasOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    f1.ignores_late(
+        t + 1,
+        cas_result_for(activation, CasOutcome::Committed(Revision(11))),
+    );
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE - 1, fired(5)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE, fired(5)),
+        vec![get(), arm(6, ACTIVATION_DEADLINE + WINDOW)],
+        "the exchange's own fire reads"
+    );
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE + 1, found_at(9, ours())),
+        vec![cas(Revision(9), A)]
+    );
+    let result = recovered(&f1.step(
+        ACTIVATION_DEADLINE + 2,
+        cas_result(CasOutcome::Committed(Revision(10))),
+    ));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, Revision(10));
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+
+    let mut f1 = activation_proposed();
+    assert_eq!(
+        f1.step(
+            t,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(10),
+            })
+        ),
+        vec![get()]
+    );
+    assert_eq!(
+        f1.step(t + 1, read_result(ReadOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)],
+        "the conflict re-read's Unavailable resolves as well"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+}
+
+/// W10-D1 row 11 (A-R102 addendum, Round 13, item 2): a fence held behind the activation whose
+/// re-entry is refused — here no plan is held for its lineage, so `fence()` refuses it
+/// `InvalidConfig` — leaves F1 resolving, never `Blocked`. `Unknown` reads at once;
+/// `Unavailable` waits for the exchange's own fire.
+#[retcd_test]
+fn w10_d1_a_refused_held_fence_leaves_the_activation_resolving() {
+    for (outcome, reason, reads) in [
+        (CasOutcome::Unknown, BlockReason::ControlUnknown, true),
+        (
+            CasOutcome::Unavailable,
+            BlockReason::ControlUnavailable,
+            false,
+        ),
+    ] {
+        let mut f1 = activation_proposed();
+        assert_eq!(
+            f1.rec(
+                REFENCE_AT,
+                RecoveryEvent::FenceProven(Box::new(later_fence()))
+            ),
+            vec![ign(ReplicaIgnoreReason::Recorded)],
+            "held, with no plan for its lineage"
+        );
+        let t = REFENCE_AT + 1;
+        let mut expected = vec![block(reason), ign(ReplicaIgnoreReason::InvalidConfig)];
+        if reads {
+            expected.extend([get(), arm(6, t + WINDOW)]);
+        }
+        assert_eq!(f1.step(t, cas_result(outcome)), expected, "{outcome:?}");
+        assert_eq!(
+            f1.phase(),
+            RecoveryPhase::ActivationUnresolved,
+            "{outcome:?}"
+        );
+    }
+}
