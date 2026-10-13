@@ -301,8 +301,9 @@ impl Publication {
                     return Ok(PubEvent::AuthorityView(*view));
                 }
                 // Another partition's fence never reaches here: `not_ours` answered it.
-                KernelEvent::Authority(AuthorityEvent::Fence { reason, .. }) => {
+                KernelEvent::Authority(AuthorityEvent::Fence { scope, reason }) => {
                     return Ok(PubEvent::Freeze {
+                        scope: *scope,
                         cause: freeze_cause(*reason),
                     });
                 }

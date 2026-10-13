@@ -2605,7 +2605,8 @@ fn after_a_fence_a_record_not_yet_proven_expired_is_not_replaced() {
 
 /// Scenario (S2b-E): the record is not this boot's to replace — the planner froze it, another
 /// boot holds it, the cluster authority generation moved, or it is gone. No CAS and no re-arm:
-/// polling stops, and the node stays fenced (a takeover or a restart is the way on).
+/// polling stops, and the node stays fenced (nothing in M9 moves it on; M10's takeover or rejoin
+/// does, #42).
 #[retcd_test]
 fn after_a_fence_a_record_not_ours_to_replace_stops_the_polling() {
     type Change = fn(&mut GrantRecord);

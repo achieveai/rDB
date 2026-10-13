@@ -320,7 +320,8 @@ pub struct Acquire {
 /// reset, not even by a new grant. The K-A-39 sweep moved all three onto the kernel for exactly
 /// that reason. The epoch revocations followed for the same one (lead ledger L-R178e): a
 /// revocation is a fact about this node's disk, not about a grant, so a new grant must not start
-/// without it.
+/// without it. So did the storage fences, in M9 S2b-E round 4, once a same-boot self-replace
+/// could start a new grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Held {
     grant: GrantId,
@@ -339,7 +340,6 @@ pub struct Held {
     /// from `served`, the entry itself absent. No key is in both this and `served`.
     removed_revisions: BTreeMap<PartitionId, Revision>,
     partitions_revision: Revision,
-    storage_fenced: BTreeSet<PartitionId>,
     /// The last linearizable read of `grants/{node}` answered `Unavailable`, and no quorum has
     /// answered since. Denies `ControlUnavailable` without ending the grant (`design.md` §2.4
     /// property 6; M7A-59). Cleared by the next read that finds our record, or by a committed
@@ -387,14 +387,24 @@ impl Held {
     /// stands in for cannot disagree about a partition. Before it, the view judged the grant
     /// alone and published admitting views for a revoked epoch, a storage-fenced partition, and
     /// a partition this node does not serve.
-    fn partition_deny(&self, lineage: Lineage, revoked: &RevokedEpochs) -> Option<DenyReason> {
+    fn partition_deny(
+        &self,
+        lineage: Lineage,
+        revoked: &RevokedEpochs,
+        storage_fenced: &BTreeSet<PartitionId>,
+    ) -> Option<DenyReason> {
         let current = self.served.get(&lineage.partition).is_some_and(|served| {
             served.generation == lineage.generation && served.owner_epoch == lineage.owner_epoch
         });
         if !current {
             return Some(DenyReason::GenerationChanged);
         }
-        self.installed_deny(lineage.partition, lineage.owner_epoch, revoked)
+        self.installed_deny(
+            lineage.partition,
+            lineage.owner_epoch,
+            revoked,
+            storage_fenced,
+        )
     }
 
     /// The conjuncts of [`Self::partition_deny`] that survive an install: why `owner_epoch` of
@@ -408,11 +418,12 @@ impl Held {
         partition: PartitionId,
         owner_epoch: OwnerEpoch,
         revoked: &RevokedEpochs,
+        storage_fenced: &BTreeSet<PartitionId>,
     ) -> Option<DenyReason> {
         if revoked.contains(&(partition, owner_epoch)) {
             return Some(DenyReason::EpochRevoked);
         }
-        if self.storage_fenced.contains(&partition) {
+        if storage_fenced.contains(&partition) {
             return Some(DenyReason::LocalStorageFenced);
         }
         None
@@ -432,12 +443,16 @@ impl Held {
         id: PartitionId,
         next: Option<&ServedLineage>,
         revoked: &RevokedEpochs,
+        storage_fenced: &BTreeSet<PartitionId>,
     ) -> bool {
         let Some(served) = self.served.get(&id) else {
             return false;
         };
         next.is_none_or(|next| {
-            next != served && self.installed_deny(id, next.owner_epoch, revoked).is_some()
+            next != served
+                && self
+                    .installed_deny(id, next.owner_epoch, revoked, storage_fenced)
+                    .is_some()
         })
     }
 }
@@ -563,8 +578,9 @@ impl TakeoverMarks {
 ///
 /// The held-only items are `Option`, `None` in [`AuthorityState::Unheld`] and
 /// [`AuthorityState::Fenced`]. The held-only collections are empty rather than `None` in those
-/// states, which is the same claim without a second layer to unwrap. `takeover` and
-/// `revoked_epochs` are not held-only: they live on the kernel and read the same in every state.
+/// states, which is the same claim without a second layer to unwrap. `takeover`,
+/// `revoked_epochs` and `storage_fenced` are not held-only: they live on the kernel and read the
+/// same in every state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorityStateView {
     /// The grant state itself, including [`AuthorityState::Fenced`]'s reason and tick.
@@ -607,7 +623,8 @@ pub struct AuthorityStateView {
     /// kernel, like `takeover`: present in every state, kept across grants, and refilled at start
     /// by [`AuthorityEvent::EpochRevocationRestored`] (lead ledger L-R178e).
     pub revoked_epochs: BTreeSet<(PartitionId, OwnerEpoch)>,
-    /// The partitions whose local storage failed. Fenced individually; the grant stays held.
+    /// The partitions whose local storage failed on this boot. Fenced individually; the grant
+    /// stays held. On the kernel, like `revoked_epochs`: kept across a same-boot self-replace.
     pub storage_fenced: BTreeSet<PartitionId>,
     /// The revision the partitions family was last coherently read at.
     ///
@@ -793,6 +810,13 @@ pub struct Authority {
     /// a `Held` field that `enter_held` built empty, so a revocation completed while `Unheld`, or
     /// made by an earlier process, was forgotten by the next grant.
     revoked_epochs: RevokedEpochs,
+    /// The partitions whose local storage failed on this boot (spec §5.2 step 3, ADR-rdb-0007 §3:
+    /// the fence holds for the rest of the generation). On the kernel, not in [`Held`], for the
+    /// `revoked_epochs` reason: a storage failure is a fact about this node's disk, not about a
+    /// grant. Before round 4 of M9 S2b-E it was a `Held` field that `enter_held` built empty, and
+    /// once a same-boot self-replace (A-R96) could start a new grant, the new grant admitted a
+    /// partition this boot had already fenced. It only ever grows; a new process starts empty.
+    storage_fenced: BTreeSet<PartitionId>,
     /// T1's outstanding `grants/{owner}` reads, keyed by the correlation the read was issued
     /// under **and** the owner it reads. `design.md` §2.6a keys by correlation alone, but every
     /// effect of one step carries that step's correlation, so one snapshot naming two owners
@@ -900,6 +924,7 @@ impl Authority {
             grants_issued: 0,
             takeover: BTreeMap::new(),
             revoked_epochs: BTreeSet::new(),
+            storage_fenced: BTreeSet::new(),
             takeover_reads: BTreeMap::new(),
             parked: BTreeMap::new(),
             takeover_marks: TakeoverMarks::default(),
@@ -933,9 +958,7 @@ impl Authority {
                 .unwrap_or_default(),
             takeover: self.takeover.clone(),
             revoked_epochs: self.revoked_epochs.clone(),
-            storage_fenced: held
-                .map(|held| held.storage_fenced.clone())
-                .unwrap_or_default(),
+            storage_fenced: self.storage_fenced.clone(),
             partitions_revision: held.map(|held| held.partitions_revision),
             expiry_utc_ms: held.map(|held| held.expiry_utc_ms),
             renewed_at: held.map(|held| held.renewed_at),
@@ -1110,7 +1133,7 @@ impl Authority {
         if held.control_unavailable {
             return Verdict::Deny(DenyReason::ControlUnavailable);
         }
-        held.partition_deny(lineage, &self.revoked_epochs)
+        held.partition_deny(lineage, &self.revoked_epochs, &self.storage_fenced)
             .map_or(Verdict::Admit, Verdict::Deny)
     }
 
@@ -1473,7 +1496,10 @@ impl Authority {
             generation: served.generation,
             owner_epoch: served.owner_epoch,
         };
-        if held.partition_deny(lineage, &self.revoked_epochs).is_some() {
+        if held
+            .partition_deny(lineage, &self.revoked_epochs, &self.storage_fenced)
+            .is_some()
+        {
             return None;
         }
         let (valid_through_tick, past_horizon) = self.admission_horizon(held, ctx);
@@ -1897,7 +1923,14 @@ impl Authority {
         let superseded: Vec<PartitionId> = held
             .served
             .keys()
-            .filter(|id| held.must_fence(**id, served.get(id), &self.revoked_epochs))
+            .filter(|id| {
+                held.must_fence(
+                    **id,
+                    served.get(id),
+                    &self.revoked_epochs,
+                    &self.storage_fenced,
+                )
+            })
             .copied()
             .collect();
 
@@ -2115,7 +2148,12 @@ impl Authority {
         }
         // A move to a lineage the adopt would withhold fences the old one first, while `served`
         // still holds it (lead ruling A-R56.1, finding N4) — the same shape as a snapshot's.
-        let mut effects = if held.must_fence(id, Some(&lineage), &self.revoked_epochs) {
+        let mut effects = if held.must_fence(
+            id,
+            Some(&lineage),
+            &self.revoked_epochs,
+            &self.storage_fenced,
+        ) {
             self.fence(
                 ctx,
                 event,
@@ -2370,7 +2408,8 @@ impl Authority {
     /// * The store unavailable — a quorum loss, the promise's main path: the poll re-armed one
     ///   renewal interval on, and nothing else. Still `Fenced`.
     /// * `Never`, or the record absent: [`AuthorityIgnoreReason::NotOurs`] and no re-arm. Polling
-    ///   stops; a takeover or a restart is the way on.
+    ///   stops, and nothing in M9 moves the node on: the way on is M10's takeover or rejoin
+    ///   (#42).
     ///
     /// # Errors
     ///
@@ -2639,7 +2678,6 @@ impl Authority {
             served_revisions: BTreeMap::new(),
             removed_revisions: BTreeMap::new(),
             partitions_revision: Revision::default(),
-            storage_fenced: BTreeSet::new(),
             control_unavailable: false,
         });
         self.cursors.insert(ControlPrefix::Grants, revision);
@@ -3769,9 +3807,7 @@ impl Authority {
             FenceScope::Partition(partition),
             DenyReason::LocalStorageFenced,
         );
-        if let AuthorityState::Held(held) = &mut self.state {
-            held.storage_fenced.insert(partition);
-        }
+        self.storage_fenced.insert(partition);
         Ok(effects)
     }
 

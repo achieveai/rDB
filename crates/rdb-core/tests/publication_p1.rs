@@ -1973,6 +1973,7 @@ fn frozen_causes_gate_publication_and_only_the_unresolved_one_reopens() {
     kernel.apply(
         Tick(3),
         PubEvent::Freeze {
+            scope: FenceScope::Node,
             cause: FreezeCause::RecoveryReadOnly,
         },
         Some(&view),
@@ -5079,6 +5080,7 @@ fn admit_publication_read_only() -> (PubMode, PubMode, Vec<PubEffect>, Seq) {
     let mut direct = Direct::new();
     direct.apply(PubEvent::Candidate(candidate_of(P, 5, 5)));
     direct.apply(PubEvent::Freeze {
+        scope: FenceScope::Node,
         cause: FreezeCause::RecoveryReadOnly,
     });
     let entry = direct.kernel.view().mode;
@@ -6299,9 +6301,11 @@ fn m7a_167_post_apply_candidate_under_lost_authority_is_accepted_not_dropped() {
 
     for entry in [
         PubEvent::Freeze {
+            scope: FenceScope::Node,
             cause: FreezeCause::AuthorityLost(DenyReason::Expired),
         },
         PubEvent::Freeze {
+            scope: FenceScope::Node,
             cause: FreezeCause::LocalStorageFenced,
         },
         PubEvent::BlockPartition { reason: block() },
@@ -6327,7 +6331,10 @@ fn m7a_167_post_apply_candidate_under_lost_authority_is_accepted_not_dropped() {
         FreezeCause::RecoveryReadOnly,
     ] {
         let mut direct = Direct::new();
-        direct.apply(PubEvent::Freeze { cause });
+        direct.apply(PubEvent::Freeze {
+            scope: FenceScope::Node,
+            cause,
+        });
         let mode = direct.kernel.view().mode;
         assert_eq!(
             direct.apply(PubEvent::Candidate(candidate_of(P, 7, 7))),
@@ -6990,21 +6997,25 @@ fn a_partition_scope_lost_authority_freeze_never_thaws_in_m9() {
 /// `Fence` before its past view. No grant id is known to have ended, so the first admitting view
 /// of this lineage, from the grant the self-replace wrote, thaws P1: writes come back by
 /// themselves (A-R96). A node fence ends its grant id, and A1 never again publishes an admitting
-/// view under it.
+/// view under it. The fence's own past view under the ended grant arrives between, as `fence()`
+/// emits it, and lifts nothing (reviewer F-002). The partition-scope twin stays frozen (A-R97).
 #[retcd_test]
 fn a_node_fence_before_any_view_thaws_on_the_first_admitting_view() {
-    let mut rig = Rig::bare();
-    assert_eq!(
-        rig.step(fence(FenceScope::Node, DenyReason::Expired)),
-        vec![]
-    );
-    assert_eq!(
-        rig.view().mode,
-        PubMode::Frozen {
-            cause: FreezeCause::AuthorityLost(DenyReason::Expired)
-        },
-        "fixture"
-    );
-    assert_eq!(rig.step(view_under(2, 2, u64::MAX)), vec![]);
-    assert_eq!(rig.view().mode, PubMode::Serving);
+    for scope in [FenceScope::Node, FenceScope::Partition(P)] {
+        let mut rig = Rig::bare();
+        assert_eq!(rig.step(fence(scope, DenyReason::Expired)), vec![]);
+        let frozen = PubMode::Frozen {
+            cause: FreezeCause::AuthorityLost(DenyReason::Expired),
+        };
+        assert_eq!(rig.view().mode, frozen, "{scope:?}: fixture");
+        // The past view under grant 1, which the fence ended: not admitting at now = 100.
+        assert_eq!(rig.step(view_under(1, 1, 50)), vec![]);
+        assert_eq!(rig.view().mode, frozen, "{scope:?}: the past view");
+        assert_eq!(rig.step(view_under(2, 2, u64::MAX)), vec![]);
+        let expected = match scope {
+            FenceScope::Node => PubMode::Serving,
+            FenceScope::Partition(_) => frozen,
+        };
+        assert_eq!(rig.view().mode, expected, "{scope:?}: the new grant's view");
+    }
 }

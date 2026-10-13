@@ -160,7 +160,7 @@ pub enum SelfReplace {
     /// This boot's record, but its expiry is not proven past yet: ask again later.
     NotYet,
     /// Not this boot's to replace: frozen (a takeover's), another boot's, or issued under another
-    /// authority generation. Only a takeover or a restart moves it.
+    /// authority generation. Nothing in M9 moves it: the way on is M10's takeover or rejoin (#42).
     Never,
 }
 

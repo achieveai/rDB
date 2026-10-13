@@ -117,6 +117,50 @@ pub enum QueueMode {
     },
 }
 
+/// What a `Frozen{AuthorityLost}` freeze waits for: whether a view can lift it (lead rulings A-R96,
+/// A-R97). Shared by T1 and P1, so the two kernels cannot disagree about a thaw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LostAuthority {
+    /// A node fence ended the grant, or (P1 only) a deny at `Publication` quarantined a write.
+    /// An admitting view of the frozen lineage lifts it, unless it is under `ended`, the grant id
+    /// of the view held at the freeze. `ended` is `None` when no view was held then (C02,
+    /// `s2b-verify.md`): any admitting view lifts it, because a node fence ends its grant id and
+    /// A1 never again publishes an admitting view under it.
+    Thaws {
+        /// The grant id the freeze ended, if a view was held.
+        ended: Option<GrantId>,
+    },
+    /// A partition-scope fence (`GenerationChanged`, `EpochRevoked`, ...). Never lifted by a
+    /// view in M9 (A-R97): it waits for M10's takeover or rejoin, which comes as `Recovered`.
+    /// Sticky: a later node fence does not make it liftable.
+    Stays,
+}
+
+impl LostAuthority {
+    /// The record a freeze for lost authority leaves. `partition_scope` is whether the fence was
+    /// partition-scoped; `before` is the record already held; `held` is the grant id of the view
+    /// held now.
+    pub(crate) const fn at_freeze(
+        partition_scope: bool,
+        before: Option<Self>,
+        held: Option<GrantId>,
+    ) -> Self {
+        if partition_scope || matches!(before, Some(Self::Stays)) {
+            Self::Stays
+        } else {
+            Self::Thaws { ended: held }
+        }
+    }
+
+    /// Whether an admitting view of the frozen lineage under `grant` lifts the freeze.
+    pub(crate) fn lifts_under(self, grant: GrantId) -> bool {
+        match self {
+            Self::Thaws { ended } => ended != Some(grant),
+            Self::Stays => false,
+        }
+    }
+}
+
 /// How long the start record may wait for its `StorageDispatch` answer before it is refused and
 /// owed again (M9 S0 rules 1 and 2). One hour, as in the probe that proved the trigger
 /// (`s0-probe.md` E4b): no client waits on it, so the deadline only bounds a check A1 never
@@ -399,10 +443,9 @@ pub struct TxnKernel {
     /// When the start record was last refused, `None` until it is. A send under such a
     /// same-seq view waits one renew interval from it (review F-003, critic C1).
     start_refused_at: Option<Tick>,
-    /// The grant id of the view held when the queue froze for lost authority. Only an admitting
-    /// view of this lineage under a **different** grant id thaws it (lead ruling A-R96); `None`
-    /// when no view was held then, and such a freeze never thaws here.
-    lost_grant: Option<GrantId>,
+    /// What the queue's lost-authority freeze waits for (lead rulings A-R96, A-R97); `None` until
+    /// one freezes it.
+    lost: Option<LostAuthority>,
 }
 
 impl TxnKernel {
@@ -603,7 +646,7 @@ impl TxnKernel {
             },
             start_sent_under: None,
             start_refused_at: None,
-            lost_grant: None,
+            lost: None,
         }
     }
 
@@ -1320,16 +1363,26 @@ impl TxnKernel {
         }
     }
 
-    /// Lift a lost-authority freeze (lead ruling A-R96, M9 S2b-E), or `None` when it holds.
+    /// Lift a lost-authority freeze (lead rulings A-R96 and A-R97, M9 S2b-E), or `None` when it
+    /// holds.
     ///
-    /// It lifts only when **all** of these hold: the queue is `Frozen{AuthorityLost}` with
-    /// nothing unresolved; the view held names exactly this lineage; its grant id differs from
-    /// the one held at the freeze; and it admits now. Safe because an `AuthorityLost` freeze
-    /// comes only from a node fence, terminal for its grant id, or from a revoked epoch, whose
-    /// lineage A1 publishes no view for again. So an admitting view of this lineage under another
-    /// grant id is a new grant of the same boot, and with nothing unresolved every applied seq
-    /// is published: `next_seq` and `prev_digest` continue the chain. `LocalStorageFenced`,
-    /// `UnresolvedTransaction` and `RecoveryReadOnly` are never lifted here.
+    /// The rule (A-R97): only a freeze whose `AuthorityLost` came from a **node**-scope fence
+    /// lifts here. It lifts only when **all** of these hold: the queue is `Frozen{AuthorityLost}`
+    /// with nothing unresolved; a node fence froze it and no partition fence did
+    /// ([`LostAuthority::Thaws`]); the view held names exactly this lineage; its grant id is not
+    /// the one held at the freeze (any grant id, when none was held: C02); and it admits now.
+    /// One rule per source of an `AuthorityLost` freeze:
+    /// - a node fence (`Expired`, `HolderMismatch`, ...): terminal for its grant id, so an
+    ///   admitting view of this lineage under another grant id is a new grant of the same boot.
+    ///   It lifts (A-R96).
+    /// - a partition-scope fence, `GenerationChanged` (`classify`, `classify_absent`, an adopt's
+    ///   `must_fence`, a superseding snapshot) or `EpochRevoked`: never lifted here in M9, **even
+    ///   at the identical lineage** under a new grant. It waits for M10's takeover or rejoin
+    ///   (#42). A later node fence does not make it liftable.
+    ///
+    /// With nothing unresolved every applied seq is published, so `next_seq` and `prev_digest`
+    /// continue the chain. `LocalStorageFenced`, `UnresolvedTransaction` and `RecoveryReadOnly`
+    /// are never lifted here.
     fn thaw(&mut self, ctx: &StepCtx<'_>) -> Option<Vec<TxnEffect>> {
         let QueueMode::Frozen {
             cause: FreezeCause::AuthorityLost(_),
@@ -1339,15 +1392,15 @@ impl TxnKernel {
             return None;
         };
         let view = self.authority?;
-        let lost = self.lost_grant?;
+        let lost = self.lost?;
         if view.lineage != self.lineage
-            || view.grant_id == lost
+            || !lost.lifts_under(view.grant_id)
             || ctx.now > view.valid_through_tick
         {
             return None;
         }
         self.mode = QueueMode::Open;
-        self.lost_grant = None;
+        self.lost = None;
         Some(self.pump(ctx))
     }
 
@@ -1359,6 +1412,19 @@ impl TxnKernel {
         if !covers {
             return vec![ignored(AuthorityIgnoreReason::NotOurs)];
         }
+        // A storage fence holds for the rest of the generation (spec §5.2 step 3, ADR-rdb-0007
+        // §3), so a later loss of authority never replaces it: a new grant's view would then
+        // lift a freeze that must hold (M9 S2b-E round 4).
+        let cause = match (self.mode, cause) {
+            (
+                QueueMode::Frozen {
+                    cause: FreezeCause::LocalStorageFenced,
+                    ..
+                },
+                FreezeCause::AuthorityLost(_),
+            ) => FreezeCause::LocalStorageFenced,
+            _ => cause,
+        };
         let mut out = Vec::new();
         let unresolved = match self.inflight.take() {
             Some(Inflight::AwaitingDispatchCheck { admitted, .. }) => {
@@ -1382,7 +1448,11 @@ impl TxnKernel {
             freeze_error(cause, &k.deny_context(identity, k.lineage.generation))
         }));
         if matches!(cause, FreezeCause::AuthorityLost(_)) {
-            self.lost_grant = self.authority.map(|view| view.grant_id);
+            self.lost = Some(LostAuthority::at_freeze(
+                matches!(scope, FenceScope::Partition(_)),
+                self.lost,
+                self.authority.map(|view| view.grant_id),
+            ));
         }
         self.mode = QueueMode::Frozen { cause, unresolved };
         out
@@ -1974,7 +2044,7 @@ mod tests {
             start: super::StartRecord::NotOwed,
             start_sent_under: None,
             start_refused_at: None,
-            lost_grant: None,
+            lost: None,
         }
     }
 

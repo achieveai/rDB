@@ -11,13 +11,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::contracts::authority::{
-    AuthorityDecision, AuthorityView, BlockReason, Boundary, Checkpoint, DenyReason, Lineage,
-    PartitionMode, Verdict,
+    AuthorityDecision, AuthorityView, BlockReason, Boundary, Checkpoint, DenyReason, FenceScope,
+    Lineage, PartitionMode, Verdict,
 };
 use crate::contracts::digest::Digest;
 use crate::contracts::errors::ErrorKind;
 use crate::contracts::ids::{
-    BootId, CorrelationId, Generation, GrantId, PartitionId, RequestIdentity, Seq, SnapshotHandle,
+    BootId, CorrelationId, Generation, PartitionId, RequestIdentity, Seq, SnapshotHandle,
     TimerVersion,
 };
 pub use crate::contracts::publication::{
@@ -32,7 +32,7 @@ use crate::contracts::time::Tick;
 use crate::contracts::txn::{Durability, Outcome as TxnOutcome, TxnResult};
 use crate::replication::progress::DigestLookup;
 use crate::transaction::dedup::{parse_dedup_key, parse_dedup_value, SEED_PAGE};
-use crate::transaction::RETENTION_CAP_ENTRIES;
+use crate::transaction::{LostAuthority, RETENTION_CAP_ENTRIES};
 
 use super::status::{recovered_outcome, StatusIndex};
 use super::view::ReplicationView;
@@ -180,7 +180,8 @@ pub enum PubFact {
     /// `Admit` at `Publication` in `Blocked`.
     PublishRefusedBlocked,
     /// `Admit` at `Publication` in `Frozen{RecoveryReadOnly}` (test plan Q-6), or
-    /// `Deny(ControlUnavailable)` there: asked again on A1's next view (A-R96 M2).
+    /// `Deny(ControlUnavailable)` at `Publication` in any mode: asked again on A1's next view
+    /// (A-R96 M2).
     PublishDeferred,
     /// `Admit` at `Publication`, but R1's predicate is false now.
     PublishPredicateFalse {
@@ -261,6 +262,9 @@ pub enum PubEvent {
     },
     /// A1 fenced a scope covering this partition.
     Freeze {
+        /// The scope A1 fenced: only a node-scope `AuthorityLost` freeze can thaw (lead ruling
+        /// A-R97).
+        scope: FenceScope,
         /// Why.
         cause: FreezeCause,
     },
@@ -577,10 +581,9 @@ pub struct PubKernel {
     waiters: VecDeque<Waiter>,
     authority: Option<AuthorityView>,
     mode: PubMode,
-    /// The grant id of the view held when the mode became `Frozen{AuthorityLost}`, which only an
-    /// admitting view of this lineage under a **different** grant id thaws (lead ruling A-R96).
-    /// `None` when no view was held then, and such a freeze never thaws here.
-    lost_grant: Option<GrantId>,
+    /// What the `Frozen{AuthorityLost}` mode waits for (lead rulings A-R96, A-R97): the same
+    /// record T1 keeps, so the two kernels cannot disagree about a thaw. `None` outside it.
+    lost: Option<LostAuthority>,
     next_correlation: u64,
     next_timer_version: u64,
     /// Invariant: when `Some`, storage bound it at [`Self::published`].
@@ -609,7 +612,7 @@ impl PubKernel {
             waiters: VecDeque::new(),
             authority: None,
             mode: PubMode::Serving,
-            lost_grant: None,
+            lost: None,
             next_correlation: 0,
             next_timer_version: 0,
             kept: None,
@@ -828,7 +831,7 @@ impl PubKernel {
                     outcome,
                 }]
             }
-            PubEvent::Freeze { cause } => self.on_freeze(cause),
+            PubEvent::Freeze { scope, cause } => self.on_freeze(scope, cause),
             PubEvent::AuthorityView(view) => self.on_view(now, view),
             PubEvent::BlockPartition { reason } => self.on_block(reason),
             PubEvent::ModeQuery { reader } => vec![PubEffect::Mode {
@@ -1124,7 +1127,13 @@ impl PubKernel {
             self.mode = PubMode::Frozen {
                 cause: FreezeCause::AuthorityLost(reason),
             };
-            self.lost_grant = self.authority.map(|view| view.grant_id);
+            // A deny at `Publication` is not a partition fence of its own; a partition fence
+            // already recorded stays (A-R97).
+            self.lost = Some(LostAuthority::at_freeze(
+                false,
+                self.lost,
+                self.authority.map(|view| view.grant_id),
+            ));
         }
         effects.extend(self.drain_waiters());
         effects
@@ -1485,7 +1494,7 @@ impl PubKernel {
             .collect()
     }
 
-    fn on_freeze(&mut self, cause: FreezeCause) -> Vec<PubEffect> {
+    fn on_freeze(&mut self, scope: FenceScope, cause: FreezeCause) -> Vec<PubEffect> {
         if let Some(pending) = self.pending.as_mut() {
             pending.recheck = None;
         }
@@ -1494,8 +1503,24 @@ impl PubKernel {
             effects.push(PubEffect::Fact(PubFact::FenceWhileBlocked { cause }));
             return effects;
         }
+        // A storage fence holds for the rest of the generation (spec §5.2 step 3, ADR-rdb-0007
+        // §3), so a later loss of authority never replaces it: a new grant's view would then
+        // lift a freeze that must hold (M9 S2b-E round 4).
+        let cause = match (&self.mode, cause) {
+            (
+                PubMode::Frozen {
+                    cause: FreezeCause::LocalStorageFenced,
+                },
+                FreezeCause::AuthorityLost(_),
+            ) => FreezeCause::LocalStorageFenced,
+            _ => cause,
+        };
         if matches!(cause, FreezeCause::AuthorityLost(_)) {
-            self.lost_grant = self.authority.map(|view| view.grant_id);
+            self.lost = Some(LostAuthority::at_freeze(
+                matches!(scope, FenceScope::Partition(_)),
+                self.lost,
+                self.authority.map(|view| view.grant_id),
+            ));
         }
         self.mode = PubMode::Frozen { cause };
         let mut effects = self.drain_waiters();
@@ -1536,13 +1561,22 @@ impl PubKernel {
         }]
     }
 
-    /// Whether the view held would lift a lost-authority freeze (lead ruling A-R96, M9 S2b-E):
-    /// the mode is `Frozen{AuthorityLost}`, the view names exactly this lineage under a grant id
-    /// other than the one held at the freeze, and it admits now. Safe for the reason
-    /// `TxnKernel::thaw` gives: an `AuthorityLost` freeze comes only from a node fence, terminal
-    /// for its grant id, from a revoked epoch, whose lineage A1 publishes no view for again, or
-    /// from a deny at `Publication`. `LocalStorageFenced`, `Blocked`, `UnresolvedTransaction` and
-    /// `RecoveryReadOnly` are never lifted here.
+    /// Whether the view held would lift a lost-authority freeze (lead rulings A-R96 and A-R97,
+    /// M9 S2b-E): the mode is `Frozen{AuthorityLost}`, no partition-scope fence froze it
+    /// ([`LostAuthority::Thaws`]), the view names exactly this lineage under a grant id other
+    /// than the one held at the freeze (any grant id, when none was held: C02), and it admits now.
+    ///
+    /// The rule is `TxnKernel::thaw`'s, one per source of an `AuthorityLost` freeze:
+    /// - a node fence: terminal for its grant id, so it lifts (A-R96).
+    /// - a deny at `Publication` that quarantined a write: lifts as a node fence does, unless a
+    ///   partition fence froze it earlier.
+    /// - a partition-scope fence, `GenerationChanged` (`classify`, `classify_absent`, an adopt's
+    ///   `must_fence`, a superseding snapshot) or `EpochRevoked`: never lifted here in M9, **even
+    ///   at the identical lineage** under a new grant. It waits for M10's takeover or rejoin
+    ///   (#42), which arrives as `Recovered`. A later node fence does not make it liftable.
+    ///
+    /// `LocalStorageFenced`, `Blocked`, `UnresolvedTransaction` and `RecoveryReadOnly` are never
+    /// lifted here.
     fn thaw_view(&self, now: Tick) -> bool {
         let lost = matches!(
             self.mode,
@@ -1552,7 +1586,9 @@ impl PubKernel {
         );
         lost && self.authority.is_some_and(|view| {
             view.lineage == self.lineage
-                && self.lost_grant.is_some_and(|grant| grant != view.grant_id)
+                && self
+                    .lost
+                    .is_some_and(|lost| lost.lifts_under(view.grant_id))
                 && now <= view.valid_through_tick
         })
     }
@@ -1565,7 +1601,7 @@ impl PubKernel {
             return Vec::new();
         }
         self.mode = PubMode::Serving;
-        self.lost_grant = None;
+        self.lost = None;
         self.drain_waiters()
     }
 
@@ -1601,6 +1637,9 @@ impl PubKernel {
     }
 
     fn on_recovered(&mut self, result: &RecoveryResult) -> Vec<PubEffect> {
+        // Both branches below set the mode from the recovery, never to `AuthorityLost`, so a
+        // record from before is stale; a sticky `Stays` kept here would refuse a later thaw.
+        self.lost = None;
         // M9 S0 D3: F1's re-emit of the lineage already served (T-B-03) moves no position. What
         // was published, the candidate pending and the replies owed all belong to this lineage,
         // so only the mode changes. The view kept is still the published one: the lineage and
