@@ -595,7 +595,10 @@ impl Db {
             client: CLIENT,
             request,
         };
-        maybe_mutated(self.put_identified(identity, object, value, if_version))
+        maybe_mutated(
+            request,
+            self.put_identified(identity, object, value, if_version),
+        )
     }
 
     fn put_identified(
@@ -701,7 +704,8 @@ impl Db {
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
         let wait = send_wait(Duration::from_millis(request.remaining_millis));
-        maybe_mutated(self.send(ClientCall::Resend { request }, wait))
+        let id = request.identity.request;
+        maybe_mutated(id, self.send(ClientCall::Resend { request }, wait))
     }
 
     /// Send `request` again with a fresh kernel deadline, `deadline`: same identity, same
@@ -718,14 +722,21 @@ impl Db {
         mut request: TxnRequest,
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
+        let id = request.identity.request;
         if let Some(error) = deadline_refusal(deadline) {
-            return maybe_mutated(Err(PutError {
-                error,
-                request: Some(Box::new(request)),
-            }));
+            return maybe_mutated(
+                id,
+                Err(PutError {
+                    error,
+                    request: Some(Box::new(request)),
+                }),
+            );
         }
         request.remaining_millis = millis(deadline);
-        maybe_mutated(self.send(ClientCall::Resend { request }, send_wait(deadline)))
+        maybe_mutated(
+            id,
+            self.send(ClientCall::Resend { request }, send_wait(deadline)),
+        )
     }
 
     /// Send a write and wait `wait` for its answer.
@@ -1233,12 +1244,21 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
     })
 }
 
-/// A resend's answer: whatever refused it, the request may have applied on an earlier send.
-/// Kernel checks 2 (deadline) and 9 (overload) run before the dedup replay and prove only that
-/// this send mutated nothing (Q-A).
-fn maybe_mutated(answer: Result<PutOk, PutError>) -> Result<PutOk, PutError> {
+/// A resend's or retry's answer under `request`: whatever refused it, the request may have
+/// applied on an earlier send. Kernel checks 2 (deadline) and 9 (overload) run before the dedup
+/// replay and prove only that this send mutated nothing (Q-A). A `PROTECTION_PAUSED` refusal
+/// also points at [`Db::status`] (Message 7, P2): a retry of a write that already finished is
+/// refused paused too (F1), and status shows its outcome. A new put's refusal does not come
+/// through here.
+fn maybe_mutated(request: RequestId, answer: Result<PutOk, PutError>) -> Result<PutOk, PutError> {
     answer.map_err(|mut refused| {
         refused.error.no_mutation = false;
+        if refused.error.kind == ErrorKind::ProtectionPaused {
+            refused.error.detail = format!(
+                "{}; status {} shows its outcome",
+                refused.error.detail, request.0
+            );
+        }
         refused
     })
 }
@@ -2337,6 +2357,82 @@ mod tests {
             db.resend(late).expect("published after the heal").seq,
             Seq(5)
         );
+        db.shutdown();
+    }
+
+    /// Message 7, P2. F1 keeps a retry of a finished write `PROTECTION_PAUSED`, so a refused
+    /// resend or retry says `status <id>` shows its outcome. A new txn or put refused paused
+    /// sent nothing before, so it does not. Same pause as scenario 3b above: links 1-2 and 1-3
+    /// held, one txn unpublished.
+    /// Integration (~1 s): three node threads and one 100 ms expiry.
+    #[test]
+    fn a_paused_resend_or_retry_points_at_status_and_a_paused_new_write_does_not() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+
+        let clause = "shows its outcome";
+        let new_txn = db
+            .txn(&[txn_put(b"b", b"1", None)], Duration::from_secs(2))
+            .expect_err("3b: refused while the first txn is unpublished");
+        assert_eq!(
+            new_txn.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{new_txn:?}"
+        );
+        assert!(!new_txn.error.detail.contains(clause), "{new_txn:?}");
+        let new_put = db
+            .put(b"c", b"1", None)
+            .expect_err("a new put is refused too");
+        assert_eq!(
+            new_put.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{new_put:?}"
+        );
+        assert!(!new_put.error.detail.contains(clause), "{new_put:?}");
+
+        let request = new_txn.request.expect("a kernel refusal keeps its request");
+        let id = request.identity.request;
+        let want = format!("; status {} shows its outcome", id.0);
+        for (how, refused) in [
+            ("resend", db.resend((*request).clone())),
+            (
+                "resend_within",
+                db.resend_within((*request).clone(), Duration::from_secs(2)),
+            ),
+            ("put_as", db.put_as(id, b"b", b"2", None)),
+        ] {
+            let refused = refused.expect_err(how);
+            assert_eq!(
+                refused.error.kind,
+                ErrorKind::ProtectionPaused,
+                "{how}: {refused:?}"
+            );
+            assert!(refused.error.detail.ends_with(&want), "{how}: {refused:?}");
+        }
+        db.links().heal_all();
         db.shutdown();
     }
 

@@ -108,7 +108,10 @@
 //! `waiting to admit writes (l1=.. authority=..)`, and `ready` once node 1 admits writes: its L1
 //! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
 //! waiting line then saying which. When node 1's grant is fenced, that line says why and that
-//! writes resume by themselves, so the node is not restarted (#42). A put before `ready` is refused, never left hanging. A recovery committed below `Active` that
+//! writes resume by themselves, so the node is not restarted (#42). After a secondary restarts,
+//! L1 still admits writes for about 2 s, so the line reads `ready for now; writes pause within
+//! about 2 s because ..` until they do. A put before `ready` is refused, never left hanging. A
+//! recovery committed below `Active` that
 //! does not activate prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever
 //! the line changes:
 //!
@@ -429,7 +432,7 @@ struct Seen {
     recovered: Option<Generation>,
     ready: bool,
     waiting: Option<String>,
-    /// The reason last printed on a `not ready` line.
+    /// The reason last printed on a `ready` or `not ready` line.
     reason: Option<String>,
     faults: Vec<String>,
     /// Each node's stall line as last printed, until it clears.
@@ -478,13 +481,8 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 ));
             }
             let admits = owner.admits == Some(true);
-            let reason = not_ready_reason(owner, db.restart_note().as_deref());
-            if let Some(line) = ready_change(&seen, admits, reason.as_ref()) {
+            if let Some(line) = ready_step(&mut seen, owner, db.restart_note().as_deref()) {
                 say(&line);
-                seen.ready = admits;
-                if !admits {
-                    seen.reason = reason;
-                }
             }
             if seen.recovered.is_some() && !admits {
                 let why = waiting_line(owner);
@@ -499,18 +497,25 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
     }
 }
 
-/// Why node 1 does not admit writes, when a user could act on it wrongly. A restart wins: nothing
-/// else says writes will not come back in this run (D2). Then a fenced grant, which looks stuck
-/// but is not: A1 replaces the grant itself once the old one's expiry is proven, and a restart
-/// there would end recovery for the run (Message 6).
-fn not_ready_reason(owner: &NodeStatus, restart_note: Option<&str>) -> Option<String> {
+/// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. A
+/// restart wins. While node 1 still admits writes, it says they are about to pause: L1 keeps
+/// admitting for about 2 s after a secondary restarts (walk 6c), so a bare `ready` there is true
+/// and misleading (Message 7). Once they pause, it says nothing brings them back in this run
+/// (D2). Then a fenced grant, which looks stuck but is not: A1 replaces the grant itself once the
+/// old one's expiry is proven, and a restart there would end recovery for the run (Message 6).
+fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) -> Option<String> {
     if let Some(note) = restart_note {
-        return Some(format!(
-            "{note}; writes stay stopped for this run: to write again, quit and start rdb_dev again"
-        ));
+        return Some(if admits {
+            format!("writes pause within about 2 s because {note}")
+        } else {
+            format!(
+                "{note}; writes stay stopped for this run: to write again, quit and start rdb_dev \
+                 again"
+            )
+        });
     }
     let node = owner.node.0;
-    owner.authority.starts_with("fenced").then(|| {
+    (!admits && owner.authority.starts_with("fenced")).then(|| {
         format!(
             "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
              is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
@@ -520,18 +525,27 @@ fn not_ready_reason(owner: &NodeStatus, restart_note: Option<&str>) -> Option<St
     })
 }
 
-/// The `ready` or `not ready` line to print, given what was printed last: on each change of
-/// `admits`, and while not ready again when a new reason appears (a fence after the line, a
-/// restart after a fence). A reason that goes away prints nothing; the waiting line says what is
-/// left.
-fn ready_change(seen: &Seen, admits: bool, reason: Option<&String>) -> Option<String> {
+/// The `ready` or `not ready` line to print for `owner`, given what was printed last, and what
+/// `seen` now holds as printed: on each change of `admits`, and again when a new reason appears
+/// (a restart while ready, a fence after the line, a restart after a fence). A reason that goes
+/// away prints nothing; the waiting line says what is left.
+fn ready_step(seen: &mut Seen, owner: &NodeStatus, restart_note: Option<&str>) -> Option<String> {
+    let admits = owner.admits == Some(true);
+    let reason = ready_reason(owner, admits, restart_note);
     let changed = admits != seen.ready;
-    let new_reason = !admits && reason.is_some() && reason != seen.reason.as_ref();
-    (changed || new_reason).then(|| match (admits, reason) {
-        (true, _) => "ready".to_owned(),
+    let new_reason = reason.is_some() && reason != seen.reason;
+    if !(changed || new_reason) {
+        return None;
+    }
+    let line = match (admits, &reason) {
+        (true, None) => "ready".to_owned(),
+        (true, Some(why)) => format!("ready for now; {why}"),
         (false, None) => "not ready: writes not admitted".to_owned(),
         (false, Some(why)) => format!("not ready: writes not admitted: {why}"),
-    })
+    };
+    seen.ready = admits;
+    seen.reason = reason;
+    Some(line)
 }
 
 /// The line to print when a node's stall line changes, given the one printed last. Not a node
@@ -1633,15 +1647,7 @@ mod tests {
             (fenced.clone(), Some(note)),
             (owner(None, true), None),
         ] {
-            let admits = node.admits == Some(true);
-            let reason = not_ready_reason(&node, restart);
-            if let Some(line) = ready_change(&seen, admits, reason.as_ref()) {
-                lines.push(line);
-                seen.ready = admits;
-                if !admits {
-                    seen.reason = reason;
-                }
-            }
+            lines.extend(ready_step(&mut seen, &node, restart));
         }
         assert_eq!(
             lines,
@@ -1656,6 +1662,35 @@ mod tests {
                      to write again, quit and start rdb_dev again"
                 ),
                 "ready".to_owned(),
+            ]
+        );
+    }
+
+    /// Message 7: after a secondary restarts, L1 keeps admitting writes for about 2 s (walk 6c),
+    /// and a bare `ready` then read as if writes would last. While admitted the line says they
+    /// are about to pause and why; once they pause, the not-ready line says so for the run.
+    #[test]
+    fn ready_after_a_restart_says_writes_pause_within_about_2_s() {
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let mut seen = Seen::default();
+        let mut lines = Vec::new();
+        for (node, restart) in [
+            (owner(None, true), None),
+            (owner(None, true), Some(note)),
+            (owner(None, true), Some(note)),
+            (owner(None, false), Some(note)),
+        ] {
+            lines.extend(ready_step(&mut seen, &node, restart));
+        }
+        assert_eq!(
+            lines,
+            [
+                "ready".to_owned(),
+                format!("ready for now; writes pause within about 2 s because {note}"),
+                format!(
+                    "not ready: writes not admitted: {note}; writes stay stopped for this run: \
+                     to write again, quit and start rdb_dev again"
+                ),
             ]
         );
     }
