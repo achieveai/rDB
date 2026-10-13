@@ -2881,6 +2881,52 @@ fn after_a_fence_an_unavailable_poll_keeps_polling_until_control_returns() {
     );
 }
 
+/// Round 5 (the add-on 3 leftover): the poll's answer is a body this build cannot decode. The
+/// host offers a control answer to every module and drops an `Unavailable` error from one that
+/// is not its named consumer, so an error here re-armed nothing while `self_replace_polling`
+/// still read `true`. It is now treated as an unavailable store: the poll is armed again one
+/// renewal interval on, the node stays fenced and still polling, and the next readable answer
+/// replaces as usual.
+#[retcd_test]
+fn after_a_fence_an_undecodable_poll_answer_keeps_polling() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let at = 3_150;
+    let garbage = ReadOutcome::Found {
+        revision: Revision(7),
+        value: Bytes::from_static(b"not a grant record"),
+    };
+    let effects = kernel
+        .step(&sampled_at(at, at), &polled(at, poll, garbage))
+        .expect("an undecodable poll answer re-arms; it is not a step error");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(at + BUDGETS.renew_millis)
+        )]
+    );
+    assert!(kernel.state().is_fenced());
+    assert!(kernel.self_replace_polling(), "still polling");
+    let back = at + BUDGETS.renew_millis;
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(back, back), &acquire_due(&kernel, back, back))
+            .expect("the re-armed firing"),
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(back, back),
+            &polled(back, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("a readable answer");
+    assert!(
+        matches!(shapes(&effects).as_slice(), [Shape::Cas { .. }]),
+        "the replace: {effects:?}"
+    );
+}
+
 /// Reviewer F-004/F-016 (round 4 add-on 3): `self_replace_polling` says whether the fenced node
 /// will read its own record again. It holds from the fence through a `NotYet` wait and an
 /// unavailable store, each of which re-arms, and stops once a poll's answer is a record not ours

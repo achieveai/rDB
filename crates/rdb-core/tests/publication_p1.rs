@@ -6960,6 +6960,32 @@ fn a_node_fence_never_replaces_a_storage_fence() {
     assert_eq!(rig.view().mode, frozen, "the new grant's view");
 }
 
+/// Round 5 (the round 4 leftover, F-003's class): a deny at `Publication` quarantines the write,
+/// and it must not replace a storage fence with `AuthorityLost` either, which a new grant's view
+/// would thaw to `Serving`. The candidate is pending when `P` is storage-fenced, as in M7A-170
+/// (c), and the check answers `Deny(Expired)`.
+#[retcd_test]
+fn a_publication_deny_never_replaces_a_storage_fence() {
+    let mut rig = Rig::new();
+    rig.step(candidate(5, 5));
+    enter_storage_fenced(&mut rig);
+    let frozen = PubMode::Frozen {
+        cause: FreezeCause::LocalStorageFenced,
+    };
+    assert_eq!(rig.view().mode, frozen, "fixture");
+    rig.qualify(5);
+    let c = publication_check(&rig.step(gained(5)));
+    let effects = rig.step(answer(
+        Checkpoint::Publication,
+        c,
+        Verdict::Deny(DenyReason::Expired),
+    ));
+    assert!(effects.contains(&quarantined(5)), "fixture: {effects:?}");
+    assert_eq!(rig.view().mode, frozen, "the deny keeps the cause");
+    rig.step(view_under(2, 2, u64::MAX));
+    assert_eq!(rig.view().mode, frozen, "the new grant's view");
+}
+
 /// Round 4, lead ruling A-R97: the A-R96 thaw lifts only a freeze a **node** fence caused. A
 /// partition-scope `AuthorityLost` fence (`GenerationChanged`, as `classify`, an adopt's
 /// `must_fence` or a snapshot's supersession sends it) never thaws in M9: it waits for M10's
