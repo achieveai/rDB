@@ -1376,6 +1376,93 @@ fn check_eight_fails_closed_then_passes_the_reason_through() {
     );
 }
 
+/// P2 (red first). R(1) is published and retained; then L1 pauses. A retry of R(1) asks for
+/// nothing new, so it is answered with the saved Published result, as `m7a_72` answers it while
+/// L1 allows. That reply is the step's only effect: no batch, no check, nothing reserved. Today
+/// check 8 refuses first with `PROTECTION_PAUSED` while status says Published.
+#[retcd_test]
+fn a_retry_of_a_published_request_replays_while_l1_pauses() {
+    let (mut h, retained) = retained_after_publish();
+    assert_eq!(retained.outcome, Outcome::Published);
+    let before = (h.k().next_seq(), h.k().prev_digest());
+    assert_eq!(
+        h.step(admission(false, Some(ErrorKind::ProtectionPaused))),
+        vec![]
+    );
+    assert_eq!(
+        h.step(submit(put(1, b"k", b"v"))),
+        vec![EffectKind::Reply(ReplyEffect::Transaction {
+            identity: identity(1),
+            result: retained,
+        })]
+    );
+    assert_eq!((h.k().next_seq(), h.k().prev_digest()), before);
+    assert_eq!(h.k().inflight(), None);
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+}
+
+// pending ruling P2
+/// P2, the case the ruling decides. A retry of R(1) while R(1) is still not final, and L1
+/// pauses. This row records today's answer only; it does not assert the desired one. Three
+/// stages of R(1):
+/// - awaiting its `StorageDispatch` check (nothing written);
+/// - dispatched, storage not yet answered;
+/// - applied, not yet published (the queue is frozen on it, so check 7 answers before check 8).
+///
+/// Today every stage answers one `Failed` reply, `PROTECTION_PAUSED`, and leaves R(1)'s in-flight
+/// state and the queue mode as they were. The first two come from check 8, so `paused_after` is
+/// L1's paused prefix (4); the third from check 7, so it is the unresolved seq (1).
+#[retcd_test]
+fn a_retry_of_a_request_not_yet_final_while_l1_pauses_records_todays_answer() {
+    for (stage, paused_after) in [
+        ("awaiting check", Seq(4)),
+        ("dispatched", Seq(4)),
+        ("applied", Seq(1)),
+    ] {
+        let mut h = H::live();
+        match stage {
+            "awaiting check" => {
+                h.admit(put(1, b"k", b"v"));
+            }
+            "dispatched" => {
+                h.dispatch(put(1, b"k", b"v"));
+            }
+            _ => {
+                let (batch, _, seq) = h.dispatch(put(1, b"k", b"v"));
+                assert_eq!(h.step(committed(batch, seq)).len(), 2);
+            }
+        }
+        let inflight = h.k().inflight().cloned();
+        let mode = *h.k().mode();
+        assert!(inflight.is_some(), "{stage}: R(1) is in flight");
+        assert_eq!(
+            h.step(admission(false, Some(ErrorKind::ProtectionPaused))),
+            vec![],
+            "{stage}"
+        );
+        // pending ruling P2: today's answer, not the desired one.
+        let effects = h.step(submit(put(1, b"k", b"v")));
+        let [EffectKind::Reply(ReplyEffect::Failed {
+            identity: id,
+            error,
+        })] = effects.as_slice()
+        else {
+            panic!("{stage}: expected one Failed reply, got {effects:?}");
+        };
+        assert_eq!(*id, identity(1), "{stage}");
+        assert_eq!(
+            *error,
+            RdbError::ProtectionPaused {
+                partition: PARTITION,
+                paused_after
+            },
+            "{stage}"
+        );
+        assert_eq!(h.k().inflight().cloned(), inflight, "{stage}");
+        assert_eq!(h.k().mode(), &mode, "{stage}");
+    }
+}
+
 /// A queue of one behind the one in flight.
 fn queue_of_one() -> Limits {
     Limits {
