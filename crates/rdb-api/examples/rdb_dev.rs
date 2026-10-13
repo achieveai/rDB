@@ -543,6 +543,8 @@ const STUCK: &str =
 /// or not, as a condition. Without a held link (startup) the copies catch up by themselves.
 ///
 /// Not fenced, with A1's self-replace stopped (W8-D1): stuck, as [`gave_up_line`] says.
+///
+/// F1 blocked comes first (W10-D1): stuck, as [`blocked_line`] says, over any other reason.
 fn ready_reason(
     owner: &NodeStatus,
     admits: bool,
@@ -550,6 +552,12 @@ fn ready_reason(
     held: &[(NodeId, NodeId)],
 ) -> Option<String> {
     let fence = owner.fence.filter(|_| !admits);
+    if let Some(line) = blocked_line(owner).filter(|_| !admits) {
+        return Some(match restart_note {
+            Some(note) => format!("{line}; {note}"),
+            None => line,
+        });
+    }
     let gave_up =
         (!admits && fence.is_none() && owner.replace_stopped).then(|| gave_up_line(owner));
     let Some(note) = restart_note else {
@@ -609,6 +617,17 @@ fn links_wait<'a>(owner: &'a NodeStatus, held: &[(NodeId, NodeId)]) -> Option<(&
         .map(|(a, b)| format!("{}-{}", a.0, b.0))
         .collect();
     (!links.is_empty()).then(|| (mode, links.join(", ")))
+}
+
+/// The line for F1 `Blocked(<reason>)` on node 1: recovery cannot finish, so writes stay out
+/// whatever the grant, the links or L1 do (W10-D1, tester r24n: an activation CAS unanswered
+/// with the store down, `Blocked(ControlUnknown)`, writes never back). It names the reason and
+/// promises no way out: whether a later fence unblocks it is the kernel's open ruling.
+fn blocked_line(owner: &NodeStatus) -> Option<String> {
+    let recovery = owner.recovery.as_deref()?;
+    recovery
+        .starts_with("Blocked(")
+        .then(|| format!("node {}'s recovery is {recovery}, so {STUCK}", owner.node.0))
 }
 
 /// The line for A1 `unheld` with its self-replace stopped (`replace_stopped`): a freeze, or a
@@ -2001,6 +2020,62 @@ mod tests {
         .filter_map(|node| ready_step(&mut seen, node, None, &[]))
         .collect();
         assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
+    }
+
+    /// Walk 10, W10-D1 (tester r24n, r24n2, r26): a read-only start with links held, the store
+    /// down, then `link heal all`. F1's activation CAS went unanswered and F1 blocked
+    /// (`recovery=Blocked(ControlUnknown)`), while the poller kept promising writes resume by
+    /// themselves; once a grant was back it printed the bare line, and writes never came back.
+    /// A blocked recovery says so, names its reason and says writes stay stopped, over the
+    /// fence's resume line and the held-link line. It promises no way out. Driven directly from
+    /// r24n's states. Unit.
+    #[test]
+    fn a_blocked_recovery_says_writes_stay_stopped_over_any_resume_promise() {
+        let blocked = "not ready: writes not admitted: node 1's recovery is \
+                       Blocked(ControlUnknown), so writes stay stopped for this run: to write \
+                       again, quit and start rdb_dev again";
+        let with = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let fenced = |recovery: &str| with("fenced(Expired)", recovery, Some(DenyReason::Expired));
+        let held_links = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (fenced("Rebuilding"), &held_links[..]),
+            (fenced("ActivationProposed"), &[][..]),
+            (fenced("Blocked(ControlUnknown)"), &[][..]),
+            (with("unheld", "Blocked(ControlUnknown)", None), &[][..]),
+            (
+                with("held(grant 2)", "Blocked(ControlUnknown)", None),
+                &[][..],
+            ),
+            (
+                with("held(grant 2)", "Blocked(ControlUnknown)", None),
+                &held_links[..],
+            ),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .skip(2)
+        .collect();
+        assert_eq!(lines, [blocked]);
+        let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
+        let stuck = with("held(grant 2)", "Blocked(ControlUnknown)", None);
+        let mut healthy = stuck.clone();
+        healthy.protection = Some("healthy".to_owned());
+        for node in [stuck, healthy] {
+            assert_eq!(
+                ready_step(&mut Seen::default(), &node, Some(note), &[]),
+                Some(format!("{blocked}; {note}")),
+                "{node:?}"
+            );
+        }
     }
 
     /// Walk 8, W8-D1 (tester r6_3200): a freeze landed while A1 was between grants. A1 lost
