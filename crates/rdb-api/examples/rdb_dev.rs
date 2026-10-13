@@ -563,7 +563,7 @@ fn ready_reason(
     }
     let gave_up =
         (!admits && fence.is_none() && owner.replace_stopped).then(|| gave_up_line(owner));
-    let resolving = resolving_line(owner)
+    let resolving = resolving_line(owner, held)
         .filter(|_| !admits && fence.is_none_or(|reason| fence_lifts(owner, reason)));
     let Some(note) = restart_note else {
         if let Some(line) = gave_up.or(resolving) {
@@ -640,14 +640,25 @@ fn blocked_line(owner: &NodeStatus) -> Option<String> {
 
 /// The line for F1 `ActivationUnresolved` on node 1: the activation CAS went unanswered (tester
 /// r24n: the store down), and F1 reads and proposes again by itself once the store answers
-/// (A-R102), so writes come back with no restart.
-fn resolving_line(owner: &NodeStatus) -> Option<String> {
-    (owner.recovery.as_deref() == Some("ActivationUnresolved")).then(|| {
-        format!(
-            "node {}'s recovery is waiting for the control store to confirm activation; writes \
-             resume by themselves once it answers",
-            owner.node.0
-        )
+/// (A-R102), so writes come back with no restart. With L1 paused or reprotecting and a link of
+/// node 1's held, writes also wait on those links, so the line names both (W11-D1, tester w6:
+/// links held again mid-outage, `PROTECTION_PAUSED` after the store answered).
+fn resolving_line(owner: &NodeStatus, held: &[(NodeId, NodeId)]) -> Option<String> {
+    if owner.recovery.as_deref() != Some("ActivationUnresolved") {
+        return None;
+    }
+    let node = owner.node.0;
+    Some(match links_wait(owner, held) {
+        Some((mode, links)) => format!(
+            "node {node}'s recovery is waiting for the control store to confirm activation, \
+             l1={mode} and links {links} are held; writes resume only once the store answers \
+             and node {node}'s copies catch up, which needs those links: heal them (link heal \
+             all)"
+        ),
+        None => format!(
+            "node {node}'s recovery is waiting for the control store to confirm activation; \
+             writes resume by themselves once it answers"
+        ),
     })
 }
 
@@ -2174,6 +2185,63 @@ mod tests {
         let mut stopped = with("unheld", "ActivationUnresolved", None);
         stopped.replace_stopped = true;
         assert_eq!(reason(&stopped, None), Some(gave_up_line(&stopped)));
+    }
+
+    /// Walk 11, W11-D1 (tester w6, w6r): while F1 resolved its activation with the store down,
+    /// the tester held links 1-2 and 1-3 again. The resolving line, "writes resume by themselves
+    /// once it answers", stayed the last word; when the store answered, F1 committed and writes
+    /// stayed paused (`PROTECTION_PAUSED`) until `link heal all`. With L1 paused and a link of
+    /// node 1's held, the resolving line names both conditions, as the fence line does (W8-D2).
+    /// Driven directly from w6's states. Unit.
+    #[test]
+    fn a_resolving_activation_with_links_held_says_writes_also_wait_on_the_links() {
+        let resolving = "node 1's recovery is waiting for the control store to confirm \
+                         activation; writes resume by themselves once it answers";
+        let both = "node 1's recovery is waiting for the control store to confirm activation, \
+                    l1=paused and links 1-2, 1-3 are held; writes resume only once the store \
+                    answers and node 1's copies catch up, which needs those links: heal them \
+                    (link heal all)";
+        let links = "l1=paused and links 1-2, 1-3 are held: writes wait for node 1's copies to \
+                     catch up, which needs those links: heal them (link heal all)";
+        let with = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let resolving_fenced = with(
+            "fenced(Expired)",
+            "ActivationUnresolved",
+            Some(DenyReason::Expired),
+        );
+        let committed = with("held(grant 3)", "Committed", None);
+        let mut serving = owner(None, true);
+        serving.authority = "held(grant 3)".to_owned();
+        serving.protection = Some("healthy".to_owned());
+        let held_links = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (&resolving_fenced, &[][..]),
+            (&resolving_fenced, &held_links[..]),
+            (&committed, &held_links[..]),
+            (&serving, &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .collect();
+        let not_ready = |why: &str| format!("not ready: writes not admitted: {why}");
+        assert_eq!(
+            lines,
+            [
+                not_ready(resolving),
+                not_ready(both),
+                not_ready(links),
+                "ready".to_owned()
+            ]
+        );
     }
 
     /// Walk 8, W8-D1 (tester r6_3200): a freeze landed while A1 was between grants. A1 lost
