@@ -44,8 +44,8 @@ use rdb_core::contracts::event::{
 };
 use rdb_core::contracts::ids::{
     AffinityId, AppliedSeq, BootId, ConfigVersion, CorrelationId, DurableSeq, EventId, FlushTicket,
-    Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestIdentity, Seq,
-    SnapshotHandle, TimerId, TimerVersion,
+    Generation, MessageId, NodeId, OwnerEpoch, PartitionId, ReplicaRole, RequestId,
+    RequestIdentity, Seq, SnapshotHandle, TimerId, TimerVersion,
 };
 use rdb_core::contracts::membership::CopyId;
 use rdb_core::contracts::publication::{PublicationEffect, PublicationEvent};
@@ -451,6 +451,10 @@ pub struct NodeStatus {
     pub admits: Option<bool>,
     /// P1's published position, when P1 serves the partition here.
     pub published: Option<(Generation, Seq)>,
+    /// The request node 1's T1 holds applied and not yet published, which publishing it
+    /// resolves (`Inflight::Dispatched`). `None` when nothing is applied unpublished: a request
+    /// refused at admission, or never sent, is not here (Msg 8, W6-D1).
+    pub in_flight: Option<RequestId>,
     /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
     /// stalled; cleared when it activates.
     pub stalled: Option<String>,
@@ -3326,6 +3330,14 @@ impl Host {
                 .publication
                 .view(self.node, partition)
                 .map(|view| (view.published.generation, view.published.seq)),
+            in_flight: match self
+                .transaction
+                .kernel(self.node, partition)
+                .and_then(TxnKernel::inflight)
+            {
+                Some(Inflight::Dispatched { admitted, .. }) => Some(admitted.req.identity.request),
+                _ => None,
+            },
             stalled: self
                 .stalled
                 .get(&partition)

@@ -595,7 +595,7 @@ impl Db {
             client: CLIENT,
             request,
         };
-        maybe_mutated(
+        self.retried(
             request,
             self.put_identified(identity, object, value, if_version),
         )
@@ -705,7 +705,7 @@ impl Db {
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
         let wait = send_wait(Duration::from_millis(request.remaining_millis));
         let id = request.identity.request;
-        maybe_mutated(id, self.send(ClientCall::Resend { request }, wait))
+        self.retried(id, self.send(ClientCall::Resend { request }, wait))
     }
 
     /// Send `request` again with a fresh kernel deadline, `deadline`: same identity, same
@@ -724,7 +724,7 @@ impl Db {
     ) -> Result<PutOk, PutError> {
         let id = request.identity.request;
         if let Some(error) = deadline_refusal(deadline) {
-            return maybe_mutated(
+            return self.retried(
                 id,
                 Err(PutError {
                     error,
@@ -733,7 +733,7 @@ impl Db {
             );
         }
         request.remaining_millis = millis(deadline);
-        maybe_mutated(
+        self.retried(
             id,
             self.send(ClientCall::Resend { request }, send_wait(deadline)),
         )
@@ -847,7 +847,10 @@ impl Db {
     /// was lost, even one answered `ok`. After the owner's restart, or both secondaries', its
     /// outcome cannot be known until a restarted node rejoins (M10, achieveai/rDB#42). After one
     /// secondary's, it resolves once the other secondary can take the write: healing a link to
-    /// it is enough (tester walk 5, W5-D1).
+    /// it is enough (tester walk 5, W5-D1). That holds only for a write node 1 holds in flight,
+    /// applied and unpublished ([`NodeStatus::in_flight`]). `Unknown` also answers a request
+    /// refused at admission, which was never queued: nothing resolves it, and it stays `Unknown`
+    /// (Msg 8, W6-D1).
     ///
     /// # Errors
     ///
@@ -890,16 +893,7 @@ impl Db {
         nodes
             .into_iter()
             .filter_map(|node| {
-                let (reply, answer) = mpsc::channel();
-                self.send_to(
-                    node,
-                    Msg::Inspect {
-                        partition: PARTITION,
-                        reply,
-                    },
-                )
-                .ok()?;
-                let mut status = answer.recv_timeout(self.timeouts.read).ok()?;
+                let mut status = self.inspect(node)?;
                 status.reload_pending = self.control.reload_pending(status.node);
                 if status.node == OWNER && status.admits == Some(true) {
                     self.ready_seen.store(true, Ordering::Relaxed);
@@ -987,22 +981,70 @@ impl Db {
         if self.ready_seen.load(Ordering::Relaxed) {
             return true;
         }
-        let (reply, answer) = mpsc::channel();
-        let asked = self.send_to(
-            OWNER,
-            Msg::Inspect {
-                partition: PARTITION,
-                reply,
-            },
-        );
-        let admits = asked.is_ok()
-            && answer
-                .recv_timeout(self.timeouts.read)
-                .is_ok_and(|status| status.admits == Some(true));
+        let admits = self
+            .inspect(OWNER)
+            .is_some_and(|status| status.admits == Some(true));
         if admits {
             self.ready_seen.store(true, Ordering::Relaxed);
         }
         admits
+    }
+
+    /// `node`'s state for partition 1, or `None` when it does not answer within the read
+    /// timeout.
+    fn inspect(&self, node: NodeId) -> Option<NodeStatus> {
+        let (reply, answer) = mpsc::channel();
+        self.send_to(
+            node,
+            Msg::Inspect {
+                partition: PARTITION,
+                reply,
+            },
+        )
+        .ok()?;
+        answer.recv_timeout(self.timeouts.read).ok()
+    }
+
+    /// A resend's or retry's answer under `request`: whatever refused it, the request may have
+    /// applied on an earlier send. Kernel checks 2 (deadline) and 9 (overload) run before the
+    /// dedup replay and prove only that this send mutated nothing (Q-A). A `PROTECTION_PAUSED`
+    /// refusal points at [`Self::status`] only when status shows, or will show, the outcome
+    /// ([`Self::status_will_show`]): F1 refuses a retry of a finished write paused too (Message
+    /// 7, P2), but a request refused at admission was never queued, and nothing resolves it
+    /// (Msg 8, W6-D1). A new put's refusal does not come through here.
+    fn retried(
+        &self,
+        request: RequestId,
+        answer: Result<PutOk, PutError>,
+    ) -> Result<PutOk, PutError> {
+        answer.map_err(|mut refused| {
+            refused.error.no_mutation = false;
+            if refused.error.kind == ErrorKind::ProtectionPaused && self.status_will_show(request) {
+                refused.error.detail = format!(
+                    "{}; status {} shows its outcome",
+                    refused.error.detail, request.0
+                );
+            }
+            refused
+        })
+    }
+
+    /// Whether [`Self::status`] of `request` shows its outcome now, or will once it publishes:
+    /// node 1 holds it applied and unpublished (`in_flight`), or status already answers more
+    /// than `Unknown`. Node 1 is asked first, so a request that publishes between the two looks
+    /// is found by the second. A look that fails answers `false`: the refusal then promises
+    /// nothing, which is never untrue.
+    fn status_will_show(&self, request: RequestId) -> bool {
+        if self
+            .inspect(OWNER)
+            .is_some_and(|owner| owner.in_flight == Some(request))
+        {
+            return true;
+        }
+        matches!(
+            self.status(request, None),
+            Ok(TxnStatus::Resolved(_) | TxnStatus::Unresolved { .. })
+        )
     }
 
     /// The budgets every node runs with, or `None` in a `Db` a crate test builds by hand.
@@ -1054,12 +1096,13 @@ impl Db {
     /// takes a re-pin with catch-up, which is M10.
     ///
     /// So in M9 restarting **any** node stops writes for the life of the `Db`. A restarted
-    /// secondary's copy is never durable again, so L1 warns about 1 s later and pauses writes
-    /// about 2 s later (spec §6.2), and nothing un-pauses them before M10. Puts already admitted
-    /// may still land in that window. A restarted owner never takes a grant again: its old grant
-    /// can be cleared ([`crate::admin::clear_grant`]), but nothing acquires a new one. Logged as
-    /// `node_restarted{node, old_boot, boot}`. From then on a `PROTECTION_PAUSED`,
-    /// `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY` answer says so
+    /// secondary's copy is never durable again, so L1 pauses writes within about 2 s of the next
+    /// write (spec §6.2): about 2 s after the restart, or, after a fence, about 2 s after the
+    /// first write that follows it (tester q8, F-015). Nothing un-pauses them before M10. Puts
+    /// already admitted may still land in that window. A restarted owner never takes a grant
+    /// again: its old grant can be cleared ([`crate::admin::clear_grant`]), but nothing acquires
+    /// a new one. Logged as `node_restarted{node, old_boot, boot}`. From then on a
+    /// `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY` answer says so
     /// ([`Self::restart_note`]).
     ///
     /// # Errors
@@ -1241,25 +1284,6 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
             deadline.as_millis(),
             MAX_TXN_DEADLINE.as_millis()
         ))
-    })
-}
-
-/// A resend's or retry's answer under `request`: whatever refused it, the request may have
-/// applied on an earlier send. Kernel checks 2 (deadline) and 9 (overload) run before the dedup
-/// replay and prove only that this send mutated nothing (Q-A). A `PROTECTION_PAUSED` refusal
-/// also points at [`Db::status`] (Message 7, P2): a retry of a write that already finished is
-/// refused paused too (F1), and status shows its outcome. A new put's refusal does not come
-/// through here.
-fn maybe_mutated(request: RequestId, answer: Result<PutOk, PutError>) -> Result<PutOk, PutError> {
-    answer.map_err(|mut refused| {
-        refused.error.no_mutation = false;
-        if refused.error.kind == ErrorKind::ProtectionPaused {
-            refused.error.detail = format!(
-                "{}; status {} shows its outcome",
-                refused.error.detail, request.0
-            );
-        }
-        refused
     })
 }
 
@@ -2413,9 +2437,29 @@ mod tests {
         );
         assert!(!new_put.error.detail.contains(clause), "{new_put:?}");
 
+        // Msg 8, W6-D1: the clause follows what is in flight. The first txn applied and waits
+        // to publish, so its status will show it; the new txn was refused at admission and
+        // never queued, so nothing will, and a retry of it says nothing about status.
+        let pending = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        let pending_id = pending.identity.request;
+        assert_eq!(
+            db.node_status().first().and_then(|owner| owner.in_flight),
+            Some(pending_id),
+            "node 1 holds the first txn applied and unpublished"
+        );
+        let resent = db
+            .resend_within((*pending).clone(), Duration::from_secs(2))
+            .expect_err("still unpublished");
+        assert_eq!(resent.error.kind, ErrorKind::ProtectionPaused, "{resent:?}");
+        assert!(
+            resent
+                .error
+                .detail
+                .ends_with(&format!("; status {} shows its outcome", pending_id.0)),
+            "in flight: {resent:?}"
+        );
         let request = new_txn.request.expect("a kernel refusal keeps its request");
         let id = request.identity.request;
-        let want = format!("; status {} shows its outcome", id.0);
         for (how, refused) in [
             ("resend", db.resend((*request).clone())),
             (
@@ -2430,9 +2474,73 @@ mod tests {
                 ErrorKind::ProtectionPaused,
                 "{how}: {refused:?}"
             );
-            assert!(refused.error.detail.ends_with(&want), "{how}: {refused:?}");
+            assert!(
+                !refused.error.detail.contains(clause),
+                "never admitted: {how}: {refused:?}"
+            );
+            assert!(!refused.error.no_mutation, "{how}: {refused:?}");
         }
         db.links().heal_all();
+        db.shutdown();
+    }
+
+    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
+    /// writes; a put refused then was refused at admission and never queued, so a retry of it
+    /// must not promise that `status` will show its outcome: status stays `Unknown` for good.
+    /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
+    #[test]
+    fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        db.put(b"a", b"1", None).expect("before the restart");
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while db.node_status().first().and_then(|node| node.admits) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "L1 does not pause within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let refused = db.put(b"a", b"9", None).expect_err("paused");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{refused:?}"
+        );
+        let request = refused.request.expect("a kernel refusal keeps its request");
+        let id = request.identity.request;
+        let retried = db.resend(*request).expect_err("still paused");
+        assert_eq!(
+            retried.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{retried:?}"
+        );
+        assert!(
+            !retried.error.detail.contains("shows its outcome"),
+            "refused at admission, so nothing will resolve it: {retried:?}"
+        );
+        assert!(
+            retried.error.detail.contains("node 3 restarted"),
+            "{retried:?}"
+        );
+        assert_eq!(
+            db.node_status().first().map(|owner| owner.in_flight),
+            Some(None),
+            "nothing is applied unpublished at node 1"
+        );
+        assert_eq!(db.status(id, None).expect("status"), TxnStatus::Unknown);
         db.shutdown();
     }
 

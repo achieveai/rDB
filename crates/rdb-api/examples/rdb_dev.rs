@@ -44,9 +44,10 @@
 //!                                         boot plus one; prints `node n boot b`. The new
 //!                                         process holds no role and stays out until M10. So
 //!                                         any restart stops writes, safely, for the life of
-//!                                         this run: after a secondary's, L1 pauses about 2 s
-//!                                         later (`PROTECTION_PAUSED`) because that copy is
-//!                                         never durable again; after the owner's, no node
+//!                                         this run: after a secondary's, L1 pauses within
+//!                                         about 2 s of the next write (`PROTECTION_PAUSED`)
+//!                                         because that copy is never durable again; after
+//!                                         the owner's, no node
 //!                                         holds a grant. Reads: after a secondary's they keep
 //!                                         answering, unless a write was in flight that no
 //!                                         other copy can take yet: then fresh reads answer
@@ -109,11 +110,11 @@
 //! admits and its A1 holds a grant. `not ready: writes not admitted` when either half stops, the
 //! waiting line then saying which. When node 1's grant is fenced, that line says why and that
 //! writes resume by themselves, so the node is not restarted (#42). After a secondary restarts,
-//! L1 still admits writes for about 2 s, so the line reads `ready for now; writes pause within
-//! about 2 s because ..` until they do. A put before `ready` is refused, never left hanging. A
-//! recovery committed below `Active` that
-//! does not activate prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever
-//! the line changes:
+//! L1 still admits writes for a while, so the line reads `ready for now; writes pause within
+//! about 2 s of the next write because ..` until they do: about 2 s after the restart, or,
+//! after a fence, about 2 s after the next write (tester q8). A put before `ready` is refused,
+//! never left hanging. A recovery committed below `Active` that does not activate prints
+//! `stalled node=N recovery_rebuild_stalled ...`, and again whenever the line changes:
 //!
 //! - when F1 pinned its rebuild, at F1's rebuild deadline (the discovery window, ~2 s) with
 //!   `unproven=[..]`, the copies that have not proved the pinned point;
@@ -499,14 +500,15 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
 
 /// The reason a `ready` or `not ready` line carries, when a user could act on it wrongly. A
 /// restart wins. While node 1 still admits writes, it says they are about to pause: L1 keeps
-/// admitting for about 2 s after a secondary restarts (walk 6c), so a bare `ready` there is true
-/// and misleading (Message 7). Once they pause, it says nothing brings them back in this run
+/// admitting for about 2 s after a secondary restarts (walk 6c), or after a fence until about
+/// 2 s after the next write (tester q8), so a bare `ready` there is true and misleading
+/// (Message 7). Both pauses fall within about 2 s of the next write (F-015). Once they pause, it says nothing brings them back in this run
 /// (D2). Then a fenced grant, which looks stuck but is not: A1 replaces the grant itself once the
 /// old one's expiry is proven, and a restart there would end recovery for the run (Message 6).
 fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) -> Option<String> {
     if let Some(note) = restart_note {
         return Some(if admits {
-            format!("writes pause within about 2 s because {note}")
+            format!("writes pause within about 2 s of the next write because {note}")
         } else {
             format!(
                 "{note}; writes stay stopped for this run: to write again, quit and start rdb_dev \
@@ -1134,18 +1136,23 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
         )),
         _ => return Err("status <request> [<generation>]".to_owned()),
     };
+    // The nodes first: a request node 1 holds in flight that publishes between the two looks is
+    // then answered by the status, never called not in flight (Msg 8, W6-D1).
+    let nodes = db.node_status();
     match db.status(RequestId(request), generation) {
         // After a restart, `Unknown` can be a write this session saw `ok` (tester W3-D2).
         Ok(TxnStatus::Unknown) => {
-            let restarted: Vec<NodeId> = db
-                .node_status()
+            let in_flight = nodes
+                .iter()
+                .any(|node| node.node == NodeId(1) && node.in_flight == Some(RequestId(request)));
+            let restarted: Vec<NodeId> = nodes
                 .iter()
                 .filter(|node| node.boot != rdb_api::host::BOOT)
                 .map(|node| node.node)
                 .collect();
             let note = db.restart_note();
             let ours = sent.by_id.contains_key(&request);
-            say(&unknown_line(ours, &restarted, note.as_deref()));
+            say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
         }
         Ok(status) => say(&format!("status {status:?}")),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
@@ -1154,10 +1161,18 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
 }
 
 /// `status Unknown`, with the restart note when there is one, unless this session never sent
-/// the request (`ours` false): that outcome is known (tester walk 5). It waits for M10 only
-/// after the owner's restart or both secondaries': after one secondary's, it resolves once the
-/// other can take the write, as when a held link heals (W5-D1).
-fn unknown_line(ours: bool, restarted: &[NodeId], restart_note: Option<&str>) -> String {
+/// the request (`ours` false): that outcome is known (tester walk 5). After the owner's
+/// restart its outcome waits for M10. Otherwise it follows what node 1 holds (Msg 8, W6-D1): a
+/// request not `in_flight` there was refused before it was queued, or never arrived, and
+/// nothing will resolve it. One in flight waits for M10 after both secondaries' restarts, and
+/// after one secondary's resolves once the other can take it, as when a held link heals
+/// (W5-D1).
+fn unknown_line(
+    ours: bool,
+    in_flight: bool,
+    restarted: &[NodeId],
+    restart_note: Option<&str>,
+) -> String {
     let Some(note) = restart_note.filter(|_| ours) else {
         return "status Unknown".to_owned();
     };
@@ -1165,8 +1180,13 @@ fn unknown_line(ours: bool, restarted: &[NodeId], restart_note: Option<&str>) ->
         .into_iter()
         .filter(|node| !restarted.contains(&NodeId(*node)))
         .collect();
+    let owner_restarted = restarted.contains(&NodeId(1));
     match others.as_slice() {
-        [other] if !restarted.contains(&NodeId(1)) => format!(
+        _ if !owner_restarted && !in_flight => format!(
+            "status Unknown (node 1 does not hold it in flight, so waiting will not change \
+             this: it was refused before it was queued, or never arrived; {note})"
+        ),
+        [other] if !owner_restarted => format!(
             "status Unknown (not evidence of a lost write: it resolves once node {other}, which \
              did not restart, can take it; {note})"
         ),
@@ -1565,6 +1585,7 @@ mod tests {
             protection: None,
             admits: Some(admits),
             published: None,
+            in_flight: None,
             stalled: stalled.map(str::to_owned),
             reload_pending: None,
         }
@@ -1686,7 +1707,9 @@ mod tests {
             lines,
             [
                 "ready".to_owned(),
-                format!("ready for now; writes pause within about 2 s because {note}"),
+                format!(
+                    "ready for now; writes pause within about 2 s of the next write because {note}"
+                ),
                 format!(
                     "not ready: writes not admitted: {note}; writes stay stopped for this run: \
                      to write again, quit and start rdb_dev again"
@@ -1698,27 +1721,41 @@ mod tests {
     /// Tester W3-D2 and walk 5: after a restart, `Unknown` for a request this session sent
     /// carries the note, and promises M10 only after the owner's restart or both secondaries'.
     /// After one secondary's it names the copy that can still resolve it (W5-D1). A request
-    /// never sent, or no restart, stays bare.
+    /// never sent, or no restart, stays bare. Msg 8, W6-D1: one node 1 does not hold in flight
+    /// promises nothing, unless the owner restarted; the Db row
+    /// `a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status` proves
+    /// `in_flight` on a real Db.
     #[test]
     fn status_unknown_carries_the_restart_note_and_waits_for_m10_only_when_no_copy_can_resolve() {
         let note = Some("NOTE");
-        assert_eq!(unknown_line(true, &[], None), "status Unknown");
-        assert_eq!(unknown_line(false, &[NodeId(2)], note), "status Unknown");
+        assert_eq!(unknown_line(true, true, &[], None), "status Unknown");
         assert_eq!(
-            unknown_line(true, &[NodeId(2)], note),
+            unknown_line(false, false, &[NodeId(2)], note),
+            "status Unknown"
+        );
+        assert_eq!(
+            unknown_line(true, true, &[NodeId(2)], note),
             "status Unknown (not evidence of a lost write: it resolves once node 3, which did \
              not restart, can take it; NOTE)"
         );
         assert_eq!(
-            unknown_line(true, &[NodeId(3)], note),
+            unknown_line(true, true, &[NodeId(3)], note),
             "status Unknown (not evidence of a lost write: it resolves once node 2, which did \
              not restart, can take it; NOTE)"
         );
         let m10 = "status Unknown (not evidence of a lost write: its outcome cannot be known \
                    until a restarted node rejoins, which is M10; NOTE)";
-        assert_eq!(unknown_line(true, &[NodeId(2), NodeId(3)], note), m10);
-        assert_eq!(unknown_line(true, &[NodeId(1)], note), m10);
-        assert_eq!(unknown_line(true, &[NodeId(1), NodeId(2)], note), m10);
+        assert_eq!(unknown_line(true, true, &[NodeId(2), NodeId(3)], note), m10);
+        assert_eq!(unknown_line(true, true, &[NodeId(1)], note), m10);
+        assert_eq!(unknown_line(true, true, &[NodeId(1), NodeId(2)], note), m10);
+        assert_eq!(unknown_line(true, false, &[NodeId(1)], note), m10);
+        let refused = "status Unknown (node 1 does not hold it in flight, so waiting will not \
+                       change this: it was refused before it was queued, or never arrived; NOTE)";
+        assert_eq!(unknown_line(true, false, &[NodeId(3)], note), refused);
+        assert_eq!(
+            unknown_line(true, false, &[NodeId(2), NodeId(3)], note),
+            refused
+        );
     }
 
     /// F-005, F-006: an open that fails tears the run down as a clean quit does, and without
