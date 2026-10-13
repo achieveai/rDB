@@ -359,6 +359,24 @@ recovery only through a fresh fencing proof; an unchanged record means a lost re
 re-propose is allowed. Neither unreachable arm may proceed — the CAS may have landed, and a recovery
 that does not know whether it is the owner must not act as if it were.
 
+**Amended 2026-10-13 (ruling A-R102, W10-D1): an `Unknown` activation CAS resolves, it does not
+block.** The rule above stays for the recovery CAS. The activation CAS rewrites the commit's own
+bytes, and nothing in M9 fences the owner's own partition, so a terminal block there kept a
+partition read-only for good after a control-store outage, with its record already rewritten.
+With no fence held, an `Unknown` activation (or one unanswered at its deadline) reports
+`BlockPromotion { ControlUnknown }` and enters `ActivationUnresolved`, not `Blocked`. It reads
+`partitions/{id}` (DesignSpec-01: read authoritative state and use CAS to recover). If the read
+shows our own bytes at a revision `r` at or above the commit's, it sends the same CAS at `r`;
+only that CAS's `Committed` activates — a read alone never does. Any other record is classified
+as a conflict's re-read is: a newer epoch is `OvertakenByPeer`, anything else `CasContention`.
+One request is outstanding at a time; a timer fire abandons an unanswered one and reads again;
+`Unavailable` and `Unknown` wait for the next fire. A fence with a newer root enters at once.
+Safety rests on the exact-revision CAS and the linearizable read: after our commit no recoverer
+can write our bytes, and a takeover first needs a non-`Serving` record (A-R51), which changes them.
+The recovery CAS cannot be resolved this way: `PartitionRecord` binds no run id or cutoff, so our
+bytes cannot be told from a peer's identical decision (ruling F-g). That needs a run id in
+`partitions/{id}`, owed to M10.
+
 ### 8. Modes follow from how many eligible regulars hold the barrier
 
 | Eligible regulars | Mode | Rules |
@@ -480,7 +498,7 @@ consumer does not handle.
 | Failure recorded before a shorter prefix is chosen | Effect-vector index assertion: `RecordSourceUnavailable` precedes `SelectPrefix` |
 | Buffered entries are fsynced before the barrier | `RecoveryBarrier::try_new` rejects a missing proof, a proof below the cutoff and a proof bound to another digest, each by a named test; a `FlushFailed` blocks commit — **V1, V3** |
 | One CAS, one key | The effect vector from `Proposing` contains exactly one `ControlCas`, targeting `partitions/{id}` |
-| A lost CAS response does not promote | `Unavailable` and `Unknown` each leave the node `Blocked` under their own reason; neither proceeds as owner, and both require a fresh fencing proof to retry |
+| A lost CAS response does not promote | `Unavailable` and `Unknown` each leave the node `Blocked` under their own reason; neither proceeds as owner, and both require a fresh fencing proof to retry. **Amended 2026-10-13 (A-R102):** an `Unknown` activation CAS with no fence held instead enters `ActivationUnresolved` and activates only on a `Committed` answer to a CAS at the revision a read found its own bytes at; a peer's record blocks `OvertakenByPeer` (`w10_d1_*` rows in `recovery_f1.rs`, M7B-146, M7B-240) |
 | A successful rebuild leaves read-only mode | After the activation CAS commits, the recovery module re-emits its result with `mode: Active`; the transaction and publication modules leave `Frozen { RecoveryReadOnly }` on it. Without that emission a rebuilt partition stays read-only forever — **V3** |
 | The activation re-emit moves no position | A partition recovered `DegradedRf2` at cutoff 0 that wrote seq 1 keeps it when the `Active` re-emit arrives: published goes 1, 2, 3, a `Fresh` read answers after the re-emit, and lag protection reaches `Healthy` (`m9_d3_00`, amended 2026-10-07) |
 | Recovery catch-up is fence-gated | A `RecoveryAppend` with a superseded fence is rejected `STALE_FENCE`; one whose envelope diverges is quarantined exactly as a normal append would be |

@@ -6417,11 +6417,14 @@ fn recovered_count(f1: &F1) -> usize {
     f1.log.iter().filter(|e| is_recovered(e)).count()
 }
 
-/// An activation blocked by its own deadline, then a store that answers again: every `Get` F1
-/// sends from here is told `partitions/{p}` holds `value` at `revision`, every CAS F1 sends lands
-/// one revision above what it expected, and every timer F1 arms is fired at its deadline. When F1
-/// has nothing outstanding the next window's fire is offered anyway. Returns the `Recovered` F1
-/// emitted, if any.
+/// An activation blocked by its own deadline, then a store that answers again, at once: every
+/// `Get` F1 sends from here is told `partitions/{p}` holds `value` at `revision`, and every CAS F1
+/// sends lands one revision above what it expected. A timer F1 arms is fired at its deadline only
+/// once nothing it asked is left unanswered; with no timer armed, the next window's fire is
+/// offered anyway. Returns the `Recovered` F1 emitted, if any.
+///
+/// (Round 12 red fired each timer as soon as it was armed, ahead of the answers to requests sent
+/// in the same step. That is not a prompt store, and it abandoned every request it answered.)
 fn blocked_activation_then_store_answers(
     revision: Revision,
     value: Bytes,
@@ -6436,14 +6439,15 @@ fn blocked_activation_then_store_answers(
     );
     effects.remove(0);
     let mut recovered = None;
+    let mut armed = None;
     let mut now = deadline;
-    for _ in 0..8 {
+    for _ in 0..12 {
         let mut next = Vec::new();
         for effect in effects.drain(..) {
             match effect {
                 EffectKind::Control(ControlEffect::Get { .. }) => {
                     next.extend(f1.step(
-                        now + 1,
+                        now,
                         read_result(ReadOutcome::Found {
                             revision,
                             value: value.clone(),
@@ -6455,26 +6459,26 @@ fn blocked_activation_then_store_answers(
                     ..
                 }) => {
                     next.extend(f1.step(
-                        now + 2,
+                        now,
                         cas_result(CasOutcome::Committed(Revision(expected.0 + 1))),
                     ));
                 }
                 EffectKind::Timer(TimerEffect::Arm { version, at, .. }) => {
-                    now = at.0;
-                    next.extend(f1.step(now, fired(version.0)));
+                    armed = Some((version.0, at.0));
                 }
                 EffectKind::Kernel(KernelEffect::Recovered(result)) => recovered = Some(*result),
                 _ => {}
             }
         }
-        if next.is_empty() {
-            now += WINDOW;
-            next.extend(f1.step(now, fired(6)));
-        }
-        effects = next;
         if recovered.is_some() {
             break;
         }
+        if next.is_empty() {
+            let (version, at) = armed.take().unwrap_or((6, now + WINDOW));
+            now = at;
+            next.extend(f1.step(now, fired(version)));
+        }
+        effects = next;
     }
     (f1, recovered)
 }
@@ -6602,6 +6606,19 @@ fn w10_d1_a_store_that_is_down_is_read_once_per_fire() {
         ),
         vec![ign(ReplicaIgnoreReason::Outstanding)],
         "A-R102: Unavailable waits for the next fire"
+    );
+    // One fact per attempt: the read is answered, so nothing is outstanding until the next
+    // fire, and a second answer on its id is a late one, not a second attempt.
+    let answered = *f1.requests.last().expect("the first read");
+    f1.ignores_late(
+        ACTIVATION_DEADLINE + 2,
+        read_result_for(
+            answered,
+            ReadOutcome::Found {
+                revision: Revision(9),
+                value: ours(),
+            },
+        ),
     );
     let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
     assert_eq!(f1.step(first - 1, fired(6)), stale, "before the deadline");
@@ -6739,4 +6756,28 @@ fn w10_d1_resolving_is_reported_apart_from_a_block() {
         recovery.phase(),
         RecoveryPhase::Blocked(BlockReason::ControlUnknown)
     );
+}
+
+/// W10-D1 row 9 (critic A1: our bytes at `r`, "with `r` at or above `c`"): our own bytes read
+/// below the commit revision are not ours to propose over. No linearizable store answers that
+/// after our commit, so it is classified as any other record is, by `Cas::on_read`: identical
+/// bytes there are a peer's decision (F-g). Never a CAS at the stale revision.
+#[retcd_test]
+fn w10_d1_our_bytes_below_the_commit_are_not_proposed_over() {
+    let mut f1 = resolving();
+    assert_eq!(
+        f1.step(
+            ACTIVATION_DEADLINE + 1,
+            read_result(ReadOutcome::Found {
+                revision: Revision(8),
+                value: ours(),
+            })
+        ),
+        vec![block(BlockReason::OvertakenByPeer)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+    assert_eq!(f1.cas_count(), 2, "no CAS at a revision below the commit");
 }
