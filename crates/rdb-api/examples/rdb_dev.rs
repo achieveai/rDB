@@ -487,7 +487,12 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 ));
             }
             let admits = owner.admits == Some(true);
-            if let Some(line) = ready_step(&mut seen, owner, db.restart_note().as_deref()) {
+            if let Some(line) = ready_step(
+                &mut seen,
+                owner,
+                db.restart_note().as_deref(),
+                &db.links().held(),
+            ) {
                 say(&line);
             }
             if seen.recovered.is_some() && !admits {
@@ -532,10 +537,27 @@ const STUCK: &str =
 /// for the run (Message 6). The line promises that only while the poll is live and the reason
 /// is not one [`never_replaced`] names (F-004): once the poll stopped (a frozen, foreign or
 /// deleted record, F-016), nothing in M9 lifts the fence.
-fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) -> Option<String> {
+///
+/// With no restart, L1 paused or reprotecting while `held` holds a link of node 1's keeps writes
+/// out until those links heal and the copies catch up (W8-D2): the line names the links, fenced
+/// or not, as a condition. Without a held link (startup) the copies catch up by themselves.
+fn ready_reason(
+    owner: &NodeStatus,
+    admits: bool,
+    restart_note: Option<&str>,
+    held: &[(NodeId, NodeId)],
+) -> Option<String> {
     let fence = owner.fence.filter(|_| !admits);
     let Some(note) = restart_note else {
-        return fence.map(|reason| fence_line(owner, reason));
+        return match (fence, links_wait(owner, held)) {
+            (Some(reason), _) => Some(fence_line(owner, reason, held)),
+            (None, Some((mode, links))) if !admits => Some(format!(
+                "l1={mode} and links {links} are held: writes wait for node {}'s copies to catch \
+                 up, which needs those links: heal them (link heal all)",
+                owner.node.0
+            )),
+            (None, _) => None,
+        };
     };
     let pause = format!(
         "pause soon, at the latest about {PAUSE_AGE_SECS} s after the next write, because {note}"
@@ -543,20 +565,40 @@ fn ready_reason(owner: &NodeStatus, admits: bool, restart_note: Option<&str>) ->
     if admits {
         return Some(format!("writes {pause}"));
     }
-    let l1_rejects = matches!(owner.protection.as_deref(), Some("paused" | "reprotecting"));
-    if owner.boot != rdb_api::host::BOOT || l1_rejects {
+    if owner.boot != rdb_api::host::BOOT || l1_rejecting(owner).is_some() {
         return Some(format!("{note}; {STUCK}"));
     }
     Some(match fence {
         Some(reason) if fence_lifts(owner, reason) => {
             format!(
                 "{}; once they resume, they {pause}",
-                fence_line(owner, reason)
+                fence_line(owner, reason, held)
             )
         }
-        Some(reason) => format!("{}; {note}", fence_line(owner, reason)),
+        Some(reason) => format!("{}; {note}", fence_line(owner, reason, held)),
         None => format!("writes are not admitted now; if they come back, they {pause}"),
     })
+}
+
+/// L1's mode while it refuses writes, `paused` or `reprotecting`: with a copy out it waits on
+/// that copy and its links, and after a restart nothing in M9 brings the copy back.
+fn l1_rejecting(owner: &NodeStatus) -> Option<&str> {
+    owner
+        .protection
+        .as_deref()
+        .filter(|mode| matches!(*mode, "paused" | "reprotecting"))
+}
+
+/// L1's mode while it refuses writes, and the links of `owner`'s that `held` holds, when there
+/// are both: writes then wait on those links (W8-D2).
+fn links_wait<'a>(owner: &'a NodeStatus, held: &[(NodeId, NodeId)]) -> Option<(&'a str, String)> {
+    let mode = l1_rejecting(owner)?;
+    let links: Vec<String> = held
+        .iter()
+        .filter(|(a, b)| *a == owner.node || *b == owner.node)
+        .map(|(a, b)| format!("{}-{}", a.0, b.0))
+        .collect();
+    (!links.is_empty()).then(|| (mode, links.join(", ")))
 }
 
 /// Whether A1's self-replace can still lift a fence for `reason`: its poll is live, and the
@@ -565,10 +607,21 @@ const fn fence_lifts(owner: &NodeStatus, reason: DenyReason) -> bool {
     owner.fence_polling && !never_replaced(reason)
 }
 
-/// The fenced grant's line: it resumes by itself while [`fence_lifts`], else it is stuck.
-fn fence_line(owner: &NodeStatus, reason: DenyReason) -> String {
+/// The fenced grant's line: it resumes by itself while [`fence_lifts`], else it is stuck. With
+/// L1 paused or reprotecting and a link of node 1's held, the grant comes back by itself and
+/// writes still wait on those links (W8-D2, tester r9: `held(grant 3)`, `l1=paused`, writes back
+/// only after `link heal all`).
+fn fence_line(owner: &NodeStatus, reason: DenyReason, held: &[(NodeId, NodeId)]) -> String {
     let node = owner.node.0;
-    if fence_lifts(owner, reason) {
+    if let (true, Some((mode, links))) = (fence_lifts(owner, reason), links_wait(owner, held)) {
+        format!(
+            "node {node}'s grant is {}, l1={mode} and links {links} are held; writes resume only \
+             once the old grant's expiry is proven and node {node}'s copies catch up, which needs \
+             those links: heal them (link heal all); do not restart node {node}: a restarted \
+             node does not rejoin in M9 (achieveai/rDB#42)",
+            owner.authority
+        )
+    } else if fence_lifts(owner, reason) {
         format!(
             "node {node}'s grant is {}; writes resume by themselves once the old grant's expiry \
              is proven, so do not restart node {node}: a restarted node does not rejoin in M9 \
@@ -596,10 +649,20 @@ const fn never_replaced(reason: DenyReason) -> bool {
 /// The `ready` or `not ready` line to print for `owner`, given what was printed last, and what
 /// `seen` now holds as printed: on each change of `admits`, and again when a new reason appears
 /// (a restart while ready, a fence after the line, a restart after a fence). A reason that goes
-/// away prints nothing; the waiting line says what is left.
-fn ready_step(seen: &mut Seen, owner: &NodeStatus, restart_note: Option<&str>) -> Option<String> {
+/// away prints the bare line, so a promise it made never outlives its state (W8-D1, tester
+/// r6_3200: the fence's resume line stayed the last word after A1 stopped, `unheld`).
+fn ready_step(
+    seen: &mut Seen,
+    owner: &NodeStatus,
+    restart_note: Option<&str>,
+    held: &[(NodeId, NodeId)],
+) -> Option<String> {
     let admits = owner.admits == Some(true);
-    step_line(seen, admits, ready_reason(owner, admits, restart_note))
+    step_line(
+        seen,
+        admits,
+        ready_reason(owner, admits, restart_note, held),
+    )
 }
 
 /// The poller's line once node 1's restart failed: no process runs it, so `node_status` leaves
@@ -613,9 +676,7 @@ fn stopped_owner_step(seen: &mut Seen, restart_note: Option<&str>) -> Option<Str
 /// The `ready` or `not ready` line for `admits` and `reason`, given what `seen` holds as
 /// printed, as [`ready_step`] describes.
 fn step_line(seen: &mut Seen, admits: bool, reason: Option<String>) -> Option<String> {
-    let changed = admits != seen.ready;
-    let new_reason = reason.is_some() && reason != seen.reason;
-    if !(changed || new_reason) {
+    if admits == seen.ready && reason == seen.reason {
         return None;
     }
     let line = match (admits, &reason) {
@@ -1810,7 +1871,8 @@ mod tests {
 
     /// Message 6 paper cut: a fenced owner printed a bare `not ready`, and a user may then restart
     /// the node, which ends recovery in M9. The fence prints its reason when it comes after the
-    /// line, nothing more while it lasts or as it clears, and a restart after it prints again.
+    /// line, nothing more while it lasts, the bare line as it clears with writes still out
+    /// (W8-D1), and a restart after it prints again.
     /// W7-D2 (tester r3): that restart left the poll live, and writes came back, so the line
     /// promises the resume and the pause after it, not that writes stay stopped.
     #[test]
@@ -1833,7 +1895,7 @@ mod tests {
             (fenced.clone(), Some(note)),
             (owner(None, true), None),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart));
+            lines.extend(ready_step(&mut seen, &node, restart, &[]));
         }
         assert_eq!(
             lines,
@@ -1843,6 +1905,7 @@ mod tests {
                  resume by themselves once the old grant's expiry is proven, so do not restart \
                  node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)"
                     .to_owned(),
+                "not ready: writes not admitted".to_owned(),
                 format!(
                     "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
                      resume by themselves once the old grant's expiry is proven, so do not \
@@ -1895,7 +1958,7 @@ mod tests {
             for polling in [true, false] {
                 let mut seen = Seen::default();
                 assert_eq!(
-                    ready_step(&mut seen, &fenced(reason, polling), None),
+                    ready_step(&mut seen, &fenced(reason, polling), None, &[]),
                     Some(stuck(name)),
                     "{name}, polling={polling}"
                 );
@@ -1912,9 +1975,151 @@ mod tests {
             fenced(DenyReason::Expired, false),
         ]
         .iter()
-        .filter_map(|node| ready_step(&mut seen, node, None))
+        .filter_map(|node| ready_step(&mut seen, node, None, &[]))
         .collect();
         assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
+    }
+
+    /// Walk 8, W8-D1 (tester r6_3200): a freeze landed while A1 was between grants. A1 lost
+    /// its self-replace CAS, answered the frozen record `NotOurs` and stopped, `unheld` for the
+    /// rest of the run, and the fence's "resume by themselves" line stayed the last word because
+    /// a reason that went away printed nothing. A reason that goes away while writes stay out
+    /// is withdrawn with the bare line, so no promise outlives the state that made it.
+    #[test]
+    fn a_resume_promise_is_withdrawn_when_its_fence_goes_and_writes_stay_out() {
+        let mut fenced = owner(None, false);
+        fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        fenced.fence_polling = true;
+        let mut unheld = owner(None, false);
+        unheld.authority = "unheld".to_owned();
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let lines: Vec<String> = [fenced, unheld.clone(), unheld]
+            .iter()
+            .filter_map(|node| ready_step(&mut seen, node, None, &[]))
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "not ready: writes not admitted: node 1's grant is fenced(Expired); writes \
+                 resume by themselves once the old grant's expiry is proven, so do not restart \
+                 node 1: a restarted node does not rejoin in M9 (achieveai/rDB#42)",
+                "not ready: writes not admitted",
+            ]
+        );
+    }
+
+    /// Node 1's links held, as `link hold 1-2; link hold 1-3` leaves them.
+    const HELD: [(NodeId, NodeId); 2] = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+
+    /// Walk 8, W8-D2 (tester r9, walk 7's 4b): links held, a write in flight, then the fence.
+    /// L1 was paused, and the fence line promised writes resume by themselves. The grant came
+    /// back (`held(grant 3)`) and writes did not, until `link heal all`. With L1 paused or
+    /// reprotecting and a link of node 1's held, under a live poll, the line names the links
+    /// writes also wait on, and still says not to restart node 1. With no link of node 1's held,
+    /// the copies catch up by themselves and the resume line stands.
+    #[test]
+    fn a_fence_with_l1_paused_and_links_held_says_writes_also_wait_on_the_links() {
+        for mode in ["paused", "reprotecting"] {
+            let mut node = owner(None, false);
+            node.authority = "fenced(Expired)".to_owned();
+            node.fence = Some(DenyReason::Expired);
+            node.fence_polling = true;
+            node.protection = Some(mode.to_owned());
+            assert_eq!(
+                ready_step(&mut Seen::default(), &node, None, &HELD),
+                Some(format!(
+                    "not ready: writes not admitted: node 1's grant is fenced(Expired), \
+                     l1={mode} and links 1-2, 1-3 are held; writes resume only once the old \
+                     grant's expiry is proven and node 1's copies catch up, which needs those \
+                     links: heal them (link heal all); do not restart node 1: a restarted node \
+                     does not rejoin in M9 (achieveai/rDB#42)"
+                )),
+                "l1={mode}"
+            );
+            for held in [&[][..], &[(NodeId(2), NodeId(3))][..]] {
+                assert_eq!(
+                    ready_step(&mut Seen::default(), &node, None, held),
+                    Some(
+                        "not ready: writes not admitted: node 1's grant is fenced(Expired); \
+                         writes resume by themselves once the old grant's expiry is proven, so \
+                         do not restart node 1: a restarted node does not rejoin in M9 \
+                         (achieveai/rDB#42)"
+                            .to_owned()
+                    ),
+                    "l1={mode} held={held:?}"
+                );
+            }
+        }
+    }
+
+    /// W8-D2 live re-walk (`r9/walks/w8/w8d2.out`): once A1 held grant 2 again, the fence's
+    /// reason went, and the withdrawal (W8-D1) printed the bare line while L1 stayed paused for
+    /// 20 s, until `link heal all`. Not admitting with L1 paused or reprotecting, a link of node
+    /// 1's held and no restart, names the links writes wait on, as a condition and not a
+    /// promise: a stopped A1 may also hold them out. At startup (`w8d2b.out`) L1 is paused, then
+    /// reprotecting, with no link held, and catches up by itself: no reason.
+    #[test]
+    fn l1_paused_with_links_held_says_writes_wait_on_those_links() {
+        let fenced = |mode: &str| {
+            let mut node = owner(None, false);
+            node.authority = "fenced(Expired)".to_owned();
+            node.fence = Some(DenyReason::Expired);
+            node.fence_polling = true;
+            node.protection = Some(mode.to_owned());
+            node
+        };
+        let held = |mode: &str, admits: bool| {
+            let mut node = owner(None, admits);
+            node.authority = "held(grant 2)".to_owned();
+            node.protection = Some(mode.to_owned());
+            node
+        };
+        let mut startup = Seen::default();
+        assert_eq!(
+            ready_step(&mut startup, &held("paused", false), None, &[]),
+            None
+        );
+        assert_eq!(
+            ready_step(&mut startup, &held("reprotecting", false), None, &[]),
+            None
+        );
+        let wait = "not ready: writes not admitted: l1=paused and links 1-2, 1-3 are held: \
+                    writes wait for node 1's copies to catch up, which needs those links: heal \
+                    them (link heal all)";
+        let mut seen = Seen {
+            ready: true,
+            ..Seen::default()
+        };
+        let lines: Vec<String> = [
+            (held("paused", false), &HELD[..]),
+            (fenced("paused"), &HELD[..]),
+            (held("paused", false), &HELD[..]),
+            (held("paused", false), &HELD[..]),
+            (held("reprotecting", false), &[][..]),
+            (held("healthy", true), &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                wait.to_owned(),
+                "not ready: writes not admitted: node 1's grant is fenced(Expired), l1=paused \
+                 and links 1-2, 1-3 are held; writes resume only once the old grant's expiry is \
+                 proven and node 1's copies catch up, which needs those links: heal them (link \
+                 heal all); do not restart node 1: a restarted node does not rejoin in M9 \
+                 (achieveai/rDB#42)"
+                    .to_owned(),
+                wait.to_owned(),
+                "not ready: writes not admitted".to_owned(),
+                "ready".to_owned(),
+            ]
+        );
     }
 
     /// Message 7: after a secondary restarts, L1 keeps admitting writes for a while (walk 6c),
@@ -1936,7 +2141,7 @@ mod tests {
             (owner(None, true), Some(note)),
             (paused, Some(note)),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart));
+            lines.extend(ready_step(&mut seen, &node, restart, &[]));
         }
         assert_eq!(
             lines,
@@ -2119,7 +2324,11 @@ mod tests {
                 ready: !admits,
                 ..Seen::default()
             };
-            assert_eq!(ready_step(&mut seen, &node, restart), line, "state {state}");
+            assert_eq!(
+                ready_step(&mut seen, &node, restart, &[]),
+                line,
+                "state {state}"
+            );
         }
     }
 
@@ -2257,7 +2466,7 @@ mod tests {
     /// `seen` after a `ready` line, as the poller holds it before a failure.
     fn lines_ready(seen: &mut Seen) {
         assert_eq!(
-            ready_step(seen, &owner(None, true), None),
+            ready_step(seen, &owner(None, true), None, &[]),
             Some("ready".to_owned())
         );
     }
