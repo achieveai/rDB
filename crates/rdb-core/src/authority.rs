@@ -2423,34 +2423,38 @@ impl Authority {
     ///   interval on. Still `Fenced`.
     /// * The store unavailable — a quorum loss, the promise's main path: the poll re-armed one
     ///   renewal interval on, and nothing else. Still `Fenced`.
+    /// * A body this build cannot decode: treated as the store unavailable, and logged as
+    ///   `a1.self_replace_poll_undecodable`. The poll is re-armed one renewal interval on, so
+    ///   [`Self::self_replace_polling`] stays true and stays truthful. Never a step error: the
+    ///   host offers a control answer to every module and drops an `Unavailable` from one that is
+    ///   not its named consumer, so an error here re-armed nothing (M9 S2b-E round 5).
     /// * `Never`, or the record absent: [`AuthorityIgnoreReason::NotOurs`] and no re-arm. Polling
     ///   stops, and nothing in M9 moves the node on: the way on is M10's takeover or rejoin
     ///   (#42).
-    ///
-    /// # Errors
-    ///
-    /// `Unavailable` naming [`Capability::Codec`] when the body is not a [`GrantRecord`].
     fn on_fenced_poll_read(
         &mut self,
         ctx: &StepCtx<'_>,
         event: &Event,
         reason: DenyReason,
         outcome: &ReadOutcome,
-    ) -> Result<Vec<Effect>, RdbError> {
+    ) -> Vec<Effect> {
         let (record, revision) = match outcome {
             ReadOutcome::Found { revision, value } => {
                 let Some(record) = GrantRecord::decode(value) else {
-                    return Err(RdbError::unavailable(
-                        Capability::Codec,
-                        "authority: grants/{node} body is not a GrantRecord this build can read",
-                    ));
+                    tracing::warn!(
+                        node = ctx.node.0,
+                        revision = revision.0,
+                        bytes = value.len(),
+                        "a1.self_replace_poll_undecodable"
+                    );
+                    return vec![self.acquire_retry(ctx, event)];
                 };
                 (record, *revision)
             }
-            ReadOutcome::Unavailable => return Ok(vec![self.acquire_retry(ctx, event)]),
+            ReadOutcome::Unavailable => return vec![self.acquire_retry(ctx, event)],
             ReadOutcome::Absent { .. } => {
                 self.stop_polling();
-                return Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]);
+                return vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)];
             }
         };
         let verdict = self_replace(
@@ -2467,7 +2471,7 @@ impl Authority {
                 acquire: None,
             };
         }
-        Ok(self.after_fence_effects(ctx, event, verdict, revision))
+        self.after_fence_effects(ctx, event, verdict, revision)
     }
 
     /// What a [`grant::self_replace`] verdict on our own record, read at `revision`, does — for
@@ -2951,7 +2955,7 @@ impl Authority {
                 if let Some(after) = self.after_fence.as_mut() {
                     after.poll = None;
                 }
-                return self.on_fenced_poll_read(ctx, event, reason, outcome);
+                return Ok(self.on_fenced_poll_read(ctx, event, reason, outcome));
             }
             return Ok(vec![Self::ignored(
                 event,

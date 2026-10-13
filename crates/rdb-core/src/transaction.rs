@@ -126,6 +126,17 @@ pub(crate) enum LostAuthority {
     /// of the view held at the freeze. `ended` is `None` when no view was held then (C02,
     /// `s2b-verify.md`): any admitting view lifts it, because a node fence ends its grant id and
     /// A1 never again publishes an admitting view under it.
+    ///
+    /// No admitting view under the ended grant can arrive **after** the fence, reordered (M9
+    /// S2b-E round 5). A1 emits a view only while `Held`, under the held grant
+    /// (`Authority::publish`); a node fence moves it to `Fenced` in the same step that emits the
+    /// `Fence` (`Authority::fence`); and it never holds the fenced grant id again
+    /// (`Authority::on_unheld_grant_read`, A-R96 M1). Every view A1 emitted under that grant
+    /// therefore precedes the `Fence` in emission order, and the host keeps that order: each
+    /// routed twin is pushed on the node's one FIFO queue (`Host::kernel` through
+    /// `route::event_for` to `Host::push`, in `rdb-api`) and processed in order by `Host::drain`.
+    /// Only timers are delayed (`Host::delay`). So such a view reaches this kernel before the
+    /// fence, and the freeze then records its grant as `ended`.
     Thaws {
         /// The grant id the freeze ended, if a view was held.
         ended: Option<GrantId>,
@@ -1383,6 +1394,10 @@ impl TxnKernel {
     /// With nothing unresolved every applied seq is published, so `next_seq` and `prev_digest`
     /// continue the chain. `LocalStorageFenced`, `UnresolvedTransaction` and `RecoveryReadOnly`
     /// are never lifted here.
+    ///
+    /// T1 never records `ended: None`: an instance is built from `Recovered` holding its view.
+    /// Why an admitting view under the ended grant cannot arrive after the fence, reordered, is on
+    /// [`LostAuthority::Thaws`] (M9 S2b-E round 5).
     fn thaw(&mut self, ctx: &StepCtx<'_>) -> Option<Vec<TxnEffect>> {
         let QueueMode::Frozen {
             cause: FreezeCause::AuthorityLost(_),

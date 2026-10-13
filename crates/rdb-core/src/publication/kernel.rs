@@ -1123,7 +1123,18 @@ impl PubKernel {
             generation: cand.lineage.generation,
             seq: cand.seq,
         }));
-        if !matches!(self.mode, PubMode::Blocked { .. }) {
+        // `Blocked` is sticky under a publication deny (K-A-48), and so is a storage fence: it
+        // holds for the rest of the generation (spec §5.2 step 3, ADR-rdb-0007 §3), and the
+        // `AuthorityLost` that replaced it would thaw on a new grant's view (M9 S2b-E round 5,
+        // the same rule as `on_freeze`).
+        let sticky = matches!(
+            self.mode,
+            PubMode::Blocked { .. }
+                | PubMode::Frozen {
+                    cause: FreezeCause::LocalStorageFenced
+                }
+        );
+        if !sticky {
             self.mode = PubMode::Frozen {
                 cause: FreezeCause::AuthorityLost(reason),
             };
@@ -1577,6 +1588,10 @@ impl PubKernel {
     ///
     /// `LocalStorageFenced`, `Blocked`, `UnresolvedTransaction` and `RecoveryReadOnly` are never
     /// lifted here.
+    ///
+    /// Why an admitting view under the ended grant cannot arrive after the fence, reordered, so
+    /// that `ended: None` (C02) never lifts on it, is on [`LostAuthority::Thaws`] (M9 S2b-E round
+    /// 5).
     fn thaw_view(&self, now: Tick) -> bool {
         let lost = matches!(
             self.mode,

@@ -2881,6 +2881,28 @@ fn after_a_fence_an_unavailable_poll_keeps_polling_until_control_returns() {
     );
 }
 
+/// This test's own log lines whose message is `message`, from the per-test JSONL file the
+/// `#[retcd_test]` layer writes. The same reader as `publication_p1.rs`'s `own_log_lines`: rdb-core
+/// has no `config-testkit` dev-dependency.
+fn own_log_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    let run = config_log::testing::test_run_id();
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read test log {}: {e}", path.display()))
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("malformed JSONL line in {}: {e}", path.display()))
+        })
+        .filter(|line| line["testRun"].as_str() == Some(run) && line["@m"] == message)
+        .collect()
+}
+
 /// Round 5 (the add-on 3 leftover): the poll's answer is a body this build cannot decode. The
 /// host offers a control answer to every module and drops an `Unavailable` error from one that
 /// is not its named consumer, so an error here re-armed nothing while `self_replace_polling`
@@ -2909,6 +2931,17 @@ fn after_a_fence_an_undecodable_poll_answer_keeps_polling() {
     );
     assert!(kernel.state().is_fenced());
     assert!(kernel.self_replace_polling(), "still polling");
+    let logged = own_log_lines(
+        "after_a_fence_an_undecodable_poll_answer_keeps_polling",
+        "a1.self_replace_poll_undecodable",
+    );
+    let [line] = logged.as_slice() else {
+        panic!("one undecodable-poll line: {logged:?}");
+    };
+    assert_eq!(
+        (line["node"].as_u64(), line["revision"].as_u64()),
+        (Some(u64::from(NODE.0)), Some(7))
+    );
     let back = at + BUDGETS.renew_millis;
     let poll = poll_sent(
         &kernel
