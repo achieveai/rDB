@@ -1188,7 +1188,8 @@ impl PubKernel {
                 },
             );
         }
-        // 7. Resolving the transaction is what unfreezes it; no other cause reopens (K-A-47).
+        // 7. Resolving the transaction is what unfreezes it (K-A-47). A lost-authority freeze
+        //    also reopens, at step 8, on a view under a new grant id (A-R96).
         if self.mode
             == (PubMode::Frozen {
                 cause: FreezeCause::UnresolvedTransaction,
@@ -1510,11 +1511,13 @@ impl PubKernel {
             return vec![PubEffect::Fact(PubFact::StaleAuthorityView)];
         }
         self.authority = Some(view);
-        // The pending write is asked again (A-R96 M2) when it was deferred — a view is what A1
-        // emits when its renewal commits, so control answers again; asked under the deny it is
-        // deferred again, and nothing loops, because no view arrives while control is down — or
-        // when this view would thaw a lost-authority freeze, so the write it holds can publish
-        // under the new grant first. Otherwise nothing is pending and the freeze lifts here.
+        // The pending write is asked again (A-R96 M2) when it was deferred, or when this view
+        // would thaw a lost-authority freeze, so the write it holds publishes under the new grant
+        // first. Views do arrive while control is down: the host stamps each step's sample at
+        // `now`, so A1 republishes on every step. A deferred write is therefore asked about once
+        // per A1 step through an outage — one check per step, bounded, and never a ping-pong,
+        // because a step's view is queued before its answer. Otherwise the freeze lifts here
+        // when nothing is pending.
         let ask = self.pending.as_ref().is_some_and(|p| p.recheck.is_none())
             && (self.pending.as_ref().is_some_and(|p| p.deferred) || self.thaw_view(now));
         if !ask {

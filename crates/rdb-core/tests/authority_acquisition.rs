@@ -2830,3 +2830,165 @@ fn after_a_fence_an_absent_record_read_back_is_not_taken() {
     );
     assert!(!kernel.state().is_held());
 }
+
+/// R4 (A-R96), the promise's main path: a quorum loss. The poll's answer is `Unavailable`; the
+/// poll is armed again one renewal interval on, and the node stays `Fenced`. Once control is back,
+/// the re-armed firing polls again and a proven expiry replaces at the exact revision read.
+#[retcd_test]
+fn after_a_fence_an_unavailable_poll_keeps_polling_until_control_returns() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let lost = 3_150;
+    let effects = kernel
+        .step(
+            &sampled_at(lost, lost),
+            &polled(lost, poll, ReadOutcome::Unavailable),
+        )
+        .expect("the poll's answer");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(lost + BUDGETS.renew_millis)
+        )]
+    );
+    assert!(kernel.state().is_fenced(), "still fenced, still polling");
+    let back = lost + BUDGETS.renew_millis;
+    let due = acquire_due(&kernel, back, back);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(back, back), &due)
+            .expect("the re-armed firing"),
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(back, back),
+            &polled(back, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer once control is back");
+    let replaced = shapes(&effects);
+    let [Shape::Cas { expected, record }] = replaced.as_slice() else {
+        panic!("one CAS: {effects:?}");
+    };
+    assert_eq!(*expected, Some(Revision(7)), "the exact revision read");
+    assert_ne!(
+        record.as_ref().map(|r| r.grant),
+        Some(fenced),
+        "a new grant id"
+    );
+}
+
+/// The freeze race (A-R96 kernel ruling 1, critic M2): the replace conflicts because the record
+/// changed under it, and the read-back finds it is no longer ours to replace — a planner froze
+/// it, or another boot or authority generation wrote it. No CAS, no re-arm, not `Held`.
+#[retcd_test]
+fn after_a_fence_a_conflicting_replace_never_writes_over_a_record_not_ours() {
+    type Change = fn(&mut GrantRecord);
+    let cases: [(&str, Change); 3] = [
+        ("frozen by a planner", |r| r.frozen = true),
+        ("another boot", |r| r.boot = BootId(2)),
+        ("another authority generation", |r| {
+            r.authority_generation = AuthorityGeneration(1)
+        }),
+    ];
+    for (why, change) in cases {
+        let (mut kernel, fenced, poll) = fenced_and_polled();
+        let replace = kernel
+            .step(
+                &sampled_at(PROVEN, PROVEN),
+                &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+            )
+            .expect("the poll's answer");
+        let request = sent_as(&replace);
+        kernel
+            .step(
+                &sampled_at(PROVEN + 1, PROVEN),
+                &cas_result(
+                    PROVEN + 1,
+                    PROVEN + 1,
+                    request,
+                    CasOutcome::Conflict {
+                        exists: true,
+                        current: Revision(8),
+                    },
+                ),
+            )
+            .expect("the replace conflicts");
+        let mut record = our_record(fenced, e_new_at(5));
+        change(&mut record);
+        let effects = kernel
+            .step(
+                &sampled_at(PROVEN + 2, PROVEN),
+                &grant_read(PROVEN + 2, found(8, &record)),
+            )
+            .expect("the read-back");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+            "{why}: no CAS, no re-arm"
+        );
+        assert!(!kernel.state().is_held(), "{why}");
+    }
+}
+
+/// Critic A5 (A-R96): a read of our record lands while the replace CAS is in flight. It records
+/// nothing: when the replace then conflicts and the read-back is not yet proven, the next firing
+/// polls again rather than CASing at the revision the in-flight read saw.
+#[retcd_test]
+fn after_a_fence_a_read_under_an_in_flight_replace_leaves_no_replace_target() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let record = our_record(fenced, e_new_at(5));
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &record)),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &grant_read(PROVEN + 1, found(7, &record)),
+        )
+        .expect("a read under the in-flight replace");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::StaleTimer)]
+    );
+    kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &cas_result(
+                PROVEN + 2,
+                PROVEN + 2,
+                request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(50),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    let late = our_record(fenced, e_new_at(505));
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 3, PROVEN),
+            &grant_read(PROVEN + 3, found(50, &late)),
+        )
+        .expect("the read-back, not yet proven");
+    assert_eq!(
+        shapes(&effects)[0],
+        Shape::Ignored(AuthorityIgnoreReason::AcquireWithheld)
+    );
+    let at = PROVEN + 3 + BUDGETS.renew_millis;
+    let due = acquire_due(&kernel, at, at);
+    let effects = kernel
+        .step(&sampled_at(at, at), &due)
+        .expect("the re-armed firing");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Get(ControlKey::Grant(NODE))],
+        "a poll, never a CAS at revision 7"
+    );
+}

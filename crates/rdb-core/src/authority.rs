@@ -2287,10 +2287,19 @@ impl Authority {
     ///
     /// With [`AfterFence`] set, the CAS is never create-only. Until a read has proven the own
     /// record replaceable, the firing only polls it with a `Get` (M1); once one has, the CAS
-    /// expects exactly the revision that read saw.
-    fn on_acquire_due(&mut self, ctx: &StepCtx<'_>, event: &Event) -> Vec<Effect> {
+    /// expects exactly the revision that read saw: `replace`, recorded only once no CAS is
+    /// already in flight, so a read landing under an in-flight replace leaves nothing behind.
+    fn on_acquire_due(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        event: &Event,
+        replace: Option<Revision>,
+    ) -> Vec<Effect> {
         if self.state.acquire().is_some() {
             return vec![Self::ignored(event, AuthorityIgnoreReason::StaleTimer)];
+        }
+        if let (Some(revision), Some(after)) = (replace, self.after_fence.as_mut()) {
+            after.replace_at = Some(revision);
         }
         if self
             .after_fence
@@ -2356,8 +2365,10 @@ impl Authority {
     ///
     /// * `Replace`: `Unheld`, with the fence's reason kept as `last_fence`, and the acquisition
     ///   row at once — a CAS at the revision read, under a new grant id.
-    /// * `NotYet`, or the store unavailable: [`AuthorityIgnoreReason::AcquireWithheld`] and the
-    ///   poll re-armed one renewal interval on. Still `Fenced`.
+    /// * `NotYet`: [`AuthorityIgnoreReason::AcquireWithheld`] and the poll re-armed one renewal
+    ///   interval on. Still `Fenced`.
+    /// * The store unavailable — a quorum loss, the promise's main path: the poll re-armed one
+    ///   renewal interval on, and nothing else. Still `Fenced`.
     /// * `Never`, or the record absent: [`AuthorityIgnoreReason::NotOurs`] and no re-arm. Polling
     ///   stops; a takeover or a restart is the way on.
     ///
@@ -2386,29 +2397,41 @@ impl Authority {
                 return Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]);
             }
         };
-        match self_replace(
+        let verdict = self_replace(
             &record,
             ctx.node,
             ctx.boot,
             &self.clock,
             ctx.now,
             ctx.budgets,
-        ) {
-            SelfReplace::Replace => {
-                if let Some(after) = self.after_fence.as_mut() {
-                    after.replace_at = Some(revision);
-                }
-                self.state = AuthorityState::Unheld {
-                    last_fence: Some(reason),
-                    acquire: None,
-                };
-                Ok(self.on_acquire_due(ctx, event))
-            }
-            SelfReplace::NotYet => Ok(vec![
+        );
+        if verdict == SelfReplace::Replace {
+            self.state = AuthorityState::Unheld {
+                last_fence: Some(reason),
+                acquire: None,
+            };
+        }
+        Ok(self.after_fence_effects(ctx, event, verdict, revision))
+    }
+
+    /// What a [`grant::self_replace`] verdict on our own record, read at `revision`, does — for
+    /// both after-fence read handlers (A-R96). `Replace`: the acquisition row at once, a CAS at
+    /// `revision` under a new grant id. `NotYet`: withheld, and the poll re-armed one renewal
+    /// interval on. `Never`: [`AuthorityIgnoreReason::NotOurs`] and no re-arm; polling stops.
+    fn after_fence_effects(
+        &mut self,
+        ctx: &StepCtx<'_>,
+        event: &Event,
+        verdict: SelfReplace,
+        revision: Revision,
+    ) -> Vec<Effect> {
+        match verdict {
+            SelfReplace::Replace => self.on_acquire_due(ctx, event, Some(revision)),
+            SelfReplace::NotYet => vec![
                 Self::ignored(event, AuthorityIgnoreReason::AcquireWithheld),
                 self.acquire_retry(ctx, event),
-            ]),
-            SelfReplace::Never => Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)]),
+            ],
+            SelfReplace::Never => vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)],
         }
     }
 
@@ -2553,28 +2576,15 @@ impl Authority {
             }
             // After a fence: replace when proven, wait while not, stop when it is not ours.
             _ if after_fence.is_some() => {
-                match self_replace(
+                let verdict = self_replace(
                     &record,
                     ctx.node,
                     ctx.boot,
                     &self.clock,
                     ctx.now,
                     ctx.budgets,
-                ) {
-                    SelfReplace::Replace => {
-                        if let Some(after) = self.after_fence.as_mut() {
-                            after.replace_at = Some(*revision);
-                        }
-                        Ok(self.on_acquire_due(ctx, event))
-                    }
-                    SelfReplace::NotYet => Ok(vec![
-                        Self::ignored(event, AuthorityIgnoreReason::AcquireWithheld),
-                        self.acquire_retry(ctx, event),
-                    ]),
-                    SelfReplace::Never => {
-                        Ok(vec![Self::ignored(event, AuthorityIgnoreReason::NotOurs)])
-                    }
-                }
+                );
+                Ok(self.after_fence_effects(ctx, event, verdict, *revision))
             }
             _ => Ok(vec![
                 Self::ignored(event, AuthorityIgnoreReason::NotOurs),
@@ -3640,7 +3650,7 @@ impl Authority {
             }
             AuthorityTimer::Renew if self.state.is_held() => Ok(self.on_renew_due(ctx, event)),
             AuthorityTimer::Acquire if self.state.is_unheld() => {
-                Ok(self.on_acquire_due(ctx, event))
+                Ok(self.on_acquire_due(ctx, event, None))
             }
             // A renewal wake with no grant, or an acquisition wake while one is held: the state
             // moved under a timer that was armed for the other one.

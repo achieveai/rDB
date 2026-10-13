@@ -2995,9 +2995,10 @@ fn a_failed_batch_answers_the_queue_behind_it() {
     assert_eq!(h.k().queue_len(), 0);
 }
 
-/// A-R71, tester-t1 hunt_21, pinned as designed (design §3.3: only `Recovered` reopens). A
-/// freeze for lost authority holds for the rest of the generation. A fresh view does not reopen
-/// it, and a `Recovered` no newer than the held lineage is ignored. A newer generation does.
+/// A-R71, tester-t1 hunt_21, pinned as designed (design §3.3: `Recovered` reopens, or, since lead
+/// ruling A-R96, a view under a new grant id). A freeze for lost authority holds for the rest of
+/// the generation under the fenced grant. A fresh view under that same grant does not reopen it,
+/// and a `Recovered` no newer than the held lineage is ignored. A newer generation does.
 #[retcd_test]
 fn a_lost_authority_freeze_reopens_only_on_a_newer_generation() {
     let mut h = H::live();

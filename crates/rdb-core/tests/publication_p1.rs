@@ -1213,40 +1213,50 @@ fn m7a_99_publication_check_deny_quarantines_freezes_authority_lost() {
     assert!(view.pending.is_some(), "pending kept");
 }
 
-/// `Admit` under a moved lineage quarantines exactly as a deny, as `GenerationChanged`.
+/// `Admit` under a moved authority quarantines exactly as a deny, as `GenerationChanged`.
 ///
 /// Re-derived for lead ruling A-R96 M2: this row moved only the grant id, and a decision that
 /// differs from the candidate's **only** in grant id now publishes
-/// (`an_admit_under_a_new_grant_id_alone_publishes_the_pending_write`). The authority generation
-/// is still compared, so moving it keeps the row's claim — a moved authority quarantines — and
-/// its exact vector unchanged.
+/// (`an_admit_under_a_new_grant_id_alone_publishes_the_pending_write`). Boot and authority
+/// generation are still compared, so moving either keeps the row's claim — a moved authority
+/// quarantines — and its exact vector unchanged. One case each (critic A2, A-R96).
 #[retcd_test]
 fn an_admit_under_a_moved_lineage_quarantines() {
-    let mut rig = Rig::new();
-    let c = rig.pending_with_recheck(5);
-    assert_eq!(rig.admitted(read(21)), vec![]);
-    let mut moved = decision(P, Checkpoint::Publication, c, Verdict::Admit, 1);
-    moved.authority_generation = AuthorityGeneration(2);
-    let t = rig.now + 10;
-    let effects = rig.step(EventKind::Kernel(KernelEvent::Authority(
-        AuthorityEvent::Answer(moved),
-    )));
-    assert_eq!(
-        effects,
-        vec![
-            status_write(5, 5, StatusOutcome::Unknown, t),
-            quarantined(5),
-            rejected_read(21, ErrorKind::GenerationChanged),
-        ],
-        "the freeze drains the queue exactly as a deny's does"
-    );
-    assert_eq!(
-        rig.view().mode,
-        PubMode::Frozen {
-            cause: FreezeCause::AuthorityLost(DenyReason::GenerationChanged)
-        }
-    );
-    assert_eq!(rig.view().published.seq, Seq(START));
+    type Move = fn(&mut AuthorityDecision);
+    let cases: [(&str, Move); 2] = [
+        ("authority generation", |d| {
+            d.authority_generation = AuthorityGeneration(2)
+        }),
+        ("boot", |d| d.boot = BootId(BOOT.0 + 1)),
+    ];
+    for (why, change) in cases {
+        let mut rig = Rig::new();
+        let c = rig.pending_with_recheck(5);
+        assert_eq!(rig.admitted(read(21)), vec![]);
+        let mut moved = decision(P, Checkpoint::Publication, c, Verdict::Admit, 1);
+        change(&mut moved);
+        let t = rig.now + 10;
+        let effects = rig.step(EventKind::Kernel(KernelEvent::Authority(
+            AuthorityEvent::Answer(moved),
+        )));
+        assert_eq!(
+            effects,
+            vec![
+                status_write(5, 5, StatusOutcome::Unknown, t),
+                quarantined(5),
+                rejected_read(21, ErrorKind::GenerationChanged),
+            ],
+            "{why}: the freeze drains the queue exactly as a deny's does"
+        );
+        assert_eq!(
+            rig.view().mode,
+            PubMode::Frozen {
+                cause: FreezeCause::AuthorityLost(DenyReason::GenerationChanged)
+            },
+            "{why}"
+        );
+        assert_eq!(rig.view().published.seq, Seq(START), "{why}");
+    }
 }
 
 /// The one `Publication` check in `effects`, or a panic naming what came instead.
