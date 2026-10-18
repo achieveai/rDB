@@ -1956,6 +1956,22 @@ impl Host {
                     .or_default()
                     .push_back((lineage.generation, *seq, self.clock.now()));
             }
+            // A1 refused a check. The refusal the client sees (`LEASE_EXPIRED` and the like) does
+            // not say which conjunct denied, so name it here (U1, ruling A-R109). Still routed.
+            KernelEffect::Authority(AuthorityEffect::Answer(decision)) => {
+                if let Verdict::Deny(reason) = decision.verdict {
+                    tracing::info!(
+                        node,
+                        partition = site.partition.0,
+                        checkpoint = ?decision.checkpoint,
+                        reason = ?reason,
+                        grant = decision.grant.0,
+                        authority_seq = ?decision.authority_seq,
+                        at = self.stepped_at.0,
+                        "authority_check_denied"
+                    );
+                }
+            }
             _ => {}
         }
         if let Some(event) = route::event_for(kernel) {
