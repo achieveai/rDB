@@ -203,9 +203,9 @@ mod tests {
 
     /// M9 S3-1, S3-1n and S3-1h: a dropped direction loses what is sent on it and still answers
     /// `Ok`, so the sender learns of it only by its own timers (A-2). It is one direction: the
-    /// reverse still delivers. A heal of the pair lifts it from either end, and `heal_all`
-    /// lifts every drop as well as every hold (A-1). What a drop lost stays lost; what a hold
-    /// kept is delivered. Unit.
+    /// reverse still delivers. A heal of the pair lifts it from either end, named in either
+    /// order, and `heal_all` lifts every drop as well as every hold (A-1). What a drop lost
+    /// stays lost; what a hold kept is delivered. Unit.
     #[test]
     fn a_dropped_direction_loses_silently_one_way_until_a_heal() {
         let links = Links::new();
@@ -231,6 +231,9 @@ mod tests {
         assert_eq!(links.dropped(), [], "healed from the other end");
         assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack")), Ok(()));
         assert_eq!(got(&rx1), ["ack"]);
+        links.drop_direction(NodeId(1), NodeId(2));
+        assert_eq!(links.heal(NodeId(1), NodeId(2)), 0);
+        assert_eq!(links.dropped(), [], "healed from the same end");
 
         links.drop_direction(NodeId(3), NodeId(1));
         links.hold(NodeId(1), NodeId(2));

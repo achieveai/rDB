@@ -4752,7 +4752,8 @@ mod tests {
     /// links are held, and a put stays unacknowledged past the pause age. Then a stall line is
     /// written for a `DegradedRf2` watch set by hand, as the K1 row above does, and it says
     /// writes stay paused. After the heal L1 resumes, and that watch never activates. Once L1
-    /// admits writes, the line must stop saying they are paused.
+    /// admits writes, the line must stop saying they are paused. Status names the held put as
+    /// the write the owner's queue waits on (`waits_on`, U1), and nothing once it publishes.
     /// Integration (~1 s): three hosts stepped by hand, through a real L1 pause and resume.
     #[test]
     fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
@@ -4763,9 +4764,15 @@ mod tests {
         trio.links.hold(NodeId(1), NodeId(2));
         trio.links.hold(NodeId(1), NodeId(3));
         let unacknowledged = trio.call(put(1, b"a", b"1", None));
-        trio.until("L1 pauses writes", |trio| {
-            (trio.status(0).admits == Some(false)).then_some(())
+        let paused = trio.until("L1 pauses writes", |trio| {
+            let status = trio.status(0);
+            (status.admits == Some(false)).then_some(status)
         });
+        assert_eq!(
+            paused.waits_on,
+            Some(Seq(2)),
+            "waits_on names the applied, unpublished put: {paused:?}"
+        );
 
         let partition = PartitionId(1);
         let host = &mut trio.nodes[0].0;
@@ -4807,6 +4814,14 @@ mod tests {
         assert!(
             line.ends_with("so the partition stays DegradedRf2 and does not activate"),
             "{line}"
+        );
+        let published = trio.until("seq 2 publishes", |trio| {
+            let status = trio.status(0);
+            (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
+        });
+        assert_eq!(
+            published.waits_on, None,
+            "waits_on once the put published: {published:?}"
         );
         drop(unacknowledged);
     }
