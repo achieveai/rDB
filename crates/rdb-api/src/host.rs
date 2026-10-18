@@ -6166,6 +6166,43 @@ mod tests {
         }
     }
 
+    /// Tester coverage ask (S3-5): the trim duty skips a partition with nothing published to
+    /// age and goes on to the next. Node 1 holds an empty publish queue for partition 0, which
+    /// sorts before partition 1, as an idle partition's does once its last entry aged out. The
+    /// write on partition 1 is still trimmed. A duty that stopped at the idle partition would
+    /// never trim partition 1. Trio (~4 s): a 300 ms retention, one trim tick past it.
+    #[config_log::retcd_test]
+    fn the_trim_duty_passes_an_idle_partition_and_trims_the_next() {
+        const METHOD: &str = "the_trim_duty_passes_an_idle_partition_and_trims_the_next";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = 300;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let owner = &mut trio.nodes[0].0;
+        assert_eq!(owner.node, NodeId(1));
+        owner.published_at.insert(PartitionId(0), VecDeque::new());
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        let trims = trio.until("node 1 trims partition 1 below 3", |_| {
+            let trims = logged!(METHOD, "host_duty")
+                .into_iter()
+                .filter(|line| line["kind"] == "trim")
+                .collect::<Vec<_>>();
+            trims.iter().any(|line| line["below"] == 3).then_some(trims)
+        });
+        assert!(
+            trims
+                .iter()
+                .all(|line| line["node"] == 1 && line["partition"] == 1),
+            "nothing trimmed for the idle partition: {trims:?}"
+        );
+    }
+
     /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
     /// applies request 3 with both links held, so it is committed and unpublished. Past the
     /// retention it is still held, and the trim spares it. Once healed it publishes, and a
