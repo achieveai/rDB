@@ -210,6 +210,11 @@ pub struct DbConfig {
     /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
     /// status index holds no more than that. A dev budget, to reach a full index by hand.
     pub dedup_cap: Option<usize>,
+    /// How long a published write's retained answer is kept before the owner's trim duty lets
+    /// it go: its dedup entry and its status. `None` is the spec's 24 h
+    /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// A retry of a trimmed request is no longer recognised and applies again (spec §5.3).
+    pub dedup_retention: Option<Duration>,
 }
 
 impl DbConfig {
@@ -401,7 +406,19 @@ impl Db {
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
         let limits = limits(config.dedup_cap)?;
-        tracing::info!(dedup_cap = limits.dedup_cap, "db_open");
+        let budgets = Budgets {
+            dedup_retention_millis: config
+                .dedup_retention
+                .map_or(budgets.dedup_retention_millis, |retention| {
+                    u64::try_from(retention.as_millis()).unwrap_or(u64::MAX)
+                }),
+            ..budgets
+        };
+        tracing::info!(
+            dedup_cap = limits.dedup_cap,
+            dedup_retention_ms = budgets.dedup_retention_millis,
+            "db_open"
+        );
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
             budgets,
@@ -1361,6 +1378,7 @@ mod tests {
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
+            dedup_retention: None,
         }
     }
 
@@ -1398,6 +1416,7 @@ mod tests {
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
+            dedup_retention: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1480,6 +1499,7 @@ mod tests {
                 read: Duration::from_secs(1),
             },
             dedup_cap: None,
+            dedup_retention: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1598,6 +1618,7 @@ mod tests {
                 read: patience,
             },
             dedup_cap: None,
+            dedup_retention: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1838,6 +1859,7 @@ mod tests {
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
+            dedup_retention: None,
         };
         match rt.block_on(Db::open(config, store, rt.handle().clone())) {
             Err(OpenError::NotEmpty(path)) => assert_eq!(path, dir.path().join("nodes")),
@@ -3003,6 +3025,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let above = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
+            dedup_retention: None,
             ..config(dir.path())
         };
         match rt.block_on(Db::open(above, store, rt.handle().clone())) {
@@ -3027,6 +3050,7 @@ mod tests {
         assert_eq!(lines[0]["dedup_cap"], RETENTION_CAP_ENTRIES + 1);
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
+            dedup_retention: None,
             ..config(dir.path())
         };
         assert!(

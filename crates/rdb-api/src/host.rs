@@ -15,8 +15,9 @@
 //!   queue is drained before the next mailbox message.
 //! * **Duties no kernel emits (§4.1).** A flush every [`HOST_FLUSH_EVERY_MILLIS`], the health
 //!   evaluation L1 is owed every [`HEALTH_EVAL_PERIOD_MILLIS`], A1's first `AcquireDue` on the
-//!   primary [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after the recovery, and the start-of-process
-//!   revocation replay (none persisted in M9: Decision 4).
+//!   primary [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after the recovery, the start-of-process
+//!   revocation replay (none persisted in M9: Decision 4), and the retention trim every
+//!   [`HOST_TRIM_EVERY_MILLIS`] (ADR-rdb-0004 §4, achieveai/rDB#34).
 //! * **Fail loud (§4.4).** An effect the host cannot serve logs `host_unsupported` and faults the
 //!   node. A faulted node answers every later call with the fault and runs nothing else. It never
 //!   drops an effect and never fakes an answer.
@@ -87,6 +88,11 @@ pub const BOOT: BootId = BootId(1);
 /// `HOST_FLUSH_EVERY_MILLIS`. Mandatory: without it a recovered copy reports durable 0 for ever
 /// and L1 never resumes (L-R177gf; s0-probe, control D).
 pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
+
+/// The trim duty's period, in milliseconds: how often the host looks for published writes
+/// older than [`Budgets::dedup_retention_millis`] and lets T1 and P1 drop their retained
+/// answers (achieveai/rDB#34).
+pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
 
 /// How long after a recovery the primary's A1 is first woken to acquire its grant. The same
 /// value as the lowering's `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first
@@ -774,6 +780,11 @@ struct Host {
     next_frame: u32,
     next_flush: Tick,
     next_ticket: u64,
+    next_trim: Tick,
+    /// Per partition, each published `(generation, seq)` and when it was published, oldest
+    /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
+    /// fills it.
+    published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
     flushed_once: bool,
     /// Per partition, the step view and the `(generation, applied)` it was built at. Per
     /// partition, because the flusher's completions arrive on partition 0 and would otherwise
@@ -859,6 +870,8 @@ impl Host {
             next_frame: 1,
             next_flush: now.plus_millis(HOST_FLUSH_EVERY_MILLIS),
             next_ticket: 1,
+            next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
+            published_at: BTreeMap::new(),
             flushed_once: false,
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -925,6 +938,7 @@ impl Host {
         let now = self.clock.now();
         let due = [
             Some(self.next_flush),
+            Some(self.next_trim),
             self.timers.values().map(|(_, at, _)| *at).min(),
             self.l1.values().filter_map(|l1| l1.next_eval).min(),
             self.delayed.keys().next().map(|(at, _)| *at),
@@ -1191,6 +1205,10 @@ impl Host {
                 return;
             }
         }
+        if self.next_trim <= now {
+            self.next_trim = now.plus_millis(HOST_TRIM_EVERY_MILLIS);
+            self.trim_duty(now);
+        }
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
         for (_, item) in due {
@@ -1266,6 +1284,63 @@ impl Host {
         };
         self.push(site, EventKind::Storage(kind), false, None);
         Ok(())
+    }
+
+    /// The trim duty (achieveai/rDB#34; ADR-rdb-0004 §4): per partition, the published writes
+    /// at least [`Budgets::dedup_retention_millis`] old go from T1's dedup index and P1's status
+    /// index together, as one `DedupTrim` and one `StatusTrim` with the same `below`: the
+    /// last aged seq plus one, so no younger entry goes. A write ages from its publish, never
+    /// its commit, so a write still held unpublished is never trimmed. A sweep, not a waiter.
+    ///
+    /// Publish times live in this process only. A new owner, promoted or restarted, has none
+    /// for the rows it seeds, so it must age them itself (for example, stamp them at its own
+    /// activation) and retire the old generation; M10 owes that (ruling A-R105).
+    fn trim_duty(&mut self, now: Tick) {
+        let retention = self.budgets.dedup_retention_millis;
+        let mut trims = Vec::new();
+        for (partition, published) in &mut self.published_at {
+            let Some(&(generation, _, _)) = published.front() else {
+                continue;
+            };
+            let mut last = None;
+            while let Some(&(g, seq, at)) = published.front() {
+                if g != generation || at.plus_millis(retention) > now {
+                    break;
+                }
+                last = Some(seq);
+                published.pop_front();
+            }
+            if let Some(last) = last {
+                trims.push((*partition, generation, Seq(last.0 + 1)));
+            }
+        }
+        for (partition, generation, below) in trims {
+            tracing::info!(
+                node = self.node.0,
+                kind = "trim",
+                partition = partition.0,
+                generation = generation.0,
+                below = below.0,
+                retention_ms = retention,
+                "host_duty"
+            );
+            let site = Site {
+                partition,
+                correlation: CorrelationId::default(),
+            };
+            self.push(
+                site,
+                EventKind::Kernel(KernelEvent::DedupTrim { generation, below }),
+                false,
+                None,
+            );
+            self.push(
+                site,
+                EventKind::Kernel(KernelEvent::StatusTrim { generation, below }),
+                false,
+                None,
+            );
+        }
     }
 
     /// F-014: the put sent as `event` still waits at its deadline plus the margin, so P1 has
@@ -1873,6 +1948,13 @@ impl Host {
             }
             KernelEffect::CopyCaughtUp { copy, head, .. } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+            }
+            // Recorded for the trim duty, then routed to T1 below.
+            KernelEffect::Published { lineage, seq, .. } => {
+                self.published_at
+                    .entry(lineage.partition)
+                    .or_default()
+                    .push_back((lineage.generation, *seq, self.clock.now()));
             }
             _ => {}
         }

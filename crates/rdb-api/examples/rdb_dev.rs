@@ -3,11 +3,14 @@
 //! ```text
 //! cargo run -p rdb-api --example rdb_dev -- [--dir D] [--log-dir L] [--script F] [--keep]
 //!                                           [--hold 1-2,1-3] [--put-timeout-ms N]
-//!                                           [--dedup-cap N]
+//!                                           [--dedup-cap N] [--dedup-retention-ms N]
 //! ```
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
+//! `--dedup-retention-ms N` keeps a published write's retained answer N ms instead of 24 h: the
+//! owner's trim duty then drops its dedup entry and status (`host_duty kind=trim`, once a
+//! second), so a full index frees up by hand. A `retry` of a trimmed request applies again.
 //!
 //! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
 //! on spaces; `"..."` makes one word, so `""` is an empty object or value:
@@ -194,6 +197,8 @@ struct Args {
     put_timeout: Option<std::time::Duration>,
     /// T1's dedup cap, lowered as a dev budget.
     dedup_cap: Option<usize>,
+    /// How long a published write's answer is retained, shortened as a dev budget.
+    dedup_retention: Option<Duration>,
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -206,6 +211,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         hold: Vec::new(),
         put_timeout: None,
         dedup_cap: None,
+        dedup_retention: None,
     };
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().ok_or_else(|| format!("{name} needs a value"));
@@ -227,6 +233,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     text.parse::<usize>()
                         .map_err(|_| format!("--dedup-cap takes a number, not {text:?}"))?,
                 );
+            }
+            "--dedup-retention-ms" => {
+                let text = value("--dedup-retention-ms")?;
+                let millis = text
+                    .parse::<u64>()
+                    .map_err(|_| format!("--dedup-retention-ms takes a number, not {text:?}"))?;
+                parsed.dedup_retention = Some(Duration::from_millis(millis));
             }
             "--hold" => {
                 for pair in value("--hold")?.split(',') {
@@ -320,6 +333,7 @@ where
             ..Timeouts::default()
         },
         dedup_cap: args.dedup_cap,
+        dedup_retention: args.dedup_retention,
     };
     // Before the voters start (PC-2): a refused option starts nothing.
     if let Err(e) = config.check() {
@@ -2921,6 +2935,7 @@ mod tests {
             hold: Vec::new(),
             put_timeout: None,
             dedup_cap: None,
+            dedup_retention: None,
         };
         let code = run(&args, |_, _, _| async {
             Err(OpenError::Node("node 2: injected".to_owned()))
@@ -3057,6 +3072,7 @@ mod tests {
             hold: Vec::new(),
             put_timeout: None,
             dedup_cap: Some(65_537),
+            dedup_retention: None,
         };
         let opened = AtomicBool::new(false);
         let code = run(&args, |_, _, _| {
