@@ -978,6 +978,7 @@ fn repl<'scope, 'env>(
                 scope.spawn(move || {
                     let answer = db.put(object.as_bytes(), value.as_bytes(), if_version);
                     say(&format!("bg {object}: {}", put_text(&answer)));
+                    bg_note(db, &format!("bg {object}"), &answer);
                 });
             }),
             ["txn", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
@@ -989,6 +990,7 @@ fn repl<'scope, 'env>(
                 scope.spawn(move || {
                     let answer = db.txn(&txn_puts(&ops), deadline);
                     say(&format!("bg txn: {}", put_text(&answer)));
+                    bg_note(db, "bg txn", &answer);
                 });
             }),
             ["retry", rest @ .., "--payload", value] => {
@@ -1469,6 +1471,16 @@ fn waits_note(db: &Db) -> Option<String> {
     let owner = nodes.iter().find(|node| node.node == NodeId(1))?;
     let links = db.links();
     waits_on_line(owner, &links.held(), &links.dropped()).map(|line| format!("note: {line}"))
+}
+
+/// [`waits_note`] for a background `put&` or `txn&`, under the same `label` as its answer
+/// line, so the note cannot be read as another command's.
+fn bg_note(db: &Db, label: &str, answer: &Result<rdb_api::PutOk, PutError>) {
+    if answer.is_err() {
+        if let Some(note) = waits_note(db) {
+            say(&format!("{label}: {note}"));
+        }
+    }
 }
 
 /// A put's answer as one line.
