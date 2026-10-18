@@ -345,7 +345,8 @@ pub enum TxnEvent {
 /// A refusal. **No success variant** — "T1 never returns success" is a type (M7A-84).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnRejection {
-    /// Definitive: nothing was written (checks 1–10, steps 11–14, a pre-apply freeze).
+    /// Definitive for this submission: it wrote nothing (checks 1–10, steps 11–14, a pre-apply
+    /// freeze). An earlier send of the same identity may still have applied (#35).
     NotAdmitted(RdbError),
     /// Not definitive: the batch may have landed (`UNKNOWN_OUTCOME`).
     Ambiguous(RdbError),

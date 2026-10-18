@@ -90,16 +90,23 @@ First failure wins, in this order, so that one trace always produces one reason:
 
 | # | Check | Error | What the caller may conclude |
 |---|---|---|---|
-| 1 | `api_version`, no unknown mandatory field | `INCOMPATIBLE_VERSION` | nothing was written |
-| 2 | remaining deadline > 0 | `DEADLINE_BEFORE_ADMISSION` | nothing was written |
-| 3 | all keys share `(tenant, affinity_id)` | `CROSS_AFFINITY` | nothing was written |
-| 4 | affinity hash routes here | `NOT_PRIMARY` / `ROUTE_CHANGED` | nothing was written |
-| 5 | `expected_generation` matches | `GENERATION_CHANGED` | nothing was written |
-| 6 | authority admits at `Checkpoint::Admission` | `LEASE_EXPIRED` etc. | nothing was written |
-| 7 | partition queue not frozen | `PROTECTION_PAUSED` | nothing was written **by this request** |
-| 8 | L1's admission state allows (`AdmissionState.allow`; the reply is its `reason`) | `PROTECTION_PAUSED`, or `DIVERGENCE_REQUIRES_OPERATOR` while the partition is blocked | nothing was written **by this request** |
-| 9 | queue below cap | `OVERLOADED` | nothing was written |
-| 10 | structural validation | `INVALID_ARGUMENT` | nothing was written |
+| 1 | `api_version`, no unknown mandatory field | `INCOMPATIBLE_VERSION` | **this submission** wrote nothing |
+| 2 | remaining deadline > 0 | `DEADLINE_BEFORE_ADMISSION` | **this submission** wrote nothing |
+| 3 | all keys share `(tenant, affinity_id)` | `CROSS_AFFINITY` | **this submission** wrote nothing |
+| 4 | affinity hash routes here | `NOT_PRIMARY` / `ROUTE_CHANGED` | **this submission** wrote nothing |
+| 5 | `expected_generation` matches | `GENERATION_CHANGED` | **this submission** wrote nothing |
+| 6 | authority admits at `Checkpoint::Admission` | `LEASE_EXPIRED` etc. | **this submission** wrote nothing |
+| 7 | partition queue not frozen | `PROTECTION_PAUSED` | **this submission** wrote nothing |
+| 8 | L1's admission state allows (`AdmissionState.allow`; the reply is its `reason`) | `PROTECTION_PAUSED`, or `DIVERGENCE_REQUIRES_OPERATOR` while the partition is blocked | **this submission** wrote nothing |
+| 9 | queue below cap | `OVERLOADED` | **this submission** wrote nothing |
+| 10 | structural validation | `INVALID_ARGUMENT` | **this submission** wrote nothing |
+
+**Amended 2026-10-18 (M9 S3, #35): the conclusion covers the submission, not the request.**
+Checks 1–10 all run before the dedup lookup at step 11. So a resend of a request identity that
+has already applied can be refused here, for example by check 2 with a zero deadline or check 9
+with a full queue, and the answer is still correct: this send wrote nothing. It says nothing about
+an earlier send of the same identity. The caller rule for that case is in §5. No kernel change;
+the order above stands.
 
 Then, serialized at the partition queue (§5.2 step 2):
 
@@ -147,6 +154,15 @@ Three rules adopted from rEtcd's ADR-0025 rather than re-derived:
   an event carrying a watermark, computed outside the kernel. This is ADR-0025's `applied_revision`
   discipline, transposed from revisions to sequences.
 
+  Except an answer no sequence follows. A `CONDITION_FAILED` is retained at `next_seq`, and only
+  the publish of that sequence ages it by the counter; with nothing published after it (a cap
+  filled by failures) that never comes. So T1 also drops such an entry once the event time
+  reaches its answering step's time plus `Budgets::dedup_retention_millis`. The kernel still
+  reads no clock. The watermark is untouched: these entries are memory-only (§8), never seeded,
+  and never outlive the instance, so nothing outside it needs to know. Under the host trim duty
+  the time rule always fires before the counter rule for these entries, so the counter rule is
+  the simulator's rule for them. (Amended 2026-10-18, M9 S3, A-R108.)
+
 **The request digest covers the semantic request and nothing else.** Preimage, normatively:
 `tenant`, `affinity_id`, `api_version`, `conditions[]`, `mutations[]`. **Excluded:** `deadline`,
 `client_id`, `request_id`, `expected_generation`, and every routing or transport field.
@@ -193,14 +209,28 @@ implementation: V4 measures whether a client SDK can implement §5.4 as a total 
 
 There is no `NOT_EXECUTED` value in the result type to return by accident.
 
+**Amended 2026-10-18 (M9 S3, #32): applied but not yet published answers `UNKNOWN_OUTCOME`.**
+P1 records a write's status when its applied candidate arrives, with the outcome `Unknown`, and
+replaces it with `Published` at publication. So until publication the first row answers, and the
+recorded outcome is `UNKNOWN_OUTCOME`; the wire value is `TxnStatus::Unknown`. P1 never
+answers `TxnStatus::Unresolved` (test plan KA-9, row M7A-115). The caller asks again with the same
+identity.
+
+**Clarified 2026-10-18 (M9 S3): dedup holds only inside the retention window.** Once a trim covers
+an identity, its dedup entry is gone. A retry with that identity misses step 11 and is admitted as
+a new request, so it may apply again at a new sequence (row M7A-89, spec §5.3). The client's
+`expected_generation` stops that only across a generation change (check 5, §8). So "a retry never
+applies twice" holds inside the retention window, not beyond it. This states what §5.3 already
+allows; it is not a new rule.
+
 ### 5. Error categories and their retry rules (§5.4, normative)
 
 | Error | Retry rule | Class |
 |---|---|---|
 | `NOT_PRIMARY`, `ROUTE_CHANGED` | refresh route; **retain request identity and expected generation** | no admission |
 | `LEASE_EXPIRED`, `RECOVERY_READ_ONLY`, `PROTECTION_PAUSED` | retry after health/authority recovers; **do not assume an already-admitted request failed** | no admission *for this submission* |
-| `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | definitive rejection before mutation; the caller changes the request intentionally | proves no mutation |
-| `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | definitive no-admission; bounded jittered retry | proves no mutation |
+| `CONDITION_FAILED`, `CROSS_AFFINITY`, `INVALID_ARGUMENT` | definitive rejection before mutation; the caller changes the request intentionally | proves no mutation *by this submission* |
+| `OVERLOADED`, `DEADLINE_BEFORE_ADMISSION` | definitive no-admission; bounded jittered retry | proves no mutation *by this submission* |
 | `UNKNOWN_OUTCOME` | query status with the **same identity**; never generate a new request id | ambiguous |
 | `GENERATION_CHANGED`, `REQUEST_ID_REUSE` | reconcile or fail; never transparent replay | ambiguous / conflicting |
 | `STATUS_EXPIRED` | retention passed; absence proves nothing | ambiguous |
@@ -208,8 +238,14 @@ There is no `NOT_EXECUTED` value in the result type to return by accident.
 | `DIVERGENCE_REQUIRES_OPERATOR` | the partition is blocked (ADR-rdb-0009, B-R26): no data-path exit; retry after the operator removes the diverged copies and fences; **do not assume an already-admitted request failed** | no admission *for this submission* |
 
 The load-bearing line, and the reason this ADR is gated by V4: **only pre-admission rejection
-proves no mutation.** Everything after the local atomic batch is `UNKNOWN_OUTCOME` until a status
-query or a recovery decision resolves it.
+proves no mutation, and only by the submission it answers.** Everything after the local atomic
+batch is `UNKNOWN_OUTCOME` until a status query or a recovery decision resolves it.
+
+**Amended 2026-10-18 (M9 S3, #35): the client rule for an unanswered send.** Once any send of a
+request identity went unanswered (a timeout, a lost reply, or `UNKNOWN_OUTCOME`), only a status
+query with the same identity settles it, and only inside the dedup retention window (§4). A
+definitive answer to a later resend does not settle it: §3's checks run before the dedup lookup,
+so that answer covers the resend alone. Past retention, status cannot settle it either (§4).
 
 ### 6. The local apply never returns success
 
@@ -285,7 +321,7 @@ request misses the index. If its condition now holds, it is admitted. Nothing ap
   within the generation that answered, and not across a recovery. This is a documented caller
   obligation, like request-id retention in Consequences.
 - The kernel does not change. "Retained result replayed verbatim" (§4, Verification) holds within
-  a generation.
+  a generation and inside the retention window (§4).
 
 **Rejected.**
 - *Make `expected_generation` required on the wire.* It would be the strongest guarantee, but it
