@@ -2895,11 +2895,17 @@ impl Authority {
     ///   its own next renewal commits" in its conservative form.
     /// * **Not a higher revision** — the record already held. **No row in `design.md`.** Nothing
     ///   is adopted ([`AuthorityIgnoreReason::GrantRecordNotNewer`], §2.6a decision e3), and
-    ///   `Renew` is re-armed at
-    ///   the later of now and one interval after `renewed_at`. Without the re-arm an `Unknown`
-    ///   renewal that did not land leaves no renewal scheduled, and the grant runs out on a
-    ///   healthy store. The watch echo of our own committed renewal also lands here; it re-arms
-    ///   at the deadline the commit already set.
+    ///   `Renew` is re-armed. Without the re-arm an `Unknown` renewal that did not land leaves no
+    ///   renewal scheduled, and the grant runs out on a healthy store. Two cases share the arm:
+    ///   * The watch echo of our own committed renewal: `renewed_at + renew_millis` is still
+    ///     ahead, and the re-arm keeps that deadline, the one the commit already set.
+    ///   * The read-back after an `Unknown` renewal that did not land: the next renewal is
+    ///     already due, and the re-arm backs off to `now + renew_millis`, as the `Unavailable`
+    ///     row does. A re-arm at `now` fired at once, went `Unknown` again and read back again:
+    ///     about 1,400 control calls a second from one owner (M9 S3 W3-D1, ruling A-R107).
+    ///     It spends the window no faster than the `Unavailable` row does: each retry comes one
+    ///     `renew_millis` after the last answer, and with the spec budgets (grant 3 000 ms, renew
+    ///     500 ms) four retries still fit before the window, renewed at `renewed_at`, lapses.
     fn on_held_grant_record(
         &mut self,
         ctx: &StepCtx<'_>,
@@ -2916,7 +2922,12 @@ impl Authority {
             return Vec::new();
         };
         if revision <= held.record_revision {
-            let at = ctx.now.max(held.renewed_at.plus_millis(renew_millis));
+            let due = held.renewed_at.plus_millis(renew_millis);
+            let at = if due > ctx.now {
+                due
+            } else {
+                ctx.now.plus_millis(renew_millis)
+            };
             return vec![
                 Self::ignored(event, AuthorityIgnoreReason::GrantRecordNotNewer),
                 self.arm(event, AuthorityTimer::Renew, at),

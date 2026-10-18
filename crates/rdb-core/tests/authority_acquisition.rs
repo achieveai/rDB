@@ -991,7 +991,8 @@ fn the_read_back_of_a_landed_renewal_adopts_it_without_restarting_the_window() {
 /// `Held | ReadOk{Some(rec)}`, same grant, **not** a higher revision: the record is the one held.
 /// **No row in `design.md`.** Nothing is adopted, and the renewal wake is re-armed. Without the
 /// re-arm, an `Unknown` renewal that did not land leaves no renewal scheduled at all, and the
-/// grant runs out on a healthy store.
+/// grant runs out on a healthy store. The renewal is overdue here, so the re-arm backs off one
+/// interval from now (M9 S3 W3-D1, ruling A-R107).
 #[retcd_test]
 fn the_read_back_of_the_record_already_held_adopts_nothing_and_rearms() {
     let (mut kernel, grant, renewal) = renewing();
@@ -1021,9 +1022,14 @@ fn the_read_back_of_the_record_already_held_adopts_nothing_and_rearms() {
         vec![
             // `design.md` §2.6a decision e3: `StaleAuthorityView` was a homograph here.
             Shape::Ignored(AuthorityIgnoreReason::GrantRecordNotNewer),
-            Shape::Arm(AuthorityTimer::Renew, TimerVersion(armed.0 + 1), Tick(560)),
+            Shape::Arm(
+                AuthorityTimer::Renew,
+                TimerVersion(armed.0 + 1),
+                Tick(560 + BUDGETS.renew_millis)
+            ),
         ],
-        "the next renewal is due now: renewed_at 5 + renew_millis is already past"
+        "renewed_at 5 + renew_millis is already past, so the retry backs off one interval from \
+         now (A-R107), as the Unavailable row does; it was armed at now and looped"
     );
     let view = kernel.view();
     assert_eq!(view.expiry_utc_ms, Some(e_new_at(5)));
@@ -3650,4 +3656,131 @@ fn a_partition_fence_then_self_replace_republishes_the_identical_lineage() {
     };
     assert_eq!(view.lineage, p1_lineage(), "the identical lineage");
     assert_ne!(view.grant_id, fenced, "under the new grant");
+}
+
+// ---- W3-D1 (M9 S3, ruling A-R107): a renewal that stays unknown backs off ---------------
+
+/// The end of the window [`m9_w3_d1_00_a_renewal_that_stays_unknown_is_retried_once_per_interval`]
+/// drives: [`ctx`]'s sample is fresh until `max_sample_age_millis`, and a stale one withholds the
+/// CAS, so every firing before this tick issues one.
+const W3_END: u64 = BUDGETS.max_sample_age_millis;
+
+/// The one `Renew` arm in `effects`, by its deadline.
+fn renew_armed_at(effects: &[Effect]) -> Tick {
+    let armed: Vec<Tick> = shapes(effects)
+        .into_iter()
+        .filter_map(|shape| match shape {
+            Shape::Arm(AuthorityTimer::Renew, _, at) => Some(at),
+            _ => None,
+        })
+        .collect();
+    let [at] = armed.as_slice() else {
+        panic!("fixture: one Renew arm: {effects:?}");
+    };
+    *at
+}
+
+/// Scenario (S3-3x, W3-D1): the control store drops every renewal CAS, so each answers
+/// `Unknown`, and the read-back finds our own record at the revision held. The renewal is
+/// overdue by then. The node must retry no faster than once per renewal interval, as the
+/// `Unavailable` row does (M7A-15), and not at once: before the fix the read-back re-armed
+/// `Renew` at `now`, and the walk measured about 1,400 control calls a second from one owner.
+///
+/// Each CAS answers one tick after it is sent and its read-back one tick after that; every
+/// `Renew` fires at the tick it was armed for. Over [`W3_END`] the node sends the CAS at 505 and
+/// at most one more per `renew_millis`.
+#[retcd_test]
+fn m9_w3_d1_00_a_renewal_that_stays_unknown_is_retried_once_per_interval() {
+    let (mut kernel, grant, renewal) = renewing();
+    let mut request = renewal.request;
+    let mut sent = vec![505];
+    let mut now = 505;
+    while sent.len() <= 100 {
+        kernel
+            .step(
+                &ctx(now + 1),
+                &cas_result(now + 1, now, request, CasOutcome::Unknown),
+            )
+            .expect("the Unknown row is built");
+        let read_at = now + 2;
+        let effects = kernel
+            .step(
+                &ctx(read_at),
+                &grant_read(
+                    read_at,
+                    ReadOutcome::Found {
+                        revision: Revision(7),
+                        value: our_record(grant, e_new_at(5)).encode(),
+                    },
+                ),
+            )
+            .expect("the read-back row is built");
+        let at = renew_armed_at(&effects);
+        assert!(
+            at >= Tick(read_at + BUDGETS.renew_millis),
+            "the read-back at {read_at} of an unknown renewal re-armed Renew at {at:?}, before \
+             now + renew_millis = {}; CAS sent at {sent:?}",
+            read_at + BUDGETS.renew_millis
+        );
+        if at.0 >= W3_END {
+            break;
+        }
+        now = at.0;
+        let effects = kernel
+            .step(&ctx(now), &renew_due(&kernel, now, now))
+            .expect("the RenewDue row is built");
+        request = sent_as(&effects);
+        sent.push(now);
+    }
+    let most = 1 + (W3_END - 505) / BUDGETS.renew_millis;
+    assert!(
+        sent.len() as u64 <= most,
+        "at most {most} renewal CAS before {W3_END}, one per interval: {sent:?}"
+    );
+    assert!(kernel.state().is_held(), "backing off is not a fence");
+}
+
+/// The other half of A-R107's rule: the watch echo of our own committed renewal reaches the same
+/// "not a higher revision" arm, with `renewed_at + renew_millis` still ahead, and keeps the
+/// deadline the commit set. Backing it off too would delay every healthy renewal by the time the
+/// echo took to arrive.
+#[retcd_test]
+fn m9_w3_d1_01_the_echo_of_a_committed_renewal_keeps_the_commits_deadline() {
+    let (mut kernel, grant, renewal) = renewing();
+    let effects = kernel
+        .step(
+            &ctx(540),
+            &cas_result(
+                540,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(9)),
+            ),
+        )
+        .expect("the commit row is built");
+    let committed = renew_armed_at(&effects);
+    assert_eq!(committed, Tick(505 + BUDGETS.renew_millis), "fixture");
+
+    let effects = kernel
+        .step(
+            &ctx(560),
+            &grant_read(
+                560,
+                ReadOutcome::Found {
+                    revision: Revision(9),
+                    value: our_record(grant, e_new_at(505)).encode(),
+                },
+            ),
+        )
+        .expect("the echo row is built");
+
+    assert_eq!(
+        shapes(&effects)[0],
+        Shape::Ignored(AuthorityIgnoreReason::GrantRecordNotNewer)
+    );
+    assert_eq!(
+        renew_armed_at(&effects),
+        committed,
+        "the echo keeps the commit's deadline, renewed_at 505 + renew_millis"
+    );
 }
