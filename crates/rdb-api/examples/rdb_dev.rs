@@ -517,6 +517,7 @@ fn poll(db: &Db, progress: &Progress, stop: &AtomicBool) {
                 owner,
                 db.restart_note().as_deref(),
                 &db.links().held(),
+                &db.links().dropped(),
             ) {
                 say(&line);
             }
@@ -578,6 +579,7 @@ fn ready_reason(
     admits: bool,
     restart_note: Option<&str>,
     held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
 ) -> Option<String> {
     let fence = owner.fence.filter(|_| !admits);
     if let Some(line) = blocked_line(owner).filter(|_| !admits) {
@@ -588,16 +590,16 @@ fn ready_reason(
     }
     let gave_up =
         (!admits && fence.is_none() && owner.replace_stopped).then(|| gave_up_line(owner));
-    let resolving = resolving_line(owner, held)
+    let resolving = resolving_line(owner, held, dropped)
         .filter(|_| !admits && fence.is_none_or(|reason| fence_lifts(owner, reason)));
     let Some(note) = restart_note else {
         if let Some(line) = gave_up.or(resolving) {
             return Some(line);
         }
-        return match (fence, links_wait(owner, held)) {
-            (Some(reason), _) => Some(fence_line(owner, reason, held)),
+        return match (fence, links_wait(owner, held, dropped)) {
+            (Some(reason), _) => Some(fence_line(owner, reason, held, dropped)),
             (None, Some((mode, links))) if !admits => Some(format!(
-                "l1={mode} and links {links} are held: writes wait for node {}'s copies to catch \
+                "l1={mode} and {links}: writes wait for node {}'s copies to catch \
                  up, which needs those links: heal them (link heal all)",
                 owner.node.0
             )),
@@ -623,10 +625,10 @@ fn ready_reason(
         Some(reason) if fence_lifts(owner, reason) => {
             format!(
                 "{}; once they resume, they {pause}",
-                fence_line(owner, reason, held)
+                fence_line(owner, reason, held, dropped)
             )
         }
-        Some(reason) => format!("{}; {note}", fence_line(owner, reason, held)),
+        Some(reason) => format!("{}; {note}", fence_line(owner, reason, held, dropped)),
         None => format!("writes are not admitted now; if they come back, they {pause}"),
     })
 }
@@ -640,16 +642,32 @@ fn l1_rejecting(owner: &NodeStatus) -> Option<&str> {
         .filter(|mode| matches!(*mode, "paused" | "reprotecting"))
 }
 
-/// L1's mode while it refuses writes, and the links of `owner`'s that `held` holds, when there
-/// are both: writes then wait on those links (W8-D2).
-fn links_wait<'a>(owner: &'a NodeStatus, held: &[(NodeId, NodeId)]) -> Option<(&'a str, String)> {
+/// L1's mode while it refuses writes, and which of `owner`'s links `held` holds or `dropped`
+/// drops, when there are both: writes then wait on those links (W8-D2). A dropped direction
+/// keeps the copies from catching up as a held link does (M9 S3 resume-line table). The
+/// second part reads `links 1-2 are held`, `links 2->1 are dropped`, or both joined by `and`.
+fn links_wait<'a>(
+    owner: &'a NodeStatus,
+    held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
+) -> Option<(&'a str, String)> {
     let mode = l1_rejecting(owner)?;
-    let links: Vec<String> = held
-        .iter()
-        .filter(|(a, b)| *a == owner.node || *b == owner.node)
-        .map(|(a, b)| format!("{}-{}", a.0, b.0))
-        .collect();
-    (!links.is_empty()).then(|| (mode, links.join(", ")))
+    let names = |links: &[(NodeId, NodeId)], between: &str| -> Vec<String> {
+        links
+            .iter()
+            .filter(|(a, b)| *a == owner.node || *b == owner.node)
+            .map(|(a, b)| format!("{}{between}{}", a.0, b.0))
+            .collect()
+    };
+    let parts: Vec<String> = [
+        (names(held, "-"), "held"),
+        (names(dropped, "->"), "dropped"),
+    ]
+    .into_iter()
+    .filter(|(links, _)| !links.is_empty())
+    .map(|(links, how)| format!("links {} are {how}", links.join(", ")))
+    .collect();
+    (!parts.is_empty()).then(|| (mode, parts.join(" and ")))
 }
 
 /// The line for F1 `Blocked(<reason>)` on node 1: recovery cannot finish, so writes stay out
@@ -668,15 +686,19 @@ fn blocked_line(owner: &NodeStatus) -> Option<String> {
 /// (A-R102), so writes come back with no restart. With L1 paused or reprotecting and a link of
 /// node 1's held, writes also wait on those links, so the line names both (W11-D1, tester w6:
 /// links held again mid-outage, `PROTECTION_PAUSED` after the store answered).
-fn resolving_line(owner: &NodeStatus, held: &[(NodeId, NodeId)]) -> Option<String> {
+fn resolving_line(
+    owner: &NodeStatus,
+    held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
+) -> Option<String> {
     if owner.recovery.as_deref() != Some("ActivationUnresolved") {
         return None;
     }
     let node = owner.node.0;
-    Some(match links_wait(owner, held) {
+    Some(match links_wait(owner, held, dropped) {
         Some((mode, links)) => format!(
             "node {node}'s recovery is waiting for the control store to confirm activation, \
-             l1={mode} and links {links} are held; writes resume only once the store answers \
+             l1={mode} and {links}; writes resume only once the store answers \
              and node {node}'s copies catch up, which needs those links: heal them (link heal \
              all)"
         ),
@@ -709,11 +731,18 @@ const fn fence_lifts(owner: &NodeStatus, reason: DenyReason) -> bool {
 /// L1 paused or reprotecting and a link of node 1's held, the grant comes back by itself and
 /// writes still wait on those links (W8-D2, tester r9: `held(grant 3)`, `l1=paused`, writes back
 /// only after `link heal all`).
-fn fence_line(owner: &NodeStatus, reason: DenyReason, held: &[(NodeId, NodeId)]) -> String {
+fn fence_line(
+    owner: &NodeStatus,
+    reason: DenyReason,
+    held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
+) -> String {
     let node = owner.node.0;
-    if let (true, Some((mode, links))) = (fence_lifts(owner, reason), links_wait(owner, held)) {
+    if let (true, Some((mode, links))) =
+        (fence_lifts(owner, reason), links_wait(owner, held, dropped))
+    {
         format!(
-            "node {node}'s grant is {}, l1={mode} and links {links} are held; writes resume only \
+            "node {node}'s grant is {}, l1={mode} and {links}; writes resume only \
              once the old grant's expiry is proven and node {node}'s copies catch up, which needs \
              those links: heal them (link heal all); do not restart node {node}: a restarted \
              node does not rejoin in M9 (achieveai/rDB#42)",
@@ -754,12 +783,13 @@ fn ready_step(
     owner: &NodeStatus,
     restart_note: Option<&str>,
     held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
 ) -> Option<String> {
     let admits = owner.admits == Some(true);
     step_line(
         seen,
         admits,
-        ready_reason(owner, admits, restart_note, held),
+        ready_reason(owner, admits, restart_note, held, dropped),
     )
 }
 
@@ -2036,7 +2066,7 @@ mod tests {
             (fenced.clone(), Some(note)),
             (owner(None, true), None),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart, &[]));
+            lines.extend(ready_step(&mut seen, &node, restart, &[], &[]));
         }
         assert_eq!(
             lines,
@@ -2099,7 +2129,7 @@ mod tests {
             for polling in [true, false] {
                 let mut seen = Seen::default();
                 assert_eq!(
-                    ready_step(&mut seen, &fenced(reason, polling), None, &[]),
+                    ready_step(&mut seen, &fenced(reason, polling), None, &[], &[]),
                     Some(stuck(name)),
                     "{name}, polling={polling}"
                 );
@@ -2116,7 +2146,7 @@ mod tests {
             fenced(DenyReason::Expired, false),
         ]
         .iter()
-        .filter_map(|node| ready_step(&mut seen, node, None, &[]))
+        .filter_map(|node| ready_step(&mut seen, node, None, &[], &[]))
         .collect();
         assert_eq!(lines, [resume("Expired"), stuck("Expired")]);
     }
@@ -2160,7 +2190,7 @@ mod tests {
             ),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
         .skip(2)
         .collect();
         assert_eq!(lines, [blocked]);
@@ -2170,7 +2200,7 @@ mod tests {
         healthy.protection = Some("healthy".to_owned());
         for node in [stuck, healthy] {
             assert_eq!(
-                ready_step(&mut Seen::default(), &node, Some(note), &[]),
+                ready_step(&mut Seen::default(), &node, Some(note), &[], &[]),
                 Some(format!("{blocked}; {note}")),
                 "{node:?}"
             );
@@ -2211,7 +2241,7 @@ mod tests {
             (serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
         .skip(2)
         .collect();
         assert_eq!(
@@ -2222,7 +2252,7 @@ mod tests {
             ]
         );
 
-        let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[]);
+        let reason = |node: &NodeStatus, note| ready_reason(node, false, note, &[], &[]);
         let note = "node 2 restarted (now boot 2); a restarted node stays out until M10 (#42)";
         let mut healthy = with("held(grant 2)", "ActivationUnresolved", None);
         healthy.protection = Some("healthy".to_owned());
@@ -2297,7 +2327,7 @@ mod tests {
             (&serving, &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
         .collect();
         let not_ready = |why: &str| format!("not ready: writes not admitted: {why}");
         assert_eq!(
@@ -2340,7 +2370,7 @@ mod tests {
             };
             let lines: Vec<String> = [&fenced, &stopped, &stopped]
                 .iter()
-                .filter_map(|node| ready_step(&mut seen, node, restart, &[]))
+                .filter_map(|node| ready_step(&mut seen, node, restart, &[], &[]))
                 .skip(1)
                 .collect();
             let want = restart.map_or_else(
@@ -2354,7 +2384,7 @@ mod tests {
         fenced_stopped.fence_polling = false;
         fenced_stopped.replace_stopped = true;
         assert_eq!(
-            ready_step(&mut Seen::default(), &fenced_stopped, None, &[]),
+            ready_step(&mut Seen::default(), &fenced_stopped, None, &[], &[]),
             Some(
                 "not ready: writes not admitted: node 1's grant is fenced(Expired); nothing in M9 \
                  replaces it, so writes stay stopped for this run: to write again, quit and \
@@ -2375,7 +2405,7 @@ mod tests {
         };
         let lines: Vec<String> = [fenced, unheld.clone(), unheld]
             .iter()
-            .filter_map(|node| ready_step(&mut seen, node, None, &[]))
+            .filter_map(|node| ready_step(&mut seen, node, None, &[], &[]))
             .collect();
         assert_eq!(
             lines,
@@ -2390,6 +2420,81 @@ mod tests {
 
     /// Node 1's links held, as `link hold 1-2; link hold 1-3` leaves them.
     const HELD: [(NodeId, NodeId); 2] = [(NodeId(1), NodeId(2)), (NodeId(1), NodeId(3))];
+
+    /// M9 S3 resume-line table, cell "drop" (dev walk `tab-drop-fence`): ACKs 2->1 and 3->1
+    /// dropped, a write in flight, L1 paused, then the fence. The fence line promised writes
+    /// resume by themselves; the grant came back (`held(grant 1706)`) and writes did not, until
+    /// `link heal all`. A dropped direction keeps the copies from catching up as a held link
+    /// does, so every line that names held links names dropped ones too: the fence line, the
+    /// bare L1 line once the fence is gone, the resolving line, and both kinds at once.
+    #[test]
+    fn a_resume_line_with_l1_paused_and_links_dropped_says_writes_also_wait_on_the_links() {
+        const DROPPED: [(NodeId, NodeId); 2] = [(NodeId(2), NodeId(1)), (NodeId(3), NodeId(1))];
+        let paused = |authority: &str, recovery: &str, fence: Option<DenyReason>| {
+            let mut node = owner(None, false);
+            node.authority = authority.to_owned();
+            node.recovery = Some(recovery.to_owned());
+            node.protection = Some("paused".to_owned());
+            node.fence = fence;
+            node.fence_polling = fence.is_some();
+            node
+        };
+        let fenced = paused("fenced(Expired)", "Committed", Some(DenyReason::Expired));
+        let regranted = paused("held(grant 1706)", "Committed", None);
+        let mut serving = owner(None, true);
+        serving.protection = Some("healthy".to_owned());
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [
+            (&fenced, &DROPPED[..]),
+            (&regranted, &DROPPED[..]),
+            (&regranted, &DROPPED[..]),
+            (&serving, &[][..]),
+        ]
+        .iter()
+        .filter_map(|(node, dropped)| ready_step(&mut seen, node, None, &[], dropped))
+        .collect();
+        assert_eq!(
+            lines,
+            [
+                "not ready: writes not admitted: node 1's grant is fenced(Expired), l1=paused and \
+                 links 2->1, 3->1 are dropped; writes resume only once the old grant's expiry is \
+                 proven and node 1's copies catch up, which needs those links: heal them (link \
+                 heal all); do not restart node 1: a restarted node does not rejoin in M9 \
+                 (achieveai/rDB#42)",
+                "not ready: writes not admitted: l1=paused and links 2->1, 3->1 are dropped: \
+                 writes wait for node 1's copies to catch up, which needs those links: heal them \
+                 (link heal all)",
+                "ready",
+            ]
+        );
+
+        let resolving = paused("held(grant 2)", "ActivationUnresolved", None);
+        assert_eq!(
+            ready_reason(&resolving, false, None, &[], &DROPPED),
+            Some(
+                "node 1's recovery is waiting for the control store to confirm activation, \
+                 l1=paused and links 2->1, 3->1 are dropped; writes resume only once the store \
+                 answers and node 1's copies catch up, which needs those links: heal them (link \
+                 heal all)"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            ready_reason(
+                &regranted,
+                false,
+                None,
+                &[(NodeId(1), NodeId(2))],
+                &[(NodeId(3), NodeId(1)), (NodeId(2), NodeId(3))]
+            ),
+            Some(
+                "l1=paused and links 1-2 are held and links 3->1 are dropped: writes wait for \
+                 node 1's copies to catch up, which needs those links: heal them (link heal all)"
+                    .to_owned()
+            ),
+            "both kinds; a direction between two secondaries is not node 1's"
+        );
+    }
 
     /// Walk 8, W8-D2 (tester r9, walk 7's 4b): links held, a write in flight, then the fence.
     /// L1 was paused, and the fence line promised writes resume by themselves. The grant came
@@ -2406,7 +2511,7 @@ mod tests {
             node.fence_polling = true;
             node.protection = Some(mode.to_owned());
             assert_eq!(
-                ready_step(&mut Seen::default(), &node, None, &HELD),
+                ready_step(&mut Seen::default(), &node, None, &HELD, &[]),
                 Some(format!(
                     "not ready: writes not admitted: node 1's grant is fenced(Expired), \
                      l1={mode} and links 1-2, 1-3 are held; writes resume only once the old \
@@ -2418,7 +2523,7 @@ mod tests {
             );
             for held in [&[][..], &[(NodeId(2), NodeId(3))][..]] {
                 assert_eq!(
-                    ready_step(&mut Seen::default(), &node, None, held),
+                    ready_step(&mut Seen::default(), &node, None, held, &[]),
                     Some(
                         "not ready: writes not admitted: node 1's grant is fenced(Expired); \
                          writes resume by themselves once the old grant's expiry is proven, so \
@@ -2456,11 +2561,11 @@ mod tests {
         };
         let mut startup = Seen::default();
         assert_eq!(
-            ready_step(&mut startup, &held("paused", false), None, &[]),
+            ready_step(&mut startup, &held("paused", false), None, &[], &[]),
             None
         );
         assert_eq!(
-            ready_step(&mut startup, &held("reprotecting", false), None, &[]),
+            ready_step(&mut startup, &held("reprotecting", false), None, &[], &[]),
             None
         );
         let wait = "not ready: writes not admitted: l1=paused and links 1-2, 1-3 are held: \
@@ -2479,7 +2584,7 @@ mod tests {
             (held("healthy", true), &[][..]),
         ]
         .iter()
-        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links))
+        .filter_map(|(node, links)| ready_step(&mut seen, node, None, links, &[]))
         .collect();
         assert_eq!(
             lines,
@@ -2517,7 +2622,7 @@ mod tests {
             (owner(None, true), Some(note)),
             (paused, Some(note)),
         ] {
-            lines.extend(ready_step(&mut seen, &node, restart, &[]));
+            lines.extend(ready_step(&mut seen, &node, restart, &[], &[]));
         }
         assert_eq!(
             lines,
@@ -2701,7 +2806,7 @@ mod tests {
                 ..Seen::default()
             };
             assert_eq!(
-                ready_step(&mut seen, &node, restart, &[]),
+                ready_step(&mut seen, &node, restart, &[], &[]),
                 line,
                 "state {state}"
             );
@@ -2842,7 +2947,7 @@ mod tests {
     /// `seen` after a `ready` line, as the poller holds it before a failure.
     fn lines_ready(seen: &mut Seen) {
         assert_eq!(
-            ready_step(seen, &owner(None, true), None, &[]),
+            ready_step(seen, &owner(None, true), None, &[], &[]),
             Some("ready".to_owned())
         );
     }
