@@ -368,7 +368,8 @@ With no fence held, an `Unknown` activation (or one unanswered at its deadline) 
 `partitions/{id}` (DesignSpec-01: read authoritative state and use CAS to recover). If the read
 shows our own bytes at a revision `r` at or above the commit's, it sends the same CAS at `r`;
 only that CAS's `Committed` activates — a read alone never does. Any other record is classified
-as a conflict's re-read is: a newer epoch is `OvertakenByPeer`, anything else `CasContention`.
+as a conflict's re-read is: an identical record (our own bytes below the commit revision) or a
+newer epoch is `OvertakenByPeer`, anything else `CasContention`.
 One request is outstanding at a time; a timer fire abandons an unanswered one and reads again;
 `Unavailable` and `Unknown` wait for the next fire. A fence with a newer root enters at once.
 **Addendum (Round 13):** a definitive `Unavailable` on the activation exchange resolves the same

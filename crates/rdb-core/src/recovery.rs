@@ -53,8 +53,9 @@
 //! * Our own commit bytes at `r`, at or above the commit revision: the same CAS at `r`. Only a
 //!   `Committed` answer lands; nothing activates on a read alone. So an operator's no-op rewrite
 //!   of our bytes (`rdb_dev control lifecycle`) is harmless: the CAS writes our bytes again.
-//! * Any other record goes through `Cas::on_read`, as a conflict's re-read does: a newer epoch
-//!   is `OvertakenByPeer`, anything else `CasContention`.
+//! * Any other record goes through `Cas::on_read`, as a conflict's re-read does: an identical
+//!   record (our own bytes below the commit revision) or a newer epoch is `OvertakenByPeer`,
+//!   anything else `CasContention`.
 //! * One request is outstanding at a time. A due fire abandons an unanswered one (its late
 //!   answer is `UnmatchedCompletion`) and reads again, re-armed. `Conflict` reads again at once.
 //!   `Unavailable` and `Unknown`, read or CAS, are one `Outstanding` and wait for the next fire.
@@ -1028,8 +1029,9 @@ impl Recovery {
     /// * A due fire abandons whatever is unanswered and reads again, re-armed.
     /// * A read of our own bytes at `r`, at or above the commit revision, proposes the same CAS
     ///   at `r`. Only its `Committed` activates; nothing activates on a read alone.
-    /// * Any other record goes through `Cas::on_read`, as a conflict's re-read does: a newer
-    ///   epoch is `OvertakenByPeer`, anything else `CasContention`. Both block.
+    /// * Any other record goes through `Cas::on_read`, as a conflict's re-read does: an
+    ///   identical record (our own bytes below the commit revision) or a newer epoch is
+    ///   `OvertakenByPeer`, anything else `CasContention`. Both block.
     /// * `Conflict` reads again at once. `Unavailable` and `Unknown`, read or CAS, are one
     ///   `Outstanding` and wait for the next fire. Nothing waits forever and nothing spins.
     fn resolve(

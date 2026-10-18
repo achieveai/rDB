@@ -112,11 +112,11 @@
 //! still polls its own record it adds that writes resume by themselves, so the node is not
 //! restarted (#42); once the poll has stopped, or for a frozen, foreign-boot or other-authority
 //! record, it says nothing in M9 replaces the grant and writes stay stopped for the run. After a secondary restarts,
-//! L1 still admits writes for a while, so the line reads `ready for now; writes pause within
-//! about 2 s of the next write because ..` until they do: about 2 s after the restart, or,
-//! after a fence, about 2 s after the next write (tester q8). A put before `ready` is refused,
-//! never left hanging. A recovery committed below `Active` that does not activate prints
-//! `stalled node=N recovery_rebuild_stalled ...`, and again whenever the line changes:
+//! L1 still admits writes for a while, so the line reads `ready for now; writes pause soon, at
+//! the latest about 2 s after the next write, because ..` until they do: about 2 s after the
+//! restart, or, after a fence, about 2 s after the next write (tester q8). A put before `ready`
+//! is refused, never left hanging. A recovery committed below `Active` that does not activate
+//! prints `stalled node=N recovery_rebuild_stalled ...`, and again whenever the line changes:
 //!
 //! - when F1 pinned its rebuild, at F1's rebuild deadline (the discovery window, ~2 s) with
 //!   `unproven=[..]`, the copies that have not proved the pinned point;
