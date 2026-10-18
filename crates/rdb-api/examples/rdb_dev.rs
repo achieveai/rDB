@@ -10,7 +10,9 @@
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
 //! `--dedup-retention-ms N` keeps a published write's retained answer N ms instead of 24 h: the
 //! owner's trim duty then drops its dedup entry and status (`host_duty kind=trim`, once a
-//! second), so a full index frees up by hand. A `retry` of a trimmed request applies again.
+//! second), so a full index frees up by hand. A `retry` of a trimmed request is no longer
+//! recognised and is sent afresh; every rdb_dev write carries a version condition, so it
+//! answers `CONDITION_FAILED` rather than applying twice.
 //!
 //! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
 //! on spaces; `"..."` makes one word, so `""` is an empty object or value:
