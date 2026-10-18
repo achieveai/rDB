@@ -878,7 +878,9 @@ impl Db {
     /// it is enough (tester walk 5, W5-D1). That holds only for a write node 1 holds in flight,
     /// applied and unpublished ([`NodeStatus::in_flight`]). `Unknown` also answers a request
     /// refused at admission, which was never queued: nothing resolves it, and it stays `Unknown`
-    /// (Msg 8, W6-D1).
+    /// (Msg 8, W6-D1). `Unknown` also answers a published request whose retained answer aged out
+    /// of the dedup retention window ([`DbConfig::dedup_retention`]); a resend after that runs
+    /// afresh.
     ///
     /// # Errors
     ///
