@@ -99,9 +99,10 @@
 //! ship, a lost ACK, or a copy that answered `Busy` would wait for a next record that never
 //! comes, and the write would end `UnknownOutcome`. `Busy` and `AlreadyHave` still start no
 //! cursor (B-R48a F1): the re-send is what answers them. The record is forgotten on the ACK, when
-//! a cursor takes the copy (the cursor then owns what the copy is sent), on `Recovered`, when
-//! control re-announces the copy at a new node or boot, when the copy diverges, and when it
-//! leaves every active predicate.
+//! a cursor takes the copy with a record in flight or is dropped (the cursor then owns what the
+//! copy is sent), on `Recovered`, when control re-announces the copy at a new node or boot, when
+//! the copy diverges, and when it leaves every active predicate. An idle cursor, one with nothing
+//! in flight, takes nothing from the stream (M9 S3 W1-D1, ruling A-R106).
 
 use std::collections::BTreeMap;
 
@@ -573,10 +574,16 @@ impl Primary {
     }
 
     /// Hand `outcome` to `copy`'s cursor, making one if none runs, and drop the cursor once it
-    /// has caught the copy up or stopped. The cursor owns what the copy is sent from here, so
-    /// the stream forgets the record it shipped there (lead ruling B-R67i).
+    /// has caught the copy up or stopped. A cursor left with a record in flight owns what the
+    /// copy is sent from here, so the stream forgets the record it shipped there (lead ruling
+    /// B-R67i), as it does when the cursor is dropped.
+    ///
+    /// A cursor still running with nothing in flight owns nothing, and the shipped record stays
+    /// (M9 S3 W1-D1, ruling A-R106). An idle cursor outlives the catch-up that made it, and the
+    /// copy's flush ACK for the record before the shipped one reaches it. Forgetting the shipped
+    /// record there left nothing awaiting an ACK, so the retransmit timer lapsed and a ship lost
+    /// one way was never re-sent.
     fn drive(&mut self, copy: CopyId, outcome: AppendOutcome) -> Vec<EffectKind> {
-        self.shipped.remove(&copy);
         let cursor = self
             .cursors
             .entry(copy)
@@ -593,8 +600,12 @@ impl Primary {
                 EffectKind::Kernel(KernelEffect::CopyCaughtUp { .. })
             )
         });
+        let idle = cursor.unacked().is_none();
         if caught_up || cursor.stopped().is_some() {
             self.cursors.remove(&copy);
+            self.shipped.remove(&copy);
+        } else if !idle {
+            self.shipped.remove(&copy);
         }
         effects
     }

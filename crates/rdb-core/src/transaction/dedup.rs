@@ -3,10 +3,13 @@
 //! Keyed `(generation, affinity, identity)`, which is spec §5.3's scoping verbatim. Nothing in
 //! here reads a clock: an entry's age is the sequence it was retained at (`applied_at_seq`), and
 //! the 24 h window is enforced by whoever issues [`DedupIndex::trim`] and
-//! [`DedupIndex::retire`]. T1 never drops an entry on its own, so absent a trim the index only
+//! [`DedupIndex::retire`]. T1 never drops an entry on its own, except an entry no `Published`
+//! names: a condition failure, which it drops `dedup_retention_millis` after the step that
+//! answered it ([`DedupIndex::expire_unpublished`], lead ruling A-R108). That age is event time,
+//! the answering step's `StepCtx::now`, so still no clock. Absent a trim the index otherwise only
 //! grows, and [`RETENTION_CAP_ENTRIES`] bounds that growth by refusing admission (plan Q-4).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use bytes::Bytes;
 
@@ -17,6 +20,7 @@ use crate::contracts::ids::{
     TenantId,
 };
 use crate::contracts::storage::{Namespace, SnapshotRead};
+use crate::contracts::time::Tick;
 use crate::contracts::txn::TxnResult;
 
 /// Records read per [`SnapshotRead::scan`] call while seeding.
@@ -74,13 +78,19 @@ pub const DEDUP_VALUE_LEN: usize = 48;
 pub enum RetainedAnswer {
     /// P1 published it; this is the result P1 published, replayed verbatim.
     Applied(TxnResult),
-    /// Step 12 failed at this condition. Retained so a retry sees the answer the original
-    /// submission saw, not a fresh evaluation against moved state (M7A-79). No sequence was
-    /// allocated.
+    /// Step 12 failed at this condition. Retained so a retry answered inside the retention window
+    /// sees the answer the original submission saw, not a fresh evaluation against moved state
+    /// (M7A-79). No sequence was allocated, so no `Published` ever names it: it ages by
+    /// `answered_at` ([`DedupIndex::expire_unpublished`]) as well as by `applied_at_seq`, and
+    /// whichever rule fires first drops it. Both fire at or after the retention window.
     ConditionFailed {
         /// The zero-based position [`crate::contracts::errors::RdbError::ConditionFailed`]
         /// named.
         index: u32,
+        /// The `StepCtx::now` of the step that answered it. Expiry removes the entry only when
+        /// this equals the tick it queued, so a stale queue slot never drops a later answer for
+        /// the same key (lead ruling A-R108, K-1).
+        answered_at: Tick,
     },
 }
 
@@ -94,6 +104,11 @@ pub struct Retained {
     pub answer: RetainedAnswer,
     /// The age counter [`DedupIndex::trim`] compares: the transaction's own sequence for an
     /// applied answer, and the last reserved position for a condition failure.
+    ///
+    /// A condition failure also ages by time ([`RetainedAnswer::ConditionFailed`]'s
+    /// `answered_at`). Under the host's trim duty the time rule always fires first, because the
+    /// duty trims a sequence only once its own publish has aged; this counter is the rule that
+    /// drops a failure in the simulator, which issues trims directly (A-R71, hunt_06).
     pub applied_at_seq: Seq,
 }
 
@@ -119,6 +134,10 @@ pub struct DedupIndex {
     entries: BTreeMap<(Generation, AffinityId, RequestIdentity), Retained>,
     retained_from_seq: BTreeMap<Generation, Seq>,
     retired_generations: BTreeSet<Generation>,
+    /// Every entry [`Self::insert_unpublished`] retained, oldest answer first, with the tick it
+    /// was answered at. A key stays queued after a trim or a newer answer removed or replaced
+    /// its entry; [`Self::expire_unpublished`] then skips it.
+    unpublished: VecDeque<(Tick, (Generation, AffinityId, RequestIdentity))>,
 }
 
 impl DedupIndex {
@@ -164,6 +183,11 @@ impl DedupIndex {
 
     /// Retain `retained` for `identity`. A retired generation retains nothing: it is gone by
     /// declaration, and a late insert would resurrect part of it.
+    ///
+    /// The trim watermark is ignored, on purpose. A watermark records what was dropped; it never
+    /// filters what arrives. Respecting it would turn an over-eager trim into a second execution
+    /// of a request already applied. Under the host contract `below` never passes a sequence that
+    /// is not yet published, so no answer depends on this today.
     pub fn insert(
         &mut self,
         generation: Generation,
@@ -176,6 +200,59 @@ impl DedupIndex {
         }
         self.entries
             .insert((generation, affinity, identity), retained);
+    }
+
+    /// [`Self::insert`] an entry no `Published` will ever name, and queue it to expire
+    /// `dedup_retention_millis` after `answered_at` ([`Self::expire_unpublished`]). `retained`
+    /// is a [`RetainedAnswer::ConditionFailed`] stamped with the same `answered_at`.
+    pub fn insert_unpublished(
+        &mut self,
+        generation: Generation,
+        affinity: AffinityId,
+        identity: RequestIdentity,
+        retained: Retained,
+        answered_at: Tick,
+    ) {
+        if self.retired_generations.contains(&generation) {
+            return;
+        }
+        self.insert(generation, affinity, identity, retained);
+        self.unpublished
+            .push_back((answered_at, (generation, affinity, identity)));
+    }
+
+    /// Drop every entry [`Self::insert_unpublished`] retained whose answer is at least
+    /// `retention_millis` old at `now`. Returns how many entries were dropped.
+    ///
+    /// An entry is removed only while it is still the answer that was queued: a
+    /// [`RetainedAnswer::ConditionFailed`] whose `answered_at` is the queued tick. A key a trim
+    /// dropped and a later answer reused, applied or failed again, keeps its own entry and
+    /// window (lead ruling A-R108, K-1). The trim watermark is never touched: these entries are
+    /// memory-only, never durable or seeded, and never outlive the instance, so nothing outside
+    /// it needs to know they aged.
+    ///
+    /// Pops in queue order and stops at the first answer still inside the window, so a `now`
+    /// that went backwards only delays expiry.
+    pub fn expire_unpublished(&mut self, now: Tick, retention_millis: u64) -> usize {
+        let mut dropped = 0;
+        while let Some(&(queued, key)) = self.unpublished.front() {
+            if queued.plus_millis(retention_millis) > now {
+                break;
+            }
+            self.unpublished.pop_front();
+            let still_queued = matches!(
+                self.entries.get(&key),
+                Some(Retained {
+                    answer: RetainedAnswer::ConditionFailed { answered_at, .. },
+                    ..
+                }) if *answered_at == queued
+            );
+            if still_queued {
+                self.entries.remove(&key);
+                dropped += 1;
+            }
+        }
+        dropped
     }
 
     /// `DedupTrim{generation, below}`: drop that generation's entries with
@@ -317,6 +394,10 @@ impl DedupIndex {
 ///
 /// Held in memory only. After a crash it is gone and the next seed retains a superset, which
 /// is the safe direction.
+///
+/// It holds nothing about condition failures. They are never durable and never seeded, so no
+/// later instance can hold one, and their time age ([`DedupIndex::expire_unpublished`]) is local
+/// to the instance that answered them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrimMemory {
     below: BTreeMap<Generation, Seq>,

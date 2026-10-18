@@ -14,7 +14,7 @@ use crate::contracts::time::Tick;
 use crate::contracts::txn::{key_scope, Condition, TxnRequest};
 use crate::contracts::version::{check_mandatory, VersionedArtifact};
 use crate::replication::append::{MAX_ENVELOPE_BYTES, MAX_MUTATIONS};
-use crate::transaction::{encoded_len, Admitted, FreezeCause, QueueMode, TxnKernel, TxnRejection};
+use crate::transaction::{encoded_len, Admitted, FreezeCause, TxnKernel, TxnRejection};
 
 /// Check 9: how many admitted requests may wait behind the one in flight, unless
 /// [`crate::transaction::Limits`] overrides it.
@@ -160,9 +160,10 @@ pub fn admit(
             &at,
         ));
     }
-    // 7. The queue is open.
-    if let QueueMode::Frozen { cause, .. } = k.mode() {
-        return refuse(freeze_error(*cause, &at));
+    // 7. The queue is open. A lost-authority freeze whose authority is back and which waits only
+    //    on an unresolved write is refused as that write's freeze (U1, A-R109).
+    if let Some(cause) = k.refusing_cause(now) {
+        return refuse(freeze_error(cause, &at));
     }
     //    ...and the predecessor's retained identities are loaded (A-R68). Until then a retry
     //    of an already-applied request could not be recognised. The refusal is the one a

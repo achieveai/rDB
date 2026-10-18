@@ -907,6 +907,11 @@ struct AfterFence {
     /// The revision a read proved replaceable at. The next acquisition CAS expects exactly it;
     /// taken when that CAS is dispatched.
     replace_at: Option<Revision>,
+    /// The revision the last replace CAS expected. A `Replace` verdict on a read at this same
+    /// revision repeats an attempt whose answer was unknown or unavailable, so it waits one renewal
+    /// interval instead of sending the CAS again at once (M9 S3 W3-D1, ruling A-R107a). A read
+    /// at any other revision is a new fact and replaces at once.
+    attempted: Option<Revision>,
     /// A poll's answer stopped the polling: the record is not this boot's to replace
     /// ([`SelfReplace::Never`]) or is absent. Nothing re-arms after it.
     stopped: bool,
@@ -1314,6 +1319,7 @@ impl Authority {
                 fenced: held.grant,
                 poll: None,
                 replace_at: None,
+                attempted: None,
                 stopped: false,
             });
             self.state = AuthorityState::Fenced {
@@ -2358,6 +2364,8 @@ impl Authority {
     /// record replaceable, the firing only polls it with a `Get` (M1); once one has, the CAS
     /// expects exactly the revision that read saw: `replace`, recorded only once no CAS is
     /// already in flight, so a read landing under an in-flight replace leaves nothing behind.
+    /// A repeat against the revision the last replace already expected is deferred one renewal
+    /// interval by [`Self::after_fence_effects`], which records the revision for this firing.
     fn on_acquire_due(
         &mut self,
         ctx: &StepCtx<'_>,
@@ -2386,6 +2394,9 @@ impl Authority {
             .after_fence
             .as_mut()
             .and_then(|after| after.replace_at.take());
+        if let (Some(revision), Some(after)) = (expected, self.after_fence.as_mut()) {
+            after.attempted = Some(revision);
+        }
         self.grants_issued = self.grants_issued.saturating_add(1);
         let grant = GrantId(self.grants_issued);
         let record = GrantRecord {
@@ -2491,7 +2502,14 @@ impl Authority {
 
     /// What a [`grant::self_replace`] verdict on our own record, read at `revision`, does — for
     /// both after-fence read handlers (A-R96). `Replace`: the acquisition row at once, a CAS at
-    /// `revision` under a new grant id. `NotYet`: withheld, and the poll re-armed one renewal
+    /// `revision` under a new grant id. `Replace` on the revision the last replace CAS already
+    /// expected, with none in flight, is a repeat of an attempt that answered `Unknown` or
+    /// `Unavailable`: the revision is recorded and the `Acquire` retry armed one renewal interval
+    /// on, and that firing sends the CAS at exactly the recorded revision (A-R96 still holds: the
+    /// only exit is a CAS at the exact revision read). Before, the repeat went at once, and a
+    /// store dropping every replace CAS saw about 700 control calls a second (M9 S3 W3-D1, ruling
+    /// A-R107a: the first attempt after a new fact is immediate; a repeat against the same
+    /// revision backs off). `NotYet`: withheld, and the poll re-armed one renewal
     /// interval on. `Never`: [`AuthorityIgnoreReason::NotOurs`] and no re-arm; polling stops.
     fn after_fence_effects(
         &mut self,
@@ -2501,7 +2519,19 @@ impl Authority {
         revision: Revision,
     ) -> Vec<Effect> {
         match verdict {
-            SelfReplace::Replace => self.on_acquire_due(ctx, event, Some(revision)),
+            SelfReplace::Replace => {
+                let repeat = self.state.acquire().is_none()
+                    && self
+                        .after_fence
+                        .is_some_and(|after| after.attempted == Some(revision));
+                if !repeat {
+                    return self.on_acquire_due(ctx, event, Some(revision));
+                }
+                if let Some(after) = self.after_fence.as_mut() {
+                    after.replace_at = Some(revision);
+                }
+                vec![self.acquire_retry(ctx, event)]
+            }
             SelfReplace::NotYet => vec![
                 Self::ignored(event, AuthorityIgnoreReason::AcquireWithheld),
                 self.acquire_retry(ctx, event),
@@ -2895,11 +2925,17 @@ impl Authority {
     ///   its own next renewal commits" in its conservative form.
     /// * **Not a higher revision** — the record already held. **No row in `design.md`.** Nothing
     ///   is adopted ([`AuthorityIgnoreReason::GrantRecordNotNewer`], §2.6a decision e3), and
-    ///   `Renew` is re-armed at
-    ///   the later of now and one interval after `renewed_at`. Without the re-arm an `Unknown`
-    ///   renewal that did not land leaves no renewal scheduled, and the grant runs out on a
-    ///   healthy store. The watch echo of our own committed renewal also lands here; it re-arms
-    ///   at the deadline the commit already set.
+    ///   `Renew` is re-armed. Without the re-arm an `Unknown` renewal that did not land leaves no
+    ///   renewal scheduled, and the grant runs out on a healthy store. Two cases share the arm:
+    ///   * The watch echo of our own committed renewal: `renewed_at + renew_millis` is still
+    ///     ahead, and the re-arm keeps that deadline, the one the commit already set.
+    ///   * The read-back after an `Unknown` renewal that did not land: the next renewal is
+    ///     already due, and the re-arm backs off to `now + renew_millis`, as the `Unavailable`
+    ///     row does. A re-arm at `now` fired at once, went `Unknown` again and read back again:
+    ///     about 1,400 control calls a second from one owner (M9 S3 W3-D1, ruling A-R107).
+    ///     It spends the window no faster than the `Unavailable` row does: each retry comes one
+    ///     `renew_millis` after the last answer, and with the spec budgets (grant 3 000 ms, renew
+    ///     500 ms) four retries still fit before the window, renewed at `renewed_at`, lapses.
     fn on_held_grant_record(
         &mut self,
         ctx: &StepCtx<'_>,
@@ -2916,7 +2952,12 @@ impl Authority {
             return Vec::new();
         };
         if revision <= held.record_revision {
-            let at = ctx.now.max(held.renewed_at.plus_millis(renew_millis));
+            let due = held.renewed_at.plus_millis(renew_millis);
+            let at = if due > ctx.now {
+                due
+            } else {
+                ctx.now.plus_millis(renew_millis)
+            };
             return vec![
                 Self::ignored(event, AuthorityIgnoreReason::GrantRecordNotNewer),
                 self.arm(event, AuthorityTimer::Renew, at),
