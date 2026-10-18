@@ -3784,3 +3784,133 @@ fn m9_w3_d1_01_the_echo_of_a_committed_renewal_keeps_the_commits_deadline() {
         "the echo keeps the commit's deadline, renewed_at 505 + renew_millis"
     );
 }
+
+// ---- W3-D1 after the fence (M9 S3, ruling A-R107a): a replace that stays unknown backs off ---
+
+/// The `grants/{node}` CAS in `effects`, if any, as the revision it expects.
+fn cas_expects(effects: &[Effect]) -> Option<Option<Revision>> {
+    shapes(effects).into_iter().find_map(|shape| match shape {
+        Shape::Cas { expected, .. } => Some(expected),
+        _ => None,
+    })
+}
+
+/// The one `Acquire` arm in `effects`, by its deadline, if any.
+fn acquire_armed_at(effects: &[Effect]) -> Option<Tick> {
+    shapes(effects).into_iter().find_map(|shape| match shape {
+        Shape::Arm(AuthorityTimer::Acquire, _, at) => Some(at),
+        _ => None,
+    })
+}
+
+/// Scenario (S3-3x-b, W3-D1 after the fence): the node fenced on expiry, its poll proved the
+/// fenced record replaceable, and the control store drops every replace CAS, so each answers
+/// `Unknown` and the read-back finds the fenced record still at revision 7. Before A-R107a that
+/// read-back's `Replace` verdict sent the CAS again in the same step, with no timer at all: the
+/// walk measured about 700 control calls a second after the fence.
+///
+/// A-R107a: the first replace after a new fact goes at once; a repeat against the same revision
+/// after an unknown answer waits one renewal interval. Each CAS answers one tick after it is sent
+/// and its read-back one tick after that; each `Acquire` fires at the tick it was armed for. Over
+/// one second the node sends the first replace and at most one more per `renew_millis`, and each
+/// is still a CAS at exactly revision 7 (A-R96).
+#[retcd_test]
+fn m9_w3_d1_02_a_replace_that_stays_unknown_is_retried_once_per_interval() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let record = our_record(fenced, e_new_at(5));
+    let mut effects = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &record)),
+        )
+        .expect("the poll's answer");
+    let end = PROVEN + 1_000;
+    let mut now = PROVEN;
+    let mut sent = Vec::new();
+    while sent.len() <= 100 {
+        assert_eq!(
+            cas_expects(&effects),
+            Some(Some(Revision(7))),
+            "a CAS at exactly revision 7 at {now}: {effects:?}"
+        );
+        sent.push(now);
+        kernel
+            .step(
+                &sampled_at(now + 1, now + 1),
+                &cas_result(now + 1, now + 1, sent_as(&effects), CasOutcome::Unknown),
+            )
+            .expect("the Unknown answer");
+        let read_at = now + 2;
+        let back = kernel
+            .step(
+                &sampled_at(read_at, read_at),
+                &grant_read(read_at, found(7, &record)),
+            )
+            .expect("the read-back");
+        assert_eq!(
+            cas_expects(&back),
+            None,
+            "the read-back at {read_at} of an unknown replace sent the CAS again at once; CAS sent \
+             at {sent:?}"
+        );
+        let at = acquire_armed_at(&back)
+            .unwrap_or_else(|| panic!("the read-back at {read_at} armed no retry: {back:?}"));
+        assert!(
+            at >= Tick(read_at + BUDGETS.renew_millis),
+            "the retry is armed at {at:?}, before now + renew_millis"
+        );
+        if at.0 >= end {
+            break;
+        }
+        now = at.0;
+        let due = acquire_due(&kernel, now, now);
+        effects = kernel
+            .step(&sampled_at(now, now), &due)
+            .expect("the retry firing");
+    }
+    let most = 1 + (end - PROVEN) / BUDGETS.renew_millis;
+    assert!(
+        sent.len() as u64 <= most,
+        "at most {most} replace CAS in {}ms, one per interval: {sent:?}",
+        end - PROVEN
+    );
+    assert!(kernel.state().is_unheld(), "still replacing");
+}
+
+/// The other half of A-R107a's rule: a read-back that finds the record at a **newer** revision
+/// than the replace expected is a new fact, so the replace goes again at once, at that revision.
+#[retcd_test]
+fn m9_w3_d1_03_a_replace_read_back_at_a_newer_revision_replaces_at_once() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let record = our_record(fenced, e_new_at(5));
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &record)),
+        )
+        .expect("the poll's answer");
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN + 1),
+            &cas_result(
+                PROVEN + 1,
+                PROVEN + 1,
+                sent_as(&replace),
+                CasOutcome::Unknown,
+            ),
+        )
+        .expect("the Unknown answer");
+
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN + 2),
+            &grant_read(PROVEN + 2, found(8, &record)),
+        )
+        .expect("the read-back at a newer revision");
+
+    assert_eq!(
+        cas_expects(&effects),
+        Some(Some(Revision(8))),
+        "a new revision is a new fact: the replace goes at once, at revision 8: {effects:?}"
+    );
+}
