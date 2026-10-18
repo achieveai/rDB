@@ -5348,6 +5348,75 @@ mod tests {
         );
     }
 
+    /// U1 (ruling A-R109) end to end: a write applied and unpublished when a node fence lands.
+    /// Both copies' ACKs to the owner are dropped, so the put (seq 2) is applied on node 1 and
+    /// never published, and T1's queue is frozen on it. The control store then fails until A1
+    /// fences, which turns that freeze into a lost-authority one: status names seq 2 as the
+    /// write the queue waits on, and does not admit. The store returns and A1 replaces its own
+    /// grant (A-R96), and the queue still waits on seq 2: only its publication resolves it. Once
+    /// the links heal it publishes, `waits_on` clears, and writes are admitted again.
+    /// Integration (~3.5 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        trio.links.drop_direction(NodeId(2), NodeId(1));
+        trio.links.drop_direction(NodeId(3), NodeId(1));
+        let unacknowledged = trio.call(put(1, b"a", b"1", None));
+        trio.until("node 1 applies seq 2", |trio| {
+            (trio.head() == Some(2)).then_some(())
+        });
+
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        let fenced = trio.until("node 1 fenced", |trio| {
+            let status = trio.status(0);
+            status.fence.is_some().then_some(status)
+        });
+        assert_eq!(
+            (
+                fenced.waits_on,
+                fenced.admits,
+                fenced.published.map(|(_, seq)| seq)
+            ),
+            (Some(Seq(2)), Some(false), Some(Seq(1))),
+            "waits_on names the unpublished put at the fence: {fenced:?}"
+        );
+
+        trio.mem.stop_failing();
+        let replaced = trio.until("node 1 holds a grant again", |trio| {
+            let status = trio.status(0);
+            status.authority.starts_with("held(").then_some(status)
+        });
+        assert_eq!(
+            (replaced.waits_on, replaced.published.map(|(_, seq)| seq)),
+            (Some(Seq(2)), Some(Seq(1))),
+            "waits_on still names the put under the new grant: {replaced:?}"
+        );
+
+        trio.links.heal_all();
+        let published = trio.until("seq 2 publishes", |trio| {
+            let status = trio.status(0);
+            (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
+        });
+        assert_eq!(
+            published.waits_on, None,
+            "waits_on once the put published: {published:?}"
+        );
+        trio.until("node 1 admits writes", |trio| {
+            (trio.status(0).admits == Some(true)).then_some(())
+        });
+        drop(unacknowledged);
+    }
+
     /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
     /// logged, never dropped in silence, and the primary neither faults nor stops taking
     /// writes: copy 1 still acknowledges. The `SendFailed` event it also queues is not asserted:
