@@ -499,6 +499,30 @@ impl TxnKernel {
         &self.mode
     }
 
+    /// The freeze check 7 reports, or `None` while the queue is open.
+    ///
+    /// The mode's own cause, except in one case (U1, lead ruling A-R109): a lost-authority freeze
+    /// whose authority is back ([`Self::authority_restored`]) and which holds only because a
+    /// dispatched write is unresolved. That queue waits on the write, not on the authority, so it
+    /// is refused as a queue frozen on an unresolved transaction is (`PROTECTION_PAUSED`,
+    /// ADR-0004 row 7). Reported as its lost authority it was `LEASE_EXPIRED`, naming a grant
+    /// that A1 was renewing. The mode is unchanged: `Published` still thaws it through
+    /// [`Self::thaw`]. No test of `unresolved` is needed: with nothing unresolved, the view that
+    /// restored the authority already thawed the queue in [`Self::on_view`], and a view only
+    /// stops admitting as time passes.
+    #[must_use]
+    pub(crate) fn refusing_cause(&self, now: Tick) -> Option<FreezeCause> {
+        let QueueMode::Frozen { cause, .. } = self.mode else {
+            return None;
+        };
+        match cause {
+            FreezeCause::AuthorityLost(_) if self.authority_restored(now) => {
+                Some(FreezeCause::UnresolvedTransaction)
+            }
+            _ => Some(cause),
+        }
+    }
+
     /// The transaction past the queue, if any.
     #[must_use]
     pub const fn inflight(&self) -> Option<&Inflight> {
@@ -1417,17 +1441,25 @@ impl TxnKernel {
         else {
             return None;
         };
-        let view = self.authority?;
-        let lost = self.lost?;
-        if view.lineage != self.lineage
-            || !lost.lifts_under(view.grant_id)
-            || ctx.now > view.valid_through_tick
-        {
+        if !self.authority_restored(ctx.now) {
             return None;
         }
         self.mode = QueueMode::Open;
         self.lost = None;
         Some(self.pump(ctx))
+    }
+
+    /// The thaw's authority conjuncts (A-R96, A-R97): a lost authority is recorded, and the view
+    /// held names exactly this lineage, under a grant id that lifts it, and admits at `now`.
+    /// Shared with [`Self::refusing_cause`], so check 7 cannot call an authority back that the
+    /// thaw would not.
+    fn authority_restored(&self, now: Tick) -> bool {
+        let (Some(view), Some(lost)) = (self.authority, self.lost) else {
+            return false;
+        };
+        view.lineage == self.lineage
+            && lost.lifts_under(view.grant_id)
+            && now <= view.valid_through_tick
     }
 
     fn on_freeze(&mut self, scope: FenceScope, cause: FreezeCause) -> Vec<TxnEffect> {

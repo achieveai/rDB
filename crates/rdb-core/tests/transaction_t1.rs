@@ -3211,6 +3211,44 @@ fn a_write_in_flight_at_the_fence_publishes_and_the_queue_thaws() {
     let _ = h.admit(put(2, b"b", b"2"));
 }
 
+/// U1 (lead ruling A-R109, tester walk `w8/u1`): a write was in flight at a node fence, A1 then
+/// replaced its own grant, and the new grant's view admits. The queue stays frozen only because
+/// that write is unresolved, so a new submit is refused at check 7. The refusal is
+/// `PROTECTION_PAUSED`, as for any queue frozen on an unresolved transaction (ADR-0004 row 7),
+/// not `LEASE_EXPIRED` naming a grant that is valid. The walk got `LEASE_EXPIRED` for grant 1627
+/// while A1 renewed that grant every 500 ms; no `AuthorityCheck` was asked.
+#[retcd_test]
+fn m9_u1_00_a_submit_after_a_self_replace_waits_on_the_unresolved_write_as_paused() {
+    let mut h = H::non_empty();
+    let (batch, digest, seq) = h.dispatch(put(1, b"a", b"1"));
+    let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+    let _ = h.step(committed(batch, seq));
+    let _ = h.step(view_under(3, 9, u64::MAX));
+    assert_eq!(
+        failed(&h.step(submit(put(2, b"b", b"2")))),
+        ErrorKind::ProtectionPaused,
+        "the new grant admits; only the unresolved write holds the queue"
+    );
+    let _ = h.step(published(seq, digest, 1));
+    assert_eq!(h.k().mode(), &QueueMode::Open);
+    let _ = h.admit(put(3, b"c", b"3"));
+}
+
+/// U1's guard: the same unresolved write, and a fresh admitting view, but under the grant the
+/// fence ended. The authority is still lost, so check 7 stays `LEASE_EXPIRED`.
+#[retcd_test]
+fn m9_u1_01_a_submit_under_the_fenced_grant_stays_lease_expired() {
+    let mut h = H::non_empty();
+    let (batch, _, seq) = h.dispatch(put(1, b"a", b"1"));
+    let _ = h.step(fence(FenceScope::Node, DenyReason::Expired));
+    let _ = h.step(committed(batch, seq));
+    let _ = h.step(view_under(2, 9, u64::MAX));
+    assert_eq!(
+        failed(&h.step(submit(put(2, b"b", b"2")))),
+        ErrorKind::LeaseExpired
+    );
+}
+
 /// A-R71, tester-t1 hunt_23. Check 10's upper bounds: exactly 255 mutations and exactly
 /// `MAX_CONDITIONS` conditions are admitted, and one more of either is `INVALID_ARGUMENT` naming
 /// the field.
