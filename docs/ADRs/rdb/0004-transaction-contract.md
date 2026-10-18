@@ -154,6 +154,15 @@ Three rules adopted from rEtcd's ADR-0025 rather than re-derived:
   an event carrying a watermark, computed outside the kernel. This is ADR-0025's `applied_revision`
   discipline, transposed from revisions to sequences.
 
+  Except an answer no sequence follows. A `CONDITION_FAILED` is retained at `next_seq`, and only
+  the publish of that sequence ages it by the counter; with nothing published after it (a cap
+  filled by failures) that never comes. So T1 also drops such an entry once the event time
+  reaches its answering step's time plus `Budgets::dedup_retention_millis`. The kernel still
+  reads no clock. The watermark is untouched: these entries are memory-only (§8), never seeded,
+  and never outlive the instance, so nothing outside it needs to know. Under the host trim duty
+  the time rule always fires before the counter rule for these entries, so the counter rule is
+  the simulator's rule for them. (Amended 2026-10-18, M9 S3, A-R108.)
+
 **The request digest covers the semantic request and nothing else.** Preimage, normatively:
 `tenant`, `affinity_id`, `api_version`, `conditions[]`, `mutations[]`. **Excluded:** `deadline`,
 `client_id`, `request_id`, `expected_generation`, and every routing or transport field.
@@ -312,7 +321,7 @@ request misses the index. If its condition now holds, it is admitted. Nothing ap
   within the generation that answered, and not across a recovery. This is a documented caller
   obligation, like request-id retention in Consequences.
 - The kernel does not change. "Retained result replayed verbatim" (§4, Verification) holds within
-  a generation.
+  a generation and inside the retention window (§4).
 
 **Rejected.**
 - *Make `expected_generation` required on the wire.* It would be the strongest guarantee, but it
