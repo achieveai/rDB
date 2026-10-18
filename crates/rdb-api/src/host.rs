@@ -1731,10 +1731,22 @@ impl Host {
                     self.report_dispatch(batch);
                 }
                 match self.engine.commit(batch.clone()) {
-                    Ok(applied) => StorageEvent::Committed {
-                        batch: batch.id,
-                        applied,
-                    },
+                    // One line per commit, on every node: a seq applied twice shows as two.
+                    Ok(applied) => {
+                        tracing::info!(
+                            node = self.node.0,
+                            from = ?from,
+                            partition = batch.partition.0,
+                            batch = batch.id.0,
+                            seq = batch.seq.0,
+                            applied = applied.0,
+                            "store_commit"
+                        );
+                        StorageEvent::Committed {
+                            batch: batch.id,
+                            applied,
+                        }
+                    }
                     Err(fault) => {
                         tracing::error!(
                             node = self.node.0,

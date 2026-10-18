@@ -100,6 +100,10 @@
 //! control freeze-grant <n>                set grants/<n>'s frozen bit on the rEtcd leader, at
 //!                                         its revision. Nothing in M9 undoes it: run it last
 //! link hold|heal <a>-<b> | link heal all | links
+//! link drop <a>-<b>                       lose every peer message node a sends to node b,
+//!                                         one direction only, until `link heal` of the pair
+//!                                         or `link heal all`; the sender is never told. A
+//!                                         hold delays, a drop loses. `links` prints both
 //! wait recovered|ready [<seconds>]        block until the partition gets there
 //! sleep <millis>
 //! quit
@@ -1010,13 +1014,16 @@ fn repl<'scope, 'env>(
                     .collect::<Vec<_>>()
             )),
             ["links"] => {
-                say(&format!(
-                    "held={:?}",
-                    db.links()
-                        .held()
+                let names = |pairs: Vec<(NodeId, NodeId)>| {
+                    pairs
                         .iter()
                         .map(|(a, b)| format!("{}-{}", a.0, b.0))
                         .collect::<Vec<_>>()
+                };
+                say(&format!(
+                    "held={:?} dropped={:?}",
+                    names(db.links().held()),
+                    names(db.links().dropped())
                 ));
                 Ok(())
             }
@@ -1024,10 +1031,13 @@ fn repl<'scope, 'env>(
                 say(&format!("healed delivered={}", db.links().heal_all()));
                 Ok(())
             }
-            ["link", verb @ ("hold" | "heal"), pair] => parse_pair(pair).map(|(a, b)| {
+            ["link", verb @ ("hold" | "heal" | "drop"), pair] => parse_pair(pair).map(|(a, b)| {
                 if *verb == "hold" {
                     db.links().hold(a, b);
                     say(&format!("held {}-{}", a.0, b.0));
+                } else if *verb == "drop" {
+                    db.links().drop_direction(a, b);
+                    say(&format!("dropping {}->{}", a.0, b.0));
                 } else {
                     say(&format!(
                         "healed {}-{} delivered={}",
