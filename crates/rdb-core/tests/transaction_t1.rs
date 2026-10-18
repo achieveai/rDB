@@ -388,6 +388,8 @@ struct H {
     node: NodeId,
     /// That node's boot: its `StepCtx.boot` and its event's `boot`.
     boot: BootId,
+    /// Every step's `StepCtx.budgets`: [`BUDGETS`] unless a row shortens one.
+    budgets: Budgets,
 }
 
 impl H {
@@ -415,6 +417,7 @@ impl H {
             t1: Transaction::with_limits(limits),
             snap: Snap::default(),
             now: 10,
+            budgets: BUDGETS,
             node: NODE_A,
             boot: BootId(1),
         };
@@ -434,6 +437,7 @@ impl H {
         event.boot = self.boot;
         let ctx = StepCtx {
             boot: self.boot,
+            budgets: &self.budgets,
             ..ctx(self.now, self.node, &self.snap)
         };
         let effects = self.t1.step(&ctx, &event)?;
@@ -543,6 +547,7 @@ fn an_inert_node_runs_checks_one_to_three_before_not_primary() {
         t1: Transaction::new(),
         snap: Snap::default(),
         now: 10,
+        budgets: BUDGETS,
         node: NODE_A,
         boot: BootId(1),
     };
@@ -1344,6 +1349,7 @@ fn check_eight_fails_closed_then_passes_the_reason_through() {
         t1: Transaction::new(),
         snap: Snap::default(),
         now: 10,
+        budgets: BUDGETS,
         node: NODE_A,
         boot: BootId(1),
     };
@@ -5273,7 +5279,10 @@ fn m7a_90_no_trim_bounded_growth_dedup_and_status() {
 fn retained_at(seq: u64) -> Retained {
     Retained {
         request_digest: Digest::ROOT,
-        answer: RetainedAnswer::ConditionFailed { index: 0 },
+        answer: RetainedAnswer::ConditionFailed {
+            index: 0,
+            answered_at: Tick::ZERO,
+        },
         applied_at_seq: Seq(seq),
     }
 }
@@ -6097,4 +6106,170 @@ fn a_failed_batch_holds_storage_fenced_into_the_next_generation() {
             unresolved: None,
         }
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// M9 S3 workstream K: condition failures age out (lead rulings A-R108, A-R108a)
+// ---------------------------------------------------------------------------------------------
+
+/// The answering step's tick in the aging rows.
+const T: u64 = 50_000;
+/// The retention the aging rows run under. Below [`T`] on purpose: a failure stamped at
+/// `Tick::ZERO` instead of its answering step's `now` (mutant 4) has then already aged by `T`,
+/// so the stamp is observable. Equal or above, a zero stamp would still hold the entry at `T`.
+const R: u64 = 1_000;
+
+/// `request` puts `k`, on the condition that `k` is at version 3. Fails while `k` is absent or
+/// at another version.
+fn needs_k_at_3(request: u64) -> TxnRequest {
+    let mut req = put(request, b"k", b"v");
+    req.conditions.push(Condition::VersionEquals {
+        key: key(b"k"),
+        version: 3,
+    });
+    req
+}
+
+/// [`H::non_empty`] with `limits`, at `T`, retaining for `R`.
+fn aging(limits: Limits) -> H {
+    let mut h = H::live_at(limits, 1);
+    h.budgets.dedup_retention_millis = R;
+    h.now = T;
+    h
+}
+
+/// Walk 5f-r in the kernel: condition failures alone fill the dedup cap, and with nothing
+/// published after them no trim ever ages them. They hold the cap until `R` after the step that
+/// answered them; at exactly `T + R` they are gone and a new write is admitted.
+#[retcd_test]
+fn m9_s3k_00_condition_failures_alone_fill_the_cap_then_age_out() {
+    let mut h = aging(Limits {
+        queue_cap: 8,
+        dedup_cap: 2,
+        ..Limits::default()
+    });
+    for request in [1, 2] {
+        assert_eq!(
+            failed(&h.step(submit(needs_k_at_3(request)))),
+            ErrorKind::ConditionFailed
+        );
+    }
+    assert_eq!(h.k().dedup().len(), 2, "both failures held at T");
+    h.now = T + R - 1;
+    assert_eq!(
+        failed(&h.step(submit(put(3, b"a", b"1")))),
+        ErrorKind::Overloaded,
+        "inside the window the failures still fill the cap"
+    );
+    h.now = T + R;
+    let _ = h.admit(put(3, b"a", b"1"));
+    assert_eq!(h.k().dedup().len(), 0, "both aged out at T + R");
+}
+
+/// M7A-79 with a window: a retry answered inside `R` of the failure replays it even though the
+/// condition now holds, and allocates nothing; answered at `T + R` it is evaluated fresh.
+#[retcd_test]
+fn m9_s3k_01_a_condition_failure_replays_inside_retention_and_runs_fresh_after() {
+    let mut h = aging(Limits::default());
+    let req = needs_k_at_3(1);
+    assert_eq!(
+        failed(&h.step(submit(req.clone()))),
+        ErrorKind::ConditionFailed
+    );
+    h.snap.versions.insert(key(b"k").to_vec(), 3);
+    let next = h.k().next_seq();
+    h.now = T + R - 1;
+    assert_eq!(
+        h.step(submit(req.clone())),
+        fail(1, RdbError::ConditionFailed { index: 0 }),
+        "answered inside the window: the original answer"
+    );
+    assert_eq!(h.k().next_seq(), next);
+    h.now = T + R;
+    let _ = h.admit(req);
+}
+
+/// Expiry drops only condition failures. An applied entry answered at the same tick still
+/// replays past `T + R`, and the trim watermark is untouched: nothing claims a sequence aged.
+#[retcd_test]
+fn m9_s3k_02_expiry_keeps_applied_entries_and_the_watermark() {
+    let mut h = aging(Limits::default());
+    let (_, seq) = h.resolve(put(1, b"a", b"1"));
+    assert_eq!(
+        failed(&h.step(submit(needs_k_at_3(5)))),
+        ErrorKind::ConditionFailed
+    );
+    h.now = T + R + 1;
+    let effects = h.step(submit(put(1, b"a", b"1")));
+    let [EffectKind::Reply(ReplyEffect::Transaction { result, .. })] = effects.as_slice() else {
+        panic!("the applied entry replays, got {effects:?}");
+    };
+    assert_eq!(result.seq, Seq(seq));
+    assert_eq!(
+        h.k().dedup().get(GEN, AFF, identity(5)),
+        None,
+        "the failure aged"
+    );
+    assert_eq!(h.k().dedup().len(), 1);
+    assert_eq!(h.k().dedup().retained_from_seq(GEN), None, "no watermark");
+}
+
+/// An over-eager trim (`below` past `next_seq`) drops a failure early; the same identity then
+/// runs and publishes, and its applied entry reuses the key. The failure's stale queue slot pops
+/// at `T + R` and must leave the applied entry alone, so the retry still replays its sequence.
+/// Also pins that `insert` ignores the watermark: the applied entry sits below it.
+#[retcd_test]
+fn m9_s3k_03_expiry_never_removes_an_applied_entry_that_reused_the_key() {
+    let mut h = aging(Limits::default());
+    let req = needs_k_at_3(5);
+    assert_eq!(
+        failed(&h.step(submit(req.clone()))),
+        ErrorKind::ConditionFailed
+    );
+    let below = h.k().next_seq().0 + 1;
+    let _ = h.step(trim(GEN, below));
+    assert_eq!(
+        h.k().dedup().get(GEN, AFF, identity(5)),
+        None,
+        "over-trimmed"
+    );
+    h.snap.versions.insert(key(b"k").to_vec(), 3);
+    let (_, seq) = h.resolve(req.clone());
+    h.now = T + R;
+    let effects = h.step(submit(req));
+    let [EffectKind::Reply(ReplyEffect::Transaction { result, .. })] = effects.as_slice() else {
+        panic!("the applied entry replays, got {effects:?}");
+    };
+    assert_eq!(result.seq, Seq(seq));
+}
+
+/// K-1 (lead ruling A-R108): an over-eager trim drops a failure F1 answered at `T`; the same
+/// identity fails again at `T2`. At `T + R` F1's stale queue slot pops, and F2 must keep its own
+/// window: the retry, with the condition now true, still replays F2. At `T2 + R` it runs fresh.
+#[retcd_test]
+fn m9_s3k_05_a_second_failure_on_a_trimmed_key_keeps_its_own_window() {
+    let mut h = aging(Limits::default());
+    let req = needs_k_at_3(5);
+    assert_eq!(
+        failed(&h.step(submit(req.clone()))),
+        ErrorKind::ConditionFailed
+    );
+    let below = h.k().next_seq().0 + 1;
+    let _ = h.step(trim(GEN, below));
+    let t2 = T + R / 2;
+    h.now = t2;
+    assert_eq!(
+        failed(&h.step(submit(req.clone()))),
+        ErrorKind::ConditionFailed,
+        "F2"
+    );
+    h.snap.versions.insert(key(b"k").to_vec(), 3);
+    h.now = T + R;
+    assert_eq!(
+        h.step(submit(req.clone())),
+        fail(5, RdbError::ConditionFailed { index: 0 }),
+        "F1's window closed, F2's has not"
+    );
+    h.now = t2 + R;
+    let _ = h.admit(req);
 }

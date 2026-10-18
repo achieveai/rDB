@@ -934,16 +934,22 @@ impl TxnKernel {
         // 12. Conditions, against the authoritative local state. No sequence is reserved, so
         //     the failure is aged at `next_seq`, the first sequence published after it: aged at
         //     the one before, a trim of that older sequence dropped it early (A-R71, hunt_06).
+        //     Nothing need ever publish after it, so it also ages by this step's `now`
+        //     (`DedupIndex::expire_unpublished`, lead ruling A-R108).
         if let Some(index) = first_failed_condition(&admitted.req, ctx.snapshot) {
-            self.dedup.insert(
+            self.dedup.insert_unpublished(
                 generation,
                 affinity,
                 identity,
                 Retained {
                     request_digest: admitted.request_digest,
-                    answer: RetainedAnswer::ConditionFailed { index },
+                    answer: RetainedAnswer::ConditionFailed {
+                        index,
+                        answered_at: ctx.now,
+                    },
                     applied_at_seq: self.next_seq,
                 },
+                ctx.now,
             );
             return vec![reply(
                 identity,
@@ -1680,7 +1686,7 @@ fn replay(identity: RequestIdentity, digest: Digest, retained: &Retained) -> Txn
             identity,
             result: *result,
         },
-        RetainedAnswer::ConditionFailed { index } => reply(
+        RetainedAnswer::ConditionFailed { index, .. } => reply(
             identity,
             TxnRejection::NotAdmitted(RdbError::ConditionFailed { index: *index }),
         ),
@@ -1804,6 +1810,11 @@ impl Transaction {
         if let Some(kernel) = self.kernels.get_mut(&key) {
             // A-R68: any T1 input is a chance to load a seed the snapshot now covers.
             kernel.try_seed(ctx.snapshot);
+            // A-R108: and to age the condition failures no publish will ever age. Before the
+            // event, so a submit at the boundary sees the room.
+            kernel
+                .dedup
+                .expire_unpublished(ctx.now, ctx.budgets.dedup_retention_millis);
         }
         // A-R73a: remembered whether or not an instance is held. The answer below is unchanged.
         match event {
