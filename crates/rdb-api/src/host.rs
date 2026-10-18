@@ -67,7 +67,7 @@ use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
-use rdb_core::transaction::{Inflight, Limits, Transaction, TxnKernel};
+use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::keys::{root_key, RootKey};
@@ -471,6 +471,11 @@ pub struct NodeStatus {
     /// resolves (`Inflight::Dispatched`). `None` when nothing is applied unpublished: a request
     /// refused at admission, or never sent, is not here (Msg 8, W6-D1).
     pub in_flight: Option<RequestId>,
+    /// The applied sequence this node's T1 queue is frozen on, unpublished, while the freeze is
+    /// a lost authority or that write itself (`QueueMode::Frozen { unresolved }`). Every write
+    /// is refused until it publishes, even with A1 holding a grant again and L1 admitting
+    /// (U1, ruling A-R109). `None` while the queue is open or nothing is unresolved.
+    pub waits_on: Option<Seq>,
     /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
     /// stalled; cleared when it activates.
     pub stalled: Option<String>,
@@ -3470,6 +3475,17 @@ impl Host {
                 .and_then(TxnKernel::inflight)
             {
                 Some(Inflight::Dispatched { admitted, .. }) => Some(admitted.req.identity.request),
+                _ => None,
+            },
+            waits_on: match self
+                .transaction
+                .kernel(self.node, partition)
+                .map(TxnKernel::mode)
+            {
+                Some(QueueMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_) | FreezeCause::UnresolvedTransaction,
+                    unresolved,
+                }) => *unresolved,
                 _ => None,
             },
             stalled: self

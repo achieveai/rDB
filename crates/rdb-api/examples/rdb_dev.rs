@@ -595,7 +595,10 @@ fn ready_reason(
     let resolving = resolving_line(owner, held, dropped)
         .filter(|_| !admits && fence.is_none_or(|reason| fence_lifts(owner, reason)));
     let Some(note) = restart_note else {
-        if let Some(line) = gave_up.or(resolving) {
+        if let Some(line) = gave_up
+            .or(resolving)
+            .or_else(|| waits_on_line(owner, held, dropped))
+        {
             return Some(line);
         }
         return match (fence, links_wait(owner, held, dropped)) {
@@ -654,6 +657,16 @@ fn links_wait<'a>(
     dropped: &[(NodeId, NodeId)],
 ) -> Option<(&'a str, String)> {
     let mode = l1_rejecting(owner)?;
+    Some((mode, node_links(owner, held, dropped)?))
+}
+
+/// Which of `owner`'s links `held` holds or `dropped` drops: `links 1-2 are held`,
+/// `links 2->1 are dropped`, or both joined by `and`. `None` when there are none.
+fn node_links(
+    owner: &NodeStatus,
+    held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
+) -> Option<String> {
     let names = |links: &[(NodeId, NodeId)], between: &str| -> Vec<String> {
         links
             .iter()
@@ -669,7 +682,37 @@ fn links_wait<'a>(
     .filter(|(links, _)| !links.is_empty())
     .map(|(links, how)| format!("links {} are {how}", links.join(", ")))
     .collect();
-    (!parts.is_empty()).then(|| (mode, parts.join(" and ")))
+    (!parts.is_empty()).then(|| parts.join(" and "))
+}
+
+/// The line for node 1's queue frozen on a write it applied and has not published
+/// (`waits_on`), with its grant not fenced: every write is refused until that write publishes,
+/// whatever A1 and L1 say (U1, ruling A-R109). It names the request, as `in_flight` holds it,
+/// and its seq. With a link of node 1's held or dropped the copies cannot take it, so the line
+/// names those links and says healing them resolves it; without one, it publishes once the
+/// copies take it.
+fn waits_on_line(
+    owner: &NodeStatus,
+    held: &[(NodeId, NodeId)],
+    dropped: &[(NodeId, NodeId)],
+) -> Option<String> {
+    let seq = owner.waits_on.filter(|_| owner.fence.is_none())?;
+    let node = owner.node.0;
+    let what = match owner.in_flight {
+        Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
+        None => format!("the outcome of seq {}", seq.0),
+    };
+    Some(match node_links(owner, held, dropped) {
+        Some(links) => format!(
+            "partition 1 waits on {what}, which node {node} applied and has not published, and \
+             {links}; writes resume once it publishes, which needs those links: heal them (link \
+             heal all)"
+        ),
+        None => format!(
+            "partition 1 waits on {what}, which node {node} applied and has not published; \
+             writes resume once node {node}'s copies take it and it publishes"
+        ),
+    })
 }
 
 /// The line for F1 `Blocked(<reason>)` on node 1: recovery cannot finish, so writes stay out
@@ -787,7 +830,8 @@ fn ready_step(
     held: &[(NodeId, NodeId)],
     dropped: &[(NodeId, NodeId)],
 ) -> Option<String> {
-    let admits = owner.admits == Some(true);
+    // A queue frozen on a write admits nothing, whatever A1 and L1 say (U1).
+    let admits = owner.admits == Some(true) && owner.waits_on.is_none();
     step_line(
         seen,
         admits,
@@ -922,7 +966,7 @@ fn repl<'scope, 'env>(
                         object: object.as_bytes().to_vec(),
                         if_version,
                     };
-                    put_line(answer, Some((&mut sent, kind)));
+                    put_line(db, answer, Some((&mut sent, kind)));
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -937,7 +981,7 @@ fn repl<'scope, 'env>(
             }),
             ["txn", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
                 let answer = db.txn(&txn_puts(&ops), deadline);
-                put_line(answer, Some((&mut sent, Kind::Txn)));
+                put_line(db, answer, Some((&mut sent, Kind::Txn)));
             }),
             ["txn&", rest @ ..] => parse_txn(rest, deadline).map(|(deadline, ops)| {
                 say("bg txn: queued");
@@ -950,7 +994,11 @@ fn repl<'scope, 'env>(
                 sent.pick(rest).and_then(|(request, kind)| {
                     let id = request.identity.request;
                     let (object, if_version) = payload_put(kind, id)?;
-                    put_line(db.put_as(id, &object, value.as_bytes(), if_version), None);
+                    put_line(
+                        db,
+                        db.put_as(id, &object, value.as_bytes(), if_version),
+                        None,
+                    );
                     Ok(())
                 })
             }
@@ -959,7 +1007,7 @@ fn repl<'scope, 'env>(
                     let deadline = Duration::from_millis(ms);
                     let answer = db.resend_within(request, deadline);
                     sent.resent_within(deadline, &answer);
-                    put_line(answer, None);
+                    put_line(db, answer, None);
                 }),
                 Err(_) => Err("retry [<request>] --deadline-ms N: N is milliseconds".to_owned()),
             },
@@ -972,7 +1020,7 @@ fn repl<'scope, 'env>(
                         db.resend_within(request, deadline)
                     }
                 };
-                put_line(answer, None);
+                put_line(db, answer, None);
             }),
             ["get", object] => {
                 get_line(db.get(object.as_bytes()));
@@ -1391,18 +1439,35 @@ impl Sent {
     }
 }
 
-/// Print a put's or txn's answer, and remember what it sent when `record` names where.
-fn put_line(answer: Result<rdb_api::PutOk, PutError>, record: Option<(&mut Sent, Kind)>) {
+/// Print a put's or txn's answer, and remember what it sent when `record` names where. A
+/// refusal is followed by a `note:` line when node 1's queue waits on a write it applied and
+/// has not published ([`waits_note`]).
+fn put_line(db: &Db, answer: Result<rdb_api::PutOk, PutError>, record: Option<(&mut Sent, Kind)>) {
     let remember = |request: Option<TxnRequest>| {
         if let Some((sent, kind)) = record {
             sent.record(request, kind);
         }
     };
     say(&put_text(&answer));
+    if answer.is_err() {
+        if let Some(note) = waits_note(db) {
+            say(&note);
+        }
+    }
     match answer {
         Ok(ok) => remember(Some(*ok.sent)),
         Err(PutError { request, .. }) => remember(request.map(|request| *request)),
     }
+}
+
+/// After a refusal, the reason when node 1's queue waits on a write it applied and has not
+/// published (U1, ruling A-R109): the refusal names only its kind, `PROTECTION_PAUSED`, and not
+/// the write the partition waits on, nor that healing the links resolves it.
+fn waits_note(db: &Db) -> Option<String> {
+    let nodes = db.node_status();
+    let owner = nodes.iter().find(|node| node.node == NodeId(1))?;
+    let links = db.links();
+    waits_on_line(owner, &links.held(), &links.dropped()).map(|line| format!("note: {line}"))
 }
 
 /// A put's answer as one line.
@@ -1981,6 +2046,7 @@ mod tests {
             admits: Some(admits),
             published: None,
             in_flight: None,
+            waits_on: None,
             stalled: stalled.map(str::to_owned),
             reload_pending: None,
         }
@@ -2495,6 +2561,61 @@ mod tests {
                     .to_owned()
             ),
             "both kinds; a direction between two secondaries is not node 1's"
+        );
+    }
+
+    /// M9 S3 resume-line table, cell "unresolved" (U1, ruling A-R109, kernel 935e65d): `put a 2`
+    /// was in flight when node 1's ACKs were dropped, the fence froze the queue on its seq 3,
+    /// and A1 replaced the grant. Every write is then refused until seq 3 publishes, whatever
+    /// A1 and L1 say, so the line names the request and its seq, and says healing the links
+    /// resolves it, and never `ready` while L1 admits. Once it publishes the queue thaws.
+    #[test]
+    fn a_resume_line_with_the_queue_frozen_on_a_write_names_it_and_the_links() {
+        const DROPPED: [(NodeId, NodeId); 2] = [(NodeId(2), NodeId(1)), (NodeId(3), NodeId(1))];
+        let waiting = |protection: &str, admits: bool| {
+            let mut node = owner(None, admits);
+            node.authority = "held(grant 6)".to_owned();
+            node.protection = Some(protection.to_owned());
+            node.in_flight = Some(RequestId(2));
+            node.waits_on = Some(rdb_core::contracts::ids::Seq(3));
+            node
+        };
+        let paused = waiting("paused", false);
+        let admitting = waiting("healthy", true);
+        let mut thawed = owner(None, true);
+        thawed.protection = Some("healthy".to_owned());
+        let mut seen = Seen::default();
+        let lines: Vec<String> = [&paused, &admitting, &thawed]
+            .iter()
+            .filter_map(|node| ready_step(&mut seen, node, None, &[], &DROPPED))
+            .collect();
+        let waits = "partition 1 waits on request 2's outcome (seq 3), which node 1 applied and \
+                     has not published, and links 2->1, 3->1 are dropped; writes resume once it \
+                     publishes, which needs those links: heal them (link heal all)";
+        assert_eq!(
+            lines,
+            [
+                format!("not ready: writes not admitted: {waits}"),
+                "ready".to_owned()
+            ],
+            "L1 admitting does not make it ready"
+        );
+        assert_eq!(
+            ready_reason(&paused, false, None, &HELD, &[]),
+            Some(
+                "partition 1 waits on request 2's outcome (seq 3), which node 1 applied and has \
+                 not published, and links 1-2, 1-3 are held; writes resume once it publishes, \
+                 which needs those links: heal them (link heal all)"
+                    .to_owned()
+            )
+        );
+        let mut fenced = paused.clone();
+        fenced.authority = "fenced(Expired)".to_owned();
+        fenced.fence = Some(DenyReason::Expired);
+        assert_eq!(
+            waits_on_line(&fenced, &[], &DROPPED),
+            None,
+            "a fenced grant is the fence line's"
         );
     }
 
