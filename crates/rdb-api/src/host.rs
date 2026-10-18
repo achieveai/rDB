@@ -3165,7 +3165,16 @@ impl Host {
                 ));
             }
         };
-        let _ = pending.reply.send(answer);
+        // The caller stopped waiting, at its own deadline, before the answer came: the answer is
+        // lost here. A write's caller then holds `UNKNOWN_OUTCOME`, which `status` settles.
+        if pending.reply.send(answer).is_err() {
+            tracing::info!(
+                node = self.node.0,
+                request = identity.request.0,
+                reply = reply_name(reply),
+                "reply_undelivered"
+            );
+        }
         self.release_queued(identity)
     }
 
