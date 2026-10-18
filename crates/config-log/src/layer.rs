@@ -26,8 +26,9 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use serde_json::{Map, Value};
 use tracing::field::{Field, Visit};
@@ -160,6 +161,7 @@ fn run_test_writer(rx: mpsc::Receiver<WriterMsg>) {
     for msg in rx {
         match msg {
             WriterMsg::Line(path, line) => {
+                wait_while_writes_held();
                 if failed.iter().any(|(p, _)| *p == path) {
                     continue;
                 }
@@ -186,6 +188,39 @@ fn run_test_writer(rx: mpsc::Receiver<WriterMsg>) {
             }
         }
     }
+}
+
+/// Set while a [`TestWriteHold`] exists. Unset, a per-test write costs one load of it.
+static WRITES_HELD: AtomicBool = AtomicBool::new(false);
+/// Locked by the [`TestWriteHold`]; a per-test write waits on it while [`WRITES_HELD`] is set.
+static WRITE_HOLD: Mutex<()> = Mutex::new(());
+
+fn wait_while_writes_held() {
+    if WRITES_HELD.load(Ordering::Acquire) {
+        drop(WRITE_HOLD.lock().unwrap_or_else(|e| e.into_inner()));
+    }
+}
+
+/// Stalls every per-test file write until dropped, the way one slow append did on 2026-10-12.
+/// For the row that proves logging does not wait for the write. Lines logged meanwhile queue.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct TestWriteHold {
+    _locked: MutexGuard<'static, ()>,
+}
+
+impl Drop for TestWriteHold {
+    fn drop(&mut self) {
+        WRITES_HELD.store(false, Ordering::Release);
+    }
+}
+
+/// Start a [`TestWriteHold`]. Test-only; a second hold waits for the first to drop.
+#[doc(hidden)]
+pub fn hold_test_writes() -> TestWriteHold {
+    let guard = WRITE_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+    WRITES_HELD.store(true, Ordering::Release);
+    TestWriteHold { _locked: guard }
 }
 
 /// Per-test log lines were lost, so a reader would see a file with lines missing.

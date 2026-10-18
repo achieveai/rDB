@@ -1,8 +1,10 @@
 //! Per-test lines go through a background writer thread. Nothing logged may be missing when a
-//! test reads its own file, and nothing may be missing from the file once the process exits.
+//! test reads its own file, nor once a test has ended normally and the process exits.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use config_log::retcd_test;
 use config_log::testing::{test_log_dir, test_run_id};
@@ -189,4 +191,61 @@ fn an_unopenable_log_file_loses_only_its_own_lines() {
         text.contains("to my own file"),
         "the writer kept going after the failed open"
     );
+}
+
+/// A stalled file write must not stall logging. With every per-test write held, other threads
+/// still log all their lines and return; the lines reach the file once the write resumes.
+/// Before 2026-10-12 the layer wrote under one process-wide lock, and this row would wait out
+/// its bound.
+#[retcd_test]
+fn logging_returns_while_the_file_write_is_stalled() {
+    const METHOD: &str = "logging_returns_while_the_file_write_is_stalled";
+    const PER_THREAD_HELD: usize = 250;
+    // Far above what queueing these lines costs, and the hold never ends on its own.
+    const BOUND: Duration = Duration::from_secs(2);
+    // The path without the flush `test_file_path` does, which would wait out the hold.
+    let unflushed = test_log_dir()
+        .join("test_log_writer")
+        .join(format!("{METHOD}.jsonl"));
+
+    // Flushed first, so nothing of this file is mid-write when it is read under the hold.
+    config_log::layer::flush_test_logs();
+    let hold = config_log::layer::hold_test_writes();
+    let (done_tx, done_rx) = mpsc::channel();
+    let span = tracing::Span::current();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let _entered = span.enter();
+        log_lines(THREADS, PER_THREAD_HELD);
+        let _ = done_tx.send(());
+    });
+    let logged = done_rx.recv_timeout(BOUND);
+    let elapsed = started.elapsed();
+    let on_disk_while_held = lines_if_any(&unflushed).len();
+    drop(hold);
+    assert!(
+        logged.is_ok(),
+        "logging waited for a stalled file write: {THREADS} threads not done after {elapsed:?}"
+    );
+    assert_eq!(
+        on_disk_while_held, 0,
+        "lines written while the write was held"
+    );
+
+    let path = config_log::layer::test_file_path(&test_log_dir(), module_path!(), METHOD);
+    assert_complete(
+        METHOD,
+        &lines_in(&path, Some(test_run_id())),
+        THREADS,
+        PER_THREAD_HELD,
+    );
+}
+
+/// [`lines_in`], or none when the file does not exist yet.
+fn lines_if_any(path: &Path) -> Vec<(u64, u64)> {
+    if path.exists() {
+        lines_in(path, None)
+    } else {
+        Vec::new()
+    }
 }
