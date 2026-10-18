@@ -8,6 +8,10 @@
 //! may still publish; ask `status` with the same identity), `UNAVAILABLE` with no request for a
 //! put that could not be compiled in time (nothing was sent), and `UNAVAILABLE` for a read (a
 //! read mutates nothing). None waits for ever.
+//!
+//! Once any send of a request id went unanswered (a timeout, a lost reply or `UNKNOWN_OUTCOME`),
+//! only [`Db::status`] with the same id settles it, and only inside the dedup retention window;
+//! a definitive answer to a later resend covers that resend alone.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,7 +70,8 @@ pub struct ApiError {
     pub kind: ErrorKind,
     /// What the caller may do.
     pub retry: RetryRule,
-    /// Whether nothing was mutated, provably.
+    /// Whether this submission provably mutated nothing. It says nothing of an earlier send of
+    /// the same request id.
     pub no_mutation: bool,
     /// Detail, for the log and the operator.
     pub detail: String,
@@ -92,7 +97,8 @@ impl ApiError {
     /// | any other | `BoundedJitter` | `false` |
     ///
     /// This is not what the kernel attaches to the same kind: for example a kernel
-    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves no mutation.
+    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves this submission
+    /// mutated nothing.
     /// Wrap a kernel error with [`Self::from_kernel`], never with this.
     #[must_use]
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
@@ -130,8 +136,9 @@ impl ApiError {
     }
 
     /// A put refused before it was sent: this node has adopted no generation yet, so there is
-    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). Nothing left
-    /// the host, so nothing was mutated, and it may be retried once a generation is adopted.
+    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). This submission
+    /// never left the host, so it mutated nothing, and it may be retried once a generation is
+    /// adopted.
     #[must_use]
     pub fn not_adopted(node: NodeId, partition: PartitionId) -> Self {
         Self {
@@ -213,7 +220,9 @@ pub struct DbConfig {
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
     /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
-    /// A retry of a trimmed request is no longer recognised and applies again (spec §5.3).
+    /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
+    /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
+    /// the first send applied, rather than applying twice.
     pub dedup_retention: Option<Duration>,
 }
 
