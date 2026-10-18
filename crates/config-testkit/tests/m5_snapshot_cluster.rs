@@ -443,8 +443,10 @@ async fn published_id(build: BackgroundBuild) -> String {
 /// openraft does not export that state through `NodeMetrics`, so this waits for the core's own
 /// `finish_building_snapshot` event in this test's log. The core logs it inside the call that
 /// clears its in-progress flag, and handles a trigger sent afterwards only after that call
-/// returns. The layer writes each line unbuffered, so a substring scan of the raw file is
-/// enough, and a half-written last line cannot break it.
+/// returns. The layer's writer thread appends each line with one unbuffered write, and keeps
+/// draining after the one flush in `test_file_path`, so polling the raw file sees the event as
+/// soon as the writer reaches it. A substring scan is enough, and a half-written last line
+/// cannot break it.
 async fn wait_for_openraft_to_finish(cluster: &Cluster, snapshot_id: &str, method: &str) {
     let path = config_log::layer::test_file_path(
         &config_log::testing::test_log_dir(),

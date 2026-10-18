@@ -41,6 +41,12 @@ mod async_case {
 
     #[retcd_test]
     async fn async_test_is_tagged_across_await_and_spawn() {
+        // A bare async `#[retcd_test]` keeps `tokio::test`'s current-thread default; the macro
+        // runs the body under `tokio::main`, whose own default is multi-thread.
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread
+        );
         tracing::info!("before await");
         tokio::task::yield_now().await;
         // spawned work must be instrumented explicitly to keep the test context
@@ -67,6 +73,10 @@ mod async_case {
 
     #[retcd_test(flavor = "multi_thread", worker_threads = 2)]
     async fn tokio_args_are_forwarded() {
+        assert_eq!(
+            tokio::runtime::Handle::current().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        );
         tracing::info!("multi thread ok");
         let lines = read_lines(module_path!(), "tokio_args_are_forwarded");
         assert!(lines.iter().any(|l| l["@m"] == "multi thread ok"));
