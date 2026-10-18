@@ -220,6 +220,8 @@ pub struct DbConfig {
     /// How long a published write's retained answer is kept before the owner's trim duty lets
     /// it go: its dedup entry and its status. `None` is the spec's 24 h
     /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// A `CONDITION_FAILED` answer is kept as long, counted from when it was given, since nothing
+    /// need publish after it (ruling A-R108).
     /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
     /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
     /// the first send applied, rather than applying twice.
@@ -3066,6 +3068,76 @@ mod tests {
             limits(at_cap.dedup_cap).is_ok(),
             "the status cap itself is allowed"
         );
+    }
+
+    /// Walk 5f-r through the `Db` (ruling A-R108a, kernel 11fe5d6), and mutant 8: the `Db`
+    /// threads `dedup_retention` into every node's budgets. With a cap of 2, two applied puts
+    /// fill the dedup index and a third is `OVERLOADED`. The owner's trim duty frees both once
+    /// they age past a 300 ms retention. Resending the two originals runs them afresh, and each
+    /// fails its compiled condition: two `CONDITION_FAILED` answers refill the cap, and nothing
+    /// publishes after them. They age out by time alone, so a put then succeeds. Without the
+    /// retention in the budgets nothing ages for 24 h, and the trim wait fails.
+    /// Integration (~2 s): three node threads on wall-clock time, one trim tick.
+    #[test]
+    fn m9_s3k_04_db_condition_failures_free_the_cap() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            dedup_cap: Some(2),
+            dedup_retention: Some(Duration::from_millis(300)),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "before the first put");
+        let first = db.put(b"a", b"1", None).expect("put a=1");
+        let second = db.put(b"b", b"1", None).expect("put b=1");
+        let overloaded = |db: &Db, phase: &str| {
+            let refused = db.put(b"c", b"1", None).expect_err(phase);
+            assert_eq!(refused.error.name(), "OVERLOADED", "{phase}: {refused:?}");
+        };
+        overloaded(&db, "two applied entries fill a cap of 2");
+
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while [first.request, second.request]
+            .iter()
+            .any(|request| !matches!(db.status(*request, None), Ok(TxnStatus::Unknown)))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trim did not free both applied entries within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for original in [first, second] {
+            let failed = db
+                .resend(*original.sent)
+                .expect_err("a trimmed put runs afresh");
+            assert_eq!(failed.error.name(), "CONDITION_FAILED", "{failed:?}");
+        }
+        overloaded(&db, "two condition failures refill the cap");
+
+        let deadline = std::time::Instant::now() + patience;
+        let applied = loop {
+            match db.put(b"c", b"1", None) {
+                Ok(applied) => break applied,
+                Err(refused) => assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the condition failures did not age out within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            applied.seq,
+            Seq(4),
+            "the first write published after the failures"
+        );
+        db.shutdown();
     }
 
     #[test]

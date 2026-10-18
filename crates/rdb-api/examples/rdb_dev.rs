@@ -8,11 +8,12 @@
 //!
 //! `--dedup-cap N` lowers T1's dedup cap, the retained answers allowed before a new write is
 //! `OVERLOADED`, so a full index can be reached by hand. Above 65536 the open is refused.
-//! `--dedup-retention-ms N` keeps a published write's retained answer N ms instead of 24 h: the
-//! owner's trim duty then drops its dedup entry and status (`host_duty kind=trim`, once a
-//! second), so a full index frees up by hand. A `retry` of a trimmed request is no longer
-//! recognised and is sent afresh; every rdb_dev write carries a version condition, so it
-//! answers `CONDITION_FAILED` rather than applying twice.
+//! `--dedup-retention-ms N` keeps every retained answer N ms instead of 24 h. A published
+//! write's dedup entry and status go with the owner's trim duty (`host_duty kind=trim`, once a
+//! second). A `CONDITION_FAILED` answer goes N ms after it was given, even when nothing
+//! publishes after it, so a cap filled by condition failures alone also frees up by hand. A
+//! `retry` of a trimmed request is no longer recognised and is sent afresh; every rdb_dev write
+//! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
 //!
 //! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
 //! on spaces; `"..."` makes one word, so `""` is an empty object or value:
