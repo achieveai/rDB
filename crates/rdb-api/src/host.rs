@@ -6063,6 +6063,198 @@ mod tests {
         }
     }
 
+    /// M9 S3-5: the owner's trim duty lets a published write's retained answer go once it is
+    /// `dedup_retention_millis` old, never before (a 1.1 s look covers a trim tick, so a duty
+    /// that ignored the age would have trimmed). One `below` = the last aged seq + 1 covers
+    /// both writes, sent to T1 and P1 together: afterwards `status` is `Unknown` for both, and
+    /// a resend of the first is not replayed from the dedup index but runs afresh, where its
+    /// `Absent` condition fails. Only node 1 trims. Trio (~4 s): a 1.5 s retention.
+    #[config_log::retcd_test]
+    fn the_trim_duty_drops_both_retained_answers_once_they_age_and_not_before() {
+        const METHOD: &str =
+            "the_trim_duty_drops_both_retained_answers_once_they_age_and_not_before";
+        const RETENTION_MILLIS: u64 = 1_500;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = RETENTION_MILLIS;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let first = match trio.ask(compile(1, b"a", b"1")) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 1: {other:?}"),
+        };
+        let resend = |trio: &mut Trio| {
+            trio.ask(ClientCall::Resend {
+                request: first.clone(),
+            })
+        };
+        match resend(&mut trio) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("request 1: {other:?}"),
+        }
+        match trio.ask(put(2, b"b", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("request 2: {other:?}"),
+        }
+        let status = |trio: &mut Trio, request| {
+            trio.ask(ClientCall::Status {
+                identity: identity(request),
+                generation: None,
+            })
+        };
+
+        let looked = trio.clock.now().plus_millis(1_100);
+        trio.until("1.1 s, a trim tick", |trio| {
+            (trio.clock.now() >= looked).then_some(())
+        });
+        match status(&mut trio, 1) {
+            Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(2)),
+            other => panic!("status 1 inside the retention: {other:?}"),
+        }
+        match resend(&mut trio) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2), "replayed"),
+            other => panic!("resend 1 inside the retention: {other:?}"),
+        }
+
+        let trims = trio.until("node 1 trims below 4", |_| {
+            let trims = logged!(METHOD, "host_duty")
+                .into_iter()
+                .filter(|line| line["kind"] == "trim")
+                .collect::<Vec<_>>();
+            trims.iter().any(|line| line["below"] == 4).then_some(trims)
+        });
+        assert!(
+            trims
+                .iter()
+                .all(|line| line["node"] == 1 && line["generation"] == 1),
+            "{trims:?}"
+        );
+        assert_eq!(
+            trims.last().map(|line| line["below"] == 4),
+            Some(true),
+            "{trims:?}"
+        );
+        for request in [1, 2] {
+            match status(&mut trio, request) {
+                Answer::Status(TxnStatus::Unknown) => {}
+                other => panic!("status {request} after the trim: {other:?}"),
+            }
+        }
+        match resend(&mut trio) {
+            Answer::Error { error, .. } => {
+                assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
+            }
+            other => panic!("resend 1 after the trim runs afresh and fails: {other:?}"),
+        }
+    }
+
+    /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
+    /// applies request 3 with both links held, so it is committed and unpublished. Past the
+    /// retention it is still held, and the trim spares it. Once healed it publishes, and a
+    /// resend right away replays it from the dedup index. Once aged from its publication a
+    /// trim takes it, and a resend runs afresh and fails its condition. Aged from the commit,
+    /// the host would trim it while held, when T1 has no entry for it yet, and never again:
+    /// the entry would outlive the retention and the last resend would still replay.
+    /// Trio (~5 s): a 300 ms retention; each wait is the retention plus one trim period and a
+    /// margin, so a trim tick falls after the write has aged.
+    #[config_log::retcd_test]
+    fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = 300;
+        });
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        let held = match trio.ask(compile(3, b"b", b"1")) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 3: {other:?}"),
+        };
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let answer = trio.call(ClientCall::Resend {
+            request: held.clone(),
+        });
+        trio.until("node 1 applied request 3", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+        let healed = trio
+            .clock
+            .now()
+            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
+        trio.until("held past the retention and then a trim tick", |trio| {
+            (trio.clock.now() >= healed).then_some(())
+        });
+        trio.links.heal_all();
+        match trio.answer(&answer) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("request 3 after the heal: {other:?}"),
+        }
+        match trio.ask(ClientCall::Resend {
+            request: held.clone(),
+        }) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3), "replayed"),
+            other => panic!("resend 3 right after its publication: {other:?}"),
+        }
+        let aged = trio
+            .clock
+            .now()
+            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
+        trio.until("aged from its publication, then a trim tick", |trio| {
+            (trio.clock.now() >= aged).then_some(())
+        });
+        match trio.ask(ClientCall::Resend { request: held }) {
+            Answer::Error { error, .. } => {
+                assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
+            }
+            other => panic!("resend 3 once aged from its publication: {other:?}"),
+        }
+    }
+
+    /// U1 (ruling A-R109): a check A1 refuses is logged `authority_check_denied` with its
+    /// reason, which the client's refusal does not carry. The positive control for that line:
+    /// with the control store down, A1 still holds its grant but denies `ControlUnavailable`,
+    /// and a put's dispatch check is refused for that reason.
+    /// Trio (~2 s): bootstrap, then one store outage on a 100 ms renewal.
+    #[config_log::retcd_test]
+    fn a_dispatch_check_a1_denies_is_logged_with_its_reason() {
+        const METHOD: &str = "a_dispatch_check_a1_denies_is_logged_with_its_reason";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        assert!(logged!(METHOD, "authority_check_denied").is_empty());
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 stops admitting", |trio| {
+            (trio.status(0).admits != Some(true)).then_some(())
+        });
+        let refused = trio.ask(put(1, b"a", b"1", None));
+        trio.mem.stop_failing();
+        assert!(matches!(refused, Answer::Error { .. }), "{refused:?}");
+        let lines = trio.until("authority_check_denied", |_| {
+            let lines = logged!(METHOD, "authority_check_denied");
+            (!lines.is_empty()).then_some(lines)
+        });
+        assert!(
+            lines.iter().any(|line| line["node"] == 1
+                && line["checkpoint"] == "StorageDispatch"
+                && line["reason"] == "ControlUnavailable"),
+            "{lines:?}"
+        );
+    }
+
     /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
     /// `count_resend` calls touch its slot.
     const UNSENT: CopyId = CopyId(9);

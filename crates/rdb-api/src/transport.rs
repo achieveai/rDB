@@ -176,3 +176,71 @@ impl Links {
         self.lock().dropped.iter().copied().collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver};
+
+    /// A message `send` can carry, told apart by `detail`.
+    fn msg(detail: &str) -> Msg {
+        Msg::Fault {
+            boot: crate::host::BOOT,
+            kind: "probe",
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// What `rx` holds now, by detail.
+    fn got(rx: &Receiver<Msg>) -> Vec<String> {
+        rx.try_iter()
+            .map(|msg| match msg {
+                Msg::Fault { detail, .. } => detail,
+                other => panic!("not a probe: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// M9 S3-1, S3-1n and S3-1h: a dropped direction loses what is sent on it and still answers
+    /// `Ok`, so the sender learns of it only by its own timers (A-2). It is one direction: the
+    /// reverse still delivers. A heal of the pair lifts it from either end, and `heal_all`
+    /// lifts every drop as well as every hold (A-1). What a drop lost stays lost; what a hold
+    /// kept is delivered. Unit.
+    #[test]
+    fn a_dropped_direction_loses_silently_one_way_until_a_heal() {
+        let links = Links::new();
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (tx3, rx3) = mpsc::channel();
+        links.register(NodeId(1), tx1);
+        links.register(NodeId(2), tx2);
+        links.register(NodeId(3), tx3);
+
+        links.drop_direction(NodeId(2), NodeId(1));
+        assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack lost")), Ok(()));
+        assert_eq!(links.send(NodeId(1), NodeId(2), msg("frame")), Ok(()));
+        assert_eq!(got(&rx1), Vec::<String>::new(), "2->1 is dropped");
+        assert_eq!(got(&rx2), ["frame"], "1->2 still delivers");
+        assert_eq!(links.dropped(), [(NodeId(2), NodeId(1))]);
+
+        assert_eq!(
+            links.heal(NodeId(1), NodeId(2)),
+            0,
+            "a drop buffers nothing"
+        );
+        assert_eq!(links.dropped(), [], "healed from the other end");
+        assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack")), Ok(()));
+        assert_eq!(got(&rx1), ["ack"]);
+
+        links.drop_direction(NodeId(3), NodeId(1));
+        links.hold(NodeId(1), NodeId(2));
+        assert_eq!(links.send(NodeId(3), NodeId(1), msg("lost")), Ok(()));
+        assert_eq!(links.send(NodeId(1), NodeId(2), msg("held")), Ok(()));
+        assert_eq!(links.heal_all(), 1, "only the held frame is delivered");
+        assert_eq!((links.held(), links.dropped()), (vec![], vec![]));
+        assert_eq!(got(&rx2), ["held"]);
+        assert_eq!(links.send(NodeId(3), NodeId(1), msg("after")), Ok(()));
+        assert_eq!(got(&rx1), ["after"], "the lost one stays lost");
+        assert_eq!(got(&rx3), Vec::<String>::new());
+    }
+}
