@@ -94,6 +94,13 @@
 //! control fail list <unavailable|deadline|notleader|invalid|off>
 //!                                         every list the Db's store sends answers that error,
 //!                                         until `off`. `control` reads are not affected
+//! control fail put <prefix> <lose-reply|drop|off> [n]
+//!                                         the next n puts (default 1) the Db's store sends
+//!                                         under <prefix>, such as `grants/` or
+//!                                         `partitions/`, answer `DeadlineExceededUnknownOutcome`:
+//!                                         `lose-reply` after rEtcd applied the put, `drop`
+//!                                         without sending it. Then the fault is spent; `off`
+//!                                         ends it sooner
 //! control lifecycle <p> <serving|fencing|drained>
 //!                                         rewrite partitions/<p>'s lifecycle on the rEtcd
 //!                                         leader, at its revision. Put `serving` back after
@@ -165,7 +172,7 @@ use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
 
-use hostile_store::{HostileStore, ListFault};
+use hostile_store::{HostileStore, ListFault, PutFault};
 
 /// The control voters' Raft timers. Faster than the harness default, whose failover can outlast
 /// A1's write horizon (walk 1L): `tests::control_failover_millis` is 1000 ms here, 3000 ms there.
@@ -995,7 +1002,20 @@ fn repl<'scope, 'env>(
                 control.store.fail_lists(fault);
                 say(&format!("fail list {word}"));
             }),
-            ["control", "fail", ..] => Err(format!("control fail list <{}>", ListFault::WORDS)),
+            ["control", "fail", "put", prefix, word, rest @ ..] => {
+                parse_put_fault(word, rest).map(|(fault, count)| {
+                    control.store.fail_puts(prefix, fault, count);
+                    say(&match fault {
+                        Some(_) => format!("fail put {prefix} {word} {count}"),
+                        None => format!("fail put {prefix} off"),
+                    });
+                })
+            }
+            ["control", "fail", ..] => Err(format!(
+                "control fail list <{}> | control fail put <prefix> <{}> [n]",
+                ListFault::WORDS,
+                PutFault::WORDS
+            )),
             ["control", verb @ ("stop" | "start"), voter] => parse_voter(control.cluster, voter)
                 .map(|voter| {
                     say(&if *verb == "stop" {
@@ -1195,6 +1215,29 @@ fn parse_op(op: &str) -> Result<TxnOp, String> {
         value: value.to_owned(),
         if_version,
     })
+}
+
+/// `control fail put <prefix> <word> [n]`'s fault and count: at least one put, 1 by default.
+fn parse_put_fault(word: &str, rest: &[&str]) -> Result<(Option<PutFault>, u64), String> {
+    let fault = PutFault::parse(word)?;
+    let count = match rest {
+        [] => 1,
+        [n] => match n.parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                return Err(format!(
+                    "control fail put: n is a count of 1 or more, not {n:?}"
+                ))
+            }
+        },
+        _ => {
+            return Err(format!(
+                "control fail put <prefix> <{}> [n]",
+                PutFault::WORDS
+            ))
+        }
+    };
+    Ok((fault, count))
 }
 
 fn is_digits(text: &str) -> bool {

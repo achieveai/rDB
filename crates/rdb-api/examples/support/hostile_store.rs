@@ -18,13 +18,20 @@
 //! * [`HostileStore::fail_lists`] answers every `list` with one error until turned off
 //!   (`control fail list`), without reaching a voter, so the answer moves no binding.
 //!
+//! And one for scenario S3, a control-store reply that gets lost:
+//!
+//! * [`HostileStore::fail_puts`] arms a [`PutFault`] for the next `n` puts whose key starts
+//!   with a prefix (`control fail put`). Each matched put answers
+//!   `DeadlineExceededUnknownOutcome`: after the voter applied it (`lose-reply`), or without
+//!   sending it (`drop`). The count runs out, so the fault always ends by itself.
+//!
 //! It holds the cluster weakly, so `rdb_dev` can still take the cluster back to shut it down.
 //! Example-only: the product's Db takes any `ConfigStore` and knows nothing of voters.
 //!
 //! Written out by hand, as `src/test_store.rs` is, because `async-trait` is not a dependency of
 //! this crate.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -88,6 +95,40 @@ impl ListFault {
     }
 }
 
+/// What `control fail put` does to a matched put. Both answer `DeadlineExceededUnknownOutcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutFault {
+    /// The voter applies the put; its answer is lost.
+    LoseReply,
+    /// The put never reaches a voter.
+    Drop,
+}
+
+impl PutFault {
+    /// The words `control fail put <prefix>` takes; `off` is `None`.
+    pub const WORDS: &'static str = "lose-reply|drop|off";
+
+    /// `control fail put <prefix> <word>`: `Some` fault, or `None` for `off`.
+    pub fn parse(word: &str) -> Result<Option<Self>, String> {
+        match word {
+            "lose-reply" => Ok(Some(Self::LoseReply)),
+            "drop" => Ok(Some(Self::Drop)),
+            "off" => Ok(None),
+            other => Err(format!(
+                "control fail put <prefix> <{}> [n], not {other:?}",
+                Self::WORDS
+            )),
+        }
+    }
+
+    const fn word(self) -> &'static str {
+        match self {
+            Self::LoseReply => "lose-reply",
+            Self::Drop => "drop",
+        }
+    }
+}
+
 /// Which voter the store talks to, and the voters it must not move to.
 struct Binding {
     voter: VoterId,
@@ -103,6 +144,8 @@ pub struct HostileStore {
     binding: Mutex<Binding>,
     /// The fault every `list` answers, while set.
     list_fault: Mutex<Option<ListFault>>,
+    /// Armed put faults by key prefix, each with the puts it has left.
+    put_faults: Mutex<BTreeMap<Vec<u8>, (PutFault, u64)>>,
     /// Bumped by [`HostileStore::drop_watches`]; every stream handed out ends on the next bump.
     ends: watch::Sender<u64>,
 }
@@ -135,6 +178,7 @@ impl HostileStore {
                 stopping: BTreeSet::new(),
             }),
             list_fault: Mutex::new(None),
+            put_faults: Mutex::new(BTreeMap::new()),
             ends: watch::channel(0).0,
         }
     }
@@ -240,6 +284,47 @@ impl HostileStore {
         tracing::info!(fault = ?fault, "control_store_fail_lists");
     }
 
+    /// `control fail put <prefix> <word> [n]`: the next `n` puts under `prefix` take `fault`,
+    /// then the fault is spent; `None` disarms `prefix` now. Re-arming a prefix replaces its
+    /// fault and count.
+    pub fn fail_puts(&self, prefix: &str, fault: Option<PutFault>, count: u64) {
+        let mut faults = self
+            .put_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match fault {
+            Some(fault) => faults.insert(prefix.as_bytes().to_vec(), (fault, count)),
+            None => faults.remove(prefix.as_bytes()),
+        };
+        tracing::info!(
+            prefix,
+            fault = fault.map(PutFault::word),
+            count,
+            "control_store_fail_puts"
+        );
+    }
+
+    /// The fault `key` takes, if an armed prefix matches it; that prefix's count goes down by
+    /// one, and the arm goes when it reaches zero.
+    fn put_fault(&self, key: &[u8]) -> Option<PutFault> {
+        let mut faults = self
+            .put_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prefix = faults
+            .keys()
+            .find(|prefix| key.starts_with(prefix))
+            .cloned()?;
+        let (fault, left) = faults.get_mut(&prefix)?;
+        let fault = *fault;
+        *left -= 1;
+        if *left == 0 {
+            faults.remove(&prefix);
+            tracing::info!(prefix = %String::from_utf8_lossy(&prefix), "control_store_put_fault_spent");
+        }
+        Some(fault)
+    }
+
     /// `control drop-watches`: end every watch stream this store handed out. Each ends as a
     /// plain end of stream, which the Db reads as `Unavailable` and re-watches from its cursor.
     /// Returns how many were open.
@@ -299,7 +384,34 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
-        self.through(move |store| store.put(request))
+        let Some(fault) = self.put_fault(&request.key) else {
+            return self.through(move |store| store.put(request));
+        };
+        let key = String::from_utf8_lossy(&request.key).into_owned();
+        let expected = request.expected_mod_revision;
+        let sent = match fault {
+            PutFault::LoseReply => Some(self.through(move |store| store.put(request))),
+            PutFault::Drop => None,
+        };
+        Box::pin(async move {
+            let applied = match sent {
+                Some(sent) => match sent.await {
+                    Ok(response) => {
+                        format!("{:?} revision={}", response.outcome, response.revision)
+                    }
+                    Err(error) => format!("error {error}"),
+                },
+                None => "not sent".to_owned(),
+            };
+            tracing::info!(
+                key,
+                expected,
+                fault = fault.word(),
+                applied,
+                "control_store_put_failed"
+            );
+            Err(ConfigError::DeadlineExceededUnknownOutcome)
+        })
     }
 
     fn delete<'a, 'b>(&'a self, request: DeleteRequest) -> Reply<'b, MutationResponse>
