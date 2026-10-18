@@ -671,4 +671,87 @@ mod tests {
         let cluster = Arc::try_unwrap(cluster).expect("the only handle");
         rt.block_on(cluster.shutdown());
     }
+
+    /// M9 S3-3/S3-4 (`control fail put`): `lose-reply` applies the put and loses its answer;
+    /// `drop` never sends it; both answer `DeadlineExceededUnknownOutcome`. An arm covers only
+    /// its prefix and is spent after `n` puts, then puts go through again. One in-memory
+    /// cluster, well under a second.
+    #[test]
+    fn a_put_fault_loses_or_drops_n_puts_under_its_prefix_then_is_spent() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = Arc::new(
+            rt.block_on(
+                Cluster::builder()
+                    .nodes(3)
+                    .storage(StorageKind::Ephemeral)
+                    .start(),
+            ),
+        );
+        let leader = rt.block_on(cluster.leader());
+        let store = HostileStore::new(&cluster, leader);
+        let put = |key: &'static [u8], value: &'static [u8]| {
+            rt.block_on(store.put(PutRequest {
+                key: Bytes::from_static(key),
+                value: Bytes::from_static(value),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+        };
+        let value = |key: &'static [u8]| {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from_static(key),
+            }))
+            .expect("get")
+            .record
+            .map(|record| record.value)
+        };
+        let unknown = |answer: Result<MutationResponse, ConfigError>, what: &str| {
+            assert!(
+                matches!(answer, Err(ConfigError::DeadlineExceededUnknownOutcome)),
+                "{what}: {answer:?}"
+            );
+        };
+
+        assert_eq!(
+            ["lose-reply", "drop", "off"].map(|word| PutFault::parse(word).expect("a word")),
+            [Some(PutFault::LoseReply), Some(PutFault::Drop), None]
+        );
+        assert!(PutFault::parse("bogus").is_err());
+
+        store.fail_puts("grants/", Some(PutFault::LoseReply), 1);
+        assert!(
+            put(b"partitions/1", b"p").is_ok(),
+            "another prefix goes through"
+        );
+        unknown(put(b"grants/1", b"one"), "lose-reply");
+        assert_eq!(
+            value(b"grants/1"),
+            Some(Bytes::from_static(b"one")),
+            "applied"
+        );
+        assert!(put(b"grants/1", b"two").is_ok(), "spent after 1");
+
+        store.fail_puts("grants/", Some(PutFault::Drop), 2);
+        unknown(put(b"grants/1", b"three"), "drop, first");
+        unknown(put(b"grants/1", b"four"), "drop, second");
+        assert_eq!(
+            value(b"grants/1"),
+            Some(Bytes::from_static(b"two")),
+            "never sent"
+        );
+        assert!(put(b"grants/1", b"five").is_ok(), "spent after 2");
+
+        store.fail_puts("grants/", Some(PutFault::Drop), 5);
+        store.fail_puts("grants/", None, 0);
+        assert!(put(b"grants/1", b"six").is_ok(), "off disarms at once");
+        assert_eq!(value(b"grants/1"), Some(Bytes::from_static(b"six")));
+
+        drop(store);
+        let cluster = Arc::try_unwrap(cluster).expect("the only handle");
+        rt.block_on(cluster.shutdown());
+    }
 }

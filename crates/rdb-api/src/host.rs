@@ -5999,6 +5999,54 @@ mod tests {
         assert_eq!(host.fault, None);
     }
 
+    /// M9 S3-2: the owner publishes a write after its caller stopped waiting. The answer has
+    /// nowhere to go, so the host logs `reply_undelivered` once, naming the node and request,
+    /// and does not fault; `status` with the same id then settles it at the seq it published.
+    /// Trio (~2 s): the hold keeps the write unpublished until the caller is gone.
+    #[config_log::retcd_test]
+    fn a_write_published_after_its_caller_left_is_logged_undelivered_and_status_settles_it() {
+        const METHOD: &str =
+            "a_write_published_after_its_caller_left_is_logged_undelivered_and_status_settles_it";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        drop(trio.call(put(2, b"a", b"2", None)));
+        trio.until("node 1 applied request 2", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+        assert!(
+            logged!(METHOD, "reply_undelivered").is_empty(),
+            "not yet published"
+        );
+
+        trio.links.heal_all();
+        let lines = trio.until("reply_undelivered", |_| {
+            let lines = logged!(METHOD, "reply_undelivered");
+            (!lines.is_empty()).then_some(lines)
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0]["node"] == 1 && lines[0]["request"] == 2,
+            "{lines:?}"
+        );
+        match trio.ask(ClientCall::Status {
+            identity: identity(2),
+            generation: None,
+        }) {
+            Answer::Status(TxnStatus::Resolved(result)) => {
+                assert_eq!((result.generation, result.seq), (Generation(1), Seq(3)));
+            }
+            other => panic!("status of request 2: {other:?}"),
+        }
+    }
+
     /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct
     /// `count_resend` calls touch its slot.
     const UNSENT: CopyId = CopyId(9);
