@@ -109,7 +109,9 @@ Read by Codex, GitHub Copilot, Hermes and other agents. Claude Code reads it thr
   flush.** `config_log::layer::test_file_path` and every `config_testkit::logs` helper flush
   first. A reader that finds a log file some other way (walking the run directory, say) calls
   `config_log::layer::flush_test_logs()` before reading. `#[retcd_test]` flushes again when
-  the test ends, after an async test's runtime has shut down, so nothing is lost at exit.
+  the test ends, after an async test's runtime has shut down, so nothing queued is lost when a
+  test ends normally. Lines still queued are lost if the process aborts, calls exit, or is
+  killed.
   Before 2026-10-12 the layer wrote inline under one process-wide lock. One append that
   stalled for 2.2–2.8 s on this host then froze every cluster in the binary, and
   `m4_watch_cluster` lost 10–12 rows at once to `deadline exceeded`.

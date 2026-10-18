@@ -115,6 +115,8 @@ pub fn init_test_logging() {
 /// down (whose tasks still log), and during unwinding after a panic. It drops inside the test
 /// function, before libtest has the result, so the binary cannot exit while it is flushing.
 /// Without it, the lines still queued when the binary's last test returns are lost at exit.
+/// It runs only when the test function returns or unwinds: lines still queued are lost if the
+/// process aborts, calls `exit`, or is killed.
 ///
 /// It is a plain local, never a thread-local: a thread-local destructor runs under the Windows
 /// loader lock, and one that waits on the writer stops every thread in the process from
