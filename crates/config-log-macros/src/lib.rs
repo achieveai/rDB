@@ -7,10 +7,10 @@
 //! #[retcd_test]                       // sync test
 //! fn puts_then_gets() { ... }
 //!
-//! #[retcd_test]                       // async test -> #[tokio::test]
+//! #[retcd_test]                       // async test, on a current-thread Tokio runtime
 //! async fn cluster_forms() { ... }
 //!
-//! #[retcd_test(flavor = "multi_thread", worker_threads = 4)]   // args forwarded to tokio::test
+//! #[retcd_test(flavor = "multi_thread", worker_threads = 4)]   // args forwarded to the runtime
 //! async fn heavy() { ... }
 //! ```
 
@@ -30,19 +30,36 @@ pub fn retcd_test(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &input.attrs;
     let is_async = sig.asyncness.is_some();
 
+    // Every expansion makes `FlushTestLogsOnDrop` its first local, so it drops last. For an
+    // async test that has to be after the runtime shuts down, and `#[tokio::test]` builds and
+    // drops the runtime inside the function it generates, leaving nowhere to put it. So the
+    // body runs in an inner `#[tokio::main]` function and the outer one is a plain `#[test]`.
+    // `tokio::main` defaults to the multi-thread flavor where `tokio::test` defaults to
+    // current-thread, so keep the test default unless the arguments name a flavor.
     let expanded = if is_async {
-        let test_attr = if attr2.is_empty() {
-            quote! { #[tokio::test] }
+        let rt_args = if attr2.to_string().contains("flavor") {
+            attr2
+        } else if attr2.is_empty() {
+            quote! { flavor = "current_thread" }
         } else {
-            quote! { #[tokio::test(#attr2)] }
+            quote! { flavor = "current_thread", #attr2 }
         };
+        let mut outer_sig = sig.clone();
+        outer_sig.asyncness = None;
+        let output = &sig.output;
         quote! {
             #(#attrs)*
-            #test_attr
-            #vis #sig {
-                let __retcd_span = ::config_log::testing::test_span(module_path!(), #name_str);
-                let __retcd_fut = async move #block;
-                ::config_log::testing::run_instrumented(__retcd_span, __retcd_fut).await
+            #[test]
+            #vis #outer_sig {
+                #[tokio::main(#rt_args)]
+                async fn __retcd_body() #output {
+                    let __retcd_span =
+                        ::config_log::testing::test_span(module_path!(), #name_str);
+                    let __retcd_fut = async move #block;
+                    ::config_log::testing::run_instrumented(__retcd_span, __retcd_fut).await
+                }
+                let __retcd_flush = ::config_log::testing::FlushTestLogsOnDrop;
+                __retcd_body()
             }
         }
     } else {
@@ -50,6 +67,7 @@ pub fn retcd_test(attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#attrs)*
             #[test]
             #vis #sig {
+                let __retcd_flush = ::config_log::testing::FlushTestLogsOnDrop;
                 let __retcd_span = ::config_log::testing::test_span(module_path!(), #name_str);
                 let __retcd_guard = __retcd_span.enter();
                 let __retcd_result = (move || #block)();

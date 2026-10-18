@@ -5593,6 +5593,8 @@ fn m7b_137_sync_after_commit_a_new_generation_sync_flushes_its_inherited_base_on
 
 /// This test's own log lines that contain `needle`.
 fn own_log_lines(method: &str, needle: &str) -> Vec<String> {
+    // Found by walking the run directory, not through `test_file_path`, so flush here.
+    config_log::layer::flush_test_logs();
     fn walk(dir: &std::path::Path, file: &str, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;

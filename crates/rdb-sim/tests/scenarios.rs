@@ -1754,8 +1754,9 @@ fn fixture_dir(row: &str) -> std::path::PathBuf {
         .join(row)
 }
 
-/// This row's own log lines named `message`, read back from its JSONL file. `config-log` writes
-/// with a blocking append, so every line the row emitted is on disk when this runs.
+/// This row's own log lines named `message`, read back from its JSONL file.
+/// `test_file_path` flushes `config-log`'s writer first, so every line the row emitted is on
+/// disk when this runs.
 fn own_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
     let path = config_log::layer::test_file_path(
         &config_log::testing::test_log_dir(),
