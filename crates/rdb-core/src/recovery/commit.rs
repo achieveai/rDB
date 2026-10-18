@@ -7,11 +7,17 @@
 //! `CasOutcome::Conflict` does not carry the record, so a conflict is classified by one re-read
 //! (`ControlEffect::Get`) — the design's "no second read is needed" assumed a shape that did not
 //! land (contract ask Q2). `Conflict` is definitive: our comparison failed and exactly one racer
-//! committed; a lost response comes back `Unknown`, never `Conflict`. So the re-read never lands
-//! our CAS and never re-proposes (lead rulings F-f, B-R41; F-g, B-R45). A record at an epoch newer
-//! than the one we superseded, or identical to our proposal, is a peer's decision; anything else,
-//! `Absent` and unreadable bytes included, is contention. A blind retry never happens:
-//! `Unavailable` and `Unknown` block.
+//! committed; a lost response comes back `Unknown`, never `Conflict`. So a conflict's re-read
+//! never lands our CAS and never re-proposes (lead rulings F-f, B-R41; F-g, B-R45). A record at an
+//! epoch newer than the one we superseded, or identical to our proposal, is a peer's decision;
+//! anything else, `Absent` and unreadable bytes included, is contention. A blind retry never
+//! happens: `Unavailable` and `Unknown` block the recovery CAS.
+//!
+//! One exception, for the activation CAS only (ruling A-R102 and its addendum, W10-D1): after
+//! `Unknown` or `Unavailable` it is resolved by a read, then the same CAS at the revision the read found our own bytes at
+//! ([`Cas::ours_at`], [`Cas::repropose`]). Nothing lands on a read; only that CAS's `Committed`
+//! does. Any other record on that read still goes through [`Cas::on_read`]. The recovery CAS
+//! stays terminal: its record binds no run id, so our bytes cannot be told from a peer's (F-g).
 //!
 //! Every request carries a fresh [`ControlRequestId`] from [`Requests`], and only an answer
 //! echoing the outstanding one is this proposal's (lead ledger L-R177hs): a re-run's CAS and an
@@ -121,6 +127,44 @@ impl Cas {
         ControlEffect::Get {
             request,
             key: key(self.record.partition),
+        }
+    }
+
+    /// Resolving an `Unknown` activation (ruling A-R102): read the record under `request`, which
+    /// is outstanding from now. Its answer is a `Value`, as a conflict's re-read is.
+    pub(crate) fn resolve_read(&mut self, request: ControlRequestId) -> ControlEffect {
+        self.rereading = true;
+        self.read_effect(request)
+    }
+
+    /// Resolving (ruling A-R102): propose the same record again, conditioned on `expected`, the
+    /// revision our own bytes were read at, under `request`. Only its `Committed` lands.
+    pub(crate) fn repropose(
+        &mut self,
+        request: ControlRequestId,
+        expected: Revision,
+    ) -> ControlEffect {
+        self.rereading = false;
+        self.request = request;
+        self.effect(expected)
+    }
+
+    /// Bound the exchange by a fresh `deadline`: each resolving attempt has its own (A-R102).
+    pub(crate) fn retime(&mut self, deadline: Tick) {
+        self.deadline = deadline;
+    }
+
+    /// The revision `outcome` holds this proposal's own record at, when that is at or above
+    /// `floor`. Resolving (A-R102) proposes again at it; it never lands on it.
+    pub(crate) fn ours_at(&self, outcome: &ReadOutcome, floor: Revision) -> Option<Revision> {
+        match outcome {
+            ReadOutcome::Found { revision, value }
+                if *revision >= floor
+                    && PartitionRecord::decode(value).is_some_and(|read| read == self.record) =>
+            {
+                Some(*revision)
+            }
+            _ => None,
         }
     }
 

@@ -1730,9 +1730,11 @@ fn a_lost_copy_stalls_the_rebuild_and_never_shrinks_it() {
     assert_eq!(f1.cas_count(), 1);
 }
 
-/// The activation CAS answers the same four arms: `Unknown` blocks.
+/// The activation CAS answers the same four arms, except `Unknown` (ruling A-R102, W10-D1): it
+/// still reports `BlockPromotion{ControlUnknown}`, but the activation resolves by reading
+/// `partitions/{p}` at once, bounded by a fresh window, instead of blocking for good.
 #[retcd_test]
-fn an_unknown_activation_blocks() {
+fn an_unknown_activation_resolves_by_reading() {
     let mut f1 = lone_committed();
     f1.rec(
         4_000,
@@ -1747,12 +1749,13 @@ fn an_unknown_activation_blocks() {
     }
     assert_eq!(
         f1.step(4_200, cas_result(CasOutcome::Unknown)),
-        vec![block(BlockReason::ControlUnknown)]
+        vec![
+            block(BlockReason::ControlUnknown),
+            get(),
+            arm(6, 4_200 + WINDOW)
+        ]
     );
-    assert_eq!(
-        f1.phase(),
-        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
-    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
 }
 
 /// Committed and fully protected: rebuild inputs have nothing to act on.
@@ -3998,7 +4001,9 @@ fn m7b_128_copy_lost_during_rebuilding_stalls_loudly_and_never_shrinks_required(
 /// M7B-146 (D §5.1 `Unknown` arm: the CAS is more likely to have landed, so a blind retry is
 /// worse; ADR 0009 §5): `ControlUnknown`, by value distinct from `ControlUnavailable`, with no CAS
 /// and no re-proposal short of a fresh fence. Twin of M7B-109 by the outcome arm. The activation
-/// CAS answers `Unknown` the same way: no activation over a CAS that may have landed.
+/// CAS's `Unknown` is amended by ruling A-R102 (W10-D1): it reports the same fact, then resolves
+/// by reading `partitions/{p}`. It never activates and never re-proposes blind: only a read of
+/// our own bytes leads to a CAS, and only that CAS's `Committed` lands (rows `w10_d1_*`).
 #[retcd_test]
 fn m7b_146_cas_unknown_blocks_and_is_the_worse_case_to_retry() {
     assert_ne!(BlockReason::ControlUnknown, BlockReason::ControlUnavailable);
@@ -4006,15 +4011,16 @@ fn m7b_146_cas_unknown_blocks_and_is_the_worse_case_to_retry() {
     let (mut f1, _) = activating();
     assert_eq!(
         f1.step(4_200, cas_result(CasOutcome::Unknown)),
-        vec![block(BlockReason::ControlUnknown)]
+        vec![
+            block(BlockReason::ControlUnknown),
+            get(),
+            arm(6, 4_200 + WINDOW)
+        ]
     );
-    assert_eq!(
-        f1.phase(),
-        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
-    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
     assert_eq!(
         f1.rec(4_300, durable(C, 20, dg(0, 20))),
-        vec![ign(ReplicaIgnoreReason::RecoveryBlocked)]
+        vec![ign(ReplicaIgnoreReason::OutOfPhase)]
     );
     assert_eq!(f1.cas_count(), 2, "the recovery CAS and one activation CAS");
     assert_eq!(f1.log.iter().filter(|e| is_recovered(e)).count(), 1);
@@ -6039,19 +6045,22 @@ fn m7b_240_a_lost_cas_completion_is_bounded_by_the_discovery_timer() {
     assert_eq!(steps, fresh_steps, "M7B-240: the second run is a fresh one");
     assert_eq!(result, fresh_result, "M7B-240");
 
-    // Activation with nothing held: blocked, and only a fresh fence moves it.
+    // Activation with nothing held: amended by ruling A-R102 (W10-D1). The same fact, then the
+    // activation resolves by reading, and the activation CAS's own late answer moves nothing.
     let mut f1 = activation_proposed();
+    let activation = *f1.requests.last().expect("the activation CAS");
     assert_eq!(
         f1.step(deadline, fired(5)),
-        vec![block(BlockReason::ControlUnknown)]
+        vec![
+            block(BlockReason::ControlUnknown),
+            get(),
+            arm(6, deadline + WINDOW)
+        ]
     );
-    assert_eq!(
-        f1.phase(),
-        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
-    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
     f1.ignores_late(
         deadline + 1,
-        cas_result(CasOutcome::Committed(Revision(11))),
+        cas_result_for(activation, CasOutcome::Committed(Revision(11))),
     );
 
     // The recovery CAS.
@@ -6334,4 +6343,538 @@ fn m9_k1_01_a_degraded_commit_at_cutoff_one_does_not_pin() {
         f1.rec(4_000, caught_up(C, 1, dg(0, 1))),
         vec![sync(A, 1), sync(B, 1), sync(C, 1), arm(4, 4_000 + WINDOW)]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// W10-D1 (Walk 10, 2026-10-13; ruling A-R102): the activation CAS went unanswered while the
+// store had lost quorum, its deadline blocked F1 with `ControlUnknown`, and the write still
+// landed once quorum came back. Nothing in M9 fences the owner's own partition, so the block
+// never lifted. Under A-R102 an `Unknown` activation resolves instead: F1 reads
+// `partitions/{p}` and, on its own commit bytes at `r`, proposes the same CAS at `r`. Only a
+// `Committed` answer lands. The recovery CAS is out of scope and still blocks for good.
+// ---------------------------------------------------------------------------------------------
+
+/// The resolving read F1 sends, its id shown as [`LATEST`].
+fn get() -> EffectKind {
+    EffectKind::Control(ControlEffect::Get {
+        request: LATEST,
+        key: ControlKey::Partition(PARTITION),
+    })
+}
+
+/// The store's answer to a read: `value` at `revision`.
+fn found_at(revision: u64, value: Bytes) -> EventKind {
+    read_result(ReadOutcome::Found {
+        revision: Revision(revision),
+        value,
+    })
+}
+
+/// Our own commit bytes, which the activation CAS writes again (commit at revision 9).
+fn ours() -> Bytes {
+    record(A).encode()
+}
+
+/// A `CasResult` echoing the raw request id `request`, not the newest one.
+fn cas_result_for(request: ControlRequestId, outcome: CasOutcome) -> EventKind {
+    EventKind::Control(ControlEvent::CasResult {
+        request,
+        key: ControlKey::Partition(PARTITION),
+        outcome,
+    })
+}
+
+/// A `Value` echoing the raw request id `request`, not the newest one.
+fn read_result_for(request: ControlRequestId, outcome: ReadOutcome) -> EventKind {
+    EventKind::Control(ControlEvent::Value {
+        request,
+        key: ControlKey::Partition(PARTITION),
+        outcome,
+    })
+}
+
+/// The activation's deadline: [`activation_proposed`] sent it at 4_100.
+const ACTIVATION_DEADLINE: u64 = 4_100 + WINDOW;
+
+/// [`activation_proposed`], unanswered at its deadline: the `BlockPromotion{ControlUnknown}` fact,
+/// then at once the first resolving read, bounded by a fresh window (timer v6).
+fn resolving() -> F1 {
+    let mut f1 = activation_proposed();
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE, fired(5)),
+        vec![
+            block(BlockReason::ControlUnknown),
+            get(),
+            arm(6, ACTIVATION_DEADLINE + WINDOW)
+        ],
+        "A-R102: an unanswered activation resolves by reading"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    f1
+}
+
+fn recovered_count(f1: &F1) -> usize {
+    f1.log.iter().filter(|e| is_recovered(e)).count()
+}
+
+/// An activation blocked by its own deadline, then a store that answers again, at once: every
+/// `Get` F1 sends from here is told `partitions/{p}` holds `value` at `revision`, and every CAS F1
+/// sends lands one revision above what it expected. A timer F1 arms is fired at its deadline only
+/// once nothing it asked is left unanswered; with no timer armed, the next window's fire is
+/// offered anyway. Returns the `Recovered` F1 emitted, if any.
+///
+/// (Round 12 red fired each timer as soon as it was armed, ahead of the answers to requests sent
+/// in the same step. That is not a prompt store, and it abandoned every request it answered.)
+fn blocked_activation_then_store_answers(
+    revision: Revision,
+    value: Bytes,
+) -> (F1, Option<RecoveryResult>) {
+    let mut f1 = activation_proposed();
+    let deadline = ACTIVATION_DEADLINE;
+    let mut effects = f1.step(deadline, fired(5));
+    assert_eq!(
+        effects.first(),
+        Some(&block(BlockReason::ControlUnknown)),
+        "W10-D1: the unanswered activation still reports BlockPromotion{{ControlUnknown}}"
+    );
+    effects.remove(0);
+    let mut recovered = None;
+    let mut armed = None;
+    let mut now = deadline;
+    for _ in 0..12 {
+        let mut next = Vec::new();
+        for effect in effects.drain(..) {
+            match effect {
+                EffectKind::Control(ControlEffect::Get { .. }) => {
+                    next.extend(f1.step(
+                        now,
+                        read_result(ReadOutcome::Found {
+                            revision,
+                            value: value.clone(),
+                        }),
+                    ));
+                }
+                EffectKind::Control(ControlEffect::Cas {
+                    expected: Some(expected),
+                    ..
+                }) => {
+                    next.extend(f1.step(
+                        now,
+                        cas_result(CasOutcome::Committed(Revision(expected.0 + 1))),
+                    ));
+                }
+                EffectKind::Timer(TimerEffect::Arm { version, at, .. }) => {
+                    armed = Some((version.0, at.0));
+                }
+                EffectKind::Kernel(KernelEffect::Recovered(result)) => recovered = Some(*result),
+                _ => {}
+            }
+        }
+        if recovered.is_some() {
+            break;
+        }
+        if next.is_empty() {
+            let (version, at) = armed.take().unwrap_or((6, now + WINDOW));
+            now = at;
+            next.extend(f1.step(now, fired(version)));
+        }
+        effects = next;
+    }
+    (f1, recovered)
+}
+
+/// W10-D1 (A-R102): the activation landed while F1 waited. Once the store answers it holds F1's
+/// own commit bytes at revision 16, so F1 proposes the same CAS at 16, and only that CAS's
+/// `Committed` (17) activates. F1 ends `Committed` with `mode: Active`, not blocked for good.
+/// (Round 12 red asserted revision 16; A-R102 takes the critic's A1, so no arm lands on a read
+/// and the revision is the re-sent CAS's.)
+#[retcd_test]
+fn w10_d1_a_landed_activation_is_found_once_the_store_answers() {
+    let (f1, recovered) = blocked_activation_then_store_answers(Revision(16), ours());
+    let result =
+        recovered.expect("W10-D1: F1 stays Blocked(ControlUnknown) after the store answers");
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, Revision(17));
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+    assert!(
+        f1.log.contains(&cas(Revision(16), A)),
+        "W10-D1: the same CAS at the revision read"
+    );
+    assert_eq!(
+        f1.cas_count(),
+        3,
+        "recovery, activation, and one re-sent CAS"
+    );
+}
+
+/// W10-D1 guard (A-R102, critic A2): the activation may have landed, but another lineage has
+/// decided since. Its bytes go through `Cas::on_read`: a newer epoch is `OvertakenByPeer`, and F1
+/// never goes `Active` on it or proposes over it.
+#[retcd_test]
+fn w10_d1_a_peers_decision_after_a_blocked_activation_never_activates() {
+    let peer = PartitionRecord {
+        owner: NodeId(9),
+        generation: Generation(9),
+        owner_epoch: OwnerEpoch(3),
+        ..record(A)
+    };
+    let (f1, recovered) = blocked_activation_then_store_answers(Revision(17), peer.encode());
+    assert_eq!(recovered, None, "W10-D1: no Recovered on a peer's decision");
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+    assert_eq!(
+        f1.cas_count(),
+        2,
+        "W10-D1: the recovery CAS and the activation, never re-proposed over a peer"
+    );
+}
+
+/// W10-D1 row 3 (A-R102 M4): the record is still at the commit revision with our bytes. Exactly
+/// one CAS at that revision; a `Conflict` reads again and never lands; its `Unknown` answers one
+/// `Outstanding` and returns to resolving, with no `Recovered` and no terminal block; so does
+/// its deadline, which abandons it. Only a `Committed` answer lands.
+#[retcd_test]
+fn w10_d1_a_resent_activation_lands_only_on_its_committed() {
+    let mut f1 = resolving();
+    let t = ACTIVATION_DEADLINE + 10;
+    assert_eq!(f1.step(t, found_at(9, ours())), vec![cas(Revision(9), A)]);
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    assert_eq!(
+        f1.step(t + 1, cas_result(CasOutcome::Unknown)),
+        vec![ign(ReplicaIgnoreReason::Outstanding)],
+        "A-R102: Unknown returns to resolving, one fact"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    let next = ACTIVATION_DEADLINE + WINDOW;
+    assert_eq!(f1.step(next, fired(6)), vec![get(), arm(7, next + WINDOW)]);
+    assert_eq!(
+        f1.step(next + 1, found_at(9, ours())),
+        vec![cas(Revision(9), A)]
+    );
+    assert_eq!(
+        f1.step(
+            next + 2,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(10),
+            })
+        ),
+        vec![get()],
+        "A-R102: a Conflict reads again"
+    );
+    assert_eq!(
+        f1.step(next + 3, found_at(10, ours())),
+        vec![cas(Revision(10), A)]
+    );
+    let abandoned = *f1.requests.last().expect("the CAS at 10");
+    let later = next + WINDOW;
+    assert_eq!(
+        f1.step(later, fired(7)),
+        vec![get(), arm(8, later + WINDOW)],
+        "A-R102: the deadline abandons the CAS and reads again"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    f1.ignores_late(
+        later + 1,
+        cas_result_for(abandoned, CasOutcome::Committed(Revision(11))),
+    );
+    assert_eq!(recovered_count(&f1), 1, "only the ReadOnly commit so far");
+    assert_eq!(
+        f1.step(later + 2, found_at(11, ours())),
+        vec![cas(Revision(11), A)]
+    );
+    let result = recovered(&f1.step(later + 3, cas_result(CasOutcome::Committed(Revision(12)))));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, Revision(12));
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+}
+
+/// W10-D1 row 4 (A-R102 M4): with the store down, one `Get` per fire and none on an immediate
+/// `Unavailable`, which answers one `Outstanding` and waits for the next fire. A fire with a
+/// `Get` unanswered abandons it under a fresh id, and the old id's late `Value` is
+/// `UnmatchedCompletion`. Each fire re-arms; an early or older fire is `StaleTimer`.
+#[retcd_test]
+fn w10_d1_a_store_that_is_down_is_read_once_per_fire() {
+    let mut f1 = resolving();
+    let first = ACTIVATION_DEADLINE + WINDOW;
+    assert_eq!(
+        f1.step(
+            ACTIVATION_DEADLINE + 1,
+            read_result(ReadOutcome::Unavailable)
+        ),
+        vec![ign(ReplicaIgnoreReason::Outstanding)],
+        "A-R102: Unavailable waits for the next fire"
+    );
+    // One fact per attempt: the read is answered, so nothing is outstanding until the next
+    // fire, and a second answer on its id is a late one, not a second attempt.
+    let answered = *f1.requests.last().expect("the first read");
+    f1.ignores_late(
+        ACTIVATION_DEADLINE + 2,
+        read_result_for(
+            answered,
+            ReadOutcome::Found {
+                revision: Revision(9),
+                value: ours(),
+            },
+        ),
+    );
+    let stale = vec![ign(ReplicaIgnoreReason::StaleTimer)];
+    assert_eq!(f1.step(first - 1, fired(6)), stale, "before the deadline");
+    assert_eq!(f1.step(first, fired(5)), stale, "an older version");
+    assert_eq!(
+        f1.step(first, fired(6)),
+        vec![get(), arm(7, first + WINDOW)]
+    );
+    let unanswered = *f1.requests.last().expect("the second read");
+    let second = first + WINDOW;
+    assert_eq!(
+        f1.step(second, fired(7)),
+        vec![get(), arm(8, second + WINDOW)]
+    );
+    let fresh = *f1.requests.last().expect("the third read");
+    assert_ne!(fresh, unanswered, "A-R102: a fresh id for each read");
+    f1.ignores_late(
+        second + 1,
+        read_result_for(
+            unanswered,
+            ReadOutcome::Found {
+                revision: Revision(9),
+                value: ours(),
+            },
+        ),
+    );
+    let gets = f1
+        .log
+        .iter()
+        .filter(|e| matches!(e, EffectKind::Control(ControlEffect::Get { .. })))
+        .count();
+    assert_eq!(gets, 3, "one read on entry and one per fire");
+    assert_eq!(
+        f1.cas_count(),
+        2,
+        "nothing proposed without a read of our bytes"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+}
+
+/// W10-D1 row 5 (A-R102 A3; issue #2): a newer fence while resolving enters at once, never held.
+/// The resolving read's late answer is then `UnmatchedCompletion`. M7B-240's held-fence half is
+/// unchanged.
+#[retcd_test]
+fn w10_d1_a_fence_while_resolving_enters_at_once() {
+    let mut f1 = resolving();
+    let t = REFENCE_AT;
+    assert_eq!(
+        f1.rec(t, RecoveryEvent::Plan(Box::new(replan()))),
+        vec![ign(ReplicaIgnoreReason::Recorded)],
+        "A-R102 A3: a plan is held while resolving"
+    );
+    assert_eq!(
+        f1.rec(t, RecoveryEvent::FenceProven(Box::new(later_fence()))),
+        vec![
+            r(RecoveryEffect::QueryInventory {
+                copies: vec![A, B, C],
+            }),
+            arm(7, t + WINDOW),
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::Fenced);
+    f1.ignores_late(t + 1, found_at(9, ours()));
+    f1.ignores_late(t + 2, cas_result(CasOutcome::Committed(Revision(11))));
+}
+
+/// W10-D1 row 6, guard (A-R102 scope): the recovery CAS stays out. Its deadline is still a
+/// terminal `Blocked(ControlUnknown)`: no read, no re-proposal, on any later fire.
+#[retcd_test]
+fn w10_d1_an_unknown_recovery_cas_still_blocks_for_good() {
+    let mut f1 = proposing(20);
+    let deadline = 3_000 + WINDOW;
+    assert_eq!(
+        f1.step(deadline, fired(3)),
+        vec![block(BlockReason::ControlUnknown)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
+    );
+    let refused = vec![ign(ReplicaIgnoreReason::RecoveryBlocked)];
+    assert_eq!(f1.step(deadline + WINDOW, fired(3)), refused);
+    assert_eq!(f1.step(deadline + WINDOW, fired(4)), refused);
+    assert!(!f1
+        .log
+        .iter()
+        .any(|e| matches!(e, EffectKind::Control(ControlEffect::Get { .. }))));
+    assert_eq!(f1.cas_count(), 1, "never re-proposed");
+}
+
+/// W10-D1 row 7 (A-R102, critic M1): an operator's no-op rewrite of our bytes while resolving is
+/// harmless. F1 proposes at whatever revision it reads; a rewrite racing that CAS is a
+/// `Conflict`, read again, and proposed again; only a `Committed` lands.
+#[retcd_test]
+fn w10_d1_a_no_op_rewrite_while_resolving_is_proposed_over() {
+    let mut f1 = resolving();
+    let t = ACTIVATION_DEADLINE + 10;
+    assert_eq!(f1.step(t, found_at(20, ours())), vec![cas(Revision(20), A)]);
+    assert_eq!(
+        f1.step(
+            t + 1,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(21),
+            })
+        ),
+        vec![get()]
+    );
+    assert_eq!(
+        f1.step(t + 2, found_at(21, ours())),
+        vec![cas(Revision(21), A)]
+    );
+    let result = recovered(&f1.step(t + 3, cas_result(CasOutcome::Committed(Revision(22)))));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, Revision(22));
+}
+
+/// W10-D1 row 8 (A-R102 M2): resolving is its own reported phase, never `Blocked`, while the
+/// recovery CAS's `Unknown` answer is still `Blocked(ControlUnknown)`.
+#[retcd_test]
+fn w10_d1_resolving_is_reported_apart_from_a_block() {
+    let (mut f1, _) = activating();
+    assert_eq!(
+        f1.step(4_200, cas_result(CasOutcome::Unknown)),
+        vec![
+            block(BlockReason::ControlUnknown),
+            get(),
+            arm(6, 4_200 + WINDOW)
+        ]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    let mut recovery = proposing(20);
+    recovery.step(3_100, cas_result(CasOutcome::Unknown));
+    assert_eq!(
+        recovery.phase(),
+        RecoveryPhase::Blocked(BlockReason::ControlUnknown)
+    );
+}
+
+/// W10-D1 row 9 (critic A1: our bytes at `r`, "with `r` at or above `c`"): our own bytes read
+/// below the commit revision are not ours to propose over. No linearizable store answers that
+/// after our commit, so it is classified as any other record is, by `Cas::on_read`: identical
+/// bytes there are a peer's decision (F-g). Never a CAS at the stale revision.
+#[retcd_test]
+fn w10_d1_our_bytes_below_the_commit_are_not_proposed_over() {
+    let mut f1 = resolving();
+    assert_eq!(
+        f1.step(
+            ACTIVATION_DEADLINE + 1,
+            read_result(ReadOutcome::Found {
+                revision: Revision(8),
+                value: ours(),
+            })
+        ),
+        vec![block(BlockReason::OvertakenByPeer)]
+    );
+    assert_eq!(
+        f1.phase(),
+        RecoveryPhase::Blocked(BlockReason::OvertakenByPeer)
+    );
+    assert_eq!(f1.cas_count(), 2, "no CAS at a revision below the commit");
+}
+
+/// W10-D1 row 10 (A-R102 addendum, Round 13, item 1): a definitive `Unavailable` on the
+/// activation exchange proves our CAS did not apply. It is the same store outage as `Unknown`
+/// under a different timing, so it resolves too, never blocks: one
+/// `BlockPromotion{ControlUnavailable}` fact, then it waits for the exchange's own fire (M4:
+/// `Unavailable` waits), reads, and proposes again at the revision it read. The `Conflict`
+/// re-read's `Unavailable` is the same exit.
+#[retcd_test]
+fn w10_d1_a_definitive_unavailable_activation_resolves_too() {
+    let mut f1 = activation_proposed();
+    let activation = *f1.requests.last().expect("the activation CAS");
+    let t = 4_200;
+    assert_eq!(
+        f1.step(t, cas_result(CasOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)]
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+    f1.ignores_late(
+        t + 1,
+        cas_result_for(activation, CasOutcome::Committed(Revision(11))),
+    );
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE - 1, fired(5)),
+        vec![ign(ReplicaIgnoreReason::StaleTimer)]
+    );
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE, fired(5)),
+        vec![get(), arm(6, ACTIVATION_DEADLINE + WINDOW)],
+        "the exchange's own fire reads"
+    );
+    assert_eq!(
+        f1.step(ACTIVATION_DEADLINE + 1, found_at(9, ours())),
+        vec![cas(Revision(9), A)]
+    );
+    let result = recovered(&f1.step(
+        ACTIVATION_DEADLINE + 2,
+        cas_result(CasOutcome::Committed(Revision(10))),
+    ));
+    assert_eq!(result.mode, PartitionMode::Active);
+    assert_eq!(result.committed.revision, Revision(10));
+    assert_eq!(f1.phase(), RecoveryPhase::Committed);
+
+    let mut f1 = activation_proposed();
+    assert_eq!(
+        f1.step(
+            t,
+            cas_result(CasOutcome::Conflict {
+                exists: true,
+                current: Revision(10),
+            })
+        ),
+        vec![get()]
+    );
+    assert_eq!(
+        f1.step(t + 1, read_result(ReadOutcome::Unavailable)),
+        vec![block(BlockReason::ControlUnavailable)],
+        "the conflict re-read's Unavailable resolves as well"
+    );
+    assert_eq!(f1.phase(), RecoveryPhase::ActivationUnresolved);
+}
+
+/// W10-D1 row 11 (A-R102 addendum, Round 13, item 2): a fence held behind the activation whose
+/// re-entry is refused — here no plan is held for its lineage, so `fence()` refuses it
+/// `InvalidConfig` — leaves F1 resolving, never `Blocked`. `Unknown` reads at once;
+/// `Unavailable` waits for the exchange's own fire.
+#[retcd_test]
+fn w10_d1_a_refused_held_fence_leaves_the_activation_resolving() {
+    for (outcome, reason, reads) in [
+        (CasOutcome::Unknown, BlockReason::ControlUnknown, true),
+        (
+            CasOutcome::Unavailable,
+            BlockReason::ControlUnavailable,
+            false,
+        ),
+    ] {
+        let mut f1 = activation_proposed();
+        assert_eq!(
+            f1.rec(
+                REFENCE_AT,
+                RecoveryEvent::FenceProven(Box::new(later_fence()))
+            ),
+            vec![ign(ReplicaIgnoreReason::Recorded)],
+            "held, with no plan for its lineage"
+        );
+        let t = REFENCE_AT + 1;
+        let mut expected = vec![block(reason), ign(ReplicaIgnoreReason::InvalidConfig)];
+        if reads {
+            expected.extend([get(), arm(6, t + WINDOW)]);
+        }
+        assert_eq!(f1.step(t, cas_result(outcome)), expected, "{outcome:?}");
+        assert_eq!(
+            f1.phase(),
+            RecoveryPhase::ActivationUnresolved,
+            "{outcome:?}"
+        );
+    }
 }

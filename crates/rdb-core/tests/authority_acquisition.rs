@@ -24,7 +24,8 @@ use rdb_core::authority::{
     Acquire, Authority, AuthorityState, AuthorityStateView, AuthorityTimer, Renewal,
 };
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityFact, AuthorityIgnoreReason, DenyReason, FenceScope, Lineage, Verdict,
+    AuthorityEffect, AuthorityFact, AuthorityIgnoreReason, AuthorityView, DenyReason, FenceScope,
+    Lineage, Verdict,
 };
 use rdb_core::contracts::control::{
     CasOutcome, ControlChange, ControlEffect, ControlEvent, ControlKey, ControlPrefix,
@@ -34,12 +35,12 @@ use rdb_core::contracts::event::{
     Budgets, Effect, EffectKind, Event, EventKind, KernelEffect, Module, NodeLifecycle, StepCtx,
 };
 use rdb_core::contracts::ids::{
-    AuthorityGeneration, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
+    AuthorityGeneration, BatchId, BootId, ConfigVersion, ControlRequestId, CorrelationId, EventId,
     Generation, GrantId, NodeId, OwnerEpoch, PartitionId, Revision, Seq, SnapshotHandle,
     TimerVersion,
 };
 use rdb_core::contracts::ignore::KernelIgnoredReason;
-use rdb_core::contracts::storage::{Namespace, SnapshotRead};
+use rdb_core::contracts::storage::{Namespace, SnapshotRead, StorageEvent, StorageFault};
 use rdb_core::contracts::time::{ControlTime, Tick, TimerEffect, TimerFired};
 use rdb_core::contracts::trace::Version;
 
@@ -1817,10 +1818,10 @@ fn m7a_22_fenced_then_cas_applied_late_renewal_ignored() {
     );
 }
 
-/// M7A-23. `design.md` §2.1 "Fenced terminal; exit only via new grant id". **The terminal half
-/// only** (lead ruling A-R57's reasoning for M7A-42, applied here and flagged in the handoff):
-/// `Fenced` has no exit in this build, so "only a fresh `AcquireDue` produces a create-only
-/// `Cas`" is Unavailable, not asserted.
+/// M7A-23. `design.md` §2.1 "Fenced terminal; exit only via new grant id". **The terminal half**:
+/// no input but the self-replace poll's answer moves `Fenced`. The exit half (lead ruling A-R96,
+/// M9 S2b-E) is a `Cas` at the exact revision read under a new grant id, never create-only; the
+/// `after_a_fence_*` rows below assert it. Here `AcquireDue` sends that poll, a `Get`.
 ///
 /// `Fenced`, then `RenewDue`, a tick, a newer valid sample, 20 grant watch deliveries and an
 /// `AcquireDue`: zero CASes, and `Fenced` throughout.
@@ -2461,4 +2462,1192 @@ fn republished_views_leave_with_the_next_step_a1_accepts() {
             "{why}: an unchanged sample republishes nothing"
         );
     }
+}
+
+// =============================================================================================
+// Self-replace after a fence (lead ruling A-R96, M9 S2b-E). A node fence leaves the same boot a
+// way back: once its own record is proven expired, it writes over it — by a CAS at the exact
+// revision it read — under a new grant id. The host fires the `Acquire` timer after the fence
+// (M3); here a row fires it at the version the kernel holds, as the host will.
+// =============================================================================================
+
+/// The tick the self-replace rows prove expiry at: past `E = e_new_at(5)` plus epsilon (10) and
+/// delta (100), under a sample taken at the same tick.
+const PROVEN: u64 = 3_200;
+
+/// The `Get` of our grant in `effects`, as the request it was sent as.
+fn poll_sent(effects: &[Effect]) -> ControlRequestId {
+    let sent: Vec<ControlRequestId> = effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Control(ControlEffect::Get {
+                request,
+                key: ControlKey::Grant(NODE),
+            }) => Some(*request),
+            _ => None,
+        })
+        .collect();
+    let [request] = sent.as_slice() else {
+        panic!("one Get of our grant: {effects:?}");
+    };
+    *request
+}
+
+/// The answer to the read sent as `request`, at tick `at`.
+fn polled(at: u64, request: ControlRequestId, outcome: ReadOutcome) -> Event {
+    event(
+        at,
+        at,
+        EventKind::Control(ControlEvent::Value {
+            request,
+            key: ControlKey::Grant(NODE),
+            outcome,
+        }),
+    )
+}
+
+fn found(revision: u64, record: &GrantRecord) -> ReadOutcome {
+    ReadOutcome::Found {
+        revision: Revision(revision),
+        value: record.encode(),
+    }
+}
+
+/// [`held`] (grant 1, `E = e_new_at(5)`, revision 7), fenced `Expired` at [`LAPSE`], then the
+/// host's `Acquire` firing at 3_100: the poll's request id.
+fn fenced_and_polled() -> (Authority, GrantId, ControlRequestId) {
+    let (mut kernel, grant) = held();
+    kernel
+        .step(&ctx(LAPSE), &probe(LAPSE))
+        .expect("the lapse fence");
+    assert!(kernel.state().is_fenced(), "fixture: fenced");
+    let due = acquire_due(&kernel, 3_100, 3_100);
+    let effects = kernel
+        .step(&sampled_at(3_100, 3_100), &due)
+        .expect("the fenced Acquire row");
+    assert_eq!(shapes(&effects), vec![Shape::Get(ControlKey::Grant(NODE))]);
+    assert!(kernel.state().is_fenced(), "a poll moves nothing");
+    (kernel, grant, poll_sent(&effects))
+}
+
+/// Scenario (S2b-E): the control quorum came back after this node fenced on expiry; the record
+/// still names the fenced grant, and its expiry is now proven past. The node writes over it at the
+/// exact revision it read, under a new grant id, and holds the new grant on commit — no restart.
+#[retcd_test]
+fn after_a_fence_a_proven_expired_record_is_replaced_under_a_new_grant_id() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let fresh = GrantId(fenced.0 + 1);
+    let e_new = (ESTIMATE + PROVEN + BUDGETS.grant_millis) as i64;
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Cas {
+            expected: Some(Revision(7)),
+            record: Some(our_record(fresh, e_new)),
+        }],
+        "an exact-revision CAS with a new grant id, never create-only"
+    );
+    assert_eq!(kernel.state().fence_reason(), Some(DenyReason::Expired));
+    assert!(
+        kernel.state().is_unheld(),
+        "Unheld, with the replace in flight"
+    );
+
+    let request = sent_as(&effects);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 5, PROVEN),
+            &cas_result(
+                PROVEN + 5,
+                PROVEN + 5,
+                request,
+                CasOutcome::Committed(Revision(9)),
+            ),
+        )
+        .expect("the replace commits");
+    let held = kernel.state().held().expect("Held again, same boot");
+    assert_eq!(held.identity().grant, fresh);
+    assert_eq!(kernel.view().record_revision, Some(Revision(9)));
+}
+
+/// Scenario (S2b-E): the poll lands before the fenced grant's expiry is proven. Nothing is
+/// written; the poll is armed again one renewal interval on, and the node stays fenced.
+#[retcd_test]
+fn after_a_fence_a_record_not_yet_proven_expired_is_not_replaced() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    // After the poll (3_100) and short of `E + epsilon + delta` (3_115).
+    let at = 3_110;
+    let effects = kernel
+        .step(
+            &sampled_at(at, at),
+            &polled(at, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![
+            Shape::Ignored(AuthorityIgnoreReason::AcquireWithheld),
+            Shape::Arm(
+                AuthorityTimer::Acquire,
+                version,
+                Tick(at + BUDGETS.renew_millis)
+            ),
+        ]
+    );
+    assert!(kernel.state().is_fenced());
+}
+
+/// Scenario (S2b-E): the record is not this boot's to replace — the planner froze it, another
+/// boot holds it, the cluster authority generation moved, or it is gone. No CAS and no re-arm:
+/// polling stops, and the node stays fenced (nothing in M9 moves it on; M10's takeover or rejoin
+/// does, #42).
+#[retcd_test]
+fn after_a_fence_a_record_not_ours_to_replace_stops_the_polling() {
+    type Change = fn(&mut GrantRecord);
+    let cases: [(&str, Option<Change>); 5] = [
+        ("another node", Some(|r| r.node = NodeId(2))),
+        ("frozen", Some(|r| r.frozen = true)),
+        ("another boot", Some(|r| r.boot = BootId(2))),
+        (
+            "another authority generation",
+            Some(|r| r.authority_generation = AuthorityGeneration(1)),
+        ),
+        ("absent", None),
+    ];
+    for (why, change) in cases {
+        let (mut kernel, fenced, poll) = fenced_and_polled();
+        let outcome = match change {
+            Some(change) => {
+                let mut record = our_record(fenced, e_new_at(5));
+                change(&mut record);
+                found(7, &record)
+            }
+            None => ReadOutcome::Absent { as_of: Revision(7) },
+        };
+        let effects = kernel
+            .step(&sampled_at(PROVEN, PROVEN), &polled(PROVEN, poll, outcome))
+            .expect("the poll's answer");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+            "{why}"
+        );
+        assert!(kernel.state().is_fenced(), "{why}");
+    }
+}
+
+/// Scenario (S2b-E, A-R96 M1, ADR-rdb-0007 R5 variant): a renewal of the fenced grant was in
+/// flight at the fence and lands after the replace was dispatched, so the record again names the
+/// fenced grant with a valid expiry. Before A-R96 the `Unheld` read-back adopted exactly that, and
+/// the node was `Held` on a grant id it had fenced. Now it never goes back to that id: it waits,
+/// polls with a `Get` (never a create-only CAS), and replaces at the new revision once that expiry
+/// is proven too.
+#[retcd_test]
+fn after_a_fence_a_late_valid_renewal_of_the_fenced_grant_is_never_adopted() {
+    let (mut kernel, fenced, renewal) = renewing();
+    kernel
+        .step(&ctx(LAPSE), &probe(LAPSE))
+        .expect("the lapse fence");
+    assert!(kernel.state().is_fenced(), "fixture: fenced");
+    let due = acquire_due(&kernel, 3_100, 3_100);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(3_100, 3_100), &due)
+            .expect("the fenced Acquire row"),
+    );
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    // The late renewal commits first, at revision 50, with `E = e_new_at(505)`; the replace then
+    // conflicts on revision 7.
+    let late = kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(
+                PROVEN + 1,
+                505,
+                renewal.request,
+                CasOutcome::Committed(Revision(50)),
+            ),
+        )
+        .expect("the late renewal's answer");
+    assert_eq!(
+        shapes(&late),
+        vec![Shape::Ignored(AuthorityIgnoreReason::UnmatchedCompletion)]
+    );
+    let lost = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &cas_result(
+                PROVEN + 2,
+                PROVEN + 2,
+                request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(50),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    assert_eq!(
+        shapes(&lost),
+        vec![
+            Shape::Get(ControlKey::Grant(NODE)),
+            Shape::Fact(AuthorityFact::AcquireLost)
+        ]
+    );
+    // The read-back: the fenced grant, still valid. Adoptable by every pre-A-R96 rule.
+    let late_record = our_record(fenced, e_new_at(505));
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 3, PROVEN),
+            &grant_read(PROVEN + 3, found(50, &late_record)),
+        )
+        .expect("the read-back");
+    assert!(
+        !kernel.state().is_held(),
+        "never Held on the fenced grant id: {effects:?}"
+    );
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![
+            Shape::Ignored(AuthorityIgnoreReason::AcquireWithheld),
+            Shape::Arm(
+                AuthorityTimer::Acquire,
+                version,
+                Tick(PROVEN + 3 + BUDGETS.renew_millis)
+            ),
+        ]
+    );
+    // The re-armed firing polls; it never sends a create-only CAS.
+    let at = 3_700;
+    let due = acquire_due(&kernel, at, at);
+    let effects = kernel
+        .step(&sampled_at(at, at), &due)
+        .expect("the Acquire row");
+    assert_eq!(shapes(&effects), vec![Shape::Get(ControlKey::Grant(NODE))]);
+    // Its answer, once `e_new_at(505)` is proven past, replaces at revision 50.
+    let effects = kernel
+        .step(
+            &sampled_at(at, at),
+            &grant_read(at, found(50, &late_record)),
+        )
+        .expect("the poll's answer");
+    let replaced = shapes(&effects);
+    let [Shape::Cas {
+        expected,
+        record: Some(record),
+    }] = replaced.as_slice()
+    else {
+        panic!("one CAS: {effects:?}");
+    };
+    assert_eq!(*expected, Some(Revision(50)));
+    assert_ne!(record.grant, fenced, "a new grant id");
+}
+
+/// The poll-id guard (A-R96): while `Fenced`, a read answer that is not the poll's own — a read
+/// in flight at the fence, or a stray — starts nothing, however replaceable the record it
+/// carries. The poll's own answer, after it, still replaces.
+#[retcd_test]
+fn after_a_fence_only_the_polls_own_answer_starts_a_replace() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let record = our_record(fenced, e_new_at(5));
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, STRAY, found(7, &record)),
+        )
+        .expect("a stray read");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::StaleAuthorityView)]
+    );
+    assert!(kernel.state().is_fenced(), "a stray moves nothing");
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &record)),
+        )
+        .expect("the poll's answer");
+    let replaced = shapes(&effects);
+    assert!(
+        matches!(replaced.as_slice(), [Shape::Cas { .. }]),
+        "{effects:?}"
+    );
+}
+
+/// After a fence, a replace that conflicted reads its record back, and the record is gone. An
+/// absent record is not a free key to take (A-R96): no create-only CAS, and nothing re-armed.
+#[retcd_test]
+fn after_a_fence_an_absent_record_read_back_is_not_taken() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    let lost = kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(
+                PROVEN + 1,
+                PROVEN + 1,
+                request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(8),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    assert_eq!(
+        shapes(&lost),
+        vec![
+            Shape::Get(ControlKey::Grant(NODE)),
+            Shape::Fact(AuthorityFact::AcquireLost)
+        ]
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &grant_read(PROVEN + 2, ReadOutcome::Absent { as_of: Revision(9) }),
+        )
+        .expect("the read-back");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert!(!kernel.state().is_held());
+}
+
+/// R4 (A-R96), the promise's main path: a quorum loss. The poll's answer is `Unavailable`; the
+/// poll is armed again one renewal interval on, and the node stays `Fenced`. Once control is back,
+/// the re-armed firing polls again and a proven expiry replaces at the exact revision read.
+#[retcd_test]
+fn after_a_fence_an_unavailable_poll_keeps_polling_until_control_returns() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let lost = 3_150;
+    let effects = kernel
+        .step(
+            &sampled_at(lost, lost),
+            &polled(lost, poll, ReadOutcome::Unavailable),
+        )
+        .expect("the poll's answer");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(lost + BUDGETS.renew_millis)
+        )]
+    );
+    assert!(kernel.state().is_fenced(), "still fenced, still polling");
+    let back = lost + BUDGETS.renew_millis;
+    let due = acquire_due(&kernel, back, back);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(back, back), &due)
+            .expect("the re-armed firing"),
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(back, back),
+            &polled(back, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer once control is back");
+    let replaced = shapes(&effects);
+    let [Shape::Cas { expected, record }] = replaced.as_slice() else {
+        panic!("one CAS: {effects:?}");
+    };
+    assert_eq!(*expected, Some(Revision(7)), "the exact revision read");
+    assert_ne!(
+        record.as_ref().map(|r| r.grant),
+        Some(fenced),
+        "a new grant id"
+    );
+}
+
+/// This test's own log lines whose message is `message`, from the per-test JSONL file the
+/// `#[retcd_test]` layer writes. The same reader as `publication_p1.rs`'s `own_log_lines`: rdb-core
+/// has no `config-testkit` dev-dependency.
+fn own_log_lines(method: &str, message: &str) -> Vec<serde_json::Value> {
+    let path = config_log::layer::test_file_path(
+        &config_log::testing::test_log_dir(),
+        module_path!(),
+        method,
+    );
+    let run = config_log::testing::test_run_id();
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read test log {}: {e}", path.display()))
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|e| panic!("malformed JSONL line in {}: {e}", path.display()))
+        })
+        .filter(|line| line["testRun"].as_str() == Some(run) && line["@m"] == message)
+        .collect()
+}
+
+/// Round 5 (the add-on 3 leftover): the poll's answer is a body this build cannot decode. The
+/// host offers a control answer to every module and drops an `Unavailable` error from one that
+/// is not its named consumer, so an error here re-armed nothing while `self_replace_polling`
+/// still read `true`. It is now treated as an unavailable store: the poll is armed again one
+/// renewal interval on, the node stays fenced and still polling, and the next readable answer
+/// replaces as usual.
+#[retcd_test]
+fn after_a_fence_an_undecodable_poll_answer_keeps_polling() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let at = 3_150;
+    let garbage = ReadOutcome::Found {
+        revision: Revision(7),
+        value: Bytes::from_static(b"not a grant record"),
+    };
+    let effects = kernel
+        .step(&sampled_at(at, at), &polled(at, poll, garbage))
+        .expect("an undecodable poll answer re-arms; it is not a step error");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(at + BUDGETS.renew_millis)
+        )]
+    );
+    assert!(kernel.state().is_fenced());
+    assert!(kernel.self_replace_polling(), "still polling");
+    let logged = own_log_lines(
+        "after_a_fence_an_undecodable_poll_answer_keeps_polling",
+        "a1.self_replace_poll_undecodable",
+    );
+    let [line] = logged.as_slice() else {
+        panic!("one undecodable-poll line: {logged:?}");
+    };
+    assert_eq!(
+        (line["node"].as_u64(), line["revision"].as_u64()),
+        (Some(u64::from(NODE.0)), Some(7))
+    );
+    let back = at + BUDGETS.renew_millis;
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(back, back), &acquire_due(&kernel, back, back))
+            .expect("the re-armed firing"),
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(back, back),
+            &polled(back, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("a readable answer");
+    assert!(
+        matches!(shapes(&effects).as_slice(), [Shape::Cas { .. }]),
+        "the replace: {effects:?}"
+    );
+}
+
+/// Round 6 (the round 5 adjacent item): the read-back after a lost or unknown acquisition is the
+/// only way on from `Unheld` — the CAS answer arms nothing — and its body is one this build cannot
+/// decode. It used to be a `Codec` error, which the host drops for a control answer, so the node
+/// sat `Unheld` with no `Acquire` armed for ever. It is now an unavailable store: logged, and
+/// `Acquire` re-armed one renewal interval on. Two cases: a first acquisition that conflicted, and
+/// a self-replace after a fence whose outcome is unknown. Each re-armed firing acts again.
+#[retcd_test]
+fn an_undecodable_read_back_while_unheld_rearms_the_acquisition() {
+    let garbage = |revision: u64| ReadOutcome::Found {
+        revision: Revision(revision),
+        value: Bytes::from_static(b"not a grant record"),
+    };
+
+    // A first acquisition, lost.
+    let (mut kernel, acquire) = acquiring();
+    kernel
+        .step(
+            &ctx(9),
+            &cas_result(
+                9,
+                5,
+                acquire.request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(3),
+                },
+            ),
+        )
+        .expect("the conflict");
+    let effects = kernel
+        .step(&ctx(10), &grant_read(10, garbage(8)))
+        .expect("an undecodable read-back re-arms; it is not a step error");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(10 + BUDGETS.renew_millis)
+        )],
+        "first acquisition"
+    );
+    assert!(kernel.state().is_unheld());
+    let back = 10 + BUDGETS.renew_millis;
+    let effects = kernel
+        .step(&ctx(back), &acquire_due(&kernel, back, back))
+        .expect("the re-armed firing");
+    assert!(
+        matches!(
+            shapes(&effects).as_slice(),
+            [Shape::Cas { expected: None, .. }]
+        ),
+        "first acquisition: tries again: {effects:?}"
+    );
+
+    // A self-replace after a fence, outcome unknown.
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(PROVEN + 1, PROVEN + 1, request, CasOutcome::Unknown),
+        )
+        .expect("the replace's outcome is unknown");
+    let at = PROVEN + 2;
+    let effects = kernel
+        .step(&sampled_at(at, PROVEN), &grant_read(at, garbage(9)))
+        .expect("an undecodable read-back re-arms; it is not a step error");
+    let version = kernel.timer_version(AuthorityTimer::Acquire);
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Arm(
+            AuthorityTimer::Acquire,
+            version,
+            Tick(at + BUDGETS.renew_millis)
+        )],
+        "after a replace"
+    );
+    assert!(kernel.state().is_unheld());
+    let back = at + BUDGETS.renew_millis;
+    let effects = kernel
+        .step(&sampled_at(back, back), &acquire_due(&kernel, back, back))
+        .expect("the re-armed firing");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Get(ControlKey::Grant(NODE))],
+        "after a replace: polls again before any write"
+    );
+
+    let logged = own_log_lines(
+        "an_undecodable_read_back_while_unheld_rearms_the_acquisition",
+        "a1.grant_read_back_undecodable",
+    );
+    let seen: Vec<_> = logged
+        .iter()
+        .map(|line| (line["node"].as_u64(), line["revision"].as_u64()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Some(u64::from(NODE.0)), Some(8)),
+            (Some(u64::from(NODE.0)), Some(9))
+        ]
+    );
+}
+
+/// Reviewer F-004/F-016 (round 4 add-on 3): `self_replace_polling` says whether the fenced node
+/// will read its own record again. It holds from the fence through a `NotYet` wait and an
+/// unavailable store, each of which re-arms, and stops once a poll's answer is a record not ours
+/// to replace (here frozen) or no record. Never while held.
+#[retcd_test]
+fn self_replace_polling_holds_through_each_rearm_and_stops_on_a_record_not_ours() {
+    let (mut kernel, fenced) = held();
+    assert!(!kernel.self_replace_polling(), "held: not fenced");
+    kernel
+        .step(&ctx(LAPSE), &probe(LAPSE))
+        .expect("the lapse fence");
+    assert_eq!(kernel.state().fence_reason(), Some(DenyReason::Expired));
+    assert!(kernel.self_replace_polling(), "fenced (Expired)");
+
+    // `NotYet`: the poll lands short of `E + epsilon + delta` (3_115) and re-arms.
+    let first = 3_100;
+    let poll = poll_sent(
+        &kernel
+            .step(
+                &sampled_at(first, first),
+                &acquire_due(&kernel, first, first),
+            )
+            .expect("the fenced Acquire row"),
+    );
+    let not_yet = 3_110;
+    kernel
+        .step(
+            &sampled_at(not_yet, not_yet),
+            &polled(not_yet, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the NotYet answer");
+    assert!(kernel.self_replace_polling(), "NotYet re-arms");
+
+    // The store unavailable: re-armed again.
+    let second = not_yet + BUDGETS.renew_millis;
+    let poll = poll_sent(
+        &kernel
+            .step(
+                &sampled_at(second, second),
+                &acquire_due(&kernel, second, second),
+            )
+            .expect("the re-armed firing"),
+    );
+    kernel
+        .step(
+            &sampled_at(second, second),
+            &polled(second, poll, ReadOutcome::Unavailable),
+        )
+        .expect("the unavailable answer");
+    assert!(kernel.self_replace_polling(), "Unavailable re-arms");
+
+    // A frozen record: not ours to replace, and polling stops.
+    let third = second + BUDGETS.renew_millis;
+    let poll = poll_sent(
+        &kernel
+            .step(
+                &sampled_at(third, third),
+                &acquire_due(&kernel, third, third),
+            )
+            .expect("the re-armed firing"),
+    );
+    let mut frozen = our_record(fenced, e_new_at(5));
+    frozen.frozen = true;
+    let effects = kernel
+        .step(
+            &sampled_at(third, third),
+            &polled(third, poll, found(7, &frozen)),
+        )
+        .expect("the frozen answer");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)]
+    );
+    assert!(kernel.state().is_fenced());
+    assert!(!kernel.self_replace_polling(), "a frozen record stops it");
+
+    // No record: polling stops too.
+    let (mut kernel, _, poll) = fenced_and_polled();
+    assert!(kernel.self_replace_polling(), "fixture: polling");
+    kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, ReadOutcome::Absent { as_of: Revision(7) }),
+        )
+        .expect("the absent answer");
+    assert!(kernel.state().is_fenced());
+    assert!(!kernel.self_replace_polling(), "an absent record stops it");
+
+    // A proven record is replaced: `Unheld` with the CAS in flight, so no longer fenced.
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the Replace answer");
+    assert!(kernel.state().is_unheld(), "fixture: replacing");
+    assert!(!kernel.self_replace_polling(), "not fenced");
+}
+
+/// The freeze race (A-R96 kernel ruling 1, critic M2): the replace conflicts because the record
+/// changed under it, and the read-back finds it is no longer ours to replace — a planner froze
+/// it, or another boot or authority generation wrote it. No CAS, no re-arm, not `Held`.
+#[retcd_test]
+fn after_a_fence_a_conflicting_replace_never_writes_over_a_record_not_ours() {
+    type Change = fn(&mut GrantRecord);
+    let cases: [(&str, Change); 3] = [
+        ("frozen by a planner", |r| r.frozen = true),
+        ("another boot", |r| r.boot = BootId(2)),
+        ("another authority generation", |r| {
+            r.authority_generation = AuthorityGeneration(1)
+        }),
+    ];
+    for (why, change) in cases {
+        let (mut kernel, fenced, poll) = fenced_and_polled();
+        let replace = kernel
+            .step(
+                &sampled_at(PROVEN, PROVEN),
+                &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+            )
+            .expect("the poll's answer");
+        let request = sent_as(&replace);
+        kernel
+            .step(
+                &sampled_at(PROVEN + 1, PROVEN),
+                &cas_result(
+                    PROVEN + 1,
+                    PROVEN + 1,
+                    request,
+                    CasOutcome::Conflict {
+                        exists: true,
+                        current: Revision(8),
+                    },
+                ),
+            )
+            .expect("the replace conflicts");
+        let mut record = our_record(fenced, e_new_at(5));
+        change(&mut record);
+        let effects = kernel
+            .step(
+                &sampled_at(PROVEN + 2, PROVEN),
+                &grant_read(PROVEN + 2, found(8, &record)),
+            )
+            .expect("the read-back");
+        assert_eq!(
+            shapes(&effects),
+            vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+            "{why}: no CAS, no re-arm"
+        );
+        assert!(!kernel.state().is_held(), "{why}");
+    }
+}
+
+/// Round 8, W8-D1: a freeze lands while `Unheld` mid self-replace. The replace conflicts, the
+/// read-back finds the record frozen, and the `Never` verdict stops the self-replace. The node is
+/// not `Fenced`, so `self_replace_polling` cannot say so; `self_replace_stopped` does, so the
+/// host can tell the user writes will not come back on their own.
+#[retcd_test]
+fn a_freeze_while_unheld_mid_self_replace_reports_the_self_replace_stopped() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    assert!(!kernel.self_replace_stopped(), "fenced: still polling");
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(
+                PROVEN + 1,
+                PROVEN + 1,
+                request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(8),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    assert!(
+        kernel.state().is_unheld(),
+        "fixture: unheld mid self-replace"
+    );
+    assert!(!kernel.self_replace_stopped(), "fixture: not stopped yet");
+    let mut frozen = our_record(fenced, e_new_at(5));
+    frozen.frozen = true;
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &grant_read(PROVEN + 2, found(8, &frozen)),
+        )
+        .expect("the read-back");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+        "fixture: Never"
+    );
+    assert!(kernel.state().is_unheld());
+    assert!(
+        !kernel.self_replace_polling(),
+        "not fenced, so polling says nothing"
+    );
+    assert!(kernel.self_replace_stopped(), "A1 stopped trying");
+}
+
+/// Round 10 (dev-s2b): the grant record is deleted while `Unheld` mid self-replace. The replace
+/// conflicts and the read-back finds no record. After a fence an absent key is not a free one to
+/// create (A-R96: the only exit is a CAS at the exact revision read), so the self-replace stops,
+/// as the fenced poll's absent answer stops it, and `self_replace_stopped` says so. No CAS, no
+/// re-arm.
+#[retcd_test]
+fn an_absent_record_while_unheld_mid_self_replace_stops_the_self_replace() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &cas_result(
+                PROVEN + 1,
+                PROVEN + 1,
+                request,
+                CasOutcome::Conflict {
+                    exists: false,
+                    current: Revision(8),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    assert!(
+        kernel.state().is_unheld(),
+        "fixture: unheld mid self-replace"
+    );
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &grant_read(PROVEN + 2, ReadOutcome::Absent { as_of: Revision(8) }),
+        )
+        .expect("the read-back");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::NotOurs)],
+        "no CAS, no re-arm"
+    );
+    assert!(
+        kernel.self_replace_stopped(),
+        "A1 stopped trying, and says so"
+    );
+}
+
+/// Critic A5 (A-R96): a read of our record lands while the replace CAS is in flight. It records
+/// nothing: when the replace then conflicts and the read-back is not yet proven, the next firing
+/// polls again rather than CASing at the revision the in-flight read saw.
+#[retcd_test]
+fn after_a_fence_a_read_under_an_in_flight_replace_leaves_no_replace_target() {
+    let (mut kernel, fenced, poll) = fenced_and_polled();
+    let record = our_record(fenced, e_new_at(5));
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &record)),
+        )
+        .expect("the poll's answer");
+    let request = sent_as(&replace);
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 1, PROVEN),
+            &grant_read(PROVEN + 1, found(7, &record)),
+        )
+        .expect("a read under the in-flight replace");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Ignored(AuthorityIgnoreReason::StaleTimer)]
+    );
+    kernel
+        .step(
+            &sampled_at(PROVEN + 2, PROVEN),
+            &cas_result(
+                PROVEN + 2,
+                PROVEN + 2,
+                request,
+                CasOutcome::Conflict {
+                    exists: true,
+                    current: Revision(50),
+                },
+            ),
+        )
+        .expect("the replace conflicts");
+    let late = our_record(fenced, e_new_at(505));
+    let effects = kernel
+        .step(
+            &sampled_at(PROVEN + 3, PROVEN),
+            &grant_read(PROVEN + 3, found(50, &late)),
+        )
+        .expect("the read-back, not yet proven");
+    assert_eq!(
+        shapes(&effects)[0],
+        Shape::Ignored(AuthorityIgnoreReason::AcquireWithheld)
+    );
+    let at = PROVEN + 3 + BUDGETS.renew_millis;
+    let due = acquire_due(&kernel, at, at);
+    let effects = kernel
+        .step(&sampled_at(at, at), &due)
+        .expect("the re-armed firing");
+    assert_eq!(
+        shapes(&effects),
+        vec![Shape::Get(ControlKey::Grant(NODE))],
+        "a poll, never a CAS at revision 7"
+    );
+}
+
+/// `kernel`, holding `fenced` from [`held`], fences on expiry at [`LAPSE`], polls, proves the
+/// record expired and replaces it under a new grant id in the same boot (S2b-E). Returns the tick
+/// the replace committed at.
+fn self_replaced(kernel: &mut Authority, fenced: GrantId) -> u64 {
+    kernel
+        .step(&ctx(LAPSE), &probe(LAPSE))
+        .expect("the lapse fence");
+    assert!(kernel.state().is_fenced(), "fixture: fenced");
+    let due = acquire_due(kernel, 3_100, 3_100);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(3_100, 3_100), &due)
+            .expect("the fenced Acquire row"),
+    );
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let at = PROVEN + 5;
+    kernel
+        .step(
+            &sampled_at(at, PROVEN),
+            &cas_result(
+                at,
+                at,
+                sent_as(&replace),
+                CasOutcome::Committed(Revision(9)),
+            ),
+        )
+        .expect("the replace commits");
+    let held = kernel
+        .state()
+        .held()
+        .expect("fixture: Held again, same boot");
+    assert_ne!(held.identity().grant, fenced, "fixture: a new grant id");
+    at
+}
+
+/// A coherent partitions snapshot at `revision` holding `p1` at [`p1_lineage`], at tick `at`.
+fn p1_snapshot(at: u64, revision: u64) -> Event {
+    let record = PartitionRecord {
+        partition: P1,
+        owner: NODE,
+        generation: Generation(1),
+        owner_epoch: OwnerEpoch(1),
+        config_version: ConfigVersion(1),
+        lifecycle: PartitionLifecycle::Serving,
+    };
+    event(
+        at,
+        at,
+        EventKind::Control(ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Partitions,
+            snapshot_revision: Revision(revision),
+            records: vec![ControlRecord {
+                key: ControlKey::Partition(P1),
+                revision: Revision(revision),
+                value: record.encode(),
+            }],
+        }),
+    )
+}
+
+/// The views of `p1` in `effects` that still admit at `now`.
+fn admitting_p1_views(effects: &[Effect], now: u64) -> Vec<AuthorityView> {
+    effects
+        .iter()
+        .filter_map(|effect| match &effect.kind {
+            EffectKind::Kernel(KernelEffect::Authority(AuthorityEffect::PublishAuthorityView(
+                view,
+            ))) if view.lineage.partition == P1 && now <= view.valid_through_tick.0 => Some(*view),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Round 4 (review lane, spec §5.2 step 3, ADR-rdb-0007 §3): a storage fence holds for the rest
+/// of the generation. `p1` is served under grant 1 and its local write fails, so `p1` is fenced
+/// `LocalStorageFenced`. Then the node fences on expiry, replaces its own record under a new grant
+/// id in the same boot (S2b-E), and installs `p1` again under the new grant. The disk is the same
+/// disk: `p1` must still be refused `LocalStorageFenced`, and no view of it may admit.
+#[retcd_test]
+fn a_storage_fence_outlives_a_same_boot_self_replace() {
+    let (mut kernel, fenced) = held();
+    serve_p1(&mut kernel, &ctx(6));
+    let effects = kernel
+        .step(
+            &ctx(7),
+            &event(
+                7,
+                7,
+                EventKind::Storage(StorageEvent::CommitFailed {
+                    batch: BatchId(1),
+                    fault: StorageFault::WriteFailed,
+                }),
+            ),
+        )
+        .expect("the storage fence row");
+    assert_eq!(
+        fence_shapes(&effects),
+        vec![Shape::Fence(
+            FenceScope::Partition(P1),
+            DenyReason::LocalStorageFenced
+        )],
+        "fixture: p1 storage-fenced under grant 1"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_lineage(), Tick(7), &BUDGETS),
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+        "fixture"
+    );
+
+    let now = self_replaced(&mut kernel, fenced) + 1;
+    let effects = kernel
+        .step(&sampled_at(now, PROVEN), &p1_snapshot(now, 10))
+        .expect("p1 installed under the new grant");
+    assert!(
+        kernel.view().served.contains_key(&P1),
+        "fixture: p1 served under the new grant"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_lineage(), Tick(now), &BUDGETS),
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+        "the storage fence holds across the self-replace"
+    );
+    assert!(
+        kernel.view().storage_fenced.contains(&P1),
+        "the fence is still recorded"
+    );
+    assert_eq!(
+        admitting_p1_views(&effects, now),
+        vec![],
+        "no admitting view of p1"
+    );
+}
+
+/// Round 7, F-017 (A-R98 N1): the storage fault arrives on the step whose `revalidate` fences the
+/// node on expiry, so A1 is already `Fenced` when the fault reaches it. The failure is a fact
+/// about this disk for the rest of the boot, whatever A1's state, so `p1` is still recorded
+/// storage-fenced. After a same-boot self-replace and `p1`'s install under the new grant, `p1` is
+/// refused `LocalStorageFenced` and no view of it admits.
+#[retcd_test]
+fn a_storage_fault_on_the_step_that_fences_the_node_still_fences_the_partition() {
+    let (mut kernel, fenced) = held();
+    serve_p1(&mut kernel, &ctx(6));
+    kernel
+        .step(
+            &ctx(LAPSE),
+            &event(
+                LAPSE,
+                LAPSE,
+                EventKind::Storage(StorageEvent::CommitFailed {
+                    batch: BatchId(1),
+                    fault: StorageFault::WriteFailed,
+                }),
+            ),
+        )
+        .expect("the lapse step carrying the storage fault");
+    assert!(
+        kernel.state().is_fenced(),
+        "fixture: the same step fenced the node"
+    );
+
+    let due = acquire_due(&kernel, 3_100, 3_100);
+    let poll = poll_sent(
+        &kernel
+            .step(&sampled_at(3_100, 3_100), &due)
+            .expect("the fenced Acquire row"),
+    );
+    let replace = kernel
+        .step(
+            &sampled_at(PROVEN, PROVEN),
+            &polled(PROVEN, poll, found(7, &our_record(fenced, e_new_at(5)))),
+        )
+        .expect("the poll's answer");
+    let at = PROVEN + 5;
+    kernel
+        .step(
+            &sampled_at(at, PROVEN),
+            &cas_result(
+                at,
+                at,
+                sent_as(&replace),
+                CasOutcome::Committed(Revision(9)),
+            ),
+        )
+        .expect("the replace commits");
+    let held_now = kernel
+        .state()
+        .held()
+        .expect("fixture: Held again, same boot");
+    assert_ne!(held_now.identity().grant, fenced, "fixture: a new grant id");
+
+    let now = at + 1;
+    let effects = kernel
+        .step(&sampled_at(now, PROVEN), &p1_snapshot(now, 10))
+        .expect("p1 installed under the new grant");
+    assert!(kernel.view().served.contains_key(&P1), "fixture: p1 served");
+    assert!(
+        kernel.view().storage_fenced.contains(&P1),
+        "the fault is recorded though A1 was fenced when it arrived"
+    );
+    assert_eq!(
+        kernel.may_admit_at(p1_lineage(), Tick(now), &BUDGETS),
+        Verdict::Deny(DenyReason::LocalStorageFenced),
+        "a write fault seen while fenced still fences p1 under the new grant"
+    );
+    assert_eq!(
+        admitting_p1_views(&effects, now),
+        vec![],
+        "no admitting view of p1"
+    );
+}
+
+/// Round 4, lead ruling A-R97: the A1 half of the path the verifier traced, steps 1-3. Under
+/// grant 1 a snapshot drops `p1`, which fences it `GenerationChanged` at partition scope and
+/// leaves a tombstone. The node fences, self-replaces to grant 2, and a newer snapshot installs
+/// the **identical** lineage again: nothing asks for a new owner epoch, so A1 publishes an
+/// admitting view of that lineage under grant 2. This row pins that A1 does (it is not A1's
+/// fault: re-adopting past a tombstone is A-R48b). The kernel half, step 4, is
+/// `a_partition_scope_lost_authority_freeze_never_thaws_in_m9` in T1 and P1, which must not thaw
+/// on this view.
+#[retcd_test]
+fn a_partition_fence_then_self_replace_republishes_the_identical_lineage() {
+    let (mut kernel, fenced) = held();
+    serve_p1(&mut kernel, &ctx(6));
+    let dropped = event(
+        7,
+        7,
+        EventKind::Control(ControlEvent::FamilySnapshot {
+            prefix: ControlPrefix::Partitions,
+            snapshot_revision: Revision(11),
+            records: vec![],
+        }),
+    );
+    let effects = kernel
+        .step(&ctx(7), &dropped)
+        .expect("the dropping snapshot");
+    assert_eq!(
+        fence_shapes(&effects),
+        vec![Shape::Fence(
+            FenceScope::Partition(P1),
+            DenyReason::GenerationChanged
+        )],
+        "step 1: a partition-scope fence under grant 1"
+    );
+
+    let now = self_replaced(&mut kernel, fenced) + 1;
+    let effects = kernel
+        .step(&sampled_at(now, PROVEN), &p1_snapshot(now, 12))
+        .expect("step 3: the identical lineage, newer revision");
+    let views = admitting_p1_views(&effects, now);
+    let [view] = views.as_slice() else {
+        panic!("one admitting view of p1: {effects:?}");
+    };
+    assert_eq!(view.lineage, p1_lineage(), "the identical lineage");
+    assert_ne!(view.grant_id, fenced, "under the new grant");
 }

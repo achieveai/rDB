@@ -10,9 +10,9 @@
 //! read mutates nothing). None waits for ever.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -20,7 +20,7 @@ use config_core::ConfigStore;
 use rdb_core::contracts::errors::{ErrorKind, RdbError, RetryRule};
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
+    AffinityId, BootId, ClientId, Generation, GrantId, NodeId, OwnerEpoch, PartitionId, RequestId,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::trace::ReadServiceOutcome;
@@ -32,7 +32,8 @@ use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
 use crate::host::{
-    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, PutOp, TXN_WAITER_MARGIN_MILLIS,
+    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, NodeStopped, PutOp,
+    TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::transport::Links;
 
@@ -319,12 +320,21 @@ pub enum OpenError {
 
 /// Three rDB nodes in this process, serving partition 1.
 pub struct Db {
-    nodes: Vec<NodeHandle>,
+    /// The running node threads. Under a lock, because [`Db::restart_node`] replaces one while
+    /// other threads keep calling.
+    nodes: Mutex<Vec<NodeHandle>>,
+    /// What [`Db::restart_node`] starts a node again with. `None` in a `Db` a crate test builds
+    /// by hand around threadless nodes.
+    respawn: Option<Respawn>,
     links: Arc<Links>,
     control: Arc<ControlAdapter>,
     clock: HostClock,
     timeouts: Timeouts,
     next_request: AtomicU64,
+    /// Whether node 1 has been seen admitting writes: by [`Db::node_status`], by a put that
+    /// was answered, or by [`Db::restart_node`]'s own look. Never cleared, so a node can still
+    /// be restarted once writes have stopped (M9 S2b, D3).
+    ready_seen: AtomicBool,
     /// The `nodes/` this open claimed, while the open is unfinished. Dropping the `Db` then
     /// removes it after the nodes have stopped, whether the open failed or was cancelled
     /// (F-001, F-003). `None` once the open succeeds, so a served `Db` never removes its data.
@@ -335,6 +345,20 @@ impl std::fmt::Debug for Db {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Db").finish_non_exhaustive()
     }
+}
+
+/// How the open started its nodes, kept so a restarted node starts the same way.
+#[derive(Debug, Clone)]
+struct Respawn {
+    nodes_dir: PathBuf,
+    budgets: Budgets,
+    limits: Limits,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Db {
@@ -357,7 +381,7 @@ impl Db {
     /// can be run again against the same store. A store error is
     /// [`admin::BootstrapError::Control`]; the next open adopts the record if it was written.
     ///
-    /// S0 supports one `Db` per control store. Every `Db` runs nodes 1-3 with [`host::BOOT`], so
+    /// S0 supports one `Db` per control store. Every `Db` starts nodes 1-3 at [`host::BOOT`], so
     /// a second `Db` on the same store is refused with [`admin::BootstrapError::AlreadyExists`]
     /// or, if it opens before the first has committed generation 1, opens but never becomes
     /// ready.
@@ -378,15 +402,31 @@ impl Db {
     ) -> Result<Self, OpenError> {
         let limits = limits(config.dedup_cap)?;
         tracing::info!(dedup_cap = limits.dedup_cap, "db_open");
-        Self::open_spawning(
+        let respawn = Respawn {
+            nodes_dir: config.dir.join("nodes"),
+            budgets,
+            limits,
+        };
+        let mut db = Self::open_spawning(
             config,
             store,
             rt,
             move |node, dir, links, control, clock| {
-                host::spawn_with(node, dir, links, control, clock, budgets, limits)
+                host::spawn_with(
+                    node,
+                    dir,
+                    links,
+                    control,
+                    clock,
+                    budgets,
+                    limits,
+                    host::BOOT,
+                )
             },
         )
-        .await
+        .await?;
+        db.respawn = Some(respawn);
+        Ok(db)
     }
 
     /// [`Self::open_with`] with `spawn` starting each node, so a crate test can fail one.
@@ -424,12 +464,14 @@ impl Db {
         // far, shuts the control adapter down, then removes `nodes/` (F-004, F-005, F-003). So
         // the same open can run again.
         let mut db = Self {
-            nodes: Vec::with_capacity(3),
+            nodes: Mutex::new(Vec::with_capacity(3)),
+            respawn: None,
             links,
             control,
             clock,
             timeouts: config.timeouts,
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: Some(nodes_dir.clone()),
         };
         db.start(&nodes_dir, &store, spawn).await?;
@@ -461,17 +503,24 @@ impl Db {
                 self.clock,
             )
             .map_err(OpenError::Node)?;
-            self.nodes.push(handle);
+            lock(&self.nodes).push(handle);
         }
-        let owner = self
-            .node(OWNER)
-            .ok_or_else(|| OpenError::Node("no owner node".into()))?;
-        admin::bootstrap(store, self.clock.now(), |msg| owner.send(msg)).await?;
+        if !lock(&self.nodes).iter().any(|handle| handle.node == OWNER) {
+            return Err(OpenError::Node("no owner node".into()));
+        }
+        admin::bootstrap(store, self.clock.now(), |msg| self.send_to(OWNER, msg)).await?;
         Ok(())
     }
 
-    fn node(&self, node: NodeId) -> Option<&NodeHandle> {
-        self.nodes.iter().find(|handle| handle.node == node)
+    /// Send `msg` to `node`'s running process. The lock is held for the send only, never while
+    /// an answer is awaited.
+    fn send_to(&self, node: NodeId, msg: Msg) -> Result<(), NodeStopped> {
+        let nodes = lock(&self.nodes);
+        let handle = nodes
+            .iter()
+            .find(|handle| handle.node == node)
+            .ok_or(NodeStopped(node))?;
+        handle.send(msg)
     }
 
     fn identity(&self) -> RequestIdentity {
@@ -489,8 +538,7 @@ impl Db {
             call,
             reply,
         });
-        let owner = self.node(OWNER)?;
-        if owner.send(msg).is_err() {
+        if self.send_to(OWNER, msg).is_err() {
             return Some(Answer::Error {
                 error: ApiError::host("the owner's node thread has stopped"),
                 request: None,
@@ -547,7 +595,10 @@ impl Db {
             client: CLIENT,
             request,
         };
-        maybe_mutated(self.put_identified(identity, object, value, if_version))
+        self.retried(
+            request,
+            self.put_identified(identity, object, value, if_version),
+        )
     }
 
     fn put_identified(
@@ -621,7 +672,7 @@ impl Db {
         };
         let refused = |error| {
             Err(PutError {
-                error,
+                error: self.explained(error),
                 request: None,
             })
         };
@@ -653,7 +704,8 @@ impl Db {
     /// the request carries, never [`Timeouts::put`] (S1-R-003): a txn's deadline can be 30 s.
     pub fn resend(&self, request: TxnRequest) -> Result<PutOk, PutError> {
         let wait = send_wait(Duration::from_millis(request.remaining_millis));
-        maybe_mutated(self.send(ClientCall::Resend { request }, wait))
+        let id = request.identity.request;
+        self.retried(id, self.send(ClientCall::Resend { request }, wait))
     }
 
     /// Send `request` again with a fresh kernel deadline, `deadline`: same identity, same
@@ -670,14 +722,21 @@ impl Db {
         mut request: TxnRequest,
         deadline: Duration,
     ) -> Result<PutOk, PutError> {
+        let id = request.identity.request;
         if let Some(error) = deadline_refusal(deadline) {
-            return maybe_mutated(Err(PutError {
-                error,
-                request: Some(Box::new(request)),
-            }));
+            return self.retried(
+                id,
+                Err(PutError {
+                    error,
+                    request: Some(Box::new(request)),
+                }),
+            );
         }
         request.remaining_millis = millis(deadline);
-        maybe_mutated(self.send(ClientCall::Resend { request }, send_wait(deadline)))
+        self.retried(
+            id,
+            self.send(ClientCall::Resend { request }, send_wait(deadline)),
+        )
     }
 
     /// Send a write and wait `wait` for its answer.
@@ -690,7 +749,7 @@ impl Db {
             ClientCall::Resend { request } => request.identity.request,
             _ => RequestId(0),
         };
-        match self.call(call, wait) {
+        let answered = match self.call(call, wait) {
             Some(Answer::Txn { result, request }) => Ok(PutOk {
                 request: identity,
                 generation: result.generation,
@@ -717,7 +776,14 @@ impl Db {
                 ),
                 request: sent.map(Box::new),
             }),
+        };
+        if answered.is_ok() {
+            self.ready_seen.store(true, Ordering::Relaxed);
         }
+        answered.map_err(|PutError { error, request }| PutError {
+            error: self.explained(error),
+            request,
+        })
     }
 
     /// Read `object` at the publication barrier.
@@ -747,7 +813,7 @@ impl Db {
     }
 
     fn read(&self, call: ClientCall) -> Result<GetOk, ApiError> {
-        match self.call(call, self.timeouts.read) {
+        let answered = match self.call(call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
                 ..
@@ -771,10 +837,20 @@ impl Db {
                 ErrorKind::Unavailable,
                 format!("no read answer in {:?}", self.timeouts.read),
             )),
-        }
+        };
+        answered.map_err(|error| self.explained(error))
     }
 
     /// What became of this client's request `request`.
+    ///
+    /// After a restart ([`Self::restart_note`] is `Some`), `Unknown` is not evidence that a write
+    /// was lost, even one answered `ok`. After the owner's restart, or both secondaries', its
+    /// outcome cannot be known until a restarted node rejoins (M10, achieveai/rDB#42). After one
+    /// secondary's, it resolves once the other secondary can take the write: healing a link to
+    /// it is enough (tester walk 5, W5-D1). That holds only for a write node 1 holds in flight,
+    /// applied and unpublished ([`NodeStatus::in_flight`]). `Unknown` also answers a request
+    /// refused at admission, which was never queued: nothing resolves it, and it stays `Unknown`
+    /// (Msg 8, W6-D1).
     ///
     /// # Errors
     ///
@@ -789,7 +865,7 @@ impl Db {
             client: CLIENT,
             request,
         };
-        match self.call(
+        let answered = match self.call(
             ClientCall::Status {
                 identity,
                 generation,
@@ -805,25 +881,23 @@ impl Db {
                 ErrorKind::Unavailable,
                 format!("no status answer in {:?}", self.timeouts.read),
             )),
-        }
+        };
+        answered.map_err(|error| self.explained(error))
     }
 
     /// Each node's state for partition 1, in node order. A node that does not answer within
     /// the read timeout is left out.
     #[must_use]
     pub fn node_status(&self) -> Vec<NodeStatus> {
-        self.nodes
-            .iter()
-            .filter_map(|handle| {
-                let (reply, answer) = mpsc::channel();
-                handle
-                    .send(Msg::Inspect {
-                        partition: PARTITION,
-                        reply,
-                    })
-                    .ok()?;
-                let mut status = answer.recv_timeout(self.timeouts.read).ok()?;
+        let nodes: Vec<NodeId> = lock(&self.nodes).iter().map(|handle| handle.node).collect();
+        nodes
+            .into_iter()
+            .filter_map(|node| {
+                let mut status = self.inspect(node)?;
                 status.reload_pending = self.control.reload_pending(status.node);
+                if status.node == OWNER && status.admits == Some(true) {
+                    self.ready_seen.store(true, Ordering::Relaxed);
+                }
                 Some(status)
             })
             .collect()
@@ -841,9 +915,298 @@ impl Db {
         self.clock.now()
     }
 
+    /// The boot `node`'s running process has, or `None` for a node this `Db` does not run. After
+    /// a restart that failed, the boot that restart gave it: no process runs it, and the old
+    /// boot is retired either way (F-013).
+    #[must_use]
+    pub fn boot_of(&self, node: NodeId) -> Option<BootId> {
+        lock(&self.nodes)
+            .iter()
+            .find(|handle| handle.node == node)
+            .map(|handle| handle.boot)
+    }
+
+    /// Whether `node`'s last restart failed, so no process runs it (F-013). [`Self::node_status`]
+    /// leaves such a node out, as it does one that did not answer in time; this tells the two
+    /// apart (W7-D3).
+    #[must_use]
+    pub fn restart_failed(&self, node: NodeId) -> bool {
+        lock(&self.nodes)
+            .iter()
+            .any(|handle| handle.node == node && handle.start_failed)
+    }
+
+    /// Why writes stopped for good, once a node of this `Db` has restarted or failed to restart;
+    /// `None` while every node runs its first boot. Names each restarted node and its boot, and
+    /// says when the restart failed and the node stays stopped (F-013), in one short clause,
+    /// because it rides on every refused answer (tester walk 5): a restarted copy does not
+    /// rejoin before M10 (achieveai/rDB#42), so writes do not resume, and this `Db`'s data and
+    /// control store cannot be opened again (`NotEmpty`, `AlreadyExists`), so writing again
+    /// takes a new `Db` on new ones (M9 S2b, D2).
+    #[must_use]
+    pub fn restart_note(&self) -> Option<String> {
+        let restarted: Vec<String> = lock(&self.nodes)
+            .iter()
+            .filter(|handle| handle.boot != host::BOOT)
+            .map(|handle| {
+                let (node, boot) = (handle.node.0, handle.boot.0);
+                let who = if handle.node == OWNER {
+                    format!("the owner, node {node},")
+                } else {
+                    format!("node {node}")
+                };
+                if handle.start_failed {
+                    format!("{who} stopped: its restart as boot {boot} failed")
+                } else {
+                    format!("{who} restarted (now boot {boot})")
+                }
+            })
+            .collect();
+        (!restarted.is_empty()).then(|| {
+            format!(
+                "{}; a restarted node stays out until M10 (#42)",
+                restarted.join(", ")
+            )
+        })
+    }
+
+    /// `error` with [`Self::restart_note`] appended to its detail, for the kinds a restart
+    /// leaves every later call with: `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME`, and
+    /// `NOT_PRIMARY`, whose `RefreshRoute` would otherwise send the caller looking for a primary
+    /// that no node becomes again in M9 (tester W3-D1). The kind, retry rule and mutation proof
+    /// are unchanged.
+    fn explained(&self, mut error: ApiError) -> ApiError {
+        let Some(note) = self.restart_note() else {
+            return error;
+        };
+        match error.kind {
+            ErrorKind::ProtectionPaused | ErrorKind::Unavailable | ErrorKind::UnknownOutcome => {
+                error.detail = format!("{}; {note}", error.detail);
+            }
+            ErrorKind::NotPrimary => {
+                error.detail = format!(
+                    "{}; no node becomes primary again in M9: {note}",
+                    error.detail
+                );
+            }
+            _ => {}
+        }
+        error
+    }
+
+    /// Whether node 1 admits writes or has been seen to; looks once when it has not.
+    fn ready(&self) -> bool {
+        if self.ready_seen.load(Ordering::Relaxed) {
+            return true;
+        }
+        let admits = self
+            .inspect(OWNER)
+            .is_some_and(|status| status.admits == Some(true));
+        if admits {
+            self.ready_seen.store(true, Ordering::Relaxed);
+        }
+        admits
+    }
+
+    /// `node`'s state for partition 1, or `None` when it does not answer within the read
+    /// timeout.
+    fn inspect(&self, node: NodeId) -> Option<NodeStatus> {
+        let (reply, answer) = mpsc::channel();
+        self.send_to(
+            node,
+            Msg::Inspect {
+                partition: PARTITION,
+                reply,
+            },
+        )
+        .ok()?;
+        answer.recv_timeout(self.timeouts.read).ok()
+    }
+
+    /// A resend's or retry's answer under `request`: whatever refused it, the request may have
+    /// applied on an earlier send. Kernel checks 2 (deadline) and 9 (overload) run before the
+    /// dedup replay and prove only that this send mutated nothing (Q-A). A `PROTECTION_PAUSED`
+    /// refusal points at [`Self::status`] only when status shows, or will show, the outcome
+    /// ([`Self::status_will_show`]): F1 refuses a retry of a finished write paused too (Message
+    /// 7, P2), but a request refused at admission was never queued, and nothing resolves it
+    /// (Msg 8, W6-D1). A new put's refusal does not come through here.
+    fn retried(
+        &self,
+        request: RequestId,
+        answer: Result<PutOk, PutError>,
+    ) -> Result<PutOk, PutError> {
+        answer.map_err(|mut refused| {
+            refused.error.no_mutation = false;
+            if refused.error.kind == ErrorKind::ProtectionPaused && self.status_will_show(request) {
+                refused.error.detail = format!(
+                    "{}; status {} shows its outcome",
+                    refused.error.detail, request.0
+                );
+            }
+            refused
+        })
+    }
+
+    /// Whether [`Self::status`] of `request` shows its outcome now, or will once it publishes:
+    /// node 1 holds it applied and unpublished (`in_flight`), or status already answers more
+    /// than `Unknown`. Node 1 is asked first, so a request that publishes between the two looks
+    /// is found by the second. A look that fails answers `false`: the refusal then promises
+    /// nothing, which is never untrue.
+    fn status_will_show(&self, request: RequestId) -> bool {
+        if self
+            .inspect(OWNER)
+            .is_some_and(|owner| owner.in_flight == Some(request))
+        {
+            return true;
+        }
+        matches!(
+            self.status(request, None),
+            Ok(TxnStatus::Resolved(_) | TxnStatus::Unresolved { .. })
+        )
+    }
+
+    /// The budgets every node runs with, or `None` in a `Db` a crate test builds by hand.
+    pub(crate) fn budgets(&self) -> Option<Budgets> {
+        self.respawn.as_ref().map(|respawn| respawn.budgets)
+    }
+
+    /// A `Db` around `nodes` built by hand, for crate tests (`NodeHandle::unanswered`).
+    /// `respawn` names where [`Self::restart_node`] starts a node and the budgets it uses, and
+    /// is what lets [`crate::admin::clear_grant`] judge; `None` refuses both.
+    #[cfg(test)]
+    pub(crate) fn by_hand(
+        nodes: Vec<NodeHandle>,
+        store: Arc<dyn ConfigStore>,
+        rt: &Handle,
+        timeouts: Timeouts,
+        respawn: Option<(PathBuf, Budgets)>,
+    ) -> Self {
+        let links = Links::new();
+        Self {
+            nodes: Mutex::new(nodes),
+            respawn: respawn.map(|(nodes_dir, budgets)| Respawn {
+                nodes_dir,
+                budgets,
+                limits: Limits::default(),
+            }),
+            links: Arc::clone(&links),
+            control: ControlAdapter::new(store, rt.clone(), links),
+            clock: HostClock::start(),
+            timeouts,
+            next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
+            unwind: None,
+        }
+    }
+
+    /// Stop `node`'s process and start it again on the same data at its boot plus one, as a
+    /// process supervisor would (M9 S2b; a real supervisor takes over in M10). Returns the new
+    /// boot.
+    ///
+    /// In order: the old thread is stopped and joined, which drops its engine and releases
+    /// RocksDB's `LOCK` on `nodes/<n>`; the control adapter forgets the node's watches, reloads
+    /// and calls ([`ControlAdapter::forget_node`]); the node starts again at the new boot and
+    /// takes over its mailbox. A completion the old process asked for that still arrives carries
+    /// the old boot and is dropped (`control_stale_boot_dropped`).
+    ///
+    /// The new process holds no role and stays out. Its peers' membership pins the old boot, so
+    /// they refuse its acknowledgements, and nothing in M9 arms it to acquire a grant: rejoining
+    /// takes a re-pin with catch-up, which is M10.
+    ///
+    /// So in M9 restarting **any** node stops writes for the life of the `Db`. A restarted
+    /// secondary's copy is never durable again, so L1 pauses writes within about 2 s of the next
+    /// write (spec §6.2): about 2 s after the restart, or, after a fence, about 2 s after the
+    /// first write that follows it (tester q8, F-015). Nothing un-pauses them before M10. Puts
+    /// already admitted may still land in that window. A restarted owner never takes a grant
+    /// again: its old grant can be cleared ([`crate::admin::clear_grant`]), but nothing acquires
+    /// a new one. Logged as `node_restarted{node, old_boot, boot}`. From then on a
+    /// `PROTECTION_PAUSED`, `UNAVAILABLE`, `UNKNOWN_OUTCOME` or `NOT_PRIMARY` answer says so
+    /// ([`Self::restart_note`]).
+    ///
+    /// # Errors
+    ///
+    /// `UNAVAILABLE`, with nothing stopped, before this `Db` is ready: node 1 has never been seen
+    /// admitting writes (logged `node_restart_refused_not_ready`). `INVALID_ARGUMENT` for a node
+    /// this `Db` does not run, or a `Db` with no data directory (a crate test's). A host error
+    /// when the node does not start again: it then stays stopped, [`Self::boot_of`] names the
+    /// boot it was given, and [`Self::restart_note`] says the restart failed (F-013).
+    pub fn restart_node(&self, node: NodeId) -> Result<BootId, ApiError> {
+        let Some(respawn) = &self.respawn else {
+            return Err(ApiError::invalid(
+                "this Db was built without a data directory, so it cannot restart a node",
+            ));
+        };
+        // Before the lock: the look asks node 1 through it.
+        if !self.ready() {
+            tracing::warn!(node = node.0, "node_restart_refused_not_ready");
+            return Err(ApiError {
+                kind: ErrorKind::Unavailable,
+                retry: RetryRule::BoundedJitter,
+                no_mutation: true,
+                detail: format!(
+                    "node {} not restarted: this Db is not ready yet (node 1 has not admitted \
+                     a write); restart a node only once it is ready",
+                    node.0
+                ),
+            });
+        }
+        // Held throughout, so no call reaches a half-restarted node: a call meanwhile waits.
+        let mut nodes = lock(&self.nodes);
+        let Some(handle) = nodes.iter_mut().find(|handle| handle.node == node) else {
+            return Err(ApiError::invalid(format!(
+                "node {}: no such node; this Db runs nodes 1, 2 and 3",
+                node.0
+            )));
+        };
+        let old_boot = handle.boot;
+        let boot = BootId(old_boot.0 + 1);
+        handle.stop();
+        self.control.forget_node(node, old_boot);
+        let started = host::spawn_with(
+            node,
+            respawn.nodes_dir.join(node.0.to_string()),
+            Arc::clone(&self.links),
+            Arc::clone(&self.control),
+            self.clock,
+            respawn.budgets,
+            respawn.limits,
+            boot,
+        );
+        match started {
+            Ok(started) => {
+                *handle = started;
+                tracing::info!(
+                    node = node.0,
+                    old_boot = old_boot.0,
+                    boot = boot.0,
+                    "node_restarted"
+                );
+                Ok(boot)
+            }
+            Err(detail) => {
+                tracing::error!(
+                    node = node.0,
+                    old_boot = old_boot.0,
+                    boot = boot.0,
+                    %detail,
+                    "node_restart_failed"
+                );
+                // The old process is gone and its boot is retired: name the boot it was given,
+                // so nothing calls the old boot's grant "running" (F-013).
+                handle.boot = boot;
+                handle.start_failed = true;
+                Err(ApiError::host(&detail))
+            }
+        }
+    }
+
     /// Stop every node and every control call. The control store stays the caller's.
     pub fn shutdown(&mut self) {
-        for handle in &mut self.nodes {
+        for handle in self
+            .nodes
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             handle.stop();
         }
         self.control.shutdown();
@@ -944,16 +1307,6 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
             deadline.as_millis(),
             MAX_TXN_DEADLINE.as_millis()
         ))
-    })
-}
-
-/// A resend's answer: whatever refused it, the request may have applied on an earlier send.
-/// Kernel checks 2 (deadline) and 9 (overload) run before the dedup replay and prove only that
-/// this send mutated nothing (Q-A).
-fn maybe_mutated(answer: Result<PutOk, PutError>) -> Result<PutOk, PutError> {
-    answer.map_err(|mut refused| {
-        refused.error.no_mutation = false;
-        refused
     })
 }
 
@@ -1177,7 +1530,8 @@ mod tests {
         let links = Links::new();
         let (owner, mailbox) = NodeHandle::unanswered(OWNER);
         let mut db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
@@ -1186,6 +1540,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
 
@@ -1371,7 +1726,8 @@ mod tests {
         let dropper = std::thread::spawn(move || drop(mailbox.recv()));
         let put = Duration::from_secs(5);
         let mut db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
@@ -1380,6 +1736,7 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
 
@@ -1416,12 +1773,14 @@ mod tests {
         let links = Links::new();
         let (owner, mailbox) = NodeHandle::unanswered(OWNER);
         let mut db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
             timeouts: Timeouts::default(),
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
         let cases = [
@@ -1517,6 +1876,7 @@ mod tests {
                 clock,
                 Budgets::SPEC_DEFAULTS,
                 Limits::default(),
+                host::BOOT,
             )
         };
 
@@ -1621,6 +1981,7 @@ mod tests {
                             clock,
                             fast(),
                             Limits::default(),
+                            host::BOOT,
                         )?;
                         if node == NodeId(3) {
                             race.wait("the loser returns while these nodes run", other, |s| s.1);
@@ -2046,6 +2407,187 @@ mod tests {
         db.shutdown();
     }
 
+    /// Message 7, P2. F1 keeps a retry of a finished write `PROTECTION_PAUSED`, so a refused
+    /// resend or retry says `status <id>` shows its outcome. A new txn or put refused paused
+    /// sent nothing before, so it does not. Same pause as scenario 3b above: links 1-2 and 1-3
+    /// held, one txn unpublished.
+    /// Integration (~1 s): three node threads and one 100 ms expiry.
+    #[test]
+    fn a_paused_resend_or_retry_points_at_status_and_a_paused_new_write_does_not() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let budgets = Budgets {
+            warn_age_millis: 2_000,
+            pause_age_millis: 4_000,
+            ..fast()
+        };
+        let config = DbConfig {
+            timeouts: Timeouts {
+                put: Duration::from_millis(500),
+                ..Timeouts::default()
+            },
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
+            .expect("open");
+        admits(&db, "after the open");
+        db.links().hold(NodeId(1), NodeId(2));
+        db.links().hold(NodeId(1), NodeId(3));
+        let unknown = db
+            .txn(&[txn_put(b"a", b"1", None)], Duration::from_millis(100))
+            .expect_err("nothing can acknowledge it");
+        assert_eq!(unknown.error.kind, ErrorKind::UnknownOutcome, "{unknown:?}");
+
+        let clause = "shows its outcome";
+        let new_txn = db
+            .txn(&[txn_put(b"b", b"1", None)], Duration::from_secs(2))
+            .expect_err("3b: refused while the first txn is unpublished");
+        assert_eq!(
+            new_txn.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{new_txn:?}"
+        );
+        assert!(!new_txn.error.detail.contains(clause), "{new_txn:?}");
+        let new_put = db
+            .put(b"c", b"1", None)
+            .expect_err("a new put is refused too");
+        assert_eq!(
+            new_put.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{new_put:?}"
+        );
+        assert!(!new_put.error.detail.contains(clause), "{new_put:?}");
+
+        // Msg 8, W6-D1: the clause follows what is in flight. The first txn applied and waits
+        // to publish, so its status will show it; the new txn was refused at admission and
+        // never queued, so nothing will, and a retry of it says nothing about status.
+        let pending = unknown.request.expect("UNKNOWN_OUTCOME keeps its request");
+        let pending_id = pending.identity.request;
+        assert_eq!(
+            db.node_status().first().and_then(|owner| owner.in_flight),
+            Some(pending_id),
+            "node 1 holds the first txn applied and unpublished"
+        );
+        let resent = db
+            .resend_within((*pending).clone(), Duration::from_secs(2))
+            .expect_err("still unpublished");
+        assert_eq!(resent.error.kind, ErrorKind::ProtectionPaused, "{resent:?}");
+        assert!(
+            resent
+                .error
+                .detail
+                .ends_with(&format!("; status {} shows its outcome", pending_id.0)),
+            "in flight: {resent:?}"
+        );
+        let request = new_txn.request.expect("a kernel refusal keeps its request");
+        let id = request.identity.request;
+        for (how, refused) in [
+            ("resend", db.resend((*request).clone())),
+            (
+                "resend_within",
+                db.resend_within((*request).clone(), Duration::from_secs(2)),
+            ),
+            ("put_as", db.put_as(id, b"b", b"2", None)),
+        ] {
+            let refused = refused.expect_err(how);
+            assert_eq!(
+                refused.error.kind,
+                ErrorKind::ProtectionPaused,
+                "{how}: {refused:?}"
+            );
+            assert!(
+                !refused.error.detail.contains(clause),
+                "never admitted: {how}: {refused:?}"
+            );
+            assert!(!refused.error.no_mutation, "{how}: {refused:?}");
+        }
+        db.links().heal_all();
+        db.shutdown();
+    }
+
+    /// Msg 8, W6-D1, the tester's q7 path on a real `Db`. After a secondary restarts, L1 pauses
+    /// writes; a put refused then was refused at admission and never queued, so a retry of it
+    /// must not promise that `status` will show its outcome: status stays `Unknown` for good. A
+    /// retry of the published put keeps the promise, since status shows it (review F-023).
+    /// Integration (~1 s): three node threads, one restart, a 400 ms pause budget.
+    #[test]
+    fn a_retry_of_a_put_refused_paused_after_a_restart_does_not_promise_a_status() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "after the open");
+        let first = db.put(b"a", b"1", None).expect("before the restart");
+        assert_eq!(db.restart_node(NodeId(3)).expect("restart"), BootId(2));
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while db.node_status().first().and_then(|node| node.admits) != Some(false) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "L1 does not pause within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let refused = db.put(b"a", b"9", None).expect_err("paused");
+        assert_eq!(
+            refused.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{refused:?}"
+        );
+        let request = refused.request.expect("a kernel refusal keeps its request");
+        let id = request.identity.request;
+        let retried = db.resend(*request).expect_err("still paused");
+        assert_eq!(
+            retried.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{retried:?}"
+        );
+        assert!(
+            !retried.error.detail.contains("shows its outcome"),
+            "refused at admission, so nothing will resolve it: {retried:?}"
+        );
+        assert!(
+            retried.error.detail.contains("node 3 restarted"),
+            "{retried:?}"
+        );
+        assert_eq!(
+            db.node_status().first().map(|owner| owner.in_flight),
+            Some(None),
+            "nothing is applied unpublished at node 1"
+        );
+        assert_eq!(db.status(id, None).expect("status"), TxnStatus::Unknown);
+
+        // Review F-023, mutant U3: a published request is not in flight either (just checked),
+        // so only the status half of `status_will_show` keeps its retry's promise.
+        let published = db.resend(*first.sent).expect_err("still paused");
+        assert_eq!(
+            published.error.kind,
+            ErrorKind::ProtectionPaused,
+            "{published:?}"
+        );
+        assert!(
+            published
+                .error
+                .detail
+                .contains(&format!("status {} shows its outcome", first.request.0)),
+            "published, so status shows it: {published:?}"
+        );
+        assert!(
+            !matches!(db.status(first.request, None), Ok(TxnStatus::Unknown)),
+            "and status does"
+        );
+        db.shutdown();
+    }
+
     /// The tester's Q-A probe (lead ruling: fix it in rdb-api). Kernel checks 2 (deadline)
     /// and 9 (overload) run before the dedup replay, so a resend of a request that already
     /// committed can be refused `no_mutation=true` although its mutation is applied. A resend
@@ -2177,7 +2719,8 @@ mod tests {
         let links = Links::new();
         let (owner, mailbox) = NodeHandle::unanswered(OWNER);
         let db = Db {
-            nodes: vec![owner],
+            nodes: Mutex::new(vec![owner]),
+            respawn: None,
             links: Arc::clone(&links),
             control: ControlAdapter::new(store, rt.handle().clone(), links),
             clock: HostClock::start(),
@@ -2186,9 +2729,192 @@ mod tests {
                 ..Timeouts::default()
             },
             next_request: AtomicU64::new(1),
+            ready_seen: AtomicBool::new(false),
             unwind: None,
         };
         (db, mailbox, rt)
+    }
+
+    /// M9 S2b D2 and tester W3-D1: once a node has restarted, every `PROTECTION_PAUSED`,
+    /// `UNAVAILABLE`, `UNKNOWN_OUTCOME` and `NOT_PRIMARY` answer names it, and `NOT_PRIMARY` says
+    /// no node becomes primary again; the kind and retry rule stay. Other kinds, and every kind
+    /// before a restart, are left alone. The calls route through it: a get, a status and a put
+    /// that nothing answers come back `UNAVAILABLE` with the note.
+    /// Unit (~100 ms): the owner has no thread.
+    #[test]
+    fn after_a_restart_each_noted_kind_names_it_and_not_primary_says_no_primary_returns() {
+        use ErrorKind::{LeaseExpired, NotPrimary, ProtectionPaused, Unavailable, UnknownOutcome};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let (owner, _mailbox) = NodeHandle::unanswered(OWNER);
+        let short = Timeouts {
+            put: Duration::from_millis(20),
+            read: Duration::from_millis(20),
+        };
+        let mut db = Db::by_hand(vec![owner], store, rt.handle(), short, None);
+        let kinds = [
+            ProtectionPaused,
+            Unavailable,
+            UnknownOutcome,
+            NotPrimary,
+            LeaseExpired,
+        ];
+        assert_eq!(db.restart_note(), None);
+        for kind in kinds {
+            assert_eq!(
+                db.explained(ApiError::new(kind, "d")).detail,
+                "d",
+                "{kind:?}"
+            );
+        }
+
+        lock(&db.nodes)[0].boot = BootId(2);
+        let note = db.restart_note().expect("the owner restarted");
+        assert_eq!(
+            note,
+            "the owner, node 1, restarted (now boot 2); a restarted node stays out until M10 (#42)"
+        );
+        for kind in kinds {
+            let plain = ApiError::new(kind, "d");
+            let explained = db.explained(plain.clone());
+            let detail = match kind {
+                ProtectionPaused | Unavailable | UnknownOutcome => format!("d; {note}"),
+                NotPrimary => format!("d; no node becomes primary again in M9: {note}"),
+                _ => "d".to_owned(),
+            };
+            assert_eq!(
+                (explained.kind, explained.retry, explained.detail),
+                (kind, plain.retry, detail)
+            );
+        }
+
+        let get = db.get(b"a").expect_err("nothing answers the read");
+        let status = db.status(RequestId(1), None).expect_err("nor the status");
+        let put = db.put(b"a", b"1", None).expect_err("nor the compile").error;
+        for (call, error) in [("get", get), ("status", status), ("put", put)] {
+            assert!(
+                error.kind == Unavailable && error.detail.ends_with(&note),
+                "{call}: {error:?}"
+            );
+        }
+        db.shutdown();
+    }
+
+    /// M9 S2b D3: `restart_node` is refused, with nothing stopped, until node 1 has been seen
+    /// admitting writes, and goes ahead once it has, even if writes have stopped since: the
+    /// flag never clears. Unit (~200 ms): the owner has no thread, so its look goes unanswered;
+    /// the allowed restart starts a real node on a temp directory.
+    #[test]
+    fn a_restart_is_refused_before_ready_and_goes_ahead_after() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let dir = config_testkit::fs::temp_dir();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let (owner, mailbox) = NodeHandle::unanswered(OWNER);
+        let short = Timeouts {
+            read: Duration::from_millis(20),
+            ..Timeouts::default()
+        };
+        let respawn = Some((dir.path().to_path_buf(), fast()));
+        let mut db = Db::by_hand(vec![owner], store, rt.handle(), short, respawn);
+
+        let refused = db.restart_node(OWNER).expect_err("not ready yet");
+        assert_eq!(
+            (refused.kind, refused.no_mutation),
+            (ErrorKind::Unavailable, true),
+            "{refused:?}"
+        );
+        assert!(refused.detail.contains("not ready yet"), "{refused:?}");
+        assert_eq!(db.boot_of(OWNER), Some(host::BOOT), "nothing was stopped");
+        assert!(
+            matches!(mailbox.try_recv(), Ok(Msg::Inspect { .. })),
+            "the refusal comes from the look at node 1"
+        );
+
+        db.ready_seen.store(true, Ordering::Relaxed);
+        assert_eq!(db.restart_node(OWNER).expect("ready was seen"), BootId(2));
+        assert_eq!(db.boot_of(OWNER), Some(BootId(2)));
+        db.shutdown();
+    }
+
+    /// Msg 8, F-013: a restart whose new process does not start leaves the node stopped, and
+    /// says so. Before, the handle kept the old boot: `restart_note` was `None`, so refusals lost
+    /// the note, and `clear_grant` called the stopped node's record `Current`, "running".
+    /// Unit (~100 ms): node 2's data directory sits under a file, so its engine cannot open.
+    #[test]
+    fn a_failed_restart_leaves_the_node_stopped_and_says_so() {
+        let rt = runtime();
+        let dir = config_testkit::fs::temp_dir();
+        let blocker = dir.path().join("nodes");
+        std::fs::write(&blocker, b"a file where the nodes directory goes").expect("write");
+        let store = config_testkit::MemStore::new();
+        let (owner, _owner_mailbox) = NodeHandle::unanswered(OWNER);
+        let (second, _second_mailbox) = NodeHandle::unanswered(NodeId(2));
+        let short = Timeouts {
+            read: Duration::from_millis(20),
+            ..Timeouts::default()
+        };
+        let mut db = Db::by_hand(
+            vec![owner, second],
+            Arc::new(config_testkit::MemStore::new()),
+            rt.handle(),
+            short,
+            Some((blocker, fast())),
+        );
+        db.ready_seen.store(true, Ordering::Relaxed);
+
+        let failed = db
+            .restart_node(NodeId(2))
+            .expect_err("cannot open its engine");
+        assert_eq!(failed.kind, ErrorKind::Unavailable, "{failed:?}");
+        assert_eq!(
+            db.boot_of(NodeId(2)),
+            Some(BootId(2)),
+            "the boot it was given"
+        );
+        assert!(
+            db.restart_failed(NodeId(2)),
+            "W7-D3: a caller can tell it failed"
+        );
+        assert!(!db.restart_failed(OWNER), "node 1 was never restarted");
+        let note = db
+            .restart_note()
+            .expect("a failed restart stops writes too");
+        assert!(
+            note.contains("node 2 stopped: its restart as boot 2 failed"),
+            "{note}"
+        );
+        let refused = db.get(b"a").expect_err("node 1 never answers");
+        assert!(refused.detail.ends_with(&note), "{refused:?}");
+
+        let old = rdb_core::authority::grant::GrantRecord {
+            grant: GrantId(2),
+            node: NodeId(2),
+            boot: host::BOOT,
+            authority_generation: rdb_core::contracts::ids::AuthorityGeneration(0),
+            expiry_utc_ms: 0,
+            frozen: false,
+        };
+        rt.block_on(store.put(config_core::PutRequest {
+            key: Bytes::from(rdb_core::contracts::control::ControlKey::Grant(NodeId(2)).encode()),
+            value: old.encode(),
+            expected_mod_revision: Some(0),
+            dedup: None,
+        }))
+        .expect("put grants/2");
+        let clearance = rt
+            .block_on(crate::admin::clear_grant(&db, &store, NodeId(2)))
+            .expect("clear_grant");
+        assert!(
+            matches!(clearance, crate::admin::Clearance::Cleared(_)),
+            "the boot-1 record is no running process's: {clearance:?}"
+        );
+        db.shutdown();
     }
 
     /// S1 ruling M1 (scenario 4b) and the tester's PC-1. A deadline past 30 s is refused

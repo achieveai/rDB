@@ -8843,3 +8843,114 @@ fn m7v_101_recording_every_line_matches_engine_state_on_the_spine_and_the_rebuil
         .collect();
     assert!(seen.len() > 1, "more than one preload role: {seen:?}");
 }
+
+/// A-R102 addendum, Round 13, item 3: a resolving activation still names the pinned
+/// configuration. F1 commits, rebuilds and sends the activation CAS; its answer is lost, and the
+/// read F1 makes at the deadline to resolve it fails, so F1 waits in `ActivationUnresolved` for
+/// its next fire. A `SyncWalThrough` for copy 2 asked then is served from the pinned
+/// configuration's node for it, as in `Committed`, `Rebuilding` and `ActivationProposed`. It is
+/// never withheld `NotPlaced` merely because no survivor was ever placed for copy 2.
+#[retcd_test]
+fn a_resolving_activation_still_serves_syncs_from_the_pinned_configuration() {
+    use rdb_core::contracts::trace::{ControlOpKind, SyncWithheldReason};
+    use rdb_core::recovery::{Recovery, RecoveryPhase};
+    use rdb_sim::harness::run::{ScenarioStep, StepAction, StopReason};
+    support::preamble();
+    let base = run_rebuild(Vec::new());
+    let activation = base
+        .trace
+        .events
+        .iter()
+        .filter(|event| {
+            event.node == NODE
+                && matches!(
+                    event.kind,
+                    TraceKind::ControlInteraction {
+                        op: ControlOpKind::Cas,
+                        key: Some(ControlKey::Partition(PartitionId(1))),
+                        ..
+                    }
+                )
+        })
+        .nth(1)
+        .expect("the activation CAS")
+        .logical_tick;
+    let mut plan = rebuild_plan(Vec::new());
+    // The activation CAS's answer is lost, so F1 resolves at its deadline fire; the read it
+    // makes then fails, so it waits there for the next one. Node 1's grant renewals complete
+    // at x01 ticks, so neither planned fault can be spent on one.
+    let fire = activation + Budgets::SPEC_DEFAULTS.discovery_window_millis;
+    let step = |at: u64, action| ScenarioStep {
+        at: Tick(at),
+        node: NODE,
+        partition: PartitionId(1),
+        action,
+        line: None,
+        taken: None,
+    };
+    plan.steps.push(step(
+        activation,
+        StepAction::Control(ControlOp::DropCompletion { node: NODE }),
+    ));
+    plan.steps.push(step(
+        fire,
+        StepAction::Control(ControlOp::PlanReadUnavailable),
+    ));
+    plan.limits.deadline = Tick(fire + 1);
+    let mut runner = Runner::new(&plan).expect("a runner");
+    let report = runner.run(plan.limits).expect("the run");
+    assert!(
+        matches!(report.stop, StopReason::DeadlineReached { .. }),
+        "stopped at the deadline, past the failed read: {:?}",
+        report.stop
+    );
+    let control: Vec<String> = runner
+        .recorded()
+        .iter()
+        .filter(|event| matches!(event.kind, TraceKind::ControlInteraction { .. }))
+        .map(|event| format!("{}@{}: {:?}", event.node.0, event.logical_tick, event.kind))
+        .collect();
+    tracing::info!(activation, ?control, "control interactions");
+    assert_eq!(
+        runner
+            .dispatcher()
+            .recovery(NODE, PartitionId(1))
+            .map(Recovery::phase),
+        Some(RecoveryPhase::ActivationUnresolved),
+        "precondition: resolving, waiting for its next fire"
+    );
+    runner.dispatcher_mut().take_notes();
+    let sync = effect_from(
+        ModuleName::Recovery,
+        EffectKind::Kernel(KernelEffect::Recovery(RecoveryEffect::SyncWalThrough {
+            copy: CopyId(2),
+            cutoff: Seq(SPINE_HEAD),
+        })),
+    );
+    runner.carry_out(NODE, BOOT, vec![sync]).expect("a sync");
+    let notes = runner.dispatcher_mut().take_notes();
+    tracing::info!(?notes, "sync while resolving");
+    assert!(
+        !notes.iter().any(|(_, _, note)| matches!(
+            note,
+            KernelNote::SyncWithheld {
+                reason: SyncWithheldReason::NotPlaced,
+                ..
+            }
+        )),
+        "served from the pinned configuration: {notes:?}"
+    );
+    assert_eq!(
+        notes,
+        vec![(
+            NODE,
+            ModuleName::Recovery,
+            KernelNote::SyncProven {
+                copy: CopyId(2),
+                cutoff: Seq(SPINE_HEAD),
+                durable: rdb_core::contracts::ids::DurableSeq(SPINE_HEAD),
+            }
+        )],
+        "node 3's engine proves copy 2 through the cutoff"
+    );
+}
