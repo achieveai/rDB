@@ -54,12 +54,14 @@
 //! map|set <object> [--absent | --expect V] <op>...
 //!                                         change a map or a set, ops in order, as one write.
 //!                                         An op is `put K J`, `add K`, `del K` or `need K
-//!                                         present|absent`; K is a JSON scalar. A map takes
+//!                                         present|absent`; K is a JSON scalar, or
+//!                                         `{"$bytes":"<hex>"}` for a byte string. A map takes
 //!                                         `put`, a set `add`: the other is refused
 //!                                         (`KindMismatch`). No ops with `--absent` creates an
 //!                                         empty one. Guards and `retry` as for `doc`
 //! members <object> [--after K] [--limit N]
-//!                                         a page of a map or set in key order, after K or
+//!                                         a page of a map or set in key order (type, then
+//!                                         value: `3` before `1.5`), after K or
 //!                                         from the first, N at most (default 100): `map
 //!                                         version=V count=C listed=L ...`, then `  K = J` per
 //!                                         entry or `  K` per member
@@ -1361,6 +1363,32 @@ impl<'a> Words<'a> {
         self.rest = after;
         Ok(value)
     }
+
+    /// The next map key or set member, for `what`: a JSON value, or `{"$bytes":"<hex>"}` for a
+    /// byte string, the form a read prints (A-R121). Only at key position: a map is never a key,
+    /// so the form cannot mean a map here, and no `$$` escape applies. A document value takes no
+    /// `$bytes` input.
+    fn key(&mut self, what: &str) -> Result<Value, String> {
+        let value = self.json(what)?;
+        let digits = match &value {
+            Value::Map(map) => {
+                let mut entries = map.iter();
+                match (entries.next(), entries.next()) {
+                    (Some((name, Value::Text(text))), None) if name.as_str() == "$bytes" => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some(digits) = digits else {
+            return Ok(value);
+        };
+        hex::decode(&digits)
+            .map(Value::Bytes)
+            .map_err(|e| format!("{what}: $bytes {digits:?} is not hex: {e}"))
+    }
 }
 
 /// `--absent` or `--expect V`, once, before the ops; neither is `None`.
@@ -1460,11 +1488,11 @@ fn elem_ops(words: &mut Words<'_>) -> Result<Vec<ElemOp>, String> {
     let mut ops = Vec::new();
     while let Some(word) = words.next() {
         ops.push(match word {
-            "put" => ElemOp::Put(words.json("put K")?, words.json("put's value J")?),
-            "add" => ElemOp::Add(words.json("add K")?),
-            "del" => ElemOp::Remove(words.json("del K")?),
+            "put" => ElemOp::Put(words.key("put K")?, words.json("put's value J")?),
+            "add" => ElemOp::Add(words.key("add K")?),
+            "del" => ElemOp::Remove(words.key("del K")?),
             "need" => {
-                let key = words.json("need K")?;
+                let key = words.key("need K")?;
                 match words.take("present or absent")? {
                     "present" => ElemOp::NeedPresent(key),
                     "absent" => ElemOp::NeedAbsent(key),
@@ -1490,7 +1518,7 @@ fn parse_members(line: &str) -> Result<(String, Look), String> {
     let (mut after, mut limit) = (None, None);
     while let Some(word) = words.next() {
         match word {
-            "--after" if after.is_none() => after = Some(words.json("--after K")?),
+            "--after" if after.is_none() => after = Some(words.key("--after K")?),
             "--limit" if limit.is_none() => {
                 let n = words.take("a count after --limit")?;
                 limit = Some(
@@ -3944,5 +3972,36 @@ mod tests {
         let refused =
             payload_put(Kind::Value, RequestId(5)).expect_err("a value write takes no payload");
         assert!(refused.contains("request 5 was a value write"), "{refused}");
+    }
+
+    /// A-R121: at key position only, `{"$bytes":"<hex>"}` is a byte-string key, the form a
+    /// read prints. Bad hex is refused; `$$bytes` is no escape there, so it stays a map, which
+    /// the owner refuses as a key. It fails if `Words::key` is `Words::json`. Unit.
+    #[test]
+    fn a_bytes_key_is_entered_as_a_read_prints_it() {
+        let (_, _, change) =
+            parse_change(r#"map m --absent put {"$bytes":"00ff"} 1"#).expect("a map line");
+        assert_eq!(
+            change,
+            Change::Map(vec![ElemOp::Put(
+                Value::Bytes(vec![0x00, 0xff]),
+                Value::Integer(Int::from(1_u64))
+            )])
+        );
+        let (_, look) = parse_members(r#"members m --after {"$bytes":"00"}"#).expect("a page");
+        assert_eq!(
+            look,
+            Look::Members {
+                after: Some(Value::Bytes(vec![0x00])),
+                limit: DEFAULT_LIMIT
+            }
+        );
+        let refused = parse_change(r#"set s add {"$bytes":"zz"}"#).expect_err("zz is not hex");
+        assert!(refused.contains("is not hex"), "{refused}");
+        let (_, _, escaped) = parse_change(r#"set s add {"$$bytes":"00"}"#).expect("a set line");
+        assert!(
+            matches!(&escaped, Change::Set(ops) if matches!(ops[..], [ElemOp::Add(Value::Map(_))])),
+            "{escaped:?}"
+        );
     }
 }
