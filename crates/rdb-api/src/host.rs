@@ -6069,6 +6069,9 @@ mod tests {
         assert_eq!(trio.head(), Some(3), "request 10 published once");
 
         // (b)
+        // A-R124d: put 20 needs node 1's grant, which can lapse after (a)'s hold. No retention
+        // or deadline here depends on the time.
+        trio.ready();
         hold(&trio);
         let put_b = trio.call(put(20, b"b", b"1", None));
         trio.until("node 1 applied request 20", |trio| {
@@ -6459,6 +6462,9 @@ mod tests {
             lines[0]["node"] == 1 && lines[0]["request"] == 2,
             "{lines:?}"
         );
+        // A-R124d: after a 2 s-scale hold node 1's grant can lapse, and a fenced node answers
+        // `status` `Unknown`. The default retention is a day, so the wait moves nothing past it.
+        trio.ready();
         match trio.ask(ClientCall::Status {
             identity: identity(2),
             generation: None,
@@ -6543,6 +6549,9 @@ mod tests {
             Some(true),
             "{trims:?}"
         );
+        // A-R124b: node 1's grant can lapse and fence it here; a fenced node answers `Unknown`
+        // and refuses the resend `LEASE_EXPIRED`. Both are trimmed already, so waiting only ages them.
+        trio.ready();
         for request in [1, 2] {
             match status(&mut trio, request) {
                 Answer::Status(TxnStatus::Unknown) => {}
