@@ -7264,9 +7264,17 @@ mod tests {
         };
         assert_eq!(listed(last), vec![(2, text("c"))], "-1 is the last of 3");
         for (request, at) in [(3, -4), (4, 99)] {
-            match trio.look(request, b"l", Look::Items { at, limit: 10 }) {
-                Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
-                Ok(seen) => panic!("a read from {at} of 3 was answered: {seen:?}"),
+            let out_of_range = ClientCall::Get {
+                identity: identity(request),
+                object: Bytes::from_static(b"l"),
+                look: Look::Items { at, limit: 10 },
+            };
+            match trio.ask(out_of_range) {
+                Answer::Error {
+                    error,
+                    request: None,
+                } => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
+                other => panic!("a read from {at} of 3, refused with no request: {other:?}"),
             }
         }
 
