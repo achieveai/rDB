@@ -3410,6 +3410,7 @@ impl Host {
                     mutations.extend(compiled.mutations);
                 }
                 Err(mut refused) => {
+                    log_stored_damage(self.node, &root, &refused);
                     refused.detail = format!("op {index}: {}", refused.detail);
                     return Ok(Err(refused));
                 }
@@ -3591,8 +3592,14 @@ impl Host {
                         format!("previous view {} is not bound", handle.0),
                     )
                 })?;
-                object_answer(view, &root, &Look::Doc, ReadServiceOutcome::Served)
-                    .map_err(|detail| fail_waiter(&pending.reply, detail))?
+                object_answer(
+                    self.node,
+                    view,
+                    &root,
+                    &Look::Doc,
+                    ReadServiceOutcome::Served,
+                )
+                .map_err(|detail| fail_waiter(&pending.reply, detail))?
             }
         };
         let _ = pending.reply.send(answer);
@@ -3635,7 +3642,7 @@ impl Host {
         if matches!(rdb_value::read(view, root), Ok(None)) {
             return Err("read reply names a value the step view does not decode".into());
         }
-        object_answer(view, root, look, outcome)
+        object_answer(self.node, view, root, look, outcome)
     }
 
     // ------------------------------------------------------------------ inspection
@@ -4043,6 +4050,7 @@ fn margin_ms(horizon: Tick, at: Tick) -> i64 {
 /// another kind's look (`KindMismatch`), is the caller's error. The outer error faults the
 /// node: the view cannot back the answer P1 gave.
 fn object_answer(
+    node: NodeId,
     view: &RocksSnapshot,
     root: &RootKey,
     look: &Look,
@@ -4101,11 +4109,38 @@ fn object_answer(
             generation,
             at,
         },
-        Err(error) => Answer::Error {
-            error: compile_error(&error),
-            request: None,
-        },
+        Err(error) => {
+            let error = compile_error(&error);
+            log_stored_damage(node, root, &error);
+            Answer::Error {
+                error,
+                request: None,
+            }
+        }
     })
+}
+
+/// Stored damage a compile or a read found, refused as `CORRUPT_BLOB` or `CORRUPT_HISTORY`: one
+/// warn line naming the object and the kind (review F-005), since the caller's refusal reaches
+/// no log of its own.
+fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError) {
+    if !matches!(
+        error.kind,
+        ErrorKind::CorruptBlob | ErrorKind::CorruptHistory
+    ) {
+        return;
+    }
+    let object = match rdb_value::keys::parse(root.as_bytes()) {
+        Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
+        Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
+    };
+    tracing::warn!(
+        node = node.0,
+        %object,
+        kind = %error.name(),
+        detail = %error.detail,
+        "stored_damage"
+    );
 }
 
 const fn client_name(event: &ClientEvent) -> &'static str {
