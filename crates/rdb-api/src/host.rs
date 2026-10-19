@@ -425,7 +425,9 @@ pub enum Change {
         bytes: Bytes,
     },
     /// Publish upload `upload` as the blob at the object (ADR-rdb-0014 §6): every chunk is
-    /// checked against `size`, `chunk_size` and `sha256` before the root is written.
+    /// checked against `size`, `chunk_size` and `sha256` before the root is written. That blob
+    /// already at the root compiles to nothing: [`Answer::Unchanged`] once it is published,
+    /// `UNKNOWN_OUTCOME` while it is applied and not yet published (C-3).
     Publish {
         /// The upload whose chunks the blob is.
         upload: Upload,
@@ -435,6 +437,14 @@ pub enum Change {
         chunk_size: u64,
         /// SHA-256 of the whole blob.
         sha256: [u8; 32],
+    },
+    /// Delete one batch of the object's chunks that its blob does not name, at a version at or
+    /// below `floor` (ADR-rdb-0014 §8). The caller picks the floor (S4 Q1): a chunk of an upload
+    /// still in progress above it is kept. Takes no `expect`. Nothing left to delete compiles to
+    /// nothing, never sent ([`Answer::Unchanged`]).
+    Gc {
+        /// The highest chunk version that may go.
+        floor: u64,
     },
 }
 
@@ -449,6 +459,7 @@ impl Change {
             Self::List(_) => "list",
             Self::Chunk { .. } => "chunk",
             Self::Publish { .. } => "publish",
+            Self::Gc { .. } => "gc",
         }
     }
 }
@@ -3307,6 +3318,12 @@ impl Host {
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("step view missing after refresh".into());
         };
+        // What P1 has published here, as `status` reads it: a publish answers unchanged only
+        // at or below it (C-3).
+        let published = self
+            .publication
+            .view(self.node, partition)
+            .map(|view| (view.published.generation, view.published.seq));
         // The first put's group is the request's affinity. A put in another group is refused
         // here, before anything is sent, as the kernel's check 3 would refuse it (PR #36 F-001).
         let affinity = puts.first().map_or(AFFINITY, |put| put.group);
@@ -3346,9 +3363,14 @@ impl Host {
                 )
                 .map_err(|e| compile_error(&e)),
                 Change::List(edits) => list_compile(view, &root, expected, edits),
-                Change::Chunk { .. } if put.expect.is_some() => Err(ApiError::invalid(
-                    "a chunk takes no expect: it is written only where none is stored",
-                )),
+                Change::Chunk { .. } | Change::Gc { .. } if put.expect.is_some() => {
+                    Err(ApiError::invalid(format!(
+                        "a {} takes no expect: it is guarded by what it reads",
+                        put.change.name()
+                    )))
+                }
+                Change::Gc { floor } => rdb_value::blob::collect_garbage(view, &root, *floor)
+                    .map_err(|e| compile_error(&e)),
                 Change::Chunk {
                     upload,
                     index,
@@ -3372,7 +3394,13 @@ impl Host {
                     sha256,
                     generation,
                 )
-                .map_err(|e| compile_error(&e)),
+                .map_err(|e| compile_error(&e))
+                .and_then(|compiled| {
+                    if compiled.mutations.is_empty() {
+                        already_published(view, &root, published)?;
+                    }
+                    Ok(compiled)
+                }),
             };
             match compiled {
                 Ok(compiled) => {
@@ -3817,6 +3845,33 @@ fn compile_error(error: &ValueError) -> ApiError {
         ) => ApiError::new(ErrorKind::ConditionFailed, error.to_string()),
         ValueError::Apply(_) => ApiError::new(ErrorKind::InvalidArgument, error.to_string()),
         ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
+    }
+}
+
+/// C-3: a publish whose blob is already at the root answers unchanged only when that root is
+/// published: its version at or below P1's published position, in the step view's generation.
+/// Above it, the root was applied and not yet published, so it may still be lost: that is
+/// `UNKNOWN_OUTCOME`, nothing sent, and the publish that wrote it is the one to ask about.
+fn already_published(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    published: Option<(Generation, Seq)>,
+) -> Result<(), ApiError> {
+    let version = view.version(Namespace::User, root.as_bytes());
+    match (version, published) {
+        (Some(version), Some((generation, seq)))
+            if generation == view.generation() && version <= seq.0 =>
+        {
+            Ok(())
+        }
+        _ => Err(ApiError::new(
+            ErrorKind::UnknownOutcome,
+            format!(
+                "the blob is at the root (version {version:?}) but not published yet (published \
+                 {published:?}, view generation {}); ask the status of the publish that wrote it",
+                view.generation().0
+            ),
+        )),
     }
 }
 

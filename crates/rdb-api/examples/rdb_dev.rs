@@ -96,6 +96,9 @@
 //!       --sha256 H                        publish upload U as the blob; H is 64 hex digits.
 //!                                         That blob already there answers `unchanged
 //!                                         (already published)`, and sends nothing
+//! blob gc <object> --floor F             delete one batch of the object's chunks its blob
+//!                                         does not name, at versions up to F. Nothing left to
+//!                                         delete answers `unchanged (nothing to collect)`
 //! read <object> [--offset O --len L]      read a blob at the publication barrier: `blob
 //!                                         version=V size=S chunks=N upload=U ...`, with
 //!                                         `bytes="..."` for a range of at least one byte
@@ -1122,6 +1125,7 @@ fn repl<'scope, 'env>(
             ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
             ["blob", "chunk", object, rest @ ..] => blob_chunk(db, object, rest, &mut sent),
             ["blob", "publish", object, rest @ ..] => blob_publish(db, object, rest, &mut sent),
+            ["blob", "gc", object, rest @ ..] => blob_gc(db, object, rest, &mut sent),
             ["blob", ..] => Err(BLOB_USAGE.to_owned()),
             ["read", object, rest @ ..] => parse_range(rest).map(|look| {
                 read_line(db.read(object.as_bytes(), look));
@@ -1692,7 +1696,8 @@ fn labelled_write_line(
 const BLOB_USAGE: &str = "blob upload <object> [--absent | --expect V] --upload U --chunk-size N \
                           <text> [--stop-after K] | blob chunk <object> --upload U --index I \
                           <text> | blob publish <object> [--absent | --expect V] --upload U \
-                          --size N --chunk-size N --sha256 H; U is 32 hex digits, H 64";
+                          --size N --chunk-size N --sha256 H | blob gc <object> --floor F; U is \
+                          32 hex digits, H 64";
 const READ_USAGE: &str = "read <object> [--offset O --len L]";
 
 /// A `blob` line's words after the object: `--absent` or `--expect V`, the `--name value`
@@ -1861,6 +1866,21 @@ fn blob_publish(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result
     };
     let answer = db.write(object.as_bytes(), change, args.expect);
     labelled_write_line(db, "publish ", "already published", answer, sent);
+    Ok(())
+}
+
+/// `blob gc`: one batch of the object's unreachable chunks at or below the floor. A guard is
+/// passed on for the owner to refuse.
+fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--floor"])?;
+    if args.text.is_some() {
+        return Err("blob gc takes no <text>".to_owned());
+    }
+    let change = Change::Gc {
+        floor: args.number("--floor")?,
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(db, "gc ", "nothing to collect", answer, sent);
     Ok(())
 }
 
