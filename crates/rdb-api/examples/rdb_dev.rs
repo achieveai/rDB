@@ -94,8 +94,11 @@
 //!                                         `unchanged (already stored)`, and send nothing
 //! blob publish <object> [--absent | --expect V] --upload U --size N --chunk-size N
 //!       --sha256 H                        publish upload U as the blob; H is 64 hex digits.
-//!                                         That blob already there answers `unchanged
-//!                                         (already published)`, and sends nothing
+//!                                         That blob already there and published answers
+//!                                         `unchanged (already published)`; already there
+//!                                         but not yet published, `UNKNOWN_OUTCOME` with
+//!                                         `request=-`: ask `status` of the publish that
+//!                                         wrote it. Either sends nothing
 //! blob gc <object> --floor F             delete one batch of the object's chunks its blob
 //!                                         does not name, at versions up to F. Nothing left to
 //!                                         delete answers `unchanged (nothing to collect)`

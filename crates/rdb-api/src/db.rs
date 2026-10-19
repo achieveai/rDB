@@ -703,19 +703,41 @@ impl Db {
 
     /// Apply `change` to `object`, as one transaction. `expect` says when it may happen:
     /// `None` at the version the owner's compile sees (absent included), `Some(Absent)` only
-    /// as a create, `Some(Version(v))` only at version `v`. The owner compiles the change
-    /// against the object as it is, so the request carries the whole after-image of what it
-    /// changes and the version it was compiled against; a write that lands first makes this
-    /// one `CONDITION_FAILED`, at the compile or at the kernel.
+    /// as a create, `Some(Version(v))` only at version `v`. A `Chunk` or a `Gc` takes no
+    /// `expect`. The owner compiles the change against the object as it is, so the request
+    /// carries the whole after-image of what it changes.
     ///
-    /// `Ok(None)` is a change that compiles to nothing and is never sent: a chunk whose bytes
-    /// are already stored, or a publish of the blob already there.
+    /// What guards the request:
+    /// - `Doc`, `Map`, `Set`, `List` and `Publish`: the object's version it was compiled
+    ///   against. A write to the object that lands first makes this one `CONDITION_FAILED`, at
+    ///   the compile or at the kernel. A `Publish` is also guarded by each chunk's version.
+    /// - `Chunk`: only that chunk's key being absent, never the object's version. A chunk is
+    ///   stored under an object of any kind, or none (A-R127).
+    /// - `Gc`: the object as the compile read it, and each chunk it deletes.
+    ///
+    /// `Ok(None)` is a change that compiles to nothing and is never sent:
+    /// - a `Chunk` whose bytes are already stored at its upload and index;
+    /// - a `Gc` with nothing left to collect;
+    /// - a `Publish` of the blob already at the object and published: its version is at or
+    ///   below what P1 has published, in the generation the compile sees.
     ///
     /// # Errors
     ///
-    /// As [`Self::put`]. A change the compile refuses sends nothing and carries no request:
-    /// `CONDITION_FAILED` for a version that moved, `INVALID_ARGUMENT` for an op that does not
-    /// fit the object (`KindMismatch`, `NotAContainer`, ...).
+    /// Once sent, as [`Self::put`]: a §5.4 refusal, or `UNKNOWN_OUTCOME` carrying the request,
+    /// ready to [`Db::resend`] unchanged. A change the compile refuses sends nothing and
+    /// carries no request:
+    /// - `CONDITION_FAILED` for a version that moved, or an object or element that a change or
+    ///   a `Need` finds absent or present when it must not be;
+    /// - `INVALID_ARGUMENT` for an op that does not fit the object (`KindMismatch`,
+    ///   `NotAContainer`, ...), an `expect` on a `Chunk` or a `Gc`, or a `Publish` whose stored
+    ///   chunks do not match it (`ChunkMissing`, `ChunkLength`, `BlobDigestMismatch`, ...);
+    /// - `UPLOAD_CHUNK_CONFLICT` for a `Chunk` whose upload and index already hold other bytes;
+    /// - `CORRUPT_BLOB` when a stored manifest or chunk the compile reads fails its checks, and
+    ///   `CORRUPT_HISTORY` when another stored record does not open;
+    /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
+    ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
+    ///   [`Self::status`] about that publish;
+    /// - `UNAVAILABLE` when no compile answer came in time.
     pub fn write(
         &self,
         object: &[u8],
