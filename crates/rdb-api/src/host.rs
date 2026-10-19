@@ -75,7 +75,7 @@ use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
 use rdb_value::list::{Items, ListOp, Start, Token, DEFAULT_BLOCK_MAX};
 use rdb_value::value::Value;
-use rdb_value::{Compiled, Document, Expected, ValueError};
+use rdb_value::{Compiled, Corrupt, Document, Expected, ValueError};
 
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
@@ -3843,7 +3843,19 @@ fn compile_error(error: &ValueError) -> ApiError {
             | ApplyError::ElementAbsent
             | ApplyError::ElementExists,
         ) => ApiError::new(ErrorKind::ConditionFailed, error.to_string()),
+        // S4b (A-R114 Q2): other bytes under a stored chunk's upload and index.
+        ValueError::Apply(ApplyError::ChunkConflict { .. }) => {
+            ApiError::new(ErrorKind::UploadChunkConflict, error.to_string())
+        }
         ValueError::Apply(_) => ApiError::new(ErrorKind::InvalidArgument, error.to_string()),
+        // A blob's manifest or chunks fail their checks. A record that does not open at all is
+        // still CORRUPT_HISTORY, whatever object it is.
+        ValueError::Corrupt(
+            Corrupt::Manifest(_)
+            | Corrupt::Chunk { .. }
+            | Corrupt::ChunkMismatch { .. }
+            | Corrupt::ChunkMissing { .. },
+        ) => ApiError::new(ErrorKind::CorruptBlob, error.to_string()),
         ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
     }
 }
