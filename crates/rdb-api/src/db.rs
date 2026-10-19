@@ -96,7 +96,8 @@ impl ApiError {
     /// |---|---|---|
     /// | `ConditionFailed`, `InvalidArgument` | `Definitive` | `true` |
     /// | `UnknownOutcome` | `QueryStatus` | `false` |
-    /// | `CorruptHistory` | `Quarantine` | `false` |
+    /// | `CorruptHistory`, `CorruptBlob` | `Quarantine` | `false` |
+    /// | `UploadChunkConflict` | `Reconcile` | `true` |
     /// | any other | `BoundedJitter` | `false` |
     ///
     /// This is not what the kernel attaches to the same kind: for example a kernel
@@ -110,7 +111,8 @@ impl ApiError {
                 (RetryRule::Definitive, true)
             }
             ErrorKind::UnknownOutcome => (RetryRule::QueryStatus, false),
-            ErrorKind::CorruptHistory => (RetryRule::Quarantine, false),
+            ErrorKind::CorruptHistory | ErrorKind::CorruptBlob => (RetryRule::Quarantine, false),
+            ErrorKind::UploadChunkConflict => (RetryRule::Reconcile, true),
             _ => (RetryRule::BoundedJitter, false),
         };
         Self {
