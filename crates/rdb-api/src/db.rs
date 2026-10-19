@@ -30,14 +30,17 @@ use rdb_core::contracts::ids::{
 use rdb_core::contracts::trace::ReadServiceOutcome;
 use rdb_core::contracts::txn::{Durability, Outcome, TxnRequest, TxnStatus};
 use rdb_core::transaction::{Limits, RETENTION_CAP_ENTRIES};
+use rdb_value::delta::{Delta, Op};
+use rdb_value::value::Value;
+use rdb_value::{Document, Expected};
 use tokio::runtime::Handle;
 
 use crate::admin::{self, PARTITION};
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
 use crate::host::{
-    self, Answer, Client, ClientCall, Msg, NodeHandle, NodeStatus, NodeStopped, PutOp,
-    TXN_WAITER_MARGIN_MILLIS,
+    self, Answer, Change, Client, ClientCall, Look, Msg, NodeHandle, NodeStatus, NodeStopped,
+    PutOp, Seen, TXN_WAITER_MARGIN_MILLIS,
 };
 use crate::transport::Links;
 
@@ -283,6 +286,19 @@ pub struct GetOk {
     /// it can still be the predecessor generation: the new generation has written nothing
     /// yet, so both views hold identical contents. Never fence on it; a write fences with the
     /// generation the node adopted, not with this one.
+    pub generation: Generation,
+    /// The position of that view.
+    pub at: Seq,
+    /// Whether it waited at the barrier for an in-flight write.
+    pub waited: bool,
+}
+
+/// A served [`Db::read`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadOk {
+    /// What it saw, with the version it saw.
+    pub seen: Seen,
+    /// The storage generation of the view it was read from; as [`GetOk::generation`].
     pub generation: Generation,
     /// The position of that view.
     pub at: Seq,
@@ -640,13 +656,13 @@ impl Db {
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
-        let put = TxnPut {
+        let put = PutOp {
             group: GROUP,
-            object,
-            value,
-            if_version,
+            object: Bytes::copy_from_slice(object),
+            change: byte_doc(value),
+            expect: if_version.map(Expected::Version),
         };
-        self.compile_and_send(identity, &[put], self.timeouts.put, self.timeouts.put)
+        self.compile_and_send(identity, vec![put], self.timeouts.put, self.timeouts.put)
     }
 
     /// Write every put in `puts` as one transaction, or none of them, with a kernel deadline of
@@ -669,7 +685,52 @@ impl Db {
                 request: None,
             });
         }
+        let puts = puts
+            .iter()
+            .map(|put| PutOp {
+                group: put.group,
+                object: Bytes::copy_from_slice(put.object),
+                change: byte_doc(put.value),
+                expect: put.if_version.map(Expected::Version),
+            })
+            .collect();
         self.compile_and_send(self.identity(), puts, deadline, send_wait(deadline))
+    }
+
+    /// Apply `change` to `object`, as one transaction. `expect` says when it may happen:
+    /// `None` at the version the owner's compile sees (absent included), `Some(Absent)` only
+    /// as a create, `Some(Version(v))` only at version `v`. The owner compiles the change
+    /// against the object as it is, so the request carries the whole after-image of what it
+    /// changes and the version it was compiled against; a write that lands first makes this
+    /// one `CONDITION_FAILED`, at the compile or at the kernel.
+    ///
+    /// `Ok(None)` is reserved for a change that compiles to nothing and is never sent; no
+    /// change today does that.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`]. A change the compile refuses sends nothing and carries no request:
+    /// `CONDITION_FAILED` for a version that moved, `INVALID_ARGUMENT` for an op that does not
+    /// fit the object (`KindMismatch`, `NotAContainer`, ...).
+    pub fn write(
+        &self,
+        object: &[u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> Result<Option<PutOk>, PutError> {
+        let put = PutOp {
+            group: GROUP,
+            object: Bytes::copy_from_slice(object),
+            change,
+            expect,
+        };
+        self.compile_and_send(
+            self.identity(),
+            vec![put],
+            self.timeouts.put,
+            self.timeouts.put,
+        )
+        .map(Some)
     }
 
     /// Compile `puts` under `identity` with kernel deadline `deadline`, waiting
@@ -677,7 +738,7 @@ impl Db {
     fn compile_and_send(
         &self,
         identity: RequestIdentity,
-        puts: &[TxnPut<'_>],
+        puts: Vec<PutOp>,
         deadline: Duration,
         wait: Duration,
     ) -> Result<PutOk, PutError> {
@@ -687,15 +748,7 @@ impl Db {
         // definitive UNAVAILABLE, never UNKNOWN_OUTCOME.
         let call = ClientCall::Compile {
             identity,
-            puts: puts
-                .iter()
-                .map(|put| PutOp {
-                    group: put.group,
-                    object: Bytes::copy_from_slice(put.object),
-                    value: Bytes::copy_from_slice(put.value),
-                    if_version: put.if_version,
-                })
-                .collect(),
+            puts,
             remaining_millis: millis(deadline),
         };
         let refused = |error| {
@@ -814,16 +867,20 @@ impl Db {
         })
     }
 
-    /// Read `object` at the publication barrier.
+    /// Read `object` at the publication barrier, as a byte string.
     ///
     /// # Errors
     ///
     /// [`ApiError`]: a §5.4 refusal, or `UNAVAILABLE` when no answer came in time.
+    /// `INVALID_ARGUMENT` when the object is a document that is not a byte string, or another
+    /// kind: read those with [`Self::read`].
     pub fn get(&self, object: &[u8]) -> Result<GetOk, ApiError> {
-        self.read(ClientCall::Get {
+        self.read_call(ClientCall::Get {
             identity: self.identity(),
             object: Bytes::copy_from_slice(object),
+            look: Look::Doc,
         })
+        .and_then(byte_string)
     }
 
     /// Read `object` from the previously published view, at once: it never waits for a write
@@ -832,15 +889,31 @@ impl Db {
     /// # Errors
     ///
     /// [`ApiError`]: P1's refusal (`UNAVAILABLE` before any view is kept), or `UNAVAILABLE`
-    /// when no answer came in time.
+    /// when no answer came in time. As [`Self::get`] for an object that is not a byte string.
     pub fn get_previous(&self, object: &[u8]) -> Result<GetOk, ApiError> {
-        self.read(ClientCall::GetPrevious {
+        self.read_call(ClientCall::GetPrevious {
             identity: self.identity(),
             object: Bytes::copy_from_slice(object),
         })
+        .and_then(byte_string)
     }
 
-    fn read(&self, call: ClientCall) -> Result<GetOk, ApiError> {
+    /// Read `look` of `object` at the publication barrier: one consistent view, with the
+    /// version of what it saw. A missing object is [`Seen::Absent`], not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError`]: a §5.4 refusal, or `UNAVAILABLE` when no answer came in time.
+    /// `INVALID_ARGUMENT` (`KindMismatch`) when `look` does not fit the object's kind.
+    pub fn read(&self, object: &[u8], look: Look) -> Result<ReadOk, ApiError> {
+        self.read_call(ClientCall::Get {
+            identity: self.identity(),
+            object: Bytes::copy_from_slice(object),
+            look,
+        })
+    }
+
+    fn read_call(&self, call: ClientCall) -> Result<ReadOk, ApiError> {
         let answered = match self.call(call, self.timeouts.read) {
             Some(Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
@@ -848,11 +921,11 @@ impl Db {
             }) => Err(refused_read(kind)),
             Some(Answer::Read {
                 outcome,
-                value,
+                seen,
                 generation,
                 at,
-            }) => Ok(GetOk {
-                value,
+            }) => Ok(ReadOk {
+                seen,
                 generation,
                 at,
                 waited: outcome == ReadServiceOutcome::WaitedAtBarrier,
@@ -1260,6 +1333,34 @@ impl Drop for Db {
             }
         }
     }
+}
+
+/// A byte-string document: what [`Db::put`] and [`Db::txn`] write.
+fn byte_doc(value: &[u8]) -> Change {
+    Change::Doc(Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]))
+}
+
+/// A document read as [`Db::get`] answers it: its bytes, or `INVALID_ARGUMENT` when it
+/// is not a byte string.
+fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
+    let value = match read.seen {
+        Seen::Absent => None,
+        Seen::Doc(Document {
+            version,
+            value: Value::Bytes(bytes),
+        }) => Some((version, Bytes::from(bytes))),
+        Seen::Doc(_) => {
+            return Err(ApiError::invalid(
+                "the object is not a byte string; read it with Db::read",
+            ))
+        }
+    };
+    Ok(GetOk {
+        value,
+        generation: read.generation,
+        at: read.at,
+        waited: read.waited,
+    })
 }
 
 /// A read P1 refused with `kind`, with the retry rule and mutation proof the kernel's own table
@@ -1833,7 +1934,7 @@ mod tests {
                 reply
                     .send(Answer::Read {
                         outcome: ReadServiceOutcome::Rejected(kind),
-                        value: None,
+                        seen: Seen::Absent,
                         generation: Generation(1),
                         at: Seq(1),
                     })

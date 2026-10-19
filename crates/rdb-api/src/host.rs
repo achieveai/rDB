@@ -69,10 +69,9 @@ use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
-use rdb_value::delta::{ApplyError, Delta, Op};
+use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
-use rdb_value::value::Value;
-use rdb_value::{Expected, ValueError};
+use rdb_value::{Document, Expected, ValueError};
 
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
@@ -324,17 +323,16 @@ pub struct Client {
 /// `Db` never does this: each of its gets mints a fresh identity.
 #[derive(Debug, Clone)]
 pub enum ClientCall {
-    /// Replace object `object` with the byte string `value` (Decision 2), compiled here against
-    /// the step view.
+    /// Apply `change` to object `object`, compiled here against the step view and sent.
     Put {
         /// The identity minted for it.
         identity: RequestIdentity,
         /// The object id.
         object: Bytes,
-        /// The bytes.
-        value: Bytes,
-        /// Write only if the object is at this version.
-        if_version: Option<u64>,
+        /// What the write changes.
+        change: Change,
+        /// When the write may happen; `None` is the version the compile sees.
+        expect: Option<Expected>,
         /// The kernel deadline.
         remaining_millis: u64,
     },
@@ -363,6 +361,8 @@ pub enum ClientCall {
         identity: RequestIdentity,
         /// The object id.
         object: Bytes,
+        /// What to read of it.
+        look: Look,
     },
     /// Read object `object` from the previously published view, at once (P1's
     /// `ReadPrevious`): it never waits for a write in flight.
@@ -381,19 +381,53 @@ pub enum ClientCall {
     },
 }
 
-/// One put of a [`ClientCall::Compile`]: replace `object` in affinity group `group` with the
-/// byte string `value`.
+/// One write of a [`ClientCall::Compile`]: apply `change` to `object` in affinity group
+/// `group`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PutOp {
     /// The affinity group the object lives in.
     pub group: AffinityId,
     /// The object id.
     pub object: Bytes,
-    /// The bytes.
-    pub value: Bytes,
-    /// Write only if the object is at this version; `None` means the version the compile sees
-    /// (absent included).
-    pub if_version: Option<u64>,
+    /// What the write changes.
+    pub change: Change,
+    /// When the write may happen. `None` is the version the compile sees, absent included;
+    /// `Some(Absent)` creates only; `Some(Version(v))` writes only at version `v`.
+    pub expect: Option<Expected>,
+}
+
+/// What one write changes. The kind of the object is fixed when it is created; a change of
+/// another kind is `INVALID_ARGUMENT` (`KindMismatch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Document ops, applied in order to the whole document (ADR-rdb-0012).
+    Doc(Delta),
+}
+
+impl Change {
+    /// The kind's name, for logs.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Doc(_) => "doc",
+        }
+    }
+}
+
+/// What a read looks at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Look {
+    /// The whole document.
+    Doc,
+}
+
+/// What a read saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Seen {
+    /// No object at that id.
+    Absent,
+    /// A document and its version.
+    Doc(Document),
 }
 
 /// A node's answer to a client call.
@@ -410,8 +444,8 @@ pub enum Answer {
     Read {
         /// How P1 served it.
         outcome: ReadServiceOutcome,
-        /// The object's version and bytes, `None` when absent.
-        value: Option<(u64, Bytes)>,
+        /// What it saw.
+        seen: Seen,
         /// The generation of the view it was served from.
         generation: Generation,
         /// The position of that view.
@@ -721,7 +755,7 @@ struct Pending {
 #[derive(Debug)]
 enum PendingKind {
     Txn(TxnRequest),
-    Read(RootKey),
+    Read(RootKey, Look),
     Previous(RootKey),
 }
 
@@ -1116,7 +1150,7 @@ impl Host {
         for (identity, pending) in std::mem::take(&mut self.pending) {
             let request = match pending.kind {
                 PendingKind::Txn(request) => Some(request),
-                PendingKind::Read(_) | PendingKind::Previous(_) => None,
+                PendingKind::Read(..) | PendingKind::Previous(_) => None,
             };
             tracing::info!(
                 node = self.node.0,
@@ -2970,8 +3004,8 @@ impl Host {
             ClientCall::Put {
                 identity,
                 object,
-                value,
-                if_version,
+                change,
+                expect,
                 remaining_millis,
             } => match self
                 .compile(
@@ -2980,8 +3014,8 @@ impl Host {
                     &[PutOp {
                         group: AFFINITY,
                         object,
-                        value,
-                        if_version,
+                        change,
+                        expect,
                     }],
                     remaining_millis,
                 )
@@ -3020,6 +3054,7 @@ impl Host {
                     partition = partition.0,
                     request = identity.request.0,
                     puts = puts.len(),
+                    change = puts.first().map_or("none", |put| put.change.name()),
                     compiled = matches!(answer, Answer::Compiled(_)),
                     "client_compile"
                 );
@@ -3031,7 +3066,11 @@ impl Host {
                 EventKind::Client(ClientEvent::Submit(request.clone())),
                 Some(PendingKind::Txn(request)),
             ),
-            ClientCall::Get { identity, object } => {
+            ClientCall::Get {
+                identity,
+                object,
+                look,
+            } => {
                 let root = root_key(identity.tenant, AFFINITY, &object);
                 (
                     identity,
@@ -3039,7 +3078,7 @@ impl Host {
                         identity,
                         key: root.to_bytes(),
                     }),
-                    Some(PendingKind::Read(root)),
+                    Some(PendingKind::Read(root, look)),
                 )
             }
             ClientCall::GetPrevious { identity, object } => (
@@ -3120,7 +3159,7 @@ impl Host {
         Ok(())
     }
 
-    /// Compile byte-string puts as one transaction against the step view. The outer error
+    /// Compile writes as one transaction against the step view. The outer error
     /// faults the node (the step view could not be built); the inner one is the caller's: the
     /// first put that does not compile refuses them all, named by its index, never its key.
     fn compile(
@@ -3154,14 +3193,14 @@ impl Host {
                 return Ok(Err(refused));
             }
             let root = root_key(identity.tenant, put.group, &put.object);
-            let expected = match put.if_version {
-                Some(version) => Expected::Version(version),
-                None => view
-                    .version(Namespace::User, root.as_bytes())
-                    .map_or(Expected::Absent, Expected::Version),
+            let expected = put.expect.unwrap_or_else(|| {
+                view.version(Namespace::User, root.as_bytes())
+                    .map_or(Expected::Absent, Expected::Version)
+            });
+            let compiled = match &put.change {
+                Change::Doc(delta) => rdb_value::compile(view, &root, expected, delta),
             };
-            let delta = Delta(vec![Op::Replace(Value::Bytes(put.value.to_vec()))]);
-            match rdb_value::compile(view, &root, expected, &delta) {
+            match compiled {
                 Ok(compiled) => {
                     conditions.extend(compiled.conditions);
                     mutations.extend(compiled.mutations);
@@ -3243,8 +3282,8 @@ impl Host {
                 error: ApiError::from_kernel(error),
                 request: None,
             },
-            (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root)) => self
-                .read_answer(partition, *outcome, *value, &root)
+            (ReplyEffect::Read { outcome, value, .. }, PendingKind::Read(root, look)) => self
+                .read_answer(partition, *outcome, *value, &root, &look)
                 .map_err(|detail| fail_waiter(&pending.reply, detail))?,
             (reply, kind) => {
                 return Err(fail_waiter(
@@ -3333,7 +3372,7 @@ impl Host {
         let answer = match handle {
             Err(kind) => Answer::Read {
                 outcome: ReadServiceOutcome::Rejected(kind),
-                value: None,
+                seen: Seen::Absent,
                 generation: Generation(0),
                 at: Seq::ZERO,
             },
@@ -3344,7 +3383,8 @@ impl Host {
                         format!("previous view {} is not bound", handle.0),
                     )
                 })?;
-                document_answer(view, &root, ReadServiceOutcome::Served)
+                object_answer(view, &root, &Look::Doc, ReadServiceOutcome::Served)
+                    .map_err(|detail| fail_waiter(&pending.reply, detail))?
             }
         };
         let _ = pending.reply.send(answer);
@@ -3359,6 +3399,7 @@ impl Host {
         outcome: ReadServiceOutcome,
         value: Option<(u64, Digest)>,
         root: &RootKey,
+        look: &Look,
     ) -> Result<Answer, String> {
         let Some((_, view)) = self.views.get(&partition) else {
             return Err("read reply with no step view".into());
@@ -3367,7 +3408,7 @@ impl Host {
         let Some((version, digest)) = value else {
             return Ok(Answer::Read {
                 outcome,
-                value: None,
+                seen: Seen::Absent,
                 generation,
                 at,
             });
@@ -3386,7 +3427,7 @@ impl Host {
         if matches!(rdb_value::read(view, root), Ok(None)) {
             return Err("read reply names a value the step view does not decode".into());
         }
-        Ok(document_answer(view, root, outcome))
+        object_answer(view, root, look, outcome)
     }
 
     // ------------------------------------------------------------------ inspection
@@ -3609,38 +3650,32 @@ fn margin_ms(horizon: Tick, at: Tick) -> i64 {
     i64::try_from(ahead).unwrap_or(if ahead < 0 { i64::MIN } else { i64::MAX })
 }
 
-/// A byte-string read of `root` from `view`: absent, its version and bytes, or why not.
-fn document_answer(view: &RocksSnapshot, root: &RootKey, outcome: ReadServiceOutcome) -> Answer {
+/// What `look` sees of the object at `root` in `view`, the view P1 just answered from (or, for
+/// `get --previous`, the kept view P1 handed out). A refusal of the read itself, such as
+/// another kind's look (`KindMismatch`), is the caller's error. The outer error faults the
+/// node: the view cannot back the answer P1 gave.
+fn object_answer(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    look: &Look,
+    outcome: ReadServiceOutcome,
+) -> Result<Answer, String> {
     let (generation, at) = (view.generation(), view.at());
-    let document = match rdb_value::read(view, root) {
-        Ok(Some(document)) => document,
-        Ok(None) => {
-            return Answer::Read {
-                outcome,
-                value: None,
-                generation,
-                at,
-            };
-        }
-        Err(error) => {
-            return Answer::Error {
-                error: compile_error(&error),
-                request: None,
-            };
-        }
+    let seen = match look {
+        Look::Doc => rdb_value::read(view, root).map(|found| found.map_or(Seen::Absent, Seen::Doc)),
     };
-    let Value::Bytes(bytes) = document.value else {
-        return Answer::Error {
-            error: ApiError::invalid("the object is not a byte string (S4a reads documents)"),
+    Ok(match seen {
+        Ok(seen) => Answer::Read {
+            outcome,
+            seen,
+            generation,
+            at,
+        },
+        Err(error) => Answer::Error {
+            error: compile_error(&error),
             request: None,
-        };
-    };
-    Answer::Read {
-        outcome,
-        value: Some((document.version, Bytes::from(bytes))),
-        generation,
-        at,
-    }
+        },
+    })
 }
 
 const fn client_name(event: &ClientEvent) -> &'static str {
@@ -3693,6 +3728,8 @@ mod tests {
     use rdb_core::contracts::errors::RetryRule;
     use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
     use rdb_core::contracts::txn::{Durability, Outcome};
+    use rdb_value::delta::Op;
+    use rdb_value::value::Value;
 
     /// This test's log lines whose message is `$message`. A macro, because the JSON value type
     /// is not nameable here without a `serde_json` dependency.
@@ -3839,8 +3876,8 @@ mod tests {
             call: ClientCall::Put {
                 identity,
                 object: Bytes::from_static(b"a"),
-                value: Bytes::from_static(b"v"),
-                if_version: None,
+                change: byte_doc(b"v"),
+                expect: None,
                 remaining_millis: 5_000,
             },
             reply,
@@ -4326,8 +4363,12 @@ mod tests {
             other => panic!("request 1 with another value: {other:?}"),
         }
         match trio.ask(get(4, b"a")) {
-            Answer::Read { value, .. } => {
-                assert_eq!(value, Some((2, Bytes::from_static(b"1"))), "a is unchanged");
+            Answer::Read { seen, .. } => {
+                assert_eq!(
+                    doc_bytes(seen),
+                    Some((2, Bytes::from_static(b"1"))),
+                    "a is unchanged"
+                );
             }
             other => panic!("get a: {other:?}"),
         }
@@ -4383,11 +4424,11 @@ mod tests {
         }) {
             Answer::Read {
                 outcome,
-                value,
+                seen,
                 generation,
                 at,
             } => assert_eq!(
-                (outcome, value, generation, at),
+                (outcome, doc_bytes(seen), generation, at),
                 (
                     ReadServiceOutcome::Served,
                     Some((2, Bytes::from_static(b"old"))),
@@ -4406,9 +4447,9 @@ mod tests {
         }
         match trio.answer(&barrier) {
             Answer::Read {
-                outcome, value, at, ..
+                outcome, seen, at, ..
             } => assert_eq!(
-                (outcome, value, at),
+                (outcome, doc_bytes(seen), at),
                 (
                     ReadServiceOutcome::WaitedAtBarrier,
                     Some((3, Bytes::from_static(b"new"))),
@@ -4631,9 +4672,9 @@ mod tests {
             previous.try_recv().ok()
         }) {
             Answer::Read {
-                outcome, value, at, ..
+                outcome, seen, at, ..
             } => assert_eq!(
-                (outcome, value, at),
+                (outcome, doc_bytes(seen), at),
                 (ReadServiceOutcome::Served, None, Seq(0)),
                 "answered from the view kept at seq 0"
             ),
@@ -5503,7 +5544,9 @@ mod tests {
             other => panic!("put a=1: {other:?}"),
         }
         match trio.ask(get(2, b"a")) {
-            Answer::Read { value, .. } => assert_eq!(value, Some((2, Bytes::from_static(b"1")))),
+            Answer::Read { seen, .. } => {
+                assert_eq!(doc_bytes(seen), Some((2, Bytes::from_static(b"1"))))
+            }
             other => panic!("get a: {other:?}"),
         }
 
@@ -5515,7 +5558,7 @@ mod tests {
             identity(3),
             Pending {
                 reply,
-                kind: PendingKind::Read(root),
+                kind: PendingKind::Read(root, Look::Doc),
                 event: EventId(0),
                 since: Tick(0),
             },
@@ -5609,7 +5652,10 @@ mod tests {
                 "read reply to a previous-view call",
                 PendingKind::Previous(root.clone()),
             ),
-            ("previous view to a read", PendingKind::Read(root.clone())),
+            (
+                "previous view to a read",
+                PendingKind::Read(root.clone(), Look::Doc),
+            ),
             ("unbound previous view", PendingKind::Previous(root)),
         ];
         for (n, (name, kind)) in (1u64..).zip(cases) {
@@ -5789,8 +5835,8 @@ mod tests {
             other => panic!("put b: {other:?}"),
         }
         match trio.answer(&read) {
-            Answer::Read { outcome, value, .. } => assert_eq!(
-                (outcome, value),
+            Answer::Read { outcome, seen, .. } => assert_eq!(
+                (outcome, doc_bytes(seen)),
                 (
                     ReadServiceOutcome::WaitedAtBarrier,
                     Some((4, Bytes::from_static(b"1")))
@@ -5956,8 +6002,8 @@ mod tests {
             puts: vec![PutOp {
                 group: AFFINITY,
                 object: Bytes::from_static(b"a"),
-                value: Bytes::from_static(b"1"),
-                if_version: None,
+                change: byte_doc(b"1"),
+                expect: None,
             }],
             remaining_millis: REMAINING_MILLIS,
         }) {
@@ -6422,9 +6468,26 @@ mod tests {
         ClientCall::Put {
             identity: identity(request),
             object: Bytes::from_static(object),
-            value: Bytes::from_static(value),
-            if_version,
+            change: byte_doc(value),
+            expect: if_version.map(Expected::Version),
             remaining_millis: 5_000,
+        }
+    }
+
+    /// A byte-string document, as `Db::put` writes one.
+    fn byte_doc(value: &[u8]) -> Change {
+        Change::Doc(Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]))
+    }
+
+    /// A read's version and bytes when it saw a byte-string document, `None` when absent.
+    fn doc_bytes(seen: Seen) -> Option<(u64, Bytes)> {
+        match seen {
+            Seen::Absent => None,
+            Seen::Doc(Document {
+                version,
+                value: Value::Bytes(bytes),
+            }) => Some((version, Bytes::from(bytes))),
+            other => panic!("not a byte-string document: {other:?}"),
         }
     }
 
@@ -6434,8 +6497,8 @@ mod tests {
             puts: vec![PutOp {
                 group: AFFINITY,
                 object: Bytes::from_static(object),
-                value: Bytes::from_static(value),
-                if_version: None,
+                change: byte_doc(value),
+                expect: None,
             }],
             remaining_millis: 5_000,
         }
@@ -6445,6 +6508,7 @@ mod tests {
         ClientCall::Get {
             identity: identity(request),
             object: Bytes::from_static(object),
+            look: Look::Doc,
         }
     }
 

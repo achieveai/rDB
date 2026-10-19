@@ -28,6 +28,12 @@ config-log-macros = { workspace = true }
 # Paused time (`start_paused`), so a row can assert the exact wait between reload retries
 # (PR #38 review F-001).
 tokio = { workspace = true, features = ["test-util"] }
+# `rdb_dev` reads JSON values with `doc_scenario`'s parser (`#[path]`, S4 A-1). The `Db` parses
+# no JSON. `float_roundtrip`: the default parser stores ~1 in 3 decimals 1 ULP off (ADR-rdb-0012
+# §3). `serde` for the visitor that refuses a duplicate key; `hex` for `$bytes` output.
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+hex = { workspace = true }
 
 [[example]]
 name = "rdb_dev"

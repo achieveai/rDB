@@ -15,8 +15,10 @@
 //! `retry` of a trimmed request is no longer recognised and is sent afresh; every rdb_dev write
 //! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
 //!
-//! Commands are read from `--script` or stdin, one per line (`#` starts a comment). Words split
-//! on spaces; `"..."` makes one word, so `""` is an empty object or value:
+//! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
+//! word starts a comment; one inside a word, as in `{"tag":"#1"}`, is kept. Words split on
+//! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`)
+//! reads its JSON values from the line as written, quotes and all:
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
@@ -40,7 +42,16 @@
 //! retry [<request>] --payload <value>     the same put and request id with another value,
 //!                                         compiled afresh (REQUEST_ID_REUSE); not remembered.
 //!                                         A put's only, never a txn's
-//! get <object>                            read at the publication barrier
+//! doc <object> [--absent | --expect V] <op>...
+//!                                         change a JSON document, ops in order, as one write.
+//!                                         An op is `--json J` (the whole document), `set
+//!                                         <path> J`, `remove <path>` or `incr <path> N`; a path
+//!                                         is `/a/0`. `--absent`: only if missing; `--expect
+//!                                         V`: only at version V; neither: at the version the
+//!                                         owner sees. `retry` resends it unchanged; `retry
+//!                                         --payload` refuses it
+//! get <object>                            read at the publication barrier: `value=` for a byte
+//!                                         string, `doc=<json>` for any other document
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
 //! status <request> [<generation>]         what became of a request this session sent
@@ -152,6 +163,8 @@
 
 #[path = "support/hostile_store.rs"]
 mod hostile_store;
+#[path = "../../rdb-value/examples/doc_scenario/json.rs"]
+mod json;
 
 use std::io::{BufRead, Write as _};
 use std::path::PathBuf;
@@ -168,7 +181,10 @@ use config_testkit::cluster::{Cluster, StorageKind};
 use config_testkit::TestTimers;
 use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
-use rdb_api::{ApiError, Db, DbConfig, OpenError, PutError, Timeouts, TxnPut};
+use rdb_api::{
+    ApiError, Change, Db, DbConfig, Delta, Expected, Int, Look, Op, OpenError, Path, PutError,
+    ReadOk, Timeouts, TxnPut, Value,
+};
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
 use rdb_core::contracts::authority::DenyReason;
@@ -949,6 +965,19 @@ fn repl<'scope, 'env>(
             say(&format!("> {line}"));
         }
         tracing::info!(command = %line, "repl_command");
+        // A value verb reads its JSON from the raw line (risk R1), so it skips `split_words`.
+        if line.split_whitespace().next() == Some("doc") {
+            match parse_doc(&line) {
+                Ok((object, expect, change)) => {
+                    write_line(db, db.write(object.as_bytes(), change, expect), &mut sent);
+                }
+                Err(e) => {
+                    say(&format!("usage: {e}; {DOC_USAGE}"));
+                    bad = true;
+                }
+            }
+            continue;
+        }
         let words = match split_words(&line) {
             Ok(words) => words,
             Err(e) => {
@@ -1016,7 +1045,7 @@ fn repl<'scope, 'env>(
             },
             ["retry", rest @ ..] => sent.pick(rest).map(|(request, kind)| {
                 let answer = match kind {
-                    Kind::Put { .. } => db.resend(request),
+                    Kind::Put { .. } | Kind::Value => db.resend(request),
                     // A txn waits as it was sent: its own deadline, not the put timeout.
                     Kind::Txn => {
                         let deadline = Duration::from_millis(request.remaining_millis);
@@ -1026,7 +1055,7 @@ fn repl<'scope, 'env>(
                 put_line(db, answer, None);
             }),
             ["get", object] => {
-                get_line(db.get(object.as_bytes()));
+                read_line(db.read(object.as_bytes(), Look::Doc));
                 Ok(())
             }
             ["get", object, "--previous"] => {
@@ -1200,8 +1229,198 @@ fn repl<'scope, 'env>(
 /// PowerShell 5.1 wrote as UTF-16LE, otherwise ran nothing and exited 0.
 fn command(line: std::io::Result<String>) -> Result<Option<String>, String> {
     let line = line.map_err(|e| format!("input: {e}; scripts must be UTF-8"))?;
-    let line = line.split('#').next().unwrap_or("").trim().to_owned();
+    let line = uncommented(&line).trim().to_owned();
     Ok((!line.is_empty()).then_some(line))
+}
+
+/// `line` up to its comment: a `#` at the start of a word, never one inside a word, so JSON
+/// such as `{"tag":"#1"}` is kept whole (S4 A-2).
+fn uncommented(line: &str) -> &str {
+    let mut word_start = true;
+    for (at, c) in line.char_indices() {
+        if c == '#' && word_start {
+            return &line[..at];
+        }
+        word_start = c.is_whitespace();
+    }
+    line
+}
+
+/// The size limit `json.rs` reads an argument under. `rdb_dev` reads its values from the
+/// line instead, so this only satisfies the shared file's import.
+const MAX_JSON_TEXT: usize = 1 << 20;
+
+/// A JSON input refusal, as `json.rs` builds it.
+#[derive(Debug)]
+struct Failure {
+    error: String,
+    detail: String,
+}
+
+impl Failure {
+    const fn refused(error: String, detail: String) -> Self {
+        Self { error, detail }
+    }
+}
+
+/// An argument as text, refused over `limit` bytes; `json.rs`'s import.
+fn arg_text(arg: &str, limit: usize) -> Result<String, Failure> {
+    if arg.len() > limit {
+        return Err(Failure::refused(
+            "InputTooLarge".into(),
+            format!("over the {limit}-byte limit"),
+        ));
+    }
+    Ok(arg.to_owned())
+}
+
+/// A value verb's line, read word by word. A JSON value is read from the raw text with
+/// serde's stream reader (risk R1), so its quotes and spaces are kept: `split_words` would turn
+/// `"b"` into `b`.
+struct Words<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Words<'a> {
+    const fn new(line: &'a str) -> Self {
+        Self { rest: line }
+    }
+
+    /// The next word, up to whitespace.
+    fn next(&mut self) -> Option<&'a str> {
+        let text = self.rest.trim_start();
+        if text.is_empty() {
+            self.rest = text;
+            return None;
+        }
+        let end = text.find(char::is_whitespace).unwrap_or(text.len());
+        self.rest = &text[end..];
+        Some(&text[..end])
+    }
+
+    /// The next word, which `what` needs.
+    fn take(&mut self, what: &str) -> Result<&'a str, String> {
+        self.next().ok_or_else(|| format!("missing {what}"))
+    }
+
+    /// The next JSON value, for `what`. A value that does not end at whitespace or the end of
+    /// the line is refused: `1x` is not `1` then `x`.
+    fn json(&mut self, what: &str) -> Result<Value, String> {
+        let text = self.rest.trim_start();
+        if text.is_empty() {
+            return Err(format!("missing {what} (a JSON value)"));
+        }
+        let (value, used) =
+            json::json_value(text).map_err(|f| format!("{what}: {}: {}", f.error, f.detail))?;
+        let after = &text[used..];
+        if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+            return Err(format!(
+                "{what}: the JSON value ends at {:?}, not at a space",
+                &text[..used]
+            ));
+        }
+        self.rest = after;
+        Ok(value)
+    }
+}
+
+/// `--absent` or `--expect V`, once, before the ops; neither is `None`.
+fn parse_expect(words: &mut Words<'_>) -> Result<Option<Expected>, String> {
+    let before = words.rest;
+    match words.next() {
+        Some("--absent") => Ok(Some(Expected::Absent)),
+        Some("--expect") => {
+            let v = words.take("a version after --expect")?;
+            v.parse()
+                .map(|v| Some(Expected::Version(v)))
+                .map_err(|_| format!("--expect {v:?} is not a version"))
+        }
+        _ => {
+            words.rest = before;
+            Ok(None)
+        }
+    }
+}
+
+const DOC_USAGE: &str = "doc <object> [--absent | --expect V] <op>...; an op is --json J, \
+                         set <path> J, remove <path> or incr <path> N";
+
+/// `doc <object> [--absent | --expect V] <op>...`: the object, the guard and the change.
+fn parse_doc(line: &str) -> Result<(String, Option<Expected>, Change), String> {
+    let mut words = Words::new(line);
+    words.next(); // `doc`
+    let object = words.take("<object>")?.to_owned();
+    let expect = parse_expect(&mut words)?;
+    let mut ops = Vec::new();
+    while let Some(word) = words.next() {
+        let path = |words: &mut Words<'_>| {
+            let text = words.take("a path")?;
+            Path::parse(text).map_err(|e| format!("{e} in path {text:?}"))
+        };
+        ops.push(match word {
+            "--json" => Op::Replace(words.json("--json")?),
+            "set" => Op::Set(path(&mut words)?, words.json("set")?),
+            "remove" => Op::Remove(path(&mut words)?),
+            "incr" => {
+                let at = path(&mut words)?;
+                let n = words.take("an integer")?;
+                let by = n
+                    .parse::<i128>()
+                    .ok()
+                    .and_then(Int::new)
+                    .ok_or_else(|| format!("incr {n:?} is not an integer in -2^64..2^64-1"))?;
+                Op::Increment(at, by)
+            }
+            "--absent" | "--expect" => return Err(format!("{word} goes before the ops")),
+            other => return Err(format!("unexpected {other:?}")),
+        });
+    }
+    if ops.is_empty() {
+        return Err("no op".to_owned());
+    }
+    Ok((object, expect, Change::Doc(Delta(ops))))
+}
+
+/// A value write's answer, remembered for `retry` as [`Kind::Value`].
+fn write_line(db: &Db, answer: Result<Option<rdb_api::PutOk>, PutError>, sent: &mut Sent) {
+    match answer {
+        Ok(None) => say("unchanged (nothing sent)"),
+        Ok(Some(ok)) => put_line(db, Ok(ok), Some((sent, Kind::Value))),
+        Err(e) => put_line(db, Err(e), Some((sent, Kind::Value))),
+    }
+}
+
+/// A `Db::read` answer as lines. A byte-string document prints as `get` always has; any other
+/// document as JSON.
+fn read_line(answer: Result<ReadOk, ApiError>) {
+    let ok = match answer {
+        Ok(ok) => ok,
+        Err(error) => {
+            say(&format!("err {} ({})", error.name(), error.detail));
+            return;
+        }
+    };
+    let view = format!(
+        "gen={} at={}{}",
+        ok.generation.0,
+        ok.at.0,
+        if ok.waited { " waited" } else { "" }
+    );
+    match ok.seen {
+        rdb_api::Seen::Absent => say(&format!("absent {view}")),
+        rdb_api::Seen::Doc(doc) => match doc.value {
+            Value::Bytes(bytes) => say(&format!(
+                "value={} version={} {view}",
+                String::from_utf8_lossy(&bytes),
+                doc.version
+            )),
+            value => say(&format!(
+                "doc={} version={} {view}",
+                json::render(&value),
+                doc.version
+            )),
+        },
+    }
 }
 
 /// Split a command line on spaces; `"..."` is one word, and `""` an empty one.
@@ -1361,6 +1580,11 @@ fn payload_put(kind: Kind, request: RequestId) -> Result<(Vec<u8>, Option<u64>),
             "retry --payload changes a put's value; request {} was a txn",
             request.0
         )),
+        Kind::Value => Err(format!(
+            "retry --payload changes a put's value; request {} was a value write: retry it \
+             unchanged, or send a new write",
+            request.0
+        )),
     }
 }
 
@@ -1374,6 +1598,8 @@ enum Kind {
     },
     /// A txn.
     Txn,
+    /// A value write (`doc`): resent unchanged, never with another payload (S4 A-5).
+    Value,
 }
 
 /// Every put and txn request this session sent, and which came last. `retry` replays the
