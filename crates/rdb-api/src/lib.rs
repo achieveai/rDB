@@ -30,10 +30,11 @@ pub use db::{
     ApiError, Db, DbConfig, GetOk, OpenError, PutError, PutOk, ReadOk, Timeouts, TxnPut,
     MAX_TXN_DEADLINE,
 };
-pub use host::{Change, Look, Seen};
+pub use host::{Change, ListEdit, Look, Seen};
 // The value types an app builds a change from, by name only (S4 A-8): no `rdb_value` internals.
 pub use rdb_value::collection::{Collection, CollectionKind, ElemOp, Member, Members};
 pub use rdb_value::delta::{Delta, Op};
+pub use rdb_value::list::{Item, Items, List, Token};
 pub use rdb_value::path::Path;
 pub use rdb_value::value::{Float, Int, Map, MapKey, Value};
 pub use rdb_value::{Document, Expected};

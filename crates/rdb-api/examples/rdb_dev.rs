@@ -1542,6 +1542,31 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                 }
             }
         }
+        // `list version=V count=C listed=L`, one `  P J` line per item (`inline=false` when the
+        // item has its own record), then `token=G:V:P` when items remain.
+        rdb_api::Seen::Items(page) => {
+            let root = page.list;
+            say(&format!(
+                "list version={} count={} listed={} {view}",
+                root.version,
+                root.count,
+                page.items.len()
+            ));
+            for item in page.items {
+                say(&format!(
+                    "  {} {}{}",
+                    item.position,
+                    json::render(&item.value),
+                    if item.inline { "" } else { " inline=false" }
+                ));
+            }
+            if let Some(next) = page.next {
+                say(&format!(
+                    "token={}:{}:{}",
+                    next.generation.0, next.version, next.position
+                ));
+            }
+        }
     }
 }
 

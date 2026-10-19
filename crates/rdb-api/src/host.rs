@@ -72,8 +72,9 @@ use rdb_storage::{RocksEngine, RocksSnapshot};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
+use rdb_value::list::{Items, ListOp, Start, Token, DEFAULT_BLOCK_MAX};
 use rdb_value::value::Value;
-use rdb_value::{Document, Expected, ValueError};
+use rdb_value::{Compiled, Document, Expected, ValueError};
 
 use crate::clock::HostClock;
 use crate::control::ControlAdapter;
@@ -408,6 +409,9 @@ pub enum Change {
     Map(Vec<ElemOp>),
     /// Set ops, applied in order (ADR-rdb-0013): `Add`, `Remove` and the `Need` checks.
     Set(Vec<ElemOp>),
+    /// List edits, applied in order (ADR-rdb-0016). A create makes an ordinary list (`records`
+    /// false) with the default block size.
+    List(Vec<ListEdit>),
 }
 
 impl Change {
@@ -418,8 +422,45 @@ impl Change {
             Self::Doc(_) => "doc",
             Self::Map(_) => "map",
             Self::Set(_) => "set",
+            Self::List(_) => "list",
         }
     }
+}
+
+/// One list edit (A-R116). A position counts from the start, or from the end when negative:
+/// `-1` is the last item. Positions read the list as the earlier edits left it, as
+/// `rdb_value`'s `ListOp` positions do. The owner turns them into `ListOp`s against the list
+/// version the write is checked against, so a concurrent change cannot shift one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListEdit {
+    /// Add the value at the end.
+    Push(Value),
+    /// Add the value before position `at`; `at` may also be the count, the end.
+    Insert {
+        /// The new item's position.
+        at: i64,
+        /// The new item's value.
+        value: Value,
+    },
+    /// Remove the item at `at`.
+    Remove {
+        /// The item's position.
+        at: i64,
+    },
+    /// Replace the value of the item at `at`.
+    Replace {
+        /// The item's position.
+        at: i64,
+        /// Its new value.
+        value: Value,
+    },
+    /// Move the item at `from` so that it ends at `to`.
+    Move {
+        /// The item's position now.
+        from: i64,
+        /// Its position after the move.
+        to: i64,
+    },
 }
 
 /// What a read looks at.
@@ -435,6 +476,22 @@ pub enum Look {
         /// The most elements to return.
         limit: usize,
     },
+    /// Up to `limit` list items from position `at`. A negative `at` counts from the end: `-1` is
+    /// the last item, read against the count of the list this read sees (A-R116).
+    Items {
+        /// The first position.
+        at: i64,
+        /// The most items to return.
+        limit: usize,
+    },
+    /// Up to `limit` list items from where an earlier page stopped. A token from another
+    /// generation or list version is `STALE_CONTINUATION` (C-2).
+    ItemsAfter {
+        /// The earlier page's `next`.
+        token: Token,
+        /// The most items to return.
+        limit: usize,
+    },
 }
 
 /// What a read saw.
@@ -446,6 +503,8 @@ pub enum Seen {
     Doc(Document),
     /// A page of a map or set, with its root.
     Members(Members),
+    /// A page of a list, with its root and where to resume.
+    Items(Items),
 }
 
 /// A node's answer to a client call.
@@ -3216,29 +3275,33 @@ impl Host {
                     .map_or(Expected::Absent, Expected::Version)
             });
             let compiled = match &put.change {
-                Change::Doc(delta) => rdb_value::compile(view, &root, expected, delta),
+                Change::Doc(delta) => {
+                    rdb_value::compile(view, &root, expected, delta).map_err(|e| compile_error(&e))
+                }
                 Change::Map(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
                     CollectionKind::Map,
                     expected,
                     ops,
-                ),
+                )
+                .map_err(|e| compile_error(&e)),
                 Change::Set(ops) => rdb_value::collection::compile_collection(
                     view,
                     &root,
                     CollectionKind::Set,
                     expected,
                     ops,
-                ),
+                )
+                .map_err(|e| compile_error(&e)),
+                Change::List(edits) => list_compile(view, &root, expected, edits),
             };
             match compiled {
                 Ok(compiled) => {
                     conditions.extend(compiled.conditions);
                     mutations.extend(compiled.mutations);
                 }
-                Err(error) => {
-                    let mut refused = compile_error(&error);
+                Err(mut refused) => {
                     refused.detail = format!("op {index}: {}", refused.detail);
                     return Ok(Err(refused));
                 }
@@ -3674,6 +3737,130 @@ fn compile_error(error: &ValueError) -> ApiError {
     }
 }
 
+/// Where `Look::Items` starts: `at` itself, or for `-k` the list's count in `view` less k. Below 0
+/// is the caller's `INVALID_ARGUMENT`; the outer error is reading the list root.
+fn items_start(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    at: i64,
+) -> Result<Result<Start, ApiError>, ValueError> {
+    if let Ok(position) = u64::try_from(at) {
+        return Ok(Ok(Start::Position(position)));
+    }
+    let count = rdb_value::list::list(view, root)?
+        .ok_or(ApplyError::ObjectAbsent)?
+        .count;
+    Ok(resolve_position(at, count)
+        .map(Start::Position)
+        .ok_or_else(|| {
+            ApiError::invalid(format!("position {at} is not inside the list of {count}"))
+        }))
+}
+
+/// Compile `edits` against the list at `root` in `view`. Each position is resolved against the
+/// list's count in the same view, carried through the edits (A-R116). A create starts at 0 and
+/// makes an ordinary list with the default block size. The guard is checked first: when a
+/// position, or reading the count, is refused, the edits are compiled empty, so a stale or
+/// missing list answers `CONDITION_FAILED` whatever its positions say.
+fn list_compile(
+    view: &RocksSnapshot,
+    root: &RootKey,
+    expected: Expected,
+    edits: &[ListEdit],
+) -> Result<Compiled, ApiError> {
+    let compile = |ops: &[ListOp]| {
+        match expected {
+            Expected::Absent => {
+                rdb_value::list::create_list(view, root, false, DEFAULT_BLOCK_MAX, ops)
+            }
+            Expected::Version(_) => {
+                rdb_value::list::compile_list(view, root, expected, DEFAULT_BLOCK_MAX, ops)
+            }
+        }
+        .map(|compiled| compiled.compiled().clone())
+        .map_err(|e| compile_error(&e))
+    };
+    let count = match expected {
+        Expected::Absent => Ok(0),
+        // No root: the compile below refuses it (`ObjectAbsent`); 0 resolves nothing wrongly,
+        // because that refusal comes first.
+        Expected::Version(_) => rdb_value::list::list(view, root)
+            .map(|found| found.map_or(0, |list| list.count))
+            .map_err(|e| compile_error(&e)),
+    };
+    match count.and_then(|count| resolve_edits(edits, count)) {
+        Ok(ops) => compile(&ops),
+        Err(refused) => {
+            compile(&[])?;
+            Err(refused)
+        }
+    }
+}
+
+/// `edits` as `ListOp`s against a list of `count` items: `-k` is `count - k`, and the count
+/// moves as the edits do (push and insert +1, remove -1). A position outside the list as the
+/// earlier edits left it is `INVALID_ARGUMENT`, named by its edit and as it was written.
+fn resolve_edits(edits: &[ListEdit], mut count: u64) -> Result<Vec<ListOp>, ApiError> {
+    let mut ops = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        // An insert may name the end; every other position names an item.
+        let at = |at: i64, end_ok: bool| {
+            let len = count + u64::from(end_ok);
+            resolve_position(at, count)
+                .filter(|position| *position < len)
+                .ok_or_else(|| {
+                    ApiError::invalid(format!(
+                        "edit {index}: position {at} is not inside the list of {count}"
+                    ))
+                })
+        };
+        ops.push(match edit {
+            ListEdit::Push(value) => {
+                count += 1;
+                ListOp::Push(value.clone())
+            }
+            ListEdit::Insert {
+                at: position,
+                value,
+            } => {
+                let at = at(*position, true)?;
+                count += 1;
+                ListOp::Insert {
+                    at,
+                    value: value.clone(),
+                }
+            }
+            ListEdit::Remove { at: position } => {
+                let at = at(*position, false)?;
+                count -= 1;
+                ListOp::Remove { at }
+            }
+            ListEdit::Replace {
+                at: position,
+                value,
+            } => ListOp::Replace {
+                at: at(*position, false)?,
+                value: value.clone(),
+            },
+            ListEdit::Move { from, to } => ListOp::Move {
+                from: at(*from, false)?,
+                to: at(*to, false)?,
+            },
+        });
+    }
+    Ok(ops)
+}
+
+/// `at` against a list of `count` items: itself when not negative, `count - k` for `-k`, and
+/// `None` below 0.
+fn resolve_position(at: i64, count: u64) -> Option<u64> {
+    if at < 0 {
+        count.checked_sub(at.unsigned_abs())
+    } else {
+        u64::try_from(at).ok()
+    }
+}
+
 fn millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
@@ -3700,6 +3887,34 @@ fn object_answer(
         Look::Doc => rdb_value::read(view, root).map(|found| found.map_or(Seen::Absent, Seen::Doc)),
         Look::Members { after, limit } => {
             rdb_value::collection::members(view, root, after.as_ref(), *limit).map(Seen::Members)
+        }
+        Look::Items { at: from, limit } => match items_start(view, root, *from) {
+            Ok(Ok(start)) => rdb_value::list::items(view, root, start, *limit).map(Seen::Items),
+            Ok(Err(refused)) => {
+                return Ok(Answer::Error {
+                    error: refused,
+                    request: None,
+                })
+            }
+            Err(error) => Err(error),
+        },
+        Look::ItemsAfter { token, limit } => {
+            match rdb_value::list::items(view, root, Start::Token(*token), *limit) {
+                // The list moved on since the token: restart the read (C-2). The kernel's kind
+                // and retry rule, with the reason `rdb_value` gave.
+                Err(ValueError::Apply(
+                    reason @ (ApplyError::GenerationChanged { .. }
+                    | ApplyError::VersionConflict { .. }),
+                )) => {
+                    let mut stale = ApiError::from_kernel(&RdbError::StaleContinuation);
+                    stale.detail = reason.to_string();
+                    return Ok(Answer::Error {
+                        error: stale,
+                        request: None,
+                    });
+                }
+                read => read.map(Seen::Items),
+            }
         }
     };
     Ok(match seen {
