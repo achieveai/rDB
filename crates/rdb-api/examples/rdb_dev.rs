@@ -18,7 +18,8 @@
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, is kept. Words split on
 //! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`,
-//! `map`, `set`, `members`) reads its JSON values from the line as written, quotes and all:
+//! `map`, `set`, `members`, `list`, `items`) reads its JSON values from the line as written,
+//! quotes and all:
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
@@ -62,6 +63,21 @@
 //!                                         from the first, N at most (default 100): `map
 //!                                         version=V count=C listed=L ...`, then `  K = J` per
 //!                                         entry or `  K` per member
+//! list <object> [--absent | --expect V] <op>...
+//!                                         change a list, ops in order, as one write. An op is
+//!                                         `push J`, `insert P J`, `remove P`, `replace P J` or
+//!                                         `move P Q`. A negative P counts from the end (`-1`
+//!                                         is the last item), read against the list as the
+//!                                         earlier ops left it. No ops with `--absent` creates
+//!                                         an empty list. Guards and `retry` as for `doc`
+//! items <object> [--from P | --token G:V:P] [--limit N]
+//!                                         a page of a list from position P (default 0; `-1`
+//!                                         the last) or from a page's token, N at most
+//!                                         (default 100): `list version=V count=C listed=L
+//!                                         ...`, then `  P J` per item (`inline=false` when it
+//!                                         has its own record), then `token=G:V:P` when items
+//!                                         remain. A token the list moved past answers
+//!                                         `STALE_CONTINUATION`: read again from the start
 //! get <object>                            read at the publication barrier: `value=` for a byte
 //!                                         string, `doc=<json>` for any other document
 //! get <object> --previous                 read the previously published view at once, never
@@ -194,8 +210,8 @@ use config_testkit::TestTimers;
 use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
 use rdb_api::{
-    ApiError, Change, CollectionKind, Db, DbConfig, Delta, ElemOp, Expected, Int, Look, Op,
-    OpenError, Path, PutError, ReadOk, Timeouts, TxnPut, Value,
+    ApiError, Change, CollectionKind, Db, DbConfig, Delta, ElemOp, Expected, Int, ListEdit, Look,
+    Op, OpenError, Path, PutError, ReadOk, Timeouts, Token, TxnPut, Value,
 };
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
@@ -983,9 +999,13 @@ fn repl<'scope, 'env>(
             .next()
             .filter(|verb| VALUE_VERBS.contains(verb))
         {
-            let done = if verb == "members" {
-                parse_members(&line)
-                    .map(|(object, look)| read_line(db.read(object.as_bytes(), look)))
+            let read = match verb {
+                "members" => Some(parse_members(&line)),
+                "items" => Some(parse_items(&line)),
+                _ => None,
+            };
+            let done = if let Some(read) = read {
+                read.map(|(object, look)| read_line(db.read(object.as_bytes(), look)))
             } else {
                 parse_change(&line).map(|(object, expect, change)| {
                     write_line(db, db.write(object.as_bytes(), change, expect), &mut sent);
@@ -1362,24 +1382,30 @@ fn parse_expect(words: &mut Words<'_>) -> Result<Option<Expected>, String> {
 }
 
 /// The value verbs, each read from the raw line (risk R1).
-const VALUE_VERBS: [&str; 4] = ["doc", "map", "set", "members"];
+const VALUE_VERBS: [&str; 6] = ["doc", "map", "set", "members", "list", "items"];
 
 const DOC_USAGE: &str = "doc <object> [--absent | --expect V] <op>...; an op is --json J, \
                          set <path> J, remove <path> or incr <path> N";
 const COLLECTION_USAGE: &str = "map|set <object> [--absent | --expect V] <op>...; an op is put K \
                                 J, add K, del K or need K present|absent";
 const MEMBERS_USAGE: &str = "members <object> [--after K] [--limit N]";
+const LIST_USAGE: &str =
+    "list <object> [--absent | --expect V] <op>...; an op is push J, insert P J, \
+                          remove P, replace P J or move P Q; a negative P counts from the end";
+const ITEMS_USAGE: &str = "items <object> [--from P | --token G:V:P] [--limit N]";
 
 /// The usage line for `verb`'s refusals.
 fn usage_of(verb: &str) -> &'static str {
     match verb {
         "doc" => DOC_USAGE,
         "members" => MEMBERS_USAGE,
+        "list" => LIST_USAGE,
+        "items" => ITEMS_USAGE,
         _ => COLLECTION_USAGE,
     }
 }
 
-/// `doc|map|set <object> [--absent | --expect V] <op>...`: the object, the guard and the change.
+/// `doc|map|set|list <object> [--absent | --expect V] <op>...`: the object, the guard and the change.
 fn parse_change(line: &str) -> Result<(String, Option<Expected>, Change), String> {
     let mut words = Words::new(line);
     let verb = words.take("a verb")?;
@@ -1389,6 +1415,7 @@ fn parse_change(line: &str) -> Result<(String, Option<Expected>, Change), String
         "doc" => Change::Doc(Delta(doc_ops(&mut words)?)),
         "map" => Change::Map(elem_ops(&mut words)?),
         "set" => Change::Set(elem_ops(&mut words)?),
+        "list" => Change::List(list_edits(&mut words)?),
         other => return Err(format!("{other:?} is not a write")),
     };
     Ok((object, expect, change))
@@ -1478,6 +1505,97 @@ fn parse_members(line: &str) -> Result<(String, Look), String> {
     Ok((object, Look::Members { after, limit }))
 }
 
+/// A `list` line's edits, possibly none (a create of an empty list). A position is an integer;
+/// negative counts from the end, resolved by the owner (A-R116).
+fn list_edits(words: &mut Words<'_>) -> Result<Vec<ListEdit>, String> {
+    let position = |words: &mut Words<'_>, what: &str| {
+        let text = words.take(what)?;
+        text.parse::<i64>()
+            .map_err(|_| format!("{what} {text:?} is not a position"))
+    };
+    let mut edits = Vec::new();
+    while let Some(word) = words.next() {
+        edits.push(match word {
+            "push" => ListEdit::Push(words.json("push J")?),
+            "insert" => ListEdit::Insert {
+                at: position(words, "insert P")?,
+                value: words.json("insert's value J")?,
+            },
+            "remove" => ListEdit::Remove {
+                at: position(words, "remove P")?,
+            },
+            "replace" => ListEdit::Replace {
+                at: position(words, "replace P")?,
+                value: words.json("replace's value J")?,
+            },
+            "move" => ListEdit::Move {
+                from: position(words, "move P")?,
+                to: position(words, "move's Q")?,
+            },
+            "--absent" | "--expect" => return Err(format!("{word} goes before the ops")),
+            other => return Err(format!("unexpected {other:?}")),
+        });
+    }
+    Ok(edits)
+}
+
+/// `items <object> [--from P | --token G:V:P] [--limit N]`: the object and the look. Without
+/// either start it reads from position 0.
+fn parse_items(line: &str) -> Result<(String, Look), String> {
+    let mut words = Words::new(line);
+    words.next(); // `items`
+    let object = words.take("<object>")?.to_owned();
+    let (mut from, mut token, mut limit) = (None, None, None);
+    while let Some(word) = words.next() {
+        match word {
+            "--from" if from.is_none() && token.is_none() => {
+                let p = words.take("a position after --from")?;
+                from = Some(
+                    p.parse::<i64>()
+                        .map_err(|_| format!("--from {p:?} is not a position"))?,
+                );
+            }
+            "--token" if from.is_none() && token.is_none() => {
+                token = Some(parse_token(words.take("G:V:P after --token")?)?);
+            }
+            "--limit" if limit.is_none() => {
+                let n = words.take("a count after --limit")?;
+                limit = Some(
+                    n.parse::<usize>()
+                        .map_err(|_| format!("--limit {n:?} is not a count"))?,
+                );
+            }
+            other => return Err(format!("unexpected {other:?}")),
+        }
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    let look = match token {
+        Some(token) => Look::ItemsAfter { token, limit },
+        None => Look::Items {
+            at: from.unwrap_or(0),
+            limit,
+        },
+    };
+    Ok((object, look))
+}
+
+/// `G:V:P`, as `items` prints a page's `token=`.
+fn parse_token(text: &str) -> Result<Token, String> {
+    let parts: Vec<&str> = text.split(':').collect();
+    let [g, v, p] = parts.as_slice() else {
+        return Err(format!("--token {text:?} is not G:V:P"));
+    };
+    let number = |part: &str| {
+        part.parse::<u64>()
+            .map_err(|_| format!("--token {text:?} is not G:V:P"))
+    };
+    Ok(Token {
+        generation: Generation(number(g)?),
+        version: number(v)?,
+        position: number(p)?,
+    })
+}
+
 /// A value write's answer, remembered for `retry` as [`Kind::Value`].
 fn write_line(db: &Db, answer: Result<Option<rdb_api::PutOk>, PutError>, sent: &mut Sent) {
     match answer {
@@ -1493,7 +1611,13 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
     let ok = match answer {
         Ok(ok) => ok,
         Err(error) => {
-            say(&format!("err {} ({})", error.name(), error.detail));
+            // `retry=` too: a stale token's `Reconcile` is the line's point (C-2).
+            say(&format!(
+                "err {} retry={:?} ({})",
+                error.name(),
+                error.retry,
+                error.detail
+            ));
             return;
         }
     };
