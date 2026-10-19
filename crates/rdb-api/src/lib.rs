@@ -32,6 +32,7 @@ pub use db::{
 };
 pub use host::{Change, ListEdit, Look, Seen};
 // The value types an app builds a change from, by name only (S4 A-8): no `rdb_value` internals.
+pub use rdb_value::blob::{Blob, Manifest, Upload};
 pub use rdb_value::collection::{Collection, CollectionKind, ElemOp, Member, Members};
 pub use rdb_value::delta::{Delta, Op};
 pub use rdb_value::list::{Item, Items, List, Token};

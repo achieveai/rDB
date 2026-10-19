@@ -69,6 +69,7 @@ use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
+use rdb_value::blob::{Blob, Upload};
 use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
@@ -412,6 +413,29 @@ pub enum Change {
     /// List edits, applied in order (ADR-rdb-0016). A create makes an ordinary list (`records`
     /// false) with the default block size.
     List(Vec<ListEdit>),
+    /// Store chunk `index` of upload `upload` for the blob at the object (ADR-rdb-0014 §5). The
+    /// caller mints the upload id (S4 Q1). Takes no `expect`. The same bytes already stored
+    /// compile to nothing, never sent ([`Answer::Unchanged`]).
+    Chunk {
+        /// The upload the chunk belongs to.
+        upload: Upload,
+        /// The chunk's position, from 0.
+        index: u32,
+        /// The chunk's bytes.
+        bytes: Bytes,
+    },
+    /// Publish upload `upload` as the blob at the object (ADR-rdb-0014 §6): every chunk is
+    /// checked against `size`, `chunk_size` and `sha256` before the root is written.
+    Publish {
+        /// The upload whose chunks the blob is.
+        upload: Upload,
+        /// The blob's length in bytes.
+        size: u64,
+        /// Every chunk's length, except the last.
+        chunk_size: u64,
+        /// SHA-256 of the whole blob.
+        sha256: [u8; 32],
+    },
 }
 
 impl Change {
@@ -423,6 +447,8 @@ impl Change {
             Self::Map(_) => "map",
             Self::Set(_) => "set",
             Self::List(_) => "list",
+            Self::Chunk { .. } => "chunk",
+            Self::Publish { .. } => "publish",
         }
     }
 }
@@ -493,6 +519,14 @@ pub enum Look {
         /// The most items to return.
         limit: usize,
     },
+    /// Bytes `offset … offset + len` of a blob, with its manifest, from one view (ADR-rdb-0014
+    /// §7). `len` 0 reads the manifest alone.
+    Range {
+        /// The first byte.
+        offset: u64,
+        /// How many bytes.
+        len: u64,
+    },
 }
 
 /// What a read saw.
@@ -506,6 +540,13 @@ pub enum Seen {
     Members(Members),
     /// A page of a list, with its root and where to resume.
     Items(Items),
+    /// A blob's manifest and version, and the asked bytes of it.
+    Range {
+        /// The blob's root as read.
+        blob: Blob,
+        /// The bytes asked for.
+        bytes: Bytes,
+    },
 }
 
 /// A node's answer to a client call.
@@ -531,6 +572,8 @@ pub enum Answer {
     },
     /// A put compiled and not sent. Send it with [`ClientCall::Resend`].
     Compiled(TxnRequest),
+    /// The writes compiled to nothing: what they ask is already stored. Nothing was sent.
+    Unchanged,
     /// A status query was answered.
     Status(TxnStatus),
     /// The call failed.
@@ -3099,11 +3142,15 @@ impl Host {
                 )
                 .map_err(|detail| fail_waiter(&reply, detail))?
             {
-                Ok(request) => (
+                Ok(Some(request)) => (
                     identity,
                     EventKind::Client(ClientEvent::Submit(request.clone())),
                     Some(PendingKind::Txn(request)),
                 ),
+                Ok(None) => {
+                    let _ = reply.send(Answer::Unchanged);
+                    return Ok(());
+                }
                 Err(error) => {
                     let _ = reply.send(Answer::Error {
                         error,
@@ -3121,7 +3168,8 @@ impl Host {
                     .compile(partition, identity, &puts, remaining_millis)
                     .map_err(|detail| fail_waiter(&reply, detail))?
                 {
-                    Ok(request) => Answer::Compiled(request),
+                    Ok(Some(request)) => Answer::Compiled(request),
+                    Ok(None) => Answer::Unchanged,
                     Err(error) => Answer::Error {
                         error,
                         request: None,
@@ -3134,6 +3182,7 @@ impl Host {
                     puts = puts.len(),
                     change = puts.first().map_or("none", |put| put.change.name()),
                     compiled = matches!(answer, Answer::Compiled(_)),
+                    unchanged = matches!(answer, Answer::Unchanged),
                     "client_compile"
                 );
                 let _ = reply.send(answer);
@@ -3240,13 +3289,14 @@ impl Host {
     /// Compile writes as one transaction against the step view. The outer error
     /// faults the node (the step view could not be built); the inner one is the caller's: the
     /// first put that does not compile refuses them all, named by its index, never its key.
+    /// `None` is a compile with nothing to write, which is never sent.
     fn compile(
         &mut self,
         partition: PartitionId,
         identity: RequestIdentity,
         puts: &[PutOp],
         remaining_millis: u64,
-    ) -> Result<Result<TxnRequest, ApiError>, String> {
+    ) -> Result<Result<Option<TxnRequest>, ApiError>, String> {
         let generation = self.adopted(partition).generation;
         // Generation 0 is no lineage: nothing adopted yet, so nothing to fence the put with.
         // Refused here and never sent (lead ruling on D1, 2026-10-07).
@@ -3296,6 +3346,33 @@ impl Host {
                 )
                 .map_err(|e| compile_error(&e)),
                 Change::List(edits) => list_compile(view, &root, expected, edits),
+                Change::Chunk { .. } if put.expect.is_some() => Err(ApiError::invalid(
+                    "a chunk takes no expect: it is written only where none is stored",
+                )),
+                Change::Chunk {
+                    upload,
+                    index,
+                    bytes,
+                } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes)
+                    .map_err(|e| compile_error(&e)),
+                // `serving` is the adopted generation the request will be fenced with
+                // (ADR-rdb-0014 §6 check 0).
+                Change::Publish {
+                    upload,
+                    size,
+                    chunk_size,
+                    sha256,
+                } => rdb_value::blob::publish(
+                    view,
+                    &root,
+                    expected,
+                    upload,
+                    *size,
+                    *chunk_size,
+                    sha256,
+                    generation,
+                )
+                .map_err(|e| compile_error(&e)),
             };
             match compiled {
                 Ok(compiled) => {
@@ -3308,7 +3385,12 @@ impl Host {
                 }
             }
         }
-        Ok(Ok(TxnRequest {
+        // Puts with nothing to write: never sent, since the kernel refuses an empty request (S4
+        // guard 7). No puts at all is still sent, for the kernel to refuse as malformed.
+        if mutations.is_empty() && !puts.is_empty() {
+            return Ok(Ok(None));
+        }
+        Ok(Ok(Some(TxnRequest {
             api_version: API_VERSION,
             identity,
             affinity,
@@ -3316,7 +3398,7 @@ impl Host {
             remaining_millis,
             conditions,
             mutations,
-        }))
+        })))
     }
 
     fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), String> {
@@ -3917,6 +3999,11 @@ fn object_answer(
                 read => read.map(Seen::Items),
             }
         }
+        Look::Range { offset, len } => rdb_value::blob::read_blob(view, root).and_then(|blob| {
+            let blob = blob.ok_or(ApplyError::ObjectAbsent)?;
+            rdb_value::blob::read_range(view, root, *offset, *len)
+                .map(|bytes| Seen::Range { blob, bytes })
+        }),
     };
     Ok(match seen {
         // P1 found a root record, so the view holds one: its absence here is not an answer (A-4).

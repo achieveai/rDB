@@ -663,6 +663,7 @@ impl Db {
             expect: if_version.map(Expected::Version),
         };
         self.compile_and_send(identity, vec![put], self.timeouts.put, self.timeouts.put)
+            .and_then(written)
     }
 
     /// Write every put in `puts` as one transaction, or none of them, with a kernel deadline of
@@ -695,6 +696,7 @@ impl Db {
             })
             .collect();
         self.compile_and_send(self.identity(), puts, deadline, send_wait(deadline))
+            .and_then(written)
     }
 
     /// Apply `change` to `object`, as one transaction. `expect` says when it may happen:
@@ -704,8 +706,8 @@ impl Db {
     /// changes and the version it was compiled against; a write that lands first makes this
     /// one `CONDITION_FAILED`, at the compile or at the kernel.
     ///
-    /// `Ok(None)` is reserved for a change that compiles to nothing and is never sent; no
-    /// change today does that.
+    /// `Ok(None)` is a change that compiles to nothing and is never sent: a chunk whose bytes
+    /// are already stored, or a publish of the blob already there.
     ///
     /// # Errors
     ///
@@ -730,7 +732,6 @@ impl Db {
             self.timeouts.put,
             self.timeouts.put,
         )
-        .map(Some)
     }
 
     /// Compile `puts` under `identity` with kernel deadline `deadline`, waiting
@@ -741,7 +742,7 @@ impl Db {
         puts: Vec<PutOp>,
         deadline: Duration,
         wait: Duration,
-    ) -> Result<PutOk, PutError> {
+    ) -> Result<Option<PutOk>, PutError> {
         // Compile first, send second (defect w24): the request is in hand before anything is
         // sent, so every outcome of the send, a timeout included, hands it back for an
         // unchanged resend. A compile sends nothing, so a compile that does not answer is a
@@ -760,7 +761,10 @@ impl Db {
         // The compile waits the put timeout, never the deadline: a deadline of 0 must reach the
         // kernel, which refuses it, not time out here (S1 guard 4).
         match self.call(call, self.timeouts.put) {
-            Some(Answer::Compiled(request)) => self.send(ClientCall::Resend { request }, wait),
+            Some(Answer::Compiled(request)) => {
+                self.send(ClientCall::Resend { request }, wait).map(Some)
+            }
+            Some(Answer::Unchanged) => Ok(None),
             Some(Answer::Error { error, .. }) => refused(error),
             Some(other) => refused(ApiError::host(&format!(
                 "a put compile was answered with {other:?}"
@@ -1340,6 +1344,15 @@ fn byte_doc(value: &[u8]) -> Change {
     Change::Doc(Delta(vec![Op::Replace(Value::Bytes(value.to_vec()))]))
 }
 
+/// A byte write's answer. A byte document always compiles to a root `Put`, so a compile with
+/// nothing to send is the host's fault, never a success.
+fn written(answer: Option<PutOk>) -> Result<PutOk, PutError> {
+    answer.ok_or_else(|| PutError {
+        error: ApiError::host("a byte write compiled to nothing; nothing was sent"),
+        request: None,
+    })
+}
+
 /// A document read as [`Db::get`] answers it: its bytes, or `INVALID_ARGUMENT` when it
 /// is not a byte string.
 fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
@@ -1351,7 +1364,7 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
         }) => Some((version, Bytes::from(bytes))),
         // `get` looks with `Look::Doc`, so `Members` and `Items` are not expected here; either
         // way it is no byte string.
-        Seen::Doc(_) | Seen::Members(_) | Seen::Items(_) => {
+        Seen::Doc(_) | Seen::Members(_) | Seen::Items(_) | Seen::Range { .. } => {
             return Err(ApiError::invalid(
                 "the object is not a byte string; read it with Db::read",
             ))

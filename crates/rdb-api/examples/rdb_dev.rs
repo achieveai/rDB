@@ -80,7 +80,26 @@
 //!                                         has its own record), then `token=G:V:P` when items
 //!                                         remain. A token the list moved past answers
 //!                                         `STALE_CONTINUATION`: read again from the start
-//! get <object>                            read at the publication barrier: `value=` for a byte
+//! blob upload <object> [--absent | --expect V] --upload U --chunk-size N <text>
+//!       [--stop-after K]                  store <text> as a blob: chunk i is its bytes from
+//!                                         i*N, each one write (`chunk i ok ...`), then the
+//!                                         publish (`publish ok ...`). U, the upload id, is 32
+//!                                         hex digits the caller picks. The guard is the
+//!                                         publish's; chunks take none. It stops at a refused
+//!                                         chunk. `--stop-after K` sends K chunks, then prints
+//!                                         the `blob publish` line to finish with. `""` is a
+//!                                         blob of no chunks
+//! blob chunk <object> --upload U --index I <text>
+//!                                         store one chunk. The same bytes again answer
+//!                                         `unchanged (already stored)`, and send nothing
+//! blob publish <object> [--absent | --expect V] --upload U --size N --chunk-size N
+//!       --sha256 H                        publish upload U as the blob; H is 64 hex digits.
+//!                                         That blob already there answers `unchanged
+//!                                         (already published)`, and sends nothing
+//! read <object> [--offset O --len L]      read a blob at the publication barrier: `blob
+//!                                         version=V size=S chunks=N upload=U ...`, with
+//!                                         `bytes="..."` for a range of at least one byte
+//! get <object>                           read at the publication barrier: `value=` for a byte
 //!                                         string, `doc=<json>` for any other document
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
@@ -223,6 +242,7 @@ use rdb_core::contracts::errors::RetryRule;
 use rdb_core::contracts::event::Budgets;
 use rdb_core::contracts::ids::{AffinityId, BootId, Generation, NodeId, PartitionId, RequestId};
 use rdb_core::contracts::txn::{TxnRequest, TxnStatus};
+use sha2::{Digest as _, Sha256};
 
 use hostile_store::{HostileStore, ListFault, PutFault};
 
@@ -1099,6 +1119,14 @@ fn repl<'scope, 'env>(
                 read_line(db.read(object.as_bytes(), Look::Doc));
                 Ok(())
             }
+            ["blob", "upload", object, rest @ ..] => blob_upload(db, object, rest, &mut sent),
+            ["blob", "chunk", object, rest @ ..] => blob_chunk(db, object, rest, &mut sent),
+            ["blob", "publish", object, rest @ ..] => blob_publish(db, object, rest, &mut sent),
+            ["blob", ..] => Err(BLOB_USAGE.to_owned()),
+            ["read", object, rest @ ..] => parse_range(rest).map(|look| {
+                read_line(db.read(object.as_bytes(), look));
+            }),
+            ["read", ..] => Err(READ_USAGE.to_owned()),
             ["get", object, "--previous"] => {
                 get_line(db.get_previous(object.as_bytes()));
                 Ok(())
@@ -1631,10 +1659,226 @@ fn parse_token(text: &str) -> Result<Token, String> {
 
 /// A value write's answer, remembered for `retry` as [`Kind::Value`].
 fn write_line(db: &Db, answer: Result<Option<rdb_api::PutOk>, PutError>, sent: &mut Sent) {
+    labelled_write_line(db, "", "nothing to write", answer, sent);
+}
+
+/// [`write_line`] with `label` before the answer, and `unchanged` saying why a write that
+/// compiled to nothing was not sent. Such a write is the latest and sent nothing, so a bare
+/// `retry` after it has nothing to send. Whether the write was sent or answered unchanged.
+fn labelled_write_line(
+    db: &Db,
+    label: &str,
+    unchanged: &str,
+    answer: Result<Option<rdb_api::PutOk>, PutError>,
+    sent: &mut Sent,
+) -> bool {
     match answer {
-        Ok(None) => say("unchanged (nothing sent)"),
-        Ok(Some(ok)) => put_line(db, Ok(ok), Some((sent, Kind::Value))),
-        Err(e) => put_line(db, Err(e), Some((sent, Kind::Value))),
+        Ok(None) => {
+            say(&format!("{label}unchanged ({unchanged}; nothing sent)"));
+            sent.record(None, Kind::Value);
+            true
+        }
+        Ok(Some(ok)) => {
+            labelled_put_line(db, label, Ok(ok), Some((sent, Kind::Value)));
+            true
+        }
+        Err(e) => {
+            labelled_put_line(db, label, Err(e), Some((sent, Kind::Value)));
+            false
+        }
+    }
+}
+
+const BLOB_USAGE: &str = "blob upload <object> [--absent | --expect V] --upload U --chunk-size N \
+                          <text> [--stop-after K] | blob chunk <object> --upload U --index I \
+                          <text> | blob publish <object> [--absent | --expect V] --upload U \
+                          --size N --chunk-size N --sha256 H; U is 32 hex digits, H 64";
+const READ_USAGE: &str = "read <object> [--offset O --len L]";
+
+/// A `blob` line's words after the object: `--absent` or `--expect V`, the `--name value`
+/// flags in `takes`, each once, and at most one other word, the text.
+#[derive(Debug, Default)]
+struct BlobArgs<'a> {
+    expect: Option<Expected>,
+    flags: std::collections::BTreeMap<&'a str, &'a str>,
+    text: Option<&'a str>,
+}
+
+impl<'a> BlobArgs<'a> {
+    fn parse(words: &[&'a str], takes: &[&str]) -> Result<Self, String> {
+        let mut args = Self::default();
+        let mut words = words.iter();
+        while let Some(&word) = words.next() {
+            match word {
+                "--absent" if args.expect.is_none() => args.expect = Some(Expected::Absent),
+                "--expect" if args.expect.is_none() => {
+                    let v = words.next().ok_or("missing a version after --expect")?;
+                    let v = v
+                        .parse()
+                        .map_err(|_| format!("--expect {v:?} is not a version"))?;
+                    args.expect = Some(Expected::Version(v));
+                }
+                flag if takes.contains(&flag) => {
+                    let value = words
+                        .next()
+                        .ok_or_else(|| format!("missing a value after {flag}"))?;
+                    if args.flags.insert(flag, value).is_some() {
+                        return Err(format!("{flag} given twice"));
+                    }
+                }
+                text if args.text.is_none() && !text.starts_with("--") => args.text = Some(text),
+                other => return Err(format!("unexpected {other:?}")),
+            }
+        }
+        Ok(args)
+    }
+
+    /// The value of `flag`, which must be given.
+    fn flag(&self, flag: &str) -> Result<&'a str, String> {
+        self.flags
+            .get(flag)
+            .copied()
+            .ok_or_else(|| format!("missing {flag}"))
+    }
+
+    /// The number after `flag`, which must be given.
+    fn number<T: std::str::FromStr>(&self, flag: &str) -> Result<T, String> {
+        let text = self.flag(flag)?;
+        text.parse()
+            .map_err(|_| format!("{flag} {text:?} is not a number"))
+    }
+
+    fn text(&self) -> Result<&'a str, String> {
+        self.text.ok_or_else(|| "missing <text>".to_owned())
+    }
+
+    /// `--upload U`: 32 hex digits, the 16-byte upload id (S4 A-7).
+    fn upload(&self) -> Result<rdb_api::Upload, String> {
+        let text = self.flag("--upload")?;
+        hex_bytes(text).map_err(|e| format!("--upload {text:?}: {e}; it is 32 hex digits"))
+    }
+}
+
+/// `text` as exactly `N` bytes of hex.
+fn hex_bytes<const N: usize>(text: &str) -> Result<[u8; N], String> {
+    let bytes = hex::decode(text).map_err(|e| e.to_string())?;
+    <[u8; N]>::try_from(bytes).map_err(|bytes| format!("{} bytes, not {N}", bytes.len()))
+}
+
+/// `blob upload`: each chunk, then the publish, unless `--stop-after` stops it first.
+fn blob_upload(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--upload", "--chunk-size", "--stop-after"])?;
+    let upload = args.upload()?;
+    let text = args.text()?.as_bytes();
+    let chunk_size: u64 = args.number("--chunk-size")?;
+    let piece = usize::try_from(chunk_size)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| format!("--chunk-size {chunk_size} is not a chunk length"))?;
+    let stop_after = match args.flags.get("--stop-after") {
+        Some(_) => Some(args.number::<usize>("--stop-after")?),
+        None => None,
+    };
+    let size = u64::try_from(text.len()).expect("a line fits u64");
+    let sha256: [u8; 32] = Sha256::digest(text).into();
+    let chunks = text.chunks(piece).take(stop_after.unwrap_or(usize::MAX));
+    for (index, bytes) in chunks.enumerate() {
+        let change = Change::Chunk {
+            upload,
+            index: u32::try_from(index).map_err(|_| format!("chunk {index} is past u32"))?,
+            bytes: Bytes::copy_from_slice(bytes),
+        };
+        let answer = db.write(object.as_bytes(), change, None);
+        if !labelled_write_line(
+            db,
+            &format!("chunk {index} "),
+            "already stored",
+            answer,
+            sent,
+        ) {
+            return Ok(());
+        }
+    }
+    if let Some(k) = stop_after {
+        let k = k.min(text.len().div_ceil(piece));
+        let guard = match args.expect {
+            Some(Expected::Absent) => " --absent".to_owned(),
+            Some(Expected::Version(v)) => format!(" --expect {v}"),
+            None => String::new(),
+        };
+        say(&format!(
+            "stopped after {k} chunks; finish with: blob publish {object}{guard} --upload {} \
+             --size {size} --chunk-size {chunk_size} --sha256 {}",
+            hex::encode(upload),
+            hex::encode(sha256)
+        ));
+        return Ok(());
+    }
+    let change = Change::Publish {
+        upload,
+        size,
+        chunk_size,
+        sha256,
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(db, "publish ", "already published", answer, sent);
+    Ok(())
+}
+
+/// `blob chunk`: one chunk. A guard is passed on for the owner to refuse.
+fn blob_chunk(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--upload", "--index"])?;
+    let index: u32 = args.number("--index")?;
+    let change = Change::Chunk {
+        upload: args.upload()?,
+        index,
+        bytes: Bytes::copy_from_slice(args.text()?.as_bytes()),
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(
+        db,
+        &format!("chunk {index} "),
+        "already stored",
+        answer,
+        sent,
+    );
+    Ok(())
+}
+
+/// `blob publish`: publish an upload whose chunks are stored.
+fn blob_publish(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), String> {
+    let args = BlobArgs::parse(rest, &["--upload", "--size", "--chunk-size", "--sha256"])?;
+    if args.text.is_some() {
+        return Err("blob publish takes no <text>".to_owned());
+    }
+    let sha = args.flag("--sha256")?;
+    let change = Change::Publish {
+        upload: args.upload()?,
+        size: args.number("--size")?,
+        chunk_size: args.number("--chunk-size")?,
+        sha256: hex_bytes(sha)
+            .map_err(|e| format!("--sha256 {sha:?}: {e}; it is 64 hex digits"))?,
+    };
+    let answer = db.write(object.as_bytes(), change, args.expect);
+    labelled_write_line(db, "publish ", "already published", answer, sent);
+    Ok(())
+}
+
+/// `read`'s words after the object: nothing, the manifest alone, or `--offset O --len L`.
+fn parse_range(rest: &[&str]) -> Result<Look, String> {
+    let number = |flag: &str, text: &str| {
+        text.parse::<u64>()
+            .map_err(|_| format!("{flag} {text:?} is not a number"))
+    };
+    match rest {
+        [] => Ok(Look::Range { offset: 0, len: 0 }),
+        ["--offset", offset, "--len", len] | ["--len", len, "--offset", offset] => {
+            Ok(Look::Range {
+                offset: number("--offset", offset)?,
+                len: number("--len", len)?,
+            })
+        }
+        _ => Err(READ_USAGE.to_owned()),
     }
 }
 
@@ -1723,6 +1967,22 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                     next.generation.0, next.version, next.position
                 ));
             }
+        }
+        // `blob version=V size=S chunks=N upload=U`, then `bytes="..."` for a non-empty range.
+        rdb_api::Seen::Range { blob, bytes } => {
+            let m = &blob.manifest;
+            let range = if bytes.is_empty() {
+                String::new()
+            } else {
+                format!(" bytes={:?}", String::from_utf8_lossy(&bytes))
+            };
+            say(&format!(
+                "blob version={} size={} chunks={} upload={}{range} {view}",
+                blob.version,
+                m.size,
+                m.chunks(),
+                hex::encode(m.upload)
+            ));
         }
     }
 }
@@ -1976,12 +2236,22 @@ impl Sent {
 /// refusal is followed by a `note:` line when node 1's queue waits on a write it applied and
 /// has not published ([`waits_note`]).
 fn put_line(db: &Db, answer: Result<rdb_api::PutOk, PutError>, record: Option<(&mut Sent, Kind)>) {
+    labelled_put_line(db, "", answer, record);
+}
+
+/// [`put_line`] with `label` before the answer, as `chunk 0 ok ...`.
+fn labelled_put_line(
+    db: &Db,
+    label: &str,
+    answer: Result<rdb_api::PutOk, PutError>,
+    record: Option<(&mut Sent, Kind)>,
+) {
     let remember = |request: Option<TxnRequest>| {
         if let Some((sent, kind)) = record {
             sent.record(request, kind);
         }
     };
-    say(&put_text(&answer));
+    say(&format!("{label}{}", put_text(&answer)));
     if answer.is_err() {
         if let Some(note) = waits_note(db) {
             say(&note);
