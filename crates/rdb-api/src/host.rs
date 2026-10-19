@@ -6071,7 +6071,7 @@ mod tests {
         // (b)
         // A-R124d: put 20 needs node 1's grant, which can lapse after (a)'s hold. No retention
         // or deadline here depends on the time.
-        trio.ready();
+        trio.admits_for(1_000);
         hold(&trio);
         let put_b = trio.call(put(20, b"b", b"1", None));
         trio.until("node 1 applied request 20", |trio| {
@@ -6464,7 +6464,7 @@ mod tests {
         );
         // A-R124d: after a 2 s-scale hold node 1's grant can lapse, and a fenced node answers
         // `status` `Unknown`. The default retention is a day, so the wait moves nothing past it.
-        trio.ready();
+        trio.admits_for(1_000);
         match trio.ask(ClientCall::Status {
             identity: identity(2),
             generation: None,
@@ -6493,7 +6493,9 @@ mod tests {
             host.budgets.dedup_retention_millis = RETENTION_MILLIS;
         });
         trio.bootstrap();
-        trio.ready();
+        // A-R124b: the status and resend inside the 1.5 s retention need the grant for about
+        // 1.2 s more, and no wait can come between them without passing the retention.
+        trio.admits_for(RETENTION_MILLIS);
         let first = match trio.ask(compile(1, b"a", b"1")) {
             Answer::Compiled(request) => request,
             other => panic!("compile request 1: {other:?}"),
@@ -6551,7 +6553,7 @@ mod tests {
         );
         // A-R124b: node 1's grant can lapse and fence it here; a fenced node answers `Unknown`
         // and refuses the resend `LEASE_EXPIRED`. Both are trimmed already, so waiting only ages them.
-        trio.ready();
+        trio.admits_for(1_000);
         for request in [1, 2] {
             match status(&mut trio, request) {
                 Answer::Status(TxnStatus::Unknown) => {}
@@ -6668,9 +6670,7 @@ mod tests {
         });
         // A-R123: by now the grant may have expired and fenced node 1, and a resend inside that
         // window is refused `LEASE_EXPIRED` rather than run. Waiting only ages the entry more.
-        trio.until("node 1 admits writes", |trio| {
-            (trio.status(0).admits == Some(true)).then_some(())
-        });
+        trio.admits_for(1_000);
         match trio.ask(ClientCall::Resend { request: held }) {
             Answer::Error { error, .. } => {
                 assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
@@ -6930,6 +6930,24 @@ mod tests {
         fn ready(&mut self) {
             self.until("node 1 admits writes", |trio| {
                 (trio.status(0).admits == Some(true)).then_some(())
+            });
+        }
+
+        /// [`Self::ready`], and node 1's grant runs at least `millis` more (A-R123, A-R124).
+        /// Under full-suite load a grant sometimes stops renewing and lapses; `admits` stays
+        /// true until the fence, but a check in the last 100 ms is refused `LEASE_EXPIRED`
+        /// (seen 2026-10-19 at margin 29 ms). A lapsed grant makes this wait for the fence and
+        /// the re-acquire.
+        fn admits_for(&mut self, millis: u64) {
+            self.until("node 1 admits writes with time left on its grant", |trio| {
+                let now = trio.clock.now().0;
+                let left = trio.nodes[0]
+                    .0
+                    .authority_views
+                    .get(&PartitionId(1))
+                    .map(|view| view.valid_through_tick.0.saturating_sub(now));
+                (trio.status(0).admits == Some(true) && left.is_some_and(|left| left >= millis))
+                    .then_some(())
             });
         }
 
