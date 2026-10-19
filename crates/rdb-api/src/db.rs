@@ -3251,4 +3251,101 @@ mod tests {
         assert_eq!(wire_name(ErrorKind::UnknownOutcome), "UNKNOWN_OUTCOME");
         assert_eq!(wire_name(ErrorKind::Unavailable), "UNAVAILABLE");
     }
+
+    /// Ruling A-R120 (tester coverage review, MATERIAL): the public `Db::write` and `Db::read`,
+    /// end to end for a list, and `Db::get` on a document that is no byte string. A write carries
+    /// its change and its guard: a stale `Version` is refused at the compile with no request, and
+    /// a create over the list is the kernel's refusal, carrying the change's own request. A read
+    /// carries its look: `Items { at: -1 }` lists the last item. It fails if `write` sends
+    /// `expect: None` (the stale write publishes), if `read` forwards `Look::Doc` (the list read
+    /// is `INVALID_ARGUMENT`), or if `byte_string` answers a map document as `Ok`.
+    /// Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn the_public_write_and_read_carry_the_change_its_guard_and_the_look() {
+        use crate::host::ListEdit;
+        use rdb_value::value::{Int, Map, MapKey};
+
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let text = |s: &str| Value::Text(s.to_owned());
+        let push = |s: &str| ListEdit::Push(text(s));
+
+        let created = db
+            .write(
+                b"l",
+                Change::List(vec![push("a"), push("b"), push("c")]),
+                Some(Expected::Absent),
+            )
+            .expect("create l")
+            .expect("a create is sent");
+        assert_eq!((created.request, created.seq), (RequestId(1), Seq(2)));
+        match db
+            .read(b"l", Look::Items { at: -1, limit: 10 })
+            .expect("items of l")
+            .seen
+        {
+            Seen::Items(items) => {
+                let root = (items.list.version, items.list.count);
+                let listed: Vec<_> = items
+                    .items
+                    .into_iter()
+                    .map(|item| (item.position, item.value))
+                    .collect();
+                assert_eq!((root, listed), ((2, 3), vec![(2, text("c"))]));
+            }
+            other => panic!("items of l: {other:?}"),
+        }
+
+        let stale = db
+            .write(
+                b"l",
+                Change::List(vec![push("q")]),
+                Some(Expected::Version(1)),
+            )
+            .expect_err("l is at version 2");
+        assert_eq!(stale.error.name(), "CONDITION_FAILED", "{stale:?}");
+        assert!(stale.request.is_none(), "refused at the compile: {stale:?}");
+        let over = db
+            .write(b"l", Change::List(vec![push("q")]), Some(Expected::Absent))
+            .expect_err("l exists");
+        assert_eq!(over.error.name(), "CONDITION_FAILED", "{over:?}");
+        assert_eq!(
+            over.request.map(|request| request.identity.request),
+            Some(RequestId(4)),
+            "the kernel's refusal carries the change's own request"
+        );
+
+        let mut map = Map::new();
+        map.insert(MapKey::new("n"), Value::Integer(Int::from(1_u64)));
+        let doc = Value::Map(map);
+        let written = db
+            .write(
+                b"d",
+                Change::Doc(Delta(vec![Op::Replace(doc.clone())])),
+                Some(Expected::Absent),
+            )
+            .expect("create d")
+            .expect("a create is sent");
+        assert_eq!(
+            db.read(b"d", Look::Doc).expect("read d").seen,
+            Seen::Doc(Document {
+                version: written.seq.0,
+                value: doc
+            })
+        );
+        let refused = db.get(b"d").expect_err("d holds a map, not bytes");
+        assert_eq!(refused.kind, ErrorKind::InvalidArgument, "{refused:?}");
+        assert!(refused.detail.contains("not a byte string"), "{refused:?}");
+        db.shutdown();
+    }
 }

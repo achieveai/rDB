@@ -469,7 +469,8 @@ pub enum Look {
     /// The whole document.
     Doc,
     /// Up to `limit` map entries or set members in element order, after `after` (which need not
-    /// be an element) or from the first.
+    /// be an element) or from the first. Element order is encoded-key order: by type first, then
+    /// by value, so the integer `3` lists before the float `1.5` (A-R122).
     Members {
         /// Start after this key.
         after: Option<Value>,
@@ -7189,6 +7190,11 @@ mod tests {
             ]),
             "the insert moved the end"
         );
+        assert_eq!(
+            resolve_edits(&[ListEdit::Replace { at: -1, value: z() }], 3),
+            Ok(vec![ListOp::Replace { at: 2, value: z() }]),
+            "a replace resolves -1 as every edit does"
+        );
         for (edits, count, refused) in [
             (
                 vec![ListEdit::Remove { at: -4 }],
@@ -7219,9 +7225,10 @@ mod tests {
         }
     }
 
-    /// S4-3 3n1, 3n2 and 3t: arch §4 guards 14, 12 and 4. A read's negative `--from` resolves
-    /// against the list the read sees. `-4` of 3 is refused by the compile, before a request
-    /// exists. A continuation token whose list has changed is `STALE_CONTINUATION` with retry
+    /// S4-3 3n1, 3n2, 3e and 3t: arch §4 guards 14, 12 and 4. A read's negative `--from`
+    /// resolves against the list the read sees, and a start before 0 or past the end is refused.
+    /// `-4` of 3 is refused by the compile, before a request exists. A fresh continuation token
+    /// continues after its page; one whose list has changed is `STALE_CONTINUATION` with retry
     /// `Reconcile`, as the kernel's own stale continuation is. Mutant m14 (resolved against 0)
     /// refuses `-1`; m12c (off by one) lists from item 1; m12a publishes the `-4` remove; m4a
     /// (built with `ApiError::new`) answers retry `BoundedJitter`; m4b (the arm cut) answers
@@ -7243,28 +7250,42 @@ mod tests {
             other => panic!("items of l: {other:?}"),
         };
         let last = page(trio.look(2, b"l", Look::Items { at: -1, limit: 10 }));
-        let listed: Vec<_> = last
-            .items
-            .iter()
-            .map(|item| (item.position, item.value.clone()))
-            .collect();
-        assert_eq!(listed, vec![(2, text("c"))], "-1 is the last of 3");
+        let listed = |items: Items| -> Vec<(u64, Value)> {
+            items
+                .items
+                .into_iter()
+                .map(|item| (item.position, item.value))
+                .collect()
+        };
+        assert_eq!(listed(last), vec![(2, text("c"))], "-1 is the last of 3");
+        for (request, at) in [(3, -4), (4, 99)] {
+            match trio.look(request, b"l", Look::Items { at, limit: 10 }) {
+                Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
+                Ok(seen) => panic!("a read from {at} of 3 was answered: {seen:?}"),
+            }
+        }
 
         let past = Change::List(vec![ListEdit::Remove { at: -4 }]);
         assert_eq!(
-            trio.write(compile_change(3, b"l", past, Some(Expected::Version(2)))),
+            trio.write(compile_change(5, b"l", past, Some(Expected::Version(2)))),
             Err(Refused::AtCompile(ErrorKind::InvalidArgument)),
             "-4 of 3 is refused before a request exists"
         );
 
-        let first = page(trio.look(4, b"l", Look::Items { at: 0, limit: 2 }));
+        let first = page(trio.look(6, b"l", Look::Items { at: 0, limit: 2 }));
         let token = first.next.expect("a page of 2 of 3 has a next token");
+        let rest = page(trio.look(7, b"l", Look::ItemsAfter { token, limit: 10 }));
+        assert_eq!(
+            listed(rest),
+            vec![(2, text("c"))],
+            "a fresh token continues after its page"
+        );
         let more = Change::List(vec![push("z")]);
         assert_eq!(
-            trio.write(compile_change(5, b"l", more, Some(Expected::Version(2)))),
+            trio.write(compile_change(8, b"l", more, Some(Expected::Version(2)))),
             Ok(3)
         );
-        match trio.look(6, b"l", Look::ItemsAfter { token, limit: 10 }) {
+        match trio.look(9, b"l", Look::ItemsAfter { token, limit: 10 }) {
             Err(error) => assert_eq!(
                 (error.kind, error.retry),
                 (ErrorKind::StaleContinuation, RetryRule::Reconcile),
