@@ -146,6 +146,9 @@
 //!                                         in M9 (no takeover runs), `partition-in-transfer
 //!                                         pP` waits for pP to be `serving` again. Clearing
 //!                                         never lets a restarted owner write again in M9
+//! admin damage-chunk <o> --upload U --index I
+//!                                         dev only: overwrite that stored chunk with other
+//!                                         bytes, so reading the blob is `CORRUPT_BLOB`
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store
@@ -1164,7 +1167,10 @@ fn repl<'scope, 'env>(
                     },
                 );
             }),
-            ["admin", ..] => Err("admin clear-grant <n>: n is 1, 2 or 3".to_owned()),
+            ["admin", "damage-chunk", object, rest @ ..] => damage_chunk(db, object, rest),
+            ["admin", ..] => Err(format!(
+                "admin clear-grant <n>: n is 1, 2 or 3 | {DAMAGE_USAGE}"
+            )),
             ["control", "lifecycle", partition, word] => {
                 parse_lifecycle(partition, word).map(|(partition, lifecycle)| {
                     say(&set_lifecycle(rt, control.cluster, partition, lifecycle));
@@ -1883,6 +1889,46 @@ fn blob_gc(db: &Db, object: &str, rest: &[&str], sent: &mut Sent) -> Result<(), 
     labelled_write_line(db, "gc ", "nothing to collect", answer, sent);
     Ok(())
 }
+
+/// Request ids for `admin damage-chunk`, under its own client so they never meet the `Db`'s.
+static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `admin damage-chunk`: overwrite one stored chunk with other bytes, through a replicated
+/// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
+/// tool only, to reach that answer by hand; the product never writes a chunk this way.
+fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
+    use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
+    use rdb_core::contracts::txn::Mutation;
+    let args = BlobArgs::parse(rest, &["--upload", "--index"])?;
+    if args.expect.is_some() || args.text.is_some() {
+        return Err(DAMAGE_USAGE.to_owned());
+    }
+    let index: u32 = args.number("--index")?;
+    let root = rdb_value::keys::root_key(TenantId(1), AffinityId(1), object.as_bytes());
+    let value = rdb_value::envelope::seal(rdb_value::envelope::Kind::Chunk, b"damaged")
+        .expect("seven bytes fit an envelope");
+    let request = TxnRequest {
+        api_version: rdb_core::contracts::version::API_VERSION,
+        identity: RequestIdentity {
+            tenant: TenantId(1),
+            client: ClientId(2),
+            request: RequestId(DAMAGE_REQUEST.fetch_add(1, Ordering::Relaxed)),
+        },
+        affinity: AffinityId(1),
+        expected_generation: None,
+        remaining_millis: 5_000,
+        conditions: Vec::new(),
+        mutations: vec![Mutation::Put {
+            key: rdb_value::keys::chunk_key(&root, &args.upload()?, index),
+            value,
+            expected_version: None,
+        }],
+    };
+    labelled_put_line(db, "damage-chunk ", db.resend(request), None);
+    Ok(())
+}
+
+const DAMAGE_USAGE: &str = "admin damage-chunk <object> --upload U --index I";
 
 /// `read`'s words after the object: nothing, the manifest alone, or `--offset O --len L`.
 fn parse_range(rest: &[&str]) -> Result<Look, String> {
