@@ -469,6 +469,8 @@ does not describe.
 - Forged-identity rejection depends on the transport's authenticated-peer label. In M7 that label is
   simulated and forgeable on demand by the harness; binding it to mTLS is M9. The kernel's rejection
   logic is testable now; the binding is not.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: the mTLS binding is carried to M10. M9 runs in one
+  process; gRPC and mTLS are M10, M9 plan decision 1.)
 - `sync_wal_through` remains an unvalidated contract until D1. Any durability claim made before that
   gate is a claim about the simulator, not about RocksDB, and must be reported that way.
 

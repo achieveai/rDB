@@ -519,7 +519,8 @@ How it is proved:
       member. Tester example: with member `"b"` holding the byte `78`, `add "b"` exits 0 and writes
       the root only; `b` stays byte-identical and damaged, and `member` and `members` still report
       `Corrupt(SetMemberHasValue{len: 1})`. Only `del` then `add` in one compile, or the M9 repair
-      functions (decision 11), clear it.
+      functions (decision 11), clear it. (Status 2026-10-19, M9 S4, A-R113 C-5: the repair
+      functions are built in M9 S6.)
   - **Not checked: elements the write does not touch.** Checking them would mean a full scan, O(n),
     on every write.
     - **The residual (tester W2, within ruling A2):** a later write that does not touch a
@@ -541,6 +542,9 @@ compares `count` with one scanned element (decision 9).
 - **Writes.** Every record whose key starts with an object prefix is written only by `rdb-value`'s
   compiled output. Decision 1 makes that true inside `rdb-value`. M9 must give clients no raw path to
   these keys. That includes the plain KV API, the admin path and backup restore of single keys.
+  (Status 2026-10-19, M9 S4, A-R114 Q4: carried to M10. The raw path closes at the M10 wire. Until
+  then `Db::resend` and `Db::resend_within` accept a raw `TxnRequest` from the one in-process
+  embedder; S4 adds no opaque request type.)
 - **Definitions.** An object is **damaged** when any of three things holds:
   - `rdb-value` returns `Corrupt` for one of its records. That covers every cause in decisions 4, 7, 9,
     10 and 13. It includes `Corrupt(Root(..))` for a count that a compile would push above `u64::MAX`
@@ -554,6 +558,7 @@ compares `count` with one scanned element (decision 9).
     - a compile, when it would remove more elements than `count` (decision 9).
 - **Repairs: ADR-rdb-0012 §12's path, narrowed.**
   - ADR-rdb-0012 §12 lets the M9 admin path clear a **damaged** record with "a storage `Delete`".
+    (Status 2026-10-19, M9 S4, A-R113 C-5: the admin path is M9 S6.)
   - For a record under an object prefix, that is allowed **only for a document root**. A document is one
     record, so deleting its root leaves nothing behind, **unless a breach of this rule already left
     element records under its prefix.**
@@ -562,15 +567,16 @@ compares `count` with one scanned element (decision 9).
     `OrphanElement`, and `clear_object` clears them.
   - Every other damaged record is repaired through two `rdb-value` functions. They are specified here
     and built with the M9 admin path (Open O7):
+    (Status 2026-10-19, M9 S4, A-R113 C-5: built in M9 S6, for every row of the table below.)
 
 | Damaged record | Repair | Effect |
 |---|---|---|
 | a map entry or set member (a value that fails, a member with bytes, or a key that does not decode) | `repair_element(snapshot, &RootKey, raw element key)` | `Delete` of that key, plus a root `Put` at `count − 1` with `expected_version: Some(root version)`. Needs a readable root. **Refuses when `count` is 0**: an element under a count of 0 is the orphan state, and `clear_object` is the repair |
 | a collection root; an element whose root is unreadable; an object in the count-mismatch or orphan state | `clear_object(snapshot, &RootKey)` | Up to 254 `Delete`s of non-root records per call. The root's `Delete` comes last, in the call that finds no other record. Repeat until done |
 | a document root | storage `Delete`, as in ADR-rdb-0012 §12 | unchanged |
-| a blob root (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | Deletes the chunks, then the root, as for a collection root. Each call also stops when one more `Delete` would put `record_len` over `MAX_ENVELOPE_BYTES` (ADR-rdb-0014 decision 8). `repair_element` does not apply. Built with the M9 admin path (O7) |
+| a blob root (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | Deletes the chunks, then the root, as for a collection root. Each call also stops when one more `Delete` would put `record_len` over `MAX_ENVELOPE_BYTES` (ADR-rdb-0014 decision 8). `repair_element` does not apply. Built with the M9 admin path (O7). Status 2026-10-19 (M9 S4, A-R113 C-5): M9 S6 |
 | a blob chunk that does not open, or a key under `sub` `0x04` whose tail is not 20 bytes (amended 2026-10-05, L-R186x; ADR-rdb-0014 decision 9) | `clear_object(snapshot, &RootKey)` | As for a blob root. A chunk no manifest names is garbage, not damage, and GC removes it (ADR-rdb-0014 decision 8) |
-| a list root, block, change slot or item record in any row of ADR-rdb-0016 decision 7 (amended 2026-10-05, L-R186ee; ADR-rdb-0016 decision 7) | `clear_object(snapshot, &RootKey)` | As for a collection root. ADR-rdb-0016 decision 7 lists each row and the error a read names. Built with the M9 admin path (O7) |
+| a list root, block, change slot or item record in any row of ADR-rdb-0016 decision 7 (amended 2026-10-05, L-R186ee; ADR-rdb-0016 decision 7) | `clear_object(snapshot, &RootKey)` | As for a collection root. ADR-rdb-0016 decision 7 lists each row and the error a read names. Built with the M9 admin path (O7). Status 2026-10-19 (M9 S4, A-R113 C-5): M9 S6 |
 
   - **Both functions refuse with `NotDamaged` when the object is not damaged.** By the definition above,
     a count-mismatch or orphan object is damaged, so `clear_object` accepts it, even though its root
@@ -698,6 +704,7 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
 ## Open (none blocks S3)
 - **O1 Length limits** for object ids and element keys. No spec number exists. M9 sets one with its
   request limits. Adding a limit later refuses only new writes.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: set in M9 S5, with the other request limits.)
 - **O2 Lists** (S4): records, pages, scan tokens and the envelope `kind`. **Closed** 2026-10-05 by
   ADR-rdb-0016 decisions 1 and 6 (L-R186ee); blocks and change slots replace pages.
 - **O3 Chunk placement and tail** (S5). **Closed** 2026-10-05 by ADR-rdb-0014 decision 1 (Gautam,
@@ -705,6 +712,8 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
   `upload_id` (16 bytes), then `index` u32 BE, fixed width, 20 bytes (decision 3, row `0x04`).
 - **O4 Value-digest and element-id preconditions:** spec §4.3.2 says callers "may additionally
   require" them. They belong to the M9 API.
+  (Status 2026-10-19, M9 S4, A-R114 Q5: carried to M10. No M9 consumer; the S4 API offers neither
+  precondition.)
 - **O5 A request that writes one key twice. Closed** by check 10 (spec §4.2, L-R186f).
   - The kernel refuses a request in which two **mutations** (`Put` or `Delete`) name the same key, with
     `InvalidArgument{field: "mutations"}`, inside check 10.
@@ -715,10 +724,11 @@ starts with the row it protects (`r1_` to `r13_`) or the finding it closes (for 
   - Built in `rdb-core` `transaction/admission.rs`, before M9's first `rdb-api` slice, as Gautam Q4
     required.
 - **O6 Deleting a non-empty collection in one call:** this needs a multi-transaction "deleting" state.
-  M9.
+  M9. (Status 2026-10-19, M9 S4, A-R114 Q5: carried to M10. No M9 consumer; S4 builds no drop.)
 - **O7 The repair functions of decision 11** (`repair_element`, `clear_object`) are built in
   `rdb-value` with their only caller, the M9 admin path, against decision 11's table. S3 builds the
   checks that make a breach loud: `OrphanElement` and `CountMismatch`.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: built in M9 S6, with the admin path.)
 
 ## References
 - Spec §4.1, §4.2, §4.3, §4.3.1, §4.3.2, §4.3.3; validation plan V13.

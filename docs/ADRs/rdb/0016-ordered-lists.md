@@ -126,6 +126,7 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
     ≈ 269,636 + 244e at 192 KiB (e ≤ 3,192). **Drop:** 8,960 + 242e (e ≤ 4,295).
   - **So every list compile refuses an object id with e > 3,072 (`TooLarge{ObjectId}`)**; emptying and dropping then never
     fail on bytes. M9's object-id limit (O1) must be ≤ 3,072 B escaped for lists.
+    (Status 2026-10-19, M9 S4, A-R113 C-5: the limit is set in M9 S5.)
   - Writes: root, ≤ 2 blocks × (base + split block), one item record, one retired block (≤ 241 deletes): ≤ 247 < 255.
     Drop: root + block + ≤ 240 slots = 242.
   - `MAX_ITEM` = 524,288 (Q2, kept). Multi-op deltas are counted against both caps and refused `TooManyWrites`/`TooLarge`
@@ -163,7 +164,9 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - **Token** = `(generation, version, position)`: `GenerationChanged` or `VersionConflict` on a mismatch.
 - **Version:** every op writes the root, so the collection version moves once per transaction. An inline item's `version` is
   the root's; an out-of-line item's is its record's. Not concurrency tokens; M9's value-digest check hashes the value.
+  (Status 2026-10-19, M9 S4, A-R114 Q5: the value-digest check is carried to M10.)
 - **Finding an item by id (Gautam's note, L-R186cz).** No v1 caller reads by id (ADR-rdb-0013 O4 defers it to M9).
+  (Status 2026-10-19, M9 S4, A-R114 Q5: reads by id are carried to M10. No M9 consumer.)
   - An **out-of-line item** is keyed by its id: one `get` of `0x02 · id` returns its value. Its position is not known
     without a block scan.
   - An **inline item** has no key: finding it means replaying blocks until an entry has its `n`. That is up to ~160 KiB per
@@ -175,6 +178,8 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
     role: positions come from the root's block counts. Its code is removed; git history keeps it.
 
 ### 7. Damage: refused, never served (ADR-rdb-0013 decision 11); every row is repaired by `clear_object` (M9)
+(Status 2026-10-19, M9 S4, A-R113 C-5: `clear_object` is built in M9 S6, with the admin path.)
+
 | Damage | Error |
 |---|---|
 | root does not open; bad payload; not exactly the 6 keys; `blocks` empty or > 512; a count-0 block beside others; count ≠ Σ blocks' counts; `n` ≥ `next`; one block `n` named twice; a block `head` of `u64::MAX`; overflow | `Corrupt(Envelope / Codec / ListRoot(..))` |
@@ -303,15 +308,19 @@ checked in `tests/blobs.rs`, `tests/ops_compile.rs`, `tests/collections.rs` and 
 ## Open
 - **O1** Id-addressed reads and id/value-digest preconditions (ADR-rdb-0013 O4): M9, costs in decision 6. M9's object-id
   limit must be ≤ 3,072 B escaped for lists (decision 4).
+  (Status 2026-10-19, M9 S4: id-addressed reads and the preconditions are carried to M10 (A-R114 Q5);
+  the object-id limit is set in M9 S5 (A-R113 C-5).)
 - **O2** Range removal and one-call delete (ADR-rdb-0013 O6). **O3** A second index level past 512 blocks.
 - **O4** RocksDB Merge, only with a measured need and §4.3.4's gates.
 - **O5** `rdb-value` is caller-bounded: `items()` takes any `limit`, and one delta any number of ops. M9 caps both: the
   `items()` page size, and the ops per request.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: both caps are set in M9 S5. S4 adds neither.)
   - Measured at 02b5236 on the dev's run (release build, one thread), by the ignored probe `l_r186ee_probe_d2_one_delta_of_k_front_inserts`: one
     delta's compile cost grows with k² for front inserts. k = 5,000: 24 ms; 20,000: 318 ms; 43,000: 1.5 s.
   - A delta that will be refused `TooLarge{List}` still pays the full replay first (k = 100,000: 7.6 s, refused).
   - Times vary with host load. The manual tester measured 8–40% slower under load, with the same outcomes and the
     same k² shape.
   - So M9's per-request op cap must keep k small (L-R186ef).
+    (Status 2026-10-19, M9 S4, A-R113 C-5: the op cap is set in M9 S5.)
   - Reads are not the concern: `l_r186ee_probe_d1_a_full_block_with_240_pending_front_inserts` reads a block of 10,000
     entries with 240 pending front inserts in 11.6 ms, dominated by decoding the base.
