@@ -17,8 +17,8 @@
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, is kept. Words split on
-//! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`)
-//! reads its JSON values from the line as written, quotes and all:
+//! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`,
+//! `map`, `set`, `members`) reads its JSON values from the line as written, quotes and all:
 //!
 //! ```text
 //! put <object> <value> [--if-version N]   write a byte string
@@ -50,6 +50,18 @@
 //!                                         V`: only at version V; neither: at the version the
 //!                                         owner sees. `retry` resends it unchanged; `retry
 //!                                         --payload` refuses it
+//! map|set <object> [--absent | --expect V] <op>...
+//!                                         change a map or a set, ops in order, as one write.
+//!                                         An op is `put K J`, `add K`, `del K` or `need K
+//!                                         present|absent`; K is a JSON scalar. A map takes
+//!                                         `put`, a set `add`: the other is refused
+//!                                         (`KindMismatch`). No ops with `--absent` creates an
+//!                                         empty one. Guards and `retry` as for `doc`
+//! members <object> [--after K] [--limit N]
+//!                                         a page of a map or set in key order, after K or
+//!                                         from the first, N at most (default 100): `map
+//!                                         version=V count=C listed=L ...`, then `  K = J` per
+//!                                         entry or `  K` per member
 //! get <object>                            read at the publication barrier: `value=` for a byte
 //!                                         string, `doc=<json>` for any other document
 //! get <object> --previous                 read the previously published view at once, never
@@ -182,8 +194,8 @@ use config_testkit::TestTimers;
 use rdb_api::admin::{self, Clearance};
 use rdb_api::host::NodeStatus;
 use rdb_api::{
-    ApiError, Change, Db, DbConfig, Delta, Expected, Int, Look, Op, OpenError, Path, PutError,
-    ReadOk, Timeouts, TxnPut, Value,
+    ApiError, Change, CollectionKind, Db, DbConfig, Delta, ElemOp, Expected, Int, Look, Op,
+    OpenError, Path, PutError, ReadOk, Timeouts, TxnPut, Value,
 };
 use rdb_core::authority::grant::{ClearRefusal, GrantRecord};
 use rdb_core::authority::partition::{PartitionLifecycle, PartitionRecord};
@@ -966,15 +978,22 @@ fn repl<'scope, 'env>(
         }
         tracing::info!(command = %line, "repl_command");
         // A value verb reads its JSON from the raw line (risk R1), so it skips `split_words`.
-        if line.split_whitespace().next() == Some("doc") {
-            match parse_doc(&line) {
-                Ok((object, expect, change)) => {
+        if let Some(verb) = line
+            .split_whitespace()
+            .next()
+            .filter(|verb| VALUE_VERBS.contains(verb))
+        {
+            let done = if verb == "members" {
+                parse_members(&line)
+                    .map(|(object, look)| read_line(db.read(object.as_bytes(), look)))
+            } else {
+                parse_change(&line).map(|(object, expect, change)| {
                     write_line(db, db.write(object.as_bytes(), change, expect), &mut sent);
-                }
-                Err(e) => {
-                    say(&format!("usage: {e}; {DOC_USAGE}"));
-                    bad = true;
-                }
+                })
+            };
+            if let Err(e) = done {
+                say(&format!("usage: {e}; {}", usage_of(verb)));
+                bad = true;
             }
             continue;
         }
@@ -1342,15 +1361,41 @@ fn parse_expect(words: &mut Words<'_>) -> Result<Option<Expected>, String> {
     }
 }
 
+/// The value verbs, each read from the raw line (risk R1).
+const VALUE_VERBS: [&str; 4] = ["doc", "map", "set", "members"];
+
 const DOC_USAGE: &str = "doc <object> [--absent | --expect V] <op>...; an op is --json J, \
                          set <path> J, remove <path> or incr <path> N";
+const COLLECTION_USAGE: &str = "map|set <object> [--absent | --expect V] <op>...; an op is put K \
+                                J, add K, del K or need K present|absent";
+const MEMBERS_USAGE: &str = "members <object> [--after K] [--limit N]";
 
-/// `doc <object> [--absent | --expect V] <op>...`: the object, the guard and the change.
-fn parse_doc(line: &str) -> Result<(String, Option<Expected>, Change), String> {
+/// The usage line for `verb`'s refusals.
+fn usage_of(verb: &str) -> &'static str {
+    match verb {
+        "doc" => DOC_USAGE,
+        "members" => MEMBERS_USAGE,
+        _ => COLLECTION_USAGE,
+    }
+}
+
+/// `doc|map|set <object> [--absent | --expect V] <op>...`: the object, the guard and the change.
+fn parse_change(line: &str) -> Result<(String, Option<Expected>, Change), String> {
     let mut words = Words::new(line);
-    words.next(); // `doc`
+    let verb = words.take("a verb")?;
     let object = words.take("<object>")?.to_owned();
     let expect = parse_expect(&mut words)?;
+    let change = match verb {
+        "doc" => Change::Doc(Delta(doc_ops(&mut words)?)),
+        "map" => Change::Map(elem_ops(&mut words)?),
+        "set" => Change::Set(elem_ops(&mut words)?),
+        other => return Err(format!("{other:?} is not a write")),
+    };
+    Ok((object, expect, change))
+}
+
+/// A `doc` line's ops; at least one.
+fn doc_ops(words: &mut Words<'_>) -> Result<Vec<Op>, String> {
     let mut ops = Vec::new();
     while let Some(word) = words.next() {
         let path = |words: &mut Words<'_>| {
@@ -1359,10 +1404,10 @@ fn parse_doc(line: &str) -> Result<(String, Option<Expected>, Change), String> {
         };
         ops.push(match word {
             "--json" => Op::Replace(words.json("--json")?),
-            "set" => Op::Set(path(&mut words)?, words.json("set")?),
-            "remove" => Op::Remove(path(&mut words)?),
+            "set" => Op::Set(path(words)?, words.json("set")?),
+            "remove" => Op::Remove(path(words)?),
             "incr" => {
-                let at = path(&mut words)?;
+                let at = path(words)?;
                 let n = words.take("an integer")?;
                 let by = n
                     .parse::<i128>()
@@ -1378,7 +1423,59 @@ fn parse_doc(line: &str) -> Result<(String, Option<Expected>, Change), String> {
     if ops.is_empty() {
         return Err("no op".to_owned());
     }
-    Ok((object, expect, Change::Doc(Delta(ops))))
+    Ok(ops)
+}
+
+/// A `map` or `set` line's ops, possibly none (a create of an empty collection). Either verb
+/// takes `put` and `add`, as `doc_scenario` does: the library refuses the other kind's op
+/// (`KindMismatch`), so the refusal is the library's, not the tool's.
+fn elem_ops(words: &mut Words<'_>) -> Result<Vec<ElemOp>, String> {
+    let mut ops = Vec::new();
+    while let Some(word) = words.next() {
+        ops.push(match word {
+            "put" => ElemOp::Put(words.json("put K")?, words.json("put's value J")?),
+            "add" => ElemOp::Add(words.json("add K")?),
+            "del" => ElemOp::Remove(words.json("del K")?),
+            "need" => {
+                let key = words.json("need K")?;
+                match words.take("present or absent")? {
+                    "present" => ElemOp::NeedPresent(key),
+                    "absent" => ElemOp::NeedAbsent(key),
+                    other => return Err(format!("need takes present or absent, not {other:?}")),
+                }
+            }
+            "--absent" | "--expect" => return Err(format!("{word} goes before the ops")),
+            other => return Err(format!("unexpected {other:?}")),
+        });
+    }
+    Ok(ops)
+}
+
+/// `rdb_dev` lists this many elements when `--limit` is not given (arch §2: `limit` is uncapped
+/// until S5).
+const DEFAULT_LIMIT: usize = 100;
+
+/// `members <object> [--after K] [--limit N]`: the object and the look.
+fn parse_members(line: &str) -> Result<(String, Look), String> {
+    let mut words = Words::new(line);
+    words.next(); // `members`
+    let object = words.take("<object>")?.to_owned();
+    let (mut after, mut limit) = (None, None);
+    while let Some(word) = words.next() {
+        match word {
+            "--after" if after.is_none() => after = Some(words.json("--after K")?),
+            "--limit" if limit.is_none() => {
+                let n = words.take("a count after --limit")?;
+                limit = Some(
+                    n.parse::<usize>()
+                        .map_err(|_| format!("--limit {n:?} is not a count"))?,
+                );
+            }
+            other => return Err(format!("unexpected {other:?}")),
+        }
+    }
+    let limit = limit.unwrap_or(DEFAULT_LIMIT);
+    Ok((object, Look::Members { after, limit }))
 }
 
 /// A value write's answer, remembered for `retry` as [`Kind::Value`].
@@ -1420,6 +1517,31 @@ fn read_line(answer: Result<ReadOk, ApiError>) {
                 doc.version
             )),
         },
+        // `map version=V count=N`, then one line per element: `K = J` for a map entry, `K` for
+        // a set member.
+        rdb_api::Seen::Members(page) => {
+            let root = page.collection;
+            let kind = match root.kind {
+                CollectionKind::Map => "map",
+                CollectionKind::Set => "set",
+            };
+            say(&format!(
+                "{kind} version={} count={} listed={} {view}",
+                root.version,
+                root.count,
+                page.members.len()
+            ));
+            for member in page.members {
+                match member.value {
+                    Some(value) => say(&format!(
+                        "  {} = {}",
+                        json::render(&member.key),
+                        json::render(&value)
+                    )),
+                    None => say(&format!("  {}", json::render(&member.key))),
+                }
+            }
+        }
     }
 }
 

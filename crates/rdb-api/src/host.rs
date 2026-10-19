@@ -69,8 +69,10 @@ use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
 use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
+use rdb_value::collection::{CollectionKind, ElemOp, Members};
 use rdb_value::delta::{ApplyError, Delta};
 use rdb_value::keys::{root_key, RootKey};
+use rdb_value::value::Value;
 use rdb_value::{Document, Expected, ValueError};
 
 use crate::clock::HostClock;
@@ -402,6 +404,10 @@ pub struct PutOp {
 pub enum Change {
     /// Document ops, applied in order to the whole document (ADR-rdb-0012).
     Doc(Delta),
+    /// Map ops, applied in order (ADR-rdb-0013): `Put`, `Remove` and the `Need` checks.
+    Map(Vec<ElemOp>),
+    /// Set ops, applied in order (ADR-rdb-0013): `Add`, `Remove` and the `Need` checks.
+    Set(Vec<ElemOp>),
 }
 
 impl Change {
@@ -410,6 +416,8 @@ impl Change {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Doc(_) => "doc",
+            Self::Map(_) => "map",
+            Self::Set(_) => "set",
         }
     }
 }
@@ -419,6 +427,14 @@ impl Change {
 pub enum Look {
     /// The whole document.
     Doc,
+    /// Up to `limit` map entries or set members in element order, after `after` (which need not
+    /// be an element) or from the first.
+    Members {
+        /// Start after this key.
+        after: Option<Value>,
+        /// The most elements to return.
+        limit: usize,
+    },
 }
 
 /// What a read saw.
@@ -428,6 +444,8 @@ pub enum Seen {
     Absent,
     /// A document and its version.
     Doc(Document),
+    /// A page of a map or set, with its root.
+    Members(Members),
 }
 
 /// A node's answer to a client call.
@@ -3199,6 +3217,20 @@ impl Host {
             });
             let compiled = match &put.change {
                 Change::Doc(delta) => rdb_value::compile(view, &root, expected, delta),
+                Change::Map(ops) => rdb_value::collection::compile_collection(
+                    view,
+                    &root,
+                    CollectionKind::Map,
+                    expected,
+                    ops,
+                ),
+                Change::Set(ops) => rdb_value::collection::compile_collection(
+                    view,
+                    &root,
+                    CollectionKind::Set,
+                    expected,
+                    ops,
+                ),
             };
             match compiled {
                 Ok(compiled) => {
@@ -3631,9 +3663,12 @@ fn fail_waiter(reply: &Sender<Answer>, detail: String) -> String {
 /// A value compile's refusal, as the caller's error (§5.4 for documents, S0's subset).
 fn compile_error(error: &ValueError) -> ApiError {
     match error {
-        ValueError::Apply(ApplyError::VersionConflict { .. } | ApplyError::ObjectAbsent) => {
-            ApiError::new(ErrorKind::ConditionFailed, error.to_string())
-        }
+        ValueError::Apply(
+            ApplyError::VersionConflict { .. }
+            | ApplyError::ObjectAbsent
+            | ApplyError::ElementAbsent
+            | ApplyError::ElementExists,
+        ) => ApiError::new(ErrorKind::ConditionFailed, error.to_string()),
         ValueError::Apply(_) => ApiError::new(ErrorKind::InvalidArgument, error.to_string()),
         ValueError::Corrupt(_) => ApiError::new(ErrorKind::CorruptHistory, error.to_string()),
     }
@@ -3663,8 +3698,17 @@ fn object_answer(
     let (generation, at) = (view.generation(), view.at());
     let seen = match look {
         Look::Doc => rdb_value::read(view, root).map(|found| found.map_or(Seen::Absent, Seen::Doc)),
+        Look::Members { after, limit } => {
+            rdb_value::collection::members(view, root, after.as_ref(), *limit).map(Seen::Members)
+        }
     };
     Ok(match seen {
+        // P1 found a root record, so the view holds one: its absence here is not an answer (A-4).
+        Err(ValueError::Apply(ApplyError::ObjectAbsent)) => {
+            return Err(format!(
+                "the read view holds no root record for an object P1 answered as present ({look:?})"
+            ));
+        }
         Ok(seen) => Answer::Read {
             outcome,
             seen,
@@ -3729,7 +3773,6 @@ mod tests {
     use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
     use rdb_core::contracts::txn::{Durability, Outcome};
     use rdb_value::delta::Op;
-    use rdb_value::value::Value;
 
     /// This test's log lines whose message is `$message`. A macro, because the JSON value type
     /// is not nameable here without a `serde_json` dependency.

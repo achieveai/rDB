@@ -1349,7 +1349,9 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
             version,
             value: Value::Bytes(bytes),
         }) => Some((version, Bytes::from(bytes))),
-        Seen::Doc(_) => {
+        // `get` looks with `Look::Doc`, so `Members` is not expected here; either way it is no
+        // byte string.
+        Seen::Doc(_) | Seen::Members(_) => {
             return Err(ApiError::invalid(
                 "the object is not a byte string; read it with Db::read",
             ))
