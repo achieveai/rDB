@@ -289,7 +289,7 @@ pub enum Clearance {
 ///
 /// `INVALID_ARGUMENT` for a node `db` does not run, or a `Db` built without budgets (a crate
 /// test's). `UNAVAILABLE` when a read fails, the `partitions/` list comes back truncated, or a
-/// record does not decode: nothing is deleted then, and `no_mutation` says so. Its retry rule is
+/// record does not decode: this call deletes nothing then, and `no_mutation` says so. Its retry rule is
 /// `BoundedJitter` only for a store that was unavailable, timed out or not the leader, and
 /// `NotWired` otherwise: repeating a refused or unreadable call changes nothing (F-012).
 /// `UNKNOWN_OUTCOME` when the delete's reply is lost; running it again reads where it stands.

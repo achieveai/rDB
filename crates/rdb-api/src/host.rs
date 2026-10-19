@@ -15,8 +15,9 @@
 //!   queue is drained before the next mailbox message.
 //! * **Duties no kernel emits (§4.1).** A flush every [`HOST_FLUSH_EVERY_MILLIS`], the health
 //!   evaluation L1 is owed every [`HEALTH_EVAL_PERIOD_MILLIS`], A1's first `AcquireDue` on the
-//!   primary [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after the recovery, and the start-of-process
-//!   revocation replay (none persisted in M9: Decision 4).
+//!   primary [`ACQUIRE_AFTER_RECOVERED_MILLIS`] after the recovery, the start-of-process
+//!   revocation replay (none persisted in M9: Decision 4), and the retention trim every
+//!   [`HOST_TRIM_EVERY_MILLIS`] (ADR-rdb-0004 §4, achieveai/rDB#34).
 //! * **Fail loud (§4.4).** An effect the host cannot serve logs `host_unsupported` and faults the
 //!   node. A faulted node answers every later call with the fault and runs nothing else. It never
 //!   drops an effect and never fakes an answer.
@@ -66,7 +67,7 @@ use rdb_core::publication::{Publication, ReplicationView};
 use rdb_core::recovery::{Recovery, RecoveryPhase};
 use rdb_core::replication::Replication;
 use rdb_core::route::{self, Arm, Edge};
-use rdb_core::transaction::{Inflight, Limits, Transaction, TxnKernel};
+use rdb_core::transaction::{FreezeCause, Inflight, Limits, QueueMode, Transaction, TxnKernel};
 use rdb_storage::{RocksEngine, RocksSnapshot};
 use rdb_value::delta::{ApplyError, Delta, Op};
 use rdb_value::keys::{root_key, RootKey};
@@ -87,6 +88,11 @@ pub const BOOT: BootId = BootId(1);
 /// `HOST_FLUSH_EVERY_MILLIS`. Mandatory: without it a recovered copy reports durable 0 for ever
 /// and L1 never resumes (L-R177gf; s0-probe, control D).
 pub const HOST_FLUSH_EVERY_MILLIS: u64 = 100;
+
+/// The trim duty's period, in milliseconds: how often the host looks for published writes
+/// older than [`Budgets::dedup_retention_millis`] and lets T1 and P1 drop their retained
+/// answers (achieveai/rDB#34).
+pub const HOST_TRIM_EVERY_MILLIS: u64 = 1_000;
 
 /// How long after a recovery the primary's A1 is first woken to acquire its grant. The same
 /// value as the lowering's `ACQUIRE_AFTER_CUTOFF_MILLIS`; nothing in the kernel arms the first
@@ -465,6 +471,11 @@ pub struct NodeStatus {
     /// resolves (`Inflight::Dispatched`). `None` when nothing is applied unpublished: a request
     /// refused at admission, or never sent, is not here (Msg 8, W6-D1).
     pub in_flight: Option<RequestId>,
+    /// The applied sequence this node's T1 queue is frozen on, unpublished, while the freeze is
+    /// a lost authority or that write itself (`QueueMode::Frozen { unresolved }`). Every write
+    /// is refused until it publishes, even with A1 holding a grant again and L1 admitting
+    /// (U1, ruling A-R109). `None` while the queue is open or nothing is unresolved.
+    pub waits_on: Option<Seq>,
     /// The `recovery_rebuild_stalled` line, once this node reported the partition's rebuild
     /// stalled; cleared when it activates.
     pub stalled: Option<String>,
@@ -774,6 +785,11 @@ struct Host {
     next_frame: u32,
     next_flush: Tick,
     next_ticket: u64,
+    next_trim: Tick,
+    /// Per partition, each published `(generation, seq)` and when it was published, oldest
+    /// first, until the trim duty ages it out. Only the owner's P1 publishes, so only the owner
+    /// fills it.
+    published_at: BTreeMap<PartitionId, VecDeque<(Generation, Seq, Tick)>>,
     flushed_once: bool,
     /// Per partition, the step view and the `(generation, applied)` it was built at. Per
     /// partition, because the flusher's completions arrive on partition 0 and would otherwise
@@ -859,6 +875,8 @@ impl Host {
             next_frame: 1,
             next_flush: now.plus_millis(HOST_FLUSH_EVERY_MILLIS),
             next_ticket: 1,
+            next_trim: now.plus_millis(HOST_TRIM_EVERY_MILLIS),
+            published_at: BTreeMap::new(),
             flushed_once: false,
             views: BTreeMap::new(),
             bound: BTreeMap::new(),
@@ -925,6 +943,7 @@ impl Host {
         let now = self.clock.now();
         let due = [
             Some(self.next_flush),
+            Some(self.next_trim),
             self.timers.values().map(|(_, at, _)| *at).min(),
             self.l1.values().filter_map(|l1| l1.next_eval).min(),
             self.delayed.keys().next().map(|(at, _)| *at),
@@ -1191,6 +1210,10 @@ impl Host {
                 return;
             }
         }
+        if self.next_trim <= now {
+            self.next_trim = now.plus_millis(HOST_TRIM_EVERY_MILLIS);
+            self.trim_duty(now);
+        }
         let later = self.delayed.split_off(&(Tick(now.0.saturating_add(1)), 0));
         let due = std::mem::replace(&mut self.delayed, later);
         for (_, item) in due {
@@ -1266,6 +1289,63 @@ impl Host {
         };
         self.push(site, EventKind::Storage(kind), false, None);
         Ok(())
+    }
+
+    /// The trim duty (achieveai/rDB#34; ADR-rdb-0004 §4): per partition, the published writes
+    /// at least [`Budgets::dedup_retention_millis`] old go from T1's dedup index and P1's status
+    /// index together, as one `DedupTrim` and one `StatusTrim` with the same `below`: the
+    /// last aged seq plus one, so no younger entry goes. A write ages from its publish, never
+    /// its commit, so a write still held unpublished is never trimmed. A sweep, not a waiter.
+    ///
+    /// Publish times live in this process only. A new owner, promoted or restarted, has none
+    /// for the rows it seeds, so it must age them itself (for example, stamp them at its own
+    /// activation) and retire the old generation; M10 owes that (ruling A-R105).
+    fn trim_duty(&mut self, now: Tick) {
+        let retention = self.budgets.dedup_retention_millis;
+        let mut trims = Vec::new();
+        for (partition, published) in &mut self.published_at {
+            let Some(&(generation, _, _)) = published.front() else {
+                continue;
+            };
+            let mut last = None;
+            while let Some(&(g, seq, at)) = published.front() {
+                if g != generation || at.plus_millis(retention) > now {
+                    break;
+                }
+                last = Some(seq);
+                published.pop_front();
+            }
+            if let Some(last) = last {
+                trims.push((*partition, generation, Seq(last.0 + 1)));
+            }
+        }
+        for (partition, generation, below) in trims {
+            tracing::info!(
+                node = self.node.0,
+                kind = "trim",
+                partition = partition.0,
+                generation = generation.0,
+                below = below.0,
+                retention_ms = retention,
+                "host_duty"
+            );
+            let site = Site {
+                partition,
+                correlation: CorrelationId::default(),
+            };
+            self.push(
+                site,
+                EventKind::Kernel(KernelEvent::DedupTrim { generation, below }),
+                false,
+                None,
+            );
+            self.push(
+                site,
+                EventKind::Kernel(KernelEvent::StatusTrim { generation, below }),
+                false,
+                None,
+            );
+        }
     }
 
     /// F-014: the put sent as `event` still waits at its deadline plus the margin, so P1 has
@@ -1873,6 +1953,29 @@ impl Host {
             }
             KernelEffect::CopyCaughtUp { copy, head, .. } => {
                 tracing::info!(node, copy = copy.0, seq = head.0, "copy_caught_up");
+            }
+            // Recorded for the trim duty, then routed to T1 below.
+            KernelEffect::Published { lineage, seq, .. } => {
+                self.published_at
+                    .entry(lineage.partition)
+                    .or_default()
+                    .push_back((lineage.generation, *seq, self.clock.now()));
+            }
+            // A1 refused a check. The refusal the client sees (`LEASE_EXPIRED` and the like) does
+            // not say which conjunct denied, so name it here (U1, ruling A-R109). Still routed.
+            KernelEffect::Authority(AuthorityEffect::Answer(decision)) => {
+                if let Verdict::Deny(reason) = decision.verdict {
+                    tracing::info!(
+                        node,
+                        partition = site.partition.0,
+                        checkpoint = ?decision.checkpoint,
+                        reason = ?reason,
+                        grant = decision.grant.0,
+                        authority_seq = ?decision.authority_seq,
+                        at = self.stepped_at.0,
+                        "authority_check_denied"
+                    );
+                }
             }
             _ => {}
         }
@@ -3153,7 +3256,16 @@ impl Host {
                 ));
             }
         };
-        let _ = pending.reply.send(answer);
+        // The caller stopped waiting, at its own deadline, before the answer came: the answer is
+        // lost here. A write's caller then holds `UNKNOWN_OUTCOME`, which `status` settles.
+        if pending.reply.send(answer).is_err() {
+            tracing::info!(
+                node = self.node.0,
+                request = identity.request.0,
+                reply = reply_name(reply),
+                "reply_undelivered"
+            );
+        }
         self.release_queued(identity)
     }
 
@@ -3363,6 +3475,17 @@ impl Host {
                 .and_then(TxnKernel::inflight)
             {
                 Some(Inflight::Dispatched { admitted, .. }) => Some(admitted.req.identity.request),
+                _ => None,
+            },
+            waits_on: match self
+                .transaction
+                .kernel(self.node, partition)
+                .map(TxnKernel::mode)
+            {
+                Some(QueueMode::Frozen {
+                    cause: FreezeCause::AuthorityLost(_) | FreezeCause::UnresolvedTransaction,
+                    unresolved,
+                }) => *unresolved,
                 _ => None,
             },
             stalled: self
@@ -4629,7 +4752,8 @@ mod tests {
     /// links are held, and a put stays unacknowledged past the pause age. Then a stall line is
     /// written for a `DegradedRf2` watch set by hand, as the K1 row above does, and it says
     /// writes stay paused. After the heal L1 resumes, and that watch never activates. Once L1
-    /// admits writes, the line must stop saying they are paused.
+    /// admits writes, the line must stop saying they are paused. Status names the held put as
+    /// the write the owner's queue waits on (`waits_on`, U1), and nothing once it publishes.
     /// Integration (~1 s): three hosts stepped by hand, through a real L1 pause and resume.
     #[test]
     fn a_stall_line_stops_saying_writes_are_paused_once_l1_admits_them() {
@@ -4640,9 +4764,15 @@ mod tests {
         trio.links.hold(NodeId(1), NodeId(2));
         trio.links.hold(NodeId(1), NodeId(3));
         let unacknowledged = trio.call(put(1, b"a", b"1", None));
-        trio.until("L1 pauses writes", |trio| {
-            (trio.status(0).admits == Some(false)).then_some(())
+        let paused = trio.until("L1 pauses writes", |trio| {
+            let status = trio.status(0);
+            (status.admits == Some(false)).then_some(status)
         });
+        assert_eq!(
+            paused.waits_on,
+            Some(Seq(2)),
+            "waits_on names the applied, unpublished put: {paused:?}"
+        );
 
         let partition = PartitionId(1);
         let host = &mut trio.nodes[0].0;
@@ -4684,6 +4814,14 @@ mod tests {
         assert!(
             line.ends_with("so the partition stays DegradedRf2 and does not activate"),
             "{line}"
+        );
+        let published = trio.until("seq 2 publishes", |trio| {
+            let status = trio.status(0);
+            (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
+        });
+        assert_eq!(
+            published.waits_on, None,
+            "waits_on once the put published: {published:?}"
         );
         drop(unacknowledged);
     }
@@ -5208,6 +5346,75 @@ mod tests {
             ),
             "the reason is unchanged; only the poll says it stopped: {stopped:?}"
         );
+    }
+
+    /// U1 (ruling A-R109) end to end: a write applied and unpublished when a node fence lands.
+    /// Both copies' ACKs to the owner are dropped, so the put (seq 2) is applied on node 1 and
+    /// never published, and T1's queue is frozen on it. The control store then fails until A1
+    /// fences, which turns that freeze into a lost-authority one: status names seq 2 as the
+    /// write the queue waits on, and does not admit. The store returns and A1 replaces its own
+    /// grant (A-R96), and the queue still waits on seq 2: only its publication resolves it. Once
+    /// the links heal it publishes, `waits_on` clears, and writes are admitted again.
+    /// Integration (~3.5 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn a_write_unpublished_at_a_fence_is_what_the_queue_waits_on_until_it_publishes() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        trio.links.drop_direction(NodeId(2), NodeId(1));
+        trio.links.drop_direction(NodeId(3), NodeId(1));
+        let unacknowledged = trio.call(put(1, b"a", b"1", None));
+        trio.until("node 1 applies seq 2", |trio| {
+            (trio.head() == Some(2)).then_some(())
+        });
+
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        let fenced = trio.until("node 1 fenced", |trio| {
+            let status = trio.status(0);
+            status.fence.is_some().then_some(status)
+        });
+        assert_eq!(
+            (
+                fenced.waits_on,
+                fenced.admits,
+                fenced.published.map(|(_, seq)| seq)
+            ),
+            (Some(Seq(2)), Some(false), Some(Seq(1))),
+            "waits_on names the unpublished put at the fence: {fenced:?}"
+        );
+
+        trio.mem.stop_failing();
+        let replaced = trio.until("node 1 holds a grant again", |trio| {
+            let status = trio.status(0);
+            status.authority.starts_with("held(").then_some(status)
+        });
+        assert_eq!(
+            (replaced.waits_on, replaced.published.map(|(_, seq)| seq)),
+            (Some(Seq(2)), Some(Seq(1))),
+            "waits_on still names the put under the new grant: {replaced:?}"
+        );
+
+        trio.links.heal_all();
+        let published = trio.until("seq 2 publishes", |trio| {
+            let status = trio.status(0);
+            (status.published.map(|(_, seq)| seq) == Some(Seq(2))).then_some(status)
+        });
+        assert_eq!(
+            published.waits_on, None,
+            "waits_on once the put published: {published:?}"
+        );
+        trio.until("node 1 admits writes", |trio| {
+            (trio.status(0).admits == Some(true)).then_some(())
+        });
+        drop(unacknowledged);
     }
 
     /// A held link buffers; a stopped peer cannot. A send to a node whose mailbox is gone is
@@ -5906,6 +6113,283 @@ mod tests {
         );
         assert_eq!(logged!(METHOD, "txn_waiter_expired").len(), 0);
         assert_eq!(host.fault, None);
+    }
+
+    /// M9 S3-2: the owner publishes a write after its caller stopped waiting. The answer has
+    /// nowhere to go, so the host logs `reply_undelivered` once, naming the node and request,
+    /// and does not fault; `status` with the same id then settles it at the seq it published.
+    /// Trio (~2 s): the hold keeps the write unpublished until the caller is gone.
+    #[config_log::retcd_test]
+    fn a_write_published_after_its_caller_left_is_logged_undelivered_and_status_settles_it() {
+        const METHOD: &str =
+            "a_write_published_after_its_caller_left_is_logged_undelivered_and_status_settles_it";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        drop(trio.call(put(2, b"a", b"2", None)));
+        trio.until("node 1 applied request 2", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+        assert!(
+            logged!(METHOD, "reply_undelivered").is_empty(),
+            "not yet published"
+        );
+
+        trio.links.heal_all();
+        let lines = trio.until("reply_undelivered", |_| {
+            let lines = logged!(METHOD, "reply_undelivered");
+            (!lines.is_empty()).then_some(lines)
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0]["node"] == 1 && lines[0]["request"] == 2,
+            "{lines:?}"
+        );
+        match trio.ask(ClientCall::Status {
+            identity: identity(2),
+            generation: None,
+        }) {
+            Answer::Status(TxnStatus::Resolved(result)) => {
+                assert_eq!((result.generation, result.seq), (Generation(1), Seq(3)));
+            }
+            other => panic!("status of request 2: {other:?}"),
+        }
+    }
+
+    /// M9 S3-5: the owner's trim duty lets a published write's retained answer go once it is
+    /// `dedup_retention_millis` old, never before (a 1.1 s look covers a trim tick, so a duty
+    /// that ignored the age would have trimmed). One `below` = the last aged seq + 1 covers
+    /// both writes, sent to T1 and P1 together: afterwards `status` is `Unknown` for both, and
+    /// a resend of the first is not replayed from the dedup index but runs afresh, where its
+    /// `Absent` condition fails. Only node 1 trims. Trio (~4 s): a 1.5 s retention.
+    #[config_log::retcd_test]
+    fn the_trim_duty_drops_both_retained_answers_once_they_age_and_not_before() {
+        const METHOD: &str =
+            "the_trim_duty_drops_both_retained_answers_once_they_age_and_not_before";
+        const RETENTION_MILLIS: u64 = 1_500;
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = RETENTION_MILLIS;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let first = match trio.ask(compile(1, b"a", b"1")) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 1: {other:?}"),
+        };
+        let resend = |trio: &mut Trio| {
+            trio.ask(ClientCall::Resend {
+                request: first.clone(),
+            })
+        };
+        match resend(&mut trio) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("request 1: {other:?}"),
+        }
+        match trio.ask(put(2, b"b", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("request 2: {other:?}"),
+        }
+        let status = |trio: &mut Trio, request| {
+            trio.ask(ClientCall::Status {
+                identity: identity(request),
+                generation: None,
+            })
+        };
+
+        let looked = trio.clock.now().plus_millis(1_100);
+        trio.until("1.1 s, a trim tick", |trio| {
+            (trio.clock.now() >= looked).then_some(())
+        });
+        match status(&mut trio, 1) {
+            Answer::Status(TxnStatus::Resolved(result)) => assert_eq!(result.seq, Seq(2)),
+            other => panic!("status 1 inside the retention: {other:?}"),
+        }
+        match resend(&mut trio) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2), "replayed"),
+            other => panic!("resend 1 inside the retention: {other:?}"),
+        }
+
+        let trims = trio.until("node 1 trims below 4", |_| {
+            let trims = logged!(METHOD, "host_duty")
+                .into_iter()
+                .filter(|line| line["kind"] == "trim")
+                .collect::<Vec<_>>();
+            trims.iter().any(|line| line["below"] == 4).then_some(trims)
+        });
+        assert!(
+            trims
+                .iter()
+                .all(|line| line["node"] == 1 && line["generation"] == 1),
+            "{trims:?}"
+        );
+        assert_eq!(
+            trims.last().map(|line| line["below"] == 4),
+            Some(true),
+            "{trims:?}"
+        );
+        for request in [1, 2] {
+            match status(&mut trio, request) {
+                Answer::Status(TxnStatus::Unknown) => {}
+                other => panic!("status {request} after the trim: {other:?}"),
+            }
+        }
+        match resend(&mut trio) {
+            Answer::Error { error, .. } => {
+                assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
+            }
+            other => panic!("resend 1 after the trim runs afresh and fails: {other:?}"),
+        }
+    }
+
+    /// Tester coverage ask (S3-5): the trim duty skips a partition with nothing published to
+    /// age and goes on to the next. Node 1 holds an empty publish queue for partition 0, which
+    /// sorts before partition 1, as an idle partition's does once its last entry aged out. The
+    /// write on partition 1 is still trimmed. A duty that stopped at the idle partition would
+    /// never trim partition 1. Trio (~4 s): a 300 ms retention, one trim tick past it.
+    #[config_log::retcd_test]
+    fn the_trim_duty_passes_an_idle_partition_and_trims_the_next() {
+        const METHOD: &str = "the_trim_duty_passes_an_idle_partition_and_trims_the_next";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = 300;
+        });
+        trio.bootstrap();
+        trio.ready();
+        let owner = &mut trio.nodes[0].0;
+        assert_eq!(owner.node, NodeId(1));
+        owner.published_at.insert(PartitionId(0), VecDeque::new());
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        let trims = trio.until("node 1 trims partition 1 below 3", |_| {
+            let trims = logged!(METHOD, "host_duty")
+                .into_iter()
+                .filter(|line| line["kind"] == "trim")
+                .collect::<Vec<_>>();
+            trims.iter().any(|line| line["below"] == 3).then_some(trims)
+        });
+        assert!(
+            trims
+                .iter()
+                .all(|line| line["node"] == 1 && line["partition"] == 1),
+            "nothing trimmed for the idle partition: {trims:?}"
+        );
+    }
+
+    /// M9 S3-5c, guard 1: a write ages from its publication, never from its commit. Node 1
+    /// applies request 3 with both links held, so it is committed and unpublished. Past the
+    /// retention it is still held, and the trim spares it. Once healed it publishes, and a
+    /// resend right away replays it from the dedup index. Once aged from its publication a
+    /// trim takes it, and a resend runs afresh and fails its condition. Aged from the commit,
+    /// the host would trim it while held, when T1 has no entry for it yet, and never again:
+    /// the entry would outlive the retention and the last resend would still replay.
+    /// Trio (~5 s): a 300 ms retention; each wait is the retention plus one trim period and a
+    /// margin, so a trim tick falls after the write has aged.
+    #[config_log::retcd_test]
+    fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.dedup_retention_millis = 300;
+        });
+        trio.bootstrap();
+        trio.ready();
+        match trio.ask(put(1, b"a", b"1", None)) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
+            other => panic!("put a=1: {other:?}"),
+        }
+        let held = match trio.ask(compile(3, b"b", b"1")) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile request 3: {other:?}"),
+        };
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let answer = trio.call(ClientCall::Resend {
+            request: held.clone(),
+        });
+        trio.until("node 1 applied request 3", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+        let healed = trio
+            .clock
+            .now()
+            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
+        trio.until("held past the retention and then a trim tick", |trio| {
+            (trio.clock.now() >= healed).then_some(())
+        });
+        trio.links.heal_all();
+        match trio.answer(&answer) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("request 3 after the heal: {other:?}"),
+        }
+        match trio.ask(ClientCall::Resend {
+            request: held.clone(),
+        }) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3), "replayed"),
+            other => panic!("resend 3 right after its publication: {other:?}"),
+        }
+        let aged = trio
+            .clock
+            .now()
+            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
+        trio.until("aged from its publication, then a trim tick", |trio| {
+            (trio.clock.now() >= aged).then_some(())
+        });
+        match trio.ask(ClientCall::Resend { request: held }) {
+            Answer::Error { error, .. } => {
+                assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
+            }
+            other => panic!("resend 3 once aged from its publication: {other:?}"),
+        }
+    }
+
+    /// U1 (ruling A-R109): a check A1 refuses is logged `authority_check_denied` with its
+    /// reason, which the client's refusal does not carry. The positive control for that line:
+    /// with the control store down, A1 still holds its grant but denies `ControlUnavailable`,
+    /// and a put's dispatch check is refused for that reason.
+    /// Trio (~2 s): bootstrap, then one store outage on a 100 ms renewal.
+    #[config_log::retcd_test]
+    fn a_dispatch_check_a1_denies_is_logged_with_its_reason() {
+        const METHOD: &str = "a_dispatch_check_a1_denies_is_logged_with_its_reason";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        assert!(logged!(METHOD, "authority_check_denied").is_empty());
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 stops admitting", |trio| {
+            (trio.status(0).admits != Some(true)).then_some(())
+        });
+        let refused = trio.ask(put(1, b"a", b"1", None));
+        trio.mem.stop_failing();
+        assert!(matches!(refused, Answer::Error { .. }), "{refused:?}");
+        let lines = trio.until("authority_check_denied", |_| {
+            let lines = logged!(METHOD, "authority_check_denied");
+            (!lines.is_empty()).then_some(lines)
+        });
+        assert!(
+            lines.iter().any(|line| line["node"] == 1
+                && line["checkpoint"] == "StorageDispatch"
+                && line["reason"] == "ControlUnavailable"),
+            "{lines:?}"
+        );
     }
 
     /// A copy id outside the Trio's configuration: R1 never sends to it, so only a row's direct

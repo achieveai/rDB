@@ -294,13 +294,19 @@ pub struct TxnResult {
 pub enum TxnStatus {
     /// The transaction is resolved; here is its result.
     Resolved(TxnResult),
-    /// Applied locally but not yet resolved. The partition queue is frozen until it is.
+    /// Reserved for T1's answer for a write admitted and queued behind a freeze (test plan
+    /// KA-9). P1, which answers status queries, never returns it (row M7A-115), and no module
+    /// returns it in this build. A write that is applied but not yet published answers
+    /// [`Self::Unknown`] (ADR-rdb-0004 §4; #32).
     Unresolved {
         /// The position that is unresolved.
         seq: Seq,
     },
     /// Retained history does not contain it and retention has not expired. Not proof it did not
     /// run (spec §8.1).
+    ///
+    /// This is also the answer for a write that is applied but not yet published, and for one
+    /// trimmed from a live generation (ADR-rdb-0004 §4). Ask again with the same identity.
     Unknown,
     /// The retention window has passed. Also not proof it did not run.
     Expired,

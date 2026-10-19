@@ -63,6 +63,7 @@ use rdb_core::contracts::trace::{
 };
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest, TxnResult};
 use rdb_core::contracts::version::API_VERSION;
+use rdb_core::replication::catchup::RETRANSMIT_MS;
 use rdb_sim::harness::manifest::BudgetOverride;
 use rdb_sim::harness::run::{RunPlan, Runner, ScenarioStep, SeedEvent, StepAction, StopReason};
 use rdb_sim::harness::trace::validate;
@@ -1649,6 +1650,100 @@ fn m9_k1_03_a_copy_away_for_three_deadlines_is_named_stalled_once_per_deadline()
         written(&replies),
         vec![(RequestId(300), Seq(2)), (RequestId(301), Seq(3))],
         "both writes publish after the start record; replies: {replies:#?}"
+    );
+    assert_eq!(
+        violations,
+        Vec::<String>::new(),
+        "every oracle accepts the run"
+    );
+}
+
+// ---- W1-D1 (M9 S3, ruling A-R106): a record lost one way while the copies' ACKs flow. ----
+
+/// The two writes of the W1-D1 row: the first publishes seq 2 with every link up; the second,
+/// seq 3, is submitted 5 ms later, inside the 100 ms before the copies' next flush, as the host
+/// walk's second write was (4 ms).
+const W1_WRITES: [(u64, u64); 2] = [(SUBMIT_AT, 400), (SUBMIT_AT + 5, 401)];
+
+/// Case B (three copies, B primary) with [`W1_WRITES`], and the next frame on each link in
+/// `lost` after the first write is dropped: the stream's ship of seq 3.
+fn w1_lost(lost: &[(NodeId, NodeId)]) -> RunPlan {
+    let mut plan = case_b();
+    plan.seed.retain(|seed| {
+        !matches!(&seed.kind, EventKind::Client(ClientEvent::Submit(request))
+            if request.identity == CLIENT)
+    });
+    plan.seed.extend(
+        W1_WRITES
+            .iter()
+            .map(|(at, request)| submit_at(*at, 9_000 + request, RequestId(*request))),
+    );
+    plan.steps.extend(
+        lost.iter()
+            .map(|(from, to)| plan_next(W1_WRITES[1].0 - 1, *from, *to, Delivery::Drop)),
+    );
+    plan.steps.sort_by_key(|step| step.at);
+    plan.limits.deadline = Tick(W1_WRITES[1].0 + 2_000);
+    plan
+}
+
+/// The tick of B's `publish` line for `seq`, if there is one.
+fn published_at(trace: &Trace, seq: Seq) -> Option<u64> {
+    trace.events.iter().find_map(|event| match &event.kind {
+        TraceKind::Publish { seq: s, .. } if event.node == B_NODE && *s == seq => {
+            Some(event.logical_tick)
+        }
+        _ => None,
+    })
+}
+
+/// W1-D1 (tester walk 1, edge 1e; lead ruling A-R106). **Scenario:** the client writes twice to
+/// B. The first write publishes at seq 2. B ships the second, seq 3, and both copies of that ship
+/// are lost on the way out (B to C, B to A). Nothing B receives is lost: C and A flush seq 2 and
+/// tell B so, and B takes those ACKs. **The client must observe** its second write published at
+/// seq 3 within R1's retransmit cadence: one quiet interval, then a re-send (B-R67i), well
+/// inside the write's 1 s deadline and L1's 2 s warn-to-pause path.
+///
+/// Before the fix each copy's flush ACK reached the idle catch-up cursor that seq 1's start
+/// left for it, and `Primary::drive` forgot the stream's shipped seq 3 before the cursor, which
+/// had nothing to send, ran. With nothing awaiting an ACK the retransmit timer lapsed, seq 3 was
+/// never re-sent, and the write ended `UnknownOutcome`.
+#[retcd_test]
+fn m9_w1_d1_00_a_record_lost_one_way_while_the_copies_acks_flow_is_re_sent_and_publishes() {
+    let (replies, trace, violations) = run_judged(&w1_lost(&[(B_NODE, C_NODE), (B_NODE, A_NODE)]));
+    let ship = W1_WRITES[1].0;
+    let at = published_at(&trace, Seq(3));
+    tracing::info!(?at, ?replies, "w1d1.run");
+    for node in [C_NODE, A_NODE] {
+        let seq_three = applied_on(&trace, node)
+            .into_iter()
+            .find(|(_, _, seq, outcome)| *seq == Seq(3) && *outcome == ApplyOutcome::Applied)
+            .map(|(at, ..)| at);
+        assert!(
+            seq_three.is_none_or(|at| at > ship),
+            "the precondition: the ship of seq 3 to {node:?} at t{ship} is lost (applied at \
+             {seq_three:?})"
+        );
+        let acked = trace.events.iter().any(|event| {
+            event.logical_tick > ship
+                && matches!(&event.kind, TraceKind::ReplicationAck {
+                    from_node, to_node, accepted: true, ..
+                } if *from_node == node && *to_node == B_NODE)
+        });
+        assert!(
+            acked,
+            "the precondition: {node:?}'s ACKs still reach B after the lost ship"
+        );
+    }
+    assert_eq!(
+        written(&replies),
+        vec![(RequestId(400), Seq(2)), (RequestId(401), Seq(3))],
+        "both writes publish; replies: {replies:#?}"
+    );
+    assert!(
+        at.is_some_and(|at| at <= ship + 2 * RETRANSMIT_MS + 100),
+        "seq 3 publishes within R1's retransmit cadence of its lost ship (t{ship}), not after \
+         L1's pause: published at {at:?}"
     );
     assert_eq!(
         violations,

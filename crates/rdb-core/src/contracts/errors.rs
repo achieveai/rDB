@@ -51,9 +51,13 @@ pub enum RetryRule {
     /// Wait for health or authority to recover, then reissue. The already-admitted request must
     /// not be assumed to have failed.
     RetryAfterRecovery,
-    /// Nothing was mutated. The caller may issue a deliberately different request.
+    /// This submission mutated nothing. An earlier send of the same request identity may still
+    /// have applied: the answer covers the submission it answers, not the request (#35). The
+    /// caller may issue a deliberately different request.
     Definitive,
-    /// Nothing was admitted. Bounded jittered retry is safe.
+    /// This submission was not admitted, so it mutated nothing. An earlier send of the same
+    /// request identity may still have applied (#35). Bounded jittered retry with the same
+    /// identity is safe.
     BoundedJitter,
     /// Query status with the *same* identity. Never generate a fresh request id.
     QueryStatus,
@@ -171,7 +175,7 @@ pub enum RdbError {
         paused_after: Seq,
     },
 
-    /// A declared condition did not hold. Definitive: nothing was mutated.
+    /// A declared condition did not hold. Definitive: this submission mutated nothing.
     #[error("condition {index} failed")]
     ConditionFailed {
         /// Zero-based position of the failing condition in the request.
@@ -195,7 +199,7 @@ pub enum RdbError {
         field: &'static str,
     },
 
-    /// Admission control rejected the request before any mutation.
+    /// Admission control rejected this submission before it could mutate anything.
     #[error("partition {partition:?} overloaded")]
     Overloaded {
         /// The partition that was addressed.
@@ -352,18 +356,24 @@ impl RdbError {
             | Self::StatusExpired { .. }
             // Operator action, not a retry — which is the whole difference between this and
             // `ProtectionPaused`'s `RetryAfterRecovery`. It is deliberately not `Definitive`
-            // even though admission refused: `Definitive` promises nothing was mutated, and a
-            // blocked partition proves nothing about the request that arrived before it
-            // blocked.
+            // even though admission refused: `Definitive` promises this submission mutated
+            // nothing, and a blocked partition proves nothing about the request that arrived
+            // before it blocked.
             | Self::DivergenceRequiresOperator { .. } => RetryRule::Quarantine,
             Self::Unavailable { .. } => RetryRule::NotWired,
         }
     }
 
-    /// Whether this error proves no mutation was applied.
+    /// Whether this error proves that **this submission** applied no mutation.
     ///
     /// Only pre-admission rejection proves it (spec §5.4 takeaway). An oracle that needs to know
-    /// "could this request have had an effect?" asks here rather than matching variants itself.
+    /// "could this submission have had an effect?" asks here rather than matching variants
+    /// itself.
+    ///
+    /// `true` says nothing about other sends of the same request identity (#35). Admission checks
+    /// 1–10 run before the dedup lookup (ADR-rdb-0004 §3), so a resend of an identity that has
+    /// already applied can be refused here, and `true` is still the right answer for that send.
+    /// `false` means "not proven", never "written".
     ///
     /// [`RetryRule::NotWired`] is **not** proof (finding K-F-26). An unwired module has not
     /// mutated anything, but the module that returned `Unavailable` may not be the only one the

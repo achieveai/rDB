@@ -355,9 +355,10 @@ not be reached — and `Unknown` — the request went out and the answer was los
 `Unknown` is the more dangerous of the two to retry, because the CAS is more likely to have landed.
 `Committed { revision }` proceeds. `Conflict` re-reads the
 record: a different owner at a newer epoch means this node was overtaken and it blocks, re-entering
-recovery only through a fresh fencing proof; an unchanged record means a lost response and one
-re-propose is allowed. Neither unreachable arm may proceed — the CAS may have landed, and a recovery
-that does not know whether it is the owner must not act as if it were.
+recovery only through a fresh fencing proof; an identical record is a peer's decision (B-R41); the
+activation CAS resolves as amended below (A-R102). Neither unreachable arm may proceed — the CAS
+may have landed, and a recovery that does not know whether it is the owner must not act as if it
+were.
 
 **Amended 2026-10-13 (ruling A-R102, W10-D1): an `Unknown` activation CAS resolves, it does not
 block.** The rule above stays for the recovery CAS. The activation CAS rewrites the commit's own

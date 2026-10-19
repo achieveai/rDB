@@ -2,8 +2,11 @@
 //!
 //! A concrete struct, no trait until M10. Each rDB node registers its mailbox. A peer message —
 //! a replication frame, or a recovery request and its answer — goes through [`Links::send`] and
-//! honours a hold. A held link buffers in order and delivers on [`Links::heal`], so a hold is a
-//! delay, never a loss: the frames arrive late, as a slow network delivers them.
+//! honours a hold or a drop. A held link buffers in order and delivers on [`Links::heal`], so a
+//! hold is a delay, never a loss: the frames arrive late, as a slow network delivers them. A
+//! dropped direction ([`Links::drop_direction`]) loses what is sent on it: `send` discards the
+//! message and still answers `Ok`, as a lossy network never tells the sender. Only a retransmit
+//! after [`Links::heal`] gets the message through.
 //!
 //! [`Links::post`] skips the holds. It carries what does not travel on the peer link: client
 //! calls, control completions and the control-plane `Recovered` watch.
@@ -30,6 +33,8 @@ struct Inner {
     held: BTreeSet<(NodeId, NodeId)>,
     /// Per direction, what a hold kept back, oldest first.
     buffered: BTreeMap<(NodeId, NodeId), VecDeque<Msg>>,
+    /// Dropped directions, `(from, to)`: what is sent on one is lost.
+    dropped: BTreeSet<(NodeId, NodeId)>,
 }
 
 const fn pair(a: NodeId, b: NodeId) -> (NodeId, NodeId) {
@@ -66,7 +71,9 @@ impl Links {
         self.lock().mailboxes.contains_key(&node)
     }
 
-    /// Send a peer message from `from` to `to`, honouring a hold.
+    /// Send a peer message from `from` to `to`, honouring a drop and then a hold. A dropped
+    /// direction discards the message and answers `Ok(())`: a loss is silent, never a
+    /// [`LinkFault`], so the sender learns of it only by its own timers.
     ///
     /// # Errors
     ///
@@ -75,6 +82,10 @@ impl Links {
         let mut inner = self.lock();
         if !inner.mailboxes.contains_key(&to) {
             return Err(LinkFault::Unreachable);
+        }
+        if inner.dropped.contains(&(from, to)) {
+            tracing::info!(from = from.0, to = to.0, "link_dropped");
+            return Ok(());
         }
         if inner.held.contains(&pair(from, to)) {
             let queue = inner.buffered.entry((from, to)).or_default();
@@ -109,11 +120,21 @@ impl Links {
         tracing::info!(a = a.0, b = b.0, added, "link_hold");
     }
 
-    /// Heal the link between `a` and `b` and deliver what it buffered, in order per direction.
+    /// Lose every message sent from `from` to `to` until a heal of that pair. One direction
+    /// only: `to` still reaches `from`. Dropping a dropped direction is a no-op.
+    pub fn drop_direction(&self, from: NodeId, to: NodeId) {
+        let added = self.lock().dropped.insert((from, to));
+        tracing::info!(from = from.0, to = to.0, added, "link_drop");
+    }
+
+    /// Heal the link between `a` and `b`: lift its hold and the drops in both directions,
+    /// and deliver what the hold buffered, in order per direction. What a drop lost stays lost.
     /// Returns how many messages were delivered.
     pub fn heal(&self, a: NodeId, b: NodeId) -> usize {
         let mut inner = self.lock();
         let removed = inner.held.remove(&pair(a, b));
+        let undropped =
+            usize::from(inner.dropped.remove(&(a, b))) + usize::from(inner.dropped.remove(&(b, a)));
         let mut flushed = 0;
         for direction in [(a, b), (b, a)] {
             let Some(queue) = inner.buffered.remove(&direction) else {
@@ -128,19 +149,101 @@ impl Links {
                 }
             }
         }
-        tracing::info!(a = a.0, b = b.0, removed, flushed, "link_heal");
+        tracing::info!(a = a.0, b = b.0, removed, undropped, flushed, "link_heal");
         flushed
     }
 
-    /// Heal every held link. Returns how many messages were delivered.
+    /// Heal every held link and every dropped direction. Returns how many messages were
+    /// delivered.
     pub fn heal_all(&self) -> usize {
-        let held: Vec<_> = self.lock().held.iter().copied().collect();
-        held.into_iter().map(|(a, b)| self.heal(a, b)).sum()
+        let pairs: BTreeSet<_> = {
+            let inner = self.lock();
+            let dropped = inner.dropped.iter().map(|&(from, to)| pair(from, to));
+            inner.held.iter().copied().chain(dropped).collect()
+        };
+        pairs.into_iter().map(|(a, b)| self.heal(a, b)).sum()
     }
 
     /// The held links, smaller node first.
     #[must_use]
     pub fn held(&self) -> Vec<(NodeId, NodeId)> {
         self.lock().held.iter().copied().collect()
+    }
+
+    /// The dropped directions, as `(from, to)`.
+    #[must_use]
+    pub fn dropped(&self) -> Vec<(NodeId, NodeId)> {
+        self.lock().dropped.iter().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc::{self, Receiver};
+
+    /// A message `send` can carry, told apart by `detail`.
+    fn msg(detail: &str) -> Msg {
+        Msg::Fault {
+            boot: crate::host::BOOT,
+            kind: "probe",
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// What `rx` holds now, by detail.
+    fn got(rx: &Receiver<Msg>) -> Vec<String> {
+        rx.try_iter()
+            .map(|msg| match msg {
+                Msg::Fault { detail, .. } => detail,
+                other => panic!("not a probe: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// M9 S3-1, S3-1n and S3-1h: a dropped direction loses what is sent on it and still answers
+    /// `Ok`, so the sender learns of it only by its own timers (A-2). It is one direction: the
+    /// reverse still delivers. A heal of the pair lifts it from either end, named in either
+    /// order, and `heal_all` lifts every drop as well as every hold (A-1). What a drop lost
+    /// stays lost; what a hold kept is delivered. Unit.
+    #[test]
+    fn a_dropped_direction_loses_silently_one_way_until_a_heal() {
+        let links = Links::new();
+        let (tx1, rx1) = mpsc::channel();
+        let (tx2, rx2) = mpsc::channel();
+        let (tx3, rx3) = mpsc::channel();
+        links.register(NodeId(1), tx1);
+        links.register(NodeId(2), tx2);
+        links.register(NodeId(3), tx3);
+
+        links.drop_direction(NodeId(2), NodeId(1));
+        assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack lost")), Ok(()));
+        assert_eq!(links.send(NodeId(1), NodeId(2), msg("frame")), Ok(()));
+        assert_eq!(got(&rx1), Vec::<String>::new(), "2->1 is dropped");
+        assert_eq!(got(&rx2), ["frame"], "1->2 still delivers");
+        assert_eq!(links.dropped(), [(NodeId(2), NodeId(1))]);
+
+        assert_eq!(
+            links.heal(NodeId(1), NodeId(2)),
+            0,
+            "a drop buffers nothing"
+        );
+        assert_eq!(links.dropped(), [], "healed from the other end");
+        assert_eq!(links.send(NodeId(2), NodeId(1), msg("ack")), Ok(()));
+        assert_eq!(got(&rx1), ["ack"]);
+        links.drop_direction(NodeId(1), NodeId(2));
+        assert_eq!(links.heal(NodeId(1), NodeId(2)), 0);
+        assert_eq!(links.dropped(), [], "healed from the same end");
+
+        links.drop_direction(NodeId(3), NodeId(1));
+        links.hold(NodeId(1), NodeId(2));
+        assert_eq!(links.send(NodeId(3), NodeId(1), msg("lost")), Ok(()));
+        assert_eq!(links.send(NodeId(1), NodeId(2), msg("held")), Ok(()));
+        assert_eq!(links.heal_all(), 1, "only the held frame is delivered");
+        assert_eq!((links.held(), links.dropped()), (vec![], vec![]));
+        assert_eq!(got(&rx2), ["held"]);
+        assert_eq!(links.send(NodeId(3), NodeId(1), msg("after")), Ok(()));
+        assert_eq!(got(&rx1), ["after"], "the lost one stays lost");
+        assert_eq!(got(&rx3), Vec::<String>::new());
     }
 }

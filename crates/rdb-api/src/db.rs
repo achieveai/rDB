@@ -8,6 +8,10 @@
 //! may still publish; ask `status` with the same identity), `UNAVAILABLE` with no request for a
 //! put that could not be compiled in time (nothing was sent), and `UNAVAILABLE` for a read (a
 //! read mutates nothing). None waits for ever.
+//!
+//! Once any send of a request id went unanswered (a timeout, a lost reply or `UNKNOWN_OUTCOME`),
+//! only [`Db::status`] with the same id settles it, and only inside the dedup retention window;
+//! a definitive answer to a later resend covers that resend alone.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -66,7 +70,8 @@ pub struct ApiError {
     pub kind: ErrorKind,
     /// What the caller may do.
     pub retry: RetryRule,
-    /// Whether nothing was mutated, provably.
+    /// Whether this submission provably mutated nothing. It says nothing of an earlier send of
+    /// the same request id.
     pub no_mutation: bool,
     /// Detail, for the log and the operator.
     pub detail: String,
@@ -92,7 +97,8 @@ impl ApiError {
     /// | any other | `BoundedJitter` | `false` |
     ///
     /// This is not what the kernel attaches to the same kind: for example a kernel
-    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves no mutation.
+    /// `NotPrimary` carries `RefreshRoute`, and a kernel `BoundedJitter` proves this submission
+    /// mutated nothing.
     /// Wrap a kernel error with [`Self::from_kernel`], never with this.
     #[must_use]
     pub fn new(kind: ErrorKind, detail: impl Into<String>) -> Self {
@@ -130,8 +136,9 @@ impl ApiError {
     }
 
     /// A put refused before it was sent: this node has adopted no generation yet, so there is
-    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). Nothing left
-    /// the host, so nothing was mutated, and it may be retried once a generation is adopted.
+    /// none to fence it with (`expected_generation` is always set; ADR-0004 §8). This submission
+    /// never left the host, so it mutated nothing, and it may be retried once a generation is
+    /// adopted.
     #[must_use]
     pub fn not_adopted(node: NodeId, partition: PartitionId) -> Self {
         Self {
@@ -210,6 +217,15 @@ pub struct DbConfig {
     /// the spec's [`RETENTION_CAP_ENTRIES`]; a value above it is refused at open, since P1's
     /// status index holds no more than that. A dev budget, to reach a full index by hand.
     pub dedup_cap: Option<usize>,
+    /// How long a published write's retained answer is kept before the owner's trim duty lets
+    /// it go: its dedup entry and its status. `None` is the spec's 24 h
+    /// ([`Budgets::dedup_retention_millis`]). A dev budget, to see a full index free up by hand.
+    /// A `CONDITION_FAILED` answer is kept as long, counted from when it was given, since nothing
+    /// need publish after it (ruling A-R108).
+    /// A retry of a trimmed request is no longer recognised: it is submitted afresh (spec §5.3).
+    /// A plain `put` compiles a version condition, so its retry fails `CONDITION_FAILED` once
+    /// the first send applied, rather than applying twice.
+    pub dedup_retention: Option<Duration>,
 }
 
 impl DbConfig {
@@ -401,7 +417,19 @@ impl Db {
         budgets: Budgets,
     ) -> Result<Self, OpenError> {
         let limits = limits(config.dedup_cap)?;
-        tracing::info!(dedup_cap = limits.dedup_cap, "db_open");
+        let budgets = Budgets {
+            dedup_retention_millis: config
+                .dedup_retention
+                .map_or(budgets.dedup_retention_millis, |retention| {
+                    u64::try_from(retention.as_millis()).unwrap_or(u64::MAX)
+                }),
+            ..budgets
+        };
+        tracing::info!(
+            dedup_cap = limits.dedup_cap,
+            dedup_retention_ms = budgets.dedup_retention_millis,
+            "db_open"
+        );
         let respawn = Respawn {
             nodes_dir: config.dir.join("nodes"),
             budgets,
@@ -850,7 +878,9 @@ impl Db {
     /// it is enough (tester walk 5, W5-D1). That holds only for a write node 1 holds in flight,
     /// applied and unpublished ([`NodeStatus::in_flight`]). `Unknown` also answers a request
     /// refused at admission, which was never queued: nothing resolves it, and it stays `Unknown`
-    /// (Msg 8, W6-D1).
+    /// (Msg 8, W6-D1). `Unknown` also answers a published request whose retained answer aged out
+    /// of the dedup retention window ([`DbConfig::dedup_retention`]); a resend after that runs
+    /// afresh.
     ///
     /// # Errors
     ///
@@ -1361,6 +1391,7 @@ mod tests {
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
+            dedup_retention: None,
         }
     }
 
@@ -1398,6 +1429,7 @@ mod tests {
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
+            dedup_retention: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1480,6 +1512,7 @@ mod tests {
                 read: Duration::from_secs(1),
             },
             dedup_cap: None,
+            dedup_retention: None,
         };
         let mut db = rt
             .block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1598,6 +1631,7 @@ mod tests {
                 read: patience,
             },
             dedup_cap: None,
+            dedup_retention: None,
         };
         let db = Arc::new(
             rt.block_on(Db::open_with(config, store, rt.handle().clone(), budgets))
@@ -1838,6 +1872,7 @@ mod tests {
             hold: Vec::new(),
             timeouts: Timeouts::default(),
             dedup_cap: None,
+            dedup_retention: None,
         };
         match rt.block_on(Db::open(config, store, rt.handle().clone())) {
             Err(OpenError::NotEmpty(path)) => assert_eq!(path, dir.path().join("nodes")),
@@ -3003,6 +3038,7 @@ mod tests {
         let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
         let above = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES + 1),
+            dedup_retention: None,
             ..config(dir.path())
         };
         match rt.block_on(Db::open(above, store, rt.handle().clone())) {
@@ -3027,12 +3063,83 @@ mod tests {
         assert_eq!(lines[0]["dedup_cap"], RETENTION_CAP_ENTRIES + 1);
         let at_cap = DbConfig {
             dedup_cap: Some(RETENTION_CAP_ENTRIES),
+            dedup_retention: None,
             ..config(dir.path())
         };
         assert!(
             limits(at_cap.dedup_cap).is_ok(),
             "the status cap itself is allowed"
         );
+    }
+
+    /// Walk 5f-r through the `Db` (ruling A-R108a, kernel 11fe5d6), and mutant 8: the `Db`
+    /// threads `dedup_retention` into every node's budgets. With a cap of 2, two applied puts
+    /// fill the dedup index and a third is `OVERLOADED`. The owner's trim duty frees both once
+    /// they age past a 300 ms retention. Resending the two originals runs them afresh, and each
+    /// fails its compiled condition: two `CONDITION_FAILED` answers refill the cap, and nothing
+    /// publishes after them. They age out by time alone, so a put then succeeds. Without the
+    /// retention in the budgets nothing ages for 24 h, and the trim wait fails.
+    /// Integration (~2 s): three node threads on wall-clock time, one trim tick.
+    #[test]
+    fn m9_s3k_04_db_condition_failures_free_the_cap() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let config = DbConfig {
+            dedup_cap: Some(2),
+            dedup_retention: Some(Duration::from_millis(300)),
+            ..config(dir.path())
+        };
+        let mut db = rt
+            .block_on(Db::open_with(config, store, rt.handle().clone(), fast()))
+            .expect("open");
+        admits(&db, "before the first put");
+        let first = db.put(b"a", b"1", None).expect("put a=1");
+        let second = db.put(b"b", b"1", None).expect("put b=1");
+        let overloaded = |db: &Db, phase: &str| {
+            let refused = db.put(b"c", b"1", None).expect_err(phase);
+            assert_eq!(refused.error.name(), "OVERLOADED", "{phase}: {refused:?}");
+        };
+        overloaded(&db, "two applied entries fill a cap of 2");
+
+        let patience = crate::host::test_patience(Duration::from_secs(5));
+        let deadline = std::time::Instant::now() + patience;
+        while [first.request, second.request]
+            .iter()
+            .any(|request| !matches!(db.status(*request, None), Ok(TxnStatus::Unknown)))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the trim did not free both applied entries within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for original in [first, second] {
+            let failed = db
+                .resend(*original.sent)
+                .expect_err("a trimmed put runs afresh");
+            assert_eq!(failed.error.name(), "CONDITION_FAILED", "{failed:?}");
+        }
+        overloaded(&db, "two condition failures refill the cap");
+
+        let deadline = std::time::Instant::now() + patience;
+        let applied = loop {
+            match db.put(b"c", b"1", None) {
+                Ok(applied) => break applied,
+                Err(refused) => assert_eq!(refused.error.name(), "OVERLOADED", "{refused:?}"),
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the condition failures did not age out within {patience:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            applied.seq,
+            Seq(4),
+            "the first write published after the failures"
+        );
+        db.shutdown();
     }
 
     #[test]

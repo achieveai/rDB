@@ -329,7 +329,7 @@ The barrier waits for the in-flight transaction or obtains an immutable snapshot
 
 Within one active generation, primary reads pass the same authority gate and serial queue; they see an ordered whole-transaction prefix. Healthy secondary reads are not exposed in v1. After recovery, reads declare the new generation and may observe loss of previously acknowledged values.
 
-Dedup key is `(tenant, client_id, request_id)` scoped to its affinity group and generation; store request digest and result atomically. Same identity with changed payload is `REQUEST_ID_REUSE`. Keep dedup entries at least 24 hours; beyond retention callers cannot infer nonexecution from absence.
+Dedup key is `(tenant, client_id, request_id)` scoped to its affinity group and generation; store request digest and result atomically. Same identity with changed payload is `REQUEST_ID_REUSE`. Keep dedup entries at least 24 hours; beyond retention callers cannot infer nonexecution from absence. So a retry is deduplicated only inside the retention window: past it, a retry with the same identity is admitted as a new request and may apply again, at a new sequence, unless it names an expected generation that has since changed (clarified 2026-10-18, M9 S3; row M7A-89; [ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §4).
 
 A retry with stale expected generation returns `GENERATION_CHANGED` before any mutation. The caller must reconcile on recovery; it must not silently retry a lost-generation transaction as a new effect. A transaction received by a replica may recover even if its client never saw success.
 
@@ -349,7 +349,9 @@ stateDiagram-v2
   RecoveredOrLost --> [*]: caller reconciles generation
 ```
 
-**Takeaway:** only pre-admission rejection proves no mutation; post-apply failure is an unknown outcome resolved by status or recovery.
+**Takeaway:** only pre-admission rejection proves no mutation, and only by the submission it answers; post-apply failure is an unknown outcome resolved by status or recovery.
+
+**Client rule (amended 2026-10-18, M9 S3, #35):** once any send of a request ID went unanswered (a timeout, a lost reply or `UNKNOWN_OUTCOME`), only a status query with the same identity settles it, and only inside the dedup retention window (§5.3). A definitive rejection of a later resend does not settle it. Admission checks run before the dedup lookup, so a resend of a request that already applied can be refused, and that answer covers the resend alone ([ADR-rdb-0004](../ADRs/rdb/0004-transaction-contract.md) §3 and §5). While a write is applied but not yet published, status answers `UNKNOWN_OUTCOME`; ask again with the same identity.
 
 
 | Error | Retry rule |

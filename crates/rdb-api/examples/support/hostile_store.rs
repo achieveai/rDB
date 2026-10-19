@@ -18,13 +18,20 @@
 //! * [`HostileStore::fail_lists`] answers every `list` with one error until turned off
 //!   (`control fail list`), without reaching a voter, so the answer moves no binding.
 //!
+//! And one for scenario S3, a control-store reply that gets lost:
+//!
+//! * [`HostileStore::fail_puts`] arms a [`PutFault`] for the next `n` puts whose key starts
+//!   with a prefix (`control fail put`). Each matched put answers
+//!   `DeadlineExceededUnknownOutcome`: after the voter applied it (`lose-reply`), or without
+//!   sending it (`drop`). The count runs out, so the fault always ends by itself.
+//!
 //! It holds the cluster weakly, so `rdb_dev` can still take the cluster back to shut it down.
 //! Example-only: the product's Db takes any `ConfigStore` and knows nothing of voters.
 //!
 //! Written out by hand, as `src/test_store.rs` is, because `async-trait` is not a dependency of
 //! this crate.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -88,6 +95,40 @@ impl ListFault {
     }
 }
 
+/// What `control fail put` does to a matched put. Both answer `DeadlineExceededUnknownOutcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PutFault {
+    /// The voter applies the put; its answer is lost.
+    LoseReply,
+    /// The put never reaches a voter.
+    Drop,
+}
+
+impl PutFault {
+    /// The words `control fail put <prefix>` takes; `off` is `None`.
+    pub const WORDS: &'static str = "lose-reply|drop|off";
+
+    /// `control fail put <prefix> <word>`: `Some` fault, or `None` for `off`.
+    pub fn parse(word: &str) -> Result<Option<Self>, String> {
+        match word {
+            "lose-reply" => Ok(Some(Self::LoseReply)),
+            "drop" => Ok(Some(Self::Drop)),
+            "off" => Ok(None),
+            other => Err(format!(
+                "control fail put <prefix> <{}> [n], not {other:?}",
+                Self::WORDS
+            )),
+        }
+    }
+
+    const fn word(self) -> &'static str {
+        match self {
+            Self::LoseReply => "lose-reply",
+            Self::Drop => "drop",
+        }
+    }
+}
+
 /// Which voter the store talks to, and the voters it must not move to.
 struct Binding {
     voter: VoterId,
@@ -103,6 +144,8 @@ pub struct HostileStore {
     binding: Mutex<Binding>,
     /// The fault every `list` answers, while set.
     list_fault: Mutex<Option<ListFault>>,
+    /// Armed put faults by key prefix, each with the puts it has left.
+    put_faults: Mutex<BTreeMap<Vec<u8>, (PutFault, u64)>>,
     /// Bumped by [`HostileStore::drop_watches`]; every stream handed out ends on the next bump.
     ends: watch::Sender<u64>,
 }
@@ -135,6 +178,7 @@ impl HostileStore {
                 stopping: BTreeSet::new(),
             }),
             list_fault: Mutex::new(None),
+            put_faults: Mutex::new(BTreeMap::new()),
             ends: watch::channel(0).0,
         }
     }
@@ -240,6 +284,47 @@ impl HostileStore {
         tracing::info!(fault = ?fault, "control_store_fail_lists");
     }
 
+    /// `control fail put <prefix> <word> [n]`: the next `n` puts under `prefix` take `fault`,
+    /// then the fault is spent; `None` disarms `prefix` now. Re-arming a prefix replaces its
+    /// fault and count.
+    pub fn fail_puts(&self, prefix: &str, fault: Option<PutFault>, count: u64) {
+        let mut faults = self
+            .put_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match fault {
+            Some(fault) => faults.insert(prefix.as_bytes().to_vec(), (fault, count)),
+            None => faults.remove(prefix.as_bytes()),
+        };
+        tracing::info!(
+            prefix,
+            fault = fault.map(PutFault::word),
+            count,
+            "control_store_fail_puts"
+        );
+    }
+
+    /// The fault `key` takes, if an armed prefix matches it; that prefix's count goes down by
+    /// one, and the arm goes when it reaches zero.
+    fn put_fault(&self, key: &[u8]) -> Option<PutFault> {
+        let mut faults = self
+            .put_faults
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prefix = faults
+            .keys()
+            .find(|prefix| key.starts_with(prefix))
+            .cloned()?;
+        let (fault, left) = faults.get_mut(&prefix)?;
+        let fault = *fault;
+        *left -= 1;
+        if *left == 0 {
+            faults.remove(&prefix);
+            tracing::info!(prefix = %String::from_utf8_lossy(&prefix), "control_store_put_fault_spent");
+        }
+        Some(fault)
+    }
+
     /// `control drop-watches`: end every watch stream this store handed out. Each ends as a
     /// plain end of stream, which the Db reads as `Unavailable` and re-watches from its cursor.
     /// Returns how many were open.
@@ -299,7 +384,34 @@ impl ConfigStore for HostileStore {
         'a: 'b,
         Self: 'b,
     {
-        self.through(move |store| store.put(request))
+        let Some(fault) = self.put_fault(&request.key) else {
+            return self.through(move |store| store.put(request));
+        };
+        let key = String::from_utf8_lossy(&request.key).into_owned();
+        let expected = request.expected_mod_revision;
+        let sent = match fault {
+            PutFault::LoseReply => Some(self.through(move |store| store.put(request))),
+            PutFault::Drop => None,
+        };
+        Box::pin(async move {
+            let applied = match sent {
+                Some(sent) => match sent.await {
+                    Ok(response) => {
+                        format!("{:?} revision={}", response.outcome, response.revision)
+                    }
+                    Err(error) => format!("error {error}"),
+                },
+                None => "not sent".to_owned(),
+            };
+            tracing::info!(
+                key,
+                expected,
+                fault = fault.word(),
+                applied,
+                "control_store_put_failed"
+            );
+            Err(ConfigError::DeadlineExceededUnknownOutcome)
+        })
     }
 
     fn delete<'a, 'b>(&'a self, request: DeleteRequest) -> Reply<'b, MutationResponse>
@@ -555,6 +667,89 @@ mod tests {
         assert!(ended.is_ok(), "the stream did not end within 1 s");
 
         drop(stream);
+        drop(store);
+        let cluster = Arc::try_unwrap(cluster).expect("the only handle");
+        rt.block_on(cluster.shutdown());
+    }
+
+    /// M9 S3-3/S3-4 (`control fail put`): `lose-reply` applies the put and loses its answer;
+    /// `drop` never sends it; both answer `DeadlineExceededUnknownOutcome`. An arm covers only
+    /// its prefix and is spent after `n` puts, then puts go through again. One in-memory
+    /// cluster, well under a second.
+    #[test]
+    fn a_put_fault_loses_or_drops_n_puts_under_its_prefix_then_is_spent() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster = Arc::new(
+            rt.block_on(
+                Cluster::builder()
+                    .nodes(3)
+                    .storage(StorageKind::Ephemeral)
+                    .start(),
+            ),
+        );
+        let leader = rt.block_on(cluster.leader());
+        let store = HostileStore::new(&cluster, leader);
+        let put = |key: &'static [u8], value: &'static [u8]| {
+            rt.block_on(store.put(PutRequest {
+                key: Bytes::from_static(key),
+                value: Bytes::from_static(value),
+                expected_mod_revision: None,
+                dedup: None,
+            }))
+        };
+        let value = |key: &'static [u8]| {
+            rt.block_on(store.get(GetRequest {
+                key: Bytes::from_static(key),
+            }))
+            .expect("get")
+            .record
+            .map(|record| record.value)
+        };
+        let unknown = |answer: Result<MutationResponse, ConfigError>, what: &str| {
+            assert!(
+                matches!(answer, Err(ConfigError::DeadlineExceededUnknownOutcome)),
+                "{what}: {answer:?}"
+            );
+        };
+
+        assert_eq!(
+            ["lose-reply", "drop", "off"].map(|word| PutFault::parse(word).expect("a word")),
+            [Some(PutFault::LoseReply), Some(PutFault::Drop), None]
+        );
+        assert!(PutFault::parse("bogus").is_err());
+
+        store.fail_puts("grants/", Some(PutFault::LoseReply), 1);
+        assert!(
+            put(b"partitions/1", b"p").is_ok(),
+            "another prefix goes through"
+        );
+        unknown(put(b"grants/1", b"one"), "lose-reply");
+        assert_eq!(
+            value(b"grants/1"),
+            Some(Bytes::from_static(b"one")),
+            "applied"
+        );
+        assert!(put(b"grants/1", b"two").is_ok(), "spent after 1");
+
+        store.fail_puts("grants/", Some(PutFault::Drop), 2);
+        unknown(put(b"grants/1", b"three"), "drop, first");
+        unknown(put(b"grants/1", b"four"), "drop, second");
+        assert_eq!(
+            value(b"grants/1"),
+            Some(Bytes::from_static(b"two")),
+            "never sent"
+        );
+        assert!(put(b"grants/1", b"five").is_ok(), "spent after 2");
+
+        store.fail_puts("grants/", Some(PutFault::Drop), 5);
+        store.fail_puts("grants/", None, 0);
+        assert!(put(b"grants/1", b"six").is_ok(), "off disarms at once");
+        assert_eq!(value(b"grants/1"), Some(Bytes::from_static(b"six")));
+
         drop(store);
         let cluster = Arc::try_unwrap(cluster).expect("the only handle");
         rt.block_on(cluster.shutdown());
