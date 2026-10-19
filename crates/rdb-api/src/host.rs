@@ -6602,13 +6602,16 @@ mod tests {
     /// the host would trim it while held, when T1 has no entry for it yet, and never again:
     /// the entry would outlive the retention and the last resend would still replay.
     /// Trio (~5 s): a 300 ms retention; each wait is the retention plus one trim period and a
-    /// margin, so a trim tick falls after the write has aged.
+    /// margin, so a trim tick falls after the write has aged. The hold is 1.5 s, so L1's pause
+    /// age is 5 s here, not 2 s: one 850 ms host stall otherwise let it pause first and fail
+    /// the held write `UNKNOWN_OUTCOME` (A-R123).
     #[config_log::retcd_test]
     fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), |host| {
             Trio::fast(host);
             host.budgets.dedup_retention_millis = 300;
+            host.budgets.pause_age_millis = 5_000;
         });
         trio.bootstrap();
         trio.ready();
