@@ -180,6 +180,8 @@ const RENDER_PER_BYTE: usize = r#"{"$bytes":""},"#.len();
 /// Longer JSON (deep indentation, very long float spellings) is refused; send it with
 /// `--cbor-hex`.
 const MAX_JSON_TEXT: usize = RENDER_PER_BYTE * MAX_PAYLOAD;
+/// What a JSON integer refusal advises instead (`json.rs`).
+const JSON_INTEGER_ADVICE: &str = "write 0, write a float, or send it with --cbor-hex";
 /// `--cbor-hex` and `--hex` text: two digits per byte of the largest envelope, which leaves the
 /// header's length in digits for whitespace around a payload's hex.
 const MAX_HEX_TEXT: usize = 2 * MAX_ENVELOPE;

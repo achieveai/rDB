@@ -2,12 +2,14 @@
 //! (this crate) and `rdb_dev` (`rdb-api`). One copy, so the M8 input fixes (a duplicate key,
 //! `-0`, an integer past 64 bits, a bad surrogate) hold in both.
 //!
-//! Its includer's root supplies `arg_text`, `Failure` (with `Failure::refused(error, detail)`)
-//! and `MAX_JSON_TEXT`. An item one includer does not use carries `#[allow(dead_code)]`.
+//! Its includer's root supplies `arg_text`, `Failure` (with `Failure::refused(error, detail)`),
+//! `MAX_JSON_TEXT` and `JSON_INTEGER_ADVICE`, what to do instead of an integer JSON cannot carry
+//! (only `doc_scenario` has `--cbor-hex`). An item one includer does not use carries
+//! `#[allow(dead_code)]`.
 
 use rdb_value::value::{Float, Int, Map, MapKey, Value};
 
-use super::{arg_text, Failure, MAX_JSON_TEXT};
+use super::{arg_text, Failure, JSON_INTEGER_ADVICE, MAX_JSON_TEXT};
 
 /// One JSON value read whole from an argument (or `@FILE`), with nothing after it but
 /// whitespace.
@@ -46,7 +48,7 @@ fn refuse_float_integers(text: &str) -> Result<(), Failure> {
             "JsonInput".into(),
             format!(
                 "integer {token} would become a float through JSON input (it is -0 or does not \
-                 fit 64 bits); write 0, write a float, or send it with --cbor-hex"
+                 fit 64 bits); {JSON_INTEGER_ADVICE}"
             ),
         )),
         None => Ok(()),
@@ -248,8 +250,10 @@ pub fn render(value: &Value) -> String {
 
 /// The output rule that keeps tagged scalars apart from maps: a map key starting with `$` gets
 /// one more `$` (`$bytes` → `$$bytes`, `$$x` → `$$$x`). A key with a single leading `$` is
-/// therefore always a tag. Input needs no rule: JSON input has no tagged forms, so every JSON
-/// object is a map with its keys as written.
+/// therefore always a tag. [`json_input`] and [`json_value`] read no tagged form and undo no
+/// escape: every JSON object they read is a map with its keys as written. `rdb_dev` reads one
+/// form itself, `{"$bytes":"<hex>"}` where it takes a map key or a set member (A-R121); a
+/// `$$bytes` there stays a map.
 fn escape_key(key: &str) -> String {
     if key.starts_with('$') {
         format!("${key}")

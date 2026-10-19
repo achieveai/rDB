@@ -401,7 +401,9 @@ pub struct PutOp {
 }
 
 /// What one write changes. The kind of the object is fixed when it is created; a change of
-/// another kind is `INVALID_ARGUMENT` (`KindMismatch`).
+/// another kind is `INVALID_ARGUMENT` (`KindMismatch`). `Chunk` and `Gc` are the exceptions:
+/// neither reads the object's kind. A chunk is stored under an object of any kind, or none,
+/// and only its publish is refused (A-R127); a gc deletes the chunks that no blob names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     /// Document ops, applied in order to the whole document (ADR-rdb-0012).

@@ -1337,6 +1337,9 @@ fn uncommented(line: &str) -> &str {
 /// The size limit `json.rs` reads an argument under. `rdb_dev` reads its values from the
 /// line instead, so this only satisfies the shared file's import.
 const MAX_JSON_TEXT: usize = 1 << 20;
+/// What a JSON integer refusal advises instead. `rdb_dev` has no CBOR input, so not `--cbor-hex`
+/// (tester P1-2).
+const JSON_INTEGER_ADVICE: &str = "write 0 or write a float";
 
 /// A JSON input refusal, as `json.rs` builds it.
 #[derive(Debug)]
@@ -2258,7 +2261,8 @@ enum Kind {
     },
     /// A txn.
     Txn,
-    /// A value write (`doc`): resent unchanged, never with another payload (S4 A-5).
+    /// A `Db::write`: `doc`, `map`, `set`, `list` or a `blob` line. Resent unchanged, never with
+    /// another payload (S4 A-5).
     Value,
 }
 
