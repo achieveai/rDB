@@ -7058,10 +7058,10 @@ mod tests {
         );
         let stale = Some(Expected::Version(4));
         for (what, call) in [
-            ("a chunk", chunk_call(8, b"b", 0, b"HELL", stale.clone())),
+            ("a chunk", chunk_call(8, b"b", 0, b"HELL", stale)),
             (
                 "a gc",
-                compile_change(9, b"b", Change::Gc { floor: 4 }, stale.clone()),
+                compile_change(9, b"b", Change::Gc { floor: 4 }, stale),
             ),
         ] {
             assert_eq!(
