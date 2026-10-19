@@ -1,4 +1,4 @@
-<!-- drift-basis: 7d8fa9c -->
+<!-- drift-basis: 90cfbdd5e33d5855eb258a88ab159bad1324113d -->
 
 # M7 kernel-b test plan: R1 replication, L1 protection, F1 recovery
 
