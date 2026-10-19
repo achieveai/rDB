@@ -772,6 +772,12 @@ fn waits_on_line(
     let seq = owner.waits_on.filter(|_| owner.fence.is_none())?;
     let node = owner.node.0;
     let what = match owner.in_flight {
+        // The kernel's own start record carries a reserved id, not a client's (PB-3).
+        Some(request)
+            if request == rdb_core::contracts::ids::RequestIdentity::START_RECORD.request =>
+        {
+            format!("the start record's outcome (seq {})", seq.0)
+        }
         Some(request) => format!("request {}'s outcome (seq {})", request.0, seq.0),
         None => format!("the outcome of seq {}", seq.0),
     };
@@ -2415,10 +2421,34 @@ fn status_line(db: &Db, sent: &Sent, request: &str, rest: &[&str]) -> Result<(),
             let ours = sent.by_id.contains_key(&request);
             say(&unknown_line(ours, in_flight, &restarted, note.as_deref()));
         }
-        Ok(status) => say(&format!("status {status:?}")),
+        Ok(status) => say(&known_status_line(request, &status)),
         Err(error) => say(&format!("err {} ({})", error.name(), error.detail)),
     }
     Ok(())
+}
+
+/// A `status` answer other than `Unknown`, in plain numbers as a put's `ok` line (PB-2).
+fn known_status_line(request: u64, status: &TxnStatus) -> String {
+    use rdb_core::contracts::txn::Outcome;
+    match status {
+        TxnStatus::Resolved(result) => format!(
+            "status resolved: {} p={} gen={} seq={} epoch={} {:?} request={request}",
+            match result.outcome {
+                Outcome::Published => "published",
+                Outcome::RecoveredApplied => "recovered-applied",
+            },
+            result.partition.0,
+            result.generation.0,
+            result.seq.0,
+            result.owner_epoch.0,
+            result.durability,
+        ),
+        TxnStatus::Unresolved { seq } => {
+            format!("status unresolved: seq={} request={request}", seq.0)
+        }
+        TxnStatus::Unknown => "status Unknown".to_owned(),
+        TxnStatus::Expired => format!("status expired request={request}"),
+    }
 }
 
 /// The nodes that restarted, from each node's boot (`boot_of`), never from the nodes that
