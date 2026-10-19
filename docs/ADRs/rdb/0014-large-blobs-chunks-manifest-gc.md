@@ -560,6 +560,10 @@ seen to fail under a named fault (a mutant), then pass.
   (Status 2026-10-19, M9 S4, A-R113 C-5: M10, with upload sessions (O1). In M9 GC runs on request.)
 - **O6 Lazy snapshot** for large blobs.
 - **O7 Inline binary:** the API threshold between a bytes document and a blob.
+  (Status 2026-10-19, M9 S4: closed for M9 with no threshold. The app picks. `Db::put` writes a
+  byte-string document, and `Change::Chunk` with `Change::Publish` writes a blob. `rdb-api` never
+  switches between them: a value too large for a document is refused `INVALID_ARGUMENT`, not stored
+  as a blob. Nothing is carried to M10.)
 - **O8 Compression or encryption:** a new `codec_version` on chunk records.
 - **O9 The generation fence for every compile (lead):** document and collection requests have the same
   version-reuse exposure as a lost update (ADR-rdb-0012 §11, ADR-rdb-0013). If ruled general, it moves
