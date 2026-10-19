@@ -1377,6 +1377,11 @@ impl<'a> Words<'a> {
                     (Some((name, Value::Text(text))), None) if name.as_str() == "$bytes" => {
                         Some(text.clone())
                     }
+                    (Some((name, _)), None) if name.as_str() == "$bytes" => {
+                        return Err(format!(
+                            r#"{what}: $bytes needs a hex string, as {{"$bytes":"00ff"}}"#
+                        ));
+                    }
                     _ => None,
                 }
             }
@@ -3998,6 +4003,12 @@ mod tests {
         );
         let refused = parse_change(r#"set s add {"$bytes":"zz"}"#).expect_err("zz is not hex");
         assert!(refused.contains("is not hex"), "{refused}");
+        // P3-2 (A-R124c): a `$bytes` that is not a string names the form it expects.
+        let refused = parse_change(r#"set s add {"$bytes":1}"#).expect_err("1 is not hex text");
+        assert!(
+            refused.contains(r#"$bytes needs a hex string, as {"$bytes":"00ff"}"#),
+            "{refused}"
+        );
         let (_, _, escaped) = parse_change(r#"set s add {"$$bytes":"00"}"#).expect("a set line");
         assert!(
             matches!(&escaped, Change::Set(ops) if matches!(ops[..], [ElemOp::Add(Value::Map(_))])),
