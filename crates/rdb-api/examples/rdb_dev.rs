@@ -104,8 +104,10 @@
 //!                                         delete answers `unchanged (nothing to collect)`
 //! read <object> [--offset O --len L]      read a blob at the publication barrier: `blob
 //!                                         version=V size=S chunks=N upload=U ...`, with
-//!                                         `bytes="..."` for a range of at least one byte
-//! get <object>                           read at the publication barrier: `value=` for a byte
+//!                                         `bytes="..."` for a range of at least one byte.
+//!                                         Without `--offset`/`--len` it reads the manifest
+//!                                         only, so a damaged chunk shows on a range read only
+//! get <object>                         read at the publication barrier: `value=` for a byte
 //!                                         string, `doc=<json>` for any other document
 //! get <object> --previous                 read the previously published view at once, never
 //!                                         waiting for a write in flight (ReadPrevious)
@@ -151,7 +153,9 @@
 //!                                         never lets a restarted owner write again in M9
 //! admin damage-chunk <o> --upload U --index I
 //!                                         dev only: overwrite that stored chunk with other
-//!                                         bytes, so reading the blob is `CORRUPT_BLOB`
+//!                                         bytes, so a range read over it (`--offset`/`--len`)
+//!                                         is `CORRUPT_BLOB`. A plain `read` reads the
+//!                                         manifest only and does not see it
 //! control                                 the partitions/ and grants/ records in rEtcd, read
 //!                                         from the rEtcd leader now, never through the Db's
 //!                                         store

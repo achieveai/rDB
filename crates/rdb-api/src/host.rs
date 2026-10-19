@@ -3344,6 +3344,8 @@ impl Host {
                 view.version(Namespace::User, root.as_bytes())
                     .map_or(Expected::Absent, Expected::Version)
             });
+            // The damaged chunk a Chunk or Publish arm met, with its upload, for the log (A-R132).
+            let mut chunk = None;
             let compiled = match &put.change {
                 Change::Doc(delta) => {
                     rdb_value::compile(view, &root, expected, delta).map_err(|e| compile_error(&e))
@@ -3377,8 +3379,10 @@ impl Host {
                     upload,
                     index,
                     bytes,
-                } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes)
-                    .map_err(|e| compile_error(&e)),
+                } => rdb_value::blob::put_chunk(view, &root, upload, *index, bytes).map_err(|e| {
+                    chunk = damaged_chunk(&e).map(|index| (*upload, index));
+                    compile_error(&e)
+                }),
                 // `serving` is the adopted generation the request will be fenced with
                 // (ADR-rdb-0014 §6 check 0).
                 Change::Publish {
@@ -3396,7 +3400,10 @@ impl Host {
                     sha256,
                     generation,
                 )
-                .map_err(|e| compile_error(&e))
+                .map_err(|e| {
+                    chunk = damaged_chunk(&e).map(|index| (*upload, index));
+                    compile_error(&e)
+                })
                 .and_then(|compiled| {
                     if compiled.mutations.is_empty() {
                         already_published(view, &root, published)?;
@@ -3410,7 +3417,7 @@ impl Host {
                     mutations.extend(compiled.mutations);
                 }
                 Err(mut refused) => {
-                    log_stored_damage(self.node, &root, &refused);
+                    log_stored_damage(self.node, &root, &refused, chunk);
                     refused.detail = format!("op {index}: {}", refused.detail);
                     return Ok(Err(refused));
                 }
@@ -4057,6 +4064,8 @@ fn object_answer(
     outcome: ReadServiceOutcome,
 ) -> Result<Answer, String> {
     let (generation, at) = (view.generation(), view.at());
+    // A range read's upload, from the manifest it opened, for a damaged chunk's log (A-R132).
+    let mut upload = None;
     let seen = match look {
         Look::Doc => rdb_value::read(view, root).map(|found| found.map_or(Seen::Absent, Seen::Doc)),
         Look::Members { after, limit } => {
@@ -4092,6 +4101,7 @@ fn object_answer(
         }
         Look::Range { offset, len } => rdb_value::blob::read_blob(view, root).and_then(|blob| {
             let blob = blob.ok_or(ApplyError::ObjectAbsent)?;
+            upload = Some(blob.manifest.upload);
             rdb_value::blob::read_range(view, root, *offset, *len)
                 .map(|bytes| Seen::Range { blob, bytes })
         }),
@@ -4110,8 +4120,9 @@ fn object_answer(
             at,
         },
         Err(error) => {
+            let chunk = upload.zip(damaged_chunk(&error));
             let error = compile_error(&error);
-            log_stored_damage(node, root, &error);
+            log_stored_damage(node, root, &error, chunk);
             Answer::Error {
                 error,
                 request: None,
@@ -4120,10 +4131,25 @@ fn object_answer(
     })
 }
 
+/// The index of the chunk a blob refusal found damaged: one that does not open, is not the one
+/// the manifest names, or is missing.
+const fn damaged_chunk(error: &ValueError) -> Option<u32> {
+    match error {
+        ValueError::Corrupt(
+            Corrupt::Chunk { index, .. }
+            | Corrupt::ChunkMismatch { index }
+            | Corrupt::ChunkMissing { index },
+        ) => Some(*index),
+        _ => None,
+    }
+}
+
 /// Stored damage a compile or a read found, refused as `CORRUPT_BLOB` or `CORRUPT_HISTORY`: one
 /// warn line naming the object and the kind (review F-005), since the caller's refusal reaches
-/// no log of its own.
-fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError) {
+/// no log of its own. `chunk` adds `upload` (hex) and `index` where the finder knew them: a
+/// chunk that failed its check (A-R132). Damage to the manifest itself names no upload, so the
+/// line leaves both out rather than guess one.
+fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError, chunk: Option<(Upload, u32)>) {
     if !matches!(
         error.kind,
         ErrorKind::CorruptBlob | ErrorKind::CorruptHistory
@@ -4134,13 +4160,24 @@ fn log_stored_damage(node: NodeId, root: &RootKey, error: &ApiError) {
         Ok(parsed) => String::from_utf8_lossy(&parsed.object_id).into_owned(),
         Err(fault) => format!("(root key {:?} does not parse: {fault})", root.as_bytes()),
     };
-    tracing::warn!(
-        node = node.0,
-        %object,
-        kind = %error.name(),
-        detail = %error.detail,
-        "stored_damage"
-    );
+    match chunk {
+        Some((upload, index)) => tracing::warn!(
+            node = node.0,
+            %object,
+            kind = %error.name(),
+            upload = %format!("{:032x}", u128::from_be_bytes(upload)),
+            index,
+            detail = %error.detail,
+            "stored_damage"
+        ),
+        None => tracing::warn!(
+            node = node.0,
+            %object,
+            kind = %error.name(),
+            detail = %error.detail,
+            "stored_damage"
+        ),
+    }
 }
 
 const fn client_name(event: &ClientEvent) -> &'static str {
