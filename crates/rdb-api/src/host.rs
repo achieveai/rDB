@@ -6601,8 +6601,9 @@ mod tests {
     /// trim takes it, and a resend runs afresh and fails its condition. Aged from the commit,
     /// the host would trim it while held, when T1 has no entry for it yet, and never again:
     /// the entry would outlive the retention and the last resend would still replay.
-    /// Trio (~5 s): a 300 ms retention; each wait is the retention plus one trim period and a
-    /// margin, so a trim tick falls after the write has aged.
+    /// Trio (~4 s): a 300 ms retention. The hold ends at node 1's first trim tick once the
+    /// write is 300 ms old; the wait after publication is the retention, a trim period and a
+    /// margin.
     #[config_log::retcd_test]
     fn a_write_held_past_the_retention_ages_from_its_publication_not_its_commit() {
         let dir = config_testkit::fs::temp_dir();
@@ -6628,12 +6629,15 @@ mod tests {
         trio.until("node 1 applied request 3", |trio| {
             (trio.head() == Some(3)).then_some(())
         });
-        let healed = trio
-            .clock
-            .now()
-            .plus_millis(300 + HOST_TRIM_EVERY_MILLIS + 200);
+        // A-R124a: held until node 1's first trim tick at or past the write's age, 0.3 to
+        // 1.3 s, not a fixed 1.5 s, since P1 answers a held write UNKNOWN_OUTCOME 2 s after it
+        // applies. A tick that trims nothing logs nothing, so the tick is read from
+        // `next_trim`, which each tick sets to its own time plus the period.
+        // Residual exposure: a stall over about 2 s minus this hold still crosses that deadline.
+        let aged = trio.clock.now().plus_millis(300);
         trio.until("held past the retention and then a trim tick", |trio| {
-            (trio.clock.now() >= healed).then_some(())
+            let ticked = trio.nodes[0].0.next_trim.0 - HOST_TRIM_EVERY_MILLIS;
+            (ticked >= aged.0).then_some(())
         });
         trio.links.heal_all();
         match trio.answer(&answer) {
