@@ -1,6 +1,6 @@
 # Test Plan — M7, team kernel-a (A1, T1, P1)
 
-<!-- drift-basis: 7d8fa9c -->
+<!-- drift-basis: 90cfbdd5e33d5855eb258a88ab159bad1324113d -->
 
 **Status:** Proposed — test planner deliverable, **correction round 5** (critic-kernel-a round 3
 findings **TD-12..TD-20** applied over round 4's TD-01..TD-11 and round 3's T-A-01..15; §8.7 holds

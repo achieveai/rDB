@@ -354,7 +354,8 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
   value protects that reader. So GC must not run while a reader, read session or backup older than the GC
   snapshot may still read the object. **In M8 there is none:** every read is one engine snapshot, and
   both engines' snapshots are owned copies (Context). Read sessions (M9) and backups (M10) need a second
-  input, Open O2.
+  input, Open O2. (Status 2026-10-19, M9 S4, A-R113 C-5: read sessions are carried to M10. In M9
+  every read is one step view, and nothing promises consistency across calls.)
 - **Output:** `Delete`s in key order, each with `expected_version: Some(its version)`, plus **one root
   guard**: `VersionEquals{root, v}`, or `Absent{root}` when there is no root. A batch stops at 255
   `Delete`s (`MAX_REQUEST_MUTATIONS`) **or** when one more would put `record_len` over
@@ -378,6 +379,7 @@ ruling L-R186v). There, `Compiled` already carries `conditions: Vec<Condition>` 
     `Delete`, so ADR-rdb-0010 decision 6's copy "as of `base`" is exact. `History` retention is ADR-rdb-0010 O4.
   - Lagging replicas apply the same records in order. Read sessions across requests and backups: Open O2, O3.
 - Which objects to visit, and when, is a scheduler's job: M9 or M10 (Open O5).
+  (Status 2026-10-19, M9 S4, A-R113 C-5: M10. In M9 GC runs only when the app asks for it.)
 
 ### 9. Integrity rule (ADR-rdb-0013 decision 11) for blobs
 - Chunk and manifest records are written only by `rdb-value`'s compiled output, as decision 11 says for
@@ -517,12 +519,16 @@ seen to fail under a named fault (a mutant), then pass.
 
 ## Open (none blocks S5)
 - **O1 Upload sessions (M9):** who mints `upload_id`, the abandonment timeout, and the GC `floor`.
+  (Status 2026-10-19, M9 S4, A-R114 Q1: in M9 the caller mints `upload_id` and passes the GC
+  `floor`. Upload sessions and the abandonment timeout are carried to M10, with GC scheduling (O5).)
 - **O2 Read sessions (M9) and backups (M10):** `floor` cannot protect them (decision 8); rev 1's "or the
   floor must also cover it" is withdrawn. Either the reader holds one engine snapshot for its whole life,
   or GC gets a second input: the oldest retained reader's `seq`, compared with when a chunk became
   unreachable. A present root bounds that from above by its own version. A deleted root leaves no
   version, so a delete would need to leave its `seq` somewhere, such as a tombstone root kind. That is a
   stored-format choice for M9, not a constant. A lazy `RocksSnapshot` must pin a RocksDB snapshot.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: read sessions and the tombstone choice are carried to M10.
+  M9 has no read session across calls, so nothing in M9 needs the second input.)
 - **O3 Replication (M10):** the upload stream, 256 KiB frames, the prepared-secondary token,
   `BLOB_DEPENDENCY_UNAVAILABLE`, and V14's ACK clause. If M10 writes chunks outside transactions, it must
   give them a version **from the partition's own `seq`**, checked by the kernel at apply, or both guards
@@ -530,6 +536,7 @@ seen to fail under a named fault (a mutant), then pass.
 - **O4 Id length (ADR-rdb-0013 O1):** an id limit of 3,745 bytes or less keeps a full chunk writable.
   GC no longer depends on it (decision 8's byte bound).
 - **O5 GC scheduling (M9/M10):** which objects to visit, and a key-only scan so GC does not load chunk values.
+  (Status 2026-10-19, M9 S4, A-R113 C-5: M10, with upload sessions (O1). In M9 GC runs on request.)
 - **O6 Lazy snapshot** for large blobs.
 - **O7 Inline binary:** the API threshold between a bytes document and a blob.
 - **O8 Compression or encryption:** a new `codec_version` on chunk records.
@@ -544,6 +551,13 @@ seen to fail under a named fault (a mutant), then pass.
   refusal of a retry (the fence, a condition, an `expected_version` or the compile), the executor
   re-reads a fresh snapshot and compiles again before it reports failure (decision 6, check 0
   precondition).
+  **Amended 2026-10-19 (M9 S4, A-R113 C-4, A-R114 Q3): in M9 the app re-issues, not the executor.**
+  `Db` keeps no re-read-and-compile step after a refused retry: it reports the refusal as the kernel
+  gave it (`CONDITION_FAILED request=<R>`, S4 recipe 4o). The app then sends the same change again
+  as a new request, which compiles on a fresh snapshot. A re-issued publish answers "unchanged"
+  only when the root's version is at or below the host's published seq for that partition; above
+  it, the answer is `UNKNOWN_OUTCOME` and nothing is sent (S4 edge 4h, A-R113 C-3). `Gc`'s empty
+  answer and `put_chunk`'s "already stored" are exempt from that check (A-R113 C-3).
 
 ## References
 - Spec §4.2, §4.3, §4.3.1, §5.4; validation plan V14.
