@@ -3876,14 +3876,28 @@ fn already_published(
         {
             Ok(())
         }
-        _ => Err(ApiError::new(
-            ErrorKind::UnknownOutcome,
-            format!(
-                "the blob is at the root (version {version:?}) but not published yet (published \
-                 {published:?}, view generation {}); ask the status of the publish that wrote it",
-                view.generation().0
-            ),
-        )),
+        _ => {
+            let at = version.map_or_else(|| "-".to_owned(), |v| v.to_string());
+            let through = match published {
+                Some((generation, seq)) if generation == view.generation() => {
+                    format!("published only through seq {}", seq.0)
+                }
+                Some((generation, seq)) => format!(
+                    "published through seq {} of generation {}, not generation {}",
+                    seq.0,
+                    generation.0,
+                    view.generation().0
+                ),
+                None => "nothing published yet".to_owned(),
+            };
+            Err(ApiError::new(
+                ErrorKind::UnknownOutcome,
+                format!(
+                    "the blob is at version {at}, {through}; ask the status of the publish that \
+                     wrote it"
+                ),
+            ))
+        }
     }
 }
 
