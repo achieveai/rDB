@@ -6653,6 +6653,11 @@ mod tests {
         trio.until("aged from its publication, then a trim tick", |trio| {
             (trio.clock.now() >= aged).then_some(())
         });
+        // A-R123: by now the grant may have expired and fenced node 1, and a resend inside that
+        // window is refused `LEASE_EXPIRED` rather than run. Waiting only ages the entry more.
+        trio.until("node 1 admits writes", |trio| {
+            (trio.status(0).admits == Some(true)).then_some(())
+        });
         match trio.ask(ClientCall::Resend { request: held }) {
             Answer::Error { error, .. } => {
                 assert_eq!(error.kind, ErrorKind::ConditionFailed, "{error:?}");
