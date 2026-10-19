@@ -6970,13 +6970,17 @@ mod tests {
         bytes: &'static [u8],
         expect: Option<Expected>,
     ) -> ClientCall {
-        let bytes = Bytes::from_static(bytes);
-        let change = Change::Chunk {
-            upload: U1,
-            index,
-            bytes,
-        };
+        let change = chunk_of(U1, index, bytes);
         compile_change(request, object, change, expect)
+    }
+
+    /// Chunk `index` of `upload`.
+    fn chunk_of(upload: Upload, index: u32, bytes: &'static [u8]) -> Change {
+        Change::Chunk {
+            upload,
+            index,
+            bytes: Bytes::from_static(bytes),
+        }
     }
 
     /// A compile of the publish of `blob`, uploaded as [`U1`] in chunks of 4.
@@ -6986,14 +6990,18 @@ mod tests {
         blob: &[u8],
         expect: Option<Expected>,
     ) -> ClientCall {
+        compile_change(request, object, publish_of(U1, blob), expect)
+    }
+
+    /// The publish of `blob`, uploaded as `upload` in chunks of 4.
+    fn publish_of(upload: Upload, blob: &[u8]) -> Change {
         use sha2::Digest as _;
-        let change = Change::Publish {
-            upload: U1,
+        Change::Publish {
+            upload,
             size: blob.len() as u64,
             chunk_size: 4,
             sha256: sha2::Sha256::digest(blob).into(),
-        };
-        compile_change(request, object, change, expect)
+        }
     }
 
     /// A refusal as `(kind, retry, no_mutation, whether it names a request)`.
@@ -7164,6 +7172,180 @@ mod tests {
         match trio.ask(publish(4)) {
             Answer::Unchanged => {}
             other => panic!("the publish once published: {other:?}"),
+        }
+    }
+
+    /// Review F-002, the Set arm: arch §4 guard 2. A set change compiled at version 2 and sent
+    /// after another write moved the set to 3 is refused by the kernel, on the version the
+    /// compile attached. Mutant m15 (the Set arm's version guard cut from what it compiles)
+    /// publishes it. Trio, about 1 s.
+    #[test]
+    fn a_set_change_sent_after_the_set_moved_is_refused_by_the_kernel() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let add = |n| Change::Set(vec![ElemOp::Add(int(n))]);
+        let created = compile_change(1, b"s", add(1), Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let stale = trio.compiled(compile_change(2, b"s", add(2), None));
+        assert_eq!(trio.write(compile_change(3, b"s", add(3), None)), Ok(3));
+        assert_eq!(
+            trio.sent(stale),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "compiled at version 2, sent at 3"
+        );
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(4, b"s", members) {
+            Ok(Seen::Members(page)) => {
+                let keys: Vec<_> = page.members.into_iter().map(|m| m.key).collect();
+                assert_eq!(keys, vec![int(1), int(3)], "2 was never added");
+            }
+            other => panic!("members of s: {other:?}"),
+        }
+    }
+
+    /// Review F-002, the Publish arm: arch §4 guard 2. A publish of upload 2 compiled over the
+    /// blob at version 3 and sent after a publish of upload 3 replaced it is refused by the
+    /// kernel. Mutant m16 (the Publish arm's version guard cut from what it compiles) publishes
+    /// it. Trio, about 1 s.
+    #[test]
+    fn a_publish_sent_after_the_blob_moved_is_refused_by_the_kernel() {
+        const U2: Upload = [2; 16];
+        const U3: Upload = [3; 16];
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"p", 0, b"abcd", None)), Ok(2));
+        let first = publish_call(2, b"p", b"abcd", Some(Expected::Absent));
+        assert_eq!(trio.write(first), Ok(3));
+        let chunk = |request, upload, bytes| {
+            compile_change(request, b"p", chunk_of(upload, 0, bytes), None)
+        };
+        assert_eq!(trio.write(chunk(3, U2, b"wxyz")), Ok(4));
+        assert_eq!(trio.write(chunk(4, U3, b"1234")), Ok(5));
+        let stale = trio.compiled(compile_change(5, b"p", publish_of(U2, b"wxyz"), None));
+        let replace = publish_of(U3, b"1234");
+        let replace = compile_change(6, b"p", replace, Some(Expected::Version(3)));
+        assert_eq!(trio.write(replace), Ok(6));
+        assert_eq!(
+            trio.sent(stale),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "compiled over version 3, sent at 6"
+        );
+        match trio.look(7, b"p", Look::Range { offset: 0, len: 4 }) {
+            Ok(Seen::Range { blob, bytes }) => assert_eq!(
+                (blob.version, blob.manifest.upload, bytes),
+                (6, U3, Bytes::from_static(b"1234"))
+            ),
+            other => panic!("a range read of p: {other:?}"),
+        }
+    }
+
+    /// Review F-003: arch §4 guards 2 and 12 together. A list edit with a stale guard and a
+    /// position outside the list is CONDITION_FAILED, not INVALID_ARGUMENT: the guard is
+    /// compiled first, so a write that raced this one reads as the race. So is an edit to a
+    /// list that is not there. Mutant m17 (`list_compile` returns the position's refusal without
+    /// compiling the guard) answers INVALID_ARGUMENT for both. Trio, about 1 s.
+    #[test]
+    fn a_stale_list_edit_at_a_bad_position_is_a_condition_failure() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let push = |s: &str| ListEdit::Push(text(s));
+        let created = Change::List(vec![push("a"), push("b"), push("c")]);
+        let created = compile_change(1, b"l", created, Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let more = compile_change(2, b"l", Change::List(vec![push("d")]), None);
+        assert_eq!(trio.write(more), Ok(3));
+        for (request, object, at) in [(3, &b"l"[..], -5), (4, &b"none"[..], 0)] {
+            let call = ClientCall::Compile {
+                identity: identity(request),
+                puts: vec![PutOp {
+                    group: AFFINITY,
+                    object: Bytes::copy_from_slice(object),
+                    change: Change::List(vec![ListEdit::Remove { at }]),
+                    expect: Some(Expected::Version(2)),
+                }],
+                remaining_millis: 5_000,
+            };
+            assert_eq!(
+                trio.write(call),
+                Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
+                "remove {at} at version 2 of {object:?}"
+            );
+        }
+    }
+
+    /// Review F-004: a gc's floor reaches `collect_garbage` as the caller gave it. Two chunks of
+    /// an upload nothing publishes, at versions 2 and 3: a gc with floor 2 deletes the first and
+    /// keeps the second, so the first compiles to a write again and the second to nothing.
+    /// Mutant m18a (floor 0) collects nothing, so the gc answers `Unchanged`; m18b (floor
+    /// `u64::MAX`) collects both. Trio, about 1 s.
+    #[test]
+    fn a_gc_deletes_the_unnamed_chunks_at_or_below_its_floor_and_keeps_the_rest() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"g", 0, b"abcd", None)), Ok(2));
+        assert_eq!(trio.write(chunk_call(2, b"g", 1, b"ef", None)), Ok(3));
+        let gc = compile_change(3, b"g", Change::Gc { floor: 2 }, None);
+        assert_eq!(trio.write(gc), Ok(4));
+        match trio.ask(chunk_call(4, b"g", 0, b"abcd", None)) {
+            Answer::Compiled(_) => {}
+            other => panic!("chunk 0, at version 2, was collected: {other:?}"),
+        }
+        match trio.ask(chunk_call(5, b"g", 1, b"ef", None)) {
+            Answer::Unchanged => {}
+            other => panic!("chunk 1, at version 3, was kept: {other:?}"),
+        }
+    }
+
+    /// Review F-008, the `GenerationChanged` half of a stale token (C-2): a token from another
+    /// generation is `STALE_CONTINUATION`, retry `Reconcile`, as one from another list version
+    /// is. Forged here, since no generation changes in a Trio row. Mutant m21 (that variant cut
+    /// from the arm) answers `INVALID_ARGUMENT`. Trio, about 1 s.
+    #[test]
+    fn a_token_from_another_generation_must_reconcile() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let created = Change::List(vec![ListEdit::Push(text("a")), ListEdit::Push(text("b"))]);
+        let created = compile_change(1, b"l", created, Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let first = match trio.look(2, b"l", Look::Items { at: 0, limit: 1 }) {
+            Ok(Seen::Items(items)) => items,
+            other => panic!("items of l: {other:?}"),
+        };
+        let token = first.next.expect("a page of 1 of 2 has a next token");
+        let forged = Token {
+            generation: Generation(token.generation.0 + 1),
+            ..token
+        };
+        match trio.look(
+            3,
+            b"l",
+            Look::ItemsAfter {
+                token: forged,
+                limit: 10,
+            },
+        ) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry),
+                (ErrorKind::StaleContinuation, RetryRule::Reconcile),
+                "{error:?}"
+            ),
+            Ok(seen) => panic!(
+                "a token from generation {} read: {seen:?}",
+                forged.generation.0
+            ),
         }
     }
 
@@ -7413,6 +7595,19 @@ mod tests {
                 Answer::Error { error, .. } => return Err(Refused::AtCompile(error.kind)),
                 other => panic!("compile: {other:?}"),
             };
+            self.sent(request)
+        }
+
+        /// The request `call` compiles to, not yet sent.
+        fn compiled(&mut self, call: ClientCall) -> TxnRequest {
+            match self.ask(call) {
+                Answer::Compiled(request) => request,
+                other => panic!("compile: {other:?}"),
+            }
+        }
+
+        /// Send `request`, as [`Self::write`] does once it has compiled.
+        fn sent(&mut self, request: TxnRequest) -> Result<u64, Refused> {
             match self.ask(ClientCall::Resend { request }) {
                 Answer::Txn { result, .. } => Ok(result.seq.0),
                 Answer::Error { error, .. } => Err(Refused::ByKernel(error.kind)),
@@ -7637,6 +7832,33 @@ mod tests {
         }
     }
 
+    /// Review F-008: an insert may name the count, the end of the list; no other edit may.
+    /// Mutant m19 (the end never allowed) refuses it. Unit.
+    #[test]
+    fn an_insert_at_the_count_adds_at_the_end() {
+        let z = Value::Text("z".to_owned());
+        assert_eq!(
+            resolve_edits(
+                &[ListEdit::Insert {
+                    at: 3,
+                    value: z.clone()
+                }],
+                3
+            ),
+            Ok(vec![ListOp::Insert { at: 3, value: z }])
+        );
+    }
+
+    /// Review F-008: a move's destination counts from the end when negative, as its source
+    /// does: `-1` is the last position. Mutant m20 (`to` never resolved) refuses it. Unit.
+    #[test]
+    fn a_move_to_a_negative_position_counts_from_the_end() {
+        assert_eq!(
+            resolve_edits(&[ListEdit::Move { from: 0, to: -1 }], 3),
+            Ok(vec![ListOp::Move { from: 0, to: 2 }])
+        );
+    }
+
     /// S4-3 3n1, 3n2, 3e and 3t: arch §4 guards 14, 12 and 4. A read's negative `--from`
     /// resolves against the list the read sees, and a start before 0 or past the end is refused.
     /// `-4` of 3 is refused by the compile, before a request exists. A fresh continuation token
@@ -7671,17 +7893,9 @@ mod tests {
         };
         assert_eq!(listed(last), vec![(2, text("c"))], "-1 is the last of 3");
         for (request, at) in [(3, -4), (4, 99)] {
-            let out_of_range = ClientCall::Get {
-                identity: identity(request),
-                object: Bytes::from_static(b"l"),
-                look: Look::Items { at, limit: 10 },
-            };
-            match trio.ask(out_of_range) {
-                Answer::Error {
-                    error,
-                    request: None,
-                } => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
-                other => panic!("a read from {at} of 3, refused with no request: {other:?}"),
+            match trio.look(request, b"l", Look::Items { at, limit: 10 }) {
+                Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
+                Ok(seen) => panic!("a read from {at} of 3 was answered: {seen:?}"),
             }
         }
 

@@ -3385,4 +3385,43 @@ mod tests {
         assert!(refused.detail.contains("not a byte string"), "{refused:?}");
         db.shutdown();
     }
+
+    /// Review F-008: `Db::write` answers a change that compiles to nothing as `Ok(None)`: a gc
+    /// with nothing to collect, and a chunk already stored. Nothing is sent, so the next write
+    /// lands at the next seq. Mutant m22 (the `Unchanged` arm cut from `compile_and_send`)
+    /// answers each as a host error. Integration (~1 s): three node threads on wall-clock time.
+    #[test]
+    fn a_write_that_compiles_to_nothing_is_ok_none() {
+        let dir = config_testkit::fs::temp_dir();
+        let rt = runtime();
+        let store: Arc<dyn ConfigStore> = Arc::new(config_testkit::MemStore::new());
+        let mut db = rt
+            .block_on(Db::open_with(
+                config(dir.path()),
+                store,
+                rt.handle().clone(),
+                fast(),
+            ))
+            .expect("open");
+        admits(&db, "before the first write");
+        let chunk = |index, bytes| Change::Chunk {
+            upload: [1; 16],
+            index,
+            bytes: Bytes::from_static(bytes),
+        };
+
+        let gc = db.write(b"g", Change::Gc { floor: u64::MAX }, None);
+        assert_eq!(gc.expect("a gc of nothing").map(|ok| ok.seq), None);
+        let first = db.write(b"g", chunk(0, b"abcd"), None).expect("chunk 0");
+        let first = first.expect("a new chunk is sent").seq;
+        let again = db.write(b"g", chunk(0, b"abcd"), None);
+        assert_eq!(again.expect("chunk 0 again").map(|ok| ok.seq), None);
+        let next = db.write(b"g", chunk(1, b"ef"), None).expect("chunk 1");
+        assert_eq!(
+            next.map(|ok| ok.seq),
+            Some(Seq(first.0 + 1)),
+            "nothing was sent in between"
+        );
+        db.shutdown();
+    }
 }
