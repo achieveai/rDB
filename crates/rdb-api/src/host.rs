@@ -3988,6 +3988,8 @@ mod tests {
     use rdb_core::contracts::ids::{ClientId, ReceivedSeq, RequestId, TenantId};
     use rdb_core::contracts::txn::{Durability, Outcome};
     use rdb_value::delta::Op;
+    use rdb_value::path::Path;
+    use rdb_value::value::{Int, Map, MapKey};
 
     /// This test's log lines whose message is `$message`. A macro, because the JSON value type
     /// is not nameable here without a `serde_json` dependency.
@@ -6938,6 +6940,219 @@ mod tests {
         fn ask(&mut self, call: ClientCall) -> Answer {
             let answer = self.call(call);
             self.answer(&answer)
+        }
+    }
+
+    /// A `ClientCall::Compile` of one change to `object`, as `Db::write` sends first.
+    fn compile_change(
+        request: u64,
+        object: &'static [u8],
+        change: Change,
+        expect: Option<Expected>,
+    ) -> ClientCall {
+        ClientCall::Compile {
+            identity: identity(request),
+            puts: vec![PutOp {
+                group: AFFINITY,
+                object: Bytes::from_static(object),
+                change,
+                expect,
+            }],
+            remaining_millis: 5_000,
+        }
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Text(s.to_owned())
+    }
+
+    fn int(n: u64) -> Value {
+        Value::Integer(Int::from(n))
+    }
+
+    fn json_map(entries: &[(&str, Value)]) -> Value {
+        let mut map = Map::new();
+        for (key, value) in entries {
+            map.insert(MapKey::new(*key), value.clone());
+        }
+        Value::Map(map)
+    }
+
+    fn path(text: &str) -> Path {
+        Path::parse(text).expect("a path")
+    }
+
+    /// Where a write was refused, as `rdb_dev` prints it: the compile answered an error, so no
+    /// request was built (`request=-`), or it compiled and the kernel refused the request it was
+    /// sent as (`request=<R>`).
+    #[derive(Debug, PartialEq, Eq)]
+    enum Refused {
+        AtCompile(ErrorKind),
+        ByKernel(ErrorKind),
+    }
+
+    impl Trio {
+        /// Compile `call`, then send what it compiled to, as `Db::write` does. `Ok` is the
+        /// published seq.
+        fn write(&mut self, call: ClientCall) -> Result<u64, Refused> {
+            let request = match self.ask(call) {
+                Answer::Compiled(request) => request,
+                Answer::Error { error, .. } => return Err(Refused::AtCompile(error.kind)),
+                other => panic!("compile: {other:?}"),
+            };
+            match self.ask(ClientCall::Resend { request }) {
+                Answer::Txn { result, .. } => Ok(result.seq.0),
+                Answer::Error { error, .. } => Err(Refused::ByKernel(error.kind)),
+                other => panic!("send: {other:?}"),
+            }
+        }
+
+        /// What a read of `object` through `look` saw, or its refusal.
+        fn look(
+            &mut self,
+            request: u64,
+            object: &'static [u8],
+            look: Look,
+        ) -> Result<Seen, ApiError> {
+            let call = ClientCall::Get {
+                identity: identity(request),
+                object: Bytes::from_static(object),
+                look,
+            };
+            match self.ask(call) {
+                Answer::Read { seen, .. } => Ok(seen),
+                Answer::Error { error, .. } => Err(error),
+                other => panic!("read: {other:?}"),
+            }
+        }
+    }
+
+    /// S4-1 (main line, 1k): arch §4 guards 1 and 2. A stale `Version` guard is refused by the
+    /// compile, before a request exists. A create over an existing document compiles, and the
+    /// kernel refuses it on the `Absent` condition the compile attached. Mutant m1 (the compile
+    /// ignores `expect`) publishes the stale change; m2 (conditions dropped) publishes the
+    /// create and empties the document. Trio, about 1 s.
+    #[test]
+    fn a_stale_document_change_is_refused_by_the_compile_and_a_create_over_one_by_the_kernel() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let replace = |value: Value| Change::Doc(Delta(vec![Op::Replace(value)]));
+        let created = json_map(&[
+            ("n", int(1)),
+            ("tags", Value::Array(vec![text("a"), text("x")])),
+        ]);
+        assert_eq!(
+            trio.write(compile_change(
+                1,
+                b"d",
+                replace(created),
+                Some(Expected::Absent)
+            )),
+            Ok(2)
+        );
+        let change = Change::Doc(Delta(vec![
+            Op::Increment(path("/n"), Int::from(5_u64)),
+            Op::Set(path("/tags/1"), text("b")),
+        ]));
+        assert_eq!(
+            trio.write(compile_change(2, b"d", change, Some(Expected::Version(2)))),
+            Ok(3)
+        );
+        let changed = Seen::Doc(Document {
+            version: 3,
+            value: json_map(&[
+                ("n", int(6)),
+                ("tags", Value::Array(vec![text("a"), text("b")])),
+            ]),
+        });
+        assert_eq!(trio.look(3, b"d", Look::Doc), Ok(changed.clone()));
+
+        let stale = Change::Doc(Delta(vec![Op::Increment(path("/n"), Int::from(1_u64))]));
+        assert_eq!(
+            trio.write(compile_change(4, b"d", stale, Some(Expected::Version(2)))),
+            Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
+            "a stale guard is refused before a request exists"
+        );
+        let over = replace(json_map(&[]));
+        assert_eq!(
+            trio.write(compile_change(5, b"d", over, Some(Expected::Absent))),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "a create compiles without reading; the kernel's Absent condition refuses it"
+        );
+        assert_eq!(trio.look(6, b"d", Look::Doc), Ok(changed), "d is unchanged");
+    }
+
+    /// S4-2 (2n, 2k, 2p): arch §4 guards 2, 3 and 5. A failed `need` is a failed condition,
+    /// either way round. A create over an existing map is refused by the kernel. A document read
+    /// of a map is refused, never `absent`. Mutant m3 (the element arm cut) answers
+    /// `INVALID_ARGUMENT` for the needs; m5 (read errors as `Seen::Absent`) reads the map as
+    /// absent; m2 publishes the create. Trio, about 1 s.
+    #[test]
+    fn a_failed_need_is_a_condition_failure_and_a_map_never_reads_as_a_document() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let map = Change::Map(vec![
+            ElemOp::Put(text("a"), int(1)),
+            ElemOp::Put(text("b"), int(2)),
+        ]);
+        assert_eq!(
+            trio.write(compile_change(1, b"m", map, Some(Expected::Absent))),
+            Ok(2)
+        );
+        let set = Change::Set(vec![ElemOp::Add(int(1))]);
+        assert_eq!(
+            trio.write(compile_change(2, b"s", set, Some(Expected::Absent))),
+            Ok(3)
+        );
+
+        for (request, need) in [
+            (3, ElemOp::NeedPresent(int(9))),
+            (4, ElemOp::NeedAbsent(int(1))),
+        ] {
+            let change = Change::Set(vec![need.clone()]);
+            assert_eq!(
+                trio.write(compile_change(
+                    request,
+                    b"s",
+                    change,
+                    Some(Expected::Version(3))
+                )),
+                Err(Refused::AtCompile(ErrorKind::ConditionFailed)),
+                "{need:?}"
+            );
+        }
+        let over = Change::Map(vec![ElemOp::Put(text("z"), int(1))]);
+        assert_eq!(
+            trio.write(compile_change(5, b"m", over, Some(Expected::Absent))),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "a create over the map is the kernel's refusal"
+        );
+        match trio.look(6, b"m", Look::Doc) {
+            Err(error) => assert_eq!(error.kind, ErrorKind::InvalidArgument, "{error:?}"),
+            Ok(seen) => panic!("a map read as a document: {seen:?}"),
+        }
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(7, b"m", members) {
+            Ok(Seen::Members(page)) => {
+                let keys: Vec<_> = page
+                    .members
+                    .iter()
+                    .map(|member| member.key.clone())
+                    .collect();
+                assert_eq!(
+                    (page.collection.version, page.collection.count, keys),
+                    (2, 2, vec![text("a"), text("b")]),
+                    "m is as created"
+                );
+            }
+            other => panic!("members of m: {other:?}"),
         }
     }
 }

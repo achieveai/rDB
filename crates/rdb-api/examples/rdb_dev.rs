@@ -3904,4 +3904,45 @@ mod tests {
             Ok(Some("put a 1".to_owned()))
         );
     }
+
+    /// S4-1 1j, guard 6 (A-2): a `#` starts a comment only at the start of a word, so one
+    /// inside a JSON value is kept, and the value is read from the raw line with its quotes
+    /// (R1). Mutant m6 (cut at any `#`) fails the first assertion. Unit.
+    #[test]
+    fn a_hash_inside_a_word_is_kept_and_json_is_read_from_the_raw_line() {
+        assert_eq!(
+            command(Ok(
+                r##"doc t --absent --json {"tag":"#1"}   # a comment"##.to_owned()
+            )),
+            Ok(Some(r##"doc t --absent --json {"tag":"#1"}"##.to_owned()))
+        );
+        assert_eq!(command(Ok("#only a comment".to_owned())), Ok(None));
+        let (object, expect, change) =
+            parse_change(r#"doc d --expect 2 incr /n 5 set /tags/1 "b""#).expect("a doc line");
+        let path = |text| Path::parse(text).expect("a path");
+        assert_eq!(
+            (object.as_str(), expect, change),
+            (
+                "d",
+                Some(Expected::Version(2)),
+                Change::Doc(Delta(vec![
+                    Op::Increment(path("/n"), Int::from(5_u64)),
+                    Op::Set(path("/tags/1"), Value::Text("b".to_owned())),
+                ]))
+            ),
+            "the quotes around \"b\" survive: it is text, not a bare word"
+        );
+        let refused =
+            parse_change(r#"doc d set /a "a"x"#).expect_err("\"a\"x is not one JSON value");
+        assert!(refused.contains("not at a space"), "{refused}");
+    }
+
+    /// S4-1 1s (A-5): `retry <R> --payload` refuses a value write; it is resent unchanged or not
+    /// at all. Unit.
+    #[test]
+    fn retry_payload_refuses_a_value_write() {
+        let refused =
+            payload_put(Kind::Value, RequestId(5)).expect_err("a value write takes no payload");
+        assert!(refused.contains("request 5 was a value write"), "{refused}");
+    }
 }
