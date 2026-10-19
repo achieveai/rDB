@@ -7155,4 +7155,122 @@ mod tests {
             other => panic!("members of m: {other:?}"),
         }
     }
+
+    /// S4-3 3n2, 3n4, 3n5, 3n6 and the running count (3x): arch §4 guards 12 and 13 (A-R116).
+    /// `-k` names `count - k`; a position below 0 or past the end is refused, naming the edit;
+    /// each push or insert moves the count up and each remove moves it down, so a later edit
+    /// resolves against the list as the earlier edits leave it. Mutant m12a (below 0 clamps to 0)
+    /// removes item 0; m12b (negatives never resolved) refuses `-1`; m12c (off by one) removes
+    /// item 1; m13 (a push does not move the count) removes the old last item. Unit.
+    #[test]
+    fn a_negative_position_counts_from_the_end_of_the_list_the_earlier_edits_leave() {
+        let z = || Value::Text("z".to_owned());
+        assert_eq!(
+            resolve_edits(&[ListEdit::Remove { at: -1 }], 3),
+            Ok(vec![ListOp::Remove { at: 2 }]),
+            "-1 is the last item"
+        );
+        assert_eq!(
+            resolve_edits(&[ListEdit::Push(z()), ListEdit::Remove { at: -1 }], 3),
+            Ok(vec![ListOp::Push(z()), ListOp::Remove { at: 3 }]),
+            "the push moved the end"
+        );
+        assert_eq!(
+            resolve_edits(
+                &[
+                    ListEdit::Insert { at: -1, value: z() },
+                    ListEdit::Move { from: -1, to: 0 }
+                ],
+                2
+            ),
+            Ok(vec![
+                ListOp::Insert { at: 1, value: z() },
+                ListOp::Move { from: 2, to: 0 }
+            ]),
+            "the insert moved the end"
+        );
+        for (edits, count, refused) in [
+            (
+                vec![ListEdit::Remove { at: -4 }],
+                3,
+                "edit 0: position -4 is not inside the list of 3",
+            ),
+            (
+                vec![ListEdit::Remove { at: -1 }, ListEdit::Remove { at: -1 }],
+                1,
+                "edit 1: position -1 is not inside the list of 0",
+            ),
+            (
+                vec![ListEdit::Insert { at: -1, value: z() }],
+                0,
+                "edit 0: position -1 is not inside the list of 0",
+            ),
+            (
+                vec![ListEdit::Replace { at: 3, value: z() }],
+                3,
+                "edit 0: position 3 is not inside the list of 3",
+            ),
+        ] {
+            let error = resolve_edits(&edits, count).expect_err(refused);
+            assert_eq!(
+                (error.kind, error.detail.as_str()),
+                (ErrorKind::InvalidArgument, refused)
+            );
+        }
+    }
+
+    /// S4-3 3n1, 3n2 and 3t: arch §4 guards 14, 12 and 4. A read's negative `--from` resolves
+    /// against the list the read sees. `-4` of 3 is refused by the compile, before a request
+    /// exists. A continuation token whose list has changed is `STALE_CONTINUATION` with retry
+    /// `Reconcile`, as the kernel's own stale continuation is. Mutant m14 (resolved against 0)
+    /// refuses `-1`; m12c (off by one) lists from item 1; m12a publishes the `-4` remove; m4a
+    /// (built with `ApiError::new`) answers retry `BoundedJitter`; m4b (the arm cut) answers
+    /// `CONDITION_FAILED`. Trio, about 1 s.
+    #[test]
+    fn a_list_read_resolves_its_start_against_the_list_and_a_stale_token_must_reconcile() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let push = |s: &str| ListEdit::Push(text(s));
+        let created = Change::List(vec![push("a"), push("b"), push("c")]);
+        assert_eq!(
+            trio.write(compile_change(1, b"l", created, Some(Expected::Absent))),
+            Ok(2)
+        );
+        let page = |seen: Result<Seen, ApiError>| match seen {
+            Ok(Seen::Items(items)) => items,
+            other => panic!("items of l: {other:?}"),
+        };
+        let last = page(trio.look(2, b"l", Look::Items { at: -1, limit: 10 }));
+        let listed: Vec<_> = last
+            .items
+            .iter()
+            .map(|item| (item.position, item.value.clone()))
+            .collect();
+        assert_eq!(listed, vec![(2, text("c"))], "-1 is the last of 3");
+
+        let past = Change::List(vec![ListEdit::Remove { at: -4 }]);
+        assert_eq!(
+            trio.write(compile_change(3, b"l", past, Some(Expected::Version(2)))),
+            Err(Refused::AtCompile(ErrorKind::InvalidArgument)),
+            "-4 of 3 is refused before a request exists"
+        );
+
+        let first = page(trio.look(4, b"l", Look::Items { at: 0, limit: 2 }));
+        let token = first.next.expect("a page of 2 of 3 has a next token");
+        let more = Change::List(vec![push("z")]);
+        assert_eq!(
+            trio.write(compile_change(5, b"l", more, Some(Expected::Version(2)))),
+            Ok(3)
+        );
+        match trio.look(6, b"l", Look::ItemsAfter { token, limit: 10 }) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry),
+                (ErrorKind::StaleContinuation, RetryRule::Reconcile),
+                "{error:?}"
+            ),
+            Ok(seen) => panic!("a token from before the push still read: {seen:?}"),
+        }
+    }
 }
