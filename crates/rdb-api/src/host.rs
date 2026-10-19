@@ -6959,6 +6959,214 @@ mod tests {
         }
     }
 
+    /// The upload every S4-4 row writes under.
+    const U1: Upload = [1; 16];
+
+    /// A compile of chunk `index` of [`U1`] under `object`.
+    fn chunk_call(
+        request: u64,
+        object: &'static [u8],
+        index: u32,
+        bytes: &'static [u8],
+        expect: Option<Expected>,
+    ) -> ClientCall {
+        let bytes = Bytes::from_static(bytes);
+        let change = Change::Chunk {
+            upload: U1,
+            index,
+            bytes,
+        };
+        compile_change(request, object, change, expect)
+    }
+
+    /// A compile of the publish of `blob`, uploaded as [`U1`] in chunks of 4.
+    fn publish_call(
+        request: u64,
+        object: &'static [u8],
+        blob: &[u8],
+        expect: Option<Expected>,
+    ) -> ClientCall {
+        use sha2::Digest as _;
+        let change = Change::Publish {
+            upload: U1,
+            size: blob.len() as u64,
+            chunk_size: 4,
+            sha256: sha2::Sha256::digest(blob).into(),
+        };
+        compile_change(request, object, change, expect)
+    }
+
+    /// A refusal as `(kind, retry, no_mutation, whether it names a request)`.
+    fn refusal(answer: Answer) -> (ErrorKind, RetryRule, bool, bool) {
+        match answer {
+            Answer::Error { error, request } => (
+                error.kind,
+                error.retry,
+                error.no_mutation,
+                request.is_some(),
+            ),
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// S4-4 main line, 4c, 4x: arch §4 guards 7, 8, 10 and 11, and both blob kinds end to end.
+    /// A repeated chunk, a gc with nothing to collect, and the same publish compile to nothing,
+    /// and nothing is sent. The publish's check 0 needs `serving` to be the adopted generation.
+    /// A chunk under other bytes is UPLOAD_CHUNK_CONFLICT. A chunk or gc with an `expect` is
+    /// refused. A read of a damaged chunk is CORRUPT_BLOB. Every refusal is at the compile and
+    /// names no request.
+    /// Mutants: m7 (empty compile sent) and m8 (`Generation(0)`) answer `Compiled`. m10a and
+    /// m10b (rows dropped) answer `BoundedJitter`. m11 (expect ignored) answers `Unchanged`.
+    /// Trio, about 1 s.
+    #[test]
+    fn a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"b", 0, b"HELL", None)), Ok(2));
+        assert_eq!(trio.write(chunk_call(2, b"b", 1, b"O", None)), Ok(3));
+        let publish = publish_call(3, b"b", b"HELLO", Some(Expected::Absent));
+        assert_eq!(trio.write(publish), Ok(4));
+
+        for (what, call) in [
+            ("the same chunk", chunk_call(4, b"b", 0, b"HELL", None)),
+            (
+                "a gc with nothing to collect",
+                compile_change(5, b"b", Change::Gc { floor: 4 }, None),
+            ),
+            (
+                "the same publish",
+                publish_call(6, b"b", b"HELLO", Some(Expected::Absent)),
+            ),
+        ] {
+            match trio.ask(call) {
+                Answer::Unchanged => {}
+                other => panic!("{what}: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            refusal(trio.ask(chunk_call(7, b"b", 0, b"XXXX", None))),
+            (
+                ErrorKind::UploadChunkConflict,
+                RetryRule::Reconcile,
+                true,
+                false
+            ),
+            "other bytes under a stored chunk"
+        );
+        let stale = Some(Expected::Version(4));
+        for (what, call) in [
+            ("a chunk", chunk_call(8, b"b", 0, b"HELL", stale.clone())),
+            (
+                "a gc",
+                compile_change(9, b"b", Change::Gc { floor: 4 }, stale.clone()),
+            ),
+        ] {
+            assert_eq!(
+                refusal(trio.ask(call)),
+                (
+                    ErrorKind::InvalidArgument,
+                    RetryRule::Definitive,
+                    true,
+                    false
+                ),
+                "{what} with an expect"
+            );
+        }
+
+        let range = |trio: &mut Trio, request, offset, len| {
+            trio.look(request, b"b", Look::Range { offset, len })
+                .map(|seen| match seen {
+                    Seen::Range { bytes, .. } => bytes,
+                    other => panic!("a range read: {other:?}"),
+                })
+        };
+        assert_eq!(range(&mut trio, 10, 0, 5), Ok(Bytes::from_static(b"HELLO")));
+
+        // Other bytes over chunk 1, written as `rdb_dev admin damage-chunk` does.
+        let root = root_key(TenantId(1), AFFINITY, b"b");
+        let damage = TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(11),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::chunk_key(&root, &U1, 1),
+                value: rdb_value::envelope::seal(rdb_value::envelope::Kind::Chunk, b"damaged")
+                    .expect("seven bytes fit an envelope"),
+                expected_version: None,
+            }],
+        };
+        match trio.ask(ClientCall::Resend { request: damage }) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(5)),
+            other => panic!("the damage write: {other:?}"),
+        }
+        assert_eq!(
+            range(&mut trio, 12, 0, 4),
+            Ok(Bytes::from_static(b"HELL")),
+            "chunk 0 is intact"
+        );
+        match range(&mut trio, 13, 4, 1) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptBlob, RetryRule::Quarantine, false)
+            ),
+            Ok(bytes) => panic!("a damaged chunk read as {bytes:?}"),
+        }
+    }
+
+    /// S4-4 4h, C-3: arch §4 guard 9. With both secondaries cut off, node 1 applies a publish
+    /// that cannot publish. The same publish re-issued meanwhile finds its blob at the root, but
+    /// above P1's published seq. So it is UNKNOWN_OUTCOME at the compile, naming no request, and
+    /// never `unchanged`. After the heal the held publish publishes, and the re-issue is
+    /// `unchanged`. Mutant m9 (the check dropped) answers `Unchanged` while held.
+    /// Trio, about 1 s.
+    #[test]
+    fn a_publish_reissued_before_its_blob_publishes_is_an_unknown_outcome_not_unchanged() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"h", 0, b"abcd", None)), Ok(2));
+        let publish = |request| publish_call(request, b"h", b"abcd", Some(Expected::Absent));
+        let request = match trio.ask(publish(2)) {
+            Answer::Compiled(request) => request,
+            other => panic!("compile the publish: {other:?}"),
+        };
+        trio.links.hold(NodeId(1), NodeId(2));
+        trio.links.hold(NodeId(1), NodeId(3));
+        let held = trio.call(ClientCall::Resend { request });
+        trio.until("node 1 applied the publish", |trio| {
+            (trio.head() == Some(3)).then_some(())
+        });
+
+        assert_eq!(
+            refusal(trio.ask(publish(3))),
+            (
+                ErrorKind::UnknownOutcome,
+                RetryRule::QueryStatus,
+                false,
+                false
+            ),
+            "the blob is at the root and not published"
+        );
+        assert!(held.try_recv().is_err(), "no copy acknowledged the publish");
+
+        trio.links.heal_all();
+        match trio.answer(&held) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(3)),
+            other => panic!("the held publish after the heal: {other:?}"),
+        }
+        match trio.ask(publish(4)) {
+            Answer::Unchanged => {}
+            other => panic!("the publish once published: {other:?}"),
+        }
+    }
+
     /// Three hosts on this thread, stepped by hand, for the rows that need a whole partition.
     /// Fields drop in order: the hosts close before the runtime their control calls run on.
     struct Trio {
