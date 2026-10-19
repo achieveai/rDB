@@ -1903,14 +1903,17 @@ static DAMAGE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// write, so a later read of the blob finds a chunk that fails its hash: `CORRUPT_BLOB`. A dev
 /// tool only, to reach that answer by hand; the product never writes a chunk this way.
 fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
+    use rdb_core::contracts::errors::ErrorKind;
     use rdb_core::contracts::ids::{ClientId, RequestIdentity, TenantId};
-    use rdb_core::contracts::txn::Mutation;
+    use rdb_core::contracts::txn::{Condition, Mutation};
     let args = BlobArgs::parse(rest, &["--upload", "--index"])?;
     if args.expect.is_some() || args.text.is_some() {
         return Err(DAMAGE_USAGE.to_owned());
     }
     let index: u32 = args.number("--index")?;
+    let upload = args.flag("--upload")?;
     let root = rdb_value::keys::root_key(TenantId(1), AffinityId(1), object.as_bytes());
+    let key = rdb_value::keys::chunk_key(&root, &args.upload()?, index);
     let value = rdb_value::envelope::seal(rdb_value::envelope::Kind::Chunk, b"damaged")
         .expect("seven bytes fit an envelope");
     let request = TxnRequest {
@@ -1923,14 +1926,32 @@ fn damage_chunk(db: &Db, object: &str, rest: &[&str]) -> Result<(), String> {
         affinity: AffinityId(1),
         expected_generation: None,
         remaining_millis: 5_000,
-        conditions: Vec::new(),
+        // PB-6: only a stored chunk is damaged; a missing one is refused, never written.
+        conditions: vec![Condition::Present { key: key.clone() }],
         mutations: vec![Mutation::Put {
-            key: rdb_value::keys::chunk_key(&root, &args.upload()?, index),
+            key,
             value,
             expected_version: None,
         }],
     };
-    labelled_put_line(db, "damage-chunk ", db.resend(request), None);
+    // PB-5: no request id is printed. This write is under damage-chunk's own client, so
+    // `status` and `retry` would look up another write under the same number.
+    say(&match db.resend(request) {
+        Ok(ok) => format!(
+            "damage-chunk ok p=1 gen={} seq={} {:?} request=- (damage-chunk's own client; \
+             status does not know it)",
+            ok.generation.0, ok.seq.0, ok.durability
+        ),
+        Err(PutError { error, .. }) if error.kind == ErrorKind::ConditionFailed => format!(
+            "err admin damage-chunk: no stored chunk {index} for upload {upload} under {object}"
+        ),
+        Err(PutError { error, .. }) => format!(
+            "err admin damage-chunk: {} retry={:?} request=- ({})",
+            error.name(),
+            error.retry,
+            error.detail
+        ),
+    });
     Ok(())
 }
 
