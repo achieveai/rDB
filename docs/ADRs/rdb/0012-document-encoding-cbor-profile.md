@@ -63,6 +63,9 @@ Each edit is marked in place with its ruling.
 - **The document root may be any value**, a scalar included: `5`, `"x"` and `null` are documents.
   Path ops below the root need a container there and are refused `NotAContainer{at: Root}`
   otherwise; `Replace` works on any root. Reversible until M9 has clients (L-R185m Q1).
+  (Status 2026-10-19, M9 S4: kept. `Change::Doc` hands its delta to `rdb_value::compile` with no
+  check on the root's type, and every `Db::put` stores a byte-string root, so S4's clients already
+  depend on a scalar root.)
 - **No cross-type equality.** `1`, `1.0` and decimal `[0, 1]` are three different values.
 - Tag 1001's inner map has integer keys. That is part of the timestamp type, not a document map.
 
@@ -88,6 +91,10 @@ Each edit is marked in place with its ruling.
     **normal** feature. Today only `rdb-value`'s example parses JSON, and the feature is on its
     dev-dependency, so it reaches test and example builds only. Without it, about one float in three
     parses one ULP off (L-R185o D1).
+  (Status 2026-10-19, M9 S4, both M9 lines above: no M9 crate parses client JSON in a normal build.
+  The `Db` takes `Value`s and parses no text. Only the `rdb_dev` example reads JSON, through
+  `doc_scenario`'s `json.rs`, with `float_roundtrip` on `rdb-api`'s `serde_json` dev-dependency.
+  The rule binds the first non-example crate that parses client JSON.)
 - Tags: only 4 and 1001, in the forms above. Every other tag is refused.
 - **`encode` refuses** a value deeper than 64 levels (`TooDeep`) or larger than the limit (`TooLarge`).
   So the writer can never produce bytes the reader refuses (decision 11).
@@ -290,6 +297,11 @@ upgrade note.
     object prefix, the storage `Delete` is allowed only for a document root. Every other damaged
     record is repaired through the `rdb-value` functions in ADR-rdb-0013 decision 11.
 - Mapping to the client error categories (spec §5.4) belongs to M9 `rdb-api`.
+  (Status 2026-10-19, M9 S4: done in `rdb-api`'s `compile_error`. `VersionConflict`,
+  `ObjectAbsent`, `ElementAbsent` and `ElementExists` are `CONDITION_FAILED`; `ChunkConflict` is
+  `UPLOAD_CHUNK_CONFLICT`; every other `Apply` error is `INVALID_ARGUMENT`. Blob damage is
+  `CORRUPT_BLOB`, and any other `Corrupt` is `CORRUPT_HISTORY`. A list token whose list moved is
+  the kernel's `STALE_CONTINUATION`.)
 
 ### 13. Who owns the object-key layout
 - A document lives at its object's root key, and the document API takes only a root key (amended
@@ -303,6 +315,11 @@ upgrade note.
 ### 14. Showing a document as JSON: the `$` rule (L-R185o A3)
 - The library has no JSON form; the example (`crates/rdb-value/examples/doc_scenario.rs`) shows
   documents as JSON for people. M9's API inherits this rule if it shows JSON.
+  (Status 2026-10-19, M9 S4: the `Db` shows no JSON. `rdb_dev` shows values with `doc_scenario`'s
+  own `render`, so this rule holds there unchanged. One input exception, A-R121: at a map-key or
+  set-member position only, `rdb_dev` reads `{"$bytes":"<hex>"}` as a byte string, the form a
+  read prints. A document value still takes no tagged input
+  (`a_bytes_key_is_entered_as_a_read_prints_it`).)
 - Types JSON lacks are shown as one-key objects with a single leading `$`: `{"$bytes":"<hex>"}`,
   `{"$decimal":[exponent, mantissa]}`, `{"$timestamp":{"secs":S,"nanos":N}}`.
 - **A map key that starts with `$` is shown with one more `$`**, at any depth: `$bytes` → `$$bytes`,

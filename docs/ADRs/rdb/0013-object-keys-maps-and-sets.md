@@ -407,6 +407,11 @@ How it is proved:
   compiled request needs at least one mutation (spec §4.2, check 10 refuses an empty one), and the root
   write is the one a collection compile always has. For M9: a client that wants "no write if nothing
   changed" must check before it submits.
+  (Status 2026-10-19, M9 S4: so it is. `Host::compile` sends every compile that has a mutation, and
+  `compile_collection` always puts the root first, so a map or set write of no-ops is sent and moves
+  the root version. Only a chunk, gc or publish that writes nothing is held back (`Db::write`
+  answers `Ok(None)`; guard 7, row
+  `a_repeated_blob_write_sends_nothing_and_its_refusals_name_the_blob_kinds`).)
 - Element records keep their own storage versions. These are not public concurrency tokens
   (spec §4.3.2). Every element write also rewrites the root, so an element's version is never above
   its root's. Decision 10 checks that.

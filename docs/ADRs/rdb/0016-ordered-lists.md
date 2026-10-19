@@ -88,6 +88,8 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 ### 4. Split, merge back, limits
 - **B** (`block_max`) is a **compile argument, not stored**, in `1,024 … 196,608`; `DEFAULT_BLOCK_MAX` = 131,072. M9 does
   not expose it; tests and `doc_scenario` pass less. The top is 192 KiB so the cap exception below stays under the reader cap.
+  (Status 2026-10-19, M9 S4: so it is. `list_compile` passes `DEFAULT_BLOCK_MAX` to every create and update, and no
+  `Change` or `ListEdit` carries a block size.)
 - **The compile rule (B1, M1, M2).** At the end of a compile, every touched block ends in exactly one of these states:
   1. **Written, base ≤ B**, with at most one split. **The last block splits at its end**: it keeps its id and the longest
      prefix of at most B bytes; a new last block takes the rest. **Any other block splits into byte-balanced halves**: the
@@ -138,6 +140,21 @@ at, generation}`, `record_len`, `MAX_REQUEST_MUTATIONS`, `MAX_ENVELOPE_BYTES` ex
 - Ops, 0-based: `Push(v)`, `Insert{at, v}` (`at ≤ count`), `Remove{at}`, `Replace{at, v}`, `Move{from, to}` (`to` is the
   final position); a bad one is `PositionInvalid{position, len}`. A position maps to (block, offset) by the root's counts,
   with decision 4's boundary tie.
+  (Status 2026-10-19, M9 S4, A-R116, A-R117: the API's positions are signed, as Gautam asked. `-1` is the last item.
+  - **Edits:** every `ListEdit` position (`Insert`, `Remove`, `Replace`, `Move` from and to) is an `i64`. `-k` means
+    `count - k`, the Python rule, so `Insert{at: -1}` goes before the last item; `Push` appends. The owner resolves it
+    (`resolve_edits`) against the count in the compile's view. That count moves as earlier edits in the same request
+    change it: +1 for a push or insert, -1 for a remove. The ops it then compiles are the 0-based ops above.
+  - **Reads:** `Look::Items{at: i64}` resolves the same way, against the count of the list in the view the read is
+    served from.
+  - **Out of range:** nothing is clamped. A negative past the start (`-4` on 3 items, `-1` on none) is
+    `INVALID_ARGUMENT`, for an edit and for a read alike.
+    - For an edit, so is a position at or past the count, except that an insert may name the count, the end. The
+      refusal names the edit and the position as written ("edit 1: position -1 is not inside the list of 0"). The
+      guard is compiled first, so a stale version still answers `CONDITION_FAILED`.
+    - For a read, a start past the count is refused. A start at the count returns an empty page.
+  - **Rows:** `a_negative_position_counts_from_the_end_of_the_list_the_earlier_edits_leave` and
+    `a_list_read_resolves_its_start_against_the_list_and_a_stale_token_must_reconcile`.)
 - **Create** (`Expected::Absent`) checks `block_max` (`InvalidBlockSize{found}`) and the id (decision 4), then, **only if the
   root is absent**, the orphan scan from `prefix | 0x02`, limit 1: a hit under `0x02`/`0x03` is `Corrupt(OrphanElement)`. It
   writes the root with `Condition::Absent{root}`, block 0 and the initial ops. **Update** checks version and kind.
