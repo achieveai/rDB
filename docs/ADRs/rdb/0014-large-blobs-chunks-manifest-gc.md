@@ -551,6 +551,13 @@ seen to fail under a named fault (a mutant), then pass.
   refusal of a retry (the fence, a condition, an `expected_version` or the compile), the executor
   re-reads a fresh snapshot and compiles again before it reports failure (decision 6, check 0
   precondition).
+  **Amended 2026-10-19 (M9 S4, A-R113 C-4, A-R114 Q3): in M9 the app re-issues, not the executor.**
+  `Db` keeps no re-read-and-compile step after a refused retry: it reports the refusal as the kernel
+  gave it (`CONDITION_FAILED request=<R>`, S4 recipe 4o). The app then sends the same change again
+  as a new request, which compiles on a fresh snapshot. A re-issued publish answers "unchanged"
+  only when the root's version is at or below the host's published seq for that partition; above
+  it, the answer is `UNKNOWN_OUTCOME` and nothing is sent (S4 edge 4h, A-R113 C-3). `Gc`'s empty
+  answer and `put_chunk`'s "already stored" are exempt from that check (A-R113 C-3).
 
 ## References
 - Spec §4.2, §4.3, §4.3.1, §5.4; validation plan V14.
