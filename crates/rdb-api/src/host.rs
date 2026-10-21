@@ -7361,6 +7361,50 @@ mod tests {
         }
     }
 
+    /// Review F2 (A-R133), the Map arm: arch §4 guard 2. A map change compiled at version 2 and
+    /// sent after another write moved the map to 3 is refused by the kernel, on the version the
+    /// compile attached. The map keeps the other write's keys, values and count. Mutant m23 (the
+    /// Map arm's version guard cut from what it compiles) publishes it. Trio, about 1 s.
+    #[test]
+    fn a_map_change_sent_after_the_map_moved_is_refused_by_the_kernel() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let put = |key, n| Change::Map(vec![ElemOp::Put(text(key), int(n))]);
+        let created = compile_change(1, b"m", put("a", 1), Some(Expected::Absent));
+        assert_eq!(trio.write(created), Ok(2));
+        let stale = trio.compiled(compile_change(2, b"m", put("b", 2), None));
+        assert_eq!(
+            trio.write(compile_change(3, b"m", put("c", 3), None)),
+            Ok(3)
+        );
+        assert_eq!(
+            trio.sent(stale),
+            Err(Refused::ByKernel(ErrorKind::ConditionFailed)),
+            "compiled at version 2, sent at 3"
+        );
+        let members = Look::Members {
+            after: None,
+            limit: 10,
+        };
+        match trio.look(4, b"m", members) {
+            Ok(Seen::Members(page)) => {
+                let entries: Vec<_> = page.members.into_iter().map(|m| (m.key, m.value)).collect();
+                assert_eq!(
+                    (page.collection.version, page.collection.count, entries),
+                    (
+                        3,
+                        2,
+                        vec![(text("a"), Some(int(1))), (text("c"), Some(int(3)))]
+                    ),
+                    "b was never put"
+                );
+            }
+            other => panic!("members of m: {other:?}"),
+        }
+    }
+
     /// Review F-002, the Publish arm: arch §4 guard 2. A publish of upload 2 compiled over the
     /// blob at version 3 and sent after a publish of upload 3 replaced it is refused by the
     /// kernel. Mutant m16 (the Publish arm's version guard cut from what it compiles) publishes
