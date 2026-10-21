@@ -16,7 +16,8 @@
 //! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
-//! word starts a comment; one inside a word, as in `{"tag":"#1"}`, is kept. Words split on
+//! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
+//! string, as in `{"m":"hello #world"}`, is kept. Words split on
 //! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`,
 //! `map`, `set`, `members`, `list`, `items`) reads its JSON values from the line as written,
 //! quotes and all:
@@ -1327,13 +1328,23 @@ fn command(line: std::io::Result<String>) -> Result<Option<String>, String> {
     Ok((!line.is_empty()).then_some(line))
 }
 
-/// `line` up to its comment: a `#` at the start of a word, never one inside a word, so JSON
-/// such as `{"tag":"#1"}` is kept whole (S4 A-2).
+/// `line` up to its comment: a `#` at the start of a word and outside a `"..."` string, so JSON
+/// such as `{"tag":"#1"}` or `{"m":"hello #world"}` is kept whole. A `\"` does not end a
+/// string (S4 A-2, review F3).
 fn uncommented(line: &str) -> &str {
-    let mut word_start = true;
+    let (mut word_start, mut quoted, mut escaped) = (true, false, false);
     for (at, c) in line.char_indices() {
-        if c == '#' && word_start {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else if c == '#' && word_start {
             return &line[..at];
+        } else if c == '"' {
+            quoted = true;
         }
         word_start = c.is_whitespace();
     }
@@ -4335,6 +4346,28 @@ mod tests {
         assert_eq!(
             command(Ok("put a 1 # set a".to_owned())),
             Ok(Some("put a 1".to_owned()))
+        );
+    }
+
+    /// Review F3 (A-R133): a `#` inside a `"..."` string is kept, even at the start of a word;
+    /// a `\"` does not end the string; and a `#` word after the string is still a comment. At
+    /// 2cc5b24 the first two lines were cut at their `#`. Unit.
+    #[test]
+    fn a_hash_inside_a_json_string_is_kept_and_one_after_it_is_a_comment() {
+        let command = |line: &str| command(Ok(line.to_owned()));
+        let kept = |line: &str| Ok(Some(line.to_owned()));
+        let spaced = r##"doc d --absent --json {"m":"hello #world"}"##;
+        assert_eq!(command(spaced), kept(spaced), "a spaced # in a string");
+        let escaped = r##"doc d --absent --json {"m":"say \" #hi"}"##;
+        assert_eq!(
+            command(escaped),
+            kept(escaped),
+            "a # after an escaped quote"
+        );
+        assert_eq!(
+            command(r##"doc d --absent --json {"m":"a #b"}  # a real comment"##),
+            kept(r##"doc d --absent --json {"m":"a #b"}"##),
+            "a trailing comment"
         );
     }
 
