@@ -13,9 +13,10 @@
 # A drift table is only as fresh as its last re-read, and "remember to re-read it" is a
 # convention. This makes it a red build instead.
 #
-# The rule: a plan's declared basis must be the newest commit that touched the contract surface.
-# If the surface has moved since, the plan was written against something that no longer exists
-# and its author has to look again.
+# The rule: a plan's declared basis must match the contract surface as it is now. Name the
+# contracts tree (below); a legacy commit basis is accepted when its contracts surface matches the
+# current one. If the surface has moved since, the plan was written against something that no
+# longer exists and its author has to look again.
 #
 # Declare the basis in the plan with a marker on its own line, anywhere in the file:
 #
@@ -28,7 +29,8 @@
 # keeps it. A branch commit does not survive one: PR #48 set all four markers to its branch
 # commit 7d8fa9c, the squash merge made 0e64d47 instead, and main failed this stage from then on
 # (2026-10-19, ruling A-R118). A tree basis passes when it equals the current contracts tree and
-# fails, listing the changed files, when it does not. A commit basis still works as before.
+# fails, listing the changed files, when it does not. A legacy commit basis passes when its
+# contracts surface matches the current one.
 #
 # Usage:
 #   scripts/drift-check.sh            check every plan
