@@ -299,9 +299,10 @@ upgrade note.
 - Mapping to the client error categories (spec §5.4) belongs to M9 `rdb-api`.
   (Status 2026-10-19, M9 S4: done in `rdb-api`'s `compile_error`. `VersionConflict`,
   `ObjectAbsent`, `ElementAbsent` and `ElementExists` are `CONDITION_FAILED`; `ChunkConflict` is
-  `UPLOAD_CHUNK_CONFLICT`; every other `Apply` error is `INVALID_ARGUMENT`. Blob damage is
-  `CORRUPT_BLOB`, and any other `Corrupt` is `CORRUPT_HISTORY`. A list token whose list moved is
-  the kernel's `STALE_CONTINUATION`.)
+  `UPLOAD_CHUNK_CONFLICT`; every other `Apply` error is `INVALID_ARGUMENT`. Four blob damages are
+  `CORRUPT_BLOB`: `Manifest`, `Chunk`, `ChunkMissing` and `ChunkMismatch`. Any other `Corrupt` is
+  `CORRUPT_HISTORY`, a blob root whose envelope does not open (`Envelope`) included. A list token
+  whose list moved is the kernel's `STALE_CONTINUATION`.)
 
 ### 13. Who owns the object-key layout
 - A document lives at its object's root key, and the document API takes only a root key (amended

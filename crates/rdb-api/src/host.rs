@@ -3891,8 +3891,9 @@ fn compile_error(error: &ValueError) -> ApiError {
             ApiError::new(ErrorKind::UploadChunkConflict, error.to_string())
         }
         ValueError::Apply(_) => ApiError::new(ErrorKind::InvalidArgument, error.to_string()),
-        // A blob's manifest or chunks fail their checks. A record that does not open at all is
-        // still CORRUPT_HISTORY, whatever object it is.
+        // These four only: a blob root that is not a v1 manifest, or a chunk that does not
+        // open, is not stored, or is not the one the manifest names. A blob root whose envelope
+        // does not open is `Corrupt::Envelope`, so CORRUPT_HISTORY, as for any object.
         ValueError::Corrupt(
             Corrupt::Manifest(_)
             | Corrupt::Chunk { .. }
@@ -7225,6 +7226,33 @@ mod tests {
                 (ErrorKind::CorruptBlob, RetryRule::Quarantine, false)
             ),
             Ok(bytes) => panic!("a damaged chunk read as {bytes:?}"),
+        }
+
+        // A blob root whose envelope does not open is none of the four blob variants: it is
+        // CORRUPT_HISTORY, as for any object (review F4).
+        let damage = TxnRequest {
+            api_version: API_VERSION,
+            identity: identity(14),
+            affinity: AFFINITY,
+            expected_generation: None,
+            remaining_millis: 5_000,
+            conditions: Vec::new(),
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: root.to_bytes(),
+                value: Bytes::from_static(b"not an envelope"),
+                expected_version: None,
+            }],
+        };
+        match trio.ask(ClientCall::Resend { request: damage }) {
+            Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(6)),
+            other => panic!("the root damage write: {other:?}"),
+        }
+        match range(&mut trio, 15, 0, 4) {
+            Err(error) => assert_eq!(
+                (error.kind, error.retry, error.no_mutation),
+                (ErrorKind::CorruptHistory, RetryRule::Quarantine, false)
+            ),
+            Ok(bytes) => panic!("a damaged root read as {bytes:?}"),
         }
     }
 
