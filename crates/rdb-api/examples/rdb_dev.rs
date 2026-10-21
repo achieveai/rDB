@@ -98,7 +98,9 @@
 //!                                         `unchanged (already published)`; already there
 //!                                         but not yet published, `UNKNOWN_OUTCOME` with
 //!                                         `request=-`: ask `status` of the publish that
-//!                                         wrote it. Either sends nothing
+//!                                         wrote it. While reads are refused, as after a
+//!                                         fence, it answers as `read` does. Each sends
+//!                                         nothing
 //! blob gc <object> --floor F             delete one batch of the object's chunks its blob
 //!                                         does not name, at versions up to F. Nothing left to
 //!                                         delete answers `unchanged (nothing to collect)`

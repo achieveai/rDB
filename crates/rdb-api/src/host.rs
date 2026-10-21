@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rdb_core::authority::{Authority, AuthorityState, AuthorityTimer};
 use rdb_core::contracts::authority::{
-    AuthorityEffect, AuthorityView, DenyReason, FenceScope, Lineage, PartitionMode, Verdict,
+    AuthorityEffect, AuthorityView, Boundary, DenyReason, FenceScope, Lineage, PartitionMode,
+    Verdict,
 };
 use rdb_core::contracts::control::ControlEvent;
 use rdb_core::contracts::digest::{Digest, Domain};
@@ -3406,6 +3407,7 @@ impl Host {
                 })
                 .and_then(|compiled| {
                     if compiled.mutations.is_empty() {
+                        self.read_admitted(partition)?;
                         already_published(view, &root, published)?;
                     }
                     Ok(compiled)
@@ -3437,6 +3439,31 @@ impl Host {
             conditions,
             mutations,
         })))
+    }
+
+    /// "Already published" is a read (ADR-rdb-0014 O9), so it is given only while A1 admits a
+    /// read: A1's verdict on the adopted lineage, the one it answers P1's read check with. A deny
+    /// is refused as a read refused for it is (review F1).
+    fn read_admitted(&self, partition: PartitionId) -> Result<(), ApiError> {
+        let adopted = self.adopted(partition);
+        let lineage = Lineage {
+            partition,
+            generation: adopted.generation,
+            owner_epoch: adopted.owner_epoch,
+        };
+        match self
+            .authority
+            .may_admit_at(lineage, self.clock.now(), &self.budgets)
+        {
+            Verdict::Admit => Ok(()),
+            Verdict::Deny(reason) => {
+                let mut refused =
+                    crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
+                refused.detail =
+                    format!("a read is refused now ({reason:?}), so the publish is not confirmed");
+                Err(refused)
+            }
+        }
     }
 
     fn reply(&mut self, partition: PartitionId, reply: &ReplyEffect) -> Result<(), String> {
@@ -7246,6 +7273,58 @@ mod tests {
         match trio.ask(publish(4)) {
             Answer::Unchanged => {}
             other => panic!("the publish once published: {other:?}"),
+        }
+    }
+
+    /// Review F1 (A-R133), C-3 and ADR-rdb-0014 O9: "already published" is a read, so it is
+    /// given only while a read would be. A blob publishes; the control store then fails until
+    /// A1 fences node 1, and a plain read is refused. The same publish re-issued meanwhile is
+    /// refused as that read is, and sends nothing. Once the store returns and node 1 admits
+    /// again, the re-issue is `unchanged`. Mutant m24 (the read gate cut) answers `Unchanged`
+    /// while fenced, as 2cc5b24 did.
+    /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
+    #[config_log::retcd_test]
+    fn a_publish_reissued_while_fenced_is_refused_as_a_read_is_and_unchanged_once_admitted() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), |host| {
+            Trio::fast(host);
+            host.budgets.grant_millis = 600;
+            host.budgets.renew_millis = 100;
+        });
+        trio.bootstrap();
+        trio.ready();
+        assert_eq!(trio.write(chunk_call(1, b"f", 0, b"abcd", None)), Ok(2));
+        let publish = |request| publish_call(request, b"f", b"abcd", Some(Expected::Absent));
+        assert_eq!(trio.write(publish(2)), Ok(3));
+
+        trio.mem
+            .failing_with(config_core::ConfigError::Unavailable {
+                reason: "the control store is down".to_owned(),
+            });
+        trio.until("node 1 fenced", |trio| trio.status(0).fence.map(|_| ()));
+        let read = ClientCall::Get {
+            identity: identity(3),
+            object: Bytes::from_static(b"f"),
+            look: Look::Range { offset: 0, len: 4 },
+        };
+        let refused = match trio.ask(read) {
+            Answer::Read {
+                outcome: ReadServiceOutcome::Rejected(kind),
+                ..
+            } => crate::db::refused_read(kind),
+            other => panic!("a read while fenced: {other:?}"),
+        };
+        assert_eq!(
+            refusal(trio.ask(publish(4))),
+            (refused.kind, refused.retry, refused.no_mutation, false),
+            "the publish while fenced, as the read ({refused:?})"
+        );
+
+        trio.mem.stop_failing();
+        trio.ready();
+        match trio.ask(publish(5)) {
+            Answer::Unchanged => {}
+            other => panic!("the publish once node 1 admits again: {other:?}"),
         }
     }
 

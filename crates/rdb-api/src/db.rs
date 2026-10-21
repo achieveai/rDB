@@ -737,6 +737,8 @@ impl Db {
     /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
     ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
     ///   [`Self::status`] about that publish;
+    /// - for a `Publish` of the blob already at the object while A1 refuses reads, what
+    ///   [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), never "unchanged";
     /// - `UNAVAILABLE` when no compile answer came in time.
     pub fn write(
         &self,
@@ -1405,7 +1407,7 @@ fn byte_string(read: ReadOk) -> Result<GetOk, ApiError> {
 /// A read P1 refused with `kind`, with the retry rule and mutation proof the kernel's own table
 /// gives that kind, as a put's refusal has (F-011). The `RdbError` here only carries the kind
 /// to that table: its fields are placeholders, so its message never reaches the detail.
-fn refused_read(kind: ErrorKind) -> ApiError {
+pub(crate) fn refused_read(kind: ErrorKind) -> ApiError {
     let partition = PARTITION;
     let identity = RequestIdentity {
         tenant: TENANT,
