@@ -5155,8 +5155,9 @@ mod tests {
     /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
     /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
     /// Integration (~5 s at scale 1): the stall line waits two 2 s windows, then the row watches
-    /// twice L1's pause age to show L1 never paused.
-    #[test]
+    /// twice L1's pause age to show L1 never paused. Tagged so its lines land in its own log
+    /// file (#50).
+    #[config_log::retcd_test]
     fn a_start_cut_off_from_both_secondaries_heals_into_a_writable_partition() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), Trio::fast_pause);

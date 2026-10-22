@@ -42,6 +42,7 @@ use rdb_core::contracts::ids::{
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
+use tracing::{Instrument, Span};
 
 use crate::host::Msg;
 use crate::transport::Links;
@@ -121,6 +122,9 @@ impl ControlAdapter {
         };
         let store = Arc::clone(&self.store);
         let links = Arc::clone(&self.links);
+        // Every task below runs inside the submitter's span, so its lines land where the
+        // submitter's do (a test's own log file, not `_untagged`; #50). A node thread has no
+        // span, so there it changes nothing.
         if let ControlEffect::Reload { prefix } = effect {
             // Only the newest reload of a family may answer: an older snapshot posted after a
             // newer one would roll the node's cache back. Spawned under the lock, so the new
@@ -128,32 +132,40 @@ impl ControlAdapter {
             // older one's work; `reload` is what keeps it from answering.
             let failed = Arc::new(AtomicU32::new(0));
             let mut reloads = lock(&self.reloads);
-            let task = self.rt.spawn(reload(
-                store,
-                links,
-                Arc::clone(&self.reloads),
-                site,
-                prefix,
-                Arc::clone(&failed),
-            ));
+            let task = self.rt.spawn(
+                reload(
+                    store,
+                    links,
+                    Arc::clone(&self.reloads),
+                    site,
+                    prefix,
+                    Arc::clone(&failed),
+                )
+                .instrument(Span::current()),
+            );
             if let Some((old, _)) = reloads.insert((node, prefix), (task, failed)) {
                 old.abort();
             }
             return;
         }
         if let ControlEffect::Watch { prefix, from } = effect {
-            let task = self.rt.spawn(watch(store, links, site, prefix, from));
+            let task = self
+                .rt
+                .spawn(watch(store, links, site, prefix, from).instrument(Span::current()));
             if let Some(old) = lock(&self.watches).insert((node, prefix), task) {
                 old.abort();
             }
             return;
         }
-        let task = self.rt.spawn(async move {
-            match call(&*store, site, effect).await {
-                Ok(event) => post(&links, site, event),
-                Err((kind, detail)) => fault(&links, site, kind, detail),
+        let task = self.rt.spawn(
+            async move {
+                match call(&*store, site, effect).await {
+                    Ok(event) => post(&links, site, event),
+                    Err((kind, detail)) => fault(&links, site, kind, detail),
+                }
             }
-        });
+            .instrument(Span::current()),
+        );
         let mut tasks = lock(&self.tasks);
         let calls = tasks.entry(node).or_default();
         calls.retain(|task| !task.is_finished());
