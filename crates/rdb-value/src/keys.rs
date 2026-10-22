@@ -108,7 +108,7 @@ const MAX_ADJUSTED: i128 = BIAS + 18;
 const MAX_DIGITS: usize = 20;
 
 /// Why stored key bytes do not decode. Element keys come only from storage (a client sends a
-/// [`Value`]), so every one of these is damage.
+/// [`Value`]), so every one of these is damage, except [`KeyError::UnknownTag`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
     /// Shorter than the tenant and affinity prefix.
@@ -135,7 +135,9 @@ pub enum KeyError {
         /// The extra bytes.
         len: usize,
     },
-    /// The element key's type tag is not in profile v1.
+    /// The element key's type tag is not in profile v1. New key types come as new tags
+    /// (ADR-rdb-0013 decision 4), so this may be a newer build's key, not damage
+    /// ([`crate::Corrupt::is_newer_build`]; review R-3).
     #[error("unknown element key tag {0:#04x}")]
     UnknownTag(u8),
     /// The element key ends inside a fixed-width body.

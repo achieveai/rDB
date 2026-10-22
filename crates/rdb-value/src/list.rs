@@ -637,7 +637,7 @@ struct Loaded {
 }
 
 /// The slot op no `op` lives in: `op mod 240`.
-fn slot_of(op: u64) -> u8 {
+pub(crate) fn slot_of(op: u64) -> u8 {
     u8::try_from(op % SLOTS).expect("a slot is below 240")
 }
 

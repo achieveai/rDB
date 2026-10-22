@@ -183,8 +183,10 @@ pub enum Corrupt {
 impl Corrupt {
     /// Whether the record that fails is a newer build's, not damage (ADR-rdb-0012 §12): an
     /// envelope [`EnvelopeError::is_newer_build`] names, the root's or a chunk's, list block's or
-    /// change slot's; an unknown element key profile; or an unknown sub. Such a record may be
-    /// valid, so it is answered `INCOMPATIBLE_VERSION` and never cleared.
+    /// change slot's; an unknown element key profile; an unknown sub; or an element key tag
+    /// profile 1 does not define, since new key types come as new tags (ADR-rdb-0013 decision 4;
+    /// review R-3, A-R145). Such a record may be valid, so it is answered `INCOMPATIBLE_VERSION`
+    /// and never cleared.
     #[must_use]
     pub fn is_newer_build(&self) -> bool {
         match self {
@@ -199,7 +201,9 @@ impl Corrupt {
                     },
                 ..
             } => error.is_newer_build(),
-            Self::UnknownKeyProfile(_) | Self::UnknownSub(_) => true,
+            Self::UnknownKeyProfile(_)
+            | Self::UnknownSub(_)
+            | Self::Key(KeyError::UnknownTag(_)) => true,
             _ => false,
         }
     }

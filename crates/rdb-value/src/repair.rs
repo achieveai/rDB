@@ -11,14 +11,20 @@
 //!   apply makes the kernel refuse the whole batch. So does a record the proof found missing, by
 //!   its `Absent` condition.
 //! - **Clean records first; faulting records, then the root, last.** A batch that does not empty
-//!   the object keeps the root and every faulting record, so the object still reads as damaged
-//!   until the last batch.
+//!   the object keeps the root and every faulting record.
+//! - **Never healthy while half cleared.** A batch that leaves any record is checked against
+//!   what it leaves: the object must still prove damaged, or deletes are taken back from its end
+//!   until it does (review R-1). Otherwise the next call would answer "not damaged" over what is
+//!   left.
+
+use std::collections::BTreeSet;
 
 use bytes::Bytes;
+use rdb_core::contracts::trace::Version;
 use rdb_core::replication::append::MAX_ENVELOPE_BYTES;
 use rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
 use rdb_core::transaction::record_len;
-use rdb_core::{Condition, Mutation, Namespace, SnapshotRead};
+use rdb_core::{Condition, Generation, Mutation, Namespace, Seq, SnapshotHandle, SnapshotRead};
 
 use crate::blob::{check_chunk, read_blob, verify_chunks, Manifest};
 use crate::collection::{
@@ -27,8 +33,8 @@ use crate::collection::{
 use crate::compile::{read, record, BlockFault, Compiled, Corrupt, SlotFault, ValueError};
 use crate::delta::{ApplyError, SizeLimit};
 use crate::envelope::{open, Kind};
-use crate::keys::{block_key, chunk_key, item_key, parse, KeyError, RootKey, Sub};
-use crate::list::{check_base, check_item, check_slot, drop_list, items, list, Start};
+use crate::keys::{block_key, chunk_key, item_key, parse, slot_key, KeyError, RootKey, Sub};
+use crate::list::{check_base, check_item, check_slot, drop_list, items, list, slot_of, Start};
 
 /// The most deletes of records other than the root in one batch: one less than a request
 /// carries, so the batch that empties the object still has room for the root.
@@ -97,7 +103,30 @@ pub fn clear_object(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
 ) -> Result<Option<Cleared>, ValueError> {
-    let (root_version, proof) = match record(snapshot, root.as_bytes())? {
+    let (root_version, proof) = assess(snapshot, root)?;
+    let reader = proof.as_ref().map_or(&Reader::Unchecked, |p| &p.reader);
+    let records = scan(snapshot, root, reader)?;
+    let (damage, missing) = match proof {
+        Some(proof) => (proof.damage, proof.missing),
+        None if records.is_empty() => return Ok(None),
+        None => (prove_absent(&records)?, Vec::new()),
+    };
+    let still_damaged = |deletes: &[Mutation]| proves_after(snapshot, root, deletes);
+    let (compiled, faulting) = batch(root, root_version, missing, records, still_damaged)?;
+    Ok(Some(Cleared {
+        compiled,
+        damage,
+        faulting,
+    }))
+}
+
+/// The root's version and the proof that the object is damaged, both `None` with no root. A
+/// root that opens is proved by its kind's read; one that does not is damage.
+fn assess(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+) -> Result<(Option<u64>, Option<Proof>), ValueError> {
+    Ok(match record(snapshot, root.as_bytes())? {
         None => (None, None),
         Some((version, bytes)) => match open(&bytes) {
             Ok(opened) => (
@@ -116,24 +145,98 @@ pub fn clear_object(
                 }),
             ),
         },
+    })
+}
+
+/// Whether the object still proves damaged once `deletes` apply, by the same proof the clear
+/// starts with (review R-1). A batch that leaves any record must leave this true.
+fn proves_after(
+    snapshot: &dyn SnapshotRead,
+    root: &RootKey,
+    deletes: &[Mutation],
+) -> Result<bool, ValueError> {
+    let left = Without::new(snapshot, deletes);
+    let proved = match assess(&left, root) {
+        Ok((_, Some(_))) => return Ok(true),
+        Ok((_, None)) => scan(&left, root, &Reader::Unchecked).and_then(|r| prove_absent(&r)),
+        Err(error) => Err(error),
     };
-    let reader = proof.as_ref().map_or(&Reader::Unchecked, |p| &p.reader);
-    let records = scan(snapshot, root, reader)?;
-    let count = match reader {
-        Reader::Collection(found) => Some(found.count),
-        _ => None,
-    };
-    let (damage, missing) = match proof {
-        Some(proof) => (proof.damage, proof.missing),
-        None if records.is_empty() => return Ok(None),
-        None => (prove_absent(&records)?, Vec::new()),
-    };
-    let (compiled, faulting) = batch(root, root_version, count, missing, records)?;
-    Ok(Some(Cleared {
-        compiled,
-        damage,
-        faulting,
-    }))
+    match proved {
+        Ok(_) => Ok(true),
+        Err(ValueError::Apply(ApplyError::NotDamaged | ApplyError::OnlyChunks)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// A snapshot with the records some deletes name taken out: what a batch would leave.
+struct Without<'a> {
+    snapshot: &'a dyn SnapshotRead,
+    deleted: BTreeSet<&'a [u8]>,
+}
+
+impl<'a> Without<'a> {
+    fn new(snapshot: &'a dyn SnapshotRead, deletes: &'a [Mutation]) -> Self {
+        let deleted = deletes
+            .iter()
+            .filter_map(|m| match m {
+                Mutation::Delete { key, .. } => Some(key.as_ref()),
+                Mutation::Put { .. } => None,
+            })
+            .collect();
+        Self { snapshot, deleted }
+    }
+
+    fn gone(&self, ns: Namespace, key: &[u8]) -> bool {
+        ns == Namespace::User && self.deleted.contains(key)
+    }
+}
+
+impl SnapshotRead for Without<'_> {
+    fn handle(&self) -> SnapshotHandle {
+        self.snapshot.handle()
+    }
+
+    fn at(&self) -> Seq {
+        self.snapshot.at()
+    }
+
+    fn generation(&self) -> Generation {
+        self.snapshot.generation()
+    }
+
+    fn get(&self, ns: Namespace, key: &[u8]) -> Option<Bytes> {
+        (!self.gone(ns, key))
+            .then(|| self.snapshot.get(ns, key))
+            .flatten()
+    }
+
+    fn version(&self, ns: Namespace, key: &[u8]) -> Option<Version> {
+        (!self.gone(ns, key))
+            .then(|| self.snapshot.version(ns, key))
+            .flatten()
+    }
+
+    /// Pages past the records taken out, so a scan still returns `limit` records when that
+    /// many are left.
+    fn scan(&self, ns: Namespace, from: &[u8], limit: usize) -> Vec<(Bytes, Bytes)> {
+        let mut out = Vec::new();
+        let mut from = from.to_vec();
+        while out.len() < limit {
+            let want = limit - out.len();
+            let page = self.snapshot.scan(ns, &from, want);
+            let full = page.len() == want;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            from = last.to_vec();
+            from.push(0x00);
+            out.extend(page.into_iter().filter(|(key, _)| !self.gone(ns, key)));
+            if !full {
+                break;
+            }
+        }
+        out
+    }
 }
 
 /// No root: an element, item or block record is an orphan, and a record whose key does not
@@ -228,8 +331,8 @@ fn prove_collection(
     proven(damage, Reader::Collection(found), Vec::new())
 }
 
-/// A list: its root, every item as [`items`] reads them, then [`drop_list`]. A block or item the
-/// list names and the read found missing gets an `Absent` condition.
+/// A list: its root, every item as [`items`] reads them, then [`drop_list`]. A block, item or
+/// pending slot the list names and the read found missing gets an `Absent` condition.
 fn prove_list(
     snapshot: &dyn SnapshotRead,
     root: &RootKey,
@@ -251,6 +354,15 @@ fn prove_list(
             fault: BlockFault::Missing,
         }) => vec![block_key(root, *id)],
         Some(Corrupt::ItemMissing { id }) => vec![item_key(root, *id)],
+        // A pending slot not stored (review Q-1). `OpMissing` also names a slot stored with
+        // another op in it: that one is in the scan, and its delete names its version.
+        Some(Corrupt::Block {
+            id,
+            fault: BlockFault::OpMissing { op },
+        }) => Some(slot_key(root, *id, slot_of(*op)))
+            .filter(|key| snapshot.get(Namespace::User, key).is_none())
+            .into_iter()
+            .collect(),
         _ => Vec::new(),
     };
     proven(damage, Reader::List(version), missing)
@@ -341,8 +453,16 @@ fn faulting(
             }
         }
     }
-    let Ok(parsed) = parsed else {
-        return Ok(checked);
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        // An element key tag this build does not know is a newer build's key (review R-3).
+        Err(error) => {
+            let corrupt = Corrupt::Key(error);
+            if corrupt.is_newer_build() {
+                return Err(ValueError::Corrupt(corrupt));
+            }
+            return Ok(checked);
+        }
     };
     let check = match (
         reader,
@@ -390,21 +510,17 @@ fn faulting(
 
 /// Clean records in key order, then faulting ones, then the root in the batch that empties the
 /// rest. Every batch carries an `Absent` for each key the proof found missing, and every batch
-/// that keeps the root is guarded by it as read: its version, or its absence. A batch that keeps
-/// the root of a map or set never leaves exactly the `count` elements the root names (review
-/// F-003). Also returns how many faulting records the batch deletes.
+/// that keeps the root is guarded by it as read: its version, or its absence. A batch that
+/// leaves any record leaves the object `still_damaged` (review F-003 for a map's count, R-1
+/// for every kind). Also returns how many faulting records the batch deletes.
 fn batch(
     root: &RootKey,
     root_version: Option<u64>,
-    count: Option<u64>,
     missing: Vec<Bytes>,
     records: Vec<Found>,
+    still_damaged: impl Fn(&[Mutation]) -> Result<bool, ValueError>,
 ) -> Result<(Compiled, usize), ValueError> {
     let total = records.len();
-    let elements = records
-        .iter()
-        .filter(|f| matches!(f.sub, Ok(Sub::Element)))
-        .count();
     let (clean, faulting): (Vec<_>, Vec<_>) = records.into_iter().partition(|f| !f.faulting);
     let clean_len = clean.len();
     let guard = match root_version {
@@ -421,13 +537,13 @@ fn batch(
         .map(|key| Condition::Absent { key })
         .collect();
     let mut mutations = Vec::new();
-    // Per delete: whether it is of an element, and of a faulting record.
+    // Per delete: whether it is of a faulting record.
     let mut deleted = Vec::new();
     for found in clean.into_iter().chain(faulting) {
         if mutations.len() == MAX_CLEAR_DELETES {
             break;
         }
-        deleted.push((matches!(found.sub, Ok(Sub::Element)), found.faulting));
+        deleted.push(found.faulting);
         mutations.push(Mutation::Delete {
             key: found.key,
             expected_version: Some(found.version),
@@ -456,14 +572,15 @@ fn batch(
         }
         mutations.pop();
     }
-    // C-1: with the root kept and every element left clean, `count` elements left would read
-    // back as healthy. One element fewer in this batch leaves one more, so the object still
-    // reads as damaged.
-    let left = elements - deleted.iter().filter(|(element, _)| *element).count();
-    if count.is_some_and(|count| u64::try_from(left).is_ok_and(|left| left == count)) {
-        if let Some(at) = deleted.iter().rposition(|(element, _)| *element) {
-            mutations.remove(at);
-            deleted.remove(at);
+    // The batch leaves the root, or with no root some record. If what it leaves would read back
+    // cleanly, the next call would answer "not damaged" over it: a map left holding exactly the
+    // `count` elements its root names (F-003), an empty list left without its orphans (R-1).
+    // Each delete taken back from the end leaves one more record; with none taken, the object
+    // is as proved.
+    if root_version.is_some() || mutations.len() < total {
+        while !mutations.is_empty() && !still_damaged(&mutations)? {
+            mutations.pop();
+            deleted.pop();
         }
     }
     if mutations.is_empty() {
@@ -472,7 +589,7 @@ fn batch(
         }
         .into());
     }
-    let faulting = deleted.iter().filter(|(_, faulting)| *faulting).count();
+    let faulting = deleted.iter().filter(|faulting| **faulting).count();
     let mut conditions = vec![guard];
     conditions.extend(absent);
     Ok((
