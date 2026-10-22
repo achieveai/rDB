@@ -91,6 +91,16 @@ pub enum Corrupt {
     /// build's record, not damage (ADR-rdb-0012 §12). Only a clear looks there (M9 S6).
     #[error("a record at unknown sub {0:#04x}")]
     UnknownSub(u8),
+    /// A map entry a map write names does not open, because a newer build wrote it (#55, ruling
+    /// A-R150 F7). A map write names the key, single-op too; a read or a clear meeting the same
+    /// entry answers [`Corrupt::Envelope`].
+    #[error("map entry {}: {error}", key_text(.key))]
+    Entry {
+        /// The entry's key, as the write named it.
+        key: Value,
+        /// Why it does not open.
+        error: EnvelopeError,
+    },
     /// A map entry's envelope is not a document.
     #[error("map entry envelope is a {found:?}, not a Document")]
     EntryNotDocument {
@@ -182,15 +192,16 @@ pub enum Corrupt {
 
 impl Corrupt {
     /// Whether the record that fails is a newer build's, not damage (ADR-rdb-0012 §12): an
-    /// envelope [`EnvelopeError::is_newer_build`] names, the root's or a chunk's, list block's or
-    /// change slot's; an unknown element key profile; an unknown sub; or an element key tag
-    /// profile 1 does not define, since new key types come as new tags (ADR-rdb-0013 decision 4;
-    /// review R-3, A-R145). Such a record may be valid, so it is answered `INCOMPATIBLE_VERSION`
-    /// and never cleared.
+    /// envelope [`EnvelopeError::is_newer_build`] names, the root's or a named map entry's, a
+    /// chunk's, list block's or change slot's; an unknown element key profile; an unknown sub;
+    /// or an element key tag profile 1 does not define, since new key types come as new tags
+    /// (ADR-rdb-0013 decision 4; review R-3, A-R145). Such a record may be valid, so it is
+    /// answered `INCOMPATIBLE_VERSION` and never cleared.
     #[must_use]
     pub fn is_newer_build(&self) -> bool {
         match self {
             Self::Envelope(error)
+            | Self::Entry { error, .. }
             | Self::Chunk { error, .. }
             | Self::Block {
                 fault:
@@ -207,6 +218,79 @@ impl Corrupt {
             _ => false,
         }
     }
+}
+
+/// The longest key text [`key_text`] shows, in chars, before it cuts the rest to `…`.
+const KEY_TEXT_CAP: usize = 64;
+
+/// A map key as an error names it to the caller (#55, ruling A-R150 F5), safe for a terminal
+/// (never for a log line, which carries a key only as `key_hex`: ADR-0013, ruling A-R154):
+/// text quoted with every control char escaped (`escape_debug`), bytes as `h'<hex>'`, numbers,
+/// `true`/`false`/`null` canonical, a decimal as `4([exponent, mantissa])` and a timestamp as
+/// `1001({1: secs, -9: nanos})`, as CBOR's diagnostic notation writes them. A key whose text,
+/// without its quotes or `h'`, runs over [`KEY_TEXT_CAP`] chars is cut to at most that many and
+/// ends `…`. The cut falls between escapes, never inside one (A-R152).
+fn key_text(key: &Value) -> String {
+    use std::fmt::Write as _;
+    let (open, body, close) = match key {
+        Value::Text(s) => ("\"", s.escape_debug().to_string(), "\""),
+        Value::Bytes(b) => {
+            let mut hex = String::with_capacity(b.len() * 2);
+            for byte in b {
+                write!(hex, "{byte:02x}").expect("writing to a String does not fail");
+            }
+            ("h'", hex, "'")
+        }
+        Value::Null => ("", "null".to_owned(), ""),
+        Value::Bool(b) => ("", b.to_string(), ""),
+        Value::Integer(i) => ("", i.get().to_string(), ""),
+        Value::Float(f) => ("", format!("{:?}", f.get()), ""),
+        Value::Decimal(d) => (
+            "",
+            format!("4([{}, {}])", d.exponent(), d.mantissa().get()),
+            "",
+        ),
+        Value::Timestamp(t) if t.nanos() == 0 => ("", format!("1001({{1: {}}})", t.secs()), ""),
+        Value::Timestamp(t) => (
+            "",
+            format!("1001({{1: {}, -9: {}}})", t.secs(), t.nanos()),
+            "",
+        ),
+        // Not a key type (`UnsupportedKeyType`); never named by a write that got this far.
+        Value::Array(_) => ("", "an array".to_owned(), ""),
+        Value::Map(_) => ("", "a map".to_owned(), ""),
+    };
+    if body.chars().count() <= KEY_TEXT_CAP {
+        return format!("{open}{body}{close}");
+    }
+    let mut text = open.to_owned();
+    let mut kept = 0;
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        // One unit: a plain char, or a whole escape `escape_debug` wrote (`\n`, `\\`, `\u{1b}`).
+        let mut unit = String::from(c);
+        if c == '\\' {
+            let next = chars
+                .next()
+                .expect("escape_debug never ends on a lone backslash");
+            unit.push(next);
+            if next == 'u' {
+                for d in chars.by_ref() {
+                    unit.push(d);
+                    if d == '}' {
+                        break;
+                    }
+                }
+            }
+        }
+        kept += unit.chars().count();
+        if kept > KEY_TEXT_CAP {
+            break;
+        }
+        text.push_str(&unit);
+    }
+    text.push('…');
+    text
 }
 
 /// Why a list block is refused (ADR-rdb-0016 §7). An unknown kind, codec or format inside

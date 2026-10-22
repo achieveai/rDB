@@ -3547,10 +3547,13 @@ dependencies = [
  "config-log",
  "config-log-macros",
  "config-testkit",
+ "rdb-api",
  "rdb-core",
+ "rdb-value",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
 ]
 

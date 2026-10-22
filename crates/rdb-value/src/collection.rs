@@ -259,13 +259,17 @@ pub fn compile_collection(
                 };
                 // M9 S7 (A-R144 Q2): a map write never overwrites, deletes or vouches for a newer
                 // build's entry. Named before its version, as a read names it; a damaged entry
-                // still passes, so `put`/`del` stays the app's repair (ADR-rdb-0013 §10).
+                // still passes, so `put`/`del` stays the app's repair (ADR-rdb-0013 §10). The
+                // refusal names the entry's key (#55, A-R150 F7).
                 if kind == CollectionKind::Map && version.is_some() {
                     if let Some(error) = snapshot
                         .get(Namespace::User, entry.key())
                         .and_then(|bytes| newer_build(&bytes))
                     {
-                        return Err(ValueError::Corrupt(Corrupt::Envelope(error)));
+                        return Err(ValueError::Corrupt(Corrupt::Entry {
+                            key: key.clone(),
+                            error,
+                        }));
                     }
                 }
                 // Lead ruling on tester W1 A2: a touched element newer than its root is the

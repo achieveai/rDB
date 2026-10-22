@@ -40,26 +40,23 @@ mod support;
 
 use bytes::Bytes;
 use config_log::retcd_test;
-use rdb_core::authority::partition::PartitionRecord;
 use rdb_core::contracts::authority::PartitionMode;
-use rdb_core::contracts::control::ControlKey;
-use rdb_core::contracts::digest::Digest;
 use rdb_core::contracts::errors::ErrorKind;
 use rdb_core::contracts::event::ModuleName;
-use rdb_core::contracts::event::{Budgets, ClientEvent, EventKind, KernelEvent, ReplyEffect};
+use rdb_core::contracts::event::{ClientEvent, EventKind, ReplyEffect};
 use rdb_core::contracts::ids::{
-    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, OwnerEpoch, RequestId,
+    AffinityId, ClientId, CorrelationId, DurableSeq, Generation, NodeId, RequestId,
     RequestIdentity, Seq, TenantId,
 };
 use rdb_core::contracts::ignore::{KernelIgnoredReason, ReplicaIgnoreReason};
 use rdb_core::contracts::membership::CopyId;
-use rdb_core::contracts::recovery::{RecoveryEffect, RecoveryEvent, SurvivorInventory};
+use rdb_core::contracts::recovery::RecoveryEffect;
 use rdb_core::contracts::storage::StorageFault;
 use rdb_core::contracts::time::Tick;
 use rdb_core::contracts::trace::{AckRejectReason, ApplyOutcome};
 use rdb_core::contracts::trace::{
-    BudgetName, KernelNote, ProtectionPhase, Provenance, ReadServiceOutcome, SyncWithheldReason,
-    Trace, TraceKind,
+    BudgetName, KernelNote, ProtectionPhase, ReadServiceOutcome, SyncWithheldReason, Trace,
+    TraceKind,
 };
 use rdb_core::contracts::txn::{scoped_key, Mutation, TxnRequest, TxnResult};
 use rdb_core::contracts::version::API_VERSION;
@@ -73,10 +70,7 @@ use rdb_sim::storage::StorageOp;
 
 use support::oracle::Oracle;
 use support::scenarios::cases::{self, A_NODE, B_NODE, C_NODE, PARTITION, PLAN_AT};
-use support::scenarios::grammar::{
-    Budget, RecoveryOp, Scenario, ScenarioOp, TimeOp, SCENARIO_GENERATOR_VERSION,
-    SCENARIO_SCHEMA_VERSION,
-};
+use support::scenarios::grammar::{Scenario, ScenarioOp, TimeOp};
 use support::scenarios::run as scenario_run;
 
 /// When the client writes, as in the corpus case. The probe saw L1 healthy at t7503 in both
@@ -99,38 +93,7 @@ fn empty(survivors: &[NodeId]) -> Scenario {
 /// The survivors in `survivors` hold the prior lineage through `head`; the run ends at
 /// `max_ticks`.
 fn held(survivors: &[NodeId], head: Seq, max_ticks: u64) -> Scenario {
-    let mut ops: Vec<ScenarioOp> = survivors
-        .iter()
-        .map(|node| {
-            ScenarioOp::Recovery(RecoveryOp::Synchronize {
-                node: *node,
-                to: head,
-            })
-        })
-        .collect();
-    ops.extend([
-        ScenarioOp::Time(TimeOp::Advance { ticks: PLAN_AT }),
-        ScenarioOp::Recovery(RecoveryOp::InspectSurvivors {
-            partition: PARTITION,
-            window: Budgets::SPEC_DEFAULTS.discovery_window_millis,
-        }),
-        ScenarioOp::Time(TimeOp::Advance {
-            ticks: max_ticks - PLAN_AT,
-        }),
-    ]);
-    Scenario {
-        schema_version: SCENARIO_SCHEMA_VERSION,
-        generator_version: SCENARIO_GENERATOR_VERSION,
-        provenance: Provenance::Authored {
-            case: String::from("m9_s0_empty_partition"),
-        },
-        topology: cases::rf3_partition_1(),
-        budget: Budget {
-            max_events: 50_000,
-            max_ticks,
-        },
-        ops,
-    }
+    cases::m9_s0_held(survivors, head, max_ticks)
 }
 
 /// The client's one write, to the primary B, at [`SUBMIT_AT`].
@@ -173,56 +136,7 @@ fn case_a() -> RunPlan {
 /// Case B: the real host's shape. Case A's plan edited so all three copies are empty survivors
 /// and the prior lineage is generation 0, epoch 0, owned by B, so F1 creates generation 1.
 fn case_b() -> RunPlan {
-    let mut plan = scenario_run::lower(&empty(&[B_NODE, C_NODE])).expect("lowers");
-    let gen0 = |lineage: &mut rdb_core::contracts::authority::Lineage| {
-        assert_eq!(
-            lineage.generation,
-            Generation(1),
-            "the lowering's prior lineage"
-        );
-        lineage.generation = Generation(0);
-        lineage.owner_epoch = OwnerEpoch(0);
-    };
-    for (key, value) in &mut plan.control_records {
-        if *key == ControlKey::Partition(PARTITION) {
-            let mut record = PartitionRecord::decode(value).expect("decodes");
-            record.generation = Generation(0);
-            record.owner_epoch = OwnerEpoch(0);
-            record.owner = B_NODE;
-            *value = record.encode();
-        }
-    }
-    for seed in &mut plan.seed {
-        match &mut seed.kind {
-            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::Plan(p))) => {
-                gen0(&mut p.anchor.lineage);
-                gen0(&mut p.authority_view.lineage);
-            }
-            EventKind::Kernel(KernelEvent::Recovery(RecoveryEvent::FenceProven(f))) => {
-                f.prior_generation = Generation(0);
-                f.prior_owner_epoch = OwnerEpoch(0);
-            }
-            _ => {}
-        }
-    }
-    for (_, _, generation, _) in &mut plan.preload_durable {
-        *generation = Generation(0);
-    }
-    for (_, _, inventory) in &mut plan.survivors {
-        gen0(&mut inventory.anchor_seen.lineage);
-        assert_eq!(
-            inventory.head,
-            (Seq::ZERO, Digest::ROOT),
-            "an empty survivor heads at the root"
-        );
-    }
-    let a_inventory = SurvivorInventory {
-        copy: CopyId(2),
-        ..plan.survivors[0].2.clone()
-    };
-    plan.preload_durable
-        .push((A_NODE, PARTITION, Generation(0), DurableSeq(0)));
-    plan.survivors.push((A_NODE, PARTITION, a_inventory));
+    let mut plan = cases::m9_s0_case_b(MAX_TICKS);
     plan.seed.push(submit());
     plan
 }

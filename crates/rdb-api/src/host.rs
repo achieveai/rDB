@@ -3210,7 +3210,9 @@ impl Host {
                     change = puts.first().map_or("none", |put| put.change.name()),
                     compiled = matches!(answer, Answer::Compiled(_)),
                     unchanged = matches!(answer, Answer::Unchanged),
-                    reason = %match &answer { Answer::Error { error, .. } => error.to_string(), _ => String::new() },
+                    // The kind only: a refusal's detail can name a map key or a path segment
+                    // as text, and a log never carries a key's text (ADR-0013, A-R154).
+                    kind = %match &answer { Answer::Error { error, .. } => error.name(), _ => String::new() },
                     "client_compile"
                 );
                 let _ = reply.send(answer);
@@ -5155,8 +5157,9 @@ mod tests {
     /// Not D4's regression guard: stepped by hand, it passed 20 of 20 with D4 unfixed, where the
     /// threaded walk lost a copy in ~3 of 23. The sim row `m9_d4_00` guards D4.
     /// Integration (~5 s at scale 1): the stall line waits two 2 s windows, then the row watches
-    /// twice L1's pause age to show L1 never paused.
-    #[test]
+    /// twice L1's pause age to show L1 never paused. Tagged so its lines land in its own log
+    /// file (#50).
+    #[config_log::retcd_test]
     fn a_start_cut_off_from_both_secondaries_heals_into_a_writable_partition() {
         let dir = config_testkit::fs::temp_dir();
         let mut trio = Trio::new(dir.path(), Trio::fast_pause);
@@ -5718,6 +5721,8 @@ mod tests {
         }
         assert_eq!(not_advancing!(METHOD).len(), 0, "level with the head");
 
+        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+        trio.admits_for(1_000);
         match trio.ask(put(1, b"a", b"1", None)) {
             Answer::Txn { result, .. } => assert_eq!(result.seq, Seq(2)),
             other => panic!("put a=1: {other:?}"),
@@ -6768,6 +6773,8 @@ mod tests {
             .count();
         assert_eq!(dequeued, 1, "the queued resend was released by the expiry");
 
+        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+        trio.admits_for(1_000);
         match trio.ask(ClientCall::Resend { request: compiled }) {
             Answer::Txn { result, .. } => assert_eq!(result, status, "the replayed result"),
             other => panic!("request 1 resent after expiry: {other:?}"),
@@ -7121,6 +7128,8 @@ mod tests {
         trio.bootstrap();
         trio.ready();
         assert!(logged!(METHOD, "authority_check_denied").is_empty());
+        // A stall on this thread past the grant lapses it (#50): ask with time left on it.
+        trio.admits_for(1_000);
         trio.mem
             .failing_with(config_core::ConfigError::Unavailable {
                 reason: "the control store is down".to_owned(),
@@ -8342,6 +8351,171 @@ mod tests {
 
     fn clear_call(request: u64, object: &'static [u8]) -> ClientCall {
         compile_change(request, object, Change::Clear, None)
+    }
+
+    /// #55 (A-R150 F6, F7): a map write that names a newer build's entry is refused at the
+    /// compile, and the detail names the entry's key, after the op index and the newer-build
+    /// prefix: `op 0: written by a newer build: map entry "b": ...`. Two ops or one, the same
+    /// text. Nothing is sent, so `d` keeps its value; a page after `b` reads it.
+    /// Integration (~1 s): Trio, three map writes and a page.
+    #[config_log::retcd_test]
+    fn m9_s7_a_map_write_refused_for_a_newer_entry_names_its_key() {
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let made = Change::Map(vec![
+            ElemOp::Put(text("a"), int(1)),
+            ElemOp::Put(text("b"), int(2)),
+            ElemOp::Put(text("d"), int(3)),
+        ]);
+        assert_eq!(
+            trio.write(compile_change(1, b"m", made, Some(Expected::Absent))),
+            Ok(2)
+        );
+        // `admin damage m --element "b" --as newer`: the entry's record, not the root's.
+        let root = root_key(TenantId(1), AFFINITY, b"m");
+        let damage = TxnRequest {
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::element_key(&root, &text("b")).expect("a text key"),
+                value: newer_build_document(),
+                expected_version: None,
+            }],
+            ..damage_write(2, b"m", Bytes::new())
+        };
+        assert_eq!(trio.sent(damage), Ok(3));
+
+        let named = "op 0: written by a newer build: map entry \"b\": unknown codec version 0x02";
+        for (request, ops) in [
+            (
+                3,
+                vec![
+                    ElemOp::Put(text("d"), int(4)),
+                    ElemOp::Put(text("b"), int(9)),
+                ],
+            ),
+            (4, vec![ElemOp::Put(text("b"), int(9))]),
+        ] {
+            match trio.ask(compile_change(request, b"m", Change::Map(ops), None)) {
+                Answer::Error {
+                    error,
+                    request: sent,
+                } => assert_eq!(
+                    (error.kind, error.detail.as_str(), sent.is_some()),
+                    (ErrorKind::IncompatibleVersion, named, false),
+                    "request {request}"
+                ),
+                other => panic!("not refused: {other:?}"),
+            }
+        }
+        let after_b = Look::Members {
+            after: Some(text("b")),
+            limit: 10,
+        };
+        match trio.look(5, b"m", after_b) {
+            Ok(Seen::Members(page)) => {
+                let entries: Vec<_> = page
+                    .members
+                    .iter()
+                    .map(|member| (member.key.clone(), member.value.clone()))
+                    .collect();
+                assert_eq!(entries, [(text("d"), Some(int(3)))], "d is unchanged");
+            }
+            other => panic!("members of m after b: {other:?}"),
+        }
+    }
+
+    /// Ruling A-R154 (PR #56, Revobot Q4): a log line never carries a map key's text (ADR-0013).
+    /// A map write refused for a newer build's entry (#55) and a document write whose path
+    /// names a missing map key both answer the caller with the key readable, as before. Their
+    /// `client_compile` lines carry the refusal's kind only, and no line of the test's log
+    /// holds either key's text.
+    /// Integration (~1 s): Trio, two writes, a raw damage write and two refused compiles.
+    #[config_log::retcd_test]
+    fn m9_close_a_refused_write_answers_its_key_and_never_logs_it() {
+        const METHOD: &str = "m9_close_a_refused_write_answers_its_key_and_never_logs_it";
+        // Distinct from every other word in the log, the test's own name included.
+        const ENTRY: &str = "kq7-entry";
+        const SEGMENT: &str = "zx9-field";
+        let dir = config_testkit::fs::temp_dir();
+        let mut trio = Trio::new(dir.path(), Trio::fast);
+        trio.bootstrap();
+        trio.ready();
+        let made = Change::Map(vec![ElemOp::Put(text(ENTRY), int(1))]);
+        assert_eq!(
+            trio.write(compile_change(1, b"m", made, Some(Expected::Absent))),
+            Ok(2)
+        );
+        let root = root_key(TenantId(1), AFFINITY, b"m");
+        let damage = TxnRequest {
+            mutations: vec![rdb_core::contracts::txn::Mutation::Put {
+                key: rdb_value::keys::element_key(&root, &text(ENTRY)).expect("a text key"),
+                value: newer_build_document(),
+                expected_version: None,
+            }],
+            ..damage_write(2, b"m", Bytes::new())
+        };
+        assert_eq!(trio.sent(damage), Ok(3));
+        let doc = Change::Doc(Delta(vec![Op::Replace(json_map(&[("a", int(1))]))]));
+        assert_eq!(
+            trio.write(compile_change(3, b"doc", doc, Some(Expected::Absent))),
+            Ok(4)
+        );
+
+        let refused = [
+            (
+                4,
+                b"m" as &'static [u8],
+                Change::Map(vec![ElemOp::Put(text(ENTRY), int(9))]),
+                ErrorKind::IncompatibleVersion,
+                format!(
+                    "op 0: written by a newer build: map entry \"{ENTRY}\": unknown codec \
+                     version 0x02"
+                ),
+            ),
+            (
+                5,
+                b"doc",
+                Change::Doc(Delta(vec![Op::Remove(path(&format!("/{SEGMENT}")))])),
+                ErrorKind::InvalidArgument,
+                format!("op 0: nothing at segment \"{SEGMENT}\""),
+            ),
+        ];
+        for (request, object, change, kind, detail) in refused {
+            match trio.ask(compile_change(request, object, change, None)) {
+                Answer::Error { error, .. } => assert_eq!(
+                    (error.kind, error.detail.as_str()),
+                    (kind, detail.as_str()),
+                    "request {request}: the reply names the key readably"
+                ),
+                other => panic!("request {request} not refused: {other:?}"),
+            }
+        }
+
+        let compiles = logged!(METHOD, "client_compile");
+        for (request, kind) in [(4, "INCOMPATIBLE_VERSION"), (5, "INVALID_ARGUMENT")] {
+            let lines: Vec<_> = compiles
+                .iter()
+                .filter(|line| line["request"] == request)
+                .collect();
+            assert!(
+                !lines.is_empty(),
+                "request {request}: no client_compile line"
+            );
+            for line in lines {
+                assert!(
+                    line["compiled"] == false && line["kind"] == kind,
+                    "request {request}: {line}"
+                );
+            }
+        }
+        let leaks: Vec<String> =
+            config_testkit::logs::lines_for_current_test(module_path!(), METHOD)
+                .iter()
+                .map(ToString::to_string)
+                .filter(|line| line.contains(ENTRY) || line.contains(SEGMENT))
+                .collect();
+        assert!(leaks.is_empty(), "log lines carry a key's text: {leaks:#?}");
     }
 
     /// M9 S6 contracts 2 and 5 (tester-s6; A-R139, A-R140), guards 9, 10 and 14. A clear's answers

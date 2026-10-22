@@ -24,3 +24,13 @@ config-log-macros = { workspace = true }
 # The campaign's evidence artifacts go through `write_evidence`, which stamps the shared envelope
 # and disclaimer; nothing in this crate may write a second copy (ruling V-R24, after V-R5/F-R1).
 config-testkit = { workspace = true }
+# `m9_host_vs_sim` runs one client script through the simulator and through the real host
+# (`rdb_api::Db` over `config_testkit::MemStore`) and compares the replies (M9 close-out C1,
+# ruling A-R150). Allowed: `deps` forbids only `config-*` -> `rdb-*`; no product crate takes
+# rdb-sim.
+rdb-api = { workspace = true }
+# The script's keys (`keys::root_key`), values (the byte-document envelope) and the decode of the
+# simulator's read, by the same functions the host uses.
+rdb-value = { workspace = true }
+# The runtime `Db::open` takes for its control calls.
+tokio = { workspace = true }
