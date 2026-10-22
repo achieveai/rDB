@@ -9,14 +9,16 @@ mod common;
 use bytes::Bytes;
 use common::{int, text, Kernel};
 use rdb_core::{AffinityId, TenantId};
+use rdb_value::cbor::decode;
 use rdb_value::collection::{compile_collection, member, members, CollectionKind, ElemOp};
 use rdb_value::delta::ApplyError;
 use rdb_value::envelope::{
     digest, newer_build, open, seal, EnvelopeError, Kind, HEADER_LEN, MAX_ENVELOPE, MAX_PAYLOAD,
 };
-use rdb_value::keys::{element_key, parse, root_key, RootKey, Sub};
+use rdb_value::keys::{block_key, element_key, item_key, parse, root_key, RootKey, Sub};
 use rdb_value::list::{compile_list, create_list, items, ListOp, Start, MIN_BLOCK_MAX};
 use rdb_value::repair::clear_object;
+use rdb_value::value::{MapKey, Value};
 use rdb_value::{BlockFault, Corrupt, Expected, ValueError};
 
 fn object(id: &[u8]) -> RootKey {
@@ -95,6 +97,9 @@ fn s7_newer_build_answers_as_open_for_every_header_byte_value() {
     newer_empty[2] = 0x02;
     let newer_empty = rehash(newer_empty);
     for (bytes, at) in [
+        (&[][..], "0 bytes"),
+        (&sound[..1], "1 byte"),
+        (&sound[..3], "3 bytes"),
         (&sound[..HEADER_LEN - 1], "39 bytes"),
         (&empty[..], "40 bytes"),
         (&newer_empty[..], "40 bytes, codec 0x02"),
@@ -439,4 +444,85 @@ fn s7_two_faults_in_one_map_never_lose_the_newer_entry() {
         newer_record(),
         "b keeps the newer build's bytes"
     );
+}
+
+/// The `n` of each block in a list's root index, in list order.
+fn block_ns(k: &Kernel, root: &RootKey) -> Vec<u64> {
+    let raw = &k.records[&root.to_bytes()].1;
+    let Value::Map(fields) = decode(open(raw).unwrap().payload).unwrap() else {
+        panic!("a list root is a map")
+    };
+    let Some(Value::Array(blocks)) = fields.get(&MapKey::new("blocks")) else {
+        panic!("a list root has blocks")
+    };
+    blocks
+        .iter()
+        .map(|block| match block {
+            Value::Array(parts) => match &parts[0] {
+                Value::Integer(n) => u64::try_from(n.get()).unwrap(),
+                other => panic!("a block's n is an integer: {other:?}"),
+            },
+            other => panic!("a block entry is an array: {other:?}"),
+        })
+        .collect()
+}
+
+/// A records list at `MIN_BLOCK_MAX`, every item in its own record, grown until it has two
+/// blocks. Returns its item ids and its block ids, each in list order.
+fn two_block_list(k: &mut Kernel, root: &RootKey) -> (Vec<u128>, Vec<u128>) {
+    let made = create_list(&k.snapshot(), root, true, MIN_BLOCK_MAX, &[]).unwrap();
+    k.commit(made.compiled());
+    for _ in 0..100 {
+        let blocks = block_ns(k, root);
+        if blocks.len() == 2 {
+            let page = items(&k.snapshot(), root, Start::Position(0), usize::MAX).unwrap();
+            let ids: Vec<u128> = page.items.iter().map(|item| item.id).collect();
+            let seed = ids[0] >> 64 << 64;
+            return (ids, blocks.iter().map(|n| seed | u128::from(*n)).collect());
+        }
+        let version = Expected::Version(root_version(k, root));
+        let push: Vec<ListOp> = (0..20).map(|n| ListOp::Push(int(n))).collect();
+        let made = compile_list(&k.snapshot(), root, version, MIN_BLOCK_MAX, &push).unwrap();
+        k.commit(made.compiled());
+    }
+    panic!("the list never grew a second block")
+}
+
+/// Review F-001 (A-R148), the list twin of the map row above: damage in the first block, read
+/// before a newer build's record in the second. The read names the damage; the clear refuses on
+/// the newer record, which keeps its bytes. A newer item follows a damaged first item. A newer
+/// block follows a damaged first base instead, because `items` loads every block of its page
+/// before any item record. With the newer block above its root, `faulting`'s own
+/// `newer_build` call is the only check that refuses: `check_base` names `NewerThanRoot`
+/// first, which is damage, and the clear would delete the block.
+#[test]
+fn s7_two_faults_in_one_list_never_lose_the_newer_record() {
+    for newer_block in [false, true] {
+        let mut k = Kernel::new();
+        let root = object(b"l");
+        let (ids, blocks) = two_block_list(&mut k, &root);
+        let (damaged, newer) = if newer_block {
+            (block_key(&root, blocks[0]), block_key(&root, blocks[1]))
+        } else {
+            (
+                item_key(&root, ids[0]),
+                item_key(&root, *ids.last().unwrap()),
+            )
+        };
+        store(&mut k, damaged, damaged_record(), true);
+        store(&mut k, newer.clone(), newer_record(), true);
+        let at = format!("newer_block={newer_block}");
+        let s = k.snapshot();
+        let read = items(&s, &root, Start::Position(0), usize::MAX).unwrap_err();
+        assert!(
+            matches!(read, ValueError::Corrupt(ref c) if !c.is_newer_build()),
+            "{at}: the read names the damage first: {read:?}"
+        );
+        assert_eq!(clear_object(&s, &root).unwrap_err(), NEWER, "{at}");
+        assert_eq!(
+            k.records[&newer].1,
+            newer_record(),
+            "{at}: the newer record keeps its bytes"
+        );
+    }
 }
