@@ -15,7 +15,7 @@ use rdb_value::delta::ApplyError;
 use rdb_value::envelope::{
     digest, newer_build, open, seal, EnvelopeError, Kind, HEADER_LEN, MAX_ENVELOPE, MAX_PAYLOAD,
 };
-use rdb_value::keys::{block_key, element_key, item_key, parse, root_key, RootKey, Sub};
+use rdb_value::keys::{block_key, element_key, item_key, parse, root_key, slot_key, RootKey, Sub};
 use rdb_value::list::{compile_list, create_list, items, ListOp, Start, MIN_BLOCK_MAX};
 use rdb_value::repair::clear_object;
 use rdb_value::value::{MapKey, Value};
@@ -604,4 +604,56 @@ fn s7_two_faults_in_one_list_never_lose_the_newer_record() {
             "{at}: the newer record keeps its bytes"
         );
     }
+}
+
+/// Revobot 4353435175 (A-R153): a stray record between two pending slots is named a newer
+/// build's when a newer build wrote it, before its key is judged. Shape: the block's
+/// `Block{Envelope}`, as for a newer base. A damaged one there is still key damage.
+#[test]
+fn s7_a_newer_stray_between_pending_slots_reads_as_a_newer_build() {
+    let mut k = Kernel::new();
+    let root = object(b"l");
+    let base: Vec<ListOp> = (0..40).map(|n| ListOp::Push(int(n))).collect();
+    let made = create_list(&k.snapshot(), &root, false, MIN_BLOCK_MAX, &base).unwrap();
+    k.commit(made.compiled());
+    for n in [40, 41] {
+        let version = Expected::Version(root_version(&k, &root));
+        let push = [ListOp::Push(int(n))];
+        let made = compile_list(&k.snapshot(), &root, version, MIN_BLOCK_MAX, &push).unwrap();
+        k.commit(made.compiled());
+    }
+    let slots: Vec<Bytes> = k
+        .records
+        .keys()
+        .filter(|key| parse(key).is_ok_and(|p| p.slot.is_some()))
+        .cloned()
+        .collect();
+    assert_eq!(slots.len(), 2, "two pending slots: {slots:?}");
+    let parsed = parse(&slots[0]).unwrap();
+    let id = parsed.list_id.unwrap();
+    assert_eq!(slots[0], slot_key(&root, id, parsed.slot.unwrap()));
+    let mut stray = slots[0].to_vec();
+    stray.push(0x00);
+    let stray = Bytes::from(stray);
+    assert!(
+        slots[0] < stray && stray < slots[1],
+        "the stray sorts between the slots"
+    );
+    let at = root_version(&k, &root);
+    k.records.insert(stray.clone(), (at, damaged_record()));
+    let damaged = items(&k.snapshot(), &root, Start::Position(0), usize::MAX).unwrap_err();
+    assert!(
+        matches!(damaged, ValueError::Corrupt(Corrupt::Key(_))),
+        "a damaged stray is key damage: {damaged:?}"
+    );
+    k.records.insert(stray, (at, newer_record()));
+    let read = items(&k.snapshot(), &root, Start::Position(0), usize::MAX).unwrap_err();
+    assert!(is_newer(&read), "{read:?}");
+    assert_eq!(
+        read,
+        ValueError::Corrupt(Corrupt::Block {
+            id,
+            fault: BlockFault::Envelope(EnvelopeError::UnknownCodec(0x02)),
+        })
+    );
 }

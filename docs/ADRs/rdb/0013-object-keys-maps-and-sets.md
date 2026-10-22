@@ -526,6 +526,10 @@ How it is proved:
       `TooManyWrites` and `TooLarge`: a write that names a newer build's entry answers
       `INCOMPATIBLE_VERSION` even when it is also too big.
     - Set members are never checked: a member has no envelope, so bytes in one are damage.
+    - **Frozen rule (M9 S7, review Q5):** a set member never carries a newer build's bytes under
+      today's set root. A future set-member encoding that carries bytes must bump the set root's
+      format or kind, so an old build meets the newer root first and refuses it. Guarded by
+      `s7_a_set_member_is_never_a_newer_builds` (`crates/rdb-value/tests/newer_build.rs`).
     - Why: before S7 a `put` or `del` over a newer build's entry at or below its root replaced or
       removed it with no error, an old build destroying valid data during a rollback, which
       ADR-rdb-0012 §12 forbids.
