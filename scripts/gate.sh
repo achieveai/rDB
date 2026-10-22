@@ -65,8 +65,9 @@ stage="${1:-all}"
 echo "gate: target=$CARGO_TARGET_DIR scale=$RETCD_TEST_DEADLINE_SCALE ports=$RETCD_TEST_PORT_RANGE logs=$RETCD_TEST_LOG_DIR data=$RETCD_TEST_DATA_DIR"
 
 run_fmt()  { echo "== fmt";    cargo fmt --all --check; }
-# The second non-cargo check. Every M7 test plan says which contract commit it was written
-# against; this fails when that commit is no longer the newest one to touch the contracts.
+# The second non-cargo check. Every M7 test plan says which contract surface it was written
+# against; this fails when that basis no longer matches the contracts at HEAD. The basis is the
+# contracts tree; a legacy commit basis passes when its contracts surface matches the current one.
 # All four teams held a stale basis at once on 2026-09-20, and a stale basis always over-holds:
 # rows report Unavailable on types that have already landed. See scripts/drift-check.sh.
 run_drift() { scripts/drift-check.sh; }

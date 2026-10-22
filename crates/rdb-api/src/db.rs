@@ -732,8 +732,9 @@ impl Db {
     ///   `NotAContainer`, ...), an `expect` on a `Chunk` or a `Gc`, or a `Publish` whose stored
     ///   chunks do not match it (`ChunkMissing`, `ChunkLength`, `BlobDigestMismatch`, ...);
     /// - `UPLOAD_CHUNK_CONFLICT` for a `Chunk` whose upload and index already hold other bytes;
-    /// - `CORRUPT_BLOB` when a stored manifest or chunk the compile reads fails its checks, and
-    ///   `CORRUPT_HISTORY` when another stored record does not open;
+    /// - `CORRUPT_BLOB` when a blob root that opens is not a v1 manifest, or a chunk it names does
+    ///   not open, is not stored, or is not the one the manifest names; `CORRUPT_HISTORY` when any
+    ///   other stored record does not open, a blob root whose envelope does not open included;
     /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
     ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
     ///   [`Self::status`] about that publish;
