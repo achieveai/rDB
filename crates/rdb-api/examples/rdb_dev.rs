@@ -16,7 +16,9 @@
 //! carries a version condition, so it answers `CONDITION_FAILED` rather than applying twice.
 //!
 //! Limits, checked before anything is compiled, sent or read: an object id is at most 1,024
-//! bytes, for every write and read. A request over a limit answers `INVALID_ARGUMENT` with
+//! bytes, for every write and read; a `doc`, `map`, `set` or `list` write carries at most 255
+//! ops, and a `txn` at most 255 puts. A map or set write also writes its root, so with distinct
+//! keys the compile's 255-write cap refuses it first, at 255 keys. A request over a limit answers `INVALID_ARGUMENT` with
 //! `request=-`, and its detail ends `request R not sent` (or `not read`): R is the id it used up.
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a

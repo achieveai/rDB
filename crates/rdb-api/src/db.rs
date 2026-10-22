@@ -77,6 +77,12 @@ pub const MAX_OBJECT_ID: usize = 1_024;
 // layer admits.
 const _: () = assert!(2 * MAX_OBJECT_ID + 2 <= rdb_value::list::MAX_ID_ESCAPED);
 
+/// The most ops one change carries, and the most puts one [`Db::txn`] takes (M9 S5): the
+/// kernel's own cap on writes in one request. A request over it is `INVALID_ARGUMENT` before
+/// anything is compiled or sent. A change's writes are capped separately, at compile: a map or
+/// set change also writes its root, so it takes at most 254 element changes.
+pub const MAX_OPS: usize = rdb_core::transaction::admission::MAX_REQUEST_MUTATIONS;
+
 /// A failed call, with the §5.4 name and what the caller may do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -699,6 +705,24 @@ impl Db {
                 request: None,
             });
         }
+        let identity = self.identity();
+        // Counted before any value is copied (M9 S5).
+        if puts.len() > MAX_OPS {
+            return Err(PutError {
+                error: limit_refused(
+                    identity.request,
+                    "puts",
+                    puts.len(),
+                    MAX_OPS,
+                    format!(
+                        "{} puts, over the {MAX_OPS}-put limit; request {} not sent",
+                        puts.len(),
+                        identity.request.0
+                    ),
+                ),
+                request: None,
+            });
+        }
         let puts = puts
             .iter()
             .map(|put| PutOp {
@@ -708,7 +732,7 @@ impl Db {
                 expect: put.if_version.map(Expected::Version),
             })
             .collect();
-        self.compile_and_send(self.identity(), puts, deadline, send_wait(deadline))
+        self.compile_and_send(identity, puts, deadline, send_wait(deadline))
             .and_then(written)
     }
 
@@ -1514,8 +1538,8 @@ fn deadline_refusal(deadline: Duration) -> Option<ApiError> {
 /// `None` when every put is within every limit. `request` is the id the refused request used up.
 fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
     puts.iter().enumerate().find_map(|(index, put)| {
-        (put.object.len() > MAX_OBJECT_ID).then(|| {
-            limit_refused(
+        if put.object.len() > MAX_OBJECT_ID {
+            return Some(limit_refused(
                 request,
                 "object_id",
                 put.object.len(),
@@ -1526,9 +1550,33 @@ fn write_refusal(puts: &[PutOp], request: RequestId) -> Option<ApiError> {
                     put.object.len(),
                     request.0
                 ),
+            ));
+        }
+        let ops = op_count(&put.change);
+        (ops > MAX_OPS).then(|| {
+            limit_refused(
+                request,
+                "ops",
+                ops,
+                MAX_OPS,
+                format!(
+                    "op {index}: {ops} ops, over the {MAX_OPS}-op limit; request {} not sent",
+                    request.0
+                ),
             )
         })
     })
+}
+
+/// How many ops `change` carries. Every kind is named, so a new one does not compile until
+/// someone decides its count.
+fn op_count(change: &Change) -> usize {
+    match change {
+        Change::Doc(delta) => delta.0.len(),
+        Change::Map(ops) | Change::Set(ops) => ops.len(),
+        Change::List(edits) => edits.len(),
+        Change::Chunk { .. } | Change::Publish { .. } | Change::Gc { .. } => 0,
+    }
 }
 
 /// The first limit a read `call` breaks, as `INVALID_ARGUMENT`, or `None` when it is within
@@ -1570,7 +1618,15 @@ fn limit_refused(
     max: usize,
     detail: String,
 ) -> ApiError {
-    tracing::info!(request = request.0, limit, found, max, "limit_refused");
+    // `client` with `request` is the key a log query joins on: `request` alone is not unique.
+    tracing::info!(
+        client = CLIENT.0,
+        request = request.0,
+        limit,
+        found,
+        max,
+        "limit_refused"
+    );
     ApiError::invalid(detail)
 }
 
