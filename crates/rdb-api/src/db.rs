@@ -717,6 +717,9 @@ impl Db {
     ///
     /// `Ok(None)` is a change that compiles to nothing and is never sent:
     /// - a `Chunk` whose bytes are already stored at its upload and index;
+    /// - that `Chunk` answer even while A1 refuses reads, as after a fence: "already stored" is
+    ///   never final, because a `Publish` re-reads every chunk and is admitted or refused under
+    ///   the fence, so it is not gated on A1 (ADR-rdb-0014 O9);
     /// - a `Gc` with nothing left to collect;
     /// - a `Publish` of the blob already at the object and published: its version is at or
     ///   below what P1 has published, in the generation the compile sees.
@@ -738,8 +741,9 @@ impl Db {
     /// - `UNKNOWN_OUTCOME`, with no request, for a `Publish` of the blob already at the object
     ///   but not yet published (C-3): the publish that wrote it may still be lost, so ask
     ///   [`Self::status`] about that publish;
-    /// - for a `Publish` of the blob already at the object while A1 refuses reads, what
-    ///   [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), never "unchanged";
+    /// - for a `Publish` of the blob already at the object while A1 refuses reads, the kind and
+    ///   retry rule [`Self::read`] answers then (`LEASE_EXPIRED` while the grant is lost), with
+    ///   `no_mutation`, never "unchanged";
     /// - `UNAVAILABLE` when no compile answer came in time.
     pub fn write(
         &self,

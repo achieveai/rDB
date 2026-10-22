@@ -17,7 +17,8 @@
 //!
 //! Commands are read from `--script` or stdin, one per line. A `#` at the start of a
 //! word starts a comment; one inside a word, as in `{"tag":"#1"}`, or inside a `"..."`
-//! string, as in `{"m":"hello #world"}`, is kept. Words split on
+//! string, as in `{"m":"hello #world"}`, is kept, so a comment after JSON needs a space
+//! before its `#`: `{"a":1} # note`, not `{"a":1}# note`. Words split on
 //! spaces; `"..."` makes one word, so `""` is an empty object or value. A value verb (`doc`,
 //! `map`, `set`, `members`, `list`, `items`) reads its JSON values from the line as written,
 //! quotes and all:

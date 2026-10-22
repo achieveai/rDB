@@ -3197,6 +3197,7 @@ impl Host {
                     change = puts.first().map_or("none", |put| put.change.name()),
                     compiled = matches!(answer, Answer::Compiled(_)),
                     unchanged = matches!(answer, Answer::Unchanged),
+                    reason = %match &answer { Answer::Error { error, .. } => error.to_string(), _ => String::new() },
                     "client_compile"
                 );
                 let _ = reply.send(answer);
@@ -3461,6 +3462,8 @@ impl Host {
                     crate::db::refused_read(reason.client_error_kind(Boundary::PreApply));
                 refused.detail =
                     format!("a read is refused now ({reason:?}), so the publish is not confirmed");
+                // Nothing was sent: this gate refuses before any send.
+                refused.no_mutation = true;
                 Err(refused)
             }
         }
@@ -7307,9 +7310,10 @@ mod tests {
     /// Review F1 (A-R133), C-3 and ADR-rdb-0014 O9: "already published" is a read, so it is
     /// given only while a read would be. A blob publishes; the control store then fails until
     /// A1 fences node 1, and a plain read is refused. The same publish re-issued meanwhile is
-    /// refused as that read is, and sends nothing. Once the store returns and node 1 admits
-    /// again, the re-issue is `unchanged`. Mutant m24 (the read gate cut) answers `Unchanged`
-    /// while fenced, as 2cc5b24 did.
+    /// refused as that read is, and sends nothing, so it says `no_mutation`. Once the store
+    /// returns and node 1 admits again, the re-issue is `unchanged`. Mutant m24 (the read gate
+    /// cut) answers `Unchanged` while fenced, as 2cc5b24 did; mutant m28 (`no_mutation` not set)
+    /// says `false`.
     /// Integration (~2 s): bootstrap's discovery window, then one fence on a 600 ms grant.
     #[config_log::retcd_test]
     fn a_publish_reissued_while_fenced_is_refused_as_a_read_is_and_unchanged_once_admitted() {
@@ -7344,8 +7348,8 @@ mod tests {
         };
         assert_eq!(
             refusal(trio.ask(publish(4))),
-            (refused.kind, refused.retry, refused.no_mutation, false),
-            "the publish while fenced, as the read ({refused:?})"
+            (refused.kind, refused.retry, true, false),
+            "the publish while fenced, as the read ({refused:?}) but sending nothing"
         );
 
         trio.mem.stop_failing();
