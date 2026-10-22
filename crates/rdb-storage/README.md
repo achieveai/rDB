@@ -22,7 +22,9 @@ one (linked), or gets a copy of it as of `base` (copied). Format 1
 
 `get`, `read` and `snapshot` try the lineage, then its parent, and so on. They stop at a value,
 a tombstone, or a lineage with no parent. `History` falls through only for `seq <= base` of
-every link crossed. Other namespaces stop at a `copied` link.
+every link crossed. Other namespaces stop at a `copied` link. `snapshot` leaves `History` out (M10
+decision 2): it grew by one record per write, and no kernel module reads it through a view. Read
+it with `read --ns history`.
 
 ## Entry point
 

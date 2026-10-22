@@ -492,7 +492,20 @@ impl Run {
             .snapshot(id, active, SnapshotHandle(1))
             .expect("rocks snapshot");
         let memory_view = memory.snapshot(id, active, SnapshotHandle(1));
-        assert_eq!(rocks_view.len(), memory_view.len(), "{at}: snapshot len");
+        // M10 decision 2: the RocksDB view leaves `History` out; the oracle's view keeps it.
+        // `History` is compared through `get` and `history_at` below, never through the view.
+        let oracle_history = memory_view.scan(Namespace::History, &[], usize::MAX).len();
+        assert_eq!(
+            rocks_view.len(),
+            memory_view.len() - oracle_history,
+            "{at}: snapshot len, History aside"
+        );
+        assert!(
+            rocks_view
+                .scan(Namespace::History, &[], usize::MAX)
+                .is_empty(),
+            "{at}: the view holds no History"
+        );
         assert_eq!(rocks_view.at(), memory_view.at(), "{at}: snapshot at");
         for (ns, key, value, version, _) in rocks_view.entries() {
             assert_eq!(
@@ -516,6 +529,9 @@ impl Run {
         );
         let mut namespaces = Vec::new();
         for (ns, key) in &partition.written {
+            if *ns == Namespace::History {
+                continue;
+            }
             assert_eq!(
                 rocks_view.get(*ns, key),
                 memory_view.get(*ns, key),

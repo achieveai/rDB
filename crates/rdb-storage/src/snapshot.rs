@@ -2,8 +2,8 @@
 //!
 //! Built by [`RocksEngine::snapshot`] with the same walk as [`RocksEngine::get`]
 //! (ADR-rdb-0010 decisions 2, 4 and 5): a newer level shadows an older one, a tombstone hides the
-//! key, `History` falls through only for `seq <= base` of every link it crosses, and the other
-//! namespaces stop at a `copied` link. Eager and O(lineage) in memory, like `MemorySnapshot`;
+//! key, and a read stops at a `copied` link. `History` is not in the view (M10 decision 2); read it
+//! with [`RocksEngine::get`]. Eager and O(lineage) in memory, like `MemorySnapshot`;
 //! a streaming merge is owed once a measured partition passes ~1 GB (design R2 §6).
 
 use std::collections::BTreeMap;
@@ -15,12 +15,14 @@ use rdb_core::contracts::trace::Version;
 use rocksdb::{Direction, IteratorMode};
 
 use crate::engine::{RocksEngine, LOG_TARGET};
-use crate::keys::{self, decode_mark, encode_key, unframe, Frame, PREFIX_LEN};
+use crate::keys::{self, encode_key, unframe, Frame, PREFIX_LEN};
 
-/// Every contract namespace, in the order a snapshot reads them.
-const NAMESPACES: [Namespace; 5] = [
+/// The namespaces a snapshot reads, in order. Not `History` (M10 decision 2, quick fix): no
+/// kernel module reads it through [`SnapshotRead`], and it grows by one record per write, so
+/// copying it made every step view O(all writes). `History` stays readable through
+/// [`RocksEngine::get`] and [`RocksEngine::history_at`].
+const NAMESPACES: [Namespace; 4] = [
     Namespace::User,
-    Namespace::History,
     Namespace::Dedup,
     Namespace::Progress,
     Namespace::Meta,
@@ -98,16 +100,6 @@ impl SnapshotRead for RocksSnapshot {
     }
 }
 
-/// What one level of the chain may show to the lineage at the top.
-#[derive(Debug, Clone, Copy)]
-struct Level {
-    generation: Generation,
-    /// `History` shows only `seq <=` this; `None` at the top level.
-    history_through: Option<u64>,
-    /// The other namespaces show nothing from this level (a `copied` link was crossed).
-    history_only: bool,
-}
-
 impl RocksEngine {
     /// An owned view of lineage `(partition, generation)` at its applied watermark, read through
     /// the chain (module docs).
@@ -125,9 +117,6 @@ impl RocksEngine {
         let mut seen: BTreeMap<(Namespace, Bytes), Option<Entry>> = BTreeMap::new();
         for level in self.chain(partition, generation) {
             for ns in NAMESPACES {
-                if level.history_only && ns != Namespace::History {
-                    continue;
-                }
                 self.scan_level(partition, level, ns, &mut seen)?;
             }
         }
@@ -143,39 +132,27 @@ impl RocksEngine {
         })
     }
 
-    /// The levels a read of `(partition, generation)` can reach, newest first.
-    fn chain(&self, partition: PartitionId, generation: Generation) -> Vec<Level> {
-        let mut levels = vec![Level {
-            generation,
-            history_through: None,
-            history_only: false,
-        }];
-        let mut current = levels[0];
-        while let Some(link) = self.link(partition, current.generation) {
-            current = Level {
-                generation: link.parent,
-                history_through: Some(
-                    current
-                        .history_through
-                        .map_or(link.base.0, |through| through.min(link.base.0)),
-                ),
-                history_only: current.history_only || link.copied,
-            };
+    /// The generations a read of `(partition, generation)` can reach, newest first: up the
+    /// links, stopping after a `copied` one (the copy holds the parent's state as of `base`).
+    fn chain(&self, partition: PartitionId, generation: Generation) -> Vec<Generation> {
+        let mut levels = vec![generation];
+        let mut current = generation;
+        while let Some(link) = self.link(partition, current).filter(|link| !link.copied) {
+            current = link.parent;
             levels.push(current);
         }
         levels
     }
 
-    /// Add one level's records in `ns` that the lineage at the top can see and no newer level
-    /// already holds.
+    /// Add one level's records in `ns` that no newer level already holds.
     fn scan_level(
         &self,
         partition: PartitionId,
-        level: Level,
+        level: Generation,
         ns: Namespace,
         seen: &mut BTreeMap<(Namespace, Bytes), Option<Entry>>,
     ) -> Result<(), StorageFault> {
-        let prefix = encode_key(partition, level.generation, ns, &[]);
+        let prefix = encode_key(partition, level, ns, &[]);
         let corrupt = |what: &str, detail: String| {
             tracing::error!(target: LOG_TARGET, detail, "snapshot_{what}_failed");
             StorageFault::Corrupt
@@ -187,14 +164,9 @@ impl RocksEngine {
                 break;
             }
             let key = &raw[PREFIX_LEN..];
-            if let Some(through) = level.history_through {
-                if ns == Namespace::History && decode_mark(key).is_none_or(|seq| seq > through) {
-                    continue;
-                }
-            }
             let entry = match unframe(&value) {
                 Some(Frame::Value(version, bytes)) => {
-                    Some((Bytes::copy_from_slice(bytes), version, level.generation))
+                    Some((Bytes::copy_from_slice(bytes), version, level))
                 }
                 Some(Frame::Tombstone(_)) => None,
                 None => return Err(corrupt("unframe", format!("{raw:02x?}"))),
