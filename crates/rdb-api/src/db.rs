@@ -4254,20 +4254,27 @@ mod tests {
         db.shutdown();
     }
 
-    /// Which revision the spike's fence names as `control_revision`.
-    #[derive(Debug, Clone, Copy)]
-    enum SpikeRevision {
-        /// R3a exactly: the revision the exact-revision delete of `grants/1` landed at.
-        GrantDelete,
-        /// `partitions/1`'s `mod_revision` as read before the heal.
-        PartitionRecord,
+    /// What the spike saw.
+    #[derive(Debug)]
+    struct SpikeSeen {
+        /// The revision the grant delete landed at.
+        deleted: rdb_core::contracts::ids::Revision,
+        /// The store revision the `partitions/1` read was served at.
+        read_revision: rdb_core::contracts::ids::Revision,
+        /// `partitions/1`'s `mod_revision` from that read.
+        partition_revision: rdb_core::contracts::ids::Revision,
+        /// The fence's `control_revision`.
+        control_revision: rdb_core::contracts::ids::Revision,
     }
 
-    /// M10 W1 day-1 spike: bootstrap, write, stop, start the same `nodes/` again at boot 2,
-    /// clear `grants/1` by its exact revision once it is proven expired, hand node 1 a second
-    /// recovery's `Plan` and an `ExpiryProven` fence, and read the write back from generation 2.
-    /// Returns node 1's F1 phase when it stops moving, and the read when it admits.
-    fn spike(which: SpikeRevision) -> (Option<String>, Option<GetOk>) {
+    /// M10 W1 day-1 spike (ruling A-R163): bootstrap, write, stop, start the same `nodes/` again
+    /// at boot 2, clear `grants/1` by its exact revision once it is proven expired, read
+    /// `partitions/1` after the delete's reply, hand node 1 a second recovery's `Plan` and an
+    /// `ExpiryProven` fence naming that record's revision, and read the write back from
+    /// generation 2.
+    /// Integration (~5 s): a grant must be proven expired on wall-clock time.
+    #[config_log::retcd_test]
+    fn m10_spike_partition_revision() {
         use config_core::GetRequest;
         use rdb_core::authority::grant::GrantRecord;
         use rdb_core::authority::partition::PartitionRecord;
@@ -4277,9 +4284,7 @@ mod tests {
         use rdb_core::contracts::control::ControlKey;
         use rdb_core::contracts::digest::Digest;
         use rdb_core::contracts::event::{EventKind, KernelEvent};
-        use rdb_core::contracts::ids::{
-            AuthorityGeneration, ConfigVersion, CorrelationId, ReplicaRole, Revision,
-        };
+        use rdb_core::contracts::ids::{ConfigVersion, CorrelationId, ReplicaRole, Revision};
         use rdb_core::contracts::membership::{CopyId, Member, PartitionConfig};
         use rdb_core::contracts::recovery::{
             Candidate, LineageAnchor, RecoveryEvent, RecoveryPlan,
@@ -4318,20 +4323,9 @@ mod tests {
                 key: Bytes::from(key.encode()),
             }))
             .expect("get")
-            .record
         };
-        let found = read(ControlKey::Partition(PARTITION)).expect("partitions/1");
-        let record = PartitionRecord::decode(&found.value).expect("decodes");
-        let partition_revision = Revision(found.mod_revision);
-        let grant = read(ControlKey::Grant(OWNER)).expect("grants/1");
-        let held = GrantRecord::decode(&grant.value).expect("decodes");
-        tracing::info!(
-            ?record,
-            partition_revision = partition_revision.0,
-            ?held,
-            grant_revision = grant.mod_revision,
-            "spike_read"
-        );
+        let held = read(ControlKey::Grant(OWNER)).record.expect("grants/1");
+        let held = GrantRecord::decode(&held.value).expect("decodes");
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         let deleted = loop {
             match rt.block_on(admin::clear_grant(&db, &*store, OWNER)) {
@@ -4343,16 +4337,24 @@ mod tests {
                 other => panic!("clear grants/1: {other:?}"),
             }
         };
+        // Read only after the delete's reply (A-R163).
+        let after = read(ControlKey::Partition(PARTITION));
+        let found = after.record.expect("partitions/1");
+        let record = PartitionRecord::decode(&found.value).expect("decodes");
         let now = db.now();
         let sample = HostClock::control_time(now, &budgets);
-        let control_revision = match which {
-            SpikeRevision::GrantDelete => deleted,
-            SpikeRevision::PartitionRecord => partition_revision,
+        let seen = SpikeSeen {
+            deleted,
+            read_revision: Revision(after.read_revision),
+            partition_revision: Revision(found.mod_revision),
+            control_revision: Revision(found.mod_revision),
         };
         tracing::info!(
-            deleted = deleted.0,
-            control_revision = control_revision.0,
-            ?which,
+            ?record,
+            ?held,
+            deleted = seen.deleted.0,
+            read_revision = seen.read_revision.0,
+            control_revision = seen.control_revision.0,
             "spike_cleared"
         );
 
@@ -4360,11 +4362,6 @@ mod tests {
             partition: PARTITION,
             generation: record.generation,
             owner_epoch: record.owner_epoch,
-        };
-        let anchor = LineageAnchor {
-            lineage,
-            base_seq: Seq::ZERO,
-            base_digest: Digest::ROOT,
         };
         let version = ConfigVersion(record.config_version.0 + 1);
         let members: Vec<Member> = (1..=3u8)
@@ -4381,7 +4378,11 @@ mod tests {
             .collect();
         let config = PartitionConfig::new(PARTITION, version, members);
         let plan = RecoveryPlan {
-            anchor,
+            anchor: LineageAnchor {
+                lineage,
+                base_seq: Seq::ZERO,
+                base_digest: Digest::ROOT,
+            },
             candidates: config
                 .members
                 .iter()
@@ -4420,7 +4421,7 @@ mod tests {
                 epsilon_ms: u32::try_from(budgets.clock_error_millis).expect("eps"),
                 delta_ms: u32::try_from(budgets.dispatch_margin_millis).expect("delta"),
             },
-            control_revision,
+            control_revision: seen.control_revision,
             decision_tick: now,
         };
         for event in [
@@ -4437,47 +4438,48 @@ mod tests {
 
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut phase = None;
-        loop {
-            let owner = db.node_status().into_iter().find(|s| s.node == OWNER);
-            if let Some(owner) = &owner {
-                if owner.recovery != phase {
-                    tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
-                    phase.clone_from(&owner.recovery);
-                }
-                if owner.admits == Some(true) {
-                    let got = db.get(b"a").expect("get a");
-                    tracing::info!(?got, "spike_read_back");
-                    return (phase, Some(got));
-                }
-                let terminal = phase
-                    .as_deref()
-                    .is_some_and(|p| p.starts_with("Blocked") || p == "Quarantined");
-                if terminal {
-                    return (phase, None);
-                }
+        let owner = loop {
+            let owner = db
+                .node_status()
+                .into_iter()
+                .find(|s| s.node == OWNER)
+                .expect("node 1 status");
+            if owner.recovery != phase {
+                tracing::info!(phase = ?owner.recovery, admits = ?owner.admits, "spike_phase");
+                phase.clone_from(&owner.recovery);
             }
-            if std::time::Instant::now() > deadline {
-                return (phase, None);
+            if owner.admits == Some(true) {
+                break owner;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "node 1 never admitted; last phase {phase:?}"
+            );
             std::thread::sleep(Duration::from_millis(20));
-        }
-    }
+        };
+        let got = db.get(b"a").expect("get a");
+        tracing::info!(?got, ?seen, "spike_result");
 
-    /// The spike with R3a's proof exactly (`control_revision` = the grant delete's revision).
-    /// Integration (~5 s): a grant must be proven expired on wall-clock time.
-    #[config_log::retcd_test]
-    fn m10_spike_r3a_exact() {
-        let (phase, read) = spike(SpikeRevision::GrantDelete);
-        tracing::info!(?phase, ?read, "spike_result");
-        eprintln!("SPIKE r3a_exact phase={phase:?} read={read:?}");
-    }
-
-    /// The spike with `control_revision` = `partitions/1`'s revision, for comparison.
-    /// Integration (~5 s).
-    #[config_log::retcd_test]
-    fn m10_spike_partition_revision() {
-        let (phase, read) = spike(SpikeRevision::PartitionRecord);
-        tracing::info!(?phase, ?read, "spike_result");
-        eprintln!("SPIKE partition_revision phase={phase:?} read={read:?}");
+        // The proof names partitions/1's revision, read after the delete landed.
+        assert!(seen.read_revision >= seen.deleted, "{seen:?}");
+        assert_eq!(seen.control_revision, seen.partition_revision, "{seen:?}");
+        // Generation 2 is committed (F1's recovery CAS on partitions/1 is conditioned on exactly
+        // that revision) and active (node 1 admits writes only after the activation CAS).
+        assert_eq!(owner.recovered, Some(Generation(2)), "{owner:?}");
+        let now_record = read(ControlKey::Partition(PARTITION))
+            .record
+            .expect("partitions/1");
+        assert!(Revision(now_record.mod_revision) > seen.partition_revision);
+        let now_record = PartitionRecord::decode(&now_record.value).expect("decodes");
+        assert_eq!(now_record.generation, Generation(2), "{now_record:?}");
+        let fresh = db.put(b"b", b"world", None).expect("put at generation 2");
+        assert_eq!(fresh.generation, Generation(2));
+        // The acknowledged write reads back.
+        assert_eq!(got.generation, Generation(2), "{got:?}");
+        assert_eq!(
+            got.value.as_ref().map(|(_, v)| v.as_ref()),
+            Some(&b"hello"[..]),
+            "{got:?}"
+        );
     }
 }
